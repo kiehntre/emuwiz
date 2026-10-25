@@ -1,0 +1,1943 @@
+#!/usr/bin/env python3
+"""emuwiz-cargo-retire: manifest-authorised retirement of Cargo compiler artifacts.
+
+DRY RUN by default.  Nothing is deleted unless --execute is given together with
+the approved manifest digest.  It deletes only the exact compiler-artifact paths
+named by the approved manifest, and only when every gate below passes; anything
+unknown, uncertain or failed is HOLD (left in place, with a reason).
+
+Gates (all required, per cache):
+  * the manifest's SHA-256 equals --approved-sha256;
+  * the cache is a real directory reached without symlinks, with the manifest's
+    device/inode, and no mount point inside the deleted subtrees;
+  * a lifecycle record whose adoption is VERIFIED against the source (path hash or
+    source path + exact HEAD) - an adoption record alone never authorises deletion;
+  * the exclusive lifecycle lock is obtained (builds hold it shared), then a fresh
+    process census shows no reference (cwd, exe, fds, maps, CARGO_TARGET_DIR) to
+    the cache or its source, with COMPLETE process visibility;
+  * an owner-attested completed task; no subsequent build/write or manifest-time write;
+  * caches that no wrapper-managed build ever recorded need
+    --maintenance-window-attested (see docs/CARGO_CACHE_RETENTION.md: advisory
+    locks cannot exclude a plain `cargo` that does not use cargo-iso).
+
+Each selected path is re-checked (device/inode/mode, artifact class, no symlink,
+no data-looking file) and removed through directory descriptors opened with
+O_NOFOLLOW; a changed or rebound path stops that entry.  Cargo's own lock files
+(.cargo-lock, .cargo-build-lock, .cargo-artifact-lock) are never removed.
+"""
+import os
+import stat
+import sys
+
+# ---------------------------------------------------------------- trust gate
+# Runs before ANY other import of this script (os, stat and sys are built in or frozen).
+# Kept identical in emuwiz-cargo-maintain and emuwiz-cargo-retire.
+
+
+def _install_problem(script, siblings, interpreter, module_dirs):
+    """None, or why this copy is unfit to run with root privileges: the script, every
+    sibling it loads, the interpreter and every module directory, each with all of its
+    parent directories, must be root-owned, not group/world writable and symlink-free.
+
+    This is a tripwire for a misplaced or modified copy, checked before this script
+    imports anything; it cannot vouch for the interpreter binary or for the few stdlib
+    modules the interpreter loads at start-up (encodings), which is why the interpreter
+    and its library must live in root-owned directories (verify-install checks them, and
+    should first be run unprivileged with the same interpreter)."""
+    def problem(path, want_dir):
+        cur = path
+        while True:
+            try:
+                st = os.lstat(cur)
+            except OSError as error:
+                return f"{cur}: {error.strerror}"
+            if stat.S_ISLNK(st.st_mode):
+                return f"{cur} is a symlink"
+            if cur == path and not (stat.S_ISDIR(st.st_mode) if want_dir else stat.S_ISREG(st.st_mode)):
+                return f"{cur} is not a {'directory' if want_dir else 'regular file'}"
+            if st.st_uid != 0:
+                return f"{cur} is owned by uid {st.st_uid}, not root"
+            if st.st_mode & 0o022:
+                return f"{cur} is group/world writable"
+            if cur == "/":
+                return None
+            cur = os.path.dirname(cur)
+
+    if not interpreter:
+        return "the interpreter path is unknown"
+    checks = [(os.path.realpath(p), False) for p in [script] + list(siblings) + [interpreter]]
+    checks += [(os.path.realpath(p), True) for p in module_dirs if p and os.path.isdir(p)]
+    for path, want_dir in checks:
+        why = problem(path, want_dir)
+        if why:
+            return why
+    return None
+
+
+def _require_trusted_install(script, siblings, force=False):
+    """Root (or a process that can regain root) runs only root-owned code; unprivileged
+    runs are unaffected unless `force` (verify-install)."""
+    if not force and os.geteuid() != 0 and os.getresuid()[2] != 0:
+        return
+    if not (sys.flags.isolated and sys.flags.no_site):
+        raise SystemExit("refusing to run with root privileges: start it as `/usr/bin/python3 -I -S <installed script>`")
+    why = _install_problem(script, siblings, sys.executable, sys.path)
+    if why:
+        raise SystemExit(f"refusing to run with root privileges from an untrusted location: {why}. "
+                         "Install root-owned copies (docs/CARGO_CACHE_RETENTION.md, privileged installation)")
+
+
+_require_trusted_install(__file__, [os.path.join(os.path.dirname(os.path.realpath(__file__)),
+                                                 "emuwiz-cargo-retention")])
+
+import argparse
+import contextlib
+import errno
+import hashlib
+import importlib.machinery
+import importlib.util
+import json
+import re
+import signal
+import time
+
+CARGO_LOCK_NAMES = (".cargo-lock", ".cargo-build-lock", ".cargo-artifact-lock")
+_hook = None  # test seam: called with a stage name; may mutate the filesystem
+
+
+def load_foundation():
+    path = os.path.join(os.path.dirname(os.path.realpath(__file__)), "emuwiz-cargo-retention")
+    # Never write bytecode next to the scripts: a retirement tool must not add
+    # files to the repository tree it runs from.
+    sys.dont_write_bytecode = True
+    loader = importlib.machinery.SourceFileLoader("emuwiz_cargo_retention", path)
+    spec = importlib.util.spec_from_loader(loader.name, loader)
+    module = importlib.util.module_from_spec(spec)
+    loader.exec_module(module)
+    return module
+
+
+F = load_foundation()
+
+
+class Refusal(Exception):
+    def __init__(self, code, detail=""):
+        super().__init__(f"{code}: {detail}" if detail else code)
+        self.code = code
+        self.detail = detail
+
+
+class RetirementFence:
+    """Existing target flock owns the operation; metadata stamps fence each mutation.
+
+    Keep registry.meta across the final metadata check AND syscall, never across
+    a census or tree walk. This also fences older clients, which only use that
+    global lock. Atomic replacement is detected even if JSON returns to its prior
+    value (pin/release or reopen/finish ABA). No persisted lease can be stranded.
+    """
+    def __init__(self, registry, key, target):
+        self.registry, self.key, self.target = registry, key, target
+        self.paths = [registry.path(kind, key) for kind in ("targets", "pins")]
+        self._metadata = contextlib.ExitStack()
+        self._closed = False
+
+    @staticmethod
+    def stat_stamp(st):
+        if not stat.S_ISREG(st.st_mode) or st.st_uid != os.geteuid():
+            raise Refusal("RETIREMENT_FENCE_CHANGED", "metadata is not a regular owner-held file")
+        return (st.st_dev, st.st_ino, st.st_mode, st.st_uid, st.st_size, st.st_mtime_ns, st.st_ctime_ns)
+
+    @classmethod
+    def stamp(cls, path):
+        try:
+            return cls.stat_stamp(os.lstat(path))
+        except FileNotFoundError:
+            return None
+
+    def target_identity(self):
+        st = os.lstat(self.target)
+        if not stat.S_ISDIR(st.st_mode) or st.st_uid != os.geteuid():
+            raise Refusal("RETIREMENT_FENCE_CHANGED", "target ownership or type changed")
+        return st.st_dev, st.st_ino, st.st_mode, st.st_uid
+
+    def reserve(self):
+        try:
+            with self.registry.meta_lock():
+                self.proof = [self.stamp(path) for path in self.paths]
+                for path, expected in zip(self.paths, self.proof):
+                    if expected is not None:
+                        fd = F.open_lock_file(path, os.O_RDONLY)
+                        self._metadata.callback(os.close, fd)
+                        if self.stat_stamp(os.fstat(fd)) != expected:
+                            raise Refusal("RETIREMENT_FENCE_CHANGED", "metadata rebound while reserving")
+                # Retain these original objects until finalization: even coarse
+                # timestamps cannot hide atomic replacement through inode reuse.
+                for kind, validator in (("targets", F.valid_target_record), ("pins", F.valid_pin_file)):
+                    state, _ = self.registry.read_checked(kind, self.key, validator)
+                    if state == "invalid":
+                        raise Refusal("RETIREMENT_FENCE_CHANGED", "unknown target metadata")
+                self.identity = self.target_identity()
+                self.check()
+        except BaseException:
+            self.close()
+            raise
+
+    def close(self):
+        self._closed = True
+        self._metadata.close()
+
+    def check(self):
+        if self._closed:
+            raise Refusal("RETIREMENT_FENCE_CHANGED", "reservation is closed")
+        try:
+            if self.proof != [self.stamp(path) for path in self.paths] or self.identity != self.target_identity():
+                raise Refusal("RETIREMENT_FENCE_CHANGED", "target metadata, identity or ownership changed")
+        except OSError as error:
+            raise Refusal("RETIREMENT_FENCE_CHANGED", str(error)) from error
+
+    @contextlib.contextmanager
+    def mutation(self, process_guard):
+        while True:
+            process_guard()  # a full census, if required, never holds registry.meta
+            with self.registry.meta_lock():
+                self.check()
+                # Waiting for metadata may have admitted a new process. Release,
+                # recensus and retry; never weaken the final process-use guard.
+                if not process_guard(check_only=True):
+                    continue
+                yield  # includes final parent/inode/owner checks and unlink/rmdir
+                return
+
+
+def hook(stage):
+    if _hook is not None:
+        _hook(stage)
+
+
+def sha256_file(path):
+    digest = hashlib.sha256()
+    with open(path, "rb") as handle:
+        for block in iter(lambda: handle.read(1 << 20), b""):
+            digest.update(block)
+    return digest.hexdigest()
+
+
+def real_now():
+    return time.time()
+
+
+def parse_iso(text):
+    from datetime import datetime
+    try:
+        return datetime.fromisoformat(text).timestamp()
+    except (TypeError, ValueError):
+        return None
+
+
+# ------------------------------------------------- durable execution journal
+
+SNAPSHOT_LIMIT = 1_000_000
+JOURNAL_MAX_PATHS = 20_000
+FULL_CENSUS_INTERVAL = 2.0  # seconds between complete process censuses while unlinking
+JOURNAL_SUFFIX = ".journal.jsonl"
+
+
+class JournalError(Exception):
+    """Progress evidence could not be published; mutation must stop."""
+
+
+class Interrupted(BaseException):
+    """SIGTERM/SIGHUP during execution: unwound like KeyboardInterrupt."""
+
+
+def fsync_dir(path):
+    fd = os.open(path, os.O_RDONLY | os.O_DIRECTORY)
+    try:
+        os.fsync(fd)
+    finally:
+        os.close(fd)
+
+
+class Journal:
+    """Append-only, fsynced JSON-lines record of one execution, kept outside every
+    cache.  Records per run: begin, one group_plan per group, then per manifest
+    entry an `intent` (before its first unlink) and an `outcome`, finally `end`.
+    Size is O(manifest entries); nothing is written per deleted file."""
+
+    def __init__(self, path, fd):
+        self.path = path
+        self.fd = fd
+        self.seq = 0
+
+    @classmethod
+    def create(cls, directory, exec_id):
+        os.makedirs(directory, mode=0o700, exist_ok=True)
+        path = os.path.join(directory, f"retire-{exec_id}{JOURNAL_SUFFIX}")
+        fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_APPEND | os.O_NOFOLLOW | os.O_CLOEXEC, 0o600)
+        try:
+            fsync_dir(directory)
+        except BaseException:
+            os.close(fd)
+            raise
+        return cls(path, fd)
+
+    def write(self, record):
+        self.seq += 1
+        line = (json.dumps(dict(record, seq=self.seq, t=time.time()), sort_keys=True) + "\n").encode()
+        view = memoryview(line)
+        while view:
+            n = os.write(self.fd, view)
+            view = view[n:]
+        os.fsync(self.fd)
+
+    def close(self):
+        try:
+            os.close(self.fd)
+        except OSError:
+            pass
+
+
+def read_journal(path):
+    """(records, torn) - a torn final line (killed mid-write) is reported, not trusted."""
+    records, torn = [], False
+    fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK | os.O_CLOEXEC)  # a FIFO must not hang us
+    with os.fdopen(fd, "rb") as handle:
+        if not stat.S_ISREG(os.fstat(handle.fileno()).st_mode):
+            raise OSError(errno.EINVAL, "journal is not a regular file")
+        for raw in handle.read().split(b"\n"):
+            if not raw:
+                continue
+            try:
+                value = json.loads(raw)
+            except ValueError:
+                torn = True
+                continue
+            if isinstance(value, dict):
+                records.append(value)
+            else:
+                torn = True
+    return records, torn
+
+
+def journal_backlog(directory):
+    """(pending, reconciled) for the journals of earlier executions.  `pending` block the
+    next --execute; `reconciled` are interrupted journals proven safe by their own bytes
+    (see clean_interruption), listed with the digest that was judged."""
+    pending, reconciled = [], []
+    try:
+        names = sorted(os.listdir(directory))
+    except FileNotFoundError:
+        return pending, reconciled
+    for name in names:
+        if not name.endswith(JOURNAL_SUFFIX):
+            continue
+        path = os.path.join(directory, name)
+        try:  # an unforeseen shape (even RecursionError from JSON) blocks, never crashes the timer
+            records, torn = read_journal(path)
+            if not torn and any(r.get("event") == "end" for r in records):
+                continue
+            if journal_resolved(path):
+                continue
+            clean = clean_interruption(path)
+        except Exception:
+            pending.append(path)
+            continue
+        if clean.get("reconciled"):
+            reconciled.append({"journal": path, "journal_sha256": clean["journal_sha256"], "rule": clean["rule"]})
+        else:
+            pending.append(path)
+    return pending, reconciled
+
+
+def incomplete_journals(directory):
+    return journal_backlog(directory)[0]
+
+
+def protected_name(name):
+    """Journals, databases, saves, ROM-like data and Cargo-adjacent evidence."""
+    lower = name.lower()
+    return lower.endswith(F.DATA_SUFFIXES) or "journal" in lower or name in F.ALWAYS_PRESERVE
+
+
+def snapshot_tree(path):
+    """key (relative path below `path`, '/'-joined) -> (dev, ino), and counts."""
+    snap = {}
+    files = dirs = 0
+    stack = [("", path)]
+    while stack:
+        key, directory = stack.pop()
+        with os.scandir(directory) as it:
+            for entry in it:
+                st = entry.stat(follow_symlinks=False)
+                child = key + "/" + entry.name
+                snap[child] = (st.st_dev, st.st_ino)
+                if len(snap) > SNAPSHOT_LIMIT:
+                    raise Refusal("SNAPSHOT_TOO_LARGE", path)
+                if stat.S_ISDIR(st.st_mode):
+                    dirs += 1
+                    stack.append((child, entry.path))
+                else:
+                    files += 1
+    return snap, files, dirs
+
+
+# ------------------------------------------------------- descriptor-bound I/O
+
+
+def open_dir_nofollow(path):
+    """Open an absolute directory with every component opened O_NOFOLLOW."""
+    if not os.path.isabs(path) or os.path.normpath(path) != path:
+        raise Refusal("PATH_NOT_CANONICAL", path)
+    fd = os.open("/", os.O_RDONLY | os.O_DIRECTORY)
+    try:
+        for part in [p for p in path.split("/") if p]:
+            try:
+                nxt = os.open(part, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW, dir_fd=fd)
+            except OSError as error:
+                raise Refusal("SYMLINK_OR_MISSING_COMPONENT", f"{part}: {error.strerror}") from error
+            os.close(fd)
+            fd = nxt
+        return fd
+    except BaseException:
+        os.close(fd)
+        raise
+
+
+def lstat_at(name, dir_fd):
+    return os.stat(name, dir_fd=dir_fd, follow_symlinks=False)
+
+
+class Counters:
+    def __init__(self):
+        self.freed = 0
+        self.retained = 0
+        self.files = 0
+        self.dirs = 0
+
+
+class IncrementalFiles(dict):
+    """File evidence plus the aliases whose ctime our own unlink will advance."""
+    def __init__(self, files):
+        super().__init__(files)
+        self.aliases = {}
+        for key, stamp in files.items():
+            self.aliases.setdefault(stamp[:2], []).append(key)
+
+    def unlinked(self, before, after):
+        old, new = F.incremental_stamp(before), F.incremental_stamp(after)
+        # Only our known link removal may advance ctime. All content metadata
+        # and the exact inode must remain unchanged on the retained descriptor.
+        if old[:-1] != new[:-1] or after.st_nlink != before.st_nlink - 1:
+            raise Refusal("INCREMENTAL_FILE_CHANGED", "hardlinked compiler file changed during unlink")
+        for key in self.aliases[old[:2]]:
+            self[key] = new
+
+
+def guard_entry(name, st, snap, key, incremental_files=None):
+    """Deletion-time classification, applied immediately before each unlink."""
+    if incremental_files is not None:
+        # A validated rustc crate name can contain "journal". Directories are
+        # bound to the planned snapshot; every file additionally needs its full
+        # compiler proof. This exception never applies outside that output unit.
+        if stat.S_ISREG(st.st_mode) and incremental_files.get(key) != F.incremental_stamp(st):
+            raise Refusal("INCREMENTAL_FILE_CHANGED", name)
+    elif protected_name(name):
+        raise Refusal("PROTECTED_FILE", name)
+    if snap is not None and snap.get(key) != (st.st_dev, st.st_ino):
+        raise Refusal("NOT_IN_PLANNED_SNAPSHOT", name)
+
+
+def verify_bound_parent(dir_fd, approved_path):
+    if not approved_path:
+        return
+    parent = os.path.dirname(approved_path)
+    if path_has_symlink_component(parent):
+        raise Refusal("PARENT_IDENTITY_CHANGED", parent)
+    try:
+        named, opened = os.lstat(parent), os.fstat(dir_fd)
+    except OSError as error:
+        raise Refusal("PARENT_IDENTITY_CHANGED", parent) from error
+    if (named.st_dev, named.st_ino) != (opened.st_dev, opened.st_ino):
+        raise Refusal("PARENT_IDENTITY_CHANGED", parent)
+
+
+def remove_entry(dir_fd, name, expect, root_dev, counters, top=True, snap=None, key="", approved_path=None, process_guard=None, live_identities=None, mutation_guard=None, incremental_files=None):
+    """Remove `name` below dir_fd without following links; refuse anything odd.
+
+    `counters` is updated after every successful removal, so a refusal part-way
+    leaves an exact account of what was already removed."""
+    verify_bound_parent(dir_fd, approved_path)
+    try:
+        st = lstat_at(name, dir_fd)
+    except FileNotFoundError:
+        raise Refusal("ALREADY_ABSENT", name)
+    if top and expect is not None:
+        if (st.st_dev, st.st_ino, st.st_mode) != expect:
+            raise Refusal("PATH_IDENTITY_MISMATCH", name)
+    if st.st_uid != os.geteuid():
+        raise Refusal("FILESYSTEM_OWNER_MISMATCH", name)
+    if st.st_dev != root_dev:
+        raise Refusal("CROSSES_FILESYSTEM", name)
+    if stat.S_ISLNK(st.st_mode):
+        raise Refusal("SYMLINK_FOUND", name)
+    if not top:
+        guard_entry(name, st, snap, key, incremental_files)
+    if stat.S_ISDIR(st.st_mode):
+        flags = os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW
+        try:
+            fd = os.open(name, flags, dir_fd=dir_fd)
+        except OSError as error:
+            raise Refusal("OPEN_FAILED", f"{name}: {error.strerror}") from error
+        try:
+            fst = os.fstat(fd)
+            if (fst.st_dev, fst.st_ino) != (st.st_dev, st.st_ino):
+                raise Refusal("PATH_IDENTITY_MISMATCH", f"{name} rebound while opening")
+            children = os.listdir(fd)
+            # Validate every child before removing any of them, so a late symlink,
+            # protected file or unknown entry stops this directory untouched.
+            for child in children:
+                try:
+                    cst = lstat_at(child, fd)
+                except FileNotFoundError:
+                    continue
+                if cst.st_dev != root_dev:
+                    raise Refusal("CROSSES_FILESYSTEM", child)
+                if stat.S_ISLNK(cst.st_mode):
+                    raise Refusal("SYMLINK_FOUND", child)
+                guard_entry(child, cst, snap, key + "/" + child, incremental_files)
+                if not (stat.S_ISDIR(cst.st_mode) or stat.S_ISREG(cst.st_mode)):
+                    raise Refusal("SPECIAL_FILE", child)
+            for child in children:
+                remove_entry(fd, child, None, root_dev, counters, False, snap, key + "/" + child,
+                             os.path.join(approved_path, child) if approved_path else None, process_guard, live_identities, mutation_guard, incremental_files)
+        finally:
+            os.close(fd)
+        hook("before-rmdir:" + name)
+        with mutation_guard(process_guard) if mutation_guard else contextlib.nullcontext():
+            if process_guard and not mutation_guard:
+                process_guard()
+            verify_bound_parent(dir_fd, approved_path)
+            again = lstat_at(name, dir_fd)
+            if (again.st_dev, again.st_ino, again.st_mode, again.st_uid) != (st.st_dev, st.st_ino, st.st_mode, os.geteuid()):
+                raise Refusal("PATH_IDENTITY_MISMATCH", name + " changed before rmdir")
+            os.rmdir(name, dir_fd=dir_fd)
+        if live_identities is not None:
+            live_identities.discard((st.st_dev, st.st_ino))
+        counters.dirs += 1
+        return
+    if not stat.S_ISREG(st.st_mode):
+        raise Refusal("SPECIAL_FILE", name)
+    hook("before-unlink:" + name)
+    link_fd = None
+    try:
+        with mutation_guard(process_guard) if mutation_guard else contextlib.nullcontext():
+            if process_guard and not mutation_guard:
+                process_guard()
+            verify_bound_parent(dir_fd, approved_path)
+            # Re-establish the same inode immediately before the unlink.
+            again = lstat_at(name, dir_fd)
+            if (again.st_dev, again.st_ino, again.st_mode, again.st_uid) != (st.st_dev, st.st_ino, st.st_mode, os.geteuid()):
+                raise Refusal("PATH_IDENTITY_MISMATCH", f"{name} changed before unlink")
+            if incremental_files is not None:
+                guard_entry(name, again, snap, key, incremental_files)
+                if again.st_nlink > 1:
+                    link_fd = os.open(name, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK, dir_fd=dir_fd)
+                    if F.incremental_stamp(os.fstat(link_fd)) != F.incremental_stamp(again):
+                        raise Refusal("INCREMENTAL_FILE_CHANGED", name)
+            os.unlink(name, dir_fd=dir_fd)
+            # Account immediately: a post-unlink proof refusal is still PARTIAL.
+            if again.st_nlink == 1:
+                if live_identities is not None:
+                    live_identities.discard((again.st_dev, again.st_ino))
+                counters.freed += again.st_blocks * 512
+            else:
+                counters.retained += again.st_blocks * 512
+            counters.files += 1
+            if link_fd is not None:
+                incremental_files.unlinked(again, os.fstat(link_fd))
+    finally:
+        if link_fd is not None:
+            os.close(link_fd)
+
+
+# -------------------------------------------------------------- evaluation
+
+
+def entry_class_problem(rel_parts, parent_path):
+    """Why a manifest path is not an enumerated compiler artifact, else None."""
+    if not rel_parts or any(p in ("", ".", "..") for p in rel_parts):
+        return "PATH_OUTSIDE_TARGET"
+    name = rel_parts[-1]
+    if name in CARGO_LOCK_NAMES:
+        return "CARGO_INTERNAL_LOCK_FILE"
+    if len(rel_parts) == 1:
+        return None if name in F.TOP_META_FILES else "NOT_A_COMPILER_ARTIFACT"
+    if len(rel_parts) > 3 or any(p in F.ALWAYS_PRESERVE for p in rel_parts):
+        return "NOT_A_COMPILER_ARTIFACT"
+    profile = parent_path
+    has_marker = any(
+        os.path.isdir(os.path.join(profile, marker)) and not os.path.islink(os.path.join(profile, marker))
+        for marker in (".fingerprint", "deps")
+    )
+    orphan = (name == "incremental" and os.path.basename(profile) in ("debug", "release")
+              and (len(rel_parts) == 2 or re.fullmatch(r"[A-Za-z0-9_]+(?:-[A-Za-z0-9_]+){2,}", rel_parts[0])))
+    if not has_marker and not orphan:
+        return "NOT_A_COMPILER_ARTIFACT"
+    if name in F.ARTIFACT_DIRS:
+        return None
+    if name.endswith(F.ARTIFACT_FILE_SUFFIXES):
+        return None
+    full = os.path.join(profile, name)
+    try:
+        st = os.lstat(full)
+    except OSError:
+        return None  # absence is handled by the identity check
+    if stat.S_ISREG(st.st_mode) and st.st_mode & 0o111 and os.path.exists(full + ".d"):
+        return None
+    return "NOT_A_COMPILER_ARTIFACT"
+
+
+def path_has_symlink_component(path):
+    cur = "/"
+    for part in [p for p in path.split("/") if p]:
+        cur = os.path.join(cur, part)
+        try:
+            if stat.S_ISLNK(os.lstat(cur).st_mode):
+                return True
+        except OSError:
+            return False
+    return False
+
+
+def load_manifest(path, approved):
+    actual = sha256_file(path)
+    if approved is None or actual != approved.lower():
+        raise Refusal("MANIFEST_DIGEST_MISMATCH", f"manifest is {actual}, approved {approved}")
+    with open(path) as handle:
+        data = json.load(handle)
+    groups = []
+    for group in data.get("cargo_artifact_groups", []):
+        paths = json.loads(group.get("deletion_paths_json") or "[]")
+        sources = json.loads(group.get("associated_source_paths") or "[]")
+        groups.append({"group": group, "paths": paths, "sources": sources})
+    return data, actual, groups
+
+
+def verified_owner(group, record, source_paths, target):
+    """Adoption is only a claim; this is the evidence that makes it count."""
+    if not record or not record.get("owner"):
+        return "NOT_ADOPTED", "no lifecycle record with an owner"
+    if not group.get("source_exists") or not source_paths:
+        return "SOURCE_MISSING", "the owning source checkout is not present to verify"
+    name = os.path.basename(target)
+    recorded = os.path.realpath(record["worktree"]) if record.get("worktree") else None
+    matched = False
+    for src in source_paths:
+        real = os.path.realpath(src)
+        if not os.path.isdir(real):
+            return "SOURCE_MISSING", real
+        head = F.head_of(real)
+        if group.get("source_head") and head != group["source_head"]:
+            return "OWNER_UNVERIFIED", f"source HEAD {head} differs from the manifest's {group['source_head']}"
+        digest = hashlib.sha256(real.encode()).hexdigest()[:12]
+        if name.endswith("-" + digest) or recorded == real:
+            matched = True
+    if not matched:
+        return "OWNER_UNVERIFIED", "neither the target's path hash nor the recorded worktree matches the source"
+    return None, ""
+
+
+def evaluate_group(entry, registry, args, census, now_ts, execute, own_lock=False):
+    """Group-level holds (read-only). Returns (holds, context)."""
+    group, paths, sources = entry["group"], entry["paths"], entry["sources"]
+    target = group["directory"]
+    holds = []
+    ctx = {"target": target, "key": None, "record": None}
+
+    def hold(code, detail=""):
+        holds.append({"code": code, "detail": detail})
+
+    if not os.path.isabs(target) or os.path.normpath(target) != target:
+        hold("TARGET_PATH_NOT_CANONICAL", target)
+        return holds, ctx
+    if path_has_symlink_component(target):
+        hold("TARGET_PATH_HAS_SYMLINK", target)
+        return holds, ctx
+    try:
+        st = os.lstat(target)
+    except OSError as error:
+        hold("TARGET_NOT_FOUND", error.strerror or "")
+        return holds, ctx
+    if not stat.S_ISDIR(st.st_mode):
+        hold("TARGET_NOT_A_DIRECTORY")
+        return holds, ctx
+    if (st.st_dev, st.st_ino) != (group.get("device"), group.get("inode")):
+        hold("DIRECTORY_IDENTITY_CHANGED", f"now {st.st_dev}:{st.st_ino}")
+    if st.st_uid != os.geteuid():
+        hold("FILESYSTEM_OWNER_MISMATCH")
+    if target == F.legacy_target() or os.path.dirname(target) != F.target_root():
+        hold("SHARED_OR_EXTERNAL_TARGET")
+    mounts = F.mountinfo()
+    if not mounts:
+        hold("MOUNT_VISIBILITY_UNKNOWN")
+    elif any(m == target or m.startswith(target + "/") for m, _ in mounts):
+        hold("CONTAINS_MOUNT_POINT")
+    key = F.key_for(target)
+    ctx["key"] = key
+    rec_state, record = registry.read_checked("targets", key, F.valid_target_record)
+    if rec_state == "invalid":
+        hold("REGISTRY_RECORD_INVALID", "the lifecycle record is unreadable or malformed; treated as unknown")
+        record = None
+    ctx["record"] = record
+    if not record and rec_state == "absent" and args.assume_adopted and not execute:
+        record = {"owner": "ASSUMED-FOR-DRY-RUN", "adopted_at": now_ts, "worktree": sources[0] if sources else None}
+        ctx["record"] = record
+        ctx["assumed"] = True
+    problem, detail = verified_owner(group, record, sources, target)
+    if problem:
+        hold(problem, detail)
+    if record and record.get("identity"):
+        ident = record["identity"]
+        if (ident.get("dev"), ident.get("ino")) != (st.st_dev, st.st_ino):
+            hold("DIRECTORY_IDENTITY_CHANGED", "differs from the identity recorded at first build/adoption")
+    pin_state, pins = registry.pin_state(key)
+    if pin_state == "invalid":
+        hold("PIN_STATE_UNKNOWN", "the pin record is unreadable or malformed; a corrupt pin is never 'no pin'")
+    elif pins:
+        hold("PINNED", ",".join(sorted({p["reason"] for p in pins})))
+    locked = False if own_lock else registry.probe_lock(key)
+    if locked:
+        hold("BUILD_LOCK_HELD")
+    elif locked is None:
+        hold("LOCK_STATE_UNKNOWN", "the lifecycle lock could not be probed")
+    if record:
+        live = [e for e in record.get("active", [])
+                if e.get("boot_id") == F.boot_id() and F.proc_starttime(e.get("pid")) == e.get("starttime")]
+        if live:
+            hold("RECORDED_BUILD_ALIVE", f"{len(live)} build(s)")
+    refs = census.refs.get(os.path.realpath(target), []) if census else []
+    if refs:
+        hold("LIVE_PROCESS_REFERENCE", ", ".join(f"{r['comm']}[{r['pid']}] {r['kind']}" for r in refs[:5]))
+    for src in sources:
+        real = os.path.realpath(src)
+        srefs = census.refs.get(real, []) if census else []
+        if srefs:
+            hold("LIVE_PROCESS_IN_SOURCE", ", ".join(f"{r['comm']}[{r['pid']}] {r['kind']}" for r in srefs[:5]))
+    if census is None or census.unreadable_foreign:
+        hold("INCOMPLETE_PROCESS_VISIBILITY",
+             f"{census.unreadable_foreign if census else '?'} process(es) of other users are not inspectable")
+    # activity
+    seen = set()
+    m = F.measure_tree(target, seen, with_identities=True)
+    ctx["measured"] = m
+    if census:
+        for src in sources:
+            try:
+                source_st = os.lstat(src)
+                m["identities"].add((source_st.st_dev, source_st.st_ino))
+            except OSError:
+                hold("SOURCE_MISSING", src)
+        census.match_inodes(m["identities"], target)
+        if census.refs.get(target) and not any(h["code"] == "LIVE_PROCESS_REFERENCE" for h in holds):
+            hold("LIVE_PROCESS_REFERENCE", "inode reference through a path or namespace alias")
+    problem = F.completion_problem(record, m["newest_mtime"])
+    if problem:
+        hold(problem, "task completion must be explicitly released by the verified owner")
+    activity = [v for v in ((record or {}).get("last_use"), (record or {}).get("last_end"), m["newest_mtime"] or None) if v]
+    newest = max(activity) if activity else None
+    if newest is None:
+        hold("UNKNOWN_ACTIVITY")
+    elif now_ts - newest < max(F.MIN_IDLE_HOURS, args.min_idle_hours) * 3600:
+        hold("RECENT_ACTIVITY", f"{(now_ts - newest) / 3600:.1f} h ago")
+    approved_mtime = parse_iso(group.get("latest_mtime_utc"))
+    if approved_mtime is not None and m["newest_mtime"] and m["newest_mtime"] > approved_mtime + 1:
+        hold("ACTIVITY_SINCE_MANIFEST", "files were written after the manifest was made")
+    if m["errors"]:
+        hold("MEASUREMENT_INCOMPLETE")
+    if m["cross_device"]:
+        hold("CONTAINS_MOUNT_POINT")
+    participating = bool(record and record.get("last_start"))
+    ctx["participating"] = participating
+    if not participating and not args.maintenance_window_attested:
+        hold("NONPARTICIPATING_WRITERS_NOT_EXCLUDED",
+             "no cargo-iso build was ever recorded here; plain cargo is not locked - needs an attested maintenance window")
+    return holds, ctx
+
+
+def evaluate_entry(entry_path, group, dev_expect):
+    """Per-path checks, read-only. Returns (reason or None, normalized parts)."""
+    target = group["directory"]
+    norm = os.path.normpath(entry_path["path"])
+    if norm != entry_path["path"] or not (norm + "/").startswith(target + "/") or norm == target:
+        return "PATH_OUTSIDE_TARGET", None
+    rel = os.path.relpath(norm, target).split("/")
+    parent = os.path.dirname(norm)
+    if path_has_symlink_component(parent):
+        return "SYMLINK_COMPONENT", rel
+    reason = entry_class_problem(rel, parent)
+    if reason:
+        return reason, rel
+    try:
+        st = os.lstat(norm)
+    except FileNotFoundError:
+        return "ALREADY_ABSENT", rel
+    except OSError:
+        return "UNREADABLE", rel
+    if (st.st_dev, st.st_ino, st.st_mode) != dev_expect:
+        return "PATH_IDENTITY_MISMATCH", rel
+    if stat.S_ISLNK(st.st_mode):
+        return "SYMLINK", rel
+    if stat.S_ISDIR(st.st_mode):
+        problem = F.incremental_evidence(norm)[0] if rel[-1] == "incremental" else F.subtree_problem(norm, st.st_dev)
+        if problem:
+            return "SUBTREE_REFUSED: " + problem, rel
+    elif not stat.S_ISREG(st.st_mode):
+        return "SPECIAL_FILE", rel
+    elif rel[-1].lower().endswith(F.DATA_SUFFIXES):
+        return "SUBTREE_REFUSED: looks like data", rel
+    return None, rel
+
+
+# ------------------------------------------------------------------- run
+
+
+def run(args):
+    execute = args.execute
+    if execute:
+        if args.assume_adopted:
+            raise SystemExit("--assume-adopted is for dry runs only")
+        if os.environ.get("EMUWIZ_RETENTION_NOW"):
+            raise SystemExit("--execute refuses EMUWIZ_RETENTION_NOW: it needs real time")
+        if not args.receipt_dir:
+            raise SystemExit("--execute requires --receipt-dir (outside every cache)")
+        if args.min_idle_hours < F.MIN_IDLE_HOURS:
+            raise SystemExit(f"--min-idle-hours cannot go below {F.MIN_IDLE_HOURS} when executing")
+    now_ts = real_now()
+    receipt = {
+        "mode": "EXECUTE" if execute else "DRY RUN (nothing deleted)",
+        "started": now_ts,
+        "manifest": os.path.realpath(args.manifest),
+        "approved_sha256": args.approved_sha256,
+        "host": os.uname().nodename,
+        "policy": {
+            "min_idle_hours": max(F.MIN_IDLE_HOURS, args.min_idle_hours),
+            "visibility": "complete required",
+            "maintenance_window_attested": bool(args.maintenance_window_attested),
+            "assume_adopted": bool(args.assume_adopted),
+        },
+        "groups": [],
+        "totals": {},
+    }
+    try:
+        data, digest, groups = load_manifest(args.manifest, args.approved_sha256)
+    except Refusal as refusal:
+        receipt["refused"] = {"code": refusal.code, "detail": refusal.detail}
+        finish(args, receipt)
+        return 3
+    receipt["manifest_sha256"] = digest
+    directories = [os.path.realpath(g["group"]["directory"]) for g in groups]
+    sources = [os.path.realpath(s) for g in groups for s in g["sources"]]
+    journal = None
+    if execute:
+        refusal = prepare_execution(args, groups, directories, sources)
+        if refusal is not None:
+            receipt["refused"] = refusal
+            finish(args, receipt)
+            return refusal.get("rc", 4)
+        exec_id = time.strftime("%Y%m%dT%H%M%S") + f"-{time.time_ns() % 10**9:09d}-{os.getpid()}"
+        backlog = journal_backlog(args.receipt_dir)
+        if backlog[0] and not args.acknowledge_incomplete_journals:
+            # a journal appeared or changed since prepare_execution judged the backlog
+            receipt["refused"] = {"code": "INCOMPLETE_JOURNAL_PRESENT", "detail": ", ".join(backlog[0])}
+            finish(args, receipt)
+            return 6
+        receipt["reconciled_interrupted"] = backlog[1]
+        try:
+            journal = Journal.create(args.receipt_dir, exec_id)
+            journal.write({
+                "event": "begin", "exec_id": exec_id, "manifest": receipt["manifest"],
+                "manifest_sha256": digest, "approved_sha256": args.approved_sha256,
+                "host": receipt["host"], "pid": os.getpid(), "policy": receipt["policy"],
+                "acknowledged_incomplete": sorted(backlog[0]),
+                "reconciled_interrupted": backlog[1],
+            })
+            for entry in groups:
+                g = entry["group"]
+                journal.write({
+                    "event": "group_plan", "directory": g["directory"],
+                    "device": g.get("device"), "inode": g.get("inode"),
+                    "paths": [{"path": i["path"], "device": i.get("device"),
+                               "inode": i.get("inode"), "mode": i.get("mode")} for i in entry["paths"]],
+                })
+        except OSError as error:
+            # Progress evidence cannot be published: begin no mutation at all.
+            if journal is not None:
+                journal.close()
+            receipt["refused"] = {"code": "JOURNAL_UNAVAILABLE",
+                                  "detail": f"{error.strerror or error}; nothing was changed"}
+            finish(args, receipt)
+            return 4
+        receipt["journal_file"] = journal.path
+        for sig in (signal.SIGTERM, signal.SIGHUP):
+            signal.signal(sig, _raise_interrupted)
+    registry = F.Registry(create=execute)
+    census = F.Census(directories + sources)
+    receipt["process_census"] = {"examined": census.examined, "unreadable_foreign": census.unreadable_foreign}
+    total_selected = total_held = total_partial = 0
+    freed_all = retained_all = 0
+    status = 0
+    try:
+        for entry in groups:
+            if any(r.get("outcome") == "ABORTED" for r in receipt["groups"]):
+                receipt["groups"].append({
+                    "directory": entry["group"]["directory"], "outcome": "NOT_STARTED_RUN_ABORTED", "holds": [],
+                    "paths": [{"path": i["path"], "outcome": "UNTOUCHED", "reason": "RUN_ABORTED"} for i in entry["paths"]],
+                    "paths_selected": 0, "paths_held": 0, "paths_partial": 0, "estimated_recoverable_bytes": 0,
+                    "paths_individually_eligible": 0, "accounted_freed_bytes": 0, "retained_hardlink_bytes": 0,
+                })
+                continue
+            result = process_group(entry, registry, args, census, now_ts, execute, journal)
+            receipt["groups"].append(result)
+            total_selected += result["paths_selected"]
+            total_held += result["paths_held"]
+            total_partial += result.get("paths_partial", 0)
+            freed_all += result["accounted_freed_bytes"]
+            retained_all += result["retained_hardlink_bytes"]
+    except (KeyboardInterrupt, Interrupted) as error:
+        partial = getattr(error, "partial_group", None)
+        if partial is not None:
+            receipt["groups"].append(partial)
+            total_selected += partial["paths_selected"]
+            total_held += partial["paths_held"]
+            total_partial += partial.get("paths_partial", 0)
+            freed_all += partial["accounted_freed_bytes"]
+            retained_all += partial["retained_hardlink_bytes"]
+        status = 130 if isinstance(error, KeyboardInterrupt) else 143
+        receipt["interrupted"] = type(error).__name__
+        receipt["mode"] = "EXECUTE (INTERRUPTED: progress is in the journal; run --inspect-journal)"
+        if journal is not None:
+            try:
+                journal.write({"event": "interrupted", "kind": type(error).__name__})
+            except OSError:
+                pass
+    if any(r.get("outcome") == "ABORTED" for r in receipt["groups"]) and status == 0:
+        status = 7
+    receipt["totals"] = {
+        "paths_in_manifest": sum(len(g["paths"]) for g in groups),
+        "paths_selected": total_selected,
+        "paths_held": total_held,
+        "paths_partial": total_partial,
+        "paths_individually_eligible": sum(g["paths_individually_eligible"] for g in receipt["groups"]),
+        "estimated_recoverable_if_group_gates_pass": sum(g["estimated_recoverable_bytes"] for g in receipt["groups"]),
+        "accounted_freed_bytes": freed_all,
+        "retained_hardlink_bytes": retained_all,
+    }
+    receipt["finished"] = real_now()
+    if journal is not None and not receipt.get("interrupted"):
+        try:
+            journal.write({"event": "end", "totals": receipt["totals"], "status": status})
+        except OSError:
+            status = status or 7  # no `end`: the journal stays "incomplete" on purpose
+    try:
+        finish(args, receipt)
+    except OSError as error:
+        # The journal already holds the full account; say so and fail loudly.
+        print(f"emuwiz-cargo-retire: receipt could not be published ({error.strerror or error}); "
+              f"the execution journal is complete: {journal.path if journal else '-'}", file=sys.stderr)
+        if journal is not None:
+            try:
+                journal.write({"event": "receipt_publication_failed", "error": str(error)})
+            except OSError:
+                pass
+        status = status or 5
+    if journal is not None:
+        journal.close()
+    return status
+
+
+def _raise_interrupted(signum, frame):
+    raise Interrupted(signum)
+
+
+def prepare_execution(args, groups, directories, sources):
+    """Checks that must hold before the journal is created; a refusal dict or None."""
+    receipt_dir = os.path.realpath(args.receipt_dir)
+    for root in directories + sources:
+        if receipt_dir == root or receipt_dir.startswith(root + os.sep):
+            return {"code": "RECEIPT_DIR_INSIDE_CACHE", "detail": f"{receipt_dir} is inside {root}", "rc": 4}
+    try:
+        os.makedirs(args.receipt_dir, mode=0o700, exist_ok=True)
+        rst = os.lstat(args.receipt_dir)
+    except OSError as error:
+        return {"code": "RECEIPT_DIR_UNSAFE", "detail": f"{args.receipt_dir}: {error.strerror or error}", "rc": 4}
+    if not stat.S_ISDIR(rst.st_mode) or rst.st_uid != os.geteuid() or rst.st_mode & 0o022:
+        return {"code": "RECEIPT_DIR_UNSAFE", "rc": 4,
+                "detail": f"{args.receipt_dir} must be a real directory owned by uid {os.geteuid()}, not group/world writable"}
+    if sum(len(g["paths"]) for g in groups) > JOURNAL_MAX_PATHS:
+        return {"code": "MANIFEST_TOO_LARGE_FOR_JOURNAL",
+                "detail": f"more than {JOURNAL_MAX_PATHS} paths; split the manifest", "rc": 4}
+    pending = incomplete_journals(args.receipt_dir)
+    if pending and not args.acknowledge_incomplete_journals:
+        return {"code": "INCOMPLETE_JOURNAL_PRESENT",
+                "detail": "an earlier execution did not finish and its journal cannot be reconciled automatically; "
+                          "inspect with --inspect-journal, then review it with --resolve-journal: " + ", ".join(pending),
+                "rc": 6}
+    return None
+
+
+def inspect_journal(path):
+    """Classify every planned entry from the journal and the current filesystem.
+
+    KNOWN_COMPLETED / KNOWN_PARTIAL / KNOWN_UNTOUCHED come from recorded outcomes,
+    or (untouched only) from an unchanged identity with an unchanged content count.  A missing pathname
+    without a recorded outcome is UNCERTAIN: absence alone is never proof of a
+    completed deletion."""
+    records, torn = read_journal(path)
+    report = inspect_records(records, torn)
+    report["journal"] = os.path.realpath(path)
+    try:
+        clean = clean_interruption(path)
+    except Exception as error:
+        clean = {"reconciled": False, "rule": None, "why": f"could not be judged: {error!r}"}
+    report["restart_reconciliation"] = {k: clean[k] for k in ("reconciled", "rule", "why")}
+    return report
+
+
+def inspect_records(records, torn):
+    begin = next((r for r in records if r.get("event") == "begin"), None)
+    plans = [r for r in records if r.get("event") == "group_plan"]
+    intents = {r["path"]: r for r in records if r.get("event") == "intent"}
+    outcomes = {r["path"]: r for r in records if r.get("event") == "outcome"}
+    entries = []
+    for plan in plans:
+        for item in plan.get("paths", []):
+            p = item["path"]
+            row = {"path": p, "directory": plan["directory"]}
+            if p in outcomes:
+                o = outcomes[p]
+                row.update(files=o.get("files"), dirs=o.get("dirs"), recorded_outcome=o.get("outcome"))
+                if o.get("outcome") == "REMOVED":
+                    row["state"] = "KNOWN_COMPLETED"
+                elif o.get("outcome") == "PARTIAL" or (o.get("files") or o.get("dirs")):
+                    row["state"] = "KNOWN_PARTIAL"
+                elif o.get("interrupted"):
+                    row["state"] = "UNCERTAIN_INTERRUPTED"
+                else:
+                    row["state"] = "KNOWN_UNTOUCHED"
+            elif p in intents:
+                row.update(classify_after_intent(intents[p]))
+            else:
+                row["state"] = "KNOWN_UNTOUCHED"
+                row["why"] = "no intent was recorded, so no unlink was ever started"
+            entries.append(row)
+    summary = {}
+    for row in entries:
+        summary[row["state"]] = summary.get(row["state"], 0) + 1
+    return {
+        "complete": any(r.get("event") == "end" for r in records),
+        "interrupted_record": any(r.get("event") == "interrupted" for r in records),
+        "torn_final_record": torn,
+        "exec_id": (begin or {}).get("exec_id"),
+        "manifest_sha256": (begin or {}).get("manifest_sha256"),
+        "summary": summary,
+        "entries": entries,
+    }
+
+
+def classify_after_intent(intent):
+    p = intent["path"]
+    if path_has_symlink_component(os.path.dirname(p)):
+        return {"state": "UNCERTAIN_SYMLINK_COMPONENT"}
+    try:
+        st = os.lstat(p)
+    except FileNotFoundError:
+        return {"state": "UNCERTAIN_ABSENT_UNCONFIRMED",
+                "why": "path is gone but no outcome was recorded; completion is not assumed"}
+    except OSError as error:
+        return {"state": "UNCERTAIN_UNREADABLE", "why": str(error)}
+    if (st.st_dev, st.st_ino, st.st_mode) != (intent.get("device"), intent.get("inode"), intent.get("mode")):
+        return {"state": "UNCERTAIN_IDENTITY_CHANGED"}
+    if not stat.S_ISDIR(st.st_mode):
+        return {"state": "KNOWN_UNTOUCHED", "why": "same file identity still present"}
+    try:
+        _, files, dirs = snapshot_tree(p)
+    except (OSError, Refusal) as error:
+        return {"state": "UNCERTAIN_UNREADABLE", "why": str(error)}
+    dirs += 1
+    want_f, want_d = intent.get("files", 0), intent.get("dirs", 0)
+    if (files, dirs) == (want_f, want_d):
+        return {"state": "KNOWN_UNTOUCHED", "why": "same identity and unchanged content count"}
+    if files <= want_f and dirs <= want_d:
+        # Same inode number but fewer entries: removal began.  The extent cannot be
+        # proven (an inode number can be reused), so this stays UNCERTAIN.
+        return {"state": "UNCERTAIN_PARTIALLY_REMOVED", "files_remaining": files, "files_planned": want_f,
+                "dirs_remaining": dirs, "dirs_planned": want_d}
+    return {"state": "UNCERTAIN_CONTENT_CHANGED", "files_now": files, "files_planned": want_f}
+
+
+# ------------------------------------------------- journal resolution (recovery)
+#
+# An interrupted execution leaves a journal without an `end` record, which blocks every
+# later --execute.  Resolution is the narrow, non-destructive way out: after an operator
+# reviews the fresh classification and approves its exact digest, a sidecar receipt binds
+# "this journal, with exactly this content, was reviewed" to it.  The journal itself is
+# never modified.  Resolution deletes nothing, continues nothing and grants no authority to
+# retire anything: the executor still demands a fresh approved manifest and passes every
+# gate.  Any change to the journal invalidates its receipt (the content hash is bound).
+
+RESOLUTION_SUFFIX = ".resolution.json"
+RESOLUTION_SCHEMA = "emuwiz-cargo-journal-resolution/1"
+LEGACY_RESOLUTION_SCHEMA = 1
+RESOLUTION_MAX_BYTES = 1 << 20
+JOURNAL_MAX_BYTES = 64 << 20
+# Only these can be accepted by an operator: removal was begun or interrupted on the very
+# object the journal recorded.  Absent, replaced, re-symlinked or grown paths cannot.
+ACCEPTABLE_UNCERTAIN = ("UNCERTAIN_INTERRUPTED", "UNCERTAIN_PARTIALLY_REMOVED")
+
+
+def resolution_path(journal_path):
+    return journal_path + RESOLUTION_SUFFIX
+
+
+def _read_regular(path, limit):
+    """Bytes of an owned, non-group/world-writable regular file opened without following
+    a final symlink; None when it is absent, unsafe or oversized."""
+    try:
+        fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK | os.O_CLOEXEC)
+    except OSError:
+        return None
+    try:
+        st = os.fstat(fd)
+        if not stat.S_ISREG(st.st_mode) or st.st_uid != os.geteuid() or st.st_mode & 0o022 or st.st_size > limit:
+            return None
+        return os.read(fd, limit + 1) if st.st_size else b""
+    except OSError:
+        return None
+    finally:
+        os.close(fd)
+
+
+def journal_sha256(path):
+    data = _read_regular(path, JOURNAL_MAX_BYTES)
+    return None if data is None else hashlib.sha256(data).hexdigest()
+
+
+def clean_interruption(journal_path):
+    """Whether an incomplete journal reconciles on restart without a person.
+
+    Two shapes qualify, both proven from the journal's own bytes (plus host and the
+    liveness of the pid those bytes name), so every restart reaches the same verdict:
+
+    * CLEAN_SELF_RECORDED_INTERRUPTION: this executor stopped itself.  Its own
+      `interrupted` is the final record, every intent is closed by a later outcome for
+      the same planned path, and every entry is KNOWN from recorded outcomes alone
+      (counts are a lower bound by at most one file or directory per entry).
+    * NO_UNLINK_STARTED: no intent was ever completed.  An intent is fsynced before the
+      first unlink of its entry, so nothing was removed; a torn final line is allowed.
+      This covers a run that died while planning (for example ENOSPC or a signal before
+      its handlers were installed).
+
+    Anything else (SIGKILL or a crash after an intent, an unclosed intent, an
+    interrupted entry with nothing recorded removed, another host, a live or unknown
+    writer, a malformed record, an unsafe file) stays pending for --resolve-journal.
+    Reconciling deletes nothing and authorises nothing: the next execution still
+    re-validates its own approved manifest."""
+    out = {"journal": journal_path, "reconciled": False, "journal_sha256": None, "rule": None, "why": None}
+
+    def no(why):
+        out["why"] = why
+        return out
+
+    data = _read_regular(journal_path, JOURNAL_MAX_BYTES)
+    if data is None:
+        return no("not a regular file owned by this user, or group/world writable, or oversized")
+    out["journal_sha256"] = hashlib.sha256(data).hexdigest()
+    lines = data.split(b"\n")
+    torn = lines.pop() != b""
+    records = []
+    for raw in lines:
+        try:
+            value = json.loads(raw)
+        except ValueError:
+            return no("a record is not valid JSON")
+        if not isinstance(value, dict) or not isinstance(value.get("event"), str):
+            return no("a record is not an event")
+        records.append(value)
+    if not records or records[0]["event"] != "begin":
+        return no("the journal does not start with a complete begin record")
+    begin = records[0]
+    pid = begin.get("pid")
+    if (not isinstance(begin.get("exec_id"), str) or not begin["exec_id"]
+            or begin.get("host") != os.uname().nodename):
+        return no("the execution identity is missing or belongs to another host")
+    if not isinstance(pid, int) or isinstance(pid, bool) or pid <= 0:
+        return no("the recorded executor pid is missing or invalid, so its liveness is unknown")
+    if [r.get("seq") for r in records] != list(range(1, len(records) + 1)):
+        return no("record sequence numbers are not contiguous")
+    if any(r["event"] in ("begin", "end") for r in records[1:]):
+        return no("the journal holds a second begin or an end record")
+    if _pid_is_executor(pid):
+        return no("the recorded executor is still running")
+    planned = set()
+    for record in records:
+        if record["event"] == "group_plan":
+            if not isinstance(record.get("directory"), str) or not isinstance(record.get("paths"), list):
+                return no("a group plan is malformed")
+            for item in record["paths"]:
+                if not isinstance(item, dict) or not isinstance(item.get("path"), str) or item["path"] in planned:
+                    return no("a planned path is missing or repeated")
+                planned.add(item["path"])
+    if not any(r["event"] in ("intent", "outcome") for r in records):
+        tail = records[1:-1] if records[-1]["event"] == "interrupted" and len(records) > 1 else records[1:]
+        if any(r["event"] != "group_plan" for r in tail):
+            return no("an unexpected record appears before any intent")
+        out.update(reconciled=True, rule="NO_UNLINK_STARTED", why=None)
+        return out
+    if torn:
+        return no("the final record is torn")
+    if records[-1]["event"] != "interrupted" or sum(r["event"] == "interrupted" for r in records) != 1:
+        return no("the run did not record its own interruption as its final record")
+    open_intent = None
+    closed = set()
+    for record in records[1:-1]:
+        event, path = record["event"], record.get("path")
+        if event == "group_plan":
+            if open_intent is not None:
+                return no("a group was planned while an entry was open")
+        elif event == "intent":
+            if not isinstance(path, str) or open_intent is not None or path not in planned or path in closed:
+                return no(f"intent for {path} is unplanned, repeated or overlaps another entry")
+            open_intent = path
+        elif event == "outcome":
+            if not isinstance(path, str) or path != open_intent:
+                return no(f"outcome for {path} has no matching open intent")
+            open_intent = None
+            closed.add(path)
+        else:
+            return no(f"unexpected {event} record before the interruption")
+    if open_intent is not None:
+        return no(f"{open_intent} has an intent but no recorded outcome; its extent is unknown")
+    states = {row["state"] for row in inspect_records(records, False)["entries"]}
+    if any(not state.startswith("KNOWN_") for state in states):
+        return no("an entry is not known from recorded outcomes: " + ", ".join(sorted(states)))
+    out.update(reconciled=True, rule="CLEAN_SELF_RECORDED_INTERRUPTION", why=None)
+    return out
+
+
+def journal_resolved(journal_path):
+    """True only for a well-formed receipt bound to the journal's current bytes.
+    Anything doubtful is False: the journal then keeps blocking (fail closed)."""
+    raw = _read_regular(resolution_path(journal_path), RESOLUTION_MAX_BYTES)
+    if raw is None:
+        return False
+    try:
+        receipt = json.loads(raw)
+    except ValueError:
+        return False
+    if not isinstance(receipt, dict):
+        return False
+    if receipt.get("schema") == LEGACY_RESOLUTION_SCHEMA:
+        # Written by the deployed 2026-10-21 resolver: same trust boundary, bound by name and digest.
+        digest = journal_sha256(journal_path)
+        return bool(isinstance(receipt.get("operator"), str) and receipt["operator"].strip()
+                    and receipt.get("host") == os.uname().nodename
+                    and isinstance(receipt.get("accepted_uncertain"), list)
+                    and receipt.get("journal") == os.path.basename(journal_path)
+                    and digest is not None and receipt.get("journal_sha256") == digest)
+    if receipt.get("schema") != RESOLUTION_SCHEMA:
+        return False
+    if receipt.get("journal_name") != os.path.basename(journal_path):
+        return False
+    if (not isinstance(receipt.get("accepted_uncertain"), list) or receipt.get("resolved_by_euid") != os.geteuid()
+            or not re.fullmatch(r"[0-9a-f]{64}", str(receipt.get("review_digest")))):
+        return False
+    # Same trust boundary as --acknowledge-incomplete-journals: code running as the cache
+    # owner could write a receipt by hand.  This only makes a forgery non-accidental.
+    digest = journal_sha256(journal_path)
+    return digest is not None and receipt.get("journal_sha256") == digest
+
+
+def _observed_identity(path):
+    try:
+        st = os.lstat(path)
+    except FileNotFoundError:
+        return "ABSENT"
+    except OSError as error:
+        return f"UNREADABLE:{error.errno}"
+    # ctime too: a recreated directory often reuses the inode number
+    return [st.st_dev, st.st_ino, st.st_mode, st.st_uid, st.st_ctime_ns]
+
+
+def _writer_may_be_running(journal_path):
+    """The recorded executor pid, if it is still an emuwiz-cargo-retire process."""
+    records, _ = read_journal(journal_path)
+    begin = next((r for r in records if r.get("event") == "begin"), None)
+    pid = (begin or {}).get("pid")
+    if not isinstance(pid, int) or pid <= 0:
+        return None
+    return _pid_is_executor(pid)
+
+
+def _pid_is_executor(pid):
+    try:
+        with open(f"/proc/{pid}/cmdline", "rb") as handle:
+            cmdline = handle.read()
+    except OSError:
+        return None
+    # maintain loads the executor in-process, so its pid is the writer too
+    return pid if (b"emuwiz-cargo-retire" in cmdline or b"emuwiz-cargo-maintain" in cmdline) else None
+
+
+def review_journal_resolution(journal_path, receipt_dir, locked=False):
+    """Fresh, read-only review.  Returns a dict with `blockers` (refusals that no
+    approval can override), `uncertain` (paths needing explicit per-path acceptance) and
+    `review_digest` (what an operator approves).  `locked` means the caller already holds
+    every target's lifecycle lock exclusively, so the lock probe is skipped."""
+    blockers = []
+    review = {"journal": journal_path, "blockers": blockers, "uncertain": [], "review_digest": None}
+    real_dir = os.path.realpath(receipt_dir)
+    try:
+        rst = os.lstat(real_dir)
+    except OSError as error:
+        blockers.append({"code": "RECEIPT_DIR_UNSAFE", "detail": f"{real_dir}: {error.strerror or error}"})
+        return review
+    if not stat.S_ISDIR(rst.st_mode) or rst.st_uid != os.geteuid() or rst.st_mode & 0o022:
+        blockers.append({"code": "RECEIPT_DIR_UNSAFE",
+                         "detail": f"{real_dir} must be a real directory owned by uid {os.geteuid()}, not group/world writable"})
+        return review
+    name = os.path.basename(journal_path)
+    if (os.path.realpath(os.path.dirname(os.path.abspath(journal_path))) != real_dir
+            or not name.endswith(JOURNAL_SUFFIX) or name != os.path.basename(os.path.realpath(journal_path))):
+        blockers.append({"code": "JOURNAL_NOT_IN_RECEIPT_DIR", "detail": journal_path})
+        return review
+    sha = journal_sha256(journal_path)
+    if sha is None:
+        blockers.append({"code": "JOURNAL_UNSAFE_OR_UNREADABLE",
+                         "detail": "must be a regular file owned by this user, not group/world writable"})
+        return review
+    review["journal_sha256"] = sha
+    if os.path.lexists(resolution_path(journal_path)):
+        review["already_resolved"] = journal_resolved(journal_path)
+        if not review["already_resolved"]:
+            blockers.append({"code": "RESOLUTION_RECEIPT_PRESENT_BUT_INVALID",
+                             "detail": resolution_path(journal_path) + " is kept; it is never overwritten"})
+        return review
+    info = inspect_journal(journal_path)
+    review["inspection"] = {k: info[k] for k in ("exec_id", "manifest_sha256", "summary", "complete",
+                                                    "interrupted_record", "torn_final_record")}
+    if info["complete"] and not info["torn_final_record"]:
+        blockers.append({"code": "JOURNAL_ALREADY_COMPLETE", "detail": "nothing to resolve"})
+        return review
+    if not info["exec_id"] or not any(r.get("event") == "group_plan" for r in read_journal(journal_path)[0]):
+        blockers.append({"code": "JOURNAL_HAS_NO_EXECUTION_IDENTITY", "detail": "no begin/exec_id or no group_plan"})
+        return review
+    pid = _writer_may_be_running(journal_path)
+    if pid:
+        blockers.append({"code": "JOURNAL_WRITER_MAY_BE_RUNNING", "detail": f"pid {pid} is an emuwiz-cargo-retire process"})
+    records, _ = read_journal(journal_path)
+    plans = [r for r in records if r.get("event") == "group_plan"]
+    directories = []
+    for plan in plans:
+        target = plan.get("directory")
+        if not isinstance(target, str) or not os.path.isabs(target) or os.path.normpath(target) != target:
+            blockers.append({"code": "TARGET_PATH_NOT_CANONICAL", "detail": str(target)})
+            continue
+        directories.append(target)
+        if path_has_symlink_component(target):
+            blockers.append({"code": "TARGET_PATH_HAS_SYMLINK", "detail": target})
+            continue
+        try:
+            st = os.lstat(target)
+        except FileNotFoundError:
+            continue  # gone: nothing left that a process could be using
+        except OSError as error:
+            blockers.append({"code": "TARGET_UNREADABLE", "detail": f"{target}: {error.strerror}"})
+            continue
+        if not stat.S_ISDIR(st.st_mode):
+            blockers.append({"code": "TARGET_NOT_A_DIRECTORY", "detail": target})
+        elif (st.st_dev, st.st_ino) != (plan.get("device"), plan.get("inode")):
+            blockers.append({"code": "DIRECTORY_IDENTITY_CHANGED", "detail": f"{target} is now {st.st_dev}:{st.st_ino}"})
+        if st.st_uid != os.geteuid():
+            blockers.append({"code": "FILESYSTEM_OWNER_MISMATCH", "detail": target})
+        if os.path.dirname(target) != F.target_root() or target == F.legacy_target():
+            blockers.append({"code": "SHARED_OR_EXTERNAL_TARGET", "detail": target})
+    registry = F.Registry(create=False)
+    for target in directories:
+        if not os.path.isdir(target):
+            continue
+        key = F.key_for(target)
+        state, record = registry.read_checked("targets", key, F.valid_target_record)
+        if state == "invalid":
+            blockers.append({"code": "REGISTRY_RECORD_INVALID", "detail": target})
+        if not locked and registry.probe_lock(key) is not False:
+            blockers.append({"code": "BUILD_LOCK_HELD_OR_UNKNOWN", "detail": target})
+        if record and any(e.get("boot_id") == F.boot_id() and F.proc_starttime(e.get("pid")) == e.get("starttime")
+                          for e in record.get("active", [])):
+            blockers.append({"code": "RECORDED_BUILD_ALIVE", "detail": target})
+        if registry.pin_state(key)[0] == "invalid":
+            blockers.append({"code": "PIN_STATE_UNKNOWN", "detail": target})
+    census = F.Census(directories)
+    review["process_census"] = {"examined": census.examined, "unreadable_foreign": census.unreadable_foreign}
+    if census.unreadable_foreign:
+        blockers.append({"code": "INCOMPLETE_PROCESS_VISIBILITY",
+                         "detail": f"{census.unreadable_foreign} process(es) of other users are not inspectable"})
+    for target in directories:
+        refs = census.refs.get(os.path.realpath(target), [])
+        if refs:
+            blockers.append({"code": "LIVE_PROCESS_REFERENCE",
+                             "detail": ", ".join(f"{r['comm']}[{r['pid']}] {r['kind']}" for r in refs[:5])})
+    entries = []
+    for row in info["entries"]:
+        entries.append([row["path"], row["state"], _observed_identity(row["path"]),
+                        row.get("files_remaining", row.get("files")), row.get("dirs_remaining", row.get("dirs"))])
+        if row["state"].startswith("UNCERTAIN"):
+            review["uncertain"].append(row["path"])
+            if row["state"] not in ACCEPTABLE_UNCERTAIN:
+                blockers.append({"code": "UNRESOLVABLE_ENTRY",
+                                 "detail": f"{row['path']} is {row['state']}: a person must investigate; it cannot be accepted"})
+    review["entries"] = entries
+    canonical = json.dumps({"journal_sha256": sha, "exec_id": info["exec_id"], "entries": entries,
+                            "groups": [[p.get("directory"), p.get("device"), p.get("inode")] for p in plans]},
+                           sort_keys=True, separators=(",", ":"))
+    review["review_digest"] = hashlib.sha256(canonical.encode()).hexdigest()
+    return review
+
+
+def resolve_journal(args):
+    """(exit status, report).  Without --approve-resolution this is review only."""
+    if not args.receipt_dir:
+        raise SystemExit("--resolve-journal requires --receipt-dir")
+    journal_path = os.path.abspath(args.resolve_journal)
+    with contextlib.ExitStack() as stack:
+        if args.approve_resolution:
+            locks_ok = _hold_lifecycle_locks(stack, journal_path)
+            if locks_ok is not True:
+                return 8, {"journal": journal_path, "outcome": "REFUSED", "uncertain": [],
+                           "blockers": [{"code": "BUILD_LOCK_HELD_OR_UNKNOWN", "detail": locks_ok}]}
+            return _resolve_locked(args, journal_path, locked=True)
+        return _resolve_locked(args, journal_path, locked=False)
+
+
+def _hold_lifecycle_locks(stack, journal_path):
+    """Exclusive, non-blocking lifecycle locks on every existing target of the journal, held
+    until `stack` closes (so no build can start between review and receipt).  True, or why not."""
+    try:
+        records, _ = read_journal(journal_path)
+        registry = F.Registry(create=False)
+        for directory in sorted({str(r.get("directory")) for r in records if r.get("event") == "group_plan"}):
+            if not os.path.isdir(directory):
+                continue
+            lock = registry.lifecycle_lock_path(F.key_for(directory))
+            if not os.path.lexists(lock):
+                continue
+            fd = F.open_lock_file(lock, os.O_RDWR)
+            stack.callback(os.close, fd)
+            F.fcntl.flock(fd, F.fcntl.LOCK_EX | F.fcntl.LOCK_NB)
+    except OSError as error:
+        return f"{error.strerror or error}"
+    return True
+
+
+def _resolve_locked(args, journal_path, locked):
+    review = review_journal_resolution(journal_path, args.receipt_dir, locked=locked)
+    if review.get("already_resolved"):
+        review["outcome"] = "ALREADY_RESOLVED"
+        return 0, review
+    if review["blockers"]:
+        review["outcome"] = "REFUSED"
+        return 8, review
+    if not args.approve_resolution:
+        review["outcome"] = "REVIEW_ONLY"
+        return 0, review
+    if args.approve_resolution != review["review_digest"]:
+        review["outcome"] = "REFUSED"
+        review["blockers"].append({"code": "APPROVAL_DIGEST_MISMATCH",
+                                   "detail": "the journal or filesystem differs from what was reviewed; review again"})
+        return 8, review
+    accepted = sorted(set(args.accept_uncertain or []))
+    if accepted != sorted(review["uncertain"]):
+        review["outcome"] = "REFUSED"
+        review["blockers"].append({
+            "code": "UNCERTAIN_ENTRIES_NOT_EXPLICITLY_ACCEPTED",
+            "detail": "every UNCERTAIN path must be named with --accept-uncertain, and no other path may be"})
+        return 8, review
+    if not (args.operator_note or "").strip():
+        review["outcome"] = "REFUSED"
+        review["blockers"].append({"code": "OPERATOR_NOTE_REQUIRED", "detail": "state why this journal is safe to resolve"})
+        return 8, review
+    if journal_sha256(journal_path) != review["journal_sha256"]:
+        review["outcome"] = "REFUSED"
+        review["blockers"].append({"code": "JOURNAL_CHANGED", "detail": "the journal changed during validation"})
+        return 8, review
+    receipt = {
+        "schema": RESOLUTION_SCHEMA,
+        "journal_name": os.path.basename(journal_path),
+        "journal_sha256": review["journal_sha256"],
+        "review_digest": review["review_digest"],
+        "exec_id": review["inspection"]["exec_id"],
+        "manifest_sha256": review["inspection"]["manifest_sha256"],
+        "summary": review["inspection"]["summary"],
+        "entries": review["entries"],
+        "accepted_uncertain": accepted,
+        "operator_note": args.operator_note.strip(),
+        "resolved_by_euid": os.geteuid(),
+        "host": os.uname().nodename,
+        "resolved_at": real_now(),
+        "process_census": review["process_census"],
+        "authority": "none: this deletes nothing and authorises no retirement; later executions still need a "
+                     "fresh approved manifest and pass every gate",
+    }
+    target = resolution_path(journal_path)
+    tmp = f"{target}.tmp-{os.getpid()}-{os.urandom(6).hex()}"
+    try:
+        fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW | os.O_CLOEXEC, 0o600)
+        try:
+            view = memoryview((json.dumps(receipt, indent=1, sort_keys=True) + "\n").encode())
+            while view:
+                view = view[os.write(fd, view):]
+            os.fsync(fd)
+        finally:
+            os.close(fd)
+        os.link(tmp, target, follow_symlinks=False)  # never replaces an existing receipt
+        fsync_dir(os.path.dirname(target))
+        if not journal_resolved(journal_path):
+            os.unlink(target)  # our own just-created receipt: it would not be honoured (e.g. oversize)
+            review["outcome"] = "REFUSED"
+            review["blockers"].append({"code": "RESOLUTION_RECEIPT_NOT_HONOURABLE",
+                                       "detail": "the written receipt failed verification and was removed"})
+            return 8, review
+    except FileExistsError:
+        review["outcome"] = "REFUSED"
+        review["blockers"].append({"code": "RESOLUTION_RECEIPT_PRESENT_BUT_INVALID", "detail": target})
+        return 8, review
+    except OSError as error:
+        review["outcome"] = "REFUSED"
+        review["blockers"].append({"code": "RESOLUTION_RECEIPT_UNAVAILABLE", "detail": error.strerror or str(error)})
+        return 8, review
+    finally:
+        with contextlib.suppress(OSError):
+            os.unlink(tmp)
+    review["outcome"] = "RESOLVED"
+    review["receipt"] = target
+    return 0, review
+
+
+def process_group(entry, registry, args, census, now_ts, execute, journal=None):
+    group = entry["group"]
+    target = group["directory"]
+    out = {
+        "directory": target, "key": None, "holds": [], "paths": [],
+        "paths_selected": 0, "paths_held": 0, "estimated_recoverable_bytes": 0,
+        "paths_individually_eligible": 0,
+        "accounted_freed_bytes": 0, "retained_hardlink_bytes": 0, "outcome": "HELD",
+        "paths_partial": 0, "files_removed": 0, "dirs_removed": 0,
+    }
+    lock_fd = None
+    fence = None
+    try:
+        if execute:
+            # Exclusive lifecycle lock BEFORE the final census: a wrapper-managed
+            # build starting now blocks on it instead of racing the deletion.
+            key = F.key_for(target)
+            # never through a symlink, and only a regular lock file of this user: the
+            # same file a cargo-iso build of this target can open
+            try:
+                lock_fd = F.open_lock_file(registry.lifecycle_lock_path(key), os.O_RDWR | os.O_CREAT)
+            except OSError as error:
+                out["holds"].append({"code": "LIFECYCLE_LOCK_UNAVAILABLE",
+                                     "detail": f"the lifecycle lock cannot be used safely: {error.strerror or error}"})
+                return hold_all(entry, out, "LIFECYCLE_LOCK_UNAVAILABLE")
+            try:
+                F.fcntl.flock(lock_fd, F.fcntl.LOCK_EX | F.fcntl.LOCK_NB)
+            except OSError:
+                os.close(lock_fd)
+                lock_fd = None
+                out["holds"].append({"code": "LIFECYCLE_LOCK_UNAVAILABLE", "detail": "a build holds the target"})
+                return hold_all(entry, out, "LIFECYCLE_LOCK_UNAVAILABLE")
+            # a fresh census once the lock is ours
+            fresh = F.Census([os.path.realpath(target)] + [os.path.realpath(s) for s in entry["sources"]])
+            census = fresh
+        holds, ctx = evaluate_group(entry, registry, args, census, now_ts, execute, own_lock=lock_fd is not None)
+        out["key"] = ctx.get("key")
+        if ctx.get("assumed"):
+            out["note"] = "ownership ASSUMED for this dry run; execution would hold on NOT_ADOPTED"
+        out["holds"] = holds
+        selected = []
+        for item in entry["paths"]:
+            expect = (item.get("device"), item.get("inode"), item.get("mode"))
+            reason, rel = evaluate_entry(item, group, expect)
+            if reason == "ALREADY_ABSENT":
+                out["paths"].append({"path": item["path"], "outcome": "ABSENT", "reason": reason})
+            elif reason:
+                out["paths"].append({"path": item["path"], "outcome": "HELD", "reason": reason})
+            elif holds:
+                out["paths"].append({"path": item["path"], "outcome": "HELD", "reason": holds[0]["code"],
+                                     "individually_eligible": True})
+            else:
+                out["paths"].append({"path": item["path"], "outcome": "SELECTED", "reason": ""})
+            if not reason:
+                selected.append((item, expect))
+        if selected:
+            est, retained = F.reclaim_estimate(
+                [{"path": i["path"], "type": "dir" if stat.S_ISDIR(e[2]) else "file"} for i, e in selected]
+            )
+            out["estimated_recoverable_bytes"] = est
+            out["retained_hardlink_bytes"] = retained
+        out["paths_individually_eligible"] = len(selected)
+        if execute and not holds:
+            chosen = []
+            by_path = {p["path"]: p for p in out["paths"]}
+            for item, expect in selected:
+                # the planned snapshot is taken under the exclusive lock, before any
+                # unlink: anything that appears later is "not planned" and is refused
+                try:
+                    snap, nfiles, ndirs = (
+                        snapshot_tree(item["path"]) if stat.S_ISDIR(expect[2]) else ({}, 1, 0)
+                    )
+                    incremental_files = None
+                    if os.path.basename(item["path"]) == "incremental":
+                        problem, incremental_files = F.incremental_evidence(item["path"])
+                        if problem or len(incremental_files) != nfiles or any(
+                            snap.get(key) != stamp[:2] for key, stamp in incremental_files.items()
+                        ):
+                            raise Refusal("INCREMENTAL_SNAPSHOT_CHANGED", problem or "file identities changed")
+                        incremental_files = IncrementalFiles(incremental_files)
+                except (OSError, Refusal) as error:
+                    by_path[item["path"]].update(outcome="HELD", reason="SNAPSHOT_FAILED", detail=str(error))
+                    continue
+                chosen.append((item, expect, snap, nfiles, ndirs + (1 if stat.S_ISDIR(expect[2]) else 0), incremental_files))
+            if chosen:
+                fence = RetirementFence(registry, key, target)
+                try:
+                    fence.reserve()
+                except (Refusal, OSError) as error:
+                    holds = [{"code": "RETIREMENT_FENCE_CHANGED", "detail": str(error)}]
+                else:
+                    fresh = F.Census([target] + entry["sources"])
+                    holds, final_ctx = evaluate_group(entry, registry, args, fresh, F.now(), True, own_lock=True)
+                if holds:
+                    out["holds"] = holds
+                    for path in out["paths"]:
+                        if path["outcome"] == "SELECTED":
+                            path.update(outcome="HELD", reason=holds[0]["code"])
+                else:
+                    execute_group(entry, chosen, out, journal, final_ctx["measured"]["identities"], fence.mutation)
+        out["paths_selected"] = sum(1 for p in out["paths"] if p["outcome"] in ("SELECTED", "REMOVED"))
+        out["paths_partial"] = sum(1 for p in out["paths"] if p["outcome"] == "PARTIAL")
+        out["paths_would_be_eligible_if_group_gates_pass"] = out["paths_individually_eligible"]
+        out["paths_held"] = sum(1 for p in out["paths"] if p["outcome"] in ("HELD", "REFUSED"))
+        removed = any(p["outcome"] in ("REMOVED", "PARTIAL") for p in out["paths"])
+        if out["holds"]:
+            out["outcome"] = "PARTIAL" if removed else "HELD"
+        elif execute:
+            if out.get("aborted"):
+                out["outcome"] = "ABORTED"
+            elif out["paths_partial"] or (removed and any(p["outcome"] == "REFUSED" for p in out["paths"])):
+                out["outcome"] = "PARTIAL"
+            else:
+                out["outcome"] = "RETIRED" if removed else "NOTHING_REMOVED"
+        else:
+            out["outcome"] = "WOULD_RETIRE" if selected else "NOTHING_SELECTED"
+        return out
+    except BaseException as error:
+        # keep what was accounted so far: an interrupted group is still reported
+        out["outcome"] = "INTERRUPTED"
+        out["paths_partial"] = sum(1 for p in out["paths"] if p["outcome"] == "PARTIAL")
+        out["paths_selected"] = sum(1 for p in out["paths"] if p["outcome"] in ("SELECTED", "REMOVED"))
+        out["paths_held"] = sum(1 for p in out["paths"] if p["outcome"] in ("HELD", "REFUSED"))
+        error.partial_group = out
+        raise
+    finally:
+        try:
+            if fence is not None:
+                fence.close()
+        finally:
+            if lock_fd is not None:
+                os.close(lock_fd)
+
+
+def hold_all(entry, out, code):
+    for item in entry["paths"]:
+        out["paths"].append({"path": item["path"], "outcome": "HELD", "reason": code})
+    out["paths_held"] = len(out["paths"])
+    return out
+
+
+def execute_group(entry, selected, out, journal, identities=None, mutation_guard=None):
+    group = entry["group"]
+    target = group["directory"]
+    counters = Counters()
+    by_path = {p["path"]: p for p in out["paths"]}
+
+    def refuse_all(code, detail):
+        out["holds"].append({"code": code, "detail": detail})
+        for p in out["paths"]:
+            if p["outcome"] == "SELECTED":
+                p.update(outcome="REFUSED", reason=code)
+
+    try:
+        root_fd = open_dir_nofollow(target)
+    except Refusal as refusal:
+        refuse_all(refusal.code, refusal.detail)
+        return
+    try:
+        rst = os.fstat(root_fd)
+        if (rst.st_dev, rst.st_ino) != (group.get("device"), group.get("inode")):
+            refuse_all("DIRECTORY_IDENTITY_CHANGED", "after opening")
+            return
+        before = statvfs_free(target)
+        hook("after-open-target")
+        for index, (item, expect, snap, nfiles, ndirs, incremental_files) in enumerate(selected):
+            record = by_path[item["path"]]
+            rel = os.path.relpath(item["path"], target).split("/")
+            hook("before-entry:" + item["path"])
+            # Selection/snapshot may take time: recheck live use at mutation boundary.
+            fresh = F.Census([target] + entry["sources"])
+            fresh.match_inodes(identities or set(), target)
+            refs = any(fresh.refs.values())
+            mounts = F.mountinfo()
+            code = ("INCOMPLETE_PROCESS_VISIBILITY" if fresh.unreadable_foreign else
+                    "LIVE_PROCESS_REFERENCE" if refs else
+                    "MOUNT_VISIBILITY_UNKNOWN" if not mounts else
+                    "CONTAINS_MOUNT_POINT" if any(m == target or m.startswith(target + "/") for m, _ in mounts) else None)
+            if code:
+                refuse_all(code, "fresh deletion-boundary safety check refused: " + str(fresh.refs))
+                break
+            known_pids = set(fresh.pids_seen)
+            full_at = time.monotonic()
+
+            def process_guard(check_only=False):
+                nonlocal known_pids, full_at
+                try:
+                    current = {int(p) for p in os.listdir("/proc") if p.isdigit()}
+                except OSError as error:
+                    raise Refusal("INCOMPLETE_PROCESS_VISIBILITY", str(error)) from error
+                stale = time.monotonic() - full_at >= FULL_CENSUS_INTERVAL
+                if not stale and not current - known_pids:
+                    return True
+                if check_only:
+                    return False
+                # Between full censuses only PIDs not yet inspected are examined: a full
+                # census before every unlink made retirement crawl at a few files per
+                # second on a busy host.  The root listing inside Census decides what is
+                # new, and a full census still runs at least every FULL_CENSUS_INTERVAL so
+                # already-seen processes that later touch the target are caught too.
+                latest = F.Census([target] + entry["sources"], skip_pids=None if stale else known_pids)
+                latest.match_inodes(identities or set(), target)
+                known_pids = set(latest.pids_seen)
+                if stale:
+                    full_at = time.monotonic()
+                code = ("INCOMPLETE_PROCESS_VISIBILITY" if latest.unreadable_foreign else
+                        "LIVE_PROCESS_REFERENCE" if any(latest.refs.values()) else None)
+                if code:
+                    detail = "new process before unlink: " + str(latest.refs)
+                    out["holds"].append({"code": code, "detail": detail})
+                    raise Refusal(code, detail)
+                return True
+
+            one = Counters()
+            parent_fd = None
+            started = False
+            try:
+                # walk the parent chain from the already-open, identity-checked root
+                parent_fd = os.dup(root_fd)
+                for part in rel[:-1]:
+                    nxt = os.open(part, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW, dir_fd=parent_fd)
+                    os.close(parent_fd)
+                    parent_fd = nxt
+                # the open root must still be what the path names
+                try:
+                    now_st = os.lstat(target)
+                except OSError:
+                    raise Refusal("DIRECTORY_IDENTITY_CHANGED", "target path vanished")
+                if (now_st.st_dev, now_st.st_ino) != (rst.st_dev, rst.st_ino):
+                    raise Refusal("DIRECTORY_IDENTITY_CHANGED", "target path was rebound")
+                # Durable intent BEFORE the first unlink of this entry.  If it cannot
+                # be published nothing is removed and the run stops.
+                if journal is not None:
+                    try:
+                        journal.write({"event": "intent", "path": item["path"], "device": expect[0],
+                                       "inode": expect[1], "mode": expect[2],
+                                       "files": nfiles, "dirs": ndirs})
+                    except OSError as error:
+                        raise JournalError(f"intent: {error.strerror or error}") from error
+                started = True
+                remove_entry(parent_fd, rel[-1], expect, rst.st_dev, one, snap=snap, approved_path=item["path"], process_guard=process_guard, live_identities=identities, mutation_guard=mutation_guard, incremental_files=incremental_files)
+                outcome, reason, detail = "REMOVED", "", ""
+            except Refusal as refusal:
+                outcome, reason, detail = "REFUSED", refusal.code, refusal.detail
+            except JournalError as error:
+                record.update(outcome="REFUSED", reason="JOURNAL_WRITE_FAILED", detail=str(error))
+                out["aborted"] = "JOURNAL_WRITE_FAILED"
+                break
+            except OSError as error:
+                outcome, reason, detail = "REFUSED", "OS_ERROR", f"{error.strerror}"
+            except BaseException as error:  # KeyboardInterrupt / Interrupted / crash
+                progress = one.files + one.dirs
+                record.update(outcome="PARTIAL" if progress else "INTERRUPTED", reason=type(error).__name__,
+                              files=one.files, dirs=one.dirs, freed_bytes=one.freed)
+                counters.freed += one.freed
+                counters.retained += one.retained
+                counters.files += one.files
+                counters.dirs += one.dirs
+                if journal is not None and started:
+                    try:
+                        journal.write({"event": "outcome", "path": item["path"], "outcome": record["outcome"],
+                                       "reason": record["reason"], "files": one.files, "dirs": one.dirs,
+                                       "freed": one.freed, "interrupted": True})
+                    except OSError:
+                        pass
+                out["accounted_freed_bytes"] = counters.freed
+                out["retained_hardlink_bytes"] = counters.retained
+                out["files_removed"], out["dirs_removed"] = counters.files, counters.dirs
+                raise
+            finally:
+                if parent_fd is not None:
+                    os.close(parent_fd)
+            progress = one.files + one.dirs
+            if outcome == "REFUSED" and progress:
+                outcome = "PARTIAL"  # some artifacts were removed before the refusal
+            counters.freed += one.freed
+            counters.retained += one.retained
+            counters.files += one.files
+            counters.dirs += one.dirs
+            record.update(outcome=outcome, reason=reason, files=one.files, dirs=one.dirs,
+                          freed_bytes=one.freed, retained_bytes=one.retained)
+            if detail:
+                record["detail"] = detail
+            if journal is not None and started:
+                try:
+                    journal.write({"event": "outcome", "path": item["path"], "outcome": outcome,
+                                   "reason": reason, "files": one.files, "dirs": one.dirs,
+                                   "freed": one.freed, "retained": one.retained})
+                except OSError as error:
+                    # the unlink happened but could not be recorded: stop mutating
+                    out["aborted"] = "JOURNAL_WRITE_FAILED"
+                    record["journal_error"] = f"outcome not recorded: {error.strerror or error}"
+                    break
+            if reason == "RETIREMENT_FENCE_CHANGED":
+                out["holds"].append({"code": reason, "detail": detail})
+                for remaining in out["paths"]:
+                    if remaining["outcome"] == "SELECTED":
+                        remaining.update(outcome="HELD", reason=reason)
+                break  # revocation permanently ends this group's reservation
+        if out.get("aborted"):
+            for p in out["paths"]:
+                if p["outcome"] == "SELECTED":
+                    p.update(outcome="HELD", reason="RUN_ABORTED_" + out["aborted"])
+        after = statvfs_free(target)
+        out["accounted_freed_bytes"] = counters.freed
+        out["retained_hardlink_bytes"] = counters.retained
+        out["files_removed"], out["dirs_removed"] = counters.files, counters.dirs
+        out["filesystem_free_before"] = before
+        out["filesystem_free_after"] = after
+    finally:
+        # always leave the group accounting current, including on interruption
+        out["accounted_freed_bytes"] = counters.freed
+        out["retained_hardlink_bytes"] = counters.retained
+        out["files_removed"], out["dirs_removed"] = counters.files, counters.dirs
+        os.close(root_fd)
+
+
+def statvfs_free(path):
+    try:
+        v = os.statvfs(path)
+        return v.f_bavail * v.f_frsize
+    except OSError:
+        return None
+
+
+def finish(args, receipt):
+    text = json.dumps(receipt, indent=1, sort_keys=True)
+    # A receipt directory inside a cache is refused: never write the refusal there.
+    inside = (receipt.get("refused") or {}).get("code") == "RECEIPT_DIR_INSIDE_CACHE"
+    if args.receipt_dir and not inside:
+        os.makedirs(args.receipt_dir, mode=0o700, exist_ok=True)
+        name = "retire-%s-%s.json" % ("execute" if args.execute else "dryrun", time.strftime("%Y%m%dT%H%M%S"))
+        F.atomic_write(os.path.join(args.receipt_dir, name), receipt)
+        fsync_dir(args.receipt_dir)
+        receipt["receipt_file"] = os.path.join(args.receipt_dir, name)
+    if args.json:
+        print(json.dumps(receipt, indent=1, sort_keys=True))
+        return
+    t = receipt.get("totals", {})
+    print(receipt["mode"])
+    if receipt.get("refused"):
+        print(f"REFUSED: {receipt['refused']['code']}: {receipt['refused']['detail']}")
+        return
+    print(f"  manifest sha256 {receipt['manifest_sha256']}")
+    print(f"  census: {receipt['process_census']['examined']} processes examined; "
+          f"{receipt['process_census']['unreadable_foreign']} of other users not inspectable")
+    for g in receipt["groups"]:
+        codes = sorted({h['code'] for h in g["holds"]})
+        print(f"  {g['outcome']:<14} {os.path.basename(g['directory'])}: "
+              f"{g['paths_selected']} selected, {g['paths_held']} held"
+              + (f"  [{','.join(codes)}]" if codes else "")
+              + (f"  ~{g['estimated_recoverable_bytes'] / 1e9:.2f} GB" if g["estimated_recoverable_bytes"] else ""))
+    print(f"  paths: {t.get('paths_selected', 0)} selected, {t.get('paths_held', 0)} held of {t.get('paths_in_manifest', 0)}")
+    print(f"  individually eligible paths (if every cache-level gate passed): "
+          f"{t.get('paths_individually_eligible', 0)}, about "
+          f"{t.get('estimated_recoverable_if_group_gates_pass', 0) / 1e9:.2f} GB")
+    print(f"  actually freed (accounted) {t.get('accounted_freed_bytes', 0) / 1e9:.2f} GB")
+    if receipt.get("receipt_file"):
+        print(f"  receipt: {receipt['receipt_file']}")
+
+
+def enter_privileged(as_user):
+    """Started as root: become the owner for every file operation (see the foundation's
+    drop_to_owner).  Started unprivileged: --as-user, if given, must name this user."""
+    if os.geteuid() != 0:
+        if as_user is not None:
+            import pwd
+            if pwd.getpwuid(os.geteuid()).pw_name != as_user:
+                raise SystemExit(f"--as-user {as_user}: only root can act for another user")
+        return
+    if not as_user:
+        raise SystemExit("running as root requires --as-user OWNER (the account that owns the caches and registry)")
+    if os.environ.get("EMUWIZ_RETENTION_NOW"):
+        raise SystemExit("a privileged run refuses EMUWIZ_RETENTION_NOW: it needs real time")
+    pw = F.drop_to_owner(as_user)
+    F.require_owned_dirs(pw.pw_uid, [F.registry_dir()])
+
+
+def main(argv=None):
+    p = argparse.ArgumentParser(prog="emuwiz-cargo-retire", description=__doc__.split("\n\n")[0])
+    p.add_argument("--manifest")
+    p.add_argument("--approved-sha256", help="digest of the manifest you approved")
+    p.add_argument("--inspect-journal", metavar="FILE",
+                   help="read-only: classify an execution journal against the filesystem and exit")
+    p.add_argument("--resolve-journal", metavar="FILE",
+                   help="review an incomplete journal (needs --receipt-dir); with --approve-resolution write an "
+                        "auditable resolution receipt. Deletes nothing and authorises no retirement")
+    p.add_argument("--approve-resolution", metavar="DIGEST", help="the review_digest you reviewed")
+    p.add_argument("--accept-uncertain", metavar="PATH", action="append",
+                   help="explicitly accept one UNCERTAIN entry (repeat; must name exactly the uncertain set)")
+    p.add_argument("--operator-note", help="why this journal is safe to resolve (recorded in the receipt)")
+    p.add_argument("--acknowledge-incomplete-journals", action="store_true",
+                   help="allow --execute although earlier incomplete journals exist (they are kept)")
+    p.add_argument("--execute", action="store_true", help="actually delete (default is a dry run)")
+    p.add_argument("--receipt-dir", help="where the receipt JSON goes (required with --execute)")
+    p.add_argument("--maintenance-window-attested", action="store_true",
+                   help="you attest no non-cargo-iso build can write these targets right now")
+    p.add_argument("--assume-adopted", action="store_true",
+                   help="DRY RUN ONLY: pretend verified ownership exists, to size the remaining holds")
+    p.add_argument("--min-idle-hours", type=float, default=F.MIN_IDLE_HOURS)
+    p.add_argument("--json", action="store_true")
+    p.add_argument("--as-user", metavar="OWNER",
+                   help="required when started as root: do all file work as OWNER (root is kept only for the process census)")
+    args = p.parse_args(argv)
+    enter_privileged(args.as_user)
+    if args.inspect_journal:
+        print(json.dumps(inspect_journal(args.inspect_journal), indent=1, sort_keys=True))
+        return 0
+    if args.resolve_journal:
+        status, report = resolve_journal(args)
+        print(json.dumps(report, indent=1, sort_keys=True))
+        return status
+    if not args.manifest or not args.approved_sha256:
+        p.error("--manifest and --approved-sha256 are required")
+    return run(args)
+
+
+if __name__ == "__main__":
+    sys.exit(main())

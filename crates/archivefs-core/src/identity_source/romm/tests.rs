@@ -8,8 +8,10 @@
 use super::capability::*;
 use super::client::*;
 use super::config::*;
+use super::import::source_fingerprint;
 use crate::identity_source::net_policy::StaticResolver;
-use crate::identity_source::path_map::ProviderPathKind;
+use crate::identity_source::path_map::{PathMapping, ProviderPathKind};
+use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
 
 // --- Fixtures -------------------------------------------------------------
@@ -92,6 +94,10 @@ struct FakeRomm {
     seen_urls: std::sync::Mutex<Vec<String>>,
     /// A body larger than the ceiling, for the oversized case.
     oversized: bool,
+    /// The `timeout` argument every call was given, in call order - so a test
+    /// can prove which requests asked for the tight default and which asked
+    /// for the longer detail-request allowance.
+    seen_timeouts: std::sync::Mutex<Vec<std::time::Duration>>,
 }
 
 impl FakeRomm {
@@ -125,6 +131,10 @@ impl FakeRomm {
     fn urls(&self) -> Vec<String> {
         self.seen_urls.lock().expect("lock").clone()
     }
+
+    fn timeouts(&self) -> Vec<std::time::Duration> {
+        self.seen_timeouts.lock().expect("lock").clone()
+    }
 }
 
 impl RommTransport for FakeRomm {
@@ -133,12 +143,14 @@ impl RommTransport for FakeRomm {
         url: &str,
         authorization: Option<&str>,
         max_bytes: usize,
+        timeout: std::time::Duration,
     ) -> Result<RommHttpResponse, RommRequestError> {
         self.seen_authorization
             .lock()
             .expect("lock")
             .push(authorization.map(str::to_string));
         self.seen_urls.lock().expect("lock").push(url.to_string());
+        self.seen_timeouts.lock().expect("lock").push(timeout);
 
         if self.oversized {
             return Err(RommRequestError::ResponseTooLarge { limit: max_bytes });
@@ -169,11 +181,145 @@ fn source() -> ValidatedRommSource {
         enabled: true,
         url: "http://172.19.0.20:8080".to_string(),
         mappings: Vec::new(),
+        media_mapping: None,
         provider_path_kind: ProviderPathKind::AbsoluteProviderPath,
         token_path: None,
     };
     ValidatedRommSource::validate(&config, &token(), &[], &StaticResolver::new())
         .expect("this configuration should validate")
+}
+
+/// Same as [`source`] but with an explicit, already-normalised set of path
+/// mappings - used by the source-fingerprint tests below, which need to
+/// vary the mapping set (including its aliases) between two otherwise
+/// identical sources.
+fn source_with_mappings(mappings: Vec<PathMapping>) -> ValidatedRommSource {
+    let config = RommSourceConfig {
+        enabled: true,
+        url: "http://172.19.0.20:8080".to_string(),
+        mappings,
+        media_mapping: None,
+        provider_path_kind: ProviderPathKind::ProviderRelative,
+        token_path: None,
+    };
+    ValidatedRommSource::validate(&config, &token(), &[], &StaticResolver::new())
+        .expect("this configuration should validate")
+}
+
+fn gcn_mapping(aliases: Vec<&str>) -> PathMapping {
+    PathMapping {
+        provider_prefix: "roms/gcn".to_string(),
+        archivefs_prefix: PathBuf::from("/mnt/usbdrive/games/ngc"),
+        provider_aliases: aliases.into_iter().map(str::to_string).collect(),
+    }
+}
+
+// --- ScummVM-style provider-alias fingerprint safety -----------------------
+//
+// Runtime `PathMappings` translation already treats a provider alias as
+// equivalent to its canonical prefix (see `path_map.rs`), so the source
+// fingerprint - which exists to decide whether previously-imported/cached
+// state is still current - must change whenever the alias *set* changes,
+// and must never change for a merely-reordered but otherwise identical set.
+// The four real alias groups this was found against:
+// amiga-cd32/amigacd32, atarijaguar/jaguar, gcn/ngc, ps/psx.
+
+#[test]
+fn fingerprint_changes_when_a_provider_alias_is_added() {
+    let without_alias = source_with_mappings(vec![gcn_mapping(vec![])]);
+    let with_alias = source_with_mappings(vec![gcn_mapping(vec!["roms/ngc"])]);
+    assert_ne!(
+        source_fingerprint(&without_alias),
+        source_fingerprint(&with_alias),
+        "adding the ngc alias must invalidate any fingerprint taken before it existed"
+    );
+}
+
+#[test]
+fn fingerprint_changes_when_a_provider_alias_is_removed() {
+    let with_alias = source_with_mappings(vec![gcn_mapping(vec!["roms/ngc"])]);
+    let without_alias = source_with_mappings(vec![gcn_mapping(vec![])]);
+    assert_ne!(
+        source_fingerprint(&with_alias),
+        source_fingerprint(&without_alias)
+    );
+}
+
+#[test]
+fn fingerprint_is_stable_for_an_unchanged_mapping() {
+    let first = source_with_mappings(vec![gcn_mapping(vec!["roms/ngc"])]);
+    let second = source_with_mappings(vec![gcn_mapping(vec!["roms/ngc"])]);
+    assert_eq!(
+        source_fingerprint(&first),
+        source_fingerprint(&second),
+        "two sources built from the identical configuration must fingerprint identically"
+    );
+}
+
+#[test]
+fn fingerprint_is_independent_of_alias_declaration_order() {
+    let mapping_a = PathMapping {
+        provider_prefix: "roms/scummvm".to_string(),
+        archivefs_prefix: PathBuf::from("/mnt/usbdrive/games/scummvm"),
+        provider_aliases: vec!["roms/scumm".to_string(), "roms/sci".to_string()],
+    };
+    let mapping_b = PathMapping {
+        provider_prefix: "roms/scummvm".to_string(),
+        archivefs_prefix: PathBuf::from("/mnt/usbdrive/games/scummvm"),
+        provider_aliases: vec!["roms/sci".to_string(), "roms/scumm".to_string()],
+    };
+    let first = source_with_mappings(vec![mapping_a]);
+    let second = source_with_mappings(vec![mapping_b]);
+    assert_eq!(
+        source_fingerprint(&first),
+        source_fingerprint(&second),
+        "the same alias set declared in a different order is the same configuration"
+    );
+}
+
+#[test]
+fn fingerprint_changes_across_all_four_real_alias_groups() {
+    let groups: [(&str, &str, &str); 4] = [
+        (
+            "roms/amiga-cd32",
+            "roms/amigacd32",
+            "/mnt/usbdrive/games/amiga-cd32",
+        ),
+        (
+            "roms/atarijaguar",
+            "roms/jaguar",
+            "/mnt/usbdrive/games/atarijaguar",
+        ),
+        ("roms/gcn", "roms/ngc", "/mnt/usbdrive/games/gcn"),
+        ("roms/ps", "roms/psx", "/mnt/usbdrive/games/ps"),
+    ];
+    for (primary, alias, destination) in groups {
+        let without_alias = source_with_mappings(vec![PathMapping {
+            provider_prefix: primary.to_string(),
+            archivefs_prefix: PathBuf::from(destination),
+            provider_aliases: vec![],
+        }]);
+        let with_alias = source_with_mappings(vec![PathMapping {
+            provider_prefix: primary.to_string(),
+            archivefs_prefix: PathBuf::from(destination),
+            provider_aliases: vec![alias.to_string()],
+        }]);
+        assert_ne!(
+            source_fingerprint(&without_alias),
+            source_fingerprint(&with_alias),
+            "{primary}/{alias}: registering the alias must change the fingerprint"
+        );
+        let with_alias_again = source_with_mappings(vec![PathMapping {
+            provider_prefix: primary.to_string(),
+            archivefs_prefix: PathBuf::from(destination),
+            provider_aliases: vec![alias.to_string()],
+        }]);
+        assert_eq!(
+            source_fingerprint(&with_alias),
+            source_fingerprint(&with_alias_again),
+            "{primary}/{alias}: the same alias mapping must be stable across rebuilds"
+        );
+    }
 }
 
 // --- Token handling -------------------------------------------------------
@@ -218,6 +364,7 @@ fn the_token_reaches_the_header_and_nowhere_else() {
         enabled: true,
         url: "http://127.0.0.1:8080".to_string(),
         mappings: Vec::new(),
+        media_mapping: None,
         provider_path_kind: ProviderPathKind::AbsoluteProviderPath,
         token_path: Some(std::path::PathBuf::from("/tmp/x")),
     };
@@ -658,6 +805,7 @@ fn a_configuration_is_validated_as_a_whole() {
         enabled: true,
         url: "http://8.8.8.8:8080".to_string(),
         mappings: Vec::new(),
+        media_mapping: None,
         provider_path_kind: ProviderPathKind::AbsoluteProviderPath,
         token_path: None,
     };
@@ -673,7 +821,9 @@ fn a_configuration_is_validated_as_a_whole() {
         mappings: vec![crate::identity_source::path_map::PathMapping {
             provider_prefix: "/romm/library".to_string(),
             archivefs_prefix: std::path::PathBuf::from("/etc"),
+            provider_aliases: Vec::new(),
         }],
+        media_mapping: None,
         provider_path_kind: ProviderPathKind::AbsoluteProviderPath,
         token_path: None,
     };
@@ -819,4 +969,454 @@ fn the_verified_real_instance_contract_is_recorded() {
         parsed.major_version().expect("a major") >= MINIMUM_SUPPORTED_MAJOR,
         "the verified instance must satisfy the adapter's own minimum"
     );
+}
+
+// --- Per-request timeout: normal vs. detail (2026-08-22) -------------------
+//
+// A live RomM 5.2.0 instance's one pathological record (28,831 files, id
+// 43030) was measured taking 22s, 25s and 187s across three real samples -
+// well past the 30-second `REQUEST_TIMEOUT` every other request uses, which
+// is why a real full import was seeing "RomM did not answer in time" for
+// exactly this record's page. These tests pin that a ROM page asked for
+// *with* file detail gets the longer, still-bounded allowance, and that
+// every other request - including a ROM page *without* file detail - keeps
+// the tight default.
+
+#[test]
+fn a_rom_page_with_file_detail_is_given_the_longer_detail_timeout() {
+    let fake = FakeRomm::healthy();
+    let source = source();
+    let client = RommClient::new(&source, &fake);
+    client
+        .roms_page_detail(50, 0, true, None)
+        .expect("a page with file detail");
+    assert_eq!(
+        fake.timeouts(),
+        vec![DETAIL_REQUEST_TIMEOUT],
+        "a request carrying with_files=true must use the longer timeout"
+    );
+}
+
+#[test]
+fn a_rom_page_without_file_detail_keeps_the_normal_timeout() {
+    let fake = FakeRomm::healthy();
+    let source = source();
+    let client = RommClient::new(&source, &fake);
+    client
+        .roms_page_detail(50, 0, false, None)
+        .expect("a page without file detail");
+    assert_eq!(
+        fake.timeouts(),
+        vec![REQUEST_TIMEOUT],
+        "a request without file detail is never the slow shape, so it keeps \
+         the tight default"
+    );
+}
+
+#[test]
+fn every_other_endpoint_keeps_the_normal_timeout() {
+    let fake = FakeRomm::healthy();
+    let source = source();
+    let client = RommClient::new(&source, &fake);
+    client.heartbeat(None).expect("heartbeat");
+    client.api_capability(None).expect("capability");
+    client.platforms(None).expect("platforms");
+    assert_eq!(
+        fake.timeouts(),
+        vec![REQUEST_TIMEOUT, REQUEST_TIMEOUT, REQUEST_TIMEOUT],
+        "heartbeat, capability and platforms are not the pathological shape \
+         and must not silently inherit the longer allowance"
+    );
+}
+
+#[test]
+fn the_detail_timeout_is_a_real_bound_not_an_unlimited_wait() {
+    // Item 3's explicit requirement: no "unlimited" timeout anywhere.
+    assert!(DETAIL_REQUEST_TIMEOUT > REQUEST_TIMEOUT);
+    assert!(DETAIL_REQUEST_TIMEOUT < std::time::Duration::from_secs(3600));
+}
+
+// --- Optional local-media mapping degradation (regression for 71bdb29) --------
+//
+// `ValidatedRommSource::validate` treats the optional `media_mapping` as
+// best-effort: a mapping that no longer validates (root gone, root replaced by a
+// file, symlinked root, unsafe provider prefix, non-absolute root) is dropped
+// for that validation cycle so the RomM HTTP/cache source stays usable, while a
+// broken *required* setting still fails the whole validation. The caller's
+// persisted `RommSourceConfig` is never rewritten. These tests pin that
+// configuration contract; the artwork-side consequence (`media_mapping()` ==
+// `None` -> local reuse skipped -> existing HTTP/cache fallback) is already
+// covered by `identity_source::artwork::tests` and is not repeated here.
+
+use crate::identity_source::romm::media_mapping::{RommMediaMapping, RommMediaMappingError};
+
+const DEGRADATION_MEDIA_PREFIX: &str = "/assets/romm/resources";
+
+/// A RomM config whose every *required* part is good (a validating loopback
+/// endpoint, no ROM mappings), carrying the given optional media mapping - so
+/// only the mapping is ever in question.
+fn config_with_media_mapping(media_mapping: Option<RommMediaMapping>) -> RommSourceConfig {
+    RommSourceConfig {
+        enabled: true,
+        url: "http://127.0.0.1:8080".to_string(),
+        mappings: Vec::new(),
+        media_mapping,
+        provider_path_kind: ProviderPathKind::AbsoluteProviderPath,
+        token_path: None,
+    }
+}
+
+fn validate_source(config: &RommSourceConfig) -> Result<ValidatedRommSource, ConfigRefusal> {
+    ValidatedRommSource::validate(config, &token(), &[], &StaticResolver::new())
+}
+
+/// 1. A valid mapping is kept, and the retained root is the canonical form of
+///    the configured root.
+#[test]
+fn a_valid_media_mapping_is_kept_and_canonicalised() {
+    let root = tempfile::tempdir().expect("tempdir");
+    std::fs::write(root.path().join("cover.png"), b"png").unwrap();
+    let config = config_with_media_mapping(Some(RommMediaMapping {
+        provider_prefix: DEGRADATION_MEDIA_PREFIX.to_string(),
+        local_root: root.path().to_path_buf(),
+    }));
+
+    let source =
+        validate_source(&config).expect("a valid optional mapping must not block validation");
+    let mapping = source.media_mapping().expect("a valid mapping is kept");
+    assert_eq!(mapping.provider_prefix(), DEGRADATION_MEDIA_PREFIX);
+    assert_eq!(
+        mapping.local_root(),
+        std::fs::canonicalize(root.path()).unwrap(),
+        "the kept root is the canonical form of the configured root"
+    );
+    assert_eq!(source.server_id(), "http://127.0.0.1:8080");
+}
+
+/// 2. A configured root that does not exist disables reuse but leaves the
+///    source - endpoint, token, server id - fully usable.
+#[test]
+fn a_missing_media_root_disables_reuse_but_keeps_the_source() {
+    let parent = tempfile::tempdir().expect("tempdir");
+    let absent = parent.path().join("not-mounted-yet");
+    assert!(!absent.exists());
+    let config = config_with_media_mapping(Some(RommMediaMapping {
+        provider_prefix: DEGRADATION_MEDIA_PREFIX.to_string(),
+        local_root: absent,
+    }));
+
+    let source =
+        validate_source(&config).expect("a missing optional media root must not fail the source");
+    assert!(
+        source.media_mapping().is_none(),
+        "reuse is disabled while the root is absent"
+    );
+    assert_eq!(source.server_id(), "http://127.0.0.1:8080");
+    let _ = source.endpoint();
+    let _ = source.token();
+}
+
+/// 3. A configured root that is a regular file, not a directory, is never
+///    trusted as a media root; the source still validates.
+#[test]
+fn a_media_root_that_is_a_regular_file_is_never_trusted() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let file_root = dir.path().join("root-is-a-file");
+    std::fs::write(&file_root, b"not a directory").unwrap();
+    // The primitive itself refuses it (a file is not a media root).
+    assert!(matches!(
+        crate::identity_source::romm::media_mapping::validate_romm_media_mapping(
+            &RommMediaMapping {
+                provider_prefix: DEGRADATION_MEDIA_PREFIX.to_string(),
+                local_root: file_root.clone(),
+            }
+        ),
+        Err(RommMediaMappingError::RootUnavailable(_))
+    ));
+
+    let source = validate_source(&config_with_media_mapping(Some(RommMediaMapping {
+        provider_prefix: DEGRADATION_MEDIA_PREFIX.to_string(),
+        local_root: file_root,
+    })))
+    .expect("a file where a media root should be must not fail the source");
+    assert!(source.media_mapping().is_none());
+}
+
+/// 4. A symlinked root is dropped, never followed or trusted; the source still
+///    validates.
+#[cfg(unix)]
+#[test]
+fn a_symlinked_media_root_is_never_trusted() {
+    let real = tempfile::tempdir().expect("tempdir");
+    let parent = tempfile::tempdir().expect("tempdir");
+    let link = parent.path().join("root-link");
+    std::os::unix::fs::symlink(real.path(), &link).unwrap();
+    assert!(matches!(
+        crate::identity_source::romm::media_mapping::validate_romm_media_mapping(
+            &RommMediaMapping {
+                provider_prefix: DEGRADATION_MEDIA_PREFIX.to_string(),
+                local_root: link.clone(),
+            }
+        ),
+        Err(RommMediaMappingError::RootIsSymlink(_))
+    ));
+
+    let source = validate_source(&config_with_media_mapping(Some(RommMediaMapping {
+        provider_prefix: DEGRADATION_MEDIA_PREFIX.to_string(),
+        local_root: link,
+    })))
+    .expect("a symlinked media root must not fail the source");
+    assert!(
+        source.media_mapping().is_none(),
+        "a symlinked root is dropped, not trusted"
+    );
+}
+
+/// 5. Representative unsafe provider prefixes (traversal, malformed separator)
+///    disable reuse without failing the source. The exhaustive parser cases
+///    live in `media_mapping.rs`.
+#[test]
+fn an_unsafe_provider_prefix_disables_reuse_without_failing_the_source() {
+    let root = tempfile::tempdir().expect("tempdir");
+    for prefix in ["/assets/../romm/resources", "/assets\\romm\\resources"] {
+        let source = validate_source(&config_with_media_mapping(Some(RommMediaMapping {
+            provider_prefix: prefix.to_string(),
+            local_root: root.path().to_path_buf(),
+        })))
+        .unwrap_or_else(|_| panic!("prefix {prefix:?} must not fail the whole source"));
+        assert!(
+            source.media_mapping().is_none(),
+            "unsafe prefix {prefix:?} must not become a trusted mapping"
+        );
+    }
+}
+
+/// 6. A non-absolute local root is dropped; the source remains valid.
+#[test]
+fn a_non_absolute_media_root_is_dropped() {
+    let source = validate_source(&config_with_media_mapping(Some(RommMediaMapping {
+        provider_prefix: DEGRADATION_MEDIA_PREFIX.to_string(),
+        local_root: std::path::PathBuf::from("relative/media/root"),
+    })))
+    .expect("a non-absolute optional root must not fail the source");
+    assert!(source.media_mapping().is_none());
+}
+
+/// 7. With no mapping configured, validation is unchanged.
+#[test]
+fn no_media_mapping_leaves_validation_unchanged() {
+    let source = validate_source(&config_with_media_mapping(None)).expect("validates");
+    assert!(source.media_mapping().is_none());
+    assert_eq!(source.server_id(), "http://127.0.0.1:8080");
+}
+
+/// 8. A broken *required* setting still fails the whole validation, even when
+///    the optional mapping is perfectly valid - optional degradation never
+///    rescues a required failure.
+#[test]
+fn a_broken_required_setting_still_fails_even_with_a_valid_optional_mapping() {
+    let root = tempfile::tempdir().expect("tempdir");
+    let good_mapping = || {
+        Some(RommMediaMapping {
+            provider_prefix: DEGRADATION_MEDIA_PREFIX.to_string(),
+            local_root: root.path().to_path_buf(),
+        })
+    };
+
+    // Bad endpoint: a public address is never approved.
+    let mut bad_endpoint = config_with_media_mapping(good_mapping());
+    bad_endpoint.url = "http://8.8.8.8:8080".to_string();
+    let refusal = validate_source(&bad_endpoint)
+        .expect_err("a bad endpoint must still fail the whole source");
+    assert_eq!(refusal.code(), "not_private_address");
+
+    // Bad required ROM mapping: destination outside every trusted root.
+    let mut bad_mapping = config_with_media_mapping(good_mapping());
+    bad_mapping.mappings = vec![crate::identity_source::path_map::PathMapping {
+        provider_prefix: "/romm/library".to_string(),
+        archivefs_prefix: std::path::PathBuf::from("/etc"),
+        provider_aliases: Vec::new(),
+    }];
+    let refusal = ValidatedRommSource::validate(
+        &bad_mapping,
+        &token(),
+        &[std::path::PathBuf::from("/mnt/games/roms")],
+        &StaticResolver::new(),
+    )
+    .expect_err("a required ROM mapping outside the trusted roots must still fail");
+    assert_eq!(refusal.code(), "outside_trusted_roots");
+}
+
+/// 9. Validation disables the mapping only for that cycle: the caller's config
+///    is byte-for-byte unchanged, still carrying the configured mapping.
+#[test]
+fn validation_does_not_rewrite_the_persisted_config_when_the_root_is_absent() {
+    let parent = tempfile::tempdir().expect("tempdir");
+    let absent = parent.path().join("offline-mount");
+    let original = config_with_media_mapping(Some(RommMediaMapping {
+        provider_prefix: DEGRADATION_MEDIA_PREFIX.to_string(),
+        local_root: absent.clone(),
+    }));
+    let before = original.clone();
+
+    let source = validate_source(&original).expect("validates with the mapping disabled");
+    assert!(source.media_mapping().is_none());
+
+    assert_eq!(
+        original, before,
+        "validation must not mutate the caller's config"
+    );
+    let kept = original
+        .media_mapping
+        .as_ref()
+        .expect("the mapping is still configured after validation");
+    assert_eq!(kept.provider_prefix, DEGRADATION_MEDIA_PREFIX);
+    assert_eq!(kept.local_root, absent);
+}
+
+/// 10. Transient mount recovery: the same persisted config validates with the
+///     mapping disabled while the root is absent, then re-enables it once the
+///     root returns.
+#[test]
+fn a_media_root_that_returns_is_honoured_on_the_next_validation() {
+    let parent = tempfile::tempdir().expect("tempdir");
+    let root = parent.path().join("removable-media");
+    let config = config_with_media_mapping(Some(RommMediaMapping {
+        provider_prefix: DEGRADATION_MEDIA_PREFIX.to_string(),
+        local_root: root.clone(),
+    }));
+
+    assert!(
+        validate_source(&config)
+            .expect("validates while the root is absent")
+            .media_mapping()
+            .is_none(),
+        "reuse is disabled while the mount is offline"
+    );
+
+    std::fs::create_dir_all(&root).unwrap();
+
+    let source = validate_source(&config).expect("validates after the root returns");
+    let mapping = source
+        .media_mapping()
+        .expect("the same persisted config enables reuse once the root returns");
+    assert_eq!(mapping.local_root(), std::fs::canonicalize(&root).unwrap());
+    assert_eq!(mapping.provider_prefix(), DEGRADATION_MEDIA_PREFIX);
+}
+
+// --- Proxy isolation ----------------------------------------------------------
+
+/// Environment variable that switches
+/// [`the_production_transport_never_routes_a_token_through_an_environment_proxy`]
+/// into its child role. The child is the same test binary re-executed with
+/// proxy variables set, so the parent's environment is never mutated.
+const PROXY_CHILD_TARGET: &str = "EMUWIZ_ROMM_PROXY_CHILD_TARGET";
+
+/// The RomM endpoint policy approves one loopback/private address and the
+/// token is only ever meant to travel there. `ureq` reads `HTTP_PROXY`,
+/// `ALL_PROXY` and friends by default, so without an explicit opt-out a
+/// proxy variable in the desktop session would route the plain-HTTP bearer
+/// token to whatever host the proxy names - an address the policy never saw.
+/// This runs the real transport against a real loopback "RomM" with every
+/// proxy variable pointed at a separate loopback listener, and proves the
+/// proxy is never contacted.
+#[test]
+fn the_production_transport_never_routes_a_token_through_an_environment_proxy() {
+    use std::io::{Read, Write};
+    use std::net::TcpListener;
+    use std::time::Duration;
+
+    if let Ok(target) = std::env::var(PROXY_CHILD_TARGET) {
+        let transport = UreqTransport::new();
+        let response = transport
+            .get(
+                &target,
+                Some("Bearer proxy-isolation-secret"),
+                4096,
+                Duration::from_secs(5),
+            )
+            .expect("the direct request succeeds");
+        assert_eq!(response.status, 200);
+        return;
+    }
+
+    let romm = TcpListener::bind("127.0.0.1:0").unwrap();
+    let proxy = TcpListener::bind("127.0.0.1:0").unwrap();
+    proxy.set_nonblocking(true).unwrap();
+    let romm_address = romm.local_addr().unwrap();
+    let proxy_address = proxy.local_addr().unwrap();
+
+    romm.set_nonblocking(true).unwrap();
+    let server = std::thread::spawn(move || {
+        let deadline = std::time::Instant::now() + Duration::from_secs(10);
+        let mut stream = loop {
+            match romm.accept() {
+                Ok((stream, _)) => break stream,
+                Err(_) if std::time::Instant::now() < deadline => {
+                    std::thread::sleep(Duration::from_millis(10));
+                }
+                Err(_) => return None,
+            }
+        };
+        stream.set_nonblocking(false).unwrap();
+        stream
+            .set_read_timeout(Some(Duration::from_secs(5)))
+            .unwrap();
+        let mut request = Vec::new();
+        let mut buffer = [0u8; 1024];
+        while !request.windows(4).any(|window| window == b"\r\n\r\n") {
+            let count = stream.read(&mut buffer).unwrap_or(0);
+            if count == 0 {
+                break;
+            }
+            request.extend_from_slice(&buffer[..count]);
+        }
+        stream
+            .write_all(
+                b"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\n\
+                  Content-Length: 2\r\nConnection: close\r\n\r\n{}",
+            )
+            .unwrap();
+        Some(String::from_utf8_lossy(&request).into_owned())
+    });
+
+    let proxy_url = format!("http://{proxy_address}");
+    let mut child = std::process::Command::new(std::env::current_exe().unwrap());
+    child
+        .arg("--exact")
+        .arg(
+            "identity_source::romm::tests::\
+             the_production_transport_never_routes_a_token_through_an_environment_proxy",
+        )
+        .arg("--nocapture")
+        .env(
+            PROXY_CHILD_TARGET,
+            format!("http://{romm_address}/api/heartbeat"),
+        )
+        .env_remove("NO_PROXY")
+        .env_remove("no_proxy");
+    for variable in [
+        "ALL_PROXY",
+        "all_proxy",
+        "HTTPS_PROXY",
+        "https_proxy",
+        "HTTP_PROXY",
+        "http_proxy",
+    ] {
+        child.env(variable, &proxy_url);
+    }
+    let status = child.status().unwrap();
+
+    let proxy_contacted = proxy.accept().is_ok();
+    assert!(
+        !proxy_contacted,
+        "the RomM transport connected to the environment proxy"
+    );
+    assert!(status.success(), "child transport request failed");
+    let request = server
+        .join()
+        .unwrap()
+        .expect("the approved RomM address received the request");
+    assert!(request.starts_with("GET /api/heartbeat "));
+    assert!(request.contains("proxy-isolation-secret"));
 }

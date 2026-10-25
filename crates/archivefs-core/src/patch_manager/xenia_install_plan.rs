@@ -42,6 +42,9 @@ pub enum XeniaInstallPlanErrorKind {
     DestinationUnreadable,
     DestinationTooLarge,
     DestinationPathUnsafe,
+    /// An existing patch file cannot be decoded or safely represented by
+    /// the strict patch schema, so merging would risk dropping content.
+    DestinationMalformed,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -356,12 +359,29 @@ pub fn load_xenia_destination(
                     format!("existing destination could not be read: {failure}"),
                 )
             })?;
-            let text = String::from_utf8_lossy(&bytes).into_owned();
+            let text = std::str::from_utf8(&bytes).map_err(|failure| {
+                error(
+                    XeniaInstallPlanErrorKind::DestinationMalformed,
+                    Some(&path),
+                    format!(
+                        "existing destination is not valid UTF-8 (first invalid byte at offset {}); it will not be rewritten",
+                        failure.valid_up_to()
+                    ),
+                )
+            })?;
+            let document = parse_xenia_patch_toml(text);
+            if document.has_rewrite_blocking_warnings() {
+                return Err(error(
+                    XeniaInstallPlanErrorKind::DestinationMalformed,
+                    Some(&path),
+                    "existing destination contains malformed or unsupported patch data and will not be rewritten",
+                ));
+            }
             Ok(LoadedXeniaDestination {
                 path,
                 existed: true,
                 digest: Some(hex_sha256(&bytes)),
-                document: Some(parse_xenia_patch_toml(&text)),
+                document: Some(document),
             })
         }
         Err(failure) if failure.kind() == std::io::ErrorKind::NotFound => {
@@ -646,6 +666,13 @@ pub fn stage_xenia_patch_file(
             XeniaInstallPlanErrorKind::NoSelectedPatches,
             None,
             "refusing to stage a patch file with no patches selected",
+        ));
+    }
+    if existing.is_some_and(XeniaPatchDocument::has_rewrite_blocking_warnings) {
+        return Err(error(
+            XeniaInstallPlanErrorKind::DestinationMalformed,
+            None,
+            "existing destination contains malformed or unsupported patch data and will not be rewritten",
         ));
     }
     let merged = merge_patches(existing, &candidate.patches, selected_names);
@@ -1099,5 +1126,41 @@ hash = "4768B579A3C5F134"
             &[],
         );
         assert!(result.is_err());
+    }
+
+    #[test]
+    fn malformed_existing_destination_is_never_merged_or_rewritten() {
+        let result = provider_result(vec![document(
+            "patches/415607D2 - Quake 4.patch.toml",
+            QUAKE4_TOML,
+        )]);
+        let outcome = build_xenia_candidates(&result, Some("415607D2"), None);
+        let malformed = parse_xenia_patch_toml("this is not valid TOML");
+        let error = stage_xenia_patch_file(
+            &std::env::temp_dir().join("archivefs-xenia-malformed-existing"),
+            "x.patch.toml",
+            &outcome.candidates[0],
+            Some(&malformed),
+            &["Performance fix".to_string()],
+        )
+        .expect_err("a malformed destination must not be rendered over");
+        assert_eq!(error.kind, XeniaInstallPlanErrorKind::DestinationMalformed);
+    }
+
+    #[test]
+    fn invalid_utf8_existing_destination_is_refused_without_lossy_decoding() {
+        let root = std::env::temp_dir().join(format!(
+            "archivefs-xenia-invalid-utf8-{}",
+            std::process::id()
+        ));
+        let patches = root.join("patches");
+        fs::create_dir_all(&patches).unwrap();
+        let path = patches.join("x.patch.toml");
+        fs::write(&path, [0xff, 0xfe, 0x00]).unwrap();
+        let error = load_xenia_destination(&patches, "x.patch.toml")
+            .expect_err("invalid bytes are never repaired before merge");
+        assert_eq!(error.kind, XeniaInstallPlanErrorKind::DestinationMalformed);
+        assert_eq!(fs::read(&path).unwrap(), [0xff, 0xfe, 0x00]);
+        let _ = fs::remove_dir_all(root);
     }
 }

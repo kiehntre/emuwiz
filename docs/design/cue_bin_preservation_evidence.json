@@ -1,0 +1,255 @@
+{
+  "schema": "emuwiz.cue-preservation.implementation-evidence.v1",
+  "base": "1467155b0dc06df4e88c016c58d962b0bd0d9cff",
+  "branch": "feat/cue-bin-preservation-evidence",
+  "scope": [
+    "crates/archivefs-core/src/ingestion/mod.rs",
+    "crates/archivefs-core/src/ingestion/cue_preservation.rs",
+    "crates/archivefs-core/tests/cue_preservation_evidence.rs",
+    "docs/design/cue_bin_preservation_evidence.json"
+  ],
+  "purpose": "Read-only, verified physical source layout/content snapshots; no conversion, repair, Redump or cooked-sector equivalence claims.",
+  "reuse": {
+    "parser": "ingestion::cue_bin::resolve_cue_layout_text",
+    "timeline": "ingestion::cue_timeline::build_timeline_with using inspected file lengths",
+    "reading": "safe_read::open_bounded_read, no trusted roots; constant-memory exact streaming reads",
+    "identity": "CapturedFileIdentity plus Unix change time"
+  },
+  "record": {
+    "schema": "emuwiz.cue-preservation.v1",
+    "construction": "Opaque verified record; no deserialization or mutable public proof fields",
+    "provenance": "Verified original CUE text and SHA-256, literal FILE references, canonical paths, FILE ordinals/types, device/inode/size/mtime/ctime",
+    "layout": "Canonical track numbers/modes, INDEX 00/01, extra INDEX entries, PREGAP/POSTGAP declarations and complete timeline",
+    "content": "SHA-256 of every whole source FILE and every program/stored-pregap range; unassigned prefix separately recorded, never called a pregap",
+    "relationships": "FILE partitions and identity aliases, including hard links"
+  },
+  "verification": [
+    "Inspect bounded CUE snapshot and all safely opened backing-file identities.",
+    "Reuse canonical parser and timeline; refuse unrepresented directives, unused FILE declarations and descending extra INDEX numbers.",
+    "Validate CUE bytes, FILE resolution and all source identities before hashing.",
+    "Hash each complete source and its contiguous range partition in one pass; synthetic gaps produce no bytes or digest.",
+    "Check descriptor identity after each source.",
+    "Re-read CUE and re-resolve its FILE references, then recheck all source identities before returning the record."
+  ],
+  "comparison": {
+    "Equivalent": "Only two successfully verified supported snapshots with matching FILE partitions/aliases/types/sizes, track modes/relationships, all declared indexes/gaps/boundaries and every stored byte digest.",
+    "Different": "Typed differences in stored pregap/program/source bytes, indexes/boundaries, pregap storage, synthetic declarations or source relationships.",
+    "Unsupported": "Unsafe references, malformed/truncated layout, unsupported byte mapping/directives/limits/platform or ambiguity; identical refusals are never equivalent.",
+    "Indeterminate": "Missing/unreadable backing files or CUE, failed reads, or changed identities/FILE relationships.",
+    "programs_match": "Physical program bytes/modes only; never establishes whole-layout, cooked-sector, CHD or Redump equivalence.",
+    "normalization": "Absolute source names, machine-local identities and harmless REM COMMENT/GENRE text are provenance. Physical aliases and FILE partitioning remain comparison facts. Optional zero-length gap declarations are retained."
+  },
+  "supported": "On Unix, regular readable BINARY source files with canonical unambiguous consecutive tracks, whole sectors and a consistent sector width per FILE. MODE1/2048, MODE1/2352, MODE2/2352 and AUDIO permit physical-byte evidence, including same-width mixed tracks and multiple FILEs. This adds no sector decoding or conversion support.",
+  "limits": {
+    "cue_bytes": 262144,
+    "file_declarations": 99,
+    "tracks": 99,
+    "aggregate_source_bytes": 8589934592,
+    "read_chunk_bytes": 131072,
+    "memory": "CUE text, bounded layout and range metadata, and one fixed read buffer; never load a BIN into memory."
+  },
+  "limitations": [
+    "Non-Unix systems refuse evidence until stable source identities can be proved.",
+    "WAVE and other FILE mappings, mixed sector widths within one FILE, CD-text, flags, catalog/ISRC/session metadata and other unrepresented directives remain explicitly unsupported.",
+    "INDEX 00 together with PREGAP remains ambiguous and refused by the existing canonical timeline.",
+    "Frozen snapshots compare the inspected bytes and relationships; they neither lock source files nor authorize later changes. Source identities/relationships must be checked again for any later operation.",
+    "Synthetic gaps are declarations only; no silence is invented or hashed.",
+    "Physical-byte evidence does not prove decoded audio, disc readability, original mastering information or Redump equivalence.",
+    "The CUE anchor must be an absolute, normal, nonsymlink path satisfying the shared safe-read policy. Relative FILE references are resolved by the canonical parser and checked again before proof publication."
+  ],
+  "red_baseline": {
+    "log": "red-contract-executed.log",
+    "passed": 0,
+    "failed": 17,
+    "meaning": "New evidence API intentionally unimplemented; all requested regression scenarios were written before implementation."
+  },
+  "discovered_defect": {
+    "before_log": "extended-regressions-before.log",
+    "before": "24 passed, 1 failed: descending INDEX 03/02 numbers were classified Equivalent to self.",
+    "correction": "Refuse descending additional INDEX numbers only in new evidence inspection; parser/timeline and conversion behaviour remain unchanged.",
+    "attempts": 1,
+    "after": "26 integration regressions pass, including descending INDEX-number refusal."
+  },
+  "validation": {
+    "status": "PASS: focused regressions, affected suites, formatting, workspace all-target compilation and scope checks",
+    "integration_regressions": {
+      "passed": 26,
+      "failed": 0,
+      "log": "final-supported-platform-regressions.log"
+    },
+    "formatting": {
+      "exit": 0,
+      "log": "formatting-final.log"
+    },
+    "scope_guard": {
+      "exit": 0,
+      "log": "scope-final.log",
+      "changed_files": 4,
+      "gui_root_net_added_lines": 0
+    },
+    "affected_suites": [
+      {
+        "filter": "cue_",
+        "exit": 0,
+        "log": "/tmp/emuwiz-cue-preservation-6fwlqybe/logs/affected-cue_.log",
+        "summary": [
+          "test result: ok. 117 passed; 0 failed; 0 ignored; 0 measured; 11747 filtered out; finished in 1.46s"
+        ]
+      },
+      {
+        "filter": "optical_",
+        "exit": 0,
+        "log": "/tmp/emuwiz-cue-preservation-6fwlqybe/logs/affected-optical_.log",
+        "summary": [
+          "test result: ok. 107 passed; 0 failed; 0 ignored; 0 measured; 11757 filtered out; finished in 1.57s"
+        ]
+      },
+      {
+        "filter": "raw_cd",
+        "exit": 0,
+        "log": "/tmp/emuwiz-cue-preservation-6fwlqybe/logs/affected-raw_cd.log",
+        "summary": [
+          "test result: ok. 45 passed; 0 failed; 0 ignored; 0 measured; 11819 filtered out; finished in 0.01s"
+        ]
+      },
+      {
+        "filter": "chd_redump",
+        "exit": 0,
+        "log": "/tmp/emuwiz-cue-preservation-6fwlqybe/logs/affected-chd_redump.log",
+        "summary": [
+          "test result: ok. 5 passed; 0 failed; 0 ignored; 0 measured; 11859 filtered out; finished in 0.00s"
+        ]
+      },
+      {
+        "filter": "safe_read",
+        "exit": 0,
+        "log": "/tmp/emuwiz-cue-preservation-6fwlqybe/logs/affected-safe_read.log",
+        "summary": [
+          "test result: ok. 23 passed; 0 failed; 0 ignored; 0 measured; 11841 filtered out; finished in 0.01s"
+        ]
+      }
+    ],
+    "affected_test_executions": 297,
+    "new_regressions": 28,
+    "private_unit_fault_probes": [
+      "a_source_replaced_after_hashing_is_refused_by_final_verification",
+      "overflowing_read_range_is_refused_before_content_access"
+    ],
+    "platform": "Unprivileged native Unix (uid 1000); permission fixture executed. Other platforms fail closed and positive proof fixtures are cfg(unix). No cross-platform build claimed.",
+    "isolation": "Private HOME/XDG/TMP/application roots, scripts/cargo-iso --low-debug and unique target; no real ROM library/configuration access.",
+    "affected_unique_tests": 287,
+    "total_unique_tests": 313,
+    "final_checks": [
+      {
+        "check": "fault-unit-tests-final",
+        "exit": 0,
+        "log": "/tmp/emuwiz-cue-preservation-6fwlqybe/logs/fault-unit-tests-final.log",
+        "summary": [
+          "    Finished `test` profile [unoptimized] target(s) in 5m 15s",
+          "test result: ok. 2 passed; 0 failed; 0 ignored; 0 measured; 11862 filtered out; finished in 0.01s"
+        ]
+      },
+      {
+        "check": "workspace-all-targets",
+        "exit": 0,
+        "log": "/tmp/emuwiz-cue-preservation-6fwlqybe/logs/workspace-all-targets.log",
+        "summary": [
+          "    Finished `dev` profile [unoptimized] target(s) in 6m 46s"
+        ]
+      }
+    ],
+    "persistent_fixture_recheck": "All stored fixture bytes, digests, inodes, mtime and ctime match the saved manifest after validation.",
+    "source_scope": "Only the four listed files; all previously existing parser, timeline, safe-read and optical gate blobs unchanged except the one-line ingestion module export."
+  },
+  "artifacts": "/tmp/emuwiz-cue-preservation-6fwlqybe",
+  "untouched_guards": "guard-blobs.json proves seven existing parser/timeline/safe-read/optical gate blobs unchanged from base",
+  "independent_review": "Required for exact resulting local candidate SHA; no promotion authorization.",
+  "before_after_fixtures": [
+    {
+      "case": "identical",
+      "existing_program_fingerprints_match": true,
+      "new_outcome": "Equivalent",
+      "new_physical_programs_match": true,
+      "differences": "[]",
+      "refusals": []
+    },
+    {
+      "case": "changed stored pregap",
+      "existing_program_fingerprints_match": true,
+      "new_outcome": "Different",
+      "new_physical_programs_match": true,
+      "differences": "[SourceContent { ordinal: 0 }, StoredPregapContent { track: 1 }]",
+      "refusals": []
+    },
+    {
+      "case": "same program, different INDEX00",
+      "existing_program_fingerprints_match": true,
+      "new_outcome": "Different",
+      "new_physical_programs_match": true,
+      "differences": "[IndexBoundaries { track: 1 }, StoredPregapContent { track: 1 }]",
+      "refusals": []
+    },
+    {
+      "case": "source-backed versus synthetic",
+      "existing_program_fingerprints_match": true,
+      "new_outcome": "Different",
+      "new_physical_programs_match": true,
+      "differences": "[SourceRelationships, SourceContent { ordinal: 0 }, IndexBoundaries { track: 1 }, PregapStorage { track: 1 }, SyntheticGaps { track: 1 }]",
+      "refusals": []
+    },
+    {
+      "case": "additional index boundary",
+      "existing_program_fingerprints_match": true,
+      "new_outcome": "Different",
+      "new_physical_programs_match": true,
+      "differences": "[IndexBoundaries { track: 1 }]",
+      "refusals": []
+    },
+    {
+      "case": "truncated",
+      "existing_program_fingerprints_match": false,
+      "new_outcome": "Unsupported",
+      "new_physical_programs_match": null,
+      "differences": "[]",
+      "refusals": [
+        "malformed CUE: INDEX 01 is outside FILE for track 1",
+        "malformed CUE: INDEX 01 is outside FILE for track 1"
+      ]
+    },
+    {
+      "case": "missing",
+      "existing_program_fingerprints_match": false,
+      "new_outcome": "Indeterminate",
+      "new_physical_programs_match": null,
+      "differences": "[]",
+      "refusals": [
+        "Backing FILE is missing or unreadable: /tmp/emuwiz-cue-preservation-6fwlqybe/probes/fixtures/missing/absent.bin"
+      ]
+    },
+    {
+      "case": "unsafe",
+      "existing_program_fingerprints_match": false,
+      "new_outcome": "Unsupported",
+      "new_physical_programs_match": null,
+      "differences": "[]",
+      "refusals": [
+        "CUE references an unsafe path",
+        "CUE references an unsafe path"
+      ]
+    }
+  ],
+  "changed_after_inspection": "Source identity, content or FILE resolution changed: /tmp/emuwiz-cue-preservation-6fwlqybe/probes/fixtures/replaced_after_inspection/disc.bin",
+  "probe_artifacts": [
+    "probes/evidence_probe.rs",
+    "logs/probe-report.json",
+    "probes/fixture-manifest.json",
+    "probes/fixtures/"
+  ],
+  "main_reverified": "1467155b0dc06df4e88c016c58d962b0bd0d9cff",
+  "api": {
+    "inspection": "inspect_cue_preservation(&Path) -> Result<CuePreservationInspection, CuePreservationError>",
+    "reading": "read_cue_preservation(&CuePreservationInspection) -> Result<DiscLayoutEvidence, CuePreservationError>",
+    "collection": "collect_cue_preservation(&Path) -> Result<DiscLayoutEvidence, CuePreservationError>",
+    "comparison": "compare_cue_evidence(&Result<DiscLayoutEvidence, CuePreservationError>, &Result<DiscLayoutEvidence, CuePreservationError>) -> CuePreservationComparison"
+  }
+}

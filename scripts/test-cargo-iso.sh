@@ -1,0 +1,240 @@
+#!/usr/bin/env bash
+# Tests for scripts/cargo-iso. Uses a fake cargo and temporary git worktrees under
+# /tmp; it builds nothing, deletes nothing outside its own temp directory, and never
+# touches ~/.cache/emuwiz-cargo-target(s).
+set -uo pipefail
+
+here=$(cd "$(dirname "$0")" && pwd -P)
+iso="$here/cargo-iso"
+tmp=$(mktemp -d /tmp/emuwiz-cargo-iso-test.XXXXXX)
+trap 'rm -rf -- "${tmp:?}"' EXIT
+pass=0
+fail=0
+
+ok() { pass=$((pass + 1)); echo "ok   - $1"; }
+bad() { fail=$((fail + 1)); echo "FAIL - $1" >&2; }
+check() { # check "name" <command...>  (command succeeds = pass)
+  local name=$1; shift
+  if "$@" >/dev/null 2>&1; then ok "$name"; else bad "$name"; fi
+}
+
+# A fake cargo that records its environment and arguments, and exits as told.
+fake="$tmp/fake-cargo"
+cat >"$fake" <<'E'
+#!/usr/bin/env bash
+{
+  echo "target=${CARGO_TARGET_DIR-<unset>}"
+  echo "build_target=${CARGO_BUILD_TARGET_DIR-<unset>}"
+  echo "dev_debug=${CARGO_PROFILE_DEV_DEBUG-<unset>}"
+  echo "test_debug=${CARGO_PROFILE_TEST_DEBUG-<unset>}"
+  echo "incremental=${CARGO_INCREMENTAL-<unset>}"
+  echo "wrapper=${RUSTC_WRAPPER-<unset>}"
+  echo "sccache_dir=${SCCACHE_DIR-<unset>}"
+  echo "sccache_size=${SCCACHE_CACHE_SIZE-<unset>}"
+  echo "sccache_port=${SCCACHE_SERVER_PORT-<unset>}"
+  echo "argc=$#"
+  i=0; for a in "$@"; do i=$((i + 1)); echo "arg$i=$a"; done
+} >"${FAKE_CARGO_LOG:?}"
+exit "${FAKE_CARGO_EXIT:-0}"
+E
+chmod +x "$fake"
+
+# Two real worktrees of one throwaway repo, plus one with an awkward name.
+repo="$tmp/repo"
+git init -q "$repo"
+git -C "$repo" -c user.name=t -c user.email=t@t commit -q --allow-empty -m init
+git -C "$repo" worktree add -q "$tmp/wt-one" -b one
+git -C "$repo" worktree add -q "$tmp/wt two (odd) \$name" -b two
+mkdir -p "$tmp/home"
+export HOME="$tmp/home"
+export EMUWIZ_TARGET_ROOT="$tmp/targets"
+export EMUWIZ_CARGO="$fake"
+export FAKE_CARGO_LOG="$tmp/log"
+legacy="$HOME/.cache/emuwiz-cargo-target"
+unset CARGO_TARGET_DIR CARGO_BUILD_TARGET_DIR CARGO_PROFILE_DEV_DEBUG CARGO_PROFILE_TEST_DEBUG EMUWIZ_CARGO_LOW_DEBUG EMUWIZ_CARGO_FULL_DEBUG EMUWIZ_CARGO_INCREMENTAL EMUWIZ_CARGO_SCCACHE EMUWIZ_SCCACHE_DIR EMUWIZ_SCCACHE_SIZE EMUWIZ_SCCACHE_PORT RUSTC_WRAPPER SCCACHE_DIR
+
+target_of() { (cd "$1" && "$iso" --print-target | sed -n 's/^target: *//p'); }
+logged() { sed -n "s/^$1=//p" "$FAKE_CARGO_LOG"; }
+
+# ---- target uniqueness and stability
+t1=$(target_of "$tmp/wt-one")
+t2=$(target_of "$tmp/wt two (odd) \$name")
+check "each worktree gets a target under the root" test "${t1#"$EMUWIZ_TARGET_ROOT"/}" != "$t1"
+check "two worktrees get different targets" test "$t1" != "$t2"
+check "the target is stable across calls" test "$t1" = "$(target_of "$tmp/wt-one")"
+check "a subdirectory of the worktree maps to the same target" \
+  test "$t1" = "$(mkdir -p "$tmp/wt-one/sub/dir" && target_of "$tmp/wt-one/sub/dir")"
+ln -s "$tmp/wt-one" "$tmp/link-to-one"
+check "a symlinked path maps to the canonical worktree's target" test "$t1" = "$(target_of "$tmp/link-to-one")"
+check "the name has a 12-hex hash suffix" bash -c "[[ '$(basename "$t1")' =~ ^wt-one-[0-9a-f]{12}$ ]]"
+
+# ---- path safety
+base2=$(basename "$t2")
+check "an awkward worktree name is made safe" bash -c "[[ '$base2' =~ ^[A-Za-z0-9._-]+$ ]]"
+check "the target never escapes the root" test "$(dirname "$t2")" = "$EMUWIZ_TARGET_ROOT"
+
+# ---- read-only --print-target
+rm -rf "$EMUWIZ_TARGET_ROOT"
+(cd "$tmp/wt-one" && "$iso" --print-target >/dev/null)
+check "--print-target creates nothing" test ! -e "$EMUWIZ_TARGET_ROOT"
+check "--print-target does not run cargo" test ! -e "$FAKE_CARGO_LOG"
+
+# ---- normal execution: arguments, environment, exit codes
+rm -f "$FAKE_CARGO_LOG"
+(cd "$tmp/wt-one" && "$iso" test -p "some crate" --lib -- --test-threads=2 "a b" >/dev/null 2>&1); rc=$?
+check "exit code 0 is preserved" test "$rc" = 0
+check "the target directory is created for the build" test -d "$t1"
+check "CARGO_TARGET_DIR is the worktree's target" test "$(logged target)" = "$t1"
+check "all arguments pass through, including spaces" test "$(logged argc)" = 7
+check "argument order and content are preserved" bash -c "
+  [ \"\$(sed -n 's/^arg1=//p' '$FAKE_CARGO_LOG')\" = test ] &&
+  [ \"\$(sed -n 's/^arg3=//p' '$FAKE_CARGO_LOG')\" = 'some crate' ] &&
+  [ \"\$(sed -n 's/^arg7=//p' '$FAKE_CARGO_LOG')\" = 'a b' ]"
+check "a new target defaults to low-debug" test "$(logged dev_debug)/$(logged test_debug)" = 0/0
+(cd "$tmp/wt-one" && FAKE_CARGO_EXIT=7 "$iso" check >/dev/null 2>&1); rc=$?
+check "cargo's non-zero exit code is propagated (7)" test "$rc" = 7
+(cd "$tmp/wt-one" && FAKE_CARGO_EXIT=101 "$iso" test >/dev/null 2>&1); rc=$?
+check "cargo's test-failure exit code is propagated (101)" test "$rc" = 101
+
+# ---- inherited environment is overridden
+(cd "$tmp/wt-one" && CARGO_TARGET_DIR="$legacy" CARGO_BUILD_TARGET_DIR="$legacy" "$iso" check >/dev/null 2>"$tmp/err")
+check "an inherited legacy CARGO_TARGET_DIR is overridden" test "$(logged target)" = "$t1"
+check "CARGO_BUILD_TARGET_DIR is unset" test "$(logged build_target)" = "<unset>"
+check "overriding the legacy target prints a note" grep -q "legacy shared target" "$tmp/err"
+(cd "$tmp/wt-one" && CARGO_TARGET_DIR=/some/other/dir "$iso" check >/dev/null 2>&1)
+check "any other inherited CARGO_TARGET_DIR is overridden too" test "$(logged target)" = "$t1"
+
+# ---- the legacy shared target can never be used
+(cd "$tmp/wt-one" && EMUWIZ_TARGET_ROOT="$legacy" "$iso" check >/dev/null 2>&1); rc=$?
+check "a target root equal to the legacy target is refused (3)" test "$rc" = 3
+(cd "$tmp/wt-one" && EMUWIZ_TARGET_ROOT="$legacy/inner" "$iso" check >/dev/null 2>&1); rc=$?
+check "a target root inside the legacy target is refused (3)" test "$rc" = 3
+rm -f "$FAKE_CARGO_LOG"
+(cd "$tmp/wt-one" && "$iso" build --target-dir "$legacy" >/dev/null 2>&1); rc=$?
+check "--target-dir pointing at the legacy target is refused (3)" test "$rc" = 3
+(cd "$tmp/wt-one" && "$iso" build "--target-dir=$legacy/debug" >/dev/null 2>&1); rc=$?
+check "--target-dir=<inside legacy> is refused (3)" test "$rc" = 3
+check "a refused build never runs cargo" test ! -e "$FAKE_CARGO_LOG"
+(cd "$tmp/wt-one" && "$iso" build --target-dir "$tmp/elsewhere" >/dev/null 2>&1); rc=$?
+check "an unrelated explicit --target-dir is the caller's choice (allowed)" test "$rc" = 0
+(cd "$tmp/wt-one" && "$iso" test -- --target-dir "$legacy" >/dev/null 2>&1); rc=$?
+check "arguments after -- are not inspected as cargo options" test "$rc" = 0
+
+# ---- disk-space guard
+rm -f "$FAKE_CARGO_LOG"
+(cd "$tmp/wt-one" && EMUWIZ_MIN_FREE_GB=99999999 "$iso" check >/dev/null 2>"$tmp/err"); rc=$?
+check "too little free disk is refused (4)" test "$rc" = 4
+check "a disk refusal never runs cargo" test ! -e "$FAKE_CARGO_LOG"
+check "the refusal says nothing was deleted" grep -q "nothing was deleted" "$tmp/err"
+(cd "$tmp/wt-one" && EMUWIZ_MIN_FREE_GB=0 "$iso" check >/dev/null 2>&1); rc=$?
+check "a zero threshold lets the build run" test "$rc" = 0
+(cd "$tmp/wt-one" && EMUWIZ_MIN_FREE_GB=abc "$iso" check >/dev/null 2>&1); rc=$?
+check "a non-numeric threshold is a usage error (2)" test "$rc" = 2
+check "the default threshold is 8 GiB" bash -c "cd '$tmp/wt-one' && '$iso' --print-target | grep -q 'minimum 8 GiB'"
+
+# ---- low-debug mode
+(cd "$tmp/wt-one" && "$iso" --low-debug check >/dev/null 2>&1)
+check "--low-debug disables dev debug info" test "$(logged dev_debug)" = 0
+check "--low-debug disables test debug info" test "$(logged test_debug)" = 0
+check "--low-debug is not passed on to cargo" bash -c "! grep -q 'low-debug' '$FAKE_CARGO_LOG'"
+(cd "$tmp/wt-one" && EMUWIZ_CARGO_LOW_DEBUG=1 "$iso" check >/dev/null 2>&1)
+check "EMUWIZ_CARGO_LOW_DEBUG=1 does the same" test "$(logged dev_debug)" = 0
+
+# ---- debug mode is recorded per target and never switches silently
+mode_of() { cat "$EMUWIZ_TARGET_ROOT.debug-mode/$(basename "$1")"; }
+check "the new target's mode was recorded outside the target" test "$(mode_of "$t1")" = low
+check "nothing was written into the target root for it" test ! -e "$EMUWIZ_TARGET_ROOT/.debug-mode"
+(cd "$tmp/wt-one" && CARGO_PROFILE_DEV_DEBUG=2 "$iso" check >/dev/null 2>&1)
+check "a recorded low mode is reused (inherited debug=2 does not switch it)" test "$(logged dev_debug)" = 0
+(cd "$tmp/wt-one" && "$iso" --full-debug check >/dev/null 2>"$tmp/err")
+check "--full-debug is an explicit override" test "$(logged dev_debug)/$(logged test_debug)" = "<unset>/<unset>"
+check "an explicit switch is announced" grep -q "changes from low to full" "$tmp/err"
+check "--full-debug is not passed on to cargo" bash -c "! grep -q 'full-debug' '$FAKE_CARGO_LOG'"
+check "the switch is recorded" test "$(mode_of "$t1")" = full
+(cd "$tmp/wt-one" && CARGO_PROFILE_DEV_DEBUG=0 "$iso" check >/dev/null 2>"$tmp/err")
+check "a recorded full mode stays full (inherited debug=0 is cleared)" test "$(logged dev_debug)" = "<unset>"
+check "reusing the recorded mode is silent" test ! -s "$tmp/err"
+(cd "$tmp/wt-one" && "$iso" --print-target | grep -q '^debug: *full (recorded)')
+check "--print-target shows the recorded mode" test $? = 0
+(cd "$tmp/wt-one" && EMUWIZ_CARGO_LOW_DEBUG=1 EMUWIZ_CARGO_FULL_DEBUG=1 "$iso" check >/dev/null 2>&1); rc=$?
+check "both debug env overrides at once is a usage error (2)" test "$rc" = 2
+(cd "$tmp/wt-one" && "$iso" --low-debug check >/dev/null 2>&1)
+check "--low-debug switches back and records it" test "$(mode_of "$t1")/$(logged dev_debug)" = low/0
+# An existing target from before the record: unchanged behaviour, nothing recorded.
+wt3="$tmp/wt-three"; git -C "$repo" worktree add -q "$wt3" -b three
+t3=$(target_of "$wt3"); mkdir -p "$t3/debug"; : >"$t3/debug/old-artifact"
+(cd "$wt3" && "$iso" check >/dev/null 2>&1)
+check "an unrecorded existing target is built exactly as before" test "$(logged dev_debug)" = "<unset>"
+check "an unrecorded existing target is not given a guessed record" test ! -e "$EMUWIZ_TARGET_ROOT.debug-mode/$(basename "$t3")"
+(cd "$wt3" && CARGO_PROFILE_DEV_DEBUG=0 "$iso" check >/dev/null 2>&1)
+check "an unrecorded existing target keeps inherited settings" test "$(logged dev_debug)" = 0
+check "--print-target says it is unrecorded" bash -c "cd '$wt3' && '$iso' --print-target | grep -q '^debug: *inherited'"
+check "its artefacts are untouched" test -e "$t3/debug/old-artifact"
+# A record that cannot be read refuses; an explicit choice repairs it.
+printf 'banana\n' >"$EMUWIZ_TARGET_ROOT.debug-mode/$(basename "$t3")"
+rm -f "$FAKE_CARGO_LOG"
+(cd "$wt3" && "$iso" check >/dev/null 2>"$tmp/err"); rc=$?
+check "an invalid record refuses the build (3)" test "$rc" = 3
+check "an invalid-record refusal never runs cargo" test ! -e "$FAKE_CARGO_LOG"
+check "the refusal names the fix" grep -q -- "--low-debug or --full-debug" "$tmp/err"
+check "--print-target reports an invalid record without failing" bash -c "cd '$wt3' && '$iso' --print-target | grep -q '^debug: *unknown'"
+(cd "$wt3" && "$iso" --full-debug check >/dev/null 2>&1); rc=$?
+check "an explicit mode repairs an invalid record" test "$rc/$(mode_of "$t3")" = 0/full
+# A target that cannot be recorded is not built (it would fall back silently later).
+wt4="$tmp/wt-four"; git -C "$repo" worktree add -q "$wt4" -b four
+mv "$EMUWIZ_TARGET_ROOT.debug-mode" "$tmp/saved-modes"; : >"$EMUWIZ_TARGET_ROOT.debug-mode"
+rm -f "$FAKE_CARGO_LOG"
+(cd "$wt4" && "$iso" check >/dev/null 2>&1); rc=$?
+check "an unrecordable new target is refused (3)" test "$rc" = 3
+check "an unrecordable target never runs cargo" test ! -e "$FAKE_CARGO_LOG"
+rm -f "$EMUWIZ_TARGET_ROOT.debug-mode"; mv "$tmp/saved-modes" "$EMUWIZ_TARGET_ROOT.debug-mode"
+(cd "$wt4" && "$iso" check >/dev/null 2>&1)
+check "the refused (still empty) target is new again afterwards" test "$(mode_of "$(target_of "$wt4")")" = low
+
+# ---- usage errors
+(cd "$tmp" && "$iso" check >/dev/null 2>&1); rc=$?
+check "outside a git worktree is a usage error (2)" test "$rc" = 2
+(cd "$tmp/wt-one" && "$iso" >/dev/null 2>&1); rc=$?
+check "no cargo command is a usage error (2)" test "$rc" = 2
+check "--help works and exits 0" bash -c "'$iso' --help | grep -q 'unique to THIS git worktree'"
+
+# ---- incremental mode (opt-in; inherited CARGO_INCREMENTAL is otherwise untouched)
+(cd "$tmp/wt-one" && CARGO_INCREMENTAL=0 "$iso" check >/dev/null 2>&1)
+check "inherited CARGO_INCREMENTAL=0 is left alone by default" test "$(logged incremental)" = 0
+(cd "$tmp/wt-one" && CARGO_INCREMENTAL=0 "$iso" --incremental check >/dev/null 2>&1)
+check "--incremental sets CARGO_INCREMENTAL=1" test "$(logged incremental)" = 1
+check "--incremental is not passed on to cargo" bash -c "! grep -q 'incremental' <(grep '^arg' '$FAKE_CARGO_LOG')"
+(cd "$tmp/wt-one" && CARGO_INCREMENTAL=0 EMUWIZ_CARGO_INCREMENTAL=1 "$iso" check >/dev/null 2>&1)
+check "EMUWIZ_CARGO_INCREMENTAL=1 does the same" test "$(logged incremental)" = 1
+
+# ---- sccache mode (opt-in)
+fakebin="$tmp/fakebin"; mkdir -p "$fakebin"; printf '#!/bin/sh\nexit 0\n' >"$fakebin/sccache"; chmod +x "$fakebin/sccache"
+(cd "$tmp/wt-one" && "$iso" check >/dev/null 2>&1)
+check "sccache is not used by default" test "$(logged wrapper)" = "<unset>"
+(cd "$tmp/wt-one" && PATH="$fakebin:$PATH" CARGO_INCREMENTAL=1 "$iso" --sccache check >/dev/null 2>&1); rc=$?
+check "--sccache runs" test "$rc" = 0
+check "--sccache sets RUSTC_WRAPPER" test "$(logged wrapper)" = "$fakebin/sccache"
+check "--sccache forces incremental off" test "$(logged incremental)" = 0
+check "--sccache caps the cache at 2G by default" test "$(logged sccache_size)" = 2G
+check "--sccache uses a dedicated dir under HOME" test "$(logged sccache_dir)" = "$HOME/.cache/emuwiz-sccache"
+check "--sccache uses a private server port" test "$(logged sccache_port)" = 4241
+check "--sccache keeps the per-worktree target" test "$(logged target)" = "$t1"
+check "--sccache is not passed on to cargo" bash -c "! grep -q 'sccache' <(grep '^arg' '$FAKE_CARGO_LOG')"
+(cd "$tmp/wt-one" && PATH="$fakebin:$PATH" "$iso" --sccache --incremental check >/dev/null 2>&1); rc=$?
+check "--sccache with --incremental is refused (2)" test "$rc" = 2
+(cd "$tmp/wt-one" && PATH="/usr/bin-none:$PATH" EMUWIZ_CARGO_SCCACHE=0 "$iso" check >/dev/null 2>&1); rc=$?
+check "EMUWIZ_CARGO_SCCACHE=0 is the default" test "$rc" = 0
+(cd "$tmp/wt-one" && PATH="$fakebin:$PATH" EMUWIZ_SCCACHE_SIZE=lots "$iso" --sccache check >/dev/null 2>&1); rc=$?
+check "a malformed cache size is refused (2)" test "$rc" = 2
+(cd "$tmp/wt-one" && PATH="$fakebin:$PATH" EMUWIZ_SCCACHE_SIZE=512M EMUWIZ_SCCACHE_DIR="$tmp/sc" "$iso" --sccache check >/dev/null 2>&1)
+check "size and dir overrides are honoured" test "$(logged sccache_size)/$(logged sccache_dir)" = "512M/$tmp/sc"
+
+# ---- never deletes
+mkdir -p "$t1/debug" && : >"$t1/debug/precious-artifact"
+(cd "$tmp/wt-one" && "$iso" check >/dev/null 2>&1)
+check "existing build artefacts are never removed" test -e "$t1/debug/precious-artifact"
+check "the script contains no delete or clean command" bash -c "! grep -E '(^|[^a-z_])(rm |rmdir|unlink|find .*-delete|cargo clean)' '$iso'"
+
+echo
+echo "cargo-iso tests: $pass passed, $fail failed"
+[ "$fail" -eq 0 ]

@@ -32,7 +32,10 @@ use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
 
-use super::{DatHealthState, DatSourceEntry, DatSourceHealth, DatSourceKind, MIN_DAT_PRIORITY};
+use super::{
+    ArcadeCatalogueRevision, DatHealthState, DatSourceEntry, DatSourceHealth, DatSourceKind,
+    DatSourceOwnership, MIN_DAT_PRIORITY,
+};
 use crate::ArchiveFsError;
 use crate::dat::policy::config::DatPolicyConfig;
 
@@ -70,6 +73,11 @@ pub struct DatSourceConfigEntry {
     pub display_name: String,
     pub path: String,
     pub kind: DatSourceKind,
+
+    /// Typed provenance for entries created by EmuWiz workflows. Missing in
+    /// old configs means UserLocal; origin text never influences this field.
+    #[serde(default, skip_serializing_if = "DatSourceOwnership::is_user_local")]
+    pub ownership: DatSourceOwnership,
 
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub enabled: Option<bool>,
@@ -113,6 +121,18 @@ pub struct DatSourceConfigEntry {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub health_observed_modified_unix_seconds: Option<i64>,
 
+    /// Sub-second part of the validated file's modification time. A new
+    /// optional key: builds that predate it keep it as an unknown field.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub health_observed_modified_subsec_nanos: Option<u32>,
+
+    /// Arcade DAT catalogue `<version>` headers observed at validation time,
+    /// one flat `"<ecosystem-key>=<version>"` string each (see
+    /// [`ArcadeCatalogueRevision`]). Kept as scalars, not a sub-table, so the
+    /// health block's TOML ordering rules are unaffected.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub health_arcade_catalogue_revisions: Option<Vec<String>>,
+
     /// Keys inside this entry that a newer build wrote.
     #[serde(flatten)]
     pub unknown_fields: toml::Table,
@@ -135,6 +155,7 @@ impl DatSourceConfigEntry {
             display_name: self.display_name,
             path: PathBuf::from(self.path),
             kind: self.kind,
+            ownership: self.ownership,
             enabled: self.enabled.unwrap_or(true),
             priority: self
                 .priority
@@ -153,6 +174,12 @@ impl DatSourceConfigEntry {
                 formats: self.health_formats,
                 observed_size_bytes: self.health_observed_size_bytes,
                 observed_modified_unix_seconds: self.health_observed_modified_unix_seconds,
+                observed_modified_subsec_nanos: self.health_observed_modified_subsec_nanos,
+                arcade_catalogue_revisions: ArcadeCatalogueRevision::decode_all(
+                    self.health_arcade_catalogue_revisions
+                        .as_deref()
+                        .unwrap_or(&[]),
+                ),
             },
             unknown_fields: self.unknown_fields,
         }
@@ -164,6 +191,7 @@ impl DatSourceConfigEntry {
             display_name: entry.display_name.clone(),
             path: entry.path.to_string_lossy().into_owned(),
             kind: entry.kind,
+            ownership: entry.ownership.clone(),
             enabled: Some(entry.enabled),
             priority: Some(entry.priority),
             platform: entry.platform.clone(),
@@ -178,6 +206,10 @@ impl DatSourceConfigEntry {
             health_formats: entry.health.formats.clone(),
             health_observed_size_bytes: entry.health.observed_size_bytes,
             health_observed_modified_unix_seconds: entry.health.observed_modified_unix_seconds,
+            health_observed_modified_subsec_nanos: entry.health.observed_modified_subsec_nanos,
+            health_arcade_catalogue_revisions: ArcadeCatalogueRevision::encode_all(
+                &entry.health.arcade_catalogue_revisions,
+            ),
             unknown_fields: entry.unknown_fields.clone(),
         }
     }

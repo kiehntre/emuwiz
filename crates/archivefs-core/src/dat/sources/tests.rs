@@ -8,24 +8,59 @@
 //! config tests do, so parallel tests that do read `HOME` are unaffected).
 //! Nothing reads a real ROM or DAT collection, and nothing here opens a socket:
 //! the code under test has no network surface at all.
+//!
+//! This module's own `run_dat_audit` below shadows
+//! [`super::audit_run::run_dat_audit`] with a thin wrapper that always passes
+//! [`AuditCacheConfig::Disabled`], for the same reason: the audited *paths*
+//! being inside a temp dir says nothing about where the persistent audit
+//! cache itself lives - that resolves from real `HOME` unless a config says
+//! otherwise - so every one of this file's many `run_dat_audit(...)` call
+//! sites needs exactly one fix here, not thirty.
 
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 
 use tempfile::TempDir;
 
-use super::audit_run::{DatAuditError, DatAuditRequest, run_dat_audit};
+use super::audit_cache::AuditCacheConfig;
+use super::audit_run::{
+    CombinedDatAuditRequest, CombinedDatAuditSource, DatAuditError, DatAuditOutcome,
+    DatAuditProgress, DatAuditRequest, run_combined_dat_audit_with_cache,
+    run_dat_audit_with_cache as production_run_dat_audit,
+};
 use super::config::{
     DatSourceConfigEntry, DatSourcesConfig, dat_sources_config_path_in,
     load_dat_sources_config_from, save_dat_sources_config_to,
 };
-use super::validation::{DatFileOutcome, sniff_dat_format};
+use super::validation::{
+    DatFileOutcome, DatFileReport, arcade_catalogue_revisions, sniff_dat_format,
+};
 use super::*;
 use crate::dat::limits::DatLimits;
 use crate::dat::model::DatFormat;
 use crate::dat::parser::DiagnosticSeverity;
 use crate::dat::parsers::parse_dat_file;
 use crate::safe_read::TrustedRoots;
+
+/// Shadows [`super::audit_run::run_dat_audit`] for every test in this file:
+/// identical signature, but always `AuditCacheConfig::Disabled` so none of
+/// this module's audits can read or write the real EmuWiz application-data
+/// cache. See the module doc above for why the audited path being inside a
+/// temp dir does not already guarantee that on its own.
+fn run_dat_audit(
+    request: &DatAuditRequest,
+    trusted: &TrustedRoots,
+    cancel: &AtomicBool,
+    on_progress: &dyn Fn(DatAuditProgress),
+) -> Result<DatAuditOutcome, DatAuditError> {
+    production_run_dat_audit(
+        request,
+        trusted,
+        cancel,
+        on_progress,
+        AuditCacheConfig::Disabled,
+    )
+}
 
 // ---------------------------------------------------------------------------
 // Fixtures
@@ -118,7 +153,7 @@ fn a_valid_dat_folder_can_be_registered_and_finds_only_dat_files() {
         .add(entry_for(&folder, DatSourceKind::Folder))
         .expect("a folder of DATs registers");
 
-    let report = validate_dat_source(&registry.entries()[0], DatLimits::default());
+    let (report, _expected) = validate_dat_source(&registry.entries()[0], DatLimits::default());
     assert_eq!(report.state, DatHealthState::Valid, "{report:?}");
     let names: Vec<&str> = report
         .files
@@ -374,12 +409,12 @@ fn format_detection_names_both_supported_formats() {
     assert_eq!(sniff_dat_format(&logiqx), Some(DatFormat::Logiqx));
     assert_eq!(sniff_dat_format(&clrmamepro), Some(DatFormat::ClrMamePro));
 
-    let report = validate_dat_source(
+    let (report, _expected) = validate_dat_source(
         &entry_for(&logiqx, DatSourceKind::File),
         DatLimits::default(),
     );
     assert_eq!(report.formats, vec!["Logiqx XML".to_string()]);
-    let report = validate_dat_source(
+    let (report, _expected) = validate_dat_source(
         &entry_for(&clrmamepro, DatSourceKind::File),
         DatLimits::default(),
     );
@@ -417,7 +452,8 @@ fn malformed_xml_is_reported_as_invalid_with_an_actionable_error() {
     );
     let before = std::fs::read(&path).unwrap();
 
-    let report = validate_dat_source(&entry_for(&path, DatSourceKind::File), DatLimits::default());
+    let (report, _expected) =
+        validate_dat_source(&entry_for(&path, DatSourceKind::File), DatLimits::default());
     assert_eq!(report.state, DatHealthState::Invalid);
     assert!(
         !report.summary.is_empty(),
@@ -450,7 +486,8 @@ fn invalid_utf8_does_not_panic_and_is_reported() {
     assert_eq!(sniff_dat_format(&path), Some(DatFormat::Logiqx));
 
     // And validation must produce a verdict rather than unwinding.
-    let report = validate_dat_source(&entry_for(&path, DatSourceKind::File), DatLimits::default());
+    let (report, _expected) =
+        validate_dat_source(&entry_for(&path, DatSourceKind::File), DatLimits::default());
     assert!(
         report.state.is_checked(),
         "an undecodable DAT still gets a verdict: {report:?}"
@@ -464,7 +501,7 @@ fn a_file_above_the_size_limit_is_refused_rather_than_read() {
     let path = write(dir.path(), "big.dat", LOGIQX);
     let tiny = DatLimits::builder().max_file_size(8).build();
 
-    let report = validate_dat_source(&entry_for(&path, DatSourceKind::File), tiny);
+    let (report, _expected) = validate_dat_source(&entry_for(&path, DatSourceKind::File), tiny);
     assert_eq!(report.state, DatHealthState::Invalid);
     assert!(
         report.summary.contains("limit"),
@@ -486,12 +523,13 @@ fn a_large_entry_count_is_handled_and_its_ceiling_is_enforced() {
     xml.push_str("</datafile>\n");
     let path = write(dir.path(), "big.dat", &xml);
 
-    let report = validate_dat_source(&entry_for(&path, DatSourceKind::File), DatLimits::default());
+    let (report, _expected) =
+        validate_dat_source(&entry_for(&path, DatSourceKind::File), DatLimits::default());
     assert_eq!(report.state, DatHealthState::Valid, "{}", report.summary);
     assert_eq!(report.entry_count, 5_000);
 
     let capped = DatLimits::builder().max_entries(10).build();
-    let report = validate_dat_source(&entry_for(&path, DatSourceKind::File), capped);
+    let (report, _expected) = validate_dat_source(&entry_for(&path, DatSourceKind::File), capped);
     assert_eq!(
         report.state,
         DatHealthState::Invalid,
@@ -509,7 +547,7 @@ fn two_dat_files_claiming_one_identity_are_reported_not_resolved() {
     write(&folder, "copy-a.dat", LOGIQX);
     write(&folder, "copy-b.dat", LOGIQX);
 
-    let report = validate_dat_source(
+    let (report, _expected) = validate_dat_source(
         &entry_for(&folder, DatSourceKind::Folder),
         DatLimits::default(),
     );
@@ -530,7 +568,7 @@ fn an_empty_folder_is_invalid_and_says_what_it_looked_for() {
     let dir = temp();
     let folder = dir.path().join("empty");
     std::fs::create_dir(&folder).unwrap();
-    let report = validate_dat_source(
+    let (report, _expected) = validate_dat_source(
         &entry_for(&folder, DatSourceKind::Folder),
         DatLimits::default(),
     );
@@ -570,7 +608,8 @@ fn a_doctype_parser_note_keeps_the_source_valid() {
         &logiqx_with_doctype_and_entries(1005),
     );
 
-    let report = validate_dat_source(&entry_for(&path, DatSourceKind::File), DatLimits::default());
+    let (report, _expected) =
+        validate_dat_source(&entry_for(&path, DatSourceKind::File), DatLimits::default());
     assert_eq!(report.entry_count, 1005);
     assert_eq!(report.rom_count, 1005);
     assert_eq!(
@@ -590,7 +629,7 @@ fn a_doctype_parser_note_keeps_the_source_valid() {
         "{diagnostics:?}"
     );
     assert!(
-        diagnostics[0].message.contains("DOCTYPE"),
+        diagnostics[0].message.contains("Logiqx") && diagnostics[0].message.contains("DTD"),
         "{diagnostics:?}"
     );
 }
@@ -607,7 +646,8 @@ fn a_real_warning_produces_valid_with_warnings() {
 <datafile><game name="G"><rom name="a.bin" size="4" crc="not-a-checksum"/></game></datafile>"#,
     );
 
-    let report = validate_dat_source(&entry_for(&path, DatSourceKind::File), DatLimits::default());
+    let (report, _expected) =
+        validate_dat_source(&entry_for(&path, DatSourceKind::File), DatLimits::default());
     assert_eq!(
         report.state,
         DatHealthState::ValidWithWarnings,
@@ -634,7 +674,8 @@ fn a_real_parser_failure_is_invalid() {
         "<?xml version=\"1.0\"?><datafile><game",
     );
 
-    let report = validate_dat_source(&entry_for(&path, DatSourceKind::File), DatLimits::default());
+    let (report, _expected) =
+        validate_dat_source(&entry_for(&path, DatSourceKind::File), DatLimits::default());
     assert_eq!(report.state, DatHealthState::Invalid);
     assert!(matches!(
         report.files[0].outcome,
@@ -655,7 +696,8 @@ fn mixed_warnings_and_notes_produce_valid_with_warnings() {
 <datafile><game name="G"><rom name="a.bin" size="4" crc="not-a-checksum"/></game></datafile>"#,
     );
 
-    let report = validate_dat_source(&entry_for(&path, DatSourceKind::File), DatLimits::default());
+    let (report, _expected) =
+        validate_dat_source(&entry_for(&path, DatSourceKind::File), DatLimits::default());
     assert_eq!(
         report.state,
         DatHealthState::ValidWithWarnings,
@@ -699,7 +741,7 @@ fn mixed_errors_warnings_and_notes_produce_invalid() {
 <datafile><game name="G"><rom name="a.bin" size="4" crc="not-a-checksum"/></game></datafile>"#,
     );
 
-    let report = validate_dat_source(
+    let (report, _expected) = validate_dat_source(
         &entry_for(&folder, DatSourceKind::Folder),
         DatLimits::default(),
     );
@@ -734,7 +776,7 @@ fn clrmamepro_diagnostics_carry_their_line() {
         "the ClrMamePro parser must record the offending line: {warning:?}"
     );
 
-    let report = validate_dat_source(&entry_for(&path, DatSourceKind::File), limits);
+    let (report, _expected) = validate_dat_source(&entry_for(&path, DatSourceKind::File), limits);
     let DatFileOutcome::Parsed { diagnostics, .. } = &report.files[0].outcome else {
         panic!("the DAT must parse");
     };
@@ -758,7 +800,7 @@ fn a_safety_limit_stop_reports_an_honest_total_when_it_knows_one() {
         write(&folder, &format!("set-{index:04}.dat"), LOGIQX);
     }
 
-    let report = validate_dat_source(
+    let (report, _expected) = validate_dat_source(
         &entry_for(&folder, DatSourceKind::Folder),
         DatLimits::default(),
     );
@@ -780,7 +822,7 @@ fn a_folder_that_fits_reports_its_exact_count() {
     write(&folder, "a.dat", LOGIQX);
     write(&folder, "b.dat", LOGIQX);
 
-    let report = validate_dat_source(
+    let (report, _expected) = validate_dat_source(
         &entry_for(&folder, DatSourceKind::Folder),
         DatLimits::default(),
     );
@@ -796,7 +838,7 @@ fn a_source_whose_path_disappeared_is_unreadable_not_invalid() {
     let entry = entry_for(&path, DatSourceKind::File);
     std::fs::remove_file(&path).unwrap();
 
-    let report = validate_dat_source(&entry, DatLimits::default());
+    let (report, _expected) = validate_dat_source(&entry, DatLimits::default());
     assert_eq!(
         report.state,
         DatHealthState::Unreadable,
@@ -835,7 +877,7 @@ fn a_stored_verdict_goes_stale_when_the_file_changes() {
     let dir = temp();
     let path = write(dir.path(), "changing.dat", LOGIQX);
     let entry = entry_for(&path, DatSourceKind::File);
-    let report = validate_dat_source(&entry, DatLimits::default());
+    let (report, _expected) = validate_dat_source(&entry, DatLimits::default());
     let health = report.to_health(&path, DatSourceKind::File);
     assert_eq!(health.state(), DatHealthState::Valid);
     assert!(!health.is_stale_for(&path, DatSourceKind::File));
@@ -845,6 +887,93 @@ fn a_stored_verdict_goes_stale_when_the_file_changes() {
     assert!(
         health.is_stale_for(&path, DatSourceKind::File),
         "a verdict must not keep claiming to describe a file it no longer describes"
+    );
+}
+
+fn set_mtime(path: &Path, seconds: u64, nanos: u32) {
+    std::fs::File::options()
+        .write(true)
+        .open(path)
+        .unwrap()
+        .set_modified(std::time::UNIX_EPOCH + std::time::Duration::new(seconds, nanos))
+        .unwrap();
+}
+
+#[test]
+fn a_same_size_edit_within_the_same_second_is_detected_when_the_subsecond_was_recorded() {
+    let dir = temp();
+    let path = write(dir.path(), "same_second.dat", LOGIQX);
+    set_mtime(&path, 1_800_000_000, 100_000_000);
+    let entry = entry_for(&path, DatSourceKind::File);
+    let (report, _expected) = validate_dat_source(&entry, DatLimits::default());
+    let health = report.to_health(&path, DatSourceKind::File);
+    assert_eq!(health.observed_modified_unix_seconds, Some(1_800_000_000));
+    assert_eq!(health.observed_modified_subsec_nanos, Some(100_000_000));
+    assert!(!health.is_stale_for(&path, DatSourceKind::File));
+
+    // Same length, same whole second, later within it.
+    let edited = LOGIQX.replacen("a", "b", 1);
+    assert_eq!(edited.len(), LOGIQX.len());
+    std::fs::write(&path, &edited).unwrap();
+    set_mtime(&path, 1_800_000_000, 600_000_000);
+    assert!(
+        health.is_stale_for(&path, DatSourceKind::File),
+        "an edit within the validated second must still mark the verdict stale"
+    );
+
+    // Restoring the exact recorded time (and size) is the file we validated.
+    set_mtime(&path, 1_800_000_000, 100_000_000);
+    assert!(!health.is_stale_for(&path, DatSourceKind::File));
+}
+
+#[test]
+fn a_record_without_a_subsecond_part_stays_at_whole_second_resolution() {
+    let dir = temp();
+    let path = write(dir.path(), "legacy.dat", LOGIQX);
+    set_mtime(&path, 1_800_000_000, 100_000_000);
+    let entry = entry_for(&path, DatSourceKind::File);
+    let (report, _expected) = validate_dat_source(&entry, DatLimits::default());
+    let mut legacy = report.to_health(&path, DatSourceKind::File);
+    legacy.observed_modified_subsec_nanos = None;
+
+    // Precision is never invented: a different sub-second part in the same
+    // second is not claimed to be a change for a record that never saw it.
+    set_mtime(&path, 1_800_000_000, 600_000_000);
+    assert!(!legacy.is_stale_for(&path, DatSourceKind::File));
+    // A different whole second or size is still caught, as before.
+    set_mtime(&path, 1_800_000_001, 100_000_000);
+    assert!(legacy.is_stale_for(&path, DatSourceKind::File));
+}
+
+#[test]
+fn the_subsecond_part_survives_save_and_load_and_old_files_without_it_still_load() {
+    let dir = temp();
+    let path = write(dir.path(), "persist.dat", LOGIQX);
+    set_mtime(&path, 1_800_000_000, 250_000_000);
+    let mut entry = entry_for(&path, DatSourceKind::File);
+    let (report, _expected) = validate_dat_source(&entry, DatLimits::default());
+    entry.health = report.to_health(&path, DatSourceKind::File);
+    let config = DatSourceConfigEntry::from_entry(&entry);
+    assert_eq!(
+        config.health_observed_modified_subsec_nanos,
+        Some(250_000_000)
+    );
+    let text = toml::to_string(&config).unwrap();
+    assert!(text.contains("health_observed_modified_subsec_nanos = 250000000"));
+    // A file written before the key existed loads with no sub-second part.
+    let legacy_text = text
+        .lines()
+        .filter(|line| !line.starts_with("health_observed_modified_subsec_nanos"))
+        .collect::<Vec<_>>()
+        .join("\n");
+    let legacy: DatSourceConfigEntry = toml::from_str(&legacy_text).unwrap();
+    assert_eq!(legacy.health_observed_modified_subsec_nanos, None);
+    assert_eq!(
+        legacy
+            .into_entry("redump".into())
+            .health
+            .observed_modified_subsec_nanos,
+        None
     );
 }
 
@@ -914,8 +1043,9 @@ fn everything_a_user_set_round_trips() {
         entry.platform = Some("NES".to_string());
         entry.origin = Some("added via GUI".to_string());
         entry.priority = 42;
-        entry.health =
-            validate_dat_source(entry, DatLimits::default()).to_health(&path, DatSourceKind::File);
+        entry.health = validate_dat_source(entry, DatLimits::default())
+            .0
+            .to_health(&path, DatSourceKind::File);
     }
     let before = registry.get("full").unwrap().clone();
 
@@ -1173,6 +1303,7 @@ fn bare_config_entry(id: &str, path: &str) -> DatSourceConfigEntry {
         display_name: id.to_string(),
         path: path.to_string(),
         kind: DatSourceKind::File,
+        ownership: DatSourceOwnership::UserLocal,
         enabled: None,
         priority: None,
         platform: None,
@@ -1187,6 +1318,8 @@ fn bare_config_entry(id: &str, path: &str) -> DatSourceConfigEntry {
         health_formats: None,
         health_observed_size_bytes: None,
         health_observed_modified_unix_seconds: None,
+        health_observed_modified_subsec_nanos: None,
+        health_arcade_catalogue_revisions: None,
         unknown_fields: toml::Table::new(),
     }
 }
@@ -1494,6 +1627,824 @@ fn an_audit_finds_an_exact_match_and_reports_what_is_absent() {
         vec!["Test No-Intro Collection".to_string()]
     );
     assert!(outcome.headline().contains("Test No-Intro Collection"));
+}
+
+#[test]
+fn zip_members_are_matched_individually_but_never_enter_rename_planning() {
+    use crate::dat::archive::ArchiveMemberStatus;
+    use crate::dat::audit::AuditVerdict;
+    use crate::dat::rename_plan::{RenamePlanContext, build_rename_plan};
+    use std::io::Write;
+    use zip::write::SimpleFileOptions;
+    use zip::{CompressionMethod, ZipWriter};
+
+    let dir = temp();
+    let dat = write(
+        dir.path(),
+        "members.dat",
+        r#"<datafile><header><name>ZIP member catalogue</name></header>
+<game name="Game (World)"><rom name="world.rom" size="4" sha1="a94a8fe5ccb19ba61c4c0873d391e987982fbbd3"/></game>
+<game name="Game (USA)"><rom name="usa.rom" size="4" sha1="a94a8fe5ccb19ba61c4c0873d391e987982fbbd3"/></game>
+<game name="Other"><rom name="other.rom" size="3" sha1="a9993e364706816aba3e25717850c26c9cd0d89d"/></game>
+</datafile>"#,
+    );
+    let roms = dir.path().join("roms");
+    std::fs::create_dir(&roms).unwrap();
+    let archive = roms.join("collection.zip");
+    let mut writer = ZipWriter::new(std::fs::File::create(&archive).unwrap());
+    for (name, contents, method) in [
+        ("game.rom", b"test".as_slice(), CompressionMethod::Stored),
+        ("other.rom", b"abc".as_slice(), CompressionMethod::Deflated),
+    ] {
+        writer
+            .start_file(
+                name,
+                SimpleFileOptions::default().compression_method(method),
+            )
+            .unwrap();
+        writer.write_all(contents).unwrap();
+    }
+    writer.finish().unwrap();
+    let archive_before = std::fs::read(&archive).unwrap();
+
+    let request = DatAuditRequest {
+        source_id: "members".to_string(),
+        source_display_name: "ZIP member catalogue".to_string(),
+        dat_path: dat,
+        dat_kind: DatSourceKind::File,
+        scan_root: roms,
+        limits: DatLimits::default(),
+        policy: None,
+        platform: None,
+    };
+    let outcome = run_dat_audit(&request, &TrustedRoots::none(), &no_cancel(), &|_| {}).unwrap();
+
+    assert_eq!(
+        outcome.report.entries.len(),
+        1,
+        "outer ZIP stays one physical row"
+    );
+    assert_eq!(outcome.archives.len(), 1);
+    assert_eq!(outcome.archives[0].members.len(), 2);
+    assert!(
+        outcome.archives[0]
+            .members
+            .iter()
+            .all(|member| member.evidence.status == ArchiveMemberStatus::HashComplete)
+    );
+    assert!(
+        matches!(
+            outcome.archives[0].members[0].verdict,
+            Some(AuditVerdict::ExactMultipleCandidates { count: 2, .. })
+        ),
+        "two exact region variants identify the content; they are not ambiguity"
+    );
+    assert!(matches!(
+        outcome.archives[0].members[1].verdict,
+        Some(AuditVerdict::Exact { ref game_name, .. }) if game_name == "Other"
+    ));
+
+    let plan =
+        build_rename_plan(&outcome, &RenamePlanContext { generation: 1 }, &no_cancel()).unwrap();
+    assert!(
+        plan.proposals.is_empty(),
+        "archive evidence must not produce rename proposals"
+    );
+    assert_eq!(
+        std::fs::read(&archive).unwrap(),
+        archive_before,
+        "audit must not rewrite ZIP"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// RomVault `forcepacking="fileonly"` packing policy.
+// ---------------------------------------------------------------------------
+
+fn sha1_hex(bytes: &[u8]) -> String {
+    use sha1::{Digest, Sha1};
+    let mut hasher = Sha1::new();
+    hasher.update(bytes);
+    hasher
+        .finalize()
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect()
+}
+
+/// Writes a two-member ZIP and returns its path plus the SHA-1 of the whole
+/// file (the outer container's own bytes) - not any member's.
+fn write_two_member_zip(dir: &Path, name: &str) -> (PathBuf, String) {
+    use std::io::Write;
+    use zip::write::SimpleFileOptions;
+    use zip::{CompressionMethod, ZipWriter};
+
+    let path = dir.join(name);
+    let mut writer = ZipWriter::new(std::fs::File::create(&path).unwrap());
+    for (member_name, contents) in [("a.rom", b"aaaa".as_slice()), ("b.rom", b"bbbb".as_slice())] {
+        writer
+            .start_file(
+                member_name,
+                SimpleFileOptions::default().compression_method(CompressionMethod::Stored),
+            )
+            .unwrap();
+        writer.write_all(contents).unwrap();
+    }
+    writer.finish().unwrap();
+    let bytes = std::fs::read(&path).unwrap();
+    (path, sha1_hex(&bytes))
+}
+
+#[test]
+fn fileonly_hashes_matches_the_outer_zip_and_never_inspects_members() {
+    use crate::dat::audit::AuditVerdict;
+
+    let dir = temp();
+    let roms = dir.path().join("roms");
+    std::fs::create_dir(&roms).unwrap();
+    let (archive, outer_sha1) = write_two_member_zip(&roms, "collection.zip");
+    let archive_len = std::fs::metadata(&archive).unwrap().len();
+
+    let dat = write(
+        dir.path(),
+        "fileonly.dat",
+        &format!(
+            r#"<datafile><header><name>RomVault fileonly set</name><romvault forcepacking="fileonly" /></header>
+<game name="Collection"><rom name="collection.zip" size="{archive_len}" sha1="{outer_sha1}"/></game>
+</datafile>"#
+        ),
+    );
+
+    let request = DatAuditRequest {
+        source_id: "fileonly".to_string(),
+        source_display_name: "RomVault fileonly set".to_string(),
+        dat_path: dat,
+        dat_kind: DatSourceKind::File,
+        scan_root: roms,
+        limits: DatLimits::default(),
+        policy: None,
+        platform: None,
+    };
+    let outcome = run_dat_audit(&request, &TrustedRoots::none(), &no_cancel(), &|_| {}).unwrap();
+
+    assert_eq!(
+        outcome.archives.len(),
+        0,
+        "fileonly must never run member-level archive inspection"
+    );
+    assert_eq!(outcome.report.entries.len(), 1);
+    assert!(
+        matches!(
+            outcome.report.entries[0].verdict,
+            AuditVerdict::Exact { ref game_name, .. } if game_name == "Collection"
+        ),
+        "the outer ZIP's own hash must match the fileonly DAT item: {:?}",
+        outcome.report.entries[0].verdict
+    );
+}
+
+#[test]
+fn fileonly_never_matches_an_inner_member_even_when_a_member_hash_would_coincidentally_fit() {
+    // The DAT's only rom entry is the *member*'s hash, never declared as
+    // the outer's - if fileonly enumerated members anyway, this member
+    // would falsely "match". It must not: fileonly never runs the member
+    // pass at all, so this can only ever surface as `NotInDat` for the
+    // outer whole-file hash (which does not equal the member's hash).
+    let dir = temp();
+    let roms = dir.path().join("roms");
+    std::fs::create_dir(&roms).unwrap();
+    let (archive, _outer_sha1) = write_two_member_zip(&roms, "collection.zip");
+    let member_sha1 = sha1_hex(b"aaaa");
+    let _ = &archive;
+
+    let dat = write(
+        dir.path(),
+        "fileonly.dat",
+        &format!(
+            r#"<datafile><header><name>RomVault fileonly set</name><romvault forcepacking="fileonly" /></header>
+<game name="Collection"><rom name="a.rom" size="4" sha1="{member_sha1}"/></game>
+</datafile>"#
+        ),
+    );
+
+    let request = DatAuditRequest {
+        source_id: "fileonly-decoy".to_string(),
+        source_display_name: "RomVault fileonly set".to_string(),
+        dat_path: dat,
+        dat_kind: DatSourceKind::File,
+        scan_root: roms,
+        limits: DatLimits::default(),
+        policy: None,
+        platform: None,
+    };
+    let outcome = run_dat_audit(&request, &TrustedRoots::none(), &no_cancel(), &|_| {}).unwrap();
+
+    assert_eq!(outcome.archives.len(), 0);
+    assert_eq!(outcome.report.entries.len(), 1);
+    assert!(
+        !matches!(
+            outcome.report.entries[0].verdict,
+            crate::dat::audit::AuditVerdict::Exact { .. }
+        ),
+        "the outer ZIP's whole-file hash must not equal an inner member's hash by policy \
+         confusion: {:?}",
+        outcome.report.entries[0].verdict
+    );
+}
+
+#[test]
+fn ordinary_dat_with_no_forcepacking_marker_retains_member_based_archive_inspection() {
+    use crate::dat::audit::AuditVerdict;
+
+    let dir = temp();
+    let roms = dir.path().join("roms");
+    std::fs::create_dir(&roms).unwrap();
+    let (archive, _outer_sha1) = write_two_member_zip(&roms, "collection.zip");
+    let _ = &archive;
+    let member_sha1 = sha1_hex(b"aaaa");
+
+    let dat = write(
+        dir.path(),
+        "standard.dat",
+        &format!(
+            r#"<datafile><header><name>Ordinary set</name></header>
+<game name="Alpha"><rom name="a.rom" size="4" sha1="{member_sha1}"/></game>
+</datafile>"#
+        ),
+    );
+
+    let request = DatAuditRequest {
+        source_id: "standard".to_string(),
+        source_display_name: "Ordinary set".to_string(),
+        dat_path: dat,
+        dat_kind: DatSourceKind::File,
+        scan_root: roms,
+        limits: DatLimits::default(),
+        policy: None,
+        platform: None,
+    };
+    let outcome = run_dat_audit(&request, &TrustedRoots::none(), &no_cancel(), &|_| {}).unwrap();
+
+    assert_eq!(
+        outcome.archives.len(),
+        1,
+        "a standard DAT must still open the archive for member inspection"
+    );
+    assert_eq!(outcome.archives[0].members.len(), 2);
+    assert!(matches!(
+        outcome.archives[0].members[0].verdict,
+        Some(AuditVerdict::Exact { ref game_name, .. }) if game_name == "Alpha"
+    ));
+}
+
+#[test]
+fn unrecognized_forcepacking_value_fails_closed_at_audit_time() {
+    let dir = temp();
+    let roms = dir.path().join("roms");
+    std::fs::create_dir(&roms).unwrap();
+    let dat = write(
+        dir.path(),
+        "weird.dat",
+        r#"<datafile><header><name>Weird set</name><romvault forcepacking="something-nobody-invented" /></header>
+<game name="Game"><rom name="game.rom" size="4" crc="deadbeef"/></game>
+</datafile>"#,
+    );
+
+    let request = DatAuditRequest {
+        source_id: "weird".to_string(),
+        source_display_name: "Weird set".to_string(),
+        dat_path: dat,
+        dat_kind: DatSourceKind::File,
+        scan_root: roms,
+        limits: DatLimits::default(),
+        policy: None,
+        platform: None,
+    };
+    let error = run_dat_audit(&request, &TrustedRoots::none(), &no_cancel(), &|_| {})
+        .expect_err("an unrecognised packing policy must fail closed, not default to Standard");
+    assert!(
+        matches!(error, DatAuditError::UnrecognizedPackingPolicy(ref value) if value == "something-nobody-invented")
+    );
+}
+
+#[test]
+fn conflicting_packing_policies_across_a_merged_folder_source_fail_closed() {
+    let dir = temp();
+    let roms = dir.path().join("roms");
+    std::fs::create_dir(&roms).unwrap();
+    let dat_dir = dir.path().join("dats");
+    std::fs::create_dir(&dat_dir).unwrap();
+    write(
+        &dat_dir,
+        "standard.dat",
+        r#"<datafile><header><name>Standard part</name></header>
+<game name="A"><rom name="a.rom" size="4" crc="deadbeef"/></game>
+</datafile>"#,
+    );
+    write(
+        &dat_dir,
+        "fileonly.dat",
+        r#"<datafile><header><name>Fileonly part</name><romvault forcepacking="fileonly" /></header>
+<game name="B"><rom name="b.zip" size="4" crc="cafef00d"/></game>
+</datafile>"#,
+    );
+
+    let request = DatAuditRequest {
+        source_id: "mixed".to_string(),
+        source_display_name: "Mixed folder".to_string(),
+        dat_path: dat_dir,
+        dat_kind: DatSourceKind::Folder,
+        scan_root: roms,
+        limits: DatLimits::default(),
+        policy: None,
+        platform: None,
+    };
+    let error = run_dat_audit(&request, &TrustedRoots::none(), &no_cancel(), &|_| {})
+        .expect_err("conflicting packing policies across merged DAT files must fail closed");
+    assert_eq!(error, DatAuditError::ConflictingPackingPolicy);
+}
+
+/// Builds a syntactically valid 124-byte CHD v5 header with the given
+/// `overall_sha1`, mirroring the fixture in `dat::disk_audit`'s own tests.
+fn synthetic_chd_header(overall_sha1: [u8; 20]) -> Vec<u8> {
+    fn put_u32(bytes: &mut [u8], offset: usize, value: u32) {
+        bytes[offset..offset + 4].copy_from_slice(&value.to_be_bytes());
+    }
+    fn put_u64(bytes: &mut [u8], offset: usize, value: u64) {
+        bytes[offset..offset + 8].copy_from_slice(&value.to_be_bytes());
+    }
+    let mut bytes = [0_u8; 124];
+    bytes[0..8].copy_from_slice(b"MComprHD");
+    put_u32(&mut bytes, 8, 124);
+    put_u32(&mut bytes, 12, 5);
+    put_u64(&mut bytes, 32, 4096);
+    put_u32(&mut bytes, 56, 0x0002_0000);
+    put_u32(&mut bytes, 60, 0x0000_0800);
+    bytes[84..104].copy_from_slice(&overall_sha1);
+    bytes.to_vec()
+}
+
+#[test]
+fn end_to_end_chd_disk_evidence_reaches_a_complete_mixed_set() {
+    use zip::write::SimpleFileOptions;
+    use zip::{CompressionMethod, ZipWriter};
+
+    let dir = temp();
+    let dat = write(
+        dir.path(),
+        "disc.dat",
+        r#"<datafile><header><name>Disc catalogue</name></header>
+<game name="Disc Game (World)">
+<rom name="game.cue" size="4" sha1="a94a8fe5ccb19ba61c4c0873d391e987982fbbd3"/>
+<disk name="game" sha1="111111111111111111111111111111111111111a"/>
+</game>
+</datafile>"#,
+    );
+    let library = dir.path().join("library");
+    std::fs::create_dir(&library).unwrap();
+
+    // The ROM half: a ZIP containing the one required rom.
+    let archive = library.join("collection.zip");
+    let mut writer = ZipWriter::new(std::fs::File::create(&archive).unwrap());
+    writer
+        .start_file(
+            "game.cue",
+            SimpleFileOptions::default().compression_method(CompressionMethod::Stored),
+        )
+        .unwrap();
+    std::io::Write::write_all(&mut writer, b"test").unwrap();
+    writer.finish().unwrap();
+
+    // The disk half: a loose .chd whose header `overall_sha1` matches the
+    // DAT's declared disk identity - never a hash of the .chd file's own
+    // bytes.
+    let mut overall_sha1 = [0x11_u8; 20];
+    overall_sha1[19] = 0x1a;
+    std::fs::write(library.join("game.chd"), synthetic_chd_header(overall_sha1)).unwrap();
+
+    let request = DatAuditRequest {
+        source_id: "disc".to_string(),
+        source_display_name: "Disc catalogue".to_string(),
+        dat_path: dat,
+        dat_kind: DatSourceKind::File,
+        scan_root: library,
+        limits: DatLimits::default(),
+        policy: None,
+        platform: None,
+    };
+    let outcome = run_dat_audit(&request, &TrustedRoots::none(), &no_cancel(), &|_| {}).unwrap();
+
+    assert_eq!(outcome.sets.len(), 1);
+    assert_eq!(outcome.sets[0].state, crate::dat::set::SetState::Complete);
+    assert_eq!(outcome.sets[0].disks_required, vec!["game"]);
+    assert_eq!(outcome.sets[0].disks_identity_matched, vec!["game"]);
+}
+
+#[test]
+fn end_to_end_wrong_chd_never_satisfies_the_required_disk_slot() {
+    use zip::write::SimpleFileOptions;
+    use zip::{CompressionMethod, ZipWriter};
+
+    let dir = temp();
+    let dat = write(
+        dir.path(),
+        "disc.dat",
+        r#"<datafile><header><name>Disc catalogue</name></header>
+<game name="Disc Game (World)">
+<rom name="game.cue" size="4" sha1="a94a8fe5ccb19ba61c4c0873d391e987982fbbd3"/>
+<disk name="game" sha1="111111111111111111111111111111111111111a"/>
+</game>
+</datafile>"#,
+    );
+    let library = dir.path().join("library");
+    std::fs::create_dir(&library).unwrap();
+
+    let archive = library.join("collection.zip");
+    let mut writer = ZipWriter::new(std::fs::File::create(&archive).unwrap());
+    writer
+        .start_file(
+            "game.cue",
+            SimpleFileOptions::default().compression_method(CompressionMethod::Stored),
+        )
+        .unwrap();
+    std::io::Write::write_all(&mut writer, b"test").unwrap();
+    writer.finish().unwrap();
+
+    // A CHD is present, but its overall_sha1 matches nothing in the DAT.
+    let mut unrelated_sha1 = [0x22_u8; 20];
+    unrelated_sha1[19] = 0x2b;
+    std::fs::write(
+        library.join("game.chd"),
+        synthetic_chd_header(unrelated_sha1),
+    )
+    .unwrap();
+
+    let request = DatAuditRequest {
+        source_id: "disc".to_string(),
+        source_display_name: "Disc catalogue".to_string(),
+        dat_path: dat,
+        dat_kind: DatSourceKind::File,
+        scan_root: library,
+        limits: DatLimits::default(),
+        policy: None,
+        platform: None,
+    };
+    let outcome = run_dat_audit(&request, &TrustedRoots::none(), &no_cancel(), &|_| {}).unwrap();
+
+    assert_eq!(outcome.sets.len(), 1);
+    assert_ne!(outcome.sets[0].state, crate::dat::set::SetState::Complete);
+    assert!(outcome.sets[0].disks_identity_matched.is_empty());
+}
+
+#[test]
+fn end_to_end_all_zero_sentinel_disk_and_chd_never_reach_complete() {
+    use zip::write::SimpleFileOptions;
+    use zip::{CompressionMethod, ZipWriter};
+
+    let dir = temp();
+    // Independent review's concrete false-Complete finding: an unset DAT
+    // disk SHA-1 (all zeroes) and an unset CHD header overall_sha1 (all
+    // zeroes) must never be treated as matching each other, even with a
+    // genuinely verified ROM alongside.
+    let dat = write(
+        dir.path(),
+        "disc.dat",
+        r#"<datafile><header><name>Disc catalogue</name></header>
+<game name="Disc Game (World)">
+<rom name="game.cue" size="4" sha1="a94a8fe5ccb19ba61c4c0873d391e987982fbbd3"/>
+<disk name="game" sha1="0000000000000000000000000000000000000000"/>
+</game>
+</datafile>"#,
+    );
+    let library = dir.path().join("library");
+    std::fs::create_dir(&library).unwrap();
+
+    let archive = library.join("collection.zip");
+    let mut writer = ZipWriter::new(std::fs::File::create(&archive).unwrap());
+    writer
+        .start_file(
+            "game.cue",
+            SimpleFileOptions::default().compression_method(CompressionMethod::Stored),
+        )
+        .unwrap();
+    std::io::Write::write_all(&mut writer, b"test").unwrap();
+    writer.finish().unwrap();
+
+    // A CHD whose header overall_sha1 is also all-zero.
+    std::fs::write(library.join("game.chd"), synthetic_chd_header([0x00; 20])).unwrap();
+
+    let request = DatAuditRequest {
+        source_id: "disc".to_string(),
+        source_display_name: "Disc catalogue".to_string(),
+        dat_path: dat,
+        dat_kind: DatSourceKind::File,
+        scan_root: library,
+        limits: DatLimits::default(),
+        policy: None,
+        platform: None,
+    };
+    let outcome = run_dat_audit(&request, &TrustedRoots::none(), &no_cancel(), &|_| {}).unwrap();
+
+    assert_eq!(outcome.sets.len(), 1);
+    assert_ne!(
+        outcome.sets[0].state,
+        crate::dat::set::SetState::Complete,
+        "two all-zero sentinels must never satisfy a required disk slot"
+    );
+    assert!(outcome.sets[0].disks_identity_matched.is_empty());
+}
+
+#[test]
+fn end_to_end_chd_container_bytes_matching_a_dat_rom_digest_never_produces_a_rom_match() {
+    use crate::dat::rename_plan::{RenamePlanContext, build_rename_plan};
+    use sha1::{Sha1, digest::Digest};
+
+    let dir = temp();
+    let library = dir.path().join("library");
+    std::fs::create_dir(&library).unwrap();
+
+    // A syntactically valid CHD v5 header whose own whole-file bytes will be
+    // declared, in the DAT below, as a ROM's digest - modelling a
+    // pathological (or adversarial) container whose container-level SHA-1
+    // happens to collide with a completely unrelated DAT ROM entry.
+    let mut overall_sha1 = [0x33_u8; 20];
+    overall_sha1[19] = 0x3c;
+    let chd_bytes = synthetic_chd_header(overall_sha1);
+    let container_sha1: String = Sha1::digest(&chd_bytes)
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect();
+    let disk_sha1: String = overall_sha1
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect();
+
+    // Explicit assertion (finding 2C): the raw container digest and the
+    // disk-identity digest are never the same value or the same lookup
+    // path - constructing them from different byte spans of the same file
+    // proves they cannot coincidentally be compared against each other.
+    assert_ne!(container_sha1, disk_sha1);
+
+    let dat = write(
+        dir.path(),
+        "collision.dat",
+        &format!(
+            r#"<datafile><header><name>Collision catalogue</name></header>
+<game name="Unrelated ROM Game">
+<rom name="evil.rom" size="{}" sha1="{container_sha1}"/>
+</game>
+<game name="Disc Game">
+<disk name="game" sha1="{disk_sha1}"/>
+</game>
+</datafile>"#,
+            chd_bytes.len()
+        ),
+    );
+    std::fs::write(library.join("game.chd"), &chd_bytes).unwrap();
+
+    let request = DatAuditRequest {
+        source_id: "collision".to_string(),
+        source_display_name: "Collision catalogue".to_string(),
+        dat_path: dat,
+        dat_kind: DatSourceKind::File,
+        scan_root: library,
+        limits: DatLimits::default(),
+        policy: None,
+        platform: None,
+    };
+    let outcome = run_dat_audit(&request, &TrustedRoots::none(), &no_cancel(), &|_| {}).unwrap();
+
+    // Finding 2A: the CHD must never appear as ordinary ROM evidence, even
+    // though its whole-file bytes are a byte-for-byte match for a declared
+    // DAT ROM digest.
+    assert!(
+        outcome
+            .report
+            .entries
+            .iter()
+            .all(|entry| !entry.local_path.contains("game.chd")),
+        "a .chd must never enter the ordinary loose-ROM report at all"
+    );
+    assert!(
+        !outcome.report.entries.iter().any(|entry| matches!(
+            &entry.verdict,
+            crate::dat::audit::AuditVerdict::Exact { game_name, .. }
+                if game_name == "Unrelated ROM Game"
+        )),
+        "the coincidental container-byte match must never surface as a ROM Exact verdict"
+    );
+
+    let plan =
+        build_rename_plan(&outcome, &RenamePlanContext { generation: 1 }, &no_cancel()).unwrap();
+    assert!(
+        plan.proposals.is_empty(),
+        "a CHD misidentified as a ROM must never become rename-eligible"
+    );
+
+    // Finding 2B: the very same CHD still independently matches its DAT
+    // <disk sha1> declaration via overall_sha1 - the fix routes it away from
+    // ROM evidence, it does not blind the disk-evidence path to it.
+    let disk_dat = crate::dat::parsers::parse_dat_file(
+        &request.dat_path,
+        crate::dat::limits::DatLimits::default(),
+    )
+    .unwrap()
+    .dat;
+    let disk_index = crate::dat::index::DatDiskIndex::build(&disk_dat);
+    let disk_audit = crate::dat::disk_audit::audit_chd_disk(
+        &request.scan_root.join("game.chd"),
+        &TrustedRoots::none(),
+        &disk_index,
+    );
+    assert!(
+        matches!(
+            disk_audit.verdict,
+            Some(crate::dat::disk_audit::DiskAuditVerdict::Exact { ref game_name, .. })
+                if game_name == "Disc Game"
+        ),
+        "the CHD's overall_sha1 must still independently match its DAT disk entry"
+    );
+}
+
+#[test]
+fn sevenz_members_are_matched_individually_but_never_enter_rename_planning() {
+    use crate::dat::archive::ArchiveMemberStatus;
+    use crate::dat::audit::AuditVerdict;
+    use crate::dat::rename_plan::{RenamePlanContext, build_rename_plan};
+    use sevenz_rust2::{ArchiveEntry, ArchiveWriter};
+    use std::io::Cursor;
+
+    let dir = temp();
+    let dat = write(
+        dir.path(),
+        "members.dat",
+        r#"<datafile><header><name>7z member catalogue</name></header>
+<game name="Game (World)"><rom name="world.rom" size="4" sha1="a94a8fe5ccb19ba61c4c0873d391e987982fbbd3"/></game>
+<game name="Game (USA)"><rom name="usa.rom" size="4" sha1="a94a8fe5ccb19ba61c4c0873d391e987982fbbd3"/></game>
+<game name="Other"><rom name="other.rom" size="3" sha1="a9993e364706816aba3e25717850c26c9cd0d89d"/></game>
+</datafile>"#,
+    );
+    let roms = dir.path().join("roms");
+    std::fs::create_dir(&roms).unwrap();
+    let archive = roms.join("collection.7z");
+    let mut writer = ArchiveWriter::new(std::fs::File::create(&archive).unwrap()).unwrap();
+    for (name, contents) in [
+        ("game.rom", b"test".as_slice()),
+        ("other.rom", b"abc".as_slice()),
+    ] {
+        let mut entry = ArchiveEntry::new();
+        entry.name = name.to_string();
+        entry.has_stream = true;
+        entry.size = contents.len() as u64;
+        writer
+            .push_archive_entry(entry, Some(Cursor::new(contents)))
+            .unwrap();
+    }
+    writer.finish().unwrap();
+    let archive_before = std::fs::read(&archive).unwrap();
+
+    let request = DatAuditRequest {
+        source_id: "members".to_string(),
+        source_display_name: "7z member catalogue".to_string(),
+        dat_path: dat,
+        dat_kind: DatSourceKind::File,
+        scan_root: roms,
+        limits: DatLimits::default(),
+        policy: None,
+        platform: None,
+    };
+    let outcome = run_dat_audit(&request, &TrustedRoots::none(), &no_cancel(), &|_| {}).unwrap();
+
+    assert_eq!(
+        outcome.report.entries.len(),
+        1,
+        "outer 7z stays one physical row"
+    );
+    assert_eq!(outcome.archives.len(), 1);
+    assert_eq!(outcome.archives[0].format, "7z");
+    assert_eq!(outcome.archives[0].members.len(), 2);
+    assert!(
+        outcome.archives[0]
+            .members
+            .iter()
+            .all(|member| member.evidence.status == ArchiveMemberStatus::HashComplete)
+    );
+    assert!(
+        matches!(
+            outcome.archives[0].members[0].verdict,
+            Some(AuditVerdict::ExactMultipleCandidates { count: 2, .. })
+        ),
+        "two exact region variants identify the content; they are not ambiguity"
+    );
+    assert!(matches!(
+        outcome.archives[0].members[1].verdict,
+        Some(AuditVerdict::Exact { ref game_name, .. }) if game_name == "Other"
+    ));
+
+    let plan =
+        build_rename_plan(&outcome, &RenamePlanContext { generation: 1 }, &no_cancel()).unwrap();
+    assert!(
+        plan.proposals.is_empty(),
+        "archive evidence must not produce rename proposals"
+    );
+    assert_eq!(
+        std::fs::read(&archive).unwrap(),
+        archive_before,
+        "audit must not rewrite 7z"
+    );
+}
+
+#[test]
+fn set_completeness_evidence_drives_only_the_outer_archive_rename_never_a_member() {
+    use crate::dat::rename_plan::{RenamePlanContext, build_rename_plan};
+    use crate::dat::set::SetState;
+    use sevenz_rust2::{ArchiveEntry, ArchiveWriter};
+    use std::io::Cursor;
+
+    let dir = temp();
+    let dat_path = write(
+        dir.path(),
+        "set.dat",
+        r#"<datafile><header><name>Set completeness catalogue</name></header>
+<game name="Game (World)">
+<rom name="game.cue" size="4" sha1="a94a8fe5ccb19ba61c4c0873d391e987982fbbd3"/>
+<rom name="game (Track 1).bin" size="3" sha1="a9993e364706816aba3e25717850c26c9cd0d89d"/>
+</game>
+</datafile>"#,
+    );
+    let roms = dir.path().join("roms");
+    std::fs::create_dir(&roms).unwrap();
+    let archive_path = roms.join("collection.7z");
+    let mut writer = ArchiveWriter::new(std::fs::File::create(&archive_path).unwrap()).unwrap();
+    for (name, contents) in [
+        ("game.cue", b"test".as_slice()),
+        ("game (Track 1).bin", b"abc".as_slice()),
+    ] {
+        let mut entry = ArchiveEntry::new();
+        entry.name = name.to_string();
+        entry.has_stream = true;
+        entry.size = contents.len() as u64;
+        writer
+            .push_archive_entry(entry, Some(Cursor::new(contents)))
+            .unwrap();
+    }
+    writer.finish().unwrap();
+
+    let request = DatAuditRequest {
+        source_id: "set-completeness".to_string(),
+        source_display_name: "Set completeness catalogue".to_string(),
+        dat_path: dat_path.clone(),
+        dat_kind: DatSourceKind::File,
+        scan_root: roms,
+        limits: DatLimits::default(),
+        policy: None,
+        platform: None,
+    };
+    let outcome = run_dat_audit(&request, &TrustedRoots::none(), &no_cancel(), &|_| {}).unwrap();
+    assert_eq!(outcome.archives.len(), 1);
+
+    // `run_dat_audit` computes set-completeness itself, bound to the exact
+    // `ParsedDat` instance it indexed - `dat::set::classify_archive_sets` is
+    // `pub(crate)` precisely so nothing outside this crate (and no test
+    // pretending to be an external caller) can hand it an independently
+    // re-parsed games slice and reopen the TOCTOU gap that would create.
+    assert_eq!(outcome.sets.len(), 1);
+    assert_eq!(outcome.sets[0].state, SetState::Complete);
+
+    // The set evidence above is never fed back into `outcome.report` - the
+    // outer-archive rename path reads `outcome.archives`/`outcome.sets`
+    // directly, entirely separate from the flat per-file report the
+    // loose-file rename path reads. A `Complete` set now legitimately
+    // produces exactly ONE proposal - a rename of the *outer* archive path,
+    // named from the DAT set/game name - and critically, never a proposal
+    // for either member individually: no member name may ever become a
+    // rename source or a rename target.
+    let plan =
+        build_rename_plan(&outcome, &RenamePlanContext { generation: 1 }, &no_cancel()).unwrap();
+    assert_eq!(plan.proposals.len(), 1);
+    let proposal = &plan.proposals[0];
+    assert!(
+        proposal.is_outer_archive,
+        "the one proposal a Complete set produces must be the outer-archive rename"
+    );
+    assert_eq!(proposal.source_path, archive_path);
+    assert_eq!(proposal.game_name.as_deref(), Some("Game (World)"));
+    assert_eq!(
+        proposal.rom_name, None,
+        "an outer-archive proposal names no single rom"
+    );
+    for member_name in ["game.cue", "game (Track 1).bin"] {
+        assert_ne!(
+            proposal.source_path.file_name().unwrap().to_str().unwrap(),
+            member_name,
+            "no archive member may itself become a rename source"
+        );
+        assert_ne!(
+            proposal.proposed_basename.as_deref(),
+            Some(member_name),
+            "no archive member's name may become a rename target"
+        );
+    }
 }
 
 #[test]
@@ -1880,4 +2831,1134 @@ fn an_audit_refuses_a_relative_scan_root() {
     let error = run_dat_audit(&request, &TrustedRoots::none(), &cancel, &|_| {})
         .expect_err("a relative scan root must be refused");
     assert!(matches!(error, DatAuditError::ScanPath(_)), "{error:?}");
+}
+
+// ---------------------------------------------------------------------
+// RAR integration: dispatch, DAT-driven verification, set completeness,
+// ambiguity, cross-format isolation, and rename eligibility through the
+// real `run_dat_audit` entry point.
+// ---------------------------------------------------------------------
+
+fn rar_fixture(name: &str) -> PathBuf {
+    PathBuf::from(concat!(env!("CARGO_MANIFEST_DIR"), "/tests/fixtures/rar")).join(name)
+}
+
+// helloworld.txt's real digests (the RAR5-stored libarchive fixture's one
+// 29-byte member), computed once out-of-band - see `dat::archive::rar`'s
+// own test module for the same constants at the lower-level API.
+const RAR_HELLOWORLD_SHA1: &str = "253aafde5dec9a54ed554bc7f95e6f291c60cbb0";
+const RAR_HELLOWORLD_WRONG_SHA1: &str = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+
+#[test]
+fn rar_member_reaches_set_complete_and_only_the_outer_archive_becomes_rename_eligible() {
+    use crate::dat::rename_plan::{RenamePlanContext, build_rename_plan};
+    use crate::dat::set::SetState;
+
+    let dir = temp();
+    let dat_path = write(
+        dir.path(),
+        "rar.dat",
+        &format!(
+            r#"<datafile><header><name>RAR catalogue</name></header>
+<game name="Hello World (Demo)">
+<rom name="helloworld.txt" size="29" sha1="{RAR_HELLOWORLD_SHA1}"/>
+</game>
+</datafile>"#
+        ),
+    );
+    let roms = dir.path().join("roms");
+    std::fs::create_dir(&roms).unwrap();
+    let archive_path = roms.join("collection.rar");
+    std::fs::copy(
+        rar_fixture("test_read_format_rar5_stored.rar"),
+        &archive_path,
+    )
+    .unwrap();
+
+    let request = DatAuditRequest {
+        source_id: "rar-set".to_string(),
+        source_display_name: "RAR catalogue".to_string(),
+        dat_path,
+        dat_kind: DatSourceKind::File,
+        scan_root: roms,
+        limits: DatLimits::default(),
+        policy: None,
+        platform: None,
+    };
+    let outcome = run_dat_audit(&request, &TrustedRoots::none(), &no_cancel(), &|_| {}).unwrap();
+
+    assert_eq!(outcome.archives.len(), 1);
+    assert_eq!(outcome.archives[0].format, "rar");
+    assert_eq!(
+        outcome.archives[0].completion,
+        crate::dat::archive::ArchivePassCompletion::Complete
+    );
+    assert_eq!(outcome.archives[0].members.len(), 1);
+    assert_eq!(
+        outcome.archives[0].members[0].evidence.status,
+        crate::dat::archive::ArchiveMemberStatus::HashComplete
+    );
+    // The RAR outer hash is retained as the parent's freshness baseline,
+    // while DAT matching remains member-only.
+    assert_eq!(outcome.report.entries.len(), 0);
+    assert_eq!(
+        outcome.files_scanned, 1,
+        "the .rar is still counted as scanned"
+    );
+
+    assert_eq!(outcome.sets.len(), 1);
+    assert_eq!(outcome.sets[0].state, SetState::Complete);
+
+    let plan =
+        build_rename_plan(&outcome, &RenamePlanContext { generation: 1 }, &no_cancel()).unwrap();
+    assert_eq!(plan.proposals.len(), 1);
+    let proposal = &plan.proposals[0];
+    assert!(
+        proposal.is_outer_archive,
+        "a Complete RAR set's one proposal must be the outer-archive rename"
+    );
+    assert_eq!(proposal.source_path, archive_path);
+    assert!(
+        proposal
+            .proposed_basename
+            .as_deref()
+            .is_none_or(|name| name.ends_with(".rar")),
+        "the outer archive's .rar extension must be preserved, never rewritten to .zip/.7z"
+    );
+    assert_ne!(
+        proposal.source_path.file_name().unwrap().to_str().unwrap(),
+        "helloworld.txt",
+        "the RAR member name must never itself become a rename source"
+    );
+    assert_ne!(
+        proposal.proposed_basename.as_deref(),
+        Some("helloworld.txt"),
+        "the RAR member name must never itself become a rename target"
+    );
+}
+
+#[test]
+fn rar_member_with_a_wrong_dat_hash_never_reaches_set_complete() {
+    use crate::dat::set::SetState;
+
+    let dir = temp();
+    let dat_path = write(
+        dir.path(),
+        "rar.dat",
+        &format!(
+            r#"<datafile><header><name>RAR catalogue</name></header>
+<game name="Hello World (Demo)">
+<rom name="helloworld.txt" size="29" sha1="{RAR_HELLOWORLD_WRONG_SHA1}"/>
+</game>
+</datafile>"#
+        ),
+    );
+    let roms = dir.path().join("roms");
+    std::fs::create_dir(&roms).unwrap();
+    std::fs::copy(
+        rar_fixture("test_read_format_rar5_stored.rar"),
+        roms.join("collection.rar"),
+    )
+    .unwrap();
+
+    let request = DatAuditRequest {
+        source_id: "rar-wrong-hash".to_string(),
+        source_display_name: "RAR catalogue".to_string(),
+        dat_path,
+        dat_kind: DatSourceKind::File,
+        scan_root: roms,
+        limits: DatLimits::default(),
+        policy: None,
+        platform: None,
+    };
+    let outcome = run_dat_audit(&request, &TrustedRoots::none(), &no_cancel(), &|_| {}).unwrap();
+
+    assert!(
+        outcome.archives[0].members[0]
+            .verdict
+            .as_ref()
+            .is_none_or(|verdict| {
+                !matches!(verdict, crate::dat::audit::AuditVerdict::Exact { .. })
+            })
+    );
+    assert!(outcome.archives[0].members[0].matched_refs.is_empty());
+    assert!(
+        outcome
+            .sets
+            .iter()
+            .all(|set| set.state != SetState::Complete),
+        "a member that fails the strong-hash gate must never let its set reach Complete: {:?}",
+        outcome.sets
+    );
+}
+
+#[test]
+fn rar4_never_reaches_set_complete_and_is_marked_unsupported_not_corrupt_rom_data() {
+    let dir = temp();
+    let dat_path = write(
+        dir.path(),
+        "rar.dat",
+        r#"<datafile><header><name>RAR catalogue</name></header>
+<game name="Anything"><rom name="anything.bin" size="4" sha1="a94a8fe5ccb19ba61c4c0873d391e987982fbbd3"/></game>
+</datafile>"#,
+    );
+    let roms = dir.path().join("roms");
+    std::fs::create_dir(&roms).unwrap();
+    // A real RAR4 archive named `.rar` - the extension gate never sniffs
+    // content, so this still dispatches to the RAR branch, where the
+    // provider itself refuses the unsupported version.
+    std::fs::copy(
+        rar_fixture("test_read_format_rar_compress_best.rar"),
+        roms.join("collection.rar"),
+    )
+    .unwrap();
+
+    let request = DatAuditRequest {
+        source_id: "rar4".to_string(),
+        source_display_name: "RAR catalogue".to_string(),
+        dat_path,
+        dat_kind: DatSourceKind::File,
+        scan_root: roms,
+        limits: DatLimits::default(),
+        policy: None,
+        platform: None,
+    };
+    let outcome = run_dat_audit(&request, &TrustedRoots::none(), &no_cancel(), &|_| {}).unwrap();
+
+    assert_eq!(outcome.archives.len(), 1);
+    assert_eq!(outcome.archives[0].format, "rar");
+    assert!(
+        !matches!(
+            outcome.archives[0].completion,
+            crate::dat::archive::ArchivePassCompletion::Complete
+        ),
+        "an unsupported RAR envelope must never report a Complete pass"
+    );
+    assert!(outcome.archives[0].members.is_empty());
+    assert!(
+        outcome
+            .sets
+            .iter()
+            .all(|set| set.state != crate::dat::set::SetState::Complete)
+    );
+}
+
+#[test]
+fn ambiguous_dat_candidates_for_one_rar_filename_never_produce_an_exact_verdict() {
+    let dir = temp();
+    // Two different games both declare a rom named "helloworld.txt", with
+    // different SHA-1 values - a genuine filename collision across the
+    // catalogue. Neither may be silently picked.
+    let dat_path = write(
+        dir.path(),
+        "rar.dat",
+        &format!(
+            r#"<datafile><header><name>RAR catalogue</name></header>
+<game name="Hello World (Demo)">
+<rom name="helloworld.txt" size="29" sha1="{RAR_HELLOWORLD_SHA1}"/>
+</game>
+<game name="Some Other Game">
+<rom name="helloworld.txt" size="29" sha1="{RAR_HELLOWORLD_WRONG_SHA1}"/>
+</game>
+</datafile>"#
+        ),
+    );
+    let roms = dir.path().join("roms");
+    std::fs::create_dir(&roms).unwrap();
+    std::fs::copy(
+        rar_fixture("test_read_format_rar5_stored.rar"),
+        roms.join("collection.rar"),
+    )
+    .unwrap();
+
+    let request = DatAuditRequest {
+        source_id: "rar-ambiguous".to_string(),
+        source_display_name: "RAR catalogue".to_string(),
+        dat_path,
+        dat_kind: DatSourceKind::File,
+        scan_root: roms,
+        limits: DatLimits::default(),
+        policy: None,
+        platform: None,
+    };
+    let outcome = run_dat_audit(&request, &TrustedRoots::none(), &no_cancel(), &|_| {}).unwrap();
+
+    assert_eq!(
+        outcome.archives[0].members[0].evidence.status,
+        crate::dat::archive::ArchiveMemberStatus::HashComplete
+    );
+    assert!(matches!(
+        outcome.archives[0].members[0].verdict.as_ref(),
+        Some(crate::dat::audit::AuditVerdict::Exact { .. })
+    ));
+    assert!(
+        outcome
+            .sets
+            .iter()
+            .any(|set| set.state == crate::dat::set::SetState::Complete)
+    );
+}
+
+#[test]
+fn a_corrupt_rar_never_downgrades_an_unrelated_zip_in_the_same_audit() {
+    use crate::dat::set::SetState;
+    use std::io::Write;
+    use zip::write::SimpleFileOptions;
+    use zip::{CompressionMethod, ZipWriter};
+
+    let dir = temp();
+    let dat_path = write(
+        dir.path(),
+        "mixed.dat",
+        &format!(
+            r#"<datafile><header><name>Mixed catalogue</name></header>
+<game name="Hello World (Demo)">
+<rom name="helloworld.txt" size="29" sha1="{RAR_HELLOWORLD_WRONG_SHA1}"/>
+</game>
+<game name="ZIP Game (World)">
+<rom name="zipgame.rom" size="4" sha1="a94a8fe5ccb19ba61c4c0873d391e987982fbbd3"/>
+</game>
+</datafile>"#
+        ),
+    );
+    let roms = dir.path().join("roms");
+    std::fs::create_dir(&roms).unwrap();
+    // A RAR whose one member cannot verify against the (deliberately wrong)
+    // DAT hash above.
+    std::fs::copy(
+        rar_fixture("test_read_format_rar5_stored.rar"),
+        roms.join("broken.rar"),
+    )
+    .unwrap();
+    // An unrelated, perfectly valid ZIP for a different game.
+    let zip_path = roms.join("zipgame.zip");
+    let mut writer = ZipWriter::new(std::fs::File::create(&zip_path).unwrap());
+    writer
+        .start_file(
+            "zipgame.rom",
+            SimpleFileOptions::default().compression_method(CompressionMethod::Stored),
+        )
+        .unwrap();
+    writer.write_all(b"test").unwrap();
+    writer.finish().unwrap();
+
+    let request = DatAuditRequest {
+        source_id: "mixed".to_string(),
+        source_display_name: "Mixed catalogue".to_string(),
+        dat_path,
+        dat_kind: DatSourceKind::File,
+        scan_root: roms,
+        limits: DatLimits::default(),
+        policy: None,
+        platform: None,
+    };
+    let outcome = run_dat_audit(&request, &TrustedRoots::none(), &no_cancel(), &|_| {}).unwrap();
+
+    assert_eq!(outcome.archives.len(), 2);
+    let rar_archive = outcome
+        .archives
+        .iter()
+        .find(|archive| archive.format == "rar")
+        .unwrap();
+    let zip_archive = outcome
+        .archives
+        .iter()
+        .find(|archive| archive.format == "zip")
+        .unwrap();
+    assert_eq!(
+        zip_archive.completion,
+        crate::dat::archive::ArchivePassCompletion::Complete
+    );
+    assert_eq!(
+        zip_archive.members[0].evidence.status,
+        crate::dat::archive::ArchiveMemberStatus::HashComplete
+    );
+
+    let rar_set = outcome
+        .sets
+        .iter()
+        .find(|set| set.archive_path == rar_archive.archive_path);
+    assert!(
+        rar_set.is_none_or(|set| set.state != SetState::Complete),
+        "the broken RAR's own set must not reach Complete"
+    );
+    let zip_set = outcome
+        .sets
+        .iter()
+        .find(|set| set.archive_path == zip_archive.archive_path)
+        .expect("the unrelated ZIP set must have been classified independently");
+    assert_eq!(
+        zip_set.state,
+        SetState::Complete,
+        "a failure confined to the RAR archive must never downgrade the unrelated ZIP set"
+    );
+}
+
+// ---------------------------------------------------------------------
+// Finding 1 (independent integration review): a .rar's outer container
+// bytes must never reach the loose-file audit path at all, regardless of
+// whether the archive itself is unsupported, provider-unavailable, or
+// corrupt - that would be a bypass of the archive trust boundary.
+// ---------------------------------------------------------------------
+
+// The whole 109-byte `test_read_format_rar5_stored.rar` fixture's own
+// digest, computed once out-of-band - used as a deliberately-planted DAT
+// declaration for the *outer container*, never a real ROM's content hash.
+const RAR_CONTAINER_SHA1: &str = "368ec4034514bbb45e0469030edcdbf7f2557ec7";
+
+fn assert_outer_rar_digest_never_becomes_loose_evidence(
+    dir: &TempDir,
+    rar_path: &Path,
+    dat_source_id: &str,
+) {
+    let dat_path = write(
+        dir.path(),
+        "container.dat",
+        &format!(
+            r#"<datafile><header><name>Container-digest bait</name></header>
+<game name="Bait"><rom name="bait.bin" size="109" sha1="{RAR_CONTAINER_SHA1}"/></game>
+</datafile>"#
+        ),
+    );
+    let request = DatAuditRequest {
+        source_id: dat_source_id.to_string(),
+        source_display_name: "Container-digest bait".to_string(),
+        dat_path,
+        dat_kind: DatSourceKind::File,
+        scan_root: rar_path.parent().unwrap().to_path_buf(),
+        limits: DatLimits::default(),
+        policy: None,
+        platform: None,
+    };
+    let outcome = run_dat_audit(&request, &TrustedRoots::none(), &no_cancel(), &|_| {}).unwrap();
+
+    // The outer hash exists for freshness only and is excluded from DAT
+    // matching and ordinary report rows.
+    assert_eq!(
+        outcome.report.entries.len(),
+        0,
+        "a .rar outer hash must not become loose DAT evidence"
+    );
+    assert!(
+        outcome
+            .report
+            .entries
+            .iter()
+            .all(|entry| !matches!(entry.verdict, crate::dat::audit::AuditVerdict::Exact { .. })),
+        "no Exact verdict may come from a RAR container's own bytes"
+    );
+
+    let plan = crate::dat::rename_plan::build_rename_plan(
+        &outcome,
+        &crate::dat::rename_plan::RenamePlanContext { generation: 1 },
+        &no_cancel(),
+    )
+    .unwrap();
+    assert!(
+        plan.proposals.is_empty(),
+        "no rename proposal may come from the container-digest bait: {:?}",
+        plan.proposals
+    );
+
+    assert!(
+        outcome
+            .sets
+            .iter()
+            .all(|set| set.state != crate::dat::set::SetState::Complete),
+        "no set may reach Complete from the container-hash bait"
+    );
+}
+
+#[test]
+fn unsupported_rar_container_digest_never_becomes_a_loose_exact_match() {
+    let dir = temp();
+    let roms = dir.path().join("roms");
+    std::fs::create_dir(&roms).unwrap();
+    let rar_path = roms.join("collection.rar");
+    // RAR4: refused by the provider before any member is ever listed.
+    std::fs::copy(
+        rar_fixture("test_read_format_rar_compress_best.rar"),
+        &rar_path,
+    )
+    .unwrap();
+
+    // This fixture's own bytes are a different file, so pair it with a DAT
+    // that declares ITS digest instead - the point under test is the same
+    // either way: the archive is unsupported, and its outer bytes must
+    // still never surface as loose evidence.
+    let dat_path = write(
+        dir.path(),
+        "container.dat",
+        r#"<datafile><header><name>Unsupported container bait</name></header>
+<game name="Bait"><rom name="bait.bin" size="4" sha1="a94a8fe5ccb19ba61c4c0873d391e987982fbbd3"/></game>
+</datafile>"#,
+    );
+    let request = DatAuditRequest {
+        source_id: "rar4-bait".to_string(),
+        source_display_name: "Unsupported container bait".to_string(),
+        dat_path,
+        dat_kind: DatSourceKind::File,
+        scan_root: roms,
+        limits: DatLimits::default(),
+        policy: None,
+        platform: None,
+    };
+    let outcome = run_dat_audit(&request, &TrustedRoots::none(), &no_cancel(), &|_| {}).unwrap();
+
+    assert_eq!(outcome.report.entries.len(), 0);
+    assert!(outcome.archives[0].completion != crate::dat::archive::ArchivePassCompletion::Complete);
+    assert!(
+        outcome
+            .sets
+            .iter()
+            .all(|set| set.state != crate::dat::set::SetState::Complete)
+    );
+}
+
+#[test]
+fn corrupt_rar_container_digest_never_becomes_a_loose_exact_match() {
+    let dir = temp();
+    let roms = dir.path().join("roms");
+    std::fs::create_dir(&roms).unwrap();
+    let rar_path = roms.join("collection.rar");
+    // Not a RAR at all: refused at the earliest signature check, before any
+    // process is even spawned - still must never loose-hash.
+    std::fs::write(&rar_path, b"this is not a rar archive, just plain bytes").unwrap();
+
+    assert_outer_rar_digest_never_becomes_loose_evidence(&dir, &rar_path, "rar-corrupt-bait");
+}
+
+#[test]
+fn exact_rar_container_digest_bait_matches_the_real_fixture_and_still_never_loose_matches() {
+    let dir = temp();
+    let roms = dir.path().join("roms");
+    std::fs::create_dir(&roms).unwrap();
+    let rar_path = roms.join("collection.rar");
+    std::fs::copy(rar_fixture("test_read_format_rar5_stored.rar"), &rar_path).unwrap();
+
+    // Here the DAT-declared digest genuinely equals this exact fixture's
+    // own container bytes (`RAR_CONTAINER_SHA1`) - the strongest form of
+    // the bait, since a bug that let the outer bytes loose-hash would
+    // produce a real `Exact` here, not merely fail to mismatch.
+    assert_outer_rar_digest_never_becomes_loose_evidence(&dir, &rar_path, "rar-exact-bait");
+}
+
+#[test]
+fn uppercase_rar_extension_is_excluded_from_loose_matching_and_still_dispatches() {
+    let dir = temp();
+    let dat_path = write(
+        dir.path(),
+        "rar.dat",
+        &format!(
+            r#"<datafile><header><name>Uppercase RAR catalogue</name></header>
+<game name="Hello World (Demo)">
+<rom name="helloworld.txt" size="29" sha1="{RAR_HELLOWORLD_SHA1}"/>
+</game>
+</datafile>"#
+        ),
+    );
+    let roms = dir.path().join("roms");
+    std::fs::create_dir(&roms).unwrap();
+    let archive_path = roms.join("COLLECTION.RAR");
+    std::fs::copy(
+        rar_fixture("test_read_format_rar5_stored.rar"),
+        &archive_path,
+    )
+    .unwrap();
+
+    let request = DatAuditRequest {
+        source_id: "rar-uppercase".to_string(),
+        source_display_name: "Uppercase RAR catalogue".to_string(),
+        dat_path,
+        dat_kind: DatSourceKind::File,
+        scan_root: roms,
+        limits: DatLimits::default(),
+        policy: None,
+        platform: None,
+    };
+    let outcome = run_dat_audit(&request, &TrustedRoots::none(), &no_cancel(), &|_| {}).unwrap();
+
+    // Never loose-matched...
+    assert_eq!(outcome.report.entries.len(), 0);
+    // ...but still fully dispatched and verified through the RAR archive
+    // path, exactly as the lowercase-extension happy path is.
+    assert_eq!(outcome.archives.len(), 1);
+    assert_eq!(outcome.archives[0].format, "rar");
+    assert_eq!(
+        outcome.archives[0].completion,
+        crate::dat::archive::ArchivePassCompletion::Complete
+    );
+    assert_eq!(outcome.sets.len(), 1);
+    assert_eq!(outcome.sets[0].state, crate::dat::set::SetState::Complete);
+}
+
+#[test]
+fn a_verified_rar_member_alongside_an_unverified_sibling_never_reaches_set_complete() {
+    let dir = temp();
+    // The DAT only declares the game satisfied by `test1.bin`; the archive
+    // itself genuinely also contains three siblings the DAT knows nothing
+    // about. `test1.bin` verifies for real; the other three are left
+    // `NotVerified`. Coverage, not DAT attribution, is what completeness
+    // means here (see `RarArchiveSource::verify_all`'s own doc) - so the
+    // archive pass, and therefore this set, must not reach Complete.
+    let dat_path = write(
+        dir.path(),
+        "rar.dat",
+        r#"<datafile><header><name>Partial coverage catalogue</name></header>
+<game name="Test One">
+<rom name="test1.bin" size="4096" md5="b0ee823da852a3d713823eb5d04760bb" sha1="e6d444eac448f176cb9f8a1db5674df32f24e163"/>
+</game>
+</datafile>"#,
+    );
+    let roms = dir.path().join("roms");
+    std::fs::create_dir(&roms).unwrap();
+    std::fs::copy(
+        rar_fixture("test_read_format_rar5_multiple_files.rar"),
+        roms.join("collection.rar"),
+    )
+    .unwrap();
+
+    let request = DatAuditRequest {
+        source_id: "rar-partial-coverage".to_string(),
+        source_display_name: "Partial coverage catalogue".to_string(),
+        dat_path,
+        dat_kind: DatSourceKind::File,
+        scan_root: roms,
+        limits: DatLimits::default(),
+        policy: None,
+        platform: None,
+    };
+    let outcome = run_dat_audit(&request, &TrustedRoots::none(), &no_cancel(), &|_| {}).unwrap();
+
+    assert_eq!(outcome.archives[0].members.len(), 4);
+    assert_eq!(
+        outcome.archives[0].members[0].evidence.status,
+        crate::dat::archive::ArchiveMemberStatus::HashComplete,
+        "test1.bin genuinely verified"
+    );
+    assert!(
+        outcome.archives[0].members[1..]
+            .iter()
+            .all(|member| member.matched_refs.is_empty())
+    );
+    assert_eq!(
+        outcome.archives[0].completion,
+        crate::dat::archive::ArchivePassCompletion::Complete
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Combined multi-catalogue audit: RAR integration
+//
+// `run_dat_audit`'s own RAR tests above prove the single-catalogue seam
+// (`RarProvider`/`RarArchiveSource`, envelope refusals, set completeness).
+// These prove `run_combined_dat_audit` now reuses that exact same seam - see
+// `audit_run::audit_combined_archives`'s own doc comment - rather than any
+// new RAR handling.
+// ---------------------------------------------------------------------------
+
+fn run_combined_dat_audit(
+    request: &CombinedDatAuditRequest,
+) -> Result<DatAuditOutcome, DatAuditError> {
+    run_combined_dat_audit_with_cache(
+        request,
+        &TrustedRoots::none(),
+        &no_cancel(),
+        &|_| {},
+        AuditCacheConfig::Disabled,
+    )
+}
+
+fn combined_source(id: &str, dat_path: PathBuf) -> CombinedDatAuditSource {
+    CombinedDatAuditSource {
+        source_id: id.to_string(),
+        source_display_name: id.to_string(),
+        dat_path,
+        dat_kind: DatSourceKind::File,
+        platform: None,
+    }
+}
+
+#[test]
+fn combined_audit_verifies_a_supported_rar5_member_and_proposes_a_canonical_rename() {
+    use crate::dat::audit::AuditVerdict;
+    use crate::dat::rename_plan::{RenamePlanContext, build_rename_plan};
+
+    let dir = temp();
+    let dat_path = write(
+        dir.path(),
+        "rar.dat",
+        &format!(
+            r#"<datafile><header><name>RAR catalogue</name></header>
+<game name="Hello World (Demo)">
+<rom name="helloworld.txt" size="29" sha1="{RAR_HELLOWORLD_SHA1}"/>
+</game>
+</datafile>"#
+        ),
+    );
+    let roms = dir.path().join("roms");
+    std::fs::create_dir(&roms).unwrap();
+    let archive_path = roms.join("random-name.rar");
+    std::fs::copy(
+        rar_fixture("test_read_format_rar5_stored.rar"),
+        &archive_path,
+    )
+    .unwrap();
+
+    let request = CombinedDatAuditRequest {
+        sources: vec![combined_source("rar-set", dat_path)],
+        scan_root: roms,
+        limits: DatLimits::default(),
+    };
+    let outcome = run_combined_dat_audit(&request).unwrap();
+
+    assert_eq!(outcome.archives.len(), 1);
+    assert_eq!(outcome.archives[0].format, "rar");
+    assert_eq!(
+        outcome.archives[0].completion,
+        crate::dat::archive::ArchivePassCompletion::Complete
+    );
+    assert_eq!(outcome.archives[0].members.len(), 1);
+    assert!(matches!(
+        outcome.archives[0].members[0].verdict,
+        Some(AuditVerdict::Exact { ref game_name, .. }) if game_name == "Hello World (Demo)"
+    ));
+    assert!(!outcome.archives[0].members[0].evidence_sources.is_empty());
+
+    let identity = outcome.archives[0].combined_identity.as_ref().expect(
+        "a single verified member with agreeing combined evidence must produce a combined identity",
+    );
+    assert_eq!(identity.game_name, "Hello World (Demo)");
+    assert_eq!(identity.member_name, "helloworld.txt");
+
+    let plan =
+        build_rename_plan(&outcome, &RenamePlanContext { generation: 1 }, &no_cancel()).unwrap();
+    assert_eq!(plan.proposals.len(), 1);
+    let proposal = &plan.proposals[0];
+    assert!(proposal.is_outer_archive);
+    assert_eq!(
+        proposal.proposed_basename.as_deref(),
+        Some("Hello World (Demo).rar")
+    );
+    assert_ne!(
+        proposal.proposed_basename.as_deref(),
+        Some("helloworld.txt"),
+        "the RAR member's own filename must never become the rename target"
+    );
+    assert_ne!(
+        proposal.proposed_basename.as_deref().unwrap(),
+        "random-name.rar",
+        "the archive's own prior name must not leak into the proposal"
+    );
+}
+
+#[test]
+fn combined_audit_reports_an_already_canonical_rar_as_no_rename_needed() {
+    use crate::dat::rename_plan::{ProposalState, RenamePlanContext, build_rename_plan};
+
+    let dir = temp();
+    let dat_path = write(
+        dir.path(),
+        "rar.dat",
+        &format!(
+            r#"<datafile><header><name>RAR catalogue</name></header>
+<game name="Hello World (Demo)">
+<rom name="helloworld.txt" size="29" sha1="{RAR_HELLOWORLD_SHA1}"/>
+</game>
+</datafile>"#
+        ),
+    );
+    let roms = dir.path().join("roms");
+    std::fs::create_dir(&roms).unwrap();
+    std::fs::copy(
+        rar_fixture("test_read_format_rar5_stored.rar"),
+        roms.join("Hello World (Demo).rar"),
+    )
+    .unwrap();
+
+    let request = CombinedDatAuditRequest {
+        sources: vec![combined_source("rar-set", dat_path)],
+        scan_root: roms,
+        limits: DatLimits::default(),
+    };
+    let outcome = run_combined_dat_audit(&request).unwrap();
+    assert!(outcome.archives[0].combined_identity.is_some());
+
+    let plan =
+        build_rename_plan(&outcome, &RenamePlanContext { generation: 1 }, &no_cancel()).unwrap();
+    assert_eq!(plan.proposals.len(), 1);
+    assert_eq!(plan.proposals[0].state, ProposalState::AlreadyCanonical);
+    assert_eq!(plan.proposals[0].proposed_basename, None);
+}
+
+#[test]
+fn combined_audit_conflicting_catalogue_evidence_is_ambiguous_and_non_actionable() {
+    use crate::dat::audit::AuditVerdict;
+    use crate::dat::rename_plan::{RenamePlanContext, build_rename_plan};
+
+    let dir = temp();
+    let dat_a = write(
+        dir.path(),
+        "a.dat",
+        &format!(
+            r#"<datafile><header><name>Catalogue A</name></header>
+<game name="Hello World (Demo)">
+<rom name="helloworld.txt" size="29" sha1="{RAR_HELLOWORLD_SHA1}"/>
+</game>
+</datafile>"#
+        ),
+    );
+    let dat_b = write(
+        dir.path(),
+        "b.dat",
+        &format!(
+            r#"<datafile><header><name>Catalogue B</name></header>
+<game name="Something Else Entirely">
+<rom name="helloworld.txt" size="29" sha1="{RAR_HELLOWORLD_SHA1}"/>
+</game>
+</datafile>"#
+        ),
+    );
+    let roms = dir.path().join("roms");
+    std::fs::create_dir(&roms).unwrap();
+    std::fs::copy(
+        rar_fixture("test_read_format_rar5_stored.rar"),
+        roms.join("collection.rar"),
+    )
+    .unwrap();
+
+    let request = CombinedDatAuditRequest {
+        sources: vec![
+            combined_source("catalogue-a", dat_a),
+            combined_source("catalogue-b", dat_b),
+        ],
+        scan_root: roms,
+        limits: DatLimits::default(),
+    };
+    let outcome = run_combined_dat_audit(&request).unwrap();
+
+    assert_eq!(outcome.archives[0].members.len(), 1);
+    assert!(matches!(
+        outcome.archives[0].members[0].verdict,
+        Some(AuditVerdict::Ambiguous { .. })
+    ));
+    assert!(outcome.archives[0].combined_identity.is_none());
+
+    let plan =
+        build_rename_plan(&outcome, &RenamePlanContext { generation: 1 }, &no_cancel()).unwrap();
+    assert!(
+        plan.proposals.iter().all(|proposal| !proposal.actionable),
+        "conflicting catalogue evidence must never become an actionable rename"
+    );
+}
+
+#[test]
+fn combined_audit_unsupported_rar_shapes_remain_non_actionable() {
+    for fixture_name in [
+        "test_read_format_rar_compress_best.rar",
+        "test_read_format_rar5_solid.rar",
+        "test_read_format_rar5_encrypted.rar",
+        "test_read_format_rar5_multiarchive.part01.rar",
+    ] {
+        let dir = temp();
+        let dat_path = write(
+            dir.path(),
+            "rar.dat",
+            r#"<datafile><header><name>Any catalogue</name></header>
+<game name="Irrelevant"><rom name="irrelevant.bin" size="1" sha1="356a192b7913b04c54574d18c28d46e6395428ab"/></game>
+</datafile>"#,
+        );
+        let roms = dir.path().join("roms");
+        std::fs::create_dir(&roms).unwrap();
+        std::fs::copy(rar_fixture(fixture_name), roms.join("collection.rar")).unwrap();
+
+        let request = CombinedDatAuditRequest {
+            sources: vec![combined_source("unsupported-shape", dat_path)],
+            scan_root: roms,
+            limits: DatLimits::default(),
+        };
+        let outcome = run_combined_dat_audit(&request).unwrap();
+
+        assert_eq!(outcome.archives.len(), 1, "{fixture_name}");
+        assert_eq!(outcome.archives[0].format, "rar", "{fixture_name}");
+        assert_ne!(
+            outcome.archives[0].completion,
+            crate::dat::archive::ArchivePassCompletion::Complete,
+            "{fixture_name} must never report a complete pass"
+        );
+        assert!(
+            outcome.archives[0].combined_identity.is_none(),
+            "{fixture_name} must never gain a combined identity"
+        );
+    }
+}
+
+#[test]
+fn combined_audit_cache_still_hashes_and_caches_loose_files_around_a_deferred_rar() {
+    let dir = temp();
+    let dat_path = write(
+        dir.path(),
+        "mixed.dat",
+        &format!(
+            r#"<datafile><header><name>Mixed catalogue</name></header>
+<game name="Super Game (World)">
+<rom name="super.bin" size="4" md5="098f6bcd4621d373cade4e832627b4f6" sha1="a94a8fe5ccb19ba61c4c0873d391e987982fbbd3"/>
+</game>
+<game name="Hello World (Demo)">
+<rom name="helloworld.txt" size="29" sha1="{RAR_HELLOWORLD_SHA1}"/>
+</game>
+</datafile>"#
+        ),
+    );
+    let roms = dir.path().join("roms");
+    std::fs::create_dir(&roms).unwrap();
+    std::fs::write(roms.join("super.bin"), SUPER_BIN_CONTENTS).unwrap();
+    std::fs::copy(
+        rar_fixture("test_read_format_rar5_stored.rar"),
+        roms.join("collection.rar"),
+    )
+    .unwrap();
+
+    let cache_path = dir.path().join("audit-cache.json");
+    let request = CombinedDatAuditRequest {
+        sources: vec![combined_source("mixed", dat_path)],
+        scan_root: roms,
+        limits: DatLimits::default(),
+    };
+
+    let first = run_combined_dat_audit_with_cache(
+        &request,
+        &TrustedRoots::none(),
+        &no_cancel(),
+        &|_| {},
+        AuditCacheConfig::At(cache_path.clone()),
+    )
+    .unwrap();
+    assert_eq!(
+        first.cache.cache_eligible, 1,
+        "only the loose super.bin is cache-eligible; the .rar is deferred exactly as before"
+    );
+    assert_eq!(first.cache.files_hashed, 1);
+    assert_eq!(first.cache.cache_hits, 0);
+    assert!(
+        first
+            .unhashed
+            .iter()
+            .any(|entry| entry.file_name == "collection.rar"
+                && entry.code == "combined-container-deferred")
+    );
+
+    let second = run_combined_dat_audit_with_cache(
+        &request,
+        &TrustedRoots::none(),
+        &no_cancel(),
+        &|_| {},
+        AuditCacheConfig::At(cache_path),
+    )
+    .unwrap();
+    assert_eq!(
+        second.cache.cache_hits, 1,
+        "the persisted cache from the first run must be reused for the loose file"
+    );
+    assert_eq!(second.cache.files_hashed, 0);
+    assert_eq!(second.archives[0].format, "rar");
+}
+
+#[test]
+fn combined_audit_zip_member_identity_and_rename_are_unaffected_by_rar_support() {
+    use crate::dat::rename_plan::{RenamePlanContext, build_rename_plan};
+    use std::io::Write;
+    use zip::write::SimpleFileOptions;
+    use zip::{CompressionMethod, ZipWriter};
+
+    let dir = temp();
+    let dat_path = write(
+        dir.path(),
+        "zip.dat",
+        r#"<datafile><header><name>ZIP catalogue</name></header>
+<game name="Game (World)"><rom name="game.rom" size="4" sha1="a94a8fe5ccb19ba61c4c0873d391e987982fbbd3"/></game>
+</datafile>"#,
+    );
+    let roms = dir.path().join("roms");
+    std::fs::create_dir(&roms).unwrap();
+    let archive_path = roms.join("random-name.zip");
+    let mut writer = ZipWriter::new(std::fs::File::create(&archive_path).unwrap());
+    writer
+        .start_file(
+            "game.rom",
+            SimpleFileOptions::default().compression_method(CompressionMethod::Stored),
+        )
+        .unwrap();
+    writer.write_all(b"test").unwrap();
+    writer.finish().unwrap();
+
+    let request = CombinedDatAuditRequest {
+        sources: vec![combined_source("zip-set", dat_path)],
+        scan_root: roms,
+        limits: DatLimits::default(),
+    };
+    let outcome = run_combined_dat_audit(&request).unwrap();
+
+    assert_eq!(outcome.archives.len(), 1);
+    assert_eq!(outcome.archives[0].format, "zip");
+    let identity = outcome.archives[0]
+        .combined_identity
+        .as_ref()
+        .expect("a single verified ZIP member must still produce a combined identity");
+    assert_eq!(identity.game_name, "Game (World)");
+
+    let plan =
+        build_rename_plan(&outcome, &RenamePlanContext { generation: 1 }, &no_cancel()).unwrap();
+    assert_eq!(plan.proposals.len(), 1);
+    assert_eq!(
+        plan.proposals[0].proposed_basename.as_deref(),
+        Some("Game (World).zip")
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Arcade DAT catalogue revision provenance
+// ---------------------------------------------------------------------------
+
+use crate::dat::model::DatEcosystem;
+
+fn parsed_file(name: &str, ecosystem: DatEcosystem, version: Option<&str>) -> DatFileReport {
+    DatFileReport {
+        path: format!("/dats/{name}"),
+        file_name: name.to_string(),
+        outcome: DatFileOutcome::Parsed {
+            format: DatFormat::Logiqx,
+            ecosystem,
+            name: Some(name.to_string()),
+            version: version.map(str::to_string),
+            entry_count: 1,
+            rom_count: 1,
+            diagnostics: Vec::new(),
+        },
+    }
+}
+
+#[test]
+fn arcade_revisions_are_taken_from_arcade_files_only() {
+    let files = [
+        parsed_file("mame.xml", DatEcosystem::MAMEArcade, Some("0.216")),
+        parsed_file("fbneo.dat", DatEcosystem::FBNeo, Some("v1.0.0.02")),
+        parsed_file("nointro.dat", DatEcosystem::NoIntro, Some("2024-01-01")),
+    ];
+    let revisions = arcade_catalogue_revisions(&files);
+    assert_eq!(revisions.len(), 2, "{revisions:?}");
+    assert_eq!(revisions[0].ecosystem, DatEcosystem::MAMEArcade);
+    assert_eq!(revisions[0].version.as_deref(), Some("0.216"));
+    assert_eq!(revisions[1].ecosystem, DatEcosystem::FBNeo);
+    assert_eq!(revisions[1].version.as_deref(), Some("v1.0.0.02"));
+}
+
+#[test]
+fn an_arcade_file_without_a_version_header_is_still_recorded() {
+    let files = [parsed_file("mame.xml", DatEcosystem::MAMEArcade, None)];
+    let revisions = arcade_catalogue_revisions(&files);
+    assert_eq!(revisions.len(), 1);
+    assert_eq!(revisions[0].ecosystem, DatEcosystem::MAMEArcade);
+    assert_eq!(revisions[0].version, None);
+}
+
+#[test]
+fn a_folder_with_two_mame_files_keeps_the_one_that_declares_a_version() {
+    let files = [
+        parsed_file("a.xml", DatEcosystem::MAMEArcade, None),
+        parsed_file("b.xml", DatEcosystem::MAMEArcade, Some("0.270")),
+    ];
+    let revisions = arcade_catalogue_revisions(&files);
+    assert_eq!(revisions.len(), 1);
+    assert_eq!(revisions[0].version.as_deref(), Some("0.270"));
+}
+
+#[test]
+fn arcade_revisions_round_trip_through_the_config_file() {
+    let dir = temp();
+    let path = write(dir.path(), "mame.dat", LOGIQX);
+    let mut entry = entry_for(&path, DatSourceKind::File);
+    entry.health = DatSourceHealth {
+        state: Some(DatHealthState::Valid),
+        arcade_catalogue_revisions: vec![
+            ArcadeCatalogueRevision {
+                ecosystem: DatEcosystem::MAMEArcade,
+                version: Some("0.216".to_string()),
+            },
+            ArcadeCatalogueRevision {
+                ecosystem: DatEcosystem::FBNeo,
+                version: None,
+            },
+        ],
+        ..DatSourceHealth::default()
+    };
+    let mut registry = DatSourceRegistry::new();
+    registry.add(entry).unwrap();
+
+    let target = dir.path().join("dat_sources.toml");
+    save_dat_sources_config_to(&target, &registry.to_config()).unwrap();
+
+    let text = std::fs::read_to_string(&target).unwrap();
+    assert!(
+        text.contains("mame_arcade=0.216"),
+        "a versioned arcade revision is persisted as a flat scalar:\n{text}"
+    );
+    assert!(
+        text.contains("fbneo="),
+        "an arcade catalogue with no version header is still persisted:\n{text}"
+    );
+
+    let reloaded = load_dat_sources_config_from(&target).unwrap();
+    let (registry, problems) = DatSourceRegistry::from_config(&reloaded);
+    assert!(problems.is_empty(), "{problems:?}");
+    let health = &registry.entries()[0].health;
+    assert_eq!(
+        health.arcade_catalogue_revisions,
+        vec![
+            ArcadeCatalogueRevision {
+                ecosystem: DatEcosystem::MAMEArcade,
+                version: Some("0.216".to_string()),
+            },
+            ArcadeCatalogueRevision {
+                ecosystem: DatEcosystem::FBNeo,
+                version: None,
+            },
+        ]
+    );
+}
+
+// --- a registered file that is not a DAT ------------------------------------
+
+/// Registering the ZIP a DAT-o-MATIC or Redump download arrives in, or any
+/// other non-catalogue file, must validate as Invalid with the reason, not
+/// as a valid catalogue with zero entries.
+#[test]
+fn a_registered_zip_or_non_catalogue_file_validates_as_invalid_with_the_reason() {
+    let dir = TempDir::new().unwrap();
+    let zip = dir
+        .path()
+        .join("Nintendo - Game Boy Color (20261001-000000).zip");
+    std::fs::write(&zip, b"PK\x03\x04\x14\x00\x00\x00\x08\x00members follow").unwrap();
+    let (report, _) =
+        validate_dat_source(&entry_for(&zip, DatSourceKind::File), DatLimits::default());
+    assert_eq!(report.state, DatHealthState::Invalid, "{}", report.summary);
+    assert!(report.summary.contains("ZIP archive"), "{}", report.summary);
+    assert!(
+        report.summary.contains("No-Intro pack"),
+        "{}",
+        report.summary
+    );
+    assert_eq!(report.entry_count, 0);
+
+    let notes = write(dir.path(), "notes.dat", "my rom notes\nnothing here\n");
+    let (report, _) = validate_dat_source(
+        &entry_for(&notes, DatSourceKind::File),
+        DatLimits::default(),
+    );
+    assert_eq!(report.state, DatHealthState::Invalid, "{}", report.summary);
+    assert!(
+        report.summary.contains("not recognised as a DAT catalogue"),
+        "{}",
+        report.summary
+    );
 }

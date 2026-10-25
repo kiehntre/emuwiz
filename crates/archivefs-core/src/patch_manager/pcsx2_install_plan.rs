@@ -656,6 +656,7 @@ mod tests {
                 identity: None,
             }],
             configuration_identity: None,
+            executable_candidates: Vec::new(),
         }
     }
 

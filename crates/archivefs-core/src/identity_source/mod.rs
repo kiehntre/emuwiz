@@ -12,22 +12,61 @@
 //! 2. **External evidence is evidence, not truth.** An imported record never
 //!    silently replaces something EmuWiz verified locally. Where they
 //!    disagree, both are kept and the conflict is shown.
-//! 3. **Local network only.** A provider endpoint is validated by
-//!    [`net_policy`] before anything connects to it.
+//! 3. **Local network only, for a user-typed endpoint with a bearer token
+//!    attached.** [`net_policy`]'s SSRF gate exists specifically for that
+//!    combination (a URL a person entered, then sent a secret to) - see its
+//!    own module doc.
+//!
+//! [`hasheous`] is this module's one deliberate exception to rule 3, not a
+//! violation of it: it talks to a single fixed, non-user-configurable public
+//! host, sends no bearer token or other secret, and its request body is
+//! exhaustively proven to carry only hash values (see that module's own doc
+//! for the exact privacy proof). The SSRF threat `net_policy` defends
+//! against - a user-typed address plus an attached secret - does not exist
+//! here, so routing it through that gate would only refuse the one request
+//! this adapter is meant to make.
 
 pub mod artwork;
 pub mod cache;
+pub mod fbneo;
+pub mod freshness;
+pub mod hackhash;
+pub mod hackhash_apply;
+pub mod hackhash_identity;
+pub mod hackhash_readiness;
+pub mod hasheous;
 pub mod hashing;
+pub use freshness::{
+    DatFreshnessAssessment, DatFreshnessComparisonBasis, DatFreshnessComparisonSource,
+    DatFreshnessEvidence, DatFreshnessFailureReason, DatFreshnessProvider, DatFreshnessState,
+    active_without_comparison, compare_explicit, failed_check, managed_dat_freshness,
+    managed_dat_freshness_after_successful_check, never_checked, tosec_active_import_freshness,
+};
+pub mod launchbox_local;
+pub mod mame_listxml;
+pub mod mame_software_list;
+/// Generic immutable managed-provider source lifecycle. Provider parsers stay
+/// outside this module and supply validation reports for staged candidates.
+pub mod managed_snapshot;
 pub mod matching;
+pub mod media_resolver;
 pub mod model;
 pub mod net_policy;
+pub mod no_intro;
 pub mod path_map;
+pub mod providers;
+pub mod redump;
 pub mod romm;
+pub mod screenscraper;
 pub mod settings;
 pub mod stale;
 pub mod status;
+pub mod tosec;
 pub mod verification;
+pub mod whdload;
 
+#[cfg(test)]
+mod provider_proxy_tests;
 #[cfg(test)]
 mod stage1b_tests;
 #[cfg(test)]

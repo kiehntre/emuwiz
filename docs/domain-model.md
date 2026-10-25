@@ -1,172 +1,64 @@
-# EmuWiz Domain Model
+# Domain model
 
-This document describes the core EmuWiz domain types used by `archivefs-core`.
+## CURRENT BEHAVIOR
 
-## Library Hierarchy
+The core model separates what was observed, what is authoritative, what is
+persisted, and what may execute:
 
-EmuWiz models a library as a hierarchy from broad organization down to concrete files and mounts.
+| Concept | Role |
+|---|---|
+| Archive/library item | Durable source item and path/content observation |
+| Platform / IdentityPlatform | Hardware/software target plus platform evidence |
+| Identity evidence | Filename, folder, extension, header, member, detector, or hash observation |
+| Verified identity facts | Fresh, bounded facts proven by structural/media inspection |
+| DAT identity / set verdict | External release/hash and set/dependency authority |
+| Media/content format | How bytes are represented and which readers are safe |
+| Emulator profile | Discovered executable/config/core and installation context |
+| Launch readiness | Preflight result; blockers are not identity |
+| Launch plan/command | Exact executable, arguments, content, and evidence for execution |
+| Provider/source | Origin and validation path for cheat/mod material |
+| Transaction plan | Explicit proposed local writes, backups, and rollback ownership |
+| Journal/history | Durable operation result and rollback evidence |
+| Library View | Managed local symlink projection |
+| Playing Library / 1G1R | Evidence-backed selection/grouping projection |
+| RomM/ES-DE projection | External/library-facing path and metadata projection |
+| Mod package plan | Bounded local inspection and proposed handling of a package |
 
-```text
-Library
- └── Platform
-     └── Title
-         └── Release
-             ├── Archive
-             └── Mount
-```
+Weak filename/folder/extension evidence can guide a candidate or platform
+classification, but it must not silently become verified game identity. A
+launch or apply consumer must request the verified facts it requires and fail
+closed when they are absent, stale, ambiguous, or conflicting.
 
-- `Library`: the full managed collection.
-- `Platform`: a system or platform grouping, such as a console, computer, media type, or preservation set.
-- `Title`: the normalized work or game title.
-- `Release`: a specific edition, region, version, dump, or package of a title.
-- `Archive`: the source archive file for a release.
-- `Mount`: the mounted folder view of an archive.
+## Relationships
 
-`Archive` and mount planning are fully implemented today. `Library`, `Platform`, `Title`, and `Release` are represented concretely in the persistent catalogue (see [`docs/database.md`](database.md) and [`docs/DATABASE_DESIGN.md`](DATABASE_DESIGN.md)) at the `platform` and `archive` levels; the full `titles`/`releases` hierarchy sketched there remains reserved for richer indexing and duplicate handling.
+An archive item may contain one or more members; a direct media file has no
+outer member but enters the same content pipeline. Ingestion records the
+container/content/media observations. Identity fusion combines those
+observations with platform evidence, verified facts, and DAT/hash authority.
 
-## Archive
+The catalogue persists these results for explanation and efficient views.
+Launch planning reads the selected item and freshly validates the execution
+inputs. A readiness result can block a valid identity, and a compatibility row
+can permit a family without producing any identity.
 
-An `Archive` is one supported archive file discovered by the scanner.
+Providers produce candidate material. An adapter validates the target profile,
+identity, destination, and materialized source. Only an eligible transaction
+plan can reach the shared apply engine. Library, RomM, and ES-DE outputs are
+projections; they do not become identity authority.
 
-```rust
-Archive {
-    path,
-    kind,
-    identity,
-    health,
-}
-```
+## Authority vocabulary
 
-- `path`: absolute or configured-source-relative path to the archive file.
-- `kind`: archive format detected from the filename.
-- `identity`: metadata used to distinguish archives beyond filename alone.
-- `health`: current archive-level health state.
+- **Evidence:** observation with provenance and confidence.
+- **Authority:** verified direct-media facts or a matching DAT/hash/set result.
+- **Persistence:** catalogue/cache/history storage of observations and results.
+- **Projection:** a derived view or export, including Playing Library, RomM,
+  and ES-DE.
+- **Execution:** launching a process or applying an explicitly confirmed
+  local transaction.
 
-## ArchiveKind
+## HISTORICAL DESIGN CONTEXT
 
-`ArchiveKind` is the supported archive format.
-
-```rust
-ArchiveKind {
-    Zip,
-    SevenZip,
-    Rar,
-}
-```
-
-These are detected from `.zip`, `.7z`, and `.rar` file extensions. Split RAR continuation parts are skipped except the main `.rar` or `.part1.rar` archive.
-
-## ArchiveIdentity
-
-`ArchiveIdentity` is the stable identity metadata for an archive.
-
-```rust
-ArchiveIdentity {
-    display_name,
-    normalized_name,
-    source_root,
-    size_bytes,
-    modified_time,
-    platform,
-    region,
-    content_hash,
-    archive_hash,
-    internal_listing_hash,
-}
-```
-
-- `display_name`: human-readable archive title derived from the filename without the archive extension.
-- `normalized_name`: normalized title used for comparison and mount naming.
-- `source_root`: configured source folder where the archive was discovered.
-- `size_bytes`: archive file size when available.
-- `modified_time`: archive file modification time when available.
-- `platform`: optional platform/system hint, reserved for richer identity.
-- `region`: optional region/version hint, reserved for richer identity.
-- `content_hash`: optional hash of extracted or interpreted content.
-- `archive_hash`: optional hash of the archive file itself.
-- `internal_listing_hash`: optional fingerprint of the archive's internal file listing.
-
-Identity must not rely on filename alone. Later versions can fill the optional fields as archive inspection improves.
-
-## ArchiveHealth
-
-`ArchiveHealth` describes archive-level health.
-
-```rust
-ArchiveHealth {
-    Pending,
-    Mounted,
-    Failed,
-    MissingParts,
-    Corrupt,
-    Unsupported,
-    PermissionDenied,
-    RetryAvailable,
-}
-```
-
-- `Pending`: discovered but not mounted or diagnosed.
-- `Mounted`: archive is mounted successfully.
-- `Failed`: mount or inspection failed.
-- `MissingParts`: split archive parts are missing.
-- `Corrupt`: archive appears damaged.
-- `Unsupported`: archive format or structure is unsupported.
-- `PermissionDenied`: EmuWiz cannot read or mount the archive due to permissions.
-- `RetryAvailable`: a failed archive can be retried.
-
-Retryable states are `Failed`, `MissingParts`, and `RetryAvailable`.
-
-## MountPlan
-
-`MountPlan` is the planned relationship between an archive and its mount directory.
-
-```rust
-MountPlan {
-    archive,
-    mount_path,
-    state,
-}
-```
-
-- `archive`: archive to mount.
-- `mount_path`: directory under the configured `mount_root`.
-- `state`: mount-level state.
-
-Mount paths are generated from safe archive names. Duplicate archive filenames get deterministic suffixes so they do not collide.
-
-## MountState
-
-`MountState` describes the mount path state for status reporting.
-
-```rust
-MountState {
-    Pending,
-    Mounted,
-    MountPathExists,
-}
-```
-
-- `Pending`: mount path is not currently mounted.
-- `Mounted`: mount path is currently mounted.
-- `MountPathExists`: mount path exists but is not detected as mounted.
-- `NotMountable`: a library item such as a loose cartridge ROM that is
-  intentionally excluded from EmuWiz mount and queue operations.
-
-## MountBackend
-
-`MountBackend` abstracts mounting and unmounting.
-
-```rust
-trait MountBackend {
-    fn mount(&self, plan: &MountPlan) -> Result<()>;
-    fn unmount(&self, mount_path: &Path) -> Result<()>;
-}
-```
-
-Mount logic depends on this trait instead of calling a concrete mount tool directly.
-
-## RatarmountBackend
-
-`RatarmountBackend` is the current mount backend. It invokes `ratarmount` to mount archives and uses the platform unmount tools for unmounting.
-
-Native FUSE and Docker packaging remain outside the current domain model. A desktop GUI exists and is built on this same domain model rather than a separate one; there is no separate daemon process.
+Older names such as ArchiveRecord and launch_plan remain in compatibility
+interfaces and historical design notes. They should not be read as a single
+flat authority model: current launch, identity, and transaction stages are
+separate.

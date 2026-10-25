@@ -179,15 +179,15 @@ pub(crate) struct UreqGameHackingTransport {
 
 impl UreqGameHackingTransport {
     fn new() -> Self {
-        let config = ureq::Agent::config_builder()
-            .https_only(true)
-            .proxy(None)
-            .max_redirects(0)
-            .http_status_as_error(false)
-            .timeout_connect(Some(Duration::from_secs(10)))
-            .timeout_global(Some(Duration::from_secs(30)))
-            .timeout_recv_body(Some(Duration::from_secs(15)))
-            .build();
+        let config = crate::http_agent::config(|builder| {
+            builder
+                .https_only(true)
+                .max_redirects(0)
+                .http_status_as_error(false)
+                .timeout_connect(Some(Duration::from_secs(10)))
+                .timeout_global(Some(Duration::from_secs(30)))
+                .timeout_recv_body(Some(Duration::from_secs(15)))
+        });
         Self {
             agent: config.new_agent(),
         }

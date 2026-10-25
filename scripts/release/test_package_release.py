@@ -1,0 +1,369 @@
+#!/usr/bin/env python3
+"""Disposable regression tests for the metadata-only release packager."""
+
+from __future__ import annotations
+
+import hashlib
+import importlib.util
+import json
+import os
+import pathlib
+import shutil
+import stat
+import subprocess
+import sys
+import tarfile
+import tempfile
+import unittest
+
+
+SCRIPT = pathlib.Path(__file__).with_name("package_release.py")
+SPEC = importlib.util.spec_from_file_location("package_release", SCRIPT)
+assert SPEC and SPEC.loader
+packager = importlib.util.module_from_spec(SPEC)
+SPEC.loader.exec_module(packager)
+
+def _workspace_version() -> str:
+    """The real workspace version: these tests package the real source tree."""
+    import tomllib
+
+    cargo = pathlib.Path(__file__).resolve().parents[2] / "Cargo.toml"
+    return tomllib.loads(cargo.read_text(encoding="utf-8"))["workspace"]["package"]["version"]
+
+
+BUNDLE = f"emuwiz-{_workspace_version()}-linux-x86_64"
+
+
+class ReleasePackagerTests(unittest.TestCase):
+    maxDiff = None
+
+    def setUp(self) -> None:
+        self.temporary = tempfile.TemporaryDirectory(prefix="emuwiz-packager-tests-")
+        self.root = pathlib.Path(self.temporary.name)
+        self.repo = SCRIPT.resolve().parents[2]
+        self.gui = self._executable("gui-fixture", b"#!/bin/sh\nexit 0\n")
+        self.cli = self._executable("cli-fixture", b"#!/bin/sh\nexit 0\n")
+        self.epoch = "1700000000"
+
+    def tearDown(self) -> None:
+        self.temporary.cleanup()
+
+    def _executable(self, name: str, content: bytes) -> pathlib.Path:
+        path = self.root / name
+        path.write_bytes(content)
+        path.chmod(0o755)
+        return path
+
+    def _run(self, *arguments: str, env: dict[str, str] | None = None) -> subprocess.CompletedProcess[str]:
+        environment = os.environ.copy()
+        environment["SOURCE_DATE_EPOCH"] = self.epoch
+        if env:
+            environment.update(env)
+        return subprocess.run(
+            [sys.executable, str(SCRIPT), *arguments],
+            text=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            env=environment,
+            check=False,
+        )
+
+    def _package(self, name: str = "output", archive: bool = False) -> tuple[pathlib.Path, subprocess.CompletedProcess[str]]:
+        output = self.root / name
+        arguments = [
+            "package",
+            "--gui", str(self.gui),
+            "--cli", str(self.cli),
+            "--source-root", str(self.repo),
+            "--output-root", str(output),
+            "--arch", "x86_64",
+            "--fixture-mode",
+            "--reproducible",
+        ]
+        if archive:
+            arguments.append("--archive")
+        result = self._run(*arguments)
+        return output / f"{BUNDLE}", result
+
+    def _verify(self, target: pathlib.Path, strict: bool = True) -> subprocess.CompletedProcess[str]:
+        args = ["verify"]
+        if strict:
+            args.append("--strict")
+        args.append(str(target))
+        return self._run(*args)
+
+    @staticmethod
+    def _rewrite_manifest_checksum(release: pathlib.Path) -> None:
+        digest = hashlib.sha256((release / "manifest.json").read_bytes()).hexdigest()
+        lines = (release / "SHA256SUMS").read_text().splitlines()
+        lines = [f"{digest}  manifest.json" if line.endswith("  manifest.json") else line for line in lines]
+        (release / "SHA256SUMS").write_text("\n".join(lines) + "\n")
+
+    def test_22_a_binary_with_the_writer_gate_test_hook_is_refused(self) -> None:
+        # The marker straddles a read-chunk boundary in the second case.
+        for padding in (0, 8 * 1024 * 1024 - 10):
+            with self.subTest(padding=padding):
+                self.gui = self._executable(
+                    f"gui-hook-{padding}",
+                    b"#!/bin/sh\nexit 0\n" + b"#" * padding + b"EMUWIZ_WRITER_GATE_PROC_ROOT\n",
+                )
+                release, result = self._package(f"hooked-{padding}")
+                self.assertNotEqual(result.returncode, 0)
+                self.assertIn("test-only safety hook", result.stderr)
+                self.assertFalse(release.exists())
+
+    def test_23_verify_refuses_a_hooked_binary_placed_in_a_packaged_tree(self) -> None:
+        release, result = self._package("verified-then-hooked")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(self._verify(release).returncode, 0)
+        gui = release / "bin/emuwiz"
+        gui.write_bytes(gui.read_bytes() + b"EMUWIZ_WRITER_GATE_PROC_ROOT")
+        verified = self._verify(release)
+        self.assertNotEqual(verified.returncode, 0)
+        self.assertIn("test-only safety hook", verified.stderr)
+
+    def test_01_valid_synthetic_executable_package(self) -> None:
+        release, result = self._package()
+        self.assertEqual(result.returncode, 0, result.stderr)
+        for relative in (
+            "bin/emuwiz", "bin/emuwiz-cli", "install.sh", "config.toml.example",
+            "assets/linux/io.github.kiehntre.emuwiz.desktop.in",
+            "assets/branding/emuwiz-logo-32.png",
+            "assets/branding/emuwiz-logo-64.png",
+            "assets/branding/emuwiz-logo-128.png",
+            "assets/branding/emuwiz-logo-256.png",
+            "assets/branding/emuwiz-logo-512.png",
+            "docs/README.txt", "docs/LICENSES.txt", "BUILD_INFO.txt", "VERIFY.txt",
+        ):
+            self.assertTrue((release / relative).is_file(), relative)
+        self.assertTrue((release / "install.sh").stat().st_mode & stat.S_IXUSR)
+        manifest = json.loads((release / "manifest.json").read_text())
+        self.assertEqual(manifest["gui"]["target"], "emuwiz")
+        self.assertEqual(manifest["gui"]["entrypoint"], "crates/archivefs-gui/src/bin/emuwiz.rs")
+        self.assertEqual(manifest["gui"]["generation"], "fixture")
+        gui_artifact = next(item for item in manifest["artifacts"] if item["path"] == "bin/emuwiz")
+        self.assertEqual(manifest["gui"]["elf_sha256"], gui_artifact["sha256"])
+        verified = self._verify(release)
+        self.assertEqual(verified.returncode, 0, verified.stderr)
+
+    def test_02_missing_input_binary(self) -> None:
+        result = self._run(
+            "package", "--gui", str(self.root / "missing"), "--cli", str(self.cli),
+            "--source-root", str(self.repo), "--output-root", str(self.root / "out"),
+            "--fixture-mode", "--arch", "x86_64",
+        )
+        self.assertEqual(result.returncode, packager.EXIT_INPUT)
+
+    def test_03_symlink_binary_refused(self) -> None:
+        link = self.root / "gui-link"
+        link.symlink_to(self.gui)
+        result = self._run(
+            "package", "--gui", str(link), "--cli", str(self.cli),
+            "--source-root", str(self.repo), "--output-root", str(self.root / "out"),
+            "--fixture-mode", "--arch", "x86_64",
+        )
+        self.assertEqual(result.returncode, packager.EXIT_INPUT)
+        self.assertIn("symlink", result.stderr)
+
+    def test_04_zero_byte_binary_refused(self) -> None:
+        empty = self._executable("empty", b"")
+        result = self._run(
+            "package", "--gui", str(empty), "--cli", str(self.cli),
+            "--source-root", str(self.repo), "--output-root", str(self.root / "out"),
+            "--fixture-mode", "--arch", "x86_64",
+        )
+        self.assertEqual(result.returncode, packager.EXIT_INPUT)
+        self.assertIn("zero bytes", result.stderr)
+
+    def test_05_checksum_tamper(self) -> None:
+        release, result = self._package()
+        self.assertEqual(result.returncode, 0, result.stderr)
+        sums = release / "SHA256SUMS"
+        sums.write_text(sums.read_text().replace(sums.read_text()[:64], "0" * 64, 1))
+        self.assertEqual(self._verify(release).returncode, packager.EXIT_VERIFY)
+
+    def test_06_missing_payload(self) -> None:
+        release, result = self._package()
+        self.assertEqual(result.returncode, 0, result.stderr)
+        (release / "bin/emuwiz-cli").unlink()
+        self.assertEqual(self._verify(release).returncode, packager.EXIT_VERIFY)
+
+    def test_07_manifest_artifact_hash_tamper(self) -> None:
+        release, result = self._package()
+        self.assertEqual(result.returncode, 0, result.stderr)
+        manifest_path = release / "manifest.json"
+        manifest = json.loads(manifest_path.read_text())
+        manifest["artifacts"][0]["sha256"] = "0" * 64
+        manifest_path.write_bytes(packager.json_bytes(manifest))
+        self._rewrite_manifest_checksum(release)
+        self.assertEqual(self._verify(release).returncode, packager.EXIT_VERIFY)
+
+    def test_08_unexpected_executable_strict_mode(self) -> None:
+        release, result = self._package()
+        self.assertEqual(result.returncode, 0, result.stderr)
+        extra = release / "extra-tool"
+        extra.write_text("#!/bin/sh\n")
+        extra.chmod(0o755)
+        self.assertEqual(self._verify(release, strict=False).returncode, 0)
+        self.assertEqual(self._verify(release, strict=True).returncode, packager.EXIT_VERIFY)
+
+    def test_09_unsafe_archive_member(self) -> None:
+        archive_path = self.root / "unsafe.tar.xz"
+        with tarfile.open(archive_path, "w:xz") as archive:
+            info = tarfile.TarInfo("../escape")
+            info.size = 1
+            temporary = self.root / "byte"
+            temporary.write_bytes(b"x")
+            with temporary.open("rb") as source:
+                archive.addfile(info, source)
+        self.assertEqual(self._verify(archive_path).returncode, packager.EXIT_VERIFY)
+
+    def test_10_reproducible_ordering_and_content(self) -> None:
+        first, first_result = self._package("first")
+        second, second_result = self._package("second")
+        self.assertEqual(first_result.returncode, 0, first_result.stderr)
+        self.assertEqual(second_result.returncode, 0, second_result.stderr)
+        self.assertEqual((first / "manifest.json").read_bytes(), (second / "manifest.json").read_bytes())
+        self.assertEqual((first / "SHA256SUMS").read_bytes(), (second / "SHA256SUMS").read_bytes())
+        paths = [line.split("  ", 1)[1] for line in (first / "SHA256SUMS").read_text().splitlines()]
+        self.assertEqual(paths, sorted(paths))
+
+    def test_11_source_date_epoch_behavior(self) -> None:
+        release, result = self._package()
+        self.assertEqual(result.returncode, 0, result.stderr)
+        manifest = json.loads((release / "manifest.json").read_text())
+        self.assertEqual(manifest["release"]["source_date_epoch"], int(self.epoch))
+        self.assertEqual(manifest["release"]["packaging_timestamp"], "2023-11-14T22:13:20Z")
+        missing = self._run(
+            "package", "--gui", str(self.gui), "--cli", str(self.cli),
+            "--source-root", str(self.repo), "--output-root", str(self.root / "missing-epoch"),
+            "--fixture-mode", "--arch", "x86_64", "--reproducible",
+            env={"SOURCE_DATE_EPOCH": ""},
+        )
+        self.assertEqual(missing.returncode, packager.EXIT_PROVENANCE)
+
+    def test_12_temporary_extraction_is_cleaned(self) -> None:
+        release, result = self._package(archive=True)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        archive = release.parent / f"{release.name}.tar.xz"
+        temp_parent = self.root / "verify-tmp"
+        temp_parent.mkdir()
+        verified = self._run("verify", "--strict", str(archive), env={"TMPDIR": str(temp_parent)})
+        self.assertEqual(verified.returncode, 0, verified.stderr)
+        self.assertEqual(list(temp_parent.iterdir()), [])
+
+    def test_13_output_root_safety(self) -> None:
+        result = self._run(
+            "package", "--gui", str(self.gui), "--cli", str(self.cli),
+            "--source-root", str(self.repo), "--output-root", "/",
+            "--fixture-mode", "--arch", "x86_64",
+        )
+        self.assertEqual(result.returncode, packager.EXIT_UNSAFE)
+
+    def test_14_secret_marker_refusal(self) -> None:
+        release, result = self._package()
+        self.assertEqual(result.returncode, 0, result.stderr)
+        suspect = release / "docs/suspect.txt"
+        suspect.write_text("password=do-not-print-this-value\n")
+        with self.assertRaises(packager.ReleaseError):
+            packager.scan_secrets(release)
+
+    def test_15_successful_archive_verify_round_trip(self) -> None:
+        release, result = self._package(archive=True)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        archive = release.parent / f"{release.name}.tar.xz"
+        sidecar = archive.with_name(f"{archive.name}.sha256")
+        verified = self._run("verify", "--strict", "--checksum", str(sidecar), str(archive))
+        self.assertEqual(verified.returncode, 0, verified.stderr)
+
+    def test_16_one_binary_byte_changes(self) -> None:
+        release, result = self._package()
+        self.assertEqual(result.returncode, 0, result.stderr)
+        binary = release / "bin/emuwiz"
+        data = bytearray(binary.read_bytes())
+        data[-1] ^= 1
+        binary.write_bytes(data)
+        binary.chmod(0o755)
+        self.assertEqual(self._verify(release).returncode, packager.EXIT_VERIFY)
+
+    def test_17_symlink_replacement_is_rejected(self) -> None:
+        release, result = self._package()
+        self.assertEqual(result.returncode, 0, result.stderr)
+        payload = release / "docs/README.txt"
+        payload.unlink()
+        payload.symlink_to(release / "VERIFY.txt")
+        self.assertEqual(self._verify(release).returncode, packager.EXIT_VERIFY)
+
+    def test_18_wrong_architecture_metadata_is_rejected(self) -> None:
+        release, result = self._package()
+        self.assertEqual(result.returncode, 0, result.stderr)
+        manifest_path = release / "manifest.json"
+        manifest = json.loads(manifest_path.read_text())
+        manifest["artifacts"][0]["elf_arch"] = "aarch64"
+        manifest_path.write_bytes(packager.json_bytes(manifest))
+        self._rewrite_manifest_checksum(release)
+        self.assertEqual(self._verify(release).returncode, packager.EXIT_VERIFY)
+
+    def test_19_owned_output_required_for_overwrite(self) -> None:
+        output = self.root / "owned-check"
+        release = output / f"{BUNDLE}"
+        release.mkdir(parents=True)
+        (release / "foreign.txt").write_text("keep me")
+        result = self._run(
+            "package", "--gui", str(self.gui), "--cli", str(self.cli),
+            "--source-root", str(self.repo), "--output-root", str(output),
+            "--fixture-mode", "--arch", "x86_64", "--overwrite",
+        )
+        self.assertEqual(result.returncode, packager.EXIT_UNSAFE)
+        self.assertTrue((release / "foreign.txt").is_file())
+
+    def test_20_executable_mode_tamper_is_rejected(self) -> None:
+        release, result = self._package()
+        self.assertEqual(result.returncode, 0, result.stderr)
+        binary = release / "bin/emuwiz-cli"
+        binary.chmod(0o644)
+        self.assertEqual(self._verify(release).returncode, packager.EXIT_VERIFY)
+
+    def test_21_unowned_archive_is_not_deleted(self) -> None:
+        output = self.root / "unowned-archive"
+        output.mkdir()
+        archive = output / f"{BUNDLE}.tar.xz"
+        sidecar = output / f"{archive.name}.sha256"
+        archive.write_bytes(b"foreign archive")
+        sidecar.write_text("foreign checksum")
+        result = self._run(
+            "package", "--gui", str(self.gui), "--cli", str(self.cli),
+            "--source-root", str(self.repo), "--output-root", str(output),
+            "--fixture-mode", "--arch", "x86_64", "--overwrite", "--archive",
+        )
+        self.assertEqual(result.returncode, packager.EXIT_UNSAFE)
+        self.assertEqual(archive.read_bytes(), b"foreign archive")
+        self.assertEqual(sidecar.read_text(), "foreign checksum")
+
+
+    def test_22_user_state_and_private_data_never_enter_the_payload(self) -> None:
+        # The release must never carry a user's database, configuration,
+        # journals or game data. Each denied name is refused whether it appears
+        # as a file or as a directory, at the top level or nested.
+        for name in sorted(packager.DENIED_PAYLOAD_NAMES):
+            for layout in (pathlib.Path(name), pathlib.Path("share") / name / "inner.bin"):
+                payload = self.root / f"payload-{abs(hash((name, str(layout))))}"
+                target = payload / layout
+                target.parent.mkdir(parents=True, exist_ok=True)
+                target.write_bytes(b"x")
+                with self.assertRaises(packager.ReleaseError) as raised:
+                    packager.payload_files(payload)
+                self.assertEqual(raised.exception.code, packager.EXIT_UNSAFE, (name, layout))
+        # The denial list itself must keep naming the user-state classes.
+        for required in ("library.sqlite3", "config.toml", "rename-transactions",
+                         "rename-transactions-sealed-v1", "undo-seals.sqlite3",
+                         "journals", "roms", "bios", "saves", ".config", ".local"):
+            self.assertIn(required, packager.DENIED_PAYLOAD_NAMES)
+        clean = self.root / "payload-clean"
+        (clean / "bin").mkdir(parents=True)
+        (clean / "bin" / "emuwiz").write_bytes(b"#!/bin/sh\n")
+        self.assertTrue(packager.payload_files(clean))
+
+
+if __name__ == "__main__":
+    unittest.main(verbosity=2)

@@ -1,5 +1,9 @@
 # DAT Sources — Stage 1 Implementation
 
+> **Historical / superseded implementation record**
+>
+> This document records an earlier implementation stage and is retained for provenance. It may not describe the complete current DAT workflow. See the [README](../../README.md) and [current roadmap](../../ROADMAP.md).
+
 Status: implemented on `feature/dat-sources-gui-stage1`. This document
 describes what shipped, not a proposal. It follows the approved design
 references in `docs/design/DAT_CHEAT_POLICY_*.md` (from the design branch)

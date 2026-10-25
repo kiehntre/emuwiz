@@ -1,5 +1,7 @@
 # DAT Games-Only Filtering Research
 
+> **Research snapshot** — This document records earlier research and design reasoning. It is not current capability documentation; see the [README](../../README.md), [current capabilities](../LAUNCH_SUPPORT.md), and [roadmap](../../ROADMAP.md) for present guidance.
+
 Status: research and design only
 Research date: 2026-08-10
 

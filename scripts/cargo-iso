@@ -1,0 +1,317 @@
+#!/usr/bin/env bash
+# cargo-iso: run cargo with a target directory unique to THIS git worktree.
+#
+#   scripts/cargo-iso test -p archivefs-gui --lib
+#   scripts/cargo-iso --low-debug check --workspace --all-targets
+#   scripts/cargo-iso --print-target       # read-only: show the target and free space
+#
+# Why: many worktrees sharing one CARGO_TARGET_DIR let concurrent builds corrupt
+# each other's results and filled the disk. Every worktree builds into
+#
+#   $EMUWIZ_TARGET_ROOT/<worktree-name>-<first 12 hex of sha256(canonical worktree path)>
+#
+# (root defaults to ~/.cache/emuwiz-cargo-targets).
+#
+# What this wrapper does:
+#   * computes that directory from the canonical (physical) worktree path;
+#   * sets CARGO_TARGET_DIR to it, overriding any inherited value, and unsets
+#     CARGO_BUILD_TARGET_DIR so nothing else can redirect the build;
+#   * refuses to build into the legacy shared target, or to accept a
+#     --target-dir that points into it;
+#   * refuses to build when the build disk has less than EMUWIZ_MIN_FREE_GB free;
+#   * passes every cargo argument through unchanged and exits with cargo's status.
+#
+# It also records each build in a registry outside the targets and holds a shared
+# lifecycle lock while cargo runs (see scripts/emuwiz-cargo-retention --help).
+#
+# What it never does: delete, clean or prune anything.
+#
+# Options (before the cargo arguments):
+#   --print-target   print worktree, target and free space; run nothing, create nothing
+#   --finish-task    task done: release this worktree's cache for automatic retirement and
+#                    report when the worktree may be removed (KEEP it until CLEAR);
+#                    optional --task NAME. A finished Cargo command is NOT a finished task
+#   --low-debug      build without debug info (about 4x smaller target); also set by
+#                    EMUWIZ_CARGO_LOW_DEBUG=1. The default for a NEW target (see below)
+#   --full-debug     build with Cargo's normal debug info (for a debugger or
+#                    line-numbered backtraces); also set by EMUWIZ_CARGO_FULL_DEBUG=1
+#   --incremental    enable incremental compilation for dev/test builds (see below);
+#                    also set by EMUWIZ_CARGO_INCREMENTAL=1
+#   --sccache        route rustc through sccache with a dedicated, size-capped cache
+#                    shared by all worktrees (see below); also EMUWIZ_CARGO_SCCACHE=1
+#   --help           this text
+#
+# Environment (all optional):
+#   EMUWIZ_TARGET_ROOT       parent of all per-worktree targets
+#   EMUWIZ_MIN_FREE_GB       minimum free GiB on the build disk (default 8)
+#   EMUWIZ_CARGO_LOW_DEBUG   1 = same as --low-debug
+#   EMUWIZ_CARGO_FULL_DEBUG  1 = same as --full-debug
+#   EMUWIZ_CARGO_INCREMENTAL 1 = same as --incremental
+#   EMUWIZ_CARGO_SCCACHE     1 = same as --sccache
+#   EMUWIZ_SCCACHE_DIR       sccache directory (default ~/.cache/emuwiz-sccache)
+#   EMUWIZ_SCCACHE_SIZE      cache size cap, e.g. 2G (default 2G)
+#   EMUWIZ_SCCACHE_PORT      private sccache server port (default 4241)
+#   EMUWIZ_CARGO             cargo executable to run (default: cargo)
+#
+# Debug mode is recorded per target, so a target never silently changes profile
+# (a change recompiles everything and keeps both copies until retired). The record
+# is $EMUWIZ_TARGET_ROOT.debug-mode/<target name>, outside every target:
+#   * explicit --low-debug / --full-debug: used, and recorded (a change is announced);
+#   * a recorded low mode is reused;
+#   * a target with no compiler output to keep gets low-debug, recorded. That is
+#     decided only by `emuwiz-cargo-maintain worktree-check` saying CLEAR: a new
+#     target, or one retired with a verified receipt (its preserved evidence stays).
+#     Anything else (HOLD, an error, the tool missing) fails closed to the next rule;
+#   * otherwise a recorded full mode is reused, and an existing target from before
+#     this record is built with the inherited settings exactly as before, unrecorded.
+# An unreadable record refuses the build (exit 3) unless a mode is given explicitly.
+#
+# Incremental builds: a shell that exports CARGO_INCREMENTAL=0 (older ~/.bashrc
+# files do) makes every edit recompile the whole crate. --incremental overrides
+# that to 1 for this run. Measured on archivefs-gui tests, an edit-to-rebuild took
+# ~92-104 s with it off and ~26-33 s with it on (after a one-off ~390 s priming
+# build), at the cost of roughly doubling that worktree's target size. Nothing is
+# changed unless you ask; keep one choice per worktree so the cache stays warm.
+#
+# sccache (--sccache): shares compiled dependency artefacts between worktrees
+# while every worktree keeps its own target directory. It sets RUSTC_WRAPPER for
+# this run only, uses its own cache directory and server port (so a developer's
+# own sccache is untouched), caps the cache (default 2G; sccache evicts its own
+# least-recently-used entries, never anything in a target), and forces
+# CARGO_INCREMENTAL=0 because sccache cannot cache incremental builds. It cannot be
+# combined with --incremental. It never starts or stops a server you did not need;
+# it never deletes anything itself.
+#
+# Exit codes of its own: 2 usage/not a git worktree, 3 refused target,
+# 4 not enough free disk, 5 reserved (an enforcing budget mode is not available: the
+# budget check in scripts/emuwiz-cargo-maintain is advisory and never refuses a build).
+# Anything else is cargo's own exit status.
+set -euo pipefail
+
+usage() { awk 'NR > 1 && !/^#/ { exit } NR > 1' "$0" | sed 's/^# \{0,1\}//'; }
+
+print_only=0
+finish_task=0
+task_name=""
+debug_choice=""
+[ "${EMUWIZ_CARGO_LOW_DEBUG:-0}" = "1" ] && debug_choice=low
+if [ "${EMUWIZ_CARGO_FULL_DEBUG:-0}" = "1" ]; then
+  [ -n "$debug_choice" ] && { echo "cargo-iso: EMUWIZ_CARGO_LOW_DEBUG and EMUWIZ_CARGO_FULL_DEBUG are mutually exclusive" >&2; exit 2; }
+  debug_choice=full
+fi
+incremental="${EMUWIZ_CARGO_INCREMENTAL:-0}"
+use_sccache="${EMUWIZ_CARGO_SCCACHE:-0}"
+while [ $# -gt 0 ]; do
+  case "$1" in
+    --print-target) print_only=1; shift ;;
+    --low-debug) debug_choice=low; shift ;;
+    --full-debug) debug_choice=full; shift ;;
+    --incremental) incremental=1; shift ;;
+    --sccache) use_sccache=1; shift ;;
+    --finish-task) finish_task=1; shift ;;
+    --task) task_name="${2:-}"; shift; [ $# -gt 0 ] && shift ;;
+    --help|-h) usage; exit 0 ;;
+    *) break ;;
+  esac
+done
+if [ "$print_only" -eq 0 ] && [ "$finish_task" -eq 0 ] && [ $# -eq 0 ]; then
+  echo "cargo-iso: no cargo command given (try --help)" >&2
+  exit 2
+fi
+
+min_free_gb="${EMUWIZ_MIN_FREE_GB:-8}"
+case "$min_free_gb" in
+  ''|*[!0-9]*) echo "cargo-iso: EMUWIZ_MIN_FREE_GB must be a whole number, got '$min_free_gb'" >&2; exit 2 ;;
+esac
+
+top=$(git rev-parse --show-toplevel 2>/dev/null) || {
+  echo "cargo-iso: not inside a git worktree" >&2
+  exit 2
+}
+top=$(cd "$top" && pwd -P)
+
+home="${HOME:?cargo-iso: HOME is not set}"
+root="${EMUWIZ_TARGET_ROOT:-$home/.cache/emuwiz-cargo-targets}"
+legacy=$(realpath -m "$home/.cache/emuwiz-cargo-target")
+
+# True when $1 is the legacy shared target or anything inside it.
+is_legacy() {
+  local p
+  p=$(realpath -m "$1")
+  [ "$p" = "$legacy" ] || [[ "$p" == "$legacy"/* ]]
+}
+
+if is_legacy "$root"; then
+  echo "cargo-iso: refusing EMUWIZ_TARGET_ROOT inside the legacy shared target: $root" >&2
+  exit 3
+fi
+
+# A readable name that cannot contain path separators or odd characters.
+name=$(printf %s "$(basename "$top")" | tr -c 'A-Za-z0-9._-' '_')
+hash=$(printf %s "$top" | sha256sum | cut -c1-12)
+target="$root/$name-$hash"
+
+if is_legacy "$target"; then
+  echo "cargo-iso: refusing the legacy shared target: $target" >&2
+  exit 3
+fi
+
+# Free space on the filesystem that will hold the target (nearest existing ancestor,
+# so --print-target never has to create anything).
+probe="$target"
+while [ ! -e "$probe" ] && [ "$probe" != "/" ]; do probe=$(dirname "$probe"); done
+free_kb=$(df --output=avail -k "$probe" | tail -1 | tr -d ' ')
+free_gb=$(( free_kb / 1024 / 1024 ))
+
+# Debug mode (see --help). Read-only here; recorded just before cargo runs.
+maintain="$(dirname "$0")/emuwiz-cargo-maintain"
+mode_file="$root.debug-mode/$name-$hash"
+recorded=""
+if [ -e "$mode_file" ] || [ -L "$mode_file" ]; then
+  recorded=$(cat -- "$mode_file" 2>/dev/null) || recorded="<unreadable>"
+  case "$recorded" in low|full) ;; *) recorded="invalid:$recorded" ;; esac
+fi
+# CLEAR from the retirement gate is the only proof that no compiler output would be
+# duplicated by a profile change. Read-only; skipped when the answer cannot matter.
+fresh=0
+fresh_why=""
+if [ -z "$debug_choice" ] && [ "$recorded" != low ] && [ "${recorded#invalid:}" = "$recorded" ] &&
+   [ -f "$maintain" ] && command -v python3 >/dev/null 2>&1 &&
+   python3 -I "$maintain" worktree-check "$top" >/dev/null 2>&1; then
+  fresh=1
+  [ -n "$recorded" ] && fresh_why=" after verified retirement" || fresh_why=""
+fi
+if [ -n "$debug_choice" ]; then
+  debug_mode=$debug_choice; debug_why="explicit"
+elif [ "${recorded#invalid:}" != "$recorded" ]; then
+  debug_mode=unknown; debug_why="record $mode_file holds '${recorded#invalid:}'"
+elif [ "$recorded" = low ]; then
+  debug_mode=low; debug_why="recorded"
+elif [ "$fresh" -eq 1 ]; then
+  debug_mode=low; debug_why="no compiler output to keep${fresh_why}"
+elif [ -n "$recorded" ]; then
+  debug_mode=$recorded; debug_why="recorded"
+else
+  debug_mode=inherited; debug_why="existing target without a record; unchanged"
+fi
+
+if [ "$finish_task" -eq 1 ]; then
+  # The task is done: release this worktree's cache for automatic retirement.
+  # Running a Cargo command to completion never does this by itself.
+  maintain="$(dirname "$0")/emuwiz-cargo-maintain"
+  [ -f "$maintain" ] && command -v python3 >/dev/null 2>&1 || { echo "cargo-iso: maintenance tooling unavailable" >&2; exit 2; }
+  exec python3 -I "$maintain" task-complete --worktree "$top" ${task_name:+--task "$task_name"}
+fi
+
+if [ "$print_only" -eq 1 ]; then
+  echo "worktree: $top"
+  echo "target:   $target"
+  echo "free:     ${free_gb} GiB (minimum ${min_free_gb} GiB)"
+  echo "debug:    $debug_mode ($debug_why)"
+  if [ -n "${CARGO_TARGET_DIR:-}" ] && [ "$(realpath -m "$CARGO_TARGET_DIR")" != "$(realpath -m "$target")" ]; then
+    echo "inherited CARGO_TARGET_DIR=$CARGO_TARGET_DIR is overridden by this wrapper"
+  fi
+  exit 0
+fi
+
+# An explicit --target-dir can still point cargo at the legacy target; refuse that.
+prev=""
+for arg in "$@"; do
+  [ "$arg" = "--" ] && break
+  value=""
+  case "$arg" in
+    --target-dir=*) value="${arg#--target-dir=}" ;;
+    *) [ "$prev" = "--target-dir" ] && value="$arg" ;;
+  esac
+  if [ -n "$value" ] && is_legacy "$value"; then
+    echo "cargo-iso: refusing --target-dir inside the legacy shared target: $value" >&2
+    exit 3
+  fi
+  prev="$arg"
+done
+
+if [ "$debug_mode" = unknown ]; then
+  echo "cargo-iso: cannot establish this target's debug mode: $debug_why." >&2
+  echo "           Nothing was built. Pass --low-debug or --full-debug to choose (and record) one." >&2
+  exit 3
+fi
+
+if [ "$free_gb" -lt "$min_free_gb" ]; then
+  echo "cargo-iso: only ${free_gb} GiB free on the build disk (minimum ${min_free_gb} GiB)." >&2
+  echo "           Free space first. Nothing was built and nothing was deleted." >&2
+  echo "           (Check with: scripts/cargo-iso --print-target)" >&2
+  exit 4
+fi
+
+if [ -n "${CARGO_TARGET_DIR:-}" ] && is_legacy "$CARGO_TARGET_DIR"; then
+  echo "cargo-iso: note: inherited CARGO_TARGET_DIR points at the legacy shared target; overriding it with $target" >&2
+fi
+
+# Budget admission is ADVISORY ONLY: it warns and records, and never refuses a build.
+# (Exit 5 is reserved for a future enforcing mode that is intentionally not available.)
+# It also covers a re-created, artifact-free (retired) directory.  Tool errors never block.
+maintain="$(dirname "$0")/emuwiz-cargo-maintain"
+if [ -f "$maintain" ] && command -v python3 >/dev/null 2>&1; then
+  admit_rc=0
+  python3 -I "$maintain" admit --target "$target" || admit_rc=$?
+  if [ "$admit_rc" -eq 5 ]; then
+    exit 5
+  elif [ "$admit_rc" -ne 0 ]; then
+    echo "cargo-iso: note: budget advisory unavailable (status $admit_rc); continuing" >&2
+  fi
+fi
+
+mkdir -p "$target"
+export CARGO_TARGET_DIR="$target"
+unset CARGO_BUILD_TARGET_DIR
+if [ "$debug_mode" = low ] || [ "$debug_mode" = full ]; then
+  if [ -n "$recorded" ] && [ "$recorded" != "$debug_mode" ]; then
+    echo "cargo-iso: note: debug mode changes from ${recorded#invalid:} to $debug_mode for this target; the next build recompiles the workspace" >&2
+  fi
+  if [ "$recorded" != "$debug_mode" ]; then
+    # Record before building: an unrecorded, non-empty target would otherwise fall
+    # back to the inherited mode next time and silently rebuild.
+    { mkdir -p -- "$(dirname "$mode_file")" &&
+      printf '%s\n' "$debug_mode" >"$mode_file.tmp.$$" &&
+      mv -f -- "$mode_file.tmp.$$" "$mode_file"; } 2>/dev/null || {
+      echo "cargo-iso: could not record the debug mode in $mode_file; nothing was built" >&2
+      exit 3
+    }
+  fi
+  if [ "$debug_mode" = low ]; then
+    export CARGO_PROFILE_DEV_DEBUG=0 CARGO_PROFILE_TEST_DEBUG=0
+  else
+    unset CARGO_PROFILE_DEV_DEBUG CARGO_PROFILE_TEST_DEBUG
+  fi
+fi
+if [ "$use_sccache" = "1" ]; then
+  if [ "$incremental" = "1" ]; then
+    echo "cargo-iso: --sccache and --incremental are mutually exclusive (sccache cannot cache incremental builds)" >&2
+    exit 2
+  fi
+  sccache_bin=$(command -v sccache 2>/dev/null) || {
+    echo "cargo-iso: --sccache requested but sccache is not installed" >&2
+    exit 2
+  }
+  sccache_size="${EMUWIZ_SCCACHE_SIZE:-2G}"
+  case "$sccache_size" in
+    [0-9]*[MG]) ;;
+    *) echo "cargo-iso: EMUWIZ_SCCACHE_SIZE must look like 512M or 2G, got '$sccache_size'" >&2; exit 2 ;;
+  esac
+  export RUSTC_WRAPPER="$sccache_bin"
+  export SCCACHE_DIR="${EMUWIZ_SCCACHE_DIR:-$home/.cache/emuwiz-sccache}"
+  export SCCACHE_CACHE_SIZE="$sccache_size"
+  export SCCACHE_SERVER_PORT="${EMUWIZ_SCCACHE_PORT:-4241}"
+  export CARGO_INCREMENTAL=0
+elif [ "$incremental" = "1" ]; then
+  export CARGO_INCREMENTAL=1
+fi
+# Lifecycle tracking (scripts/emuwiz-cargo-retention): holds a shared lock for
+# the whole build so the cache cannot be retired under it, and records who built
+# what. It preserves cargo's arguments, exit status and signals, and never blocks
+# a build if the registry is unusable. EMUWIZ_RETENTION=0 turns it off.
+retention="$(dirname "$0")/emuwiz-cargo-retention"
+if [ "${EMUWIZ_RETENTION:-1}" != "0" ] && [ -f "$retention" ] && command -v python3 >/dev/null 2>&1; then
+  exec python3 -I "$retention" run --target "$target" --worktree "$top" -- "${EMUWIZ_CARGO:-cargo}" "$@"
+fi
+exec "${EMUWIZ_CARGO:-cargo}" "$@"

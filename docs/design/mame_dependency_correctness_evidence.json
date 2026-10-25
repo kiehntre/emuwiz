@@ -1,0 +1,609 @@
+{
+  "evidence_schema_version": 1,
+  "base_sha": "1203d8bcba77da51461c2b04260518fe56820234",
+  "branch": "fix/mame-dependency-correctness",
+  "worktree": "/home/davedap/emuwiz-mame-dependency-correctness",
+  "scope": "Read-only MAME compatibility metadata and supplied observations; synthetic XML and checksum facts only. No real ROM files or MAME execution.",
+  "root_causes_corrected": [
+    "cloneof took precedence over romof and hid distinct ROM sources",
+    "dependency closure copied complete ancestor inventories instead of member requirements",
+    "metadata references were treated as mandatory physical archive names",
+    "standalone alternatives removed unresolved references and could manufacture compatibility",
+    "merge targets were not validated for unique declaration, checksum/size agreement or cycles",
+    "listxml BIOS variants and defaults were discarded, so every variant could become mandatory",
+    "BIOS/device missing files lost their specific provenance and diagnostics",
+    "unused alternative failures leaked into aggregate compatible-set diagnostics",
+    "empty relationship markers were erased and could hide contradictory metadata",
+    "contradictory observations at the same location could be resolved by preferring a matching copy",
+    "Adjacent-only merge checks could hide transitive checksum conflicts or omit an owner checksum; all facts along one explicit member chain are now retained and enforced.",
+    "Size-only observations without a usable CRC32/SHA-1 identity could be promoted to compatible."
+  ],
+  "fixture_comparison": [
+    {
+      "fixture": "clone_parent_different_from_rom_source",
+      "before": {
+        "state": "Incompatible",
+        "diagnostics": [
+          {
+            "reason": "RequiredFileMissing",
+            "set_name": "child",
+            "member_name": null
+          },
+          {
+            "reason": "RequiredFileMissing",
+            "set_name": "child",
+            "member_name": "alias.bin"
+          },
+          {
+            "reason": "RequiredFileMissing",
+            "set_name": "child",
+            "member_name": "unneeded.bin"
+          },
+          {
+            "reason": "RequiredFileMissing",
+            "set_name": "lineage",
+            "member_name": "unneeded.bin"
+          },
+          {
+            "reason": "ParentMissing",
+            "set_name": "lineage",
+            "member_name": null
+          }
+        ]
+      },
+      "after": {
+        "state": "Compatible",
+        "diagnostics": []
+      }
+    },
+    {
+      "fixture": "parent_extra_roms_are_not_clone_requirements",
+      "before": {
+        "state": "Incompatible",
+        "diagnostics": [
+          {
+            "reason": "RequiredFileMissing",
+            "set_name": "child",
+            "member_name": "parent-only.bin"
+          },
+          {
+            "reason": "RequiredFileMissing",
+            "set_name": "child",
+            "member_name": "shared-alias.bin"
+          },
+          {
+            "reason": "RequiredFileMissing",
+            "set_name": "child",
+            "member_name": "shared.bin"
+          },
+          {
+            "reason": "RequiredFileMissing",
+            "set_name": "parent",
+            "member_name": "parent-only.bin"
+          }
+        ]
+      },
+      "after": {
+        "state": "Compatible",
+        "diagnostics": []
+      }
+    },
+    {
+      "fixture": "missing_bios_is_diagnosed_as_bios",
+      "before": {
+        "state": "Incompatible",
+        "diagnostics": [
+          {
+            "reason": "RequiredFileMissing",
+            "set_name": "child",
+            "member_name": "boot.bin"
+          },
+          {
+            "reason": "RequiredFileMissing",
+            "set_name": "firmware",
+            "member_name": "boot.bin"
+          },
+          {
+            "reason": "ParentMissing",
+            "set_name": "firmware",
+            "member_name": null
+          }
+        ]
+      },
+      "after": {
+        "state": "Incompatible",
+        "diagnostics": [
+          {
+            "reason": "BiosMissing",
+            "set_name": "firmware",
+            "member_name": "boot.bin"
+          }
+        ]
+      }
+    },
+    {
+      "fixture": "missing_device_rom_is_diagnosed_as_device",
+      "before": {
+        "state": "Incompatible",
+        "diagnostics": [
+          {
+            "reason": "RequiredFileMissing",
+            "set_name": "sound",
+            "member_name": "sound.bin"
+          }
+        ]
+      },
+      "after": {
+        "state": "Incompatible",
+        "diagnostics": [
+          {
+            "reason": "DeviceDependencyMissing",
+            "set_name": "sound",
+            "member_name": "sound.bin"
+          }
+        ]
+      }
+    },
+    {
+      "fixture": "explicit_merge_checksum_mismatch_is_unknown_even_with_local_copy",
+      "before": {
+        "state": "Compatible",
+        "diagnostics": [
+          {
+            "reason": "RequiredFileMissing",
+            "set_name": "child",
+            "member_name": "source.bin"
+          }
+        ]
+      },
+      "after": {
+        "state": "Unknown",
+        "diagnostics": [
+          {
+            "reason": "EvidenceUnavailable",
+            "set_name": "source",
+            "member_name": "alias.bin"
+          }
+        ]
+      }
+    },
+    {
+      "fixture": "clone_dependency_cycle_is_unknown_and_deterministic",
+      "before": {
+        "state": "Compatible",
+        "diagnostics": []
+      },
+      "after": {
+        "state": "Unknown",
+        "diagnostics": [
+          {
+            "reason": "EvidenceUnavailable",
+            "set_name": "child",
+            "member_name": null
+          }
+        ]
+      }
+    },
+    {
+      "fixture": "missing_referenced_parent_is_metadata_unknown",
+      "before": {
+        "state": "Compatible",
+        "diagnostics": [
+          {
+            "reason": "ParentMissing",
+            "set_name": "absent",
+            "member_name": null
+          }
+        ]
+      },
+      "after": {
+        "state": "Unknown",
+        "diagnostics": [
+          {
+            "reason": "EvidenceUnavailable",
+            "set_name": "absent",
+            "member_name": null
+          }
+        ]
+      }
+    },
+    {
+      "fixture": "correct_split_collection",
+      "before": {
+        "state": "Incompatible",
+        "diagnostics": [
+          {
+            "reason": "RequiredFileMissing",
+            "set_name": "child",
+            "member_name": "parent-only.bin"
+          },
+          {
+            "reason": "RequiredFileMissing",
+            "set_name": "child",
+            "member_name": "shared-alias.bin"
+          },
+          {
+            "reason": "RequiredFileMissing",
+            "set_name": "child",
+            "member_name": "shared.bin"
+          },
+          {
+            "reason": "RequiredFileMissing",
+            "set_name": "parent",
+            "member_name": "parent-only.bin"
+          }
+        ]
+      },
+      "after": {
+        "state": "Compatible",
+        "diagnostics": []
+      }
+    },
+    {
+      "fixture": "correct_merged_collection",
+      "before": {
+        "state": "Incompatible",
+        "diagnostics": [
+          {
+            "reason": "RequiredFileMissing",
+            "set_name": "child",
+            "member_name": null
+          },
+          {
+            "reason": "RequiredFileMissing",
+            "set_name": "child",
+            "member_name": "child.bin"
+          },
+          {
+            "reason": "RequiredFileMissing",
+            "set_name": "child",
+            "member_name": "parent-only.bin"
+          },
+          {
+            "reason": "RequiredFileMissing",
+            "set_name": "child",
+            "member_name": "shared-alias.bin"
+          },
+          {
+            "reason": "RequiredFileMissing",
+            "set_name": "child",
+            "member_name": "shared.bin"
+          },
+          {
+            "reason": "RequiredFileMissing",
+            "set_name": "parent",
+            "member_name": "parent-only.bin"
+          }
+        ]
+      },
+      "after": {
+        "state": "Compatible",
+        "diagnostics": []
+      }
+    },
+    {
+      "fixture": "correct_non_merged_collection",
+      "before": {
+        "state": "Incompatible",
+        "diagnostics": [
+          {
+            "reason": "RequiredFileMissing",
+            "set_name": "child",
+            "member_name": "parent-only.bin"
+          },
+          {
+            "reason": "RequiredFileMissing",
+            "set_name": "child",
+            "member_name": "shared.bin"
+          },
+          {
+            "reason": "RequiredFileMissing",
+            "set_name": "parent",
+            "member_name": "parent-only.bin"
+          },
+          {
+            "reason": "RequiredFileMissing",
+            "set_name": "parent",
+            "member_name": "shared.bin"
+          },
+          {
+            "reason": "ParentMissing",
+            "set_name": "parent",
+            "member_name": null
+          }
+        ]
+      },
+      "after": {
+        "state": "Compatible",
+        "diagnostics": []
+      }
+    },
+    {
+      "fixture": "default_bios_selection_does_not_require_other_variants",
+      "before": {
+        "state": "Incompatible",
+        "diagnostics": [
+          {
+            "reason": "RequiredFileMissing",
+            "set_name": "child",
+            "member_name": "other.bin"
+          }
+        ]
+      },
+      "after": {
+        "state": "Compatible",
+        "diagnostics": []
+      }
+    },
+    {
+      "fixture": "full_non_merged_support_is_valid_without_support_archives",
+      "before": {
+        "state": "Compatible",
+        "diagnostics": [
+          {
+            "reason": "RequiredFileMissing",
+            "set_name": "firmware",
+            "member_name": "boot.bin"
+          },
+          {
+            "reason": "RequiredFileMissing",
+            "set_name": "sound",
+            "member_name": "sound.bin"
+          },
+          {
+            "reason": "ParentMissing",
+            "set_name": "firmware",
+            "member_name": null
+          },
+          {
+            "reason": "DeviceDependencyMissing",
+            "set_name": "sound",
+            "member_name": null
+          }
+        ]
+      },
+      "after": {
+        "state": "Compatible",
+        "diagnostics": []
+      }
+    }
+  ],
+  "red_green": {
+    "original_regressions": {
+      "command": "scripts/cargo-iso --low-debug test -p archivefs-core --test mame_dependency_correctness -- --nocapture",
+      "passed": 1,
+      "failed": 11,
+      "exit": 101,
+      "log": "/tmp/emuwiz-mame-dependency-red.log"
+    },
+    "final_regressions": {
+      "command": "scripts/cargo-iso --low-debug test -p archivefs-core --test mame_dependency_correctness -- --nocapture --test-threads=1",
+      "passed": 27,
+      "failed": 0,
+      "exit": 0,
+      "log": "/tmp/emuwiz-mame-dependency-green-with-provenance.log"
+    },
+    "additional_failures_fixed": [
+      "initial helper lifetime compilation error",
+      "explicit BIOS selection not propagated to its corresponding BIOS provider",
+      "aggregate diagnostics included unused failed layouts",
+      "non-merged game rejected separate device ROM-source storage",
+      "ROM-source search location rejected without explicit merge ownership",
+      "optional marker bypassed malformed metadata; empty attributes were lost by parser",
+      "conflicting observed copies at one location could appear compatible",
+      "Four affected-suite fixture assumptions corrected: invalid two-digit CRC values and filename-only differences sharing the same CRC. No assertions or production statistics logic were weakened.",
+      "Two transitive-merge fixtures reproduced false compatibility through sparse intermediate declarations (25 passed, 2 failed before correction; 27 passed after correction)."
+    ]
+  },
+  "schema_compatibility": {
+    "old_version": 1,
+    "new_version": 2,
+    "changes": "Add dependency resolution/provenance, effective BIOS selections, layout and verified observed-ROM records. Existing function signatures and expected/observed ROM shapes remain; new layout/BIOS methods are additive. Explicit borrowed-member declaration chains retain original per-set checksums; resolved requirements enforce their accumulated constraints without adding the provider inventory.",
+    "rust_struct_literals": "MameDependencyEvidence now requires resolution; MameSetCompatibility now includes verified_roms. The existing internal literal is updated.",
+    "cached_metadata": "Reparse older listxml artifacts to recover BIOS declarations/defaults and retained empty markers; cached data that discarded those facts cannot recreate them."
+  },
+  "remaining_limitations": [
+    "Explicit merged disk requirements are conservatively Unknown; CHD parent chains, recovery and reconstruction are outside this change.",
+    "No general software-list, sample, image-loader or live slot-configuration evaluation is added.",
+    "BIOS variants require an unambiguous declared default, a single variant or explicit caller selection. Invalid/ambiguous choices remain Unknown.",
+    "Duplicate referenced declarations, unsupported structures/load flags and chains deeper than the existing 64-node bound remain Unknown.",
+    "The evaluator consumes gathered configured-rompath evidence; it performs no filesystem scan, hashing, MAME invocation or live launch/configuration validation. Ordering of copies across rompaths is not represented.",
+    "Only available CRC32/SHA-1 and size facts can prove ROM identity in the current observed-ROM interface; unproven identity remains Unknown."
+  ],
+  "reference_sources": [
+    "https://docs.mamedev.org/usingmame/assetsearch.html",
+    "https://docs.mamedev.org/usingmame/aboutromsets.html"
+  ],
+  "validation": {
+    "initial_affected_suite_failures": {
+      "arcade_": {
+        "passed": 128,
+        "failed": 1,
+        "test": "arcade_compatibility::tests::mame_and_fbneo_expectations_remain_separate"
+      },
+      "mame_collection_stats": {
+        "passed": 3,
+        "failed": 3,
+        "tests": [
+          "mame_collection_stats::tests::primary_buckets_and_evidence_unavailable_are_not_conflated",
+          "mame_collection_stats::tests::all_complete_all_incomplete_and_unresolved_alternatives_count_cleanly",
+          "mame_collection_stats::tests::alternative_layouts_are_summarized_without_preference_policy"
+        ]
+      }
+    },
+    "final_suites": [
+      {
+        "suite": "arcade_",
+        "command": "scripts/cargo-iso --low-debug test -p archivefs-core --lib arcade_ -- --test-threads=1",
+        "passed": 129,
+        "failed": 0,
+        "log": "/tmp/emuwiz-mame-dependency-final-arcade-serial.log"
+      },
+      {
+        "suite": "dat::dependency",
+        "command": "scripts/cargo-iso --low-debug test -p archivefs-core --lib dat::dependency",
+        "passed": 137,
+        "failed": 0,
+        "log": "/tmp/emuwiz-mame-dependency-suite-dat-dependency.log"
+      },
+      {
+        "suite": "dat::set",
+        "command": "scripts/cargo-iso --low-debug test -p archivefs-core --lib dat::set",
+        "passed": 97,
+        "failed": 0,
+        "log": "/tmp/emuwiz-mame-dependency-suite-dat-set.log"
+      },
+      {
+        "suite": "dat::parsers::mame_listxml",
+        "command": "scripts/cargo-iso --low-debug test -p archivefs-core --lib dat::parsers::mame_listxml",
+        "passed": 8,
+        "failed": 0,
+        "log": "/tmp/emuwiz-mame-dependency-suite-dat-parsers-mame_listxml.log"
+      },
+      {
+        "suite": "identity_source::mame_listxml",
+        "command": "scripts/cargo-iso --low-debug test -p archivefs-core --lib identity_source::mame_listxml",
+        "passed": 16,
+        "failed": 0,
+        "log": "/tmp/emuwiz-mame-dependency-suite-identity_source-mame_listxml.log"
+      },
+      {
+        "suite": "mame_collection_stats",
+        "command": "scripts/cargo-iso --low-debug test -p archivefs-core --lib mame_collection_stats",
+        "passed": 6,
+        "failed": 0,
+        "log": "/tmp/emuwiz-mame-dependency-suite-mame_collection_stats.log"
+      },
+      {
+        "suite": "ready_to_play",
+        "command": "scripts/cargo-iso --low-debug test -p archivefs-core --lib ready_to_play",
+        "passed": 3,
+        "failed": 0,
+        "log": "/tmp/emuwiz-mame-dependency-suite-ready_to_play.log"
+      }
+    ],
+    "affected_tests_passed": 396,
+    "affected_tests_failed": 0,
+    "parallel_probe_failure": {
+      "test": "diagnostics::arcade_version_probe::tests::probe_arcade_emulator_versions_reads_a_stub_mame_version",
+      "observed": "Parallel run: 128 passed, 1 failed (zero captured stub outputs). Complete serial rerun: 129 passed, 0 failed. No probe or launch code changed.",
+      "parallel_log": "/tmp/emuwiz-mame-dependency-suite-arcade_.log",
+      "serial_log": "/tmp/emuwiz-mame-dependency-final-arcade-serial.log"
+    },
+    "workspace_check": {
+      "command": "scripts/cargo-iso --low-debug check --workspace --all-targets --offline",
+      "exit": 0,
+      "log": "/tmp/emuwiz-mame-dependency-workspace.log"
+    },
+    "format_check": {
+      "command": "scripts/cargo-iso --low-debug fmt --all -- --check",
+      "exit": 0,
+      "log": "/tmp/emuwiz-mame-dependency-format.log"
+    },
+    "scope_check": {
+      "exit": 0,
+      "log": "/tmp/emuwiz-mame-dependency-scope.log",
+      "gui_root_net_lines": 0
+    },
+    "warnings": "Existing compiler warnings in untouched code remain; no new warnings from the modified compatibility/dependency logic."
+  },
+  "handoff": "Local candidate only. Independent review required; no push, merge or promotion.",
+  "changed_files": [
+    "crates/archivefs-core/src/arcade_mame_compatibility.rs",
+    "crates/archivefs-core/src/arcade_mame_compatibility/dependencies.rs",
+    "crates/archivefs-core/src/arcade_compatibility.rs",
+    "crates/archivefs-core/src/dat/dependency/resolve.rs",
+    "crates/archivefs-core/src/dat/parsers/mame_listxml.rs",
+    "crates/archivefs-core/src/mame_collection_stats.rs",
+    "crates/archivefs-core/tests/mame_dependency_correctness.rs",
+    "docs/design/mame_dependency_correctness_evidence.json"
+  ],
+  "extended_fixture_verdicts": {
+    "bios_selection_without_default_or_explicit_choice_is_unknown": [
+      "Unknown"
+    ],
+    "borrowed_rom_checks_every_checksum_fact_along_the_owner_chain": [
+      "Incompatible",
+      "Compatible"
+    ],
+    "clone_dependency_cycle_is_unknown_and_deterministic": [
+      "Unknown"
+    ],
+    "clone_lineage_alone_never_changes_declared_rom_ownership": [
+      "Compatible"
+    ],
+    "clone_parent_different_from_rom_source": [
+      "Compatible"
+    ],
+    "conflicting_copies_at_the_same_location_require_resolution_evidence": [
+      "Unknown",
+      "Compatible"
+    ],
+    "correct_merged_collection": [
+      "Compatible"
+    ],
+    "correct_non_merged_collection": [
+      "Compatible"
+    ],
+    "correct_split_collection": [
+      "Compatible"
+    ],
+    "default_bios_selection_does_not_require_other_variants": [
+      "Compatible"
+    ],
+    "explicit_merge_checksum_mismatch_is_unknown_even_with_local_copy": [
+      "Unknown"
+    ],
+    "full_non_merged_support_is_valid_without_support_archives": [
+      "Compatible"
+    ],
+    "invalid_explicit_merge_targets_remain_unknown_in_every_layout": [
+      "Unknown"
+    ],
+    "malformed_missing_duplicate_and_cyclic_references_cannot_be_playable": [
+      "Unknown"
+    ],
+    "merge_chain_cannot_hide_checksum_conflicts_behind_sparse_intermediate_metadata": [
+      "Unknown"
+    ],
+    "missing_bios_is_diagnosed_as_bios": [
+      "Incompatible"
+    ],
+    "missing_device_rom_is_diagnosed_as_device": [
+      "Incompatible"
+    ],
+    "missing_referenced_parent_is_metadata_unknown": [
+      "Unknown"
+    ],
+    "non_merged_game_can_use_a_separate_device_rom_source": [
+      "Compatible"
+    ],
+    "optional_marker_cannot_hide_bad_metadata_or_nodump_policy": [
+      "Unknown",
+      "Unsupported"
+    ],
+    "parent_extra_roms_are_not_clone_requirements": [
+      "Compatible"
+    ],
+    "provenance_preserves_declaring_machine_owner_and_observed_location": [
+      "Compatible"
+    ],
+    "rom_source_is_a_search_location_without_automatic_ownership": [
+      "Compatible"
+    ],
+    "selected_bios_variant": [
+      "Compatible"
+    ],
+    "shared_device_diamond_is_valid_and_nested_missing_rom_has_device_provenance": [
+      "Compatible",
+      "Incompatible"
+    ],
+    "unused_layout_missing_files_are_not_reported_as_selected_set_failures": [
+      "Compatible"
+    ],
+    "unverified_identity_and_unrelated_archive_are_not_compatibility_proof": [
+      "Unknown",
+      "Incompatible"
+    ]
+  }
+}

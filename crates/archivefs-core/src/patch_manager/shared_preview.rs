@@ -12,7 +12,7 @@ use sha2::{Digest, Sha256};
 
 use super::destination_safety::{
     DestinationRootState, DestinationSafetyError, DestinationSafetyFailureReason, DestinationState,
-    assess_destination, validate_destination_root,
+    assess_destination, validate_destination_root, validate_single_component,
 };
 
 pub const PREVIEW_MAX_ENTRIES: usize = 512;
@@ -27,19 +27,65 @@ pub const PREVIEW_MAX_WARNINGS: usize = 64;
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum PreviewAdapter {
+    /// Native mGBA GBA cheat installation.
+    Mgba,
     RetroArch,
     Pcsx2,
+    DuckStation,
+    MelonDs,
     Dolphin,
+    Ppsspp,
     Xenia,
+    /// The local generic (non-cheat) mod package workflow. Distinct provenance
+    /// so a journal / history row is never mislabelled as an emulator adapter.
+    LocalModPackage,
+    /// A structurally inspected Cemu graphic pack. Its relative paths may
+    /// contain any number of safe normal components because Cemu preserves
+    /// the pack's nested content/assets/shader layout.
+    CemuGraphicPack,
+    /// A structurally inspected ordinary RPCS3 file-layer mod. Its relative
+    /// paths retain the package's nested PS3 filesystem layout.
+    Rpcs3OrdinaryMod,
+    /// A local native MAME cheat XML definition.
+    Mame,
+    /// A native Flycast Dreamcast cheat file.
+    Flycast,
+    /// A local native RPCS3 patch.yml definition.
+    Rpcs3Patch,
+    /// A native Mednafen per-system `.cht` definition.
+    Mednafen,
+    /// A local native FinalBurn Neo per-set cheat definition.
+    Fbneo,
+    /// A documented ScummVM engine-specific gameplay trainer option.
+    ScummVmTrainer,
+    /// A documented WHDLoad trainer/custom-option launch override.
+    AmigaWhdloadTrainer,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum PreviewIdentityKind {
+    MgbaRomSha256,
     RetroArchCatalogueMatch,
     Pcsx2ExecutableCrc,
+    DuckStationSerial,
+    MelonDsRomIdentity,
+    Pcsx2TexturePack,
     DolphinGameId,
+    /// An explicit multi-file Dolphin texture-pack manifest. Multiple
+    /// verified source files are expected and are not competing identity
+    /// matches in this mode.
+    DolphinTexturePack,
+    PpssppDiscId,
     XeniaTitleId,
+    CemuTitleId,
+    Rpcs3TitleId,
+    /// Exact MD5 section identity used by Mednafen `.cht` files.
+    MednafenMd5,
+    MameMachineShortname,
+    ScummVmGameId,
+    WhdloadSlave,
+    DreamcastProductCode,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
@@ -422,7 +468,24 @@ fn preview_one(
 ) -> SharedPreviewEntry {
     let mut entry = base_entry(request, source, Some(relative.clone()));
     apply_eligibility_blockers(request, source, &mut entry);
-    let Some((directory, filename)) = two_safe_components(&relative) else {
+    let Some((directory, filename)) = two_safe_components(&relative).or_else(|| {
+        (matches!(
+            request.adapter,
+            PreviewAdapter::RetroArch
+                | PreviewAdapter::Ppsspp
+                | PreviewAdapter::DuckStation
+                | PreviewAdapter::MelonDs
+                | PreviewAdapter::CemuGraphicPack
+                | PreviewAdapter::Rpcs3OrdinaryMod
+                | PreviewAdapter::Flycast
+                | PreviewAdapter::Mgba
+                | PreviewAdapter::Rpcs3Patch
+                | PreviewAdapter::Fbneo
+                | PreviewAdapter::AmigaWhdloadTrainer
+                | PreviewAdapter::ScummVmTrainer
+        ))
+        .then(|| (OsString::new(), OsString::new()))
+    }) else {
         block(
             &mut entry,
             PreviewState::UnsafeDestination,
@@ -477,11 +540,29 @@ fn preview_one(
         }
     };
 
-    let assessment = match assess_destination(
-        &request.destination_root,
-        directory.as_os_str(),
-        filename.as_os_str(),
+    let assessment = if matches!(
+        request.adapter,
+        PreviewAdapter::RetroArch
+            | PreviewAdapter::Ppsspp
+            | PreviewAdapter::CemuGraphicPack
+            | PreviewAdapter::Rpcs3OrdinaryMod
+            | PreviewAdapter::Flycast
+            | PreviewAdapter::MelonDs
+            | PreviewAdapter::Mgba
+            | PreviewAdapter::Rpcs3Patch
+            | PreviewAdapter::Fbneo
+            | PreviewAdapter::AmigaWhdloadTrainer
+            | PreviewAdapter::ScummVmTrainer
     ) {
+        assess_nested_destination(&request.destination_root, &relative)
+    } else {
+        assess_destination(
+            &request.destination_root,
+            directory.as_os_str(),
+            filename.as_os_str(),
+        )
+    };
+    let assessment = match assessment {
         Ok(assessment) => assessment,
         Err(error) => {
             entry.destination_path = Some(error.path.clone());
@@ -717,7 +798,21 @@ fn apply_eligibility_blockers(
             source.match_strength,
             PreviewMatchStrength::VerifiedExact | PreviewMatchStrength::Strong
         ),
-        PreviewAdapter::Pcsx2 | PreviewAdapter::Dolphin => {
+        PreviewAdapter::Pcsx2
+        | PreviewAdapter::DuckStation
+        | PreviewAdapter::MelonDs
+        | PreviewAdapter::Dolphin
+        | PreviewAdapter::Ppsspp
+        | PreviewAdapter::LocalModPackage
+        | PreviewAdapter::CemuGraphicPack
+        | PreviewAdapter::Rpcs3OrdinaryMod
+        | PreviewAdapter::Mame
+        | PreviewAdapter::Flycast
+        | PreviewAdapter::Mgba
+        | PreviewAdapter::Rpcs3Patch
+        | PreviewAdapter::Mednafen
+        | PreviewAdapter::Fbneo => source.match_strength == PreviewMatchStrength::VerifiedExact,
+        PreviewAdapter::AmigaWhdloadTrainer | PreviewAdapter::ScummVmTrainer => {
             source.match_strength == PreviewMatchStrength::VerifiedExact
         }
     };
@@ -846,10 +941,19 @@ fn detect_cross_entry_conflicts(request: &SharedPreviewRequest, report: &mut Sha
         .filter(|entry| entry.match_strength == PreviewMatchStrength::VerifiedExact)
         .filter_map(|entry| entry.source_path.as_ref())
         .collect::<BTreeSet<_>>();
-    if matches!(
-        request.adapter,
-        PreviewAdapter::Pcsx2 | PreviewAdapter::Dolphin
-    ) && exact_sources.len() > 1
+    if ((request.adapter == PreviewAdapter::Pcsx2
+        && request.identity.kind == PreviewIdentityKind::Pcsx2ExecutableCrc)
+        || (request.adapter == PreviewAdapter::DuckStation
+            && request.identity.kind == PreviewIdentityKind::DuckStationSerial)
+        || (request.adapter == PreviewAdapter::MelonDs
+            && request.identity.kind == PreviewIdentityKind::MelonDsRomIdentity)
+        || (request.adapter == PreviewAdapter::Dolphin
+            && request.identity.kind == PreviewIdentityKind::DolphinGameId)
+        || (request.adapter == PreviewAdapter::Rpcs3OrdinaryMod
+            && request.identity.kind == PreviewIdentityKind::Rpcs3TitleId)
+        || (request.adapter == PreviewAdapter::Mednafen
+            && request.identity.kind == PreviewIdentityKind::MednafenMd5))
+        && exact_sources.len() > 1
     {
         for index in 0..report.entries.len() {
             mark_conflict(
@@ -1117,6 +1221,104 @@ fn two_safe_components(relative: &Path) -> Option<(OsString, OsString)> {
     }
 }
 
+/// Cemu graphic packs deliberately retain arbitrary nested normal components
+/// (`content/`, shader folders, patches, and so on). This is the same
+/// destination-safety contract as the generic local-mod path, kept here so
+/// the shared preview can inspect the exact nested destination without
+/// flattening it.
+fn assess_nested_destination(
+    root: &Path,
+    relative: &Path,
+) -> Result<super::destination_safety::DestinationSafetyAssessment, DestinationSafetyError> {
+    let validated_root = validate_destination_root(root)?;
+    if relative.as_os_str().is_empty() || relative.is_absolute() {
+        return Err(DestinationSafetyError::new(
+            DestinationSafetyFailureReason::UnsafeComponent,
+            root.join(relative),
+        ));
+    }
+    let components: Vec<_> = relative.components().collect();
+    if components.is_empty()
+        || components.iter().any(|component| {
+            !matches!(component, Component::Normal(name) if validate_single_component(name, root).is_ok())
+        })
+    {
+        return Err(DestinationSafetyError::new(
+            DestinationSafetyFailureReason::UnsafeComponent,
+            root.join(relative),
+        ));
+    }
+    let mut current = root.to_path_buf();
+    let mut inspected_parents = Vec::new();
+    for component in &components[..components.len() - 1] {
+        current.push(component.as_os_str());
+        match fs::symlink_metadata(&current) {
+            Ok(metadata) if metadata.file_type().is_symlink() => {
+                return Err(DestinationSafetyError::new(
+                    DestinationSafetyFailureReason::ParentSymlink,
+                    current,
+                ));
+            }
+            Ok(metadata) if !metadata.is_dir() => {
+                return Err(DestinationSafetyError::new(
+                    DestinationSafetyFailureReason::NonDirectoryParent,
+                    current,
+                ));
+            }
+            Ok(_) => inspected_parents.push(super::destination_safety::InspectedParent {
+                path: current.clone(),
+                state: super::destination_safety::InspectedParentState::ExistingDirectory,
+            }),
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {
+                inspected_parents.push(super::destination_safety::InspectedParent {
+                    path: current.clone(),
+                    state: super::destination_safety::InspectedParentState::Missing,
+                });
+            }
+            Err(_) => {
+                return Err(DestinationSafetyError::new(
+                    DestinationSafetyFailureReason::InspectionFailed,
+                    current,
+                ));
+            }
+        }
+    }
+    let destination = root.join(relative);
+    let destination_state = match fs::symlink_metadata(&destination) {
+        Ok(metadata) if metadata.file_type().is_symlink() => {
+            return Err(DestinationSafetyError::new(
+                DestinationSafetyFailureReason::FinalSymlink,
+                destination,
+            ));
+        }
+        Ok(metadata) if metadata.is_file() => DestinationState::RegularFile,
+        Ok(metadata) if metadata.is_dir() => {
+            return Err(DestinationSafetyError::new(
+                DestinationSafetyFailureReason::DestinationIsDirectory,
+                destination,
+            ));
+        }
+        Ok(_) => DestinationState::Unsafe,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => DestinationState::Absent,
+        Err(_) => {
+            return Err(DestinationSafetyError::new(
+                DestinationSafetyFailureReason::InspectionFailed,
+                destination,
+            ));
+        }
+    };
+    let safe = super::destination_safety::SafeDestination::nested(
+        validated_root.clone(),
+        destination.clone(),
+    );
+    Ok(super::destination_safety::DestinationSafetyAssessment {
+        validated_root,
+        proposed_destination: safe,
+        destination_state,
+        inspected_parents,
+    })
+}
+
 fn is_filesystem_root(path: &Path) -> bool {
     path.is_absolute() && path.parent().is_none()
 }
@@ -1128,12 +1330,85 @@ fn platform_matches(adapter: PreviewAdapter, platform: Option<&str>) -> bool {
             normalized.as_str(),
             "ps2" | "playstation 2" | "playstation2" | "sony playstation 2"
         ),
+        PreviewAdapter::DuckStation => matches!(
+            normalized.as_str(),
+            "ps1" | "playstation" | "playstation 1" | "sony playstation"
+        ),
+        PreviewAdapter::MelonDs => matches!(
+            normalized.as_str(),
+            "nds" | "nintendo ds" | "nintendo ds / dsi" | "melonds"
+        ),
         PreviewAdapter::Dolphin => matches!(
             normalized.as_str(),
             "gamecube" | "nintendo gamecube" | "gc" | "gcn" | "wii" | "nintendo wii"
         ),
+        PreviewAdapter::Ppsspp => matches!(
+            normalized.as_str(),
+            "psp" | "playstation portable" | "sony playstation portable"
+        ),
         PreviewAdapter::Xenia => matches!(normalized.as_str(), "xbox360" | "xbox 360"),
-        PreviewAdapter::RetroArch => !normalized.is_empty(),
+        // Platform agreement for a local mod package is already established by
+        // `mod_package`'s own compatibility check before a plan is built; this
+        // adapter never goes through `build_shared_preview`.
+        PreviewAdapter::RetroArch | PreviewAdapter::LocalModPackage => !normalized.is_empty(),
+        PreviewAdapter::CemuGraphicPack => matches!(normalized.as_str(), "wiiu" | "wii u"),
+        PreviewAdapter::Rpcs3OrdinaryMod => normalized == "ps3" || normalized == "playstation 3",
+        PreviewAdapter::Rpcs3Patch => normalized == "ps3" || normalized == "playstation 3",
+        PreviewAdapter::Mame => normalized == "mame" || normalized == "arcade",
+        PreviewAdapter::Flycast => normalized == "dreamcast" || normalized == "sega dreamcast",
+        PreviewAdapter::Mgba => matches!(
+            normalized.as_str(),
+            "gba" | "game boy advance" | "nintendo game boy advance"
+        ),
+        PreviewAdapter::Mednafen => matches!(
+            normalized.as_str(),
+            "gb" | "gbc"
+                | "game boy"
+                | "gameboy"
+                | "game boy color"
+                | "gg"
+                | "game gear"
+                | "lynx"
+                | "atari lynx"
+                | "md"
+                | "mega drive"
+                | "genesis"
+                | "sega genesis"
+                | "nes"
+                | "famicom"
+                | "nintendo entertainment system"
+                | "pce"
+                | "pc engine"
+                | "pc engine cd"
+                | "turbografx 16"
+                | "turbografx cd"
+                | "supergrafx"
+                | "pce_fast"
+                | "pcfx"
+                | "pc-fx"
+                | "psx"
+                | "ps1"
+                | "playstation"
+                | "sms"
+                | "sega master system"
+                | "snes"
+                | "super nintendo"
+                | "super famicom"
+                | "snes_faust"
+                | "vb"
+                | "virtual boy"
+                | "wswan"
+                | "wonderswan"
+                | "wonder swan"
+                | "wonderswan color"
+        ),
+        PreviewAdapter::Fbneo => {
+            normalized == "arcade" || normalized == "finalburn neo" || normalized == "fbneo"
+        }
+        PreviewAdapter::ScummVmTrainer => normalized == "scummvm",
+        PreviewAdapter::AmigaWhdloadTrainer => {
+            normalized == "amiga" || normalized == "commodore amiga"
+        }
     }
 }
 

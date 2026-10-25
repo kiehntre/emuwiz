@@ -5,7 +5,15 @@ members = [
     "crates/archivefs-gui",
 ]
 resolver = "2"
+# Vendored third-party patch (see third_party/chd-0.3.4/PATCH.md); not a member.
+exclude = ["third_party/chd-0.3.4"]
 
 [workspace.package]
-version = "0.7.0"
+version = "0.10.0"
 edition = "2024"
+
+# TEMPORARY: RUSTSEC-2026-0344 (ruzstd < 0.9.1). The only change to chd 0.3.4 is
+# its ruzstd requirement. Remove when upstream chd allows ruzstd >= 0.9.1;
+# conditions and provenance are in third_party/chd-0.3.4/PATCH.md.
+[patch.crates-io]
+chd = { path = "third_party/chd-0.3.4" }

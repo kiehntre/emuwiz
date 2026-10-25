@@ -42,8 +42,8 @@
 //! - A `.cht` text parser that keeps per-cheat descriptions and
 //!   enabled-by-default flags ([`CheatDefinition`]), rather than
 //!   `retroarch_inventory::CheatFileSummary`'s aggregate-only counts. Cheat
-//!   *code* bodies (the numeric/hex value lines) are still never parsed or
-//!   stored, matching that module's existing precedent.
+//!   code bodies are retained verbatim as audit evidence, without decoding
+//!   their semantics or making them executable.
 //! - Game-identity matching against a catalogue source name/platform/
 //!   region/serial/content-hash instead of a PNACH filename or playlist
 //!   content path.
@@ -115,9 +115,10 @@ pub enum CheatCatalogueFormat {
     JsonManifest,
 }
 
-/// One cheat's bounded metadata - never the code body itself.
+/// One cheat's bounded metadata and original source evidence.
 #[derive(Debug, Clone, Serialize)]
 pub struct CheatDefinition {
+    pub source_evidence: Vec<super::cheat_provenance::CheatRecordProvenance>,
     pub description: Option<String>,
     pub enabled_by_default: bool,
     /// The declared `cheatN_*` index for a `.cht` source, or the manifest
@@ -190,9 +191,12 @@ pub struct CheatGameRecord {
     /// asserted).
     pub source_file_hash: Option<String>,
     pub format: CheatCatalogueFormat,
-    /// `false` if any parsing diagnostic was emitted for this record
-    /// (malformed line, declared/parsed count mismatch, entry index past
-    /// [`MAX_CHEATS_PER_GAME`], ...). Mirrors
+    /// `true` for every record that reaches this struct - a file that
+    /// fails to parse at all (zero usable `cheatN_*` entries alongside
+    /// malformed content) never becomes a [`CheatGameRecord`]; see
+    /// [`ChtLoadOutcome::Excluded`]. `parsing_diagnostics` still carries any
+    /// non-fatal warnings (a skipped stray line, a legacy-encoding
+    /// fallback, ...) collected while this record was parsed. Mirrors
     /// `retroarch_inventory::CheatFileSummary::complete`.
     pub parsing_complete: bool,
     pub parsing_diagnostics: Vec<CatalogueDiagnostic>,
@@ -315,13 +319,22 @@ fn empty_snapshot_for_unusable_root(
 
 pub struct RetroarchChtDirectorySource {
     source_name: String,
+    source_kind: super::cheat_provenance::CheatSourceKind,
 }
 
 impl RetroarchChtDirectorySource {
     pub fn new(source_name: &str) -> Self {
         Self {
             source_name: source_name.to_string(),
+            source_kind: super::cheat_provenance::CheatSourceKind::LocalFile,
         }
+    }
+}
+
+impl RetroarchChtDirectorySource {
+    pub fn with_source_kind(mut self, kind: super::cheat_provenance::CheatSourceKind) -> Self {
+        self.source_kind = kind;
+        self
     }
 }
 
@@ -429,7 +442,14 @@ impl CheatCatalogueSource for RetroarchChtDirectorySource {
                             continue;
                         }
                         match load_cht_record(filesystem, &path, platform_hint.as_deref()) {
-                            ChtLoadOutcome::Indexed(record) => games.push(*record),
+                            ChtLoadOutcome::Indexed(mut record) => {
+                                attribute_catalogue_record(
+                                    &mut record,
+                                    &self.source_name,
+                                    self.source_kind,
+                                );
+                                games.push(*record);
+                            }
                             ChtLoadOutcome::Excluded(excluded) => {
                                 if !push_excluded_entry(
                                     &mut excluded_entries,
@@ -554,16 +574,10 @@ fn load_cht_record(
             });
         }
     };
-    let Ok(text) = std::str::from_utf8(&bytes) else {
-        return ChtLoadOutcome::Excluded(CatalogueExcludedEntry {
-            kind: CatalogueEntryExclusionKind::UnsupportedContentEncoding,
-            path: EncodedPath::from_path(path),
-            source_game_name,
-            source_platform: platform_hint.map(str::to_string),
-        });
-    };
+    let (text, mut diagnostics) = decode_cht_text(&bytes, path);
     let hash = hex_sha256(&bytes);
-    let (cheats, parsing_complete, _file_diagnostics) = parse_cht_cheats(text, path);
+    let (cheats, parsing_complete, parse_diagnostics) = parse_cht_cheats(&text, path);
+    diagnostics.extend(parse_diagnostics);
 
     if !parsing_complete {
         return ChtLoadOutcome::Excluded(CatalogueExcludedEntry {
@@ -595,8 +609,55 @@ fn load_cht_record(
         source_file_hash: Some(hash),
         format: CheatCatalogueFormat::RetroarchChtDirectory,
         parsing_complete: true,
-        parsing_diagnostics: Vec::new(),
+        parsing_diagnostics: diagnostics,
     }))
+}
+
+/// Decodes a bounded-read `.cht` file's bytes to text, preferring UTF-8 and
+/// falling back to a Windows-1252/Latin-1-compatible decoding for legacy
+/// files that predate `.cht` authors consistently using UTF-8 (2026-08-23,
+/// real-corpus audit: 6 of 28,308 real files carry such bytes, almost
+/// always a single accented character in a `cheatN_desc` value). Every byte
+/// 0x00-0xFF maps to exactly one Unicode scalar under this scheme, so
+/// decoding itself never fails; it does not by itself make garbage content
+/// parse as a valid cheat file; the decoded text still has to pass
+/// [`parse_cht_cheats`] like any other file. Bounded by the same
+/// [`MAX_CATALOGUE_FILE_BYTES`] the caller already read - no unbounded
+/// growth is introduced here.
+fn decode_cht_text(bytes: &[u8], path: &Path) -> (String, Vec<CatalogueDiagnostic>) {
+    match std::str::from_utf8(bytes) {
+        Ok(text) => (text.to_string(), Vec::new()),
+        Err(_) => (
+            bytes.iter().map(|&byte| windows1252_char(byte)).collect(),
+            vec![CatalogueDiagnostic {
+                code: "catalogue_cht_legacy_text_encoding",
+                severity: ArtifactDiagnosticSeverity::Info,
+                path: Some(EncodedPath::from_path(path)),
+            }],
+        ),
+    }
+}
+
+/// Maps one byte to the Unicode scalar it represents under Windows-1252,
+/// which is identical to Latin-1 (ISO-8859-1) outside the 0x80-0x9F C1
+/// control range, where Windows-1252 instead defines printable characters
+/// (curly quotes, em/en dash, etc.) - the common case for legacy `.cht`
+/// text. `0x81`, `0x8D`, `0x8F`, `0x90`, and `0x9D` are undefined in
+/// Windows-1252 proper; they map back to their C1 control code, matching
+/// the standard "best effort" convention other decoders use.
+fn windows1252_char(byte: u8) -> char {
+    const CP1252_C1: [char; 32] = [
+        '\u{20AC}', '\u{0081}', '\u{201A}', '\u{0192}', '\u{201E}', '\u{2026}', '\u{2020}',
+        '\u{2021}', '\u{02C6}', '\u{2030}', '\u{0160}', '\u{2039}', '\u{0152}', '\u{008D}',
+        '\u{017D}', '\u{008F}', '\u{0090}', '\u{2018}', '\u{2019}', '\u{201C}', '\u{201D}',
+        '\u{2022}', '\u{2013}', '\u{2014}', '\u{02DC}', '\u{2122}', '\u{0161}', '\u{203A}',
+        '\u{0153}', '\u{009D}', '\u{017E}', '\u{0178}',
+    ];
+    if (0x80..=0x9F).contains(&byte) {
+        CP1252_C1[(byte - 0x80) as usize]
+    } else {
+        byte as char
+    }
 }
 
 fn os_name_has_cht_extension(name: &std::ffi::OsStr) -> bool {
@@ -636,117 +697,96 @@ fn exclusion_kind_order(kind: CatalogueEntryExclusionKind) -> u8 {
     }
 }
 
-/// Parses the same `cheatN_*`/`cheats = N` key-value text format as
-/// `retroarch_inventory::parse_cheat_summary`, but keeps one
-/// [`CheatDefinition`] per entry index instead of only aggregate counts.
-/// Deliberately re-implemented rather than importing that function:
-/// `retroarch_inventory` exposes no `pub(crate)` parser today, and
-/// widening its visibility is out of scope for this milestone's file-level
-/// boundary (see the module doc comment). Cheat *code* lines
-/// (`cheatN_code`, `cheatN_code_type`, ...) are read only far enough to
-/// confirm the key exists; their values are never stored anywhere in this
-/// module's output.
+/// Metadata projection of the shared bounded parser. Catalogue records
+/// deliberately retain incomplete entry metadata for review; selection always
+/// reparses source bytes and refuses blocking entry warnings. Legacy decoding
+/// stays explicit in `decode_cht_text`, never in the installation parser.
 fn parse_cht_cheats(
     text: &str,
     path: &Path,
 ) -> (Vec<CheatDefinition>, bool, Vec<CatalogueDiagnostic>) {
-    use std::collections::BTreeMap;
-
-    let mut declared_cheat_count = None;
-    let mut descriptions = BTreeMap::<u32, String>::new();
-    let mut enabled = BTreeSet::<u32>::new();
-    let mut seen_indices = BTreeSet::<u32>::new();
-    let mut diagnostics = Vec::new();
-    let mut complete = true;
-
-    for (index, raw_line) in text.lines().enumerate() {
-        let line_number = u32::try_from(index + 1).unwrap_or(u32::MAX);
-        let line = raw_line.trim();
-        if line.is_empty() || line.starts_with('#') {
-            continue;
+    use super::cht_document::{ChtDocumentWarningKind, MAX_CHT_DOCUMENT_WARNINGS, parse_cht_text};
+    let diagnostic = |code, line: Option<u32>| CatalogueDiagnostic {
+        code,
+        severity: ArtifactDiagnosticSeverity::Warning,
+        path: Some(EncodedPath {
+            display: match line {
+                Some(line) => format!("{}:{line}", EncodedPath::from_path(path).display),
+                None => EncodedPath::from_path(path).display,
+            },
+            lossy: EncodedPath::from_path(path).lossy,
+        }),
+    };
+    let document = match parse_cht_text(text) {
+        Ok(document) => document,
+        Err(_) => {
+            return (
+                Vec::new(),
+                false,
+                vec![diagnostic("catalogue_cht_malformed_line", None)],
+            );
         }
-        let Some((raw_key, raw_value)) = line.split_once('=') else {
-            complete = false;
-            diagnostics.push(malformed_line_diagnostic(path, line_number));
-            continue;
-        };
-        let key = raw_key.trim();
-        let value = unquote_cht_value(raw_value.trim());
-        if key == "cheats" {
-            match value.parse::<u32>() {
-                Ok(count) => declared_cheat_count = Some(count),
-                Err(_) => {
-                    complete = false;
-                    diagnostics.push(malformed_line_diagnostic(path, line_number));
+    };
+    let saw_malformed_line = document.warnings.iter().any(|warning| {
+        matches!(
+            warning.kind,
+            ChtDocumentWarningKind::MalformedLine
+                | ChtDocumentWarningKind::MalformedEntryIndex
+                | ChtDocumentWarningKind::EntryIndexOutOfRange
+                | ChtDocumentWarningKind::MalformedDeclaredCount
+                | ChtDocumentWarningKind::OversizedLine
+                | ChtDocumentWarningKind::InvalidFieldValue
+        )
+    });
+    let has_code = document.entries.iter().any(|entry| {
+        entry
+            .code
+            .as_deref()
+            .is_some_and(|code| !code.trim().is_empty())
+    });
+    let complete = (!document.entries.is_empty() || !saw_malformed_line)
+        && !(saw_malformed_line && !has_code && !document.entries.is_empty());
+    let mut diagnostics: Vec<_> = document
+        .warnings
+        .iter()
+        .map(|warning| {
+            let code = if warning.kind == ChtDocumentWarningKind::MalformedLine {
+                "catalogue_cht_malformed_line"
+            } else {
+                warning.kind.code()
+            };
+            diagnostic(code, warning.line)
+        })
+        .collect();
+    for entry in &document.entries {
+        for warning in &entry.warnings {
+            if diagnostics.len() >= MAX_CHT_DOCUMENT_WARNINGS {
+                if let Some(last) = diagnostics.last_mut() {
+                    *last = diagnostic("cht_limit_reached", None);
                 }
+                break;
             }
-            continue;
+            diagnostics.push(diagnostic(warning.kind.code(), warning.line));
         }
-        let Some(remainder) = key.strip_prefix("cheat") else {
-            continue;
-        };
-        let digit_count = remainder.bytes().take_while(u8::is_ascii_digit).count();
-        if digit_count == 0 || !remainder[digit_count..].starts_with('_') {
-            complete = false;
-            diagnostics.push(malformed_line_diagnostic(path, line_number));
-            continue;
-        }
-        let Ok(entry_index) = remainder[..digit_count].parse::<u32>() else {
-            complete = false;
-            diagnostics.push(malformed_line_diagnostic(path, line_number));
-            continue;
-        };
-        if entry_index as usize >= MAX_CHEATS_PER_GAME {
-            complete = false;
-            continue;
-        }
-        seen_indices.insert(entry_index);
-        let field = &remainder[digit_count + 1..];
-        if field == "desc" && !value.is_empty() {
-            descriptions
-                .entry(entry_index)
-                .or_insert_with(|| value.to_string());
-        }
-        if field == "enable" && value.eq_ignore_ascii_case("true") {
-            enabled.insert(entry_index);
-        }
-        // `cheatN_code`, `cheatN_code_type`, `cheatN_memory_search_size`,
-        // and any other field are intentionally not matched above - their
-        // values are read into `value` for the length of this loop
-        // iteration only and then dropped.
     }
-
-    if declared_cheat_count.is_some_and(|count| count as usize != seen_indices.len()) {
-        complete = false;
-    }
-
-    let cheats = seen_indices
+    let cheats = document
+        .entries
         .into_iter()
-        .map(|index| CheatDefinition {
-            description: descriptions.remove(&index),
-            enabled_by_default: enabled.contains(&index),
-            declared_index: Some(index),
+        .map(|entry| CheatDefinition {
+            source_evidence: {
+                let mut evidence = super::cheat_provenance::CheatRecordProvenance::original(
+                    entry.original_description.clone(),
+                    entry.original_code.clone(),
+                );
+                evidence.record_index = Some(entry.index);
+                vec![evidence]
+            },
+            description: entry.description,
+            enabled_by_default: entry.enabled_by_default,
+            declared_index: Some(entry.index),
         })
         .collect();
     (cheats, complete, diagnostics)
-}
-
-fn malformed_line_diagnostic(path: &Path, line: u32) -> CatalogueDiagnostic {
-    CatalogueDiagnostic {
-        code: "catalogue_cht_malformed_line",
-        severity: ArtifactDiagnosticSeverity::Warning,
-        path: Some(EncodedPath {
-            display: format!("{}:{line}", EncodedPath::from_path(path).display),
-            lossy: false,
-        }),
-    }
-}
-
-fn unquote_cht_value(value: &str) -> &str {
-    value
-        .strip_prefix('"')
-        .and_then(|value| value.strip_suffix('"'))
-        .unwrap_or(value)
 }
 
 // ---------------------------------------------------------------------
@@ -755,13 +795,22 @@ fn unquote_cht_value(value: &str) -> &str {
 
 pub struct JsonManifestSource {
     source_name: String,
+    source_kind: super::cheat_provenance::CheatSourceKind,
 }
 
 impl JsonManifestSource {
     pub fn new(source_name: &str) -> Self {
         Self {
             source_name: source_name.to_string(),
+            source_kind: super::cheat_provenance::CheatSourceKind::ImportedDatabase,
         }
+    }
+}
+
+impl JsonManifestSource {
+    pub fn with_source_kind(mut self, kind: super::cheat_provenance::CheatSourceKind) -> Self {
+        self.source_kind = kind;
+        self
     }
 }
 
@@ -847,7 +896,10 @@ impl CheatCatalogueSource for JsonManifestSource {
                 break;
             }
             match build_manifest_record(entry, root, &hash, index) {
-                Ok(record) => games.push(record),
+                Ok(mut record) => {
+                    attribute_catalogue_record(&mut record, &source_name, self.source_kind);
+                    games.push(record);
+                }
                 Err(diagnostic) => {
                     complete = false;
                     diagnostics.push(diagnostic);
@@ -911,6 +963,8 @@ struct ManifestGame {
 #[derive(Debug, Deserialize)]
 struct ManifestCheat {
     #[serde(default)]
+    code: Option<String>,
+    #[serde(default)]
     description: Option<String>,
     #[serde(default)]
     enabled_by_default: bool,
@@ -958,7 +1012,18 @@ fn build_manifest_record(
         if let Some(description) = &cheat.description {
             validate_manifest_string("cheat description", description, root, index)?;
         }
+        if let Some(code) = &cheat.code {
+            validate_manifest_string("cheat code", code, root, index)?;
+        }
         cheats.push(CheatDefinition {
+            source_evidence: vec![super::cheat_provenance::CheatRecordProvenance {
+                record_key: Some(format!("games/{index}/cheats/{cheat_index}")),
+                record_index: u32::try_from(cheat_index).ok(),
+                ..super::cheat_provenance::CheatRecordProvenance::original(
+                    cheat.description.clone(),
+                    cheat.code,
+                )
+            }],
             description: cheat.description.filter(|value| !value.trim().is_empty()),
             enabled_by_default: cheat.enabled_by_default,
             declared_index: u32::try_from(cheat_index).ok(),
@@ -2212,3 +2277,74 @@ fn demote_duplicate_staging_destinations(entries: &mut [CheatAvailabilityEntry])
 
 #[cfg(test)]
 mod tests;
+
+/// Attribute successfully parsed records only. Source declarations are weak
+/// applicability evidence until an existing game matcher establishes a match.
+fn attribute_catalogue_record(
+    record: &mut CheatGameRecord,
+    provider_name: &str,
+    source_kind: super::cheat_provenance::CheatSourceKind,
+) {
+    use super::cheat_provenance::*;
+    use crate::platform_evidence_fusion::evidence_lineage::{
+        ClaimStrength, SourceArtifactIdentity, SourceFamily,
+    };
+    let path = std::path::PathBuf::from(&record.source_file_path.display);
+    for cheat in &mut record.cheats {
+        for evidence in &mut cheat.source_evidence {
+            evidence.source_kind = source_kind;
+            evidence.source_quality = match source_kind {
+                CheatSourceKind::LocalFile => CheatSourceQuality::LocalKnown,
+                CheatSourceKind::Unknown => CheatSourceQuality::Unknown,
+                _ => CheatSourceQuality::ImportedUnverified,
+            };
+            evidence.source_path = Some(path.clone());
+            evidence.provider_name = Some(provider_name.into());
+            evidence.source_format = Some(
+                match record.format {
+                    CheatCatalogueFormat::RetroarchChtDirectory => "retroarch_cht",
+                    CheatCatalogueFormat::JsonManifest => "json_manifest",
+                }
+                .into(),
+            );
+            evidence.artifact = Some(SourceArtifactIdentity {
+                source_family: SourceFamily::Unknown,
+                upstream_version: None,
+                artifact_sha256: record.source_file_hash.clone(),
+                artifact_name: path.file_name().and_then(|s| s.to_str()).map(str::to_owned),
+            });
+            evidence.applicability.push(CheatApplicabilityEvidence {
+                kind: match record.format {
+                    CheatCatalogueFormat::RetroarchChtDirectory => {
+                        CheatApplicabilityKind::FilenameAssociation
+                    }
+                    CheatCatalogueFormat::JsonManifest => {
+                        CheatApplicabilityKind::SourcePackAssociation
+                    }
+                },
+                value: record.source_game_name.clone(),
+                strength: ClaimStrength::Weak,
+            });
+            for (kind, value) in [
+                (CheatApplicabilityKind::Region, &record.source_region),
+                (CheatApplicabilityKind::Revision, &record.source_revision),
+                (
+                    CheatApplicabilityKind::SerialMatch,
+                    &record.source_identifier,
+                ),
+                (
+                    CheatApplicabilityKind::ContentHashMatch,
+                    &record.source_content_hash,
+                ),
+            ] {
+                if let Some(value) = value {
+                    evidence.applicability.push(CheatApplicabilityEvidence {
+                        kind,
+                        value: value.clone(),
+                        strength: ClaimStrength::Weak,
+                    });
+                }
+            }
+        }
+    }
+}

@@ -44,11 +44,13 @@ use std::path::{Component, Path, PathBuf};
 
 use serde::Serialize;
 
-use super::{DatHealthState, DatSourceEntry, DatSourceHealth, DatSourceKind, now_unix};
+use super::{
+    ArcadeCatalogueRevision, DatHealthState, DatSourceEntry, DatSourceHealth, DatSourceKind,
+    now_unix,
+};
 use crate::dat::limits::DatLimits;
 use crate::dat::model::{DatEcosystem, DatFormat};
 use crate::dat::parser::DiagnosticSeverity;
-use crate::dat::parsers::parse_dat_file;
 
 /// How many DAT files one folder source will take.
 ///
@@ -453,9 +455,9 @@ pub struct DatValidationReport {
 impl DatValidationReport {
     /// The health record this run produced, ready to store on the entry.
     pub fn to_health(&self, path: &Path, kind: DatSourceKind) -> DatSourceHealth {
-        let (size, modified) = match kind {
+        let (size, modified, modified_nanos) = match kind {
             DatSourceKind::File => observe_file(path),
-            DatSourceKind::Folder => (None, None),
+            DatSourceKind::Folder => (None, None, None),
         };
         DatSourceHealth {
             state: Some(self.state),
@@ -470,20 +472,61 @@ impl DatValidationReport {
             formats: (!self.formats.is_empty()).then(|| self.formats.clone()),
             observed_size_bytes: size,
             observed_modified_unix_seconds: modified,
+            observed_modified_subsec_nanos: modified_nanos,
+            arcade_catalogue_revisions: arcade_catalogue_revisions(&self.files),
         }
     }
 }
 
-fn observe_file(path: &Path) -> (Option<u64>, Option<i64>) {
+/// The `<version>` header of each arcade DAT catalogue this run parsed, one
+/// entry per distinct arcade ecosystem. This never reparses anything: it
+/// reads the ecosystem and `<version>` the run already recorded on each
+/// [`DatFileReport`]. When a folder holds two files of the same arcade
+/// ecosystem, the one that actually declares a `<version>` is kept.
+pub(crate) fn arcade_catalogue_revisions(files: &[DatFileReport]) -> Vec<ArcadeCatalogueRevision> {
+    let mut revisions: Vec<ArcadeCatalogueRevision> = Vec::new();
+    for file in files {
+        let DatFileOutcome::Parsed {
+            ecosystem, version, ..
+        } = &file.outcome
+        else {
+            continue;
+        };
+        if !ArcadeCatalogueRevision::is_arcade_ecosystem(*ecosystem) {
+            continue;
+        }
+        let version = version
+            .as_deref()
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .map(str::to_string);
+        match revisions.iter_mut().find(|r| r.ecosystem == *ecosystem) {
+            Some(existing) if existing.version.is_none() && version.is_some() => {
+                existing.version = version;
+            }
+            Some(_) => {}
+            None => revisions.push(ArcadeCatalogueRevision {
+                ecosystem: *ecosystem,
+                version,
+            }),
+        }
+    }
+    revisions
+}
+
+fn observe_file(path: &Path) -> (Option<u64>, Option<i64>, Option<u32>) {
     let Ok(metadata) = std::fs::metadata(path) else {
-        return (None, None);
+        return (None, None, None);
     };
-    let modified = metadata
+    let elapsed = metadata
         .modified()
         .ok()
-        .and_then(|time| time.duration_since(std::time::UNIX_EPOCH).ok())
-        .map(|elapsed| elapsed.as_secs() as i64);
-    (Some(metadata.len()), modified)
+        .and_then(|time| time.duration_since(std::time::UNIX_EPOCH).ok());
+    (
+        Some(metadata.len()),
+        elapsed.map(|elapsed| elapsed.as_secs() as i64),
+        elapsed.map(|elapsed| elapsed.subsec_nanos()),
+    )
 }
 
 /// Validates one registered source, reading it and nothing else.
@@ -493,7 +536,21 @@ fn observe_file(path: &Path) -> (Option<u64>, Option<i64>) {
 /// being attempted. Parsing itself is bounded by `limits`; every ceiling in
 /// [`DatLimits`] applies, including the file-size one, so a hostile or
 /// accidental 4 GB file is refused rather than read.
-pub fn validate_dat_source(entry: &DatSourceEntry, limits: DatLimits) -> DatValidationReport {
+/// Validates `entry`, and - as a pure by-product of the same parse this
+/// already performs, never a second one - projects its named expected
+/// inventory (see [`crate::dat::expected_inventory`]). The caller decides
+/// whether and when to persist the projection (only on
+/// `Valid`/`ValidWithWarnings` - see [`DatValidationReport::state`] and
+/// `crate::dat::expected_inventory`'s doc on why a failed/partial parse
+/// must not overwrite a previous good inventory).
+pub fn validate_dat_source(
+    entry: &DatSourceEntry,
+    limits: DatLimits,
+) -> (
+    DatValidationReport,
+    crate::dat::expected_inventory::ExpectedDatInventoryProjection,
+) {
+    let mut expected = crate::dat::expected_inventory::ExpectedDatInventoryProjection::default();
     let mut report = DatValidationReport {
         source_id: entry.id.clone(),
         path: entry.path.to_string_lossy().into_owned(),
@@ -514,7 +571,7 @@ pub fn validate_dat_source(entry: &DatSourceEntry, limits: DatLimits) -> DatVali
     if let Err(refusal) = validate_dat_path(&entry.path, entry.kind) {
         report.summary = refusal.detail();
         report.path_refusal = Some(refusal.code().to_string());
-        return report;
+        return (report, expected);
     }
 
     let files: Vec<PathBuf> = match entry.kind {
@@ -529,7 +586,7 @@ pub fn validate_dat_source(entry: &DatSourceEntry, limits: DatLimits) -> DatVali
             Err(refusal) => {
                 report.summary = refusal.detail();
                 report.path_refusal = Some(refusal.code().to_string());
-                return report;
+                return (report, expected);
             }
         },
     };
@@ -544,7 +601,7 @@ pub fn validate_dat_source(entry: &DatSourceEntry, limits: DatLimits) -> DatVali
             }
             DatSourceKind::File => "The file is empty.".to_string(),
         };
-        return report;
+        return (report, expected);
     }
 
     let mut formats: Vec<String> = Vec::new();
@@ -559,9 +616,17 @@ pub fn validate_dat_source(entry: &DatSourceEntry, limits: DatLimits) -> DatVali
             .map(|name| name.to_string_lossy().into_owned())
             .unwrap_or_else(|| path.to_string_lossy().into_owned());
 
-        let outcome = match parse_dat_file(path, limits) {
-            Ok(parsed) => {
-                let source = &parsed.dat.source;
+        let checkpoint = expected.checkpoint();
+        let parsed = super::super::parsers::visit_dat_file_bound_raw(path, limits, &mut |game| {
+            expected.extend_from(std::slice::from_ref(&game));
+            Ok(())
+        });
+        let outcome = match parsed {
+            Ok((parsed, digest)) => {
+                if entry.kind == DatSourceKind::File {
+                    expected.catalogue_sha256 = Some(digest);
+                }
+                let source = &parsed.source;
                 report.entry_count = report.entry_count.saturating_add(source.entry_count);
                 report.rom_count = report.rom_count.saturating_add(source.rom_count);
                 let label = source.format.label().to_string();
@@ -623,6 +688,7 @@ pub fn validate_dat_source(entry: &DatSourceEntry, limits: DatLimits) -> DatVali
                 }
             }
             Err(error) => {
+                expected.rollback_to(checkpoint);
                 failures += 1;
                 DatFileOutcome::Failed {
                     error: error.to_string(),
@@ -659,7 +725,7 @@ pub fn validate_dat_source(entry: &DatSourceEntry, limits: DatLimits) -> DatVali
     };
 
     report.summary = summarise(&report, files.len(), failures);
-    report
+    (report, expected)
 }
 
 fn header_identity(name: Option<&str>, version: Option<&str>) -> Option<String> {

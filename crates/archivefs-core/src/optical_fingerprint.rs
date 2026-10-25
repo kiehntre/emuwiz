@@ -1,0 +1,548 @@
+//! Representation-independent fingerprints for the deliberately narrow
+//! optical-disc slice used by future equivalence review.
+//!
+//! The only supported representations here are one-file CUE sheets whose one
+//! track is `MODE1/2048`, and standalone CHD files with exactly one
+//! `MODE1_RAW` or chdman-produced `MODE1` CD-ROM data track and zero pregap.
+//! The canonical byte stream is
+//! the ordered concatenation of cooked 2048-byte user-data sectors. Container
+//! hashes and CHD header SHA-1 values are intentionally not used.
+
+use std::path::{Path, PathBuf};
+
+use sha2::{Digest, Sha256};
+
+use crate::chd_identity::{ChdMetadataFact, ChdMetadataOutcome, observe_chd_identity_file};
+use crate::chd_logical_media::open_chd_track_logical_media_file;
+use crate::ingestion::cue_bin::{
+    CueDataTrackMode, CueError, CueLayout, CueTrackMode, data_track_from_layout, resolve_cue_layout,
+};
+use crate::logical_media::LogicalMedia;
+use crate::raw_cd_logical_media::{
+    open_cooked_cd_file_logical_media_range, open_raw_cd_file_logical_media_range,
+};
+
+pub const OPTICAL_FINGERPRINT_SCHEMA: &str = "emuwiz.optical-fingerprint.v1";
+pub const LOGICAL_SECTOR_SIZE: u32 = 2048;
+const HASH_CHUNK_BYTES: usize = 128 * 1024;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum OpticalRepresentation {
+    CueBin,
+    Chd,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum OpticalTrackMode {
+    Mode1_2048,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct OpticalDiscStructure {
+    pub track_count: u32,
+    pub logical_sector_size: u32,
+    pub logical_sector_count: u64,
+    pub track_mode: OpticalTrackMode,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CanonicalOpticalFingerprint {
+    pub schema: &'static str,
+    pub structure: OpticalDiscStructure,
+    pub canonical_sha256: String,
+    pub representation: OpticalRepresentation,
+    pub source: PathBuf,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum OpticalFingerprintError {
+    Cue(CueError),
+    UnsupportedCueLayout(String),
+    Io(String),
+    InvalidLogicalSize,
+    Chd(String),
+    MalformedChdMetadata,
+    UnsupportedChdLayout(String),
+    LogicalRead(String),
+}
+
+impl std::fmt::Display for OpticalFingerprintError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Cue(error) => write!(f, "{error}"),
+            Self::UnsupportedCueLayout(reason) => write!(f, "unsupported CUE layout: {reason}"),
+            Self::Io(error) => write!(f, "optical image I/O error: {error}"),
+            Self::InvalidLogicalSize => {
+                f.write_str("logical image is not a non-empty 2048-byte-sector stream")
+            }
+            Self::Chd(error) => write!(f, "CHD error: {error}"),
+            Self::MalformedChdMetadata => f.write_str("CHD metadata is malformed"),
+            Self::UnsupportedChdLayout(reason) => write!(f, "unsupported CHD layout: {reason}"),
+            Self::LogicalRead(error) => write!(f, "logical sector read failed: {error}"),
+        }
+    }
+}
+
+impl std::error::Error for OpticalFingerprintError {}
+
+fn hex(bytes: impl AsRef<[u8]>) -> String {
+    bytes
+        .as_ref()
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect()
+}
+
+fn hash_logical_media<M: LogicalMedia>(
+    media: &M,
+) -> Result<(String, u64), OpticalFingerprintError> {
+    if media.len() == 0 || !media.len().is_multiple_of(LOGICAL_SECTOR_SIZE as u64) {
+        return Err(OpticalFingerprintError::InvalidLogicalSize);
+    }
+    let mut hasher = Sha256::new();
+    let mut offset = 0u64;
+    let mut buffer = vec![0u8; HASH_CHUNK_BYTES];
+    while offset < media.len() {
+        let count = (media.len() - offset).min(buffer.len() as u64) as usize;
+        media
+            .read_at(offset, &mut buffer[..count])
+            .map_err(|error| OpticalFingerprintError::LogicalRead(error.to_string()))?;
+        hasher.update(&buffer[..count]);
+        offset = offset
+            .checked_add(count as u64)
+            .ok_or(OpticalFingerprintError::InvalidLogicalSize)?;
+    }
+    Ok((
+        hex(hasher.finalize()),
+        media.len() / LOGICAL_SECTOR_SIZE as u64,
+    ))
+}
+
+/// Like [`fingerprint_cue_bin`], but refuses any layout whose declared facts
+/// the program-area hash does not cover. Use this wherever a match is treated
+/// as proof that two representations are the same disc (duplicate quarantine,
+/// CUE/BIN versus CHD verification); plain `fingerprint_cue_bin` remains the
+/// program-data identity.
+pub fn fingerprint_cue_bin_exact(
+    path: &Path,
+) -> Result<CanonicalOpticalFingerprint, OpticalFingerprintError> {
+    let layout = resolve_cue_layout(path).map_err(OpticalFingerprintError::Cue)?;
+    if let Some(reason) = unrepresented_layout_fact(&layout) {
+        return Err(OpticalFingerprintError::UnsupportedCueLayout(reason));
+    }
+    fingerprint_cue_layout(&layout)
+}
+
+pub fn fingerprint_cue_bin(
+    path: &Path,
+) -> Result<CanonicalOpticalFingerprint, OpticalFingerprintError> {
+    let layout = resolve_cue_layout(path).map_err(OpticalFingerprintError::Cue)?;
+    fingerprint_cue_layout(&layout)
+}
+
+/// The program-area fingerprint hashes only the data track's INDEX 01 range. Any
+/// declared layout fact outside that range (stored INDEX 00 sectors, synthetic
+/// PREGAP/POSTGAP, extra indexes, audio content) is not covered by the hash,
+/// so a match would not prove the two representations hold the same disc.
+/// Returns the first such fact; callers must refuse rather than guess.
+pub(crate) fn unrepresented_layout_fact(layout: &CueLayout) -> Option<String> {
+    for track in &layout.tracks {
+        let number = track.number;
+        if matches!(track.mode, CueTrackMode::Audio) {
+            return Some(format!(
+                "track {number} is audio; audio content is not part of the data-track fingerprint"
+            ));
+        }
+        if let Some(index_00) = track.index_00 {
+            return Some(format!(
+                "track {number} has INDEX 00 at frame {}: pregap sectors stored in the image are outside the program-area fingerprint",
+                index_00.frames
+            ));
+        }
+        if let Some(pregap) = track.pregap {
+            return Some(format!(
+                "track {number} declares a synthetic PREGAP of {} frames that is not stored in the image and cannot be proven present in the other representation",
+                pregap.frames
+            ));
+        }
+        if track.postgap.is_some() {
+            return Some(format!("track {number} declares a POSTGAP"));
+        }
+        if !track.extra_indexes.is_empty() {
+            return Some(format!("track {number} has INDEX 02+ markers"));
+        }
+        if track.index_01.is_some_and(|index| index.frames != 0) {
+            return Some(format!(
+                "track {number} INDEX 01 is not at the start of its file and no INDEX 00 accounts for the leading sectors"
+            ));
+        }
+    }
+    None
+}
+
+/// Hash the program range from the same layout snapshot admitted by a caller.
+pub(crate) fn fingerprint_cue_layout(
+    layout: &CueLayout,
+) -> Result<CanonicalOpticalFingerprint, OpticalFingerprintError> {
+    let track = data_track_from_layout(layout).map_err(|error| match error {
+        CueError::AmbiguousDataTracks => {
+            OpticalFingerprintError::UnsupportedCueLayout("multiple data tracks".into())
+        }
+        other => OpticalFingerprintError::Cue(other),
+    })?;
+    let (canonical_sha256, sectors) = match track.mode {
+        CueDataTrackMode::Mode1_2048 => {
+            let media = open_cooked_cd_file_logical_media_range(
+                &track.path,
+                track.index_01_frame,
+                track.data_frame_count,
+            )
+            .map_err(|error| OpticalFingerprintError::Io(error.to_string()))?;
+            hash_logical_media(&media)?
+        }
+        CueDataTrackMode::Mode1_2352 => {
+            let media = open_raw_cd_file_logical_media_range(
+                &track.path,
+                track.index_01_frame,
+                track.data_frame_count,
+            )
+            .map_err(|error| OpticalFingerprintError::Io(error.to_string()))?;
+            hash_logical_media(&media)?
+        }
+        CueDataTrackMode::Mode2_2352 => {
+            return Err(OpticalFingerprintError::UnsupportedCueLayout(
+                "MODE2/2352 logical form is not yet proven for identity".into(),
+            ));
+        }
+    };
+    Ok(CanonicalOpticalFingerprint {
+        schema: OPTICAL_FINGERPRINT_SCHEMA,
+        structure: OpticalDiscStructure {
+            track_count: track.disc_track_count,
+            logical_sector_size: LOGICAL_SECTOR_SIZE,
+            logical_sector_count: sectors,
+            track_mode: OpticalTrackMode::Mode1_2048,
+        },
+        canonical_sha256,
+        representation: OpticalRepresentation::CueBin,
+        source: layout.cue_path.clone(),
+    })
+}
+
+pub fn fingerprint_chd(
+    path: &Path,
+) -> Result<CanonicalOpticalFingerprint, OpticalFingerprintError> {
+    let identity = observe_chd_identity_file(path)
+        .map_err(|error| OpticalFingerprintError::Chd(error.to_string()))?;
+    let ChdMetadataOutcome::Observed(metadata) = identity.metadata else {
+        return Err(OpticalFingerprintError::MalformedChdMetadata);
+    };
+    let tracks: Vec<_> = metadata
+        .entries
+        .iter()
+        .filter_map(|entry| match &entry.fact {
+            ChdMetadataFact::CdromTrack(track) => Some(track),
+            _ => None,
+        })
+        .collect();
+    if tracks.len() != 1 {
+        return Err(OpticalFingerprintError::UnsupportedChdLayout(
+            "exactly one CD-ROM track is required".into(),
+        ));
+    }
+    let track = tracks[0];
+    if track.track != 1
+        || !matches!(track.track_type.as_str(), "MODE1_RAW" | "MODE1")
+        || track.pregap != Some(0)
+    {
+        return Err(OpticalFingerprintError::UnsupportedChdLayout(
+            "requires track 1 MODE1 or MODE1_RAW with zero pregap".into(),
+        ));
+    }
+    let media = open_chd_track_logical_media_file(path)
+        .map_err(|error| OpticalFingerprintError::Chd(error.to_string()))?;
+    let (canonical_sha256, sectors) = hash_logical_media(&media)?;
+    if sectors != u64::from(track.frames) {
+        return Err(OpticalFingerprintError::UnsupportedChdLayout(
+            "declared frame count does not match logical length".into(),
+        ));
+    }
+    Ok(CanonicalOpticalFingerprint {
+        schema: OPTICAL_FINGERPRINT_SCHEMA,
+        structure: OpticalDiscStructure {
+            track_count: 1,
+            logical_sector_size: LOGICAL_SECTOR_SIZE,
+            logical_sector_count: sectors,
+            track_mode: OpticalTrackMode::Mode1_2048,
+        },
+        canonical_sha256,
+        representation: OpticalRepresentation::Chd,
+        source: path.to_path_buf(),
+    })
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum OpticalFingerprintComparison {
+    Equivalent,
+    Different,
+}
+
+pub fn compare_optical_fingerprints(
+    left: &CanonicalOpticalFingerprint,
+    right: &CanonicalOpticalFingerprint,
+) -> OpticalFingerprintComparison {
+    if left.structure == right.structure && left.canonical_sha256 == right.canonical_sha256 {
+        OpticalFingerprintComparison::Equivalent
+    } else {
+        OpticalFingerprintComparison::Different
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::chd_logical_media::{MODE1_USER_DATA_OFFSET, RAW_SECTOR_BYTES};
+
+    fn sector(value: u8) -> Vec<u8> {
+        let mut bytes = vec![0u8; RAW_SECTOR_BYTES];
+        bytes[..12].copy_from_slice(&crate::raw_cd_sector::SYNC_PATTERN);
+        bytes[15] = 1;
+        for byte in &mut bytes[MODE1_USER_DATA_OFFSET..MODE1_USER_DATA_OFFSET + 2048] {
+            *byte = value;
+        }
+        bytes
+    }
+
+    fn put_u32(bytes: &mut [u8], offset: usize, value: u32) {
+        bytes[offset..offset + 4].copy_from_slice(&value.to_be_bytes());
+    }
+
+    fn put_u64(bytes: &mut [u8], offset: usize, value: u64) {
+        bytes[offset..offset + 8].copy_from_slice(&value.to_be_bytes());
+    }
+
+    fn chd_for(sectors: &[Vec<u8>], pregap: u32) -> Vec<u8> {
+        let unit = RAW_SECTOR_BYTES as u32;
+        let hunk = unit * sectors.len() as u32;
+        let payload = format!(
+            "TRACK:1 TYPE:MODE1_RAW SUBTYPE:NONE FRAMES:{} PREGAP:{pregap} PGTYPE:NONE PGSUB:NONE POSTGAP:0",
+            sectors.len()
+        );
+        let meta_offset = 124u64;
+        let map_offset = meta_offset + 16 + payload.len() as u64;
+        let data_offset = (map_offset + 4).div_ceil(hunk as u64) * hunk as u64;
+        let mut chd = vec![0u8; data_offset as usize];
+        chd[..8].copy_from_slice(b"MComprHD");
+        put_u32(&mut chd, 8, 124);
+        put_u32(&mut chd, 12, 5);
+        put_u64(&mut chd, 32, hunk as u64);
+        put_u64(&mut chd, 40, map_offset);
+        put_u64(&mut chd, 48, meta_offset);
+        put_u32(&mut chd, 56, hunk);
+        put_u32(&mut chd, 60, unit);
+        let p = meta_offset as usize;
+        chd[p..p + 4].copy_from_slice(b"CHT2");
+        chd[p + 5..p + 8].copy_from_slice(&(payload.len() as u32).to_be_bytes()[1..]);
+        chd[p + 16..p + 16 + payload.len()].copy_from_slice(payload.as_bytes());
+        chd[map_offset as usize..map_offset as usize + 4]
+            .copy_from_slice(&(data_offset / hunk as u64).to_be_bytes()[4..]);
+        for sector in sectors {
+            chd.extend_from_slice(sector);
+        }
+        chd
+    }
+
+    fn cooked_mode1_chd_for(values: &[u8]) -> Vec<u8> {
+        let unit = 2448u32;
+        let frames = values.len() as u32;
+        let units_per_hunk = 8u32;
+        let hunk = unit * units_per_hunk;
+        let payload = format!(
+            "TRACK:1 TYPE:MODE1 SUBTYPE:NONE FRAMES:{frames} PREGAP:0 PGTYPE:MOD PGSUB:NONE POSTGAP:0"
+        );
+        let meta_offset = 124u64;
+        let map_offset = meta_offset + 16 + payload.len() as u64;
+        let data_offset = (map_offset + 4).div_ceil(hunk as u64) * hunk as u64;
+        let mut chd = vec![0u8; data_offset as usize + hunk as usize];
+        chd[..8].copy_from_slice(b"MComprHD");
+        put_u32(&mut chd, 8, 124);
+        put_u32(&mut chd, 12, 5);
+        put_u64(&mut chd, 32, hunk as u64);
+        put_u64(&mut chd, 40, map_offset);
+        put_u64(&mut chd, 48, meta_offset);
+        put_u32(&mut chd, 56, hunk);
+        put_u32(&mut chd, 60, unit);
+        let metadata = meta_offset as usize;
+        chd[metadata..metadata + 4].copy_from_slice(b"CHT2");
+        chd[metadata + 5..metadata + 8].copy_from_slice(&(payload.len() as u32).to_be_bytes()[1..]);
+        chd[metadata + 16..metadata + 16 + payload.len()].copy_from_slice(payload.as_bytes());
+        chd[map_offset as usize..map_offset as usize + 4]
+            .copy_from_slice(&((data_offset / hunk as u64) as u32).to_be_bytes());
+        for (index, value) in values.iter().enumerate() {
+            let start = data_offset as usize + index * unit as usize;
+            chd[start..start + LOGICAL_SECTOR_SIZE as usize].fill(*value);
+        }
+        chd
+    }
+
+    fn cue_fixture(values: &[u8]) -> (tempfile::TempDir, PathBuf) {
+        let dir = tempfile::tempdir().unwrap();
+        let cue = dir.path().join("disc with ü.cue");
+        let bin = dir.path().join("track with ü.bin");
+        let payload = values
+            .iter()
+            .flat_map(|value| vec![*value; 2048])
+            .collect::<Vec<_>>();
+        std::fs::write(&bin, payload).unwrap();
+        std::fs::write(
+            &cue,
+            "FILE \"track with ü.bin\" BINARY\nTRACK 01 MODE1/2048\nINDEX 01 00:00:00\n",
+        )
+        .unwrap();
+        (dir, cue)
+    }
+
+    #[test]
+    fn fn_cue_and_chd_share_the_same_canonical_cooked_sector_fingerprint() {
+        let (dir, cue) = cue_fixture(&[0x11, 0x22]);
+        let chd = dir.path().join("disc.chd");
+        std::fs::write(&chd, chd_for(&[sector(0x11), sector(0x22)], 0)).unwrap();
+        let left = fingerprint_cue_bin(&cue).unwrap();
+        let right = fingerprint_chd(&chd).unwrap();
+        assert_eq!(left.canonical_sha256, right.canonical_sha256);
+        assert_eq!(left.structure, right.structure);
+        assert_eq!(
+            compare_optical_fingerprints(&left, &right),
+            OpticalFingerprintComparison::Equivalent
+        );
+    }
+
+    #[test]
+    fn chdman_mode1_cooked_frames_use_the_first_2048_bytes() {
+        let (dir, cue) = cue_fixture(&[0x11, 0x22]);
+        let chd = dir.path().join("cooked-mode1.chd");
+        std::fs::write(&chd, cooked_mode1_chd_for(&[0x11, 0x22])).unwrap();
+        let cue_fingerprint = fingerprint_cue_bin(&cue).unwrap();
+        let chd_fingerprint = fingerprint_chd(&chd).unwrap();
+        assert_eq!(
+            cue_fingerprint.canonical_sha256,
+            chd_fingerprint.canonical_sha256
+        );
+        assert_eq!(
+            compare_optical_fingerprints(&cue_fingerprint, &chd_fingerprint),
+            OpticalFingerprintComparison::Equivalent
+        );
+    }
+
+    #[test]
+    fn changed_sector_changes_the_fingerprint() {
+        let (dir, cue) = cue_fixture(&[0x11, 0x22]);
+        let chd = dir.path().join("changed.chd");
+        std::fs::write(&chd, chd_for(&[sector(0x11), sector(0x23)], 0)).unwrap();
+        let left = fingerprint_cue_bin(&cue).unwrap();
+        let right = fingerprint_chd(&chd).unwrap();
+        assert_eq!(
+            compare_optical_fingerprints(&left, &right),
+            OpticalFingerprintComparison::Different
+        );
+    }
+
+    #[test]
+    fn cue_index_01_excludes_in_file_pregap_from_identity() {
+        let (dir, cue) = cue_fixture(&[0x11, 0x22]);
+        let expected = fingerprint_cue_bin(&cue).unwrap();
+        let prefixed_cue = dir.path().join("prefixed.cue");
+        let prefixed_bin = dir.path().join("prefixed.bin");
+        let mut bytes = vec![0xEE; 150 * 2048];
+        bytes.extend(std::fs::read(dir.path().join("track with ü.bin")).unwrap());
+        std::fs::write(&prefixed_bin, bytes).unwrap();
+        std::fs::write(
+            &prefixed_cue,
+            "FILE \"prefixed.bin\" BINARY\nTRACK 01 MODE1/2048\nINDEX 00 00:00:00\nINDEX 01 00:02:00\n",
+        )
+        .unwrap();
+        let actual = fingerprint_cue_bin(&prefixed_cue).unwrap();
+        assert_eq!(actual.canonical_sha256, expected.canonical_sha256);
+        assert_eq!(actual.structure.logical_sector_count, 2);
+    }
+
+    #[test]
+    fn mode1_2352_identity_starts_at_index_01() {
+        let dir = tempfile::tempdir().unwrap();
+        let cue = dir.path().join("raw.cue");
+        let bin = dir.path().join("raw.bin");
+        let mut bytes = Vec::new();
+        for value in [0xEE, 0x11, 0x22] {
+            bytes.extend_from_slice(&sector(value));
+        }
+        std::fs::write(&bin, bytes).unwrap();
+        std::fs::write(
+            &cue,
+            "FILE \"raw.bin\" BINARY\nTRACK 01 MODE1/2352\nINDEX 00 00:00:00\nINDEX 01 00:00:01\n",
+        )
+        .unwrap();
+        let fingerprint = fingerprint_cue_bin(&cue).unwrap();
+        let mut expected = Sha256::new();
+        expected.update(vec![0x11; 2048]);
+        expected.update(vec![0x22; 2048]);
+        assert_eq!(fingerprint.canonical_sha256, hex(expected.finalize()));
+        assert_eq!(fingerprint.structure.logical_sector_count, 2);
+    }
+
+    #[test]
+    fn repeated_file_section_does_not_truncate_program_identity_or_prove_disc_equality() {
+        let dir = tempfile::tempdir().unwrap();
+        let cue = dir.path().join("disc.cue");
+        let bin = dir.path().join("disc.bin");
+        let bytes: Vec<_> = [0xEE, 0x11, 0x22, 0x33]
+            .into_iter()
+            .flat_map(sector)
+            .collect();
+        std::fs::write(&bin, &bytes).unwrap();
+        std::fs::write(&cue, "FILE \"disc.bin\" BINARY\nTRACK 01 MODE1/2352\nINDEX 00 00:00:00\nINDEX 01 00:00:01\nFILE \"disc.bin\" BINARY\nTRACK 02 AUDIO\nINDEX 00 00:00:02\nINDEX 01 00:00:03\n").unwrap();
+        let fingerprint = fingerprint_cue_bin(&cue).unwrap();
+        let mut expected = Sha256::new();
+        for value in [0x11, 0x22, 0x33] {
+            expected.update(vec![value; 2048]);
+        }
+        assert_eq!(fingerprint.structure.logical_sector_count, 3);
+        assert_eq!(fingerprint.canonical_sha256, hex(expected.finalize()));
+        assert!(matches!(
+            fingerprint_cue_bin_exact(&cue),
+            Err(OpticalFingerprintError::UnsupportedCueLayout(_))
+        ));
+        assert!(
+            crate::optical_preservation::source_layout(
+                &cue,
+                crate::repair::optical_conversion::ChdConversionSourceMode::KeepSource,
+            )
+            .is_err()
+        );
+        assert_eq!(std::fs::read(&bin).unwrap(), bytes);
+    }
+
+    #[test]
+    fn unsupported_cue_and_chd_layouts_fail_closed() {
+        let (dir, cue) = cue_fixture(&[0x11]);
+        std::fs::write(
+            &cue,
+            "FILE \"track with ü.bin\" BINARY\nTRACK 01 MODE1/2352\nINDEX 01 00:00:00\n",
+        )
+        .unwrap();
+        assert!(fingerprint_cue_bin(&cue).is_err());
+        let chd = dir.path().join("pregap.chd");
+        std::fs::write(&chd, chd_for(&[sector(0x11)], 1)).unwrap();
+        assert!(fingerprint_chd(&chd).is_err());
+    }
+
+    #[test]
+    fn truncated_bin_is_refused() {
+        let (dir, cue) = cue_fixture(&[0x11]);
+        std::fs::write(dir.path().join("track with ü.bin"), [1u8; 2047]).unwrap();
+        assert!(matches!(
+            fingerprint_cue_bin(&cue),
+            Err(OpticalFingerprintError::Io(_))
+                | Err(OpticalFingerprintError::Cue(CueError::Malformed(_)))
+        ));
+    }
+}

@@ -1,0 +1,471 @@
+//! Single source of truth for "what kind of game content does this
+//! extension represent", independent of how it is stored.
+//!
+//! This is deliberately a second registry alongside
+//! [`crate::media_registry`], not a replacement for it. `media_registry`
+//! answers "is this recognised as an [`crate::ArchiveKind`]" for the
+//! existing archive-centric scanner; this one answers a broader, coarser
+//! question for the [`super`] discovery pipeline - "what *category* of
+//! content is this" (a cartridge ROM, a disc image, an Amiga image, a
+//! computer floppy image) - without ever assigning a specific platform.
+//! Platform assignment stays entirely [`crate::platform`]'s job, reused
+//! unmodified via [`crate::ArchiveIdentity::from_path`].
+//!
+//! Like `media_registry`, a new extension is a one-line table addition;
+//! [`super::tests::registry_extensions_are_all_individually_classified`]
+//! keeps this table and [`ContentKind::label`] from drifting apart.
+
+/// The coarse category of game content a file or container represents.
+/// Never a platform - see the module docs.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ContentKind {
+    /// A loose cartridge/ROM dump (Nintendo, Sega, and similar systems).
+    RomCartridge,
+    /// A disc-based game image (CD/DVD/GD-ROM), including CUE/BIN pairs.
+    DiscImage,
+    /// An Amiga disk or hard-drive image (ADF/HDF/HDFX/RDB) or an LhA
+    /// archive of one.
+    AmigaImage,
+    /// A non-Amiga computer floppy/disk image already supported elsewhere
+    /// in EmuWiz (Atari ST, Amstrad, and similar).
+    ComputerDisk,
+    /// A cassette/tape image. This deliberately says nothing about the
+    /// platform: `.tap` and `.tzx` are shared by several 8-bit families and
+    /// `.cdt` needs separate platform evidence too.
+    TapeImage,
+    /// A machine-state snapshot (`.z80`, `.sna`, `.szx`, ...): a frozen
+    /// memory + register dump rather than a ROM, disc or tape. Category
+    /// only - the Sinclair family it belongs to comes from parsing the
+    /// bytes, not from this table.
+    MachineSnapshot,
+    /// An archive format recognised as game content, but not a disk image.
+    Archive,
+    /// A directly stored console game executable. The executable's own
+    /// format parser still decides whether identity is valid.
+    Executable,
+    /// A folder that is itself a WHDLoad installation (contains a
+    /// `.slave` file), not a folder to recurse into.
+    WhdloadInstall,
+    /// A folder containing recognisable game content directly (an
+    /// "extracted game folder" / emulator-ready folder), not a folder to
+    /// recurse into.
+    ExtractedGameFolder,
+    /// A recorded play session (an RZX input recording): preservation-only
+    /// media, kept and described but never itself a playable game.
+    GameplayRecording,
+}
+
+impl ContentKind {
+    /// What a person sees for this content category. Never archive
+    /// terminology - "what the game is", not "how it's stored".
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::RomCartridge => "ROM cartridge",
+            Self::DiscImage => "Disc image",
+            Self::AmigaImage => "Amiga image",
+            Self::ComputerDisk => "Computer disk image",
+            Self::TapeImage => "Cassette/tape image",
+            Self::MachineSnapshot => "Machine snapshot",
+            Self::Archive => "Archive",
+            Self::Executable => "Game executable",
+            Self::WhdloadInstall => "WHDLoad install",
+            Self::ExtractedGameFolder => "Game folder",
+            Self::GameplayRecording => "Gameplay recording",
+        }
+    }
+}
+
+/// One extension EmuWiz recognises as belonging to a [`ContentKind`] on
+/// its own (no folder/header corroboration needed to know the *category*;
+/// corroboration is still needed downstream to know the *platform*).
+#[derive(Debug, Clone, Copy)]
+struct ContentFormat {
+    extension: &'static str,
+    kind: ContentKind,
+}
+
+/// Loose-file content formats. `cue`/`bin` are handled separately by
+/// [`super::cue_bin`] - a `.cue` is the anchor for a disc candidate and a
+/// lone `.bin` is paired or explicitly flagged, never guessed from this
+/// table alone, so neither extension appears here.
+const CONTENT_FORMATS: &[ContentFormat] = &[
+    // --- Nintendo ---
+    cf("nes", ContentKind::RomCartridge),
+    cf("unf", ContentKind::RomCartridge),
+    cf("fds", ContentKind::ComputerDisk),
+    cf("smc", ContentKind::RomCartridge),
+    cf("sfc", ContentKind::RomCartridge),
+    cf("smd", ContentKind::RomCartridge),
+    cf("gb", ContentKind::RomCartridge),
+    cf("gbc", ContentKind::RomCartridge),
+    cf("gba", ContentKind::RomCartridge),
+    cf("ngp", ContentKind::RomCartridge),
+    cf("ngc", ContentKind::RomCartridge),
+    cf("nds", ContentKind::RomCartridge),
+    cf("z64", ContentKind::RomCartridge),
+    cf("n64", ContentKind::RomCartridge),
+    cf("v64", ContentKind::RomCartridge),
+    // Virtual Boy images are recognised as generic cartridge media only;
+    // exact identity remains DAT/hash-driven and has no header parser here.
+    cf("vb", ContentKind::RomCartridge),
+    cf("vboy", ContentKind::RomCartridge),
+    cf("min", ContentKind::RomCartridge),
+    // --- Sega ---
+    cf("sms", ContentKind::RomCartridge),
+    cf("gg", ContentKind::RomCartridge),
+    // --- MSX ---
+    cf("mx1", ContentKind::RomCartridge),
+    cf("mx2", ContentKind::RomCartridge),
+    cf("md", ContentKind::RomCartridge),
+    cf("gen", ContentKind::RomCartridge),
+    // WonderSwan cartridge images are distinct extensions. Shared `.bin`
+    // remains intentionally absent and is handled only by cue/bin pairing.
+    cf("ws", ContentKind::RomCartridge),
+    cf("wsc", ContentKind::RomCartridge),
+    // --- Disc-based ---
+    cf("iso", ContentKind::DiscImage),
+    cf("gcm", ContentKind::DiscImage),
+    cf("gcz", ContentKind::DiscImage),
+    cf("rvz", ContentKind::DiscImage),
+    cf("wbfs", ContentKind::DiscImage),
+    // Wii U disc containers: classified as disc media only; the bounded
+    // `wiiu_disc` inspector decides whether a file is actually a valid disc.
+    cf("wud", ContentKind::DiscImage),
+    cf("wux", ContentKind::DiscImage),
+    cf("ciso", ContentKind::DiscImage),
+    cf("chd", ContentKind::DiscImage),
+    // PSP/PS1 EBOOT.PBP is a bounded container; its platform and exact
+    // identity still require structural or catalogue evidence.
+    cf("pbp", ContentKind::DiscImage),
+    cf("gdi", ContentKind::DiscImage),
+    cf("cdi", ContentKind::DiscImage),
+    cf("xiso", ContentKind::DiscImage),
+    // Console executables are direct content, not archives or disc images.
+    cf("xbe", ContentKind::Executable),
+    cf("xex", ContentKind::Executable),
+    // --- Amiga ---
+    // `.hdf`/`.hdfx` are deliberately NOT registered here: they are a
+    // real-world extension collision (Sharp X68000 hard-disk images also
+    // use `.hdf` - confirmed against a real X68000 collection during
+    // validation, which mislabelled `.hdf` archive members as Amiga
+    // content). Files with these extensions are classified in
+    // `super::discovery::discover_direct_file`, which requires either a
+    // successful `amiga_disk::inspect_amiga_image` parse or independent
+    // platform evidence before committing to a content kind - see that
+    // function's docs.
+    cf("adf", ContentKind::AmigaImage),
+    cf("adz", ContentKind::AmigaImage),
+    cf("rdb", ContentKind::AmigaImage),
+    cf("lha", ContentKind::AmigaImage),
+    // `.lzh` is the same LHA archive format under its other common
+    // extension (`dat::archive::lha`'s own `LhaProvider` treats both
+    // interchangeably); registered for the same weak-fallback reasons as
+    // `.lha` above - real classification happens in
+    // `super::discovery::discover_whdload_archive`, never from this
+    // extension mapping alone.
+    cf("lzh", ContentKind::AmigaImage),
+    // --- Computer formats already supported elsewhere in EmuWiz ---
+    cf("dsk", ContentKind::ComputerDisk),
+    cf("sap", ContentKind::ComputerDisk),
+    cf("k7", ContentKind::TapeImage),
+    cf("m5", ContentKind::RomCartridge),
+    cf("m7", ContentKind::RomCartridge),
+    cf("d64", ContentKind::ComputerDisk),
+    cf("g64", ContentKind::ComputerDisk),
+    cf("d71", ContentKind::ComputerDisk),
+    cf("d81", ContentKind::ComputerDisk),
+    cf("crt", ContentKind::ComputerDisk),
+    cf("ssd", ContentKind::ComputerDisk),
+    cf("dsd", ContentKind::ComputerDisk),
+    cf("st", ContentKind::ComputerDisk),
+    cf("msa", ContentKind::ComputerDisk),
+    cf("ipf", ContentKind::ComputerDisk),
+    cf("hdi", ContentKind::ComputerDisk),
+    cf("nhd", ContentKind::ComputerDisk),
+    cf("ima", ContentKind::ComputerDisk),
+    cf("img", ContentKind::ComputerDisk),
+    cf("d88", ContentKind::ComputerDisk),
+    cf("xdf", ContentKind::ComputerDisk),
+    cf("dim", ContentKind::ComputerDisk),
+    // --- Atari ---
+    cf("a26", ContentKind::RomCartridge),
+    cf("a52", ContentKind::RomCartridge),
+    cf("a78", ContentKind::RomCartridge),
+    cf("atr", ContentKind::ComputerDisk),
+    cf("atx", ContentKind::ComputerDisk),
+    cf("xfd", ContentKind::ComputerDisk),
+    cf("lnx", ContentKind::RomCartridge),
+    cf("lyx", ContentKind::RomCartridge),
+    cf("j64", ContentKind::RomCartridge),
+    cf("jag", ContentKind::RomCartridge),
+    cf("stx", ContentKind::ComputerDisk),
+    // Apple II disk images.
+    cf("do", ContentKind::ComputerDisk),
+    cf("po", ContentKind::ComputerDisk),
+    cf("woz", ContentKind::ComputerDisk),
+    cf("2mg", ContentKind::ComputerDisk),
+    cf("nib", ContentKind::ComputerDisk),
+    // Macintosh disk images and archives.
+    cf("hfv", ContentKind::ComputerDisk),
+    cf("dc42", ContentKind::ComputerDisk),
+    cf("sit", ContentKind::Archive),
+    // ZX Spectrum TR-DOS media. The *category* is a computer disk/archive;
+    // the ZX Spectrum platform is confirmed only when
+    // `crate::disk_format::inspect_disk_format` validates the TR-DOS system
+    // descriptor (`.trd`) or the SINCLAIR archive layout (`.scl`) - see
+    // `super::discovery::discover_trdos_media`.
+    cf("trd", ContentKind::ComputerDisk),
+    cf("scl", ContentKind::ComputerDisk),
+    // These extensions identify a media family, not a system. Keep them out
+    // of platform extension evidence unless another source can prove it.
+    cf("cas", ContentKind::TapeImage),
+    cf("cdt", ContentKind::TapeImage),
+    cf("tap", ContentKind::TapeImage),
+    cf("tzx", ContentKind::TapeImage),
+    cf("t64", ContentKind::TapeImage),
+    // --- Sinclair-family machine snapshots ---
+    // The category is knowable from the extension; the machine family is not,
+    // and is confirmed by `crate::zx_spectrum_snapshot` parsing the bytes in
+    // `super::discovery::discover_direct_file`. `.szx` is included because it
+    // has a self-identifying `ZXST` header; `.trd`/`.scl` (TR-DOS disks) are
+    // deliberately still absent pending a filesystem-level parser.
+    cf("z80", ContentKind::MachineSnapshot),
+    cf("sna", ContentKind::MachineSnapshot),
+    cf("szx", ContentKind::MachineSnapshot),
+    // Spectrum-only formats confirmed by `crate::zx_spectrum_media`. An
+    // `.rzx` recording is catalogued as preservation-only media, not a game.
+    cf("pzx", ContentKind::TapeImage),
+    cf("rzx", ContentKind::GameplayRecording),
+    cf("nex", ContentKind::Executable),
+    cf("udi", ContentKind::ComputerDisk),
+    cf("mdr", ContentKind::ComputerDisk),
+    // A PKG is a digital package, not an installed PS3 game folder or disc
+    // image. Its platform is established only by bounded header evidence.
+    cf("pkg", ContentKind::Archive),
+    // --- Registry parity (platform × format coverage matrix) ---
+    // Every extension below is advertised by `crate::platform::PLATFORMS` as
+    // strong (or single-claimant weak) evidence, yet was reported by discovery
+    // as "unsupported file type" and never stored by the Library scan. The
+    // category is knowable from the extension; the platform still comes from
+    // the registry's own evidence rules, and exact identity from a catalogue.
+    // See `crate::format_coverage_matrix` and its tests.
+    cf("col", ContentKind::RomCartridge),  // ColecoVision
+    cf("vec", ContentKind::RomCartridge),  // Vectrex
+    cf("int", ContentKind::RomCartridge),  // Intellivision
+    cf("itv", ContentKind::RomCartridge),  // Intellivision
+    cf("neo", ContentKind::RomCartridge),  // Neo Geo (.neo single-file cartridge)
+    cf("pce", ContentKind::RomCartridge),  // PC Engine / TurboGrafx-16 HuCard
+    cf("sgx", ContentKind::RomCartridge),  // SuperGrafx HuCard
+    cf("32x", ContentKind::RomCartridge),  // Sega 32X
+    cf("68k", ContentKind::RomCartridge),  // Mega Drive raw dump
+    cf("dsi", ContentKind::RomCartridge),  // Nintendo DSi cartridge
+    cf("xci", ContentKind::RomCartridge),  // Switch game card image
+    cf("3ds", ContentKind::RomCartridge),  // Nintendo 3DS NCSD image
+    cf("cci", ContentKind::RomCartridge),  // Nintendo 3DS NCSD image
+    cf("cxi", ContentKind::RomCartridge),  // Nintendo 3DS NCCH partition
+    cf("sv", ContentKind::RomCartridge),   // Watara Supervision
+    cf("fig", ContentKind::RomCartridge),  // SNES copier dump (Pro Fighter)
+    cf("swc", ContentKind::RomCartridge),  // SNES copier dump (Super Wild Card)
+    cf("jfd", ContentKind::ComputerDisk),  // Acorn Archimedes (JASPP floppy)
+    cf("mfm", ContentKind::ComputerDisk),  // Atari ST MFM image
+    cf("fdi", ContentKind::ComputerDisk),  // NEC PC-98 floppy
+    cf("thd", ContentKind::ComputerDisk),  // NEC PC-98 hard disk (T98)
+    cf("d88x", ContentKind::ComputerDisk), // Sharp X68000 D88 variant
+    cf("ndd", ContentKind::ComputerDisk),  // Nintendo 64DD disk
+    cf("dms", ContentKind::AmigaImage),    // Amiga DMS compressed floppy
+    cf("cso", ContentKind::DiscImage),     // PSP compressed ISO
+    cf("wia", ContentKind::DiscImage),     // Wii WIA image
+    cf("uef", ContentKind::TapeImage),     // BBC Micro / Acorn Electron tape
+    cf("cia", ContentKind::Archive),       // Nintendo 3DS installable title
+    cf("nsp", ContentKind::Archive),       // Switch installable package
+    cf("nca", ContentKind::Archive),       // Switch content archive
+    cf("vpk", ContentKind::Archive),       // PS Vita package
+    cf("rpx", ContentKind::Executable),    // Wii U executable
+];
+
+const fn cf(extension: &'static str, kind: ContentKind) -> ContentFormat {
+    ContentFormat { extension, kind }
+}
+
+/// The [`ContentKind`] for a loose file's extension (lowercase, no leading
+/// dot), if this registry recognises it on its own. `cue`/`bin` are never
+/// resolved here - see [`super::cue_bin`].
+pub fn content_kind_for_extension(extension: &str) -> Option<ContentKind> {
+    CONTENT_FORMATS
+        .iter()
+        .find(|format| format.extension == extension)
+        .map(|format| format.kind)
+}
+
+/// Every extension this registry recognises, for parity tests and for
+/// "does this archive member look like game content" checks.
+pub fn recognized_extensions() -> impl Iterator<Item = &'static str> {
+    CONTENT_FORMATS.iter().map(|format| format.extension)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn every_registered_extension_resolves_to_itself() {
+        for format in CONTENT_FORMATS {
+            assert_eq!(
+                content_kind_for_extension(format.extension),
+                Some(format.kind),
+                "extension {} did not round-trip",
+                format.extension
+            );
+        }
+    }
+
+    #[test]
+    fn unknown_extension_resolves_to_nothing() {
+        assert_eq!(content_kind_for_extension("xyz_not_a_real_format"), None);
+    }
+
+    #[test]
+    fn cue_and_bin_are_never_registered_here() {
+        assert_eq!(content_kind_for_extension("cue"), None);
+        assert_eq!(content_kind_for_extension("bin"), None);
+    }
+
+    #[test]
+    fn fds_is_classified_as_a_computer_disk() {
+        assert_eq!(
+            content_kind_for_extension("fds"),
+            Some(ContentKind::ComputerDisk)
+        );
+    }
+
+    #[test]
+    fn msx_cartridges_are_rom_content() {
+        assert_eq!(
+            content_kind_for_extension("mx1"),
+            Some(ContentKind::RomCartridge)
+        );
+        assert_eq!(
+            content_kind_for_extension("mx2"),
+            Some(ContentKind::RomCartridge)
+        );
+        assert_eq!(content_kind_for_extension("rom"), None);
+    }
+
+    #[test]
+    fn d88_is_computer_disk_content() {
+        assert_eq!(
+            content_kind_for_extension("d88"),
+            Some(ContentKind::ComputerDisk)
+        );
+    }
+
+    #[test]
+    fn commodore_t64_is_tape_content() {
+        assert_eq!(
+            content_kind_for_extension("t64"),
+            Some(ContentKind::TapeImage)
+        );
+    }
+
+    #[test]
+    fn pc98_hard_disk_extensions_are_computer_disks() {
+        assert_eq!(
+            content_kind_for_extension("hdi"),
+            Some(ContentKind::ComputerDisk)
+        );
+        assert_eq!(
+            content_kind_for_extension("nhd"),
+            Some(ContentKind::ComputerDisk)
+        );
+    }
+
+    #[test]
+    fn atari_extensions_use_only_coarse_content_categories() {
+        for extension in ["a26", "a52", "a78", "lnx", "lyx", "j64", "jag"] {
+            assert_eq!(
+                content_kind_for_extension(extension),
+                Some(ContentKind::RomCartridge),
+                ".{extension} must be ROM content"
+            );
+        }
+        assert_eq!(
+            content_kind_for_extension("xex"),
+            Some(ContentKind::Executable),
+            ".xex remains Xbox 360 executable content"
+        );
+        for extension in ["atr", "atx", "xfd", "stx"] {
+            assert_eq!(
+                content_kind_for_extension(extension),
+                Some(ContentKind::ComputerDisk),
+                ".{extension} must be computer-disk content"
+            );
+        }
+        assert_eq!(
+            content_kind_for_extension("cas"),
+            Some(ContentKind::TapeImage)
+        );
+    }
+
+    #[test]
+    fn neo_geo_pocket_extensions_are_cartridge_content() {
+        assert_eq!(
+            content_kind_for_extension("ngp"),
+            Some(ContentKind::RomCartridge)
+        );
+        assert_eq!(
+            content_kind_for_extension("ngc"),
+            Some(ContentKind::RomCartridge)
+        );
+    }
+
+    #[test]
+    fn virtual_boy_extensions_are_generic_cartridge_content() {
+        for extension in ["vb", "vboy"] {
+            assert_eq!(
+                content_kind_for_extension(extension),
+                Some(ContentKind::RomCartridge),
+                ".{extension} must be generic ROM content"
+            );
+        }
+    }
+
+    #[test]
+    fn apple_disk_extensions_are_computer_disks_and_sit_is_an_archive() {
+        for extension in ["do", "po", "woz", "2mg", "nib", "hfv", "dc42"] {
+            assert_eq!(
+                content_kind_for_extension(extension),
+                Some(ContentKind::ComputerDisk),
+                ".{extension} must be a computer disk"
+            );
+        }
+        assert_eq!(
+            content_kind_for_extension("sit"),
+            Some(ContentKind::Archive)
+        );
+    }
+
+    #[test]
+    fn xbox_executables_and_xiso_have_distinct_content_categories() {
+        assert_eq!(
+            content_kind_for_extension("xbe"),
+            Some(ContentKind::Executable)
+        );
+        assert_eq!(
+            content_kind_for_extension("xex"),
+            Some(ContentKind::Executable)
+        );
+        assert_eq!(
+            content_kind_for_extension("xiso"),
+            Some(ContentKind::DiscImage)
+        );
+        assert_eq!(content_kind_for_extension("god"), None);
+    }
+
+    #[test]
+    fn d64_is_ingestible_as_computer_disk() {
+        assert_eq!(
+            content_kind_for_extension("d64"),
+            Some(ContentKind::ComputerDisk)
+        );
+    }
+}

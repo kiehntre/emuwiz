@@ -275,6 +275,7 @@ fn the_store_is_bounded() {
                 path: PathBuf::from(format!("/mnt/games/roms/gb/{index}.gb")),
                 size_bytes: 1024,
                 modified_unix_seconds: Some(1_785_000_000),
+                object: None,
             },
             crc32: "00000000".to_string(),
             md5: "0".repeat(32),
@@ -356,6 +357,12 @@ fn a_stored_hash_promotes_a_matching_record_to_confirmed() {
         verification: ExternalVerification::StrongExternal,
         conflicts: Vec::new(),
         evidence: Vec::new(),
+        synopsis: None,
+        genres: Vec::new(),
+        players: None,
+        rating: None,
+        release_year: None,
+        howlongtobeat: None,
     };
 
     // Without a stored hash nothing local has been compared, so the verdict rests on
@@ -415,6 +422,12 @@ fn a_stored_hash_that_disagrees_does_not_promote_and_keeps_both_sides() {
         verification: ExternalVerification::StrongExternal,
         conflicts: Vec::new(),
         evidence: Vec::new(),
+        synopsis: None,
+        genres: Vec::new(),
+        players: None,
+        rating: None,
+        release_year: None,
+        howlongtobeat: None,
     };
     record.file_size_bytes = Some(std::fs::metadata(&file).expect("metadata").len());
 

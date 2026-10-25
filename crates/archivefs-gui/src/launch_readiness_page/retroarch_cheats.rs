@@ -1,0 +1,651 @@
+//! Optional, per-launch RetroArch cheats for the Playing Library (native and
+//! AppImage RetroArch, single-disc games).
+//!
+//! The user picks one `.cht` file and ticks cheats; nothing is ticked by
+//! default. Everything the core needs but the GUI cannot know is established
+//! in the launch worker, not trusted from the screen:
+//!
+//! * the exact core file is asked for its own `library_name` in the isolated
+//!   probe (`.info` `corename`, the file stem and RetroArch's folders are all
+//!   unreliable); if that cannot be established, cheats are refused with an
+//!   explanation and an ordinary launch stays available;
+//! * RetroArch's override files are inspected read-only; an override that would
+//!   defeat a pinned setting, or one that cannot be read safely, blocks cheats;
+//! * the chosen file's SHA-256 was taken when it was previewed and is re-checked
+//!   by the cheat runtime at launch, as is the probed core file and the
+//!   settings file.
+//!
+//! RetroArch gives no sign of whether a cheat loaded, so a launch never
+//! claims a cheat is active.
+use super::RetroArchLaunchState;
+use archivefs_core::emulator_environment::retroarch::discover_retroarch_environment;
+use archivefs_core::emulator_environment::retroarch::{
+    DiscoveryEnvironment, PathPurpose, ProfileKind, ProfileRef,
+};
+use archivefs_core::emulator_environment::{FsProbe, HostReadOnlyFilesystem};
+use archivefs_core::launch::cheat_launch_plan::{
+    ApplicabilityVerdict, CheatCandidate, CheatLaunchSelection, applicability_verdict,
+};
+use archivefs_core::launch::cheat_runtime_retroarch::{
+    RetroArchCheatActivation, RetroArchCheatLaunch, RetroArchCheatLaunchError,
+    RetroArchCheatSelection, RetroArchHandoffFailure, preflight_and_launch_retroarch_with_cheats,
+    retroarch_facts,
+};
+use archivefs_core::launch::libretro_probe::{
+    CurrentExecutableLauncher, ProbeLauncher, probe_core_library_name,
+};
+use archivefs_core::launch::retroarch_cheat_candidates::{
+    ExcludedCheat, retroarch_launch_candidates,
+};
+use archivefs_core::launch::retroarch_overrides::discover_retroarch_overrides;
+use archivefs_core::launch::{RetroArchLaunchRequest, preflight_retroarch_launch};
+use archivefs_core::patch_manager::{
+    CheatPackAssociation, CheatPackCatalogueGame, CheatPackLimits, UserCheatLibraryGame,
+    preview_cheat_pack,
+};
+use eframe::egui;
+use std::collections::{BTreeMap, BTreeSet};
+use std::path::{Path, PathBuf};
+use std::sync::Arc;
+
+pub(super) const START_NOTE: &str = "RetroArch does not say whether a cheat loaded, and EmuWiz has not seen one work in a game. For this launch RetroArch gets a temporary profile holding only the cheats you ticked (and cheats switched on); your ROM, cheat file, saves and RetroArch settings are not changed, and the temporary profile is removed after RetroArch exits.";
+
+/// A reviewed cheat is the player's approval, not proof it fits the game.
+pub(super) const APPROVED_LABEL: &str = "  User-approved (not checksum-verified). Your ROM's identity is verified; this cheat's link to it is your review, and whether the core applies it is unconfirmed.";
+
+/// One cheat in the chooser.
+#[derive(Clone, Debug)]
+pub(super) struct Row {
+    pub(super) candidate: CheatCandidate,
+    pub(super) ticked: bool,
+    /// Index into `candidate.variants`, when the user has chosen one.
+    pub(super) variant: Option<usize>,
+    /// The user reviewed a weak match.
+    pub(super) acknowledged: bool,
+}
+
+impl Row {
+    /// Several implementations, or an unresolved conflict: the user must pick.
+    fn needs_choice(&self) -> bool {
+        self.candidate.variants.len() > 1 || self.candidate.unresolved_conflict
+    }
+
+    /// The source file marks this cheat as enabled. Shown, never honoured.
+    pub(super) fn on_by_default(&self) -> bool {
+        self.candidate
+            .variants
+            .iter()
+            .any(|v| v.entry.as_ref().is_some_and(|e| e.enabled_by_default))
+    }
+
+    fn needs_review(&self) -> bool {
+        let reviewed = |index: usize| {
+            applicability_verdict(&self.candidate.variants[index].applicability)
+                == ApplicabilityVerdict::ReviewRequired
+        };
+        match self.variant {
+            Some(index) => reviewed(index),
+            None => (0..self.candidate.variants.len()).any(reviewed),
+        }
+    }
+}
+
+/// The user's cheat file and choices, for one specific launch request.
+#[derive(Clone, Debug)]
+pub(super) struct Choice {
+    pub(super) content: PathBuf,
+    /// The verified game identity the review was given for.
+    pub(super) game_key: String,
+    pub(super) platform: String,
+    pub(super) profile: ProfileRef,
+    pub(super) core_stem: String,
+    pub(super) file: PathBuf,
+    pub(super) rows: Vec<Row>,
+    pub(super) excluded: Vec<ExcludedCheat>,
+}
+
+impl Choice {
+    /// Reads and assesses `file` for `request`. Writes nothing.
+    pub(super) fn load(request: &RetroArchLaunchRequest, file: &Path) -> Result<Self, String> {
+        let is_cht = file
+            .extension()
+            .and_then(|e| e.to_str())
+            .is_some_and(|e| e.eq_ignore_ascii_case("cht"));
+        if !is_cht {
+            return Err("Choose a RetroArch cheat file (.cht). Nothing was changed.".into());
+        }
+        let name = file
+            .file_name()
+            .map(PathBuf::from)
+            .ok_or("The cheat file has no name.")?;
+        // Refuse a pipe, device or link up front, without ever waiting on it.
+        archivefs_core::launch::process_spawn::open_regular_file_nonblocking(file)
+            .map_err(|e| format!("The cheat file cannot be used: {e}"))?;
+        let title = request
+            .selected_content_path
+            .file_stem()
+            .map_or_else(String::new, |s| s.to_string_lossy().into_owned());
+        let catalogue = [CheatPackCatalogueGame {
+            game: UserCheatLibraryGame {
+                game_id: request.expected_game_key.clone(),
+                title: title.clone(),
+                platform: Some(request.expected_platform_id.clone()),
+                ..UserCheatLibraryGame::default()
+            },
+            facts: Vec::new(),
+            revision: None,
+        }];
+        // The file is chosen for this game by the user; EmuWiz cannot prove the
+        // cheats belong to it, so the match is by title only and always needs
+        // the user's review.
+        let association = CheatPackAssociation {
+            title: Some(title),
+            platform: Some(request.expected_platform_id.clone()),
+            ..CheatPackAssociation::default()
+        };
+        let associations = BTreeMap::from([(name, association)]);
+        let preview = preview_cheat_pack(
+            file,
+            &catalogue,
+            &associations,
+            &BTreeSet::new(),
+            &CheatPackLimits::default(),
+        )
+        .map_err(|e| format!("The cheat file cannot be used: {e}"))?;
+        let Some(game) = preview.games.first() else {
+            return Err("No cheat in this file could be matched to this game.".into());
+        };
+        let found = retroarch_launch_candidates(&preview, &game.key.clone());
+        if found.candidates.is_empty() && found.excluded.is_empty() {
+            return Err("This file contains no cheats EmuWiz can use for this game.".into());
+        }
+        Ok(Self {
+            content: request.selected_content_path.clone(),
+            game_key: request.expected_game_key.clone(),
+            platform: request.expected_platform_id.clone(),
+            profile: request.profile,
+            core_stem: request.core_stem.clone(),
+            file: file.to_path_buf(),
+            rows: found
+                .candidates
+                .into_iter()
+                .map(|candidate| Row {
+                    candidate,
+                    ticked: false,
+                    variant: None,
+                    acknowledged: false,
+                })
+                .collect(),
+            excluded: found.excluded,
+        })
+    }
+
+    pub(super) fn matches(&self, request: &RetroArchLaunchRequest) -> bool {
+        self.content == request.selected_content_path
+            && self.game_key == request.expected_game_key
+            && self.platform == request.expected_platform_id
+            && self.profile == request.profile
+            && self.core_stem == request.core_stem
+    }
+
+    pub(super) fn ticked_count(&self) -> usize {
+        self.rows.iter().filter(|row| row.ticked).count()
+    }
+
+    /// The planner's selections, or why the choices are not yet complete.
+    pub(super) fn selections(&self) -> Result<Vec<CheatLaunchSelection>, String> {
+        let ticked: Vec<&Row> = self.rows.iter().filter(|row| row.ticked).collect();
+        if ticked.is_empty() {
+            return Err(
+                "Tick at least one cheat, or clear the cheat file to launch without cheats.".into(),
+            );
+        }
+        let mut selections = Vec::new();
+        for row in ticked {
+            let title = &row.candidate.title;
+            let variant_id = if row.needs_choice() {
+                let Some(index) = row.variant else {
+                    return Err(format!(
+                        "\"{title}\" has more than one version. Choose which one to use."
+                    ));
+                };
+                Some(row.candidate.variants[index].variant_id.clone())
+            } else {
+                None
+            };
+            if row.needs_review() && !row.acknowledged {
+                return Err(format!(
+                    "\"{title}\" is not proven to belong to this game. Tick \"I reviewed this cheat for this game\" to use it."
+                ));
+            }
+            selections.push(CheatLaunchSelection {
+                logical_id: row.candidate.logical_id.clone(),
+                variant_id,
+                review_acknowledged: row.acknowledged,
+            });
+        }
+        Ok(selections)
+    }
+}
+
+/// Where cheats cannot be offered at all.
+pub(super) fn unavailable_reason(
+    request: &RetroArchLaunchRequest,
+    multi_disc: bool,
+) -> Option<&'static str> {
+    if multi_disc {
+        return Some(
+            "Cheats are not available for multi-disc games (they launch through a playlist). The game launches normally.",
+        );
+    }
+    if request.profile.profile_kind == ProfileKind::Flatpak {
+        return Some(
+            "Cheats are not supported for a Flatpak RetroArch. The game launches normally.",
+        );
+    }
+    None
+}
+
+/// What the launch worker produced.
+pub(super) fn describe(error: RetroArchCheatLaunchError) -> String {
+    match error {
+        RetroArchCheatLaunchError::HandoffFailed { failure, receipt } => {
+            let what = match failure {
+                RetroArchHandoffFailure::PreparationFailed { detail } => {
+                    format!("the temporary cheat profile could not be prepared ({detail})")
+                }
+                RetroArchHandoffFailure::SpawnFailed { detail } => {
+                    format!("RetroArch could not be started ({detail})")
+                }
+            };
+            format!("{what}. Temporary files: {:?}.", receipt.cleanup)
+        }
+        RetroArchCheatLaunchError::Preflight(error) => preflight_message(error),
+        RetroArchCheatLaunchError::Cheats(error) => {
+            format!(
+                "the selected cheats cannot be applied to this launch, so nothing was changed. Try choosing the cheats again, or launch without cheats. Technical detail: {error:?}"
+            )
+        }
+        RetroArchCheatLaunchError::Facts(detail) => detail,
+        RetroArchCheatLaunchError::Spawn(error) => {
+            format!("RetroArch could not be started. Technical detail: {error:?}")
+        }
+        RetroArchCheatLaunchError::InvalidLaunchId => "an internal launch id was invalid".into(),
+        RetroArchCheatLaunchError::Sandbox(error) => {
+            format!(
+                "RetroArch cannot be shown to reach the game, core or save folders cheats need (its sandbox may hide them), so cheats are unavailable. The game launches normally without cheats. Technical detail: {error:?}"
+            )
+        }
+    }
+}
+
+/// The plain-language reason an ordinary launch check refused, shared with the
+/// launch button so cheat and plain launches explain a refusal the same way.
+fn preflight_message(error: archivefs_core::launch::LaunchPreflightError) -> String {
+    let (message, detail) = super::launch_error_message(
+        &archivefs_core::launch::LaunchExecutionError::Preflight(error),
+    );
+    format!("{message} ({detail})")
+}
+
+/// If the launch check failed because RetroArch's settings file is a symbolic
+/// link (which EmuWiz's RetroArch discovery deliberately does not follow, for
+/// plain launches as well as cheat launches), say so plainly instead of the
+/// opaque "no candidate" error.
+fn symlinked_settings_explanation(
+    request: &RetroArchLaunchRequest,
+    filesystem: &HostReadOnlyFilesystem,
+    environment: &DiscoveryEnvironment,
+) -> Option<String> {
+    let report = discover_retroarch_environment(filesystem, environment).ok()?;
+    let profile = report.profiles.iter().find(|p| {
+        p.profile_kind == request.profile.profile_kind && p.scope == request.profile.scope
+    })?;
+    let path = std::path::Path::new(&profile.config_file.path.display);
+    match profile.config_file.probe {
+        FsProbe::Symlink => {
+            Some(archivefs_core::launch::retroarch_overrides::symlinked_settings_message(path))
+        }
+        FsProbe::Missing => {
+            Some(archivefs_core::launch::retroarch_overrides::missing_settings_message(Some(path)))
+        }
+        _ => None,
+    }
+}
+
+fn launch_id() -> String {
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |d| d.as_nanos());
+    format!("retroarch-{}-{nanos}", std::process::id())
+}
+
+/// The whole launch, run on a worker thread that lives until it is done (the
+/// probe's parent-death signal is tied to this thread). Every refusal happens
+/// before RetroArch starts.
+pub(super) fn launch(
+    request: &RetroArchLaunchRequest,
+    choice: &Choice,
+    probe: &dyn ProbeLauncher,
+    environment: &DiscoveryEnvironment,
+) -> Result<RetroArchCheatLaunch, String> {
+    let refuse = |why: String| format!("RetroArch was not started: {why}");
+    if !choice.matches(request) {
+        return Err(refuse(
+            "the cheat file was chosen for a different game.".into(),
+        ));
+    }
+    if let Some(why) = unavailable_reason(request, false) {
+        return Err(refuse(why.into()));
+    }
+    let selections = choice.selections().map_err(refuse)?;
+    let candidates = choice.rows.iter().map(|r| r.candidate.clone()).collect();
+    launch_selection(
+        request,
+        RetroArchCheatSelection {
+            candidates,
+            selections,
+            core_library_name: String::new(),
+            effective_overrides: Vec::new(),
+            expected_core: None,
+            expected_executable: None,
+            additional_sources: Vec::new(),
+            start_from_snapshot: false,
+        },
+        probe,
+        environment,
+    )
+}
+
+/// Common canonical handoff for native .cht choices and verified Fuse POK
+/// projections. Callers own format-specific compatibility and evidence checks.
+pub(super) fn launch_selection(
+    request: &RetroArchLaunchRequest,
+    mut selection: RetroArchCheatSelection,
+    probe: &dyn ProbeLauncher,
+    environment: &DiscoveryEnvironment,
+) -> Result<RetroArchCheatLaunch, String> {
+    let refuse = |why: String| format!("RetroArch was not started: {why}");
+    let filesystem = HostReadOnlyFilesystem;
+    let command = preflight_retroarch_launch(request, &filesystem, environment).map_err(|e| {
+        refuse(
+            symlinked_settings_explanation(request, &filesystem, environment)
+                .unwrap_or_else(|| preflight_message(e)),
+        )
+    })?;
+    if selection
+        .expected_executable
+        .as_ref()
+        .is_some_and(|path| path != &command.executable)
+    {
+        return Err(refuse(
+            "The verified RetroArch executable changed; refresh trainer selection.".into(),
+        ));
+    }
+    let core_path = command.selection.core_library.clone();
+    if selection
+        .expected_core
+        .as_ref()
+        .is_some_and(|p| p != &core_path)
+    {
+        return Err(refuse(
+            "The selected core changed; refresh trainer selection.".into(),
+        ));
+    }
+    let probed = probe_core_library_name(&core_path, probe).map_err(|e| refuse(e.explanation()))?;
+    selection.core_library_name = probed.library_name.clone();
+    selection.expected_core = Some(core_path);
+    let facts = retroarch_facts(
+        &command,
+        &filesystem,
+        environment,
+        &selection,
+        PathBuf::from("/"),
+    )
+    .map_err(|e| refuse(e))?;
+    let Some(real_config) = facts.real_config_path.clone() else {
+        return Err(refuse(
+            archivefs_core::launch::retroarch_overrides::missing_settings_message(None),
+        ));
+    };
+    let home = environment.home.as_ref().map(PathBuf::from);
+    let overrides = discover_retroarch_overrides(
+        &real_config,
+        &probed.library_name,
+        &request.selected_content_path,
+        home.as_deref(),
+    );
+    if let Some(why) = overrides.refusal() {
+        return Err(refuse(why));
+    }
+    selection.effective_overrides = overrides.findings;
+    // 3. Everything verified is re-checked immediately before the launch.
+    probed
+        .ensure_unchanged()
+        .map_err(|e| refuse(e.explanation()))?;
+    if let Some(binding) = &overrides.configuration {
+        binding.ensure_unchanged().map_err(refuse)?;
+    }
+    preflight_and_launch_retroarch_with_cheats(
+        request,
+        &filesystem,
+        environment,
+        &selection,
+        &launch_id(),
+    )
+    .map_err(|e| refuse(describe(e)))
+}
+
+/// The exact content file, core `library_name`, settings file and overlay
+/// folder a plain launch of `request` would use: the same preflight as Play
+/// and the same core probe as a cheat launch. The settings come from the one
+/// profile Play selected, so other RetroArch installs never change the answer.
+/// Nothing is launched; the probe child only asks the core its name.
+pub(super) fn bezel_identity(
+    request: &RetroArchLaunchRequest,
+) -> Result<super::RetroArchBezelLaunch, String> {
+    let filesystem = HostReadOnlyFilesystem;
+    let environment = DiscoveryEnvironment::from_process_environment();
+    let command = preflight_retroarch_launch(request, &filesystem, &environment).map_err(|e| {
+        symlinked_settings_explanation(request, &filesystem, &environment)
+            .unwrap_or_else(|| preflight_message(e))
+    })?;
+    let probed =
+        probe_core_library_name(&command.selection.core_library, &CurrentExecutableLauncher)
+            .map_err(|e| e.explanation())?;
+    let report = discover_retroarch_environment(&filesystem, &environment)
+        .map_err(|e| format!("RetroArch could not be checked: {e:?}"))?;
+    let profile = report
+        .profiles
+        .iter()
+        .find(|p| {
+            p.profile_kind == command.selection.profile.profile_kind
+                && p.scope == command.selection.profile.scope
+        })
+        .ok_or("the RetroArch profile this game launches with is no longer discoverable")?;
+    if profile.config_file.path.lossy {
+        return Err("RetroArch's settings path is not valid UTF-8".into());
+    }
+    let overlays = profile
+        .paths
+        .iter()
+        .find(|path| path.purpose == PathPurpose::Overlays)
+        .and_then(|path| path.resolved_path.as_ref())
+        .filter(|path| !path.lossy)
+        .ok_or("EmuWiz can't tell which overlay folder the RetroArch settings this game launches with use, so the bezel has nowhere safe to go.")?;
+    probed.ensure_unchanged().map_err(|e| e.explanation())?;
+    Ok(super::RetroArchBezelLaunch {
+        identity: archivefs_core::bezel_apply::RetroArchContentIdentity {
+            content_path: command.selection.content_path.clone(),
+            core_library_name: probed.library_name.clone(),
+            home: environment.home.as_ref().map(PathBuf::from),
+        },
+        config: PathBuf::from(&profile.config_file.path.display),
+        overlays: PathBuf::from(&overlays.display),
+    })
+}
+
+pub(super) fn requested_label(
+    session: &archivefs_core::launch::cheat_runtime::CheatRuntimeSession<
+        archivefs_core::launch::LaunchedRetroArchProcess,
+    >,
+) -> String {
+    format!(
+        "Requested cheats: {}",
+        session
+            .receipt()
+            .cheats
+            .iter()
+            .map(|c| c.title.as_str())
+            .collect::<Vec<_>>()
+            .join(", ")
+    )
+}
+
+/// The lines shown once a cheat launch has finished.
+pub(super) fn session_summary(
+    session: &archivefs_core::launch::cheat_runtime::CheatRuntimeSession<
+        archivefs_core::launch::LaunchedRetroArchProcess,
+    >,
+) -> Vec<String> {
+    let receipt = session.receipt();
+    let exit = match receipt.process.as_ref().and_then(|p| p.exit.as_ref()) {
+        Some(exit) if exit.success => "exited normally".to_string(),
+        Some(exit) => format!("failed (exit code {:?})", exit.code),
+        None => "exited (status unknown)".to_string(),
+    };
+    let mut lines = vec![format!(
+        "RetroArch {exit}; temporary cheat profile: {:?}. EmuWiz did not see the cheats work.",
+        receipt.cleanup
+    )];
+    lines.insert(0, requested_label(session));
+    lines.extend(receipt.notes.iter().cloned());
+    lines.extend(receipt.errors.iter().cloned());
+    lines
+}
+
+/// Shown while RetroArch runs: the process started, but no cheat is confirmed.
+pub(super) fn activation_label() -> String {
+    format!(
+        "Process started — cheat activation NOT confirmed. {}",
+        RetroArchCheatActivation::PreparedActivationNotVerified.label()
+    )
+}
+
+/// The production probe launcher.
+pub(super) fn production_probe() -> Arc<dyn ProbeLauncher + Send + Sync> {
+    Arc::new(CurrentExecutableLauncher)
+}
+
+/// The chooser. Drawn only while no launch is in progress.
+pub(super) fn show_chooser(
+    ui: &mut egui::Ui,
+    state: &mut RetroArchLaunchState,
+    request: &RetroArchLaunchRequest,
+    multi_disc: bool,
+) {
+    if state.is_active() {
+        return;
+    }
+    if state
+        .cheats
+        .as_ref()
+        .is_some_and(|choice| !choice.matches(request))
+    {
+        state.cheats = None;
+        state.cheats_message = None;
+    }
+    ui.separator();
+    ui.label("Cheats for this launch (optional)");
+    if let Some(reason) = unavailable_reason(request, multi_disc) {
+        state.cheats = None;
+        ui.label(reason);
+        return;
+    }
+    super::retroarch_cheat_sets::show(ui, state, request);
+    let picked = if ui.button("Choose a cheat file (.cht)…").clicked() {
+        rfd::FileDialog::new()
+            .add_filter("RetroArch cheat file", &["cht"])
+            .pick_file()
+    } else {
+        None
+    };
+    #[cfg(test)]
+    let picked = picked.or_else(|| state.pending_cheat_file.take());
+    if let Some(path) = picked {
+        match Choice::load(request, &path) {
+            Ok(choice) => {
+                state.cheats = Some(choice);
+                state.cheats_message = None;
+            }
+            Err(error) => {
+                state.cheats = None;
+                state.cheats_message = Some(error);
+            }
+        }
+    }
+    let mut clear = false;
+    if let Some(choice) = state.cheats.as_mut() {
+        if let Some(name) = choice.file.file_name() {
+            ui.small(format!("Previewing {}", name.to_string_lossy()));
+        }
+        for row in &mut choice.rows {
+            ui.checkbox(&mut row.ticked, &row.candidate.title);
+            if row.on_by_default() {
+                ui.small("  The cheat file switches this on by default; EmuWiz leaves it off unless you tick it.");
+            }
+            if row.ticked {
+                if row.needs_choice() {
+                    let labels: Vec<String> = row
+                        .candidate
+                        .variants
+                        .iter()
+                        .map(|v| format!("{} · {}", v.source.source_id, v.variant_id))
+                        .collect();
+                    egui::ComboBox::from_id_salt(("retroarch_variant", &row.candidate.logical_id))
+                        .selected_text(
+                            row.variant
+                                .map_or("Choose a version".to_string(), |i| labels[i].clone()),
+                        )
+                        .show_ui(ui, |ui| {
+                            for (index, label) in labels.iter().enumerate() {
+                                ui.selectable_value(&mut row.variant, Some(index), label);
+                            }
+                        });
+                }
+                if row.needs_review() {
+                    ui.checkbox(&mut row.acknowledged, "I reviewed this cheat for this game");
+                    if row.acknowledged {
+                        ui.small(APPROVED_LABEL);
+                    }
+                }
+            }
+        }
+        for excluded in &choice.excluded {
+            ui.add_enabled(
+                false,
+                egui::Checkbox::new(
+                    &mut false,
+                    excluded
+                        .title
+                        .clone()
+                        .unwrap_or_else(|| excluded.logical_key.clone()),
+                ),
+            );
+            ui.small(format!(
+                "  Not available: {}.",
+                excluded.reason.explanation()
+            ));
+        }
+        ui.small(START_NOTE);
+        clear = ui
+            .button("Launch without cheats (clear cheat file)")
+            .clicked();
+    }
+    if clear {
+        state.cheats = None;
+    }
+    if let Some(message) = &state.cheats_message {
+        ui.label(message.as_str());
+    }
+}

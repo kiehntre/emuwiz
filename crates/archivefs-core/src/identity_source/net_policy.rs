@@ -42,10 +42,14 @@
 //! refuse them. They are also named explicitly, because "the metadata endpoint
 //! is refused" is a property worth asserting directly rather than inferring.
 
+/// Bounded HTTP response metadata shared by provider transports.
+pub(crate) mod http_metadata;
+
 use std::fmt;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr, ToSocketAddrs};
 
 use serde::Serialize;
+use url::Url;
 
 /// Cloud and link-local metadata addresses, refused by name as well as by range.
 ///
@@ -69,10 +73,14 @@ pub const MAX_RESOLVED_ADDRESSES: usize = 16;
 #[serde(rename_all = "snake_case", tag = "reason")]
 pub enum EndpointRefusal {
     /// The text is not a URL at all.
-    Unparseable { detail: String },
+    Unparseable {
+        detail: String,
+    },
     /// A scheme other than `http` or `https`. Names the scheme so `file:` and
     /// `unix:` attempts are legible in a diagnostic.
-    UnsupportedScheme { scheme: String },
+    UnsupportedScheme {
+        scheme: String,
+    },
     /// A URL carrying a username or password in its authority component, before
     /// the `@`. Never accepted, because such a URL ends up in caches, logs and
     /// diagnostics.
@@ -84,23 +92,40 @@ pub enum EndpointRefusal {
     /// No host at all.
     MissingHost,
     /// The host could not be resolved.
-    UnresolvableHost { detail: String },
+    UnresolvableHost {
+        detail: String,
+    },
     /// The host resolved to nothing.
     NoAddresses,
     /// The host resolved to more addresses than the policy will consider.
-    TooManyAddresses { count: usize },
+    TooManyAddresses {
+        count: usize,
+    },
     /// At least one resolved address is outside the approved ranges. The
     /// *address* is named, not just the host, because that is the fact that
     /// decided it.
-    NotPrivateAddress { address: String },
+    NotPrivateAddress {
+        address: String,
+    },
+    PrivateAddress {
+        address: String,
+    },
     /// A known cloud or link-local metadata endpoint.
-    MetadataEndpoint { address: String },
+    MetadataEndpoint {
+        address: String,
+    },
     /// A redirect, which Stage 1 does not follow.
-    RedirectRefused { location: String },
+    RedirectRefused {
+        location: String,
+    },
     /// A port outside the usable range, or zero.
-    InvalidPort { port: u16 },
+    InvalidPort {
+        port: u16,
+    },
     /// The URL carried a path that is not a prefix this client will use.
-    UnsupportedUrlShape { detail: String },
+    UnsupportedUrlShape {
+        detail: String,
+    },
 }
 
 impl EndpointRefusal {
@@ -128,6 +153,9 @@ impl EndpointRefusal {
                 "{address} is not on a local or private network; an identity source must be \
                  reachable only on loopback, a private LAN or a private container network"
             ),
+            Self::PrivateAddress { address } => format!(
+                "{address} is a private, loopback or link-local address; public DAT downloads cannot target internal networks"
+            ),
             Self::MetadataEndpoint { address } => {
                 format!("{address} is a cloud metadata endpoint and is never contacted")
             }
@@ -151,12 +179,58 @@ impl EndpointRefusal {
             Self::NoAddresses => "no_addresses",
             Self::TooManyAddresses { .. } => "too_many_addresses",
             Self::NotPrivateAddress { .. } => "not_private_address",
+            Self::PrivateAddress { .. } => "private_address",
             Self::MetadataEndpoint { .. } => "metadata_endpoint",
             Self::RedirectRefused { .. } => "redirect_refused",
             Self::InvalidPort { .. } => "invalid_port",
             Self::UnsupportedUrlShape { .. } => "unsupported_url_shape",
         }
     }
+}
+
+/// Validates a user-selected public HTTPS download destination. This remains
+/// separate from the private-LAN identity-source policy.
+pub fn validate_public_https_url(
+    url: &str,
+    resolver: &impl HostResolver,
+) -> Result<(), EndpointRefusal> {
+    let parsed = Url::parse(url).map_err(|error| EndpointRefusal::Unparseable {
+        detail: error.to_string(),
+    })?;
+    if parsed.scheme() != "https" {
+        return Err(EndpointRefusal::UnsupportedScheme {
+            scheme: parsed.scheme().to_string(),
+        });
+    }
+    if !parsed.username().is_empty() || parsed.password().is_some() {
+        return Err(EndpointRefusal::EmbeddedCredentials);
+    }
+    let host = parsed.host_str().ok_or(EndpointRefusal::MissingHost)?;
+    let port = parsed.port_or_known_default().unwrap_or(443);
+    let addresses = resolver
+        .resolve(host, port)
+        .map_err(|detail| EndpointRefusal::UnresolvableHost { detail })?;
+    if addresses.is_empty() {
+        return Err(EndpointRefusal::NoAddresses);
+    }
+    if addresses.len() > MAX_RESOLVED_ADDRESSES {
+        return Err(EndpointRefusal::TooManyAddresses {
+            count: addresses.len(),
+        });
+    }
+    for address in addresses {
+        if is_metadata_address(address) {
+            return Err(EndpointRefusal::MetadataEndpoint {
+                address: address.to_string(),
+            });
+        }
+        if is_approved_local_address(address) {
+            return Err(EndpointRefusal::PrivateAddress {
+                address: address.to_string(),
+            });
+        }
+    }
+    Ok(())
 }
 
 impl fmt::Display for EndpointRefusal {
@@ -341,6 +415,16 @@ pub fn validate_endpoint(
         scheme: parsed.scheme,
         resolved: addresses.iter().map(IpAddr::to_string).collect(),
     })
+}
+
+/// The origin an endpoint URL would have once approved, computed without any
+/// DNS lookup. Used to keep one stable identity (cache keys) for a server that
+/// is temporarily reached through a different, session-only address.
+#[must_use]
+pub fn endpoint_origin(url: &str) -> Option<String> {
+    ParsedEndpoint::parse(url)
+        .ok()
+        .map(|parsed| parsed.origin())
 }
 
 /// Revalidates a redirect destination against the same policy.

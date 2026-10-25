@@ -1,0 +1,136 @@
+MAME Collection Health GUI V1
+=============================
+
+Entry: Organisation / Organise & Export -> Check MAME collection health.
+The MAME reconstruction page also offers Open read-only MAME Health.
+The dedicated Health sub-view returns before Organisation's mutation dispatch.
+It never supplies an apply plan, runs MAME, opens a database, writes a journal,
+changes a DAT or collection, downloads data, or updates a catalogue. Report
+copying uses the clipboard. Existing reconstruction and transaction code is
+unchanged. There is no R2 dependency or integration.
+
+Selection and source evidence
+-----------------------------
+
+Selection reuses DatCataloguePickerState and typed CatalogueRef. Local DAT
+registrations have no saved ecosystem; these rows are explicitly unclassified
+candidates. Managed software-list and unrelated confirmed ecosystems are
+excluded. The worker must establish MAME arcade -listxml parser provenance
+before inspecting the collection. Legacy Logiqx arcade projections, software
+lists and malformed catalogues are refused. No MAME release is hardcoded.
+
+The source is freshly SHA-256 hashed and resolved using the existing catalogue
+resolver. The receipt retains the source reference, source ID, provenance,
+recorded author if present, source path/identity, actual catalogue version,
+collection root, inventory, inspection completeness, limits and snapshot time.
+Untrusted display values escape controls and Unicode line/paragraph separators;
+long labels are shortened while JSON retains their original values.
+
+The optional installed-version field accepts captured MAME version output. Its
+provenance is expressly user-supplied, not authenticated executable identity.
+The existing strict backend compares releases; missing, malformed, conflicting
+or unrelated-product output is Unknown. An unidentified bare numeric version
+is also Unknown; GUI input needs a MAME product label or a matching MAME build
+tag, and the backend validates its number/build syntax. Health does not execute an emulator or
+infer installed versions from good-set counts.
+
+Read-only inventory adapter
+---------------------------
+
+Fresh ZIP member evidence comes from the existing ZipArchiveSource verified
+reader. Loose machine-folder files use safe_read and the same cancellable
+streaming CRC32/MD5/SHA-1/SHA-256 hasher. Stored facts use the algorithms the
+existing analyser consumes. ZIP metadata CRCs and matching names alone cannot
+establish verified content.
+
+Bounds: 50,000 containers, 500,000 filesystem/archive entries, directory depth
+8, 64 GiB total logical hashing and 8 GiB per member; ZIPs use the existing
+archive limits plus 16,384 members. Catalogue bounds are 256 MiB, 100,000
+machines, 16,384 ROM declarations per machine and 500,000 ROM/disk declarations
+overall. Existing parser depth, string and warning limits also apply.
+
+Unsupported archive formats, nested archives, symbolic links, special files,
+unreadable entries, invalid UTF-8 member names and exhausted budgets produce
+explicit incomplete evidence. Stable filesystem identity is supported on Unix;
+other platforms cannot establish complete inspection in V1.
+
+A loose .chd is presence only, with no ordinary-file hash. ZIP CHD hashes are
+also excluded from health authority. A unique g.zip plus a CHD-only g/ folder
+is joined as a presence-only companion. Competing ROM containers remain
+ambiguous. CHD combined-digest and parent-chain verification is unsupported:
+missing CHDs and present-but-unverified CHDs have different explanations.
+
+Execution and freshness
+-----------------------
+
+Catalogue loading, hashing, scanning, analyser execution, full JSON generation
+and selected-set JSON generation run in background workers. Progress messages
+use a bounded channel. Only one inspection can be active per Health page.
+Progress counts listed entries and collected containers. The logical-byte
+counter is charged read budget (reserved before hashing), not measured bytes
+read; failed reads can consume that conservative allowance. It is labelled as
+budget used, never as content verified or bytes successfully processed.
+Requests and results are bound to job ID, catalogue reference and collection
+root. Input changes clear old results; failures do not retain green success.
+Dropping an inspection handle requests cancellation. A cancellation received
+after analysis but before completion adoption also discards the prepared report.
+
+Cancellation is checked during streaming hashes and directory traversal.
+Existing catalogue parsing and backend analysis are bounded but cannot be
+interrupted inside those steps. Cancellation during analysis invalidates the
+inventory and cannot produce Good. Progress is per loose file/ZIP container,
+not a promise of granular decompression progress within one ZIP.
+
+Metadata/identity stamps (including Unix device, inode and ctime) are checked
+after scanning and analysis. Changed/cancelled snapshots discard hash authority.
+Before presenting a completed report, and periodically while the page is
+visible, a background source-identity check hides results until checking ends.
+Detected changes or unavailable identity withdraw the report. This is a
+historical snapshot, not atomic live monitoring; metadata checks cannot prove
+that no concurrent change occurred between checks. Reinspect after changes.
+
+Presentation and export
+-----------------------
+
+Counts and per-set Why explanations come from actual analyser evidence. Clone
+lineage and ROM inheritance are separate. BIOS/device requirements, missing or
+contradictory content, insufficient hashes, CHD uncertainty and NO_DUMP/BAD_DUMP
+preservation limitations remain visible. Recorded checksum declarations and
+observed container contents are shown separately; they are not paired using
+filename guesses. Duplicate machine metadata is explicitly marked ambiguous.
+
+Search uses set names/descriptions; status filters and pages of 50 sets limit
+paint cost. A Why panel shows at most 200 requirements/checksum rows and offers
+the full selected-set receipt. Good describes verified storage within the
+inspection scope. It never establishes machine runnability.
+Unrecognised collection containers have Unknown rows and explicit explanations
+that catalogue requirements are unavailable. They are grouped by name; full
+JSON retains every observed container. Unknown counts also include unowned
+catalogue machines and are not acquisition recommendations.
+
+Full and selected-set JSON serialization/export have a 32 MiB bound. If a full
+receipt exceeds it, summary and selected-set export remain available. There is
+no file-save export or report persistence in V1. Copying does not write any
+collection, DAT, database or journal.
+
+Validation scope
+----------------
+
+Synthetic tests cover fresh ZIP/loose hashes and source-byte preservation,
+empty/incomplete/corrupt scans, budgets, symlinks, source replacement,
+cancelled workers, missing BIOS/device support, split/merged layouts, checksum
+contradictions, misleading CHD names, malformed/non-arcade catalogues, stale
+reports, cross-ID results, duplicate metadata and bounded exports.
+
+Shared-shell egui tests use actual painted/clipped text, pointer/wheel events
+and the real worker/completion path. Both Classic and Simple are exercised at
+1024x600 at 100% and 160%, including Inspect, Back and Cancel. The deterministic
+Cancel UI fixture invokes the real worker after the button cancels its queued
+handle; separate worker/adapter tests cover cancellation during real inspection.
+No production collection or database is used.
+
+Native portal dialogs, OS clipboard interoperability, screen-reader behavior,
+non-Unix execution and full-production-catalogue latency are not established by
+headless egui smoke tests. Parser/model memory scales with the bounded catalogue;
+large catalogues and repeated backend dependency evidence can still be costly.
+These are stated limitations, not verified functionality.

@@ -29,6 +29,9 @@ use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
 
+use super::media_mapping::{
+    RommMediaMapping, RommMediaMappingError, ValidatedRommMediaMapping, validate_romm_media_mapping,
+};
 use crate::identity_source::net_policy::{
     ApprovedEndpoint, EndpointRefusal, HostResolver, validate_endpoint,
 };
@@ -233,6 +236,11 @@ pub struct RommSourceConfig {
     /// The address a person entered, before validation.
     pub url: String,
     pub mappings: Vec<PathMapping>,
+    /// Optional explicit mapping for provider-served media references. This
+    /// is separate from ROM/library mappings because it targets a different
+    /// provider namespace and has filesystem/symlink validation.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub media_mapping: Option<RommMediaMapping>,
     /// Which shape of path this instance reports.
     ///
     /// Declared, never inferred per path. Absent in a configuration written
@@ -252,7 +260,12 @@ pub struct RommSourceConfig {
 pub struct ValidatedRommSource {
     endpoint: ApprovedEndpoint,
     mappings: PathMappings,
+    media_mapping: Option<ValidatedRommMediaMapping>,
     token: RommToken,
+    /// Set only when the request goes to a session-only address (a local
+    /// Docker endpoint). Cache and index keys then still name the *configured*
+    /// server, so a container address never becomes persistent identity.
+    cache_identity: Option<String>,
 }
 
 /// Why a configuration cannot be used.
@@ -261,6 +274,7 @@ pub struct ValidatedRommSource {
 pub enum ConfigRefusal {
     Endpoint(EndpointRefusal),
     Mapping(MappingRefusal),
+    MediaMapping(RommMediaMappingError),
     Token(TokenRefusal),
     Disabled,
 }
@@ -270,6 +284,7 @@ impl ConfigRefusal {
         match self {
             Self::Endpoint(refusal) => refusal.detail(),
             Self::Mapping(refusal) => refusal.detail(),
+            Self::MediaMapping(refusal) => refusal.to_string(),
             Self::Token(refusal) => refusal.detail(),
             Self::Disabled => "the RomM source is disabled".to_string(),
         }
@@ -279,6 +294,7 @@ impl ConfigRefusal {
         match self {
             Self::Endpoint(refusal) => refusal.code(),
             Self::Mapping(refusal) => refusal.code(),
+            Self::MediaMapping(_) => "media_mapping",
             Self::Token(_) => "token",
             Self::Disabled => "disabled",
         }
@@ -300,11 +316,28 @@ impl ValidatedRommSource {
         let mappings =
             PathMappings::validate(&config.mappings, trusted_roots, config.provider_path_kind)
                 .map_err(ConfigRefusal::Mapping)?;
+        // Media reuse is optional. A root can disappear after configuration or
+        // become unsafe independently of the RomM endpoint; that must disable
+        // only local reuse and leave the established HTTP/cache path usable.
+        let media_mapping = config
+            .media_mapping
+            .as_ref()
+            .and_then(|mapping| validate_romm_media_mapping(mapping).ok());
         Ok(Self {
             endpoint,
             mappings,
+            media_mapping,
             token: token.clone(),
+            cache_identity: None,
         })
+    }
+
+    /// Keeps cache and index keys on the configured server's identity while the
+    /// request itself goes to a different, session-only address.
+    #[must_use]
+    pub fn with_cache_identity(mut self, configured_origin: String) -> Self {
+        self.cache_identity = Some(configured_origin);
+        self
     }
 
     pub fn endpoint(&self) -> &ApprovedEndpoint {
@@ -315,6 +348,10 @@ impl ValidatedRommSource {
         &self.mappings
     }
 
+    pub fn media_mapping(&self) -> Option<&ValidatedRommMediaMapping> {
+        self.media_mapping.as_ref()
+    }
+
     pub fn token(&self) -> &RommToken {
         &self.token
     }
@@ -322,6 +359,8 @@ impl ValidatedRommSource {
     /// The stable, non-secret identifier for this instance, used to keep two
     /// servers' cached records apart. The approved origin - never the token.
     pub fn server_id(&self) -> &str {
-        self.endpoint.origin()
+        self.cache_identity
+            .as_deref()
+            .unwrap_or_else(|| self.endpoint.origin())
     }
 }

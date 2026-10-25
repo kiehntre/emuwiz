@@ -1,0 +1,3266 @@
+//! Central discovery orchestration: walks a source folder, classifies
+//! every path's container and content, and produces one [`GameDiscovery`]
+//! per item - accepted or skipped, always with an explanation.
+//!
+//! Everything in this module is read-only. Discovery never renames,
+//! moves, deletes, or extracts anything; scanning a source can be run as
+//! often as wanted with no side effects on the files it looks at.
+
+use super::container::{
+    ArchiveFormat, ContainerKind, FolderRole, detect_container, extension_lowercase,
+    find_slave_files, list_archive_entry_names,
+};
+use super::content_registry::{ContentKind, content_kind_for_extension};
+use super::cue_bin::resolve_cue;
+use crate::ArchiveIdentity;
+use crate::amiga_disk::{self, AmigaDisk, structural_amiga_floppy_observation};
+use crate::identity_source::whdload::{
+    SlaveArtifact, WhdloadDatContext, inspect_whdload_slave_file,
+};
+use crate::platform_evidence_fusion::evidence_lineage::EvidenceObservation;
+use crate::psp_pbp_evidence::{PBP_HEADER_BYTES, parse_pbp_header, validate_pbp_offsets};
+use sha2::{Digest, Sha256};
+use std::collections::{BTreeSet, HashMap};
+use std::path::{Path, PathBuf};
+
+// Invalidate cached pre-correction WHDLoad structural observations on the next
+// explicitly requested scan. This does not schedule scanning.
+pub const INGESTION_PARSER_VERSION: &str = "ingestion-parser-v2";
+
+/// A defensive recursion bound. Reaching it is an explicit discovery error;
+/// a successful report always represents a complete walk.
+pub const MAX_DISCOVERY_DEPTH: usize = 128;
+
+/// Extensions of files real collections are full of that are never game
+/// content in their own right - box art, manuals, metadata, saves, and
+/// filesystem/emulator-frontend housekeeping files sitting next to the
+/// actual ROMs/discs/images. Live testing against a ~75,000-file collection
+/// showed these outnumbering real content by a wide margin, so counting
+/// every one of them as a "[`SkipReason::UnsupportedExtension`]" item
+/// needing attention produced a "Needs attention: 167,499 unknown items"
+/// figure that was really almost entirely box art and readmes - true but
+/// useless, since there's nothing a person can or should do about a JPEG.
+/// Filtered out at walk time (never becoming a [`GameDiscovery`] item at
+/// all) rather than merely re-labelled, so they don't inflate `DiscoveryStats`
+/// either. This list is deliberately conservative - only extensions with no
+/// plausible game-content meaning anywhere in `content_registry` - so it can
+/// never hide a real game file.
+const KNOWN_NON_GAME_EXTENSIONS: &[&str] = &[
+    // Images (box art, screenshots, fanart).
+    "jpg", "jpeg", "png", "gif", "bmp", "webp", "tga", "ico",
+    // Manuals. Real collections carry thousands of PDF manuals beside the
+    // games; no content registry entry uses `pdf`.
+    "pdf",
+    // Text/metadata sidecars. Note: "md" is deliberately excluded here - it
+    // is a registered Sega Genesis/Mega Drive ROM extension in
+    // `content_registry`, not a safe sidecar to filter (a real-world
+    // collision the end-to-end extension-coverage test caught).
+    "txt", "nfo", "xml", "json", "yml", "yaml", "ini", "cfg", "conf", "log",
+    // Frontend/database housekeeping.
+    "db", "url", "lnk", "ds_store",
+    // Video/audio extras (trailers, theme music) sometimes bundled alongside a game.
+    "mp4", "webm", "mp3", "ogg",
+];
+
+/// Whether an extension is a known ancillary/supporting-media type rather
+/// than game content. Callers which build a *games-only* view should use this
+/// same conservative classification instead of treating cover art or manuals
+/// as unidentified games.
+pub fn is_known_non_game_extension(extension: &str) -> bool {
+    KNOWN_NON_GAME_EXTENSIONS.contains(&extension)
+}
+
+/// Why a discovered item was not accepted as a confident library
+/// candidate. Every variant is a *reason*, not a dead end - each carries
+/// (via [`SkipReason::suggested_action`]) what a person could do about it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum SkipReason {
+    /// No container/content registry recognises this extension at all.
+    UnsupportedExtension,
+    /// The content category was recognised (it looks like a ROM, disc
+    /// image, etc.) but platform/identity detection could not confirm
+    /// what game - or even confidently what platform - it is.
+    RecognizedContentNoIdentityMatch,
+    /// A lone `.bin` (or similar) file with no `.cue` sheet naming it, or
+    /// a `.cue` sheet whose referenced file(s) could not be found.
+    MissingPairedFile,
+    /// The extension is inherently shared between formats/platforms and
+    /// nothing available corroborates which one this is.
+    AmbiguousPlatform,
+    /// The path matched a recognised extension/container but its content
+    /// failed to parse as that format (e.g. an `.hdf` that is not a valid
+    /// RDB image).
+    InvalidContent(String),
+    /// No supported media interpretation, or an explicit reader/size limit.
+    /// This is not evidence of damage or an invalid dump.
+    UnsupportedContent(String),
+    /// Host I/O, staging, cancellation or unstable input prevented inspection.
+    InspectionUnavailable(String),
+}
+
+impl SkipReason {
+    pub fn label(&self) -> &'static str {
+        match self {
+            Self::UnsupportedExtension => "Unsupported file type",
+            Self::RecognizedContentNoIdentityMatch => "No identity match found",
+            Self::MissingPairedFile => "Missing paired file",
+            Self::AmbiguousPlatform => "Ambiguous platform",
+            Self::InvalidContent(_) => "Could not be read as expected",
+            Self::UnsupportedContent(_) => "Unknown or unsupported media",
+            Self::InspectionUnavailable(_) => "Inspection unavailable",
+        }
+    }
+
+    pub fn suggested_action(&self) -> &'static str {
+        match self {
+            Self::UnsupportedExtension => {
+                "EmuWiz doesn't recognise this file type yet - it was left alone."
+            }
+            Self::RecognizedContentNoIdentityMatch => {
+                "The content looks recognisable, but nothing matched it to a known game. \
+                 It can still be added manually."
+            }
+            Self::MissingPairedFile => {
+                "A disc image needs its matching .cue/.bin pair - check that both files \
+                 are present together."
+            }
+            Self::AmbiguousPlatform => {
+                "This file's extension is shared by more than one platform, and nothing \
+                 nearby confirms which one."
+            }
+            Self::InvalidContent(_) => {
+                "The file has a recognised extension but could not be read as that format - \
+                 it may be corrupt, partial, or a false match."
+            }
+            Self::UnsupportedContent(_) => {
+                "Keep the original file. This media format or inspection limit is unsupported; \
+                 no corruption or game identity is established."
+            }
+            Self::InspectionUnavailable(_) => {
+                "Retry with a stable, readable regular file and available temporary storage. \
+                 This inspection failure does not establish damaged media."
+            }
+        }
+    }
+}
+
+/// How confidently a [`GameDiscovery`] can be treated as ready for the
+/// library.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ValidationState {
+    /// Content and identity both resolved.
+    Accepted,
+    /// Content resolved but identity/platform did not - still visible,
+    /// not silently discarded (see [`SkipReason::RecognizedContentNoIdentityMatch`]).
+    Skipped,
+}
+
+/// One discovered path: how it is stored, what it appears to be, and -
+/// whether accepted or skipped - always a plain-language explanation of
+/// why. Designed to be rendered directly by a future UI: every field a
+/// person would ask about ("what is this", "why wasn't it picked up",
+/// "what should I do") has a home here.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct GameDiscovery {
+    pub path: PathBuf,
+    pub container: ContainerKind,
+    pub content: Option<ContentKind>,
+    /// The best platform guess available, from the existing identity
+    /// system - never recomputed here.
+    pub platform_hint: Option<String>,
+    /// Display/normalised-name identity evidence, reused as-is from
+    /// [`crate::ArchiveIdentity`].
+    pub identity_candidate: Option<IdentitySummary>,
+    pub validation_state: ValidationState,
+    /// Always populated - a short, plain-language sentence explaining
+    /// what this item is (if accepted) or why it wasn't (if skipped).
+    pub explanation: String,
+    pub skip_reason: Option<SkipReason>,
+}
+
+/// A trimmed, UI-friendly projection of [`crate::ArchiveIdentity`] -
+/// display name and detected platform only. Discovery never invents its
+/// own identity fields; this is a read of the existing system's output.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct IdentitySummary {
+    pub display_name: String,
+    pub platform: Option<String>,
+}
+
+impl From<&ArchiveIdentity> for IdentitySummary {
+    fn from(identity: &ArchiveIdentity) -> Self {
+        Self {
+            display_name: identity.display_name.clone(),
+            platform: identity.platform.clone(),
+        }
+    }
+}
+
+/// Per-content-category counts for one source, for "here is what your
+/// collection actually contains" reporting. Counted by recognised
+/// container/content category, independent of identity confidence - see
+/// the module docs on why an item can be counted here and still appear
+/// with a [`SkipReason`].
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct DiscoveryStats {
+    pub archives: usize,
+    pub loose_roms: usize,
+    pub disc_images: usize,
+    pub amiga_images: usize,
+    pub computer_disks: usize,
+    /// Machine-state snapshots (`.z80`, `.sna`, `.szx`, ...).
+    pub snapshots: usize,
+    /// Loose executables (`.exe`) with a structurally valid DOS MZ header.
+    /// Counted as a distinct category because a bare executable is
+    /// recognised structurally but is not, on its own, an identifiable
+    /// game.
+    pub executables: usize,
+    pub game_folders: usize,
+    /// Preservation-only gameplay recordings (RZX) that were accepted and so
+    /// become Library entries. Unlike the other categories this counts kept
+    /// items only, so "recordings" never implies a refused file was preserved;
+    /// refused, malformed and unsupported RZX files are counted in
+    /// [`SkipReasonCounts`] instead. Never counted as games.
+    pub recordings: usize,
+    pub unknown: usize,
+}
+
+impl DiscoveryStats {
+    /// Folds another source's counts into this one - used to combine
+    /// per-source-folder reports into one run-wide total.
+    pub fn merge(&mut self, other: &DiscoveryStats) {
+        self.archives += other.archives;
+        self.loose_roms += other.loose_roms;
+        self.disc_images += other.disc_images;
+        self.amiga_images += other.amiga_images;
+        self.computer_disks += other.computer_disks;
+        self.snapshots += other.snapshots;
+        self.executables += other.executables;
+        self.game_folders += other.game_folders;
+        self.recordings += other.recordings;
+        self.unknown += other.unknown;
+    }
+
+    fn record(&mut self, discovery: &GameDiscovery) {
+        if matches!(discovery.container, ContainerKind::Archive(_)) {
+            self.archives += 1;
+            return;
+        }
+        match discovery.content {
+            Some(ContentKind::RomCartridge) => self.loose_roms += 1,
+            Some(ContentKind::DiscImage) => self.disc_images += 1,
+            Some(ContentKind::AmigaImage) => self.amiga_images += 1,
+            Some(ContentKind::ComputerDisk) | Some(ContentKind::TapeImage) => {
+                self.computer_disks += 1
+            }
+            Some(ContentKind::MachineSnapshot) => self.snapshots += 1,
+            Some(ContentKind::Executable) => self.executables += 1,
+            Some(ContentKind::Archive) => self.archives += 1,
+            Some(ContentKind::WhdloadInstall) | Some(ContentKind::ExtractedGameFolder) => {
+                self.game_folders += 1
+            }
+            Some(ContentKind::GameplayRecording) => {
+                if discovery.validation_state == ValidationState::Accepted {
+                    self.recordings += 1;
+                }
+            }
+            None => self.unknown += 1,
+        }
+    }
+}
+
+/// Per-[`SkipReason`] counts for one source, always exact - the "needs
+/// attention" breakdown a person actually wants ("120 unknown items", "15
+/// missing cue/bin pairs"), computed alongside [`DiscoveryStats`] rather
+/// than requiring a caller to filter/count [`SourceDiscoveryReport::items`]
+/// itself (which is only ever a bounded sample once aggregated across a
+/// multi-folder run - see `database::ScanPersistSummary`).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct SkipReasonCounts {
+    pub unsupported_extension: usize,
+    pub no_identity_match: usize,
+    pub missing_paired_file: usize,
+    pub ambiguous_platform: usize,
+    pub invalid_content: usize,
+    pub unsupported_content: usize,
+    pub inspection_unavailable: usize,
+}
+
+impl SkipReasonCounts {
+    pub fn merge(&mut self, other: &SkipReasonCounts) {
+        self.unsupported_extension += other.unsupported_extension;
+        self.no_identity_match += other.no_identity_match;
+        self.missing_paired_file += other.missing_paired_file;
+        self.ambiguous_platform += other.ambiguous_platform;
+        self.invalid_content += other.invalid_content;
+        self.unsupported_content += other.unsupported_content;
+        self.inspection_unavailable += other.inspection_unavailable;
+    }
+
+    pub fn total(&self) -> usize {
+        self.unsupported_extension
+            + self.no_identity_match
+            + self.missing_paired_file
+            + self.ambiguous_platform
+            + self.invalid_content
+            + self.unsupported_content
+            + self.inspection_unavailable
+    }
+
+    fn record(&mut self, reason: &SkipReason) {
+        match reason {
+            SkipReason::UnsupportedExtension => self.unsupported_extension += 1,
+            SkipReason::RecognizedContentNoIdentityMatch => self.no_identity_match += 1,
+            SkipReason::MissingPairedFile => self.missing_paired_file += 1,
+            SkipReason::AmbiguousPlatform => self.ambiguous_platform += 1,
+            SkipReason::InvalidContent(_) => self.invalid_content += 1,
+            SkipReason::UnsupportedContent(_) => self.unsupported_content += 1,
+            SkipReason::InspectionUnavailable(_) => self.inspection_unavailable += 1,
+        }
+    }
+}
+
+/// One structural lineage observation produced during discovery, paired
+/// with the file it describes.
+///
+/// This is how content-derived media evidence from discovery enters the
+/// existing identity pipeline
+/// ([`crate::platform_evidence_fusion::evidence_lineage`]) without discovery
+/// itself resolving identity. Currently only
+/// [`structural_amiga_floppy_observation`] for raw ADF or decompressed ADZ:
+/// `Strong` when OFS/FFS validates, `Weak` for plausible floppy media. Both
+/// are platform candidates, never exact releases.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DiscoveredStructuralEvidence {
+    pub path: PathBuf,
+    pub observation: EvidenceObservation,
+}
+
+/// The full, read-only result of discovering one source folder.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct SourceDiscoveryReport {
+    pub items: Vec<GameDiscovery>,
+    pub stats: DiscoveryStats,
+    pub skip_reasons: SkipReasonCounts,
+    /// Structural lineage evidence gathered while classifying items - the
+    /// `.adf` content-inspection path's own
+    /// [`structural_amiga_floppy_observation`] output, one per validated
+    /// or plausible Amiga floppy. Empty when no such file was seen.
+    pub structural_evidence: Vec<DiscoveredStructuralEvidence>,
+    pub archive_evidence: Vec<ArchiveListingEvidence>,
+    pub reuse: DiscoveryReuseStats,
+    /// Stable semantic identity of `items`, used by the database to avoid
+    /// rewriting an identical discovery-detail projection.
+    pub detail_fingerprint: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ArchiveListingEvidence {
+    pub path: PathBuf,
+    pub listing_hash: String,
+    pub member_count: usize,
+    pub selected_member: Option<String>,
+    pub listing_available: bool,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct DiscoveryReuseStats {
+    pub archive_candidates: usize,
+    pub archives_reused: usize,
+    pub archives_reopened: usize,
+    pub member_listings_reused: usize,
+    pub member_listings_regenerated: usize,
+    pub cache_hits: usize,
+    pub cache_misses: usize,
+    pub fallback_inspections: usize,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum DiscoveryError {
+    Io(String),
+    NotADirectory,
+    DepthLimitReached { path: PathBuf, max_depth: usize },
+}
+
+#[cfg(test)]
+mod walk_tests {
+    use super::*;
+    use std::fs;
+
+    #[test]
+    fn source_walk_visits_more_than_the_old_entry_cap_without_retaining_paths() {
+        const ENTRY_COUNT: usize = 250_001;
+        let temp = tempfile::tempdir().unwrap();
+        for index in 0..ENTRY_COUNT {
+            fs::File::create(temp.path().join(format!("game-{index:06}.bin"))).unwrap();
+        }
+
+        let mut visited = 0;
+        walk_source(temp.path(), |_| {
+            visited += 1;
+            Ok(())
+        })
+        .unwrap();
+
+        assert_eq!(visited, ENTRY_COUNT);
+    }
+
+    #[test]
+    fn enumeration_error_and_depth_limit_are_errors_not_successful_partial_walks() {
+        let temp = tempfile::tempdir().unwrap();
+        let file = temp.path().join("not-a-directory");
+        fs::write(&file, b"x").unwrap();
+        assert!(matches!(
+            walk_source(&file, |_| Ok(())),
+            Err(DiscoveryError::Io(_))
+        ));
+
+        let mut root = temp.path().to_path_buf();
+        for index in 0..=MAX_DISCOVERY_DEPTH {
+            root.push(format!("d{index}"));
+            fs::create_dir(&root).unwrap();
+        }
+        assert!(matches!(
+            discover_source(temp.path()),
+            Err(DiscoveryError::DepthLimitReached { .. })
+        ));
+    }
+}
+
+/// Discover every game-content item under `root`, bounded and read-only.
+/// `root` is also used as the source root for identity/platform detection
+/// (folder-alias matching never looks above it), matching the existing
+/// scanner's behaviour.
+pub fn discover_source(root: &Path) -> Result<SourceDiscoveryReport, DiscoveryError> {
+    discover_source_with_fingerprints(root, &[])
+}
+
+pub fn discover_source_with_fingerprints(
+    root: &Path,
+    fingerprints: &[(i64, crate::ScanFingerprint)],
+) -> Result<SourceDiscoveryReport, DiscoveryError> {
+    discover_with_annotations(root, fingerprints, &mut |_| String::new())
+}
+
+pub(crate) fn discover_with_annotations(
+    root: &Path,
+    fingerprints: &[(i64, crate::ScanFingerprint)],
+    annotate: &mut dyn FnMut(&[SlaveArtifact]) -> String,
+) -> Result<SourceDiscoveryReport, DiscoveryError> {
+    let cache: HashMap<&Path, &crate::ScanFingerprint> = fingerprints
+        .iter()
+        .filter_map(|(_, fingerprint)| {
+            fingerprint
+                .ingestion
+                .as_ref()
+                .map(|_| (fingerprint.relative_path.as_path(), fingerprint))
+        })
+        .collect();
+    let absolute_cache: HashMap<PathBuf, &crate::ScanFingerprint> = cache
+        .into_iter()
+        .map(|(relative, fingerprint)| (root.join(relative), fingerprint))
+        .collect();
+    let cache: HashMap<&Path, &crate::ScanFingerprint> = absolute_cache
+        .iter()
+        .map(|(path, fingerprint)| (path.as_path(), *fingerprint))
+        .collect();
+    discover_source_inner(root, annotate, &cache)
+}
+
+/// [`discover_source`] with an optional generic DAT context for reconciling
+/// any discovered WHDLoad install's verified slave evidence against a
+/// catalogue's own hash index (see
+/// [`crate::identity_source::whdload::reconcile`]). When `whdload_dat` is
+/// `None`, WHDLoad installs still gain
+/// structural Amiga evidence, just no exact catalogue identity.
+pub fn discover_source_with_whdload_dat(
+    root: &Path,
+    whdload_dat: Option<&WhdloadDatContext<'_>>,
+) -> Result<SourceDiscoveryReport, DiscoveryError> {
+    let contexts: Vec<_> = whdload_dat.into_iter().copied().collect();
+    discover_source_inner(
+        root,
+        &mut |slaves| super::whdload_dat::explain(slaves, &contexts),
+        &HashMap::new(),
+    )
+}
+
+fn discover_source_inner(
+    root: &Path,
+    annotate: &mut dyn FnMut(&[SlaveArtifact]) -> String,
+    cache: &HashMap<&Path, &crate::ScanFingerprint>,
+) -> Result<SourceDiscoveryReport, DiscoveryError> {
+    if !root.is_dir() {
+        return Err(DiscoveryError::NotADirectory);
+    }
+
+    // CUE sheets are resolved first so their referenced `.bin`s are known
+    // and excluded from independent classification - see module docs. Walk
+    // twice instead of retaining a second Vec of every path in the source.
+    let mut consumed: BTreeSet<PathBuf> = BTreeSet::new();
+    let mut items = Vec::new();
+    let mut structural_evidence: Vec<DiscoveredStructuralEvidence> = Vec::new();
+    let mut archive_evidence = Vec::new();
+    let mut reuse = DiscoveryReuseStats::default();
+
+    walk_source(root, |path| {
+        if extension_lowercase(path).as_deref() == Some("cue") {
+            items.push(discover_cue(path, &mut consumed));
+        }
+        Ok(())
+    })?;
+
+    walk_source(root, |path| {
+        if !consumed.contains(path) && extension_lowercase(path).as_deref() != Some("cue") {
+            items.push(discover_file(
+                path,
+                root,
+                annotate,
+                &mut structural_evidence,
+                cache,
+                &mut archive_evidence,
+                &mut reuse,
+            ));
+        }
+        Ok(())
+    })?;
+
+    let mut stats = DiscoveryStats::default();
+    let mut skip_reasons = SkipReasonCounts::default();
+    for item in &items {
+        stats.record(item);
+        if let Some(reason) = &item.skip_reason {
+            skip_reasons.record(reason);
+        }
+    }
+    let detail_fingerprint = discovery_detail_fingerprint(&items);
+    Ok(SourceDiscoveryReport {
+        items,
+        stats,
+        skip_reasons,
+        structural_evidence,
+        archive_evidence,
+        reuse,
+        detail_fingerprint,
+    })
+}
+
+fn discovery_detail_fingerprint(items: &[GameDiscovery]) -> String {
+    let mut hasher = Sha256::new();
+    for item in items {
+        hasher.update(item.path.to_string_lossy().as_bytes());
+        hasher.update([0]);
+        hasher.update(
+            format!(
+                "{:?}|{:?}|{:?}|{:?}|{:?}|{:?}|{:?}",
+                item.container,
+                item.content,
+                item.platform_hint,
+                item.validation_state,
+                item.skip_reason,
+                item.explanation,
+                item.identity_candidate
+            )
+            .as_bytes(),
+        );
+        hasher.update([0xff]);
+    }
+    hasher
+        .finalize()
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect()
+}
+
+/// Iterative, symlink-refusing walk visiting every regular file and every
+/// folder that resolves to a leaf [`FolderRole`] (WHDLoad install or
+/// extracted game folder). A walk error fails the whole discovery; callers
+/// never receive partial results as a successful report. Read-only: only
+/// ever `read_dir`/`symlink_metadata`.
+fn walk_source(
+    root: &Path,
+    mut visit: impl FnMut(&Path) -> Result<(), DiscoveryError>,
+) -> Result<(), DiscoveryError> {
+    if crate::dat::rename_apply::is_private_recovery_root(root) {
+        return Err(DiscoveryError::Io(
+            "Recovery holding data is not a game discovery root".into(),
+        ));
+    }
+    let mut stack = vec![(root.to_path_buf(), 0_usize)];
+    while let Some((dir, depth)) = stack.pop() {
+        if depth > MAX_DISCOVERY_DEPTH {
+            return Err(DiscoveryError::DepthLimitReached {
+                path: dir,
+                max_depth: MAX_DISCOVERY_DEPTH,
+            });
+        }
+        let entries = std::fs::read_dir(&dir)
+            .map_err(|error| DiscoveryError::Io(format!("{}: {error}", dir.display())))?;
+        for entry in entries {
+            let entry =
+                entry.map_err(|error| DiscoveryError::Io(format!("{}: {error}", dir.display())))?;
+            let path = entry.path();
+            if crate::dat::rename_apply::is_private_recovery_path(&path) {
+                continue;
+            }
+            let metadata = std::fs::symlink_metadata(&path)
+                .map_err(|error| DiscoveryError::Io(format!("{}: {error}", path.display())))?;
+            if metadata.file_type().is_symlink() {
+                continue; // never follow symlinks during discovery
+            }
+            if metadata.is_dir() {
+                match super::container::detect_container(&path, true) {
+                    ContainerKind::Folder(FolderRole::Plain) => {
+                        stack.push((path, depth + 1));
+                    }
+                    ContainerKind::Folder(_) => visit(&path)?,
+                    _ => unreachable!("detect_container(_, true) always returns Folder"),
+                }
+            } else if metadata.is_file() {
+                let is_known_non_game = extension_lowercase(&path)
+                    .is_some_and(|extension| is_known_non_game_extension(&extension));
+                if !is_known_non_game {
+                    visit(&path)?;
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
+fn discover_cue(cue_path: &Path, consumed: &mut BTreeSet<PathBuf>) -> GameDiscovery {
+    match resolve_cue(cue_path) {
+        Ok(sheet) => {
+            let missing: Vec<&PathBuf> = sheet
+                .referenced_paths
+                .iter()
+                .filter(|referenced| !referenced.is_file())
+                .collect();
+            if !missing.is_empty() {
+                return skipped(
+                    cue_path.to_path_buf(),
+                    ContainerKind::DirectFile,
+                    Some(ContentKind::DiscImage),
+                    SkipReason::MissingPairedFile,
+                    format!(
+                        "This CUE sheet references {} file(s) that could not be found next to it.",
+                        missing.len()
+                    ),
+                );
+            }
+            for referenced in &sheet.referenced_paths {
+                consumed.insert(referenced.clone());
+            }
+            accepted(
+                cue_path.to_path_buf(),
+                ContainerKind::DirectFile,
+                ContentKind::DiscImage,
+                identity_for(cue_path, cue_path.parent().unwrap_or(cue_path)),
+                format!(
+                    "Disc image ({} file(s) referenced by this CUE sheet).",
+                    sheet.referenced_paths.len()
+                ),
+            )
+        }
+        Err(_) => skipped(
+            cue_path.to_path_buf(),
+            ContainerKind::DirectFile,
+            Some(ContentKind::DiscImage),
+            SkipReason::MissingPairedFile,
+            "This CUE sheet could not be read or names no data file.".to_string(),
+        ),
+    }
+}
+
+fn discover_file(
+    path: &Path,
+    source_root: &Path,
+    annotate: &mut dyn FnMut(&[SlaveArtifact]) -> String,
+    structural_evidence: &mut Vec<DiscoveredStructuralEvidence>,
+    cache: &HashMap<&Path, &crate::ScanFingerprint>,
+    archive_evidence: &mut Vec<ArchiveListingEvidence>,
+    reuse: &mut DiscoveryReuseStats,
+) -> GameDiscovery {
+    let container = detect_container(path, path.is_dir());
+    match &container {
+        ContainerKind::Folder(FolderRole::WhdloadInstall) => {
+            discover_whdload_folder(path, annotate)
+        }
+        ContainerKind::Folder(FolderRole::ExtractedGame) => discover_extracted_folder(path),
+        ContainerKind::Folder(FolderRole::Plain) => unreachable!("plain folders are recursed"),
+        ContainerKind::Archive(format) => {
+            discover_archive(path, *format, source_root, cache, archive_evidence, reuse)
+        }
+        ContainerKind::DirectFile => {
+            discover_direct_file(path, source_root, structural_evidence, annotate)
+        }
+    }
+}
+
+/// A discovered WHDLoad install: every readable `.slave` is parsed and
+/// whole-file hashed once (the existing bounded
+/// [`inspect_whdload_slave_file`]), then passed to the supplied catalogue
+/// annotation callback (which uses the existing WHDLoad reconciler). A structurally valid slave always
+/// yields strong structural Amiga evidence - so the platform hint is
+/// `Amiga` from the slave's own structure, never from the folder name; an
+/// exact whole-`.slave` SHA-1 hit in the catalogue additionally names the
+/// release. The folder is refused only when its first `.slave` cannot be
+/// read as a valid WHDLoad slave, exactly as before.
+fn discover_whdload_folder(
+    path: &Path,
+    annotate: &mut dyn FnMut(&[SlaveArtifact]) -> String,
+) -> GameDiscovery {
+    let slaves = find_slave_files(path);
+    let Some(first_slave) = slaves.first() else {
+        // classify_folder only returns WhdloadInstall when a `.slave` was
+        // seen; a concurrent change could still make this empty.
+        return skipped(
+            path.to_path_buf(),
+            ContainerKind::Folder(FolderRole::WhdloadInstall),
+            Some(ContentKind::WhdloadInstall),
+            SkipReason::InvalidContent("no readable .slave file remained".to_string()),
+            "This looked like a WHDLoad install but no .slave file could be read.".to_string(),
+        );
+    };
+    let first_artifact = match inspect_whdload_slave_file(first_slave) {
+        Ok(artifact) => artifact,
+        Err(error) => {
+            return skipped(
+                path.to_path_buf(),
+                ContainerKind::Folder(FolderRole::WhdloadInstall),
+                Some(ContentKind::WhdloadInstall),
+                SkipReason::InvalidContent(format!("{error:?}")),
+                "This folder has a .slave file, but it could not be read as a valid WHDLoad \
+                 slave."
+                    .to_string(),
+            );
+        }
+    };
+
+    // Parse the remaining slaves best-effort: a malformed extra slave never
+    // erases the identity a valid one already established.
+    let mut artifacts = vec![first_artifact];
+    for extra in slaves.iter().skip(1) {
+        if let Ok(artifact) = inspect_whdload_slave_file(extra) {
+            artifacts.push(artifact);
+        }
+    }
+
+    // The platform hint comes from the verified slave structure
+    // (`structural_slave_observation` -> `Amiga`), not the folder name.
+    let mut identity = identity_for(path, path.parent().unwrap_or(path));
+    if let Some(summary) = identity.as_mut() {
+        summary.platform = Some("Amiga".into());
+    }
+
+    let mut explanation = format!(
+        "WHDLoad install ({} readable slave file(s); verified Amiga WHDLoad slave structure).",
+        artifacts.len()
+    );
+    explanation.push_str(&annotate(&artifacts));
+
+    accepted(
+        path.to_path_buf(),
+        ContainerKind::Folder(FolderRole::WhdloadInstall),
+        ContentKind::WhdloadInstall,
+        identity,
+        explanation,
+    )
+}
+
+fn discover_extracted_folder(path: &Path) -> GameDiscovery {
+    accepted(
+        path.to_path_buf(),
+        ContainerKind::Folder(FolderRole::ExtractedGame),
+        ContentKind::ExtractedGameFolder,
+        None,
+        "Game folder (contains recognisable game content directly).".to_string(),
+    )
+}
+
+fn discover_archive(
+    path: &Path,
+    format: ArchiveFormat,
+    source_root: &Path,
+    cache: &HashMap<&Path, &crate::ScanFingerprint>,
+    archive_evidence: &mut Vec<ArchiveListingEvidence>,
+    reuse: &mut DiscoveryReuseStats,
+) -> GameDiscovery {
+    let container = ContainerKind::Archive(format);
+    reuse.archive_candidates += 1;
+    if let Some(cached) = cache.get(path).filter(|fingerprint| {
+        fingerprint_is_fresh(path, fingerprint)
+            && fingerprint.cache_version == crate::SCAN_CACHE_VERSION
+            && fingerprint.scanner_version == crate::SCANNER_VERSION
+            && fingerprint.parser_version == crate::ARCHIVE_PARSER_VERSION
+            && fingerprint.ingestion.as_ref().is_some_and(|evidence| {
+                evidence.version == INGESTION_PARSER_VERSION
+                    // A listing that found no recognised member is re-read:
+                    // the content registry may have learned the member's
+                    // format since (`.pce`, `.3ds`, `.cso`, ...). A listing
+                    // that already selected a member stays valid, so the
+                    // archives that matter are not all re-opened at once.
+                    && !(evidence.listing_available && evidence.selected_member.is_none())
+            })
+    }) {
+        reuse.cache_hits += 1;
+        reuse.archives_reused += 1;
+        reuse.member_listings_reused += 1;
+        let evidence = cached
+            .ingestion
+            .as_ref()
+            .expect("cache hit requires ingestion evidence");
+        let member_count = evidence.member_count;
+        let selected_member = evidence.selected_member.clone();
+        archive_evidence.push(ArchiveListingEvidence {
+            path: path.to_path_buf(),
+            listing_hash: evidence.listing_hash.clone(),
+            member_count,
+            selected_member: selected_member.clone(),
+            listing_available: evidence.listing_available,
+        });
+        return cached_archive_result(
+            path,
+            format,
+            cached,
+            member_count,
+            selected_member.as_deref(),
+            evidence.listing_available,
+        );
+    }
+    reuse.cache_misses += 1;
+    reuse.archives_reopened += 1;
+    reuse.member_listings_regenerated += 1;
+    reuse.fallback_inspections += 1;
+    let Some(entries) = list_archive_entry_names(path, format) else {
+        // Provider absence or a bounded safety refusal is reported without
+        // attempting extraction; see container.rs for the format policy.
+        archive_evidence.push(ArchiveListingEvidence {
+            path: path.to_path_buf(),
+            listing_hash: String::new(),
+            member_count: 0,
+            selected_member: None,
+            listing_available: false,
+        });
+        return GameDiscovery {
+            path: path.to_path_buf(),
+            container,
+            content: None,
+            platform_hint: None,
+            identity_candidate: None,
+            validation_state: ValidationState::Skipped,
+            explanation: format!(
+                "{} - member listing was unavailable or refused safely, so EmuWiz \
+                 preserves the archive without guessing its contents.",
+                format.label()
+            ),
+            skip_reason: None,
+        };
+    };
+    let recognized_member = entries.iter().find(|entry| {
+        Path::new(&entry.0)
+            .extension()
+            .and_then(|extension| extension.to_str())
+            .map(|extension| content_kind_for_extension(&extension.to_ascii_lowercase()).is_some())
+            .unwrap_or(false)
+    });
+    let listing_hash = member_listing_hash(&entries);
+    archive_evidence.push(ArchiveListingEvidence {
+        path: path.to_path_buf(),
+        listing_hash,
+        member_count: entries.len(),
+        selected_member: recognized_member.map(|member| member.0.clone()),
+        listing_available: true,
+    });
+    let Some(member) = recognized_member else {
+        return skipped(
+            path.to_path_buf(),
+            container,
+            None,
+            SkipReason::UnsupportedExtension,
+            format!(
+                "{} - none of its {} entries look like recognised game content.",
+                format.label(),
+                entries.len()
+            ),
+        );
+    };
+    let member_extension = Path::new(&member.0)
+        .extension()
+        .and_then(|extension| extension.to_str())
+        .map(|extension| extension.to_ascii_lowercase())
+        .unwrap_or_default();
+    let content = content_kind_for_extension(&member_extension)
+        .expect("recognized_member only matches when content_kind_for_extension is Some");
+
+    let identity = identity_for(path, source_root);
+    let explanation = format!(
+        "{} containing {} ({}).",
+        format.label(),
+        content.label(),
+        member.0
+    );
+    match &identity {
+        Some(summary) if summary.platform.is_some() => GameDiscovery {
+            path: path.to_path_buf(),
+            container,
+            content: Some(content),
+            platform_hint: summary.platform.clone(),
+            identity_candidate: identity.clone(),
+            validation_state: ValidationState::Accepted,
+            explanation,
+            skip_reason: None,
+        },
+        _ => GameDiscovery {
+            path: path.to_path_buf(),
+            container,
+            content: Some(content),
+            platform_hint: None,
+            identity_candidate: identity,
+            validation_state: ValidationState::Skipped,
+            explanation,
+            skip_reason: Some(SkipReason::RecognizedContentNoIdentityMatch),
+        },
+    }
+}
+
+fn fingerprint_is_fresh(path: &Path, fingerprint: &crate::ScanFingerprint) -> bool {
+    let Ok(metadata) = std::fs::metadata(path) else {
+        return false;
+    };
+    let Some(modified) = metadata
+        .modified()
+        .ok()
+        .and_then(|time| time.duration_since(std::time::UNIX_EPOCH).ok())
+    else {
+        return false;
+    };
+    metadata.len() == fingerprint.size_bytes
+        && modified.as_nanos() as i128 == fingerprint.modified_time_ns
+}
+
+fn member_listing_hash(entries: &[super::container::ArchiveEntryName]) -> String {
+    let mut hasher = Sha256::new();
+    for entry in entries {
+        hasher.update((entry.0.len() as u64).to_le_bytes());
+        hasher.update(entry.0.as_bytes());
+    }
+    hasher
+        .finalize()
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect()
+}
+
+fn cached_archive_result(
+    path: &Path,
+    format: ArchiveFormat,
+    fingerprint: &crate::ScanFingerprint,
+    member_count: usize,
+    selected_member: Option<&str>,
+    listing_available: bool,
+) -> GameDiscovery {
+    let container = ContainerKind::Archive(format);
+    if !listing_available {
+        return GameDiscovery {
+            path: path.to_path_buf(),
+            container,
+            content: None,
+            platform_hint: None,
+            identity_candidate: None,
+            validation_state: ValidationState::Skipped,
+            explanation: format!(
+                "{} - member listing was unavailable or refused safely, so EmuWiz preserves the archive without guessing its contents.",
+                format.label()
+            ),
+            skip_reason: None,
+        };
+    }
+    let Some(member) = selected_member else {
+        return skipped(
+            path.to_path_buf(),
+            container,
+            None,
+            SkipReason::UnsupportedExtension,
+            format!(
+                "{} - none of its {} entries look like recognised game content.",
+                format.label(),
+                member_count
+            ),
+        );
+    };
+    let extension = Path::new(member)
+        .extension()
+        .and_then(|value| value.to_str())
+        .map(|value| value.to_ascii_lowercase())
+        .unwrap_or_default();
+    let Some(content) = content_kind_for_extension(&extension) else {
+        return skipped(
+            path.to_path_buf(),
+            container,
+            None,
+            SkipReason::UnsupportedExtension,
+            format!(
+                "{} - none of its {} entries look like recognised game content.",
+                format.label(),
+                member_count
+            ),
+        );
+    };
+    let identity = Some(IdentitySummary {
+        display_name: fingerprint.display_name.clone(),
+        platform: fingerprint.platform.clone(),
+    });
+    let platform_hint = fingerprint.platform.clone();
+    let explanation = format!(
+        "{} containing {} ({}).",
+        format.label(),
+        content.label(),
+        member
+    );
+    if platform_hint.is_some() {
+        GameDiscovery {
+            path: path.to_path_buf(),
+            container,
+            content: Some(content),
+            platform_hint,
+            identity_candidate: identity,
+            validation_state: ValidationState::Accepted,
+            explanation,
+            skip_reason: None,
+        }
+    } else {
+        GameDiscovery {
+            path: path.to_path_buf(),
+            container,
+            content: Some(content),
+            platform_hint: None,
+            identity_candidate: identity,
+            validation_state: ValidationState::Skipped,
+            explanation,
+            skip_reason: Some(SkipReason::RecognizedContentNoIdentityMatch),
+        }
+    }
+}
+
+fn discover_direct_file(
+    path: &Path,
+    source_root: &Path,
+    structural_evidence: &mut Vec<DiscoveredStructuralEvidence>,
+    annotate: &mut dyn FnMut(&[SlaveArtifact]) -> String,
+) -> GameDiscovery {
+    let Some(extension) = extension_lowercase(path) else {
+        if let Some(discovery) = discover_structural_fallback(path, source_root) {
+            return discovery;
+        }
+        return skipped(
+            path.to_path_buf(),
+            ContainerKind::DirectFile,
+            None,
+            SkipReason::UnsupportedExtension,
+            "This file has no extension EmuWiz can recognise.".to_string(),
+        );
+    };
+
+    if matches!(extension.as_str(), "st" | "stx") {
+        return atari_st::discover(path, source_root);
+    }
+    if extension == "rdb" {
+        return discover_amiga_image(path, source_root);
+    }
+    if extension == "adf" {
+        return discover_amiga_floppy(path, source_root, structural_evidence);
+    }
+    if extension == "adz" {
+        return discover_amiga_adz_floppy(path, source_root, structural_evidence);
+    }
+    if matches!(extension.as_str(), "hdf" | "hdfx") {
+        return discover_ambiguous_disk_image(path, source_root);
+    }
+    if matches!(extension.as_str(), "lha" | "lzh") {
+        return discover_whdload_archive(path, source_root, structural_evidence, annotate);
+    }
+    if matches!(extension.as_str(), "z80" | "sna" | "szx") {
+        return discover_spectrum_snapshot(path, source_root);
+    }
+    if extension == "dsk" {
+        return discover_dsk_image(path, source_root);
+    }
+    if extension == "d88" {
+        return discover_d88_image(path, source_root, structural_evidence);
+    }
+    if extension == "crt" {
+        return discover_crt_cartridge(path, source_root);
+    }
+    if matches!(extension.as_str(), "hdi" | "nhd") {
+        return discover_hard_disk_image(path, source_root, &extension, structural_evidence);
+    }
+    if extension == "d64" {
+        return discover_d64_image(path, source_root);
+    }
+    if extension == "dc42" {
+        return discover_dc42_image(path, source_root);
+    }
+    if extension == "fds" {
+        return discover_fds_media(path, source_root);
+    }
+    if matches!(extension.as_str(), "trd" | "scl") {
+        return discover_trdos_media(path, source_root);
+    }
+    if matches!(extension.as_str(), "pzx" | "rzx" | "nex" | "udi" | "mdr") {
+        return discover_spectrum_native_media(path, source_root);
+    }
+    if matches!(extension.as_str(), "ssd" | "dsd") {
+        return discover_dfs_media(path, source_root);
+    }
+    if matches!(extension.as_str(), "xdf" | "dim") {
+        return discover_x68000_media(path, source_root);
+    }
+    if extension == "xex" {
+        return discover_xex_content(path, source_root);
+    }
+    if matches!(extension.as_str(), "xbe" | "xiso") {
+        return discover_xbox_content(path, source_root, &extension);
+    }
+    if extension == "pbp" {
+        return discover_pbp(path, source_root);
+    }
+    if extension == "pkg" {
+        return discover_ps3_pkg(path, source_root);
+    }
+    if matches!(extension.as_str(), "img" | "ima") {
+        return discover_dos_boot_media(path, source_root);
+    }
+    if extension == "exe" {
+        return discover_dos_executable(path, source_root);
+    }
+    if matches!(extension.as_str(), "ngp" | "ngc") {
+        return discover_ngp_cartridge(path, source_root, &extension);
+    }
+
+    let Some(content) = content_kind_for_extension(&extension) else {
+        // A misleading extension is only a weak filename hint. Let the
+        // bounded registry reuse existing byte-level parsers before treating
+        // it as an unsupported type (including a lone `.bin`).
+        if let Some(discovery) = discover_structural_fallback(path, source_root) {
+            return discovery;
+        }
+        if extension == "bin" {
+            return skipped(
+                path.to_path_buf(),
+                ContainerKind::DirectFile,
+                None,
+                SkipReason::MissingPairedFile,
+                "This .bin file has no matching .cue sheet next to it.".to_string(),
+            );
+        }
+        return skipped(
+            path.to_path_buf(),
+            ContainerKind::DirectFile,
+            None,
+            SkipReason::UnsupportedExtension,
+            format!("EmuWiz doesn't yet recognise the .{extension} extension."),
+        );
+    };
+
+    let identity = identity_for(path, source_root);
+    let explanation = format!("{}.", content.label());
+    match &identity {
+        Some(summary) if summary.platform.is_some() => accepted(
+            path.to_path_buf(),
+            ContainerKind::DirectFile,
+            content,
+            identity,
+            explanation,
+        ),
+        _ => GameDiscovery {
+            path: path.to_path_buf(),
+            container: ContainerKind::DirectFile,
+            content: Some(content),
+            platform_hint: None,
+            identity_candidate: identity,
+            validation_state: ValidationState::Skipped,
+            explanation,
+            skip_reason: Some(SkipReason::RecognizedContentNoIdentityMatch),
+        },
+    }
+}
+
+/// Applies the small, shared structural fallback only after all stronger
+/// extension-specific inspectors above have had their chance. It can identify
+/// a media *format* but never upgrades a filename into a game/DAT identity.
+fn discover_structural_fallback(path: &Path, source_root: &Path) -> Option<GameDiscovery> {
+    let report = super::structural_probe::probe_unknown_file(path);
+    if report.matches.is_empty() {
+        if report.malformed.is_empty() {
+            return None;
+        }
+        return Some(skipped(
+            path.to_path_buf(),
+            ContainerKind::DirectFile,
+            None,
+            SkipReason::InvalidContent(report.malformed.join("; ")),
+            format!(
+                "This file has a recognised media signature, but its bounded structure did not validate: {}.",
+                report.malformed.join("; ")
+            ),
+        ));
+    }
+
+    let formats: Vec<&str> = report.matches.iter().map(|item| item.format).collect();
+    let content = report.matches[0].content;
+    if report.is_ambiguous() {
+        return Some(skipped(
+            path.to_path_buf(),
+            ContainerKind::DirectFile,
+            Some(content),
+            SkipReason::AmbiguousPlatform,
+            format!(
+                "Unknown extension; more than one structural probe matched ({}) - EmuWiz did not choose one.",
+                formats.join(", ")
+            ),
+        ));
+    }
+
+    let probe = &report.matches[0];
+    let mut identity = identity_for(path, source_root);
+    if let (Some(platform), Some(summary)) = (probe.platform_hint, identity.as_mut()) {
+        // A parsed format's own platform-family marker outranks a weak
+        // extension/path hint, but remains structural media evidence only.
+        summary.platform = Some(platform.to_string());
+    }
+    let explanation = format!("Unknown extension; {}. {}.", probe.format, probe.evidence);
+    if probe.platform_hint.is_some() {
+        Some(accepted(
+            path.to_path_buf(),
+            ContainerKind::DirectFile,
+            probe.content,
+            identity,
+            explanation,
+        ))
+    } else {
+        Some(GameDiscovery {
+            path: path.to_path_buf(),
+            container: ContainerKind::DirectFile,
+            content: Some(probe.content),
+            platform_hint: None,
+            identity_candidate: identity,
+            validation_state: ValidationState::Skipped,
+            explanation,
+            skip_reason: Some(SkipReason::RecognizedContentNoIdentityMatch),
+        })
+    }
+}
+
+/// NGP/NGPC extensions identify cartridge content, but never the platform.
+/// The platform hint passed to the existing identity reader is only a bounded
+/// candidate selected from the extension; the parsed header's system flag is
+/// authoritative and may cross-correct it.
+fn discover_ngp_cartridge(path: &Path, source_root: &Path, extension: &str) -> GameDiscovery {
+    let content = ContentKind::RomCartridge;
+    let existing_identity = identity_for(path, source_root);
+    // `ngc` is also a reviewed GameCube folder alias. Preserve that stronger
+    // catalogue context; the bare extension must not hijack it into NGP/NGPC.
+    if existing_identity
+        .as_ref()
+        .and_then(|summary| summary.platform.as_deref())
+        == Some("GameCube")
+    {
+        return accepted(
+            path.to_path_buf(),
+            ContainerKind::DirectFile,
+            content,
+            existing_identity,
+            format!("{}.", content.label()),
+        );
+    }
+    let candidate = if extension == "ngp" {
+        "Neo Geo Pocket"
+    } else {
+        "Neo Geo Pocket Color"
+    };
+    let report = crate::game_identity::inspect_catalogued_game_identity(path, Some(candidate));
+    if report.complete {
+        let mut identity = existing_identity;
+        if let Some(summary) = identity.as_mut() {
+            summary.platform = Some(report.platform.label().to_string());
+        }
+        return accepted(
+            path.to_path_buf(),
+            ContainerKind::DirectFile,
+            content,
+            identity,
+            format!(
+                "{} cartridge header validated (system flag selects the platform).",
+                content.label()
+            ),
+        );
+    }
+    skipped(
+        path.to_path_buf(),
+        ContainerKind::DirectFile,
+        Some(content),
+        SkipReason::InvalidContent(format!(
+            ".{extension} did not pass its NGP/NGPC cartridge-header checks"
+        )),
+        format!(
+            "This .{extension} file was recognised as cartridge content, but its NGP/NGPC header did not validate."
+        ),
+    )
+}
+
+/// `.xex` is claimed by two different machines: an Xbox 360 executable
+/// (`XEX2`/`XEX1` magic) and an Atari 8-bit binary-load file (`$FFFF`
+/// header followed by load segments). The extension therefore settles
+/// nothing; the first bytes do. Each route keeps its own structural check,
+/// and bytes that fit neither are refused with both names so a person can
+/// see what was tried.
+fn discover_xex_content(path: &Path, source_root: &Path) -> GameDiscovery {
+    let head = crate::safe_read::open_bounded_read(path, &crate::safe_read::TrustedRoots::none())
+        .ok()
+        .and_then(|mut file| file.read_exact_at(0, 4, 4));
+    match head.as_deref() {
+        Some(b"XEX2" | b"XEX1") => discover_xbox_content(path, source_root, "xex"),
+        Some([0xFF, 0xFF, ..]) => discover_atari_binary_load(path, source_root),
+        _ => skipped(
+            path.to_path_buf(),
+            ContainerKind::DirectFile,
+            Some(ContentKind::Executable),
+            SkipReason::InvalidContent(
+                ".xex is neither an Xbox 360 XEX2 executable nor an Atari 8-bit binary-load file"
+                    .to_string(),
+            ),
+            "This .xex file starts with neither the Xbox 360 `XEX2` magic nor the Atari 8-bit \
+             `$FFFF` binary-load header, so EmuWiz did not assign it to either platform."
+                .to_string(),
+        ),
+    }
+}
+
+/// Largest Atari 8-bit binary-load file this bounded check reads in full:
+/// the whole 64 KiB address space plus segment headers, with headroom.
+const MAX_ATARI_BINARY_LOAD_BYTES: u64 = 256 * 1024;
+
+/// Validates the Atari DOS binary-load layout: `$FFFF`, then one or more
+/// segments of `start` `end` (little-endian, `end >= start`) followed by
+/// `end - start + 1` bytes. A segment may be preceded by a repeated `$FFFF`.
+/// Every segment must fit inside the file. This proves the *format*, which
+/// is specific to the Atari 8-bit family; it never proves which game.
+fn atari_binary_load_segments(bytes: &[u8]) -> Result<usize, String> {
+    if bytes.len() < 6 || bytes[0] != 0xFF || bytes[1] != 0xFF {
+        return Err("missing $FFFF binary-load header".to_string());
+    }
+    let mut offset = 2;
+    let mut segments = 0usize;
+    while offset < bytes.len() {
+        if bytes.len() - offset >= 2 && bytes[offset] == 0xFF && bytes[offset + 1] == 0xFF {
+            offset += 2;
+            continue;
+        }
+        if bytes.len() - offset < 4 {
+            return Err(format!("truncated segment header at byte {offset}"));
+        }
+        let start = u16::from_le_bytes([bytes[offset], bytes[offset + 1]]) as usize;
+        let end = u16::from_le_bytes([bytes[offset + 2], bytes[offset + 3]]) as usize;
+        if end < start {
+            return Err(format!(
+                "segment at byte {offset} ends (${end:04X}) before it starts (${start:04X})"
+            ));
+        }
+        let length = end - start + 1;
+        offset += 4;
+        if bytes.len() - offset < length {
+            return Err(format!(
+                "segment ${start:04X}-${end:04X} needs {length} bytes but only {} remain",
+                bytes.len() - offset
+            ));
+        }
+        offset += length;
+        segments += 1;
+    }
+    if segments == 0 {
+        return Err("no load segments after the $FFFF header".to_string());
+    }
+    Ok(segments)
+}
+
+fn discover_atari_binary_load(path: &Path, source_root: &Path) -> GameDiscovery {
+    let trusted = crate::safe_read::TrustedRoots::none();
+    let Ok(mut file) = crate::safe_read::open_bounded_read(path, &trusted) else {
+        return skipped(
+            path.to_path_buf(),
+            ContainerKind::DirectFile,
+            Some(ContentKind::Executable),
+            SkipReason::InspectionUnavailable("the file could not be opened for reading".into()),
+            "This .xex file could not be opened safely, so its contents were not inspected."
+                .to_string(),
+        );
+    };
+    let len = file.len();
+    if len > MAX_ATARI_BINARY_LOAD_BYTES {
+        return skipped(
+            path.to_path_buf(),
+            ContainerKind::DirectFile,
+            Some(ContentKind::Executable),
+            SkipReason::UnsupportedContent(format!(
+                "{len} bytes exceeds the {MAX_ATARI_BINARY_LOAD_BYTES}-byte Atari binary-load bound"
+            )),
+            "This .xex starts like an Atari 8-bit binary-load file but is larger than this \
+             bounded check reads, so it was left alone."
+                .to_string(),
+        );
+    }
+    let Some(bytes) = file.read_exact_at(0, len as usize, MAX_ATARI_BINARY_LOAD_BYTES as usize)
+    else {
+        return skipped(
+            path.to_path_buf(),
+            ContainerKind::DirectFile,
+            Some(ContentKind::Executable),
+            SkipReason::InspectionUnavailable("the file changed or could not be read".into()),
+            "This .xex file could not be read completely, so its contents were not inspected."
+                .to_string(),
+        );
+    };
+    match atari_binary_load_segments(&bytes) {
+        Ok(segments) => GameDiscovery {
+            path: path.to_path_buf(),
+            container: ContainerKind::DirectFile,
+            content: Some(ContentKind::Executable),
+            platform_hint: Some("Atari 8-bit".to_string()),
+            identity_candidate: identity_for(path, source_root),
+            validation_state: ValidationState::Accepted,
+            explanation: format!(
+                "Atari 8-bit binary-load executable ({segments} load segment(s) validated). The \
+                 platform comes from the file's own structure; exact game identity still needs a \
+                 catalogue match."
+            ),
+            skip_reason: None,
+        },
+        Err(error) => skipped(
+            path.to_path_buf(),
+            ContainerKind::DirectFile,
+            Some(ContentKind::Executable),
+            SkipReason::InvalidContent(format!(
+                "Atari 8-bit binary-load structure invalid: {error}"
+            )),
+            format!(
+                "This .xex starts with the Atari 8-bit $FFFF header but its load segments do not \
+                 validate: {error}."
+            ),
+        ),
+    }
+}
+
+fn discover_xbox_content(path: &Path, source_root: &Path, extension: &str) -> GameDiscovery {
+    let (platform, content) = match extension {
+        "xbe" => ("Xbox", ContentKind::Executable),
+        "xex" => ("Xbox360", ContentKind::Executable),
+        "xiso" => ("Xbox", ContentKind::DiscImage),
+        _ => unreachable!("called only for registered Xbox extensions"),
+    };
+    let identity = crate::game_identity::inspect_catalogued_game_identity(path, Some(platform));
+    if identity.complete
+        && identity.platform
+            == crate::game_identity::IdentityPlatform::from_catalogue(Some(platform))
+    {
+        return accepted(
+            path.to_path_buf(),
+            ContainerKind::DirectFile,
+            content,
+            identity_for(path, source_root),
+            format!(
+                "{} content validated by its existing bounded identity path.",
+                content.label()
+            ),
+        );
+    }
+    skipped(
+        path.to_path_buf(),
+        ContainerKind::DirectFile,
+        Some(content),
+        SkipReason::InvalidContent(format!(
+            ".{extension} did not pass its Xbox identity checks"
+        )),
+        format!(
+            "This .{extension} file was recognised, but its Xbox structure or identity did not validate."
+        ),
+    )
+}
+
+/// `.pbp` is a shared PSP/PS1 Classics container. Validate its fixed header
+/// and section table before accepting it as recognised content; the extension
+/// and the container do not settle which PlayStation platform it belongs to.
+fn discover_pbp(path: &Path, source_root: &Path) -> GameDiscovery {
+    let safe =
+        match crate::safe_read::open_bounded_read(path, &crate::safe_read::TrustedRoots::none()) {
+            Ok(safe) => safe,
+            Err(error) => {
+                return skipped(
+                    path.to_path_buf(),
+                    ContainerKind::DirectFile,
+                    Some(ContentKind::DiscImage),
+                    SkipReason::InvalidContent(error.detail()),
+                    "This .pbp file could not be opened safely.".to_string(),
+                );
+            }
+        };
+    let file_len = safe.len();
+    let mut file = safe.into_file();
+    let mut prefix = vec![0_u8; file_len.min(crate::game_identity::MAX_BYTES_READ) as usize];
+    if let Err(error) = std::io::Read::read_exact(&mut file, &mut prefix) {
+        return skipped(
+            path.to_path_buf(),
+            ContainerKind::DirectFile,
+            Some(ContentKind::DiscImage),
+            SkipReason::InvalidContent(error.to_string()),
+            "This .pbp file could not be read completely within the bounded inspection."
+                .to_string(),
+        );
+    }
+    let Some(header) = parse_pbp_header(&prefix[..prefix.len().min(PBP_HEADER_BYTES)]) else {
+        return skipped(
+            path.to_path_buf(),
+            ContainerKind::DirectFile,
+            Some(ContentKind::DiscImage),
+            SkipReason::InvalidContent("malformed or truncated PBP fixed header".to_string()),
+            "This .pbp file does not contain a valid PBP fixed header.".to_string(),
+        );
+    };
+    if let Err(error) = validate_pbp_offsets(&header, file_len) {
+        return skipped(
+            path.to_path_buf(),
+            ContainerKind::DirectFile,
+            Some(ContentKind::DiscImage),
+            SkipReason::InvalidContent(error.to_string()),
+            "This .pbp file has an invalid section-offset table.".to_string(),
+        );
+    }
+
+    let identity = identity_for(path, source_root);
+    let platform = identity.as_ref().and_then(|item| item.platform.clone());
+    match platform {
+        Some(platform) => accepted(
+            path.to_path_buf(),
+            ContainerKind::DirectFile,
+            ContentKind::DiscImage,
+            identity,
+            format!("Valid PBP container; platform context identifies {platform}."),
+        ),
+        None => GameDiscovery {
+            path: path.to_path_buf(),
+            container: ContainerKind::DirectFile,
+            content: Some(ContentKind::DiscImage),
+            platform_hint: None,
+            identity_candidate: identity,
+            validation_state: ValidationState::Skipped,
+            explanation: "Valid PBP container, but PSP and PS1 Classics are both possible and no platform corroboration was found.".to_string(),
+            skip_reason: Some(SkipReason::AmbiguousPlatform),
+        },
+    }
+}
+
+fn discover_ps3_pkg(path: &Path, source_root: &Path) -> GameDiscovery {
+    match crate::ps3_disc_evidence::observe_pkg_file(path, &crate::safe_read::TrustedRoots::none())
+    {
+        Ok(_) => accepted(
+            path.to_path_buf(),
+            ContainerKind::DirectFile,
+            ContentKind::Archive,
+            identity_for(path, source_root),
+            "PS3 digital package (bounded PKG header validated; contents were not extracted)."
+                .to_string(),
+        ),
+        Err(error) => skipped(
+            path.to_path_buf(),
+            ContainerKind::DirectFile,
+            Some(ContentKind::Archive),
+            SkipReason::InvalidContent(error),
+            "This .pkg file did not pass the bounded PS3 package-header checks.".to_string(),
+        ),
+    }
+}
+
+fn discover_dc42_image(path: &Path, source_root: &Path) -> GameDiscovery {
+    use crate::disk_format::{DiskFormat, DiskFormatContext, inspect_disk_format};
+    let evidence = inspect_disk_format(
+        path,
+        &crate::safe_read::TrustedRoots::none(),
+        DiskFormatContext::default(),
+        None,
+    );
+    match evidence.format {
+        Some(DiskFormat::MacintoshDiskCopy42) => accepted(
+            path.to_path_buf(),
+            ContainerKind::DirectFile,
+            ContentKind::ComputerDisk,
+            identity_for(path, source_root),
+            format!(
+                "Valid Macintosh Disk Copy 4.2 image. {} Structural media evidence only; exact release/game identity still needs a DAT/catalogue match.",
+                evidence.evidence.first().cloned().unwrap_or_default()
+            ),
+        ),
+        _ => skipped(
+            path.to_path_buf(),
+            ContainerKind::DirectFile,
+            Some(ContentKind::ComputerDisk),
+            SkipReason::InvalidContent(
+                evidence
+                    .refusal
+                    .as_ref()
+                    .map(|refusal| refusal.detail())
+                    .unwrap_or_else(|| "not a valid DC42 image".to_string()),
+            ),
+            "This file is named like a Macintosh Disk Copy 4.2 image but its bounded structure did not validate.".to_string(),
+        ),
+    }
+}
+
+/// A raw FDS image is accepted only after the shared disk-format layer has
+/// validated its side framing and ordered blocks. The `.fds` extension and an
+/// NES folder alone are not sufficient evidence.
+fn discover_fds_media(path: &Path, source_root: &Path) -> GameDiscovery {
+    use crate::disk_format::{DiskFormat, DiskFormatContext, inspect_disk_format};
+    let evidence = inspect_disk_format(
+        path,
+        &crate::safe_read::TrustedRoots::none(),
+        DiskFormatContext::default(),
+        None,
+    );
+    match evidence.format {
+        Some(DiskFormat::FamicomDiskSystem) => {
+            let mut identity = identity_for(path, source_root);
+            if let Some(summary) = identity.as_mut() {
+                summary.platform = Some("NES".to_string());
+            }
+            accepted(
+                path.to_path_buf(),
+                ContainerKind::DirectFile,
+                ContentKind::ComputerDisk,
+                identity,
+                format!(
+                    "Valid Famicom Disk System image ({}). Exact game identity still requires a +                     DAT/hash match; the disk metadata is not used as a title.",
+                    evidence.evidence.first().cloned().unwrap_or_default()
+                ),
+            )
+        }
+        _ => skipped(
+            path.to_path_buf(),
+            ContainerKind::DirectFile,
+            Some(ContentKind::ComputerDisk),
+            SkipReason::InvalidContent(
+                evidence
+                    .refusal
+                    .as_ref()
+                    .map(|refusal| refusal.detail())
+                    .unwrap_or_else(|| "not a valid raw FDS image".to_string()),
+            ),
+            "This .fds file did not pass the bounded Famicom Disk System structure checks."
+                .to_string(),
+        ),
+    }
+}
+/// `.rdb` is registered unconditionally as [`ContentKind::AmigaImage`] (see
+/// `content_registry`) - RDB is Amiga-specific, unlike `.hdf`/`.hdfx` (see
+/// [`discover_ambiguous_disk_image`]). Still runs
+/// [`amiga_disk::inspect_amiga_image`] to validate the file actually
+/// parses (covers both RDB-partitioned and, since that function's fix,
+/// flat AmigaDOS images) and to report the partition/filesystem detail.
+fn discover_amiga_image(path: &Path, source_root: &Path) -> GameDiscovery {
+    match amiga_disk::inspect_amiga_image(path) {
+        Ok(disk) => accepted(
+            path.to_path_buf(),
+            ContainerKind::DirectFile,
+            ContentKind::AmigaImage,
+            identity_for(path, source_root),
+            amiga_explanation(&disk),
+        ),
+        Err(error) => skipped(
+            path.to_path_buf(),
+            ContainerKind::DirectFile,
+            Some(ContentKind::AmigaImage),
+            SkipReason::InvalidContent(format!("{error:?}")),
+            format!("This looked like an Amiga disk image but could not be read: {error}"),
+        ),
+    }
+}
+
+/// `.hdf`/`.hdfx` are a real extension collision: Amiga hard-disk images
+/// and Sharp X68000 hard-disk images both use it (confirmed against a
+/// real X68000 collection during validation, where archive members named
+/// `*.hdf` were previously mislabelled `AmigaImage`). Resolution order:
+///
+/// 1. [`amiga_disk::inspect_amiga_image`] succeeds -> it really is a
+///    readable Amiga image (RDB-partitioned or flat AmigaDOS); structural
+///    evidence outranks naming, so this is accepted as `AmigaImage`
+///    regardless of what the identity system's platform hint says.
+/// 2. Amiga parsing fails, but the existing identity system resolves a
+///    platform anyway (e.g. a `Sharp X68000` folder alias) -> accepted as
+///    the more general [`ContentKind::ComputerDisk`], visible with a
+///    known platform even though the exact disk format wasn't verified.
+/// 3. Neither -> visible but flagged [`SkipReason::AmbiguousPlatform`]:
+///    genuinely unresolved which format/platform this is.
+fn discover_ambiguous_disk_image(path: &Path, source_root: &Path) -> GameDiscovery {
+    if let Ok(disk) = amiga_disk::inspect_amiga_image(path) {
+        return accepted(
+            path.to_path_buf(),
+            ContainerKind::DirectFile,
+            ContentKind::AmigaImage,
+            identity_for(path, source_root),
+            amiga_explanation(&disk),
+        );
+    }
+
+    let identity = identity_for(path, source_root);
+    match &identity {
+        Some(summary) if summary.platform.is_some() => accepted(
+            path.to_path_buf(),
+            ContainerKind::DirectFile,
+            ContentKind::ComputerDisk,
+            identity,
+            "Disk image (.hdf/.hdfx is shared between formats; not verified as an Amiga \
+             image, but the platform is otherwise identified)."
+                .to_string(),
+        ),
+        _ => skipped(
+            path.to_path_buf(),
+            ContainerKind::DirectFile,
+            Some(ContentKind::ComputerDisk),
+            SkipReason::AmbiguousPlatform,
+            "This .hdf/.hdfx file could not be confirmed as an Amiga image, and no other \
+             platform evidence identified it either - the extension is shared across formats \
+             (e.g. Amiga and Sharp X68000)."
+                .to_string(),
+        ),
+    }
+}
+
+fn amiga_explanation(disk: &AmigaDisk) -> String {
+    format!("Amiga image ({} partition(s)).", disk.rdb.partitions.len())
+}
+
+/// `.adf` is the dominant Amiga floppy format, and - unlike `.rdb`, which
+/// is Amiga-specific - it is a real cross-platform extension collision:
+/// Acorn ADFS / Archimedes floppy images use `.adf` too (see the `Amiga`
+/// platform's `conflicts_with`). It has therefore always been classified
+/// mainly by extension and weak platform evidence. This routes it through
+/// [`amiga_disk::inspect_amiga_floppy`],
+/// which reuses the existing bounded RDB / flat-AmigaDOS reader and the
+/// existing OFS/FFS traversal to validate the on-disc boot and root
+/// blocks:
+///
+/// 1. Contents validate as AmigaDOS -> accepted as [`ContentKind::AmigaImage`]
+///    with a structural `Amiga` platform hint that outranks any filename
+///    signal, and an explanation naming the DOS variant, OFS/FFS family,
+///    block size, and flags.
+/// 2. Standard floppy size and recognized Amiga boot evidence without a
+///    readable AmigaDOS filesystem -> visible plausible Amiga media with
+///    weak platform evidence; no title/game identity and no validation claim.
+/// 3. Insufficient Amiga media evidence, but the existing identity system
+///    still resolves a *non-Amiga* platform (e.g. an `Acorn Archimedes`
+///    folder) -> accepted as the more general [`ContentKind::ComputerDisk`],
+///    visible with that platform, the Amiga claim withheld.
+/// 4. Neither -> refused with the structural failure explained; no Amiga
+///    identity is produced from the `.adf` extension alone.
+fn discover_amiga_floppy(
+    path: &Path,
+    source_root: &Path,
+    structural_evidence: &mut Vec<DiscoveredStructuralEvidence>,
+) -> GameDiscovery {
+    match amiga_disk::inspect_amiga_floppy(path) {
+        Ok(inspection) => {
+            // Filesystem validation and weaker media evidence have different
+            // strengths. Neither a filename nor a volume label is a game ID.
+            let validated = inspection.filesystem().is_some();
+            let observation = structural_amiga_floppy_observation(&inspection);
+            let platform_hint = observation.platform_candidate.clone();
+            structural_evidence.push(DiscoveredStructuralEvidence {
+                path: path.to_path_buf(),
+                observation,
+            });
+            GameDiscovery {
+                path: path.to_path_buf(),
+                container: ContainerKind::DirectFile,
+                content: Some(ContentKind::AmigaImage),
+                platform_hint,
+                identity_candidate: None,
+                validation_state: if validated {
+                    ValidationState::Accepted
+                } else {
+                    ValidationState::Skipped
+                },
+                explanation: amiga_floppy_explanation(&inspection),
+                skip_reason: if validated {
+                    None
+                } else {
+                    Some(SkipReason::RecognizedContentNoIdentityMatch)
+                },
+            }
+        }
+        Err(error) => {
+            // Only an unknown boot identifier can use the shared Acorn .adf
+            // extension fallback. Known Amiga metadata and host I/O failures
+            // cannot be overridden by a folder or filename identity hint.
+            if !matches!(
+                error,
+                amiga_disk::AmigaFloppyError::Container(amiga_disk::DiskError::NoRdb)
+            ) {
+                return amiga_floppy_refusal(path, &error);
+            }
+            let identity = identity_for(path, source_root);
+            match &identity {
+                Some(summary)
+                    if summary
+                        .platform
+                        .as_deref()
+                        .is_some_and(|platform| platform != "Amiga") =>
+                {
+                    accepted(
+                        path.to_path_buf(),
+                        ContainerKind::DirectFile,
+                        ContentKind::ComputerDisk,
+                        identity,
+                        "Disk image (.adf is shared between Amiga and Acorn ADFS; not \
+                         verified as an Amiga floppy, but the platform is otherwise \
+                         identified)."
+                            .to_string(),
+                    )
+                }
+                _ => amiga_floppy_refusal(path, &error),
+            }
+        }
+    }
+}
+
+fn amiga_floppy_explanation(inspection: &amiga_disk::AmigaFloppyInspection) -> String {
+    inspection.description()
+}
+
+pub(super) fn amiga_floppy_refusal(
+    path: &Path,
+    error: &amiga_disk::AmigaFloppyError,
+) -> GameDiscovery {
+    use amiga_disk::{AmigaFloppyError, DiskError, FilesystemError};
+    let (reason, explanation) = match error {
+        AmigaFloppyError::Container(DiskError::TooManyPartitions) => (
+            SkipReason::UnsupportedContent(error.to_string()),
+            format!(
+                "Amiga RDB inspection exceeded the {}-partition reader limit. No content-integrity conclusion was made.",
+                amiga_disk::MAX_PARTITIONS
+            ),
+        ),
+        AmigaFloppyError::Container(DiskError::InvalidBlockSize(bytes))
+            if *bytes >= 512 && bytes.is_multiple_of(512) =>
+        {
+            (
+                SkipReason::UnsupportedContent(error.to_string()),
+                format!(
+                    "The declared RDB logical block size ({bytes} bytes) exceeds the supported reader range. No content-integrity conclusion was made."
+                ),
+            )
+        }
+        AmigaFloppyError::Container(
+            DiskError::Io(_) | DiskError::NotRegularFile | DiskError::ChangedWhileReading,
+        )
+        | AmigaFloppyError::Filesystem(FilesystemError::Io(_) | FilesystemError::Cancelled) => (
+            SkipReason::InspectionUnavailable(error.to_string()),
+            format!(
+                "Amiga media inspection could not complete: {error}. No content-integrity conclusion was made."
+            ),
+        ),
+        AmigaFloppyError::Container(DiskError::NoRdb)
+        | AmigaFloppyError::NoPartition
+        | AmigaFloppyError::Filesystem(
+            FilesystemError::UnsupportedFilesystem(_)
+            | FilesystemError::UnsupportedBlockSize { .. },
+        ) => (
+            SkipReason::UnsupportedContent(error.to_string()),
+            format!(
+                "Unknown or unsupported Amiga media interpretation: {error}. No supported filesystem metadata was validated; damage is not established."
+            ),
+        ),
+        AmigaFloppyError::Container(inner) => (
+            SkipReason::InvalidContent(format!("{inner:?}")),
+            format!("Amiga image container structure did not validate: {inner}."),
+        ),
+        AmigaFloppyError::Filesystem(inner) => (
+            SkipReason::InvalidContent(format!("{inner:?}")),
+            format!(
+                "AmigaDOS boot/root metadata or its partition range did not validate: {inner}. \
+                 No filesystem or dump integrity is established."
+            ),
+        ),
+    };
+    skipped(
+        path.to_path_buf(),
+        ContainerKind::DirectFile,
+        Some(ContentKind::AmigaImage),
+        reason,
+        explanation,
+    )
+}
+
+/// `.adz` is a gzip-wrapped Amiga floppy image - not a new filesystem or a
+/// new disk format (see [`crate::amiga_adz`]'s own module docs). This
+/// bounded-decompresses the container and reuses exactly the same
+/// [`structural_amiga_floppy_observation`] path [`discover_amiga_floppy`]
+/// uses for a raw `.adf` - the platform hint and structural evidence come
+/// from the decompressed media evidence, never from the `.adz`
+/// extension alone.
+fn discover_amiga_adz_floppy(
+    path: &Path,
+    _source_root: &Path,
+    structural_evidence: &mut Vec<DiscoveredStructuralEvidence>,
+) -> GameDiscovery {
+    match crate::amiga_adz::inspect_adz(path) {
+        Ok(inspection) => {
+            let validated = inspection.floppy.filesystem().is_some();
+            let observation = structural_amiga_floppy_observation(&inspection.floppy);
+            let platform_hint = observation.platform_candidate.clone();
+            structural_evidence.push(DiscoveredStructuralEvidence {
+                path: path.to_path_buf(),
+                observation,
+            });
+            GameDiscovery {
+                path: path.to_path_buf(),
+                container: ContainerKind::DirectFile,
+                content: Some(ContentKind::AmigaImage),
+                platform_hint,
+                identity_candidate: None,
+                validation_state: if validated {
+                    ValidationState::Accepted
+                } else {
+                    ValidationState::Skipped
+                },
+                explanation: format!(
+                    "Compressed Amiga floppy image (.adz, {} decompressed bytes): {}",
+                    inspection.decompressed_bytes,
+                    amiga_floppy_explanation(&inspection.floppy)
+                ),
+                skip_reason: if validated {
+                    None
+                } else {
+                    Some(SkipReason::RecognizedContentNoIdentityMatch)
+                },
+            }
+        }
+        Err(error) => amiga_adz_refusal(path, &error),
+    }
+}
+
+pub(super) fn amiga_adz_refusal(path: &Path, error: &crate::amiga_adz::AdzError) -> GameDiscovery {
+    use crate::amiga_adz::AdzError;
+    if let AdzError::NotAdf(inner) = error {
+        let mut item = amiga_floppy_refusal(path, inner);
+        item.explanation = format!("Decompressed ADZ media: {}", item.explanation);
+        return item;
+    }
+    let reason = match error {
+        AdzError::Io(_) | AdzError::TempFileUnavailable(_) | AdzError::ChangedWhileReading => {
+            SkipReason::InspectionUnavailable(error.to_string())
+        }
+        AdzError::NotRegularFile
+        | AdzError::NotGzip
+        | AdzError::UnsupportedGzip(_)
+        | AdzError::ContainerTooLarge { .. }
+        | AdzError::DecompressedTooLarge { .. } => {
+            SkipReason::UnsupportedContent(error.to_string())
+        }
+        AdzError::MalformedGzip(_) | AdzError::DecompressedTooSmall => {
+            SkipReason::InvalidContent(error.to_string())
+        }
+        AdzError::NotAdf(_) => unreachable!(),
+    };
+    skipped(
+        path.to_path_buf(),
+        ContainerKind::DirectFile,
+        Some(ContentKind::AmigaImage),
+        reason,
+        format!(
+            "ADZ inspection result: {error}. No game identity or dump-integrity claim is established."
+        ),
+    )
+}
+
+/// `.lha`/`.lzh` are not registered as [`ContainerKind::Archive`] (LHA has
+/// no in-process decoder - see [`crate::dat::archive::lha`]'s own docs), so
+/// they reach `discover_direct_file` like `.adf`/`.rdb` do. Finding a file
+/// merely *named* `.slave` inside is never enough: only bytes that pass the
+/// existing [`crate::identity_source::whdload::parse_whdload_slave`] become
+/// a candidate (see [`crate::amiga_whdload_archive`]). No archive filename
+/// is ever treated as game identity, and no candidate is ever auto-picked
+/// when more than one validates - see that module's own contract.
+fn discover_whdload_archive(
+    path: &Path,
+    source_root: &Path,
+    structural_evidence: &mut Vec<DiscoveredStructuralEvidence>,
+    annotate: &mut dyn FnMut(&[SlaveArtifact]) -> String,
+) -> GameDiscovery {
+    use crate::amiga_whdload_archive::{WhdloadArchiveError, discover_whdload_slaves_in_archive};
+    use std::sync::atomic::AtomicBool;
+
+    let cancel = AtomicBool::new(false);
+    match discover_whdload_slaves_in_archive(path, &cancel) {
+        Ok(discovery) if !discovery.candidates.is_empty() => {
+            for candidate in &discovery.candidates {
+                structural_evidence.push(DiscoveredStructuralEvidence {
+                    path: path.to_path_buf(),
+                    observation: crate::identity_source::whdload::structural_slave_observation(
+                        &candidate.artifact,
+                    ),
+                });
+            }
+            let mut explanation = if discovery.candidates.len() == 1 {
+                format!(
+                    "WHDLoad archive ({}; verified WHDLoad slave runtime v{}).",
+                    discovery.candidates[0].member_path,
+                    discovery.candidates[0].artifact.parsed.runtime_version
+                )
+            } else {
+                format!(
+                    "WHDLoad archive ({} candidate .slave files: {}) - ambiguous, EmuWiz did \
+                     not pick one automatically.",
+                    discovery.candidates.len(),
+                    discovery
+                        .candidates
+                        .iter()
+                        .map(|candidate| candidate.member_path.as_str())
+                        .collect::<Vec<_>>()
+                        .join(", ")
+                )
+            };
+            let artifacts: Vec<_> = discovery
+                .candidates
+                .iter()
+                .map(|c| c.artifact.clone())
+                .collect();
+            explanation.push_str(&annotate(&artifacts));
+            if !discovery.diagnostics.is_empty() {
+                explanation.push_str(&format!(
+                    " {} other .slave-named member(s) did not verify and were ignored.",
+                    discovery.diagnostics.len()
+                ));
+            }
+            // Built manually, like `discover_amiga_floppy`: the platform
+            // hint must come from the verified slave structure (`Amiga`),
+            // never from `identity_for`'s own weak folder/filename guess -
+            // a bare `.lha` in an unaliased folder has no such guess to
+            // give, and one must never be needed here.
+            GameDiscovery {
+                path: path.to_path_buf(),
+                container: ContainerKind::DirectFile,
+                content: Some(ContentKind::AmigaImage),
+                platform_hint: Some("Amiga".to_string()),
+                identity_candidate: identity_for(path, source_root),
+                validation_state: ValidationState::Accepted,
+                explanation,
+                skip_reason: None,
+            }
+        }
+        Ok(discovery) => {
+            // No `.slave` validated - not WHDLoad. Never claim the Amiga
+            // platform from the `.lha`/`.lzh` extension alone; fall back to
+            // whatever independent identity evidence already exists.
+            let identity = identity_for(path, source_root);
+            match &identity {
+                Some(summary) if summary.platform.is_some() => accepted(
+                    path.to_path_buf(),
+                    ContainerKind::DirectFile,
+                    ContentKind::Archive,
+                    identity,
+                    "LHA/LZH archive (no verified WHDLoad .slave found; not claimed as Amiga \
+                     content from the extension alone)."
+                        .to_string(),
+                ),
+                _ => skipped(
+                    path.to_path_buf(),
+                    ContainerKind::DirectFile,
+                    Some(ContentKind::Archive),
+                    SkipReason::RecognizedContentNoIdentityMatch,
+                    format!(
+                        "This LHA/LZH archive has {} member(s) but none is a verified WHDLoad \
+                         .slave.",
+                        discovery.total_members
+                    ),
+                ),
+            }
+        }
+        Err(WhdloadArchiveError::BackendUnavailable) => {
+            // A missing optional local backend, not a corrupt/non-WHDLoad
+            // archive - fail soft, never claim or refuse either way.
+            let identity = identity_for(path, source_root);
+            match &identity {
+                Some(summary) if summary.platform.is_some() => accepted(
+                    path.to_path_buf(),
+                    ContainerKind::DirectFile,
+                    ContentKind::Archive,
+                    identity,
+                    "LHA/LZH archive - member listing was unavailable (no local 7-Zip with an \
+                     LHA/LZH decoder was found), so EmuWiz preserves the archive without \
+                     guessing its contents."
+                        .to_string(),
+                ),
+                _ => skipped(
+                    path.to_path_buf(),
+                    ContainerKind::DirectFile,
+                    Some(ContentKind::Archive),
+                    SkipReason::RecognizedContentNoIdentityMatch,
+                    "This LHA/LZH archive could not be inspected for a WHDLoad .slave: no \
+                     local 7-Zip with an LHA/LZH decoder was found."
+                        .to_string(),
+                ),
+            }
+        }
+        Err(WhdloadArchiveError::Open { detail }) => skipped(
+            path.to_path_buf(),
+            ContainerKind::DirectFile,
+            Some(ContentKind::Archive),
+            SkipReason::InvalidContent(detail.clone()),
+            format!("This LHA/LZH archive could not be read: {detail}."),
+        ),
+    }
+}
+
+/// Shared catalogue/ingestion dispatch for already-supported Spectrum media.
+/// The existing inspectors decide acceptance; no extension creates identity.
+pub fn inspect_spectrum_media(path: &Path, source_root: &Path) -> Option<GameDiscovery> {
+    match path.extension()?.to_str()?.to_ascii_lowercase().as_str() {
+        "z80" | "sna" | "szx" => Some(discover_spectrum_snapshot(path, source_root)),
+        "trd" | "scl" => Some(discover_trdos_media(path, source_root)),
+        "pzx" | "rzx" | "nex" | "udi" | "mdr" => {
+            Some(discover_spectrum_native_media(path, source_root))
+        }
+        _ => None,
+    }
+}
+
+/// `.pzx` / `.rzx` / `.nex` / `.udi` / `.mdr` are Spectrum-family formats with
+/// no other platform use. The platform still comes only from
+/// [`crate::zx_spectrum_media::inspect_spectrum_media_file`] proving the
+/// structure. A recognised RZX recording is accepted as preservation-only
+/// media ([`ContentKind::GameplayRecording`]), never as a game; an
+/// unsupported variant is described but not accepted.
+fn discover_spectrum_native_media(path: &Path, source_root: &Path) -> GameDiscovery {
+    use crate::zx_spectrum_media::{SpectrumMediaFormat, SpectrumMediaRefusal, SpectrumMediaRole};
+
+    let extension = path
+        .extension()
+        .and_then(|value| value.to_str())
+        .unwrap_or_default();
+    let format = SpectrumMediaFormat::for_extension(extension);
+    let content = match format {
+        Some(SpectrumMediaFormat::PzxTape) => ContentKind::TapeImage,
+        Some(SpectrumMediaFormat::RzxRecording) => ContentKind::GameplayRecording,
+        Some(SpectrumMediaFormat::NextProgram) => ContentKind::Executable,
+        _ => ContentKind::ComputerDisk,
+    };
+    let label = format.map_or("ZX Spectrum media", |format| format.label());
+    match crate::zx_spectrum_media::inspect_spectrum_media_file(path) {
+        Ok(inspection) if inspection.catalogue_eligible() => GameDiscovery {
+            path: path.to_path_buf(),
+            container: ContainerKind::DirectFile,
+            content: Some(content),
+            platform_hint: Some(crate::zx_spectrum_snapshot::SpectrumMachine::PLATFORM.into()),
+            identity_candidate: identity_for(path, source_root),
+            validation_state: ValidationState::Accepted,
+            explanation: if inspection.role == SpectrumMediaRole::PreservationOnly {
+                format!(
+                    "Spectrum gameplay recording (preservation-only). {}. Kept as a library \
+                     record; it is not a game entry and Play is not offered. The game it \
+                     records is not identified.",
+                    inspection.describe()
+                )
+            } else {
+                format!(
+                    "{}. Structural platform/media evidence only; exact game identity still \
+                     needs a DAT/catalogue match, and no emulator is implied.",
+                    inspection.describe()
+                )
+            },
+            skip_reason: None,
+        },
+        Ok(inspection) => {
+            let why = "left alone until this variant is supported";
+            skipped(
+                path.to_path_buf(),
+                ContainerKind::DirectFile,
+                Some(content),
+                SkipReason::UnsupportedContent(inspection.describe()),
+                format!("{}; {why}.", inspection.describe()),
+            )
+        }
+        Err(error) => skipped(
+            path.to_path_buf(),
+            ContainerKind::DirectFile,
+            Some(content),
+            match error {
+                SpectrumMediaRefusal::NotReadable(_) => {
+                    SkipReason::InspectionUnavailable(error.to_string())
+                }
+                SpectrumMediaRefusal::TooLarge { .. } => {
+                    SkipReason::UnsupportedContent(error.to_string())
+                }
+                SpectrumMediaRefusal::Ambiguous(_) => SkipReason::AmbiguousPlatform,
+                _ => SkipReason::InvalidContent(error.to_string()),
+            },
+            format!(
+                "This file is named like a {label} but its contents did not validate as one: \
+                 {error}."
+            ),
+        ),
+    }
+}
+
+/// `.z80` / `.sna` / `.szx` are ZX Spectrum machine snapshots. The category
+/// is known from the extension; the Sinclair family and any machine subtype
+/// come only from parsing the bytes via
+/// [`crate::zx_spectrum_snapshot::inspect_spectrum_snapshot_file`]. A file
+/// that merely ends in one of these extensions never reaches
+/// [`ValidationState::Accepted`] here without that structural proof, and a
+/// snapshot never yields a unique game identity.
+fn discover_spectrum_snapshot(path: &Path, source_root: &Path) -> GameDiscovery {
+    match crate::zx_spectrum_snapshot::inspect_spectrum_snapshot_file(path) {
+        Ok(inspection) => {
+            let machine = inspection
+                .machine()
+                .map(|machine| machine.label().to_string());
+            let subtype = if inspection.machine_subtype_is_encoded() {
+                machine.clone().unwrap_or_else(|| "unknown".to_string())
+            } else {
+                machine
+                    .clone()
+                    .map(|label| format!("{label} (implied by the snapshot form, not encoded)"))
+                    .unwrap_or_else(|| "machine subtype not encoded".to_string())
+            };
+            GameDiscovery {
+                path: path.to_path_buf(),
+                container: ContainerKind::DirectFile,
+                content: Some(ContentKind::MachineSnapshot),
+                // The snapshot structure is authoritative for the Sinclair
+                // platform family, ahead of any filename signal.
+                platform_hint: Some(
+                    crate::zx_spectrum_snapshot::SpectrumMachine::PLATFORM.to_string(),
+                ),
+                identity_candidate: identity_for(path, source_root),
+                validation_state: ValidationState::Accepted,
+                explanation: format!(
+                    "{} - {subtype}. Structural platform/media evidence only; exact game \
+                     identity still needs a DAT/catalogue match.",
+                    inspection.facts.format.label()
+                ),
+                skip_reason: None,
+            }
+        }
+        Err(error) => skipped(
+            path.to_path_buf(),
+            ContainerKind::DirectFile,
+            Some(ContentKind::MachineSnapshot),
+            if matches!(
+                error,
+                crate::zx_spectrum_snapshot::SnapshotRefusal::NotReadable(_)
+            ) {
+                SkipReason::InspectionUnavailable(format!("{error}"))
+            } else {
+                SkipReason::InvalidContent(format!("{error}"))
+            },
+            format!(
+                "This file is named like a ZX Spectrum snapshot but its contents did not \
+                 validate as one: {error}."
+            ),
+        ),
+    }
+}
+
+/// `.dsk` is a CPCEMU container shared by the Amstrad CPC, ZX Spectrum +3 and
+/// Amstrad PCW. It is resolved from contents through the shared structural
+/// disk layer ([`crate::disk_format::inspect_disk_format`]):
+///
+/// 1. a valid `+3DOS`/PCW disk specification on track 0 -> accepted as a
+///    ZX Spectrum disk;
+/// 2. a valid bare CPCEMU container with a platform otherwise identified
+///    (folder alias) -> accepted under that platform as a computer disk;
+/// 3. a valid bare container with nothing else -> stays ambiguous
+///    ([`SkipReason::RecognizedContentNoIdentityMatch`]), never forced to a
+///    platform;
+/// 4. not a valid container -> refused.
+fn discover_dsk_image(path: &Path, source_root: &Path) -> GameDiscovery {
+    use crate::disk_format::{DiskFormat, DiskFormatContext, inspect_disk_format};
+
+    let evidence = inspect_disk_format(
+        path,
+        &crate::safe_read::TrustedRoots::none(),
+        DiskFormatContext::default(),
+        None,
+    );
+    let explanation = evidence
+        .evidence
+        .first()
+        .cloned()
+        .unwrap_or_else(|| "CPCEMU .dsk container".to_string());
+
+    match evidence.format {
+        Some(DiskFormat::SpectrumPlus3Disk) => GameDiscovery {
+            path: path.to_path_buf(),
+            container: ContainerKind::DirectFile,
+            content: Some(ContentKind::ComputerDisk),
+            platform_hint: Some("ZX Spectrum".to_string()),
+            identity_candidate: identity_for(path, source_root),
+            validation_state: ValidationState::Accepted,
+            explanation: format!("ZX Spectrum +3 disk. {explanation}."),
+            skip_reason: None,
+        },
+        Some(DiskFormat::CpcEmuDsk) => {
+            let identity = identity_for(path, source_root);
+            match &identity {
+                Some(summary) if summary.platform.is_some() => accepted(
+                    path.to_path_buf(),
+                    ContainerKind::DirectFile,
+                    ContentKind::ComputerDisk,
+                    identity,
+                    format!(
+                        "Computer disk image (CPCEMU .dsk container; shared by CPC / +3 / PCW, \
+                         platform identified from other evidence). {explanation}."
+                    ),
+                ),
+                _ => GameDiscovery {
+                    path: path.to_path_buf(),
+                    container: ContainerKind::DirectFile,
+                    content: Some(ContentKind::ComputerDisk),
+                    platform_hint: None,
+                    identity_candidate: identity,
+                    validation_state: ValidationState::Skipped,
+                    explanation: format!(
+                        "Valid CPCEMU .dsk container, but it is shared by the Amstrad CPC, \
+                         ZX Spectrum +3 and Amstrad PCW and nothing else identifies which. \
+                         {explanation}."
+                    ),
+                    skip_reason: Some(SkipReason::RecognizedContentNoIdentityMatch),
+                },
+            }
+        }
+        _ => skipped(
+            path.to_path_buf(),
+            ContainerKind::DirectFile,
+            Some(ContentKind::ComputerDisk),
+            SkipReason::InvalidContent(
+                evidence
+                    .refusal
+                    .as_ref()
+                    .map(|refusal| refusal.detail())
+                    .unwrap_or_else(|| "not a recognised CPCEMU .dsk container".to_string()),
+            ),
+            "This .dsk file is not a readable CPCEMU disk container.".to_string(),
+        ),
+    }
+}
+
+/// A D64 is a shared Commodore 1541-media structure. It is accepted when the
+/// existing folder/metadata evidence identifies a machine, and remains
+/// visible but platform-ambiguous when it does not. The disk title and
+/// internal filenames are provenance only; they never supply release identity
+/// or rename authority.
+fn discover_d64_image(path: &Path, source_root: &Path) -> GameDiscovery {
+    use crate::disk_format::{DiskFormat, DiskFormatContext, inspect_disk_format};
+
+    let evidence = inspect_disk_format(
+        path,
+        &crate::safe_read::TrustedRoots::none(),
+        DiskFormatContext::default(),
+        None,
+    );
+    let detail = evidence
+        .evidence
+        .first()
+        .cloned()
+        .unwrap_or_else(|| "Commodore 1541 D64 media".to_string());
+    if evidence.format != Some(DiskFormat::Commodore1541D64) {
+        return skipped(
+            path.to_path_buf(),
+            ContainerKind::DirectFile,
+            Some(ContentKind::ComputerDisk),
+            SkipReason::InvalidContent(
+                evidence
+                    .refusal
+                    .as_ref()
+                    .map(|refusal| refusal.detail())
+                    .unwrap_or_else(|| "not a recognised D64 image".to_string()),
+            ),
+            "This .d64 file did not validate as a bounded Commodore 1541 disk image.".to_string(),
+        );
+    }
+    let identity = identity_for(path, source_root);
+    match &identity {
+        Some(summary) if summary.platform.is_some() => accepted(
+            path.to_path_buf(),
+            ContainerKind::DirectFile,
+            ContentKind::ComputerDisk,
+            identity,
+            format!(
+                "Commodore 1541 disk media; platform supplied by surrounding evidence. {detail}."
+            ),
+        ),
+        _ => skipped(
+            path.to_path_buf(),
+            ContainerKind::DirectFile,
+            Some(ContentKind::ComputerDisk),
+            SkipReason::AmbiguousPlatform,
+            format!(
+                "Valid Commodore 1541 disk media, but D64 is shared by C64, C128 and VIC-20; no platform evidence selected one. {detail}."
+            ),
+        ),
+    }
+}
+
+/// XDF and DIM are accepted only after bounded X68000 structure validation.
+/// A suffix or same-size raw image is never sufficient evidence.
+fn discover_x68000_media(path: &Path, source_root: &Path) -> GameDiscovery {
+    use crate::disk_format::{DiskFormat, DiskFormatContext, inspect_disk_format};
+
+    let evidence = inspect_disk_format(
+        path,
+        &crate::safe_read::TrustedRoots::none(),
+        DiskFormatContext::default(),
+        None,
+    );
+    let detail = evidence
+        .evidence
+        .first()
+        .cloned()
+        .unwrap_or_else(|| "X68000 floppy media".to_string());
+    if !matches!(
+        evidence.format,
+        Some(DiskFormat::X68000Xdf | DiskFormat::X68000Dim)
+    ) {
+        return skipped(
+            path.to_path_buf(),
+            ContainerKind::DirectFile,
+            Some(ContentKind::ComputerDisk),
+            SkipReason::InvalidContent(
+                evidence
+                    .refusal
+                    .as_ref()
+                    .map(|refusal| refusal.detail())
+                    .unwrap_or_else(|| "not a recognised X68000 floppy image".to_string()),
+            ),
+            "This X68000 floppy image did not pass its bounded XDF/DIM structural checks."
+                .to_string(),
+        );
+    }
+    let identity = identity_for(path, source_root);
+    match &identity {
+        Some(summary) if summary.platform.is_some() => accepted(
+            path.to_path_buf(),
+            ContainerKind::DirectFile,
+            ContentKind::ComputerDisk,
+            identity,
+            format!("Valid Sharp X68000 floppy image. {detail}."),
+        ),
+        _ => skipped(
+            path.to_path_buf(),
+            ContainerKind::DirectFile,
+            Some(ContentKind::ComputerDisk),
+            SkipReason::RecognizedContentNoIdentityMatch,
+            format!(
+                "Valid X68000 floppy structure, but no platform identity was available. {detail}."
+            ),
+        ),
+    }
+}
+
+/// `.d88` is a structurally validated container shared by PC-88, PC-98,
+/// FM Towns and X68000. A validated NEC FAT boot sector is an additional
+/// bytes-derived PC-98 platform observation; all other D88 cases still require
+/// independent folder/DAT evidence.
+fn discover_d88_image(
+    path: &Path,
+    source_root: &Path,
+    structural_evidence: &mut Vec<DiscoveredStructuralEvidence>,
+) -> GameDiscovery {
+    use crate::disk_format::{DiskFormat, DiskFormatContext, inspect_disk_format};
+
+    let evidence = inspect_disk_format(
+        path,
+        &crate::safe_read::TrustedRoots::none(),
+        DiskFormatContext::default(),
+        None,
+    );
+    let detail = evidence
+        .evidence
+        .first()
+        .cloned()
+        .unwrap_or_else(|| "D88 disk container".to_string());
+    match evidence.format {
+        Some(DiskFormat::D88Container) => {
+            if let Some(boot) = crate::fmtowns_container_evidence::inspect_fmtowns_container(path)
+                .and_then(|container| container.boot_sector)
+                && let Some(observation) =
+                    crate::fmtowns_boot_evidence::structural_observation(&boot)
+            {
+                structural_evidence.push(DiscoveredStructuralEvidence {
+                    path: path.to_path_buf(),
+                    observation,
+                });
+                let identity = identity_for(path, source_root);
+                let conflicting = identity
+                    .as_ref()
+                    .and_then(|summary| summary.platform.as_deref())
+                    .filter(|platform| *platform != "FM Towns");
+                if let Some(platform) = conflicting {
+                    let platform = platform.to_string();
+                    return GameDiscovery {
+                        path: path.to_path_buf(),
+                        container: ContainerKind::DirectFile,
+                        content: Some(ContentKind::ComputerDisk),
+                        platform_hint: None,
+                        identity_candidate: identity,
+                        validation_state: ValidationState::Skipped,
+                        explanation: format!(
+                            "Strong FM Towns IPL4 evidence conflicts with surrounding {platform} evidence; EmuWiz kept the platform ambiguous. {detail}."
+                        ),
+                        skip_reason: Some(SkipReason::AmbiguousPlatform),
+                    };
+                }
+                return GameDiscovery {
+                    path: path.to_path_buf(),
+                    container: ContainerKind::DirectFile,
+                    content: Some(ContentKind::ComputerDisk),
+                    platform_hint: Some("FM Towns".to_string()),
+                    identity_candidate: identity,
+                    validation_state: ValidationState::Accepted,
+                    explanation: format!(
+                        "Valid D88 container with strong FM Towns IPL4 evidence. {detail}."
+                    ),
+                    skip_reason: None,
+                };
+            }
+            if let Some(boot) = crate::pc98_container_evidence::inspect_pc98_container(path)
+                .and_then(|container| container.boot_sector)
+                && let Some(observation) = crate::pc98_boot_evidence::structural_observation(&boot)
+            {
+                structural_evidence.push(DiscoveredStructuralEvidence {
+                    path: path.to_path_buf(),
+                    observation,
+                });
+                let identity = identity_for(path, source_root);
+                let conflicting = identity
+                    .as_ref()
+                    .and_then(|summary| summary.platform.as_deref())
+                    .filter(|platform| *platform != "PC-98" && *platform != "NEC PC-9801");
+                if let Some(platform) = conflicting {
+                    let platform = platform.to_string();
+                    return GameDiscovery {
+                        path: path.to_path_buf(),
+                        container: ContainerKind::DirectFile,
+                        content: Some(ContentKind::ComputerDisk),
+                        platform_hint: None,
+                        identity_candidate: identity,
+                        validation_state: ValidationState::Skipped,
+                        explanation: format!(
+                            "Strong PC-98 boot evidence conflicts with surrounding {platform} evidence; EmuWiz kept the platform ambiguous. {detail}."
+                        ),
+                        skip_reason: Some(SkipReason::AmbiguousPlatform),
+                    };
+                }
+                return GameDiscovery {
+                    path: path.to_path_buf(),
+                    container: ContainerKind::DirectFile,
+                    content: Some(ContentKind::ComputerDisk),
+                    platform_hint: Some("PC-98".to_string()),
+                    identity_candidate: identity,
+                    validation_state: ValidationState::Accepted,
+                    explanation: format!(
+                        "Valid D88 container with strong PC-98 boot evidence. {detail}."
+                    ),
+                    skip_reason: None,
+                };
+            }
+            let identity = identity_for(path, source_root);
+            match &identity {
+                Some(summary) if summary.platform.is_some() => accepted(
+                    path.to_path_buf(),
+                    ContainerKind::DirectFile,
+                    ContentKind::ComputerDisk,
+                    identity,
+                    format!(
+                        "Valid D88 disk container; platform identified from folder evidence. {detail}."
+                    ),
+                ),
+                _ => GameDiscovery {
+                    path: path.to_path_buf(),
+                    container: ContainerKind::DirectFile,
+                    content: Some(ContentKind::ComputerDisk),
+                    platform_hint: None,
+                    identity_candidate: identity,
+                    validation_state: ValidationState::Skipped,
+                    explanation: format!(
+                        "Valid D88 disk container, but D88 is shared by PC-88, PC-98, FM Towns and X68000; no platform corroboration was found. {detail}."
+                    ),
+                    skip_reason: Some(SkipReason::RecognizedContentNoIdentityMatch),
+                },
+            }
+        }
+        _ => skipped(
+            path.to_path_buf(),
+            ContainerKind::DirectFile,
+            Some(ContentKind::ComputerDisk),
+            SkipReason::InvalidContent(
+                evidence
+                    .refusal
+                    .as_ref()
+                    .map(|refusal| refusal.detail())
+                    .unwrap_or_else(|| "not a recognised D88 disk container".to_string()),
+            ),
+            "This file is not a readable D88 disk container.".to_string(),
+        ),
+    }
+}
+
+/// `.crt` is a structurally validated C64 CRT container, but CRT hardware is
+/// shared across the Commodore 8-bit family. A folder alias may corroborate a
+/// machine; a bare valid CRT remains visible as recognized content without a
+/// guessed platform.
+fn discover_crt_cartridge(path: &Path, source_root: &Path) -> GameDiscovery {
+    use crate::disk_format::{DiskFormat, DiskFormatContext, inspect_disk_format};
+
+    let evidence = inspect_disk_format(
+        path,
+        &crate::safe_read::TrustedRoots::none(),
+        DiskFormatContext::default(),
+        None,
+    );
+    let detail = evidence
+        .evidence
+        .first()
+        .cloned()
+        .unwrap_or_else(|| "Commodore CRT cartridge".to_string());
+    match evidence.format {
+        Some(DiskFormat::CommodoreCrt) => {
+            let identity = identity_for(path, source_root);
+            match &identity {
+                Some(summary) if summary.platform.is_some() => accepted(
+                    path.to_path_buf(),
+                    ContainerKind::DirectFile,
+                    ContentKind::ComputerDisk,
+                    identity,
+                    format!(
+                        "Valid Commodore CRT cartridge; platform identified from folder evidence. {detail}."
+                    ),
+                ),
+                _ => GameDiscovery {
+                    path: path.to_path_buf(),
+                    container: ContainerKind::DirectFile,
+                    content: Some(ContentKind::ComputerDisk),
+                    platform_hint: None,
+                    identity_candidate: identity,
+                    validation_state: ValidationState::Skipped,
+                    explanation: format!(
+                        "Valid Commodore CRT cartridge, but CRT hardware is shared across the Commodore 8-bit family and no platform corroboration was found. {detail}."
+                    ),
+                    skip_reason: Some(SkipReason::RecognizedContentNoIdentityMatch),
+                },
+            }
+        }
+        _ => skipped(
+            path.to_path_buf(),
+            ContainerKind::DirectFile,
+            Some(ContentKind::ComputerDisk),
+            SkipReason::InvalidContent(
+                evidence
+                    .refusal
+                    .as_ref()
+                    .map(|refusal| refusal.detail())
+                    .unwrap_or_else(|| "not a recognised CRT cartridge".to_string()),
+            ),
+            "This .crt file is not a readable Commodore CRT cartridge.".to_string(),
+        ),
+    }
+}
+
+/// HDI and NHD headers prove only a coherent hard-disk container. A validated
+/// NEC FAT boot sector at the declared payload start can add PC-98 evidence;
+/// platform identity never comes from capacity or the extension.
+fn discover_hard_disk_image(
+    path: &Path,
+    source_root: &Path,
+    extension: &str,
+    structural_evidence: &mut Vec<DiscoveredStructuralEvidence>,
+) -> GameDiscovery {
+    use crate::disk_format::{DiskFormat, DiskFormatContext, inspect_disk_format};
+
+    let evidence = inspect_disk_format(
+        path,
+        &crate::safe_read::TrustedRoots::none(),
+        DiskFormatContext::default(),
+        None,
+    );
+    let expected = if extension == "hdi" {
+        DiskFormat::HdiContainer
+    } else {
+        DiskFormat::NhdContainer
+    };
+    let detail = evidence
+        .evidence
+        .first()
+        .cloned()
+        .unwrap_or_else(|| format!(".{extension} hard-disk container"));
+    match evidence.format {
+        Some(format) if format == expected => {
+            if let Some(boot) = crate::fmtowns_container_evidence::inspect_fmtowns_container(path)
+                .and_then(|container| container.boot_sector)
+                && let Some(observation) =
+                    crate::fmtowns_boot_evidence::structural_observation(&boot)
+            {
+                structural_evidence.push(DiscoveredStructuralEvidence {
+                    path: path.to_path_buf(),
+                    observation,
+                });
+                let identity = identity_for(path, source_root);
+                let conflicting = identity
+                    .as_ref()
+                    .and_then(|summary| summary.platform.as_deref())
+                    .filter(|platform| *platform != "FM Towns");
+                if let Some(platform) = conflicting {
+                    let platform = platform.to_string();
+                    return GameDiscovery {
+                        path: path.to_path_buf(),
+                        container: ContainerKind::DirectFile,
+                        content: Some(ContentKind::ComputerDisk),
+                        platform_hint: None,
+                        identity_candidate: identity,
+                        validation_state: ValidationState::Skipped,
+                        explanation: format!(
+                            "Strong FM Towns IPL4 evidence conflicts with surrounding {platform} evidence; EmuWiz kept the platform ambiguous. {detail}."
+                        ),
+                        skip_reason: Some(SkipReason::AmbiguousPlatform),
+                    };
+                }
+                return GameDiscovery {
+                    path: path.to_path_buf(),
+                    container: ContainerKind::DirectFile,
+                    content: Some(ContentKind::ComputerDisk),
+                    platform_hint: Some("FM Towns".to_string()),
+                    identity_candidate: identity,
+                    validation_state: ValidationState::Accepted,
+                    explanation: format!(
+                        "Valid .{extension} container with strong FM Towns IPL4 evidence. {detail}."
+                    ),
+                    skip_reason: None,
+                };
+            }
+            if let Some(boot) = crate::pc98_container_evidence::inspect_pc98_container(path)
+                .and_then(|container| container.boot_sector)
+                && let Some(observation) = crate::pc98_boot_evidence::structural_observation(&boot)
+            {
+                structural_evidence.push(DiscoveredStructuralEvidence {
+                    path: path.to_path_buf(),
+                    observation,
+                });
+                let identity = identity_for(path, source_root);
+                let conflicting = identity
+                    .as_ref()
+                    .and_then(|summary| summary.platform.as_deref())
+                    .filter(|platform| *platform != "PC-98" && *platform != "NEC PC-9801");
+                if let Some(platform) = conflicting {
+                    let platform = platform.to_string();
+                    return GameDiscovery {
+                        path: path.to_path_buf(),
+                        container: ContainerKind::DirectFile,
+                        content: Some(ContentKind::ComputerDisk),
+                        platform_hint: None,
+                        identity_candidate: identity,
+                        validation_state: ValidationState::Skipped,
+                        explanation: format!(
+                            "Strong PC-98 boot evidence conflicts with surrounding {platform} evidence; EmuWiz kept the platform ambiguous. {detail}."
+                        ),
+                        skip_reason: Some(SkipReason::AmbiguousPlatform),
+                    };
+                }
+                return GameDiscovery {
+                    path: path.to_path_buf(),
+                    container: ContainerKind::DirectFile,
+                    content: Some(ContentKind::ComputerDisk),
+                    platform_hint: Some("PC-98".to_string()),
+                    identity_candidate: identity,
+                    validation_state: ValidationState::Accepted,
+                    explanation: format!(
+                        "Valid .{extension} container with strong PC-98 boot evidence. {detail}."
+                    ),
+                    skip_reason: None,
+                };
+            }
+            let identity = identity_for(path, source_root);
+            match &identity {
+                Some(summary) if summary.platform.is_some() => accepted(
+                    path.to_path_buf(),
+                    ContainerKind::DirectFile,
+                    ContentKind::ComputerDisk,
+                    identity,
+                    format!(
+                        "Valid .{extension} hard-disk container; platform identified from other evidence. {detail}."
+                    ),
+                ),
+                _ => GameDiscovery {
+                    path: path.to_path_buf(),
+                    container: ContainerKind::DirectFile,
+                    content: Some(ContentKind::ComputerDisk),
+                    platform_hint: None,
+                    identity_candidate: identity,
+                    validation_state: ValidationState::Skipped,
+                    explanation: format!(
+                        "Valid .{extension} hard-disk container, but its header does not prove PC-98 or any other platform. {detail}."
+                    ),
+                    skip_reason: Some(SkipReason::RecognizedContentNoIdentityMatch),
+                },
+            }
+        }
+        _ => skipped(
+            path.to_path_buf(),
+            ContainerKind::DirectFile,
+            Some(ContentKind::ComputerDisk),
+            SkipReason::InvalidContent(
+                evidence
+                    .refusal
+                    .as_ref()
+                    .map(|refusal| refusal.detail())
+                    .unwrap_or_else(|| format!("not a recognised .{extension} container")),
+            ),
+            format!("This .{extension} file is not a readable hard-disk container."),
+        ),
+    }
+}
+
+/// `.trd` (raw TR-DOS disk image) and `.scl` (SINCLAIR archive of TR-DOS
+/// files) are ZX Spectrum-family media. Neither is proven by its extension:
+/// resolution runs through the shared structural disk layer, which validates
+/// the TR-DOS system descriptor or SINCLAIR archive arithmetic before claiming
+/// anything.
+fn discover_trdos_media(path: &Path, source_root: &Path) -> GameDiscovery {
+    use crate::disk_format::{DiskFormat, DiskFormatContext, inspect_disk_format};
+
+    let evidence = inspect_disk_format(
+        path,
+        &crate::safe_read::TrustedRoots::none(),
+        DiskFormatContext::default(),
+        None,
+    );
+    let detail = evidence
+        .evidence
+        .first()
+        .cloned()
+        .unwrap_or_else(|| "TR-DOS media".to_string());
+
+    match evidence.format {
+        Some(DiskFormat::SpectrumTrDosDisk) | Some(DiskFormat::SpectrumSclArchive) => {
+            GameDiscovery {
+                path: path.to_path_buf(),
+                container: ContainerKind::DirectFile,
+                content: Some(ContentKind::ComputerDisk),
+                platform_hint: Some("ZX Spectrum".to_string()),
+                identity_candidate: identity_for(path, source_root),
+                validation_state: ValidationState::Accepted,
+                explanation: format!(
+                    "ZX Spectrum TR-DOS media. {detail}. Structural platform/media evidence only; \
+                     exact game identity still needs a DAT/catalogue match."
+                ),
+                skip_reason: None,
+            }
+        }
+        _ => skipped(
+            path.to_path_buf(),
+            ContainerKind::DirectFile,
+            Some(ContentKind::ComputerDisk),
+            {
+                let detail = evidence
+                    .refusal
+                    .as_ref()
+                    .map(|r| r.detail())
+                    .unwrap_or_else(|| "not a recognised TR-DOS disk or SCL archive".into());
+                if matches!(
+                    evidence.refusal,
+                    Some(
+                        crate::disk_format::DiskFormatRefusal::NotReadable { .. }
+                            | crate::disk_format::DiskFormatRefusal::Truncated { .. }
+                            | crate::disk_format::DiskFormatRefusal::Cancelled
+                    )
+                ) {
+                    SkipReason::InspectionUnavailable(detail)
+                } else {
+                    SkipReason::InvalidContent(detail)
+                }
+            },
+            "This file is named like ZX Spectrum TR-DOS media but its contents did not validate \
+             as a TR-DOS disk or an SCL archive."
+                .to_string(),
+        ),
+    }
+}
+
+/// `.ssd` and `.dsd` are raw Acorn DFS catalogues. A valid catalogue proves
+/// Acorn/BBC-family disk media, but not BBC Micro versus Acorn Electron; a
+/// containing folder may provide that corroboration. A bare valid image stays
+/// visible but ambiguous, like the shared CPCEMU disk path.
+fn discover_dfs_media(path: &Path, source_root: &Path) -> GameDiscovery {
+    use crate::disk_format::{DiskFormat, DiskFormatContext, inspect_disk_format};
+
+    let evidence = inspect_disk_format(
+        path,
+        &crate::safe_read::TrustedRoots::none(),
+        DiskFormatContext::default(),
+        None,
+    );
+    let detail = evidence
+        .evidence
+        .first()
+        .cloned()
+        .unwrap_or_else(|| "Acorn DFS media".to_string());
+
+    match evidence.format {
+        Some(DiskFormat::AcornDfsDisk) => {
+            let identity = identity_for(path, source_root);
+            match &identity {
+                Some(summary) if summary.platform.is_some() => accepted(
+                    path.to_path_buf(),
+                    ContainerKind::DirectFile,
+                    ContentKind::ComputerDisk,
+                    identity,
+                    format!(
+                        "Acorn DFS computer disk ({detail}; BBC-family and Electron media, \
+                         platform resolved from folder context)."
+                    ),
+                ),
+                _ => GameDiscovery {
+                    path: path.to_path_buf(),
+                    container: ContainerKind::DirectFile,
+                    content: Some(ContentKind::ComputerDisk),
+                    platform_hint: None,
+                    identity_candidate: identity,
+                    validation_state: ValidationState::Skipped,
+                    explanation: format!(
+                        "Valid Acorn DFS disk, but DFS is shared by BBC Micro/BBC Master and \
+                         Acorn Electron and no folder evidence identifies which. {detail}."
+                    ),
+                    skip_reason: Some(SkipReason::AmbiguousPlatform),
+                },
+            }
+        }
+        _ => skipped(
+            path.to_path_buf(),
+            ContainerKind::DirectFile,
+            Some(ContentKind::ComputerDisk),
+            SkipReason::InvalidContent(
+                evidence
+                    .refusal
+                    .as_ref()
+                    .map(|refusal| refusal.detail())
+                    .unwrap_or_else(|| "not a recognised Acorn DFS disk".to_string()),
+            ),
+            "This file is named like Acorn DFS media but its catalogue and geometry did not \
+             validate."
+                .to_string(),
+        ),
+    }
+}
+
+/// `.img` / `.ima` are raw disk-image extensions shared by DOS, the Atari
+/// ST, NEC PC-98, Sharp X68000, digital cameras and more - they are
+/// deliberately *weak* DOS extensions, never strong ones. Resolution runs
+/// through [`crate::dos_boot_evidence`], which validates a FAT12/FAT16 boot
+/// sector and walks the root directory:
+///
+/// 1. a documented DOS system-file pair (`IO.SYS`+`MSDOS.SYS` or
+///    `IBMBIO.COM`+`IBMDOS.COM`) and no other, conflicting platform
+///    already identified -> accepted as DOS-family boot media;
+/// 2. the same pair, but other evidence already names a different platform
+///    -> that platform wins (the existing DOS <-> PC and folder-alias
+///    conflict handling is preserved, never overridden here);
+/// 3. a valid FAT filesystem with no such pair -> a generic computer disk
+///    image, never forced to DOS;
+/// 4. not a readable FAT12/FAT16 boot sector -> refused.
+fn discover_dos_boot_media(path: &Path, source_root: &Path) -> GameDiscovery {
+    use crate::dos_boot_evidence::inspect_dos_boot_media;
+
+    let inspection = inspect_dos_boot_media(path, &crate::safe_read::TrustedRoots::none(), None);
+
+    let Some(volume) = inspection.filesystem else {
+        return skipped(
+            path.to_path_buf(),
+            ContainerKind::DirectFile,
+            Some(ContentKind::ComputerDisk),
+            SkipReason::InvalidContent(
+                inspection
+                    .refusal
+                    .as_ref()
+                    .map(|refusal| refusal.detail())
+                    .unwrap_or_else(|| "not a readable FAT12/FAT16 boot sector".to_string()),
+            ),
+            "This .img/.ima file is not a readable FAT12/FAT16 disk image.".to_string(),
+        );
+    };
+
+    let detail = inspection
+        .observations
+        .first()
+        .cloned()
+        .unwrap_or_else(|| format!("{} filesystem", volume.fat_type.label()));
+    let identity = identity_for(path, source_root);
+    let identified_platform = identity
+        .as_ref()
+        .and_then(|summary| summary.platform.clone());
+
+    if inspection.boot_families.is_empty() {
+        // Valid FAT, no documented DOS system-file pair: a generic disk.
+        return match &identified_platform {
+            Some(platform) => accepted(
+                path.to_path_buf(),
+                ContainerKind::DirectFile,
+                ContentKind::ComputerDisk,
+                identity,
+                format!(
+                    "Computer disk image (valid {} filesystem; platform identified from other \
+                     evidence as {platform}). {detail}.",
+                    volume.fat_type.label()
+                ),
+            ),
+            None => GameDiscovery {
+                path: path.to_path_buf(),
+                container: ContainerKind::DirectFile,
+                content: Some(ContentKind::ComputerDisk),
+                platform_hint: None,
+                identity_candidate: identity,
+                validation_state: ValidationState::Skipped,
+                explanation: format!(
+                    "Valid {} disk image, but it carries no IO.SYS+MSDOS.SYS or \
+                     IBMBIO.COM+IBMDOS.COM pair and nothing else identifies a platform. A FAT \
+                     filesystem alone is not DOS evidence. {detail}.",
+                    volume.fat_type.label()
+                ),
+                skip_reason: Some(SkipReason::RecognizedContentNoIdentityMatch),
+            },
+        };
+    }
+
+    let families: Vec<&str> = inspection
+        .boot_families
+        .iter()
+        .map(|family| family.label())
+        .collect();
+    let family_text = families.join(" and ");
+
+    // A documented DOS system-file pair is present. If other evidence has
+    // already resolved a *different* platform, defer to it rather than
+    // override - this is what preserves the DOS <-> PC conflict behaviour
+    // (and every folder-alias case) unchanged.
+    if let Some(platform) = &identified_platform
+        && platform != "DOS"
+    {
+        return GameDiscovery {
+            path: path.to_path_buf(),
+            container: ContainerKind::DirectFile,
+            content: Some(ContentKind::ComputerDisk),
+            platform_hint: None,
+            identity_candidate: identity,
+            validation_state: ValidationState::Skipped,
+            explanation: format!(
+                "{family_text} system files are present in the FAT root directory, but other \
+                 evidence identifies this as {platform}, which conflicts with DOS. Left \
+                 unresolved rather than overridden. {detail}."
+            ),
+            skip_reason: Some(SkipReason::AmbiguousPlatform),
+        };
+    }
+
+    GameDiscovery {
+        path: path.to_path_buf(),
+        container: ContainerKind::DirectFile,
+        content: Some(ContentKind::ComputerDisk),
+        platform_hint: Some("DOS".to_string()),
+        identity_candidate: identity,
+        validation_state: ValidationState::Accepted,
+        explanation: format!(
+            "{family_text} boot media ({family_text} system files in the FAT root directory). \
+             Structural DOS-family boot evidence only; exact game identity still needs a \
+             DAT/catalogue match. {detail}."
+        ),
+        skip_reason: None,
+    }
+}
+
+/// `.exe` is a DOS MZ / Windows-era executable container. It is registered
+/// as [`ContentKind::Executable`] so it is a first-class discovery item and
+/// its header reaches structural inspection
+/// ([`crate::executable_signatures::parse_mz_header`]), but the extension is
+/// weak/generic and a bare MZ header never resolves DOS:
+///
+/// 1. no readable MZ header -> refused (`InvalidContent`);
+/// 2. a structurally valid MZ header, with a platform already identified by
+///    independent evidence (a DOS folder alias, a `dosbox.conf` layout, ...)
+///    -> accepted under that platform, the MZ structure corroborating it;
+/// 3. a valid MZ header with nothing else identifying a platform -> visible
+///    but [`SkipReason::RecognizedContentNoIdentityMatch`]: `MZ` alone is
+///    shared by DOS and every Windows-era executable.
+fn discover_dos_executable(path: &Path, source_root: &Path) -> GameDiscovery {
+    use crate::executable_signatures::parse_mz_header;
+
+    const MZ_PROBE_BYTES: usize = 512;
+
+    let header = crate::safe_read::open_bounded_read(path, &crate::safe_read::TrustedRoots::none())
+        .ok()
+        .and_then(|mut file| {
+            let file_len = file.len();
+            let want = (file_len as usize).min(MZ_PROBE_BYTES);
+            if want == 0 {
+                return None;
+            }
+            file.read_exact_at(0, want, MZ_PROBE_BYTES)
+                .map(|bytes| (bytes, file_len))
+        });
+
+    let Some((bytes, file_len)) = header else {
+        return skipped(
+            path.to_path_buf(),
+            ContainerKind::DirectFile,
+            Some(ContentKind::Executable),
+            SkipReason::InvalidContent("empty file or unreadable header".to_string()),
+            "This .exe file is empty or its header could not be read.".to_string(),
+        );
+    };
+
+    let Some(fact) = parse_mz_header(&bytes, Some(file_len)) else {
+        return skipped(
+            path.to_path_buf(),
+            ContainerKind::DirectFile,
+            Some(ContentKind::Executable),
+            SkipReason::InvalidContent("no valid DOS MZ executable header".to_string()),
+            "This file is named .exe but has no valid DOS MZ executable header.".to_string(),
+        );
+    };
+
+    let stub_note = if fact.has_extended_header_pointer {
+        " It carries an NE/PE/LE extended-header pointer (a Windows-era executable with an MZ \
+         stub); only the MZ stub was inspected."
+    } else {
+        ""
+    };
+
+    let identity = identity_for(path, source_root);
+    let identified_platform = identity
+        .as_ref()
+        .and_then(|summary| summary.platform.clone());
+
+    match identified_platform {
+        Some(platform) => {
+            let corroboration = if platform == "DOS" {
+                " The MZ executable structure corroborates the DOS identification from other \
+                 evidence."
+            } else {
+                ""
+            };
+            accepted(
+                path.to_path_buf(),
+                ContainerKind::DirectFile,
+                ContentKind::Executable,
+                identity,
+                format!(
+                    "Executable ({platform} identified from other evidence; \
+                     valid DOS MZ header, load module {} bytes).{corroboration}{stub_note}",
+                    fact.load_module_bytes
+                ),
+            )
+        }
+        None => GameDiscovery {
+            path: path.to_path_buf(),
+            container: ContainerKind::DirectFile,
+            content: Some(ContentKind::Executable),
+            platform_hint: None,
+            identity_candidate: identity,
+            validation_state: ValidationState::Skipped,
+            explanation: format!(
+                "Valid DOS MZ executable, but a bare MZ header is shared by DOS and every \
+                 Windows-era executable, and nothing else identifies the platform or game. \
+                 MZ structure alone is not DOS evidence.{stub_note}"
+            ),
+            skip_reason: Some(SkipReason::RecognizedContentNoIdentityMatch),
+        },
+    }
+}
+
+fn identity_for(path: &Path, source_root: &Path) -> Option<IdentitySummary> {
+    let metadata = std::fs::metadata(path).ok();
+    let identity = ArchiveIdentity::from_path(path, source_root, metadata.as_ref());
+    Some(IdentitySummary::from(&identity))
+}
+
+fn accepted(
+    path: PathBuf,
+    container: ContainerKind,
+    content: ContentKind,
+    identity: Option<IdentitySummary>,
+    explanation: String,
+) -> GameDiscovery {
+    let platform_hint = identity
+        .as_ref()
+        .and_then(|summary| summary.platform.clone());
+    GameDiscovery {
+        path,
+        container,
+        content: Some(content),
+        platform_hint,
+        identity_candidate: identity,
+        validation_state: ValidationState::Accepted,
+        explanation,
+        skip_reason: None,
+    }
+}
+
+fn skipped(
+    path: PathBuf,
+    container: ContainerKind,
+    content: Option<ContentKind>,
+    reason: SkipReason,
+    explanation: String,
+) -> GameDiscovery {
+    GameDiscovery {
+        path,
+        container,
+        content,
+        platform_hint: None,
+        identity_candidate: None,
+        validation_state: ValidationState::Skipped,
+        explanation,
+        skip_reason: Some(reason),
+    }
+}
+
+#[cfg(test)]
+mod r2_hygiene_tests {
+    use super::*;
+    #[test]
+    fn r2_private_recovery_entries_are_not_discovered() {
+        let dir = tempfile::tempdir().unwrap();
+        let held = dir.path().join(".emuwiz-r2-holding/tx");
+        std::fs::create_dir_all(&held).unwrap();
+        std::fs::write(held.join("game.bin"), b"game").unwrap();
+        let mut seen = Vec::new();
+        walk_source(dir.path(), |p| {
+            seen.push(p.to_path_buf());
+            Ok(())
+        })
+        .unwrap();
+        assert!(seen.is_empty());
+        assert!(walk_source(&held, |_| panic!("private game visitor invoked")).is_err());
+        #[cfg(unix)]
+        {
+            let alias = dir.path().join("ordinary-name");
+            std::os::unix::fs::symlink(&held, &alias).unwrap();
+            assert!(
+                walk_source(&alias, |_| panic!("aliased private game visitor invoked")).is_err()
+            );
+        }
+    }
+}
+
+#[cfg(test)]
+#[path = "discovery/atari_st_tests.rs"]
+mod atari_st_tests;
+
+#[path = "discovery/atari_st.rs"]
+mod atari_st;

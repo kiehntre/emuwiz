@@ -1,0 +1,2912 @@
+//! Bounded, read-only inspection of local DuckStation profiles.
+//!
+//! DuckStation consumes identity that core has already established.  In
+//! particular, its serials, profile names, cheat filenames, texture-pack
+//! directories, and M3U playlists are emulator context only: this module does
+//! not emit identity evidence or select a winner between emulator metadata and
+//! Redump/CHD evidence.  It never starts DuckStation, writes a file, follows a
+//! symlink, or recursively searches a home directory.
+
+use std::collections::{BTreeMap, VecDeque};
+use std::env;
+use std::fs::{self, OpenOptions};
+use std::io::{self, Read};
+use std::path::{Path, PathBuf};
+
+#[cfg(unix)]
+use std::os::unix::fs::OpenOptionsExt;
+#[cfg(unix)]
+use std::os::unix::fs::PermissionsExt;
+
+use serde::Serialize;
+
+use crate::game_identity::serial_from_boot_path;
+use crate::launch::installation::LaunchInstallation;
+use crate::launch::installation_known::{
+    DUCKSTATION as KNOWN_DUCKSTATION, KnownInstallRoots, discover_appimages, discover_flatpaks,
+    flatpak_binary, flatpak_wrapper_app_id, portable_marker_beside,
+};
+use crate::platform_evidence_fusion::evidence_lineage::{ClaimType, Representation};
+
+pub const DUCKSTATION_MAX_PROFILES: usize = 16;
+pub const DUCKSTATION_MAX_CONFIG_BYTES: u64 = 256 * 1024;
+pub const DUCKSTATION_MAX_CHEAT_BYTES: u64 = 512 * 1024;
+pub const DUCKSTATION_MAX_PATCH_BYTES: u64 = 512 * 1024;
+pub const DUCKSTATION_MAX_PLAYLIST_BYTES: u64 = 256 * 1024;
+pub const DUCKSTATION_MAX_DIRECTORY_ENTRIES: usize = 10_000;
+pub const DUCKSTATION_MAX_TEXTURE_FILES: usize = 2_048;
+pub const DUCKSTATION_MAX_TEXTURE_DEPTH: usize = 2;
+pub const DUCKSTATION_MAX_SAVE_STATE_CANDIDATES: usize = 128;
+pub const DUCKSTATION_MAX_PLAYLIST_ENTRIES: usize = 64;
+
+const FLATPAK_APP_ID: &str = "org.duckstation.DuckStation";
+const MAX_INI_LINES: usize = 8_192;
+const MAX_INI_LINE_BYTES: usize = 8 * 1024;
+const MAX_UNKNOWN_SETTINGS: usize = 256;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum DuckStationInstallationType {
+    Native,
+    FlatpakUser,
+    Portable,
+    Explicit,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum DuckStationWarningKind {
+    UnsafePath,
+    UnreadablePath,
+    SymlinkSkipped,
+    SpecialFileSkipped,
+    FileTooLarge,
+    InvalidUtf8,
+    MalformedIni,
+    EntryLimitReached,
+    FileCountLimitReached,
+    DepthLimitReached,
+    PlaylistEntryLimitReached,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DuckStationWarning {
+    pub kind: DuckStationWarningKind,
+    pub path: PathBuf,
+    pub detail: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DuckStationExecutable {
+    pub path: PathBuf,
+    pub installation_type: DuckStationInstallationType,
+    /// Native, AppImage or `flatpak run` (then `path` is the `flatpak` program).
+    pub launch: LaunchInstallation,
+    /// Discovery never executes a binary.  An authorized outer probe may pass
+    /// its text to [`parse_duckstation_version`] through discovery roots.
+    pub version: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DuckStationProfile {
+    pub profile_id: String,
+    pub installation_type: DuckStationInstallationType,
+    pub configuration_path: PathBuf,
+    /// Where this candidate directory came from - e.g. `"XDG_CONFIG_HOME
+    /// DuckStation directory"` vs. `"AppImage-adjacent directory (from
+    /// $APPIMAGE)"`. Both currently report [`DuckStationInstallationType::Portable`],
+    /// so this is the only way to tell a genuine caller-confirmed portable
+    /// root apart from an AppImage-derived one - see
+    /// `resolve_duckstation_native_launch_binding`'s own doc comment for
+    /// why that distinction currently still leads both to being blocked.
+    pub provenance: &'static str,
+    pub eligible: bool,
+    pub blocker: Option<String>,
+    pub executable_candidates: Vec<DuckStationExecutable>,
+    pub global_config_path: PathBuf,
+    pub game_settings_path: PathBuf,
+    pub cheats_path: PathBuf,
+    pub patches_path: PathBuf,
+    pub textures_path: PathBuf,
+    pub bios_path: PathBuf,
+    pub memory_cards_path: PathBuf,
+    pub save_states_path: PathBuf,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DuckStationProfileDiscovery {
+    pub profiles: Vec<DuckStationProfile>,
+    pub complete: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DuckStationProfileDiscoveryRoots {
+    pub home: PathBuf,
+    pub xdg_config_home: PathBuf,
+    pub xdg_data_home: PathBuf,
+    /// Whether `$XDG_CONFIG_HOME` was actually present in the environment
+    /// (and absolute) - not merely whether [`Self::xdg_config_home`] holds
+    /// a value, since that field always holds one (defaulting to
+    /// `~/.config`). This distinction matters because DuckStation's own
+    /// `Core::SetDataRoot()` (see `resolve_duckstation_native_launch_binding`'s
+    /// own doc comment for the exact proven upstream logic this mirrors)
+    /// only consults `$XDG_CONFIG_HOME` when the *environment variable
+    /// itself* is set; when it is absent, DuckStation does not fall back
+    /// to `~/.config` at all - it falls back to a hardcoded
+    /// `~/.local/share` (never `$XDG_DATA_HOME`, even if set). Native
+    /// launch binding needs to reproduce that exact branch, which the
+    /// already-defaulted [`Self::xdg_config_home`] field alone cannot
+    /// distinguish.
+    pub xdg_config_home_explicit: bool,
+    /// Exact roots deliberately supplied by the caller.  They are not found
+    /// by a broad filesystem walk.
+    pub explicit_configuration_roots: Vec<PathBuf>,
+    pub portable_configuration_roots: Vec<PathBuf>,
+    pub explicit_executables: Vec<PathBuf>,
+    pub known_version_outputs: BTreeMap<PathBuf, String>,
+    pub appimage_directory: Option<PathBuf>,
+    /// Optional controlled PATH directories for deterministic callers and
+    /// tests. `None` means use the process environment in production.
+    pub path_override: Option<Vec<PathBuf>>,
+}
+
+impl DuckStationProfileDiscoveryRoots {
+    pub fn from_environment() -> Result<Self, DuckStationDiscoveryError> {
+        let home = env::var_os("HOME")
+            .map(PathBuf::from)
+            .ok_or(DuckStationDiscoveryError::HomeUnavailable)?;
+        let xdg_config_home_var = env::var_os("XDG_CONFIG_HOME").map(PathBuf::from);
+        // Mirrors DuckStation's own `getenv("XDG_CONFIG_HOME") && Path::IsAbsolute(...)`
+        // check exactly - present but relative is treated the same as absent.
+        let xdg_config_home_explicit = xdg_config_home_var
+            .as_deref()
+            .is_some_and(Path::is_absolute);
+        let xdg_config_home = xdg_config_home_var.unwrap_or_else(|| home.join(".config"));
+        let xdg_data_home = env::var_os("XDG_DATA_HOME")
+            .map(PathBuf::from)
+            .unwrap_or_else(|| home.join(".local/share"));
+        let appimage_directory = env::var_os("APPIMAGE")
+            .map(PathBuf::from)
+            .and_then(|path| path.parent().map(Path::to_path_buf));
+        // The data root of a known portable AppImage is the directory it
+        // sits in; only AppImages with a marker beside them qualify.
+        let portable_configuration_roots = KnownInstallRoots::from_environment()
+            .map(|known| {
+                discover_appimages(&KNOWN_DUCKSTATION, &known)
+                    .into_iter()
+                    .filter(|found| found.portable_marker.is_some())
+                    .filter_map(|found| found.path.parent().map(Path::to_path_buf))
+                    .collect()
+            })
+            .unwrap_or_default();
+        Ok(Self {
+            home,
+            xdg_config_home,
+            xdg_data_home,
+            xdg_config_home_explicit,
+            explicit_configuration_roots: Vec::new(),
+            portable_configuration_roots,
+            explicit_executables: Vec::new(),
+            known_version_outputs: BTreeMap::new(),
+            appimage_directory,
+            path_override: None,
+        })
+    }
+}
+
+#[derive(Debug)]
+pub enum DuckStationDiscoveryError {
+    HomeUnavailable,
+}
+
+impl std::fmt::Display for DuckStationDiscoveryError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::HomeUnavailable => formatter.write_str("HOME is not set"),
+        }
+    }
+}
+
+impl std::error::Error for DuckStationDiscoveryError {}
+
+/// A preservation fact passed in by core.  This remains descriptive context;
+/// DuckStation never compares its serial with either hash value.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DuckStationDiscContext {
+    pub disc_number: u8,
+    pub representation: Representation,
+    pub claim: ClaimType,
+}
+
+/// Identity input deliberately separates an authoritative serial from one
+/// merely exposed by DuckStation.  `disc_contexts` preserves separate discs;
+/// no M3U title or filename can collapse them into one exact disc claim.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct DuckStationGameRequest {
+    pub verified_ps1_serial: Option<String>,
+    pub emulator_serial: Option<String>,
+    pub disc_contexts: Vec<DuckStationDiscContext>,
+    pub playlist_path: Option<PathBuf>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum DuckStationSerialMapping {
+    VerifiedPs1Serial,
+    EmulatorMetadataOnly,
+    ConflictingEmulatorMetadata,
+    Unavailable,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct DuckStationSettings {
+    pub renderer: Option<String>,
+    pub internal_resolution_scale: Option<String>,
+    pub texture_filtering: Option<String>,
+    pub pgxp_enabled: Option<bool>,
+    pub widescreen_enabled: Option<bool>,
+    pub vsync_enabled: Option<bool>,
+    pub frame_pacing: Option<String>,
+    pub frame_limit: Option<String>,
+    pub cpu_execution_mode: Option<String>,
+    pub audio_backend: Option<String>,
+    pub rewind_enabled: Option<bool>,
+    pub runahead_enabled: Option<bool>,
+    pub cheats_enabled: Option<bool>,
+    pub texture_replacements_enabled: Option<bool>,
+    pub controller_profile_present: Option<bool>,
+    pub bios_directory: Option<String>,
+    pub bios_filename: Option<String>,
+    pub memory_card_mode: Option<String>,
+    pub unknown: BTreeMap<String, String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DuckStationConfigInspection {
+    pub path: PathBuf,
+    pub exists: bool,
+    pub readable: bool,
+    pub settings: DuckStationSettings,
+    pub warnings: Vec<DuckStationWarning>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum DuckStationBiosState {
+    /// A trusted hash source confirmed this exact file - see
+    /// `patch_manager::duckstation_firmware::resolve_duckstation_bios`,
+    /// which is the only place this variant is ever produced. Never
+    /// produced by this module itself (filename/existence alone never
+    /// verifies a BIOS) - see [`Self::PresentUnverified`].
+    Verified,
+    Unknown,
+    Missing,
+    PresentUnverified,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DuckStationBiosInventory {
+    pub configured_path: Option<PathBuf>,
+    pub state: DuckStationBiosState,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DuckStationCheatInventory {
+    pub path: PathBuf,
+    pub exists: bool,
+    pub entries: usize,
+    pub enabled_entries: usize,
+    pub warnings: Vec<DuckStationWarning>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DuckStationPatchInventory {
+    pub path: PathBuf,
+    pub exists: bool,
+    pub entries: usize,
+    pub warnings: Vec<DuckStationWarning>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DuckStationTextureInventory {
+    pub path: PathBuf,
+    pub present: bool,
+    pub enabled: Option<bool>,
+    pub file_count: usize,
+    pub total_size_bytes: u64,
+    pub complete: bool,
+    pub warnings: Vec<DuckStationWarning>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DuckStationMemoryCardInventory {
+    /// A serial-named candidate, not proof that a memory card belongs
+    /// exclusively to this title.  Only explicit DuckStation configuration
+    /// could establish that stronger relationship.
+    pub per_game_card_candidate: Option<PathBuf>,
+    pub shared_cards: Vec<PathBuf>,
+    pub complete: bool,
+    pub warnings: Vec<DuckStationWarning>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DuckStationSaveStateInventory {
+    pub candidate_paths: Vec<PathBuf>,
+    pub complete: bool,
+    pub warnings: Vec<DuckStationWarning>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DuckStationPlaylistInventory {
+    pub path: PathBuf,
+    pub exists: bool,
+    pub entries: Vec<String>,
+    pub complete: bool,
+    pub warnings: Vec<DuckStationWarning>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DuckStationHealth {
+    pub detected: bool,
+    pub config_readable: bool,
+    pub bios: DuckStationBiosState,
+    pub serial_mapping: DuckStationSerialMapping,
+    pub warnings: Vec<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DuckStationGameInspection {
+    pub serial: Option<String>,
+    /// The raw emulator value is retained only as context.  It is not
+    /// normalized into a preservation claim when unresolved or conflicting.
+    pub emulator_serial_context: Option<String>,
+    pub serial_mapping: DuckStationSerialMapping,
+    pub identity_mismatch: Option<String>,
+    pub disc_contexts: Vec<DuckStationDiscContext>,
+    pub playlist: Option<DuckStationPlaylistInventory>,
+    pub global_config: DuckStationConfigInspection,
+    pub per_game_config: Option<DuckStationConfigInspection>,
+    pub overridden_setting_keys: Vec<String>,
+    pub cheats: Option<DuckStationCheatInventory>,
+    pub patches: Option<DuckStationPatchInventory>,
+    pub textures: Option<DuckStationTextureInventory>,
+    pub memory_cards: Option<DuckStationMemoryCardInventory>,
+    pub save_states: Option<DuckStationSaveStateInventory>,
+    /// The configured BIOS path (if any) and its presence-only state -
+    /// exposed here (mirroring `Pcsx2GameInspection::bios`) so a firmware
+    /// verifier can locate the exact file to hash without re-parsing
+    /// configuration itself. See `patch_manager::duckstation_firmware`.
+    pub bios: DuckStationBiosInventory,
+    pub health: DuckStationHealth,
+}
+
+#[derive(Debug, Clone)]
+struct ProfileCandidate {
+    installation_type: DuckStationInstallationType,
+    path: PathBuf,
+    provenance: &'static str,
+}
+
+/// Discover documented native and Flatpak roots plus exact caller-provided
+/// portable/custom roots.  The executable search is bounded to PATH entries
+/// and exact supplied/AppImage-adjacent paths; no binary is executed.
+pub fn discover_duckstation_profiles(
+    roots: &DuckStationProfileDiscoveryRoots,
+) -> DuckStationProfileDiscovery {
+    let mut candidates = vec![
+        ProfileCandidate {
+            installation_type: DuckStationInstallationType::Native,
+            path: roots.xdg_config_home.join("duckstation"),
+            provenance: "XDG_CONFIG_HOME DuckStation directory",
+        },
+        ProfileCandidate {
+            installation_type: DuckStationInstallationType::Native,
+            path: roots.xdg_data_home.join("duckstation"),
+            provenance: "XDG_DATA_HOME fallback DuckStation directory",
+        },
+        ProfileCandidate {
+            installation_type: DuckStationInstallationType::FlatpakUser,
+            path: roots
+                .home
+                .join(".var/app")
+                .join(FLATPAK_APP_ID)
+                .join("config/duckstation"),
+            provenance: "Flatpak org.duckstation.DuckStation user configuration directory",
+        },
+        ProfileCandidate {
+            installation_type: DuckStationInstallationType::FlatpakUser,
+            path: roots
+                .home
+                .join(".var/app")
+                .join(FLATPAK_APP_ID)
+                .join("data/duckstation"),
+            provenance: "Flatpak user data directory",
+        },
+    ];
+    candidates.extend(
+        roots
+            .portable_configuration_roots
+            .iter()
+            .cloned()
+            .map(|path| ProfileCandidate {
+                installation_type: DuckStationInstallationType::Portable,
+                path,
+                provenance: "caller-confirmed portable configuration root",
+            }),
+    );
+    if let Some(directory) = &roots.appimage_directory {
+        candidates.push(ProfileCandidate {
+            installation_type: DuckStationInstallationType::Portable,
+            path: directory.join("duckstation"),
+            provenance: "AppImage-adjacent directory (from $APPIMAGE)",
+        });
+    }
+    candidates.extend(
+        roots
+            .explicit_configuration_roots
+            .iter()
+            .cloned()
+            .map(|path| ProfileCandidate {
+                installation_type: DuckStationInstallationType::Explicit,
+                path,
+                provenance: "explicit caller-confirmed configuration root",
+            }),
+    );
+    candidates.sort_by(|left, right| left.path.cmp(&right.path));
+    candidates.dedup_by(|left, right| left.path == right.path);
+
+    let executables = discover_executables(roots);
+    let mut profiles = Vec::new();
+    for candidate in candidates.into_iter().take(DUCKSTATION_MAX_PROFILES) {
+        if !candidate.path.exists()
+            && !matches!(
+                candidate.installation_type,
+                DuckStationInstallationType::Explicit | DuckStationInstallationType::Portable
+            )
+        {
+            continue;
+        }
+        profiles.push(validate_profile(candidate, &executables));
+    }
+    DuckStationProfileDiscovery {
+        complete: true,
+        profiles,
+    }
+}
+
+/// Parses externally obtained version output; discovery itself never runs an
+/// executable.  Non-version text is valid and simply reports `None`.
+pub fn parse_duckstation_version(output: &str) -> Option<String> {
+    let text = output.trim();
+    let position = text.to_ascii_lowercase().find("duckstation")?;
+    let tail = text[position + "duckstation".len()..].trim_start();
+    let tail = tail.strip_prefix('v').unwrap_or(tail);
+    let version: String = tail
+        .chars()
+        .take_while(|character| character.is_ascii_digit() || *character == '.')
+        .collect();
+    (version.split('.').count() >= 2 && version.chars().any(|character| character.is_ascii_digit()))
+        .then_some(version)
+}
+
+/// Uses the existing reviewed boot-path serial grammar rather than a local
+/// prefix list.  It accepts only core's canonical `XXXX-12345` output shape.
+pub fn normalize_duckstation_ps1_serial(value: &str) -> Option<String> {
+    let value = value.trim();
+    let bytes = value.as_bytes();
+    if bytes.len() != 10
+        || bytes[4] != b'-'
+        || !bytes[..4].iter().all(u8::is_ascii_alphanumeric)
+        || !bytes[5..].iter().all(u8::is_ascii_digit)
+    {
+        return None;
+    }
+    // `serial_from_boot_path` defines the accepted grammar.  It expects the
+    // original executable filename (`SLUS_123.45`), while core hands this
+    // adapter its canonical output (`SLUS-12345`), so reconstruct only that
+    // reversible shape before asking the existing parser to validate it.
+    let boot_name = format!("{}_{}.{}", &value[..4], &value[5..8], &value[8..10]);
+    serial_from_boot_path(boot_name.as_bytes())
+}
+
+/// Inspects local settings/assets after core supplies identity context.  It
+/// intentionally returns no `EvidenceObservation` and has no mutation path.
+pub fn inspect_duckstation_game(
+    profile: &DuckStationProfile,
+    request: &DuckStationGameRequest,
+) -> DuckStationGameInspection {
+    let global_config = inspect_config(&profile.global_config_path);
+    let (serial, serial_mapping, mismatch) = select_serial(request);
+    let per_game_config = serial.as_ref().and_then(|serial| {
+        let path = profile.game_settings_path.join(format!("{serial}.ini"));
+        is_regular_file(&path).then(|| inspect_config(&path))
+    });
+    let overridden_setting_keys = per_game_config
+        .as_ref()
+        .map(|config| differing_keys(&global_config.settings, &config.settings))
+        .unwrap_or_default();
+    let cheats = serial
+        .as_ref()
+        .map(|serial| inspect_cheats(&profile.cheats_path.join(format!("{serial}.cht"))));
+    let patches = serial
+        .as_ref()
+        .map(|serial| inspect_patches(&profile.patches_path, serial));
+    let textures = serial.as_ref().map(|serial| {
+        inspect_textures(
+            &profile.textures_path.join(serial),
+            global_config.settings.texture_replacements_enabled,
+        )
+    });
+    let memory_cards = serial
+        .as_ref()
+        .map(|serial| inspect_memory_cards(&profile.memory_cards_path, serial));
+    let save_states = serial
+        .as_ref()
+        .map(|serial| inspect_save_states(&profile.save_states_path, serial));
+    let playlist = request.playlist_path.as_deref().map(inspect_playlist);
+    let bios = inspect_bios(profile, &global_config.settings);
+    let mut warning_text: Vec<String> = global_config
+        .warnings
+        .iter()
+        .map(|warning| warning.detail.clone())
+        .collect();
+    if let Some(mismatch) = &mismatch {
+        warning_text.push(mismatch.clone());
+    }
+    let health = DuckStationHealth {
+        detected: profile.eligible || !profile.executable_candidates.is_empty(),
+        config_readable: global_config.readable,
+        bios: bios.state,
+        serial_mapping,
+        warnings: warning_text,
+    };
+    DuckStationGameInspection {
+        serial,
+        emulator_serial_context: request.emulator_serial.clone(),
+        serial_mapping,
+        identity_mismatch: mismatch,
+        disc_contexts: request
+            .disc_contexts
+            .iter()
+            .take(DUCKSTATION_MAX_PLAYLIST_ENTRIES)
+            .cloned()
+            .collect(),
+        playlist,
+        global_config,
+        per_game_config,
+        overridden_setting_keys,
+        cheats,
+        patches,
+        textures,
+        memory_cards,
+        save_states,
+        bios,
+        health,
+    }
+}
+
+fn validate_profile(
+    candidate: ProfileCandidate,
+    executables: &[DuckStationExecutable],
+) -> DuckStationProfile {
+    let global_config_path = candidate.path.join("settings.ini");
+    let blocker = if !candidate.path.is_absolute() {
+        Some("configuration path is not absolute".to_string())
+    } else if candidate.path.parent().is_none() {
+        Some("a filesystem root cannot be a DuckStation profile".to_string())
+    } else if !is_real_directory(&candidate.path) {
+        Some("configuration directory is absent, unsafe, or not a real directory".to_string())
+    } else if !is_regular_file(&global_config_path) {
+        Some("settings.ini was not found as a regular file".to_string())
+    } else {
+        None
+    };
+    DuckStationProfile {
+        profile_id: format!("duckstation:{}", candidate.path.display()),
+        installation_type: candidate.installation_type,
+        configuration_path: candidate.path.clone(),
+        provenance: candidate.provenance,
+        eligible: blocker.is_none(),
+        blocker,
+        executable_candidates: executables.to_vec(),
+        global_config_path,
+        game_settings_path: candidate.path.join("gamesettings"),
+        cheats_path: candidate.path.join("cheats"),
+        patches_path: candidate.path.join("patches"),
+        textures_path: candidate.path.join("textures"),
+        bios_path: candidate.path.join("bios"),
+        memory_cards_path: candidate.path.join("memcards"),
+        save_states_path: candidate.path.join("savestates"),
+    }
+}
+
+/// Every DuckStation executable discovery knows, for the profile resolver.
+pub(crate) fn discover_duckstation_executables(
+    roots: &DuckStationProfileDiscoveryRoots,
+) -> Vec<DuckStationExecutable> {
+    discover_executables(roots)
+}
+
+fn discover_executables(roots: &DuckStationProfileDiscoveryRoots) -> Vec<DuckStationExecutable> {
+    let mut candidates = roots.explicit_executables.clone();
+    for directory in [
+        roots.home.join("Applications"),
+        roots.home.join(".local/bin"),
+        roots.home.join(".local/share/applications"),
+        roots.home.join("AppImages"),
+        roots.home.join("bin"),
+    ] {
+        candidates.extend([
+            directory.join("DuckStation"),
+            directory.join("duckstation"),
+            directory.join("duckstation-qt"),
+            directory.join("duckstation-nogui"),
+            directory.join("DuckStation.AppImage"),
+            directory.join("duckstation.AppImage"),
+            directory.join("DuckStation").join("DuckStation.AppImage"),
+            directory.join("DuckStation").join("duckstation-qt"),
+        ]);
+    }
+    if let Some(directory) = &roots.appimage_directory {
+        candidates.extend([
+            directory.join("DuckStation.AppImage"),
+            directory.join("duckstation-qt.AppImage"),
+            directory.join("duckstation-qt"),
+        ]);
+    }
+    let path_directories = roots
+        .path_override
+        .clone()
+        .or_else(|| env::var_os("PATH").map(|path| env::split_paths(&path).collect()));
+    if let Some(path_directories) = path_directories {
+        for directory in path_directories.into_iter().take(128) {
+            candidates.extend([
+                directory.join("duckstation-qt"),
+                directory.join("duckstation"),
+            ]);
+        }
+    }
+    let known = known_install_roots(roots);
+    // Known AppImage locations beyond the fixed names above (for example
+    // `~/Applications/emulators/DuckStation.AppImage`).
+    candidates.extend(
+        discover_appimages(&KNOWN_DUCKSTATION, &known)
+            .into_iter()
+            .map(|found| found.path),
+    );
+    candidates.sort();
+    candidates.dedup();
+    let mut executables: Vec<DuckStationExecutable> = candidates
+        .into_iter()
+        .filter(|path| is_regular_file(path))
+        .filter(|path| flatpak_wrapper_app_id(path).is_none())
+        .map(|path| {
+            let is_appimage = path
+                .extension()
+                .is_some_and(|extension| extension.eq_ignore_ascii_case("AppImage"));
+            // An AppImage with a portable marker beside it keeps its data
+            // there (Portable profile); without one it uses the default
+            // data root, like a native install.
+            let portable =
+                is_appimage && portable_marker_beside(&KNOWN_DUCKSTATION, &path).is_some();
+            DuckStationExecutable {
+                installation_type: if roots.explicit_executables.contains(&path) {
+                    DuckStationInstallationType::Explicit
+                } else if portable
+                    || roots
+                        .appimage_directory
+                        .as_ref()
+                        .is_some_and(|root| path.starts_with(root))
+                {
+                    DuckStationInstallationType::Portable
+                } else {
+                    DuckStationInstallationType::Native
+                },
+                launch: if is_appimage {
+                    LaunchInstallation::AppImage {
+                        extract_and_run: false,
+                    }
+                } else {
+                    LaunchInstallation::Native
+                },
+                version: roots
+                    .known_version_outputs
+                    .get(&path)
+                    .and_then(|text| parse_duckstation_version(text)),
+                path,
+            }
+        })
+        .collect();
+    if let (Some(found), Some(program)) = (
+        discover_flatpaks(&KNOWN_DUCKSTATION, &known).first(),
+        flatpak_binary(&known),
+    ) && let Ok(launch) = LaunchInstallation::flatpak(&found.app_id)
+    {
+        executables.push(DuckStationExecutable {
+            path: program,
+            installation_type: DuckStationInstallationType::FlatpakUser,
+            launch,
+            version: None,
+        });
+    }
+    executables
+}
+
+fn known_install_roots(roots: &DuckStationProfileDiscoveryRoots) -> KnownInstallRoots {
+    KnownInstallRoots {
+        home: roots.home.clone(),
+        user_data: roots.xdg_data_home.clone(),
+        system_data: PathBuf::from("/var/lib"),
+        path_dirs: roots.path_override.clone().unwrap_or_else(|| {
+            env::var_os("PATH")
+                .map(|path| env::split_paths(&path).take(128).collect())
+                .unwrap_or_default()
+        }),
+    }
+}
+
+fn select_serial(
+    request: &DuckStationGameRequest,
+) -> (Option<String>, DuckStationSerialMapping, Option<String>) {
+    let verified = request
+        .verified_ps1_serial
+        .as_deref()
+        .and_then(normalize_duckstation_ps1_serial);
+    let emulator = request
+        .emulator_serial
+        .as_deref()
+        .and_then(normalize_duckstation_ps1_serial);
+    match (verified, emulator) {
+        (Some(verified), Some(emulator)) if verified != emulator => (
+            Some(verified.clone()),
+            DuckStationSerialMapping::ConflictingEmulatorMetadata,
+            Some(format!(
+                "DuckStation serial {emulator} conflicts with authoritative PS1 serial {verified}"
+            )),
+        ),
+        (Some(verified), _) => (
+            Some(verified),
+            DuckStationSerialMapping::VerifiedPs1Serial,
+            None,
+        ),
+        (None, Some(emulator)) => (
+            Some(emulator),
+            DuckStationSerialMapping::EmulatorMetadataOnly,
+            None,
+        ),
+        (None, None) => (None, DuckStationSerialMapping::Unavailable, None),
+    }
+}
+
+fn inspect_config(path: &Path) -> DuckStationConfigInspection {
+    let exists = path.exists();
+    let mut warnings = Vec::new();
+    let Some(text) = read_text(path, DUCKSTATION_MAX_CONFIG_BYTES, &mut warnings) else {
+        return DuckStationConfigInspection {
+            path: path.to_path_buf(),
+            exists,
+            readable: false,
+            settings: DuckStationSettings::default(),
+            warnings,
+        };
+    };
+    DuckStationConfigInspection {
+        path: path.to_path_buf(),
+        exists,
+        readable: true,
+        settings: parse_settings(&text, path, &mut warnings),
+        warnings,
+    }
+}
+
+fn parse_settings(
+    text: &str,
+    path: &Path,
+    warnings: &mut Vec<DuckStationWarning>,
+) -> DuckStationSettings {
+    let mut settings = DuckStationSettings::default();
+    let mut section = String::new();
+    for (index, raw) in text.lines().enumerate() {
+        if index >= MAX_INI_LINES {
+            warn(
+                warnings,
+                DuckStationWarningKind::EntryLimitReached,
+                path,
+                format!("INI parsing stopped at {MAX_INI_LINES} lines"),
+            );
+            break;
+        }
+        if raw.len() > MAX_INI_LINE_BYTES {
+            warn(
+                warnings,
+                DuckStationWarningKind::FileTooLarge,
+                path,
+                format!("INI line exceeds {MAX_INI_LINE_BYTES} bytes"),
+            );
+            continue;
+        }
+        let line = raw.trim();
+        if line.is_empty() || line.starts_with(';') || line.starts_with('#') {
+            continue;
+        }
+        if line.starts_with('[') {
+            if let Some(value) = line.strip_suffix(']') {
+                section = value[1..].trim().to_ascii_lowercase();
+            } else {
+                warn(
+                    warnings,
+                    DuckStationWarningKind::MalformedIni,
+                    path,
+                    "INI section does not end with ']'",
+                );
+            }
+            continue;
+        }
+        let Some((key, value)) = line.split_once('=') else {
+            warn(
+                warnings,
+                DuckStationWarningKind::MalformedIni,
+                path,
+                "INI setting has no '=' separator",
+            );
+            continue;
+        };
+        let key = key.trim();
+        let value = value.trim();
+        if key.is_empty() {
+            warn(
+                warnings,
+                DuckStationWarningKind::MalformedIni,
+                path,
+                "INI setting has an empty key",
+            );
+            continue;
+        }
+        apply_setting(&mut settings, &section, key, value);
+    }
+    settings
+}
+
+fn apply_setting(settings: &mut DuckStationSettings, section: &str, key: &str, value: &str) {
+    let key = key.to_ascii_lowercase();
+    let boolean = parse_bool(value);
+    match key.as_str() {
+        "renderer" | "gpu_renderer" => settings.renderer = Some(value.to_string()),
+        "resolutionscale" | "resolution_scale" | "internal_resolution_scale" => {
+            settings.internal_resolution_scale = Some(value.to_string())
+        }
+        "texturefiltering" | "texture_filtering" => {
+            settings.texture_filtering = Some(value.to_string())
+        }
+        "pgxpenable" | "pgxp_enable" | "pgxp_enabled" => settings.pgxp_enabled = boolean,
+        "widescreenhack" | "widescreen_hack" | "widescreen_enabled" => {
+            settings.widescreen_enabled = boolean
+        }
+        "vsync" | "vsyncenabled" | "vsync_enabled" => settings.vsync_enabled = boolean,
+        "framepacing" | "frame_pacing" => settings.frame_pacing = Some(value.to_string()),
+        "framelimit" | "frame_limit" => settings.frame_limit = Some(value.to_string()),
+        "cpuexecutionmode" | "cpu_execution_mode" | "cpu_mode" => {
+            settings.cpu_execution_mode = Some(value.to_string())
+        }
+        "audiobackend" | "audio_backend" => settings.audio_backend = Some(value.to_string()),
+        "rewindenable" | "rewind_enable" | "rewind_enabled" => settings.rewind_enabled = boolean,
+        "runaheadenable" | "runahead_enable" | "runahead_enabled" => {
+            settings.runahead_enabled = boolean
+        }
+        "enablecheats" | "enable_cheats" | "cheats_enabled" => settings.cheats_enabled = boolean,
+        "texturereplacements" | "texture_replacements" | "texture_replacements_enabled" => {
+            settings.texture_replacements_enabled = boolean
+        }
+        "controllerprofile" | "controller_profile" | "controller_profile_name" => {
+            settings.controller_profile_present = Some(!value.is_empty())
+        }
+        "biosdirectory" | "bios_directory" | "bios_path" => {
+            settings.bios_directory = Some(value.to_string())
+        }
+        "biosfilename" | "bios_filename" => settings.bios_filename = Some(value.to_string()),
+        // A bare `BIOS` key is only a legacy filename alias in a section that
+        // can hold one. DuckStation's own `[Logging] BIOS = true` is a log
+        // category flag and must never be read as a BIOS file called `true`.
+        "bios" if matches!(section, "" | "bios" | "main") => {
+            settings.bios_filename = Some(value.to_string())
+        }
+        "memorycardmode" | "memory_card_mode" => {
+            settings.memory_card_mode = Some(value.to_string())
+        }
+        _ if settings.unknown.len() < MAX_UNKNOWN_SETTINGS => {
+            settings
+                .unknown
+                .insert(format!("{section}.{key}"), value.to_string());
+        }
+        _ => {}
+    }
+}
+
+fn parse_bool(value: &str) -> Option<bool> {
+    match value.trim().to_ascii_lowercase().as_str() {
+        "1" | "true" | "yes" | "on" | "enabled" => Some(true),
+        "0" | "false" | "no" | "off" | "disabled" => Some(false),
+        _ => None,
+    }
+}
+
+fn differing_keys(global: &DuckStationSettings, game: &DuckStationSettings) -> Vec<String> {
+    let global = flattened_settings(global);
+    let game = flattened_settings(game);
+    game.into_iter()
+        .filter_map(|(key, value)| (global.get(&key) != Some(&value)).then_some(key))
+        .collect()
+}
+
+fn flattened_settings(settings: &DuckStationSettings) -> BTreeMap<String, String> {
+    let mut values = settings.unknown.clone();
+    for (key, value) in [
+        ("renderer", settings.renderer.clone()),
+        (
+            "internal_resolution_scale",
+            settings.internal_resolution_scale.clone(),
+        ),
+        ("texture_filtering", settings.texture_filtering.clone()),
+        ("frame_pacing", settings.frame_pacing.clone()),
+        ("frame_limit", settings.frame_limit.clone()),
+        ("cpu_execution_mode", settings.cpu_execution_mode.clone()),
+        ("audio_backend", settings.audio_backend.clone()),
+        ("bios_directory", settings.bios_directory.clone()),
+        ("bios_filename", settings.bios_filename.clone()),
+        ("memory_card_mode", settings.memory_card_mode.clone()),
+    ] {
+        if let Some(value) = value {
+            values.insert(key.to_string(), value);
+        }
+    }
+    for (key, value) in [
+        ("pgxp_enabled", settings.pgxp_enabled),
+        ("widescreen_enabled", settings.widescreen_enabled),
+        ("vsync_enabled", settings.vsync_enabled),
+        ("rewind_enabled", settings.rewind_enabled),
+        ("runahead_enabled", settings.runahead_enabled),
+        ("cheats_enabled", settings.cheats_enabled),
+        (
+            "texture_replacements_enabled",
+            settings.texture_replacements_enabled,
+        ),
+        (
+            "controller_profile_present",
+            settings.controller_profile_present,
+        ),
+    ] {
+        if let Some(value) = value {
+            values.insert(key.to_string(), value.to_string());
+        }
+    }
+    values
+}
+
+fn inspect_bios(
+    profile: &DuckStationProfile,
+    settings: &DuckStationSettings,
+) -> DuckStationBiosInventory {
+    let directory = settings
+        .bios_directory
+        .as_deref()
+        .map(PathBuf::from)
+        .unwrap_or_else(|| profile.bios_path.clone());
+    let configured_path = settings
+        .bios_filename
+        .as_deref()
+        .filter(|name| !name.is_empty())
+        .map(|name| directory.join(name));
+    let state = match configured_path.as_deref() {
+        Some(path) if is_regular_file(path) => DuckStationBiosState::PresentUnverified,
+        Some(_) => DuckStationBiosState::Missing,
+        None => DuckStationBiosState::Unknown,
+    };
+    DuckStationBiosInventory {
+        configured_path,
+        state,
+    }
+}
+
+fn is_cheat_section_header(line: &str) -> bool {
+    line.len() > 2
+        && line.starts_with('[')
+        && line.ends_with(']')
+        && !line[1..line.len() - 1].trim().is_empty()
+}
+
+fn inspect_cheats(path: &Path) -> DuckStationCheatInventory {
+    let exists = path.exists();
+    let mut warnings = Vec::new();
+    let Some(text) = read_text(path, DUCKSTATION_MAX_CHEAT_BYTES, &mut warnings) else {
+        return DuckStationCheatInventory {
+            path: path.to_path_buf(),
+            exists,
+            entries: 0,
+            enabled_entries: 0,
+            warnings,
+        };
+    };
+    let mut entries = 0;
+    let mut enabled_entries = 0;
+    for line in text.lines().map(str::trim) {
+        // Every non-empty `[Section]` header is one cheat. DuckStation names
+        // sections after the cheat itself (`[Infinite Health]`), so matching
+        // only a `Cheat` prefix undercounted real files.
+        if is_cheat_section_header(line) {
+            entries += 1;
+        }
+        if line.to_ascii_lowercase().starts_with("enabled")
+            && line
+                .split_once('=')
+                .and_then(|(_, value)| parse_bool(value))
+                == Some(true)
+        {
+            enabled_entries += 1;
+        }
+    }
+    DuckStationCheatInventory {
+        path: path.to_path_buf(),
+        exists,
+        entries,
+        enabled_entries,
+        warnings,
+    }
+}
+
+fn inspect_patches(directory: &Path, serial: &str) -> DuckStationPatchInventory {
+    let mut warnings = Vec::new();
+    let mut entries = 0;
+    if is_real_directory(directory) {
+        let candidates = [
+            directory.join(format!("{serial}.ini")),
+            directory.join(format!("{serial}.txt")),
+            directory.join(format!("{serial}.xml")),
+        ];
+        for candidate in candidates {
+            if is_regular_file(&candidate) {
+                let _ = read_text(&candidate, DUCKSTATION_MAX_PATCH_BYTES, &mut warnings);
+                entries += 1;
+            }
+        }
+    }
+    DuckStationPatchInventory {
+        path: directory.to_path_buf(),
+        exists: is_real_directory(directory),
+        entries,
+        warnings,
+    }
+}
+
+fn inspect_textures(path: &Path, enabled: Option<bool>) -> DuckStationTextureInventory {
+    let mut result = DuckStationTextureInventory {
+        path: path.to_path_buf(),
+        present: is_real_directory(path),
+        enabled,
+        file_count: 0,
+        total_size_bytes: 0,
+        complete: true,
+        warnings: Vec::new(),
+    };
+    if !result.present {
+        return result;
+    }
+    let mut pending = VecDeque::from([(path.to_path_buf(), 0usize)]);
+    let mut visited = 0usize;
+    while let Some((directory, depth)) = pending.pop_front() {
+        let entries = match fs::read_dir(&directory) {
+            Ok(entries) => entries,
+            Err(error) => {
+                result.complete = false;
+                warn(
+                    &mut result.warnings,
+                    DuckStationWarningKind::UnreadablePath,
+                    &directory,
+                    format!("directory cannot be read: {error}"),
+                );
+                continue;
+            }
+        };
+        let mut paths = Vec::new();
+        for entry in entries {
+            if visited >= DUCKSTATION_MAX_DIRECTORY_ENTRIES {
+                result.complete = false;
+                warn(
+                    &mut result.warnings,
+                    DuckStationWarningKind::EntryLimitReached,
+                    &directory,
+                    format!(
+                        "texture inspection stopped at {DUCKSTATION_MAX_DIRECTORY_ENTRIES} entries"
+                    ),
+                );
+                return result;
+            }
+            visited += 1;
+            if let Ok(entry) = entry {
+                paths.push(entry.path());
+            }
+        }
+        paths.sort();
+        for entry in paths {
+            let metadata = match fs::symlink_metadata(&entry) {
+                Ok(metadata) => metadata,
+                Err(error) => {
+                    result.complete = false;
+                    warn(
+                        &mut result.warnings,
+                        DuckStationWarningKind::UnreadablePath,
+                        &entry,
+                        format!("entry cannot be inspected: {error}"),
+                    );
+                    continue;
+                }
+            };
+            if metadata.file_type().is_symlink() {
+                warn(
+                    &mut result.warnings,
+                    DuckStationWarningKind::SymlinkSkipped,
+                    &entry,
+                    "symlink was not followed",
+                );
+            } else if metadata.is_file() {
+                if result.file_count >= DUCKSTATION_MAX_TEXTURE_FILES {
+                    result.complete = false;
+                    warn(
+                        &mut result.warnings,
+                        DuckStationWarningKind::FileCountLimitReached,
+                        &entry,
+                        format!(
+                            "texture inspection stopped at {DUCKSTATION_MAX_TEXTURE_FILES} files"
+                        ),
+                    );
+                    return result;
+                }
+                result.file_count += 1;
+                result.total_size_bytes = result.total_size_bytes.saturating_add(metadata.len());
+            } else if metadata.is_dir() && depth < DUCKSTATION_MAX_TEXTURE_DEPTH {
+                pending.push_back((entry, depth + 1));
+            } else if metadata.is_dir() {
+                result.complete = false;
+                warn(
+                    &mut result.warnings,
+                    DuckStationWarningKind::DepthLimitReached,
+                    &entry,
+                    format!("texture inspection stopped at depth {DUCKSTATION_MAX_TEXTURE_DEPTH}"),
+                );
+            } else {
+                warn(
+                    &mut result.warnings,
+                    DuckStationWarningKind::SpecialFileSkipped,
+                    &entry,
+                    "non-regular entry was skipped",
+                );
+            }
+        }
+    }
+    result
+}
+
+fn inspect_memory_cards(directory: &Path, serial: &str) -> DuckStationMemoryCardInventory {
+    let mut result = DuckStationMemoryCardInventory {
+        per_game_card_candidate: None,
+        shared_cards: Vec::new(),
+        complete: true,
+        warnings: Vec::new(),
+    };
+    if !is_real_directory(directory) {
+        return result;
+    }
+    let entries = match fs::read_dir(directory) {
+        Ok(entries) => entries,
+        Err(error) => {
+            result.complete = false;
+            warn(
+                &mut result.warnings,
+                DuckStationWarningKind::UnreadablePath,
+                directory,
+                format!("memory-card directory cannot be read: {error}"),
+            );
+            return result;
+        }
+    };
+    for (index, entry) in entries.enumerate() {
+        if index >= DUCKSTATION_MAX_DIRECTORY_ENTRIES {
+            result.complete = false;
+            break;
+        }
+        let Ok(entry) = entry else { continue };
+        let path = entry.path();
+        let Ok(metadata) = fs::symlink_metadata(&path) else {
+            continue;
+        };
+        if metadata.file_type().is_symlink() || !metadata.is_file() {
+            continue;
+        }
+        let name = entry.file_name().to_string_lossy().to_ascii_uppercase();
+        if name == format!("{serial}_1.MCD") || name == format!("{serial}_2.MCD") {
+            result.per_game_card_candidate.get_or_insert(path);
+        } else if name.ends_with(".MCD") {
+            result.shared_cards.push(path);
+        }
+    }
+    result.shared_cards.sort();
+    result
+}
+
+fn inspect_save_states(directory: &Path, serial: &str) -> DuckStationSaveStateInventory {
+    let mut result = DuckStationSaveStateInventory {
+        candidate_paths: Vec::new(),
+        complete: true,
+        warnings: Vec::new(),
+    };
+    if !is_real_directory(directory) {
+        return result;
+    }
+    let entries = match fs::read_dir(directory) {
+        Ok(entries) => entries,
+        Err(error) => {
+            result.complete = false;
+            warn(
+                &mut result.warnings,
+                DuckStationWarningKind::UnreadablePath,
+                directory,
+                format!("save-state directory cannot be read: {error}"),
+            );
+            return result;
+        }
+    };
+    for (index, entry) in entries.enumerate() {
+        if index >= DUCKSTATION_MAX_DIRECTORY_ENTRIES {
+            result.complete = false;
+            break;
+        }
+        let Ok(entry) = entry else { continue };
+        let path = entry.path();
+        let Ok(metadata) = fs::symlink_metadata(&path) else {
+            continue;
+        };
+        if metadata.file_type().is_symlink() || !metadata.is_file() {
+            continue;
+        }
+        if entry
+            .file_name()
+            .to_string_lossy()
+            .to_ascii_uppercase()
+            .starts_with(serial)
+        {
+            if result.candidate_paths.len() >= DUCKSTATION_MAX_SAVE_STATE_CANDIDATES {
+                result.complete = false;
+                break;
+            }
+            result.candidate_paths.push(path);
+        }
+    }
+    result.candidate_paths.sort();
+    result
+}
+
+/// Parses an explicitly supplied M3U only as bounded structural membership.
+/// The playlist basename and its entries are not identity evidence.
+pub fn inspect_duckstation_playlist(path: &Path) -> DuckStationPlaylistInventory {
+    inspect_playlist(path)
+}
+
+fn inspect_playlist(path: &Path) -> DuckStationPlaylistInventory {
+    let exists = path.exists();
+    let mut warnings = Vec::new();
+    let Some(text) = read_text(path, DUCKSTATION_MAX_PLAYLIST_BYTES, &mut warnings) else {
+        return DuckStationPlaylistInventory {
+            path: path.to_path_buf(),
+            exists,
+            entries: Vec::new(),
+            complete: false,
+            warnings,
+        };
+    };
+    let mut entries = Vec::new();
+    let mut complete = true;
+    for raw in text.lines() {
+        let line = raw.trim();
+        if line.is_empty() || line.starts_with('#') {
+            continue;
+        }
+        if entries.len() >= DUCKSTATION_MAX_PLAYLIST_ENTRIES {
+            complete = false;
+            warn(
+                &mut warnings,
+                DuckStationWarningKind::PlaylistEntryLimitReached,
+                path,
+                format!("playlist parsing stopped at {DUCKSTATION_MAX_PLAYLIST_ENTRIES} entries"),
+            );
+            break;
+        }
+        entries.push(line.to_string());
+    }
+    DuckStationPlaylistInventory {
+        path: path.to_path_buf(),
+        exists,
+        entries,
+        complete,
+        warnings,
+    }
+}
+
+fn read_text(
+    path: &Path,
+    maximum_bytes: u64,
+    warnings: &mut Vec<DuckStationWarning>,
+) -> Option<String> {
+    let metadata = match fs::symlink_metadata(path) {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return None,
+        Err(error) => {
+            warn(
+                warnings,
+                DuckStationWarningKind::UnreadablePath,
+                path,
+                format!("file cannot be inspected: {error}"),
+            );
+            return None;
+        }
+    };
+    if metadata.file_type().is_symlink() {
+        warn(
+            warnings,
+            DuckStationWarningKind::SymlinkSkipped,
+            path,
+            "symlink was not followed",
+        );
+        return None;
+    }
+    if !metadata.is_file() {
+        warn(
+            warnings,
+            DuckStationWarningKind::SpecialFileSkipped,
+            path,
+            "non-regular file was skipped",
+        );
+        return None;
+    }
+    if metadata.len() > maximum_bytes {
+        warn(
+            warnings,
+            DuckStationWarningKind::FileTooLarge,
+            path,
+            format!("file exceeds the {maximum_bytes}-byte limit"),
+        );
+        return None;
+    }
+    let mut options = OpenOptions::new();
+    options.read(true);
+    #[cfg(unix)]
+    options.custom_flags(libc::O_NOFOLLOW);
+    let mut file = match options.open(path) {
+        Ok(file) => file,
+        Err(error) => {
+            warn(
+                warnings,
+                DuckStationWarningKind::UnreadablePath,
+                path,
+                format!("file cannot be opened read-only: {error}"),
+            );
+            return None;
+        }
+    };
+    let mut bytes = Vec::with_capacity(metadata.len() as usize);
+    if let Err(error) = file
+        .by_ref()
+        .take(maximum_bytes.saturating_add(1))
+        .read_to_end(&mut bytes)
+    {
+        warn(
+            warnings,
+            DuckStationWarningKind::UnreadablePath,
+            path,
+            format!("file cannot be read: {error}"),
+        );
+        return None;
+    }
+    if bytes.len() as u64 > maximum_bytes {
+        warn(
+            warnings,
+            DuckStationWarningKind::FileTooLarge,
+            path,
+            format!("file grew beyond the {maximum_bytes}-byte limit while reading"),
+        );
+        return None;
+    }
+    match String::from_utf8(bytes) {
+        Ok(text) => Some(text),
+        Err(error) => {
+            warn(
+                warnings,
+                DuckStationWarningKind::InvalidUtf8,
+                path,
+                "file is not valid UTF-8; invalid bytes were replaced",
+            );
+            Some(String::from_utf8_lossy(error.as_bytes()).into_owned())
+        }
+    }
+}
+
+fn is_regular_file(path: &Path) -> bool {
+    fs::symlink_metadata(path)
+        .map(|metadata| metadata.is_file())
+        .unwrap_or(false)
+}
+
+fn is_real_directory(path: &Path) -> bool {
+    fs::symlink_metadata(path)
+        .map(|metadata| metadata.is_dir())
+        .unwrap_or(false)
+}
+
+// ---------------------------------------------------------------------------
+// Native launch binding
+// ---------------------------------------------------------------------------
+//
+// Everything below binds a discovered [`DuckStationProfile`] to a concrete,
+// safe, spawnable native executable - facts only, never a command line or a
+// spawn. It never starts DuckStation.
+//
+// # Authoritative current DuckStation Linux CLI/directory contract
+//
+// Proven directly from `stenzek/duckstation` upstream source
+// (`src/duckstation-qt/qthost.cpp`'s `ParseCommandLineParametersAndInitializeConfig`,
+// and `src/core/core.cpp`'s `Core::SetDataRoot`), not stale docs:
+//
+// - The Qt frontend's CMake build target - and therefore its on-disk binary
+//   name on Linux - is `duckstation-qt` (`add_executable(duckstation-qt
+//   ...)` in `src/duckstation-qt/CMakeLists.txt`; the `OUTPUT_NAME
+//   DuckStation` override in that same file is guarded to the macOS `.app`
+//   bundle case only). This is the same name [`discover_executables`]
+//   already searches `PATH` for.
+// - There is no CLI flag to override the user/config/data directory at
+//   all - `-help`/`-version`/`-batch`/`-fastboot`/`-slowboot`/`-bios`/
+//   `-resume`/`-state`/`-statefile`/`-exe`/`-fullscreen`/`-nofullscreen`/
+//   `-nogui`/`-bigpicture`/`-setupwizard`/`-earlyconsole`/
+//   `-updatecleanup`/`--` are the complete current set. This is why
+//   [`DuckStationUserDirectoryMode`] has exactly one variant: unlike
+//   Dolphin (`-u <dir>`) or a hypothetical explicit-root override, nothing
+//   in the current DuckStation CLI can force an arbitrary directory to
+//   become the active user directory - only the fixed platform rule below,
+//   or the `portable.txt`/`settings.ini` co-location rule, ever apply.
+// - `Core::SetDataRoot()`'s exact current Linux rule for a single, unified
+//   user directory (BIOS, settings.ini, memory cards, save states, cheats,
+//   textures all live under it - there is no separate "config root"):
+//   1. First, portable detection: if `portable.txt` OR `settings.ini`
+//      already exists in the executable's own directory (resolved via
+//      `$APPIMAGE`'s directory for a running AppImage, since AppImages
+//      self-mount under `/tmp`), that directory becomes the user
+//      directory. A statically discovered (not-yet-running) executable
+//      has no `/tmp` mount to resolve, so this reduces to: does
+//      `portable.txt`/`settings.ini` exist beside the executable's real,
+//      on-disk path?
+//   2. Otherwise: if `$XDG_CONFIG_HOME` is set in the environment *and
+//      absolute*, the user directory is `$XDG_CONFIG_HOME/duckstation`.
+//   3. Otherwise: the user directory is the **hardcoded**
+//      `$HOME/.local/share/duckstation` - critically, this fallback does
+//      **not** consult `$XDG_DATA_HOME` at all, even when it is set to
+//      something else. (This is why [`DuckStationProfileDiscoveryRoots`]
+//      needed the additional `xdg_config_home_explicit` field: the
+//      already-defaulted `xdg_config_home`/`xdg_data_home` fields alone
+//      cannot reproduce this exact branch.)
+// - Upstream officially distributes Linux builds only as an AppImage
+//   (`README.md`'s "Downloading and running" section names no native
+//   tarball/installer for Linux); Flatpak (`org.duckstation.DuckStation`)
+//   is mentioned only in the context of migrating *away* from it to
+//   AppImage, so it is no longer an officially supported channel. A
+//   `duckstation-qt` binary on `PATH` is therefore always a
+//   distro/community package, never an upstream-shipped artifact - this
+//   binding still supports it (as [`DuckStationInstallationType::Native`])
+//   because its CLI/directory behavior is identical (same codebase, same
+//   `Core::SetDataRoot()`), but Flatpak and AppImage/portable are refused
+//   below because their extra layer (Flatpak sandboxing; AppImage's FUSE
+//   self-mount, first-run desktop-integration prompt, and reliance on a
+//   live `$APPIMAGE` environment variable this static resolver does not
+//   have) cannot be safely proven from discovery evidence alone.
+// - A future command planner's proven, safe argv contract is exactly:
+//   `<duckstation-qt-executable> [-batch] [--] <content-path>` - the
+//   trailing path argument alone is sufficient to boot directly into that
+//   content (bypassing the game list), `-batch` additionally makes the
+//   process exit when the emulated session ends (rather than returning to
+//   an open frontend window), which is what an EmuWiz watcher needs for
+//   "one process per play session" semantics identical to the existing
+//   RetroArch/Dolphin/PCSX2 model. `--` is only required when the content
+//   path starts with `-` or must not be parsed for flags. No command is
+//   built or spawned by this module.
+
+/// Facts identifying exactly which local executable a native DuckStation
+/// launch would use, and how its user directory resolves - never a command
+/// line. See this module's own "Native launch binding" section doc comment
+/// for the exact proven upstream contract this represents.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DuckStationNativeLaunchBinding {
+    pub executable: PathBuf,
+    pub user_directory_mode: DuckStationUserDirectoryMode,
+    /// Native, AppImage or Flatpak. For Flatpak, `executable` is the
+    /// `flatpak` program.
+    pub installation: LaunchInstallation,
+}
+
+/// How DuckStation's single unified user directory (BIOS/settings/memory
+/// cards/save states - there is no separate config root) resolves for a
+/// bound executable. Only one variant exists today because DuckStation's
+/// current CLI has no override flag at all - see the "Native launch
+/// binding" section's own doc comment. Data only, never turned into an
+/// argv flag by this module.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DuckStationUserDirectoryMode {
+    /// The platform-default resolution: `$XDG_CONFIG_HOME/duckstation` when
+    /// that variable is set and absolute, else the hardcoded
+    /// `$HOME/.local/share/duckstation`.
+    DefaultNative,
+    /// A `portable.txt`/`settings.ini` beside the executable makes its own
+    /// directory the data root. Recorded, never created or moved by EmuWiz.
+    PortableBesideExecutable,
+    /// The Flatpak sandbox's own profile.
+    FlatpakSandbox,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum DuckStationLaunchBlockerKind {
+    /// Any installation type other than [`DuckStationInstallationType::Native`].
+    /// `FlatpakUser` is refused because Flatpak is no longer an officially
+    /// distributed channel and its sandboxing cannot be proven safe here;
+    /// `Portable` is refused because the current profile model reports the
+    /// same tag for a genuine `portable.txt`-marker install and an
+    /// AppImage-derived one (see [`DuckStationProfile::provenance`]) and
+    /// AppImage's FUSE self-mount/`$APPIMAGE`-dependent behavior cannot be
+    /// proven from static discovery evidence; `Explicit` is refused because
+    /// DuckStation's current CLI has no mechanism to force an arbitrary
+    /// caller-confirmed directory to become the active user directory (no
+    /// `-u`-equivalent flag exists) - see the module's own CLI contract
+    /// doc comment.
+    UnsupportedInstallationType,
+    /// More than one viable executable candidate matches the profile and no
+    /// authority distinguishes them.
+    AmbiguousExecutable,
+    /// No candidate executable exists on disk.
+    ExecutableMissing,
+    /// A candidate executable exists but is a symlink, not a regular file,
+    /// or is not an absolute path.
+    ExecutableUnsafe,
+    /// A candidate executable exists as a regular file but lacks the
+    /// executable permission bit.
+    ExecutableNotExecutable,
+    /// The profile's configuration root (or its DuckStation evidence -
+    /// `settings.ini`) no longer matches what discovery originally
+    /// observed, or the profile itself is not eligible.
+    ProfileRootMismatch,
+    /// The profile's configuration root does not match DuckStation's
+    /// current default single-user-directory resolution, so `DefaultNative`
+    /// cannot be proven.
+    DefaultResolutionMismatch,
+    /// A `portable.txt` or `settings.ini` file exists beside the resolved
+    /// executable, which would make DuckStation itself treat that
+    /// directory (not the profile just proven) as the active user
+    /// directory - see `Core::SetDataRoot()`'s exact rule in the module's
+    /// own CLI contract doc comment.
+    PortableMarkerConflict,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DuckStationLaunchBlocker {
+    pub kind: DuckStationLaunchBlockerKind,
+    pub detail: String,
+}
+
+fn launch_blocker(
+    kind: DuckStationLaunchBlockerKind,
+    detail: impl Into<String>,
+) -> DuckStationLaunchBlocker {
+    DuckStationLaunchBlocker {
+        kind,
+        detail: detail.into(),
+    }
+}
+
+/// Freshly revalidates `profile` against `roots` and either proves a launch
+/// binding or returns a structured blocker. Pure and read-only: inspects
+/// only filesystem metadata and the supplied environment-derived roots,
+/// never spawns a process, writes DuckStation configuration, or creates a
+/// directory. Safe - and intended - to call again at future launch time.
+pub fn resolve_duckstation_native_launch_binding(
+    profile: &DuckStationProfile,
+    roots: &DuckStationProfileDiscoveryRoots,
+) -> Result<DuckStationNativeLaunchBinding, DuckStationLaunchBlocker> {
+    if !profile.eligible {
+        return Err(launch_blocker(
+            DuckStationLaunchBlockerKind::ProfileRootMismatch,
+            "profile is not eligible",
+        ));
+    }
+    match profile.installation_type {
+        DuckStationInstallationType::Native => resolve_default_native_binding(profile, roots),
+        DuckStationInstallationType::Portable => resolve_portable_binding(profile),
+        DuckStationInstallationType::FlatpakUser => resolve_flatpak_binding(profile),
+        DuckStationInstallationType::Explicit => Err(launch_blocker(
+            DuckStationLaunchBlockerKind::UnsupportedInstallationType,
+            format!(
+                "only {:?} DuckStation installations are supported by this native launch \
+                 binding, got {:?} ({})",
+                DuckStationInstallationType::Native,
+                profile.installation_type,
+                profile.provenance,
+            ),
+        )),
+    }
+}
+
+/// The single unified user-directory root DuckStation's own
+/// `Core::SetDataRoot()` resolves to for a non-portable install - see the
+/// module's own "Native launch binding" doc comment for the exact proven
+/// rule this mirrors.
+pub(crate) fn expected_duckstation_native_root(
+    roots: &DuckStationProfileDiscoveryRoots,
+) -> PathBuf {
+    if roots.xdg_config_home_explicit {
+        roots.xdg_config_home.join("duckstation")
+    } else {
+        roots.home.join(".local/share").join("duckstation")
+    }
+}
+
+fn resolve_default_native_binding(
+    profile: &DuckStationProfile,
+    roots: &DuckStationProfileDiscoveryRoots,
+) -> Result<DuckStationNativeLaunchBinding, DuckStationLaunchBlocker> {
+    let expected_root = expected_duckstation_native_root(roots);
+    if profile.configuration_path != expected_root {
+        return Err(launch_blocker(
+            DuckStationLaunchBlockerKind::DefaultResolutionMismatch,
+            format!(
+                "profile root {} does not match the current default resolution {}",
+                profile.configuration_path.display(),
+                expected_root.display(),
+            ),
+        ));
+    }
+    if !is_real_directory(&profile.configuration_path) {
+        return Err(launch_blocker(
+            DuckStationLaunchBlockerKind::ProfileRootMismatch,
+            "configuration root no longer matches the discovered profile",
+        ));
+    }
+    if !is_regular_file(&profile.configuration_path.join("settings.ini")) {
+        return Err(launch_blocker(
+            DuckStationLaunchBlockerKind::ProfileRootMismatch,
+            "DuckStation configuration evidence (settings.ini) is no longer present",
+        ));
+    }
+    let (executable, installation) = resolve_native_duckstation_executable(profile)?;
+    if let Some(blocker) = portable_marker_conflict(&executable) {
+        return Err(blocker);
+    }
+    Ok(DuckStationNativeLaunchBinding {
+        executable,
+        user_directory_mode: DuckStationUserDirectoryMode::DefaultNative,
+        installation,
+    })
+}
+
+/// A portable AppImage: the profile root must be the AppImage's own
+/// directory, with a portable marker beside it. EmuWiz only launches it; the
+/// marker is left exactly as it is.
+fn resolve_portable_binding(
+    profile: &DuckStationProfile,
+) -> Result<DuckStationNativeLaunchBinding, DuckStationLaunchBlocker> {
+    let matching: Vec<&DuckStationExecutable> = profile
+        .executable_candidates
+        .iter()
+        .filter(|candidate| {
+            candidate.installation_type == DuckStationInstallationType::Portable
+                && candidate.path.parent() == Some(profile.configuration_path.as_path())
+                && portable_marker_beside(&KNOWN_DUCKSTATION, &candidate.path).is_some()
+        })
+        .collect();
+    let mut valid = Vec::new();
+    let mut last_error = None;
+    for candidate in matching {
+        match validate_native_duckstation_executable(&candidate.path) {
+            Ok(()) => valid.push((candidate.path.clone(), candidate.launch.clone())),
+            Err(error) => last_error = Some(error),
+        }
+    }
+    match valid.len() {
+        0 => Err(last_error.unwrap_or_else(|| {
+            launch_blocker(
+                DuckStationLaunchBlockerKind::ExecutableMissing,
+                "no portable DuckStation executable with a portable marker sits in this profile root",
+            )
+        })),
+        1 => {
+            let (executable, installation) = valid.remove(0);
+            Ok(DuckStationNativeLaunchBinding {
+                executable,
+                user_directory_mode: DuckStationUserDirectoryMode::PortableBesideExecutable,
+                installation,
+            })
+        }
+        count => Err(launch_blocker(
+            DuckStationLaunchBlockerKind::AmbiguousExecutable,
+            format!("{count} portable executables match this profile root"),
+        )),
+    }
+}
+
+/// The Flatpak installation: `flatpak run org.duckstation.DuckStation`, using
+/// the sandbox's own profile.
+fn resolve_flatpak_binding(
+    profile: &DuckStationProfile,
+) -> Result<DuckStationNativeLaunchBinding, DuckStationLaunchBlocker> {
+    let candidate = profile
+        .executable_candidates
+        .iter()
+        .find(|candidate| candidate.installation_type == DuckStationInstallationType::FlatpakUser);
+    let Some(candidate) = candidate else {
+        return Err(launch_blocker(
+            DuckStationLaunchBlockerKind::ExecutableMissing,
+            "the DuckStation Flatpak (or the flatpak program) was not found",
+        ));
+    };
+    validate_native_duckstation_executable(&candidate.path)?;
+    Ok(DuckStationNativeLaunchBinding {
+        executable: candidate.path.clone(),
+        user_directory_mode: DuckStationUserDirectoryMode::FlatpakSandbox,
+        installation: candidate.launch.clone(),
+    })
+}
+
+/// `portable.txt` **or** `settings.ini` next to the executable forces
+/// DuckStation into portable mode, which redirects directory resolution
+/// away from the profile just proven - see `Core::SetDataRoot()`'s exact
+/// rule in the module's own CLI contract doc comment. Checking for
+/// `settings.ini` here (not just `portable.txt`) matters: a stray/leftover
+/// settings file beside the executable is just as authoritative to
+/// DuckStation itself as an explicit marker.
+fn portable_marker_conflict(executable: &Path) -> Option<DuckStationLaunchBlocker> {
+    let directory = executable.parent()?;
+    let marker = directory.join("portable.txt");
+    let settings = directory.join("settings.ini");
+    if is_regular_file(&marker) {
+        return Some(launch_blocker(
+            DuckStationLaunchBlockerKind::PortableMarkerConflict,
+            format!(
+                "{} exists next to the executable and would force portable mode",
+                marker.display()
+            ),
+        ));
+    }
+    if is_regular_file(&settings) {
+        return Some(launch_blocker(
+            DuckStationLaunchBlockerKind::PortableMarkerConflict,
+            format!(
+                "{} exists next to the executable and would force portable mode",
+                settings.display()
+            ),
+        ));
+    }
+    None
+}
+
+/// Binds exactly one executable to `profile`, matching candidates only by
+/// the profile's own installation type - `executable_candidates` is shared
+/// across every discovered profile and is not otherwise scoped per-profile.
+/// Never falls back to a hard-coded name: a profile with no matching,
+/// verified-safe candidate is always blocked.
+fn resolve_native_duckstation_executable(
+    profile: &DuckStationProfile,
+) -> Result<(PathBuf, LaunchInstallation), DuckStationLaunchBlocker> {
+    // `resolve_default_native_binding` only ever routes a `Native` profile
+    // here (the top-level match in `resolve_duckstation_native_launch_binding`
+    // rejects `FlatpakUser` / `Portable` / `Explicit` *profiles*). Such a
+    // profile - DuckStation's own `Core::SetDataRoot()` default user
+    // directory, already proven present with `settings.ini` above - may bind
+    // either a PATH/name-matched `duckstation-qt` or an exact path the host
+    // integration already confirmed through its own provenance (an
+    // EmuWiz-managed AppImage supplied via
+    // `DuckStationProfileDiscoveryRoots::explicit_executables`, classified
+    // `DuckStationInstallationType::Explicit`). Both pass
+    // `validate_native_duckstation_executable` and the
+    // `portable_marker_conflict` gate in `resolve_default_native_binding`. A
+    // guessed `*.AppImage` (classified `Portable`) is never accepted.
+    let matching: Vec<&DuckStationExecutable> = profile
+        .executable_candidates
+        .iter()
+        .filter(|candidate| {
+            candidate.installation_type == DuckStationInstallationType::Native
+                || candidate.installation_type == DuckStationInstallationType::Explicit
+        })
+        .collect();
+    if matching.is_empty() {
+        return Err(launch_blocker(
+            DuckStationLaunchBlockerKind::ExecutableMissing,
+            "no discovered executable is associated with this profile's installation type",
+        ));
+    }
+    let mut valid = Vec::new();
+    let mut last_error = None;
+    for candidate in matching {
+        match validate_native_duckstation_executable(&candidate.path) {
+            Ok(()) => valid.push((candidate.path.clone(), candidate.launch.clone())),
+            Err(error) => last_error = Some(error),
+        }
+    }
+    match valid.len() {
+        0 => Err(last_error.expect("at least one candidate was inspected")),
+        1 => Ok(valid.into_iter().next().expect("length checked above")),
+        count => Err(launch_blocker(
+            DuckStationLaunchBlockerKind::AmbiguousExecutable,
+            format!(
+                "{count} viable executables match this profile and none is distinguished as \
+                 authoritative"
+            ),
+        )),
+    }
+}
+
+fn validate_native_duckstation_executable(path: &Path) -> Result<(), DuckStationLaunchBlocker> {
+    if !path.is_absolute() {
+        return Err(launch_blocker(
+            DuckStationLaunchBlockerKind::ExecutableUnsafe,
+            format!("{} is not an absolute path", path.display()),
+        ));
+    }
+    let metadata = fs::symlink_metadata(path).map_err(|_| {
+        launch_blocker(
+            DuckStationLaunchBlockerKind::ExecutableMissing,
+            format!("{} does not exist", path.display()),
+        )
+    })?;
+    if metadata.file_type().is_symlink() {
+        return Err(launch_blocker(
+            DuckStationLaunchBlockerKind::ExecutableUnsafe,
+            format!("{} is a symlink", path.display()),
+        ));
+    }
+    if !metadata.is_file() {
+        return Err(launch_blocker(
+            DuckStationLaunchBlockerKind::ExecutableUnsafe,
+            format!("{} is not a regular file", path.display()),
+        ));
+    }
+    #[cfg(unix)]
+    if metadata.permissions().mode() & 0o111 == 0 {
+        return Err(launch_blocker(
+            DuckStationLaunchBlockerKind::ExecutableNotExecutable,
+            format!("{} is not executable", path.display()),
+        ));
+    }
+    Ok(())
+}
+
+fn warn(
+    warnings: &mut Vec<DuckStationWarning>,
+    kind: DuckStationWarningKind,
+    path: &Path,
+    detail: impl Into<String>,
+) {
+    warnings.push(DuckStationWarning {
+        kind,
+        path: path.to_path_buf(),
+        detail: detail.into(),
+    });
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use tempfile::TempDir;
+
+    fn roots(temp: &TempDir) -> DuckStationProfileDiscoveryRoots {
+        DuckStationProfileDiscoveryRoots {
+            home: temp.path().join("home"),
+            xdg_config_home: temp.path().join("config"),
+            xdg_data_home: temp.path().join("data"),
+            xdg_config_home_explicit: true,
+            explicit_configuration_roots: Vec::new(),
+            portable_configuration_roots: Vec::new(),
+            explicit_executables: Vec::new(),
+            known_version_outputs: BTreeMap::new(),
+            appimage_directory: None,
+            path_override: Some(Vec::new()),
+        }
+    }
+
+    fn write_global(root: &Path, text: &str) {
+        fs::create_dir_all(root).unwrap();
+        fs::write(root.join("settings.ini"), text).unwrap();
+    }
+
+    fn eligible(root: PathBuf) -> DuckStationProfile {
+        let expected = root.clone();
+        let temp_home = root.parent().unwrap().to_path_buf();
+        discover_duckstation_profiles(&DuckStationProfileDiscoveryRoots {
+            home: temp_home.clone(),
+            xdg_config_home: temp_home,
+            xdg_data_home: root.parent().unwrap().join("data"),
+            xdg_config_home_explicit: true,
+            explicit_configuration_roots: vec![root],
+            portable_configuration_roots: Vec::new(),
+            explicit_executables: Vec::new(),
+            known_version_outputs: BTreeMap::new(),
+            appimage_directory: None,
+            path_override: Some(Vec::new()),
+        })
+        .profiles
+        .into_iter()
+        .find(|profile| profile.configuration_path == expected && profile.eligible)
+        .unwrap()
+    }
+
+    fn verified(serial: &str) -> DuckStationGameRequest {
+        DuckStationGameRequest {
+            verified_ps1_serial: Some(serial.to_string()),
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn native_flatpak_and_portable_profiles_are_discovered_without_execution() {
+        let temp = TempDir::new().unwrap();
+        let mut roots = roots(&temp);
+        write_global(&roots.xdg_config_home.join("duckstation"), "");
+        let flatpak = roots
+            .home
+            .join(".var/app")
+            .join(FLATPAK_APP_ID)
+            .join("config/duckstation");
+        write_global(&flatpak, "");
+        let portable = temp.path().join("portable");
+        write_global(&portable, "");
+        let appimage = temp.path().join("DuckStation.AppImage");
+        fs::write(&appimage, b"not executed").unwrap();
+        roots.portable_configuration_roots.push(portable);
+        roots.explicit_executables.push(appimage.clone());
+        roots
+            .known_version_outputs
+            .insert(appimage.clone(), "DuckStation v0.1-9999".to_string());
+        let discovery = discover_duckstation_profiles(&roots);
+        assert!(
+            discovery
+                .profiles
+                .iter()
+                .any(
+                    |profile| profile.installation_type == DuckStationInstallationType::Native
+                        && profile.eligible
+                )
+        );
+        assert!(
+            discovery
+                .profiles
+                .iter()
+                .any(|profile| profile.installation_type
+                    == DuckStationInstallationType::FlatpakUser
+                    && profile.eligible)
+        );
+        assert!(
+            discovery
+                .profiles
+                .iter()
+                .any(
+                    |profile| profile.installation_type == DuckStationInstallationType::Portable
+                        && profile.eligible
+                )
+        );
+        assert_eq!(
+            parse_duckstation_version("DuckStation v0.1-9999"),
+            Some("0.1".to_string())
+        );
+        assert_eq!(parse_duckstation_version("unknown"), None);
+    }
+
+    #[test]
+    fn missing_executable_does_not_block_a_valid_profile() {
+        let temp = TempDir::new().unwrap();
+        let root = temp.path().join("duckstation");
+        write_global(&root, "");
+        let profile = eligible(root);
+        assert!(profile.eligible);
+        assert!(profile.executable_candidates.is_empty());
+    }
+
+    #[test]
+    fn configuration_and_per_game_overrides_are_read_only_and_fail_soft() {
+        let temp = TempDir::new().unwrap();
+        let root = temp.path().join("duckstation");
+        write_global(
+            &root,
+            "[GPU]\nRenderer=Vulkan\nResolutionScale=2\nPGXPEnable=true\n[Cheats]\nEnableCheats=true\n[BIOS]\nBIOSFilename=scph1001.bin\n",
+        );
+        fs::create_dir_all(root.join("gamesettings")).unwrap();
+        fs::write(
+            root.join("gamesettings/SLUS-12345.ini"),
+            "[GPU]\nResolutionScale=4\n",
+        )
+        .unwrap();
+        let inspection = inspect_duckstation_game(&eligible(root), &verified("SLUS-12345"));
+        assert_eq!(
+            inspection.global_config.settings.renderer.as_deref(),
+            Some("Vulkan")
+        );
+        assert_eq!(inspection.global_config.settings.pgxp_enabled, Some(true));
+        assert_eq!(
+            inspection
+                .per_game_config
+                .unwrap()
+                .settings
+                .internal_resolution_scale
+                .as_deref(),
+            Some("4")
+        );
+        assert!(
+            inspection
+                .overridden_setting_keys
+                .contains(&"internal_resolution_scale".to_string())
+        );
+
+        let malformed = temp.path().join("malformed");
+        write_global(&malformed, "[GPU\nnot-a-setting\n");
+        assert!(
+            inspect_duckstation_game(&eligible(malformed), &DuckStationGameRequest::default())
+                .global_config
+                .warnings
+                .iter()
+                .any(|warning| warning.kind == DuckStationWarningKind::MalformedIni)
+        );
+    }
+
+    #[test]
+    fn authoritative_serial_wins_and_emulator_serial_cannot_override_it() {
+        let temp = TempDir::new().unwrap();
+        let root = temp.path().join("duckstation");
+        write_global(&root, "");
+        let inspection = inspect_duckstation_game(
+            &eligible(root),
+            &DuckStationGameRequest {
+                verified_ps1_serial: Some("SLUS-12345".to_string()),
+                emulator_serial: Some("SLES-54321".to_string()),
+                ..Default::default()
+            },
+        );
+        assert_eq!(inspection.serial.as_deref(), Some("SLUS-12345"));
+        assert_eq!(
+            inspection.serial_mapping,
+            DuckStationSerialMapping::ConflictingEmulatorMetadata
+        );
+        assert!(inspection.identity_mismatch.is_some());
+        let unresolved = inspect_duckstation_game(
+            &eligible(temp.path().join("duckstation")),
+            &DuckStationGameRequest {
+                emulator_serial: Some("SLES-54321".to_string()),
+                ..Default::default()
+            },
+        );
+        assert_eq!(
+            unresolved.serial_mapping,
+            DuckStationSerialMapping::EmulatorMetadataOnly
+        );
+    }
+
+    #[test]
+    fn redump_tracks_and_logical_chds_remain_separate_per_disc_contexts() {
+        let temp = TempDir::new().unwrap();
+        let root = temp.path().join("duckstation");
+        write_global(&root, "");
+        let inspection = inspect_duckstation_game(
+            &eligible(root),
+            &DuckStationGameRequest {
+                verified_ps1_serial: Some("SLUS-12345".to_string()),
+                disc_contexts: vec![
+                    DuckStationDiscContext {
+                        disc_number: 1,
+                        representation: Representation::DiscTrack,
+                        claim: ClaimType::ExactTrackMatch,
+                    },
+                    DuckStationDiscContext {
+                        disc_number: 2,
+                        representation: Representation::LogicalChd,
+                        claim: ClaimType::ExactLogicalDiscMatch,
+                    },
+                ],
+                ..Default::default()
+            },
+        );
+        assert_eq!(inspection.disc_contexts.len(), 2);
+        assert_eq!(
+            inspection.disc_contexts[0].representation,
+            Representation::DiscTrack
+        );
+        assert_eq!(
+            inspection.disc_contexts[1].representation,
+            Representation::LogicalChd
+        );
+    }
+
+    #[test]
+    fn playlists_cheats_profiles_and_textures_have_zero_identity_authority() {
+        let temp = TempDir::new().unwrap();
+        let root = temp.path().join("duckstation");
+        write_global(&root, "[GPU]\nTextureReplacements=true\n");
+        fs::create_dir_all(root.join("cheats")).unwrap();
+        fs::write(
+            root.join("cheats/SLUS-12345.cht"),
+            "[Cheat0]\nEnabled=true\n",
+        )
+        .unwrap();
+        fs::create_dir_all(root.join("textures/SLUS-12345/sub")).unwrap();
+        fs::write(root.join("textures/SLUS-12345/sub/a.png"), b"texture").unwrap();
+        fs::write(root.join("playlist.m3u"), "disc-one.chd\ndisc-two.chd\n").unwrap();
+        let profile = eligible(root.clone());
+        let unresolved = inspect_duckstation_game(
+            &profile,
+            &DuckStationGameRequest {
+                playlist_path: Some(root.join("playlist.m3u")),
+                ..Default::default()
+            },
+        );
+        assert_eq!(
+            unresolved.serial_mapping,
+            DuckStationSerialMapping::Unavailable
+        );
+        assert_eq!(unresolved.playlist.unwrap().entries.len(), 2);
+        assert!(unresolved.cheats.is_none());
+        let verified = inspect_duckstation_game(&profile, &verified("SLUS-12345"));
+        assert_eq!(verified.cheats.unwrap().enabled_entries, 1);
+        assert_eq!(verified.textures.unwrap().file_count, 1);
+    }
+
+    #[test]
+    fn patches_bios_memory_cards_and_save_states_are_inspected_conservatively() {
+        let temp = TempDir::new().unwrap();
+        let root = temp.path().join("duckstation");
+        write_global(&root, "[BIOS]\nBIOSFilename=scph1001.bin\n");
+        fs::create_dir_all(root.join("bios")).unwrap();
+        fs::write(root.join("bios/scph1001.bin"), b"bios").unwrap();
+        fs::create_dir_all(root.join("patches")).unwrap();
+        fs::write(root.join("patches/SLUS-12345.ini"), "patch").unwrap();
+        fs::create_dir_all(root.join("memcards")).unwrap();
+        fs::write(root.join("memcards/SLUS-12345_1.mcd"), b"card").unwrap();
+        fs::write(root.join("memcards/shared.mcd"), b"shared").unwrap();
+        fs::create_dir_all(root.join("savestates")).unwrap();
+        fs::write(root.join("savestates/SLUS-12345_0.sav"), b"state").unwrap();
+        let inspection = inspect_duckstation_game(&eligible(root), &verified("SLUS-12345"));
+        assert_eq!(
+            inspection.health.bios,
+            DuckStationBiosState::PresentUnverified
+        );
+        assert_eq!(inspection.patches.unwrap().entries, 1);
+        let cards = inspection.memory_cards.unwrap();
+        assert!(cards.per_game_card_candidate.is_some());
+        assert_eq!(cards.shared_cards.len(), 1);
+        assert_eq!(inspection.save_states.unwrap().candidate_paths.len(), 1);
+
+        let missing = temp.path().join("missing-bios");
+        write_global(&missing, "[BIOS]\nBIOSFilename=missing.bin\n");
+        assert_eq!(
+            inspect_duckstation_game(&eligible(missing), &verified("SLUS-12345"))
+                .health
+                .bios,
+            DuckStationBiosState::Missing
+        );
+    }
+
+    #[test]
+    fn traversal_and_oversized_input_are_bounded_without_writes() {
+        let temp = TempDir::new().unwrap();
+        let root = temp.path().join("duckstation");
+        write_global(&root, "");
+        fs::create_dir_all(root.join("cheats")).unwrap();
+        fs::write(
+            root.join("cheats/SLUS-12345.cht"),
+            vec![b'x'; DUCKSTATION_MAX_CHEAT_BYTES as usize + 1],
+        )
+        .unwrap();
+        let mut deep = root.join("textures/SLUS-12345");
+        for _ in 0..DUCKSTATION_MAX_TEXTURE_DEPTH + 2 {
+            deep = deep.join("nested");
+            fs::create_dir_all(&deep).unwrap();
+        }
+        let inspection = inspect_duckstation_game(&eligible(root), &verified("SLUS-12345"));
+        assert_eq!(inspection.cheats.unwrap().entries, 0);
+        assert!(!inspection.textures.unwrap().complete);
+    }
+
+    #[test]
+    fn realistic_named_cheat_sections_are_all_counted() {
+        let temp = TempDir::new().unwrap();
+        let root = temp.path().join("duckstation");
+        write_global(&root, "");
+        fs::create_dir_all(root.join("cheats")).unwrap();
+        fs::write(
+            root.join("cheats/SLUS-12345.cht"),
+            "[Infinite Health]\n\
+             Type = Gameshark\n\
+             Activation = EndFrame\n\
+             Description = Health never drops\n\
+             80012345 0063\n\
+             \n\
+             [Max Money]\n\
+             Type = Gameshark\n\
+             Activation = EndFrame\n\
+             Enabled = true\n\
+             80054321 FFFF\n\
+             \n\
+             [Moon Jump (Hold L2)]\n\
+             Type = Gameshark\n\
+             Activation = Manual\n\
+             D0010000 FEFF\n\
+             80010002 0200\n\
+             []\n",
+        )
+        .unwrap();
+        let cheats = inspect_duckstation_game(&eligible(root), &verified("SLUS-12345"))
+            .cheats
+            .unwrap();
+        // Three named sections; the empty `[]` header is not a cheat. Only
+        // an explicit in-file `Enabled` key counts as enabled.
+        assert_eq!(cheats.entries, 3);
+        assert_eq!(cheats.enabled_entries, 1);
+    }
+
+    // -----------------------------------------------------------------
+    // Native launch binding
+    // -----------------------------------------------------------------
+
+    fn binding_fixture_root(label: &str) -> PathBuf {
+        let nonce = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        env::temp_dir().join(format!(
+            "archivefs-duckstation-binding-{label}-{}-{nonce}",
+            std::process::id()
+        ))
+    }
+
+    /// `xdg_config_home_explicit: true` - the common case, and the one the
+    /// resolver's `DefaultResolutionMismatch` check exercises directly
+    /// against `roots.xdg_config_home`.
+    fn binding_roots(root: &Path) -> DuckStationProfileDiscoveryRoots {
+        DuckStationProfileDiscoveryRoots {
+            home: root.join("home"),
+            xdg_config_home: root.join("config"),
+            xdg_data_home: root.join("data"),
+            xdg_config_home_explicit: true,
+            explicit_configuration_roots: Vec::new(),
+            portable_configuration_roots: Vec::new(),
+            explicit_executables: Vec::new(),
+            known_version_outputs: BTreeMap::new(),
+            appimage_directory: None,
+            path_override: Some(Vec::new()),
+        }
+    }
+
+    fn make_native_executable(path: &Path) {
+        fs::create_dir_all(path.parent().unwrap()).unwrap();
+        fs::write(path, b"#!/bin/sh\nexit 0\n").unwrap();
+        #[cfg(unix)]
+        {
+            let mut perms = fs::metadata(path).unwrap().permissions();
+            perms.set_mode(0o755);
+            fs::set_permissions(path, perms).unwrap();
+        }
+    }
+
+    fn duckstation_executable(
+        path: PathBuf,
+        installation_type: DuckStationInstallationType,
+    ) -> DuckStationExecutable {
+        DuckStationExecutable {
+            path,
+            installation_type,
+            version: None,
+            launch: crate::launch::installation::LaunchInstallation::Native,
+        }
+    }
+
+    /// A minimal, hand-built, genuinely eligible profile at the exact
+    /// `DefaultNative` root `binding_roots` resolves to - `settings.ini`
+    /// is real on disk (matching `profile.eligible`'s own real
+    /// requirement), never faked.
+    fn native_duckstation_profile(
+        roots: &DuckStationProfileDiscoveryRoots,
+        executable_candidates: Vec<DuckStationExecutable>,
+    ) -> DuckStationProfile {
+        let config = expected_duckstation_native_root(roots);
+        fs::create_dir_all(&config).unwrap();
+        fs::write(config.join("settings.ini"), "[Main]\n").unwrap();
+        DuckStationProfile {
+            profile_id: "test-native".to_string(),
+            installation_type: DuckStationInstallationType::Native,
+            configuration_path: config.clone(),
+            provenance: "test",
+            eligible: true,
+            blocker: None,
+            executable_candidates,
+            global_config_path: config.join("settings.ini"),
+            game_settings_path: config.join("gamesettings"),
+            cheats_path: config.join("cheats"),
+            patches_path: config.join("patches"),
+            textures_path: config.join("textures"),
+            bios_path: config.join("bios"),
+            memory_cards_path: config.join("memcards"),
+            save_states_path: config.join("savestates"),
+        }
+    }
+
+    // --- 1: valid native binding --------------------------------------------------------------
+
+    #[test]
+    fn valid_native_duckstation_binding() {
+        let root = binding_fixture_root("valid");
+        let roots = binding_roots(&root);
+        let bin = root.join("bin/duckstation-qt");
+        make_native_executable(&bin);
+        let profile = native_duckstation_profile(
+            &roots,
+            vec![duckstation_executable(
+                bin.clone(),
+                DuckStationInstallationType::Native,
+            )],
+        );
+        let binding = resolve_duckstation_native_launch_binding(&profile, &roots).unwrap();
+        assert_eq!(binding.executable, bin);
+        assert_eq!(
+            binding.user_directory_mode,
+            DuckStationUserDirectoryMode::DefaultNative
+        );
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    // --- 1b: a Native profile binds a caller-confirmed Explicit executable ---------------------
+
+    #[test]
+    fn native_profile_binds_a_caller_confirmed_explicit_executable() {
+        // The managed-AppImage seam: a path fed via
+        // `roots.explicit_executables` is classified `Explicit`, and a
+        // profile at DuckStation's own default user directory accepts it -
+        // held to the identical file-safety and single-candidate rules.
+        let root = binding_fixture_root("explicit-exe");
+        let roots = binding_roots(&root);
+        let appimage = root.join("emulators/duckstation/DuckStation.AppImage");
+        make_native_executable(&appimage);
+        let profile = native_duckstation_profile(
+            &roots,
+            vec![duckstation_executable(
+                appimage.clone(),
+                DuckStationInstallationType::Explicit,
+            )],
+        );
+        let binding = resolve_duckstation_native_launch_binding(&profile, &roots).unwrap();
+        assert_eq!(binding.executable, appimage);
+        assert_eq!(
+            binding.user_directory_mode,
+            DuckStationUserDirectoryMode::DefaultNative
+        );
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn a_forced_untrusted_profile_never_binds_the_caller_confirmed_executable() {
+        let root = binding_fixture_root("explicit-exe-forced");
+        let roots = binding_roots(&root);
+        let appimage = root.join("emulators/duckstation/DuckStation.AppImage");
+        make_native_executable(&appimage);
+        for forced in [
+            DuckStationInstallationType::Portable,
+            DuckStationInstallationType::FlatpakUser,
+            DuckStationInstallationType::Explicit,
+        ] {
+            let mut profile = native_duckstation_profile(
+                &roots,
+                vec![duckstation_executable(
+                    appimage.clone(),
+                    DuckStationInstallationType::Explicit,
+                )],
+            );
+            profile.installation_type = forced;
+            let blocker = resolve_duckstation_native_launch_binding(&profile, &roots).unwrap_err();
+            // The confirmed executable is not a Portable/Flatpak candidate, so
+            // it never binds there; `Explicit` stays unsupported outright.
+            let expected = if forced == DuckStationInstallationType::Explicit {
+                DuckStationLaunchBlockerKind::UnsupportedInstallationType
+            } else {
+                DuckStationLaunchBlockerKind::ExecutableMissing
+            };
+            assert_eq!(blocker.kind, expected, "{forced:?}");
+        }
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn a_settings_ini_beside_the_caller_confirmed_executable_still_forces_portable_conflict() {
+        // The `portable_marker_conflict` gate is unchanged and still runs on
+        // the resolved executable path even when it is an Explicit AppImage.
+        let root = binding_fixture_root("explicit-exe-portable-marker");
+        let roots = binding_roots(&root);
+        let appimage = root.join("emulators/duckstation/DuckStation.AppImage");
+        make_native_executable(&appimage);
+        fs::write(appimage.parent().unwrap().join("settings.ini"), "[Main]\n").unwrap();
+        let profile = native_duckstation_profile(
+            &roots,
+            vec![duckstation_executable(
+                appimage,
+                DuckStationInstallationType::Explicit,
+            )],
+        );
+        let blocker = resolve_duckstation_native_launch_binding(&profile, &roots).unwrap_err();
+        assert_eq!(
+            blocker.kind,
+            DuckStationLaunchBlockerKind::PortableMarkerConflict
+        );
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    // --- 2: executable missing ------------------------------------------------------------------
+
+    #[test]
+    fn missing_executable_is_blocked() {
+        let root = binding_fixture_root("missing-exe");
+        let roots = binding_roots(&root);
+        let bin = root.join("bin/duckstation-qt");
+        let profile = native_duckstation_profile(
+            &roots,
+            vec![duckstation_executable(
+                bin,
+                DuckStationInstallationType::Native,
+            )],
+        );
+        let blocker = resolve_duckstation_native_launch_binding(&profile, &roots).unwrap_err();
+        assert_eq!(
+            blocker.kind,
+            DuckStationLaunchBlockerKind::ExecutableMissing
+        );
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn zero_candidates_is_blocked() {
+        let root = binding_fixture_root("zero-candidates");
+        let roots = binding_roots(&root);
+        let profile = native_duckstation_profile(&roots, Vec::new());
+        let blocker = resolve_duckstation_native_launch_binding(&profile, &roots).unwrap_err();
+        assert_eq!(
+            blocker.kind,
+            DuckStationLaunchBlockerKind::ExecutableMissing
+        );
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    // --- 3: ambiguous executable ------------------------------------------------------------------
+
+    #[test]
+    fn ambiguous_executable_is_blocked() {
+        let root = binding_fixture_root("ambiguous");
+        let roots = binding_roots(&root);
+        let first = root.join("bin/duckstation-qt");
+        let second = root.join("alt-bin/duckstation-qt");
+        make_native_executable(&first);
+        make_native_executable(&second);
+        let profile = native_duckstation_profile(
+            &roots,
+            vec![
+                duckstation_executable(first, DuckStationInstallationType::Native),
+                duckstation_executable(second, DuckStationInstallationType::Native),
+            ],
+        );
+        let blocker = resolve_duckstation_native_launch_binding(&profile, &roots).unwrap_err();
+        assert_eq!(
+            blocker.kind,
+            DuckStationLaunchBlockerKind::AmbiguousExecutable
+        );
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    // --- 4: symlink executable ------------------------------------------------------------------
+
+    #[cfg(unix)]
+    #[test]
+    fn symlink_executable_is_blocked() {
+        use std::os::unix::fs::symlink;
+
+        let root = binding_fixture_root("symlink");
+        let roots = binding_roots(&root);
+        let real = root.join("bin/duckstation-qt-real");
+        make_native_executable(&real);
+        let link = root.join("bin/duckstation-qt");
+        symlink(&real, &link).unwrap();
+        let profile = native_duckstation_profile(
+            &roots,
+            vec![duckstation_executable(
+                link,
+                DuckStationInstallationType::Native,
+            )],
+        );
+        let blocker = resolve_duckstation_native_launch_binding(&profile, &roots).unwrap_err();
+        assert_eq!(blocker.kind, DuckStationLaunchBlockerKind::ExecutableUnsafe);
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    // --- 5: non-regular executable ------------------------------------------------------------------
+
+    #[test]
+    fn directory_executable_is_blocked() {
+        let root = binding_fixture_root("directory-exe");
+        let roots = binding_roots(&root);
+        let bin = root.join("bin/duckstation-qt");
+        fs::create_dir_all(&bin).unwrap();
+        let profile = native_duckstation_profile(
+            &roots,
+            vec![duckstation_executable(
+                bin,
+                DuckStationInstallationType::Native,
+            )],
+        );
+        let blocker = resolve_duckstation_native_launch_binding(&profile, &roots).unwrap_err();
+        assert_eq!(blocker.kind, DuckStationLaunchBlockerKind::ExecutableUnsafe);
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    // --- 6: non-executable file ------------------------------------------------------------------
+
+    #[cfg(unix)]
+    #[test]
+    fn non_executable_permission_is_blocked() {
+        let root = binding_fixture_root("non-executable");
+        let roots = binding_roots(&root);
+        let bin = root.join("bin/duckstation-qt");
+        fs::create_dir_all(bin.parent().unwrap()).unwrap();
+        fs::write(&bin, b"not executable").unwrap();
+        let mut perms = fs::metadata(&bin).unwrap().permissions();
+        perms.set_mode(0o644);
+        fs::set_permissions(&bin, perms).unwrap();
+        let profile = native_duckstation_profile(
+            &roots,
+            vec![duckstation_executable(
+                bin,
+                DuckStationInstallationType::Native,
+            )],
+        );
+        let blocker = resolve_duckstation_native_launch_binding(&profile, &roots).unwrap_err();
+        assert_eq!(
+            blocker.kind,
+            DuckStationLaunchBlockerKind::ExecutableNotExecutable
+        );
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    // --- 7: config root drift (XDG_CONFIG_HOME explicit branch) ------------------------------------
+
+    #[test]
+    fn config_root_drift_is_blocked() {
+        let root = binding_fixture_root("config-drift");
+        let roots = binding_roots(&root);
+        let bin = root.join("bin/duckstation-qt");
+        make_native_executable(&bin);
+        let mut profile = native_duckstation_profile(
+            &roots,
+            vec![duckstation_executable(
+                bin,
+                DuckStationInstallationType::Native,
+            )],
+        );
+        // The profile's own root drifted away from what `binding_roots`
+        // currently resolves to (e.g. `$XDG_CONFIG_HOME` changed since
+        // discovery ran).
+        profile.configuration_path = root.join("config-old/duckstation");
+        let blocker = resolve_duckstation_native_launch_binding(&profile, &roots).unwrap_err();
+        assert_eq!(
+            blocker.kind,
+            DuckStationLaunchBlockerKind::DefaultResolutionMismatch
+        );
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    // --- 8: data root drift (XDG_CONFIG_HOME-unset fallback branch) --------------------------------
+
+    #[test]
+    fn data_root_drift_is_blocked_when_xdg_config_home_is_unset() {
+        let root = binding_fixture_root("data-drift");
+        let mut roots = binding_roots(&root);
+        roots.xdg_config_home_explicit = false;
+        let bin = root.join("bin/duckstation-qt");
+        make_native_executable(&bin);
+        // Correctly resolved once (against `roots.home`), matching the
+        // hardcoded `$HOME/.local/share/duckstation` fallback rule.
+        let profile = native_duckstation_profile(
+            &roots,
+            vec![duckstation_executable(
+                bin,
+                DuckStationInstallationType::Native,
+            )],
+        );
+        resolve_duckstation_native_launch_binding(&profile, &roots)
+            .expect("profile matches the current hardcoded fallback root");
+        // `$HOME` itself drifts (e.g. re-derived in a different session) -
+        // the previously proven root must no longer match.
+        let mut drifted_roots = roots.clone();
+        drifted_roots.home = root.join("a-different-home");
+        let blocker =
+            resolve_duckstation_native_launch_binding(&profile, &drifted_roots).unwrap_err();
+        assert_eq!(
+            blocker.kind,
+            DuckStationLaunchBlockerKind::DefaultResolutionMismatch
+        );
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn xdg_config_home_explicit_and_hardcoded_fallback_resolve_to_different_roots() {
+        let root = binding_fixture_root("root-rule");
+        let mut roots = binding_roots(&root);
+        roots.xdg_config_home_explicit = true;
+        let via_config_home = expected_duckstation_native_root(&roots);
+        roots.xdg_config_home_explicit = false;
+        let via_hardcoded_fallback = expected_duckstation_native_root(&roots);
+        assert_ne!(via_config_home, via_hardcoded_fallback);
+        assert_eq!(via_config_home, roots.xdg_config_home.join("duckstation"));
+        assert_eq!(
+            via_hardcoded_fallback,
+            roots.home.join(".local/share").join("duckstation")
+        );
+    }
+
+    // --- 9: unsupported Flatpak -----------------------------------------------------------------
+
+    #[test]
+    fn a_flatpak_profile_without_a_flatpak_candidate_has_no_binding() {
+        let root = binding_fixture_root("flatpak");
+        let roots = binding_roots(&root);
+        let mut profile = native_duckstation_profile(&roots, Vec::new());
+        profile.installation_type = DuckStationInstallationType::FlatpakUser;
+        let blocker = resolve_duckstation_native_launch_binding(&profile, &roots).unwrap_err();
+        assert_eq!(
+            blocker.kind,
+            DuckStationLaunchBlockerKind::ExecutableMissing
+        );
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    // --- 10: unsupported AppImage/portable ------------------------------------------------------
+
+    #[test]
+    fn a_portable_profile_without_a_portable_appimage_has_no_binding() {
+        let root = binding_fixture_root("portable");
+        let roots = binding_roots(&root);
+        let mut profile = native_duckstation_profile(&roots, Vec::new());
+        profile.installation_type = DuckStationInstallationType::Portable;
+        profile.provenance = "AppImage-adjacent directory (from $APPIMAGE)";
+        let blocker = resolve_duckstation_native_launch_binding(&profile, &roots).unwrap_err();
+        assert_eq!(
+            blocker.kind,
+            DuckStationLaunchBlockerKind::ExecutableMissing
+        );
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn a_caller_confirmed_portable_root_without_its_executable_has_no_binding() {
+        // A portable root binds only when a portable-marked AppImage sits in
+        // that exact directory; a bare root has nothing to launch.
+        let root = binding_fixture_root("genuine-portable");
+        let roots = binding_roots(&root);
+        let mut profile = native_duckstation_profile(&roots, Vec::new());
+        profile.installation_type = DuckStationInstallationType::Portable;
+        profile.provenance = "caller-confirmed portable configuration root";
+        let blocker = resolve_duckstation_native_launch_binding(&profile, &roots).unwrap_err();
+        assert_eq!(
+            blocker.kind,
+            DuckStationLaunchBlockerKind::ExecutableMissing
+        );
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    // --- 11: wrong installation kind (Explicit) ---------------------------------------------------
+
+    #[test]
+    fn explicit_installation_is_unsupported() {
+        let root = binding_fixture_root("explicit");
+        let roots = binding_roots(&root);
+        let mut profile = native_duckstation_profile(&roots, Vec::new());
+        profile.installation_type = DuckStationInstallationType::Explicit;
+        let blocker = resolve_duckstation_native_launch_binding(&profile, &roots).unwrap_err();
+        assert_eq!(
+            blocker.kind,
+            DuckStationLaunchBlockerKind::UnsupportedInstallationType
+        );
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn ineligible_profile_is_blocked_before_installation_type_is_even_checked() {
+        let root = binding_fixture_root("ineligible");
+        let roots = binding_roots(&root);
+        let mut profile = native_duckstation_profile(&roots, Vec::new());
+        profile.eligible = false;
+        let blocker = resolve_duckstation_native_launch_binding(&profile, &roots).unwrap_err();
+        assert_eq!(
+            blocker.kind,
+            DuckStationLaunchBlockerKind::ProfileRootMismatch
+        );
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    // --- 12: no hard-coded fallback ---------------------------------------------------------------
+
+    #[test]
+    fn no_hard_coded_executable_fallback() {
+        // A profile whose installation type is `Native` but whose
+        // candidate list is empty must never fall back to a well-known
+        // name/path - it must be blocked exactly like any other
+        // no-candidate case.
+        let root = binding_fixture_root("no-fallback");
+        let roots = binding_roots(&root);
+        let profile = native_duckstation_profile(&roots, Vec::new());
+        let blocker = resolve_duckstation_native_launch_binding(&profile, &roots).unwrap_err();
+        assert_eq!(
+            blocker.kind,
+            DuckStationLaunchBlockerKind::ExecutableMissing
+        );
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    // --- 13: exact executable retained -------------------------------------------------------------
+
+    #[test]
+    fn exact_executable_path_is_retained_unmodified() {
+        let root = binding_fixture_root("exact-path");
+        let roots = binding_roots(&root);
+        let bin = root.join("bin/duckstation-qt");
+        make_native_executable(&bin);
+        let profile = native_duckstation_profile(
+            &roots,
+            vec![duckstation_executable(
+                bin.clone(),
+                DuckStationInstallationType::Native,
+            )],
+        );
+        let binding = resolve_duckstation_native_launch_binding(&profile, &roots).unwrap();
+        assert_eq!(binding.executable, bin);
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    // --- 14: user-directory mode is data, not a command string -------------------------------------
+
+    #[test]
+    fn user_directory_mode_is_data_never_a_command_string() {
+        // Exhaustive destructure/match: if a future change ever added an
+        // argv-shaped field, this would fail to compile, forcing a review.
+        let mode = DuckStationUserDirectoryMode::DefaultNative;
+        match mode {
+            DuckStationUserDirectoryMode::DefaultNative
+            | DuckStationUserDirectoryMode::PortableBesideExecutable
+            | DuckStationUserDirectoryMode::FlatpakSandbox => {}
+        }
+        let root = binding_fixture_root("mode-is-data");
+        let roots = binding_roots(&root);
+        let bin = root.join("bin/duckstation-qt");
+        make_native_executable(&bin);
+        let profile = native_duckstation_profile(
+            &roots,
+            vec![duckstation_executable(
+                bin,
+                DuckStationInstallationType::Native,
+            )],
+        );
+        let binding = resolve_duckstation_native_launch_binding(&profile, &roots).unwrap();
+        let DuckStationNativeLaunchBinding {
+            executable: _,
+            user_directory_mode: _,
+            installation: _,
+        } = binding;
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    // --- 15: fresh rediscovery detects changed executable/profile ----------------------------------
+
+    #[test]
+    fn fresh_rediscovery_detects_a_swapped_executable_between_calls() {
+        let root = binding_fixture_root("fresh-rediscovery");
+        let roots = binding_roots(&root);
+        let bin = root.join("bin/duckstation-qt");
+        make_native_executable(&bin);
+        let profile = native_duckstation_profile(
+            &roots,
+            vec![duckstation_executable(
+                bin.clone(),
+                DuckStationInstallationType::Native,
+            )],
+        );
+        resolve_duckstation_native_launch_binding(&profile, &roots)
+            .expect("first resolution must succeed against the real on-disk executable");
+        // The executable is removed and replaced with a symlink between
+        // calls - a fresh call must detect this, never trust a cached
+        // result.
+        fs::remove_file(&bin).unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::symlink;
+            let real = root.join("bin/duckstation-qt-swapped");
+            make_native_executable(&real);
+            symlink(&real, &bin).unwrap();
+            let blocker = resolve_duckstation_native_launch_binding(&profile, &roots).unwrap_err();
+            assert_eq!(blocker.kind, DuckStationLaunchBlockerKind::ExecutableUnsafe);
+        }
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn fresh_rediscovery_detects_profile_root_removed() {
+        let root = binding_fixture_root("profile-removed");
+        let roots = binding_roots(&root);
+        let bin = root.join("bin/duckstation-qt");
+        make_native_executable(&bin);
+        let profile = native_duckstation_profile(
+            &roots,
+            vec![duckstation_executable(
+                bin,
+                DuckStationInstallationType::Native,
+            )],
+        );
+        resolve_duckstation_native_launch_binding(&profile, &roots)
+            .expect("first resolution must succeed against the real on-disk profile root");
+        fs::remove_dir_all(&profile.configuration_path).unwrap();
+        let blocker = resolve_duckstation_native_launch_binding(&profile, &roots).unwrap_err();
+        assert_eq!(
+            blocker.kind,
+            DuckStationLaunchBlockerKind::ProfileRootMismatch
+        );
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    // --- portable.txt / settings.ini co-location conflict -------------------------------------------
+
+    #[test]
+    fn portable_marker_beside_executable_rejects_default_native() {
+        let root = binding_fixture_root("portable-marker");
+        let roots = binding_roots(&root);
+        let bin = root.join("bin/duckstation-qt");
+        make_native_executable(&bin);
+        fs::write(bin.parent().unwrap().join("portable.txt"), b"").unwrap();
+        let profile = native_duckstation_profile(
+            &roots,
+            vec![duckstation_executable(
+                bin,
+                DuckStationInstallationType::Native,
+            )],
+        );
+        let blocker = resolve_duckstation_native_launch_binding(&profile, &roots).unwrap_err();
+        assert_eq!(
+            blocker.kind,
+            DuckStationLaunchBlockerKind::PortableMarkerConflict
+        );
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn settings_ini_beside_executable_also_rejects_default_native() {
+        // Proven from upstream source: `Core::SetDataRoot()` treats a
+        // stray `settings.ini` beside the executable exactly like
+        // `portable.txt` - not just the marker file alone.
+        let root = binding_fixture_root("settings-marker");
+        let roots = binding_roots(&root);
+        let bin = root.join("bin/duckstation-qt");
+        make_native_executable(&bin);
+        fs::write(bin.parent().unwrap().join("settings.ini"), b"[Main]\n").unwrap();
+        let profile = native_duckstation_profile(
+            &roots,
+            vec![duckstation_executable(
+                bin,
+                DuckStationInstallationType::Native,
+            )],
+        );
+        let blocker = resolve_duckstation_native_launch_binding(&profile, &roots).unwrap_err();
+        assert_eq!(
+            blocker.kind,
+            DuckStationLaunchBlockerKind::PortableMarkerConflict
+        );
+        fs::remove_dir_all(root).unwrap();
+    }
+}

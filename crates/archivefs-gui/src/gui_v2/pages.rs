@@ -1,0 +1,4108 @@
+//! Paint-only pages: layout, in-memory projections and explicit user intents.
+use super::DUPLICATE_SCAN_TITLE;
+use super::{
+    App,
+    activity::Phase,
+    artwork::Picture,
+    backend::Command,
+    imagery::{EmptyArt, empty_state},
+    library::{DuplicateGroup, Game, Library, media_kind_label},
+    media_sources::{Kind, Source},
+    onboarding,
+    problems::{Category, Problem, ProblemFilter, Severity},
+    romm_library::PresenceFilter,
+    routes::{
+        FamilyVariant, FeatureFamily, HOME_TASKS, Route, SECTIONS, Section, breadcrumb_labels,
+        family_children, family_for_route, family_home,
+    },
+};
+use crate::ui::{
+    components::{StatusTone, page_hero},
+    theme,
+};
+use eframe::egui::{self, Color32, RichText};
+
+pub(super) fn primary(ui: &mut egui::Ui, text: &str) -> bool {
+    ui.add(
+        egui::Button::new(RichText::new(text).strong())
+            .fill(theme::primary_action_fill(ui))
+            .min_size(egui::vec2(180.0, 44.0)),
+    )
+    .clicked()
+}
+
+/// Below this much body height (points) contextual guidance scrolls with the page.
+const COMPACT_BODY_HEIGHT: f32 = 260.0;
+
+/// One bounded main-content scroller; sidebar and header are outside it.
+fn check_scroll(ui: &mut egui::Ui, platform: Option<&str>, content: impl FnOnce(&mut egui::Ui)) {
+    let salt = ("v2_check_scroll", platform);
+    let id = ui.make_persistent_id(salt);
+    let mut scroll = egui::ScrollArea::vertical()
+        .id_salt(salt)
+        .auto_shrink([false, false]);
+    // This page has buttons, not text inputs. Button focus must not disable paging.
+    if ui.input(|i| !i.modifiers.alt && !i.modifiers.ctrl) {
+        let previous = egui::scroll_area::State::load(ui.ctx(), id)
+            .unwrap_or_default()
+            .offset
+            .y;
+        let maximum = ui
+            .ctx()
+            .data(|d| d.get_temp::<f32>(id.with("content_height")))
+            .map(|height| (height - ui.available_height()).max(0.0))
+            .unwrap_or(0.0);
+        let page = ui.available_height() * 0.9;
+        let target = ui.input(|i| {
+            if i.key_pressed(egui::Key::Home) {
+                Some(0.0)
+            } else if i.key_pressed(egui::Key::End) {
+                Some(maximum)
+            } else if i.key_pressed(egui::Key::PageDown) {
+                Some((previous + page).min(maximum))
+            } else if i.key_pressed(egui::Key::PageUp) {
+                Some((previous - page).max(0.0))
+            } else {
+                None
+            }
+        });
+        if let Some(target) = target {
+            scroll = scroll.vertical_scroll_offset(target);
+        }
+    }
+    let output = scroll.show(ui, content);
+    ui.ctx()
+        .data_mut(|d| d.insert_temp(id.with("content_height"), output.content_size.y));
+}
+
+impl App {
+    fn romm_library_page(&mut self, ui: &mut egui::Ui) {
+        ui.label("Read-only provider browsing. Local EmuWiz evidence is never replaced by RomM metadata.");
+        let busy = self.romm_library.operation.is_some();
+        let mut refresh = false;
+        let mut preview = false;
+        ui.horizontal_wrapped(|ui| {
+            if ui
+                .add_enabled(!busy, egui::Button::new("Refresh RomM data"))
+                .clicked()
+            {
+                refresh = true;
+            }
+            if ui
+                .add_enabled(
+                    !busy,
+                    egui::Button::new(romm_preview_button_label(
+                        crate::romm_source::SAMPLE_IMPORT_RECORDS,
+                    )),
+                )
+                .on_hover_text(
+                    "Fetches a small sample of games from your RomM server to show what an import would add. Nothing is saved or published.",
+                )
+                .clicked()
+            {
+                preview = true;
+            }
+            if busy {
+                ui.label("RomM operation in progress…");
+            }
+        });
+        if refresh {
+            self.start_romm_library_operation(
+                crate::gui_v2::romm_library::RommLibraryOperation::Refresh,
+            );
+        }
+        if preview {
+            self.start_romm_library_operation(
+                crate::gui_v2::romm_library::RommLibraryOperation::PreviewImport,
+            );
+        }
+        if let Some(error) = &self.romm_library.operation_error {
+            ui.colored_label(theme::warning(ui), error);
+        }
+        if let Some(summary) = &self.romm_library.last_preview {
+            ui.label(format!(
+                "Import preview: {} game(s) on {} platform(s) in the sample; nothing was saved or published.",
+                summary.records, summary.platforms
+            ));
+        }
+        let Some(snapshot) = self.romm_library.snapshot.as_ref() else {
+            ui.label(if self.romm_library.loading {
+                "Loading the cached RomM snapshot…"
+            } else {
+                "No RomM snapshot loaded."
+            });
+            return;
+        };
+        ui.label(&snapshot.status);
+        if let Some(cache) = &snapshot.cache {
+            ui.label(format!(
+                "Last refreshed: {} · Cached platforms: {} · Cached games: {}",
+                cache.imported_at_unix_seconds,
+                cache.platforms.len(),
+                cache.records.len()
+            ));
+        }
+        if let Some(delta) = self.romm_library.last_delta {
+            ui.label(format!(
+                "Changes since previous refresh: +{} game(s), −{} game(s), {} unchanged; +{} platform(s), −{} platform(s).",
+                delta.added_games,
+                delta.removed_games,
+                delta.unchanged_games,
+                delta.added_platforms,
+                delta.removed_platforms
+            ));
+        }
+        if snapshot.cache.is_none() {
+            ui.colored_label(
+                theme::warning(ui),
+                "RomM is unavailable, unauthenticated, or has no usable cached library.",
+            );
+            ui.label("Configure RomM in Sources if needed. Existing local games remain available.");
+            return;
+        }
+        ui.horizontal_wrapped(|ui| {
+            ui.label("Search");
+            if ui
+                .text_edit_singleline(&mut self.romm_library.search)
+                .changed()
+            {
+                self.romm_library.page = 0;
+            }
+            ui.label("Platform");
+            let current = self
+                .romm_library
+                .platform
+                .clone()
+                .unwrap_or_else(|| "All platforms".into());
+            egui::ComboBox::from_id_salt("romm_platform")
+                .selected_text(current)
+                .show_ui(ui, |ui| {
+                    if ui
+                        .selectable_label(self.romm_library.platform.is_none(), "All platforms")
+                        .clicked()
+                    {
+                        self.romm_library.platform = None;
+                    }
+                    for platform in self.romm_library.platforms() {
+                        let value = platform
+                            .canonical
+                            .clone()
+                            .unwrap_or_else(|| platform.slug.clone());
+                        if ui
+                            .selectable_label(
+                                self.romm_library.platform.as_deref() == Some(value.as_str()),
+                                &value,
+                            )
+                            .clicked()
+                        {
+                            self.romm_library.platform = Some(value);
+                        }
+                    }
+                });
+            ui.label("Local state");
+            egui::ComboBox::from_id_salt("romm_presence")
+                .selected_text(match self.romm_library.presence {
+                    PresenceFilter::Any => "Any",
+                    PresenceFilter::Present => "Present",
+                    PresenceFilter::Missing => "Missing",
+                })
+                .show_ui(ui, |ui| {
+                    ui.selectable_value(
+                        &mut self.romm_library.presence,
+                        PresenceFilter::Any,
+                        "Any",
+                    );
+                    ui.selectable_value(
+                        &mut self.romm_library.presence,
+                        PresenceFilter::Present,
+                        "Present",
+                    );
+                    ui.selectable_value(
+                        &mut self.romm_library.presence,
+                        PresenceFilter::Missing,
+                        "Missing",
+                    );
+                });
+        });
+        let rows = self.romm_library.filtered_games();
+        ui.label(format!(
+            "{} matching game(s) · deterministic title/id order · showing at most {}",
+            rows.len(),
+            crate::gui_v2::romm_library::MAX_VISIBLE
+        ));
+        for row in rows {
+            let selected = self.romm_library.selected.as_deref() == Some(row.id.as_str());
+            if ui
+                .selectable_label(
+                    selected,
+                    format!("{} · {} · RomM id {}", row.title, row.platform, row.id),
+                )
+                .clicked()
+            {
+                self.romm_library.selected = Some(row.id.clone());
+            }
+            ui.small(format!(
+                "RomM slug/name: {} · local: {} · {} file(s) · artwork: {}",
+                row.platform_slug,
+                row.local_path.as_deref().unwrap_or("unmapped"),
+                row.files,
+                if row.artwork { "available" } else { "none" }
+            ));
+        }
+        if let Some(record) = self.romm_library.selected_record() {
+            ui.separator();
+            ui.heading("Selected game");
+            ui.label(format!(
+                "RomM metadata: {}",
+                record.title.as_deref().unwrap_or("(untitled)")
+            ));
+            ui.label(format!(
+                "RomM id {} · platform id {} · slug/name {}",
+                record.provider_game_id,
+                record.provider_platform_id.as_deref().unwrap_or("-"),
+                record.provider_platform_name.as_deref().unwrap_or("-")
+            ));
+            ui.label(format!(
+                "RomM path: {} · file id {} · size {}",
+                record.provider_path,
+                record.provider_file_id.as_deref().unwrap_or("-"),
+                record
+                    .file_size_bytes
+                    .map(|v| v.to_string())
+                    .unwrap_or_else(|| "unknown".into())
+            ));
+            ui.label(format!(
+                "Local EmuWiz evidence: {} · local path {}",
+                record.verification.label(),
+                record
+                    .archivefs_path
+                    .as_ref()
+                    .map(|p| p.display().to_string())
+                    .unwrap_or_else(|| "unmapped".into())
+            ));
+            ui.label(format!(
+                "Provenance: {} · artwork reference: {} · related files: {}",
+                record.server_id,
+                if record.artwork.is_some() {
+                    "present"
+                } else {
+                    "none"
+                },
+                record.related_files.len()
+            ));
+            if record.platform_candidate.is_none() {
+                ui.colored_label(
+                    theme::warning(ui),
+                    "RomM platform is unmapped; native identity is unchanged.",
+                );
+            }
+        }
+    }
+    pub(super) fn show(&mut self, context: &egui::Context) {
+        // Presentation only: a no-op unless the Simple v1 preference changed.
+        if self.simple.apply_zoom_shortcuts(context) {
+            self.preferences_dirty = Some(std::time::Instant::now());
+        }
+        self.simple.sync_style(context);
+        // Database status's upgrade may finish while another page is shown.
+        self.tools.database.settle(context);
+        // Kept until no other load is in flight, so the reload is not lost.
+        if self.load_job.is_none() && std::mem::take(&mut self.tools.database.library_changed) {
+            self.load(false);
+        }
+        super::simple_shell::prepare_keyboard_reveal(context);
+        if self.show_manual_viewer(context) || self.show_text_guide_viewer(context) {
+            return;
+        }
+        let modal_open = self.confirm_scan
+            || self.setup_actions.confirm.is_some()
+            || self.repair_confirm
+            || self.undo_confirm.is_some()
+            || self.history_view.confirm_undo.is_some()
+            || self.missing.confirm
+            || self.equiv.confirm;
+        let (escape, alt_back) = context.input(|input| {
+            (
+                input.key_pressed(egui::Key::Escape),
+                input.modifiers.alt && input.key_pressed(egui::Key::ArrowLeft),
+            )
+        });
+        if escape {
+            // Any other open dialog (the classic Sources dialogs are hosted here too)
+            // is not ours to cancel, but Back must not run underneath it.
+            let other_window_open = context.memory(|memory| {
+                memory
+                    .areas()
+                    .visible_layer_ids()
+                    .iter()
+                    .any(|layer| layer.order == egui::Order::Middle)
+            });
+            match escape_action(
+                modal_open,
+                egui::Popup::is_any_open(context),
+                other_window_open,
+                self.text_was_focused,
+            ) {
+                EscapeAction::CloseModal => {
+                    // Every v2 confirmation is a preview-only step, so closing is always safe.
+                    self.confirm_scan = false;
+                    if let Some(confirm) = self.setup_actions.confirm.take() {
+                        let opened = egui::Id::new(("v2_setup_confirm_opened", confirm.path()));
+                        context.data_mut(|data| data.remove::<bool>(opened));
+                    }
+                    self.repair_confirm = false;
+                    self.undo_confirm = None;
+                    if let Some(id) = self.history_view.confirm_undo.take() {
+                        let opened = egui::Id::new(("v2_history_undo_opened", id));
+                        context.data_mut(|data| data.remove::<bool>(opened));
+                    }
+                    self.missing.confirm = false;
+                    self.equiv.confirm = false;
+                }
+                // egui has already released the field's focus on this key press.
+                EscapeAction::LeaveFocus => {}
+                // egui closes an open popup on this same key press.
+                EscapeAction::PopupHandles => {}
+                EscapeAction::KeepDialogOpen => {}
+                EscapeAction::Back => self.back(),
+            }
+        } else if alt_back && !modal_open {
+            self.back();
+        }
+        if context.input(|input| input.modifiers.alt && input.key_pressed(egui::Key::Home)) {
+            self.go(Route::Home);
+        }
+        let metrics = super::simple_shell::shell_metrics(
+            context.content_rect().width(),
+            context.content_rect().height(),
+        );
+        let mut status_bar = egui::TopBottomPanel::bottom("v2_activity_bar");
+        if self.simple.simple_navigation() {
+            status_bar = status_bar
+                .min_height(metrics.status)
+                .frame(super::simple_shell::status_frame());
+        }
+        status_bar.show(context, |ui| {
+            // One row while it fits: summary, the running job, then the
+            // actions. It wraps to a second row only in a narrow window, so
+            // the page body keeps the height.
+            ui.horizontal_wrapped(|ui| {
+                let running = self.activity.running();
+                let queued = self.activity.queued();
+                if running == 0 && queued == 0 {
+                    ui.label("Ready · browsing does not change your game files");
+                } else {
+                    if running > 0 {
+                        ui.spinner();
+                    }
+                    ui.label(format!(
+                        "{} active jobs · {running} running · {queued} waiting",
+                        running + queued
+                    ));
+                }
+                // The running job's own title, progress and Cancel only fit
+                // beside the summary in a wide window. In a narrow one they
+                // would wrap the bar to three rows and crush the page, and the
+                // same job is on Activity (View Activity).
+                if ui.available_width() >= 560.0
+                    && let Some(job) = self
+                        .activity
+                        .jobs
+                        .values()
+                        .rev()
+                        .find(|job| job.phase == Phase::Running)
+                    && super::job_card::show_inline(ui, job).cancel
+                {
+                    job.request_cancel();
+                }
+                let failed = self.activity.failed();
+                if failed > 0
+                    && ui
+                        .button(format!(
+                            "{failed} {} attention",
+                            if failed == 1 {
+                                "job needs"
+                            } else {
+                                "jobs need"
+                            }
+                        ))
+                        .clicked()
+                {
+                    self.activity_attention_only = true;
+                    self.go(Route::Section(Section::Activity));
+                }
+                if ui.button("View Activity").clicked() {
+                    self.activity_attention_only = false;
+                    self.go(Route::Section(Section::Activity));
+                }
+            });
+        });
+        // Classic: the header spans the window. Simple: the sidebar runs the
+        // full height and the header starts beside it, so it is added first.
+        if !self.simple.simple_navigation() {
+            self.app_chrome(context);
+        }
+        let sidebar_width = if context.content_rect().width() < 900.0 {
+            178.0
+        } else {
+            230.0
+        };
+        if self.simple.simple_navigation() {
+            // Eight destinations over the same routes; All Tools (in the
+            // header and the Tools row) lists every location.
+            let width = metrics.sidebar;
+            let mut chosen = None;
+            // The bundled badge, through the existing off-thread loader.
+            let mascot = self.imagery.mascot(context).cloned();
+            egui::SidePanel::left("v2_simple_navigation")
+                .exact_width(width)
+                .resizable(false)
+                .frame(super::simple_shell::sidebar_frame(metrics.rail))
+                .show(context, |ui| {
+                    chosen = super::simple_shell::show_sidebar(
+                        ui,
+                        &self.router.current,
+                        mascot.as_ref(),
+                        self.simple.all_tools_open(),
+                        metrics.rail,
+                    );
+                });
+            self.app_chrome(context);
+            match chosen.map(|destination| destination.route()) {
+                Some(Some(route)) => self.go(route),
+                // Tools: the All Tools browser over the current location.
+                Some(None) => self.simple.all_tools = true,
+                None => {}
+            }
+        } else {
+            egui::SidePanel::left("v2_navigation")
+                .exact_width(sidebar_width)
+                .resizable(false)
+                .show(context, |ui| {
+                    ui.heading("EmuWiz");
+                    ui.label("Your game library");
+                    ui.push_id("v2_sidebar_browse_play", |ui| {
+                        if ui
+                            .add_sized(
+                                [ui.available_width(), 40.0],
+                                egui::Button::new("Browse & Play")
+                                    .selected(matches!(
+                                        self.router.current,
+                                        Route::BrowsePlay | Route::BrowsePlayGame(_)
+                                    ))
+                                    .wrap(),
+                            )
+                            .clicked()
+                        {
+                            self.go(Route::BrowsePlay);
+                        }
+                    });
+                    super::simple_shell::show_focus_reveal_scroll(
+                        ui,
+                        "v2_sidebar_scroll",
+                        [true, true],
+                        |ui| {
+                            // One heading per group, followed by all of its entries;
+                            // ungrouped entries keep their position.
+                            let mut shown_groups: Vec<&str> = Vec::new();
+                            let mut ordered: Vec<Section> = Vec::new();
+                            for section in SECTIONS {
+                                match section.group() {
+                                    None => ordered.push(*section),
+                                    Some(group) if !shown_groups.contains(&group) => {
+                                        shown_groups.push(group);
+                                        ordered.extend(
+                                            SECTIONS
+                                                .iter()
+                                                .copied()
+                                                .filter(|other| other.group() == Some(group)),
+                                        );
+                                    }
+                                    Some(_) => {}
+                                }
+                            }
+                            let mut current_group: Option<&str> = None;
+                            for section in &ordered {
+                                if let Some(group) = section.group()
+                                    && current_group != Some(group)
+                                {
+                                    ui.separator();
+                                    ui.strong(group);
+                                }
+                                current_group = section.group();
+                                // Browse & Play has its own button above; it must not also
+                                // light up the older Games catalogue entry.
+                                let selected = self.router.current.section() == *section
+                                    && !matches!(
+                                        self.router.current,
+                                        Route::BrowsePlay | Route::BrowsePlayGame(_)
+                                    );
+                                ui.push_id(("v2_sidebar_section", *section), |ui| {
+                                    if ui
+                                        .add_sized(
+                                            [ui.available_width(), 40.0],
+                                            egui::Button::new(section.sidebar_title())
+                                                .selected(selected)
+                                                .wrap(),
+                                        )
+                                        .clicked()
+                                    {
+                                        self.go(if *section == Section::Home {
+                                            Route::Home
+                                        } else {
+                                            Route::Section(*section)
+                                        });
+                                    }
+                                });
+                            }
+                            ui.label("Tab: move focus\nEnter: open\nAlt+Left: back");
+                        },
+                    );
+                });
+        }
+        egui::CentralPanel::default().show(context, |ui| {
+            if self.simple.all_tools_open() {
+                self.all_tools_page(ui);
+                return;
+            }
+            let health_page = self.organisation.view
+                == super::organisation::OrganisationView::MameHealth
+                && matches!(
+                    self.router.current,
+                    Route::Section(Section::Build)
+                        | Route::Task {
+                            section: Section::Build,
+                            ..
+                        }
+                        | Route::MameWorkflow
+                );
+            let scrolling_intro = matches!(
+                self.router.current,
+                Route::Section(
+                    Section::Emulators | Section::Sources | Section::Dat | Section::Check
+                ) | Route::Tool(_)
+            ) || health_page;
+            // These native pages own one page scroller. Their introduction must
+            // share it: at large text sizes pinning it can consume the viewport.
+            if !scrolling_intro {
+                self.page_intro(ui);
+            }
+            let route = self.router.current.clone();
+            // Health owns read-only guidance; publication tips do not apply.
+            // Blue Home shows its tip in the Mr Wiz card instead.
+            let blue_home = self.simple.simple_navigation()
+                && matches!(route, Route::Home | Route::Section(Section::Home));
+            let guidance = (!health_page && !blue_home)
+                .then(|| self.guidance_context(&route))
+                .flatten();
+            // Keep contextual guidance in the bounded upper interaction area.
+            // A virtualised/nested page body can occupy thousands of rows;
+            // appending the strip after that body makes it effectively invisible.
+            // When the viewport is short (a large scale on a small window)
+            // the strip would leave the page almost no body, so it scrolls
+            // with the page instead of pinning above it.
+            let compact = scrolling_intro
+                || (ui.available_height() < COMPACT_BODY_HEIGHT
+                    && !matches!(route, Route::BrowsePlay | Route::BrowsePlayGame(_)));
+            let mut pinned_guidance = None;
+            if self.beginner_hints_enabled
+                && let Some(guidance) = guidance
+            {
+                if compact {
+                    pinned_guidance = Some(guidance);
+                } else {
+                    super::guidance::show(ui, &mut self.guidance, guidance);
+                    ui.add_space(theme::SPACE_SM);
+                }
+            }
+            // A failed library load is shown as a failure, never as a loading
+            // spinner or an empty catalogue.
+            if super::library_failure::needs_library(&route) && self.show_library_failure(ui) {
+                return;
+            }
+            // Browse & Play is an application layout: the shelf scrolls, the page
+            // does not, so the selected game and its Play button stay in view.
+            if let Route::BrowsePlay | Route::BrowsePlayGame(_) = route {
+                let selected = route.game();
+                if ui.available_height() < super::browse_play::MIN_BODY_HEIGHT {
+                    // A large size on a small window: keep the application
+                    // layout at a usable height and let the page scroll to it,
+                    // so Play is reachable instead of cut off.
+                    // The shared page scroller, so keyboard focus on a game
+                    // card or Play brings it into view like on every page.
+                    super::simple_shell::show_page_scroll(ui, Section::Games, false, |ui| {
+                        let width = ui.available_width();
+                        ui.allocate_ui(
+                            egui::vec2(width, super::browse_play::MIN_BODY_HEIGHT),
+                            |ui| self.browse_play(ui, selected),
+                        );
+                    });
+                } else {
+                    self.browse_play(ui, selected);
+                }
+                return;
+            }
+            super::simple_shell::show_page_scroll(
+                ui,
+                route.section(),
+                self.simple.simple_navigation()
+                    && route == Route::Section(Section::OrganisationFamily),
+                |ui| {
+                    if scrolling_intro {
+                        self.page_intro(ui);
+                    }
+                    // Settings leads with its size controls, so there the
+                    // strip follows the page rather than preceding it.
+                    // Organisation's one primary action must not sit under a
+                    // multi-line strip on a short window; the strip follows it.
+                    let guidance_last =
+                        matches!(route, Route::Section(Section::Settings | Section::Build));
+                    if !guidance_last && let Some(guidance) = pinned_guidance.clone() {
+                        super::guidance::show(ui, &mut self.guidance, guidance);
+                        ui.add_space(theme::SPACE_SM);
+                    }
+                    match route {
+                        Route::Home | Route::Section(Section::Home) => self.home(ui),
+                        Route::BrowsePlay => self.browse_play(ui, None),
+                        Route::BrowsePlayGame(id) => self.browse_play(ui, Some(id)),
+                        Route::MameWorkflow => {
+                            // A restored or deep-linked MAME route skips `go`,
+                            // so never paint the generic Organise hub under it.
+                            if !matches!(
+                                self.organisation.view,
+                                super::organisation::OrganisationView::MameNormalizer
+                                    | super::organisation::OrganisationView::MameHealth
+                            ) {
+                                self.organisation.view =
+                                    super::organisation::OrganisationView::MameNormalizer;
+                            }
+                            self.organisation_page(ui)
+                        }
+                        Route::TosecInventory => {
+                            let route = self
+                                .native_workflows
+                                .get_or_insert_with(|| {
+                                    super::native_workflows::NativeWorkflows::new(ui.ctx().clone())
+                                })
+                                .tosec_inventory
+                                .show(ui);
+                            if let Some(route) = route {
+                                self.go(route);
+                            }
+                        }
+                        Route::Section(Section::Games | Section::Launch) => self.games(ui),
+                        Route::Section(Section::Saves) => self.saves_states(ui, None),
+                        Route::Section(Section::Emulators) => self.emulator_setup(ui),
+                        Route::Section(Section::Firmware) => self.firmware(ui),
+                        Route::Section(Section::Sources) => self.sources(ui),
+                        Route::Section(Section::Romm) => self.romm_library_page(ui),
+                        Route::Section(Section::Dat) => {
+                            if ui.button("Open TOSEC Collection Inventory").clicked() {
+                                self.go(Route::TosecInventory);
+                            }
+                            self.dat_sources(ui);
+                        }
+                        Route::Section(Section::Artwork) => self.artwork_metadata(ui, None),
+                        Route::Section(Section::Mods) => self.mods_page(ui, None),
+                        Route::Section(Section::Check) => self.check_games(ui, None),
+                        Route::QuickRename => self.quick_rename(ui),
+                        Route::PlatformCheck(platform) => self.platform_check(ui, &platform),
+                        Route::LibraryFiles => self.library_files_page(ui),
+                        Route::Tool(tool) => self.tool_page(ui, tool),
+                        Route::Section(Section::Duplicates) => self.duplicates(ui),
+                        Route::Section(Section::Storage) => self.storage_page(ui),
+                        Route::Section(Section::MultiDisc) => self.multi_disc_page(ui),
+                        Route::Section(Section::Problems) => self.problems(ui, None),
+                        Route::Section(Section::Build) => self.organisation_page(ui),
+                        Route::Section(Section::Converter) => self.converter(ui),
+                        Route::Section(Section::Tape) => self.tape_inspector(ui, None),
+                        Route::Section(Section::Museum) => self.museum(ui),
+                        Route::Section(Section::Setup) => self.setup_doctor(ui),
+                        Route::Section(Section::Platforms) => self.platforms(ui),
+                        Route::Game(id) => self.game_detail(ui, id),
+                        Route::ReviewIdentity(id) => self.review_identity(ui, id),
+                        Route::Section(Section::Activity) => self.activities(ui),
+                        Route::Section(Section::History)
+                        | Route::Task {
+                            section: Section::History,
+                            ..
+                        } => self.history(ui),
+                        Route::Section(Section::Settings) => self.settings(ui),
+                        Route::Section(Section::Advanced) => self.advanced(ui),
+                        // Simple view only: the same location is the Manage
+                        // Library hub. All Tools shows the overview below.
+                        Route::Section(Section::OrganisationFamily)
+                            if self.simple.simple_navigation() =>
+                        {
+                            if let Some(section) = super::simple_shell::show_manage_library(ui) {
+                                self.go(Route::Section(section));
+                            }
+                        }
+                        Route::Section(
+                            section @ (Section::DatVerification
+                            | Section::CheatsMods
+                            | Section::SavesStates
+                            | Section::EmulatorsFamily
+                            | Section::Mame
+                            | Section::ArtworkExtras
+                            | Section::Conversion
+                            | Section::OrganisationFamily
+                            | Section::ProblemsRepair
+                            | Section::SourcesProviders
+                            | Section::HistoryUndo
+                            | Section::AdvancedDiagnostics),
+                        ) => self.family_page(ui, section),
+                        Route::Task {
+                            section: Section::Build,
+                            ..
+                        } => self.organisation_page(ui),
+                        Route::Task {
+                            section: Section::Mods,
+                            game,
+                        } => self.mods_page(ui, Some(game)),
+                        Route::Task {
+                            section: Section::Launch,
+                            game,
+                        } => self.launch(ui, game),
+                        Route::Task {
+                            section: Section::Artwork,
+                            game,
+                        } => self.artwork_metadata(ui, Some(game)),
+                        Route::Task {
+                            section: Section::Saves,
+                            game,
+                        } => self.saves_states(ui, Some(game)),
+                        Route::Task {
+                            section: Section::Check,
+                            game,
+                        } => self.check_games(ui, Some(game)),
+                        Route::Task {
+                            section: Section::Problems,
+                            game,
+                        } => self.problems(ui, Some(game)),
+                        Route::Task {
+                            section: Section::Advanced,
+                            game,
+                        } => self.archive_inspector(ui, Some(game)),
+                        Route::Task {
+                            section: Section::Tape,
+                            game,
+                        } => self.tape_inspector(ui, Some(game)),
+                        Route::Task { section, .. } => self.handoff(ui, section),
+                    }
+                    if guidance_last && let Some(guidance) = pinned_guidance {
+                        ui.add_space(theme::SPACE_SM);
+                        super::guidance::show(ui, &mut self.guidance, guidance);
+                    }
+                    // Contextual guidance stays above this potentially unbounded body.
+                },
+            );
+        });
+        if self.confirm_scan {
+            egui::Window::new("Scan your game folders?").collapsible(false).resizable(false).anchor(egui::Align2::CENTER_CENTER, egui::Vec2::ZERO).show(context, |ui| {
+                ui.set_max_width(440.0);
+                ui.label("This reads your configured game folders and updates EmuWiz's game list. It does not rename, repair or change your original games.");
+                ui.label("Once started, this scanner must finish safely. You can keep browsing and follow it in Activity.");
+                if primary(ui, "Scan configured folders") { self.confirm_scan = false; self.load(true); }
+                if ui.button("Cancel — keep browsing").clicked() { self.confirm_scan = false; }
+            });
+        }
+        self.text_was_focused = context.text_edit_focused();
+    }
+
+    pub(super) fn guidance_context(
+        &self,
+        route: &Route,
+    ) -> Option<super::guidance::GuidanceContext> {
+        use super::guidance::{GuidanceContext, GuidancePage};
+        let page = match route {
+            Route::Home | Route::Section(Section::Home) => GuidancePage::Home,
+            // The page explains itself; a tip repeating it would only cost room.
+            Route::BrowsePlay | Route::BrowsePlayGame(_) => return None,
+            Route::MameWorkflow => GuidancePage::Organisation,
+            Route::Game(_) | Route::Section(Section::Games) => GuidancePage::Games,
+            Route::Section(Section::Sources) => GuidancePage::Sources,
+            Route::Section(Section::Launch)
+            | Route::Task {
+                section: Section::Launch,
+                ..
+            } => GuidancePage::Launch,
+            Route::Section(Section::Problems) => GuidancePage::ProblemsRepair,
+            Route::Section(Section::Check) => GuidancePage::CheckGames,
+            Route::Section(Section::Setup) => GuidancePage::Setup,
+            Route::Section(Section::Activity) => GuidancePage::Activity,
+            Route::Section(Section::History)
+            | Route::Task {
+                section: Section::History,
+                ..
+            } => GuidancePage::History,
+            Route::Section(Section::Saves) => GuidancePage::Saves,
+            Route::Section(Section::Converter) => GuidancePage::Converter,
+            Route::Section(Section::Artwork) => GuidancePage::Artwork,
+            Route::Section(Section::Romm) => GuidancePage::Romm,
+            Route::Section(Section::Advanced) => GuidancePage::Advanced,
+            Route::Section(Section::Settings) => GuidancePage::Settings,
+            Route::Section(Section::Build) => GuidancePage::Organisation,
+            Route::Section(Section::Mods) => GuidancePage::CheatsMods,
+            Route::Section(Section::Museum) => GuidancePage::Museum,
+            Route::Section(Section::Tape)
+            | Route::Task {
+                section: Section::Tape,
+                ..
+            } => GuidancePage::TapeInspector,
+            Route::Task {
+                section: Section::Advanced,
+                ..
+            } => GuidancePage::ArchiveInspector,
+            Route::PlatformCheck(_) => GuidancePage::CheckGames,
+            Route::LibraryFiles => GuidancePage::ProblemsRepair,
+            Route::Section(Section::Dat) | Route::QuickRename => GuidancePage::DatManagement,
+            Route::Section(Section::Firmware) => GuidancePage::BiosFirmware,
+            Route::Section(Section::Emulators) => GuidancePage::EmulatorSetup,
+            // No page-specific guidance: show none rather than an unrelated tip.
+            _ => return None,
+        };
+        let mut context = GuidanceContext::new(page);
+        match route {
+            Route::Home | Route::Section(Section::Home) => {
+                context.evidence.has_games = Some(!self.library.games.is_empty())
+            }
+            Route::Game(id) | Route::Task { game: id, .. } => {
+                context.evidence.launch_identity_verified =
+                    self.library.game(*id).map(|game| game.identified);
+            }
+            Route::Section(Section::Problems) => {
+                if let Some(summary) = &self.problem_summary {
+                    context.evidence.problems_actionable = Some(summary.actionable_count());
+                    context.evidence.problems_needing_attention = Some(summary.attention_count());
+                }
+            }
+            Route::Section(Section::Activity) => {
+                context.evidence.jobs_running = Some(self.activity.running());
+            }
+            _ => {}
+        }
+        Some(context)
+    }
+
+    fn saves_states(&mut self, ui: &mut egui::Ui, game_id: Option<i64>) {
+        if self.saves_states.inventory.is_none() && !self.saves_states.loading {
+            self.start_saves_inventory();
+        }
+        super::saves_states::show(self, ui, game_id);
+    }
+
+    fn app_chrome(&mut self, context: &egui::Context) {
+        if self.simple.simple_navigation() {
+            self.simple_header(context);
+            return;
+        }
+        let route = self.router.current.clone();
+        let game_title = route
+            .game()
+            .and_then(|id| self.library.game(id))
+            .map(|game| game.title.as_str());
+        let breadcrumbs = breadcrumb_labels(&route, game_title);
+        egui::TopBottomPanel::top("v2_app_chrome").show(context, |ui| {
+            ui.set_min_height(48.0);
+            ui.horizontal_wrapped(|ui| {
+                ui.spacing_mut().item_spacing.x = 8.0;
+                if ui
+                    .add_enabled(
+                        self.router.can_back(),
+                        egui::Button::new("Back").min_size(egui::vec2(76.0, 32.0)),
+                    )
+                    .on_hover_text("Return to the previous GUI v2 location.")
+                    .clicked()
+                {
+                    self.back();
+                }
+                if ui
+                    .button("Home")
+                    .on_hover_text("Return to the GUI v2 home page.")
+                    .clicked()
+                {
+                    self.go(Route::Home);
+                }
+                ui.separator();
+                // The trail may use what the right-hand controls leave, so a
+                // long title is cut here rather than pushing Jump to out.
+                let button_font = egui::TextStyle::Button.resolve(ui.style());
+                let pad = 2.0 * ui.spacing().button_padding.x + ui.spacing().item_spacing.x;
+                let mut reserve = super::title_fit::text_width(ui, "Jump to…", &button_font) + pad;
+                if self.simple.enabled {
+                    reserve += super::title_fit::text_width(ui, "Simple view", &button_font) + pad;
+                }
+                ui.push_id("v2_breadcrumbs", |ui| {
+                    ui.horizontal(|ui| {
+                        let last_index = breadcrumbs.len().saturating_sub(1);
+                        for (index, label) in breadcrumbs.iter().enumerate() {
+                            if index > 0 {
+                                ui.label("›");
+                            }
+                            let is_game = index == last_index && route.game().is_some();
+                            let font = egui::TextStyle::Body.resolve(ui.style());
+                            let budget = if index == last_index {
+                                ui.available_width() - reserve - if is_game { pad } else { 0.0 }
+                            } else {
+                                (ui.available_width() * 0.4).max(120.0)
+                            };
+                            let shown = super::title_fit::fit(ui, label, &font, budget);
+                            if is_game {
+                                let response = ui
+                                    .button(egui::RichText::new(&shown).strong())
+                                    .on_hover_text(format!("{label}\nOpen Game Details."));
+                                if response.clicked() {
+                                    if let Some(id) = route.game() {
+                                        self.go(Route::Game(id));
+                                    }
+                                }
+                            } else if shown != *label {
+                                ui.strong(&shown).on_hover_text(label.as_str());
+                            } else {
+                                ui.strong(label);
+                            }
+                        }
+                    });
+                });
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    // Reached only in All Tools; the way back to the short view.
+                    if self.simple.enabled
+                        && ui
+                            .button("Simple view")
+                            .on_hover_text("Return to the seven main destinations.")
+                            .clicked()
+                    {
+                        self.simple.all_tools = false;
+                    }
+                    // Keep the popup inside the window; the list scrolls when it cannot fit.
+                    let popup_height = (ui.ctx().content_rect().height() - 90.0).max(120.0);
+                    ui.menu_button("Jump to…", |ui| {
+                        // egui caps a menu at about half the window; lift that cap, then scroll if needed.
+                        ui.set_max_height(popup_height);
+                        ui.label("Feature families");
+                        ui.separator();
+                        egui::ScrollArea::vertical()
+                            .max_height(popup_height)
+                            .show(ui, |ui| {
+                                for family in [
+                                    FeatureFamily::DatsVerification,
+                                    FeatureFamily::CheatsMods,
+                                    FeatureFamily::SavesStates,
+                                    FeatureFamily::Emulators,
+                                    FeatureFamily::Mame,
+                                    FeatureFamily::ArtworkExtras,
+                                    FeatureFamily::Conversion,
+                                    FeatureFamily::Organisation,
+                                    FeatureFamily::ProblemsRepair,
+                                    FeatureFamily::SourcesProviders,
+                                    FeatureFamily::HistoryUndo,
+                                    FeatureFamily::AdvancedDiagnostics,
+                                ] {
+                                    if ui.button(family.label()).clicked() {
+                                        self.go(family_home(family));
+                                        ui.close();
+                                    }
+                                }
+                            });
+                    });
+                });
+            });
+        });
+    }
+
+    /// Simple v1 header: a wide search on the left that feeds the existing
+    /// library filter, and the outlined All Tools button on the right. Back,
+    /// Home and Jump to are not repeated here; the sidebar, the breadcrumb row
+    /// and the existing shortcuts (Escape, Alt+Left, Alt+Home) cover them.
+    fn simple_header(&mut self, context: &egui::Context) {
+        use super::simple_shell::{self, palette};
+        let window = context.content_rect();
+        let metrics = simple_shell::shell_metrics(window.width(), window.height());
+        egui::TopBottomPanel::top("v2_simple_header")
+            .exact_height(metrics.header)
+            .frame(simple_shell::header_frame())
+            .show(context, |ui| {
+                ui.horizontal_centered(|ui| {
+                    let width = simple_shell::search_width(ui.available_width());
+                    let field = egui::Frame::new()
+                        .fill(palette::DEEP_BACKGROUND)
+                        .stroke(egui::Stroke::new(1.0_f32, palette::BORDER_SUBTLE))
+                        .corner_radius(8)
+                        .inner_margin(egui::Margin::symmetric(12, 6))
+                        .show(ui, |ui| {
+                            let (icon, _) = ui
+                                .allocate_exact_size(egui::vec2(20.0, 20.0), egui::Sense::hover());
+                            simple_shell::paint_search_icon(
+                                ui.painter(),
+                                icon.center(),
+                                palette::SECONDARY_TEXT,
+                            );
+                            ui.add(
+                                egui::TextEdit::singleline(&mut self.filter.search)
+                                    .hint_text("Search your games or systems…")
+                                    .frame(egui::Frame::NONE)
+                                    .desired_width(width - 60.0),
+                            )
+                        });
+                    let response = field.inner;
+                    if response.changed() {
+                        self.change_filter();
+                    }
+                    if response.lost_focus()
+                        && ui.input(|input| input.key_pressed(egui::Key::Enter))
+                        && !matches!(
+                            self.router.current,
+                            Route::BrowsePlay | Route::BrowsePlayGame(_)
+                        )
+                    {
+                        // The results live in the existing Browse & Play view.
+                        self.go(Route::BrowsePlay);
+                    }
+                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                        let open = self.simple.all_tools_open();
+                        if simple_shell::all_tools_button(ui, open).clicked() {
+                            self.simple.all_tools = !open;
+                        }
+                    });
+                });
+            });
+    }
+
+    /// The All Tools browser over the current location (Blue view only).
+    fn all_tools_page(&mut self, ui: &mut egui::Ui) {
+        ui.heading(super::all_tools::TITLE);
+        ui.label(super::all_tools::PURPOSE);
+        ui.add_space(8.0);
+        let mut chosen = None;
+        super::simple_shell::show_focus_reveal_scroll(
+            ui,
+            "v2_all_tools_scroll",
+            [false, false],
+            |ui| chosen = super::all_tools::show(ui, &mut self.simple.tools),
+        );
+        if let Some(route) = chosen {
+            self.go(route);
+        }
+    }
+
+    /// Simple v1: the location trail sits under the header on contextual
+    /// pages (anything deeper than a top-level destination), with Back.
+    fn simple_breadcrumbs(&mut self, ui: &mut egui::Ui) {
+        let route = self.router.current.clone();
+        let game_title = route
+            .game()
+            .and_then(|id| self.library.game(id))
+            .map(|game| game.title.as_str());
+        let breadcrumbs = super::simple_shell::simple_breadcrumb_labels(&route, game_title);
+        if breadcrumbs.len() < 2 {
+            return;
+        }
+        ui.push_id("v2_simple_breadcrumbs", |ui| {
+            ui.horizontal(|ui| {
+                ui.spacing_mut().item_spacing.x = 8.0;
+                if self.router.can_back()
+                    && ui
+                        .link("‹ Back")
+                        .on_hover_text("Return to the previous location (Alt+Left).")
+                        .clicked()
+                {
+                    self.back();
+                }
+                let muted = super::simple_shell::palette::SECONDARY_TEXT;
+                let body = egui::TextStyle::Body.resolve(ui.style());
+                for (index, label) in breadcrumbs.iter().enumerate() {
+                    if index > 0 || self.router.can_back() {
+                        ui.label(egui::RichText::new("/").color(muted));
+                    }
+                    let last = index + 1 == breadcrumbs.len();
+                    // Parents keep their natural width up to 40% of the row;
+                    // the current location takes what remains, then elides.
+                    let budget = if last {
+                        ui.available_width() - 4.0
+                    } else {
+                        (ui.available_width() * 0.4).max(120.0)
+                    };
+                    let shown = super::title_fit::fit(ui, label, &body, budget);
+                    if last && route.game().is_some() {
+                        if ui
+                            .link(egui::RichText::new(&shown).strong())
+                            .on_hover_text(format!("{label}\nOpen Game Details."))
+                            .clicked()
+                            && let Some(id) = route.game()
+                        {
+                            self.go(Route::Game(id));
+                        }
+                    } else if last {
+                        let response = ui.label(egui::RichText::new(&shown).strong());
+                        if shown != *label {
+                            response.on_hover_text(label.as_str());
+                        }
+                    } else {
+                        let response = ui.label(egui::RichText::new(&shown).color(muted));
+                        if shown != *label {
+                            response.on_hover_text(label.as_str());
+                        }
+                    }
+                }
+            });
+        });
+        ui.add_space(4.0);
+    }
+
+    /// The saved interface size, shared by Simple and Classic. Wraps, so
+    /// Reset size is never pushed past the edge at large scales.
+    fn interface_scale_controls(&mut self, ui: &mut egui::Ui) {
+        ui.horizontal_wrapped(|ui| {
+            let step = super::simple_shell::UI_SCALE_STEP;
+            let mut scale = self.simple.ui_scale;
+            if ui
+                .add_enabled(
+                    scale > super::simple_shell::UI_SCALE_MIN,
+                    egui::Button::new("Smaller"),
+                )
+                .clicked()
+            {
+                scale -= step;
+            }
+            if ui
+                .add_enabled(
+                    scale < super::simple_shell::UI_SCALE_MAX,
+                    egui::Button::new("Larger"),
+                )
+                .clicked()
+            {
+                scale += step;
+            }
+            if ui
+                .button("Reset size")
+                .on_hover_text("Ctrl+Plus, Ctrl+Minus and Ctrl+0 change this same saved size.")
+                .clicked()
+            {
+                scale = 1.0;
+            }
+            if scale != self.simple.ui_scale {
+                self.simple.set_ui_scale(scale);
+                self.preferences_dirty = Some(std::time::Instant::now());
+            }
+        });
+    }
+
+    /// Settings controls for the interface size and the Classic fallback view.
+    fn simple_shell_settings(&mut self, ui: &mut egui::Ui) {
+        // First, so recovery from a too-large size is the first thing reached.
+        ui.label(theme::card_title(format!(
+            "Text and interface size: {}%",
+            (self.simple.ui_scale * 100.0).round() as u32
+        )));
+        self.interface_scale_controls(ui);
+        ui.label(theme::card_title("Classic view"));
+        ui.label("EmuWiz Blue is the standard view. The Classic view keeps the previous layout and colours while the move to Blue is finished. It changes how EmuWiz looks, not what it does.");
+        let mut classic = !self.simple.enabled;
+        if ui.checkbox(&mut classic, "Use the Classic view").changed() {
+            self.simple.enabled = !classic;
+            self.simple.all_tools = false;
+            self.preferences_dirty = Some(std::time::Instant::now());
+        }
+        ui.separator();
+    }
+
+    fn page_intro(&mut self, ui: &mut egui::Ui) {
+        if self.simple.simple_navigation() {
+            self.simple_breadcrumbs(ui);
+        }
+        self.page_header(ui);
+        if let Some(notice) = &self.notice {
+            let mut dismiss = false;
+            egui::Frame::group(ui.style()).show(ui, |ui| {
+                ui.strong("Needs attention");
+                ui.label(&notice.message);
+                ui.collapsing("Technical details", |ui| {
+                    ui.label(&notice.technical);
+                });
+                dismiss = ui.button("Dismiss message").clicked();
+            });
+            if dismiss {
+                self.notice = None;
+            }
+        }
+        if let Some(status) = self.handoff_status.clone() {
+            let mut dismiss = false;
+            egui::Frame::group(ui.style()).show(ui, |ui| {
+                ui.strong("Separate window");
+                ui.label(status);
+                dismiss = ui.button("Dismiss").clicked();
+            });
+            if dismiss {
+                self.handoff_status = None;
+            }
+        }
+    }
+
+    fn page_header(&mut self, ui: &mut egui::Ui) {
+        // Blue Home paints its own welcome title.
+        if self.simple.simple_navigation()
+            && matches!(
+                self.router.current,
+                Route::Home | Route::Section(Section::Home)
+            )
+        {
+            return;
+        }
+        if self.simple.simple_navigation()
+            && self.router.current == Route::Section(Section::OrganisationFamily)
+        {
+            ui.heading(super::simple_shell::MANAGE_TITLE);
+            ui.label(super::simple_shell::MANAGE_PURPOSE);
+            ui.add_space(8.0);
+            return;
+        }
+        let family = family_for_route(&self.router.current);
+        let title = match &self.router.current {
+            Route::BrowsePlay | Route::BrowsePlayGame(_) => "Browse & Play",
+            // The title is the first thing in the page body (and in the
+            // breadcrumb); repeating it as the page heading made it appear twice.
+            Route::Game(id) => self
+                .library
+                .game(*id)
+                .map(|_| "Game Details")
+                .unwrap_or("Game no longer listed"),
+            Route::Task { game: id, .. } => self
+                .library
+                .game(*id)
+                .map(|game| game.title.as_str())
+                .unwrap_or("Game no longer listed"),
+            Route::Tool(tool) => tool.title(),
+            _ => family
+                .filter(|family| family_home(*family).section() == self.router.current.section())
+                .map(FeatureFamily::label)
+                .unwrap_or_else(|| self.router.current.section().title()),
+        };
+        ui.heading(title);
+        if matches!(
+            self.router.current,
+            Route::BrowsePlay | Route::BrowsePlayGame(_)
+        ) {
+            ui.label("Find a game, check that it is ready, then play.");
+        } else if let Route::Tool(tool) = &self.router.current {
+            ui.label(tool.purpose());
+        } else if self.router.current.game().is_some() {
+            ui.label("Your game's information, readiness and next actions, in one place.");
+        } else if let Some(family) = family {
+            if family_home(family).section() == self.router.current.section() {
+                // One concise description; the body must not repeat it.
+                ui.label(family.purpose());
+            } else {
+                ui.label(self.router.current.section().purpose());
+            }
+        } else {
+            ui.label(self.router.current.section().purpose());
+        }
+        ui.separator();
+    }
+
+    fn family_page(&mut self, ui: &mut egui::Ui, section: Section) {
+        let Some(family) = family_for_route(&Route::Section(section)) else {
+            return;
+        };
+        if family == FeatureFamily::SourcesProviders {
+            let workflows = self.native_workflows.get_or_insert_with(|| {
+                super::native_workflows::NativeWorkflows::new(ui.ctx().clone())
+            });
+            if let Some(route) = workflows.show_sources_providers_overview(ui) {
+                self.go(route);
+            }
+            return;
+        }
+        // Title and purpose come from the page header; only the shortcut note
+        // is specific to this body.
+        ui.label("These are shortcuts to existing workflows; opening a shortcut does not change your files.");
+        ui.add_space(theme::SPACE_SM);
+        for action in family_children(family) {
+            let variant = match action.variant {
+                FamilyVariant::Normal => "",
+                FamilyVariant::Easy => " · Easy",
+                FamilyVariant::Advanced => " · Advanced",
+            };
+            egui::Frame::group(ui.style()).show(ui, |ui| {
+                ui.push_id(("v2_family_action", family, action.id), |ui| {
+                    ui.set_min_width(ui.available_width());
+                    ui.heading(format!("{}{}", action.label, variant));
+                    ui.label(action.description);
+                    if ui.button(format!("Open {}", action.label)).clicked() {
+                        self.go(action.route.clone());
+                    }
+                });
+            });
+        }
+    }
+
+    fn setup_doctor(&mut self, ui: &mut egui::Ui) {
+        // A summary that arrived since the last frame goes to the clipboard once.
+        if let Some(summary) = self.setup_actions.summary.take() {
+            ui.ctx().copy_text(summary);
+            self.setup_actions.summary_copied = true;
+        }
+        let action = onboarding::show(
+            ui,
+            self.environment.as_ref(),
+            &self.library,
+            self.welcome_dismissed,
+            self.doctor_platform.as_deref(),
+            &mut self.imagery,
+            &self.setup_actions,
+        );
+        self.handle_onboarding_action(ui.ctx(), action);
+        if let Some(confirm) = self.setup_actions.confirm.clone() {
+            match onboarding::confirm_dialog(ui.ctx(), &confirm) {
+                Some(true) => {
+                    self.setup_actions.confirm = None;
+                    self.setup_actions.feedback = None;
+                    let (title, command) = match &confirm {
+                        onboarding::SetupConfirm::StarterConfig(path) => (
+                            "Creating a starter configuration",
+                            Command::CreateStarterConfig {
+                                expected: path.clone(),
+                            },
+                        ),
+                        onboarding::SetupConfirm::MountRoot(path) => (
+                            "Creating the mount folder",
+                            Command::CreateMountRoot {
+                                expected: path.clone(),
+                            },
+                        ),
+                    };
+                    let id = self
+                        .activity
+                        .queue(title, Route::Section(Section::Setup), false);
+                    self.setup_actions.job = Some(id);
+                    self.send(id, command);
+                }
+                Some(false) => self.setup_actions.confirm = None,
+                None => {}
+            }
+        }
+    }
+
+    fn home(&mut self, ui: &mut egui::Ui) {
+        if self.simple.simple_navigation() {
+            self.home_blue(ui);
+            return;
+        }
+        self.home_hero(ui);
+        egui::Frame::group(ui.style()).show(ui, |ui| {
+            ui.label(theme::card_title("Browse & Play"));
+            ui.label("A simple game-first view for platforms, artwork and launching.");
+            if primary(ui, "Browse & Play") {
+                self.go(Route::BrowsePlay);
+            }
+        });
+        ui.add_space(theme::SPACE_SM);
+        if self.loaded && self.library.games.is_empty() {
+            if empty_state(
+                ui,
+                &mut self.imagery,
+                EmptyArt::Mascot,
+                "Let's find your games",
+                "No games are listed yet. Start by discovering your game folders. Next: review the folders found before choosing what to scan.",
+                Some("Add my games"),
+            ) {
+                self.go(Route::Section(Section::Sources));
+            }
+        } else if self.loaded {
+            self.home_systems(ui);
+            self.home_showcase(ui);
+            ui.add_space(theme::SPACE_SM);
+            ui.label(theme::section_title("Things you can do"));
+        }
+        for (section, title, purpose, action) in HOME_TASKS {
+            egui::Frame::group(ui.style()).show(ui, |ui| {
+                ui.set_min_width(ui.available_width()); ui.label(theme::card_title(*title)); ui.label(*purpose);
+                if primary(ui, action) { self.go(Route::Section(*section)); }
+                ui.label(match section { Section::Games | Section::Launch | Section::Mods => "Next: choose a platform or game.", _ => "Next: review setup and continue in the existing workflow. Nothing changes by opening it." });
+            });
+        }
+    }
+
+    fn games(&mut self, ui: &mut egui::Ui) {
+        ui.horizontal_wrapped(|ui| {
+            ui.label("Find a game");
+            let search = ui.add(
+                egui::TextEdit::singleline(&mut self.filter.search)
+                    .hint_text("Search title or system")
+                    .desired_width(240.0),
+            );
+            let mut changed = search.changed();
+            let previous_platform = self.filter.platform.clone();
+            egui::ComboBox::from_id_salt("v2_platform_filter")
+                .selected_text(if self.filter.platform.is_empty() {
+                    "All systems"
+                } else {
+                    &self.filter.platform
+                })
+                .show_ui(ui, |ui| {
+                    changed |= ui
+                        .selectable_value(&mut self.filter.platform, String::new(), "All systems")
+                        .changed();
+                    for (platform, count) in &self.library.platforms {
+                        changed |= ui
+                            .selectable_value(
+                                &mut self.filter.platform,
+                                platform.clone(),
+                                format!("{platform} ({count})"),
+                            )
+                            .changed();
+                    }
+                });
+            if self.filter.platform != previous_platform {
+                self.filter.select_platform(self.filter.platform.clone());
+            }
+            changed |= ui
+                .checkbox(&mut self.filter.attention_only, "Needs attention")
+                .changed();
+            changed |= ui
+                .selectable_value(&mut self.filter.list, false, "Grid")
+                .changed();
+            changed |= ui
+                .selectable_value(&mut self.filter.list, true, "List")
+                .changed();
+            if changed {
+                self.change_filter();
+            }
+        });
+        ui.horizontal_wrapped(|ui| {
+            if !self.filter_inflight && self.filter_dirty.is_none() {
+                ui.label(format!("{} catalogued games shown", self.indices.len()));
+            }
+            if self.filter_inflight || self.filter_dirty.is_some() {
+                ui.spinner();
+                ui.label("Updating results…");
+            }
+            if ui.button("Clear filters").clicked() {
+                self.filter = Default::default();
+                self.change_filter();
+            }
+            if ui
+                .add_enabled(
+                    self.load_job.is_none(),
+                    egui::Button::new("Reload game list"),
+                )
+                .clicked()
+            {
+                self.load(false);
+            }
+        });
+        if !self.filter.platform.is_empty() {
+            ui.label(format!("{}: {} catalogued games before search or health filters. Other systems remain separate.", self.filter.platform, self.library.platforms.get(&self.filter.platform).copied().unwrap_or(0)));
+            if self.filter.platform == "Arcade" {
+                ui.label("This is the saved game list, not a count of files on disk. Extracted arcade ROM parts may not be catalogued as games.");
+            }
+            if ui
+                .small_button("Missing games? Review folders and scan")
+                .clicked()
+            {
+                self.go(Route::Section(Section::Sources));
+            }
+        }
+        ui.collapsing("Advanced details", |ui| {
+            egui::ScrollArea::vertical().id_salt("v2_filter_details").max_height(150.0).show(ui, |ui| {
+            ui.label(format!("Selected platform ID: {} · display label: {}", self.filter.platform, self.filter.platform));
+            ui.label("Platform IDs are the catalogue's exact current assignments; no alias grouping or artwork filter is applied.");
+            ui.label(format!("Search: {:?} · needs attention only: {} · source/path filter: none", self.filter.search, self.filter.attention_only));
+            ui.label(format!("Logical filtered rows: {} · updating: {}", self.indices.len(), self.filter_inflight || self.filter_dirty.is_some()));
+            for (platform, sources) in &self.library.platform_sources {
+                if self.filter.platform.is_empty() || *platform == self.filter.platform {
+                    ui.label(format!("{platform}: {} total catalogue rows", self.library.platforms[platform]));
+                    for ((id, path), count) in sources {
+                        ui.label(format!("Source {id}: {} · {count} rows", path.display()));
+                    }
+                }
+            }
+            });
+        });
+        if !self.loaded {
+            ui.spinner();
+            ui.label("Loading your game list in the background. Progress is in Activity.");
+            return;
+        }
+        if self.filter_inflight || self.filter_dirty.is_some() {
+            // Never paint the previous platform's result under the new selection.
+            return;
+        }
+        if self.indices.is_empty() && !self.filter_inflight && self.filter_dirty.is_none() {
+            let platform = self.filter.platform.clone();
+            if empty_state(
+                ui,
+                &mut self.imagery,
+                if self.library.games.is_empty() || platform.is_empty() {
+                    EmptyArt::Mascot
+                } else {
+                    EmptyArt::Platform(&platform)
+                },
+                if self.library.games.is_empty() {
+                    "Your games can go here"
+                } else {
+                    "No games match these choices"
+                },
+                if self.library.games.is_empty() {
+                    "Add a folder of games and EmuWiz will list them here. Nothing is moved or changed."
+                } else {
+                    "Try another system or clear the search. If a game folder is missing, add it through Sources."
+                },
+                Some(if self.library.games.is_empty() {
+                    "Add my games"
+                } else {
+                    "Show all games"
+                }),
+            ) {
+                if self.library.games.is_empty() {
+                    self.go(Route::Section(Section::Sources));
+                } else {
+                    self.filter = Default::default();
+                    self.change_filter();
+                }
+            }
+            return;
+        }
+        let list = self.filter.list;
+        let columns = if list {
+            1
+        } else {
+            ((ui.available_width() + 12.0) / 205.0).floor().max(1.0) as usize
+        };
+        let width = ((ui.available_width() - 12.0 * columns.saturating_sub(1) as f32)
+            / columns as f32)
+            .max(150.0);
+        let height = if list { 94.0 } else { 272.0 };
+        let rows = self.indices.len().div_ceil(columns);
+        let library = self.library.clone();
+        egui::ScrollArea::vertical()
+            .id_salt(("v2_games", list, &self.filter.platform))
+            // A short window leaves no height below the filters; keep one row
+            // so the page scrolls to it instead of hiding every game.
+            .min_scrolled_height(height)
+            .show_rows(ui, height, rows, |ui, visible| {
+                for row in visible {
+                    ui.horizontal(|ui| {
+                        for column in 0..columns {
+                            let Some(index) = self.indices.get(row * columns + column) else {
+                                continue;
+                            };
+                            let Some(game) = library.games.get(*index) else {
+                                continue;
+                            };
+                            ui.push_id(game.archive.id, |ui| {
+                                ui.allocate_ui_with_layout(
+                                    egui::vec2(width, height),
+                                    egui::Layout::top_down(egui::Align::Min),
+                                    |ui| {
+                                        egui::Frame::group(ui.style()).show(ui, |ui| {
+                                            ui.set_width(width - 18.0);
+                                            if list {
+                                                ui.horizontal(|ui| {
+                                                    self.picture(
+                                                        ui,
+                                                        game,
+                                                        Kind::Cover,
+                                                        egui::vec2(46.0, 62.0),
+                                                    );
+                                                    ui.vertical(|ui| {
+                                                        self.game_link(ui, game);
+                                                        self.duplicate_badge(ui, game);
+                                                        ui.add(
+                                                            egui::Label::new(format!(
+                                                                "{} · {}",
+                                                                game.platform,
+                                                                game.status()
+                                                            ))
+                                                            .truncate(),
+                                                        );
+                                                    });
+                                                });
+                                            } else {
+                                                self.picture(
+                                                    ui,
+                                                    game,
+                                                    Kind::Cover,
+                                                    egui::vec2((width - 20.0).min(175.0), 150.0),
+                                                );
+                                                self.game_link(ui, game);
+                                                self.duplicate_badge(ui, game);
+                                                ui.add(egui::Label::new(&game.platform).truncate());
+                                                ui.add(egui::Label::new(game.status()).truncate());
+                                            }
+                                        });
+                                    },
+                                );
+                            });
+                        }
+                    });
+                }
+            });
+    }
+
+    pub(super) fn game_link(&mut self, ui: &mut egui::Ui, game: &Game) {
+        if ui
+            .add_sized(
+                [ui.available_width(), 40.0],
+                egui::Button::new(&game.title).truncate(),
+            )
+            .on_hover_text("Open game details")
+            .clicked()
+        {
+            self.go(Route::Game(game.archive.id));
+        }
+    }
+
+    fn duplicate_badge(&mut self, ui: &mut egui::Ui, game: &Game) {
+        let Some((count, _key)) = self.duplicate_report.as_ref().and_then(|report| {
+            report.groups.iter().find_map(|group| {
+                group
+                    .members
+                    .iter()
+                    .any(|member| member.path == game.archive.absolute_path)
+                    .then_some((group.members.len(), group.sha256.clone()))
+            })
+        }) else {
+            return;
+        };
+        if ui.small_button(format!("{count} exact copies")).clicked() {
+            self.go(Route::Section(Section::Duplicates));
+        }
+    }
+
+    pub(super) fn picture(&mut self, ui: &mut egui::Ui, game: &Game, kind: Kind, size: egui::Vec2) {
+        self.picture_in(ui, game, kind, size, true);
+    }
+
+    /// A picture for a crowded shelf: the short reason is painted on the tile,
+    /// the longer explanation is left to the tooltip.
+    pub(super) fn picture_tile(
+        &mut self,
+        ui: &mut egui::Ui,
+        game: &Game,
+        kind: Kind,
+        size: egui::Vec2,
+    ) {
+        self.picture_in(ui, game, kind, size, false);
+    }
+
+    fn picture_in(
+        &mut self,
+        ui: &mut egui::Ui,
+        game: &Game,
+        kind: Kind,
+        size: egui::Vec2,
+        detail_on_tile: bool,
+    ) {
+        let (rect, response) = ui.allocate_exact_size(size, egui::Sense::hover());
+        if !ui.is_rect_visible(rect) {
+            return;
+        }
+        // Showing a picture is what starts artwork discovery.
+        self.ensure_artwork_index();
+        let key = self.artwork.request(game.archive.id, kind);
+        if let Some(Picture::Ready { texture, .. }) = self.artwork.pictures.get(&key) {
+            ui.painter().rect_filled(rect, 8.0, theme::deep_fill(ui));
+            let aspect = texture.size_vec2();
+            let factor = (size.x / aspect.x).min(size.y / aspect.y);
+            let target = egui::Rect::from_center_size(rect.center(), aspect * factor);
+            ui.painter().image(
+                texture.id(),
+                target,
+                egui::Rect::from_min_max(egui::Pos2::ZERO, egui::pos2(1.0, 1.0)),
+                Color32::WHITE,
+            );
+        } else {
+            // No cover (yet): the game's own platform hardware, dimmed, on the
+            // same plate, so an uncovered shelf still reads as distinct systems.
+            ui.painter().rect_filled(rect, 8.0, theme::deep_fill(ui));
+            // Blue: a dashed same-size placeholder, never a fake cover.
+            if theme::blue_profile(ui) {
+                crate::ui::components::paint_dashed_outline(
+                    ui.painter(),
+                    rect,
+                    theme::blue::BORDER_STRONG,
+                );
+            } else {
+                ui.painter()
+                    .rect_stroke(rect, 8.0, theme::border(ui), egui::StrokeKind::Inside);
+            }
+            let label = super::artwork::picture_label(
+                self.artwork.preparing(),
+                self.artwork.paused,
+                self.artwork.pictures.get(&key),
+            );
+            let labelled = size.x > 90.0 && size.y > 90.0;
+            // Lay the words out first so the hardware image leaves them room.
+            let font = egui::FontId::proportional(theme::METADATA_SIZE);
+            let wrap = (size.x - 12.0).max(40.0);
+            let galleys: Vec<_> = if labelled {
+                std::iter::once(label.headline.to_string())
+                    .chain(label.detail.clone().filter(|_| detail_on_tile))
+                    .map(|text| {
+                        ui.painter()
+                            .layout(text, font.clone(), theme::SECONDARY_TEXT, wrap)
+                    })
+                    .collect()
+            } else {
+                Vec::new()
+            };
+            let text_height: f32 = galleys.iter().map(|galley| galley.size().y).sum();
+            let side = if labelled {
+                (size.x.min(size.y - text_height - 22.0)).max(24.0) * 0.72
+            } else {
+                size.x.min(size.y) * 0.82
+            };
+            let centre = if labelled {
+                rect.center() - egui::vec2(0.0, text_height / 2.0)
+            } else {
+                rect.center()
+            };
+            self.imagery.paint_platform(
+                ui,
+                egui::Rect::from_center_size(centre, egui::vec2(side, side)),
+                &game.platform,
+                Color32::from_white_alpha(150),
+            );
+            let mut bottom = rect.bottom() - 8.0;
+            for galley in galleys.into_iter().rev() {
+                bottom -= galley.size().y;
+                let x = rect.center().x - galley.size().x / 2.0;
+                ui.painter()
+                    .galley(egui::pos2(x, bottom), galley, theme::SECONDARY_TEXT);
+            }
+            // Small tiles have no room for words; the tooltip carries them.
+            let hover = match &label.detail {
+                Some(detail) => format!("{}\n{detail}", label.headline),
+                None => label.headline.to_string(),
+            };
+            response.on_hover_text(hover);
+        }
+    }
+
+    fn platforms(&mut self, ui: &mut egui::Ui) {
+        self.platforms_grid(ui);
+    }
+
+    /// Native v2 Museum projection. This deliberately uses the same loaded
+    /// `Library` and artwork worker as Games and Game Details; it must never
+    /// open the legacy `ArchiveFsApp` or maintain a second catalogue.
+    fn museum(&mut self, ui: &mut egui::Ui) {
+        if self.artwork.index.is_none() && !self.artwork.index_loading {
+            self.refresh_artwork_index();
+        }
+
+        let library = self.library.clone();
+        ui.horizontal_wrapped(|ui| {
+            ui.label(format!("{} catalogued games", library.games.len()));
+            ui.label(format!("{} platforms", library.platforms.len()));
+            if self.artwork.index_loading {
+                ui.spinner();
+                ui.label("Finding existing artwork…");
+            }
+        });
+
+        if library.games.is_empty() {
+            if empty_state(
+                ui,
+                &mut self.imagery,
+                EmptyArt::Mascot,
+                "No games in the current catalogue",
+                "Museum is using the same catalogue as Games. Add or scan a game folder to browse platforms, titles and artwork here.",
+                Some("Open Sources"),
+            ) {
+                self.go(Route::Section(Section::Sources));
+            }
+            return;
+        }
+
+        let selected_platform = self.filter.platform.clone();
+        ui.separator();
+        ui.strong("Browse platforms");
+        ui.horizontal_wrapped(|ui| {
+            let all_selected = selected_platform.is_empty();
+            if ui
+                .selectable_label(
+                    all_selected,
+                    format!("All systems ({})", library.games.len()),
+                )
+                .clicked()
+            {
+                self.filter.select_platform(String::new());
+                self.interacted = true;
+            }
+            for (platform, count) in &library.platforms {
+                if ui
+                    .selectable_label(
+                        selected_platform == *platform,
+                        format!("{platform} ({count})"),
+                    )
+                    .clicked()
+                {
+                    self.filter.select_platform(platform.clone());
+                    self.interacted = true;
+                }
+            }
+        });
+
+        if selected_platform.is_empty() {
+            ui.add_space(theme::SPACE_SM);
+            ui.strong("Choose a platform to browse its titles");
+            ui.label("The counts above come directly from the loaded v2 catalogue and stay consistent with Games.");
+            return;
+        }
+
+        let games = library
+            .by_platform
+            .get(&selected_platform)
+            .map_or(&[][..], Vec::as_slice);
+        ui.add_space(theme::SPACE_SM);
+        ui.horizontal_wrapped(|ui| {
+            ui.label(theme::card_title(&selected_platform));
+            ui.label(format!("{} title(s) in the current catalogue", games.len()));
+            if ui.button("Open this platform in Games").clicked() {
+                self.go(Route::Section(Section::Games));
+            }
+        });
+
+        let columns = ((ui.available_width() + 16.0) / 210.0).floor().max(1.0) as usize;
+        let card_width = ((ui.available_width() - 16.0 * columns.saturating_sub(1) as f32)
+            / columns as f32)
+            .max(160.0);
+        let rows = games.len().div_ceil(columns);
+        egui::ScrollArea::vertical()
+            .id_salt(("v2_museum_titles", &selected_platform))
+            .show_rows(ui, 300.0, rows, |ui, visible| {
+                for row in visible {
+                    ui.horizontal(|ui| {
+                        for column in 0..columns {
+                            let Some(game) = games
+                                .get(row * columns + column)
+                                .and_then(|index| library.games.get(*index))
+                            else {
+                                continue;
+                            };
+                            ui.push_id(("museum-game", game.archive.id), |ui| {
+                                egui::Frame::group(ui.style()).show(ui, |ui| {
+                                    self.picture(
+                                        ui,
+                                        game,
+                                        Kind::Cover,
+                                        egui::vec2(card_width, 180.0),
+                                    );
+                                    ui.strong(&game.title);
+                                    ui.label(game.status());
+                                    ui.horizontal_wrapped(|ui| {
+                                        if ui.button("Details").clicked() {
+                                            self.go(Route::Game(game.archive.id));
+                                        }
+                                        if !game.is_preservation_only() && primary(ui, "Play") {
+                                            self.go(Route::Task {
+                                                section: Section::Launch,
+                                                game: game.archive.id,
+                                            });
+                                        }
+                                    });
+                                });
+                            });
+                            if column + 1 < columns {
+                                ui.add_space(16.0);
+                            }
+                        }
+                    });
+                    ui.add_space(16.0);
+                }
+            });
+    }
+
+    /// The existing platform-first Check My Games flow, opened on `platform`.
+    fn platform_check(&mut self, ui: &mut egui::Ui, platform: &str) {
+        if ui.button("‹ Back to Check Games").clicked() {
+            self.check_platform = Some(platform.to_string());
+            self.go(Route::Section(Section::Check));
+        }
+        let workflows = self
+            .native_workflows
+            .get_or_insert_with(|| super::native_workflows::NativeWorkflows::new(ui.ctx().clone()));
+        if let Some(route) = workflows.show_platform_check(ui, &mut self.activity, platform) {
+            self.go(route);
+        }
+    }
+
+    fn check_games(&mut self, ui: &mut egui::Ui, game_id: Option<i64>) {
+        if let Some(game_id) = game_id
+            && let Some((title, platform_name)) = self
+                .library
+                .game(game_id)
+                .map(|game| (game.title.clone(), game.platform.clone()))
+        {
+            egui::Frame::group(ui.style()).show(ui, |ui| {
+                ui.strong("Checking this selected game");
+                ui.label(format!("{title} · {platform_name}"));
+                ui.label("The existing platform verification run remains authoritative; this context is retained while you review it.");
+                if ui.button("Back to Game Details").clicked() {
+                    self.go(Route::Game(game_id));
+                }
+            });
+        }
+        ui.label("Read-only verification. Your original game files are never renamed, moved or deleted here.");
+        if ui.button("Quick Rename verified games").clicked() {
+            self.go(Route::QuickRename);
+        }
+        if self.check_platform.is_none() {
+            ui.label(theme::card_title("Choose a platform"));
+            // Arcade readiness is read from the saved DAT registry, the same
+            // way the platform Check page decides whether it can verify
+            // arcade sets. It used to be asserted for every Arcade row
+            // whether or not any MAME catalogue existed.
+            let has_arcade = self
+                .library
+                .platforms
+                .iter()
+                .any(|(platform, _)| platform.eq_ignore_ascii_case("Arcade"));
+            let arcade_ready = has_arcade && {
+                let workflows = self.native_workflows.get_or_insert_with(|| {
+                    super::native_workflows::NativeWorkflows::new(ui.ctx().clone())
+                });
+                let _ = workflows.app.ensure_dat_sources_page_loaded();
+                workflows.app.arcade_verification_data_ready()
+            };
+            for (platform, count) in self.library.platforms.clone() {
+                egui::Frame::group(ui.style()).show(ui, |ui| {
+                    ui.set_min_width(ui.available_width());
+                    ui.label(theme::card_title(&platform));
+                    ui.label(format!("{count} games"));
+                    if platform.eq_ignore_ascii_case("Arcade") {
+                        if arcade_ready {
+                            ui.label("MAME Arcade verification data ready");
+                        } else {
+                            ui.label(
+                                "MAME Arcade verification data not set up yet — add and validate a MAME catalogue in DAT Management first",
+                            );
+                        }
+                    }
+                    if primary(ui, &format!("Check {platform}")) {
+                        self.check_platform(platform.clone());
+                    }
+                });
+            }
+            if self.library.platforms.is_empty() {
+                ui.label("Add a game folder first, then return here to choose a platform.");
+            }
+            return;
+        }
+        let platform = self.check_platform.clone().unwrap_or_default();
+        ui.label(theme::card_title(format!("{platform} games")));
+        let summary = self.check_summary(&platform);
+        egui::Frame::group(ui.style()).show(ui, |ui| {
+            ui.set_min_width(ui.available_width());
+            let count = |n: usize| super::job_card::count(n as u64);
+            ui.strong(format!("{} verified", count(summary.verified)));
+            if summary.matched > 0 {
+                ui.label(format!("{} matched to reference data", count(summary.matched)));
+            }
+            for (n, text) in [
+                (summary.not_checked, "ready to verify (not checked yet)"),
+                (summary.no_data, "waiting for identification data"),
+                (summary.no_match, "no match found"),
+                (summary.need_choice, "need your choice"),
+            ] {
+                if n > 0 {
+                    ui.label(format!("{} {text}", count(n)));
+                }
+            }
+            ui.label("Verified requires an exact content fingerprint match in trusted catalogue data. Preview and confirm to check this platform.");
+            // The next step, in plain words. Both land in the existing
+            // platform-first Check My Games flow, already on this platform.
+            if summary.not_checked > 0 {
+                if primary(ui, &format!("Verify {platform} games")) {
+                    self.go(Route::PlatformCheck(platform.clone()));
+                }
+            }
+            if summary.no_data > 0 {
+                let label = format!("Set up {platform} identification data");
+                let clicked = if summary.not_checked > 0 {
+                    ui.button(label).clicked()
+                } else {
+                    primary(ui, &label)
+                };
+                if clicked {
+                    self.go(Route::PlatformCheck(platform.clone()));
+                }
+            }
+        });
+        let help = summary.rows.len();
+        if help == 0 {
+            ui.label("Every game here is verified or matched. Nothing needs your help.");
+        } else {
+            ui.add_space(6.0);
+            ui.strong(format!(
+                "Review {help} game{}",
+                if help == 1 { "" } else { "s" }
+            ));
+            let mut open = None;
+            egui::ScrollArea::vertical()
+                .id_salt(("v2_check_rows", &platform))
+                .max_height(360.0)
+                .show_rows(ui, 30.0, help, |ui, range| {
+                    for index in range {
+                        let (id, label) = summary.rows[index];
+                        if let Some(game) = self.library.game(id) {
+                            ui.horizontal(|ui| {
+                                if ui.link(&game.title).clicked() {
+                                    open = Some(id);
+                                }
+                                ui.label(label);
+                            });
+                        }
+                    }
+                });
+            if let Some(id) = open {
+                self.go(Route::ReviewIdentity(id));
+            }
+        }
+        ui.add_space(6.0);
+        if ui.button("Choose another platform").clicked() {
+            self.check_platform = None;
+            self.verification = None;
+        }
+        if let Some(job) = self
+            .verification_job
+            .and_then(|id| self.activity.jobs.get(&id))
+            .filter(|job| job.active())
+        {
+            ui.separator();
+            super::job_card::show(ui, job, true);
+        } else if let Some(result) = self.verification.clone() {
+            ui.label(format!(
+                "File check: {} missing · {} with a saved health warning",
+                result.missing, result.attention
+            ));
+        } else if ui
+            .button("Also check that these files are still present")
+            .clicked()
+        {
+            self.start_verification();
+        }
+    }
+
+    fn duplicates(&mut self, ui: &mut egui::Ui) {
+        egui::ScrollArea::vertical()
+            .id_salt("v2_duplicates_scroll")
+            .auto_shrink([false, false])
+            .show(ui, |ui| self.duplicates_content(ui));
+    }
+
+    fn duplicates_content(&mut self, ui: &mut egui::Ui) {
+        self.duplicates_hero(ui);
+        self.equivalent_duplicates_section(ui);
+        ui.label("Only byte-identical files are called exact duplicates. Different regions, revisions and titles remain separate unless their contents are proven identical.");
+        if self.duplicate_report.is_none() {
+            if let Some(job) = self
+                .duplicate_job
+                .and_then(|id| self.activity.jobs.get(&id))
+            {
+                // The Activity model owns this job, so leaving and returning
+                // shows the same one instead of starting another.
+                if super::job_card::show(ui, job, false).cancel {
+                    job.request_cancel();
+                }
+            } else {
+                if let Some(last) = self
+                    .activity
+                    .jobs
+                    .values()
+                    .rev()
+                    .find(|job| job.title == DUPLICATE_SCAN_TITLE)
+                    .filter(|job| matches!(job.phase, Phase::Failed | Phase::Cancelled))
+                {
+                    egui::Frame::group(ui.style()).show(ui, |ui| {
+                        super::job_card::show(ui, last, true);
+                        if last.phase == Phase::Failed {
+                            ui.label("You can try again; nothing was changed.");
+                            ui.collapsing("Details", |ui| {
+                                ui.label(&last.technical);
+                            });
+                        }
+                    });
+                }
+                let clicked = if ui.available_width() < 560.0 {
+                    self.duplicate_narrow_empty_state(ui)
+                } else {
+                    empty_state(
+                        ui,
+                        &mut self.imagery,
+                        // The hero above already shows Mr Wiz: once per screen.
+                        EmptyArt::Glyph("console"),
+                        "Nothing has been compared yet",
+                        "Mr Wiz compares file evidence and verified hashes, not filenames alone. Finding duplicates never deletes anything; results are reviewed before any recoverable quarantine.",
+                        Some("Find duplicates"),
+                    )
+                };
+                if clicked {
+                    self.start_duplicate_scan();
+                }
+            }
+            return;
+        }
+        let report = self.duplicate_report.clone().unwrap_or_default();
+        ui.label(format!(
+            "{} files examined · {} exact groups",
+            report.files_examined,
+            report.groups.len()
+        ));
+        let focus = self
+            .problem_nav
+            .duplicate_focus
+            .clone()
+            .filter(|sha| report.groups.iter().any(|group| &group.sha256 == sha));
+        if focus.is_some() {
+            ui.horizontal_wrapped(|ui| {
+                ui.strong("Showing the group from Problems & Repair.");
+                if ui.button("Show all groups").clicked() {
+                    self.problem_nav.duplicate_focus = None;
+                }
+            });
+        }
+        for (index, group) in report.groups.iter().enumerate() {
+            let key = format!("{}:{}", group.sha256, index);
+            if self.duplicate_ignored.contains(&key) {
+                continue;
+            }
+            if focus.as_ref().is_some_and(|sha| sha != &group.sha256) {
+                continue;
+            }
+            ui.push_id(("duplicate-group", &group.sha256), |ui| {
+                egui::Frame::group(ui.style()).show(ui, |ui| {
+                ui.heading(format!("{} · {} copies", group.kind, group.members.len()));
+                if let Some(readiness) = self.duplicate_readiness(group) {
+                    ui.label(RichText::new(readiness).strong().color(
+                        if readiness.starts_with("Blocked") {
+                            theme::warning(ui)
+                        } else if readiness.starts_with("Review") {
+                            theme::accent(ui)
+                        } else {
+                            theme::success(ui)
+                        },
+                    ));
+                }
+                ui.label(format!("{} bytes · {}", group.size_bytes, group.sha256));
+                for member in &group.members {
+                    ui.label(format!("{} · {} · {} bytes", member.title, member.path.display(), member.size_bytes));
+                }
+                ui.horizontal_wrapped(|ui| {
+                    if ui.button("Keep both").clicked() { self.duplicate_ignored.insert(key.clone()); }
+                    if ui.button("Ignore group").clicked() { self.duplicate_ignored.insert(key.clone()); }
+                    if self.duplicate_readiness(group).is_none_or(|readiness| readiness.starts_with("Exact duplicate"))
+                        && ui.button("Quarantine duplicate").clicked()
+                    {
+                        self.go(Route::Section(Section::Problems));
+                    }
+                });
+                ui.label(if self.duplicate_readiness(group).is_some_and(|readiness| readiness.starts_with("Blocked")) {
+                    "This group is blocked from automatic action; review the evidence before deciding what to do."
+                } else {
+                    "Quarantine is recoverable and must be reviewed in Problems & Repair; there is no delete action here."
+                });
+                });
+            });
+        }
+    }
+
+    fn duplicate_readiness(&self, group: &DuplicateGroup) -> Option<&'static str> {
+        self.duplicate_report
+            .as_ref()
+            .and_then(|report| report.exact_groups.get(group.exact_index))
+            .map(|group| &group.readiness)
+            .map(duplicate_readiness_label)
+    }
+
+    fn duplicates_hero(&mut self, ui: &mut egui::Ui) {
+        let wide = ui.available_width() >= 620.0;
+        egui::Frame::new()
+            .fill(theme::card_fill(ui))
+            .stroke(egui::Stroke::new(
+                1.0_f32,
+                theme::PRIMARY_ACTION.gamma_multiply(0.45),
+            ))
+            .corner_radius(10)
+            .inner_margin(egui::Margin::same(14))
+            .show(ui, |ui| {
+                ui.horizontal(|ui| {
+                    let mascot_side = if wide { 78.0 } else { 58.0 };
+                    let (mascot_rect, _) = ui.allocate_exact_size(
+                        egui::vec2(mascot_side, mascot_side),
+                        egui::Sense::hover(),
+                    );
+                    if let Some(texture) = self.imagery.mascot(ui.ctx()) {
+                        ui.painter().image(
+                            texture.id(),
+                            mascot_rect,
+                            egui::Rect::from_min_max(egui::Pos2::ZERO, egui::pos2(1.0, 1.0)),
+                            egui::Color32::WHITE,
+                        );
+                    }
+                    ui.add_space(theme::SPACE_MD);
+                    ui.vertical(|ui| {
+                        // The page title is already in the page header.
+                        ui.label(
+                            RichText::new(
+                                "Mr Wiz checks the copy in the mirror before anything moves.",
+                            )
+                            .color(theme::muted(ui)),
+                        );
+                    });
+                    if wide {
+                        ui.add_space(theme::SPACE_LG);
+                        let (motif, _) =
+                            ui.allocate_exact_size(egui::vec2(126.0, 66.0), egui::Sense::hover());
+                        let painter = ui.painter();
+                        let left = egui::Rect::from_min_size(
+                            motif.left_top() + egui::vec2(2.0, 11.0),
+                            egui::vec2(48.0, 44.0),
+                        );
+                        let right = egui::Rect::from_min_size(
+                            motif.left_top() + egui::vec2(70.0, 11.0),
+                            egui::vec2(48.0, 44.0),
+                        );
+                        painter.rect_filled(left, 6.0, theme::deep_fill(ui));
+                        painter.rect_stroke(
+                            left,
+                            6.0,
+                            egui::Stroke::new(2.0_f32, theme::PRIMARY_ACTION),
+                            egui::StrokeKind::Inside,
+                        );
+                        painter.rect_filled(right, 6.0, theme::deep_fill(ui));
+                        painter.rect_stroke(
+                            right,
+                            6.0,
+                            egui::Stroke::new(2.0_f32, theme::accent(ui)),
+                            egui::StrokeKind::Inside,
+                        );
+                        painter.line_segment(
+                            [left.center(), right.center()],
+                            egui::Stroke::new(1.5_f32, theme::SECONDARY_TEXT),
+                        );
+                        painter.circle_filled(
+                            left.center(),
+                            8.0,
+                            theme::PRIMARY_ACTION.gamma_multiply(0.7),
+                        );
+                        painter.circle_filled(
+                            right.center(),
+                            8.0,
+                            theme::accent(ui).gamma_multiply(0.7),
+                        );
+                    }
+                });
+            });
+        ui.add_space(theme::SPACE_SM);
+    }
+
+    fn duplicate_narrow_empty_state(&mut self, ui: &mut egui::Ui) -> bool {
+        let mut clicked = false;
+        egui::Frame::group(ui.style()).show(ui, |ui| {
+            ui.vertical_centered(|ui| {
+                if let Some(texture) = self.imagery.mascot(ui.ctx()) {
+                    ui.add(egui::Image::new(texture).fit_to_exact_size(egui::vec2(58.0, 58.0)));
+                }
+                ui.heading("Nothing has been compared yet");
+                ui.label("Mr Wiz compares verified file evidence, not filenames alone.");
+                ui.label("Finding duplicates never deletes anything; review comes first.");
+                clicked = primary(ui, "Find duplicates");
+            });
+        });
+        clicked
+    }
+
+    fn problems(&mut self, ui: &mut egui::Ui, game_id: Option<i64>) {
+        if self.problem_summary.is_none() {
+            self.start_problem_summary();
+        }
+        egui::ScrollArea::vertical().id_salt("v2_problems").show(ui, |ui| {
+            let summary = self.problem_summary.clone();
+            let (attention, warnings) = summary
+                .as_ref()
+                .map(|summary| (summary.attention_count(), summary.count(Severity::Warning)))
+                .unwrap_or_default();
+            ui.horizontal_wrapped(|ui| {
+                ui.strong("Inbox view");
+                if ui
+                    .selectable_label(
+                        self.problem_filter == ProblemFilter::Actionable,
+                        ProblemFilter::Actionable.label(),
+                    )
+                    .clicked()
+                {
+                    self.problem_filter = ProblemFilter::Actionable;
+                }
+                if ui
+                    .selectable_label(
+                        self.problem_filter == ProblemFilter::All,
+                        ProblemFilter::All.label(),
+                    )
+                    .clicked()
+                {
+                    self.problem_filter = ProblemFilter::All;
+                }
+                ui.label("Search");
+                ui.add_sized(
+                    [220.0, 28.0],
+                    egui::TextEdit::singleline(&mut self.problem_query)
+                        .hint_text("title, game or path"),
+                );
+                if !self.problem_query.is_empty() && ui.button("Clear").clicked() {
+                    self.problem_query.clear();
+                }
+                ui.separator();
+                if ui
+                    .button("Check library files")
+                    .on_hover_text("Library files check: which files EmuWiz has never catalogued, and which entries point at files that are gone. Read-only: nothing is imported, moved or deleted.")
+                    .clicked()
+                {
+                    self.go(Route::LibraryFiles);
+                }
+            });
+            if game_id.is_none() && ui.button("Exact duplicates").clicked() {
+                self.organisation.view = super::organisation::OrganisationView::ExactDuplicates;
+                self.go(Route::Section(Section::Build));
+            }
+            let problem_query = self.problem_query.trim().to_lowercase();
+            let problem_filter = self.problem_filter;
+            if let Some(game_id) = game_id
+                && let Some((title, platform)) = self
+                    .library
+                    .game(game_id)
+                    .map(|game| (game.title.clone(), game.platform.clone()))
+            {
+                let identity = self.identity_review_for(game_id);
+                egui::Frame::group(ui.style()).show(ui, |ui| {
+                    ui.heading(&title);
+                    ui.label(format!("Problems for this game · {platform}"));
+                    if let Some(review) = &identity {
+                        ui.label(format!("Identity: {}", review.list_label()));
+                        if !review.is_verified() && ui.button("Review identity").clicked() {
+                            self.go(Route::ReviewIdentity(game_id));
+                        }
+                    }
+                    ui.label("Only findings recorded for this game are shown here.");
+                    if ui.button("Back to game").clicked() {
+                        self.go(Route::Game(game_id));
+                    }
+                });
+            }
+            // For one game the selected-game section is the page; the library-wide
+            // inbox (and its large counts) is secondary and stays out of the way.
+            if game_id.is_none() {
+            let mascot = self.imagery.mascot(ui.ctx()).cloned();
+            page_hero(
+                ui,
+                move |ui, size| {
+                    let rect = ui.max_rect().shrink(5.0);
+                    ui.painter().rect_filled(rect, 8.0, theme::deep_fill(ui));
+                    ui.painter().rect_stroke(rect, 8.0, egui::Stroke::new(1.0_f32, theme::accent(ui).gamma_multiply(0.65)), egui::StrokeKind::Inside);
+                    ui.painter().rect_stroke(rect.shrink(10.0), 3.0, egui::Stroke::new(1.0_f32, theme::PRIMARY_ACTION.gamma_multiply(0.65)), egui::StrokeKind::Inside);
+                    if let Some(mascot) = mascot {
+                        ui.put(rect.shrink(7.0), egui::Image::new(&mascot).fit_to_exact_size(size - egui::vec2(14.0, 14.0)));
+                    }
+                },
+                "Review what needs attention",
+                "Check the evidence and choose a supported next step.",
+                Some((if summary.is_none() { "Checking saved evidence" } else if attention > 0 { "Needs attention" } else { "Ready for review" }, if summary.is_none() { StatusTone::Active } else if attention > 0 { StatusTone::Warning } else { StatusTone::Success })),
+                Some("Read-only first. Preview any supported repair before it changes a file."),
+                |ui| {
+                    let lines = match summary.as_ref() {
+                        Some(summary) => vec![
+                            "PROBLEM INBOX".to_string(),
+                            format!("ACTIONABLE {:>3}", summary.actionable_count()),
+                            format!("WARNINGS   {warnings:>3}"),
+                            format!("TOTAL      {:>3}", summary.problems.len()),
+                        ],
+                        None => vec!["PROBLEM INBOX".to_string(), "CHECKING...".to_string()],
+                    };
+                    crate::ui::components::signal_panel(ui, egui::vec2(180.0, 86.0), &lines, |_, _| {});
+                },
+                |ui| {
+                    if let Some(summary) = summary.as_ref() {
+                        if !summary.problems.is_empty()
+                            && primary(ui, "Review problems")
+                            && self.problem_selected.is_none()
+                        {
+                            self.problem_selected = summary
+                                .problems
+                                .first()
+                                .map(|problem| problem.id.clone());
+                        }
+                    } else {
+                        ui.add_enabled(false, egui::Button::new("Checking saved evidence"));
+                    }
+                },
+            );
+            }
+            if let Some(message) = self.repair_result.clone() {
+                egui::Frame::group(ui.style()).show(ui, |ui| {
+                    ui.strong("Repair complete");
+                    ui.label(message);
+                    if ui.button("Open History").clicked() { self.go(Route::Section(Section::History)); }
+                });
+            }
+            if let Some(preview) = self.repair_preview.clone() {
+                self.duplicate_preview(ui, &preview);
+            }
+            if game_id.is_none() {
+                if std::mem::take(&mut self.problem_nav.focus_missing_review) {
+                    ui.scroll_to_cursor(Some(egui::Align::TOP));
+                }
+                self.missing_review_panel(ui);
+            }
+            let Some(summary) = summary else {
+                egui::Frame::group(ui.style()).show(ui, |ui| {
+                    ui.horizontal(|ui| { ui.spinner(); ui.label("Checking the saved catalogue evidence… You can keep browsing while this finishes."); });
+                });
+                return;
+            };
+            let visible = |problem: &Problem| {
+                game_id.is_none_or(|id| problem.game_id == Some(id))
+                    && problem_filter.accepts(problem)
+                    && (problem_query.is_empty()
+                        || problem.title.to_lowercase().contains(&problem_query)
+                        || problem.affected.to_lowercase().contains(&problem_query)
+                        || problem.location.to_lowercase().contains(&problem_query))
+            };
+            let visible_count = summary.problems.iter().filter(|problem| visible(problem)).count();
+            if let Some(game_id) = game_id
+                && !summary
+                    .problems
+                    .iter()
+                    .any(|problem| problem.game_id == Some(game_id))
+            {
+                let unresolved = self
+                    .identity_review_for(game_id)
+                    .is_some_and(|review| !review.is_verified());
+                egui::Frame::group(ui.style()).show(ui, |ui| {
+                    ui.heading("No current problems are recorded for this game.");
+                    if unresolved {
+                        ui.label("It still needs identifying. That is shown separately from file problems.");
+                        if primary(ui, "Review identity") {
+                            self.go(Route::ReviewIdentity(game_id));
+                        }
+                    } else if primary(ui, "Back to game") {
+                        self.go(Route::Game(game_id));
+                    }
+                });
+                if ui.small_button(format!("{} findings elsewhere in your library", summary.problems.len())).clicked() {
+                    self.go(Route::Section(Section::Problems));
+                }
+                return;
+            }
+            if summary.problems.is_empty() {
+                egui::Frame::group(ui.style()).show(ui, |ui| {
+                    ui.heading("Nothing currently needs your attention.");
+                    ui.label("No current file, identity, or duplicate findings are recorded.");
+                    if primary(ui, "Verify my games") { self.go(Route::Section(Section::Check)); }
+                });
+                return;
+            }
+            let informational = summary
+                .problems
+                .iter()
+                .filter(|problem| !problem.state.is_actionable())
+                .count();
+            if visible_count == 0
+                && game_id.is_none()
+                && problem_query.is_empty()
+                && problem_filter == ProblemFilter::Actionable
+                && informational > 0
+            {
+                // Nothing to do: say so plainly, with the notes one click away.
+                egui::Frame::group(ui.style()).show(ui, |ui| {
+                    ui.heading("Nothing needs your attention right now.");
+                    ui.label(format!(
+                        "{informational} informational note{} {} available. They need no action.",
+                        if informational == 1 { "" } else { "s" },
+                        if informational == 1 { "is" } else { "are" }
+                    ));
+                    if ui.button("Show informational notes").clicked() {
+                        self.problem_filter = ProblemFilter::All;
+                    }
+                });
+                return;
+            }
+            if visible_count == 0 {
+                egui::Frame::group(ui.style()).show(ui, |ui| {
+                    ui.heading("No problems match the current filters.");
+                    ui.label("Clear the search or show all current findings to review the rest of the inbox.");
+                    if primary(ui, "Show all current findings") {
+                        self.problem_filter = ProblemFilter::All;
+                        self.problem_query.clear();
+                    }
+                });
+                return;
+            }
+            if game_id.is_none() { ui.horizontal_wrapped(|ui| {
+                ui.strong(format!("Needs attention: {}", summary.attention_count()));
+                ui.label(format!("Warnings: {}", summary.count(Severity::Warning)));
+                ui.label(format!("Informational: {}", summary.count(Severity::Informational)));
+            }); }
+            if self.duplicate_report.is_none() {
+                ui.label("Exact duplicates have not been checked in this session.");
+                if ui.button("Check for exact duplicates").clicked() { self.start_duplicate_scan(); }
+            }
+            let mut selected = self.problem_selected.clone();
+            let mut run: Option<super::problems::ProblemAction> = None;
+            for category in [Category::Files, Category::Duplicates, Category::Identity, Category::Verification] {
+                let Some(entries) = summary.category_indices.get(&category) else { continue; };
+                let entries: Vec<_> = entries
+                    .iter()
+                    .copied()
+                    .filter(|&index| visible(&summary.problems[index]))
+                    .collect();
+                if entries.is_empty() {
+                    continue;
+                }
+                ui.separator();
+                ui.heading(category.label());
+                if let Some(&problem_index) = entries
+                    .iter()
+                    .find(|&&index| selected.as_deref() == Some(summary.problems[index].id.as_str()))
+                {
+                    egui::Frame::group(ui.style())
+                        .show(ui, |ui| self.problem_details(ui, &summary.problems[problem_index]));
+                }
+                egui::ScrollArea::vertical().id_salt(("v2_problem_rows", category)).show_rows(ui, 96.0, entries.len(), |ui, range| {
+                    for index in range {
+                        let problem = &summary.problems[entries[index]];
+                        let is_selected = selected.as_deref() == Some(problem.id.as_str());
+                    ui.push_id(&problem.id, |ui| {
+                        egui::Frame::group(ui.style()).show(ui, |ui| {
+                        ui.set_min_width(ui.available_width());
+                            ui.horizontal_wrapped(|ui| {
+                                ui.strong(&problem.title);
+                                ui.label(problem.severity.label());
+                                ui.label(problem.state.label());
+                            if ui.button(if is_selected { "Hide details" } else { "View details" }).clicked() {
+                                selected = (!is_selected).then(|| problem.id.clone());
+                            }
+                        });
+                        ui.label(&problem.affected);
+                        ui.label(&problem.location);
+                        ui.label(&problem.action);
+                        ui.horizontal_wrapped(|ui| {
+                            if let Some(action) = problem.primary.as_ref()
+                                && primary(ui, &action.label)
+                            {
+                                run = Some(action.clone());
+                            }
+                            if let Some(action) = problem.secondary.as_ref()
+                                && ui.button(&action.label).clicked()
+                            {
+                                run = Some(action.clone());
+                            }
+                        });
+                        if problem.category == Category::Duplicates
+                            && self.repair_preview.is_none()
+                            && self.repair_job.is_none()
+                            && self.duplicate_report.is_some()
+                            && let Some(index) = problem.id.strip_prefix("duplicate-").and_then(|id| id.split('-').next()).and_then(|id| id.parse::<usize>().ok())
+                            && ui.button("Preview safe quarantine").clicked()
+                        {
+                            self.start_duplicate_preview(index);
+                        }
+                        });
+                    });
+                    }
+                });
+            }
+            self.problem_selected = selected;
+            if let Some(action) = run {
+                self.run_problem_action(&action);
+            }
+        });
+    }
+
+    fn duplicate_preview(
+        &mut self,
+        ui: &mut egui::Ui,
+        preview: &super::backend::DuplicateRepairPreview,
+    ) {
+        egui::Frame::group(ui.style()).show(ui, |ui| {
+            ui.heading("Repair preview: quarantine duplicate files");
+            ui.label("EmuWiz will move only the redundant byte-identical copies into its recoverable quarantine. It will not delete the retained copy or alter unrelated files.");
+            ui.label(format!("{} file(s) will change · {} byte(s) · retained copy: {}", preview.proposals.len(), preview.group.reclaimable_bytes, preview.group.recommendation.retained_path().map_or("unknown".into(), |path| path.display().to_string())));
+            for proposal in &preview.proposals {
+                if let archivefs_core::repair::RepairAction::MovePath { destination } = &proposal.action {
+                    ui.label(format!("Move {} -> {}", proposal.source_path.display(), destination.display()));
+                }
+            }
+            ui.label("The transaction journal records the move; nothing is deleted.");
+            ui.label(super::quarantine_confirm::UNDO_NOT_PROMISED);
+            ui.horizontal_wrapped(|ui| {
+                if primary(ui, "Confirm quarantine") { self.repair_confirm = true; }
+                if ui.button("Cancel preview").clicked() { self.repair_preview = None; }
+            });
+            ui.collapsing("Advanced Details", |ui| {
+                ui.monospace(format!("Trusted root: {}\nJournal directory: {}", preview.trusted_root.display(), preview.journal_dir.display()));
+            });
+        });
+        if self.repair_confirm {
+            // The final confirmation names what stays, what moves and where.
+            let plan = super::quarantine_confirm::QuarantinePlan {
+                kept: preview
+                    .group
+                    .recommendation
+                    .retained_path()
+                    .map(|path| path.display().to_string()),
+                moved: preview
+                    .proposals
+                    .iter()
+                    .map(|proposal| proposal.source_path.display().to_string())
+                    .collect(),
+                destination: super::quarantine_confirm::quarantine_folder(&preview.trusted_root),
+            };
+            match super::quarantine_confirm::show(
+                ui.ctx(),
+                egui::Id::new("v2_duplicate_quarantine_confirm"),
+                &plan,
+            ) {
+                Some(true) => self.apply_duplicate_preview(),
+                Some(false) => self.repair_confirm = false,
+                None => {}
+            }
+        }
+    }
+
+    fn problem_details(&mut self, ui: &mut egui::Ui, problem: &Problem) {
+        ui.separator();
+        ui.strong("What happened");
+        ui.label(&problem.title);
+        ui.strong("Why it matters");
+        ui.label(&problem.why);
+        ui.strong("What EmuWiz can do");
+        ui.label(&problem.action);
+        ui.strong("Current state");
+        ui.label(problem.state.label());
+        ui.label(&problem.location);
+        ui.strong("Safety and undo");
+        ui.label(&problem.safety);
+        ui.label(&problem.undo);
+        if let Some(game_id) = problem.game_id
+            && ui.button("Open Game Details").clicked()
+        {
+            self.go(Route::Game(game_id));
+        }
+        if let Some(action) = problem.primary.clone()
+            && primary(ui, &action.label)
+        {
+            self.run_problem_action(&action);
+        }
+        ui.collapsing("Advanced details", |ui| {
+            ui.monospace(&problem.technical);
+        });
+    }
+
+    fn game_detail(&mut self, ui: &mut egui::Ui, id: i64) {
+        let library = self.library.clone();
+        let Some(game) = library.game(id) else {
+            ui.label("This game is not in the current game list. It may have moved or its folder may be disconnected.");
+            if primary(ui, "Return to games") {
+                self.go(Route::Section(Section::Games));
+            }
+            return;
+        };
+        self.imagery.note_opened(id);
+        let latest_verification = self
+            .verification
+            .as_ref()
+            .filter(|result| result.platform == game.platform)
+            .and_then(|result| result.statuses.get(&id))
+            .cloned();
+        self.hackhash
+            .inspect_selected_rom(&game.archive.absolute_path);
+        let key = self.artwork.key(id, Kind::Cover);
+        // One scroll area holds the whole page. Specialist evidence used to be
+        // drawn above it, which pushed the title and Play off small windows.
+        egui::ScrollArea::vertical().id_salt(("v2_detail", id)).show(ui, |ui| {
+            if self.moved_game == Some(id) {
+                ui.group(|ui| {
+                    ui.strong("This game has moved");
+                    ui.label("This catalogue entry is from an older library location. EmuWiz found the current copy.");
+                    ui.label("No action is needed.");
+                });
+                ui.add_space(theme::SPACE_SM);
+            }
+            let blue = self.simple.simple_navigation();
+            // Blue, with room: the hero beside "Can I play it?", Game
+            // information and Advanced details (boards D6/D7-Game-Main).
+            if blue && ui.available_width() >= super::game_detail_blue::SIDE_BY_SIDE_MIN_WIDTH {
+                let gap = 20.0;
+                let right = (ui.available_width() * 0.3).clamp(360.0, 440.0);
+                let left = ui.available_width() - right - gap;
+                ui.horizontal_top(|ui| {
+                    ui.spacing_mut().item_spacing.x = gap;
+                    ui.allocate_ui_with_layout(
+                        egui::vec2(left, 0.0),
+                        egui::Layout::top_down(egui::Align::Min),
+                        |ui| {
+                            ui.set_width(left);
+                            super::game_detail_blue::hero_card(ui, |ui| {
+                                ui.horizontal_top(|ui| {
+                                    self.picture(ui, game, Kind::Cover, super::game_detail_blue::HERO_COVER);
+                                    ui.add_space(theme::SPACE_LG);
+                                    ui.vertical(|ui| {
+                                        self.detail_heading(ui, &library, game);
+                                        ui.add_space(theme::SPACE_SM);
+                                        self.detail_more(ui, game);
+                                    });
+                                });
+                            });
+                            self.detail_body(ui, game, &key);
+                        },
+                    );
+                    ui.allocate_ui_with_layout(
+                        egui::vec2(right, 0.0),
+                        egui::Layout::top_down(egui::Align::Min),
+                        |ui| {
+                            ui.set_width(right);
+                            super::game_detail_blue::side_card(ui, "Can I play it?", |ui| {
+                                self.detail_readiness(ui, game, latest_verification.as_deref());
+                                self.show_arcade_input_details(ui, game);
+                                self.classic_trainers.show(ui, game);
+                            });
+                            super::game_detail_blue::information_card(ui, game);
+                            super::game_detail_blue::side_card(ui, "", |ui| {
+                                ui.collapsing("Advanced details", |ui| {
+                                    self.detail_advanced(ui, &library, game, &key);
+                                });
+                            });
+                        },
+                    );
+                });
+                return;
+            }
+            let wide = ui.available_width() >= 760.0;
+            let cover = if wide { egui::vec2(240.0, 320.0) } else { egui::vec2(168.0, 224.0) };
+            ui.horizontal_top(|ui| {
+                self.picture(ui, game, Kind::Cover, cover);
+                ui.add_space(theme::SPACE_LG);
+                ui.vertical(|ui| {
+                    self.detail_heading(ui, &library, game);
+                    ui.add_space(theme::SPACE_SM);
+                    self.detail_readiness(ui, game, latest_verification.as_deref());
+                    self.show_arcade_input_details(ui, game);
+                    ui.add_space(theme::SPACE_SM);
+                    self.detail_more(ui, game);
+                });
+            });
+            if blue {
+                super::game_detail_blue::information_card(ui, game);
+            }
+            self.detail_body(ui, game, &key);
+            self.classic_trainers.show(ui, game);
+            ui.add_space(theme::SPACE_MD);
+            ui.collapsing("Advanced details", |ui| {
+                self.detail_advanced(ui, &library, game, &key);
+            });
+        });
+    }
+
+    /// Title, platform and (only when another game shares the title) a hint
+    /// that tells the two apart.
+    fn detail_heading(&mut self, ui: &mut egui::Ui, library: &Library, game: &Game) {
+        let id = game.archive.id;
+        super::title_fit::title_label(ui, &game.title, theme::TextRole::PageTitle, 3);
+        ui.horizontal(|ui| {
+            self.imagery.platform_icon(ui, &game.platform, 28.0);
+            ui.label(
+                RichText::new(format!(
+                    "{} · {}",
+                    game.platform,
+                    media_kind_label(&game.archive.archive_kind)
+                ))
+                .color(theme::muted(ui)),
+            );
+        });
+        // Only when another game shares this title (regions, revisions,
+        // duplicates): a friendly hint, never a full path - the file
+        // name when it says more than the title, else the folder.
+        let has_twin = library.has_title_twin(id);
+        if let Some(hint) = has_twin
+            .then(|| {
+                disambiguating_hint(
+                    &game.title,
+                    &game.archive.relative_path,
+                    &game.archive.absolute_path,
+                )
+            })
+            .flatten()
+        {
+            ui.label(RichText::new(hint).small().color(theme::muted(ui)));
+        }
+    }
+
+    fn show_arcade_input_details(&mut self, ui: &mut egui::Ui, game: &Game) {
+        let arcade_platform = game.platform.eq_ignore_ascii_case("arcade");
+        let arcade_identity = game.archive.identity_report.as_ref().is_some_and(|report| {
+            report.platform == archivefs_core::game_identity::IdentityPlatform::Arcade
+        });
+        if !arcade_platform && !arcade_identity {
+            return;
+        }
+        let open_catalogue_setup = self.arcade_input_details.show(
+            ui,
+            game.archive.id,
+            game.archive.identity_report.as_ref(),
+            &self.organisation.mame_health,
+        );
+        if open_catalogue_setup {
+            self.organisation.view = super::organisation::OrganisationView::MameHealth;
+            self.go(Route::MameWorkflow);
+        }
+    }
+
+    /// The readiness card (which owns the single primary action), the latest
+    /// verification, the identity status and the saved-check notes.
+    fn detail_readiness(
+        &mut self,
+        ui: &mut egui::Ui,
+        game: &Game,
+        latest_verification: Option<&str>,
+    ) {
+        self.nkit_guidance(ui, game, false);
+        let id = game.archive.id;
+        // The readiness card owns the single primary action: Play
+        // when the game is ready, otherwise the step that fixes it.
+        let readiness_route = {
+            let workflows = self.native_workflows.get_or_insert_with(|| {
+                super::native_workflows::NativeWorkflows::new(ui.ctx().clone())
+            });
+            workflows.note_catalogue_row(&game.archive);
+            workflows.show_readiness_summary(
+                ui,
+                id,
+                &game.archive.absolute_path,
+                game.archive.identity_report.as_ref(),
+                game.dat_exact.is_some(),
+                &mut self.activity,
+            )
+        };
+        if let Some(route) = readiness_route {
+            self.go(route);
+        }
+        let state_target = self
+            .native_workflows
+            .as_ref()
+            .and_then(|workflows| workflows.save_state_target(id, &game.archive.absolute_path));
+        super::save_state_guidance::show_game(
+            ui,
+            game,
+            self.saves_states.inventory.as_ref(),
+            state_target.as_ref(),
+        );
+        #[cfg(target_os = "linux")]
+        super::electron_preview::show(ui, game);
+        // Multi-disc guidance, read-only, under the same readiness card.
+        let disc_guidance = self
+            .native_workflows
+            .as_ref()
+            .and_then(|workflows| workflows.disc_guidance(&game.archive.absolute_path));
+        if let Some(guidance) = &disc_guidance {
+            ui.add_space(theme::SPACE_SM);
+            crate::multidisc_launch_view::show_guidance(ui, guidance);
+        }
+        // Amiga format, machine and readiness; links only, never Play.
+        if super::amiga_game::machine(game).is_some() {
+            ui.add_space(theme::SPACE_SM);
+            if let Some(route) = super::amiga_game::show(ui, game, disc_guidance.as_ref()) {
+                self.go(route);
+            }
+        }
+        // A CUE disc whose saved verification is waiting on a re-check (a
+        // file changed, is missing, or the drive looks remounted). Only an
+        // explicit click re-hashes that one disc.
+        if let Some((reason, running, message)) = self
+            .native_workflows
+            .as_ref()
+            .and_then(|workflows| workflows.disc_recheck_view(&game.archive.absolute_path))
+        {
+            ui.add_space(theme::SPACE_SM);
+            if !reason.is_empty() {
+                ui.colored_label(
+                    ui.visuals().warn_fg_color,
+                    format!("Verification needs a re-check: {reason}"),
+                );
+                let label = if running {
+                    "Re-checking this disc…"
+                } else {
+                    "Re-check this disc"
+                };
+                if ui.add_enabled(!running, egui::Button::new(label)).clicked()
+                    && let Some(workflows) = self.native_workflows.as_mut()
+                {
+                    workflows.start_disc_recheck(&game.archive.absolute_path);
+                }
+            }
+            if let Some(message) = message {
+                ui.label(message);
+            }
+        }
+        ui.add_space(theme::SPACE_SM);
+        if let Some(status) = latest_verification {
+            ui.label(format!("Latest verification: {status}"));
+        }
+        self.detail_verification_guidance(ui, game);
+        // General file identification and launch readiness remain separate.
+        if let Some(review) = self.identity_review_for(id) {
+            ui.horizontal_wrapped(|ui| {
+                ui.strong(format!("Identity: {}", review.list_label()));
+                let label = if review.is_verified() {
+                    "View evidence"
+                } else {
+                    "Review identity"
+                };
+                if ui.button(label).clicked() {
+                    self.go(Route::ReviewIdentity(id));
+                }
+            });
+        }
+        if let Some(detail) = self.detail.as_ref().filter(|detail| detail.game == id) {
+            if !detail.file_present {
+                ui.colored_label(
+                    theme::warning(ui),
+                    "Needs attention · game file is unavailable",
+                );
+            } else if !detail.unchanged {
+                ui.colored_label(
+                    theme::warning(ui),
+                    "Needs attention · game file changed since the last scan",
+                );
+            }
+            if detail.saved_checks > 0 && ui.button("View verification result").clicked() {
+                // Keep this game and its system: Check Games otherwise opens
+                // on whichever platform was chosen last (or none), and the
+                // person has to find their way back to the game they came from.
+                self.check_platform = Some(game.platform.clone());
+                self.go(Route::Task {
+                    section: Section::Check,
+                    game: game.archive.id,
+                });
+            }
+        } else if self.detail_failed == Some(id) {
+            ui.label("Saved checks could not be read. Your game has not been changed.");
+            if ui.button("Try again").clicked() {
+                self.detail_failed = None;
+            }
+        }
+    }
+
+    /// "More for this game": the existing per-game pages, and Open Folder.
+    fn detail_more(&mut self, ui: &mut egui::Ui, game: &Game) {
+        let id = game.archive.id;
+        ui.label(RichText::new("More for this game").color(theme::muted(ui)));
+        ui.horizontal_wrapped(|ui| {
+            for (label, section) in [
+                ("Verify", Section::Check),
+                ("Artwork, Manuals & Extras", Section::Artwork),
+                ("Mods & Cheats", Section::Mods),
+                ("Saves & States", Section::Saves),
+                ("Fix Problems", Section::Problems),
+            ] {
+                if ui.button(label).clicked() {
+                    if matches!(section, Section::Check) {
+                        self.check_platform = Some(game.platform.clone());
+                    }
+                    self.go(Route::Task { section, game: id });
+                }
+            }
+            if ui.button("Open Folder").clicked() {
+                let job = self
+                    .activity
+                    .queue("Opening the game folder", Route::Game(id), false);
+                self.send(job, Command::OpenFolder(game.archive.absolute_path.clone()));
+            }
+        });
+    }
+
+    /// Picture retry, description, screenshots, saves, documents and the
+    /// collapsed disc and ROM evidence.
+    fn detail_body(&mut self, ui: &mut egui::Ui, game: &Game, key: &super::artwork::Key) {
+        super::hdf_contents::show(ui, game);
+        if super::psp_iso_analyser::show(ui, game) {
+            self.go(Route::Section(Section::Converter));
+        }
+        let id = game.archive.id;
+        if matches!(
+            self.artwork.pictures.get(key),
+            Some(Picture::Failed(_) | Picture::Unavailable { .. })
+        ) && ui.button("Retry picture").clicked()
+        {
+            self.artwork.retry(key.clone());
+        }
+        if let Some(description) = self
+            .artwork
+            .index
+            .as_ref()
+            .and_then(|index| index.descriptions.get(&id))
+        {
+            ui.add_space(theme::SPACE_MD);
+            ui.label(theme::section_title("About this game"));
+            ui.scope(|ui| {
+                // Keep long descriptions at a readable line length.
+                ui.set_max_width(ui.available_width().min(920.0));
+                ui.label(description);
+            });
+        }
+        let count = self
+            .artwork
+            .index
+            .as_ref()
+            .and_then(|index| index.screenshots.get(&id))
+            .map_or(0, Vec::len);
+        ui.add_space(theme::SPACE_MD);
+        ui.label(theme::section_title("Screenshots"));
+        if self.artwork.index.is_none() {
+            ui.horizontal(|ui| {
+                ui.spinner();
+                ui.label("Looking for screenshots…");
+            });
+        } else if count == 0 {
+            ui.weak("No screenshots found for this game.");
+        } else {
+            // The first screenshot is shown straight away; the rest load
+            // only when asked for, keeping a game visit to two pictures.
+            let shown = if self.screenshots { count } else { 1 };
+            ui.horizontal_wrapped(|ui| {
+                for ordinal in 0..shown {
+                    ui.vertical(|ui| {
+                        self.picture(
+                            ui,
+                            game,
+                            Kind::Screenshot(ordinal),
+                            egui::vec2(320.0, 240.0),
+                        );
+                        let key = self.artwork.key(id, Kind::Screenshot(ordinal));
+                        if matches!(
+                            self.artwork.pictures.get(&key),
+                            Some(Picture::Failed(_) | Picture::Unavailable { .. })
+                        ) && ui
+                            .button(format!("Retry screenshot {}", ordinal + 1))
+                            .clicked()
+                        {
+                            self.artwork.retry(key);
+                        }
+                    });
+                }
+            });
+            if !self.screenshots
+                && count > 1
+                && ui
+                    .button(format!("Show all screenshots ({count})"))
+                    .clicked()
+            {
+                self.screenshots = true;
+            }
+        }
+        self.save_backups_panel(ui, game);
+        self.documents_panel(ui, id, game);
+        // Everything below is reference material, closed by default and
+        // always last so it never pushes the useful parts down.
+        if super::dreamcast_ipbin::applies(game)
+            || super::wiiu_disc::applies(game)
+            || super::saturn_manifest::applies(game)
+            || self.hackhash.has_selected_evidence()
+        {
+            ui.add_space(theme::SPACE_MD);
+            egui::CollapsingHeader::new("Disc & ROM evidence")
+                .id_salt(("v2_detail_evidence", id))
+                .default_open(false)
+                .show(ui, |ui| {
+                    self.hackhash.show_selected_rom_evidence(ui);
+                    super::dreamcast_ipbin::show(ui, game);
+                    super::wiiu_disc::show(ui, game);
+                    super::saturn_manifest::show(ui, game);
+                });
+        }
+    }
+
+    /// Advanced details: identity, source, media kind, old locations,
+    /// saved diagnostics, artwork diagnosis and specialist inspectors.
+    fn detail_advanced(
+        &mut self,
+        ui: &mut egui::Ui,
+        library: &Library,
+        game: &Game,
+        key: &super::artwork::Key,
+    ) {
+        let id = game.archive.id;
+        let key = key.clone();
+        ui.label(match game.dat_exact_label() {
+            Some(label) => label,
+            None if game.identified => "Identified in the saved game list".to_string(),
+            None => "Identity is not confirmed".to_string(),
+        });
+        ui.monospace(format!("Source: {}", game.archive.relative_path.display()));
+        ui.monospace(format!("Media kind: {}", game.archive.archive_kind));
+        for old in library.historical_for(id) {
+            ui.label(format!(
+                "Old library location (no action needed): {}",
+                old.archive.relative_path.display()
+            ));
+            if let Some(link) = library.historical_links.get(&old.archive.id) {
+                ui.label(format!(
+                    "Why EmuWiz treats it as the same game: {}.",
+                    link.evidence.describe()
+                ));
+            }
+        }
+        if let Some(detail) = self.detail.as_ref().filter(|detail| detail.game == id) {
+            ui.label(detail.emulator_status());
+            ui.label(&detail.technical);
+        }
+        if let Some(index) = &self.artwork.index
+            && let Some(diagnostic) = index.diagnostic_for(game)
+        {
+            ui.label(diagnostic);
+        }
+        ui.label("An installed emulator is not proof that this game can launch. The launch check also rechecks identity, media, firmware and profiles.");
+        match self.artwork.pictures.get(&key) {
+            Some(Picture::Ready { timings, .. }) => {
+                ui.monospace(format!("{timings:#?}"));
+            }
+            Some(Picture::Failed(error)) => {
+                ui.label(error);
+            }
+            _ => {}
+        }
+        self.artwork_provider_details(ui, id);
+        if crate::tape_analysis_page::is_tape_path(&game.archive.absolute_path)
+            && ui.button("Inspect tape").clicked()
+        {
+            self.go(Route::Task {
+                section: Section::Tape,
+                game: id,
+            });
+        }
+        if super::archive_inspector::is_supported_archive(&game.archive.archive_kind)
+            && ui.button("Inspect archive").clicked()
+        {
+            self.go(Route::Task {
+                section: Section::Advanced,
+                game: id,
+            });
+        }
+    }
+
+    /// Technical artwork diagnosis for Advanced details. Never shows a token;
+    /// the endpoint is shown as configured, without any user-information part.
+    pub(super) fn artwork_provider_details(&self, ui: &mut egui::Ui, id: i64) {
+        use archivefs_core::identity_source::romm::connectivity::displayable_endpoint;
+        let key = self.artwork.key(id, Kind::Cover);
+        let Some(index) = self.artwork.index.as_ref() else {
+            ui.label("Artwork: the artwork index is still being prepared.");
+            return;
+        };
+        let source = &index.settings.source;
+        let endpoint = if source.url.trim().is_empty() {
+            "not configured".to_string()
+        } else {
+            displayable_endpoint(&source.url)
+        };
+        ui.label(format!("RomM endpoint: {endpoint}"));
+        ui.label(format!(
+            "RomM online artwork: {}",
+            if source.enabled { "on" } else { "off" }
+        ));
+        match self.artwork.health.snapshot() {
+            Some((state, age)) => ui.label(format!(
+                "RomM provider state: {} (last checked {}s ago)",
+                state.technical_label(),
+                age.as_secs()
+            )),
+            None => ui.label("RomM provider state: no online request has been needed yet"),
+        };
+        ui.label(format!(
+            "Cover source: {}",
+            match index.source(id, Kind::Cover) {
+                Some(super::media_sources::Source::Local(path)) =>
+                    format!("local file {}", path.display()),
+                Some(super::media_sources::Source::Remote { .. }) =>
+                    "RomM (remote; served from the local cache when cached)".to_string(),
+                None => "none found".to_string(),
+            }
+        ));
+        match self.artwork.pictures.get(&key) {
+            Some(Picture::Ready { timings, .. }) => {
+                ui.label(format!(
+                    "Cached image used: {}",
+                    if timings.cache_hit { "yes" } else { "no" }
+                ));
+            }
+            Some(Picture::Unavailable { issue, message }) => {
+                ui.label(format!(
+                    "An uncached RomM picture exists but could not be fetched: {} ({message})",
+                    issue.technical_label()
+                ));
+            }
+            _ => {}
+        }
+        if let Some(wait) = self.artwork.retry_in(key) {
+            ui.label(format!(
+                "Automatic retry: in about {}s while this picture stays on screen",
+                wait.as_secs()
+            ));
+        }
+    }
+
+    fn save_backups_panel(&mut self, ui: &mut egui::Ui, game: &Game) {
+        if !game.archive.absolute_path.exists() {
+            return;
+        }
+        ui.add_space(theme::SPACE_MD);
+        ui.collapsing("Saves & Backups", |ui| {
+            ui.label("Create a local backup of your save before making changes.");
+            ui.label("Save files and save states are kept as different kinds of data.");
+            ui.horizontal_wrapped(|ui| {
+                if ui.button("Open Saves & States").clicked() {
+                    self.go(Route::Task {
+                        section: Section::Saves,
+                        game: game.archive.id,
+                    });
+                }
+            });
+            ui.collapsing("Advanced details", |ui| {
+                ui.label("Snapshots are stored locally, hashed on this machine, and published only after the copy is complete.");
+                ui.label("EmuWiz will require the emulator to be closed before snapshot or restore work.");
+            });
+        });
+    }
+
+    fn mods_page(&mut self, ui: &mut egui::Ui, game_id: Option<i64>) {
+        let selected = game_id.and_then(|id| self.library.game(id));
+        let workflows = self
+            .native_workflows
+            .get_or_insert_with(|| super::native_workflows::NativeWorkflows::new(ui.ctx().clone()));
+        let destination = crate::gui_v2::mods::show_mods_page(
+            ui,
+            &mut self.mods,
+            selected,
+            workflows,
+            &mut self.activity,
+        );
+        if let Some(destination) = destination {
+            self.go(destination);
+        }
+    }
+
+    fn launch(&mut self, ui: &mut egui::Ui, game_id: i64) {
+        let Some(game) = self.library.game(game_id).cloned() else {
+            ui.label("This game is no longer in the current library.");
+            if primary(ui, "Return to games") {
+                self.go(Route::Section(Section::Games));
+            }
+            return;
+        };
+        egui::Frame::group(ui.style()).show(ui, |ui| {
+            ui.horizontal_top(|ui| {
+                // Launch reuses the same bounded cover/platform pipeline as
+                // Games and Game Details. It never performs its own artwork
+                // lookup or eagerly scans the catalogue.
+                self.picture(ui, &game, Kind::Cover, egui::vec2(128.0, 172.0));
+                ui.add_space(theme::SPACE_MD);
+                ui.vertical(|ui| {
+                    ui.heading(&game.title);
+                    ui.horizontal(|ui| {
+                        self.imagery.platform_icon(ui, &game.platform, 40.0);
+                        ui.vertical(|ui| {
+                            ui.label(format!("Platform: {}", game.platform));
+                            ui.label(format!(
+                                "Media: {}",
+                                media_kind_label(&game.archive.archive_kind)
+                            ));
+                        });
+                    });
+                    ui.label(if game.identified {
+                        "Verified identity is available"
+                    } else {
+                        "Game identity needs review"
+                    });
+                });
+            });
+        });
+        ui.add_space(12.0);
+        self.nkit_guidance(ui, &game, true);
+        let workflows = self
+            .native_workflows
+            .get_or_insert_with(|| super::native_workflows::NativeWorkflows::new(ui.ctx().clone()));
+        workflows.note_catalogue_row(&game.archive);
+        if let Some(route) = workflows.show_launch(
+            ui,
+            game_id,
+            &game.archive.absolute_path,
+            game.archive.identity_report.as_ref(),
+            &mut self.activity,
+        ) {
+            self.go(route);
+        }
+    }
+
+    fn emulator_setup(&mut self, ui: &mut egui::Ui) {
+        let environment = self.environment.clone();
+        let workflows = self
+            .native_workflows
+            .get_or_insert_with(|| super::native_workflows::NativeWorkflows::new(ui.ctx().clone()));
+        // The shared page owns wheel input and keyboard focus reveal.
+        workflows.show_setup(ui, environment.as_ref());
+    }
+
+    fn firmware(&mut self, ui: &mut egui::Ui) {
+        let workflows = self
+            .native_workflows
+            .get_or_insert_with(|| super::native_workflows::NativeWorkflows::new(ui.ctx().clone()));
+        let readiness = &mut workflows.app.emulator_readiness;
+        readiness
+            .bios_projection_page
+            .information()
+            .set_installed(readiness.emulator_inventory_page.inventory.as_ref());
+        workflows.show_firmware(ui);
+        let navigation = workflows
+            .app
+            .emulator_readiness
+            .bios_projection_page
+            .information()
+            .take_navigation();
+        match navigation {
+            Some(crate::bios_projection_page::FirmwareNavigation::SetupDoctor) => {
+                self.go(Route::Section(Section::Setup));
+            }
+            Some(crate::bios_projection_page::FirmwareNavigation::EmulatorSetup) => {
+                self.go(Route::Section(Section::Emulators));
+            }
+            None => {}
+        }
+    }
+
+    fn sources(&mut self, ui: &mut egui::Ui) {
+        let workflows = self
+            .native_workflows
+            .get_or_insert_with(|| super::native_workflows::NativeWorkflows::new(ui.ctx().clone()));
+        if let Some(route) = workflows.show_sources(ui, &mut self.activity) {
+            self.go(route);
+        }
+        ui.separator();
+        self.hackhash.show(ui);
+        ui.separator();
+    }
+
+    fn dat_sources(&mut self, ui: &mut egui::Ui) {
+        if primary(ui, "Verify library games…") {
+            let platform = self
+                .review
+                .dat_context
+                .as_ref()
+                .map(|(_, platform)| platform.as_str());
+            self.go(super::identity_review_page::setup_verification_route(
+                platform,
+            ));
+        }
+        if let Some((game, platform)) = self.review.dat_context.clone() {
+            egui::Frame::group(ui.style()).show(ui, |ui| {
+                ui.strong(format!("Setting up identification data for {platform}"));
+                ui.label("Choose a compatible catalogue, preview this system's library games and confirm verification.");
+                if ui.button("Back to Review identity").clicked() {
+                    self.review.dat_context = None;
+                    self.go(Route::ReviewIdentity(game));
+                }
+            });
+        }
+        ui.horizontal_wrapped(|ui| {
+            ui.label("Need to rename verified files to their trusted DAT names?");
+            if ui.button("Quick Rename").clicked() {
+                self.go(Route::QuickRename);
+            }
+            if ui.button("Check Games").clicked() {
+                self.go(Route::Section(Section::Check));
+            }
+            if ui.button("Advanced Rename").clicked() {
+                self.go(Route::Section(Section::Build));
+            }
+            if ui.button("History & Undo").clicked() {
+                self.go(Route::Section(Section::History));
+            }
+        });
+        let workflows = self
+            .native_workflows
+            .get_or_insert_with(|| super::native_workflows::NativeWorkflows::new(ui.ctx().clone()));
+        if let Some(route) = workflows.show_dat_sources(ui, &mut self.activity) {
+            self.go(route);
+        }
+    }
+
+    fn advanced(&mut self, ui: &mut egui::Ui) {
+        let archive_games = self.archive_inspector.rows(&self.library);
+        let mut inspect_game = None;
+        check_scroll(ui, None, |ui| {
+            if primary(ui, "Open specialist interface") {
+                self.legacy(Section::Advanced);
+            }
+            ui.separator();
+            ui.strong("Archive Inspector");
+            ui.label("Review ZIP, 7z and RAR member metadata without extracting anything.");
+            if archive_games.is_empty() {
+                ui.label("No archive-backed games are currently in the catalogue.");
+            } else {
+                for row in &archive_games {
+                    ui.push_id(("archive-game", row.id), |ui| {
+                        ui.horizontal_wrapped(|ui| {
+                            ui.label(match &row.location {
+                                Some(location) => {
+                                    format!("{} · {} · {location}", row.title, row.media)
+                                }
+                                None => format!("{} · {}", row.title, row.media),
+                            });
+                            if ui.button("Inspect contents").clicked() {
+                                inspect_game = Some(row.id);
+                            }
+                        });
+                    });
+                }
+            }
+            ui.separator();
+            ui.strong("Specialist tools");
+            ui.label("Mounts, media-set inspection, storage and journal details remain available in the existing technical interface.");
+            ui.add_space(8.0);
+            ui.strong("Normal pages");
+            if ui.button("Open DAT Management").clicked() {
+                self.go(Route::Section(Section::Dat));
+            }
+            if ui.button("Open Organisation").clicked() {
+                self.go(Route::Section(Section::Build));
+            }
+            if ui.button("Open Tape Inspector").clicked() {
+                self.go(Route::Section(Section::Tape));
+            }
+            ui.collapsing("Advanced details", |ui| {
+                ui.label("The specialist interface preserves legacy mount, media, storage and history tools. Opening it changes nothing.");
+            });
+        });
+        if let Some(game) = inspect_game {
+            self.go(Route::Task {
+                section: Section::Advanced,
+                game,
+            });
+        }
+    }
+
+    fn archive_inspector(&mut self, ui: &mut egui::Ui, game_id: Option<i64>) {
+        let target = game_id.and_then(|id| {
+            self.library.game(id).and_then(|game| {
+                super::archive_inspector::ArchiveInspectorTarget::from_game(id, game)
+            })
+        });
+        super::archive_inspector::show(ui, &mut self.archive_inspector, target);
+    }
+
+    fn artwork_metadata(&mut self, ui: &mut egui::Ui, selected: Option<i64>) {
+        if self.artwork.index.is_none() && !self.artwork.index_loading {
+            self.refresh_artwork_index();
+        }
+        let library = self.library.clone();
+        let mut metadata_changed = false;
+        egui::ScrollArea::vertical()
+            .id_salt(("v2_artwork_metadata", selected))
+            .auto_shrink([false, false])
+            .show(ui, |ui| {
+                ui.label("Review artwork, manuals and supported extras for one game. Provider setup stays in Sources & Providers.");
+                if ui
+                    .add_enabled(!self.artwork.index_loading, egui::Button::new("Recheck providers"))
+                    .clicked()
+                {
+                    self.refresh_artwork_index();
+                }
+                if self.artwork.index_loading {
+                    ui.spinner();
+                    ui.label("Checking metadata and artwork providers…");
+                }
+                let Some(game_id) = selected else {
+                    let (covers, screenshots, descriptions) = self.artwork.index.as_ref().map_or(
+                        (0, 0, 0),
+                        |index| (index.covers.len(), index.screenshots.len(), index.descriptions.len()),
+                    );
+                    ui.heading("Library artwork");
+                    ui.label(format!("{covers} covers · {screenshots} games with screenshots · {descriptions} metadata descriptions"));
+                    let mut folders = super::local_artwork_folders::configured();
+                    if super::local_artwork_folders::show(ui, &mut folders) && !self.artwork.index_loading {
+                        self.refresh_artwork_index();
+                    }
+                    if ui.button("Configure artwork sources").clicked() {
+                        self.go(Route::Section(Section::SourcesProviders));
+                    }
+                    if library.games.is_empty() {
+                        ui.label("No games are available yet. Add or scan a source first.");
+                        if primary(ui, "Open Sources") {
+                            self.go(Route::Section(Section::Sources));
+                        }
+                    } else {
+                        if library.games.len() > 200 {
+                            ui.label("Showing the first 200 games here. Open any other game from Games, then choose Artwork, Manuals & Extras.");
+                        }
+                        for game in library.games.iter().take(200) {
+                            ui.push_id(game.archive.id, |ui| {
+                                egui::Frame::group(ui.style()).show(ui, |ui| {
+                                ui.horizontal(|ui| {
+                                    self.picture(ui, game, Kind::Cover, egui::vec2(72.0, 96.0));
+                                    ui.vertical(|ui| {
+                                        ui.strong(&game.title);
+                                        ui.label(&game.platform);
+                                        ui.label(self.artwork_summary(game.archive.id, game.screenscraper.is_some()));
+                                        if ui.button("View artwork, manuals & extras").clicked() {
+                                            self.go(Route::Task { section: Section::Artwork, game: game.archive.id });
+                                        }
+                                    });
+                                });
+                                });
+                            });
+                        }
+                    }
+                    return;
+                };
+                let Some(game) = library.game(game_id) else {
+                    ui.label("This game is no longer in the current library.");
+                    return;
+                };
+                ui.heading(&game.title);
+                ui.label(&game.platform);
+                ui.label("Artwork and documents shown here use the selected game's existing identity and association evidence.");
+                let workflows = self.native_workflows.get_or_insert_with(|| {
+                    super::native_workflows::NativeWorkflows::new(ui.ctx().clone())
+                });
+                let retroarch_scope = workflows.retroarch_bezel_scope();
+                let launch_request =
+                    workflows.retroarch_bezel_request(game_id, &game.archive.absolute_path);
+                if let Some((config, overlays, core)) = retroarch_scope {
+                    self.bezel.set_retroarch_scope(Some(config), Some(overlays), core);
+                }
+                self.bezel.set_launch_request(launch_request.map_err(str::to_string));
+                ui.heading("Extras");
+                self.bezel.set_game(&game.title, &game.platform);
+                egui::CollapsingHeader::new("Bezel & decorations")
+                    .id_salt(("v2_bezel_panel", game_id))
+                    .default_open(false)
+                    .show(ui, |ui| super::bezel::show(ui, &mut self.bezel));
+                ui.separator();
+                ui.horizontal_top(|ui| {
+                    self.picture(ui, game, Kind::Cover, egui::vec2(180.0, 240.0));
+                    ui.vertical(|ui| {
+                        ui.strong("Box art");
+                        if self.artwork.index.as_ref().is_some_and(|index| !index.covers.contains_key(&game_id)) {
+                            ui.label("No box art is available for this game.");
+                            if ui.button("Configure artwork sources").clicked() {
+                                self.go(Route::Section(Section::SourcesProviders));
+                            }
+                        }
+                        self.artwork_provenance(ui, game_id, game.screenscraper.as_ref());
+                        ui.strong("Metadata");
+                        if let Some(description) = self.artwork.index.as_ref().and_then(|index| index.descriptions.get(&game_id)) {
+                            ui.scope(|ui| {
+                    // Keep long descriptions at a readable line length.
+                    ui.set_max_width(ui.available_width().min(920.0));
+                    ui.label(description);
+                });
+                        } else if let Some(saved) = &game.screenscraper {
+                            ui.label(saved.values.synopsis.as_deref().unwrap_or("ScreenScraper metadata is saved for this game."));
+                        } else if !game.identified {
+                            ui.label("Identity needs review before provider metadata can be matched safely.");
+                        } else if self.artwork.index.as_ref().is_some_and(|index| !index.warnings.is_empty()) {
+                            ui.label("A metadata provider is unavailable, so this search may be incomplete. Existing local artwork remains usable.");
+                        } else {
+                            ui.label("No metadata record matched this game.");
+                        }
+                    });
+                });
+                self.documents_panel(ui, game_id, game);
+                let count = self.artwork.index.as_ref().and_then(|index| index.screenshots.get(&game_id)).map_or(0, Vec::len);
+                ui.separator();
+                ui.heading("Artwork");
+                ui.strong("Screenshots");
+                if count == 0 {
+                    ui.label(if self.artwork.index_loading { "Looking for screenshots…" } else { "No screenshot is available for this game." });
+                } else {
+                    for ordinal in 0..count {
+                        self.picture(ui, game, Kind::Screenshot(ordinal), egui::vec2(320.0, 220.0));
+                    }
+                }
+                ui.collapsing("Advanced Details", |ui| {
+                    ui.monospace(format!("Original path: {}", game.archive.absolute_path.display()));
+                    if let Some(saved) = &game.screenscraper {
+                        ui.label(format!("ScreenScraper record: {}", saved.receipt.provider_record_id));
+                        ui.label(format!("Match evidence: {}", saved.receipt.match_basis));
+                    }
+                    if let Some(index) = &self.artwork.index {
+                        if let Some(Source::Local(path)) = index.covers.get(&game_id) {
+                            ui.monospace(format!("Artwork path: {}", path.display()));
+                        }
+                        { let resolved = index.resolved_for(game);
+                            for (kind, candidate) in &resolved.artwork {
+                                ui.label(format!("{kind:?}: {} · {} · cached={}", candidate.provenance.provider.label(), candidate.path.display(), candidate.cached));
+                                ui.label(format!("Provenance: {:?}", candidate.provenance));
+                            }
+                            ui.label(format!("Retained metadata alternatives: {}", resolved.conflicts.len()));
+                        }
+                        if let Some(diagnostic) = index.diagnostic_for(game) { ui.label(diagnostic); }
+                        ui.label(format!("Cover diagnosis: {}", index.explain_cover(&game)));
+                        ui.label(format!("Provider lookup: {} ms", index.elapsed_ms));
+                        for warning in &index.warnings { ui.label(warning); }
+                    }
+                });
+                let workflows = self.native_workflows.get_or_insert_with(|| {
+                    super::native_workflows::NativeWorkflows::new(ui.ctx().clone())
+                });
+                metadata_changed = workflows.show_metadata_tools(
+                    ui,
+                    Some((game_id, &game.archive.absolute_path)),
+                    &mut self.activity,
+                );
+            });
+        if metadata_changed {
+            self.load(false);
+        }
+    }
+
+    fn artwork_summary(&self, game: i64, screenscraper: bool) -> String {
+        let Some(index) = &self.artwork.index else {
+            return "Checking providers…".into();
+        };
+        let cover = index.covers.contains_key(&game);
+        let screenshots = index.screenshots.get(&game).map_or(0, Vec::len);
+        let metadata = index.descriptions.contains_key(&game) || screenscraper;
+        format!(
+            "{} · {screenshots} screenshot(s) · {}",
+            if cover {
+                "Cover ready"
+            } else {
+                "No cover found"
+            },
+            if metadata {
+                "Metadata ready"
+            } else {
+                "No metadata match"
+            }
+        )
+    }
+
+    fn artwork_provenance(
+        &self,
+        ui: &mut egui::Ui,
+        game: i64,
+        screenscraper: Option<
+            &archivefs_core::screenscraper_enrichment::PersistedScreenScraperEnrichment,
+        >,
+    ) {
+        ui.strong("Artwork source");
+        let index = self.artwork.index.as_ref();
+        let resolved_winner =
+            index
+                .and_then(|index| index.resolved.get(&game))
+                .and_then(|resolved| {
+                    resolved
+                        .artwork
+                        .get(&archivefs_core::metadata_aggregation::AssetKind::CoverFront)
+                });
+        if let Some(candidate) = resolved_winner {
+            ui.label(format!("Using: {}", candidate.provenance.provider.label()));
+            ui.monospace(format!("Source file: {}", candidate.path.display()));
+            ui.label(format!(
+                "Provider evidence: {}",
+                candidate.provenance.detail
+            ));
+            if candidate.cached {
+                ui.label("Using a cached copy of this artwork.");
+            }
+        } else if let Some(source) = index.and_then(|index| index.covers.get(&game)) {
+            ui.label(match source {
+                Source::Local(_) => "Using local artwork".to_string(),
+                Source::Remote { .. } => "Using RomM artwork".to_string(),
+            });
+        }
+        if screenscraper.is_some() && index.is_none_or(|index| !index.covers.contains_key(&game)) {
+            ui.label("ScreenScraper metadata is saved for this game.");
+        }
+        if index.is_some_and(|index| {
+            !index.covers.contains_key(&game) && !index.descriptions.contains_key(&game)
+        }) && screenscraper.is_none()
+        {
+            ui.label("No artwork source matched this game.");
+        }
+    }
+
+    fn handoff(&mut self, ui: &mut egui::Ui, section: Section) {
+        // Launch is a native v2 workflow. Keep a stale or converted launch
+        // task from ever falling through to the deliberate legacy subprocess
+        // handoff; explicit legacy actions for every other section remain
+        // available below.
+        if let Some(route) = native_route_for_handoff(section, self.router.current.game()) {
+            self.go(route);
+            return;
+        }
+        egui::ScrollArea::vertical().id_salt(("v2_task", section)).show(ui, |ui| {
+            ui.heading("This workflow is available in the existing interface");
+            ui.label("This task opens the existing interface in a separate window. GUI v2 stays open so you can return safely.");
+            if let Some(game) = self.router.current.game().and_then(|id| self.library.game(id)) { ui.strong(format!("Selected game: {}", game.title)); }
+            let action = if section == Section::Launch { "Continue to Play" } else if section == Section::Mods { "Open this game's Mods & Cheats" } else { section.action() };
+            if primary(ui, action) { self.legacy(section); }
+            ui.label("Next: review what EmuWiz found. Opening the workflow does not approve changes or launch a game.");
+            ui.separator();
+            if ui.button("View games").clicked() { self.go(Route::Section(Section::Games)); }
+            if section == Section::Sources {
+                ui.label(format!("{} configured game folders are enabled.", self.library.sources));
+                if self.library.sources > 0 && ui.add_enabled(self.load_job.is_none(), egui::Button::new("Scan configured folders…")).clicked() { self.confirm_scan = true; }
+                ui.label("Discovery comes first. You can choose folders manually in the existing workflow if discovery cannot find them.");
+            }
+            ui.collapsing("Advanced details", |ui| {
+                ui.label("Migration status: deliberate legacy handoff. Existing safety checks, previews and confirmations remain authoritative.");
+                ui.label("Opening the separate window is an immediate handoff. Jobs started there report progress inside that window, not here.");
+                if ui.button("Open full technical interface").clicked() { self.legacy(Section::Advanced); }
+            });
+        });
+    }
+
+    fn converter(&mut self, ui: &mut egui::Ui) {
+        ui.label("Queue WUD ↔ WUX here. Disc Conversion · CUE/BIN -> CHD and the existing PSP and ZIP tools are below.");
+        if super::wiiu_disc::show_conversion_queue(ui) {
+            self.go(Route::Section(Section::History));
+        }
+        ui.separator();
+        crate::optical_conversion_page::show_optical_conversion_page(ui, &mut self.converter);
+    }
+
+    fn tape_inspector(&mut self, ui: &mut egui::Ui, game_id: Option<i64>) {
+        let selected = game_id.and_then(|id| {
+            self.library.game(id).map(|game| {
+                (
+                    game.title.as_str(),
+                    game.archive.absolute_path.as_path(),
+                    game.platform.as_str(),
+                )
+            })
+        });
+        let workflows = self
+            .native_workflows
+            .get_or_insert_with(|| super::native_workflows::NativeWorkflows::new(ui.ctx().clone()));
+        workflows.show_tape(ui, selected);
+    }
+
+    fn activities(&mut self, ui: &mut egui::Ui) {
+        ui.label("Work continues when you leave this page. No estimated completion time is shown unless it is known.");
+        if self.activity.jobs.is_empty()
+            && empty_state(
+                ui,
+                &mut self.imagery,
+                EmptyArt::Mascot,
+                "Nothing is running yet",
+                "Scans, checks and picture loading appear here while they work, with their result afterwards. Browse your games to get started.",
+                Some("Browse my games"),
+            )
+        {
+            self.go(Route::Section(Section::Games));
+        }
+        let mut destination = None;
+        if self.activity_attention_only {
+            let needing = self.activity.failed();
+            ui.horizontal(|ui| {
+                ui.strong(if needing == 0 {
+                    "No jobs need attention".to_string()
+                } else {
+                    format!(
+                        "Showing {needing} {} that need attention",
+                        if needing == 1 { "job" } else { "jobs" }
+                    )
+                });
+                if ui.button("Show all activity").clicked() {
+                    self.activity_attention_only = false;
+                }
+            });
+        }
+        let attention_only = self.activity_attention_only;
+        egui::ScrollArea::vertical()
+            .id_salt("v2_jobs")
+            .show(ui, |ui| {
+                for (id, job) in super::activity::visible_jobs(&self.activity, attention_only) {
+                    ui.push_id(id, |ui| {
+                        egui::Frame::group(ui.style()).show(ui, |ui| {
+                            ui.set_min_width(ui.available_width());
+                            let card = super::job_card::show(ui, job, false);
+                            if card.cancel {
+                                job.request_cancel();
+                            }
+                            if !job.active()
+                                && primary(
+                                    ui,
+                                    if job.phase == Phase::Failed {
+                                        "Return to task / retry"
+                                    } else {
+                                        "View result"
+                                    },
+                                )
+                            {
+                                destination = Some(job.result.clone());
+                            }
+                            ui.collapsing("Technical details", |ui| {
+                                ui.label(&job.technical);
+                            });
+                        });
+                    });
+                }
+            });
+        if let Some(route) = destination {
+            self.go(route);
+        }
+    }
+
+    fn settings(&mut self, ui: &mut egui::Ui) {
+        self.simple_shell_settings(ui);
+        super::update_check::show(ui, &mut self.update_check);
+        ui.horizontal_wrapped(|ui| {
+            ui.label("Your library:");
+            if crate::ui::components::action_button(
+                ui,
+                "Platform aliases",
+                crate::ui::components::ActionStyle::Secondary,
+                true,
+            )
+            .clicked()
+            {
+                self.go(Route::Tool(super::routes::ToolPage::PlatformAliases));
+            }
+            if crate::ui::components::action_button(
+                ui,
+                "Database status",
+                crate::ui::components::ActionStyle::Secondary,
+                true,
+            )
+            .clicked()
+            {
+                self.go(Route::Tool(super::routes::ToolPage::DatabaseStatus));
+            }
+        });
+        self.setup_portability.render(ui);
+        ui.label("Readable text and a permanent sidebar are on by default. The library view and current location are remembered separately from the legacy interface.");
+        ui.separator();
+        ui.label(theme::card_title("Beginner guidance"));
+        ui.label("These hints explain EmuWiz terms and suggest next steps. They never remove controls or advanced routes.");
+        if ui
+            .checkbox(&mut self.beginner_hints_enabled, "Show beginner hints")
+            .changed()
+        {
+            self.preferences_dirty = Some(std::time::Instant::now());
+        }
+        ui.collapsing("What is this?", |ui| {
+            ui.label("DAT — a versioned release catalogue used as identity evidence.");
+            ui.label("BIOS / firmware — system software an emulator may require.");
+            ui.label("Provenance — where a fact came from and when it was observed.");
+            ui.label("Verified evidence comes from matching local checks; external evidence comes from a provider and cannot silently override stronger local identity.");
+            ui.label("MAME preservation keeps original set relationships; a playing library is a reviewed frontend-oriented projection.");
+        });
+        ui.label("Advanced tools remain available in the sidebar and through Advanced Details, even when hints are disabled.");
+        ui.separator();
+        ui.label(theme::card_title("Local manuals and guides"));
+        ui.label("EmuWiz checks each game's folder and these optional folders for documents. It never searches the whole filesystem.");
+        if ui.button("Add documentation root").clicked()
+            && let Some(root) = rfd::FileDialog::new().pick_folder()
+            && !self.document_preferences.roots.contains(&root)
+        {
+            self.document_preferences.roots.push(root);
+            self.document_preferences.roots.sort();
+            self.document_cache = None;
+            self.preferences_dirty = Some(std::time::Instant::now());
+        }
+        let mut remove_root = None;
+        for (index, root) in self.document_preferences.roots.iter().enumerate() {
+            ui.horizontal(|ui| {
+                ui.label(root.display().to_string());
+                if ui.small_button("Remove").clicked() {
+                    remove_root = Some(index);
+                }
+            });
+        }
+        if let Some(index) = remove_root {
+            self.document_preferences.roots.remove(index);
+            self.document_cache = None;
+            self.preferences_dirty = Some(std::time::Instant::now());
+        }
+        ui.label("PDF and CBZ open in your desktop viewer. CBR is recognised but requires an installed viewer that EmuWiz cannot verify.");
+        if primary(ui, "Return Home") {
+            self.go(Route::Home);
+        }
+        ui.label("Next: choose a task. All existing application settings remain available below.");
+        ui.collapsing("Advanced details", |ui| {
+            ui.label(format!(
+                "Library load: {} ms · {} games",
+                self.library.load_ms,
+                self.library.games.len()
+            ));
+            if let Some(index) = &self.artwork.index {
+                ui.label(format!(
+                    "Artwork lookup index: {} ms · {} covers",
+                    index.elapsed_ms,
+                    index.covers.len()
+                ));
+                for warning in &index.warnings {
+                    ui.label(warning);
+                }
+            }
+            ui.label(format!(
+                "Artwork workers: {} local + {} remote. Timing details are on each game.",
+                super::artwork::LOCAL_WORKERS,
+                super::artwork::REMOTE_WORKERS
+            ));
+            if ui.button("Open existing application settings").clicked() {
+                self.legacy(Section::Settings);
+            }
+        });
+    }
+}
+
+pub(super) fn native_route_for_handoff(section: Section, game: Option<i64>) -> Option<Route> {
+    (section == Section::Launch).then(|| {
+        game.map_or(Route::Section(Section::Games), |game| Route::Task {
+            section: Section::Launch,
+            game,
+        })
+    })
+}
+
+pub(super) fn duplicate_readiness_label(
+    readiness: &archivefs_core::repair::GroupQuarantineReadiness,
+) -> &'static str {
+    use archivefs_core::repair::GroupQuarantineReadiness;
+
+    match readiness {
+        GroupQuarantineReadiness::Safe => "Exact duplicate · safe to preview",
+        GroupQuarantineReadiness::NeedsReview(_) => "Review needed · no automatic action",
+        GroupQuarantineReadiness::Blocked(_) => "Blocked from automatic action",
+    }
+}
+
+/// Button label for the RomM sample preview, from the real sample size.
+pub(super) fn romm_preview_button_label(games: usize) -> String {
+    format!("Preview import (first {games} games)")
+}
+
+/// A short, friendly hint for telling same-title games apart. Prefers a file
+/// name that says more than the title; otherwise names the *source* the copy
+/// lives in (the last two folders of its scan root), which is what actually
+/// differs between duplicates of one file. Never a full path.
+fn disambiguating_hint(
+    title: &str,
+    relative_path: &std::path::Path,
+    absolute_path: &std::path::Path,
+) -> Option<String> {
+    let name = relative_path.file_name()?.to_string_lossy().into_owned();
+    let stem = relative_path
+        .file_stem()
+        .map(|stem| stem.to_string_lossy().into_owned())
+        .unwrap_or_default();
+    if !stem.eq_ignore_ascii_case(title.trim()) {
+        return Some(format!("File: {name}"));
+    }
+    let root = absolute_path
+        .to_string_lossy()
+        .strip_suffix(relative_path.to_string_lossy().as_ref())
+        .map(|root| std::path::PathBuf::from(root.trim_end_matches('/')));
+    if let Some(root) = root {
+        let names: Vec<_> = root
+            .components()
+            .filter_map(|part| match part {
+                std::path::Component::Normal(name) => Some(name.to_string_lossy().into_owned()),
+                _ => None,
+            })
+            .collect();
+        if !names.is_empty() {
+            let tail = &names[names.len().saturating_sub(2)..];
+            return Some(format!("Source: {}", tail.join("/")));
+        }
+    }
+    let folder = relative_path
+        .parent()?
+        .file_name()?
+        .to_string_lossy()
+        .into_owned();
+    (!folder.is_empty()).then(|| format!("Folder: {folder}"))
+}
+
+#[cfg(test)]
+mod disambiguation_tests {
+    use super::disambiguating_hint;
+    use std::path::Path;
+
+    #[test]
+    fn a_file_name_that_only_repeats_the_title_and_has_no_source_adds_nothing() {
+        assert_eq!(
+            disambiguating_hint(
+                "Example Game",
+                Path::new("Example Game.iso"),
+                Path::new("Example Game.iso")
+            ),
+            None
+        );
+    }
+
+    #[test]
+    fn a_differing_file_name_is_shown() {
+        assert_eq!(
+            disambiguating_hint(
+                "Sonic",
+                Path::new("megadrive/Sonic (Rev A).zip"),
+                Path::new("/mnt/games/roms/megadrive/Sonic (Rev A).zip")
+            ),
+            Some("File: Sonic (Rev A).zip".into())
+        );
+    }
+
+    #[test]
+    fn identical_copies_in_two_sources_are_told_apart_by_their_source() {
+        let relative = Path::new("snes/'89 Dennou Kyuusei Uranai (Japan).zip");
+        let first = disambiguating_hint(
+            "'89 Dennou Kyuusei Uranai (Japan)",
+            relative,
+            Path::new("/mnt/games/roms/snes/'89 Dennou Kyuusei Uranai (Japan).zip"),
+        );
+        let second = disambiguating_hint(
+            "'89 Dennou Kyuusei Uranai (Japan)",
+            relative,
+            Path::new("/mnt/usbdrive/games/snes/'89 Dennou Kyuusei Uranai (Japan).zip"),
+        );
+        assert_eq!(first.as_deref(), Some("Source: games/roms"));
+        assert_eq!(second.as_deref(), Some("Source: usbdrive/games"));
+        assert_ne!(first, second);
+    }
+}
+
+/// What one Escape press means, most specific first: an open confirmation,
+/// then an open menu, then a focused text field, and only then Back.
+#[derive(Debug, PartialEq, Eq)]
+pub(super) enum EscapeAction {
+    CloseModal,
+    PopupHandles,
+    KeepDialogOpen,
+    LeaveFocus,
+    Back,
+}
+
+pub(super) fn escape_action(
+    modal_open: bool,
+    popup_open: bool,
+    other_window_open: bool,
+    typing: bool,
+) -> EscapeAction {
+    if modal_open {
+        EscapeAction::CloseModal
+    } else if popup_open {
+        EscapeAction::PopupHandles
+    } else if other_window_open {
+        EscapeAction::KeepDialogOpen
+    } else if typing {
+        EscapeAction::LeaveFocus
+    } else {
+        EscapeAction::Back
+    }
+}

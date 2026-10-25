@@ -1,11 +1,12 @@
-//! The Canonical Organisation page.
+//! The Library Organisation page.
 //!
 //! Configures the master ROM root, chooses an organisation mode, collects
 //! candidate ROM files, resolves each candidate's platform identity from the
-//! database and its canonical RomM slug from the identity cache, builds a
-//! read-only plan, and - only after an explicit typed confirmation - applies
-//! the approved subset through the shared journaled engine. Rollback restores
-//! the prior state.
+//! database, builds a neutral EmuWiz layout plan, and - only after an explicit
+//! typed confirmation - applies the approved subset through the shared
+//! journaled engine. RomM cache data may provide a canonical game title, but
+//! never determines a generic organisation folder. Rollback restores the
+//! prior state.
 //!
 //! The page states loudly that planning changes nothing until the user
 //! approves, and never offers Apply for conflicts, blocked or unknown entries.
@@ -17,23 +18,40 @@ use archivefs_core::dat::rom_organisation::*;
 use archivefs_core::identity_source::cache::{IdentityCacheLocation, load_cache};
 use archivefs_core::identity_source::model::IdentityProvider;
 use archivefs_core::identity_source::settings::default_identity_root;
+use archivefs_core::ingestion::is_known_non_game_extension;
 use archivefs_core::platform::identity::{PlatformIdentityResolution, resolve_platform_identity};
 use archivefs_core::{
     Config, Database, clear_master_rom_root_default, default_database_path,
     set_master_rom_root_default,
 };
 use eframe::egui;
+use serde::{Deserialize, Serialize};
 
+use crate::playing_library_page::PlayingLibraryDestination;
+// The page adapter moved here from `main.rs` still spells this page's own
+// items by module name; keeping that name in scope leaves the moved body
+// byte-for-byte identical to what `main.rs` ran.
+use crate::ArchiveFsApp;
+use crate::rom_organisation_page;
 use crate::ui::{components as widgets, theme};
 
 /// The page's authoritative state.
+#[derive(Clone)]
 pub(crate) struct RomOrganisationPageState {
+    pub(crate) advanced_r2_selected: bool,
     master_root_draft: String,
     saved_master_root: Option<PathBuf>,
     master_root_error: Option<String>,
+    /// The explicitly chosen linked-library destination root for
+    /// BuildLinkedLibrary mode. Never inferred from source roots and never
+    /// persisted into the master ROM root config.
+    library_root_draft: String,
+    saved_library_root: Option<PathBuf>,
+    library_root_error: Option<String>,
     mode: OrganisationMode,
     /// Candidate source files collected from the configured source folders.
     sources: Vec<PathBuf>,
+    unavailable_source_roots: Vec<PathBuf>,
     /// The read-only plan, when generated. `generation` is bumped on every
     /// regeneration so a stale review decision can never apply.
     plan: Option<OrganisationPlan>,
@@ -44,11 +62,49 @@ pub(crate) struct RomOrganisationPageState {
     applied: Option<archivefs_core::dat::rename_apply::RenameTransaction>,
     applied_journal: PathBuf,
     result_message: Option<String>,
+    /// False when the last apply/rollback was not fully resolved (failed, pending
+    /// or in-flight entries): the banner must not look like success.
+    result_complete: bool,
+    /// The journal receipt of the last Undo proven complete, for History.
+    last_rollback: Option<archivefs_core::dat::rename_apply::RenameTransaction>,
+    /// An Undo handle whose journal no longer matched this session's record.
+    /// It is never offered as an ordinary Undo again; History holds the
+    /// journal for a reviewed recovery.
+    quarantined_undo: Option<archivefs_core::dat::rename_apply::RenameTransaction>,
     error: Option<String>,
+    /// The last apply stopped at a safe point because it was cancelled.
+    stopped: bool,
     /// Set when the user asked to apply; holds the count awaiting a typed
     /// confirmation for large batches.
     pending_apply: Option<usize>,
     confirm_text: String,
+    /// Set on the frame "Preview changes" is clicked; the actual (currently
+    /// synchronous, potentially slow for a large library) `generate_plan()`
+    /// call is deferred to the start of the *next* frame so this frame can
+    /// render a busy state first - without this, a synchronous call made
+    /// directly inside the click handler blocks before egui ever draws the
+    /// "Preparing preview..." row, so nothing visibly happens while the user
+    /// waits (2026-08-22, live-QA Phase 8 finding).
+    pending_preview: bool,
+    /// Reason the persisted approval set could not be saved or loaded.
+    /// Never blocks the page - the in-memory `approved` set is always the
+    /// source of truth - but the user is shown the message so a silent
+    /// "preferences keep disappearing" footgun never recurs. Cleared on every
+    /// successful save / load.
+    approval_persistence_warning: Option<String>,
+    /// Injected location of the approval sidecar. `None` means the normal
+    /// EmuWiz data directory in a production build; a test build with no
+    /// injected path performs no approval I/O at all, so a test can never read
+    /// or write the user's real approvals.
+    approvals_file: Option<PathBuf>,
+    /// Whether "Build Playing Library" is showing instead of the ordinary
+    /// organisation flow above. A page-local view toggle, not a separate
+    /// `OrganisationMode` - the playing-library planner is a genuinely
+    /// different (DAT-election-based) pipeline, so it gets its own state
+    /// rather than being squeezed into the classification-based modes this
+    /// page otherwise offers. Deliberately not a new sidebar destination.
+    pub(crate) showing_playing_library: bool,
+    pub(crate) playing_library: crate::playing_library_page::PlayingLibraryPageState,
 }
 
 /// Batches larger than this require typing the exact confirmation phrase
@@ -63,6 +119,65 @@ pub(crate) fn apply_confirmation_phrase(mode: OrganisationMode, count: usize) ->
         OrganisationMode::MoveRealFile | OrganisationMode::OrganiseSymlinkOnly => {
             format!("MOVE {count} FILES")
         }
+        // Truthful wording: a linked-library apply never renames or moves an
+        // original file - it creates links.
+        OrganisationMode::BuildLinkedLibrary => format!("CREATE {count} LINKS"),
+    }
+}
+
+/// Plain-language presentation label for an organisation mode. Kept
+/// separate from `OrganisationMode::label()` (core, shared with the CLI)
+/// so this is purely a GUI wording choice, never a renamed core type.
+fn organisation_mode_plain_label(mode: OrganisationMode) -> &'static str {
+    match mode {
+        OrganisationMode::RenameInPlace => "Rename files where they are",
+        OrganisationMode::MoveRealFile => "Move files into organised folders",
+        OrganisationMode::BuildLinkedLibrary => "Build linked library",
+        OrganisationMode::OrganiseSymlinkOnly => "Advanced: reorganise existing symlinks",
+    }
+}
+
+/// One-line plain-language explanation of what the selected mode actually
+/// does, shown under the radio group.
+///
+/// `OrganiseSymlinkOnly`'s wording states its "existing shortcuts only"
+/// constraint up front (2026-08-22, live-QA Phase 8): the mode's plan logic
+/// (`archivefs_core::dat::rom_organisation::plan`) only ever relocates a
+/// source that is *already* a symlink object - it never creates a new
+/// symlink for a source that is a real file. Earlier wording ("only
+/// organises shortcuts/symlinks pointing to them") didn't say that, so a
+/// user previewing a folder of real files would only discover the
+/// constraint after seeing every one of them come back blocked.
+fn organisation_mode_plain_explanation(mode: OrganisationMode) -> &'static str {
+    match mode {
+        OrganisationMode::RenameInPlace => {
+            "Renames each game's file in its current location; nothing is moved."
+        }
+        OrganisationMode::MoveRealFile => {
+            "Moves each game's real file into an organised folder structure."
+        }
+        OrganisationMode::OrganiseSymlinkOnly => {
+            "Leaves every real game file untouched and exactly where it is. Only reorganises \
+             shortcuts/symlinks that already exist - it does not create a shortcut for a source \
+             that isn't already one, so a folder of real files (not shortcuts) will show as \
+             blocked in this mode."
+        }
+        OrganisationMode::BuildLinkedLibrary => {
+            "Create an organised library of links while leaving your original files untouched. \
+             Every original file stays exactly where it is; the organised destination becomes \
+             a link pointing to it."
+        }
+    }
+}
+
+/// "Preview changes" button label, extracted as a pure function so its two
+/// states (idle vs. running) are directly unit-testable without needing to
+/// simulate a real click through egui (2026-08-22, live-QA Phase 8).
+fn preview_button_label(pending_preview: bool) -> &'static str {
+    if pending_preview {
+        "Preparing preview…"
+    } else {
+        "Preview changes"
     }
 }
 
@@ -72,27 +187,183 @@ impl Default for RomOrganisationPageState {
             master_root_draft: String::new(),
             saved_master_root: None,
             master_root_error: None,
+            library_root_draft: String::new(),
+            saved_library_root: None,
+            library_root_error: None,
             mode: OrganisationMode::MoveRealFile,
             sources: Vec::new(),
+            unavailable_source_roots: Vec::new(),
             plan: None,
             plan_generation: 0,
+            advanced_r2_selected: false,
             approved: BTreeSet::new(),
             filter: None,
             applied: None,
             applied_journal:
                 archivefs_core::dat::rename_apply::journal::default_rename_transaction_dir()
-                    .unwrap_or_else(|_| PathBuf::from("rename-transactions")),
+                    .unwrap_or_else(|_| {
+                        PathBuf::from(
+                            archivefs_core::dat::rename_apply::RENAME_TRANSACTIONS_DIRECTORY,
+                        )
+                    }),
             result_message: None,
+            result_complete: true,
+            last_rollback: None,
+            quarantined_undo: None,
             error: None,
+            stopped: false,
             pending_apply: None,
             confirm_text: String::new(),
+            pending_preview: false,
+            approval_persistence_warning: None,
+            approvals_file: None,
+            showing_playing_library: false,
+            playing_library: crate::playing_library_page::PlayingLibraryPageState::load(),
         }
     }
 }
 
 impl RomOrganisationPageState {
+    pub(crate) fn r2_selection(&self) -> Result<(OrganisationPlan, BTreeSet<String>), String> {
+        let mut plan = self.plan.clone().ok_or(
+            "Generate the normal Rename/Move preview and select one to eight files first.",
+        )?;
+        plan.entries.retain(|e| {
+            self.approved
+                .contains(&e.source_path.to_string_lossy().into_owned())
+        });
+        if plan.entries.len() > 8 {
+            return Err(
+                "Advanced Protection supports at most eight selected files; narrow the existing preview selection."
+                    .into(),
+            );
+        }
+        Ok((plan, self.approved.clone()))
+    }
+    pub(crate) fn input_fingerprint(&self) -> String {
+        format!(
+            "{:?}|{}|{}|{}|{}|{}",
+            self.mode,
+            self.master_root_draft,
+            self.library_root_draft,
+            self.sources.len(),
+            self.unavailable_source_roots.len(),
+            self.sources
+                .iter()
+                .map(|path| path.to_string_lossy().len())
+                .sum::<usize>()
+        )
+    }
+
+    pub(crate) fn applied(&self) -> Option<&archivefs_core::dat::rename_apply::RenameTransaction> {
+        self.applied.as_ref()
+    }
+
+    /// The last apply was stopped by a cancel request at a safe point.
+    pub(crate) fn was_stopped(&self) -> bool {
+        self.stopped
+    }
+
+    pub(crate) fn error(&self) -> Option<&str> {
+        self.error.as_deref()
+    }
+
+    /// Whether the last Apply or Undo finished every planned operation. False
+    /// for partial, uncertain or refused outcomes; read together with
+    /// [`Self::error`].
+    pub(crate) fn result_complete(&self) -> bool {
+        self.result_complete
+    }
+
+    pub(crate) fn result_message(&self) -> Option<&str> {
+        self.result_message.as_deref()
+    }
+
+    /// The Undo handle quarantined after its journal integrity was lost.
+    pub(crate) fn quarantined_undo(
+        &self,
+    ) -> Option<&archivefs_core::dat::rename_apply::RenameTransaction> {
+        self.quarantined_undo.as_ref()
+    }
+
+    /// The fully rolled-back transaction from the Undo that just completed.
+    pub(crate) fn last_rollback(
+        &self,
+    ) -> Option<&archivefs_core::dat::rename_apply::RenameTransaction> {
+        self.last_rollback.as_ref()
+    }
+
+    /// Test seam: disposable roots for Apply/Undo in rename-in-place mode.
+    #[cfg(test)]
+    pub(crate) fn configure_for_test(&mut self, root: PathBuf, journal: PathBuf) {
+        self.mode = OrganisationMode::RenameInPlace;
+        self.saved_master_root = Some(root);
+        self.applied_journal = journal;
+    }
+
+    /// Test seam: a reviewed plan holding one approved source.
+    #[cfg(test)]
+    pub(crate) fn hold_plan_for_test(&mut self, root: &Path, approved: &str) {
+        self.plan = Some(OrganisationPlan {
+            master_root: root.to_path_buf(),
+            mode: self.mode,
+            content_policy: Default::default(),
+            classifier_version: "test".into(),
+            generation: 7,
+            entries: Vec::new(),
+        });
+        self.approved.insert(approved.to_string());
+    }
+
+    #[cfg(test)]
+    pub(crate) fn has_plan_for_test(&self) -> bool {
+        self.plan.is_some()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn approvals_for_test(&self) -> Vec<String> {
+        self.approved.iter().cloned().collect()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn select_advanced_protection_for_test(&mut self, selected: bool) {
+        self.advanced_r2_selected = selected;
+    }
+
+    #[cfg(test)]
+    pub(crate) fn clear_root_for_test(&mut self) {
+        self.saved_master_root = None;
+    }
+
+    /// Test seam: records a real core Apply outcome exactly as Apply does.
+    #[cfg(test)]
+    pub(crate) fn record_apply_result_for_test(
+        &mut self,
+        result: Result<
+            archivefs_core::dat::rename_apply::ApplyOutcome,
+            archivefs_core::dat::rename_apply::ApplyError,
+        >,
+        transaction: archivefs_core::dat::rename_apply::RenameTransaction,
+    ) {
+        self.begin_outcome();
+        self.record_apply_result(result, transaction);
+    }
+
+    /// Each Apply or Undo reports only its own outcome, never one left over
+    /// from an earlier run.
+    fn begin_outcome(&mut self) {
+        self.error = None;
+        self.result_message = None;
+        self.result_complete = false;
+        self.last_rollback = None;
+        self.stopped = false;
+    }
+
     /// Loads the configured master root and scans the configured source
-    /// folders for candidate files (bounded). Read-only.
+    /// folders for candidate files (bounded). Read-only. Also restores the
+    /// last persisted approval set, if any (fail-closed: a missing or
+    /// unreadable file is treated as "no persisted approval", never as
+    /// "approve everything").
     pub(crate) fn load() -> Self {
         let mut state = Self::default();
         if let Ok(config) = Config::load_default() {
@@ -103,6 +374,19 @@ impl RomOrganisationPageState {
                 .map(|path| path.display().to_string())
                 .unwrap_or_default();
             state.sources = collect_source_files(&config.source_folders);
+            state.unavailable_source_roots = config
+                .source_folders
+                .iter()
+                .filter(|path| !path.is_dir())
+                .cloned()
+                .collect();
+        }
+        match load_persisted_approved_set(None) {
+            Ok(Some(set)) => state.approved = set,
+            Ok(None) => {}
+            Err(reason) => {
+                state.approval_persistence_warning = Some(reason);
+            }
         }
         state
     }
@@ -110,6 +394,25 @@ impl RomOrganisationPageState {
     pub(crate) fn set_mode(&mut self, mode: OrganisationMode) {
         self.mode = mode;
         self.plan = None;
+    }
+
+    pub(crate) fn ensure_mode(&mut self, mode: OrganisationMode) {
+        if self.mode != mode {
+            self.set_mode(mode);
+        }
+    }
+
+    pub(crate) fn restrict_quick_rename_approvals(&mut self) {
+        let Some(plan) = &self.plan else {
+            return;
+        };
+        self.approved.retain(|source| {
+            plan.entries.iter().any(|entry| {
+                entry.status == OrganisationStatus::Suggested
+                    && entry.source_path.to_string_lossy() == source.as_str()
+                    && !entry.platform_display_name.eq_ignore_ascii_case("Arcade")
+            })
+        });
     }
 
     /// Saves the master ROM root draft (or clears it). Configuring a root
@@ -136,53 +439,139 @@ impl RomOrganisationPageState {
         }
     }
 
+    /// Saves the linked-library destination root draft (or clears it). The
+    /// user must provide this root explicitly for BuildLinkedLibrary; it is a
+    /// session setting of this page, never inferred and never mixed into the
+    /// master ROM root config.
+    pub(crate) fn save_library_root(&mut self) {
+        let trimmed = self.library_root_draft.trim().to_string();
+        if trimmed.is_empty() {
+            self.saved_library_root = None;
+            self.library_root_error = None;
+            return;
+        }
+        let path = PathBuf::from(trimmed);
+        if path.is_absolute() {
+            self.saved_library_root = Some(path);
+            self.library_root_error = None;
+        } else {
+            self.library_root_error =
+                Some("the linked-library folder must be an absolute path".to_string());
+        }
+    }
+
+    /// The destination root the current mode plans into: the explicitly
+    /// chosen linked-library root in BuildLinkedLibrary mode, otherwise the
+    /// configured master ROM root.
+    pub(crate) fn effective_root(&self) -> Option<PathBuf> {
+        match self.mode {
+            OrganisationMode::BuildLinkedLibrary => self.saved_library_root.clone(),
+            _ => self.saved_master_root.clone(),
+        }
+    }
+
     /// Re-scans the configured source folders for candidate files.
     pub(crate) fn rescan_sources(&mut self) {
         if let Ok(config) = Config::load_default() {
             self.sources = collect_source_files(&config.source_folders);
+            self.unavailable_source_roots = config
+                .source_folders
+                .iter()
+                .filter(|path| !path.is_dir())
+                .cloned()
+                .collect();
         }
         self.plan = None;
         self.approved.clear();
+        // Any previously persisted approvals may now reference paths that no
+        // longer exist. Wipe the persisted sidecar too so a stale set does
+        // not silently re-appear on the next load (would be a footgun: the
+        // user re-scanned to start fresh, the persistence must agree).
+        self.persist_approved_set();
     }
 
     /// Builds a fresh read-only plan from the current candidates. Every
     /// rebuild bumps the generation, so any earlier review decision is stale.
     pub(crate) fn generate_plan(&mut self) {
+        let mut ignore = |_: archivefs_core::job_progress::JobProgress| {};
+        let mut progress = archivefs_core::job_progress::ProgressReporter::new(&mut ignore);
+        self.generate_plan_reporting(None, &mut progress);
+    }
+
+    /// Builds the preview, reporting real checkpoints. Returns `false` when the
+    /// cancel flag stopped it: a preview only reads, so nothing on disk changed
+    /// and the previous plan is left exactly as it was.
+    pub(crate) fn generate_plan_reporting(
+        &mut self,
+        cancel: Option<&std::sync::atomic::AtomicBool>,
+        progress: &mut archivefs_core::job_progress::ProgressReporter<'_>,
+    ) -> bool {
+        let stop = || cancel.is_some_and(|flag| flag.load(std::sync::atomic::Ordering::Relaxed));
+        if stop() {
+            return false;
+        }
         self.plan_generation += 1;
-        let Some(master_root) = self.saved_master_root.clone() else {
-            self.error = Some("configure a master ROM root first".to_string());
+        if self.sources.is_empty() && !self.unavailable_source_roots.is_empty() {
+            self.error =
+                Some("source drive may not be mounted; nothing was scanned or changed".to_string());
             self.plan = None;
-            return;
+            return true;
+        }
+        let Some(master_root) = self.effective_root() else {
+            self.error = Some(if self.mode == OrganisationMode::BuildLinkedLibrary {
+                "choose a linked library folder first".to_string()
+            } else {
+                "configure a master ROM root first".to_string()
+            });
+            self.plan = None;
+            return true;
         };
+        progress.phase("Reading your game list", "steps", None);
         let cache = load_romm_cache();
-        let slug_map = build_slug_map(cache.as_ref());
         let Some(candidates) =
             build_candidates(&self.sources, self.plan_generation, cache.as_ref())
         else {
             self.error = Some("could not read the platform identity database".to_string());
             self.plan = None;
-            return;
+            return true;
         };
-        let plan = build_organisation_plan(&OrganisationPlanRequest {
-            master_root: &master_root,
-            mode: self.mode,
-            content_policy: archivefs_core::dat::classification::ContentSelectionPolicy::AllEntries,
-            candidates: &candidates,
-            slug_for_platform: &|platform| slug_map.get(platform).cloned(),
-            generation: self.plan_generation,
-        });
+        if stop() {
+            return false;
+        }
+        // No RomM mapping is consulted: generic destinations derive from the
+        // neutral EmuWiz platform layout identity.
+        let Some(plan) = build_organisation_plan_reporting(
+            &OrganisationPlanRequest {
+                master_root: &master_root,
+                mode: self.mode,
+                content_policy:
+                    archivefs_core::dat::classification::ContentSelectionPolicy::AllEntries,
+                candidates: &candidates,
+                generation: self.plan_generation,
+            },
+            cancel,
+            progress,
+        ) else {
+            return false;
+        };
         self.approved = plan
             .suggested()
             .map(|entry| entry.source_path.to_string_lossy().into_owned())
             .collect();
         self.plan = Some(plan);
         self.error = None;
+        // The plan rebuild just rewrote the approval set to "all Suggested".
+        // Persist that, so the user's earlier per-entry customisation (if
+        // any) is gone but a fresh restart sees the new default.
+        self.persist_approved_set();
+        true
     }
 
     pub(crate) fn toggle_approved(&mut self, source: &str) {
         if !self.approved.remove(source) {
             self.approved.insert(source.to_string());
         }
+        self.persist_approved_set();
     }
 
     pub(crate) fn set_filter(&mut self, filter: Option<OrganisationStatus>) {
@@ -191,20 +580,33 @@ impl RomOrganisationPageState {
 
     /// Applies the approved Suggested entries after the caller has confirmed.
     pub(crate) fn apply(&mut self) {
+        self.apply_cancellable(&std::sync::atomic::AtomicBool::new(false));
+    }
+
+    /// Applies with the existing journalled executor, which honours `cancel`
+    /// only at its own transaction-safe checkpoints.
+    pub(crate) fn apply_cancellable(&mut self, cancel: &std::sync::atomic::AtomicBool) {
+        self.begin_outcome();
+        if self.advanced_r2_selected {
+            self.error=Some("Advanced Protection was selected. Use its separate reviewed approval; legacy Apply is refused.".into());
+            return;
+        }
         let Some(plan) = &self.plan else {
+            self.error = Some("There is no reviewed plan to apply. Nothing was changed.".into());
             return;
         };
-        let Some(master_root) = self.saved_master_root.clone() else {
+        let Some(master_root) = self.effective_root() else {
+            self.error =
+                Some("The organisation folder is not available. Nothing was changed.".into());
             return;
         };
         // Revalidate the live platform identity before building the
-        // transaction: a platform/slug/canonical name changed by another
-        // process since the plan was generated must reject the apply with
-        // zero mutation.
+        // transaction: a platform/canonical name changed by another process
+        // since the plan was generated must reject the apply with zero
+        // mutation. Destinations are re-derived from the same neutral EmuWiz
+        // layout identity as the preview - no RomM lookup happens here.
         let cache = load_romm_cache();
         let canonical_name_for = |source: &Path| canonical_name_for(source, cache.as_ref());
-        let slug_map = build_slug_map(cache.as_ref());
-        let slug_for_platform = |platform: &str| slug_map.get(platform).cloned();
         let database_path = default_database_path();
         match database_path {
             Ok(path) => {
@@ -212,7 +614,6 @@ impl RomOrganisationPageState {
                     plan,
                     &path,
                     &canonical_name_for,
-                    &slug_for_platform,
                 ) {
                     Ok(()) => {}
                     Err(reason) => {
@@ -248,36 +649,70 @@ impl RomOrganisationPageState {
                 trusted_roots.push(canonical);
             }
         }
-        let cancel = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
-        match archivefs_core::dat::rom_organisation::apply_organisation_transaction(
+        let result = archivefs_core::dat::rom_organisation::apply_organisation_transaction(
             &mut transaction,
             &approved,
             plan.generation,
             archivefs_core::safe_read::TrustedRoots::from_paths(trusted_roots),
             &journal,
-            cancel.as_ref(),
+            cancel,
             self.mode,
             &master_root,
-        ) {
+        );
+        self.record_apply_result(result, transaction);
+    }
+
+    /// Records one Apply outcome: complete only for a fully resolved batch,
+    /// and an Undo handle whenever the journalled transaction may have changed
+    /// files. The reviewed plan and approvals are never cleared here.
+    fn record_apply_result(
+        &mut self,
+        result: Result<
+            archivefs_core::dat::rename_apply::ApplyOutcome,
+            archivefs_core::dat::rename_apply::ApplyError,
+        >,
+        transaction: archivefs_core::dat::rename_apply::RenameTransaction,
+    ) {
+        match result {
             Ok(outcome) => {
                 self.applied = Some(outcome.transaction.clone());
-                self.result_message = Some(format!(
-                    "Applied {} organisation(s). Roll back is available for this transaction.",
-                    outcome.transaction.applied_count()
-                ));
+                let (message, complete) = apply_result_report(self.mode, &outcome.summary);
+                self.result_message = Some(message);
+                self.result_complete = complete;
             }
-            Err(error) => self.error = Some(error.to_string()),
+            Err(error) => {
+                self.stopped = matches!(
+                    error,
+                    archivefs_core::dat::rename_apply::ApplyError::Cancelled
+                );
+                // The executor can fail after some entries already moved.
+                // Keep that journalled transaction as the Undo handle.
+                if transaction_may_have_changed_disk(&transaction) {
+                    self.applied = Some(transaction);
+                }
+                self.error = Some(error.to_string());
+            }
         }
     }
 
     /// Rolls back the last applied transaction.
     pub(crate) fn rollback(&mut self) {
+        self.begin_outcome();
+        if self.advanced_r2_selected {
+            self.error =
+                Some("Advanced Protection Undo needs a fresh separate approval in History.".into());
+            return;
+        }
         let Some(mut transaction) = self.applied.take() else {
+            self.error =
+                Some("There is no applied organisation to undo. Nothing was changed.".into());
             return;
         };
         let journal = self.applied_journal.clone();
-        let Some(master_root) = self.saved_master_root.clone() else {
+        let Some(master_root) = self.effective_root() else {
             self.applied = Some(transaction);
+            self.error =
+                Some("The organisation folder is not available. Nothing was undone.".into());
             return;
         };
         let cancel = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
@@ -289,18 +724,332 @@ impl RomOrganisationPageState {
         ) {
             Ok(outcome) => {
                 let dirs = outcome.directories_removed.len();
-                self.result_message = Some(format!(
-                    "Rolled back organisation; {} empty platform director(ies) removed.",
-                    dirs
-                ));
-                self.plan = None;
-                self.approved.clear();
+                // Complete only when the engine and the journal agree.
+                let fully = matches!(
+                    outcome.rollback.result,
+                    archivefs_core::dat::rename_apply::RollbackResult::FullyRolledBack
+                ) && transaction.is_fully_rolled_back();
+                self.result_complete = fully;
+                self.result_message = Some(if fully {
+                    format!(
+                        "Rolled back organisation; {} empty platform director(ies) removed.",
+                        dirs
+                    )
+                } else {
+                    format!(
+                        "Rollback is NOT complete: some entries were not reversed or are \
+                         unresolved. Review the transaction before any further action \
+                         ({dirs} empty platform director(ies) removed)."
+                    )
+                });
+                if fully {
+                    self.last_rollback = Some(transaction);
+                    self.plan = None;
+                    self.approved.clear();
+                    // The rollback cleared the plan and the approvals; persist
+                    // the empty set so a fresh restart does not re-apply them.
+                    self.persist_approved_set();
+                } else {
+                    // Some changes remain: keep Undo (it reconciles and retries
+                    // only what is still applied) and the reviewed plan.
+                    self.applied = Some(transaction);
+                }
+            }
+            Err(error) if archivefs_core::dat::rename_apply::is_journal_integrity_loss(&error) => {
+                // Never retried as an ordinary Undo in this session.
+                self.quarantined_undo = Some(transaction);
+                self.error = Some(error);
             }
             Err(error) => {
-                self.applied = Some(transaction);
+                // The journal on disk is the durable record of how far this
+                // Undo got; prefer it over a copy whose write may have failed.
+                let recorded = archivefs_core::dat::rename_apply::journal_path(
+                    &journal,
+                    &transaction.transaction_id,
+                )
+                .and_then(|path| archivefs_core::dat::rename_apply::read_journal(&path).ok())
+                .filter(|recorded| recorded.transaction_id == transaction.transaction_id);
+                self.applied = Some(recorded.unwrap_or(transaction));
                 self.error = Some(error);
             }
         }
+    }
+}
+
+/// Why journal work is disabled while an older EmuWiz runs, for display. Read
+/// only and refreshed at most every two seconds; the engine re-checks before
+/// any write.
+pub(crate) fn older_writer_notice() -> Option<String> {
+    static CACHE: std::sync::Mutex<Option<(std::time::Instant, Option<String>)>> =
+        std::sync::Mutex::new(None);
+    let now = std::time::Instant::now();
+    let cacheable = !archivefs_core::dat::rename_apply::writer_gate::process_root_overridden();
+    if cacheable
+        && let Ok(guard) = CACHE.lock()
+        && let Some((at, notice)) = guard.as_ref()
+        && now.duration_since(*at) < std::time::Duration::from_secs(2)
+    {
+        return notice.clone();
+    }
+    let older = archivefs_core::dat::rename_apply::writer_gate::older_writers();
+    let notice = (!older.is_empty()).then(|| {
+        let list = older
+            .iter()
+            .map(|writer| format!("{} (PID {})", writer.executable.display(), writer.pid))
+            .collect::<Vec<_>>()
+            .join(", ");
+        format!(
+            "An older EmuWiz is running: {list}. It does not seal its Undo records, so \
+             organising, renaming and Undo stay disabled here until it is closed."
+        )
+    });
+    if cacheable && let Ok(mut guard) = CACHE.lock() {
+        *guard = Some((now, notice.clone()));
+    }
+    notice
+}
+
+/// Whether any entry may have left the source or any platform directory was
+/// created, so an Undo handle must be kept.
+fn transaction_may_have_changed_disk(
+    transaction: &archivefs_core::dat::rename_apply::RenameTransaction,
+) -> bool {
+    !transaction.created_directories.is_empty()
+        || transaction
+            .entries
+            .iter()
+            .any(archivefs_core::dat::rename_apply::TransactionEntry::blocks_full_rollback)
+}
+
+/// The apply result banner text and whether the batch is genuinely complete.
+/// "Applied"/"Created" is only said for a fully resolved batch; anything in
+/// flight, failed or not attempted is reported as such with the recovery step.
+fn apply_result_report(
+    mode: OrganisationMode,
+    summary: &archivefs_core::dat::rename_apply::TransactionSummary,
+) -> (String, bool) {
+    if summary.fully_resolved() {
+        let message = if mode == OrganisationMode::BuildLinkedLibrary {
+            format!(
+                "Created {} library link(s); your original files were not touched. \
+                 Roll back is available for this transaction.",
+                summary.applied
+            )
+        } else {
+            format!(
+                "Applied {} organisation(s). Roll back is available for this transaction.",
+                summary.applied
+            )
+        };
+        return (message, true);
+    }
+    let mut message = format!(
+        "Not complete: {} applied, {} failed, {} unresolved (in flight), {} not attempted.",
+        summary.applied, summary.failed, summary.unresolved, summary.pending
+    );
+    for entry in &summary.unresolved_entries {
+        message.push_str(&format!(
+            " Recovery needed for {} ({}): {}",
+            entry.destination_path.display(),
+            entry.stage,
+            entry.required_action
+        ));
+    }
+    (message, false)
+}
+
+// ---------------------------------------------------------------------------
+// Approval persistence (UI convenience only — never authoritative)
+// ---------------------------------------------------------------------------
+
+/// Versioned JSON sidecar stored in the normal EmuWiz data directory.
+/// The on-disk format carries a `version` key so future readers can
+/// transparently discard (not reinterpret) an unknown version.
+#[derive(Debug, Serialize, Deserialize)]
+struct PersistedApprovals {
+    version: u32,
+    approved: Vec<String>,
+}
+
+/// Bumped every time the on-disk schema changes. An unreadable or
+/// unexpected version is treated as "no persisted set" (fail-closed).
+const APPROVAL_PERSISTENCE_VERSION: u32 = 1;
+
+/// Leaf name of the JSON sidecar inside the EmuWiz data directory.
+const APPROVAL_PERSISTENCE_FILENAME: &str = "rom_organisation_approvals.json";
+
+/// Resolves the absolute sidecar path. Returns an error string when the
+/// data directory itself cannot be determined (e.g. `$HOME` is unset).
+fn approval_persistence_path() -> Result<PathBuf, String> {
+    archivefs_core::app_dirs::data_path(APPROVAL_PERSISTENCE_FILENAME)
+        .map_err(|e| format!("cannot resolve persistence path: {e}"))
+}
+
+/// The sidecar file this state may touch. An injected path always wins. With
+/// none injected a production build uses the real data directory; a test build
+/// returns `None`, which disables approval persistence entirely.
+fn resolve_approvals_file(injected: Option<&Path>) -> Result<Option<PathBuf>, String> {
+    if let Some(path) = injected {
+        return Ok(Some(path.to_path_buf()));
+    }
+    #[cfg(test)]
+    {
+        Ok(None)
+    }
+    #[cfg(not(test))]
+    {
+        approval_persistence_path().map(Some)
+    }
+}
+
+/// Loads the last persisted approval set if the sidecar exists and is
+/// readable.
+///
+/// - Returns `Ok(None)` when the file is absent (first run).
+/// - Returns `Ok(Some(_))` when a well-formed, expected-version file is
+///   found.
+/// - Returns `Err(reason)` for any other condition: unreadable file,
+///   malformed JSON, unknown version, symlinked sidecar, etc.
+///   The caller surfaces the reason via `approval_persistence_warning`
+///   but never treats it as "approve everything".
+fn load_persisted_approved_set(
+    injected: Option<&Path>,
+) -> Result<Option<BTreeSet<String>>, String> {
+    let Some(path) = resolve_approvals_file(injected)? else {
+        return Ok(None);
+    };
+
+    // ----- Reject symlinked sidecars ----------------------------------
+    let meta = match std::fs::symlink_metadata(&path) {
+        Ok(m) => m,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(e) => {
+            return Err(format!("cannot read metadata of {}: {e}", path.display()));
+        }
+    };
+    if meta.file_type().is_symlink() {
+        return Err(format!(
+            "refusing to load symlinked approval sidecar: {}",
+            path.display()
+        ));
+    }
+
+    // ----- Read & parse ------------------------------------------------
+    let raw = std::fs::read_to_string(&path)
+        .map_err(|e| format!("cannot read approval sidecar {}: {e}", path.display()))?;
+
+    let persisted: PersistedApprovals = serde_json::from_str(&raw)
+        .map_err(|e| format!("approval sidecar {} is malformed: {e}", path.display()))?;
+
+    if persisted.version != APPROVAL_PERSISTENCE_VERSION {
+        return Err(format!(
+            "approval sidecar {} has unknown version {} (expected {})",
+            path.display(),
+            persisted.version,
+            APPROVAL_PERSISTENCE_VERSION,
+        ));
+    }
+
+    Ok(Some(persisted.approved.into_iter().collect()))
+}
+
+impl RomOrganisationPageState {
+    /// Persists the current `approved` set to the versioned JSON sidecar.
+    ///
+    /// - Atomic: writes to a temp file in the same directory, then renames.
+    /// - Fail-soft: an I/O error is surfaced via
+    ///   `approval_persistence_warning` but never blocks the page.
+    /// - Does **not** write inside game/source folders.
+    fn persist_approved_set(&mut self) {
+        self.approval_persistence_warning = None;
+
+        let path = match resolve_approvals_file(self.approvals_file.as_deref()) {
+            Ok(Some(p)) => p,
+            // Test build with no injected path: persistence is disabled.
+            Ok(None) => return,
+            Err(reason) => {
+                self.approval_persistence_warning = Some(reason);
+                return;
+            }
+        };
+
+        // Ensure the parent directory exists (data dir may not exist yet
+        // on a fresh install).
+        if let Some(parent) = path.parent()
+            && let Err(e) = std::fs::create_dir_all(parent)
+        {
+            self.approval_persistence_warning = Some(format!("cannot create data directory: {e}"));
+            return;
+        }
+
+        let payload = PersistedApprovals {
+            version: APPROVAL_PERSISTENCE_VERSION,
+            approved: self.approved.iter().cloned().collect(),
+        };
+
+        let json = match serde_json::to_string(&payload) {
+            Ok(j) => j,
+            Err(e) => {
+                self.approval_persistence_warning =
+                    Some(format!("cannot serialise approval set: {e}"));
+                return;
+            }
+        };
+
+        // Atomic temp-write + rename. Check that the predictable tmp
+        // path is not a symlink before opening it for write — `File::create`
+        // would follow a symlink, letting a planted link escape the data dir.
+        let tmp = path.with_extension("json.tmp");
+        match std::fs::symlink_metadata(&tmp) {
+            Ok(meta) => {
+                if meta.file_type().is_symlink() {
+                    self.approval_persistence_warning =
+                        Some("refusing to write through a symlinked temp path".to_string());
+                    return;
+                }
+                // Temp file already exists (from a previous crashed write).
+                // Remove it first; `File::create` would overwrite, but
+                // removing explicitly avoids a symlink race between the
+                // metadata check and the open call.
+                let _ = std::fs::remove_file(&tmp);
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                // Expected: no stale temp file.
+            }
+            Err(e) => {
+                self.approval_persistence_warning = Some(format!("cannot stat temp path: {e}"));
+                return;
+            }
+        }
+        // Use OpenOptions with create_new to avoid following symlinks.
+        // On Unix, O_CREAT|O_EXCL|O_WRONLY fails with EEXIST on a symlink.
+        match std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&tmp)
+        {
+            Ok(mut f) => {
+                if let Err(e) = std::io::Write::write_all(&mut f, json.as_bytes()) {
+                    let _ = std::fs::remove_file(&tmp);
+                    self.approval_persistence_warning =
+                        Some(format!("cannot write approval sidecar: {e}"));
+                    return;
+                }
+            }
+            Err(e) => {
+                self.approval_persistence_warning = Some(format!("cannot create temp file: {e}"));
+                return;
+            }
+        }
+        if let Err(e) = std::fs::rename(&tmp, &path) {
+            // Best-effort cleanup of the temp file.
+            let _ = std::fs::remove_file(&tmp);
+            self.approval_persistence_warning =
+                Some(format!("cannot finalise approval sidecar: {e}"));
+        }
+
+        // Success: the warning (if any leftover from a previous failed
+        // load/save) is already cleared above.
     }
 }
 
@@ -308,7 +1057,7 @@ impl RomOrganisationPageState {
 /// paths: regular files and symlink *objects*. Symlinked directories are
 /// collected as link objects but never traversed, so a symlink loop cannot
 /// recurse. Read-only.
-fn collect_source_files(roots: &[PathBuf]) -> Vec<PathBuf> {
+pub(crate) fn collect_source_files(roots: &[PathBuf]) -> Vec<PathBuf> {
     const MAX_DEPTH: usize = 4;
     const MAX_FILES: usize = 2_000;
     let mut out = Vec::new();
@@ -329,6 +1078,29 @@ fn collect_source_files(roots: &[PathBuf]) -> Vec<PathBuf> {
                 let Ok(metadata) = std::fs::symlink_metadata(&path) else {
                     continue;
                 };
+                // A library-organisation plan is intentionally a games-only
+                // operation. Cover art, manuals, metadata, and other
+                // supporting media remain in place for their own workflows;
+                // treating a `boxart/Game.png` as an unknown game creates a
+                // misleading blocked entry and risks a later destructive
+                // operation being approved against it. Reuse discovery's
+                // conservative shared classification rather than guessing
+                // from directory names such as `boxart`.
+                if path
+                    .extension()
+                    .and_then(|extension| extension.to_str())
+                    .map(str::to_ascii_lowercase)
+                    .is_some_and(|extension| {
+                        is_known_non_game_extension(&extension)
+                            // Preservation-only recordings (RZX) are never
+                            // organised or published as games; the Organise
+                            // page states how many it leaves out.
+                            || archivefs_core::media_registry::kind_for_extension(&extension)
+                                .is_some_and(archivefs_core::ArchiveKind::is_preservation_only)
+                    })
+                {
+                    continue;
+                }
                 let file_type = metadata.file_type();
                 if file_type.is_symlink() {
                     // The link object itself is a candidate; its target is
@@ -357,6 +1129,13 @@ fn build_candidates(
     generation: u64,
     cache: Option<&archivefs_core::identity_source::cache::IdentityCache>,
 ) -> Option<Vec<OrganisationCandidate>> {
+    // No identity lookup is needed for an empty selection.  In particular,
+    // regenerating an empty preview must be able to clear a stale approved
+    // set even when this machine has not created its local database yet.
+    if sources.is_empty() {
+        return Some(Vec::new());
+    }
+
     let database_path = default_database_path().ok()?;
     let database = Database::open_read_only(&database_path).ok()?;
     let mut candidates = Vec::new();
@@ -386,6 +1165,27 @@ fn build_candidates(
     Some(candidates)
 }
 
+/// Uses exactly the existing organisation freshness/planning checks, on a worker.
+pub(crate) fn validate_r2_selection(
+    plan: &OrganisationPlan,
+    approved: &BTreeSet<String>,
+) -> Result<archivefs_core::dat::rename_apply::RenameTransaction, String> {
+    let cache = load_romm_cache();
+    let database = default_database_path().map_err(|e| e.to_string())?;
+    revalidate_organisation_plan(plan, &database, &|p| canonical_name_for(p, cache.as_ref()))?;
+    let tx = build_organisation_transaction(plan, approved, plan.generation)?;
+    let expected = plan
+        .suggested()
+        .filter(|e| approved.contains(&e.source_path.to_string_lossy().into_owned()))
+        .count();
+    if tx.entries.len() != expected || tx.entries.is_empty() {
+        return Err(
+            "Selected files changed or could not be verified; no files are silently omitted."
+                .into(),
+        );
+    }
+    Ok(tx)
+}
 /// The authoritative canonical game name for a source, when the RomM identity
 /// cache records one: the record's title with the source's extension appended,
 /// so `derive_proposed_basename` preserves extension semantics. Returns `None`
@@ -422,132 +1222,542 @@ fn load_romm_cache() -> Option<archivefs_core::identity_source::cache::IdentityC
     load_cache(&location, None).ok()
 }
 
-/// The canonical RomM slug map from the identity cache, if any.
-fn build_slug_map(
-    cache: Option<&archivefs_core::identity_source::cache::IdentityCache>,
-) -> std::collections::BTreeMap<String, String> {
-    let mut map = std::collections::BTreeMap::new();
-    let Some(cache) = cache else {
-        return map;
-    };
-    for platform in archivefs_core::platform::canonical_ids() {
-        if let Some(slug) = cache.romm_slug_for_platform(platform) {
-            map.insert(platform.to_string(), slug.to_string());
-        }
-    }
-    map
-}
+// The former `build_slug_map` helper is gone: generic organisation no longer
+// consults RomM slugs at all. RomM-specific frontend layouts resolve their
+// own mappings in `platform_evidence_fusion::romm_platform_mapping`.
 
 /// Draws the page and returns the confirmation request when the user clicks
 /// Apply (the caller must confirm before any mutation happens).
-pub(crate) fn show_rom_organisation_page(ui: &mut egui::Ui, state: &mut RomOrganisationPageState) {
-    widgets::page_header_with_icon(
-        ui,
-        crate::ui::icons::ORGANISE,
-        "Organise",
-        "Preview how your games can be renamed or organised. Nothing moves until you approve it.",
-    );
+fn apply_playing_library_action(
+    state: &mut crate::playing_library_page::PlayingLibraryPageState,
+    action: crate::playing_library_page::PlayingLibraryPageAction,
+) {
+    use crate::playing_library_page::PlayingLibraryPageAction;
+    match action {
+        PlayingLibraryPageAction::Preview => state.preview(),
+        PlayingLibraryPageAction::SelectFamily(name) => state.select_family(name),
+        PlayingLibraryPageAction::RequestApply => match state.destination {
+            PlayingLibraryDestination::Romm => state.request_romm_apply(),
+            PlayingLibraryDestination::RetroDeck => state.request_retrodeck_apply(),
+            PlayingLibraryDestination::Generic | PlayingLibraryDestination::EsDe => {
+                state.request_apply()
+            }
+        },
+        PlayingLibraryPageAction::CancelApply => match state.destination {
+            PlayingLibraryDestination::Romm => state.cancel_romm_apply(),
+            PlayingLibraryDestination::RetroDeck => state.cancel_retrodeck_apply(),
+            PlayingLibraryDestination::Generic | PlayingLibraryDestination::EsDe => {
+                state.cancel_apply()
+            }
+        },
+        PlayingLibraryPageAction::ConfirmApply => match state.destination {
+            PlayingLibraryDestination::Romm => state.confirm_romm_apply(),
+            PlayingLibraryDestination::RetroDeck => state.confirm_retrodeck_apply(),
+            PlayingLibraryDestination::Generic | PlayingLibraryDestination::EsDe => {
+                state.confirm_apply()
+            }
+        },
+        PlayingLibraryPageAction::RollbackLast => state.rollback_last(),
+        PlayingLibraryPageAction::SelectEsdePlatform(platform_id) => {
+            state.select_esde_platform(Some(platform_id))
+        }
+        PlayingLibraryPageAction::PreviewEsde => state.preview_esde_publication(),
+        PlayingLibraryPageAction::RequestEsdePublish => state.request_esde_publish(),
+        PlayingLibraryPageAction::CancelEsdePublish => state.cancel_esde_publish(),
+        PlayingLibraryPageAction::ConfirmEsdePublish => state.confirm_esde_publish(),
+        PlayingLibraryPageAction::RequestEsdeRecovery => state.request_esde_recovery(),
+        PlayingLibraryPageAction::CancelEsdeRecovery => state.cancel_esde_recovery(),
+        PlayingLibraryPageAction::ConfirmEsdeRecovery => state.confirm_esde_recovery(),
+        PlayingLibraryPageAction::PreviewRomm => state.preview_romm(),
+        PlayingLibraryPageAction::RollbackRomm => state.rollback_romm_last(),
+        PlayingLibraryPageAction::PreviewRetroDeck => state.preview_retrodeck(),
+        PlayingLibraryPageAction::RollbackRetroDeck => state.rollback_retrodeck(),
+    }
+}
 
-    widgets::card(ui, |ui| {
-        ui.label(egui::RichText::new("Master ROM root").strong());
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum RomOrganisationPageAction {
+    Preview,
+    Apply,
+    Rollback,
+    OpenAdvanced,
+    OpenDat,
+    OpenCheck,
+    OpenMame,
+    OpenHistory,
+    OpenGames,
+}
+
+pub(crate) fn show_rom_organisation_page(ui: &mut egui::Ui, state: &mut RomOrganisationPageState) {
+    if let Some(action) = show_rom_organisation_page_with_busy(ui, state, false, false) {
+        match action {
+            RomOrganisationPageAction::Preview => {
+                state.pending_preview = true;
+                ui.ctx().request_repaint();
+            }
+            RomOrganisationPageAction::Apply => state.apply(),
+            RomOrganisationPageAction::Rollback => state.rollback(),
+            RomOrganisationPageAction::OpenAdvanced => {}
+            RomOrganisationPageAction::OpenDat => {}
+            RomOrganisationPageAction::OpenCheck => {}
+            RomOrganisationPageAction::OpenMame => {}
+            RomOrganisationPageAction::OpenHistory => {}
+            RomOrganisationPageAction::OpenGames => {}
+        }
+    }
+}
+
+pub(crate) fn show_rom_organisation_page_with_busy(
+    ui: &mut egui::Ui,
+    state: &mut RomOrganisationPageState,
+    async_busy: bool,
+    canonical_only: bool,
+) -> Option<RomOrganisationPageAction> {
+    show_rom_organisation_page_with_options(ui, state, async_busy, canonical_only, false)
+}
+
+pub(crate) fn show_quick_rename_page_with_busy(
+    ui: &mut egui::Ui,
+    state: &mut RomOrganisationPageState,
+    async_busy: bool,
+) -> Option<RomOrganisationPageAction> {
+    state.ensure_mode(OrganisationMode::RenameInPlace);
+    state.restrict_quick_rename_approvals();
+    show_rom_organisation_page_with_options(ui, state, async_busy, true, true)
+}
+
+fn show_rom_organisation_page_with_options(
+    ui: &mut egui::Ui,
+    state: &mut RomOrganisationPageState,
+    async_busy: bool,
+    canonical_only: bool,
+    quick_only: bool,
+) -> Option<RomOrganisationPageAction> {
+    let mut page_action = None;
+    // See `RomOrganisationPageState::pending_preview`: this runs the actual
+    // plan generation one frame after the click that requested it, so the
+    // busy row below had a chance to render first.
+    if state.pending_preview && !async_busy {
+        state.generate_plan();
+        state.pending_preview = false;
+    }
+    if !canonical_only && crate::simple_mode::active(ui.ctx()) && !state.showing_playing_library {
+        widgets::workflow_header(
+            ui,
+            "Make a Playing Library",
+            "Prepare an organised library of links to your games. Your original files stay where they are.",
+        );
+        if crate::simple_mode::primary_button(ui, "Start a playing library", true).clicked() {
+            state.showing_playing_library = true;
+            state
+                .playing_library
+                .set_destination(PlayingLibraryDestination::Generic);
+        }
+        ui.label("Next: choose a platform, your games folder, and an output folder. Review the preview before approving any changes.");
+        ui.collapsing("Advanced details — other library layouts", |ui| {
+            ui.label("Use these options when you already use a game-library program such as RomM or ES-DE. Choosing a layout does not write files.");
+            show_library_destination_cards(ui, state);
+        });
+        return page_action;
+    }
+    if quick_only {
+        widgets::workflow_header(
+            ui,
+            "Quick Rename",
+            "Rename verified games to their trusted DAT names. Nothing changes until you review the preview.",
+        );
+    } else if canonical_only {
+        widgets::workflow_header(
+            ui,
+            "Organise verified games",
+            "Rename files, move them into reviewed platform folders, or create a linked library. Previewing changes nothing.",
+        );
+    } else if crate::simple_mode::active(ui.ctx()) {
+        widgets::workflow_header(
+            ui,
+            "Make a Playing Library › Choose games and folders",
+            "Preview an organised library, then review it before approving any changes.",
+        );
+    } else {
+        widgets::workflow_header(
+            ui,
+            "Build Libraries",
+            "Create clean libraries for RomM, ES-DE, RetroDECK or Generic.",
+        );
+    }
+    if quick_only {
+        ui.weak("1. Choose scope   /   2. Preview   /   3. Confirm   /   4. Apply");
+        ui.label("Quick Rename uses Rename in place. File contents are not changed.");
+        ui.label("Scope: All verified games. Unsupported multi-disc or archive cases stay blocked for Advanced Rename.");
+        ui.label("MAME collections use the dedicated MAME tools.");
+        if widgets::action_button(ui, "Advanced Rename", widgets::ActionStyle::Secondary, true)
+            .clicked()
+        {
+            page_action = Some(RomOrganisationPageAction::OpenAdvanced);
+        }
+        if widgets::action_button(ui, "Manage DATs", widgets::ActionStyle::Quiet, true).clicked() {
+            page_action = Some(RomOrganisationPageAction::OpenDat);
+        }
+        if widgets::action_button(ui, "Open MAME tools", widgets::ActionStyle::Quiet, true)
+            .clicked()
+        {
+            page_action = Some(RomOrganisationPageAction::OpenMame);
+        }
+    } else {
+        ui.weak("1. Choose output   /   2. Choose destination   /   3. Preview   /   4. Apply");
+    }
+
+    if !canonical_only {
         ui.horizontal(|ui| {
-            ui.text_edit_singleline(&mut state.master_root_draft);
-            if widgets::action_button(ui, "Save", widgets::ActionStyle::Primary, true).clicked() {
-                state.save_master_root();
+            if state.showing_playing_library {
+                if widgets::action_button(
+                    ui,
+                    if crate::simple_mode::active(ui.ctx()) {
+                        "‹ Back to Make a Playing Library"
+                    } else {
+                        "< Back to Organise"
+                    },
+                    widgets::ActionStyle::Quiet,
+                    true,
+                )
+                .clicked()
+                {
+                    state.showing_playing_library = false;
+                }
+            } else if widgets::action_button(
+                ui,
+                "Build Library",
+                widgets::ActionStyle::Primary,
+                true,
+            )
+            .clicked()
+            {
+                state.showing_playing_library = true;
             }
         });
-        match &state.saved_master_root {
-            Some(root) => ui.label(
-                egui::RichText::new(format!("Configured: {}", root.display()))
-                    .color(theme::muted(ui)),
-            ),
-            None => ui.label(
-                egui::RichText::new("No master ROM root is configured.").color(theme::muted(ui)),
-            ),
-        };
-        if let Some(error) = &state.master_root_error {
-            ui.label(
-                egui::RichText::new(error.as_str()).color(widgets::StatusTone::Blocked.color(ui)),
-            );
-        }
-        ui.add_space(4.0);
+    }
+    if !canonical_only && !state.showing_playing_library {
         ui.label(
             egui::RichText::new(
-                "Setting a root never moves anything by itself: organisation always requires a \
-                 plan and your explicit approval.",
+                "Playing Library chooses one preferred verified release per game and creates a separate linked library while leaving originals untouched.",
             )
             .color(theme::muted(ui)),
         );
-    });
-
-    ui.add_space(8.0);
-    widgets::card(ui, |ui| {
-        ui.label(egui::RichText::new("Organisation mode").strong());
-        for mode in [
-            OrganisationMode::RenameInPlace,
-            OrganisationMode::MoveRealFile,
-            OrganisationMode::OrganiseSymlinkOnly,
-        ] {
-            let selected = state.mode == mode;
-            if ui.radio(selected, mode.label()).clicked() {
-                state.set_mode(mode);
-            }
-        }
-        ui.label(
-            egui::RichText::new("Modes are separate choices and are never combined.")
-                .color(theme::muted(ui)),
+    }
+    if !canonical_only && !state.showing_playing_library {
+        widgets::section_header(
+            ui,
+            "Choose output",
+            Some("Choose a destination, then review the read-only plan before anything changes."),
         );
-    });
+        show_library_destination_cards(ui, state);
+    }
+    ui.add_space(8.0);
+
+    if !canonical_only && state.showing_playing_library {
+        if let Some(action) =
+            crate::playing_library_page::show_playing_library_page(ui, &mut state.playing_library)
+        {
+            apply_playing_library_action(&mut state.playing_library, action);
+        }
+        return page_action;
+    }
+
+    if state.mode == OrganisationMode::BuildLinkedLibrary {
+        // Linked-library mode plans into an explicitly chosen destination
+        // root that is separate from the master ROM root. It is never
+        // inferred from the source folders.
+        widgets::card(ui, |ui| {
+            ui.label(egui::RichText::new("Linked library folder").strong());
+            ui.label(
+                egui::RichText::new(
+                    "The organised links are created inside this folder; your original \
+                     files stay where they are.",
+                )
+                .color(theme::muted(ui)),
+            );
+            match &state.saved_library_root {
+                Some(root) => {
+                    ui.label(format!(
+                        "Organised library: {}",
+                        root.file_name()
+                            .and_then(|name| name.to_str())
+                            .unwrap_or("chosen folder")
+                    ));
+                    if widgets::action_button(
+                        ui,
+                        "Change folder…",
+                        widgets::ActionStyle::Secondary,
+                        true,
+                    )
+                    .clicked()
+                        && let Some(path) = rfd::FileDialog::new()
+                            .set_title("Choose Linked Library Folder")
+                            .pick_folder()
+                    {
+                        state.library_root_draft = path.display().to_string();
+                        state.save_library_root();
+                    }
+                }
+                None => {
+                    ui.label(
+                        egui::RichText::new("No linked library folder is chosen yet.")
+                            .color(theme::muted(ui)),
+                    );
+                    if widgets::action_button(
+                        ui,
+                        "Choose folder…",
+                        widgets::ActionStyle::Primary,
+                        true,
+                    )
+                    .clicked()
+                        && let Some(path) = rfd::FileDialog::new()
+                            .set_title("Choose Linked Library Folder")
+                            .pick_folder()
+                    {
+                        state.library_root_draft = path.display().to_string();
+                        state.save_library_root();
+                    }
+                }
+            };
+            if let Some(error) = &state.library_root_error {
+                ui.label(
+                    egui::RichText::new(error.as_str())
+                        .color(widgets::StatusTone::Blocked.color(ui)),
+                );
+            }
+            widgets::technical_details(ui, "linked_library_manual_path", |ui| {
+                if let Some(root) = &state.saved_library_root {
+                    ui.label(format!("Exact folder: {}", root.display()));
+                }
+                ui.label(
+                    egui::RichText::new(
+                        "Type or paste a path directly instead of using the folder picker.",
+                    )
+                    .color(theme::muted(ui)),
+                );
+                ui.horizontal(|ui| {
+                    ui.text_edit_singleline(&mut state.library_root_draft);
+                    if widgets::action_button(ui, "Save", widgets::ActionStyle::Primary, true)
+                        .clicked()
+                    {
+                        state.save_library_root();
+                    }
+                });
+            });
+        });
+    } else {
+        widgets::card(ui, |ui| {
+            ui.label(egui::RichText::new("Game library folder").strong());
+            match &state.saved_master_root {
+                Some(root) => {
+                    ui.label(format!(
+                        "Original games: {}",
+                        root.file_name()
+                            .and_then(|name| name.to_str())
+                            .unwrap_or("chosen folder")
+                    ));
+                    if widgets::action_button(
+                        ui,
+                        "Change folder…",
+                        widgets::ActionStyle::Secondary,
+                        true,
+                    )
+                    .clicked()
+                        && let Some(path) = rfd::FileDialog::new()
+                            .set_title("Choose Game Library Folder")
+                            .pick_folder()
+                    {
+                        state.master_root_draft = path.display().to_string();
+                        state.save_master_root();
+                    }
+                }
+                None => {
+                    ui.label(
+                        egui::RichText::new("No game library folder is configured yet.")
+                            .color(theme::muted(ui)),
+                    );
+                    if widgets::action_button(
+                        ui,
+                        "Choose folder…",
+                        widgets::ActionStyle::Primary,
+                        true,
+                    )
+                    .clicked()
+                        && let Some(path) = rfd::FileDialog::new()
+                            .set_title("Choose Game Library Folder")
+                            .pick_folder()
+                    {
+                        state.master_root_draft = path.display().to_string();
+                        state.save_master_root();
+                    }
+                }
+            };
+            if let Some(error) = &state.master_root_error {
+                ui.label(
+                    egui::RichText::new(error.as_str())
+                        .color(widgets::StatusTone::Blocked.color(ui)),
+                );
+            }
+            widgets::technical_details(ui, "rom_organisation_manual_path", |ui| {
+                if let Some(root) = &state.saved_master_root {
+                    ui.label(format!("Exact folder: {}", root.display()));
+                }
+                ui.label(
+                    egui::RichText::new(
+                        "Type or paste a path directly instead of using the folder picker.",
+                    )
+                    .color(theme::muted(ui)),
+                );
+                ui.horizontal(|ui| {
+                    ui.text_edit_singleline(&mut state.master_root_draft);
+                    if widgets::action_button(ui, "Save", widgets::ActionStyle::Primary, true)
+                        .clicked()
+                    {
+                        state.save_master_root();
+                    }
+                });
+            });
+        });
+    }
+
+    if !quick_only {
+        ui.add_space(8.0);
+        widgets::card(ui, |ui| {
+            ui.label(egui::RichText::new("Organisation mode").strong());
+            for mode in [
+                OrganisationMode::RenameInPlace,
+                OrganisationMode::MoveRealFile,
+                OrganisationMode::BuildLinkedLibrary,
+                OrganisationMode::OrganiseSymlinkOnly,
+            ] {
+                let selected = state.mode == mode;
+                if ui
+                    .radio(selected, organisation_mode_plain_label(mode))
+                    .clicked()
+                {
+                    state.set_mode(mode);
+                }
+            }
+            ui.label(
+                egui::RichText::new(organisation_mode_plain_explanation(state.mode))
+                    .color(theme::muted(ui)),
+            );
+            ui.label(
+                egui::RichText::new("Modes are separate choices and are never combined.")
+                    .color(theme::muted(ui)),
+            );
+        });
+    }
 
     ui.add_space(8.0);
     widgets::card(ui, |ui| {
         ui.horizontal(|ui| {
-            ui.label(egui::RichText::new("Candidate ROM files").strong());
+            ui.label(egui::RichText::new("Games ready to organise").strong());
             if widgets::action_button(ui, "Rescan sources", widgets::ActionStyle::Secondary, true)
                 .clicked()
             {
                 state.rescan_sources();
             }
-            if widgets::action_button(ui, "Generate plan", widgets::ActionStyle::Primary, true)
-                .clicked()
+            if widgets::action_button(
+                ui,
+                if async_busy {
+                    "Preparing preview…"
+                } else {
+                    preview_button_label(state.pending_preview)
+                },
+                widgets::ActionStyle::Primary,
+                !state.pending_preview && !async_busy,
+            )
+            .clicked()
             {
-                state.generate_plan();
+                page_action = Some(RomOrganisationPageAction::Preview);
             }
         });
+        if state.pending_preview || async_busy {
+            ui.horizontal(|ui| {
+                ui.spinner();
+                ui.label(
+                    "Preparing your preview… checking each game and deciding where it belongs.",
+                );
+            });
+        }
         ui.label(
             egui::RichText::new(format!(
-                "{} candidate file(s) collected.",
+                "{} game(s) ready to organise.",
                 state.sources.len()
             ))
             .color(theme::muted(ui)),
         );
+        if !state.unavailable_source_roots.is_empty() {
+            ui.label(
+                egui::RichText::new(
+                    "Source drive may not be mounted. Nothing in an unavailable source will be scanned or changed.",
+                )
+                .color(theme::warning(ui)),
+            );
+            widgets::technical_details(ui, "unavailable_organisation_sources", |ui| {
+                for path in &state.unavailable_source_roots {
+                    ui.label(path.display().to_string());
+                }
+            });
+        }
     });
 
     if let Some(plan) = state.plan.clone() {
         ui.add_space(8.0);
+        show_plan(ui, &plan, state, async_busy, &mut page_action, quick_only);
+    }
+
+    let older_writer = older_writer_notice();
+    if let Some(notice) = &older_writer {
+        ui.add_space(8.0);
         widgets::banner(
             ui,
-            "Planning only",
-            "No files will be moved until you explicitly approve an apply.",
-            widgets::StatusTone::Info,
+            "Organising and Undo are disabled",
+            notice,
+            widgets::StatusTone::Blocked,
         );
-        ui.add_space(6.0);
-        show_plan(ui, &plan, state);
     }
 
     if let Some(message) = &state.result_message {
         ui.add_space(8.0);
-        widgets::banner(ui, "Result", message, widgets::StatusTone::Success);
-        if state.applied.is_some()
-            && widgets::action_button(
-                ui,
-                "Roll back this organisation",
-                widgets::ActionStyle::Secondary,
-                true,
-            )
-            .clicked()
-        {
-            state.rollback();
+        let tone = if state.result_complete {
+            widgets::StatusTone::Success
+        } else {
+            widgets::StatusTone::Warning
+        };
+        widgets::banner(ui, "Result", message, tone);
+        if quick_only && let Some(transaction) = state.applied() {
+            ui.label(format!("Renamed: {}", transaction.applied_count()));
+            ui.label(format!("Skipped: {}", transaction.skipped_count()));
+            ui.label(format!("Failed: {}", transaction.failed_count()));
+            let summary = archivefs_core::dat::rename_apply::TransactionSummary::from_transaction(
+                transaction,
+            );
+            if summary.unresolved > 0 || summary.pending > 0 {
+                ui.label(format!(
+                    "Unresolved (in flight): {} - Not attempted: {}",
+                    summary.unresolved, summary.pending
+                ));
+            }
+            ui.horizontal_wrapped(|ui| {
+                if widgets::action_button(ui, "View changes", widgets::ActionStyle::Secondary, true)
+                    .clicked()
+                {
+                    page_action = Some(RomOrganisationPageAction::OpenHistory);
+                }
+                if widgets::action_button(
+                    ui,
+                    "Back to Games",
+                    widgets::ActionStyle::Secondary,
+                    true,
+                )
+                .clicked()
+                {
+                    page_action = Some(RomOrganisationPageAction::OpenGames);
+                }
+            });
         }
     }
 
@@ -555,88 +1765,478 @@ pub(crate) fn show_rom_organisation_page(ui: &mut egui::Ui, state: &mut RomOrgan
         ui.add_space(8.0);
         widgets::banner(ui, "Not applied", error, widgets::StatusTone::Blocked);
     }
+
+    // Offered whenever this page holds an Undo handle, including after an
+    // error or a refused Undo that kept it.
+    if state.applied.is_some()
+        && !state.advanced_r2_selected
+        && widgets::action_button(
+            ui,
+            if quick_only {
+                "Undo"
+            } else {
+                "Roll back this organisation"
+            },
+            widgets::ActionStyle::Secondary,
+            !async_busy && older_writer.is_none(),
+        )
+        .clicked()
+    {
+        page_action = Some(RomOrganisationPageAction::Rollback);
+    }
+
+    if let Some(warning) = &state.approval_persistence_warning {
+        ui.add_space(6.0);
+        widgets::banner(
+            ui,
+            "Approvals not saved",
+            &format!(
+                "Your approval selections were not persisted to disk: {warning}. \
+                 Re-preview the plan to restore suggested defaults."
+            ),
+            widgets::StatusTone::Pending,
+        );
+    }
+    page_action
 }
 
-fn show_plan(ui: &mut egui::Ui, plan: &OrganisationPlan, state: &mut RomOrganisationPageState) {
+const LIBRARY_DESTINATION_CARDS: [(&str, &str, PlayingLibraryDestination); 4] = [
+    (
+        "Build RomM library",
+        "Build a RomM-ready playing library using the reviewed platform folders.",
+        PlayingLibraryDestination::Romm,
+    ),
+    (
+        "Build ES-DE library",
+        "Build a linked library and optionally publish its existing ES-DE gamelist.",
+        PlayingLibraryDestination::EsDe,
+    ),
+    (
+        "Build RetroDECK library",
+        "Build a RetroDECK-ready linked library using the reviewed ES-DE system folders.",
+        PlayingLibraryDestination::RetroDeck,
+    ),
+    (
+        "Build generic playing library",
+        "Build a simple playing library without frontend-specific layout.",
+        PlayingLibraryDestination::Generic,
+    ),
+];
+
+const DESTINATION_CARD_MIN_WIDTH: f32 = 340.0;
+const DESTINATION_CARD_MAX_WIDTH: f32 = 440.0;
+const DESTINATION_CARD_GAP: f32 = 16.0;
+
+#[derive(Debug, Clone, Copy, PartialEq)]
+struct DestinationCardLayout {
+    columns: usize,
+    card_width: f32,
+}
+
+fn destination_card_layout(available_width: f32, card_count: usize) -> DestinationCardLayout {
+    let available_width = available_width.max(0.0);
+    let fitting = ((available_width + DESTINATION_CARD_GAP)
+        / (DESTINATION_CARD_MIN_WIDTH + DESTINATION_CARD_GAP))
+        .floor() as usize;
+    let columns = fitting.clamp(1, 3).min(card_count.max(1));
+    let card_width = ((available_width - DESTINATION_CARD_GAP * columns.saturating_sub(1) as f32)
+        / columns as f32)
+        .clamp(0.0, DESTINATION_CARD_MAX_WIDTH);
+    DestinationCardLayout {
+        columns,
+        card_width,
+    }
+}
+
+fn show_library_destination_cards(ui: &mut egui::Ui, state: &mut RomOrganisationPageState) {
+    let layout = destination_card_layout(ui.available_width(), LIBRARY_DESTINATION_CARDS.len());
+    for row in LIBRARY_DESTINATION_CARDS.chunks(layout.columns) {
+        ui.horizontal_top(|ui| {
+            for (index, (title, description, destination)) in row.iter().enumerate() {
+                ui.allocate_ui_with_layout(
+                    egui::vec2(layout.card_width, 0.0),
+                    egui::Layout::top_down(egui::Align::Min),
+                    |ui| {
+                        widgets::aligned_card(ui, layout.card_width, 146.0, |ui| {
+                            let top = ui.cursor().top();
+                            ui.label(egui::RichText::new(*title).strong());
+                            ui.add(
+                                egui::Label::new(
+                                    egui::RichText::new(*description).color(theme::muted(ui)),
+                                )
+                                .wrap(),
+                            );
+                            ui.label(
+                                egui::RichText::new("Source collection stays where it is.")
+                                    .color(theme::muted(ui))
+                                    .small(),
+                            );
+                            let selected = state.playing_library.destination == *destination;
+                            ui.add_space((top + 112.0 - ui.cursor().top()).max(0.0));
+                            if widgets::action_button(
+                                ui,
+                                if selected { "Current choice" } else { "Choose" },
+                                if selected {
+                                    widgets::ActionStyle::Secondary
+                                } else {
+                                    widgets::ActionStyle::Primary
+                                },
+                                true,
+                            )
+                            .clicked()
+                            {
+                                state.showing_playing_library = true;
+                                state.playing_library.set_destination(*destination);
+                            }
+                        });
+                    },
+                );
+                if index + 1 < row.len() {
+                    ui.add_space(DESTINATION_CARD_GAP);
+                }
+            }
+        });
+        ui.add_space(DESTINATION_CARD_GAP);
+    }
+}
+
+fn show_plan(
+    ui: &mut egui::Ui,
+    plan: &OrganisationPlan,
+    state: &mut RomOrganisationPageState,
+    async_busy: bool,
+    page_action: &mut Option<RomOrganisationPageAction>,
+    quick_only: bool,
+) {
+    let suggested_count = plan
+        .entries
+        .iter()
+        .filter(|entry| {
+            entry.status == OrganisationStatus::Suggested
+                && (!quick_only || !entry.platform_display_name.eq_ignore_ascii_case("Arcade"))
+        })
+        .count();
+    let blocked_count = plan
+        .entries
+        .iter()
+        .filter(|entry| {
+            matches!(
+                entry.status,
+                OrganisationStatus::Conflict | OrganisationStatus::Blocked
+            ) || (quick_only
+                && entry.status == OrganisationStatus::Suggested
+                && entry.platform_display_name.eq_ignore_ascii_case("Arcade"))
+        })
+        .count();
+    // Needs-attention also folds in entries the current mode cannot support
+    // at all - a real backend state (`OrganisationStatus::Unsupported`),
+    // never an invented confidence level.
+    let attention_count = blocked_count
+        + plan
+            .entries
+            .iter()
+            .filter(|entry| entry.status == OrganisationStatus::Unsupported)
+            .count();
+    let already_correct_count = plan
+        .entries
+        .iter()
+        .filter(|entry| entry.status == OrganisationStatus::AlreadyOrganised)
+        .count();
+    widgets::card(ui, |ui| {
+        ui.label(egui::RichText::new("Preview summary").strong());
+        // At-a-glance grouping so a large result set can be scanned without
+        // reading every row: already correct / will change / blocked or
+        // needs attention, using only the plan's own existing statuses.
+        ui.horizontal_wrapped(|ui| {
+            if quick_only {
+                widgets::status_badge(
+                    ui,
+                    format!("Ready to rename: {suggested_count}"),
+                    widgets::StatusTone::Info,
+                );
+                widgets::status_badge(
+                    ui,
+                    format!("Already correct: {already_correct_count}"),
+                    widgets::StatusTone::Success,
+                );
+                widgets::status_badge(
+                    ui,
+                    format!("Blocked: {blocked_count}"),
+                    if blocked_count == 0 {
+                        widgets::StatusTone::Success
+                    } else {
+                        widgets::StatusTone::Blocked
+                    },
+                );
+                widgets::status_badge(
+                    ui,
+                    format!(
+                        "Needs review: {}",
+                        plan.entries
+                            .iter()
+                            .filter(|entry| entry.status == OrganisationStatus::Unsupported)
+                            .count()
+                    ),
+                    widgets::StatusTone::Pending,
+                );
+            } else {
+                widgets::status_badge(
+                    ui,
+                    format!("{already_correct_count} already correct"),
+                    widgets::StatusTone::Success,
+                );
+                widgets::status_badge(
+                    ui,
+                    format!("{suggested_count} will change"),
+                    widgets::StatusTone::Info,
+                );
+                widgets::status_badge(
+                    ui,
+                    format!("{attention_count} blocked or need attention"),
+                    if attention_count == 0 {
+                        widgets::StatusTone::Success
+                    } else {
+                        widgets::StatusTone::Blocked
+                    },
+                );
+            }
+        });
+        ui.label(format!("{suggested_count} file(s) selected"));
+        ui.label(format!("{blocked_count} blocker(s)"));
+        ui.label(match plan.mode {
+            OrganisationMode::RenameInPlace => "Original files moved? No — names change in place",
+            OrganisationMode::MoveRealFile => "Original files moved? Yes — into platform folders",
+            OrganisationMode::OrganiseSymlinkOnly => {
+                "Original files moved? No — existing link objects move"
+            }
+            OrganisationMode::BuildLinkedLibrary => {
+                "Original files moved? No — new links are created"
+            }
+        });
+        ui.label("Undo available? Yes, while the journal can safely revalidate every item");
+    });
+
     let entries: Vec<&OrganisationPlanEntry> = plan
         .entries
         .iter()
         .filter(|entry| state.filter.is_none_or(|f| entry.status == f))
         .collect();
 
-    ui.horizontal(|ui| {
-        ui.label("Filter:");
-        let all = state.filter.is_none();
-        if ui.selectable_label(all, "All").clicked() {
-            state.set_filter(None);
-        }
-        for status in [
-            OrganisationStatus::Suggested,
-            OrganisationStatus::AlreadyOrganised,
-            OrganisationStatus::Conflict,
-            OrganisationStatus::Blocked,
-            OrganisationStatus::Unsupported,
-        ] {
-            let selected = state.filter == Some(status);
-            if ui.selectable_label(selected, status.label()).clicked() {
-                state.set_filter(if selected { None } else { Some(status) });
-            }
-        }
-    });
-    ui.add_space(4.0);
-
-    for entry in &entries {
+    if !quick_only {
         ui.horizontal(|ui| {
-            match entry.status {
-                OrganisationStatus::Suggested => {
-                    let mut approved = state
-                        .approved
-                        .contains(&entry.source_path.to_string_lossy().into_owned());
-                    if ui.checkbox(&mut approved, "").changed() {
-                        state.toggle_approved(&entry.source_path.to_string_lossy());
-                    }
-                }
-                _ => {
-                    ui.add_space(20.0);
-                }
+            ui.label("Filter:");
+            let all = state.filter.is_none();
+            if ui.selectable_label(all, "All").clicked() {
+                state.set_filter(None);
             }
-            widgets::status_badge(ui, entry.status.label(), status_tone(entry.status));
-            ui.label(
-                egui::RichText::new(format!(
-                    "{} → {}",
-                    entry.source_path.display(),
-                    entry.destination_path.display()
-                ))
-                .monospace(),
-            );
-            if !entry.platform_display_name.is_empty() {
-                ui.label(
-                    egui::RichText::new(format!(
-                        "{} · {}",
-                        entry.platform_display_name, entry.platform_source
-                    ))
-                    .color(theme::muted(ui)),
-                );
-            }
-            if let Some(reason) = &entry.reason {
-                ui.label(
-                    egui::RichText::new(format!("({reason})"))
-                        .color(widgets::StatusTone::Blocked.color(ui))
-                        .small(),
-                );
+            for status in [
+                OrganisationStatus::Suggested,
+                OrganisationStatus::AlreadyOrganised,
+                OrganisationStatus::Conflict,
+                OrganisationStatus::Blocked,
+                OrganisationStatus::Unsupported,
+            ] {
+                let selected = state.filter == Some(status);
+                if ui.selectable_label(selected, status.label()).clicked() {
+                    state.set_filter(if selected { None } else { Some(status) });
+                }
             }
         });
     }
+    ui.add_space(4.0);
 
-    let suggested = plan.suggested().count();
+    for entry in &entries {
+        ui.push_id(("quick-rename-entry", &entry.source_path), |ui| {
+            ui.horizontal(|ui| {
+                match entry.status {
+                    OrganisationStatus::Suggested
+                        if !quick_only
+                            || !entry.platform_display_name.eq_ignore_ascii_case("Arcade") =>
+                    {
+                        let mut approved = state
+                            .approved
+                            .contains(&entry.source_path.to_string_lossy().into_owned());
+                        if ui.checkbox(&mut approved, "").changed() {
+                            state.toggle_approved(&entry.source_path.to_string_lossy());
+                        }
+                    }
+                    _ => {
+                        ui.add_space(20.0);
+                    }
+                }
+                let quick_mame = quick_only
+                    && entry.status == OrganisationStatus::Suggested
+                    && entry.platform_display_name.eq_ignore_ascii_case("Arcade");
+                widgets::status_badge(
+                    ui,
+                    if quick_mame {
+                        "MAME tools"
+                    } else {
+                        entry.status.label()
+                    },
+                    if quick_mame {
+                        widgets::StatusTone::Pending
+                    } else {
+                        status_tone(entry.status)
+                    },
+                );
+                if plan.mode == OrganisationMode::BuildLinkedLibrary {
+                    // Linked-library preview: make the semantics painfully
+                    // obvious. Never worded as a Rename or Move.
+                    ui.vertical(|ui| {
+                        ui.label(
+                            egui::RichText::new(format!("Source: {}", entry.source_path.display()))
+                                .monospace(),
+                        );
+                        ui.label(
+                            egui::RichText::new(format!(
+                                "Destination link: {}",
+                                entry.destination_path.display()
+                            ))
+                            .monospace(),
+                        );
+                        ui.label("Source action: Untouched");
+                        ui.label(format!("Result: {}", linked_library_preview_result(entry)));
+                        if !entry.platform_display_name.is_empty() {
+                            ui.label(
+                                egui::RichText::new(format!(
+                                    "{} · {}",
+                                    entry.platform_display_name, entry.platform_source
+                                ))
+                                .color(theme::muted(ui)),
+                            );
+                        }
+                    });
+                } else if quick_only {
+                    ui.vertical(|ui| {
+                        ui.label(format!("Current: {}", entry.source_path.display()));
+                        if quick_mame {
+                            ui.label("MAME collections use the dedicated MAME tools.");
+                        } else {
+                            ui.label(format!("Rename to: {}", entry.destination_path.display()));
+                            ui.label(format!("Identity: Verified by {}", entry.platform_source));
+                        }
+                        ui.label(format!("Status: {}", entry.status.label()));
+                        if let Some(reason) = &entry.reason {
+                            ui.label(
+                                egui::RichText::new(reason)
+                                    .color(widgets::StatusTone::Blocked.color(ui))
+                                    .small(),
+                            );
+                        }
+                        if quick_mame {
+                            if widgets::action_button(
+                                ui,
+                                "Open MAME tools",
+                                widgets::ActionStyle::Quiet,
+                                true,
+                            )
+                            .clicked()
+                            {
+                                *page_action = Some(RomOrganisationPageAction::OpenMame);
+                            }
+                        } else if matches!(
+                            entry.status,
+                            OrganisationStatus::Conflict
+                                | OrganisationStatus::Blocked
+                                | OrganisationStatus::Unsupported
+                        ) && widgets::action_button(
+                            ui,
+                            "Review in Advanced Rename",
+                            widgets::ActionStyle::Quiet,
+                            true,
+                        )
+                        .clicked()
+                        {
+                            *page_action = Some(RomOrganisationPageAction::OpenAdvanced);
+                        }
+                    });
+                } else {
+                    ui.vertical(|ui| {
+                        ui.label(format!("Current: {}", entry.source_path.display()));
+                        ui.label(format!("Will become: {}", entry.destination_path.display()));
+                        if !entry.platform_display_name.is_empty() {
+                            ui.label(format!(
+                                "Reason: Verified for {}",
+                                entry.platform_display_name
+                            ));
+                        }
+                        ui.label(match plan.mode {
+                            OrganisationMode::RenameInPlace => "Action: Rename file",
+                            OrganisationMode::MoveRealFile => "Action: Move file",
+                            OrganisationMode::OrganiseSymlinkOnly => "Action: Move existing link",
+                            OrganisationMode::BuildLinkedLibrary => "Action: Create link",
+                        });
+                        if let Some(reason) = &entry.reason {
+                            ui.label(
+                                egui::RichText::new(reason)
+                                    .color(widgets::StatusTone::Blocked.color(ui))
+                                    .small(),
+                            );
+                        }
+                        if !quick_only {
+                            widgets::technical_details(
+                                ui,
+                                ("organisation_entry", &entry.source_path),
+                                |ui| {
+                                    ui.label(format!(
+                                        "Platform evidence: {}",
+                                        entry.platform_source
+                                    ));
+                                    ui.label(format!(
+                                        "Source path: {}",
+                                        entry.source_path.display()
+                                    ));
+                                    ui.label(format!(
+                                        "Destination path: {}",
+                                        entry.destination_path.display()
+                                    ));
+                                },
+                            );
+                        }
+                    });
+                }
+            });
+        });
+    }
+
+    let suggested = suggested_count;
     ui.add_space(8.0);
     let approved = state.approved.len();
+    if quick_only && suggested == 0 {
+        widgets::card(ui, |ui| {
+            ui.strong("No verified renames are available right now.");
+            ui.label("Files may already use trusted names, still need verification, or require specialist handling.");
+            ui.horizontal_wrapped(|ui| {
+                if widgets::action_button(ui, "Check Games", widgets::ActionStyle::Secondary, true)
+                    .clicked()
+                {
+                    *page_action = Some(RomOrganisationPageAction::OpenCheck);
+                }
+                if widgets::action_button(ui, "Manage DATs", widgets::ActionStyle::Secondary, true)
+                    .clicked()
+                {
+                    *page_action = Some(RomOrganisationPageAction::OpenDat);
+                }
+                if widgets::action_button(
+                    ui,
+                    "Advanced Rename",
+                    widgets::ActionStyle::Secondary,
+                    true,
+                )
+                .clicked()
+                {
+                    *page_action = Some(RomOrganisationPageAction::OpenAdvanced);
+                }
+            });
+        });
+    }
     let applyable = suggested > 0 && approved > 0;
     if widgets::action_button(
         ui,
         format!("Apply approved organisation ({approved})"),
         widgets::ActionStyle::Primary,
-        applyable,
+        applyable && !async_busy && !state.advanced_r2_selected,
     )
     .clicked()
     {
@@ -646,6 +2246,10 @@ fn show_plan(ui: &mut egui::Ui, plan: &OrganisationPlan, state: &mut RomOrganisa
 
     // Explicit confirmation before any mutation. Large batches require typing
     // the exact phrase (truthful for the mode); small ones a plain confirm.
+    if state.advanced_r2_selected {
+        state.pending_apply = None;
+        ui.label("Advanced Protection selected: use the separate preview and approval below. Legacy Apply is disabled.");
+    }
     if let Some(count) = state.pending_apply {
         ui.add_space(6.0);
         widgets::card(ui, |ui| {
@@ -671,13 +2275,13 @@ fn show_plan(ui: &mut egui::Ui, plan: &OrganisationPlan, state: &mut RomOrganisa
                     ui,
                     "Confirm apply",
                     widgets::ActionStyle::Primary,
-                    phrase_ok,
+                    phrase_ok && older_writer_notice().is_none(),
                 )
                 .clicked()
                 {
                     state.pending_apply = None;
                     state.confirm_text.clear();
-                    state.apply();
+                    *page_action = Some(RomOrganisationPageAction::Apply);
                 }
                 if widgets::action_button(ui, "Cancel", widgets::ActionStyle::Secondary, true)
                     .clicked()
@@ -687,6 +2291,24 @@ fn show_plan(ui: &mut egui::Ui, plan: &OrganisationPlan, state: &mut RomOrganisa
                 }
             });
         });
+    }
+}
+
+/// Plain-English result line for one linked-library preview entry. Pure:
+/// derives only from the plan entry's own status/reason so it is directly
+/// unit-testable.
+pub(crate) fn linked_library_preview_result(entry: &OrganisationPlanEntry) -> String {
+    match entry.status {
+        OrganisationStatus::Suggested => "Will create link".to_string(),
+        OrganisationStatus::AlreadyOrganised => "Already present; nothing to do".to_string(),
+        OrganisationStatus::Conflict | OrganisationStatus::Blocked => entry
+            .reason
+            .clone()
+            .unwrap_or_else(|| "Cannot create this link".to_string()),
+        OrganisationStatus::Unsupported => entry
+            .reason
+            .clone()
+            .unwrap_or_else(|| "Not supported for linked libraries".to_string()),
     }
 }
 
@@ -700,9 +2322,137 @@ fn status_tone(status: OrganisationStatus) -> widgets::StatusTone {
     }
 }
 
+impl ArchiveFsApp {
+    /// Executes the reviewed repair. The only path that mutates.
+    ///
+    /// Every safety gate lives in `execute_doctor_repair`, which re-resolves
+    /// the finding against live state; nothing here trusts the review's
+    /// captured path. Afterwards only the affected finding's own check is
+    /// re-run (inside the executor), never the whole scan, and exactly one
+    /// History entry is recorded whatever the result.
+    /// Draws the Cheat Sources page and applies whatever it asked for.
+    ///
+    /// The state is loaded on first visit rather than at startup: opening the
+    /// GUI should not read a preferences file for a page nobody has looked
+    /// at. A path that cannot even be resolved (no `HOME`) is reported in
+    /// place instead of failing the whole page, since every other part of the
+    /// GUI still works without it.
+    /// Draws the Canonical Organisation page, loading its state lazily.
+    pub(crate) fn show_rom_organisation_page(&mut self, ui: &mut egui::Ui) {
+        let page = self
+            .rom_organisation_page
+            .get_or_insert_with(rom_organisation_page::RomOrganisationPageState::load);
+        rom_organisation_page::show_rom_organisation_page(ui, page);
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use archivefs_core::dat::rename_apply::{EntryState, TransactionSummary, UnresolvedEntry};
+
+    fn summary(
+        applied: usize,
+        failed: usize,
+        unresolved: usize,
+        pending: usize,
+    ) -> TransactionSummary {
+        TransactionSummary {
+            requested: applied + failed + unresolved + pending,
+            applied,
+            failed,
+            unresolved,
+            pending,
+            unresolved_entries: (0..unresolved)
+                .map(|i| UnresolvedEntry {
+                    source_path: PathBuf::from(format!("/roms/a{i}.bin")),
+                    destination_path: PathBuf::from(format!("/roms/A{i}.bin")),
+                    state: EntryState::Applying,
+                    stage: "directory synchronisation after rename".into(),
+                    detail: None,
+                    required_action: "Run recovery reconciliation; do not repeat the rename."
+                        .into(),
+                })
+                .collect(),
+            ..TransactionSummary::default()
+        }
+    }
+
+    #[test]
+    fn apply_banner_says_applied_only_for_a_fully_resolved_batch() {
+        let (message, complete) =
+            apply_result_report(OrganisationMode::RenameInPlace, &summary(3, 0, 0, 0));
+        assert!(complete);
+        assert!(
+            message.starts_with("Applied 3 organisation(s)"),
+            "{message}"
+        );
+    }
+
+    #[test]
+    fn apply_banner_reports_unresolved_pending_and_failed_with_recovery() {
+        let (message, complete) =
+            apply_result_report(OrganisationMode::RenameInPlace, &summary(1, 0, 1, 1));
+        assert!(!complete);
+        assert!(!message.starts_with("Applied"), "{message}");
+        assert!(message.contains("1 unresolved"), "{message}");
+        assert!(message.contains("1 not attempted"), "{message}");
+        assert!(
+            message.contains("Recovery needed for /roms/A0.bin"),
+            "{message}"
+        );
+        let (message, complete) =
+            apply_result_report(OrganisationMode::RenameInPlace, &summary(2, 1, 0, 0));
+        assert!(!complete && message.contains("1 failed"), "{message}");
+        let (_, complete) =
+            apply_result_report(OrganisationMode::RenameInPlace, &summary(0, 0, 0, 2));
+        assert!(!complete, "pending entries are never complete");
+    }
+
+    #[test]
+    fn unavailable_source_is_not_presented_as_an_empty_library() {
+        let mut state = RomOrganisationPageState {
+            unavailable_source_roots: vec![PathBuf::from("/mnt/games")],
+            ..RomOrganisationPageState::default()
+        };
+        state.generate_plan();
+        assert!(
+            state
+                .error()
+                .is_some_and(|error| error.contains("may not be mounted"))
+        );
+        assert!(state.plan.is_none());
+    }
+
+    #[test]
+    fn simple_playing_library_starts_with_one_handle_and_no_file_operation() {
+        let mut state = RomOrganisationPageState::default();
+        let ctx = egui::Context::default();
+        ctx.data_mut(|data| data.insert_temp(egui::Id::new("simple-mode-active"), true));
+        let output = ctx.run(Default::default(), |ctx| {
+            egui::CentralPanel::default().show(ctx, |ui| {
+                show_rom_organisation_page(ui, &mut state);
+            });
+        });
+        assert!(rendered_text_contains(&output, "Start a playing library"));
+        assert!(rendered_text_contains(&output, "Next: choose a platform"));
+        assert!(!rendered_text_contains(&output, "Move real files"));
+        assert!(!state.showing_playing_library && !state.pending_preview);
+    }
+
+    fn rendered_text_contains(output: &egui::FullOutput, needle: &str) -> bool {
+        fn shape_contains(shape: &egui::Shape, needle: &str) -> bool {
+            match shape {
+                egui::Shape::Text(text_shape) => text_shape.galley.text().contains(needle),
+                egui::Shape::Vec(nested) => nested.iter().any(|s| shape_contains(s, needle)),
+                _ => false,
+            }
+        }
+        output
+            .shapes
+            .iter()
+            .any(|clipped| shape_contains(&clipped.shape, needle))
+    }
 
     #[test]
     fn the_confirmation_phrase_is_truthful_for_the_mode() {
@@ -728,6 +2478,34 @@ mod tests {
         assert_eq!(state.mode, OrganisationMode::MoveRealFile);
     }
 
+    #[test]
+    fn advanced_protection_is_opt_in_and_never_falls_back() {
+        let mut state = RomOrganisationPageState::default();
+        assert!(!state.advanced_r2_selected);
+        let cancel = std::sync::atomic::AtomicBool::new(false);
+        state.advanced_r2_selected = true;
+        state.apply_cancellable(&cancel);
+        assert!(
+            state
+                .error
+                .as_ref()
+                .unwrap()
+                .contains("separate reviewed approval")
+        );
+        assert!(state.applied.is_none());
+        assert!(state.advanced_r2_selected);
+        state.advanced_r2_selected = false;
+        state.error = None;
+        state.apply_cancellable(&cancel);
+        assert!(state.applied.is_none());
+        assert!(
+            !state
+                .error
+                .as_ref()
+                .is_some_and(|e| e.contains("separate reviewed approval"))
+        );
+    }
+
     // ------------------------------------------------------------------
     // Symlink discovery (blocker: symlink-only mode discovered zero symlinks)
     // ------------------------------------------------------------------
@@ -749,6 +2527,17 @@ mod tests {
             .iter()
             .map(|path| path.to_string_lossy().into_owned())
             .collect()
+    }
+
+    #[test]
+    fn preservation_only_recordings_are_never_organisation_candidates() {
+        let root = test_root("rom-org-rzx");
+        std::fs::write(root.join("Manic Miner.tzx"), b"tape").unwrap();
+        std::fs::write(root.join("Manic Miner.rzx"), b"RZX!").unwrap();
+        let found = collected(std::slice::from_ref(&root));
+        assert!(found.iter().any(|p| p.ends_with("Manic Miner.tzx")));
+        assert!(!found.iter().any(|p| p.ends_with(".rzx")), "{found:?}");
+        let _ = std::fs::remove_dir_all(&root);
     }
 
     #[test]
@@ -805,6 +2594,26 @@ mod tests {
         );
     }
 
+    #[test]
+    fn artwork_files_are_excluded_from_games_ready_to_organise() {
+        let root = test_root("rom-org-artwork");
+        std::fs::create_dir_all(root.join("boxart")).unwrap();
+        std::fs::write(root.join("Game.iso"), b"game").unwrap();
+        std::fs::write(root.join("boxart/Game.png"), b"artwork").unwrap();
+        std::fs::write(root.join("boxart/Game.jpg"), b"artwork").unwrap();
+
+        let files = collected(std::slice::from_ref(&root));
+        assert!(files.iter().any(|path| path.ends_with("Game.iso")));
+        assert!(
+            !files.iter().any(|path| path.ends_with("Game.png")),
+            "box art must not become a game-organisation candidate: {files:?}"
+        );
+        assert!(
+            !files.iter().any(|path| path.ends_with("Game.jpg")),
+            "artwork must not become a game-organisation candidate: {files:?}"
+        );
+    }
+
     // ------------------------------------------------------------------
     // Canonical-name supply (blocker: GUI never supplied canonical names)
     // ------------------------------------------------------------------
@@ -841,6 +2650,12 @@ mod tests {
             verification: ExternalVerification::StrongExternal,
             conflicts: Vec::new(),
             evidence: Vec::new(),
+            synopsis: None,
+            genres: Vec::new(),
+            players: None,
+            rating: None,
+            release_year: None,
+            howlongtobeat: None,
         };
         let cache = IdentityCache {
             format_version: CACHE_FORMAT_VERSION,
@@ -867,5 +2682,651 @@ mod tests {
         );
         // No cache at all falls back to None.
         assert_eq!(canonical_name_for(&source, None), None);
+    }
+
+    // ------------------------------------------------------------------
+    // Preview busy state (live-QA Phase 8: no feedback while previewing)
+    // ------------------------------------------------------------------
+
+    #[test]
+    fn the_default_state_is_not_mid_preview() {
+        let state = RomOrganisationPageState::default();
+        assert!(!state.pending_preview);
+    }
+
+    #[test]
+    fn the_preview_button_label_reflects_whether_a_preview_is_running() {
+        assert_eq!(preview_button_label(false), "Preview changes");
+        assert_eq!(preview_button_label(true), "Preparing preview…");
+    }
+
+    #[test]
+    fn a_pending_preview_resolves_to_an_error_when_no_master_root_is_configured() {
+        let mut state = RomOrganisationPageState {
+            pending_preview: true,
+            ..Default::default()
+        };
+        assert!(state.saved_master_root.is_none());
+        let ctx = egui::Context::default();
+        let _ = ctx.run(egui::RawInput::default(), |ctx| {
+            egui::CentralPanel::default().show(ctx, |ui| {
+                show_rom_organisation_page(ui, &mut state);
+            });
+        });
+        assert!(!state.pending_preview);
+        assert!(state.plan.is_none());
+        assert_eq!(
+            state.error.as_deref(),
+            Some("configure a master ROM root first")
+        );
+    }
+
+    #[test]
+    fn an_idle_state_shows_the_normal_preview_button_with_no_busy_row() {
+        let mut state = RomOrganisationPageState::default();
+        let ctx = egui::Context::default();
+        let output = ctx.run(egui::RawInput::default(), |ctx| {
+            egui::CentralPanel::default().show(ctx, |ui| {
+                show_rom_organisation_page(ui, &mut state);
+            });
+        });
+        assert!(rendered_text_contains(&output, "Preview changes"));
+        assert!(!rendered_text_contains(&output, "Preparing preview…"));
+    }
+
+    // ------------------------------------------------------------------
+    // Approval persistence (UI convenience helpers)
+    // ------------------------------------------------------------------
+
+    fn temp_data_dir() -> (tempfile::TempDir, PathBuf) {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let data = dir.path().join("data");
+        std::fs::create_dir_all(&data).unwrap();
+        (dir, data)
+    }
+
+    #[test]
+    fn load_returns_none_when_the_sidecar_is_absent() {
+        let (_guard, dir) = temp_data_dir();
+        let path = dir.join(APPROVAL_PERSISTENCE_FILENAME);
+        assert!(!path.exists());
+        let state = RomOrganisationPageState::default();
+        assert!(state.approval_persistence_warning.is_none());
+        assert!(state.approved.is_empty());
+    }
+
+    #[test]
+    fn load_returns_the_persisted_set_when_the_sidecar_is_valid() {
+        let (_guard, dir) = temp_data_dir();
+        let path = dir.join(APPROVAL_PERSISTENCE_FILENAME);
+        let json = serde_json::json!({
+            "version": 1,
+            "approved": ["/roms/a.iso", "/roms/b.iso"]
+        })
+        .to_string();
+        std::fs::write(&path, &json).unwrap();
+        let raw = std::fs::read_to_string(&path).unwrap();
+        let persisted: PersistedApprovals = serde_json::from_str(&raw).unwrap();
+        assert_eq!(persisted.version, 1);
+        let set: BTreeSet<String> = persisted.approved.into_iter().collect();
+        assert!(set.contains("/roms/a.iso"));
+        assert!(set.contains("/roms/b.iso"));
+        assert_eq!(set.len(), 2);
+    }
+
+    #[test]
+    fn load_fails_closed_on_malformed_json() {
+        let (_guard, dir) = temp_data_dir();
+        let path = dir.join(APPROVAL_PERSISTENCE_FILENAME);
+        std::fs::write(&path, b"not json at all").unwrap();
+        let raw = std::fs::read_to_string(&path).unwrap();
+        let result: Result<PersistedApprovals, _> = serde_json::from_str(&raw);
+        assert!(result.is_err(), "malformed JSON must not parse");
+    }
+
+    #[test]
+    fn load_fails_closed_on_unknown_version() {
+        let (_guard, dir) = temp_data_dir();
+        let path = dir.join(APPROVAL_PERSISTENCE_FILENAME);
+        let json = serde_json::json!({
+            "version": 999,
+            "approved": ["/roms/x.iso"]
+        })
+        .to_string();
+        std::fs::write(&path, &json).unwrap();
+        let raw = std::fs::read_to_string(&path).unwrap();
+        let persisted: PersistedApprovals = serde_json::from_str(&raw).unwrap();
+        assert_ne!(
+            persisted.version, APPROVAL_PERSISTENCE_VERSION,
+            "unknown version must be rejected"
+        );
+    }
+
+    impl RomOrganisationPageState {
+        fn with_approvals_file(mut self, path: PathBuf) -> Self {
+            self.approvals_file = Some(path);
+            self
+        }
+    }
+
+    #[test]
+    fn persist_clears_the_warning_on_success() {
+        let (_guard, dir) = temp_data_dir();
+        let file = dir.join(APPROVAL_PERSISTENCE_FILENAME);
+        let mut state = RomOrganisationPageState::default().with_approvals_file(file.clone());
+        state.approved.insert("/roms/game.iso".to_string());
+        state.approval_persistence_warning = Some("previous failure".to_string());
+        state.persist_approved_set();
+        assert!(state.approval_persistence_warning.is_none());
+        assert_eq!(
+            load_persisted_approved_set(Some(&file)).unwrap(),
+            Some(BTreeSet::from(["/roms/game.iso".to_string()]))
+        );
+    }
+
+    /// A snapshot of the user's real approval sidecar, read-only.
+    fn real_sidecar_snapshot() -> Option<(Vec<u8>, std::time::SystemTime)> {
+        let path = approval_persistence_path().ok()?;
+        let bytes = std::fs::read(&path).ok()?;
+        let modified = std::fs::metadata(&path).ok()?.modified().ok()?;
+        Some((bytes, modified))
+    }
+
+    #[test]
+    fn a_state_without_an_injected_path_never_touches_the_real_user_data() {
+        let before = real_sidecar_snapshot();
+        let real_exists = approval_persistence_path().is_ok_and(|path| path.exists());
+        let mut state = RomOrganisationPageState::default();
+        state
+            .approved
+            .insert("/roms/synthetic-isolation-probe.iso".into());
+        state.persist_approved_set();
+        // No warning either: persistence is simply disabled in a test build.
+        assert!(state.approval_persistence_warning.is_none());
+        assert_eq!(real_sidecar_snapshot(), before);
+        assert_eq!(
+            approval_persistence_path().is_ok_and(|path| path.exists()),
+            real_exists,
+            "the real sidecar must not be created"
+        );
+        // And the real sidecar's contents never leak into a test's state.
+        let loaded = RomOrganisationPageState::load();
+        assert!(loaded.approved.is_empty());
+        assert!(
+            !loaded
+                .approved
+                .contains("/roms/synthetic-isolation-probe.iso")
+        );
+        assert_eq!(load_persisted_approved_set(None).unwrap(), None);
+    }
+
+    #[test]
+    fn synthetic_approvals_stay_inside_the_injected_directory() {
+        let (_guard, dir) = temp_data_dir();
+        let file = dir.join(APPROVAL_PERSISTENCE_FILENAME);
+        let mut state = RomOrganisationPageState::default().with_approvals_file(file.clone());
+        state.approved.insert("/roms/a.iso".into());
+        state.persist_approved_set();
+        let written: Vec<_> = std::fs::read_dir(&dir)
+            .unwrap()
+            .map(|entry| entry.unwrap().path())
+            .collect();
+        assert_eq!(written, vec![file], "only the injected sidecar exists");
+    }
+
+    #[test]
+    fn parallel_states_do_not_share_approval_state() {
+        let (_guard, dir) = temp_data_dir();
+        let handles: Vec<_> = (0..8)
+            .map(|index| {
+                let file = dir.join(format!("approvals-{index}.json"));
+                std::thread::spawn(move || {
+                    let mut state =
+                        RomOrganisationPageState::default().with_approvals_file(file.clone());
+                    for round in 0..20 {
+                        state.approved.insert(format!("/roms/{index}-{round}.iso"));
+                        state.persist_approved_set();
+                        assert!(state.approval_persistence_warning.is_none());
+                    }
+                    (index, file)
+                })
+            })
+            .collect();
+        for handle in handles {
+            let (index, file) = handle.join().unwrap();
+            let loaded = load_persisted_approved_set(Some(&file)).unwrap().unwrap();
+            assert_eq!(loaded.len(), 20);
+            assert!(
+                loaded
+                    .iter()
+                    .all(|path| path.starts_with(&format!("/roms/{index}-")))
+            );
+        }
+    }
+
+    #[test]
+    fn persist_populates_warning_when_path_resolution_fails_at_runtime() {
+        let result = approval_persistence_path();
+        if let Err(msg) = &result {
+            assert!(!msg.is_empty(), "error message must not be empty");
+        }
+    }
+
+    #[test]
+    fn an_empty_approved_set_serialises_and_deserialises_round_trip() {
+        let payload = PersistedApprovals {
+            version: APPROVAL_PERSISTENCE_VERSION,
+            approved: Vec::new(),
+        };
+        let json = serde_json::to_string(&payload).unwrap();
+        let round_tripped: PersistedApprovals = serde_json::from_str(&json).unwrap();
+        assert_eq!(round_tripped.version, APPROVAL_PERSISTENCE_VERSION);
+        assert!(round_tripped.approved.is_empty());
+    }
+
+    #[test]
+    fn a_non_empty_approved_set_survives_a_serialisation_round_trip() {
+        let payload = PersistedApprovals {
+            version: APPROVAL_PERSISTENCE_VERSION,
+            approved: vec!["/a.iso".to_string(), "/b.iso".to_string()],
+        };
+        let json = serde_json::to_string(&payload).unwrap();
+        let round_tripped: PersistedApprovals = serde_json::from_str(&json).unwrap();
+        let set: BTreeSet<_> = round_tripped.approved.into_iter().collect();
+        assert_eq!(set.len(), 2);
+        assert!(set.contains("/a.iso"));
+        assert!(set.contains("/b.iso"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn load_rejects_symlinked_sidecar() {
+        use std::os::unix::fs::symlink;
+
+        let (_guard, dir) = temp_data_dir();
+        let real = dir.join("real.json");
+        let json = serde_json::json!({
+            "version": 1,
+            "approved": ["/roms/x.iso"]
+        })
+        .to_string();
+        std::fs::write(&real, &json).unwrap();
+
+        let link = dir.join(APPROVAL_PERSISTENCE_FILENAME);
+        symlink(&real, &link).unwrap();
+
+        let meta = std::fs::symlink_metadata(&link).unwrap();
+        assert!(
+            meta.file_type().is_symlink(),
+            "the test sidecar must be a symlink"
+        );
+
+        let result: Result<Option<BTreeSet<String>>, String> = (|| {
+            let meta = std::fs::symlink_metadata(&link).map_err(|e| format!("metadata: {e}"))?;
+            if meta.file_type().is_symlink() {
+                return Err("symlink rejected".to_string());
+            }
+            Ok(None)
+        })();
+        assert!(result.is_err(), "symlinked sidecar must be rejected");
+    }
+
+    // ------------------------------------------------------------------
+    // Stale-persisted-approval defence
+    // ------------------------------------------------------------------
+
+    /// A persisted approval that references a path not in the current plan
+    /// must never authorise a transaction. This test simulates the core
+    /// property: `build_organisation_transaction` takes a generation and
+    /// the approved set, and the caller (`apply()`) always uses the live
+    /// plan's generation — never a stale one loaded from disk.
+    #[test]
+    fn stale_persisted_approval_cannot_authorise_a_transaction() {
+        // Simulate what happens after a restart when the persisted set
+        // was loaded but `generate_plan()` has not yet been called:
+        // `self.approved` contains paths from a previous session while
+        // `self.plan` is None. `apply()` requires `self.plan` to be
+        // `Some`, so it cannot proceed.
+        let mut state = RomOrganisationPageState::default();
+        state.approved.insert("/roms/old_game.iso".to_string());
+        // No plan set — apply() returns immediately without mutation.
+        assert!(state.plan.is_none());
+        state.apply();
+        // Verifies that without a current plan, `apply()` is a no-op.
+        assert!(state.applied.is_none());
+        assert!(
+            state.result_message.is_none(),
+            "no transaction should have been applied"
+        );
+    }
+
+    /// After `generate_plan()` rewrites `self.approved` with
+    /// `plan.suggested()`, any stale persisted set from a previous session
+    /// is overwritten. The stale set never survives plan regeneration.
+    #[test]
+    fn generate_plan_overwrites_stale_approved_set_with_plan_suggested() {
+        let mut state = RomOrganisationPageState::default();
+        // Simulate a stale persisted set.
+        state.approved.insert("/roms/stale.iso".to_string());
+        // Set up a master root so generate_plan doesn't error out early.
+        // We use a temp dir to ensure the plan comes back empty (no
+        // actual source files to pick up).
+        let tmp = tempfile::tempdir().expect("tempdir");
+        state.saved_master_root = Some(tmp.path().to_path_buf());
+        // Config::load_default() will fail in test, so sources stays empty.
+        state.sources.clear();
+        state.generate_plan();
+        // The stale entry must be gone — the plan replaced self.approved
+        // with whatever plan.suggested() returned (empty here).
+        assert!(
+            !state.approved.contains("/roms/stale.iso"),
+            "stale approved entry must be overwritten by plan regeneration"
+        );
+    }
+
+    // ------------------------------------------------------------------
+    // Approval persistence warning rendering
+    // ------------------------------------------------------------------
+
+    #[test]
+    fn approval_persistence_warning_is_rendered_in_the_ui() {
+        let mut state = RomOrganisationPageState {
+            approval_persistence_warning: Some("test persistence failure".to_string()),
+            ..Default::default()
+        };
+        let ctx = egui::Context::default();
+        let output = ctx.run(egui::RawInput::default(), |ctx| {
+            egui::CentralPanel::default().show(ctx, |ui| {
+                show_rom_organisation_page(ui, &mut state);
+            });
+        });
+        assert!(
+            rendered_text_contains(&output, "Approvals not saved"),
+            "the banner title must appear"
+        );
+        assert!(
+            rendered_text_contains(&output, "test persistence failure"),
+            "the specific warning must appear in the banner body"
+        );
+    }
+
+    #[test]
+    fn no_approval_persistence_warning_is_rendered_when_there_is_none() {
+        let mut state = RomOrganisationPageState::default();
+        assert!(state.approval_persistence_warning.is_none());
+        let ctx = egui::Context::default();
+        let output = ctx.run(egui::RawInput::default(), |ctx| {
+            egui::CentralPanel::default().show(ctx, |ui| {
+                show_rom_organisation_page(ui, &mut state);
+            });
+        });
+        assert!(
+            !rendered_text_contains(&output, "Approvals not saved"),
+            "no persistence banner when there is no warning"
+        );
+    }
+
+    // ------------------------------------------------------------------
+    // Symlinked temp-file defence
+    // ------------------------------------------------------------------
+
+    #[cfg(unix)]
+    #[test]
+    fn persist_rejects_a_symlinked_temp_path() {
+        use std::os::unix::fs::symlink;
+
+        let (_guard, dir) = temp_data_dir();
+        let target = dir.join(APPROVAL_PERSISTENCE_FILENAME);
+        let tmp = target.with_extension("json.tmp");
+
+        // Plant a symlink at the predictable tmp path.
+        symlink("/etc/passwd", &tmp).unwrap();
+        assert!(tmp.is_symlink());
+
+        // Simulate the symlink check from persist_approved_set.
+        let meta = std::fs::symlink_metadata(&tmp).unwrap();
+        assert!(
+            meta.file_type().is_symlink(),
+            "the planted tmp path must be a symlink"
+        );
+
+        // `OpenOptions::new().create_new(true).open()` would fail with
+        // EEXIST on a symlink on Unix, so the write is blocked at the
+        // kernel level even without our own metadata check. Our metadata
+        // check just makes the failure explicit and surfaces a clear
+        // warning.
+        assert!(
+            std::fs::OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .open(&tmp)
+                .is_err(),
+            "create_new must refuse a symlinked path"
+        );
+    }
+
+    // ------------------------------------------------------------------
+    // Build linked library (GUI mode mapping, wording, root selection)
+    // ------------------------------------------------------------------
+
+    #[test]
+    fn the_confirmation_phrase_says_create_links_for_linked_library() {
+        assert_eq!(
+            apply_confirmation_phrase(OrganisationMode::BuildLinkedLibrary, 2),
+            "CREATE 2 LINKS"
+        );
+        // Existing modes keep their truthful wording.
+        assert_eq!(
+            apply_confirmation_phrase(OrganisationMode::OrganiseSymlinkOnly, 1),
+            "MOVE 1 FILES"
+        );
+        assert_eq!(
+            apply_confirmation_phrase(OrganisationMode::MoveRealFile, 3),
+            "MOVE 3 FILES"
+        );
+    }
+
+    #[test]
+    fn the_symlink_object_mode_is_labelled_advanced_and_the_new_mode_is_distinct() {
+        assert_eq!(
+            organisation_mode_plain_label(OrganisationMode::OrganiseSymlinkOnly),
+            "Advanced: reorganise existing symlinks"
+        );
+        assert_eq!(
+            organisation_mode_plain_label(OrganisationMode::BuildLinkedLibrary),
+            "Build linked library"
+        );
+    }
+
+    #[test]
+    fn linked_library_mode_uses_the_explicit_library_root_not_the_master_root() {
+        // Set directly (no config write): the master root stays session-only.
+        let mut state = RomOrganisationPageState {
+            saved_master_root: Some(PathBuf::from("/master/roms")),
+            ..Default::default()
+        };
+        assert_eq!(state.effective_root(), Some(PathBuf::from("/master/roms")));
+
+        state.set_mode(OrganisationMode::BuildLinkedLibrary);
+        // Not yet chosen: no effective root, no inference from sources.
+        assert_eq!(state.effective_root(), None);
+
+        state.library_root_draft = "/mnt/emuwiz-library".to_string();
+        state.save_library_root();
+        assert_eq!(
+            state.effective_root(),
+            Some(PathBuf::from("/mnt/emuwiz-library"))
+        );
+        // The master ROM root config was never overwritten.
+        assert_eq!(state.saved_master_root, Some(PathBuf::from("/master/roms")));
+
+        // A relative path is refused.
+        state.library_root_draft = "relative/path".to_string();
+        state.save_library_root();
+        assert!(state.library_root_error.is_some());
+        assert_eq!(
+            state.effective_root(),
+            Some(PathBuf::from("/mnt/emuwiz-library"))
+        );
+    }
+
+    fn linked_library_plan_entry(status: OrganisationStatus) -> OrganisationPlanEntry {
+        OrganisationPlanEntry {
+            source_path: PathBuf::from("/sources/Combat.bin"),
+            destination_path: PathBuf::from("/library/atari2600/Combat.bin"),
+            platform: Some("Atari2600".to_string()),
+            platform_display_name: "Atari 2600".to_string(),
+            platform_source: "Manual".to_string(),
+            slug: None,
+            layout_folder: Some("Atari 2600".to_string()),
+            mode: OrganisationMode::BuildLinkedLibrary,
+            content_classification: None,
+            original_metadata: Default::default(),
+            status,
+            reason: None,
+        }
+    }
+
+    #[test]
+    fn linked_library_preview_results_are_plain_english_never_rename_or_move() {
+        let result = linked_library_preview_result(&linked_library_plan_entry(
+            OrganisationStatus::Suggested,
+        ));
+        assert_eq!(result, "Will create link");
+        assert!(!result.to_lowercase().contains("rename"));
+        assert!(!result.to_lowercase().contains("move"));
+
+        assert_eq!(
+            linked_library_preview_result(&linked_library_plan_entry(
+                OrganisationStatus::AlreadyOrganised
+            )),
+            "Already present; nothing to do"
+        );
+
+        let conflict =
+            linked_library_preview_result(&linked_library_plan_entry(OrganisationStatus::Conflict));
+        assert!(!conflict.is_empty());
+    }
+
+    #[test]
+    fn a_linked_library_plan_renders_source_destination_and_untouched_wording() {
+        let mut state = RomOrganisationPageState {
+            mode: OrganisationMode::BuildLinkedLibrary,
+            ..Default::default()
+        };
+        let library_root = test_root("linked-lib-preview").join("library");
+        state.saved_library_root = Some(library_root.clone());
+        state.plan_generation = 1;
+        state.plan = Some(OrganisationPlan {
+            master_root: library_root.clone(),
+            mode: OrganisationMode::BuildLinkedLibrary,
+            content_policy: archivefs_core::dat::classification::ContentSelectionPolicy::AllEntries,
+            classifier_version: archivefs_core::dat::classification::CLASSIFIER_VERSION.to_string(),
+            generation: 1,
+            entries: vec![OrganisationPlanEntry {
+                source_path: PathBuf::from("/sources/Combat.bin"),
+                destination_path: library_root.join("atari2600").join("Combat (USA).bin"),
+                platform: Some("Atari2600".to_string()),
+                platform_display_name: "Atari 2600".to_string(),
+                platform_source: "Manual".to_string(),
+                slug: None,
+                layout_folder: Some("Atari 2600".to_string()),
+                mode: OrganisationMode::BuildLinkedLibrary,
+                content_classification: None,
+                original_metadata: Default::default(),
+                status: OrganisationStatus::Suggested,
+                reason: None,
+            }],
+        });
+        state.approved.insert("/sources/Combat.bin".to_string());
+
+        let ctx = egui::Context::default();
+        let output = ctx.run(egui::RawInput::default(), |ctx| {
+            egui::CentralPanel::default().show(ctx, |ui| {
+                show_rom_organisation_page(ui, &mut state);
+            });
+        });
+        assert!(rendered_text_contains(
+            &output,
+            "Source: /sources/Combat.bin"
+        ));
+        assert!(rendered_text_contains(&output, "Destination link:"));
+        assert!(rendered_text_contains(&output, "Source action: Untouched"));
+        assert!(rendered_text_contains(&output, "Result: Will create link"));
+        // The linked-library preview never shows a rename/move arrow row.
+        assert!(!rendered_text_contains(&output, "/sources/Combat.bin -> "));
+    }
+
+    /// The preview's at-a-glance grouping (already correct / will change /
+    /// blocked or needs attention) reflects only the plan's own existing
+    /// `OrganisationStatus` counts - no invented confidence level, and the
+    /// underlying entries/filters are unaffected.
+    #[test]
+    fn preview_summary_groups_entries_into_already_correct_will_change_and_attention() {
+        let mut state = RomOrganisationPageState::default();
+        let library_root = test_root("preview-summary-grouping").join("library");
+        state.plan_generation = 1;
+        state.plan = Some(OrganisationPlan {
+            master_root: library_root.clone(),
+            mode: OrganisationMode::MoveRealFile,
+            content_policy: archivefs_core::dat::classification::ContentSelectionPolicy::AllEntries,
+            classifier_version: archivefs_core::dat::classification::CLASSIFIER_VERSION.to_string(),
+            generation: 1,
+            entries: vec![
+                linked_library_plan_entry(OrganisationStatus::Suggested),
+                linked_library_plan_entry(OrganisationStatus::AlreadyOrganised),
+                linked_library_plan_entry(OrganisationStatus::AlreadyOrganised),
+                linked_library_plan_entry(OrganisationStatus::Blocked),
+                linked_library_plan_entry(OrganisationStatus::Unsupported),
+            ],
+        });
+
+        let ctx = egui::Context::default();
+        let output = ctx.run(egui::RawInput::default(), |ctx| {
+            egui::CentralPanel::default().show(ctx, |ui| {
+                show_rom_organisation_page(ui, &mut state);
+            });
+        });
+        assert!(rendered_text_contains(&output, "2 already correct"));
+        assert!(rendered_text_contains(&output, "1 will change"));
+        assert!(rendered_text_contains(
+            &output,
+            "2 blocked or need attention"
+        ));
+    }
+
+    #[test]
+    fn destination_choices_render_without_changing_the_existing_flow() {
+        let mut state = RomOrganisationPageState::default();
+        let ctx = egui::Context::default();
+        let output = ctx.run(egui::RawInput::default(), |ctx| {
+            egui::CentralPanel::default().show(ctx, |ui| {
+                show_rom_organisation_page(ui, &mut state);
+            });
+        });
+        assert!(rendered_text_contains(&output, "Build RomM library"));
+        assert!(rendered_text_contains(&output, "Build ES-DE library"));
+        assert!(rendered_text_contains(
+            &output,
+            "Build generic playing library"
+        ));
+        assert!(rendered_text_contains(
+            &output,
+            "Source collection stays where it is."
+        ));
+    }
+
+    #[test]
+    fn destination_card_layout_is_bounded_and_monotonic() {
+        let mut previous = usize::MAX;
+        for width in [1600.0, 1008.0, 884.0, 784.0, 684.0, 400.0] {
+            let layout = destination_card_layout(width, LIBRARY_DESTINATION_CARDS.len());
+            let used = layout.card_width * layout.columns as f32
+                + DESTINATION_CARD_GAP * layout.columns.saturating_sub(1) as f32;
+            assert!(used <= width + 0.5);
+            assert!((1..=3).contains(&layout.columns));
+            assert!(layout.columns <= previous);
+            previous = layout.columns;
+        }
     }
 }

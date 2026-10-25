@@ -1,0 +1,2762 @@
+//! Gamer View: the simple, one-screen front door (search + platform chips +
+//! game list + selected-game action panel) - see
+//! docs/GUI_NAVIGATION_RESET_DESIGN.md. Extracted verbatim from `main.rs`
+//! (2026-08-22, GUI extraction Phase A); `GuiMode` itself (which of Gamer
+//! View/Advanced View is active) stays in `main.rs` as top-level app state,
+//! since the top-level render dispatch reads it directly - only Gamer
+//! View's own screen state (`GamerViewScreen`) and rendering moved here.
+
+use super::*;
+
+pub(crate) mod alpha_jump;
+mod layout;
+mod rail;
+mod stage;
+
+pub(crate) use alpha_jump::AlphaJumpIndex;
+pub(crate) use layout::GamerStageLayout;
+
+/// Which of Gamer View's two screens is currently showing - the
+/// one-screen game list (default) or the read-only Details view reached
+/// from the selected-game action panel. Never persisted; always starts
+/// on `GameList`.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(crate) enum GamerViewScreen {
+    #[default]
+    GameList,
+    Details,
+}
+
+/// The small identity vocabulary used by Gamer View's Details screen. The
+/// underlying evidence verdict remains authoritative; these labels only make
+/// an already-available result understandable without exposing its internal
+/// evidence terminology.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum GamerIdentityStatus {
+    Identified,
+    Uncertain,
+    ConflictingEvidence,
+    StillChecking,
+}
+
+impl GamerIdentityStatus {
+    pub(crate) const fn label(self) -> &'static str {
+        match self {
+            Self::Identified => "Identified",
+            Self::Uncertain => "Uncertain",
+            Self::ConflictingEvidence => "Conflicting evidence",
+            Self::StillChecking => "Still checking",
+        }
+    }
+}
+
+pub(crate) fn gamer_identity_status_from_verdict(
+    status: archivefs_core::platform_evidence_fusion::identity_presentation::IdentityStatus,
+) -> GamerIdentityStatus {
+    use archivefs_core::platform_evidence_fusion::identity_presentation::IdentityStatus;
+
+    match status {
+        IdentityStatus::Conflict => GamerIdentityStatus::ConflictingEvidence,
+        IdentityStatus::Ambiguous | IdentityStatus::Unknown => GamerIdentityStatus::Uncertain,
+        IdentityStatus::VerifiedByDat
+        | IdentityStatus::ContentAndDatAgree
+        | IdentityStatus::ContentOnly
+        | IdentityStatus::DatOnly => GamerIdentityStatus::Identified,
+    }
+}
+
+/// Gamer View's own wording for the scan its "Add games" flow just
+/// chained - never the Advanced-View "Scan complete: N source(s)
+/// scanned, N archive(s) found" phrasing `source_action_success_message`
+/// uses, which names "source(s)"/"archive(s)" directly. Reads the exact
+/// same already-computed `ingestion_stats` Collection Discovery and the
+/// Advanced View Sources banner already read - no detection logic is
+/// duplicated, only the presentation.
+pub(crate) fn gamer_view_first_scan_message(summary: &ScanPersistSummary) -> String {
+    let stats = &summary.ingestion_stats;
+    let found = stats.loose_roms
+        + stats.disc_images
+        + stats.amiga_images
+        + stats.computer_disks
+        + stats.game_folders
+        + stats.archives;
+    if found == 0 {
+        return "We looked through that folder but didn't find any games in it. \
+                Double-check it's the right folder, or try another one."
+            .to_string();
+    }
+    let plural = if found == 1 { "game" } else { "games" };
+    let skipped = summary.skipped_files_total();
+    if skipped > 0 {
+        return format!(
+            "Found {found} {plural}. {skipped} file{} need attention.",
+            if skipped == 1 { "" } else { "s" }
+        );
+    }
+    let ingestion_skipped = summary.ingestion_skip_reasons.total();
+    if ingestion_skipped > 0 {
+        return format!(
+            "Found {found} {plural}. {ingestion_skipped} item{} need attention.",
+            if ingestion_skipped == 1 { "" } else { "s" }
+        );
+    }
+    if summary.counts.errors_count > 0 || !summary.folder_errors.is_empty() {
+        return format!("Found {found} {plural}. Some folders need attention.");
+    }
+    format!("Found {found} {plural}!")
+}
+
+/// Whether the completed scan has existing, truthful detail that the user can
+/// review. This only consults counters already supplied by the scan; it does
+/// not infer a count from the library rows.
+pub(crate) fn gamer_view_scan_needs_review(summary: &ScanPersistSummary) -> bool {
+    summary.skipped_files_total() > 0
+        || summary.ingestion_skip_reasons.total() > 0
+        || summary.counts.errors_count > 0
+        || !summary.folder_errors.is_empty()
+}
+
+/// Beginner-facing failure copy for Gamer View's explicit folder-add action.
+/// The precise backend/config/I/O error is retained separately in
+/// `ActionFeedback::more_information` and rendered under Technical details.
+pub(crate) const GAMER_ADD_GAMES_FAILURE_MESSAGE: &str =
+    "EmuWiz couldn't finish adding that game folder, so no scan was started.";
+/// Gamer View's plain-language primary-action state for a selected game -
+/// see docs/GUI_NAVIGATION_RESET_DESIGN.md §2.3. Never exposes a raw
+/// `MountState` variant name (finding #4); Advanced View keeps the
+/// precise names unchanged (`mount_validation_label`, `planned_action_label`,
+/// `MountState`'s own `Display` impl - none of those are touched here).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum GamerPrimaryAction {
+    Mount,
+    Unmount,
+    NoMountingNeeded,
+    Blocked(String),
+}
+
+pub(crate) fn gamer_primary_action(state: MountState) -> GamerPrimaryAction {
+    match state {
+        MountState::Pending => GamerPrimaryAction::Mount,
+        MountState::Mounted => GamerPrimaryAction::Unmount,
+        MountState::NotMountable => GamerPrimaryAction::NoMountingNeeded,
+        MountState::MountPathExists => GamerPrimaryAction::Blocked(
+            "A file already exists where EmuWiz would prepare this game. Open Advanced View to \
+             resolve this."
+                .to_string(),
+        ),
+    }
+}
+
+/// The short, list-row-sized counterpart of `gamer_primary_action` - one
+/// or two words, safe to append after a title/platform pair. The list has
+/// no per-row launch plan, so a mount-free game reads only "Game found"
+/// (media is usable); whether a safe core exists is the selected-game card's
+/// verdict ("Ready to play" vs "Needs setup"), never claimed here.
+pub(crate) fn gamer_primary_action_short_label(action: &GamerPrimaryAction) -> &'static str {
+    match action {
+        GamerPrimaryAction::Mount => "Prepare game",
+        GamerPrimaryAction::Unmount => "Mounted",
+        GamerPrimaryAction::NoMountingNeeded => "Game found",
+        GamerPrimaryAction::Blocked(_) => "Needs attention",
+    }
+}
+
+/// The Gamer View card's **single** reconciled readiness state, derived from
+/// media/mount readiness *and* safe-launch readiness together. The card's
+/// status line and its primary action both consume this one value, so a
+/// game can never simultaneously read "Ready to play" and "Can't play yet".
+///
+/// A game that needs no mounting is only `Ready` when the shared launch
+/// planner ([`launch_readiness_page::gamer_play_action`]) actually produced
+/// a safe RetroArch request; a blocked plan is `NeedsSetup`, never
+/// "Ready to play". No launch-planning rule is re-implemented here.
+pub(crate) enum GamerReadiness<'a> {
+    /// Pending mount - the media is usable once mounted.
+    Mount,
+    /// A container needs a bounded read-only preparation pass before it can
+    /// expose Play.
+    Prepare,
+    /// More than one safe member was found; the user must choose one.
+    ChooseMember {
+        candidates: &'a [archivefs_core::PreparedMemberCandidate],
+    },
+    /// Currently mounted.
+    Unmount,
+    /// Media usable and a safe launch plan exists.
+    Ready {
+        request: &'a launch_readiness_page::TypedLaunchRequest,
+    },
+    /// Media usable, but the launch is blocked. The typed blocker supplies
+    /// both the novice heading and the correct next action.
+    NeedsSetup {
+        blocker: &'a launch_readiness_page::GamerBlocker,
+    },
+    /// The media / mount itself is blocked. Carries the mount blocker.
+    NeedsAttention { reason: String },
+}
+
+/// Reconciles mount state and the shared launch-plan projection into one
+/// [`GamerReadiness`]. `MountState` alone never yields `Ready`.
+pub(crate) fn gamer_readiness<'a>(
+    mount_state: MountState,
+    play_action: &'a launch_readiness_page::GamerPlayAction,
+) -> GamerReadiness<'a> {
+    match gamer_primary_action(mount_state) {
+        GamerPrimaryAction::Mount => GamerReadiness::Mount,
+        GamerPrimaryAction::Unmount => GamerReadiness::Unmount,
+        GamerPrimaryAction::Blocked(reason) => GamerReadiness::NeedsAttention { reason },
+        GamerPrimaryAction::NoMountingNeeded => match play_action {
+            launch_readiness_page::GamerPlayAction::Launch(request) => {
+                GamerReadiness::Ready { request }
+            }
+            launch_readiness_page::GamerPlayAction::BlockedTyped(blocker) => {
+                GamerReadiness::NeedsSetup { blocker }
+            }
+        },
+    }
+}
+
+/// Maps the shared launch planner's typed projection onto a
+/// [`GamerReadiness`]. Play is offered only when the planner actually
+/// produced a safe request; a typed blocker becomes `NeedsSetup`, which
+/// routes to the correct setup action - never back to Prepare.
+fn planner_readiness(play_action: &launch_readiness_page::GamerPlayAction) -> GamerReadiness<'_> {
+    match play_action {
+        launch_readiness_page::GamerPlayAction::Launch(request) => {
+            GamerReadiness::Ready { request }
+        }
+        launch_readiness_page::GamerPlayAction::BlockedTyped(blocker) => {
+            GamerReadiness::NeedsSetup { blocker }
+        }
+    }
+}
+
+/// Archive containers have one extra, explicit preparation step. Mount state
+/// alone is never treated as launch readiness: Play is available only after a
+/// specific member has been retained and the shared planner accepts it.
+pub(crate) fn gamer_archive_readiness<'a>(
+    mount_state: MountState,
+    prepared: bool,
+    play_action: &'a launch_readiness_page::GamerPlayAction,
+    member_choices: Option<&'a [archivefs_core::PreparedMemberCandidate]>,
+) -> GamerReadiness<'a> {
+    match gamer_primary_action(mount_state) {
+        GamerPrimaryAction::Blocked(reason) => GamerReadiness::NeedsAttention { reason },
+        // An explicit multi-member chooser always wins: the user must pick
+        // one member before any launch plan can be trusted.
+        GamerPrimaryAction::Mount | GamerPrimaryAction::Unmount if member_choices.is_some() => {
+            GamerReadiness::ChooseMember {
+                candidates: member_choices.expect("checked above"),
+            }
+        }
+        // Not mounted yet: the bounded preparation pass still has to run. A
+        // leftover `prepared` flag from a previous selection cannot stand in
+        // for a live mount.
+        GamerPrimaryAction::Mount => GamerReadiness::Prepare,
+        // Mounted, but no compatible member has been retained yet.
+        GamerPrimaryAction::Unmount if !prepared => GamerReadiness::Prepare,
+        // Mounted with exactly one retained compatible member: the shared
+        // launch planner has already evaluated that exact member (its inner
+        // path is fed through `build_launch_readiness_input`), so defer to
+        // it just like a mount-free game. Successful retention therefore
+        // reaches Play - or the correct typed blocker - instead of looping
+        // back to Prepare.
+        GamerPrimaryAction::Unmount => planner_readiness(play_action),
+        GamerPrimaryAction::NoMountingNeeded => planner_readiness(play_action),
+    }
+}
+
+/// The one- or two-word status word for a [`GamerReadiness`] - the text on
+/// the card's status line, kept in lockstep with its primary action.
+pub(crate) fn gamer_readiness_short_label(readiness: &GamerReadiness<'_>) -> &'static str {
+    match readiness {
+        GamerReadiness::Mount => "Prepare game",
+        GamerReadiness::Prepare => "Ready to prepare",
+        GamerReadiness::ChooseMember { .. } => "Choose game file",
+        GamerReadiness::Unmount => "Mounted",
+        GamerReadiness::Ready { request } if !request.unverified_warnings().is_empty() => {
+            "Ready, compatibility unverified"
+        }
+        GamerReadiness::Ready { .. } => "Ready to play",
+        GamerReadiness::NeedsSetup { .. } => "Needs setup",
+        GamerReadiness::NeedsAttention { .. } => "Needs attention",
+    }
+}
+
+/// Keeps the planner's exact refusal available without exposing backend
+/// terminology in the main sentence, and exposes the blocker-specific next
+/// action to the caller through the returned `GamerViewAction`.
+pub(crate) fn show_gamer_launch_blocker(
+    ui: &mut egui::Ui,
+    blocker: &launch_readiness_page::GamerBlocker,
+) {
+    ui.colored_label(ui.visuals().warn_fg_color, blocker.heading());
+    let next = match blocker.kind {
+        launch_readiness_page::GamerBlockerKind::CheckingGame => {
+            "EmuWiz is still checking this game."
+        }
+        launch_readiness_page::GamerBlockerKind::UnknownSystem => {
+            "Review the game identity and assign its system if you know it."
+        }
+        launch_readiness_page::GamerBlockerKind::InspectionIncomplete => {
+            "Rescan this game's source folder, then return here. Nothing about the game was changed."
+        }
+        launch_readiness_page::GamerBlockerKind::ConflictingIdentity => {
+            "Review the conflicting identity evidence before choosing a system."
+        }
+        launch_readiness_page::GamerBlockerKind::ContentNeedsPreparation => {
+            "Prepare the game's content, then return here to play."
+        }
+        launch_readiness_page::GamerBlockerKind::EmulatorNotInstalled => {
+            "Open Emulator Setup to install or register this emulator."
+        }
+        launch_readiness_page::GamerBlockerKind::EmulatorSetupIncomplete => {
+            "Open Emulator Setup to finish this emulator's setup."
+        }
+        launch_readiness_page::GamerBlockerKind::EmulatorNotChecked => {
+            "Run the emulator check to see what is ready on this computer."
+        }
+        launch_readiness_page::GamerBlockerKind::NoSafeEmulator => {
+            "Run the emulator check or review launch readiness for details."
+        }
+        launch_readiness_page::GamerBlockerKind::MultipleChoices => {
+            "Choose one emulator explicitly before playing."
+        }
+        launch_readiness_page::GamerBlockerKind::LaunchPlanInvalid => {
+            "Review launch readiness for the exact reason this plan was refused."
+        }
+    };
+    ui.label(next);
+    widgets::technical_details(ui, "gamer-launch-blocker", |ui| {
+        ui.label(&blocker.detail);
+    });
+}
+
+const GAMER_PLAY_LABEL: &str = "Play";
+const COPY_FOLDER_LOCATION_LABEL: &str = "Copy folder location";
+
+fn gamer_copy_location_label() -> &'static str {
+    COPY_FOLDER_LOCATION_LABEL
+}
+
+/// Prefers the real, human title from metadata; falls back to the
+/// archive's filename (without extension) rather than ever showing a raw
+/// internal path as if it were a title.
+pub(crate) fn gamer_display_title(record: &ArchiveRecord) -> String {
+    record
+        .metadata
+        .title
+        .clone()
+        .filter(|title| !title.is_empty())
+        .unwrap_or_else(|| {
+            record
+                .mount_plan
+                .archive
+                .path
+                .file_stem()
+                .and_then(|stem| stem.to_str())
+                .unwrap_or("Unknown game")
+                .to_string()
+        })
+}
+
+/// Stage 3's exact rule: Undo is shown only when the selected game has a
+/// genuinely reversible operation recorded - never speculatively. This
+/// only gates *visibility*; the click still routes through
+/// `start_cheat_install_rollback`, which carries its own authoritative
+/// safety checks unchanged.
+pub(crate) fn gamer_undo_available(
+    workflow: Option<&CheatWorkflowState>,
+    selected: Option<&Path>,
+) -> bool {
+    let (Some(workflow), Some(selected)) = (workflow, selected) else {
+        return false;
+    };
+    workflow.archive_path == selected
+        && matches!(workflow.transaction, CheatTransactionState::Result { .. })
+}
+
+pub(crate) enum GamerViewAction {
+    Operation(OperationRequest),
+    Prepare(PathBuf),
+    SelectArchiveMember(PathBuf, String),
+    Play(Box<launch_readiness_page::TypedLaunchRequest>),
+    OpenCheatsMods(PathBuf),
+    /// The folder to copy to the clipboard - "Copy folder location" (§2.1's
+    /// action visibility rules). No file-manager process is launched;
+    /// see the implementation summary for why (no such capability, and
+    /// no new external-process dependency, exists in this codebase today).
+    CopyLocation(String),
+    Undo,
+    /// First-run "Add games": the folder a person just picked via the
+    /// native folder dialog (opened synchronously inside `show_gamer_view`,
+    /// matching every other `rfd::FileDialog` call site in this codebase).
+    /// The caller reuses the exact same `SourceAction::Add` the Advanced
+    /// View Sources page uses - see `gamer_view_pending_first_scan` for
+    /// how the resulting scan is chained automatically.
+    AddGamesFolder(PathBuf),
+    /// Open the existing Sources -> Discovery review for the most recent
+    /// scan, without starting another scan or changing any file.
+    ReviewScan,
+    /// Reuses the existing `SourceAction::ScanAll` path. Gamer View owns only
+    /// the beginner-facing entry point; source enumeration, cancellation, and
+    /// scan persistence remain in the shared background action.
+    ScanForNewGames,
+    /// Phase 5: "Review" on a game whose platform couldn't be confidently
+    /// identified - the archive to keep selected while switching into
+    /// Advanced View's Selected page, which already shows the real
+    /// identity/evidence detail. Mirrors `OpenCheatsMods`'s exact
+    /// select-then-navigate shape (`AppOperationRequest::OpenCheatsMods`'s
+    /// handler) rather than inventing new plumbing.
+    ReviewIdentity(PathBuf),
+    /// Open the selected game's launch/readiness surface where the user can
+    /// choose one of several equally valid emulator candidates.
+    OpenLaunchChoices(PathBuf),
+    /// Run the existing Doctor emulator check before returning to setup.
+    CheckEmulators(PathBuf),
+    /// "Open Emulator Setup" from a `NeedsSetup` card: the game whose
+    /// launch is blocked, plus the exact emulator repair card to bring into
+    /// view. The caller keeps the game selected and switches to Advanced
+    /// View's Emulator Setup page, the same select-then-navigate shape as
+    /// `ReviewIdentity`. The focus is carried as typed navigation state,
+    /// never derived by parsing blocker text.
+    OpenEmulatorSetup(PathBuf, EmulatorSetupFocus),
+    /// "Update game information": re-reads the already-cached enrichment
+    /// data from disk for the currently focused game. Never itself
+    /// contacts a metadata provider's server - see
+    /// `crate::game_metadata`'s module doc comment for why - so it affects
+    /// enrichment display only, never identity, mount state, or anything
+    /// else about the game.
+    RefreshGameInformation,
+}
+
+pub(crate) fn emulator_setup_focus(emulator: &str) -> EmulatorSetupFocus {
+    if emulator.eq_ignore_ascii_case("RetroArch") {
+        EmulatorSetupFocus::RetroArch
+    } else {
+        EmulatorSetupFocus::Emulator(emulator.to_string())
+    }
+}
+
+/// The single authoritative row snapshot one Gamer View frame is built
+/// from: the shelf's counts, the "All" count and the game list all read
+/// from this one object, so they cannot disagree.
+///
+/// # Why this type exists
+///
+/// The shelf used to count every row in the library while the list below
+/// it applied `LibraryRowFilters::matches` in full. `LibraryRowFilters` is
+/// shared with Advanced View, which exposes five further checkboxes
+/// (Present / Missing / Awaiting validation / Known platform / Unknown
+/// platform) that Gamer View neither shows nor can clear. Ticking any of
+/// them in Advanced View - or opening the Health dashboard's "Review
+/// missing", which sets `missing` directly - and returning to Gamer View
+/// left every card advertising its full count while the list matched
+/// nothing, reporting "No games match the selected platform" for a
+/// platform whose card said 4023. Only a restart cleared it, because
+/// `LibraryRowFilters` is not persisted.
+///
+/// Gamer View exposes exactly two filters - the search box and the
+/// platform shelf - so those are the only two it applies. `candidates` is
+/// everything the search admits; the counts are derived from `candidates`,
+/// and `visible` is `candidates` narrowed by the platform selection. A
+/// non-zero card count therefore *is* the number of rows selecting that
+/// card produces, by construction rather than by agreement.
+pub(crate) struct GamerLibrarySnapshot {
+    /// Indices into the row list that pass every filter Gamer View
+    /// exposes *except* the platform selection. The "All" card's count.
+    pub(crate) candidates: Vec<usize>,
+    /// `candidates` narrowed by the platform selection - exactly what the
+    /// game list renders.
+    pub(crate) visible: Vec<usize>,
+    /// Counted over `candidates`, never over the unfiltered library.
+    pub(crate) platform_counts: DetectedPlatformCounts,
+    /// A platform is selected that no card in this snapshot offers, so no
+    /// card is highlighted and no click can restore the list. The caller
+    /// resets the selection to All.
+    pub(crate) selection_is_stale: bool,
+}
+
+impl GamerLibrarySnapshot {
+    pub(crate) fn build(rows: &[ArchiveRow], platform: Option<&str>, search_text: &str) -> Self {
+        let candidates: Vec<usize> = rows
+            .iter()
+            .enumerate()
+            .filter(|(_, row)| search_text.is_empty() || row.search_text.contains(search_text))
+            .map(|(index, _)| index)
+            .collect();
+        let platform_counts = detected_platform_counts(
+            candidates
+                .iter()
+                .map(|index| &rows[*index])
+                .map(|row| (!row.unknown_platform).then_some(row.platform.as_str())),
+        );
+        let visible: Vec<usize> = candidates
+            .iter()
+            .copied()
+            .filter(|index| gamer_row_matches_platform(&rows[*index], platform))
+            .collect();
+        // Judged against the whole library, never against `candidates`.
+        // A search that currently matches nothing would otherwise make every
+        // platform look absent and silently throw the user's selection away
+        // as they typed - the search must narrow the list, not rewrite what
+        // they picked. "Unknown" is a real platform here, so it is stale on
+        // the same terms: only when nothing in the library is unclassified.
+        let selection_is_stale = match platform {
+            None => false,
+            Some("Unknown") => !rows.iter().any(|row| row.unknown_platform),
+            Some(platform) => !rows
+                .iter()
+                .any(|row| !row.unknown_platform && row.platform == platform),
+        };
+        Self {
+            candidates,
+            visible,
+            platform_counts,
+            selection_is_stale,
+        }
+    }
+}
+
+/// Normalises the live search text into what `GamerLibrarySnapshot::build`
+/// matches against: trimmed of leading/trailing whitespace (so " mario "
+/// and "mario" behave identically - a person editing a search box rarely
+/// means the spaces) and lower-cased (matching `ArchiveRow::search_text`,
+/// which is stored lower-cased for the same reason).
+fn gamer_search_text(filter: &str) -> String {
+    filter.trim().to_lowercase()
+}
+
+#[cfg(test)]
+mod gamer_search_text_tests {
+    use super::*;
+
+    #[test]
+    fn trims_leading_and_trailing_whitespace() {
+        assert_eq!(gamer_search_text("  mario  "), "mario");
+    }
+
+    #[test]
+    fn lower_cases_so_matching_is_case_insensitive() {
+        assert_eq!(gamer_search_text("MaRiO"), "mario");
+    }
+
+    #[test]
+    fn whitespace_only_becomes_an_empty_search() {
+        assert_eq!(gamer_search_text("   "), "");
+    }
+}
+
+/// Why the game list is empty, in the user's terms. Search and platform
+/// compose, so when both are narrowing the message says so rather than
+/// blaming whichever one the old `else if` chain happened to test first.
+pub(crate) fn gamer_empty_list_guidance(
+    library_is_empty: bool,
+    searching: bool,
+    platform_selected: bool,
+) -> &'static str {
+    match (library_is_empty, searching, platform_selected) {
+        (true, _, _) => "No games are in your library yet.",
+        (false, true, true) => "No games on this platform match your search.",
+        (false, true, false) => "No games match your search.",
+        (false, false, true) => "No games match the selected platform.",
+        (false, false, false) => "No games are in your library yet.",
+    }
+}
+
+/// Whether Gamer View's first-run "Add games" call-to-action should show
+/// alongside the empty-list guidance above - only the true first-run case
+/// (nothing in the library at all, and no search/platform filter could be
+/// hiding something that does exist), never "no results for your search"
+/// or "no games on this platform" - those already have a different real
+/// cause a folder-add button would not fix.
+pub(crate) fn gamer_view_shows_add_games_button(
+    library_is_empty: bool,
+    search_is_empty: bool,
+    no_platform_selected: bool,
+) -> bool {
+    library_is_empty && search_is_empty && no_platform_selected
+}
+
+/// Phase 5: a game whose platform couldn't be resolved is as much
+/// "Needs attention" in the list as a blocked mount is - both get the
+/// same word here; the selected-game panel explains which one applies
+/// (and, for the platform case, offers Review) once the row is opened.
+pub(crate) fn gamer_view_row_state_label(
+    unknown_platform: bool,
+    mount_state: MountState,
+) -> &'static str {
+    if unknown_platform {
+        "Needs attention"
+    } else {
+        gamer_primary_action_short_label(&gamer_primary_action(mount_state))
+    }
+}
+
+/// Phase 4: Gamer View's own wording for a failed action, translated from
+/// the shared `ActionFeedback.message` every failure already sets -
+/// itself untouched, since Advanced View's own feedback banners
+/// (`self.feedback`, read at several other call sites) still show that
+/// raw, precise text unchanged. Today every mount/unmount/scan failure
+/// reaching that shared field is `ArchiveFsError`'s raw `Display` output
+/// (core/src/lib.rs) - e.g. `"scanner error: ..."`, `"database error:
+/// ..."`, or a bare OS error like `"/path: Permission denied (os error
+/// 13)"` - none of it written for a beginner. This function classifies
+/// the *shape* of that already-flattened string rather than requiring a
+/// new error-classification type to be threaded through the mount
+/// pipeline (out of this phase's "no backend changes" scope): permission
+/// and not-found problems get a precise message when the raw text
+/// recognisably names one; everything else - including a scanner/
+/// database/config-flavored raw message, so those words are never
+/// echoed here - gets one honest, generic explanation that still meets
+/// every bar Phase 4 set: what happened, that the user's files are safe
+/// (true for every mount/unmount/scan failure - none of them write to
+/// or delete a game file), a real next action the app actually supports
+/// (retry; Advanced View has the detail), and no invented certainty
+/// about a cause this function cannot actually determine.
+pub(crate) fn gamer_view_failure_message(raw: &str) -> String {
+    if raw == GAMER_ADD_GAMES_FAILURE_MESSAGE {
+        return raw.to_string();
+    }
+    let lower = raw.to_ascii_lowercase();
+    if lower.contains("permission denied") {
+        "EmuWiz doesn't have permission to access this file or folder. Check the folder's \
+         permissions, then try again."
+            .to_string()
+    } else if lower.contains("no such file or directory") || lower.contains("not found") {
+        "We can't find this any more - it may have been moved, renamed, or deleted. Your \
+         other games are safe."
+            .to_string()
+    } else {
+        "Something didn't work. Your games are safe - nothing was changed or deleted. Try \
+         again, or check Advanced View for more detail."
+            .to_string()
+    }
+}
+
+/// The platform half of Gamer View's filtering, matching
+/// `LibraryRowFilters::matches`'s own platform rule exactly - `"Unknown"`
+/// is the diagnostic selection for unclassified rows, not an empty one.
+pub(crate) fn gamer_row_matches_platform(row: &ArchiveRow, platform: Option<&str>) -> bool {
+    platform.is_none_or(|wanted| {
+        if wanted == "Unknown" {
+            row.unknown_platform
+        } else {
+            !row.unknown_platform && row.platform == wanted
+        }
+    })
+}
+
+/// Draws the featured cover for the selected game.
+///
+/// The box is reserved at a fixed size for this frame whatever the artwork is
+/// doing, so the title and the actions beneath it never move as a cover arrives,
+/// fails, or turns out not to exist.
+///
+/// Allocated with [`egui::Sense::hover`] and painted directly: artwork is not a
+/// control, so it takes no place in the Tab order and Mount stays the first thing
+/// a keyboard reaches.
+pub(crate) fn show_featured_cover(
+    ui: &mut egui::Ui,
+    box_size: egui::Vec2,
+    cover: Option<&crate::gamer_artwork::CoverSlot>,
+    placeholder: GameRowArtworkPaint<'_>,
+    artwork_cache: &mut PlatformArtworkCache,
+    artwork_directory: Option<&Path>,
+) {
+    let fallback = matches!(cover, Some(crate::gamer_artwork::CoverSlot::None(_)))
+        .then_some("No cover available");
+    widgets::media_frame(ui, box_size, fallback, |ui, rect| match cover {
+        Some(crate::gamer_artwork::CoverSlot::Ready { texture, .. }) => {
+            let drawn = crate::gamer_artwork::fit_within(box_size, texture.size_vec2());
+            ui.painter().image(
+                texture.id(),
+                egui::Rect::from_center_size(rect.center(), drawn),
+                egui::Rect::from_min_max(egui::Pos2::ZERO, egui::pos2(1.0, 1.0)),
+                egui::Color32::WHITE,
+            );
+        }
+        _ => {
+            let glyph = (box_size.y * 0.42).min(96.0);
+            paint_game_row_artwork(
+                ui,
+                artwork_cache,
+                artwork_directory,
+                GameRowArtworkPaint {
+                    center: rect.center() - egui::vec2(0.0, glyph * 0.16),
+                    size: glyph,
+                    ..placeholder
+                },
+            );
+        }
+    });
+}
+
+/// The featured panel's primary button: full width and taller than a secondary
+/// one, so the current action reads as the thing to do from across a room.
+///
+/// Still `widgets::action_button`'s `Primary` fill and still an ordinary
+/// `egui::Button`, so its enable/disable rules, focus behaviour and activation are
+/// exactly what they were.
+pub(crate) fn featured_primary_button(
+    ui: &mut egui::Ui,
+    label: &str,
+    enabled: bool,
+) -> egui::Response {
+    let width = ui.available_width();
+    ui.add_enabled(
+        enabled,
+        egui::Button::new(egui::RichText::new(label).size(17.0).strong())
+            .fill(theme::primary_action_fill(ui))
+            .min_size(egui::vec2(width, 42.0)),
+    )
+}
+
+/// Gamer View styling for the same tracked executor state Advanced View
+/// renders. Returns `true` only for an explicit enabled Play/retry click;
+/// process creation remains exclusively in the caller's
+/// `GamerViewAction::Play` handler and the shared launch executor.
+fn featured_retroarch_launch_action(
+    ui: &mut egui::Ui,
+    launch_state: &mut launch_readiness_page::RetroArchLaunchState,
+    request: &archivefs_core::launch::RetroArchLaunchRequest,
+    enabled: bool,
+) -> bool {
+    use launch_readiness_page::RetroArchLaunchDisplay;
+
+    let display = launch_state.display_for(request);
+    launch_readiness_page::show_retroarch_launch_feedback(ui, &display);
+    // Integration: the executor state machine, polling and running/closed/
+    // error presentation are 934c9ec's; the plain beginner label is
+    // 1c825e7's (`GAMER_PLAY_LABEL`).
+    match display {
+        RetroArchLaunchDisplay::Idle
+        | RetroArchLaunchDisplay::Exited { .. }
+        | RetroArchLaunchDisplay::Failed { .. } => {
+            featured_primary_button(ui, GAMER_PLAY_LABEL, enabled).clicked()
+        }
+        RetroArchLaunchDisplay::Starting => {
+            featured_primary_button(ui, "Starting…", false);
+            false
+        }
+        RetroArchLaunchDisplay::Running { .. } => {
+            featured_primary_button(ui, GAMER_PLAY_LABEL, false);
+            false
+        }
+    }
+}
+
+pub(crate) fn featured_typed_launch_action(
+    ui: &mut egui::Ui,
+    request: &launch_readiness_page::TypedLaunchRequest,
+    retroarch_launch_state: &mut launch_readiness_page::RetroArchLaunchState,
+    enabled: bool,
+) -> bool {
+    match request {
+        launch_readiness_page::TypedLaunchRequest::RetroArch(request, _) => {
+            featured_retroarch_launch_action(ui, retroarch_launch_state, request, enabled)
+        }
+        _ => {
+            let label = format!("{GAMER_PLAY_LABEL} with {}", request.adapter_name());
+            featured_primary_button(ui, &label, enabled).clicked()
+        }
+    }
+}
+
+/// One line of the featured panel's metadata block.
+pub(crate) fn featured_meta_line(ui: &mut egui::Ui, text: String, strong: bool) {
+    let text = egui::RichText::new(text).size(if strong { 16.0 } else { 14.0 });
+    ui.label(if strong {
+        text.color(theme::PRIMARY_TEXT)
+    } else {
+        text.color(theme::muted(ui))
+    });
+}
+
+/// Merges `record.metadata`'s own fields over a RomM enrichment answer,
+/// field by field, `record.metadata` always winning when both have a
+/// value.
+///
+/// This is the one place the merge happens, and the direction is
+/// deliberate: `record.metadata` is whatever the app's own
+/// `FilenameMetadataProvider` (or, in the future, a manual edit) already
+/// decided, and enrichment only ever fills a *gap*, never replaces an
+/// existing answer - the architecture rule this whole milestone exists
+/// under ("metadata enriches the game record; metadata does not become
+/// preservation identity authority") applies just as much to one
+/// enrichment-only field quietly overwriting another as it would to
+/// enrichment touching identity.
+/// The featured panel's platform line: platform, archive format, and -
+/// when known - release year on one line together, so a game's year sits
+/// naturally beside what it *is* rather than getting its own "Released
+/// 1998" line lower in the panel.
+pub(crate) fn featured_platform_line(
+    platform: &str,
+    format_name: &str,
+    year: Option<u16>,
+) -> String {
+    match year {
+        Some(year) => format!("{platform} \u{b7} {format_name} \u{b7} {year}"),
+        None => format!("{platform} \u{b7} {format_name}"),
+    }
+}
+
+pub(crate) struct GamerMetadataView<'a> {
+    pub(crate) synopsis: Option<&'a str>,
+    pub(crate) genre: Option<&'a str>,
+    pub(crate) players: Option<&'a str>,
+    pub(crate) rating: Option<u8>,
+    pub(crate) release_year: Option<u16>,
+}
+
+impl<'a> GamerMetadataView<'a> {
+    pub(crate) fn merge(
+        record_metadata: &'a archivefs_core::ArchiveMetadata,
+        enrichment: Option<&'a crate::game_metadata::GameMetadataResult>,
+    ) -> Self {
+        let found = match enrichment {
+            Some(crate::game_metadata::GameMetadataResult::Found(found)) => Some(&found.metadata),
+            _ => None,
+        };
+        Self {
+            synopsis: record_metadata
+                .synopsis
+                .as_deref()
+                .or_else(|| found.and_then(|m| m.synopsis.as_deref())),
+            genre: record_metadata
+                .genre
+                .as_deref()
+                .or_else(|| found.and_then(|m| m.genre.as_deref())),
+            players: record_metadata
+                .players
+                .as_deref()
+                .or_else(|| found.and_then(|m| m.players.as_deref())),
+            rating: record_metadata
+                .rating
+                .or_else(|| found.and_then(|m| m.rating)),
+            release_year: record_metadata
+                .release_year
+                .or_else(|| found.and_then(|m| m.release_year)),
+        }
+    }
+
+    pub(crate) fn is_empty(&self) -> bool {
+        self.synopsis.is_none()
+            && self.genre.is_none()
+            && self.players.is_none()
+            && self.rating.is_none()
+            && self.release_year.is_none()
+    }
+}
+
+/// Splits a joined genre string back into its individual labels for chip
+/// display. `enrichment_metadata` (core) is the one place that joins a
+/// provider's genre list with `", "`; this is its exact inverse, kept
+/// local to presentation rather than changing `ArchiveMetadata::genre`'s
+/// shape (a `String`, used by other display sites too) for one panel's
+/// chip layout. Genre names have not been observed to contain a literal
+/// `", "`, so this round-trips cleanly in practice; a name that somehow
+/// did would simply render as one chip spanning two labels' worth of
+/// text, not lost or malformed data.
+fn split_genre_list(genre: &str) -> Vec<&str> {
+    genre.split(", ").filter(|part| !part.is_empty()).collect()
+}
+
+/// "1 player", "4 players", "1-4 players" - never the placeholder-looking
+/// "player(s)". A range (RomM's own common shape, e.g. "1-2") is always
+/// worded as plural, since a range whose top end is 1 does not occur in
+/// practice and "1-1 player" would read strangely if it did.
+fn format_players(players: &str) -> String {
+    match players.trim().parse::<u32>() {
+        Ok(1) => "1 player".to_string(),
+        _ => format!("{} players", players.trim()),
+    }
+}
+
+/// A community/critic rating, 0-100, as a percentage - the same number
+/// [`archivefs_core::ArchiveMetadata::rating`] already holds, just read as
+/// the percentage it already is rather than a test-style "N/100" score.
+/// The Details screen keeps the `/100` form alongside provenance, so the
+/// original normalised value stays available there.
+fn format_rating(rating: u8) -> String {
+    format!("{rating}% rating")
+}
+
+/// Characters shown before a long synopsis is truncated with "Show more" -
+/// long enough to read a real paragraph's opening without scrolling, short
+/// enough that a short synopsis (a couple of sentences) usually needs no
+/// truncation at all. Word-boundary aware, so a truncation never lands
+/// mid-word.
+const SYNOPSIS_PREVIEW_CHARS: usize = 220;
+
+/// Bounded height for an *expanded* synopsis - generous enough that a real
+/// provider synopsis (the longest observed in live validation was ~1,200
+/// characters) wraps naturally with no inner scrollbar at a typical panel
+/// width, while still capping a pathological one so it cannot push the
+/// primary action button off screen; a scrollbar only ever appears in that
+/// unusual case, never for an ordinary synopsis.
+const SYNOPSIS_EXPANDED_MAX_HEIGHT: f32 = 260.0;
+
+/// The synopsis block: full text with natural wrapping when it is short
+/// enough to need no truncation, otherwise a preview and a "Show more"
+/// toggle rather than a permanently visible tiny scrollbar. Expand/collapse
+/// state is keyed by the synopsis text itself, so it starts collapsed again
+/// automatically for whichever game is selected next - nothing has to
+/// track "which game this state belongs to" separately.
+fn show_synopsis(ui: &mut egui::Ui, synopsis: &str) {
+    let truncated = synopsis
+        .char_indices()
+        .nth(SYNOPSIS_PREVIEW_CHARS)
+        .is_some();
+    if !truncated {
+        ui.label(
+            egui::RichText::new(synopsis)
+                .size(13.0)
+                .color(theme::muted(ui)),
+        );
+        return;
+    }
+    let expand_id = egui::Id::new("gamer_featured_synopsis_expanded").with(synopsis);
+    let mut expanded = ui.data(|data| data.get_temp::<bool>(expand_id).unwrap_or(false));
+    if expanded {
+        egui::ScrollArea::vertical()
+            .id_salt(("gamer_featured_synopsis_scroll", synopsis))
+            .max_height(SYNOPSIS_EXPANDED_MAX_HEIGHT)
+            .auto_shrink([false, true])
+            .show(ui, |ui| {
+                ui.label(
+                    egui::RichText::new(synopsis)
+                        .size(13.0)
+                        .color(theme::muted(ui)),
+                );
+            });
+    } else {
+        let boundary = synopsis[..synopsis
+            .char_indices()
+            .nth(SYNOPSIS_PREVIEW_CHARS)
+            .map_or(synopsis.len(), |(i, _)| i)]
+            .rfind(char::is_whitespace)
+            .unwrap_or(SYNOPSIS_PREVIEW_CHARS.min(synopsis.len()));
+        ui.label(
+            egui::RichText::new(format!("{}\u{2026}", synopsis[..boundary].trim_end()))
+                .size(13.0)
+                .color(theme::muted(ui)),
+        );
+    }
+    if widgets::action_button(
+        ui,
+        if expanded { "Show less" } else { "Show more" },
+        widgets::ActionStyle::Secondary,
+        true,
+    )
+    .clicked()
+    {
+        expanded = !expanded;
+        ui.data_mut(|data| data.insert_temp(expand_id, expanded));
+    }
+}
+
+/// The featured panel's optional enrichment block: a bounded/expandable
+/// synopsis, genre chips, and compact players/rating lines - whatever of
+/// these the merged view actually has. Renders nothing at all - not even a
+/// heading - when nothing was found, per this milestone's explicit rule
+/// that missing fields simply disappear rather than showing rows of
+/// "Unknown". Release year is shown by the caller, alongside platform, not
+/// here - see the featured panel's platform/format/year line.
+pub(crate) fn show_gamer_metadata_enrichment(ui: &mut egui::Ui, view: &GamerMetadataView<'_>) {
+    if view.is_empty() {
+        return;
+    }
+    if let Some(synopsis) = view.synopsis {
+        ui.add_space(4.0);
+        show_synopsis(ui, synopsis);
+        ui.add_space(4.0);
+    }
+    if let Some(genre) = view.genre {
+        widgets::info_chip_row(ui, &split_genre_list(genre));
+        ui.add_space(2.0);
+    }
+    if let Some(players) = view.players {
+        featured_meta_line(ui, format_players(players), false);
+    }
+    if let Some(rating) = view.rating {
+        featured_meta_line(ui, format_rating(rating), false);
+    }
+}
+
+pub(crate) struct GamerViewViewState<'a> {
+    /// The live search text. Mutable so the browsing rail's own search
+    /// field (drawn directly above "YOUR LIBRARY") can edit the exact same
+    /// text the top bar's search box does - either one narrows the same
+    /// result set, and clearing either clears both.
+    pub(crate) filter: &'a mut String,
+    pub(crate) library_filters: &'a mut LibraryRowFilters,
+    pub(crate) archive_context: &'a mut ArchiveContext,
+    pub(crate) screen: &'a mut GamerViewScreen,
+    pub(crate) busy: bool,
+    pub(crate) block_reason: Option<&'static str>,
+    pub(crate) cleanup_after_unmount: bool,
+    pub(crate) cheat_workflow: Option<&'a CheatWorkflowState>,
+    pub(crate) feedback: Option<&'a ActionFeedback>,
+    pub(crate) scan_review_available: bool,
+    pub(crate) artwork_directory: Option<&'a Path>,
+    pub(crate) artwork_cache: &'a mut PlatformArtworkCache,
+    /// RomM covers already answered for, and the scheduling that decides what
+    /// to ask about next.
+    pub(crate) covers: &'a mut crate::gamer_artwork::GamerCoverCache,
+    pub(crate) screenshots: &'a mut crate::gamer_artwork::GamerScreenshotCache,
+    /// Filled with the records this frame wants covers for. The view itself
+    /// never sends anything: it reports what the visible window needs and the
+    /// caller hands that to the worker, which keeps this function free of
+    /// threads and testable without one.
+    pub(crate) cover_requests: &'a mut Vec<crate::gamer_artwork::CoverJob>,
+    pub(crate) screenshot_requests: &'a mut Vec<crate::gamer_artwork::CoverJob>,
+    /// Enrichment (synopsis/genre/players/rating/release year) already
+    /// resolved for the currently focused game, if any - `None` until the
+    /// caller's worker has answered, distinct from
+    /// [`crate::game_metadata::GameMetadataResult::NotFound`]/
+    /// [`crate::game_metadata::GameMetadataResult::Unavailable`], both of
+    /// which are real (already-answered) results this view still renders
+    /// (as "no game information available" wording), never network calls.
+    pub(crate) game_metadata: Option<&'a crate::game_metadata::GameMetadataResult>,
+    pub(crate) identity_status: Option<GamerIdentityStatus>,
+    pub(crate) prepared_member: bool,
+    pub(crate) member_choices: Option<&'a [archivefs_core::PreparedMemberCandidate]>,
+    pub(crate) preparation_message: Option<&'a str>,
+    pub(crate) play_action: &'a launch_readiness_page::GamerPlayAction,
+    /// The shared DuckStation resolver's fallback or refusal, shown beside
+    /// the primary action. `None` for every ordinary selection.
+    pub(crate) resolver_notice: Option<&'a launch_readiness_page::GamerResolverNotice>,
+    pub(crate) retroarch_launch_state: &'a mut launch_readiness_page::RetroArchLaunchState,
+    pub(crate) dolphin_launch_state: &'a mut launch_readiness_page::DolphinLaunchState,
+    pub(crate) pcsx2_launch_state: &'a mut launch_readiness_page::Pcsx2LaunchState,
+    pub(crate) standalone_launch_state: &'a mut launch_readiness_page::StandaloneLaunchState,
+    /// The A-Z jump strip's index - see [`AlphaJumpIndex`]. Persisted at the
+    /// app level (like `covers`) because it caches a sort/bucket rebuild
+    /// across frames; the browsing rail is the only thing that reads or
+    /// rebuilds it.
+    pub(crate) alpha_jump: &'a mut AlphaJumpIndex,
+}
+
+/// The read-only Details screen (finding #2): identity/platform/metadata
+/// only - no mount/unmount/platform-assignment controls here. Those live
+/// exclusively on the action panel (Stage 3), so there is exactly one
+/// place a beginner ever clicks to change a game's state, not two
+/// slightly-different copies of the same buttons.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn show_gamer_details_panel(
+    ui: &mut egui::Ui,
+    record: &ArchiveRecord,
+    enrichment: Option<&crate::game_metadata::GameMetadataResult>,
+    identity_status: Option<GamerIdentityStatus>,
+    covers: &crate::gamer_artwork::GamerCoverCache,
+    screenshots: &mut crate::gamer_artwork::GamerScreenshotCache,
+    artwork_cache: &mut PlatformArtworkCache,
+    artwork_directory: Option<&Path>,
+    screenshot_requests: &mut Vec<crate::gamer_artwork::CoverJob>,
+) -> Option<GamerViewAction> {
+    let view = GamerMetadataView::merge(&record.metadata, enrichment);
+    let platform = record
+        .metadata
+        .platform
+        .as_deref()
+        .or(record.identity.platform.as_deref())
+        .unwrap_or("Unknown");
+    let title = gamer_display_title(record);
+    let archive_path = record.mount_plan.archive.path.as_path();
+    screenshot_requests.extend(screenshots.visible(archive_path));
+    let cover = covers.slot_for(archive_path, None);
+    let real_cover = matches!(cover, Some(crate::gamer_artwork::CoverSlot::Ready { .. }));
+    let media_box = details_cover_box(real_cover);
+    let platform_asset = platform_asset_id(platform, false);
+    let platform_fallback =
+        crate::ui::platform_artwork::platform_fallback_asset_id(platform, false);
+
+    widgets::section_header(ui, "GAME DETAILS", None);
+    widgets::hero_card(ui, |ui| {
+        if ui.available_width() >= DETAILS_HERO_HORIZONTAL_MIN_WIDTH {
+            ui.horizontal_top(|ui| {
+                show_featured_cover(
+                    ui,
+                    media_box,
+                    cover,
+                    GameRowArtworkPaint {
+                        center: egui::Pos2::ZERO,
+                        size: 0.0,
+                        title: &title,
+                        platform_asset: &platform_asset,
+                        platform_fallback,
+                    },
+                    artwork_cache,
+                    artwork_directory,
+                );
+                ui.add_space(theme::SPACE_MD);
+                show_details_hero_text(ui, record, &view, platform, &title, identity_status);
+            });
+        } else {
+            ui.vertical(|ui| {
+                ui.horizontal(|ui| {
+                    show_featured_cover(
+                        ui,
+                        media_box.min(egui::vec2(220.0, 286.0)),
+                        cover,
+                        GameRowArtworkPaint {
+                            center: egui::Pos2::ZERO,
+                            size: 0.0,
+                            title: &title,
+                            platform_asset: &platform_asset,
+                            platform_fallback,
+                        },
+                        artwork_cache,
+                        artwork_directory,
+                    );
+                });
+                show_details_hero_text(ui, record, &view, platform, &title, identity_status);
+            });
+        }
+    });
+
+    if let Some(count) = screenshots.section_count(archive_path) {
+        ui.add_space(theme::SECTION_GAP);
+        widgets::section_header(ui, "SCREENSHOTS", None);
+        show_gamer_screenshot_strip(ui, screenshots, archive_path, count);
+    }
+
+    if let Some(synopsis) = view.synopsis {
+        ui.add_space(theme::SECTION_GAP);
+        widgets::section_header(ui, "SYNOPSIS", None);
+        show_synopsis(ui, synopsis);
+    }
+
+    ui.add_space(theme::SECTION_GAP);
+    widgets::section_header(ui, "GAME INFORMATION", None);
+    egui::Grid::new("gamer_details_information_grid")
+        .num_columns(2)
+        .striped(true)
+        .show(ui, |ui| {
+            optional_detail_row(ui, "Genre", view.genre);
+            optional_detail_row(
+                ui,
+                "Release year",
+                view.release_year.map(|year| year.to_string()).as_deref(),
+            );
+            optional_detail_row(ui, "Players", view.players);
+            optional_detail_row(
+                ui,
+                "Rating",
+                view.rating.map(|rating| format!("{rating}/100")).as_deref(),
+            );
+            optional_detail_row(ui, "Publisher", record.metadata.publisher.as_deref());
+            optional_detail_row(ui, "Developer", record.metadata.developer.as_deref());
+            optional_detail_row(ui, "Region", record.metadata.region.as_deref());
+            optional_detail_row(ui, "Version", record.metadata.version.as_deref());
+            optional_detail_row(ui, "Disc", record.metadata.disc.as_deref());
+        });
+
+    ui.add_space(theme::SECTION_GAP);
+    widgets::section_header(ui, "PLATFORM / ARCHIVAL INFORMATION", None);
+    egui::Grid::new("gamer_details_archival_grid")
+        .num_columns(2)
+        .striped(true)
+        .show(ui, |ui| {
+            detail_row(ui, "Platform", platform);
+            detail_row(
+                ui,
+                "Format",
+                archive_kind_name(record.mount_plan.archive.kind),
+            );
+            detail_row(ui, "Mount state", &record.mount_state.to_string());
+            detail_row(ui, "Health", &record.health.to_string());
+        });
+
+    widgets::technical_details(ui, "gamer_details_technical", |ui| {
+        detail_row(ui, "Archive path", &archive_path.display().to_string());
+        detail_row(ui, "Size", &format_size(record.identity.size_bytes));
+        if let Some(source) = record.metadata.source.as_deref() {
+            detail_row(ui, "Metadata source", source);
+        }
+        ui.label("Screenshot references are read from the imported RomM identity matched to this exact archive path. Only RomM-hosted references are eligible for loading; public scraper references are retained as provenance and are not fetched.");
+    });
+    show_resolved_metadata_evidence(ui, &record.metadata, enrichment);
+    let game_info_action = show_game_information_provenance(ui, enrichment);
+    show_howlongtobeat(ui, enrichment);
+    show_retroachievements(ui, archive_path);
+    game_info_action
+}
+
+/// Displays the shared resolver's winning fields and conflicts alongside the
+/// existing game-information panel. The resolver is fed only with values
+/// already present in the local catalogue or cache; opening Details never
+/// performs provider I/O.
+fn show_resolved_metadata_evidence(
+    ui: &mut egui::Ui,
+    local: &archivefs_core::ArchiveMetadata,
+    enrichment: Option<&crate::game_metadata::GameMetadataResult>,
+) {
+    use crate::game_metadata::GameMetadataResult;
+
+    let Some(cached) = enrichment.and_then(|result| match result {
+        GameMetadataResult::Found(found) => Some(&found.metadata),
+        GameMetadataResult::NotFound | GameMetadataResult::Unavailable => None,
+    }) else {
+        return;
+    };
+    let resolved = crate::game_metadata::resolve_metadata_evidence(local, cached);
+    if resolved.fields.is_empty() && resolved.conflicts.is_empty() {
+        return;
+    }
+    ui.add_space(theme::SECTION_GAP);
+    widgets::section_header(
+        ui,
+        "Resolved metadata evidence",
+        Some("Provider-neutral, cache-only selection with provenance."),
+    );
+    egui::Grid::new("gamer_resolved_metadata_evidence")
+        .num_columns(3)
+        .striped(true)
+        .show(ui, |ui| {
+            for (field, candidate) in &resolved.fields {
+                ui.label(format!("{field:?}"));
+                ui.label(&candidate.value);
+                ui.small(format!(
+                    "{} · {}",
+                    candidate.provenance.provider.label(),
+                    candidate.provenance.detail
+                ));
+                ui.end_row();
+            }
+        });
+    if !resolved.conflicts.is_empty() {
+        ui.colored_label(
+            ui.visuals().warn_fg_color,
+            format!(
+                "{} conflicting lower-precedence value(s) retained as evidence",
+                resolved.conflicts.len()
+            ),
+        );
+    }
+}
+
+/// Optional completion times imported into the local RomM identity cache.
+/// This is deliberately a presentation-only cache read: browsing neither
+/// contacts RomM nor invokes HowLongToBeat.
+fn show_howlongtobeat(
+    ui: &mut egui::Ui,
+    enrichment: Option<&crate::game_metadata::GameMetadataResult>,
+) {
+    use crate::game_metadata::GameMetadataResult;
+
+    let Some(durations) = enrichment.and_then(|result| match result {
+        GameMetadataResult::Found(found) => found.howlongtobeat.as_ref(),
+        GameMetadataResult::NotFound | GameMetadataResult::Unavailable => None,
+    }) else {
+        return;
+    };
+
+    ui.add_space(theme::SECTION_GAP);
+    widgets::section_header(
+        ui,
+        "HowLongToBeat",
+        Some("Completion times cached by RomM."),
+    );
+    egui::Grid::new("gamer_details_howlongtobeat_grid")
+        .num_columns(2)
+        .striped(true)
+        .show(ui, |ui| {
+            optional_duration_row(ui, "Main Story", durations.main_story_seconds);
+            optional_duration_row(ui, "Main + Extras", durations.main_plus_extras_seconds);
+            optional_duration_row(ui, "Completionist", durations.completionist_seconds);
+        });
+    ui.label(
+        egui::RichText::new("Source: HowLongToBeat via RomM · cached metadata only")
+            .color(theme::muted(ui))
+            .small(),
+    );
+}
+
+fn optional_duration_row(ui: &mut egui::Ui, label: &str, seconds: Option<u64>) {
+    let Some(value) = seconds.and_then(format_completion_duration) else {
+        return;
+    };
+    detail_row(ui, label, &value);
+}
+
+fn format_completion_duration(seconds: u64) -> Option<String> {
+    let minutes = seconds.checked_div(60)?;
+    if minutes == 0 {
+        return None;
+    }
+    let hours = minutes / 60;
+    let remainder_minutes = minutes % 60;
+    Some(match (hours, remainder_minutes) {
+        (0, minutes) => format!("{minutes}m"),
+        (hours, 0) => format!("{hours}h"),
+        (hours, minutes) => format!("{hours}h {minutes}m"),
+    })
+}
+
+/// Optional cache-only RetroAchievements summary.  It is deliberately a
+/// separate section from RomM enrichment: no network request is made while
+/// browsing and absence of a cache never affects playability or identity.
+fn show_retroachievements(ui: &mut egui::Ui, archive_path: &Path) {
+    ui.add_space(theme::SECTION_GAP);
+    widgets::section_header(
+        ui,
+        "RetroAchievements",
+        Some("Optional public achievement metadata."),
+    );
+    let entry = archivefs_core::app_dirs::data_dir()
+        .ok()
+        .map(|root| archivefs_core::retroachievements::cache_path(&root))
+        .and_then(|path| archivefs_core::retroachievements::load_cache(&path).ok())
+        .and_then(|entries| {
+            archivefs_core::retroachievements::cached_for_path(&entries, archive_path).cloned()
+        });
+    if let Some(game) = entry {
+        ui.horizontal(|ui| {
+            widgets::status_badge(ui, "Cached", widgets::StatusTone::Info);
+            ui.label(format!(
+                "{} achievements · {} points",
+                game.achievement_count, game.total_points
+            ));
+        });
+        ui.label(
+            egui::RichText::new("Source: RetroAchievements · public metadata only")
+                .color(theme::muted(ui))
+                .small(),
+        );
+    } else {
+        ui.label(egui::RichText::new("Not linked").color(theme::muted(ui)));
+    }
+}
+
+fn show_gamer_screenshot_strip(
+    ui: &mut egui::Ui,
+    screenshots: &crate::gamer_artwork::GamerScreenshotCache,
+    archive_path: &Path,
+    count: usize,
+) {
+    let layout = screenshot_gallery_layout(ui.available_width(), count);
+    for row in 0..layout.rows {
+        let first_index = row * layout.columns;
+        ui.columns(layout.columns, |columns| {
+            for (column_index, column) in columns.iter_mut().enumerate() {
+                let index = first_index + column_index;
+                if index >= layout.visible {
+                    break;
+                }
+                let width = (column.available_width() - 8.0).max(80.0);
+                let height = (width * 9.0 / 16.0).clamp(70.0, 150.0);
+                match screenshots.slot_for(archive_path, index) {
+                    Some(crate::gamer_artwork::CoverSlot::Ready { texture, .. }) => {
+                        widgets::media_frame(
+                            column,
+                            egui::vec2(width, height),
+                            None,
+                            |ui, rect| {
+                                let drawn = crate::gamer_artwork::fit_within(
+                                    egui::vec2(width, height),
+                                    texture.size_vec2(),
+                                );
+                                ui.painter().image(
+                                    texture.id(),
+                                    egui::Rect::from_center_size(rect.center(), drawn),
+                                    egui::Rect::from_min_max(
+                                        egui::Pos2::ZERO,
+                                        egui::pos2(1.0, 1.0),
+                                    ),
+                                    egui::Color32::WHITE,
+                                );
+                            },
+                        );
+                    }
+                    Some(crate::gamer_artwork::CoverSlot::Loading) => {
+                        widgets::media_frame(
+                            column,
+                            egui::vec2(width, height),
+                            Some("Loading"),
+                            |_, _| {},
+                        );
+                    }
+                    Some(crate::gamer_artwork::CoverSlot::None(_)) | None => {}
+                    Some(crate::gamer_artwork::CoverSlot::Revalidating { .. }) => {
+                        widgets::media_frame(
+                            column,
+                            egui::vec2(width, height),
+                            Some("Loading"),
+                            |_, _| {},
+                        );
+                    }
+                }
+            }
+        });
+        if row + 1 < layout.rows {
+            ui.add_space(theme::SPACE_SM);
+        }
+    }
+}
+
+/// Keeps the Details gallery compact while ensuring the bounded set of loaded
+/// screenshots is all visible. The old one-row `ui.columns` implementation
+/// correctly requested five images but silently painted only the first three
+/// or four. The final row deliberately retains the same cell width rather
+/// than stretching a lone last screenshot across the entire details panel.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct ScreenshotGalleryLayout {
+    visible: usize,
+    columns: usize,
+    rows: usize,
+}
+
+fn screenshot_gallery_layout(available_width: f32, count: usize) -> ScreenshotGalleryLayout {
+    let visible = count.min(crate::gamer_artwork::MAX_DETAILS_SCREENSHOTS);
+    let columns = if available_width >= 1_200.0 { 4 } else { 3 };
+    ScreenshotGalleryLayout {
+        visible,
+        columns,
+        rows: (visible + columns.saturating_sub(1)) / columns,
+    }
+}
+
+fn show_details_hero_text(
+    ui: &mut egui::Ui,
+    record: &ArchiveRecord,
+    view: &GamerMetadataView<'_>,
+    platform: &str,
+    title: &str,
+    identity_status: Option<GamerIdentityStatus>,
+) {
+    ui.vertical(|ui| {
+        ui.heading(title);
+        ui.add_space(theme::SPACE_XS);
+        let subtitle = details_hero_subtitle(
+            platform,
+            view.release_year,
+            archive_kind_name(record.mount_plan.archive.kind),
+        );
+        ui.label(egui::RichText::new(subtitle).color(theme::muted(ui)));
+        if let Some(genre) = view.genre {
+            widgets::info_chip_row(ui, &split_genre_list(genre));
+        }
+        if let Some(players) = view.players {
+            featured_meta_line(ui, format_players(players), false);
+        }
+        if let Some(rating) = view.rating {
+            featured_meta_line(ui, format_rating(rating), false);
+        }
+        if let Some(status) = identity_status {
+            ui.add_space(theme::SPACE_SM);
+            widgets::status_badge(ui, "Identity", status_tone(status));
+            ui.label(status.label());
+        }
+        ui.add_space(theme::SPACE_SM);
+        ui.label(
+            egui::RichText::new("The cover is reused from Gamer View's shared cache.")
+                .small()
+                .color(theme::muted(ui)),
+        );
+    });
+}
+
+fn details_cover_box(real_cover: bool) -> egui::Vec2 {
+    crate::gamer_artwork::featured_cover_box(300.0, 390.0, real_cover)
+        .unwrap_or_else(|| egui::vec2(220.0, 286.0))
+}
+
+/// Below this width the hero keeps the cover and metadata in a compact
+/// vertical flow.  The previous 700px cutoff still put the large poster-sized
+/// cover beside the details at a 900px desktop window, crowding the useful
+/// metadata and actions.
+pub(crate) const DETAILS_HERO_HORIZONTAL_MIN_WIDTH: f32 = 980.0;
+
+fn details_hero_subtitle(platform: &str, release_year: Option<u16>, format: &str) -> String {
+    let year = release_year.map(|year| year.to_string());
+    [Some(platform), year.as_deref(), Some(format)]
+        .into_iter()
+        .flatten()
+        .collect::<Vec<_>>()
+        .join("  ·  ")
+}
+
+fn status_tone(status: GamerIdentityStatus) -> widgets::StatusTone {
+    match status {
+        GamerIdentityStatus::Identified => widgets::StatusTone::Success,
+        GamerIdentityStatus::StillChecking => widgets::StatusTone::Info,
+        GamerIdentityStatus::Uncertain | GamerIdentityStatus::ConflictingEvidence => {
+            widgets::StatusTone::Warning
+        }
+    }
+}
+
+/// Game-information (enrichment) provenance and the "Refresh game
+/// information" action - kept entirely separate from the identity/mount
+/// technical details above, since this data was never part of what
+/// established what this game *is*, only what is known *about* it.
+fn show_game_information_provenance(
+    ui: &mut egui::Ui,
+    enrichment: Option<&crate::game_metadata::GameMetadataResult>,
+) -> Option<GamerViewAction> {
+    use crate::game_metadata::GameMetadataResult;
+
+    ui.add_space(theme::SECTION_GAP);
+    widgets::section_header(ui, "Game information", None);
+    match enrichment {
+        Some(GameMetadataResult::Found(found)) => {
+            widgets::technical_details(ui, "gamer_game_information_details", |ui| {
+                ui.label(format!(
+                    "Source: {}",
+                    found
+                        .metadata
+                        .source
+                        .as_deref()
+                        .unwrap_or("Unknown provider")
+                ));
+                ui.label("Read from the locally cached catalogue - not fetched while browsing.");
+            });
+        }
+        Some(GameMetadataResult::NotFound) => {
+            ui.label(
+                egui::RichText::new("No extra game information is available for this game.")
+                    .color(theme::muted(ui)),
+            );
+        }
+        Some(GameMetadataResult::Unavailable) | None => {
+            widgets::failure_summary(
+                ui,
+                "gamer_game_information_unavailable",
+                "We couldn't load game information right now",
+                Some("The game itself is unaffected - mounting and playing work normally."),
+                "No configured metadata source could be read (not configured, never synced, \
+                 or its cached catalogue could not be opened).",
+            );
+        }
+    }
+    if widgets::action_button(
+        ui,
+        "Update game information",
+        widgets::ActionStyle::Secondary,
+        true,
+    )
+    .on_hover_text(
+        "Re-reads game information already cached from a previous sync. To fetch new \
+         information from the configured source, use Sync in Sources › RomM.",
+    )
+    .clicked()
+    {
+        return Some(GamerViewAction::RefreshGameInformation);
+    }
+    None
+}
+
+/// Gamer View's one primary screen (Stage 2/3): search + platform chips +
+/// game list on the left, the selected-game action panel on the right -
+/// or, when `screen` is `Details`, the read-only Details view instead.
+/// Returns `None` while data is still loading (the caller shows its own
+/// loading state via `data: None`).
+pub(crate) fn show_gamer_view(
+    ui: &mut egui::Ui,
+    data: Option<&LoadedData>,
+    view_state: GamerViewViewState<'_>,
+) -> Option<GamerViewAction> {
+    let GamerViewViewState {
+        filter,
+        library_filters,
+        archive_context,
+        screen,
+        busy,
+        block_reason,
+        cleanup_after_unmount,
+        cheat_workflow,
+        feedback,
+        scan_review_available,
+        artwork_directory,
+        artwork_cache,
+        covers,
+        screenshots,
+        cover_requests,
+        screenshot_requests,
+        game_metadata,
+        identity_status,
+        prepared_member,
+        member_choices,
+        preparation_message,
+        play_action,
+        resolver_notice,
+        retroarch_launch_state,
+        dolphin_launch_state,
+        pcsx2_launch_state,
+        standalone_launch_state,
+        alpha_jump,
+    } = view_state;
+    let mut action = None;
+
+    if retroarch_launch_state.poll() || retroarch_launch_state.is_active() {
+        ui.ctx().request_repaint();
+    }
+    if dolphin_launch_state.poll() || dolphin_launch_state.is_active() {
+        ui.ctx().request_repaint();
+    }
+    if pcsx2_launch_state.poll() || pcsx2_launch_state.is_active() {
+        ui.ctx().request_repaint();
+    }
+    if standalone_launch_state.poll() || standalone_launch_state.is_active() {
+        ui.ctx().request_repaint();
+    }
+
+    if let Some(feedback) = feedback {
+        let color = if feedback.succeeded {
+            egui::Color32::from_rgb(70, 170, 90)
+        } else {
+            ui.visuals().error_fg_color
+        };
+        let message = if feedback.succeeded {
+            std::borrow::Cow::Borrowed(feedback.message.as_str())
+        } else {
+            std::borrow::Cow::Owned(gamer_view_failure_message(&feedback.message))
+        };
+        ui.colored_label(color, message.as_ref());
+        if feedback.succeeded
+            && scan_review_available
+            && widgets::action_button(ui, "Review", widgets::ActionStyle::Quiet, true).clicked()
+        {
+            action = Some(GamerViewAction::ReviewScan);
+        }
+        if let Some(more_information) = &feedback.more_information {
+            widgets::technical_details(
+                ui,
+                ("gamer_action_feedback_details", more_information.as_str()),
+                |ui| {
+                    ui.label(more_information);
+                },
+            );
+        }
+        ui.add_space(4.0);
+    }
+
+    let Some(data) = data else {
+        ui.horizontal(|ui| {
+            ui.spinner();
+            ui.label("Loading your games...");
+        });
+        return None;
+    };
+
+    if *screen == GamerViewScreen::Details {
+        if ui.button("\u{2190} Back to games").clicked() {
+            *screen = GamerViewScreen::GameList;
+        }
+        ui.add_space(theme::SECTION_GAP);
+        let details_action =
+            match selected_record(&data.records, archive_context.focused.as_deref()) {
+                Some(record) => show_gamer_details_panel(
+                    ui,
+                    record,
+                    game_metadata,
+                    identity_status,
+                    covers,
+                    screenshots,
+                    artwork_cache,
+                    artwork_directory,
+                    screenshot_requests,
+                ),
+                None => {
+                    ui.label("Select a game to view its details.");
+                    None
+                }
+            };
+        return details_action;
+    }
+
+    let search_text = gamer_search_text(filter);
+    // One authoritative snapshot for this frame - see
+    // `GamerLibrarySnapshot`. Everything below (shelf counts, the "All"
+    // count, the game list, and the empty-state wording) reads from it,
+    // so the shelf can never advertise a count the list cannot produce.
+    let snapshot = GamerLibrarySnapshot::build(
+        &data.rows,
+        library_filters.platform.as_deref(),
+        &search_text,
+    );
+    // A platform that is no longer in the snapshot (library reloaded, a
+    // source removed, or a canonical id written by another page - see
+    // `open_cheat_archive_picker`) would otherwise leave Gamer View stuck
+    // on an empty list with no card highlighted and no way back except a
+    // restart. Falling back to All is the only truthful resolution, and it
+    // happens before the shelf is drawn so this frame already shows it.
+    if snapshot.selection_is_stale {
+        library_filters.platform = None;
+        archive_context.clear_selection();
+    }
+    let platform_counts = &snapshot.platform_counts;
+
+    // Region 1 tail: a slim, right-aligned utility row for the two recurring
+    // maintenance actions. Both dispatch the same shared source actions as
+    // Advanced View; this layer adds no scanning of its own. The window's own
+    // top chrome (search + Menu) is owned by `main.rs`.
+    if !data.rows.is_empty() {
+        ui.horizontal(|ui| {
+            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                if widgets::action_button(
+                    ui,
+                    "Scan for new games",
+                    widgets::ActionStyle::Quiet,
+                    !busy,
+                )
+                .on_hover_text("Look through all your game folders again.")
+                .clicked()
+                {
+                    action = Some(GamerViewAction::ScanForNewGames);
+                }
+                if widgets::action_button(
+                    ui,
+                    "Add another game folder",
+                    widgets::ActionStyle::Quiet,
+                    !busy,
+                )
+                .on_hover_text("Choose another folder for EmuWiz to look through.")
+                .clicked()
+                    && let Some(folder) = rfd::FileDialog::new()
+                        .set_title("Choose another games folder")
+                        .pick_folder()
+                {
+                    action = Some(GamerViewAction::AddGamesFolder(folder));
+                }
+            });
+        });
+        ui.add_space(theme::SPACE_SM);
+    }
+
+    // The visual platform picker (milestone: "Gamer View Visual Platform
+    // Picker and Library Layout Polish"): a single-row, horizontally
+    // scrollable shelf, never wrapping onto multiple lines regardless of
+    // how many platforms are present - "must not consume most of the
+    // vertical height" is true unconditionally, not just for a typical
+    // library. A fixed shelf height also means `available_height` below
+    // is captured after a *known* amount of space is consumed, not a
+    // wrapping row count that varies with window width.
+    let platform_card_width = gamer_platform_card_width(ui.available_width());
+    let mut shelf_artwork = PlatformShelfArtwork {
+        directory: artwork_directory,
+        cache: artwork_cache,
+    };
+
+    // Built here rather than inside the shelf so that this function keeps
+    // ownership of what a platform means, and the shelf only draws and
+    // navigates. The order is the order a person sees: All, then each detected
+    // platform, then Unknown last if any.
+    let mut entries: Vec<ShelfEntry<'_>> = vec![ShelfEntry {
+        asset_id: PlatformAssetCategory::Console.asset_id().to_owned(),
+        label: "All",
+        count: snapshot.candidates.len(),
+        platform: None,
+    }];
+    for (platform, count) in &platform_counts.named {
+        entries.push(ShelfEntry {
+            asset_id: platform_asset_id(platform, false),
+            label: platform.as_str(),
+            count: *count,
+            platform: Some(platform.as_str()),
+        });
+    }
+    if platform_counts.unknown > 0 {
+        entries.push(ShelfEntry {
+            asset_id: PlatformAssetCategory::Unknown.asset_id().to_owned(),
+            label: "Unknown",
+            count: platform_counts.unknown,
+            platform: Some("Unknown"),
+        });
+    }
+
+    let shelf = show_gamer_platform_shelf(
+        ui,
+        &entries,
+        library_filters.platform.as_deref(),
+        platform_card_width,
+        &mut shelf_artwork,
+        PLATFORM_SHELF_HEIGHT,
+    );
+    if let Some(chosen) = shelf.chosen {
+        library_filters.platform = chosen;
+        // Consistent with Advanced View's Library platform strip
+        // (docs/GUI_NAVIGATION_RESET_DESIGN.md mandatory risk #3): every
+        // platform-selection change clears the current focus rather than
+        // risking a stale selected-game panel for a game no longer in view.
+        archive_context.clear_selection();
+    }
+    // Keep the shelf close to its maintenance actions; the page itself now
+    // provides the vertical breathing room as it continues into the stage.
+    ui.add_space(theme::SPACE_SM);
+
+    // ------------------------------------------------------------------
+    // Regions 3 & 4: the dominant selected-game stage, then the
+    // subordinate browsing rail beneath it. One vertically stacked
+    // composition budgeted by `GamerStageLayout`, replacing the old fixed
+    // list-left / detail-right split entirely.
+    // ------------------------------------------------------------------
+    let stage_layout =
+        GamerStageLayout::compute(egui::vec2(ui.available_width(), ui.available_height()));
+    // Capture the selected-game stage's document-space rect before drawing
+    // it. The rail uses this stable page anchor only when a game card is
+    // explicitly activated; A-Z keeps its independent library-row target.
+    let selected_stage_rect = egui::Rect::from_min_size(
+        ui.cursor().min,
+        egui::vec2(ui.available_width(), stage_layout.stage_height),
+    );
+
+    let selected = selected_record(&data.records, archive_context.focused.as_deref());
+    let selected_row = selected.and_then(|record| {
+        let path = record.mount_plan.archive.path.as_path();
+        data.rows.iter().find(|row| row.path == path)
+    });
+    // The stage shows the first-run "add your games" invitation only in the
+    // genuine empty-library case - never "no results for your search", which
+    // has a different real cause a folder picker would not fix.
+    let first_run = gamer_view_shows_add_games_button(
+        data.rows.is_empty(),
+        search_text.is_empty(),
+        library_filters.platform.is_none(),
+    );
+
+    if let Some(stage_action) = stage::show_selected_game_stage(
+        ui,
+        stage::StageContext {
+            record: selected,
+            row: selected_row,
+            busy,
+            block_reason,
+            cleanup_after_unmount,
+            cheat_workflow,
+            artwork_directory,
+            artwork_cache,
+            covers,
+            game_metadata,
+            prepared_member,
+            member_choices,
+            preparation_message,
+            play_action,
+            resolver_notice,
+            retroarch_launch_state,
+            screen,
+            layout: stage_layout,
+            first_run,
+        },
+    ) {
+        action = Some(stage_action);
+    }
+
+    ui.add_space(stage_layout.region_gap);
+
+    if let Some(rail_action) = rail::show_browsing_rail(
+        ui,
+        rail::RailContext {
+            data,
+            snapshot: &snapshot,
+            archive_context,
+            screen,
+            covers,
+            cover_requests,
+            artwork_directory,
+            artwork_cache,
+            columns: stage_layout.rail_columns,
+            min_height: stage_layout.rail_min_height,
+            searching: !search_text.is_empty(),
+            platform_selected: library_filters.platform.is_some(),
+            filter,
+            alpha_jump,
+            selected_stage_rect,
+        },
+    ) {
+        action = Some(rail_action);
+    }
+
+    action
+}
+
+/// Below this the featured panel's three secondary actions cannot share a row at
+/// all, so they become a full-width stack rather than one button per line with a
+/// ragged right edge. Above it they wrap, which degrades gracefully in between.
+pub(crate) const GAMER_SECONDARY_ROW_MIN_WIDTH: f32 = 300.0;
+
+#[cfg(test)]
+mod game_metadata_enrichment_tests {
+    use super::*;
+    use crate::game_metadata::GameMetadataResult;
+
+    fn rendered_text_contains(output: &egui::FullOutput, needle: &str) -> bool {
+        fn shape_contains(shape: &egui::Shape, needle: &str) -> bool {
+            match shape {
+                egui::Shape::Text(text_shape) => text_shape.galley.text().contains(needle),
+                egui::Shape::Vec(nested) => nested.iter().any(|s| shape_contains(s, needle)),
+                _ => false,
+            }
+        }
+        output
+            .shapes
+            .iter()
+            .any(|clipped| shape_contains(&clipped.shape, needle))
+    }
+
+    #[test]
+    fn details_hero_keeps_a_prominent_cover_budget() {
+        let real = details_cover_box(true);
+        let fallback = details_cover_box(false);
+        assert!(real.y >= 300.0);
+        assert!(real.x / real.y > 0.6 && real.x / real.y < 0.8);
+        assert!(real.y > fallback.y);
+        const { assert!(DETAILS_HERO_HORIZONTAL_MIN_WIDTH > 900.0) };
+    }
+
+    #[test]
+    fn screenshot_gallery_keeps_all_bounded_screenshots_visible_on_desktop() {
+        assert_eq!(
+            screenshot_gallery_layout(1_100.0, crate::gamer_artwork::MAX_DETAILS_SCREENSHOTS),
+            ScreenshotGalleryLayout {
+                visible: 5,
+                columns: 3,
+                rows: 2,
+            }
+        );
+        assert_eq!(
+            screenshot_gallery_layout(1_920.0, crate::gamer_artwork::MAX_DETAILS_SCREENSHOTS),
+            ScreenshotGalleryLayout {
+                visible: 5,
+                columns: 4,
+                rows: 2,
+            }
+        );
+    }
+
+    #[test]
+    fn screenshot_gallery_keeps_small_or_empty_sets_to_one_or_zero_rows() {
+        assert_eq!(
+            screenshot_gallery_layout(900.0, 1),
+            ScreenshotGalleryLayout {
+                visible: 1,
+                columns: 3,
+                rows: 1,
+            }
+        );
+        assert_eq!(
+            screenshot_gallery_layout(900.0, 0),
+            ScreenshotGalleryLayout {
+                visible: 0,
+                columns: 3,
+                rows: 0,
+            }
+        );
+    }
+
+    #[test]
+    fn details_hero_subtitle_orders_human_metadata() {
+        assert_eq!(
+            details_hero_subtitle("Nintendo 64", Some(1998), "ZIP"),
+            "Nintendo 64  ·  1998  ·  ZIP"
+        );
+        assert_eq!(
+            details_hero_subtitle("Nintendo 64", None, "ZIP"),
+            "Nintendo 64  ·  ZIP"
+        );
+    }
+
+    #[test]
+    fn details_uses_the_existing_identity_status_vocabulary() {
+        assert_eq!(GamerIdentityStatus::Identified.label(), "Identified");
+        assert_eq!(GamerIdentityStatus::Uncertain.label(), "Uncertain");
+        assert_eq!(
+            GamerIdentityStatus::ConflictingEvidence.label(),
+            "Conflicting evidence"
+        );
+        assert_eq!(GamerIdentityStatus::StillChecking.label(), "Still checking");
+    }
+
+    #[test]
+    fn clipboard_action_is_named_copy_folder_location() {
+        assert_eq!(gamer_copy_location_label(), "Copy folder location");
+        assert_ne!(gamer_copy_location_label(), "Open location");
+
+        let action = GamerViewAction::CopyLocation("/games".to_string());
+        assert!(matches!(action, GamerViewAction::CopyLocation(path) if path == "/games"));
+    }
+
+    #[test]
+    fn mount_free_row_does_not_claim_launch_readiness() {
+        let mount_only = gamer_primary_action(MountState::NotMountable);
+        assert_eq!(gamer_primary_action_short_label(&mount_only), "Game found");
+
+        let refusal = "Can't play yet: executable preflight rejected the selected core";
+        let play_action = launch_readiness_page::GamerPlayAction::BlockedTyped(
+            launch_readiness_page::GamerBlocker {
+                kind: launch_readiness_page::GamerBlockerKind::LaunchPlanInvalid,
+                emulator: None,
+                detail: refusal.to_string(),
+            },
+        );
+        let readiness = gamer_readiness(MountState::NotMountable, &play_action);
+        assert!(matches!(
+            readiness,
+            GamerReadiness::NeedsSetup { blocker } if blocker.detail == refusal
+        ));
+    }
+
+    #[test]
+    fn archived_game_uses_prepare_game_wording_without_changing_operation_kind() {
+        let action = gamer_primary_action(MountState::Pending);
+        assert_eq!(gamer_primary_action_short_label(&action), "Prepare game");
+        assert_eq!(
+            gamer_readiness_short_label(&GamerReadiness::Mount),
+            "Prepare game"
+        );
+        assert!(matches!(action, GamerPrimaryAction::Mount));
+    }
+
+    #[test]
+    fn mounted_archive_shows_prepare_until_a_member_is_retained() {
+        let play_action = launch_readiness_page::GamerPlayAction::BlockedTyped(
+            launch_readiness_page::GamerBlocker {
+                kind: launch_readiness_page::GamerBlockerKind::ContentNeedsPreparation,
+                emulator: None,
+                detail: "archive member has not been resolved".to_string(),
+            },
+        );
+        let readiness = gamer_archive_readiness(MountState::Mounted, false, &play_action, None);
+        assert!(matches!(readiness, GamerReadiness::Prepare));
+        assert_eq!(gamer_readiness_short_label(&readiness), "Ready to prepare");
+    }
+
+    #[test]
+    fn multiple_archive_members_show_a_chooser_instead_of_unmount_or_play() {
+        let candidates = vec![archivefs_core::PreparedMemberCandidate {
+            member_name: "disc1.iso".to_string(),
+            size_bytes: 10,
+            reason: "ISO media accepted for PlayStation 2".to_string(),
+        }];
+        let play_action = launch_readiness_page::GamerPlayAction::BlockedTyped(
+            launch_readiness_page::GamerBlocker {
+                kind: launch_readiness_page::GamerBlockerKind::ContentNeedsPreparation,
+                emulator: None,
+                detail: "archive member has not been resolved".to_string(),
+            },
+        );
+        let readiness =
+            gamer_archive_readiness(MountState::Mounted, false, &play_action, Some(&candidates));
+        assert!(
+            matches!(readiness, GamerReadiness::ChooseMember { candidates } if candidates.len() == 1)
+        );
+    }
+
+    /// A ready RetroArch play action, standing in for the shared launch
+    /// planner's `Launch` projection over an already-retained archive member.
+    fn ready_retroarch_play_action() -> launch_readiness_page::GamerPlayAction {
+        let request = archivefs_core::launch::RetroArchLaunchRequest {
+            selected_content_path: PathBuf::from("/mnt/archive/disc1.iso"),
+            expected_platform_id: "PlayStation 2".to_string(),
+            expected_game_key: "retained-member".to_string(),
+            profile: archivefs_core::emulator_environment::retroarch::ProfileRef {
+                profile_kind: archivefs_core::emulator_environment::retroarch::ProfileKind::Native,
+                scope: archivefs_core::emulator_environment::retroarch::ProfileScope::User,
+            },
+            core_stem: "pcsx2".to_string(),
+            expected_appimage_executable: None,
+            expected_executable_binding: None,
+            expected_configuration_file: None,
+        };
+        launch_readiness_page::GamerPlayAction::Launch(Box::new(
+            launch_readiness_page::TypedLaunchRequest::RetroArch(request, None),
+        ))
+    }
+
+    #[test]
+    fn mounted_archive_with_retained_member_and_ready_plan_shows_play() {
+        let play_action = ready_retroarch_play_action();
+        let readiness = gamer_archive_readiness(MountState::Mounted, true, &play_action, None);
+        assert!(
+            matches!(readiness, GamerReadiness::Ready { .. }),
+            "a successfully retained member with a ready launch plan must reach Play, \
+             not loop back to Prepare"
+        );
+        assert_eq!(gamer_readiness_short_label(&readiness), "Ready to play");
+    }
+
+    #[test]
+    fn mounted_archive_with_retained_member_but_blocked_launch_routes_to_setup_not_prepare() {
+        let refusal = "RetroArch is installed but its setup is incomplete";
+        let play_action = launch_readiness_page::GamerPlayAction::BlockedTyped(
+            launch_readiness_page::GamerBlocker {
+                kind: launch_readiness_page::GamerBlockerKind::EmulatorSetupIncomplete,
+                emulator: Some("RetroArch".to_string()),
+                detail: refusal.to_string(),
+            },
+        );
+        let readiness = gamer_archive_readiness(MountState::Mounted, true, &play_action, None);
+        assert!(
+            matches!(
+                &readiness,
+                GamerReadiness::NeedsSetup { blocker }
+                    if blocker.kind
+                        == launch_readiness_page::GamerBlockerKind::EmulatorSetupIncomplete
+                        && blocker.detail == refusal
+            ),
+            "a retained member with a typed launch blocker must route to the blocker's \
+             setup action, never back to Prepare"
+        );
+        assert_eq!(gamer_readiness_short_label(&readiness), "Needs setup");
+    }
+
+    #[test]
+    fn retained_member_flag_is_ignored_until_the_archive_is_actually_mounted() {
+        // `reconcile_archive_preparation` clears a stale Ready state, but even
+        // if a `prepared` flag survived one frame it must never make an
+        // unmounted archive look launch-ready.
+        let play_action = ready_retroarch_play_action();
+        let readiness = gamer_archive_readiness(MountState::Pending, true, &play_action, None);
+        assert!(matches!(readiness, GamerReadiness::Prepare));
+    }
+
+    #[test]
+    fn multiple_members_win_over_a_retained_member_and_ready_plan() {
+        let candidates = vec![
+            archivefs_core::PreparedMemberCandidate {
+                member_name: "disc1.iso".to_string(),
+                size_bytes: 10,
+                reason: "ISO media accepted for PlayStation 2".to_string(),
+            },
+            archivefs_core::PreparedMemberCandidate {
+                member_name: "disc2.iso".to_string(),
+                size_bytes: 11,
+                reason: "ISO media accepted for PlayStation 2".to_string(),
+            },
+        ];
+        let play_action = ready_retroarch_play_action();
+        let readiness =
+            gamer_archive_readiness(MountState::Mounted, true, &play_action, Some(&candidates));
+        assert!(
+            matches!(readiness, GamerReadiness::ChooseMember { candidates } if candidates.len() == 2),
+            "an unresolved multi-member choice is never auto-collapsed into Play"
+        );
+    }
+
+    #[test]
+    fn failed_preparation_keeps_prepare_and_surfaces_the_failure_message() {
+        // `archive_preparation_view` reports a `Failed` state as
+        // `prepared == false` plus a preparation message; readiness stays on
+        // Prepare so the failure is shown above the retry button.
+        let play_action = launch_readiness_page::GamerPlayAction::BlockedTyped(
+            launch_readiness_page::GamerBlocker {
+                kind: launch_readiness_page::GamerBlockerKind::ContentNeedsPreparation,
+                emulator: None,
+                detail: "archive member has not been resolved".to_string(),
+            },
+        );
+        let readiness = gamer_archive_readiness(MountState::Mounted, false, &play_action, None);
+        assert!(matches!(readiness, GamerReadiness::Prepare));
+    }
+
+    #[test]
+    fn raw_launch_refusal_is_collapsed_by_default() {
+        let refusal = "executable preflight rejected /cores/gambatte_libretro.so";
+        let ctx = egui::Context::default();
+        let output = ctx.run(egui::RawInput::default(), |ctx| {
+            egui::CentralPanel::default().show(ctx, |ui| {
+                show_gamer_launch_blocker(
+                    ui,
+                    &launch_readiness_page::GamerBlocker {
+                        kind: launch_readiness_page::GamerBlockerKind::LaunchPlanInvalid,
+                        emulator: None,
+                        detail: refusal.to_string(),
+                    },
+                );
+            });
+        });
+        assert!(rendered_text_contains(&output, "Launch plan invalid"));
+        assert!(rendered_text_contains(&output, "Technical details"));
+        assert!(!rendered_text_contains(&output, refusal));
+    }
+
+    fn empty_archive_metadata() -> archivefs_core::ArchiveMetadata {
+        archivefs_core::ArchiveMetadata {
+            title: None,
+            platform: None,
+            region: None,
+            languages: None,
+            version: None,
+            disc: None,
+            publisher: None,
+            developer: None,
+            release_year: None,
+            genre: None,
+            notes: None,
+            source: None,
+            synopsis: None,
+            players: None,
+            rating: None,
+        }
+    }
+
+    fn found(metadata: archivefs_core::ArchiveMetadata) -> GameMetadataResult {
+        GameMetadataResult::Found(Box::new(crate::game_metadata::GameMetadataFound {
+            metadata,
+            howlongtobeat: None,
+        }))
+    }
+
+    // --- GamerMetadataView::merge --------------------------------------
+
+    #[test]
+    fn merge_with_no_record_metadata_and_no_enrichment_is_empty() {
+        let record_metadata = empty_archive_metadata();
+        let view = GamerMetadataView::merge(&record_metadata, None);
+        assert!(view.is_empty());
+    }
+
+    #[test]
+    fn merge_prefers_the_records_own_metadata_over_romm_enrichment() {
+        // The architecture rule under test: enrichment only ever fills a
+        // gap, it never replaces something the record already had -
+        // whether that came from filename parsing or, in the future, a
+        // manual edit.
+        let mut record_metadata = empty_archive_metadata();
+        record_metadata.genre = Some("Strategy".to_string());
+        let mut enrichment = empty_archive_metadata();
+        enrichment.genre = Some("RPG".to_string());
+        enrichment.players = Some("1-4".to_string());
+
+        let enrichment_result = found(enrichment);
+        let view = GamerMetadataView::merge(&record_metadata, Some(&enrichment_result));
+
+        assert_eq!(
+            view.genre,
+            Some("Strategy"),
+            "the record's own genre must win"
+        );
+        assert_eq!(
+            view.players,
+            Some("1-4"),
+            "a field the record never had is still filled from enrichment"
+        );
+    }
+
+    #[test]
+    fn merge_ignores_enrichment_when_the_result_is_not_found() {
+        let mut record_metadata = empty_archive_metadata();
+        record_metadata.title = Some("Strong DAT Title".to_string());
+        for result in [
+            GameMetadataResult::NotFound,
+            GameMetadataResult::Unavailable,
+        ] {
+            let view = GamerMetadataView::merge(&record_metadata, Some(&result));
+            assert!(view.is_empty());
+        }
+    }
+
+    // --- show_gamer_metadata_enrichment (Gamer View primary panel) -----
+
+    fn view_of(metadata: &archivefs_core::ArchiveMetadata) -> GamerMetadataView<'_> {
+        GamerMetadataView::merge(metadata, None)
+    }
+
+    #[test]
+    fn nothing_is_rendered_when_no_field_was_found() {
+        let ctx = egui::Context::default();
+        let output = ctx.run(egui::RawInput::default(), |ctx| {
+            egui::CentralPanel::default().show(ctx, |ui| {
+                show_gamer_metadata_enrichment(ui, &view_of(&empty_archive_metadata()));
+            });
+        });
+        // No enrichment text of any kind, and specifically never a raw
+        // "Unavailable"/"NotFound"-style internal label leaking into the
+        // primary panel - missing fields simply disappear.
+        assert!(!rendered_text_contains(&output, "Rating"));
+        assert!(!rendered_text_contains(&output, "Unavailable"));
+        assert!(!rendered_text_contains(&output, "NotFound"));
+    }
+
+    #[test]
+    fn present_fields_render_and_absent_ones_do_not() {
+        let mut metadata = empty_archive_metadata();
+        metadata.synopsis = Some("A short adventure across five islands.".to_string());
+        metadata.rating = Some(87);
+        // Deliberately no genre and no players, to prove they are simply
+        // omitted rather than shown as "Unknown".
+        let ctx = egui::Context::default();
+        let output = ctx.run(egui::RawInput::default(), |ctx| {
+            egui::CentralPanel::default().show(ctx, |ui| {
+                show_gamer_metadata_enrichment(ui, &view_of(&metadata));
+            });
+        });
+        assert!(rendered_text_contains(&output, "A short adventure"));
+        assert!(rendered_text_contains(&output, "87% rating"));
+        assert!(!rendered_text_contains(&output, "Unknown"));
+    }
+
+    #[test]
+    fn a_sparse_record_with_only_one_field_shows_no_blank_rows_or_headings() {
+        // Item 5's explicit rule: a single present field must still look
+        // deliberate - no separators, headings, or "Unknown" placeholders
+        // around it.
+        let mut metadata = empty_archive_metadata();
+        metadata.players = Some("2".to_string());
+        let ctx = egui::Context::default();
+        let output = ctx.run(egui::RawInput::default(), |ctx| {
+            egui::CentralPanel::default().show(ctx, |ui| {
+                show_gamer_metadata_enrichment(ui, &view_of(&metadata));
+            });
+        });
+        assert!(rendered_text_contains(&output, "2 players"));
+        assert!(!rendered_text_contains(&output, "Unknown"));
+        assert!(!rendered_text_contains(&output, "Genre"));
+        assert!(!rendered_text_contains(&output, "Rating"));
+        assert!(!rendered_text_contains(&output, "Synopsis"));
+    }
+
+    #[test]
+    fn completion_duration_formatting_is_compact_and_never_uses_raw_seconds() {
+        assert_eq!(format_completion_duration(45 * 60).as_deref(), Some("45m"));
+        assert_eq!(
+            format_completion_duration(12 * 60 * 60).as_deref(),
+            Some("12h")
+        );
+        assert_eq!(
+            format_completion_duration(32 * 60 * 60 + 15 * 60).as_deref(),
+            Some("32h 15m")
+        );
+        assert_eq!(format_completion_duration(59), None);
+    }
+
+    #[test]
+    fn howlongtobeat_section_only_renders_cached_populated_rows() {
+        let result = GameMetadataResult::Found(Box::new(crate::game_metadata::GameMetadataFound {
+            metadata: empty_archive_metadata(),
+            howlongtobeat: Some(
+                archivefs_core::identity_source::model::HowLongToBeatDurations {
+                    main_story_seconds: Some(45 * 60),
+                    main_plus_extras_seconds: None,
+                    completionist_seconds: Some(12 * 60 * 60),
+                },
+            ),
+        }));
+        let ctx = egui::Context::default();
+        let output = ctx.run(egui::RawInput::default(), |ctx| {
+            egui::CentralPanel::default().show(ctx, |ui| {
+                show_howlongtobeat(ui, Some(&result));
+            });
+        });
+        assert!(rendered_text_contains(&output, "HowLongToBeat"));
+        assert!(rendered_text_contains(&output, "45m"));
+        assert!(rendered_text_contains(&output, "12h"));
+        assert!(!rendered_text_contains(&output, "Main + Extras"));
+        assert!(rendered_text_contains(&output, "via RomM"));
+    }
+
+    #[test]
+    fn howlongtobeat_section_is_absent_without_cached_durations() {
+        let result = found(empty_archive_metadata());
+        let ctx = egui::Context::default();
+        let output = ctx.run(egui::RawInput::default(), |ctx| {
+            egui::CentralPanel::default().show(ctx, |ui| {
+                show_howlongtobeat(ui, Some(&result));
+            });
+        });
+        assert!(!rendered_text_contains(&output, "HowLongToBeat"));
+    }
+
+    // --- players wording: item 8 ----------------------------------------
+
+    #[test]
+    fn a_single_player_is_worded_in_the_singular() {
+        assert_eq!(format_players("1"), "1 player");
+    }
+
+    #[test]
+    fn more_than_one_player_is_worded_in_the_plural() {
+        assert_eq!(format_players("2"), "2 players");
+        assert_eq!(format_players("4"), "4 players");
+    }
+
+    #[test]
+    fn a_player_range_is_always_worded_in_the_plural() {
+        assert_eq!(format_players("1-4"), "1-4 players");
+        assert_eq!(format_players("1-2"), "1-2 players");
+    }
+
+    #[test]
+    fn player_wording_never_uses_the_placeholder_shape() {
+        for players in ["1", "2", "1-4"] {
+            assert!(!format_players(players).contains("player(s)"));
+        }
+    }
+
+    // --- rating wording: item 6 ------------------------------------------
+
+    #[test]
+    fn rating_is_presented_as_a_percentage_not_a_raw_score() {
+        assert_eq!(format_rating(93), "93% rating");
+        assert!(!format_rating(93).contains("/100"));
+    }
+
+    // --- genre chips: item 7 ----------------------------------------------
+
+    #[test]
+    fn a_single_genre_splits_to_one_chip() {
+        assert_eq!(split_genre_list("Platformer"), vec!["Platformer"]);
+    }
+
+    #[test]
+    fn several_genres_split_into_individual_chips() {
+        assert_eq!(
+            split_genre_list("Adventure, Puzzle, Platform, Shooter"),
+            vec!["Adventure", "Puzzle", "Platform", "Shooter"]
+        );
+    }
+
+    #[test]
+    fn many_genres_render_as_wrapping_chips_not_one_long_run_on_line() {
+        let mut metadata = empty_archive_metadata();
+        metadata.genre =
+            Some("Adventure, Hack and slash/Beat 'em up, Platform, Puzzle".to_string());
+        let ctx = egui::Context::default();
+        let output = ctx.run(egui::RawInput::default(), |ctx| {
+            egui::CentralPanel::default().show(ctx, |ui| {
+                show_gamer_metadata_enrichment(ui, &view_of(&metadata));
+            });
+        });
+        for genre in ["Adventure", "Platform", "Puzzle"] {
+            assert!(rendered_text_contains(&output, genre));
+        }
+        // Each genre is its own chip/shape, never one comma-joined run.
+        assert!(!rendered_text_contains(
+            &output,
+            "Adventure, Hack and slash/Beat 'em up, Platform, Puzzle"
+        ));
+    }
+
+    // --- synopsis show more/less: item 3 ----------------------------------
+
+    #[test]
+    fn a_short_synopsis_needs_no_show_more_toggle() {
+        let mut metadata = empty_archive_metadata();
+        metadata.synopsis = Some("A short adventure across five islands.".to_string());
+        let ctx = egui::Context::default();
+        let output = ctx.run(egui::RawInput::default(), |ctx| {
+            egui::CentralPanel::default().show(ctx, |ui| {
+                show_gamer_metadata_enrichment(ui, &view_of(&metadata));
+            });
+        });
+        assert!(rendered_text_contains(&output, "A short adventure"));
+        assert!(!rendered_text_contains(&output, "Show more"));
+    }
+
+    #[test]
+    fn a_long_synopsis_is_truncated_with_a_show_more_toggle() {
+        let mut metadata = empty_archive_metadata();
+        // The real Ocarina of Time synopsis length observed live (1,096
+        // characters) - long enough to need truncation.
+        metadata.synopsis = Some("Adventure across time and space. ".repeat(35));
+        let ctx = egui::Context::default();
+        let output = ctx.run(egui::RawInput::default(), |ctx| {
+            egui::CentralPanel::default().show(ctx, |ui| {
+                show_gamer_metadata_enrichment(ui, &view_of(&metadata));
+            });
+        });
+        assert!(rendered_text_contains(&output, "Show more"));
+        assert!(rendered_text_contains(&output, "\u{2026}"));
+    }
+
+    #[test]
+    fn clicking_show_more_reveals_the_full_synopsis() {
+        let mut metadata = empty_archive_metadata();
+        metadata.synopsis = Some("Adventure across time and space. ".repeat(35));
+        let ctx = egui::Context::default();
+        let full_text = metadata.synopsis.clone().unwrap();
+        let show_more_pos = {
+            let output = ctx.run(egui::RawInput::default(), |ctx| {
+                egui::CentralPanel::default().show(ctx, |ui| {
+                    show_gamer_metadata_enrichment(ui, &view_of(&metadata));
+                });
+            });
+            text_rect_for_test(&output, "Show more")
+                .expect("Show more must render")
+                .center()
+        };
+        let _ = ctx.run(
+            egui::RawInput {
+                events: vec![
+                    egui::Event::PointerMoved(show_more_pos),
+                    egui::Event::PointerButton {
+                        pos: show_more_pos,
+                        button: egui::PointerButton::Primary,
+                        pressed: true,
+                        modifiers: egui::Modifiers::default(),
+                    },
+                    egui::Event::PointerButton {
+                        pos: show_more_pos,
+                        button: egui::PointerButton::Primary,
+                        pressed: false,
+                        modifiers: egui::Modifiers::default(),
+                    },
+                ],
+                ..Default::default()
+            },
+            |ctx| {
+                egui::CentralPanel::default().show(ctx, |ui| {
+                    show_gamer_metadata_enrichment(ui, &view_of(&metadata));
+                });
+            },
+        );
+        // The click toggles state stored for next frame's render, exactly
+        // as a real click-then-repaint does - a follow-up frame with no
+        // new events is what shows the effect, the same way the click
+        // itself would only visibly react on the frame after it lands.
+        let output = ctx.run(egui::RawInput::default(), |ctx| {
+            egui::CentralPanel::default().show(ctx, |ui| {
+                show_gamer_metadata_enrichment(ui, &view_of(&metadata));
+            });
+        });
+        assert!(rendered_text_contains(&output, &full_text));
+        assert!(rendered_text_contains(&output, "Show less"));
+    }
+
+    #[test]
+    fn a_very_long_synopsis_does_not_push_content_below_the_viewport() {
+        // Bounded/scrollable rule: even an extreme synopsis, expanded, must
+        // stay inside the reserved height rather than growing the panel -
+        // the scroll fallback that protects against a pathological case.
+        let mut metadata = empty_archive_metadata();
+        metadata.synopsis = Some("Lorem ipsum dolor sit amet. ".repeat(200));
+        let width = 460.0_f32;
+        let height = 720.0_f32;
+        let ctx = egui::Context::default();
+        let run = |ctx: &egui::Context| {
+            ctx.run(
+                egui::RawInput {
+                    screen_rect: Some(egui::Rect::from_min_size(
+                        egui::Pos2::ZERO,
+                        egui::vec2(width, height),
+                    )),
+                    ..Default::default()
+                },
+                |ctx| {
+                    egui::CentralPanel::default().show(ctx, |ui| {
+                        show_gamer_metadata_enrichment(ui, &view_of(&metadata));
+                        // Content that would appear "below" the enrichment
+                        // block in the real panel - proves the synopsis
+                        // didn't consume unbounded height and push this
+                        // off-screen, whether collapsed or expanded.
+                        ui.label("below the synopsis");
+                    });
+                },
+            )
+        };
+        for output in [run(&ctx), run(&ctx)] {
+            let rect =
+                text_rect_for_test(&output, "below the synopsis").expect("the marker must render");
+            assert!(
+                rect.bottom() <= height,
+                "content after a very long synopsis must stay within the viewport: {rect:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_fully_populated_real_record_leaves_room_for_content_below_it() {
+        // Item 10: not just a long synopsis alone, but the whole enrichment
+        // block together (synopsis, several genre chips, players, rating) -
+        // real Ocarina of Time / Castlevania-shaped data - must still leave
+        // the primary action visible at a normal window size.
+        let mut metadata = empty_archive_metadata();
+        metadata.synopsis = Some(
+            "The Legend of Zelda: Ocarina of Time is the fifth main installment of \
+             The Legend of Zelda series and the first to be released for the \
+             Nintendo 64. It was one of the most highly anticipated games of its age."
+                .to_string(),
+        );
+        metadata.genre =
+            Some("Adventure, Hack and slash/Beat 'em up, Platform, Puzzle".to_string());
+        metadata.players = Some("1-4".to_string());
+        metadata.rating = Some(93);
+        let width = 460.0_f32;
+        let height = 720.0_f32;
+        let ctx = egui::Context::default();
+        let output = ctx.run(
+            egui::RawInput {
+                screen_rect: Some(egui::Rect::from_min_size(
+                    egui::Pos2::ZERO,
+                    egui::vec2(width, height),
+                )),
+                ..Default::default()
+            },
+            |ctx| {
+                egui::CentralPanel::default().show(ctx, |ui| {
+                    show_gamer_metadata_enrichment(ui, &view_of(&metadata));
+                    ui.label("below the metadata block");
+                });
+            },
+        );
+        let rect = text_rect_for_test(&output, "below the metadata block")
+            .expect("the marker must render");
+        assert!(
+            rect.bottom() <= height,
+            "a fully populated real metadata block must still leave the primary action \
+             visible: {rect:?}"
+        );
+    }
+
+    // --- featured_platform_line: item 9 -----------------------------------
+
+    #[test]
+    fn the_platform_line_includes_the_year_when_known() {
+        assert_eq!(
+            featured_platform_line("Nintendo 64", "ZIP", Some(1998)),
+            "Nintendo 64 \u{b7} ZIP \u{b7} 1998"
+        );
+    }
+
+    #[test]
+    fn the_platform_line_omits_the_year_when_unknown() {
+        assert_eq!(
+            featured_platform_line("Nintendo 64", "ZIP", None),
+            "Nintendo 64 \u{b7} ZIP"
+        );
+    }
+
+    // --- live-data validation (2026-08-22) ------------------------------
+    //
+    // The two cases below use fields captured from a real, live RomM 5.2.0
+    // instance rather than invented values, to prove the render function
+    // handles the shape real API data actually takes (multi-genre lists,
+    // a rounded 0-100 rating, a real-length synopsis) and, separately, the
+    // sparse case a real unmatched-in-RomM library entry produces (only one
+    // field present, everything else absent).
+
+    #[test]
+    fn a_real_live_ocarina_of_time_lookup_renders_every_field_it_returned() {
+        let mut metadata = empty_archive_metadata();
+        metadata.genre = Some("Adventure, Puzzle".to_string());
+        metadata.players = Some("1".to_string());
+        metadata.rating = Some(93);
+        metadata.release_year = Some(1998);
+        metadata.synopsis = Some(
+            "The Legend of Zelda: Ocarina of Time is the fifth main installment \
+             of The Legend of Zelda series and the first to be released for the \
+             Nintendo 64."
+                .to_string(),
+        );
+        let ctx = egui::Context::default();
+        let output = ctx.run(egui::RawInput::default(), |ctx| {
+            egui::CentralPanel::default().show(ctx, |ui| {
+                featured_meta_line(
+                    ui,
+                    featured_platform_line("Nintendo 64", "ZIP", metadata.release_year),
+                    false,
+                );
+                show_gamer_metadata_enrichment(ui, &view_of(&metadata));
+            });
+        });
+        assert!(rendered_text_contains(&output, "1998"));
+        assert!(rendered_text_contains(&output, "93% rating"));
+        assert!(rendered_text_contains(&output, "Adventure"));
+        assert!(rendered_text_contains(&output, "Puzzle"));
+        assert!(rendered_text_contains(&output, "1 player"));
+        assert!(rendered_text_contains(&output, "The Legend of Zelda"));
+        assert!(!rendered_text_contains(&output, "Unknown"));
+    }
+
+    #[test]
+    fn a_real_live_unmatched_library_entry_renders_only_its_one_present_field() {
+        // "3 in 1 - Break Out + Centipede + Warlords # GBA.zip" (RomM id
+        // 5541, live, 2026-08-22): RomM never matched this to a metadata
+        // source, so every field is absent except `player_count: "1"`.
+        let mut metadata = empty_archive_metadata();
+        metadata.players = Some("1".to_string());
+        let ctx = egui::Context::default();
+        let output = ctx.run(egui::RawInput::default(), |ctx| {
+            egui::CentralPanel::default().show(ctx, |ui| {
+                show_gamer_metadata_enrichment(ui, &view_of(&metadata));
+            });
+        });
+        assert!(rendered_text_contains(&output, "1 player"));
+        assert!(!rendered_text_contains(&output, "Rating"));
+        assert!(!rendered_text_contains(&output, "Unknown"));
+        assert!(!rendered_text_contains(&output, "null"));
+    }
+
+    fn text_rect_for_test(output: &egui::FullOutput, needle: &str) -> Option<egui::Rect> {
+        fn walk(shape: &egui::Shape, needle: &str, out: &mut Option<egui::Rect>) {
+            match shape {
+                egui::Shape::Text(text) if text.galley.text() == needle && out.is_none() => {
+                    *out = Some(text.visual_bounding_rect());
+                }
+                egui::Shape::Vec(nested) => nested.iter().for_each(|s| walk(s, needle, out)),
+                _ => {}
+            }
+        }
+        let mut found = None;
+        for clipped in &output.shapes {
+            walk(&clipped.shape, needle, &mut found);
+        }
+        found
+    }
+
+    // --- show_game_information_provenance (Details screen) -------------
+
+    #[test]
+    fn found_enrichment_offers_its_source_behind_technical_details() {
+        // Provenance is exactly the kind of detail the milestone's own
+        // rules keep out of the primary panel - it lives behind the same
+        // shared progressive-disclosure control every other technical
+        // section in this app uses, collapsed by default.
+        let mut metadata = empty_archive_metadata();
+        metadata.synopsis = Some("A story.".to_string());
+        metadata.source = Some("RomM".to_string());
+        let result = found(metadata);
+        let ctx = egui::Context::default();
+        let output = ctx.run(egui::RawInput::default(), |ctx| {
+            egui::CentralPanel::default().show(ctx, |ui| {
+                let _ = show_game_information_provenance(ui, Some(&result));
+            });
+        });
+        assert!(rendered_text_contains(&output, "Technical details"));
+        assert!(
+            !rendered_text_contains(&output, "Source: RomM"),
+            "collapsed by default - the source string must not already be visible"
+        );
+    }
+
+    #[test]
+    fn unavailable_shows_human_wording_never_an_internal_label() {
+        let ctx = egui::Context::default();
+        let output = ctx.run(egui::RawInput::default(), |ctx| {
+            egui::CentralPanel::default().show(ctx, |ui| {
+                let _ =
+                    show_game_information_provenance(ui, Some(&GameMetadataResult::Unavailable));
+            });
+        });
+        assert!(rendered_text_contains(
+            &output,
+            "We couldn't load game information right now"
+        ));
+        assert!(rendered_text_contains(
+            &output,
+            "mounting and playing work normally"
+        ));
+        assert!(!rendered_text_contains(&output, "GameMetadataResult"));
+        assert!(!rendered_text_contains(&output, "Unavailable"));
+    }
+
+    #[test]
+    fn the_refresh_action_is_always_offered_regardless_of_state() {
+        for state in [
+            None,
+            Some(GameMetadataResult::NotFound),
+            Some(GameMetadataResult::Unavailable),
+            Some(found(empty_archive_metadata())),
+        ] {
+            let ctx = egui::Context::default();
+            let output = ctx.run(egui::RawInput::default(), |ctx| {
+                egui::CentralPanel::default().show(ctx, |ui| {
+                    let _ = show_game_information_provenance(ui, state.as_ref());
+                });
+            });
+            assert!(rendered_text_contains(&output, "Update game information"));
+        }
+    }
+}

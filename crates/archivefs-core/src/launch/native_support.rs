@@ -1,0 +1,781 @@
+//! Pieces shared by the Linux native adapters (Atari800, b-em, Caprice32,
+//! NP2kai, Oricutron) so there is exactly one executable policy and one
+//! seed-verification rule, not five copies.
+//!
+//! # Executable policy
+//!
+//! The same rule as `emulator_inventory` and `emulator_lifecycle`: the path is
+//! absolute and normalised, and its LEAF is a regular file (not a symlink) with
+//! an execute bit. Parent directories may be symlinks (`/bin` is one on a
+//! merged-/usr system); what is launched and bound is the file itself. The
+//! identity `(device, inode, size, mtime)` of that file is captured at planning
+//! and compared again immediately before spawn.
+//!
+//! A symlink on `PATH` (for example `~/.local/bin/caprice32 -> ~/Applications/
+//! .../cap32`) is therefore NOT an eligible executable. Discovery does not
+//! silently follow it: it reports the link and, when the target is itself an
+//! eligible regular executable, that target, so a person can select the real
+//! file explicitly. Trust is not widened to make a particular install pass.
+
+use std::ffi::OsStr;
+use std::fs::{self, OpenOptions};
+use std::io::{self, Read};
+use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
+use std::path::{Component, Path, PathBuf};
+
+use super::planning::CanonicalIdentityStatus;
+use super::process_spawn::CapturedFileIdentity;
+use super::readiness::LaunchReadiness;
+use super::safe_launch_sandbox::{
+    ConfigIsolation, LaunchMediaSafety, LaunchMediaSafetyDeclaration, MAX_CONFIG_BYTES, MediaKind,
+    MediaMember, MediaRole, PersistentStatePolicy, ProfileSeed, SafeLaunchSandboxError,
+    SandboxPlan, SourceProvenance, plan_sandbox,
+};
+use crate::identity_source::model::LocalEvidenceStrength;
+
+const MAX_EXPLICIT: usize = 16;
+const MAX_PATH_ENTRIES: usize = 64;
+const MAX_PATH_BYTES: usize = 16 * 1024;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ExecutableRefusal {
+    /// Nothing exists at the path.
+    Missing,
+    /// Relative, non-normalised, not a regular file, a symlink, or not
+    /// executable.
+    Unsafe,
+}
+
+/// Validates the executable policy above and captures the file's identity.
+pub fn executable_identity(path: &Path) -> Result<CapturedFileIdentity, ExecutableRefusal> {
+    if !path.is_absolute()
+        || path
+            .components()
+            .any(|c| matches!(c, Component::ParentDir | Component::CurDir))
+    {
+        return Err(ExecutableRefusal::Unsafe);
+    }
+    let metadata = fs::symlink_metadata(path).map_err(|_| ExecutableRefusal::Missing)?;
+    if !metadata.is_file()
+        || metadata.file_type().is_symlink()
+        || metadata.permissions().mode() & 0o111 == 0
+    {
+        return Err(ExecutableRefusal::Unsafe);
+    }
+    Ok(CapturedFileIdentity::capture(&metadata))
+}
+
+/// Largest executable that is also content-hashed. Larger files (AppImages)
+/// are bound by metadata identity only, and `sha256` is `None`.
+pub const MAX_HASHED_EXECUTABLE_BYTES: u64 = 128 * 1024 * 1024;
+
+/// Planning-time binding of an executable: metadata identity AND content hash.
+/// `(device, inode, size, mtime)` alone cannot see a same-size replacement
+/// that reuses the inode within one filesystem timestamp tick (observed in
+/// testing), so the hash is the stronger half.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ExecutableBinding {
+    pub identity: CapturedFileIdentity,
+    pub sha256: Option<[u8; 32]>,
+}
+
+impl ExecutableBinding {
+    pub fn capture(path: &Path) -> Result<Self, ExecutableRefusal> {
+        let identity = executable_identity(path)?;
+        let sha256 = if identity.size <= MAX_HASHED_EXECUTABLE_BYTES {
+            Some(hash_executable(path, identity).map_err(|_| ExecutableRefusal::Unsafe)?)
+        } else {
+            None
+        };
+        Ok(Self { identity, sha256 })
+    }
+
+    /// True only if the path is still an eligible executable with the same
+    /// identity and, when bound, the same bytes.
+    pub fn is_unchanged(&self, path: &Path) -> bool {
+        Self::capture(path).is_ok_and(|now| now == *self)
+    }
+}
+
+fn hash_executable(path: &Path, identity: CapturedFileIdentity) -> io::Result<[u8; 32]> {
+    use sha2::{Digest, Sha256};
+    let mut file = OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK)
+        .open(path)?;
+    if CapturedFileIdentity::capture(&file.metadata()?) != identity {
+        return Err(io::Error::other("executable changed while binding"));
+    }
+    let mut hash = Sha256::new();
+    let mut buffer = [0u8; 64 * 1024];
+    let mut remaining = identity.size;
+    while remaining > 0 {
+        let count = remaining.min(buffer.len() as u64) as usize;
+        file.read_exact(&mut buffer[..count])?;
+        hash.update(&buffer[..count]);
+        remaining -= count as u64;
+    }
+    Ok(hash.finalize().into())
+}
+
+/// A `PATH` or explicit entry that is a symlink, which the policy refuses.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SymlinkedExecutable {
+    pub link: PathBuf,
+    /// The fully resolved target when it is itself an eligible executable:
+    /// the path a person may select explicitly. `None` when it is dangling or
+    /// ineligible.
+    pub eligible_target: Option<PathBuf>,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct ExecutableDiscovery {
+    /// Eligible executables, sorted and de-duplicated. Never probed or run.
+    pub executables: Vec<PathBuf>,
+    pub symlink_refusals: Vec<SymlinkedExecutable>,
+}
+
+/// Bounded, read-only discovery: explicit paths plus `<PATH entry>/<name>` for
+/// each reviewed executable name. No candidate is executed.
+pub fn discover_executables(
+    explicit: &[PathBuf],
+    path_env: Option<&OsStr>,
+    names: &[&str],
+) -> ExecutableDiscovery {
+    let mut candidates: Vec<PathBuf> = explicit.iter().take(MAX_EXPLICIT).cloned().collect();
+    if let Some(value) = path_env.filter(|v| v.len() <= MAX_PATH_BYTES) {
+        for directory in std::env::split_paths(value)
+            .take(MAX_PATH_ENTRIES)
+            .filter(|p| p.is_absolute())
+        {
+            candidates.extend(names.iter().map(|name| directory.join(name)));
+        }
+    }
+    let mut found = ExecutableDiscovery::default();
+    for path in candidates {
+        match executable_identity(&path) {
+            Ok(_) => found.executables.push(path),
+            Err(ExecutableRefusal::Unsafe)
+                if fs::symlink_metadata(&path).is_ok_and(|m| m.file_type().is_symlink()) =>
+            {
+                let eligible_target = fs::canonicalize(&path)
+                    .ok()
+                    .filter(|target| executable_identity(target).is_ok());
+                found.symlink_refusals.push(SymlinkedExecutable {
+                    link: path,
+                    eligible_target,
+                });
+            }
+            Err(_) => {}
+        }
+    }
+    found.executables.sort();
+    found.executables.dedup();
+    found.symlink_refusals.sort_by(|a, b| a.link.cmp(&b.link));
+    found.symlink_refusals.dedup();
+    found
+}
+
+/// The first `count` bytes of a planned source, read through a no-follow
+/// descriptor and only if it is still the file that was captured.
+pub fn read_prefix(source: &SourceProvenance, count: usize) -> io::Result<Vec<u8>> {
+    let file = OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK)
+        .open(&source.original_path)?;
+    if CapturedFileIdentity::capture(&file.metadata()?) != source.original_identity {
+        return Err(io::Error::other("source changed since it was captured"));
+    }
+    let mut bytes = Vec::new();
+    file.take(count as u64).read_to_end(&mut bytes)?;
+    Ok(bytes)
+}
+
+/// Whether a planned config seed is EXACTLY `expected`: same length and same
+/// bytes. A length check alone (or a prefix) is not accepted as a profile.
+pub fn seed_is_exact(seed: &SourceProvenance, expected: &str) -> io::Result<bool> {
+    if seed.original_identity.size != expected.len() as u64
+        || seed.original_identity.size > MAX_CONFIG_BYTES
+    {
+        return Ok(false);
+    }
+    // One byte more than expected also catches a file that grew meanwhile.
+    Ok(read_prefix(seed, expected.len() + 1)? == expected.as_bytes())
+}
+
+pub fn member(path: &Path, role: MediaRole, kind: MediaKind, suffix: &str) -> MediaMember {
+    MediaMember {
+        source: path.to_owned(),
+        role,
+        kind,
+        suffix: suffix.into(),
+    }
+}
+
+/// Honest launch status of a native adapter. A `PreviewReadinessOnly` adapter
+/// binds and validates its inputs but offers no `prepare`/`spawn`: some fact
+/// needed to launch it without touching the user's files could not be proven.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum NativeAdapterClassification {
+    VerifiedLaunchable,
+    BackendReadyRealEmulatorUnverified,
+    PreviewReadinessOnly,
+    Blocked,
+}
+
+#[derive(Debug)]
+pub enum PreviewError {
+    ExecutableMissing,
+    ExecutableUnsafe,
+    IdentityNotVerified,
+    UnsupportedMedia(&'static str),
+    MachineRequired,
+    DisposableSessionRequired,
+    Sandbox(SafeLaunchSandboxError),
+    Io(io::Error),
+}
+
+impl std::fmt::Display for PreviewError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::ExecutableMissing => f.write_str("the emulator executable is missing; select a native installation"),
+            Self::ExecutableUnsafe => f.write_str(
+                "the emulator requires an unchanged regular (non-symlink) executable with execute permission",
+            ),
+            Self::IdentityNotVerified => f.write_str(
+                "fresh verified platform evidence and a matching verified source hash are required; extension alone is insufficient",
+            ),
+            Self::UnsupportedMedia(reason) => f.write_str(reason),
+            Self::MachineRequired => f.write_str("select the machine explicitly; none is inferred"),
+            Self::DisposableSessionRequired => {
+                f.write_str("a disposable scratch session must be acknowledged; persistent sessions are not supported")
+            }
+            Self::Sandbox(error) => write!(f, "scratch planning refused: {error}"),
+            Self::Io(error) => write!(f, "input unavailable: {error}"),
+        }
+    }
+}
+impl std::error::Error for PreviewError {}
+impl From<SafeLaunchSandboxError> for PreviewError {
+    fn from(error: SafeLaunchSandboxError) -> Self {
+        Self::Sandbox(error)
+    }
+}
+impl From<io::Error> for PreviewError {
+    fn from(error: io::Error) -> Self {
+        Self::Io(error)
+    }
+}
+impl From<ExecutableRefusal> for PreviewError {
+    fn from(refusal: ExecutableRefusal) -> Self {
+        match refusal {
+            ExecutableRefusal::Missing => Self::ExecutableMissing,
+            ExecutableRefusal::Unsafe => Self::ExecutableUnsafe,
+        }
+    }
+}
+
+/// What a preview-only adapter validated. Deliberately has no argv, no
+/// `prepare` and no `spawn`: `unproven` lists exactly what stands in the way.
+#[derive(Debug, Clone)]
+pub struct NativePreview {
+    adapter: &'static str,
+    platform_id: &'static str,
+    executable: PathBuf,
+    executable_binding: ExecutableBinding,
+    scratch: SandboxPlan,
+    unproven: &'static [&'static str],
+}
+
+impl NativePreview {
+    pub fn adapter(&self) -> &'static str {
+        self.adapter
+    }
+    pub fn platform_id(&self) -> &'static str {
+        self.platform_id
+    }
+    pub fn classification(&self) -> NativeAdapterClassification {
+        NativeAdapterClassification::PreviewReadinessOnly
+    }
+    /// Never ready: launching is not offered. Inputs are valid, not launchable.
+    pub fn readiness(&self) -> LaunchReadiness {
+        LaunchReadiness::Blocked
+    }
+    pub fn is_launchable(&self) -> bool {
+        false
+    }
+    /// Why launch is not offered, in a person's words.
+    pub fn unproven(&self) -> &'static [&'static str] {
+        self.unproven
+    }
+    /// The hash-bound sources a future, proven launch would copy. Only the
+    /// provenance is exposed, never the `SandboxPlan`: handing a plan out would
+    /// let generic code `prepare` and `spawn` it with a hand-built argv, which
+    /// is exactly the launch path a preview-only adapter must not offer.
+    pub fn bound_sources(&self) -> impl Iterator<Item = &SourceProvenance> {
+        self.scratch.sources()
+    }
+    pub fn executable(&self) -> &Path {
+        &self.executable
+    }
+    /// True while the executable and every bound source are unchanged.
+    pub fn is_fresh(&self) -> bool {
+        self.executable_binding.is_unchanged(&self.executable)
+            && self.scratch.revalidate_sources().is_ok()
+    }
+}
+
+pub struct PreviewRequest<'a> {
+    pub adapter: &'static str,
+    pub platform_id: &'static str,
+    pub executable: &'a Path,
+    pub media: &'a Path,
+    pub kind: MediaKind,
+    pub suffix: &'static str,
+    /// Canonical identity already resolved upstream, when the platform's
+    /// identity layer provides one.
+    pub identity: Option<&'a CanonicalIdentityStatus>,
+    pub platform_evidence: LocalEvidenceStrength,
+    pub verified_source_sha256: [u8; 32],
+    pub disposable_session_acknowledged: bool,
+    pub unproven: &'static [&'static str],
+}
+
+/// Common preview planning: executable policy, verified evidence bound to the
+/// SAME bytes, bounded media, scratch plan. `validate` is the platform's own
+/// structural check on the bound source.
+pub fn plan_preview(
+    request: PreviewRequest<'_>,
+    validate: impl FnOnce(&SourceProvenance) -> Result<(), PreviewError>,
+) -> Result<NativePreview, PreviewError> {
+    if !request.disposable_session_acknowledged {
+        return Err(PreviewError::DisposableSessionRequired);
+    }
+    let executable_binding = ExecutableBinding::capture(request.executable)?;
+    let identity_ok = request.identity.is_none_or(|identity| {
+        matches!(identity, CanonicalIdentityStatus::Resolved(id)
+            if id.platform_id == request.platform_id && !id.game_key.trim().is_empty())
+    });
+    if request.platform_evidence != LocalEvidenceStrength::Verified || !identity_ok {
+        return Err(PreviewError::IdentityNotVerified);
+    }
+    let scratch = plan_sandbox(
+        LaunchMediaSafetyDeclaration {
+            safety: LaunchMediaSafety::ScratchCopy,
+            // Config isolation is exactly what remains unproven here.
+            config_isolation: ConfigIsolation::None,
+            persistent_state: PersistentStatePolicy::DisposableSession,
+        },
+        &[member(
+            request.media,
+            MediaRole::PrimaryMedia,
+            request.kind,
+            request.suffix,
+        )],
+        ProfileSeed::Empty,
+    )?;
+    let source = scratch.sources().next().expect("one primary member");
+    if source.sha256 != request.verified_source_sha256 {
+        return Err(PreviewError::IdentityNotVerified);
+    }
+    validate(source)?;
+    Ok(NativePreview {
+        adapter: request.adapter,
+        platform_id: request.platform_id,
+        executable: request.executable.to_owned(),
+        executable_binding,
+        scratch,
+        unproven: request.unproven,
+    })
+}
+
+/// What a person or a router can be told about one native adapter without
+/// running anything. Read-only: nothing here changes how any other launch is
+/// planned or routed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct NativeAdapterInfo {
+    pub adapter_id: &'static str,
+    pub display_name: &'static str,
+    pub platform_id: &'static str,
+    pub classification: NativeAdapterClassification,
+    /// Media formats the adapter accepts (launch or, for preview-only adapters,
+    /// validation).
+    pub supported_media: &'static [&'static str],
+    /// Formats it refuses by name.
+    pub refused_media: &'static [&'static str],
+    /// Why launch is not offered; empty for a verified-launchable adapter.
+    pub unproven: &'static [&'static str],
+}
+
+/// Native adapters, in alphabetical order of adapter id.
+pub const NATIVE_ADAPTERS: &[NativeAdapterInfo] = &[
+    NativeAdapterInfo {
+        adapter_id: super::atari800::ADAPTER_ID,
+        display_name: super::atari800::DISPLAY_NAME,
+        platform_id: super::atari800::PLATFORM_ID,
+        classification: super::atari800::CLASSIFICATION,
+        supported_media: &["ATR", "XFD"],
+        refused_media: &["ATX", "tape", "program", "cartridge", "HDD", "manifest"],
+        unproven: &[],
+    },
+    NativeAdapterInfo {
+        adapter_id: super::b_em::ADAPTER_ID,
+        display_name: "b-em",
+        platform_id: super::b_em::PLATFORM_ID,
+        classification: super::b_em::CLASSIFICATION,
+        supported_media: &["SSD", "DSD", "UEF"],
+        refused_media: &["CSW", "ADF", "snapshot"],
+        unproven: super::b_em::UNPROVEN,
+    },
+    NativeAdapterInfo {
+        adapter_id: super::caprice32::ADAPTER_ID,
+        display_name: super::caprice32::DISPLAY_NAME,
+        platform_id: super::caprice32::PLATFORM_ID,
+        classification: super::caprice32::CLASSIFICATION,
+        supported_media: &["DSK", "CDT"],
+        refused_media: &["IPF", "CPR", "SNA"],
+        unproven: &[],
+    },
+    NativeAdapterInfo {
+        adapter_id: super::elkulator::ADAPTER_ID,
+        display_name: "Elkulator",
+        platform_id: super::elkulator::PLATFORM_ID,
+        classification: super::elkulator::CLASSIFICATION,
+        supported_media: &["SSD", "DSD", "UEF"],
+        refused_media: &["CSW", "WAV", "ROM", "snapshot", "ADF", "FDI"],
+        unproven: super::elkulator::UNPROVEN,
+    },
+    NativeAdapterInfo {
+        adapter_id: super::np2kai::ADAPTER_ID,
+        display_name: "NP2kai",
+        platform_id: super::np2kai::PLATFORM_ID,
+        classification: super::np2kai::CLASSIFICATION,
+        supported_media: &["D88"],
+        refused_media: &["HDI", "HDD", "NHD"],
+        unproven: super::np2kai::UNPROVEN,
+    },
+    NativeAdapterInfo {
+        adapter_id: super::oricutron::ADAPTER_ID,
+        display_name: "Oricutron",
+        platform_id: super::oricutron::PLATFORM_ID,
+        classification: super::oricutron::CLASSIFICATION,
+        supported_media: &["TAP", "DSK (MFM_DISK)"],
+        refused_media: &["Telestrat", "unverified media"],
+        unproven: super::oricutron::UNPROVEN,
+    },
+];
+
+pub fn native_adapter_info(adapter_id: &str) -> Option<&'static NativeAdapterInfo> {
+    NATIVE_ADAPTERS
+        .iter()
+        .find(|info| info.adapter_id == adapter_id)
+}
+
+pub fn native_adapters_for_platform(
+    platform_id: &str,
+) -> impl Iterator<Item = &'static NativeAdapterInfo> {
+    NATIVE_ADAPTERS
+        .iter()
+        .filter(move |info| info.platform_id == platform_id)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::os::unix::fs::symlink;
+
+    fn make_executable(path: &Path) {
+        fs::write(path, b"#!/bin/sh\nexit 0\n").unwrap();
+        fs::set_permissions(path, fs::Permissions::from_mode(0o755)).unwrap();
+    }
+
+    #[test]
+    fn the_registry_is_consistent_and_only_proven_adapters_are_launchable() {
+        let ids: Vec<_> = NATIVE_ADAPTERS.iter().map(|i| i.adapter_id).collect();
+        let mut sorted = ids.clone();
+        sorted.sort();
+        sorted.dedup();
+        assert_eq!(ids, sorted, "alphabetical and unique");
+        let launchable: Vec<_> = NATIVE_ADAPTERS
+            .iter()
+            .filter(|i| i.classification == NativeAdapterClassification::VerifiedLaunchable)
+            .map(|i| i.adapter_id)
+            .collect();
+        assert_eq!(launchable, ["atari800", "caprice32"]);
+        for info in NATIVE_ADAPTERS {
+            assert!(!info.supported_media.is_empty() && !info.refused_media.is_empty());
+            // Not launchable <=> a reason is given; launchable <=> none is.
+            assert_eq!(
+                info.unproven.is_empty(),
+                info.classification == NativeAdapterClassification::VerifiedLaunchable,
+                "{}",
+                info.adapter_id
+            );
+        }
+        assert_eq!(
+            native_adapter_info("oricutron").unwrap().platform_id,
+            "Oric"
+        );
+        assert!(native_adapter_info("nonexistent").is_none());
+        assert_eq!(native_adapters_for_platform("PC-98").count(), 1);
+        assert_eq!(native_adapters_for_platform("Nowhere").count(), 0);
+    }
+
+    #[test]
+    fn a_regular_executable_is_bound_by_identity_and_content() {
+        let dir = tempfile::tempdir().unwrap();
+        let exe = dir.path().join("emu");
+        make_executable(&exe);
+        let binding = ExecutableBinding::capture(&exe).unwrap();
+        assert!(binding.sha256.is_some());
+        assert!(binding.is_unchanged(&exe));
+        // A different size is seen by the metadata identity.
+        fs::write(
+            &exe,
+            b"#!/bin/sh
+exit 1 # changed
+",
+        )
+        .unwrap();
+        assert!(!binding.is_unchanged(&exe));
+    }
+
+    #[test]
+    fn a_same_size_replacement_with_restored_mtime_is_caught_by_the_hash() {
+        let dir = tempfile::tempdir().unwrap();
+        let exe = dir.path().join("emu");
+        make_executable(&exe);
+        let binding = ExecutableBinding::capture(&exe).unwrap();
+        let modified = fs::metadata(&exe).unwrap().modified().unwrap();
+        let mut bytes = fs::read(&exe).unwrap();
+        *bytes.last_mut().unwrap() ^= 1;
+        fs::write(&exe, bytes).unwrap();
+        fs::File::options()
+            .write(true)
+            .open(&exe)
+            .unwrap()
+            .set_modified(modified)
+            .unwrap();
+        // Metadata identity is unchanged by construction; only content moved.
+        assert_eq!(executable_identity(&exe).unwrap(), binding.identity);
+        assert!(!binding.is_unchanged(&exe));
+        // Replaced by a symlink: refused outright.
+        let target = dir.path().join("target");
+        make_executable(&target);
+        fs::remove_file(&exe).unwrap();
+        symlink(&target, &exe).unwrap();
+        assert!(!binding.is_unchanged(&exe));
+    }
+
+    #[test]
+    fn symlinked_non_executable_relative_and_traversing_paths_are_refused() {
+        let dir = tempfile::tempdir().unwrap();
+        let exe = dir.path().join("emu");
+        make_executable(&exe);
+        let link = dir.path().join("link");
+        symlink(&exe, &link).unwrap();
+        assert_eq!(executable_identity(&link), Err(ExecutableRefusal::Unsafe));
+        let plain = dir.path().join("plain");
+        fs::write(&plain, b"x").unwrap();
+        assert_eq!(executable_identity(&plain), Err(ExecutableRefusal::Unsafe));
+        assert_eq!(
+            executable_identity(Path::new("emu")),
+            Err(ExecutableRefusal::Unsafe)
+        );
+        assert_eq!(
+            executable_identity(&dir.path().join("sub/../emu")),
+            Err(ExecutableRefusal::Unsafe)
+        );
+        assert_eq!(
+            executable_identity(&dir.path().join("missing")),
+            Err(ExecutableRefusal::Missing)
+        );
+        assert_eq!(
+            executable_identity(dir.path()),
+            Err(ExecutableRefusal::Unsafe)
+        );
+    }
+
+    #[test]
+    fn merged_usr_style_paths_stay_usable_and_hash_bound() {
+        // Built layout: <root>/usr/bin/emu with <root>/bin -> usr/bin and
+        // <root>/lib64 chains of symlinked parents.
+        let dir = tempfile::tempdir().unwrap();
+        let usr_bin = dir.path().join("usr/bin");
+        fs::create_dir_all(&usr_bin).unwrap();
+        make_executable(&usr_bin.join("emu"));
+        symlink("usr/bin", dir.path().join("bin")).unwrap();
+        symlink("bin", dir.path().join("sbin")).unwrap();
+        for path in [
+            dir.path().join("usr/bin/emu"),
+            dir.path().join("bin/emu"),
+            dir.path().join("sbin/emu"),
+        ] {
+            let binding = ExecutableBinding::capture(&path).unwrap();
+            assert!(binding.sha256.is_some());
+            assert!(binding.is_unchanged(&path));
+        }
+        // The same file reached through different parents has one identity.
+        assert_eq!(
+            executable_identity(&dir.path().join("bin/emu")).unwrap(),
+            executable_identity(&dir.path().join("usr/bin/emu")).unwrap()
+        );
+        // A leaf symlink inside a symlinked parent is still refused.
+        symlink(usr_bin.join("emu"), usr_bin.join("alias")).unwrap();
+        assert!(executable_identity(&dir.path().join("bin/alias")).is_err());
+    }
+
+    #[test]
+    fn this_hosts_real_merged_usr_binaries_are_accepted_when_bin_is_a_symlink() {
+        if !fs::symlink_metadata("/bin").is_ok_and(|m| m.file_type().is_symlink()) {
+            return;
+        }
+        let binding = ExecutableBinding::capture(Path::new("/bin/sh"));
+        // /bin/sh is itself a symlink on Debian/Ubuntu (-> dash): the leaf
+        // policy refuses it, while the real target through /bin is accepted.
+        if fs::symlink_metadata("/bin/sh").is_ok_and(|m| m.file_type().is_symlink()) {
+            assert!(binding.is_err());
+            assert!(ExecutableBinding::capture(Path::new("/bin/dash")).is_ok());
+        } else {
+            assert!(binding.is_ok());
+        }
+    }
+
+    #[test]
+    fn a_symlinked_parent_directory_is_accepted_like_the_existing_policy() {
+        // /bin -> usr/bin on merged-usr systems: the launched file is regular.
+        let dir = tempfile::tempdir().unwrap();
+        let real = dir.path().join("real");
+        fs::create_dir(&real).unwrap();
+        make_executable(&real.join("emu"));
+        symlink(&real, dir.path().join("alias")).unwrap();
+        assert!(executable_identity(&dir.path().join("alias/emu")).is_ok());
+    }
+
+    #[test]
+    fn discovery_reports_a_path_symlink_with_its_eligible_target_instead_of_following_it() {
+        let dir = tempfile::tempdir().unwrap();
+        let apps = dir.path().join("apps");
+        let bin = dir.path().join("bin");
+        let other = dir.path().join("other");
+        for d in [&apps, &bin, &other] {
+            fs::create_dir(d).unwrap();
+        }
+        make_executable(&apps.join("cap32"));
+        symlink(apps.join("cap32"), bin.join("caprice32")).unwrap();
+        make_executable(&other.join("cap32"));
+        symlink(dir.path().join("nowhere"), bin.join("cap32")).unwrap();
+        let path = std::env::join_paths([&bin, &other]).unwrap();
+        let found = discover_executables(&[], Some(&path), &["caprice32", "cap32"]);
+        // Only the regular file is eligible; both links are reported.
+        assert_eq!(found.executables, vec![other.join("cap32")]);
+        assert_eq!(found.symlink_refusals.len(), 2);
+        let resolved = found
+            .symlink_refusals
+            .iter()
+            .find(|l| l.link == bin.join("caprice32"))
+            .unwrap();
+        assert_eq!(
+            resolved.eligible_target.as_deref(),
+            Some(fs::canonicalize(apps.join("cap32")).unwrap().as_path())
+        );
+        assert!(
+            found
+                .symlink_refusals
+                .iter()
+                .find(|l| l.link == bin.join("cap32"))
+                .unwrap()
+                .eligible_target
+                .is_none()
+        );
+        // Selecting the resolved target explicitly is accepted.
+        let explicit = discover_executables(
+            &[resolved.eligible_target.clone().unwrap()],
+            None,
+            &["caprice32"],
+        );
+        assert_eq!(explicit.executables.len(), 1);
+    }
+
+    #[test]
+    fn discovery_is_bounded_and_ignores_relative_path_entries() {
+        let dir = tempfile::tempdir().unwrap();
+        make_executable(&dir.path().join("emu"));
+        let path =
+            std::env::join_paths([PathBuf::from("relative"), dir.path().to_owned()]).unwrap();
+        let found = discover_executables(&[], Some(&path), &["emu"]);
+        assert_eq!(found.executables, vec![dir.path().join("emu")]);
+        let huge = "/a:".repeat(MAX_PATH_BYTES);
+        assert!(
+            discover_executables(&[], Some(OsStr::new(&huge)), &["emu"])
+                .executables
+                .is_empty()
+        );
+    }
+}
+
+#[cfg(test)]
+mod preview_only_guard {
+    /// The three preview-only adapters must have no production route to a
+    /// launch. This scans their source (everything before `#[cfg(test)]`) for
+    /// any identifier that builds argv, prepares scratch copies, or starts a
+    /// process, so adding one is a deliberate, reviewed change to this test.
+    #[test]
+    fn b_em_np2kai_and_oricutron_contain_no_launch_capability() {
+        for (name, source) in [
+            ("b_em", include_str!("b_em.rs")),
+            ("np2kai", include_str!("np2kai.rs")),
+            ("oricutron", include_str!("oricutron.rs")),
+        ] {
+            let production = source.split("#[cfg(test)]").next().unwrap();
+            for token in [
+                "prepare(",
+                "spawn",
+                "PreparedProcessCommand",
+                "PreparedSandbox",
+                "SandboxManager",
+                "SandboxedProcess",
+                "std::process",
+                "Command::new",
+                "working_directory",
+                "config_arguments",
+                "arguments",
+                "SandboxPlan",
+            ] {
+                // Doc comments may name what is absent; code may not use it.
+                let code: String = production
+                    .lines()
+                    .filter(|line| !line.trim_start().starts_with("//"))
+                    .collect::<Vec<_>>()
+                    .join("\n");
+                assert!(!code.contains(token), "{name} uses {token}");
+            }
+        }
+    }
+
+    #[test]
+    fn nothing_outside_the_launch_module_names_the_native_adapters() {
+        // No generic routing, GUI or planner references these modules yet; the
+        // read-only registry is the only intended consumer.
+        for (name, source) in [
+            ("planning", include_str!("planning.rs")),
+            ("platform_map", include_str!("platform_map.rs")),
+            ("readiness", include_str!("readiness.rs")),
+            ("integration", include_str!("integration.rs")),
+        ] {
+            for module in [
+                "atari800",
+                "caprice32",
+                "b_em",
+                "np2kai",
+                "oricutron",
+                "native_support",
+            ] {
+                assert!(
+                    !source.contains(&format!("{module}::")),
+                    "{name} routes to {module}"
+                );
+            }
+        }
+    }
+}

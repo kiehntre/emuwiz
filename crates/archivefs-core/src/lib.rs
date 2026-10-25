@@ -1,3 +1,6 @@
+#[cfg(test)]
+crate::install_test_environment!();
+
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::env;
 use std::fmt;
@@ -16,30 +19,165 @@ use serde::ser::{SerializeMap, SerializeStruct};
 use serde::{Serialize, Serializer};
 use sha2::{Digest, Sha256};
 
+// Launch-option trainer adapters keep preview, identity, and transaction
+// semantics in the core crate for all GUI surfaces.
+
+/// Bounded gzip decompression of `.adz` (compressed Amiga floppy) containers,
+/// projected through the existing ADF parser - no new filesystem, no new
+/// ADF parsing.
+pub mod amiga_adz;
+/// Shared, read-only CD32/CDTV platform, machine, firmware, and media evidence.
+pub mod amiga_cd_evidence;
+pub mod amiga_disk;
+pub mod amiga_game_readiness;
+/// Bounded WHDLoad `.slave` discovery inside LHA/LZH archives, reusing the
+/// existing archive-member reader and WHDLoad slave parser.
+pub mod amiga_whdload_archive;
 /// App-directory resolution with legacy ArchiveFS compatibility. See the
 /// module for the reuse-not-migrate strategy that keeps existing user data
 /// reachable during the EmuWiz rename.
 pub mod app_dirs;
+/// Bounded, read-only Apple II disk structural evidence.
+pub mod apple2_disk;
+/// Read-only orchestration of independent MAME and FBNeo compatibility results.
+pub mod arcade_compatibility;
+/// Read-only per-set compatibility against an explicitly pinned FBNeo source.
+pub mod arcade_fbneo_compatibility;
+/// Read-only per-set compatibility against pinned installed MAME evidence.
+pub mod arcade_mame_compatibility;
+/// Deterministic emulator recommendation from existing arcade evidence.
+pub mod arcade_recommendation;
+/// Bounded Atari 8-bit standard cassette WAV evidence.
+pub mod atari_tape;
+mod atomic_text;
+pub mod attention;
+/// Bounded BBC Micro/Acorn standard cassette WAV evidence.
+pub mod bbc_tape;
+/// Fail-closed typed bezel apply planning. Mutation remains adapter-gated.
+pub mod bezel_apply;
+/// Read-only master BIOS inventory and emulator projection planning.
+pub mod bios_projection;
+pub mod catalogue_health;
+pub mod catalogue_reconciliation;
+pub mod catalogue_supersession;
 mod database;
 /// Read-only Doctor diagnostics: one shared finding model plus adapters
 /// over the existing per-subsystem reports. See the module documentation
 /// for the read-only contract.
 pub mod diagnostics;
+pub mod dragon_coco_tape;
+pub mod emulator_download;
+pub mod emulator_inventory;
+/// Provider-neutral, read-only emulator installation lifecycle projection.
+pub mod emulator_lifecycle;
+pub mod emulator_profile_resolver;
+pub mod emulator_update;
+/// Deterministic, read-only reconciliation of existing identity, topology and
+/// readiness evidence. This derived layer never mutates the catalogue.
+pub mod evidence_resolution;
+/// Adapter evidence for per-game firmware guidance; never changes Launch.
+pub mod game_firmware_adapters;
+/// Structured, read-only per-game firmware readiness projection over an
+/// already selected launch candidate. Explains; never decides or mutates.
+pub mod game_firmware_readiness;
+pub mod game_profile_planner;
+/// Provider-neutral homebrew project, release and artifact metadata types.
+pub mod homebrew_artifact;
+/// Offline discovery from an explicitly supplied local metadata catalogue.
+pub mod homebrew_catalogue;
+/// GitHub Releases provider for already-known homebrew repositories.
+pub mod homebrew_github;
+mod http_agent;
+pub mod identity_attention;
+pub mod job_progress;
+/// Typed library presentation visibility, separate from source ownership and
+/// subsystem evidence availability.
+pub mod library_visibility;
+/// Read-only impact projection for refreshed imported MAME authority.
+pub mod mame_authority_impact;
+/// Read-only MAME collection health, completeness and update-readiness analysis.
+pub mod mame_collection_analyser;
+/// Deterministic collection statistics over evaluated MAME evidence.
+pub mod mame_collection_stats;
+/// Conservative static input requirements projected from MAME metadata.
+pub mod mame_input_requirements;
+/// Read-only planning for repairing MAME sets from exact bytes already present
+/// elsewhere in the same collection.
+pub mod mame_internal_repair;
+pub mod mame_internal_repair_apply;
+/// Read-only MAME family curation and playing-library projection.
+pub mod mame_playing_library;
+pub mod mame_post_repair;
+pub mod managed_appimage_bootstrap;
+/// Manifest-backed ownership and side-by-side managed AppImage installs.
+pub mod managed_emulator_install;
+/// Provider-neutral, cache-first artwork and metadata evidence resolution.
+pub mod metadata_aggregation;
+/// Bounded MSX standard cassette WAV evidence.
+pub mod msx_tape;
+pub mod nintendo3ds_retail;
+/// Shared read-only projections of workflow journals into operation receipts
+/// and conservative recovery capabilities.
+pub mod operation;
+/// Bounded Oric media structure and read-only source bindings.
+pub mod oric_media;
+pub mod oric_tape;
+/// Pure per-game launch-readiness projection over existing gathered evidence.
+pub mod ready_to_play;
+/// Bounded, read-only availability probes for local and remote-backed paths.
+pub mod remote_source_health;
+/// Optional, read-only RetroAchievements game metadata and bounded cache.
+pub mod retroachievements;
+pub mod retrobios_provider;
+pub mod retrobios_viewer;
+pub mod rom_representation_diagnostics;
+pub mod save_migration_planner;
+/// Local immutable emulator-save snapshots and conservative restore previews.
+pub mod save_snapshots;
+pub mod self_update;
+/// Legally generated media samples for the platform × format coverage suite.
+#[cfg(any(test, feature = "test-support"))]
+pub mod synthetic_media;
+/// Bounded descriptive analysis for supported tape-image containers.
+pub mod tape_analysis;
+/// Bounded PCM/WAV pulse evidence for tape recordings.
+pub mod tape_audio;
+#[cfg(any(test, feature = "test-support"))]
+pub mod test_environment;
+/// Bounded, read-only Thomson SAP floppy evidence.
+pub mod thomson_sap;
+pub mod uef_tape;
+/// A disposable profile holding one production-verified synthetic game.
+#[cfg(any(test, feature = "test-support"))]
+pub mod verified_game_fixture;
 use database::scan_and_persist_folders;
 pub use database::{
     ArchiveChangeKind, ArchiveObservationKind, ArchiveUpsertOutcome, AutomaticPlatformDetails,
     BulkPlatformAssignmentResult, CUSTOM_FOLDER_ALIAS_SOURCE, CatalogueStats, CompletedScanSummary,
-    DAT_ROMM_AGREEMENT_SOURCE, Database, DatabaseCheckOutcome, DatabaseCheckStatus,
-    DatabaseDiagnostic, DatabaseDiagnosticCode, DatabaseDiagnosticSeverity, DatabaseFileFinding,
-    DatabaseHealth, DatabaseHealthReport, DatabaseOpenOutcome, DatabaseSidecarFinding,
-    DatabaseSidecarKind, MANUAL_PLATFORM_SOURCE, MissingArchiveRemovalResult, PersistedArchive,
-    PlatformAlias, PlatformAssignmentChange, PlatformIdentityApplyOutcome,
-    PlatformIdentityConflictDetail, PlatformIdentityEnrichmentSummary, PlatformProvenanceDetails,
-    ROMM_PLATFORM_SOURCE, RecentScanAdditions, RegisteredSourceFolder,
-    SOURCE_PLATFORM_ASSIGNMENT_SOURCE, ScanPersistSummary, ScanRunCounts, SourceFolderRecord,
-    SourceScanStatus, VERIFIED_DAT_PLATFORM_SOURCE, check_database_health, default_database_path,
-    diagnose_database, format_unix_timestamp_utc, latest_schema_version,
-    persisted_archive_has_unknown_platform, scan_and_persist,
+    CueDiscCatalogue, CueDiscRevalidation, CurrentLibraryDatEvidence, DAT_ROMM_AGREEMENT_SOURCE,
+    DatDiscOrderOutcome, Database, DatabaseCheckOutcome, DatabaseCheckStatus, DatabaseDiagnostic,
+    DatabaseDiagnosticCode, DatabaseDiagnosticSeverity, DatabaseFileFinding, DatabaseHealth,
+    DatabaseHealthReport, DatabaseOpenOutcome, DatabaseRestorePlan, DatabaseRestoreReceipt,
+    DatabaseRestoreResult, DatabaseRestoreState, DatabaseSidecarFinding, DatabaseSidecarKind,
+    DatabaseUpgradeReport, DiscoveryDetailFilter, DiscoveryDetailRecord, DiscoveryDetailsPage,
+    DiscoveryRunId, DiscoveryRunStatus, GameScanDisposition, LibraryDatState,
+    MANUAL_PLATFORM_SOURCE, MAX_RETAINED_DISCOVERY_RUNS, MissingArchiveRemovalResult,
+    PersistedArchive, PersistedSetAuditDependency, PersistedSetAuditResult, PlatformAlias,
+    PlatformAssignmentChange, PlatformIdentityApplyOutcome, PlatformIdentityConflictDetail,
+    PlatformIdentityEnrichmentSummary, PlatformProvenanceDetails, ROMM_PLATFORM_SOURCE,
+    RecentScanAdditions, RegisteredSourceFolder, SOURCE_PLATFORM_ASSIGNMENT_SOURCE,
+    ScanPersistSummary, ScanRunCounts, ScummVmScanReport, SourceFolderRecord, SourceRole,
+    SourceScanStatus, TopologyPersistOutcome, UpgradeBackupInspection, UpgradeBackupState,
+    VERIFIED_DAT_PLATFORM_SOURCE, check_database_health, default_database_path, diagnose_database,
+    format_unix_timestamp_utc, inspect_upgrade_backup_evidence, inspect_upgrade_backups,
+    latest_schema_version, pending_schema_migration_versions,
+    persisted_archive_has_unknown_platform, prepare_database_restore, restore_database,
+    rollback_database_restore, scan_and_persist, upgrade_library_database,
+};
+pub use database::{
+    DiscoveryImportExclusion, DiscoveryImportItem, DiscoveryImportOperation,
+    DiscoveryImportUndoPreview, DiscoveryImportUndoResult, MissingCleanupTarget,
+    PreservationFreshness,
 };
 
 mod inspector;
@@ -49,22 +187,51 @@ pub use inspector::{
     is_inspectable, is_known_disc_companion,
 };
 
-pub mod game_identity;
+pub mod archive_member_resolver;
+pub mod archive_workflow;
+pub mod memory_card_inventory;
+pub mod persistent_state_inventory;
+pub mod save_state_compatibility;
+pub mod save_state_orchestration;
+pub mod save_state_resume_readiness;
+/// Verified ZIP creation and extraction for the Converter page.
+pub mod zip_converter;
+pub(crate) mod zip_member_name;
+pub use archive_member_resolver::{
+    ArchiveMemberResolution, MAX_PREPARE_CANDIDATES, MAX_PREPARE_MEMBER_COMPONENTS,
+    MAX_PREPARE_MEMBER_PATH_BYTES, PreparedMemberCandidate, prepared_member_path,
+    resolve_prepared_members,
+};
 
+pub mod game_identity;
+pub mod scummvm_detection;
+
+mod library_view_history;
+pub use library_view_history::{
+    LIBRARY_VIEW_HISTORY_SCHEMA_VERSION, LibraryViewHistoryEntry, LibraryViewHistoryOperation,
+    LibraryViewHistoryRecord, default_library_view_history_dir, library_view_history_dir,
+    list_library_view_history_at, list_library_view_history_default,
+    load_library_view_history_record,
+};
 mod library_views;
 pub use library_views::{
+    FrontendPlatformMapping, FrontendProfile, FrontendProfileKind, FrontendProfilePolicy,
     LibraryViewApplyEntryResult, LibraryViewApplyOutcome, LibraryViewApplyReport,
-    LibraryViewConfig, LibraryViewLayoutTemplate, LibraryViewManifest, LibraryViewManifestEntry,
-    LibraryViewPlan, LibraryViewPlanAction, LibraryViewPlanCounts, LibraryViewPlanEntry,
-    add_library_view_default, apply_library_view, apply_library_view_default,
-    default_library_views_config_path, default_library_views_data_dir, edit_library_view_default,
-    generate_library_view_id, generate_relative_link_path, library_view_manifest_path,
-    load_library_view_configs_default, load_library_view_configs_from,
-    load_library_view_manifest_at, load_library_view_manifest_default, plan_library_view,
-    preview_library_view_default, remove_library_view_default, remove_library_view_symlinks,
-    repair_library_view, repair_library_view_default, resolve_library_view_identifier,
-    save_library_view_configs_default, save_library_view_configs_to,
-    set_library_view_enabled_default, validate_library_view_destination,
+    LibraryViewConfig, LibraryViewGeneratedFilePlan, LibraryViewLayoutTemplate,
+    LibraryViewManifest, LibraryViewManifestEntry, LibraryViewObjectClassification,
+    LibraryViewObjectKind, LibraryViewPlan, LibraryViewPlanAction, LibraryViewPlanCounts,
+    LibraryViewPlanEntry, MultidiscHandlingPolicy, SymlinkTargetStrategy, TitleSelectionPolicy,
+    VariantHandlingPolicy, add_library_view_default, apply_library_view,
+    apply_library_view_default, classify_library_view_object, compute_view_profile_fingerprint,
+    default_library_views_config_path, default_library_views_data_dir, derive_view_filename,
+    edit_library_view_default, generate_library_view_id, generate_relative_link_path,
+    library_view_manifest_path, load_library_view_configs_default, load_library_view_configs_from,
+    load_library_view_manifest_at, load_library_view_manifest_default, plan_generated_file,
+    plan_library_view, preview_library_view_default, remove_library_view_default,
+    remove_library_view_symlinks, repair_library_view, repair_library_view_default,
+    resolve_library_view_identifier, resolve_romm_platform_slug, save_library_view_configs_default,
+    save_library_view_configs_to, set_library_view_enabled_default,
+    validate_library_view_destination,
 };
 
 /// The single authoritative platform registry and the evidence-based
@@ -79,6 +246,19 @@ pub use library_views::{
 /// Read-only external identity providers - RomM in Stage 1, with room for local
 /// DAT catalogues and Hasheous later.
 pub mod identity_source;
+/// Explicit, user-approved descriptive metadata enrichment. This is kept
+/// separate from identity/platform evidence by construction.
+pub mod screenscraper_enrichment;
+
+pub mod format_coverage_matrix;
+/// Universal source discovery: container-vs-content classification of a
+/// mixed collection (archives, loose ROMs, disc images, Amiga images,
+/// WHDLoad folders, extracted game folders), feeding the existing
+/// identity system rather than replacing it. See the module docs.
+pub mod ingestion;
+#[cfg(test)]
+mod lha_catalogue_tests;
+pub mod registry_parity;
 
 /// Provider-neutral DAT catalogue parsing and read-only audit.
 ///
@@ -88,10 +268,379 @@ pub mod identity_source;
 /// Stage 1A: core model, parsers, indexes, and audit - no persistence or GUI.
 pub mod dat;
 
+/// Read-only "Build Playing Library" 1G1R planner over authoritatively
+/// grouped DAT families. See the module documentation for the identity
+/// rule, election contract, and apply seam.
+pub mod playing_library;
+
+/// Universal Library Publisher Profiles (Phase 1: read-only planning
+/// only). Projects an existing Playing Library plan into a frontend's own
+/// destination layout (RomM, ES-DE) - see the module documentation for the
+/// exact read-only boundary and the Phase 2 execution seam.
+pub mod publisher_profile;
+
+pub mod setup_portability;
+/// Generic, read-only contract for auditing and planning source-root changes.
+pub mod source_root_migration;
+
+/// Read-only conversion-tool capability inventory and per-item eligibility.
+pub mod storage_conversion;
+/// Read-only storage usage and future conversion-opportunity analysis.
+pub mod storage_health;
+
+/// Read-only projection of persisted source-folder/database state into the
+/// generic source-root migration planner.
+pub mod source_folder_migration;
+
+/// Read-only projection of active rename/recovery transaction paths into the
+/// generic source-root migration planner.
+pub mod recovery_state_migration;
+
 pub mod disk_format;
+/// Bounded Sharp X68000 Human68k boot/filesystem evidence.
+pub mod x68000_human68k;
+
+/// Pure content/container/media evidence, deliberately separate from
+/// canonical platform identity. See the module documentation for why.
+pub mod content_evidence;
+/// Batch 11: the smallest reusable, read-only disc-evidence collector -
+/// see that module's own doc comment.
+pub mod disc_evidence_collector;
+
+/// The generic, dependency-free contract future content/media detectors
+/// implement. No detector implementation lives here.
+pub mod content_detector;
+
+/// Pure, read-only Nintendo 64 byte-order (z64/v64/n64) detection and
+/// normalization prototype. The first real [`content_detector`] example.
+pub mod n64_byte_order;
+
+/// Pure, read-only recognition and removal of known, reversible fixed-length
+/// copier/container headers (iNES, FDS, Lynx, Atari 7800, SNES copier).
+pub mod header_normalization;
+
+/// Pure, read-only Super Magic Drive (SMD) de-interleave normalization for
+/// Sega Mega Drive / Genesis ROM images.
+pub mod smd_normalization;
+
+/// Pure, read-only CHD identity observation - separates a CHD's physical
+/// file identity from the raw/combined logical identity its own v5 header
+/// already records. Reuses [`dat::archive::chd`] rather than duplicating it.
+pub mod chd_identity;
+
+/// The smallest possible read-only "bytes addressable by offset"
+/// abstraction, so a logical-filesystem reader (see [`iso9660`]) is not
+/// permanently coupled to any one container.
+pub mod logical_media;
+
+/// Pure, read-only ISO9660 logical-filesystem observation: root layout,
+/// path lookup, and well-known boot-path existence facts. A filesystem is
+/// evidence, never a platform - see the module documentation.
+pub mod iso9660;
+
+/// Pure, read-only CHD logical-data reading: adapts the `chd` crate
+/// (chd-rs) to [`logical_media::LogicalMedia`], connecting a CHD's selected
+/// CD/GD-ROM data track to [`iso9660`].
+pub mod chd_logical_media;
+/// Bounded, read-only CHD logical-track verification against DAT expectations.
+pub mod chd_redump;
+
+/// Philips CD-i filesystem, volume, and startup evidence layered on the
+/// shared logical optical-media reader. The platform registry owns the
+/// `CD-RTOS` identity gate; this module reports structural corroboration.
+pub mod cdi_disc_evidence;
+
+/// Read-only LaserDisc game-set/framefile coherence verification.
+pub mod laserdisc_set;
+
+/// Shared, pure, read-only raw CD/CD-XA sector layout (sync pattern, mode
+/// byte, Mode 1 / Mode 2 Form 1 user-data extraction) used by both
+/// [`chd_logical_media`] and [`raw_cd_logical_media`].
+pub mod raw_cd_sector;
+
+/// Conservative FM Towns IPL4/TownsOS boot evidence.
+pub mod fmtowns_boot_evidence;
+pub mod fmtowns_container_evidence;
+/// Narrow, representation-independent optical-disc fingerprinting seam.
+pub mod optical_fingerprint;
+pub mod optical_layout_inspection;
+
+/// Shared preservation admission and output verification for CD conversion.
+pub(crate) mod optical_preservation;
+/// Conservative PC-98 boot-sector and FAT evidence.
+pub mod pc98_boot_evidence;
+pub mod pc98_container_evidence;
+/// A [`logical_media::LogicalMedia`] adapter over a plain, file-backed
+/// raw-sector optical image (`.bin`-style: a bare stream of 2352-byte CD
+/// sectors) - cooks physical raw sectors down to the conventional
+/// 2048-byte logical view [`iso9660`] and the various boot-header observers
+/// expect, without a second ISO9660/CHD implementation.
+pub mod raw_cd_logical_media;
+
+/// Optional specialist optical-disc backend (Dreamcast GD-ROM high-density
+/// data, and other complex optical layouts [`chd_logical_media`]
+/// deliberately does not handle), behind the `chd-optical-specialist`
+/// feature. See the module documentation for the fallback policy and the
+/// native-dependency tradeoffs of enabling it.
+#[cfg(feature = "chd-optical-specialist")]
+pub mod chd_optical_specialist;
+pub mod conversion_planner;
+
+/// Dreamcast DiscJuggler `.cdi` identity support, behind the
+/// `dreamcast-cdi` feature (default-on). Independent of
+/// `chd-optical-specialist`: unlike [`chd_optical_specialist`], this pulls
+/// in no native/C++ code - `opticaldiscs::discjuggler` is pure Rust, and
+/// this feature does not enable `opticaldiscs`'s own `chd` feature.
+#[cfg(feature = "dreamcast-cdi")]
+pub mod dreamcast_cdi;
+
+/// Pure, read-only PlayStation-style boot evidence (`SYSTEM.CNF`, PS-X EXE
+/// magic) - neutral [`content_evidence`] facts, never a platform.
+pub mod playstation_boot_evidence;
+
+/// Pure, read-only Dreamcast boot-sector (`IP.BIN`) evidence - neutral
+/// [`content_evidence`] facts, never a platform.
+pub mod dreamcast_boot_evidence;
+pub mod dreamcast_dcp_apply;
+pub mod dreamcast_extent_patch;
+/// Read-only Dreamcast DCP/package inspection and fail-closed patch readiness.
+pub mod dreamcast_patch_readiness;
+mod optical_patch_tree;
+
+/// Pure, read-only FAT12/FAT16 root-directory observation for DOS-family
+/// boot media - neutral [`content_evidence`] facts keyed strictly on
+/// documented DOS system-file pairs, never on FAT geometry.
+pub mod dos_boot_evidence;
+
+/// Pure, read-only structural evidence for DOSBox configuration files -
+/// replaces name-only `dosbox.conf` trust with a verified `[autoexec]`
+/// check; corroborating DOS evidence only, never a resolver, never
+/// executed.
+pub mod dosbox_config_evidence;
+
+/// Shared, pure, read-only executable/container header observers: ELF,
+/// PS3 SELF, Xbox XBE, Xbox 360 XEX2.
+pub mod executable_signatures;
+
+/// Shared, pure, read-only PARAM.SFO parser used by
+/// [`psp_boot_evidence`]/[`ps3_boot_evidence`].
+pub mod param_sfo;
+
+/// Pure, read-only PlayStation 2 boot evidence (`SYSTEM.CNF` `BOOT2=` +
+/// ELF magic) - reuses [`playstation_boot_evidence`]/[`executable_signatures`].
+pub mod ps2_boot_evidence;
+
+/// Pure, read-only PSP boot/layout evidence (`PSP_GAME/` + `PARAM.SFO`).
+pub mod psp_boot_evidence;
+
+pub mod psp_game_slimmer;
+#[cfg(test)]
+mod psp_iso_fixtures;
+/// PSP ISO to CSO v1 conversion with byte-exact reversible verification.
+pub mod psp_reversible_shrink;
+
+/// Strict, local-first Game Slimmer profile knowledge and read-only matching.
+pub mod game_slimmer_profiles;
+
+/// Pure, read-only PSP/PS3/Vita `EBOOT.PBP` container header evidence:
+/// bounded fixed-header parsing, offset-table validation, and reuse of
+/// [`param_sfo`] for the embedded `PARAM.SFO` section.
+pub mod psp_pbp_evidence;
+
+/// Pure, read-only PS3 boot/layout evidence (`PS3_GAME/` + `PARAM.SFO` +
+/// SELF magic).
+pub mod ps3_boot_evidence;
+
+/// Pure, read-only PS4 extracted-game layout evidence (`sce_sys/param.sfo`
+/// + a `CUSA`-family `TITLE_ID`). No PKG, no decryption, no launch.
+pub mod ps4_layout_evidence;
+
+/// Pure, read-only Sega Saturn boot-header ("System ID") evidence,
+/// verified against Sega's own official SDK specification.
+pub mod saturn_boot_evidence;
+/// Deterministic, read-only Saturn CUE/BIN optical preservation manifests
+/// and byte/topology verifier.
+pub mod saturn_disc_manifest;
+pub mod saturn_patch_apply;
+/// Read-only, fail-closed Saturn patch compatibility and impact preview.
+pub mod saturn_patch_readiness;
+/// Read-only comparison proof for a future deterministic Saturn data-track
+/// rebuild. This module contains no builder or apply operation.
+pub mod saturn_rebuild_proof;
+
+/// Pure, read-only Sega CD/Mega-CD boot-signature evidence
+/// (`SEGADISCSYSTEM` only - see the module documentation for scope limits).
+pub mod segacd_boot_evidence;
+
+/// Shared XDVDFS volume-descriptor magic check, used by
+/// [`xbox_boot_evidence`]/[`xbox360_boot_evidence`].
+pub mod xdvdfs_signature;
+
+/// Bounded, read-only XDVDFS directory/file traversal (root listing, exact
+/// path lookup, bounded file-prefix reads), built on the `xdvdfs` crate and
+/// used by [`xbox_boot_evidence`]/[`xbox360_boot_evidence`].
+pub mod xdvdfs_traversal;
+
+/// Pure, read-only original Xbox boot evidence (XDVDFS + XBE).
+pub mod xbox_boot_evidence;
+
+/// Pure, read-only Xbox 360 boot evidence (XDVDFS + XEX2).
+pub mod xbox360_boot_evidence;
+
+/// Pure, read-only Xbox 360 STFS digital-package metadata evidence (Xbox
+/// Live Arcade, DLC, saves, and other package content) - bounded, magic +
+/// fixed-header only, verified against a real specimen. See the module
+/// documentation for the Xbox digital collision policy.
+pub mod xbox360_stfs_evidence;
+
+/// Read-only XISO reversible-shrink analysis. No byte-exact shrink writer is
+/// exposed until an exact reconstruction representation is proven.
+pub mod xiso_reversible_shrink;
+
+/// Pure, read-only GameCube/Wii disc-structure evidence, backed by the
+/// `nod` crate rather than a hand-written optical filesystem stack.
+pub mod gamecube_wii_boot_evidence;
+
+/// Pure, read-only PS3 folder-install layout evidence (`PS3_GAME/`
+/// directory tree) and a bounded `.pkg` header observer.
+pub mod ps3_disc_evidence;
+
+/// Pure, read-only 3DO ("Opera" filesystem) boot/volume evidence.
+pub mod threedo_boot_evidence;
+
+/// Pure, read-only PC-FX boot/volume evidence.
+pub mod pcfx_boot_evidence;
+
+/// Pure, read-only Neo Geo CD boot/volume evidence.
+pub mod neogeocd_boot_evidence;
+
+/// Pure, read-only PC Engine CD-ROM² / TurboGrafx-CD IPL boot-record
+/// evidence.
+pub mod pcengine_cd_boot_evidence;
+
+/// Shared, bounded cartridge-header primitives (ASCII field trimming,
+/// wrapping-sum checksums) reused across this crate's cartridge-header
+/// observers. Not a generic framework - each format still owns its own
+/// verified offsets.
+pub mod cartridge_header;
+
+/// Pure, read-only NES/Famicom iNES/NES 2.0 header field decoding (mapper,
+/// PRG/CHR size, flags) - deeper than [`header_normalization`]'s magic-only
+/// recognition.
+pub mod nes_header_evidence;
+
+/// Pure, read-only SNES/Super Famicom internal-header candidate evidence
+/// (LoROM/HiROM/ExHiROM), selected only by checksum/complement validation -
+/// never by title-byte plausibility alone.
+pub mod snes_header_evidence;
+
+/// Pure, read-only Game Boy / Game Boy Color cartridge header evidence
+/// (Nintendo logo, header checksum, CGB support).
+pub mod gb_header_evidence;
+
+/// Pure, read-only Game Boy Advance cartridge header evidence (fixed value,
+/// complement checksum, game code).
+pub mod gba_header_evidence;
+
+/// Pure, read-only Nintendo 64 ROM header field decoding (clock rate, boot
+/// address, CRC1/CRC2, image name, cartridge/country codes) - operates on
+/// canonical `Z64` byte order; see [`n64_byte_order`] for normalization.
+pub mod n64_header_evidence;
+
+/// Pure, read-only Nintendo 64 CIC bootcode identification and CIC-specific
+/// CRC1/CRC2 validation over canonical `Z64` bytes.
+pub mod n64_cic_evidence;
+
+/// Pure, read-only Sega Mega Drive / Genesis cartridge header field
+/// decoding, deeper than the platform registry's own magic-only `SEGA`
+/// check. Includes an opt-in, whole-ROM checksum verifier.
+pub mod megadrive_header_evidence;
+
+/// Pure, read-only Sega Master System / Game Gear `TMR SEGA` header
+/// evidence.
+pub mod sms_gg_header_evidence;
+
+/// Pure, read-only Sega 32X additional-evidence leg, layered on
+/// [`megadrive_header_evidence`] rather than duplicating it.
+pub mod sega32x_header_evidence;
+
+/// Pure, read-only Atari 7800 `.a78` header field decoding, deeper than
+/// [`header_normalization`]'s magic-only recognition.
+pub mod atari7800_header_evidence;
+
+/// Pure, read-only Atari Lynx `.lnx` header field decoding, deeper than
+/// [`header_normalization`]'s magic-only recognition.
+pub mod lynx_header_evidence;
+
+/// Pure, read-only Neo Geo Pocket / Neo Geo Pocket Color cartridge header
+/// evidence.
+pub mod ngp_header_evidence;
+
+/// Pure, read-only bounded Pokémon Mini cartridge header evidence.
+pub mod pokemon_mini_header_evidence;
+
+/// Pure, read-only Bandai WonderSwan / WonderSwan Color ROM footer
+/// evidence, including an opt-in whole-ROM checksum verifier.
+pub mod ws_header_evidence;
+
+/// Bounded, read-only PZX / RZX / NEX / UDI / MDR inspection with an
+/// explicit support status and machine evidence. Never a game identity.
+pub mod zx_spectrum_media;
+/// Pure, read-only structural parsing of ZX Spectrum machine snapshots
+/// (`.z80` v1/v2/v3, `.sna` 48K/128K, `.szx`) into content/structural
+/// evidence - a valid container, a supported Sinclair family, and a machine
+/// subtype only where the format genuinely encodes one. Never a game
+/// identity.
+pub mod zx_spectrum_snapshot;
+
+/// Bounded, read-only structural inspection for Commodore TAP and T64
+/// containers. This observes headers and T64 directory metadata only; it
+/// never decodes pulses or extracts member bytes.
+pub mod commodore_tape;
+
+/// Bounded, read-only ZX Spectrum TAP/TZX and Amstrad CDT inspection.
+pub mod tape_identity;
+
+/// Evidence *scope*: whether an observed content fact could ever
+/// discriminate between platforms (Generic/Family/PlatformSpecific) -
+/// deliberately a separate axis from
+/// [`content_evidence::ContentEvidenceConfidence`] (how reliably the fact
+/// was observed). Consumed only by [`platform_evidence_fusion`].
+pub mod content_evidence_scope;
+/// Generic, mutation-free conversion queue and space-preview model.
+pub mod conversion_queue;
+
+/// The first conservative, explainable content-evidence fusion layer:
+/// groups/weighs/compares [`content_evidence::ContentEvidence`] facts into
+/// a [`platform_evidence_fusion::FusionOutcome`]
+/// (Resolved/Ambiguous/Conflict/Unknown), never an action. See the module
+/// documentation for how this differs from
+/// [`platform::identity::resolve_platform_identity`].
+pub mod platform_evidence_fusion;
+
+/// Bounded, read-only ZIP archive-member content evidence: runs this
+/// crate's cartridge/console-signature detectors over a bounded prefix of
+/// each candidate member's decompressed bytes, with an explicit multi-
+/// member policy that never silently picks a "winning" member.
+pub mod archive_member_content_evidence;
+
+/// Machine-counted evidence coverage inventory: one small manifest linked
+/// to canonical platform ids from [`platform::PLATFORMS`], plus counting
+/// functions that compute every coverage number a report needs from real
+/// data - never a hand-typed total.
+pub mod coverage_inventory;
+
+/// Batch 7: the normalized-view provenance sweep - proves physical vs
+/// normalized bytes stay distinct and reversible for every format this
+/// crate normalizes, and documents (honestly, without inventing it) why no
+/// normalized-hash DAT-matching feature exists yet.
+pub mod normalized_view_provenance;
+
+pub mod repair;
 
 pub mod safe_read;
 
+pub mod media_registry;
 pub mod platform;
 
 /// Explicit, offline management of user-owned platform artwork overrides.
@@ -99,7 +648,90 @@ pub mod platform_artwork;
 
 pub mod patch_manager;
 
+/// Read-only inspection and deterministic planning for caller-supplied local
+/// game-mod package directories. This is intentionally separate from the
+/// cheat/emulator patch manager: it never applies a change or creates history.
+pub mod mod_package;
+
+/// Foundation for trainers on ordinary (non-WHDLoad) Amiga disk images: exact
+/// image identity, typed memory-write trainers, and an immutable-source plan.
+pub mod amiga_adf_trainer;
+/// Read-only inspection and shared-transaction planning for ordinary folder
+/// and ZIP mod packages. No package content is executed or flattened.
+pub mod archive_mod_package;
+
+/// Bounded, read-only inspection of manuals and strategy guides (PDF, CBZ, CBR)
+/// and the deterministic state of an internal page viewer.
+pub mod manual_document;
+
+/// Read-only novice-facing projection and cross-package conflict comparison
+/// over ordinary local mod package inspections.
+pub mod mod_package_preview;
+
+/// Unified read-only projection of installed mod receipts, including optional
+/// provider provenance attached only after a strong local-package join.
+pub mod mod_history;
+
+/// Neutral, bank-aware classic microcomputer POKE cheat projections.
+pub mod classic_poke_family;
+/// Per-game, read-only view of classic POKE trainers (never applies anything).
+pub mod classic_trainer_evidence;
+/// Provider-neutral, metadata-only catalogue records for future mod sources.
+pub mod mod_catalogue;
+/// Provider-neutral, metadata-only discovery and user-acquisition handoff.
+/// This module never scrapes, downloads, extracts, or installs third-party
+/// content; those concerns remain with the existing local safety machinery.
+pub mod mod_provider;
+/// Conservative, metadata-only ModDB project and release provider.
+pub mod moddb;
+/// Legal/open cheat-provider metadata and conservative local projections.
+pub mod open_retro_cheat_providers;
+/// Bounded import of user-supplied local ROM-hack metadata.
+pub mod rom_hack_catalogue;
+
+/// Shared, fail-closed activation planning for enabled mod stacks and previews.
+pub mod mod_activation;
+/// Pure review projection for provider-neutral catalogue records.
+pub mod mod_catalogue_review;
+/// Local, immutable handoff from downloaded bytes to existing mod inspectors.
+pub mod mod_download_inspection;
+/// Pure, no-network policy validation for future external mod payload fetches.
+pub mod mod_download_policy;
+/// Bounded HTTPS transport for policy-approved external mod payloads.
+pub mod mod_download_transport;
+
+/// Read-only list-first inspection of archived local mod packages.
+pub mod archived_mod_package;
+pub mod bezel_decorations;
+
+pub mod patch_output_recovery;
+pub mod patch_package_composition;
+/// Bounded, read-only inspection and immutable-base planning for standalone
+/// IPS/BPS/UPS/VCDIFF/PPF patch files. No patch application is performed.
+pub mod standalone_patch;
+
 pub mod emulator_environment;
+
+/// Unified Launch Planning, Phase 1: canonical-platform → standalone-
+/// adapter/RetroArch-core downstream compatibility, firmware readiness
+/// projections, and the pure `launch::planning::build_launch_plan`
+/// planner. Identity/evidence decides WHAT the game is; this module only
+/// ever decides HOW it could be played from already-resolved identity —
+/// see [`archivefs_core::launch`]'s own doc comment for the exact
+/// boundary.
+pub mod launch;
+/// Recovered bounded, read-only Wii U structural content evidence.
+pub mod wiiu_content_readiness;
+/// Read-only verified WUD/WUX conversion planning.
+pub mod wiiu_conversion;
+/// Bounded, read-only Wii U WUD/WUX container inspection.
+pub mod wiiu_disc;
+
+/// Read-only persistence of already-verified [`game_identity`] facts as a
+/// catalogue-side cache / user-visible projection. Never a trust anchor:
+/// launch and cheat/mod execution keep re-verifying from a fresh
+/// [`game_identity::GameIdentityReport`].
+pub mod verified_identity_cache;
 
 #[derive(Debug)]
 pub enum ArchiveFsError {
@@ -1938,6 +2570,282 @@ pub fn set_master_rom_root_to(config_path: &Path, path: &Path) -> Result<Option<
     Ok(previous)
 }
 
+/// Sets the temporary preparation/mount root without rewriting any unrelated
+/// configuration. The selected directory must already exist, be a real
+/// directory (not a symlink), and be writable by the current user.
+pub fn set_mount_root_default(path: &Path) -> Result<PathBuf> {
+    let config_path = default_config_path()?;
+    set_mount_root_to(&config_path, path)
+}
+
+/// Sets the temporary preparation/mount root in an explicit config file.
+///
+/// This is intentionally a text-preserving update rather than a call through
+/// the source-config renderer: users may have unrelated settings or comments
+/// in `config.toml`, and changing one setting must not discard them. The
+/// existing config is parsed before anything is written, and a symlinked or
+/// otherwise unsafe config path is rejected.
+pub fn set_mount_root_to(config_path: &Path, path: &Path) -> Result<PathBuf> {
+    // Validate the configuration file first - it must exist, be a regular
+    // non-symlinked file, be readable, and parse cleanly. Only if all of
+    // that holds is the selected directory probed (a probe creates and
+    // removes a temp file inside it) or anything written.
+    let contents = read_config_for_update(config_path)?;
+    validate_mount_root_selection(path)?;
+    let updated = replace_mount_root_assignment(&contents, path)?;
+    // The exact bytes about to be published must parse and round-trip the
+    // requested folder. This is what stops a path containing an embedded
+    // newline (or any other text that breaks the assignment line) from ever
+    // publishing an invalid config.
+    verify_proposed_config(&updated, path)?;
+    if updated != contents {
+        ensure_safe_config_target(config_path)?;
+        atomic_write_text(config_path, &updated)?;
+    }
+    Ok(path.to_path_buf())
+}
+
+/// Parses the exact proposed configuration text and confirms it round-trips
+/// the requested mount root. If parsing fails, or the parsed `mount_root`
+/// differs from what was requested, nothing is published.
+fn verify_proposed_config(proposed: &str, expected_mount_root: &Path) -> Result<()> {
+    let parsed = parse_config(proposed).map_err(|source| {
+        ArchiveFsError::Config(format!(
+            "the updated configuration would not parse and was not written: {source}"
+        ))
+    })?;
+    if parsed.mount_root != expected_mount_root {
+        return Err(ArchiveFsError::Config(
+            "the updated configuration did not round-trip the selected folder and was not written"
+                .to_string(),
+        ));
+    }
+    Ok(())
+}
+
+fn validate_mount_root_selection(path: &Path) -> Result<()> {
+    validate_mount_root_path(path)?;
+    validate_mount_root_directory(path)
+}
+
+fn validate_mount_root_path(path: &Path) -> Result<()> {
+    if !path.is_absolute() {
+        return Err(ArchiveFsError::Config(
+            "choose an absolute folder for the temporary preparation folder".to_string(),
+        ));
+    }
+    if path.parent().is_none() || path.components().count() == 1 {
+        return Err(ArchiveFsError::Config(
+            "the filesystem root cannot be used as the temporary preparation folder".to_string(),
+        ));
+    }
+    let value = path.to_str().ok_or_else(|| {
+        ArchiveFsError::Config(
+            "the selected temporary preparation folder cannot be stored losslessly in config.toml"
+                .to_string(),
+        )
+    })?;
+    // Path::components normalizes internal `.` components. Inspect the raw
+    // spelling before any filesystem access or writable-directory probe.
+    #[cfg(windows)]
+    let has_dot_component = value
+        .split(['/', '\\'])
+        .any(|part| matches!(part, "." | ".."));
+    #[cfg(not(windows))]
+    let has_dot_component = value.split('/').any(|part| matches!(part, "." | ".."));
+    if has_dot_component {
+        return Err(ArchiveFsError::Config(format!(
+            "the selected temporary preparation folder is not a safe location: dot or traversal component in {}",
+            path.display()
+        )));
+    }
+    if value.contains(['\r', '\n']) {
+        return Err(ArchiveFsError::Config(
+            "the selected temporary preparation folder contains a line break and cannot be stored safely in config.toml; configuration was not written".to_string(),
+        ));
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+mod mount_root_validation_tests;
+
+fn validate_mount_root_directory(path: &Path) -> Result<()> {
+    let metadata = fs::symlink_metadata(path).map_err(|source| {
+        ArchiveFsError::Config(format!(
+            "the selected temporary preparation folder cannot be used at {}: {source}",
+            path.display()
+        ))
+    })?;
+    if metadata.file_type().is_symlink() {
+        return Err(ArchiveFsError::Config(format!(
+            "the selected temporary preparation folder is a symlink; choose the real writable folder: {}",
+            path.display()
+        )));
+    }
+    if !metadata.is_dir() {
+        return Err(ArchiveFsError::Config(format!(
+            "the selected temporary preparation folder is not a directory: {}",
+            path.display()
+        )));
+    }
+    // Additionally reuse the existing read-only destination-root validator so
+    // an unsafe selection the direct checks above cannot see - a `..`
+    // component, a symlinked parent directory, a symlink loop, or any other
+    // unsafe path component - is rejected with the same rules the rest of
+    // core applies to destination roots. It never creates anything, and a
+    // path that does not resolve to a real directory is `Absent`, refused
+    // here too.
+    let validated = patch_manager::validate_destination_root(path).map_err(|source| {
+        ArchiveFsError::Config(format!(
+            "the selected temporary preparation folder is not a safe location at {}: {source}",
+            path.display()
+        ))
+    })?;
+    if validated.state() != patch_manager::DestinationRootState::ExistingDirectory {
+        return Err(ArchiveFsError::Config(format!(
+            "the selected temporary preparation folder must already exist; choose an existing writable folder: {}",
+            path.display()
+        )));
+    }
+    // No write probe may run through an unsafe ancestor.
+    if !directory_is_writable(path) {
+        return Err(ArchiveFsError::Config(format!(
+            "the selected temporary preparation folder is not writable: {}",
+            path.display()
+        )));
+    }
+    Ok(())
+}
+
+fn read_config_for_update(config_path: &Path) -> Result<String> {
+    ensure_safe_config_target(config_path)?;
+    let contents = fs::read_to_string(config_path)
+        .map_err(|source| ArchiveFsError::io(config_path.to_path_buf(), source))?;
+    // Parsing before the write is the fail-closed boundary for malformed
+    // config. In particular, no partial update is attempted on a file the
+    // application cannot understand.
+    parse_config(&contents)?;
+    Ok(contents)
+}
+
+fn ensure_safe_config_target(config_path: &Path) -> Result<()> {
+    match fs::symlink_metadata(config_path) {
+        Ok(metadata) if metadata.file_type().is_symlink() => Err(ArchiveFsError::Config(format!(
+            "refusing to overwrite symlinked config path: {}",
+            config_path.display()
+        ))),
+        Ok(metadata) if !metadata.is_file() => Err(ArchiveFsError::Config(format!(
+            "refusing to overwrite config path that is not a regular file: {}",
+            config_path.display()
+        ))),
+        Ok(_) => Ok(()),
+        Err(source) => Err(ArchiveFsError::io(config_path.to_path_buf(), source)),
+    }
+}
+
+fn replace_mount_root_assignment(contents: &str, path: &Path) -> Result<String> {
+    let value = path.to_str().ok_or_else(|| {
+        ArchiveFsError::Config(
+            "the selected temporary preparation folder cannot be stored losslessly in config.toml"
+                .to_string(),
+        )
+    })?;
+    let quoted = quote_config_string(value);
+    let mut output = String::with_capacity(contents.len() + quoted.len());
+    let mut in_source_block = false;
+    let mut matches = 0;
+
+    for segment in contents.split_inclusive('\n') {
+        let (line, newline) = segment
+            .strip_suffix('\n')
+            .map_or((segment, ""), |line| (line, "\n"));
+        let (line, carriage_return) = line
+            .strip_suffix('\r')
+            .map_or((line, ""), |line| (line, "\r"));
+        let uncommented = strip_comment(line);
+        let trimmed = uncommented.trim();
+
+        if trimmed == "[[source]]" {
+            in_source_block = true;
+        } else if trimmed.starts_with('[') && trimmed.ends_with(']') {
+            in_source_block = false;
+        }
+
+        let is_mount_root = !in_source_block
+            && trimmed
+                .split_once('=')
+                .is_some_and(|(key, _)| key.trim() == "mount_root");
+        if is_mount_root {
+            matches += 1;
+            let key_start = line.find("mount_root").ok_or_else(|| {
+                ArchiveFsError::Config("could not locate the mount_root setting safely".to_string())
+            })?;
+            let equals = uncommented.find('=').ok_or_else(|| {
+                ArchiveFsError::Config(
+                    "could not locate the mount_root assignment safely".to_string(),
+                )
+            })?;
+            // Whitespace between `=` and the opening quote of the value.
+            let after_equals = &uncommented[equals + 1..];
+            let value_offset = after_equals
+                .find(|character: char| !character.is_whitespace())
+                .ok_or_else(|| {
+                    ArchiveFsError::Config("the mount_root setting has no value".to_string())
+                })?;
+            let whitespace_after_equals = &after_equals[..value_offset];
+            let value_and_trailing = &after_equals[value_offset..];
+            if !value_and_trailing.starts_with('"') {
+                return Err(ArchiveFsError::Config(
+                    "the mount_root value is not a quoted string".to_string(),
+                ));
+            }
+            // Length of the quoted value, honouring `\"` escapes.
+            let mut value_len = None;
+            let mut escaped = false;
+            for (index, character) in value_and_trailing[1..].char_indices() {
+                if character == '"' && !escaped {
+                    // +1 for the skipped opening quote, +1 to sit past the close.
+                    value_len = Some(index + 2);
+                    break;
+                }
+                escaped = character == '\\' && !escaped;
+            }
+            let value_len = value_len.ok_or_else(|| {
+                ArchiveFsError::Config(
+                    "the mount_root value is missing its closing quote".to_string(),
+                )
+            })?;
+            // Whitespace between the value and any inline comment / line end.
+            let trailing_whitespace = &value_and_trailing[value_len..];
+            let comment = &line[uncommented.len()..];
+
+            output.push_str(&line[..key_start]);
+            output.push_str("mount_root");
+            // Whitespace between the key and `=`, plus `=` itself.
+            output.push_str(&line[key_start + "mount_root".len()..equals + 1]);
+            output.push_str(whitespace_after_equals);
+            output.push_str(&quoted);
+            output.push_str(trailing_whitespace);
+            output.push_str(comment);
+        } else {
+            output.push_str(line);
+        }
+        output.push_str(carriage_return);
+        output.push_str(newline);
+    }
+
+    match matches {
+        1 => Ok(output),
+        0 => Err(ArchiveFsError::Config(
+            "config.toml has no unambiguous top-level mount_root setting".to_string(),
+        )),
+        _ => Err(ArchiveFsError::Config(
+            "config.toml has multiple top-level mount_root settings".to_string(),
+        )),
+    }
+}
+
 /// Clears the configured master ROM root (returns the removed value, if any).
 pub fn clear_master_rom_root_default() -> Result<Option<PathBuf>> {
     clear_master_rom_root_to(&default_config_path()?)
@@ -2039,87 +2947,23 @@ fn quote_config_string(value: &str) -> String {
     format!("\"{}\"", value.replace('\\', "\\\\").replace('"', "\\\""))
 }
 
-/// Writes `contents` to `path` durably: a same-directory temp file, whose
-/// contents are flushed to stable storage before it is published, then an
-/// atomic `fs::rename`, then a best-effort sync of the parent directory.
+/// Replaces a regular text file using exclusively created, owned staging.
+/// Writes, mode preservation and file sync use the retained staging handle.
+/// Required mode preservation errors refuse before publication. New files use
+/// the existing 0666/umask creation policy without changing process-wide umask.
 ///
-/// # Why the syncs, and not just the rename
-///
-/// The rename alone is atomic on any POSIX filesystem, so a reader always
-/// sees either the old complete file or the new one - never a splice of
-/// both. That is not the same as durable. Without
-/// [`File::sync_all`] on the temp file, a crash can order the rename ahead
-/// of the data, publishing a file that is *present, named correctly and
-/// empty or truncated*. For a preferences file that is worse than losing
-/// the edit: an empty `cheat_sources.toml` still parses, as "no overrides",
-/// so every stored preference is silently discarded rather than visibly
-/// lost. Syncing the directory afterwards makes the rename itself survive
-/// the same crash.
-///
-/// Directory sync is best-effort by platform: filesystems that do not give
-/// directory handles `fsync` semantics report an error here, and that is
-/// not a failure of the write - the data is already durable and published,
-/// so the error is discarded rather than propagated.
-///
-/// # Permissions
-///
-/// When `path` already exists its permissions are copied onto the
-/// replacement before the rename, so writing a config that a user had
-/// tightened to `0600` does not silently widen it to the process umask's
-/// default.
-///
-/// These writes happen only on an explicit user action (saving settings or
-/// preferences), never in a hot loop, so the cost of two syncs is not a
-/// throughput concern.
+/// Observed staging-name substitution refuses publication and cleanup. This is
+/// parent-bound: entry checks, create, rename and unlink use one directory fd.
+/// Observed parent rebinding refuses publication; if detected after rename, an
+/// error explicitly reports publication in the pinned original directory.
+/// This does not lock writers or eliminate hostile same-UID leaf check/use
+/// races. Directory sync is best effort, not universal crash durability.
 pub(crate) fn atomic_write_text(path: &Path, contents: &str) -> Result<()> {
-    static TEMP_FILE_SEQUENCE: AtomicU64 = AtomicU64::new(0);
-
-    let parent = path.parent().ok_or_else(|| {
-        ArchiveFsError::Config(format!("config path has no parent: {}", path.display()))
-    })?;
-    fs::create_dir_all(parent)
-        .map_err(|source| ArchiveFsError::io(parent.to_path_buf(), source))?;
-
-    let temp_path = parent.join(format!(
-        ".archivefs-config-write-{}-{}.tmp",
-        std::process::id(),
-        TEMP_FILE_SEQUENCE.fetch_add(1, Ordering::Relaxed)
-    ));
-
-    // Scoped so the handle is closed before the rename: on Windows a rename
-    // over an open file fails, and there is nothing to gain from holding it.
-    let write_result = (|| -> io::Result<()> {
-        let mut file = fs::File::create(&temp_path)?;
-        file.write_all(contents.as_bytes())?;
-        file.flush()?;
-        file.sync_all()
-    })();
-    if let Err(source) = write_result {
-        let _ = fs::remove_file(&temp_path);
-        return Err(ArchiveFsError::io(temp_path, source));
-    }
-
-    // Carry the existing file's mode across. Failure to read it is not fatal:
-    // the write still has to happen, just with default permissions.
-    if let Ok(existing) = fs::metadata(path) {
-        let _ = fs::set_permissions(&temp_path, existing.permissions());
-    }
-
-    fs::rename(&temp_path, path).map_err(|source| {
-        let _ = fs::remove_file(&temp_path);
-        ArchiveFsError::io(path.to_path_buf(), source)
-    })?;
-
-    sync_directory_best_effort(parent);
-    Ok(())
+    atomic_text::write(path, contents)
 }
-
-/// Flushes a directory entry change (a rename) to stable storage.
-///
-/// Best-effort on purpose - see [`atomic_write_text`]. Opening a directory
-/// for reading and syncing it is the POSIX idiom; platforms and filesystems
-/// that do not support it fail here, and the caller's write is still
-/// complete and durable, so the error is deliberately dropped.
+/// Attempts to sync a directory entry change. Failure is deliberately ignored
+/// for the existing API's compatibility; it does not establish durable rename
+/// publication on filesystems where directory synchronization fails.
 fn sync_directory_best_effort(dir: &Path) {
     if let Ok(handle) = fs::File::open(dir) {
         let _ = handle.sync_all();
@@ -2207,11 +3051,9 @@ pub(crate) fn validate_configured_source_roots(paths: &[PathBuf]) -> Result<()> 
     for path in paths {
         validate_source_root_shape(path)?;
         let path: PathBuf = path.components().collect();
-        if let Some(existing) = normalized.iter().find(|existing| {
-            path == **existing || path.starts_with(existing) || existing.starts_with(&path)
-        }) {
+        if let Some(existing) = normalized.iter().find(|existing| path == **existing) {
             return Err(ArchiveFsError::Config(format!(
-                "duplicate or overlapping source roots are not supported: {} and {}",
+                "duplicate source roots are not supported: {} and {}",
                 existing.display(),
                 path.display()
             )));
@@ -2221,6 +3063,21 @@ pub(crate) fn validate_configured_source_roots(paths: &[PathBuf]) -> Result<()> 
     Ok(())
 }
 
+/// Returns explicitly configured roots strictly below `source`, in stable
+/// order. A child source owns its subtree when the parent is scanned, so a
+/// pathological child cannot consume the parent's whole entry budget and no
+/// file is discovered under two source-folder owners.
+pub(crate) fn nested_source_roots(source: &Path, roots: &[PathBuf]) -> Vec<PathBuf> {
+    let mut nested: Vec<PathBuf> = roots
+        .iter()
+        .filter(|root| *root != source && root.starts_with(source))
+        .cloned()
+        .collect();
+    nested.sort();
+    nested.dedup();
+    nested
+}
+
 /// Validates a user-supplied path as a candidate new source folder,
 /// against the currently configured sources - the multi-source
 /// milestone's shared validation, used identically by the GUI's Add
@@ -2228,12 +3085,11 @@ pub(crate) fn validate_configured_source_roots(paths: &[PathBuf]) -> Result<()> 
 /// Confirms the path exists, is a directory, and is readable (via
 /// `fs::read_dir`, which only lists directory entries - this never opens
 /// or inspects any archive file inside it), then rejects it as a
-/// duplicate or a parent/child overlap of any `existing` source, using
-/// canonicalized paths for that comparison so a trailing separator or a
-/// symlink cannot slip an equivalent path past the check. Overlaps are
-/// rejected outright rather than accepted-with-confirmation, per the
-/// milestone's stated preference, since nothing in this schema
-/// deduplicates a file discovered under two different source folders.
+/// duplicate of any `existing` source, using canonicalized paths for that
+/// comparison so a trailing separator or a symlink cannot slip an equivalent
+/// path past the check. Parent/child roots are allowed because the scanner
+/// gives the explicit child ownership of its subtree and excludes it from the
+/// parent traversal.
 ///
 /// Returns the exact absolute path to store with a harmless trailing
 /// separator removed. Symlink components, traversal, filesystem-root paths,
@@ -2319,22 +3175,9 @@ pub fn validate_new_source_folder(candidate: &Path, existing: &[PathBuf]) -> Res
                 normalized.display()
             )));
         }
-        if candidate_canonical.starts_with(&existing_canonical) {
-            return Err(ArchiveFsError::Config(format!(
-                "{} is inside the already-configured source folder {} - overlapping \
-                 sources are not supported",
-                normalized.display(),
-                existing_path.display()
-            )));
-        }
-        if existing_canonical.starts_with(&candidate_canonical) {
-            return Err(ArchiveFsError::Config(format!(
-                "{} would contain the already-configured source folder {} - overlapping \
-                 sources are not supported",
-                normalized.display(),
-                existing_path.display()
-            )));
-        }
+        // Parent/child roots are safe: the scanner shadows an explicitly
+        // configured child while traversing its parent, then scans the child
+        // independently under the same bounded budget.
     }
 
     Ok(normalized)
@@ -2419,6 +3262,7 @@ fn classify_scan_failure(error: &str) -> SourceAvailability {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct SourceFolderView {
     pub path: PathBuf,
+    pub role: SourceRole,
     pub enabled: bool,
     pub created_at: Option<String>,
     /// `None` only if this source has never been registered in the
@@ -2452,6 +3296,9 @@ pub fn build_source_folder_views(
             let last_scan_error = record.and_then(|record| record.last_scan_error.clone());
             SourceFolderView {
                 path: source.path.clone(),
+                role: record
+                    .map(|record| record.role)
+                    .unwrap_or_else(SourceRole::default),
                 enabled: source.enabled,
                 created_at: source.created_at.clone(),
                 id: record.map(|record| record.id),
@@ -2487,12 +3334,82 @@ pub fn list_source_folder_views_at(
     Ok(build_source_folder_views(&sources, &records))
 }
 
-/// Saves an explicit platform default for a configured source. The returned
+/// Persists the explicit role for one configured source. Role changes are
+/// metadata-only: they never scan, move, rename, or otherwise touch the
+/// source folder. The next explicit scan uses the persisted role's existing
+/// routing policy.
+pub fn set_source_role_at(
+    config_path: &Path,
+    database_path: &Path,
+    target: &Path,
+    role: SourceRole,
+) -> Result<()> {
+    let sources = load_source_folder_configs_from(config_path)?;
+    if !sources.iter().any(|source| source.path == target) {
+        return Err(ArchiveFsError::Config(format!(
+            "source folder {} is not configured",
+            target.display()
+        )));
+    }
+    let mut database = Database::open_or_create(database_path)?;
+    register_configured_sources(&mut database, &sources)?;
+    database.set_source_role(target, role)
+}
+
+/// Read-only review of one configured source's storage binding, against the
+/// library database at `database_path`. See [`Database::review_source_rebind`].
+pub fn review_source_rebind_at(
+    database_path: &Path,
+    target: &Path,
+) -> Result<catalogue_health::SourceRebindReview> {
+    let database = Database::open_read_only(database_path)?;
+    let record = database
+        .list_source_folders()?
+        .into_iter()
+        .find(|record| record.path == target)
+        .ok_or_else(|| {
+            ArchiveFsError::Database(format!(
+                "source folder {} is not registered",
+                target.display()
+            ))
+        })?;
+    database.review_source_rebind(record.id)
+}
+
+pub fn review_source_rebind_default(target: &Path) -> Result<catalogue_health::SourceRebindReview> {
+    review_source_rebind_at(&default_database_path()?, target)
+}
+
+/// Commits a rebind the user reviewed and confirmed. Never scans, never marks
+/// anything Missing, and refuses if anything changed since the review.
+pub fn rebind_source_after_review_at(
+    database_path: &Path,
+    review: &catalogue_health::SourceRebindReview,
+) -> Result<()> {
+    Database::open_or_create(database_path)?.confirm_source_rebind(review)
+}
+
+pub fn rebind_source_after_review_default(
+    review: &catalogue_health::SourceRebindReview,
+) -> Result<()> {
+    rebind_source_after_review_at(&default_database_path()?, review)
+}
+
+pub fn set_source_role_default(target: &Path, role: SourceRole) -> Result<()> {
+    set_source_role_at(
+        &default_config_path()?,
+        &default_database_path()?,
+        target,
+        role,
+    )
+}
+
+/// Read-only preview of assigning a platform default to a configured source. The returned
 /// count is the number of currently visible Unknown rows that a subsequent
 /// rescan may safely recover; callers must show it before invoking this
 /// mutating action.
 pub fn preview_source_platform_assignment_at(database_path: &Path, target: &Path) -> Result<i64> {
-    let database = Database::open_or_create(database_path)?;
+    let database = Database::open_read_only(database_path)?;
     let record = database
         .list_source_folders()?
         .into_iter()
@@ -2523,9 +3440,8 @@ pub fn assign_source_platform_at(
             target.display()
         )));
     }
-    let all_paths: Vec<PathBuf> = sources.iter().map(|source| source.path.clone()).collect();
     let mut database = Database::open_or_create(database_path)?;
-    database.register_source_folders(&all_paths)?;
+    register_configured_sources(&mut database, &sources)?;
     database.set_source_platform_assignment(target, Some(canonical))?;
     drop(database);
     scan_source_folder_at(config_path, database_path, target, triggered_by)
@@ -2541,13 +3457,19 @@ pub fn assign_source_platform_default(target: &Path, platform: &str) -> Result<S
     )
 }
 
-/// Adds `candidate` as a new, enabled source folder: validates it against
-/// every currently configured source (see [`validate_new_source_folder`]),
-/// atomically saves the updated config, then immediately registers it in
-/// the database so it has a stable id and shows up on the Sources page
-/// right away - deliberately *never* scans it (the milestone requires an
-/// explicit, separate Scan action; adding a source must never itself walk
-/// the filesystem beyond the one-time validation check).
+/// Adds `candidate` as a new, enabled source folder: bootstraps the existing
+/// starter configuration only when the config path is genuinely absent,
+/// validates the folder against every currently configured source (see
+/// [`validate_new_source_folder`]), atomically saves the updated config, then
+/// immediately registers it in the database so it has a stable id and shows
+/// up on the Sources page right away.
+///
+/// This remains an explicit, write-authorised source-add operation. Startup,
+/// diagnostics, config loading, and page rendering do not call it and remain
+/// read-only. An existing path - including a malformed file, directory, or
+/// symlink - is never replaced with a starter config. Source addition also
+/// deliberately *never* scans: callers decide whether to queue a scan after a
+/// successful add.
 pub fn add_source_folder_default(candidate: &Path) -> Result<SourceFolderConfig> {
     add_source_folder_at(
         &default_config_path()?,
@@ -2561,6 +3483,7 @@ pub fn add_source_folder_at(
     database_path: &Path,
     candidate: &Path,
 ) -> Result<SourceFolderConfig> {
+    ensure_config_for_explicit_source_add(config_path)?;
     let mut sources = load_source_folder_configs_from(config_path)?;
     let config = Config::load_from(config_path)?;
 
@@ -2582,11 +3505,25 @@ pub fn add_source_folder_at(
         config.master_rom_root.as_deref(),
     )?;
 
-    let all_paths: Vec<PathBuf> = sources.iter().map(|source| source.path.clone()).collect();
     let mut database = Database::open_or_create(database_path)?;
-    database.register_source_folders(&all_paths)?;
+    register_configured_sources(&mut database, &sources)?;
 
     Ok(new_source)
+}
+
+/// Creates the established starter config only for an explicit source-add
+/// operation and only after `symlink_metadata` proves there is no filesystem
+/// entry at `config_path`. Using `symlink_metadata` rather than `exists()` is
+/// important: a dangling symlink is still an existing configuration path and
+/// must fail closed instead of being treated as permission to replace it.
+/// `create_starter_config` retains the final create-new/no-overwrite guard for
+/// a concurrent creator between this check and the write.
+fn ensure_config_for_explicit_source_add(config_path: &Path) -> Result<()> {
+    match fs::symlink_metadata(config_path) {
+        Ok(_) => Ok(()),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => create_starter_config(config_path),
+        Err(source) => Err(ArchiveFsError::io(config_path.to_path_buf(), source)),
+    }
 }
 
 /// The result of enabling or disabling a source folder. `scan` is only
@@ -2641,9 +3578,8 @@ pub fn set_source_folder_enabled_at(
         config.master_rom_root.as_deref(),
     )?;
 
-    let all_paths: Vec<PathBuf> = sources.iter().map(|source| source.path.clone()).collect();
     let mut database = Database::open_or_create(database_path)?;
-    let registered = database.register_source_folders(&all_paths)?;
+    let registered = register_configured_sources(&mut database, &sources)?;
 
     let scan = if enabled {
         let folder = registered
@@ -2770,6 +3706,22 @@ pub fn remove_source_folder_at(
     })
 }
 
+/// Registers the configured sources and records their enabled state in the same
+/// step, so the database's Missing authority never relies on config it cannot read.
+fn register_configured_sources(
+    database: &mut Database,
+    sources: &[SourceFolderConfig],
+) -> Result<Vec<RegisteredSourceFolder>> {
+    let paths: Vec<PathBuf> = sources.iter().map(|source| source.path.clone()).collect();
+    let registered = database.register_source_folders(&paths)?;
+    let states: Vec<(PathBuf, bool)> = sources
+        .iter()
+        .map(|source| (source.path.clone(), source.enabled))
+        .collect();
+    database.sync_source_enablement(&states)?;
+    Ok(registered)
+}
+
 /// Scans exactly one configured source folder, enabled or disabled - an
 /// explicit, targeted action, so unlike [`scan_all_enabled_sources_at`]
 /// this does not check `enabled` at all (a user directly clicking "Scan"
@@ -2804,9 +3756,8 @@ pub fn scan_source_folder_at(
         )));
     }
 
-    let all_paths: Vec<PathBuf> = sources.iter().map(|source| source.path.clone()).collect();
     let mut database = Database::open_or_create(database_path)?;
-    let registered = database.register_source_folders(&all_paths)?;
+    let registered = register_configured_sources(&mut database, &sources)?;
     let folder = registered
         .into_iter()
         .find(|folder| folder.path == target)
@@ -2817,7 +3768,10 @@ pub fn scan_source_folder_at(
             ))
         })?;
 
-    scan_and_persist_folders(&mut database, std::slice::from_ref(&folder), triggered_by)
+    let summary =
+        scan_and_persist_folders(&mut database, std::slice::from_ref(&folder), triggered_by)?;
+    refresh_configured_mame_arcade_identity(&mut database, &[target.to_path_buf()])?;
+    Ok(summary)
 }
 
 /// Scans every *enabled* configured source folder independently - a
@@ -2843,7 +3797,7 @@ pub fn scan_all_enabled_sources_at(
     let all_paths: Vec<PathBuf> = sources.iter().map(|source| source.path.clone()).collect();
     validate_configured_source_roots(&all_paths)?;
     let mut database = Database::open_or_create(database_path)?;
-    let registered = database.register_source_folders(&all_paths)?;
+    let registered = register_configured_sources(&mut database, &sources)?;
 
     let enabled_paths: HashSet<&PathBuf> = sources
         .iter()
@@ -2855,7 +3809,78 @@ pub fn scan_all_enabled_sources_at(
         .filter(|folder| enabled_paths.contains(&folder.path))
         .collect();
 
-    scan_and_persist_folders(&mut database, &enabled_folders, triggered_by)
+    let skipped: Vec<_> = sources
+        .iter()
+        .filter(|s| !s.enabled)
+        .map(|s| s.path.clone())
+        .collect();
+    let summary = database::scan_and_persist_folders_with_skipped(
+        &mut database,
+        &enabled_folders,
+        triggered_by,
+        &skipped,
+    )?;
+    let paths = enabled_folders
+        .iter()
+        .map(|folder| folder.path.clone())
+        .collect::<Vec<_>>();
+    refresh_configured_mame_arcade_identity(&mut database, &paths)?;
+    Ok(summary)
+}
+
+/// Refreshes the existing persisted MAME Arcade join after a successful
+/// source scan. The DAT registry remains the authority: absent, invalid, or
+/// non-MAME sources are simply not launch-authorizing and never produce
+/// guessed identity. Raw members are only used by the bounded join to build
+/// one logical set record.
+fn refresh_configured_mame_arcade_identity(
+    database: &mut Database,
+    roots: &[PathBuf],
+) -> Result<()> {
+    let config_path = dat::sources::default_dat_sources_config_path()?;
+    let config = dat::sources::load_dat_sources_config_from(config_path)?;
+    let Some(source) = config
+        .sources
+        .unwrap_or_default()
+        .into_iter()
+        .find(|source| source.id == "mame-0-174-arcade-xml" && source.enabled.unwrap_or(true))
+    else {
+        return Ok(());
+    };
+    let dat = dat::mame_arcade_join::load_verified_mame_0174(Path::new(&source.path))
+        .map_err(ArchiveFsError::Config)?;
+    let audited_at = format!("{:?}", std::time::SystemTime::now());
+    for root in roots {
+        let arcade_root = if root
+            .file_name()
+            .is_some_and(|name| name.to_string_lossy().eq_ignore_ascii_case("arcade"))
+        {
+            root.clone()
+        } else {
+            root.join("arcade")
+        };
+        if !arcade_root.is_dir() {
+            continue;
+        }
+        let join_started = std::time::Instant::now();
+        let report =
+            dat::mame_arcade_join::join_extracted_arcade_root(&dat, &arcade_root, &audited_at)
+                .map_err(ArchiveFsError::Config)?;
+        log::info!(
+            "MAME Arcade join prepared {} logical sets from {} in {:?}",
+            report.evidence.len(),
+            arcade_root.display(),
+            join_started.elapsed()
+        );
+        let persist_started = std::time::Instant::now();
+        let rows = database.persist_mame_arcade_join(&report)?;
+        log::info!(
+            "MAME Arcade audit persisted {rows} rows from {} in {:?}",
+            arcade_root.display(),
+            persist_started.elapsed()
+        );
+    }
+    Ok(())
 }
 
 /// Resolves a CLI-style `<id-or-path>` argument to a configured source
@@ -3029,17 +4054,79 @@ fn parse_string_array(value: &str, line_number: usize) -> Result<Vec<String>> {
     Ok(values)
 }
 
+/// Whether a stored `archive_kind` names a directory-shaped catalogue item
+/// (an extracted arcade set or ScummVM game folder) rather than a file.
+pub fn archive_kind_is_directory_item(kind: &str) -> bool {
+    matches!(kind, "arcade_set_directory" | "scummvm_directory")
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum ArchiveKind {
     Zip,
     SevenZip,
     Rar,
+    /// An LHA/LZH archive (`.lha` and `.lzh` are one format). It is catalogued
+    /// as a library row only: EmuWiz has no LHA mount backend, so it is never
+    /// a mount input, and a row implies neither verified identity nor
+    /// launchability. Member inspection stays on the bounded LHA reader.
+    Lha,
     /// A loose Mega Drive/Genesis ROM. It is catalogued but deliberately
     /// marked unsupported for EmuWiz's archive-mount backend.
     MegaDriveRom,
     /// A supported game image that is catalogued directly rather than
     /// requiring an archive wrapper. Scanning never mounts or modifies it.
     DirectGameImage,
+    /// One extracted MAME/FBNeo ROM set directory. Its member files remain
+    /// source-level evidence; the directory is the single logical catalogue
+    /// item and is never a mount input.
+    ArcadeSetDirectory,
+    /// One extracted game folder the installed ScummVM detector recognised as
+    /// exactly one `engine:game`. The folder is the single catalogue item; its
+    /// files are never mounted, and the row implies detection, not launchability
+    /// (a launch re-detects).
+    ScummVmDirectory,
+    /// A preservation-only media record: kept in the library with an
+    /// import-time SHA-256 fingerprint, but never a game entry, never a DAT
+    /// game match, and never a mount or launch input. Today only a structurally recognised ZX Spectrum RZX
+    /// gameplay recording ([`crate::zx_spectrum_media`]) produces one.
+    PreservationRecording,
+}
+
+impl ArchiveKind {
+    pub fn from_storage(value: &str) -> Option<Self> {
+        match value {
+            "zip" => Some(Self::Zip),
+            "sevenzip" => Some(Self::SevenZip),
+            "rar" => Some(Self::Rar),
+            "lha" => Some(Self::Lha),
+            "megadrive_rom" => Some(Self::MegaDriveRom),
+            "direct_game_image" => Some(Self::DirectGameImage),
+            "arcade_set_directory" => Some(Self::ArcadeSetDirectory),
+            "scummvm_directory" => Some(Self::ScummVmDirectory),
+            "preservation_recording" => Some(Self::PreservationRecording),
+            _ => None,
+        }
+    }
+
+    pub fn storage_name(self) -> &'static str {
+        match self {
+            Self::Zip => "zip",
+            Self::SevenZip => "sevenzip",
+            Self::Rar => "rar",
+            Self::Lha => "lha",
+            Self::MegaDriveRom => "megadrive_rom",
+            Self::DirectGameImage => "direct_game_image",
+            Self::ArcadeSetDirectory => "arcade_set_directory",
+            Self::ScummVmDirectory => "scummvm_directory",
+            Self::PreservationRecording => "preservation_recording",
+        }
+    }
+
+    /// Whether this row is preservation-only media rather than a game: it is
+    /// shown and kept, but Play is never offered for it.
+    pub fn is_preservation_only(self) -> bool {
+        self == Self::PreservationRecording
+    }
 }
 
 impl ArchiveKind {
@@ -3047,7 +4134,15 @@ impl ArchiveKind {
     /// Loose cartridge ROMs remain selectable library content but never
     /// become queue or mount candidates.
     pub fn is_mount_input(self) -> bool {
-        !matches!(self, Self::MegaDriveRom | Self::DirectGameImage)
+        !matches!(
+            self,
+            Self::Lha
+                | Self::MegaDriveRom
+                | Self::DirectGameImage
+                | Self::ArcadeSetDirectory
+                | Self::ScummVmDirectory
+                | Self::PreservationRecording
+        )
     }
 }
 
@@ -3117,6 +4212,12 @@ pub struct ArchiveIdentity {
     pub filesystem_inode: Option<u64>,
     pub source_filesystem_device: Option<u64>,
     pub source_filesystem_inode: Option<u64>,
+    /// Reads the platform detector attempted on this file that did not
+    /// complete (see `platform::PlatformDetectionReport::inspection_problems`).
+    /// Empty for a completed inspection and for identities rebuilt from a
+    /// scan fingerprint. A scan never retracts an assignment on the strength
+    /// of an identity whose inspection was incomplete.
+    pub inspection_problems: Vec<String>,
 }
 
 impl ArchiveIdentity {
@@ -3129,7 +4230,8 @@ impl ArchiveIdentity {
         let source_metadata = fs::symlink_metadata(&source_root).ok();
         let file_identity = metadata.map(filesystem_identity);
         let source_identity = source_metadata.as_ref().map(filesystem_identity);
-        let detection = detect_platform_with_provenance(path, &source_root);
+        let (detection, inspection_problems) =
+            detect_platform_with_details_and_problems(path, &source_root);
         let (platform, platform_provenance) = match detection {
             Some(detection) => (Some(detection.platform), Some(detection.provenance)),
             None => (None, None),
@@ -3150,6 +4252,7 @@ impl ArchiveIdentity {
             filesystem_inode: file_identity.map(|identity| identity.inode),
             source_filesystem_device: source_identity.map(|identity| identity.device),
             source_filesystem_inode: source_identity.map(|identity| identity.inode),
+            inspection_problems,
         }
     }
 
@@ -3174,10 +4277,28 @@ pub struct ArchiveMetadata {
     pub genre: Option<String>,
     pub notes: Option<String>,
     pub source: Option<String>,
+    /// Enrichment-only fields (game metadata milestone, 2026-08-22): never
+    /// written by any identity/preservation code path, and never consulted
+    /// by DAT matching, platform detection, or the resolver. Populated only
+    /// by an enrichment `MetadataProvider` (see `identity_source::romm`'s
+    /// enrichment support) - a game with none of these set is exactly as
+    /// usable as one that never had a metadata provider configured at all.
+    pub synopsis: Option<String>,
+    /// A free-form player-count description as the enrichment source
+    /// published it (e.g. "1-2", "1-4"), not a parsed range - providers
+    /// disagree on shape too often to normalise further without risking a
+    /// wrong-looking precise number.
+    pub players: Option<String>,
+    /// A community/critic rating, 0-100 (RomM's `average_rating` is IGDB's
+    /// 0-100 convention; rounded to a whole number, which is all display
+    /// ever needs). Display-only: never used for sorting, filtering, or any
+    /// decision. `Option<u8>` rather than a float so `ArchiveMetadata` can
+    /// keep deriving `Eq`/`Hash`.
+    pub rating: Option<u8>,
 }
 
 impl ArchiveMetadata {
-    fn empty() -> Self {
+    pub fn empty() -> Self {
         Self {
             title: None,
             platform: None,
@@ -3191,6 +4312,9 @@ impl ArchiveMetadata {
             genre: None,
             notes: None,
             source: None,
+            synopsis: None,
+            players: None,
+            rating: None,
         }
     }
 }
@@ -3238,6 +4362,91 @@ pub struct Archive {
 }
 
 impl Archive {
+    pub(crate) fn from_arcade_set_directory(path: &Path, source_root: &Path) -> Option<Self> {
+        let metadata = fs::symlink_metadata(path)
+            .ok()
+            .filter(|metadata| metadata.is_dir() && !metadata.file_type().is_symlink())?;
+        Some(Self {
+            path: path.to_path_buf(),
+            kind: ArchiveKind::ArcadeSetDirectory,
+            identity: ArchiveIdentity::from_path(path, source_root, Some(&metadata)),
+            health: ArchiveHealth::Pending,
+        })
+    }
+
+    /// A real (non-symlink) game folder ScummVM detected as one game. The
+    /// platform is `ScummVM` with header-level provenance: the detector read
+    /// the folder's own files.
+    pub(crate) fn from_scummvm_directory(
+        path: &Path,
+        source_root: &Path,
+        detected_description: Option<&str>,
+    ) -> Option<Self> {
+        let metadata = fs::symlink_metadata(path)
+            .ok()
+            .filter(|metadata| metadata.is_dir() && !metadata.file_type().is_symlink())?;
+        let mut identity = ArchiveIdentity::from_path(path, source_root, Some(&metadata));
+        identity.platform = Some("ScummVM".into());
+        identity.platform_provenance = Some(PlatformProvenance::HeaderIdentity);
+        // The folder name is whatever the person called it; the detector's own
+        // title (without its trailing "(CD/DOS/English)" variant note) reads
+        // better and is what they will search for.
+        if let Some(title) = detected_description
+            .and_then(|text| text.split(" (").next())
+            .map(str::trim)
+            .filter(|title| !title.is_empty())
+        {
+            identity.display_name = title.to_string();
+            identity.normalized_name = safe_mount_name(Path::new(title)).to_lowercase();
+        }
+        Some(Self {
+            path: path.to_path_buf(),
+            kind: ArchiveKind::ScummVmDirectory,
+            identity,
+            health: ArchiveHealth::Pending,
+        })
+    }
+
+    fn from_scan_fingerprint(
+        path: &Path,
+        source_root: &Path,
+        fingerprint: &ScanFingerprint,
+        metadata: fs::Metadata,
+    ) -> Self {
+        let identity = ArchiveIdentity {
+            display_name: fingerprint.display_name.clone(),
+            normalized_name: fingerprint.normalized_name.clone(),
+            source_root: source_root.to_path_buf(),
+            size_bytes: Some(fingerprint.size_bytes),
+            modified_time: metadata.modified().ok(),
+            platform: fingerprint.platform.clone(),
+            platform_provenance: fingerprint.platform_provenance,
+            region: None,
+            content_hash: None,
+            archive_hash: None,
+            internal_listing_hash: None,
+            filesystem_device: Some(filesystem_identity(&metadata).device),
+            filesystem_inode: Some(filesystem_identity(&metadata).inode),
+            source_filesystem_device: fs::symlink_metadata(source_root)
+                .ok()
+                .map(|m| filesystem_identity(&m).device),
+            source_filesystem_inode: fs::symlink_metadata(source_root)
+                .ok()
+                .map(|m| filesystem_identity(&m).inode),
+            inspection_problems: Vec::new(),
+        };
+        Self {
+            path: path.to_path_buf(),
+            kind: fingerprint.archive_kind,
+            identity,
+            health: if fingerprint.archive_kind == ArchiveKind::MegaDriveRom {
+                ArchiveHealth::Unsupported
+            } else {
+                ArchiveHealth::Pending
+            },
+        }
+    }
+
     pub fn from_path(path: impl AsRef<Path>) -> Option<Self> {
         Self::from_path_in_root(path, PathBuf::new())
     }
@@ -3262,6 +4471,53 @@ impl Archive {
                 {
                     identity.platform = Some(platform.to_string());
                     identity.platform_provenance = Some(PlatformProvenance::HeaderIdentity);
+                }
+                // Folder and registry evidence outrank the header; the header
+                // only fills in a platform nothing else could name.
+                if kind == ArchiveKind::DirectGameImage
+                    && identity.platform.is_none()
+                    && let Some(platform) = detect_game_boy_header_platform(path)
+                {
+                    identity.platform = Some(platform.to_string());
+                    identity.platform_provenance = Some(PlatformProvenance::HeaderIdentity);
+                }
+                // `archive_kind_in_root` returns a kind for these only after
+                // `zx_spectrum_media` proved the structure, and no other
+                // platform uses them.
+                if path
+                    .extension()
+                    .and_then(|e| e.to_str())
+                    .and_then(zx_spectrum_media::SpectrumMediaFormat::for_extension)
+                    .is_some()
+                {
+                    identity.platform =
+                        Some(zx_spectrum_snapshot::SpectrumMachine::PLATFORM.into());
+                    identity.platform_provenance = Some(PlatformProvenance::HeaderIdentity);
+                }
+                if kind == ArchiveKind::DirectGameImage
+                    && matches!(
+                        path.extension()
+                            .and_then(|e| e.to_str())
+                            .unwrap_or_default()
+                            .to_ascii_lowercase()
+                            .as_str(),
+                        "hdf" | "hdfx"
+                    )
+                    && amiga_disk::inspect_amiga_image(path).is_ok()
+                {
+                    identity.platform = Some("Amiga".into());
+                    identity.platform_provenance = Some(PlatformProvenance::HeaderIdentity);
+                }
+                if path
+                    .extension()
+                    .is_some_and(|extension| extension.eq_ignore_ascii_case("rpx"))
+                    && let Some(root) =
+                        wiiu_content_readiness::launch_selection::extracted_root_for_selection(path)
+                {
+                    identity.platform = Some("WiiU".into());
+                    identity.platform_provenance = Some(PlatformProvenance::RegistryDetector);
+                    identity.display_name = archive_title(&root);
+                    identity.normalized_name = normalized_title(&root);
                 }
                 // A Mega Drive ROM's *kind* is weak evidence: it comes from an
                 // extension. It may fill in a platform nothing else identified,
@@ -3299,39 +4555,61 @@ pub fn archive_kind(path: impl AsRef<Path>) -> Option<ArchiveKind> {
         return None;
     }
 
-    if filename.ends_with(".zip") {
-        Some(ArchiveKind::Zip)
-    } else if filename.ends_with(".7z") {
-        Some(ArchiveKind::SevenZip)
-    } else if filename.ends_with(".rar") {
-        Some(ArchiveKind::Rar)
-    } else if filename.ends_with(".smd") {
-        // `.smd` is a Super Magic Drive dump: Mega Drive specific, so it needs
-        // no corroboration.
-        //
-        // `.gen` deliberately does NOT appear here. It collides with Sierra
-        // SCI `RESOURCE.GEN` files, which every ScummVM game directory
-        // contains, and classifying one of those as a Mega Drive ROM is
-        // exactly the misdetection this milestone fixes. A `.gen` file is
-        // recognised as a Mega Drive ROM only once something corroborates it -
-        // see `archive_kind_in_root`.
-        Some(ArchiveKind::MegaDriveRom)
-    } else if [".iso", ".gcm", ".gcz", ".rvz", ".wbfs", ".ciso"]
-        .iter()
-        .any(|extension| filename.ends_with(extension))
-    {
-        Some(ArchiveKind::DirectGameImage)
-    } else {
-        None
-    }
+    // `.gen` deliberately never resolves here, even though it would collide
+    // with Mega Drive dumps: it also collides with Sierra SCI
+    // `RESOURCE.GEN` files, which every ScummVM game directory contains,
+    // and classifying one of those as a Mega Drive ROM is exactly the
+    // misdetection an earlier milestone fixed. A `.gen` (or `.md`/`.bin`)
+    // file is recognised as a Mega Drive ROM only once folder, source-root,
+    // or cartridge-header evidence corroborates it - see
+    // `archive_kind_in_root`. Every extension below is, by contrast,
+    // self-evidencing: the media registry is the single source of truth
+    // for it, shared with the filesystem watcher (`media_registry::
+    // is_watch_relevant_extension`) so the two can never drift apart again.
+    let extension = Path::new(&filename).extension()?.to_str()?;
+    media_registry::kind_for_extension(extension)
 }
 
 pub(crate) fn archive_kind_in_root(path: &Path, source_root: &Path) -> Option<ArchiveKind> {
+    let extension = path
+        .extension()
+        .and_then(|e| e.to_str())
+        .unwrap_or_default()
+        .to_ascii_lowercase();
+    // Structural gates: stored only when the bytes validate. The set of gated
+    // extensions lives in `media_registry::requires_structural_gate`; the
+    // branches below are reachable only through it.
+    if media_registry::requires_structural_gate(&extension) {
+        return match extension.as_str() {
+            "rpx" => wiiu_content_readiness::launch_selection::extracted_root_for_selection(path)
+                .filter(|root| source_root.as_os_str().is_empty() || root.starts_with(source_root))
+                .map(|_| ArchiveKind::DirectGameImage),
+            "hdf" | "hdfx" => amiga_disk::inspect_amiga_image(path)
+                .is_ok()
+                .then_some(ArchiveKind::DirectGameImage),
+            // A loose CUE sheet is one PlayStation disc entry - its referenced
+            // files stay companions - only where folder evidence already says
+            // PlayStation and the sheet and every file it needs pass the
+            // strict inspector. Other platforms' sheets are unchanged: still
+            // not catalogued.
+            "cue" => (is_playstation_location(path, source_root)
+                && ingestion::ps1_cue_disc::inspect_ps1_cue_disc(path).is_ok())
+            .then_some(ArchiveKind::DirectGameImage),
+            _ => ingestion::discovery::inspect_spectrum_media(path, source_root).and_then(|item| {
+                let kind = if item.content == Some(ingestion::ContentKind::GameplayRecording) {
+                    ArchiveKind::PreservationRecording
+                } else {
+                    ArchiveKind::DirectGameImage
+                };
+                (item.validation_state == ingestion::ValidationState::Accepted).then_some(kind)
+            }),
+        };
+    }
     if let Some(kind) = archive_kind(path) {
         return Some(kind);
     }
     let extension = path.extension()?.to_str()?.to_ascii_lowercase();
-    if !matches!(extension.as_str(), "md" | "bin" | "gen") {
+    if !media_registry::is_corroboration_candidate(&extension) {
         return None;
     }
     // Corroboration, in the same priority order detection uses everywhere:
@@ -3374,7 +4652,9 @@ fn detect_direct_image_header_platform(path: &Path) -> Option<&'static str> {
     if !matches!(extension.as_str(), "iso" | "gcm") {
         return None;
     }
-    let request = platform::DetectionRequest::new(path, Path::new("")).inspecting_content();
+    // Header recognition needs signatures only, never sibling/directory inspection.
+    let mut request = platform::DetectionRequest::new(path, Path::new(""));
+    request.read_signatures = true;
     let report = platform::detect_platform_report(&request);
     report
         .evidence
@@ -3386,6 +4666,40 @@ fn detect_direct_image_header_platform(path: &Path) -> Option<&'static str> {
         .map(|item| item.platform)
 }
 
+/// Platform for a loose `.gb`/`.gbc` ROM from its own cartridge header: a
+/// valid Nintendo logo and header checksum in a file of at least 32 KiB, and
+/// a colour flag that agrees with the extension. `.gb` and `.gbc` conflict in
+/// the platform registry, so the extension alone never decides. Anything
+/// short, unreadable, invalid or ambiguous (a dual-mode ROM under `.gb`, a
+/// monochrome ROM under `.gbc`) stays unassigned.
+fn detect_game_boy_header_platform(path: &Path) -> Option<&'static str> {
+    use gb_header_evidence::GbColorSupport;
+    let extension = path.extension()?.to_str()?.to_ascii_lowercase();
+    if !matches!(extension.as_str(), "gb" | "gbc") {
+        return None;
+    }
+    let safe = safe_read::open_bounded_read(path, &safe_read::TrustedRoots::none()).ok()?;
+    if safe.len() < gb_header_evidence::GB_MIN_ROM_BYTES {
+        return None;
+    }
+    let mut bytes = Vec::with_capacity(gb_header_evidence::GB_HEADER_BYTES);
+    let file = safe.into_file();
+    (&file)
+        .take(gb_header_evidence::GB_HEADER_BYTES as u64)
+        .read_to_end(&mut bytes)
+        .ok()?;
+    let fact = gb_header_evidence::parse_gb_header(&bytes)?;
+    if !fact.logo_valid || !fact.header_checksum_valid {
+        return None;
+    }
+    match (extension.as_str(), fact.color_support) {
+        ("gb", GbColorSupport::DmgOnly) => Some("Game Boy"),
+        ("gb", GbColorSupport::CgbOnly)
+        | ("gbc", GbColorSupport::CgbOnly | GbColorSupport::CgbEnhanced) => Some("Game Boy Color"),
+        _ => None,
+    }
+}
+
 /// Whether `path` carries a real Mega Drive cartridge header, using the
 /// registry's own signature rule rather than a second copy of the offset.
 ///
@@ -3395,7 +4709,9 @@ fn detect_direct_image_header_platform(path: &Path) -> Option<&'static str> {
 /// single `source_root` argument would be guessing at what the user configured.
 /// Deliberately left fail-closed; see `crate::safe_read`.
 fn has_mega_drive_cartridge_header(path: &Path) -> bool {
-    let request = platform::DetectionRequest::new(path, Path::new("")).inspecting_content();
+    // Header recognition needs signatures only, never sibling/directory inspection.
+    let mut request = platform::DetectionRequest::new(path, Path::new(""));
+    request.read_signatures = true;
     platform::detect_platform_report(&request)
         .evidence
         .iter()
@@ -4447,11 +5763,189 @@ pub struct ArchiveScanner<'a> {
     config: &'a Config,
 }
 
+// v2 records that stable direct-media classifications are reusable under the
+// same metadata envelope. Existing v1 rows are deliberately stale.
+// Re-inspect pre-header GB/GBC fingerprints once; filesystem identity and
+// all persisted assignment/verification safety checks remain unchanged.
+pub const SCANNER_VERSION: &str = "scan-v3-game-boy-header";
+pub const ARCHIVE_PARSER_VERSION: &str = "archive-parser-v1";
+pub const SCAN_CACHE_VERSION: i64 = 1;
+
+/// Cheap, versioned evidence used by the incremental scanner. It is
+/// deliberately narrower than a content hash: matching this envelope is the
+/// condition for reusing prior classification evidence, never a replacement
+/// for revalidation of the live path.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ScanFingerprint {
+    pub relative_path: PathBuf,
+    pub size_bytes: u64,
+    pub modified_time_ns: i128,
+    pub archive_kind: ArchiveKind,
+    pub display_name: String,
+    pub normalized_name: String,
+    pub platform: Option<String>,
+    pub platform_provenance: Option<PlatformProvenance>,
+    pub scanner_version: String,
+    pub parser_version: String,
+    pub cache_version: i64,
+    pub ingestion: Option<IngestionFingerprint>,
+    pub non_archive_kind: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct IngestionFingerprint {
+    pub version: String,
+    pub listing_hash: String,
+    pub member_count: usize,
+    pub selected_member: Option<String>,
+    pub listing_available: bool,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize)]
+pub struct ScanPhaseTimings {
+    pub filesystem_traversal_ns: u128,
+    pub candidate_discovery_ns: u128,
+    pub stat_metadata_ns: u128,
+    pub classification_ns: u128,
+    pub candidates: u64,
+    pub reused: u64,
+    pub re_inspected: u64,
+    pub directories_visited: u64,
+    pub files_statted: u64,
+    pub missing_fingerprint: u64,
+    pub stat_mismatch: u64,
+    pub cache_version_mismatch: u64,
+    pub deliberately_non_cacheable: u64,
+    pub re_inspected_plain_files: u64,
+    pub re_inspected_direct_images: u64,
+    pub re_inspected_archives: u64,
+    pub unsupported_files: u64,
+    pub ambiguous_files: u64,
+}
+
+/// The maximum number of individual [`SkippedFile`] entries
+/// [`ArchiveScanDiscovery::skipped_files`] retains, regardless of how many
+/// files a scan actually skips. The aggregate counters
+/// (`skipped_unsupported_extension`/`skipped_ambiguous_platform`) always
+/// reflect the *entire* scan; `skipped_files` is a bounded, best-effort
+/// sample of that total for GUI drill-down, never a second source of truth
+/// for the count - see [`ArchiveScanDiscovery::skipped_files_truncated`].
+pub const MAX_RETAINED_SKIPPED_FILES: usize = 1000;
+
+/// Why one file was skipped during a scan - see
+/// [`ArchiveScanner::scan_source`]'s two skip branches, which are the only
+/// two ways a file is ever skipped today.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum SkipReason {
+    /// No extension the media registry recognises at all -
+    /// `media_registry::is_recognized_extension` returned `false` and the
+    /// extension is not one of the Mega Drive corroboration candidates
+    /// either.
+    UnsupportedExtension,
+    /// A recognised dispatch extension failed the existing structural inspector.
+    InvalidContent,
+    /// The structural inspector recognised the format, but this version or
+    /// variant (or its size) is outside what it reads - for example an RZX
+    /// recording from a future major version. Not evidence of damage.
+    UnsupportedVariant,
+    /// The extension is shared with `MegaDriveRom` (`.md`/`.bin`/`.gen`) but
+    /// no folder, source-root, or cartridge-header evidence corroborated it,
+    /// see `archive_kind_in_root`. A genuinely different, unrelated file
+    /// that merely shares one of these three extensions (for example a
+    /// ScummVM `RESOURCE.GEN`) is reported this way, not as unsupported.
+    AmbiguousPlatform,
+}
+
+impl SkipReason {
+    /// A short, human-readable label - what a GUI shows for this reason.
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::UnsupportedExtension => "Unsupported extension",
+            Self::InvalidContent => "Unsupported or invalid media structure",
+            Self::UnsupportedVariant => "Recognised, unsupported variant",
+            Self::AmbiguousPlatform => "Ambiguous platform",
+        }
+    }
+}
+
+/// One skipped file's identity and reason - part of the bounded,
+/// best-effort sample [`ArchiveScanDiscovery::skipped_files`] retains for
+/// GUI drill-down. Never itself a classification decision: recording (or
+/// failing to record, once the bound is reached) a file here changes
+/// nothing about whether it was skipped or why.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SkippedFile {
+    pub path: PathBuf,
+    pub reason: SkipReason,
+}
+
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct ArchiveScanDiscovery {
     pub archives: Vec<Archive>,
     pub skipped_unsupported_extension: usize,
     pub skipped_ambiguous_platform: usize,
+    /// A bounded (see [`MAX_RETAINED_SKIPPED_FILES`]) sample of individual
+    /// skipped files, for GUI drill-down. The exact totals always live in
+    /// `skipped_unsupported_extension`/`skipped_ambiguous_platform` - this
+    /// list is explanatory detail on top of those counts, never a
+    /// replacement for them; call [`Self::skipped_files_truncated`] before
+    /// presenting it as complete.
+    pub skipped_files: Vec<SkippedFile>,
+    pub timings: ScanPhaseTimings,
+    pub entries_seen: usize,
+    pub scan_errors: Vec<ScanError>,
+    pub scan_errors_total: usize,
+    /// Compact fingerprints for deterministic skipped files. This is retained
+    /// under a fixed memory bound and contains no file payload.
+    pub non_archive_fingerprints: Vec<ScanFingerprint>,
+    /// Directories that are mount roots of their own (mount ID differs from the
+    /// parent directory's, so same-device bind mounts count). Remembered so a later scan that finds one gone or
+    /// replaced cannot treat the files formerly beneath it as deleted.
+    pub nested_boundaries: Vec<catalogue_health::NestedBoundaryObservation>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ScanError {
+    pub path: PathBuf,
+    pub message: String,
+}
+
+const MAX_RETAINED_SCAN_ERRORS: usize = 1024;
+const MAX_RETAINED_NON_ARCHIVE_FINGERPRINTS: usize = 16_384;
+
+impl ArchiveScanDiscovery {
+    fn record_scan_error(&mut self, path: PathBuf, message: impl Into<String>) {
+        self.scan_errors_total = self.scan_errors_total.saturating_add(1);
+        if self.scan_errors.len() < MAX_RETAINED_SCAN_ERRORS {
+            self.scan_errors.push(ScanError {
+                path,
+                message: message.into(),
+            });
+        }
+    }
+
+    pub fn is_complete(&self) -> bool {
+        self.scan_errors_total == 0
+    }
+
+    pub fn scan_errors_truncated(&self) -> bool {
+        self.scan_errors_total > self.scan_errors.len()
+    }
+}
+
+impl ArchiveScanDiscovery {
+    /// The exact total skipped count across both reasons - always accurate,
+    /// regardless of how much detail `skipped_files` retains.
+    pub fn total_skipped(&self) -> usize {
+        self.skipped_unsupported_extension + self.skipped_ambiguous_platform
+    }
+
+    /// Whether `skipped_files` is a truncated sample of the full skip
+    /// count - true whenever more files were skipped in total than
+    /// [`MAX_RETAINED_SKIPPED_FILES`] retains detail for.
+    pub fn skipped_files_truncated(&self) -> bool {
+        self.total_skipped() > self.skipped_files.len()
+    }
 }
 
 impl<'a> ArchiveScanner<'a> {
@@ -4464,16 +5958,66 @@ impl<'a> ArchiveScanner<'a> {
     }
 
     pub fn scan_archives_with_summary(&self) -> Result<ArchiveScanDiscovery> {
+        self.scan_archives_with_cache(&[])
+    }
+
+    pub fn scan_archives_with_cache(
+        &self,
+        fingerprints: &[(i64, ScanFingerprint)],
+    ) -> Result<ArchiveScanDiscovery> {
+        self.scan_archives_with_cache_excluding(fingerprints, &[])
+    }
+
+    /// Scans configured roots while shadowing any explicitly configured child
+    /// roots from their parent traversal. Each root still has its own bounded
+    /// entry/depth budget; the exclusion only prevents the same filesystem
+    /// subtree from being walked twice.
+    pub fn scan_archives_with_cache_excluding(
+        &self,
+        fingerprints: &[(i64, ScanFingerprint)],
+        additional_excluded_roots: &[PathBuf],
+    ) -> Result<ArchiveScanDiscovery> {
         info!(
             "starting archive scan across {} source folder(s)",
             self.config.source_folders.len()
         );
         validate_configured_source_roots(&self.config.source_folders)?;
+        let fingerprint_map: HashMap<(i64, PathBuf), &ScanFingerprint> = fingerprints
+            .iter()
+            .map(|(source_id, fingerprint)| {
+                ((*source_id, fingerprint.relative_path.clone()), fingerprint)
+            })
+            .collect();
         let mut discovery = ArchiveScanDiscovery::default();
-        for source in &self.config.source_folders {
+        for (source_index, source) in self.config.source_folders.iter().enumerate() {
             debug!("scanning source folder {}", source.display());
-            self.scan_source(source, source, &mut discovery)?;
+            let source_id = fingerprints.get(source_index).map(|(id, _)| *id);
+            let mut excluded_roots = nested_source_roots(source, &self.config.source_folders);
+            excluded_roots.extend(
+                additional_excluded_roots
+                    .iter()
+                    .filter(|root| root.starts_with(source) && *root != source)
+                    .cloned(),
+            );
+            excluded_roots.sort();
+            excluded_roots.dedup();
+            self.scan_source(
+                source,
+                source,
+                &mut discovery,
+                source_id,
+                &fingerprint_map,
+                &excluded_roots,
+            )?;
         }
+        discovery.skipped_files.sort_by(|left, right| {
+            left.path
+                .cmp(&right.path)
+                .then_with(|| left.reason.label().cmp(right.reason.label()))
+        });
+        discovery
+            .non_archive_fingerprints
+            .sort_by(|left, right| left.relative_path.cmp(&right.relative_path));
         discovery
             .archives
             .sort_by(|left, right| left.path.cmp(&right.path));
@@ -4541,49 +6085,129 @@ impl<'a> ArchiveScanner<'a> {
         source_root: &Path,
         source: &Path,
         discovery: &mut ArchiveScanDiscovery,
+        source_id: Option<i64>,
+        fingerprints: &HashMap<(i64, PathBuf), &ScanFingerprint>,
+        excluded_roots: &[PathBuf],
     ) -> Result<()> {
-        const MAX_SCAN_ENTRIES: usize = 250_000;
         const MAX_SCAN_DEPTH: usize = 128;
 
         let source_identity = validate_source_root(source_root)?;
-        let mut directories = vec![(source.to_path_buf(), 0_usize)];
-        let mut entries_seen = 0_usize;
-        while let Some((directory, depth)) = directories.pop() {
-            let before = fs::symlink_metadata(&directory)
-                .map_err(|error| ArchiveFsError::io(directory.clone(), error))?;
-            if before.file_type().is_symlink() || !before.is_dir() {
-                return Err(ArchiveFsError::Scanner(format!(
-                    "source directory changed or became unsafe during scan: {}",
-                    directory.display()
-                )));
-            }
-            let read_dir = fs::read_dir(&directory)
-                .map_err(|error| ArchiveFsError::io(directory.clone(), error))?;
-            let mut entries = Vec::new();
-            for entry in read_dir {
-                entries_seen = entries_seen.checked_add(1).ok_or_else(|| {
-                    ArchiveFsError::Scanner("source entry count overflow".to_string())
-                })?;
-                if entries_seen > MAX_SCAN_ENTRIES {
-                    return Err(ArchiveFsError::Scanner(format!(
-                        "source scan exceeded the {MAX_SCAN_ENTRIES} entry limit at {}",
-                        directory.display()
-                    )));
+        let root_mount = catalogue_health::directory_mount(source)
+            .map(|mount| mount.mount_id)
+            .map_err(|error| ArchiveFsError::io(source.to_path_buf(), error))?;
+        let mut directories = vec![(source.to_path_buf(), 0_usize, root_mount)];
+        while let Some((directory, depth, parent_mount)) = directories.pop() {
+            discovery.timings.directories_visited += 1;
+            let traversal_started = Instant::now();
+            let before = match fs::symlink_metadata(&directory) {
+                Ok(metadata) => metadata,
+                Err(error) => {
+                    discovery.record_scan_error(
+                        directory.clone(),
+                        ArchiveFsError::io(directory.clone(), error).to_string(),
+                    );
+                    continue;
                 }
-                entries.push(entry.map_err(|error| ArchiveFsError::io(directory.clone(), error))?);
+            };
+            if before.file_type().is_symlink() || !before.is_dir() {
+                discovery.record_scan_error(
+                    directory.clone(),
+                    format!(
+                        "source directory changed or became unsafe during scan: {}",
+                        directory.display()
+                    ),
+                );
+                continue;
             }
-            entries.sort_by_key(|entry| entry.path());
-
+            let directory_mount = match catalogue_health::directory_mount(&directory) {
+                Ok(mount) => mount,
+                Err(error) => {
+                    // Without a mount identity a boundary cannot be excluded.
+                    discovery.record_scan_error(
+                        directory.clone(),
+                        format!(
+                            "mount identity unavailable for {}: {error}",
+                            directory.display()
+                        ),
+                    );
+                    continue;
+                }
+            };
+            if depth > 0 && directory_mount.mount_id != parent_mount {
+                discovery
+                    .nested_boundaries
+                    .push(catalogue_health::NestedBoundaryObservation {
+                        path: directory.clone(),
+                        device: directory_mount.device,
+                        inode: directory_mount.inode,
+                        mount_id: directory_mount.mount_id,
+                    });
+            }
+            let directory_device = directory_mount.mount_id;
+            let read_dir = match fs::read_dir(&directory) {
+                Ok(read_dir) => read_dir,
+                Err(error) => {
+                    discovery.record_scan_error(
+                        directory.clone(),
+                        ArchiveFsError::io(directory.clone(), error).to_string(),
+                    );
+                    continue;
+                }
+            };
             let mut child_directories = Vec::new();
-            for entry in entries {
+            discovery.timings.filesystem_traversal_ns += traversal_started.elapsed().as_nanos();
+            for entry in read_dir {
+                discovery.entries_seen = discovery.entries_seen.saturating_add(1);
+                let entry = match entry {
+                    Ok(entry) => entry,
+                    Err(error) => {
+                        discovery.record_scan_error(
+                            directory.clone(),
+                            ArchiveFsError::io(directory.clone(), error).to_string(),
+                        );
+                        continue;
+                    }
+                };
+                let candidate_started = Instant::now();
                 let path = entry.path();
-                let file_type = entry
-                    .file_type()
-                    .map_err(|error| ArchiveFsError::io(path.clone(), error))?;
+                let file_type = match entry.file_type() {
+                    Ok(file_type) => file_type,
+                    Err(error) => {
+                        discovery.record_scan_error(
+                            path.clone(),
+                            ArchiveFsError::io(path.clone(), error).to_string(),
+                        );
+                        continue;
+                    }
+                };
                 if file_type.is_symlink() {
                     continue;
                 }
+                let mut metadata_error = None;
+                let candidate = if file_type.is_file() {
+                    self.archive_from_fingerprint_or_path(
+                        &path,
+                        source_root,
+                        source_id,
+                        fingerprints,
+                        &mut discovery.timings,
+                        &mut metadata_error,
+                    )
+                } else {
+                    None
+                };
+                if let Some(error) = metadata_error {
+                    discovery.record_scan_error(path.clone(), error);
+                    continue;
+                }
                 if file_type.is_dir() {
+                    if excluded_roots.contains(&path) {
+                        debug!(
+                            "not descending into explicitly configured child source {}",
+                            path.display()
+                        );
+                        continue;
+                    }
                     if path
                         .file_name()
                         .is_some_and(|name| is_container_directory(&name.to_string_lossy()))
@@ -4596,24 +6220,27 @@ impl<'a> ArchiveScanner<'a> {
                         continue;
                     }
                     if depth >= MAX_SCAN_DEPTH {
-                        return Err(ArchiveFsError::Scanner(format!(
-                            "source scan exceeded the {MAX_SCAN_DEPTH} directory depth limit at {}",
-                            path.display()
-                        )));
+                        discovery.record_scan_error(path.clone(), format!("source scan exceeded the {MAX_SCAN_DEPTH} directory depth limit at {}", path.display()));
+                        continue;
                     }
-                    child_directories.push((path, depth + 1));
-                } else if file_type.is_file()
-                    && let Some(archive) = Archive::from_path_in_root(&path, source_root)
-                {
+                    child_directories.push((path, depth + 1, directory_device));
+                } else if let Some(archive) = candidate {
                     if archive.identity.size_bytes.is_none() {
-                        return Err(ArchiveFsError::Scanner(format!(
-                            "archive changed or became unreadable during scan: {}",
-                            path.display()
-                        )));
+                        discovery.record_scan_error(
+                            path.clone(),
+                            format!(
+                                "archive changed or became unreadable during scan: {}",
+                                path.display()
+                            ),
+                        );
+                        continue;
                     }
                     debug!("discovered archive {}", archive.path.display());
                     discovery.archives.push(archive);
+                    discovery.timings.candidate_discovery_ns +=
+                        candidate_started.elapsed().as_nanos();
                 } else if file_type.is_file() {
+                    discovery.timings.unsupported_files += 1;
                     let extension = path
                         .extension()
                         .and_then(|value| value.to_str())
@@ -4623,26 +6250,149 @@ impl<'a> ArchiveScanner<'a> {
                     // or a cartridge header corroborates them, so one that was
                     // skipped was skipped for an ambiguous platform - not
                     // because the extension is unsupported.
-                    if extension
+                    let refused_playstation_sheet = extension.as_deref() == Some("cue")
+                        && is_playstation_location(&path, source_root);
+                    // The structural inspector's own refusal decides a Spectrum
+                    // file's reason, so an unsupported variant or a
+                    // size-only lookalike is never reported as corrupt.
+                    let spectrum_refusal = extension
+                        .as_deref()
+                        .is_some_and(media_registry::requires_spectrum_structure)
+                        .then(|| {
+                            ingestion::discovery::inspect_spectrum_media(&path, source_root)
+                                .and_then(|item| item.skip_reason)
+                        })
+                        .flatten();
+                    let reason = if matches!(
+                        spectrum_refusal,
+                        Some(ingestion::SkipReason::AmbiguousPlatform)
+                    ) {
+                        discovery.skipped_ambiguous_platform += 1;
+                        SkipReason::AmbiguousPlatform
+                    } else if matches!(
+                        spectrum_refusal,
+                        Some(ingestion::SkipReason::UnsupportedContent(_))
+                    ) && (!path
+                        .extension()
+                        .and_then(|value| value.to_str())
+                        .is_some_and(|value| {
+                            zx_spectrum_media::SpectrumMediaFormat::for_extension(value).is_some()
+                        })
+                        // A reader size limit is refused before the signature
+                        // is read, so it is not a recognised variant.
+                        || zx_spectrum_media::inspect_spectrum_media_file(&path).is_ok_and(
+                            |inspection| {
+                                inspection.status
+                                    == zx_spectrum_media::SpectrumMediaStatus::UnsupportedVariant
+                            },
+                        ))
+                    {
+                        // Kept in the historical unsupported counter for schema
+                        // compatibility; per-item reasons remain distinct.
+                        discovery.skipped_unsupported_extension += 1;
+                        SkipReason::UnsupportedVariant
+                    } else if refused_playstation_sheet
+                        || extension
+                            .as_deref()
+                            .is_some_and(media_registry::requires_spectrum_structure)
+                    {
+                        discovery.skipped_unsupported_extension += 1;
+                        SkipReason::InvalidContent
+                    } else if extension
                         .as_deref()
                         .is_some_and(|value| matches!(value, "md" | "bin" | "gen"))
                     {
                         discovery.skipped_ambiguous_platform += 1;
+                        SkipReason::AmbiguousPlatform
                     } else {
                         discovery.skipped_unsupported_extension += 1;
+                        SkipReason::UnsupportedExtension
+                    };
+                    // Bounded: the counters above always stay exact for the
+                    // whole scan, but the retained detail list never grows
+                    // past `MAX_RETAINED_SKIPPED_FILES` - see
+                    // `ArchiveScanDiscovery::skipped_files_truncated`.
+                    if discovery.skipped_files.len() < MAX_RETAINED_SKIPPED_FILES {
+                        discovery.skipped_files.push(SkippedFile {
+                            path: path.clone(),
+                            reason,
+                        });
+                    }
+                    let non_archive_metadata = match fs::metadata(&path) {
+                        Ok(metadata) => metadata,
+                        Err(error) => {
+                            discovery.record_scan_error(
+                                path.clone(),
+                                ArchiveFsError::io(path.clone(), error).to_string(),
+                            );
+                            continue;
+                        }
+                    };
+                    if discovery.non_archive_fingerprints.len()
+                        < MAX_RETAINED_NON_ARCHIVE_FINGERPRINTS
+                        && !self.non_archive_fingerprint_is_current(
+                            &path,
+                            source_root,
+                            source_id,
+                            fingerprints,
+                            &non_archive_metadata,
+                        )
+                    {
+                        let metadata = non_archive_metadata;
+                        let modified_time_ns = metadata
+                            .modified()
+                            .ok()
+                            .and_then(system_time_to_unix_nanos)
+                            .unwrap_or_default();
+                        if let Ok(relative_path) = path.strip_prefix(source_root) {
+                            discovery.non_archive_fingerprints.push(ScanFingerprint {
+                                relative_path: relative_path.to_path_buf(),
+                                size_bytes: metadata.len(),
+                                modified_time_ns,
+                                archive_kind: ArchiveKind::DirectGameImage,
+                                display_name: String::new(),
+                                normalized_name: String::new(),
+                                platform: None,
+                                platform_provenance: None,
+                                scanner_version: SCANNER_VERSION.to_string(),
+                                parser_version: ARCHIVE_PARSER_VERSION.to_string(),
+                                cache_version: SCAN_CACHE_VERSION,
+                                ingestion: None,
+                                non_archive_kind: Some(
+                                    match reason {
+                                        SkipReason::UnsupportedExtension => "unsupported",
+                                        SkipReason::InvalidContent => "invalid_content",
+                                        SkipReason::UnsupportedVariant => "unsupported_variant",
+                                        SkipReason::AmbiguousPlatform => "ambiguous",
+                                    }
+                                    .to_string(),
+                                ),
+                            });
+                        }
                     }
                 }
             }
-            let after = fs::symlink_metadata(&directory)
-                .map_err(|error| ArchiveFsError::io(directory.clone(), error))?;
+            let after = match fs::symlink_metadata(&directory) {
+                Ok(metadata) => metadata,
+                Err(error) => {
+                    discovery.record_scan_error(
+                        directory.clone(),
+                        ArchiveFsError::io(directory.clone(), error).to_string(),
+                    );
+                    continue;
+                }
+            };
             if after.file_type().is_symlink()
                 || !after.is_dir()
                 || filesystem_identity(&before) != filesystem_identity(&after)
             {
-                return Err(ArchiveFsError::Scanner(format!(
-                    "source directory changed during scan: {}",
-                    directory.display()
-                )));
+                discovery.record_scan_error(
+                    directory.clone(),
+                    format!(
+                        "source directory changed during scan: {}",
+                        directory.display()
+                    ),
+                );
             }
             child_directories.reverse();
             directories.extend(child_directories);
@@ -4654,6 +6404,169 @@ impl<'a> ArchiveScanner<'a> {
             )));
         }
         Ok(())
+    }
+
+    fn archive_from_fingerprint_or_path(
+        &self,
+        path: &Path,
+        source_root: &Path,
+        source_id: Option<i64>,
+        fingerprints: &HashMap<(i64, PathBuf), &ScanFingerprint>,
+        timings: &mut ScanPhaseTimings,
+        metadata_error: &mut Option<String>,
+    ) -> Option<Archive> {
+        timings.candidates += 1;
+        let metadata_started = Instant::now();
+        let metadata = match fs::metadata(path) {
+            Ok(metadata) => metadata,
+            Err(error) => {
+                *metadata_error = Some(ArchiveFsError::io(path.to_path_buf(), error).to_string());
+                return None;
+            }
+        };
+        timings.files_statted += 1;
+        timings.stat_metadata_ns += metadata_started.elapsed().as_nanos();
+        let relative = path.strip_prefix(source_root).ok()?;
+        let cached =
+            source_id.and_then(|id| fingerprints.get(&(id, relative.to_path_buf())).copied());
+        let cached = cached.filter(|_| {
+            !path
+                .extension()
+                .and_then(|s| s.to_str())
+                // A structural gate's acceptance depends on the bytes (and,
+                // for a CUE sheet, on the files it references), which the
+                // file's own stat cannot show.
+                .is_some_and(|ext| {
+                    media_registry::requires_structural_gate(&ext.to_ascii_lowercase())
+                })
+        });
+        let mtime_ns = metadata.modified().ok().and_then(system_time_to_unix_nanos);
+        if let Some(fingerprint) = cached {
+            if let Some(verdict) = fingerprint.non_archive_kind.as_deref()
+                && fingerprint.cache_version == SCAN_CACHE_VERSION
+                && fingerprint.scanner_version == SCANNER_VERSION
+                && fingerprint.parser_version == ARCHIVE_PARSER_VERSION
+                && fingerprint.size_bytes == metadata.len()
+                && Some(fingerprint.modified_time_ns) == mtime_ns
+                && non_archive_verdict_is_still_current(path, verdict)
+            {
+                timings.reused += 1;
+                return None;
+            }
+            // A non-archive verdict that is no longer current (its extension
+            // has since been registered) must be re-inspected, never rebuilt
+            // into a library row from a fingerprint that never described one.
+            // A platform the registry detector assigned from a signature the
+            // registry now treats as shared is re-evaluated rather than
+            // trusted from the cache.
+            if fingerprint.non_archive_kind.is_none()
+                && !platform_assignment_needs_re_evaluation(path, fingerprint)
+                && fingerprint.cache_version == SCAN_CACHE_VERSION
+                && fingerprint.scanner_version == SCANNER_VERSION
+                && fingerprint.parser_version == ARCHIVE_PARSER_VERSION
+                && fingerprint.size_bytes == metadata.len()
+                && Some(fingerprint.modified_time_ns) == mtime_ns
+            {
+                timings.reused += 1;
+                return Some(Archive::from_scan_fingerprint(
+                    path,
+                    source_root,
+                    fingerprint,
+                    metadata,
+                ));
+            }
+            if fingerprint.cache_version != SCAN_CACHE_VERSION
+                || fingerprint.scanner_version != SCANNER_VERSION
+                || fingerprint.parser_version != ARCHIVE_PARSER_VERSION
+            {
+                timings.cache_version_mismatch += 1;
+            } else if fingerprint.size_bytes != metadata.len()
+                || Some(fingerprint.modified_time_ns) != mtime_ns
+            {
+                timings.stat_mismatch += 1;
+            }
+        } else {
+            timings.missing_fingerprint += 1;
+        }
+        timings.re_inspected += 1;
+        if cached
+            .is_some_and(|fingerprint| fingerprint.archive_kind == ArchiveKind::DirectGameImage)
+        {
+            timings.re_inspected_direct_images += 1;
+        } else if path
+            .extension()
+            .and_then(|value| value.to_str())
+            .is_some_and(|extension| {
+                matches!(
+                    extension.to_ascii_lowercase().as_str(),
+                    "zip" | "7z" | "rar" | "lha" | "lzh"
+                )
+            })
+        {
+            timings.re_inspected_archives += 1;
+        } else {
+            timings.re_inspected_plain_files += 1;
+        }
+        let classification_started = Instant::now();
+        let archive = Archive::from_path_in_root(path, source_root);
+        if archive.is_none()
+            && let Some(item) = ingestion::discovery::inspect_spectrum_media(path, source_root)
+            && matches!(
+                item.skip_reason,
+                Some(ingestion::SkipReason::InspectionUnavailable(_))
+            )
+        {
+            *metadata_error = Some(format!("{} {:?}", item.explanation, item.skip_reason));
+        }
+        if archive.is_none()
+            && path
+                .extension()
+                .and_then(|s| s.to_str())
+                .is_some_and(|ext| {
+                    ext.eq_ignore_ascii_case("hdf") || ext.eq_ignore_ascii_case("hdfx")
+                })
+            && let Err(amiga_disk::DiskError::Io(error)) = amiga_disk::inspect_amiga_image(path)
+        {
+            *metadata_error = Some(format!(
+                "Amiga image inspection unavailable for {}: {error}",
+                path.display()
+            ));
+        }
+        timings.classification_ns += classification_started.elapsed().as_nanos();
+        archive
+    }
+
+    fn non_archive_fingerprint_is_current(
+        &self,
+        path: &Path,
+        source_root: &Path,
+        source_id: Option<i64>,
+        fingerprints: &HashMap<(i64, PathBuf), &ScanFingerprint>,
+        metadata: &fs::Metadata,
+    ) -> bool {
+        let Some(source_id) = source_id else {
+            return false;
+        };
+        let Ok(relative) = path.strip_prefix(source_root) else {
+            return false;
+        };
+        let Some(fingerprint) = fingerprints.get(&(source_id, relative.to_path_buf())) else {
+            return false;
+        };
+        fingerprint
+            .non_archive_kind
+            .as_deref()
+            .is_some_and(|verdict| non_archive_verdict_is_still_current(path, verdict))
+            && fingerprint.cache_version == SCAN_CACHE_VERSION
+            && fingerprint.scanner_version == SCANNER_VERSION
+            && fingerprint.parser_version == ARCHIVE_PARSER_VERSION
+            && fingerprint.size_bytes == metadata.len()
+            && fingerprint.modified_time_ns
+                == metadata
+                    .modified()
+                    .ok()
+                    .and_then(system_time_to_unix_nanos)
+                    .unwrap_or_default()
     }
 }
 
@@ -4678,6 +6591,62 @@ const CONTAINER_DIRECTORY_SUFFIXES: &[&str] = &[".ngage"];
 /// stringified so a non-UTF-8 name is a safe non-match rather than a
 /// panic) matches a recognised container/game-directory suffix,
 /// case-insensitively.
+/// Extensions whose platform the registry detector may once have settled on
+/// a signature the registry marks as shared between machines (`SEGA` at
+/// 0x100 for Mega Drive and 32X, `PLAYSTATION` for PS1 and PS2, `TMR SEGA`
+/// for Master System and Game Gear, `ZXTape!` for Spectrum and CPC,
+/// `NINTENDO` for the Pokémon Mini). A fingerprint for such a file whose
+/// platform came from the detector is re-inspected on the next scan so the
+/// evidence-strength rules decide again; folder, manual and catalogue
+/// assignments are not touched (see `Database::assign_platform`).
+const SHARED_SIGNATURE_RE_EVALUATION_EXTENSIONS: &[&str] = &[
+    "md", "gen", "bin", "68k", "32x", "smd", "iso", "img", "sms", "gg", "tap", "tzx", "cdt", "min",
+];
+
+fn platform_assignment_needs_re_evaluation(path: &Path, fingerprint: &ScanFingerprint) -> bool {
+    fingerprint.platform_provenance == Some(PlatformProvenance::RegistryDetector)
+        && path
+            .extension()
+            .and_then(|value| value.to_str())
+            .map(str::to_ascii_lowercase)
+            .is_some_and(|extension| {
+                SHARED_SIGNATURE_RE_EVALUATION_EXTENSIONS.contains(&extension.as_str())
+            })
+}
+
+/// Whether a cached "this file is not library media" verdict still describes
+/// what the current scanner would conclude from the file's name, so that the
+/// verdict may be reused without re-inspecting the file.
+///
+/// Targeted invalidation instead of a scanner-version bump: a verdict is a
+/// function of the registries, so when a format joins
+/// [`media_registry::MEDIA_FORMATS`] only the files that carry it are looked
+/// at again, and the other hundred thousand fingerprints stay valid. A stale
+/// "unsupported" is never kept to save work.
+///
+/// - `unsupported`: current while the extension is still neither registered
+///   media nor a corroboration candidate.
+/// - `ambiguous`: current while the extension is still a corroboration
+///   candidate (`.md`/`.bin`/`.gen`), whose folder/header gate is unchanged.
+/// - `invalid_content`: the structural gates (`.hdf`, Sinclair formats,
+///   `.cue`, `.rpx`) are already excluded from reuse by the caller; anything
+///   else that reached this verdict is re-inspected.
+fn non_archive_verdict_is_still_current(path: &Path, verdict: &str) -> bool {
+    let extension = path
+        .extension()
+        .and_then(|value| value.to_str())
+        .map(str::to_ascii_lowercase)
+        .unwrap_or_default();
+    match verdict {
+        "unsupported" => {
+            !media_registry::is_recognized_extension(&extension)
+                && !media_registry::is_corroboration_candidate(&extension)
+        }
+        "ambiguous" => media_registry::is_corroboration_candidate(&extension),
+        _ => false,
+    }
+}
+
 fn is_container_directory(name: &str) -> bool {
     let lower = name.to_ascii_lowercase();
     CONTAINER_DIRECTORY_SUFFIXES
@@ -4705,26 +6674,32 @@ pub(crate) fn revalidate_archive_for_catalogue(archive: &Archive) -> Result<()> 
             archive.path.display()
         )));
     }
-    let relative = archive
-        .path
-        .strip_prefix(&archive.identity.source_root)
-        .map_err(|_| ArchiveFsError::Scanner("archive source binding changed".to_string()))?;
-    let mut current = archive.identity.source_root.clone();
-    for component in relative.components() {
-        current.push(component.as_os_str());
-        let metadata = fs::symlink_metadata(&current)
-            .map_err(|error| ArchiveFsError::io(current.clone(), error))?;
-        if metadata.file_type().is_symlink() {
-            return Err(ArchiveFsError::Scanner(format!(
-                "archive path contains a symlink after scan: {}",
-                current.display()
-            )));
-        }
-    }
-    let metadata = fs::symlink_metadata(&archive.path)
-        .map_err(|error| ArchiveFsError::io(archive.path.clone(), error))?;
+    // One descriptor-relative resolution (no symlinks, beneath, no xdev): a
+    // component swapped after the scan cannot redirect to outside content.
+    let root = catalogue_health::BoundRoot::open(&archive.identity.source_root)
+        .filter(|root| root.identity == (source_identity.device, source_identity.inode))
+        .ok_or_else(|| {
+            ArchiveFsError::Scanner(format!(
+                "source root changed after scan: {}",
+                archive.identity.source_root.display()
+            ))
+        })?;
+    let metadata = root.metadata(&archive.path).map_err(|error| {
+        ArchiveFsError::Scanner(format!(
+            "archive path unsafe after scan: {}: {error}",
+            archive.path.display()
+        ))
+    })?;
     let identity = filesystem_identity(&metadata);
-    if !metadata.is_file()
+    let expected_shape = if matches!(
+        archive.kind,
+        ArchiveKind::ArcadeSetDirectory | ArchiveKind::ScummVmDirectory
+    ) {
+        metadata.is_dir()
+    } else {
+        metadata.is_file()
+    };
+    if !expected_shape
         || archive.identity.filesystem_device != Some(identity.device)
         || archive.identity.filesystem_inode != Some(identity.inode)
         || archive.identity.size_bytes != Some(metadata.len())
@@ -4733,6 +6708,12 @@ pub(crate) fn revalidate_archive_for_catalogue(archive: &Archive) -> Result<()> 
         return Err(ArchiveFsError::Scanner(format!(
             "archive changed after scan: {}",
             archive.path.display()
+        )));
+    }
+    if !root.current() {
+        return Err(ArchiveFsError::Scanner(format!(
+            "source root changed after scan: {}",
+            archive.identity.source_root.display()
         )));
     }
     Ok(())
@@ -4890,6 +6871,12 @@ fn normalized_title(path: &Path) -> String {
     safe_mount_name(path).to_lowercase()
 }
 
+fn system_time_to_unix_nanos(time: std::time::SystemTime) -> Option<i128> {
+    time.duration_since(std::time::UNIX_EPOCH)
+        .ok()
+        .map(|duration| duration.as_nanos() as i128)
+}
+
 /// How a [`detect_platform_with_provenance`] result was determined. This is
 /// what `platform_assignments.source` (see `database.rs`) is ultimately
 /// derived from, and what decides whether a later, weaker guess is allowed
@@ -4904,6 +6891,14 @@ pub enum PlatformProvenance {
     Heuristic,
     /// An exact folder-alias match in the `platform` registry.
     FolderAlias,
+    /// The `platform` registry's own strong-extension/layout/emulator-
+    /// context evidence (via [`platform::detect_platform_report`]), used
+    /// only after folder-alias matching finds nothing. Deliberately given
+    /// the same database persistence priority as [`Self::Heuristic`] (see
+    /// `database::provenance_priority`) - a strong extension is a
+    /// reasonable guess, not the deliberate signal folder-alias or a
+    /// header signature is.
+    RegistryDetector,
 }
 
 impl PlatformProvenance {
@@ -4915,6 +6910,7 @@ impl PlatformProvenance {
             Self::HeaderIdentity => "header_identity",
             Self::Heuristic => "heuristic-path-detector",
             Self::FolderAlias => "folder_alias",
+            Self::RegistryDetector => "registry_detector",
         }
     }
 }
@@ -4974,26 +6970,113 @@ pub fn detect_platform_with_details(
     path: impl AsRef<Path>,
     source_root: impl AsRef<Path>,
 ) -> Option<DetailedPlatformDetection> {
+    detect_platform_with_details_and_problems(path, source_root).0
+}
+
+/// [`detect_platform_with_details`] plus the detector's record of reads that
+/// did not complete. The folder-alias and heuristic tiers read nothing, so
+/// problems can only come from the registry detector's bounded reads; a
+/// `None` detection with an empty problem list is a completed verdict.
+pub fn detect_platform_with_details_and_problems(
+    path: impl AsRef<Path>,
+    source_root: impl AsRef<Path>,
+) -> (Option<DetailedPlatformDetection>, Vec<String>) {
     let path = path.as_ref();
     let source_root = source_root.as_ref();
 
     if let Some((platform, matched_folder)) =
         detect_platform_from_folder_alias_with_match(path, source_root)
     {
-        return Some(DetailedPlatformDetection {
-            platform: platform.to_string(),
-            provenance: PlatformProvenance::FolderAlias,
-            matched_folder: Some(matched_folder),
-        });
+        return (
+            Some(DetailedPlatformDetection {
+                platform: platform.to_string(),
+                provenance: PlatformProvenance::FolderAlias,
+                matched_folder: Some(matched_folder),
+            }),
+            Vec::new(),
+        );
     }
 
-    detect_platform_from_known_heuristics(path, source_root).map(|platform| {
-        DetailedPlatformDetection {
-            platform,
-            provenance: PlatformProvenance::Heuristic,
-            matched_folder: None,
+    let report = detect_platform_report_for_registry(path, source_root);
+    let problems = report.inspection_problems.clone();
+    if let Some(platform) = platform_from_registry_report(&report) {
+        return (
+            Some(DetailedPlatformDetection {
+                platform,
+                provenance: PlatformProvenance::RegistryDetector,
+                matched_folder: None,
+            }),
+            problems,
+        );
+    }
+
+    (
+        detect_platform_from_known_heuristics(path, source_root).map(|platform| {
+            DetailedPlatformDetection {
+                platform,
+                provenance: PlatformProvenance::Heuristic,
+                matched_folder: None,
+            }
+        }),
+        problems,
+    )
+}
+
+/// Falls back to the `platform` registry's own strong-extension/magic-
+/// byte/layout evidence (via [`platform::detect_platform_report`]) when
+/// folder-alias matching finds nothing. Only ever reached after folder
+/// alias has already failed, so this never overrides that stronger,
+/// deliberate signal - it only fills in a platform for collections whose
+/// folder is not named after the platform at all (a curated set name, a
+/// region pack, "roms", etc.), which real collections do constantly.
+///
+/// `Ambiguous`/`Unknown` confidence (several platforms fit equally, or
+/// nothing does) contributes nothing here, exactly like every other tier
+/// in this function refuses to guess. A bounded signature read is enabled
+/// so extension evidence can be corroborated by a magic-byte check when
+/// one exists - but layout evidence (`inspect_layout`, one `read_dir` per
+/// call) is deliberately left off, unlike `inspecting_content()`'s
+/// default: this function runs once per scanned file, so a directory
+/// listing here would turn one source folder's scan into an O(n^2) number
+/// of `read_dir` calls against that same folder. Punishing on any storage;
+/// measured 77x slower against a real 1,228-file FUSE-mounted collection
+/// during validation.
+///
+/// `Confirmed` evidence (an explicit assignment or a magic-byte
+/// signature) is always used. `Probable` evidence - typically a strong
+/// extension alone - is used only when the resolved platform's own
+/// `conflicts_with` is empty, with MSX/MSX2 and the Apple II/Macintosh
+/// media family as explicit registry-policy exceptions. A `.rvz`/`.wbfs`
+/// file remains subject to the existing GameCube/Wii conflict handling, so
+/// this is not a blanket "any strong extension is confirmed" rule.
+fn detect_platform_report_for_registry(
+    path: &Path,
+    source_root: &Path,
+) -> platform::PlatformDetectionReport {
+    let mut request = platform::DetectionRequest::new(path, source_root);
+    request.read_signatures = true;
+    platform::detect_platform_report(&request)
+}
+
+fn platform_from_registry_report(report: &platform::PlatformDetectionReport) -> Option<String> {
+    let platform = report.platform?;
+    match report.confidence {
+        platform::DetectionConfidence::Confirmed => Some(platform.to_string()),
+        platform::DetectionConfidence::Probable => {
+            // Apple II and Macintosh are the one paired family whose strong
+            // media extensions remain discoverable as registry candidates
+            // while declaring their mutual conflict. Folder aliases are
+            // handled earlier and continue to outrank this tier.
+            let apple_family = matches!(platform, "Apple II" | "Macintosh");
+            let unambiguous = report.candidates.len() == 1
+                && (apple_family
+                    || platform::platform_by_id(platform)
+                        .is_some_and(|entry| entry.conflicts_with.is_empty())
+                    || matches!(platform, "MSX" | "MSX2"));
+            unambiguous.then(|| platform.to_string())
         }
-    })
+        platform::DetectionConfidence::Unknown | platform::DetectionConfidence::Ambiguous => None,
+    }
 }
 
 /// The original `detect_platform` heuristic, unchanged: a small set of
@@ -5110,6 +7193,18 @@ fn folder_platform_alias(segment: &str) -> Option<&'static str> {
 /// components from the archive's nearest containing folder upward to and
 /// including `source_root` - the nearest matching folder wins. Nothing outside
 /// `source_root` participates, and the archive's own filename is excluded.
+/// Whether the folder holding `path`, or the configured source root itself,
+/// names PlayStation - the same folder evidence platform detection uses.
+fn is_playstation_location(path: &Path, source_root: &Path) -> bool {
+    detect_platform_from_folder_alias_with_match(path, source_root)
+        .is_some_and(|(platform, _)| platform == "PSX")
+        || source_root
+            .file_name()
+            .and_then(|name| name.to_str())
+            .and_then(folder_platform_alias)
+            == Some("PSX")
+}
+
 fn detect_platform_from_folder_alias_with_match(
     path: &Path,
     source_root: &Path,
@@ -5157,11 +7252,13 @@ fn archive_title(path: &Path) -> String {
         return filename[..filename.len() - suffix_len + 1 - part_digits].to_string();
     }
 
-    for extension in [
-        ".zip", ".7z", ".rar", ".iso", ".gcm", ".gcz", ".rvz", ".wbfs", ".ciso",
-    ] {
-        if lower.ends_with(extension) {
-            return filename[..filename.len() - extension.len()].to_string();
+    // Registry-backed, so a newly recognised media format never needs a
+    // second hardcoded extension list to strip its own suffix - see
+    // `media_registry`.
+    for format in media_registry::MEDIA_FORMATS {
+        let dotted_extension = format!(".{}", format.extension);
+        if lower.ends_with(&dotted_extension) {
+            return filename[..filename.len() - dotted_extension.len()].to_string();
         }
     }
 
@@ -5549,14 +7646,13 @@ fn watch_path_is_supported_archive(path: &Path) -> bool {
         return false;
     }
 
+    // Delegates to the same media registry `archive_kind` consults, so
+    // scanning and watching can never independently drift out of sync
+    // again - see `media_registry`.
     let Some(extension) = path.extension().and_then(|extension| extension.to_str()) else {
         return false;
     };
-
-    matches!(
-        extension.to_ascii_lowercase().as_str(),
-        "zip" | "rar" | "7z" | "iso" | "md" | "gen" | "smd" | "bin"
-    )
+    media_registry::is_watch_relevant_extension(&extension.to_ascii_lowercase())
 }
 
 pub fn is_temporary_or_incomplete_path(path: impl AsRef<Path>) -> bool {
@@ -5830,28 +7926,56 @@ pub fn load_read_only_snapshot_default() -> Result<ArchiveSnapshot> {
 }
 
 /// Loads one read-only view of a library without creating mount directories.
+///
+/// A config file that does not exist yet is not an error here: a fresh
+/// install genuinely has none until the user's first source/config action
+/// creates one, and `create_starter_config`'s own written comment already
+/// documents this as the intended, normal state ("a fresh install with zero
+/// sources loads normally"). This resolves to the same empty library a
+/// freshly-written starter config would produce - without writing anything,
+/// since this function is read-only by contract - using the exact "missing
+/// {path}" wording `run_doctor_with_mount_root_creation` already uses for
+/// the same condition, so Doctor's existing Finding adapter
+/// (`doctor_check_severity`) keeps reporting it as Info, never Error. A
+/// config file that exists but cannot be read for another reason (permission
+/// denied, not a regular file, etc.) is unaffected and still fails closed.
 pub fn load_read_only_snapshot(config_path: impl AsRef<Path>) -> Result<ArchiveSnapshot> {
     let config_path = config_path.as_ref().to_path_buf();
-    let contents = fs::read_to_string(&config_path)
-        .map_err(|source| ArchiveFsError::io(config_path.clone(), source))?;
-    let config = parse_config(&contents)?;
-    let identity = config_identity(&config_path, Some(&contents));
-    let records = current_archive_records(&config)?;
-    let stats = summarize_archive_records(&records);
-    let statuses = archive_statuses_from_records(&records);
-    let mut doctor = empty_doctor_report(config_path.clone());
-    doctor.pass("config file", format!("found {}", config_path.display()));
-    doctor.pass("config parses", "configuration parsed successfully");
-    complete_doctor_report(&mut doctor, &config, false, Some((&records, &statuses)));
+    match fs::read_to_string(&config_path) {
+        Ok(contents) => {
+            let config = parse_config(&contents)?;
+            let identity = config_identity(&config_path, Some(&contents));
+            let records = current_archive_records(&config)?;
+            let stats = summarize_archive_records(&records);
+            let statuses = archive_statuses_from_records(&records);
+            let mut doctor = empty_doctor_report(config_path.clone());
+            doctor.pass("config file", format!("found {}", config_path.display()));
+            doctor.pass("config parses", "configuration parsed successfully");
+            complete_doctor_report(&mut doctor, &config, false, Some((&records, &statuses)));
 
-    Ok(ArchiveSnapshot {
-        mount_root: config.mount_root.clone(),
-        records,
-        stats,
-        statuses,
-        doctor,
-        config_identity: identity,
-    })
+            Ok(ArchiveSnapshot {
+                mount_root: config.mount_root.clone(),
+                records,
+                stats,
+                statuses,
+                doctor,
+                config_identity: identity,
+            })
+        }
+        Err(source) if source.kind() == io::ErrorKind::NotFound => {
+            let mut doctor = empty_doctor_report(config_path.clone());
+            doctor.fail("config file", format!("missing {}", config_path.display()));
+            Ok(ArchiveSnapshot {
+                mount_root: PathBuf::from("/path/to/archivefs-mounts"),
+                records: Vec::new(),
+                stats: summarize_archive_records(&[]),
+                statuses: Vec::new(),
+                doctor,
+                config_identity: config_identity(&config_path, None),
+            })
+        }
+        Err(source) => Err(ArchiveFsError::io(config_path.clone(), source)),
+    }
 }
 
 pub fn select_archive_record(records: &[ArchiveRecord], input: &str) -> Result<ArchiveRecord> {
@@ -6399,6 +8523,12 @@ fn ensure_no_symlink_components(path: &Path) -> Result<()> {
 }
 
 fn validate_archive_for_mount(archive: &Archive) -> Result<()> {
+    if archive.kind == ArchiveKind::Lha {
+        return Err(ArchiveFsError::Mount(format!(
+            "LHA/LZH archives are catalogued for library discovery but EmuWiz has no LHA mount backend: {}",
+            archive.path.display()
+        )));
+    }
     if archive.kind == ArchiveKind::MegaDriveRom {
         return Err(ArchiveFsError::Mount(format!(
             "loose Mega Drive ROMs are catalogued for library discovery but are not archive mount inputs: {}",
@@ -7222,7 +9352,7 @@ fn run_command_os(program: &str, args: &[&std::ffi::OsStr]) -> Result<()> {
 
 const COMMAND_OUTPUT_LIMIT: usize = 64 * 1024;
 
-fn run_command_os_with_timeout(
+pub(crate) fn run_command_os_with_timeout(
     program: &str,
     args: &[&std::ffi::OsStr],
     timeout: Duration,
@@ -7442,6 +9572,617 @@ mod tests {
                 && archive.identity.platform_provenance == Some(PlatformProvenance::FolderAlias)
         }));
         let _ = fs::remove_dir_all(root.parent().unwrap());
+    }
+
+    /// Test 1/2/3 (loose Commodore media milestone): `.d64` and `.g64`
+    /// under a `c128`-aliased folder are discovered as
+    /// `ArchiveKind::DirectGameImage`, assigned `Commodore 128` by the same
+    /// folder-alias heuristic every other platform already uses, while
+    /// `images/`, `videos/`, and `gamelist.xml` - none of them a
+    /// recognised extension - are never discovered as candidates at all.
+    #[test]
+    fn loose_c128_d64_and_g64_are_discovered_but_companion_assets_are_not() {
+        let root = test_root("loose-c128-media").join("c128");
+        fs::create_dir_all(root.join("images")).unwrap();
+        fs::create_dir_all(root.join("videos")).unwrap();
+        fs::write(root.join("BurgerWhop!.d64"), vec![0_u8; 174_848]).unwrap();
+        fs::write(
+            root.join("Ultima V - Warriors of Destiny(Disk 1 of 4 Side A)(Main).g64"),
+            vec![0_u8; 278_234],
+        )
+        .unwrap();
+        fs::write(root.join("DFS Game.ssd"), vec![0_u8; 100 * 1024]).unwrap();
+        fs::write(root.join("DFS Game.dsd"), vec![0_u8; 200 * 1024]).unwrap();
+        fs::write(root.join("gamelist.xml"), b"<gameList/>").unwrap();
+        fs::write(
+            root.join("images").join("BurgerWhop-boxart.png"),
+            b"png fixture",
+        )
+        .unwrap();
+        fs::write(
+            root.join("videos").join("BurgerWhop-video.mp4"),
+            b"mp4 fixture",
+        )
+        .unwrap();
+
+        let config = Config {
+            source_folders: vec![root.clone()],
+            mount_root: root.join("mount"),
+            ratarmount_bin: "ratarmount".into(),
+            master_rom_root: None,
+        };
+        let discovery = ArchiveScanner::new(&config)
+            .scan_archives_with_summary()
+            .unwrap();
+
+        assert_eq!(
+            discovery.archives.len(),
+            4,
+            "only the four recognised loose disk images may be discovered - got {:?}",
+            discovery
+                .archives
+                .iter()
+                .map(|archive| archive.path.clone())
+                .collect::<Vec<_>>()
+        );
+        assert!(
+            discovery
+                .archives
+                .iter()
+                .all(|archive| archive.kind == ArchiveKind::DirectGameImage),
+            "loose Commodore media is catalogued directly, never wrapped or copied"
+        );
+        assert!(
+            discovery
+                .archives
+                .iter()
+                .all(|archive| archive.identity.platform.as_deref() == Some("Commodore 128")),
+            "the `c128` folder alias must resolve all four loose media files to Commodore 128, \
+             exactly like every other weak/shared extension already does"
+        );
+        assert!(
+            discovery
+                .archives
+                .iter()
+                .any(|archive| archive.path.ends_with("BurgerWhop!.d64"))
+        );
+        assert!(discovery.archives.iter().any(|archive| {
+            archive
+                .path
+                .ends_with("Ultima V - Warriors of Destiny(Disk 1 of 4 Side A)(Main).g64")
+        }));
+        assert!(
+            discovery
+                .archives
+                .iter()
+                .any(|archive| archive.path.ends_with("DFS Game.ssd"))
+        );
+        assert!(
+            discovery
+                .archives
+                .iter()
+                .any(|archive| archive.path.ends_with("DFS Game.dsd"))
+        );
+        assert!(
+            discovery.archives.iter().all(|archive| !archive
+                .path
+                .to_string_lossy()
+                .contains("images")
+                && !archive.path.to_string_lossy().contains("videos")
+                && !archive.path.ends_with("gamelist.xml")),
+            "images/, videos/, and gamelist.xml must never become candidates"
+        );
+        assert_eq!(
+            discovery.skipped_unsupported_extension, 3,
+            "gamelist.xml, the .png, and the .mp4 are each an unsupported extension - counted, \
+             never silently dropped"
+        );
+        assert_eq!(discovery.skipped_ambiguous_platform, 0);
+        // The same three files must also appear as individual skipped-file
+        // detail, each with the unsupported-extension reason and its own
+        // path - see the "Skipped files / why-skipped UI" milestone.
+        assert_eq!(discovery.skipped_files.len(), 3);
+        assert!(
+            discovery
+                .skipped_files
+                .iter()
+                .all(|item| item.reason == SkipReason::UnsupportedExtension)
+        );
+        assert!(
+            discovery
+                .skipped_files
+                .iter()
+                .any(|item| item.path.ends_with("gamelist.xml"))
+        );
+        assert!(!discovery.skipped_files_truncated());
+
+        let _ = fs::remove_dir_all(root.parent().unwrap());
+    }
+
+    // -------------------------------------------------------------------
+    // Skipped-files detail (`SkippedFile`/`SkipReason`) - the "Skipped
+    // files / why-skipped UI" milestone.
+    // -------------------------------------------------------------------
+
+    /// Test: an unsupported-extension file produces a `SkippedFile` detail
+    /// entry with the exact right reason and path.
+    #[test]
+    fn unsupported_extension_produces_a_skipped_file_detail_entry() {
+        let root = test_root("skipped-detail-unsupported");
+        fs::create_dir_all(&root).unwrap();
+        let boxart = root.join("boxart.png");
+        fs::write(&boxart, b"not a rom").unwrap();
+
+        let config = Config {
+            source_folders: vec![root.clone()],
+            mount_root: root.join("mount"),
+            ratarmount_bin: "ratarmount".into(),
+            master_rom_root: None,
+        };
+        let discovery = ArchiveScanner::new(&config)
+            .scan_archives_with_summary()
+            .unwrap();
+
+        assert_eq!(discovery.skipped_unsupported_extension, 1);
+        assert_eq!(discovery.skipped_files.len(), 1);
+        assert_eq!(discovery.skipped_files[0].path, boxart);
+        assert_eq!(
+            discovery.skipped_files[0].reason,
+            SkipReason::UnsupportedExtension
+        );
+
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    /// Test: an uncorroborated `.gen` (shared with Mega Drive, but with no
+    /// folder/source/header evidence here) produces a `SkippedFile` detail
+    /// entry with the ambiguous-platform reason, not unsupported-extension.
+    #[test]
+    fn ambiguous_platform_produces_a_skipped_file_detail_entry() {
+        let root = test_root("skipped-detail-ambiguous");
+        fs::create_dir_all(&root).unwrap();
+        let resource = root.join("RESOURCE.GEN");
+        fs::write(&resource, b"scummvm resource, not a rom").unwrap();
+
+        let config = Config {
+            source_folders: vec![root.clone()],
+            mount_root: root.join("mount"),
+            ratarmount_bin: "ratarmount".into(),
+            master_rom_root: None,
+        };
+        let discovery = ArchiveScanner::new(&config)
+            .scan_archives_with_summary()
+            .unwrap();
+
+        assert_eq!(discovery.skipped_ambiguous_platform, 1);
+        assert_eq!(discovery.skipped_unsupported_extension, 0);
+        assert_eq!(discovery.skipped_files.len(), 1);
+        assert_eq!(discovery.skipped_files[0].path, resource);
+        assert_eq!(
+            discovery.skipped_files[0].reason,
+            SkipReason::AmbiguousPlatform
+        );
+
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    /// Test: a recognised archive produces no skipped-file detail at all -
+    /// explaining skips must never mention something that was not, in
+    /// fact, skipped.
+    #[test]
+    fn recognized_file_produces_no_skipped_detail() {
+        let root = test_root("skipped-detail-recognized");
+        fs::create_dir_all(&root).unwrap();
+        fs::write(root.join("Sonic.zip"), b"zip bytes").unwrap();
+
+        let config = Config {
+            source_folders: vec![root.clone()],
+            mount_root: root.join("mount"),
+            ratarmount_bin: "ratarmount".into(),
+            master_rom_root: None,
+        };
+        let discovery = ArchiveScanner::new(&config)
+            .scan_archives_with_summary()
+            .unwrap();
+
+        assert_eq!(discovery.archives.len(), 1);
+        assert!(discovery.skipped_files.is_empty());
+        assert_eq!(discovery.total_skipped(), 0);
+
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    /// Test: the aggregate counters stay exact for the *entire* scan even
+    /// when the retained detail list is capped at
+    /// `MAX_RETAINED_SKIPPED_FILES` - the count is never derived from
+    /// `skipped_files.len()`, and truncation is reported honestly rather
+    /// than the list silently pretending to be complete.
+    #[test]
+    fn aggregate_counters_remain_exact_when_the_detail_list_is_capped() {
+        let root = test_root("skipped-detail-capped");
+        fs::create_dir_all(&root).unwrap();
+        let extra = 5;
+        let total_unsupported = MAX_RETAINED_SKIPPED_FILES + extra;
+        for index in 0..total_unsupported {
+            fs::write(root.join(format!("junk-{index:05}.xyz")), b"").unwrap();
+        }
+
+        let config = Config {
+            source_folders: vec![root.clone()],
+            mount_root: root.join("mount"),
+            ratarmount_bin: "ratarmount".into(),
+            master_rom_root: None,
+        };
+        let discovery = ArchiveScanner::new(&config)
+            .scan_archives_with_summary()
+            .unwrap();
+
+        assert_eq!(
+            discovery.skipped_unsupported_extension, total_unsupported,
+            "the exact aggregate count must reflect every skipped file, capped detail or not"
+        );
+        assert_eq!(discovery.total_skipped(), total_unsupported);
+        assert_eq!(
+            discovery.skipped_files.len(),
+            MAX_RETAINED_SKIPPED_FILES,
+            "the retained detail list must never grow past the bound"
+        );
+        assert!(discovery.skipped_files_truncated());
+
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    /// Test: no skipped file is ever recorded twice in `skipped_files`,
+    /// whether or not it shares its skip reason with others in the same
+    /// scan.
+    #[test]
+    fn no_duplicate_skipped_entries() {
+        let root = test_root("skipped-detail-no-duplicates");
+        fs::create_dir_all(&root).unwrap();
+        for name in ["a.png", "b.jpg", "c.xyz"] {
+            fs::write(root.join(name), b"").unwrap();
+        }
+        for name in ["d.gen", "e.bin"] {
+            fs::write(root.join(name), b"").unwrap();
+        }
+
+        let config = Config {
+            source_folders: vec![root.clone()],
+            mount_root: root.join("mount"),
+            ratarmount_bin: "ratarmount".into(),
+            master_rom_root: None,
+        };
+        let discovery = ArchiveScanner::new(&config)
+            .scan_archives_with_summary()
+            .unwrap();
+
+        assert_eq!(discovery.skipped_files.len(), 5);
+        let unique: std::collections::HashSet<&Path> = discovery
+            .skipped_files
+            .iter()
+            .map(|item| item.path.as_path())
+            .collect();
+        assert_eq!(unique.len(), discovery.skipped_files.len());
+
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    /// Media/platform-responsibility review: `.g64` is strong extension
+    /// evidence for Commodore 64 and only weak evidence for Commodore 128
+    /// (see `platform::PLATFORMS`) - a real, standing conflict between the
+    /// two platforms' own extension tables. Folder-alias evidence must
+    /// still win over that conflicting strong extension, exactly as it
+    /// already does for every other weak/shared extension: the media
+    /// registry only ever decides "this is recognised media"; which
+    /// platform it belongs to is entirely `detect_platform_with_provenance`'s
+    /// folder-alias-first precedence, unchanged by this work.
+    #[test]
+    fn folder_alias_wins_over_conflicting_strong_extension_for_g64_in_c128_folder() {
+        let root = test_root("g64-folder-alias-precedence").join("c128");
+        fs::create_dir_all(&root).unwrap();
+        let g64 = root.join("Ultima V.g64");
+        fs::write(&g64, vec![0_u8; 1024]).unwrap();
+
+        let archive = Archive::from_path_in_root(&g64, &root).unwrap();
+        assert_eq!(archive.kind, ArchiveKind::DirectGameImage);
+        assert_eq!(
+            archive.identity.platform.as_deref(),
+            Some("Commodore 128"),
+            "a `c128`-aliased folder must resolve `.g64` to Commodore 128, not Commodore 64, \
+             even though `.g64` is C64's own strong extension"
+        );
+        assert_eq!(
+            archive.identity.platform_provenance,
+            Some(PlatformProvenance::FolderAlias)
+        );
+
+        let _ = fs::remove_dir_all(root.parent().unwrap());
+    }
+
+    /// Platform-safety review: `.chd` (like `.d64`/`.g64`) is deliberately
+    /// never strong evidence for any single platform on its own - it is
+    /// shared across Neo Geo CD, Sega CD, arcade sets, and more. A `.chd`
+    /// with no corroborating folder/source/header evidence must resolve no
+    /// platform at all, never default to any one of the platforms that
+    /// merely lists it as weak evidence.
+    #[test]
+    fn a_bare_chd_with_no_corroborating_evidence_resolves_no_platform() {
+        let root = test_root("chd-no-corroboration").join("random");
+        fs::create_dir_all(&root).unwrap();
+        let chd = root.join("Game.chd");
+        fs::write(&chd, vec![0_u8; 1024]).unwrap();
+
+        let archive = Archive::from_path_in_root(&chd, &root).unwrap();
+        assert_eq!(archive.kind, ArchiveKind::DirectGameImage);
+        assert_eq!(
+            archive.identity.platform, None,
+            "a `.chd` outside any recognised folder must never be assumed to be Neo Geo CD \
+             (or any other platform) by extension alone"
+        );
+
+        let _ = fs::remove_dir_all(root.parent().unwrap());
+    }
+
+    /// The mirror case: a `neogeocd`-aliased folder still resolves `.chd`
+    /// to Neo Geo CD, exactly like every other weak/shared extension.
+    #[test]
+    fn chd_resolves_neo_geo_cd_when_folder_evidence_corroborates_it() {
+        let root = test_root("chd-neogeocd-folder-alias").join("neogeocd");
+        fs::create_dir_all(&root).unwrap();
+        let chd = root.join("Metal Slug.chd");
+        fs::write(&chd, vec![0_u8; 1024]).unwrap();
+
+        let archive = Archive::from_path_in_root(&chd, &root).unwrap();
+        assert_eq!(archive.identity.platform.as_deref(), Some("Neo Geo CD"));
+        assert_eq!(
+            archive.identity.platform_provenance,
+            Some(PlatformProvenance::FolderAlias)
+        );
+
+        let _ = fs::remove_dir_all(root.parent().unwrap());
+    }
+
+    /// Real-world-surfaced regression: `neocdz` (the actual MAME driver
+    /// name, and what several real Neo Geo CD collections/frontends use as
+    /// a folder name) must resolve `.chd` to Neo Geo CD via folder-alias
+    /// evidence, exactly like `neogeocd`/`snkneogeocd`/`ngcd` already do.
+    /// The companion case in the same test proves this is still genuine
+    /// folder-alias corroboration, not a relaxation of CHD's ambiguity: a
+    /// `.chd` in an unrelated folder must remain unresolved.
+    #[test]
+    fn neocdz_folder_alias_resolves_chd_to_neo_geo_cd_while_an_unknown_folder_stays_unresolved() {
+        let root = test_root("chd-neocdz-folder-alias").join("neocdz");
+        fs::create_dir_all(&root).unwrap();
+        let chd = root.join("2020 Super Baseball (World).chd");
+        fs::write(&chd, vec![0_u8; 1024]).unwrap();
+
+        let archive = Archive::from_path_in_root(&chd, &root).unwrap();
+        assert_eq!(archive.kind, ArchiveKind::DirectGameImage);
+        assert_eq!(archive.identity.platform.as_deref(), Some("Neo Geo CD"));
+        assert_eq!(
+            archive.identity.platform_provenance,
+            Some(PlatformProvenance::FolderAlias)
+        );
+
+        let unknown_root = test_root("chd-neocdz-folder-alias").join("some-other-folder");
+        fs::create_dir_all(&unknown_root).unwrap();
+        let unknown_chd = unknown_root.join("Game.chd");
+        fs::write(&unknown_chd, vec![0_u8; 1024]).unwrap();
+        let unknown_archive = Archive::from_path_in_root(&unknown_chd, &unknown_root).unwrap();
+        assert_eq!(
+            unknown_archive.identity.platform, None,
+            "`.chd` must stay unresolved outside a recognised folder - the fix only adds a \
+             folder alias, it never makes `.chd` sufficient platform identity on its own"
+        );
+
+        let _ = fs::remove_dir_all(root.parent().unwrap());
+    }
+
+    /// Same synthetic 8-sector WUX the Wii U queue tests use.
+    fn synthetic_wux() -> Vec<u8> {
+        let sector = crate::wiiu_disc::WUD_SECTOR_SIZE as usize;
+        let mut raw = vec![0_u8; 8 * sector];
+        raw[..10].copy_from_slice(b"WUP-P-TEST");
+        raw[0x10000..0x10004].copy_from_slice(&0xcc54_9eb9_u32.to_be_bytes());
+        raw[0x10005] = 1;
+        raw[0x18000..crate::wiiu_disc::WUD_HEADER_SIZE as usize].fill(0xa5);
+        let mut data = vec![0_u8; 5 * sector];
+        data[..4].copy_from_slice(b"WUX0");
+        data[4..8].copy_from_slice(&0x1099_d02e_u32.to_le_bytes());
+        data[8..12].copy_from_slice(&crate::wiiu_disc::WUD_SECTOR_SIZE.to_le_bytes());
+        data[16..24].copy_from_slice(&(raw.len() as u64).to_le_bytes());
+        for (i, block) in [0_u32, 1, 2, 3, 1, 1, 1, 1].into_iter().enumerate() {
+            data[32 + i * 4..36 + i * 4].copy_from_slice(&block.to_le_bytes());
+        }
+        data[sector..].copy_from_slice(&raw[..4 * sector]);
+        data
+    }
+
+    fn scan_wiiu(root: &Path) -> ArchiveScanDiscovery {
+        let config = Config {
+            source_folders: vec![root.to_path_buf()],
+            mount_root: root.join("mount"),
+            ratarmount_bin: "ratarmount".into(),
+            master_rom_root: None,
+        };
+        ArchiveScanner::new(&config)
+            .scan_archives_with_summary()
+            .unwrap()
+    }
+
+    /// Registration makes `.wud`/`.wux` discoverable and nothing more: the
+    /// platform comes from the registry, and the bounded inspector alone says
+    /// whether a file is really a disc.
+    #[test]
+    fn wud_and_wux_are_catalogued_but_never_gain_verified_identity_from_the_extension() {
+        let root = test_root("wiiu-media-registration").join("wiiu");
+        fs::create_dir_all(&root).unwrap();
+        fs::write(root.join("Good Game.wux"), synthetic_wux()).unwrap();
+        fs::write(root.join("Bad Game.wux"), b"WUX0 not really").unwrap();
+        fs::write(root.join("Bad Disc.wud"), vec![0_u8; 4096]).unwrap();
+        fs::write(root.join("UPPER.WUX"), synthetic_wux()).unwrap();
+        fs::write(root.join("Game.key"), b"companion").unwrap();
+        fs::write(root.join("Game.rpx"), b"not media").unwrap();
+
+        let discovery = scan_wiiu(&root);
+        let found = |name: &str| {
+            discovery
+                .archives
+                .iter()
+                .find(|archive| archive.path.ends_with(name))
+        };
+        for name in ["Good Game.wux", "Bad Game.wux", "Bad Disc.wud", "UPPER.WUX"] {
+            let archive = found(name).unwrap_or_else(|| panic!("{name} must be catalogued"));
+            assert_eq!(archive.kind, ArchiveKind::DirectGameImage, "{name}");
+            // Platform evidence is registry-derived (here the `wiiu` folder alias)...
+            assert_eq!(archive.identity.platform.as_deref(), Some("WiiU"), "{name}");
+            // ...and is never a verified header identity.
+            assert_ne!(
+                archive.identity.platform_provenance,
+                Some(PlatformProvenance::HeaderIdentity),
+                "{name}: extension/folder evidence must not claim a verified identity"
+            );
+        }
+        assert!(found("Game.key").is_none() && found("Game.rpx").is_none());
+        assert_eq!(discovery.archives.len(), 4);
+
+        // The inspector, not the extension, decides validity.
+        assert!(
+            crate::wiiu_disc::inspect_wii_u_disc(&root.join("Good Game.wux")).structural_complete
+        );
+        assert!(
+            !crate::wiiu_disc::inspect_wii_u_disc(&root.join("Bad Game.wux")).structural_complete
+        );
+        assert!(
+            !crate::wiiu_disc::inspect_wii_u_disc(&root.join("Bad Disc.wud")).structural_complete
+        );
+        let _ = fs::remove_dir_all(root.parent().unwrap());
+    }
+
+    #[test]
+    fn wii_u_extensions_follow_the_existing_case_policy_and_stay_unresolved_without_evidence() {
+        for name in ["Game.wud", "Game.WUD", "Game.wux", "Game.WuX"] {
+            assert_eq!(
+                archive_kind(Path::new(name)),
+                Some(ArchiveKind::DirectGameImage),
+                "{name}"
+            );
+        }
+        assert_eq!(archive_kind(Path::new("Game.wua")), None);
+        // An unrelated extension is untouched.
+        assert_eq!(archive_kind(Path::new("Game.xyz")), None);
+        // Outside a recognised folder, a malformed file is catalogued as media
+        // but never as a verified identity.
+        let root = test_root("wiiu-no-folder");
+        fs::write(root.join("Mystery.wud"), vec![0_u8; 2048]).unwrap();
+        let discovery = scan_wiiu(&root);
+        let archive = discovery
+            .archives
+            .iter()
+            .find(|a| a.path.ends_with("Mystery.wud"))
+            .expect("catalogued as media");
+        assert_ne!(
+            archive.identity.platform_provenance,
+            Some(PlatformProvenance::HeaderIdentity)
+        );
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn archive_kind_recognizes_loose_commodore_disk_images() {
+        assert_eq!(
+            archive_kind(Path::new("BurgerWhop!.d64")),
+            Some(ArchiveKind::DirectGameImage)
+        );
+        assert_eq!(
+            archive_kind(Path::new("Ultima V.g64")),
+            Some(ArchiveKind::DirectGameImage)
+        );
+        assert_eq!(
+            archive_kind(Path::new("BurgerWhop!.D64")),
+            Some(ArchiveKind::DirectGameImage)
+        );
+        // Existing archive-format recognition is unaffected by this addition.
+        assert_eq!(archive_kind(Path::new("Sonic.zip")), Some(ArchiveKind::Zip));
+        assert_eq!(archive_kind(Path::new("gamelist.xml")), None);
+        assert_eq!(archive_kind(Path::new("boxart.png")), None);
+    }
+
+    #[test]
+    fn archive_title_strips_loose_commodore_disk_image_extensions() {
+        assert_eq!(archive_title(Path::new("BurgerWhop!.d64")), "BurgerWhop!");
+        assert_eq!(
+            archive_title(Path::new(
+                "Ultima V - Warriors of Destiny(Disk 1 of 4 Side A)(Main).g64"
+            )),
+            "Ultima V - Warriors of Destiny(Disk 1 of 4 Side A)(Main)"
+        );
+        // Existing archive-format title stripping is unaffected.
+        assert_eq!(archive_title(Path::new("Sonic.zip")), "Sonic");
+    }
+
+    // -------------------------------------------------------------------
+    // Media-registry review follow-up: CHD recognition/title handling and
+    // scan/watch parity.
+    // -------------------------------------------------------------------
+
+    #[test]
+    fn archive_kind_recognizes_chd() {
+        assert_eq!(
+            archive_kind(Path::new("Metal Slug.chd")),
+            Some(ArchiveKind::DirectGameImage)
+        );
+        assert_eq!(
+            archive_kind(Path::new("Metal Slug.CHD")),
+            Some(ArchiveKind::DirectGameImage)
+        );
+    }
+
+    #[test]
+    fn archive_title_strips_chd_extension() {
+        // Registry-backed title stripping (see `media_registry`): a newly
+        // registered format must never need its own second hardcoded
+        // extension list here to have its suffix stripped.
+        assert_eq!(archive_title(Path::new("Metal Slug.chd")), "Metal Slug");
+        assert_ne!(archive_title(Path::new("Metal Slug.chd")), "Metal Slug.chd");
+    }
+
+    #[test]
+    fn scan_and_watch_recognize_exactly_the_same_media_registry_extensions() {
+        // Every extension `archive_kind` (scanning) recognises on its own
+        // must also be watch-relevant, and vice versa for anything the
+        // watcher does not additionally treat as a Mega Drive corroboration
+        // candidate - both must derive from `media_registry`, never two
+        // independently maintained lists.
+        for format in media_registry::MEDIA_FORMATS {
+            let dotted = format!("Game.{}", format.extension);
+            assert_eq!(
+                archive_kind(Path::new(&dotted)),
+                Some(format.kind),
+                "archive_kind must recognise `.{}`",
+                format.extension
+            );
+            assert!(
+                watch_path_is_supported_archive(Path::new(&format!("/roms/{dotted}"))),
+                "the watcher must recognise `.{}` - previously gcz/rvz/wbfs/ciso/d64/g64/chd \
+                 were missing from its own separate, stale extension list",
+                format.extension
+            );
+        }
+    }
+
+    #[test]
+    fn watch_closes_the_previously_missing_direct_image_extension_gaps() {
+        // These four extensions were already recognised by `archive_kind`
+        // (scanning) before this change, but were absent from the
+        // watcher's own separate hardcoded list - a real scan/watch
+        // disagreement this change closes.
+        for extension in ["gcz", "rvz", "wbfs", "ciso"] {
+            assert!(
+                watch_path_is_supported_archive(Path::new(&format!("/roms/Game.{extension}"))),
+                "the watcher must recognise `.{extension}`"
+            );
+        }
     }
 
     #[test]
@@ -9894,6 +12635,12 @@ mod tests {
     }
 
     #[test]
+    fn hdi_nhd_capacity_and_filename_do_not_prove_pc98() {
+        assert_eq!(detect_platform("/roms/PC-98 Game.hdi", "/roms"), None);
+        assert_eq!(detect_platform("/roms/NEC PC-9801 Game.nhd", "/roms"), None);
+    }
+
+    #[test]
     fn detects_platform_from_collection_style_xbox_segments() {
         assert_eq!(
             detect_platform(
@@ -10117,6 +12864,116 @@ mod tests {
         // Alias-looking ancestors outside that root remain excluded.
         assert_eq!(
             detect_platform("/home/msx2/collection/game.zip", "/home/msx2/collection"),
+            None
+        );
+    }
+
+    // --- Registry-based fallback tier (Stage 4B real-collection fix) -----
+    //
+    // Real GBA/GB/etc collections are routinely organised under a curated
+    // set name ("Nintendo Game Boy Advance Champion Collection") rather
+    // than a folder alias - folder-alias matching finds nothing there, so
+    // every loose ROM in a real 1,228-file collection previously fell
+    // through to unresolved. These tests pin the fix: a strong,
+    // unambiguous extension resolves a platform on its own once folder
+    // alias has already failed, but a strong extension shared between
+    // conflicting platforms (GameCube/Wii's `.rvz`/`.wbfs`) still does
+    // not, matching `database::tests::saved_source_assignment_reclassifies_unknown_rvz_on_rescan`.
+
+    #[test]
+    fn an_unambiguous_strong_extension_resolves_a_platform_when_folder_alias_finds_nothing() {
+        let detection = detect_platform_with_details(
+            "/mnt/gba-roms/Nintendo Game Boy Advance Champion Collection/007 - NightFire (NA).gba",
+            "/mnt/gba-roms/Nintendo Game Boy Advance Champion Collection",
+        )
+        .expect("a .gba file should resolve via the registry fallback");
+        assert_eq!(detection.platform, "Game Boy Advance");
+        assert_eq!(detection.provenance, PlatformProvenance::RegistryDetector);
+    }
+
+    #[test]
+    fn msx_cartridge_extensions_resolve_via_the_registry_fallback() {
+        let root = "/mnt/msx-roms/curated-set";
+        let mx1 = detect_platform_with_details(format!("{root}/cart.mx1"), root)
+            .expect(".mx1 should resolve without a folder alias");
+        assert_eq!(mx1.platform, "MSX");
+        assert_eq!(mx1.provenance, PlatformProvenance::RegistryDetector);
+
+        let mx2 = detect_platform_with_details(format!("{root}/cart.mx2"), root)
+            .expect(".mx2 should resolve without a folder alias");
+        assert_eq!(mx2.platform, "MSX2");
+        assert_eq!(mx2.provenance, PlatformProvenance::RegistryDetector);
+    }
+
+    #[test]
+    fn msx_cartridge_boundaries_remain_fail_closed() {
+        let root = "/mnt/msx-roms/curated-set";
+        assert_eq!(detect_platform(format!("{root}/cart.rom"), root), None);
+        assert_eq!(detect_platform(format!("{root}/cart.bin"), root), None);
+        assert_eq!(
+            detect_platform(format!("{root}/msx-turbo/Game.zip"), root),
+            None
+        );
+        assert_eq!(
+            detect_platform(format!("{root}/cart.mx2"), root),
+            Some("MSX2".to_string())
+        );
+    }
+
+    #[test]
+    fn msx2_folder_keeps_priority_over_contradicting_mx1_extension() {
+        let root = "/mnt/msx-roms";
+        let path = format!("{root}/MSX2/cart.mx1");
+        let report = platform::detect_platform_report(&platform::DetectionRequest::new(
+            std::path::Path::new(&path),
+            std::path::Path::new(root),
+        ));
+        assert_eq!(report.platform, Some("MSX2"));
+        assert_eq!(
+            report.deciding_source,
+            Some(platform::DetectionSource::FolderAlias)
+        );
+        assert!(report.evidence.iter().any(|evidence| {
+            evidence.source == platform::DetectionSource::StrongExtension
+                && evidence.platform == "MSX"
+        }));
+        assert_eq!(detect_platform(path, root), Some("MSX2".to_string()));
+    }
+
+    #[test]
+    fn an_extension_shared_between_conflicting_platforms_does_not_auto_resolve() {
+        // `.rvz` is a strong GameCube extension but GameCube declares
+        // `conflicts_with: &["Wii"]` - the registry tier must defer to a
+        // person rather than silently guess between the two.
+        assert_eq!(
+            detect_platform_with_details(
+                "/mnt/collection/unsorted/ZooCube (USA).rvz",
+                "/mnt/collection/unsorted",
+            ),
+            None
+        );
+    }
+
+    #[test]
+    fn folder_alias_still_wins_over_the_registry_tier_when_both_could_answer() {
+        // Even though `.gba` alone is unambiguous, an exact folder alias
+        // is still checked first and still wins - this fix only ever
+        // fills in what folder-alias evidence leaves empty.
+        let detection =
+            detect_platform_with_details("/mnt/collection/gba/Some Game.gba", "/mnt/collection")
+                .unwrap();
+        assert_eq!(detection.provenance, PlatformProvenance::FolderAlias);
+    }
+
+    #[test]
+    fn d88_filenames_do_not_supply_japanese_platform_identity() {
+        let root = "/mnt/japanese-computer/unsorted";
+        assert_eq!(
+            detect_platform(format!("{root}/NEC PC-8801 Game.d88"), root),
+            None
+        );
+        assert_eq!(
+            detect_platform(format!("{root}/PC-98 Game.d88"), root),
             None
         );
     }
@@ -10996,7 +13853,7 @@ mod tests {
     }
 
     #[test]
-    fn scanner_rejects_duplicate_and_nested_roots_but_not_prefix_siblings() {
+    fn scanner_rejects_duplicate_and_shadows_nested_roots_but_not_prefix_siblings() {
         let root = test_root("scanner_source_overlap");
         let source = root.join("cache");
         let child = source.join("nested");
@@ -11013,20 +13870,23 @@ mod tests {
                 .scan_archives()
                 .unwrap_err()
                 .to_string()
-                .contains("overlapping")
+                .contains("duplicate")
         );
 
         let nested = Config {
-            source_folders: vec![source.clone(), child],
+            source_folders: vec![source.clone(), child.clone()],
             ..scanner_config(&root)
         };
-        assert!(
-            ArchiveScanner::new(&nested)
-                .scan_archives()
-                .unwrap_err()
-                .to_string()
-                .contains("overlapping")
-        );
+        fs::write(source.join("parent.zip"), b"parent").unwrap();
+        fs::write(child.join("child.zip"), b"child").unwrap();
+        let archives = ArchiveScanner::new(&nested).scan_archives().unwrap();
+        let archive_paths = archives
+            .iter()
+            .map(|archive| archive.path.clone())
+            .collect::<std::collections::BTreeSet<_>>();
+        assert_eq!(archive_paths.len(), 2);
+        assert!(archive_paths.contains(&source.join("parent.zip")));
+        assert!(archive_paths.contains(&child.join("child.zip")));
 
         let prefix_collision = Config {
             source_folders: vec![source, prefix_sibling],
@@ -11063,11 +13923,63 @@ mod tests {
             fs::create_dir(&directory).unwrap();
         }
 
-        let error = ArchiveScanner::new(&scanner_config(&root))
-            .scan_archives()
-            .unwrap_err();
+        let discovery = ArchiveScanner::new(&scanner_config(&root))
+            .scan_archives_with_summary()
+            .unwrap();
+        assert!(!discovery.is_complete());
+        assert!(
+            discovery
+                .scan_errors
+                .iter()
+                .any(|error| error.message.contains("directory depth limit"))
+        );
+    }
 
-        assert!(error.to_string().contains("directory depth limit"));
+    #[test]
+    #[ignore = "resource-intensive regression for the former 250,000-entry ceiling"]
+    fn scanner_streams_a_directory_larger_than_the_former_global_limit() {
+        let root = test_root("scanner-large-directory");
+        fs::create_dir_all(&root).unwrap();
+        for index in 0..250_001 {
+            fs::write(root.join(format!("sidecar-{index:06}.txt")), b"").unwrap();
+        }
+        let discovery = ArchiveScanner::new(&scanner_config(&root))
+            .scan_archives_with_summary()
+            .unwrap();
+        assert!(discovery.is_complete());
+        assert_eq!(discovery.entries_seen, 250_001);
+        assert!(discovery.archives.is_empty());
+        assert!(discovery.non_archive_fingerprints.len() <= 16_384);
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn scanner_keeps_valid_siblings_when_one_subtree_hits_depth_bound() {
+        let root = test_root("scanner-partial-sibling");
+        let mut deep = root.join("deep");
+        fs::create_dir_all(&deep).unwrap();
+        for _ in 0..=128 {
+            deep.push("d");
+            fs::create_dir(&deep).unwrap();
+        }
+        fs::write(root.join("valid.zip"), b"valid").unwrap();
+        let discovery = ArchiveScanner::new(&scanner_config(&root))
+            .scan_archives_with_summary()
+            .unwrap();
+        assert!(!discovery.is_complete());
+        assert!(
+            discovery
+                .archives
+                .iter()
+                .any(|archive| archive.path == root.join("valid.zip"))
+        );
+        assert!(
+            discovery
+                .scan_errors
+                .iter()
+                .any(|error| error.message.contains("directory depth limit"))
+        );
+        let _ = fs::remove_dir_all(root);
     }
 
     #[cfg(unix)]
@@ -11418,6 +14330,58 @@ mod tests {
     }
 
     #[test]
+    fn read_only_snapshot_resolves_to_an_empty_library_when_no_config_file_exists_yet() {
+        // A genuinely fresh install has no config file until the user's
+        // first source/config action creates one - `create_starter_config`'s
+        // own written comment already documents this as the intended,
+        // normal state ("a fresh install with zero sources loads normally").
+        // This must resolve the same way a freshly-written starter config
+        // would, not fail closed as a hard error.
+        let root = test_root("read_only_snapshot_missing_config");
+        let config_path = root.join("does-not-exist").join("config.toml");
+        assert!(!config_path.exists());
+
+        let snapshot = load_read_only_snapshot(&config_path).unwrap();
+
+        assert_eq!(snapshot.records.len(), 0);
+        assert_eq!(snapshot.stats.total_archives, 0);
+        assert!(snapshot.statuses.is_empty());
+        assert_eq!(snapshot.config_identity.config_path, Some(config_path));
+        // No content digest was computed - there was no file to hash.
+        assert!(snapshot.config_identity.content_digest.is_none());
+        // Never actually created anything: this function is read-only by
+        // contract, even for the "no config yet" case.
+        assert!(!root.join("does-not-exist").exists());
+        // Reuses the exact "missing {path}" wording
+        // `run_doctor_with_mount_root_creation` already uses for the same
+        // condition, so Doctor's existing Finding adapter
+        // (`doctor_check_severity`) keeps reporting this as Info, never
+        // Error - this is a normal fresh-install state, not a failure.
+        assert!(
+            snapshot
+                .doctor
+                .checks
+                .iter()
+                .any(|check| check.name == "config file" && check.detail.starts_with("missing "))
+        );
+    }
+
+    #[test]
+    fn read_only_snapshot_still_fails_closed_when_the_config_path_is_unreadable_for_another_reason()
+    {
+        // Only a genuinely absent file is treated as "fresh install, no
+        // config yet". A config path that exists but cannot be read for a
+        // different reason (here: it is a directory, not a file) must keep
+        // failing closed exactly as before - this fix narrowly targets
+        // `io::ErrorKind::NotFound` only.
+        let root = test_root("read_only_snapshot_unreadable_config");
+        let config_path = root.join("config.toml");
+        fs::create_dir_all(&config_path).unwrap();
+
+        assert!(load_read_only_snapshot(&config_path).is_err());
+    }
+
+    #[test]
     fn read_only_doctor_does_not_create_missing_mount_root() {
         let root = test_root("doctor_read_only");
         let source_root = root.join("roms");
@@ -11669,6 +14633,279 @@ mod tests {
     }
 
     #[test]
+    fn mount_root_update_preserves_unrelated_config_text_and_fields() {
+        let root = test_root("mount_root_update_preserves_config");
+        let config_path = root.join("config.toml");
+        let old_mount_root = root.join("old-mounts");
+        let new_mount_root = root.join("new-mounts");
+        fs::create_dir_all(&old_mount_root).unwrap();
+        fs::create_dir_all(&new_mount_root).unwrap();
+        let original = format!(
+            "# keep this comment\nsource_folders = []\nmount_root = {} # keep this note\nratarmount_bin = \"custom-ratarmount\"\nfuture_setting = \"preserve me\"\n",
+            quote_config_string(&old_mount_root.display().to_string())
+        );
+        fs::write(&config_path, &original).unwrap();
+
+        set_mount_root_to(&config_path, &new_mount_root).unwrap();
+
+        let updated = fs::read_to_string(&config_path).unwrap();
+        assert!(updated.contains("# keep this comment"));
+        assert!(updated.contains("ratarmount_bin = \"custom-ratarmount\""));
+        assert!(updated.contains("future_setting = \"preserve me\""));
+        assert!(updated.contains("# keep this note"));
+        assert_eq!(
+            Config::load_from(&config_path).unwrap().mount_root,
+            new_mount_root
+        );
+    }
+
+    #[test]
+    fn mount_root_update_fails_closed_on_malformed_config() {
+        let root = test_root("mount_root_update_malformed_config");
+        let config_path = root.join("config.toml");
+        let selected = root.join("mounts");
+        fs::create_dir_all(&selected).unwrap();
+        let original = "source_folders = [\nmount_root = \"/old\"\n";
+        fs::write(&config_path, original).unwrap();
+
+        let error = set_mount_root_to(&config_path, &selected).unwrap_err();
+
+        assert!(error.to_string().contains("never closed"));
+        assert_eq!(fs::read_to_string(&config_path).unwrap(), original);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn mount_root_update_never_overwrites_a_symlinked_config_path() {
+        let root = test_root("mount_root_update_symlink_config");
+        let target = root.join("real-config.toml");
+        let config_path = root.join("config.toml");
+        let selected = root.join("mounts");
+        fs::create_dir_all(&selected).unwrap();
+        let original = "source_folders = []\nmount_root = \"/old\"\n";
+        fs::write(&target, original).unwrap();
+        std::os::unix::fs::symlink(&target, &config_path).unwrap();
+
+        let error = set_mount_root_to(&config_path, &selected).unwrap_err();
+
+        assert!(error.to_string().contains("symlinked config path"));
+        assert_eq!(fs::read_to_string(&target).unwrap(), original);
+        assert!(
+            fs::symlink_metadata(&config_path)
+                .unwrap()
+                .file_type()
+                .is_symlink()
+        );
+    }
+
+    #[test]
+    fn mount_root_update_rejects_missing_or_non_directory_selection() {
+        let root = test_root("mount_root_update_invalid_selection");
+        let config_path = root.join("config.toml");
+        let selected_file = root.join("not-a-folder");
+        let original = "source_folders = []\nmount_root = \"/old\"\n";
+        fs::write(&config_path, original).unwrap();
+        fs::write(&selected_file, b"file").unwrap();
+
+        let error = set_mount_root_to(&config_path, &selected_file).unwrap_err();
+
+        assert!(error.to_string().contains("not a directory"));
+        assert_eq!(fs::read_to_string(&config_path).unwrap(), original);
+    }
+
+    #[test]
+    fn archive_snapshot_consumes_the_updated_mount_root() {
+        let root = test_root("mount_root_update_snapshot");
+        let config_path = root.join("config.toml");
+        let selected = root.join("mounts");
+        fs::create_dir_all(&selected).unwrap();
+        fs::write(
+            &config_path,
+            "source_folders = []\nmount_root = \"/old\"\nratarmount_bin = \"ratarmount\"\n",
+        )
+        .unwrap();
+
+        set_mount_root_to(&config_path, &selected).unwrap();
+
+        assert_eq!(
+            load_read_only_snapshot(&config_path).unwrap().mount_root,
+            selected
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn set_mount_root_rejects_a_symlinked_target_folder() {
+        let root = test_root("mount_root_update_symlink_target");
+        let config_path = root.join("config.toml");
+        let original = "source_folders = []\nmount_root = \"/old\"\n";
+        fs::write(&config_path, original).unwrap();
+
+        let real = root.join("real-target");
+        fs::create_dir_all(&real).unwrap();
+        let link = root.join("linked-target");
+        std::os::unix::fs::symlink(&real, &link).unwrap();
+
+        let error = set_mount_root_to(&config_path, &link).unwrap_err();
+        assert!(error.to_string().contains("symlink"));
+        assert_eq!(fs::read_to_string(&config_path).unwrap(), original);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn set_mount_root_rejects_an_unwritable_directory() {
+        use std::os::unix::fs::PermissionsExt;
+        let root = test_root("mount_root_update_unwritable_target");
+        let config_path = root.join("config.toml");
+        let original = "source_folders = []\nmount_root = \"/old\"\n";
+        fs::write(&config_path, original).unwrap();
+
+        let readonly = root.join("readonly-target");
+        fs::create_dir_all(&readonly).unwrap();
+        fs::set_permissions(&readonly, fs::Permissions::from_mode(0o555)).unwrap();
+
+        let result = set_mount_root_to(&config_path, &readonly);
+        // Restore before asserting so temp-dir cleanup always succeeds.
+        fs::set_permissions(&readonly, fs::Permissions::from_mode(0o755)).unwrap();
+
+        let error = result.unwrap_err();
+        assert!(error.to_string().contains("not writable"));
+        assert_eq!(fs::read_to_string(&config_path).unwrap(), original);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn set_mount_root_rejects_a_parent_symlinked_or_dotdot_target() {
+        let root = test_root("mount_root_update_unsafe_target");
+        let config_path = root.join("config.toml");
+        let original = "source_folders = []\nmount_root = \"/old\"\n";
+        fs::write(&config_path, original).unwrap();
+
+        // A `..` component is rejected even though the OS-resolved directory
+        // is a real, writable directory that the direct checks accept.
+        fs::create_dir_all(root.join("sub")).unwrap();
+        fs::create_dir_all(root.join("mounts")).unwrap();
+        let dotdot_target = root.join("sub").join("..").join("mounts");
+        let error = set_mount_root_to(&config_path, &dotdot_target).unwrap_err();
+        assert!(error.to_string().contains("not a safe location"));
+        assert_eq!(fs::read_to_string(&config_path).unwrap(), original);
+
+        // A real directory reached through a symlinked parent is rejected.
+        let real_parent = root.join("real-parent");
+        fs::create_dir_all(real_parent.join("target")).unwrap();
+        let linked_parent = root.join("linked-parent");
+        std::os::unix::fs::symlink(&real_parent, &linked_parent).unwrap();
+        let via_parent_symlink = linked_parent.join("target");
+        let error = set_mount_root_to(&config_path, &via_parent_symlink).unwrap_err();
+        assert!(error.to_string().contains("not a safe location"));
+        assert_eq!(fs::read_to_string(&config_path).unwrap(), original);
+    }
+
+    #[test]
+    fn first_run_add_games_bootstrap_semantics_are_unaffected_by_mount_root_support() {
+        let root = test_root("mount_root_update_first_run_untouched");
+        let config_path = root.join("config.toml");
+        assert!(!config_path.exists(), "precondition: no config file yet");
+
+        // The mount-root setter never bootstraps a missing config.
+        let selected = root.join("mounts");
+        fs::create_dir_all(&selected).unwrap();
+        assert!(set_mount_root_to(&config_path, &selected).is_err());
+        assert!(
+            !config_path.exists(),
+            "set_mount_root must not create a starter config"
+        );
+
+        // First-run Add Games still bootstraps + registers exactly as before.
+        let games = root.join("games");
+        fs::create_dir_all(&games).unwrap();
+        let database_path = root.join("library.sqlite3");
+        let added = add_source_folder_at(&config_path, &database_path, &games).unwrap();
+        assert_eq!(added.path, games);
+        assert!(config_path.exists());
+    }
+
+    #[test]
+    fn a_malformed_config_is_rejected_before_the_selected_directory_is_touched() {
+        let root = test_root("mount_root_update_config_before_probe");
+        let config_path = root.join("config.toml");
+        // Malformed (unterminated array) *and* a selection that does not
+        // exist. Config validation runs first, so the error is about the
+        // config, never about the (never-probed) selected directory.
+        fs::write(&config_path, "source_folders = [\nmount_root = \"/old\"\n").unwrap();
+        let missing_selection = root.join("never-created");
+
+        let error = set_mount_root_to(&config_path, &missing_selection).unwrap_err();
+        let text = error.to_string();
+        assert!(
+            !text.contains("never-created"),
+            "config validation must fail before the selected directory is looked at: {text}"
+        );
+        assert_eq!(
+            fs::read_to_string(&config_path).unwrap(),
+            "source_folders = [\nmount_root = \"/old\"\n"
+        );
+    }
+
+    #[test]
+    fn a_newline_containing_selected_path_never_publishes_a_malformed_config() {
+        let root = test_root("mount_root_update_newline_path");
+        let config_path = root.join("config.toml");
+        let original =
+            "source_folders = []\nmount_root = \"/old\"\nratarmount_bin = \"ratarmount\"\n";
+        fs::write(&config_path, original).unwrap();
+
+        // A real directory whose name embeds a newline plus injected TOML.
+        let evil = root.join("evil\nratarmount_bin = \"pwned\"");
+        fs::create_dir_all(&evil).unwrap();
+
+        let error = set_mount_root_to(&config_path, &evil).unwrap_err();
+        assert!(
+            error.to_string().contains("was not written"),
+            "proposed config must be verified before publication: {error}"
+        );
+        // The on-disk config is byte-for-byte the untouched original, and
+        // still parses to the old mount root.
+        assert_eq!(fs::read_to_string(&config_path).unwrap(), original);
+        assert_eq!(
+            Config::load_from(&config_path).unwrap().mount_root,
+            PathBuf::from("/old")
+        );
+    }
+
+    #[test]
+    fn set_mount_root_preserves_exact_crlf_and_inline_comment_spacing() {
+        let root = test_root("mount_root_update_spacing");
+        let config_path = root.join("config.toml");
+        let new_mount_root = root.join("new mounts");
+        fs::create_dir_all(&new_mount_root).unwrap();
+
+        // CRLF throughout; odd spacing around the assignment; two spaces
+        // before an inline comment; unrelated lines that must be byte-exact.
+        let original = "# top comment\r\n\
+                        source_folders = []\r\n\
+                        mount_root   =   \"/old\"  # chosen before\r\n\
+                        ratarmount_bin = \"custom\"\r\n";
+        fs::write(&config_path, original).unwrap();
+
+        set_mount_root_to(&config_path, &new_mount_root).unwrap();
+
+        let updated = fs::read_to_string(&config_path).unwrap();
+        let quoted = quote_config_string(&new_mount_root.display().to_string());
+        let expected = format!(
+            "# top comment\r\n\
+             source_folders = []\r\n\
+             mount_root   =   {quoted}  # chosen before\r\n\
+             ratarmount_bin = \"custom\"\r\n"
+        );
+        assert_eq!(updated, expected);
+        assert_eq!(
+            Config::load_from(&config_path).unwrap().mount_root,
+            new_mount_root
+        );
+    }
+
+    #[test]
     fn a_relative_or_root_master_rom_root_is_rejected() {
         let root = test_root("master_rom_root_reject");
         let config_path = root.join("config.toml");
@@ -11880,27 +15117,27 @@ mod tests {
     }
 
     #[test]
-    fn validate_new_source_folder_rejects_a_child_of_an_existing_source() {
+    fn validate_new_source_folder_accepts_a_child_of_an_existing_source() {
         let root = test_root("validate_overlap_child");
         let parent = root.join("archives");
         let child = parent.join("nested");
         fs::create_dir_all(&child).unwrap();
 
-        let error = validate_new_source_folder(&child, &[parent]).unwrap_err();
+        let validated = validate_new_source_folder(&child, &[parent]).unwrap();
 
-        assert!(error.to_string().contains("overlapping"));
+        assert_eq!(validated, child);
     }
 
     #[test]
-    fn validate_new_source_folder_rejects_a_parent_of_an_existing_source() {
+    fn validate_new_source_folder_accepts_a_parent_of_an_existing_source() {
         let root = test_root("validate_overlap_parent");
         let parent = root.join("archives");
         let child = parent.join("nested");
         fs::create_dir_all(&child).unwrap();
 
-        let error = validate_new_source_folder(&parent, &[child]).unwrap_err();
+        let validated = validate_new_source_folder(&parent, &[child]).unwrap();
 
-        assert!(error.to_string().contains("overlapping"));
+        assert_eq!(validated, parent);
     }
 
     #[test]
@@ -11996,7 +15233,146 @@ mod tests {
     }
 
     #[test]
-    fn add_source_folder_rejects_an_overlap_through_the_orchestration_layer() {
+    fn explicit_source_add_bootstraps_a_genuinely_missing_config_and_registers_source() {
+        let root = test_root("add_source_folder_first_run_bootstrap");
+        let config_path = root.join("config/config.toml");
+        let database_path = root.join("data/library.sqlite3");
+        let games = root.join("games");
+        fs::create_dir_all(&games).unwrap();
+
+        assert!(!config_path.exists());
+        let added = add_source_folder_at(&config_path, &database_path, &games).unwrap();
+
+        assert_eq!(added.path, games);
+        assert!(config_path.is_file());
+        let config = Config::load_from(&config_path).unwrap();
+        assert_eq!(config.source_folders, vec![games.clone()]);
+        assert_eq!(
+            config.mount_root,
+            PathBuf::from("/path/to/archivefs-mounts")
+        );
+        assert_eq!(config.ratarmount_bin, "ratarmount");
+
+        let views = list_source_folder_views_at(&config_path, &database_path).unwrap();
+        assert_eq!(views.len(), 1);
+        assert_eq!(views[0].path, games);
+        assert!(views[0].id.is_some());
+        assert_eq!(
+            views[0].last_archive_count, None,
+            "core source registration must not replace Gamer View's queued first scan"
+        );
+    }
+
+    #[test]
+    fn explicit_source_add_preserves_existing_config_fields_without_starter_reset() {
+        let root = test_root("add_source_folder_existing_config");
+        let config_path = root.join("config.toml");
+        let database_path = root.join("library.sqlite3");
+        let mount_root = root.join("custom-mounts");
+        let master_rom_root = root.join("custom-master-library");
+        let ratarmount = root.join("bin/custom-ratarmount");
+        let games = root.join("games");
+        fs::create_dir_all(&games).unwrap();
+        fs::write(
+            &config_path,
+            format!(
+                "# existing user configuration\nsource_folders = []\nmount_root = \"{}\"\nratarmount_bin = \"{}\"\nmaster_rom_root = \"{}\"\n",
+                mount_root.display(),
+                ratarmount.display(),
+                master_rom_root.display()
+            ),
+        )
+        .unwrap();
+
+        add_source_folder_at(&config_path, &database_path, &games).unwrap();
+
+        let contents = fs::read_to_string(&config_path).unwrap();
+        assert!(!contents.contains("EmuWiz starter configuration"));
+        let config = Config::load_from(&config_path).unwrap();
+        assert_eq!(config.mount_root, mount_root);
+        assert_eq!(config.ratarmount_bin, ratarmount.to_string_lossy());
+        assert_eq!(config.master_rom_root, Some(master_rom_root));
+        assert_eq!(config.source_folders, vec![games]);
+    }
+
+    #[test]
+    fn explicit_source_add_never_replaces_an_existing_malformed_config() {
+        let root = test_root("add_source_folder_existing_malformed_config");
+        let config_path = root.join("config.toml");
+        let database_path = root.join("library.sqlite3");
+        let games = root.join("games");
+        fs::create_dir_all(&games).unwrap();
+        let existing = b"this is the user's existing malformed config [[[\n";
+        fs::write(&config_path, existing).unwrap();
+
+        let error = add_source_folder_at(&config_path, &database_path, &games).unwrap_err();
+
+        assert!(error.to_string().contains("config error"));
+        assert_eq!(fs::read(&config_path).unwrap(), existing);
+        assert!(!database_path.exists(), "source must not be registered");
+    }
+
+    #[test]
+    fn starter_config_creation_failure_registers_nothing() {
+        let root = test_root("add_source_folder_starter_failure");
+        let database_path = root.join("library.sqlite3");
+        let games = root.join("games");
+        fs::create_dir_all(&games).unwrap();
+
+        let error = add_source_folder_at(Path::new(""), &database_path, &games).unwrap_err();
+
+        assert!(error.to_string().contains("config path has no parent"));
+        assert!(!database_path.exists(), "source must not be registered");
+    }
+
+    #[test]
+    fn first_run_bootstrap_preserves_invalid_folder_validation() {
+        let root = test_root("add_source_folder_first_run_invalid");
+        let config_path = root.join("config.toml");
+        let database_path = root.join("library.sqlite3");
+        let missing = root.join("missing-games");
+
+        let error = add_source_folder_at(&config_path, &database_path, &missing).unwrap_err();
+
+        assert!(error.to_string().contains("does not exist"));
+        assert!(config_path.is_file(), "the safe starter creation completed");
+        assert!(
+            !database_path.exists(),
+            "an invalid source must not be registered"
+        );
+        assert!(
+            Config::load_from(&config_path)
+                .unwrap()
+                .source_folders
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn duplicate_source_semantics_are_unchanged_after_bootstrap() {
+        let root = test_root("add_source_folder_first_run_duplicate");
+        let config_path = root.join("config.toml");
+        let database_path = root.join("library.sqlite3");
+        let games = root.join("games");
+        fs::create_dir_all(&games).unwrap();
+
+        add_source_folder_at(&config_path, &database_path, &games).unwrap();
+        let before = fs::read_to_string(&config_path).unwrap();
+        let error = add_source_folder_at(&config_path, &database_path, &games).unwrap_err();
+
+        assert!(
+            error
+                .to_string()
+                .contains("already a configured source folder")
+        );
+        assert_eq!(fs::read_to_string(&config_path).unwrap(), before);
+        let views = list_source_folder_views_at(&config_path, &database_path).unwrap();
+        assert_eq!(views.len(), 1);
+        assert_eq!(views[0].path, games);
+    }
+
+    #[test]
+    fn add_source_folder_accepts_a_nested_source_through_the_orchestration_layer() {
         let root = test_root("add_source_folder_overlap");
         let config_path = root.join("config.toml");
         let database_path = root.join("library.sqlite3");
@@ -12007,11 +15383,11 @@ mod tests {
         fs::create_dir_all(&child).unwrap();
 
         add_source_folder_at(&config_path, &database_path, &parent).unwrap();
-        let error = add_source_folder_at(&config_path, &database_path, &child).unwrap_err();
-
-        assert!(error.to_string().contains("overlapping"));
+        add_source_folder_at(&config_path, &database_path, &child).unwrap();
         let views = list_source_folder_views_at(&config_path, &database_path).unwrap();
-        assert_eq!(views.len(), 1, "a rejected add must not partially persist");
+        assert_eq!(views.len(), 2);
+        assert!(views.iter().any(|view| view.path == parent));
+        assert!(views.iter().any(|view| view.path == child));
     }
 
     #[test]
@@ -12056,6 +15432,56 @@ mod tests {
             disabled_view.last_archive_count,
             Some(1),
             "disabling must preserve the last known archive count, not reset it"
+        );
+    }
+
+    #[test]
+    fn disabling_through_the_api_removes_missing_authority_until_a_fresh_scan() {
+        let root = test_root("disable_source_missing_authority");
+        let config_path = root.join("config.toml");
+        let database_path = root.join("library.sqlite3");
+        write_starter_config(&config_path, &root.join("mounts"));
+        let source = root.join("source-a");
+        fs::create_dir_all(&source).unwrap();
+        fs::write(source.join("a.zip"), b"a").unwrap();
+        fs::write(source.join("b.zip"), b"b").unwrap();
+        add_source_folder_at(&config_path, &database_path, &source).unwrap();
+        scan_all_enabled_sources_at(&config_path, &database_path, "test").unwrap();
+        let enabled_flag = || -> Option<i64> {
+            rusqlite::Connection::open(&database_path)
+                .unwrap()
+                .query_row("SELECT enabled FROM source_enablement", [], |r| r.get(0))
+                .ok()
+        };
+        let missing_rows = || -> i64 {
+            rusqlite::Connection::open(&database_path)
+                .unwrap()
+                .query_row(
+                    "SELECT count(*) FROM archives WHERE last_verified_missing_at IS NOT NULL",
+                    [],
+                    |r| r.get(0),
+                )
+                .unwrap()
+        };
+
+        set_source_folder_enabled_at(&config_path, &database_path, &source, false).unwrap();
+        assert_eq!(enabled_flag(), Some(0));
+        fs::remove_file(source.join("a.zip")).unwrap();
+        // An explicit scan of a disabled source must never write Missing.
+        let _ = scan_source_folder_at(&config_path, &database_path, &source, "test");
+        assert_eq!(
+            missing_rows(),
+            0,
+            "a disabled source must not gain Missing evidence"
+        );
+
+        // Re-enabling scans straight away, which is the fresh authority.
+        set_source_folder_enabled_at(&config_path, &database_path, &source, true).unwrap();
+        assert_eq!(enabled_flag(), Some(1));
+        assert_eq!(
+            missing_rows(),
+            1,
+            "the fresh scan after re-enable reconciles the deletion"
         );
     }
 
@@ -12199,6 +15625,7 @@ mod tests {
     ) -> SourceFolderView {
         SourceFolderView {
             path: PathBuf::from(path),
+            role: Default::default(),
             enabled: !matches!(availability, SourceAvailability::Disabled),
             created_at: None,
             id: Some(1),
@@ -12265,6 +15692,7 @@ mod tests {
         let records = vec![SourceFolderRecord {
             id: 7,
             path: PathBuf::from("/data/archives"),
+            role: Default::default(),
             first_seen_at: "2026-01-01T00:00:00Z".to_string(),
             last_scan_status: None,
             last_scan_error: None,
@@ -12379,6 +15807,10 @@ mod tests {
         let report = run_setup_diagnostics_with_command_check(&config_path, |_| true);
 
         assert!(report.config_missing);
+        assert!(
+            !config_path.exists(),
+            "launch/read-only diagnostics must never create the starter config"
+        );
         assert!(!report.ready_for_scanning);
         assert!(!report.ready_for_actions);
         assert!(
@@ -13378,3 +16810,6 @@ mod tests {
         }
     }
 }
+
+/// Read-only optical/floppy/tape release and media topology planning.
+pub mod media_set;

@@ -1,0 +1,2251 @@
+//! Native EmuWiz GUI v2 presentation layer.
+mod activity;
+mod all_tools;
+mod amiga_game;
+mod arcade_input_details;
+mod archive_inspector;
+mod artwork;
+mod backend;
+mod bezel;
+mod bezel_history;
+mod browse_play;
+mod cheat_extras_page;
+pub(crate) mod classic_trainers;
+#[cfg(test)]
+mod dat_exact_tests;
+mod database_status_page;
+mod documents;
+mod dreamcast_ipbin;
+mod duplicate_undo;
+#[cfg(target_os = "linux")]
+mod electron_preview;
+mod environment;
+mod equivalent_duplicates;
+mod game_detail_blue;
+mod game_documents;
+mod game_verification_guidance;
+#[cfg(test)]
+mod glyph_coverage_tests;
+mod guidance;
+mod hackhash;
+mod hdf_contents;
+mod history_discovery_import;
+mod history_duckstation;
+mod history_view;
+mod home_blue;
+mod identity_review;
+mod identity_review_page;
+mod imagery;
+mod job_card;
+pub(crate) mod launch_readiness_summary;
+mod legacy;
+pub(crate) mod library;
+mod library_failure;
+mod library_reconciliation;
+mod library_views_page;
+mod local_artwork_folders;
+mod mame_collection_health;
+mod mame_reconstruction;
+mod manual_viewer;
+mod media_sets;
+mod media_sets_tool;
+mod media_sources;
+mod missing_review;
+mod mods;
+mod mounts_page;
+mod native_workflows;
+mod needs_attention_page;
+mod nkit;
+mod onboarding;
+mod organisation;
+mod pages;
+mod platform_aliases_page;
+mod problem_actions;
+mod problems;
+mod psp_iso_analyser;
+mod quarantine_confirm;
+mod r2_rename;
+#[cfg(test)]
+mod retroarch_journey_tests;
+mod romm_library;
+mod routes;
+mod saturn_manifest;
+mod save_snapshots;
+mod save_state_guidance;
+mod saves_states;
+#[cfg(test)]
+mod scummvm_journey_tests;
+mod setup_portability;
+#[cfg(test)]
+#[path = "tests/shared_scroll.rs"]
+mod shared_scroll_tests;
+mod simple_shell;
+mod sources_providers;
+#[cfg(test)]
+mod stale_inspection_tests;
+mod storage_review;
+#[cfg(test)]
+mod tape_tests;
+#[cfg(test)]
+mod tests;
+mod text_guide_viewer;
+mod thumbnail;
+mod title_fit;
+mod tool_pages;
+mod tosec_inventory;
+mod update_check;
+#[cfg(test)]
+pub(crate) mod verified_game_fixture;
+#[cfg(test)]
+mod verified_game_fixture_tests;
+#[cfg(test)]
+mod verify_journey_tests;
+mod view_history_page;
+mod visual_pages;
+mod wiiu_disc;
+
+use crate::optical_conversion_page::OpticalConversionPageState;
+use crate::playing_library_page::{PlayingLibraryPageAction, PlayingLibraryPageState};
+use activity::Activity;
+
+pub(super) const DUPLICATE_SCAN_TITLE: &str = "Finding exact duplicate files";
+use artwork::Artwork;
+use backend::{
+    Backend, Command, DuplicateRepairPreview, DuplicateRepairRecord, Event, Payload, Preferences,
+    VerificationResult,
+};
+use eframe::egui;
+use library::{Detail, DuplicateReport, Filter, Library, SharedLibrary};
+use mods::ModsPageState;
+use routes::{Route, Router, Section, migrate_route};
+use std::{
+    sync::Arc,
+    time::{Duration, Instant},
+};
+
+/// Stable release identity used by packaging and `--version` verification.
+pub const GUI_GENERATION: &str = "native-v2";
+
+/// Run the native EmuWiz GUI v2 application.
+pub fn run() -> eframe::Result<()> {
+    // The libretro core probe child must be recognised before anything else:
+    // no thread, file or registration may exist before it sandboxes itself.
+    #[cfg(target_os = "linux")]
+    archivefs_core::launch::libretro_probe::dispatch_if_probe_child();
+    // `--version` needs no Undo or writer state: it registers only in the
+    // per-user runtime registry (never the data directory, no seal store),
+    // and without one it runs unregistered.
+    if std::env::args_os().any(|arg| arg == "--version") {
+        let _reader =
+            archivefs_core::dat::rename_apply::writer_gate::register_reader_at_startup().ok();
+        println!(
+            "{} · GUI v2 ({})",
+            crate::gui_version_line(),
+            GUI_GENERATION
+        );
+        return Ok(());
+    }
+    // Registered before anything else, helpers included, so other
+    // sealing-capable instances never mistake this one for an older build.
+    let _sealed_writer = archivefs_core::dat::rename_apply::writer_gate::register_at_startup()
+        .map_err(|error| eprintln!("EmuWiz: {error}"))
+        .ok();
+    if std::env::args_os()
+        .nth(1)
+        .is_some_and(|arg| arg == archivefs_core::manual_document::pdf_render::HELPER_ARGUMENT)
+    {
+        std::process::exit(
+            if archivefs_core::manual_document::pdf_render::run_helper().is_ok() {
+                0
+            } else {
+                1
+            },
+        );
+    }
+    crate::init_logging();
+    let args: Vec<_> = std::env::args_os().collect();
+    if args.iter().any(|arg| arg == "--measure-library") {
+        match archivefs_core::default_database_path()
+            .map_err(|error| error.to_string())
+            .and_then(|path| backend::load_library(&path))
+        {
+            Ok(library) => {
+                println!(
+                    "GUI v2 read-only load: {} games, {} platforms, {} ms",
+                    library.games.len(),
+                    library.platforms.len(),
+                    library.load_ms
+                );
+                let index = media_sources::MediaIndex::discover(&library);
+                println!(
+                    "GUI v2 read-only artwork index: {} covers, {} screenshot groups, {} ms; no artwork network requests",
+                    index.covers.len(),
+                    index.screenshots.len(),
+                    index.elapsed_ms
+                );
+            }
+            Err(error) => eprintln!("Library measurement failed: {error}"),
+        }
+        return Ok(());
+    }
+    if args.iter().any(|arg| arg == "--diagnose-artwork") {
+        match archivefs_core::default_database_path()
+            .map_err(|error| error.to_string())
+            .and_then(|path| backend::load_library(&path))
+        {
+            Ok(library) => {
+                let index = media_sources::MediaIndex::discover_with_stats(&library);
+                println!("{}", index.diagnostic_report(&library));
+            }
+            Err(error) => eprintln!("Artwork diagnosis failed: {error}"),
+        }
+        return Ok(());
+    }
+    let handoff = args.iter().position(|arg| arg == "--legacy").map(|index| {
+        let section = args
+            .get(index + 1)
+            .and_then(|arg| serde_json::from_str(&arg.to_string_lossy()).ok())
+            .unwrap_or(Section::Advanced);
+        (section, args.get(index + 2).map(std::path::PathBuf::from))
+    });
+    let mut viewport = egui::ViewportBuilder::default()
+        .with_inner_size([1280.0, 820.0])
+        .with_min_inner_size([620.0, 480.0])
+        .with_app_id("org.emuwiz.gui-v2");
+    if let Some(icon) = crate::app_icon() {
+        viewport = viewport.with_icon(icon);
+    }
+    eframe::run_native(
+        if handoff.is_some() {
+            "EmuWiz — Legacy / Advanced interface"
+        } else {
+            "EmuWiz — GUI v2"
+        },
+        eframe::NativeOptions {
+            viewport,
+            ..Default::default()
+        },
+        Box::new(move |context| {
+            if let Some((section, path)) = handoff {
+                Ok(Box::new(legacy::LegacyHost::new(
+                    context.egui_ctx.clone(),
+                    section,
+                    path,
+                )))
+            } else {
+                let mut app = App::new(context.egui_ctx.clone());
+                app.setup_portability.set_dialog_parent(context);
+                Ok(Box::new(app))
+            }
+        }),
+    )
+}
+
+pub(super) fn readable_style(context: &egui::Context) {
+    // Start from the one application palette so embedded legacy workflow
+    // widgets and native-v2 pages share surfaces, borders, selection and
+    // semantic status colors. Only typography and spacing are enlarged here.
+    crate::ui::theme::apply(context);
+    let mut style = (*context.style()).clone();
+    style
+        .text_styles
+        .insert(egui::TextStyle::Body, egui::FontId::proportional(18.0));
+    style
+        .text_styles
+        .insert(egui::TextStyle::Button, egui::FontId::proportional(18.0));
+    style
+        .text_styles
+        .insert(egui::TextStyle::Heading, egui::FontId::proportional(27.0));
+    style
+        .text_styles
+        .insert(egui::TextStyle::Small, egui::FontId::proportional(16.0));
+    style.spacing.item_spacing = egui::vec2(12.0, 10.0);
+    style.spacing.button_padding = egui::vec2(14.0, 9.0);
+    style.spacing.interact_size.y = 40.0;
+    style.visuals.override_text_color = Some(crate::ui::theme::PRIMARY_TEXT);
+    style.visuals.selection.bg_fill = crate::ui::theme::PRIMARY_ACTION;
+    style.visuals.widgets.active.bg_stroke = egui::Stroke::new(2.0_f32, egui::Color32::WHITE);
+    context.set_style(style);
+}
+
+struct Notice {
+    message: String,
+    technical: String,
+}
+
+fn notice_for_background_error(title: Option<&str>, error: &str) -> Option<Notice> {
+    let title = title?;
+    Some(Notice {
+        message: format!(
+            "{title} could not finish. You can keep browsing the last loaded games. Retry it from this page; your game files were not changed."
+        ),
+        technical: error.to_string(),
+    })
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum PlayingLibraryJobKind {
+    Preview,
+    Apply,
+    PreviewRomm,
+    ApplyRomm,
+    PreviewRetroDeck,
+    ApplyRetroDeck,
+    PreviewEsde,
+    PublishEsde,
+    RecoverEsde,
+    Rollback,
+    RollbackRomm,
+    RollbackRetroDeck,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum CanonicalOrganisationJobKind {
+    Preview,
+    Apply,
+    Rollback,
+}
+
+#[derive(Clone, Debug)]
+struct PlayingLibraryJob {
+    id: u64,
+    kind: PlayingLibraryJobKind,
+    generation: u64,
+    input_fingerprint: String,
+}
+
+#[derive(Clone, Debug)]
+struct CanonicalOrganisationJob {
+    id: u64,
+    kind: CanonicalOrganisationJobKind,
+    generation: u64,
+    input_fingerprint: String,
+}
+
+pub(super) struct App {
+    router: Router,
+    backend: Backend,
+    library: SharedLibrary,
+    indices: Vec<usize>,
+    filter: Filter,
+    filter_generation: u64,
+    filter_inflight: bool,
+    filter_dirty: Option<Instant>,
+    detail: Option<Detail>,
+    detail_pending: Option<i64>,
+    detail_generation: u64,
+    detail_failed: Option<i64>,
+    activity: Activity,
+    artwork: Artwork,
+    imagery: imagery::Imagery,
+    load_job: Option<u64>,
+    artwork_job: Option<u64>,
+    index_job: Option<u64>,
+    /// How many shelf cards Browse & Play draws, and the scope it was chosen for.
+    browse_play: browse_play::BrowsePlayState,
+    preferences_dirty: Option<Instant>,
+    interacted: bool,
+    loaded: bool,
+    /// Why the library could not load; `None` once a load succeeds.
+    library_failure: Option<library_failure::LibraryLoadFailure>,
+    /// The current game a navigation was redirected to because the requested
+    /// catalogue entry is from an older library location.
+    moved_game: Option<i64>,
+    review: identity_review_page::ReviewUi,
+    notice: Option<Notice>,
+    /// Non-alarming confirmation that a separate window was opened; cleared on
+    /// navigation or dismissal.
+    handoff_status: Option<String>,
+    confirm_scan: bool,
+    /// egui drops focus on Escape before `show` runs, so remember last frame's.
+    text_was_focused: bool,
+    screenshots: bool,
+    check_platform: Option<String>,
+    /// Activity is showing only the jobs that need attention.
+    activity_attention_only: bool,
+    verification: Option<VerificationResult>,
+    verification_job: Option<u64>,
+    duplicate_report: Option<DuplicateReport>,
+    duplicate_job: Option<u64>,
+    problem_summary: Option<Arc<problems::ProblemSummary>>,
+    problem_summary_job: Option<u64>,
+    duplicate_ignored: std::collections::HashSet<String>,
+    problem_selected: Option<String>,
+    problem_filter: problems::ProblemFilter,
+    problem_nav: problem_actions::ProblemNav,
+    problem_query: String,
+    repair_preview: Option<DuplicateRepairPreview>,
+    repair_confirm: bool,
+    repair_job: Option<u64>,
+    repair_history: Vec<DuplicateRepairRecord>,
+    undo_confirm: Option<usize>,
+    undo_job: Option<duplicate_undo::DuplicateUndoJob>,
+    undo_generation: u64,
+    repair_result: Option<String>,
+    playing_library: PlayingLibraryPageState,
+    playing_library_history: Vec<archivefs_core::dat::rename_apply::model::RenameTransaction>,
+    /// History records that are shown but never undone (legacy, unsealed,
+    /// changed or unreadable).
+    journal_evidence: Vec<archivefs_core::dat::rename_apply::seal::JournalEvidence>,
+    playing_library_job: Option<PlayingLibraryJob>,
+    playing_library_generation: u64,
+    organisation: organisation::OrganisationState,
+    arcade_input_details: arcade_input_details::State,
+    classic_trainers: classic_trainers::State,
+    canonical_organisation: crate::rom_organisation_page::RomOrganisationPageState,
+    canonical_organisation_job: Option<CanonicalOrganisationJob>,
+    history_view: history_view::HistoryViewState,
+    discovery_import_history: history_discovery_import::State,
+    duckstation_history: history_duckstation::State,
+    canonical_organisation_generation: u64,
+    canonical_organisation_history:
+        Vec<archivefs_core::dat::rename_apply::model::RenameTransaction>,
+    mods: ModsPageState,
+    native_workflows: Option<native_workflows::NativeWorkflows>,
+    environment: Option<environment::EnvironmentSnapshot>,
+    environment_job: Option<u64>,
+    /// Setup & Doctor's confirmed create actions and Copy summary.
+    setup_actions: onboarding::SetupActions,
+    welcome_dismissed: bool,
+    beginner_hints_enabled: bool,
+    doctor_platform: Option<String>,
+    guidance: guidance::GuidanceState,
+    saves_states: saves_states::SavesStatesState,
+    archive_inspector: archive_inspector::ArchiveInspectorPageState,
+    converter: OpticalConversionPageState,
+    bezel: bezel::BezelPanelState,
+    hackhash: hackhash::HackHashPageState,
+    romm_library: romm_library::RommBrowserState,
+    romm_library_job: Option<u64>,
+    manual_viewer: manual_viewer::ManualViewer,
+    text_guide_viewer: text_guide_viewer::TextGuideViewer,
+    document_preferences: documents::DocumentPreferences,
+    document_index: Option<std::sync::Arc<media_sources::MediaIndex>>,
+    document_issue: Option<String>,
+    document_cache: Option<(i64, std::path::PathBuf, Vec<documents::GameDocument>)>,
+    setup_portability: setup_portability::SetupPortabilityState,
+    update_check: update_check::UpdateCheckState,
+    missing: missing_review::MissingReviewState,
+    equiv: equivalent_duplicates::EquivalentState,
+    storage: storage_review::StorageState,
+    reconcile: library_reconciliation::ReconcileState,
+    multi: media_sets::MultiDiscState,
+    /// Simple v1 shell: presentation state only.
+    simple: simple_shell::ShellState,
+    /// Native pages of former legacy-only tools.
+    tools: tool_pages::ToolPagesState,
+}
+
+impl App {
+    fn new(context: egui::Context) -> Self {
+        readable_style(&context);
+        let backend = Backend::start(context.clone());
+        let mut app = Self {
+            router: Router::default(),
+            backend,
+            library: Arc::new(Library::default()),
+            indices: Vec::new(),
+            filter: Filter::default(),
+            filter_generation: 0,
+            filter_inflight: false,
+            filter_dirty: None,
+            detail: None,
+            detail_pending: None,
+            detail_generation: 0,
+            detail_failed: None,
+            activity: Activity::default(),
+            artwork: Artwork::start(context),
+            imagery: imagery::Imagery::default(),
+            load_job: None,
+            artwork_job: None,
+            index_job: None,
+            browse_play: Default::default(),
+            preferences_dirty: None,
+            interacted: false,
+            loaded: false,
+            library_failure: None,
+            moved_game: None,
+            review: Default::default(),
+            notice: None,
+            handoff_status: None,
+            confirm_scan: false,
+            text_was_focused: false,
+            screenshots: false,
+            check_platform: None,
+            activity_attention_only: false,
+            verification: None,
+            verification_job: None,
+            duplicate_report: None,
+            duplicate_job: None,
+            problem_summary: None,
+            problem_summary_job: None,
+            duplicate_ignored: std::collections::HashSet::new(),
+            problem_selected: None,
+            problem_filter: problems::ProblemFilter::default(),
+            problem_nav: Default::default(),
+            problem_query: String::new(),
+            repair_preview: None,
+            repair_confirm: false,
+            repair_job: None,
+            repair_history: Vec::new(),
+            undo_confirm: None,
+            undo_job: None,
+            undo_generation: 0,
+            repair_result: None,
+            playing_library: PlayingLibraryPageState::load(),
+            playing_library_history: Vec::new(),
+            journal_evidence: Vec::new(),
+            playing_library_job: None,
+            playing_library_generation: 0,
+            organisation: organisation::OrganisationState::default(),
+            arcade_input_details: arcade_input_details::State::default(),
+            classic_trainers: classic_trainers::State::default(),
+            canonical_organisation: crate::rom_organisation_page::RomOrganisationPageState::load(),
+            canonical_organisation_job: None,
+            history_view: Default::default(),
+            discovery_import_history: Default::default(),
+            duckstation_history: Default::default(),
+            canonical_organisation_generation: 0,
+            canonical_organisation_history: Vec::new(),
+            mods: ModsPageState::default(),
+            native_workflows: None,
+            environment: None,
+            environment_job: None,
+            setup_actions: Default::default(),
+            welcome_dismissed: false,
+            beginner_hints_enabled: true,
+            doctor_platform: None,
+            guidance: guidance::GuidanceState::default(),
+            saves_states: saves_states::SavesStatesState::default(),
+            archive_inspector: archive_inspector::ArchiveInspectorPageState::default(),
+            converter: OpticalConversionPageState::default(),
+            bezel: bezel::BezelPanelState::default(),
+            hackhash: hackhash::HackHashPageState::new(),
+            romm_library: romm_library::RommBrowserState::default(),
+            romm_library_job: None,
+            manual_viewer: manual_viewer::ManualViewer::default(),
+            text_guide_viewer: text_guide_viewer::TextGuideViewer::default(),
+            document_preferences: documents::DocumentPreferences::default(),
+            document_index: None,
+            document_issue: None,
+            document_cache: None,
+            setup_portability: setup_portability::SetupPortabilityState::default(),
+            update_check: update_check::UpdateCheckState::default(),
+            missing: Default::default(),
+            equiv: Default::default(),
+            storage: Default::default(),
+            reconcile: Default::default(),
+            multi: Default::default(),
+            simple: Default::default(),
+            tools: tool_pages::ToolPagesState::live(),
+        };
+        let environment_job = app.activity.queue(
+            "Checking EmuWiz setup",
+            Route::Section(Section::Setup),
+            false,
+        );
+        app.environment_job = Some(environment_job);
+        app.send(environment_job, Command::EnvironmentCheck);
+        app.send(0, Command::Restore);
+        app.send(0, Command::LoadRepairHistory);
+        app.load(false);
+        app
+    }
+    fn send(&mut self, id: u64, command: Command) -> bool {
+        if let Err(error) = self.backend.send(id, command) {
+            self.activity.finish(
+                id,
+                "This action could not start. Reopen GUI v2 to retry.".into(),
+                Some(error.clone()),
+            );
+            self.notice = Some(Notice {
+                message: error,
+                technical: String::new(),
+            });
+            false
+        } else {
+            true
+        }
+    }
+
+    fn romm_library_load_needed(&self) -> bool {
+        self.router.current.section() == Section::Romm
+            && self.romm_library.snapshot.is_none()
+            && self.romm_library_job.is_none()
+    }
+
+    fn settle_romm_library_load(
+        &mut self,
+        id: u64,
+        result: Result<romm_library::RommBrowserSnapshot, String>,
+    ) -> bool {
+        if self.romm_library_job != Some(id) {
+            return false;
+        }
+        self.romm_library_job = None;
+        self.romm_library.loading = false;
+        self.romm_library.snapshot = Some(match result {
+            Ok(snapshot) => snapshot,
+            Err(error) => romm_library::RommBrowserSnapshot::unavailable(error),
+        });
+        true
+    }
+
+    fn start_romm_library_operation(&mut self, operation: romm_library::RommLibraryOperation) {
+        if self.romm_library.operation.is_some() {
+            return;
+        }
+        let (romm_operation, label) = match operation {
+            romm_library::RommLibraryOperation::Refresh => (
+                crate::romm_source::RommOperation::Refresh,
+                "Refreshing RomM data",
+            ),
+            romm_library::RommLibraryOperation::PreviewImport => (
+                crate::romm_source::RommOperation::SampleImport {
+                    records: crate::romm_source::SAMPLE_IMPORT_RECORDS,
+                },
+                "Previewing RomM import",
+            ),
+        };
+        let id = self
+            .activity
+            .queue(label, Route::Section(Section::Romm), false);
+        self.romm_library.operation = Some((id, operation));
+        self.romm_library.operation_error = None;
+        if matches!(operation, romm_library::RommLibraryOperation::Refresh) {
+            self.romm_library.refresh_baseline = self
+                .romm_library
+                .snapshot
+                .as_ref()
+                .and_then(|snapshot| snapshot.cache.clone());
+        }
+        if !self.send(
+            id,
+            Command::RommOperation {
+                operation: Box::new(romm_operation),
+            },
+        ) {
+            self.romm_library.operation = None;
+        }
+    }
+
+    fn handle_romm_library_operation(
+        &mut self,
+        operation: crate::romm_source::RommOperation,
+        outcome: crate::romm_source::RommOperationOutcome,
+        snapshot: Option<romm_library::RommBrowserSnapshot>,
+    ) {
+        let Some((job_id, kind)) = self.romm_library.operation.take() else {
+            return;
+        };
+        match (kind, operation, outcome) {
+            (
+                romm_library::RommLibraryOperation::Refresh,
+                crate::romm_source::RommOperation::Refresh,
+                crate::romm_source::RommOperationOutcome::Import(summary),
+            ) => {
+                self.romm_library.last_import = Some(*summary.clone());
+                if let Some(snapshot) = snapshot {
+                    if let Some(cache) = snapshot.cache.as_ref() {
+                        self.romm_library.last_delta = Some(romm_library::RommCacheDelta::between(
+                            self.romm_library.refresh_baseline.as_ref(),
+                            cache,
+                        ));
+                    }
+                    self.romm_library.snapshot = Some(romm_library::RommBrowserSnapshot {
+                        status: format!("Cached from {}", snapshot.status),
+                        cache: snapshot.cache.clone(),
+                    });
+                }
+                self.romm_library.refresh_baseline = None;
+                self.activity.finish(
+                    job_id,
+                    format!(
+                        "RomM cache refreshed: {} game(s), {} platform(s). Local identity and ROM files were not changed.",
+                        summary.records, summary.platforms
+                    ),
+                    None,
+                );
+            }
+            (
+                romm_library::RommLibraryOperation::PreviewImport,
+                crate::romm_source::RommOperation::SampleImport { .. },
+                crate::romm_source::RommOperationOutcome::Sample(summary),
+            ) => {
+                self.romm_library.last_preview = Some(*summary);
+                self.activity.finish(
+                    job_id,
+                    "RomM import preview ready. Nothing was published and local identity was not changed.".into(),
+                    None,
+                );
+            }
+            (_, _, other) => {
+                let error = "RomM returned an unexpected operation result; the cached browser state was kept.".to_string();
+                self.romm_library.operation_error = Some(error.clone());
+                self.activity
+                    .finish(job_id, error, Some(format!("Unexpected result: {other:?}")));
+            }
+        }
+    }
+    fn load(&mut self, scan: bool) {
+        if self.load_job.is_some() {
+            return;
+        }
+        // Database status's upgrade scan writes the same catalogue.
+        if scan && self.tools.database.upgrading() {
+            self.notice = Some(Notice {
+                message: "A library database upgrade is running. Scan again when it has finished; nothing was started.".into(),
+                technical: "Refused: Database status is scanning to upgrade the catalogue.".into(),
+            });
+            return;
+        }
+        let id = self.activity.queue(
+            if scan {
+                "Scanning your game folders"
+            } else {
+                "Loading your library"
+            },
+            Route::Section(Section::Games),
+            false,
+        );
+        self.load_job = Some(id);
+        self.send(id, Command::Load { scan });
+    }
+    fn refresh_environment(&mut self, context: &egui::Context) {
+        if self.environment_job.is_some() {
+            return;
+        }
+        let id = self.activity.queue(
+            "Checking EmuWiz setup",
+            Route::Section(Section::Setup),
+            false,
+        );
+        self.environment_job = Some(id);
+        if self.send(id, Command::EnvironmentCheck) {
+            context.request_repaint();
+        }
+    }
+    fn start_snapshot_history(
+        &mut self,
+        root: std::path::PathBuf,
+        targets: Vec<save_snapshots::SnapshotTarget>,
+    ) {
+        let generation = self.saves_states.generation;
+        let id = self.activity.queue(
+            "Checking save snapshots",
+            Route::Section(Section::Saves),
+            false,
+        );
+        self.saves_states.snapshots.history_job = Some(id);
+        if !self.send(
+            id,
+            Command::SaveSnapshotHistory {
+                root,
+                targets,
+                generation,
+            },
+        ) {
+            self.saves_states.snapshots.history_job = None;
+        }
+    }
+    fn start_snapshot_create(
+        &mut self,
+        root: std::path::PathBuf,
+        target: save_snapshots::SnapshotTarget,
+    ) {
+        let panel = &mut self.saves_states.snapshots;
+        if panel.create_job.is_some() || panel.history_job.is_some() {
+            return;
+        }
+        let id = self.activity.queue(
+            "Creating a save snapshot",
+            Route::Section(Section::Saves),
+            false,
+        );
+        self.saves_states.snapshots.create_job = Some(id);
+        self.saves_states.snapshots.feedback = None;
+        if !self.send(id, Command::CreateSaveSnapshot { root, target }) {
+            self.saves_states.snapshots.create_job = None;
+        }
+    }
+    fn start_saves_inventory(&mut self) {
+        if self.saves_states.loading {
+            return;
+        }
+        self.saves_states.generation = self.saves_states.generation.wrapping_add(1);
+        let generation = self.saves_states.generation;
+        let id = self.activity.queue(
+            "Checking save locations",
+            Route::Section(Section::Saves),
+            false,
+        );
+        self.saves_states.loading = true;
+        self.saves_states.job = Some(id);
+        self.saves_states.error = None;
+        if !self.send(
+            id,
+            Command::PersistentStateInventory {
+                roots: saves_states::configured_roots(),
+                generation,
+            },
+        ) {
+            self.saves_states.loading = false;
+        }
+    }
+    /// Any surface that shows artwork calls this. The first request after a
+    /// catalogue load builds the index in the background (never on the UI
+    /// thread); later requests find it building or built and do nothing, so
+    /// there is one index however many surfaces ask. Browse & Play is a
+    /// consumer like any other: nothing needs to visit Museum first.
+    fn ensure_artwork_index(&mut self) {
+        if self.loaded && self.artwork.index.is_none() && !self.artwork.index_loading {
+            self.start_artwork_index("Preparing artwork");
+        }
+    }
+    fn refresh_artwork_index(&mut self) {
+        self.start_artwork_index("Refreshing metadata and artwork");
+    }
+    fn start_artwork_index(&mut self, label: &str) {
+        if self.artwork.index_loading {
+            return;
+        }
+        self.artwork.reload(self.library.clone());
+        let id = self
+            .activity
+            .queue(label, Route::Section(Section::Artwork), false);
+        self.activity.start(id);
+        self.index_job = Some(id);
+    }
+    fn go(&mut self, route: Route) {
+        if route == Route::MameWorkflow {
+            self.organisation.view = organisation::OrganisationView::MameNormalizer;
+        }
+        let resolved = match route.game() {
+            Some(id) if self.library.resolve(id) != id => route.with_game(self.library.resolve(id)),
+            _ => route.clone(),
+        };
+        self.moved_game = (resolved != route).then(|| resolved.game()).flatten();
+        if matches!(resolved, Route::ReviewIdentity(_)) {
+            // Re-read what is recorded each time the review is opened, so a
+            // check or setup done elsewhere is reflected on return.
+            self.review.invalidate();
+        }
+        if !matches!(resolved, Route::PlatformCheck(_))
+            && let Some(workflows) = &mut self.native_workflows
+        {
+            workflows.leave_platform_check();
+        }
+        self.router.go(resolved);
+        self.handoff_status = None;
+        self.navigation_changed();
+    }
+
+    fn handle_onboarding_action(
+        &mut self,
+        context: &egui::Context,
+        action: Option<onboarding::Action>,
+    ) {
+        match action {
+            None => {}
+            Some(onboarding::Action::DismissWelcome) => {
+                self.welcome_dismissed = true;
+                self.preferences_dirty = Some(Instant::now());
+            }
+            Some(onboarding::Action::DismissAndGoHome) => {
+                self.welcome_dismissed = true;
+                self.preferences_dirty = Some(Instant::now());
+                self.go(Route::Home);
+            }
+            Some(onboarding::Action::Refresh) => self.refresh_environment(context),
+            Some(onboarding::Action::Open(section)) => self.go(Route::Section(section)),
+            Some(onboarding::Action::OpenPlatform(platform)) => {
+                self.doctor_platform = Some(platform);
+            }
+            Some(onboarding::Action::OpenGame(game)) => {
+                self.go(Route::Task {
+                    section: Section::Launch,
+                    game,
+                });
+            }
+            // Only remembered: the dialog asks before anything is created.
+            Some(onboarding::Action::RequestCreate(confirm)) => {
+                self.setup_actions.confirm = Some(confirm);
+            }
+            Some(onboarding::Action::CopySummary) => {
+                self.setup_actions.summary_copied = false;
+                let id = self.activity.queue(
+                    "Preparing the Doctor summary",
+                    Route::Section(Section::Setup),
+                    false,
+                );
+                self.setup_actions.summary_job = Some(id);
+                self.send(id, Command::DoctorSummary);
+            }
+        }
+    }
+    fn navigation_changed(&mut self) {
+        // Choosing any location closes the All Tools browser.
+        self.simple.all_tools = false;
+        self.interacted = true;
+        self.preferences_dirty = Some(Instant::now());
+        self.screenshots = false;
+        self.detail_generation += 1;
+        self.review.verification_guidance.invalidate();
+        self.detail_failed = None;
+        // Cancelled artwork remains resumable; entering a game/browser resumes it.
+        self.artwork.paused = false;
+    }
+    fn back(&mut self) {
+        // Back first closes the All Tools browser, returning to the page
+        // underneath it.
+        if self.simple.all_tools_open() {
+            self.simple.all_tools = false;
+            return;
+        }
+        self.router.back();
+        self.navigation_changed();
+    }
+    fn change_filter(&mut self) {
+        self.filter_generation += 1;
+        self.filter_dirty = Some(Instant::now());
+        self.interacted = true;
+        self.preferences_dirty = Some(Instant::now());
+    }
+    fn check_platform(&mut self, platform: String) {
+        self.check_platform = Some(platform);
+        self.verification = None;
+        self.go(Route::Section(Section::Check));
+    }
+    fn start_verification(&mut self) {
+        let Some(platform) = self.check_platform.clone() else {
+            return;
+        };
+        let games = self
+            .library
+            .games
+            .iter()
+            .filter(|game| game.platform == platform)
+            .cloned()
+            .collect::<Vec<_>>();
+        let id = self.activity.queue(
+            &format!("Checking {platform}"),
+            Route::Section(Section::Check),
+            true,
+        );
+        let cancel = self
+            .activity
+            .jobs
+            .get(&id)
+            .and_then(|job| job.cancel.clone())
+            .unwrap_or_else(|| Arc::new(std::sync::atomic::AtomicBool::new(false)));
+        self.verification_job = Some(id);
+        self.send(
+            id,
+            Command::Verify {
+                platform,
+                games,
+                cancel,
+            },
+        );
+    }
+    fn start_duplicate_scan(&mut self) {
+        if self.duplicate_job.is_some() {
+            return;
+        }
+        let id = self.activity.queue_with(
+            DUPLICATE_SCAN_TITLE,
+            Route::Section(Section::Duplicates),
+            activity::CancelPolicy::SafeNow,
+        );
+        let cancel = self.job_cancel_flag(id);
+        self.duplicate_job = Some(id);
+        self.send(
+            id,
+            Command::ScanDuplicates {
+                games: self.library.games.clone(),
+                cancel,
+            },
+        );
+    }
+    /// The cancel flag the job's worker polls; the Activity model owns it.
+    fn job_cancel_flag(&self, id: u64) -> Arc<std::sync::atomic::AtomicBool> {
+        self.activity
+            .jobs
+            .get(&id)
+            .and_then(|job| job.cancel.clone())
+            .unwrap_or_else(|| Arc::new(std::sync::atomic::AtomicBool::new(false)))
+    }
+    fn start_problem_summary(&mut self) {
+        if self.problem_summary_job.is_some() {
+            return;
+        }
+        let id = self.activity.queue(
+            "Checking saved problem evidence",
+            Route::Section(Section::Problems),
+            false,
+        );
+        self.problem_summary_job = Some(id);
+        self.send(
+            id,
+            Command::BuildProblemSummary {
+                library: self.library.clone(),
+                duplicates: self.duplicate_report.clone(),
+            },
+        );
+    }
+    fn start_duplicate_preview(&mut self, index: usize) {
+        let Some(report) = self.duplicate_report.as_ref() else {
+            return;
+        };
+        let Some(group) = report.exact_groups.get(index).cloned() else {
+            return;
+        };
+        let id = self.activity.queue(
+            "Preparing the duplicate quarantine preview",
+            Route::Section(Section::Problems),
+            false,
+        );
+        self.repair_preview = None;
+        self.repair_result = None;
+        self.send(
+            id,
+            Command::PrepareDuplicateRepair {
+                group: Box::new(group),
+            },
+        );
+    }
+    fn apply_duplicate_preview(&mut self) {
+        if self.repair_job.is_some() {
+            return;
+        }
+        let Some(preview) = self.repair_preview.clone() else {
+            return;
+        };
+        let id = self.activity.queue(
+            "Applying the approved duplicate quarantine",
+            Route::Section(Section::History),
+            true,
+        );
+        let cancel = self
+            .activity
+            .jobs
+            .get(&id)
+            .and_then(|job| job.cancel.clone())
+            .unwrap_or_else(|| Arc::new(std::sync::atomic::AtomicBool::new(false)));
+        self.repair_job = Some(id);
+        self.repair_confirm = false;
+        self.send(
+            id,
+            Command::ApplyDuplicateRepair {
+                preview: Box::new(preview),
+                cancel,
+            },
+        );
+    }
+    fn legacy(&mut self, section: Section) {
+        let path = self
+            .router
+            .current
+            .game()
+            .and_then(|id| self.library.game(id))
+            .map(|game| game.archive.absolute_path.clone());
+        match legacy::open(section, path.as_deref()) {
+            Ok(()) => {
+                self.handoff_status = Some(
+                    "Opened in a separate window. If you cannot see it, look behind this window; GUI v2 is still open."
+                        .into(),
+                );
+            }
+            Err(error) => {
+                self.notice = Some(Notice {
+                    message: "The existing workflow could not be opened.".into(),
+                    technical: error,
+                });
+            }
+        }
+    }
+
+    fn start_canonical_organisation_job(&mut self, kind: CanonicalOrganisationJobKind) {
+        if self.canonical_organisation_job.is_some() {
+            return;
+        }
+        self.canonical_organisation_generation =
+            self.canonical_organisation_generation.wrapping_add(1);
+        let generation = self.canonical_organisation_generation;
+        let input_fingerprint = self.canonical_organisation.input_fingerprint();
+        let id = self.activity.queue_with(
+            match kind {
+                CanonicalOrganisationJobKind::Preview => "Planning verified-game organisation",
+                CanonicalOrganisationJobKind::Apply => "Organising verified games",
+                CanonicalOrganisationJobKind::Rollback => "Undoing game organisation",
+            },
+            Route::Section(Section::Build),
+            match kind {
+                // A preview only reads files, so it can stop between files.
+                CanonicalOrganisationJobKind::Preview => activity::CancelPolicy::SafeNow,
+                // The journalled executor stops only at its own safe checkpoints.
+                CanonicalOrganisationJobKind::Apply => activity::CancelPolicy::AfterCurrentStep,
+                // Undo must run to the end so the library is left consistent.
+                CanonicalOrganisationJobKind::Rollback => activity::CancelPolicy::NotCancellable,
+            },
+        );
+        let cancel = self.job_cancel_flag(id);
+        self.canonical_organisation_job = Some(CanonicalOrganisationJob {
+            id,
+            kind,
+            generation,
+            input_fingerprint,
+        });
+        let command = Command::CanonicalOrganisation {
+            state: Box::new(self.canonical_organisation.clone()),
+            generation,
+            kind,
+            cancel,
+        };
+        if !self.send(id, command) {
+            self.canonical_organisation_job = None;
+        }
+    }
+
+    fn finish_canonical_organisation_job(
+        &mut self,
+        id: u64,
+        kind: CanonicalOrganisationJobKind,
+        state: Box<crate::rom_organisation_page::RomOrganisationPageState>,
+        generation: u64,
+    ) {
+        let Some(job) = self.canonical_organisation_job.as_ref() else {
+            self.activity.supersede(
+                id,
+                "The organisation result no longer has an active request.".into(),
+            );
+            return;
+        };
+        if job.id != id {
+            self.activity.supersede(
+                id,
+                "A newer organisation request replaced this result.".into(),
+            );
+            return;
+        }
+        let job = self
+            .canonical_organisation_job
+            .take()
+            .expect("matching current job checked above");
+        if job.kind != kind || job.generation != generation {
+            self.activity.supersede(
+                job.id,
+                "The organisation result did not match its request and was discarded.".into(),
+            );
+            return;
+        }
+        if kind == CanonicalOrganisationJobKind::Preview
+            && (generation != self.canonical_organisation_generation
+                || job.input_fingerprint != self.canonical_organisation.input_fingerprint())
+        {
+            self.activity.supersede(
+                job.id,
+                "The preview was discarded because the organisation settings changed. Preview again.".into(),
+            );
+            return;
+        }
+        let previous_transaction_id = self
+            .canonical_organisation
+            .applied()
+            .map(|transaction| transaction.transaction_id.clone());
+        let error = state.error().map(str::to_owned);
+        let stopped = state.was_stopped();
+        let complete = state.result_complete();
+        let result_message = state.result_message().map(str::to_owned);
+        let transaction = state.applied().cloned();
+        let rolled_back = state.last_rollback().cloned();
+        self.canonical_organisation = *state;
+        let new_transaction = transaction
+            .as_ref()
+            .filter(|t| previous_transaction_id.as_deref() != Some(t.transaction_id.as_str()));
+        // Every journalled transaction belongs in History, whatever its outcome.
+        if let Some(transaction) = new_transaction
+            && !self
+                .canonical_organisation_history
+                .iter()
+                .any(|item| item.transaction_id == transaction.transaction_id)
+        {
+            self.canonical_organisation_history
+                .push(transaction.clone());
+        }
+        if kind == CanonicalOrganisationJobKind::Rollback
+            && let Some(transaction_id) = previous_transaction_id.as_deref()
+            && let Some(existing) = self
+                .canonical_organisation_history
+                .iter_mut()
+                .find(|item| item.transaction_id == transaction_id)
+        {
+            match transaction
+                .as_ref()
+                .filter(|t| t.transaction_id == transaction_id)
+            {
+                // Undo kept its handle: show the journal's real state.
+                Some(kept) => *existing = kept.clone(),
+                // Rolled back only after the page proved a complete rollback;
+                // record that journal receipt, not just its state.
+                None if error.is_none() && complete => {
+                    match rolled_back.filter(|receipt| receipt.transaction_id == transaction_id) {
+                        Some(receipt) => *existing = receipt,
+                        None => {
+                            existing.state =
+                            archivefs_core::dat::rename_apply::model::TransactionState::RolledBack;
+                        }
+                    }
+                }
+                None => {}
+            }
+        }
+        if error.is_some() && stopped {
+            // The executor honoured Cancel at one of its own safe checkpoints.
+            self.activity.settle(
+                job.id,
+                "Stopped at a safe point. Check History for anything already recorded; any Undo this page still holds stays available here.".into(),
+                activity::Settled::Stopped,
+            );
+        } else if let Some(error) = error {
+            self.activity.finish(
+                job.id,
+                match kind {
+                    CanonicalOrganisationJobKind::Preview => {
+                        "The organisation preview could not be completed. Nothing was changed."
+                    }
+                    CanonicalOrganisationJobKind::Apply if new_transaction.is_some() => {
+                        "The organisation stopped before finishing. Some changes may have been made; Undo is available on this page and History records it for review."
+                    }
+                    CanonicalOrganisationJobKind::Apply => {
+                        "The organisation stopped safely. Review the details before trying again."
+                    }
+                    CanonicalOrganisationJobKind::Rollback
+                        if archivefs_core::dat::rename_apply::is_journal_integrity_loss(&error) =>
+                    {
+                        "Undo was refused: its journal changed outside this session. Nothing was moved or written. This Undo is set aside for this session; review its journal in History."
+                    }
+                    CanonicalOrganisationJobKind::Rollback if previous_transaction_id.is_none() => {
+                        "There was nothing to undo. Nothing was changed."
+                    }
+                    CanonicalOrganisationJobKind::Rollback => {
+                        "Undo could not finish safely. The operation needs review."
+                    }
+                }
+                .into(),
+                Some(error),
+            );
+        } else if kind == CanonicalOrganisationJobKind::Preview {
+            self.activity.finish(
+                job.id,
+                "Organisation preview ready. Review every move, rename, link and blocker before confirming.".into(),
+                None,
+            );
+        } else if complete {
+            self.activity.finish(
+                job.id,
+                match kind {
+                    CanonicalOrganisationJobKind::Rollback => "Organisation was undone safely.",
+                    _ => {
+                        "Verified-game organisation completed. The durable journal records its undo state."
+                    }
+                }
+                .into(),
+                None,
+            );
+        } else {
+            self.activity.finish(
+                job.id,
+                match kind {
+                    CanonicalOrganisationJobKind::Rollback => {
+                        "Undo did not finish. Some files could not be put back yet; History shows which and why. Undo stays available and retries a file only after checking it is safe; the reviewed plan is kept."
+                    }
+                    _ => {
+                        "Organisation did not complete. Some approved changes were not made; Undo and the reviewed plan are kept. Check History before trying again."
+                    }
+                }
+                .into(),
+                Some(result_message.unwrap_or_else(|| {
+                    "The outcome could not be confirmed as complete.".into()
+                })),
+            );
+        }
+    }
+
+    fn invalidate_changed_canonical_organisation_plan(&mut self) {
+        let Some(job) = self.canonical_organisation_job.as_ref() else {
+            return;
+        };
+        if job.kind == CanonicalOrganisationJobKind::Preview
+            && job.generation == self.canonical_organisation_generation
+            && job.input_fingerprint != self.canonical_organisation.input_fingerprint()
+        {
+            self.canonical_organisation_generation =
+                self.canonical_organisation_generation.wrapping_add(1);
+        }
+    }
+
+    fn start_playing_library_job(&mut self, kind: PlayingLibraryJobKind) {
+        if self.playing_library_job.is_some() {
+            return;
+        }
+        self.playing_library_generation = self.playing_library_generation.wrapping_add(1);
+        let generation = self.playing_library_generation;
+        let input_fingerprint = self.playing_library.input_fingerprint();
+        let id = self.activity.queue(
+            match kind {
+                PlayingLibraryJobKind::Preview => "Planning your playing library",
+                PlayingLibraryJobKind::Apply => "Building your playing library",
+                PlayingLibraryJobKind::PreviewRomm => "Checking the RomM library layout",
+                PlayingLibraryJobKind::ApplyRomm => "Creating the RomM library",
+                PlayingLibraryJobKind::PreviewRetroDeck => "Checking the RetroDECK layout",
+                PlayingLibraryJobKind::ApplyRetroDeck => "Creating the RetroDECK library",
+                PlayingLibraryJobKind::PreviewEsde => "Checking ES-DE metadata",
+                PlayingLibraryJobKind::PublishEsde => "Publishing ES-DE metadata",
+                PlayingLibraryJobKind::RecoverEsde => "Restoring ES-DE metadata",
+                PlayingLibraryJobKind::Rollback
+                | PlayingLibraryJobKind::RollbackRomm
+                | PlayingLibraryJobKind::RollbackRetroDeck => "Undoing linked-library changes",
+            },
+            Route::Section(Section::Build),
+            false,
+        );
+        self.playing_library_job = Some(PlayingLibraryJob {
+            id,
+            kind,
+            generation,
+            input_fingerprint,
+        });
+        let state = Box::new(self.playing_library.clone());
+        let command = match kind {
+            PlayingLibraryJobKind::Preview => Command::PlayingLibraryPreview { state, generation },
+            PlayingLibraryJobKind::Apply => Command::PlayingLibraryApply { state, generation },
+            _ => Command::PlayingLibrarySpecial {
+                state,
+                generation,
+                kind,
+            },
+        };
+        if !self.send(id, command) {
+            self.playing_library_job = None;
+        }
+    }
+
+    fn handle_playing_library_action(&mut self, action: PlayingLibraryPageAction) {
+        use PlayingLibraryPageAction::*;
+        match action {
+            Preview => {
+                self.start_playing_library_job(PlayingLibraryJobKind::Preview);
+            }
+            SelectFamily(name) => self.playing_library.select_family(name),
+            RequestApply => match self.playing_library.destination {
+                crate::playing_library_page::PlayingLibraryDestination::Romm => {
+                    self.playing_library.request_romm_apply()
+                }
+                crate::playing_library_page::PlayingLibraryDestination::RetroDeck => {
+                    self.playing_library.request_retrodeck_apply()
+                }
+                crate::playing_library_page::PlayingLibraryDestination::Generic
+                | crate::playing_library_page::PlayingLibraryDestination::EsDe => {
+                    self.playing_library.request_apply()
+                }
+            },
+            CancelApply => match self.playing_library.destination {
+                crate::playing_library_page::PlayingLibraryDestination::Romm => {
+                    self.playing_library.cancel_romm_apply()
+                }
+                crate::playing_library_page::PlayingLibraryDestination::RetroDeck => {
+                    self.playing_library.cancel_retrodeck_apply()
+                }
+                crate::playing_library_page::PlayingLibraryDestination::Generic
+                | crate::playing_library_page::PlayingLibraryDestination::EsDe => {
+                    self.playing_library.cancel_apply()
+                }
+            },
+            ConfirmApply => {
+                let kind = match self.playing_library.destination {
+                    crate::playing_library_page::PlayingLibraryDestination::Romm => {
+                        PlayingLibraryJobKind::ApplyRomm
+                    }
+                    crate::playing_library_page::PlayingLibraryDestination::RetroDeck => {
+                        PlayingLibraryJobKind::ApplyRetroDeck
+                    }
+                    crate::playing_library_page::PlayingLibraryDestination::Generic
+                    | crate::playing_library_page::PlayingLibraryDestination::EsDe => {
+                        PlayingLibraryJobKind::Apply
+                    }
+                };
+                self.start_playing_library_job(kind);
+            }
+            RollbackLast => {
+                self.start_playing_library_job(PlayingLibraryJobKind::Rollback);
+            }
+            SelectEsdePlatform(platform) => {
+                self.playing_library.select_esde_platform(Some(platform))
+            }
+            PreviewEsde => self.start_playing_library_job(PlayingLibraryJobKind::PreviewEsde),
+            RequestEsdePublish => self.playing_library.request_esde_publish(),
+            CancelEsdePublish => self.playing_library.cancel_esde_publish(),
+            ConfirmEsdePublish => {
+                self.start_playing_library_job(PlayingLibraryJobKind::PublishEsde)
+            }
+            RequestEsdeRecovery => self.playing_library.request_esde_recovery(),
+            CancelEsdeRecovery => self.playing_library.cancel_esde_recovery(),
+            ConfirmEsdeRecovery => {
+                self.start_playing_library_job(PlayingLibraryJobKind::RecoverEsde)
+            }
+            PreviewRomm => self.start_playing_library_job(PlayingLibraryJobKind::PreviewRomm),
+            RollbackRomm => self.start_playing_library_job(PlayingLibraryJobKind::RollbackRomm),
+            PreviewRetroDeck => {
+                self.start_playing_library_job(PlayingLibraryJobKind::PreviewRetroDeck)
+            }
+            RollbackRetroDeck => {
+                self.start_playing_library_job(PlayingLibraryJobKind::RollbackRetroDeck)
+            }
+        }
+    }
+
+    fn finish_playing_library_job(
+        &mut self,
+        id: u64,
+        kind: PlayingLibraryJobKind,
+        state: Box<PlayingLibraryPageState>,
+        generation: u64,
+    ) {
+        let Some(job) = self.playing_library_job.as_ref() else {
+            self.activity.supersede(
+                id,
+                "The library result no longer has an active request.".into(),
+            );
+            return;
+        };
+        if job.id != id {
+            self.activity
+                .supersede(id, "A newer library request replaced this result.".into());
+            return;
+        }
+        let job = self
+            .playing_library_job
+            .take()
+            .expect("matching current job checked above");
+        if job.kind != kind || job.generation != generation {
+            self.activity.supersede(
+                job.id,
+                "The library result did not match its request and was discarded.".into(),
+            );
+            return;
+        }
+        match kind {
+            PlayingLibraryJobKind::Preview => {
+                if generation != self.playing_library_generation
+                    || job.input_fingerprint != self.playing_library.input_fingerprint()
+                {
+                    self.activity.supersede(
+                        job.id,
+                        "The preview was discarded because the library settings changed. Plan again to review the new settings.".into(),
+                    );
+                    return;
+                }
+                self.playing_library = *state;
+                if let Some(error) = self.playing_library.error().map(str::to_owned) {
+                    self.activity.finish(
+                        job.id,
+                        "The preview could not be completed. Nothing was changed.".into(),
+                        Some(error.clone()),
+                    );
+                    self.notice = Some(Notice {
+                        message: "The playing-library preview needs attention.".into(),
+                        technical: error,
+                    });
+                } else {
+                    self.activity.finish(
+                        job.id,
+                        "Preview ready. Review the selected games before creating links.".into(),
+                        None,
+                    );
+                }
+            }
+            PlayingLibraryJobKind::Apply => {
+                let transaction = state.applied().cloned();
+                let error = state.apply_error().map(str::to_owned);
+                self.playing_library.merge_async_apply_result(*state);
+                if let Some(error) = error {
+                    self.activity.finish(
+                        job.id,
+                        "The playing library was not completed. Your original collection remains unchanged.".into(),
+                        Some(error),
+                    );
+                } else if let Some(transaction) = transaction {
+                    if !self
+                        .playing_library_history
+                        .iter()
+                        .any(|item| item.transaction_id == transaction.transaction_id)
+                    {
+                        self.playing_library_history.push(transaction.clone());
+                    }
+                    self.activity.finish(
+                        job.id,
+                        format!(
+                            "Playing library created: {} links. Your original collection was not changed.",
+                            transaction.applied_count()
+                        ),
+                        None,
+                    );
+                } else {
+                    self.activity.finish(
+                        job.id,
+                        "No playing-library changes were made.".into(),
+                        None,
+                    );
+                }
+            }
+            PlayingLibraryJobKind::PreviewRomm
+            | PlayingLibraryJobKind::PreviewRetroDeck
+            | PlayingLibraryJobKind::PreviewEsde
+            | PlayingLibraryJobKind::ApplyRomm
+            | PlayingLibraryJobKind::ApplyRetroDeck
+            | PlayingLibraryJobKind::PublishEsde
+            | PlayingLibraryJobKind::RecoverEsde
+            | PlayingLibraryJobKind::Rollback
+            | PlayingLibraryJobKind::RollbackRomm
+            | PlayingLibraryJobKind::RollbackRetroDeck => {
+                let planning = matches!(
+                    kind,
+                    PlayingLibraryJobKind::PreviewRomm
+                        | PlayingLibraryJobKind::PreviewRetroDeck
+                        | PlayingLibraryJobKind::PreviewEsde
+                );
+                if planning
+                    && (generation != self.playing_library_generation
+                        || job.input_fingerprint != self.playing_library.input_fingerprint())
+                {
+                    self.activity.supersede(
+                        job.id,
+                        "The result was discarded because the source, destination or preferences changed. Preview again.".into(),
+                    );
+                    return;
+                }
+                let error = if matches!(
+                    kind,
+                    PlayingLibraryJobKind::PreviewEsde
+                        | PlayingLibraryJobKind::PublishEsde
+                        | PlayingLibraryJobKind::RecoverEsde
+                ) {
+                    state.esde_operation_error().map(str::to_owned)
+                } else {
+                    state.destination_error().map(str::to_owned)
+                };
+                let transaction = state.destination_transaction().cloned();
+                self.playing_library = *state;
+                if let Some(transaction) = transaction {
+                    if let Some(existing) = self
+                        .playing_library_history
+                        .iter_mut()
+                        .find(|item| item.transaction_id == transaction.transaction_id)
+                    {
+                        *existing = transaction;
+                    } else {
+                        self.playing_library_history.push(transaction);
+                    }
+                }
+                if let Some(error) = error {
+                    self.activity.finish(
+                        job.id,
+                        "The organisation operation stopped safely. Review the explanation before retrying.".into(),
+                        Some(error),
+                    );
+                } else {
+                    let summary = match kind {
+                        PlayingLibraryJobKind::PreviewRomm => {
+                            "RomM layout preview ready. Source files remain untouched."
+                        }
+                        PlayingLibraryJobKind::PreviewRetroDeck => {
+                            "RetroDECK layout preview ready, including sandbox visibility."
+                        }
+                        PlayingLibraryJobKind::PreviewEsde => {
+                            "ES-DE metadata preview ready. Existing entries will be preserved."
+                        }
+                        PlayingLibraryJobKind::ApplyRomm => {
+                            "RomM linked library created. No RomM server data was edited."
+                        }
+                        PlayingLibraryJobKind::ApplyRetroDeck => {
+                            "RetroDECK linked library created. Metadata publication remains a separate step."
+                        }
+                        PlayingLibraryJobKind::PublishEsde => "ES-DE metadata published safely.",
+                        PlayingLibraryJobKind::RecoverEsde => {
+                            "ES-DE's previous metadata was restored safely."
+                        }
+                        PlayingLibraryJobKind::Rollback
+                        | PlayingLibraryJobKind::RollbackRomm
+                        | PlayingLibraryJobKind::RollbackRetroDeck => {
+                            "Linked-library changes were undone safely."
+                        }
+                        PlayingLibraryJobKind::Preview | PlayingLibraryJobKind::Apply => {
+                            unreachable!()
+                        }
+                    };
+                    self.activity.finish(job.id, summary.into(), None);
+                }
+            }
+        }
+    }
+
+    fn invalidate_changed_playing_library_plan(&mut self) {
+        let Some(job) = self.playing_library_job.as_ref() else {
+            return;
+        };
+        if matches!(
+            job.kind,
+            PlayingLibraryJobKind::Preview
+                | PlayingLibraryJobKind::PreviewRomm
+                | PlayingLibraryJobKind::PreviewRetroDeck
+                | PlayingLibraryJobKind::PreviewEsde
+        ) && job.generation == self.playing_library_generation
+            && job.input_fingerprint != self.playing_library.input_fingerprint()
+        {
+            // The worker owns a snapshot. Once the user edits any planning
+            // input, its eventual result must not be accepted—even if the
+            // user changes the value back before the worker replies.
+            self.playing_library_generation = self.playing_library_generation.wrapping_add(1);
+        }
+    }
+
+    fn poll(&mut self, context: &egui::Context) {
+        if self.discovery_import_history.poll_background() {
+            self.load(false);
+            if let Some(native) = &mut self.native_workflows {
+                native.refresh_after_discovery_undo(context.clone());
+            }
+        }
+        self.organisation.frontend_export.poll(context);
+        self.artwork.begin_frame(context);
+        self.imagery.begin_frame(context);
+        for _ in 0..32 {
+            let Ok(event) = self.backend.rx.try_recv() else {
+                break;
+            };
+            match event {
+                Event::Started(id) => self.activity.start(id),
+                Event::Progress { id, progress } => self.activity.update_progress(id, progress),
+                Event::Finished { id, outcome } => {
+                    let was_load_job = self.load_job == Some(id);
+                    if was_load_job {
+                        self.load_job = None;
+                    }
+                    if self.problem_summary_job == Some(id) {
+                        self.problem_summary_job = None;
+                    }
+                    match outcome {
+                        Ok(payload) => {
+                            match payload {
+                                Payload::SetupCreated(message) => {
+                                    self.setup_actions.job = None;
+                                    self.setup_actions.feedback = Some((true, message));
+                                    // Show the new state straight away.
+                                    self.environment_job = None;
+                                    let refresh = self.activity.queue(
+                                        "Checking EmuWiz setup",
+                                        Route::Section(Section::Setup),
+                                        false,
+                                    );
+                                    self.environment_job = Some(refresh);
+                                    self.send(refresh, Command::EnvironmentCheck);
+                                }
+                                Payload::DoctorSummary(text) => {
+                                    self.setup_actions.summary_job = None;
+                                    self.setup_actions.summary = Some(text);
+                                }
+                                Payload::Environment(snapshot) => {
+                                    self.environment_job = None;
+                                    let fresh = snapshot.is_fresh();
+                                    self.environment = Some(snapshot);
+                                    if fresh && !self.welcome_dismissed && !self.interacted {
+                                        self.router.current = Route::Section(Section::Setup);
+                                    }
+                                }
+                                Payload::RommLibrary(snapshot) => {
+                                    self.settle_romm_library_load(id, Ok(snapshot));
+                                }
+                                Payload::RommOperation {
+                                    operation,
+                                    outcome,
+                                    snapshot,
+                                } => {
+                                    self.handle_romm_library_operation(
+                                        operation, *outcome, snapshot,
+                                    );
+                                }
+                                Payload::PersistentStateInventory {
+                                    inventory,
+                                    generation,
+                                } => {
+                                    if self.saves_states.job == Some(id) {
+                                        self.saves_states.job = None;
+                                        self.saves_states.loading = false;
+                                    }
+                                    if generation == self.saves_states.generation {
+                                        self.saves_states.inventory = Some(inventory);
+                                        self.activity.finish(
+                                            id,
+                                            "Save locations checked. No files were changed.".into(),
+                                            None,
+                                        );
+                                    } else {
+                                        self.activity.finish(id, "An older save inventory was discarded; refresh to check the current locations.".into(), None);
+                                    }
+                                }
+                                Payload::SaveSnapshotHistory { report, generation } => {
+                                    let panel = &mut self.saves_states.snapshots;
+                                    if panel.history_job == Some(id) {
+                                        panel.history_job = None;
+                                    }
+                                    if generation == self.saves_states.generation {
+                                        panel.report = Some(report);
+                                    } else {
+                                        panel.loaded_for = None;
+                                    }
+                                    self.activity.finish(
+                                        id,
+                                        "Save snapshots checked. No files were changed.".into(),
+                                        None,
+                                    );
+                                }
+                                Payload::SaveSnapshotCreated { result } => {
+                                    let panel = &mut self.saves_states.snapshots;
+                                    if panel.create_job == Some(id) {
+                                        panel.create_job = None;
+                                    }
+                                    // Re-read history so the new snapshot and
+                                    // fresh closure evidence are shown.
+                                    panel.loaded_for = None;
+                                    let message = match &result {
+                                        Ok(snapshot) => format!(
+                                            "Snapshot {snapshot} created and verified. Your save was only read."
+                                        ),
+                                        Err(error) => error.clone(),
+                                    };
+                                    panel.feedback = Some((result.is_ok(), message.clone()));
+                                    self.activity.finish(id, message, None);
+                                }
+                                Payload::Library(library) => {
+                                    self.activity.finish(id, format!("{} games available to browse. Original game files were not changed.", library.games.len()), None);
+                                    if let Some(warning) = &library.scan_warning {
+                                        self.activity.finish(
+                                            id,
+                                            warning.clone(),
+                                            Some(warning.clone()),
+                                        );
+                                        self.notice = Some(Notice {
+                                            message: warning.clone(),
+                                            technical: String::new(),
+                                        });
+                                    }
+                                    self.library = library;
+                                    // Remembered pages may name a game by an older catalogue
+                                    // entry; point them at the current copy.
+                                    let before = self.router.current.game();
+                                    self.router.remap_games(|id| self.library.resolve(id));
+                                    let after = self.router.current.game();
+                                    self.moved_game = (before != after).then_some(after).flatten();
+                                    self.library_failure = None;
+                                    self.problem_summary = None;
+                                    self.missing.plan = None;
+                                    self.loaded = true;
+                                    self.indices.clear();
+                                    self.change_filter();
+                                    self.detail = None;
+                                    self.review.verification_guidance.invalidate();
+                                    self.detail_failed = None;
+                                    // Artwork discovery walks every provider snapshot and every
+                                    // catalogue row.  It is useful when the Artwork page is
+                                    // opened, but it is not needed to make Home or Games usable.
+                                    // Starting it here made a 132k-game load overlap the library
+                                    // projection and could retain several full provider indexes.
+                                    self.artwork.index = None;
+                                    self.artwork.index_loading = false;
+                                    self.index_job = None;
+                                }
+                                Payload::Filter {
+                                    indices,
+                                    generation,
+                                } => {
+                                    self.filter_inflight = false;
+                                    if generation == self.filter_generation {
+                                        self.indices = indices;
+                                    }
+                                }
+                                Payload::Detail { detail, generation } => {
+                                    self.detail_pending = None;
+                                    if generation == self.detail_generation {
+                                        self.detail = Some(detail);
+                                    }
+                                }
+                                Payload::Verification(result) => {
+                                    // A late answer for a platform the person has
+                                    // since left is evidence about that platform
+                                    // only; it never becomes the current check.
+                                    let current = self.verification_job == Some(id);
+                                    if current {
+                                        self.verification_job = None;
+                                    }
+                                    if current
+                                        && self.check_platform.as_deref()
+                                            == Some(result.platform.as_str())
+                                    {
+                                        self.verification = Some(result);
+                                        self.router.current = Route::Section(Section::Check);
+                                    }
+                                }
+                                Payload::Duplicates(report) => {
+                                    self.duplicate_job = None;
+                                    self.activity.settle(
+                                        id,
+                                        format!(
+                                            "{} files checked · {} duplicate group{} found",
+                                            job_card::count(report.files_examined as u64),
+                                            job_card::count(report.exact_groups.len() as u64),
+                                            if report.exact_groups.len() == 1 {
+                                                ""
+                                            } else {
+                                                "s"
+                                            },
+                                        ),
+                                        activity::Settled::Done,
+                                    );
+                                    self.duplicate_report = Some(report);
+                                    self.problem_summary = None;
+                                }
+                                Payload::ProblemSummary(summary) => {
+                                    self.problem_summary_job = None;
+                                    self.problem_summary = Some(summary);
+                                }
+                                Payload::DuplicatePreview(preview) => {
+                                    self.repair_preview = Some(*preview);
+                                    self.repair_result = None;
+                                }
+                                Payload::DuplicateApplied(record) => {
+                                    self.repair_job = None;
+                                    self.repair_history.push(*record);
+                                    self.repair_preview = None;
+                                    self.repair_result = Some("The duplicate copy was moved to EmuWiz quarantine. Your original content was not deleted, and this change can be undone from History.".into());
+                                }
+                                Payload::DuplicateUndone(result) => {
+                                    self.duplicate_undo_done(id, *result);
+                                    continue;
+                                }
+                                Payload::RepairHistory {
+                                    duplicates,
+                                    playing_libraries,
+                                    organisations,
+                                    mame_reconstructions,
+                                    evidence,
+                                } => {
+                                    self.history_view.built_for = None;
+                                    self.journal_evidence = evidence;
+                                    self.repair_history = duplicates;
+                                    self.playing_library_history = playing_libraries;
+                                    self.canonical_organisation_history = organisations;
+                                    self.organisation.mame_reconstruction.history =
+                                        mame_reconstructions;
+                                }
+                                Payload::EquivalentScan(scan) => self.equivalent_scan_done(*scan),
+                                Payload::EquivalentApplied(record) => {
+                                    self.equivalent_applied(*record)
+                                }
+                                Payload::MediaSetReview(review) => self.media_sets_done(*review),
+                                Payload::StorageReview(review) => self.storage_review_done(*review),
+                                Payload::Reconciliation(view) => self.reconcile_done(view),
+                                Payload::ReconciliationHashes(run) => self.reconcile_hash_done(run),
+                                Payload::ReconciliationSupportCheck(run) => {
+                                    self.reconcile_support_check_done(id, *run)
+                                }
+                                Payload::MissingPreview(plan) => {
+                                    self.missing.job = None;
+                                    self.missing.plan = Some(plan);
+                                }
+                                Payload::MissingApplied(result) => self.missing_apply_done(*result),
+                                Payload::MissingUndone(restored) => {
+                                    self.missing_undo_done(restored)
+                                }
+                                Payload::Preferences(preferences) => {
+                                    self.welcome_dismissed = preferences.welcome_dismissed;
+                                    self.beginner_hints_enabled =
+                                        preferences.beginner_hints_enabled;
+                                    self.simple.enabled = simple_shell::blue_enabled(&preferences);
+                                    self.simple.set_ui_scale(preferences.ui_scale);
+                                    self.document_preferences.roots =
+                                        preferences.document_roots.clone();
+                                    self.document_preferences.associations =
+                                        preferences.document_associations.clone();
+                                    self.document_preferences.reading =
+                                        preferences.document_reading.clone();
+                                    let mut preferences = preferences;
+                                    preferences.route = migrate_route(preferences.route);
+                                    if !self.interacted {
+                                        let keep_onboarding =
+                                            self.environment.as_ref().is_some_and(|snapshot| {
+                                                snapshot.is_fresh() && !self.welcome_dismissed
+                                            });
+                                        if !keep_onboarding {
+                                            self.router.current = preferences.route;
+                                        }
+                                        self.filter = preferences.filter;
+                                        self.filter_dirty = Some(Instant::now());
+                                    }
+                                }
+                                Payload::PlayingLibraryPreview { state, generation } => {
+                                    self.finish_playing_library_job(
+                                        id,
+                                        PlayingLibraryJobKind::Preview,
+                                        state,
+                                        generation,
+                                    );
+                                }
+                                Payload::PlayingLibraryApply { state, generation } => {
+                                    self.finish_playing_library_job(
+                                        id,
+                                        PlayingLibraryJobKind::Apply,
+                                        state,
+                                        generation,
+                                    );
+                                }
+                                Payload::PlayingLibrarySpecial {
+                                    state,
+                                    generation,
+                                    kind,
+                                } => {
+                                    self.finish_playing_library_job(id, kind, state, generation);
+                                }
+                                Payload::CanonicalOrganisation {
+                                    state,
+                                    generation,
+                                    kind,
+                                } => {
+                                    self.finish_canonical_organisation_job(
+                                        id, kind, state, generation,
+                                    );
+                                }
+                                Payload::IdentityKnowledge {
+                                    archive_id,
+                                    knowledge,
+                                } => {
+                                    if self.review.knowledge_job == Some(id) {
+                                        self.review.knowledge_job = None;
+                                    }
+                                    self.review.knowledge = knowledge;
+                                    self.review.knowledge_for = Some(archive_id);
+                                    self.activity.settle(
+                                        id,
+                                        "Read what EmuWiz has recorded. Nothing was changed."
+                                            .into(),
+                                        activity::Settled::Done,
+                                    );
+                                }
+                                Payload::SystemCleared { archive_id } => {
+                                    self.activity.settle(
+                                        id,
+                                        "Your system choice was removed. Your game file was not changed."
+                                            .into(),
+                                        activity::Settled::Done,
+                                    );
+                                    self.finish_system_assignment(archive_id);
+                                }
+                                Payload::SystemAssigned { archive_id } => {
+                                    self.activity.settle(
+                                        id,
+                                        "System saved. Your game file was not changed.".into(),
+                                        activity::Settled::Done,
+                                    );
+                                    self.finish_system_assignment(archive_id);
+                                }
+                                Payload::Done => {}
+                            }
+                            self.activity.finish(
+                                id,
+                                "Complete. Open the result to continue.".into(),
+                                None,
+                            );
+                        }
+                        Err(error) => {
+                            if self.duplicate_job == Some(id) {
+                                self.duplicate_job = None;
+                            }
+                            if self.review.knowledge_job == Some(id) {
+                                self.review.knowledge_job = None;
+                                self.review.knowledge_for = None;
+                            }
+                            if self.review.assign_job.is_some_and(|(job, _)| job == id) {
+                                self.review.assign_job = None;
+                            }
+                            if was_load_job {
+                                self.library_load_failed(&error);
+                            }
+                            if self
+                                .playing_library_job
+                                .as_ref()
+                                .is_some_and(|job| job.id == id)
+                            {
+                                self.playing_library_job = None;
+                            }
+                            if self
+                                .canonical_organisation_job
+                                .as_ref()
+                                .is_some_and(|job| job.id == id)
+                            {
+                                self.canonical_organisation_job = None;
+                            }
+                            if self.environment_job == Some(id) {
+                                self.environment_job = None;
+                            }
+                            if self.setup_actions.job == Some(id) {
+                                self.setup_actions.job = None;
+                                self.setup_actions.feedback =
+                                    Some((false, format!("Nothing was created. {error}")));
+                            }
+                            if self.setup_actions.summary_job == Some(id) {
+                                self.setup_actions.summary_job = None;
+                            }
+                            if self.saves_states.job == Some(id) {
+                                self.saves_states.job = None;
+                                self.saves_states.loading = false;
+                            }
+                            if self.saves_states.snapshots.history_job == Some(id) {
+                                self.saves_states.snapshots.history_job = None;
+                            }
+                            if self.saves_states.snapshots.create_job == Some(id) {
+                                self.saves_states.snapshots.create_job = None;
+                                self.saves_states.snapshots.loaded_for = None;
+                                self.saves_states.snapshots.feedback = Some((
+                                    false,
+                                    format!(
+                                        "The snapshot was not created. Your save was not changed. {error}"
+                                    ),
+                                ));
+                            }
+                            if self.repair_job == Some(id) {
+                                self.repair_job = None;
+                            }
+                            if self.undo_job.as_ref().is_some_and(|job| job.id == id) {
+                                self.undo_job = None;
+                            }
+                            if self.missing.job == Some(id) {
+                                self.missing_failed(&error);
+                            }
+                            if self.equiv.job == Some(id) {
+                                self.equivalent_failed(&error);
+                            }
+                            if self.storage.job == Some(id) {
+                                self.storage_review_failed();
+                            }
+                            self.reconcile_failed(id, &error);
+                            if self.multi.job == Some(id) {
+                                self.media_sets_failed();
+                            }
+                            self.settle_romm_library_load(id, Err(error.clone()));
+                            if self
+                                .romm_library
+                                .operation
+                                .as_ref()
+                                .is_some_and(|(job, _)| *job == id)
+                            {
+                                self.romm_library.operation = None;
+                                self.romm_library.refresh_baseline = None;
+                                self.romm_library.operation_error = Some(error.clone());
+                            }
+                            self.detail_failed = self.detail_pending.take();
+                            self.filter_inflight = false;
+                            let title = self.activity.jobs.get(&id).map(|job| job.title.clone());
+                            if error == activity::CANCELLED {
+                                // The worker stopped on request: say so, with no error banner.
+                                self.activity.settle(
+                                    id,
+                                    "Stopped at your request. Nothing was changed.".into(),
+                                    activity::Settled::Stopped,
+                                );
+                            } else if let Some(notice) =
+                                notice_for_background_error(title.as_deref(), &error)
+                            {
+                                self.activity.settle(
+                                    id,
+                                    notice.message.clone(),
+                                    activity::Settled::Failed(error.clone()),
+                                );
+                                self.notice = Some(notice);
+                            } else {
+                                // Startup housekeeping (preference restore and history
+                                // discovery) is intentionally untracked. It must not turn a
+                                // recoverable diagnostic detail into a global warning banner.
+                                if let Some(title) = title {
+                                    self.activity.finish(
+                                        id,
+                                        format!(
+                                            "{title} failed. See activity details for the reason."
+                                        ),
+                                        Some(error.clone()),
+                                    );
+                                }
+                                log::warn!("GUI v2 background operation {id} failed: {error}");
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        if !self.artwork.index_loading
+            && let Some(id) = self.index_job.take()
+        {
+            self.activity.finish(
+                id,
+                "Artwork locations checked. Pictures load only when you browse them.".into(),
+                None,
+            );
+        }
+        if self
+            .filter_dirty
+            .is_some_and(|time| time.elapsed() >= Duration::from_millis(120))
+            && !self.filter_inflight
+            && self.loaded
+        {
+            self.filter_dirty = None;
+            self.filter_inflight = true;
+            self.send(
+                0,
+                Command::Filter {
+                    library: self.library.clone(),
+                    filter: self.filter.clone(),
+                    generation: self.filter_generation,
+                },
+            );
+        }
+        if self.romm_library_load_needed() {
+            let id =
+                self.activity
+                    .queue("Loading RomM library", Route::Section(Section::Romm), false);
+            self.romm_library.loading = true;
+            self.romm_library_job = Some(id);
+            self.send(id, Command::LoadRommLibrary);
+        }
+        if let Some(id) = self.router.current.game()
+            && self.detail_pending.is_none()
+            && self.detail_failed != Some(id)
+            && self.detail.as_ref().is_none_or(|detail| detail.game != id)
+            && let Some(game) = self.library.game(id).cloned()
+        {
+            let job = self.activity.queue(
+                "Checking this game's saved information and installed emulators",
+                Route::Game(id),
+                false,
+            );
+            self.detail_pending = Some(id);
+            self.send(
+                job,
+                Command::Detail {
+                    game: Box::new(game),
+                    generation: self.detail_generation,
+                },
+            );
+        }
+        if self
+            .preferences_dirty
+            .is_some_and(|time| time.elapsed() > Duration::from_millis(500))
+        {
+            self.preferences_dirty = None;
+            self.send(
+                0,
+                Command::Save(Preferences {
+                    route: self.router.current.clone(),
+                    filter: self.filter.clone(),
+                    welcome_dismissed: self.welcome_dismissed,
+                    beginner_hints_enabled: self.beginner_hints_enabled,
+                    document_roots: self.document_preferences.roots.clone(),
+                    document_associations: self.document_preferences.associations.clone(),
+                    document_reading: self.document_preferences.reading.clone(),
+                    simple_shell: self.simple.enabled,
+                    classic_view: !self.simple.enabled,
+                    ui_scale: self.simple.ui_scale,
+                }),
+            );
+        }
+        if self.activity.active() > 0
+            || self.artwork.active() > 0
+            || self.filter_dirty.is_some()
+            || self.preferences_dirty.is_some()
+        {
+            context.request_repaint_after(Duration::from_millis(100));
+        }
+    }
+    fn finish_frame(&mut self) {
+        self.artwork.end_frame();
+        if self.artwork.active() > 0 && self.artwork_job.is_none() {
+            let id = self
+                .activity
+                .queue("Loading artwork", Route::Section(Section::Games), true);
+            self.activity.start(id);
+            self.artwork_job = Some(id);
+        }
+        if let Some(id) = self.artwork_job {
+            if let Some(job) = self.activity.jobs.get_mut(&id) {
+                job.progress = Some(
+                    activity::JobProgress::new("Loading pictures", "pictures")
+                        .with_total(self.artwork.requested)
+                        .at(self.artwork.completed),
+                );
+                job.summary = "Loading visible pictures. Off-screen requests are cancelled.".into();
+                if job
+                    .cancel
+                    .as_ref()
+                    .is_some_and(|cancel| cancel.load(std::sync::atomic::Ordering::Relaxed))
+                {
+                    self.artwork.cancel();
+                }
+            }
+            if self.artwork.active() == 0 {
+                let summary = format!(
+                    "{} picture requests finished; {} cancelled off screen; {} pictures could not load. Games remain available. Open a game to retry an unavailable picture.",
+                    self.artwork.completed, self.artwork.cancelled, self.artwork.failures
+                );
+                self.activity.finish(
+                    id,
+                    summary,
+                    (self.artwork.failures > 0).then(|| {
+                        "Per-picture errors and timings are in the game's Advanced details.".into()
+                    }),
+                );
+                self.artwork_job = None;
+                self.artwork.requested = 0;
+                self.artwork.completed = 0;
+                self.artwork.failures = 0;
+                self.artwork.cancelled = 0;
+            }
+        }
+    }
+}
+
+impl eframe::App for App {
+    fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
+        self.mods.poll();
+        let mut reload_library = false;
+        let mut reload_artwork = false;
+        if let Some(workflows) = &mut self.native_workflows {
+            workflows.prepare_blue_history(self.router.current.section() == Section::History);
+            workflows.poll(ui.ctx(), &mut self.activity);
+            if self.load_job.is_none() {
+                reload_library =
+                    workflows.take_source_library_reload() | workflows.take_dat_identity_reload();
+            }
+            if !self.artwork.index_loading {
+                reload_artwork = workflows.take_artwork_reload();
+            }
+        }
+        if reload_library {
+            self.load(false);
+        }
+        if reload_artwork {
+            self.refresh_artwork_index();
+        }
+        self.poll(ui.ctx());
+        self.show(ui.ctx());
+        self.simple.paint_focus_ring(ui.ctx());
+        self.finish_frame();
+    }
+}

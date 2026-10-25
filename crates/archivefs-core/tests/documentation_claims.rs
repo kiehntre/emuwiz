@@ -9,6 +9,8 @@
 //! tested, wired feature. These tests read the actual files rather than a
 //! copy, so they fail the moment either claim reappears.
 
+archivefs_core::install_test_environment!();
+
 use std::fs;
 use std::path::PathBuf;
 

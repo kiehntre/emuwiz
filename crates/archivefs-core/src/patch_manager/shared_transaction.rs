@@ -16,16 +16,27 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
-use super::destination_safety::{DestinationState, assess_destination, validate_destination_root};
+use super::destination_safety::{
+    DestinationRootState, DestinationState, assess_destination, validate_destination_root,
+    validate_single_component,
+};
 use super::shared_preview::{
     PreviewAdapter, PreviewDestinationState, PreviewEligibility, PreviewProposedAction,
     SharedPreviewReport,
 };
 use crate::default_database_path;
+use crate::identity_source::hackhash::HackHashPatchProvenance;
 
 pub const SHARED_APPLY_SCHEMA_VERSION: u32 = 1;
+/// Version for the durable intent/checkpoint envelope.  It is deliberately
+/// separate from `SharedApplyJournal`: old final-only receipts remain
+/// readable as legacy completed receipts.
+pub const SHARED_DURABLE_JOURNAL_SCHEMA_VERSION: u32 = 1;
 pub const SHARED_MAX_ENTRIES: usize = 128;
 pub const SHARED_MAX_SOURCE_BYTES: u64 = 1024 * 1024;
+/// ROM-sized generated outputs use a separate bounded in-memory lane. The
+/// ordinary shared source lane remains deliberately small for config files.
+pub const SHARED_MAX_MATERIALIZED_BYTES: u64 = 512 * 1024 * 1024;
 pub const SHARED_MAX_TOTAL_WRITTEN_BYTES: u64 = 32 * 1024 * 1024;
 pub const SHARED_MAX_BACKUP_BYTES: u64 = 32 * 1024 * 1024;
 pub const SHARED_MAX_JOURNAL_BYTES: u64 = 2 * 1024 * 1024;
@@ -61,7 +72,7 @@ fn default_managed_root(name: &str) -> Result<PathBuf, SharedApplyFailure> {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum FaultPoint {
+pub(super) enum FaultPoint {
     BackupWrite,
     TemporaryWrite,
     Flush,
@@ -73,16 +84,29 @@ enum FaultPoint {
     DestinationMutation,
     RollbackRemovalVerification,
     RollbackRestore,
+    ApplyCheckpoint,
+    RollbackCheckpoint,
+    RollbackAfterMutation,
+    TerminalJournal,
+    DurableJournalWrite,
 }
 
 #[cfg(test)]
 thread_local! {
     static INJECTED_FAULT: std::cell::Cell<Option<FaultPoint>> = const { std::cell::Cell::new(None) };
+    static INJECTED_AFTER: std::cell::Cell<Option<(FaultPoint, usize)>> = const { std::cell::Cell::new(None) };
 }
 
 #[cfg(test)]
-fn inject_fault(point: Option<FaultPoint>) {
+pub(super) fn inject_fault(point: Option<FaultPoint>) {
     INJECTED_FAULT.with(|fault| fault.set(point));
+    INJECTED_AFTER.with(|fault| fault.set(None));
+}
+
+#[cfg(test)]
+pub(super) fn inject_fault_after(point: FaultPoint, occurrences: usize) {
+    INJECTED_FAULT.with(|fault| fault.set(None));
+    INJECTED_AFTER.with(|fault| fault.set(Some((point, occurrences))));
 }
 
 #[cfg(test)]
@@ -90,8 +114,31 @@ fn should_inject(point: FaultPoint) -> bool {
     INJECTED_FAULT.with(|fault| fault.get() == Some(point))
 }
 
+#[cfg(test)]
+fn should_inject_after(point: FaultPoint) -> bool {
+    INJECTED_AFTER.with(|fault| {
+        let Some((configured, remaining)) = fault.get() else {
+            return false;
+        };
+        if configured != point {
+            return false;
+        }
+        if remaining == 0 {
+            true
+        } else {
+            fault.set(Some((configured, remaining - 1)));
+            false
+        }
+    })
+}
+
 #[cfg(not(test))]
 fn should_inject(_point: FaultPoint) -> bool {
+    false
+}
+
+#[cfg(not(test))]
+fn should_inject_after(_point: FaultPoint) -> bool {
     false
 }
 
@@ -106,8 +153,22 @@ pub fn adapter_write_support(adapter: PreviewAdapter) -> SharedAdapterWriteSuppo
     match adapter {
         PreviewAdapter::RetroArch
         | PreviewAdapter::Pcsx2
+        | PreviewAdapter::DuckStation
+        | PreviewAdapter::MelonDs
         | PreviewAdapter::Dolphin
-        | PreviewAdapter::Xenia => SharedAdapterWriteSupport::ApplyAndRollback,
+        | PreviewAdapter::Ppsspp
+        | PreviewAdapter::Xenia
+        | PreviewAdapter::LocalModPackage
+        | PreviewAdapter::CemuGraphicPack
+        | PreviewAdapter::Rpcs3OrdinaryMod
+        | PreviewAdapter::Mame
+        | PreviewAdapter::Flycast
+        | PreviewAdapter::Mgba
+        | PreviewAdapter::Rpcs3Patch
+        | PreviewAdapter::Mednafen
+        | PreviewAdapter::Fbneo
+        | PreviewAdapter::AmigaWhdloadTrainer
+        | PreviewAdapter::ScummVmTrainer => SharedAdapterWriteSupport::ApplyAndRollback,
     }
 }
 
@@ -249,6 +310,25 @@ pub struct SharedPlanEntry {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum SharedContentVerification {
+    /// Marks a plan produced by the local generic-mod adapter.  Unlike the
+    /// emulator-specific adapters, its destination may contain any number of
+    /// safe normal path components beneath the approved game root.
+    LocalModPackage,
+    CemuGraphicPack,
+    Rpcs3OrdinaryMod,
+    RetroArchBezel,
+    HackHashPatch {
+        base_hash: String,
+        patch_hash: String,
+        expected_output_sha1: String,
+        expected_output_md5: String,
+        expected_output_crc32: String,
+        expected_output_hash: String,
+        provider_snapshot_hash: String,
+        tool: String,
+        #[serde(default)]
+        provenance: Option<HackHashPatchProvenance>,
+    },
     DolphinManagedGameHacking {
         expected_managed_names: Vec<String>,
         require_managed_section: bool,
@@ -291,6 +371,17 @@ pub struct SharedApplyOptions {
     pub current_context: SharedApplyContext,
     pub history_root: PathBuf,
     pub backup_root: PathBuf,
+}
+
+/// Generated output handed directly to the shared atomic writer. No staging
+/// file is created outside the shared journal.
+#[derive(Debug, Clone)]
+pub struct SharedMaterializedOutput {
+    pub source_path: PathBuf,
+    pub source_digest: String,
+    pub output_digest: String,
+    pub bytes: Vec<u8>,
+    pub guard_paths: Vec<(PathBuf, String)>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -344,6 +435,113 @@ pub enum SharedApplyStatus {
     Failed,
 }
 
+/// Durable state of the shared transaction envelope.  These states are
+/// descriptive only; discovery never resumes or mutates a transaction.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SharedRecoveryState {
+    Planned,
+    Applying,
+    Applied,
+    ApplyFailed,
+    RollingBack,
+    RolledBack,
+    RollbackFailed,
+    NeedsReview,
+    UnsafeToResume,
+    LegacyComplete,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SharedEntryRecoveryState {
+    Planned,
+    Applying,
+    BackupCreated,
+    DestinationTempWritten,
+    DestinationReplaced,
+    DestinationVerified,
+    Applied,
+    RollingBack,
+    RolledBack,
+    NeedsReview,
+    UnsafeToResume,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SharedDurableEntry {
+    pub plan_entry: SharedPlanEntry,
+    pub state: SharedEntryRecoveryState,
+    pub observed_destination_digest: Option<String>,
+    pub backup_path: Option<SharedTransactionPath>,
+    pub backup_digest: Option<String>,
+    pub resulting_destination_digest: Option<String>,
+    pub temporary_path: Option<SharedTransactionPath>,
+    pub destination_existed_before_apply: Option<bool>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SharedDurableJournal {
+    pub schema_version: u32,
+    pub transaction_state: SharedRecoveryState,
+    pub operation_id: String,
+    pub operation_type: String,
+    pub plan_id: String,
+    pub timestamp_unix_seconds: u64,
+    pub context: SharedApplyContext,
+    pub approved_source_root: SharedTransactionPath,
+    pub destination_root: SharedTransactionPath,
+    pub backup_root: SharedTransactionPath,
+    pub entries: Vec<SharedDurableEntry>,
+    #[serde(default)]
+    pub created_root_directories: Vec<SharedCreatedRootDirectory>,
+    pub rollback_operation_id: Option<String>,
+    #[serde(default)]
+    pub rollback_of_operation_id: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SharedPendingOperation {
+    pub journal_path: SharedTransactionPath,
+    pub journal: SharedDurableJournal,
+    pub reconciled_entries: Vec<SharedEntryRecoveryState>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SharedPendingRecoveryPlan {
+    pub operation_id: String,
+    pub state: SharedRecoveryState,
+    pub can_safe_rollback: bool,
+    pub can_resume: bool,
+    pub reason: String,
+}
+
+/// The stable filesystem identity of one directory, captured via `fstat` on
+/// an already-open, no-follow-opened descriptor at the moment
+/// [`bootstrap_missing_destination_root`] created it - never re-derived
+/// from a pathname later. This is the proof rollback checks before it will
+/// ever remove a bootstrap-created directory: a directory that now exists
+/// at the same *path* but has a different `(device, inode)` pair is a
+/// replacement, never the one this transaction made, and is never touched.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SharedDirectoryIdentity {
+    pub device: u64,
+    pub inode: u64,
+}
+
+/// One destination-root directory level [`bootstrap_missing_destination_root`]
+/// created. `identity` is `Option` only so that a malformed/tampered
+/// journal entry that omits it deserializes instead of poisoning the whole
+/// journal - [`validate_created_root_chain`] treats a missing identity as
+/// unprovable ownership and refuses to act on it, and no code path this
+/// module controls ever writes an entry without one.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SharedCreatedRootDirectory {
+    pub path: SharedTransactionPath,
+    #[serde(default)]
+    pub identity: Option<SharedDirectoryIdentity>,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SharedApplyJournal {
     pub schema_version: u32,
@@ -353,6 +551,33 @@ pub struct SharedApplyJournal {
     pub context: SharedApplyContext,
     pub approved_source_root: SharedTransactionPath,
     pub destination_root: SharedTransactionPath,
+    /// Destination-root directory levels this transaction itself created
+    /// because `destination_root` (or one of its ancestors up to the
+    /// nearest already-existing directory) did not exist yet - see
+    /// `bootstrap_missing_destination_root`. Ordered outermost-created
+    /// first, so `destination_root` itself (when created) is always last.
+    ///
+    /// Deliberately separate from each [`SharedApplyEntry::created_directories`]
+    /// (ordinary child directories, e.g. a platform folder, created *below*
+    /// an already-existing or already-bootstrapped root): this field alone
+    /// is how rollback tells "the root existed before EmuWiz" from "this
+    /// transaction created the root," which an ordinary child-directory
+    /// entry can never express.
+    ///
+    /// Untrusted, persisted input by the time rollback reads it back -
+    /// never acted on directly. See [`validate_created_root_chain`] for the
+    /// full set of structural checks a claimed chain must pass before
+    /// anything here is even opened, let alone removed.
+    ///
+    /// `#[serde(default)]` so a journal written before this field existed
+    /// deserializes with an empty list - meaning nothing here for it, since
+    /// no journal written by older code could ever have bootstrapped a
+    /// root. Its rollback behaviour is therefore unchanged for every old
+    /// journal: an empty list carries no root-cleanup authority at all, and
+    /// there is no way to reinterpret an absent field into one - see
+    /// [`cleanup_transaction_created_root_directories`].
+    #[serde(default)]
+    pub created_root_directories: Vec<SharedCreatedRootDirectory>,
     pub dry_run: bool,
     pub entries: Vec<SharedApplyEntry>,
     pub status: SharedApplyStatus,
@@ -614,9 +839,114 @@ pub fn require_dolphin_managed_gamehacking_verification(
     Ok(())
 }
 
+/// Marks a validated local generic-mod plan as using the generic safe-path
+/// destination contract and reseals its plan digest.
+pub fn require_local_mod_package_verification(
+    plan: &mut SharedTransactionPlan,
+) -> Result<(), SharedApplyFailure> {
+    if plan.context.source_mode != "local_mod_package" || plan.entries.is_empty() {
+        return Err(failure(
+            SharedApplyFailureKind::InvalidPlan,
+            None,
+            "local-mod verification requires a local package transaction",
+        ));
+    }
+    for entry in &mut plan.entries {
+        entry.content_verification = Some(SharedContentVerification::LocalModPackage);
+    }
+    plan.plan_id.clear();
+    plan.plan_id = plan_digest(plan)?;
+    Ok(())
+}
+
+/// Marks a Cemu graphic-pack plan as using its reviewed nested-path contract
+/// and reseals the plan before it can be applied.
+pub fn require_cemu_graphic_pack_verification(
+    plan: &mut SharedTransactionPlan,
+) -> Result<(), SharedApplyFailure> {
+    if plan.context.adapter != PreviewAdapter::CemuGraphicPack
+        || plan.context.source_mode != "cemu_graphic_pack"
+        || plan.entries.is_empty()
+    {
+        return Err(failure(
+            SharedApplyFailureKind::InvalidPlan,
+            None,
+            "Cemu graphic-pack verification requires a Cemu graphic-pack transaction",
+        ));
+    }
+    for entry in &mut plan.entries {
+        entry.content_verification = Some(SharedContentVerification::CemuGraphicPack);
+    }
+    plan.plan_id.clear();
+    plan.plan_id = plan_digest(plan)?;
+    Ok(())
+}
+
+/// Marks a validated ordinary RPCS3 file-layer mod as using the reviewed
+/// nested-path contract and reseals its plan before it can be applied.
+pub fn require_rpcs3_ordinary_mod_verification(
+    plan: &mut SharedTransactionPlan,
+) -> Result<(), SharedApplyFailure> {
+    if plan.context.adapter != PreviewAdapter::Rpcs3OrdinaryMod
+        || plan.context.source_mode != "rpcs3_ordinary_mod"
+        || plan.entries.is_empty()
+    {
+        return Err(failure(
+            SharedApplyFailureKind::InvalidPlan,
+            None,
+            "RPCS3 ordinary-mod verification requires an RPCS3 ordinary-mod transaction",
+        ));
+    }
+    for entry in &mut plan.entries {
+        entry.content_verification = Some(SharedContentVerification::Rpcs3OrdinaryMod);
+    }
+    plan.plan_id.clear();
+    plan.plan_id = plan_digest(plan)?;
+    Ok(())
+}
+
+/// Marks a RetroArch bezel transaction as using the reviewed nested override
+/// path contract and reseals its digest before apply.
+pub fn require_retroarch_bezel_verification(
+    plan: &mut SharedTransactionPlan,
+) -> Result<(), SharedApplyFailure> {
+    if plan.context.adapter != PreviewAdapter::RetroArch
+        || plan.context.source_mode != "retroarch_bezel"
+        || plan.entries.is_empty()
+    {
+        return Err(failure(
+            SharedApplyFailureKind::InvalidPlan,
+            None,
+            "RetroArch bezel verification requires a RetroArch bezel transaction",
+        ));
+    }
+    for entry in &mut plan.entries {
+        entry.content_verification = Some(SharedContentVerification::RetroArchBezel);
+    }
+    plan.plan_id.clear();
+    plan.plan_id = plan_digest(plan)?;
+    Ok(())
+}
+
 pub fn execute_shared_apply(
     plan: &SharedTransactionPlan,
     options: &SharedApplyOptions,
+) -> SharedApplyResult {
+    execute_shared_apply_internal(plan, options, None)
+}
+
+pub fn execute_shared_materialized_apply(
+    plan: &SharedTransactionPlan,
+    options: &SharedApplyOptions,
+    materialized: &SharedMaterializedOutput,
+) -> SharedApplyResult {
+    execute_shared_apply_internal(plan, options, Some(materialized))
+}
+
+fn execute_shared_apply_internal(
+    plan: &SharedTransactionPlan,
+    options: &SharedApplyOptions,
+    materialized: Option<&SharedMaterializedOutput>,
 ) -> SharedApplyResult {
     let effective_dry_run = options.dry_run
         || options
@@ -631,6 +961,7 @@ pub fn execute_shared_apply(
         context: plan.context.clone(),
         approved_source_root: plan.approved_source_root.clone(),
         destination_root: plan.destination_root.clone(),
+        created_root_directories: Vec::new(),
         dry_run: effective_dry_run,
         entries: Vec::new(),
         status: SharedApplyStatus::DryRun,
@@ -685,12 +1016,20 @@ pub fn execute_shared_apply(
         let duplicate = operation.as_ref().ok().is_some_and(|operation| {
             fs::symlink_metadata(options.history_root.join(format!("{operation}.json"))).is_ok()
         });
+        let pending_duplicate = operation.as_ref().ok().is_some_and(|operation| {
+            fs::symlink_metadata(
+                options
+                    .history_root
+                    .join(format!("{operation}.pending.json")),
+            )
+            .is_ok()
+        });
         let managed_overlap = roots_overlap(&options.history_root, &source_root)
             || roots_overlap(&options.history_root, &destination_root)
             || roots_overlap(&options.backup_root, &source_root)
             || roots_overlap(&options.backup_root, &destination_root);
-        if operation.is_err() || duplicate || managed_overlap {
-            let (kind, detail) = if duplicate {
+        if operation.is_err() || duplicate || pending_duplicate || managed_overlap {
+            let (kind, detail) = if duplicate || pending_duplicate {
                 (
                     SharedApplyFailureKind::DuplicateOperationId,
                     "operation ID already has a journal",
@@ -719,11 +1058,79 @@ pub fn execute_shared_apply(
             };
         }
     }
-    let mut lock = None;
+    let pending_path = pending_journal_path(&options.history_root, &options.operation_id).ok();
+    let mut durable = durable_journal_from_plan(plan, options);
     if !effective_dry_run {
+        if let Err(error) = write_pending_journal(&durable, &options.history_root) {
+            journal.entries = plan
+                .entries
+                .iter()
+                .map(|entry| failed_entry(entry, error.kind, "durable intent could not be written"))
+                .collect();
+            journal.status = SharedApplyStatus::Failed;
+            return SharedApplyResult {
+                journal,
+                journal_path: None,
+                journal_failure: Some(error),
+            };
+        }
+        durable.transaction_state = SharedRecoveryState::Applying;
+        if let Err(error) = write_pending_journal(&durable, &options.history_root) {
+            journal.status = SharedApplyStatus::Failed;
+            return SharedApplyResult {
+                journal,
+                journal_path: None,
+                journal_failure: Some(error),
+            };
+        }
+    }
+    let mut lock = None;
+    let mut created_root_directories: Vec<CreatedRootDirectory> = Vec::new();
+    if !effective_dry_run {
+        // Bootstrap is only ever attempted for a plan the preview step
+        // already flagged as needing parent creation (`DestinationParentsMissing`,
+        // surfaced through `SharedPlanEntry::parent_creation_approved`) -
+        // the exact same consent an ordinary missing child directory
+        // already requires under `apply_one`. A missing root the user was
+        // never shown falls straight through to `RootLock::acquire` below,
+        // unchanged from before this existed.
+        let root_creation_approved = plan
+            .entries
+            .iter()
+            .any(|entry| entry.parent_creation_approved);
+        if root_creation_approved {
+            match bootstrap_missing_destination_root(&destination_root) {
+                Ok(created) => created_root_directories = created,
+                Err(kind) => {
+                    journal.entries = plan
+                        .entries
+                        .iter()
+                        .map(|entry| {
+                            failed_entry(
+                                entry,
+                                kind,
+                                "destination root could not be safely created",
+                            )
+                        })
+                        .collect();
+                    journal.status = SharedApplyStatus::Failed;
+                    return SharedApplyResult {
+                        journal,
+                        journal_path: None,
+                        journal_failure: None,
+                    };
+                }
+            }
+        }
         match RootLock::acquire(&destination_root, LOCK_TIMEOUT) {
             Ok(guard) => lock = Some(guard),
             Err(kind) => {
+                // Nothing was journaled yet, so an empty root this call
+                // itself just created would otherwise be orphaned with no
+                // journal ever able to clean it up later. Descriptor-
+                // anchored and identity-verified, exactly like real
+                // rollback - see `remove_verified_root_chain`.
+                remove_verified_root_chain(&created_root_directories);
                 journal.entries = plan
                     .entries
                     .iter()
@@ -737,12 +1144,34 @@ pub fn execute_shared_apply(
                 };
             }
         }
+        durable.created_root_directories = created_root_directories
+            .iter()
+            .map(|entry| SharedCreatedRootDirectory {
+                path: SharedTransactionPath::from_path(&entry.path),
+                identity: Some(entry.identity),
+            })
+            .collect();
+        if let Err(error) = write_pending_journal(&durable, &options.history_root) {
+            journal.status = SharedApplyStatus::Failed;
+            return SharedApplyResult {
+                journal,
+                journal_path: None,
+                journal_failure: Some(error),
+            };
+        }
     }
     let replacement_approved = confirmation.is_some_and(|value| value.replacement_approved);
     let mut written = 0_u64;
     let mut backup_bytes = 0_u64;
-    for entry in &plan.entries {
-        journal.entries.push(apply_one(
+    for (index, entry) in plan.entries.iter().enumerate() {
+        let mut checkpoint = |state: SharedEntryRecoveryState, value: &SharedApplyEntry| {
+            update_durable_entry(&mut durable, index, value);
+            if let Some(durable_entry) = durable.entries.get_mut(index) {
+                durable_entry.state = state;
+            }
+            write_pending_journal(&durable, &options.history_root).is_ok()
+        };
+        let applied_entry = apply_one(
             entry,
             &source_root,
             &destination_root,
@@ -752,9 +1181,68 @@ pub fn execute_shared_apply(
             replacement_approved,
             &mut written,
             &mut backup_bytes,
-        ));
+            materialized,
+            &mut checkpoint,
+        );
+        journal.entries.push(applied_entry.clone());
+        update_durable_entry(&mut durable, index, &applied_entry);
+        if !effective_dry_run {
+            if should_inject(FaultPoint::ApplyCheckpoint)
+                || should_inject_after(FaultPoint::ApplyCheckpoint)
+            {
+                durable.transaction_state = SharedRecoveryState::Applying;
+                let error = failure(
+                    SharedApplyFailureKind::JournalFailed,
+                    None,
+                    "injected interruption before apply checkpoint",
+                );
+                return SharedApplyResult {
+                    journal,
+                    journal_path: None,
+                    journal_failure: Some(error),
+                };
+            }
+            if let Err(error) = write_pending_journal(&durable, &options.history_root) {
+                durable.transaction_state = SharedRecoveryState::ApplyFailed;
+                let _ = write_pending_journal(&durable, &options.history_root);
+                return SharedApplyResult {
+                    journal,
+                    journal_path: None,
+                    journal_failure: Some(error),
+                };
+            }
+        }
+    }
+    if !effective_dry_run && !created_root_directories.is_empty() {
+        let any_write = journal.entries.iter().any(|entry| {
+            matches!(
+                entry.outcome,
+                SharedApplyOutcome::InstalledNew | SharedApplyOutcome::ReplacedExisting
+            )
+        });
+        if !any_write {
+            // Nothing was actually installed under the bootstrap-created
+            // root: clean it up immediately, in this same call (the lock
+            // is still held), rather than leaving an empty root a journal
+            // would otherwise claim ownership of that normal rollback can
+            // never reach - rollback requires at least one installed,
+            // `Available` per-file entry, which an all-failed apply never
+            // has. Truncated to whatever `remove_verified_root_chain`
+            // actually removed (deepest-first, stopping at the first
+            // unremovable level), so the journal below never claims
+            // ownership of something already gone from disk.
+            let removed = remove_verified_root_chain(&created_root_directories);
+            created_root_directories.truncate(created_root_directories.len() - removed);
+        }
     }
     drop(lock);
+    journal.created_root_directories = created_root_directories
+        .iter()
+        .map(|entry| SharedCreatedRootDirectory {
+            path: SharedTransactionPath::from_path(&entry.path),
+            identity: Some(entry.identity),
+        })
+        .collect();
     journal.status = derive_status(&journal.entries, effective_dry_run);
     log::info!(
         "shared apply {}: {:?}, {} entr(y/ies), {} byte(s) written",
@@ -770,6 +1258,17 @@ pub fn execute_shared_apply(
             journal_failure: None,
         };
     }
+    if should_inject(FaultPoint::TerminalJournal) {
+        return SharedApplyResult {
+            journal,
+            journal_path: None,
+            journal_failure: Some(failure(
+                SharedApplyFailureKind::JournalFailed,
+                None,
+                "injected interruption before terminal journal write",
+            )),
+        };
+    }
     match write_journal_once(&journal, &options.history_root) {
         Ok(path) => {
             log::info!(
@@ -777,6 +1276,25 @@ pub fn execute_shared_apply(
                 journal.operation_id,
                 path.display(),
             );
+            durable.transaction_state = match journal.status {
+                SharedApplyStatus::Success => SharedRecoveryState::Applied,
+                SharedApplyStatus::PartialFailure => SharedRecoveryState::ApplyFailed,
+                SharedApplyStatus::Failed => SharedRecoveryState::ApplyFailed,
+                SharedApplyStatus::DryRun => SharedRecoveryState::Planned,
+            };
+            let _ = write_pending_journal(&durable, &options.history_root);
+            let _ = pending_path.and_then(|pending| fs::remove_file(pending).ok());
+            // PCSX2 may chain a legacy-PNACH migration that re-reads this
+            // same staged root, so its caller retires the root afterwards.
+            if journal.status == SharedApplyStatus::Success
+                && plan.context.adapter != PreviewAdapter::Pcsx2
+            {
+                // The terminal journal and backups are all Undo needs; the
+                // job-private staged source is spent.
+                super::staging_job::retire_completed_staging_job(
+                    &plan.approved_source_root.to_path_buf().unwrap_or_default(),
+                );
+            }
             SharedApplyResult {
                 journal,
                 journal_path: Some(path),
@@ -809,6 +1327,8 @@ pub fn execute_shared_apply(
                     }
                 }
             }
+            durable.transaction_state = SharedRecoveryState::ApplyFailed;
+            let _ = write_pending_journal(&durable, &options.history_root);
             SharedApplyResult {
                 journal,
                 journal_path: None,
@@ -829,6 +1349,8 @@ fn apply_one(
     replacement_approved: bool,
     written: &mut u64,
     backup_bytes: &mut u64,
+    materialized: Option<&SharedMaterializedOutput>,
+    checkpoint: &mut dyn FnMut(SharedEntryRecoveryState, &SharedApplyEntry) -> bool,
 ) -> SharedApplyEntry {
     let mut result = SharedApplyEntry {
         plan_entry: plan.clone(),
@@ -888,7 +1410,12 @@ fn apply_one(
             "source is outside approved adapter scope",
         );
     }
-    let source_hash = match stable_hash(&source, SHARED_MAX_SOURCE_BYTES) {
+    let source_hash_limit = if materialized.is_some() {
+        SHARED_MAX_MATERIALIZED_BYTES
+    } else {
+        SHARED_MAX_SOURCE_BYTES
+    };
+    let source_hash = match stable_hash(&source, source_hash_limit) {
         Ok(value) => value,
         Err(kind) => {
             return fail_result(
@@ -910,7 +1437,46 @@ fn apply_one(
             "source digest changed since approved preview",
         );
     }
-    if source_hash.bytes > SHARED_MAX_TOTAL_WRITTEN_BYTES.saturating_sub(*written) {
+    let materialized = materialized.filter(|value| value.source_path == source);
+    if let Some(value) = materialized {
+        if value.source_digest != source_hash.digest
+            || value.bytes.len() as u64 > SHARED_MAX_MATERIALIZED_BYTES
+            || digest_bytes(&value.bytes) != value.output_digest
+        {
+            return fail_result(
+                result,
+                SharedApplyOutcome::SourceChanged,
+                SharedApplyFailureKind::SourceChanged,
+                Some(&source),
+                "materialized output or source precondition changed",
+            );
+        }
+        for (guard, expected) in &value.guard_paths {
+            let observed = match stable_hash(guard, SHARED_MAX_MATERIALIZED_BYTES) {
+                Ok(observed) => observed.digest,
+                Err(kind) => {
+                    return fail_result(
+                        result,
+                        SharedApplyOutcome::SourceChanged,
+                        kind,
+                        Some(guard),
+                        "materialized output guard could not be revalidated",
+                    );
+                }
+            };
+            if &observed != expected {
+                return fail_result(
+                    result,
+                    SharedApplyOutcome::SourceChanged,
+                    SharedApplyFailureKind::SourceChanged,
+                    Some(guard),
+                    "materialized output guard changed since review",
+                );
+            }
+        }
+    }
+    let output_bytes = materialized.map_or(source_hash.bytes, |value| value.bytes.len() as u64);
+    if output_bytes > SHARED_MAX_TOTAL_WRITTEN_BYTES.saturating_sub(*written) {
         return fail_result(
             result,
             SharedApplyOutcome::WriteFailed,
@@ -919,16 +1485,54 @@ fn apply_one(
             "transaction write-byte limit reached",
         );
     }
-    let Some((category, filename)) = exactly_two_components(&relative) else {
-        return fail_result(
-            result,
-            SharedApplyOutcome::SkippedConflict,
-            SharedApplyFailureKind::DestinationUnsafe,
-            None,
-            "destination must contain exactly two normal components",
-        );
+    let nested_mod_package = matches!(
+        plan.content_verification.as_ref(),
+        Some(
+            SharedContentVerification::LocalModPackage
+                | SharedContentVerification::CemuGraphicPack
+                | SharedContentVerification::Rpcs3OrdinaryMod
+                | SharedContentVerification::RetroArchBezel
+                | SharedContentVerification::HackHashPatch { .. }
+        )
+    ) || matches!(
+        plan.adapter,
+        PreviewAdapter::Flycast
+            | PreviewAdapter::MelonDs
+            | PreviewAdapter::Mgba
+            | PreviewAdapter::AmigaWhdloadTrainer
+            | PreviewAdapter::ScummVmTrainer
+    ) || (plan.adapter == PreviewAdapter::Ppsspp
+        && relative == Path::new(&format!("{}.ini", plan.verified_game_identity)))
+        || (plan.adapter == PreviewAdapter::Rpcs3Patch
+            && relative == Path::new("patch_config.yml"));
+    let assessment = if nested_mod_package {
+        assess_local_mod_destination(destination_root, &relative)
+    } else {
+        let Some((category, filename)) = exactly_two_components(&relative) else {
+            return fail_result(
+                result,
+                SharedApplyOutcome::SkippedConflict,
+                SharedApplyFailureKind::DestinationUnsafe,
+                None,
+                "destination must contain exactly two normal components",
+            );
+        };
+        assess_destination(destination_root, &category, &filename)
+            .map(|assessment| {
+                (
+                    assessment.destination_state,
+                    assessment.proposed_destination.path().to_path_buf(),
+                )
+            })
+            .map_err(|error| {
+                failure(
+                    SharedApplyFailureKind::DestinationUnsafe,
+                    Some(&error.path),
+                    &error.to_string(),
+                )
+            })
     };
-    let assessment = match assess_destination(destination_root, &category, &filename) {
+    let (destination_state, destination) = match assessment {
         Ok(value) => value,
         Err(error) => {
             return fail_result(
@@ -936,13 +1540,12 @@ fn apply_one(
                 SharedApplyOutcome::DestinationChanged,
                 SharedApplyFailureKind::DestinationUnsafe,
                 Some(destination_root),
-                &error.to_string(),
+                &error.detail,
             );
         }
     };
-    let destination = assessment.proposed_destination.path().to_path_buf();
     let parent = destination.parent().unwrap_or(destination_root);
-    let current = if assessment.destination_state == DestinationState::RegularFile {
+    let current = if destination_state == DestinationState::RegularFile {
         match stable_hash(&destination, SHARED_MAX_SOURCE_BYTES) {
             Ok(value) => Some(value),
             Err(kind) => {
@@ -971,9 +1574,9 @@ fn apply_one(
         );
     }
     let expected_state_matches = match plan.proposed_action {
-        PreviewProposedAction::Install => assessment.destination_state == DestinationState::Absent,
+        PreviewProposedAction::Install => destination_state == DestinationState::Absent,
         PreviewProposedAction::Replace | PreviewProposedAction::Skip => {
-            assessment.destination_state == DestinationState::RegularFile
+            destination_state == DestinationState::RegularFile
         }
         PreviewProposedAction::Blocked => false,
     };
@@ -986,7 +1589,7 @@ fn apply_one(
             SharedApplyOutcome::DestinationChanged,
             SharedApplyFailureKind::DestinationChanged,
             Some(&destination),
-            "destination state or digest changed since approved preview",
+            "destination state or digest changed since approved preview (another install may have written it); nothing was changed - review the current file and preview again",
         );
     }
     if plan.proposed_action == PreviewProposedAction::Skip {
@@ -1019,15 +1622,24 @@ fn apply_one(
         return result;
     }
     if !parent.exists() {
-        if !plan.parent_creation_approved
-            || !matches!(
-                plan.adapter,
-                PreviewAdapter::RetroArch
-                    | PreviewAdapter::Pcsx2
-                    | PreviewAdapter::Dolphin
-                    | PreviewAdapter::Xenia
-            )
-        {
+        let adapter_allows_parent_creation = matches!(
+            plan.adapter,
+            PreviewAdapter::RetroArch
+                | PreviewAdapter::Pcsx2
+                | PreviewAdapter::DuckStation
+                | PreviewAdapter::MelonDs
+                | PreviewAdapter::Dolphin
+                | PreviewAdapter::Ppsspp
+                | PreviewAdapter::Xenia
+                | PreviewAdapter::LocalModPackage
+                | PreviewAdapter::CemuGraphicPack
+                | PreviewAdapter::Rpcs3OrdinaryMod
+                | PreviewAdapter::Mednafen
+                | PreviewAdapter::Fbneo
+                | PreviewAdapter::AmigaWhdloadTrainer
+                | PreviewAdapter::ScummVmTrainer
+        );
+        if !plan.parent_creation_approved || !adapter_allows_parent_creation {
             return fail_result(
                 result,
                 SharedApplyOutcome::WriteFailed,
@@ -1036,18 +1648,31 @@ fn apply_one(
                 "parent creation was not approved by preview and adapter contract",
             );
         }
-        if let Err(kind) = create_one_parent(destination_root, parent) {
-            return fail_result(
-                result,
-                SharedApplyOutcome::WriteFailed,
-                kind,
-                Some(parent),
-                "approved destination parent could not be created safely",
-            );
+        let create = if nested_mod_package {
+            create_local_mod_parents(destination_root, parent)
+        } else {
+            create_one_parent(destination_root, parent).map(|()| vec![parent.to_path_buf()])
+        };
+        let created_dirs = match create {
+            Ok(dirs) => dirs,
+            Err(kind) => {
+                return fail_result(
+                    result,
+                    SharedApplyOutcome::WriteFailed,
+                    kind,
+                    Some(parent),
+                    "approved destination parent could not be created safely",
+                );
+            }
+        };
+        // Every directory level this transaction actually created, so rollback
+        // removes each one (innermost first) and leaves no empty scaffold
+        // behind - not just the immediate parent.
+        for dir in &created_dirs {
+            result
+                .created_directories
+                .push(SharedTransactionPath::from_path(dir));
         }
-        result
-            .created_directories
-            .push(SharedTransactionPath::from_path(parent));
     }
     if plan.proposed_action == PreviewProposedAction::Replace {
         let Some(existing) = current.as_ref() else {
@@ -1074,6 +1699,15 @@ fn apply_one(
                 result.backup_path = Some(SharedTransactionPath::from_path(&path));
                 result.backup_digest = Some(existing.digest.clone());
                 result.stages.push(SharedTransactionStage::BackupCreated);
+                if !checkpoint(SharedEntryRecoveryState::BackupCreated, &result) {
+                    return fail_result(
+                        result,
+                        SharedApplyOutcome::BackupFailed,
+                        SharedApplyFailureKind::JournalFailed,
+                        Some(&destination),
+                        "backup was created but its durable checkpoint failed",
+                    );
+                }
             }
             Err(error) => {
                 result.stages.push(SharedTransactionStage::BackupFailed);
@@ -1087,17 +1721,48 @@ fn apply_one(
             }
         }
     }
-    match atomic_write(
-        &source,
-        &destination,
-        &source_hash.digest,
-        plan.proposed_action == PreviewProposedAction::Install,
-    ) {
+    if !checkpoint(SharedEntryRecoveryState::Applying, &result) {
+        return fail_result(
+            result,
+            SharedApplyOutcome::WriteFailed,
+            SharedApplyFailureKind::JournalFailed,
+            Some(&destination),
+            "destination mutation intent checkpoint failed",
+        );
+    }
+    let output_digest = materialized.map_or_else(
+        || source_hash.digest.clone(),
+        |value| value.output_digest.clone(),
+    );
+    let write_result = match materialized {
+        Some(value) => atomic_write_bytes(
+            &value.bytes,
+            &destination,
+            &output_digest,
+            plan.proposed_action == PreviewProposedAction::Install,
+        ),
+        None => atomic_write(
+            &source,
+            &destination,
+            &output_digest,
+            plan.proposed_action == PreviewProposedAction::Install,
+        ),
+    };
+    match write_result {
         Ok(temp) => {
             result.temporary_path = Some(SharedTransactionPath::from_path(&temp));
+            if !checkpoint(SharedEntryRecoveryState::DestinationReplaced, &result) {
+                return fail_result(
+                    result,
+                    SharedApplyOutcome::WriteFailed,
+                    SharedApplyFailureKind::JournalFailed,
+                    Some(&destination),
+                    "destination was replaced but its durable checkpoint failed",
+                );
+            }
             match verify_entry_content(plan, &destination) {
                 Ok(()) => {
-                    result.final_destination_digest = Some(source_hash.digest);
+                    result.final_destination_digest = Some(output_digest.clone());
                     result.verification_succeeded = true;
                     result.outcome = if plan.proposed_action == PreviewProposedAction::Install {
                         SharedApplyOutcome::InstalledNew
@@ -1105,7 +1770,16 @@ fn apply_one(
                         SharedApplyOutcome::ReplacedExisting
                     };
                     result.stages.push(SharedTransactionStage::Success);
-                    *written += source_hash.bytes;
+                    if !checkpoint(SharedEntryRecoveryState::DestinationVerified, &result) {
+                        return fail_result(
+                            result,
+                            SharedApplyOutcome::VerificationFailed,
+                            SharedApplyFailureKind::JournalFailed,
+                            Some(&destination),
+                            "verified destination checkpoint failed",
+                        );
+                    }
+                    *written += output_bytes;
                 }
                 Err(detail) => {
                     let restore = restore_after_failed_verification(plan, &result, &destination);
@@ -1147,6 +1821,31 @@ fn verify_entry_content(plan: &SharedPlanEntry, destination: &Path) -> Result<()
     let Some(contract) = &plan.content_verification else {
         return Ok(());
     };
+    if let SharedContentVerification::HackHashPatch {
+        expected_output_hash,
+        ..
+    } = contract
+    {
+        let observed = stable_hash(destination, SHARED_MAX_MATERIALIZED_BYTES)
+            .map_err(|kind| format!("live patched ROM could not be re-read: {kind:?}"))?;
+        return if observed.digest == *expected_output_hash {
+            Ok(())
+        } else {
+            Err("live patched ROM hash differs from the prepared output".into())
+        };
+    }
+    // These contracts have no text-level check, and their files (bezel
+    // images, mod packages) are often binary, so a UTF-8 read would only
+    // reject correct installs.
+    if matches!(
+        contract,
+        SharedContentVerification::LocalModPackage
+            | SharedContentVerification::CemuGraphicPack
+            | SharedContentVerification::Rpcs3OrdinaryMod
+            | SharedContentVerification::RetroArchBezel
+    ) {
+        return Ok(());
+    }
     let bytes = read_bounded(destination, SHARED_MAX_SOURCE_BYTES)
         .map_err(|kind| format!("live target could not be re-read: {kind:?}"))?;
     let text =
@@ -1195,6 +1894,104 @@ fn verify_entry_content(plan: &SharedPlanEntry, destination: &Path) -> Result<()
             }
             Ok(())
         }
+        SharedContentVerification::LocalModPackage
+        | SharedContentVerification::CemuGraphicPack
+        | SharedContentVerification::Rpcs3OrdinaryMod
+        | SharedContentVerification::RetroArchBezel
+        | SharedContentVerification::HackHashPatch { .. } => Ok(()),
+    }
+}
+
+/// Revalidate an arbitrary, safe relative path for a local mod package. The
+/// existing adapter contracts intentionally restrict their destinations to
+/// two components; the genuinely-new part here is walking N parents. Root
+/// validation and per-component traversal/absolute-path checks are delegated
+/// to `destination_safety` rather than reimplemented.
+fn assess_local_mod_destination(
+    root: &Path,
+    relative: &Path,
+) -> Result<(DestinationState, PathBuf), SharedApplyFailure> {
+    validate_destination_root(root).map_err(|error| {
+        failure(
+            SharedApplyFailureKind::DestinationUnsafe,
+            Some(root),
+            &error.to_string(),
+        )
+    })?;
+    if relative.as_os_str().is_empty() {
+        return Err(failure(
+            SharedApplyFailureKind::DestinationUnsafe,
+            Some(relative),
+            "local mod destination is empty",
+        ));
+    }
+    for component in relative.components() {
+        let Component::Normal(name) = component else {
+            return Err(failure(
+                SharedApplyFailureKind::DestinationUnsafe,
+                Some(relative),
+                "local mod destination must contain only normal relative components",
+            ));
+        };
+        validate_single_component(name, root).map_err(|error| {
+            failure(
+                SharedApplyFailureKind::DestinationUnsafe,
+                Some(&error.path),
+                &error.to_string(),
+            )
+        })?;
+    }
+    let destination = root.join(relative);
+    let mut current = root.to_path_buf();
+    let components: Vec<_> = relative.components().collect();
+    for component in &components[..components.len().saturating_sub(1)] {
+        current.push(component.as_os_str());
+        match fs::symlink_metadata(&current) {
+            Ok(metadata) if metadata.file_type().is_symlink() => {
+                return Err(failure(
+                    SharedApplyFailureKind::DestinationUnsafe,
+                    Some(&current),
+                    "local mod destination parent is a symlink",
+                ));
+            }
+            Ok(metadata) if !metadata.is_dir() => {
+                return Err(failure(
+                    SharedApplyFailureKind::DestinationUnsafe,
+                    Some(&current),
+                    "local mod destination parent is not a directory",
+                ));
+            }
+            Ok(_) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => {
+                return Err(failure(
+                    SharedApplyFailureKind::DestinationUnsafe,
+                    Some(&current),
+                    &format!("cannot inspect local mod destination parent: {error}"),
+                ));
+            }
+        }
+    }
+    match fs::symlink_metadata(&destination) {
+        Ok(metadata) if metadata.file_type().is_symlink() => Err(failure(
+            SharedApplyFailureKind::DestinationUnsafe,
+            Some(&destination),
+            "local mod destination is a symlink",
+        )),
+        Ok(metadata) if metadata.is_file() => Ok((DestinationState::RegularFile, destination)),
+        Ok(_) => Err(failure(
+            SharedApplyFailureKind::DestinationUnsafe,
+            Some(&destination),
+            "local mod destination is not a regular file",
+        )),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            Ok((DestinationState::Absent, destination))
+        }
+        Err(error) => Err(failure(
+            SharedApplyFailureKind::DestinationUnsafe,
+            Some(&destination),
+            &format!("cannot inspect local mod destination: {error}"),
+        )),
     }
 }
 
@@ -1241,6 +2038,14 @@ pub fn discover_shared_apply_history(history_root: &Path) -> SharedHistoryReport
                 && !path
                     .file_name()
                     .is_some_and(|name| name.to_string_lossy().ends_with(".rollback.json"))
+                && !path
+                    .file_name()
+                    .is_some_and(|name| name.to_string_lossy().ends_with(".pending.json"))
+                // Adapter receipts that group several journals into one
+                // logical operation are not journals themselves.
+                && !path
+                    .file_name()
+                    .is_some_and(|name| name.to_string_lossy().ends_with(".receipt.json"))
         })
         .collect::<Vec<_>>();
     paths.sort();
@@ -1377,8 +2182,43 @@ pub fn execute_shared_rollback(
         };
     };
     let original = read_journal(&journal_path).expect("fresh rollback preview parsed journal");
+    let mut durable = durable_journal_from_completed(
+        &original,
+        &options.rollback_operation_id,
+        &options.backup_root,
+    );
+    if write_pending_journal(&durable, &options.history_root).is_err() {
+        return SharedRollbackResult {
+            preview: fresh,
+            journal_path: None,
+            status: SharedApplyStatus::Failed,
+        };
+    }
     let mut applied = fresh.clone();
-    for (rollback, install) in applied.entries.iter_mut().zip(&original.entries) {
+    for (index, (rollback, install)) in applied
+        .entries
+        .iter_mut()
+        .zip(&original.entries)
+        .enumerate()
+    {
+        durable.transaction_state = SharedRecoveryState::RollingBack;
+        if let Some(entry) = durable.entries.get_mut(index) {
+            entry.state = SharedEntryRecoveryState::RollingBack;
+        }
+        if should_inject(FaultPoint::RollbackCheckpoint) {
+            return SharedRollbackResult {
+                preview: applied,
+                journal_path: None,
+                status: SharedApplyStatus::PartialFailure,
+            };
+        }
+        if write_pending_journal(&durable, &options.history_root).is_err() {
+            return SharedRollbackResult {
+                preview: applied,
+                journal_path: None,
+                status: SharedApplyStatus::PartialFailure,
+            };
+        }
         let destination = install
             .plan_entry
             .destination_root
@@ -1425,7 +2265,9 @@ pub fn execute_shared_rollback(
                     continue;
                 };
                 let expected = install.backup_digest.as_deref().unwrap_or_default();
-                if should_inject(FaultPoint::RollbackRestore) {
+                if should_inject(FaultPoint::RollbackRestore)
+                    || should_inject_after(FaultPoint::RollbackRestore)
+                {
                     rollback.outcome = SharedRollbackOutcome::Failed;
                     continue;
                 }
@@ -1451,7 +2293,40 @@ pub fn execute_shared_rollback(
             }
             _ => rollback.outcome = SharedRollbackOutcome::NoChangeRequired,
         }
+        if let Some(entry) = durable.entries.get_mut(index) {
+            entry.state = match rollback.outcome {
+                SharedRollbackOutcome::RemovedInstalledFile
+                | SharedRollbackOutcome::RestoredBackup
+                | SharedRollbackOutcome::NoChangeRequired => SharedEntryRecoveryState::RolledBack,
+                SharedRollbackOutcome::Failed => SharedEntryRecoveryState::NeedsReview,
+                _ => SharedEntryRecoveryState::RollingBack,
+            };
+        }
+        if should_inject(FaultPoint::RollbackAfterMutation) {
+            durable.transaction_state = SharedRecoveryState::RollingBack;
+            return SharedRollbackResult {
+                preview: applied,
+                journal_path: None,
+                status: SharedApplyStatus::PartialFailure,
+            };
+        }
+        if write_pending_journal(&durable, &options.history_root).is_err() {
+            durable.transaction_state = SharedRecoveryState::RollbackFailed;
+            let _ = write_pending_journal(&durable, &options.history_root);
+            return SharedRollbackResult {
+                preview: applied,
+                journal_path: None,
+                status: SharedApplyStatus::PartialFailure,
+            };
+        }
     }
+    // Every per-entry installed file/child directory above has already
+    // been removed (or left in place on failure) - only now can a
+    // transaction-created root directory possibly be empty, so this always
+    // runs last, and is a no-op for a journal that never bootstrapped a
+    // root at all (including every journal written before that field
+    // existed).
+    cleanup_transaction_created_root_directories(&original, &root);
     let success = applied.entries.iter().all(|entry| {
         matches!(
             entry.outcome,
@@ -1474,6 +2349,19 @@ pub fn execute_shared_rollback(
             atomic_managed_write(&marker, &bytes).ok().map(|_| marker)
         });
     let marker_written = journal_path.is_some();
+    durable.transaction_state = if success && marker_written {
+        SharedRecoveryState::RolledBack
+    } else {
+        SharedRecoveryState::RollbackFailed
+    };
+    if success && marker_written {
+        let _ = write_pending_journal(&durable, &options.history_root);
+        if let Ok(path) = pending_journal_path(&options.history_root, &original.operation_id) {
+            let _ = fs::remove_file(path);
+        }
+    } else {
+        let _ = write_pending_journal(&durable, &options.history_root);
+    }
     SharedRollbackResult {
         preview: applied,
         journal_path,
@@ -1597,6 +2485,18 @@ fn atomic_write(
     if digest_bytes(&bytes) != expected {
         return Err((SharedApplyFailureKind::SourceChanged, None));
     }
+    atomic_write_bytes(&bytes, destination, expected, no_replace)
+}
+
+fn atomic_write_bytes(
+    bytes: &[u8],
+    destination: &Path,
+    expected: &str,
+    no_replace: bool,
+) -> Result<PathBuf, (SharedApplyFailureKind, Option<PathBuf>)> {
+    if bytes.len() as u64 > SHARED_MAX_MATERIALIZED_BYTES {
+        return Err((SharedApplyFailureKind::ResourceLimitReached, None));
+    }
     let parent = destination
         .parent()
         .ok_or((SharedApplyFailureKind::DestinationUnsafe, None))?;
@@ -1611,7 +2511,7 @@ fn atomic_write(
             .create_new(true)
             .open(&temp)
             .map_err(|_| SharedApplyFailureKind::WriteFailed)?;
-        file.write_all(&bytes)
+        file.write_all(bytes)
             .map_err(|_| SharedApplyFailureKind::WriteFailed)?;
         if should_inject(FaultPoint::Flush) {
             return Err(SharedApplyFailureKind::WriteFailed);
@@ -1619,7 +2519,7 @@ fn atomic_write(
         file.sync_all()
             .map_err(|_| SharedApplyFailureKind::WriteFailed)?;
         set_permissions(&file).map_err(|_| SharedApplyFailureKind::WriteFailed)?;
-        let temp_hash = stable_hash(&temp, SHARED_MAX_SOURCE_BYTES)?;
+        let temp_hash = stable_hash(&temp, SHARED_MAX_MATERIALIZED_BYTES)?;
         if should_inject(FaultPoint::Verification) || temp_hash.digest != expected {
             return Err(SharedApplyFailureKind::VerificationFailed);
         }
@@ -1633,7 +2533,7 @@ fn atomic_write(
             fs::rename(&temp, destination).map_err(|_| SharedApplyFailureKind::WriteFailed)?;
         }
         sync_directory(parent);
-        let final_hash = stable_hash(destination, SHARED_MAX_SOURCE_BYTES)?;
+        let final_hash = stable_hash(destination, SHARED_MAX_MATERIALIZED_BYTES)?;
         if final_hash.digest != expected {
             return Err(SharedApplyFailureKind::VerificationFailed);
         }
@@ -1678,6 +2578,376 @@ fn atomic_managed_write(path: &Path, bytes: &[u8]) -> Result<(), SharedApplyFail
     }
     sync_directory(parent);
     Ok(())
+}
+
+fn atomic_managed_replace(path: &Path, bytes: &[u8]) -> Result<(), SharedApplyFailureKind> {
+    let parent = path
+        .parent()
+        .ok_or(SharedApplyFailureKind::ManagedRootUnsafe)?;
+    prepare_managed_root(parent)?;
+    let temp = parent.join(format!(
+        ".archivefs-managed-replace-{}-{}",
+        std::process::id(),
+        NEXT_ID.fetch_add(1, Ordering::Relaxed)
+    ));
+    let result = (|| {
+        let mut file = OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&temp)
+            .map_err(|_| SharedApplyFailureKind::WriteFailed)?;
+        file.write_all(bytes)
+            .map_err(|_| SharedApplyFailureKind::WriteFailed)?;
+        file.sync_all()
+            .map_err(|_| SharedApplyFailureKind::WriteFailed)?;
+        fs::rename(&temp, path).map_err(|_| SharedApplyFailureKind::WriteFailed)?;
+        sync_directory(parent);
+        Ok(())
+    })();
+    if result.is_err() {
+        let _ = fs::remove_file(&temp);
+    }
+    result
+}
+
+fn pending_journal_path(
+    history_root: &Path,
+    operation_id: &str,
+) -> Result<PathBuf, SharedApplyFailureKind> {
+    Ok(history_root.join(format!("{}.pending.json", safe_identifier(operation_id)?)))
+}
+
+fn planned_backup_path(
+    backup_root: &Path,
+    operation_id: &str,
+    entry: &SharedPlanEntry,
+) -> Option<SharedTransactionPath> {
+    if !entry.backup_required {
+        return None;
+    }
+    let relative = entry.destination_relative_path.to_path_buf().ok()?;
+    let destination = entry.destination_root.to_path_buf().ok()?.join(relative);
+    let operation = safe_identifier(operation_id).ok()?;
+    Some(SharedTransactionPath::from_path(
+        &backup_root.join(operation).join(format!(
+            "{}.bak",
+            digest_text(&destination.to_string_lossy())
+        )),
+    ))
+}
+
+fn durable_journal_from_plan(
+    plan: &SharedTransactionPlan,
+    options: &SharedApplyOptions,
+) -> SharedDurableJournal {
+    SharedDurableJournal {
+        schema_version: SHARED_DURABLE_JOURNAL_SCHEMA_VERSION,
+        transaction_state: SharedRecoveryState::Planned,
+        operation_id: options.operation_id.clone(),
+        operation_type: "shared_mod_apply".into(),
+        plan_id: plan.plan_id.clone(),
+        timestamp_unix_seconds: options.timestamp_unix_seconds,
+        context: plan.context.clone(),
+        approved_source_root: plan.approved_source_root.clone(),
+        destination_root: plan.destination_root.clone(),
+        backup_root: SharedTransactionPath::from_path(&options.backup_root),
+        entries: plan
+            .entries
+            .iter()
+            .map(|entry| SharedDurableEntry {
+                plan_entry: entry.clone(),
+                state: SharedEntryRecoveryState::Planned,
+                observed_destination_digest: entry.destination_pre_digest.clone(),
+                backup_path: planned_backup_path(
+                    &options.backup_root,
+                    &options.operation_id,
+                    entry,
+                ),
+                backup_digest: entry.destination_pre_digest.clone(),
+                resulting_destination_digest: None,
+                temporary_path: None,
+                destination_existed_before_apply: Some(matches!(
+                    entry.destination_pre_state,
+                    PreviewDestinationState::RegularFileIdentical
+                        | PreviewDestinationState::RegularFileDifferent
+                )),
+            })
+            .collect(),
+        created_root_directories: Vec::new(),
+        rollback_operation_id: None,
+        rollback_of_operation_id: None,
+    }
+}
+
+fn durable_journal_from_completed(
+    journal: &SharedApplyJournal,
+    rollback_operation_id: &str,
+    backup_root: &Path,
+) -> SharedDurableJournal {
+    SharedDurableJournal {
+        schema_version: SHARED_DURABLE_JOURNAL_SCHEMA_VERSION,
+        transaction_state: SharedRecoveryState::RollingBack,
+        operation_id: journal.operation_id.clone(),
+        operation_type: "shared_mod_rollback".into(),
+        plan_id: journal.plan_id.clone(),
+        timestamp_unix_seconds: journal.timestamp_unix_seconds,
+        context: journal.context.clone(),
+        approved_source_root: journal.approved_source_root.clone(),
+        destination_root: journal.destination_root.clone(),
+        backup_root: SharedTransactionPath::from_path(backup_root),
+        entries: journal
+            .entries
+            .iter()
+            .map(|entry| SharedDurableEntry {
+                plan_entry: entry.plan_entry.clone(),
+                state: SharedEntryRecoveryState::RollingBack,
+                observed_destination_digest: entry.observed_destination_digest.clone(),
+                backup_path: entry.backup_path.clone(),
+                backup_digest: entry.backup_digest.clone(),
+                resulting_destination_digest: entry.final_destination_digest.clone(),
+                temporary_path: entry.temporary_path.clone(),
+                destination_existed_before_apply: entry.destination_existed_before_apply,
+            })
+            .collect(),
+        created_root_directories: journal.created_root_directories.clone(),
+        rollback_operation_id: Some(rollback_operation_id.to_owned()),
+        rollback_of_operation_id: Some(journal.operation_id.clone()),
+    }
+}
+
+fn update_durable_entry(
+    durable: &mut SharedDurableJournal,
+    index: usize,
+    entry: &SharedApplyEntry,
+) {
+    let Some(target) = durable.entries.get_mut(index) else {
+        return;
+    };
+    target.observed_destination_digest = entry.observed_destination_digest.clone();
+    target.backup_path = entry.backup_path.clone();
+    target.backup_digest = entry.backup_digest.clone();
+    target.resulting_destination_digest = entry.final_destination_digest.clone();
+    target.temporary_path = entry.temporary_path.clone();
+    target.destination_existed_before_apply = entry.destination_existed_before_apply;
+    target.state = match entry.outcome {
+        SharedApplyOutcome::InstalledNew | SharedApplyOutcome::ReplacedExisting
+            if entry.verification_succeeded =>
+        {
+            SharedEntryRecoveryState::Applied
+        }
+        SharedApplyOutcome::BackupFailed => SharedEntryRecoveryState::Applying,
+        SharedApplyOutcome::WriteFailed | SharedApplyOutcome::VerificationFailed => {
+            SharedEntryRecoveryState::NeedsReview
+        }
+        _ => SharedEntryRecoveryState::Applying,
+    };
+}
+
+fn write_pending_journal(
+    journal: &SharedDurableJournal,
+    history_root: &Path,
+) -> Result<(), SharedApplyFailure> {
+    if should_inject(FaultPoint::DurableJournalWrite) {
+        return Err(failure(
+            SharedApplyFailureKind::JournalFailed,
+            None,
+            "injected durable journal write failure",
+        ));
+    }
+    let bytes = serde_json::to_vec_pretty(journal).map_err(|error| {
+        failure(
+            SharedApplyFailureKind::JournalFailed,
+            None,
+            &error.to_string(),
+        )
+    })?;
+    if bytes.len() as u64 > SHARED_MAX_JOURNAL_BYTES {
+        return Err(failure(
+            SharedApplyFailureKind::ResourceLimitReached,
+            None,
+            "durable journal size limit reached",
+        ));
+    }
+    let path = pending_journal_path(history_root, &journal.operation_id)
+        .map_err(|kind| failure(kind, None, "operation ID is not safe for a pending journal"))?;
+    atomic_managed_replace(&path, &bytes)
+        .map_err(|kind| failure(kind, Some(&path), "pending journal could not be written"))
+}
+
+pub(super) fn read_pending_journal(
+    path: &Path,
+) -> Result<SharedDurableJournal, SharedApplyFailure> {
+    let metadata = fs::symlink_metadata(path).map_err(|error| {
+        failure(
+            SharedApplyFailureKind::InvalidJournal,
+            Some(path),
+            &error.to_string(),
+        )
+    })?;
+    if metadata.file_type().is_symlink()
+        || !metadata.is_file()
+        || metadata.len() > SHARED_MAX_JOURNAL_BYTES
+    {
+        return Err(failure(
+            SharedApplyFailureKind::InvalidJournal,
+            Some(path),
+            "pending journal is not a bounded regular file",
+        ));
+    }
+    let bytes = read_bounded(path, SHARED_MAX_JOURNAL_BYTES)
+        .map_err(|kind| failure(kind, Some(path), "pending journal could not be read"))?;
+    let journal: SharedDurableJournal = serde_json::from_slice(&bytes).map_err(|error| {
+        failure(
+            SharedApplyFailureKind::InvalidJournal,
+            Some(path),
+            &error.to_string(),
+        )
+    })?;
+    if journal.schema_version != SHARED_DURABLE_JOURNAL_SCHEMA_VERSION {
+        return Err(failure(
+            SharedApplyFailureKind::UnsupportedJournal,
+            Some(path),
+            "durable journal schema version is unsupported",
+        ));
+    }
+    Ok(journal)
+}
+
+/// Read-only startup discovery for durable shared-mod journals.  It performs
+/// no cleanup, rollback, resume, locking, or filesystem mutation.
+pub fn discover_pending_operations(history_root: &Path) -> Vec<SharedPendingOperation> {
+    let Ok(entries) = fs::read_dir(history_root) else {
+        return Vec::new();
+    };
+    let mut paths = entries
+        .filter_map(Result::ok)
+        .map(|entry| entry.path())
+        .filter(|path| path.extension() == Some(OsStr::new("json")))
+        .filter(|path| {
+            path.file_name()
+                .is_some_and(|name| name.to_string_lossy().ends_with(".pending.json"))
+        })
+        .collect::<Vec<_>>();
+    paths.sort();
+    paths
+        .into_iter()
+        .filter_map(|path| {
+            let journal = read_pending_journal(&path).ok()?;
+            let reconciled_entries = journal
+                .entries
+                .iter()
+                .map(|entry| reconcile_durable_entry(entry, journal.transaction_state))
+                .collect();
+            if matches!(
+                journal.transaction_state,
+                SharedRecoveryState::Applied | SharedRecoveryState::RolledBack
+            ) {
+                return None;
+            }
+            Some(SharedPendingOperation {
+                journal_path: SharedTransactionPath::from_path(&path),
+                journal,
+                reconciled_entries,
+            })
+        })
+        .collect()
+}
+
+/// Build an explicit, read-only recovery decision.  It never resumes or
+/// rolls back; a caller must separately request an operation after checking
+/// the displayed identities and exact transaction envelope.
+pub fn plan_pending_recovery(operation: &SharedPendingOperation) -> SharedPendingRecoveryPlan {
+    let safe_entries = operation.reconciled_entries.iter().all(|state| {
+        matches!(
+            state,
+            SharedEntryRecoveryState::Applied | SharedEntryRecoveryState::Planned
+        )
+    });
+    let rollback_state = matches!(
+        operation.journal.transaction_state,
+        SharedRecoveryState::Applying
+            | SharedRecoveryState::ApplyFailed
+            | SharedRecoveryState::NeedsReview
+    );
+    let can_safe_rollback = rollback_state && safe_entries;
+    SharedPendingRecoveryPlan {
+        operation_id: operation.journal.operation_id.clone(),
+        state: operation.journal.transaction_state,
+        can_safe_rollback,
+        can_resume: false,
+        reason: if can_safe_rollback {
+            "all observed entries are either proven applied or proven unchanged; explicit rollback may be planned"
+                .into()
+        } else {
+            "identity mismatch, missing backup, rollback in progress, or ambiguous filesystem state"
+                .into()
+        },
+    }
+}
+
+fn reconcile_durable_entry(
+    entry: &SharedDurableEntry,
+    transaction_state: SharedRecoveryState,
+) -> SharedEntryRecoveryState {
+    let Ok(root) = entry.plan_entry.destination_root.to_path_buf() else {
+        return SharedEntryRecoveryState::UnsafeToResume;
+    };
+    let Ok(relative) = entry.plan_entry.destination_relative_path.to_path_buf() else {
+        return SharedEntryRecoveryState::UnsafeToResume;
+    };
+    let destination = root.join(relative);
+    let destination_digest = stable_hash(&destination, SHARED_MAX_SOURCE_BYTES)
+        .ok()
+        .map(|hash| hash.digest);
+    let expected_new = entry.plan_entry.source_digest.as_str();
+    let expected_old = entry.plan_entry.destination_pre_digest.as_deref();
+    let backup_valid = if entry.plan_entry.backup_required {
+        entry
+            .backup_path
+            .as_ref()
+            .and_then(|path| path.to_path_buf().ok())
+            .and_then(|path| stable_hash(&path, SHARED_MAX_BACKUP_BYTES).ok())
+            .is_some_and(|hash| Some(hash.digest.as_str()) == expected_old)
+    } else {
+        true
+    };
+    match transaction_state {
+        SharedRecoveryState::RollingBack | SharedRecoveryState::RollbackFailed => {
+            if (entry.destination_existed_before_apply == Some(false)
+                && destination_digest.is_none())
+                || (backup_valid && entry.backup_digest.as_deref() == destination_digest.as_deref())
+                || (expected_old.is_none() && destination_digest.is_none())
+            {
+                SharedEntryRecoveryState::RolledBack
+            } else if destination_digest.as_deref() == Some(expected_new) {
+                SharedEntryRecoveryState::RollingBack
+            } else {
+                SharedEntryRecoveryState::NeedsReview
+            }
+        }
+        _ => {
+            if destination_digest.as_deref() == Some(expected_new) {
+                if backup_valid {
+                    SharedEntryRecoveryState::Applied
+                } else {
+                    SharedEntryRecoveryState::UnsafeToResume
+                }
+            } else if destination_digest.as_deref() == expected_old {
+                SharedEntryRecoveryState::Planned
+            } else if destination_digest.is_none() && expected_old.is_none() {
+                if matches!(
+                    entry.state,
+                    SharedEntryRecoveryState::Planned | SharedEntryRecoveryState::Applying
+                ) {
+                    SharedEntryRecoveryState::Planned
+                } else {
+                    SharedEntryRecoveryState::UnsafeToResume
+                }
+            } else {
+                SharedEntryRecoveryState::NeedsReview
+            }
+        }
+    }
 }
 
 fn write_journal_once(
@@ -1925,6 +3195,515 @@ fn create_one_parent(root: &Path, parent: &Path) -> Result<(), SharedApplyFailur
         return Err(SharedApplyFailureKind::ParentCreationFailed);
     }
     Ok(())
+}
+
+/// Creates every missing directory level between `root` and `parent`,
+/// returning the levels it actually created (creation order, outermost
+/// first) so rollback can remove exactly those. Per-component
+/// traversal/absolute-path checks are delegated to `destination_safety`; an
+/// existing symlink or non-directory anywhere in the chain fails closed.
+fn create_local_mod_parents(
+    root: &Path,
+    parent: &Path,
+) -> Result<Vec<PathBuf>, SharedApplyFailureKind> {
+    if should_inject(FaultPoint::ParentCreationRace) {
+        return Err(SharedApplyFailureKind::ParentCreationFailed);
+    }
+    let relative = parent
+        .strip_prefix(root)
+        .map_err(|_| SharedApplyFailureKind::ParentCreationFailed)?;
+    for component in relative.components() {
+        let Component::Normal(name) = component else {
+            return Err(SharedApplyFailureKind::ParentCreationFailed);
+        };
+        validate_single_component(name, root)
+            .map_err(|_| SharedApplyFailureKind::ParentCreationFailed)?;
+    }
+    validate_destination_root(root).map_err(|_| SharedApplyFailureKind::RootChanged)?;
+    let mut current = root.to_path_buf();
+    let mut created = Vec::new();
+    for component in relative.components() {
+        current.push(component.as_os_str());
+        match fs::symlink_metadata(&current) {
+            Ok(metadata) if metadata.file_type().is_symlink() || !metadata.is_dir() => {
+                return Err(SharedApplyFailureKind::ParentCreationFailed);
+            }
+            Ok(_) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                fs::create_dir(&current)
+                    .map_err(|_| SharedApplyFailureKind::ParentCreationFailed)?;
+                created.push(current.clone());
+            }
+            Err(_) => return Err(SharedApplyFailureKind::ParentCreationFailed),
+        }
+    }
+    Ok(created)
+}
+
+/// One directory level [`bootstrap_missing_destination_root`] itself
+/// created and opened, in memory. `path` is display/journal-only from this
+/// point on - every filesystem decision this module makes about a
+/// bootstrap-created directory goes through `identity` (an `fstat`-derived
+/// `(device, inode)` pair) and an open descriptor, never a re-resolved
+/// pathname. See the `# Safety` section on [`bootstrap_missing_destination_root`].
+#[derive(Debug, Clone)]
+struct CreatedRootDirectory {
+    path: PathBuf,
+    identity: SharedDirectoryIdentity,
+}
+
+/// Minimal, narrowly-scoped `unsafe` wrappers around the POSIX fd-relative
+/// primitives (`openat`/`mkdirat`/`unlinkat`/`fstat`) this module's
+/// descriptor-anchored root bootstrap/cleanup is built on. Nothing outside
+/// this inner module ever touches `libc` directly for this feature.
+#[cfg(unix)]
+mod fd_relative {
+    use std::ffi::{CString, OsStr};
+    use std::io;
+    use std::os::fd::{AsRawFd, FromRawFd, OwnedFd, RawFd};
+    use std::os::unix::ffi::OsStrExt;
+    use std::path::Path;
+
+    fn component_cstring(name: &OsStr) -> io::Result<CString> {
+        CString::new(name.as_bytes())
+            .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "path contains a NUL byte"))
+    }
+
+    /// Opens `path` as a directory, refusing to follow a symlink at its
+    /// final component (`O_NOFOLLOW`). The *only* plain-pathname open in
+    /// this whole feature - used exclusively for the one trusted starting
+    /// ancestor a caller has already re-validated; every directory this
+    /// module creates, opens, or removes after this point is resolved
+    /// strictly relative to an already-open descriptor (`openat`/`mkdirat`/
+    /// `unlinkat`), so nothing above this ancestor - or any sibling of it -
+    /// can ever redirect where a later step lands, no matter what gets
+    /// swapped into the path string afterward.
+    pub(super) fn open_dir_no_follow(path: &Path) -> io::Result<OwnedFd> {
+        let c_path = CString::new(path.as_os_str().as_bytes())
+            .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "path contains a NUL byte"))?;
+        // SAFETY: `c_path` is a valid, NUL-terminated C string for the
+        // duration of this call; `open` either returns a valid owned fd
+        // (>= 0, taken over by `OwnedFd`) or a negative value with `errno`
+        // set, both handled below.
+        let fd = unsafe {
+            libc::open(
+                c_path.as_ptr(),
+                libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC | libc::O_RDONLY,
+            )
+        };
+        if fd < 0 {
+            return Err(io::Error::last_os_error());
+        }
+        // SAFETY: `fd` was just returned by `open` as a fresh, valid,
+        // uniquely-owned descriptor (checked `>= 0` above).
+        Ok(unsafe { OwnedFd::from_raw_fd(fd) })
+    }
+
+    /// Opens `name` (a single path component - never validated as such
+    /// here; every caller in this module already only ever passes one) as
+    /// a directory directly beneath the already-open `parent` descriptor,
+    /// refusing to follow a symlink. Resolution is entirely relative to
+    /// `parent`'s own descriptor, never the filesystem root.
+    pub(super) fn openat_dir_no_follow(parent: RawFd, name: &OsStr) -> io::Result<OwnedFd> {
+        let c_name = component_cstring(name)?;
+        // SAFETY: `parent` is a live, caller-owned directory descriptor for
+        // the duration of this call; `c_name` is a valid NUL-terminated C
+        // string. `openat` either returns a valid owned fd or a negative
+        // value with `errno` set.
+        let fd = unsafe {
+            libc::openat(
+                parent,
+                c_name.as_ptr(),
+                libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC | libc::O_RDONLY,
+            )
+        };
+        if fd < 0 {
+            return Err(io::Error::last_os_error());
+        }
+        // SAFETY: `fd` was just returned by `openat` as a fresh, valid,
+        // uniquely-owned descriptor (checked `>= 0` above).
+        Ok(unsafe { OwnedFd::from_raw_fd(fd) })
+    }
+
+    /// Creates directory `name` directly beneath the already-open `parent`
+    /// descriptor. There is no path string involved beyond the single
+    /// component `name`, so there is nothing above `parent` left to swap.
+    pub(super) fn mkdirat_here(parent: RawFd, name: &OsStr) -> io::Result<()> {
+        let c_name = component_cstring(name)?;
+        // SAFETY: `parent` is a live directory descriptor; `c_name` is a
+        // valid NUL-terminated C string. `mkdirat` returns `0` on success
+        // or `-1` with `errno` set.
+        let result = unsafe { libc::mkdirat(parent, c_name.as_ptr(), 0o777) };
+        if result != 0 {
+            return Err(io::Error::last_os_error());
+        }
+        Ok(())
+    }
+
+    /// Removes directory `name` directly beneath the already-open `parent`
+    /// descriptor - `unlinkat` with `AT_REMOVEDIR`, equivalent to `rmdir`.
+    /// This is the *only* emptiness check this module ever performs: POSIX
+    /// requires `rmdir`/`AT_REMOVEDIR` to both fail closed on a symlink
+    /// (`ENOTDIR`, never dereferenced) and fail on a non-empty directory
+    /// (`ENOTEMPTY`) atomically with the removal itself - there is
+    /// deliberately no separate `read_dir`-then-`remove_dir` anywhere in
+    /// this module, which would open a window between checking and acting
+    /// that a path-based check alone could never close.
+    pub(super) fn unlinkat_rmdir(parent: RawFd, name: &OsStr) -> io::Result<()> {
+        let c_name = component_cstring(name)?;
+        // SAFETY: `parent` is a live directory descriptor; `c_name` is a
+        // valid NUL-terminated C string. `unlinkat` returns `0` on success
+        // or `-1` with `errno` set.
+        let result = unsafe { libc::unlinkat(parent, c_name.as_ptr(), libc::AT_REMOVEDIR) };
+        if result != 0 {
+            return Err(io::Error::last_os_error());
+        }
+        Ok(())
+    }
+
+    /// The `(device, inode, is_directory)` triple for an already-open
+    /// descriptor, read via `fstat` on the descriptor itself - never by
+    /// re-resolving a pathname, so nothing that happens to a name
+    /// afterward can change what this reports.
+    pub(super) fn fstat_identity(fd: RawFd) -> io::Result<(u64, u64, bool)> {
+        let mut stat: libc::stat = unsafe { std::mem::zeroed() };
+        // SAFETY: `fd` is a live descriptor; `&mut stat` is a valid,
+        // properly-sized out-parameter for the duration of this call.
+        let result = unsafe { libc::fstat(fd, &mut stat) };
+        if result != 0 {
+            return Err(io::Error::last_os_error());
+        }
+        let is_dir = (stat.st_mode & libc::S_IFMT) == libc::S_IFDIR;
+        Ok((stat.st_dev as u64, stat.st_ino as u64, is_dir))
+    }
+
+    pub(super) fn as_raw(fd: &OwnedFd) -> RawFd {
+        fd.as_raw_fd()
+    }
+}
+
+/// Safely creates `root` and any missing ancestors up to (but never above)
+/// the nearest already-existing directory, when `root` itself does not
+/// exist yet. A no-op returning an empty list when `root` already exists -
+/// existing-root transactions are completely unaffected by this function
+/// ever having been called.
+///
+/// # Why this exists
+///
+/// [`RootLock::acquire`] (and every other destination write in this module)
+/// requires `root` to already exist. A fresh adapter destination - the
+/// motivating case is a Dolphin profile's `Load/Textures`, which does not
+/// exist until a texture pack is first installed - never has that. This is
+/// the one place that gap is closed, narrowly: only the exact missing
+/// `root` chain a caller already validated and approved is ever created,
+/// never anything wider.
+///
+/// # Safety
+///
+/// [`validate_destination_root`] is used only to find a *plausible*
+/// starting ancestor and to fail closed early on an obviously unsafe
+/// `root` - it is never, by itself, treated as proof that stays true by
+/// the time a directory is actually created. The real authority is
+/// descriptor-anchored, no-follow traversal (see [`fd_relative`]): the
+/// starting ancestor is (re)opened with `O_NOFOLLOW`, and every directory
+/// below it is created with `mkdirat` and then immediately reopened with
+/// `openat`+`O_NOFOLLOW` *relative to that already-open parent descriptor* -
+/// never a fresh top-level pathname lookup. If an ancestor is swapped to
+/// a symlink at any point after it was opened, there is no path string left
+/// for that swap to redirect: every subsequent `openat`/`mkdirat` resolves
+/// strictly against the open descriptor chain already established, not
+/// against `/`. A swap of the *exact* newly created entry, in the narrow
+/// window between `mkdirat` and the immediately following `openat`+
+/// `O_NOFOLLOW`, is the one gap POSIX itself does not offer an atomic
+/// primitive to close (there is no `O_CREAT|O_DIRECTORY`); it fails closed
+/// at that `openat` (`ENOTDIR`/`ELOOP`) rather than silently proceeding.
+///
+/// A failure partway through removes whatever prefix of the chain this
+/// call already created, deepest first, through the same descriptor chain
+/// (see [`remove_verified_root_chain`]) rather than leaving a partial,
+/// orphaned chain behind.
+///
+/// This function itself never decides whether creating a missing root was
+/// *approved* - see `execute_shared_apply`'s own `parent_creation_approved`
+/// gate, which is checked before this is ever called.
+#[cfg(unix)]
+fn bootstrap_missing_destination_root(
+    root: &Path,
+) -> Result<Vec<CreatedRootDirectory>, SharedApplyFailureKind> {
+    let validated_root =
+        validate_destination_root(root).map_err(|_| SharedApplyFailureKind::DestinationUnsafe)?;
+    if validated_root.state() == DestinationRootState::ExistingDirectory {
+        return Ok(Vec::new());
+    }
+    // The normalized, absolute form `validate_destination_root` itself
+    // already proved has no `..`/empty components - never the raw
+    // caller-supplied `root` from here on.
+    let root = validated_root.path().to_path_buf();
+
+    // Find a *plausible* starting ancestor - see this function's own
+    // `# Safety` section for why this walk is only ever a starting point,
+    // never the actual safety guarantee.
+    let mut existing_ancestor: Option<PathBuf> = None;
+    for ancestor in root.ancestors().skip(1) {
+        match validate_destination_root(ancestor) {
+            Ok(validated) if validated.state() == DestinationRootState::ExistingDirectory => {
+                existing_ancestor = Some(ancestor.to_path_buf());
+                break;
+            }
+            Ok(_) => continue,
+            Err(_) => return Err(SharedApplyFailureKind::DestinationUnsafe),
+        }
+    }
+    let Some(existing_ancestor) = existing_ancestor else {
+        return Err(SharedApplyFailureKind::DestinationUnsafe);
+    };
+
+    let missing_suffix = root
+        .strip_prefix(&existing_ancestor)
+        .map_err(|_| SharedApplyFailureKind::DestinationUnsafe)?;
+    let mut missing_names = Vec::new();
+    for component in missing_suffix.components() {
+        match component {
+            Component::Normal(name) => missing_names.push(name.to_os_string()),
+            // A validated, normalized path can only ever have `Normal`
+            // components below an existing prefix; anything else here
+            // means the two walks above somehow disagreed - fail closed
+            // rather than guess.
+            _ => return Err(SharedApplyFailureKind::DestinationUnsafe),
+        }
+    }
+    if missing_names.is_empty() {
+        // `root` validated `Absent` above but now has an existing ancestor
+        // equal to itself - it was recreated between the two checks.
+        return Err(SharedApplyFailureKind::RootChanged);
+    }
+    if missing_names.len() > SHARED_MAX_CREATED_DIRECTORIES {
+        return Err(SharedApplyFailureKind::ResourceLimitReached);
+    }
+
+    // The one and only plain-pathname open in this whole function - see
+    // `fd_relative::open_dir_no_follow`'s own doc comment.
+    let anchor_fd = fd_relative::open_dir_no_follow(&existing_ancestor)
+        .map_err(|_| SharedApplyFailureKind::RootChanged)?;
+
+    let mut open_chain = vec![anchor_fd];
+    let mut created: Vec<CreatedRootDirectory> = Vec::new();
+    let mut path_so_far = existing_ancestor;
+    for name in missing_names {
+        path_so_far.push(&name);
+        let parent_fd = fd_relative::as_raw(open_chain.last().expect("anchor always present"));
+
+        if should_inject(FaultPoint::ParentCreationRace)
+            || fd_relative::mkdirat_here(parent_fd, &name).is_err()
+        {
+            remove_verified_root_chain(&created);
+            return Err(SharedApplyFailureKind::ParentCreationFailed);
+        }
+        let child_fd = match fd_relative::openat_dir_no_follow(parent_fd, &name) {
+            Ok(fd) => fd,
+            Err(_) => {
+                // The narrow post-`mkdirat` window this function's own
+                // `# Safety` section documents - fail closed, and clean up
+                // only what was verified before this point.
+                remove_verified_root_chain(&created);
+                return Err(SharedApplyFailureKind::ParentCreationFailed);
+            }
+        };
+        let identity = match fd_relative::fstat_identity(fd_relative::as_raw(&child_fd)) {
+            Ok((device, inode, true)) => SharedDirectoryIdentity { device, inode },
+            Ok((_, _, false)) | Err(_) => {
+                remove_verified_root_chain(&created);
+                return Err(SharedApplyFailureKind::ParentCreationFailed);
+            }
+        };
+        created.push(CreatedRootDirectory {
+            path: path_so_far.clone(),
+            identity,
+        });
+        open_chain.push(child_fd);
+    }
+    Ok(created)
+}
+
+#[cfg(not(unix))]
+fn bootstrap_missing_destination_root(
+    _root: &Path,
+) -> Result<Vec<CreatedRootDirectory>, SharedApplyFailureKind> {
+    // The descriptor-relative primitives this feature depends on
+    // (`openat`/`mkdirat`/`unlinkat`/`O_NOFOLLOW`) are POSIX-only, exactly
+    // like `RootLock::acquire`'s own non-unix fallback - fails closed
+    // rather than falling back to a weaker, path-based strategy.
+    Err(SharedApplyFailureKind::LockUnsupported)
+}
+
+/// Descriptor-anchored, identity-verified removal of a bootstrap-created
+/// destination-root chain, deepest first. Shared by every cleanup call
+/// site in this module - a same-call abort partway through
+/// [`bootstrap_missing_destination_root`], a `RootLock` failure
+/// immediately after a successful bootstrap, an all-failed apply cleaning
+/// up its own just-created empty root, and real rollback reading a
+/// validated chain back from a persisted journal (see
+/// [`validate_created_root_chain`]) - the exact same safety discipline
+/// every time.
+///
+/// For each entry, outermost first: opens it relative to the previous
+/// level's own already-open descriptor (`openat`+`O_NOFOLLOW` - the first
+/// entry's parent, the "anchor", is opened once via
+/// [`fd_relative::open_dir_no_follow`], the one plain-pathname open in this
+/// call), reads its `(device, inode)` identity via `fstat` on that
+/// descriptor, and compares it against the identity `entry` itself already
+/// carries. The walk stops - without opening anything further - at the
+/// first level that fails to open or whose identity disagrees: a directory
+/// that no longer matches is never assumed to be "close enough," and
+/// nothing deeper than an already-stopped level is ever reachable to be
+/// removed by mistake.
+///
+/// Only entries that matched are then removed, deepest first, each via
+/// `unlinkat`+`AT_REMOVEDIR` against the parent descriptor already opened
+/// above - the one atomic operation that both proves emptiness and
+/// performs the removal (see [`fd_relative::unlinkat_rmdir`]'s own doc
+/// comment). Stops at the first removal failure (non-empty, or anything
+/// else) and never continues to a shallower level after that.
+///
+/// Returns how many entries (counted from the deepest/last) were actually
+/// removed, so a caller updating a journal can `truncate` to exactly what
+/// remains true on disk rather than continuing to claim ownership of
+/// something already gone.
+#[cfg(unix)]
+fn remove_verified_root_chain(chain: &[CreatedRootDirectory]) -> usize {
+    let Some(first) = chain.first() else {
+        return 0;
+    };
+    let Some(anchor_path) = first.path.parent() else {
+        return 0;
+    };
+    let Ok(anchor_fd) = fd_relative::open_dir_no_follow(anchor_path) else {
+        return 0;
+    };
+
+    let mut open_chain = vec![anchor_fd];
+    let mut matched = 0usize;
+    for entry in chain {
+        let Some(name) = entry.path.file_name() else {
+            break;
+        };
+        let parent_fd = fd_relative::as_raw(open_chain.last().expect("anchor always present"));
+        let Ok(child_fd) = fd_relative::openat_dir_no_follow(parent_fd, name) else {
+            break;
+        };
+        let Ok((device, inode, is_dir)) =
+            fd_relative::fstat_identity(fd_relative::as_raw(&child_fd))
+        else {
+            break;
+        };
+        if !is_dir || device != entry.identity.device || inode != entry.identity.inode {
+            break;
+        }
+        open_chain.push(child_fd);
+        matched += 1;
+    }
+
+    let mut removed = 0usize;
+    for index in (0..matched).rev() {
+        let Some(name) = chain[index].path.file_name() else {
+            break;
+        };
+        let parent_fd = fd_relative::as_raw(&open_chain[index]);
+        if fd_relative::unlinkat_rmdir(parent_fd, name).is_err() {
+            break;
+        }
+        removed += 1;
+    }
+    removed
+}
+
+#[cfg(not(unix))]
+fn remove_verified_root_chain(_chain: &[CreatedRootDirectory]) -> usize {
+    0
+}
+
+/// Validates `journal.created_root_directories` as untrusted, persisted
+/// input before anything in it is ever opened, let alone removed. A
+/// tampered or corrupted claim is rejected as a whole - never trimmed to
+/// "the parts that look fine" - by returning an empty `Vec`:
+///
+/// - bounded by [`SHARED_MAX_CREATED_DIRECTORIES`], the same limit
+///   creation itself enforces;
+/// - `journal.destination_root` must equal `root` (defense in depth
+///   alongside the `root_matches` check already performed before
+///   [`execute_shared_rollback`] is ever reachable);
+/// - every path must be absolute with only `Normal` components (no `..`,
+///   no empty component);
+/// - entries must form one exact, contiguous parent/child chain - each
+///   entry after the first must be a direct child of the previous one, so
+///   there is no gap, no repeat, and no out-of-order entry; this also
+///   structurally guarantees no entry can equal the chain's own implied
+///   anchor (a path is never its own parent), which is what keeps "the
+///   destination root's pre-existing ancestor" out of the chain a tampered
+///   journal could otherwise try to claim;
+/// - the *last* entry must equal `root` itself - a chain that does not
+///   actually terminate at this rollback's destination is rejected;
+/// - every entry must carry an `identity` - one without it is unprovable
+///   ownership, not proof of anything (see [`SharedCreatedRootDirectory`]'s
+///   own doc comment).
+fn validate_created_root_chain(
+    journal: &SharedApplyJournal,
+    root: &Path,
+) -> Vec<CreatedRootDirectory> {
+    let claimed = &journal.created_root_directories;
+    if claimed.is_empty() || claimed.len() > SHARED_MAX_CREATED_DIRECTORIES {
+        return Vec::new();
+    }
+    if journal.destination_root.to_path_buf().ok().as_deref() != Some(root) {
+        return Vec::new();
+    }
+
+    let mut resolved: Vec<CreatedRootDirectory> = Vec::with_capacity(claimed.len());
+    let mut previous: Option<PathBuf> = None;
+    for (index, entry) in claimed.iter().enumerate() {
+        let Ok(path) = entry.path.to_path_buf() else {
+            return Vec::new();
+        };
+        if !path.is_absolute()
+            || path
+                .components()
+                .any(|component| !matches!(component, Component::RootDir | Component::Normal(_)))
+        {
+            return Vec::new();
+        }
+        if let Some(previous_path) = &previous
+            && path.parent() != Some(previous_path.as_path())
+        {
+            return Vec::new();
+        }
+        if index + 1 == claimed.len() && path != root {
+            return Vec::new();
+        }
+        let Some(identity) = entry.identity else {
+            return Vec::new();
+        };
+        previous = Some(path.clone());
+        resolved.push(CreatedRootDirectory { path, identity });
+    }
+    resolved
+}
+
+/// Rollback-time removal of a transaction's own bootstrap-created
+/// destination-root directory chain. Validates the persisted, untrusted
+/// journal chain first (see [`validate_created_root_chain`]) and, only for
+/// whatever survives that validation, removes it through the same
+/// descriptor-anchored, identity-verified path every other cleanup in this
+/// module uses (see [`remove_verified_root_chain`]).
+///
+/// A no-op for a journal with no `created_root_directories` at all -
+/// including every journal written before this field existed (see its own
+/// `#[serde(default)]`) - so rollback of an old journal is byte-for-byte
+/// unchanged from before this function existed: an absent field carries no
+/// root-cleanup authority, and there is no path by which it is
+/// reinterpreted into any.
+fn cleanup_transaction_created_root_directories(journal: &SharedApplyJournal, root: &Path) {
+    let chain = validate_created_root_chain(journal, root);
+    remove_verified_root_chain(&chain);
 }
 
 fn strict_absolute_root(root: &Path) -> Result<(), SharedApplyFailure> {
@@ -2179,6 +3958,14 @@ fn failure(kind: SharedApplyFailureKind, path: Option<&Path>, detail: &str) -> S
     }
 }
 
+pub fn seal_shared_transaction_plan(
+    plan: &mut SharedTransactionPlan,
+) -> Result<(), SharedApplyFailure> {
+    plan.plan_id.clear();
+    plan.plan_id = plan_digest(plan)?;
+    Ok(())
+}
+
 fn plan_digest(plan: &SharedTransactionPlan) -> Result<String, SharedApplyFailure> {
     let mut clone = plan.clone();
     clone.plan_id.clear();
@@ -2361,6 +4148,185 @@ mod tests {
             history_root: fixture.history_root(),
             backup_root: fixture.backup_root(),
         }
+    }
+
+    #[test]
+    fn interrupted_apply_is_discoverable_and_reconciles_without_auto_resume() {
+        let fixture = Fixture::new("durable-interrupted-apply");
+        let report = preview(&fixture, b"new", None);
+        let plan = make_plan(&fixture, &report);
+        inject_fault(Some(FaultPoint::TerminalJournal));
+        let result = execute_shared_apply(
+            &plan,
+            &options(&fixture, &plan, "durable-interrupted", false, true, false),
+        );
+        inject_fault(None);
+        assert_eq!(result.journal.status, SharedApplyStatus::Success);
+        assert!(result.journal_path.is_none());
+        assert!(
+            fixture
+                .destination_root()
+                .join("Nintendo - NES/game.cht")
+                .exists()
+        );
+        let pending = discover_pending_operations(&fixture.history_root());
+        assert_eq!(pending.len(), 1);
+        assert_eq!(
+            pending[0].journal.transaction_state,
+            SharedRecoveryState::Applying
+        );
+        assert_eq!(
+            pending[0].reconciled_entries,
+            vec![SharedEntryRecoveryState::Applied]
+        );
+        assert!(plan_pending_recovery(&pending[0]).can_safe_rollback);
+        assert!(!plan_pending_recovery(&pending[0]).can_resume);
+        assert!(
+            discover_shared_apply_history(&fixture.history_root())
+                .journals
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn multi_file_interruption_after_second_entry_has_all_mutations_discoverable() {
+        let fixture = Fixture::new("durable-multi-file");
+        fs::create_dir(fixture.source_root()).unwrap();
+        fs::create_dir(fixture.destination_root()).unwrap();
+        let source_items = (0..3)
+            .map(|index| {
+                let source = fixture.source_root().join(format!("source-{index}.cht"));
+                fs::write(&source, format!("new-{index}")).unwrap();
+                PreviewSourceItem {
+                    adapter: PreviewAdapter::RetroArch,
+                    source_path: source,
+                    expected_source_digest: None,
+                    destination_relative_paths: vec![PathBuf::from(format!(
+                        "Nintendo - NES/game-{index}.cht"
+                    ))],
+                    match_strength: PreviewMatchStrength::VerifiedExact,
+                }
+            })
+            .collect();
+        let report = build_shared_preview(&SharedPreviewRequest {
+            adapter: PreviewAdapter::RetroArch,
+            selected_archive: fixture.0.join("selected.zip"),
+            platform: Some("NES".into()),
+            identity: PreviewIdentity {
+                kind: PreviewIdentityKind::RetroArchCatalogueMatch,
+                state: PreviewIdentityState::Verified,
+                value: Some("archive-1".into()),
+                archive_path: fixture.0.join("selected.zip"),
+                revision: None,
+            },
+            destination_root: fixture.destination_root(),
+            source_items,
+        })
+        .unwrap();
+        let plan = make_plan(&fixture, &report);
+        inject_fault_after(FaultPoint::ApplyCheckpoint, 1);
+        let result = execute_shared_apply(
+            &plan,
+            &options(&fixture, &plan, "durable-multi", false, true, false),
+        );
+        inject_fault(None);
+        assert_eq!(
+            result.journal_failure.unwrap().kind,
+            SharedApplyFailureKind::JournalFailed
+        );
+        assert!(
+            fixture
+                .destination_root()
+                .join("Nintendo - NES/game-0.cht")
+                .exists()
+        );
+        assert!(
+            fixture
+                .destination_root()
+                .join("Nintendo - NES/game-1.cht")
+                .exists()
+        );
+        assert!(
+            !fixture
+                .destination_root()
+                .join("Nintendo - NES/game-2.cht")
+                .exists()
+        );
+        let pending = discover_pending_operations(&fixture.history_root());
+        assert_eq!(pending.len(), 1);
+        assert_eq!(
+            pending[0].reconciled_entries,
+            vec![
+                SharedEntryRecoveryState::Applied,
+                SharedEntryRecoveryState::Applied,
+                SharedEntryRecoveryState::Planned
+            ]
+        );
+    }
+
+    #[test]
+    fn interrupted_rollback_is_discoverable_and_not_a_completed_receipt() {
+        let fixture = Fixture::new("durable-interrupted-rollback");
+        let report = preview(&fixture, b"new", Some(b"old"));
+        let plan = make_plan(&fixture, &report);
+        let applied = execute_shared_apply(
+            &plan,
+            &options(&fixture, &plan, "durable-rollback", false, true, true),
+        );
+        let journal_path = applied.journal_path.unwrap();
+        let rollback = preview_shared_rollback(
+            &journal_path,
+            &fixture.destination_root(),
+            &fixture.backup_root(),
+        );
+        inject_fault(Some(FaultPoint::RollbackAfterMutation));
+        let result = execute_shared_rollback(
+            &rollback,
+            &SharedRollbackOptions {
+                confirmation: SharedRollbackConfirmation {
+                    preview_id: rollback.preview_id.clone(),
+                    approved: true,
+                },
+                rollback_operation_id: "durable-rollback-reverse".into(),
+                timestamp_unix_seconds: 1_700_000_001,
+                history_root: fixture.history_root(),
+                backup_root: fixture.backup_root(),
+            },
+        );
+        inject_fault(None);
+        assert_eq!(result.status, SharedApplyStatus::PartialFailure);
+        let pending = discover_pending_operations(&fixture.history_root());
+        assert_eq!(pending.len(), 1);
+        assert_eq!(
+            pending[0].journal.transaction_state,
+            SharedRecoveryState::RollingBack
+        );
+        assert!(pending[0].journal.rollback_of_operation_id.is_some());
+        assert!(
+            fixture
+                .history_root()
+                .join("durable-rollback.json")
+                .exists()
+        );
+    }
+
+    #[test]
+    fn legacy_final_receipt_is_not_reported_as_pending() {
+        let fixture = Fixture::new("durable-legacy");
+        let report = preview(&fixture, b"new", None);
+        let plan = make_plan(&fixture, &report);
+        let result = execute_shared_apply(
+            &plan,
+            &options(&fixture, &plan, "legacy-receipt", false, true, false),
+        );
+        assert_eq!(result.journal.status, SharedApplyStatus::Success);
+        assert!(discover_pending_operations(&fixture.history_root()).is_empty());
+        assert_eq!(
+            discover_shared_apply_history(&fixture.history_root())
+                .journals
+                .len(),
+            1
+        );
     }
 
     #[test]
@@ -2593,9 +4559,10 @@ mod tests {
         let fixture = Fixture::new("journal-failure");
         let report = preview(&fixture, b"new", None);
         let plan = make_plan(&fixture, &report);
-        let mut options = options(&fixture, &plan, "partial", false, true, false);
-        options.history_root = fixture.0.join("missing-parent/history");
+        let options = options(&fixture, &plan, "partial", false, true, false);
+        inject_fault(Some(FaultPoint::JournalWrite));
         let result = execute_shared_apply(&plan, &options);
+        inject_fault(None);
         assert_eq!(result.journal.status, SharedApplyStatus::PartialFailure);
         assert!(result.journal_failure.is_some());
         assert_eq!(
@@ -2778,5 +4745,766 @@ mod tests {
             build_shared_transaction_plan(&report, "profile", "trusted", &fixture.source_root())
                 .is_err()
         );
+    }
+
+    // -----------------------------------------------------------------
+    // Missing destination-root bootstrap (descriptor-anchored)
+    // -----------------------------------------------------------------
+    //
+    // Every test below drives the real entry points
+    // (`execute_shared_apply`/`execute_shared_rollback`) rather than
+    // calling `bootstrap_missing_destination_root`/`remove_verified_root_chain`
+    // directly, except where a test is specifically about rejecting a
+    // hand-crafted, tampered journal - the one place going through
+    // `execute_shared_rollback` and going around it via `read_journal` on a
+    // hand-edited file both exercise the real, persisted-input code path.
+
+    /// Like [`preview`], but never pre-creates `destination_root` (or
+    /// anything below it) - callers decide exactly how much of the chain
+    /// exists before building the preview/plan, so these tests can exercise
+    /// a completely missing root, a partially missing chain, or (by
+    /// pre-creating everything themselves) an already-existing root.
+    fn preview_at_root(
+        fixture: &Fixture,
+        destination_root: PathBuf,
+        source_bytes: &[u8],
+    ) -> SharedPreviewReport {
+        fs::create_dir(fixture.source_root()).unwrap();
+        let source = fixture.source_root().join("game.cht");
+        fs::write(&source, source_bytes).unwrap();
+        build_shared_preview(&SharedPreviewRequest {
+            adapter: PreviewAdapter::RetroArch,
+            selected_archive: fixture.0.join("selected.zip"),
+            platform: Some("NES".into()),
+            identity: PreviewIdentity {
+                kind: PreviewIdentityKind::RetroArchCatalogueMatch,
+                state: PreviewIdentityState::Verified,
+                value: Some("archive-1".into()),
+                archive_path: fixture.0.join("selected.zip"),
+                revision: None,
+            },
+            destination_root,
+            source_items: vec![PreviewSourceItem {
+                adapter: PreviewAdapter::RetroArch,
+                source_path: source,
+                expected_source_digest: Some(digest_bytes(source_bytes)),
+                destination_relative_paths: vec![PathBuf::from("Nintendo - NES/game.cht")],
+                match_strength: PreviewMatchStrength::VerifiedExact,
+            }],
+        })
+        .unwrap()
+    }
+
+    fn created_root_paths(journal: &SharedApplyJournal) -> Vec<PathBuf> {
+        journal
+            .created_root_directories
+            .iter()
+            .map(|entry| entry.path.to_path_buf().unwrap())
+            .collect()
+    }
+
+    // --- existing-root transaction unchanged ------------------------------
+
+    #[test]
+    fn existing_destination_root_bootstraps_nothing() {
+        let fixture = Fixture::new("bootstrap-existing-root");
+        let report = preview(&fixture, b"new", None);
+        let plan = make_plan(&fixture, &report);
+        let result = execute_shared_apply(
+            &plan,
+            &options(&fixture, &plan, "existing-root", false, true, false),
+        );
+        assert_eq!(result.journal.status, SharedApplyStatus::Success);
+        assert!(result.journal.created_root_directories.is_empty());
+        assert!(
+            fixture
+                .destination_root()
+                .join("Nintendo - NES/game.cht")
+                .is_file()
+        );
+    }
+
+    // --- full missing-root create/apply/journal/rollback -------------------
+
+    #[test]
+    fn completely_missing_destination_root_is_safely_created_applied_and_rolled_back() {
+        let fixture = Fixture::new("bootstrap-fully-missing");
+        // Mirrors the motivating Dolphin case: `<profile>/Load/Textures`,
+        // none of which exists yet.
+        let root = fixture.0.join("dolphin").join("Load").join("Textures");
+        assert!(!root.exists());
+        let report = preview_at_root(&fixture, root.clone(), b"new");
+        let plan = make_plan(&fixture, &report);
+        let result = execute_shared_apply(
+            &plan,
+            &options(&fixture, &plan, "fully-missing", false, true, false),
+        );
+        assert_eq!(result.journal.status, SharedApplyStatus::Success);
+        assert!(root.is_dir());
+        assert!(root.join("Nintendo - NES/game.cht").is_file());
+        assert_eq!(
+            fs::read(root.join("Nintendo - NES/game.cht")).unwrap(),
+            b"new"
+        );
+
+        // Recorded outermost-first, each with a real identity, and
+        // persisted to disk (not only held in memory).
+        assert_eq!(
+            created_root_paths(&result.journal),
+            vec![
+                fixture.0.join("dolphin"),
+                fixture.0.join("dolphin").join("Load"),
+                root.clone(),
+            ]
+        );
+        assert!(
+            result
+                .journal
+                .created_root_directories
+                .iter()
+                .all(|entry| entry.identity.is_some())
+        );
+        let journal_path = result.journal_path.unwrap();
+        let persisted = read_journal(&journal_path).unwrap();
+        assert_eq!(persisted.created_root_directories.len(), 3);
+
+        let rollback = preview_shared_rollback(&journal_path, &root, &fixture.backup_root());
+        assert!(rollback.available);
+        let rolled_back = execute_shared_rollback(
+            &rollback,
+            &SharedRollbackOptions {
+                confirmation: SharedRollbackConfirmation {
+                    preview_id: rollback.preview_id.clone(),
+                    approved: true,
+                },
+                rollback_operation_id: "rollback-removes-rollback".into(),
+                timestamp_unix_seconds: 1_700_000_001,
+                history_root: fixture.history_root(),
+                backup_root: fixture.backup_root(),
+            },
+        );
+        assert_eq!(rolled_back.status, SharedApplyStatus::Success);
+        assert!(!root.exists());
+        assert!(!fixture.0.join("dolphin").join("Load").exists());
+        assert!(!fixture.0.join("dolphin").exists());
+    }
+
+    #[test]
+    fn partially_missing_root_chain_creates_only_the_missing_levels() {
+        let fixture = Fixture::new("bootstrap-partial");
+        let dolphin = fixture.0.join("dolphin");
+        fs::create_dir(&dolphin).unwrap();
+        let root = dolphin.join("Load").join("Textures");
+        let report = preview_at_root(&fixture, root.clone(), b"new");
+        let plan = make_plan(&fixture, &report);
+        let result = execute_shared_apply(
+            &plan,
+            &options(&fixture, &plan, "partial-missing", false, true, false),
+        );
+        assert_eq!(result.journal.status, SharedApplyStatus::Success);
+        assert!(root.is_dir());
+        assert_eq!(
+            created_root_paths(&result.journal),
+            vec![dolphin.join("Load"), root.clone()]
+        );
+    }
+
+    #[test]
+    fn rollback_leaves_a_pre_existing_root_untouched() {
+        let fixture = Fixture::new("bootstrap-rollback-preserves-preexisting");
+        let dolphin = fixture.0.join("dolphin");
+        fs::create_dir(&dolphin).unwrap();
+        let root = dolphin.join("Load").join("Textures");
+        let report = preview_at_root(&fixture, root.clone(), b"new");
+        let plan = make_plan(&fixture, &report);
+        let result = execute_shared_apply(
+            &plan,
+            &options(&fixture, &plan, "rollback-preserves", false, true, false),
+        );
+        assert_eq!(result.journal.status, SharedApplyStatus::Success);
+        let journal_path = result.journal_path.unwrap();
+        let rollback = preview_shared_rollback(&journal_path, &root, &fixture.backup_root());
+        let rolled_back = execute_shared_rollback(
+            &rollback,
+            &SharedRollbackOptions {
+                confirmation: SharedRollbackConfirmation {
+                    preview_id: rollback.preview_id.clone(),
+                    approved: true,
+                },
+                rollback_operation_id: "rollback-preserves-rollback".into(),
+                timestamp_unix_seconds: 1_700_000_001,
+                history_root: fixture.history_root(),
+                backup_root: fixture.backup_root(),
+            },
+        );
+        assert_eq!(rolled_back.status, SharedApplyStatus::Success);
+        assert!(!root.exists(), "the bootstrap-created leaf must be removed");
+        assert!(
+            !dolphin.join("Load").exists(),
+            "the bootstrap-created intermediate level must be removed"
+        );
+        assert!(
+            dolphin.is_dir(),
+            "a directory that existed before the transaction must never be removed by rollback"
+        );
+    }
+
+    #[test]
+    fn rollback_stops_at_a_non_empty_transaction_created_directory() {
+        let fixture = Fixture::new("bootstrap-rollback-stop-nonempty");
+        let root = fixture.0.join("dolphin").join("Load").join("Textures");
+        let report = preview_at_root(&fixture, root.clone(), b"new");
+        let plan = make_plan(&fixture, &report);
+        let result = execute_shared_apply(
+            &plan,
+            &options(
+                &fixture,
+                &plan,
+                "rollback-stop-nonempty",
+                false,
+                true,
+                false,
+            ),
+        );
+        assert_eq!(result.journal.status, SharedApplyStatus::Success);
+        let journal_path = result.journal_path.unwrap();
+        let rollback = preview_shared_rollback(&journal_path, &root, &fixture.backup_root());
+
+        // The installed file's own removal reports failure and leaves the
+        // file (and so its "Nintendo - NES" parent directory) genuinely
+        // present - the bootstrap-created `Textures` root is therefore
+        // non-empty by the time root cleanup would run.
+        inject_fault(Some(FaultPoint::RollbackRemovalVerification));
+        let rolled_back = execute_shared_rollback(
+            &rollback,
+            &SharedRollbackOptions {
+                confirmation: SharedRollbackConfirmation {
+                    preview_id: rollback.preview_id.clone(),
+                    approved: true,
+                },
+                rollback_operation_id: "rollback-stop-nonempty-rollback".into(),
+                timestamp_unix_seconds: 1_700_000_001,
+                history_root: fixture.history_root(),
+                backup_root: fixture.backup_root(),
+            },
+        );
+        inject_fault(None);
+        assert_eq!(rolled_back.status, SharedApplyStatus::Failed);
+        assert!(
+            root.join("Nintendo - NES/game.cht").is_file(),
+            "the file itself was never actually removed"
+        );
+        assert!(root.is_dir(), "a non-empty root must never be removed");
+        assert!(
+            fixture.0.join("dolphin").join("Load").is_dir(),
+            "a shallower level must never be removed once a deeper one stopped cleanup"
+        );
+    }
+
+    // --- created root replaced by a user-created directory before rollback -
+
+    #[test]
+    fn a_created_root_replaced_by_a_user_created_directory_is_not_deleted() {
+        let fixture = Fixture::new("bootstrap-user-replaced-directory");
+        let root = fixture.0.join("dolphin").join("Load").join("Textures");
+        let report = preview_at_root(&fixture, root.clone(), b"new");
+        let plan = make_plan(&fixture, &report);
+        let result = execute_shared_apply(
+            &plan,
+            &options(&fixture, &plan, "user-replaced-dir", false, true, false),
+        );
+        assert_eq!(result.journal.status, SharedApplyStatus::Success);
+        let journal_path = result.journal_path.unwrap();
+        let rollback = preview_shared_rollback(&journal_path, &root, &fixture.backup_root());
+
+        // The user wipes and recreates `Textures` themselves (their own
+        // new, empty directory - same path, different inode) before
+        // rollback ever runs. This also removes the installed file, so the
+        // per-file rollback step itself cannot succeed either - the point
+        // of this test is specifically that root cleanup, which runs
+        // regardless of the per-file outcome, still refuses to touch the
+        // replacement.
+        fs::remove_dir_all(&root).unwrap();
+        fs::create_dir(&root).unwrap();
+        fs::write(root.join("user-file.txt"), b"do not touch").unwrap();
+
+        let rolled_back = execute_shared_rollback(
+            &rollback,
+            &SharedRollbackOptions {
+                confirmation: SharedRollbackConfirmation {
+                    preview_id: rollback.preview_id.clone(),
+                    approved: true,
+                },
+                rollback_operation_id: "user-replaced-dir-rollback".into(),
+                timestamp_unix_seconds: 1_700_000_001,
+                history_root: fixture.history_root(),
+                backup_root: fixture.backup_root(),
+            },
+        );
+        let _ = rolled_back;
+        assert!(
+            root.is_dir(),
+            "the user's replacement directory must never be removed"
+        );
+        assert!(
+            root.join("user-file.txt").is_file(),
+            "its contents must be completely untouched"
+        );
+    }
+
+    // --- created root replaced by a file -----------------------------------
+
+    #[test]
+    fn a_created_root_replaced_by_a_file_is_blocked() {
+        let fixture = Fixture::new("bootstrap-user-replaced-file");
+        let root = fixture.0.join("dolphin").join("Load").join("Textures");
+        let report = preview_at_root(&fixture, root.clone(), b"new");
+        let plan = make_plan(&fixture, &report);
+        let result = execute_shared_apply(
+            &plan,
+            &options(&fixture, &plan, "user-replaced-file", false, true, false),
+        );
+        assert_eq!(result.journal.status, SharedApplyStatus::Success);
+        let journal_path = result.journal_path.unwrap();
+        let rollback = preview_shared_rollback(&journal_path, &root, &fixture.backup_root());
+
+        fs::remove_dir_all(&root).unwrap();
+        fs::write(&root, b"now a plain file").unwrap();
+
+        let rolled_back = execute_shared_rollback(
+            &rollback,
+            &SharedRollbackOptions {
+                confirmation: SharedRollbackConfirmation {
+                    preview_id: rollback.preview_id.clone(),
+                    approved: true,
+                },
+                rollback_operation_id: "user-replaced-file-rollback".into(),
+                timestamp_unix_seconds: 1_700_000_001,
+                history_root: fixture.history_root(),
+                backup_root: fixture.backup_root(),
+            },
+        );
+        let _ = rolled_back;
+        assert!(root.is_file(), "the replacement file must never be removed");
+        assert_eq!(fs::read(&root).unwrap(), b"now a plain file");
+    }
+
+    // --- malformed journal claiming the pre-existing ancestor --------------
+
+    #[test]
+    fn a_journal_claiming_the_pre_existing_ancestor_is_rejected() {
+        let fixture = Fixture::new("bootstrap-malformed-claims-ancestor");
+        let dolphin = fixture.0.join("dolphin");
+        fs::create_dir(&dolphin).unwrap();
+        let root = dolphin.join("Load").join("Textures");
+        let report = preview_at_root(&fixture, root.clone(), b"new");
+        let plan = make_plan(&fixture, &report);
+        let result = execute_shared_apply(
+            &plan,
+            &options(&fixture, &plan, "malformed-ancestor", false, true, false),
+        );
+        assert_eq!(result.journal.status, SharedApplyStatus::Success);
+        let journal_path = result.journal_path.unwrap();
+
+        // Tamper the persisted journal: prepend the pre-existing `dolphin`
+        // ancestor to the claimed chain, as if this transaction had
+        // created it too.
+        let mut tampered = read_journal(&journal_path).unwrap();
+        let mut identity = tampered.created_root_directories[0].identity;
+        // A plausible-looking (but fabricated) identity - the chain must
+        // still be rejected on structure alone before identity is ever
+        // consulted for the injected entry.
+        if let Some(value) = &mut identity {
+            value.inode = value.inode.wrapping_add(1);
+        }
+        tampered.created_root_directories.insert(
+            0,
+            SharedCreatedRootDirectory {
+                path: SharedTransactionPath::from_path(&dolphin),
+                identity,
+            },
+        );
+        fs::write(&journal_path, serde_json::to_vec_pretty(&tampered).unwrap()).unwrap();
+
+        let rollback = preview_shared_rollback(&journal_path, &root, &fixture.backup_root());
+        assert!(rollback.available);
+        let rolled_back = execute_shared_rollback(
+            &rollback,
+            &SharedRollbackOptions {
+                confirmation: SharedRollbackConfirmation {
+                    preview_id: rollback.preview_id.clone(),
+                    approved: true,
+                },
+                rollback_operation_id: "malformed-ancestor-rollback".into(),
+                timestamp_unix_seconds: 1_700_000_001,
+                history_root: fixture.history_root(),
+                backup_root: fixture.backup_root(),
+            },
+        );
+        assert_eq!(rolled_back.status, SharedApplyStatus::Success);
+        // The whole claimed chain is rejected as malformed (an entry whose
+        // parent/child relationship to its neighbour does not hold), so
+        // *nothing* in it is acted on - the pre-existing ancestor
+        // survives, but so does the genuinely transaction-created leaf.
+        assert!(
+            dolphin.is_dir(),
+            "the pre-existing ancestor must never be removed"
+        );
+        assert!(
+            root.exists(),
+            "a malformed chain must not be partially honoured either"
+        );
+    }
+
+    // --- malformed / out-of-order / out-of-root created-root chain ---------
+
+    #[test]
+    fn an_out_of_order_created_root_chain_is_rejected() {
+        let fixture = Fixture::new("bootstrap-malformed-out-of-order");
+        let root = fixture.0.join("dolphin").join("Load").join("Textures");
+        let report = preview_at_root(&fixture, root.clone(), b"new");
+        let plan = make_plan(&fixture, &report);
+        let result = execute_shared_apply(
+            &plan,
+            &options(&fixture, &plan, "malformed-order", false, true, false),
+        );
+        assert_eq!(result.journal.status, SharedApplyStatus::Success);
+        let journal_path = result.journal_path.unwrap();
+
+        let mut tampered = read_journal(&journal_path).unwrap();
+        tampered.created_root_directories.reverse();
+        fs::write(&journal_path, serde_json::to_vec_pretty(&tampered).unwrap()).unwrap();
+
+        let rollback = preview_shared_rollback(&journal_path, &root, &fixture.backup_root());
+        let rolled_back = execute_shared_rollback(
+            &rollback,
+            &SharedRollbackOptions {
+                confirmation: SharedRollbackConfirmation {
+                    preview_id: rollback.preview_id.clone(),
+                    approved: true,
+                },
+                rollback_operation_id: "malformed-order-rollback".into(),
+                timestamp_unix_seconds: 1_700_000_001,
+                history_root: fixture.history_root(),
+                backup_root: fixture.backup_root(),
+            },
+        );
+        assert_eq!(rolled_back.status, SharedApplyStatus::Success);
+        assert!(
+            root.exists(),
+            "a reordered chain must be rejected wholesale"
+        );
+    }
+
+    #[test]
+    fn a_created_root_chain_pointing_outside_the_destination_root_is_rejected() {
+        let fixture = Fixture::new("bootstrap-malformed-out-of-root");
+        let root = fixture.0.join("dolphin").join("Load").join("Textures");
+        let report = preview_at_root(&fixture, root.clone(), b"new");
+        let plan = make_plan(&fixture, &report);
+        let result = execute_shared_apply(
+            &plan,
+            &options(&fixture, &plan, "malformed-out-of-root", false, true, false),
+        );
+        assert_eq!(result.journal.status, SharedApplyStatus::Success);
+        let journal_path = result.journal_path.unwrap();
+
+        let outside = fixture.0.join("somewhere-else");
+        fs::create_dir(&outside).unwrap();
+        let mut tampered = read_journal(&journal_path).unwrap();
+        // Point the final (leaf) entry at a directory entirely outside the
+        // real chain, while still (dishonestly) claiming to be the
+        // transaction's own destination root.
+        let last = tampered.created_root_directories.last_mut().unwrap();
+        last.path = SharedTransactionPath::from_path(&outside);
+        fs::write(&journal_path, serde_json::to_vec_pretty(&tampered).unwrap()).unwrap();
+
+        let rollback = preview_shared_rollback(&journal_path, &root, &fixture.backup_root());
+        let rolled_back = execute_shared_rollback(
+            &rollback,
+            &SharedRollbackOptions {
+                confirmation: SharedRollbackConfirmation {
+                    preview_id: rollback.preview_id.clone(),
+                    approved: true,
+                },
+                rollback_operation_id: "malformed-out-of-root-rollback".into(),
+                timestamp_unix_seconds: 1_700_000_001,
+                history_root: fixture.history_root(),
+                backup_root: fixture.backup_root(),
+            },
+        );
+        assert_eq!(rolled_back.status, SharedApplyStatus::Success);
+        assert!(
+            outside.is_dir(),
+            "a chain that does not terminate at the real destination root must never be acted on"
+        );
+    }
+
+    // --- symlink ancestor swapped in before creation ------------------------
+
+    #[cfg(unix)]
+    #[test]
+    fn an_ancestor_swapped_to_a_symlink_before_creation_is_rejected() {
+        use std::os::unix::fs::symlink;
+        let fixture = Fixture::new("bootstrap-symlink-ancestor");
+        let dolphin = fixture.0.join("dolphin");
+        let root = dolphin.join("Load").join("Textures");
+        // Preview/plan are built while `dolphin` genuinely does not exist
+        // yet - a real, honest approval. Only *after* that (the real
+        // caller's own earlier check) does `dolphin` get swapped to a
+        // symlink, simulating a race that lands squarely between that
+        // earlier check and `execute_shared_apply`'s own bootstrap.
+        let report = preview_at_root(&fixture, root.clone(), b"new");
+        let plan = make_plan(&fixture, &report);
+        let real_target = fixture.0.join("real-target");
+        fs::create_dir(&real_target).unwrap();
+        symlink(&real_target, &dolphin).unwrap();
+
+        let link = dolphin;
+        let result = execute_shared_apply(
+            &plan,
+            &options(&fixture, &plan, "symlink-ancestor", false, true, false),
+        );
+        assert_eq!(result.journal.status, SharedApplyStatus::Failed);
+        assert!(
+            !real_target.join("Load").exists(),
+            "nothing may be created through a symlinked ancestor, even one whose target is safe"
+        );
+        assert!(link.is_symlink(), "the symlink itself must be untouched");
+    }
+
+    // --- creation cannot escape through a swapped ancestor ------------------
+
+    #[cfg(unix)]
+    #[test]
+    fn creation_cannot_escape_through_an_intermediate_symlinked_ancestor() {
+        use std::os::unix::fs::symlink;
+        let fixture = Fixture::new("bootstrap-escape-attempt");
+        // A directory well outside the destination root's own lineage -
+        // proves creation never lands here even though the symlink below
+        // (introduced after preview/plan approval) points straight at it.
+        let escape_target = fixture.0.join("escape-target");
+        fs::create_dir(&escape_target).unwrap();
+        let dolphin = fixture.0.join("dolphin");
+        let load_link = dolphin.join("Load");
+        let root = load_link.join("Textures");
+        let report = preview_at_root(&fixture, root.clone(), b"new");
+        let plan = make_plan(&fixture, &report);
+        // Only now does `Load` become a symlink pointing outside `dolphin`
+        // entirely - after the real approval, before the real apply. A
+        // pathname-only re-check between validation and creation would
+        // have happily walked straight through it.
+        fs::create_dir(&dolphin).unwrap();
+        symlink(&escape_target, &load_link).unwrap();
+
+        let result = execute_shared_apply(
+            &plan,
+            &options(&fixture, &plan, "escape-attempt", false, true, false),
+        );
+        assert_eq!(result.journal.status, SharedApplyStatus::Failed);
+        assert!(
+            !escape_target.join("Textures").exists(),
+            "creation must never be redirected through a symlinked intermediate ancestor"
+        );
+        assert!(
+            load_link.is_symlink(),
+            "the symlink itself must be untouched"
+        );
+    }
+
+    // --- partial-chain failure cleans only this attempt's own directories --
+
+    #[test]
+    fn a_parent_creation_race_cleans_up_only_the_partial_chain_this_attempt_made() {
+        let fixture = Fixture::new("bootstrap-race-cleanup");
+        // A directory that already existed before this transaction, right
+        // next to where the transaction's own chain will be created -
+        // proves cleanup never reaches sideways into it.
+        let sibling = fixture.0.join("sibling-pre-existing");
+        fs::create_dir(&sibling).unwrap();
+        fs::write(sibling.join("keep.txt"), b"unrelated").unwrap();
+
+        let root = fixture.0.join("dolphin").join("Load").join("Textures");
+        let report = preview_at_root(&fixture, root.clone(), b"new");
+        let plan = make_plan(&fixture, &report);
+        inject_fault(Some(FaultPoint::ParentCreationRace));
+        let result = execute_shared_apply(
+            &plan,
+            &options(&fixture, &plan, "race-cleanup", false, true, false),
+        );
+        inject_fault(None);
+        assert_eq!(result.journal.status, SharedApplyStatus::Failed);
+        assert!(
+            !fixture.0.join("dolphin").exists(),
+            "a chain that failed partway through must leave nothing behind, not even the first \
+             level"
+        );
+        assert!(
+            sibling.is_dir(),
+            "an unrelated pre-existing directory must be untouched"
+        );
+        assert!(sibling.join("keep.txt").is_file());
+    }
+
+    // --- all entries fail after bootstrap -----------------------------------
+
+    #[test]
+    fn all_entries_failing_after_bootstrap_leaves_no_unreachable_empty_root() {
+        let fixture = Fixture::new("bootstrap-all-fail-cleanup");
+        let root = fixture.0.join("dolphin").join("Load").join("Textures");
+        let report = preview_at_root(&fixture, root.clone(), b"new");
+        let plan = make_plan(&fixture, &report);
+        inject_fault(Some(FaultPoint::SourceMutation));
+        let result = execute_shared_apply(
+            &plan,
+            &options(&fixture, &plan, "all-fail-cleanup", false, true, false),
+        );
+        inject_fault(None);
+        assert_eq!(result.journal.status, SharedApplyStatus::Failed);
+        assert_eq!(
+            result.journal.entries[0].outcome,
+            SharedApplyOutcome::SourceChanged
+        );
+        // A journal was still written (the lock was held, entries were
+        // attempted) - but since nothing was actually installed, the
+        // freshly bootstrapped, still-empty root was cleaned up in the
+        // same call rather than left as an empty directory a journal
+        // claims but normal rollback (which requires at least one
+        // `Available` per-file entry) could never reach.
+        assert!(result.journal_path.is_some());
+        assert!(!root.exists());
+        assert!(!fixture.0.join("dolphin").join("Load").exists());
+        assert!(!fixture.0.join("dolphin").exists());
+        assert!(result.journal.created_root_directories.is_empty());
+    }
+
+    // --- journal-write failure with zero successful installs ---------------
+
+    #[test]
+    fn journal_write_failure_with_zero_successful_installs_still_cleans_up_safely() {
+        let fixture = Fixture::new("bootstrap-journal-fail-zero-writes");
+        let root = fixture.0.join("dolphin").join("Load").join("Textures");
+        let report = preview_at_root(&fixture, root.clone(), b"new");
+        let plan = make_plan(&fixture, &report);
+        // A real (non-injected) reason for zero successful writes: the
+        // source no longer matches what the plan approved.
+        fs::write(fixture.source_root().join("game.cht"), b"tampered").unwrap();
+        inject_fault(Some(FaultPoint::JournalWrite));
+        let result = execute_shared_apply(
+            &plan,
+            &options(
+                &fixture,
+                &plan,
+                "journal-fail-zero-writes",
+                false,
+                true,
+                false,
+            ),
+        );
+        inject_fault(None);
+        assert_eq!(result.journal.status, SharedApplyStatus::Failed);
+        assert!(
+            result.journal_path.is_none(),
+            "the journal write itself failed"
+        );
+        assert!(
+            !root.exists(),
+            "zero installs means the bootstrap-created root is safely removable even though the \
+             journal recording that never made it to disk"
+        );
+        assert!(!fixture.0.join("dolphin").exists());
+    }
+
+    #[test]
+    fn a_parent_creation_race_is_rejected_and_the_partial_chain_is_cleaned_up() {
+        let fixture = Fixture::new("bootstrap-helper-race-cleanup");
+        let root = fixture.0.join("a").join("b").join("c");
+        inject_fault(Some(FaultPoint::ParentCreationRace));
+        let result = bootstrap_missing_destination_root(&root);
+        inject_fault(None);
+        assert!(matches!(
+            result,
+            Err(SharedApplyFailureKind::ParentCreationFailed)
+        ));
+        assert!(
+            !fixture.0.join("a").exists(),
+            "a chain that failed partway through must leave nothing behind, not even the first \
+             level"
+        );
+    }
+
+    #[test]
+    fn target_becomes_a_file_before_locking_is_rejected() {
+        let fixture = Fixture::new("bootstrap-target-becomes-file");
+        let dolphin = fixture.0.join("dolphin");
+        fs::create_dir(&dolphin).unwrap();
+        // The exact destination root path is a regular file, not a
+        // directory - the same shape a symlink-replacement race would
+        // leave behind at the instant this is (re)validated.
+        let root = dolphin.join("Load");
+        fs::write(&root, b"not a directory").unwrap();
+        let result = bootstrap_missing_destination_root(&root);
+        assert!(matches!(
+            result,
+            Err(SharedApplyFailureKind::DestinationUnsafe)
+        ));
+        assert!(root.is_file(), "the existing file must be left untouched");
+    }
+
+    #[test]
+    fn old_journal_without_the_new_field_still_loads_and_never_gains_root_cleanup_authority() {
+        let fixture = Fixture::new("bootstrap-old-journal-compat");
+        let report = preview(&fixture, b"new", None);
+        let plan = make_plan(&fixture, &report);
+        let result = execute_shared_apply(
+            &plan,
+            &options(&fixture, &plan, "old-journal", false, true, false),
+        );
+        let journal_path = result.journal_path.unwrap();
+
+        // Simulate a journal written before `created_root_directories`
+        // existed: strip the field out of the persisted JSON entirely.
+        let bytes = fs::read(&journal_path).unwrap();
+        let mut value: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        value
+            .as_object_mut()
+            .unwrap()
+            .remove("created_root_directories");
+        fs::write(&journal_path, serde_json::to_vec_pretty(&value).unwrap()).unwrap();
+
+        let loaded = read_journal(&journal_path).unwrap();
+        assert!(loaded.created_root_directories.is_empty());
+
+        let rollback = preview_shared_rollback(
+            &journal_path,
+            &fixture.destination_root(),
+            &fixture.backup_root(),
+        );
+        assert!(rollback.available);
+        let rolled_back = execute_shared_rollback(
+            &rollback,
+            &SharedRollbackOptions {
+                confirmation: SharedRollbackConfirmation {
+                    preview_id: rollback.preview_id.clone(),
+                    approved: true,
+                },
+                rollback_operation_id: "old-journal-rollback".into(),
+                timestamp_unix_seconds: 1_700_000_001,
+                history_root: fixture.history_root(),
+                backup_root: fixture.backup_root(),
+            },
+        );
+        assert_eq!(rolled_back.status, SharedApplyStatus::Success);
+        assert!(
+            !fixture
+                .destination_root()
+                .join("Nintendo - NES/game.cht")
+                .exists()
+        );
+        // The pre-existing destination root itself (never created by this
+        // transaction, and absent from the old journal by construction)
+        // must never be removed - identical to `install_new_is_atomic_
+        // journaled_and_rollback_is_bound_and_idempotent`'s own assertion.
+        assert!(fixture.destination_root().is_dir());
     }
 }

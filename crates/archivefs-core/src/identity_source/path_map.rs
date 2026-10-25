@@ -126,6 +126,11 @@ pub struct PathMapping {
     pub provider_prefix: String,
     /// Where those files are for EmuWiz, e.g. `/mnt/games/roms`.
     pub archivefs_prefix: PathBuf,
+    /// Additional provider prefixes which are exact aliases of this mapping.
+    /// They share this destination without weakening the one-destination-per-
+    /// mapping invariant. Empty for ordinary mappings.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub provider_aliases: Vec<String>,
 }
 
 /// Why a mapping or a path cannot be used.
@@ -347,6 +352,14 @@ impl PathMappings {
             // A prefix is typed by a person, so a trailing separator is tolerated
             // and normalised away. A *record* path gets no such courtesy.
             let provider = normalise_configured_prefix(&mapping.provider_prefix, kind)?;
+            let mut aliases = Vec::with_capacity(mapping.provider_aliases.len());
+            for alias in &mapping.provider_aliases {
+                let alias = normalise_configured_prefix(alias, kind)?;
+                if alias == provider || aliases.iter().any(|seen| seen == &alias) {
+                    return Err(MappingRefusal::DuplicateSource { value: alias });
+                }
+                aliases.push(alias);
+            }
             let destination = &mapping.archivefs_prefix;
             if destination.as_os_str().is_empty() {
                 return Err(MappingRefusal::EmptyPrefix);
@@ -374,16 +387,30 @@ impl PathMappings {
             if seen_sources.iter().any(|seen| seen == &provider) {
                 return Err(MappingRefusal::DuplicateSource { value: provider });
             }
+            if aliases
+                .iter()
+                .any(|alias| seen_sources.iter().any(|seen| seen == alias))
+            {
+                return Err(MappingRefusal::DuplicateSource {
+                    value: aliases
+                        .iter()
+                        .find(|alias| seen_sources.iter().any(|seen| seen == *alias))
+                        .cloned()
+                        .unwrap_or_default(),
+                });
+            }
             if seen_destinations.iter().any(|seen| seen == destination) {
                 return Err(MappingRefusal::DuplicateDestination {
                     value: destination.display().to_string(),
                 });
             }
             seen_sources.push(provider.clone());
+            seen_sources.extend(aliases.iter().cloned());
             seen_destinations.push(destination.clone());
             validated.push(PathMapping {
                 provider_prefix: provider,
                 archivefs_prefix: destination.clone(),
+                provider_aliases: aliases,
             });
         }
 
@@ -436,10 +463,13 @@ impl PathMappings {
             }
         };
         for mapping in &self.ordered {
-            let Some(relative) = strip_component_prefix(&normalised, &mapping.provider_prefix)
-            else {
+            let matched_prefix = std::iter::once(&mapping.provider_prefix)
+                .chain(mapping.provider_aliases.iter())
+                .find(|prefix| strip_component_prefix(&normalised, prefix).is_some());
+            let Some(matched_prefix) = matched_prefix else {
                 continue;
             };
+            let relative = strip_component_prefix(&normalised, matched_prefix).expect("matched");
             let mut translated = mapping.archivefs_prefix.clone();
             for component in relative.split('/').filter(|part| !part.is_empty()) {
                 translated.push(component);
@@ -480,7 +510,7 @@ impl PathMappings {
                 normalised_path: normalised,
                 kind: self.kind,
                 archivefs_path: translated,
-                matched_prefix: mapping.provider_prefix.clone(),
+                matched_prefix: matched_prefix.clone(),
                 trusted_root,
             };
         }

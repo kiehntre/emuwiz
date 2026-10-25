@@ -27,6 +27,20 @@
 //! makes `//evil.example/x` and `http://evil.example/x` refusals rather than
 //! requests: both are legal relative-URL forms that change the host.
 //!
+//! # A mapped local file is read instead of fetched
+//!
+//! When a RomM source carries an explicit media mapping
+//! ([`super::romm::config::ValidatedRommSource::media_mapping`]) and the hosted
+//! reference resolves through it - and only through it - to a readable local
+//! file, that file is decoded directly and no HTTP request is made. The
+//! resolution is done exclusively by
+//! [`super::romm::media_mapping::resolve_romm_media_reference`], which owns the
+//! provider-prefix, traversal, symlink-escape and media-type checks. Anything it
+//! does not resolve cleanly - no mapping, an absent file, an unsafe reference,
+//! an oversized or non-decodable file - falls straight through to the fetch
+//! path above, so local media is only ever a read-instead-of-fetch, never a new
+//! way to fail or a new trust surface.
+//!
 //! # Bounded at every step
 //!
 //! Response bytes, source dimensions, decode allocation, thumbnail dimensions and
@@ -41,6 +55,12 @@
 //! index holds the approved origin, record ids and digests, and no cover path or
 //! URL at all. Artwork on the tested instance needs no authentication, so the token
 //! is only offered if a request is actually refused without it.
+//!
+//! A cover or screenshot resolved from a mapped local file is thumbnailed and
+//! cached under that *same* key: it is the same image, identified the same way,
+//! so provenance never enters the key. An offline [`ArtworkCache::lookup`] then
+//! finds it, and a cover RomM later replaces (new `ts` in the reference) still
+//! produces a different key and is re-resolved.
 
 use std::collections::HashMap;
 use std::fs;
@@ -54,8 +74,9 @@ use serde::{Deserialize, Serialize};
 
 use super::model::IdentityProvider;
 use super::net_policy::EndpointRefusal;
-use super::romm::client::{RommRequestError, RommTransport};
+use super::romm::client::{REQUEST_TIMEOUT, RommRequestError, RommTransport};
 use super::romm::config::ValidatedRommSource;
+use super::romm::media_mapping::resolve_romm_media_reference;
 
 /// The box a thumbnail must fit inside. Matches the GUI's cover aspect closely
 /// enough that nothing is stretched: an image is scaled to fit, never to fill.
@@ -64,6 +85,11 @@ pub const THUMBNAIL_MAX_HEIGHT: u32 = 280;
 
 /// The most one artwork response may be. A real small cover is about 55 KB.
 pub const MAX_ARTWORK_RESPONSE_BYTES: usize = 2 * 1024 * 1024;
+/// The one public image host explicitly approved for provider-derived
+/// LaunchBox references. This is deliberately exact: no wildcard subdomains
+/// or caller-supplied hosts are accepted.
+pub const APPROVED_LAUNCHBOX_IMAGE_HOST: &str = "images.launchbox-app.com";
+const MAX_EXTERNAL_IMAGE_PATH_BYTES: usize = 2048;
 
 /// The largest source image this will decode, per side and in total allocation.
 /// A decompression bomb is a small file that decodes to an enormous buffer, so the
@@ -99,6 +125,9 @@ pub const LAST_USED_WRITE_INTERVAL_SECONDS: i64 = 3600;
 #[derive(Debug, Clone, Copy)]
 pub struct ArtworkRequest<'a> {
     pub provider_game_id: &'a str,
+    pub kind: ArtworkKind,
+    /// RomM's larger hosted cover path, preferred when it is usable.
+    pub large_reference: Option<&'a str>,
     /// RomM's own small-cover path. The only fetchable reference.
     pub small_reference: Option<&'a str>,
     /// Whatever scraper URL RomM recorded. Kept for provenance, never fetched.
@@ -111,10 +140,41 @@ impl<'a> ArtworkRequest<'a> {
         let artwork = record.artwork.as_ref();
         Self {
             provider_game_id: &record.provider_game_id,
+            kind: ArtworkKind::Cover,
+            large_reference: artwork.and_then(|art| art.large_reference.as_deref()),
             small_reference: artwork.and_then(|art| art.small_reference.as_deref()),
-            public_reference: artwork.map(|art| art.reference.as_str()),
+            public_reference: artwork.and_then(|art| {
+                (art.large_reference.as_deref() != Some(art.reference.as_str()))
+                    .then_some(art.reference.as_str())
+            }),
         }
     }
+
+    pub fn from_media(provider_game_id: &'a str, media: &'a super::model::MediaReference) -> Self {
+        Self {
+            provider_game_id,
+            kind: ArtworkKind::Screenshot,
+            large_reference: None,
+            small_reference: media.hosted_reference.as_deref(),
+            public_reference: media.public_reference.as_deref(),
+        }
+    }
+
+    pub fn without_large(&self) -> ArtworkRequest<'a> {
+        ArtworkRequest {
+            provider_game_id: self.provider_game_id,
+            kind: self.kind,
+            large_reference: None,
+            small_reference: self.small_reference,
+            public_reference: self.public_reference,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ArtworkKind {
+    Cover,
+    Screenshot,
 }
 
 /// Why a thumbnail is not available.
@@ -589,6 +649,8 @@ impl ArtworkCache {
         digest.update(b"\0");
         digest.update(request.provider_game_id.as_bytes());
         digest.update(b"\0");
+        digest.update([request.kind as u8]);
+        digest.update(b"\0");
         digest.update(artwork_identity(request).as_bytes());
         digest
             .finalize()
@@ -605,9 +667,18 @@ impl ArtworkCache {
     /// corrupted entry is refetched rather than drawn as a broken image.
     pub fn lookup(&self, server_id: &str, request: &ArtworkRequest<'_>) -> Option<CachedThumbnail> {
         let key = Self::key_for(server_id, request);
+        if let Some(thumbnail) = self.lookup_key(server_id, &key) {
+            return Some(thumbnail);
+        }
+        let fallback = request.without_large();
+        fallback.large_reference?;
+        self.lookup_key(server_id, &Self::key_for(server_id, &fallback))
+    }
+
+    fn lookup_key(&self, server_id: &str, key: &str) -> Option<CachedThumbnail> {
         let index = self.load_index(server_id);
         let entry = index.entries.iter().find(|entry| entry.key == key)?;
-        let path = self.thumbnail_path(&key);
+        let path = self.thumbnail_path(key);
         let bytes = fs::read(&path).ok();
         let valid = bytes
             .as_deref()
@@ -625,7 +696,7 @@ impl ArtworkCache {
             return None;
         }
         let thumbnail = CachedThumbnail {
-            key: key.clone(),
+            key: key.to_string(),
             path,
             width: entry.width,
             height: entry.height,
@@ -679,7 +750,50 @@ impl ArtworkCache {
         now_unix_seconds: i64,
         cancel: Option<&AtomicBool>,
     ) -> Result<CachedThumbnail, ArtworkRefusal> {
+        let fallback = request.without_large();
+        let candidates = if request.large_reference.is_some() {
+            [*request, fallback]
+        } else {
+            [*request, *request]
+        };
+        let mut last_error = None;
+        for (index, candidate) in candidates.iter().enumerate() {
+            if index == 1 && request.large_reference.is_none() {
+                break;
+            }
+            match self.fetch_one(source, transport, candidate, now_unix_seconds, cancel) {
+                Ok(thumbnail) => return Ok(thumbnail),
+                Err(ArtworkRefusal::Cancelled) => return Err(ArtworkRefusal::Cancelled),
+                Err(error) => last_error = Some(error),
+            }
+        }
+        Err(last_error.unwrap_or(ArtworkRefusal::NoArtwork))
+    }
+
+    fn fetch_one<T: RommTransport>(
+        &self,
+        source: &ValidatedRommSource,
+        transport: &T,
+        request: &ArtworkRequest<'_>,
+        now_unix_seconds: i64,
+        cancel: Option<&AtomicBool>,
+    ) -> Result<CachedThumbnail, ArtworkRefusal> {
         let server_id = source.server_id().to_string();
+
+        // An explicitly-configured local media mapping can make RomM's hosted
+        // reference resolve to a readable file on disk. When it does, that file
+        // is the same image RomM would serve, so it is decoded directly and the
+        // HTTP fetch is skipped. Every way this can come up short - no mapping,
+        // the file is absent, the reference is unsafe, the file is oversized, or
+        // it does not decode - falls through to the existing approved-origin
+        // fetch below, so local media is only ever an optimisation, never a new
+        // failure mode.
+        if let Some(thumbnail) =
+            self.fetch_local_media(source, &server_id, request, now_unix_seconds, cancel)?
+        {
+            return Ok(thumbnail);
+        }
+
         let url = self.resolve(source, request)?;
         if cancelled(cancel) {
             return Err(ArtworkRefusal::Cancelled);
@@ -689,24 +803,43 @@ impl ArtworkCache {
         // not offered first. It is only used if the instance actually refuses -
         // there is no reason to hand a credential to a request that does not want
         // one.
-        let response = match transport.get(&url, None, MAX_ARTWORK_RESPONSE_BYTES) {
-            Ok(response) if response.status == 401 || response.status == 403 => source
-                .token()
-                .with_header_value(|header| {
-                    transport.get(&url, Some(header), MAX_ARTWORK_RESPONSE_BYTES)
-                })
-                .map_err(ArtworkRefusal::Request)?,
+        let launchbox = is_launchbox_url(&url);
+        let response = match transport.get(&url, None, MAX_ARTWORK_RESPONSE_BYTES, REQUEST_TIMEOUT)
+        {
+            Ok(response) if !launchbox && (response.status == 401 || response.status == 403) => {
+                source
+                    .token()
+                    .with_header_value(|header| {
+                        transport.get(
+                            &url,
+                            Some(header),
+                            MAX_ARTWORK_RESPONSE_BYTES,
+                            REQUEST_TIMEOUT,
+                        )
+                    })
+                    .map_err(ArtworkRefusal::Request)?
+            }
             Ok(response) => response,
-            Err(RommRequestError::Unauthorised { .. }) => source
+            Err(RommRequestError::Unauthorised { .. }) if !launchbox => source
                 .token()
                 .with_header_value(|header| {
-                    transport.get(&url, Some(header), MAX_ARTWORK_RESPONSE_BYTES)
+                    transport.get(
+                        &url,
+                        Some(header),
+                        MAX_ARTWORK_RESPONSE_BYTES,
+                        REQUEST_TIMEOUT,
+                    )
                 })
                 .map_err(ArtworkRefusal::Request)?,
             Err(error) => return Err(ArtworkRefusal::Request(error)),
         };
         if cancelled(cancel) {
             return Err(ArtworkRefusal::Cancelled);
+        }
+        if let Some(location) = response.location.as_deref() {
+            return Err(ArtworkRefusal::Endpoint(EndpointRefusal::RedirectRefused {
+                location: location.to_string(),
+            }));
         }
         if response.status != 200 {
             return Err(ArtworkRefusal::Request(RommRequestError::HttpStatus {
@@ -727,6 +860,97 @@ impl ArtworkCache {
         self.store(&server_id, request, thumbnail, now_unix_seconds)
     }
 
+    /// Tries to satisfy `request` from an explicitly-mapped local media file
+    /// instead of an HTTP fetch.
+    ///
+    /// `Ok(Some(_))` is a local hit: the mapped file decoded and was stored
+    /// under the identical cache key the remote path would have used - it is the
+    /// same image, identified the same way (RomM's reference and its `ts`), so a
+    /// later [`Self::lookup`] finds it with no network and a replaced cover
+    /// still invalidates it.
+    ///
+    /// `Ok(None)` means there is nothing usable locally and the caller must fall
+    /// back to the existing remote/cache path: no mapping is configured, the
+    /// reference does not resolve to a present regular file, the reference is
+    /// unsafe (traversal, symlink escape, wrong provider prefix, unsupported
+    /// type, unreadable), the file is over [`MAX_ARTWORK_RESPONSE_BYTES`], or it
+    /// failed to decode. A local problem is never surfaced as an error - the
+    /// remote copy may still be usable.
+    ///
+    /// The only `Err` is [`ArtworkRefusal::Cancelled`] or a genuine
+    /// cache-write failure from [`Self::store`], both of which the remote path
+    /// raises identically.
+    fn fetch_local_media(
+        &self,
+        source: &ValidatedRommSource,
+        server_id: &str,
+        request: &ArtworkRequest<'_>,
+        now_unix_seconds: i64,
+        cancel: Option<&AtomicBool>,
+    ) -> Result<Option<CachedThumbnail>, ArtworkRefusal> {
+        let Some(mapping) = source.media_mapping() else {
+            return Ok(None);
+        };
+        // `fetch` already tries the large reference and then the small one in
+        // turn, so exactly one reference is resolved here - the same one
+        // `resolve` would fetch for this call.
+        let Some(reference) = request
+            .large_reference
+            .or(request.small_reference)
+            .map(str::trim)
+            .filter(|reference| !reference.is_empty())
+        else {
+            return Ok(None);
+        };
+        // RomM appends a `?ts=...` cache-busting query to hosted references. It
+        // identifies a version over HTTP but is not part of the on-disk file
+        // name, so the local lookup uses the path portion only. The mapping
+        // primitive's traversal / `..` / control-character refusals act on the
+        // path components, which dropping a trailing `?query` or `#fragment`
+        // cannot affect.
+        let path_reference = reference
+            .split(['?', '#'])
+            .next()
+            .unwrap_or(reference)
+            .trim();
+        if path_reference.is_empty() {
+            return Ok(None);
+        }
+        // The only local-path primitive: it validates the provider prefix, the
+        // configured root, `..`/traversal, symlink escape and the media type,
+        // and returns `Ok(None)` when the mapped file is simply absent.
+        let local_path = match resolve_romm_media_reference(Some(mapping), path_reference) {
+            Ok(Some(path)) => path,
+            Ok(None) | Err(_) => return Ok(None),
+        };
+        if cancelled(cancel) {
+            return Err(ArtworkRefusal::Cancelled);
+        }
+        // The same ceiling the transport enforces on a response body, applied
+        // before the file is read into memory.
+        match fs::metadata(&local_path) {
+            Ok(metadata) if metadata.len() <= MAX_ARTWORK_RESPONSE_BYTES as u64 => {}
+            _ => return Ok(None),
+        }
+        let Ok(bytes) = fs::read(&local_path) else {
+            return Ok(None);
+        };
+        if bytes.len() > MAX_ARTWORK_RESPONSE_BYTES {
+            return Ok(None);
+        }
+        // Decoding uses the identical bounded decoder the remote body goes
+        // through. A local file that is not a PNG this build decodes is not an
+        // error - the remote copy might be - so fall through instead.
+        let Ok(thumbnail) = render_thumbnail(&bytes) else {
+            return Ok(None);
+        };
+        if cancelled(cancel) {
+            return Err(ArtworkRefusal::Cancelled);
+        }
+        self.store(server_id, request, thumbnail, now_unix_seconds)
+            .map(Some)
+    }
+
     /// Resolves a request to a URL on the approved origin, or refuses.
     fn resolve(
         &self,
@@ -734,7 +958,8 @@ impl ArtworkCache {
         request: &ArtworkRequest<'_>,
     ) -> Result<String, ArtworkRefusal> {
         let Some(reference) = request
-            .small_reference
+            .large_reference
+            .or(request.small_reference)
             .map(str::trim)
             .filter(|r| !r.is_empty())
         else {
@@ -745,6 +970,7 @@ impl ArtworkCache {
                 .map(str::trim)
                 .filter(|r| !r.is_empty())
             {
+                Some(public) if validate_launchbox_url(public).is_ok() => Ok(public.to_string()),
                 Some(public) => Err(ArtworkRefusal::RemoteHostNotAllowed {
                     host: host_of(public).unwrap_or_else(|| "an external host".to_string()),
                 }),
@@ -998,7 +1224,8 @@ impl ArtworkCache {
 /// path itself is used.
 fn artwork_identity(request: &ArtworkRequest<'_>) -> String {
     match request
-        .small_reference
+        .large_reference
+        .or(request.small_reference)
         .map(str::trim)
         .filter(|r| !r.is_empty())
     {
@@ -1027,6 +1254,54 @@ fn host_of(reference: &str) -> Option<String> {
     url::Url::parse(reference)
         .ok()
         .and_then(|url| url.host_str().map(str::to_string))
+}
+
+/// Validates the narrowly approved LaunchBox image URL shape. LaunchBox is a
+/// public CDN exception to RomM's private-origin policy, so it has its own
+/// exact-host check; direct/private IP literals are still refused.
+fn validate_launchbox_url(reference: &str) -> Result<(), ArtworkRefusal> {
+    let url = url::Url::parse(reference).map_err(|error| ArtworkRefusal::UnsupportedReference {
+        detail: error.to_string(),
+    })?;
+    if url.scheme() != "https" {
+        return Err(ArtworkRefusal::UnsupportedReference {
+            detail: "LaunchBox media must use HTTPS".to_string(),
+        });
+    }
+    if url.username() != "" || url.password().is_some() {
+        return Err(ArtworkRefusal::UnsupportedReference {
+            detail: "LaunchBox media URLs must not contain credentials".to_string(),
+        });
+    }
+    if url.host_str() != Some(APPROVED_LAUNCHBOX_IMAGE_HOST) {
+        return Err(ArtworkRefusal::RemoteHostNotAllowed {
+            host: url.host_str().unwrap_or("missing host").to_string(),
+        });
+    }
+    if url.port_or_known_default() != Some(443) {
+        return Err(ArtworkRefusal::UnsupportedReference {
+            detail: "LaunchBox media must use the default HTTPS port".to_string(),
+        });
+    }
+    if url.path().len() > MAX_EXTERNAL_IMAGE_PATH_BYTES {
+        return Err(ArtworkRefusal::UnsupportedReference {
+            detail: "LaunchBox media URL path is too long".to_string(),
+        });
+    }
+    if url
+        .host_str()
+        .and_then(|host| host.parse::<std::net::IpAddr>().ok())
+        .is_some()
+    {
+        return Err(ArtworkRefusal::UnsupportedReference {
+            detail: "LaunchBox media must use its approved hostname".to_string(),
+        });
+    }
+    Ok(())
+}
+
+fn is_launchbox_url(reference: &str) -> bool {
+    validate_launchbox_url(reference).is_ok()
 }
 
 fn cancelled(cancel: Option<&AtomicBool>) -> bool {

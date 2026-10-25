@@ -1,0 +1,1540 @@
+{
+  "baseline": "cb3205b7690221703de1fd600fa8996d195fe991",
+  "branch": "fix/brick1b-parent-boundary",
+  "worktree": "/home/davedap/emuwiz-brick1b-parent-boundary",
+  "environment": {
+    "kernel": "Linux 6.8.0-142-generic",
+    "filesystem": "ext4",
+    "uid": 1000,
+    "private_root": "/tmp/emuwiz-brick1b-q7karliu"
+  },
+  "source_hashes_sha256": {
+    "crates/archivefs-core/src/atomic_text.rs": "c02ecafd8fb67eb9ddaf144a7dea23f50d7c5a8f78ac735f91b55dbd930b1f8e",
+    "crates/archivefs-core/src/atomic_text/parent_dir.rs": "15170afe5e0f67b07b4c7682305e4b8298ceb2c47ed854c63798de7bb1b2844a",
+    "crates/archivefs-core/src/lib.rs": "bd505d0a2c96583385d1e30dd62a5bf5d1d2a3f0a87561a36f46994b186c6cbd",
+    "crates/archivefs-core/src/atomic_text/tests.rs": "df999df1a3f9f69b8e1e613aaf06f1c34354e89859bc6bab0c102ee2d347c3ac",
+    "crates/archivefs-core/src/atomic_text/tests/parent_boundary.rs": "4d564fe16e361e98c904f954d3ff4cefbca46c997193319b45c9122a1a357ce9",
+    "crates/archivefs-core/src/atomic_text/tests/pinned_parent.rs": "fce7e68dcf5e17f9f01c402d05392de144fa08ffc18c5dd1f6c8116e4e79d2e9"
+  },
+  "commands": [
+    {
+      "tag": "baseline-parent",
+      "command": [
+        "scripts/cargo-iso",
+        "--low-debug",
+        "test",
+        "--offline",
+        "--locked",
+        "-p",
+        "archivefs-core",
+        "--lib",
+        "atomic_text::tests::parent_boundary",
+        "--",
+        "--nocapture"
+      ],
+      "result": "FAILED",
+      "passed": 0,
+      "failed": 5,
+      "ignored": 0,
+      "log": "/tmp/emuwiz-brick1b-q7karliu/logs/baseline-parent.log",
+      "log_sha256": "e2004bc794f8fd092818601bc1ee19ce4d1fe09bc8bd976426600e4c5ab3f80d"
+    },
+    {
+      "tag": "candidate-atomic",
+      "command": [
+        "scripts/cargo-iso",
+        "--low-debug",
+        "test",
+        "--offline",
+        "--locked",
+        "-p",
+        "archivefs-core",
+        "--lib",
+        "atomic_text::tests",
+        "--",
+        "--nocapture"
+      ],
+      "result": "ok",
+      "passed": 42,
+      "failed": 0,
+      "ignored": 0,
+      "log": "/tmp/emuwiz-brick1b-q7karliu/logs/candidate-atomic.log",
+      "log_sha256": "54e111f9c4275a71ae99969509bc562b4af47a00bfdb245929d26e5e9e445047"
+    },
+    {
+      "tag": "integration-ownership",
+      "command": [
+        "scripts/cargo-iso",
+        "--low-debug",
+        "test",
+        "--offline",
+        "--locked",
+        "-p",
+        "archivefs-core",
+        "--test",
+        "atomic_text_temp_ownership",
+        "--",
+        "--nocapture"
+      ],
+      "result": "ok",
+      "passed": 6,
+      "failed": 0,
+      "ignored": 0,
+      "log": "/tmp/emuwiz-brick1b-q7karliu/logs/integration-ownership.log",
+      "log_sha256": "79f8d3a5e4c5c28ef0394103cd60675c02ef604399168dc748c4ec23335c9313"
+    },
+    {
+      "tag": "config-sources",
+      "command": [
+        "scripts/cargo-iso",
+        "--low-debug",
+        "test",
+        "--offline",
+        "--locked",
+        "-p",
+        "archivefs-core",
+        "--lib",
+        "save_source_folder_configs",
+        "--",
+        "--test-threads=2"
+      ],
+      "result": "ok",
+      "passed": 2,
+      "failed": 0,
+      "ignored": 0,
+      "log": "/tmp/emuwiz-brick1b-q7karliu/logs/config-sources.log",
+      "log_sha256": "47eefe8d109f3d4ae5e068f40228c09d9afba87e0840900d72a3d37fa02e8699"
+    },
+    {
+      "tag": "config-mount-update",
+      "command": [
+        "scripts/cargo-iso",
+        "--low-debug",
+        "test",
+        "--offline",
+        "--locked",
+        "-p",
+        "archivefs-core",
+        "--lib",
+        "mount_root_update",
+        "--",
+        "--test-threads=2"
+      ],
+      "result": "ok",
+      "passed": 4,
+      "failed": 0,
+      "ignored": 0,
+      "log": "/tmp/emuwiz-brick1b-q7karliu/logs/config-mount-update.log",
+      "log_sha256": "61ef735cf042906d65d88f0551f5a91022cfe1e7f0d2ba169e09722c302100b9"
+    },
+    {
+      "tag": "config-set-mount",
+      "command": [
+        "scripts/cargo-iso",
+        "--low-debug",
+        "test",
+        "--offline",
+        "--locked",
+        "-p",
+        "archivefs-core",
+        "--lib",
+        "set_mount_root",
+        "--",
+        "--test-threads=2"
+      ],
+      "result": "ok",
+      "passed": 4,
+      "failed": 0,
+      "ignored": 0,
+      "log": "/tmp/emuwiz-brick1b-q7karliu/logs/config-set-mount.log",
+      "log_sha256": "9b24a79605a26ea9e74d95d912f05e7538bdd280f8117f6aeb444ee9e5b04b42"
+    },
+    {
+      "tag": "config-master-root",
+      "command": [
+        "scripts/cargo-iso",
+        "--low-debug",
+        "test",
+        "--offline",
+        "--locked",
+        "-p",
+        "archivefs-core",
+        "--lib",
+        "master_rom_root_round_trips",
+        "--",
+        "--test-threads=2"
+      ],
+      "result": "ok",
+      "passed": 1,
+      "failed": 0,
+      "ignored": 0,
+      "log": "/tmp/emuwiz-brick1b-q7karliu/logs/config-master-root.log",
+      "log_sha256": "b843ac0bc58c2725bbc416d59f185df1b75dac118ed5fb255f81212e21ea7164"
+    },
+    {
+      "tag": "profiles",
+      "command": [
+        "scripts/cargo-iso",
+        "--low-debug",
+        "test",
+        "--offline",
+        "--locked",
+        "-p",
+        "archivefs-core",
+        "--lib",
+        "emulator_profile_resolver::tests",
+        "--",
+        "--test-threads=2"
+      ],
+      "result": "ok",
+      "passed": 28,
+      "failed": 0,
+      "ignored": 1,
+      "log": "/tmp/emuwiz-brick1b-q7karliu/logs/profiles.log",
+      "log_sha256": "67a63f9194c0675e386d69259d3b18014a4edaf446d06fc1430119121a303c1b"
+    },
+    {
+      "tag": "profile-memory",
+      "command": [
+        "scripts/cargo-iso",
+        "--low-debug",
+        "test",
+        "--offline",
+        "--locked",
+        "-p",
+        "archivefs-core",
+        "--lib",
+        "patch_manager::emulator_profile_memory::tests",
+        "--",
+        "--test-threads=2"
+      ],
+      "result": "ok",
+      "passed": 14,
+      "failed": 0,
+      "ignored": 0,
+      "log": "/tmp/emuwiz-brick1b-q7karliu/logs/profile-memory.log",
+      "log_sha256": "899a44f2ddef7a459b70fa0494170d9ee61e5bba23993d42f11911535593989f"
+    },
+    {
+      "tag": "rename-journals",
+      "command": [
+        "scripts/cargo-iso",
+        "--low-debug",
+        "test",
+        "--offline",
+        "--locked",
+        "-p",
+        "archivefs-core",
+        "--lib",
+        "dat::rename_apply::",
+        "--",
+        "--test-threads=2"
+      ],
+      "result": "ok",
+      "passed": 138,
+      "failed": 0,
+      "ignored": 0,
+      "log": "/tmp/emuwiz-brick1b-q7karliu/logs/rename-journals.log",
+      "log_sha256": "6682a7569e4942312a1830a9459684bd8bfcd9e47eb143524b09019144367dcb"
+    },
+    {
+      "tag": "dat-state",
+      "command": [
+        "scripts/cargo-iso",
+        "--low-debug",
+        "test",
+        "--offline",
+        "--locked",
+        "-p",
+        "archivefs-core",
+        "--lib",
+        "dat::updates::tests",
+        "--",
+        "--test-threads=2"
+      ],
+      "result": "ok",
+      "passed": 72,
+      "failed": 0,
+      "ignored": 0,
+      "log": "/tmp/emuwiz-brick1b-q7karliu/logs/dat-state.log",
+      "log_sha256": "0d0f18aa083d5d9e949f95ca56ef7fbf3993dc7ec2d3bd5d39faa547d8288db2"
+    },
+    {
+      "tag": "conversion-queue",
+      "command": [
+        "scripts/cargo-iso",
+        "--low-debug",
+        "test",
+        "--offline",
+        "--locked",
+        "-p",
+        "archivefs-core",
+        "--lib",
+        "conversion_queue::durable::tests",
+        "--",
+        "--test-threads=2"
+      ],
+      "result": "ok",
+      "passed": 45,
+      "failed": 0,
+      "ignored": 0,
+      "log": "/tmp/emuwiz-brick1b-q7karliu/logs/conversion-queue.log",
+      "log_sha256": "b619a5781969a925f3cd45dd478253ecdd3ba850a4a89ae041fa93557bdb2b10"
+    },
+    {
+      "tag": "patch-recovery",
+      "command": [
+        "scripts/cargo-iso",
+        "--low-debug",
+        "test",
+        "--offline",
+        "--locked",
+        "-p",
+        "archivefs-core",
+        "--lib",
+        "patch_output_recovery::tests",
+        "--",
+        "--test-threads=2"
+      ],
+      "result": "ok",
+      "passed": 5,
+      "failed": 0,
+      "ignored": 0,
+      "log": "/tmp/emuwiz-brick1b-q7karliu/logs/patch-recovery.log",
+      "log_sha256": "15ba7ebea3b41be702dda9625b0c34c41a7e4d4eb1104ba8645164f5281fe7c2"
+    },
+    {
+      "tag": "library-views",
+      "command": [
+        "scripts/cargo-iso",
+        "--low-debug",
+        "test",
+        "--offline",
+        "--locked",
+        "-p",
+        "archivefs-core",
+        "--lib",
+        "library_views::tests",
+        "--",
+        "--test-threads=2"
+      ],
+      "result": "ok",
+      "passed": 105,
+      "failed": 0,
+      "ignored": 0,
+      "log": "/tmp/emuwiz-brick1b-q7karliu/logs/library-views.log",
+      "log_sha256": "db151497de748cd1318c73cd33f3d81c1364b1dc3b2ec7add71a08811118aff5"
+    },
+    {
+      "tag": "es-de",
+      "command": [
+        "scripts/cargo-iso",
+        "--low-debug",
+        "test",
+        "--offline",
+        "--locked",
+        "-p",
+        "archivefs-core",
+        "--lib",
+        "launch::es_de_publish::tests",
+        "--",
+        "--test-threads=2"
+      ],
+      "result": "ok",
+      "passed": 29,
+      "failed": 0,
+      "ignored": 0,
+      "log": "/tmp/emuwiz-brick1b-q7karliu/logs/es-de.log",
+      "log_sha256": "a705311931196d60fe86c17e18d85bfa0de4165ba4b6fef3ac873a5512bb9587"
+    }
+  ],
+  "baseline_reproductions": [
+    {
+      "after": {
+        "original": {
+          "directory": {
+            "bytes": null,
+            "dev": 64512,
+            "ino": 14555037,
+            "links": 2,
+            "mode": 16893,
+            "resolved_directory": [
+              64512,
+              14555037
+            ],
+            "symlink": null
+          },
+          "entries": [
+            {
+              "name": ".archivefs-config-write-nnAdFZOgm0JV.tmp",
+              "object": {
+                "bytes_hex": "",
+                "bytes_utf8": "",
+                "dev": 64512,
+                "ino": 14555048,
+                "links": 1,
+                "mode": 33204,
+                "resolved_directory": null,
+                "symlink": null
+              }
+            },
+            {
+              "name": "destination",
+              "object": {
+                "bytes_hex": "6f726967696e616c2064657374696e6174696f6e",
+                "bytes_utf8": "original destination",
+                "dev": 64512,
+                "ino": 14555039,
+                "links": 1,
+                "mode": 33204,
+                "resolved_directory": null,
+                "symlink": null
+              }
+            }
+          ]
+        },
+        "replacement": {
+          "directory": {
+            "bytes": null,
+            "dev": 64512,
+            "ino": 14555049,
+            "links": 2,
+            "mode": 16893,
+            "resolved_directory": [
+              64512,
+              14555049
+            ],
+            "symlink": null
+          },
+          "entries": [
+            {
+              "name": ".archivefs-config-write-nnAdFZOgm0JV.tmp",
+              "object": {
+                "bytes_hex": "6f74686572206f7065726174696f6e207374616765",
+                "bytes_utf8": "other operation stage",
+                "dev": 64512,
+                "ino": 14555053,
+                "links": 1,
+                "mode": 33204,
+                "resolved_directory": null,
+                "symlink": null
+              }
+            },
+            {
+              "name": "destination",
+              "object": {
+                "bytes_hex": "7265706c6163656d656e742064657374696e6174696f6e",
+                "bytes_utf8": "replacement destination",
+                "dev": 64512,
+                "ino": 14555052,
+                "links": 1,
+                "mode": 33204,
+                "resolved_directory": null,
+                "symlink": null
+              }
+            }
+          ]
+        }
+      },
+      "before": {
+        "directory": {
+          "bytes": null,
+          "dev": 64512,
+          "ino": 14555037,
+          "links": 2,
+          "mode": 16893,
+          "resolved_directory": [
+            64512,
+            14555037
+          ],
+          "symlink": null
+        },
+        "entries": [
+          {
+            "name": "destination",
+            "object": {
+              "bytes_hex": "6f726967696e616c2064657374696e6174696f6e",
+              "bytes_utf8": "original destination",
+              "dev": 64512,
+              "ino": 14555039,
+              "links": 1,
+              "mode": 33204,
+              "resolved_directory": null,
+              "symlink": null
+            }
+          }
+        ]
+      },
+      "case": "parent-replaced",
+      "result": "Err(Io { path: Some(\"/tmp/emuwiz-brick1b-q7karliu/tmp/emuwiz-owned-stage-20sIPT/parent/.archivefs-config-write-nnAdFZOgm0JV.tmp\"), source: Custom { kind: Other, error: \"/tmp/emuwiz-brick1b-q7karliu/tmp/emuwiz-owned-stage-20sIPT/parent/.archivefs-config-write-nnAdFZOgm0JV.tmp: temporary entry no longer identifies the exclusively owned staging file; temporary cleanup refused or failed (temporary entry no longer identifies the exclusively owned staging file); inspect the destination and temporary path /tmp/emuwiz-brick1b-q7karliu/tmp/emuwiz-owned-stage-20sIPT/parent/.archivefs-config-write-nnAdFZOgm0JV.tmp\" } })"
+    },
+    {
+      "after": {
+        "original": {
+          "directory": {
+            "bytes": null,
+            "dev": 64512,
+            "ino": 14551796,
+            "links": 2,
+            "mode": 16893,
+            "resolved_directory": [
+              64512,
+              14551796
+            ],
+            "symlink": null
+          },
+          "entries": [
+            {
+              "name": "destination",
+              "object": {
+                "bytes_hex": "6f726967696e616c2064657374696e6174696f6e",
+                "bytes_utf8": "original destination",
+                "dev": 64512,
+                "ino": 14551798,
+                "links": 1,
+                "mode": 33204,
+                "resolved_directory": null,
+                "symlink": null
+              }
+            }
+          ]
+        },
+        "replacement": {
+          "directory": {
+            "bytes": null,
+            "dev": 64512,
+            "ino": 14555033,
+            "links": 2,
+            "mode": 16893,
+            "resolved_directory": [
+              64512,
+              14555033
+            ],
+            "symlink": null
+          },
+          "entries": [
+            {
+              "name": ".archivefs-config-write-other.tmp",
+              "object": {
+                "bytes_hex": "6f74686572206f7065726174696f6e207374616765",
+                "bytes_utf8": "other operation stage",
+                "dev": 64512,
+                "ino": 14555049,
+                "links": 1,
+                "mode": 33204,
+                "resolved_directory": null,
+                "symlink": null
+              }
+            },
+            {
+              "name": "destination",
+              "object": {
+                "bytes_hex": "6e65772074657874",
+                "bytes_utf8": "new text",
+                "dev": 64512,
+                "ino": 14555047,
+                "links": 1,
+                "mode": 33204,
+                "resolved_directory": null,
+                "symlink": null
+              }
+            }
+          ]
+        }
+      },
+      "before": {
+        "directory": {
+          "bytes": null,
+          "dev": 64512,
+          "ino": 14551796,
+          "links": 2,
+          "mode": 16893,
+          "resolved_directory": [
+            64512,
+            14551796
+          ],
+          "symlink": null
+        },
+        "entries": [
+          {
+            "name": "destination",
+            "object": {
+              "bytes_hex": "6f726967696e616c2064657374696e6174696f6e",
+              "bytes_utf8": "original destination",
+              "dev": 64512,
+              "ino": 14551798,
+              "links": 1,
+              "mode": 33204,
+              "resolved_directory": null,
+              "symlink": null
+            }
+          }
+        ]
+      },
+      "case": "relocated-owned-stage",
+      "result": "Ok(())"
+    },
+    {
+      "after": {
+        "original": {
+          "directory": {
+            "bytes": null,
+            "dev": 64512,
+            "ino": 14555040,
+            "links": 2,
+            "mode": 16893,
+            "resolved_directory": [
+              64512,
+              14555040
+            ],
+            "symlink": null
+          },
+          "entries": [
+            {
+              "name": "destination",
+              "object": {
+                "bytes_hex": "6f726967696e616c2064657374696e6174696f6e",
+                "bytes_utf8": "original destination",
+                "dev": 64512,
+                "ino": 14555043,
+                "links": 1,
+                "mode": 33204,
+                "resolved_directory": null,
+                "symlink": null
+              }
+            }
+          ]
+        },
+        "parent": {
+          "bytes": null,
+          "dev": 64512,
+          "ino": 14555039,
+          "links": 1,
+          "mode": 41471,
+          "resolved_directory": [
+            64512,
+            14555041
+          ],
+          "symlink": "/tmp/emuwiz-brick1b-q7karliu/tmp/emuwiz-owned-stage-hkm6fB/replacement-directory"
+        },
+        "replacement": {
+          "directory": {
+            "bytes": null,
+            "dev": 64512,
+            "ino": 14555041,
+            "links": 2,
+            "mode": 16893,
+            "resolved_directory": [
+              64512,
+              14555041
+            ],
+            "symlink": null
+          },
+          "entries": [
+            {
+              "name": "destination",
+              "object": {
+                "bytes_hex": "6e65772074657874",
+                "bytes_utf8": "new text",
+                "dev": 64512,
+                "ino": 14555051,
+                "links": 1,
+                "mode": 33204,
+                "resolved_directory": null,
+                "symlink": null
+              }
+            }
+          ]
+        }
+      },
+      "before": {
+        "original": {
+          "directory": {
+            "bytes": null,
+            "dev": 64512,
+            "ino": 14555040,
+            "links": 2,
+            "mode": 16893,
+            "resolved_directory": [
+              64512,
+              14555040
+            ],
+            "symlink": null
+          },
+          "entries": [
+            {
+              "name": "destination",
+              "object": {
+                "bytes_hex": "6f726967696e616c2064657374696e6174696f6e",
+                "bytes_utf8": "original destination",
+                "dev": 64512,
+                "ino": 14555043,
+                "links": 1,
+                "mode": 33204,
+                "resolved_directory": null,
+                "symlink": null
+              }
+            }
+          ]
+        },
+        "parent": {
+          "bytes": null,
+          "dev": 64512,
+          "ino": 14555042,
+          "links": 1,
+          "mode": 41471,
+          "resolved_directory": [
+            64512,
+            14555040
+          ],
+          "symlink": "/tmp/emuwiz-brick1b-q7karliu/tmp/emuwiz-owned-stage-hkm6fB/original-directory"
+        },
+        "replacement": {
+          "directory": {
+            "bytes": null,
+            "dev": 64512,
+            "ino": 14555041,
+            "links": 2,
+            "mode": 16893,
+            "resolved_directory": [
+              64512,
+              14555041
+            ],
+            "symlink": null
+          },
+          "entries": [
+            {
+              "name": "destination",
+              "object": {
+                "bytes_hex": "7265706c6163656d656e742064657374696e6174696f6e",
+                "bytes_utf8": "replacement destination",
+                "dev": 64512,
+                "ino": 14555044,
+                "links": 1,
+                "mode": 33204,
+                "resolved_directory": null,
+                "symlink": null
+              }
+            }
+          ]
+        }
+      },
+      "case": "symlink-rebinding",
+      "result": "Ok(())"
+    },
+    {
+      "after": {
+        "original": {
+          "directory": {
+            "bytes": null,
+            "dev": 64512,
+            "ino": 14555034,
+            "links": 2,
+            "mode": 16893,
+            "resolved_directory": [
+              64512,
+              14555034
+            ],
+            "symlink": null
+          },
+          "entries": [
+            {
+              "name": "gamelist.xml",
+              "object": {
+                "bytes_hex": "6f726967696e616c2067616d656c697374",
+                "bytes_utf8": "original gamelist",
+                "dev": 64512,
+                "ino": 14555036,
+                "links": 1,
+                "mode": 33204,
+                "resolved_directory": null,
+                "symlink": null
+              }
+            }
+          ]
+        },
+        "replacement": {
+          "directory": {
+            "bytes": null,
+            "dev": 64512,
+            "ino": 14555037,
+            "links": 2,
+            "mode": 16893,
+            "resolved_directory": [
+              64512,
+              14555037
+            ],
+            "symlink": null
+          },
+          "entries": [
+            {
+              "name": "gamelist.xml",
+              "object": {
+                "bytes_hex": "6e65772067616d656c697374",
+                "bytes_utf8": "new gamelist",
+                "dev": 64512,
+                "ino": 14555042,
+                "links": 1,
+                "mode": 33204,
+                "resolved_directory": null,
+                "symlink": null
+              }
+            }
+          ]
+        }
+      },
+      "before": {
+        "directory": {
+          "bytes": null,
+          "dev": 64512,
+          "ino": 14555034,
+          "links": 2,
+          "mode": 16893,
+          "resolved_directory": [
+            64512,
+            14555034
+          ],
+          "symlink": null
+        },
+        "entries": [
+          {
+            "name": "gamelist.xml",
+            "object": {
+              "bytes_hex": "6f726967696e616c2067616d656c697374",
+              "bytes_utf8": "original gamelist",
+              "dev": 64512,
+              "ino": 14555036,
+              "links": 1,
+              "mode": 33204,
+              "resolved_directory": null,
+              "symlink": null
+            }
+          }
+        ]
+      },
+      "case": "es-de-outer-result",
+      "result": "Ok(())"
+    },
+    {
+      "after": {
+        "original": {
+          "directory": {
+            "bytes": null,
+            "dev": 64512,
+            "ino": 14555045,
+            "links": 2,
+            "mode": 16893,
+            "resolved_directory": [
+              64512,
+              14555045
+            ],
+            "symlink": null
+          },
+          "entries": [
+            {
+              "name": "destination.json",
+              "object": {
+                "bytes_hex": "7b0a2020227472616e73616374696f6e5f6964223a202264657374696e6174696f6e222c0a202022706c616e5f67656e65726174696f6e223a20372c0a202022636c61737369666965725f76657273696f6e223a20226461742d636f6e74656e742d70302d7631222c0a202022637265617465645f61745f756e6978223a2034322c0a202022736f757263655f7363616e5f726f6f74223a202273796e746865746963222c0a2020227374617465223a2022706c616e6e6564222c0a202022656e7472696573223a205b5d0a7d0a",
+                "bytes_utf8": "{\n  \"transaction_id\": \"destination\",\n  \"plan_generation\": 7,\n  \"classifier_version\": \"dat-content-p0-v1\",\n  \"created_at_unix\": 42,\n  \"source_scan_root\": \"synthetic\",\n  \"state\": \"planned\",\n  \"entries\": []\n}\n",
+                "dev": 64512,
+                "ino": 14555046,
+                "links": 1,
+                "mode": 33204,
+                "resolved_directory": null,
+                "symlink": null
+              }
+            }
+          ]
+        },
+        "replacement": {
+          "directory": {
+            "bytes": null,
+            "dev": 64512,
+            "ino": 14551795,
+            "links": 2,
+            "mode": 16893,
+            "resolved_directory": [
+              64512,
+              14551795
+            ],
+            "symlink": null
+          },
+          "entries": [
+            {
+              "name": "destination.json",
+              "object": {
+                "bytes_hex": "7b0a2020227472616e73616374696f6e5f6964223a202264657374696e6174696f6e222c0a202022706c616e5f67656e65726174696f6e223a20372c0a202022636c61737369666965725f76657273696f6e223a20226461742d636f6e74656e742d70302d7631222c0a202022637265617465645f61745f756e6978223a2034322c0a202022736f757263655f7363616e5f726f6f74223a202273796e746865746963222c0a2020227374617465223a20226170706c696564222c0a202022656e7472696573223a205b5d0a7d0a",
+                "bytes_utf8": "{\n  \"transaction_id\": \"destination\",\n  \"plan_generation\": 7,\n  \"classifier_version\": \"dat-content-p0-v1\",\n  \"created_at_unix\": 42,\n  \"source_scan_root\": \"synthetic\",\n  \"state\": \"applied\",\n  \"entries\": []\n}\n",
+                "dev": 64512,
+                "ino": 14555044,
+                "links": 1,
+                "mode": 33204,
+                "resolved_directory": null,
+                "symlink": null
+              }
+            }
+          ]
+        }
+      },
+      "before": {
+        "directory": {
+          "bytes": null,
+          "dev": 64512,
+          "ino": 14555045,
+          "links": 2,
+          "mode": 16893,
+          "resolved_directory": [
+            64512,
+            14555045
+          ],
+          "symlink": null
+        },
+        "entries": [
+          {
+            "name": "destination.json",
+            "object": {
+              "bytes_hex": "7b0a2020227472616e73616374696f6e5f6964223a202264657374696e6174696f6e222c0a202022706c616e5f67656e65726174696f6e223a20372c0a202022636c61737369666965725f76657273696f6e223a20226461742d636f6e74656e742d70302d7631222c0a202022637265617465645f61745f756e6978223a2034322c0a202022736f757263655f7363616e5f726f6f74223a202273796e746865746963222c0a2020227374617465223a2022706c616e6e6564222c0a202022656e7472696573223a205b5d0a7d0a",
+              "bytes_utf8": "{\n  \"transaction_id\": \"destination\",\n  \"plan_generation\": 7,\n  \"classifier_version\": \"dat-content-p0-v1\",\n  \"created_at_unix\": 42,\n  \"source_scan_root\": \"synthetic\",\n  \"state\": \"planned\",\n  \"entries\": []\n}\n",
+              "dev": 64512,
+              "ino": 14555046,
+              "links": 1,
+              "mode": 33204,
+              "resolved_directory": null,
+              "symlink": null
+            }
+          }
+        ]
+      },
+      "case": "journal-result",
+      "result": "Ok(())"
+    }
+  ],
+  "candidate_reproductions": [
+    {
+      "after": {
+        "original": {
+          "directory": {
+            "bytes": null,
+            "dev": 64512,
+            "ino": 14558345,
+            "links": 2,
+            "mode": 16893,
+            "resolved_directory": [
+              64512,
+              14558345
+            ],
+            "symlink": null
+          },
+          "entries": [
+            {
+              "name": "destination",
+              "object": {
+                "bytes_hex": "6f726967696e616c2064657374696e6174696f6e",
+                "bytes_utf8": "original destination",
+                "dev": 64512,
+                "ino": 14558351,
+                "links": 1,
+                "mode": 33204,
+                "resolved_directory": null,
+                "symlink": null
+              }
+            }
+          ]
+        },
+        "replacement": {
+          "directory": {
+            "bytes": null,
+            "dev": 64512,
+            "ino": 14558344,
+            "links": 2,
+            "mode": 16893,
+            "resolved_directory": [
+              64512,
+              14558344
+            ],
+            "symlink": null
+          },
+          "entries": [
+            {
+              "name": ".archivefs-config-write-oDyuijFruMGY.tmp",
+              "object": {
+                "bytes_hex": "6f74686572206f7065726174696f6e207374616765",
+                "bytes_utf8": "other operation stage",
+                "dev": 64512,
+                "ino": 14558360,
+                "links": 1,
+                "mode": 33204,
+                "resolved_directory": null,
+                "symlink": null
+              }
+            },
+            {
+              "name": "destination",
+              "object": {
+                "bytes_hex": "7265706c6163656d656e742064657374696e6174696f6e",
+                "bytes_utf8": "replacement destination",
+                "dev": 64512,
+                "ino": 14558357,
+                "links": 1,
+                "mode": 33204,
+                "resolved_directory": null,
+                "symlink": null
+              }
+            }
+          ]
+        }
+      },
+      "before": {
+        "directory": {
+          "bytes": null,
+          "dev": 64512,
+          "ino": 14558345,
+          "links": 2,
+          "mode": 16893,
+          "resolved_directory": [
+            64512,
+            14558345
+          ],
+          "symlink": null
+        },
+        "entries": [
+          {
+            "name": "destination",
+            "object": {
+              "bytes_hex": "6f726967696e616c2064657374696e6174696f6e",
+              "bytes_utf8": "original destination",
+              "dev": 64512,
+              "ino": 14558351,
+              "links": 1,
+              "mode": 33204,
+              "resolved_directory": null,
+              "symlink": null
+            }
+          }
+        ]
+      },
+      "case": "parent-replaced",
+      "result": "Err(Io { path: Some(\"/tmp/emuwiz-brick1b-q7karliu/tmp/emuwiz-owned-stage-2MIPX4/parent\"), source: Custom { kind: Other, error: \"parent directory binding changed; pinned (64512, 14558345), observed (64512, 14558344)\" } })"
+    },
+    {
+      "after": {
+        "original": {
+          "directory": {
+            "bytes": null,
+            "dev": 64512,
+            "ino": 14558353,
+            "links": 2,
+            "mode": 16893,
+            "resolved_directory": [
+              64512,
+              14558353
+            ],
+            "symlink": null
+          },
+          "entries": [
+            {
+              "name": "gamelist.xml",
+              "object": {
+                "bytes_hex": "6f726967696e616c2067616d656c697374",
+                "bytes_utf8": "original gamelist",
+                "dev": 64512,
+                "ino": 14558342,
+                "links": 1,
+                "mode": 33204,
+                "resolved_directory": null,
+                "symlink": null
+              }
+            }
+          ]
+        },
+        "replacement": {
+          "directory": {
+            "bytes": null,
+            "dev": 64512,
+            "ino": 14558375,
+            "links": 2,
+            "mode": 16893,
+            "resolved_directory": [
+              64512,
+              14558375
+            ],
+            "symlink": null
+          },
+          "entries": [
+            {
+              "name": ".archivefs-config-write-vq1F9Zb5b2sy.tmp",
+              "object": {
+                "bytes_hex": "7b0a202022736368656d615f76657273696f6e223a20312c0a20202267616d656c6973745f70617468223a20222f746d702f656d7577697a2d627269636b31622d71376b61726c69752f746d702f656d7577697a2d6f776e65642d73746167652d3048494442372f706172656e742f67616d656c6973742e786d6c222c0a20202270726576696f75735f636f6e74656e74223a20226f726967696e616c2067616d656c697374220a7d",
+                "bytes_utf8": "{\n  \"schema_version\": 1,\n  \"gamelist_path\": \"/tmp/emuwiz-brick1b-q7karliu/tmp/emuwiz-owned-stage-0HIDB7/parent/gamelist.xml\",\n  \"previous_content\": \"original gamelist\"\n}",
+                "dev": 64512,
+                "ino": 14558358,
+                "links": 1,
+                "mode": 33204,
+                "resolved_directory": null,
+                "symlink": null
+              }
+            },
+            {
+              "name": "gamelist.xml",
+              "object": {
+                "bytes_hex": "7265706c6163656d656e742067616d656c697374",
+                "bytes_utf8": "replacement gamelist",
+                "dev": 64512,
+                "ino": 14558324,
+                "links": 1,
+                "mode": 33204,
+                "resolved_directory": null,
+                "symlink": null
+              }
+            }
+          ]
+        }
+      },
+      "before": {
+        "directory": {
+          "bytes": null,
+          "dev": 64512,
+          "ino": 14558353,
+          "links": 2,
+          "mode": 16893,
+          "resolved_directory": [
+            64512,
+            14558353
+          ],
+          "symlink": null
+        },
+        "entries": [
+          {
+            "name": "gamelist.xml",
+            "object": {
+              "bytes_hex": "6f726967696e616c2067616d656c697374",
+              "bytes_utf8": "original gamelist",
+              "dev": 64512,
+              "ino": 14558342,
+              "links": 1,
+              "mode": 33204,
+              "resolved_directory": null,
+              "symlink": null
+            }
+          }
+        ]
+      },
+      "case": "es-de-outer-result",
+      "result": "Err(Io { path: \"/tmp/emuwiz-brick1b-q7karliu/tmp/emuwiz-owned-stage-0HIDB7/parent/gamelist.xml.es-de-publish-recovery.json\", detail: \"/tmp/emuwiz-brick1b-q7karliu/tmp/emuwiz-owned-stage-0HIDB7/parent/.archivefs-config-write-vq1F9Zb5b2sy.tmp: /tmp/emuwiz-brick1b-q7karliu/tmp/emuwiz-owned-stage-0HIDB7/parent: parent directory binding changed; pinned (64512, 14558353), observed (64512, 14558375); temporary cleanup refused or failed (No such file or directory (os error 2)); inspect the destination and temporary path /tmp/emuwiz-brick1b-q7karliu/tmp/emuwiz-owned-stage-0HIDB7/parent/.archivefs-config-write-vq1F9Zb5b2sy.tmp\" })"
+    },
+    {
+      "after": {
+        "original": {
+          "directory": {
+            "bytes": null,
+            "dev": 64512,
+            "ino": 14558343,
+            "links": 2,
+            "mode": 16893,
+            "resolved_directory": [
+              64512,
+              14558343
+            ],
+            "symlink": null
+          },
+          "entries": [
+            {
+              "name": "destination",
+              "object": {
+                "bytes_hex": "6f726967696e616c2064657374696e6174696f6e",
+                "bytes_utf8": "original destination",
+                "dev": 64512,
+                "ino": 14558354,
+                "links": 1,
+                "mode": 33204,
+                "resolved_directory": null,
+                "symlink": null
+              }
+            }
+          ]
+        },
+        "parent": {
+          "bytes": null,
+          "dev": 64512,
+          "ino": 14558361,
+          "links": 1,
+          "mode": 41471,
+          "resolved_directory": [
+            64512,
+            14558348
+          ],
+          "symlink": "/tmp/emuwiz-brick1b-q7karliu/tmp/emuwiz-owned-stage-kS53Nj/replacement-directory"
+        },
+        "replacement": {
+          "directory": {
+            "bytes": null,
+            "dev": 64512,
+            "ino": 14558348,
+            "links": 2,
+            "mode": 16893,
+            "resolved_directory": [
+              64512,
+              14558348
+            ],
+            "symlink": null
+          },
+          "entries": [
+            {
+              "name": ".archivefs-config-write-poiEowugM8ob.tmp",
+              "object": {
+                "bytes_hex": "6e65772074657874",
+                "bytes_utf8": "new text",
+                "dev": 64512,
+                "ino": 14558359,
+                "links": 1,
+                "mode": 33204,
+                "resolved_directory": null,
+                "symlink": null
+              }
+            },
+            {
+              "name": "destination",
+              "object": {
+                "bytes_hex": "7265706c6163656d656e742064657374696e6174696f6e",
+                "bytes_utf8": "replacement destination",
+                "dev": 64512,
+                "ino": 14558303,
+                "links": 1,
+                "mode": 33204,
+                "resolved_directory": null,
+                "symlink": null
+              }
+            }
+          ]
+        }
+      },
+      "before": {
+        "original": {
+          "directory": {
+            "bytes": null,
+            "dev": 64512,
+            "ino": 14558343,
+            "links": 2,
+            "mode": 16893,
+            "resolved_directory": [
+              64512,
+              14558343
+            ],
+            "symlink": null
+          },
+          "entries": [
+            {
+              "name": "destination",
+              "object": {
+                "bytes_hex": "6f726967696e616c2064657374696e6174696f6e",
+                "bytes_utf8": "original destination",
+                "dev": 64512,
+                "ino": 14558354,
+                "links": 1,
+                "mode": 33204,
+                "resolved_directory": null,
+                "symlink": null
+              }
+            }
+          ]
+        },
+        "parent": {
+          "bytes": null,
+          "dev": 64512,
+          "ino": 14558349,
+          "links": 1,
+          "mode": 41471,
+          "resolved_directory": [
+            64512,
+            14558343
+          ],
+          "symlink": "/tmp/emuwiz-brick1b-q7karliu/tmp/emuwiz-owned-stage-kS53Nj/original-directory"
+        },
+        "replacement": {
+          "directory": {
+            "bytes": null,
+            "dev": 64512,
+            "ino": 14558348,
+            "links": 2,
+            "mode": 16893,
+            "resolved_directory": [
+              64512,
+              14558348
+            ],
+            "symlink": null
+          },
+          "entries": [
+            {
+              "name": "destination",
+              "object": {
+                "bytes_hex": "7265706c6163656d656e742064657374696e6174696f6e",
+                "bytes_utf8": "replacement destination",
+                "dev": 64512,
+                "ino": 14558303,
+                "links": 1,
+                "mode": 33204,
+                "resolved_directory": null,
+                "symlink": null
+              }
+            }
+          ]
+        }
+      },
+      "case": "symlink-rebinding",
+      "result": "Err(Io { path: Some(\"/tmp/emuwiz-brick1b-q7karliu/tmp/emuwiz-owned-stage-kS53Nj/parent-link/.archivefs-config-write-poiEowugM8ob.tmp\"), source: Custom { kind: Other, error: \"/tmp/emuwiz-brick1b-q7karliu/tmp/emuwiz-owned-stage-kS53Nj/parent-link: parent directory binding changed; pinned (64512, 14558343), observed (64512, 14558348); temporary cleanup refused or failed (No such file or directory (os error 2)); inspect the destination and temporary path /tmp/emuwiz-brick1b-q7karliu/tmp/emuwiz-owned-stage-kS53Nj/parent-link/.archivefs-config-write-poiEowugM8ob.tmp\" } })"
+    },
+    {
+      "after": {
+        "original": {
+          "directory": {
+            "bytes": null,
+            "dev": 64512,
+            "ino": 14558347,
+            "links": 2,
+            "mode": 16893,
+            "resolved_directory": [
+              64512,
+              14558347
+            ],
+            "symlink": null
+          },
+          "entries": [
+            {
+              "name": "destination",
+              "object": {
+                "bytes_hex": "6f726967696e616c2064657374696e6174696f6e",
+                "bytes_utf8": "original destination",
+                "dev": 64512,
+                "ino": 14558352,
+                "links": 1,
+                "mode": 33204,
+                "resolved_directory": null,
+                "symlink": null
+              }
+            }
+          ]
+        },
+        "replacement": {
+          "directory": {
+            "bytes": null,
+            "dev": 64512,
+            "ino": 14558378,
+            "links": 2,
+            "mode": 16893,
+            "resolved_directory": [
+              64512,
+              14558378
+            ],
+            "symlink": null
+          },
+          "entries": [
+            {
+              "name": ".archivefs-config-write-6tlq75odtN9U.tmp",
+              "object": {
+                "bytes_hex": "6e65772074657874",
+                "bytes_utf8": "new text",
+                "dev": 64512,
+                "ino": 14558297,
+                "links": 1,
+                "mode": 33204,
+                "resolved_directory": null,
+                "symlink": null
+              }
+            },
+            {
+              "name": ".archivefs-config-write-other.tmp",
+              "object": {
+                "bytes_hex": "6f74686572206f7065726174696f6e207374616765",
+                "bytes_utf8": "other operation stage",
+                "dev": 64512,
+                "ino": 14558330,
+                "links": 1,
+                "mode": 33204,
+                "resolved_directory": null,
+                "symlink": null
+              }
+            },
+            {
+              "name": "destination",
+              "object": {
+                "bytes_hex": "7265706c6163656d656e742064657374696e6174696f6e",
+                "bytes_utf8": "replacement destination",
+                "dev": 64512,
+                "ino": 14558380,
+                "links": 1,
+                "mode": 33204,
+                "resolved_directory": null,
+                "symlink": null
+              }
+            }
+          ]
+        }
+      },
+      "before": {
+        "directory": {
+          "bytes": null,
+          "dev": 64512,
+          "ino": 14558347,
+          "links": 2,
+          "mode": 16893,
+          "resolved_directory": [
+            64512,
+            14558347
+          ],
+          "symlink": null
+        },
+        "entries": [
+          {
+            "name": "destination",
+            "object": {
+              "bytes_hex": "6f726967696e616c2064657374696e6174696f6e",
+              "bytes_utf8": "original destination",
+              "dev": 64512,
+              "ino": 14558352,
+              "links": 1,
+              "mode": 33204,
+              "resolved_directory": null,
+              "symlink": null
+            }
+          }
+        ]
+      },
+      "case": "relocated-owned-stage",
+      "result": "Err(Io { path: Some(\"/tmp/emuwiz-brick1b-q7karliu/tmp/emuwiz-owned-stage-gH3NgJ/parent/.archivefs-config-write-6tlq75odtN9U.tmp\"), source: Custom { kind: Other, error: \"/tmp/emuwiz-brick1b-q7karliu/tmp/emuwiz-owned-stage-gH3NgJ/parent: parent directory binding changed; pinned (64512, 14558347), observed (64512, 14558378); temporary cleanup refused or failed (No such file or directory (os error 2)); inspect the destination and temporary path /tmp/emuwiz-brick1b-q7karliu/tmp/emuwiz-owned-stage-gH3NgJ/parent/.archivefs-config-write-6tlq75odtN9U.tmp\" } })"
+    },
+    {
+      "after": {
+        "original": {
+          "directory": {
+            "bytes": null,
+            "dev": 64512,
+            "ino": 14558332,
+            "links": 2,
+            "mode": 16893,
+            "resolved_directory": [
+              64512,
+              14558332
+            ],
+            "symlink": null
+          },
+          "entries": [
+            {
+              "name": "destination.json",
+              "object": {
+                "bytes_hex": "7b0a2020227472616e73616374696f6e5f6964223a202264657374696e6174696f6e222c0a202022706c616e5f67656e65726174696f6e223a20372c0a202022636c61737369666965725f76657273696f6e223a20226461742d636f6e74656e742d70302d7631222c0a202022637265617465645f61745f756e6978223a2034322c0a202022736f757263655f7363616e5f726f6f74223a202273796e746865746963222c0a2020227374617465223a2022706c616e6e6564222c0a202022656e7472696573223a205b5d0a7d0a",
+                "bytes_utf8": "{\n  \"transaction_id\": \"destination\",\n  \"plan_generation\": 7,\n  \"classifier_version\": \"dat-content-p0-v1\",\n  \"created_at_unix\": 42,\n  \"source_scan_root\": \"synthetic\",\n  \"state\": \"planned\",\n  \"entries\": []\n}\n",
+                "dev": 64512,
+                "ino": 14558333,
+                "links": 1,
+                "mode": 33204,
+                "resolved_directory": null,
+                "symlink": null
+              }
+            }
+          ]
+        },
+        "replacement": {
+          "directory": {
+            "bytes": null,
+            "dev": 64512,
+            "ino": 14558275,
+            "links": 2,
+            "mode": 16893,
+            "resolved_directory": [
+              64512,
+              14558275
+            ],
+            "symlink": null
+          },
+          "entries": [
+            {
+              "name": ".archivefs-config-write-eIjmZ9EGQNK8.tmp",
+              "object": {
+                "bytes_hex": "7b0a2020227472616e73616374696f6e5f6964223a202264657374696e6174696f6e222c0a202022706c616e5f67656e65726174696f6e223a20372c0a202022636c61737369666965725f76657273696f6e223a20226461742d636f6e74656e742d70302d7631222c0a202022637265617465645f61745f756e6978223a2034322c0a202022736f757263655f7363616e5f726f6f74223a202273796e746865746963222c0a2020227374617465223a20226170706c696564222c0a202022656e7472696573223a205b5d0a7d0a",
+                "bytes_utf8": "{\n  \"transaction_id\": \"destination\",\n  \"plan_generation\": 7,\n  \"classifier_version\": \"dat-content-p0-v1\",\n  \"created_at_unix\": 42,\n  \"source_scan_root\": \"synthetic\",\n  \"state\": \"applied\",\n  \"entries\": []\n}\n",
+                "dev": 64512,
+                "ino": 14558263,
+                "links": 1,
+                "mode": 33204,
+                "resolved_directory": null,
+                "symlink": null
+              }
+            },
+            {
+              "name": "destination.json",
+              "object": {
+                "bytes_hex": "756e72656c61746564206a6f75726e616c206279746573",
+                "bytes_utf8": "unrelated journal bytes",
+                "dev": 64512,
+                "ino": 14558265,
+                "links": 1,
+                "mode": 33204,
+                "resolved_directory": null,
+                "symlink": null
+              }
+            }
+          ]
+        }
+      },
+      "before": {
+        "directory": {
+          "bytes": null,
+          "dev": 64512,
+          "ino": 14558332,
+          "links": 2,
+          "mode": 16893,
+          "resolved_directory": [
+            64512,
+            14558332
+          ],
+          "symlink": null
+        },
+        "entries": [
+          {
+            "name": "destination.json",
+            "object": {
+              "bytes_hex": "7b0a2020227472616e73616374696f6e5f6964223a202264657374696e6174696f6e222c0a202022706c616e5f67656e65726174696f6e223a20372c0a202022636c61737369666965725f76657273696f6e223a20226461742d636f6e74656e742d70302d7631222c0a202022637265617465645f61745f756e6978223a2034322c0a202022736f757263655f7363616e5f726f6f74223a202273796e746865746963222c0a2020227374617465223a2022706c616e6e6564222c0a202022656e7472696573223a205b5d0a7d0a",
+              "bytes_utf8": "{\n  \"transaction_id\": \"destination\",\n  \"plan_generation\": 7,\n  \"classifier_version\": \"dat-content-p0-v1\",\n  \"created_at_unix\": 42,\n  \"source_scan_root\": \"synthetic\",\n  \"state\": \"planned\",\n  \"entries\": []\n}\n",
+              "dev": 64512,
+              "ino": 14558333,
+              "links": 1,
+              "mode": 33204,
+              "resolved_directory": null,
+              "symlink": null
+            }
+          }
+        ]
+      },
+      "case": "journal-result",
+      "result": "Err(Io { path: Some(\"/tmp/emuwiz-brick1b-q7karliu/tmp/emuwiz-owned-stage-jIlD5f/parent/.archivefs-config-write-eIjmZ9EGQNK8.tmp\"), source: Custom { kind: Other, error: \"/tmp/emuwiz-brick1b-q7karliu/tmp/emuwiz-owned-stage-jIlD5f/parent: parent directory binding changed; pinned (64512, 14558332), observed (64512, 14558275); temporary cleanup refused or failed (No such file or directory (os error 2)); inspect the destination and temporary path /tmp/emuwiz-brick1b-q7karliu/tmp/emuwiz-owned-stage-jIlD5f/parent/.archivefs-config-write-eIjmZ9EGQNK8.tmp\" } })"
+    }
+  ],
+  "primitive_proof": {
+    "held_ino": 14564627,
+    "retained_ino": 14564627,
+    "replacement_ino": 14564645,
+    "original_bytes": [
+      111,
+      119,
+      110,
+      101,
+      100,
+      32,
+      116,
+      101,
+      120,
+      116
+    ],
+    "replacement_entries": []
+  },
+  "source_truth": {
+    "checkout_head_before_task": "eba83521309942d26c164f4bca9493fe4c017423",
+    "fetched_origin_main": "cb3205b7690221703de1fd600fa8996d195fe991",
+    "ls_remote_main": "cb3205b7690221703de1fd600fa8996d195fe991",
+    "dedicated_head": "cb3205b7690221703de1fd600fa8996d195fe991",
+    "fetch": "git --git-dir=/home/davedap/archivefs/.git fetch --no-tags origin",
+    "final_fetched_origin_main": "cb3205b7690221703de1fd600fa8996d195fe991",
+    "final_ls_remote_main": "cb3205b7690221703de1fd600fa8996d195fe991",
+    "final_verified_at_utc": "2026-10-08T17:00:25.496981+00:00"
+  }
+}

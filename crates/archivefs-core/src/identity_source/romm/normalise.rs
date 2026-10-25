@@ -27,7 +27,7 @@ use serde_json::Value;
 
 use crate::identity_source::model::{
     ArtworkReference, ExternalHash, ExternalIdentityRecord, ExternalVerification, HashAlgorithm,
-    IdentityProvider, MetadataProviderId,
+    HowLongToBeatDurations, IdentityProvider, MediaReference, MetadataProviderId,
 };
 use crate::identity_source::path_map::{PathMappings, PathTranslation};
 
@@ -49,6 +49,10 @@ const METADATA_ID_FIELDS: &[(&str, &str)] = &[
 /// The most `files[]` entries one record's relationships will carry, so a
 /// pathological record cannot make the cache unbounded.
 pub const MAX_RELATED_FILES: usize = 64;
+
+/// A hundred years is comfortably above a real game-completion estimate while
+/// refusing malformed provider integers that would be meaningless in the UI.
+const MAX_HLTB_DURATION_SECONDS: u64 = 100 * 366 * 24 * 60 * 60;
 
 /// A hash RomM published that could not be used.
 ///
@@ -162,12 +166,76 @@ pub fn normalise_rom(
         .collect();
 
     // Artwork references only - never bytes, and never fetched here.
-    let artwork = string_field(value, "url_cover")
-        .or_else(|| string_field(value, "path_cover_large"))
-        .map(|reference| ArtworkReference {
-            reference,
-            small_reference: string_field(value, "path_cover_small"),
+    let mut screenshots = media_references(value, "path_screenshots", "url_screenshots");
+    let launchbox_media = launchbox_media(value);
+    if screenshots.is_empty() {
+        screenshots = launchbox_media.screenshots;
+    }
+    let manual = media_reference(value, "path_manual", "url_manual");
+    let large_reference = string_field(value, "path_cover_large");
+    let cover_reference = string_field(value, "url_cover")
+        .or_else(|| large_reference.clone())
+        .or(launchbox_media.cover);
+    let artwork =
+        (cover_reference.is_some() || !screenshots.is_empty() || manual.is_some()).then(|| {
+            ArtworkReference {
+                reference: cover_reference.unwrap_or_default(),
+                small_reference: string_field(value, "path_cover_small"),
+                large_reference,
+                screenshots: screenshots.clone(),
+                manual: manual.clone(),
+            }
         });
+
+    // Enrichment (game metadata milestone, 2026-08-22): `summary` is a flat
+    // field on the ROM object itself, but `genres`/`player_count`/
+    // `average_rating`/`first_release_date` all live inside RomM's nested
+    // `metadatum` object (`RomMetadataSchema` in RomM's own API, confirmed
+    // against a real RomM release's response shape) - never at the top
+    // level. A record with no `metadatum` at all (an older RomM instance,
+    // or a game RomM never matched to a metadata source) simply carries
+    // none of these; nothing here treats that as an error.
+    let synopsis = string_field(value, "summary");
+    let metadatum = value.get("metadatum");
+    let genres = metadatum
+        .map(|m| string_array(m, "genres"))
+        .unwrap_or_default();
+    // RomM has been observed (live, 2026-08-22, Majora's Mask on a real
+    // instance) sending the literal JSON string "null" for `player_count`
+    // rather than JSON null, on records where the value was never set - a
+    // provider-side stringification quirk, not a genuine "unknown" value
+    // spelled that way. Treated the same as absent, enrichment-side only:
+    // this does not touch how any identity field is read.
+    let players = metadatum
+        .and_then(|m| string_field(m, "player_count"))
+        .filter(|value| !value.eq_ignore_ascii_case("null"));
+    let rating = metadatum
+        .and_then(|m| m.get("average_rating"))
+        .and_then(Value::as_f64)
+        .map(|value| value.round().clamp(0.0, 100.0) as u8);
+    // `metadatum.first_release_date` is milliseconds, not seconds - confirmed
+    // 2026-08-22 against a live RomM 5.2.0 instance (Ocarina of Time reports
+    // 911606400000, which is 1998-11-21 as milliseconds; read as seconds it
+    // overflows a plausible year and was silently discarded).
+    let release_year = metadatum
+        .and_then(|m| m.get("first_release_date"))
+        .and_then(Value::as_i64)
+        .and_then(|millis| millis.checked_div(1000))
+        .and_then(unix_seconds_to_year);
+
+    // RomM's detailed ROM schema exposes its HowLongToBeat provider result at
+    // the top-level `hltb_metadata` object. Its `main_story`,
+    // `main_plus_extra`, and `completionist` values are whole seconds (the
+    // same unit RomM's own Game Details UI divides by 3600). RomM owns the
+    // provider match; EmuWiz only preserves those cached values.
+    let hltb_metadata = value.get("hltb_metadata");
+    let howlongtobeat = hltb_metadata
+        .map(|metadata| HowLongToBeatDurations {
+            main_story_seconds: hltb_duration_seconds(metadata, "main_story"),
+            main_plus_extras_seconds: hltb_duration_seconds(metadata, "main_plus_extra"),
+            completionist_seconds: hltb_duration_seconds(metadata, "completionist"),
+        })
+        .filter(HowLongToBeatDurations::has_any);
 
     // Multi-file structure, preserved rather than flattened.
     let related_files: Vec<String> = value
@@ -261,7 +329,85 @@ pub fn normalise_rom(
         verification: ExternalVerification::Unmatched,
         conflicts: Vec::new(),
         evidence,
+        synopsis,
+        genres,
+        players,
+        rating,
+        release_year,
+        howlongtobeat,
     })
+}
+
+/// Projects the already-selected LaunchBox media object that RomM includes in
+/// its ROM response.  This is deliberately a projection only: it does not
+/// query Redis, fetch bytes, or participate in identity matching.  Direct
+/// RomM screenshot/cover fields remain higher priority; LaunchBox fills only
+/// the gaps they leave behind.
+#[derive(Default)]
+struct LaunchboxMediaProjection {
+    cover: Option<String>,
+    screenshots: Vec<MediaReference>,
+}
+
+fn launchbox_media(value: &Value) -> LaunchboxMediaProjection {
+    let Some(images) = value
+        .get("launchbox_metadata")
+        .and_then(|metadata| metadata.get("images"))
+        .and_then(Value::as_array)
+    else {
+        return LaunchboxMediaProjection::default();
+    };
+
+    const MAX_SCREENSHOTS: usize = 32;
+    let mut projection = LaunchboxMediaProjection::default();
+    let mut seen = std::collections::HashSet::new();
+    for image in images {
+        let Some(file_name) = image.get("url").and_then(Value::as_str).map(str::trim) else {
+            continue;
+        };
+        if file_name.is_empty() {
+            continue;
+        }
+        let image_type = image
+            .get("type")
+            .and_then(Value::as_str)
+            .unwrap_or_default();
+        if image_type == "Box - Front" && projection.cover.is_none() {
+            projection.cover = Some(file_name.to_string());
+        }
+        if image_type.starts_with("Screenshot")
+            && projection.screenshots.len() < MAX_SCREENSHOTS
+            && seen.insert(file_name.to_string())
+        {
+            projection.screenshots.push(MediaReference {
+                hosted_reference: None,
+                public_reference: Some(file_name.to_string()),
+            });
+        }
+    }
+    projection
+}
+
+fn hltb_duration_seconds(value: &Value, field: &str) -> Option<u64> {
+    value
+        .get(field)
+        .and_then(Value::as_u64)
+        .filter(|seconds| (1..=MAX_HLTB_DURATION_SECONDS).contains(seconds))
+}
+
+/// A Unix timestamp's calendar year in UTC, bounded to a plausible release
+/// date range. `None` for a timestamp so implausible it is more likely a
+/// provider data error than a real game.
+///
+/// Reuses [`crate::database::format_unix_timestamp_utc`] (the project's one
+/// hand-rolled Unix-timestamp-to-calendar-date routine) rather than a
+/// second implementation of the same civil-calendar math.
+fn unix_seconds_to_year(seconds: i64) -> Option<u16> {
+    let formatted = crate::database::format_unix_timestamp_utc(seconds);
+    let year: i64 = formatted.get(0..4)?.parse().ok()?;
+    u16::try_from(year)
+        .ok()
+        .filter(|&year| (1950..=2100).contains(&year))
 }
 
 /// The path a RomM record describes, exactly as RomM gives it.
@@ -331,6 +477,23 @@ pub fn normalise_platform(value: &Value) -> Option<NormalisedPlatform> {
 /// A short explicit table handles the few slugs whose RomM spelling has no alias
 /// in the registry. It is deliberately tiny and each entry is a slug observed on
 /// a real instance; anything not here stays unknown rather than being guessed.
+///
+/// # Deliberately not inverted for the opposite (canonical -> slug) direction
+///
+/// The Library Views frontend-profile planner (`library_views::resolve_romm_platform_slug`)
+/// needs the *opposite* direction - given a canonical platform, which RomM slug
+/// to plan a path under - and does not derive it from this table. Several
+/// entries below are intentionally approximate, many-to-one associations for
+/// *importing* provider data (e.g. `fds` -> `NES`, because FDS games are
+/// commonly catalogued alongside NES; `pc-fx` -> `PC Engine`, a related but
+/// distinct NEC console; `xboxone` -> `Xbox`, a different console generation),
+/// which is safe for recognising an incoming slug but would be actively wrong
+/// if inverted to output a default slug for the canonical platform (`NES`'s
+/// real, correct RomM slug is `nes` - resolved through `platform_for_alias`
+/// above - never `fds`). The output-direction planner therefore only ever
+/// resolves a slug from an explicit user override or a locally cached, live
+/// instance's own reported slug, and fails closed otherwise; see that
+/// function's doc comment.
 pub fn canonical_platform_for_romm_slug(slug: &str) -> Option<&'static str> {
     if let Some(platform) = crate::platform::platform_for_alias(slug) {
         return Some(platform.id);
@@ -340,8 +503,6 @@ pub fn canonical_platform_for_romm_slug(slug: &str) -> Option<&'static str> {
     // slug, never a pattern.
     const ROMM_SLUG_ALIASES: &[(&str, &str)] = &[
         ("acpc", "Amstrad CPC"),
-        ("c-plus-4", "Commodore 64"),
-        ("c16", "Commodore 64"),
         ("cpc", "Amstrad CPC"),
         ("dc", "Dreamcast"),
         ("fds", "NES"),
@@ -435,4 +596,450 @@ fn string_array(value: &Value, field: &str) -> Vec<String> {
                 .collect()
         })
         .unwrap_or_default()
+}
+
+fn media_references(value: &Value, hosted_field: &str, public_field: &str) -> Vec<MediaReference> {
+    let hosted = string_array_or_single(value, hosted_field);
+    let public = string_array_or_single(value, public_field);
+    (0..hosted.len().max(public.len()))
+        .map(|index| MediaReference {
+            hosted_reference: hosted.get(index).cloned(),
+            public_reference: public.get(index).cloned(),
+        })
+        .collect()
+}
+
+fn media_reference(
+    value: &Value,
+    hosted_field: &str,
+    public_field: &str,
+) -> Option<MediaReference> {
+    let hosted = string_field(value, hosted_field);
+    let public = string_field(value, public_field);
+    (hosted.is_some() || public.is_some()).then_some(MediaReference {
+        hosted_reference: hosted,
+        public_reference: public,
+    })
+}
+
+fn string_array_or_single(value: &Value, field: &str) -> Vec<String> {
+    let array = string_array(value, field);
+    if !array.is_empty() {
+        array
+    } else {
+        string_field(value, field).into_iter().collect()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::identity_source::path_map::{PathMapping, PathMappings, ProviderPathKind};
+    use serde_json::json;
+    use std::path::PathBuf;
+
+    fn no_mappings() -> PathMappings {
+        PathMappings::validate(&[], &[], ProviderPathKind::ProviderRelative)
+            .expect("an empty mapping set always validates")
+    }
+
+    #[test]
+    fn a_curated_provider_alias_translates_during_import_normalisation() {
+        let mappings = PathMappings::validate(
+            &[PathMapping {
+                provider_prefix: "roms/gb".to_string(),
+                archivefs_prefix: PathBuf::from("/mnt/usbdrive/games/gb"),
+                provider_aliases: vec!["roms/gameboy".to_string()],
+            }],
+            &[],
+            ProviderPathKind::ProviderRelative,
+        )
+        .unwrap();
+        let mut report = NormalisationReport::default();
+        let record = normalise_rom(
+            &json!({
+                "id": 7,
+                "platform_slug": "gameboy",
+                "fs_path": "roms/gameboy",
+                "fs_name": "example.gb",
+                "name": "Example"
+            }),
+            "server",
+            &mappings,
+            1,
+            &mut report,
+        )
+        .expect("record normalises");
+        assert_eq!(
+            record.archivefs_path,
+            Some(PathBuf::from("/mnt/usbdrive/games/gb/example.gb"))
+        );
+    }
+
+    #[test]
+    fn an_alias_record_is_translated_during_import_normalisation() {
+        let mappings = PathMappings::validate(
+            &[PathMapping {
+                provider_prefix: "roms/gcn".to_string(),
+                archivefs_prefix: PathBuf::from("/mnt/usbdrive/games/ngc"),
+                provider_aliases: vec!["roms/ngc".to_string()],
+            }],
+            &[],
+            ProviderPathKind::ProviderRelative,
+        )
+        .unwrap();
+        let mut report = NormalisationReport::default();
+        let record = normalise_rom(
+            &json!({
+                "id": 101059,
+                "platform_slug": "ngc",
+                "full_path": "roms/ngc/example.iso",
+                "name": "Example",
+            }),
+            "server",
+            &mappings,
+            1,
+            &mut report,
+        )
+        .expect("the alias record is importable");
+
+        assert_eq!(
+            record.archivefs_path,
+            Some(PathBuf::from("/mnt/usbdrive/games/ngc/example.iso"))
+        );
+    }
+
+    #[test]
+    fn refreshing_with_a_corrected_alias_mapping_replaces_a_stale_null_translation() {
+        // The exact real-world shape the source-fingerprint bug produced: an
+        // alias-provider path (`roms/ngc/...`) normalised against a mapping
+        // set that does not yet know about the `ngc` alias comes back
+        // untranslated. `normalise_rom` takes no previous result as input -
+        // there is nothing here for a stale answer to hide in - so a second
+        // call against the *corrected* mapping must independently produce
+        // the real path, never inherit or preserve the earlier `None`.
+        let rom = json!({
+            "id": 101059,
+            "platform_slug": "ngc",
+            "full_path": "roms/ngc/example.iso",
+            "name": "Example",
+        });
+
+        let mut stale_report = NormalisationReport::default();
+        let stale_record = normalise_rom(&rom, "server", &no_mappings(), 1, &mut stale_report)
+            .expect("an unmapped alias path is still importable, just untranslated");
+        assert_eq!(
+            stale_record.archivefs_path, None,
+            "before the corrected mapping exists, the alias path has no local translation"
+        );
+
+        let corrected_mappings = PathMappings::validate(
+            &[PathMapping {
+                provider_prefix: "roms/gcn".to_string(),
+                archivefs_prefix: PathBuf::from("/mnt/usbdrive/games/ngc"),
+                provider_aliases: vec!["roms/ngc".to_string()],
+            }],
+            &[],
+            ProviderPathKind::ProviderRelative,
+        )
+        .unwrap();
+        let mut refreshed_report = NormalisationReport::default();
+        let refreshed_record = normalise_rom(
+            &rom,
+            "server",
+            &corrected_mappings,
+            1,
+            &mut refreshed_report,
+        )
+        .expect("the alias record is importable");
+        assert_eq!(
+            refreshed_record.archivefs_path,
+            Some(PathBuf::from("/mnt/usbdrive/games/ngc/example.iso")),
+            "a refreshed publication with the corrected mapping must replace the stale \
+             null translation, not preserve it"
+        );
+    }
+
+    /// A realistic ROM object, shaped exactly like a real RomM release's
+    /// `/api/roms` response (confirmed against RomM's own `RomSchema`/
+    /// `RomMetadataSchema` source, 2026-08-22): `summary` flat on the ROM
+    /// itself, everything else the enrichment milestone reads nested
+    /// inside `metadatum`, never at the top level.
+    fn rom_with_enrichment() -> serde_json::Value {
+        json!({
+            "id": 42,
+            "platform_id": 7,
+            "platform_slug": "gb",
+            "fs_name": "game.gb",
+            "name": "Example Game",
+            "path_screenshots": ["assets/screens/second.jpg", "assets/screens/first.png"],
+            "url_screenshots": ["https://public.example/second.jpg", "https://public.example/first.png"],
+            "path_manual": "assets/manuals/game.pdf",
+            "url_manual": "https://public.example/game.pdf",
+            "launchbox_metadata": {
+                "images": [
+                    {"url": "https://images.launchbox-app.com/box-front.jpg", "type": "Box - Front"},
+                    {"url": "https://images.launchbox-app.com/gameplay.png", "type": "Screenshot - Gameplay"},
+                    {"url": "https://images.launchbox-app.com/title.png", "type": "Screenshot - Game Title"},
+                    {"url": "https://images.launchbox-app.com/logo.png", "type": "Clear Logo"}
+                ],
+                "video_url": "https://www.youtube.com/watch?v=example"
+            },
+            "summary": "A short adventure across five islands.",
+            "hltb_id": 12345,
+            "hltb_metadata": {
+                "main_story": 2_700,
+                "main_plus_extra": 5_400,
+                "completionist": 7_650
+            },
+            "metadatum": {
+                "rom_id": 42,
+                "genres": ["Action", "Platformer"],
+                "franchises": [],
+                "collections": [],
+                "companies": ["Example Studio"],
+                "game_modes": [],
+                "age_ratings": [],
+                "player_count": "1-2",
+                // Milliseconds, as RomM's real metadatum actually reports it
+                // (confirmed live against a RomM 5.2.0 instance) - not seconds.
+                "first_release_date": 896_745_600_000_i64, // 1998-06-02T00:00:00Z
+                "average_rating": 87.4,
+            },
+        })
+    }
+
+    #[test]
+    fn enrichment_fields_are_read_from_the_nested_metadatum_object() {
+        let mut report = NormalisationReport::default();
+        let record = normalise_rom(
+            &rom_with_enrichment(),
+            "server",
+            &no_mappings(),
+            1,
+            &mut report,
+        )
+        .expect("a record with an id normalises");
+
+        assert_eq!(
+            record.synopsis.as_deref(),
+            Some("A short adventure across five islands.")
+        );
+        assert_eq!(record.genres, vec!["Action", "Platformer"]);
+        assert_eq!(record.players.as_deref(), Some("1-2"));
+        assert_eq!(record.rating, Some(87));
+        assert_eq!(record.release_year, Some(1998));
+        assert_eq!(
+            record
+                .howlongtobeat
+                .as_ref()
+                .map(|times| times.main_story_seconds),
+            Some(Some(2_700))
+        );
+        assert!(
+            record
+                .metadata_provider_ids
+                .iter()
+                .any(|id| { id.provider == "howlongtobeat" && id.id == "12345" })
+        );
+    }
+
+    #[test]
+    fn launchbox_media_fills_missing_cover_and_screenshots_without_overriding_identity() {
+        let mut fixture = rom_with_enrichment();
+        fixture
+            .as_object_mut()
+            .expect("fixture object")
+            .remove("path_screenshots");
+        fixture
+            .as_object_mut()
+            .expect("fixture object")
+            .remove("url_screenshots");
+        let mut report = NormalisationReport::default();
+        let record = normalise_rom(&fixture, "server", &no_mappings(), 1, &mut report)
+            .expect("a record with an id normalises");
+
+        let artwork = record.artwork.expect("LaunchBox images produce artwork");
+        assert_eq!(
+            artwork.reference,
+            "https://images.launchbox-app.com/box-front.jpg"
+        );
+        assert_eq!(artwork.screenshots.len(), 2);
+        assert!(artwork.screenshots.iter().any(|media| {
+            media.public_reference.as_deref()
+                == Some("https://images.launchbox-app.com/gameplay.png")
+        }));
+        assert!(artwork.screenshots.iter().any(|media| {
+            media.public_reference.as_deref() == Some("https://images.launchbox-app.com/title.png")
+        }));
+        assert!(!artwork.screenshots.iter().any(|media| {
+            media.public_reference.as_deref() == Some("https://images.launchbox-app.com/logo.png")
+        }));
+        assert_eq!(record.platform_candidate.as_deref(), Some("Game Boy"));
+        assert_eq!(record.provider_game_id, "42");
+    }
+
+    #[test]
+    fn hltb_durations_keep_partial_values_and_refuse_zero_malformed_or_implausible_values() {
+        let mut value = rom_with_enrichment();
+        value["hltb_metadata"] = json!({
+            "main_story": null,
+            "main_plus_extra": 0,
+            "completionist": 9_000_000,
+        });
+        let mut report = NormalisationReport::default();
+        let record = normalise_rom(&value, "server", &no_mappings(), 1, &mut report)
+            .expect("a record with an id normalises");
+        let times = record
+            .howlongtobeat
+            .expect("the valid partial value survives");
+        assert_eq!(times.main_story_seconds, None);
+        assert_eq!(times.main_plus_extras_seconds, None);
+        assert_eq!(times.completionist_seconds, Some(9_000_000));
+
+        value["hltb_metadata"]["completionist"] = json!(MAX_HLTB_DURATION_SECONDS + 1);
+        value["hltb_metadata"]["main_story"] = json!("2700");
+        let record = normalise_rom(&value, "server", &no_mappings(), 1, &mut report)
+            .expect("a record with an id normalises");
+        assert_eq!(record.howlongtobeat, None);
+    }
+
+    #[test]
+    fn romm_media_is_preserved_in_provider_order_without_fetching_it() {
+        let mut report = NormalisationReport::default();
+        let record = normalise_rom(
+            &rom_with_enrichment(),
+            "server",
+            &no_mappings(),
+            1,
+            &mut report,
+        )
+        .expect("a record with an id normalises");
+        let artwork = record.artwork.expect("media keeps the artwork envelope");
+        assert_eq!(artwork.screenshots.len(), 2);
+        assert_eq!(
+            artwork.screenshots[0].hosted_reference.as_deref(),
+            Some("assets/screens/second.jpg")
+        );
+        assert_eq!(
+            artwork.screenshots[1].hosted_reference.as_deref(),
+            Some("assets/screens/first.png")
+        );
+        assert_eq!(
+            artwork
+                .manual
+                .as_ref()
+                .and_then(|m| m.hosted_reference.as_deref()),
+            Some("assets/manuals/game.pdf")
+        );
+    }
+
+    #[test]
+    fn path_cover_large_is_normalised_separately_from_the_public_cover_reference() {
+        let value = json!({
+            "id": 7,
+            "platform_slug": "gb",
+            "url_cover": "https://images.example/cover.jpg",
+            "path_cover_large": "assets/romm/resources/large.jpg",
+            "path_cover_small": "assets/romm/resources/small.png"
+        });
+        let mut report = NormalisationReport::default();
+        let record = normalise_rom(&value, "server", &no_mappings(), 1, &mut report)
+            .expect("a record with an id normalises");
+        let artwork = record.artwork.expect("cover is present");
+        assert_eq!(artwork.reference, "https://images.example/cover.jpg");
+        assert_eq!(
+            artwork.large_reference.as_deref(),
+            Some("assets/romm/resources/large.jpg")
+        );
+        assert_eq!(
+            artwork.small_reference.as_deref(),
+            Some("assets/romm/resources/small.png")
+        );
+    }
+
+    #[test]
+    fn a_release_date_taken_from_a_real_live_romm_response_normalises_to_the_correct_year() {
+        // The exact `first_release_date` a live RomM 5.2.0 instance returned
+        // for The Legend of Zelda: Ocarina of Time (rom id 2189, 2026-08-22) -
+        // milliseconds, not seconds. Read as seconds this overflows the
+        // plausible-year range and silently disappears; this test pins the
+        // real value so that regression can't recur unnoticed.
+        let mut value = rom_with_enrichment();
+        value["metadatum"]["first_release_date"] = json!(911_606_400_000_i64);
+        let mut report = NormalisationReport::default();
+        let record = normalise_rom(&value, "server", &no_mappings(), 1, &mut report)
+            .expect("a record with an id normalises");
+        assert_eq!(record.release_year, Some(1998));
+    }
+
+    #[test]
+    fn a_rom_with_no_metadatum_at_all_normalises_with_no_enrichment() {
+        // An older RomM instance, or a game RomM never matched to a
+        // metadata source - not an error, just nothing to enrich with.
+        let mut value = rom_with_enrichment();
+        value.as_object_mut().unwrap().remove("metadatum");
+        value.as_object_mut().unwrap().remove("summary");
+        value.as_object_mut().unwrap().remove("hltb_metadata");
+
+        let mut report = NormalisationReport::default();
+        let record = normalise_rom(&value, "server", &no_mappings(), 1, &mut report)
+            .expect("a record with an id normalises");
+
+        assert_eq!(record.synopsis, None);
+        assert!(record.genres.is_empty());
+        assert_eq!(record.players, None);
+        assert_eq!(record.rating, None);
+        assert_eq!(record.release_year, None);
+        assert_eq!(record.howlongtobeat, None);
+        // Identity fields are entirely unaffected by the missing metadatum.
+        assert_eq!(record.title.as_deref(), Some("Example Game"));
+    }
+
+    #[test]
+    fn a_literal_null_string_player_count_from_a_real_live_romm_response_is_treated_as_absent() {
+        // A live RomM 5.2.0 instance returned the four-character JSON string
+        // "null" (not JSON null) for The Legend of Zelda: Majora's Mask's
+        // `player_count`, 2026-08-22 - a provider-side stringification quirk
+        // that must not surface in the UI as the literal text "null".
+        let mut value = rom_with_enrichment();
+        value["metadatum"]["player_count"] = json!("null");
+        let mut report = NormalisationReport::default();
+        let record = normalise_rom(&value, "server", &no_mappings(), 1, &mut report)
+            .expect("a record with an id normalises");
+        assert_eq!(record.players, None);
+    }
+
+    #[test]
+    fn an_out_of_range_rating_is_clamped_not_rejected() {
+        let mut value = rom_with_enrichment();
+        value["metadatum"]["average_rating"] = json!(140.0);
+        let mut report = NormalisationReport::default();
+        let record = normalise_rom(&value, "server", &no_mappings(), 1, &mut report)
+            .expect("a record with an id normalises");
+        assert_eq!(record.rating, Some(100));
+    }
+
+    #[test]
+    fn unix_seconds_to_year_rejects_implausible_timestamps() {
+        assert_eq!(unix_seconds_to_year(896_745_600), Some(1998));
+        assert_eq!(
+            unix_seconds_to_year(0),
+            Some(1970),
+            "1970 is within the plausible release range"
+        );
+        assert_eq!(
+            unix_seconds_to_year(-2_000_000_000),
+            None,
+            "a wildly negative timestamp must not panic or produce a bogus year"
+        );
+    }
+
+    #[test]
+    fn c16_and_plus_four_slugs_remain_unresolved_without_canonical_rows() {
+        assert_eq!(canonical_platform_for_romm_slug("c16"), None);
+        assert_eq!(canonical_platform_for_romm_slug("c-plus-4"), None);
+        assert_eq!(canonical_platform_for_romm_slug("commodore-16"), None);
+        assert_eq!(canonical_platform_for_romm_slug("plus-4"), None);
+    }
 }

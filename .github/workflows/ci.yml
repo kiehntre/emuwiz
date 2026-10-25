@@ -2,8 +2,14 @@ name: CI
 
 on:
   push:
+    branches:
+      - main
   pull_request:
   workflow_dispatch:
+
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 permissions:
   contents: read
@@ -12,19 +18,192 @@ env:
   CARGO_TERM_COLOR: always
 
 jobs:
-  fmt:
-    name: Formatting
+  classify:
+    name: Classify change risk
     runs-on: ubuntu-latest
+    outputs:
+      tier: ${{ steps.classify.outputs.tier }}
+      shards: ${{ steps.classify.outputs.shards }}
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          fetch-depth: 0
+      - id: classify
+        name: Select fast or full validation
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+          BASE_SHA: ${{ github.event.pull_request.base.sha }}
+          HEAD_SHA: ${{ github.sha }}
+        run: |
+          if [[ "$EVENT_NAME" != pull_request ]]; then
+            tier=full
+          else
+            mapfile -d '' changed < <(git diff --name-only -z "$BASE_SHA...$HEAD_SHA")
+            if ((${#changed[@]} == 0)); then
+              tier=full
+            else
+              tier=$(scripts/classify-ci-changes.sh "${changed[@]}")
+            fi
+          fi
+          shards=$(python3 -I scripts/ci_test_shards.py shards "$tier")
+          echo "tier=$tier" >> "$GITHUB_OUTPUT"
+          echo "shards=$shards" >> "$GITHUB_OUTPUT"
+          echo "Selected CI tier: $tier, test shards: $shards"
+
+  repository-guardrails:
+    name: Repository guardrails
+    runs-on: ubuntu-latest
+    if: github.event_name == 'pull_request'
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          fetch-depth: 0
+      - name: Validate guard scripts
+        run: |
+          bash -n scripts/check-main-rs-boundary.sh
+          bash -n scripts/check-working-tree-scope.sh
+          bash -n scripts/task-preflight.sh
+          bash -n scripts/task-postcheck.sh
+      - name: Check main.rs boundary against PR base
+        run: scripts/check-main-rs-boundary.sh --base "${{ github.event.pull_request.base.sha }}"
+
+  # The core and full tiers run their one `cargo test` command in parallel
+  # shards defined by scripts/ci_test_shards.py: each shard runs its own libtest
+  # name filters and --skips every earlier shard's, the last skips them all, so
+  # every test (unit, integration and doc) runs in exactly one shard. Every shard
+  # keeps the tier's package selection and therefore its unified feature set.
+  # test-shard-coverage proves the partition from each shard's real --list.
+  validation:
+    name: Formatting and relevant tests (${{ matrix.shard }})
+    runs-on: ubuntu-latest
+    needs: [classify]
+    strategy:
+      fail-fast: false
+      matrix:
+        shard: ${{ fromJSON(needs.classify.outputs.shards) }}
+    steps:
+      - uses: actions/checkout@v5
+      - name: Install tools for real patch and optical-conversion tests
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends xdelta3 mame-tools
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: "1.97.1"
+          components: rustfmt
+      - uses: Swatinem/rust-cache@v2
+        with:
+          cache-on-failure: true
+      - name: Verify Xdelta3 is available
+        run: |
+          test -x /usr/bin/xdelta3
+          command -v xdelta3
+          xdelta3 -V
+      - name: Verify CHDman is available
+        run: |
+          test -x /usr/bin/chdman
+          # CHDman returns 1 after printing help; still reject execution failures.
+          chdman_help=$(/usr/bin/chdman help 2>&1) || test "$?" -eq 1
+          printf '%s\n' "$chdman_help"
+          grep -Fq 'MAME Compressed Hunks of Data' <<< "$chdman_help"
+      - id: fmt
+        name: Check Rust formatting
+        continue-on-error: true
+        run: cargo fmt --all --check
+      # The R2 eligibility contract is unchanged; the independent gate below
+      # still proves both refusal and success on every event. Every tier gets
+      # the disposable ext4: ubuntu-26.04 runners have a tmpfs /tmp, where the
+      # ZIP Converter's ext4-only publication (correctly) refuses to apply, so
+      # gui/core-tier PRs failed tests that pass on the full tier.
+      - name: Create qualified disposable ext4 for the selected tests
+        run: |
+          # Under /tmp and short: some tests require a host-/tmp path and build
+          # Unix-socket paths that must stay under SUN_LEN.
+          img="$RUNNER_TEMP/r2-ext4.img"
+          mnt=/tmp/r2e
+          truncate -s 4G "$img"
+          mkfs.ext4 -q -b 4096 -F "$img"
+          sudo mkdir -p "$mnt"
+          sudo mount -o loop "$img" "$mnt"
+          sudo chown "$(id -u):$(id -g)" "$mnt"
+          findmnt -no FSTYPE "$mnt" | grep -qx ext4
+          echo "TMPDIR=$mnt" >> "$GITHUB_ENV"
+          echo "EMUWIZ_R2_REQUIRE_QUALIFIED=1" >> "$GITHUB_ENV"
+      - id: enumerate
+        name: Build and enumerate this shard's tests
+        env:
+          CI_TIER: ${{ needs.classify.outputs.tier }}
+          SHARD: ${{ matrix.shard }}
+        run: |
+          source scripts/ci-test-shard-args.sh
+          lists="$RUNNER_TEMP/test-shard-lists"
+          mkdir -p "$lists"
+          cargo test "${packages[@]}" --no-run
+          cargo test "${packages[@]}" --no-fail-fast -- --list > "$lists/$SHARD.all" 2>&1
+          cargo test "${packages[@]}" --no-fail-fast -- --list "${selection[@]}" > "$lists/$SHARD.selected" 2>&1
+          printf '%s: %s of %s listed entries\n' "$SHARD" \
+            "$(grep -cE ': (test|bench)$' "$lists/$SHARD.selected")" "$(grep -cE ': (test|bench)$' "$lists/$SHARD.all")"
+      - name: Upload this shard's test enumeration
+        uses: actions/upload-artifact@v4
+        with:
+          name: test-shard-list-${{ matrix.shard }}
+          path: ${{ runner.temp }}/test-shard-lists/
+          if-no-files-found: error
+          retention-days: 3
+      - name: Run tests selected for the change
+        env:
+          CI_TIER: ${{ needs.classify.outputs.tier }}
+          SHARD: ${{ matrix.shard }}
+        run: |
+          # Same arguments as the enumerated run: derived again from the same script.
+          source scripts/ci-test-shard-args.sh
+          cargo test "${packages[@]}" --no-fail-fast -- "${selection[@]}"
+          if [[ "$CI_TIER" == core && "$SHARD" == rest ]]; then
+            cargo check -p archivefs-cli -p archivefs-gui --locked
+          fi
+      - name: Report and enforce formatting outcome
+        if: always()
+        env:
+          FMT_OUTCOME: ${{ steps.fmt.outcome }}
+        run: |
+          {
+            echo '### Formatting'
+            echo "- Formatting: $FMT_OUTCOME"
+          } >> "$GITHUB_STEP_SUMMARY"
+          [[ "$FMT_OUTCOME" != failure ]] || exit 1
+
+  # Fails unless the shards' own enumerations show every test in exactly one
+  # shard. A shard that failed before enumerating leaves its list missing, which
+  # fails this job too; test failures still fail their own shard.
+  test-shard-coverage:
+    name: Test shard coverage
+    runs-on: ubuntu-latest
+    needs: [classify, validation]
+    if: ${{ !cancelled() && needs.classify.result == 'success' }}
     steps:
       - uses: actions/checkout@v5
       - uses: dtolnay/rust-toolchain@master
         with:
           toolchain: "1.97.1"
-          components: rustfmt
-      - run: cargo fmt --all --check
+      - name: Test shard partitioning against a real libtest binary
+        run: python3 -B scripts/test_ci_test_shards.py
+      - uses: actions/download-artifact@v5
+        with:
+          pattern: test-shard-list-*
+          merge-multiple: true
+          path: ${{ runner.temp }}/test-shard-lists
+      - name: Every test runs in exactly one shard
+        env:
+          SHARDS: ${{ needs.classify.outputs.shards }}
+        run: |
+          printf '%s\n' "$SHARDS" > "$RUNNER_TEMP/test-shard-lists/shards.json"
+          python3 -I scripts/ci_test_shards.py check "$RUNNER_TEMP/test-shard-lists"
 
+  # Runs on every PR (fast and full tier), on main and on manual runs, so a new
+  # warning fails the PR that introduces it instead of surfacing after merge.
+  # Deliberately not gated on the change-risk tier.
   clippy:
-    name: Clippy
+    name: Clippy warning ratchet
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v5
@@ -34,11 +213,17 @@ jobs:
           components: clippy
       - uses: Swatinem/rust-cache@v2
         with:
-          cache-on-failure: false
-      - run: cargo clippy --workspace --all-targets -- -D warnings
+          cache-on-failure: true
+      # A separate job: it reports against its own baseline and cannot
+      # suppress workspace or release validation.
+      - name: Test ratchet and workflow conditions
+        run: python3 -B scripts/test_clippy_ratchet.py
+      - run: scripts/clippy-ratchet.sh
 
-  test:
-    name: Workspace tests
+  # Independent of the workspace suite so unrelated failures there cannot stop
+  # the R2 filesystem-gate proofs from running. The gate itself is not relaxed.
+  r2-filesystem-gate:
+    name: R2 filesystem gate
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v5
@@ -47,12 +232,40 @@ jobs:
           toolchain: "1.97.1"
       - uses: Swatinem/rust-cache@v2
         with:
-          cache-on-failure: false
-      - run: cargo test --workspace
+          cache-on-failure: true
+      - name: Unsupported filesystem (tmpfs) must be refused
+        env:
+          TMPDIR: /dev/shm
+          EMUWIZ_R2_REQUIRE_REFUSAL: "1"
+        run: cargo test -p archivefs-cli --test r2_blue
+      - name: Qualified loop ext4 must succeed
+        run: |
+          img="$RUNNER_TEMP/r2-ext4.img"
+          mnt="$RUNNER_TEMP/r2-ext4"
+          truncate -s 1G "$img"
+          mkfs.ext4 -q -b 4096 -F "$img"
+          mkdir "$mnt"
+          sudo mount -o loop "$img" "$mnt"
+          sudo chown "$(id -u):$(id -g)" "$mnt"
+          findmnt -no FSTYPE "$mnt" | grep -qx ext4
+          TMPDIR="$mnt" EMUWIZ_R2_REQUIRE_QUALIFIED=1 \
+            cargo test -p archivefs-cli --test r2_blue
 
-  release-build:
-    name: Locked release build
-    runs-on: ubuntu-latest
+  # The DOSBox sandbox tests skip (and pass) where bubblewrap or DOSBox is missing.
+  # Here both are installed, Ubuntu's AppArmor user-namespace restriction stays
+  # on (bwrap is allowed by Ubuntu's own bwrap-userns-restrict profile, whose
+  # children run without capabilities), and EMUWIZ_REQUIRE_SANDBOX=1 turns any unusable
+  # sandbox into a failure; a SKIPPED line from any test fails the job as well,
+  # so a skipped enforcement test can never count as a security pass.
+  dosbox-sandbox-enforcement:
+    name: DOSBox sandbox enforcement (${{ matrix.os }})
+    strategy:
+      fail-fast: false
+      matrix:
+        # 24.04 restricts user namespaces with no bwrap profile enabled (a real
+        # stock denial); ubuntu-latest (26.04 at the time of writing) lets bwrap through.
+        os: [ubuntu-24.04, ubuntu-latest]
+    runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v5
       - uses: dtolnay/rust-toolchain@master
@@ -60,9 +273,101 @@ jobs:
           toolchain: "1.97.1"
       - uses: Swatinem/rust-cache@v2
         with:
-          cache-on-failure: false
-      - run: cargo build --workspace --release --locked
-      - run: scripts/check-version-consistency.sh --binary-dir target/release
+          cache-on-failure: true
+      - name: Install bubblewrap, DOSBox, Xvfb and Ubuntu's extra AppArmor profiles
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends bubblewrap dosbox xvfb xauth apparmor-utils apparmor-profiles
+          test -x /usr/bin/bwrap
+          test -x /usr/bin/dosbox
+      - name: Record this runner's AppArmor behaviour
+        run: |
+          echo "restrict_unprivileged_userns=$(cat /proc/sys/kernel/apparmor_restrict_unprivileged_userns)"
+          echo "apparmor enabled=$(cat /sys/module/apparmor/parameters/enabled)"
+          sudo aa-status | grep -E 'profiles are (loaded|in enforce)|unprivileged_userns|bwrap' || true
+          . /etc/os-release && echo "os=$VERSION_ID"
+          ls -la /usr/bin/true /usr/bin/env
+          ls /etc/apparmor.d | grep -i bwrap || echo "no bwrap profile in /etc/apparmor.d"
+          if bwrap --ro-bind / / --unshare-all true; then
+            echo "this runner's stock AppArmor lets bwrap through"
+          else
+            echo "this runner's stock AppArmor denies bwrap"
+          fi
+      - name: Where stock AppArmor denies bwrap, EmuWiz fails closed (real stock denial)
+        env:
+          EMUWIZ_EXPECT_SANDBOX_DENIED: "1"
+        run: |
+          set -o pipefail
+          if bwrap --ro-bind / / --unshare-all true; then
+            echo "::notice::stock AppArmor lets bwrap through here; the aa-exec denial below still runs"
+            exit 0
+          fi
+          cargo test -p archivefs-core --lib \
+            launch::dosbox_sandbox::tests::stock_apparmor_denial_fails_closed_with_the_hint \
+            -- --exact --nocapture 2>&1 | tee "$RUNNER_TEMP/stock-denial.log"
+          grep -q 'test result: ok. 1 passed' "$RUNNER_TEMP/stock-denial.log"
+      - name: Under an AppArmor denial (unprivileged_userns) EmuWiz fails closed
+        # The restriction stays on for the whole job. aa-exec places the test in
+        # unprivileged_userns, so bwrap is denied by AppArmor. bwrap fails earlier
+        # here than on a stock machine; this proves fail-closed, not stock fidelity.
+        env:
+          EMUWIZ_EXPECT_SANDBOX_DENIED: "1"
+        run: |
+          set -o pipefail
+          test "$(cat /proc/sys/kernel/apparmor_restrict_unprivileged_userns)" = 1
+          sudo aa-status | grep -qx '   unprivileged_userns'
+          if aa-exec -p unprivileged_userns -- bwrap --ro-bind / / --unshare-all true; then
+            echo "::error::bwrap was not denied under unprivileged_userns; the denial path is untested"
+            exit 1
+          fi
+          cargo test -p archivefs-core --lib --no-run
+          aa-exec -p unprivileged_userns -- cargo test --offline -p archivefs-core --lib \
+            launch::dosbox_sandbox::tests::stock_apparmor_denial_fails_closed_with_the_hint \
+            -- --exact --nocapture 2>&1 | tee "$RUNNER_TEMP/denial.log"
+          grep -q 'test result: ok. 1 passed' "$RUNNER_TEMP/denial.log"
+      - name: Sandbox tests with this runner's stock AppArmor, where it allows bwrap
+        # Same zero-skip rules as the mandatory run below.
+        env:
+          EMUWIZ_REQUIRE_SANDBOX: "1"
+        run: |
+          set -o pipefail
+          if ! bwrap --ro-bind / / --unshare-all true; then
+            echo "::notice::stock AppArmor denies plain bwrap here; only the profile run below applies"
+            exit 0
+          fi
+          log="$RUNNER_TEMP/dosbox-sandbox-unconfined.log"
+          xvfb-run -a cargo test -p archivefs-core --lib launch::dosbox_ \
+            -- --nocapture --test-threads=1 2>&1 | tee "$log"
+          if grep -n 'SKIPPED' "$log"; then
+            echo "::error::a DOSBox sandbox enforcement test was skipped"
+            exit 1
+          fi
+          grep -Eq 'test result: ok\. [1-9][0-9]* passed' "$log"
+      - name: Enable Ubuntu's bwrap-userns-restrict profile (restriction stays on)
+        run: |
+          if [ ! -e /etc/apparmor.d/bwrap-userns-restrict ]; then
+            sudo install -m 0644 /usr/share/apparmor/extra-profiles/bwrap-userns-restrict /etc/apparmor.d/
+          else
+            echo "the distribution already installs bwrap-userns-restrict"
+          fi
+          sudo apparmor_parser -r /etc/apparmor.d/bwrap-userns-restrict
+          test "$(cat /proc/sys/kernel/apparmor_restrict_unprivileged_userns)" = 1
+          label=$(bwrap --ro-bind / / --proc /proc --unshare-all cat /proc/self/attr/current)
+          echo "inside bwrap: $label"
+          case "$label" in 'bwrap//&unpriv_bwrap'*) ;; *) echo "::error::bwrap's children are not confined by unpriv_bwrap"; exit 1 ;; esac
+      - name: Sandbox and execution tests must run, not skip
+        env:
+          EMUWIZ_REQUIRE_SANDBOX: "1"
+        run: |
+          set -o pipefail
+          log="$RUNNER_TEMP/dosbox-sandbox.log"
+          xvfb-run -a cargo test -p archivefs-core --lib launch::dosbox_ \
+            -- --nocapture --test-threads=1 2>&1 | tee "$log"
+          if grep -n 'SKIPPED' "$log"; then
+            echo "::error::a DOSBox sandbox enforcement test was skipped"
+            exit 1
+          fi
+          grep -Eq 'test result: ok\. [1-9][0-9]* passed' "$log"
 
   security:
     name: Dependency and secret audit
@@ -74,17 +379,27 @@ jobs:
           toolchain: "1.97.1"
       - uses: Swatinem/rust-cache@v2
         with:
-          cache-on-failure: false
+          cache-on-failure: true
+      - name: Test credential-URL classification
+        run: bash scripts/test-security-scan.sh
       - name: Scan tracked files for credential-shaped secrets
         run: scripts/security-scan.sh
       - name: Install cargo-audit
         run: cargo install cargo-audit --locked
       - name: Audit resolved dependencies
         run: cargo audit
+      # Dependency bumps can orphan pinned licence supplements and reviews;
+      # the real-inventory tests catch that on the PR, not at release.
+      - name: Test SBOM licence inventory
+        run: |
+          cargo fetch --locked
+          python3 -B scripts/release/test_generate_sbom.py
 
   install-script-tests:
     name: Installer script tests
     runs-on: ubuntu-latest
+    needs: [classify]
+    if: needs.classify.outputs.tier == 'full' || github.event_name != 'pull_request'
     steps:
       - uses: actions/checkout@v5
       # desktop-file-validate (from desktop-file-utils) is exercised by
@@ -93,12 +408,21 @@ jobs:
       # never actually checked in CI.
       - name: Install desktop-file-utils
         run: sudo apt-get update && sudo apt-get install -y desktop-file-utils
+      - run: bash tests/test_install_environment_isolation.sh
+      - run: bash scripts/test-check-version-consistency.sh
       - run: bash tests/test_install.sh
+      - run: python3 tests/test_installer_asset_races.py
+      - run: python3 tests/test_installer_upgrade_preservation.py
 
   release-artifact:
     name: Create canonical artifact
     runs-on: ubuntu-latest
-    needs: [fmt, clippy, test, release-build, security]
+    # Keep release qualification observable even when a workspace test fails;
+    # the failed validation job still fails CI and blocks merging normally.
+    # Installer tests run in parallel rather than first: they share no output
+    # with this job, and a failure there still fails CI.
+    needs: [classify, security]
+    if: needs.classify.outputs.tier == 'full' || github.event_name != 'pull_request'
     steps:
       - uses: actions/checkout@v5
       - uses: dtolnay/rust-toolchain@master
@@ -106,7 +430,7 @@ jobs:
           toolchain: "1.97.1"
       - uses: Swatinem/rust-cache@v2
         with:
-          cache-on-failure: false
+          cache-on-failure: true
       # See the comment on the install-script-tests job: without this,
       # build-release.sh's and verify-release-artifact.sh's
       # desktop-file-validate checks silently no-op in CI.
@@ -115,27 +439,28 @@ jobs:
       - name: Build and internally verify artifact
         run: scripts/build-release.sh --output-dir "$RUNNER_TEMP/release"
       - name: Reject representative malformed artifacts
-        run: scripts/test-release-artifact-verifier.sh "$RUNNER_TEMP/release/"*.tar.gz
+        run: scripts/test-release-artifact-verifier.sh "$RUNNER_TEMP/release/"*.tar.xz
       - name: Check artifact and binary versions
         run: |
           scripts/check-version-consistency.sh \
             --binary-dir target/release \
-            --artifact "$RUNNER_TEMP/release/"*.tar.gz \
-            --checksum "$RUNNER_TEMP/release/"*.tar.gz.sha256
+            --artifact "$RUNNER_TEMP/release/"*.tar.xz \
+            --checksum "$RUNNER_TEMP/release/"*.tar.xz.sha256
       - name: Upload untrusted CI artifact for verification
         uses: actions/upload-artifact@v4
         with:
           name: archivefs-release-candidate
           path: |
-            ${{ runner.temp }}/release/*.tar.gz
-            ${{ runner.temp }}/release/*.tar.gz.sha256
+            ${{ runner.temp }}/release/*.tar.xz
+            ${{ runner.temp }}/release/*.tar.xz.sha256
           if-no-files-found: error
           retention-days: 14
 
   verify-artifact:
     name: Verify downloaded artifact
     runs-on: ubuntu-latest
-    needs: release-artifact
+    needs: [classify, release-artifact]
+    if: needs.classify.outputs.tier == 'full' || github.event_name != 'pull_request'
     steps:
       - uses: actions/checkout@v5
       - uses: dtolnay/rust-toolchain@master
@@ -147,16 +472,57 @@ jobs:
           path: ${{ runner.temp }}/download
       - name: Install desktop-file-utils
         run: sudo apt-get update && sudo apt-get install -y desktop-file-utils
-      - run: scripts/verify-release-artifact.sh "$RUNNER_TEMP/download/"*.tar.gz
+      - run: scripts/verify-release-artifact.sh "$RUNNER_TEMP/download/"*.tar.xz
 
-  reproducibility:
-    name: Reproducibility
+  # The two clean builds run on separate runners, each with the same isolation
+  # as before (disposable shared clone, own target, TMPDIR and output root, no
+  # compiler wrapper, no incremental, no rust-cache); the comparison is the
+  # unchanged byte-for-byte --archives check of both downloaded outputs.
+  reproducibility-build:
+    name: Reproducibility build ${{ matrix.run }}
     runs-on: ubuntu-latest
-    needs: [fmt, clippy, test, release-build, security]
+    needs: [classify, security]
+    if: needs.classify.outputs.tier == 'full' || github.event_name != 'pull_request'
+    strategy:
+      fail-fast: false
+      matrix:
+        run: [1, 2]
     steps:
       - uses: actions/checkout@v5
       - uses: dtolnay/rust-toolchain@master
         with:
           toolchain: "1.97.1"
-      - name: Build twice in independent clean directories
-        run: scripts/compare-release-builds.sh --output-dir "$RUNNER_TEMP/reproducibility"
+      - name: Build once in an independent clean directory
+        run: scripts/compare-release-builds.sh --run ${{ matrix.run }} --output-dir "$RUNNER_TEMP/reproducibility"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: reproducibility-run${{ matrix.run }}
+          path: |
+            ${{ runner.temp }}/reproducibility/run${{ matrix.run }}/*.tar.xz
+            ${{ runner.temp }}/reproducibility/run${{ matrix.run }}/*.tar.xz.sha256
+          if-no-files-found: error
+          retention-days: 3
+
+  reproducibility:
+    name: Reproducibility
+    runs-on: ubuntu-latest
+    needs: [classify, reproducibility-build]
+    if: needs.classify.outputs.tier == 'full' || github.event_name != 'pull_request'
+    steps:
+      - uses: actions/checkout@v5
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: "1.97.1"
+      - name: Test reproducibility orchestration and archive diagnostics
+        run: python3 -B scripts/release/test_release_reproducibility.py
+      - uses: actions/download-artifact@v5
+        with:
+          pattern: reproducibility-run*
+          path: ${{ runner.temp }}/reproducibility
+      - name: Compare both independent builds byte for byte
+        run: |
+          shopt -s nullglob
+          first=("$RUNNER_TEMP"/reproducibility/reproducibility-run1/*.tar.xz)
+          second=("$RUNNER_TEMP"/reproducibility/reproducibility-run2/*.tar.xz)
+          ((${#first[@]} == 1 && ${#second[@]} == 1)) || { echo "expected one archive per build" >&2; exit 1; }
+          scripts/compare-release-builds.sh --archives "${first[0]}" "${second[0]}"

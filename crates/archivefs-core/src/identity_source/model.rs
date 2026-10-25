@@ -22,18 +22,24 @@ use serde::{Deserialize, Serialize};
 #[serde(rename_all = "snake_case")]
 pub enum IdentityProvider {
     Romm,
+    Mame,
+    ScummVm,
 }
 
 impl IdentityProvider {
     pub fn label(self) -> &'static str {
         match self {
             Self::Romm => "RomM",
+            Self::Mame => "MAME",
+            Self::ScummVm => "ScummVM",
         }
     }
 
     pub fn slug(self) -> &'static str {
         match self {
             Self::Romm => "romm",
+            Self::Mame => "mame",
+            Self::ScummVm => "scummvm",
         }
     }
 }
@@ -106,6 +112,30 @@ pub struct MetadataProviderId {
     pub id: String,
 }
 
+/// Optional completion-time estimates that RomM retained from its
+/// HowLongToBeat provider.
+///
+/// Values are whole seconds. They are display-only provenance from RomM: they
+/// are never used to identify a game, rank a match, or cause EmuWiz to contact
+/// HowLongToBeat.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct HowLongToBeatDurations {
+    /// The main-story estimate in seconds.
+    pub main_story_seconds: Option<u64>,
+    /// The main-story-plus-extras estimate in seconds.
+    pub main_plus_extras_seconds: Option<u64>,
+    /// The completionist estimate in seconds.
+    pub completionist_seconds: Option<u64>,
+}
+
+impl HowLongToBeatDurations {
+    pub fn has_any(&self) -> bool {
+        self.main_story_seconds.is_some()
+            || self.main_plus_extras_seconds.is_some()
+            || self.completionist_seconds.is_some()
+    }
+}
+
 /// A reference to artwork the external source owns.
 ///
 /// A reference, never the bytes: the source remains the owner of full-size
@@ -117,6 +147,25 @@ pub struct ArtworkReference {
     pub reference: String,
     /// The smaller of the provider's variants, when it publishes more than one.
     pub small_reference: Option<String>,
+    /// RomM's larger hosted cover variant, when published.
+    #[serde(default)]
+    pub large_reference: Option<String>,
+    /// RomM-hosted screenshot references, kept in provider order.
+    #[serde(default)]
+    pub screenshots: Vec<MediaReference>,
+    /// The manual reference published by RomM, if any.
+    #[serde(default)]
+    pub manual: Option<MediaReference>,
+}
+
+/// A non-cover media reference published by RomM.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct MediaReference {
+    /// A provider-hosted path. This is the only reference eligible for EmuWiz's
+    /// approved RomM-origin fetch policy.
+    pub hosted_reference: Option<String>,
+    /// A public/provider-derived reference retained as provenance only.
+    pub public_reference: Option<String>,
 }
 
 /// How well an external record agrees with what EmuWiz can see locally.
@@ -304,6 +353,31 @@ pub struct ExternalIdentityRecord {
     pub conflicts: Vec<IdentityConflict>,
     /// The observed facts behind the verification level.
     pub evidence: Vec<String>,
+    /// Enrichment-only fields (game metadata milestone, 2026-08-22): display
+    /// information the provider publishes alongside identity, never
+    /// consulted for matching/verification and never promoted to identity
+    /// evidence. `#[serde(default)]` so a cache file written before this
+    /// field existed still deserialises - an older cached record simply has
+    /// none of these, exactly like a record from a provider that never
+    /// published them.
+    #[serde(default)]
+    pub synopsis: Option<String>,
+    #[serde(default)]
+    pub genres: Vec<String>,
+    /// A free-form player-count description as the provider published it
+    /// (e.g. "1-2"), not a parsed range.
+    #[serde(default)]
+    pub players: Option<String>,
+    /// A community/critic rating, 0-100. Display-only. `Option<u8>` rather
+    /// than a float so this type can keep deriving `Eq`/`Hash`.
+    #[serde(default)]
+    pub rating: Option<u8>,
+    #[serde(default)]
+    pub release_year: Option<u16>,
+    /// Completion-time metadata RomM retained from its HowLongToBeat provider.
+    /// Optional/defaulted so pre-existing identity-cache JSON remains readable.
+    #[serde(default)]
+    pub howlongtobeat: Option<HowLongToBeatDurations>,
 }
 
 impl ExternalIdentityRecord {
@@ -319,6 +393,27 @@ impl ExternalIdentityRecord {
 
     pub fn has_conflicts(&self) -> bool {
         !self.conflicts.is_empty()
+    }
+
+    /// Whether the provider published any display-only enrichment for this
+    /// record (synopsis, genre, players, rating, or release year).
+    ///
+    /// The single source of truth for "does this record have game
+    /// information" - used both to decide what a bulk metadata update
+    /// counts as found, and by [`crate::identity_source::romm::enrichment`]
+    /// to decide whether to claim a source for a single-game lookup. Reads
+    /// only the enrichment fields, never identity fields, matching the rule
+    /// that enrichment presence or absence never reflects on identity.
+    pub fn has_game_information(&self) -> bool {
+        self.synopsis.is_some()
+            || !self.genres.is_empty()
+            || self.players.is_some()
+            || self.rating.is_some()
+            || self.release_year.is_some()
+            || self
+                .howlongtobeat
+                .as_ref()
+                .is_some_and(HowLongToBeatDurations::has_any)
     }
 
     /// A one-line summary for a list view.
@@ -347,7 +442,24 @@ pub struct IdentityImportCounts {
     pub unmatched: usize,
     pub with_hashes: usize,
     pub with_artwork: usize,
+    /// Records whose [`ArtworkReference::reference`] (the cover) is
+    /// non-empty - independent of `with_screenshot` below. A record with
+    /// screenshots but no cover reference counts here as 0, not 1: cover and
+    /// screenshot presence are never conflated with each other or with
+    /// `with_artwork` (which only says *some* artwork reference exists).
+    pub with_cover: usize,
+    /// Records with at least one screenshot reference - a game with five
+    /// screenshots still counts once here, matching "coverage is per game,
+    /// not per file."
+    pub with_screenshot: usize,
     pub multi_file: usize,
+    /// Records carrying at least one enrichment field (synopsis, genre,
+    /// players, rating, or release year) - see
+    /// [`ExternalIdentityRecord::has_game_information`]. Never affects, and
+    /// is never affected by, `confirmed`/`strong`/.../`unmatched` above:
+    /// those describe preservation-identity confidence, this describes an
+    /// unrelated, purely cosmetic property.
+    pub with_game_information: usize,
 }
 
 impl IdentityImportCounts {
@@ -368,11 +480,20 @@ impl IdentityImportCounts {
             if !record.hashes.is_empty() {
                 counts.with_hashes += 1;
             }
-            if record.artwork.is_some() {
+            if let Some(artwork) = &record.artwork {
                 counts.with_artwork += 1;
+                if !artwork.reference.is_empty() {
+                    counts.with_cover += 1;
+                }
+                if !artwork.screenshots.is_empty() {
+                    counts.with_screenshot += 1;
+                }
             }
             if !record.related_files.is_empty() {
                 counts.multi_file += 1;
+            }
+            if record.has_game_information() {
+                counts.with_game_information += 1;
             }
         }
         counts
@@ -381,5 +502,80 @@ impl IdentityImportCounts {
     /// Records that are usable as identity.
     pub fn usable(&self) -> usize {
         self.confirmed + self.strong + self.probable
+    }
+
+    /// One [`IdentityImportCounts`] per [`ExternalIdentityRecord::platform_candidate`],
+    /// computed in the same single pass as [`Self::of`] (grouped first, then
+    /// each group counted) - never a second scan or per-platform query.
+    /// Records with no resolved platform candidate are grouped together
+    /// under `None` so they are still accounted for, never silently
+    /// dropped from the total.
+    pub fn grouped_by_platform(
+        records: &[ExternalIdentityRecord],
+    ) -> std::collections::BTreeMap<Option<String>, Self> {
+        let mut by_platform: std::collections::BTreeMap<
+            Option<String>,
+            Vec<&ExternalIdentityRecord>,
+        > = std::collections::BTreeMap::new();
+        for record in records {
+            by_platform
+                .entry(record.platform_candidate.clone())
+                .or_default()
+                .push(record);
+        }
+        by_platform
+            .into_iter()
+            .map(|(platform, group)| {
+                let owned: Vec<ExternalIdentityRecord> = group.into_iter().cloned().collect();
+                (platform, Self::of(&owned))
+            })
+            .collect()
+    }
+}
+
+/// A per-game media-completeness projection, derived from
+/// [`IdentityImportCounts`] - never a second scan, never a second source of
+/// truth. See `docs/research/LIBRARY_MEDIA_COVERAGE_V1.md` for the full
+/// design and exactly which media types are authoritatively countable today.
+///
+/// Coverage is per logical record (one imported title), matching
+/// [`IdentityImportCounts::with_cover`]/[`IdentityImportCounts::with_screenshot`]'s
+/// own per-record counting - five screenshots on one game still count that
+/// game once.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct MediaCoverage {
+    pub total_games: usize,
+    pub covers_available: usize,
+    pub screenshots_available: usize,
+    /// `None` means video presence is not tracked by any currently
+    /// integrated provider - this is never fabricated as `Some(0)`. See the
+    /// module doc / design note for why: no current identity source
+    /// publishes a video reference at all.
+    pub videos_available: Option<usize>,
+}
+
+impl MediaCoverage {
+    pub fn from_counts(counts: &IdentityImportCounts) -> Self {
+        Self {
+            total_games: counts.total,
+            covers_available: counts.with_cover,
+            screenshots_available: counts.with_screenshot,
+            videos_available: None,
+        }
+    }
+
+    pub fn covers_missing(&self) -> usize {
+        self.total_games.saturating_sub(self.covers_available)
+    }
+
+    pub fn screenshots_missing(&self) -> usize {
+        self.total_games.saturating_sub(self.screenshots_available)
+    }
+
+    /// `None` when video coverage itself is not indexed - never a claim
+    /// that every game is missing video.
+    pub fn videos_missing(&self) -> Option<usize> {
+        self.videos_available
+            .map(|available| self.total_games.saturating_sub(available))
     }
 }

@@ -1,5 +1,13 @@
 # GUI ↔ Backend Capability Matrix
 
+> **Historical / superseded snapshot**
+>
+> This matrix records an earlier GUI integration state based on campaign base
+> commit `fd0b4b143d64d9f8d681054eb60e8b4b8a41edd6`. Its “not integrated”,
+> “partial”, and “missing” entries must not be read as current product gaps.
+> For current behavior, see the [README](../README.md), [adapter support
+> matrix](ADAPTER_SUPPORT_MATRIX.md), and [launch support](LAUNCH_SUPPORT.md).
+
 Maps each design-reference screen (`design-reference/EmuWiz design stage
 one.zip` — screens confirmed present by text search: Mount, Selected,
 Active Mounts, Library, Sources, Doctor, History & Logs, Settings, About) to

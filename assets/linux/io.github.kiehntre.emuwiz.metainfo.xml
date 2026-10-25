@@ -1,0 +1,41 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!-- Copyright 2026 David Armstrong -->
+<component type="desktop-application">
+  <id>io.github.kiehntre.emuwiz</id>
+  <name>EmuWiz</name>
+  <summary>Verify, organise, and play a retro-game library</summary>
+  <metadata_license>MIT</metadata_license>
+  <project_license>MIT</project_license>
+  <developer id="io.github.kiehntre">
+    <name>David Armstrong</name>
+  </developer>
+  <url type="homepage">https://github.com/kiehntre/emuwiz</url>
+  <url type="bugtracker">https://github.com/kiehntre/emuwiz/issues</url>
+  <description>
+    <p>
+      EmuWiz helps you turn a messy emulation collection into a verified,
+      organised, and more playable library.
+    </p>
+    <p>
+      It identifies supported games from their files and archive contents,
+      checks them against preservation databases, highlights missing or
+      questionable files, helps discover and prepare emulator profiles,
+      builds organised libraries for tools such as RomM and ES-DE, and
+      provides safe cheat, patch, and selected mod workflows.
+    </p>
+    <p>
+      Potentially destructive operations are previewed before they run and
+      use confirmation, verification, and rollback safeguards where
+      supported. EmuWiz can also mount supported ZIP, 7z, and RAR archives
+      read-only, so you can browse and use their contents without
+      permanently extracting everything. It runs locally on Linux, and
+      your collection stays yours.
+    </p>
+  </description>
+  <launchable type="desktop-id">io.github.kiehntre.emuwiz.desktop</launchable>
+  <categories>
+    <category>Utility</category>
+    <category>Archiving</category>
+  </categories>
+  <content_rating type="oars-1.1" />
+</component>

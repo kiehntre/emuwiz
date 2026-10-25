@@ -94,6 +94,9 @@ pub enum ManagedFormat {
     XeniaPatch,
     /// RetroArch `.cht`. Journal-anchored only.
     RetroArchCheat,
+    /// A local generic (non-cheat) mod package write. Journal-anchored only;
+    /// no in-file marker and no profile-directory marker scan.
+    LocalModPackage,
 }
 
 impl ManagedFormat {
@@ -103,6 +106,7 @@ impl ManagedFormat {
             Self::Pcsx2Pnach => "PCSX2 PNACH",
             Self::XeniaPatch => "Xenia patch",
             Self::RetroArchCheat => "RetroArch cheat file",
+            Self::LocalModPackage => "Local mod package",
         }
     }
 
@@ -115,9 +119,22 @@ impl ManagedFormat {
     fn from_adapter(adapter: PreviewAdapter) -> Self {
         match adapter {
             PreviewAdapter::Dolphin => Self::DolphinGameSettings,
+            PreviewAdapter::Ppsspp => Self::LocalModPackage,
             PreviewAdapter::Pcsx2 => Self::Pcsx2Pnach,
+            PreviewAdapter::DuckStation => Self::LocalModPackage,
+            PreviewAdapter::MelonDs | PreviewAdapter::Mgba => Self::LocalModPackage,
             PreviewAdapter::Xenia => Self::XeniaPatch,
             PreviewAdapter::RetroArch => Self::RetroArchCheat,
+            PreviewAdapter::LocalModPackage
+            | PreviewAdapter::CemuGraphicPack
+            | PreviewAdapter::Rpcs3OrdinaryMod
+            | PreviewAdapter::Mame
+            | PreviewAdapter::Flycast
+            | PreviewAdapter::Rpcs3Patch
+            | PreviewAdapter::Mednafen
+            | PreviewAdapter::Fbneo
+            | PreviewAdapter::AmigaWhdloadTrainer
+            | PreviewAdapter::ScummVmTrainer => Self::LocalModPackage,
         }
     }
 }
@@ -450,7 +467,9 @@ fn scan_marked_files(
         let expected_extension = match target.format {
             ManagedFormat::DolphinGameSettings => "ini",
             ManagedFormat::Pcsx2Pnach => "pnach",
-            ManagedFormat::XeniaPatch | ManagedFormat::RetroArchCheat => continue,
+            ManagedFormat::XeniaPatch
+            | ManagedFormat::RetroArchCheat
+            | ManagedFormat::LocalModPackage => continue,
         };
         if path
             .extension()
@@ -526,7 +545,9 @@ fn managed_ids(format: ManagedFormat, bytes: &[u8]) -> Result<Vec<String>, Strin
         ManagedFormat::Pcsx2Pnach => parse_pnach_document(bytes)
             .map(|document| document.managed_block_ids().iter().cloned().collect())
             .map_err(|error| error.detail.clone()),
-        ManagedFormat::XeniaPatch | ManagedFormat::RetroArchCheat => Ok(Vec::new()),
+        ManagedFormat::XeniaPatch
+        | ManagedFormat::RetroArchCheat
+        | ManagedFormat::LocalModPackage => Ok(Vec::new()),
     }
 }
 
@@ -924,6 +945,7 @@ mod tests {
             },
             approved_source_root: SharedTransactionPath::from_path(Path::new("/tmp")),
             destination_root: SharedTransactionPath::from_path(Path::new("/tmp")),
+            created_root_directories: Vec::new(),
             dry_run: false,
             entries,
             status,

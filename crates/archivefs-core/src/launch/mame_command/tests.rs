@@ -1,0 +1,295 @@
+use super::*;
+use crate::dat::dependency::{
+    DependencyKind, DependencyOutcome, DependencyRequirement, DependencyState, DependencyTarget,
+    SetDependencyReport,
+};
+use crate::dat::set::{SetIdentity, SetResolution, SetState};
+use crate::launch::planning::{CanonicalIdentityStatus, ResolvedIdentity};
+
+fn identity(key: &str) -> CanonicalIdentityStatus {
+    identity_for_platform("Arcade", key)
+}
+
+fn identity_for_platform(platform_id: &str, key: &str) -> CanonicalIdentityStatus {
+    CanonicalIdentityStatus::Resolved(ResolvedIdentity {
+        platform_id: platform_id.to_string(),
+        game_key: key.to_string(),
+    })
+}
+
+fn resolution(name: &str, state: SetState) -> SetResolution {
+    SetResolution {
+        identity: SetIdentity {
+            source_id: "mame".to_string(),
+            game_name: name.to_string(),
+        },
+        archive_path: "/library/set.zip".into(),
+        state,
+        members_required: Vec::new(),
+        members_verified: Vec::new(),
+        members_bad: Vec::new(),
+        members_optional: Vec::new(),
+        members_borrowed: Vec::new(),
+        disks_required: Vec::new(),
+        disks_identity_matched: Vec::new(),
+        disks_parent_required: Vec::new(),
+        dependencies: SetDependencyReport {
+            state: DependencyState::NotApplicable,
+            requirements: Vec::new(),
+        },
+    }
+}
+
+#[test]
+fn complete_set_plans_one_native_set_name_argument() {
+    let plan = build_mame_command_plan(
+        &identity("pacman"),
+        &[resolution("pacman", SetState::Complete)],
+        Some(std::path::Path::new("/usr/bin/mame")),
+        Some(std::path::Path::new("/library")),
+    );
+    let command = plan
+        .command
+        .as_ref()
+        .expect("complete MAME set should plan");
+    assert!(plan.blockers.is_empty());
+    assert_eq!(classify_mame_readiness(&plan), MameReadiness::Ready);
+    assert!(plan.first_blocker().is_none());
+    assert_eq!(
+        command.arguments,
+        vec![
+            OsString::from("-rompath"),
+            OsString::from("/library"),
+            OsString::from("pacman")
+        ]
+    );
+}
+
+#[test]
+fn set_and_dependency_verdicts_block_without_fallback() {
+    let incomplete = build_mame_command_plan(
+        &identity("pacman"),
+        &[resolution("pacman", SetState::Incomplete)],
+        Some(std::path::Path::new("/usr/bin/mame")),
+        Some(std::path::Path::new("/library")),
+    );
+    assert!(incomplete.command.is_none());
+    assert!(
+        incomplete
+            .blockers
+            .iter()
+            .any(|b| b.kind == LaunchBlockerKind::MameSetIncomplete)
+    );
+
+    let unavailable = build_mame_command_plan(
+        &identity("pacman"),
+        &[],
+        Some(std::path::Path::new("/usr/bin/mame")),
+        Some(std::path::Path::new("/library")),
+    );
+    assert!(
+        unavailable
+            .blockers
+            .iter()
+            .any(|b| b.kind == LaunchBlockerKind::MameSetVerdictUnavailable)
+    );
+    assert_eq!(
+        classify_mame_readiness(&unavailable),
+        MameReadiness::Blocked
+    );
+}
+
+#[test]
+fn identity_mismatch_and_unconfigured_search_path_block() {
+    let plan = build_mame_command_plan(
+        &identity("other"),
+        &[resolution("pacman", SetState::Complete)],
+        Some(std::path::Path::new("/usr/bin/mame")),
+        None,
+    );
+    assert!(plan.command.is_none());
+    assert!(
+        plan.blockers
+            .iter()
+            .any(|b| b.kind == LaunchBlockerKind::MameSetIdentityUnavailable)
+    );
+    assert!(
+        plan.blockers
+            .iter()
+            .any(|b| b.kind == LaunchBlockerKind::MameSearchPathUnconfigured)
+    );
+    assert_eq!(classify_mame_readiness(&plan), MameReadiness::Blocked);
+}
+
+#[test]
+fn search_path_must_be_the_exact_parent_and_is_passed_to_mame() {
+    let mismatched = build_mame_command_plan(
+        &identity("pacman"),
+        &[resolution("pacman", SetState::Complete)],
+        Some(std::path::Path::new("/usr/bin/mame")),
+        Some(std::path::Path::new("/wrong/roms")),
+    );
+    assert!(
+        mismatched
+            .blockers
+            .iter()
+            .any(|blocker| blocker.kind == LaunchBlockerKind::MameSearchPathUnconfigured)
+    );
+}
+
+#[test]
+fn no_identity_or_executable_never_becomes_ready() {
+    let plan = build_mame_command_plan(
+        &CanonicalIdentityStatus::Unknown,
+        &[],
+        None,
+        Some(std::path::Path::new("/library")),
+    );
+    assert!(plan.command.is_none());
+    assert!(
+        plan.blockers
+            .iter()
+            .any(|b| b.kind == LaunchBlockerKind::IdentityUnresolved)
+    );
+    assert!(
+        plan.blockers
+            .iter()
+            .any(|b| b.kind == LaunchBlockerKind::MameEmulatorUnavailable)
+    );
+    assert_eq!(classify_mame_readiness(&plan), MameReadiness::Blocked);
+    assert_eq!(
+        plan.first_blocker().map(|blocker| blocker.kind),
+        Some(LaunchBlockerKind::IdentityUnresolved)
+    );
+}
+
+#[test]
+fn missing_executable_with_other_evidence_needs_setup() {
+    let plan = build_mame_command_plan(
+        &identity("pacman"),
+        &[resolution("pacman", SetState::Complete)],
+        None,
+        Some(std::path::Path::new("/library")),
+    );
+    assert_eq!(classify_mame_readiness(&plan), MameReadiness::NeedsSetup);
+    assert_eq!(
+        plan.first_blocker().map(|blocker| blocker.kind),
+        Some(LaunchBlockerKind::MameEmulatorUnavailable)
+    );
+}
+
+#[test]
+fn complete_neogeo_set_plans_through_native_mame() {
+    let plan = build_mame_command_plan(
+        &identity_for_platform("NeoGeo", "mslug3"),
+        &[resolution("mslug3", SetState::Complete)],
+        Some(std::path::Path::new("/usr/bin/mame")),
+        Some(std::path::Path::new("/library")),
+    );
+    let command = plan.command.expect("complete NeoGeo set should plan");
+    assert!(plan.blockers.is_empty());
+    assert_eq!(command.arguments.last(), Some(&OsString::from("mslug3")));
+}
+
+#[test]
+fn neo_geo_cd_is_not_a_native_mame_platform() {
+    let plan = build_mame_command_plan(
+        &identity_for_platform("Neo Geo CD", "lastblad"),
+        &[resolution("lastblad", SetState::Complete)],
+        Some(std::path::Path::new("/usr/bin/mame")),
+        Some(std::path::Path::new("/library")),
+    );
+    assert!(plan.command.is_none());
+    assert!(
+        plan.blockers
+            .iter()
+            .any(|b| b.kind == LaunchBlockerKind::MamePlatformMismatch)
+    );
+}
+
+#[test]
+fn unrelated_platform_is_not_a_native_mame_platform() {
+    let plan = build_mame_command_plan(
+        &identity_for_platform("SNES", "mario"),
+        &[resolution("mario", SetState::Complete)],
+        Some(std::path::Path::new("/usr/bin/mame")),
+        Some(std::path::Path::new("/library")),
+    );
+    assert!(plan.command.is_none());
+    assert!(
+        plan.blockers
+            .iter()
+            .any(|b| b.kind == LaunchBlockerKind::MamePlatformMismatch)
+    );
+}
+
+#[test]
+fn neogeo_dependency_blocker_remains_authoritative() {
+    let mut set = resolution("kof98", SetState::Complete);
+    set.dependencies = SetDependencyReport::from_requirements(vec![DependencyRequirement {
+        kind: DependencyKind::Device,
+        target: DependencyTarget::Set {
+            name: "i486".into(),
+        },
+        outcome: DependencyOutcome::Missing,
+        via_member: None,
+    }]);
+    let plan = build_mame_command_plan(
+        &identity_for_platform("NeoGeo", "kof98"),
+        &[set],
+        Some(std::path::Path::new("/usr/bin/mame")),
+        Some(std::path::Path::new("/library")),
+    );
+    assert!(plan.command.is_none());
+    assert!(
+        plan.blockers
+            .iter()
+            .any(|b| b.kind == LaunchBlockerKind::MameDependencyBlocked)
+    );
+    assert!(plan.blockers.iter().any(|blocker| {
+        blocker.kind == LaunchBlockerKind::MameDependencyBlocked
+            && blocker.detail.contains("device i486 (Missing)")
+    }));
+}
+
+#[test]
+fn neogeo_argument_comes_from_dat_set_shortname_not_archive_filename() {
+    let mut set = resolution("real_set", SetState::Complete);
+    set.archive_path = "/library/renamed-display-title.zip".into();
+    let plan = build_mame_command_plan(
+        &identity_for_platform("NeoGeo", "real_set"),
+        &[set],
+        Some(std::path::Path::new("/usr/bin/mame")),
+        Some(std::path::Path::new("/library")),
+    );
+    let command = plan.command.expect("verified set should plan");
+    assert_eq!(command.arguments.last(), Some(&OsString::from("real_set")));
+}
+
+#[test]
+fn mame_disk_declaration_review_blocks_command_before_handoff() {
+    for (reason, diagnostic) in [
+        (
+            crate::dat::set::NeedsReviewReason::DependencyEvidenceIncomplete,
+            "fresh MAME audit",
+        ),
+        (
+            crate::dat::set::NeedsReviewReason::UnsupportedSetStructure,
+            "unverified",
+        ),
+    ] {
+        let plan = build_mame_command_plan(
+            &identity("fixture"),
+            &[resolution("fixture", SetState::NeedsReview(reason))],
+            Some(std::path::Path::new("/isolated/fake-mame")),
+            Some(std::path::Path::new("/library")),
+        );
+        assert!(plan.command.is_none());
+        assert_eq!(classify_mame_readiness(&plan), MameReadiness::Blocked);
+        assert!(
+            plan.blockers
+                .iter()
+                .any(|blocker| blocker.detail.contains(diagnostic))
+        );
+    }
+}

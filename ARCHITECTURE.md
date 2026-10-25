@@ -1,68 +1,71 @@
-# EmuWiz Architecture
+# EmuWiz architecture
 
-This is a short, top-level overview. The full, current architecture
-reference - core components, providers, the persistent catalogue, managed
-library views, the patch-preview/adapter boundary, and testing strategy -
-lives in [`docs/architecture.md`](docs/architecture.md).
+EmuWiz is a local-first, Linux-first library and launch platform. It keeps
+source archives and media untouched, builds a shared evidence model, and lets
+the CLI and GUI use the same core planning, persistence, diagnostics, and
+execution logic. The Rust crate names retain the archivefs-* compatibility
+namespace.
 
-## Crates
+The detailed references are [docs/architecture.md](docs/architecture.md),
+[docs/domain-model.md](docs/domain-model.md),
+[docs/LAUNCH_SUPPORT.md](docs/LAUNCH_SUPPORT.md), and [ROADMAP.md](ROADMAP.md).
 
-EmuWiz is a Rust workspace with three crates:
+## System shape
 
-- `archivefs-core`: configuration, scanning, mount planning and execution,
-  the persistent SQLite catalogue, managed library views, the archive
-  inspector, and the patch-preview/adapter subsystem.
-- `archivefs-cli`: the command-line interface, built as thin commands over
-  `archivefs-core`.
-- `archivefs-gui`: a desktop frontend (`egui`/`eframe`) over the same core
-  scanning, catalogue, and mount logic as the CLI.
+sources / archives / direct media
+  -> ingestion, media recognition, structural evidence
+  -> identity evidence, verified facts, DAT/hash authority
+  -> catalogue, launch/readiness plans, library plans
+  -> CLI and GUI, emulator execution, views, Playing Library, RomM, ES-DE
 
-There is no separate daemon crate. Continuous background behavior today is
-limited to the explicit `watch` command described in
-[`docs/watcher.md`](docs/watcher.md), which refreshes the JSON index and
-never mounts or unmounts anything on its own.
+archivefs-core owns this logic. archivefs-cli and archivefs-gui are thin
+presentation and interaction layers. There is no separate daemon or
+GUI-owned identity system.
 
-## Mount backend
+## Architectural boundaries
 
-Archive mounting is implemented through the `MountBackend` trait
-(see [`docs/domain-model.md`](docs/domain-model.md)). The only current
-implementation, `RatarmountBackend`, shells out to `ratarmount`. Mounts are
-always read-only; EmuWiz never modifies a source archive.
+- Source archives are read-only. Inspection may read an archive member or
+  direct image, but does not rewrite the source.
+- Filename, folder, extension, and weak platform hints are evidence only.
+  They never silently become verified game identity.
+- The catalogue persists observations, identity reports, DAT results, set
+  verdicts, and verified facts as useful, freshness-aware projections. Fresh
+  launch and apply paths revalidate the relevant content.
+- Launch separates compatibility, identity, emulator/profile discovery,
+  readiness, command planning, and process execution. See
+  [docs/LAUNCH_SUPPORT.md](docs/LAUNCH_SUPPORT.md).
+- Cheats and mods separate discovery/provider browsing/preview from selected,
+  verified apply. Supported apply paths use shared transaction, journal,
+  backup, verification, and rollback machinery.
+- Doctor and database-check are diagnostic/read-only paths; repair and other
+  explicitly confirmed operations are separate.
 
-## Archive health states
+## Main subsystems
 
-`ArchiveHealth` currently has these variants:
+Ingestion, media registries, archive-member readers, and format observers turn
+paths into bounded content and platform evidence. Identity fusion combines
+that evidence with verified direct-media facts and DAT/hash results. SQLite
+persists the catalogue and its evidence lineage.
 
-- `Pending`
-- `Mounted`
-- `Failed`
-- `MissingParts`
-- `Corrupt`
-- `Unsupported`
-- `PermissionDenied`
-- `RetryAvailable`
+The launch subsystem discovers emulator profiles, resolves verified identity,
+computes readiness, plans a command, and only then executes it. The support
+matrix is the current reference for supported families; coverage is not
+uniform across platforms or emulators.
 
-`Failed`, `MissingParts`, and `RetryAvailable` are retryable; retries are
-always an explicit user action, never automatic.
+Playing Library and Library Views are plans over the evidence-backed library.
+RomM and ES-DE are projections/exports, not alternate identity authorities.
+The RomM client is local-path-aware and read-only toward RomM; publishing an
+ES-DE projection is a separate local operation.
 
-## Duplicate detection
+The patch-manager subsystem contains provider/source validation, local
+inspection, mod-package planning, adapter-specific materialization, and the
+shared safe-apply pipeline. Unsupported formats fail closed. A local mod
+package can be inspected and planned without implying that its patch format
+is executable or apply-capable.
 
-Filename-based duplicate detection (`FilenameDuplicateDetector`) is
-implemented today, grouping by normalized filename and effective platform.
-It never relies on filename alone as a *correctness* claim - matches are
-reported as candidates, not proven duplicates. Stronger, hash-based
-detection remains a documented future direction; see
-[`docs/duplicate-detector.md`](docs/duplicate-detector.md).
+## Historical design context
 
-## Further reading
-
-- [`docs/architecture.md`](docs/architecture.md) - full component reference.
-- [`docs/domain-model.md`](docs/domain-model.md) - core types.
-- [`docs/database.md`](docs/database.md) and
-  [`docs/DATABASE_DESIGN.md`](docs/DATABASE_DESIGN.md) - persistent catalogue
-  schema and design rationale.
-- [`docs/library-views.md`](docs/library-views.md) - managed library views.
-- [`docs/PATCH_CHEAT_MANAGER_DESIGN.md`](docs/PATCH_CHEAT_MANAGER_DESIGN.md) -
-  the patch-preview system and emulator adapter boundary.
-- [`docs/security.md`](docs/security.md) - safety and trust boundaries.
-- [`docs/json-api.md`](docs/json-api.md) - stable JSON output contracts.
+Older documents and release notes may call the project ArchiveFS, describe a
+flat launch_plan, or frame PCSX2 as the only adapter. Those descriptions are
+provenance, not the current ownership model; current behavior is defined by
+the references above and the live registry/support matrix.

@@ -64,6 +64,12 @@ fn romm_record(
         verification,
         conflicts: Vec::new(),
         evidence: Vec::new(),
+        synopsis: None,
+        genres: Vec::new(),
+        players: None,
+        rating: None,
+        release_year: None,
+        howlongtobeat: None,
     }
 }
 
@@ -77,6 +83,7 @@ fn romm(platform: &str) -> PlatformIdentityEvidence {
 
 fn dat_outcome(platform: Option<&str>, verdict: AuditVerdict) -> DatAuditOutcome {
     DatAuditOutcome {
+        population: Default::default(),
         source_id: "dat-1".to_string(),
         source_display_name: "No-Intro PSP".to_string(),
         dat_path: "/catalogues/psp.dat".to_string(),
@@ -84,6 +91,13 @@ fn dat_outcome(platform: Option<&str>, verdict: AuditVerdict) -> DatAuditOutcome
         catalogue_names: vec!["Sony PSP".to_string()],
         catalogue_entries: 1,
         catalogue_roms: 1,
+        catalogue_version: None,
+        catalogue_sha256: None,
+        catalogue_inventory: None,
+        catalogue_author: None,
+        catalogue_homepage: None,
+        catalogue_ecosystem: None,
+        catalogue_variant: None,
         unreadable_catalogues: Vec::new(),
         report: AuditReport {
             entries: vec![AuditEntry {
@@ -93,13 +107,20 @@ fn dat_outcome(platform: Option<&str>, verdict: AuditVerdict) -> DatAuditOutcome
             }],
             summary: AuditSummary::default(),
         },
+        evidence_sources: Vec::new(),
+        archives: Vec::new(),
+        sets: Vec::new(),
         unhashed: Vec::new(),
         files_scanned: 1,
         bytes_hashed: 123,
+        archive_bytes_hashed: 0,
         truncated: false,
         policy: None,
         content: Default::default(),
         platform: platform.map(str::to_string),
+        cache: Default::default(),
+        known_hashes: Default::default(),
+        loose_discs: Default::default(),
     }
 }
 
@@ -390,4 +411,82 @@ fn future_romm_directory_slug_comes_from_imported_canonical_mapping() {
     };
     assert_eq!(cache.romm_slug_for_platform("PSP"), Some("psp"));
     assert_eq!(cache.romm_slug_for_platform("not-a-platform"), None);
+}
+
+/// Builds a minimal identity cache whose `platforms` list is exactly the
+/// given `(provider_slug, canonical)` pairs, for exercising
+/// `romm_slug_for_platform`'s ambiguity handling directly.
+fn cache_with_platforms(platforms: Vec<(&str, Option<&str>)>) -> IdentityCache {
+    IdentityCache {
+        format_version: CACHE_FORMAT_VERSION,
+        provider: IdentityProvider::Romm,
+        server_id: "https://romm.example".to_string(),
+        server_version: None,
+        source_fingerprint: "fixture".to_string(),
+        imported_at_unix_seconds: 1,
+        platforms: platforms
+            .into_iter()
+            .enumerate()
+            .map(|(index, (slug, canonical))| NormalisedPlatform {
+                provider_platform_id: Some(index.to_string()),
+                provider_slug: slug.to_string(),
+                provider_name: None,
+                canonical: canonical.map(str::to_string),
+                rom_count: Some(1),
+            })
+            .collect(),
+        records: Vec::new(),
+        rejected_hashes: Vec::new(),
+        unknown_platforms: Vec::new(),
+        server_reported_total: Some(0),
+    }
+}
+
+#[test]
+fn romm_slug_for_platform_fails_closed_on_ambiguous_mapping() {
+    // A single distinct slug resolves.
+    let cache = cache_with_platforms(vec![("nes", Some("NES"))]);
+    assert_eq!(cache.romm_slug_for_platform("NES"), Some("nes"));
+
+    // Duplicate identical entries collapse to one and still resolve.
+    let cache = cache_with_platforms(vec![("nes", Some("NES")), ("nes", Some("NES"))]);
+    assert_eq!(cache.romm_slug_for_platform("NES"), Some("nes"));
+
+    // Two distinct slugs for one canonical platform are ambiguous.
+    let cache = cache_with_platforms(vec![("fds", Some("NES")), ("nes", Some("NES"))]);
+    assert_eq!(cache.romm_slug_for_platform("NES"), None);
+
+    // Zero matching slugs is unresolved.
+    let cache = cache_with_platforms(vec![("psp", Some("PSP"))]);
+    assert_eq!(cache.romm_slug_for_platform("NES"), None);
+}
+
+#[test]
+fn a_cue_sheet_match_is_platform_evidence_only_when_its_whole_disc_is_verified() {
+    let mut outcome = dat_outcome(
+        Some("PSX"),
+        AuditVerdict::Exact {
+            game_name: "Game".to_string(),
+            rom_name: "Game.cue".to_string(),
+            algorithm: "SHA-1",
+        },
+    );
+    outcome.report.entries[0].local_path = "/library/Game.cue".to_string();
+    let cue = Path::new("/library/Game.cue");
+    assert!(PlatformIdentityEvidence::from_verified_dat(&outcome, cue, GENERATION).is_none());
+
+    let mut disc = crate::dat::sources::audit_run::LooseDiscAudit {
+        cue_path: "/library/Game.cue".to_string(),
+        members: Vec::new(),
+        verified_game: None,
+        detail: Some("a track did not match".into()),
+    };
+    outcome.loose_discs = vec![disc.clone()];
+    assert!(PlatformIdentityEvidence::from_verified_dat(&outcome, cue, GENERATION).is_none());
+
+    disc.verified_game = Some("Game".into());
+    disc.detail = None;
+    outcome.loose_discs = vec![disc];
+    let evidence = PlatformIdentityEvidence::from_verified_dat(&outcome, cue, GENERATION).unwrap();
+    assert_eq!(evidence.source, PlatformIdentitySource::VerifiedDat);
 }

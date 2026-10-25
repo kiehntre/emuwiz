@@ -56,6 +56,14 @@ pub struct SafeDestination {
 }
 
 impl SafeDestination {
+    pub(crate) fn nested(root: ValidatedDestinationRoot, path: PathBuf) -> Self {
+        Self {
+            root,
+            platform_directory: PathBuf::new(),
+            file_name: PathBuf::new(),
+            path,
+        }
+    }
     pub fn root(&self) -> &ValidatedDestinationRoot {
         &self.root
     }
@@ -139,7 +147,7 @@ pub struct DestinationSafetyError {
 }
 
 impl DestinationSafetyError {
-    fn new(reason: DestinationSafetyFailureReason, path: PathBuf) -> Self {
+    pub(crate) fn new(reason: DestinationSafetyFailureReason, path: PathBuf) -> Self {
         Self {
             reason,
             path,
@@ -374,7 +382,7 @@ pub fn assess_destination(
     inspect_safe_destination(&destination)
 }
 
-fn validate_single_component(
+pub(crate) fn validate_single_component(
     value: &OsStr,
     error_path: &Path,
 ) -> Result<(), DestinationSafetyError> {

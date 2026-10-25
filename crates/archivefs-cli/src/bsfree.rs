@@ -91,6 +91,7 @@ pub fn run(args: Vec<String>) -> Result<(), Box<dyn std::error::Error>> {
             render(
                 &catalogue.search_games(&BsFreeGameSearchRequest {
                     platform_id,
+                    system_id: None,
                     title,
                     version,
                     device_id,

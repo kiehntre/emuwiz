@@ -4,12 +4,26 @@ This note records the dependency-advisory remediation performed for the
 EmuWiz v0.7 alpha candidate on 2026-07-29. It covers the resolved Cargo
 graph; it does not claim that all future dependency versions are safe.
 
+## Current v0.8.3 audit disposition
+
+The current candidate's `cargo audit` run succeeds with two unmaintained-crate
+warnings and no vulnerability, unsoundness, or yanked-package finding:
+
+| Advisory | Resolved path | Exposure and disposition |
+| --- | --- | --- |
+| RUSTSEC-2025-0056 (`adler 1.0.2`) | `archivefs-core` -> `opticaldiscs 0.15.0` -> `nod 1.4.4` -> `adler` (also reached through the optional optical-discs path) | Unmaintained warning only; no known vulnerability. `adler` is transitive and the enabled `nod` 1.x feature set is required for the supported disc readers. The available `nod 2.0.0-alpha` line is not a safe release update. Retain for this release and review when a stable compatible parent path exists. |
+| RUSTSEC-2025-0141 (`bincode 1.3.3`) | `archivefs-core` -> `xdvdfs 0.8.3` -> `bincode` | Unmaintained warning only; no known vulnerability. `bincode` is transitive and EmuWiz does not use it as an application serialization format. Replacing it requires an upstream `xdvdfs` compatibility change, so no format migration or forced lockfile churn is justified for this release. Retain and review with the next compatible `xdvdfs` release. |
+
+These are conscious, scoped release acceptances rather than hidden audit
+ignores. They do not change the policy that any actual vulnerability must
+block release.
+
 ## Findings and exposure
 
 | Advisory | Before | Exposure in EmuWiz | Resolution |
 | --- | --- | --- | --- |
-| RUSTSEC-2026-0195 | `quick-xml 0.39.4` | Build-time only, through the `wayland-scanner` procedural macro. EmuWiz does not use this parser on game or catalogue data at runtime. | Updated to `quick-xml 0.41.0` through `wayland-scanner 0.31.11`. |
-| RUSTSEC-2026-0194 | `quick-xml 0.39.4` | Build-time only, through the same Wayland protocol-generation path. | Updated to `quick-xml 0.41.0` through `wayland-scanner 0.31.11`. |
+| RUSTSEC-2026-0195 | `quick-xml 0.39.4` | Reached at build time through the `wayland-scanner` procedural macro. quick-xml is also a runtime dependency of `archivefs-core`, where it parses Logiqx DAT/catalogue XML. | Updated to `quick-xml 0.41.0` through `wayland-scanner 0.31.11`. |
+| RUSTSEC-2026-0194 | `quick-xml 0.39.4` | Reached at build time through the same Wayland protocol-generation path. quick-xml is also a runtime dependency of `archivefs-core`, where it parses Logiqx DAT/catalogue XML. | Updated to `quick-xml 0.41.0` through `wayland-scanner 0.31.11`. |
 | RUSTSEC-2026-0192 | `ttf-parser 0.25.1` | Runtime GUI font parsing and rendering through `owned_ttf_parser`, `ab_glyph`, `epaint`, and `egui`. The finding is an unmaintained-crate warning rather than a known vulnerability. | Removed by updating the coordinated `eframe`/`egui` family from 0.32.3 to 0.34.3. The replacement font path uses `font-types 0.11.3`, `read-fonts 0.37.0`, and `skrifa 0.40.0`. |
 
 Before remediation, the relevant dependency paths were:

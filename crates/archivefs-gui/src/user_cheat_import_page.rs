@@ -1,0 +1,4572 @@
+//! Review of user-supplied RetroArch, PCSX2, Dolphin and Xenia cheat files.
+//!
+//! The core importer is a read-only index: it reads bounded local files and
+//! reports provenance and matching evidence. Installing a reviewed file is a
+//! separate, explicit step that hands it to the existing per-emulator local
+//! install bridge (preview, confirm, apply, undo); the index never writes.
+
+use std::collections::{BTreeMap, BTreeSet};
+use std::path::PathBuf;
+use std::sync::mpsc::{self, Receiver, TryRecvError};
+use std::thread;
+
+use crate::onframe_install_session::OnFrameInstallSession;
+use archivefs_core::emulator_environment::{
+    BoundedReadResult, HostReadOnlyFilesystem, ReadOnlyHostFilesystem,
+};
+use archivefs_core::patch_manager::{
+    CheatCandidateOptions, CheatCodeDecodeResult, CheatDestinationRequest, CheatDocument,
+    CheatIssue, CheatJourneyApplyApproval, CheatJourneyApplyOptions, CheatJourneyGameIdentity,
+    CheatJourneyPreview, CheatJourneyPreviewAction, CheatJourneyUndoConfirmation,
+    CheatJourneyUndoOptions, CheatJourneyUndoPreview, CheatOperation, CheatPackCatalogueGame,
+    CheatPackLimits, CheatPackPreview, CheatPlatform, CheatSourceFormat, CheatTargetFormat,
+    CheatTargetPlatform, ConversionCapability, DolphinCandidate, DolphinInstallPreview,
+    DolphinInstallPreviewRequest, LocalDolphinInstallState, LocalPcsx2InstallState,
+    LocalXeniaInstallState, Pcsx2GameIdentity, Pcsx2InstallPreview, Pcsx2InstallPreviewRequest,
+    Pcsx2Profile, PreviewProposedAction, SharedApplyConfirmation, SharedApplyOptions,
+    SharedApplyStatus, SharedRollbackConfirmation, SharedRollbackOptions, SharedRollbackPreview,
+    UserCheatCandidate, UserCheatDiagnostic, UserCheatFormat, UserCheatImportError,
+    UserCheatImportReport, UserCheatLibraryGame, UserCheatMatchState, XeniaInstallPreview,
+    XeniaInstallPreviewRequest, XeniaProfile, apply_cheat_journey, build_dolphin_install_preview,
+    build_pcsx2_install_preview, build_shared_transaction_plan, build_xenia_install_preview,
+    check_local_dolphin_install_state, check_local_pcsx2_install_state,
+    check_local_xenia_install_state, convert_cheat_document, decode_action_replay,
+    default_shared_backup_root, default_shared_history_root, detect_action_replay_format,
+    discover_local_dolphin_cheat_file, discover_local_pcsx2_pnach_file,
+    discover_local_retroarch_cheat_file, discover_local_xenia_patch_file, dolphin_line_to_ir,
+    dolphin_on_frame_line_to_ir, execute_shared_apply, execute_shared_rollback,
+    generate_shared_operation_id, load_dolphin_destination, load_local_xenia_destination,
+    parse_ds_action_replay_document, pnach_line_to_ir, preview_cheat_journey,
+    preview_cheat_journey_undo, preview_cheat_pack, preview_shared_rollback,
+    scan_user_cheat_directory, scan_user_cheat_file, select_cheat_journey_candidate,
+    stage_local_dolphin_codes, stage_local_xenia_patch_file, stage_pcsx2_pnach,
+    supported_targets_for, undo_cheat_journey,
+};
+use eframe::egui;
+
+use crate::ui::components as widgets;
+
+/// The currently selected game's identity and resolved RetroArch cheat
+/// destination, bound by the caller exactly as `build_cheat_candidate_request`
+/// binds it for the trusted-catalogue journey - this page never derives
+/// identity or a destination path on its own.
+pub(crate) struct LocalCheatInstallContext {
+    pub game: CheatJourneyGameIdentity,
+    /// `None` when no eligible RetroArch profile with a resolved cheat
+    /// directory is selected yet; the install action stays disabled with
+    /// that exact reason rather than guessing a destination.
+    pub destination: Option<CheatDestinationRequest>,
+}
+
+/// How long a confirmation may wait for its fresh emulator re-check before
+/// it is reported as timed out. The check runs off the render path.
+const LOCAL_CONFIRM_VALIDATION_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
+const MAX_CONVERSION_INPUT_BYTES: usize = 1024 * 1024;
+const CONVERSION_SOURCE_LABELS: [&str; 5] = [
+    "Dolphin Gecko",
+    "Dolphin Action Replay",
+    "Dolphin On-Frame",
+    "PCSX2 PNACH",
+    "Nintendo DS Action Replay",
+];
+
+fn conversion_source_format(index: usize) -> Option<CheatSourceFormat> {
+    Some(match index {
+        0 => CheatSourceFormat::Gecko,
+        1 => CheatSourceFormat::DolphinActionReplay,
+        2 => CheatSourceFormat::DolphinOnFrame,
+        3 => CheatSourceFormat::Pnach,
+        4 => CheatSourceFormat::ActionReplayDs,
+        _ => return None,
+    })
+}
+
+fn detect_conversion_source(text: &str) -> Option<usize> {
+    let lines: Vec<_> = text
+        .lines()
+        .map(str::trim)
+        .filter(|line| !line.is_empty())
+        .collect();
+    if lines.is_empty() {
+        return None;
+    }
+    if lines.iter().any(|line| line.starts_with("patch=")) {
+        return Some(3);
+    }
+    if lines
+        .iter()
+        .any(|line| line.starts_with("[Gecko]") || line.starts_with("$"))
+    {
+        return Some(0);
+    }
+    if lines.iter().any(|line| line.starts_with("[ActionReplay]")) {
+        return Some(1);
+    }
+    if lines
+        .iter()
+        .any(|line| line.contains(":byte:") || line.contains(":word:") || line.contains(":dword:"))
+    {
+        return Some(2);
+    }
+    // Plain address/value pairs overlap between Dolphin and DS AR. Require
+    // an explicit source choice rather than guessing from a game title.
+    None
+}
+
+fn looks_like_unlabelled_pair_list(text: &str) -> bool {
+    let mut count = 0usize;
+    for line in text.lines().map(str::trim).filter(|line| !line.is_empty()) {
+        let fields: Vec<_> = line.split_whitespace().collect();
+        if fields.len() != 2
+            || fields
+                .iter()
+                .any(|word| word.len() != 8 || !word.bytes().all(|byte| byte.is_ascii_hexdigit()))
+        {
+            return false;
+        }
+        count += 1;
+    }
+    count > 0
+}
+
+fn parse_conversion_line(raw: &str, source_index: usize) -> CheatOperation {
+    if source_index <= 1 {
+        let mut fields = raw.split_whitespace();
+        let pair = fields.next().zip(fields.next());
+        let valid_pair = fields.next().is_none()
+            && pair.is_some_and(|(address, value)| {
+                let address = address.strip_prefix("0x").unwrap_or(address);
+                let value = value.strip_prefix("0x").unwrap_or(value);
+                if address.len() != 8 || value.len() != 8 {
+                    return false;
+                }
+                let (Ok(address), Ok(value)) = (
+                    u32::from_str_radix(address, 16),
+                    u32::from_str_radix(value, 16),
+                ) else {
+                    return false;
+                };
+                match address >> 24 {
+                    0x00 => value <= u32::from(u8::MAX),
+                    0x02 => value <= u32::from(u16::MAX),
+                    0x04 => true,
+                    _ => true, // the Core parser retains control codes as unsupported.
+                }
+            });
+        if !valid_pair {
+            return CheatOperation::UnsupportedRaw {
+                source_format: conversion_source_format(source_index).unwrap(),
+                raw: raw.to_string(),
+                reason: "malformed pair or value does not fit the declared write width".into(),
+            };
+        }
+        return dolphin_line_to_ir(raw, conversion_source_format(source_index).unwrap());
+    }
+    if source_index == 3 {
+        let Some(values) = raw.strip_prefix("patch=") else {
+            return pnach_line_to_ir(raw);
+        };
+        let fields: Vec<_> = values.split(',').map(str::trim).collect();
+        let safe = fields.len() == 5
+            && fields[0] == "1"
+            && fields[1] == "EE"
+            && matches!(fields[3], "byte" | "short" | "word")
+            && u64::from_str_radix(fields[2], 16).is_ok()
+            && u32::from_str_radix(fields[4], 16).is_ok_and(|value| match fields[3] {
+                "byte" => value <= u32::from(u8::MAX),
+                "short" => value <= u32::from(u16::MAX),
+                "word" => true,
+                _ => false,
+            });
+        if !safe {
+            return CheatOperation::UnsupportedRaw {
+                source_format: CheatSourceFormat::Pnach,
+                raw: raw.to_string(),
+                reason: "PNACH line is malformed, non-EE, disabled, or exceeds its declared width"
+                    .into(),
+            };
+        }
+        return pnach_line_to_ir(raw);
+    }
+    match source_index {
+        2 => dolphin_on_frame_line_to_ir(raw),
+        4 => unreachable!("DS AR documents use the Core document parser"),
+        _ => CheatOperation::UnsupportedRaw {
+            source_format: conversion_source_format(source_index)
+                .unwrap_or(CheatSourceFormat::Other("unknown".into())),
+            raw: raw.into(),
+            reason: "unsupported source format".into(),
+        },
+    }
+}
+
+fn build_conversion_document(
+    title: &str,
+    platform: CheatPlatform,
+    source_index: usize,
+    text: &str,
+) -> Result<CheatDocument, String> {
+    let source_format = conversion_source_format(source_index)
+        .ok_or_else(|| "Choose a supported source format.".to_string())?;
+    let compatible = matches!(
+        (&platform, source_index),
+        (CheatPlatform::GameCube | CheatPlatform::Wii, 0..=2)
+            | (CheatPlatform::Ps2, 3)
+            | (CheatPlatform::NintendoDs, 4)
+    );
+    if !compatible {
+        return Err("The selected source format does not match this game's platform.".into());
+    }
+    if text.len() > MAX_CONVERSION_INPUT_BYTES {
+        return Err("Input exceeds the 1 MiB conversion limit.".into());
+    }
+    if source_index == 4 {
+        let document = parse_ds_action_replay_document(
+            title,
+            text,
+            vec!["pasted or selected local text".into()],
+        );
+        if document.operations.is_empty() {
+            return Err("No Action Replay code lines were found.".into());
+        }
+        return Ok(document);
+    }
+    let mut operations = Vec::new();
+    let mut issues = Vec::new();
+    for raw in text.lines().map(str::trim) {
+        if raw.is_empty()
+            || raw.starts_with('#')
+            || raw.starts_with(';')
+            || raw.starts_with('[')
+            || raw.starts_with('$')
+            || raw.starts_with("//")
+        {
+            continue;
+        }
+        let operation = parse_conversion_line(raw, source_index);
+        if matches!(operation, CheatOperation::UnsupportedRaw { .. }) {
+            issues.push(CheatIssue::UnsupportedOperation(raw.to_string()));
+        }
+        operations.push(operation);
+    }
+    if operations.is_empty() {
+        return Err("No code lines were found in the selected format.".into());
+    }
+    Ok(CheatDocument {
+        source_evidence: Vec::new(),
+        title: title.to_string(),
+        platform,
+        source_format,
+        operations,
+        issues,
+        provenance: vec!["pasted or selected local text".into()],
+    })
+}
+
+/// Shown when a confirmation's re-check did not finish in time.
+pub(crate) const LOCAL_CONFIRM_TIMED_OUT: &str = "EmuWiz could not finish re-checking your emulator setup in time (an emulator folder may be slow or unavailable), so nothing was installed. Confirm again to retry.";
+
+/// Shown when the page was left while a confirmation was being checked.
+pub(crate) const LOCAL_CONFIRM_INTERRUPTED: &str = "Your confirmation was not used because this page was closed before EmuWiz finished re-checking your emulator setup, so nothing was installed. Review the preview and confirm again.";
+
+/// A PCSX2/Dolphin/Xenia local install target: profile ID and its
+/// configuration path.
+type LocalNativeTarget = (String, PathBuf);
+
+/// Shown when a local-file install preview no longer matches the target.
+pub(crate) const LOCAL_INSTALL_TARGET_CHANGED: &str = "The emulator, core or cheat folder for this game changed after the preview, so nothing was installed. Install the file again to preview the new destination.";
+
+/// Whether a PCSX2/Dolphin/Xenia preview's profile and configuration path are
+/// still exactly the current target.
+fn native_target_is_current(
+    profile_id: &str,
+    configuration_path: &std::path::Path,
+    current: Option<&LocalNativeTarget>,
+) -> bool {
+    current.is_some_and(|(current_id, current_path)| {
+        current_id == profile_id && current_path == configuration_path
+    })
+}
+
+/// Whether a local-file install preview built for `previewed` still targets
+/// the destination the current emulator choice resolves to.
+pub(crate) fn local_preview_targets_current_destination(
+    previewed: &CheatDestinationRequest,
+    current: Option<&CheatDestinationRequest>,
+) -> bool {
+    current.is_some_and(|current| current == previewed)
+}
+
+/// One local-file install attempt's current stage. Only one is ever active;
+/// starting a new one (a different file, or "Try again") replaces it.
+#[derive(Default)]
+enum LocalInstallStage {
+    #[default]
+    Idle,
+    Blocked {
+        source_path: PathBuf,
+        message: String,
+    },
+    Preview {
+        source_path: PathBuf,
+        catalogue_root: PathBuf,
+        preview: Box<CheatJourneyPreview>,
+    },
+    Applied {
+        destination_root: PathBuf,
+        journal_path: Option<PathBuf>,
+        transaction_id: String,
+    },
+    UndoPreview {
+        destination_root: PathBuf,
+        journal_path: PathBuf,
+        transaction_id: String,
+        preview: Box<CheatJourneyUndoPreview>,
+    },
+    Done {
+        message: String,
+    },
+    Error {
+        message: String,
+    },
+}
+
+/// The currently selected game's PCSX2 identity and resolved profile,
+/// bound by the caller exactly as `pcsx2_identity_for_workflow` already
+/// binds it for the GameHacking-catalogue journey.
+pub(crate) struct LocalPcsx2InstallContext {
+    pub identity: Pcsx2GameIdentity,
+    /// `None` when no eligible PCSX2 profile is selected yet; the install
+    /// action stays disabled with that exact reason rather than guessing
+    /// a destination.
+    pub profile: Option<Pcsx2Profile>,
+}
+
+/// One local `.pnach` install attempt's current stage, independent of
+/// `LocalInstallStage` (RetroArch) so the two formats never share state.
+#[derive(Default)]
+enum LocalPcsx2InstallStage {
+    #[default]
+    Idle,
+    Blocked {
+        source_path: PathBuf,
+        message: String,
+    },
+    AlreadyInstalled {
+        source_path: PathBuf,
+    },
+    Preview {
+        source_path: PathBuf,
+        profile: Pcsx2Profile,
+        preview: Box<Pcsx2InstallPreview>,
+    },
+    Applied {
+        destination_root: PathBuf,
+        journal_path: Option<PathBuf>,
+    },
+    UndoPreview {
+        destination_root: PathBuf,
+        journal_path: PathBuf,
+        preview: Box<SharedRollbackPreview>,
+    },
+    Done {
+        message: String,
+    },
+    Error {
+        message: String,
+    },
+}
+
+/// The currently selected game's already-resolved Dolphin candidate
+/// (exact game ID, and when applicable exact disc revision, already
+/// matched against the selected profile) plus the profile's own
+/// configuration root - bound by the caller exactly as the existing
+/// Dolphin Gecko provider workflow binds them, never re-derived here.
+pub(crate) struct LocalDolphinInstallContext {
+    pub candidate: DolphinCandidate,
+    pub platform: CheatPlatform,
+    pub configuration_path: PathBuf,
+    /// The selected Dolphin profile's own ID, exactly the string
+    /// `build_shared_transaction_plan` already scopes every other Dolphin
+    /// apply's journal/backup entries under.
+    pub profile_id: String,
+}
+
+/// Xenia identity/profile binding supplied by Cheats & Mods. Optional fields
+/// let the UI explain unresolved or ambiguous state without guessing.
+pub(crate) struct LocalXeniaInstallContext {
+    pub title_id: Option<String>,
+    pub profile: Option<XeniaProfile>,
+}
+
+#[derive(Default)]
+enum LocalXeniaInstallStage {
+    #[default]
+    Idle,
+    Blocked {
+        source_path: PathBuf,
+        message: String,
+    },
+    AlreadyInstalled {
+        source_path: PathBuf,
+    },
+    Preview {
+        source_path: PathBuf,
+        profile_id: String,
+        configuration_path: PathBuf,
+        preview: Box<XeniaInstallPreview>,
+    },
+    Applied {
+        destination_root: PathBuf,
+        journal_path: Option<PathBuf>,
+    },
+    UndoPreview {
+        destination_root: PathBuf,
+        preview: Box<SharedRollbackPreview>,
+    },
+    Done {
+        message: String,
+    },
+    Error {
+        message: String,
+    },
+}
+
+/// One local Dolphin `.ini` (Gecko/Action Replay) install attempt's
+/// current stage, independent of the RetroArch/PCSX2 stages so the three
+/// formats never share state. Unlike RetroArch/PCSX2, there is no
+/// directory-wide scan to pick a candidate from - the user picks the file
+/// directly, so this starts from a file path rather than a report row.
+#[derive(Default)]
+enum LocalDolphinInstallStage {
+    #[default]
+    Idle,
+    Blocked {
+        source_path: PathBuf,
+        message: String,
+    },
+    AlreadyInstalled {
+        source_path: PathBuf,
+    },
+    Preview {
+        source_path: PathBuf,
+        configuration_path: PathBuf,
+        profile_id: String,
+        preview: Box<DolphinInstallPreview>,
+    },
+    Applied {
+        destination_root: PathBuf,
+        journal_path: Option<PathBuf>,
+    },
+    UndoPreview {
+        destination_root: PathBuf,
+        journal_path: PathBuf,
+        preview: Box<SharedRollbackPreview>,
+    },
+    Done {
+        message: String,
+    },
+    Error {
+        message: String,
+    },
+}
+
+#[derive(Debug)]
+enum TaskResult {
+    /// The scan report, plus (for a folder) the bounded read-only pack preview
+    /// computed in the same background pass.
+    Scanned(
+        Result<UserCheatImportReport, UserCheatImportError>,
+        Option<Result<Box<CheatPackPreview>, String>>,
+    ),
+}
+
+#[derive(Debug, Default)]
+enum ImportState {
+    #[default]
+    Idle,
+    Scanning {
+        source: PathBuf,
+    },
+    Ready {
+        report: UserCheatImportReport,
+    },
+    Failed {
+        source: PathBuf,
+        message: String,
+    },
+}
+
+/// GUI state for the user-supplied cheat import review card.
+#[derive(Default)]
+pub(crate) struct UserCheatImportPageState {
+    state: ImportState,
+    task: Option<(u64, Receiver<TaskResult>)>,
+    /// What EmuWiz found in the last scanned folder, if it was a folder.
+    pack_preview: Option<Result<Box<CheatPackPreview>, String>>,
+    generation: u64,
+    context_key: Option<String>,
+    report_context_key: Option<String>,
+    last_source: Option<(PathBuf, bool)>,
+    selected_candidate: Option<usize>,
+    converter_text: String,
+    converter_source_format: Option<usize>,
+    converter_target_format: Option<CheatTargetFormat>,
+    converter_error: Option<String>,
+    converter_game_confirmed: bool,
+    converter_context_key: Option<String>,
+    technical_details: bool,
+    local_install: LocalInstallStage,
+    /// The RetroArch destination the current emulator choice resolves to,
+    /// refreshed every frame; a local install only writes when its preview
+    /// still targets exactly this.
+    local_install_current_destination: Option<CheatDestinationRequest>,
+    /// When "Confirm install" was clicked. The write runs only once the
+    /// caller reports a target validation based on emulator discovery that
+    /// started after this click; the page waits (without blocking) until
+    /// then, and reports a timeout or an interruption instead of failing
+    /// silently.
+    local_install_confirm_requested_at: Option<std::time::Instant>,
+    /// This frame's validation for the pending confirmation, supplied by
+    /// Cheats & Mods: `None` still checking, `Some(true)` current.
+    local_install_confirm_validation: Option<bool>,
+    /// Why the last confirmation did not install, shown on the preview.
+    local_install_confirm_notice: Option<&'static str>,
+    /// Render pass this page was last shown in; a gap means it was left.
+    last_shown_pass: Option<u64>,
+    /// Current PCSX2/Dolphin/Xenia install target (profile ID and
+    /// configuration path), refreshed every frame from Cheats & Mods.
+    local_pcsx2_current_target: Option<LocalNativeTarget>,
+    local_dolphin_current_target: Option<LocalNativeTarget>,
+    local_xenia_current_target: Option<LocalNativeTarget>,
+    local_pcsx2_install: LocalPcsx2InstallStage,
+    local_dolphin_install: LocalDolphinInstallStage,
+    local_xenia_install: LocalXeniaInstallStage,
+    /// Dedicated OnFrame workflow state; never shared with Gecko/Action Replay.
+    pub(crate) onframe_install: OnFrameInstallSession,
+    /// (profile ID, configuration path) the OnFrame session was bound under.
+    onframe_profile_key: Option<(String, PathBuf)>,
+    action_replay_input: String,
+    action_replay_target: CheatTargetPlatform,
+    action_replay_result: Option<CheatCodeDecodeResult>,
+}
+
+impl UserCheatImportPageState {
+    fn poll(&mut self, context: &egui::Context) {
+        let Some((generation, receiver)) = self.task.as_ref() else {
+            return;
+        };
+        let generation = *generation;
+        let (result, pack) = match receiver.try_recv() {
+            Ok(TaskResult::Scanned(result, pack)) => (result, pack),
+            Err(TryRecvError::Empty) => {
+                context.request_repaint_after(std::time::Duration::from_millis(100));
+                return;
+            }
+            Err(TryRecvError::Disconnected) => (
+                Err(UserCheatImportError::Io {
+                    path: PathBuf::new(),
+                    message: "The cheat import worker stopped unexpectedly.".to_string(),
+                }),
+                None,
+            ),
+        };
+        self.task = None;
+        if generation != self.generation {
+            return;
+        }
+        let source = match &self.state {
+            ImportState::Scanning { source } => source.clone(),
+            _ => PathBuf::new(),
+        };
+        match result {
+            Ok(report) => {
+                self.report_context_key = self.context_key.clone();
+                self.selected_candidate = None;
+                self.pack_preview = pack;
+                self.state = ImportState::Ready { report };
+            }
+            Err(error) => {
+                self.pack_preview = None;
+                self.state = ImportState::Failed {
+                    source,
+                    message: error.to_string(),
+                };
+            }
+        }
+        context.request_repaint();
+    }
+
+    fn start_scan(
+        &mut self,
+        context: &egui::Context,
+        source: PathBuf,
+        is_directory: bool,
+        library: Vec<UserCheatLibraryGame>,
+    ) {
+        self.generation = self.generation.wrapping_add(1);
+        let generation = self.generation;
+        let (sender, receiver) = mpsc::channel();
+        self.task = Some((generation, receiver));
+        self.last_source = Some((source.clone(), is_directory));
+        self.state = ImportState::Scanning {
+            source: source.clone(),
+        };
+        let context = context.clone();
+        self.pack_preview = None;
+        thread::spawn(move || {
+            let result = if is_directory {
+                scan_user_cheat_directory(&source, &library)
+            } else {
+                scan_user_cheat_file(&source, &library)
+            };
+            // Bounded, read-only, nothing is enabled. No verified identity
+            // facts are supplied here, so matches stay title-level at best.
+            let pack = is_directory.then(|| {
+                let catalogue: Vec<CheatPackCatalogueGame> = library
+                    .iter()
+                    .map(|game| CheatPackCatalogueGame {
+                        game: game.clone(),
+                        facts: Vec::new(),
+                        revision: None,
+                    })
+                    .collect();
+                preview_cheat_pack(
+                    &source,
+                    &catalogue,
+                    &BTreeMap::new(),
+                    &BTreeSet::new(),
+                    &CheatPackLimits::default(),
+                )
+                .map(Box::new)
+                .map_err(|error| error.to_string())
+            });
+            let _ = sender.send(TaskResult::Scanned(result, pack));
+            context.request_repaint();
+        });
+    }
+
+    /// When the pending local-file confirmation was clicked, while its
+    /// preview is still pending.
+    pub(crate) fn local_install_confirm_requested_at(&self) -> Option<std::time::Instant> {
+        self.local_install_confirm_requested_at
+            .filter(|_| self.has_pending_local_install_preview())
+    }
+
+    /// The "Confirm install" click. Ignored while a confirmation is already
+    /// being checked (no duplicate installs); applied only after a fresh
+    /// re-check.
+    fn request_local_install_confirm(&mut self) -> bool {
+        if self.local_install_confirm_requested_at.is_some()
+            || !self.has_pending_local_install_preview()
+        {
+            return false;
+        }
+        self.local_install_confirm_requested_at = Some(std::time::Instant::now());
+        self.local_install_confirm_notice = None;
+        true
+    }
+
+    /// Supplies this frame's validation of the pending confirmation.
+    pub(crate) fn set_local_install_confirm_validation(&mut self, validation: Option<bool>) {
+        self.local_install_confirm_validation = validation;
+    }
+
+    /// Advances the pending confirmation: installs once validated, keeps
+    /// waiting (without blocking) while the re-check runs, and otherwise
+    /// says clearly why nothing was installed.
+    fn advance_local_install_confirm(&mut self, page_was_left: bool, context: &egui::Context) {
+        let validation = self.local_install_confirm_validation.take();
+        let Some(requested_at) = self.local_install_confirm_requested_at else {
+            return;
+        };
+        if !self.has_pending_local_install_preview() {
+            // Cancelled or blocked (its own message explains why).
+            self.local_install_confirm_requested_at = None;
+            return;
+        }
+        if page_was_left {
+            self.local_install_confirm_requested_at = None;
+            self.local_install_confirm_notice = Some(LOCAL_CONFIRM_INTERRUPTED);
+            return;
+        }
+        // An expired confirmation never installs, even if its re-check
+        // finishes late; a changed target still blocks below.
+        if requested_at.elapsed() >= LOCAL_CONFIRM_VALIDATION_TIMEOUT && validation != Some(false) {
+            self.local_install_confirm_requested_at = None;
+            self.local_install_confirm_notice = Some(LOCAL_CONFIRM_TIMED_OUT);
+            return;
+        }
+        match validation {
+            Some(true) => {
+                self.local_install_confirm_requested_at = None;
+                self.confirm_local_apply();
+            }
+            Some(false) => {
+                self.local_install_confirm_requested_at = None;
+                if let LocalInstallStage::Preview { source_path, .. } = &self.local_install {
+                    self.local_install = LocalInstallStage::Blocked {
+                        source_path: source_path.clone(),
+                        message: LOCAL_INSTALL_TARGET_CHANGED.to_string(),
+                    };
+                }
+            }
+            None => context.request_repaint_after(std::time::Duration::from_millis(100)),
+        }
+    }
+
+    /// Whether a local-file install preview is waiting for confirmation.
+    pub(crate) fn has_pending_local_install_preview(&self) -> bool {
+        matches!(self.local_install, LocalInstallStage::Preview { .. })
+    }
+
+    /// Cancels a local-file install preview whose destination is no longer
+    /// the current emulator target (another emulator, core or profile was
+    /// chosen after it was built), so "Confirm install" can never write to
+    /// the previous target.
+    fn invalidate_stale_local_install(
+        &mut self,
+        local_install_context: Option<&LocalCheatInstallContext>,
+    ) {
+        let LocalInstallStage::Preview {
+            source_path,
+            preview,
+            ..
+        } = &self.local_install
+        else {
+            return;
+        };
+        if local_preview_targets_current_destination(
+            &preview.destination_request,
+            local_install_context.and_then(|context| context.destination.as_ref()),
+        ) {
+            return;
+        }
+        self.local_install = LocalInstallStage::Blocked {
+            source_path: source_path.clone(),
+            message: LOCAL_INSTALL_TARGET_CHANGED.to_string(),
+        };
+    }
+
+    /// Drops any OnFrame binding/preview when the Dolphin target changed:
+    /// a different profile, or the same profile ID pointing at another
+    /// configuration path.
+    fn sync_onframe_target(&mut self, key: Option<(String, PathBuf)>) {
+        if self.onframe_profile_key != key {
+            self.onframe_profile_key = key;
+            self.onframe_install.reset_for_profile_change();
+        }
+    }
+
+    /// PCSX2/Dolphin/Xenia counterpart of
+    /// [`Self::invalidate_stale_local_install`]: a pending preview whose
+    /// profile or configuration path is no longer the current target (or
+    /// that has no target any more) is cancelled.
+    fn invalidate_stale_native_local_installs(&mut self) {
+        let blocked = |source_path: &PathBuf| {
+            (
+                source_path.clone(),
+                LOCAL_INSTALL_TARGET_CHANGED.to_string(),
+            )
+        };
+        if let LocalPcsx2InstallStage::Preview {
+            source_path,
+            profile,
+            ..
+        } = &self.local_pcsx2_install
+            && !native_target_is_current(
+                &profile.profile_id,
+                &profile.configuration_path,
+                self.local_pcsx2_current_target.as_ref(),
+            )
+        {
+            let (source_path, message) = blocked(source_path);
+            self.local_pcsx2_install = LocalPcsx2InstallStage::Blocked {
+                source_path,
+                message,
+            };
+        }
+        if let LocalDolphinInstallStage::Preview {
+            source_path,
+            configuration_path,
+            profile_id,
+            ..
+        } = &self.local_dolphin_install
+            && !native_target_is_current(
+                profile_id,
+                configuration_path,
+                self.local_dolphin_current_target.as_ref(),
+            )
+        {
+            let (source_path, message) = blocked(source_path);
+            self.local_dolphin_install = LocalDolphinInstallStage::Blocked {
+                source_path,
+                message,
+            };
+        }
+        if let LocalXeniaInstallStage::Preview {
+            source_path,
+            profile_id,
+            configuration_path,
+            ..
+        } = &self.local_xenia_install
+            && !native_target_is_current(
+                profile_id,
+                configuration_path,
+                self.local_xenia_current_target.as_ref(),
+            )
+        {
+            let (source_path, message) = blocked(source_path);
+            self.local_xenia_install = LocalXeniaInstallStage::Blocked {
+                source_path,
+                message,
+            };
+        }
+    }
+
+    fn invalidate_if_context_changed(&mut self, context_key: Option<String>) {
+        if self.context_key == context_key {
+            return;
+        }
+        self.context_key = context_key;
+        // A different game never inherits another game's pending install.
+        self.local_install_confirm_requested_at = None;
+        self.local_install_confirm_notice = None;
+        self.local_pcsx2_current_target = None;
+        self.local_dolphin_current_target = None;
+        self.local_xenia_current_target = None;
+        self.local_install_current_destination = None;
+        self.invalidate_stale_native_local_installs();
+        if let LocalInstallStage::Preview { source_path, .. } = &self.local_install {
+            self.local_install = LocalInstallStage::Blocked {
+                source_path: source_path.clone(),
+                message: LOCAL_INSTALL_TARGET_CHANGED.to_string(),
+            };
+        }
+        self.onframe_install.reset_for_game_identity_change();
+        if self.report_context_key != self.context_key {
+            self.generation = self.generation.wrapping_add(1);
+            self.task = None;
+        }
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn show(
+        &mut self,
+        ui: &mut egui::Ui,
+        context: &egui::Context,
+        library: &[UserCheatLibraryGame],
+        selected_game: Option<(&str, &str)>,
+        selected_platform: Option<&str>,
+        local_install_context: Option<&LocalCheatInstallContext>,
+        local_pcsx2_install_context: Option<&LocalPcsx2InstallContext>,
+        local_dolphin_install_context: Option<&LocalDolphinInstallContext>,
+        local_xenia_install_context: Option<&LocalXeniaInstallContext>,
+    ) {
+        let context_key = selected_game.map(|(id, _)| id.to_string());
+        self.invalidate_if_context_changed(context_key);
+        let converter_context_key = selected_game
+            .map(|(id, _)| format!("{id}|{}", selected_platform.unwrap_or("unknown platform")));
+        self.sync_converter_context(converter_context_key);
+        self.local_install_current_destination =
+            local_install_context.and_then(|context| context.destination.clone());
+        self.invalidate_stale_local_install(local_install_context);
+        self.local_pcsx2_current_target = local_pcsx2_install_context
+            .and_then(|context| context.profile.as_ref())
+            .map(|profile| {
+                (
+                    profile.profile_id.clone(),
+                    profile.configuration_path.clone(),
+                )
+            });
+        self.local_dolphin_current_target = local_dolphin_install_context.map(|context| {
+            (
+                context.profile_id.clone(),
+                context.configuration_path.clone(),
+            )
+        });
+        self.local_xenia_current_target = local_xenia_install_context
+            .and_then(|context| context.profile.as_ref())
+            .map(|profile| {
+                (
+                    profile.profile_id.clone(),
+                    profile.configuration_path.clone(),
+                )
+            });
+        self.invalidate_stale_native_local_installs();
+        let pass = context.cumulative_pass_nr();
+        let page_was_left = self.last_shown_pass.is_some_and(|last| pass > last + 1);
+        self.last_shown_pass = Some(pass);
+        self.advance_local_install_confirm(page_was_left, context);
+        self.sync_onframe_target(local_dolphin_install_context.map(|context| {
+            (
+                context.profile_id.clone(),
+                context.configuration_path.clone(),
+            )
+        }));
+        self.poll(context);
+
+        widgets::section_header(
+            ui,
+            "Your cheat files",
+            Some("Review local .cht and .pnach files without changing emulator files."),
+        );
+        widgets::card(ui, |ui| {
+            ui.label("Imported for review only. EmuWiz has not changed your emulator files.");
+            ui.label(
+                "Local install is available for RetroArch .cht, PCSX2 .pnach, Dolphin \
+                 Gecko/Action Replay .ini files, and Xenia .patch.toml files.",
+            );
+            if let Some((_, title)) = selected_game {
+                widgets::status_badge(
+                    ui,
+                    format!("Selected game: {title}"),
+                    widgets::StatusTone::Info,
+                );
+            }
+            ui.horizontal_wrapped(|ui| {
+                let can_start = self.task.is_none();
+                if widgets::action_button(
+                    ui,
+                    "Add cheat file",
+                    widgets::ActionStyle::Primary,
+                    can_start,
+                )
+                .clicked()
+                    && let Some(path) = rfd::FileDialog::new()
+                        .add_filter("Cheat files", &["cht", "pnach"])
+                        .pick_file()
+                {
+                    self.start_scan(context, path, false, library.to_vec());
+                }
+                if widgets::action_button(
+                    ui,
+                    "Add cheat folder",
+                    widgets::ActionStyle::Secondary,
+                    can_start,
+                )
+                .clicked()
+                    && let Some(path) = rfd::FileDialog::new().pick_folder()
+                {
+                    self.start_scan(context, path, true, library.to_vec());
+                }
+                if let Some((source, is_directory)) = self.last_source.clone()
+                    && widgets::action_button(
+                        ui,
+                        "Scan again",
+                        widgets::ActionStyle::Secondary,
+                        can_start,
+                    )
+                    .clicked()
+                {
+                    self.start_scan(context, source, is_directory, library.to_vec());
+                }
+                if matches!(
+                    &self.state,
+                    ImportState::Ready { .. } | ImportState::Failed { .. }
+                ) && widgets::action_button(
+                    ui,
+                    "Clear results",
+                    widgets::ActionStyle::Quiet,
+                    true,
+                )
+                .clicked()
+                {
+                    self.generation = self.generation.wrapping_add(1);
+                    self.task = None;
+                    self.state = ImportState::Idle;
+                    self.pack_preview = None;
+                    self.report_context_key = None;
+                    self.selected_candidate = None;
+                }
+            });
+
+            let report = match &self.state {
+                ImportState::Ready { report } => Some(report.clone()),
+                _ => None,
+            };
+            match &self.state {
+                ImportState::Idle => {
+                    ui.label("Choose a cheat file or folder to scan it safely.");
+                }
+                ImportState::Scanning { source } => {
+                    ui.horizontal(|ui| {
+                        ui.spinner();
+                        ui.label(format!("Scanning {}…", source.display()));
+                    });
+                }
+                ImportState::Failed { source, message } => {
+                    widgets::banner(
+                        ui,
+                        "Cheat scan failed",
+                        &format!("{}: {message}", source.display()),
+                        widgets::StatusTone::Blocked,
+                    );
+                }
+                ImportState::Ready { .. } => {
+                    self.show_pack_preview(ui);
+                    if let Some(report) = report.as_ref() {
+                        self.show_report(
+                            ui,
+                            report,
+                            local_install_context,
+                            local_pcsx2_install_context,
+                            local_dolphin_install_context,
+                            local_xenia_install_context,
+                        );
+                    }
+                }
+            }
+            self.show_dolphin_local_install_picker(ui, context, local_dolphin_install_context);
+        });
+        self.show_local_install_panel(ui);
+        self.show_local_pcsx2_install_panel(ui);
+        self.show_local_dolphin_install_panel(ui);
+        self.show_onframe_install_panel(ui, local_dolphin_install_context);
+        self.show_local_xenia_install_picker(ui, local_xenia_install_context);
+        self.show_local_xenia_install_panel(ui);
+        self.show_converter(ui, selected_game, selected_platform);
+        self.show_action_replay_decoder_panel(ui);
+    }
+
+    /// "What EmuWiz found in this folder": a plain summary of the bounded
+    /// pack preview. It never enables, installs or selects anything.
+    fn show_pack_preview(&self, ui: &mut egui::Ui) {
+        match &self.pack_preview {
+            None => {}
+            Some(Err(message)) => widgets::banner(
+                ui,
+                "Could not look through this folder",
+                message,
+                widgets::StatusTone::Warning,
+            ),
+            Some(Ok(preview)) => widgets::card(ui, |ui| {
+                ui.strong("What EmuWiz found in this folder");
+                for (line, warn) in pack_summary_lines(preview) {
+                    if warn {
+                        ui.colored_label(crate::ui::theme::warning(ui), line);
+                    } else {
+                        ui.label(line);
+                    }
+                }
+            }),
+        }
+    }
+
+    fn show_action_replay_decoder_panel(&mut self, ui: &mut egui::Ui) {
+        widgets::section_header(
+            ui,
+            "Action Replay / GameShark decoder",
+            Some(
+                "Local-only clean-room decoding preview; no database, network, or emulator writes.",
+            ),
+        );
+        widgets::card(ui, |ui| {
+            ui.label("Paste raw code lines to inspect format and supported operations.");
+            ui.add(
+                egui::TextEdit::multiline(&mut self.action_replay_input)
+                    .desired_rows(3)
+                    .hint_text("02000000 1234"),
+            );
+            ui.horizontal_wrapped(|ui| {
+                ui.label("Target:");
+                for (label, target) in [
+                    ("GBA", CheatTargetPlatform::GameBoyAdvance),
+                    ("PS2", CheatTargetPlatform::PlayStation2),
+                    ("GameCube", CheatTargetPlatform::GameCube),
+                    ("DS", CheatTargetPlatform::NintendoDs),
+                ] {
+                    ui.selectable_value(&mut self.action_replay_target, target, label);
+                }
+                if widgets::action_button(
+                    ui,
+                    "Decode preview",
+                    widgets::ActionStyle::Secondary,
+                    !self.action_replay_input.trim().is_empty(),
+                )
+                .clicked()
+                {
+                    self.action_replay_result = Some(decode_action_replay(
+                        &self.action_replay_input,
+                        self.action_replay_target.clone(),
+                    ));
+                }
+            });
+            if !self.action_replay_input.trim().is_empty() {
+                let detection = detect_action_replay_format(&self.action_replay_input);
+                ui.label(format!("Detected shape: {:?}", detection.candidates));
+            }
+            if let Some(result) = &self.action_replay_result {
+                let status = result.status();
+                widgets::status_badge(
+                    ui,
+                    format!("Status: {status}"),
+                    if status == "Decoded successfully" {
+                        widgets::StatusTone::Success
+                    } else {
+                        widgets::StatusTone::Warning
+                    },
+                );
+                ui.label(format!("Format: {:?}", result.format));
+                ui.label(format!("Instructions: {}", result.instructions.len()));
+                for instruction in &result.instructions {
+                    ui.label(format!(
+                        "{} -> {:?}",
+                        instruction.original, instruction.operation
+                    ));
+                }
+                for issue in &result.issues {
+                    ui.label(format!("Warning: {:?}", issue));
+                }
+                ui.label(format!(
+                    "Provenance: {} (local-only)",
+                    result.provenance.method
+                ));
+            }
+        });
+    }
+
+    fn show_onframe_install_panel(
+        &mut self,
+        ui: &mut egui::Ui,
+        local_dolphin_install_context: Option<&LocalDolphinInstallContext>,
+    ) {
+        ui.add_space(theme_gap());
+        let Some(context) = local_dolphin_install_context else {
+            return;
+        };
+        let platform = context.platform.clone();
+        let game_id = context.candidate.game_id.clone();
+        let configuration_path = context.configuration_path.clone();
+        let profile_id = context.profile_id.clone();
+        let session = &mut self.onframe_install;
+        widgets::card(ui, |ui| {
+            ui.strong("Install a Dolphin OnFrame cheat");
+            ui.label(
+                "Choose a local OnFrame file, review the exact change, then confirm the install.",
+            );
+            if widgets::action_button(
+                ui,
+                "Choose OnFrame file…",
+                widgets::ActionStyle::Primary,
+                !session.source_candidates.discovering,
+            )
+            .clicked()
+                && let Some(path) = rfd::FileDialog::new()
+                    .add_filter("Dolphin OnFrame", &["ini"])
+                    .pick_file()
+            {
+                session.discover(path, platform.clone());
+            }
+            if session.source_candidates.discovering {
+                ui.spinner();
+                ui.label("Reading OnFrame candidates…");
+            }
+            if let Some(error) = session.source_candidates.discovery_error.as_deref() {
+                widgets::banner(
+                    ui,
+                    "OnFrame file could not be used",
+                    error,
+                    widgets::StatusTone::Blocked,
+                );
+            }
+            let mut clicked_candidate = None;
+            for (index, source) in session.source_candidates.candidates.iter().enumerate() {
+                let selected = session.source_candidates.selected == Some(index);
+                if ui
+                    .selectable_label(
+                        selected,
+                        format!(
+                            "{} — {}",
+                            source.candidate.title,
+                            source.provenance.display()
+                        ),
+                    )
+                    .clicked()
+                {
+                    clicked_candidate = Some(index);
+                }
+            }
+            if let Some(index) = clicked_candidate {
+                session.select_candidate(index);
+            }
+            if session.selected_candidate.is_some()
+                && session.binding.is_none()
+                && ui.button("Bind to verified game").clicked()
+            {
+                session.bind_selected(Some(&game_id), Some(&configuration_path), false);
+            }
+            if let Some(binding) = session.binding.as_ref() {
+                ui.label(format!("Verified game: {}", binding.verified_game_id));
+                ui.label(format!(
+                    "Destination: {}",
+                    binding.gamesettings_destination.display()
+                ));
+                if !binding.refusal_reasons.is_empty() {
+                    for reason in &binding.refusal_reasons {
+                        ui.colored_label(egui::Color32::YELLOW, reason);
+                    }
+                }
+                if session.preview.is_none()
+                    && binding.can_install
+                    && ui.button("Build install preview").clicked()
+                {
+                    session.prepare_preview();
+                }
+            }
+            if let Some(plan) = session.plan.as_ref() {
+                egui::CollapsingHeader::new("Install preview")
+                    .default_open(true)
+                    .show(ui, |ui| {
+                        ui.label(format!("Patch: {}", plan.patch_name));
+                        ui.label(format!("Exact operations: {}", plan.lines.len()));
+                        ui.label(format!("Status: {:?}", plan.status));
+                        for conflict in &plan.conflicts {
+                            ui.colored_label(
+                                egui::Color32::YELLOW,
+                                format!("Conflict: {conflict}"),
+                            );
+                        }
+                        for warning in &plan.warnings {
+                            ui.label(format!("Warning: {warning}"));
+                        }
+                        ui.monospace(plan.new_contents.as_str());
+                    });
+            }
+            match &session.workflow_state {
+                crate::onframe_install_state::OnFrameInstallState::PreviewReady { .. } => {
+                    if ui.button("Review and confirm install").clicked() {
+                        session.request_confirmation();
+                    }
+                }
+                crate::onframe_install_state::OnFrameInstallState::AwaitingConfirmation {
+                    ..
+                } => {
+                    ui.label("This will update Dolphin's GameSettings file after confirmation.");
+                    if ui.button("Confirm Apply").clicked() {
+                        session.apply_confirmed(&profile_id);
+                    }
+                    if ui.button("Cancel").clicked() {
+                        session.workflow_state.cancel_confirmation();
+                    }
+                }
+                crate::onframe_install_state::OnFrameInstallState::Applied {
+                    transaction_id,
+                    ..
+                } => {
+                    widgets::status_badge(ui, "Installed", widgets::StatusTone::Success);
+                    if let Some(transaction_id) = transaction_id {
+                        ui.label(format!("Transaction: {transaction_id}"));
+                    }
+                    if session.rollback_available && ui.button("Undo this install").clicked() {
+                        session.prepare_rollback();
+                    }
+                }
+                crate::onframe_install_state::OnFrameInstallState::RolledBack { .. } => {
+                    widgets::status_badge(ui, "Install undone", widgets::StatusTone::Info);
+                }
+                crate::onframe_install_state::OnFrameInstallState::RecoveryRequired {
+                    detail,
+                    ..
+                } => {
+                    widgets::banner(
+                        ui,
+                        "Recovery required",
+                        detail,
+                        widgets::StatusTone::Blocked,
+                    );
+                }
+                crate::onframe_install_state::OnFrameInstallState::Failed { message } => {
+                    widgets::banner(
+                        ui,
+                        "OnFrame install blocked",
+                        message,
+                        widgets::StatusTone::Blocked,
+                    );
+                }
+                _ => {}
+            }
+            if let Some(rollback) = session.rollback_preview.as_ref() {
+                ui.label("Rollback preview");
+                ui.label(format!("Rollback available: {}", rollback.available));
+                if rollback.available && ui.button("Confirm undo").clicked() {
+                    session.rollback_confirmed();
+                }
+                if ui.button("Cancel undo").clicked() {
+                    session.rollback_preview = None;
+                }
+            }
+        });
+    }
+
+    /// Dolphin's local-file entry point: unlike RetroArch/PCSX2, Dolphin
+    /// cheat files are never scanned or matched from a directory listing
+    /// here - the file the user picks *is* the one installed, bound to the
+    /// already-resolved [`LocalDolphinInstallContext`] for the selected
+    /// game. A dedicated `.ini` file picker keeps this fully independent
+    /// of the generic multi-format import review above.
+    fn show_dolphin_local_install_picker(
+        &mut self,
+        ui: &mut egui::Ui,
+        _context: &egui::Context,
+        local_dolphin_install_context: Option<&LocalDolphinInstallContext>,
+    ) {
+        ui.add_space(theme_gap());
+        widgets::card(ui, |ui| {
+            ui.strong("Install a local Dolphin cheat file (.ini)");
+            ui.label(
+                "The file must declare a [Gecko] and/or [ActionReplay] section, exactly like \
+                 a Dolphin GameSettings file - the same sections Dolphin itself reads.",
+            );
+            let Some(install_context) = local_dolphin_install_context else {
+                ui.label("Select a Dolphin game and an eligible profile in Cheats & Mods to install a local file.");
+                return;
+            };
+            let can_start = matches!(self.local_dolphin_install, LocalDolphinInstallStage::Idle);
+            if widgets::action_button(
+                ui,
+                "Choose a Dolphin cheat file…",
+                widgets::ActionStyle::Primary,
+                can_start,
+            )
+            .clicked()
+                && let Some(path) = rfd::FileDialog::new()
+                    .add_filter("Dolphin GameSettings", &["ini"])
+                    .pick_file()
+            {
+                self.start_local_dolphin_install(
+                    path,
+                    install_context.candidate.clone(),
+                    install_context.configuration_path.clone(),
+                    install_context.profile_id.clone(),
+                );
+            }
+        });
+    }
+
+    fn show_report(
+        &mut self,
+        ui: &mut egui::Ui,
+        report: &UserCheatImportReport,
+        local_install_context: Option<&LocalCheatInstallContext>,
+        local_pcsx2_install_context: Option<&LocalPcsx2InstallContext>,
+        local_dolphin_install_context: Option<&LocalDolphinInstallContext>,
+        local_xenia_install_context: Option<&LocalXeniaInstallContext>,
+    ) {
+        if self.report_context_key != self.context_key {
+            widgets::banner(
+                ui,
+                "Results need a new scan",
+                "The selected game or library context changed. Scan again to refresh matching evidence.",
+                widgets::StatusTone::Warning,
+            );
+            return;
+        }
+        let exact = report
+            .candidates
+            .iter()
+            .filter(|c| c.match_state == UserCheatMatchState::Exact)
+            .count();
+        let strong = report
+            .candidates
+            .iter()
+            .filter(|c| c.match_state == UserCheatMatchState::Strong)
+            .count();
+        let possible = report
+            .candidates
+            .iter()
+            .filter(|c| c.match_state == UserCheatMatchState::Possible)
+            .count();
+        let ambiguous = report
+            .candidates
+            .iter()
+            .filter(|c| c.match_state == UserCheatMatchState::Ambiguous)
+            .count();
+        let unmatched = report
+            .candidates
+            .iter()
+            .filter(|c| c.match_state == UserCheatMatchState::NoMatch)
+            .count();
+        ui.label(format!(
+            "Scanned {} file(s): {} supported, {} exact, {} strong, {} possible, {} ambiguous, {} unmatched.",
+            report.files_visited, report.supported_files, exact, strong, possible, ambiguous, unmatched
+        ));
+        if report.truncated {
+            widgets::banner(
+                ui,
+                "Scan limit reached",
+                "The scan was safely truncated by its bounded file, byte, depth, or warning limits.",
+                widgets::StatusTone::Warning,
+            );
+        }
+        self.show_candidates(
+            ui,
+            report,
+            "Matched",
+            local_install_context,
+            local_pcsx2_install_context,
+            local_dolphin_install_context,
+            local_xenia_install_context,
+            |candidate| {
+                matches!(
+                    candidate.match_state,
+                    UserCheatMatchState::Exact | UserCheatMatchState::Strong
+                )
+            },
+        );
+        self.show_candidates(
+            ui,
+            report,
+            "Possible matches",
+            None,
+            None,
+            local_dolphin_install_context,
+            local_xenia_install_context,
+            |candidate| candidate.match_state == UserCheatMatchState::Possible,
+        );
+        self.show_candidates(
+            ui,
+            report,
+            "Ambiguous matches",
+            None,
+            None,
+            local_dolphin_install_context,
+            local_xenia_install_context,
+            |candidate| candidate.match_state == UserCheatMatchState::Ambiguous,
+        );
+        self.show_candidates(
+            ui,
+            report,
+            "Unmatched",
+            None,
+            None,
+            local_dolphin_install_context,
+            local_xenia_install_context,
+            |candidate| candidate.match_state == UserCheatMatchState::NoMatch,
+        );
+        self.show_candidates(
+            ui,
+            report,
+            "Unsupported or rejected",
+            None,
+            None,
+            None,
+            None,
+            |candidate| candidate.match_state == UserCheatMatchState::Unsupported,
+        );
+        if !report.duplicates.is_empty() {
+            egui::CollapsingHeader::new(format!("Duplicate files ({})", report.duplicates.len()))
+                .default_open(false)
+                .show(ui, |ui| {
+                    for duplicate in &report.duplicates {
+                        ui.label(format!("Same SHA-256: {}", duplicate.source_sha256));
+                        for path in &duplicate.paths {
+                            ui.label(format!("  {}", path.display()));
+                        }
+                        ui.label("Duplicate file — both paths were retained for review.");
+                    }
+                });
+        }
+        if !report.diagnostics.is_empty() {
+            egui::CollapsingHeader::new(format!("Diagnostics ({})", report.diagnostics.len()))
+                .default_open(false)
+                .show(ui, |ui| {
+                    for diagnostic in &report.diagnostics {
+                        ui.label(format_diagnostic(diagnostic));
+                    }
+                });
+        }
+        egui::CollapsingHeader::new("Technical details")
+            .default_open(self.technical_details)
+            .show(ui, |ui| {
+                self.technical_details = true;
+                ui.label(format!("Scan root: {}", report.scanned_root.display()));
+                ui.label(format!("Files visited: {}", report.files_visited));
+                ui.label(format!("Bytes read: {}", report.bytes_read));
+                ui.label(format!("Read-only: {}", report.read_only));
+                ui.label(format!("Writes performed: {}", report.writes_performed));
+                ui.label(format!("Apply available: {}", report.apply_available));
+            });
+    }
+
+    fn show_candidates<F>(
+        &mut self,
+        ui: &mut egui::Ui,
+        report: &UserCheatImportReport,
+        heading: &str,
+        local_install_context: Option<&LocalCheatInstallContext>,
+        local_pcsx2_install_context: Option<&LocalPcsx2InstallContext>,
+        local_dolphin_install_context: Option<&LocalDolphinInstallContext>,
+        local_xenia_install_context: Option<&LocalXeniaInstallContext>,
+        filter: F,
+    ) where
+        F: Fn(&UserCheatCandidate) -> bool,
+    {
+        let indexes: Vec<usize> = report
+            .candidates
+            .iter()
+            .enumerate()
+            .filter(|(_, c)| filter(c))
+            .map(|(i, _)| i)
+            .collect();
+        if indexes.is_empty() {
+            return;
+        }
+        egui::CollapsingHeader::new(format!("{heading} ({})", indexes.len()))
+            .default_open(true)
+            .show(ui, |ui| {
+                for index in indexes {
+                    let candidate = &report.candidates[index];
+                    widgets::card(ui, |ui| {
+                        ui.horizontal_wrapped(|ui| {
+                            ui.strong(candidate.provenance.original_filename.as_str());
+                            widgets::status_badge(ui, match_label(candidate.match_state), match_tone(candidate.match_state));
+                            if ui.button(if self.selected_candidate == Some(index) { "Hide details" } else { "View details" }).clicked() {
+                                self.selected_candidate = (self.selected_candidate != Some(index)).then_some(index);
+                            }
+                        });
+                        ui.label(format!("{} cheat(s) found in {}.", candidate.cheat_count, format_label(candidate.format)));
+                        ui.label(match_explanation(candidate.match_state));
+                        if let Some(game) = candidate.matches.first() {
+                            ui.label(format!("Matched game: {}", game.game_title));
+                        }
+                        if self.selected_candidate == Some(index) {
+                            ui.label(format!("Source: {}", candidate.provenance.original_path.display()));
+                            ui.label(format!("SHA-256: {}", candidate.provenance.source_sha256));
+                            for warning in &candidate.parser_warnings { ui.label(format!("Warning: {warning}")); }
+                            for game in &candidate.matches {
+                                ui.label(format!("Evidence for {}: {}", game.game_title, evidence_text(&game.evidence)));
+                            }
+                            ui.label("Individual cheat names are not exposed by the current bounded import API.");
+                            ui.label("No files were installed or changed.");
+                        }
+                        match candidate.format {
+                            UserCheatFormat::RetroarchCht => {
+                                self.show_install_action(ui, candidate, local_install_context);
+                            }
+                            UserCheatFormat::Pcsx2Pnach => {
+                                self.show_pcsx2_install_action(
+                                    ui,
+                                    candidate,
+                                    local_pcsx2_install_context,
+                                );
+                            }
+                            UserCheatFormat::DolphinGameSettingsIni => {
+                                self.show_scanned_dolphin_install_action(
+                                    ui,
+                                    candidate,
+                                    local_dolphin_install_context,
+                                );
+                            }
+                            UserCheatFormat::XeniaPatchToml => {
+                                self.show_scanned_xenia_install_action(
+                                    ui,
+                                    candidate,
+                                    local_xenia_install_context,
+                                );
+                            }
+                        }
+                    });
+                }
+            });
+    }
+
+    /// The install action for exactly one matched RetroArch `.cht`
+    /// candidate. Everything downstream of the click - discovery, matching,
+    /// preview, apply, and undo - is the same, unmodified `cheat_journey`
+    /// pipeline the trusted-catalogue flow already uses; this only supplies
+    /// the one file the user picked and the already-bound game identity.
+    fn show_install_action(
+        &mut self,
+        ui: &mut egui::Ui,
+        candidate: &UserCheatCandidate,
+        local_install_context: Option<&LocalCheatInstallContext>,
+    ) {
+        let Some(install_context) = local_install_context else {
+            ui.label("Select a game in Cheats & Mods to install this file.");
+            return;
+        };
+        let Some(destination) = install_context.destination.as_ref() else {
+            ui.label(
+                "Select an eligible RetroArch profile with a resolved cheat directory (Stage 1) before installing a local file.",
+            );
+            return;
+        };
+        let path = candidate.provenance.original_path.clone();
+        if ui.button("Install this cheat file").clicked() {
+            self.start_local_install(path, &install_context.game, destination);
+        }
+    }
+
+    fn start_local_install(
+        &mut self,
+        source_path: PathBuf,
+        game: &CheatJourneyGameIdentity,
+        destination: &CheatDestinationRequest,
+    ) {
+        let found = match discover_local_retroarch_cheat_file(
+            &HostReadOnlyFilesystem,
+            &source_path,
+            game,
+            &CheatCandidateOptions::default(),
+        ) {
+            Ok(found) => found,
+            Err(error) => {
+                self.local_install = LocalInstallStage::Blocked {
+                    source_path,
+                    message: error.to_string(),
+                };
+                return;
+            }
+        };
+        let Some(candidate) = found.candidate() else {
+            self.local_install = LocalInstallStage::Blocked {
+                source_path,
+                message: "This file could not be read back as a supported cheat file.".to_string(),
+            };
+            return;
+        };
+        if !candidate.manually_selectable {
+            let evidence = candidate
+                .evidence
+                .iter()
+                .map(|entry| entry.detail.clone())
+                .collect::<Vec<_>>()
+                .join("; ");
+            self.local_install = LocalInstallStage::Blocked {
+                source_path,
+                message: format!(
+                    "Not installable for the selected game ({:?}). {evidence}",
+                    candidate.classification
+                ),
+            };
+            return;
+        }
+        let mut selection = match select_cheat_journey_candidate(
+            &found.discovery,
+            &found.location.catalogue_root,
+            &found.location.catalogue_relative_path,
+        ) {
+            Ok(selection) => selection,
+            Err(error) => {
+                self.local_install = LocalInstallStage::Blocked {
+                    source_path,
+                    message: error.to_string(),
+                };
+                return;
+            }
+        };
+        selection.cheat_selection.select_all();
+        if selection.cheat_selection.selected_count() == 0 {
+            self.local_install = LocalInstallStage::Blocked {
+                source_path,
+                message: "This file has no cheats that can be safely selected.".to_string(),
+            };
+            return;
+        }
+        match preview_cheat_journey(
+            &selection,
+            &found.location.catalogue_root,
+            destination.clone(),
+            "retroarch-main",
+            "local file",
+        ) {
+            Ok(preview) => {
+                self.local_install = LocalInstallStage::Preview {
+                    source_path,
+                    catalogue_root: found.location.catalogue_root,
+                    preview: Box::new(preview),
+                };
+                self.local_install_confirm_requested_at = None;
+                self.local_install_confirm_notice = None;
+            }
+            Err(error) => {
+                self.local_install = LocalInstallStage::Blocked {
+                    source_path,
+                    message: error.to_string(),
+                };
+            }
+        }
+    }
+
+    fn confirm_local_apply(&mut self) {
+        let LocalInstallStage::Preview {
+            source_path,
+            catalogue_root,
+            preview,
+        } = std::mem::take(&mut self.local_install)
+        else {
+            return;
+        };
+        // Revalidated immediately before writing: a confirmation made for a
+        // previous emulator, core or cheat folder never writes.
+        if !local_preview_targets_current_destination(
+            &preview.destination_request,
+            self.local_install_current_destination.as_ref(),
+        ) {
+            self.local_install = LocalInstallStage::Blocked {
+                source_path,
+                message: LOCAL_INSTALL_TARGET_CHANGED.to_string(),
+            };
+            return;
+        }
+        let history_root = match default_shared_history_root() {
+            Ok(root) => root,
+            Err(error) => {
+                self.local_install = LocalInstallStage::Error {
+                    message: format!("History root unavailable: {}", error.detail),
+                };
+                return;
+            }
+        };
+        let backup_root = match default_shared_backup_root() {
+            Ok(root) => root,
+            Err(error) => {
+                self.local_install = LocalInstallStage::Error {
+                    message: format!("Backup root unavailable: {}", error.detail),
+                };
+                return;
+            }
+        };
+        let staging_root = match crate::default_generated_cheat_staging_root() {
+            Ok(root) => root,
+            Err(message) => {
+                self.local_install = LocalInstallStage::Error { message };
+                return;
+            }
+        };
+        let timestamp = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|duration| duration.as_secs())
+            .unwrap_or(0);
+        let destination_root = preview.destination_request.profile_cheat_root.clone();
+        match apply_cheat_journey(
+            &preview,
+            &catalogue_root,
+            &CheatJourneyApplyApproval {
+                preview_id: preview.preview_id.clone(),
+                approved: true,
+                replacement_approved: matches!(
+                    preview.action,
+                    CheatJourneyPreviewAction::ReplaceExisting
+                ),
+            },
+            &CheatJourneyApplyOptions {
+                staging_root,
+                operation_id: generate_shared_operation_id(),
+                timestamp_unix_seconds: timestamp,
+                history_root,
+                backup_root,
+            },
+        ) {
+            Ok(applied) => {
+                self.local_install = LocalInstallStage::Applied {
+                    destination_root,
+                    journal_path: applied.result.journal_path,
+                    transaction_id: applied.transaction_id,
+                };
+            }
+            Err(error) => {
+                self.local_install = LocalInstallStage::Error {
+                    message: error.to_string(),
+                };
+            }
+        }
+    }
+
+    fn start_local_undo(&mut self) {
+        let LocalInstallStage::Applied {
+            destination_root,
+            journal_path,
+            transaction_id,
+        } = std::mem::take(&mut self.local_install)
+        else {
+            return;
+        };
+        let Some(journal_path) = journal_path else {
+            self.local_install = LocalInstallStage::Error {
+                message: "No transaction journal was recorded for this apply.".to_string(),
+            };
+            return;
+        };
+        let backup_root = match default_shared_backup_root() {
+            Ok(root) => root,
+            Err(error) => {
+                self.local_install = LocalInstallStage::Error {
+                    message: format!("Backup root unavailable: {}", error.detail),
+                };
+                return;
+            }
+        };
+        let preview = preview_cheat_journey_undo(
+            &transaction_id,
+            &journal_path,
+            &destination_root,
+            &backup_root,
+        );
+        self.local_install = LocalInstallStage::UndoPreview {
+            destination_root,
+            journal_path,
+            transaction_id,
+            preview: Box::new(preview),
+        };
+    }
+
+    fn confirm_local_undo(&mut self) {
+        let LocalInstallStage::UndoPreview { preview, .. } =
+            std::mem::take(&mut self.local_install)
+        else {
+            return;
+        };
+        let history_root = match default_shared_history_root() {
+            Ok(root) => root,
+            Err(error) => {
+                self.local_install = LocalInstallStage::Error {
+                    message: format!("History root unavailable: {}", error.detail),
+                };
+                return;
+            }
+        };
+        let backup_root = match default_shared_backup_root() {
+            Ok(root) => root,
+            Err(error) => {
+                self.local_install = LocalInstallStage::Error {
+                    message: format!("Backup root unavailable: {}", error.detail),
+                };
+                return;
+            }
+        };
+        let timestamp = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|duration| duration.as_secs())
+            .unwrap_or(0);
+        match undo_cheat_journey(
+            &preview,
+            &CheatJourneyUndoOptions {
+                confirmation: CheatJourneyUndoConfirmation {
+                    preview_id: preview.preview.preview_id.clone(),
+                    approved: true,
+                },
+                rollback_operation_id: generate_shared_operation_id(),
+                timestamp_unix_seconds: timestamp,
+                history_root,
+                backup_root,
+            },
+        ) {
+            Ok(result) if result.status == SharedApplyStatus::Success => {
+                self.local_install = LocalInstallStage::Done {
+                    message:
+                        "The installed cheat file was removed and the prior state was restored."
+                            .to_string(),
+                };
+            }
+            Ok(result) => {
+                self.local_install = LocalInstallStage::Error {
+                    message: format!("Undo did not fully succeed: {:?}", result.status),
+                };
+            }
+            Err(error) => {
+                self.local_install = LocalInstallStage::Error {
+                    message: error.to_string(),
+                };
+            }
+        }
+    }
+
+    /// Takes ownership of the current stage before rendering it so the
+    /// action buttons below (which need `&mut self` to advance the state
+    /// machine) never conflict with a live borrow of `self.local_install`.
+    /// Every arm puts a stage back before returning.
+    fn show_local_install_panel(&mut self, ui: &mut egui::Ui) {
+        let stage = std::mem::take(&mut self.local_install);
+        match stage {
+            LocalInstallStage::Idle => {}
+            LocalInstallStage::Blocked {
+                source_path,
+                message,
+            } => {
+                ui.add_space(theme_gap());
+                widgets::banner(
+                    ui,
+                    &format!("Cannot install {}", source_path.display()),
+                    &message,
+                    widgets::StatusTone::Blocked,
+                );
+                if ui.button("Dismiss").clicked() {
+                    self.local_install = LocalInstallStage::Idle;
+                } else {
+                    self.local_install = LocalInstallStage::Blocked {
+                        source_path,
+                        message,
+                    };
+                }
+            }
+            LocalInstallStage::Preview {
+                source_path,
+                catalogue_root,
+                preview,
+            } => {
+                ui.add_space(theme_gap());
+                let mut confirmed = false;
+                let mut cancelled = false;
+                widgets::card(ui, |ui| {
+                    ui.strong("Review before installing");
+                    ui.label(format!("Source file: {}", source_path.display()));
+                    ui.label(format!(
+                        "Destination: {}",
+                        preview.destination.path.display()
+                    ));
+                    ui.label(match preview.action {
+                        CheatJourneyPreviewAction::InstallNew => {
+                            "This will create a new cheat file at the destination above.".to_string()
+                        }
+                        CheatJourneyPreviewAction::AlreadyInstalled => {
+                            "The exact same content is already installed at this destination - installing again changes nothing.".to_string()
+                        }
+                        CheatJourneyPreviewAction::ReplaceExisting => {
+                            "A different cheat file already exists at this destination. Installing will back it up and replace it.".to_string()
+                        }
+                    });
+                    egui::CollapsingHeader::new("Parsed contents to be written")
+                        .default_open(false)
+                        .show(ui, |ui| {
+                            ui.monospace(preview.rendered_contents.as_str());
+                        });
+                    if let Some(notice) = self.local_install_confirm_notice {
+                        widgets::banner(
+                            ui,
+                            "Nothing was installed",
+                            notice,
+                            widgets::StatusTone::Warning,
+                        );
+                    }
+                    let checking = self.local_install_confirm_requested_at.is_some();
+                    ui.horizontal(|ui| {
+                        // One confirmation at a time: repeated clicks while
+                        // it is being checked do nothing.
+                        if widgets::action_button(
+                            ui,
+                            if checking {
+                                "Checking your emulator setup..."
+                            } else {
+                                "Confirm install"
+                            },
+                            widgets::ActionStyle::Primary,
+                            !checking,
+                        )
+                        .clicked()
+                        {
+                            confirmed = true;
+                        }
+                        if ui.button("Cancel").clicked() {
+                            cancelled = true;
+                        }
+                    });
+                });
+                if confirmed {
+                    self.local_install = LocalInstallStage::Preview {
+                        source_path,
+                        catalogue_root,
+                        preview,
+                    };
+                    self.request_local_install_confirm();
+                    ui.ctx().request_repaint();
+                } else if cancelled {
+                    self.local_install_confirm_requested_at = None;
+                    self.local_install_confirm_notice = None;
+                    self.local_install = LocalInstallStage::Idle;
+                } else {
+                    self.local_install = LocalInstallStage::Preview {
+                        source_path,
+                        catalogue_root,
+                        preview,
+                    };
+                }
+            }
+            LocalInstallStage::Applied {
+                destination_root,
+                journal_path,
+                transaction_id,
+            } => {
+                ui.add_space(theme_gap());
+                let mut undo = false;
+                let mut dismissed = false;
+                widgets::card(ui, |ui| {
+                    widgets::status_badge(ui, "Installed", widgets::StatusTone::Success);
+                    if let Some(journal_path) = journal_path.as_ref() {
+                        ui.label(format!("Transaction journal: {}", journal_path.display()));
+                    }
+                    ui.horizontal(|ui| {
+                        if ui.button("Undo this install").clicked() {
+                            undo = true;
+                        }
+                        if ui.button("Dismiss").clicked() {
+                            dismissed = true;
+                        }
+                    });
+                });
+                if undo {
+                    self.local_install = LocalInstallStage::Applied {
+                        destination_root,
+                        journal_path,
+                        transaction_id,
+                    };
+                    self.start_local_undo();
+                } else if dismissed {
+                    self.local_install = LocalInstallStage::Idle;
+                } else {
+                    self.local_install = LocalInstallStage::Applied {
+                        destination_root,
+                        journal_path,
+                        transaction_id,
+                    };
+                }
+            }
+            LocalInstallStage::UndoPreview {
+                destination_root,
+                journal_path,
+                transaction_id,
+                preview,
+            } => {
+                ui.add_space(theme_gap());
+                let mut confirmed = false;
+                let mut cancelled = false;
+                widgets::card(ui, |ui| {
+                    ui.strong("Confirm undo");
+                    ui.label("This will remove the installed cheat file and restore any prior file that was backed up.");
+                    ui.horizontal(|ui| {
+                        if widgets::action_button(
+                            ui,
+                            "Confirm undo",
+                            widgets::ActionStyle::Primary,
+                            true,
+                        )
+                        .clicked()
+                        {
+                            confirmed = true;
+                        }
+                        if ui.button("Cancel").clicked() {
+                            cancelled = true;
+                        }
+                    });
+                });
+                if confirmed {
+                    self.local_install = LocalInstallStage::UndoPreview {
+                        destination_root,
+                        journal_path,
+                        transaction_id,
+                        preview,
+                    };
+                    self.confirm_local_undo();
+                } else if cancelled {
+                    self.local_install = LocalInstallStage::Applied {
+                        destination_root,
+                        journal_path: Some(journal_path),
+                        transaction_id,
+                    };
+                } else {
+                    self.local_install = LocalInstallStage::UndoPreview {
+                        destination_root,
+                        journal_path,
+                        transaction_id,
+                        preview,
+                    };
+                }
+            }
+            LocalInstallStage::Done { message } => {
+                ui.add_space(theme_gap());
+                widgets::banner(ui, "Undo complete", &message, widgets::StatusTone::Info);
+                if ui.button("Dismiss").clicked() {
+                    self.local_install = LocalInstallStage::Idle;
+                } else {
+                    self.local_install = LocalInstallStage::Done { message };
+                }
+            }
+            LocalInstallStage::Error { message } => {
+                ui.add_space(theme_gap());
+                widgets::banner(
+                    ui,
+                    "Local cheat install error",
+                    &message,
+                    widgets::StatusTone::Blocked,
+                );
+                if ui.button("Dismiss").clicked() {
+                    self.local_install = LocalInstallStage::Idle;
+                } else {
+                    self.local_install = LocalInstallStage::Error { message };
+                }
+            }
+        }
+    }
+
+    /// The install action for exactly one matched PCSX2 `.pnach`
+    /// candidate. Everything downstream of the click - staging, preview,
+    /// apply, and rollback - is the same, unmodified PCSX2 install-plan
+    /// pipeline the GameHacking-catalogue flow already uses; this only
+    /// supplies the one file the user picked, resolved into the single
+    /// managed cheat it becomes.
+    fn show_pcsx2_install_action(
+        &mut self,
+        ui: &mut egui::Ui,
+        candidate: &UserCheatCandidate,
+        local_pcsx2_install_context: Option<&LocalPcsx2InstallContext>,
+    ) {
+        let Some(install_context) = local_pcsx2_install_context else {
+            ui.label("Select a PCSX2 game in Cheats & Mods to install this file.");
+            return;
+        };
+        let Some(profile) = install_context.profile.as_ref() else {
+            ui.label("Select an eligible PCSX2 profile (Stage 1) before installing a local file.");
+            return;
+        };
+        let path = candidate.provenance.original_path.clone();
+        if ui.button("Install this cheat file").clicked() {
+            self.start_local_pcsx2_install(path, &install_context.identity, profile.clone());
+        }
+    }
+
+    fn start_local_pcsx2_install(
+        &mut self,
+        source_path: PathBuf,
+        identity: &Pcsx2GameIdentity,
+        profile: Pcsx2Profile,
+    ) {
+        let discovery = match discover_local_pcsx2_pnach_file(&source_path, identity) {
+            Ok(discovery) => discovery,
+            Err(error) => {
+                self.local_pcsx2_install = LocalPcsx2InstallStage::Blocked {
+                    source_path,
+                    message: error.to_string(),
+                };
+                return;
+            }
+        };
+        match check_local_pcsx2_install_state(&profile, &discovery) {
+            Ok(LocalPcsx2InstallState::AlreadyInstalled) => {
+                self.local_pcsx2_install = LocalPcsx2InstallStage::AlreadyInstalled { source_path };
+                return;
+            }
+            Ok(LocalPcsx2InstallState::New) => {}
+            Err(error) => {
+                self.local_pcsx2_install = LocalPcsx2InstallStage::Blocked {
+                    source_path,
+                    message: error.to_string(),
+                };
+                return;
+            }
+        }
+        let staging_root = match crate::default_generated_pcsx2_local_staging_root() {
+            Ok(root) => root,
+            Err(message) => {
+                self.local_pcsx2_install = LocalPcsx2InstallStage::Error { message };
+                return;
+            }
+        };
+        let staged = match stage_pcsx2_pnach(
+            &staging_root,
+            &profile,
+            discovery.detected_serial.as_deref(),
+            &discovery.detected_crc,
+            std::slice::from_ref(&discovery.cheat),
+        ) {
+            Ok(staged) => staged,
+            Err(error) => {
+                self.local_pcsx2_install = LocalPcsx2InstallStage::Blocked {
+                    source_path,
+                    message: error.to_string(),
+                };
+                return;
+            }
+        };
+        match build_pcsx2_install_preview(&Pcsx2InstallPreviewRequest {
+            selected_archive: identity.archive_path.clone(),
+            profile: profile.clone(),
+            identity: identity.clone(),
+            staged,
+        }) {
+            Ok(preview) => {
+                self.local_pcsx2_install = LocalPcsx2InstallStage::Preview {
+                    source_path,
+                    profile,
+                    preview: Box::new(preview),
+                };
+            }
+            Err(error) => {
+                self.local_pcsx2_install = LocalPcsx2InstallStage::Blocked {
+                    source_path,
+                    message: error.to_string(),
+                };
+            }
+        }
+    }
+
+    fn confirm_local_pcsx2_apply(&mut self) {
+        let LocalPcsx2InstallStage::Preview {
+            source_path,
+            profile,
+            preview,
+        } = std::mem::take(&mut self.local_pcsx2_install)
+        else {
+            return;
+        };
+        if !native_target_is_current(
+            &profile.profile_id,
+            &profile.configuration_path,
+            self.local_pcsx2_current_target.as_ref(),
+        ) {
+            self.local_pcsx2_install = LocalPcsx2InstallStage::Blocked {
+                source_path,
+                message: LOCAL_INSTALL_TARGET_CHANGED.to_string(),
+            };
+            return;
+        }
+        let history_root = match default_shared_history_root() {
+            Ok(root) => root,
+            Err(error) => {
+                self.local_pcsx2_install = LocalPcsx2InstallStage::Error {
+                    message: format!("History root unavailable: {}", error.detail),
+                };
+                return;
+            }
+        };
+        let backup_root = match default_shared_backup_root() {
+            Ok(root) => root,
+            Err(error) => {
+                self.local_pcsx2_install = LocalPcsx2InstallStage::Error {
+                    message: format!("Backup root unavailable: {}", error.detail),
+                };
+                return;
+            }
+        };
+        let replacement_required = preview
+            .report
+            .entries
+            .iter()
+            .any(|entry| entry.proposed_action == PreviewProposedAction::Replace);
+        let plan = match build_shared_transaction_plan(
+            &preview.report,
+            &profile.profile_id,
+            "pcsx2-local-file",
+            &preview.staged.staging_root,
+        ) {
+            Ok(plan) => plan,
+            Err(error) => {
+                self.local_pcsx2_install = LocalPcsx2InstallStage::Error {
+                    message: error.detail,
+                };
+                return;
+            }
+        };
+        let timestamp = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|duration| duration.as_secs())
+            .unwrap_or(0);
+        let destination_root = profile.configuration_path.clone();
+        let result = execute_shared_apply(
+            &plan,
+            &SharedApplyOptions {
+                dry_run: false,
+                confirmation: Some(SharedApplyConfirmation {
+                    plan_id: plan.plan_id.clone(),
+                    general_approved: true,
+                    replacement_approved: replacement_required,
+                }),
+                operation_id: generate_shared_operation_id(),
+                timestamp_unix_seconds: timestamp,
+                current_context: plan.context.clone(),
+                history_root,
+                backup_root,
+            },
+        );
+        if result.journal.status == SharedApplyStatus::Success {
+            // The engine leaves PCSX2 staging for its caller; no migration
+            // follows a local import, so the spent job directory goes now.
+            if let Ok(root) = result.journal.approved_source_root.to_path_buf() {
+                archivefs_core::patch_manager::retire_completed_staging_job(&root);
+            }
+            self.local_pcsx2_install = LocalPcsx2InstallStage::Applied {
+                destination_root,
+                journal_path: result.journal_path,
+            };
+        } else {
+            self.local_pcsx2_install = LocalPcsx2InstallStage::Error {
+                message: format!("Apply did not fully succeed: {:?}", result.journal.status),
+            };
+        }
+    }
+
+    fn start_local_pcsx2_undo(&mut self) {
+        let LocalPcsx2InstallStage::Applied {
+            destination_root,
+            journal_path,
+        } = std::mem::take(&mut self.local_pcsx2_install)
+        else {
+            return;
+        };
+        let Some(journal_path) = journal_path else {
+            self.local_pcsx2_install = LocalPcsx2InstallStage::Error {
+                message: "No transaction journal was recorded for this apply.".to_string(),
+            };
+            return;
+        };
+        let backup_root = match default_shared_backup_root() {
+            Ok(root) => root,
+            Err(error) => {
+                self.local_pcsx2_install = LocalPcsx2InstallStage::Error {
+                    message: format!("Backup root unavailable: {}", error.detail),
+                };
+                return;
+            }
+        };
+        let preview = preview_shared_rollback(&journal_path, &destination_root, &backup_root);
+        self.local_pcsx2_install = LocalPcsx2InstallStage::UndoPreview {
+            destination_root,
+            journal_path,
+            preview: Box::new(preview),
+        };
+    }
+
+    fn confirm_local_pcsx2_undo(&mut self) {
+        let LocalPcsx2InstallStage::UndoPreview { preview, .. } =
+            std::mem::take(&mut self.local_pcsx2_install)
+        else {
+            return;
+        };
+        let history_root = match default_shared_history_root() {
+            Ok(root) => root,
+            Err(error) => {
+                self.local_pcsx2_install = LocalPcsx2InstallStage::Error {
+                    message: format!("History root unavailable: {}", error.detail),
+                };
+                return;
+            }
+        };
+        let backup_root = match default_shared_backup_root() {
+            Ok(root) => root,
+            Err(error) => {
+                self.local_pcsx2_install = LocalPcsx2InstallStage::Error {
+                    message: format!("Backup root unavailable: {}", error.detail),
+                };
+                return;
+            }
+        };
+        let timestamp = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|duration| duration.as_secs())
+            .unwrap_or(0);
+        let result = execute_shared_rollback(
+            &preview,
+            &SharedRollbackOptions {
+                confirmation: SharedRollbackConfirmation {
+                    preview_id: preview.preview_id.clone(),
+                    approved: true,
+                },
+                rollback_operation_id: generate_shared_operation_id(),
+                timestamp_unix_seconds: timestamp,
+                history_root,
+                backup_root,
+            },
+        );
+        if result.status == SharedApplyStatus::Success {
+            self.local_pcsx2_install = LocalPcsx2InstallStage::Done {
+                message: "The installed cheat file was removed and the prior state was restored."
+                    .to_string(),
+            };
+        } else {
+            self.local_pcsx2_install = LocalPcsx2InstallStage::Error {
+                message: format!("Undo did not fully succeed: {:?}", result.status),
+            };
+        }
+    }
+
+    /// Mirrors `show_local_install_panel`'s ownership dance for the same
+    /// reason: `self.local_pcsx2_install` is taken by value before
+    /// rendering so the action buttons' `&mut self` calls never conflict
+    /// with a live borrow of it.
+    fn show_local_pcsx2_install_panel(&mut self, ui: &mut egui::Ui) {
+        let stage = std::mem::take(&mut self.local_pcsx2_install);
+        match stage {
+            LocalPcsx2InstallStage::Idle => {}
+            LocalPcsx2InstallStage::Blocked {
+                source_path,
+                message,
+            } => {
+                ui.add_space(theme_gap());
+                widgets::banner(
+                    ui,
+                    &format!("Cannot install {}", source_path.display()),
+                    &message,
+                    widgets::StatusTone::Blocked,
+                );
+                if ui.button("Dismiss").clicked() {
+                    self.local_pcsx2_install = LocalPcsx2InstallStage::Idle;
+                } else {
+                    self.local_pcsx2_install = LocalPcsx2InstallStage::Blocked {
+                        source_path,
+                        message,
+                    };
+                }
+            }
+            LocalPcsx2InstallStage::AlreadyInstalled { source_path } => {
+                ui.add_space(theme_gap());
+                widgets::banner(
+                    ui,
+                    "Already installed",
+                    &format!(
+                        "{} is already installed for this game - installing it again would change nothing.",
+                        source_path.display()
+                    ),
+                    widgets::StatusTone::Info,
+                );
+                if ui.button("Dismiss").clicked() {
+                    self.local_pcsx2_install = LocalPcsx2InstallStage::Idle;
+                } else {
+                    self.local_pcsx2_install =
+                        LocalPcsx2InstallStage::AlreadyInstalled { source_path };
+                }
+            }
+            LocalPcsx2InstallStage::Preview {
+                source_path,
+                profile,
+                preview,
+            } => {
+                ui.add_space(theme_gap());
+                let mut confirmed = false;
+                let mut cancelled = false;
+                widgets::card(ui, |ui| {
+                    ui.strong("Review before installing");
+                    ui.label(format!("Source file: {}", source_path.display()));
+                    ui.label(format!(
+                        "Destination: {}",
+                        preview.staged.destination_path.display()
+                    ));
+                    ui.label(preview.plain_summary.clone());
+                    egui::CollapsingHeader::new("Technical details")
+                        .default_open(false)
+                        .show(ui, |ui| {
+                            for line in &preview.technical_details {
+                                ui.label(line);
+                            }
+                        });
+                    egui::CollapsingHeader::new("Merged PNACH contents to be written")
+                        .default_open(false)
+                        .show(ui, |ui| {
+                            ui.monospace(
+                                String::from_utf8_lossy(&preview.staged.contents).into_owned(),
+                            );
+                        });
+                    ui.horizontal(|ui| {
+                        if widgets::action_button(
+                            ui,
+                            "Confirm install",
+                            widgets::ActionStyle::Primary,
+                            true,
+                        )
+                        .clicked()
+                        {
+                            confirmed = true;
+                        }
+                        if ui.button("Cancel").clicked() {
+                            cancelled = true;
+                        }
+                    });
+                });
+                if confirmed {
+                    self.local_pcsx2_install = LocalPcsx2InstallStage::Preview {
+                        source_path,
+                        profile,
+                        preview,
+                    };
+                    self.confirm_local_pcsx2_apply();
+                } else if cancelled {
+                    self.local_pcsx2_install = LocalPcsx2InstallStage::Idle;
+                } else {
+                    self.local_pcsx2_install = LocalPcsx2InstallStage::Preview {
+                        source_path,
+                        profile,
+                        preview,
+                    };
+                }
+            }
+            LocalPcsx2InstallStage::Applied {
+                destination_root,
+                journal_path,
+            } => {
+                ui.add_space(theme_gap());
+                let mut undo = false;
+                let mut dismissed = false;
+                widgets::card(ui, |ui| {
+                    widgets::status_badge(ui, "Installed", widgets::StatusTone::Success);
+                    if let Some(journal_path) = journal_path.as_ref() {
+                        ui.label(format!("Transaction journal: {}", journal_path.display()));
+                    }
+                    ui.horizontal(|ui| {
+                        if ui.button("Undo this install").clicked() {
+                            undo = true;
+                        }
+                        if ui.button("Dismiss").clicked() {
+                            dismissed = true;
+                        }
+                    });
+                });
+                if undo {
+                    self.local_pcsx2_install = LocalPcsx2InstallStage::Applied {
+                        destination_root,
+                        journal_path,
+                    };
+                    self.start_local_pcsx2_undo();
+                } else if dismissed {
+                    self.local_pcsx2_install = LocalPcsx2InstallStage::Idle;
+                } else {
+                    self.local_pcsx2_install = LocalPcsx2InstallStage::Applied {
+                        destination_root,
+                        journal_path,
+                    };
+                }
+            }
+            LocalPcsx2InstallStage::UndoPreview {
+                destination_root,
+                journal_path,
+                preview,
+            } => {
+                ui.add_space(theme_gap());
+                let mut confirmed = false;
+                let mut cancelled = false;
+                widgets::card(ui, |ui| {
+                    ui.strong("Confirm undo");
+                    ui.label("This will remove the installed managed cheat block and restore any prior file content.");
+                    ui.horizontal(|ui| {
+                        if widgets::action_button(
+                            ui,
+                            "Confirm undo",
+                            widgets::ActionStyle::Primary,
+                            true,
+                        )
+                        .clicked()
+                        {
+                            confirmed = true;
+                        }
+                        if ui.button("Cancel").clicked() {
+                            cancelled = true;
+                        }
+                    });
+                });
+                if confirmed {
+                    self.local_pcsx2_install = LocalPcsx2InstallStage::UndoPreview {
+                        destination_root,
+                        journal_path,
+                        preview,
+                    };
+                    self.confirm_local_pcsx2_undo();
+                } else if cancelled {
+                    self.local_pcsx2_install = LocalPcsx2InstallStage::Applied {
+                        destination_root,
+                        journal_path: Some(journal_path),
+                    };
+                } else {
+                    self.local_pcsx2_install = LocalPcsx2InstallStage::UndoPreview {
+                        destination_root,
+                        journal_path,
+                        preview,
+                    };
+                }
+            }
+            LocalPcsx2InstallStage::Done { message } => {
+                ui.add_space(theme_gap());
+                widgets::banner(ui, "Undo complete", &message, widgets::StatusTone::Info);
+                if ui.button("Dismiss").clicked() {
+                    self.local_pcsx2_install = LocalPcsx2InstallStage::Idle;
+                } else {
+                    self.local_pcsx2_install = LocalPcsx2InstallStage::Done { message };
+                }
+            }
+            LocalPcsx2InstallStage::Error { message } => {
+                ui.add_space(theme_gap());
+                widgets::banner(
+                    ui,
+                    "Local PCSX2 cheat install error",
+                    &message,
+                    widgets::StatusTone::Blocked,
+                );
+                if ui.button("Dismiss").clicked() {
+                    self.local_pcsx2_install = LocalPcsx2InstallStage::Idle;
+                } else {
+                    self.local_pcsx2_install = LocalPcsx2InstallStage::Error { message };
+                }
+            }
+        }
+    }
+
+    /// Discovers, checks for an already-installed identical state, stages,
+    /// and previews - everything downstream of this is the same,
+    /// unmodified Dolphin install-plan pipeline
+    /// (`build_dolphin_install_preview`) the provider-driven Gecko flow
+    /// already uses; this only supplies the one file the user picked,
+    /// merged into the codes it becomes.
+    fn start_local_dolphin_install(
+        &mut self,
+        source_path: PathBuf,
+        candidate: DolphinCandidate,
+        configuration_path: PathBuf,
+        profile_id: String,
+    ) {
+        let discovery = match discover_local_dolphin_cheat_file(&source_path, &candidate) {
+            Ok(discovery) => discovery,
+            Err(error) => {
+                self.local_dolphin_install = LocalDolphinInstallStage::Blocked {
+                    source_path,
+                    message: error.to_string(),
+                };
+                return;
+            }
+        };
+        let destination = match load_dolphin_destination(&configuration_path, &candidate.game_id) {
+            Ok(destination) => destination,
+            Err(error) => {
+                self.local_dolphin_install = LocalDolphinInstallStage::Blocked {
+                    source_path,
+                    message: error.to_string(),
+                };
+                return;
+            }
+        };
+        if check_local_dolphin_install_state(&destination, &discovery)
+            == LocalDolphinInstallState::AlreadyInstalled
+        {
+            self.local_dolphin_install = LocalDolphinInstallStage::AlreadyInstalled { source_path };
+            return;
+        }
+        let staging_root = match crate::default_generated_dolphin_local_staging_root() {
+            Ok(root) => root,
+            Err(message) => {
+                self.local_dolphin_install = LocalDolphinInstallStage::Error { message };
+                return;
+            }
+        };
+        let staged = match stage_local_dolphin_codes(&staging_root, &destination, &discovery) {
+            Ok(staged) => staged,
+            Err(error) => {
+                self.local_dolphin_install = LocalDolphinInstallStage::Blocked {
+                    source_path,
+                    message: error.to_string(),
+                };
+                return;
+            }
+        };
+        match build_dolphin_install_preview(&DolphinInstallPreviewRequest {
+            selected_archive: candidate.path.clone(),
+            configuration_path: configuration_path.clone(),
+            game_id: candidate.game_id.clone(),
+            revision: candidate.revision,
+            staged,
+        }) {
+            Ok(preview) => {
+                self.local_dolphin_install = LocalDolphinInstallStage::Preview {
+                    source_path,
+                    configuration_path,
+                    profile_id,
+                    preview: Box::new(preview),
+                };
+            }
+            Err(error) => {
+                self.local_dolphin_install = LocalDolphinInstallStage::Blocked {
+                    source_path,
+                    message: error.to_string(),
+                };
+            }
+        }
+    }
+
+    fn confirm_local_dolphin_apply(&mut self) {
+        let LocalDolphinInstallStage::Preview {
+            source_path,
+            configuration_path,
+            profile_id,
+            preview,
+        } = std::mem::take(&mut self.local_dolphin_install)
+        else {
+            return;
+        };
+        if !native_target_is_current(
+            &profile_id,
+            &configuration_path,
+            self.local_dolphin_current_target.as_ref(),
+        ) {
+            self.local_dolphin_install = LocalDolphinInstallStage::Blocked {
+                source_path,
+                message: LOCAL_INSTALL_TARGET_CHANGED.to_string(),
+            };
+            return;
+        }
+        let history_root = match default_shared_history_root() {
+            Ok(root) => root,
+            Err(error) => {
+                self.local_dolphin_install = LocalDolphinInstallStage::Error {
+                    message: format!("History root unavailable: {}", error.detail),
+                };
+                return;
+            }
+        };
+        let backup_root = match default_shared_backup_root() {
+            Ok(root) => root,
+            Err(error) => {
+                self.local_dolphin_install = LocalDolphinInstallStage::Error {
+                    message: format!("Backup root unavailable: {}", error.detail),
+                };
+                return;
+            }
+        };
+        let replacement_required = preview
+            .report
+            .entries
+            .iter()
+            .any(|entry| entry.proposed_action == PreviewProposedAction::Replace);
+        let plan = match build_shared_transaction_plan(
+            &preview.report,
+            &profile_id,
+            "dolphin-local-file",
+            &preview.staged.staging_root,
+        ) {
+            Ok(plan) => plan,
+            Err(error) => {
+                self.local_dolphin_install = LocalDolphinInstallStage::Error {
+                    message: error.detail,
+                };
+                return;
+            }
+        };
+        let timestamp = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|duration| duration.as_secs())
+            .unwrap_or(0);
+        let destination_root = configuration_path.clone();
+        let result = execute_shared_apply(
+            &plan,
+            &SharedApplyOptions {
+                dry_run: false,
+                confirmation: Some(SharedApplyConfirmation {
+                    plan_id: plan.plan_id.clone(),
+                    general_approved: true,
+                    replacement_approved: replacement_required,
+                }),
+                operation_id: generate_shared_operation_id(),
+                timestamp_unix_seconds: timestamp,
+                current_context: plan.context.clone(),
+                history_root,
+                backup_root,
+            },
+        );
+        if result.journal.status == SharedApplyStatus::Success {
+            self.local_dolphin_install = LocalDolphinInstallStage::Applied {
+                destination_root,
+                journal_path: result.journal_path,
+            };
+        } else {
+            self.local_dolphin_install = LocalDolphinInstallStage::Error {
+                message: format!("Apply did not fully succeed: {:?}", result.journal.status),
+            };
+        }
+    }
+
+    fn start_local_dolphin_undo(&mut self) {
+        let LocalDolphinInstallStage::Applied {
+            destination_root,
+            journal_path,
+        } = std::mem::take(&mut self.local_dolphin_install)
+        else {
+            return;
+        };
+        let Some(journal_path) = journal_path else {
+            self.local_dolphin_install = LocalDolphinInstallStage::Error {
+                message: "No transaction journal was recorded for this apply.".to_string(),
+            };
+            return;
+        };
+        let backup_root = match default_shared_backup_root() {
+            Ok(root) => root,
+            Err(error) => {
+                self.local_dolphin_install = LocalDolphinInstallStage::Error {
+                    message: format!("Backup root unavailable: {}", error.detail),
+                };
+                return;
+            }
+        };
+        let preview = preview_shared_rollback(&journal_path, &destination_root, &backup_root);
+        self.local_dolphin_install = LocalDolphinInstallStage::UndoPreview {
+            destination_root,
+            journal_path,
+            preview: Box::new(preview),
+        };
+    }
+
+    fn confirm_local_dolphin_undo(&mut self) {
+        let LocalDolphinInstallStage::UndoPreview { preview, .. } =
+            std::mem::take(&mut self.local_dolphin_install)
+        else {
+            return;
+        };
+        let history_root = match default_shared_history_root() {
+            Ok(root) => root,
+            Err(error) => {
+                self.local_dolphin_install = LocalDolphinInstallStage::Error {
+                    message: format!("History root unavailable: {}", error.detail),
+                };
+                return;
+            }
+        };
+        let backup_root = match default_shared_backup_root() {
+            Ok(root) => root,
+            Err(error) => {
+                self.local_dolphin_install = LocalDolphinInstallStage::Error {
+                    message: format!("Backup root unavailable: {}", error.detail),
+                };
+                return;
+            }
+        };
+        let timestamp = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|duration| duration.as_secs())
+            .unwrap_or(0);
+        let result = execute_shared_rollback(
+            &preview,
+            &SharedRollbackOptions {
+                confirmation: SharedRollbackConfirmation {
+                    preview_id: preview.preview_id.clone(),
+                    approved: true,
+                },
+                rollback_operation_id: generate_shared_operation_id(),
+                timestamp_unix_seconds: timestamp,
+                history_root,
+                backup_root,
+            },
+        );
+        if result.status == SharedApplyStatus::Success {
+            self.local_dolphin_install = LocalDolphinInstallStage::Done {
+                message: "The installed cheat file was removed and the prior state was restored."
+                    .to_string(),
+            };
+        } else {
+            self.local_dolphin_install = LocalDolphinInstallStage::Error {
+                message: format!("Undo did not fully succeed: {:?}", result.status),
+            };
+        }
+    }
+
+    /// Mirrors `show_local_pcsx2_install_panel`'s ownership dance for the
+    /// same reason: `self.local_dolphin_install` is taken by value before
+    /// rendering so the action buttons' `&mut self` calls never conflict
+    /// with a live borrow of it.
+    fn show_local_dolphin_install_panel(&mut self, ui: &mut egui::Ui) {
+        let stage = std::mem::take(&mut self.local_dolphin_install);
+        match stage {
+            LocalDolphinInstallStage::Idle => {}
+            LocalDolphinInstallStage::Blocked {
+                source_path,
+                message,
+            } => {
+                ui.add_space(theme_gap());
+                widgets::banner(
+                    ui,
+                    &format!("Cannot install {}", source_path.display()),
+                    &message,
+                    widgets::StatusTone::Blocked,
+                );
+                if ui.button("Dismiss").clicked() {
+                    self.local_dolphin_install = LocalDolphinInstallStage::Idle;
+                } else {
+                    self.local_dolphin_install = LocalDolphinInstallStage::Blocked {
+                        source_path,
+                        message,
+                    };
+                }
+            }
+            LocalDolphinInstallStage::AlreadyInstalled { source_path } => {
+                ui.add_space(theme_gap());
+                widgets::banner(
+                    ui,
+                    "Already installed",
+                    &format!(
+                        "{} is already installed, unchanged, for this game - installing it again would change nothing.",
+                        source_path.display()
+                    ),
+                    widgets::StatusTone::Info,
+                );
+                if ui.button("Dismiss").clicked() {
+                    self.local_dolphin_install = LocalDolphinInstallStage::Idle;
+                } else {
+                    self.local_dolphin_install =
+                        LocalDolphinInstallStage::AlreadyInstalled { source_path };
+                }
+            }
+            LocalDolphinInstallStage::Preview {
+                source_path,
+                configuration_path,
+                profile_id,
+                preview,
+            } => {
+                ui.add_space(theme_gap());
+                let mut confirmed = false;
+                let mut cancelled = false;
+                widgets::card(ui, |ui| {
+                    ui.strong("Review before installing");
+                    ui.label(format!("Source file: {}", source_path.display()));
+                    ui.label(format!("Destination: {}", preview.staged.path.display()));
+                    ui.label(format!(
+                        "{} code(s) merged in this install.",
+                        preview.staged.selected_code_count
+                    ));
+                    for entry in &preview.report.entries {
+                        ui.label(format!("{:?}", entry.proposed_action));
+                    }
+                    egui::CollapsingHeader::new("Merged GameSettings contents to be written")
+                        .default_open(false)
+                        .show(ui, |ui| {
+                            ui.monospace(preview.staged.contents.clone());
+                        });
+                    ui.horizontal(|ui| {
+                        if widgets::action_button(
+                            ui,
+                            "Confirm install",
+                            widgets::ActionStyle::Primary,
+                            true,
+                        )
+                        .clicked()
+                        {
+                            confirmed = true;
+                        }
+                        if ui.button("Cancel").clicked() {
+                            cancelled = true;
+                        }
+                    });
+                });
+                if confirmed {
+                    self.local_dolphin_install = LocalDolphinInstallStage::Preview {
+                        source_path,
+                        configuration_path,
+                        profile_id: profile_id.clone(),
+                        preview,
+                    };
+                    self.confirm_local_dolphin_apply();
+                } else if cancelled {
+                    self.local_dolphin_install = LocalDolphinInstallStage::Idle;
+                } else {
+                    self.local_dolphin_install = LocalDolphinInstallStage::Preview {
+                        source_path,
+                        configuration_path,
+                        profile_id: profile_id.clone(),
+                        preview,
+                    };
+                }
+            }
+            LocalDolphinInstallStage::Applied {
+                destination_root,
+                journal_path,
+            } => {
+                ui.add_space(theme_gap());
+                let mut undo = false;
+                let mut dismissed = false;
+                widgets::card(ui, |ui| {
+                    widgets::status_badge(ui, "Installed", widgets::StatusTone::Success);
+                    if let Some(journal_path) = journal_path.as_ref() {
+                        ui.label(format!("Transaction journal: {}", journal_path.display()));
+                    }
+                    ui.horizontal(|ui| {
+                        if ui.button("Undo this install").clicked() {
+                            undo = true;
+                        }
+                        if ui.button("Dismiss").clicked() {
+                            dismissed = true;
+                        }
+                    });
+                });
+                if undo {
+                    self.local_dolphin_install = LocalDolphinInstallStage::Applied {
+                        destination_root,
+                        journal_path,
+                    };
+                    self.start_local_dolphin_undo();
+                } else if dismissed {
+                    self.local_dolphin_install = LocalDolphinInstallStage::Idle;
+                } else {
+                    self.local_dolphin_install = LocalDolphinInstallStage::Applied {
+                        destination_root,
+                        journal_path,
+                    };
+                }
+            }
+            LocalDolphinInstallStage::UndoPreview {
+                destination_root,
+                journal_path,
+                preview,
+            } => {
+                ui.add_space(theme_gap());
+                let mut confirmed = false;
+                let mut cancelled = false;
+                widgets::card(ui, |ui| {
+                    ui.strong("Confirm undo");
+                    ui.label("This will remove the installed managed codes and restore any prior file content.");
+                    ui.horizontal(|ui| {
+                        if widgets::action_button(
+                            ui,
+                            "Confirm undo",
+                            widgets::ActionStyle::Primary,
+                            true,
+                        )
+                        .clicked()
+                        {
+                            confirmed = true;
+                        }
+                        if ui.button("Cancel").clicked() {
+                            cancelled = true;
+                        }
+                    });
+                });
+                if confirmed {
+                    self.local_dolphin_install = LocalDolphinInstallStage::UndoPreview {
+                        destination_root,
+                        journal_path,
+                        preview,
+                    };
+                    self.confirm_local_dolphin_undo();
+                } else if cancelled {
+                    self.local_dolphin_install = LocalDolphinInstallStage::Applied {
+                        destination_root,
+                        journal_path: Some(journal_path),
+                    };
+                } else {
+                    self.local_dolphin_install = LocalDolphinInstallStage::UndoPreview {
+                        destination_root,
+                        journal_path,
+                        preview,
+                    };
+                }
+            }
+            LocalDolphinInstallStage::Done { message } => {
+                ui.add_space(theme_gap());
+                widgets::banner(ui, "Undo complete", &message, widgets::StatusTone::Info);
+                if ui.button("Dismiss").clicked() {
+                    self.local_dolphin_install = LocalDolphinInstallStage::Idle;
+                } else {
+                    self.local_dolphin_install = LocalDolphinInstallStage::Done { message };
+                }
+            }
+            LocalDolphinInstallStage::Error { message } => {
+                ui.add_space(theme_gap());
+                widgets::banner(
+                    ui,
+                    "Local Dolphin cheat install error",
+                    &message,
+                    widgets::StatusTone::Blocked,
+                );
+                if ui.button("Dismiss").clicked() {
+                    self.local_dolphin_install = LocalDolphinInstallStage::Idle;
+                } else {
+                    self.local_dolphin_install = LocalDolphinInstallStage::Error { message };
+                }
+            }
+        }
+    }
+}
+
+impl UserCheatImportPageState {
+    /// Hands a scanned Dolphin `.ini` to the existing local Dolphin install
+    /// bridge, which re-validates the file and its Game ID against the game
+    /// selected in Cheats & Mods before any preview.
+    fn show_scanned_dolphin_install_action(
+        &mut self,
+        ui: &mut egui::Ui,
+        candidate: &UserCheatCandidate,
+        context: Option<&LocalDolphinInstallContext>,
+    ) {
+        let Some(context) = context else {
+            ui.label("To install it, select this GameCube/Wii game and a Dolphin profile in Cheats & Mods.");
+            return;
+        };
+        let enabled = matches!(self.local_dolphin_install, LocalDolphinInstallStage::Idle);
+        if widgets::action_button(
+            ui,
+            "Preview install for Dolphin",
+            widgets::ActionStyle::Secondary,
+            enabled,
+        )
+        .clicked()
+        {
+            self.start_local_dolphin_install(
+                candidate.provenance.original_path.clone(),
+                context.candidate.clone(),
+                context.configuration_path.clone(),
+                context.profile_id.clone(),
+            );
+        }
+    }
+
+    /// Hands a scanned Xenia `.patch.toml` to the existing local Xenia
+    /// install bridge, which binds it to the selected game's Title ID.
+    fn show_scanned_xenia_install_action(
+        &mut self,
+        ui: &mut egui::Ui,
+        candidate: &UserCheatCandidate,
+        context: Option<&LocalXeniaInstallContext>,
+    ) {
+        let Some(context) = context else {
+            ui.label(
+                "To install it, select this Xbox 360 game and a Xenia profile in Cheats & Mods.",
+            );
+            return;
+        };
+        let enabled = context.title_id.is_some()
+            && context.profile.is_some()
+            && matches!(self.local_xenia_install, LocalXeniaInstallStage::Idle);
+        if widgets::action_button(
+            ui,
+            "Preview install for Xenia",
+            widgets::ActionStyle::Secondary,
+            enabled,
+        )
+        .clicked()
+            && let Some(profile) = context.profile.clone()
+        {
+            self.start_local_xenia_install(
+                candidate.provenance.original_path.clone(),
+                context.title_id.clone(),
+                profile,
+            );
+        }
+    }
+
+    fn show_local_xenia_install_picker(
+        &mut self,
+        ui: &mut egui::Ui,
+        context: Option<&LocalXeniaInstallContext>,
+    ) {
+        ui.add_space(theme_gap());
+        widgets::card(ui, |ui| {
+            ui.strong("Install a local Xenia patch file (.patch.toml)");
+            ui.label("The file is parsed by Xenia's existing strict patch parser and bound to the selected game's verified Title ID. No network access is used.");
+            let Some(context) = context else {
+                ui.label("Select an Xbox 360/Xenia game in Cheats & Mods first.");
+                return;
+            };
+            if context.title_id.is_none() {
+                ui.label("Blocked: the selected game's Xenia Title ID is unresolved or ambiguous.");
+            }
+            if context.profile.is_none() {
+                ui.label("Blocked: select one eligible Xenia profile first.");
+            }
+            let enabled = context.title_id.is_some()
+                && context.profile.is_some()
+                && matches!(self.local_xenia_install, LocalXeniaInstallStage::Idle);
+            if widgets::action_button(
+                ui,
+                "Choose a Xenia .patch.toml file…",
+                widgets::ActionStyle::Primary,
+                enabled,
+            )
+            .clicked()
+                && let Some(path) = rfd::FileDialog::new()
+                    .add_filter("Xenia patches", &["patch.toml"])
+                    .pick_file()
+            {
+                let profile = context.profile.clone().expect("enabled picker has profile");
+                self.start_local_xenia_install(path, context.title_id.clone(), profile);
+            }
+        });
+    }
+
+    fn show_converter(
+        &mut self,
+        ui: &mut egui::Ui,
+        selected_game: Option<(&str, &str)>,
+        selected_platform: Option<&str>,
+    ) {
+        let Some((game_id, title)) = selected_game else {
+            return;
+        };
+        let Some(platform_name) = selected_platform else {
+            return;
+        };
+        let platform = match platform_name.to_ascii_lowercase().as_str() {
+            "gamecube" | "gc" => CheatPlatform::GameCube,
+            "wii" => CheatPlatform::Wii,
+            "playstation 2" | "ps2" => CheatPlatform::Ps2,
+            "nintendo ds" | "nds" | "ds" => CheatPlatform::NintendoDs,
+            _ => return,
+        };
+        egui::CollapsingHeader::new("Convert Cheat Codes")
+            .default_open(false)
+            .show(ui, |ui| {
+                widgets::card(ui, |ui| {
+                    ui.label(format!("Game: {title} ({game_id}) — {platform_name}"));
+                    ui.label("Paste code text or read one local file. Conversion is preview-only; nothing is installed or saved.");
+                    ui.horizontal_wrapped(|ui| {
+                        if ui.button("Choose cheat file…").clicked()
+                            && let Some(path) = rfd::FileDialog::new()
+                                .add_filter("Cheat text", &["txt", "ini", "pnach"])
+                                .pick_file()
+                        {
+                            match HostReadOnlyFilesystem.read_bounded(&path, MAX_CONVERSION_INPUT_BYTES) {
+                                BoundedReadResult::Ok(bytes) => match String::from_utf8(bytes) {
+                                    Ok(text) => {
+                                        self.converter_text = text;
+                                        self.converter_error = None;
+                                    }
+                                    Err(_) => self.converter_error = Some("The selected file is not UTF-8 text.".into()),
+                                },
+                                BoundedReadResult::Symlink => self.converter_error = Some("Refused a symbolic-link file.".into()),
+                                BoundedReadResult::TooLarge => self.converter_error = Some("File exceeds the 1 MiB limit.".into()),
+                                _ => self.converter_error = Some("Could not read a regular local cheat file.".into()),
+                            }
+                        }
+                        if ui.button("Cancel / clear").clicked() {
+                            self.clear_converter();
+                        }
+                    });
+                    let response = ui.add_sized(
+                        [ui.available_width(), 130.0],
+                        egui::TextEdit::multiline(&mut self.converter_text)
+                            .hint_text("Paste cheat codes here")
+                            .desired_rows(7),
+                    );
+                    if response.changed() {
+                        self.converter_error = None;
+                    }
+                    ui.checkbox(
+                        &mut self.converter_game_confirmed,
+                        format!("I confirm these codes are for {title}"),
+                    );
+                    let detected = detect_conversion_source(&self.converter_text);
+                    ui.label(match detected {
+                        Some(index) => format!("Detected source format: {}", CONVERSION_SOURCE_LABELS[index]),
+                        None if self.converter_text.trim().is_empty() => "Source format: waiting for input".into(),
+                        None if looks_like_unlabelled_pair_list(&self.converter_text) => "Source format is ambiguous. Select it explicitly; EmuWiz will not guess.".into(),
+                        None => "No supported source format was detected. Select a supported format or revise the input.".into(),
+                    });
+                    egui::ComboBox::from_label("Source format")
+                        .selected_text(self.converter_source_format
+                            .and_then(|index| CONVERSION_SOURCE_LABELS.get(index).copied())
+                            .unwrap_or("Choose source format"))
+                        .show_ui(ui, |ui| {
+                            for (index, label) in CONVERSION_SOURCE_LABELS.iter().enumerate() {
+                                ui.selectable_value(&mut self.converter_source_format, Some(index), *label);
+                            }
+                        });
+                    let source_index = detected.or(self.converter_source_format);
+                    let document = if !self.converter_game_confirmed {
+                        Err("Confirm the selected game's identity before conversion.".into())
+                    } else if let Some(source_index) = source_index {
+                        build_conversion_document(title, platform.clone(), source_index, &self.converter_text)
+                    } else if self.converter_text.trim().is_empty() {
+                        Err("Add code text to begin.".into())
+                    } else {
+                        Err("Choose a source format to resolve the ambiguous input.".into())
+                    };
+                    match document {
+                        Err(reason) => {
+                            if !self.converter_text.trim().is_empty() {
+                                widgets::banner(ui, "Conversion unavailable", &reason, widgets::StatusTone::Warning);
+                            }
+                        }
+                        Ok(document) => {
+                            let capabilities = supported_targets_for(&document);
+                            for item in &capabilities {
+                                let status = match &item.capability {
+                                    ConversionCapability::Exact => "Exact for all parsed operations".to_string(),
+                                    ConversionCapability::Lossy { .. } => "Lossy: some source details cannot be represented".to_string(),
+                                    ConversionCapability::Unsupported { reason } => match reason.as_str() {
+                                        "one or more operations are not safely representable" => "Unsupported: one or more codes cannot be converted safely".to_string(),
+                                        "MissingTargetEncoder" => "Unsupported: this target format has no safe encoder".to_string(),
+                                        _ => format!("Unsupported: {reason}"),
+                                    },
+                                };
+                                ui.label(format!("{}: {status}", target_label(&item.target)));
+                            }
+                            if self.converter_target_format.is_none() {
+                                self.converter_target_format = capabilities.first().map(|item| item.target.clone());
+                            }
+                            if let Some(target) = self.converter_target_format.clone() {
+                                egui::ComboBox::from_label("Target format")
+                                    .selected_text(target_label(&target))
+                                    .show_ui(ui, |ui| {
+                                        for item in &capabilities {
+                                            ui.selectable_value(&mut self.converter_target_format, Some(item.target.clone()), target_label(&item.target));
+                                        }
+                                    });
+                                let preview = convert_cheat_document(&document, target);
+                                ui.label(format!("Preview: {} exact, {} unsupported", preview.exact_operations, preview.unsupported_operations));
+                                if !preview.warnings.is_empty() {
+                                    ui.colored_label(
+                                        crate::ui::theme::warning(ui),
+                                        "Review required: the selected target cannot safely represent every code.",
+                                    );
+                                }
+                                if let Some(output) = preview.output_preview.as_deref() {
+                                    ui.label("Converted output (read-only preview):");
+                                    let mut preview_output = output.to_owned();
+                                    ui.add(egui::TextEdit::multiline(&mut preview_output).desired_rows(6).interactive(false));
+                                    if ui.button("Copy converted codes").clicked() {
+                                        ui.ctx().copy_text(output.to_string());
+                                    }
+                                } else {
+                                    ui.label("No output is available because the selected target cannot safely represent every operation.");
+                                }
+                            }
+                        }
+                    }
+                    if let Some(error) = &self.converter_error {
+                        widgets::banner(ui, "Could not read cheat input", error, widgets::StatusTone::Warning);
+                    }
+                    ui.label("Code order is retained. Source descriptions remain visible above but are not embedded in the converted output.");
+                });
+            });
+    }
+
+    fn clear_converter(&mut self) {
+        self.converter_text.clear();
+        self.converter_error = None;
+        self.converter_source_format = None;
+        self.converter_target_format = None;
+        self.converter_game_confirmed = false;
+    }
+
+    fn sync_converter_context(&mut self, context_key: Option<String>) {
+        if self.converter_context_key != context_key {
+            self.clear_converter();
+            self.converter_context_key = context_key;
+        }
+    }
+
+    fn start_local_xenia_install(
+        &mut self,
+        source_path: PathBuf,
+        title_id: Option<String>,
+        profile: XeniaProfile,
+    ) {
+        let discovery = match discover_local_xenia_patch_file(&source_path, title_id.as_deref()) {
+            Ok(value) => value,
+            Err(error) => {
+                self.local_xenia_install = LocalXeniaInstallStage::Blocked {
+                    source_path,
+                    message: error.to_string(),
+                };
+                return;
+            }
+        };
+        let file_name = source_path
+            .file_name()
+            .and_then(|name| name.to_str())
+            .unwrap_or_default()
+            .to_string();
+        let destination =
+            match load_local_xenia_destination(&profile.configuration_path, &file_name) {
+                Ok(value) => value,
+                Err(error) => {
+                    self.local_xenia_install = LocalXeniaInstallStage::Blocked {
+                        source_path,
+                        message: error.to_string(),
+                    };
+                    return;
+                }
+            };
+        if check_local_xenia_install_state(&destination, &discovery)
+            == LocalXeniaInstallState::AlreadyInstalled
+        {
+            self.local_xenia_install = LocalXeniaInstallStage::AlreadyInstalled { source_path };
+            return;
+        }
+        let staging_root = match crate::default_generated_xenia_staging_root() {
+            Ok(root) => root,
+            Err(message) => {
+                self.local_xenia_install = LocalXeniaInstallStage::Error { message };
+                return;
+            }
+        };
+        let staged = match stage_local_xenia_patch_file(
+            &staging_root,
+            &file_name,
+            &discovery,
+            destination.document.as_ref(),
+        ) {
+            Ok(value) => value,
+            Err(error) => {
+                self.local_xenia_install = LocalXeniaInstallStage::Blocked {
+                    source_path,
+                    message: error.to_string(),
+                };
+                return;
+            }
+        };
+        match build_xenia_install_preview(&XeniaInstallPreviewRequest {
+            selected_archive: source_path.clone(),
+            configuration_path: profile.configuration_path.clone(),
+            title_id: discovery.candidate.title_id.clone(),
+            compatibility: discovery.candidate.compatibility,
+            staged,
+        }) {
+            Ok(preview) => {
+                self.local_xenia_install = LocalXeniaInstallStage::Preview {
+                    source_path,
+                    profile_id: profile.profile_id,
+                    configuration_path: profile.configuration_path,
+                    preview: Box::new(preview),
+                }
+            }
+            Err(error) => {
+                self.local_xenia_install = LocalXeniaInstallStage::Blocked {
+                    source_path,
+                    message: error.to_string(),
+                }
+            }
+        }
+    }
+
+    fn confirm_local_xenia_apply(&mut self) {
+        let LocalXeniaInstallStage::Preview {
+            source_path,
+            profile_id,
+            configuration_path,
+            preview,
+        } = std::mem::take(&mut self.local_xenia_install)
+        else {
+            return;
+        };
+        if !native_target_is_current(
+            &profile_id,
+            &configuration_path,
+            self.local_xenia_current_target.as_ref(),
+        ) {
+            self.local_xenia_install = LocalXeniaInstallStage::Blocked {
+                source_path,
+                message: LOCAL_INSTALL_TARGET_CHANGED.to_string(),
+            };
+            return;
+        }
+        let (Ok(history_root), Ok(backup_root)) =
+            (default_shared_history_root(), default_shared_backup_root())
+        else {
+            self.local_xenia_install = LocalXeniaInstallStage::Error {
+                message: "Shared history/backup roots are unavailable.".to_string(),
+            };
+            return;
+        };
+        let plan = match build_shared_transaction_plan(
+            &preview.report,
+            &profile_id,
+            "xenia-local-file",
+            &preview.staged.staging_root,
+        ) {
+            Ok(plan) => plan,
+            Err(error) => {
+                self.local_xenia_install = LocalXeniaInstallStage::Error {
+                    message: format!("{error:?}"),
+                };
+                return;
+            }
+        };
+        let replacement = plan
+            .entries
+            .iter()
+            .any(|entry| entry.proposed_action == PreviewProposedAction::Replace);
+        let result = execute_shared_apply(
+            &plan,
+            &SharedApplyOptions {
+                dry_run: false,
+                confirmation: Some(SharedApplyConfirmation {
+                    plan_id: plan.plan_id.clone(),
+                    general_approved: true,
+                    replacement_approved: replacement,
+                }),
+                operation_id: generate_shared_operation_id(),
+                timestamp_unix_seconds: now_unix_seconds(),
+                current_context: plan.context.clone(),
+                history_root,
+                backup_root,
+            },
+        );
+        if result.journal.status == SharedApplyStatus::Success {
+            self.local_xenia_install = LocalXeniaInstallStage::Applied {
+                destination_root: configuration_path,
+                journal_path: result.journal_path,
+            };
+        } else {
+            self.local_xenia_install = LocalXeniaInstallStage::Error {
+                message: format!("Apply did not fully succeed: {:?}", result.journal.status),
+            };
+        }
+    }
+
+    fn show_local_xenia_install_panel(&mut self, ui: &mut egui::Ui) {
+        let stage = std::mem::take(&mut self.local_xenia_install);
+        match stage {
+            LocalXeniaInstallStage::Idle => {}
+            LocalXeniaInstallStage::Blocked {
+                source_path,
+                message,
+            } => {
+                widgets::banner(
+                    ui,
+                    &format!("Cannot install {}", source_path.display()),
+                    &message,
+                    widgets::StatusTone::Blocked,
+                );
+                if !ui.button("Dismiss").clicked() {
+                    self.local_xenia_install = LocalXeniaInstallStage::Blocked {
+                        source_path,
+                        message,
+                    };
+                }
+            }
+            LocalXeniaInstallStage::AlreadyInstalled { source_path } => {
+                widgets::banner(
+                    ui,
+                    "Already installed",
+                    &format!("{} is already installed unchanged.", source_path.display()),
+                    widgets::StatusTone::Info,
+                );
+                if !ui.button("Dismiss").clicked() {
+                    self.local_xenia_install =
+                        LocalXeniaInstallStage::AlreadyInstalled { source_path };
+                }
+            }
+            LocalXeniaInstallStage::Preview {
+                source_path,
+                profile_id,
+                configuration_path,
+                preview,
+            } => {
+                let mut confirm = false;
+                let mut cancel = false;
+                widgets::card(ui, |ui| {
+                    ui.strong("Review local Xenia patch before installing");
+                    ui.label(format!("Source path: {}", source_path.display()));
+                    ui.label(format!(
+                        "Selected Xenia Title ID: {}",
+                        preview
+                            .report
+                            .entries
+                            .first()
+                            .and_then(|entry| entry.verified_identity.clone())
+                            .unwrap_or_else(|| "unknown".to_string())
+                    ));
+                    ui.label(format!("Destination: {}", preview.staged.path.display()));
+                    ui.label(format!(
+                        "Parsed patch entries: {}",
+                        preview.staged.selected_patch_count
+                    ));
+                    for entry in &preview.report.entries {
+                        ui.label(format!(
+                            "Mutation: {:?} ({:?})",
+                            entry.proposed_action, entry.destination_state
+                        ));
+                    }
+                    egui::CollapsingHeader::new("Exact mutation contents")
+                        .default_open(false)
+                        .show(ui, |ui| ui.monospace(&preview.staged.contents));
+                    if widgets::action_button(
+                        ui,
+                        "Confirm install",
+                        widgets::ActionStyle::Primary,
+                        true,
+                    )
+                    .clicked()
+                    {
+                        confirm = true;
+                    }
+                    if ui.button("Cancel").clicked() {
+                        cancel = true;
+                    }
+                });
+                if confirm {
+                    self.local_xenia_install = LocalXeniaInstallStage::Preview {
+                        source_path,
+                        profile_id,
+                        configuration_path,
+                        preview,
+                    };
+                    self.confirm_local_xenia_apply();
+                } else if !cancel {
+                    self.local_xenia_install = LocalXeniaInstallStage::Preview {
+                        source_path,
+                        profile_id,
+                        configuration_path,
+                        preview,
+                    };
+                }
+            }
+            LocalXeniaInstallStage::Applied {
+                destination_root,
+                journal_path,
+            } => {
+                widgets::status_badge(ui, "Installed", widgets::StatusTone::Success);
+                if let Some(path) = journal_path.as_ref() {
+                    ui.label(format!("Transaction journal: {}", path.display()));
+                }
+                if ui.button("Undo this install").clicked() {
+                    if let Some(path) = journal_path {
+                        self.local_xenia_install = LocalXeniaInstallStage::UndoPreview {
+                            destination_root: destination_root.clone(),
+                            preview: Box::new(preview_shared_rollback(
+                                &path,
+                                &destination_root,
+                                &default_shared_backup_root().unwrap_or_default(),
+                            )),
+                        };
+                    }
+                } else {
+                    self.local_xenia_install = LocalXeniaInstallStage::Applied {
+                        destination_root,
+                        journal_path,
+                    };
+                }
+            }
+            LocalXeniaInstallStage::UndoPreview {
+                destination_root,
+                preview,
+            } => {
+                let mut confirm = false;
+                if widgets::action_button(ui, "Confirm undo", widgets::ActionStyle::Primary, true)
+                    .clicked()
+                {
+                    confirm = true;
+                }
+                if confirm {
+                    let (Ok(history_root), Ok(backup_root)) =
+                        (default_shared_history_root(), default_shared_backup_root())
+                    else {
+                        self.local_xenia_install = LocalXeniaInstallStage::Error {
+                            message: "Shared history/backup roots unavailable.".to_string(),
+                        };
+                        return;
+                    };
+                    let result = execute_shared_rollback(
+                        &preview,
+                        &SharedRollbackOptions {
+                            confirmation: SharedRollbackConfirmation {
+                                preview_id: preview.preview_id.clone(),
+                                approved: true,
+                            },
+                            rollback_operation_id: generate_shared_operation_id(),
+                            timestamp_unix_seconds: now_unix_seconds(),
+                            history_root,
+                            backup_root,
+                        },
+                    );
+                    self.local_xenia_install = if result.status == SharedApplyStatus::Success {
+                        LocalXeniaInstallStage::Done {
+                            message: "Xenia patch install undone and prior state restored."
+                                .to_string(),
+                        }
+                    } else {
+                        LocalXeniaInstallStage::Error {
+                            message: format!("Undo did not fully succeed: {:?}", result.status),
+                        }
+                    };
+                } else {
+                    self.local_xenia_install = LocalXeniaInstallStage::UndoPreview {
+                        destination_root,
+                        preview,
+                    };
+                }
+            }
+            LocalXeniaInstallStage::Done { message } => {
+                widgets::banner(ui, "Undo complete", &message, widgets::StatusTone::Info);
+                if !ui.button("Dismiss").clicked() {
+                    self.local_xenia_install = LocalXeniaInstallStage::Done { message };
+                }
+            }
+            LocalXeniaInstallStage::Error { message } => {
+                widgets::banner(
+                    ui,
+                    "Local Xenia install error",
+                    &message,
+                    widgets::StatusTone::Blocked,
+                );
+                if !ui.button("Dismiss").clicked() {
+                    self.local_xenia_install = LocalXeniaInstallStage::Error { message };
+                }
+            }
+        }
+    }
+}
+
+/// Plain-language summary of a pack preview: `(text, needs_attention)` pairs.
+/// Zero counts are omitted. Wording avoids internal terms and always ends by
+/// saying nothing is enabled or installed.
+fn pack_summary_lines(preview: &CheatPackPreview) -> Vec<(String, bool)> {
+    let t = &preview.totals;
+    let plural = |n: usize, one: &str, many: &str| {
+        if n == 1 {
+            one.to_string()
+        } else {
+            many.to_string()
+        }
+    };
+    let mut lines = vec![(
+        format!(
+            "EmuWiz looked through {} {} and found {} {}.",
+            t.files_discovered,
+            plural(t.files_discovered, "file", "files"),
+            t.logical_cheats,
+            plural(t.logical_cheats, "cheat", "cheats"),
+        ),
+        false,
+    )];
+    if !preview.complete {
+        lines.push((
+            "This folder is larger than EmuWiz looks through at once, so these results are partial.".into(),
+            true,
+        ));
+    }
+    let mut add = |n: usize, text: String, warn: bool| {
+        if n > 0 {
+            lines.push((text, warn));
+        }
+    };
+    add(
+        t.usable_cheats,
+        format!("{} can be reviewed for your games.", t.usable_cheats),
+        false,
+    );
+    let mismatched = t.region_mismatches + t.revision_mismatches;
+    add(
+        mismatched,
+        format!("{mismatched} may not match this region or revision."),
+        true,
+    );
+    add(
+        t.conflicts,
+        format!(
+            "{} have different versions - you will choose which to use.",
+            t.conflicts
+        ),
+        true,
+    );
+    let unsupported = t.unsupported_formats + t.unsupported_targets;
+    add(
+        unsupported,
+        format!("{unsupported} are in a format EmuWiz cannot use here."),
+        true,
+    );
+    let unreadable = t.malformed_cheats + t.files_malformed;
+    add(unreadable, format!("{unreadable} could not be read."), true);
+    let unmatched = t.would_remain_unmatched;
+    add(
+        unmatched,
+        format!("{unmatched} do not match a game in your library yet."),
+        false,
+    );
+    add(
+        t.would_remain_ambiguous,
+        format!("{} match more than one game.", t.would_remain_ambiguous),
+        true,
+    );
+    let copies = t.exact_duplicates + t.equivalent_duplicates;
+    add(
+        copies,
+        format!("{copies} appear more than once or are copies of cheats you already have."),
+        false,
+    );
+    lines.push((
+        "Nothing is enabled or installed by this preview.".into(),
+        false,
+    ));
+    lines
+}
+
+fn now_unix_seconds() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|value| value.as_secs())
+        .unwrap_or(0)
+}
+
+fn theme_gap() -> f32 {
+    crate::ui::theme::SECTION_GAP
+}
+
+fn format_label(format: UserCheatFormat) -> &'static str {
+    match format {
+        UserCheatFormat::RetroarchCht => "RetroArch .cht",
+        UserCheatFormat::Pcsx2Pnach => "PCSX2 .pnach",
+        UserCheatFormat::DolphinGameSettingsIni => "Dolphin GameSettings .ini",
+        UserCheatFormat::XeniaPatchToml => "Xenia .patch.toml",
+    }
+}
+
+fn target_label(target: &CheatTargetFormat) -> &'static str {
+    match target {
+        CheatTargetFormat::DolphinActionReplay => "Dolphin Action Replay",
+        CheatTargetFormat::Gecko => "Gecko",
+        CheatTargetFormat::Pnach => "PCSX2 PNACH",
+        CheatTargetFormat::RetroArch => "RetroArch",
+        CheatTargetFormat::ActionReplayDs => "Action Replay DS",
+        CheatTargetFormat::GameSharkPs2 => "PS2 GameShark",
+        CheatTargetFormat::CodeBreakerPs2 => "PS2 CodeBreaker",
+        CheatTargetFormat::DolphinOnFrame => "Dolphin On-Frame",
+    }
+}
+
+fn match_label(state: UserCheatMatchState) -> &'static str {
+    match state {
+        UserCheatMatchState::Exact => "Exact match",
+        UserCheatMatchState::Strong => "Strong match",
+        UserCheatMatchState::Possible => "Possible match",
+        UserCheatMatchState::Ambiguous => "Review matches",
+        UserCheatMatchState::Unsupported => "Not imported",
+        UserCheatMatchState::NoMatch => "No match",
+    }
+}
+
+fn match_explanation(state: UserCheatMatchState) -> &'static str {
+    match state {
+        UserCheatMatchState::Exact => {
+            "Exact match — this file matches a game using strong identity evidence."
+        }
+        UserCheatMatchState::Strong => {
+            "Strong match — the game details match, but an exact file identity was not confirmed."
+        }
+        UserCheatMatchState::Possible => {
+            "Possible match — some details fit. Review the evidence before using this cheat."
+        }
+        UserCheatMatchState::Ambiguous => {
+            "EmuWiz found more than one possible game. Review the matches; it will not guess."
+        }
+        UserCheatMatchState::Unsupported => {
+            "This file was not imported because its format is not supported. Supported formats are RetroArch .cht and PCSX2 .pnach."
+        }
+        UserCheatMatchState::NoMatch => "No matching game was found in your library.",
+    }
+}
+
+fn match_tone(state: UserCheatMatchState) -> widgets::StatusTone {
+    match state {
+        UserCheatMatchState::Exact => widgets::StatusTone::Success,
+        UserCheatMatchState::Strong => widgets::StatusTone::Info,
+        UserCheatMatchState::Possible | UserCheatMatchState::Ambiguous => {
+            widgets::StatusTone::Warning
+        }
+        UserCheatMatchState::Unsupported | UserCheatMatchState::NoMatch => {
+            widgets::StatusTone::Pending
+        }
+    }
+}
+
+fn evidence_text(evidence: &[archivefs_core::patch_manager::UserCheatEvidence]) -> String {
+    if evidence.is_empty() {
+        "No matching evidence reported.".to_string()
+    } else {
+        evidence
+            .iter()
+            .map(|item| format!("{}={}", item.kind, item.value))
+            .collect::<Vec<_>>()
+            .join(", ")
+    }
+}
+
+fn format_diagnostic(diagnostic: &UserCheatDiagnostic) -> String {
+    format!("{}: {}", diagnostic.path.display(), diagnostic.message)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn converter_detects_unique_formats_but_refuses_to_guess_plain_pairs() {
+        assert_eq!(
+            detect_conversion_source("patch=1,EE,20123456,word,DEADBEEF"),
+            Some(3)
+        );
+        assert_eq!(
+            detect_conversion_source("[Gecko]\n$Lives\n042318AC 3B8003E7"),
+            Some(0)
+        );
+        assert_eq!(detect_conversion_source("042318AC 3B8003E7"), None);
+        assert!(looks_like_unlabelled_pair_list("042318AC 3B8003E7"));
+        assert!(!looks_like_unlabelled_pair_list("cheat4_code = A"));
+    }
+
+    #[test]
+    fn converter_produces_exact_preview_for_matching_game_and_source() {
+        let document = build_conversion_document(
+            "Example Game",
+            CheatPlatform::GameCube,
+            0,
+            "[Gecko]\n$Infinite Lives\n042318AC 3B8003E7",
+        )
+        .unwrap();
+        let preview = convert_cheat_document(&document, CheatTargetFormat::DolphinActionReplay);
+        assert!(preview.can_apply);
+        assert_eq!(preview.output_preview.as_deref(), Some("042318AC 3B8003E7"));
+    }
+
+    #[test]
+    fn converter_blocks_wrong_platform_malformed_and_width_overflow() {
+        assert!(
+            build_conversion_document("Example Game", CheatPlatform::Ps2, 0, "042318AC 3B8003E7",)
+                .is_err()
+        );
+        let malformed = build_conversion_document(
+            "Example Game",
+            CheatPlatform::GameCube,
+            1,
+            "002318AC 00000100",
+        )
+        .unwrap();
+        let preview = convert_cheat_document(&malformed, CheatTargetFormat::DolphinActionReplay);
+        assert!(!preview.can_apply);
+        assert!(preview.output_preview.is_none());
+    }
+
+    #[test]
+    fn converter_rejects_overflowing_pnach_values_instead_of_truncating() {
+        let document = build_conversion_document(
+            "Example PS2 Game",
+            CheatPlatform::Ps2,
+            3,
+            "patch=1,EE,20123456,byte,00000100",
+        )
+        .unwrap();
+        let preview = convert_cheat_document(&document, CheatTargetFormat::Pnach);
+        assert!(!preview.can_apply);
+        assert!(preview.output_preview.is_none());
+    }
+
+    #[test]
+    fn converter_cancel_clears_uncommitted_preview_only() {
+        let mut state = UserCheatImportPageState {
+            converter_text: "042318AC 3B8003E7".into(),
+            converter_source_format: Some(0),
+            converter_target_format: Some(CheatTargetFormat::Gecko),
+            ..Default::default()
+        };
+        state.clear_converter();
+        assert!(state.converter_text.is_empty());
+        assert!(state.converter_target_format.is_none());
+    }
+
+    #[test]
+    fn changing_games_clears_converter_identity_confirmation() {
+        let mut state = UserCheatImportPageState {
+            context_key: Some("game-a".into()),
+            converter_context_key: Some("game-a|GameCube".into()),
+            converter_text: "042318AC 3B8003E7".into(),
+            converter_game_confirmed: true,
+            ..Default::default()
+        };
+        state.sync_converter_context(Some("game-b|GameCube".into()));
+        assert!(!state.converter_game_confirmed);
+        assert!(state.converter_text.is_empty());
+    }
+
+    fn retroarch_destination(core: &str) -> CheatDestinationRequest {
+        CheatDestinationRequest {
+            profile_cheat_root: PathBuf::from("/profile/cheats"),
+            retroarch_core: Some(core.to_string()),
+            retroarch_core_required: true,
+            platform: Some("Arcade".to_string()),
+            content_basename: Some("sf2".to_string()),
+            playlist_name: None,
+            catalogue_name: "sf2".to_string(),
+        }
+    }
+
+    /// A real local-file preview for a SNES game, built through the same
+    /// discovery/selection/preview pipeline the "Install this cheat file"
+    /// button uses. Returns the page in its Preview stage, the previewed
+    /// destination and the temporary root (the caller removes it).
+    fn page_with_local_preview(
+        core: &str,
+    ) -> (UserCheatImportPageState, CheatDestinationRequest, PathBuf) {
+        let root = std::env::temp_dir().join(format!(
+            "emuwiz-stale-local-preview-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let write = |relative: &str, contents: &str| {
+            let path = root.join(relative);
+            std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+            std::fs::write(&path, contents).unwrap();
+            path
+        };
+        let local_file = write(
+            "downloads/Chrono Quest (USA).cht",
+            "cheats = 1\ncheat0_desc = \"Infinite Health\"\ncheat0_code = \"AAAA\"\ncheat0_enable = false\n",
+        );
+        let game = CheatJourneyGameIdentity {
+            state: archivefs_core::patch_manager::CheatJourneyIdentityState::Verified,
+            selected_archive: write("library/Chrono Quest (USA).sfc", "rom"),
+            identity_key: "library:chrono-quest-usa".into(),
+            archive: archivefs_core::patch_manager::CheatCandidateArchive {
+                display_name: "Chrono Quest (USA)".into(),
+                platform: Some("SNES".into()),
+                region: Some("USA".into()),
+                content_basename: Some("Chrono Quest (USA)".into()),
+                ..Default::default()
+            },
+            evidence: vec![archivefs_core::patch_manager::CheatJourneyIdentityEvidence {
+                kind: archivefs_core::patch_manager::CheatJourneyIdentityEvidenceKind::CanonicalLibraryRecord,
+                value: "game-42".into(),
+            }],
+        };
+        let cheat_root = root.join("retroarch/cheats");
+        std::fs::create_dir_all(cheat_root.join(core)).unwrap();
+        let destination = CheatDestinationRequest {
+            profile_cheat_root: cheat_root,
+            retroarch_core: Some(core.to_string()),
+            retroarch_core_required: true,
+            platform: Some("SNES".into()),
+            content_basename: Some("Chrono Quest (USA)".into()),
+            playlist_name: None,
+            catalogue_name: "Chrono Quest (USA)".into(),
+        };
+        let mut page = UserCheatImportPageState::default();
+        page.start_local_install(local_file, &game, &destination);
+        if let LocalInstallStage::Blocked { message, .. } = &page.local_install {
+            panic!("fixture must reach Preview, got Blocked: {message}");
+        }
+        assert!(
+            page.has_pending_local_install_preview(),
+            "fixture must reach Preview"
+        );
+        (page, destination, root)
+    }
+
+    fn assert_stale_blocked(page: &UserCheatImportPageState, root: &std::path::Path) {
+        assert!(matches!(
+            &page.local_install,
+            LocalInstallStage::Blocked { message, .. } if message == LOCAL_INSTALL_TARGET_CHANGED
+        ));
+        // Nothing was written under the previewed cheat folder.
+        let written = walk_files(&root.join("retroarch/cheats"));
+        assert!(written.is_empty(), "{written:?}");
+    }
+
+    fn walk_files(dir: &std::path::Path) -> Vec<PathBuf> {
+        let mut out = Vec::new();
+        if let Ok(entries) = std::fs::read_dir(dir) {
+            for entry in entries.flatten() {
+                let path = entry.path();
+                if path.is_dir() {
+                    out.extend(walk_files(&path));
+                } else {
+                    out.push(path);
+                }
+            }
+        }
+        out
+    }
+
+    /// Renders one frame of the page as Cheats & Mods does: the caller first
+    /// supplies the pending confirmation's validation (`None` still
+    /// checking) and the local RetroArch context (`None` when stale).
+    fn page_frame(
+        ctx: &egui::Context,
+        page: &mut UserCheatImportPageState,
+        destination: Option<CheatDestinationRequest>,
+        validation: Option<bool>,
+    ) {
+        let context = destination.map(|destination| LocalCheatInstallContext {
+            game: CheatJourneyGameIdentity {
+                state: archivefs_core::patch_manager::CheatJourneyIdentityState::Verified,
+                selected_archive: PathBuf::from("/x"),
+                identity_key: "x".into(),
+                archive: Default::default(),
+                evidence: vec![],
+            },
+            destination: Some(destination),
+        });
+        page.set_local_install_confirm_validation(validation);
+        let _ = ctx.run(egui::RawInput::default(), |ctx| {
+            egui::CentralPanel::default().show(ctx, |ui| {
+                page.show(
+                    ui,
+                    ctx,
+                    &[],
+                    Some(("game", "Chrono Quest (USA)")),
+                    Some("GameCube"),
+                    context.as_ref(),
+                    None,
+                    None,
+                    None,
+                );
+            });
+        });
+    }
+
+    fn written(root: &std::path::Path) -> usize {
+        walk_files(&root.join("retroarch/cheats")).len()
+    }
+
+    /// Installing tests stage identical content through the shared staging
+    /// root; run them one at a time.
+    static INSTALLING_TESTS: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    fn assert_writes_isolated() {
+        // Successful cases write a journal and backups: only ever inside the
+        // private test environment, never the real data folder.
+        let isolated = archivefs_core::test_environment::isolated_root()
+            .expect("this test writes only inside the isolated test environment");
+        for root in [
+            default_shared_history_root().unwrap(),
+            default_shared_backup_root().unwrap(),
+        ] {
+            assert!(
+                root.starts_with(isolated),
+                "{root:?} is outside {isolated:?}"
+            );
+        }
+    }
+
+    fn confirm_page() -> (
+        egui::Context,
+        UserCheatImportPageState,
+        CheatDestinationRequest,
+        PathBuf,
+    ) {
+        let (mut page, destination, root) = page_with_local_preview("snes9x");
+        page.context_key = Some("game".into());
+        let ctx = egui::Context::default();
+        // First render establishes the page as shown.
+        page_frame(&ctx, &mut page, Some(destination.clone()), None);
+        (ctx, page, destination, root)
+    }
+
+    #[test]
+    fn confirmation_installs_only_after_the_fresh_recheck_and_only_once() {
+        let _serial = INSTALLING_TESTS.lock().unwrap_or_else(|e| e.into_inner());
+        assert_writes_isolated();
+        let (ctx, mut page, destination, root) = confirm_page();
+        assert!(page.request_local_install_confirm());
+        // Repeated clicks while checking are ignored (no duplicate install).
+        assert!(!page.request_local_install_confirm());
+        // The re-check is still running (slow folder): nothing happens, the
+        // page keeps waiting and stays responsive.
+        for _ in 0..5 {
+            page_frame(&ctx, &mut page, Some(destination.clone()), None);
+            assert!(page.local_install_confirm_requested_at().is_some());
+            assert_eq!(written(&root), 0);
+        }
+        // Fresh validation arrives: exactly one install.
+        page_frame(&ctx, &mut page, Some(destination.clone()), Some(true));
+        if let LocalInstallStage::Error { message } = &page.local_install {
+            panic!("install failed: {message}");
+        }
+        assert!(matches!(
+            page.local_install,
+            LocalInstallStage::Applied { .. }
+        ));
+        let after_install = written(&root);
+        assert!(after_install > 0);
+        // Further frames or clicks cannot install again.
+        assert!(!page.request_local_install_confirm());
+        page_frame(&ctx, &mut page, Some(destination), Some(true));
+        assert_eq!(written(&root), after_install);
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn a_timed_out_confirmation_reports_it_and_can_be_retried() {
+        let _serial = INSTALLING_TESTS.lock().unwrap_or_else(|e| e.into_inner());
+        assert_writes_isolated();
+        let (ctx, mut page, destination, root) = confirm_page();
+        assert!(page.request_local_install_confirm());
+        page.local_install_confirm_requested_at =
+            Some(std::time::Instant::now() - LOCAL_CONFIRM_VALIDATION_TIMEOUT);
+        page_frame(&ctx, &mut page, Some(destination.clone()), None);
+        assert_eq!(
+            page.local_install_confirm_notice,
+            Some(LOCAL_CONFIRM_TIMED_OUT)
+        );
+        assert!(page.has_pending_local_install_preview());
+        assert!(page.local_install_confirm_requested_at().is_none());
+        assert_eq!(written(&root), 0);
+        // Retry: a new confirmation clears the notice and installs once checked.
+        assert!(page.request_local_install_confirm());
+        assert_eq!(page.local_install_confirm_notice, None);
+        page_frame(&ctx, &mut page, Some(destination), Some(true));
+        assert!(written(&root) > 0);
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn a_re_check_that_finishes_after_the_timeout_never_installs() {
+        let (ctx, mut page, destination, root) = confirm_page();
+        assert!(page.request_local_install_confirm());
+        page.local_install_confirm_requested_at =
+            Some(std::time::Instant::now() - LOCAL_CONFIRM_VALIDATION_TIMEOUT);
+        page_frame(&ctx, &mut page, Some(destination), Some(true));
+        assert_eq!(
+            page.local_install_confirm_notice,
+            Some(LOCAL_CONFIRM_TIMED_OUT)
+        );
+        assert!(page.has_pending_local_install_preview());
+        assert_eq!(written(&root), 0);
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn switching_game_clears_a_pending_confirmation_and_its_notice() {
+        let (_ctx, mut page, _destination, root) = confirm_page();
+        assert!(page.request_local_install_confirm());
+        page.local_install_confirm_notice = Some(LOCAL_CONFIRM_TIMED_OUT);
+        page.invalidate_if_context_changed(Some("another-game".into()));
+        assert!(page.local_install_confirm_requested_at.is_none());
+        assert_eq!(page.local_install_confirm_notice, None);
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn leaving_the_page_cancels_the_confirmation_with_a_message() {
+        let (ctx, mut page, destination, root) = confirm_page();
+        assert!(page.request_local_install_confirm());
+        // Frames pass without this page being shown (the user navigated
+        // away); on return a now-valid check must not install.
+        for _ in 0..3 {
+            let _ = ctx.run(egui::RawInput::default(), |_| {});
+        }
+        page_frame(&ctx, &mut page, Some(destination), Some(true));
+        assert_eq!(
+            page.local_install_confirm_notice,
+            Some(LOCAL_CONFIRM_INTERRUPTED)
+        );
+        assert!(page.has_pending_local_install_preview());
+        assert_eq!(written(&root), 0);
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn a_changed_target_refuses_a_pending_confirmation() {
+        // Stale context (emulator/core/folder changed): Blocked, no write.
+        let (ctx, mut page, _destination, root) = confirm_page();
+        assert!(page.request_local_install_confirm());
+        page_frame(&ctx, &mut page, None, None);
+        assert_stale_blocked(&page, &root);
+        assert!(page.local_install_confirm_requested_at().is_none());
+        // Fresh re-check found RetroArch is no longer the target.
+        let (ctx, mut page, destination, root2) = confirm_page();
+        assert!(page.request_local_install_confirm());
+        page_frame(&ctx, &mut page, Some(destination), Some(false));
+        assert_stale_blocked(&page, &root2);
+        let _ = std::fs::remove_dir_all(&root);
+        let _ = std::fs::remove_dir_all(&root2);
+    }
+
+    #[test]
+    fn stale_local_confirmation_never_writes_after_emulator_core_or_folder_change() {
+        let changes: [fn(&mut Option<CheatDestinationRequest>); 3] = [
+            // Emulator changed away from RetroArch: no RetroArch destination.
+            |current| *current = None,
+            // RetroArch core changed.
+            |current| current.as_mut().unwrap().retroarch_core = Some("bsnes".into()),
+            // Cheat folder (profile) changed.
+            |current| {
+                current.as_mut().unwrap().profile_cheat_root = PathBuf::from("/elsewhere/cheats")
+            },
+        ];
+        for change in changes {
+            let (mut page, destination, root) = page_with_local_preview("snes9x");
+            let mut current = Some(destination);
+            change(&mut current);
+            // A confirmation for the old target arrives (e.g. the click was
+            // queued before the page re-rendered): it must not write.
+            page.local_install_current_destination = current;
+            page.confirm_local_apply();
+            assert_stale_blocked(&page, &root);
+            let _ = std::fs::remove_dir_all(&root);
+        }
+    }
+
+    #[test]
+    fn onframe_session_resets_when_the_config_path_changes_under_the_same_profile() {
+        let target = |path: &str| Some(("profile-1".to_string(), PathBuf::from(path)));
+        let mut page = UserCheatImportPageState::default();
+        page.sync_onframe_target(target("/dolphin/a"));
+        page.onframe_install.rollback_available = true;
+        // Same target: the session is left alone.
+        page.sync_onframe_target(target("/dolphin/a"));
+        assert!(page.onframe_install.rollback_available);
+        // Same profile ID, different configuration path: reset.
+        page.sync_onframe_target(target("/dolphin/b"));
+        assert!(!page.onframe_install.rollback_available);
+        // Target disappearing also resets.
+        page.onframe_install.rollback_available = true;
+        page.sync_onframe_target(None);
+        assert!(!page.onframe_install.rollback_available);
+    }
+
+    #[test]
+    fn stale_local_preview_is_cancelled_on_the_next_frame() {
+        let (mut page, destination, root) = page_with_local_preview("snes9x");
+        // Unchanged target: the preview survives (no unnecessary cancel).
+        page.invalidate_stale_local_install(Some(&LocalCheatInstallContext {
+            game: CheatJourneyGameIdentity {
+                state: archivefs_core::patch_manager::CheatJourneyIdentityState::Verified,
+                selected_archive: PathBuf::from("/x"),
+                identity_key: "x".into(),
+                archive: Default::default(),
+                evidence: vec![],
+            },
+            destination: Some(destination.clone()),
+        }));
+        assert!(page.has_pending_local_install_preview());
+        // No RetroArch target any more (other emulator chosen or stale core).
+        page.invalidate_stale_local_install(None);
+        assert_stale_blocked(&page, &root);
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// A real Xenia local-patch preview (temporary profile and staging root).
+    fn page_with_xenia_preview() -> (UserCheatImportPageState, PathBuf, PathBuf) {
+        use archivefs_core::patch_manager::{
+            XeniaInstallPreviewRequest, build_xenia_install_preview,
+            discover_local_xenia_patch_file, load_local_xenia_destination,
+            stage_local_xenia_patch_file,
+        };
+        let root = std::env::temp_dir().join(format!(
+            "emuwiz-stale-xenia-preview-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let source = root.join("incoming/Test.patch.toml");
+        std::fs::create_dir_all(source.parent().unwrap()).unwrap();
+        std::fs::write(
+            &source,
+            "title_name = \"Test Game\"\ntitle_id = \"415607D2\"\nhash = \"4768B579A3C5F134\"\n\n[[patch]]\nname = \"Infinite health\"\ndesc = \"test\"\nauthor = \"local\"\nis_enabled = false\n[[patch.be32]]\naddress = 0x82000000\nvalue = 0x1\n",
+        )
+        .unwrap();
+        let config = root.join("xenia");
+        std::fs::create_dir_all(&config).unwrap();
+        let discovery = discover_local_xenia_patch_file(&source, Some("415607D2")).unwrap();
+        let destination = load_local_xenia_destination(&config, "Test.patch.toml").unwrap();
+        let staged = stage_local_xenia_patch_file(
+            &root.join("generated"),
+            "Test.patch.toml",
+            &discovery,
+            destination.document.as_ref(),
+        )
+        .unwrap();
+        let preview = build_xenia_install_preview(&XeniaInstallPreviewRequest {
+            selected_archive: source.clone(),
+            configuration_path: config.clone(),
+            title_id: discovery.candidate.title_id.clone(),
+            compatibility: discovery.candidate.compatibility,
+            staged,
+        })
+        .unwrap();
+        let mut page = UserCheatImportPageState::default();
+        page.local_xenia_install = LocalXeniaInstallStage::Preview {
+            source_path: source,
+            profile_id: "xenia-user".into(),
+            configuration_path: config.clone(),
+            preview: Box::new(preview),
+        };
+        (page, config, root)
+    }
+
+    fn xenia_blocked(page: &UserCheatImportPageState) -> bool {
+        matches!(
+            &page.local_xenia_install,
+            LocalXeniaInstallStage::Blocked { message, .. } if message == LOCAL_INSTALL_TARGET_CHANGED
+        )
+    }
+
+    #[test]
+    fn xenia_local_preview_is_kept_for_an_unchanged_target_and_cancelled_on_change() {
+        let (mut page, config, root) = page_with_xenia_preview();
+        page.local_xenia_current_target = Some(("xenia-user".into(), config.clone()));
+        page.invalidate_stale_native_local_installs();
+        assert!(matches!(
+            page.local_xenia_install,
+            LocalXeniaInstallStage::Preview { .. }
+        ));
+        // Another profile was selected (or Xenia is no longer the target).
+        for current in [Some(("other-profile".to_string(), config.clone())), None] {
+            let (mut page, _, root) = page_with_xenia_preview();
+            page.local_xenia_current_target = current;
+            page.invalidate_stale_native_local_installs();
+            assert!(xenia_blocked(&page));
+            let _ = std::fs::remove_dir_all(&root);
+        }
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn stale_xenia_confirmation_never_writes() {
+        let (mut page, config, root) = page_with_xenia_preview();
+        page.local_xenia_current_target = Some(("xenia-user".into(), root.join("elsewhere")));
+        page.confirm_local_xenia_apply();
+        assert!(xenia_blocked(&page));
+        let written = walk_files(&config);
+        assert!(written.is_empty(), "{written:?}");
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn native_local_targets_must_match_profile_and_configuration_path() {
+        let path = PathBuf::from("/profile/config.ini");
+        let current = ("profile-a".to_string(), path.clone());
+        assert!(native_target_is_current("profile-a", &path, Some(&current)));
+        assert!(!native_target_is_current(
+            "profile-b",
+            &path,
+            Some(&current)
+        ));
+        assert!(!native_target_is_current(
+            "profile-a",
+            std::path::Path::new("/other/config.ini"),
+            Some(&current)
+        ));
+        assert!(!native_target_is_current("profile-a", &path, None));
+    }
+
+    #[test]
+    fn switching_game_cancels_every_pending_local_preview() {
+        let (mut page, config, root) = page_with_xenia_preview();
+        page.context_key = Some("game-a".into());
+        page.local_xenia_current_target = Some(("xenia-user".into(), config));
+        page.invalidate_if_context_changed(Some("game-b".into()));
+        assert!(xenia_blocked(&page));
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn local_install_preview_is_cancelled_when_the_target_changes() {
+        let previewed = retroarch_destination("fbneo");
+        assert!(local_preview_targets_current_destination(
+            &previewed,
+            Some(&retroarch_destination("fbneo"))
+        ));
+        // Another core, another profile, or no RetroArch target at all (for
+        // example standalone MAME was chosen) invalidates the preview.
+        assert!(!local_preview_targets_current_destination(
+            &previewed,
+            Some(&retroarch_destination("mame2003_plus"))
+        ));
+        let mut other_profile = retroarch_destination("fbneo");
+        other_profile.profile_cheat_root = PathBuf::from("/other/cheats");
+        assert!(!local_preview_targets_current_destination(
+            &previewed,
+            Some(&other_profile)
+        ));
+        assert!(!local_preview_targets_current_destination(&previewed, None));
+        assert!(LOCAL_INSTALL_TARGET_CHANGED.contains("nothing was installed"));
+    }
+
+    #[test]
+    fn wording_preserves_backend_confidence() {
+        assert!(match_explanation(UserCheatMatchState::Exact).starts_with("Exact match"));
+        assert!(match_explanation(UserCheatMatchState::Strong).contains("not confirmed"));
+        assert!(match_explanation(UserCheatMatchState::Possible).contains("some details"));
+        assert!(match_explanation(UserCheatMatchState::Ambiguous).contains("will not guess"));
+    }
+
+    #[test]
+    fn unsupported_and_unmatched_are_separate() {
+        assert_ne!(
+            match_label(UserCheatMatchState::Unsupported),
+            match_label(UserCheatMatchState::NoMatch)
+        );
+        assert!(match_explanation(UserCheatMatchState::Unsupported).contains("not supported"));
+        assert!(match_explanation(UserCheatMatchState::NoMatch).contains("No matching game"));
+    }
+
+    #[test]
+    fn no_mutating_action_is_named_by_the_review_surface() {
+        for state in [
+            UserCheatMatchState::Exact,
+            UserCheatMatchState::Strong,
+            UserCheatMatchState::Possible,
+            UserCheatMatchState::Ambiguous,
+            UserCheatMatchState::NoMatch,
+        ] {
+            assert!(!match_explanation(state).contains("Apply"));
+            assert!(!match_explanation(state).contains("Install"));
+        }
+    }
+
+    #[test]
+    fn formats_are_the_two_backend_formats() {
+        assert_eq!(
+            format_label(UserCheatFormat::RetroarchCht),
+            "RetroArch .cht"
+        );
+        assert_eq!(format_label(UserCheatFormat::Pcsx2Pnach), "PCSX2 .pnach");
+    }
+
+    fn preview_of(files: &[(&str, &str)]) -> CheatPackPreview {
+        let root = tempfile::tempdir().unwrap();
+        for (name, body) in files {
+            std::fs::write(root.path().join(name), body).unwrap();
+        }
+        let library = vec![CheatPackCatalogueGame {
+            game: UserCheatLibraryGame {
+                game_id: "g".into(),
+                title: "Example".into(),
+                ..Default::default()
+            },
+            facts: Vec::new(),
+            revision: None,
+        }];
+        preview_cheat_pack(
+            root.path(),
+            &library,
+            &BTreeMap::new(),
+            &BTreeSet::new(),
+            &CheatPackLimits::default(),
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn pack_summary_reports_conflicts_and_unreadable_files_in_plain_words() {
+        let preview = preview_of(&[
+            (
+                "Example.cht",
+                "cheats = 1\ncheat0_desc = \"Lives\"\ncheat0_code = \"A\"\ncheat0_code = \"B\"\n",
+            ),
+            ("Broken.cht", "\u{0}\u{1}not a cheat file"),
+        ]);
+        let lines = pack_summary_lines(&preview);
+        let text: Vec<&str> = lines.iter().map(|(line, _)| line.as_str()).collect();
+        assert!(
+            text[0].starts_with("EmuWiz looked through 2 files"),
+            "{text:?}"
+        );
+        assert!(
+            text.iter().any(|l| l.contains("different versions")),
+            "{text:?}"
+        );
+        assert!(
+            text.iter().any(|l| l.contains("could not be read")),
+            "{text:?}"
+        );
+        assert_eq!(
+            *text.last().unwrap(),
+            "Nothing is enabled or installed by this preview."
+        );
+        // Nothing in normal wording leaks internal names, and a preview can
+        // never be applied.
+        for line in &text {
+            assert!(
+                !line.contains("CheatPack") && !line.contains("Variant") && !line.contains("::"),
+                "{line}"
+            );
+        }
+        assert!(!preview.can_apply());
+    }
+
+    #[test]
+    fn pack_summary_for_an_empty_folder_is_calm_and_complete() {
+        let preview = preview_of(&[]);
+        let lines = pack_summary_lines(&preview);
+        assert_eq!(lines.len(), 2, "{lines:?}");
+        assert!(lines[0].0.contains("0 files") && lines[0].0.contains("0 cheats"));
+        assert!(lines.iter().all(|(_, attention)| !attention));
+    }
+}

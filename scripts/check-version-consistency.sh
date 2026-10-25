@@ -47,8 +47,8 @@ VERSION="$(release_workspace_version "$REPO_ROOT")"
 TARGET_NAME="$(release_target_name)"
 BUNDLE_NAME="$(release_bundle_name "$VERSION" "$TARGET_NAME")"
 
-grep -Fqx "## v$VERSION (unreleased)" "$REPO_ROOT/CHANGELOG.md" ||
-    release_die "CHANGELOG.md must contain the current heading: ## v$VERSION (unreleased)"
+release_changelog_current_heading_ok "$REPO_ROOT/CHANGELOG.md" "$VERSION" ||
+    release_die "CHANGELOG.md must contain the current heading: ## v$VERSION (unreleased) or ## v$VERSION (YYYY-MM-DD)"
 grep -Fq "v$VERSION" "$REPO_ROOT/README.md" ||
     release_die "README.md does not mention current release v$VERSION"
 
@@ -57,16 +57,19 @@ if [[ -n "$BINARY_DIR" ]]; then
     [[ -x "$BINARY_DIR/emuwiz" ]] || release_die "GUI binary missing in $BINARY_DIR"
     [[ "$($BINARY_DIR/emuwiz-cli --version)" == "emuwiz-cli $VERSION" ]] ||
         release_die "CLI --version disagrees with workspace version"
-    [[ "$($BINARY_DIR/emuwiz --version)" == "emuwiz $VERSION" ]] ||
+    # The shipped GUI is the native v2 entrypoint, whose full identity is
+    # "emuwiz <version> · GUI v2 (native-v2)" (crates/archivefs-gui gui_v2::run).
+    # The whole line is required: version and generation must both agree.
+    [[ "$($BINARY_DIR/emuwiz --version)" == "emuwiz $VERSION · GUI v2 (native-v2)" ]] ||
         release_die "GUI --version disagrees with workspace version"
 fi
 
 if [[ -n "$ARTIFACT" ]]; then
-    [[ "$(basename -- "$ARTIFACT")" == "$BUNDLE_NAME.tar.gz" ]] ||
+    [[ "$(basename -- "$ARTIFACT")" == "$BUNDLE_NAME.tar.xz" ]] ||
         release_die "artifact filename disagrees with workspace version"
 fi
 if [[ -n "$CHECKSUM" ]]; then
-    [[ "$(basename -- "$CHECKSUM")" == "$BUNDLE_NAME.tar.gz.sha256" ]] ||
+    [[ "$(basename -- "$CHECKSUM")" == "$BUNDLE_NAME.tar.xz.sha256" ]] ||
         release_die "checksum filename disagrees with workspace version"
 fi
 

@@ -1,0 +1,309 @@
+#!/usr/bin/env python3
+"""Tests for restart reconciliation of interrupted executions in scripts/emuwiz-cargo-retire.
+
+Disposable synthetic targets only (the shared fixtures of test_emuwiz_cargo_retire);
+no production journal, registry or cache is read or written.
+"""
+import hashlib
+import json
+import os
+import sys
+import unittest
+
+HERE = os.path.dirname(os.path.abspath(__file__))
+sys.path.insert(0, HERE)
+sys.dont_write_bytecode = True
+import test_emuwiz_cargo_retire as R  # noqa: E402
+
+# SIGTERM after the second entry's files are unlinked, before its directory goes: the
+# 2026-10-21 16:22 shape (outcome PARTIAL with interrupted: true, then `interrupted`).
+SIGTERM_MID_ENTRY = (
+    "state = {'entries': 0}\n"
+    "def hook(stage):\n"
+    "    if stage.startswith('before-entry'):\n"
+    "        state['entries'] += 1\n"
+    "    if stage.startswith('before-rmdir') and state['entries'] == 2:\n"
+    "        os.kill(os.getpid(), signal.SIGTERM)\n"
+    "mod._hook = hook\n"
+)
+SIGKILL_MID_ENTRY = SIGTERM_MID_ENTRY.replace("SIGTERM", "SIGKILL")
+
+
+def slurp(path):
+    with open(path, "rb") as handle:
+        return handle.read()
+
+
+class Restart(R.Corrections):
+    def interrupted(self, body=SIGTERM_MID_ENTRY, name="wt-restart"):
+        wt, t, path, digest = self.cache(name)
+        r = self.run_driver(body, path, digest)
+        self.assertEqual(r.returncode, 143 if "SIGTERM" in body else -9, r.stderr)
+        (journal,) = self.journals()
+        return t, path, digest, journal
+
+    def records(self, journal):
+        return [json.loads(line) for line in slurp(journal).splitlines()]
+
+    def rewrite(self, journal, records, renumber=True):
+        if renumber:
+            records = [dict(r, seq=i) for i, r in enumerate(records, 1)]
+        with open(journal, "wb") as handle:
+            handle.write(b"".join(json.dumps(r, sort_keys=True).encode() + b"\n" for r in records))
+
+    def assert_pending(self, journal, why):
+        self.assertEqual(self.mod.incomplete_journals(self.receipts), [journal])
+        verdict = self.mod.clean_interruption(journal)
+        self.assertFalse(verdict["reconciled"])
+        self.assertIn(why, verdict["why"])
+
+    # ------------------------------------------------------------ reconciled
+    def test_clean_sigterm_mid_entry_reconciles_on_restart_without_touching_evidence(self):
+        t, path, digest, journal = self.interrupted()
+        self.assertEqual(self.events(journal)[-1], "interrupted")
+        states = self.states(journal)
+        self.assertEqual(states["debug/deps"], "KNOWN_COMPLETED")
+        self.assertEqual(states["debug/.fingerprint"], "KNOWN_PARTIAL")
+        self.assertEqual(states["debug/incremental"], "KNOWN_UNTOUCHED")
+        before = slurp(journal)
+        rc, r2 = self.run_retire(path, digest, execute=True)
+        self.assertNotIn("refused", r2)
+        self.assertEqual(slurp(journal), before, "the interrupted journal is evidence and is never modified")
+        self.assertFalse(os.path.lexists(self.mod.resolution_path(journal)), "reconciliation writes no receipt")
+        expected = [{"journal": journal, "journal_sha256": hashlib.sha256(before).hexdigest(),
+                     "rule": "CLEAN_SELF_RECORDED_INTERRUPTION"}]
+        self.assertEqual(r2["reconciled_interrupted"], expected)
+        new = [j for j in self.journals() if j != journal]
+        self.assertEqual(len(new), 1)
+        begin = self.records(new[0])[0]
+        self.assertEqual(begin["reconciled_interrupted"], expected)
+        self.assertEqual(begin["acknowledged_incomplete"], [])
+        self.assertEqual(self.events(new[0])[-1], "end")
+        # replay: the same bytes give the same verdict on every later restart
+        for _ in range(2):
+            self.assertEqual(self.mod.journal_backlog(self.receipts), ([], expected))
+        self.assertEqual(slurp(journal), before)
+
+    def test_interrupt_between_entries_reconciles(self):
+        wt, t, path, digest = self.cache("wt-restart-between")
+        count = {"n": 0}
+
+        def hook(stage):
+            if stage.startswith("before-entry"):
+                count["n"] += 1
+                if count["n"] == 2:
+                    raise KeyboardInterrupt()
+        self.set_hook(hook)
+        rc, _ = self.run_retire(path, digest, execute=True)
+        self.assertEqual(rc, 130)
+        (journal,) = self.journals()
+        self.assertTrue(self.mod.clean_interruption(journal)["reconciled"])
+        self.assertEqual(self.mod.incomplete_journals(self.receipts), [])
+
+    def test_inspect_journal_reports_the_restart_verdict(self):
+        t, path, digest, journal = self.interrupted()
+        report = self.mod.inspect_journal(journal)
+        self.assertEqual(report["restart_reconciliation"],
+                         {"reconciled": True, "rule": "CLEAN_SELF_RECORDED_INTERRUPTION", "why": None})
+
+    def test_reconciliation_does_not_bypass_the_executor_gates(self):
+        t, path, digest, journal = self.interrupted()
+        rc, r2 = self.run_retire(path, "0" * 64, execute=True)
+        self.assertEqual(r2["refused"]["code"], "MANIFEST_DIGEST_MISMATCH")
+        self.assertTrue(self.exists(t, "debug/incremental"))
+        self.assertEqual(len(self.journals()), 1, "a refused run must not start a journal")
+
+    # ------------------------------------------------------------ refused
+    def test_sigkill_without_an_interrupted_record_stays_pending(self):
+        t, path, digest, journal = self.interrupted(SIGKILL_MID_ENTRY, "wt-restart-kill")
+        self.assert_pending(journal, "did not record its own interruption")
+        rc, r2 = self.run_retire(path, digest, execute=True)
+        self.assertEqual((rc, r2["refused"]["code"]), (6, "INCOMPLETE_JOURNAL_PRESENT"))
+        self.assertTrue(self.exists(t, "debug/incremental"))
+
+    def test_untrusted_journal_shapes_stay_pending(self):
+        t, path, digest, journal = self.interrupted()
+        good = self.records(journal)
+        intents = [i for i, r in enumerate(good) if r["event"] == "intent"]
+        outcomes = [i for i, r in enumerate(good) if r["event"] == "outcome"]
+        partial = next(i for i in outcomes if good[i]["outcome"] == "PARTIAL")
+        cases = {
+            "torn": None,
+            "the final record is torn": None,
+            "did not record its own interruption": good[:-1] + [dict(good[0], event="note")],
+            "no matching open intent": [r for i, r in enumerate(good) if i != intents[0]],
+            "has an intent but no recorded outcome": [r for i, r in enumerate(good) if i != partial],
+            "another host": [dict(good[0], host="elsewhere")] + good[1:],
+            "second begin or an end": good[:-1] + [dict(good[0])] + good[-1:],
+            "unplanned": good[:intents[0]] + [dict(good[intents[0]], path="/elsewhere")] + good[intents[0] + 1:],
+            "not known from recorded outcomes": [
+                dict(r, outcome="INTERRUPTED", files=0, dirs=0) if i == partial else r for i, r in enumerate(good)],
+            "unexpected note record": good[:-1] + [{"event": "note"}] + good[-1:],
+        }
+        for why, records in cases.items():
+            with self.subTest(why):
+                if why == "torn":
+                    self.rewrite(journal, good)
+                    with open(journal, "ab") as handle:
+                        handle.write(b'{"event": "outc')
+                    self.assert_pending(journal, "torn")
+                    continue
+                if why == "the final record is torn":
+                    self.rewrite(journal, good)
+                    with open(journal, "rb+") as handle:
+                        handle.truncate(os.path.getsize(journal) - 1)
+                    self.assert_pending(journal, why)
+                    continue
+                self.rewrite(journal, records)
+                self.assert_pending(journal, why)
+        # gaps in the sequence (a record removed without renumbering) are refused too
+        self.rewrite(journal, good[:2] + good[3:], renumber=False)
+        self.assert_pending(journal, "not contiguous")
+        self.rewrite(journal, good)
+        self.assertEqual(self.mod.incomplete_journals(self.receipts), [])
+
+    def test_a_live_writer_keeps_the_journal_pending(self):
+        t, path, digest, journal = self.interrupted()
+        self.mod._pid_is_executor = lambda pid: pid
+        self.assert_pending(journal, "still running")
+
+    def test_unsafe_journal_files_stay_pending(self):
+        t, path, digest, journal = self.interrupted()
+        os.chmod(journal, 0o620)
+        self.assert_pending(journal, "group/world writable")
+        os.chmod(journal, 0o600)
+        # a symlink named like a journal is never followed
+        moved = os.path.join(self.tmp, "elsewhere.journal.jsonl")
+        os.rename(journal, moved)
+        os.symlink(moved, journal)
+        self.assertEqual(self.mod.incomplete_journals(self.receipts), [journal])
+        self.assertFalse(self.mod.clean_interruption(journal)["reconciled"])
+
+    def test_changing_a_reconciled_journal_is_judged_afresh(self):
+        t, path, digest, journal = self.interrupted()
+        self.assertEqual(self.mod.incomplete_journals(self.receipts), [])
+        with open(journal, "ab") as handle:
+            handle.write(b'{"event": "note", "seq": 99}\n')
+        self.assert_pending(journal, "not contiguous")
+
+    def test_a_journal_with_no_completed_intent_reconciles_as_no_unlink_started(self):
+        t, path, digest, journal = self.interrupted()
+        good = self.records(journal)
+        head = [r for r in good if r["event"] in ("begin", "group_plan")]
+        for name, records, tail in (("begin only", head[:1], b""),
+                                    ("planned", head, b""),
+                                    ("torn intent", head, b'{"event": "intent", "pa'),
+                                    ("interrupted while planning", head + [{"event": "interrupted"}], b"")):
+            with self.subTest(name):
+                self.rewrite(journal, records)
+                with open(journal, "ab") as handle:
+                    handle.write(tail)
+                verdict = self.mod.clean_interruption(journal)
+                self.assertEqual((verdict["reconciled"], verdict["rule"]), (True, "NO_UNLINK_STARTED"), verdict)
+                self.assertEqual(self.mod.incomplete_journals(self.receipts), [])
+        # a plan followed by anything but plans (or a final interruption) is not this shape
+        self.rewrite(journal, head + [{"event": "receipt_publication_failed"}])
+        self.assert_pending(journal, "unexpected record")
+
+    def test_empty_or_torn_begin_and_invalid_pid_stay_pending(self):
+        t, path, digest, journal = self.interrupted()
+        good = self.records(journal)
+        with open(journal, "wb"):
+            pass
+        self.assert_pending(journal, "complete begin")
+        with open(journal, "wb") as handle:
+            handle.write(json.dumps(good[0]).encode()[:40])
+        self.assert_pending(journal, "complete begin")
+        for pid in ("123", True, 0, -5, None):
+            with self.subTest(pid=pid):
+                self.rewrite(journal, [dict(good[0], pid=pid)] + good[1:])
+                self.assert_pending(journal, "pid is missing or invalid")
+
+    def test_malformed_records_are_refused_not_crashed_on(self):
+        t, path, digest, journal = self.interrupted()
+        good = self.records(journal)
+        plan = next(i for i, r in enumerate(good) if r["event"] == "group_plan")
+        out = next(i for i, r in enumerate(good) if r["event"] == "outcome")
+        cases = {
+            "group plan is malformed": [{k: v for k, v in r.items() if k != "directory"} if i == plan else r
+                                        for i, r in enumerate(good)],
+            "group plan is malformed ": [dict(r, paths="x") if i == plan else r for i, r in enumerate(good)],
+            "has no matching open intent": good[:out - 1] + [{k: v for k, v in good[out].items() if k != "path"}]
+                                           + good[out + 1:],
+        }
+        for why, records in cases.items():
+            with self.subTest(why):
+                self.rewrite(journal, records)
+                self.assert_pending(journal, why.strip())
+                # the manual tools may raise on such a journal (fail closed); they never approve it
+                try:
+                    report = self.mod.inspect_journal(journal)
+                except (KeyError, TypeError):
+                    continue
+                self.assertFalse(report["restart_reconciliation"]["reconciled"])
+        # whatever clean_interruption cannot judge blocks rather than crashing the timer
+        self.rewrite(journal, good)
+        self.mod.clean_interruption = lambda p: 1 / 0
+        self.assertEqual(self.mod.incomplete_journals(self.receipts), [journal])
+
+    def test_deeply_nested_json_blocks_instead_of_crashing(self):
+        t, path, digest, journal = self.interrupted()
+        good = slurp(journal)
+        bomb = b"[" * 100000 + b"]" * 100000
+        for where in ("journal line", "torn tail", "receipt"):
+            with self.subTest(where):
+                with open(journal, "wb") as handle:
+                    handle.write(good + (bomb + b"\n" if where == "journal line" else bomb if where == "torn tail" else b""))
+                if where == "receipt":
+                    with open(self.mod.resolution_path(journal), "wb") as handle:
+                        handle.write(bomb)
+                    os.chmod(self.mod.resolution_path(journal), 0o600)
+                # whatever cannot be judged blocks, even a journal that would otherwise reconcile
+                self.assertEqual(self.mod.incomplete_journals(self.receipts), [journal])
+        rc, r2 = self.run_retire(path, digest, execute=True)
+        self.assertEqual((rc, r2["refused"]["code"]), (6, "INCOMPLETE_JOURNAL_PRESENT"))
+        self.assertTrue(self.exists(t, "debug/incremental"))
+
+    def test_receipt_publication_failure_after_interruption_stays_pending(self):
+        t, path, digest, journal = self.interrupted()
+        self.rewrite(journal, self.records(journal) + [{"event": "receipt_publication_failed", "error": "x"}])
+        self.assert_pending(journal, "did not record its own interruption")
+
+    def test_a_real_live_executor_process_keeps_the_journal_pending(self):
+        import subprocess
+        t, path, digest, journal = self.interrupted()
+        good = self.records(journal)
+        live = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(60)", "emuwiz-cargo-retire"])
+        self.addCleanup(live.wait)
+        self.addCleanup(live.kill)
+        self.rewrite(journal, [dict(good[0], pid=live.pid)] + good[1:])
+        self.assert_pending(journal, "still running")
+        live.kill()
+        live.wait()
+        self.assertEqual(self.mod.incomplete_journals(self.receipts), [])
+
+    # ------------------------------------------------------------ legacy receipts
+    def test_deployed_schema_one_receipts_are_honoured_only_when_bound(self):
+        t, path, digest, journal = self.interrupted(SIGKILL_MID_ENTRY, "wt-restart-legacy")
+        sha = hashlib.sha256(slurp(journal)).hexdigest()
+        legacy = {"schema": 1, "journal": os.path.basename(journal), "journal_sha256": sha,
+                  "operator": "davedap (approved in test)", "accepted_uncertain": [], "note": "review record only",
+                  "host": os.uname().nodename}
+        receipt = self.mod.resolution_path(journal)
+        for bad in ({"journal_sha256": "0" * 64}, {"journal": "other.journal.jsonl"}, {"operator": " "},
+                    {"operator": None}, {"schema": 2}, {"host": "elsewhere"}, {"accepted_uncertain": None}):
+            with self.subTest(bad):
+                with open(receipt, "w") as handle:
+                    json.dump(dict(legacy, **bad), handle)
+                os.chmod(receipt, 0o600)
+                self.assertEqual(self.mod.incomplete_journals(self.receipts), [journal])
+        with open(receipt, "w") as handle:
+            json.dump(legacy, handle)
+        self.assertEqual(self.mod.incomplete_journals(self.receipts), [])
+        with open(journal, "ab") as handle:
+            handle.write(b'{"event": "note"}\n')
+        self.assertEqual(self.mod.incomplete_journals(self.receipts), [journal])
+
+
+if __name__ == "__main__":
+    unittest.main()

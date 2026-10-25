@@ -115,11 +115,18 @@ const LIKELY_CONTENT_EXTENSIONS: &[&str] = &[
     // Cartridge/ROM dump extensions.
     "nes", "fds", "sfc", "smc", "gb", "gbc", "gba", "n64", "z64", "v64", "nds", "3ds", "cia", "gg",
     "sms", "gen", "32x", "pce", "ws", "wsc", "ngp", "ngc", "a26", "a52", "a78", "j64", "col",
-    "int", "vec", "lnx", "adf", "ipf", "dsk", "d64", "t64", "tap", "crt", "rom",
-    // Disc-image extensions.
-    "iso", "bin", "img", "mdf", "mds", "nrg", "cso", "gcz", "wbfs", "wad", "rvz", "chd", "gdi",
-    "cdi", "pbp", "ecm", // Executable/installer extensions.
+    "int", "vec", "lnx", "adf", "ipf", "dsk", "d64", "t64", "tap", "crt", "rom", "mx1", "mx2",
+    "d88", "hdi", "nhd", "xdf", "dim", // Disc-image extensions.
+    "iso", "xiso", "bin", "img", "mdf", "mds", "nrg", "cso", "gcz", "wbfs", "wad", "rvz", "chd",
+    "gdi", "cdi", "pbp", "ecm", "xbe", "xex", "jag", "lyx", "atr", "atx", "xfd", "st", "stx",
+    "msa", // Apple II and Macintosh media/archive extensions.
+    "pkg", "do", "po", "woz", "2mg", "nib", "hfv", "dc42", "sit",
+    // Executable/installer extensions.
     "exe", "msi", "bat", "sh", "app", "com",
+    // Registry-parity additions (see `crate::format_coverage_matrix`).
+    "itv", "neo", "sgx", "68k", "dsi", "xci", "cci", "cxi", "nsp", "nca", "min", "sv", "fig", "swc",
+    "jfd", "mfm", "fdi", "thd", "d88x", "ndd", "dms", "adz", "wia", "uef", "vpk", "rpx", "sap",
+    "k7", "m5", "m7", "cdt", "tzx", "z80", "sna", "szx", "trd", "scl", "vb", "vboy",
 ];
 
 /// Classifies one entry from its stored name and directory-ness alone -
@@ -296,7 +303,25 @@ pub fn inspect_archive_with_limit(
     if !is_inspectable(path) {
         return Err(InspectorError::UnsupportedFormat(path.to_path_buf()));
     }
+    inspect_zip_archive_with_limit(path, limit)
+}
 
+/// The same read-only listing as [`inspect_archive_with_limit`], for a caller
+/// that has *already* established the file is a ZIP by some means other than
+/// its name.
+///
+/// [`is_inspectable`] is filename-only on purpose - it is the cheap, pure
+/// predicate the GUI uses to decide whether to offer "Inspect contents", and
+/// it must never touch the filesystem. That makes it the wrong gate for a
+/// content-addressed file, which has no extension to read: the downloaded-mod
+/// cache stores payloads under their digest, so a perfectly good ZIP would be
+/// refused by name after its signature had already identified it. Callers that
+/// have their own format evidence use this entry point; everything else keeps
+/// the filename gate.
+pub fn inspect_zip_archive_with_limit(
+    path: &Path,
+    limit: usize,
+) -> Result<InspectorReport, InspectorError> {
     let file = File::open(path).map_err(|source| classify_open_error(path, source))?;
     // `ZipArchive::new` reads and parses the whole central directory up
     // front - every entry's metadata (name, sizes, compression method,
@@ -330,7 +355,12 @@ pub fn inspect_archive_with_limit(
             return Err(InspectorError::Encrypted(path.to_path_buf()));
         }
 
-        let name = raw.name().to_string();
+        let name = crate::zip_member_name::owned(raw.name()).map_err(|error| {
+            InspectorError::Malformed {
+                path: path.to_path_buf(),
+                detail: error.to_string(),
+            }
+        })?;
         let is_directory = raw.is_dir();
         let classification = classify_entry(&name, is_directory);
         entries.push(InspectorEntry {
@@ -685,6 +715,31 @@ mod tests {
     }
 
     #[test]
+    fn apple_media_extensions_are_likely_content() {
+        for extension in ["do", "po", "woz", "2mg", "nib", "hfv", "dc42", "sit"] {
+            assert_eq!(
+                classify_entry(&format!("game.{extension}"), false),
+                InspectorEntryClassification::LikelyContent,
+                ".{extension} must be discoverable content"
+            );
+        }
+    }
+
+    #[test]
+    fn atari_media_extensions_are_likely_content() {
+        for extension in [
+            "a26", "a52", "a78", "atr", "atx", "xex", "xfd", "lnx", "lyx", "j64", "jag", "st",
+            "stx", "msa", "ipf",
+        ] {
+            assert_eq!(
+                classify_entry(&format!("game.{extension}"), false),
+                InspectorEntryClassification::LikelyContent,
+                ".{extension} must be discoverable content"
+            );
+        }
+    }
+
+    #[test]
     fn malformed_zip_produces_a_clear_error() {
         let dir = temp_dir("malformed");
         let path = dir.join("broken.zip");
@@ -808,11 +863,72 @@ mod tests {
     }
 
     #[test]
+    fn an_extensionless_zip_is_refused_by_name_but_listed_when_the_format_is_known() {
+        // The two halves of the split: the filename gate still refuses, so the
+        // GUI predicate and `inspect_archive` behave exactly as before, while a
+        // caller holding its own format evidence can still read the archive.
+        // Content-addressed downloads have no extension to read.
+        let dir = temp_dir("extensionless");
+        let named = write_test_zip(
+            &dir,
+            "package.zip",
+            &[FixtureEntry {
+                name: "README.txt",
+                content: b"fixture\n",
+                method: CompressionMethod::Stored,
+            }],
+        );
+        let unnamed = dir.join("sha256-object");
+        fs::copy(&named, &unnamed).unwrap();
+
+        assert!(!is_inspectable(&unnamed));
+        assert_eq!(
+            inspect_archive(&unnamed).unwrap_err(),
+            InspectorError::UnsupportedFormat(unnamed.clone())
+        );
+
+        let by_name = inspect_archive(&named).unwrap();
+        let by_format = inspect_zip_archive_with_limit(&unnamed, INSPECTOR_ENTRY_LIMIT).unwrap();
+        assert_eq!(by_format.entries.len(), by_name.entries.len());
+        assert!(!by_format.entries.is_empty());
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
     fn is_inspectable_accepts_only_zip() {
         assert!(is_inspectable(Path::new("/roms/game.zip")));
         assert!(!is_inspectable(Path::new("/roms/game.7z")));
         assert!(!is_inspectable(Path::new("/roms/game.rar")));
         assert!(!is_inspectable(Path::new("/roms/game.txt")));
+    }
+
+    #[test]
+    fn msx_cartridges_are_likely_content() {
+        assert_eq!(
+            classify_entry("cart.mx1", false),
+            InspectorEntryClassification::LikelyContent
+        );
+        assert_eq!(
+            classify_entry("cart.mx2", false),
+            InspectorEntryClassification::LikelyContent
+        );
+        assert_eq!(
+            classify_entry("disk.hdi", false),
+            InspectorEntryClassification::LikelyContent
+        );
+        assert_eq!(
+            classify_entry("disk.nhd", false),
+            InspectorEntryClassification::LikelyContent
+        );
+    }
+
+    #[test]
+    fn d88_is_likely_content() {
+        assert_eq!(
+            classify_entry("disk.d88", false),
+            InspectorEntryClassification::LikelyContent
+        );
     }
 }
 

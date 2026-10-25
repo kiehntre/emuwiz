@@ -1,0 +1,76 @@
+//! Universal source discovery: understands a mixed collection (archives,
+//! loose ROMs, disc images, Amiga images, WHDLoad folders, extracted game
+//! folders) as different *containers* that may hold playable *content*,
+//! rather than assuming everything is an archive.
+//!
+//! # Container vs content
+//!
+//! [`container::ContainerKind`] answers "how is this stored" (zip, tar,
+//! folder, direct file). [`content_registry::ContentKind`] answers "what
+//! does it represent" (a ROM cartridge, a disc image, an Amiga image, a
+//! WHDLoad install, a game folder). Neither ever assigns a *platform* -
+//! that stays [`crate::platform`]'s job, reused unmodified through
+//! [`crate::ArchiveIdentity::from_path`], so a loose `.v64` and a `.zip`
+//! containing the same `.v64` reach identity through the same path (see
+//! [`discovery::discover_archive`]/[`discovery::discover_direct_file`]).
+//!
+//! The result of scanning one source folder is a [`discovery::SourceDiscoveryReport`]:
+//! every item found, each with an always-populated, human-readable
+//! explanation - accepted items say what they are, skipped items say why
+//! and what to do about it (see [`discovery::SkipReason`]). Nothing here
+//! is user-facing UI; it is designed so a future GUI layer can render it
+//! directly without re-deriving explanations of its own.
+//!
+//! # Read-only
+//!
+//! Discovery readers in this module only ever read: `read_dir`,
+//! `symlink_metadata`, and opening files for reading. No file is renamed,
+//! moved, deleted, extracted, or otherwise written by anything reachable
+//! from [`discovery::discover_source`].
+//! [`bounded_import`] is the separately confirmed, database-changing consumer
+//! of a sealed preview allowlist; discovery never calls Apply automatically.
+//!
+//! # Relationship to the existing archive scanner
+//!
+//! This module is additive: `crate::ArchiveScanner`/`crate::ArchiveKind`
+//! are untouched, and existing scanning behaviour is unchanged by this
+//! module's addition. [`discovery::discover_source`] is a new, independent
+//! entry point future callers (CLI/GUI) can adopt; it does not replace
+//! `ArchiveScanner::scan_source` in this change.
+
+pub mod arcade;
+pub mod bounded_import;
+pub mod container;
+pub mod content_registry;
+pub mod cue_bin;
+pub mod cue_evidence_trust;
+pub mod cue_preservation;
+pub mod cue_timeline;
+pub mod discovery;
+pub mod explicit_preview;
+pub mod gdi;
+pub mod import_batches;
+pub mod preview;
+pub mod ps1_cue_disc;
+mod saved_archive_checks;
+pub mod saved_discovery;
+pub mod structural_probe;
+pub(crate) mod whdload_dat;
+
+#[cfg(test)]
+mod tests;
+
+pub(crate) use arcade::discover_extracted_sets_excluding;
+pub use arcade::{
+    ArcadeIngestionDiagnostics, ArcadeSetDirectory, ArcadeSetDiscovery, SupportMaterialKind,
+    discover_extracted_sets, discover_extracted_sets_scoped, support_material_kind,
+};
+pub use container::{ArchiveFormat, ContainerKind, FolderRole};
+pub use content_registry::ContentKind;
+pub use discovery::{
+    ArchiveListingEvidence, DiscoveredStructuralEvidence, DiscoveryError, DiscoveryReuseStats,
+    DiscoveryStats, GameDiscovery, INGESTION_PARSER_VERSION, IdentitySummary, SkipReason,
+    SkipReasonCounts, SourceDiscoveryReport, ValidationState, discover_source,
+    discover_source_with_fingerprints, discover_source_with_whdload_dat,
+    is_known_non_game_extension,
+};

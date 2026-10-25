@@ -1,0 +1,2022 @@
+#!/usr/bin/env python3
+"""emuwiz-cargo-retention: build-cache lifecycle tracking, pinning and dry-run planning.
+
+Phase 1 (this file) never deletes anything.  It provides:
+
+  run      (used by scripts/cargo-iso) hold a shared lifecycle lock for the whole
+           build, record who/what/when, then run cargo with its exit status and
+           signals preserved
+  status   storage total, protected storage, free space, budgets
+  list     each tracked target: size, owner, activity, protection
+  pin      explicitly protect a target (survives restarts; never expires by age)
+  release  release a pin you own
+  adopt    record an owner for an existing, untracked target (a human attestation)
+  plan     dry-run retirement proposal: exact compiler artifacts, estimated blocks
+
+Everything lives in a registry OUTSIDE the cargo targets
+($EMUWIZ_RETENTION_DIR, default ~/.cache/emuwiz-cargo-retention).  Python 3
+standard library only.  Anything unknown means HOLD.
+"""
+import argparse
+import contextlib
+import errno
+import fcntl
+import hashlib
+import json
+import math
+import os
+import re
+import shutil
+import signal
+import socket
+import stat
+import subprocess
+import sys
+import tempfile
+import time
+
+SOFT_BUDGET = 220_000_000_000
+HARD_BUDGET = 240_000_000_000
+MIN_IDLE_HOURS = 0  # completion is required; elapsed time never proves completion
+DEFAULT_MIN_FREE_GIB = 8
+LOCK_WAIT_SECONDS = 60
+PIN_REASONS = (
+    "active-development",
+    "independent-review",
+    "release-build",
+    "running-gui",
+    "preservation-evidence",
+)
+NAME_RE = re.compile(r"^[A-Za-z0-9._-]+$")
+HASH_NAME_RE = re.compile(r"^(?P<base>.+)-(?P<hash>[0-9a-f]{12})$")
+# Enumerated Cargo compiler-output subtrees of a profile directory.
+ARTIFACT_DIRS = (".fingerprint", "build", "deps", "examples", "incremental")
+ARTIFACT_FILE_SUFFIXES = (".d", ".rlib", ".rmeta", ".so", ".a", ".dylib", ".dll", ".pdb")
+# Cargo's own lock files are never selected: removing a held lock inode would let
+# a second cargo create a new one and defeat its exclusion.
+CARGO_LOCK_NAMES = (".cargo-lock", ".cargo-build-lock", ".cargo-artifact-lock")
+ARTIFACT_META_FILES = ()
+TOP_META_FILES = (".rustc_info.json",)
+# Anything that looks like data worth keeping stops selection of its subtree.
+DATA_SUFFIXES = (
+    ".db", ".sqlite", ".sqlite3", ".wal", ".shm", ".journal", ".jsonl",
+    ".bak", ".backup", ".dat", ".bios", ".bin", ".nes", ".gb", ".gba", ".nds", ".smc", ".sfc",
+    ".png", ".jpg", ".jpeg", ".wav", ".flac", ".mp3", ".mp4", ".pdf",
+    ".sav", ".srm", ".rom", ".iso", ".chd", ".cue", ".zip", ".7z", ".rar",
+)
+ALWAYS_PRESERVE = ("emuwiz-test-env", "tmp", "history", "undo", "receipts", "backups", "audit-ledger")
+
+
+# ------------------------------------------------------- privileged execution
+#
+# A complete process census needs root.  Root never acts on the owner's files: the
+# privileged entry points (emuwiz-cargo-maintain, emuwiz-cargo-retire) first verify
+# that all code they load is root-owned (see their trusted-install check), then call
+# drop_to_owner(), which sets the effective uid/gid and groups to the owner while
+# keeping uid 0 as real and saved uid.  Every file is then opened, created, replaced
+# and removed with the owner's own permissions (so a planted symlink can only lead
+# where the owner could already write, and every file stays owned by the owner).
+# Only the /proc census runs with euid 0 again (elevated()), and child processes are
+# started fully as the owner (run_as_owner()).
+
+
+def privileged_session():
+    """True when a root process has dropped to an owner and may re-elevate."""
+    ruid, euid, suid = os.getresuid()
+    return euid != 0 and suid == 0
+
+
+CATCHABLE_SIGNALS = set(signal.Signals) - {signal.SIGKILL, signal.SIGSTOP}
+
+
+@contextlib.contextmanager
+def elevated():
+    """euid 0 for read-only /proc inspection only; a no-op outside a privileged session.
+    Signals stay blocked while elevated, so no handler (KeyboardInterrupt, SIGTERM) can
+    run, or unwind past the restore, at euid 0; they are delivered once it is restored."""
+    if not privileged_session():
+        yield
+        return
+    euid = os.geteuid()
+    old = signal.pthread_sigmask(signal.SIG_BLOCK, CATCHABLE_SIGNALS)
+    try:
+        os.seteuid(0)
+        yield
+    finally:
+        os.seteuid(euid)
+        signal.pthread_sigmask(signal.SIG_SETMASK, old)
+    if os.geteuid() == 0:
+        os._exit(70)  # cannot happen; never continue as root
+
+
+def _unblock_signals():
+    signal.pthread_sigmask(signal.SIG_UNBLOCK, CATCHABLE_SIGNALS)
+
+
+def refuse_root_write():
+    """Defence in depth: after drop_to_owner nothing may be written with euid 0."""
+    if os.environ.get("EMUWIZ_PRIVILEGED_OWNER_UID") and os.geteuid() == 0:
+        raise OSError(errno.EPERM, "refusing a file write with euid 0 in a privileged session")
+
+
+def drop_to_owner(user):
+    """Become `user` for all file access (euid/egid/groups); keep uid 0 as real and
+    saved uid for elevated().  Returns the passwd entry.  Refuses root and unknown users."""
+    import pwd
+    if os.geteuid() != 0:
+        raise SystemExit("drop_to_owner: not running as root")
+    try:
+        pw = pwd.getpwnam(user)
+    except (KeyError, TypeError):
+        raise SystemExit(f"--as-user {user!r}: no such user")
+    if pw.pw_uid == 0 or pw.pw_gid == 0:
+        raise SystemExit("--as-user must name the unprivileged owner of the caches, not root")
+    os.setgroups(os.getgrouplist(pw.pw_name, pw.pw_gid))
+    os.setresgid(pw.pw_gid, pw.pw_gid, pw.pw_gid)
+    os.setresuid(0, pw.pw_uid, 0)
+    os.environ["EMUWIZ_PRIVILEGED_OWNER_UID"] = str(pw.pw_uid)
+    os.umask(0o077)
+    os.environ["USER"] = os.environ["LOGNAME"] = pw.pw_name
+    os.environ["PATH"] = "/usr/bin:/bin"
+    os.chdir("/")
+    if os.geteuid() != pw.pw_uid or os.getegid() != pw.pw_gid:
+        raise SystemExit("could not drop privileges to the owner")
+    return pw
+
+
+def require_owned_dirs(uid, paths):
+    """In a privileged session the registry and target root must be real directories
+    owned by the owner; anything else (missing, symlink, other owner) is refused."""
+    for path in paths:
+        try:
+            st = os.lstat(path)
+        except OSError as error:
+            raise SystemExit(f"privileged run refused: {path}: {error.strerror}")
+        if not stat.S_ISDIR(st.st_mode) or st.st_uid != uid:
+            raise SystemExit(f"privileged run refused: {path} is not a real directory owned by uid {uid}")
+
+
+def run_as_owner(cmd, **kw):
+    """subprocess.run; inside a privileged session the child gives up uid 0 entirely
+    (real, effective and saved) before exec, so no child ever runs with root's power."""
+    if not privileged_session():
+        return subprocess.run(cmd, **kw)
+    uid, gid, groups = os.geteuid(), os.getegid(), os.getgroups()
+    kw.setdefault("cwd", "/")
+    timeout = kw.pop("timeout", None)
+    if kw.pop("capture_output", False):
+        kw["stdout"] = kw["stderr"] = subprocess.PIPE
+    with elevated():  # euid 0 only for fork+exec; the child drops every uid before exec
+        proc = subprocess.Popen(cmd, user=uid, group=gid, extra_groups=groups,
+                                preexec_fn=_unblock_signals, **kw)
+    with proc:
+        try:
+            out, err = proc.communicate(timeout=timeout)
+        except subprocess.TimeoutExpired:
+            proc.kill()
+            proc.communicate()
+            raise
+    return subprocess.CompletedProcess(cmd, proc.returncode, out, err)
+
+
+def open_lock_file(path, flags):
+    """A lock file opened without following a symlink, refused unless it is a regular
+    file owned by the effective user (so a lock always stays usable by its builds)."""
+    refuse_root_write()
+    fd = os.open(path, flags | os.O_NOFOLLOW | os.O_CLOEXEC | os.O_NONBLOCK, 0o600)
+    try:
+        st = os.fstat(fd)
+        if not stat.S_ISREG(st.st_mode) or st.st_uid != os.geteuid():
+            raise OSError(errno.EPERM, f"{path} is not a regular lock file owned by uid {os.geteuid()}")
+    except BaseException:
+        os.close(fd)
+        raise
+    return fd
+
+
+def now():
+    override = os.environ.get("EMUWIZ_RETENTION_NOW")
+    return float(override) if override else time.time()
+
+
+def owner_name():
+    return os.environ.get("EMUWIZ_OWNER") or os.environ.get("USER") or str(os.getuid())
+
+
+def home():
+    return os.environ.get("HOME") or os.path.expanduser("~")
+
+
+def registry_dir():
+    return os.environ.get("EMUWIZ_RETENTION_DIR") or os.path.join(
+        home(), ".cache", "emuwiz-cargo-retention"
+    )
+
+
+def target_root():
+    return os.environ.get("EMUWIZ_TARGET_ROOT") or os.path.join(
+        home(), ".cache", "emuwiz-cargo-targets"
+    )
+
+
+def legacy_target():
+    return os.path.join(home(), ".cache", "emuwiz-cargo-target")
+
+
+def canon(path):
+    return os.path.realpath(path)
+
+
+def key_for(target_path):
+    return hashlib.sha256(canon(target_path).encode()).hexdigest()[:20]
+
+
+def sanitized(name):
+    # Per byte, like cargo-iso's `tr -c 'A-Za-z0-9._-' '_'`: "é" is two bytes, so "__".
+    return re.sub(rb"[^A-Za-z0-9._-]", b"_", os.fsencode(name)).decode()
+
+
+def proc_starttime(pid):
+    try:
+        with open(f"/proc/{pid}/stat", "rb") as handle:
+            data = handle.read().decode("utf-8", "replace")
+        return int(data.rsplit(")", 1)[1].split()[19])
+    except (OSError, ValueError, IndexError):
+        return None
+
+
+def boot_id():
+    try:
+        with open("/proc/sys/kernel/random/boot_id") as handle:
+            return handle.read().strip()
+    except OSError:
+        return ""
+
+
+def mountinfo(source="/proc/self/mountinfo"):
+    points = []
+    try:
+        with open(source, "rb") as handle:
+            for line in handle:
+                left, _, right = line.partition(b" - ")
+                fields = left.split()
+                # The kernel octal-escapes space, tab, newline and backslash and
+                # leaves every other byte raw, so non-ASCII names survive intact.
+                raw = re.sub(rb"\\([0-7]{3})", lambda m: bytes([int(m.group(1), 8)]), fields[4])
+                points.append((os.fsdecode(raw), os.fsdecode(right.split()[0])))
+    except (OSError, IndexError, ValueError):
+        return []
+    return points
+
+
+def filesystem_of(path, points=None):
+    points = points if points is not None else mountinfo()
+    best = ("/", "unknown")
+    for mount, fstype in points:
+        if (path == mount or path.startswith(mount.rstrip("/") + "/")) and len(mount) >= len(best[0]):
+            best = (mount, fstype)
+    try:
+        dev = os.lstat(path).st_dev
+    except OSError:
+        dev = None
+    return {"dev": dev, "mount": best[0], "fstype": best[1]}
+
+
+def atomic_write(path, data):
+    refuse_root_write()
+    directory = os.path.dirname(path)
+    fd, temp = tempfile.mkstemp(dir=directory, prefix=".tmp-")
+    try:
+        with os.fdopen(fd, "w") as handle:
+            json.dump(data, handle, indent=1, sort_keys=True)
+            handle.write("\n")
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.chmod(temp, 0o600)
+        os.replace(temp, path)
+        dfd = os.open(directory, os.O_RDONLY | os.O_DIRECTORY)
+        try:
+            os.fsync(dfd)
+        finally:
+            os.close(dfd)
+    except BaseException:
+        try:
+            os.unlink(temp)
+        except OSError:
+            pass
+        raise
+
+
+class RegistryRecordInvalid(Exception):
+    """A registry file exists but is unreadable or does not have a valid shape."""
+
+
+def _is_int(value):
+    return isinstance(value, int) and not isinstance(value, bool)
+
+
+def valid_active_entry(entry):
+    return (
+        isinstance(entry, dict)
+        and _is_int(entry.get("pid"))
+        and (entry.get("starttime") is None or _is_int(entry.get("starttime")))
+        and isinstance(entry.get("boot_id"), (str, type(None)))
+    )
+
+
+def valid_target_record(record):
+    """Shape check for targets/<key>.json; anything else is treated as unknown."""
+    if not isinstance(record, dict):
+        return False
+    if not isinstance(record.get("target"), str) or not record["target"]:
+        return False
+    active = record.get("active", [])
+    if not isinstance(active, list) or not all(valid_active_entry(e) for e in active):
+        return False
+    for field in ("owner", "worktree", "head"):
+        if record.get(field) is not None and not isinstance(record[field], str):
+            return False
+    for field in ("last_use", "last_end", "last_start", "first_seen"):
+        if record.get(field) is not None and not isinstance(record[field], (int, float)):
+            return False
+    released = record.get("released")
+    if released is not None and not (
+        isinstance(released, dict) and isinstance(released.get("by"), str)
+        and isinstance(released.get("at"), (int, float))
+    ):
+        return False
+    identity = record.get("identity")
+    if identity is not None and not (
+        isinstance(identity, dict) and _is_int(identity.get("dev")) and _is_int(identity.get("ino"))
+    ):
+        return False
+    return True
+
+
+def valid_pin_file(data):
+    if not isinstance(data, dict) or not isinstance(data.get("pins"), list):
+        return False
+    return all(
+        isinstance(p, dict) and isinstance(p.get("owner"), str) and isinstance(p.get("reason"), str)
+        for p in data["pins"]
+    )
+
+
+class Registry:
+    """Records, pins and lifecycle locks, all outside the cargo targets."""
+
+    def __init__(self, create=False):
+        self.root = registry_dir()
+        self.create = create
+        if create:
+            for sub in ("targets", "pins", "locks"):
+                os.makedirs(os.path.join(self.root, sub), mode=0o700, exist_ok=True)
+
+    def path(self, kind, key, ext="json"):
+        return os.path.join(self.root, kind, f"{key}.{ext}")
+
+    def read(self, kind, key):
+        try:
+            with open(self.path(kind, key)) as handle:
+                return json.load(handle)
+        except (OSError, ValueError):
+            return None
+
+    def read_checked(self, kind, key, validate):
+        """(state, data): "absent" only when the file genuinely does not exist,
+        "ok" for a valid record, otherwise "invalid" (unreadable, corrupt or the
+        wrong shape).  A read failure is never evidence that nothing is there."""
+        try:
+            with open(self.path(kind, key)) as handle:
+                data = json.load(handle)
+        except FileNotFoundError:
+            return "absent", None
+        except (OSError, ValueError, UnicodeDecodeError):
+            return "invalid", None
+        return ("ok", data) if validate(data) else ("invalid", None)
+
+    def pin_state(self, key):
+        """(state, pins) for a target; state is absent, ok or invalid."""
+        state, data = self.read_checked("pins", key, valid_pin_file)
+        return state, (data["pins"] if state == "ok" else [])
+
+    def all_records(self):
+        out = {}
+        directory = os.path.join(self.root, "targets")
+        try:
+            names = os.listdir(directory)
+        except OSError:
+            return out
+        for name in names:
+            if name.endswith(".json"):
+                state, record = self.read_checked("targets", name[:-5], valid_target_record)
+                if state == "ok":
+                    out[name[:-5]] = record
+        return out
+
+    def meta_lock(self):
+        fd = open_lock_file(os.path.join(self.root, "locks", "registry.meta"), os.O_WRONLY | os.O_CREAT | os.O_APPEND)
+        handle = os.fdopen(fd, "a")
+        fcntl.flock(handle, fcntl.LOCK_EX)
+        return handle
+
+    def log_event(self, event):
+        event = dict(event, at=now(), by=owner_name())
+        with open(os.path.join(self.root, "events.jsonl"), "a") as handle:
+            handle.write(json.dumps(event, sort_keys=True) + "\n")
+
+    def lifecycle_lock_path(self, key):
+        return self.path("locks", key, "lock")
+
+    def probe_lock(self, key):
+        """True if some build holds the lifecycle lock; None if it cannot be told."""
+        path = self.lifecycle_lock_path(key)
+        if not os.path.lexists(path):
+            return False
+        try:
+            fd = open_lock_file(path, os.O_RDONLY)
+        except OSError:
+            return None
+        try:
+            try:
+                fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            except OSError as error:
+                return True if error.errno in (errno.EWOULDBLOCK, errno.EAGAIN) else None
+            fcntl.flock(fd, fcntl.LOCK_UN)
+            return False
+        finally:
+            os.close(fd)
+
+
+# --------------------------------------------------------------------------- run
+
+
+def cmd_run(args):
+    cmd = args.cmd
+    if cmd and cmd[0] == "--":
+        cmd = cmd[1:]
+    if not cmd:
+        print("emuwiz-cargo-retention run: no command", file=sys.stderr)
+        return 2
+    lock_fd = None
+    token = None
+    registry = None
+    key = key_for(args.target)
+    try:
+        registry = Registry(create=True)
+        lock_fd = open_lock_file(registry.lifecycle_lock_path(key), os.O_RDWR | os.O_CREAT)
+        deadline = time.time() + LOCK_WAIT_SECONDS
+        while True:
+            try:
+                fcntl.flock(lock_fd, fcntl.LOCK_SH | fcntl.LOCK_NB)
+                break
+            except OSError as error:
+                if error.errno not in (errno.EWOULDBLOCK, errno.EAGAIN):
+                    raise
+                if time.time() > deadline:
+                    print(
+                        "cargo-iso: this target is being retired right now; "
+                        "try again in a moment (nothing was built).",
+                        file=sys.stderr,
+                    )
+                    return 75
+                time.sleep(0.2)
+        token = f"{os.getpid()}-{int(time.time() * 1000)}"
+        begin_record(registry, key, args, token, cmd)
+    except Exception as error:  # noqa: BLE001 - this is the tracking boundary only
+        # A broken or malformed registry must never block a build.  Nothing was
+        # registered: the lock is released, the record (if any) is left exactly as
+        # found, and cargo runs with its original arguments.  An untracked target
+        # has no (valid) lifecycle record, so it stays ineligible for retirement.
+        print(
+            f"cargo-iso: build tracking unavailable ({type(error).__name__}: {error}); "
+            "building untracked (this build is not registered and the target stays "
+            "ineligible for retirement)",
+            file=sys.stderr,
+        )
+        if lock_fd is not None:
+            try:
+                os.close(lock_fd)
+            except OSError:
+                pass
+        os.execvp(cmd[0], cmd)
+
+    masked = {signal.SIGINT, signal.SIGTERM, signal.SIGHUP, signal.SIGQUIT}
+    signal.pthread_sigmask(signal.SIG_BLOCK, masked)
+
+    def unmask():
+        signal.pthread_sigmask(signal.SIG_UNBLOCK, masked)
+
+    try:
+        child = subprocess.Popen(cmd, pass_fds=(lock_fd,), preexec_fn=unmask)
+    except OSError as error:
+        unmask()
+        finish_record(registry, key, token, 127, f"could not start: {error}")
+        print(f"{cmd[0]}: {error.strerror or error}", file=sys.stderr)
+        return 127 if error.errno == errno.ENOENT else 126
+    rc = None
+    while rc is None:
+        info = signal.sigtimedwait(masked, 0.2)
+        if info is not None:
+            # A terminal's Ctrl-C already reaches the child (same process group).
+            from_terminal = info.si_signo == signal.SIGINT and info.si_code == 0x80
+            if not from_terminal:
+                try:
+                    child.send_signal(info.si_signo)
+                except OSError:
+                    pass
+        rc = child.poll()
+    status = "ok" if rc == 0 else (f"signal {-rc}" if rc < 0 else f"exit {rc}")
+    finish_record(registry, key, token, rc, status)
+    unmask()
+    if rc < 0:
+        signal.signal(-rc, signal.SIG_DFL)
+        os.kill(os.getpid(), -rc)
+        return 128 - rc
+    return rc
+
+
+def head_of(worktree):
+    try:
+        out = run_as_owner(
+            ["git", "-C", worktree, "rev-parse", "HEAD"],
+            capture_output=True, text=True, timeout=10,
+        )
+        return out.stdout.strip() if out.returncode == 0 else None
+    except (OSError, subprocess.SubprocessError):
+        return None
+
+
+def begin_record(registry, key, args, token, cmd):
+    target = canon(args.target)
+    try:
+        st = os.lstat(target)
+        identity = {"dev": st.st_dev, "ino": st.st_ino}
+    except OSError:
+        identity = None
+    sub = next((word for word in cmd[1:] if not word.startswith("-")), "")
+    meta = registry.meta_lock()
+    try:
+        state, existing = registry.read_checked("targets", key, valid_target_record)
+        if state == "invalid":
+            raise RegistryRecordInvalid(
+                f"registry record {registry.path('targets', key)} is unreadable or malformed; "
+                "left unchanged as evidence"
+            )
+        record = existing or {
+            "schema": 1,
+            "key": key,
+            "target": target,
+            "target_name": os.path.basename(target),
+            "first_seen": now(),
+        }
+        record["worktree"] = canon(args.worktree) if args.worktree else record.get("worktree")
+        record["worktree_hash"] = (
+            hashlib.sha256(record["worktree"].encode()).hexdigest()[:12] if record.get("worktree") else None
+        )
+        record["head"] = head_of(record["worktree"]) if record.get("worktree") else None
+        record["owner"] = record.get("owner") or owner_name()
+        record["last_builder"] = owner_name()
+        record["task"] = os.environ.get("EMUWIZ_TASK") or record.get("task") or record["worktree"]
+        record["identity"] = record.get("identity") or identity
+        record["filesystem"] = filesystem_of(target)
+        record["low_debug"] = os.environ.get("CARGO_PROFILE_DEV_DEBUG") == "0"
+        record["last_start"] = now()
+        record["last_use"] = now()
+        if record.pop("released", None) is not None:
+            record["reopened_at"] = now()  # building again means the output is needed again
+        live = []
+        for entry in record.get("active", []):
+            if entry.get("boot_id") == boot_id() and proc_starttime(entry.get("pid")) == entry.get("starttime"):
+                live.append(entry)
+        record["active"] = live + [{
+            "token": token,
+            "pid": os.getpid(),
+            "starttime": proc_starttime(os.getpid()),
+            "boot_id": boot_id(),
+            "host": socket.gethostname(),
+            "started": now(),
+            "subcommand": sub,
+        }]
+        atomic_write(registry.path("targets", key), record)
+    finally:
+        meta.close()
+
+
+def finish_record(registry, key, token, rc, status):
+    try:
+        meta = registry.meta_lock()
+        try:
+            state, record = registry.read_checked("targets", key, valid_target_record)
+            if state != "ok":
+                return  # absent or malformed: never overwrite evidence
+            record["active"] = [e for e in record.get("active", []) if e.get("token") != token]
+            record["last_end"] = now()
+            record["last_use"] = now()
+            record["last_exit"] = rc
+            record["last_status"] = status
+            atomic_write(registry.path("targets", key), record)
+        finally:
+            meta.close()
+    except Exception:  # noqa: BLE001 - cargo's exit status must survive bookkeeping
+        pass
+
+
+# --------------------------------------------------------------- measurement
+
+
+def measure_tree(path, seen, with_identities=False):
+    """Walk without following symlinks; unique inodes only (`seen` is shared)."""
+    result = {
+        "allocated": 0, "apparent": 0, "files": 0, "newest_mtime": 0.0,
+        "newest_atime": 0.0, "symlinks": 0, "errors": 0, "cross_device": 0,
+    }
+    if with_identities:
+        result["identities"] = set()
+    try:
+        root_st = os.lstat(path)
+        root_dev = root_st.st_dev
+        if with_identities:
+            result["identities"].add((root_st.st_dev, root_st.st_ino))
+    except OSError:
+        result["errors"] += 1
+        return result
+    stack = [path]
+    while stack:
+        directory = stack.pop()
+        try:
+            iterator = os.scandir(directory)
+        except OSError:
+            result["errors"] += 1
+            continue
+        with iterator:
+            for entry in iterator:
+                try:
+                    st = entry.stat(follow_symlinks=False)
+                except OSError:
+                    result["errors"] += 1
+                    continue
+                mode = st.st_mode
+                if with_identities:
+                    result["identities"].add((st.st_dev, st.st_ino))
+                if stat.S_ISLNK(mode):
+                    result["symlinks"] += 1
+                    continue
+                if st.st_dev != root_dev:
+                    result["cross_device"] += 1
+                    continue
+                if stat.S_ISDIR(mode):
+                    stack.append(entry.path)
+                    continue
+                ident = (st.st_dev, st.st_ino)
+                result["files"] += 1
+                result["newest_mtime"] = max(result["newest_mtime"], st.st_mtime)
+                result["newest_atime"] = max(result["newest_atime"], st.st_atime)
+                if ident not in seen:
+                    seen.add(ident)
+                    result["allocated"] += st.st_blocks * 512
+                    result["apparent"] += st.st_size
+    return result
+
+
+# ------------------------------------------------------------- process census
+
+
+class Census:
+    """Point-in-time view of processes touching cargo outputs (never prints env)."""
+
+    def __init__(self, target_paths, skip_pids=None):
+        """`skip_pids`: PIDs already inspected by a recent census; every other PID in the
+        (root) listing is inspected and all are recorded.  Used between unlinks."""
+        self.skip_pids = frozenset(skip_pids or ())
+        self.targets = sorted(target_paths, key=len, reverse=True)
+        self.refs = {}
+        self.unreadable_foreign = 0
+        self.examined = 0
+        self.pids_seen = set()
+        # A sandbox PID namespace cannot prove that host writers are absent.
+        try:
+            with open("/proc/1/comm") as handle:
+                if handle.read().strip() not in ("systemd", "init"):
+                    self.unreadable_foreign += 1
+        except OSError:
+            self.unreadable_foreign += 1
+        # the acting user's processes are the ones whose environment is checked; in a
+        # privileged session that is the owner, and /proc is read with euid 0
+        uid = os.geteuid()
+        self._inode_refs = []
+        self._owner_inode_retries = []
+        self._env_paths = []
+        with elevated():
+            self._scan_all(uid)
+        # User FUSE mounts may deny root while permitting their owner. Retry only
+        # the acting owner's proc objects after dropping elevation, otherwise HOLD.
+        if self._owner_inode_retries:
+            # FUSE checks real credentials too: the worker gives up every root uid.
+            code = ("import os,json,sys; result=[]\n"
+                    "for path in sys.argv[1:]:\n"
+                    " try:\n  st=os.stat(path); result.append([st.st_dev,st.st_ino])\n"
+                    " except FileNotFoundError: result.append('gone')\n"
+                    " except OSError: result.append(None)\n"
+                    "print(json.dumps(result))")
+            try:
+                result = run_as_owner([sys.executable, "-I", "-S", "-c", code] +
+                                      [p for p, _, _ in self._owner_inode_retries],
+                                      capture_output=True, text=True, timeout=10)
+                identities = json.loads(result.stdout) if result.returncode == 0 else []
+                if len(identities) != len(self._owner_inode_retries):
+                    raise ValueError("incomplete owner inode census")
+                for identity, (_, pid, kind) in zip(identities, self._owner_inode_retries):
+                    if identity == "gone":
+                        continue
+                    if identity is None:
+                        self.unreadable_foreign += 1
+                    else:
+                        self._inode_refs.append((tuple(identity), pid, kind))
+            except (OSError, ValueError, subprocess.SubprocessError):
+                self.unreadable_foreign += len(self._owner_inode_retries)
+        # owner-supplied paths are resolved only after leaving euid 0
+        for raw, pid in self._env_paths:
+            self.note(canon(raw), pid, "env")
+
+    def _scan_all(self, uid):
+        me = os.getpid()
+        try:
+            pids = [int(n) for n in os.listdir("/proc") if n.isdigit()]
+        except OSError:
+            pids = []
+            self.unreadable_foreign += 1
+        self.pids_seen.update(pids)
+        for pid in pids:
+            if pid == me or pid in self.skip_pids:
+                continue
+            self.examined += 1
+            base = f"/proc/{pid}"
+            try:
+                owner = os.stat(base).st_uid
+            except OSError:
+                continue  # exited meanwhile
+            same_user = owner == uid
+            readable = self.scan(pid, base, same_user)
+            if not readable and os.path.exists(base) and self.is_userspace(base):
+                self.unreadable_foreign += 1
+
+    @staticmethod
+    def is_userspace(base):
+        # Kernel threads have an empty command line and no executable to hold.
+        try:
+            with open(f"{base}/cmdline", "rb") as handle:
+                return bool(handle.read(1))
+        except FileNotFoundError:
+            return False
+        except OSError:
+            return True
+
+    def note(self, path, pid, kind):
+        if path.endswith(" (deleted)"):
+            path = path[: -len(" (deleted)")]
+        for target in self.targets:
+            if path == target or path.startswith(target + "/"):
+                comm = ""
+                try:
+                    with open(f"/proc/{pid}/comm") as handle:
+                        comm = handle.read().strip()
+                except OSError:
+                    pass
+                self.refs.setdefault(target, []).append({"pid": pid, "comm": comm, "kind": kind})
+                return
+
+    def match_inodes(self, identities, target):
+        """Match bind/chroot aliases by kernel identity, not pathname spelling."""
+        for identity, pid, kind in self._inode_refs:
+            if identity in identities:
+                self.refs.setdefault(target, []).append({"pid": pid, "comm": "", "kind": kind})
+
+    def note_inode(self, path, pid, kind, owner_retry=False):
+        try:
+            st = os.stat(path)
+            self._inode_refs.append(((st.st_dev, st.st_ino), pid, kind))
+        except FileNotFoundError:
+            pass  # a process or descriptor exited during inspection
+        except PermissionError:
+            if owner_retry and os.getresuid()[2] == 0:
+                self._owner_inode_retries.append((path, pid, kind))
+            else:
+                self.unreadable_foreign += 1
+        except OSError:
+            self.unreadable_foreign += 1
+
+    def scan(self, pid, base, same_user):
+        ok = True
+        for name, kind in (("cwd", "cwd"), ("exe", "exe")):
+            try:
+                self.note(os.readlink(f"{base}/{name}"), pid, kind)
+                self.note_inode(f"{base}/{name}", pid, kind, same_user)
+            except OSError:
+                ok = False
+        try:
+            for fd in os.listdir(f"{base}/fd"):
+                try:
+                    self.note(os.readlink(f"{base}/fd/{fd}"), pid, "fd")
+                    self.note_inode(f"{base}/fd/{fd}", pid, "fd", same_user)
+                except FileNotFoundError:
+                    pass
+                except OSError:
+                    ok = False
+        except OSError:
+            ok = False
+        try:
+            with open(f"{base}/maps", "rb") as handle:
+                seen = set()
+                for line in handle:
+                    parts = line.decode("utf-8", "replace").rstrip("\n").split(None, 5)
+                    if len(parts) >= 5 and int(parts[4]):
+                        major, minor = (int(v, 16) for v in parts[3].split(":"))
+                        self._inode_refs.append(((os.makedev(major, minor), int(parts[4])), pid, "mapped-inode"))
+                    if len(parts) == 6 and parts[5].startswith("/") and parts[5] not in seen:
+                        seen.add(parts[5])
+                        self.note(parts[5], pid, "mapped")
+        except (OSError, ValueError, IndexError):
+            ok = False
+        if same_user:
+            try:
+                with open(f"{base}/environ", "rb") as handle:
+                    for item in handle.read().split(b"\0"):
+                        for var in (b"CARGO_TARGET_DIR=", b"CARGO_BUILD_TARGET_DIR="):
+                            if item.startswith(var):
+                                self._env_paths.append((item[len(var):].decode("utf-8", "replace"), pid))
+            except OSError:
+                ok = False
+        return ok
+
+
+# ------------------------------------------------------------------ inventory
+
+
+def git_worktrees(repo):
+    out = []
+    try:
+        text = run_as_owner(
+            ["git", "-C", repo, "worktree", "list", "--porcelain"],
+            capture_output=True, text=True, timeout=30,
+        ).stdout
+    except (OSError, subprocess.SubprocessError):
+        return out
+    current = {}
+    for line in text.splitlines() + [""]:
+        if not line:
+            if current.get("worktree"):
+                out.append(current)
+            current = {}
+        elif " " in line:
+            k, v = line.split(" ", 1)
+            current[k] = v
+        else:
+            current[line] = True
+    return out
+
+
+SOURCE_SCAN_DEPTH = 3
+
+
+def source_roots(args, worktrees):
+    """Directories searched for checkouts that a target's path hash may name."""
+    roots = list(getattr(args, "source_root", None) or [])
+    roots += [r for r in os.environ.get("EMUWIZ_SOURCE_ROOTS", "").split(os.pathsep) if r]
+    roots.append(home())
+    roots += [os.path.dirname(canon(wt["worktree"])) for wt in worktrees]
+    return list(dict.fromkeys(canon(r) for r in roots if os.path.isdir(r)))
+
+
+def path_hash_sources(wanted, roots):
+    """Existing checkouts for target names, by the cargo-iso naming rule.
+
+    cargo-iso names a target `<sanitized basename>-<sha256(canonical toplevel)[:12]>`,
+    so a git checkout under `roots` whose canonical path hashes to the target's
+    suffix is its source even when it is not a worktree of the inventoried
+    repository (another clone, a review checkout, a script run from elsewhere).
+    This is evidence for reporting and `adopt` only; it never makes a target
+    eligible, and `emuwiz-cargo-retire` re-verifies source and HEAD itself.
+    """
+    bases = {}
+    for name in wanted:
+        m = HASH_NAME_RE.match(name)
+        if m:
+            bases.setdefault(m.group("base"), set()).add(name)
+    found = {}
+    if not bases:
+        return found
+    skip = canon(target_root())
+    # Never stat or list another filesystem below a root: a hung FUSE/network
+    # mount would block the whole inventory.
+    mounts = {mount for mount, _ in mountinfo()}
+    # Shallowest depth each directory was listed at: a root nested under another
+    # root ($HOME/a under $HOME) still gets its own full depth.
+    seen = {}
+    stack = [(root, 0) for root in roots]
+    matchable = sum(len(names) for names in bases.values())
+    while stack and len(found) < matchable:
+        directory, depth = stack.pop()
+        if seen.get(directory, SOURCE_SCAN_DEPTH) <= depth or directory == skip:
+            continue
+        seen[directory] = depth
+        try:
+            with os.scandir(directory) as it:
+                entries = [e for e in it if not e.name.startswith(".") and e.is_dir(follow_symlinks=False)]
+        except OSError:
+            continue
+        for entry in entries:
+            # Roots are canonical and symlinks are never followed, so the
+            # joined path is the canonical path cargo-iso would have hashed.
+            path = entry.path
+            if path in mounts:
+                continue
+            if os.path.exists(os.path.join(path, ".git")):
+                base = sanitized(entry.name)
+                # fsencode: cargo-iso hashes the raw path bytes, valid UTF-8 or not.
+                name = f"{base}-{hashlib.sha256(os.fsencode(path)).hexdigest()[:12]}"
+                if name in bases.get(base, ()) and name not in found:
+                    found[name] = {"worktree": path, "head": head_of(path), "branch": None,
+                                   "via": "path-hash"}
+                continue
+            if depth + 1 < SOURCE_SCAN_DEPTH:
+                stack.append((path, depth + 1))
+    return found
+
+
+def inventory(args, registry):
+    """Every known or discoverable cargo output directory, with evidence."""
+    here = os.path.dirname(canon(__file__))
+    worktrees = git_worktrees(args.repo or here)
+    by_name = {}
+    for wt in worktrees:
+        path = canon(wt["worktree"])
+        digest = hashlib.sha256(path.encode()).hexdigest()[:12]
+        by_name[f"{sanitized(os.path.basename(path))}-{digest}"] = {
+            "worktree": path, "head": wt.get("HEAD"), "branch": wt.get("branch"),
+        }
+    records = registry.all_records()
+    by_target = {canon(r["target"]): (k, r) for k, r in records.items()}
+    found = {}
+
+    def add(path, kind):
+        path = canon(path)
+        if path in found:
+            return
+        found[path] = {"target": path, "kind": kind}
+
+    root = target_root()
+    try:
+        for name in sorted(os.listdir(root)):
+            full = os.path.join(root, name)
+            if stat.S_ISDIR(os.lstat(full).st_mode) or os.path.islink(full):
+                found.setdefault(canon(full) if not os.path.islink(full) else full,
+                                 {"target": full, "kind": "per-worktree", "name": name,
+                                  "symlink": os.path.islink(full)})
+    except OSError:
+        pass
+    if os.path.isdir(legacy_target()):
+        add(legacy_target(), "legacy-shared")
+    for wt in worktrees:
+        local = os.path.join(canon(wt["worktree"]), "target")
+        if os.path.isdir(local) and not os.path.islink(local):
+            add(local, "worktree-local")
+    for extra in args.extra_target or []:
+        add(extra, "extra")
+    for path in by_target:
+        if path not in found:
+            found[path] = {"target": path, "kind": "registered"}
+    unmatched = {b["name"] for b in found.values()
+                 if b["kind"] == "per-worktree" and not b.get("symlink") and b["name"] not in by_name}
+    by_name.update(path_hash_sources(unmatched, source_roots(args, worktrees)))
+    items = []
+    for path, base in sorted(found.items()):
+        item = dict(base)
+        name = os.path.basename(item["target"])
+        item["name"] = name
+        item["key"] = key_for(item["target"]) if not item.get("symlink") else None
+        rec = by_target.get(path)
+        item["record"] = rec[1] if rec else None
+        item["inferred"] = by_name.get(name) if item["kind"] == "per-worktree" else None
+        items.append(item)
+    return items
+
+
+LIFECYCLE_STATES = ("ACTIVE", "PROTECTED", "IDLE", "RELEASED", "RETIRABLE", "UNTRACKED")
+
+
+def completion_problem(record, newest_mtime=0):
+    """An owner release attests completion, preserved evidence and no expected reuse.
+
+    Never infer task completion from age, a successful Cargo exit or source ancestry.
+    Both planners and the executor must enforce this, including manual manifests.
+    """
+    released = (record or {}).get("released")
+    if not released:
+        return "NOT_RELEASED"
+    owner = record.get("owner")
+    if not owner or released.get("by") != owner:
+        return "OWNER_UNVERIFIED"
+    at = released.get("at")
+    if (not isinstance(at, (int, float)) or isinstance(at, bool)
+            or not math.isfinite(at) or at <= 0 or at > now()):
+        return "COMPLETION_UNVERIFIED"
+    activity = [record.get(k) or 0 for k in ("last_start", "last_end", "last_use")]
+    if any(not math.isfinite(v) or v > at for v in activity):
+        return "WRITTEN_AFTER_RELEASE"
+    if (newest_mtime or 0) > at:
+        return "WRITTEN_AFTER_RELEASE"
+    return None
+
+
+def lifecycle_state(item, record):
+    """ACTIVE: in use. PROTECTED: pinned (or pin state unknown). UNTRACKED: no valid
+    lifecycle record (legacy). IDLE: tracked, not released. RELEASED: the owner
+    finished with it. RETIRABLE: released and every retirement gate is clear."""
+    holds = item["holds"]
+    if any(h in holds for h in ("BUILD_LOCK_HELD", "RECORDED_BUILD_ALIVE", "LIVE_PROCESS_REFERENCE")):
+        return "ACTIVE"
+    if "PINNED" in holds or "PIN_STATE_UNKNOWN" in holds:
+        return "PROTECTED"
+    if not record:
+        return "UNTRACKED"
+    if record.get("released"):
+        return "RETIRABLE" if item["eligible"] else "RELEASED"
+    return "IDLE"
+
+
+def evaluate(items, registry, args, census, measured):
+    t = now()
+    min_idle = args.min_idle_hours * 3600
+    for item in items:
+        path = item["target"]
+        record = item["record"]
+        holds, info = [], []
+        item["holds"] = holds
+        item["info"] = info
+        pin_state, pins = registry.pin_state(item["key"]) if item["key"] else ("absent", [])
+        item["pins"] = pins
+        if pin_state == "invalid":
+            holds.append("PIN_STATE_UNKNOWN")
+        if pins:
+            holds.append("PINNED")
+        if item.get("symlink") or not os.path.isdir(path) or os.path.islink(path):
+            holds.append("SYMLINK_OR_MISSING_TARGET")
+        if item["kind"] == "per-worktree" and not NAME_RE.match(item["name"]):
+            holds.append("UNUSUAL_TARGET_NAME")
+        if item["kind"] in ("legacy-shared",):
+            holds.append("SHARED_LEGACY_TARGET")
+        if item["kind"] == "extra":
+            holds.append("EXTERNAL_TARGET_NOT_IN_REGISTRY")
+        # lifecycle lock + recorded live builds
+        locked = registry.probe_lock(item["key"]) if item["key"] else None
+        item["lock_held"] = locked
+        if locked:
+            holds.append("BUILD_LOCK_HELD")
+        elif locked is None and item["key"] and record:
+            holds.append("LOCK_STATE_UNKNOWN")
+        live = []
+        if record:
+            for entry in record.get("active", []):
+                if entry.get("boot_id") == boot_id() and proc_starttime(entry.get("pid")) == entry.get("starttime"):
+                    live.append(entry)
+            if live and "BUILD_LOCK_HELD" not in holds:
+                holds.append("RECORDED_BUILD_ALIVE")
+            stale = len(record.get("active", [])) - len(live)
+            if stale:
+                info.append(f"{stale} stale build entr{'y' if stale == 1 else 'ies'} (process gone)")
+            ident = record.get("identity")
+            try:
+                st = os.lstat(path)
+                if ident and (ident.get("dev"), ident.get("ino")) != (st.st_dev, st.st_ino):
+                    holds.append("DIRECTORY_IDENTITY_CHANGED")
+            except OSError:
+                pass
+        refs = census.refs.get(path, []) if census else []
+        item["process_refs"] = refs
+        if refs:
+            holds.append("LIVE_PROCESS_REFERENCE")
+        if not record:
+            holds.append("NO_LIFECYCLE_RECORD")
+        m = measured.get(path) or {}
+        # Writes (mtime) and recorded builds are the activity evidence.  File atime
+        # is noisy (audits and scans read files), so it only counts with
+        # --strict-atime; it is always reported.
+        activity = [v for v in (
+            (record or {}).get("last_use"), (record or {}).get("last_end"),
+            m.get("newest_mtime") or None,
+            (m.get("newest_atime") or None) if args.strict_atime else None,
+        ) if v]
+        item["newest_atime"] = m.get("newest_atime") or None
+        item["last_activity"] = max(activity) if activity else None
+        if item["last_activity"] is None:
+            holds.append("UNKNOWN_ACTIVITY")
+        elif t - item["last_activity"] < min_idle:
+            holds.append("RECENT_ACTIVITY")
+        # A release only covers what existed when it was recorded.  Output written
+        # later (an untracked rebuild: the wrapper could not update the record) means
+        # the worktree was reopened, whatever the stale record says.
+        problem = completion_problem(record, m.get("newest_mtime"))
+        if problem:
+            holds.append(problem)
+        if census and census.unreadable_foreign and not args.accept_foreign_process_gap:
+            holds.append("INCOMPLETE_PROCESS_VISIBILITY")
+        if m.get("cross_device"):
+            holds.append("CONTAINS_MOUNT_POINT")
+        item["protected_reasons"] = [h for h in holds if h in (
+            "PINNED", "PIN_STATE_UNKNOWN", "BUILD_LOCK_HELD", "RECORDED_BUILD_ALIVE", "LIVE_PROCESS_REFERENCE",
+            "RECENT_ACTIVITY", "DIRECTORY_IDENTITY_CHANGED", "CONTAINS_MOUNT_POINT", "WRITTEN_AFTER_RELEASE",
+        )]
+        item["eligible"] = not holds
+        item["state"] = lifecycle_state(item, record)
+        item["owner"] = (record or {}).get("owner") or ("unknown" if not item["inferred"] else "inferred")
+        item["worktree"] = (record or {}).get("worktree") or (item["inferred"] or {}).get("worktree")
+        item["head"] = (record or {}).get("head") or (item["inferred"] or {}).get("head")
+    return items
+
+
+def collect(args, with_measure=True):
+    registry = Registry(create=False)
+    items = inventory(args, registry)
+    seen = set()
+    measured = {}
+    if with_measure:
+        for item in items:
+            if item.get("symlink") or not os.path.isdir(item["target"]):
+                continue
+            measured[item["target"]] = measure_tree(item["target"], seen)
+    census = Census([i["target"] for i in items if not i.get("symlink")])
+    evaluate(items, registry, args, census, measured)
+    for item in items:
+        m = measured.get(item["target"]) or {}
+        item["allocated"] = m.get("allocated", 0)
+        item["apparent"] = m.get("apparent", 0)
+        item["files"] = m.get("files", 0)
+        item["fs"] = filesystem_of(item["target"]) if os.path.exists(item["target"]) else None
+    return registry, items, census, measured
+
+
+# --------------------------------------------------------------- reporting
+
+
+def gb(n):
+    return f"{n / 1e9:,.2f} GB"
+
+
+def age_text(ts):
+    if not ts:
+        return "unknown"
+    hours = (now() - ts) / 3600
+    return f"{hours / 24:.1f}d" if hours >= 48 else f"{hours:.1f}h"
+
+
+def budget_device():
+    try:
+        return os.lstat(target_root()).st_dev
+    except OSError:
+        try:
+            return os.lstat(home()).st_dev
+        except OSError:
+            return None
+
+
+def summary(items, args, census):
+    dev = budget_device()
+    counted = [i for i in items if i.get("fs") and i["fs"]["dev"] == dev]
+    off = [i for i in items if i.get("fs") and i["fs"]["dev"] != dev]
+    total = sum(i["allocated"] for i in counted)
+    protected = sum(i["allocated"] for i in counted if i["protected_reasons"])
+    unowned = sum(i["allocated"] for i in counted if not i["protected_reasons"] and not i["eligible"])
+    eligible = sum(i["allocated"] for i in counted if i["eligible"])
+    free = None
+    try:
+        free = shutil.disk_usage(target_root() if os.path.isdir(target_root()) else home()).free
+    except OSError:
+        pass
+    return {
+        "budget_device": dev,
+        "counted_targets": len(counted),
+        "total_allocated": total,
+        "protected_allocated": protected,
+        "held_other_allocated": unowned,
+        "eligible_allocated": eligible,
+        "by_state": {st: {"targets": sum(1 for i in counted if i["state"] == st),
+                          "allocated": sum(i["allocated"] for i in counted if i["state"] == st)}
+                     for st in LIFECYCLE_STATES},
+        "off_device_allocated": sum(i["allocated"] for i in off),
+        "off_device_targets": len(off),
+        "free_bytes": free,
+        "min_free_bytes": int(os.environ.get("EMUWIZ_MIN_FREE_GB", DEFAULT_MIN_FREE_GIB)) * 1024**3,
+        "soft_budget": args.soft_budget,
+        "hard_budget": args.hard_budget,
+        "soft_exceeded": total > args.soft_budget,
+        "hard_exceeded": total > args.hard_budget,
+        "over_soft_by": max(0, total - args.soft_budget),
+        "process_visibility": {
+            "examined": census.examined,
+            "unreadable_foreign_uid": census.unreadable_foreign,
+        },
+    }
+
+
+def cmd_status(args):
+    _, items, census, _ = collect(args)
+    s = summary(items, args, census)
+    if args.json:
+        print(json.dumps(s, indent=1, sort_keys=True))
+        return 0
+    print(f"EmuWiz Cargo cache retention (phase 1: advisory, nothing is deleted)")
+    print(f"  registry            {registry_dir()}")
+    print(f"  targets counted     {s['counted_targets']} on the budget device")
+    print(f"  total allocated     {gb(s['total_allocated'])} (unique inodes, hardlinks counted once)")
+    print(f"  protected           {gb(s['protected_allocated'])} (pinned, building, in use, or recently active)")
+    print(f"  held, not protected {gb(s['held_other_allocated'])} (unknown owner or other hold; counted, not deletable)")
+    print(f"  retirement-eligible {gb(s['eligible_allocated'])} before artifact selection")
+    if s["off_device_targets"]:
+        print(f"  off-device          {gb(s['off_device_allocated'])} in {s['off_device_targets']} target(s); does not relieve the root SSD")
+    if s["free_bytes"] is not None:
+        print(f"  free space          {gb(s['free_bytes'])} (build guard minimum {gb(s['min_free_bytes'])})")
+    for label, limit, exceeded in (("soft", s["soft_budget"], s["soft_exceeded"]), ("hard", s["hard_budget"], s["hard_exceeded"])):
+        flag = "EXCEEDED" if exceeded else "ok"
+        print(f"  {label} budget          {gb(limit)}: {flag}")
+    if s["soft_exceeded"]:
+        floor = s["protected_allocated"]
+        print(f"  over soft budget by {gb(s['over_soft_by'])}; protected floor is {gb(floor)}")
+        blockers = sorted((i for i in items if i["protected_reasons"]), key=lambda i: -i["allocated"])[:8]
+        print("  largest protected targets preventing further reduction:")
+        for i in blockers:
+            print(f"    {gb(i['allocated']):>12}  {i['name']}  [{','.join(i['protected_reasons'])}]")
+    pv = s["process_visibility"]
+    if pv["unreadable_foreign_uid"]:
+        print(f"  process visibility  PARTIAL: {pv['unreadable_foreign_uid']} of {pv['examined']} processes belong to other users and cannot be inspected")
+    return 0
+
+
+def cmd_list(args):
+    _, items, census, _ = collect(args)
+    rows = []
+    for i in sorted(items, key=lambda i: -i["allocated"]):
+        state = i["state"]
+        rows.append({
+            "name": i["name"], "kind": i["kind"], "target": i["target"],
+            "allocated": i["allocated"], "owner": i["owner"], "worktree": i["worktree"],
+            "head": i["head"], "last_activity_age": age_text(i["last_activity"]),
+            "state": state, "pins": [p["reason"] for p in i["pins"]],
+            "newest_atime_age": age_text(i.get("newest_atime")),
+            "eligible": i["eligible"], "holds": i["holds"],
+            "process_refs": i["process_refs"],
+        })
+    if args.json:
+        print(json.dumps(rows, indent=1, sort_keys=True))
+        return 0
+    print(f"{'SIZE':>11}  {'ACTIVITY':>8}  {'STATE':<9} {'OWNER':<10} {'KIND':<13} NAME  [HOLDS]")
+    for r in rows:
+        holds = ",".join(r["holds"]) if r["holds"] else "ELIGIBLE"
+        pin = f" pin={'/'.join(r['pins'])}" if r["pins"] else ""
+        print(f"{gb(r['allocated']):>11}  {r['last_activity_age']:>8}  {r['state']:<9} {r['owner']:<10} {r['kind']:<13} {r['name']}  [{holds}]{pin}")
+    return 0
+
+
+def resolve_target(spec, args):
+    """A target by name, directory, or the worktree path it belongs to."""
+    registry = Registry(create=False)
+    items = inventory(args, registry)
+    wanted = canon(spec) if os.path.exists(spec) else spec
+    matches = []
+    for item in items:
+        wt = (item["record"] or {}).get("worktree") or (item["inferred"] or {}).get("worktree")
+        if item["target"] == wanted or item["name"] == spec or (wt and wt == wanted):
+            matches.append(item)
+    if len(matches) != 1:
+        raise SystemExit(f"emuwiz-cargo-retention: {spec!r} matches {len(matches)} targets; name one exactly")
+    item = matches[0]
+    if item.get("symlink") or not item["key"]:
+        raise SystemExit("emuwiz-cargo-retention: refusing a symlinked target")
+    return item
+
+
+def effective_owner(args):
+    """The acting owner is the caller's own identity.  --owner may only restate it:
+    owner names are advisory labels within one Unix account (anyone in the account
+    can set EMUWIZ_OWNER or edit the registry), not an authenticated identity."""
+    me = owner_name()
+    if args.owner and args.owner != me:
+        raise SystemExit(
+            f"emuwiz-cargo-retention: --owner {args.owner!r} differs from your owner {me!r}; "
+            "owner names are advisory labels, not an access control, and a pin is only "
+            "released by the owner label that created it (set EMUWIZ_OWNER to act under "
+            "a different label deliberately)"
+        )
+    return me
+
+
+def checked_pin_data(registry, item, default):
+    """Existing pin data, a default when genuinely absent, otherwise refuse."""
+    state, data = registry.read_checked("pins", item["key"], valid_pin_file)
+    if state == "invalid":
+        raise SystemExit(
+            f"emuwiz-cargo-retention: PIN_STATE_UNKNOWN: the pin record for {item['name']} "
+            f"({registry.path('pins', item['key'])}) is unreadable or malformed; refusing to "
+            "change it. The target is held. Inspect and repair or move the file by hand."
+        )
+    return data if state == "ok" else default
+
+
+def cmd_pin(args):
+    if args.reason not in PIN_REASONS:
+        raise SystemExit(f"--reason must be one of: {', '.join(PIN_REASONS)}")
+    item = resolve_target(args.target, args)
+    registry = Registry(create=True)
+    owner = effective_owner(args)
+    meta = registry.meta_lock()
+    try:
+        data = checked_pin_data(registry, item, {"target": item["target"], "pins": []})
+        for pin in data["pins"]:
+            if pin["owner"] == owner and pin["reason"] == args.reason:
+                print(f"already pinned by {owner} for {args.reason}: {item['name']}")
+                return 0
+        data["pins"].append({"owner": owner, "reason": args.reason, "note": args.note or "", "since": now()})
+        atomic_write(registry.path("pins", item["key"]), data)
+        registry.log_event({"event": "pin", "target": item["target"], "reason": args.reason, "owner": owner})
+    finally:
+        meta.close()
+    print(f"pinned {item['name']} ({args.reason}, owner {owner})")
+    return 0
+
+
+def cmd_release(args):
+    item = resolve_target(args.target, args)
+    registry = Registry(create=True)
+    owner = effective_owner(args)
+    meta = registry.meta_lock()
+    try:
+        data = checked_pin_data(registry, item, {"pins": []})
+        mine = [p for p in data["pins"] if p["owner"] == owner and (not args.reason or p["reason"] == args.reason)]
+        if not mine:
+            others = sorted({p["owner"] for p in data["pins"]})
+            raise SystemExit(
+                f"no pin owned by {owner} on {item['name']}"
+                + (f" (pinned by: {', '.join(others)})" if others else " (not pinned)")
+            )
+        data["pins"] = [p for p in data["pins"] if p not in mine]
+        data["target"] = item["target"]
+        atomic_write(registry.path("pins", item["key"]), data)
+        registry.log_event({"event": "release", "target": item["target"], "owner": owner, "count": len(mine)})
+    finally:
+        meta.close()
+    left = len(data["pins"])
+    print(f"released {len(mine)} pin(s) on {item['name']}; {left} pin(s) remain" + (" (still protected)" if left else ""))
+    return 0
+
+
+def cmd_finish(args):
+    """Mark a target RELEASED: its owner has finished the task and no longer needs
+    the compiled output.  A Cargo command finishing never does this by itself.
+
+    Take the target's exclusive lifecycle lock before recording completion.  This
+    makes completion fail closed while any cargo-iso build still owns the shared
+    lock, and prevents a build from racing the release record.  A build that starts
+    after this lock is released will reopen the target in begin_record()."""
+    item = resolve_target(args.target, args)
+    registry = Registry(create=True)
+    me = effective_owner(args)
+    lifecycle_fd = open_lock_file(registry.lifecycle_lock_path(item["key"]), os.O_RDWR | os.O_CREAT)
+    try:
+        fcntl.flock(lifecycle_fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except OSError as error:
+        os.close(lifecycle_fd)
+        if error.errno in (errno.EWOULDBLOCK, errno.EAGAIN):
+            raise SystemExit(f"emuwiz-cargo-retention: {item['name']} has an active cargo-iso build; "
+                             "task completion was not released")
+        raise
+    try:
+        meta = registry.meta_lock()
+    except BaseException:
+        os.close(lifecycle_fd)
+        raise
+    try:
+        state, record = registry.read_checked("targets", item["key"], valid_target_record)
+        if state != "ok":
+            raise SystemExit(
+                f"emuwiz-cargo-retention: {item['name']} has no valid lifecycle record "
+                "(never built through cargo-iso, or the record is malformed); nothing to release. "
+                "Legacy caches need an explicit owner `adopt`."
+            )
+        if record.get("owner") and record["owner"] != me:
+            raise SystemExit(
+                f"emuwiz-cargo-retention: {item['name']} is owned by {record['owner']!r}, not {me!r}; "
+                "owner labels are advisory, but a release is only recorded under the owning label"
+            )
+        if record.get("released"):
+            newest = measure_tree(item["target"], set())["newest_mtime"] if os.path.isdir(item["target"]) else 0
+            if not newest or newest <= record["released"].get("at", 0):
+                # idempotent: the original release (time, task) is kept; pins untouched
+                print(f"{item['name']} is already released (task {record['released'].get('task') or '-'})")
+                return 0
+            # output was written after that release (WRITTEN_AFTER_RELEASE): release again now
+            previous = record["released"].get("at")
+        else:
+            previous = None
+        record["task"] = args.task or record.get("task") or record.get("worktree")
+        record["released"] = {"by": me, "at": now(), "task": record["task"], "note": args.note or "",
+                              "worktree": record.get("worktree"), "head": head_of(record["worktree"]) if record.get("worktree") else None}
+        if previous:
+            record["released"]["previous_at"] = previous
+        atomic_write(registry.path("targets", item["key"]), record)
+        registry.log_event({"event": "finish", "target": item["target"], "task": args.task or "", "owner": me})
+    finally:
+        meta.close()
+        os.close(lifecycle_fd)
+    print(f"released {item['name']} (task {args.task or '-'}): eligible for automatic retirement once "
+          "every gate passes, without a mandatory waiting period; a new build re-opens it")
+    return 0
+
+
+def cmd_reopen(args):
+    item = resolve_target(args.target, args)
+    registry = Registry(create=True)
+    me = effective_owner(args)
+    meta = registry.meta_lock()
+    try:
+        state, record = registry.read_checked("targets", item["key"], valid_target_record)
+        if state != "ok":
+            raise SystemExit(f"emuwiz-cargo-retention: {item['name']} has no valid lifecycle record")
+        if record.get("owner") and record["owner"] != me:
+            raise SystemExit(f"emuwiz-cargo-retention: {item['name']} is owned by {record['owner']!r}")
+        record.pop("released", None)
+        record["reopened_at"] = now()
+        atomic_write(registry.path("targets", item["key"]), record)
+        registry.log_event({"event": "reopen", "target": item["target"], "owner": me})
+    finally:
+        meta.close()
+    print(f"re-opened {item['name']}: no longer released")
+    return 0
+
+
+def cmd_adopt(args):
+    item = resolve_target(args.target, args)
+    registry = Registry(create=True)
+    if not args.owner:
+        raise SystemExit("adopt requires --owner: it records a human attestation of who owns this cache")
+    meta = registry.meta_lock()
+    try:
+        st = os.lstat(item["target"])
+        state, existing = registry.read_checked("targets", item["key"], valid_target_record)
+        if state == "invalid":
+            raise SystemExit(
+                f"emuwiz-cargo-retention: the registry record for {item['name']} "
+                f"({registry.path('targets', item['key'])}) is unreadable or malformed; "
+                "refusing to overwrite it. Inspect and repair or move it by hand."
+            )
+        record = existing or {
+            "schema": 1, "key": item["key"], "target": item["target"],
+            "target_name": item["name"], "first_seen": now(), "active": [],
+        }
+        record.update({
+            "owner": args.owner, "adopted_by": owner_name(), "adopted_at": now(),
+            "worktree": record.get("worktree") or (item["inferred"] or {}).get("worktree"),
+            "head": record.get("head") or (item["inferred"] or {}).get("head"),
+            "identity": {"dev": st.st_dev, "ino": st.st_ino},
+            "filesystem": filesystem_of(item["target"]),
+        })
+        atomic_write(registry.path("targets", item["key"]), record)
+        registry.log_event({"event": "adopt", "target": item["target"], "owner": args.owner})
+    finally:
+        meta.close()
+    print(f"recorded {args.owner} as owner of {item['name']} (no build activity is implied)")
+    return 0
+
+
+# ----------------------------------------------------------------------- plan
+
+
+def select_artifacts(target, root_dev):
+    """Exact compiler-artifact paths under one target, and everything preserved."""
+    selected, preserved = [], []
+
+    def keep(path, why):
+        preserved.append({"path": path, "why": why})
+
+    def lstat(path):
+        try:
+            return os.lstat(path)
+        except OSError:
+            return None
+
+    st = lstat(target)
+    if st is None or not stat.S_ISDIR(st.st_mode):
+        return selected, preserved
+    for name in sorted(os.listdir(target)):
+        full = os.path.join(target, name)
+        s = lstat(full)
+        if s is None:
+            continue
+        if name in ALWAYS_PRESERVE:
+            keep(full, "test environment / temporary data is never selected")
+            continue
+        if stat.S_ISLNK(s.st_mode):
+            keep(full, "symlink")
+            continue
+        if stat.S_ISREG(s.st_mode) and name in TOP_META_FILES:
+            selected.append(file_entry(full, s, "cargo metadata"))
+            continue
+        if not stat.S_ISDIR(s.st_mode):
+            keep(full, "unrecognised file")
+            continue
+        for profile in profile_dirs(full, s, keep):
+            select_profile(profile, selected, keep)
+    return selected, preserved
+
+
+def profile_dirs(path, st, keep):
+    """`debug`/`release` (or <triple>/<profile>) directories that hold cargo output."""
+    def is_profile(p, orphan=True):
+        markers = (".fingerprint", "deps")
+        # A prior retirement may have removed both markers. This only locates a
+        # candidate: select_profile still validates every incremental artifact.
+        if orphan and os.path.basename(p) in ("debug", "release"):
+            markers += ("incremental",)
+        return any(os.path.isdir(os.path.join(p, n)) and not os.path.islink(os.path.join(p, n))
+                   for n in markers)
+    if is_profile(path):
+        yield path
+        return
+    try:
+        children = sorted(os.listdir(path))
+    except OSError:
+        return
+    found = False
+    for child in children:
+        full = os.path.join(path, child)
+        if os.path.islink(full) or not os.path.isdir(full):
+            continue
+        triple = re.fullmatch(r"[A-Za-z0-9_]+(?:-[A-Za-z0-9_]+){2,}", os.path.basename(path))
+        if is_profile(full, orphan=bool(triple)):
+            found = True
+            yield full
+    if not found:
+        keep(path, "not a recognised cargo profile directory")
+
+
+def file_entry(path, st, what):
+    return {"path": path, "type": "file", "what": what, "dev": st.st_dev, "ino": st.st_ino, "nlink": st.st_nlink}
+
+
+def select_profile(profile, selected, keep):
+    try:
+        names = sorted(os.listdir(profile))
+        dev = os.lstat(profile).st_dev
+    except OSError:
+        return
+    incremental = os.path.join(profile, "incremental")
+    if "incremental" in names:
+        problem, _ = incremental_evidence(incremental)
+        if problem:
+            # Keep the profile's output together when incremental output is
+            # unknown; do not remove its identifying markers and strand it.
+            for name in names:
+                keep(os.path.join(profile, name), problem)
+            return
+    for name in names:
+        full = os.path.join(profile, name)
+        try:
+            s = os.lstat(full)
+        except OSError:
+            continue
+        if name in ALWAYS_PRESERVE:
+            keep(full, "test environment / temporary data is never selected")
+        elif stat.S_ISLNK(s.st_mode):
+            keep(full, "symlink")
+        elif stat.S_ISDIR(s.st_mode) and name in ARTIFACT_DIRS:
+            problem = incremental_evidence(full)[0] if name == "incremental" else subtree_problem(full, dev)
+            if problem:
+                keep(full, problem)
+            else:
+                selected.append({"path": full, "type": "dir", "what": f"cargo {name}",
+                                 "dev": s.st_dev, "ino": s.st_ino})
+        elif stat.S_ISREG(s.st_mode) and (
+            name.endswith(ARTIFACT_FILE_SUFFIXES) or name in ARTIFACT_META_FILES
+            or (s.st_mode & 0o111 and os.path.exists(full + ".d"))
+        ):
+            if name.lower().endswith(DATA_SUFFIXES):
+                keep(full, "looks like data, not a compiler artifact")
+            else:
+                selected.append(file_entry(full, s, "compiled output"))
+        else:
+            keep(full, "unrecognised path")
+
+
+def incremental_stamp(st):
+    """Immutable file proof, rechecked by the executor immediately before unlink."""
+    return (st.st_dev, st.st_ino, st.st_mode, st.st_uid, st.st_size, st.st_mtime_ns, st.st_ctime_ns)
+
+
+def incremental_evidence(path):
+    """Recognise a complete rustc incremental output unit, not its name alone.
+
+    This is artifact classification, NEVER ownership/retirement authority. The
+    caller must also pass the unchanged target lifecycle and execution gates.
+    Read at most eight header bytes per regular compiler file, via no-follow
+    descriptors. Unknown formats, children, owners, links or mounts fail closed.
+    """
+    files = {}
+    crate_pattern = re.compile(r"[A-Za-z_][A-Za-z_0-9]*-[0-9a-z]{12,16}\Z")
+    session_pattern = re.compile(r"(s-[0-9a-z]{8,16}-[0-9a-z]{6,10})-([0-9a-z]{16,32}|working)\Z")
+    object_pattern = re.compile(r"[0-9a-z]{16,32}\.o\Z")
+    caches = {"dep-graph.bin", "query-cache.bin", "work-products.bin"}
+    budget = 1_000_000
+
+    def fail(why):
+        raise ValueError("unrecognised rustc incremental output: " + why)
+
+    def checked(st, directory):
+        if st.st_dev != device or st.st_uid != os.geteuid():
+            fail("filesystem/owner mismatch")
+        if not (stat.S_ISDIR(st.st_mode) if directory else stat.S_ISREG(st.st_mode)):
+            fail("symlink or special file")
+
+    def open_child(parent, name, directory):
+        before = os.stat(name, dir_fd=parent, follow_symlinks=False)
+        checked(before, directory)
+        flags = os.O_RDONLY | os.O_NOFOLLOW | os.O_CLOEXEC | os.O_NONBLOCK
+        fd = os.open(name, flags | (os.O_DIRECTORY if directory else 0), dir_fd=parent)
+        try:
+            if incremental_stamp(before) == incremental_stamp(os.fstat(fd)):
+                return fd
+            fail("identity changed while opening")
+        except BaseException:
+            os.close(fd)
+            raise
+
+    def names(fd):
+        nonlocal budget
+        result = os.listdir(fd)
+        budget -= len(result)
+        if budget < 0:
+            fail("entry limit")
+        return result
+
+    root = None
+    try:
+        if not os.path.isabs(path) or os.path.normpath(path) != path:
+            fail("noncanonical path")
+        # No symlink component, including a replaced ancestor of incremental/.
+        root = os.open("/", os.O_RDONLY | os.O_DIRECTORY)
+        for part in path.split("/")[1:]:
+            nxt = os.open(part, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW, dir_fd=root)
+            os.close(root)
+            root = nxt
+        device = os.fstat(root).st_dev
+        checked(os.fstat(root), True)
+        crates = names(root)
+        if not crates and not any(os.path.isdir(os.path.join(os.path.dirname(path), n))
+                                  and not os.path.islink(os.path.join(os.path.dirname(path), n))
+                                  for n in (".fingerprint", "deps")):
+            fail("empty orphan without compiler evidence")
+        for crate in crates:
+            if not crate_pattern.fullmatch(crate):
+                fail("unknown crate directory")
+            cfd = open_child(root, crate, True)
+            try:
+                children = names(cfd)
+                sessions, locks = set(), set()
+                for child in children:
+                    match = session_pattern.fullmatch(child)
+                    if match:
+                        sessions.add(match[1])
+                        sfd = open_child(cfd, child, True)
+                        try:
+                            entries = set(names(sfd))
+                            if match[2] == "working":
+                                if not entries.intersection({"dep-graph.bin", "dep-graph.part.bin"}):
+                                    fail("working session without compiler cache")
+                            elif not caches.issubset(entries):
+                                fail("incomplete committed session")
+                            for name in entries:
+                                cache = name in caches or (match[2] == "working" and name == "dep-graph.part.bin")
+                                if not (cache or name == "metadata.rmeta" or object_pattern.fullmatch(name)):
+                                    fail("unknown session file")
+                                fd = open_child(sfd, name, False)
+                                try:
+                                    before = os.fstat(fd)
+                                    header = os.read(fd, 8)
+                                    if cache:
+                                        valid = (len(header) == 8 and header[:6] == b"RSIC\0\0"
+                                                 and 5 <= header[6] < 128 and 48 <= header[7] <= 57)
+                                    else:
+                                        valid = header[:4] == b"rust" if name == "metadata.rmeta" else header[:4] in (b"\x7fELF", b"BC\xc0\xde")
+                                    if not valid or incremental_stamp(before) != incremental_stamp(os.fstat(fd)):
+                                        fail("invalid or changing compiler header")
+                                    files["/" + "/".join((crate, child, name))] = incremental_stamp(before)
+                                finally:
+                                    os.close(fd)
+                        finally:
+                            os.close(sfd)
+                    elif re.fullmatch(r"s-[0-9a-z]{8,16}-[0-9a-z]{6,10}\.lock", child):
+                        fd = open_child(cfd, child, False)
+                        try:
+                            st = os.fstat(fd)
+                            if st.st_size != 0:
+                                fail("nonempty session lock")
+                            locks.add(child[:-5])
+                            files["/" + crate + "/" + child] = incremental_stamp(st)
+                        finally:
+                            os.close(fd)
+                    else:
+                        fail("unknown crate child")
+                if not sessions or sessions != locks:
+                    fail("session/lock mismatch")
+            finally:
+                os.close(cfd)
+        return None, files
+    except (OSError, ValueError) as error:
+        return str(error), {}
+    finally:
+        if root is not None:
+            os.close(root)
+
+
+def subtree_problem(path, dev):
+    stack = [path]
+    while stack:
+        directory = stack.pop()
+        try:
+            it = os.scandir(directory)
+        except OSError:
+            return "unreadable subtree"
+        with it:
+            for entry in it:
+                try:
+                    st = entry.stat(follow_symlinks=False)
+                except OSError:
+                    return "unreadable entry"
+                if stat.S_ISLNK(st.st_mode):
+                    return "contains a symlink"
+                if st.st_dev != dev:
+                    return "crosses a filesystem boundary"
+                lower = entry.name.lower()
+                if lower.endswith(DATA_SUFFIXES) or "journal" in lower:
+                    return f"contains a possible data file ({entry.name})"
+                if stat.S_ISDIR(st.st_mode):
+                    stack.append(entry.path)
+    return None
+
+
+def reclaim_estimate(selected_all):
+    """Allocated bytes freed only for inodes whose every link is inside the selection."""
+    links, blocks = {}, {}
+    for sel in selected_all:
+        if sel["type"] == "file":
+            try:
+                st = os.lstat(sel["path"])
+            except OSError:
+                continue
+            ident = (st.st_dev, st.st_ino)
+            links[ident] = links.get(ident, 0) + 1
+            blocks[ident] = (st.st_blocks * 512, st.st_nlink)
+            continue
+        stack = [sel["path"]]
+        while stack:
+            directory = stack.pop()
+            try:
+                it = os.scandir(directory)
+            except OSError:
+                continue
+            with it:
+                for entry in it:
+                    try:
+                        st = entry.stat(follow_symlinks=False)
+                    except OSError:
+                        continue
+                    if stat.S_ISDIR(st.st_mode):
+                        stack.append(entry.path)
+                    elif stat.S_ISREG(st.st_mode):
+                        ident = (st.st_dev, st.st_ino)
+                        links[ident] = links.get(ident, 0) + 1
+                        blocks[ident] = (st.st_blocks * 512, st.st_nlink)
+    freed = retained_links = 0
+    for ident, count in links.items():
+        size, nlink = blocks[ident]
+        if count >= nlink:
+            freed += size
+        else:
+            retained_links += size
+    return freed, retained_links
+
+
+def cmd_plan(args):
+    _, items, census, _ = collect(args)
+    s = summary(items, args, census)
+    eligible, held = [], []
+    for item in sorted(items, key=lambda i: (i["last_activity"] or 0)):
+        (eligible if item["eligible"] else held).append(item)
+    plan_targets = []
+    all_selected = []
+    for item in eligible:
+        selected, preserved = select_artifacts(item["target"], None)
+        for sel in selected:
+            sel["target"] = item["target"]
+        all_selected.extend(selected)
+        plan_targets.append({"item": item, "selected": selected, "preserved": preserved})
+    freed, retained = reclaim_estimate(all_selected)
+    # Read-only estimates pending ownership AND completion; neither is inferred.
+    pending = [
+        i for i in held
+        if i["holds"] and set(i["holds"]) <= {"NO_LIFECYCLE_RECORD", "NOT_RELEASED", "INCOMPLETE_PROCESS_VISIBILITY"}
+        and i["kind"] in ("per-worktree", "worktree-local")
+        and not i["protected_reasons"]
+    ]
+    whatif = None
+    if args.whatif_pending and pending:
+        sel_all, pres_all = [], []
+        for i in pending:
+            sel, pres = select_artifacts(i["target"], None)
+            for entry in sel:
+                entry["target"] = i["target"]
+            sel_all.extend(sel)
+            pres_all.extend(pres)
+        w_freed, w_retained = reclaim_estimate(sel_all)
+        whatif = {
+            "label": "WHAT-IF ONLY: ownership and task completion are unverified; NOT eligible",
+            "targets": len(pending), "selected_paths": len(sel_all),
+            "estimated_recoverable_bytes": w_freed,
+            "retained_hardlink_bytes_not_counted": w_retained,
+            "preserved_paths": len(pres_all),
+        }
+    result = {
+        "mode": "DRY RUN: nothing is deleted; no manifest is written",
+        "whatif_pending_ownership": whatif,
+        "generated": now(),
+        "summary": s,
+        "eligible_targets": len(plan_targets),
+        "estimated_recoverable_bytes": freed,
+        "retained_hardlink_bytes_not_counted": retained,
+        "selected_paths": [
+            {"target": sel["target"], "path": sel["path"], "type": sel["type"],
+             "what": sel["what"], "dev": sel["dev"], "ino": sel["ino"]}
+            for sel in all_selected
+        ],
+        "preserved_paths": [
+            {"target": pt["item"]["target"], **p} for pt in plan_targets for p in pt["preserved"]
+        ],
+        "held": [
+            {"name": i["name"], "target": i["target"], "allocated": i["allocated"], "holds": i["holds"],
+             "process_refs": i["process_refs"], "pins": [p["reason"] for p in i["pins"]]}
+            for i in held
+        ],
+        "pending_ownership_candidates": [
+            {"name": i["name"], "target": i["target"], "allocated": i["allocated"],
+             "inactive_for": age_text(i["last_activity"]), "inferred_worktree": i["worktree"],
+             "holds": i["holds"]}
+            for i in pending
+        ],
+        "needed_to_reach_soft_budget": s["over_soft_by"],
+        "budget_reachable_from_eligible": s["over_soft_by"] <= freed,
+    }
+    if args.output:
+        atomic_write(args.output, result)
+    if args.json:
+        print(json.dumps(result, indent=1, sort_keys=True))
+        return 0
+    print("DRY RUN - nothing is deleted and no manifest authorises deletion.")
+    print(f"  total allocated {gb(s['total_allocated'])}; soft budget {gb(s['soft_budget'])}; "
+          f"over by {gb(s['over_soft_by'])}")
+    print(f"  eligible targets {len(plan_targets)}; selected paths {len(all_selected)}; "
+          f"estimated recoverable {gb(freed)}")
+    if retained:
+        print(f"  not counted (hardlinked to files outside the selection) {gb(retained)}")
+    for pt in plan_targets:
+        it = pt["item"]
+        size = sum(1 for _ in pt["selected"])
+        print(f"  ELIGIBLE {it['name']}: {size} artifact path(s); inactive {age_text(it['last_activity'])}; owner {it['owner']}")
+        for sel in pt["selected"][:6]:
+            print(f"      select   {sel['path']}  ({sel['what']})")
+        for pres in pt["preserved"][:4]:
+            print(f"      preserve {pres['path']}  ({pres['why']})")
+    print(f"  held: {len(held)} target(s)")
+    counts = {}
+    for i in held:
+        for h in i["holds"]:
+            counts[h] = counts.get(h, 0) + 1
+    for h, n in sorted(counts.items(), key=lambda kv: -kv[1]):
+        print(f"      {n:>4}  {h}")
+    if pending:
+        total = sum(i["allocated"] for i in pending)
+        print(f"  pending ownership: {len(pending)} inactive target(s), {gb(total)}, would become eligible once an owner "
+              f"is recorded (`adopt`); NOT deletable now")
+        for i in sorted(pending, key=lambda i: -i["allocated"])[:10]:
+            print(f"      {gb(i['allocated']):>11}  idle {age_text(i['last_activity']):>7}  {i['name']}")
+    if whatif:
+        print(f"  WHAT-IF (not eligible; owners unknown): {whatif['targets']} target(s), "
+              f"{whatif['selected_paths']} artifact path(s), would recover about "
+              f"{gb(whatif['estimated_recoverable_bytes'])}; {whatif['preserved_paths']} path(s) preserved")
+    if s["soft_exceeded"] and s["over_soft_by"] > freed:
+        print(f"  The soft budget cannot be reached from eligible output alone: need {gb(s['over_soft_by'])}, "
+              f"eligible {gb(freed)}; protected floor {gb(s['protected_allocated'])}.")
+    return 0
+
+
+# ----------------------------------------------------------------------- main
+
+
+_BUDGET_WARNED = set()
+
+
+def budget_from_env(name, default):
+    """A byte budget from the environment.  A malformed, non-positive or absurd value is
+    reported once on stderr and the documented default is used, so a bad optional
+    setting can never stop a build, a release or `--finish-task`."""
+    raw = os.environ.get(name)
+    if raw is None or raw.strip() == "":
+        return default
+    try:
+        value = int(raw.strip())
+        if not 0 < value <= 10 ** 15:
+            raise ValueError("out of range")
+        return value
+    except ValueError:
+        if name not in _BUDGET_WARNED:
+            _BUDGET_WARNED.add(name)
+            print(f"emuwiz-cargo-retention: ignoring invalid {name}={raw!r} (need a positive integer byte count "
+                  f"up to 10^15); using the default {default}", file=sys.stderr)
+        return default
+
+
+def build_parser():
+    p = argparse.ArgumentParser(prog="emuwiz-cargo-retention", description=__doc__.split("\n\n")[0])
+    sub = p.add_subparsers(dest="command", required=True)
+
+    def common(sp):
+        sp.add_argument("--repo", help="repository whose worktrees are enumerated (default: this script's)")
+        sp.add_argument("--extra-target", action="append", help="additional target directory to inventory")
+        sp.add_argument("--source-root", action="append",
+                        help="also search here (3 levels) for checkouts whose path hash names a target; "
+                             "also EMUWIZ_SOURCE_ROOTS, always $HOME and worktree parents")
+        sp.add_argument("--soft-budget", type=int, default=budget_from_env("EMUWIZ_SOFT_BUDGET_BYTES", SOFT_BUDGET))
+        sp.add_argument("--hard-budget", type=int, default=budget_from_env("EMUWIZ_HARD_BUDGET_BYTES", HARD_BUDGET))
+        sp.add_argument("--min-idle-hours", type=float, default=MIN_IDLE_HOURS)
+        sp.add_argument("--accept-foreign-process-gap", action="store_true",
+                        help="do not HOLD for other users' processes this user cannot inspect (recorded in output)")
+        sp.add_argument("--strict-atime", action="store_true",
+                        help="treat recent file access times as recent use too (noisy: scans and audits read files)")
+        sp.add_argument("--json", action="store_true")
+
+    r = sub.add_parser("run", help="run a build under the lifecycle lock (used by cargo-iso)")
+    r.add_argument("--target", required=True)
+    r.add_argument("--worktree", default="")
+    r.add_argument("cmd", nargs=argparse.REMAINDER)
+    r.set_defaults(func=cmd_run)
+    for name, fn, helptext in (
+        ("status", cmd_status, "storage, protection, free space and budgets"),
+        ("list", cmd_list, "tracked targets"),
+        ("plan", cmd_plan, "dry-run retirement proposal"),
+    ):
+        sp = sub.add_parser(name, help=helptext)
+        common(sp)
+        if name == "plan":
+            sp.add_argument("--output", help="also write the plan JSON here (outside any target)")
+            sp.add_argument("--whatif-pending", action="store_true",
+                            help="also estimate artifacts of inactive-but-unowned targets (never eligible)")
+        sp.set_defaults(func=fn)
+    pin = sub.add_parser("pin", help="protect a target")
+    common(pin)
+    pin.add_argument("target")
+    pin.add_argument("--reason", required=True, choices=PIN_REASONS)
+    pin.add_argument("--owner")
+    pin.add_argument("--note")
+    pin.set_defaults(func=cmd_pin)
+    rel = sub.add_parser("release", help="release a pin you own")
+    common(rel)
+    rel.add_argument("target")
+    rel.add_argument("--reason", choices=PIN_REASONS)
+    rel.add_argument("--owner")
+    rel.set_defaults(func=cmd_release)
+    fin = sub.add_parser("finish", help="release a target: its task is finished (opt-in to automatic retirement)")
+    common(fin)
+    fin.add_argument("target")
+    fin.add_argument("--task", help="task or branch name, for the record")
+    fin.add_argument("--note")
+    fin.add_argument("--owner")
+    fin.set_defaults(func=cmd_finish)
+    reo = sub.add_parser("reopen", help="undo a release")
+    common(reo)
+    reo.add_argument("target")
+    reo.add_argument("--owner")
+    reo.set_defaults(func=cmd_reopen)
+    ad = sub.add_parser("adopt", help="record an owner for an untracked target")
+    common(ad)
+    ad.add_argument("target")
+    ad.add_argument("--owner")
+    ad.set_defaults(func=cmd_adopt)
+    return p
+
+
+def main(argv=None):
+    if os.geteuid() == 0 or os.getresuid()[2] == 0:
+        raise SystemExit("emuwiz-cargo-retention (and cargo-iso) must not run as root: run it as the cache owner")
+    args = build_parser().parse_args(argv)
+    return args.func(args)
+
+
+if __name__ == "__main__":
+    sys.exit(main())

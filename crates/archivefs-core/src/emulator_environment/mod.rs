@@ -20,12 +20,20 @@
 //! component) rather than sharing code with it - only a second
 //! environment-discovery target would justify extracting a shared trait.
 //!
-//! Only one emulator (RetroArch, in [`retroarch`]) is implemented. No
-//! generic `EmulatorEnvironmentAdapter` trait exists yet - see the module
-//! doc comment on `patch_manager::adapter` for why guessing a second
-//! implementation's shape ahead of time is exactly the mistake this
-//! project avoids repeating.
+//! Two frontends are implemented: RetroArch (in [`retroarch`]) and ES-DE
+//! (in [`es_de`]). No generic `EmulatorEnvironmentAdapter` trait exists
+//! yet - each module still defines its own local `Diagnostic`/severity/
+//! category vocabulary rather than sharing one, since a shared trait was
+//! deliberately deferred until a second implementation actually existed
+//! to prove its shape - see the module doc comment on
+//! `patch_manager::adapter`. [`es_de`] only reuses this module's
+//! [`ReadOnlyHostFilesystem`]/[`EncodedPath`]/[`FsProbe`] primitives; it
+//! does not import from, or get imported by, [`retroarch`].
 
+pub mod es_de;
+pub mod es_de_metadata;
+pub mod fbneo;
+pub mod mame;
 pub mod retroarch;
 
 use std::ffi::OsString;
@@ -177,10 +185,29 @@ pub trait ReadOnlyHostFilesystem {
     /// for native executable discovery via `PATH`. See
     /// [`ExecutableProbe`].
     fn probe_executable(&self, path: &Path) -> ExecutableProbe;
+    /// Resolves one PATH executable candidate to the exact regular file
+    /// that would be executed. The default keeps injected/test filesystems
+    /// source-compatible and returns the candidate itself after the same
+    /// executable probe; the host implementation canonicalizes symlinks and
+    /// then re-checks the resolved target as a regular executable file.
+    ///
+    /// RetroArch discovery records this resolved path, not a PATH symlink.
+    /// That keeps readiness and launch preflight in agreement without
+    /// weakening preflight's rule that the final executable path itself
+    /// must not be a symlink.
+    fn resolve_executable(&self, path: &Path) -> Option<std::path::PathBuf> {
+        (self.probe_executable(path) == ExecutableProbe::RegularExecutable)
+            .then(|| path.to_path_buf())
+    }
     /// Reads at most `max_bytes` bytes. `BoundedReadResult::TooLarge` if
     /// the file is larger; the oversized content is never partially
     /// trusted as a truncated prefix.
     fn read_bounded(&self, path: &Path, max_bytes: usize) -> BoundedReadResult;
+    /// Bounded executable header, used only to distinguish native binaries
+    /// from launcher scripts. An oversized script is never parsed partially.
+    fn executable_header(&self, path: &Path) -> BoundedReadResult {
+        self.read_bounded(path, 16 * 1024)
+    }
     /// Non-recursive listing bounded to `max_entries`.
     /// `BoundedListResult::TooLarge` if the directory has more entries;
     /// no partial listing is returned in that case.
@@ -228,6 +255,28 @@ fn io_error_to_probe(error: &io::Error) -> FsProbe {
 }
 
 impl ReadOnlyHostFilesystem for HostReadOnlyFilesystem {
+    fn executable_header(&self, path: &Path) -> BoundedReadResult {
+        use std::io::Read;
+        use std::os::unix::fs::OpenOptionsExt;
+        let file = match fs::OpenOptions::new()
+            .read(true)
+            .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK)
+            .open(path)
+        {
+            Ok(file) => file,
+            Err(error) => return bounded_read_error(&error),
+        };
+        if !file.metadata().is_ok_and(|metadata| metadata.is_file()) {
+            return BoundedReadResult::WrongType;
+        }
+        let mut bytes = Vec::new();
+        match file.take(16 * 1024 + 1).read_to_end(&mut bytes) {
+            Ok(_) if bytes.starts_with(b"\x7fELF") => BoundedReadResult::Ok(bytes[..4].to_vec()),
+            Ok(_) if bytes.len() > 16 * 1024 => BoundedReadResult::TooLarge,
+            Ok(_) => BoundedReadResult::Ok(bytes),
+            Err(error) => bounded_read_error(&error),
+        }
+    }
     fn probe(&self, path: &Path) -> FsProbe {
         Self::probe_metadata(fs::symlink_metadata(path))
     }
@@ -257,6 +306,18 @@ impl ReadOnlyHostFilesystem for HostReadOnlyFilesystem {
                 io::ErrorKind::PermissionDenied => ExecutableProbe::Inaccessible,
                 _ => ExecutableProbe::IoError,
             },
+        }
+    }
+
+    fn resolve_executable(&self, path: &Path) -> Option<std::path::PathBuf> {
+        use std::os::unix::fs::PermissionsExt;
+
+        let resolved = fs::canonicalize(path).ok()?;
+        let metadata = fs::symlink_metadata(&resolved).ok()?;
+        if metadata.file_type().is_file() && metadata.permissions().mode() & 0o111 != 0 {
+            Some(resolved)
+        } else {
+            None
         }
     }
 

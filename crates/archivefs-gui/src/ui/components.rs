@@ -1,8 +1,19 @@
 use std::path::Path;
 
+use archivefs_core::ArchiveKind;
 use eframe::egui;
 
 use super::theme;
+use crate::{ClipboardBackend, open_folder_in_file_manager};
+
+#[cfg(test)]
+#[path = "workflow_presentation_tests.rs"]
+mod workflow_presentation_tests;
+
+pub(crate) const EMUWIZ_MASCOT_BADGE_PNG: &[u8] =
+    include_bytes!("../../assets/emuwiz_mascot_badge.png");
+const EMUWIZ_MAGIC_DIVIDER_LONG_PNG: &[u8] =
+    include_bytes!("../../assets/emuwiz_magic_divider_long.png");
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum ActionStyle {
@@ -10,6 +21,8 @@ pub(crate) enum ActionStyle {
     Secondary,
     Quiet,
     Destructive,
+    /// Only for an Undo the app has verified is available. Purple in Blue.
+    Undo,
 }
 
 pub(crate) fn action_button(
@@ -18,13 +31,241 @@ pub(crate) fn action_button(
     style: ActionStyle,
     enabled: bool,
 ) -> egui::Response {
+    let blue = theme::blue_profile(ui);
     let button = match style {
-        ActionStyle::Primary => egui::Button::new(label).fill(theme::ACCENT),
+        ActionStyle::Primary => egui::Button::new(label).fill(theme::primary_action_fill(ui)),
+        ActionStyle::Secondary if blue => egui::Button::new(label)
+            .fill(theme::blue::RAISED_SURFACE)
+            .stroke(egui::Stroke::new(1.0_f32, theme::blue::BORDER_STRONG)),
         ActionStyle::Secondary => egui::Button::new(label),
         ActionStyle::Quiet => egui::Button::new(label).frame(false),
-        ActionStyle::Destructive => egui::Button::new(label).fill(theme::DANGER),
+        ActionStyle::Destructive => egui::Button::new(label).fill(theme::destructive_fill(ui)),
+        ActionStyle::Undo if blue => egui::Button::new(label)
+            .fill(theme::blue::UNDO)
+            .stroke(egui::Stroke::new(1.0_f32, theme::blue::UNDO_TEXT)),
+        ActionStyle::Undo => egui::Button::new(label),
     };
+    if blue {
+        let button = button
+            .corner_radius(BLUE_BUTTON_RADIUS)
+            .min_size(egui::vec2(0.0, blue_min_control_height(blue_compact(ui))));
+        if !enabled {
+            return blue_disabled_button(ui, button);
+        }
+        return ui.add(button);
+    }
     ui.add_enabled(enabled, button)
+}
+
+const BLUE_BUTTON_RADIUS: u8 = 10;
+
+/// Whether the window is in the compact Blue layout (the 1024x600 boards):
+/// the compact width class, or too short for full-size controls.
+pub(crate) fn blue_compact(ui: &egui::Ui) -> bool {
+    let window = ui.ctx().content_rect();
+    window.height() < 700.0
+        || super::layout::responsive_class(window.width())
+            == super::layout::ResponsiveClass::Compact
+}
+
+/// Minimum hit target in Blue: 40 at full size, 34 in compact layouts.
+pub(crate) fn blue_min_control_height(compact: bool) -> f32 {
+    if compact { 34.0 } else { 40.0 }
+}
+
+/// A disabled Blue button: drawn disabled, then outlined with a dashed
+/// `BORDER_STRONG` edge so it never reads as an available action.
+fn blue_disabled_button(ui: &mut egui::Ui, button: egui::Button<'_>) -> egui::Response {
+    let response = ui.add_enabled(false, button.fill(egui::Color32::TRANSPARENT));
+    paint_dashed_outline(ui.painter(), response.rect, theme::blue::BORDER_STRONG);
+    response
+}
+
+/// A disabled action that always carries its one-line reason, visibly and as
+/// a hover text. Use this for any control whose behaviour does not exist yet
+/// or is blocked right now; never show such a control as working.
+pub(crate) fn disabled_action_with_reason(
+    ui: &mut egui::Ui,
+    label: impl Into<egui::WidgetText>,
+    reason: &str,
+) -> egui::Response {
+    ui.vertical(|ui| {
+        let response =
+            action_button(ui, label, ActionStyle::Secondary, false).on_disabled_hover_text(reason);
+        ui.label(
+            egui::RichText::new(reason)
+                .size(13.0)
+                .color(disabled_reason_color(ui)),
+        );
+        response
+    })
+    .inner
+}
+
+fn disabled_reason_color(ui: &egui::Ui) -> egui::Color32 {
+    if theme::blue_profile(ui) {
+        theme::blue::DIM_TEXT
+    } else {
+        theme::muted(ui)
+    }
+}
+
+/// Dashed square-cornered outline: the Blue mark for disabled, proposed
+/// and "requires confirmation" items.
+pub(crate) fn paint_dashed_outline(
+    painter: &egui::Painter,
+    rect: egui::Rect,
+    color: egui::Color32,
+) {
+    let stroke = egui::Stroke::new(1.0_f32, color);
+    let rect = rect.shrink(0.5);
+    let corners = [
+        rect.left_top(),
+        rect.right_top(),
+        rect.right_bottom(),
+        rect.left_bottom(),
+        rect.left_top(),
+    ];
+    painter.extend(egui::Shape::dashed_line(&corners, stroke, 5.0, 4.0));
+}
+
+/// The three approved safety tags. Each carries an icon and words, so colour
+/// is never the only signal.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum SafetyTag {
+    /// Looks only; never changes files.
+    ReadOnly,
+    /// Shows a preview and asks before changing anything.
+    AsksFirst,
+    /// Needs an explicit confirmation step.
+    RequiresConfirmation,
+}
+
+impl SafetyTag {
+    pub(crate) fn label(self) -> &'static str {
+        match self {
+            Self::ReadOnly => "Read-only",
+            Self::AsksFirst => "Asks first",
+            Self::RequiresConfirmation => "Requires confirmation",
+        }
+    }
+
+    /// The tag's icon, painted (no font has to carry the glyph): an eye,
+    /// a shield, or an "i" in a circle.
+    fn paint_cue(self, painter: &egui::Painter, center: egui::Pos2, color: egui::Color32) {
+        let stroke = egui::Stroke::new(1.3_f32, color);
+        match self {
+            Self::ReadOnly => {
+                painter.add(egui::Shape::ellipse_stroke(
+                    center,
+                    egui::vec2(5.5, 3.4),
+                    stroke,
+                ));
+                painter.circle_filled(center, 1.6, color);
+            }
+            Self::AsksFirst => {
+                let at = |x: f32, y: f32| center + egui::vec2(x, y);
+                painter.add(egui::Shape::closed_line(
+                    vec![
+                        at(0.0, -5.5),
+                        at(4.8, -3.5),
+                        at(4.2, 1.5),
+                        at(0.0, 5.5),
+                        at(-4.2, 1.5),
+                        at(-4.8, -3.5),
+                    ],
+                    stroke,
+                ));
+            }
+            Self::RequiresConfirmation => {
+                painter.circle_stroke(center, 5.0, stroke);
+                painter.line_segment(
+                    [
+                        center + egui::vec2(0.0, -0.5),
+                        center + egui::vec2(0.0, 2.8),
+                    ],
+                    stroke,
+                );
+                painter.circle_filled(center + egui::vec2(0.0, -2.6), 0.8, color);
+            }
+        }
+    }
+
+    pub(crate) fn color(self, ui: &egui::Ui) -> egui::Color32 {
+        match (self, theme::blue_profile(ui)) {
+            (Self::ReadOnly, true) => theme::blue::ACCENT,
+            (Self::AsksFirst, true) => theme::blue::WARN,
+            (Self::RequiresConfirmation, true) => theme::blue::SECONDARY_TEXT,
+            (Self::ReadOnly, false) => theme::INFO,
+            (Self::AsksFirst, false) => theme::WARNING,
+            (Self::RequiresConfirmation, false) => theme::muted(ui),
+        }
+    }
+}
+
+pub(crate) fn safety_tag(ui: &mut egui::Ui, tag: SafetyTag) -> egui::Response {
+    let color = tag.color(ui);
+    let dashed = tag == SafetyTag::RequiresConfirmation;
+    // Measured and painted at its exact size, so it never stretches to a
+    // row's height or width whatever layout it is placed in.
+    let label = ui.painter().layout_no_wrap(
+        tag.label().to_owned(),
+        egui::FontId::proportional(12.5),
+        color,
+    );
+    let size = egui::vec2(
+        8.0 + 12.0 + 5.0 + label.size().x + 8.0,
+        label.size().y + 6.0,
+    );
+    let (rect, response) = ui.allocate_exact_size(size, egui::Sense::hover());
+    if ui.is_rect_visible(rect) {
+        let painter = ui.painter();
+        if dashed {
+            let border = if theme::blue_profile(ui) {
+                theme::blue::BORDER_STRONG
+            } else {
+                theme::border_color(ui)
+            };
+            paint_dashed_outline(painter, rect, border);
+        } else {
+            painter.rect(
+                rect,
+                7.0,
+                color.gamma_multiply(0.14),
+                egui::Stroke::new(1.0_f32, color.gamma_multiply(0.7)),
+                egui::StrokeKind::Inside,
+            );
+        }
+        tag.paint_cue(
+            painter,
+            egui::pos2(rect.left() + 14.0, rect.center().y),
+            color,
+        );
+        painter.galley(
+            egui::pos2(rect.left() + 25.0, rect.center().y - label.size().y / 2.0),
+            label,
+            color,
+        );
+    }
+    response.on_hover_text(tag.label())
+}
+
+/// The shared centered-modal convention for confirmation/review dialogs:
+/// anchored at the viewport's true center (never a hardcoded screen
+/// position, so this holds on any monitor size/aspect ratio, including
+/// ultrawide) and not collapsible - a confirmation dialog is meant to be
+/// answered and dismissed, not minimized. Callers still choose
+/// `.resizable(...)`, `.open(...)`, etc. themselves; this only fixes the
+/// one property that was wrong across several dialogs (an unset default
+/// position that could land near a screen edge, easy to miss on a large
+/// display). An anchored `egui::Window` is not draggable by the user
+/// (egui recomputes its position from the anchor every frame regardless),
+/// which is the correct, existing behavior for a centered confirmation -
+/// this helper does not need to additionally disable movement itself.
+pub(crate) fn centered_window(title: impl Into<egui::WidgetText>) -> egui::Window<'static> {
+    egui::Window::new(title)
+        .anchor(egui::Align2::CENTER_CENTER, egui::Vec2::ZERO)
+        .collapsible(false)
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -39,6 +280,9 @@ pub(crate) enum StatusTone {
 
 impl StatusTone {
     pub(crate) fn color(self, ui: &egui::Ui) -> egui::Color32 {
+        if theme::blue_profile(ui) {
+            return self.blue_color();
+        }
         match self {
             Self::Success => theme::SUCCESS,
             Self::Warning => theme::WARNING,
@@ -48,29 +292,152 @@ impl StatusTone {
             Self::Info => theme::INFO,
         }
     }
+
+    /// Blue tones: ok, warn, bad only for their meaning; info and active
+    /// use the accent; pending is quiet.
+    pub(crate) fn blue_color(self) -> egui::Color32 {
+        match self {
+            Self::Success => theme::blue::OK,
+            Self::Warning => theme::blue::WARN,
+            Self::Blocked => theme::blue::BAD,
+            Self::Pending => theme::blue::DIM_TEXT,
+            Self::Active | Self::Info => theme::blue::ACCENT,
+        }
+    }
 }
 
 pub(crate) fn status_badge(ui: &mut egui::Ui, label: impl Into<String>, tone: StatusTone) {
     let color = tone.color(ui);
     // A small consistent status cue by tone, always paired with the word so
-    // status is never carried by the glyph alone.
-    let cue = match tone {
-        StatusTone::Success => "✓",
-        StatusTone::Warning => "!",
-        StatusTone::Blocked => "×",
-        StatusTone::Pending => "?",
-        StatusTone::Active => "▶",
-        StatusTone::Info => "i",
+    // status is never carried by the glyph alone. A tick and a play mark are
+    // painted: egui's default fonts have no glyph for them and drew a box.
+    let painted = match tone {
+        StatusTone::Success => Some(Cue::Check),
+        StatusTone::Active => Some(Cue::Play),
+        _ => None,
     };
-    let text = format!("{cue} {}", label.into());
+    let cue = match tone {
+        StatusTone::Warning => "! ",
+        StatusTone::Blocked => "× ",
+        // A question mark is read as a broken/missing icon by several Linux
+        // font stacks and made labels such as "? Remove" look malformed.
+        // Pending is a neutral state, so use a plain supported text cue.
+        StatusTone::Pending => "· ",
+        StatusTone::Info => "i ",
+        StatusTone::Success | StatusTone::Active => "",
+    };
+    let text = format!("{cue}{}", label.into());
+    let blue = theme::blue_profile(ui);
     egui::Frame::new()
-        .fill(color.gamma_multiply(0.18))
+        .fill(color.gamma_multiply(if blue { 0.14 } else { 0.18 }))
         .stroke(egui::Stroke::new(1.0_f32, color.gamma_multiply(0.7)))
+        .corner_radius(if blue { 7 } else { 5 })
+        .inner_margin(egui::Margin::symmetric(8, 3))
+        .show(ui, |ui| {
+            // Blue's 44-point minimum row height must not stretch a chip.
+            if blue {
+                ui.spacing_mut().interact_size.y = 0.0;
+            }
+            if painted.is_none() && !blue {
+                ui.label(egui::RichText::new(text.clone()).color(color).strong());
+                return;
+            }
+            ui.horizontal(|ui| {
+                ui.spacing_mut().item_spacing.x = 4.0;
+                ui.spacing_mut().interact_size.y = 0.0;
+                if let Some(cue) = painted {
+                    let (rect, _) =
+                        ui.allocate_exact_size(egui::vec2(12.0, 12.0), egui::Sense::hover());
+                    paint_cue(ui.painter(), rect.center(), cue, color);
+                }
+                let text = egui::RichText::new(text).color(color).strong();
+                ui.label(if blue { text.size(12.5) } else { text });
+            });
+        });
+}
+
+/// Small status marks painted with lines, so they never depend on a font
+/// carrying the glyph.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum Cue {
+    Check,
+    Attention,
+    Cross,
+    Dot,
+    Play,
+}
+
+pub(crate) fn paint_cue(
+    painter: &egui::Painter,
+    center: egui::Pos2,
+    cue: Cue,
+    color: egui::Color32,
+) {
+    let stroke = egui::Stroke::new(1.8_f32, color);
+    let at = |x: f32, y: f32| center + egui::vec2(x, y);
+    match cue {
+        Cue::Check => {
+            painter.add(egui::Shape::line(
+                vec![at(-4.5, 0.2), at(-1.4, 3.4), at(4.8, -3.6)],
+                stroke,
+            ));
+        }
+        Cue::Attention => {
+            painter.add(egui::Shape::closed_line(
+                vec![at(0.0, -5.2), at(5.4, 4.4), at(-5.4, 4.4)],
+                egui::Stroke::new(1.4_f32, color),
+            ));
+            painter.line_segment(
+                [at(0.0, -1.6), at(0.0, 1.2)],
+                egui::Stroke::new(1.4_f32, color),
+            );
+            painter.circle_filled(at(0.0, 2.9), 0.8, color);
+        }
+        Cue::Cross => {
+            painter.line_segment([at(-3.8, -3.8), at(3.8, 3.8)], stroke);
+            painter.line_segment([at(-3.8, 3.8), at(3.8, -3.8)], stroke);
+        }
+        Cue::Dot => {
+            painter.circle_filled(center, 2.4, color);
+        }
+        Cue::Play => {
+            painter.add(egui::Shape::convex_polygon(
+                vec![at(-3.2, -4.4), at(4.4, 0.0), at(-3.2, 4.4)],
+                color,
+                egui::Stroke::NONE,
+            ));
+        }
+    }
+}
+
+/// A small neutral label pill for a piece of metadata a game carries (a
+/// genre, a tag) - never a status. Reuses [`status_badge`]'s exact visual
+/// grammar (Frame fill/stroke/corner radius/margin) so it reads as the same
+/// design language, but with no tone colour and no glyph: a genre is not a
+/// state something is in, and prefixing "Adventure" with a status icon
+/// would misread as one.
+pub(crate) fn info_chip(ui: &mut egui::Ui, label: &str) {
+    let color = theme::muted(ui);
+    egui::Frame::new()
+        .fill(ui.visuals().extreme_bg_color)
+        .stroke(theme::border(ui))
         .corner_radius(5)
         .inner_margin(egui::Margin::symmetric(8, 3))
         .show(ui, |ui| {
-            ui.label(egui::RichText::new(text).color(color).strong());
+            ui.label(egui::RichText::new(label).color(color).size(12.5));
         });
+}
+
+/// A row of [`info_chip`]s that wraps onto further lines rather than
+/// running off the side of the panel - for a field like genre that can
+/// carry several values.
+pub(crate) fn info_chip_row(ui: &mut egui::Ui, labels: &[&str]) {
+    ui.horizontal_wrapped(|ui| {
+        ui.spacing_mut().item_spacing = egui::vec2(6.0, 4.0);
+        for label in labels {
+            info_chip(ui, label);
+        }
+    });
 }
 
 /// A page header with a leading icon, for the major navigation pages. The
@@ -83,15 +450,397 @@ pub(crate) fn page_header_with_icon(ui: &mut egui::Ui, icon: &str, title: &str, 
             ui.label(egui::RichText::new(purpose).color(theme::muted(ui)));
         });
     });
-    ui.add_space(theme::SECTION_GAP);
+    ui.add_space(theme::SPACE_2XL.min(theme::SECTION_GAP));
+}
+
+/// The small branded header for dense utility pages. The artwork is cached in
+/// egui's temporary context data, so it is decoded/uploaded once per UI
+/// context and a decode failure simply leaves the native text header intact.
+/// All status content is supplied by the caller; this primitive has no
+/// diagnostic meaning of its own.
+pub(crate) fn workshop_light_header(
+    ui: &mut egui::Ui,
+    title: &str,
+    purpose: &str,
+    status: impl FnOnce(&mut egui::Ui),
+) {
+    egui::Frame::new()
+        .fill(theme::raised_fill(ui).gamma_multiply(0.72))
+        .stroke(theme::border(ui))
+        .corner_radius(8)
+        .inner_margin(egui::Margin::same(10))
+        .show(ui, |ui| {
+            ui.horizontal_wrapped(|ui| {
+                if let Some(texture) =
+                    cached_workshop_texture(ui, "mascot", EMUWIZ_MASCOT_BADGE_PNG)
+                {
+                    ui.add(
+                        egui::Image::new((texture.id(), egui::vec2(42.0, 42.0)))
+                            .sense(egui::Sense::hover()),
+                    );
+                }
+                ui.vertical(|ui| {
+                    ui.label(
+                        egui::RichText::new(title)
+                            .size(theme::PAGE_TITLE_SIZE)
+                            .strong(),
+                    );
+                    ui.label(egui::RichText::new(purpose).color(theme::muted(ui)));
+                    status(ui);
+                });
+            });
+            if let Some(texture) =
+                cached_workshop_texture(ui, "divider", EMUWIZ_MAGIC_DIVIDER_LONG_PNG)
+            {
+                let size = workshop_divider_size(ui.available_width());
+                ui.add(
+                    egui::Image::new((texture.id(), size))
+                        .tint(egui::Color32::from_white_alpha(105))
+                        .sense(egui::Sense::hover()),
+                );
+            }
+        });
+    ui.add_space(theme::SPACE_SM);
+}
+
+fn cached_workshop_texture(ui: &egui::Ui, kind: &str, bytes: &[u8]) -> Option<egui::TextureHandle> {
+    let id = egui::Id::new(("emuwiz-workshop-light-header", kind));
+    if let Some(texture) = ui
+        .ctx()
+        .data_mut(|data| data.get_temp::<egui::TextureHandle>(id))
+    {
+        return Some(texture);
+    }
+    // Some headless egui test renderers cap one texture side at 2048 pixels;
+    // the supplied divider is intentionally wide, so downsample only the
+    // uploaded copy while preserving its aspect ratio.
+    let decoded = image::load_from_memory(bytes).ok()?.thumbnail(2048, 2048);
+    let rgba = decoded.to_rgba8();
+    let size = [rgba.width() as usize, rgba.height() as usize];
+    let texture = ui.ctx().load_texture(
+        format!("emuwiz-workshop-light-header-{kind}"),
+        egui::ColorImage::from_rgba_unmultiplied(size, rgba.as_raw()),
+        egui::TextureOptions::LINEAR,
+    );
+    ui.ctx()
+        .data_mut(|data| data.insert_temp(id, texture.clone()));
+    Some(texture)
+}
+
+fn workshop_divider_size(available_width: f32) -> egui::Vec2 {
+    let width = available_width.clamp(0.0, 520.0);
+    egui::vec2(width, width * 724.0 / 2172.0)
+}
+
+#[cfg(test)]
+mod workshop_light_header_tests {
+    use super::*;
+
+    #[test]
+    fn bundled_workshop_assets_decode() {
+        assert!(image::load_from_memory(EMUWIZ_MASCOT_BADGE_PNG).is_ok());
+        assert!(image::load_from_memory(EMUWIZ_MAGIC_DIVIDER_LONG_PNG).is_ok());
+    }
+
+    #[test]
+    fn invalid_workshop_asset_has_native_fallback_path() {
+        assert!(image::load_from_memory(b"not an image").is_err());
+    }
+
+    #[test]
+    fn divider_keeps_approved_aspect_ratio_and_bounds_narrow_widths() {
+        let size = workshop_divider_size(700.0);
+        assert_eq!(size.x, 520.0);
+        assert!((size.y / size.x - 724.0 / 2172.0).abs() < f32::EPSILON);
+
+        let narrow = workshop_divider_size(80.0);
+        assert_eq!(narrow.x, 80.0);
+        assert!(narrow.y > 0.0);
+    }
+}
+
+/// The shared compact page-hero: a raised card carrying a motif slot, a
+/// title, a one-line purpose, an optional state/safety badge, an optional
+/// small motto line, and a primary-action slot. This is the reusable
+/// building block for the "retro control room" visual direction
+/// (`docs/GUI_DESIGN_SYSTEM.md`) - every major workflow page composes the
+/// same shape instead of inventing its own header/hero layout.
+///
+/// `motif` paints into a fixed-size square slot to its caller's taste (a
+/// lightweight drawn shape, an icon glyph, ...); it must be cheap and
+/// fallback-safe - see each page's own motif function for the concrete
+/// per-workflow treatment. `state_line` is the honest current
+/// readiness/safety statement (e.g. "Read-only inspection"), always paired
+/// with a status tone so meaning never rests on colour alone. `motto` is
+/// the page's single small contextual line (used sparingly - at most one
+/// per page). `primary_action` renders the page's one obvious next step;
+/// pass an empty closure when the page has no single primary action yet.
+/// `signal` renders the page's optional "signal panel" - a small
+/// terminal/oscilloscope-style readout box (see [`signal_panel`]) placed to
+/// the right of the title block, matching the reference mockups' secondary
+/// status readout next to the hero artwork. Pass an empty closure for pages
+/// that have no such readout yet; this never fabricates a reading - callers
+/// only pass their own real, already-known state.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn page_hero(
+    ui: &mut egui::Ui,
+    motif: impl FnOnce(&mut egui::Ui, egui::Vec2),
+    title: &str,
+    purpose: &str,
+    state_line: Option<(&str, StatusTone)>,
+    motto: Option<&str>,
+    signal: impl FnOnce(&mut egui::Ui),
+    primary_action: impl FnOnce(&mut egui::Ui),
+) {
+    page_hero_with_motif_size(
+        ui,
+        egui::vec2(56.0, 56.0),
+        motif,
+        title,
+        purpose,
+        state_line,
+        motto,
+        signal,
+        primary_action,
+    );
+}
+
+/// Variant of [`page_hero`] for pages whose visual identity needs a larger
+/// bounded illustration. The default remains compact so existing pages keep
+/// their established layout.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn page_hero_with_motif_size(
+    ui: &mut egui::Ui,
+    motif_size: egui::Vec2,
+    motif: impl FnOnce(&mut egui::Ui, egui::Vec2),
+    title: &str,
+    purpose: &str,
+    state_line: Option<(&str, StatusTone)>,
+    motto: Option<&str>,
+    signal: impl FnOnce(&mut egui::Ui),
+    primary_action: impl FnOnce(&mut egui::Ui),
+) {
+    hero_card(ui, |ui| {
+        ui.horizontal(|ui| {
+            let (rect, _) = ui.allocate_exact_size(motif_size, egui::Sense::hover());
+            ui.painter()
+                .rect_filled(rect, 8.0, theme::deep_fill(ui).gamma_multiply(1.0));
+            {
+                let mut child = ui.new_child(
+                    egui::UiBuilder::new()
+                        .max_rect(rect)
+                        .layout(egui::Layout::top_down(egui::Align::Min)),
+                );
+                motif(&mut child, motif_size);
+            }
+            ui.vertical(|ui| {
+                ui.label(
+                    egui::RichText::new(title)
+                        .size(theme::PAGE_TITLE_SIZE)
+                        .strong(),
+                );
+                ui.label(egui::RichText::new(purpose).color(theme::muted(ui)));
+                if let Some((label, tone)) = state_line {
+                    status_badge(ui, label, tone);
+                }
+                if let Some(motto) = motto {
+                    ui.label(
+                        egui::RichText::new(motto)
+                            .italics()
+                            .small()
+                            .color(theme::muted(ui)),
+                    );
+                }
+            });
+            ui.with_layout(egui::Layout::right_to_left(egui::Align::Min), |ui| {
+                signal(ui);
+            });
+        });
+        ui.add_space(theme::SPACE_SM);
+        primary_action(ui);
+    });
+    ui.add_space(theme::SPACE_SM);
+}
+
+/// A dark terminal/oscilloscope-style readout panel - the shared "signal
+/// panel" chrome for the reference mockups' secondary status box next to a
+/// page's hero artwork (Tape Inspector's "TAPE SIGNAL … PLAYING" panel,
+/// Disc Conversion's "FLOOPY POWER … CONVERTING" panel). `lines` are the
+/// caller's own already-known, honest status text (never fabricated data -
+/// an idle state must say idle, a real percentage must be a real
+/// percentage). `reading` paints a bounded custom readout (a waveform, a
+/// progress bar) directly with the painter into the remaining space below
+/// the text - no heap allocation beyond the caller's own bounded drawing,
+/// and no repaint is requested here: callers that animate follow the same
+/// `request_repaint_after` convention as the page's own motif.
+pub(crate) fn signal_panel(
+    ui: &mut egui::Ui,
+    size: egui::Vec2,
+    lines: &[String],
+    reading: impl FnOnce(&egui::Painter, egui::Rect),
+) {
+    let (rect, _) = ui.allocate_exact_size(size, egui::Sense::hover());
+    let accent = theme::accent(ui);
+    let painter = ui.painter();
+    painter.rect_filled(rect, 6.0, theme::deep_fill(ui));
+    painter.rect_stroke(
+        rect,
+        6.0,
+        egui::Stroke::new(1.0_f32, accent.gamma_multiply(0.55)),
+        egui::StrokeKind::Inside,
+    );
+    let inner = rect.shrink(8.0);
+    const LINE_HEIGHT: f32 = 14.0;
+    for (index, line) in lines.iter().enumerate() {
+        painter.text(
+            egui::pos2(inner.left(), inner.top() + index as f32 * LINE_HEIGHT),
+            egui::Align2::LEFT_TOP,
+            line,
+            egui::FontId::monospace(11.0),
+            accent,
+        );
+    }
+    let reading_top = inner.top() + lines.len() as f32 * LINE_HEIGHT + 4.0;
+    let reading_rect = egui::Rect::from_min_max(
+        egui::pos2(inner.left(), reading_top.min(inner.bottom())),
+        inner.max,
+    );
+    if reading_rect.height() > 1.0 && reading_rect.width() > 1.0 {
+        reading(painter, reading_rect);
+    }
+}
+
+/// A compact colored badge identifying one supported format (e.g. "TAP",
+/// "CHD") - visually distinct from [`status_badge`] (a state) and
+/// [`info_chip`] (a neutral tag): `accent` is a caller-chosen identity
+/// colour for that one format so a row of formats stays distinguishable at
+/// a glance, matching the reference mockups' per-format colored chips.
+/// Never a status colour - a format chip does not carry a readiness
+/// meaning.
+pub(crate) fn format_chip(ui: &mut egui::Ui, label: &str, accent: egui::Color32) {
+    egui::Frame::new()
+        .fill(accent.gamma_multiply(0.22))
+        .stroke(egui::Stroke::new(1.0_f32, accent.gamma_multiply(0.75)))
+        .corner_radius(5)
+        .inner_margin(egui::Margin::symmetric(8, 4))
+        .show(ui, |ui| {
+            ui.label(egui::RichText::new(label).color(accent).strong().small());
+        });
+}
+
+/// A wrapping row of [`format_chip`]s. Callers must only pass formats their
+/// own backend genuinely supports today - this performs no filtering or
+/// validation of its own.
+pub(crate) fn format_chip_row(ui: &mut egui::Ui, chips: &[(&str, egui::Color32)]) {
+    ui.horizontal_wrapped(|ui| {
+        ui.spacing_mut().item_spacing = egui::vec2(6.0, 4.0);
+        for (label, accent) in chips {
+            format_chip(ui, label, *accent);
+        }
+    });
+}
+
+/// The shared "Choose -> Step -> Step -> ..." workflow strip for a page with
+/// a real, ordered multi-step flow. `current` is the zero-based index of the
+/// step the user is on now; it is highlighted with both colour (teal) and
+/// text weight/marker so the current step is never communicated by colour
+/// alone. Only render this where the steps are the actual states the page's
+/// own logic walks through - never a fabricated flow.
+pub(crate) fn workflow_strip(ui: &mut egui::Ui, steps: &[&str], current: usize) {
+    const BADGE_DIAMETER: f32 = 24.0;
+    const CONNECTOR_WIDTH: f32 = 22.0;
+    ui.horizontal_wrapped(|ui| {
+        ui.spacing_mut().item_spacing = egui::vec2(2.0, 6.0);
+        for (index, step) in steps.iter().enumerate() {
+            let is_done = index < current;
+            let is_current = index == current;
+            let badge_color = if is_current {
+                theme::accent(ui)
+            } else if is_done {
+                theme::accent(ui).gamma_multiply(0.65)
+            } else {
+                theme::muted(ui)
+            };
+            if index > 0 {
+                let (rect, _) = ui.allocate_exact_size(
+                    egui::vec2(CONNECTOR_WIDTH, BADGE_DIAMETER),
+                    egui::Sense::hover(),
+                );
+                let connector_color = if index <= current {
+                    theme::accent(ui).gamma_multiply(0.7)
+                } else {
+                    theme::muted(ui).gamma_multiply(0.6)
+                };
+                ui.painter().line_segment(
+                    [
+                        egui::pos2(rect.left(), rect.center().y),
+                        egui::pos2(rect.right(), rect.center().y),
+                    ],
+                    egui::Stroke::new(1.5_f32, connector_color),
+                );
+            }
+            ui.vertical(|ui| {
+                let (rect, _) = ui.allocate_exact_size(
+                    egui::vec2(BADGE_DIAMETER, BADGE_DIAMETER),
+                    egui::Sense::hover(),
+                );
+                let painter = ui.painter();
+                let radius = BADGE_DIAMETER / 2.0 - 1.0;
+                if is_current {
+                    painter.circle_filled(rect.center(), radius, badge_color.gamma_multiply(0.22));
+                }
+                painter.circle_stroke(
+                    rect.center(),
+                    radius,
+                    egui::Stroke::new(1.5_f32, badge_color),
+                );
+                // A finished step's tick is painted: the default fonts have
+                // no check-mark glyph and drew an empty box.
+                if is_done {
+                    paint_cue(painter, rect.center(), Cue::Check, badge_color);
+                } else {
+                    painter.text(
+                        rect.center(),
+                        egui::Align2::CENTER_CENTER,
+                        (index + 1).to_string(),
+                        egui::FontId::monospace(12.0),
+                        badge_color,
+                    );
+                }
+                // Never colour alone: the current step also carries a
+                // leading glyph and bold weight; a completed step keeps its
+                // checkmark from the badge above reflected in its label too.
+                let label = if is_current {
+                    format!("▶ {step}")
+                } else if is_done {
+                    format!("{step} · done")
+                } else {
+                    (*step).to_string()
+                };
+                let text = if is_current {
+                    egui::RichText::new(label)
+                        .color(theme::accent(ui))
+                        .strong()
+                        .small()
+                } else {
+                    egui::RichText::new(label).color(theme::muted(ui)).small()
+                };
+                ui.label(text);
+            });
+        }
+    });
 }
 
 pub(crate) fn section_header(ui: &mut egui::Ui, title: &str, description: Option<&str>) {
-    ui.label(egui::RichText::new(title).size(19.0).strong());
+    ui.label(
+        egui::RichText::new(title)
+            .size(theme::SECTION_TITLE_SIZE)
+            .strong(),
+    );
     if let Some(description) = description {
         ui.label(egui::RichText::new(description).color(theme::muted(ui)));
     }
-    ui.add_space(4.0);
+    ui.add_space(theme::SPACE_XS);
 }
 
 pub(crate) fn card<R>(ui: &mut egui::Ui, add_contents: impl FnOnce(&mut egui::Ui) -> R) -> R {
@@ -102,6 +851,128 @@ pub(crate) fn card<R>(ui: &mut egui::Ui, add_contents: impl FnOnce(&mut egui::Ui
         .inner_margin(egui::Margin::same(14))
         .show(ui, add_contents)
         .inner
+}
+
+/// Equal-width workflow cards. Expanded content may grow, never clip; the
+/// collapsed surface has a consistent height and uses the standard padding.
+pub(crate) fn aligned_card<R>(
+    ui: &mut egui::Ui,
+    width: f32,
+    minimum_height: f32,
+    add_contents: impl FnOnce(&mut egui::Ui) -> R,
+) -> R {
+    card(ui, |ui| {
+        ui.set_width((width - 30.0).max(0.0));
+        ui.set_min_height(minimum_height);
+        add_contents(ui)
+    })
+}
+
+pub(crate) fn full_width_card<R>(
+    ui: &mut egui::Ui,
+    add_contents: impl FnOnce(&mut egui::Ui) -> R,
+) -> R {
+    aligned_card(ui, ui.available_width(), 0.0, add_contents)
+}
+
+/// A compact, text-first header; actions remain owned by the calling page.
+pub(crate) fn workflow_header(ui: &mut egui::Ui, title: &str, purpose: &str) {
+    ui.heading(title);
+    ui.label(egui::RichText::new(purpose).color(theme::muted(ui)));
+    ui.add_space(theme::SPACE_MD);
+}
+
+/// Picking changes only the draft text. Inspection, persistence and apply
+/// remain separate, explicit actions in the caller.
+pub(crate) fn folder_picker(ui: &mut egui::Ui, label: &str, value: &mut String) {
+    ui.push_id(label, |ui| {
+        ui.label(label);
+        ui.horizontal(|ui| {
+            let width = (ui.available_width() - 96.0 - ui.spacing().item_spacing.x).max(1.0);
+            ui.add_sized(egui::vec2(width, 30.0), egui::TextEdit::singleline(value));
+            if ui
+                .add_sized(egui::vec2(96.0, 30.0), egui::Button::new("Browse…"))
+                .clicked()
+                && let Some(path) = rfd::FileDialog::new().set_title(label).pick_folder()
+            {
+                *value = path.display().to_string();
+            }
+        });
+    });
+}
+
+/// The selected-content surface used by Gamer View. It provides elevation and
+/// hierarchy while leaving all actions and state decisions to the caller.
+pub(crate) fn hero_card<R>(ui: &mut egui::Ui, add_contents: impl FnOnce(&mut egui::Ui) -> R) -> R {
+    egui::Frame::new()
+        .fill(theme::raised_fill(ui))
+        .stroke(egui::Stroke::new(1.0_f32, theme::focus_border_color(ui)))
+        .corner_radius(10)
+        .inner_margin(egui::Margin::same(theme::SPACE_SM as i8))
+        .show(ui, add_contents)
+        .inner
+}
+
+/// A consistent letterboxed artwork plate. The closure paints the actual
+/// image, keeping media loading and fallback selection in the existing caller.
+pub(crate) fn media_frame(
+    ui: &mut egui::Ui,
+    size: egui::Vec2,
+    fallback_label: Option<&str>,
+    paint: impl FnOnce(&mut egui::Ui, egui::Rect),
+) {
+    let (allocated, _) = ui.allocate_exact_size(size, egui::Sense::hover());
+    let rect = egui::Rect::from_min_size(allocated.min, size);
+    ui.painter().rect_filled(rect, 8.0, theme::deep_fill(ui));
+    ui.painter()
+        .rect_stroke(rect, 8.0, theme::border(ui), egui::StrokeKind::Inside);
+    paint(ui, rect);
+    if let Some(label) = fallback_label {
+        ui.painter().text(
+            rect.center_bottom() - egui::vec2(0.0, 12.0),
+            egui::Align2::CENTER_CENTER,
+            label,
+            egui::FontId::proportional(theme::TECHNICAL_SIZE),
+            theme::SECONDARY_TEXT,
+        );
+    }
+}
+
+#[allow(dead_code)] // Foundation primitive; callers are added as operation UIs migrate.
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct ProgressRow<'a> {
+    pub(crate) spinner: bool,
+    pub(crate) current: Option<(u64, u64)>,
+    pub(crate) phase: Option<&'a str>,
+    pub(crate) cancel_label: Option<&'a str>,
+}
+
+/// Shared long-operation presentation. Cancellation is opt-in and therefore
+/// cannot accidentally appear for a non-cancellable operation.
+#[allow(dead_code)] // Foundation primitive; intentionally not wired everywhere yet.
+pub(crate) fn progress_row(ui: &mut egui::Ui, progress: ProgressRow<'_>) -> bool {
+    let mut cancelled = false;
+    ui.horizontal(|ui| {
+        if progress.spinner {
+            ui.spinner();
+        }
+        if let Some((current, total)) = progress.current {
+            let fraction = if total == 0 {
+                0.0
+            } else {
+                current as f32 / total as f32
+            };
+            ui.add(egui::ProgressBar::new(fraction.clamp(0.0, 1.0)).desired_width(150.0));
+            ui.label(format!("{current}/{total}"));
+        }
+        if let Some(phase) = progress.phase {
+            ui.label(egui::RichText::new(phase).color(theme::SECONDARY_TEXT));
+        }
+        if let Some(label) = progress.cancel_label {
+            cancelled = ui.button(label).clicked();
+        }
+    });
+    cancelled
 }
 
 /// A restrained workflow identity for a major navigation card. This colour is
@@ -116,7 +987,7 @@ pub(crate) fn workflow_card<R>(
         .fill(accent.gamma_multiply(0.075))
         .stroke(theme::border(ui))
         .corner_radius(9)
-        .inner_margin(egui::Margin::same(16))
+        .inner_margin(egui::Margin::same(theme::SPACE_LG as i8))
         .show(ui, add_contents);
     ui.painter().line_segment(
         [
@@ -184,6 +1055,89 @@ pub(crate) fn technical_details<R>(
         .default_open(false)
         .show(ui, add_contents)
         .body_returned
+}
+
+/// A substantial, named page section the reader can collapse. The
+/// open/closed state is remembered for the rest of the app session - egui
+/// persists a `CollapsingHeader`'s openness in its own memory keyed by
+/// `id_salt` - so collapsing a dense "advanced" block stays collapsed while
+/// the reader moves around the app and comes back.
+///
+/// Use this only for genuinely large sections (a card's worth of controls or
+/// more); never wrap a single-row control in it. Pass `default_open: true`
+/// for the current/primary task and `default_open: false` for advanced,
+/// reference-heavy, or rarely-needed detail. Changes no behaviour - it only
+/// controls whether the body is drawn this frame. Returns the body closure's
+/// value when the section is expanded, `None` when it is collapsed.
+pub(crate) fn collapsible_section<R>(
+    ui: &mut egui::Ui,
+    id_salt: impl std::hash::Hash,
+    title: &str,
+    default_open: bool,
+    add_contents: impl FnOnce(&mut egui::Ui) -> R,
+) -> Option<R> {
+    egui::CollapsingHeader::new(egui::RichText::new(title).strong())
+        .id_salt(id_salt)
+        .default_open(default_open)
+        .show(ui, add_contents)
+        .body_returned
+}
+
+/// A compact, searchable platform picker: a filter box above a bounded,
+/// internally-scrolling list of compact selectable rows - a drop-in
+/// replacement for the "one full-height `egui::Button` per platform" wall
+/// this project had in several places (Sources' "Assign platform" menu, a
+/// Library row's "Set platform" context menu, ...). Semantics are
+/// unchanged: the same `platforms` list, the same click-to-choose action:
+/// only the presentation and (new) filtering are different.
+///
+/// The filter text lives in egui's own per-widget memory, keyed by
+/// `id_salt`, so callers need no persistent field of their own - this is
+/// deliberately reusable without adding any state to the caller's page.
+/// Returns the clicked platform name, if any, this frame.
+pub(crate) fn platform_picker(
+    ui: &mut egui::Ui,
+    id_salt: impl std::hash::Hash,
+    platforms: &[&'static str],
+    selected: Option<&str>,
+    enabled: bool,
+) -> Option<&'static str> {
+    let search_id = egui::Id::new(("platform_picker_search", &id_salt));
+    let mut search = ui
+        .data_mut(|data| data.get_temp::<String>(search_id))
+        .unwrap_or_default();
+    ui.horizontal(|ui| {
+        ui.label("Search:");
+        ui.add_enabled(enabled, egui::TextEdit::singleline(&mut search));
+    });
+    let query = search.to_lowercase();
+    let filtered: Vec<&'static str> = platforms
+        .iter()
+        .copied()
+        .filter(|name| query.is_empty() || name.to_lowercase().contains(&query))
+        .collect();
+    let mut clicked = None;
+    ui.add_enabled_ui(enabled, |ui| {
+        egui::ScrollArea::vertical()
+            .id_salt(("platform_picker_scroll", &id_salt))
+            .max_height(240.0)
+            .auto_shrink([false, false])
+            .show(ui, |ui| {
+                if filtered.is_empty() {
+                    ui.weak("No platform matches this search.");
+                }
+                for name in &filtered {
+                    if ui
+                        .selectable_label(selected == Some(*name), *name)
+                        .clicked()
+                    {
+                        clicked = Some(*name);
+                    }
+                }
+            });
+    });
+    ui.data_mut(|data| data.insert_temp(search_id, search));
+    clicked
 }
 
 /// A compact single row of status badges, for pages that used to stack
@@ -302,7 +1256,14 @@ pub(crate) fn failure_summary(
     );
     if !detail.is_empty() {
         technical_details(ui, id_salt, |ui| {
-            ui.add(egui::Label::new(egui::RichText::new(detail).monospace()).wrap());
+            ui.add(
+                egui::Label::new(
+                    egui::RichText::new(detail)
+                        .monospace()
+                        .color(theme::TECHNICAL_TEXT),
+                )
+                .wrap(),
+            );
         });
     }
 }
@@ -322,6 +1283,140 @@ pub(crate) fn copyable_value(ui: &mut egui::Ui, label: &str, full: &str) -> bool
     copy
 }
 
+/// The shared header every `ToolsOverlay` screen that doesn't already
+/// provide its own dismiss action (unlike Diagnostics, whose own
+/// `show_setup_diagnostics` already returns `Continue`/`ViewLastSnapshot`)
+/// renders - a heading plus one "Back to Library" button. Returns `true`
+/// exactly when that button was clicked, so the caller can close the
+/// overlay.
+///
+/// Reviewed for the Library IA migration and deliberately left as-is:
+/// despite the label, clicking it does not navigate anywhere - it only
+/// clears `self.tools_overlay`, returning to whatever `view` was already
+/// active (Mount, Settings, or anything else a Tools overlay can be
+/// opened from, not only Library). The label predates the unified
+/// Library shell and is a pre-existing minor inaccuracy for the
+/// non-Library case, not something this migration introduced or should
+/// fix in passing - changing its target to actually navigate to Library
+/// would be a real, unrelated behaviour change for users who open a
+/// Tools overlay from a non-Library page.
+///
+/// Extracted verbatim from `main.rs` (2026-08-22, GUI extraction pass 2):
+/// a shared primitive used by five different overlay renderers, not any
+/// one page's own concern.
+pub(crate) fn show_tools_overlay_header(ui: &mut egui::Ui, title: &str) -> bool {
+    let mut close = false;
+    ui.horizontal(|ui| {
+        ui.heading(title);
+        if ui.button("Back to Library").clicked() {
+            close = true;
+        }
+    });
+    ui.separator();
+    close
+}
+
+// --- Detail-grid rows ------------------------------------------------------
+//
+// Extracted verbatim from `main.rs` (2026-08-22, GUI extraction pass 3):
+// shared by the Selected archive panel and Gamer View's Details screen, so
+// this lives with the other shared widgets rather than in either page's own
+// module - moving it into just one would have made the other page depend on
+// it.
+
+pub(crate) fn detail_row(ui: &mut egui::Ui, label: &str, value: &str) {
+    ui.strong(label);
+    ui.add(egui::Label::new(value).selectable(true).wrap());
+    ui.end_row();
+}
+
+pub(crate) fn optional_detail_row(ui: &mut egui::Ui, label: &str, value: Option<&str>) {
+    if let Some(value) = value {
+        detail_row(ui, label, value);
+    }
+}
+
+pub(crate) fn detail_row_with_copy(
+    ui: &mut egui::Ui,
+    label: &str,
+    value: &str,
+    clipboard: &mut dyn ClipboardBackend,
+) {
+    ui.strong(label);
+    ui.vertical(|ui| {
+        let response = ui
+            .add(
+                egui::Label::new(value)
+                    .selectable(true)
+                    .truncate()
+                    .sense(egui::Sense::click()),
+            )
+            .on_hover_text(value);
+        if ui.small_button("Copy").clicked() {
+            let _ = clipboard.set_text(value.to_string());
+        }
+        response.context_menu(|ui| {
+            if ui.button("Copy").clicked() {
+                let _ = clipboard.set_text(value.to_string());
+                ui.close();
+            }
+            if ui.button("Select all").clicked() {
+                let _ = clipboard.set_text(value.to_string());
+                ui.close();
+            }
+            if ui.button("Show containing folder").clicked() {
+                let folder = Path::new(value).parent().unwrap_or(Path::new(value));
+                let _ = open_folder_in_file_manager(folder);
+                ui.close();
+            }
+        });
+    });
+    ui.end_row();
+}
+
+pub(crate) fn archive_kind_name(kind: ArchiveKind) -> &'static str {
+    match kind {
+        ArchiveKind::Zip => "ZIP",
+        ArchiveKind::SevenZip => "7z",
+        ArchiveKind::Rar => "RAR",
+        ArchiveKind::Lha => "LHA",
+        ArchiveKind::MegaDriveRom => "Mega Drive ROM",
+        ArchiveKind::DirectGameImage => "Game image",
+        ArchiveKind::ArcadeSetDirectory => "Arcade set",
+        ArchiveKind::ScummVmDirectory => "ScummVM game folder",
+        ArchiveKind::PreservationRecording => "Spectrum gameplay recording",
+    }
+}
+
+pub(crate) fn format_size(size_bytes: Option<u64>) -> String {
+    size_bytes
+        .map(|size| format!("{size} bytes"))
+        .unwrap_or_else(|| "Unknown".to_string())
+}
+
+pub(crate) fn summary_value(ui: &mut egui::Ui, label: &str, value: usize) {
+    // Explicit tighter vertical margin than `egui::Frame::group`'s default
+    // (6px all sides): with the app-wide readability item_spacing bump
+    // (see `apply_readability_style`), the Health and Duplicates pages'
+    // multi-card summary rows read as having excessive empty space around
+    // each card's small text. Horizontal margin is left roomier for
+    // legibility; only the vertical footprint is tightened.
+    egui::Frame::group(ui.style())
+        .inner_margin(egui::Margin::symmetric(10, 3))
+        .show(ui, |ui| {
+            // Never allow a horizontal container to crush a counter into
+            // one-character-wide vertical text. Narrow viewports scroll or
+            // wrap whole cards instead.
+            ui.set_min_width(96.0);
+            ui.set_width(120.0);
+            ui.set_max_width(120.0);
+            ui.vertical_centered(|ui| {
+                ui.strong(value.to_string());
+                ui.small(label);
+            });
+        });
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -338,6 +1433,126 @@ mod tests {
             .shapes
             .iter()
             .any(|clipped| shape_contains(&clipped.shape, needle))
+    }
+
+    fn find_exact_text_center(output: &egui::FullOutput, needle: &str) -> Option<egui::Pos2> {
+        fn find_in_shape(shape: &egui::Shape, needle: &str) -> Option<egui::Pos2> {
+            match shape {
+                egui::Shape::Text(text_shape) => (text_shape.galley.text() == needle)
+                    .then(|| text_shape.pos + text_shape.galley.size() / 2.0),
+                egui::Shape::Vec(nested) => nested.iter().find_map(|s| find_in_shape(s, needle)),
+                _ => None,
+            }
+        }
+        output
+            .shapes
+            .iter()
+            .find_map(|clipped| find_in_shape(&clipped.shape, needle))
+    }
+
+    /// Regression for the "Review catalogue update" dialog (and its
+    /// directly-related confirmation dialogs) opening near the top/right
+    /// instead of centered - easy to miss on a large/ultrawide display.
+    /// Renders in a deliberately wide, asymmetric viewport: a dialog that
+    /// defaulted to egui's un-anchored placement would land far from the
+    /// center, so this would fail without the fix.
+    #[test]
+    fn centered_window_opens_near_the_viewport_center_not_a_corner() {
+        let ctx = egui::Context::default();
+        let screen = egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(2000.0, 1000.0));
+        let mut open = true;
+        let input = egui::RawInput {
+            screen_rect: Some(screen),
+            ..Default::default()
+        };
+        // A never-before-seen floating window needs one settling frame
+        // before its final anchored position is reflected in the output -
+        // same reason this file's other window-rendering tests run twice.
+        let _ = ctx.run(input.clone(), |ctx| {
+            centered_window("Test dialog")
+                .resizable(false)
+                .open(&mut open)
+                .show(ctx, |ui| {
+                    ui.label("dialog body text");
+                });
+        });
+        let output = ctx.run(input, |ctx| {
+            centered_window("Test dialog")
+                .resizable(false)
+                .open(&mut open)
+                .show(ctx, |ui| {
+                    ui.label("dialog body text");
+                });
+        });
+
+        let pos = find_exact_text_center(&output, "dialog body text")
+            .expect("the dialog's body text must render");
+        let center = screen.center();
+        assert!(
+            (pos.x - center.x).abs() < 400.0,
+            "expected the dialog near the horizontal center ({}), got x={}",
+            center.x,
+            pos.x
+        );
+        assert!(
+            (pos.y - center.y).abs() < 300.0,
+            "expected the dialog near the vertical center ({}), got y={}",
+            center.y,
+            pos.y
+        );
+    }
+
+    #[test]
+    fn hero_card_and_media_frame_render_title_and_fallback() {
+        let ctx = egui::Context::default();
+        let output = ctx.run(egui::RawInput::default(), |ctx| {
+            egui::CentralPanel::default().show(ctx, |ui| {
+                hero_card(ui, |ui| {
+                    ui.label(egui::RichText::new("Selected game").size(theme::DISPLAY_SIZE));
+                    media_frame(
+                        ui,
+                        egui::vec2(120.0, 160.0),
+                        Some("Artwork unavailable"),
+                        |ui, _| {
+                            ui.label("Cover");
+                        },
+                    );
+                });
+            });
+        });
+        assert!(rendered_text_contains(&output, "Selected game"));
+        assert!(rendered_text_contains(&output, "Artwork unavailable"));
+        assert!(rendered_text_contains(&output, "Cover"));
+    }
+
+    #[test]
+    fn progress_row_renders_indeterminate_determinate_and_optional_cancel() {
+        let ctx = egui::Context::default();
+        let output = ctx.run(egui::RawInput::default(), |ctx| {
+            egui::CentralPanel::default().show(ctx, |ui| {
+                assert!(!progress_row(
+                    ui,
+                    ProgressRow {
+                        spinner: true,
+                        current: None,
+                        phase: Some("Scanning"),
+                        cancel_label: None
+                    }
+                ));
+                assert!(!progress_row(
+                    ui,
+                    ProgressRow {
+                        spinner: false,
+                        current: Some((3, 10)),
+                        phase: Some("Reading"),
+                        cancel_label: Some("Cancel")
+                    }
+                ));
+            });
+        });
+        assert!(rendered_text_contains(&output, "Scanning"));
+        assert!(rendered_text_contains(&output, "3/10"));
+        assert!(rendered_text_contains(&output, "Cancel"));
     }
 
     #[test]
@@ -481,6 +1696,100 @@ mod tests {
         );
     }
 
+    const TEST_PLATFORMS: &[&str] = &["Nintendo 64", "Nintendo Switch", "Sega Genesis", "Sega CD"];
+
+    #[test]
+    fn platform_picker_renders_every_platform_when_unfiltered() {
+        let ctx = egui::Context::default();
+        let output = ctx.run(egui::RawInput::default(), |ctx| {
+            egui::CentralPanel::default().show(ctx, |ui| {
+                let _ = platform_picker(ui, "picker_unfiltered_test", TEST_PLATFORMS, None, true);
+            });
+        });
+        for platform in TEST_PLATFORMS {
+            assert!(
+                rendered_text_contains(&output, platform),
+                "expected {platform:?} to render unfiltered"
+            );
+        }
+    }
+
+    #[test]
+    fn platform_picker_search_narrows_the_visible_list() {
+        let ctx = egui::Context::default();
+        // Frame 1: type "sega" into the search box.
+        let _ = ctx.run(egui::RawInput::default(), |ctx| {
+            egui::CentralPanel::default().show(ctx, |ui| {
+                let id = egui::Id::new(("platform_picker_search", "picker_search_test"));
+                ui.data_mut(|data| data.insert_temp(id, "sega".to_string()));
+                let _ = platform_picker(ui, "picker_search_test", TEST_PLATFORMS, None, true);
+            });
+        });
+        // Frame 2: the picker now reads back the search text it just
+        // persisted, and the list must be filtered accordingly.
+        let output = ctx.run(egui::RawInput::default(), |ctx| {
+            egui::CentralPanel::default().show(ctx, |ui| {
+                let _ = platform_picker(ui, "picker_search_test", TEST_PLATFORMS, None, true);
+            });
+        });
+        assert!(rendered_text_contains(&output, "Sega Genesis"));
+        assert!(rendered_text_contains(&output, "Sega CD"));
+        assert!(!rendered_text_contains(&output, "Nintendo 64"));
+        assert!(!rendered_text_contains(&output, "Nintendo Switch"));
+    }
+
+    #[test]
+    fn platform_picker_reports_the_clicked_platform() {
+        let ctx = egui::Context::default();
+        let screen = egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(600.0, 400.0));
+        let base_input = egui::RawInput {
+            screen_rect: Some(screen),
+            ..Default::default()
+        };
+        let mut clicked = None;
+        let _ = ctx.run(base_input.clone(), |ctx| {
+            egui::CentralPanel::default().show(ctx, |ui| {
+                clicked = platform_picker(ui, "picker_click_test", TEST_PLATFORMS, None, true);
+            });
+        });
+        assert_eq!(clicked, None, "no click was simulated yet");
+
+        let output = ctx.run(base_input.clone(), |ctx| {
+            egui::CentralPanel::default().show(ctx, |ui| {
+                let _ = platform_picker(ui, "picker_click_test", TEST_PLATFORMS, None, true);
+            });
+        });
+        let pos = find_exact_text_center(&output, "Nintendo 64")
+            .expect("expected \"Nintendo 64\" to render as its own row");
+
+        let click = egui::RawInput {
+            screen_rect: Some(screen),
+            events: vec![
+                egui::Event::PointerMoved(pos),
+                egui::Event::PointerButton {
+                    pos,
+                    button: egui::PointerButton::Primary,
+                    pressed: true,
+                    modifiers: Default::default(),
+                },
+                egui::Event::PointerButton {
+                    pos,
+                    button: egui::PointerButton::Primary,
+                    pressed: false,
+                    modifiers: Default::default(),
+                },
+            ],
+            ..Default::default()
+        };
+        let mut clicked = None;
+        let _ = ctx.run(click, |ctx| {
+            egui::CentralPanel::default().show(ctx, |ui| {
+                clicked = platform_picker(ui, "picker_click_test", TEST_PLATFORMS, None, true);
+            });
+        });
+        assert_eq!(clicked, Some("Nintendo 64"));
+    }
+
     #[test]
     fn failure_summary_shows_the_headline_and_retained_note_directly_but_hides_detail() {
         let ctx = egui::Context::default();
@@ -510,6 +1819,117 @@ mod tests {
     }
 
     #[test]
+    fn page_hero_renders_title_purpose_state_and_motto() {
+        let ctx = egui::Context::default();
+        let output = ctx.run(egui::RawInput::default(), |ctx| {
+            egui::CentralPanel::default().show(ctx, |ui| {
+                page_hero(
+                    ui,
+                    |ui, size| {
+                        // A fallback-safe motif: draws nothing but must not
+                        // panic even though it is given real layout space.
+                        let _ = ui.allocate_exact_size(size, egui::Sense::hover());
+                    },
+                    "Tape Inspector",
+                    "Inspect cassette structure.",
+                    Some(("Read-only inspection", StatusTone::Info)),
+                    Some("Replay your youth."),
+                    |_ui| {},
+                    |ui| {
+                        ui.label("Primary action slot");
+                    },
+                );
+            });
+        });
+        assert!(rendered_text_contains(&output, "Tape Inspector"));
+        assert!(rendered_text_contains(
+            &output,
+            "Inspect cassette structure."
+        ));
+        assert!(rendered_text_contains(&output, "Read-only inspection"));
+        assert!(rendered_text_contains(&output, "Replay your youth."));
+        assert!(rendered_text_contains(&output, "Primary action slot"));
+    }
+
+    #[test]
+    fn workflow_strip_highlights_current_step_with_marker_and_colour() {
+        let ctx = egui::Context::default();
+        let output = ctx.run(egui::RawInput::default(), |ctx| {
+            egui::CentralPanel::default().show(ctx, |ui| {
+                workflow_strip(ui, &["Choose", "Inspect", "Convert", "Verify"], 1);
+            });
+        });
+        for expected in ["Choose", "Inspect", "Convert", "Verify"] {
+            assert!(
+                rendered_text_contains(&output, expected),
+                "workflow_strip did not render {expected:?}"
+            );
+        }
+        // The current step is marked with a non-colour cue (the leading
+        // glyph plus its numbered/checkmark badge), not colour alone.
+        assert!(rendered_text_contains(&output, "▶ Inspect"));
+        assert!(rendered_text_contains(&output, "Choose · done"));
+    }
+
+    #[test]
+    fn signal_panel_renders_its_status_lines_and_reading() {
+        let ctx = egui::Context::default();
+        let output = ctx.run(egui::RawInput::default(), |ctx| {
+            egui::CentralPanel::default().show(ctx, |ui| {
+                signal_panel(
+                    ui,
+                    egui::vec2(160.0, 70.0),
+                    &["TAPE SIGNAL".to_string(), "IDLE".to_string()],
+                    |painter, rect| {
+                        painter.line_segment(
+                            [rect.left_center(), rect.right_center()],
+                            egui::Stroke::new(1.5_f32, theme::TEAL),
+                        );
+                    },
+                );
+            });
+        });
+        assert!(rendered_text_contains(&output, "TAPE SIGNAL"));
+        assert!(rendered_text_contains(&output, "IDLE"));
+    }
+
+    #[test]
+    fn signal_panel_is_fallback_safe_at_degenerate_sizes() {
+        let ctx = egui::Context::default();
+        let _ = ctx.run(egui::RawInput::default(), |ctx| {
+            egui::CentralPanel::default().show(ctx, |ui| {
+                signal_panel(ui, egui::vec2(0.0, 0.0), &[], |_painter, _rect| {});
+                signal_panel(
+                    ui,
+                    egui::vec2(40.0, 10.0),
+                    &["ONE".to_string(), "TWO".to_string(), "THREE".to_string()],
+                    |_painter, _rect| {},
+                );
+            });
+        });
+    }
+
+    #[test]
+    fn format_chip_row_renders_every_label() {
+        let ctx = egui::Context::default();
+        let output = ctx.run(egui::RawInput::default(), |ctx| {
+            egui::CentralPanel::default().show(ctx, |ui| {
+                format_chip_row(
+                    ui,
+                    &[
+                        ("TAP", egui::Color32::from_rgb(59, 130, 246)),
+                        ("TZX / CDT", theme::SUCCESS),
+                        ("T64", egui::Color32::from_rgb(168, 85, 247)),
+                    ],
+                );
+            });
+        });
+        assert!(rendered_text_contains(&output, "TAP"));
+        assert!(rendered_text_contains(&output, "TZX / CDT"));
+        assert!(rendered_text_contains(&output, "T64"));
+    }
+
+    #[test]
     fn failure_summary_omits_the_disclosure_entirely_when_there_is_no_detail() {
         let ctx = egui::Context::default();
         let output = ctx.run(egui::RawInput::default(), |ctx| {
@@ -519,4 +1939,10 @@ mod tests {
         });
         assert!(!rendered_text_contains(&output, "Technical details"));
     }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum ArrowDirection {
+    Up,
+    Down,
 }

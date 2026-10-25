@@ -67,11 +67,20 @@ use crate::{
     SourceHealthIssue,
 };
 
+pub mod arcade_dat_version;
+pub mod arcade_profiles;
+pub mod arcade_version_probe;
 pub mod environment;
+pub mod handheld_profiles;
 pub mod managed;
+pub mod native_profiles;
 pub mod profiles;
+pub mod remaining_profiles;
 pub mod repair;
+pub mod rmg_sameboy;
 pub mod runner;
+pub mod scummvm_dosbox;
+pub mod verified_identity;
 
 #[cfg(test)]
 mod tests;
@@ -251,8 +260,14 @@ pub enum DoctorSubsystem {
     /// `diagnostics::environment::mount_table` (`/proc/self/mountinfo`)
     FilesystemMountState,
     /// `discover_dolphin_profiles` / `discover_pcsx2_profiles` /
-    /// `discover_xenia_profiles`
+    /// `discover_xenia_profiles` / `discover_xemu_profiles`
     EmulatorProfiles,
+    /// Whether a discovered xemu/Xenia profile can actually launch a game:
+    /// native executable binding safety/ambiguity, plus - xemu only - the
+    /// four required system files (MCPX boot ROM, flash BIOS, EEPROM, HDD
+    /// image). A distinct question from [`Self::EmulatorProfiles`]'s "could
+    /// EmuWiz write into this profile".
+    EmulatorReadiness,
     /// EmuWiz-managed cheat and patch entries, anchored on install
     /// journals and on each adapter's own ownership marker.
     ManagedEntries,
@@ -278,6 +293,7 @@ impl DoctorSubsystem {
             Self::FilesystemCapacity => "filesystem_capacity",
             Self::FilesystemMountState => "filesystem_mount_state",
             Self::EmulatorProfiles => "emulator_profiles",
+            Self::EmulatorReadiness => "emulator_readiness",
             Self::ManagedEntries => "managed_entries",
             Self::DoctorRunner => "doctor_runner",
         }
@@ -298,6 +314,7 @@ impl DoctorSubsystem {
             Self::FilesystemCapacity => "filesystem capacity",
             Self::FilesystemMountState => "filesystem mount state",
             Self::EmulatorProfiles => "emulator profiles",
+            Self::EmulatorReadiness => "emulator launch readiness",
             Self::ManagedEntries => "managed entries",
             Self::DoctorRunner => "Doctor runner",
         }
@@ -761,7 +778,7 @@ fn finding_from_doctor_check(check: &DoctorCheck) -> Option<Finding> {
     if category == DoctorCategory::MountRoot && check.name == "mount root" {
         finding = finding.with_recovery(KnownRecovery::new(
             None,
-            "Settings → Validate configuration offers Create Mount Root",
+            "Settings › Validate configuration offers Create Mount Root",
         ));
     }
     Some(finding)
@@ -944,19 +961,19 @@ fn health_issue_id(category: HealthCategory) -> &'static str {
 fn health_issue_recovery(issue: &HealthIssue) -> Option<KnownRecovery> {
     match issue.recovery_action {
         Some(action @ RecoveryAction::RetryMount) => {
-            Some(KnownRecovery::new(Some(action), "Library → Health, Retry"))
+            Some(KnownRecovery::new(Some(action), "Library › Health, Retry"))
         }
         Some(action @ RecoveryAction::Remount) => Some(KnownRecovery::new(
             Some(action),
-            "Library → Health, Remount",
+            "Library › Health, Remount",
         )),
         Some(action @ RecoveryAction::LazyUnmount) => Some(KnownRecovery::new(
             Some(action),
-            "Library → Health, Force unmount",
+            "Library › Health, Force unmount",
         )),
         None if issue.category == HealthCategory::Missing => Some(KnownRecovery::new(
             None,
-            "Library → Health, Review missing archives",
+            "Problems & Repair, Review stale library entries",
         )),
         None => None,
     }
@@ -1112,7 +1129,7 @@ pub fn findings_from_source_health(issues: &[SourceHealthIssue]) -> Vec<Finding>
                 )
                 .with_affected_path(&issue.path)
                 .with_evidence(evidence)
-                .with_recovery(KnownRecovery::new(None, "Sources → Rescan this folder")),
+                .with_recovery(KnownRecovery::new(None, "Sources › Rescan this folder")),
             )
         })
         .collect()
@@ -1286,7 +1303,7 @@ mod database_adapter {
                         .with_evidence(outcome.messages.clone())
                         .with_recovery(KnownRecovery::new(
                             None,
-                            "Tools → Database Status shows the full report; EmuWiz never repairs the catalogue automatically",
+                            "Tools › Database Status shows the full report; EmuWiz never repairs the catalogue automatically",
                         )),
                     );
                 }
@@ -1489,7 +1506,7 @@ pub fn findings_from_transaction_history(report: &SharedHistoryReport) -> Vec<Fi
         if journal.rollback_operation_id.is_none() {
             finding = finding.with_recovery(KnownRecovery::new(
                 None,
-                "History & Logs → Preview rollback for this operation",
+                "History & Logs › Preview rollback for this operation",
             ));
         } else {
             finding

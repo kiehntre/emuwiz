@@ -29,7 +29,8 @@ use crate::dat::rename_apply::executor::{
 use crate::dat::rename_apply::identity::capture_identity;
 use crate::dat::rename_apply::journal::write_journal;
 use crate::dat::rename_apply::model::{
-    EntryState, RenameTransaction, TransactionEntry, TransactionState,
+    EntryState, ObjectKind, RenameTransaction, TransactionEntry, TransactionOperation,
+    TransactionState,
 };
 use crate::dat::rename_apply::preflight::DirectoryPolicy;
 use crate::dat::rename_apply::rollback::{RollbackOutcome, rollback_transaction};
@@ -71,6 +72,24 @@ pub fn build_organisation_transaction(
             // cannot carry a recorded identity, so it is excluded.
             continue;
         };
+        // Linked-library defence in depth: only a regular file may become a
+        // link source, and both the recorded link target and the approved
+        // destination root must be absolute so recovery/rollback can trust
+        // them verbatim.
+        let operation = if plan.mode == OrganisationMode::BuildLinkedLibrary {
+            if identity.kind != ObjectKind::RegularFile
+                || !entry.source_path.is_absolute()
+                || !plan.master_root.is_absolute()
+            {
+                continue;
+            }
+            TransactionOperation::CreateSymlink {
+                expected_target: entry.source_path.clone(),
+                destination_root: plan.master_root.clone(),
+            }
+        } else {
+            TransactionOperation::RenameMove
+        };
         let original_basename = entry
             .source_path
             .file_name()
@@ -85,6 +104,7 @@ pub fn build_organisation_transaction(
             original_basename,
             proposed_basename: proposed_basename.to_string_lossy().into_owned(),
             identity,
+            operation,
             preflight_passed: false,
             preflight_failures: Vec::new(),
             state: EntryState::Planned,
@@ -112,6 +132,8 @@ pub fn build_organisation_transaction(
         state: TransactionState::Planned,
         entries,
         created_directories: Vec::new(),
+        recovery_resolution: None,
+        recovery_resolved_at_unix: None,
         unknown: Default::default(),
     })
 }
@@ -151,19 +173,19 @@ fn planned_platform_directories(
 }
 
 /// Re-resolves the current platform identity for every Suggested plan entry
-/// against the live database and RomM identity data, and re-derives the
-/// destination.
+/// against the live database, and re-derives the destination from the same
+/// neutral EmuWiz layout identity the preview used.
 ///
 /// Returns `Ok(())` only when nothing changed; otherwise a reason naming the
 /// entry that went stale. The GUI calls this immediately before applying, so
 /// a platform identity changed by another process (or a changed canonical
-/// slug / canonical name / archive destination) is detected and the apply is
-/// refused without any mutation.
+/// name / archive destination) is detected and the apply is refused without
+/// any mutation. No RomM mapping is consulted: preview and apply agree on the
+/// neutral folder by construction.
 pub fn revalidate_organisation_plan(
     plan: &OrganisationPlan,
     database_path: &Path,
     canonical_name_for: &dyn Fn(&Path) -> Option<String>,
-    slug_for_platform: &dyn Fn(&str) -> Option<String>,
 ) -> Result<(), String> {
     use super::plan::{OrganisationCandidate, OrganisationPlanRequest, build_organisation_plan};
 
@@ -182,14 +204,13 @@ pub fn revalidate_organisation_plan(
             mode: plan.mode,
             content_policy: plan.content_policy,
             candidates: std::slice::from_ref(&candidate),
-            slug_for_platform,
             generation: plan.generation,
         });
         let re_entry = &re_plan.entries[0];
         if re_entry.status != super::model::OrganisationStatus::Suggested
             || re_entry.destination_path != entry.destination_path
             || re_entry.platform.as_deref() != entry.platform.as_deref()
-            || re_entry.slug.as_deref() != entry.slug.as_deref()
+            || re_entry.layout_folder != entry.layout_folder
         {
             return Err(format!(
                 "the platform identity for {} changed since the plan was generated; regenerate \
@@ -249,6 +270,11 @@ pub fn apply_organisation_transaction(
     mode: OrganisationMode,
     master_root: &Path,
 ) -> Result<ApplyOutcome, ApplyError> {
+    // Live from the first Applying journal write, before the shared engine.
+    let _live = crate::dat::rename_apply::journal::mark_transaction_live(
+        journal_dir,
+        &transaction.transaction_id,
+    );
     crate::dat::rename_apply::executor::validate_classifier_version(
         transaction.classifier_version.as_deref(),
     )?;
@@ -400,6 +426,10 @@ pub fn rollback_organisation_transaction(
     cancel: &AtomicBool,
     master_root: &Path,
 ) -> Result<OrganisationRollbackOutcome, String> {
+    let _live = crate::dat::rename_apply::journal::mark_transaction_live(
+        journal_dir,
+        &transaction.transaction_id,
+    );
     let rollback = rollback_transaction(transaction, journal_dir, cancel)?;
 
     let mut directories_removed = Vec::new();

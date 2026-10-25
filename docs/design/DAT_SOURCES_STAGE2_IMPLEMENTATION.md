@@ -1,5 +1,9 @@
 # DAT Sources — Stage 2: Matching Preferences and Effective Policy
 
+> **Historical / superseded implementation record**
+>
+> This document records an earlier implementation stage and is retained for provenance. It may not describe the complete current DAT workflow. See the [README](../../README.md) and [current roadmap](../../ROADMAP.md).
+
 Status: implemented on `feature/dat-preferences-policy`. This document describes
 what shipped, not a proposal. It implements the parts of the approved
 `docs/design/DAT_CHEAT_POLICY_*.md` documents that current `main` can support

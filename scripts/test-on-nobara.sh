@@ -2,10 +2,10 @@
 
 set -Eeuo pipefail
 
-PROJECT_DIR="${PROJECT_DIR:-/home/davedap/archivefs}"
+PROJECT_DIR="${PROJECT_DIR:-$PWD}"
 NOBARA_HOST="${NOBARA_HOST:-}"
 REMOTE_DOWNLOADS="${REMOTE_DOWNLOADS:-/home/davedap/Downloads}"
-BUNDLE_NAME="${BUNDLE_NAME:-archivefs-current-test-x86_64-linux}"
+BUNDLE_NAME="${BUNDLE_NAME:-emuwiz-current-test-linux-x86_64}"
 EXPECTED_COMMAND_PATTERN="${EXPECTED_COMMAND_PATTERN:-}"
 SKIP_TESTS="${SKIP_TESTS:-0}"
 
@@ -21,7 +21,7 @@ log() {
 cleanup_local() {
     rm -rf \
         "$PROJECT_DIR/$BUNDLE_NAME" \
-        "$PROJECT_DIR/${BUNDLE_NAME}.tar.gz"
+        "$PROJECT_DIR/${BUNDLE_NAME}.tar.xz"
 }
 
 trap 'printf "\nFailed near line %s\n" "$LINENO" >&2' ERR
@@ -78,70 +78,37 @@ log "Built version"
 cleanup_local
 mkdir -p "$BUNDLE_NAME"
 
-log "Assembling temporary test bundle"
-install -m755 "$CLI" "$BUNDLE_NAME/emuwiz-cli"
-install -m755 "$GUI" "$BUNDLE_NAME/emuwiz"
-install -m755 install.sh "$BUNDLE_NAME/install.sh"
-
-for file in README.md CHANGELOG.md; do
-    [[ -f "$file" ]] && cp "$file" "$BUNDLE_NAME/"
-done
-
-shopt -s nullglob
-
-for file in LICENSE LICENSE-* LICENSES; do
-    [[ -e "$file" ]] && cp -r "$file" "$BUNDLE_NAME/"
-done
-
-for file in \
-    config.toml.example \
-    config.example.toml \
-    examples/config.toml \
-    examples/config.toml.example
-do
-    [[ -e "$file" ]] && cp "$file" "$BUNDLE_NAME/"
-done
-
-shopt -u nullglob
-
-log "Verifying copied binaries"
-cmp --silent "$CLI" "$BUNDLE_NAME/emuwiz-cli" ||
-    die "Bundled CLI differs from target/release/emuwiz-cli"
-
-cmp --silent "$GUI" "$BUNDLE_NAME/emuwiz" ||
-    die "Bundled GUI differs from target/release/emuwiz"
-
-"$BUNDLE_NAME/emuwiz-cli" --version
+log "Packaging the canonical test bundle"
+scripts/release/package-release.sh \
+    --gui "$GUI" --cli "$CLI" --source-root "$PROJECT_DIR" \
+    --output-root "$PROJECT_DIR" --archive --overwrite
 
 if [[ -n "$EXPECTED_COMMAND_PATTERN" ]]; then
     log "Checking expected CLI commands"
-    if ! "$BUNDLE_NAME/emuwiz-cli" --help |
+    if ! "$BUNDLE_NAME/bin/emuwiz-cli" --help |
         grep -E "$EXPECTED_COMMAND_PATTERN"
     then
         die "Expected CLI command pattern not found: $EXPECTED_COMMAND_PATTERN"
     fi
 fi
 
-log "Creating tarball"
-tar -czf "${BUNDLE_NAME}.tar.gz" "$BUNDLE_NAME"
-
 log "Testing tarball contents"
 TEST_DIR="$(mktemp -d)"
 trap 'rm -rf "$TEST_DIR"; cleanup_local' EXIT
 
-tar -xzf "${BUNDLE_NAME}.tar.gz" -C "$TEST_DIR"
+tar -xJf "${BUNDLE_NAME}.tar.xz" -C "$TEST_DIR"
 
-"$TEST_DIR/$BUNDLE_NAME/emuwiz-cli" --version
+"$TEST_DIR/$BUNDLE_NAME/bin/emuwiz-cli" --version
 
 if [[ -n "$EXPECTED_COMMAND_PATTERN" ]]; then
-    "$TEST_DIR/$BUNDLE_NAME/emuwiz-cli" --help |
+    "$TEST_DIR/$BUNDLE_NAME/bin/emuwiz-cli" --help |
         grep -E "$EXPECTED_COMMAND_PATTERN" >/dev/null ||
         die "Expected commands missing from extracted tarball"
 fi
 
 log "Copying bundle to Nobara"
 scp \
-    "${BUNDLE_NAME}.tar.gz" \
+    "${BUNDLE_NAME}.tar.xz" \
     "$NOBARA_HOST:$REMOTE_DOWNLOADS/"
 
 log "Installing and testing on Nobara"
@@ -161,16 +128,16 @@ EXPECTED_COMMAND_PATTERN="${EXPECTED_COMMAND_PATTERN:-}"
 cd "$REMOTE_DOWNLOADS"
 
 rm -rf "$BUNDLE_NAME"
-tar -xzf "${BUNDLE_NAME}.tar.gz"
+tar -xJf "${BUNDLE_NAME}.tar.xz"
 
 cd "$BUNDLE_NAME"
 
 printf '\n==> Bundle version before installation\n'
-./emuwiz-cli --version
+./bin/emuwiz-cli --version
 
 if [[ -n "$EXPECTED_COMMAND_PATTERN" ]]; then
     printf '\n==> Checking expected commands before installation\n'
-    ./emuwiz-cli --help |
+    ./bin/emuwiz-cli --help |
         grep -E "$EXPECTED_COMMAND_PATTERN"
 fi
 

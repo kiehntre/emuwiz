@@ -1,0 +1,2815 @@
+use super::container::{ContainerKind, FolderRole};
+use super::content_registry::ContentKind;
+use super::content_registry::recognized_extensions;
+use super::discovery::{
+    SkipReason, SourceDiscoveryReport, ValidationState, discover_source,
+    discover_source_with_fingerprints,
+};
+use crate::{
+    ARCHIVE_PARSER_VERSION, Archive, ArchiveKind, IngestionFingerprint, SCAN_CACHE_VERSION,
+    SCANNER_VERSION, ScanFingerprint,
+};
+use std::fs::File;
+use std::path::Path;
+use tempfile::tempdir;
+
+fn source_dir(name: &str) -> tempfile::TempDir {
+    tempdir().unwrap_or_else(|error| panic!("failed to create temp source dir {name}: {error}"))
+}
+
+#[test]
+fn unchanged_archive_reuses_ingestion_listing_without_reopening() {
+    use zip::ZipWriter;
+    use zip::write::SimpleFileOptions;
+
+    let dir = source_dir("ingestion-cache");
+    let archive_path = dir.path().join("Game.zip");
+    let mut writer = ZipWriter::new(File::create(&archive_path).unwrap());
+    writer
+        .start_file("Game.nes", SimpleFileOptions::default())
+        .unwrap();
+    std::io::Write::write_all(&mut writer, b"rom").unwrap();
+    writer.finish().unwrap();
+
+    let cold = discover_source(dir.path()).unwrap();
+    let archive = Archive::from_path_in_root(&archive_path, dir.path()).unwrap();
+    let evidence = cold
+        .archive_evidence
+        .iter()
+        .find(|evidence| evidence.path == archive_path)
+        .unwrap();
+    let fingerprint = ScanFingerprint {
+        relative_path: archive_path.strip_prefix(dir.path()).unwrap().to_path_buf(),
+        size_bytes: archive.identity.size_bytes.unwrap(),
+        modified_time_ns: archive
+            .identity
+            .modified_time
+            .unwrap()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos() as i128,
+        archive_kind: ArchiveKind::Zip,
+        display_name: archive.identity.display_name,
+        normalized_name: archive.identity.normalized_name,
+        platform: archive.identity.platform,
+        platform_provenance: archive.identity.platform_provenance,
+        scanner_version: SCANNER_VERSION.into(),
+        parser_version: ARCHIVE_PARSER_VERSION.into(),
+        cache_version: SCAN_CACHE_VERSION,
+        ingestion: Some(IngestionFingerprint {
+            version: super::discovery::INGESTION_PARSER_VERSION.into(),
+            listing_hash: evidence.listing_hash.clone(),
+            member_count: evidence.member_count,
+            selected_member: evidence.selected_member.clone(),
+            listing_available: evidence.listing_available,
+        }),
+        non_archive_kind: None,
+    };
+
+    let mut stale = fingerprint.clone();
+    stale.size_bytes += 1;
+    let changed = discover_source_with_fingerprints(dir.path(), &[(1, stale)]).unwrap();
+    assert_eq!(changed.reuse.archives_reused, 0);
+    assert_eq!(changed.reuse.archives_reopened, 1);
+
+    let mut stale_version = fingerprint.clone();
+    stale_version.ingestion.as_mut().unwrap().version = "ingestion-parser-v1".into();
+    let invalidated = discover_source_with_fingerprints(dir.path(), &[(1, stale_version)]).unwrap();
+    assert_eq!(invalidated.reuse.cache_misses, 1);
+    assert_eq!(invalidated.reuse.member_listings_regenerated, 1);
+
+    let warm = discover_source_with_fingerprints(dir.path(), &[(1, fingerprint)]).unwrap();
+    assert_eq!(warm.reuse.archives_reused, 1);
+    assert_eq!(warm.reuse.member_listings_reused, 1);
+    assert_eq!(warm.reuse.archives_reopened, 0);
+    assert_eq!(warm.items, cold.items);
+}
+
+fn minimal_hdi() -> Vec<u8> {
+    let mut image = vec![0; 32 + 512];
+    image[8..12].copy_from_slice(&32_u32.to_le_bytes());
+    image[12..16].copy_from_slice(&512_u32.to_le_bytes());
+    image[16..20].copy_from_slice(&512_u32.to_le_bytes());
+    image[20..24].copy_from_slice(&1_u32.to_le_bytes());
+    image[24..28].copy_from_slice(&1_u32.to_le_bytes());
+    image[28..32].copy_from_slice(&1_u32.to_le_bytes());
+    image
+}
+
+fn minimal_nhd() -> Vec<u8> {
+    let mut image = vec![0; 0x200 + 512];
+    image[..15].copy_from_slice(b"T98HDDIMAGE.R0\0");
+    image[0x110..0x114].copy_from_slice(&0x200_u32.to_le_bytes());
+    image[0x114..0x118].copy_from_slice(&1_u32.to_le_bytes());
+    image[0x118..0x11a].copy_from_slice(&1_u16.to_le_bytes());
+    image[0x11a..0x11c].copy_from_slice(&1_u16.to_le_bytes());
+    image[0x11c..0x11e].copy_from_slice(&512_u16.to_le_bytes());
+    image
+}
+
+fn minimal_crt() -> Vec<u8> {
+    let mut image = vec![0; 0x40 + 0x10 + 4];
+    image[..16].copy_from_slice(b"C64 CARTRIDGE   ");
+    image[0x10..0x14].copy_from_slice(&0x40u32.to_be_bytes());
+    image[0x14..0x16].copy_from_slice(&0x0200u16.to_be_bytes());
+    image[0x18] = 0;
+    image[0x19] = 1;
+    image[0x40..0x44].copy_from_slice(b"CHIP");
+    image[0x44..0x48].copy_from_slice(&0x14u32.to_be_bytes());
+    image[0x48..0x4a].copy_from_slice(&0u16.to_be_bytes());
+    image[0x4a..0x4c].copy_from_slice(&0u16.to_be_bytes());
+    image[0x4c..0x4e].copy_from_slice(&0x8000u16.to_be_bytes());
+    image[0x4e..0x50].copy_from_slice(&4u16.to_be_bytes());
+    image[0x50..].fill(0xea);
+    image
+}
+
+fn minimal_zx_tap() -> Vec<u8> {
+    // One two-byte data block: flag and checksum XOR to zero.
+    vec![2, 0, 0xff, 0xff]
+}
+
+fn minimal_d64() -> Vec<u8> {
+    let mut image = vec![0; 174_848];
+    let sectors_on_track = |track: u8| match track {
+        1..=17 => 21,
+        18..=24 => 19,
+        25..=30 => 18,
+        _ => 17,
+    };
+    let offset = |track: u8, sector: u8| {
+        (1..track)
+            .map(sectors_on_track)
+            .map(usize::from)
+            .sum::<usize>()
+            .saturating_add(usize::from(sector))
+            * 256
+    };
+    let bam = offset(18, 0);
+    image[bam..bam + 3].copy_from_slice(&[18, 1, 0x41]);
+    image[bam + 0x90..bam + 0x9F].copy_from_slice(b"INGESTION TEST ");
+    image[bam + 0xA2..bam + 0xA4].copy_from_slice(b"01");
+    image[bam + 0xA5..bam + 0xA7].copy_from_slice(b"2A");
+    for track in 1..=35_u8 {
+        let count = sectors_on_track(track);
+        let entry = bam + 4 + (usize::from(track) - 1) * 4;
+        image[entry] = count;
+        for sector in 0..count {
+            image[entry + 1 + usize::from(sector / 8)] |= 1 << (sector % 8);
+        }
+    }
+    for (track, sector) in [(18_u8, 0_u8), (18, 1)] {
+        let entry = bam + 4 + (usize::from(track) - 1) * 4;
+        image[entry] -= 1;
+        image[entry + 1 + usize::from(sector / 8)] &= !(1 << (sector % 8));
+    }
+    image[offset(18, 1)] = 0;
+    image[offset(18, 1) + 1] = 0xFF;
+    image
+}
+
+fn minimal_pbp() -> Vec<u8> {
+    let mut image = vec![0_u8; 0x28];
+    image[..4].copy_from_slice(b"\0PBP");
+    image[4..8].copy_from_slice(&1_u32.to_le_bytes());
+    for index in 0..8 {
+        image[8 + index * 4..12 + index * 4].copy_from_slice(&0x28_u32.to_le_bytes());
+    }
+    image
+}
+
+/// The standard z64 (big-endian) N64 dump signature.
+const N64_Z64_MAGIC: [u8; 4] = [0x80, 0x37, 0x12, 0x40];
+
+/// Minimal valid Game Boy header bytes are not required for detection -
+/// `.gb` is filename-strong evidence on its own - so loose ROM fixtures
+/// below use arbitrary content unless a format needs a real signature to
+/// be read at all (Amiga HDF, WHDLoad slave).
+fn put16(v: &mut [u8], at: usize, n: u16) {
+    v[at..at + 2].copy_from_slice(&n.to_be_bytes());
+}
+fn put32(v: &mut [u8], at: usize, n: u32) {
+    v[at..at + 4].copy_from_slice(&n.to_be_bytes());
+}
+
+/// A minimal, valid WHDLoad `.slave` HUNK binary - mirrors the fixture in
+/// `identity_source::whdload::tests`.
+fn minimal_whdload_slave() -> Vec<u8> {
+    let size: usize = 30;
+    let mut code = vec![0; (size + 64).next_multiple_of(4)];
+    code[..4].copy_from_slice(&[0x70, 0xff, 0x4e, 0x75]);
+    code[4..12].copy_from_slice(b"WHDLOADS");
+    put16(&mut code, 12, 1); // runtime_version
+    put16(&mut code, 14, 3);
+    put32(&mut code, 16, 524288);
+    put32(&mut code, 20, 1);
+    put16(&mut code, 24, (size + 40) as u16);
+    put16(&mut code, 26, 0);
+    put16(&mut code, 28, 0);
+    code[size..size + 5].copy_from_slice(b"Game\0");
+    code[size + 8..size + 13].copy_from_slice(b"Copy\0");
+    code[size + 16..size + 21].copy_from_slice(b"Info\0");
+    code[size + 24..size + 29].copy_from_slice(b"Kick\0");
+    code[size + 32..size + 39].copy_from_slice(b"Config\0");
+    let mut out = Vec::new();
+    for n in [
+        0x3f3_u32,
+        0,
+        1,
+        0,
+        0,
+        (code.len() / 4) as u32,
+        0x3e9,
+        (code.len() / 4) as u32,
+    ] {
+        out.extend_from_slice(&n.to_be_bytes());
+    }
+    out.extend_from_slice(&code);
+    out.extend_from_slice(&0x3f2_u32.to_be_bytes());
+    out
+}
+
+/// A minimal valid RDB/HDF image with no partitions - just enough for
+/// `amiga_disk::inspect_hdf` to succeed, mirroring `amiga_disk::tests`.
+fn minimal_amiga_hdf() -> Vec<u8> {
+    let mut b = vec![0u8; 512 * 4];
+    b[..4].copy_from_slice(b"RDSK");
+    put32(&mut b, 16, 512); // block size
+    put32(&mut b, 28, 0xffff_ffff); // partition head: NONE
+    put32(&mut b, 64, 20);
+    put32(&mut b, 68, 10);
+    put32(&mut b, 72, 2);
+    b
+}
+
+fn minimal_valid_dfs_image() -> Vec<u8> {
+    let mut image = vec![0_u8; 400 * 256];
+    image[0..8].copy_from_slice(b"TEST DFS");
+    image[256..260].copy_from_slice(b"    ");
+    image[260] = 0x12;
+    image[261] = 8;
+    image[262] = 1;
+    image[263] = 0x90;
+    image[8..15].copy_from_slice(b"!BOOT  ");
+    image[15] = b'$';
+    image[264..266].copy_from_slice(&0x1900_u16.to_le_bytes());
+    image[266..268].copy_from_slice(&0x1900_u16.to_le_bytes());
+    image[268..270].copy_from_slice(&3_u16.to_le_bytes());
+    image[271] = 2;
+    image
+}
+
+fn write_zip_containing(dir: &Path, zip_name: &str, member_name: &str, member_bytes: &[u8]) {
+    use zip::ZipWriter;
+    use zip::write::SimpleFileOptions;
+    let file = std::fs::File::create(dir.join(zip_name)).unwrap();
+    let mut writer = ZipWriter::new(file);
+    writer
+        .start_file(member_name, SimpleFileOptions::default())
+        .unwrap();
+    std::io::Write::write_all(&mut writer, member_bytes).unwrap();
+    writer.finish().unwrap();
+}
+
+#[test]
+fn loose_n64_rom_is_discovered_as_a_rom_cartridge_candidate() {
+    let dir = source_dir("n64");
+    std::fs::write(dir.path().join("Mario Kart 64.z64"), N64_Z64_MAGIC).unwrap();
+
+    let report = discover_source(dir.path()).unwrap();
+    assert_eq!(report.items.len(), 1, "{:?}", report.items);
+    let item = &report.items[0];
+    assert_eq!(item.content, Some(ContentKind::RomCartridge));
+    assert_eq!(item.container, ContainerKind::DirectFile);
+    assert!(!item.explanation.is_empty());
+    assert_eq!(report.stats.loose_roms, 1);
+}
+
+#[test]
+fn loose_game_boy_rom_is_discovered_as_a_rom_cartridge_candidate() {
+    let dir = source_dir("gb");
+    std::fs::write(dir.path().join("Pokemon.gb"), b"not a real rom, just bytes").unwrap();
+
+    let report = discover_source(dir.path()).unwrap();
+    assert_eq!(report.items.len(), 1);
+    assert_eq!(report.items[0].content, Some(ContentKind::RomCartridge));
+    assert_eq!(report.stats.loose_roms, 1);
+}
+
+#[test]
+fn loose_wonderswan_rom_is_discovered_with_its_existing_platform_context() {
+    let parent = source_dir("wonderswan");
+    let platform_dir = parent.path().join("WonderSwan");
+    std::fs::create_dir(&platform_dir).unwrap();
+    std::fs::write(platform_dir.join("Game.ws"), b"wonderswan rom bytes").unwrap();
+
+    let report = discover_source(&platform_dir).unwrap();
+    assert_eq!(report.items.len(), 1);
+    let item = &report.items[0];
+    assert_eq!(item.content, Some(ContentKind::RomCartridge));
+    assert_eq!(item.platform_hint.as_deref(), Some("WonderSwan"));
+    assert_eq!(item.validation_state, ValidationState::Accepted);
+    assert_eq!(report.stats.loose_roms, 1);
+}
+
+#[test]
+fn loose_wonderswan_color_rom_is_discovered_with_its_existing_platform_context() {
+    let parent = source_dir("wonderswan-color");
+    let platform_dir = parent.path().join("WonderSwan Color");
+    std::fs::create_dir(&platform_dir).unwrap();
+    std::fs::write(platform_dir.join("Game.wsc"), b"wonderswan color rom bytes").unwrap();
+
+    let report = discover_source(&platform_dir).unwrap();
+    assert_eq!(report.items.len(), 1);
+    let item = &report.items[0];
+    assert_eq!(item.content, Some(ContentKind::RomCartridge));
+    assert_eq!(item.platform_hint.as_deref(), Some("WonderSwan Color"));
+    assert_eq!(item.validation_state, ValidationState::Accepted);
+    assert_eq!(report.stats.loose_roms, 1);
+}
+
+#[test]
+fn loose_msx_cartridges_are_discovered_and_resolved_by_generation() {
+    let dir = source_dir("msx-cartridges");
+    std::fs::write(dir.path().join("cart.mx1"), b"MSX1 cartridge bytes").unwrap();
+    std::fs::write(dir.path().join("cart.mx2"), b"MSX2 cartridge bytes").unwrap();
+
+    let report = discover_source(dir.path()).unwrap();
+    assert_eq!(report.items.len(), 2, "{:?}", report.items);
+    for item in &report.items {
+        assert_eq!(item.container, ContainerKind::DirectFile);
+        assert_eq!(item.content, Some(ContentKind::RomCartridge));
+        assert_eq!(item.validation_state, ValidationState::Accepted);
+    }
+    assert_eq!(
+        report
+            .items
+            .iter()
+            .find(|item| item.path.extension().and_then(|ext| ext.to_str()) == Some("mx1"))
+            .and_then(|item| item.platform_hint.as_deref()),
+        Some("MSX")
+    );
+    assert_eq!(
+        report
+            .items
+            .iter()
+            .find(|item| item.path.extension().and_then(|ext| ext.to_str()) == Some("mx2"))
+            .and_then(|item| item.platform_hint.as_deref()),
+        Some("MSX2")
+    );
+    assert_eq!(report.stats.loose_roms, 2);
+}
+
+#[test]
+fn pc98_hdi_and_nhd_are_discovered_only_with_folder_identity() {
+    let parent = source_dir("pc98-hard-disks");
+    let pc98 = parent.path().join("pc98");
+    std::fs::create_dir(&pc98).unwrap();
+    std::fs::write(pc98.join("disk.hdi"), minimal_hdi()).unwrap();
+    std::fs::write(pc98.join("disk.nhd"), minimal_nhd()).unwrap();
+    let report = discover_source(&pc98).unwrap();
+    assert_eq!(report.items.len(), 2, "{:?}", report.items);
+    for item in &report.items {
+        assert_eq!(item.content, Some(ContentKind::ComputerDisk));
+        assert_eq!(item.platform_hint.as_deref(), Some("PC-98"));
+        assert_eq!(item.validation_state, ValidationState::Accepted);
+    }
+
+    let bare = source_dir("bare-pc98-hard-disks");
+    std::fs::write(bare.path().join("disk.hdi"), minimal_hdi()).unwrap();
+    std::fs::write(bare.path().join("disk.nhd"), minimal_nhd()).unwrap();
+    let report = discover_source(bare.path()).unwrap();
+    assert_eq!(report.items.len(), 2);
+    assert!(report.items.iter().all(|item| {
+        item.platform_hint.is_none()
+            && item.validation_state == ValidationState::Skipped
+            && item.skip_reason == Some(SkipReason::RecognizedContentNoIdentityMatch)
+    }));
+}
+
+#[test]
+fn ambiguous_msx_rom_and_bin_files_do_not_self_resolve() {
+    let dir = source_dir("msx-ambiguous");
+    std::fs::write(dir.path().join("cart.rom"), b"shared ROM bytes").unwrap();
+    std::fs::write(dir.path().join("cart.bin"), b"shared binary bytes").unwrap();
+
+    let report = discover_source(dir.path()).unwrap();
+    assert_eq!(report.items.len(), 2, "{:?}", report.items);
+    assert!(report.items.iter().all(|item| item.platform_hint.is_none()));
+    assert!(report.items.iter().all(|item| item.content.is_none()));
+}
+
+#[test]
+fn zip_containing_a_game_boy_rom_is_discovered_with_the_same_content_kind_as_loose() {
+    let dir = source_dir("zip-gb");
+    write_zip_containing(dir.path(), "Pokemon.zip", "Pokemon.gb", b"gb rom bytes");
+
+    let report = discover_source(dir.path()).unwrap();
+    assert_eq!(report.items.len(), 1);
+    let item = &report.items[0];
+    assert!(matches!(item.container, ContainerKind::Archive(_)));
+    assert_eq!(item.content, Some(ContentKind::RomCartridge));
+    assert_eq!(report.stats.archives, 1);
+}
+
+#[test]
+fn archive_member_ssd_and_dsd_extensions_are_likely_computer_disks() {
+    let dir = source_dir("zip-dfs");
+    write_zip_containing(dir.path(), "Disks.zip", "Game.ssd", b"not inspected");
+    let report = discover_source(dir.path()).unwrap();
+    assert_eq!(report.items.len(), 1);
+    assert_eq!(report.items[0].content, Some(ContentKind::ComputerDisk));
+    assert!(matches!(
+        report.items[0].container,
+        ContainerKind::Archive(_)
+    ));
+}
+
+#[test]
+fn cue_bin_pair_becomes_one_disc_image_candidate() {
+    let dir = source_dir("cue-bin");
+    std::fs::write(
+        dir.path().join("Final Fantasy VII Disc1.bin"),
+        b"disc bytes",
+    )
+    .unwrap();
+    std::fs::write(
+        dir.path().join("Final Fantasy VII.cue"),
+        "FILE \"Final Fantasy VII Disc1.bin\" BINARY\n",
+    )
+    .unwrap();
+
+    let report = discover_source(dir.path()).unwrap();
+    assert_eq!(
+        report.items.len(),
+        1,
+        "the .bin must be consumed by the .cue, not listed separately: {:?}",
+        report.items
+    );
+    let item = &report.items[0];
+    assert_eq!(item.content, Some(ContentKind::DiscImage));
+    assert_eq!(item.path.extension().unwrap(), "cue");
+    assert_eq!(report.stats.disc_images, 1);
+}
+
+#[test]
+fn a_lone_bin_without_a_cue_is_flagged_missing_paired_file_not_silently_dropped() {
+    let dir = source_dir("lone-bin");
+    std::fs::write(dir.path().join("orphan.bin"), b"disc bytes").unwrap();
+
+    let report = discover_source(dir.path()).unwrap();
+    assert_eq!(report.items.len(), 1);
+    assert_eq!(
+        report.items[0].skip_reason,
+        Some(SkipReason::MissingPairedFile)
+    );
+    assert!(!report.items[0].explanation.is_empty());
+}
+
+#[test]
+fn structurally_valid_zx_tap_overrides_a_misleading_bin_extension() {
+    let dir = source_dir("structural-zx-tap-bin");
+    std::fs::write(dir.path().join("game.bin"), minimal_zx_tap()).unwrap();
+
+    let report = discover_source(dir.path()).unwrap();
+    let item = &report.items[0];
+    assert_eq!(item.content, Some(ContentKind::TapeImage));
+    assert_eq!(item.platform_hint.as_deref(), Some("ZX Spectrum"));
+    assert_eq!(item.validation_state, ValidationState::Accepted);
+    assert!(item.explanation.contains("ZX Spectrum TAP"));
+}
+
+#[test]
+fn structurally_valid_zx_tap_is_found_without_an_extension() {
+    let dir = source_dir("structural-zx-tap-extensionless");
+    std::fs::write(dir.path().join("unknown-media"), minimal_zx_tap()).unwrap();
+
+    let report = discover_source(dir.path()).unwrap();
+    let item = &report.items[0];
+    assert_eq!(item.content, Some(ContentKind::TapeImage));
+    assert_eq!(item.platform_hint.as_deref(), Some("ZX Spectrum"));
+    assert_eq!(item.validation_state, ValidationState::Accepted);
+}
+
+#[test]
+fn chd_is_discovered_as_a_disc_image_candidate() {
+    let dir = source_dir("chd");
+    std::fs::write(dir.path().join("Arcade Game.chd"), b"not a real chd").unwrap();
+
+    let report = discover_source(dir.path()).unwrap();
+    assert_eq!(report.items.len(), 1);
+    let item = &report.items[0];
+    assert_eq!(item.content, Some(ContentKind::DiscImage));
+    // CHD is deliberately never strong platform evidence on its own -
+    // it is fine for identity to be unresolved, but it must still be a
+    // visible, explained candidate, never a silent drop.
+    if let Some(reason) = &item.skip_reason {
+        assert_eq!(reason, &SkipReason::RecognizedContentNoIdentityMatch);
+    }
+    assert_eq!(report.stats.disc_images, 1);
+}
+
+#[test]
+fn dsk_and_cdt_are_recognised_media_without_platform_guessing() {
+    // `.dsk` now goes through the shared structural disk layer: 13 garbage
+    // bytes are not a CPCEMU container at all, so this is an `InvalidContent`
+    // skip rather than "recognised, no identity". Both leave the platform
+    // unset, which is the property this test is really guarding.
+    for (name, expected, expected_reason) in [
+        (
+            "unknown-platform.dsk",
+            ContentKind::ComputerDisk,
+            SkipReason::InvalidContent(String::new()),
+        ),
+        (
+            "unknown-platform.cdt",
+            ContentKind::TapeImage,
+            SkipReason::RecognizedContentNoIdentityMatch,
+        ),
+    ] {
+        let dir = source_dir(name);
+        std::fs::write(dir.path().join(name), b"fixture bytes").unwrap();
+        let report = discover_source(dir.path()).unwrap();
+        assert_eq!(report.items.len(), 1);
+        let item = &report.items[0];
+        assert_eq!(item.content, Some(expected));
+        assert!(
+            item.platform_hint.is_none(),
+            "{name} must not infer a platform"
+        );
+        assert_eq!(
+            std::mem::discriminant(item.skip_reason.as_ref().unwrap()),
+            std::mem::discriminant(&expected_reason)
+        );
+    }
+}
+
+#[test]
+fn amiga_hdf_is_discovered_and_validated() {
+    let dir = source_dir("hdf");
+    std::fs::write(dir.path().join("Workbench.hdf"), minimal_amiga_hdf()).unwrap();
+
+    let report = discover_source(dir.path()).unwrap();
+    assert_eq!(report.items.len(), 1);
+    let item = &report.items[0];
+    assert_eq!(item.content, Some(ContentKind::AmigaImage));
+    assert_eq!(item.validation_state, ValidationState::Accepted);
+    assert!(item.explanation.contains("partition"));
+    assert_eq!(report.stats.amiga_images, 1);
+}
+
+/// A real-world WHDLoad CD32 pack shape: the whole file is one AmigaDOS
+/// filesystem starting at byte 0, no RDB wrapper - mirrors
+/// `amiga_disk::tests::flat_amigados_image_is_recognised_as_one_whole_image_partition`.
+fn minimal_flat_amiga_hdf() -> Vec<u8> {
+    let mut b = vec![0u8; 1024];
+    b[..4].copy_from_slice(&0x444f_5301u32.to_be_bytes());
+    b
+}
+
+#[test]
+fn a_real_world_flat_cd32_hdf_is_discovered_as_amiga_not_just_a_valid_rdb_one() {
+    let dir = source_dir("cd32-flat-hdf");
+    std::fs::write(
+        dir.path().join("JungleStrike_v1.2_CD32.hdf"),
+        minimal_flat_amiga_hdf(),
+    )
+    .unwrap();
+
+    let report = discover_source(dir.path()).unwrap();
+    assert_eq!(report.items.len(), 1);
+    let item = &report.items[0];
+    assert_eq!(item.content, Some(ContentKind::AmigaImage));
+    assert_eq!(item.validation_state, ValidationState::Accepted);
+    assert_eq!(report.stats.amiga_images, 1);
+}
+
+/// Real X68000 collections ship hard-disk images as `.hdf` too - a genuine
+/// extension collision discovered against a real 3,376-file X68000
+/// collection during validation, where these were previously mislabelled
+/// `AmigaImage`. A `.hdf` that is not a readable Amiga image, but whose
+/// platform is otherwise known (here via folder alias), must never be
+/// reported as Amiga content.
+#[test]
+fn a_non_amiga_hdf_with_known_platform_is_not_mislabelled_amiga() {
+    let dir = source_dir("x68000-hdf");
+    let platform_dir = dir.path().join("x68000");
+    std::fs::create_dir_all(&platform_dir).unwrap();
+    std::fs::write(platform_dir.join("Daimakaimura.hdf"), b"not an amiga image").unwrap();
+
+    let report = discover_source(dir.path()).unwrap();
+    assert_eq!(report.items.len(), 1);
+    let item = &report.items[0];
+    assert_ne!(item.content, Some(ContentKind::AmigaImage));
+    assert_eq!(item.content, Some(ContentKind::ComputerDisk));
+    assert_eq!(item.platform_hint.as_deref(), Some("Sharp X68000"));
+    assert_eq!(item.validation_state, ValidationState::Accepted);
+}
+
+#[test]
+fn a_non_amiga_hdf_with_no_platform_evidence_is_flagged_ambiguous_not_amiga() {
+    let dir = source_dir("unknown-hdf");
+    std::fs::write(dir.path().join("mystery.hdf"), b"not an amiga image").unwrap();
+
+    let report = discover_source(dir.path()).unwrap();
+    assert_eq!(report.items.len(), 1);
+    let item = &report.items[0];
+    assert_ne!(item.content, Some(ContentKind::AmigaImage));
+    assert_eq!(item.skip_reason, Some(SkipReason::AmbiguousPlatform));
+}
+
+#[test]
+fn valid_bare_pbp_is_structurally_discovered_but_platform_ambiguous() {
+    let dir = source_dir("pbp-valid");
+    std::fs::write(dir.path().join("EBOOT.pbp"), minimal_pbp()).unwrap();
+
+    let report = discover_source(dir.path()).unwrap();
+    let item = &report.items[0];
+    assert_eq!(item.content, Some(ContentKind::DiscImage));
+    assert_eq!(item.validation_state, ValidationState::Skipped);
+    assert_eq!(item.skip_reason, Some(SkipReason::AmbiguousPlatform));
+}
+
+#[test]
+fn random_pbp_is_rejected_by_structural_discovery() {
+    let dir = source_dir("pbp-invalid");
+    std::fs::write(dir.path().join("random.pbp"), b"not a pbp").unwrap();
+
+    let report = discover_source(dir.path()).unwrap();
+    let item = &report.items[0];
+    assert_eq!(item.validation_state, ValidationState::Skipped);
+    assert!(matches!(
+        item.skip_reason,
+        Some(SkipReason::InvalidContent(_))
+    ));
+}
+
+#[test]
+fn whdload_folder_is_discovered_as_one_install_candidate() {
+    let dir = source_dir("whdload");
+    let install_dir = dir.path().join("Turrican II");
+    std::fs::create_dir_all(&install_dir).unwrap();
+    std::fs::write(install_dir.join("Turrican2.slave"), minimal_whdload_slave()).unwrap();
+    std::fs::write(install_dir.join("Turrican2"), b"the game binary").unwrap();
+
+    let report = discover_source(dir.path()).unwrap();
+    assert_eq!(
+        report.items.len(),
+        1,
+        "the folder is one item, not recursed into: {:?}",
+        report.items
+    );
+    let item = &report.items[0];
+    assert_eq!(item.content, Some(ContentKind::WhdloadInstall));
+    assert_eq!(
+        item.container,
+        ContainerKind::Folder(FolderRole::WhdloadInstall)
+    );
+    assert_eq!(item.validation_state, ValidationState::Accepted);
+    // The platform hint comes from the verified slave structure, not the
+    // folder name; with no DAT context there is no exact catalogue match.
+    assert_eq!(item.platform_hint.as_deref(), Some("Amiga"));
+    assert!(
+        item.explanation
+            .contains("verified Amiga WHDLoad slave structure"),
+        "{}",
+        item.explanation
+    );
+    assert!(!item.explanation.contains("Exact catalogue match"));
+    assert_eq!(report.stats.game_folders, 1);
+}
+
+#[test]
+fn unsupported_file_is_visible_with_an_explained_skip_reason() {
+    let dir = source_dir("unknown");
+    std::fs::write(dir.path().join("Notes.xyz"), b"not a game").unwrap();
+
+    let report = discover_source(dir.path()).unwrap();
+    assert_eq!(report.items.len(), 1);
+    let item = &report.items[0];
+    assert_eq!(item.content, None);
+    assert_eq!(item.skip_reason, Some(SkipReason::UnsupportedExtension));
+    assert!(!item.explanation.is_empty());
+    assert!(
+        !item
+            .skip_reason
+            .as_ref()
+            .unwrap()
+            .suggested_action()
+            .is_empty()
+    );
+    assert_eq!(report.stats.unknown, 1);
+}
+
+/// Regression test for a live-QA bug: a real collection's incidental,
+/// never-game-content sidecar files (box art, readmes, saves, frontend
+/// metadata) were each counted as an `UnsupportedExtension` "needs
+/// attention" item, inflating a real scan's "needs attention" total into
+/// the hundreds of thousands and swamping any real signal in it.
+#[test]
+fn known_non_game_sidecar_files_are_not_reported_as_needing_attention() {
+    let dir = source_dir("sidecars");
+    let root = dir.path();
+    std::fs::write(root.join("Mario Kart 64.z64"), N64_Z64_MAGIC).unwrap();
+    for name in [
+        "Mario Kart 64.jpg",
+        "Mario Kart 64.png",
+        "Mario Kart 64.nfo",
+        "Mario Kart 64.txt",
+        "gamelist.xml",
+        "Thumbs.db",
+        "trailer.mp4",
+    ] {
+        std::fs::write(root.join(name), b"not game content").unwrap();
+    }
+
+    let report = discover_source(root).unwrap();
+    assert_eq!(
+        report.items.len(),
+        1,
+        "only the ROM should be a discovery item at all, sidecars must not \
+         appear as items: {:?}",
+        report.items
+    );
+    assert_eq!(report.stats.unknown, 0);
+    assert_eq!(report.skip_reasons.total(), 0);
+}
+
+#[test]
+fn a_mixed_folder_produces_a_candidate_for_every_kind_with_no_unexplained_disappearance() {
+    let dir = source_dir("mixed");
+    let root = dir.path();
+
+    std::fs::write(root.join("Mario Kart 64.z64"), N64_Z64_MAGIC).unwrap();
+    std::fs::write(root.join("Pokemon Red.gb"), b"gb bytes").unwrap();
+    write_zip_containing(root, "Game.zip", "Game.gba", b"gba bytes");
+    std::fs::write(root.join("Final Fantasy VII Disc1.bin"), b"disc bytes").unwrap();
+    std::fs::write(
+        root.join("Final Fantasy VII.cue"),
+        "FILE \"Final Fantasy VII Disc1.bin\" BINARY\n",
+    )
+    .unwrap();
+    std::fs::write(root.join("Arcade.chd"), b"chd bytes").unwrap();
+    std::fs::write(root.join("Workbench.hdf"), minimal_amiga_hdf()).unwrap();
+    let whdload_dir = root.join("WHDLoad Game");
+    std::fs::create_dir_all(&whdload_dir).unwrap();
+    std::fs::write(whdload_dir.join("Game.slave"), minimal_whdload_slave()).unwrap();
+    std::fs::write(root.join("Unknown.xyz"), b"mystery").unwrap();
+
+    let report = discover_source(root).unwrap();
+
+    // Every item must have a non-empty explanation, whether accepted or
+    // skipped - the "no valid content disappears silently" guarantee.
+    for item in &report.items {
+        assert!(
+            !item.explanation.is_empty(),
+            "item without an explanation: {item:?}"
+        );
+        if item.validation_state == ValidationState::Skipped {
+            assert!(item.skip_reason.is_some());
+        }
+    }
+
+    assert_eq!(report.stats.loose_roms, 2, "{:?}", report.stats); // z64 + gb
+    assert_eq!(report.stats.archives, 1); // Game.zip
+    assert_eq!(report.stats.disc_images, 2); // cue+bin pair + chd
+    assert_eq!(report.stats.amiga_images, 1); // hdf
+    assert_eq!(report.stats.game_folders, 1); // WHDLoad folder
+    assert_eq!(report.stats.unknown, 1); // Unknown.xyz
+
+    // The paired .bin must never appear as its own item.
+    assert!(
+        !report
+            .items
+            .iter()
+            .any(|item| item.path.extension().and_then(|e| e.to_str()) == Some("bin")),
+        "{:?}",
+        report.items
+    );
+}
+
+/// A minimal, structurally valid flat AmigaDOS floppy image (no RDB
+/// wrapper) - the same shape `amiga_disk::tests::flat_adf` builds: a
+/// `DOS\x0N` boot block, a root-block pointer, and a valid `ST_ROOT` root
+/// block with a volume label. This is what `.adf` content inspection
+/// validates through the existing bounded OFS/FFS reader.
+fn minimal_flat_adf(dos: u8, volume: &[u8]) -> Vec<u8> {
+    const SECTORS: usize = 128;
+    const ROOT: usize = SECTORS / 2;
+    let mut img = vec![0u8; SECTORS * 512];
+    img[..3].copy_from_slice(b"DOS");
+    img[3] = dos;
+    put32(&mut img, 8, ROOT as u32);
+    let mut root = [0u8; 512];
+    put32(&mut root, 0, 2); // T_HEADER
+    put32(&mut root, 12, 72); // hash-table size
+    let name_len = volume.len().min(30);
+    root[0x1B0] = name_len as u8;
+    root[0x1B1..0x1B1 + name_len].copy_from_slice(&volume[..name_len]);
+    put32(&mut root, 508, 1); // ST_ROOT
+    let mut sum = 0u32;
+    for offset in (0..512).step_by(4) {
+        if offset != 20 {
+            sum = sum.wrapping_add(u32::from_be_bytes(
+                root[offset..offset + 4].try_into().unwrap(),
+            ));
+        }
+    }
+    put32(&mut root, 20, (sum as i32).wrapping_neg() as u32);
+    img[ROOT * 512..(ROOT + 1) * 512].copy_from_slice(&root);
+    img
+}
+
+#[test]
+fn adf_ofs_dos0_is_discovered_as_amiga_from_its_contents() {
+    let dir = source_dir("adf-ofs");
+    std::fs::write(
+        dir.path().join("Some Puzzle Game (1991).adf"),
+        minimal_flat_adf(0, b"PuzzleDisk"),
+    )
+    .unwrap();
+
+    let report = discover_source(dir.path()).unwrap();
+    assert_eq!(report.items.len(), 1);
+    let item = &report.items[0];
+    assert_eq!(item.content, Some(ContentKind::AmigaImage));
+    assert_eq!(item.validation_state, ValidationState::Accepted);
+    assert_eq!(item.platform_hint.as_deref(), Some("Amiga"));
+    assert_eq!(item.skip_reason, None);
+    assert_eq!(
+        item.identity_candidate, None,
+        "filesystem validation is not a title identity"
+    );
+    assert!(item.explanation.contains("OFS"));
+    assert!(item.explanation.contains("DOS\\0"));
+    assert_eq!(report.stats.amiga_images, 1);
+
+    // The `.adf` reached `inspect_amiga_floppy` and its
+    // `structural_amiga_floppy_observation` was produced on the discovery
+    // path: a Strong Amiga platform candidate, never a release.
+    assert_eq!(report.structural_evidence.len(), 1);
+    let evidence = &report.structural_evidence[0];
+    assert_eq!(evidence.path, item.path);
+    assert_eq!(
+        evidence.observation.platform_candidate.as_deref(),
+        Some("Amiga")
+    );
+    assert_eq!(evidence.observation.release_candidate, None);
+    assert_eq!(evidence.observation.hash_or_value, None);
+}
+
+#[test]
+fn adf_ffs_dos1_is_discovered_as_amiga_with_the_ffs_family_named() {
+    let dir = source_dir("adf-ffs");
+    std::fs::write(
+        dir.path().join("unrelated title.adf"),
+        minimal_flat_adf(1, b"FastFileDisk"),
+    )
+    .unwrap();
+
+    let report = discover_source(dir.path()).unwrap();
+    let item = &report.items[0];
+    assert_eq!(item.content, Some(ContentKind::AmigaImage));
+    assert_eq!(item.validation_state, ValidationState::Accepted);
+    assert_eq!(item.platform_hint.as_deref(), Some("Amiga"));
+    assert!(item.explanation.contains("FFS"));
+
+    // The volume label is descriptive provenance in the structural
+    // observation's `notes` only - never a platform, release, or hash.
+    assert_eq!(report.structural_evidence.len(), 1);
+    let observation = &report.structural_evidence[0].observation;
+    assert_eq!(observation.platform_candidate.as_deref(), Some("Amiga"));
+    assert_eq!(observation.release_candidate, None);
+    let notes = observation.notes.as_deref().unwrap_or_default();
+    assert!(notes.contains("FastFileDisk"), "{notes}");
+    assert!(notes.contains("FFS"), "{notes}");
+}
+
+/// Requirement 4: random/unrelated content named like an Amiga game must
+/// not gain a strong Amiga structural identity from the `.adf` extension.
+#[test]
+fn random_content_named_like_an_amiga_game_gets_no_amiga_structural_evidence() {
+    let dir = source_dir("adf-lie");
+    std::fs::write(
+        dir.path().join("Some Amiga Game.adf"),
+        b"this is not an amiga disk image, just some bytes with a lying name",
+    )
+    .unwrap();
+
+    let report = discover_source(dir.path()).unwrap();
+    assert_eq!(report.items.len(), 1);
+    let item = &report.items[0];
+    // The item stays visible and explained, but is never accepted, and no
+    // Amiga platform identity is attached from the extension alone.
+    assert_eq!(item.validation_state, ValidationState::Skipped);
+    assert_eq!(item.platform_hint, None);
+    assert!(matches!(
+        item.skip_reason,
+        Some(SkipReason::InvalidContent(_))
+    ));
+    assert!(!item.explanation.contains("OFS"));
+    assert!(!item.explanation.contains("FFS"));
+    assert_eq!(report.stats.amiga_images, 1); // still categorised as an Amiga-image attempt
+    // No structural observation is produced from a `.adf` that did not
+    // validate through the OFS/FFS reader.
+    assert!(report.structural_evidence.is_empty());
+}
+
+#[test]
+fn zip_and_truncated_files_renamed_adf_fail_closed() {
+    let dir = source_dir("adf-fakes");
+    let mut zip = vec![0u8; 4096];
+    zip[..4].copy_from_slice(b"PK\x03\x04");
+    std::fs::write(dir.path().join("Game A.adf"), &zip).unwrap();
+    std::fs::write(dir.path().join("Game B.adf"), b"DOS\x00 short").unwrap();
+
+    let report = discover_source(dir.path()).unwrap();
+    assert_eq!(report.items.len(), 2);
+    for item in &report.items {
+        assert_eq!(item.validation_state, ValidationState::Skipped, "{item:?}");
+        assert_eq!(item.platform_hint, None);
+        if item.path.ends_with("Game A.adf") {
+            assert!(matches!(
+                item.skip_reason,
+                Some(SkipReason::UnsupportedContent(_))
+            ));
+        } else {
+            assert!(matches!(
+                item.skip_reason,
+                Some(SkipReason::InvalidContent(_))
+            ));
+        }
+    }
+    assert!(report.structural_evidence.is_empty());
+}
+
+/// The `.adf` extension is shared with Acorn ADFS / Archimedes. A file
+/// whose bytes carry no AmigaDOS boot signature must never be classified
+/// Amiga and must produce no Amiga structural evidence - the existing
+/// Acorn-first / fail-closed behaviour is unchanged, it just now also
+/// gates the structural observation.
+#[test]
+fn acorn_adfs_style_adf_is_never_amiga_and_yields_no_structural_evidence() {
+    let dir = source_dir("adf-acorn");
+    // No `DOS` identifier - the shape `amiga_disk::tests` uses for a
+    // non-Amiga `.adf`.
+    let mut acorn = vec![0u8; 2048];
+    acorn[..8].copy_from_slice(b"Hugo\0\0\0\0");
+    std::fs::write(dir.path().join("Zarch (1987).adf"), &acorn).unwrap();
+
+    let report = discover_source(dir.path()).unwrap();
+    assert_eq!(report.items.len(), 1);
+    let item = &report.items[0];
+    assert_ne!(item.platform_hint.as_deref(), Some("Amiga"));
+    assert_ne!(item.validation_state, ValidationState::Accepted);
+    assert!(
+        report.structural_evidence.is_empty(),
+        "an Acorn-style .adf must not enter the Amiga lineage: {:?}",
+        report.structural_evidence
+    );
+}
+
+/// A `.adf` with a real `DOS\x0N` boot signature but a corrupt root block
+/// fails closed at the OFS/FFS reader: refused, and no structural
+/// observation.
+#[test]
+fn malformed_root_block_adf_fails_closed_with_no_structural_evidence() {
+    let dir = source_dir("adf-bad-root");
+    let mut img = minimal_flat_adf(1, b"Broken");
+    let root = 64 * 512; // SECTORS/2 * 512, matching `minimal_flat_adf`
+    img[root..root + 4].copy_from_slice(&0xDEAD_BEEF_u32.to_be_bytes());
+    std::fs::write(dir.path().join("Broken.adf"), &img).unwrap();
+
+    let report = discover_source(dir.path()).unwrap();
+    let item = &report.items[0];
+    assert_eq!(item.validation_state, ValidationState::Skipped);
+    assert_ne!(item.platform_hint.as_deref(), Some("Amiga"));
+    assert!(matches!(
+        item.skip_reason,
+        Some(SkipReason::InvalidContent(_))
+    ));
+    assert!(report.structural_evidence.is_empty());
+}
+
+fn gzip_bytes(bytes: &[u8]) -> Vec<u8> {
+    let mut encoder = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::default());
+    std::io::Write::write_all(&mut encoder, bytes).unwrap();
+    encoder.finish().unwrap()
+}
+
+/// A DOS-signature image whose length is not a standard floppy size. Root
+/// pointer is the usual 880 so only the length is wrong.
+fn dos_signature_image(len: usize) -> Vec<u8> {
+    let mut img = vec![0_u8; len];
+    img[..4].copy_from_slice(b"DOS\x01");
+    put32(&mut img, 8, 880);
+    img
+}
+
+fn assert_refused_as_invalid_amiga_content(report: &SourceDiscoveryReport) {
+    assert_eq!(report.items.len(), 1);
+    let item = &report.items[0];
+    assert_eq!(item.validation_state, ValidationState::Skipped);
+    assert!(
+        matches!(item.skip_reason, Some(SkipReason::InvalidContent(_))),
+        "must be InvalidContent, got {:?}",
+        item.skip_reason
+    );
+    assert_ne!(item.platform_hint.as_deref(), Some("Amiga"));
+    assert_eq!(item.identity_candidate, None);
+    assert!(report.structural_evidence.is_empty());
+}
+
+#[test]
+fn truncated_adf_with_dos_signature_is_invalid_not_recognized() {
+    let dir = source_dir("adf-truncated-dos");
+    // Half a standard DD floppy: the root block (block 880) is missing.
+    std::fs::write(dir.path().join("Cut.adf"), dos_signature_image(450_560)).unwrap();
+    assert_refused_as_invalid_amiga_content(&discover_source(dir.path()).unwrap());
+}
+
+#[test]
+fn incorrectly_sized_adf_with_dos_signature_is_invalid_not_recognized() {
+    for (name, len) in [
+        ("Short", 819_200_usize),
+        ("OneOver", 901_121),
+        ("Odd", 1_000_000),
+    ] {
+        let dir = source_dir("adf-wrong-length-dos");
+        std::fs::write(
+            dir.path().join(format!("{name}.adf")),
+            dos_signature_image(len),
+        )
+        .unwrap();
+        assert_refused_as_invalid_amiga_content(&discover_source(dir.path()).unwrap());
+    }
+}
+
+#[test]
+fn incorrectly_sized_adz_output_with_dos_signature_is_invalid_not_recognized() {
+    let dir = source_dir("adz-wrong-length-dos");
+    std::fs::write(
+        dir.path().join("Wrong.adz"),
+        gzip_bytes(&dos_signature_image(819_200)),
+    )
+    .unwrap();
+    assert_refused_as_invalid_amiga_content(&discover_source(dir.path()).unwrap());
+}
+
+#[test]
+fn extra_cylinder_adf_and_adz_media_keep_only_weak_platform_evidence() {
+    use crate::platform_evidence_fusion::evidence_lineage::ClaimStrength;
+    let dir = source_dir("amiga-extra-cylinders");
+    for cylinders in 81..=83 {
+        let mut bytes = dos_signature_image(cylinders * 2 * 11 * 512);
+        bytes[12..14].copy_from_slice(&[0x60, 0xfe]);
+        let sum = bytes[..1024].chunks_exact(4).fold(0_u32, |sum, word| {
+            let (sum, carry) = sum.overflowing_add(u32::from_be_bytes(word.try_into().unwrap()));
+            sum.wrapping_add(u32::from(carry))
+        });
+        put32(&mut bytes, 4, !sum);
+        std::fs::write(
+            dir.path().join(format!("Known Game {cylinders}.adf")),
+            &bytes,
+        )
+        .unwrap();
+        std::fs::write(
+            dir.path().join(format!("Known Game {cylinders}.adz")),
+            gzip_bytes(&bytes),
+        )
+        .unwrap();
+    }
+    let report = discover_source(dir.path()).unwrap();
+    assert_eq!(report.items.len(), 6);
+    assert_eq!(report.structural_evidence.len(), 6);
+    for item in report.items {
+        assert_eq!(item.validation_state, ValidationState::Skipped);
+        assert_eq!(
+            item.skip_reason,
+            Some(SkipReason::RecognizedContentNoIdentityMatch)
+        );
+        assert_eq!(item.platform_hint.as_deref(), Some("Amiga"));
+        assert_eq!(item.identity_candidate, None);
+        assert!(
+            item.explanation
+                .contains("dump integrity and bootability are not established")
+        );
+    }
+    for evidence in report.structural_evidence {
+        assert_eq!(evidence.observation.claim_strength, ClaimStrength::Weak);
+        assert_eq!(evidence.observation.release_candidate, None);
+        assert_eq!(evidence.observation.hash_or_value, None);
+    }
+}
+
+#[test]
+fn unknown_ndos_identifier_is_not_filesystem_validation_or_damage_evidence() {
+    for (label, ext) in [("adf", "adf"), ("adz", "adz")] {
+        let dir = source_dir(&format!("ndos-{label}"));
+        let mut img = vec![0_u8; 901_120];
+        img[..4].copy_from_slice(b"NDOS");
+        put32(&mut img, 8, 880);
+        let bytes = if ext == "adz" { gzip_bytes(&img) } else { img };
+        std::fs::write(dir.path().join(format!("Game.{ext}")), bytes).unwrap();
+        let report = discover_source(dir.path()).unwrap();
+        let item = &report.items[0];
+        assert_eq!(item.validation_state, ValidationState::Skipped);
+        assert!(matches!(
+            item.skip_reason,
+            Some(SkipReason::UnsupportedContent(_))
+        ));
+        assert_eq!(item.platform_hint, None);
+        assert_eq!(item.identity_candidate, None);
+        assert!(report.structural_evidence.is_empty());
+    }
+}
+
+#[test]
+fn truncated_valid_adf_loses_its_validation() {
+    // A genuinely valid image, then cut below its root block.
+    let dir = source_dir("adf-valid-then-cut");
+    let img = minimal_flat_adf(1, b"Cut");
+    std::fs::write(dir.path().join("Cut.adf"), &img[..32 * 512]).unwrap();
+    assert_refused_as_invalid_amiga_content(&discover_source(dir.path()).unwrap());
+}
+
+#[test]
+fn unsupported_amiga_filesystems_are_not_described_as_corrupt_content() {
+    for header in [b"PFS\x03", b"SFS\0", b"MuFS"] {
+        let dir = source_dir("unsupported-amiga-fs");
+        let mut bytes = vec![0_u8; 128 * 512];
+        bytes[..4].copy_from_slice(header);
+        std::fs::write(dir.path().join("Unknown.adf"), bytes).unwrap();
+        let report = discover_source(dir.path()).unwrap();
+        let item = &report.items[0];
+        assert_eq!(item.validation_state, ValidationState::Skipped);
+        assert!(!matches!(
+            item.skip_reason,
+            Some(SkipReason::InvalidContent(_))
+        ));
+        assert!(item.explanation.contains("unsupported"));
+        assert_eq!(item.identity_candidate, None);
+        assert!(report.structural_evidence.is_empty());
+    }
+}
+
+fn ffs_with_1024_byte_blocks() -> Vec<u8> {
+    let mut bytes = vec![0_u8; 128 * 512];
+    bytes[..4].copy_from_slice(b"DOS\x01");
+    put32(&mut bytes, 8, 32);
+    let root = &mut bytes[32 * 1024..33 * 1024];
+    put32(root, 0, 2);
+    put32(root, 12, 200);
+    put32(root, 1020, 1);
+    let sum = root.chunks_exact(4).fold(0_u32, |s, w| {
+        s.wrapping_add(u32::from_be_bytes(w.try_into().unwrap()))
+    });
+    put32(root, 20, 0_u32.wrapping_sub(sum));
+    bytes
+}
+
+#[test]
+fn unsupported_block_size_is_a_reader_limit_for_adf_and_adz() {
+    for ext in ["adf", "adz"] {
+        let dir = source_dir("amiga-large-blocks");
+        let raw = ffs_with_1024_byte_blocks();
+        let bytes = if ext == "adz" { gzip_bytes(&raw) } else { raw };
+        std::fs::write(dir.path().join(format!("Unknown.{ext}")), bytes).unwrap();
+        let report = discover_source(dir.path()).unwrap();
+        let item = &report.items[0];
+        assert_eq!(item.validation_state, ValidationState::Skipped);
+        assert!(!matches!(
+            item.skip_reason,
+            Some(SkipReason::InvalidContent(_))
+        ));
+        assert!(item.explanation.contains("UnsupportedBlockSize"));
+        assert!(!item.explanation.contains("damaged"));
+        assert_eq!(item.identity_candidate, None);
+        assert!(report.structural_evidence.is_empty());
+    }
+}
+
+#[test]
+fn environmental_errors_do_not_become_media_corruption_or_game_identity() {
+    use crate::amiga_adz::{AdzError, inspect_adz_in_temp_dir};
+    use crate::amiga_disk::{AmigaFloppyError, DiskError, FilesystemError};
+    let dir = source_dir("amiga-unavailable");
+    let path = dir.path().join("Known Game.adz");
+    std::fs::write(&path, gzip_bytes(&minimal_flat_adf(1, b"DisplayLabel"))).unwrap();
+    let staging = inspect_adz_in_temp_dir(&path, &dir.path().join("missing-temp")).unwrap_err();
+    for error in [
+        staging,
+        AdzError::Io("host read failed".into()),
+        AdzError::ChangedWhileReading,
+    ] {
+        let item = super::discovery::amiga_adz_refusal(&path, &error);
+        assert!(matches!(
+            item.skip_reason,
+            Some(SkipReason::InspectionUnavailable(_))
+        ));
+        assert_eq!(item.validation_state, ValidationState::Skipped);
+        assert_eq!(item.platform_hint, None);
+        assert_eq!(item.identity_candidate, None);
+        assert!(
+            !item
+                .skip_reason
+                .unwrap()
+                .suggested_action()
+                .contains("may be corrupt")
+        );
+    }
+    for error in [
+        AmigaFloppyError::Container(DiskError::Io("host read failed".into())),
+        AmigaFloppyError::Filesystem(FilesystemError::Io("positional read failed".into())),
+        AmigaFloppyError::Filesystem(FilesystemError::Cancelled),
+    ] {
+        let item = super::discovery::amiga_floppy_refusal(&path, &error);
+        assert!(matches!(
+            item.skip_reason,
+            Some(SkipReason::InspectionUnavailable(_))
+        ));
+        assert_eq!(item.platform_hint, None);
+        assert_eq!(item.identity_candidate, None);
+    }
+}
+
+#[test]
+fn rdb_reader_limits_are_unsupported_but_zero_block_geometry_is_invalid() {
+    use crate::amiga_disk::{AmigaFloppyError, DiskError};
+    for (block_size, invalid) in [(65_536, false), (0, true)] {
+        let dir = source_dir("rdb-block-limit");
+        let mut bytes = vec![0_u8; 65_536];
+        bytes[..4].copy_from_slice(b"RDSK");
+        put32(&mut bytes, 16, block_size);
+        put32(&mut bytes, 28, u32::MAX);
+        std::fs::write(dir.path().join("Disk.adf"), bytes).unwrap();
+        let report = discover_source(dir.path()).unwrap();
+        let item = &report.items[0];
+        if invalid {
+            assert!(matches!(
+                item.skip_reason,
+                Some(SkipReason::InvalidContent(_))
+            ));
+        } else {
+            assert!(matches!(
+                item.skip_reason,
+                Some(SkipReason::UnsupportedContent(_))
+            ));
+        }
+        assert_eq!(item.platform_hint, None);
+        assert_eq!(item.identity_candidate, None);
+        assert!(report.structural_evidence.is_empty());
+    }
+    let item = super::discovery::amiga_floppy_refusal(
+        std::path::Path::new("Disk.adf"),
+        &AmigaFloppyError::Container(DiskError::TooManyPartitions),
+    );
+    assert!(matches!(
+        item.skip_reason,
+        Some(SkipReason::UnsupportedContent(_))
+    ));
+    assert!(item.explanation.contains("128-partition reader limit"));
+    assert_eq!(item.platform_hint, None);
+    assert_eq!(item.identity_candidate, None);
+}
+
+#[test]
+fn malformed_adz_and_amiga_metadata_cannot_use_a_non_amiga_folder_override() {
+    let dir = source_dir("amiga-format-failure");
+    let alias = dir.path().join("Acorn Archimedes");
+    std::fs::create_dir(&alias).unwrap();
+    let mut gzip = gzip_bytes(&minimal_flat_adf(1, b"Disk"));
+    gzip.extend_from_slice(b"garbage");
+    std::fs::write(alias.join("Bad.adz"), gzip).unwrap();
+    std::fs::write(alias.join("Bad.adf"), dos_signature_image(819_200)).unwrap();
+    let report = discover_source(&alias).unwrap();
+    assert_eq!(report.items.len(), 2);
+    for item in report.items {
+        assert_eq!(item.validation_state, ValidationState::Skipped);
+        assert!(matches!(
+            item.skip_reason,
+            Some(SkipReason::InvalidContent(_))
+        ));
+        assert_eq!(item.platform_hint, None);
+        assert_eq!(item.identity_candidate, None);
+    }
+    assert!(report.structural_evidence.is_empty());
+}
+
+/// A random blob of the same size as a real floppy image, named `.adf`:
+/// refused, no structural evidence.
+#[test]
+fn random_same_size_adf_is_refused_with_no_structural_evidence() {
+    let dir = source_dir("adf-random-samesize");
+    let blob = vec![0x5Au8; 128 * 512];
+    std::fs::write(dir.path().join("Lemmings.adf"), &blob).unwrap();
+
+    let report = discover_source(dir.path()).unwrap();
+    let item = &report.items[0];
+    assert_ne!(item.validation_state, ValidationState::Accepted);
+    assert_ne!(item.platform_hint.as_deref(), Some("Amiga"));
+    assert!(report.structural_evidence.is_empty());
+}
+
+/// End-to-end: a loose `.adf` placed in a source folder reaches
+/// `inspect_amiga_floppy` during ordinary `discover_source`, and the
+/// resulting `structural_amiga_floppy_observation` is carried on the
+/// report keyed to that exact file.
+#[test]
+fn loose_adf_discovery_reaches_the_amiga_structural_parser() {
+    use crate::platform_evidence_fusion::evidence_lineage::{
+        ClaimStrength, ClaimType, EvidenceChannel, Representation,
+    };
+
+    let dir = source_dir("adf-e2e");
+    let adf = dir.path().join("Agony.adf");
+    std::fs::write(&adf, minimal_flat_adf(3, b"AGONY")).unwrap();
+
+    let report = discover_source(dir.path()).unwrap();
+    assert_eq!(report.structural_evidence.len(), 1);
+    let evidence = &report.structural_evidence[0];
+    assert_eq!(evidence.path, adf);
+    let observation = &evidence.observation;
+    assert_eq!(observation.claim, ClaimType::PlatformCandidate);
+    assert_eq!(observation.claim_strength, ClaimStrength::Strong);
+    assert_eq!(observation.platform_candidate.as_deref(), Some("Amiga"));
+    assert_eq!(observation.release_candidate, None);
+    assert_eq!(observation.hash_or_value, None);
+    assert_eq!(
+        observation.provenance.channel,
+        EvidenceChannel::LocalStructural
+    );
+    assert_eq!(
+        observation.provenance.representation,
+        Representation::StructuralMetadata
+    );
+}
+
+/// The `.hdf` content-inspection path is untouched by the `.adf` wiring:
+/// it is still accepted as an Amiga image, and it never routes through
+/// the floppy observation (structural evidence stays empty for it).
+#[test]
+fn hdf_discovery_is_unchanged_by_the_adf_structural_wiring() {
+    let dir = source_dir("hdf-unaffected");
+    std::fs::write(dir.path().join("Workbench.hdf"), minimal_amiga_hdf()).unwrap();
+
+    let report = discover_source(dir.path()).unwrap();
+    assert_eq!(report.items.len(), 1);
+    let item = &report.items[0];
+    assert_eq!(item.content, Some(ContentKind::AmigaImage));
+    assert_eq!(item.validation_state, ValidationState::Accepted);
+    assert!(item.explanation.contains("partition"));
+    assert!(
+        report.structural_evidence.is_empty(),
+        "the floppy observation path is `.adf`-only"
+    );
+}
+
+// --- Amiga archive-member WHDLoad + ADZ discovery -----------------------
+//
+// Hand-built exactly like `dat::archive::lha`'s own test fixture (a real,
+// minimal, stored/`-lh0-` LHA a genuine 7-Zip can list and extract).
+
+fn lha_entry(name: &str, payload: &[u8]) -> Vec<u8> {
+    let header_size = name.len() + 23;
+    let mut bytes = vec![header_size as u8, 0];
+    bytes.extend_from_slice(b"-lh0-");
+    bytes.extend_from_slice(&(payload.len() as u32).to_le_bytes());
+    bytes.extend_from_slice(&(payload.len() as u32).to_le_bytes());
+    bytes.extend_from_slice(&0_u32.to_le_bytes());
+    bytes.push(0x20);
+    bytes.push(0);
+    bytes.push(name.len() as u8);
+    bytes.extend_from_slice(name.as_bytes());
+    bytes.extend_from_slice(&lha_crc16(payload).to_le_bytes());
+    bytes.push(0);
+    bytes[1] = bytes[2..]
+        .iter()
+        .fold(0_u8, |sum, byte| sum.wrapping_add(*byte));
+    bytes.extend_from_slice(payload);
+    bytes
+}
+
+fn stored_lha(entries: &[(&str, &[u8])]) -> Vec<u8> {
+    let mut bytes = Vec::new();
+    for (name, payload) in entries {
+        bytes.extend(lha_entry(name, payload));
+    }
+    bytes.push(0);
+    bytes
+}
+
+fn lha_crc16(bytes: &[u8]) -> u16 {
+    let mut crc = 0_u16;
+    for byte in bytes {
+        crc ^= u16::from(*byte);
+        for _ in 0..8 {
+            crc = if crc & 1 != 0 {
+                (crc >> 1) ^ 0xa001
+            } else {
+                crc >> 1
+            };
+        }
+    }
+    crc
+}
+
+fn lha_backend_available() -> bool {
+    crate::dat::archive::lha::LhaProvider::discover(std::time::Duration::from_secs(10)).is_ok()
+}
+
+#[test]
+fn lha_with_one_valid_slave_is_discovered_as_amiga_whdload_archive() {
+    if !lha_backend_available() {
+        return;
+    }
+    let dir = source_dir("lha-one-slave");
+    std::fs::write(
+        dir.path().join("Turrican II.lha"),
+        stored_lha(&[("Game/Turrican2.Slave", &minimal_whdload_slave())]),
+    )
+    .unwrap();
+
+    let report = discover_source(dir.path()).unwrap();
+    assert_eq!(report.items.len(), 1);
+    let item = &report.items[0];
+    assert_eq!(item.content, Some(ContentKind::AmigaImage));
+    assert_eq!(item.validation_state, ValidationState::Accepted);
+    assert_eq!(item.platform_hint.as_deref(), Some("Amiga"));
+    assert!(
+        item.explanation.contains("Turrican2.Slave"),
+        "{}",
+        item.explanation
+    );
+    assert_eq!(report.structural_evidence.len(), 1);
+    assert_eq!(
+        report.structural_evidence[0]
+            .observation
+            .platform_candidate
+            .as_deref(),
+        Some("Amiga")
+    );
+}
+
+#[test]
+fn lha_with_two_valid_slaves_is_ambiguous_never_auto_picked() {
+    if !lha_backend_available() {
+        return;
+    }
+    let dir = source_dir("lha-two-slaves");
+    std::fs::write(
+        dir.path().join("Bundle.lha"),
+        stored_lha(&[
+            ("GameA/GameA.Slave", &minimal_whdload_slave()),
+            ("GameB/GameB.Slave", &minimal_whdload_slave()),
+        ]),
+    )
+    .unwrap();
+
+    let report = discover_source(dir.path()).unwrap();
+    let item = &report.items[0];
+    assert_eq!(item.validation_state, ValidationState::Accepted);
+    assert_eq!(item.platform_hint.as_deref(), Some("Amiga"));
+    assert!(
+        item.explanation.contains("ambiguous"),
+        "{}",
+        item.explanation
+    );
+    assert!(
+        item.explanation.contains("2 candidate"),
+        "{}",
+        item.explanation
+    );
+    // Both candidates surface as structural evidence - neither is dropped.
+    assert_eq!(report.structural_evidence.len(), 2);
+}
+
+#[test]
+fn lha_with_no_slave_is_not_claimed_as_whdload() {
+    if !lha_backend_available() {
+        return;
+    }
+    let dir = source_dir("lha-no-slave");
+    std::fs::write(
+        dir.path().join("Docs.lha"),
+        stored_lha(&[("Readme.txt", b"just docs")]),
+    )
+    .unwrap();
+
+    let report = discover_source(dir.path()).unwrap();
+    let item = &report.items[0];
+    assert_eq!(item.platform_hint, None);
+    assert!(
+        report.structural_evidence.is_empty(),
+        "no valid slave means no Amiga structural evidence"
+    );
+}
+
+#[test]
+fn lha_with_traversal_slave_name_is_refused_not_extracted() {
+    if !lha_backend_available() {
+        return;
+    }
+    let dir = source_dir("lha-traversal");
+    std::fs::write(
+        dir.path().join("evil.lha"),
+        stored_lha(&[("../evil.slave", &minimal_whdload_slave())]),
+    )
+    .unwrap();
+
+    let report = discover_source(dir.path()).unwrap();
+    let item = &report.items[0];
+    assert_eq!(
+        item.platform_hint, None,
+        "an unsafe member path must never become Amiga platform evidence"
+    );
+    assert!(report.structural_evidence.is_empty());
+}
+
+#[test]
+fn lzh_extension_is_inspected_the_same_way_as_lha() {
+    if !lha_backend_available() {
+        return;
+    }
+    let dir = source_dir("lzh-one-slave");
+    std::fs::write(
+        dir.path().join("Game.lzh"),
+        stored_lha(&[("Game.Slave", &minimal_whdload_slave())]),
+    )
+    .unwrap();
+
+    let report = discover_source(dir.path()).unwrap();
+    let item = &report.items[0];
+    assert_eq!(item.content, Some(ContentKind::AmigaImage));
+    assert_eq!(item.validation_state, ValidationState::Accepted);
+    assert_eq!(item.platform_hint.as_deref(), Some("Amiga"));
+}
+
+#[test]
+fn adz_with_valid_gzipped_adf_is_discovered_as_amiga_image() {
+    let dir = source_dir("adz-valid");
+    let mut encoder = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::default());
+    std::io::Write::write_all(&mut encoder, &minimal_flat_adf(0, b"PuzzleDisk")).unwrap();
+    std::fs::write(
+        dir.path().join("Puzzle Game.adz"),
+        encoder.finish().unwrap(),
+    )
+    .unwrap();
+
+    let report = discover_source(dir.path()).unwrap();
+    let item = &report.items[0];
+    assert_eq!(item.content, Some(ContentKind::AmigaImage));
+    assert_eq!(item.validation_state, ValidationState::Accepted);
+    assert_eq!(item.platform_hint.as_deref(), Some("Amiga"));
+    assert_eq!(item.identity_candidate, None);
+    assert!(item.explanation.contains("OFS"), "{}", item.explanation);
+    assert_eq!(report.structural_evidence.len(), 1);
+}
+
+#[test]
+fn plausible_adf_and_adz_remain_visible_media_without_filename_game_identity() {
+    use crate::game_identity::{IdentityKind, IdentityStatus, inspect_game_identity};
+    use crate::platform_evidence_fusion::evidence_lineage::{ClaimStrength, IdentityScope};
+    let dir = source_dir("amiga-plausible-media");
+    let mut bytes = vec![0_u8; 880 * 1024];
+    bytes[..4].copy_from_slice(b"DOS\x01");
+    put32(&mut bytes, 8, 880);
+    let adf = dir.path().join("Turrican II (1991)(Disk 1 of 1).adf");
+    std::fs::write(&adf, &bytes).unwrap();
+    let mut encoder = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::default());
+    std::io::Write::write_all(&mut encoder, &bytes).unwrap();
+    let adz = dir.path().join("Turrican II (1991)(Disk 1 of 1).adz");
+    std::fs::write(&adz, encoder.finish().unwrap()).unwrap();
+    let report = discover_source(dir.path()).unwrap();
+    assert_eq!(report.items.len(), 2);
+    assert_eq!(report.stats.amiga_images, 2);
+    for item in &report.items {
+        assert_eq!(item.content, Some(ContentKind::AmigaImage));
+        assert_eq!(item.validation_state, ValidationState::Skipped);
+        assert_eq!(item.identity_candidate, None);
+        assert_eq!(
+            item.skip_reason,
+            Some(SkipReason::RecognizedContentNoIdentityMatch)
+        );
+        assert!(item.explanation.contains(
+            "Structurally plausible Amiga floppy; no readable AmigaDOS filesystem was found."
+        ));
+        assert!(!item.explanation.contains("Turrican"));
+        let identity = inspect_game_identity(&item.path, Some("Amiga"));
+        assert_eq!(identity.verified_value(IdentityKind::AmigaWHDLoad), None);
+        assert!(
+            identity
+                .evidence
+                .iter()
+                .all(|e| e.status != IdentityStatus::Verified)
+        );
+    }
+    assert_eq!(report.structural_evidence.len(), 2);
+    for evidence in &report.structural_evidence {
+        assert_eq!(evidence.observation.claim_strength, ClaimStrength::Weak);
+        assert_eq!(
+            evidence.observation.identity_scope,
+            IdentityScope::PlatformIdentity
+        );
+        assert_eq!(evidence.observation.release_candidate, None);
+        assert_eq!(evidence.observation.hash_or_value, None);
+    }
+}
+
+#[test]
+fn whdload_identity_still_requires_exactly_one_structurally_valid_slave() {
+    use crate::game_identity::{IdentityKind, IdentityStatus, inspect_game_identity};
+    if !lha_backend_available() {
+        eprintln!("optional LHA backend absent: WHDLoad archive identity cases not exercised");
+        return;
+    }
+    let dir = source_dir("whdload-identity-boundary");
+    let slave = minimal_whdload_slave();
+    for (name, entries, expected) in [
+        (
+            "Famous Game",
+            vec![("Game.slave", b"not a slave".as_slice())],
+            0,
+        ),
+        (
+            "Unrelated Title",
+            vec![("A/Game.slave", slave.as_slice())],
+            1,
+        ),
+        (
+            "Bundle",
+            vec![
+                ("A/Game.slave", slave.as_slice()),
+                ("B/Other.slave", slave.as_slice()),
+            ],
+            2,
+        ),
+    ] {
+        let path = dir.path().join(format!("{name}.lha"));
+        std::fs::write(&path, stored_lha(&entries)).unwrap();
+        let report = inspect_game_identity(&path, Some("Amiga"));
+        if expected == 1 {
+            assert!(report.verified_value(IdentityKind::AmigaWHDLoad).is_some());
+        } else {
+            assert_eq!(report.verified_value(IdentityKind::AmigaWHDLoad), None);
+            if expected == 2 {
+                assert!(
+                    report
+                        .evidence
+                        .iter()
+                        .any(|e| e.kind == IdentityKind::AmigaWHDLoad
+                            && e.status == IdentityStatus::Ambiguous)
+                );
+            }
+        }
+    }
+}
+
+#[test]
+fn adz_that_is_not_gzip_is_refused_not_guessed() {
+    let dir = source_dir("adz-not-gzip");
+    std::fs::write(dir.path().join("fake.adz"), b"not actually gzip at all").unwrap();
+
+    let report = discover_source(dir.path()).unwrap();
+    let item = &report.items[0];
+    assert_eq!(item.validation_state, ValidationState::Skipped);
+    assert!(matches!(
+        item.skip_reason,
+        Some(SkipReason::UnsupportedContent(_))
+    ));
+    assert!(report.structural_evidence.is_empty());
+}
+
+/// Every extension the content registry recognises must actually be
+/// picked up end-to-end by discovery when placed as a loose file - keeps
+/// the registry table and the discovery wiring from silently drifting
+/// apart, mirroring `crate::media_registry`'s own scan/watch parity test.
+#[test]
+fn every_registered_content_extension_is_discovered_end_to_end() {
+    for (index, extension) in recognized_extensions().enumerate() {
+        // hdf/hdfx/rdb require a real RDB image to be read at all -
+        // covered individually by `amiga_hdf_is_discovered_and_validated`
+        // and by the Amiga integration; a garbage file for those would
+        // correctly produce an `InvalidContent` skip, which is exactly
+        // right, not a registry drift bug - so skip them here.
+        if matches!(extension, "hdf" | "hdfx" | "rdb") {
+            continue;
+        }
+        let dir = source_dir(&format!("parity-{index}"));
+        let file_name = format!("fixture.{extension}");
+        std::fs::write(dir.path().join(&file_name), b"fixture bytes").unwrap();
+
+        let report = discover_source(dir.path()).unwrap();
+        assert_eq!(
+            report.items.len(),
+            1,
+            "extension {extension} did not produce exactly one discovery item"
+        );
+        assert!(
+            report.items[0].content.is_some(),
+            "extension {extension} was registered but discovery reported no content kind"
+        );
+    }
+}
+
+#[test]
+fn fds_is_discovered_as_nes_computer_disk_media() {
+    let root = source_dir("fds-discovery");
+    let mut image = vec![0_u8; 65_500];
+    image[0] = 0x01;
+    image[1..15].copy_from_slice(b"*NINTENDO-HVC*");
+    image[0x13] = b' ';
+    image[56] = 0x02;
+    image[57] = 1;
+    image[58] = 0x03;
+    image[60] = 1;
+    image[61..69].copy_from_slice(b"TEST    ");
+    image[71..73].copy_from_slice(&4_u16.to_le_bytes());
+    image[75] = 0x04;
+    image[76..80].copy_from_slice(b"FDS!");
+    std::fs::write(root.path().join("game.fds"), image).unwrap();
+    let report = discover_source(root.path()).unwrap();
+    assert_eq!(report.items.len(), 1);
+    let item = &report.items[0];
+    assert_eq!(item.content, Some(ContentKind::ComputerDisk));
+    assert_eq!(item.platform_hint.as_deref(), Some("NES"));
+    assert_eq!(item.validation_state, ValidationState::Accepted);
+}
+
+#[test]
+fn apple_media_is_discovered_with_platform_and_sit_keeps_archive_content() {
+    let root = source_dir("apple-media");
+    for extension in ["do", "po", "woz", "2mg", "nib"] {
+        std::fs::write(
+            root.path().join(format!("game.{extension}")),
+            b"fixture bytes",
+        )
+        .unwrap();
+    }
+    let mac = source_dir("macintosh-media");
+    for extension in ["hfv", "sit"] {
+        std::fs::write(
+            mac.path().join(format!("game.{extension}")),
+            b"fixture bytes",
+        )
+        .unwrap();
+    }
+
+    let mut items = discover_source(root.path()).unwrap().items;
+    items.extend(discover_source(mac.path()).unwrap().items);
+    assert_eq!(items.len(), 7);
+    for item in &items {
+        assert_eq!(item.validation_state, ValidationState::Accepted, "{item:?}");
+        if item.path.extension().and_then(|e| e.to_str()) == Some("sit") {
+            assert_eq!(item.content, Some(ContentKind::Archive));
+            assert_eq!(item.platform_hint.as_deref(), Some("Macintosh"));
+        } else if item.path.extension().unwrap().to_str().unwrap() == "hfv" {
+            assert_eq!(item.content, Some(ContentKind::ComputerDisk));
+            assert_eq!(item.platform_hint.as_deref(), Some("Macintosh"));
+        } else {
+            assert_eq!(item.content, Some(ContentKind::ComputerDisk));
+            assert_eq!(item.platform_hint.as_deref(), Some("Apple II"));
+        }
+    }
+}
+
+#[test]
+fn loose_commodore_disks_are_discovered_as_computer_disks() {
+    let root = source_dir("commodore-disks");
+    let dir = root.path().join("c128");
+    std::fs::create_dir_all(&dir).unwrap();
+    for extension in ["g64", "d71", "d81"] {
+        std::fs::write(dir.join(format!("fixture.{extension}")), b"fixture bytes").unwrap();
+    }
+    std::fs::write(dir.join("fixture.d64"), minimal_d64()).unwrap();
+
+    let report = discover_source(&dir).unwrap();
+    assert_eq!(
+        report.items.len(),
+        4,
+        "all four Commodore disks must be visible"
+    );
+    assert!(report.items.iter().all(|item| {
+        item.content == Some(ContentKind::ComputerDisk)
+            && item.validation_state == ValidationState::Accepted
+    }));
+    assert_eq!(report.stats.computer_disks, 4);
+}
+
+#[test]
+fn neo_geo_pocket_loose_extensions_are_reachable_as_direct_content() {
+    let root = source_dir("ngp-direct-discovery");
+    let mut bytes = vec![0_u8; 0x50];
+    bytes[..28].copy_from_slice(b"COPYRIGHT BY SNK CORPORATION");
+    bytes[0x23] = 0x00;
+    bytes[0x24..0x2c].copy_from_slice(b"TESTGAME");
+    std::fs::write(root.path().join("mono.ngp"), &bytes).unwrap();
+    bytes[0x23] = 0x10;
+    std::fs::write(root.path().join("colour.ngc"), &bytes).unwrap();
+
+    let report = discover_source(root.path()).unwrap();
+    assert_eq!(report.items.len(), 2);
+    assert!(report.items.iter().all(|item| {
+        item.content == Some(ContentKind::RomCartridge)
+            && item.validation_state == ValidationState::Accepted
+    }));
+    assert!(
+        report
+            .items
+            .iter()
+            .any(|item| { item.platform_hint.as_deref() == Some("Neo Geo Pocket") })
+    );
+    assert!(
+        report
+            .items
+            .iter()
+            .any(|item| { item.platform_hint.as_deref() == Some("Neo Geo Pocket Color") })
+    );
+}
+
+#[test]
+fn bare_ngc_under_gamecube_alias_stays_gamecube() {
+    let root = source_dir("ngc-gamecube-alias");
+    let gamecube = root.path().join("ngc");
+    std::fs::create_dir_all(&gamecube).unwrap();
+    std::fs::write(gamecube.join("game.ngc"), b"gamecube content").unwrap();
+
+    let report = discover_source(&gamecube).unwrap();
+    assert_eq!(report.items.len(), 1);
+    assert_eq!(report.items[0].content, Some(ContentKind::RomCartridge));
+    assert_eq!(report.items[0].platform_hint.as_deref(), Some("GameCube"));
+    assert_eq!(report.items[0].validation_state, ValidationState::Accepted);
+}
+
+#[test]
+fn crt_is_structurally_discovered_but_needs_folder_platform_evidence() {
+    let bare = source_dir("crt-bare");
+    std::fs::write(bare.path().join("cart.crt"), minimal_crt()).unwrap();
+    let report = discover_source(bare.path()).unwrap();
+    assert_eq!(report.items.len(), 1);
+    assert_eq!(report.items[0].content, Some(ContentKind::ComputerDisk));
+    assert_eq!(report.items[0].platform_hint, None);
+    assert_eq!(report.items[0].validation_state, ValidationState::Skipped);
+    assert_eq!(
+        report.items[0].skip_reason,
+        Some(SkipReason::RecognizedContentNoIdentityMatch)
+    );
+
+    let c64 = source_dir("crt-c64");
+    let folder = c64.path().join("c64");
+    std::fs::create_dir(&folder).unwrap();
+    std::fs::write(folder.join("cart.crt"), minimal_crt()).unwrap();
+    let report = discover_source(&folder).unwrap();
+    assert_eq!(report.items[0].content, Some(ContentKind::ComputerDisk));
+    assert_eq!(
+        report.items[0].platform_hint.as_deref(),
+        Some("Commodore 64")
+    );
+    assert_eq!(report.items[0].validation_state, ValidationState::Accepted);
+}
+
+#[test]
+fn random_crt_does_not_gain_identity_from_its_filename() {
+    let root = source_dir("crt-random");
+    std::fs::write(root.path().join("c64.crt"), vec![0x5a; 128]).unwrap();
+    let report = discover_source(root.path()).unwrap();
+    assert_eq!(report.items[0].platform_hint, None);
+    assert_eq!(report.items[0].validation_state, ValidationState::Skipped);
+    assert_eq!(
+        report.items[0].skip_reason,
+        Some(SkipReason::InvalidContent(
+            "CRT signature is not `C64 CARTRIDGE   `".to_string()
+        ))
+    );
+}
+
+#[test]
+fn archive_member_crt_is_discovered_as_computer_disk_content() {
+    let dir = source_dir("zip-crt");
+    write_zip_containing(dir.path(), "Cartridges.zip", "Game.crt", b"CRT bytes");
+    let report = discover_source(dir.path()).unwrap();
+    assert_eq!(report.items.len(), 1);
+    assert_eq!(report.items[0].content, Some(ContentKind::ComputerDisk));
+    assert!(matches!(
+        report.items[0].container,
+        ContainerKind::Archive(_)
+    ));
+}
+
+#[test]
+fn c128_folder_keeps_d64_and_g64_as_c128_ingestion_items() {
+    let root = source_dir("c128-folder");
+    let c128 = root.path().join("c128");
+    std::fs::create_dir_all(&c128).unwrap();
+    std::fs::write(c128.join("game.d64"), minimal_d64()).unwrap();
+    std::fs::write(c128.join("game.g64"), b"fixture bytes").unwrap();
+
+    let report = discover_source(&c128).unwrap();
+    assert_eq!(report.items.len(), 2);
+    assert!(report.items.iter().all(|item| {
+        item.content == Some(ContentKind::ComputerDisk)
+            && item.platform_hint.as_deref() == Some("Commodore 128")
+            && item.validation_state == ValidationState::Accepted
+    }));
+}
+
+#[test]
+fn valid_dfs_disks_are_accepted_with_bbc_and_electron_folder_context() {
+    for (folder, expected) in [
+        ("bbcmicro", "BBC Micro"),
+        ("bbcmaster", "BBC Micro"),
+        ("electron", "Acorn Electron"),
+    ] {
+        let root = source_dir(&format!("dfs-{folder}"));
+        let directory = root.path().join(folder);
+        std::fs::create_dir_all(&directory).unwrap();
+        for extension in ["ssd", "dsd"] {
+            let image = if extension == "ssd" {
+                minimal_valid_dfs_image()
+            } else {
+                let side = minimal_valid_dfs_image();
+                let mut dsd = vec![0_u8; 800 * 256];
+                dsd[..512].copy_from_slice(&side[..512]);
+                dsd[0x0a00..0x0a00 + 512].copy_from_slice(&side[..512]);
+                dsd
+            };
+            std::fs::write(directory.join(format!("game.{extension}")), image).unwrap();
+        }
+        let report = discover_source(&directory).unwrap();
+        assert_eq!(report.items.len(), 2);
+        assert!(
+            report.items.iter().all(|item| {
+                item.content == Some(ContentKind::ComputerDisk)
+                    && item.platform_hint.as_deref() == Some(expected)
+                    && item.validation_state == ValidationState::Accepted
+            }),
+            "{report:?}"
+        );
+    }
+}
+// --- ZX Spectrum snapshots + +3 disks ---------------------------------
+
+fn z80_v1_uncompressed() -> Vec<u8> {
+    let mut file = vec![0u8; 30 + 49152];
+    file[7] = 0x80; // PC = 0x8000 (non-zero -> v1)
+    file[9] = 0xC0; // SP = 0xC000
+    file[27] = 1; // IFF1
+    file[28] = 1; // IFF2
+    file[29] = 1; // interrupt mode 1
+    file
+}
+
+fn sna_128k() -> Vec<u8> {
+    let mut file = vec![0u8; 27 + 49152 + 4 + (5 * 16384)];
+    file[24] = 0x80; // SP = 0x8000
+    file[25] = 1; // interrupt mode
+    file[26] = 7; // border
+    file
+}
+
+/// A minimal standard CPCEMU `.dsk`; when `plus3` is set, track 0 sector 1
+/// carries a valid +3DOS disk specification.
+fn dsk(tracks: u8, sides: u8, plus3: bool) -> Vec<u8> {
+    let spt = 9usize;
+    let track_size = 256 + spt * 512;
+    let mut info = vec![0u8; 256];
+    info[..0x22].copy_from_slice(b"MV - CPCEMU Disk-File\r\nDisk-Info\r\n");
+    info[0x30] = tracks;
+    info[0x31] = sides;
+    info[0x32..0x34].copy_from_slice(&(track_size as u16).to_le_bytes());
+    let mut image = info;
+    for t in 0..(usize::from(tracks) * usize::from(sides)) {
+        let mut h = vec![0u8; 256];
+        h[..0x0C].copy_from_slice(b"Track-Info\r\n");
+        h[0x10] = (t / usize::from(sides)) as u8;
+        h[0x11] = (t % usize::from(sides)) as u8;
+        h[0x14] = 2;
+        h[0x15] = spt as u8;
+        for s in 0..spt {
+            let b = 0x18 + s * 8;
+            h[b + 2] = 0xC1 + s as u8;
+            h[b + 3] = 2;
+        }
+        image.extend_from_slice(&h);
+        let mut data = vec![0xE5u8; spt * 512];
+        if t == 0 && plus3 {
+            data[0] = 0; // disk type: Spectrum +3 SS
+            data[2] = tracks;
+            data[3] = spt as u8;
+            data[4] = 2;
+            for byte in data.iter_mut().take(15).skip(10) {
+                *byte = 0;
+            }
+        }
+        image.extend_from_slice(&data);
+    }
+    image
+}
+
+fn d88(name: &str) -> Vec<u8> {
+    let header_bytes = 0x2b0usize;
+    let mut image = vec![0u8; header_bytes + 16 + 128];
+    let name_bytes = name.as_bytes();
+    image[..name_bytes.len().min(17)].copy_from_slice(&name_bytes[..name_bytes.len().min(17)]);
+    image[0x1c..0x20].copy_from_slice(&(header_bytes as u32).to_le_bytes());
+    let track = header_bytes;
+    image[track + 2] = 1; // R
+    image[track + 4..track + 6].copy_from_slice(&1u16.to_le_bytes());
+    image[track + 14..track + 16].copy_from_slice(&128u16.to_le_bytes());
+    image[track + 16..].fill(0xe5);
+    image
+}
+
+#[test]
+fn d88_discovery_requires_structure_and_preserves_folder_platform_evidence() {
+    let root = source_dir("d88-discovery");
+    let pc88 = root.path().join("pc88");
+    let pc98 = root.path().join("pc98");
+    std::fs::create_dir_all(&pc88).unwrap();
+    std::fs::create_dir_all(&pc98).unwrap();
+    std::fs::write(pc88.join("named.d88"), d88("PC88 DISK")).unwrap();
+    std::fs::write(pc98.join("named.d88"), d88("PC98 DISK")).unwrap();
+    let pc88_report = discover_source(&pc88).unwrap();
+    let pc98_report = discover_source(&pc98).unwrap();
+    assert_eq!(pc88_report.items.len(), 1, "{:?}", pc88_report.items);
+    assert_eq!(pc98_report.items.len(), 1, "{:?}", pc98_report.items);
+    assert_eq!(
+        pc88_report.items[0].content,
+        Some(ContentKind::ComputerDisk)
+    );
+    assert_eq!(
+        pc98_report.items[0].content,
+        Some(ContentKind::ComputerDisk)
+    );
+    assert_eq!(
+        pc88_report.items[0].platform_hint.as_deref(),
+        Some("NEC PC-8801")
+    );
+    assert_eq!(pc98_report.items[0].platform_hint.as_deref(), Some("PC-98"));
+
+    let bare = source_dir("d88-bare");
+    std::fs::write(bare.path().join("bare.d88"), d88("BARE DISK")).unwrap();
+    std::fs::write(bare.path().join("random.d88"), vec![0x5a; 832]).unwrap();
+    let report = discover_source(bare.path()).unwrap();
+    assert_eq!(report.items.len(), 2, "{:?}", report.items);
+    let item = |name: &str| {
+        report
+            .items
+            .iter()
+            .find(|item| item.path.ends_with(name))
+            .unwrap_or_else(|| panic!("missing {name}: {:?}", report.items))
+    };
+    assert_eq!(item("bare.d88").content, Some(ContentKind::ComputerDisk));
+    assert_eq!(item("bare.d88").platform_hint, None);
+    assert_eq!(item("bare.d88").validation_state, ValidationState::Skipped);
+    assert_eq!(
+        item("random.d88").validation_state,
+        ValidationState::Skipped
+    );
+    assert!(matches!(
+        item("random.d88").skip_reason,
+        Some(SkipReason::InvalidContent(_))
+    ));
+}
+
+#[test]
+fn z80_v1_snapshot_is_discovered_as_a_zx_spectrum_machine_snapshot() {
+    let dir = source_dir("z80");
+    std::fs::write(
+        dir.path().join("Manic Miner (1983).z80"),
+        z80_v1_uncompressed(),
+    )
+    .unwrap();
+    let report = discover_source(dir.path()).unwrap();
+    assert_eq!(report.items.len(), 1);
+    let item = &report.items[0];
+    assert_eq!(item.content, Some(ContentKind::MachineSnapshot));
+    assert_eq!(item.validation_state, ValidationState::Accepted);
+    assert_eq!(item.platform_hint.as_deref(), Some("ZX Spectrum"));
+    assert!(item.explanation.contains("48K"));
+    assert_eq!(report.stats.snapshots, 1);
+}
+
+#[test]
+fn sna_128k_snapshot_is_discovered() {
+    let dir = source_dir("sna");
+    std::fs::write(dir.path().join("unrelated name.sna"), sna_128k()).unwrap();
+    let report = discover_source(dir.path()).unwrap();
+    let item = &report.items[0];
+    assert_eq!(item.content, Some(ContentKind::MachineSnapshot));
+    assert_eq!(item.validation_state, ValidationState::Accepted);
+    assert_eq!(item.platform_hint.as_deref(), Some("ZX Spectrum"));
+}
+
+// --- ZX Spectrum TR-DOS media (.trd / .scl) --------------------------
+
+fn scl_archive(files: &[u8]) -> Vec<u8> {
+    let mut v = Vec::new();
+    v.extend_from_slice(b"SINCLAIR");
+    v.push(files.len() as u8);
+    for &sectors in files {
+        let mut e = [0u8; 14];
+        e[..8].copy_from_slice(b"GAME    ");
+        e[8] = b'C';
+        e[13] = sectors;
+        v.extend_from_slice(&e);
+    }
+    v.extend(std::iter::repeat_n(
+        0u8,
+        files.iter().map(|&s| usize::from(s) * 256).sum(),
+    ));
+    v
+}
+
+fn trd_disk_40ss() -> Vec<u8> {
+    // 40-track single-sided: 40 * 16 * 256 = 163840 bytes.
+    let total_sectors = 40u64 * 16;
+    let mut v = vec![0u8; (total_sectors * 256) as usize];
+    v[0..8].copy_from_slice(b"BOOT    ");
+    v[8] = b'B';
+    v[13] = 1;
+    let d = 0x800usize;
+    v[d + 0xE1] = 0; // first free sector
+    v[d + 0xE2] = 1; // first free track
+    v[d + 0xE3] = 0x19; // 40 SS
+    v[d + 0xE4] = 1; // one file
+    let free = (total_sectors - 16) as u16;
+    v[d + 0xE5..d + 0xE7].copy_from_slice(&free.to_le_bytes());
+    v[d + 0xE7] = 0x10; // TR-DOS id
+    v[d + 0xF5..d + 0xFD].copy_from_slice(b"SPECCY  ");
+    v
+}
+
+#[test]
+fn scl_archive_is_discovered_as_zx_spectrum_media() {
+    let dir = source_dir("scl");
+    std::fs::write(dir.path().join("Some Collection.scl"), scl_archive(&[2, 4])).unwrap();
+    let report = discover_source(dir.path()).unwrap();
+    assert_eq!(report.items.len(), 1);
+    let item = &report.items[0];
+    assert_eq!(item.content, Some(ContentKind::ComputerDisk));
+    assert_eq!(item.validation_state, ValidationState::Accepted);
+    assert_eq!(item.platform_hint.as_deref(), Some("ZX Spectrum"));
+    assert!(item.explanation.contains("TR-DOS"));
+}
+
+#[test]
+fn trd_disk_is_discovered_as_zx_spectrum_media() {
+    let dir = source_dir("trd");
+    std::fs::write(dir.path().join("unrelated name.trd"), trd_disk_40ss()).unwrap();
+    let report = discover_source(dir.path()).unwrap();
+    let item = &report.items[0];
+    assert_eq!(item.content, Some(ContentKind::ComputerDisk));
+    assert_eq!(item.validation_state, ValidationState::Accepted);
+    assert_eq!(item.platform_hint.as_deref(), Some("ZX Spectrum"));
+}
+
+#[test]
+fn random_bytes_named_like_a_spectrum_snapshot_are_not_accepted() {
+    let dir = source_dir("z80-lie");
+    std::fs::write(
+        dir.path().join("Some Spectrum Game.z80"),
+        b"not a snapshot at all",
+    )
+    .unwrap();
+    let report = discover_source(dir.path()).unwrap();
+    let item = &report.items[0];
+    assert_eq!(item.validation_state, ValidationState::Skipped);
+    assert_eq!(item.platform_hint, None);
+    assert!(matches!(
+        item.skip_reason,
+        Some(SkipReason::InvalidContent(_))
+    ));
+    assert!(!item.explanation.contains("48K"));
+}
+
+#[test]
+fn plus3_dsk_is_discovered_as_zx_spectrum() {
+    let dir = source_dir("plus3-dsk");
+    std::fs::write(dir.path().join("Game (1988).dsk"), dsk(40, 1, true)).unwrap();
+    let report = discover_source(dir.path()).unwrap();
+    let item = &report.items[0];
+    assert_eq!(item.content, Some(ContentKind::ComputerDisk));
+    assert_eq!(item.validation_state, ValidationState::Accepted);
+    assert_eq!(item.platform_hint.as_deref(), Some("ZX Spectrum"));
+    assert!(item.explanation.contains("+3"));
+}
+
+#[test]
+fn generic_cpc_dsk_stays_ambiguous_and_is_never_forced_to_spectrum() {
+    let dir = source_dir("generic-dsk");
+    std::fs::write(dir.path().join("data disk.dsk"), dsk(80, 2, false)).unwrap();
+    let report = discover_source(dir.path()).unwrap();
+    let item = &report.items[0];
+    assert_eq!(item.content, Some(ContentKind::ComputerDisk));
+    assert_ne!(item.platform_hint.as_deref(), Some("ZX Spectrum"));
+    assert_eq!(item.validation_state, ValidationState::Skipped);
+    assert_eq!(
+        item.skip_reason,
+        Some(SkipReason::RecognizedContentNoIdentityMatch)
+    );
+}
+
+#[test]
+fn truncated_dsk_fails_closed() {
+    let dir = source_dir("trunc-dsk");
+    let mut image = dsk(40, 1, true);
+    image.truncate(image.len() - 2048);
+    std::fs::write(dir.path().join("game.dsk"), image).unwrap();
+    let report = discover_source(dir.path()).unwrap();
+    let item = &report.items[0];
+    assert_eq!(item.validation_state, ValidationState::Skipped);
+    assert!(matches!(
+        item.skip_reason,
+        Some(SkipReason::InvalidContent(_))
+    ));
+    assert_eq!(item.platform_hint, None);
+}
+
+#[test]
+fn random_bytes_named_trd_or_scl_are_not_spectrum_evidence() {
+    let dir = source_dir("trdos-lies");
+    // Correctly sized for an 80-track DS TR-DOS disk, but random.
+    std::fs::write(
+        dir.path().join("Speccy Game.trd"),
+        (0..655360u32)
+            .map(|i| (i * 91 + 5) as u8)
+            .collect::<Vec<u8>>(),
+    )
+    .unwrap();
+    std::fs::write(dir.path().join("Speccy Archive.scl"), vec![0x11u8; 8192]).unwrap();
+
+    let report = discover_source(dir.path()).unwrap();
+    assert_eq!(report.items.len(), 2);
+    for item in &report.items {
+        assert_eq!(item.validation_state, ValidationState::Skipped, "{item:?}");
+        assert_eq!(item.platform_hint, None);
+        assert!(matches!(
+            item.skip_reason,
+            Some(SkipReason::InvalidContent(_))
+        ));
+    }
+}
+
+#[test]
+fn truncated_trd_fails_closed_in_discovery() {
+    let dir = source_dir("trd-trunc");
+    let mut image = trd_disk_40ss();
+    image.truncate(0x400); // descriptor sector gone
+    std::fs::write(dir.path().join("game.trd"), image).unwrap();
+    let report = discover_source(dir.path()).unwrap();
+    let item = &report.items[0];
+    assert_eq!(item.validation_state, ValidationState::Skipped);
+    assert!(matches!(
+        item.skip_reason,
+        Some(SkipReason::InvalidContent(_))
+    ));
+    assert_eq!(item.platform_hint, None);
+}
+
+// --- DOS boot media (.img / .ima) --------------------------------------
+
+/// A 1.44 MB FAT12 floppy image: a real BPB, the boot signature, and the
+/// given 8.3 root-directory entries written at the computed root offset.
+fn dos_fat12_floppy(entries: &[(&str, &str)]) -> Vec<u8> {
+    const SECTOR: usize = 512;
+    let mut img = vec![0u8; 2880 * SECTOR];
+    img[0x00] = 0xEB;
+    img[0x01] = 0x3C;
+    img[0x02] = 0x90;
+    img[0x03..0x0B].copy_from_slice(b"MSDOS5.0");
+    img[0x0B..0x0D].copy_from_slice(&512u16.to_le_bytes());
+    img[0x0D] = 1; // sectors per cluster
+    img[0x0E..0x10].copy_from_slice(&1u16.to_le_bytes()); // reserved
+    img[0x10] = 2; // FATs
+    img[0x11..0x13].copy_from_slice(&224u16.to_le_bytes()); // root entries
+    img[0x13..0x15].copy_from_slice(&2880u16.to_le_bytes()); // total sectors
+    img[0x15] = 0xF0; // media descriptor
+    img[0x16..0x18].copy_from_slice(&9u16.to_le_bytes()); // sectors per FAT
+    img[0x18..0x1A].copy_from_slice(&18u16.to_le_bytes()); // sectors per track
+    img[0x1A..0x1C].copy_from_slice(&2u16.to_le_bytes()); // heads
+    img[510] = 0x55;
+    img[511] = 0xAA;
+    let root = (1 + 2 * 9) * SECTOR; // 9728
+    for (i, (base, ext)) in entries.iter().enumerate() {
+        let e = root + i * 32;
+        img[e..e + 11].fill(b' ');
+        img[e..e + base.len()].copy_from_slice(base.as_bytes());
+        img[e + 8..e + 8 + ext.len()].copy_from_slice(ext.as_bytes());
+        img[e + 11] = 0x07; // system|hidden|read-only
+    }
+    img
+}
+
+#[test]
+fn img_with_msdos_system_files_is_discovered_as_dos_boot_media() {
+    let dir = source_dir("dos-img");
+    std::fs::write(
+        dir.path().join("Boot Disk.img"),
+        dos_fat12_floppy(&[("IO", "SYS"), ("MSDOS", "SYS")]),
+    )
+    .unwrap();
+    let report = discover_source(dir.path()).unwrap();
+    let item = &report.items[0];
+    assert_eq!(item.content, Some(ContentKind::ComputerDisk));
+    assert_eq!(item.validation_state, ValidationState::Accepted);
+    assert_eq!(item.platform_hint.as_deref(), Some("DOS"));
+    assert!(item.explanation.contains("MS-DOS"));
+    assert!(item.explanation.contains("DAT/catalogue match"));
+}
+
+#[test]
+fn ima_with_pc_dos_system_files_is_discovered_as_dos_boot_media() {
+    let dir = source_dir("dos-ima");
+    std::fs::write(
+        dir.path().join("pcdos.ima"),
+        dos_fat12_floppy(&[("IBMBIO", "COM"), ("IBMDOS", "COM")]),
+    )
+    .unwrap();
+    let report = discover_source(dir.path()).unwrap();
+    let item = &report.items[0];
+    assert_eq!(item.validation_state, ValidationState::Accepted);
+    assert_eq!(item.platform_hint.as_deref(), Some("DOS"));
+    assert!(item.explanation.contains("PC DOS"));
+}
+
+#[test]
+fn valid_fat_img_without_a_dos_system_file_pair_is_never_forced_to_dos() {
+    let dir = source_dir("dos-img-plain");
+    std::fs::write(
+        dir.path().join("data.img"),
+        dos_fat12_floppy(&[("README", "TXT"), ("COMMAND", "COM")]),
+    )
+    .unwrap();
+    let report = discover_source(dir.path()).unwrap();
+    let item = &report.items[0];
+    assert_eq!(item.content, Some(ContentKind::ComputerDisk));
+    assert_eq!(item.validation_state, ValidationState::Skipped);
+    assert_eq!(item.platform_hint, None);
+    assert_eq!(
+        item.skip_reason,
+        Some(SkipReason::RecognizedContentNoIdentityMatch)
+    );
+    assert!(item.explanation.contains("not DOS evidence"));
+}
+
+#[test]
+fn img_filename_containing_dos_does_not_make_a_generic_fat_image_dos() {
+    let dir = source_dir("dos-img-name");
+    std::fs::write(
+        dir.path().join("MEGA DOS COLLECTION.img"),
+        dos_fat12_floppy(&[("SETUP", "EXE")]),
+    )
+    .unwrap();
+    let report = discover_source(dir.path()).unwrap();
+    let item = &report.items[0];
+    assert_eq!(item.platform_hint, None);
+    assert_eq!(item.validation_state, ValidationState::Skipped);
+}
+
+#[test]
+fn random_bytes_named_img_fail_closed_in_discovery() {
+    let dir = source_dir("dos-img-noise");
+    std::fs::write(dir.path().join("mystery.img"), vec![0x11u8; 4096]).unwrap();
+    let report = discover_source(dir.path()).unwrap();
+    let item = &report.items[0];
+    assert_eq!(item.validation_state, ValidationState::Skipped);
+    assert_eq!(item.platform_hint, None);
+    assert!(matches!(
+        item.skip_reason,
+        Some(SkipReason::InvalidContent(_))
+    ));
+}
+
+// --- DOS MZ executables (.exe) ----------------------------------------
+
+/// A minimal, structurally valid DOS MZ executable header, padded to
+/// `total` bytes. `lfanew` non-zero adds a Windows-style NE/PE stub
+/// pointer at 0x3C.
+fn mz_exe(total: usize, lfanew: u32) -> Vec<u8> {
+    let mut data = vec![0u8; total.max(0x40)];
+    data[0x00..0x02].copy_from_slice(b"MZ");
+    data[0x02..0x04].copy_from_slice(&0u16.to_le_bytes()); // last page full
+    data[0x04..0x06].copy_from_slice(&1u16.to_le_bytes()); // 1 page
+    data[0x06..0x08].copy_from_slice(&0u16.to_le_bytes()); // no relocations
+    data[0x08..0x0A].copy_from_slice(&2u16.to_le_bytes()); // 2 paragraphs
+    data[0x0C..0x0E].copy_from_slice(&0xFFFFu16.to_le_bytes());
+    data[0x18..0x1A].copy_from_slice(&0x1Cu16.to_le_bytes());
+    if lfanew != 0 {
+        data[0x3C..0x40].copy_from_slice(&lfanew.to_le_bytes());
+    }
+    data
+}
+
+#[test]
+fn a_bare_valid_exe_in_an_unaliased_folder_stays_platform_unresolved() {
+    let dir = source_dir("exe-bare");
+    std::fs::write(dir.path().join("SETUP.EXE"), mz_exe(512, 0)).unwrap();
+    let report = discover_source(dir.path()).unwrap();
+    let item = &report.items[0];
+    assert_eq!(item.content, Some(ContentKind::Executable));
+    assert_eq!(item.validation_state, ValidationState::Skipped);
+    assert_eq!(item.platform_hint, None);
+    assert_eq!(
+        item.skip_reason,
+        Some(SkipReason::RecognizedContentNoIdentityMatch)
+    );
+    assert!(item.explanation.contains("not DOS evidence"));
+    assert_eq!(report.stats.executables, 1);
+}
+
+#[test]
+fn a_valid_exe_in_a_dos_folder_keeps_the_dos_resolution() {
+    let dir = source_dir("exe-dos-folder");
+    let dos = dir.path().join("dos");
+    std::fs::create_dir_all(&dos).unwrap();
+    std::fs::write(dos.join("GAME.EXE"), mz_exe(1024, 0)).unwrap();
+    let report = discover_source(dir.path()).unwrap();
+    let item = &report.items[0];
+    assert_eq!(item.content, Some(ContentKind::Executable));
+    assert_eq!(item.validation_state, ValidationState::Accepted);
+    assert_eq!(item.platform_hint.as_deref(), Some("DOS"));
+    assert!(item.explanation.contains("corroborates"));
+}
+
+#[test]
+fn a_windows_style_mz_stub_does_not_become_dos_on_its_own() {
+    let dir = source_dir("exe-pe-stub");
+    std::fs::write(dir.path().join("WINAPP.EXE"), mz_exe(4096, 0x80)).unwrap();
+    let report = discover_source(dir.path()).unwrap();
+    let item = &report.items[0];
+    assert_eq!(item.platform_hint, None);
+    assert_eq!(item.validation_state, ValidationState::Skipped);
+    assert!(item.explanation.contains("extended-header pointer"));
+}
+
+#[test]
+fn an_exe_filename_containing_dos_is_irrelevant() {
+    let dir = source_dir("exe-dos-name");
+    std::fs::write(dir.path().join("MEGA-DOS-PACK.EXE"), mz_exe(512, 0)).unwrap();
+    let report = discover_source(dir.path()).unwrap();
+    let item = &report.items[0];
+    assert_eq!(item.platform_hint, None);
+    assert_eq!(item.validation_state, ValidationState::Skipped);
+}
+
+#[test]
+fn random_bytes_named_exe_fail_closed() {
+    let dir = source_dir("exe-noise");
+    std::fs::write(dir.path().join("mystery.exe"), vec![0x33u8; 4096]).unwrap();
+    let report = discover_source(dir.path()).unwrap();
+    let item = &report.items[0];
+    assert_eq!(item.content, Some(ContentKind::Executable));
+    assert_eq!(item.validation_state, ValidationState::Skipped);
+    assert!(matches!(
+        item.skip_reason,
+        Some(SkipReason::InvalidContent(_))
+    ));
+    assert_eq!(item.platform_hint, None);
+}
+
+#[test]
+fn a_truncated_mz_header_named_exe_is_refused() {
+    let dir = source_dir("exe-trunc");
+    std::fs::write(dir.path().join("cut.exe"), &mz_exe(512, 0)[..10]).unwrap();
+    let report = discover_source(dir.path()).unwrap();
+    let item = &report.items[0];
+    assert_eq!(item.validation_state, ValidationState::Skipped);
+    assert!(matches!(
+        item.skip_reason,
+        Some(SkipReason::InvalidContent(_))
+    ));
+}
+
+#[test]
+fn source_ownership_refusals_publish_no_identity_or_media_evidence() {
+    use crate::amiga_disk::source_identity::test_support::{Change, Checkpoint, mutate, with_hook};
+    for extension in ["adf", "adz"] {
+        for change in [
+            Change::Replace,
+            Change::SameSizeRestoredMtime,
+            Change::Remove,
+            Change::InPlace,
+        ] {
+            for point in [Checkpoint::Captured, Checkpoint::BeforePublish] {
+                let dir = source_dir("amiga-source-replacement");
+                let path = dir.path().join(format!("Known Game.{extension}"));
+                let raw = minimal_flat_adf(1, b"DisplayLabel");
+                let bytes = if extension == "adz" {
+                    gzip_bytes(&raw)
+                } else {
+                    raw
+                };
+                std::fs::write(&path, bytes).unwrap();
+                let source = path.clone();
+                let report = with_hook(
+                    &path,
+                    point,
+                    move || mutate(&source, change),
+                    || discover_source(dir.path()).unwrap(),
+                );
+                assert_eq!(report.items.len(), 1);
+                let item = &report.items[0];
+                assert_eq!(item.validation_state, ValidationState::Skipped);
+                assert!(
+                    matches!(item.skip_reason, Some(SkipReason::InspectionUnavailable(_))),
+                    "{extension} {change:?} at {point:?}: {item:?}"
+                );
+                assert_eq!(item.platform_hint, None);
+                assert_eq!(item.identity_candidate, None);
+                assert!(report.structural_evidence.is_empty());
+                assert!(report.archive_evidence.is_empty());
+                assert!(
+                    !item
+                        .skip_reason
+                        .as_ref()
+                        .unwrap()
+                        .suggested_action()
+                        .contains("may be corrupt")
+                );
+            }
+        }
+    }
+}
+
+#[test]
+fn source_ownership_stable_discovery_remains_accepted_strong_without_game_claims() {
+    for extension in ["adf", "adz"] {
+        let dir = source_dir("stable-amiga-source");
+        let raw = minimal_flat_adf(1, b"DisplayLabel");
+        let bytes = if extension == "adz" {
+            gzip_bytes(&raw)
+        } else {
+            raw
+        };
+        std::fs::write(dir.path().join(format!("Known Game.{extension}")), bytes).unwrap();
+        for _ in 0..8 {
+            let report = discover_source(dir.path()).unwrap();
+            assert_eq!(report.items.len(), 1);
+            assert_eq!(report.items[0].validation_state, ValidationState::Accepted);
+            assert_eq!(report.items[0].skip_reason, None);
+            assert_eq!(report.items[0].identity_candidate, None);
+            assert_eq!(report.structural_evidence.len(), 1);
+            let evidence = &report.structural_evidence[0].observation;
+            assert_eq!(
+                evidence.claim_strength,
+                crate::platform_evidence_fusion::evidence_lineage::ClaimStrength::Strong
+            );
+            assert_eq!(evidence.release_candidate, None);
+            assert_eq!(evidence.hash_or_value, None);
+        }
+    }
+}
+
+#[test]
+fn lha_cumulative_decode_refusal_reports_package_cost_and_remaining_allowance() {
+    assert!(
+        lha_backend_available(),
+        "Focused LHA tests require the installed decoder"
+    );
+    let dir = source_dir("lha-budget-feedback");
+    let slave = minimal_whdload_slave();
+    let payload = [7u8; 64];
+    let bytes = stored_lha(&[("Game.slave", &slave), ("disk.1", &payload)]);
+    let path = dir.path().join("Budget.lha");
+    std::fs::write(&path, &bytes).unwrap();
+    let limit = super::preview::MAX_PREVIEW_DECODE_BYTES;
+    assert_eq!(limit, 256 * 1024 * 1024);
+    let available = slave.len() as u64 + 32;
+    let mut budget = crate::dat::archive::ArchiveRunBudget::new(limit);
+    assert!(budget.try_charge(limit - available)); // model already decoded references
+    let reason = super::saved_archive_checks::read_members(
+        &path,
+        "Amiga",
+        &crate::safe_read::TrustedRoots::none(),
+        &std::sync::atomic::AtomicBool::new(false),
+        &mut budget,
+    )
+    .unwrap_err();
+    assert!(reason.contains("cumulative decode budget"), "{reason}");
+    assert!(
+        reason.contains(&format!("{} bytes", slave.len() + payload.len())),
+        "{reason}"
+    );
+    assert!(
+        reason.contains(&format!("{available} bytes remaining")),
+        "{reason}"
+    );
+    assert!(reason.contains(&format!("{limit} bytes")), "{reason}");
+    assert!(reason.contains("Budget.lha"), "{reason}");
+    assert!(budget.consumed() <= limit);
+    assert_eq!(std::fs::read(&path).unwrap(), bytes);
+}
+
+#[test]
+fn lha_package_row_retains_its_exact_inspection_refusal() {
+    assert!(lha_backend_available());
+    let dir = source_dir("lha-row-refusal");
+    let root = dir.path().join("Amiga");
+    std::fs::create_dir(&root).unwrap();
+    let bytes = stored_lha(&[
+        ("A.slave", &minimal_whdload_slave()),
+        ("B.slave", &minimal_whdload_slave()),
+    ]);
+    let path = root.join("Ambiguous.lha");
+    std::fs::write(&path, &bytes).unwrap();
+    let config = crate::Config {
+        source_folders: vec![root],
+        mount_root: Default::default(),
+        ratarmount_bin: String::new(),
+        master_rom_root: None,
+    };
+    let report = super::preview::preview_media(
+        &config,
+        &[],
+        &[],
+        &[],
+        &std::sync::atomic::AtomicBool::new(false),
+        &mut |_, _| {},
+    )
+    .unwrap();
+    let row = report.items.iter().find(|r| r.path == path).unwrap();
+    assert_eq!(row.disposition, super::preview::MediaDisposition::Excluded);
+    assert!(
+        row.explanation
+            .contains("Multiple WHDLoad slaves remain ambiguous"),
+        "{}",
+        row.explanation
+    );
+    assert!(!row.relationship_checks_complete);
+    assert_eq!(std::fs::read(path).unwrap(), bytes);
+}
+
+// --- `.xex` is two formats: Xbox 360 executable and Atari 8-bit binary load ---
+
+fn atari_binary_load(segments: &[(u16, &[u8])]) -> Vec<u8> {
+    let mut bytes = vec![0xFF, 0xFF];
+    for (start, payload) in segments {
+        let end = start + (payload.len() as u16 - 1);
+        bytes.extend_from_slice(&start.to_le_bytes());
+        bytes.extend_from_slice(&end.to_le_bytes());
+        bytes.extend_from_slice(payload);
+    }
+    bytes
+}
+
+#[test]
+fn atari_8bit_binary_load_xex_is_recognised_by_its_structure_not_refused_as_xbox() {
+    let dir = source_dir("atari-xex");
+    let path = dir.path().join("Boulder Dash.xex");
+    std::fs::write(
+        &path,
+        atari_binary_load(&[
+            (0x2000, &[0xA9, 0x00, 0x8D, 0x00, 0x02]),
+            (0x02E0, &[0x00, 0x20]),
+        ]),
+    )
+    .unwrap();
+
+    let report = discover_source(dir.path()).unwrap();
+    let item = &report.items[0];
+    assert_eq!(item.validation_state, ValidationState::Accepted, "{item:?}");
+    assert_eq!(item.content, Some(ContentKind::Executable));
+    assert_eq!(item.platform_hint.as_deref(), Some("Atari 8-bit"));
+    assert!(
+        item.explanation.contains("2 load segment(s)"),
+        "{}",
+        item.explanation
+    );
+    assert!(!item.explanation.contains("Xbox"), "{}", item.explanation);
+}
+
+#[test]
+fn truncated_atari_binary_load_xex_is_refused_with_the_atari_reason() {
+    let dir = source_dir("atari-xex-truncated");
+    let mut bytes = atari_binary_load(&[(0x2000, &[0xEA; 64])]);
+    bytes.truncate(bytes.len() - 10);
+    std::fs::write(dir.path().join("Broken.xex"), bytes).unwrap();
+
+    let report = discover_source(dir.path()).unwrap();
+    let item = &report.items[0];
+    assert_eq!(item.validation_state, ValidationState::Skipped);
+    match &item.skip_reason {
+        Some(SkipReason::InvalidContent(detail)) => {
+            assert!(detail.contains("Atari 8-bit"), "{detail}");
+            assert!(detail.contains("needs 64 bytes"), "{detail}");
+        }
+        other => panic!("expected an Atari structural refusal, got {other:?}"),
+    }
+}
+
+#[test]
+fn xex_with_neither_signature_names_both_platforms_in_its_refusal() {
+    let dir = source_dir("xex-neither");
+    std::fs::write(dir.path().join("Mystery.xex"), b"not an executable at all").unwrap();
+
+    let report = discover_source(dir.path()).unwrap();
+    let item = &report.items[0];
+    assert_eq!(item.validation_state, ValidationState::Skipped);
+    assert_ne!(item.skip_reason, Some(SkipReason::UnsupportedExtension));
+    assert!(item.explanation.contains("XEX2"), "{}", item.explanation);
+    assert!(item.explanation.contains("$FFFF"), "{}", item.explanation);
+    assert_eq!(item.platform_hint, None);
+}
+
+#[test]
+fn xex2_magic_still_takes_the_xbox_360_route() {
+    let dir = source_dir("xex-xbox");
+    let mut bytes = b"XEX2".to_vec();
+    bytes.extend_from_slice(&[0u8; 60]);
+    std::fs::write(dir.path().join("default.xex"), bytes).unwrap();
+
+    let report = discover_source(dir.path()).unwrap();
+    let item = &report.items[0];
+    // A bare magic word is not a valid XEX2 image; the Xbox route refuses it
+    // in its own words, proving the bytes were routed there.
+    assert_eq!(item.validation_state, ValidationState::Skipped);
+    assert!(item.explanation.contains("Xbox"), "{}", item.explanation);
+    assert!(!item.explanation.contains("Atari"), "{}", item.explanation);
+}
+
+// --- Old-cache → new-scanner: archives whose listing found no recognised member ---
+
+fn zip_with_member(path: &Path, member: &str) {
+    use zip::ZipWriter;
+    use zip::write::SimpleFileOptions;
+    let mut writer = ZipWriter::new(File::create(path).unwrap());
+    writer
+        .start_file(member, SimpleFileOptions::default())
+        .unwrap();
+    std::io::Write::write_all(&mut writer, b"rom").unwrap();
+    writer.finish().unwrap();
+}
+
+fn cached_listing(
+    root: &Path,
+    archive_path: &Path,
+    selected_member: Option<&str>,
+    member_count: usize,
+) -> ScanFingerprint {
+    let archive = Archive::from_path_in_root(archive_path, root).unwrap();
+    ScanFingerprint {
+        relative_path: archive_path.strip_prefix(root).unwrap().to_path_buf(),
+        size_bytes: archive.identity.size_bytes.unwrap(),
+        modified_time_ns: archive
+            .identity
+            .modified_time
+            .unwrap()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos() as i128,
+        archive_kind: ArchiveKind::Zip,
+        display_name: archive.identity.display_name,
+        normalized_name: archive.identity.normalized_name,
+        platform: archive.identity.platform,
+        platform_provenance: archive.identity.platform_provenance,
+        scanner_version: SCANNER_VERSION.into(),
+        parser_version: ARCHIVE_PARSER_VERSION.into(),
+        cache_version: SCAN_CACHE_VERSION,
+        ingestion: Some(IngestionFingerprint {
+            version: super::discovery::INGESTION_PARSER_VERSION.into(),
+            listing_hash: "stale-listing-hash".into(),
+            member_count,
+            selected_member: selected_member.map(str::to_string),
+            listing_available: true,
+        }),
+        non_archive_kind: None,
+    }
+}
+
+/// A listing cached when `.pce` was not yet recognised recorded "no
+/// recognised member". That verdict is re-read, not reused, so the game is
+/// discovered now; a listing that had already selected a member is reused.
+#[test]
+fn archive_listings_with_no_recognised_member_are_relisted_under_a_wider_registry() {
+    let dir = source_dir("stale-listing");
+    let root = dir.path();
+    let hucard = root.join("Bonk.zip");
+    zip_with_member(&hucard, "Bonk's Adventure.pce");
+    let cartridge = root.join("Mario.zip");
+    zip_with_member(&cartridge, "Super Mario Bros.nes");
+    let cached = vec![
+        (1, cached_listing(root, &hucard, None, 1)),
+        (
+            1,
+            cached_listing(root, &cartridge, Some("Super Mario Bros.nes"), 1),
+        ),
+    ];
+
+    let report = discover_source_with_fingerprints(root, &cached).unwrap();
+    assert_eq!(report.reuse.archives_reopened, 1, "{:?}", report.reuse);
+    assert_eq!(report.reuse.archives_reused, 1, "{:?}", report.reuse);
+    let bonk = report
+        .items
+        .iter()
+        .find(|item| item.path == hucard)
+        .unwrap();
+    assert_eq!(bonk.content, Some(ContentKind::RomCartridge), "{bonk:?}");
+    assert_ne!(bonk.skip_reason, Some(SkipReason::UnsupportedExtension));
+    let mario = report
+        .items
+        .iter()
+        .find(|item| item.path == cartridge)
+        .unwrap();
+    assert_eq!(mario.content, Some(ContentKind::RomCartridge));
+}

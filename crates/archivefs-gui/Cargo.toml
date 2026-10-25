@@ -2,22 +2,45 @@
 name = "archivefs-gui"
 version.workspace = true
 edition.workspace = true
+# Every binary is declared explicitly below; nothing in `src/bin/` should be
+# picked up implicitly.
+autobins = false
 
-# Binary naming during the EmuWiz rename (staged): `emuwiz` and
-# `emuwiz-gui` are the primary names; `archivefs-gui` remains as a legacy
-# compatibility alias so existing launchers keep working. All three run the
-# exact same code.
+# The GUI itself is a library (`src/lib.rs`): `ArchiveFsApp`, every page and
+# controller module, and the native startup in `run()`. Building it as one
+# library target means the module tree - and its tests - compile once rather
+# than once per binary name, which is what three `path = "src/main.rs"`
+# binaries used to do.
+[lib]
+name = "archivefs_gui"
+path = "src/lib.rs"
+
+# Binary naming during the EmuWiz rename: `emuwiz` is the shipped native GUI
+# v2 application. `emuwiz-gui` and `archivefs-gui` remain compatibility aliases
+# and intentionally launch that same application. The separate `emuwiz-v2`
+# target remains available for developer/build compatibility.
 [[bin]]
 name = "emuwiz"
-path = "src/main.rs"
+path = "src/bin/emuwiz.rs"
+# Nothing to test in a launcher; the suite lives in the library target.
+test = false
 
 [[bin]]
 name = "emuwiz-gui"
-path = "src/main.rs"
+path = "src/bin/emuwiz-gui.rs"
+# Nothing to test in a launcher; the suite lives in the library target.
+test = false
 
 [[bin]]
 name = "archivefs-gui"
-path = "src/main.rs"
+path = "src/bin/archivefs-gui.rs"
+# Nothing to test in a launcher; the suite lives in the library target.
+test = false
+
+[[bin]]
+name = "emuwiz-v2"
+path = "src/bin/emuwiz-v2.rs"
+test = false
 
 [dependencies]
 archivefs-core = { path = "../archivefs-core" }
@@ -53,7 +76,7 @@ arboard = { version = "3.6.1", features = ["wayland-data-control"] }
 # exact crate/version is already present through the GUI dependency graph;
 # a direct dependency makes the deliberately limited PNG API explicit and
 # avoids adding the much larger SVG/resvg parser stack for this milestone.
-image = { version = "0.25.10", default-features = false, features = ["png"] }
+image = { version = "0.25.10", default-features = false, features = ["png", "jpeg", "webp"] }
 # Native folder picker for "Add Folder" on the Sources page. Default
 # features enable the "xdg-portal" backend, which talks to the
 # xdg-desktop-portal D-Bus FileChooser directly (GNOME/KDE both implement
@@ -61,4 +84,18 @@ image = { version = "0.25.10", default-features = false, features = ["png"] }
 # and in-process, as required. `pick_folder()` is synchronous and returns
 # `None` on cancel/failure, never panics.
 rfd = "0.17.2"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+sha2 = "0.11.0"
 time = { version = "0.3.53", features = ["local-offset"] }
+tempfile = "3"
+zip = { version = "9.0", default-features = false, features = ["deflate"] }
+
+[dev-dependencies]
+archivefs-core = { path = "../archivefs-core", features = ["test-support"] }
+rusqlite = { version = "0.40.1", default-features = false, features = ["bundled"] }
+# Test fixtures only: a few-hundred-byte synthetic RAR5 CBR (see archivefs-core).
+rars = { version = "=0.10.2", default-features = false, features = ["write"] }
+# Test fixtures only: synthetic TOSEC catalogue hashes (same crates archivefs-core uses).
+sha1 = "0.11.0"
+md-5 = "0.11.0"

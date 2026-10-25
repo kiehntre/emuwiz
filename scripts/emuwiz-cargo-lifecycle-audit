@@ -1,0 +1,79 @@
+#!/usr/bin/env python3
+"""Explain an existing cargo-classifications.json without walking build artifacts.
+
+Snapshot evidence is never deletion authority. Exact existing source matches improve
+ownership reporting, but cannot invent participation or task completion.
+"""
+import argparse
+import hashlib
+import importlib.machinery
+import importlib.util
+import json
+import os
+import stat
+import sys
+sys.dont_write_bytecode = True
+loader = importlib.machinery.SourceFileLoader('retention_audit', os.path.join(os.path.dirname(__file__), 'emuwiz-cargo-retention'))
+spec = importlib.util.spec_from_loader(loader.name, loader)
+F = importlib.util.module_from_spec(spec)
+loader.exec_module(F)
+
+
+def explain(rows, repo):
+    records = F.Registry().all_records()
+    records = {r['target']: r for r in records.values()}
+    sources = {w['worktree'] for w in F.git_worktrees(repo)}
+    sources.update(r['worktree'] for r in records.values() if r.get('worktree'))
+    sources.update(r['worktree'] for r in rows if r.get('worktree') and r['worktree'] != 'unknown')
+    by_name = {}
+    for source in sources:
+        if not os.path.isabs(source) or os.path.realpath(source) != source:
+            continue
+        try:
+            st = os.lstat(source)
+            if not stat.S_ISDIR(st.st_mode) or st.st_uid != os.geteuid() or not F.head_of(source):
+                continue
+        except OSError:
+            continue
+        name = F.sanitized(os.path.basename(source)) + '-' + hashlib.sha256(os.fsencode(source)).hexdigest()[:12]
+        by_name[name] = source
+    result = []
+    for row in rows:
+        row = dict(row)
+        path = row['path']
+        rec = records.get(path)
+        source = by_name.get(os.path.basename(path))
+        reasons = set(row['reasons'])
+        row['ownership_evidence'] = 'lifecycle-record' if rec and rec.get('owner') else 'exact-source-path-hash' if source else 'unknown'
+        row['resolved_worktree'] = (rec or {}).get('worktree') or source
+        if row['classification'] == 'UNKNOWN' and source:
+            row['classification'] = 'HOLD'
+            row['reason_detail'] = 'source association established; lifecycle participation and completion still unverified'
+        elif reasons == {'RECENT_ACTIVITY'} and rec and not F.completion_problem(rec):
+            row['reason_detail'] = 'former time-only HOLD; candidate for fresh safety checks, never a deletion approval'
+        elif reasons & {'BUILD_LOCK_HELD', 'RECORDED_BUILD_ALIVE', 'LIVE_PROCESS_REFERENCE'}:
+            row['reason_detail'] = 'live use in saved census; fresh process inspection required'
+        elif 'PINNED' in reasons:
+            row['reason_detail'] = 'explicitly pinned; never automatically retired'
+        elif 'NO_LIFECYCLE_RECORD' in reasons:
+            row['reason_detail'] = 'missing lifecycle participation and completion; conservative HOLD/UNKNOWN'
+        elif 'NOT_RELEASED' in reasons:
+            row['reason_detail'] = 'no task completion attestation; age/promotion alone insufficient'
+        else:
+            row['reason_detail'] = '; '.join(sorted(reasons))
+        row['eligible_for_deletion'] = False
+        result.append(row)
+    return result
+
+
+def main():
+    p = argparse.ArgumentParser(description=__doc__)
+    p.add_argument('inventory')
+    p.add_argument('--repo', default=os.path.dirname(__file__))
+    args = p.parse_args()
+    with open(args.inventory) as h:
+        rows = json.load(h)
+    print(json.dumps({'mode': 'SAVED INVENTORY EXPLANATION ONLY; fresh safety checks required',
+                      'targets': explain(rows, args.repo)}, indent=1, sort_keys=True))
+
+if __name__ == '__main__': main()

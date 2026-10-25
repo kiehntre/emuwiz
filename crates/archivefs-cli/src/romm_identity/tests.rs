@@ -2891,11 +2891,12 @@ fn a_failed_adaptive_import_preserves_the_previous_cache_byte_for_byte() {
     let result = run.json();
     assert_eq!(result["error_code"], "oversized_record");
     assert_eq!(result["published"], false);
-    // The reductions it managed before giving up are still reported.
-    assert_eq!(
-        result["page_size_reductions"], 5,
-        "100 -> 50 -> 25 -> 10 -> 5 -> 1"
-    );
+    // The reductions it managed before giving up are still reported. After
+    // two consecutive refusals at one offset the third jumps straight to a
+    // single-record request rather than walking the rest of the ladder (see
+    // `import_identity_with_deadline`'s `oversized_events_at_this_offset`
+    // handling), so the sequence is 100 -> 50 -> 25 -> 1.
+    assert_eq!(result["page_size_reductions"], 3, "100 -> 50 -> 25 -> 1");
     assert_eq!(result["smallest_page_size"], 1);
 
     let after = std::fs::read(tree.cache_path()).expect("cache still there");

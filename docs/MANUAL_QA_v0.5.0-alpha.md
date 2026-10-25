@@ -1,5 +1,9 @@
 # Manual QA plan - ArchiveFS v0.5.0-alpha
 
+> **Historical QA document**
+>
+> This plan records validation for an earlier release and is retained as provenance. It is not current product guidance. See the [README](../README.md) and [release checklist](release-checklist.md) for current guidance.
+
 This is a manual, check-box acceptance plan for the v0.5.0-alpha release. It
 complements automated tests; it does not replace them. Run
 `cargo test --workspace` and the rest of

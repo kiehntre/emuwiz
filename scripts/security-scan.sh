@@ -22,8 +22,23 @@ patterns = [
     ("GitHub token", re.compile(rb"(?:gh[pousr]_[A-Za-z0-9]{20,}|github_pat_[A-Za-z0-9_]{20,})")),
     ("AWS access key", re.compile(rb"AKIA[0-9A-Z]{16}")),
     ("credential assignment", re.compile(rb"(?:GITHUB_TOKEN|GH_TOKEN|AWS_SECRET_ACCESS_KEY|CARGO_REGISTRY_TOKEN)=[^\s]+")),
-    ("credential-bearing URL", re.compile(rb"https?://[^\s/:]+:[^\s/@]+@")),
+    ("credential-bearing URL", re.compile(rb"https?://[^\s/:]+:([^\s/@]+)@")),
 ]
+# A URL password that is an unmistakable placeholder is a synthetic fixture
+# (redaction/refusal tests), not a credential. Classification looks only at the
+# password component: an exact, case-insensitive placeholder word, or an empty
+# or named format placeholder such as {} / {TOKEN}. Anything else, including a
+# placeholder-like prefix or suffix ("password123", "{TOKEN}x"), is reported.
+PLACEHOLDER_WORDS = {b"password", b"pass", b"pw", b"secret", b"fixture-password"}
+PLACEHOLDER_TEMPLATE = re.compile(rb"\{[A-Za-z0-9_]*\}")
+
+
+def synthetic_url_password(password):
+    return password.lower() in PLACEHOLDER_WORDS or bool(
+        PLACEHOLDER_TEMPLATE.fullmatch(password)
+    )
+
+
 findings = []
 for raw_path in paths:
     relative = pathlib.Path(raw_path.decode("utf-8", "surrogateescape"))
@@ -34,10 +49,14 @@ for raw_path in paths:
         findings.append(f"could not read tracked file {relative}: {error}")
         continue
     for label, pattern in patterns:
-        match = pattern.search(data)
-        if match:
+        # Every occurrence is classified, so a placeholder fixture earlier in a
+        # file can never hide a real credential later in it.
+        for match in pattern.finditer(data):
+            if label == "credential-bearing URL" and synthetic_url_password(match.group(1)):
+                continue
             excerpt = match.group(0)[:120].decode("utf-8", "backslashreplace")
             findings.append(f"{relative}: {label}: {excerpt}")
+            break
 if findings:
     print("\n".join(findings), file=sys.stderr)
     raise SystemExit(1)

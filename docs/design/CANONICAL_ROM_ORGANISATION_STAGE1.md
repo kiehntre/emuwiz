@@ -1,5 +1,9 @@
 # Canonical ROM organisation — Stage 1 design
 
+> **Historical / superseded design**
+>
+> This document records an earlier implementation stage and is retained for provenance. It may not describe the complete current organisation workflow. See the [README](../../README.md) and [current roadmap](../../ROADMAP.md).
+
 Status: implemented in `crates/archivefs-core/src/dat/rom_organisation/`.
 
 EmuWiz can organise identified games into a user-configured **master ROM

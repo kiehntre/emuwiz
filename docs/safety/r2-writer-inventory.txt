@@ -1,0 +1,402 @@
+Independent source inventory and feasibility assessment
+======================================================
+
+Audited baseline: 426bf2d9a56a1c5ea47e1a424a008aa5b4ce8a6f
+Baseline tree: 3facdc63681cb229607b8e1f7f11bd73c54ea872
+Fetched main reported/previously checked: ce8815d63c6d2797fdc480c9d1f7d840035ca6f1
+Repository: /home/davedap/emuwiz-r2-real-integration-20261015
+Reviewer: independent acceptance agent; 2026-10-15
+
+This is a READ-ONLY source inventory, not acceptance of whole-application
+participation, a new implementation, or production activation. No Cargo,
+application, mutation fixture, host configuration change, worktree/cache change,
+or source edit was performed for this inventory. The implementation owner has
+subsequently begun changes to GUI Undo handling; findings and line references
+below describe the fixed baseline, not the owner's unreviewed working changes.
+
+Method and visibility limits
+----------------------------
+
+The workspace comprises archivefs-core, archivefs-cli and archivefs-gui. I traced
+writer entry points, their publication and reversal helpers, and normal GUI/CLI
+call sites across these crates. baseline-mutation-search.json records the exact
+baseline object and heuristic raw search hits in 157 source files. It is a search
+index, NOT a count of 157 writer engines or a completeness proof. The heuristic
+excludes named test files and suffixes following a cfg(test) module; inline test
+helpers can still appear, and production code after a test module, alias/member
+calls, unsafe syscalls and external subprocess writes need separate inspection.
+
+The family inventory below is the manually audited set. I distinguish actual
+application callers, callable exported APIs with no application caller found,
+explicitly refused paths, and non-game resources. 'No caller found' means static
+search of this workspace, not an assertion that a public API is uncallable.
+There was no dynamic trace of every UI action, external binary or operating
+system platform. Generated code, future code, separately built consumers, old
+installed binaries, other applications and externally spawned emulator behavior
+are outside this source inventory's visibility. This report cannot prove that
+every possible managed-file write is intercepted.
+
+References beginning core/, cli/ or gui/ expand to
+crates/archivefs-core/src/, crates/archivefs-cli/src/, or
+crates/archivefs-gui/src/. All line numbers are baseline references.
+
+Existing R2 boundary
+--------------------
+
+core/dat/rename_apply/compact_recovery/mod.rs:321-335 and storage.rs:4-6
+compile admission, approval, Bridge and mutation integration only for tests.
+Production compiles compact read/materialization dispatch. Production reads of
+compact evidence do not establish mutation authority.
+
+integration.rs:60 creates the Bridge from an independently supplied
+admission::Configuration, acquires admission, records claims and reserves the
+store; :89 reopens from separately trusted signed context. The thread-local
+ACTIVE checkpoint adapter (:21-38) is not application bootstrap. The restrictions
+at :116-150 require a new Planned transaction, 1-8 Planned regular-file
+RenameMove entries, no created directories, no recovery resolution or exact-
+resume envelope, and both paths directly under the same private synthetic root.
+The decoded Authority object itself is evidence, explicitly not a lease
+(mod.rs:25-28). It is the test Bridge that imposes the 1-8-operation restriction.
+
+admission.rs:10 Configuration is test-private. Its directory/lock/database
+identities are supplied by the supervisor fixture; there is no production
+GUI/CLI common authority bootstrap, registration or trusted restart custody.
+The existing guard protects participating operations and durable object-plus-
+both-name claims. It cannot exclude unaware current/old/external writers.
+
+A. Main rename/repair/organisation engine and bypassing wrappers
+--------------------------------------------------------------
+
+1. Ordinary rename Apply and Undo.
+   core/dat/rename_apply/executor.rs:261 apply_transaction; :470 actual
+   apply_mutation_in. The model also supports replacement, symlink and hardlink
+   operations, beyond the R2 test Bridge's regular RenameMove subset.
+   rollback.rs:55/:74 enter Undo; the inner routine at :83 performs reversals,
+   including link removal (:365/:390/:414) and bound-parent reverse operations
+   (:493). A guard on Apply alone misses Undo and failed-Apply compensation.
+   GUI DAT Apply is dispatched from gui/dat_sources_page.rs:4607.
+
+2. Exact resume is a distinct direct mutation loop.
+   core/dat/rename_apply/exact_resume.rs:349 resume_exact_transaction calls
+   apply_mutation_in directly at :482. gui/dat_sources_page.rs:4735 dispatches
+   it. A guard only around executor::apply_transaction would miss this writer.
+
+3. Canonical platform/ROM organisation wraps the main engine.
+   core/platform_evidence_fusion/plan_transaction.rs:592/:620 Apply creates
+   owned directories before executor entry (:713); :761 Undo invokes confined
+   rollback (:767) then owned-directory cleanup (:778).
+   core/dat/rom_organisation/transaction.rs:373/:386 Apply; :424 Undo and :441
+   directory cleanup. gui/rom_organisation_page.rs:524/:561 calls these.
+   cli/rom_organise.rs is configuration only (set/clear/show master root), NOT
+   a CLI ROM Apply writer, despite the command name.
+
+4. Repair and quarantine.
+   core/repair/execute.rs:337 Apply -> executor (:359); :379 execute plan;
+   :499 Undo -> rollback (:504). N64-equivalent (:394/:411 in
+   repair/n64_equivalent.rs) and optical-equivalent (:348/:365 in
+   repair/optical_equivalent.rs) are wrappers of this family.
+   core/repair/quarantine.rs:599 Apply instead owns its own loop and calls
+   apply_mutation_in at :848, plus directory creation. Undo :958 calls rollback
+   (:964) and removes owned directories (:980). library repair calls quarantine
+   in repair/library.rs:1146. Thus quarantine Apply is another executor bypass.
+   Actual callers include cli/repair.rs; gui/gui_v2/backend.rs:650/:675;
+   gui/exact_duplicate_review_page.rs:723/:780/:806; and equivalent-duplicate
+   handlers. gui/repair_history_page.rs:1531 handles unified Undo outcomes.
+
+5. Publisher profiles and linked/playing libraries.
+   core/publisher_profile/execution.rs:466 Apply -> plan transaction; :594
+   Undo -> plan rollback. core/playing_library/apply_adapter.rs builds the
+   transaction; later direct executor hits in that file are tests.
+   gui/playing_library_page.rs:814 (RetroDECK), :918 (RomM), :995 (generic)
+   perform actual Apply, with wrapper directory/journal preparation. Their
+   Undo handlers are :865/:942/:1031 respectively. gui/gui_v2/backend.rs
+   and classic rom_organisation_page.rs route to these handlers. Compensation
+   can also run during publication failure. Directories/sidecar publication
+   before and after the main engine must be included in any operation scope.
+
+6. MAME internal repair and merged reconstruction.
+   core/mame_internal_repair_apply.rs:219 Apply -> executor :249 and rollback
+   compensation :251; :293 Undo -> confined rollback :298.
+   core/dat/mame_merged_reconstruction.rs:827/:835 stages archives; :1110
+   applies staged output through executor :1229. Its owned_attempt.rs helper
+   uses fd-relative create/rename/unlink for owned staging. Staging is a writer
+   even though final publication reuses rename_apply.
+   GUI callers: gui/gui_v2/mame_collection_health.rs:161 and
+   gui/gui_v2/organisation.rs:778; the latter also supports History Undo.
+
+7. MAME normalizer is a separate active CLI engine.
+   cli/main.rs:433 dispatches mame-normalise. cli/mame_normalise.rs:22/:27/:90
+   call Undo/recover/Apply. core/dat/mame_normalizer.rs:1476 Apply, :1623 Undo,
+   :1662 recover rebuild ZIPs/directories, move originals to backups, and
+   publish/restore via rename_noreplace (:1557/:1565/:1599/:1600/:1607/:1641/
+   :1643/:1650/:1682/:1960). It does NOT pass through the main executor.
+   The CLI file's old 'read-only preview' description is not a safe basis for
+   excluding this currently callable writer.
+
+B. Conversion and extraction
+-----------------------------
+
+8. CHD conversion.
+   core/repair/optical_conversion.rs:344/:594 creates staging, runs the
+   converter, validates output, then publishes via repair Apply (:736/:937).
+   Source quarantine is a separate transaction. Undo :961 coordinates source
+   restoration before output withdrawal (:979/:995), followed by staged-output
+   cleanup (:1006/:1008); failure/RAII paths also remove owned output.
+   gui/optical_conversion_page.rs:539/:608 and its unified Undo helper :43/:46
+   are callers; cli/repair/chd_recovery.rs:211 handles CHD recovery.
+
+9. PSP ISO -> CSO writes directly.
+   core/psp_reversible_shrink.rs:124 convert_psp_iso_to_cso opens a new output
+   at :148, writes compressed data, verifies restored temporary ISO and writes
+   provenance. gui/optical_conversion_page.rs:352 invokes it. It bypasses
+   rename_apply, despite living beside the CHD workflow in the GUI.
+
+10. Wii U conversion and durable background queue.
+    core/wiiu_conversion.rs:717/:734 executes into staging; :807 creates
+    output; :1003 publishes through repair Apply with compensation :1027.
+    core/conversion_queue/durable.rs:357 run_next owns queue serialization,
+    creates destination-parent staging and commits Running state before the
+    conversion call. gui/gui_v2/wiiu_disc/queue.rs:391 runs it in a worker.
+    The queue lock is not the R2 authority or a whole-application writer lock.
+    Guarding only final publication omits output/staging lifecycle, cancellation
+    and recovery ownership.
+
+11. Archive workflows: split enabled and refused paths.
+    core/archive_workflow.rs:646 extract_archive reaches active external
+    7z/RAR extraction (:558), PID staging (:576), Command (:578), verification,
+    final fs::rename (:625), and failure cleanup (:641). No normal GUI/CLI
+    caller of this exported non-ZIP API was found in this workspace.
+    core/zip_converter.rs:240 compress_verified and :332 extract_verified
+    explicitly return ApplyUnavailable; archive_workflow.rs:655/:660 ZIP
+    helpers also refuse. gui/zip_converter_page.rs:117/:118 reaches those
+    refused public APIs. Private ZIP implementation/test code is not evidence
+    that public ZIP Apply is enabled. Do not enable it as part of cooperation.
+    core/dat/archive/zip.rs:463 copy_zip_member_to, :782 extract_zip_members_to,
+    :930 extract_sole_zip_member are separate extraction writers. Real users
+    include Cemu/RPCS3/Dolphin package staging and DAT update private TempDir
+    extraction. They are not the disabled end-user ZIP converter API.
+
+C. Patch/mod/cheat publication
+------------------------------
+
+12. Standalone patch output and composition.
+    core/standalone_patch.rs:413 Apply -> patch_output_recovery publication
+    (:488); separately stages/publishes provenance (:589/:597/:599).
+    gui/local_mod_package_page.rs:1043 starts the actual background Apply.
+    core/patch_package_composition.rs:564 exported Apply sequences standalone
+    patches (:622) with intermediate staging/cleanup; no normal GUI/CLI caller
+    of composition Apply found. core/patch_output_recovery.rs:353 publishes
+    via exclusive staging and hard_link (:445/:481), cleanup :531, recover
+    :737 and Undo :790. Recovery/Undo are exported APIs with no explicit GUI/
+    CLI caller found. This engine has its own durable receipts, not R2 claims.
+
+13. Optical tree patch publication and loose IP.BIN.
+    core/patch_output_recovery/tree.rs:299 prepare, :442 publish, :475 Undo
+    use their own receipt lock (:367) and no-replace renames (:458/:480).
+    Dreamcast DCP/IP.BIN tree preparation (dreamcast_dcp_apply.rs:319/:729),
+    extent patch (:348 in dreamcast_extent_patch.rs), and Saturn patch (:379
+    in saturn_patch_apply.rs) prepare through this machinery. Sidecars and
+    staging cleanup are additional writes. optical_patch_tree.rs:132 copies
+    verified tree members into owned staging. No normal GUI/CLI callers found
+    for these tree publication APIs. Separately,
+    core/dreamcast_boot_evidence/ip_bin.rs:947 IpBinFilePlan::apply stages and
+    publishes a new loose output (:961); exported API, no UI/CLI caller found.
+
+14. Shared mod/cheat engine (different from rename_apply).
+    core/patch_manager/shared_transaction.rs:930 execute_shared_apply,
+    :937 execute_shared_materialized_apply -> :945 implementation;
+    :2109 execute_shared_rollback. It writes payloads, backups and journals
+    itself (e.g. :1285/:1986), without the R2 admission Bridge.
+    This is the principal family for texture packs, ordinary mods, many native
+    cheat/patch/trainer resources and bezel deployment. Preparation/extraction
+    wrappers can write owned staging before the shared executor.
+    Actual GUI calls include local_mod_package_page.rs:1590/:1666;
+    user_cheat_import_page.rs (multiple install/Undo families);
+    cheats_mods/controller.rs:2421/:2246;
+    onframe_install_session.rs:354/:426;
+    dolphin_texture_mod_page.rs:1409/:1546;
+    pcsx2_texture_mod_page.rs:401 Undo;
+    ppsspp_texture_mod_page.rs:230 Undo;
+    cemu_graphic_pack_page.rs:257/:358;
+    rpcs3_ordinary_mod_page.rs:253/:358.
+    CLI bsfree.rs:450/:660 Apply, :738 Undo uses it.
+    HackHash uses this engine, NOT standalone-patch publication:
+    core/identity_source/hackhash_apply.rs:195 prepares/verifies bytes then
+    execute_shared_materialized_apply; :365 Undo -> execute_shared_rollback.
+    gui/gui_v2/hackhash.rs:297/:648 are actual callers.
+    RetroArch bezel plan application stages image/config files before invoking
+    shared Apply (patch_manager/retroarch_bezel.rs:195/:253-255).
+
+15. Older cheat installer/rollback is another distinct active engine.
+    core/patch_manager/cheat_installer.rs:179 execute_cheat_install_run refuses
+    mutation in dry/unconfirmed mode; confirmed runs stage/publish via
+    rename_no_replace (:546), write backups (:633) and journal (:775).
+    cheat_rollback.rs:123/:413 implements separate reverse execution.
+    cli/main.rs:990/:1116 and cli/retroarch_cheat_setup.rs:203 invoke this
+    family. It cannot be covered solely by instrumenting shared_transaction.
+    Provider/catalogue/scan modules are not automatically installers:
+    patch_manager/user_cheat_import.rs inspection uses read-only opens;
+    archived_mod_package.rs / archive_mod_package.rs writes reviewed extraction
+    into private temporary directories before eventual shared publication.
+
+D. Links, generated library resources, launch resources
+-------------------------------------------------------
+
+16. Library views are independently mutable.
+    core/library_views.rs:1849 Apply, :2138 repair, :2158 remove symlinks;
+    default wrappers :2398/:2411/:2424. It creates directories, managed links
+    (temporary link/rename :2687), generated files (publication :2756 and
+    adjacent helpers), manifests and history without rename_apply/R2 admission.
+    Actual GUI library_view_controller.rs:364/:374/:387 and CLI
+    main.rs:1676/:1694/:1717. Link aliases can expose a selected object even
+    when creating the view does not rewrite the original payload.
+
+17. BIOS projection and ES-DE publication.
+    core/bios_projection.rs:790 Apply creates symlinks; :947 Undo removes
+    published links (:965). gui/bios_projection_page.rs:222/:280 invokes it.
+    core/launch/es_de_publish.rs:507 Apply, :554 recover, :577 Undo uses its own
+    atomic-text publication/cleanup for generated game-list resources; the
+    module explicitly explains separation from rename_apply. Playing-library
+    workflows call this and compensate library publication on failure.
+
+18. Launch resource workspaces, distinct from original ROM mutation.
+    core/launch/media_handoff.rs:174 prepare_multimedia_launch writes owned
+    playlists (:350/:358). retroarch_resource_projection.rs:512 materialize,
+    :630 cleanup, :668 command wrapper writes/copies/links owned resources.
+    cheat_runtime.rs:812 materialise, :1010 cleanup, :1191 execute, :1387 stale
+    cleanup manages payload/config workspaces and lifecycle markers.
+    safe_launch_sandbox/fs.rs and scummvm_execution/trainer_config.rs contain
+    additional fd-relative derived-workspace writes. They must be included if
+    'managed files' includes these outputs; they are not ordinary selected-ROM
+    renames. Spawned emulators may independently write saves, configs or game
+    resources; launching them does not enroll those later writes in R2.
+
+E. Save/card state and separately managed resources
+-------------------------------------------------
+
+19. Save snapshots/restores.
+    core/save_snapshots.rs:447 create_snapshot, :723 single-file restore,
+    :904 Undo copy/replace files with backups. No normal GUI/CLI direct caller
+    found for these exported APIs.
+    core/save_snapshots/tree_restore/safety.rs:558 directory restore,
+    :766 Undo, :787 recover wraps the inner tree_restore.rs engine (:790,
+    :1259, :1443), which publishes/restores files/directories and owns its own
+    quiescence/root locking. It is not R2 admission. No normal GUI/CLI direct
+    caller found for generic tree restore. These are separately critical
+    managed-state writers even if an initial ROM cooperation scope excludes them.
+
+20. PS2 memory-card export and guarded restore.
+    core/memory_card_inventory.rs:446 PSU export, :1600 single-file export;
+    gui/pcsx2_page.rs:785/:898 actual callers.
+    memory_card_inventory/restore_guard.rs:498 Apply, :816 Undo, :1043 recover
+    is the active guarded writer; gui/pcsx2_page.rs:1069 and
+    gui/pcsx2_page/restore_recovery.rs:250/:461 route Apply/Undo/recover.
+    The older unguarded memory_card_inventory.rs:1321/:1392 compatibility APIs
+    permanently refuse. Do not classify them as an available alternative or
+    enable them. Existing process-quiescence checks are not R2 authority claims.
+
+21. Emulator/install/bootstrap and mount-resource scope.
+    managed_emulator_install.rs, emulator_download.rs, emulator_update/safety.rs
+    and managed_appimage_bootstrap/* create/extract/install/rename binaries and
+    their owned resources. These are a separate managed-resource policy domain,
+    not ROM payload repair. They matter if 'all managed files' is literal.
+    lib.rs:8654/:8681 mount cleanup concerns empty dedicated mount directories;
+    external mounting processes are not thereby enrolled game-file writers.
+
+Config-only, metadata-only and read-only categories
+-------------------------------------------------
+
+These writes should be recorded, but grouping them with game payload operations
+merely because they call fs::write or a common atomic helper would misstate scope:
+
+* CLI rom-organise only manages master-root configuration.
+* GUI preferences/page state (e.g. rom_organisation_page.rs:776-822), setup
+  overrides, onboarding, bezel preferences, cheat reconciliation persistence,
+  view modes and library/provider configuration.
+* Identity/provider snapshots, DAT downloads/audit caches, archive index
+  (lib.rs:6984), art/thumbnail/PDF caches, mod downloads, cheat catalogues,
+  database/catalogue updates, database backup/restore and setup portability.
+  Some metadata influences later game mutation, so it is not semantically
+  irrelevant; it is not itself a selected game payload write.
+* read-only probes in storage_conversion.rs, archive RAR/LHA member inspection,
+  laserdisc verification, CUE evidence inspection and private temporary
+  inspection data (including amiga_adz.rs) are not game mutation engines.
+* mame_collection_analyser/corrections.rs and several regression-labelled files
+  in the raw hit list are test support, not user writer entry points.
+* Generic atomic_text, noclobber, dirsync and filesystem helper functions are
+  primitives shared by unrelated domains. Guarding a primitive does not supply
+  the transaction's complete object/name set or recovery/approval lifecycle.
+
+Confirmed baseline Undo-reporting defects (already sent to owner)
+----------------------------------------------------------------
+
+Linked libraries: gui/playing_library_page.rs:1031 generic rollback discards the
+nested RollbackOutcome on Ok(_). RomM :942 and RetroDECK :865 also handle only
+the outer io::Result. RetroDECK Apply compensation at :833 uses .err(), losing a
+failed/partial nested outcome. gui/gui_v2/backend.rs:806-808 then returns state;
+gui/gui_v2/mod.rs:1338-1349 checks destination_error and :1383-1391 can announce
+'Linked-library changes were undone safely.' after an unsuccessful nested Undo.
+Classic page actions route to these handlers too. RomM/RetroDECK status display
+at playing_library_page.rs:2061/:2180 can also select the green 'created' label
+for rollback failure. This is an actual source-level failure-reporting defect,
+not merely a missing R2 feature.
+
+PPSSPP textures: gui/ppsspp_texture_mod_page.rs:230 discards
+execute_shared_rollback's structured result; :242 unconditionally clears the
+applied receipt. Failed/partial Undo can lose visible recovery evidence and
+appear completed. The owner is implementing focused fixes and tests; this
+inventory does not accept those unreviewed changes.
+
+Counterexamples checked: CLI repair.rs:717/:807-815 checks the nested Undo
+outcome; GUI publisher-profile handling at :415 distinguishes fully rolled
+back from reconciliation; repair_history_page.rs:1531-1572 distinguishes
+FullyRolledBack/PartiallyRolledBack/Failed. No analogous CLI false-success defect
+was confirmed by this limited audit. That is not a proof for all CLI commands.
+
+Smallest feasible integration assessment
+----------------------------------------
+
+There is no truthful small change that makes all current GUI/CLI/background
+managed-file writers participate in the accepted R2 authority while also leaving
+R2 mutation disabled and introducing no new authority/engine. The authority is
+test-private, has no application bootstrap, and the Bridge deliberately cannot
+represent most operations above. Removing cfg(test), selecting a global lock
+directory, or adapting unsupported operations implicitly is production/security
+design work, not a wrapper-only correction.
+
+A hook around the ordinary rename executor could at most establish a bounded
+test-only property for supported operations. It misses exact-resume and
+quarantine direct loops, separate writer engines, staging/cleanup outside the
+hook, background and nested operations, backup/sidecar names, and recovery paths.
+Checking compact descriptors alone cannot discover a selected object's other
+aliases or claims in another directory. A separate 'legacy cooperative' lock
+would be a second authority unless it is explicitly the same designed authority
+with a defined enrollment/ownership lifecycle; it cannot be advertised as R2
+whole-application participation by analogy.
+
+Production same-version cooperation needs an explicit design for: shared
+GUI/CLI/background authority selection independent of profile/journal path;
+trusted registration/bootstrap and restart context; complete object and both-
+name/backup/sidecar/directory alias sets; operation scopes that span checks,
+publication, checkpoints, compensation and cleanup; nested/reentrant ownership;
+failure/uncertain-state claims retained until demonstrated terminal release;
+and adapters for the other journal models. The present regular-move Bridge does
+not supply those contracts for these families. Old/unaware/external writers and
+retained writable descriptors remain outside voluntary participation even after
+current-version enrollment, absent separately approved custody controls.
+
+The smallest justified bounded work now is to fix the confirmed Undo reporting
+and receipt-retention bugs, preserve the R2 disabled gate, retain this source
+inventory, and produce actual current/current legacy and old/external race
+characterizations with honest NOT PREVENTED outcomes. Further tests using the
+existing authority can prove narrowly enrolled test workers; they must not be
+presented as protection for production GUI/CLI writers. If whole-app cooperation
+is mandatory, this is a substantial architecture boundary requiring the owner's
+explicitly approved design and later independent review, not completion by
+claiming an executor-only guard covers every writer.
+
+Inventory task result: PASS WITH CONDITIONS as a source completeness aid.
+Whole-app same-version participation: NOT IMPLEMENTED / NOT PROVEN.
+Production R2 mutation/custody/anti-rollback activation: still BLOCKED.
+Prior acceptance of disabled commit 426bf2d9 remains unchanged. No independent
+Cargo/test execution or acceptance of the owner's new delta is claimed here.

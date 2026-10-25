@@ -17,6 +17,9 @@ use archivefs_core::identity_source::romm::config::RommSourceConfig;
 use archivefs_core::identity_source::romm::import::{
     AdaptivePagination, ImportProgress, PageSizeReduction,
 };
+use archivefs_core::identity_source::romm::linkage::{
+    RommLinkageDiagnostic, RommLinkageStatus, RommLinkageSummary,
+};
 use archivefs_core::identity_source::status::{ProviderState, ProviderStatus};
 use std::path::PathBuf;
 
@@ -49,7 +52,10 @@ fn real_counts() -> IdentityImportCounts {
         unmatched: 4,
         with_hashes: 36_000,
         with_artwork: 29_759,
+        with_cover: 0,
+        with_screenshot: 0,
         multi_file: 198,
+        with_game_information: 30_412,
     }
 }
 
@@ -65,10 +71,12 @@ fn config(enabled: bool, configured: bool) -> RommSourceConfig {
             vec![PathMapping {
                 provider_prefix: "roms".to_string(),
                 archivefs_prefix: PathBuf::from("/mnt/games/roms"),
+                provider_aliases: Vec::new(),
             }]
         } else {
             Vec::new()
         },
+        media_mapping: None,
         provider_path_kind: ProviderPathKind::ProviderRelative,
         token_path: configured.then(|| PathBuf::from("/home/user/.config/archivefs/romm-token")),
     }
@@ -100,12 +108,16 @@ fn snapshot(state: ProviderState, enabled: bool, configured: bool) -> RommSnapsh
         settings: ProviderSettings {
             source: config(enabled, configured),
             page_size: Some(100),
+            import_timeout_seconds: None,
         },
         status,
         artwork: artwork_stats(39, 2_434_474),
         token_available: configured,
         token_problem: None,
         cache_format_version: ready.then_some(1),
+        verify_summary: None,
+        media_coverage: None,
+        platform_media_coverage: Default::default(),
     }
 }
 
@@ -163,6 +175,123 @@ fn action_named(view: &RommCardView, prefix: &str) -> CardAction {
         .find(|action| action.label.starts_with(prefix))
         .unwrap_or_else(|| panic!("no action starting with {prefix:?}: {:?}", view.actions))
         .clone()
+}
+
+#[test]
+fn linkage_health_uses_plain_language_counts_and_is_read_only() {
+    let operation = RommOperation::CheckLinks {
+        local_paths: vec![PathBuf::from("/library/Game.gb")],
+    };
+    assert!(!operation.is_mutating());
+    assert!(!operation.uses_network());
+    assert!(!operation.reports_progress());
+    assert!(!RommOperation::PlanMappings.is_mutating());
+    assert!(!RommOperation::PlanMappings.uses_network());
+
+    let summary = RommLinkageSummary {
+        inspected: 100,
+        linked: 61,
+        no_import_cache: 7,
+        no_path_mapping: 8,
+        provider_path_unmapped: 9,
+        translated_elsewhere: 5,
+        stale_or_missing: 4,
+        unknown_platform: 3,
+        ambiguous: 2,
+        unresolved_other: 1,
+        ..Default::default()
+    };
+    let labels = linkage_summary_rows(&summary)
+        .into_iter()
+        .map(|row| format!("{} {}", row.label, row.value))
+        .collect::<Vec<_>>()
+        .join(" | ");
+    for expected in [
+        "Linked 61",
+        "No import/cache 7",
+        "No path mapping 8",
+        "Provider path unmapped 9",
+        "Translated elsewhere 5",
+        "Translated path missing / moved 4",
+        "Unknown platform 3",
+        "Ambiguous 2",
+    ] {
+        assert!(labels.contains(expected), "missing {expected}: {labels}");
+    }
+}
+
+#[test]
+fn mapping_preview_result_names_projection_and_requires_no_implicit_refresh() {
+    let plan = archivefs_core::identity_source::romm::mapping_plan::RommMappingPlan {
+        proposals: Vec::new(),
+        proposed_mappings: Vec::new(),
+        current_translatable: 12,
+        rescued_by_replacement: 8,
+        rescued_by_new_mapping: 3,
+        still_unmapped: 1,
+        unknown_platforms: 1,
+        ambiguous_or_conflicting: 0,
+    };
+    let result = build_result_view(
+        &RommOperation::PlanMappings,
+        Ok(&RommOperationOutcome::MappingPlan(Box::new(plan))),
+        false,
+    );
+    assert!(result.succeeded);
+    assert!(result.headline.contains("preview"));
+    assert!(result.notes.join(" ").contains("no configuration"));
+    assert_eq!(result.rows[1].value, "8");
+}
+
+#[test]
+fn linkage_health_problem_labels_are_actionable() {
+    for (status, label) in [
+        (RommLinkageStatus::NoImportCache, "No import/cache"),
+        (RommLinkageStatus::NoPathMapping, "No path mapping"),
+        (
+            RommLinkageStatus::TranslatedPathElsewhere,
+            "Translated elsewhere",
+        ),
+        (RommLinkageStatus::LocalPathMovedOrStale, "Moved/stale"),
+        (RommLinkageStatus::UnknownPlatform, "Unknown platform"),
+        (RommLinkageStatus::Ambiguous, "Ambiguous"),
+    ] {
+        assert_eq!(linkage_status_label(status), label);
+    }
+}
+
+#[test]
+fn linkage_result_is_bounded_and_declares_what_it_did_not_touch() {
+    let report = archivefs_core::identity_source::romm::linkage::RommLinkageReport {
+        summary: RommLinkageSummary {
+            inspected: 32,
+            no_import_cache: 32,
+            ..Default::default()
+        },
+        problems: (0..32)
+            .map(|index| RommLinkageDiagnostic {
+                status: RommLinkageStatus::NoImportCache,
+                reason_code: "no_import_cache",
+                explanation: "No RomM identity data has been imported yet.".to_string(),
+                local_path: PathBuf::from(format!("/library/{index}.gb")),
+                provider_game_id: None,
+                provider_platform_slug: None,
+                provider_path: None,
+                translated_local_path: None,
+                canonical_platform: None,
+            })
+            .collect(),
+    };
+    let result = build_result_view(
+        &RommOperation::CheckLinks {
+            local_paths: Vec::new(),
+        },
+        Ok(&RommOperationOutcome::Linkage(Box::new(report))),
+        false,
+    );
+    assert!(result.succeeded);
+    assert!(result.notes[0].contains("Read-only check"));
+    assert_eq!(result.rows.len(), 10);
 }
 
 // --- Card states ----------------------------------------------------------
@@ -564,6 +693,65 @@ fn the_rendered_card_draws_the_real_counts() {
     }
 }
 
+#[test]
+fn the_rendered_card_draws_linkage_health_summary() {
+    let view = build_card_view(
+        Some(&snapshot(ProviderState::Ready, true, true)),
+        None,
+        false,
+    );
+    let mut state = RommCardState {
+        linkage_report: Some(Box::new(
+            archivefs_core::identity_source::romm::linkage::RommLinkageReport {
+                summary: RommLinkageSummary {
+                    inspected: 12,
+                    linked: 8,
+                    no_import_cache: 4,
+                    ..Default::default()
+                },
+                problems: Vec::new(),
+            },
+        )),
+        ..RommCardState::default()
+    };
+    let context = egui::Context::default();
+    let output = context.run(egui::RawInput::default(), |context| {
+        egui::CentralPanel::default().show(context, |ui| {
+            let _ = show_romm_source_card(ui, &view, &mut state, None);
+        });
+    });
+    for expected in [
+        "RomM Linkage Health",
+        "Check RomM links",
+        "Linked:",
+        "No import/cache:",
+    ] {
+        assert!(
+            rendered_text_contains(&output, expected),
+            "the linkage health surface did not draw {expected:?}"
+        );
+    }
+}
+
+#[test]
+fn mapping_review_is_visible_without_a_completed_linkage_check() {
+    let view = build_card_view(
+        Some(&snapshot(ProviderState::ReadyOffline, true, true)),
+        None,
+        false,
+    );
+    let mut state = RommCardState::default();
+    let context = egui::Context::default();
+    let output = context.run(egui::RawInput::default(), |context| {
+        egui::CentralPanel::default().show(context, |ui| {
+            let _ = show_romm_source_card(ui, &view, &mut state, None);
+        });
+    });
+
+    assert!(rendered_text_contains(&output, "Check RomM links"));
+    assert!(rendered_text_contains(&output, "Review path mappings"));
+}
+
 /// The same helper the shared widgets' own tests use.
 fn rendered_text_contains(output: &egui::FullOutput, needle: &str) -> bool {
     fn shape_contains(shape: &egui::Shape, needle: &str) -> bool {
@@ -706,6 +894,8 @@ fn import_summary(published: bool, records: usize) -> RommImportSummary {
         unknown_platforms: 0,
         invalid_hashes: 0,
         multi_file_groups: 5,
+        with_game_information: records.saturating_sub(2),
+        game_information_failed: 1,
         pages_fetched: 1,
         elapsed_milliseconds: 612,
         adaptive: None,
@@ -714,6 +904,39 @@ fn import_summary(published: bool, records: usize) -> RommImportSummary {
         previous_cache_usable: true,
         platform_enrichment: None,
     }
+}
+
+#[test]
+fn verify_summary_uses_import_aggregates_without_records() {
+    let summary = import_summary(true, 94_000);
+    let verify = VerifyRommSummary::from_import(&summary);
+
+    assert_eq!(verify.total, 94_000);
+    assert_eq!(verify.strong, 21);
+    assert_eq!(verify.probable, 3);
+    assert_eq!(verify.stale, 1);
+    assert_eq!(verify.ambiguous, 0);
+}
+
+#[test]
+fn verify_summary_empty_cache_is_explicitly_empty() {
+    let counts = IdentityImportCounts::default();
+    assert_eq!(
+        VerifyRommSummary::from_counts(&counts),
+        VerifyRommSummary::default()
+    );
+}
+
+#[test]
+fn verify_summary_replacement_is_deterministic() {
+    let first = import_summary(true, 10);
+    let second = import_summary(true, 20);
+
+    assert_ne!(
+        VerifyRommSummary::from_import(&first),
+        VerifyRommSummary::from_import(&second)
+    );
+    assert_eq!(VerifyRommSummary::from_import(&second).total, 20);
 }
 
 #[test]
@@ -752,6 +975,44 @@ fn a_sample_result_says_plainly_that_nothing_was_published() {
     assert!(
         !rows.contains(&"Published to".to_string()),
         "a sample has no cache path"
+    );
+}
+
+#[test]
+fn a_completed_import_reports_game_information_counts_using_human_wording() {
+    // records = 25, with_game_information = 23 (records - 2, from
+    // import_summary), game_information_failed = 1 - so "not found" must be
+    // the derived 25 - 23 = 2, never a raw internal field name.
+    let summary = import_summary(true, 25);
+    let view = build_result_view(
+        &RommOperation::Refresh,
+        Ok(&RommOperationOutcome::Import(Box::new(summary))),
+        false,
+    );
+    let by_label: std::collections::HashMap<String, String> = view
+        .rows
+        .iter()
+        .map(|row| (row.label.clone(), row.value.clone()))
+        .collect();
+    assert_eq!(
+        by_label.get("Game information found").map(String::as_str),
+        Some("23")
+    );
+    assert_eq!(
+        by_label
+            .get("Game information not found")
+            .map(String::as_str),
+        Some("2")
+    );
+    assert_eq!(
+        by_label.get("Game information failed").map(String::as_str),
+        Some("1")
+    );
+    let labels = by_label.keys().collect::<Vec<_>>();
+    assert!(
+        labels.iter().all(|label| !label.contains("enrichment")),
+        "the result panel must use human wording (\"game information\"), not the internal \
+         term \"enrichment\": {labels:?}"
     );
 }
 
@@ -897,6 +1158,49 @@ fn a_failed_import_says_whether_the_old_cache_survived() {
         first.notes.join(" ").contains("no previous cache to lose"),
         "{:?}",
         first.notes
+    );
+}
+
+#[test]
+fn a_detail_request_timeout_gets_its_own_plain_sentence_up_front() {
+    // A bare "RomM did not answer in time" says nothing about what to make
+    // of it. The specific failure code gets a plain, visible sentence
+    // instead - the technical offset/endpoint detail stays in the rows,
+    // behind Technical details.
+    let mut summary = import_summary(false, 0);
+    summary.failure = Some(
+        "`GET /api/roms?limit=100&offset=6800&with_files=true` did not answer within 240 \
+         seconds. Nothing was published and any previous cache is untouched."
+            .to_string(),
+    );
+    summary.failure_code = Some("detail_request_timed_out".to_string());
+    summary.previous_cache_usable = true;
+    let view = build_result_view(
+        &RommOperation::Refresh,
+        Ok(&RommOperationOutcome::Import(Box::new(summary))),
+        false,
+    );
+    assert!(!view.succeeded);
+    let visible = view.notes.first().cloned().unwrap_or_default();
+    assert!(
+        visible.contains("RomM took too long to return one catalogue record"),
+        "{visible}"
+    );
+    assert!(
+        visible.contains("untouched and still browsable"),
+        "the visible sentence should still say the cache is safe, not just the offset: {visible}"
+    );
+    assert!(
+        !visible.contains("offset=6800"),
+        "the raw endpoint/offset is technical detail, not the plain sentence: {visible}"
+    );
+    assert!(
+        view.rows
+            .iter()
+            .any(|row| row.value.contains("offset=6800")),
+        "the endpoint/offset must still be available somewhere (rows, shown behind Technical \
+         details): {:?}",
+        view.rows
     );
 }
 

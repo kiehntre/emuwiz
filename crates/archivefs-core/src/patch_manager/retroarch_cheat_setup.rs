@@ -15,7 +15,8 @@ use sha2::{Digest, Sha256};
 use crate::emulator_environment::retroarch::{
     AppImageIdentificationConfidence, ConfigAssociation, ConfigReadOutcome, Diagnostic,
     DiscoveryEnvironment, ExecutableState, PathPurpose, ProfileKind, ProfileScope, ResolutionState,
-    RetroArchEnvironmentReport, RetroArchProfile, discover_retroarch_environment,
+    RetroArchEnvironmentReport, RetroArchProfile,
+    discover_retroarch_environment_with_core_directory_override,
 };
 use crate::emulator_environment::{EncodedPath, FsProbe, ReadOnlyHostFilesystem};
 
@@ -259,7 +260,30 @@ pub fn discover_retroarch_cheat_setup_profiles(
     environment: &DiscoveryEnvironment,
     configuration_override: Option<&Path>,
 ) -> Result<RetroArchCheatSetupDiscovery, RetroArchCheatSetupError> {
-    let report = discover_retroarch_environment(filesystem, environment).map_err(|error| {
+    discover_retroarch_cheat_setup_profiles_with_core_directory_override(
+        filesystem,
+        environment,
+        configuration_override,
+        None,
+    )
+}
+
+/// Like [`discover_retroarch_cheat_setup_profiles`], but threading an
+/// explicit EmuWiz core-directory override through to
+/// [`discover_retroarch_environment_with_core_directory_override`]. `None`
+/// is identical to the plain call. `retroarch.cfg` is never written.
+pub fn discover_retroarch_cheat_setup_profiles_with_core_directory_override(
+    filesystem: &dyn ReadOnlyHostFilesystem,
+    environment: &DiscoveryEnvironment,
+    configuration_override: Option<&Path>,
+    core_directory_override: Option<&Path>,
+) -> Result<RetroArchCheatSetupDiscovery, RetroArchCheatSetupError> {
+    let report = discover_retroarch_environment_with_core_directory_override(
+        filesystem,
+        environment,
+        core_directory_override,
+    )
+    .map_err(|error| {
         RetroArchCheatSetupError::new("retroarch_discovery_failed", error.to_string())
     })?;
     let profiles = report
@@ -764,6 +788,7 @@ mod tests {
                 system_flatpak_root: self.root.join("system-flatpak"),
                 app_image_search_roots: vec![self.root.join("Applications")],
                 desktop_file_roots: vec![self.root.join("applications")],
+                explicit_executables: Vec::new(),
             }
         }
 
@@ -780,7 +805,7 @@ mod tests {
             )
             .unwrap();
             let executable = bin.join("retroarch");
-            fs::write(&executable, b"test executable").unwrap();
+            fs::write(&executable, b"\x7fELFtest executable").unwrap();
             #[cfg(unix)]
             {
                 use std::os::unix::fs::PermissionsExt;
@@ -1094,6 +1119,101 @@ mod tests {
                 .collect::<Vec<_>>()
         );
         assert_eq!(snapshot_paths(&fixture.root), before);
+    }
+
+    /// The override provenance lands on the affected *profile*'s diagnostics
+    /// (report-level diagnostics stay untouched), so check across profiles.
+    fn any_profile_diagnostic(discovery: &RetroArchCheatSetupDiscovery, code: &str) -> bool {
+        discovery
+            .environment
+            .profiles
+            .iter()
+            .flat_map(|profile| profile.diagnostics.iter())
+            .any(|diagnostic| diagnostic.code == code)
+    }
+
+    #[test]
+    fn no_core_directory_override_matches_the_plain_cheat_setup_discovery() {
+        let fixture = Fixture::new("core-override-none");
+        let environment = fixture.native();
+        let plain =
+            discover_retroarch_cheat_setup_profiles(&HostReadOnlyFilesystem, &environment, None)
+                .unwrap();
+        let explicit_none = discover_retroarch_cheat_setup_profiles_with_core_directory_override(
+            &HostReadOnlyFilesystem,
+            &environment,
+            None,
+            None,
+        )
+        .unwrap();
+        assert_eq!(
+            plain
+                .diagnostics
+                .iter()
+                .map(|diagnostic| diagnostic.code)
+                .collect::<Vec<_>>(),
+            explicit_none
+                .diagnostics
+                .iter()
+                .map(|diagnostic| diagnostic.code)
+                .collect::<Vec<_>>()
+        );
+        assert!(
+            !any_profile_diagnostic(&plain, "retroarch_core_directory_override_applied")
+                && !any_profile_diagnostic(&plain, "retroarch_core_directory_override_unusable"),
+            "the plain path must not synthesise override diagnostics"
+        );
+    }
+
+    #[test]
+    fn a_persisted_core_directory_override_is_threaded_into_discovery_without_touching_disk() {
+        let fixture = Fixture::new("core-override-usable");
+        let environment = fixture.native();
+        // Any real directory is a usable override target - discovery only
+        // redirects the Cores purpose, it never rewrites retroarch.cfg.
+        let override_dir = fixture.root.join("emuwiz-core-override");
+        fs::create_dir_all(&override_dir).unwrap();
+        let before = snapshot_paths(&fixture.root);
+
+        let discovery = discover_retroarch_cheat_setup_profiles_with_core_directory_override(
+            &HostReadOnlyFilesystem,
+            &environment,
+            None,
+            Some(override_dir.as_path()),
+        )
+        .unwrap();
+
+        assert!(
+            any_profile_diagnostic(&discovery, "retroarch_core_directory_override_applied"),
+            "the persisted override must reach the core discovery hook"
+        );
+        assert_eq!(
+            snapshot_paths(&fixture.root),
+            before,
+            "applying an override must not create or modify any file"
+        );
+    }
+
+    #[test]
+    fn a_persisted_but_missing_core_directory_override_is_flagged_and_never_falls_back() {
+        let fixture = Fixture::new("core-override-missing");
+        let environment = fixture.native();
+        let missing = fixture.root.join("does-not-exist");
+
+        let discovery = discover_retroarch_cheat_setup_profiles_with_core_directory_override(
+            &HostReadOnlyFilesystem,
+            &environment,
+            None,
+            Some(missing.as_path()),
+        )
+        .unwrap();
+
+        assert!(
+            any_profile_diagnostic(&discovery, "retroarch_core_directory_override_unusable"),
+            "a missing override directory must be surfaced, not silently ignored"
+        );
+        // No panic, and the profile list is still produced.
+        assert!(!discovery.profiles.is_empty());
     }
 
     fn snapshot_paths(root: &Path) -> Vec<PathBuf> {

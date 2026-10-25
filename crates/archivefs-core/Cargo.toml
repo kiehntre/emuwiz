@@ -4,6 +4,7 @@ version.workspace = true
 edition.workspace = true
 
 [dependencies]
+ring = "0.17"
 serde = { version = "1", features = ["derive"] }
 # Library Views manifests (crates::library_views): a per-view JSON record
 # of every managed symlink, read/written wholesale on every plan/apply -
@@ -11,6 +12,12 @@ serde = { version = "1", features = ["derive"] }
 # suits it better than another hand-rolled parser. Already an existing,
 # well-established dependency of archivefs-cli.
 serde_json = "1"
+# Recovered EmuWiz release checker uses strict SemVer precedence.
+semver = "1"
+# Local homebrew title/description search: canonical Unicode normalization
+# and full default case folding, including composed accents and sharp-s.
+caseless = "0.2.2"
+unicode-normalization = "0.1"
 log = "0.4"
 libc = "0.2"
 notify = "8"
@@ -24,7 +31,7 @@ sha2 = "0.11.0"
 # primitive - they exist only to compare identifiers.
 sha1 = "0.11.0"
 md-5 = "0.11.0"
-rusqlite = { version = "0.40.1", default-features = false, features = ["bundled"] }
+rusqlite = { version = "0.40.1", default-features = false, features = ["backup", "bundled"] }
 ureq = { version = "3.3", default-features = false, features = ["rustls"] }
 http = "1"
 url = "2"
@@ -41,10 +48,10 @@ encoding_rs = "0.8"
 # the thumbnail cache be tested without a window.
 #
 # Keep the codec surface deliberately limited; the GUI only ever reads
-# EmuWiz-owned PNG output. `jpeg` is here because an imported artwork file
-# may be one. WebP is magic-detected and refused until its optional decoder can
-# be supplied by the build.
-image = { version = "0.25.10", default-features = false, features = ["png", "jpeg"] }
+# EmuWiz-owned derived PNG output and bounded local bezel validation. JPEG and
+# WebP are enabled because local bezel sources may use either format; output
+# written to EmuWiz's cache remains PNG.
+image = { version = "0.25.10", default-features = false, features = ["png", "jpeg", "webp"] }
 # Xenia Canary patch files (`*.patch.toml`): parsed as bounded, generic
 # TOML syntax via this crate, then mapped through our own strict,
 # schema-specific validator - see patch_manager::xenia_patch_document.
@@ -56,16 +63,149 @@ toml = { version = "0.8", default-features = false, features = ["parse", "displa
 # No DTD or entity expansion support is enabled; DOCTYPE and entities
 # are explicitly rejected by the parser rather than relying on the
 # crate's own limits.
-quick-xml = { version = "0.41", default-features = false }
+quick-xml = { version = "0.41", default-features = false, features = ["serialize"] }
 # Archive Inspector (read-only ZIP listing): a small, focused, well
 # established crate rather than hand-parsed ZIP structure or shelling out
 # to `unzip`/`7z`. Production code only ever lists entry metadata via
 # `ZipArchive::by_index_raw` - it never decompresses anything - so no
 # codec feature (deflate/bzip2/lzma/zstd/aes-crypto/...) is enabled here;
 # see the `[dev-dependencies]` entry below for why tests need more.
-zip = { version = "8.6", default-features = false, features = ["deflate"] }
+zip = { version = "9.0", default-features = false, features = ["deflate"] }
+# Internal CBR (RAR4/RAR5) page reader (manual_document::rar_pages). Pure Rust,
+# no `unsafe`, no C code, no build script, no runtime download or spawned tool.
+# Pinned exactly: 0.10.2 is the first release carrying the parse/output/
+# workspace limits and cancellation the reader relies on. Default features
+# (write, parallel, recovery, encryption) are off: read-only, sequential, and
+# no crypto or rayon. Licence Apache-2.0; ship its COPYING/NOTICE text with any binary release.
+rars = { version = "=0.10.2", default-features = false }
+# ZIP member streams are decoded from preflight-validated packed ranges rather
+# than `ZipArchive`'s name-keyed index (which collapses duplicate names).
+flate2 = { version = "1", default-features = false, features = ["zlib-rs"] }
+# Universal source ingestion (read-only TAR listing): pure-Rust, used only
+# to enumerate entry names for content classification - never unpacks.
+tar = { version = "0.4", default-features = false }
+# Experimental 7z archive-member reader (POST-ALPHA-1.1, zero production
+# callers). `sevenz-rust2` is the maintained fork of the (now unmaintained,
+# advisory-carrying) `sevenz-rust`; it is pure Rust, Apache-2.0. The
+# production build deliberately enables NO features at all
+# (`default-features = false` drops upstream's default
+# `aes256`/`bzip2`/`compress`/`ppmd`/`util` set): no writer (`compress`), no
+# `bzip2`, no `ppmd`, no `aes256`, and — importantly — no `util`, which is
+# the feature gating the `decompress*` extract-to-disk convenience helpers.
+# With `util` off those functions are not even compiled into the production
+# build, so the path-traversal class of defect that plagued the old crate's
+# `decompress_impl` cannot be reached from here at all.
+#
+# Encrypted 7z headers/members therefore surface as
+# `UnsupportedCompressionMethod("AES256_SHA256")` at decode time, which this
+# reader maps to an explicit Encrypted refusal. `zstd`, `brotli`, `lz4`,
+# `deflate`, `bzip2` and `ppmd` coders are likewise always refused.
+# The 7z implementation remains inert: the production DAT audit added after
+# this comment was written calls only the ZIP source.
+# (see docs/research/SEVEN_Z_RAR_ARCHIVE_VERIFICATION_RESEARCH.md §12).
+sevenz-rust2 = { version = "0.21.4", default-features = false }
+chd = "0.3.4"
+# Backs two independent features - see `[features]` below and each
+# feature's own module doc comment (`crate::dreamcast_cdi`,
+# `crate::chd_optical_specialist`):
+#
+# - `dreamcast-cdi` (default-on): pure-Rust Dreamcast DiscJuggler `.cdi`
+#   identity support via `opticaldiscs::discjuggler`, which carries no
+#   feature gate of its own inside `opticaldiscs` and pulls in no
+#   native/C++ code.
+# - `chd-optical-specialist` (opt-in): additionally turns on
+#   `opticaldiscs`'s own `chd` feature, which pulls in `libchdman-rs` - a
+#   native build of MAME's own `chd_file`/`cdrom_file` C++ core
+#   (BSD-3-Clause), by default via a prebuilt static archive fetched at
+#   build time, not compiled from source.
+#
+# No `features = [...]` is hardcoded here deliberately: which of
+# `opticaldiscs`'s own features get enabled is controlled entirely by
+# which of *our* features below are active, via Cargo's normal
+# dependency-feature unification (`"opticaldiscs/chd"`), so the two stay
+# fully independent. Every other path in this crate (including the
+# pure-Rust `chd_logical_media` reader) builds and passes its own tests
+# with `chd-optical-specialist` off.
+opticaldiscs = { version = "0.15", default-features = false, optional = true }
+# GameCube/Wii disc structure (game ID, disc header, partition table, FST,
+# apploader, main.dol) - pure Rust, no native/C dependency with default
+# features disabled. Reused rather than hand-writing a GC/Wii optical
+# filesystem stack from scratch; only structural/header facts are read,
+# never Wii partition decryption (no keys are available to this crate).
+#
+# `compress-zstd` (Batch 6): enabled so real RVZ images (Dolphin's
+# zstd-compressed disc-image format; every real .rvz specimen checked this
+# session declares WIA/RVZ compression_type=5/Zstd) can actually be read,
+# not just uncompressed WBFS/ISO. `compress-bzip2`/`compress-lzma` are
+# deliberately left disabled: no real specimen in this project's corpus
+# uses them, and unlike zstd (already a real, compiled dependency of this
+# crate via `zip`'s own default `zstd`/`zstd-safe`/`zstd-sys` 0.13.3/7.2.4/
+# 2.0.16 - this feature adds zero new crates to the dependency graph),
+# `compress-bzip2` would pull a second, different major version of the
+# `bzip2` crate (nod wants 0.4.x; `zip` already uses 0.6.1) and
+# `compress-lzma` would activate a currently-inactive native `liblzma`
+# build - real new native/build surface this milestone's own "no
+# unnecessary feature explosion" instruction says not to add without a
+# real specimen justifying it.
+nod = { version = "1.4.4", default-features = false, features = ["compress-zstd"] }
+# Original Xbox/Xbox 360 XDVDFS filesystem - pure Rust, `read`+`std`+`sync`
+# only (no `write`/`wax`/crypto). `sync` turns the crate's `maybe_async` API
+# (built on `async-trait`) into plain synchronous functions via
+# `maybe-async/is_sync`, so this crate never needs an async executor just to
+# call them; the alternative (hand-writing our own `async fn`
+# `BlockDeviceRead` impl to add read-budget cycle protection, matching the
+# crate's own `async-trait`-generated trait shape) is materially more
+# fragile than accepting `sync`'s one transitive side effect: it also
+# unconditionally enables the crate's own optional `ciso` (ISO compression)
+# feature via `ciso/sync`, which is unused here but adds only pure-Rust code
+# (`ciso`, `lz4_flex`, `ruzstd`, `twox-hash`, `arbitrary-int`, `bitbybit`) -
+# no native/C dependency. Reused rather than hand-writing an XDVDFS
+# filesystem stack from scratch.
+xdvdfs = { version = "0.8.3", default-features = false, features = ["read", "std", "sync"] }
+# Read-only Amiga OFS/FFS traversal.  The crate is MIT-licensed and is used
+# solely through its `BlockDevice` trait, which our partition-range adapter
+# backs with positional reads and a hard read budget.
+affs-read = "0.4.1"
+tempfile = "3"
+
+[features]
+default = ["dreamcast-cdi"]
+# Pure-Rust Dreamcast DiscJuggler `.cdi` identity support - see
+# `crate::dreamcast_cdi`'s module documentation and the `opticaldiscs`
+# dependency comment above. No native/C++ dependency.
+dreamcast-cdi = ["dep:opticaldiscs"]
+# Optional specialist optical-disc backend (crate::chd_optical_specialist) -
+# multi-track/GD-ROM CHD via opticaldiscs's own `chd` feature (native
+# libchdman-rs/MAME core). Independent of `dreamcast-cdi`: enabling this
+# alone does not enable CDI, and enabling `dreamcast-cdi` alone pulls in
+# no native code.
+chd-optical-specialist = ["dep:opticaldiscs", "opticaldiscs/chd"]
+# Test-binary environment isolation (`crate::test_environment`). Enabled only
+# from `[dev-dependencies]`, so no release or ordinary build contains it.
+test-support = []
 
 [dev-dependencies]
+# Existing Ed25519 protocol; only the enrolled unit-test path uses these.
+getrandom = "0.3"
+# Integration tests link the library without `cfg(test)`; this self-dependency
+# turns on the test-support feature for them (and only for test builds).
+archivefs-core = { path = ".", features = ["test-support"] }
+# Test builds only: expose chd's codec API so tests/chd_zstd_ruzstd_bounds.rs can
+# exercise the vendored chd Zstandard codecs directly. Adds no new package.
+chd = { version = "0.3.4", features = ["codec_api"] }
+# Same crate, fuller feature set: only test fixtures need to *write* 7z
+# files (solid, encrypted, multi-member) to exercise the read-only reader
+# against real archives. Cargo unifies features for one crate across
+# `[dependencies]`/`[dev-dependencies]` only within a build that includes
+# both (`cargo test`) - a plain `cargo build --release` never links the
+# writer or the AES code. `default-features = false` is kept here too, so
+# even the test build never compiles the `util` extract-to-disk helpers:
+# only `compress` (the `ArchiveWriter`) and `aes256` (the fixture that
+# writes an AES-encrypted member) are added.
+sevenz-rust2 = { version = "0.21.4", default-features = false, features = [
+    "compress",
+    "aes256",
+] }
 # Same crate, fuller feature set: only test fixtures need to *write* zip
 # files (including a deflated and a password-encrypted one) to exercise
 # the read-only inspector against real archives. Cargo unifies features
@@ -73,5 +213,16 @@ zip = { version = "8.6", default-features = false, features = ["deflate"] }
 # a build that includes both (`cargo test`) - a plain `cargo build
 # --release` (no test targets) never links any codec this crate does not
 # itself need.
-zip = { version = "8.6", features = ["deflate", "aes-crypto"] }
-tempfile = "3"
+zip = { version = "9.0", features = ["deflate", "aes-crypto"] }
+# Test builds only: synthesise small RAR4/RAR5 CBR fixtures (no proprietary rar
+# tool, no third-party archives). The reader under test never uses this feature.
+rars = { version = "=0.10.2", default-features = false, features = ["write", "encryption"] }
+
+[target.'cfg(target_os = "linux")'.dependencies]
+# PDF rasterization runs only in an independently resource-limited process.
+# MIT/Apache-2.0; no native PDF engine or embedded actions/scripts.
+hayro = { version = "=0.8.0", default-features = false, features = ["embed-fonts", "embed-cmaps"] }
+
+[[example]]
+name = "verified_game_profile"
+required-features = ["test-support"]

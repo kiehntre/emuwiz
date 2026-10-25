@@ -1,0 +1,3475 @@
+//! Checksum-backed MAME merged-set reconstruction.
+//!
+//! This is deliberately a new projection over the current MAME join/evidence
+//! model.  It does not use the historical `mame_normalizer` plan, its repair
+//! journal, or filename-based ownership rules.  A plan is pure data and is
+//! safe to display before an explicit apply decision.
+
+use std::collections::{BTreeMap, BTreeSet};
+use std::path::{Path, PathBuf};
+use std::sync::atomic::AtomicBool;
+
+use serde::{Deserialize, Serialize};
+
+use crate::dat::archive::ArchiveMemberSource;
+use crate::safe_read::TrustedRoots;
+
+use super::mame_arcade_join::{ArcadeJoinClass, ArcadeJoinEvidence};
+use super::model::{DatRomEntry, ParsedDat};
+
+/// Durable journal marker used by GUI-v2 and recovery history to distinguish
+/// MAME reconstruction transactions from the other rename-based workflows.
+pub const MAME_RECONSTRUCTION_WORKFLOW: &str = "mame_merged_reconstruction";
+pub const MAX_RECONSTRUCTION_STAGED_BYTES: u64 = 16 * 1024 * 1024 * 1024;
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ReconstructionMemberRequirement {
+    pub owner_set: String,
+    pub member_name: String,
+    pub size_bytes: Option<u64>,
+    pub sha1: Option<String>,
+    pub crc32: Option<String>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SourceArchiveIdentity {
+    pub size_bytes: u64,
+    pub modified_unix_nanos: Option<u128>,
+}
+
+impl SourceArchiveIdentity {
+    pub fn of(path: &Path) -> Option<Self> {
+        let metadata = std::fs::metadata(path).ok()?;
+        Some(Self {
+            size_bytes: metadata.len(),
+            modified_unix_nanos: metadata
+                .modified()
+                .ok()
+                .and_then(|time| time.duration_since(std::time::UNIX_EPOCH).ok())
+                .map(|elapsed| elapsed.as_nanos()),
+        })
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ReconstructionMemberSource {
+    /// Size and modification time of a packed source archive when the plan was
+    /// made. Staging refuses a changed archive and asks for a new preview; the
+    /// member's own checksum is still verified either way.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub archive_identity: Option<SourceArchiveIdentity>,
+    pub archive_path: PathBuf,
+    pub member_path: PathBuf,
+    pub current_name: String,
+    pub target_name: String,
+    pub observed_sha1: Option<String>,
+    pub observed_crc32: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct MameMergedReconstructionPlan {
+    pub dat_version: String,
+    pub dat_sha256: String,
+    pub parent: String,
+    pub clones: Vec<String>,
+    pub destination: PathBuf,
+    pub required_members: Vec<ReconstructionMemberRequirement>,
+    pub sources: Vec<ReconstructionMemberSource>,
+    pub missing_members: Vec<String>,
+    pub duplicate_candidates: Vec<String>,
+    pub hash_mismatches: Vec<String>,
+    pub unresolved_ownership: Vec<String>,
+    pub collisions: Vec<String>,
+    pub ready_to_apply: bool,
+    pub reasons: Vec<String>,
+}
+
+impl MameMergedReconstructionPlan {
+    pub fn blocked(&self) -> bool {
+        !self.ready_to_apply
+    }
+}
+
+/// Explicit publication action; replacement retains the exact original at the
+/// transaction's staged source path for undo. No authority is inferred from a name.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ReconstructionPublicationAction {
+    Create,
+    ReplaceExisting {
+        original: super::rename_apply::model::ObjectIdentity,
+    },
+    Unchanged {
+        current: super::rename_apply::model::ObjectIdentity,
+    },
+}
+
+/// A read-only, source/target-bound publication review over the canonical family
+/// plan. Private fields prevent changing requirements after review. The ordinary
+/// family planner and its ownership/duplicate/missing-member rules are unchanged.
+#[derive(Debug)]
+pub struct ReviewedReconstructionPublication {
+    plan: MameMergedReconstructionPlan,
+    action: ReconstructionPublicationAction,
+    sources: Vec<(PathBuf, super::rename_apply::model::ObjectIdentity)>,
+}
+
+impl ReviewedReconstructionPublication {
+    pub fn action(&self) -> &ReconstructionPublicationAction {
+        &self.action
+    }
+    pub fn plan(&self) -> &MameMergedReconstructionPlan {
+        &self.plan
+    }
+
+    fn revalidate(&self) -> Result<(), String> {
+        use super::rename_apply::identity::{capture_identity, identity_matches};
+        for (path, expected) in &self.sources {
+            let actual = capture_identity(path).map_err(|e| e.to_string())?;
+            if !identity_matches(expected, &actual) {
+                return Err("stale reconstruction source; review again".into());
+            }
+        }
+        match &self.action {
+            ReconstructionPublicationAction::Create => {
+                if std::fs::symlink_metadata(&self.plan.destination).is_ok() {
+                    return Err("stale reconstruction destination; review again".into());
+                }
+            }
+            ReconstructionPublicationAction::ReplaceExisting { original: expected }
+            | ReconstructionPublicationAction::Unchanged { current: expected } => {
+                let actual = capture_identity(&self.plan.destination).map_err(|e| e.to_string())?;
+                if !identity_matches(expected, &actual) {
+                    return Err("stale reconstruction target; review again".into());
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// Explicitly apply this reviewed plan. `None` is a verified no-op, without
+    /// staging or journal writes. Otherwise return the canonical outcome/undo
+    /// receipt; callers must inspect its transaction state before reporting success.
+    pub fn apply(
+        &self,
+        staging_root: &Path,
+        journal_dir: &Path,
+    ) -> Result<Option<super::rename_apply::executor::ApplyOutcome>, String> {
+        self.revalidate()?;
+        if matches!(
+            self.action,
+            ReconstructionPublicationAction::Unchanged { .. }
+        ) {
+            return Ok(None);
+        }
+        let mut guard = owned_attempt::PublicationGuard::new(staging_root, journal_dir)?;
+        guard.check_leftovers(&self.plan.parent)?;
+        let staged = stage_owned_output_with(
+            &self.plan,
+            staging_root,
+            &free_space_bytes,
+            Some(std::sync::Arc::clone(&guard.staging)),
+        )?;
+        self.revalidate()
+            .map_err(|e| staged.failure(&self.plan.parent, e))?;
+        let operation = match &self.action {
+            ReconstructionPublicationAction::ReplaceExisting { original } => {
+                super::rename_apply::model::TransactionOperation::ReplaceExisting {
+                    original_identity: original.clone(),
+                    destination_root: self
+                        .plan
+                        .destination
+                        .parent()
+                        .ok_or("target parent missing")?
+                        .to_owned(),
+                }
+            }
+            _ => Default::default(),
+        };
+        publish_staged(
+            &self.plan,
+            &staged,
+            staging_root,
+            journal_dir,
+            operation,
+            &mut guard,
+        )
+        .map_err(|e| staged.failure(&self.plan.parent, e))
+        .map(Some)
+    }
+}
+
+/// Review publication separately from family evidence, without changing DAT
+/// authority. An incomplete target needs a matching current DAT join AND at
+/// least one live checksum-proven parent-owned member. Entirely unrecognisable
+/// targets are foreign, even when named `parent.zip`.
+pub fn review_reconstruction_publication(
+    plan: &MameMergedReconstructionPlan,
+    target_evidence: Option<&ArcadeJoinEvidence>,
+) -> Result<ReviewedReconstructionPublication, String> {
+    use super::rename_apply::identity::capture_identity;
+    use super::rename_apply::model::ObjectKind;
+    if !super::rename_apply::preflight::is_safe_basename(&plan.parent) {
+        return Err("unsafe reconstruction parent name".into());
+    }
+    let mut reviewed = plan.clone();
+    let action = match std::fs::symlink_metadata(&plan.destination) {
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            ReconstructionPublicationAction::Create
+        }
+        Err(e) => return Err(e.to_string()),
+        Ok(metadata) => {
+            if !metadata.is_file() || metadata.file_type().is_symlink() {
+                return Err("target is not a regular archive".into());
+            }
+            let original = capture_identity(&plan.destination).map_err(|e| e.to_string())?;
+            let members = read_zip_evidence(&plan.destination)?;
+            if verify_members(plan, &members).is_ok() {
+                return Ok(ReviewedReconstructionPublication {
+                    plan: reviewed,
+                    action: ReconstructionPublicationAction::Unchanged { current: original },
+                    sources: Vec::new(),
+                });
+            }
+            let evidence = target_evidence
+                .ok_or("existing target needs checksum-backed ownership evidence")?;
+            if evidence.logical_set_name != plan.parent
+                || evidence.dat_set_name.as_deref() != Some(&plan.parent)
+                || evidence.dat_sha256 != plan.dat_sha256
+                || evidence.dat_version != plan.dat_version
+                || matches!(
+                    evidence.class,
+                    ArcadeJoinClass::Ambiguous | ArcadeJoinClass::NotFound
+                )
+                || !target_has_owned_member(plan, evidence, &members)
+            {
+                return Err("foreign or unproven existing target; replacement refused".into());
+            }
+            reviewed
+                .collisions
+                .retain(|path| path != &plan.destination.display().to_string());
+            if reviewed.collisions.is_empty() {
+                reviewed
+                    .reasons
+                    .retain(|reason| reason != "destination collision cannot be proven safe");
+            }
+            reviewed.ready_to_apply = reviewed.reasons.is_empty()
+                && reviewed.collisions.is_empty()
+                && reviewed.missing_members.is_empty()
+                && reviewed.duplicate_candidates.is_empty()
+                && reviewed.hash_mismatches.is_empty()
+                && reviewed.unresolved_ownership.is_empty()
+                && !reviewed.required_members.is_empty()
+                && reviewed.sources.len() == reviewed.required_members.len();
+            ReconstructionPublicationAction::ReplaceExisting { original }
+        }
+    };
+    if reviewed.blocked() {
+        return Err("reconstruction family plan remains blocked".into());
+    }
+    let paths: BTreeSet<_> = reviewed
+        .sources
+        .iter()
+        .map(|source| {
+            if source.archive_path.is_dir() {
+                source.member_path.clone()
+            } else {
+                source.archive_path.clone()
+            }
+        })
+        .collect();
+    let mut sources = Vec::new();
+    for path in paths {
+        let identity = capture_identity(&path).map_err(|e| e.to_string())?;
+        if identity.kind != ObjectKind::RegularFile {
+            return Err("donor is not a regular file".into());
+        }
+        sources.push((path, identity));
+    }
+    let result = ReviewedReconstructionPublication {
+        plan: reviewed,
+        action,
+        sources,
+    };
+    result.revalidate()?;
+    Ok(result)
+}
+
+/// Every member of the existing destination ZIP, accounted for against the
+/// reviewed requirements and the trusted catalogue. Read-only.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ReplacementMemberChanges {
+    /// Present with the required name, size and checksums; carried over.
+    pub kept: Vec<String>,
+    /// Present under a required name with different content. Its identity is
+    /// not established, so replacement is refused.
+    pub changed: Vec<String>,
+    /// Required and not present; added.
+    pub added: Vec<String>,
+    /// `(member, provider set)`: name and checksums match a ROM the family
+    /// borrows from a BIOS or other support set, and `<folder>/<provider>.zip`
+    /// was read and holds a matching copy. Not part of the merged archive;
+    /// also kept in the preserved original.
+    pub provided_elsewhere: Vec<(String, String)>,
+    /// `(member, provider set)`: a support-set ROM with no verified copy in
+    /// `<folder>/<provider>.zip`. Replacing would leave it only in the
+    /// preserved original, so replacement is refused.
+    pub support_unverified: Vec<(String, String)>,
+    /// Matches nothing the catalogue assigns to this family, repeats a name,
+    /// or could not be hashed. Replacement is refused.
+    pub unidentified: Vec<String>,
+}
+
+impl ReplacementMemberChanges {
+    /// Every existing member has an established identity: it is either kept
+    /// or a support-set ROM stored elsewhere. Nothing would be dropped whose
+    /// identity is unknown.
+    pub fn every_member_accounted_for(&self) -> bool {
+        self.changed.is_empty()
+            && self.unidentified.is_empty()
+            && self.support_unverified.is_empty()
+    }
+}
+
+pub fn replacement_member_changes(
+    plan: &MameMergedReconstructionPlan,
+    dat: &ParsedDat,
+) -> Result<ReplacementMemberChanges, String> {
+    let family = reconstruction_family_names(dat, &plan.parent)?;
+    let catalogue = dependencies::FamilyCatalogue::new(dat, family.iter().map(String::as_str));
+    let mut supported = Vec::new();
+    for game in dat.games.iter().filter(|game| family.contains(&game.name)) {
+        for rom in game.roms.iter().filter(|rom| !is_non_physical(rom)) {
+            if let dependencies::MemberPlacement::External { provider } =
+                catalogue.placement(game, rom)
+            {
+                supported.push((
+                    ReconstructionMemberRequirement {
+                        owner_set: provider.clone(),
+                        member_name: rom.name.clone(),
+                        size_bytes: rom.size_bytes,
+                        sha1: rom.sha1.as_ref().map(|v| v.to_ascii_lowercase()),
+                        crc32: rom.crc32.as_ref().map(|v| v.to_ascii_lowercase()),
+                    },
+                    provider,
+                ));
+            }
+        }
+    }
+    let members = read_zip_evidence(&plan.destination)?;
+    let folder = plan
+        .destination
+        .parent()
+        .ok_or("destination has no folder")?;
+    // Provider archives are read at most once, read-only.
+    let mut providers: BTreeMap<String, Option<Vec<crate::dat::archive::ArchiveMemberEvidence>>> =
+        BTreeMap::new();
+    // Replacement accounting needs a catalogue SHA-1: a CRC alone is forgeable.
+    let strongly_matches =
+        |required: &ReconstructionMemberRequirement,
+         member: &crate::dat::archive::ArchiveMemberEvidence| {
+            required.sha1.is_some() && member_matches(required, member)
+        };
+    let mut changes = ReplacementMemberChanges::default();
+    let mut seen = BTreeSet::new();
+    for member in &members {
+        let name = member.member_name_display.clone();
+        if !seen.insert(name.clone()) {
+            changes.unidentified.push(name);
+            continue;
+        }
+        if let Some(required) = plan
+            .required_members
+            .iter()
+            .find(|required| required.member_name == name)
+        {
+            if strongly_matches(required, member) {
+                changes.kept.push(name);
+            } else {
+                changes.changed.push(name);
+            }
+        } else if let Some((requirement, provider)) = supported.iter().find(|(requirement, _)| {
+            requirement.member_name == name && strongly_matches(requirement, member)
+        }) {
+            let stored = providers.entry(provider.clone()).or_insert_with(|| {
+                // A catalogue name with path components never names a file.
+                if !super::rename_apply::preflight::is_safe_basename(provider) {
+                    return None;
+                }
+                let path = folder.join(format!("{provider}.zip"));
+                std::fs::symlink_metadata(&path)
+                    .is_ok_and(|metadata| metadata.is_file())
+                    .then(|| read_zip_evidence(&path).ok())
+                    .flatten()
+            });
+            let verified = stored.as_ref().is_some_and(|members| {
+                members.iter().any(|copy| {
+                    copy.member_name_display == name && strongly_matches(requirement, copy)
+                })
+            });
+            if verified {
+                changes.provided_elsewhere.push((name, provider.clone()));
+            } else {
+                changes.support_unverified.push((name, provider.clone()));
+            }
+        } else {
+            changes.unidentified.push(name);
+        }
+    }
+    changes.added = plan
+        .required_members
+        .iter()
+        .filter(|required| !seen.contains(&required.member_name))
+        .map(|required| required.member_name.clone())
+        .collect();
+    changes.kept.sort();
+    changes.changed.sort();
+    changes.added.sort();
+    changes.provided_elsewhere.sort();
+    changes.support_unverified.sort();
+    changes.unidentified.sort();
+    Ok(changes)
+}
+
+fn read_zip_evidence(
+    path: &Path,
+) -> Result<Vec<crate::dat::archive::ArchiveMemberEvidence>, String> {
+    let cancel = AtomicBool::new(false);
+    let trusted = TrustedRoots::from_paths(path.parent().into_iter());
+    let mut source = crate::dat::archive::zip::ZipArchiveSource::open(
+        path,
+        &trusted,
+        crate::dat::archive::limits::ArchiveLimits::default(),
+        &cancel,
+    )
+    .map_err(|e| format!("ZIP inspection refused: {e:?}"))?;
+    let mut budget = crate::dat::archive::ArchiveRunBudget::new(MAX_RECONSTRUCTION_STAGED_BYTES);
+    let outcome = source.verify_all(&cancel, &mut budget);
+    if outcome.completion != crate::dat::archive::ArchivePassCompletion::Complete {
+        return Err("ZIP inspection incomplete or source changed".into());
+    }
+    Ok(outcome.members)
+}
+
+fn target_has_owned_member(
+    plan: &MameMergedReconstructionPlan,
+    evidence: &ArcadeJoinEvidence,
+    members: &[crate::dat::archive::ArchiveMemberEvidence],
+) -> bool {
+    let required: BTreeMap<_, _> = plan
+        .required_members
+        .iter()
+        .map(|r| (r.member_name.as_str(), r))
+        .collect();
+    let known: BTreeMap<_, _> = evidence
+        .members
+        .iter()
+        .filter_map(|m| m.current_name.as_deref().map(|name| (name, m)))
+        .collect();
+    if known.len()
+        != evidence
+            .members
+            .iter()
+            .filter(|m| m.current_name.is_some())
+            .count()
+    {
+        return false;
+    }
+    members.iter().any(|member| {
+        let Some(known) = known.get(member.member_name_display.as_str()) else {
+            return false;
+        };
+        let Some(required) = required.get(known.name.as_str()) else {
+            return false;
+        };
+        required.owner_set == plan.parent
+            && member_matches(required, member)
+            && known.kind != super::mame_arcade_join::MemberEvidenceKind::Unknown
+            && (known.observed_sha1.is_some() || known.observed_crc32.is_some())
+            && member.hashes.as_ref().is_some_and(|hashes| {
+                known
+                    .observed_sha1
+                    .as_ref()
+                    .is_none_or(|h| h.eq_ignore_ascii_case(&hashes.sha1))
+                    && known
+                        .observed_crc32
+                        .as_ref()
+                        .is_none_or(|h| h.eq_ignore_ascii_case(&hashes.crc32))
+            })
+    })
+}
+
+fn member_matches(
+    required: &ReconstructionMemberRequirement,
+    member: &crate::dat::archive::ArchiveMemberEvidence,
+) -> bool {
+    member.is_hash_complete()
+        && required.size_bytes == Some(member.logical_size)
+        && (required.sha1.is_some() || required.crc32.is_some())
+        && member.hashes.as_ref().is_some_and(|hashes| {
+            required
+                .sha1
+                .as_ref()
+                .is_none_or(|h| h.eq_ignore_ascii_case(&hashes.sha1))
+                && required
+                    .crc32
+                    .as_ref()
+                    .is_none_or(|h| h.eq_ignore_ascii_case(&hashes.crc32))
+        })
+}
+
+fn verify_members(
+    plan: &MameMergedReconstructionPlan,
+    members: &[crate::dat::archive::ArchiveMemberEvidence],
+) -> Result<(), String> {
+    if members.len() != plan.required_members.len() || members.is_empty() {
+        return Err("staged member inventory count mismatch".into());
+    }
+    let required: BTreeMap<_, _> = plan
+        .required_members
+        .iter()
+        .map(|r| (r.member_name.as_bytes(), r))
+        .collect();
+    if required.len() != plan.required_members.len() {
+        return Err("duplicate output requirement name".into());
+    }
+    let mut names = BTreeSet::new();
+    for member in members {
+        if !names.insert(&member.member_name_raw) {
+            return Err("staged duplicate member name".into());
+        }
+        let required = required
+            .get(member.member_name_raw.as_slice())
+            .ok_or("staged unexpected member")?;
+        if !member_matches(required, member) {
+            return Err(format!(
+                "staged SHA-1/CRC/size mismatch for {}",
+                required.member_name
+            ));
+        }
+    }
+    Ok(())
+}
+
+/// The parent and clone set names [`build_merged_reconstruction_plan`] plans
+/// for `requested_set`. A caller can restrict the persisted joins it loads to
+/// these names: the plan ignores every other set's join anyway.
+pub fn reconstruction_family_names(
+    dat: &ParsedDat,
+    requested_set: &str,
+) -> Result<Vec<String>, String> {
+    match reconstruction_family_shape(dat, requested_set)? {
+        ReconstructionFamilyShape::ParentWithClones { parent, clones } => {
+            Ok(std::iter::once(parent).chain(clones).collect())
+        }
+        ReconstructionFamilyShape::StandaloneParent { parent } => Ok(vec![parent]),
+        ReconstructionFamilyShape::IncompleteIdentity { reason } => Err(reason),
+    }
+}
+
+/// Build a deterministic plan from the current parsed MAME catalogue and
+/// persisted join evidence. `joins` must contain the exact archive path paired
+/// with each SHA-bound join. Directory names and member filenames are never
+/// used as identity evidence.
+pub fn build_merged_reconstruction_plan(
+    root: &Path,
+    dat: &ParsedDat,
+    joins: &[(PathBuf, ArcadeJoinEvidence)],
+    requested_set: &str,
+    dat_sha256: &str,
+) -> Result<MameMergedReconstructionPlan, String> {
+    let family_names = reconstruction_family_names(dat, requested_set)?;
+    let parent = family_names[0].as_str();
+    let family = dat
+        .games
+        .iter()
+        .filter(|game| family_names.contains(&game.name))
+        .collect::<Vec<_>>();
+    if family.iter().any(|game| game.name == parent) == false || family.len() < 2 {
+        // Same refusal as before; the message now says which case it is.
+        return Err(match reconstruction_family_shape(dat, requested_set) {
+            Ok(ReconstructionFamilyShape::StandaloneParent { parent }) => format!(
+                "no merged parent/clone reconstruction is needed for {parent}: it has no clones"
+            ),
+            Ok(ReconstructionFamilyShape::IncompleteIdentity { reason }) => {
+                format!("parent/clone identity is incomplete for {parent}: {reason}")
+            }
+            _ => format!("parent/clone identity is incomplete for {parent}"),
+        });
+    }
+    let clones = family
+        .iter()
+        .filter(|game| game.name != parent)
+        .map(|game| game.name.clone())
+        .collect::<Vec<_>>();
+    let catalogue =
+        dependencies::FamilyCatalogue::new(dat, family.iter().map(|game| game.name.as_str()));
+    let mut required = Vec::new();
+    let mut by_identity = BTreeSet::new();
+    let mut unresolved_placement = Vec::new();
+    for game in &family {
+        for rom in game.roms.iter().filter(|rom| !is_non_physical(rom)) {
+            // A member merged from a set outside the family (a BIOS) is stored
+            // in that set, never in the merged output.
+            match catalogue.placement(game, rom) {
+                dependencies::MemberPlacement::Family => {}
+                dependencies::MemberPlacement::External { .. } => continue,
+                dependencies::MemberPlacement::Unresolved(_) => {
+                    unresolved_placement.push(rom.name.clone());
+                    continue;
+                }
+            }
+            let key = rom_identity(rom).ok_or_else(|| {
+                format!(
+                    "required member has insufficient catalogue hash: {}",
+                    rom.name
+                )
+            })?;
+            if by_identity.insert(key) {
+                required.push(ReconstructionMemberRequirement {
+                    owner_set: game.name.clone(),
+                    member_name: rom.name.clone(),
+                    size_bytes: rom.size_bytes,
+                    sha1: rom.sha1.as_ref().map(|v| v.to_ascii_lowercase()),
+                    crc32: rom.crc32.as_ref().map(|v| v.to_ascii_lowercase()),
+                });
+            }
+        }
+    }
+    required.sort_by(|a, b| a.member_name.cmp(&b.member_name));
+
+    let mut candidates: BTreeMap<String, Vec<ReconstructionMemberSource>> = BTreeMap::new();
+    for (archive_path, join) in joins {
+        if !family.iter().any(|game| game.name == join.logical_set_name)
+            || join.dat_set_name.as_deref() != Some(join.logical_set_name.as_str())
+            || join.dat_sha256 != dat_sha256
+            || join.dat_version != dat.source.version.clone().unwrap_or_default()
+        {
+            continue;
+        }
+        for member in &join.members {
+            if member.kind == super::mame_arcade_join::MemberEvidenceKind::Unknown
+                || member.current_name.is_none()
+                || member.observed_sha1.is_none() && member.observed_crc32.is_none()
+            {
+                continue;
+            }
+            let Some(identity) = evidence_identity(
+                member.observed_sha1.as_deref(),
+                member.observed_crc32.as_deref(),
+            ) else {
+                continue;
+            };
+            let current_name = member.current_name.clone().unwrap();
+            candidates
+                .entry(identity)
+                .or_default()
+                .push(ReconstructionMemberSource {
+                    archive_identity: (!archive_path.is_dir())
+                        .then(|| SourceArchiveIdentity::of(archive_path))
+                        .flatten(),
+                    archive_path: archive_path.clone(),
+                    member_path: if archive_path.is_dir() {
+                        archive_path.join(&current_name)
+                    } else {
+                        PathBuf::from(&current_name)
+                    },
+                    current_name,
+                    target_name: member.name.clone(),
+                    observed_sha1: member.observed_sha1.clone(),
+                    observed_crc32: member.observed_crc32.clone(),
+                });
+        }
+    }
+
+    let mut plan = MameMergedReconstructionPlan {
+        dat_version: dat.source.version.clone().unwrap_or_default(),
+        dat_sha256: dat_sha256.to_string(),
+        parent: parent.to_string(),
+        clones,
+        destination: root.join(format!("{parent}.zip")),
+        required_members: required,
+        sources: Vec::new(),
+        missing_members: Vec::new(),
+        duplicate_candidates: Vec::new(),
+        hash_mismatches: Vec::new(),
+        unresolved_ownership: Vec::new(),
+        collisions: Vec::new(),
+        ready_to_apply: false,
+        reasons: Vec::new(),
+    };
+    for requirement in &plan.required_members {
+        let Some(identity) = rom_identity_from_requirement(requirement) else {
+            plan.unresolved_ownership
+                .push(requirement.member_name.clone());
+            continue;
+        };
+        let matches = candidates.get(&identity).cloned().unwrap_or_default();
+        match matches.as_slice() {
+            [] => plan.missing_members.push(requirement.member_name.clone()),
+            [source] => {
+                if source.target_name != requirement.member_name {
+                    plan.hash_mismatches.push(requirement.member_name.clone());
+                } else {
+                    plan.sources.push(source.clone());
+                }
+            }
+            _ => plan
+                .duplicate_candidates
+                .push(requirement.member_name.clone()),
+        }
+    }
+    plan.unresolved_ownership.extend(unresolved_placement);
+    plan.unresolved_ownership
+        .extend(reconstruction_dependencies(dat, requested_set)?.unresolved_relationships);
+    plan.sources.sort_by(|a, b| {
+        a.target_name
+            .cmp(&b.target_name)
+            .then(a.member_path.cmp(&b.member_path))
+    });
+    if plan.destination.exists() {
+        plan.collisions.push(plan.destination.display().to_string());
+    }
+    // Two different required payloads cannot share one destination member name,
+    // and a destination member name must be a plain file name.
+    let mut destination_names = BTreeSet::new();
+    for requirement in &plan.required_members {
+        if !is_plain_member_name(&requirement.member_name) {
+            plan.collisions.push(format!(
+                "unsafe destination member name: {}",
+                requirement.member_name
+            ));
+        } else if !destination_names.insert(requirement.member_name.clone()) {
+            plan.collisions.push(format!(
+                "duplicate destination member name: {}",
+                requirement.member_name
+            ));
+        }
+    }
+    let unsupported_sources: BTreeSet<String> = plan
+        .sources
+        .iter()
+        .filter(|source| {
+            !source.archive_path.is_dir()
+                && !source
+                    .archive_path
+                    .extension()
+                    .is_some_and(|extension| extension.eq_ignore_ascii_case("zip"))
+        })
+        .map(|source| source.archive_path.display().to_string())
+        .collect();
+    if !unsupported_sources.is_empty() {
+        // Only extracted folders and ZIP archives can supply members; a member
+        // inside another archive type is not extracted by this workflow.
+        plan.reasons.push(format!(
+            "source is neither an extracted set directory nor a ZIP archive: {}",
+            unsupported_sources
+                .into_iter()
+                .collect::<Vec<_>>()
+                .join(", ")
+        ));
+    }
+    if !plan.missing_members.is_empty() {
+        plan.reasons.push("required ROM members are missing".into());
+    }
+    if !plan.duplicate_candidates.is_empty() {
+        plan.reasons
+            .push("one or more required ROMs have multiple incompatible sources".into());
+    }
+    if !plan.hash_mismatches.is_empty() {
+        plan.reasons
+            .push("persisted member hashes disagree with catalogue ownership".into());
+    }
+    if !plan.unresolved_ownership.is_empty() {
+        plan.reasons.push("ROM ownership is unresolved".into());
+    }
+    if !plan.collisions.is_empty() {
+        plan.reasons
+            .push("destination collision cannot be proven safe".into());
+    }
+    plan.ready_to_apply = plan.reasons.is_empty()
+        && plan.sources.len() == plan.required_members.len()
+        && plan.required_members.len() >= 1;
+    Ok(plan)
+}
+
+/// Discovers packed set archives whose filename is only used as a bounded
+/// candidate filter.  Every usable member is still selected by its decoded
+/// checksum when the reconstruction plan is built; the ZIP basename never
+/// establishes ROM identity.
+pub fn discover_packed_zip_sources(
+    root: &Path,
+    dat: &ParsedDat,
+    requested_set: &str,
+    dat_sha256: &str,
+) -> Result<Vec<(PathBuf, ArcadeJoinEvidence)>, String> {
+    let selected = dat
+        .games
+        .iter()
+        .find(|game| game.name == requested_set)
+        .ok_or_else(|| {
+            format!("MAME set is absent from the selected catalogue: {requested_set}")
+        })?;
+    let parent = selected
+        .clone_of
+        .as_deref()
+        .unwrap_or(selected.name.as_str());
+    let family = dat
+        .games
+        .iter()
+        .filter(|game| game.name == parent || game.clone_of.as_deref() == Some(parent))
+        .map(|game| game.name.clone())
+        .collect::<BTreeSet<_>>();
+    let catalogue = dependencies::FamilyCatalogue::new(dat, family.iter().map(String::as_str));
+    let mut target_names = BTreeMap::new();
+    for game in &dat.games {
+        if family.contains(&game.name) {
+            for rom in game.roms.iter().filter(|rom| {
+                !is_non_physical(rom)
+                    && catalogue.placement(game, rom) == dependencies::MemberPlacement::Family
+            }) {
+                if let Some(identity) = rom_identity(rom) {
+                    target_names
+                        .entry(identity)
+                        .or_insert_with(|| rom.name.clone());
+                }
+            }
+        }
+    }
+    let trusted = crate::safe_read::TrustedRoots::from_paths(std::iter::once(root));
+    let cancel = AtomicBool::new(false);
+    let mut paths = std::fs::read_dir(root)
+        .map_err(|error| format!("scan packed MAME sources: {error}"))?
+        .filter_map(Result::ok)
+        .map(|entry| entry.path())
+        // Name filters first: `is_file` is a stat, and it only matters for the few
+        // entries that could be this family's archives. Same result, one stat per
+        // candidate instead of one per entry in the folder.
+        .filter(|path| {
+            path.extension()
+                .is_some_and(|extension| extension.eq_ignore_ascii_case("zip"))
+        })
+        .filter(|path| {
+            path.file_stem()
+                .map(|stem| family.contains(&stem.to_string_lossy().to_ascii_lowercase()))
+                .unwrap_or(false)
+        })
+        .filter(|path| path.is_file())
+        .collect::<Vec<_>>();
+    paths.sort();
+
+    let mut discovered = Vec::new();
+    for path in paths {
+        let mut source = crate::dat::archive::zip::ZipArchiveSource::open(
+            &path,
+            &trusted,
+            crate::dat::archive::limits::ArchiveLimits::default(),
+            &cancel,
+        )
+        .map_err(|error| format!("packed MAME source {} refused: {error:?}", path.display()))?;
+        let mut budget = crate::dat::archive::ArchiveRunBudget::new(
+            crate::dat::archive::limits::MAX_ARCHIVE_LOGICAL_BYTES,
+        );
+        let outcome = source.verify_all(&cancel, &mut budget);
+        if !matches!(
+            outcome.completion,
+            crate::dat::archive::ArchivePassCompletion::Complete
+        ) {
+            return Err(format!(
+                "packed MAME source {} changed or could not be fully verified",
+                path.display()
+            ));
+        }
+        if let Some(refused) = outcome.members.iter().find(|member| {
+            !matches!(
+                member.status,
+                crate::dat::archive::ArchiveMemberStatus::HashComplete
+            )
+        }) {
+            return Err(format!(
+                "packed MAME source {} member {} refused: {:?}",
+                path.display(),
+                refused.member_name_display,
+                refused.status
+            ));
+        }
+        let members = outcome
+            .members
+            .into_iter()
+            .filter_map(|member| {
+                let hashes = member.hashes?;
+                if member.member_name_display.is_empty() {
+                    return None;
+                }
+                let identity = evidence_identity(Some(&hashes.sha1), Some(&hashes.crc32))?;
+                let target_name = target_names.get(&identity)?.clone();
+                Some(super::mame_arcade_join::ArcadeMemberEvidence {
+                    name: target_name,
+                    kind: super::mame_arcade_join::MemberEvidenceKind::Present,
+                    current_name: Some(member.member_name_display),
+                    checksum: Some(hashes.sha1.clone()),
+                    observed_sha1: Some(hashes.sha1),
+                    observed_crc32: Some(hashes.crc32),
+                })
+            })
+            .collect::<Vec<_>>();
+        if members.is_empty() {
+            continue;
+        }
+        let set_name = path
+            .file_stem()
+            .map(|stem| stem.to_string_lossy().to_ascii_lowercase())
+            .unwrap_or_else(|| parent.to_string());
+        discovered.push((
+            path,
+            ArcadeJoinEvidence {
+                logical_set_name: set_name.clone(),
+                dat_set_name: Some(set_name),
+                class: ArcadeJoinClass::ExactSetMatch,
+                description: None,
+                manufacturer: None,
+                year: None,
+                clone_of: None,
+                rom_of: None,
+                parent_description: None,
+                runnable: Some("yes".into()),
+                mechanical: false,
+                is_bios: false,
+                is_device: false,
+                disk_declarations: None,
+                expected_member_count: members.len(),
+                members,
+                dependencies: Vec::new(),
+                launchable_normal_game: true,
+                dat_version: dat.source.version.clone().unwrap_or_default(),
+                dat_sha256: dat_sha256.to_string(),
+                dat_path: String::new(),
+                audited_at: format!("unix:{}", crate::dat::sources::now_unix()),
+            },
+        ));
+    }
+    Ok(discovered)
+}
+
+/// Free bytes on the filesystem that holds `path` (or its nearest existing
+/// ancestor); `None` when it cannot be determined, in which case the check is
+/// skipped rather than guessed.
+fn free_space_bytes(path: &Path) -> Option<u64> {
+    use std::os::unix::ffi::OsStrExt;
+    let mut probe = path;
+    while !probe.exists() {
+        probe = probe.parent()?;
+    }
+    let c_path = std::ffi::CString::new(probe.as_os_str().as_bytes()).ok()?;
+    let mut stats: libc::statvfs = unsafe { std::mem::zeroed() };
+    // SAFETY: `c_path` is a valid NUL-terminated path and `stats` is a valid out-pointer.
+    if unsafe { libc::statvfs(c_path.as_ptr(), &mut stats) } != 0 {
+        return None;
+    }
+    Some((stats.f_bavail as u64).saturating_mul(stats.f_frsize as u64))
+}
+
+/// Writes only a staging ZIP. It never opens a source archive for writing and
+/// never removes or renames a source member. Publication is intentionally a
+/// separate caller action after [`verify_staged_output`].
+pub fn stage_reconstruction_output(
+    plan: &MameMergedReconstructionPlan,
+    staging_root: &Path,
+) -> Result<PathBuf, String> {
+    stage_reconstruction_output_with(plan, staging_root, &free_space_bytes)
+}
+
+/// [`stage_reconstruction_output`] with the free-space probe injected.
+pub fn stage_reconstruction_output_with(
+    plan: &MameMergedReconstructionPlan,
+    staging_root: &Path,
+    free_space: &dyn Fn(&Path) -> Option<u64>,
+) -> Result<PathBuf, String> {
+    stage_owned_output_with(plan, staging_root, free_space, None).map(|staged| staged.path)
+}
+
+fn stage_owned_output_with(
+    plan: &MameMergedReconstructionPlan,
+    staging_root: &Path,
+    free_space: &dyn Fn(&Path) -> Option<u64>,
+    root: Option<std::sync::Arc<owned_attempt::Directory>>,
+) -> Result<owned_attempt::StagedOutput, String> {
+    if !plan.ready_to_apply {
+        return Err("reconstruction plan is blocked; no staged output was created".into());
+    }
+    if !super::rename_apply::preflight::is_safe_basename(&plan.parent)
+        || !staging_root.is_absolute()
+        || staging_root.components().any(|c| {
+            !matches!(
+                c,
+                std::path::Component::RootDir | std::path::Component::Normal(_)
+            )
+        })
+    {
+        return Err("unsafe reconstruction staging path".into());
+    }
+    let mut ancestor = PathBuf::new();
+    for component in staging_root.components() {
+        ancestor.push(component);
+        match std::fs::symlink_metadata(&ancestor) {
+            Ok(m) if m.is_dir() && !m.file_type().is_symlink() => {}
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+            _ => return Err("unsafe staging ancestor".into()),
+        }
+    }
+
+    // Everything that can be refused before a single byte is written.
+    let mut total_bytes = 0_u64;
+    let mut largest_member = 0_u64;
+    for source in &plan.sources {
+        let requirement = plan
+            .required_members
+            .iter()
+            .find(|requirement| requirement.member_name == source.target_name)
+            .ok_or_else(|| {
+                format!(
+                    "source has no reviewed requirement for {}",
+                    source.target_name
+                )
+            })?;
+        let member_size = requirement
+            .size_bytes
+            .unwrap_or(MAX_RECONSTRUCTION_STAGED_BYTES.saturating_add(1));
+        total_bytes = total_bytes
+            .checked_add(member_size)
+            .ok_or_else(|| "reconstruction staged-byte bound overflowed".to_string())?;
+        if total_bytes > MAX_RECONSTRUCTION_STAGED_BYTES {
+            return Err(format!(
+                "reconstruction staged-byte bound exceeded ({MAX_RECONSTRUCTION_STAGED_BYTES} bytes)"
+            ));
+        }
+        largest_member = largest_member.max(member_size);
+        // A packed source archive must be the one that was reviewed.
+        if !source.archive_path.is_dir()
+            && let Some(expected) = source.archive_identity
+            && SourceArchiveIdentity::of(&source.archive_path) != Some(expected)
+        {
+            return Err(format!(
+                "source archive {} changed since the preview; nothing was staged. Preview again.",
+                source.archive_path.display()
+            ));
+        }
+    }
+    // The staged ZIP (at most the sum of its members) plus one member being
+    // copied out of its source archive, with a small margin.
+    let needed = total_bytes
+        .saturating_add(largest_member)
+        .saturating_add(1024 * 1024);
+    if let Some(free) = free_space(staging_root)
+        && free < needed
+    {
+        return Err(format!(
+            "not enough free space to stage the reconstruction: {needed} bytes needed, {free} available; nothing was staged"
+        ));
+    }
+
+    let root = match root {
+        Some(root) => root,
+        None => owned_attempt::staging_root(staging_root)?,
+    };
+    let staged = owned_attempt::StagedOutput::create(root)?;
+    let result = (|| {
+        stage_members(
+            plan,
+            staged.file.try_clone().map_err(|e| e.to_string())?,
+            &staged.root,
+        )?;
+        owned_attempt::event("before_verify", &staged.path)?;
+        let before = staged.identity()?;
+        verify_staged_output(plan, &staged.path)?;
+        let after = staged.identity()?;
+        if !crate::dat::rename_apply::identity::identity_matches(&before, &after) {
+            return Err("owned stage changed during ZIP verification".into());
+        }
+        staged.note(
+            &plan.parent,
+            serde_json::json!({"state": "verified", "identity": after}),
+        )?;
+        Ok(())
+    })();
+    result.map_err(|e| staged.failure(&plan.parent, e))?;
+    Ok(staged)
+}
+
+fn stage_members(
+    plan: &MameMergedReconstructionPlan,
+    file: std::fs::File,
+    root: &owned_attempt::Directory,
+) -> Result<(), String> {
+    let mut writer = zip::ZipWriter::new(file);
+    let cancel = AtomicBool::new(false);
+    for source in &plan.sources {
+        let requirement = plan
+            .required_members
+            .iter()
+            .find(|r| r.member_name == source.target_name)
+            .ok_or_else(|| {
+                format!(
+                    "source has no reviewed requirement for {}",
+                    source.target_name
+                )
+            })?;
+        let member_size = requirement
+            .size_bytes
+            .unwrap_or(MAX_RECONSTRUCTION_STAGED_BYTES.saturating_add(1));
+        let mut source_file = if source.archive_path.is_dir() {
+            let trusted = TrustedRoots::from_paths([source.archive_path.as_path()]);
+            crate::safe_read::open_bounded_read(&source.member_path, &trusted)
+                .map_err(|e| format!("source member refused: {e:?}"))?
+                .into_file()
+        } else {
+            let mut temporary = root.anonymous()?;
+            let trusted = TrustedRoots::from_paths(source.archive_path.parent().into_iter());
+            let request = crate::dat::archive::zip::ZipMemberRequest {
+                member_name: Some(source.current_name.clone()),
+                require_exact_name: true,
+                size_bytes: requirement.size_bytes,
+                sha1: requirement.sha1.clone(),
+                crc32: requirement.crc32.clone(),
+            };
+            crate::dat::archive::zip::copy_zip_member_into(
+                &source.archive_path,
+                &trusted,
+                &crate::dat::archive::limits::ArchiveLimits::default(),
+                &cancel,
+                &request,
+                &mut temporary,
+            )
+            .map_err(|e| format!("ZIP member {} refused: {e}", source.current_name))?;
+            use std::io::Seek;
+            temporary.rewind().map_err(|e| e.to_string())?;
+            temporary
+        };
+        writer
+            .start_file(
+                &source.target_name,
+                zip::write::SimpleFileOptions::default(),
+            )
+            .map_err(|e| e.to_string())?;
+        use std::io::Read;
+        let copied = std::io::copy(&mut (&mut source_file).take(member_size + 1), &mut writer)
+            .map_err(|e| e.to_string())?;
+        if copied != member_size {
+            return Err("source member size changed while staging".into());
+        }
+    }
+    writer
+        .finish()
+        .map_err(|e| e.to_string())?
+        .sync_all()
+        .map_err(|e| e.to_string())?;
+    Ok(())
+}
+
+/// Verifies the staged archive against the reviewed member list before any
+/// publication. Duplicate ZIP names and checksum/size mismatches fail closed.
+pub fn verify_staged_output(
+    plan: &MameMergedReconstructionPlan,
+    staged: &Path,
+) -> Result<(), String> {
+    verified_staged_members(plan, staged).map(|_| ())
+}
+
+/// [`verify_staged_output`], returning the staged members' own evidence so the
+/// receipt can record the hashes that were actually staged (not just the ones
+/// that were expected).
+fn verified_staged_members(
+    plan: &MameMergedReconstructionPlan,
+    staged: &Path,
+) -> Result<Vec<crate::dat::archive::ArchiveMemberEvidence>, String> {
+    let members = read_zip_evidence(staged)?;
+    verify_members(plan, &members)?;
+    Ok(members)
+}
+
+/// Journal key under which a reconstruction's source provenance is recorded.
+pub const MAME_RECONSTRUCTION_PROVENANCE_KEY: &str = "mame_reconstruction_provenance";
+
+/// What a receipt must be able to say about every staged member: where it came
+/// from (archive and member, or a loose file), what the DAT required, what was
+/// actually staged, and the checksum-based basis on which the member was
+/// accepted as owned. Filenames are recorded, never used as the basis.
+fn reconstruction_provenance(
+    plan: &MameMergedReconstructionPlan,
+    staged: &[crate::dat::archive::ArchiveMemberEvidence],
+) -> Result<serde_json::Value, String> {
+    let mut members = Vec::with_capacity(plan.sources.len());
+    for source in &plan.sources {
+        let requirement = plan
+            .required_members
+            .iter()
+            .find(|requirement| requirement.member_name == source.target_name)
+            .ok_or_else(|| format!("no reviewed requirement for {}", source.target_name))?;
+        let actual = staged
+            .iter()
+            .find(|member| member.member_name_display == source.target_name)
+            .ok_or_else(|| format!("staged output has no member {}", source.target_name))?;
+        let hashes = actual
+            .hashes
+            .as_ref()
+            .ok_or_else(|| format!("staged member {} has no hashes", source.target_name))?;
+        let packed = !source.archive_path.is_dir();
+        members.push(serde_json::json!({
+            "target_name": source.target_name,
+            "owner_set": requirement.owner_set,
+            "packed": packed,
+            "source_archive": source.archive_path.display().to_string(),
+            "source_member": if packed {
+                source.current_name.clone()
+            } else {
+                source.member_path.display().to_string()
+            },
+            "expected": {
+                "size_bytes": requirement.size_bytes,
+                "sha1": requirement.sha1,
+                "crc32": requirement.crc32,
+            },
+            "staged": {
+                "size_bytes": actual.logical_size,
+                "sha1": hashes.sha1,
+                "crc32": hashes.crc32,
+            },
+            "ownership": {
+                "basis": "checksum match against persisted MAME join evidence",
+                "observed_sha1": source.observed_sha1,
+                "observed_crc32": source.observed_crc32,
+            },
+        }));
+    }
+    Ok(serde_json::json!({
+        "schema": 1,
+        "dat_version": plan.dat_version,
+        "dat_sha256": plan.dat_sha256,
+        "parent": plan.parent,
+        "destination": plan.destination.display().to_string(),
+        "members": members,
+    }))
+}
+
+/// Publishes a verified staged output through the shared journaled rename
+/// executor. The caller is responsible for obtaining explicit user approval;
+/// this function never publishes a blocked plan and never touches a source
+/// member. A returned transaction is the recovery/undo handle.
+pub fn apply_staged_reconstruction_output(
+    plan: &MameMergedReconstructionPlan,
+    staging_root: &Path,
+    journal_dir: &Path,
+) -> Result<crate::dat::rename_apply::executor::ApplyOutcome, String> {
+    if !plan.ready_to_apply {
+        return Err("reconstruction plan is blocked; no staged output was created".into());
+    }
+    let mut guard = owned_attempt::PublicationGuard::new(staging_root, journal_dir)?;
+    guard.check_leftovers(&plan.parent)?;
+    let staged = stage_owned_output_with(
+        plan,
+        staging_root,
+        &free_space_bytes,
+        Some(std::sync::Arc::clone(&guard.staging)),
+    )?;
+    publish_staged(
+        plan,
+        &staged,
+        staging_root,
+        journal_dir,
+        Default::default(),
+        &mut guard,
+    )
+    .map_err(|e| staged.failure(&plan.parent, e))
+}
+
+fn publish_staged(
+    plan: &MameMergedReconstructionPlan,
+    staged: &owned_attempt::StagedOutput,
+    staging_root: &Path,
+    journal_dir: &Path,
+    operation: crate::dat::rename_apply::model::TransactionOperation,
+    guard: &mut owned_attempt::PublicationGuard,
+) -> Result<crate::dat::rename_apply::executor::ApplyOutcome, String> {
+    use crate::dat::rename_apply::model::{
+        EntryState, RenameTransaction, TransactionEntry, TransactionState,
+    };
+
+    owned_attempt::event("before_publish", &staged.path)?;
+    guard.check_recovery()?;
+    let identity = staged.identity()?;
+    let staged_members = verified_staged_members(plan, &staged.path)?;
+    let provenance = reconstruction_provenance(plan, &staged_members)?;
+    let after = staged.identity()?;
+    if !crate::dat::rename_apply::identity::identity_matches(&identity, &after) {
+        return Err("staged reconstruction changed during verification".into());
+    }
+    let destination = plan.destination.clone();
+    if (matches!(
+        operation,
+        crate::dat::rename_apply::model::TransactionOperation::RenameMove
+    ) && std::fs::symlink_metadata(&destination).is_ok())
+        || destination.parent().is_none_or(|parent| !parent.is_dir())
+    {
+        return Err(
+            "destination collision or missing destination directory; nothing was published".into(),
+        );
+    }
+    let source_key = staged.path.to_string_lossy().into_owned();
+    let entry = TransactionEntry {
+        source_path: staged.path.clone(),
+        destination_path: destination.clone(),
+        original_basename: staged
+            .path
+            .file_name()
+            .map(|v| v.to_string_lossy().into_owned())
+            .unwrap_or_default(),
+        proposed_basename: destination
+            .file_name()
+            .map(|v| v.to_string_lossy().into_owned())
+            .unwrap_or_default(),
+        identity,
+        operation,
+        preflight_passed: false,
+        preflight_failures: Vec::new(),
+        state: EntryState::Planned,
+        failure_reason: None,
+        applied_at_unix: None,
+        rolled_back_at_unix: None,
+        unknown: Default::default(),
+    };
+    let mut transaction = RenameTransaction {
+        transaction_id: String::new(),
+        plan_generation: 1,
+        classifier_version: Some(crate::dat::classification::CLASSIFIER_VERSION.to_string()),
+        created_at_unix: crate::dat::sources::now_unix(),
+        source_scan_root: staging_root.to_string_lossy().into_owned(),
+        state: TransactionState::Planned,
+        entries: vec![entry],
+        created_directories: Vec::new(),
+        recovery_resolution: None,
+        recovery_resolved_at_unix: None,
+        unknown: Default::default(),
+    };
+    transaction.unknown.insert(
+        "workflow".into(),
+        serde_json::Value::String(MAME_RECONSTRUCTION_WORKFLOW.into()),
+    );
+    transaction.unknown.insert(
+        "mame_parent".into(),
+        serde_json::Value::String(plan.parent.clone()),
+    );
+    transaction
+        .unknown
+        .insert(MAME_RECONSTRUCTION_PROVENANCE_KEY.into(), provenance);
+    staged.require_owned()?;
+    // From here on an error may leave a recovery journal behind, so every
+    // error names the reserved transaction for the caller.
+    guard
+        .reserve(&mut transaction)
+        .map_err(|e| mark_reserved(e, &transaction.transaction_id))?;
+    publish_reserved(
+        plan,
+        staged,
+        staging_root,
+        journal_dir,
+        source_key,
+        &mut transaction,
+    )
+    .map_err(|e| mark_reserved(e, &transaction.transaction_id))
+}
+
+const RESERVED_JOURNAL_MARKER: &str = "; MAME recovery journal ";
+const RESERVED_JOURNAL_SUFFIX: &str = " was reserved";
+
+fn mark_reserved(error: String, transaction_id: &str) -> String {
+    if transaction_id.is_empty() {
+        error
+    } else {
+        format!("{error}{RESERVED_JOURNAL_MARKER}{transaction_id}{RESERVED_JOURNAL_SUFFIX}")
+    }
+}
+
+/// The transaction a failed publication had already reserved a recovery
+/// journal for, when its error says so. An error without one was raised
+/// before any journal existed, so the destination was never touched.
+pub fn reserved_transaction_id(error: &str) -> Option<&str> {
+    let start = error.rfind(RESERVED_JOURNAL_MARKER)? + RESERVED_JOURNAL_MARKER.len();
+    let rest = &error[start..];
+    let id = &rest[..rest.find(RESERVED_JOURNAL_SUFFIX)?];
+    (!id.is_empty() && !id.contains(char::is_whitespace)).then_some(id)
+}
+
+fn publish_reserved(
+    plan: &MameMergedReconstructionPlan,
+    staged: &owned_attempt::StagedOutput,
+    staging_root: &Path,
+    journal_dir: &Path,
+    source_key: String,
+    transaction: &mut crate::dat::rename_apply::model::RenameTransaction,
+) -> Result<crate::dat::rename_apply::executor::ApplyOutcome, String> {
+    use crate::dat::rename_apply::executor::{
+        ApplyError, ApplyExecution, HardConflictMode, apply_transaction,
+    };
+    use crate::dat::rename_apply::model::{EntryState, TransactionState};
+    use crate::dat::rename_apply::preflight::DirectoryPolicy;
+    use std::collections::BTreeSet;
+
+    staged.note(&plan.parent, serde_json::json!({"state": "journal_reserved", "transaction_id": transaction.transaction_id}))?;
+    let mut approved = BTreeSet::new();
+    approved.insert(source_key);
+    let cancel = AtomicBool::new(false);
+    let result = apply_transaction(&mut ApplyExecution {
+        transaction,
+        approved_paths: approved,
+        current_generation: 1,
+        trusted: TrustedRoots::from_paths([staging_root, plan.destination.parent().unwrap()]),
+        journal_dir: journal_dir.to_path_buf(),
+        hard_conflict_mode: HardConflictMode::AbortAll,
+        cancel: &cancel,
+        directory_policy: DirectoryPolicy::SameFilesystem,
+        allow_symlink_source: false,
+    })
+    .map_err(|error| match error {
+        ApplyError::HardConflicts(conflicts) => format!(
+            "reconstruction preflight refused {} path(s): {}",
+            conflicts.len(),
+            conflicts
+                .into_iter()
+                .map(|(path, reasons)| format!("{} ({})", path.display(), reasons.join(", ")))
+                .collect::<Vec<_>>()
+                .join("; ")
+        ),
+        other => other.to_string(),
+    });
+    if let Err(reason) = &result {
+        // AbortAll preflight refused before mutation. Do not leave an
+        // unexplained Planned reservation, and never relabel an Applying
+        // transaction after an uncertain journal/rename failure.
+        if transaction.state == TransactionState::Planned
+            && transaction
+                .entries
+                .iter()
+                .all(|e| e.state == EntryState::Planned)
+        {
+            transaction.state = TransactionState::ApplyFailed;
+            for e in &mut transaction.entries {
+                e.state = EntryState::ApplyFailed;
+                e.failure_reason = Some(reason.clone());
+            }
+            crate::dat::rename_apply::journal::write_journal(journal_dir, transaction)
+                .map_err(|e| format!("{reason}; reservation requires Recovery: {e}"))?;
+        }
+    }
+    result
+}
+
+/// A destination ZIP member name: no absolute path, traversal, backslash,
+/// drive prefix or NUL (a relative path inside the set is allowed).
+fn is_plain_member_name(name: &str) -> bool {
+    !name.is_empty()
+        && !name.contains(['\\', '\0'])
+        && !name.starts_with('/')
+        && !(name.len() >= 2
+            && name.as_bytes()[1] == b':'
+            && name.as_bytes()[0].is_ascii_alphabetic())
+        && name
+            .split('/')
+            .all(|part| !part.is_empty() && part != "." && part != "..")
+}
+
+fn is_non_physical(rom: &DatRomEntry) -> bool {
+    rom.optional
+        .as_deref()
+        .is_some_and(|v| v.eq_ignore_ascii_case("yes"))
+        || rom
+            .status
+            .as_deref()
+            .is_some_and(|v| v.eq_ignore_ascii_case("nodump"))
+        || rom.loadflag.is_some()
+}
+
+fn rom_identity(rom: &DatRomEntry) -> Option<String> {
+    rom.sha1
+        .as_ref()
+        .map(|v| format!("sha1:{}", v.to_ascii_lowercase()))
+        .or_else(|| {
+            rom.crc32
+                .as_ref()
+                .map(|v| format!("crc32:{}", v.to_ascii_lowercase()))
+        })
+}
+
+fn rom_identity_from_requirement(rom: &ReconstructionMemberRequirement) -> Option<String> {
+    rom.sha1
+        .as_ref()
+        .map(|v| format!("sha1:{v}"))
+        .or_else(|| rom.crc32.as_ref().map(|v| format!("crc32:{v}")))
+}
+
+fn evidence_identity(sha1: Option<&str>, crc32: Option<&str>) -> Option<String> {
+    sha1.map(|v| format!("sha1:{}", v.to_ascii_lowercase()))
+        .or_else(|| crc32.map(|v| format!("crc32:{}", v.to_ascii_lowercase())))
+}
+
+mod dependencies;
+mod owned_attempt;
+
+pub use dependencies::{
+    CatalogueReference, DeclaredDisk, DeviceMember, DeviceMemberSupply, ExcludedMember,
+    ExcludedMemberReason, ExternalSetKind, ExternalSupportSet, RECONSTRUCTION_RUNNABILITY_NOTE,
+    ReconstructionDependencies, ReconstructionFamilyShape, UnresolvedMember,
+    reconstruction_dependencies, reconstruction_family_shape,
+};
+
+#[cfg(test)]
+mod dependencies_tests;
+#[cfg(test)]
+mod packed_tests;
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::dat::model::{DatEcosystem, DatFormat, DatGameEntry, DatPackingPolicy, DatSource};
+    use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+
+    static NEXT_PUBLISH_FIXTURE: AtomicU64 = AtomicU64::new(0);
+
+    fn dat(games: Vec<DatGameEntry>) -> ParsedDat {
+        ParsedDat {
+            source: DatSource {
+                format: DatFormat::Logiqx,
+                ecosystem: DatEcosystem::MAMEArcade,
+                file_path: "fixture".into(),
+                name: None,
+                description: None,
+                version: Some("test".into()),
+                author: None,
+                homepage: None,
+                clrmamepro_header: None,
+                entry_count: games.len(),
+                rom_count: games.iter().map(|g| g.roms.len()).sum(),
+                parse_warnings: vec![],
+                packing_policy: DatPackingPolicy::Standard,
+            },
+            games,
+        }
+    }
+    fn game(name: &str, clone_of: Option<&str>, roms: &[(&str, &str)]) -> DatGameEntry {
+        DatGameEntry {
+            name: name.into(),
+            clone_of: clone_of.map(str::to_owned),
+            roms: roms
+                .iter()
+                .map(|(n, h)| DatRomEntry {
+                    name: (*n).into(),
+                    sha1: Some((*h).into()),
+                    ..Default::default()
+                })
+                .collect(),
+            ..Default::default()
+        }
+    }
+    fn join(set: &str, sha: &str, names: &[(&str, &str)]) -> ArcadeJoinEvidence {
+        ArcadeJoinEvidence {
+            logical_set_name: set.into(),
+            dat_set_name: Some(set.into()),
+            class: super::super::mame_arcade_join::ArcadeJoinClass::ExactSetMatch,
+            description: None,
+            manufacturer: None,
+            year: None,
+            clone_of: None,
+            rom_of: None,
+            parent_description: None,
+            runnable: None,
+            mechanical: false,
+            is_bios: false,
+            is_device: false,
+            disk_declarations: Some(Vec::new()),
+            expected_member_count: names.len(),
+            members: names
+                .iter()
+                .map(
+                    |(name, hash)| super::super::mame_arcade_join::ArcadeMemberEvidence {
+                        name: (*name).into(),
+                        kind: super::super::mame_arcade_join::MemberEvidenceKind::Present,
+                        current_name: Some(format!("{name}.bin")),
+                        checksum: Some((*hash).into()),
+                        observed_sha1: Some((*hash).into()),
+                        observed_crc32: None,
+                    },
+                )
+                .collect(),
+            dependencies: vec![],
+            launchable_normal_game: true,
+            dat_version: "test".into(),
+            dat_sha256: sha.into(),
+            dat_path: "fixture".into(),
+            audited_at: "now".into(),
+        }
+    }
+    #[test]
+    fn a_member_in_an_unsupported_archive_type_blocks_the_plan_and_names_the_archive() {
+        let root = std::env::temp_dir().join(format!("emuwiz-merged-7z-{}", std::process::id()));
+        let _ = std::fs::create_dir_all(&root);
+        let parsed = dat(vec![
+            game("parent", None, &[("a", "a")]),
+            game("clone", Some("parent"), &[("c", "c")]),
+        ]);
+        let archive = PathBuf::from("/roms/parent.7z");
+        let joins = vec![
+            (archive.clone(), join("parent", "digest", &[("a", "a")])),
+            (root.join("clone"), join("clone", "digest", &[("c", "c")])),
+        ];
+        let plan =
+            build_merged_reconstruction_plan(&root, &parsed, &joins, "parent", "digest").unwrap();
+        assert!(plan.blocked());
+        let reason = plan
+            .reasons
+            .iter()
+            .find(|reason| reason.contains("neither an extracted set directory nor a ZIP"))
+            .expect("the unsupported-source reason is present");
+        assert!(reason.contains("/roms/parent.7z"), "{reason}");
+        let _ = std::fs::remove_dir_all(root);
+    }
+    #[test]
+    fn complete_family_is_deterministic_and_ready() {
+        let root = std::env::temp_dir().join(format!("emuwiz-merged-plan-{}", std::process::id()));
+        let _ = std::fs::create_dir_all(root.join("parent"));
+        let _ = std::fs::create_dir_all(root.join("clone"));
+        let parsed = dat(vec![
+            game("parent", None, &[("a", "a"), ("b", "b")]),
+            game("clone", Some("parent"), &[("a", "a"), ("c", "c")]),
+        ]);
+        let joins = vec![
+            (
+                root.join("parent"),
+                join("parent", "digest", &[("a", "a"), ("b", "b")]),
+            ),
+            (root.join("clone"), join("clone", "digest", &[("c", "c")])),
+        ];
+        let plan =
+            build_merged_reconstruction_plan(&root, &parsed, &joins, "parent", "digest").unwrap();
+        assert!(plan.ready_to_apply);
+        assert_eq!(
+            plan.sources
+                .iter()
+                .map(|s| s.target_name.as_str())
+                .collect::<Vec<_>>(),
+            vec!["a", "b", "c"]
+        );
+        let _ = std::fs::remove_dir_all(root);
+    }
+    #[test]
+    fn a_plan_from_only_the_family_joins_equals_the_plan_from_every_join() {
+        let parsed = dat(vec![
+            game("parent", None, &[("a", "a"), ("b", "b")]),
+            game("clone", Some("parent"), &[("c", "c")]),
+            game("stranger", None, &[("a", "a"), ("z", "z")]),
+        ]);
+        let family = reconstruction_family_names(&parsed, "clone").unwrap();
+        assert_eq!(family, vec!["parent".to_string(), "clone".to_string()]);
+        assert_eq!(
+            reconstruction_family_names(&parsed, "parent").unwrap(),
+            family
+        );
+        assert!(reconstruction_family_names(&parsed, "absent").is_err());
+
+        let every = vec![
+            (
+                PathBuf::from("/s/parent"),
+                join("parent", "digest", &[("a", "a"), ("b", "b")]),
+            ),
+            (
+                PathBuf::from("/s/clone"),
+                join("clone", "digest", &[("c", "c")]),
+            ),
+            // An unrelated set with the same bytes must not become a duplicate source.
+            (
+                PathBuf::from("/s/stranger"),
+                join("stranger", "digest", &[("a", "a"), ("z", "z")]),
+            ),
+        ];
+        let only_family: Vec<_> = every
+            .iter()
+            .filter(|(_, e)| family.contains(&e.logical_set_name))
+            .cloned()
+            .collect();
+        let root = Path::new("/output");
+        let from_every =
+            build_merged_reconstruction_plan(root, &parsed, &every, "clone", "digest").unwrap();
+        let from_family =
+            build_merged_reconstruction_plan(root, &parsed, &only_family, "clone", "digest")
+                .unwrap();
+        assert_eq!(from_every, from_family);
+        assert!(from_every.duplicate_candidates.is_empty());
+    }
+
+    #[test]
+    fn packed_source_discovery_only_considers_family_zip_files() {
+        let directory = tempfile::tempdir().unwrap();
+        let root = directory.path();
+        let parsed = dat(vec![
+            game("parent", None, &[("a", "a")]),
+            game("clone", Some("parent"), &[("c", "c")]),
+        ]);
+        // A directory that merely has a family archive's name is not an archive,
+        // and a file for another set is never opened (it is not a valid zip).
+        std::fs::create_dir(root.join("parent.zip")).unwrap();
+        std::fs::write(root.join("stranger.zip"), b"not a zip").unwrap();
+        std::fs::write(root.join("parent.txt"), b"x").unwrap();
+        assert!(
+            discover_packed_zip_sources(root, &parsed, "parent", "digest")
+                .unwrap()
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn duplicate_and_missing_members_block() {
+        let parsed = dat(vec![
+            game("parent", None, &[("a", "a"), ("b", "b")]),
+            game("clone", Some("parent"), &[]),
+        ]);
+        let joins = vec![
+            (
+                PathBuf::from("/one"),
+                join("parent", "digest", &[("a", "a")]),
+            ),
+            (
+                PathBuf::from("/two"),
+                join("parent", "digest", &[("a", "a")]),
+            ),
+        ];
+        let plan = build_merged_reconstruction_plan(
+            Path::new("/output"),
+            &parsed,
+            &joins,
+            "parent",
+            "digest",
+        )
+        .unwrap();
+        assert!(!plan.ready_to_apply);
+        assert_eq!(plan.duplicate_candidates, vec!["a"]);
+        assert_eq!(plan.missing_members, vec!["b"]);
+    }
+
+    fn publish_fixture(expected_sha1: &str) -> (MameMergedReconstructionPlan, PathBuf, PathBuf) {
+        let root = std::env::temp_dir().join(format!(
+            "emuwiz-mame-publish-{}-{}-{}",
+            std::process::id(),
+            crate::dat::sources::now_unix(),
+            NEXT_PUBLISH_FIXTURE.fetch_add(1, Ordering::Relaxed)
+        ));
+        let source_root = root.join("source-set");
+        std::fs::create_dir_all(&source_root).unwrap();
+        let member_path = source_root.join("member.bin");
+        std::fs::write(&member_path, b"mame member").unwrap();
+        let plan = MameMergedReconstructionPlan {
+            dat_version: "test".into(),
+            dat_sha256: "digest".into(),
+            parent: "parent".into(),
+            clones: vec!["clone".into()],
+            destination: root.join("parent.zip"),
+            required_members: vec![ReconstructionMemberRequirement {
+                owner_set: "parent".into(),
+                member_name: "member.bin".into(),
+                size_bytes: Some(b"mame member".len() as u64),
+                sha1: Some(expected_sha1.into()),
+                crc32: None,
+            }],
+            sources: vec![ReconstructionMemberSource {
+                archive_identity: None,
+                archive_path: source_root,
+                member_path: member_path.clone(),
+                current_name: "member.bin".into(),
+                target_name: "member.bin".into(),
+                observed_sha1: Some(expected_sha1.into()),
+                observed_crc32: None,
+            }],
+            missing_members: Vec::new(),
+            duplicate_candidates: Vec::new(),
+            hash_mismatches: Vec::new(),
+            unresolved_ownership: Vec::new(),
+            collisions: Vec::new(),
+            ready_to_apply: true,
+            reasons: Vec::new(),
+        };
+        (plan, root, member_path)
+    }
+
+    #[test]
+    fn staged_publish_journals_the_output_and_leaves_source_member_untouched() {
+        use crate::dat::rename_apply::journal::list_journals;
+        use sha1::Digest;
+
+        let digest = sha1::Sha1::digest(b"mame member")
+            .iter()
+            .map(|byte| format!("{byte:02x}"))
+            .collect::<String>();
+        let (plan, root, member_path) = publish_fixture(&digest);
+        let staging = root.join("staging");
+        let journal = root.join("journal");
+        let outcome = apply_staged_reconstruction_output(&plan, &staging, &journal)
+            .unwrap_or_else(|error| panic!("publication fixture failed: {error}"));
+
+        assert!(plan.destination.exists());
+        assert_eq!(std::fs::read(&member_path).unwrap(), b"mame member");
+        assert_eq!(
+            outcome.transaction.state,
+            crate::dat::rename_apply::model::TransactionState::Applied
+        );
+        let (journals, problems) = list_journals(&journal);
+        assert!(problems.is_empty());
+        assert_eq!(journals.len(), 1);
+        assert_eq!(
+            journals[0].unknown["workflow"],
+            MAME_RECONSTRUCTION_WORKFLOW
+        );
+        let mut transaction = outcome.transaction;
+        let rollback = crate::dat::rename_apply::rollback_transaction(
+            &mut transaction,
+            &journal,
+            &AtomicBool::new(false),
+        )
+        .unwrap();
+        assert_eq!(
+            rollback.transaction.state,
+            crate::dat::rename_apply::model::TransactionState::RolledBack
+        );
+        assert!(!plan.destination.exists());
+        assert_eq!(std::fs::read(&member_path).unwrap(), b"mame member");
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    /// The executor reports a publication that failed after preflight as
+    /// `Ok(ApplyOutcome)` whose transaction is `ApplyFailed`, so the outer
+    /// `Result` alone never proves that anything was published.
+    #[cfg(unix)]
+    #[test]
+    fn a_failed_publication_is_an_ok_outcome_whose_transaction_is_apply_failed() {
+        use crate::dat::rename_apply::journal::list_journals;
+        use crate::dat::rename_apply::model::{EntryState, TransactionState};
+        use sha1::Digest;
+        use std::os::unix::fs::PermissionsExt;
+
+        let digest = sha1::Sha1::digest(b"mame member")
+            .iter()
+            .map(|byte| format!("{byte:02x}"))
+            .collect::<String>();
+        let (plan, root, member_path) = publish_fixture(&digest);
+        let staging = root.join("staging");
+        let journal = root.join("journal");
+        std::fs::create_dir_all(&staging).unwrap();
+        std::fs::create_dir_all(&journal).unwrap();
+        // The destination directory refuses new entries, so the final rename
+        // fails after every preflight check has passed.
+        std::fs::set_permissions(&root, std::fs::Permissions::from_mode(0o555)).unwrap();
+        let result = apply_staged_reconstruction_output(&plan, &staging, &journal);
+        std::fs::set_permissions(&root, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+        let outcome = result.expect("the executor reports this failure inside Ok");
+        assert_eq!(outcome.transaction.state, TransactionState::ApplyFailed);
+        assert_eq!(
+            outcome.transaction.entries[0].state,
+            EntryState::ApplyFailed
+        );
+        assert!(outcome.transaction.entries[0].failure_reason.is_some());
+        assert_eq!(outcome.summary.applied, 0);
+        assert_eq!(outcome.summary.failed, 1);
+        assert!(!plan.destination.exists());
+        assert_eq!(std::fs::read(&member_path).unwrap(), b"mame member");
+        // The failed transaction stays in the recovery journal for diagnosis.
+        let (journals, problems) = list_journals(&journal);
+        assert!(problems.is_empty());
+        assert_eq!(journals.len(), 1);
+        assert_eq!(journals[0].state, TransactionState::ApplyFailed);
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn failed_staged_verification_never_publishes_the_destination() {
+        let (mut plan, root, member_path) =
+            publish_fixture("0000000000000000000000000000000000000000");
+        plan.sources[0].observed_sha1 = Some("0000000000000000000000000000000000000000".into());
+        let staging = root.join("staging");
+        let journal = root.join("journal");
+        let error = apply_staged_reconstruction_output(&plan, &staging, &journal).unwrap_err();
+
+        assert!(error.contains("staged SHA-1/CRC/size mismatch"));
+        assert!(!plan.destination.exists());
+        assert_eq!(std::fs::read(&member_path).unwrap(), b"mame member");
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn packed_zip_member_is_staged_without_modifying_the_source_archive() {
+        use sha1::Digest;
+        use zip::write::SimpleFileOptions;
+
+        let digest = sha1::Sha1::digest(b"mame member")
+            .iter()
+            .map(|byte| format!("{byte:02x}"))
+            .collect::<String>();
+        let (mut plan, root, _loose_member) = publish_fixture(&digest);
+        let packed = root.join("parent.zip");
+        let mut writer = zip::ZipWriter::new(std::fs::File::create(&packed).unwrap());
+        writer
+            .start_file("member.bin", SimpleFileOptions::default())
+            .unwrap();
+        std::io::Write::write_all(&mut writer, b"mame member").unwrap();
+        writer.finish().unwrap();
+        let before = std::fs::read(&packed).unwrap();
+        plan.sources[0].archive_path = packed.clone();
+        plan.sources[0].member_path = PathBuf::from("member.bin");
+        plan.sources[0].current_name = "member.bin".into();
+        let staging = root.join("staging");
+        let staged = stage_reconstruction_output(&plan, &staging).unwrap();
+        verify_staged_output(&plan, &staged).unwrap();
+        assert_eq!(std::fs::read(&packed).unwrap(), before);
+        assert!(!root.join("member.bin").exists());
+        let _ = std::fs::remove_dir_all(root);
+    }
+    mod replacement_publication {
+        use super::*;
+        use crate::dat::rename_apply::{journal, rollback};
+        use std::fs;
+        use std::io::Write;
+
+        fn zip(path: &Path, members: &[(&str, &[u8])]) {
+            let mut writer = zip::ZipWriter::new(fs::File::create(path).unwrap());
+            for (name, bytes) in members {
+                writer
+                    .start_file(*name, zip::write::SimpleFileOptions::default())
+                    .unwrap();
+                writer.write_all(bytes).unwrap();
+            }
+            writer.finish().unwrap();
+        }
+        fn sha(bytes: &[u8]) -> String {
+            use sha1::Digest;
+            sha1::Sha1::digest(bytes)
+                .iter()
+                .map(|b| format!("{b:02x}"))
+                .collect()
+        }
+        struct Fixture {
+            root: tempfile::TempDir,
+            plan: MameMergedReconstructionPlan,
+            evidence: ArcadeJoinEvidence,
+        }
+        impl Fixture {
+            fn new(members: &[(&str, &[u8])]) -> Self {
+                let root = tempfile::tempdir().unwrap();
+                let a = sha(b"a");
+                let b = sha(b"b");
+                let mut parsed = dat(vec![
+                    game("parent", None, &[("a.bin", &a), ("b.bin", &b)]),
+                    game("clone", Some("parent"), &[("b.bin", &b)]),
+                ]);
+                for game in &mut parsed.games {
+                    for rom in &mut game.roms {
+                        rom.size_bytes = Some(1);
+                    }
+                }
+                zip(&root.path().join("parent.zip"), members);
+                zip(&root.path().join("clone.zip"), &[("b.bin", b"b")]);
+                let mut evidence = join("parent", "digest", &[("a.bin", &a)]);
+                evidence.members[0].current_name = Some("a.bin".into());
+                let mut donor = join("clone", "digest", &[("b.bin", &b)]);
+                donor.members[0].current_name = Some("b.bin".into());
+                let plan = build_merged_reconstruction_plan(
+                    root.path(),
+                    &parsed,
+                    &[
+                        (root.path().join("parent.zip"), evidence.clone()),
+                        (root.path().join("clone.zip"), donor),
+                    ],
+                    "parent",
+                    "digest",
+                )
+                .unwrap();
+                Self {
+                    root,
+                    plan,
+                    evidence,
+                }
+            }
+            fn review(&self) -> Result<ReviewedReconstructionPublication, String> {
+                review_reconstruction_publication(&self.plan, Some(&self.evidence))
+            }
+            fn stage(&self) -> PathBuf {
+                self.root.path().join("stage")
+            }
+            fn journal(&self) -> PathBuf {
+                self.root.path().join("journal")
+            }
+        }
+
+        #[test]
+        fn incomplete_and_bad_hash_targets_preview_replacement_without_writes() {
+            for members in [
+                vec![("a.bin", b"a".as_slice())],
+                vec![("a.bin", b"a".as_slice()), ("b.bin", b"x".as_slice())],
+            ] {
+                let f = Fixture::new(&members);
+                let original = fs::read(&f.plan.destination).unwrap();
+                assert!(f.plan.blocked()); // Existing canonical family collision projection is unchanged.
+                let review = f.review().unwrap();
+                assert!(matches!(
+                    review.action(),
+                    ReconstructionPublicationAction::ReplaceExisting { .. }
+                ));
+                assert!(review.plan().ready_to_apply);
+                assert_eq!(fs::read(&f.plan.destination).unwrap(), original);
+                assert!(!f.stage().exists());
+                assert!(!f.journal().exists());
+            }
+        }
+
+        #[test]
+        fn packed_donor_replace_verifies_inventory_and_undo_restores_original_bytes() {
+            let f = Fixture::new(&[("a.bin", b"a"), ("b.bin", b"x"), ("obsolete", b"z")]);
+            let original = fs::read(&f.plan.destination).unwrap();
+            let donor = fs::read(f.root.path().join("clone.zip")).unwrap();
+            let reviewed = f.review().unwrap();
+            let result = reviewed.apply(&f.stage(), &f.journal()).unwrap().unwrap();
+            assert_eq!(
+                result.transaction.state,
+                crate::dat::rename_apply::TransactionState::Applied
+            );
+            verify_staged_output(reviewed.plan(), &f.plan.destination).unwrap();
+            let preserved = &result.transaction.entries[0].source_path;
+            assert_eq!(fs::read(preserved).unwrap(), original);
+            assert_eq!(fs::read(f.root.path().join("clone.zip")).unwrap(), donor);
+            // Reusing staging must not destroy the preserved original.
+            assert!(stage_reconstruction_output(reviewed.plan(), &f.stage()).is_err());
+            assert_eq!(fs::read(preserved).unwrap(), original);
+            let path =
+                journal::journal_path(&f.journal(), &result.transaction.transaction_id).unwrap();
+            let mut transaction = journal::read_journal(&path).unwrap();
+            rollback::rollback_transaction_confined(
+                &mut transaction,
+                &f.journal(),
+                &AtomicBool::new(false),
+                &TrustedRoots::from_paths([f.root.path()]),
+            )
+            .unwrap();
+            assert_eq!(fs::read(&f.plan.destination).unwrap(), original);
+            rollback::rollback_transaction_confined(
+                &mut transaction,
+                &f.journal(),
+                &AtomicBool::new(false),
+                &TrustedRoots::from_paths([f.root.path()]),
+            )
+            .unwrap();
+            assert_eq!(fs::read(&f.plan.destination).unwrap(), original);
+            assert_eq!(fs::read(f.root.path().join("clone.zip")).unwrap(), donor);
+        }
+
+        #[test]
+        fn staging_lifecycle_replace_undo_cycles_cleanup_preserve_exact_bytes() {
+            use super::super::staging_lifecycle::{cleanup, inventory};
+            let f = Fixture::new(&[("a.bin", b"a")]);
+            let original = fs::read(&f.plan.destination).unwrap();
+            for _ in 0..3 {
+                let applied = f
+                    .review()
+                    .unwrap()
+                    .apply(&f.stage(), &f.journal())
+                    .unwrap()
+                    .unwrap();
+                let staged = applied.transaction.entries[0].source_path.clone();
+                let before = inventory(&f.stage(), &f.journal()).unwrap();
+                let item = before.iter().find(|i| i.path == staged).unwrap();
+                assert!(!item.cleanup_eligible);
+                assert!(item.retention_reason.contains("Undo original"));
+                assert!(
+                    cleanup(
+                        &f.stage(),
+                        &f.journal(),
+                        item,
+                        "DELETE REDUNDANT MAME OUTPUT",
+                        "I HAVE EXCLUSIVE STAGING AND JOURNAL ACCESS"
+                    )
+                    .is_err()
+                );
+                let mut t = applied.transaction;
+                rollback::rollback_transaction_confined(
+                    &mut t,
+                    &f.journal(),
+                    &AtomicBool::new(false),
+                    &TrustedRoots::from_paths([f.root.path()]),
+                )
+                .unwrap();
+                assert_eq!(fs::read(&f.plan.destination).unwrap(), original);
+                let list = inventory(&f.stage(), &f.journal()).unwrap();
+                let item = list.iter().find(|i| i.path == staged).unwrap();
+                assert!(item.cleanup_eligible, "{}", item.retention_reason);
+                assert!(
+                    cleanup(
+                        &f.stage(),
+                        &f.journal(),
+                        item,
+                        "yes",
+                        "I HAVE EXCLUSIVE STAGING AND JOURNAL ACCESS"
+                    )
+                    .is_err()
+                );
+                cleanup(
+                    &f.stage(),
+                    &f.journal(),
+                    item,
+                    "DELETE REDUNDANT MAME OUTPUT",
+                    "I HAVE EXCLUSIVE STAGING AND JOURNAL ACCESS",
+                )
+                .unwrap();
+                assert!(!staged.exists());
+                assert_eq!(fs::read(&f.plan.destination).unwrap(), original);
+                // A repeated Undo remains a truthful no-op after cleanup.
+                rollback::rollback_transaction_confined(
+                    &mut t,
+                    &f.journal(),
+                    &AtomicBool::new(false),
+                    &TrustedRoots::from_paths([f.root.path()]),
+                )
+                .unwrap();
+            }
+        }
+
+        #[test]
+        fn staging_lifecycle_refuses_changed_missing_ambiguous_and_busy_files() {
+            use super::super::staging_lifecycle::{StagingLock, cleanup, inventory};
+            let f = Fixture::new(&[("a.bin", b"a")]);
+            let applied = f
+                .review()
+                .unwrap()
+                .apply(&f.stage(), &f.journal())
+                .unwrap()
+                .unwrap();
+            let mut t = applied.transaction;
+            let staged = t.entries[0].source_path.clone();
+            rollback::rollback_transaction_confined(
+                &mut t,
+                &f.journal(),
+                &AtomicBool::new(false),
+                &TrustedRoots::from_paths([f.root.path()]),
+            )
+            .unwrap();
+            let list = inventory(&f.stage(), &f.journal()).unwrap();
+            let reviewed = list.iter().find(|i| i.path == staged).unwrap();
+            assert!(reviewed.cleanup_eligible);
+            let foreign = f.stage().join("manual.zip");
+            fs::write(&foreign, b"manual").unwrap();
+            assert!(
+                !inventory(&f.stage(), &f.journal())
+                    .unwrap()
+                    .iter()
+                    .find(|i| i.path == foreign)
+                    .unwrap()
+                    .cleanup_eligible
+            );
+            let held = fs::File::open(&staged).unwrap();
+            assert!(
+                cleanup(
+                    &f.stage(),
+                    &f.journal(),
+                    reviewed,
+                    "DELETE REDUNDANT MAME OUTPUT",
+                    "I HAVE EXCLUSIVE STAGING AND JOURNAL ACCESS"
+                )
+                .is_err()
+            );
+            drop(held);
+            let guard = StagingLock::acquire(&f.stage(), &f.journal()).unwrap();
+            assert!(inventory(&f.stage(), &f.journal()).is_err());
+            assert!(f.review().unwrap().apply(&f.stage(), &f.journal()).is_err());
+            assert!(
+                rollback::rollback_transaction_confined(
+                    &mut t,
+                    &f.journal(),
+                    &AtomicBool::new(false),
+                    &TrustedRoots::from_paths([f.root.path()])
+                )
+                .is_err()
+            );
+            drop(guard);
+            let mut duplicate = t.clone();
+            duplicate.transaction_id = "duplicate-owner".into();
+            journal::write_journal(&f.journal(), &duplicate).unwrap();
+            assert!(
+                cleanup(
+                    &f.stage(),
+                    &f.journal(),
+                    reviewed,
+                    "DELETE REDUNDANT MAME OUTPUT",
+                    "I HAVE EXCLUSIVE STAGING AND JOURNAL ACCESS"
+                )
+                .is_err()
+            );
+            fs::remove_file(journal::journal_path(&f.journal(), "duplicate-owner").unwrap())
+                .unwrap();
+            let bytes = fs::read(&staged).unwrap();
+            fs::write(&staged, b"changed").unwrap();
+            assert!(
+                cleanup(
+                    &f.stage(),
+                    &f.journal(),
+                    reviewed,
+                    "DELETE REDUNDANT MAME OUTPUT",
+                    "I HAVE EXCLUSIVE STAGING AND JOURNAL ACCESS"
+                )
+                .is_err()
+            );
+            fs::write(&staged, bytes).unwrap();
+            assert!(
+                cleanup(
+                    &f.stage(),
+                    &f.journal(),
+                    reviewed,
+                    "DELETE REDUNDANT MAME OUTPUT",
+                    "I HAVE EXCLUSIVE STAGING AND JOURNAL ACCESS"
+                )
+                .is_err()
+            );
+            fs::remove_file(&staged).unwrap();
+            assert!(
+                cleanup(
+                    &f.stage(),
+                    &f.journal(),
+                    reviewed,
+                    "DELETE REDUNDANT MAME OUTPUT",
+                    "I HAVE EXCLUSIVE STAGING AND JOURNAL ACCESS"
+                )
+                .is_err()
+            );
+            assert!(
+                inventory(&f.stage(), &f.journal())
+                    .unwrap()
+                    .iter()
+                    .find(|i| i.path == staged)
+                    .unwrap()
+                    .retention_reason
+                    .contains("absent")
+            );
+            assert_eq!(fs::read(foreign).unwrap(), b"manual");
+        }
+
+        #[test]
+        fn staging_lifecycle_revalidates_cleanup_edges_and_unknown_references() {
+            use super::super::staging_lifecycle::{cleanup, inventory};
+            struct Reset;
+            impl Drop for Reset {
+                fn drop(&mut self) {
+                    super::super::owned_attempt::HOOK.with(|h| *h.borrow_mut() = None);
+                }
+            }
+            for edge in [
+                "before_cleanup",
+                "before_cleanup_lease",
+                "before_cleanup_unlink",
+                "journal",
+                "unknown_reference",
+                "unknown_key",
+                "lease_break",
+                "parent",
+            ] {
+                let f = Fixture::new(&[("a.bin", b"a")]);
+                let mut t = f
+                    .review()
+                    .unwrap()
+                    .apply(&f.stage(), &f.journal())
+                    .unwrap()
+                    .unwrap()
+                    .transaction;
+                rollback::rollback_transaction_confined(
+                    &mut t,
+                    &f.journal(),
+                    &AtomicBool::new(false),
+                    &TrustedRoots::from_paths([f.root.path()]),
+                )
+                .unwrap();
+                let list = inventory(&f.stage(), &f.journal()).unwrap();
+                let reviewed = list.iter().find(|i| i.cleanup_eligible).unwrap();
+                assert!(
+                    cleanup(
+                        &f.stage(),
+                        &f.journal(),
+                        reviewed,
+                        "DELETE REDUNDANT MAME OUTPUT",
+                        ""
+                    )
+                    .is_err()
+                );
+                let journal_dir = f.journal();
+                let stage_dir = f.stage();
+                let stage_old = f.root.path().join("old-stage");
+                let saved = f.root.path().join("saved-output");
+                let original = fs::read(&f.plan.destination).unwrap();
+                let mut other = t.clone();
+                let _reset = Reset;
+                super::super::owned_attempt::HOOK.with(|h| {
+                    *h.borrow_mut() = Some(Box::new(move |name, path| {
+                        let trigger = match edge {
+                            "journal" | "unknown_reference" | "unknown_key" | "lease_break" | "parent" => "before_cleanup_unlink",
+                            _ => edge,
+                        };
+                        if name != trigger {
+                            return Ok(());
+                        }
+                        match edge {
+                            "journal" => {
+                                fs::write(journal_dir.join("broken.json"), b"{").unwrap();
+                            }
+                            "unknown_reference" | "unknown_key" => {
+                                other.transaction_id = "other-reference".into();
+                                other.entries[0].source_path = stage_dir.join("another-output");
+                                other.entries[0].destination_path =
+                                    stage_dir.join("another-destination");
+                                other.entries[0]
+                                    .unknown
+                                    .insert("recovery_anchor".into(), if edge == "unknown_key" { serde_json::json!({path.to_string_lossy().as_ref(): "required"}) } else { serde_json::json!(path) });
+                                journal::write_journal(&journal_dir, &other).unwrap();
+                            }
+                            "lease_break" => {
+                                use std::os::unix::fs::OpenOptionsExt;
+                                let blocked = fs::OpenOptions::new().read(true).custom_flags(libc::O_NONBLOCK).open(path);
+                                assert!(blocked.is_err());
+                            }
+                            "parent" => {
+                                fs::rename(&stage_dir, &stage_old).unwrap();
+                                fs::create_dir(&stage_dir).unwrap();
+                                fs::write(stage_dir.join(path.file_name().unwrap()), b"manual")
+                                    .unwrap();
+                            }
+                            "before_cleanup_lease" => {
+                                fs::write(path, b"same-inode edit").unwrap();
+                            }
+                            _ => {
+                                fs::rename(path, &saved).unwrap();
+                                fs::write(path, b"manual").unwrap();
+                            }
+                        }
+                        Ok(())
+                    }))
+                });
+                assert!(
+                    cleanup(
+                        &f.stage(),
+                        &f.journal(),
+                        reviewed,
+                        "DELETE REDUNDANT MAME OUTPUT",
+                        "I HAVE EXCLUSIVE STAGING AND JOURNAL ACCESS"
+                    )
+                    .is_err(),
+                    "{edge}"
+                );
+                assert!(reviewed.path.exists(), "{edge}");
+                assert_eq!(fs::read(&f.plan.destination).unwrap(), original);
+                if matches!(edge, "before_cleanup" | "before_cleanup_unlink" | "parent") {
+                    assert_eq!(fs::read(&reviewed.path).unwrap(), b"manual");
+                }
+            }
+        }
+
+        #[test]
+        fn staging_lifecycle_deletion_boundary_never_deletes_a_substituted_entry() {
+            use super::super::staging_lifecycle::{cleanup, inventory};
+            use crate::dat::rename_apply::identity::{capture_identity, identity_matches};
+            struct Reset;
+            impl Drop for Reset {
+                fn drop(&mut self) {
+                    super::super::owned_attempt::HOOK.with(|h| *h.borrow_mut() = None);
+                }
+            }
+            let retiring = |dir: &Path| {
+                fs::read_dir(dir)
+                    .unwrap()
+                    .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+                    .filter(|n| n.starts_with(".retiring-"))
+                    .collect::<Vec<_>>()
+            };
+            for edge in [
+                "none",
+                "swap_private",
+                "swap_before_set_aside",
+                "swap_before_final_proof",
+                "journal_change",
+                "journal_change_and_swap",
+            ] {
+                let f = Fixture::new(&[("a.bin", b"a")]);
+                let mut t = f
+                    .review()
+                    .unwrap()
+                    .apply(&f.stage(), &f.journal())
+                    .unwrap()
+                    .unwrap()
+                    .transaction;
+                rollback::rollback_transaction_confined(
+                    &mut t,
+                    &f.journal(),
+                    &AtomicBool::new(false),
+                    &TrustedRoots::from_paths([f.root.path()]),
+                )
+                .unwrap();
+                let original = fs::read(&f.plan.destination).unwrap();
+                let list = inventory(&f.stage(), &f.journal()).unwrap();
+                let reviewed = list.iter().find(|i| i.cleanup_eligible).unwrap().clone();
+                let output = fs::read(&reviewed.path).unwrap();
+                let saved = f.root.path().join("moved-away");
+                let journal_dir = f.journal();
+                let mut other = t.clone();
+                let stage_dir = f.stage();
+                let _reset = Reset;
+                let hook_saved = saved.clone();
+                super::super::owned_attempt::HOOK.with(|h| {
+                    *h.borrow_mut() = Some(Box::new(move |name, path| {
+                        let trigger = match edge {
+                            "swap_before_set_aside" => "before_cleanup_set_aside",
+                            "swap_before_final_proof" | "journal_change_and_swap" => {
+                                "before_cleanup_final_proof"
+                            }
+                            _ => "cleanup_set_aside",
+                        };
+                        if name != trigger {
+                            return Ok(());
+                        }
+                        match edge {
+                            "swap_before_set_aside" | "swap_before_final_proof" => {
+                                fs::rename(path, &hook_saved).unwrap();
+                                fs::write(path, b"foreign object").unwrap();
+                            }
+                            "journal_change_and_swap" => {
+                                other.transaction_id = "mame-arrived-late".into();
+                                other.entries[0].source_path = stage_dir.join("unrelated");
+                                other.entries[0].destination_path =
+                                    stage_dir.join("unrelated-destination");
+                                journal::write_journal(&journal_dir, &other).unwrap();
+                                fs::rename(path, &hook_saved).unwrap();
+                                fs::write(path, b"foreign object").unwrap();
+                            }
+                            "swap_private" => {
+                                fs::rename(path, &hook_saved).unwrap();
+                                fs::write(path, b"foreign object").unwrap();
+                            }
+                            "journal_change" => {
+                                other.transaction_id = "mame-arrived-late".into();
+                                other.entries[0].source_path = stage_dir.join("unrelated");
+                                other.entries[0].destination_path =
+                                    stage_dir.join("unrelated-destination");
+                                journal::write_journal(&journal_dir, &other).unwrap();
+                            }
+                            _ => {}
+                        }
+                        Ok(())
+                    }))
+                });
+                let result = cleanup(
+                    &f.stage(),
+                    &f.journal(),
+                    &reviewed,
+                    "DELETE REDUNDANT MAME OUTPUT",
+                    "I HAVE EXCLUSIVE STAGING AND JOURNAL ACCESS",
+                );
+                assert_eq!(fs::read(&f.plan.destination).unwrap(), original, "{edge}");
+                match edge {
+                    "none" => {
+                        result.unwrap();
+                        assert!(!reviewed.path.exists());
+                        assert!(retiring(&f.stage()).is_empty());
+                    }
+                    "swap_private"
+                    | "swap_before_set_aside"
+                    | "swap_before_final_proof"
+                    | "journal_change_and_swap" => {
+                        let error = result.unwrap_err();
+                        assert!(error.contains("nothing was removed"), "{error}");
+                        // The proven file and the foreign object both survive.
+                        assert_eq!(fs::read(&saved).unwrap(), output);
+                        let left = retiring(&f.stage());
+                        assert_eq!(left.len(), 1);
+                        assert_eq!(
+                            fs::read(f.stage().join(&left[0])).unwrap(),
+                            b"foreign object"
+                        );
+                        assert!(!reviewed.path.exists());
+                        // The set-aside entry is reported truthfully and never offered.
+                        let now = inventory(&f.stage(), &f.journal()).unwrap();
+                        let set_aside = now
+                            .iter()
+                            .find(|i| i.path == f.stage().join(&left[0]))
+                            .unwrap();
+                        assert!(!set_aside.cleanup_eligible);
+                        assert!(
+                            set_aside
+                                .retention_reason
+                                .contains("interrupted or refused cleanup")
+                        );
+                        assert!(now.iter().all(|i| !i.cleanup_eligible));
+                    }
+                    _ => {
+                        let error = result.unwrap_err();
+                        assert!(error.contains("put back unchanged"), "{error}");
+                        assert!(retiring(&f.stage()).is_empty());
+                        let back = capture_identity(&reviewed.path).unwrap();
+                        assert!(identity_matches(reviewed.identity.as_ref().unwrap(), &back));
+                        assert_eq!(fs::read(&reviewed.path).unwrap(), output);
+                    }
+                }
+            }
+        }
+
+        #[test]
+        fn staging_lifecycle_unknown_journal_references_are_never_cleanup_authority() {
+            use super::super::staging_lifecycle::inventory;
+            for mode in ["entry", "key", "same_owner", "operation"] {
+                let f = Fixture::new(&[("a.bin", b"a")]);
+                let mut t = f
+                    .review()
+                    .unwrap()
+                    .apply(&f.stage(), &f.journal())
+                    .unwrap()
+                    .unwrap()
+                    .transaction;
+                rollback::rollback_transaction_confined(
+                    &mut t,
+                    &f.journal(),
+                    &AtomicBool::new(false),
+                    &TrustedRoots::from_paths([f.root.path()]),
+                )
+                .unwrap();
+                let staged = t.entries[0].source_path.clone();
+                assert!(
+                    inventory(&f.stage(), &f.journal())
+                        .unwrap()
+                        .iter()
+                        .find(|i| i.path == staged)
+                        .unwrap()
+                        .cleanup_eligible
+                );
+                let mut other = t.clone();
+                if mode != "same_owner" {
+                    other.transaction_id = "foreign-reference".into();
+                    other.entries[0].source_path = f.stage().join("other");
+                    other.entries[0].destination_path = f.root.path().join("other-target");
+                }
+                match mode {
+                    "key" => {
+                        other.entries[0].unknown.insert(
+                            "future_map".into(),
+                            serde_json::json!({staged.to_string_lossy().as_ref(): "required"}),
+                        );
+                    }
+                    "operation" => {
+                        other.entries[0].operation =
+                            crate::dat::rename_apply::model::TransactionOperation::CreateHardlink {
+                                expected_source: staged.clone(),
+                                destination_root: f.root.path().to_path_buf(),
+                            };
+                    }
+                    _ => {
+                        other.entries[0]
+                            .unknown
+                            .insert("future_recovery_copy".into(), serde_json::json!(&staged));
+                    }
+                }
+                journal::write_journal(&f.journal(), &other).unwrap();
+                assert!(
+                    !inventory(&f.stage(), &f.journal())
+                        .unwrap()
+                        .iter()
+                        .find(|i| i.path == staged)
+                        .unwrap()
+                        .cleanup_eligible,
+                    "{mode}"
+                );
+            }
+        }
+
+        #[test]
+        fn staging_lifecycle_inventory_without_journal_is_read_only() {
+            use super::super::staging_lifecycle::inventory;
+            let root = tempfile::tempdir().unwrap();
+            let staging = root.path().join("stage");
+            let journal = root.path().join("not-created");
+            fs::create_dir(&staging).unwrap();
+            fs::write(staging.join("manual.zip"), b"manual").unwrap();
+            let list = inventory(&staging, &journal).unwrap();
+            assert_eq!(list.len(), 1);
+            assert!(!list[0].cleanup_eligible);
+            assert!(!journal.exists());
+            assert_eq!(fs::read(staging.join("manual.zip")).unwrap(), b"manual");
+        }
+
+        #[test]
+        fn staging_lifecycle_retains_interrupted_and_acknowledged_recovery() {
+            use super::super::staging_lifecycle::{cleanup, inventory};
+            use crate::dat::rename_apply::model::{
+                EntryState, RecoveryResolution, TransactionState,
+            };
+            for state in [
+                TransactionState::Applying,
+                TransactionState::RollingBack,
+                TransactionState::RollbackFailed,
+            ] {
+                let f = Fixture::new(&[("a.bin", b"a")]);
+                let mut t = f
+                    .review()
+                    .unwrap()
+                    .apply(&f.stage(), &f.journal())
+                    .unwrap()
+                    .unwrap()
+                    .transaction;
+                rollback::rollback_transaction_confined(
+                    &mut t,
+                    &f.journal(),
+                    &AtomicBool::new(false),
+                    &TrustedRoots::from_paths([f.root.path()]),
+                )
+                .unwrap();
+                let list = inventory(&f.stage(), &f.journal()).unwrap();
+                let reviewed = list.iter().find(|i| i.cleanup_eligible).unwrap();
+                let mut interrupted = t.clone();
+                interrupted.transaction_id = "interrupted".into();
+                interrupted.entries[0].source_path = f.stage().join("missing-recovery-copy");
+                interrupted.state = state;
+                interrupted.entries[0].state = EntryState::RollingBack;
+                interrupted.recovery_resolution = Some(RecoveryResolution::LeaveUntouched);
+                journal::write_journal(&f.journal(), &interrupted).unwrap();
+                assert!(
+                    cleanup(
+                        &f.stage(),
+                        &f.journal(),
+                        reviewed,
+                        "DELETE REDUNDANT MAME OUTPUT",
+                        "I HAVE EXCLUSIVE STAGING AND JOURNAL ACCESS"
+                    )
+                    .is_err()
+                );
+                interrupted.state = TransactionState::RolledBack;
+                interrupted.entries[0].state = EntryState::RollingBack; // Contradictory stale record.
+                journal::write_journal(&f.journal(), &interrupted).unwrap();
+                assert!(
+                    cleanup(
+                        &f.stage(),
+                        &f.journal(),
+                        reviewed,
+                        "DELETE REDUNDANT MAME OUTPUT",
+                        "I HAVE EXCLUSIVE STAGING AND JOURNAL ACCESS"
+                    )
+                    .is_err()
+                );
+                fs::write(f.journal().join("broken.json"), b"{").unwrap();
+                assert!(inventory(&f.stage(), &f.journal()).is_err());
+            }
+        }
+
+        #[test]
+        fn valid_existing_target_is_read_only_noop() {
+            let f = Fixture::new(&[("a.bin", b"a"), ("b.bin", b"b")]);
+            let original = fs::read(&f.plan.destination).unwrap();
+            let review = f.review().unwrap();
+            assert!(matches!(
+                review.action(),
+                ReconstructionPublicationAction::Unchanged { .. }
+            ));
+            assert!(review.apply(&f.stage(), &f.journal()).unwrap().is_none());
+            assert_eq!(fs::read(&f.plan.destination).unwrap(), original);
+            assert!(!f.stage().exists());
+            assert!(!f.journal().exists());
+        }
+
+        #[test]
+        fn reviewed_missing_target_still_uses_create_path() {
+            let mut f = Fixture::new(&[("a.bin", b"a")]);
+            let donor = f.root.path().join("a-donor.zip");
+            fs::rename(&f.plan.destination, &donor).unwrap();
+            f.plan.sources[0].archive_path = donor;
+            f.plan.collisions.clear();
+            f.plan.reasons.clear();
+            f.plan.ready_to_apply = true;
+            let review = review_reconstruction_publication(&f.plan, None).unwrap();
+            assert_eq!(review.action(), &ReconstructionPublicationAction::Create);
+            review.apply(&f.stage(), &f.journal()).unwrap().unwrap();
+            verify_staged_output(&f.plan, &f.plan.destination).unwrap();
+        }
+
+        #[test]
+        fn target_or_donor_changes_after_review_refuse_before_staging() {
+            for donor in [false, true] {
+                let f = Fixture::new(&[("a.bin", b"a")]);
+                let review = f.review().unwrap();
+                let target_before = fs::read(&f.plan.destination).unwrap();
+                if donor {
+                    zip(&f.root.path().join("clone.zip"), &[("b.bin", b"x")]);
+                } else {
+                    zip(&f.plan.destination, &[("a.bin", b"a"), ("later", b"x")]);
+                }
+                assert!(review.apply(&f.stage(), &f.journal()).is_err());
+                assert!(!f.stage().exists());
+                if donor {
+                    assert_eq!(fs::read(&f.plan.destination).unwrap(), target_before);
+                }
+            }
+        }
+
+        #[test]
+        fn changed_published_target_blocks_undo_without_clobbering_user_changes() {
+            let f = Fixture::new(&[("a.bin", b"a")]);
+            let result = f
+                .review()
+                .unwrap()
+                .apply(&f.stage(), &f.journal())
+                .unwrap()
+                .unwrap();
+            fs::write(&f.plan.destination, b"later user data").unwrap();
+            let mut transaction = result.transaction;
+            let result = rollback::rollback_transaction_confined(
+                &mut transaction,
+                &f.journal(),
+                &AtomicBool::new(false),
+                &TrustedRoots::from_paths([f.root.path()]),
+            )
+            .unwrap();
+            assert_ne!(
+                result.transaction.state,
+                crate::dat::rename_apply::TransactionState::RolledBack
+            );
+            assert_eq!(fs::read(&f.plan.destination).unwrap(), b"later user data");
+            assert!(transaction.entries[0].source_path.exists());
+        }
+
+        #[test]
+        fn foreign_target_and_unproven_or_stale_dat_evidence_refuse() {
+            let f = Fixture::new(&[("alien", b"q")]);
+            assert!(f.review().is_err());
+            let mut f = Fixture::new(&[("a.bin", b"a")]);
+            assert!(review_reconstruction_publication(&f.plan, None).is_err());
+            f.evidence.dat_sha256 = "different catalogue".into();
+            assert!(f.review().is_err());
+        }
+
+        #[test]
+        fn symlink_and_malformed_target_refuse() {
+            let f = Fixture::new(&[("a.bin", b"a")]);
+            fs::remove_file(&f.plan.destination).unwrap();
+            std::os::unix::fs::symlink(f.root.path().join("clone.zip"), &f.plan.destination)
+                .unwrap();
+            assert!(f.review().is_err());
+            fs::remove_file(&f.plan.destination).unwrap();
+            fs::write(&f.plan.destination, b"malformed zip").unwrap();
+            assert!(f.review().is_err());
+        }
+
+        #[test]
+        fn bad_donor_evidence_cannot_publish_and_original_is_untouched() {
+            let f = Fixture::new(&[("a.bin", b"a")]);
+            let original = fs::read(&f.plan.destination).unwrap();
+            zip(&f.root.path().join("clone.zip"), &[("b.bin", b"x")]);
+            // Stale persisted join claims b; actual staging must verify it.
+            let review = f.review().unwrap();
+            assert!(review.apply(&f.stage(), &f.journal()).is_err());
+            assert_eq!(fs::read(&f.plan.destination).unwrap(), original);
+            assert!(!f.journal().exists());
+        }
+
+        #[test]
+        fn verifier_refuses_unexpected_members_and_crc_only_wrong_bytes() {
+            let mut f = Fixture::new(&[("a.bin", b"a")]);
+            let output = f.root.path().join("output.zip");
+            zip(
+                &output,
+                &[("a.bin", b"a"), ("b.bin", b"b"), ("extra", b"x")],
+            );
+            assert!(verify_staged_output(&f.plan, &output).is_err());
+            for required in &mut f.plan.required_members {
+                required.sha1 = None;
+                let mut crc = crate::identity_source::hashing::Crc32::new();
+                crc.update(if required.member_name == "a.bin" {
+                    b"a"
+                } else {
+                    b"b"
+                });
+                required.crc32 = Some(crc.finish_hex());
+            }
+            zip(&output, &[("a.bin", b"a"), ("b.bin", b"x")]);
+            assert!(verify_staged_output(&f.plan, &output).is_err());
+            zip(&output, &[("a.bin", b"a"), ("b.bin", b"b")]);
+            verify_staged_output(&f.plan, &output).unwrap();
+        }
+        #[test]
+        fn duplicate_target_members_can_be_replaced_from_unambiguous_clean_donors() {
+            let mut f = Fixture::new(&[("a.bin", b"a"), ("c.bin", b"x")]);
+            let mut bytes = fs::read(&f.plan.destination).unwrap();
+            for at in 0..bytes.len().saturating_sub(4) {
+                if &bytes[at..at + 5] == b"c.bin" {
+                    bytes[at] = b'a';
+                }
+            }
+            fs::write(&f.plan.destination, &bytes).unwrap();
+            let original = bytes;
+            let donor = f.root.path().join("clean-parent.zip");
+            zip(&donor, &[("a.bin", b"a")]);
+            f.plan.sources[0].archive_path = donor;
+            f.plan.sources[0].archive_identity =
+                SourceArchiveIdentity::of(&f.plan.sources[0].archive_path);
+            let review = f.review().unwrap();
+            let output = review.apply(&f.stage(), &f.journal()).unwrap().unwrap();
+            verify_staged_output(&f.plan, &f.plan.destination).unwrap();
+            assert_eq!(
+                fs::read(&output.transaction.entries[0].source_path).unwrap(),
+                original
+            );
+        }
+
+        #[test]
+        fn bounded_family_with_large_packed_member_and_many_small_members() {
+            use sha1::Digest;
+            let mut f = Fixture::new(&[("a.bin", b"a")]);
+            let donor = f.root.path().join("clone.zip");
+            let mut writer = zip::ZipWriter::new(fs::File::create(&donor).unwrap());
+            let options = zip::write::SimpleFileOptions::default()
+                .compression_method(zip::CompressionMethod::Stored);
+            writer.start_file("b.bin", options).unwrap();
+            writer.write_all(b"b").unwrap();
+            writer.start_file("large.bin", options).unwrap();
+            let mut chunk = [0u8; 64 * 1024];
+            let mut seed = 0x12345678u32;
+            for byte in &mut chunk {
+                seed ^= seed << 13;
+                seed ^= seed >> 17;
+                seed ^= seed << 5;
+                *byte = seed as u8;
+            }
+            let mut digest = sha1::Sha1::new();
+            for _ in 0..512 {
+                writer.write_all(&chunk).unwrap();
+                digest.update(chunk);
+            }
+            let mut additions = vec![(
+                "large.bin".to_owned(),
+                32 * 1024 * 1024,
+                digest
+                    .finalize()
+                    .iter()
+                    .map(|b| format!("{b:02x}"))
+                    .collect(),
+            )];
+            for i in 0..256u32 {
+                let name = format!("small-{i:03}.bin");
+                let bytes = i.to_le_bytes();
+                writer.start_file(&name, options).unwrap();
+                writer.write_all(&bytes).unwrap();
+                additions.push((name, 4, sha(&bytes)));
+            }
+            writer.finish().unwrap();
+            for (name, size, hash) in additions {
+                f.plan
+                    .required_members
+                    .push(ReconstructionMemberRequirement {
+                        owner_set: "clone".into(),
+                        member_name: name.clone(),
+                        size_bytes: Some(size),
+                        sha1: Some(hash.clone()),
+                        crc32: None,
+                    });
+                f.plan.sources.push(ReconstructionMemberSource {
+                    archive_identity: None,
+                    archive_path: donor.clone(),
+                    member_path: PathBuf::from(&name),
+                    current_name: name.clone(),
+                    target_name: name,
+                    observed_sha1: Some(hash),
+                    observed_crc32: None,
+                });
+            }
+            for source in &mut f.plan.sources {
+                source.archive_identity = SourceArchiveIdentity::of(&source.archive_path);
+            }
+            let before = capture_for_test(&donor);
+            let started = std::time::Instant::now();
+            let reviewed = f.review().unwrap();
+            reviewed.apply(&f.stage(), &f.journal()).unwrap().unwrap();
+            verify_staged_output(&f.plan, &f.plan.destination).unwrap();
+            assert_eq!(f.plan.required_members.len(), 259);
+            assert_eq!(capture_for_test(&donor), before);
+            eprintln!(
+                "MAME replacement synthetic: 259 members, 32 MiB largest, elapsed {:?}",
+                started.elapsed()
+            );
+        }
+
+        // ---- Finalise Replacement -------------------------------------------------
+        mod finalise {
+            use super::*;
+            use crate::dat::mame_merged_reconstruction::staging_lifecycle::{
+                FINALISE_CONFIRMATION, Finalise, StagingItem, cancel_interrupted_finalise,
+                complete_interrupted_finalise, finalise_marker, finalise_replacement, inventory,
+            };
+            use crate::dat::rename_apply::model::{
+                EntryState, RenameTransaction, TransactionState,
+            };
+            const EXCL: &str = "I HAVE EXCLUSIVE STAGING AND JOURNAL ACCESS";
+            struct Reset;
+            impl Drop for Reset {
+                fn drop(&mut self) {
+                    super::super::super::owned_attempt::HOOK.with(|h| *h.borrow_mut() = None);
+                }
+            }
+            fn fail_at(point: &'static str) -> Reset {
+                super::super::super::owned_attempt::HOOK.with(|h| {
+                    *h.borrow_mut() = Some(Box::new(move |name, _| {
+                        if name == point {
+                            Err(format!("injected failure at {point}"))
+                        } else {
+                            Ok(())
+                        }
+                    }))
+                });
+                Reset
+            }
+            fn applied(f: &Fixture) -> (RenameTransaction, PathBuf) {
+                let r = f
+                    .review()
+                    .unwrap()
+                    .apply(&f.stage(), &f.journal())
+                    .unwrap()
+                    .unwrap();
+                let original = r.transaction.entries[0].source_path.clone();
+                (r.transaction, original)
+            }
+            fn item(f: &Fixture, original: &Path) -> StagingItem {
+                inventory(&f.stage(), &f.journal())
+                    .unwrap()
+                    .into_iter()
+                    .find(|i| i.path == original)
+                    .unwrap()
+            }
+            fn disk(f: &Fixture, id: &str) -> RenameTransaction {
+                journal::read_journal(&journal::journal_path(&f.journal(), id).unwrap()).unwrap()
+            }
+            fn undo(f: &Fixture, id: &str) -> Result<(), String> {
+                let mut t = disk(f, id);
+                rollback::rollback_transaction_confined(
+                    &mut t,
+                    &f.journal(),
+                    &AtomicBool::new(false),
+                    &TrustedRoots::from_paths([f.root.path()]),
+                )
+                .map(|_| ())
+            }
+            fn finalise(f: &Fixture, i: &StagingItem) -> Result<(), String> {
+                finalise_replacement(&f.stage(), &f.journal(), i, FINALISE_CONFIRMATION, EXCL)
+                    .map(|_| ())
+            }
+            fn marker_phase(f: &Fixture, id: &str) -> Option<Finalise> {
+                finalise_marker(&disk(f, id))
+            }
+
+            #[test]
+            fn success_deletes_only_the_original_keeps_output_and_history_and_refuses_undo() {
+                let f = Fixture::new(&[("a.bin", b"a"), ("b.bin", b"x")]);
+                let (t, original) = applied(&f);
+                let published = fs::read(&f.plan.destination).unwrap();
+                let donor = fs::read(f.root.path().join("clone.zip")).unwrap();
+                let i = item(&f, &original);
+                assert!(i.finalise_eligible, "{}", i.retention_reason);
+                assert!(!i.cleanup_eligible);
+                let report =
+                    finalise_replacement(&f.stage(), &f.journal(), &i, FINALISE_CONFIRMATION, EXCL)
+                        .unwrap();
+                assert_eq!(report.transaction_id, t.transaction_id);
+                assert!(fs::symlink_metadata(&original).is_err());
+                assert_eq!(fs::read(&f.plan.destination).unwrap(), published);
+                assert_eq!(fs::read(f.root.path().join("clone.zip")).unwrap(), donor);
+                let d = disk(&f, &t.transaction_id);
+                assert_eq!(d.state, TransactionState::Finalised);
+                assert!(matches!(
+                    finalise_marker(&d),
+                    Some(Finalise::Finalised { .. })
+                ));
+                assert!(d.entries.iter().all(|e| e.state == EntryState::Applied));
+                assert!(!d.state.needs_recovery() && !d.is_rollbackable());
+                let after = item(&f, &original);
+                assert!(!after.finalise_eligible && !after.cleanup_eligible);
+                assert!(
+                    after.retention_reason.contains("finalised"),
+                    "{}",
+                    after.retention_reason
+                );
+                let err = undo(&f, &t.transaction_id).unwrap_err();
+                assert!(err.contains("finalised"), "{err}");
+                assert_eq!(fs::read(&f.plan.destination).unwrap(), published);
+                // A second finalise of the same record is refused, not repeated.
+                assert!(finalise(&f, &i).is_err());
+                // A later, ordinary publication is not blocked by the history.
+                assert!(inventory(&f.stage(), &f.journal()).is_ok());
+            }
+
+            #[test]
+            fn confirmations_are_required_and_nothing_changes_without_them() {
+                let f = Fixture::new(&[("a.bin", b"a")]);
+                let (t, original) = applied(&f);
+                let i = item(&f, &original);
+                let before = fs::read(&original).unwrap();
+                for (c, e) in [
+                    ("yes", EXCL),
+                    (FINALISE_CONFIRMATION, "yes"),
+                    ("DELETE REDUNDANT MAME OUTPUT", EXCL),
+                ] {
+                    assert!(finalise_replacement(&f.stage(), &f.journal(), &i, c, e).is_err());
+                }
+                assert_eq!(fs::read(&original).unwrap(), before);
+                assert_eq!(marker_phase(&f, &t.transaction_id), None);
+                undo(&f, &t.transaction_id).unwrap();
+            }
+
+            #[test]
+            fn missing_replaced_or_changed_inputs_are_never_finalised() {
+                // Original replaced by different bytes.
+                let f = Fixture::new(&[("a.bin", b"a")]);
+                let (t, original) = applied(&f);
+                let i = item(&f, &original);
+                fs::write(&original, b"substitute").unwrap();
+                assert!(finalise(&f, &i).is_err());
+                assert_eq!(fs::read(&original).unwrap(), b"substitute");
+                assert_eq!(marker_phase(&f, &t.transaction_id), None);
+                assert!(!item(&f, &original).finalise_eligible);
+                // Original missing.
+                let f = Fixture::new(&[("a.bin", b"a")]);
+                let (t, original) = applied(&f);
+                let i = item(&f, &original);
+                fs::remove_file(&original).unwrap();
+                assert!(finalise(&f, &i).is_err());
+                assert_eq!(marker_phase(&f, &t.transaction_id), None);
+                // Published output changed after review.
+                let f = Fixture::new(&[("a.bin", b"a")]);
+                let (t, original) = applied(&f);
+                let i = item(&f, &original);
+                fs::write(&f.plan.destination, b"someone edited the published zip").unwrap();
+                assert!(finalise(&f, &i).is_err());
+                assert!(original.exists());
+                assert_eq!(marker_phase(&f, &t.transaction_id), None);
+                assert!(!item(&f, &original).finalise_eligible);
+            }
+
+            #[test]
+            fn stale_review_is_refused_after_the_journal_changes() {
+                let f = Fixture::new(&[("a.bin", b"a")]);
+                let (t, original) = applied(&f);
+                let stale = item(&f, &original);
+                undo(&f, &t.transaction_id).unwrap();
+                assert!(finalise(&f, &stale).is_err());
+                assert_eq!(marker_phase(&f, &t.transaction_id), None);
+            }
+
+            #[test]
+            fn a_failure_before_the_original_is_touched_clears_the_record_and_keeps_undo() {
+                for point in [
+                    "before_finalise_marker",
+                    "after_finalise_marker",
+                    "before_cleanup_lease",
+                    "before_cleanup_unlink",
+                    "before_cleanup_set_aside",
+                ] {
+                    let f = Fixture::new(&[("a.bin", b"a")]);
+                    let (t, original) = applied(&f);
+                    let published = fs::read(&f.plan.destination).unwrap();
+                    let bytes = fs::read(&original).unwrap();
+                    let i = item(&f, &original);
+                    let reset = fail_at(point);
+                    let err = finalise(&f, &i).unwrap_err();
+                    drop(reset);
+                    assert!(err.contains("injected"), "{point}: {err}");
+                    assert_eq!(fs::read(&original).unwrap(), bytes, "{point}");
+                    assert_eq!(fs::read(&f.plan.destination).unwrap(), published, "{point}");
+                    assert_eq!(marker_phase(&f, &t.transaction_id), None, "{point}: {err}");
+                    assert!(
+                        err.contains("Undo remains available") || point == "before_finalise_marker",
+                        "{point}: {err}"
+                    );
+                    // Undo still restores the exact original after a refused finalise.
+                    undo(&f, &t.transaction_id).unwrap();
+                    assert_eq!(fs::read(&f.plan.destination).unwrap(), bytes, "{point}");
+                }
+            }
+
+            #[test]
+            fn interrupted_after_deletion_is_truthful_survives_restart_and_completes() {
+                let f = Fixture::new(&[("a.bin", b"a")]);
+                let (t, original) = applied(&f);
+                let published = fs::read(&f.plan.destination).unwrap();
+                let i = item(&f, &original);
+                let reset = fail_at("before_finalise_commit");
+                let err = finalise(&f, &i).unwrap_err();
+                drop(reset);
+                let _ = err;
+                // "Restart": everything below reads only from disk.
+                assert!(!original.exists());
+                assert!(matches!(
+                    marker_phase(&f, &t.transaction_id),
+                    Some(Finalise::Finalising { .. })
+                ));
+                assert_eq!(
+                    disk(&f, &t.transaction_id).state,
+                    TransactionState::Finalising
+                );
+                let it = item(&f, &original);
+                assert!(!it.finalise_eligible);
+                assert!(
+                    it.retention_reason.contains("interrupted"),
+                    "{}",
+                    it.retention_reason
+                );
+                let e = undo(&f, &t.transaction_id).unwrap_err();
+                assert!(e.contains("interrupted"), "{e}");
+                assert!(
+                    cancel_interrupted_finalise(&f.stage(), &f.journal(), &t.transaction_id)
+                        .is_err()
+                );
+                complete_interrupted_finalise(&f.stage(), &f.journal(), &t.transaction_id).unwrap();
+                assert!(matches!(
+                    marker_phase(&f, &t.transaction_id),
+                    Some(Finalise::Finalised { .. })
+                ));
+                assert_eq!(fs::read(&f.plan.destination).unwrap(), published);
+                assert!(
+                    complete_interrupted_finalise(&f.stage(), &f.journal(), &t.transaction_id)
+                        .is_err()
+                );
+            }
+
+            #[test]
+            fn complete_refuses_while_the_original_or_a_set_aside_entry_exists() {
+                let f = Fixture::new(&[("a.bin", b"a")]);
+                let (t, original) = applied(&f);
+                let i = item(&f, &original);
+                let reset = fail_at("before_finalise_commit");
+                let _ = finalise(&f, &i);
+                drop(reset);
+                fs::write(f.stage().join(".retiring-leftover"), b"maybe the original").unwrap();
+                assert!(
+                    complete_interrupted_finalise(&f.stage(), &f.journal(), &t.transaction_id)
+                        .is_err()
+                );
+                assert!(matches!(
+                    marker_phase(&f, &t.transaction_id),
+                    Some(Finalise::Finalising { .. })
+                ));
+                fs::remove_file(f.stage().join(".retiring-leftover")).unwrap();
+                fs::write(&original, b"reappeared").unwrap();
+                assert!(
+                    complete_interrupted_finalise(&f.stage(), &f.journal(), &t.transaction_id)
+                        .is_err()
+                );
+                assert_eq!(fs::read(&original).unwrap(), b"reappeared");
+            }
+
+            #[test]
+            fn interrupted_before_deletion_can_resume_or_cancel_after_restart() {
+                for resume in [true, false] {
+                    let f = Fixture::new(&[("a.bin", b"a")]);
+                    let (t, original) = applied(&f);
+                    let bytes = fs::read(&original).unwrap();
+                    let i = item(&f, &original);
+                    // Simulate a crash right after the sealed marker was written.
+                    let mut d = disk(&f, &t.transaction_id);
+                    d.state = TransactionState::Finalising;
+                    d.unknown.insert(
+                        staging_lifecycle::FINALISE_KEY.into(),
+                        serde_json::json!({"phase": "finalising", "started_unix": 1}),
+                    );
+                    journal::write_journal(&f.journal(), &d).unwrap();
+                    let it = item(&f, &original);
+                    assert!(
+                        it.finalise_eligible && it.retention_reason.contains("Interrupted"),
+                        "{}",
+                        it.retention_reason
+                    );
+                    assert!(undo(&f, &t.transaction_id).is_err());
+                    assert_eq!(fs::read(&original).unwrap(), bytes);
+                    if resume {
+                        finalise(&f, &it).unwrap();
+                        assert!(!original.exists());
+                        assert!(matches!(
+                            marker_phase(&f, &t.transaction_id),
+                            Some(Finalise::Finalised { .. })
+                        ));
+                    } else {
+                        cancel_interrupted_finalise(&f.stage(), &f.journal(), &t.transaction_id)
+                            .unwrap();
+                        assert_eq!(marker_phase(&f, &t.transaction_id), None);
+                        undo(&f, &t.transaction_id).unwrap();
+                        assert_eq!(fs::read(&f.plan.destination).unwrap(), bytes);
+                    }
+                    let _ = i;
+                }
+            }
+
+            #[test]
+            fn a_tampered_journal_blocks_finalising_before_anything_is_deleted() {
+                let f = Fixture::new(&[("a.bin", b"a")]);
+                let (t, original) = applied(&f);
+                let bytes = fs::read(&original).unwrap();
+                let i = item(&f, &original);
+                let path = journal::journal_path(&f.journal(), &t.transaction_id).unwrap();
+                let text = fs::read_to_string(&path).unwrap();
+                let edited = text.replacen(
+                    &format!("\"created_at_unix\": {}", t.created_at_unix),
+                    &format!("\"created_at_unix\": {}", t.created_at_unix + 1),
+                    1,
+                );
+                assert_ne!(edited, text);
+                fs::write(&path, edited).unwrap();
+                assert!(finalise(&f, &i).is_err());
+                assert_eq!(fs::read(&original).unwrap(), bytes);
+            }
+
+            #[test]
+            fn the_finalised_state_cannot_be_reversed_by_editing_or_rewriting_the_journal() {
+                let f = Fixture::new(&[("a.bin", b"a")]);
+                let (t, original) = applied(&f);
+                let i = item(&f, &original);
+                finalise(&f, &i).unwrap();
+                let published = fs::read(&f.plan.destination).unwrap();
+                let path = journal::journal_path(&f.journal(), &t.transaction_id).unwrap();
+                // Every sealed write of a finalised journal is refused, including
+                // putting the old state back.
+                for state in [
+                    TransactionState::Applied,
+                    TransactionState::Finalising,
+                    TransactionState::Finalised,
+                    TransactionState::RollingBack,
+                ] {
+                    let mut d = disk(&f, &t.transaction_id);
+                    d.state = state;
+                    assert!(
+                        journal::write_journal(&f.journal(), &d).is_err(),
+                        "{state:?}"
+                    );
+                }
+                assert!(journal::remove_journal(&f.journal(), &t.transaction_id).is_err());
+                // A hand edit of the status field breaks the independent seal.
+                let text = fs::read_to_string(&path).unwrap();
+                assert!(text.contains("\"finalised\""));
+                fs::write(&path, text.replace("\"finalised\"", "\"applied\"")).unwrap();
+                let err = undo(&f, &t.transaction_id).unwrap_err();
+                assert!(!err.is_empty());
+                assert_eq!(fs::read(&f.plan.destination).unwrap(), published);
+                assert!(!original.exists());
+            }
+
+            #[test]
+            fn only_the_documented_finalise_transitions_are_legal() {
+                let f = Fixture::new(&[("a.bin", b"a")]);
+                let (t, _) = applied(&f);
+                let before =
+                    fs::read(journal::journal_path(&f.journal(), &t.transaction_id).unwrap())
+                        .unwrap();
+                // Applied -> Finalised skips the recorded Finalising step.
+                let mut d = disk(&f, &t.transaction_id);
+                d.state = TransactionState::Finalised;
+                assert!(journal::write_journal(&f.journal(), &d).is_err());
+                // Neither may any other settled state move into it, and a stale
+                // Applied copy may not overwrite Finalising.
+                for state in [
+                    TransactionState::RolledBack,
+                    TransactionState::RollbackFailed,
+                    TransactionState::ApplyFailed,
+                ] {
+                    let mut d = disk(&f, &t.transaction_id);
+                    d.state = state;
+                    d.state = TransactionState::Finalised;
+                    assert!(
+                        journal::write_journal(&f.journal(), &d).is_err(),
+                        "{state:?}"
+                    );
+                }
+                let mut d = disk(&f, &t.transaction_id);
+                d.state = TransactionState::Finalising;
+                journal::write_journal(&f.journal(), &d).unwrap();
+                for state in [
+                    TransactionState::Applied,
+                    TransactionState::RollingBack,
+                    TransactionState::ApplyFailed,
+                    TransactionState::RolledBack,
+                ] {
+                    let mut d = disk(&f, &t.transaction_id);
+                    d.state = state;
+                    assert!(
+                        journal::write_journal(&f.journal(), &d).is_err(),
+                        "Finalising -> {state:?}"
+                    );
+                }
+                assert_eq!(
+                    disk(&f, &t.transaction_id).state,
+                    TransactionState::Finalising
+                );
+                let _ = before;
+            }
+
+            #[test]
+            fn an_unfinished_finalisation_blocks_publication_but_a_finalised_one_does_not() {
+                let f = Fixture::new(&[("a.bin", b"a")]);
+                let (t, original) = applied(&f);
+                let i = item(&f, &original);
+                let reset = fail_at("before_finalise_commit");
+                let _ = finalise(&f, &i);
+                drop(reset);
+                assert_eq!(
+                    disk(&f, &t.transaction_id).state,
+                    TransactionState::Finalising
+                );
+                // The publication gate every MAME publication passes first.
+                let gate = || {
+                    super::super::super::owned_attempt::PublicationGuard::new(
+                        &f.stage(),
+                        &f.journal(),
+                    )
+                    .map(|_| ())
+                };
+                let blocked = gate().unwrap_err();
+                assert!(blocked.contains("requires Recovery"), "{blocked}");
+                complete_interrupted_finalise(&f.stage(), &f.journal(), &t.transaction_id).unwrap();
+                assert_eq!(
+                    disk(&f, &t.transaction_id).state,
+                    TransactionState::Finalised
+                );
+                // A finalised, settled journal does not hold later publications back.
+                gate().unwrap();
+            }
+
+            #[test]
+            fn a_failure_after_the_original_was_set_aside_leaves_an_interrupted_finalisation() {
+                for point in ["cleanup_set_aside", "before_cleanup_final_proof"] {
+                    let f = Fixture::new(&[("a.bin", b"a")]);
+                    let (t, original) = applied(&f);
+                    let bytes = fs::read(&original).unwrap();
+                    let i = item(&f, &original);
+                    let reset = fail_at(point);
+                    let err = finalise(&f, &i).unwrap_err();
+                    drop(reset);
+                    assert!(err.contains("injected"), "{point}: {err}");
+                    assert_eq!(
+                        disk(&f, &t.transaction_id).state,
+                        TransactionState::Finalising,
+                        "{point}"
+                    );
+                    assert!(undo(&f, &t.transaction_id).is_err(), "{point}");
+                    // Whatever carries the original's bytes is still on disk.
+                    let kept: Vec<_> = fs::read_dir(f.stage())
+                        .unwrap()
+                        .map(|e| e.unwrap().path())
+                        .filter(|p| fs::read(p).ok().as_deref() == Some(bytes.as_slice()))
+                        .collect();
+                    assert!(
+                        !kept.is_empty(),
+                        "{point}: the original's bytes must survive"
+                    );
+                    // Completion must not claim success while that entry exists.
+                    if !original.exists() {
+                        assert!(
+                            complete_interrupted_finalise(
+                                &f.stage(),
+                                &f.journal(),
+                                &t.transaction_id
+                            )
+                            .is_err(),
+                            "{point}"
+                        );
+                    }
+                    assert_eq!(
+                        disk(&f, &t.transaction_id).state,
+                        TransactionState::Finalising,
+                        "{point}"
+                    );
+                }
+            }
+
+            #[test]
+            fn finalising_is_refused_end_to_end_while_an_incompatible_emuwiz_runs() {
+                use crate::dat::rename_apply::writer_gate::{
+                    set_process_root_for_this_thread, tests::add_process,
+                };
+                struct Restore;
+                impl Drop for Restore {
+                    fn drop(&mut self) {
+                        set_process_root_for_this_thread(None);
+                    }
+                }
+                let f = Fixture::new(&[("a.bin", b"a")]);
+                let (t, original) = applied(&f);
+                let bytes = fs::read(&original).unwrap();
+                let i = item(&f, &original);
+                let table = tempfile::tempdir().unwrap();
+                add_process(table.path(), "archivefs-gui", 4_700_001, "71");
+                set_process_root_for_this_thread(Some(table.path().to_path_buf()));
+                let _restore = Restore;
+                let err = finalise(&f, &i).unwrap_err();
+                assert!(err.contains("EmuWiz"), "{err}");
+                assert_eq!(fs::read(&original).unwrap(), bytes);
+                assert_eq!(disk(&f, &t.transaction_id).state, TransactionState::Applied);
+            }
+
+            #[test]
+            fn a_journal_with_a_mismatched_seal_is_not_offered_for_finalising() {
+                let f = Fixture::new(&[("a.bin", b"a")]);
+                let (t, original) = applied(&f);
+                let path = journal::journal_path(&f.journal(), &t.transaction_id).unwrap();
+                let text = fs::read_to_string(&path).unwrap();
+                let edited = text.replacen(
+                    &format!("\"created_at_unix\": {}", t.created_at_unix),
+                    &format!("\"created_at_unix\": {}", t.created_at_unix + 1),
+                    1,
+                );
+                fs::write(&path, edited).unwrap();
+                if let Ok(items) = inventory(&f.stage(), &f.journal()) {
+                    for it in items.iter().filter(|i| i.path == original) {
+                        assert!(!it.finalise_eligible, "{}", it.retention_reason);
+                    }
+                }
+                assert!(original.exists());
+            }
+
+            #[test]
+            fn finalised_and_legacy_journals_list_side_by_side_and_unknown_states_fail_closed() {
+                let f = Fixture::new(&[("a.bin", b"a")]);
+                let (t, original) = applied(&f);
+                let i = item(&f, &original);
+                finalise(&f, &i).unwrap();
+                let (listed, problems) = journal::list_journals(&f.journal());
+                let d = listed
+                    .iter()
+                    .find(|x| x.transaction_id == t.transaction_id)
+                    .unwrap();
+                assert_eq!(d.state, TransactionState::Finalised);
+                assert!(problems.is_empty(), "{problems:?}");
+                assert!(!d.is_rollbackable());
+                assert!(
+                    journal::find_rollbackable_transactions(&f.journal())
+                        .0
+                        .is_empty()
+                );
+                assert!(
+                    journal::find_recovery_transactions(&f.journal())
+                        .0
+                        .is_empty()
+                );
+                // A state this build does not know is unreadable, never treated as Applied.
+                let path = journal::journal_path(&f.journal(), &t.transaction_id).unwrap();
+                let unknown = fs::read_to_string(&path)
+                    .unwrap()
+                    .replace("\"finalised\"", "\"finalised_v9\"");
+                fs::write(f.journal().join("future-state.json"), unknown).unwrap();
+                let (listed, problems) = journal::list_journals(&f.journal());
+                assert!(listed.iter().all(|x| x.transaction_id != "future-state"));
+                assert!(!problems.is_empty());
+            }
+        }
+
+        fn capture_for_test(path: &Path) -> crate::dat::rename_apply::model::ObjectIdentity {
+            crate::dat::rename_apply::identity::capture_identity(path).unwrap()
+        }
+    }
+}
+
+/// Explicit inventory and cleanup of completed MAME staging artifacts.
+pub mod staging_lifecycle;

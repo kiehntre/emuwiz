@@ -192,15 +192,174 @@ These are implemented, tested, and in current use today:
   are accepted, and no command writes to RomM, triggers a scan on it, or
   touches a ROM.
 
+Completed since `v0.9.0` and verified on `main` (17 October 2026) as reachable
+from the GUI. "Complete" here means implemented, tested and user-reachable; it
+does not claim in-game effectiveness or runtime compatibility beyond what the
+linked documentation states.
+
+- Manuals and strategy guides: an in-app viewer for CBZ, CBR (`2ffed5c9`) and
+  PDF (`49bb0f55`; isolated renderer, Linux only), with page navigation, zoom,
+  per-file reading position, discovery beside the game and in configured
+  documentation roots, and manual association with a game (`a3823110`). RomM
+  "Open Manual" opens a locally mapped manual in the desktop viewer
+  (`e4a803f3`, Classic interface).
+- Cheats with Apply and Undo through the shared transaction and History:
+  RetroArch, PCSX2 (pnach), Dolphin (Gecko/Action Replay), Xenia, DuckStation
+  (`a397b1c8`), standalone mGBA (`52af487e`) and standalone Flycast for the
+  verified official v2.7 Linux build only (`be323ce6`; see
+  [`docs/flycast-cheats-compatibility.md`](docs/flycast-cheats-compatibility.md)).
+  User cheat-file import for RetroArch, PCSX2, Dolphin and Xenia.
+- RPCS3 local `patch.yml` activation in Blue (`6a98d465`): Preview → Apply →
+  History → guarded Undo for native Linux RPCS3 with its XDG profile and
+  supported RPCS3 schema 1.2 patch operations. An existing `patch_config.yml`
+  and unsupported profiles (for example AppImage, Flatpak or portable) are
+  refused, and in-game effectiveness is unverified; see
+  [`docs/research/RPCS3_NATIVE_PATCH_CHEAT_ADAPTER.md`](docs/research/RPCS3_NATIVE_PATCH_CHEAT_ADAPTER.md).
+- Mods: Dolphin and PCSX2 texture packs, PPSSPP texture packs (Classic
+  interface), Cemu graphic packs, RPCS3 ordinary mods and local ROM patch
+  packages, all with Apply and Undo.
+- WHDLoad trainer options: preview, save and Undo (`bca52596`).
+- Amiga media: ADF and ADZ inspection in Selected Evidence, HDF/RDB detection
+  during scans, LHA member hashing in DAT audits, WHDLoad slave parsing, and
+  launching WHDLoad LHA/LZH packages through FS-UAE or Amiberry (`9da97630`).
+- Wii U: WUD/WUX inspection and WUD↔WUX conversion through the durable
+  conversion queue with SHA-256 evidence for source, rebuilt WUD and output
+  (`5c3b9356`, `32206367`); Cemu content readiness (`bcd7cd14`).
+- shadPS4: profile discovery, launch readiness and launch on Linux
+  (`6c04a290`, `8061b04c`, `3eb032e9`), using bounded PS4 `PARAM.SFO` identity
+  (`f36e7992`). Installation stays manual and PKG files are refused, by
+  design.
+
+## Historical recovery closures (18 October 2026)
+
+Twelve completed investigations are closed without replaying old implementations:
+GameHacking browser import, PSP PBP, PS3 PKG, Nintendo compatibility/export rows,
+Set-Member Vocabulary, MAME Software Lists, Verified Identity Persistence, Arcade Version
+Data, SNES Production Wiring, Tape Identity, Disk-only Set Emission and GUI History Recovery.
+Substantive comparisons establish
+current coverage or supersession; file-name presence alone was not used as proof.
+The old GameHacking CLI entry points and unused set-member counter API are not
+claimed present. PBP/PKG payload verification or native launch, Cemu/Azahar Blue
+launch authorization and separately owned MAME/DAT work are not declared complete.
+
+Exact historical tips, closure reports, validation limits and intact USB recovery
+provenance are recorded in
+[`HISTORICAL_SIX_CLOSURES_20261018.md`](docs/reviews/HISTORICAL_SIX_CLOSURES_20261018.md).
+The first seven local archive refs and five newly closed refs (four archives plus
+the historical disk-only local head) are retired after exact-tip/bundle checks.
+Five unresolved historical candidates and all source worktrees/targets remain preserved.
+See the current classifications in
+[`LEGACY_BRANCH_BACKLOG.md`](docs/LEGACY_BRANCH_BACKLOG.md).
+
+Verified Identity Persistence is also closed: its cache implementation and 32 dedicated
+tests are unchanged on main. No port is required. The possible cached-size freshness
+weakness is handed to the existing managed-DAT owner, separate from historical recovery.
+
+The additional closures reuse completed reports: Arcade Version Data is patch-identical
+to `999e22e6`; SNES wiring is retained through `53e5581a`; Tape Identity uses separate
+integration `10be8f0d` plus reviewed regression fix `afd35956`. Disk-only correction
+`9c8e64fe` and History navigation/authority explanation `a35d36cd` are promoted.
+No old forward-resume authority, CHD payload verification or runnable-machine claim
+is restored. Selected Evidence remains blocked with an unvalidated patch; NES/FDS,
+PC Engine CD firmware, GUI DAT wiring and standalone launch remain unresolved.
+
 ## Current development
 
-The current workspace is post-`v0.7.0` `main`; `v0.7.0` remains the latest
-published release. Direct-image discovery, canonical platform aliases, source
-platform assignment, platform-first navigation, Dolphin and supported BSFree
-installation, Xenia Canary patch support, Games-only DAT selection, and EmuWiz
-Linux desktop integration are present on `main`. Release publication is handled
-by the tag-only workflow; post-release work is not retroactively part of
-`v0.7.0`.
+The current workspace is post-`v0.9.0` `main`; `v0.9.0` (2026-09-13) is the
+latest published release. Direct-image discovery, canonical platform aliases,
+source platform assignment, platform-first navigation, Dolphin and supported
+BSFree installation, Xenia Canary patch support, Games-only DAT selection, and
+EmuWiz Linux desktop integration are present on `main`. Post-release work is
+not retroactively part of `v0.9.0`.
+
+ScummVM trainer Apply (`aab25835`) is now reachable in Blue: native
+detection → documented Hypno options → Preview → explicit confirmation →
+shared Apply → durable History → reviewed Undo. Only EmuWiz-owned profiles
+are written. Saving does not claim an active in-game trainer.
+
+### NKit inspection in Blue (18 October 2026)
+
+Game Details and Launch now reuse the bounded GameCube/Wii NKit header inspector
+from `006f3911`. The panel separates recognized raw NKit v1 headers from a complete
+or verified disc, displays header claims as claims, and explains preservation,
+exact stored-representation DAT verification and unknown recoverability. GCZ/RVZ/WIA/CISO/WBFS
+inner content remains uninspected; filenames never establish NKit identity.
+
+Existing Review identity, Verify and Dolphin readiness routes remain available.
+Recognized raw NKit markers, including unsupported/malformed variants, cannot gain
+Ready/Play through ordinary ISO header identity. Native Dolphin and libretro
+preflight recheck raw representation. Existing wrapper launch checks remain unchanged;
+this integration does not detect NKit inside wrappers. This is EmuWiz's supported launch boundary,
+not a claim that all Dolphin versions reject every NKit image. GameID facts and
+DAT evidence remain independent. No NKit conversion, restoration, recovery scan
+or production-media change is implemented.
+
+### Partial, preview-only and blocked features (as of 22 October 2026)
+
+Wired into the GUI since 18 October: a saved ScummVM trainer profile used at
+launch on a private settings copy (no trainer effect is claimed); launch-time
+cheats for RetroArch (checked against the probed core), MAME and melonDS; WHDLoad
+slave DAT reconciliation in library discovery (`a33a6dbd`); Cemu launch for
+extracted, already-decrypted Wii U base games from the native default profile
+(structural checks, not hash/DAT verification); RomM manuals in Blue. A launch
+with saved WHDLoad trainer options is still refused: plain FS-UAE has no verified
+consumer for them.
+
+Implemented in core with tests but **not yet reachable from the GUI** (the
+remaining work is wiring, not reimplementation):
+
+- Saturn IPS/BPS/UPS/PPF3 patch apply on a CUE tree (`e80b80ff`), GDI
+  extent-preserving patching (`c12186c3`), and their shared publish/verify/Undo
+  (`626afa87`, `patch_output_recovery::tree`).
+- Mednafen and FBNeo cheat apply plans.
+- Direct ADF/HDF launch through FS-UAE (`3c07fd26`) and Amiberry
+  (`04a7214a`); installed-folder WHDLoad launch. (Read-only HDF/RDB/ADF
+  contents browsing is in Blue Game Details.)
+- Homebrew providers: a local offline catalogue (`7aad6911`) and GitHub
+  Releases listing (`7d88466b`); only a developer example calls them.
+- ZX Spectrum, Amstrad CPC and Atari ST POKE parsing; PCSX2 temporary-cheat
+  readiness (`55e65ec9`); generic mod enable/order/disable plans.
+
+**Dreamcast DCP Apply — blocked by missing compatibility evidence (owner decision,
+18 October 2026).** Keep Blue DCP inspection and Preview available, with Apply
+refused. No trusted provider or independently reviewed package-to-source binding
+has been confirmed. A future binding must establish that the exact DCP package
+SHA-256 belongs with the exact complete source-tree SHA-256 and reviewed Dreamcast
+product/revision/region; hashing two selected inputs does not establish that
+relationship. A filename, game title, region, IP.BIN identifier or DAT match alone
+is insufficient. The existing extracted-tree replacement/xdelta backend
+(`10a3324a`) and shared staging, verification and guarded Undo remain available in
+core, but are not GUI Apply authority. Image application additionally needs a
+reviewed DCP-to-image mapping that preserves GDI topology and audio. Reconsider
+Apply only when trustworthy binding evidence is available; do not invent a
+manifest, weaken safeguards or schedule further research as part of this item.
+
+**Preview or inspection only:** Saturn disc manifest and SSP preview
+(`519f605e`); Dreamcast IP.BIN and DCP review (`8c476277`); C64 (VICE),
+Saturn Action Replay, 3DS and Game Genie cheat previews; Amiga ADF exact-image
+trainers (`d354885d`); multi-disk Amiga media sets; Acorn Electron (Elkulator)
+inspection (`7dfa3a00`).
+
+**Blocked by a documented limitation:** Saturn SSP apply (no verified payload
+contract); passing WHDLoad trainer options at launch (FS-UAE ignores them and
+Amiberry has no verified channel); IPF images (proprietary CAPS/SPS library;
+hash-only); downloading remote RomM manuals (no approved URL-opening design);
+homebrew artifact download (hand-off only, by design); managed shadPS4 download
+and PS4 PKG input (manual install and extracted folders only, by design).
+
+**PPSSPP cheat Apply — bounded supported slice:** Blue can preview, explicitly
+confirm and install a new disabled CWCheat Write32 file, retain shared History and
+perform guarded Undo for an exact verified PSP identity, the pinned official
+1.19.3 Linux x86-64 AppImage and its existing default XDG profile. Existing cheat
+files and settings are preserved. Installation does not establish enablement or
+runtime effectiveness; unsupported builds/layouts/formats and larger-than-guard-budget
+games are refused. See [the supported contract](docs/ppsspp-cheat-install.md).
+
+**Not yet implemented:** MAME cheat apply (core has preview only);
+a Wii U key-store check; NKit-to-ISO restore; DMS-to-ADF decompression; a
+WinUAE adapter; homebrew file matching, library import and providers beyond
+the two above (for example itch.io); EKA2L1 (N-Gage), ep128emu (Enterprise),
+Palm, Psion and Gamate emulator adapters.
 
 The shared `patch_manager` orchestration layer (platform filtering,
 ambiguity heuristics, plan assembly in `patch_manager::mod`) remains
@@ -223,14 +382,18 @@ the code as these areas change.
 
 Realistic, concrete next steps, in the recommended order below:
 
-1. **PCSX2 provider content** - safe PNACH selection, preview, merge, apply, and
-   rollback are implemented; the remaining blocker is a separately licensed,
-   reviewed ordinary-cheat provider.
-2. **Performance profiling beyond smoke scale** - investigate larger
-   catalogues only if measured traces identify a concrete bottleneck.
-3. **Mods work** - no general mod installation path exists yet.
-4. **Further adapters** - PPSSPP, RPCS3, Switch, MAME, and Amiga/WHDLoad
-   remain research-only candidates and are not scheduled.
+1. **Unified recovery and operation receipts** - make recovery, refresh,
+   reconcile, and mutation outcomes explainable through one receipt model;
+   completion remains subject to implementation and tests.
+2. **DAT completeness and authority** - strengthen completeness reporting and
+   make authority/provenance boundaries clearer across the current DAT flows.
+3. **Needs Attention and refresh/reconcile** - provide one actionable queue for
+   unresolved identity, stale state, incomplete DAT evidence, and recoverable
+   operations; completion is not yet claimed.
+4. **First-run comprehension** - guide new users through Understand → Fix →
+   Organise → Play without changing the safety boundaries.
+5. **100k profiling** - measure realistic 100,000-item collections and address
+   bottlenecks found by traces rather than assuming scale characteristics.
 
 Release process discipline (a documented, repeatable release checklist
 tied to the pinned toolchain) already exists at
@@ -241,15 +404,19 @@ tied to the pinned toolchain) already exists at
 Directions consistent with the architecture already in place, not yet
 scheduled:
 
-- **Emulator adapter expansion pauses after Xenia.** The immediate priority
-  is hardening the existing RetroArch, PCSX2, Dolphin, and Xenia workflows,
-  not adding another emulator. Further adapters - PPSSPP, RPCS3, Switch,
-  MAME, and Amiga/WHDLoad - are not scheduled.
-  Switch is additionally sensitive (keys, firmware) and would need its own
-  separate policy decision before any design work, not just an
-  architecture review. Each would still follow the same
-  read-only-inspection-first pattern if and when real user demand and an
-  architecture review justify revisiting this pause.
+- **1.0 reliability/comprehension milestone.** A later 1.0 milestone remains
+  focused on dependable recovery, clear state/comprehension, and measured
+  large-library operation. It is not a promise that the 0.9 work is complete.
+
+- **Finish wiring existing emulator features before adding new emulators.**
+  PPSSPP, RPCS3, MAME, Amiga/WHDLoad, DuckStation, Xemu and shadPS4 now have
+  launch and/or cheat/mod support on `main` (see "Completed foundations" and
+  "Partial, preview-only and blocked features" above). The next step is to
+  connect the core features that already exist - Saturn patch Apply and direct
+  Amiga disk launch - and to stop the cheat router reporting PPSSPP and MAME
+  cheats as applicable before a GUI apply exists.
+  Switch remains unscheduled: it is sensitive (keys, firmware) and would need
+  its own separate policy decision before any design work.
 - Library health reporting beyond today's `CatalogueHealthReport`: damaged
   or unreadable archives, likely duplicates, missing BIOS/firmware
   detection, and region/revision information, where that information can be
@@ -276,11 +443,12 @@ or currently implemented in any form:
   RetroArch, Dolphin, Xenia, GameHacking, BSFree, RomM, and local-artwork
   sources.
 - Update/DLC awareness for preservation collections.
-- Preservation-format guidance (for example CHD, RVZ, WUA, CSO, alongside
-  the ZIP/7z/RAR archives already supported) - guidance and detection only,
-  not conversion tooling, unless a future design explicitly proposes that.
-- Interop with existing frontends such as ES-DE, RetroDECK, or LaunchBox,
-  where that is practical without EmuWiz taking over their role.
+- Preservation-format guidance for formats EmuWiz does not yet convert (for
+  example RVZ and WUA). CHD and Wii U WUD/WUX conversion already exist on
+  `main`.
+- Interop with frontends beyond the ES-DE/RetroDECK export already on `main`
+  (for example LaunchBox), where that is practical without EmuWiz taking over
+  their role.
 - Remote-play workflow documentation (for example Sunshine/Moonlight) for
   users who already use EmuWiz-managed libraries with those tools.
 
@@ -297,6 +465,7 @@ EmuWiz is not, and these are not planned:
 - A surveillance system, or any component that reports on user files to a
   third party.
 - An arbiter of which files a user is "allowed" to keep or use.
-- A universal emulator, launcher, or frontend replacement. Emulator
-  adapters describe and preview; they do not launch games or take over
-  frontend responsibilities.
+- A universal emulator, launcher, or frontend replacement. EmuWiz launches a
+  game only through an installed emulator after a readiness check the user
+  can see; it does not bundle emulators or take over frontend
+  responsibilities.

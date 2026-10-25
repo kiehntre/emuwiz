@@ -8,11 +8,11 @@
 //! # Platform safety
 //!
 //! A candidate may only be Suggested when its platform is resolved strongly
-//! enough: a manual assignment, verified DAT evidence, a canonical RomM
-//! mapping, or an accepted strong identity. Unknown platforms, platform
-//! conflicts and missing canonical/RomM slug mappings are never organised
+//! enough: a manual assignment, verified DAT evidence, or an accepted strong
+//! identity. Unknown platforms and platform conflicts are never organised
 //! silently - they are reported as Blocked/Unsupported and the user must
-//! resolve them first.
+//! resolve them first. Generic paths derive from neutral canonical EmuWiz
+//! platform metadata and never require a RomM mapping.
 
 use std::path::{Path, PathBuf};
 
@@ -47,10 +47,6 @@ pub struct OrganisationPlanRequest<'a> {
     pub mode: OrganisationMode,
     pub content_policy: ContentSelectionPolicy,
     pub candidates: &'a [OrganisationCandidate],
-    /// Resolves a canonical platform id to its canonical RomM-compatible slug.
-    /// The only acceptable source for folder names; nothing is derived from
-    /// display labels.
-    pub slug_for_platform: &'a dyn Fn(&str) -> Option<String>,
     /// Bumped by the caller on every plan (re)build; a plan is stale the
     /// moment its generation no longer matches the caller's current one.
     pub generation: u64,
@@ -58,12 +54,45 @@ pub struct OrganisationPlanRequest<'a> {
 
 /// Builds a read-only organisation plan. Never mutates the filesystem.
 pub fn build_organisation_plan(request: &OrganisationPlanRequest<'_>) -> OrganisationPlan {
-    let mut entries: Vec<OrganisationPlanEntry> = request
-        .candidates
-        .iter()
-        .map(|candidate| plan_entry(request, candidate))
-        .collect();
+    let mut ignore = |_: crate::job_progress::JobProgress| {};
+    let mut reporter = crate::job_progress::ProgressReporter::new(&mut ignore);
+    build_organisation_plan_reporting(request, None, &mut reporter)
+        .expect("a plan without a cancel flag is never cancelled")
+}
+
+/// [`build_organisation_plan`] with real checkpoints and cooperative
+/// cancellation between candidates. Planning only reads (it stats sources and
+/// computes destinations), so `None` - cancelled - means nothing on disk was
+/// touched and there is no half-built plan to reason about.
+pub fn build_organisation_plan_reporting(
+    request: &OrganisationPlanRequest<'_>,
+    cancel: Option<&std::sync::atomic::AtomicBool>,
+    progress: &mut crate::job_progress::ProgressReporter<'_>,
+) -> Option<OrganisationPlan> {
+    let stop = || cancel.is_some_and(|flag| flag.load(std::sync::atomic::Ordering::Relaxed));
+    progress.phase(
+        "Analysing files",
+        "files",
+        Some(request.candidates.len() as u64),
+    );
+    let mut entries: Vec<OrganisationPlanEntry> = Vec::with_capacity(request.candidates.len());
+    for (position, candidate) in request.candidates.iter().enumerate() {
+        if stop() {
+            return None;
+        }
+        progress.tick(position as u64);
+        entries.push(plan_entry(request, candidate));
+    }
+    progress.tick(request.candidates.len() as u64);
+    if stop() {
+        return None;
+    }
+    progress.phase("Checking destination conflicts", "files", None);
     detect_collisions(request.master_root, &mut entries);
+    if stop() {
+        return None;
+    }
+    progress.phase("Building the preview", "changes", None);
     entries.sort_by(|left, right| {
         (
             left.status_rank(),
@@ -76,14 +105,14 @@ pub fn build_organisation_plan(request: &OrganisationPlanRequest<'_>) -> Organis
                 &right.destination_path,
             ))
     });
-    OrganisationPlan {
+    Some(OrganisationPlan {
         master_root: request.master_root.to_path_buf(),
         mode: request.mode,
         content_policy: request.content_policy,
         classifier_version: crate::dat::classification::CLASSIFIER_VERSION.to_string(),
         generation: request.generation,
         entries,
-    }
+    })
 }
 
 /// Plans one candidate into an entry, classifying the status.
@@ -108,6 +137,7 @@ fn plan_entry(
         platform_display_name: String::new(),
         platform_source: String::new(),
         slug: None,
+        layout_folder: None,
         mode,
         content_classification: candidate.content_classification.clone(),
         original_metadata: candidate.original_metadata.clone(),
@@ -123,6 +153,7 @@ fn plan_entry(
             platform_display_name: display.to_string(),
             platform_source: source.to_string(),
             slug: None,
+            layout_folder: None,
             mode,
             content_classification: candidate.content_classification.clone(),
             original_metadata: candidate.original_metadata.clone(),
@@ -162,8 +193,8 @@ fn plan_entry(
         OrganisationMode::MoveRealFile => {
             if kind != ObjectKind::RegularFile {
                 let reason = if kind == ObjectKind::Symlink || kind == ObjectKind::BrokenSymlink {
-                    "the source is a symlink; use 'Organise symlink only' to move the link \
-                     object without touching its target"
+                    "this is a shortcut, not a real file; use 'Advanced: reorganise existing \
+                     symlinks' to reorganise the shortcut without touching its target"
                 } else {
                     "this mode organises regular files only"
                 };
@@ -172,7 +203,28 @@ fn plan_entry(
         }
         OrganisationMode::OrganiseSymlinkOnly => {
             if kind != ObjectKind::Symlink && kind != ObjectKind::BrokenSymlink {
-                return blocked("this mode organises symlinks only; the source is not a symlink");
+                return blocked(
+                    "this is a real file, not a shortcut; 'Advanced: reorganise existing symlinks' \
+                     only reorganises shortcuts that already exist",
+                );
+            }
+        }
+        OrganisationMode::BuildLinkedLibrary => {
+            // A linked library links regular files only: the original stays
+            // put and the canonical destination becomes a new link. A source
+            // that is itself a symlink would chain links, and directories are
+            // out of scope for this slice.
+            if kind != ObjectKind::RegularFile {
+                return blocked(
+                    "linked libraries link regular files only; this source is a shortcut or \
+                     another object kind",
+                );
+            }
+            if !candidate.source_path.is_absolute() {
+                return blocked(
+                    "the source path must be absolute so the created link can record its \
+                     exact target",
+                );
             }
         }
         OrganisationMode::RenameInPlace => {
@@ -218,25 +270,19 @@ fn plan_entry(
         None => return blocked("the resolved platform is not in the canonical registry"),
     };
 
-    // The folder name MUST come from the canonical RomM slug mapping, never
-    // from the display label. Rename-in-place has no platform folder, so it
-    // needs no slug; the move modes require one.
-    let slug = match mode {
+    // Generic organisation owns its own neutral layout identity: the
+    // canonical platform's registered EmuWiz folder name (see
+    // `platform::canonical_layout_folder`). No RomM import, cache or mapping
+    // is consulted here - RomM slugs are authority only for the explicit
+    // RomM-specific frontend-layout workflows. Rename-in-place has no
+    // platform folder at all.
+    let layout_folder = match mode {
         OrganisationMode::RenameInPlace => None,
-        OrganisationMode::MoveRealFile | OrganisationMode::OrganiseSymlinkOnly => {
-            let Some(slug) = (request.slug_for_platform)(&platform) else {
-                return unsupported(
-                    "no canonical RomM slug mapping exists for this platform; add an identity \
-                     cache import to define it",
-                    Some(platform),
-                    &display_name,
-                    &platform_source,
-                );
+        _ => {
+            let Some(folder) = crate::platform::canonical_layout_folder(&platform) else {
+                return blocked("the resolved platform has no safe canonical EmuWiz folder name");
             };
-            if !is_safe_basename(&slug) {
-                return blocked("the platform slug is not a safe single path component");
-            }
-            Some(slug)
+            Some(folder)
         }
     };
 
@@ -259,14 +305,16 @@ fn plan_entry(
 
     // Destination derivation. Rename-in-place stays in the source directory;
     // the move modes place the file under the master root's platform folder.
-    let destination_path = match (&mode, &slug) {
+    let destination_path = match (&mode, &layout_folder) {
         (OrganisationMode::RenameInPlace, _) => candidate
             .source_path
             .parent()
             .map(|parent| parent.join(&proposed_basename))
             .unwrap_or_else(|| candidate.source_path.clone()),
-        (_, Some(slug)) => request.master_root.join(slug).join(&proposed_basename),
-        (_, None) => return blocked("no canonical platform slug is available for this move"),
+        (_, Some(folder)) => request.master_root.join(folder).join(&proposed_basename),
+        (_, None) => {
+            return blocked("no canonical EmuWiz folder exists for this platform");
+        }
     };
 
     let already_organised = if candidate.source_path == destination_path {
@@ -277,8 +325,8 @@ fn plan_entry(
     {
         // Same name: already organised when the source already sits in the
         // canonical platform folder.
-        slug.as_deref().is_some_and(|slug| {
-            candidate.source_path.parent() == Some(request.master_root.join(slug).as_path())
+        layout_folder.as_deref().is_some_and(|folder| {
+            candidate.source_path.parent() == Some(request.master_root.join(folder).as_path())
         })
     } else {
         false
@@ -290,7 +338,8 @@ fn plan_entry(
         platform: Some(platform),
         platform_display_name: display_name,
         platform_source,
-        slug,
+        slug: None,
+        layout_folder,
         mode,
         content_classification: candidate.content_classification.clone(),
         original_metadata: candidate.original_metadata.clone(),
@@ -370,6 +419,40 @@ fn detect_collisions(master_root: &Path, entries: &mut [OrganisationPlanEntry]) 
         }
         if entries[index].status == OrganisationStatus::AlreadyOrganised {
             continue;
+        }
+        // Linked-library destinations are classified by their exact object
+        // state rather than by bare existence: an identical link is a no-op
+        // ("already present"), anything else occupying the name is a conflict.
+        // Nothing is ever auto-replaced.
+        if entries[index].mode == OrganisationMode::BuildLinkedLibrary {
+            match std::fs::symlink_metadata(&entries[index].destination_path) {
+                Ok(metadata) if metadata.file_type().is_symlink() => {
+                    let target = std::fs::read_link(&entries[index].destination_path).ok();
+                    if target.as_deref() == Some(entries[index].source_path.as_path()) {
+                        entries[index].status = OrganisationStatus::AlreadyOrganised;
+                        entries[index].reason =
+                            Some("already linked to this exact file; nothing to do".to_string());
+                    } else {
+                        mark_conflict(
+                            entries,
+                            index,
+                            "a different link already occupies the destination; nothing is \
+                             replaced",
+                        );
+                    }
+                    continue;
+                }
+                Ok(_) => {
+                    mark_conflict(
+                        entries,
+                        index,
+                        "the destination exists and is not a link; nothing is ever replaced",
+                    );
+                    continue;
+                }
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                Err(_) => {}
+            }
         }
         if std::fs::symlink_metadata(&entries[index].destination_path).is_ok() {
             mark_conflict(

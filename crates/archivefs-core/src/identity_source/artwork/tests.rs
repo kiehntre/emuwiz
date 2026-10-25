@@ -61,6 +61,7 @@ fn source() -> ValidatedRommSource {
         enabled: true,
         url: SERVER.to_string(),
         mappings: Vec::new(),
+        media_mapping: None,
         provider_path_kind: ProviderPathKind::ProviderRelative,
         token_path: None,
     };
@@ -107,6 +108,7 @@ impl RommTransport for FakeArtworkServer {
         url: &str,
         authorization: Option<&str>,
         _max_bytes: usize,
+        _timeout: std::time::Duration,
     ) -> Result<RommHttpResponse, RommRequestError> {
         self.requests
             .lock()
@@ -125,8 +127,24 @@ impl RommTransport for FakeArtworkServer {
 fn request<'a>(id: &'a str, small: Option<&'a str>, public: Option<&'a str>) -> ArtworkRequest<'a> {
     ArtworkRequest {
         provider_game_id: id,
+        kind: ArtworkKind::Cover,
+        large_reference: None,
         small_reference: small,
         public_reference: public,
+    }
+}
+
+fn request_with_large<'a>(
+    id: &'a str,
+    large: Option<&'a str>,
+    small: Option<&'a str>,
+) -> ArtworkRequest<'a> {
+    ArtworkRequest {
+        provider_game_id: id,
+        kind: ArtworkKind::Cover,
+        large_reference: large,
+        small_reference: small,
+        public_reference: None,
     }
 }
 
@@ -207,6 +225,180 @@ fn a_public_scraper_url_is_never_fetched() {
         0,
         "not one request should have left the process"
     );
+}
+
+#[test]
+fn a_public_screenshot_reference_is_refused_without_a_request() {
+    let tree = Tree::new("public-screenshot-refused");
+    let cache = tree.cache();
+    let server = FakeArtworkServer::serving(synthetic_png(10, 10));
+    let media = crate::identity_source::model::MediaReference {
+        hosted_reference: None,
+        public_reference: Some("https://images.example/screenshot.jpg".to_string()),
+    };
+    let refusal = cache
+        .fetch(
+            &source(),
+            &server,
+            &ArtworkRequest::from_media("1", &media),
+            1_000,
+            None,
+        )
+        .expect_err("a public screenshot host must not be fetched");
+    assert_eq!(refusal.code(), "remote_host_not_allowed");
+    assert_eq!(server.request_count(), 0);
+}
+
+#[test]
+fn approved_launchbox_screenshot_is_fetched_without_romm_credentials() {
+    let tree = Tree::new("launchbox-approved");
+    let server = FakeArtworkServer::serving(synthetic_png(20, 20));
+    let result = tree
+        .cache()
+        .fetch(
+            &source(),
+            &server,
+            &request(
+                "launchbox-game",
+                None,
+                Some("https://images.launchbox-app.com/screens/19538-1.png"),
+            ),
+            1_000,
+            None,
+        )
+        .expect("approved LaunchBox host should use the existing fetch/cache path");
+    assert!(result.path.exists());
+    assert_eq!(server.request_count(), 1);
+    assert!(
+        !server.requests()[0].1,
+        "public CDN requests never carry RomM credentials"
+    );
+}
+
+#[test]
+fn launchbox_policy_rejects_http_lookalikes_ports_and_oversized_paths() {
+    let credential_url = [
+        "https://",
+        "user",
+        ":",
+        "pass",
+        "@images.launchbox-app.com/a.png",
+    ]
+    .concat();
+    for url in [
+        "http://images.launchbox-app.com/a.png",
+        "https://evil.images.launchbox-app.com/a.png",
+        "https://images.launchbox-app.com.evil.test/a.png",
+        credential_url.as_str(),
+        "https://images.launchbox-app.com:8443/a.png",
+    ] {
+        assert!(
+            validate_launchbox_url(url).is_err(),
+            "{url} must be refused"
+        );
+    }
+    let oversized = format!("https://images.launchbox-app.com/{}", "a".repeat(2049));
+    assert!(validate_launchbox_url(&oversized).is_err());
+}
+
+#[test]
+fn launchbox_redirect_statuses_are_refused_without_following() {
+    for status in [301, 302, 307, 308] {
+        let tree = Tree::new(&format!("launchbox-redirect-{status}"));
+        let server = FakeArtworkServer::scripted(vec![Ok(RommHttpResponse {
+            status,
+            body: Vec::new(),
+            location: Some("https://evil.example/redirected.png".to_string()),
+        })]);
+        let refusal = tree
+            .cache()
+            .fetch(
+                &source(),
+                &server,
+                &request(
+                    "redirected",
+                    None,
+                    Some("https://images.launchbox-app.com/a.png"),
+                ),
+                1_000,
+                None,
+            )
+            .expect_err("redirects must fail closed");
+        assert_eq!(refusal.code(), "endpoint_refused");
+        assert!(refusal.detail().contains("redirect"));
+        assert_eq!(server.request_count(), 1);
+        assert!(!server.requests()[0].1);
+    }
+}
+
+#[test]
+fn a_valid_large_cover_is_preferred_over_the_small_cover() {
+    let tree = Tree::new("large-preferred");
+    let cache = tree.cache();
+    let server = FakeArtworkServer::serving(synthetic_png(10, 10));
+    cache
+        .fetch(
+            &source(),
+            &server,
+            &request_with_large("1", Some("/assets/large.png"), Some("/assets/small.png")),
+            1_000,
+            None,
+        )
+        .expect("large cover should be fetched");
+    assert_eq!(server.requests()[0].0, format!("{SERVER}/assets/large.png"));
+}
+
+#[test]
+fn an_unusable_large_cover_falls_back_to_the_small_cover() {
+    let tree = Tree::new("large-fallback");
+    let cache = tree.cache();
+    let server = FakeArtworkServer::serving(synthetic_png(10, 10));
+    cache
+        .fetch(
+            &source(),
+            &server,
+            &request_with_large(
+                "1",
+                Some("https://unsafe.example/large.png"),
+                Some("/assets/small.png"),
+            ),
+            1_000,
+            None,
+        )
+        .expect("unsafe large reference should fall back");
+    assert_eq!(server.requests().len(), 1);
+    assert_eq!(server.requests()[0].0, format!("{SERVER}/assets/small.png"));
+}
+
+#[test]
+fn a_missing_large_cover_response_falls_back_to_the_small_cover() {
+    let tree = Tree::new("large-stale");
+    let cache = tree.cache();
+    let server = FakeArtworkServer::scripted(vec![
+        Ok(RommHttpResponse {
+            status: 404,
+            body: Vec::new(),
+            location: None,
+        }),
+        Ok(RommHttpResponse {
+            status: 200,
+            body: synthetic_png(10, 10),
+            location: None,
+        }),
+    ]);
+    cache
+        .fetch(
+            &source(),
+            &server,
+            &request_with_large("1", Some("/assets/large.png"), Some("/assets/small.png")),
+            1_000,
+            None,
+        )
+        .expect("stale large cover should fall back");
+    let requests = server.requests();
+    assert_eq!(requests.len(), 2);
+    assert!(requests[0].0.ends_with("/assets/large.png"));
+    assert!(requests[1].0.ends_with("/assets/small.png"));
 }
 
 /// Relative-URL forms that change the host are refusals, not requests.
@@ -619,6 +811,18 @@ fn a_cache_key_is_deterministic_and_carries_no_secret() {
         one,
         ArtworkCache::key_for(SERVER, &request("42", Some(replaced), None)),
         "RomM's own timestamp changing must invalidate the thumbnail"
+    );
+    assert_ne!(
+        one,
+        ArtworkCache::key_for(
+            SERVER,
+            &request_with_large(
+                "42",
+                Some("/assets/cover/large.png"),
+                Some(REAL_SMALL_REFERENCE)
+            )
+        ),
+        "large and small variants must not share a cache identity"
     );
 }
 
@@ -1452,4 +1656,364 @@ fn concurrent_eviction_and_insertion_leave_the_cache_inside_its_ceiling() {
         entries.len(),
         "an orphaned thumbnail was left behind"
     );
+}
+
+// --- Local media reuse: a mapped file is read instead of fetched --------------
+//
+// The seam is `ArtworkCache::fetch_local_media`, reached from `fetch_one`
+// before the HTTP path. Resolution is done only by
+// `resolve_romm_media_reference`; anything it does not resolve cleanly falls
+// through to the fetch path, so every negative case below still ends at the
+// FakeArtworkServer.
+
+use crate::identity_source::romm::media_mapping::RommMediaMapping;
+use std::os::unix::fs::symlink as unix_symlink;
+
+const MEDIA_PREFIX: &str = "/assets/romm/resources";
+
+/// A source whose media mapping points at `local_root` under [`MEDIA_PREFIX`].
+fn source_with_local_media(local_root: &Path) -> ValidatedRommSource {
+    let config = RommSourceConfig {
+        enabled: true,
+        url: SERVER.to_string(),
+        mappings: Vec::new(),
+        media_mapping: Some(RommMediaMapping {
+            provider_prefix: MEDIA_PREFIX.to_string(),
+            local_root: local_root.to_path_buf(),
+        }),
+        provider_path_kind: ProviderPathKind::AbsoluteProviderPath,
+        token_path: None,
+    };
+    let token = RommToken::parse(FIXTURE_TOKEN).expect("token");
+    ValidatedRommSource::validate(&config, &token, &[], &StaticResolver::new())
+        .expect("the fixture source with a media mapping should validate")
+}
+
+fn write_media(root: &Path, relative: &str, bytes: &[u8]) -> PathBuf {
+    let path = root.join(relative);
+    fs::create_dir_all(path.parent().unwrap()).unwrap();
+    fs::write(&path, bytes).unwrap();
+    path
+}
+
+#[test]
+fn a_valid_mapped_large_cover_is_used_locally_without_a_request() {
+    let tree = Tree::new("local-large");
+    let media = Tree::new("local-large-media");
+    write_media(&media.root, "large.png", &synthetic_png(150, 200));
+    let server = FakeArtworkServer::serving(synthetic_png(10, 10));
+
+    let thumbnail = tree
+        .cache()
+        .fetch(
+            &source_with_local_media(&media.root),
+            &server,
+            &request_with_large(
+                "1",
+                Some("/assets/romm/resources/large.png"),
+                Some("/assets/romm/resources/small.png"),
+            ),
+            1_000,
+            None,
+        )
+        .expect("the mapped large cover should be decoded locally");
+
+    assert_eq!((thumbnail.width, thumbnail.height), (150, 200));
+    assert!(thumbnail.path.is_file());
+    assert_eq!(
+        server.request_count(),
+        0,
+        "a local large cover must not touch the network"
+    );
+}
+
+#[test]
+fn a_valid_mapped_normal_cover_is_used_locally_without_a_request() {
+    let tree = Tree::new("local-small");
+    let media = Tree::new("local-small-media");
+    // RomM's real shape: a `?ts=` query on the reference, absent from the file.
+    write_media(
+        &media.root,
+        "roms/149/1/cover/small.png",
+        &synthetic_png(162, 216),
+    );
+    let server = FakeArtworkServer::serving(synthetic_png(10, 10));
+
+    let thumbnail = tree
+        .cache()
+        .fetch(
+            &source_with_local_media(&media.root),
+            &server,
+            &request("1", Some(REAL_SMALL_REFERENCE), None),
+            1_000,
+            None,
+        )
+        .expect("the mapped small cover should be decoded locally");
+
+    assert_eq!((thumbnail.width, thumbnail.height), (162, 216));
+    assert_eq!(server.request_count(), 0);
+}
+
+#[test]
+fn a_valid_mapped_screenshot_is_used_locally_without_a_request() {
+    let tree = Tree::new("local-screenshot");
+    let media = Tree::new("local-screenshot-media");
+    write_media(&media.root, "screens/1.png", &synthetic_png(120, 90));
+    let server = FakeArtworkServer::serving(synthetic_png(10, 10));
+    let reference = crate::identity_source::model::MediaReference {
+        hosted_reference: Some("/assets/romm/resources/screens/1.png".to_string()),
+        public_reference: None,
+    };
+
+    let thumbnail = tree
+        .cache()
+        .fetch(
+            &source_with_local_media(&media.root),
+            &server,
+            &ArtworkRequest::from_media("1", &reference),
+            1_000,
+            None,
+        )
+        .expect("the mapped screenshot should be decoded locally");
+
+    assert_eq!((thumbnail.width, thumbnail.height), (120, 90));
+    assert_eq!(server.request_count(), 0);
+}
+
+#[test]
+fn a_missing_local_large_cover_falls_back_to_the_remote_large_cover() {
+    let tree = Tree::new("local-large-missing");
+    let media = Tree::new("local-large-missing-media");
+    // Only the small file exists locally; the large reference has no local file.
+    write_media(&media.root, "small.png", &synthetic_png(20, 20));
+    let server = FakeArtworkServer::serving(synthetic_png(30, 40));
+
+    tree.cache()
+        .fetch(
+            &source_with_local_media(&media.root),
+            &server,
+            &request_with_large(
+                "1",
+                Some("/assets/romm/resources/large.png"),
+                Some("/assets/romm/resources/small.png"),
+            ),
+            1_000,
+            None,
+        )
+        .expect("a missing local large cover should still resolve remotely");
+
+    // The large reference is still preferred - it is fetched remotely, the
+    // local (or remote) small cover is never reached.
+    assert_eq!(server.requests().len(), 1);
+    assert!(
+        server.requests()[0]
+            .0
+            .ends_with("/assets/romm/resources/large.png")
+    );
+}
+
+#[test]
+fn a_missing_local_media_file_falls_back_to_the_http_path() {
+    let tree = Tree::new("local-missing");
+    let media = Tree::new("local-missing-media");
+    let server = FakeArtworkServer::serving(synthetic_png(40, 56));
+
+    tree.cache()
+        .fetch(
+            &source_with_local_media(&media.root),
+            &server,
+            &request("1", Some("/assets/romm/resources/small.png"), None),
+            1_000,
+            None,
+        )
+        .expect("an absent local file should fall back to HTTP");
+
+    assert_eq!(server.request_count(), 1);
+    assert!(
+        server.requests()[0]
+            .0
+            .ends_with("/assets/romm/resources/small.png")
+    );
+}
+
+#[test]
+fn a_traversal_reference_is_refused_locally_and_falls_back() {
+    let tree = Tree::new("local-traversal");
+    let media = Tree::new("local-traversal-media");
+    let outside = Tree::new("local-traversal-outside");
+    write_media(&outside.root, "secret.png", &synthetic_png(8, 8));
+    let server = FakeArtworkServer::serving(synthetic_png(40, 56));
+
+    tree.cache()
+        .fetch(
+            &source_with_local_media(&media.root),
+            &server,
+            &request("1", Some("/assets/romm/resources/../../secret.png"), None),
+            1_000,
+            None,
+        )
+        .expect("a traversal reference must not read outside the root; HTTP is tried");
+
+    assert_eq!(
+        server.request_count(),
+        1,
+        "the traversal reference is refused locally, then fetched (and refused) remotely"
+    );
+}
+
+#[test]
+fn a_symlink_escape_is_refused_locally_and_falls_back() {
+    let tree = Tree::new("local-symlink");
+    let media = Tree::new("local-symlink-media");
+    let outside = Tree::new("local-symlink-outside");
+    let real = write_media(&outside.root, "cover.png", &synthetic_png(8, 8));
+    unix_symlink(&real, media.root.join("cover.png")).unwrap();
+    let server = FakeArtworkServer::serving(synthetic_png(40, 56));
+
+    tree.cache()
+        .fetch(
+            &source_with_local_media(&media.root),
+            &server,
+            &request("1", Some("/assets/romm/resources/cover.png"), None),
+            1_000,
+            None,
+        )
+        .expect("a symlink escaping the root must be refused; HTTP is tried");
+
+    assert_eq!(server.request_count(), 1);
+}
+
+#[test]
+fn a_wrong_provider_prefix_is_refused_locally_and_falls_back() {
+    let tree = Tree::new("local-wrong-prefix");
+    let media = Tree::new("local-wrong-prefix-media");
+    write_media(&media.root, "cover.png", &synthetic_png(8, 8));
+    let server = FakeArtworkServer::serving(synthetic_png(40, 56));
+
+    tree.cache()
+        .fetch(
+            &source_with_local_media(&media.root),
+            &server,
+            &request("1", Some("/assets/other/cover.png"), None),
+            1_000,
+            None,
+        )
+        .expect("a reference outside the configured prefix should fall back to HTTP");
+
+    assert_eq!(server.request_count(), 1);
+    assert!(server.requests()[0].0.ends_with("/assets/other/cover.png"));
+}
+
+#[test]
+fn without_a_media_mapping_behaviour_is_unchanged() {
+    let tree = Tree::new("local-none");
+    let media = Tree::new("local-none-media");
+    // A file that *would* match, but there is no mapping, so it is invisible.
+    write_media(&media.root, "small.png", &synthetic_png(99, 99));
+    let server = FakeArtworkServer::serving(synthetic_png(40, 56));
+
+    let thumbnail = tree
+        .cache()
+        .fetch(
+            &source(),
+            &server,
+            &request("1", Some("/assets/romm/resources/small.png"), None),
+            1_000,
+            None,
+        )
+        .expect("with no mapping the existing HTTP path is used");
+
+    assert_eq!((thumbnail.width, thumbnail.height), (40, 56));
+    assert_eq!(server.request_count(), 1);
+}
+
+#[test]
+fn a_local_decode_failure_falls_back_to_the_remote_copy() {
+    let tree = Tree::new("local-bad-decode");
+    let media = Tree::new("local-bad-decode-media");
+    // A supported extension, but the bytes are not a decodable image.
+    let mut corrupt = synthetic_png(20, 20);
+    corrupt.truncate(16);
+    write_media(&media.root, "small.png", &corrupt);
+    let server = FakeArtworkServer::serving(synthetic_png(40, 56));
+
+    let thumbnail = tree
+        .cache()
+        .fetch(
+            &source_with_local_media(&media.root),
+            &server,
+            &request("1", Some("/assets/romm/resources/small.png"), None),
+            1_000,
+            None,
+        )
+        .expect("a non-decodable local file should fall back to the remote copy");
+
+    assert_eq!((thumbnail.width, thumbnail.height), (40, 56));
+    assert_eq!(server.request_count(), 1);
+}
+
+#[test]
+fn an_oversized_local_file_falls_back_to_the_remote_copy() {
+    let tree = Tree::new("local-oversize");
+    let media = Tree::new("local-oversize-media");
+    let mut huge = synthetic_png(4, 4);
+    huge.resize(MAX_ARTWORK_RESPONSE_BYTES + 1, 0);
+    write_media(&media.root, "small.png", &huge);
+    let server = FakeArtworkServer::serving(synthetic_png(40, 56));
+
+    tree.cache()
+        .fetch(
+            &source_with_local_media(&media.root),
+            &server,
+            &request("1", Some("/assets/romm/resources/small.png"), None),
+            1_000,
+            None,
+        )
+        .expect("an oversized local file should fall back to HTTP");
+
+    assert_eq!(server.request_count(), 1);
+}
+
+#[test]
+fn a_record_without_a_hosted_reference_reads_nothing_local() {
+    let tree = Tree::new("local-no-reference");
+    let media = Tree::new("local-no-reference-media");
+    write_media(&media.root, "small.png", &synthetic_png(8, 8));
+    let server = FakeArtworkServer::serving(synthetic_png(10, 10));
+
+    // Only a public scraper URL: no hosted reference to map, and the public
+    // one is never turned into a local path.
+    let refusal = tree
+        .cache()
+        .fetch(
+            &source_with_local_media(&media.root),
+            &server,
+            &request("1", None, Some("https://images.igdb.com/x.jpg")),
+            1_000,
+            None,
+        )
+        .expect_err("a public-only record fabricates no local media");
+    assert_eq!(refusal.code(), "remote_host_not_allowed");
+    assert_eq!(server.request_count(), 0);
+}
+
+#[test]
+fn a_locally_resolved_cover_is_then_served_from_cache_offline() {
+    let tree = Tree::new("local-then-cache");
+    let media = Tree::new("local-then-cache-media");
+    write_media(&media.root, "small.png", &synthetic_png(80, 100));
+    let server = FakeArtworkServer::serving(synthetic_png(10, 10));
+    let cache = tree.cache();
+    let source = source_with_local_media(&media.root);
+    let request = request("1", Some("/assets/romm/resources/small.png"), None);
+
+    let first = cache
+        .fetch(&source, &server, &request, 1_000, None)
+        .expect("local resolve");
+    // Same key the remote path would use - an offline lookup now finds it.
+    let looked_up = cache
+        .lookup(SERVER, &request)
+        .expect("the locally-resolved thumbnail is cached under the shared key");
+    assert_eq!(first.key, looked_up.key);
+    assert_eq!(server.request_count(), 0);
 }

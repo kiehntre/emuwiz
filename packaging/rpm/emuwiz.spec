@@ -1,0 +1,157 @@
+# EmuWiz Fedora/Nobara RPM packaging foundation.
+#
+# Cargo workspace version 0.10.0 is a plain pre-1.0 release (not an alpha
+# snapshot), so this uses Fedora's ordinary final-release convention:
+#   Cargo:  0.10.0
+#   RPM:    Version 0.10.0, Release 1%{?dist}
+
+%global app_id io.github.kiehntre.emuwiz
+%global forgeurl https://github.com/kiehntre/emuwiz
+
+Name:           emuwiz
+Version:        0.10.0
+Release:        1%{?dist}
+Summary:        Verify, organise, and play a retro-game library
+
+License:        MIT
+URL:            %{forgeurl}
+# Local/offline packaging source: a plain tarball of the committed tree,
+# produced by build-rpm.sh via `git archive` (see that script and
+# docs/LINUX_PACKAGING.md - Task B3, "Source / build model"). This is not
+# a published release tarball.
+Source0:        emuwiz-%{version}.tar.gz
+
+# NOT listing cargo/rust here: this workspace's rust-toolchain.toml pins
+# 1.97.1 (edition2024 plus newer Cargo.toml syntax), and Fedora 41's dnf
+# `cargo`/`rust` (1.91.1) demonstrably cannot parse this workspace's
+# Cargo.toml - confirmed by a real failed build under packaging QA V3. A
+# `cargo >= 1.75`/`rust >= 1.75` BuildRequires would be actively misleading:
+# a build root that satisfies it can still fail. Until this project either
+# lowers its MSRV or Fedora ships a new-enough rustc, the build host must
+# provide the pinned toolchain itself (e.g. via rustup - see
+# docs/LINUX_PACKAGING.md) ahead of `rpmbuild`, on PATH.
+BuildRequires:  gcc
+BuildRequires:  pkgconfig
+BuildRequires:  mesa-libGL-devel
+BuildRequires:  libxkbcommon-devel
+BuildRequires:  libxkbcommon-x11-devel
+BuildRequires:  wayland-devel
+BuildRequires:  libX11-devel
+BuildRequires:  libXrandr-devel
+BuildRequires:  libXi-devel
+BuildRequires:  libXcursor-devel
+BuildRequires:  desktop-file-utils
+BuildRequires:  appstream
+
+# ratarmount confirmed absent from Fedora 41's official repos entirely
+# (packaging QA V3, real `dnf list --available`) - it is pip-installable
+# (python3-pip is in Recommends for that path). fuse3, xdg-utils, p7zip,
+# p7zip-plugins, unrar were all confirmed present with these exact names
+# on the same run; Fedora, unlike current Debian/Ubuntu, has NOT renamed
+# p7zip to a `7zip` package, so DEB and RPM intentionally differ here.
+Recommends:     %{name}-cli = %{version}-%{release}
+Recommends:     fuse3
+Recommends:     xdg-utils
+Recommends:     p7zip
+Recommends:     p7zip-plugins
+Recommends:     python3-pip
+Suggests:       ratarmount
+Suggests:       unrar
+
+%description
+EmuWiz helps you turn a messy emulation collection into a verified,
+organised, and more playable library. It identifies supported games
+from their files and archive contents, checks them against
+preservation databases, highlights missing or questionable files,
+helps discover and prepare emulator profiles, builds organised
+libraries for tools such as RomM and ES-DE, and provides safe cheat,
+patch, and selected mod workflows.
+
+Potentially destructive operations are previewed before they run and
+use confirmation, verification, and rollback safeguards where
+supported. EmuWiz can also mount supported ZIP, 7z, and RAR archives
+read-only via ratarmount/FUSE, so you can browse and use their
+contents without permanently extracting everything. It runs locally
+on Linux, and your collection stays yours.
+
+This package provides the graphical application.
+
+%package cli
+Summary:        Verify, organise, and play a retro-game library (CLI)
+Recommends:     fuse3
+Recommends:     p7zip
+Recommends:     p7zip-plugins
+Recommends:     python3-pip
+Suggests:       ratarmount
+Suggests:       unrar
+
+%description cli
+EmuWiz helps you turn a messy emulation collection into a verified,
+organised, and more playable library. See the main emuwiz package
+description for details.
+
+This package provides the emuwiz-cli command-line tool and has no
+dependency on the GUI package, so it can be installed standalone
+(e.g. for headless/server use).
+
+%prep
+%autosetup -n emuwiz-%{version}
+
+%build
+# CARGO_BUILD_JOBS wants a bare integer; %{_smp_mflags} expands to "-jN"
+# (a make(1) flag), which is NOT the same thing and silently produced an
+# invalid value here until real QA (packaging V3) caught it - do not
+# reintroduce %{_smp_mflags} for this variable.
+export CARGO_BUILD_JOBS="${CARGO_BUILD_JOBS:-2}"
+cargo build --release --locked \
+    -p archivefs-gui --bin emuwiz \
+    -p archivefs-cli --bin emuwiz-cli
+
+%install
+install -Dm755 target/release/emuwiz %{buildroot}%{_bindir}/emuwiz
+install -Dm755 target/release/emuwiz-cli %{buildroot}%{_bindir}/emuwiz-cli
+
+sed 's/@EMUWIZ_EXEC@/emuwiz/' assets/linux/%{app_id}.desktop.in \
+    > %{_builddir}/emuwiz-%{version}/%{app_id}.desktop
+install -Dm644 %{_builddir}/emuwiz-%{version}/%{app_id}.desktop \
+    %{buildroot}%{_datadir}/applications/%{app_id}.desktop
+
+install -Dm644 assets/linux/%{app_id}.metainfo.xml \
+    %{buildroot}%{_metainfodir}/%{app_id}.metainfo.xml
+
+for size in 32 64 128 256 512; do
+    install -Dm644 assets/branding/emuwiz-logo-${size}.png \
+        %{buildroot}%{_datadir}/icons/hicolor/${size}x${size}/apps/%{app_id}.png
+done
+
+%check
+desktop-file-validate %{buildroot}%{_datadir}/applications/%{app_id}.desktop
+appstream-util validate-relax --nonet \
+    %{buildroot}%{_metainfodir}/%{app_id}.metainfo.xml || true
+
+%files
+%license LICENSE
+%{_bindir}/emuwiz
+%{_datadir}/applications/%{app_id}.desktop
+%{_metainfodir}/%{app_id}.metainfo.xml
+%{_datadir}/icons/hicolor/32x32/apps/%{app_id}.png
+%{_datadir}/icons/hicolor/64x64/apps/%{app_id}.png
+%{_datadir}/icons/hicolor/128x128/apps/%{app_id}.png
+%{_datadir}/icons/hicolor/256x256/apps/%{app_id}.png
+%{_datadir}/icons/hicolor/512x512/apps/%{app_id}.png
+
+%files cli
+%license LICENSE
+%{_bindir}/emuwiz-cli
+
+%changelog
+* Wed Oct 21 2026 David Armstrong <kiehntre@users.noreply.github.com> - 0.10.0-1
+- Prepare the EmuWiz 0.10.0 pre-1.0 release (not yet published).
+
+* Sat Sep 12 2026 David Armstrong <kiehntre@users.noreply.github.com> - 0.8.3-1
+- Version bump to 0.8.3 (packaging only; not yet released). See
+  docs/LINUX_PACKAGING.md.
+
+* Mon Sep 07 2026 David Armstrong <kiehntre@users.noreply.github.com> - 0.8.1-0.1.alpha
+- Initial Fedora/Nobara RPM packaging foundation (packaging only; not yet
+  released). See docs/LINUX_PACKAGING.md.

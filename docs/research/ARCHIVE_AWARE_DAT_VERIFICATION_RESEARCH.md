@@ -1,5 +1,7 @@
 # Archive-Aware DAT Verification: Research & Architecture
 
+> **Research snapshot** — This document records earlier research and design reasoning. It is not current capability documentation; see the [README](../../README.md), [current capabilities](../LAUNCH_SUPPORT.md), and [roadmap](../../ROADMAP.md) for present guidance.
+
 Status: research only. No application code was changed for this document. Repo `kiehntre/emuwiz`, branch `main`, commit `f7c450c` (merge of PR #29). All file:line citations below were read directly from that commit in this clone.
 
 Tagging key: **DOCUMENTED FACT** (external, cited source), **CONCLUSION FROM SOURCE** (file:line in this repo), **INFERENCE** (reasoning stated), **UNCERTAIN** (flagged explicitly, not guessed).

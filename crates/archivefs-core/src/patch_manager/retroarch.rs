@@ -1446,6 +1446,7 @@ fn resolution_state_tag(state: ResolutionState) -> &'static [u8] {
         ResolutionState::ConfiguredUnresolved => b"configured_unresolved",
         ResolutionState::RuntimeDefaultUnknown => b"runtime_default_unknown",
         ResolutionState::NoReadableConfig => b"no_readable_config",
+        ResolutionState::EmuWizCoreDirectoryOverride => b"emuwiz_core_directory_override",
     }
 }
 
@@ -1528,6 +1529,11 @@ mod tests {
                 display_version: None,
                 system_name: None,
                 supported_extensions: extensions.iter().map(|value| value.to_string()).collect(),
+                core_name: None,
+                manufacturer: None,
+                categories: None,
+                database: None,
+                firmware: Vec::new(),
             },
         }
     }
@@ -2100,6 +2106,7 @@ mod tests {
             system_flatpak_root: root.join("var-lib-flatpak-does-not-exist"),
             app_image_search_roots: Vec::new(),
             desktop_file_roots: Vec::new(),
+            explicit_executables: Vec::new(),
         };
 
         let plan = preview_retroarch_patch_and_cheat_destinations(
@@ -2410,6 +2417,11 @@ mod tests {
             display_version: None,
             system_name: None,
             supported_extensions: vec!["zip".to_string()],
+            core_name: None,
+            manufacturer: None,
+            categories: None,
+            database: None,
+            firmware: Vec::new(),
         };
         let core = associate_core(
             &playlist_entry(

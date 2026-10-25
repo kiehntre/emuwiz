@@ -32,12 +32,42 @@
 //! - Every parse warning includes byte offset and source context.
 //! - Unknown status values are preserved rather than discarded.
 
+pub mod acquisition;
+pub mod amiga_adf_identity;
+pub mod archive;
 pub mod audit;
+pub mod authority;
+pub mod catalogue_selection;
 pub mod classification;
+pub mod coverage;
+pub mod coverage_expectations;
+pub mod custom_dat;
+pub mod custom_sources;
+pub mod dependency;
+pub mod disk_audit;
+pub mod divergence;
+pub mod duel;
+pub mod expected_inventory;
+pub mod firmware_evidence;
 pub mod hash;
+pub mod identity;
 pub mod index;
+pub mod library_identity_projection;
+pub mod library_identity_summary;
+pub mod library_verification;
 pub mod limits;
+pub mod mame_arcade_join;
+pub mod mame_input_metadata;
+pub mod mame_merged_reconstruction;
+/// Checksum-driven MAME set normalisation. Planning is read-only; applying is
+/// explicit, staged, no-clobber, and journaled for undo.
+pub mod mame_normalizer;
+pub mod managed_sources;
 pub mod model;
+/// Neo Geo MVS/AES multi-ROM set coherence: a thin, read-only projection
+/// over the existing `set`/`dependency` engine plus MAME ROM-region role
+/// evidence. See that module's own doc for the reuse contract.
+pub mod neogeo_set;
 pub mod parser;
 pub mod parsers;
 pub mod policy;
@@ -46,4 +76,14 @@ mod regression;
 pub mod rename_apply;
 pub mod rename_plan;
 pub mod rom_organisation;
+pub mod set;
 pub mod sources;
+pub mod tosec_release_pack;
+pub mod tosec_system_projection;
+pub mod trusted_dtd;
+pub mod update_health;
+pub mod updates;
+
+pub use mame_input_metadata::{MameControlMetadata, MameInputMetadata};
+
+pub mod configured_catalogues;

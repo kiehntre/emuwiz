@@ -1,0 +1,1005 @@
+//! Local, read-only pack analysis. This is an inspection/plan over existing
+//! parsers and reconciliation, not a second installer. Nothing here accepts a
+//! destination, database handle, executor, persisted review or enable command.
+//! Source observations and logical cheats have separate, reconcilable totals.
+
+use std::collections::{BTreeMap, BTreeSet};
+use std::path::{Path, PathBuf};
+
+use serde::Serialize;
+use sha2::{Digest, Sha256};
+
+use super::cheat_applicability::{
+    CheatApplicabilityInput, CheatApplicabilityIssue, CheatApplicabilityMatch,
+    CheatApplicabilityReport, CheatApplicabilityState, CheatGameAssociation,
+    CheatIdentityRequirement, CheatParseEvidence, CheatSelectedGame, assess_cheat_applicability,
+    assess_cheat_applicability_with_reconciliation,
+};
+use super::cheat_ir::{
+    self, CheatDocument, CheatDuplicateKind, CheatPlatform, CheatReconciliationEntry,
+    CheatReconciliationResult, CheatSourceFormat,
+};
+use super::cht_document::{ChtDocumentWarning, ChtEntryWarning};
+use super::user_cheat_import::{
+    UserCheatDiagnostic, UserCheatFormat, UserCheatImportError, UserCheatImportLimits,
+    UserCheatLibraryGame, UserCheatProvenance,
+};
+use crate::game_identity::{IdentityEvidence, IdentityKind, IdentityStatus};
+
+mod source;
+#[cfg(all(test, target_os = "linux"))]
+mod tests;
+
+/// Safety limits cannot exceed these defaults. Enumeration includes directories,
+/// preventing huge empty-directory trees from bypassing the source-file budget.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct CheatPackLimits {
+    pub source: UserCheatImportLimits,
+    pub max_observations: usize,
+    pub max_line_bytes: usize,
+    pub max_lines_per_file: usize,
+    pub max_code_lines: usize,
+    pub max_catalogue_games: usize,
+    pub max_matches_per_file: usize,
+}
+impl Default for CheatPackLimits {
+    fn default() -> Self {
+        Self {
+            source: UserCheatImportLimits {
+                max_file_bytes: 512 * 1024,
+                max_total_bytes: 128 * 1024 * 1024,
+                max_files_visited: 10_000,
+                max_depth: 16,
+                max_cheats_per_file: 1024,
+                max_warnings: 256,
+            },
+            max_observations: 65_536,
+            max_line_bytes: 8192,
+            max_lines_per_file: 16_384,
+            max_code_lines: 1024,
+            max_catalogue_games: 100_000,
+            max_matches_per_file: 128,
+        }
+    }
+}
+
+/// Expectations from source data or an explicitly supplied local manifest are
+/// the canonical [`CheatGameAssociation`]: a requirement is not proof of the
+/// ROM's identity. No manifest format is invented; callers adapt existing
+/// evidence to this in-memory seam.
+pub type CheatPackAssociation = CheatGameAssociation;
+pub type CheatPackIdentityRequirement = CheatIdentityRequirement;
+/// Verified facts use EmuWiz's existing IdentityEvidence, never optional string
+/// fields in UserCheatLibraryGame as an implicit verification flag.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct CheatPackCatalogueGame {
+    pub game: UserCheatLibraryGame,
+    pub facts: Vec<IdentityEvidence>,
+    pub revision: Option<String>,
+}
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize)]
+pub enum CheatPackMatchStrength {
+    Unmatched,
+    Possible,
+    Strong,
+    Exact,
+    Ambiguous,
+}
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct CheatPackGameMatch {
+    pub game_id: String,
+    pub identity_key: String,
+    pub strength: CheatPackMatchStrength,
+    pub evidence: Vec<CheatPackIdentityRequirement>,
+}
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize)]
+pub enum CheatPackAction {
+    WouldAdd,
+    WouldCorroborate,
+    WouldRetainExisting,
+    WouldRequireReview,
+    WouldRejectMalformed,
+    WouldRejectUnsupported,
+    WouldRemainUnmatched,
+    WouldRemainAmbiguous,
+}
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+pub enum CheatPackFileState {
+    Accepted,
+    Malformed,
+    Unsupported,
+    Unreadable,
+    LimitRejected,
+}
+/// Narrow adapter for typed parser diagnostics. Original .cht kinds, line and
+/// bounded raw source evidence remain intact; Batch 1 can feed this directly.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub enum CheatPackDiagnostic {
+    ChtDocument(ChtDocumentWarning),
+    ChtEntry(ChtEntryWarning),
+    ParseFailure { code: String, detail: String },
+    Source(UserCheatDiagnostic),
+    Limit { detail: String },
+}
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct CheatPackFile {
+    pub path: PathBuf,
+    pub format: Option<UserCheatFormat>,
+    pub state: CheatPackFileState,
+    pub provenance: Option<UserCheatProvenance>,
+    pub association: CheatPackAssociation,
+    pub game_key: String,
+    pub matches: Vec<CheatPackGameMatch>,
+    pub match_strength: CheatPackMatchStrength,
+    pub matches_truncated: bool,
+    pub observation_indices: Vec<usize>,
+    pub diagnostics: Vec<CheatPackDiagnostic>,
+    pub diagnostics_truncated: bool,
+    pub source_metadata: BTreeMap<String, String>,
+    pub source_comments: Vec<String>,
+}
+/// Observation provenance is separate from logical identity. Identical content
+/// digests are known copies, not evidence of independent source authorship.
+/// source_group/mirror_of may be supplied by Batch 3's richer provenance; an
+/// arbitrary filesystem path is never treated as an independent source group.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct CheatPackObservation {
+    pub file_index: usize,
+    pub source_index: Option<u32>,
+    pub source_index_conflict: bool,
+    pub provenance: UserCheatProvenance,
+    pub source_group: Option<String>,
+    pub mirror_of: Option<String>,
+    pub association: CheatPackAssociation,
+    pub document: CheatDocument,
+    pub raw_code: String,
+    pub code_truncated: bool,
+    pub full_code_digest: Option<String>,
+    pub execution_fields: BTreeMap<String, String>,
+    pub engine: Option<String>,
+    pub source_enabled_by_default: bool,
+    pub applicability: CheatApplicabilityState,
+    pub assessment: Option<CheatApplicabilityReport>,
+    pub native_cht: Option<super::cht_document::ChtEntry>,
+    pub diagnostics: Vec<CheatPackDiagnostic>,
+    pub diagnostics_truncated: bool,
+    pub logical_key: String,
+    pub action: CheatPackAction,
+}
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct CheatPackLogicalCheat {
+    pub key: String,
+    pub game_key: String,
+    pub observation_indices: Vec<usize>,
+    pub relationships: BTreeSet<CheatDuplicateKind>,
+    pub distinct_source_contents: usize,
+    pub independent_source_groups: usize,
+    pub known_mirrors: usize,
+    pub known_copies: usize,
+    pub usable: bool,
+    /// Existing main reconciliation evidence when identity is verified. Its
+    /// groups are evidence only: a duplicate subgroup cannot hide a conflict.
+    pub reconciliation: Option<CheatReconciliationResult>,
+}
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct CheatPackGame {
+    pub key: String,
+    pub file_indices: Vec<usize>,
+    pub logical_cheat_indices: Vec<usize>,
+    pub strength: CheatPackMatchStrength,
+}
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize)]
+pub struct CheatPackTotals {
+    pub files_discovered: usize,
+    pub files_readable: usize,
+    pub files_accepted: usize,
+    pub files_malformed: usize,
+    pub files_rejected: usize,
+    pub games_represented: usize,
+    pub exact_matches: usize,
+    pub strong_matches: usize,
+    pub possible_matches: usize,
+    pub ambiguous_matches: usize,
+    pub unmatched_games: usize,
+    pub observations: usize,
+    pub logical_cheats: usize,
+    pub usable_cheats: usize,
+    pub malformed_cheats: usize,
+    /// Relationship totals count logical groups, not additional cheat rows.
+    pub exact_duplicates: usize,
+    pub equivalent_duplicates: usize,
+    pub corroborating_sources: usize,
+    pub conflicts: usize,
+    pub region_mismatches: usize,
+    pub revision_mismatches: usize,
+    pub unsupported_formats: usize,
+    pub unsupported_targets: usize,
+    pub needs_review: usize,
+    /// These disjoint action totals partition observations, not logical cheats.
+    pub would_add: usize,
+    pub would_corroborate: usize,
+    pub would_retain_existing: usize,
+    pub would_review: usize,
+    pub would_reject: usize,
+    pub would_remain_unmatched: usize,
+    pub would_remain_ambiguous: usize,
+}
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct CheatPackPreview {
+    pub root: PathBuf,
+    pub limits: CheatPackLimits,
+    pub files: Vec<CheatPackFile>,
+    pub observations: Vec<CheatPackObservation>,
+    pub games: Vec<CheatPackGame>,
+    pub logical_cheats: Vec<CheatPackLogicalCheat>,
+    pub diagnostics: Vec<CheatPackDiagnostic>,
+    pub totals: CheatPackTotals,
+    pub bytes_read: u64,
+    /// False means an explicitly reported scan/retention bound was reached;
+    /// totals describe only retained evidence, never an estimate of omitted rows.
+    pub complete: bool,
+}
+impl CheatPackPreview {
+    pub fn can_apply(&self) -> bool {
+        false
+    }
+    pub fn actions_reconcile(&self) -> bool {
+        let t = &self.totals;
+        t.observations
+            == t.would_add
+                + t.would_corroborate
+                + t.would_retain_existing
+                + t.would_review
+                + t.would_reject
+                + t.would_remain_unmatched
+                + t.would_remain_ambiguous
+    }
+}
+
+/// Only local plain sources. associations are keyed by root-relative paths;
+/// existing is an immutable snapshot of known logical keys, not a DB handle.
+pub fn preview_cheat_pack(
+    root: &Path,
+    catalogue: &[CheatPackCatalogueGame],
+    associations: &BTreeMap<PathBuf, CheatPackAssociation>,
+    existing: &BTreeSet<String>,
+    limits: &CheatPackLimits,
+) -> Result<CheatPackPreview, UserCheatImportError> {
+    source::preview(root, catalogue, associations, existing, limits)
+}
+
+/// Re-plan immutable, already inspected evidence (Batch 1-4 integration seam).
+/// This accepts no filesystem/database/executor. Caller-provided Ready is an
+/// evidence state, not install permission. Invalid references fail closed.
+pub fn plan_cheat_pack_preview(
+    mut preview: CheatPackPreview,
+    existing: &BTreeSet<String>,
+) -> Result<CheatPackPreview, UserCheatImportError> {
+    source::validate(&preview.limits)?;
+    if preview.files.len() > preview.limits.source.max_files_visited
+        || preview.observations.len() > preview.limits.max_observations
+        || preview.observations.iter().any(|o| {
+            o.file_index >= preview.files.len()
+                || o.raw_code.len() > super::cht_document::MAX_CHT_FIELD_BYTES
+                || o.document.operations.len() > preview.limits.max_code_lines
+        })
+    {
+        return Err(UserCheatImportError::InvalidLimits(
+            "prepared pack exceeds bounds or has invalid source references".into(),
+        ));
+    }
+    if preview
+        .files
+        .iter()
+        .map(|f| &f.path)
+        .collect::<BTreeSet<_>>()
+        .len()
+        != preview.files.len()
+    {
+        return Err(UserCheatImportError::InvalidLimits(
+            "prepared pack has duplicate source paths".into(),
+        ));
+    }
+    preview.logical_cheats.clear();
+    preview.games.clear();
+    // Normalize prepared enumeration without changing logical identity.
+    let mut file_order: Vec<_> = (0..preview.files.len()).collect();
+    file_order.sort_by(|&a, &b| preview.files[a].path.cmp(&preview.files[b].path));
+    let mut remap = vec![0; file_order.len()];
+    let files = file_order
+        .into_iter()
+        .enumerate()
+        .map(|(new, old)| {
+            remap[old] = new;
+            preview.files[old].clone()
+        })
+        .collect();
+    preview.files = files;
+    for o in &mut preview.observations {
+        o.file_index = remap[o.file_index];
+    }
+    preview.observations.sort_by(|a, b| {
+        a.file_index
+            .cmp(&b.file_index)
+            .then_with(|| a.source_index.cmp(&b.source_index))
+            .then_with(|| content_key(a).cmp(&content_key(b)))
+            .then_with(|| a.document.title.cmp(&b.document.title))
+            .then_with(|| a.mirror_of.cmp(&b.mirror_of))
+            .then_with(|| a.source_group.cmp(&b.source_group))
+            .then_with(|| a.provenance.source_sha256.cmp(&b.provenance.source_sha256))
+            .then_with(|| a.provenance.original_path.cmp(&b.provenance.original_path))
+            .then_with(|| a.applicability.cmp(&b.applicability))
+    });
+    for f in &mut preview.files {
+        f.observation_indices.clear();
+    }
+    for (i, o) in preview.observations.iter().enumerate() {
+        preview.files[o.file_index].observation_indices.push(i);
+    }
+    bound_diagnostics(&mut preview);
+    plan(&mut preview, existing);
+    Ok(preview)
+}
+
+fn digest<T: Serialize>(domain: &str, value: &T) -> String {
+    let mut hash = Sha256::new();
+    hash.update(domain.as_bytes());
+    // All inputs here are structs/string/enums/integer collections; serde_json
+    // cannot reject them. Still return a deterministic key without panicking.
+    if let Ok(bytes) = serde_json::to_vec(value) {
+        hash.update(bytes);
+    }
+    hash.finalize().iter().map(|b| format!("{b:02x}")).collect()
+}
+fn requirement_key(kind: IdentityKind, value: &str) -> String {
+    // Identifier spelling uses the existing PS2 normalizers where applicable.
+    let value = match kind {
+        IdentityKind::Ps2Serial => {
+            super::pcsx2::normalize_serial(value).unwrap_or_else(|| value.into())
+        }
+        IdentityKind::Pcsx2ExecutableCrc => {
+            super::pcsx2::normalize_crc(value).unwrap_or_else(|| value.into())
+        }
+        IdentityKind::LooseRomSha256 | IdentityKind::LooseRomCanonicalSha256 => {
+            value.to_ascii_lowercase()
+        }
+        _ => value.trim().to_string(),
+    };
+    digest("cheat-pack-identity-v1", &(kind, value))
+}
+fn verified_keys(game: &CheatPackCatalogueGame) -> BTreeSet<String> {
+    let mut by_kind = BTreeMap::<String, BTreeSet<String>>::new();
+    for fact in game
+        .facts
+        .iter()
+        .filter(|f| f.status == IdentityStatus::Verified && is_game_identity(f.kind))
+    {
+        if let Some(value) = fact.value.as_deref().filter(|v| !v.trim().is_empty()) {
+            by_kind
+                .entry(digest("identity-kind", &fact.kind))
+                .or_default()
+                .insert(requirement_key(fact.kind, value));
+        }
+    }
+    by_kind.into_values().flatten().collect()
+}
+
+fn catalogue_key(game: &CheatPackCatalogueGame) -> String {
+    let release: BTreeSet<_> = game
+        .facts
+        .iter()
+        .filter(|f| {
+            f.status == IdentityStatus::Verified
+                && matches!(
+                    f.kind,
+                    IdentityKind::DolphinRegion | IdentityKind::DolphinRevision
+                )
+        })
+        .filter_map(|f| f.value.as_deref().map(|v| requirement_key(f.kind, v)))
+        .collect();
+    digest("cheat-pack-game-v1", &(verified_keys(game), release))
+}
+
+fn is_game_identity(kind: IdentityKind) -> bool {
+    matches!(
+        kind,
+        IdentityKind::LooseRomSha256
+            | IdentityKind::LooseRomCanonicalSha256
+            | IdentityKind::Pcsx2ExecutableCrc
+            | IdentityKind::Ps2Serial
+            | IdentityKind::Ps1Serial
+            | IdentityKind::PspDiscId
+            | IdentityKind::DolphinGameId
+            | IdentityKind::XexTitleId
+    )
+}
+/// Indexed matching: no platform-only matches and no title/filename promotion.
+struct CatalogueIndex<'a> {
+    games: &'a [CheatPackCatalogueGame],
+    order: Vec<usize>,
+    match_limit: usize,
+    facts: BTreeMap<String, BTreeSet<usize>>,
+    titles: BTreeMap<String, BTreeSet<usize>>,
+}
+impl<'a> CatalogueIndex<'a> {
+    fn new(games: &'a [CheatPackCatalogueGame], match_limit: usize) -> Self {
+        let sort_keys: Vec<_> = games
+            .iter()
+            .map(|g| (&g.game.game_id, catalogue_key(g)))
+            .collect();
+        let mut order: Vec<_> = (0..games.len()).collect();
+        order.sort_by(|&a, &b| sort_keys[a].cmp(&sort_keys[b]));
+        let mut result = Self {
+            games,
+            order,
+            match_limit,
+            facts: BTreeMap::new(),
+            titles: BTreeMap::new(),
+        };
+        for (i, &original) in result.order.iter().enumerate() {
+            let game = &games[original];
+            for key in verified_keys(game) {
+                result.facts.entry(key).or_default().insert(i);
+            }
+            let title = super::user_cheat_import::normalize_title(&game.game.title);
+            if !title.is_empty() {
+                result.titles.entry(title).or_default().insert(i);
+            }
+        }
+        result
+    }
+    fn associate(
+        &self,
+        association: &CheatPackAssociation,
+        remaining_matches: usize,
+    ) -> (
+        String,
+        CheatPackMatchStrength,
+        Vec<CheatPackGameMatch>,
+        bool,
+    ) {
+        let match_limit = self.match_limit.min(remaining_matches);
+        let mut candidates = BTreeSet::<usize>::new();
+        for requirement in &association.identities {
+            if is_game_identity(requirement.kind) && !requirement.value.trim().is_empty() {
+                let key = requirement_key(requirement.kind, &requirement.value);
+                if let Some(indices) = self.facts.get(&key) {
+                    candidates.extend(indices.iter().take(match_limit + 1).copied());
+                }
+            }
+        }
+        for text in [
+            association.title.as_deref(),
+            association.filename.as_deref(),
+        ]
+        .into_iter()
+        .flatten()
+        {
+            let title = super::user_cheat_import::normalize_title(text);
+            if !title.is_empty()
+                && let Some(indices) = self.titles.get(&title)
+            {
+                candidates.extend(indices.iter().take(match_limit + 1).copied());
+            }
+        }
+        let mut matches = Vec::new();
+        let truncated = candidates.len() > match_limit;
+        for i in candidates.into_iter().take(match_limit) {
+            let game = &self.games[self.order[i]];
+            let assessment = assess_cheat_applicability(&CheatApplicabilityInput {
+                game: selected_game(game),
+                association: association.clone(),
+                document: CheatDocument {
+                    title: String::new(),
+                    platform: source::platform(association),
+                    source_format: CheatSourceFormat::RetroArch,
+                    operations: vec![],
+                    issues: vec![],
+                    provenance: vec![],
+                    source_evidence: vec![],
+                },
+                parsing: CheatParseEvidence::Unknown,
+                native_cht: None,
+                route: None,
+                reconciliation: None,
+            });
+            let matching = association
+                .identities
+                .iter()
+                .filter(|r| verified_keys(game).contains(&requirement_key(r.kind, &r.value)))
+                .cloned()
+                .collect();
+            let strength = if assessment
+                .blockers
+                .contains(&CheatApplicabilityIssue::ConflictingIdentity)
+            {
+                CheatPackMatchStrength::Ambiguous
+            } else if assessment
+                .blockers
+                .contains(&CheatApplicabilityIssue::DifferentGame)
+            {
+                CheatPackMatchStrength::Unmatched
+            } else {
+                match assessment.identity_match {
+                    CheatApplicabilityMatch::ExactHash => CheatPackMatchStrength::Exact,
+                    CheatApplicabilityMatch::VerifiedIdentifier => CheatPackMatchStrength::Strong,
+                    CheatApplicabilityMatch::Unknown => CheatPackMatchStrength::Unmatched,
+                    _ => CheatPackMatchStrength::Possible,
+                }
+            };
+            matches.push(CheatPackGameMatch {
+                game_id: game.game.game_id.clone(),
+                identity_key: catalogue_key(game),
+                strength,
+                evidence: matching,
+            });
+        }
+        matches.sort_by(|a, b| {
+            b.strength
+                .cmp(&a.strength)
+                .then_with(|| a.game_id.cmp(&b.game_id))
+                .then_with(|| digest("evidence", &a.evidence).cmp(&digest("evidence", &b.evidence)))
+        });
+        matches.dedup();
+        let best = matches
+            .first()
+            .map_or(CheatPackMatchStrength::Unmatched, |m| m.strength);
+        let top = matches.iter().filter(|m| m.strength == best).count();
+        let strength = if top > 1 || truncated {
+            CheatPackMatchStrength::Ambiguous
+        } else {
+            best
+        };
+        if strength == CheatPackMatchStrength::Ambiguous {
+            for m in &mut matches {
+                if m.strength == best {
+                    m.strength = CheatPackMatchStrength::Ambiguous;
+                }
+            }
+        }
+        let key = if !truncated
+            && !matches.is_empty()
+            && top == 1
+            && matches!(
+                best,
+                CheatPackMatchStrength::Exact | CheatPackMatchStrength::Strong
+            ) {
+            matches[0].identity_key.clone()
+        } else {
+            digest("cheat-pack-association-v1", &association_key(association))
+        };
+        (key, strength, matches, truncated)
+    }
+}
+fn association_key(
+    a: &CheatPackAssociation,
+) -> (Option<String>, Option<String>, Option<String>, Vec<String>) {
+    let identities = a
+        .identities
+        .iter()
+        .map(|r| requirement_key(r.kind, &r.value))
+        .collect::<BTreeSet<_>>()
+        .into_iter()
+        .collect();
+    (
+        a.title
+            .as_deref()
+            .map(super::user_cheat_import::normalize_title),
+        a.filename
+            .as_deref()
+            .map(super::user_cheat_import::normalize_title),
+        a.platform.clone(),
+        identities,
+    )
+}
+fn selected_game(game: &CheatPackCatalogueGame) -> CheatSelectedGame {
+    let mut selected = CheatSelectedGame::from_evidence(&game.facts);
+    selected.title = Some(game.game.title.clone());
+    selected
+}
+
+fn assess_observation(
+    o: &CheatPackObservation,
+    game: CheatSelectedGame,
+    reconciliation: Option<&CheatReconciliationResult>,
+) -> CheatApplicabilityReport {
+    assess_cheat_applicability_with_reconciliation(
+        &CheatApplicabilityInput {
+            game,
+            association: o.association.clone(),
+            document: o.document.clone(),
+            parsing: if o.code_truncated || o.applicability == CheatApplicabilityState::Malformed {
+                CheatParseEvidence::Malformed {
+                    details: vec!["source parsing/bounds refused".into()],
+                }
+            } else {
+                CheatParseEvidence::Valid
+            },
+            native_cht: if o.code_truncated {
+                None
+            } else {
+                o.native_cht.clone()
+            },
+            route: o.assessment.as_ref().and_then(|a| a.support.route.clone()),
+            reconciliation: None,
+        },
+        reconciliation,
+    )
+}
+
+fn entry_for(
+    observation: &CheatPackObservation,
+    game_key: &str,
+    verified: bool,
+) -> CheatReconciliationEntry {
+    // One provenance model: the observation's local artifact becomes the
+    // canonical typed record (hash, path, original text), never ad hoc strings.
+    let mut record = super::cheat_provenance::CheatRecordProvenance::local_with_sha256(
+        &observation.provenance.original_path,
+        &observation.provenance.source_sha256,
+        &format!("{:?}", observation.document.source_format),
+    );
+    record.record_index = observation.source_index;
+    record.original_description = Some(observation.document.title.clone());
+    record.original_code = Some(observation.raw_code.clone());
+    let mut document = observation.document.clone();
+    document.source_evidence = vec![record];
+    CheatReconciliationEntry {
+        game_identity: game_key.into(),
+        identity_verified: verified,
+        applicability: cheat_ir::CheatApplicability {
+            region: observation.association.region.clone(),
+            revision: observation.association.revision.clone(),
+            engine: observation.engine.clone(),
+            metadata: observation.execution_fields.clone(),
+            ..Default::default()
+        },
+        source_path: Some(observation.provenance.original_path.display().to_string()),
+        source_index: observation.source_index,
+        source_fields: observation
+            .native_cht
+            .as_ref()
+            .map_or_else(Vec::new, |e| e.source_fields.clone()),
+        title: observation.document.title.clone(),
+        source: observation.provenance.source_sha256.clone(),
+        source_format: observation.document.source_format.clone(),
+        document,
+        raw_code: Some(observation.raw_code.clone()),
+        provenance: vec![
+            observation.provenance.original_path.display().to_string(),
+            observation.provenance.source_sha256.clone(),
+        ],
+    }
+}
+fn content_key(o: &CheatPackObservation) -> String {
+    // Known semantics reuse main's identity. Opaque codes keep byte spelling,
+    // format and all execution fields; no arbitrary whitespace/hex repair.
+    let semantics = cheat_ir::semantic_fingerprint(&o.document);
+    digest(
+        "cheat-pack-code-v1",
+        &(
+            semantics.clone(),
+            semantics.is_none().then_some((
+                &o.document.source_format,
+                &o.raw_code,
+                &o.full_code_digest,
+            )),
+            &o.document.issues,
+            &o.execution_fields,
+            &o.engine,
+            &o.association.region,
+            &o.association.revision,
+        ),
+    )
+}
+
+// A pack can propose importing an exact observation without knowing a runtime
+// route. Unknown runtime capabilities remain in its canonical report; they do
+// not constitute installation/launch authority. All other blockers need review.
+fn pack_admissible(report: &CheatApplicabilityReport) -> bool {
+    report.identity_match >= CheatApplicabilityMatch::VerifiedIdentifier
+        && !report.warnings.iter().any(|w| match w {
+            CheatApplicabilityIssue::RegionUnknown => report.association.region.is_some(),
+            CheatApplicabilityIssue::RevisionUnknown => report.association.revision.is_some(),
+            CheatApplicabilityIssue::UnverifiedAssociation => true,
+            _ => false,
+        })
+        && report.blockers.iter().all(|b| {
+            matches!(
+                b,
+                CheatApplicabilityIssue::EmulatorCapabilityUnknown
+                    | CheatApplicabilityIssue::FormatCapabilityUnknown
+                    | CheatApplicabilityIssue::EngineCapabilityUnknown
+            )
+        })
+}
+
+fn plan(preview: &mut CheatPackPreview, existing: &BTreeSet<String>) {
+    let mut buckets = BTreeMap::<(String, String), Vec<usize>>::new();
+    for (i, o) in preview.observations.iter().enumerate() {
+        buckets
+            .entry((
+                preview.files[o.file_index].game_key.clone(),
+                digest("platform", &o.document.platform),
+            ))
+            .or_default()
+            .push(i);
+    }
+    let mut difference_budget = preview.limits.source.max_warnings;
+    for ((game_key, _), bucket) in buckets {
+        let entries = bucket
+            .iter()
+            .map(|&i| {
+                let o = &preview.observations[i];
+                let verified = o.assessment.as_ref().is_some_and(|a| {
+                    a.identity_match >= CheatApplicabilityMatch::VerifiedIdentifier
+                        && !a.blockers.iter().any(|b| b.is_hard_refusal())
+                }) && matches!(
+                    preview.files[o.file_index].match_strength,
+                    CheatPackMatchStrength::Exact | CheatPackMatchStrength::Strong
+                );
+                entry_for(o, &game_key, verified)
+            })
+            .collect();
+        let grouped = cheat_ir::group_cheat_observations(entries);
+        for group in &grouped.groups {
+            let indices: Vec<_> = group.entry_indices.iter().map(|&i| bucket[i]).collect();
+            let mut local = group.clone();
+            local.entry_indices = (0..indices.len()).collect();
+            if local.differences.len() > difference_budget {
+                preview.complete = false;
+            }
+            local.differences.truncate(difference_budget);
+            difference_budget = difference_budget.saturating_sub(local.differences.len());
+            let reconciliation = CheatReconciliationResult {
+                game_identity: grouped.game_identity.clone(),
+                platform: grouped.platform.clone(),
+                entries: group
+                    .entry_indices
+                    .iter()
+                    .map(|&i| grouped.entries[i].clone())
+                    .collect(),
+                groups: vec![local],
+                auto_winner: None,
+            };
+            let relations = group.classifications.iter().copied().collect();
+            let conflict = group
+                .classifications
+                .iter()
+                .any(|kind| kind.requires_review());
+            let mut contents = BTreeSet::new();
+            let mut provenance = BTreeSet::new();
+            let mut copy_paths = BTreeMap::<String, BTreeSet<PathBuf>>::new();
+            let mut independent = BTreeSet::new();
+            let mut mirrors = BTreeSet::new();
+            let mut keys = BTreeSet::new();
+            let mut added = BTreeSet::new();
+            let mut retained_sources = BTreeSet::new();
+            let mut all_admissible = true;
+            for &i in &indices {
+                let o = &mut preview.observations[i];
+                let game = o
+                    .assessment
+                    .as_ref()
+                    .map(|a| a.game.clone())
+                    .unwrap_or_default();
+                let report = assess_observation(o, game, Some(&reconciliation));
+                o.applicability = report.state;
+                let admissible = pack_admissible(&report);
+                o.assessment = Some(report);
+                all_admissible &= admissible;
+                let content = content_key(o);
+                o.logical_key = digest(
+                    "cheat-pack-logical-v1",
+                    &(&game_key, &o.document.platform, &content),
+                );
+                keys.insert(o.logical_key.clone());
+                contents.insert(content);
+                provenance.insert(o.provenance.source_sha256.clone());
+                copy_paths
+                    .entry(o.provenance.source_sha256.clone())
+                    .or_default()
+                    .insert(o.provenance.original_path.clone());
+                if o.mirror_of.is_none() {
+                    if let Some(v) = &o.source_group {
+                        independent.insert(v.clone());
+                    }
+                }
+                if let Some(v) = &o.mirror_of {
+                    mirrors.insert(v.clone());
+                }
+                o.action = match o.applicability {
+                    _ if o.assessment.as_ref().is_some_and(|a| {
+                        a.blockers.contains(&CheatApplicabilityIssue::MissingCode)
+                    }) =>
+                    {
+                        CheatPackAction::WouldRejectMalformed
+                    }
+                    CheatApplicabilityState::Malformed => CheatPackAction::WouldRejectMalformed,
+                    CheatApplicabilityState::UnsupportedFormat
+                    | CheatApplicabilityState::UnsupportedEmulator => {
+                        CheatPackAction::WouldRejectUnsupported
+                    }
+                    _ if preview.files[o.file_index].match_strength
+                        == CheatPackMatchStrength::Ambiguous =>
+                    {
+                        CheatPackAction::WouldRemainAmbiguous
+                    }
+                    CheatApplicabilityState::MissingRequiredEvidence => {
+                        CheatPackAction::WouldRemainUnmatched
+                    }
+                    _ if admissible && !conflict => {
+                        if existing.contains(&o.logical_key) {
+                            CheatPackAction::WouldRetainExisting
+                        } else if added.insert(o.logical_key.clone()) {
+                            retained_sources.insert((
+                                o.logical_key.clone(),
+                                o.provenance.source_sha256.clone(),
+                            ));
+                            CheatPackAction::WouldAdd
+                        } else if retained_sources
+                            .insert((o.logical_key.clone(), o.provenance.source_sha256.clone()))
+                            && o.mirror_of.is_none()
+                        {
+                            CheatPackAction::WouldCorroborate
+                        } else {
+                            CheatPackAction::WouldRetainExisting
+                        }
+                    }
+                    _ => CheatPackAction::WouldRequireReview,
+                };
+            }
+            preview.logical_cheats.push(CheatPackLogicalCheat {
+                key: if keys.len() == 1 {
+                    keys.first().unwrap().clone()
+                } else {
+                    digest("cheat-pack-conflict-v1", &keys)
+                },
+                game_key: game_key.clone(),
+                observation_indices: indices,
+                relationships: relations,
+                distinct_source_contents: provenance.len(),
+                independent_source_groups: independent.len(),
+                known_mirrors: mirrors.len(),
+                known_copies: copy_paths
+                    .values()
+                    .map(|paths| paths.len().saturating_sub(1))
+                    .sum(),
+                usable: !conflict && contents.len() == 1 && all_admissible,
+                reconciliation: Some(reconciliation),
+            });
+        }
+    }
+    preview.logical_cheats.sort_by(|a, b| a.key.cmp(&b.key));
+    rebuild_totals(preview);
+}
+
+fn rebuild_totals(p: &mut CheatPackPreview) {
+    let mut games = BTreeMap::<String, CheatPackGame>::new();
+    let mut t = CheatPackTotals::default();
+    t.files_discovered = p.files.len();
+    for (i, f) in p.files.iter().enumerate() {
+        t.files_readable += usize::from(f.provenance.is_some());
+        match f.state {
+            CheatPackFileState::Accepted => t.files_accepted += 1,
+            CheatPackFileState::Malformed => t.files_malformed += 1,
+            _ => t.files_rejected += 1,
+        }
+        if f.state == CheatPackFileState::Unsupported {
+            t.unsupported_formats += 1;
+        }
+        if f.format.is_some()
+            && f.provenance.is_some()
+            && f.state != CheatPackFileState::Unsupported
+        {
+            games
+                .entry(f.game_key.clone())
+                .or_insert_with(|| CheatPackGame {
+                    key: f.game_key.clone(),
+                    file_indices: Vec::new(),
+                    logical_cheat_indices: Vec::new(),
+                    strength: f.match_strength,
+                })
+                .file_indices
+                .push(i);
+            if let Some(game) = games.get_mut(&f.game_key) {
+                game.strength = game.strength.max(f.match_strength);
+            }
+        }
+    }
+    for (i, g) in p.logical_cheats.iter().enumerate() {
+        if let Some(game) = games.get_mut(&g.game_key) {
+            game.logical_cheat_indices.push(i);
+        }
+        t.usable_cheats += usize::from(g.usable);
+        t.exact_duplicates += usize::from(
+            g.relationships
+                .contains(&CheatDuplicateKind::ExactDuplicate),
+        );
+        t.equivalent_duplicates += usize::from(
+            g.relationships
+                .contains(&CheatDuplicateKind::EquivalentDuplicate),
+        );
+        t.corroborating_sources += usize::from(
+            g.relationships
+                .contains(&CheatDuplicateKind::CorroboratingObservation),
+        );
+        t.conflicts += usize::from(g.relationships.iter().any(|r| {
+            matches!(
+                r,
+                CheatDuplicateKind::NameConflict
+                    | CheatDuplicateKind::CodeConflict
+                    | CheatDuplicateKind::SourceIndexConflict
+            )
+        }));
+    }
+    p.games = games.into_values().collect();
+    for g in &p.games {
+        match g.strength {
+            CheatPackMatchStrength::Exact => t.exact_matches += 1,
+            CheatPackMatchStrength::Strong => t.strong_matches += 1,
+            CheatPackMatchStrength::Possible => t.possible_matches += 1,
+            CheatPackMatchStrength::Ambiguous => t.ambiguous_matches += 1,
+            CheatPackMatchStrength::Unmatched => t.unmatched_games += 1,
+        }
+    }
+    for o in &p.observations {
+        match o.applicability {
+            CheatApplicabilityState::Malformed => t.malformed_cheats += 1,
+            _ if o
+                .assessment
+                .as_ref()
+                .is_some_and(|a| a.blockers.contains(&CheatApplicabilityIssue::MissingCode)) =>
+            {
+                t.malformed_cheats += 1
+            }
+            CheatApplicabilityState::WrongRegion => t.region_mismatches += 1,
+            CheatApplicabilityState::WrongRevision => t.revision_mismatches += 1,
+            CheatApplicabilityState::UnsupportedEmulator => t.unsupported_targets += 1,
+            _ => {}
+        }
+        match o.action {
+            CheatPackAction::WouldAdd => t.would_add += 1,
+            CheatPackAction::WouldCorroborate => t.would_corroborate += 1,
+            CheatPackAction::WouldRetainExisting => t.would_retain_existing += 1,
+            CheatPackAction::WouldRequireReview => t.would_review += 1,
+            CheatPackAction::WouldRejectMalformed | CheatPackAction::WouldRejectUnsupported => {
+                t.would_reject += 1
+            }
+            CheatPackAction::WouldRemainUnmatched => t.would_remain_unmatched += 1,
+            CheatPackAction::WouldRemainAmbiguous => t.would_remain_ambiguous += 1,
+        }
+    }
+    t.needs_review = t.would_review + t.would_remain_ambiguous;
+    t.games_represented = p.games.len();
+    t.observations = p.observations.len();
+    t.logical_cheats = p.logical_cheats.len();
+    p.totals = t;
+}
+
+/// One pack-wide retention budget, not a fresh budget per source file.
+fn bound_diagnostics(p: &mut CheatPackPreview) {
+    let mut remaining = p.limits.source.max_warnings;
+    if p.diagnostics.len() > remaining {
+        p.diagnostics.truncate(remaining);
+        p.complete = false;
+    }
+    remaining = remaining.saturating_sub(p.diagnostics.len());
+    for f in &mut p.files {
+        if f.diagnostics.len() > remaining {
+            f.diagnostics.truncate(remaining);
+            f.diagnostics_truncated = true;
+            p.complete = false;
+        }
+        remaining = remaining.saturating_sub(f.diagnostics.len());
+        for &i in &f.observation_indices {
+            let o = &mut p.observations[i];
+            if o.diagnostics.len() > remaining {
+                o.diagnostics.truncate(remaining);
+                o.diagnostics_truncated = true;
+                p.complete = false;
+            }
+            remaining = remaining.saturating_sub(o.diagnostics.len());
+        }
+    }
+}

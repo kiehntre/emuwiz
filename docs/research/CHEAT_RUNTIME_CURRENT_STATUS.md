@@ -1,0 +1,168 @@
+# Cheat runtime: current status (main `d112b7f3`, 2026-10-03)
+
+> Flycast update (2026-10-17): standalone routing is inventory-only. Blue
+> supports local native inspection and entry preview; Apply is disabled until
+> Flycast consumption, path ownership and complete native validation are proven.
+> No Flycast version/profile layout or in-game effectiveness is approved.
+> See [Blue integration and blockers](FLYCAST_BLUE_CHEATS_INTEGRATION.md).
+> Older `Supported`/persistent-install statements below are historical.
+
+Scope: what current main code proves about cheats at launch time. Derived only
+from code at this commit; nothing was executed and no emulator was launched.
+Companion to `docs/design/CHEAT_PER_LAUNCH_WORKSPACE_V1.md`,
+`docs/research/CHEAT_EMULATOR_CAPABILITY_MATRIX.md`,
+`docs/research/RETROARCH_APPENDCONFIG_PERSISTENCE_TEST.md` and
+`docs/cheats/SAFE_LAUNCH_COMPOSITION.md`.
+
+Levels: 0 research, 1 parse, 2 normalise, 3 validate, 4 stage/install,
+5 launch wiring, 6 runtime execution, 7 verified runtime effect.
+Levels 1-4 are not proof that a cheat works in game.
+
+## Planner, not executor
+
+`crates/archivefs-core/src/launch/cheat_launch_plan.rs` is a pure planner
+(`plan_cheat_launch`). Its own header says materialising, spawning, verifying
+and cleanup "belong to a later executor". The only composer is RetroArch's
+(`command_with_cheat_launch_plan` appends `--config <path>` to an existing
+`RetroArchCommand`); `cheat_launch_capability` marks every other adapter
+`PersistentInstallOnly`/not launch-scoped. Outside `launch/mod.rs` re-exports
+and tests, nothing calls `plan_cheat_launch` or `command_with_cheat_launch_plan`,
+and the derivative bytes are never written. Every `launch/*_execution.rs`
+checked states it never touches cheats.
+
+Highest level reached for any emulator in product-reachable code: **4**
+(persistent staging/install, plus a config-based loadability check in
+`cheat_loadability.rs`, which itself says EmuWiz has no runtime evidence that a
+cheat executed). RetroArch has a library-level level-5 composer that is not
+product-reachable. No emulator has level 6 or 7.
+
+## What stages/installs
+
+`cheat_apply_support` (`patch_manager/cheat_route.rs`) returns `Supported` for
+RetroArch, `pcsx2`, `dolphin`, `xenia`, `duckstation`, `ppsspp`, `mgba`,
+`mame`, `rpcs3`, `flycast`, `amiga_whdload` and `scummvm`. These publish files
+through the shared journalled transaction (`shared_preview` ->
+`shared_transaction`), with undo. That is persistent installation, not
+launch-scoped.
+
+## Adapters not reachable through that route
+
+`melonds`, `mednafen`, `fbneo`, `azahar` and `vice` fall through to
+`Unsupported`. Modules exist (`melonds_cheat.rs`, `mednafen_cheat.rs`,
+`fbneo_cheat.rs`, `three_ds_cheat.rs`, `vice_c64_cheat.rs`) but a route-table
+miss means the GUI cannot offer them. `three_ds_cheat.rs` and
+`vice_c64_cheat.rs` have no shared-transaction apply at all (parse/validate/
+projection only). `mame_cheat.rs` and `fbneo_cheat.rs` expose a
+`RuntimeEnableRequired` state: staging does not enable the cheat in the
+emulator. Classic Game Genie and Action Replay/GameShark decoders are
+decode/preview only; encrypted and CodeBreaker-style input is retained as
+opaque or rejected.
+
+## WHDLoad trainer options
+
+`whdload_trainer.rs` stages options and offers
+`project_whdload_trainer_launch_options`, but `launch/amiga_whdload_command.rs`
+contains no trainer/CUSTOM handling, so the options do not reach the FS-UAE
+`--x-whdload-args` command. Still true at this commit.
+
+## RetroArch: planner vs runtime
+
+The persistence test shows `--appendconfig` values leaked into the base config
+and `config_save_on_exit=false` suppressed one automatic rewrite (one core, no
+content, RetroArch 1.22.2 Flatpak); overrides and explicit saves were not
+covered. `cheat_launch_plan.rs` uses that as `PersistenceProof` and requires
+state fencing. It is a planned design, not an observed in-game cheat.
+
+## Next implementation boundary
+
+Per-launch executor: materialise the derivative in launch-owned scratch, spawn
+with the composed command, verify the state expectation, and clean up. Then
+route additional emulators beyond RetroArch, wire FS-UAE trainer arguments, and
+only then collect level 6-7 evidence.
+
+## Phase 1 update: RetroArch per-launch runtime handoff (feature branch, not on main)
+
+BEFORE: planner and staging only. No code materialised a plan, spawned with it,
+verified state or cleaned up.
+
+AFTER: `launch/cheat_runtime.rs` is a generic executor (plan -> owned temp
+workspace with lease marker -> fingerprint -> canonical spawn -> receipt ->
+ownership-gated cleanup, plus read-only stale scan and explicit stale cleanup).
+`launch/cheat_runtime_retroarch.rs` wires RetroArch through it:
+`preflight_and_launch_retroarch_with_cheats` runs the canonical preflight, the
+existing planner and the canonical `spawn_retroarch` with the prepared
+`--config`. The user's real config, saves, ROM and cheat files are only read and
+fingerprinted. The scratch config is seeded from the user's real settings
+(minus keys the launch owns) because `--config` replaces rather than layers.
+Unresolved save/state directories fail closed.
+
+Highest truthful level: 5-6 (launch wiring reachable at library level; process
+handed the prepared config). Level 7 is NOT reached: no test shows a cheat
+taking effect in a game, the receipt reports `RuntimeEffectUnknown`, and a
+successful result means only "RetroArch was launched with the prepared cheat
+configuration". Tests use a fake `retroarch` script. No GUI/CLI entry point is
+wired yet; the seam is the library function above. Other emulators are
+unchanged.
+
+## Reconciliation update: Flatpak resource visibility and real-RetroArch evidence
+
+The generic executor above is the one production materialiser. A separate
+branch's materialiser and launch wrapper were dropped as duplicates; what they
+proved is kept as tests.
+
+A Flatpak RetroArch has a private `/tmp`, so a `/tmp` workspace is invisible to
+it (`[Config] Config not found`). `launch/retroarch_launch_visibility.rs`
+classifies the executable that will really be spawned (native, `flatpak run
+<app>`, or unknown) and, for Flatpak, reads the installed app's metadata plus
+system/user, global/app overrides and its own `~/.var/app/<id>` directory.
+`preflight_and_launch_retroarch_with_cheats` now refuses, before anything is
+created or started, unless it can prove the spawned RetroArch reaches **all** of:
+the workspace (read/write, in the EmuWiz data-dir launch root, never `/tmp`),
+the game content (read), the `-L` core (read), and the save and save-state
+directories (read/write). The refusal names the first resource it cannot prove.
+Unknown sandboxes and unreadable permissions fail closed; a game in `/tmp` is
+refused even when the app has `host` access; nothing is ever copied or moved.
+A launch with no cheats selected never consults any of this.
+
+Evidence (real Flatpak RetroArch 1.22.2, Genesis Plus GX, synthetic ROM under
+`$HOME`, no `TMPDIR` override, `real_flatpak_retroarch_cheat_launch_end_to_end`):
+the log shows `[Cheats] Load game-specific cheatfile: "<workspace>/retroarch/
+cheats/Genesis Plus GX/game.cht"` then `[Cheats] Applying cheat changes`; the
+config was found, the content opened, save/state directories were accepted, the
+user's `retroarch.cfg` hash and the ROM were unchanged, and the workspace was
+removed. Highest proven level: **6** (RetroArch demonstrably loaded the
+generated cheat file). Level 7 (a visible in-game effect) is not shown.
+
+## The one future product entry point
+
+* Selection model: `RetroArchCheatSelection` (candidates, selections, core
+  library name, effective overrides).
+* Call: `preflight_and_launch_retroarch_with_cheats(request, filesystem,
+  environment, &selection, launch_id)`.
+* Retain: the returned `RetroArchCheatLaunch` (`Plain(process)` or
+  `WithCheats { session: Box<CheatRuntimeSession<LaunchedRetroArchProcess>>,
+  seeded_settings, activation }`). `WithCheats` means RetroArch was really
+  started; `activation` only ever says the cheats were prepared and activation
+  is not verified. A prepared launch that never reached a running RetroArch is
+  `Err(RetroArchCheatLaunchError::HandoffFailed { failure, receipt })`, where
+  `failure` is `PreparationFailed` (nothing was started) or `SpawnFailed`
+  (a start was attempted and failed); the receipt records how far it got.
+* Lifecycle: call `session.poll()` on the page's existing process poll; when
+  `session.is_finished()` the receipt holds the outcome, and `session.cleanup_now()`
+  removes the workspace (it also runs when the process is seen to exit). A crash
+  leaves a marked workspace that `scan_cheat_runtime_workspaces` finds and
+  `cleanup_stale_workspace` removes on request.
+
+## Known gaps and scanning
+
+* A true `ProfileKind::Flatpak` profile is still refused by
+  `preflight_retroarch_launch`: the command planner deliberately plans no
+  executable for it (`flatpak run ...` would be an invented launcher command)
+  and exposing the content to the sandbox would need its own design. What works
+  is a native-classified wrapper that execs `flatpak run <app>`. This is a
+  separate blocker; it is not addressed here.
+* A crash can leave a marked workspace in either root. Scan each of
+  `CheatRuntimeRoots::all_known()` (the temporary root and the EmuWiz data root
+  used for Flatpak) with `scan_cheat_runtime_workspaces`.
+* Highest proven level is 6; the "5-6" wording in the Phase 1 section above is
+  the earlier, fake-emulator-only assessment. No GUI/CLI caller exists yet.

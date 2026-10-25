@@ -28,8 +28,13 @@ use archivefs_core::identity_source::net_policy::{StaticResolver, validate_endpo
 use archivefs_core::identity_source::path_map::{
     PathMapping, PathMappings, PathTranslation, ProviderPathKind, normalise_prefix,
 };
+use archivefs_core::identity_source::romm::media_mapping::{
+    RommMediaMapping, validate_romm_media_mapping,
+};
 use archivefs_core::identity_source::settings::{
-    MAX_CONFIGURED_PAGE_SIZE, MIN_CONFIGURED_PAGE_SIZE, ProviderSettings, SUGGESTED_TOKEN_PATH,
+    MAX_CONFIGURED_IMPORT_TIMEOUT_SECONDS, MAX_CONFIGURED_PAGE_SIZE,
+    MIN_CONFIGURED_IMPORT_TIMEOUT_SECONDS, MIN_CONFIGURED_PAGE_SIZE, ProviderSettings,
+    SUGGESTED_TOKEN_PATH,
 };
 use eframe::egui;
 
@@ -90,12 +95,19 @@ impl FieldState {
 /// values are derived from it by validation.
 #[derive(Clone, Debug, Default)]
 pub(crate) struct RommConfigDraft {
+    pub(crate) enabled: Option<bool>,
+    original_settings: Option<ProviderSettings>,
     pub(crate) url: String,
     pub(crate) token_path: String,
     pub(crate) path_kind: ProviderPathKind,
     pub(crate) page_size: String,
+    /// How long a full catalogue import may run before it is abandoned, in
+    /// seconds, as typed.
+    pub(crate) import_timeout_seconds: String,
     /// The working copy of the mappings. Not written until the draft is saved.
     pub(crate) mappings: Vec<PathMapping>,
+    pub(crate) media_provider_prefix: String,
+    pub(crate) media_local_root: String,
     pub(crate) new_prefix: String,
     pub(crate) new_destination: String,
     /// A prefix whose replacement is awaiting confirmation.
@@ -114,8 +126,15 @@ pub(crate) struct RommConfigDraft {
 impl RommConfigDraft {
     /// Opens the dialog on the configuration that is actually stored.
     pub(crate) fn from_snapshot(snapshot: &RommSnapshot) -> Self {
-        let source = &snapshot.settings.source;
+        Self::from_settings(&snapshot.settings)
+    }
+
+    /// Open the same editor without loading a cached catalogue just to read settings.
+    pub(crate) fn from_settings(settings: &ProviderSettings) -> Self {
+        let source = &settings.source;
         Self {
+            enabled: Some(source.enabled),
+            original_settings: Some(settings.clone()),
             url: source.url.clone(),
             // The path, never the contents.
             token_path: source
@@ -124,8 +143,19 @@ impl RommConfigDraft {
                 .map(|path| path.display().to_string())
                 .unwrap_or_default(),
             path_kind: source.provider_path_kind,
-            page_size: snapshot.settings.effective_page_size().to_string(),
+            page_size: settings.effective_page_size().to_string(),
+            import_timeout_seconds: settings.effective_import_timeout().as_secs().to_string(),
             mappings: source.mappings.clone(),
+            media_provider_prefix: source
+                .media_mapping
+                .as_ref()
+                .map(|mapping| mapping.provider_prefix.clone())
+                .unwrap_or_default(),
+            media_local_root: source
+                .media_mapping
+                .as_ref()
+                .map(|mapping| mapping.local_root.display().to_string())
+                .unwrap_or_default(),
             preview_limit: DEFAULT_PREVIEW_LIMIT.to_string(),
             ..Self::default()
         }
@@ -135,6 +165,9 @@ impl RommConfigDraft {
     pub(crate) fn blank() -> Self {
         Self {
             page_size: "100".to_string(),
+            import_timeout_seconds:
+                archivefs_core::identity_source::settings::DEFAULT_IMPORT_TIMEOUT_SECONDS
+                    .to_string(),
             preview_limit: DEFAULT_PREVIEW_LIMIT.to_string(),
             ..Self::default()
         }
@@ -142,7 +175,11 @@ impl RommConfigDraft {
 
     /// The settings this draft would save, when it is valid.
     pub(crate) fn to_settings(&self, previous: Option<&ProviderSettings>) -> ProviderSettings {
+        let previous = previous.or(self.original_settings.as_ref());
         let mut settings = previous.cloned().unwrap_or_default();
+        if let Some(enabled) = self.enabled {
+            settings.source.enabled = enabled;
+        }
         settings.source.url = self.url.trim().to_string();
         settings.source.token_path = {
             let trimmed = self.token_path.trim();
@@ -150,6 +187,16 @@ impl RommConfigDraft {
         };
         settings.source.provider_path_kind = self.path_kind;
         settings.source.mappings = self.mappings.clone();
+        let provider_prefix = self.media_provider_prefix.trim();
+        let local_root = self.media_local_root.trim();
+        settings.source.media_mapping = if provider_prefix.is_empty() && local_root.is_empty() {
+            None
+        } else {
+            Some(RommMediaMapping {
+                provider_prefix: provider_prefix.to_string(),
+                local_root: PathBuf::from(local_root),
+            })
+        };
         // The field is prefilled with the *effective* size, so a page size that was
         // never set explicitly would otherwise be written out as though it had been.
         // Leaving it unset when it still matches keeps a no-change save a no-change
@@ -163,6 +210,17 @@ impl RommConfigDraft {
         } else {
             typed
         };
+        // Same "no-op when unchanged" rule as page size above.
+        let typed_timeout = self.import_timeout_seconds.trim().parse::<u32>().ok();
+        let timeout_previously_unset =
+            previous.is_some_and(|previous| previous.import_timeout_seconds.is_none());
+        let timeout_still_the_default = typed_timeout
+            == previous.map(|previous| previous.effective_import_timeout().as_secs() as u32);
+        settings.import_timeout_seconds = if timeout_previously_unset && timeout_still_the_default {
+            None
+        } else {
+            typed_timeout
+        };
         settings
     }
 }
@@ -173,6 +231,8 @@ pub(crate) struct RommConfigValidation {
     pub(crate) url: FieldState,
     pub(crate) token: FieldState,
     pub(crate) page_size: FieldState,
+    pub(crate) import_timeout_seconds: FieldState,
+    pub(crate) media_mapping: FieldState,
     /// Mappings that the chosen path kind would strand. A non-empty list refuses
     /// the save: mappings that can never match are worse than none.
     pub(crate) stranded_mappings: Vec<String>,
@@ -197,6 +257,8 @@ pub(crate) fn validate_draft(
         ))
     });
     let page_size = validate_page_size(&draft.page_size);
+    let import_timeout_seconds = validate_import_timeout(&draft.import_timeout_seconds);
+    let media_mapping = validate_media_mapping_draft(draft);
     // A mapping written for the other shape can never match anything, so the save
     // is refused and the offending prefixes are named.
     let stranded_mappings: Vec<String> = draft
@@ -217,6 +279,8 @@ pub(crate) fn validate_draft(
     let can_save = !url.is_problem()
         && !token.is_problem()
         && !page_size.is_problem()
+        && !import_timeout_seconds.is_problem()
+        && !media_mapping.is_problem()
         && stranded_mappings.is_empty()
         && mapping_set_problem.is_none();
     RommConfigValidation {
@@ -230,8 +294,33 @@ pub(crate) fn validate_draft(
         } else {
             page_size
         },
+        import_timeout_seconds,
+        media_mapping,
         stranded_mappings,
         can_save,
+    }
+}
+
+fn validate_media_mapping_draft(draft: &RommConfigDraft) -> FieldState {
+    let provider_prefix = draft.media_provider_prefix.trim();
+    let local_root = draft.media_local_root.trim();
+    if provider_prefix.is_empty() && local_root.is_empty() {
+        return FieldState::Good(
+            "Not configured (optional). Remote/cache media remains unchanged.".into(),
+        );
+    }
+    if provider_prefix.is_empty() || local_root.is_empty() {
+        return FieldState::Problem("Enter both the RomM media prefix and the host-visible local root, or clear both to disable local reuse.".into());
+    }
+    match validate_romm_media_mapping(&RommMediaMapping {
+        provider_prefix: provider_prefix.to_string(),
+        local_root: PathBuf::from(local_root),
+    }) {
+        Ok(mapping) => FieldState::Good(format!(
+            "Mapping is readable. Canonical root: {}",
+            mapping.local_root().display()
+        )),
+        Err(error) => FieldState::Problem(error.to_string()),
     }
 }
 
@@ -245,7 +334,9 @@ pub(crate) fn validate_url_text(text: &str) -> FieldState {
     let trimmed = text.trim();
     if trimmed.is_empty() {
         return FieldState::Empty(
-            "Enter the address of your RomM instance, for example http://172.19.0.20:8080."
+            "Enter the address of your RomM instance, for example http://romm.example.lan:8080 \
+             - a stable hostname holds up better than a container IP, which can change on \
+             restart."
                 .to_string(),
         );
     }
@@ -285,6 +376,44 @@ pub(crate) fn validate_page_size(text: &str) -> FieldState {
              ceiling."
         )),
         Err(_) => FieldState::Problem(format!("{trimmed:?} is not a whole number.")),
+    }
+}
+
+pub(crate) fn validate_import_timeout(text: &str) -> FieldState {
+    let trimmed = text.trim();
+    let minutes_range = || {
+        format!(
+            "{} to {} minutes",
+            MIN_CONFIGURED_IMPORT_TIMEOUT_SECONDS / 60,
+            MAX_CONFIGURED_IMPORT_TIMEOUT_SECONDS / 60
+        )
+    };
+    if trimmed.is_empty() {
+        return FieldState::Empty(format!(
+            "Leave blank for the default of 30 minutes. Large libraries or a slower RomM \
+             server may need more time; the allowed range is {}.",
+            minutes_range()
+        ));
+    }
+    match trimmed.parse::<u32>() {
+        Ok(value)
+            if (MIN_CONFIGURED_IMPORT_TIMEOUT_SECONDS..=MAX_CONFIGURED_IMPORT_TIMEOUT_SECONDS)
+                .contains(&value) =>
+        {
+            FieldState::Good(format!(
+                "Up to {:.0} minutes before a full catalogue import is abandoned. Your \
+                 existing game information is never affected by a timeout - only a \
+                 completed import ever replaces it.",
+                value as f64 / 60.0
+            ))
+        }
+        Ok(value) => FieldState::Problem(format!(
+            "{value} seconds is outside the allowed range of {}. There is no \"unlimited\" \
+             setting: an import that cannot finish in that time should say so rather than run \
+             indefinitely.",
+            minutes_range()
+        )),
+        Err(_) => FieldState::Problem(format!("{trimmed:?} is not a whole number of seconds.")),
     }
 }
 
@@ -444,6 +573,7 @@ pub(crate) fn add_mapping(
     let candidate = PathMapping {
         provider_prefix: prefix.clone(),
         archivefs_prefix: PathBuf::from(&destination),
+        provider_aliases: Vec::new(),
     };
     // The prefix must be the shape this source is configured for, and free of
     // traversal, dot components, doubled separators, drive letters and UNC forms.
@@ -721,7 +851,7 @@ pub(crate) fn show_config_dialog(
         preview,
         // The body no longer builds a `Save`; the footer owns that, and with
         // it the previous settings a save is derived from.
-        previous: _,
+        previous,
         busy,
         preview_running,
     } = *inputs;
@@ -732,13 +862,28 @@ pub(crate) fn show_config_dialog(
         Some("Nothing here contacts RomM. Saving writes EmuWiz's own configuration only."),
     );
     widgets::card(ui, |ui| {
+        let mut enabled = draft
+            .enabled
+            .unwrap_or_else(|| previous.is_some_and(|s| s.source.enabled));
+        if ui
+            .checkbox(&mut enabled, "Enable this RomM connection")
+            .changed()
+        {
+            draft.enabled = Some(enabled);
+            draft.dirty = true;
+        }
         // --- URL -----------------------------------------------------------
         ui.label("RomM address");
+        ui.label(
+            "Enter the server address, including http:// or https:// and its port if needed. \
+             Prefer a stable hostname this machine can reach over a container address that \
+             may change on restart.",
+        );
         if ui
             .add(
                 egui::TextEdit::singleline(&mut draft.url)
                     .desired_width(420.0)
-                    .hint_text("http://172.19.0.20:8080"),
+                    .hint_text("http://romm.example.lan:8080"),
             )
             .changed()
         {
@@ -818,6 +963,40 @@ pub(crate) fn show_config_dialog(
             );
         }
 
+        // --- Optional local media mapping --------------------------------
+        ui.add_space(theme::SECTION_GAP / 2.0);
+        ui.label("Local RomM media (optional)");
+        ui.label(
+            "Map RomM's served media references to an existing host-visible resources folder. \
+             EmuWiz never guesses Docker mounts, copies media, or changes game files. Clear \
+             both fields to disable local reuse.",
+        );
+        if ui
+            .add(
+                egui::TextEdit::singleline(&mut draft.media_provider_prefix)
+                    .desired_width(420.0)
+                    .hint_text("/assets/romm/resources"),
+            )
+            .on_hover_text("The provider namespace prefix exactly as RomM reports it.")
+            .changed()
+        {
+            draft.dirty = true;
+        }
+        ui.label("RomM media prefix");
+        if ui
+            .add(
+                egui::TextEdit::singleline(&mut draft.media_local_root)
+                    .desired_width(420.0)
+                    .hint_text("/path/to/romm/resources"),
+            )
+            .on_hover_text("An existing directory visible to this EmuWiz process.")
+            .changed()
+        {
+            draft.dirty = true;
+        }
+        ui.label("Host-visible local media root");
+        field_note(ui, &validation.media_mapping);
+
         // --- Page size -----------------------------------------------------
         ui.add_space(theme::SECTION_GAP / 2.0);
         ui.label("Records per request");
@@ -832,6 +1011,32 @@ pub(crate) fn show_config_dialog(
             draft.dirty = true;
         }
         field_note(ui, &validation.page_size);
+
+        // --- Full catalogue import time limit -------------------------------
+        ui.add_space(theme::SECTION_GAP / 2.0);
+        ui.label("Full catalogue import time limit");
+        ui.label(
+            "How long \"Refresh\"/\"Import full catalogue\" may run before it gives up. Your \
+             existing game information is left exactly as it was if it does - only a completed \
+             import ever replaces it.",
+        );
+        ui.horizontal(|ui| {
+            if ui
+                .add(
+                    egui::TextEdit::singleline(&mut draft.import_timeout_seconds)
+                        .desired_width(120.0)
+                        .hint_text(
+                            archivefs_core::identity_source::settings::DEFAULT_IMPORT_TIMEOUT_SECONDS
+                                .to_string(),
+                        ),
+                )
+                .changed()
+            {
+                draft.dirty = true;
+            }
+            ui.label("seconds");
+        });
+        field_note(ui, &validation.import_timeout_seconds);
 
         // --- Mappings ------------------------------------------------------
         ui.add_space(theme::SECTION_GAP);
@@ -935,7 +1140,7 @@ pub(crate) fn show_config_dialog_footer(
                 request = Some(ConfigDialogRequest::Close);
             }
         }
-        ui.label("Saving writes EmuWiz's configuration. It contacts nothing.");
+        ui.label("Local settings · contacts nothing.");
     });
     request
 }

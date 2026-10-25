@@ -1,0 +1,39 @@
+//! Cheats & Mods GUI ownership, extracted out of `main.rs`.
+//!
+//! - `state`: `CheatWorkflowState` and every Cheats/Mods-specific
+//!   supporting struct/enum (candidate selection, provider request keys,
+//!   generated-install records, preview/transaction state, ...).
+//! - `actions`: the typed action boundary the Cheats & Mods page emits
+//!   (`CheatWorkflowAction`, `CheatArchivePickerAction`).
+//! - `controller`: the `ArchiveFsApp` methods that own the Cheats/Mods
+//!   workflow - discovery, fetch/import, worker start/poll, Cloudflare and
+//!   offline-import handling, reconciliation, preview, apply, rollback.
+//! - `render`: the Cheats/Mods rendering + presentation helper functions
+//!   used by `cheats_mods_preview.rs` and the per-emulator workflow pages.
+//!
+//! `main.rs` still owns the `cheat_workflow: Option<CheatWorkflowState>`
+//! field on `ArchiveFsApp` and routes into these methods; it no longer
+//! owns the Cheats/Mods types or the bulk of the Cheats/Mods logic.
+
+mod actions;
+pub(crate) mod adf_trainer;
+mod controller;
+mod duckstation;
+pub(crate) mod duckstation_environment;
+pub(crate) mod flycast;
+pub(crate) mod melonds;
+pub(crate) mod mgba;
+pub(crate) mod ppsspp;
+mod render;
+mod routing;
+pub(crate) mod rpcs3;
+pub(crate) mod scummvm_trainer;
+mod state;
+pub(crate) mod whdload_trainer_flow;
+
+pub(crate) use actions::*;
+pub(crate) use controller::*;
+pub(crate) use duckstation::*;
+pub(crate) use render::*;
+pub(crate) use routing::*;
+pub(crate) use state::*;

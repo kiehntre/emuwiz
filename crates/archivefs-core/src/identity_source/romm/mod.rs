@@ -20,11 +20,21 @@
 //! What that instance actually exposes is recorded in [`capability`], along with
 //! how the adapter behaves when a field or endpoint is missing.
 
+pub mod browser;
 pub mod capability;
 pub mod client;
 pub mod config;
+pub mod connectivity;
+pub mod duplicate_provider_report;
+pub mod enrichment;
 pub mod import;
+pub mod linkage;
+pub mod local_discovery;
+pub mod manual;
+pub mod mapping_plan;
+pub mod media_mapping;
 pub mod normalise;
+pub mod stale_report;
 
 #[cfg(test)]
 mod tests;

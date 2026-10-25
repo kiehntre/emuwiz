@@ -1,9 +1,11 @@
 //! Read-only writability assessment for discovered emulator profiles.
 //!
 //! Doctor already knows which profiles exist: `discover_dolphin_profiles`,
-//! `discover_pcsx2_profiles` and `discover_xenia_profiles` do that, and each
-//! already reports its own blockers. This module answers the one question none
-//! of them answers: **could EmuWiz write an install into that profile?**
+//! `discover_pcsx2_profiles`, `discover_xenia_profiles`,
+//! `discover_ppsspp_profiles` and `discover_duckstation_profiles` do that,
+//! and each already reports its own blockers. This module answers the one
+//! question none of them answers: **could EmuWiz write an install into that
+//! profile?**
 //!
 //! It answers it from metadata only. Nothing here creates a directory, a
 //! `GameSettings` file, a `.pnach`, a `.patch.toml`, a config file or a probe
@@ -13,12 +15,19 @@
 //!
 //! ## Scope
 //!
-//! Only the three adapters EmuWiz already supports, through their existing
+//! Only the adapters EmuWiz already supports, through their existing
 //! discovery abstractions. No emulator gains support here. Flatpak profiles
 //! are assessed exactly like native ones, which is honest but incomplete: a
 //! portal can still refuse a write that the bits allow, so the narrowed
 //! deferred entry in `DEFERRED_CHECKS` says so.
+//!
+//! PPSSPP and DuckStation are assessed the same read-only way as every other
+//! adapter here, but - like Xenia - never become
+//! [`managed_scan_targets`]: neither has an in-file EmuWiz ownership marker
+//! (a managed block/section) to scan for, since neither has install/cheat-
+//! write support yet.
 
+use std::env;
 use std::fs;
 use std::path::{Path, PathBuf};
 
@@ -33,12 +42,519 @@ use super::{
     DoctorCategory, DoctorSeverity, DoctorSubsystem, Finding, Measurement, NotCheckedCheck,
 };
 use crate::emulator_environment::EncodedPath;
+use crate::launch::readiness::{FirmwareReadiness, rpcs3_firmware_readiness};
 use crate::patch_manager::{
-    DolphinProfileDiscovery, DolphinProfileDiscoveryRoots, EmulatorProfileSelection,
-    Pcsx2ProfileDiscovery, Pcsx2ProfileDiscoveryRoots, XeniaProfileDiscovery,
-    XeniaProfileDiscoveryRoots, discover_dolphin_profiles, discover_pcsx2_profiles,
-    discover_xenia_profiles, select_dolphin_profile,
+    AzaharDiscoveryRoots, AzaharEvidenceState, CemuKeysState, CemuMlcState,
+    CemuProfileDiscoveryRoots, DolphinProfileDiscovery, DolphinProfileDiscoveryRoots,
+    DuckStationProfileDiscovery, DuckStationProfileDiscoveryRoots, EmulatorProfileSelection,
+    Pcsx2ProfileDiscovery, Pcsx2ProfileDiscoveryRoots, PpssppInstallationType, PpssppLaunchBlocker,
+    PpssppLaunchBlockerKind, PpssppProfileDiscovery, PpssppProfileDiscoveryRoots, Rpcs3GameRequest,
+    Rpcs3InstallationType, Rpcs3LaunchBlocker, Rpcs3LaunchBlockerKind, Rpcs3ProfileDiscovery,
+    Rpcs3ProfileDiscoveryRoots, XemuGameRequest, XemuInstallationType, XemuLaunchBlocker,
+    XemuLaunchBlockerKind, XemuProfileDiscovery, XemuProfileDiscoveryRoots, XemuSystemFileState,
+    XeniaLaunchBlocker, XeniaLaunchBlockerKind, XeniaProfileDiscovery, XeniaProfileDiscoveryRoots,
+    discover_azahar_executable, discover_azahar_profile, discover_cemu_profiles,
+    discover_dolphin_profiles, discover_duckstation_profiles, discover_pcsx2_profiles,
+    discover_ppsspp_profiles, discover_rpcs3_profiles, discover_xemu_profiles,
+    discover_xenia_profiles, inspect_rpcs3_game, inspect_xemu_game,
+    resolve_ppsspp_native_launch_binding, resolve_rpcs3_native_launch_binding,
+    resolve_xemu_native_launch_binding, resolve_xenia_launch_binding, select_dolphin_profile,
 };
+
+/// The one [`LinuxEmulatorInstallationEvidence::installation_form`] value
+/// whose executable path carries strong enough provenance to feed into a
+/// standalone adapter's `explicit_executables`: an EmuWiz-managed AppImage
+/// under `<data_dir>/emulators/<id>/` with an `install.json` marker, whose
+/// binary [`crate::emulator_download::managed_appimage_install`] already
+/// proved is a regular, non-symlink, executable file. Every other form
+/// (plain `"AppImage"` at a fixed `~/Applications` path, Flatpak, PATH,
+/// config-only evidence) is intentionally *not* a launch-trust source.
+pub const MANAGED_APPIMAGE_INSTALLATION_FORM: &str = "EmuWiz-managed AppImage";
+
+/// Read-only evidence about an emulator installation form. This is separate
+/// from launch readiness: finding a Flatpak or AppImage is useful to the user
+/// but does not authorize EmuWiz to spawn it.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct LinuxEmulatorInstallationEvidence {
+    pub emulator: String,
+    pub installation_form: String,
+    pub executable: Option<EncodedPath>,
+    pub profile: Option<EncodedPath>,
+    pub detail: String,
+}
+
+/// Adapter-specific, read-only Doctor evidence for Azahar and Cemu.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct AzaharCemuReadiness {
+    pub adapter: String,
+    pub executable: Option<EncodedPath>,
+    pub version: Option<String>,
+    pub profile: Option<EncodedPath>,
+    pub ready: bool,
+    pub blockers: Vec<String>,
+    pub evidence: Vec<String>,
+    pub remediation: String,
+}
+
+pub fn discover_azahar_cemu_readiness() -> Vec<AzaharCemuReadiness> {
+    let Some(home) = env::var_os("HOME").map(PathBuf::from) else {
+        return Vec::new();
+    };
+    let mut result = Vec::new();
+    let azahar_roots = AzaharDiscoveryRoots {
+        explicit_executable: None,
+        path: env::var_os("PATH"),
+        config_root: Some(home.join(".config/azahar")),
+    };
+    if let Some(executable) = discover_azahar_executable(&azahar_roots) {
+        let profile = discover_azahar_profile(&azahar_roots, executable);
+        let blocked = matches!(
+            profile.config_state,
+            AzaharEvidenceState::Unreadable | AzaharEvidenceState::Oversized
+        );
+        let state = match profile.config_state {
+            AzaharEvidenceState::Present => "configuration readable",
+            AzaharEvidenceState::Absent => "configuration not created yet",
+            AzaharEvidenceState::Unreadable => "configuration unreadable",
+            AzaharEvidenceState::Oversized => "configuration is too large",
+            AzaharEvidenceState::Unknown => "configuration state unknown",
+        };
+        result.push(AzaharCemuReadiness {
+            adapter: "Azahar".into(),
+            executable: Some(EncodedPath::from_path(&profile.executable)),
+            version: None,
+            profile: profile.config.as_deref().map(EncodedPath::from_path),
+            ready: !blocked,
+            blockers: if blocked {
+                vec![format!("Azahar {state}")]
+            } else {
+                Vec::new()
+            },
+            evidence: vec![
+                format!("Configuration: {state}"),
+                "Selected-title system-data and content checks remain adapter preflight checks."
+                    .into(),
+            ],
+            remediation: if blocked {
+                "Repair or recreate Azahar's configuration, then run Doctor again.".into()
+            } else {
+                "Azahar's selected 3DSX title must still pass launch preflight.".into()
+            },
+        });
+    } else {
+        result.push(AzaharCemuReadiness {
+            adapter: "Azahar".into(),
+            executable: None,
+            version: None,
+            profile: None,
+            ready: false,
+            blockers: vec!["Azahar executable was not found".into()],
+            evidence: Vec::new(),
+            remediation: "Install Azahar or select an executable in Emulator Setup.".into(),
+        });
+    }
+    if let Ok(roots) = CemuProfileDiscoveryRoots::from_environment() {
+        let discovery = discover_cemu_profiles(&roots);
+        if discovery.profiles.is_empty() {
+            result.push(AzaharCemuReadiness {
+                adapter: "Cemu".into(),
+                executable: None,
+                version: None,
+                profile: None,
+                ready: false,
+                blockers: vec!["Cemu executable/profile was not found".into()],
+                evidence: Vec::new(),
+                remediation: "Install Cemu or select its profile in Emulator Setup.".into(),
+            });
+        }
+        for profile in discovery.profiles {
+            let executable = profile.executable_candidates.first();
+            let mlc = profile.config.as_ref().map(|config| config.mlc.state);
+            let mut blockers = profile.blocker.clone().into_iter().collect::<Vec<_>>();
+            if !matches!(mlc, Some(CemuMlcState::Present)) {
+                blockers.push(format!("Cemu MLC is {}", cemu_mlc_label(mlc)));
+            }
+            let keys = match profile.keys.state {
+                CemuKeysState::PresentUnverified => "present (contents unverified)",
+                CemuKeysState::NotConfigured => "not configured; some titles may require it",
+                CemuKeysState::Unreadable => "unreadable",
+            };
+            result.push(AzaharCemuReadiness {
+                adapter: "Cemu".into(), executable: executable.map(|item| EncodedPath::from_path(&item.path)),
+                version: executable.and_then(|item| item.version.clone()),
+                profile: Some(EncodedPath::from_path(&profile.configuration_path)),
+                ready: profile.eligible && blockers.is_empty(), blockers,
+                evidence: vec![format!("Keys: {keys}"), format!("MLC: {}", cemu_mlc_label(mlc))],
+                remediation: "Fix the reported Cemu profile/MLC state; keys are required only when selected-title preflight says so.".into(),
+            });
+        }
+    }
+    result
+}
+
+fn cemu_mlc_label(state: Option<CemuMlcState>) -> &'static str {
+    match state {
+        Some(CemuMlcState::Present) => "present",
+        Some(CemuMlcState::Missing) => "missing",
+        Some(CemuMlcState::NotConfigured) => "not configured",
+        Some(CemuMlcState::NotADirectory) => "not a directory",
+        None => "not inspected",
+    }
+}
+
+pub fn findings_from_azahar_cemu_readiness(entries: &[AzaharCemuReadiness]) -> Vec<Finding> {
+    entries.iter().map(|entry| {
+        let (severity, title, explanation) = if entry.ready {
+            (DoctorSeverity::Info, format!("{} profile inspected", entry.adapter), format!("{} has a usable discovered profile; selected-game launch readiness is checked by adapter preflight.", entry.adapter))
+        } else {
+            (DoctorSeverity::Warning, format!("{} needs setup", entry.adapter), entry.blockers.first().cloned().unwrap_or_else(|| "readiness is not established".into()))
+        };
+        let mut finding = Finding::new(format!("emulator_profile.{}_readiness", entry.adapter.to_ascii_lowercase()), DoctorCategory::EmulatorProfiles, DoctorSubsystem::EmulatorReadiness, severity, title, explanation)
+            .with_evidence(entry.evidence.clone())
+            .with_guidance("EmuWiz only reports inspected evidence and does not change emulator files.", entry.remediation.clone());
+        if let Some(executable) = &entry.executable { finding = finding.with_evidence([format!("Executable: {}", executable.display)]); }
+        if let Some(version) = &entry.version { finding = finding.with_evidence([format!("Version: {version}")]); }
+        if let Some(profile) = &entry.profile { finding = finding.with_evidence([format!("Profile/config: {}", profile.display)]); }
+        finding
+    }).collect()
+}
+
+fn safe_executable(path: &Path) -> bool {
+    let Ok(metadata) = fs::symlink_metadata(path) else {
+        return false;
+    };
+    if !metadata.is_file() || metadata.file_type().is_symlink() {
+        return false;
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        metadata.permissions().mode() & 0o111 != 0
+    }
+    #[cfg(not(unix))]
+    {
+        true
+    }
+}
+
+fn first_executable(home: &Path, names: &[&str]) -> Option<PathBuf> {
+    let mut candidates = Vec::new();
+    if let Some(path) = env::var_os("PATH") {
+        candidates.extend(
+            env::split_paths(&path)
+                .take(128)
+                .flat_map(|directory| names.iter().map(move |name| directory.join(name))),
+        );
+    }
+    for directory in [
+        home.join("Applications"),
+        home.join(".local/bin"),
+        home.join(".local/share/applications"),
+        home.join("AppImages"),
+        home.join("bin"),
+    ] {
+        candidates.extend(names.iter().map(|name| directory.join(name)));
+        candidates.extend(names.iter().map(|name| directory.join(name).join(name)));
+    }
+    candidates.into_iter().find(|path| safe_executable(path))
+}
+
+/// Bounded, read-only discovery of EmuWiz-managed AppImage installs under
+/// `<data_dir>/emulators/<id>/<binary>` - the location the emulator
+/// download flow writes to, which the PATH / `~/Applications` / Flatpak
+/// checks above do not cover.
+///
+/// One fixed set of `symlink_metadata` calls per automated-lane catalogue
+/// entry (see [`crate::emulator_download::managed_appimage_install`]); no
+/// recursion, no shell. A managed install here is reported as installation
+/// *evidence* only - launch readiness is still decided elsewhere.
+/// Just the `install.json`-backed EmuWiz-managed AppImage evidence under
+/// `<data_dir>/emulators/<id>/` for `$HOME`, without the (much larger)
+/// `PATH` / `~/Applications` / Flatpak sweep that
+/// [`discover_linux_emulator_installations`] also performs. A fixed handful
+/// of `symlink_metadata` calls per automated-lane catalogue entry - cheap
+/// enough to call from a per-frame launch-readiness projection, unlike the
+/// full sweep. Returns an empty vec when `$HOME` is unset.
+pub fn discover_managed_appimage_installations() -> Vec<LinuxEmulatorInstallationEvidence> {
+    match env::var_os("HOME").map(PathBuf::from) {
+        Some(home) => discover_managed_emulator_installations(&home),
+        None => Vec::new(),
+    }
+}
+
+fn discover_managed_emulator_installations(home: &Path) -> Vec<LinuxEmulatorInstallationEvidence> {
+    let data_dir = crate::app_dirs::data_dir_in(home);
+    let mut evidence = Vec::new();
+    for spec in crate::emulator_download::EMULATOR_DOWNLOAD_CATALOGUE {
+        if let Some(binary) = crate::emulator_download::managed_appimage_install(&data_dir, spec) {
+            evidence.push(LinuxEmulatorInstallationEvidence {
+                emulator: spec.display_name.to_string(),
+                installation_form: MANAGED_APPIMAGE_INSTALLATION_FORM.to_string(),
+                executable: Some(EncodedPath::from_path(&binary)),
+                profile: None,
+                detail: format!(
+                    "EmuWiz-managed AppImage found at {} (install.json provenance present)",
+                    binary.display()
+                ),
+            });
+        }
+    }
+    evidence
+}
+
+fn discover_shadps4_installations(home: &Path) -> Vec<LinuxEmulatorInstallationEvidence> {
+    let mut evidence = Vec::new();
+    // shadPS4 is commonly installed with a stable native binary beside a
+    // Qt launcher. Keep these paths explicit and bounded: the launcher’s
+    // version directory is user-managed and is not recursively searched.
+    for (installation_form, path, detail) in [
+        (
+            "Native",
+            home.join("Applications/shadPS4/shadps4"),
+            "shadPS4 native executable found",
+        ),
+        (
+            "Qt launcher",
+            home.join("Applications/shadPS4/QtLauncher/shadPS4QtLauncher-qt.AppImage"),
+            "shadPS4 Qt launcher found; selected emulator version remains launcher-managed",
+        ),
+    ] {
+        if safe_executable(&path) {
+            evidence.push(LinuxEmulatorInstallationEvidence {
+                emulator: "shadPS4".to_string(),
+                installation_form: installation_form.to_string(),
+                executable: Some(EncodedPath::from_path(&path)),
+                profile: None,
+                detail: detail.to_string(),
+            });
+        }
+    }
+    evidence
+}
+
+fn flatpak_metadata(home: &Path, app_id: &str) -> Option<&'static str> {
+    let user = home.join(".local/share/flatpak/app").join(app_id);
+    if fs::symlink_metadata(&user)
+        .map(|metadata| metadata.is_dir() && !metadata.file_type().is_symlink())
+        .unwrap_or(false)
+    {
+        return Some("Flatpak (user installation)");
+    }
+    let system = Path::new("/var/lib/flatpak/app").join(app_id);
+    if fs::symlink_metadata(&system)
+        .map(|metadata| metadata.is_dir() && !metadata.file_type().is_symlink())
+        .unwrap_or(false)
+    {
+        return Some("Flatpak (system installation)");
+    }
+    None
+}
+
+/// Gathers bounded, read-only installation evidence for the Emulator Setup
+/// page. It checks exact PATH names, five fixed user directories, and the
+/// standard Flatpak deployment roots; it never recursively walks HOME or
+/// executes an emulator.
+pub fn discover_linux_emulator_installations() -> Vec<LinuxEmulatorInstallationEvidence> {
+    let Some(home) = env::var_os("HOME").map(PathBuf::from) else {
+        return Vec::new();
+    };
+    let definitions = [
+        (
+            "Dolphin",
+            &["dolphin-emu", "Dolphin"][..],
+            "org.DolphinEmu.dolphin-emu",
+        ),
+        (
+            "PCSX2",
+            &["pcsx2-qt", "pcsx2", "PCSX2"][..],
+            "net.pcsx2.PCSX2",
+        ),
+        (
+            "PPSSPP",
+            &["PPSSPPSDL", "PPSSPPQt", "ppsspp"][..],
+            "org.ppsspp.PPSSPP",
+        ),
+        ("RPCS3", &["rpcs3", "RPCS3"][..], "net.rpcs3.RPCS3"),
+        ("xemu", &["xemu", "xemu-kvm"][..], "app.xemu.xemu"),
+        (
+            "DuckStation",
+            &["duckstation-qt", "duckstation-nogui", "duckstation"][..],
+            "org.duckstation.DuckStation",
+        ),
+        ("Azahar", &["azahar"][..], "org.azahar_emulator.Azahar"),
+        ("Cemu", &["Cemu", "cemu"][..], "info.cemu.Cemu"),
+        (
+            "melonDS",
+            &["melonDS", "melonds"][..],
+            "net.kuribo64.melonDS",
+        ),
+        ("mGBA", &["mgba"][..], "io.mgba.mGBA"),
+        ("RetroArch", &["retroarch"][..], "org.libretro.RetroArch"),
+        ("ScummVM", &["scummvm"][..], "org.scummvm.ScummVM"),
+        ("DOSBox", &["dosbox"][..], "com.dosbox.DOSBox"),
+        (
+            "DOSBox Staging",
+            &["dosbox-staging"][..],
+            "io.github.dosbox-staging",
+        ),
+        (
+            "Xenia",
+            &["xenia_canary", "xenia"][..],
+            "com.xenia_project.Xenia",
+        ),
+        ("MAME", &["mame"][..], "org.mamedev.MAME"),
+        (
+            "FinalBurn Neo",
+            &["fbneo", "fbn"][..],
+            "com.github.libretro.FBNeo",
+        ),
+    ];
+    let mut evidence = Vec::new();
+    for (emulator, names, app_id) in definitions {
+        let executable = first_executable(&home, names);
+        if let Some(path) = executable {
+            evidence.push(LinuxEmulatorInstallationEvidence {
+                emulator: emulator.to_string(),
+                installation_form: "Native/PATH".to_string(),
+                executable: Some(EncodedPath::from_path(&path)),
+                profile: None,
+                detail: format!("Executable found at {}", path.display()),
+            });
+        }
+        if let Some(form) = flatpak_metadata(&home, app_id) {
+            evidence.push(LinuxEmulatorInstallationEvidence {
+                emulator: emulator.to_string(),
+                installation_form: form.to_string(),
+                executable: Some(EncodedPath::from_path(Path::new("/usr/bin/flatpak"))),
+                profile: None,
+                detail: format!("Flatpak application metadata found for {app_id}"),
+            });
+        }
+    }
+    for (emulator, path) in [
+        (
+            "Dolphin",
+            home.join("Applications/Dolphin/Dolphin.AppImage"),
+        ),
+        ("PCSX2", home.join("Applications/PCSX2/PCSX2.AppImage")),
+        ("PPSSPP", home.join("Applications/PPSSPP/PPSSPP.AppImage")),
+        ("RPCS3", home.join("Applications/RPCS3/RPCS3.AppImage")),
+        ("xemu", home.join("Applications/xemu.AppImage")),
+        (
+            "DuckStation",
+            home.join("Applications/DuckStation/DuckStation.AppImage"),
+        ),
+        ("Xenia", home.join("Applications/Xenia.AppImage")),
+    ] {
+        if safe_executable(&path) {
+            evidence.push(LinuxEmulatorInstallationEvidence {
+                emulator: emulator.to_string(),
+                installation_form: "AppImage".to_string(),
+                executable: Some(EncodedPath::from_path(&path)),
+                profile: None,
+                detail: format!("AppImage found at {}", path.display()),
+            });
+        }
+    }
+    evidence.extend(discover_shadps4_installations(&home));
+    evidence.extend(discover_managed_emulator_installations(&home));
+    if let Some(path) = [home.join(".config/scummvm"), home.join(".config/ScummVM")]
+        .into_iter()
+        .find(|path| {
+            fs::symlink_metadata(path)
+                .map(|metadata| metadata.is_dir())
+                .unwrap_or(false)
+        })
+    {
+        evidence.push(LinuxEmulatorInstallationEvidence {
+            emulator: "ScummVM".to_string(),
+            installation_form: "Native/PATH".to_string(),
+            executable: None,
+            profile: Some(EncodedPath::from_path(&path)),
+            detail: format!("Configuration directory found at {}", path.display()),
+        });
+    }
+    if fs::symlink_metadata(home.join("Desktop/xenia-canary.config.toml"))
+        .map(|metadata| metadata.is_file() && !metadata.file_type().is_symlink())
+        .unwrap_or(false)
+    {
+        evidence.push(LinuxEmulatorInstallationEvidence {
+            emulator: "Xenia".to_string(),
+            installation_form: "AppImage/config evidence".to_string(),
+            executable: None,
+            profile: Some(EncodedPath::from_path(
+                &home.join("Desktop/xenia-canary.config.toml"),
+            )),
+            detail:
+                "Xenia configuration evidence is present, but no native Linux binding is authorized"
+                    .to_string(),
+        });
+    }
+    evidence
+}
+
+/// The single trusted local executable path to feed into a standalone
+/// adapter's `explicit_executables` for `emulator` (a
+/// [`LinuxEmulatorInstallationEvidence::emulator`] display name, e.g.
+/// `"PPSSPP"` / `"PCSX2"`), taken only from already-validated evidence.
+///
+/// # Trust
+///
+/// Returns a path **only** when exactly one evidence entry both names
+/// `emulator` and carries [`MANAGED_APPIMAGE_INSTALLATION_FORM`] - the
+/// `install.json`-backed managed AppImage that
+/// [`crate::emulator_download::managed_appimage_install`] already proved is
+/// a regular, non-symlink, executable file. It never returns a plain
+/// `"AppImage"` (a fixed `~/Applications` path with no provenance marker), a
+/// Flatpak, a `$APPIMAGE` guess, a `PATH` match, or a config-only entry;
+/// and if zero or more than one managed install matches, or the recorded
+/// path is a lossy (non-UTF-8) rendering, it returns `None` so the caller
+/// stays deterministic and fail-closed. Widening trust is out of scope here
+/// This is only the wiring that carries an *already*-validated path into the
+/// existing adapter discovery/binding.
+pub fn managed_appimage_executable_for(
+    installations: &[LinuxEmulatorInstallationEvidence],
+    emulator: &str,
+) -> Option<PathBuf> {
+    let mut managed = installations.iter().filter(|item| {
+        item.emulator == emulator && item.installation_form == MANAGED_APPIMAGE_INSTALLATION_FORM
+    });
+    let only = managed.next()?;
+    if managed.next().is_some() {
+        return None;
+    }
+    let encoded = only.executable.as_ref()?;
+    if encoded.lossy {
+        return None;
+    }
+    Some(PathBuf::from(&encoded.display))
+}
+
+pub fn findings_from_linux_emulator_installations(
+    evidence: &[LinuxEmulatorInstallationEvidence],
+) -> Vec<Finding> {
+    evidence
+        .iter()
+        .map(|item| {
+            let mut finding = Finding::new(
+                format!("emulator_installation.{}", item.emulator.to_lowercase()),
+                DoctorCategory::EmulatorProfiles,
+                DoctorSubsystem::EmulatorReadiness,
+                DoctorSeverity::Info,
+                format!("{} installation found", item.emulator),
+                item.detail.clone(),
+            )
+            .with_evidence([format!("Installation form: {}", item.installation_form)]);
+            if let Some(executable) = &item.executable {
+                finding = finding.with_evidence([format!("Executable: {}", executable.display)]);
+            }
+            if let Some(profile) = &item.profile {
+                finding = finding.with_evidence([format!("Profile/config: {}", profile.display)]);
+            }
+            finding
+        })
+        .collect()
+}
 
 /// At most this many profiles are reported individually; beyond it Doctor
 /// summarises. A machine with dozens of Flatpak and portable installs must not
@@ -53,6 +569,10 @@ pub enum EmulatorKind {
     Dolphin,
     Pcsx2,
     Xenia,
+    Ppsspp,
+    DuckStation,
+    Xemu,
+    Rpcs3,
 }
 
 impl EmulatorKind {
@@ -61,6 +581,10 @@ impl EmulatorKind {
             Self::Dolphin => "Dolphin",
             Self::Pcsx2 => "PCSX2",
             Self::Xenia => "Xenia Canary",
+            Self::Ppsspp => "PPSSPP",
+            Self::DuckStation => "DuckStation",
+            Self::Xemu => "xemu",
+            Self::Rpcs3 => "RPCS3",
         }
     }
 
@@ -69,6 +593,10 @@ impl EmulatorKind {
             Self::Dolphin => "dolphin",
             Self::Pcsx2 => "pcsx2",
             Self::Xenia => "xenia",
+            Self::Ppsspp => "ppsspp",
+            Self::DuckStation => "duckstation",
+            Self::Xemu => "xemu",
+            Self::Rpcs3 => "rpcs3",
         }
     }
 
@@ -80,6 +608,10 @@ impl EmulatorKind {
             Self::Dolphin => "emulator_profile.ambiguous_preferred_dolphin_profile",
             Self::Pcsx2 => "emulator_profile.ambiguous_preferred_pcsx2_profile",
             Self::Xenia => "emulator_profile.ambiguous_preferred_xenia_profile",
+            Self::Ppsspp => "emulator_profile.ambiguous_preferred_ppsspp_profile",
+            Self::DuckStation => "emulator_profile.ambiguous_preferred_duckstation_profile",
+            Self::Xemu => "emulator_profile.ambiguous_preferred_xemu_profile",
+            Self::Rpcs3 => "emulator_profile.ambiguous_preferred_rpcs3_profile",
         }
     }
 }
@@ -142,14 +674,52 @@ impl ProfileAssessment {
         }
     }
 
+    /// PPSSPP and DuckStation presently contribute profile inspection only:
+    /// EmuWiz knows their cheat directories, but has no install or managed
+    /// block support for either adapter. Keep their discovered, healthy
+    /// profiles visible in Doctor instead of treating them as a silent pass.
+    fn is_inspection_only_profile(&self) -> bool {
+        matches!(
+            self.emulator,
+            EmulatorKind::Ppsspp | EmulatorKind::DuckStation
+        )
+    }
+
+    fn inspection_finding_id(&self) -> &'static str {
+        match self.emulator {
+            EmulatorKind::Ppsspp => "emulator_profile.ppsspp_inspected",
+            EmulatorKind::DuckStation => "emulator_profile.duckstation_inspected",
+            EmulatorKind::Dolphin
+            | EmulatorKind::Pcsx2
+            | EmulatorKind::Xenia
+            | EmulatorKind::Xemu
+            | EmulatorKind::Rpcs3 => {
+                unreachable!("only inspection-only profiles have inspection finding ids")
+            }
+        }
+    }
+
+    fn destination_label(&self) -> &'static str {
+        if self.is_inspection_only_profile() {
+            "Cheat destination"
+        } else {
+            "Destination"
+        }
+    }
+
     fn evidence(&self) -> Vec<String> {
         let mut evidence = vec![
             format!("Emulator: {}", self.emulator.label()),
+            format!("Profile: {}", self.profile_id),
             format!("Profile type: {}", self.profile_kind),
             format!("Scope: {}", self.scope),
             format!("How it was found: {}", self.discovery_confidence),
-            format!("Profile root: {}", self.root_path.display),
-            format!("Destination: {}", self.destination_path.display),
+            format!("Configuration path: {}", self.root_path.display),
+            format!(
+                "{}: {}",
+                self.destination_label(),
+                self.destination_path.display
+            ),
             format!("Destination exists: {}", self.destination_exists),
             format!("Mount state: {}", self.mount_mode.label()),
             format!("Assessment: {}", self.writability.label()),
@@ -183,6 +753,114 @@ impl ProfileAssessment {
     }
 }
 
+fn profile_finding(profile: &ProfileAssessment, severity: DoctorSeverity) -> Finding {
+    let inspection_only = profile.is_inspection_only_profile();
+    let (id, title, explanation) = if inspection_only {
+        (
+            profile.inspection_finding_id(),
+            format!(
+                "{} profile inspected: {}",
+                profile.emulator.label(),
+                profile.writability.label()
+            ),
+            format!(
+                "{} profile {} uses {} as its cheat destination. {}",
+                profile.emulator.label(),
+                profile.profile_id,
+                profile.destination_path.display,
+                profile.writability.label(),
+            ),
+        )
+    } else {
+        (
+            profile.finding_id(),
+            format!(
+                "{} profile: {}",
+                profile.emulator.label(),
+                profile.writability.label()
+            ),
+            format!(
+                "{} ({}) would install into {}. {}",
+                profile.emulator.label(),
+                profile.profile_kind,
+                profile.destination_path.display,
+                profile.writability.label()
+            ),
+        )
+    };
+    let (why_it_matters, next_step) = if inspection_only {
+        (
+            "EmuWiz currently inspects this profile and its cheat destination only; it does not install PPSSPP or DuckStation cheats or manage a block in either emulator's files.",
+            "No action is available in EmuWiz for this profile yet. The assessment is read-only and reports the destination metadata without writing a probe file.",
+        )
+    } else {
+        match profile.writability {
+            WritabilityAssessment::ReadOnlyFilesystem => (
+                "Installing a cheat or patch into this profile would fail, because the filesystem itself is read-only.",
+                "Remount that filesystem read-write, or pick a different profile before installing.",
+            ),
+            WritabilityAssessment::PermissionDenied => (
+                "Installing a cheat or patch into this profile would fail with a permission error.",
+                "Give the current user write access to that directory, or pick a different profile.",
+            ),
+            WritabilityAssessment::MissingDestination => (
+                "EmuWiz creates this directory during an install, so this is only worth knowing about in advance.",
+                "Nothing to do now. Launch the emulator once, or let EmuWiz create it during an install.",
+            ),
+            WritabilityAssessment::UnsafeDestination => (
+                "EmuWiz refuses to write through a symlink or into a non-directory, so this profile cannot be used as-is.",
+                "Replace the symlink with a real directory, or point EmuWiz at a different profile.",
+            ),
+            WritabilityAssessment::NotProven | WritabilityAssessment::AppearsWritable => (
+                "EmuWiz cannot confirm from metadata alone whether a write here would succeed, and will not write a test file to find out.",
+                "No action needed. An install will report the real outcome.",
+            ),
+        }
+    };
+
+    Finding::new(
+        id,
+        DoctorCategory::EmulatorProfiles,
+        DoctorSubsystem::EmulatorProfiles,
+        severity,
+        title,
+        explanation,
+    )
+    .with_affected(profile.destination_path.clone())
+    .with_evidence(profile.evidence())
+    .with_measurements([
+        ("emulator", Measurement::text(profile.emulator.label())),
+        ("profile", Measurement::text(&profile.profile_id)),
+        ("profile_kind", Measurement::text(&profile.profile_kind)),
+        (
+            "configuration_path",
+            Measurement::text(&profile.root_path.display),
+        ),
+        (
+            "cheat_destination",
+            Measurement::text(&profile.destination_path.display),
+        ),
+        (
+            "discovery_confidence",
+            Measurement::text(&profile.discovery_confidence),
+        ),
+        (
+            "writability_assessment",
+            Measurement::text(profile.writability.label()),
+        ),
+        (
+            "filesystem_read_only",
+            Measurement::Flag(profile.writability == WritabilityAssessment::ReadOnlyFilesystem),
+        ),
+        (
+            "destination_exists",
+            Measurement::Flag(profile.destination_exists),
+        ),
+        ("eligible", Measurement::Flag(profile.eligible)),
+    ])
+    .with_guidance(why_it_matters, next_step)
+}
+
 /// Everything Doctor could work out about emulator profiles.
 #[derive(Debug, Clone, PartialEq, Serialize)]
 pub struct ProfileAssessmentReport {
@@ -204,10 +882,22 @@ pub struct ProfileDiscoveries<'a> {
     pub pcsx2_error: Option<String>,
     pub xenia: Option<&'a XeniaProfileDiscovery>,
     pub xenia_error: Option<String>,
+    pub ppsspp: Option<&'a PpssppProfileDiscovery>,
+    pub ppsspp_error: Option<String>,
+    pub duckstation: Option<&'a DuckStationProfileDiscovery>,
+    pub duckstation_error: Option<String>,
+    pub xemu: Option<&'a XemuProfileDiscovery>,
+    pub xemu_error: Option<String>,
+    pub rpcs3: Option<&'a Rpcs3ProfileDiscovery>,
+    pub rpcs3_error: Option<String>,
     /// The profile ids EmuWiz currently prefers, when known.
     pub preferred_dolphin: Option<&'a str>,
     pub preferred_pcsx2: Option<&'a str>,
     pub preferred_xenia: Option<&'a str>,
+    pub preferred_ppsspp: Option<&'a str>,
+    pub preferred_duckstation: Option<&'a str>,
+    pub preferred_xemu: Option<&'a str>,
+    pub preferred_rpcs3: Option<&'a str>,
 }
 
 /// Assesses every discovered profile's write destination.
@@ -324,6 +1014,114 @@ pub fn assess_emulator_profiles(
         unavailable.push((EmulatorKind::Xenia, error.clone()));
     }
 
+    if let Some(discovery) = discoveries.ppsspp {
+        discovery_incomplete |= !discovery.complete;
+        for profile in &discovery.profiles {
+            profiles.push(assess_one(
+                EmulatorKind::Ppsspp,
+                profile.profile_id.clone(),
+                format!("{:?}", profile.installation_type),
+                format!("{:?}", profile.scope),
+                profile.provenance.to_string(),
+                profile.eligible,
+                profile
+                    .blockers
+                    .iter()
+                    .map(|blocker| format!("{:?}: {}", blocker.kind, blocker.detail))
+                    .collect(),
+                &profile.configuration_path,
+                // The directory a per-game PPSSPP cheat file would be
+                // written into once cheat-write support exists.
+                &profile.cheats_path,
+                discoveries.preferred_ppsspp,
+                mount_table,
+            ));
+        }
+    } else if let Some(error) = &discoveries.ppsspp_error {
+        unavailable.push((EmulatorKind::Ppsspp, error.clone()));
+    }
+
+    if let Some(discovery) = discoveries.duckstation {
+        discovery_incomplete |= !discovery.complete;
+        for profile in &discovery.profiles {
+            profiles.push(assess_one(
+                EmulatorKind::DuckStation,
+                profile.profile_id.clone(),
+                format!("{:?}", profile.installation_type),
+                // DuckStation has no separate profile-scope concept - every
+                // discovered profile is either found or explicitly supplied.
+                "N/A".to_string(),
+                "discovered configuration directory".to_string(),
+                profile.eligible,
+                profile.blocker.iter().cloned().collect(),
+                &profile.configuration_path,
+                // The directory a per-game DuckStation cheat file would be
+                // written into once cheat-write support exists.
+                &profile.cheats_path,
+                discoveries.preferred_duckstation,
+                mount_table,
+            ));
+        }
+    } else if let Some(error) = &discoveries.duckstation_error {
+        unavailable.push((EmulatorKind::DuckStation, error.clone()));
+    }
+
+    if let Some(discovery) = discoveries.xemu {
+        discovery_incomplete |= !discovery.complete;
+        for profile in &discovery.profiles {
+            profiles.push(assess_one(
+                EmulatorKind::Xemu,
+                profile.profile_id.clone(),
+                format!("{:?}", profile.installation_type),
+                format!("{:?}", profile.scope),
+                profile.provenance.to_string(),
+                profile.eligible,
+                profile
+                    .blockers
+                    .iter()
+                    .map(|blocker| format!("{:?}: {}", blocker.kind, blocker.detail))
+                    .collect(),
+                &profile.configuration_path,
+                // xemu has no separate install/cheat destination yet; report
+                // the profile root itself so the finding still names
+                // something real.
+                &profile.configuration_path,
+                discoveries.preferred_xemu,
+                mount_table,
+            ));
+        }
+    } else if let Some(error) = &discoveries.xemu_error {
+        unavailable.push((EmulatorKind::Xemu, error.clone()));
+    }
+
+    if let Some(discovery) = discoveries.rpcs3 {
+        discovery_incomplete |= !discovery.complete;
+        for profile in &discovery.profiles {
+            profiles.push(assess_one(
+                EmulatorKind::Rpcs3,
+                profile.profile_id.clone(),
+                format!("{:?}", profile.installation_type),
+                format!("{:?}", profile.scope),
+                profile.provenance.to_string(),
+                profile.eligible,
+                profile
+                    .blockers
+                    .iter()
+                    .map(|blocker| format!("{:?}: {}", blocker.kind, blocker.detail))
+                    .collect(),
+                &profile.configuration_path,
+                // RPCS3 has no separate install/cheat destination yet;
+                // report the profile root itself so the finding still names
+                // something real.
+                &profile.configuration_path,
+                discoveries.preferred_rpcs3,
+                mount_table,
+            ));
+        }
+    } else if let Some(error) = &discoveries.rpcs3_error {
+        unavailable.push((EmulatorKind::Rpcs3, error.clone()));
+    }
+
     profiles.sort_by(|left, right| {
         (
             left.emulator,
@@ -401,89 +1199,25 @@ fn assess_one(
 }
 
 /// Profile findings: one per profile that has something to report, plus a
-/// summary when there are too many, plus an ambiguity finding when several
-/// eligible profiles compete and none is selected.
+/// summary when there are too many, an inspection result for every discovered
+/// PPSSPP/DuckStation profile, and an ambiguity finding when several eligible
+/// profiles compete and none is selected.
 ///
-/// A profile that appears writable produces no finding at all - Doctor reports
-/// problems, not an inventory.
+/// A profile that appears writable produces no finding at all except for
+/// PPSSPP and DuckStation. Those adapters are inspection-only, so their
+/// discovered profile metadata belongs in Doctor even when healthy.
 pub fn findings_from_emulator_profiles(report: &ProfileAssessmentReport) -> Vec<Finding> {
     let mut findings = Vec::new();
     let notable: Vec<&ProfileAssessment> = report
         .profiles
         .iter()
-        .filter(|profile| profile.severity().is_some())
+        .filter(|profile| profile.severity().is_some() && !profile.is_inspection_only_profile())
         .collect();
 
     if notable.len() <= MAX_INDIVIDUAL_PROFILE_FINDINGS {
         for profile in &notable {
             let severity = profile.severity().expect("filtered above");
-            findings.push(
-                Finding::new(
-                    profile.finding_id(),
-                    DoctorCategory::EmulatorProfiles,
-                    DoctorSubsystem::EmulatorProfiles,
-                    severity,
-                    format!("{} profile: {}", profile.emulator.label(), profile.writability.label()),
-                    format!(
-                        "{} ({}) would install into {}. {}",
-                        profile.emulator.label(),
-                        profile.profile_kind,
-                        profile.destination_path.display,
-                        profile.writability.label()
-                    ),
-                )
-                .with_affected(profile.destination_path.clone())
-                .with_evidence(profile.evidence())
-                .with_measurements([
-                    ("emulator", Measurement::text(profile.emulator.label())),
-                    ("profile_kind", Measurement::text(&profile.profile_kind)),
-                    (
-                        "discovery_confidence",
-                        Measurement::text(&profile.discovery_confidence),
-                    ),
-                    (
-                        "writability_assessment",
-                        Measurement::text(profile.writability.label()),
-                    ),
-                    (
-                        "filesystem_read_only",
-                        Measurement::Flag(
-                            profile.writability == WritabilityAssessment::ReadOnlyFilesystem,
-                        ),
-                    ),
-                    (
-                        "destination_exists",
-                        Measurement::Flag(profile.destination_exists),
-                    ),
-                    ("eligible", Measurement::Flag(profile.eligible)),
-                ])
-                .with_guidance(
-                    match profile.writability {
-                        WritabilityAssessment::ReadOnlyFilesystem =>
-                            "Installing a cheat or patch into this profile would fail, because the filesystem itself is read-only.",
-                        WritabilityAssessment::PermissionDenied =>
-                            "Installing a cheat or patch into this profile would fail with a permission error.",
-                        WritabilityAssessment::MissingDestination =>
-                            "EmuWiz creates this directory during an install, so this is only worth knowing about in advance.",
-                        WritabilityAssessment::UnsafeDestination =>
-                            "EmuWiz refuses to write through a symlink or into a non-directory, so this profile cannot be used as-is.",
-                        WritabilityAssessment::NotProven | WritabilityAssessment::AppearsWritable =>
-                            "EmuWiz cannot confirm from metadata alone whether a write here would succeed, and will not write a test file to find out.",
-                    },
-                    match profile.writability {
-                        WritabilityAssessment::ReadOnlyFilesystem =>
-                            "Remount that filesystem read-write, or pick a different profile before installing.",
-                        WritabilityAssessment::PermissionDenied =>
-                            "Give the current user write access to that directory, or pick a different profile.",
-                        WritabilityAssessment::MissingDestination =>
-                            "Nothing to do now. Launch the emulator once, or let EmuWiz create it during an install.",
-                        WritabilityAssessment::UnsafeDestination =>
-                            "Replace the symlink with a real directory, or point EmuWiz at a different profile.",
-                        WritabilityAssessment::NotProven | WritabilityAssessment::AppearsWritable =>
-                            "No action needed. An install will report the real outcome.",
-                    },
-                ),
-            );
+            findings.push(profile_finding(profile, severity));
         }
     } else {
         let mut evidence: Vec<String> = notable
@@ -537,12 +1271,27 @@ pub fn findings_from_emulator_profiles(report: &ProfileAssessmentReport) -> Vec<
         );
     }
 
+    for profile in report
+        .profiles
+        .iter()
+        .filter(|profile| profile.is_inspection_only_profile())
+    {
+        findings.push(profile_finding(
+            profile,
+            profile.severity().unwrap_or(DoctorSeverity::Info),
+        ));
+    }
+
     // Several eligible, apparently writable profiles with none selected is
     // genuinely ambiguous: an install would have to ask.
     for emulator in [
         EmulatorKind::Dolphin,
         EmulatorKind::Pcsx2,
         EmulatorKind::Xenia,
+        EmulatorKind::Ppsspp,
+        EmulatorKind::DuckStation,
+        EmulatorKind::Xemu,
+        EmulatorKind::Rpcs3,
     ] {
         let candidates: Vec<&ProfileAssessment> = report
             .profiles
@@ -680,24 +1429,90 @@ pub struct DiscoveredProfiles {
     /// discovered from roots the user has already pointed EmuWiz at. With
     /// none supplied there is nothing to assess - not a failure.
     pub xenia: Option<XeniaProfileDiscovery>,
+    pub ppsspp: Result<PpssppProfileDiscovery, String>,
+    pub duckstation: Result<DuckStationProfileDiscovery, String>,
+    pub xemu: Result<XemuProfileDiscovery, String>,
+    pub rpcs3: Result<Rpcs3ProfileDiscovery, String>,
+}
+
+/// Caller-confirmed executable/configuration-root overrides
+/// [`DiscoveredProfiles::from_environment_with_overrides`] can accept, one
+/// per adapter. Every field is *additive*: a supplied path is pushed onto
+/// that adapter's own `explicit_executables`/`explicit_configuration_roots`
+/// alongside whatever `*ProfileDiscoveryRoots::from_environment()` already
+/// finds automatically - this never suppresses or replaces automatic
+/// discovery, it only supplies one more already-confirmed candidate for the
+/// adapter's own discovery/preflight to accept or refuse on its own terms
+/// (matching the existing `explicit_executables` convention every one of
+/// these adapters already documents - see e.g.
+/// [`crate::patch_manager::Pcsx2ProfileDiscoveryRoots::explicit_executables`]).
+///
+/// PCSX2 has no `explicit_configuration_roots` field today (only
+/// `portable_configuration_roots`, which must come from an already-known
+/// PCSX2 configuration, never a blind user pick) - so there is deliberately
+/// no `pcsx2_configuration_root` here.
+///
+/// Dolphin has no executable-override channel today either:
+/// `DolphinProfileDiscoveryRoots::selected_executable` only breaks a tie
+/// among *already-running* Dolphin processes - it never introduces a new
+/// executable candidate to profile discovery - so there is deliberately no
+/// `dolphin_executable` here, only `dolphin_configuration_root`.
+#[derive(Debug, Clone, Default)]
+pub struct DiscoveredProfilesOverrides {
+    /// An explicitly selected native MAME executable. MAME does not have a
+    /// profile directory, but its lifecycle binding still needs to flow
+    /// through the same typed override boundary as other adapters.
+    pub mame_executable: Option<PathBuf>,
+    pub dolphin_configuration_root: Option<PathBuf>,
+    pub pcsx2_executable: Option<PathBuf>,
+    pub ppsspp_executable: Option<PathBuf>,
+    pub ppsspp_configuration_root: Option<PathBuf>,
+    pub duckstation_executable: Option<PathBuf>,
+    pub duckstation_configuration_root: Option<PathBuf>,
+    pub xemu_executable: Option<PathBuf>,
+    pub xemu_configuration_root: Option<PathBuf>,
+    pub rpcs3_executable: Option<PathBuf>,
+    pub rpcs3_configuration_root: Option<PathBuf>,
 }
 
 impl DiscoveredProfiles {
-    /// Discovers Dolphin and PCSX2 profiles from the documented paths, plus
-    /// Xenia from the supplied explicit roots only.
+    /// Discovers Dolphin, PCSX2, PPSSPP, DuckStation, xemu and RPCS3
+    /// profiles from their documented paths, plus Xenia from the supplied
+    /// explicit roots only.
     ///
     /// Read-only: each adapter's discovery inspects metadata of documented
     /// paths and never creates a directory or a profile.
     pub fn from_environment(explicit_xenia_roots: Vec<PathBuf>) -> Self {
+        Self::from_environment_with_overrides(
+            explicit_xenia_roots,
+            &DiscoveredProfilesOverrides::default(),
+        )
+    }
+
+    /// Like [`Self::from_environment`], but also folds in any
+    /// caller-confirmed [`DiscoveredProfilesOverrides`] - see that type's
+    /// own doc comment for exactly what "additive" means here.
+    pub fn from_environment_with_overrides(
+        explicit_xenia_roots: Vec<PathBuf>,
+        overrides: &DiscoveredProfilesOverrides,
+    ) -> Self {
         let dolphin = DolphinProfileDiscoveryRoots::from_environment()
             .map_err(|error| format!("Dolphin profiles could not be discovered: {error}"))
-            .and_then(|roots| {
+            .and_then(|mut roots| {
+                if let Some(configuration_root) = &overrides.dolphin_configuration_root {
+                    roots
+                        .explicit_configuration_roots
+                        .push(configuration_root.clone());
+                }
                 discover_dolphin_profiles(&roots)
                     .map_err(|error| format!("Dolphin profiles could not be discovered: {error}"))
             });
         let pcsx2 = Pcsx2ProfileDiscoveryRoots::from_environment()
             .map_err(|error| format!("PCSX2 profiles could not be discovered: {error}"))
-            .and_then(|roots| {
+            .and_then(|mut roots| {
+                if let Some(executable) = &overrides.pcsx2_executable {
+                    roots.explicit_executables.push(executable.clone());
+                }
                 discover_pcsx2_profiles(&roots)
                     .map_err(|error| format!("PCSX2 profiles could not be discovered: {error}"))
             });
@@ -708,6 +1523,59 @@ impl DiscoveredProfiles {
                 explicit_configuration_roots: explicit_xenia_roots,
             }))
         };
+        let ppsspp = PpssppProfileDiscoveryRoots::from_environment()
+            .map_err(|error| format!("PPSSPP profiles could not be discovered: {error}"))
+            .map(|mut roots| {
+                if let Some(executable) = &overrides.ppsspp_executable {
+                    roots.explicit_executables.push(executable.clone());
+                }
+                if let Some(configuration_root) = &overrides.ppsspp_configuration_root {
+                    roots
+                        .explicit_configuration_roots
+                        .push(configuration_root.clone());
+                }
+                discover_ppsspp_profiles(&roots)
+            });
+        let duckstation = DuckStationProfileDiscoveryRoots::from_environment()
+            .map_err(|error| format!("DuckStation profiles could not be discovered: {error}"))
+            .map(|mut roots| {
+                if let Some(executable) = &overrides.duckstation_executable {
+                    roots.explicit_executables.push(executable.clone());
+                }
+                if let Some(configuration_root) = &overrides.duckstation_configuration_root {
+                    roots
+                        .explicit_configuration_roots
+                        .push(configuration_root.clone());
+                }
+                discover_duckstation_profiles(&roots)
+            });
+        let xemu = XemuProfileDiscoveryRoots::from_environment()
+            .map_err(|error| format!("xemu profiles could not be discovered: {error}"))
+            .map(|mut roots| {
+                if let Some(executable) = &overrides.xemu_executable {
+                    roots.explicit_executables.push(executable.clone());
+                }
+                if let Some(configuration_root) = &overrides.xemu_configuration_root {
+                    roots
+                        .explicit_configuration_roots
+                        .push(configuration_root.clone());
+                }
+                discover_xemu_profiles(&roots)
+            });
+        let rpcs3 = Rpcs3ProfileDiscoveryRoots::from_environment()
+            .map_err(|error| format!("RPCS3 profiles could not be discovered: {error}"))
+            .map(|mut roots| {
+                if let Some(executable) = &overrides.rpcs3_executable {
+                    roots.explicit_executables.push(executable.clone());
+                    roots.selected_executable = Some(executable.clone());
+                }
+                if let Some(configuration_root) = &overrides.rpcs3_configuration_root {
+                    roots
+                        .explicit_configuration_roots
+                        .push(configuration_root.clone());
+                }
+                discover_rpcs3_profiles(&roots)
+            });
         let preferred_dolphin = dolphin.as_ref().ok().and_then(|discovery| {
             match select_dolphin_profile(discovery, None) {
                 EmulatorProfileSelection::Auto { profile_id, .. } => Some(profile_id),
@@ -720,6 +1588,10 @@ impl DiscoveredProfiles {
             preferred_dolphin,
             pcsx2,
             xenia,
+            ppsspp,
+            duckstation,
+            xemu,
+            rpcs3,
         }
     }
 
@@ -731,9 +1603,21 @@ impl DiscoveredProfiles {
             pcsx2_error: self.pcsx2.as_ref().err().cloned(),
             xenia: self.xenia.as_ref(),
             xenia_error: None,
+            ppsspp: self.ppsspp.as_ref().ok(),
+            ppsspp_error: self.ppsspp.as_ref().err().cloned(),
+            duckstation: self.duckstation.as_ref().ok(),
+            duckstation_error: self.duckstation.as_ref().err().cloned(),
+            xemu: self.xemu.as_ref().ok(),
+            xemu_error: self.xemu.as_ref().err().cloned(),
+            rpcs3: self.rpcs3.as_ref().ok(),
+            rpcs3_error: self.rpcs3.as_ref().err().cloned(),
             preferred_dolphin: self.preferred_dolphin.as_deref(),
             preferred_pcsx2: None,
             preferred_xenia: None,
+            preferred_ppsspp: None,
+            preferred_duckstation: None,
+            preferred_xemu: None,
+            preferred_rpcs3: None,
         }
     }
 }
@@ -783,7 +1667,13 @@ pub fn managed_scan_targets(report: &ProfileAssessmentReport) -> Vec<ManagedScan
                 format: match profile.emulator {
                     EmulatorKind::Dolphin => ManagedFormat::DolphinGameSettings,
                     EmulatorKind::Pcsx2 => ManagedFormat::Pcsx2Pnach,
-                    EmulatorKind::Xenia => unreachable!("filtered above"),
+                    EmulatorKind::Xenia
+                    | EmulatorKind::Ppsspp
+                    | EmulatorKind::DuckStation
+                    | EmulatorKind::Xemu
+                    | EmulatorKind::Rpcs3 => {
+                        unreachable!("filtered above")
+                    }
                 },
                 destination_root: if profile.destination_is_directory {
                     path
@@ -796,6 +1686,823 @@ pub fn managed_scan_targets(report: &ProfileAssessmentReport) -> Vec<ManagedScan
     targets.sort_by(|left, right| left.destination_root.cmp(&right.destination_root));
     targets.dedup();
     targets
+}
+
+// ---------------------------------------------------------------------------
+// xemu / Xenia launch readiness
+// ---------------------------------------------------------------------------
+//
+// A distinct question from the writability assessment above: not "could
+// EmuWiz write into this profile" but "could this profile actually launch a
+// game right now". Kept as its own small model rather than folded into
+// `ProfileAssessment` because the two adapters' real failure reasons do not
+// reduce to one shared shape - xemu has four independent system files with
+// no Xenia equivalent, and Xenia's one real-world confusion (a Windows
+// `xenia_canary.exe` sitting beside a real profile, unusable natively) has
+// no xemu equivalent. Genericizing them into one struct would either lose
+// xemu's four-way firmware detail or invent a fake firmware requirement for
+// Xenia - see the module's own task notes.
+//
+// The `assess_*` functions below read profile/system-file metadata (via
+// `resolve_xemu_native_launch_binding`/`resolve_xenia_launch_binding`/
+// `inspect_xemu_game`, all already read-only) and belong in this gatherer
+// module for exactly the same reason `assess_one` does. The `findings_from_*`
+// functions are pure transforms over that already-gathered data, safe to
+// call from the pure `runner`.
+
+/// One eligible xemu profile's launch readiness: its native executable
+/// binding, and all four required system files. Independent of any
+/// specific game - xemu's system files are read from its own `xemu.toml`,
+/// never from per-game state, so [`XemuGameRequest::default`] is always
+/// enough here.
+#[derive(Debug, Clone, PartialEq, Serialize)]
+pub struct XemuReadinessAssessment {
+    pub profile_id: String,
+    pub root_path: EncodedPath,
+    /// `Some` only when [`resolve_xemu_native_launch_binding`] succeeded.
+    pub executable: Option<EncodedPath>,
+    /// The plain-language reason no executable binding exists, when there
+    /// is one.
+    pub binding_problem: Option<String>,
+    pub mcpx: XemuSystemFileState,
+    pub flash_bios: XemuSystemFileState,
+    pub eeprom: XemuSystemFileState,
+    pub hdd: XemuSystemFileState,
+}
+
+/// Assesses every eligible discovered xemu profile's launch readiness.
+///
+/// Read-only: [`resolve_xemu_native_launch_binding`] inspects only
+/// filesystem metadata, and [`inspect_xemu_game`] reads only `xemu.toml`
+/// and the configured system-file paths' metadata. Nothing is created,
+/// mounted, or executed.
+pub fn assess_xemu_readiness(
+    discovery: Option<&XemuProfileDiscovery>,
+) -> Vec<XemuReadinessAssessment> {
+    let Some(discovery) = discovery else {
+        return Vec::new();
+    };
+    discovery
+        .profiles
+        .iter()
+        .filter(|profile| profile.eligible)
+        .map(|profile| {
+            let binding = resolve_xemu_native_launch_binding(profile);
+            let health = inspect_xemu_game(profile, &XemuGameRequest::default()).health;
+            XemuReadinessAssessment {
+                profile_id: profile.profile_id.clone(),
+                root_path: EncodedPath::from_path(&profile.configuration_path),
+                executable: binding
+                    .as_ref()
+                    .ok()
+                    .map(|binding| EncodedPath::from_path(&binding.executable)),
+                binding_problem: binding.as_ref().err().map(|blocker| {
+                    if let Some(candidate) = profile.executable_candidates.iter().find(|candidate| {
+                        candidate.installation_type != XemuInstallationType::Native
+                    }) {
+                        format!(
+                            "{} executable found at {}; EmuWiz has not enabled direct launch for this installation form",
+                            match candidate.installation_type {
+                                XemuInstallationType::Portable => "Portable/AppImage xemu",
+                                XemuInstallationType::FlatpakUser => "Flatpak xemu",
+                                XemuInstallationType::Explicit => "Configured xemu",
+                                XemuInstallationType::Native => "Native xemu",
+                            },
+                            candidate.path.display()
+                        )
+                    } else {
+                        xemu_binding_problem(blocker)
+                    }
+                }),
+                mcpx: health.mcpx,
+                flash_bios: health.flash_bios,
+                eeprom: health.eeprom,
+                hdd: health.hdd,
+            }
+        })
+        .collect()
+}
+
+/// A user-facing sentence for one xemu binding failure - never a raw enum
+/// dump.
+fn xemu_binding_problem(blocker: &XemuLaunchBlocker) -> String {
+    match blocker.kind {
+        XemuLaunchBlockerKind::ProfileIneligible => {
+            "the profile is not eligible for a native launch".to_string()
+        }
+        XemuLaunchBlockerKind::UnsupportedInstallationType => {
+            "the discovered xemu installation is not a supported native Linux install".to_string()
+        }
+        XemuLaunchBlockerKind::ExecutableMissing => {
+            "no native xemu executable was found in the profile".to_string()
+        }
+        XemuLaunchBlockerKind::ExecutableUnsafe => {
+            "the xemu executable is a symlink or not a regular file".to_string()
+        }
+        XemuLaunchBlockerKind::ExecutableNotExecutable => {
+            "the xemu executable does not have the execute permission set".to_string()
+        }
+        XemuLaunchBlockerKind::AmbiguousExecutable => {
+            "more than one native xemu executable was found and none is preferred".to_string()
+        }
+    }
+}
+
+/// A short, user-facing label for one xemu system file's state - never a
+/// raw enum dump.
+fn xemu_system_file_label(state: XemuSystemFileState) -> &'static str {
+    match state {
+        XemuSystemFileState::Present => "present",
+        XemuSystemFileState::Missing => "missing",
+        XemuSystemFileState::Unreadable => "present but unreadable",
+        XemuSystemFileState::NotConfigured => "not configured",
+        XemuSystemFileState::Unknown => "could not be determined",
+    }
+}
+
+/// One Finding per eligible xemu profile, always produced (like the
+/// PPSSPP/DuckStation inspection findings) so a healthy result is stated
+/// explicitly rather than left as silence a user could mistake for "not
+/// checked".
+pub fn findings_from_xemu_readiness(assessments: &[XemuReadinessAssessment]) -> Vec<Finding> {
+    assessments
+        .iter()
+        .map(|assessment| {
+            let firmware: Vec<(&str, XemuSystemFileState)> = vec![
+                ("MCPX boot ROM", assessment.mcpx),
+                ("flash BIOS", assessment.flash_bios),
+                ("EEPROM", assessment.eeprom),
+                ("HDD image", assessment.hdd),
+            ];
+            let missing: Vec<&str> = firmware
+                .iter()
+                .filter(|(_, state)| *state != XemuSystemFileState::Present)
+                .map(|(label, _)| *label)
+                .collect();
+            let ready = assessment.executable.is_some() && missing.is_empty();
+            let severity = if ready {
+                DoctorSeverity::Info
+            } else {
+                DoctorSeverity::Warning
+            };
+            let title = if ready {
+                "xemu is ready to launch".to_string()
+            } else {
+                "xemu is not ready to launch".to_string()
+            };
+            let mut problems = Vec::new();
+            if let Some(binding_problem) = &assessment.binding_problem {
+                problems.push(format!("Executable: {binding_problem}"));
+            }
+            for (label, state) in &firmware {
+                if *state != XemuSystemFileState::Present {
+                    problems.push(format!("{label} is {}", xemu_system_file_label(*state)));
+                }
+            }
+            let explanation = if ready {
+                "A native xemu executable was found and all four required system files (MCPX \
+                 boot ROM, flash BIOS, EEPROM, HDD image) are present."
+                    .to_string()
+            } else {
+                format!("xemu cannot launch a game yet: {}.", problems.join("; "))
+            };
+            let mut evidence = vec![
+                format!("Profile: {}", assessment.profile_id),
+                format!("Configuration path: {}", assessment.root_path.display),
+            ];
+            match &assessment.executable {
+                Some(executable) => evidence.push(format!("Executable: {}", executable.display)),
+                None => evidence.push(format!(
+                    "Executable: not available ({})",
+                    assessment.binding_problem.as_deref().unwrap_or("unknown")
+                )),
+            }
+            for (label, state) in &firmware {
+                evidence.push(format!("{label}: {}", xemu_system_file_label(*state)));
+            }
+            let (why_it_matters, next_step) = if ready {
+                (
+                    "xemu needs a safe native executable and all four Xbox system files (MCPX \
+                     boot ROM, flash BIOS, EEPROM, HDD image) to boot a game.",
+                    "No action needed.",
+                )
+            } else {
+                (
+                    "xemu cannot launch a game until every required system file is present and a \
+                     safe native executable is found.",
+                    "Place the missing file(s) where xemu expects them, or fix the executable \
+                     issue, then re-run Doctor.",
+                )
+            };
+            Finding::new(
+                "emulator_readiness.xemu",
+                DoctorCategory::EmulatorProfiles,
+                DoctorSubsystem::EmulatorReadiness,
+                severity,
+                title,
+                explanation,
+            )
+            .with_affected(assessment.root_path.clone())
+            .with_evidence(evidence)
+            .with_measurements([
+                ("profile", Measurement::text(&assessment.profile_id)),
+                (
+                    "executable_found",
+                    Measurement::Flag(assessment.executable.is_some()),
+                ),
+                (
+                    "mcpx",
+                    Measurement::text(xemu_system_file_label(assessment.mcpx)),
+                ),
+                (
+                    "flash_bios",
+                    Measurement::text(xemu_system_file_label(assessment.flash_bios)),
+                ),
+                (
+                    "eeprom",
+                    Measurement::text(xemu_system_file_label(assessment.eeprom)),
+                ),
+                (
+                    "hdd",
+                    Measurement::text(xemu_system_file_label(assessment.hdd)),
+                ),
+                ("ready", Measurement::Flag(ready)),
+            ])
+            .with_guidance(why_it_matters, next_step)
+        })
+        .collect()
+}
+
+/// One eligible Xenia profile's launch readiness: its native Linux
+/// executable binding only. Xenia has no firmware/BIOS concept in this
+/// build, so none is invented here - see [`findings_from_xenia_readiness`].
+#[derive(Debug, Clone, PartialEq, Serialize)]
+pub struct XeniaReadinessAssessment {
+    pub profile_id: String,
+    pub root_path: EncodedPath,
+    /// `Some` only when [`resolve_xenia_launch_binding`] succeeded.
+    pub executable: Option<EncodedPath>,
+    pub binding_problem: Option<String>,
+    /// `true` when a Windows `xenia_canary.exe` exists in the profile
+    /// directory - checked purely for wording: it never counts toward, or
+    /// substitutes for, a valid native binding.
+    pub windows_exe_present: bool,
+}
+
+/// Assesses every eligible discovered Xenia profile's launch readiness.
+///
+/// Read-only: [`resolve_xenia_launch_binding`] inspects only filesystem
+/// metadata, and the `.exe` check is a single `Path::exists` read solely to
+/// word the "Windows-only install" case precisely - it never influences
+/// which binding is chosen.
+pub fn assess_xenia_readiness(
+    discovery: Option<&XeniaProfileDiscovery>,
+) -> Vec<XeniaReadinessAssessment> {
+    let Some(discovery) = discovery else {
+        return Vec::new();
+    };
+    discovery
+        .profiles
+        .iter()
+        .filter(|profile| profile.eligible)
+        .map(|profile| {
+            let binding = resolve_xenia_launch_binding(profile);
+            XeniaReadinessAssessment {
+                profile_id: profile.profile_id.clone(),
+                root_path: EncodedPath::from_path(&profile.configuration_path),
+                executable: binding
+                    .as_ref()
+                    .ok()
+                    .map(|binding| EncodedPath::from_path(&binding.executable)),
+                binding_problem: binding.as_ref().err().map(xenia_binding_problem),
+                windows_exe_present: profile.configuration_path.join("xenia_canary.exe").exists(),
+            }
+        })
+        .collect()
+}
+
+/// A user-facing sentence for one Xenia binding failure - never a raw enum
+/// dump.
+fn xenia_binding_problem(blocker: &XeniaLaunchBlocker) -> String {
+    match blocker.kind {
+        XeniaLaunchBlockerKind::ProfileRootMismatch => {
+            "the profile configuration no longer matches what was discovered".to_string()
+        }
+        XeniaLaunchBlockerKind::ExecutableMissing => {
+            "no native Linux Xenia executable (xenia_canary or xenia) was found".to_string()
+        }
+        XeniaLaunchBlockerKind::ExecutableUnsafe => {
+            "the candidate executable is a symlink or not a regular file".to_string()
+        }
+        XeniaLaunchBlockerKind::ExecutableNotExecutable => {
+            "the candidate executable does not have the execute permission set".to_string()
+        }
+        XeniaLaunchBlockerKind::AmbiguousExecutable => {
+            "more than one native Xenia executable was found and none is preferred".to_string()
+        }
+    }
+}
+
+/// One Finding per eligible Xenia profile, always produced for the same
+/// reason as [`findings_from_xemu_readiness`].
+pub fn findings_from_xenia_readiness(assessments: &[XeniaReadinessAssessment]) -> Vec<Finding> {
+    assessments
+        .iter()
+        .map(|assessment| {
+            let ready = assessment.executable.is_some();
+            let severity = if ready {
+                DoctorSeverity::Info
+            } else {
+                DoctorSeverity::Warning
+            };
+            let title = if ready {
+                "Xenia is ready to launch".to_string()
+            } else {
+                "Xenia is not ready to launch".to_string()
+            };
+            let explanation = match (&assessment.executable, assessment.windows_exe_present) {
+                (Some(executable), _) => format!(
+                    "A native Linux Xenia executable was found: {}.",
+                    executable.display
+                ),
+                (None, true) => "A Windows xenia_canary.exe was found, but it cannot be launched \
+                                  natively on Linux. It is never treated as a valid native \
+                                  executable. Install or place a native Linux Xenia executable \
+                                  (xenia_canary or xenia, without a .exe extension) in the same \
+                                  folder."
+                    .to_string(),
+                (None, false) => format!(
+                    "Xenia cannot launch a game yet: {}.",
+                    assessment
+                        .binding_problem
+                        .as_deref()
+                        .unwrap_or("no native executable is available")
+                ),
+            };
+            let mut evidence = vec![
+                format!("Profile: {}", assessment.profile_id),
+                format!("Configuration path: {}", assessment.root_path.display),
+                format!(
+                    "Windows xenia_canary.exe present: {}",
+                    assessment.windows_exe_present
+                ),
+            ];
+            match &assessment.executable {
+                Some(executable) => evidence.push(format!("Executable: {}", executable.display)),
+                None => evidence.push(format!(
+                    "Executable: not available ({})",
+                    assessment.binding_problem.as_deref().unwrap_or("unknown")
+                )),
+            }
+            let (why_it_matters, next_step) = if ready {
+                (
+                    "Xenia needs a safe native Linux executable to boot a game. Windows/Wine \
+                     execution is not supported.",
+                    "No action needed.",
+                )
+            } else if assessment.windows_exe_present {
+                (
+                    "Only a Windows build was found. EmuWiz never assumes or configures Wine/Proton \
+                     to run it.",
+                    "Download or build a native Linux Xenia (Canary) release and place its \
+                     executable in the same folder as xenia-canary.config.toml.",
+                )
+            } else {
+                (
+                    "Xenia cannot launch a game until a safe native Linux executable is found.",
+                    "Fix the executable issue, or place a native Linux Xenia executable in the \
+                     profile folder, then re-run Doctor.",
+                )
+            };
+            Finding::new(
+                "emulator_readiness.xenia",
+                DoctorCategory::EmulatorProfiles,
+                DoctorSubsystem::EmulatorReadiness,
+                severity,
+                title,
+                explanation,
+            )
+            .with_affected(assessment.root_path.clone())
+            .with_evidence(evidence)
+            .with_measurements([
+                ("profile", Measurement::text(&assessment.profile_id)),
+                ("executable_found", Measurement::Flag(ready)),
+                (
+                    "windows_exe_present",
+                    Measurement::Flag(assessment.windows_exe_present),
+                ),
+                ("ready", Measurement::Flag(ready)),
+            ])
+            .with_guidance(why_it_matters, next_step)
+        })
+        .collect()
+}
+
+// ---------------------------------------------------------------------------
+// PPSSPP / RPCS3 launch readiness
+// ---------------------------------------------------------------------------
+//
+// The same distinct question as the xemu/Xenia section above: not "could
+// EmuWiz write into this profile" but "could this profile actually launch a
+// game right now". PPSSPP has no firmware/BIOS concept at all in this build
+// (`ppsspp_firmware_readiness` is a constant `FirmwareReadiness::NotRequired`
+// - see `crate::launch::readiness`'s own doc comment), so none is invented
+// here. RPCS3 does have one, but it is deliberately never fully verified -
+// `Rpcs3FirmwareStatus` has no `Verified` variant, only `Present`/`Missing`/
+// `Unknown` (see `crate::launch::rpcs3_execution`'s own module doc comment
+// for why its preflight therefore accepts `ReadyWithWarnings`, not only
+// strict `Ready`) - so Doctor's wording below mirrors that exact policy
+// rather than inventing a stricter or looser one of its own.
+
+/// One eligible PPSSPP profile's launch readiness: its native executable
+/// binding only. PPSSPP needs no firmware/BIOS to boot a game, so none is
+/// modeled here - see this section's own doc comment.
+#[derive(Debug, Clone, PartialEq, Serialize)]
+pub struct PpssppReadinessAssessment {
+    pub profile_id: String,
+    pub root_path: EncodedPath,
+    /// `Some` only when [`resolve_ppsspp_native_launch_binding`] succeeded.
+    pub executable: Option<EncodedPath>,
+    pub binding_problem: Option<String>,
+}
+
+/// Assesses every eligible discovered PPSSPP profile's launch readiness.
+///
+/// Read-only: [`resolve_ppsspp_native_launch_binding`] inspects only
+/// filesystem metadata. Nothing is created, mounted, or executed.
+pub fn assess_ppsspp_readiness(
+    discovery: Option<&PpssppProfileDiscovery>,
+) -> Vec<PpssppReadinessAssessment> {
+    let Some(discovery) = discovery else {
+        return Vec::new();
+    };
+    discovery
+        .profiles
+        .iter()
+        .filter(|profile| profile.eligible)
+        .map(|profile| {
+            let binding = resolve_ppsspp_native_launch_binding(profile);
+            PpssppReadinessAssessment {
+                profile_id: profile.profile_id.clone(),
+                root_path: EncodedPath::from_path(&profile.configuration_path),
+                executable: binding
+                    .as_ref()
+                    .ok()
+                    .map(|binding| EncodedPath::from_path(&binding.executable)),
+                binding_problem: binding.as_ref().err().map(|blocker| {
+                    if let Some(candidate) = profile.executable_candidates.iter().find(|candidate| {
+                        candidate.installation_type != PpssppInstallationType::Native
+                    }) {
+                        format!(
+                            "{} executable found at {}; EmuWiz has not enabled direct launch for this installation form",
+                            match candidate.installation_type {
+                                PpssppInstallationType::Portable => "Portable/AppImage PPSSPP",
+                                PpssppInstallationType::FlatpakUser => "Flatpak PPSSPP",
+                                PpssppInstallationType::Explicit => "Configured PPSSPP",
+                                PpssppInstallationType::Native => "Native PPSSPP",
+                            },
+                            candidate.path.display()
+                        )
+                    } else {
+                        ppsspp_binding_problem(blocker)
+                    }
+                }),
+            }
+        })
+        .collect()
+}
+
+/// A user-facing sentence for one PPSSPP binding failure - never a raw enum
+/// dump.
+fn ppsspp_binding_problem(blocker: &PpssppLaunchBlocker) -> String {
+    match blocker.kind {
+        PpssppLaunchBlockerKind::ProfileIneligible => {
+            "the profile is not eligible for a native launch".to_string()
+        }
+        PpssppLaunchBlockerKind::UnsupportedInstallationType => {
+            "the discovered PPSSPP installation is not a supported native Linux install".to_string()
+        }
+        PpssppLaunchBlockerKind::ExecutableMissing => {
+            "no native PPSSPP executable was found in the profile".to_string()
+        }
+        PpssppLaunchBlockerKind::ExecutableUnsafe => {
+            "the PPSSPP executable is a symlink or not a regular file".to_string()
+        }
+        PpssppLaunchBlockerKind::ExecutableNotExecutable => {
+            "the PPSSPP executable does not have the execute permission set".to_string()
+        }
+        PpssppLaunchBlockerKind::AmbiguousExecutable => {
+            "more than one native PPSSPP executable was found and none is preferred".to_string()
+        }
+    }
+}
+
+/// One Finding per eligible PPSSPP profile, always produced (like the
+/// xemu/Xenia readiness findings) so a healthy result is stated explicitly
+/// rather than left as silence a user could mistake for "not checked".
+pub fn findings_from_ppsspp_readiness(assessments: &[PpssppReadinessAssessment]) -> Vec<Finding> {
+    assessments
+        .iter()
+        .map(|assessment| {
+            let ready = assessment.executable.is_some();
+            let severity = if ready {
+                DoctorSeverity::Info
+            } else {
+                DoctorSeverity::Warning
+            };
+            let title = if ready {
+                "PPSSPP is ready to launch".to_string()
+            } else {
+                "PPSSPP is not ready to launch".to_string()
+            };
+            let explanation = match &assessment.executable {
+                Some(executable) => format!(
+                    "A native PPSSPP executable was found: {}. PPSSPP needs no separate \
+                     firmware or BIOS to boot a game.",
+                    executable.display
+                ),
+                None => format!(
+                    "PPSSPP cannot launch a game yet: {}.",
+                    assessment
+                        .binding_problem
+                        .as_deref()
+                        .unwrap_or("no native executable is available")
+                ),
+            };
+            let mut evidence = vec![
+                format!("Profile: {}", assessment.profile_id),
+                format!("Configuration path: {}", assessment.root_path.display),
+            ];
+            match &assessment.executable {
+                Some(executable) => evidence.push(format!("Executable: {}", executable.display)),
+                None => evidence.push(format!(
+                    "Executable: not available ({})",
+                    assessment.binding_problem.as_deref().unwrap_or("unknown")
+                )),
+            }
+            let (why_it_matters, next_step) = if ready {
+                (
+                    "PPSSPP needs a safe native executable to boot a game.",
+                    "No action needed.",
+                )
+            } else {
+                (
+                    "PPSSPP cannot launch a game until a safe native executable is found.",
+                    "Fix the executable issue, then re-run Doctor.",
+                )
+            };
+            Finding::new(
+                "emulator_readiness.ppsspp",
+                DoctorCategory::EmulatorProfiles,
+                DoctorSubsystem::EmulatorReadiness,
+                severity,
+                title,
+                explanation,
+            )
+            .with_affected(assessment.root_path.clone())
+            .with_evidence(evidence)
+            .with_measurements([
+                ("profile", Measurement::text(&assessment.profile_id)),
+                ("executable_found", Measurement::Flag(ready)),
+                ("ready", Measurement::Flag(ready)),
+            ])
+            .with_guidance(why_it_matters, next_step)
+        })
+        .collect()
+}
+
+/// One eligible RPCS3 profile's launch readiness: its native executable
+/// binding, and its one firmware status. Independent of any specific game -
+/// RPCS3's firmware presence is read from `dev_flash`, never from per-game
+/// state, so [`Rpcs3GameRequest::default`] is always enough here.
+#[derive(Debug, Clone, PartialEq, Serialize)]
+pub struct Rpcs3ReadinessAssessment {
+    pub profile_id: String,
+    pub root_path: EncodedPath,
+    /// `Some` only when [`resolve_rpcs3_native_launch_binding`] succeeded.
+    pub executable: Option<EncodedPath>,
+    pub binding_problem: Option<String>,
+    #[serde(serialize_with = "serialize_firmware_readiness")]
+    pub firmware: FirmwareReadiness,
+}
+
+/// [`FirmwareReadiness`] does not derive `Serialize` (it lives in
+/// `crate::launch::readiness`, which this diagnostics-only requirement is
+/// not the place to change) - serialized here as the same user-facing label
+/// [`rpcs3_firmware_label`] shows, which is more useful for a `--json`
+/// consumer than the raw variant name would be anyway.
+fn serialize_firmware_readiness<S: serde::Serializer>(
+    value: &FirmwareReadiness,
+    serializer: S,
+) -> Result<S::Ok, S::Error> {
+    serializer.serialize_str(rpcs3_firmware_label(*value))
+}
+
+/// Assesses every eligible discovered RPCS3 profile's launch readiness.
+///
+/// Read-only: [`resolve_rpcs3_native_launch_binding`] inspects only
+/// filesystem metadata, and [`inspect_rpcs3_game`] reads only `dev_flash`
+/// metadata. Nothing is created, mounted, or executed.
+pub fn assess_rpcs3_readiness(
+    discovery: Option<&Rpcs3ProfileDiscovery>,
+) -> Vec<Rpcs3ReadinessAssessment> {
+    let Some(discovery) = discovery else {
+        return Vec::new();
+    };
+    discovery
+        .profiles
+        .iter()
+        .filter(|profile| profile.eligible)
+        .map(|profile| {
+            let binding = resolve_rpcs3_native_launch_binding(profile);
+            let health = inspect_rpcs3_game(profile, &Rpcs3GameRequest::default()).health;
+            Rpcs3ReadinessAssessment {
+                profile_id: profile.profile_id.clone(),
+                root_path: EncodedPath::from_path(&profile.configuration_path),
+                executable: binding
+                    .as_ref()
+                    .ok()
+                    .map(|binding| EncodedPath::from_path(&binding.executable)),
+                binding_problem: binding.as_ref().err().map(|blocker| {
+                    if let Some(candidate) = profile.executable_candidates.iter().find(|candidate| {
+                        candidate.installation_type != Rpcs3InstallationType::Native
+                    }) {
+                        format!(
+                            "{} executable found at {}; EmuWiz has not enabled direct launch for this installation form",
+                            match candidate.installation_type {
+                                Rpcs3InstallationType::Portable => "Portable/AppImage RPCS3",
+                                Rpcs3InstallationType::FlatpakUser => "Flatpak RPCS3",
+                                Rpcs3InstallationType::Explicit => "Configured RPCS3",
+                                Rpcs3InstallationType::Native => "Native RPCS3",
+                            },
+                            candidate.path.display()
+                        )
+                    } else {
+                        rpcs3_binding_problem(blocker)
+                    }
+                }),
+                firmware: rpcs3_firmware_readiness(&health.firmware),
+            }
+        })
+        .collect()
+}
+
+/// A user-facing sentence for one RPCS3 binding failure - never a raw enum
+/// dump.
+fn rpcs3_binding_problem(blocker: &Rpcs3LaunchBlocker) -> String {
+    match blocker.kind {
+        Rpcs3LaunchBlockerKind::ProfileIneligible => {
+            "the profile is not eligible for a native launch".to_string()
+        }
+        Rpcs3LaunchBlockerKind::UnsupportedInstallation => {
+            "the discovered RPCS3 installation is not a supported native Linux install".to_string()
+        }
+        Rpcs3LaunchBlockerKind::ExecutableMissing => {
+            "no native RPCS3 executable was found in the profile".to_string()
+        }
+        Rpcs3LaunchBlockerKind::ExecutableUnsafe => {
+            "the RPCS3 executable is a symlink or not a regular file".to_string()
+        }
+        Rpcs3LaunchBlockerKind::ExecutableNotExecutable => {
+            "the RPCS3 executable does not have the execute permission set".to_string()
+        }
+        Rpcs3LaunchBlockerKind::AmbiguousExecutable => {
+            "more than one native RPCS3 executable was found and none is preferred".to_string()
+        }
+    }
+}
+
+/// A short, user-facing label for RPCS3's one firmware status - never a raw
+/// enum dump. Mirrors `crate::launch::rpcs3_execution`'s own accepted
+/// policy exactly: `PresentUnverified` is a real, launchable state under
+/// current execution policy (RPCS3 never hash-verifies its firmware), and
+/// must never read as "blocked".
+fn rpcs3_firmware_label(firmware: FirmwareReadiness) -> &'static str {
+    match firmware {
+        FirmwareReadiness::Verified => "verified",
+        FirmwareReadiness::PresentUnverified => "present (not hash-verified)",
+        FirmwareReadiness::Missing => "missing",
+        FirmwareReadiness::Unknown => "could not be determined",
+        FirmwareReadiness::NotRequired => "not required",
+    }
+}
+
+/// One Finding per eligible RPCS3 profile, always produced for the same
+/// reason as [`findings_from_xemu_readiness`].
+///
+/// Readiness mirrors `crate::launch::rpcs3_execution::preflight_rpcs3_launch`'s
+/// own accepted policy exactly: a safe native executable plus firmware that
+/// is `Verified` or `PresentUnverified` is reported as ready (with an
+/// explicit "not hash-verified" caveat in the latter case, never presented
+/// as a clean pass) - `Missing`/`Unknown` firmware is reported as not ready,
+/// exactly like `build_rpcs3_command_plan`'s own `FirmwareReadiness::Unknown`
+/// gate (an *unknown* firmware state is never launchable, but Doctor's
+/// wording never claims to have proven it missing either).
+pub fn findings_from_rpcs3_readiness(assessments: &[Rpcs3ReadinessAssessment]) -> Vec<Finding> {
+    assessments
+        .iter()
+        .map(|assessment| {
+            let firmware_launchable = matches!(
+                assessment.firmware,
+                FirmwareReadiness::Verified | FirmwareReadiness::PresentUnverified
+            );
+            let ready = assessment.executable.is_some() && firmware_launchable;
+            let firmware_unverified = assessment.firmware == FirmwareReadiness::PresentUnverified;
+            let severity = if ready {
+                DoctorSeverity::Info
+            } else {
+                DoctorSeverity::Warning
+            };
+            let title = if ready {
+                "RPCS3 is ready to launch".to_string()
+            } else {
+                "RPCS3 is not ready to launch".to_string()
+            };
+            let mut problems = Vec::new();
+            if let Some(binding_problem) = &assessment.binding_problem {
+                problems.push(format!("Executable: {binding_problem}"));
+            }
+            if !firmware_launchable {
+                problems.push(format!(
+                    "Firmware is {}",
+                    rpcs3_firmware_label(assessment.firmware)
+                ));
+            }
+            let explanation = if ready {
+                if firmware_unverified {
+                    "A native RPCS3 executable was found and firmware is present. RPCS3 never \
+                     hash-verifies firmware contents, so this is reported ready under the same \
+                     policy the launcher itself uses, not as a fully proven pass."
+                        .to_string()
+                } else {
+                    "A native RPCS3 executable was found and firmware is present.".to_string()
+                }
+            } else {
+                format!("RPCS3 cannot launch a game yet: {}.", problems.join("; "))
+            };
+            let mut evidence = vec![
+                format!("Profile: {}", assessment.profile_id),
+                format!("Configuration path: {}", assessment.root_path.display),
+            ];
+            match &assessment.executable {
+                Some(executable) => evidence.push(format!("Executable: {}", executable.display)),
+                None => evidence.push(format!(
+                    "Executable: not available ({})",
+                    assessment.binding_problem.as_deref().unwrap_or("unknown")
+                )),
+            }
+            evidence.push(format!(
+                "Firmware: {}",
+                rpcs3_firmware_label(assessment.firmware)
+            ));
+            let (why_it_matters, next_step) = if ready {
+                (
+                    "RPCS3 needs a safe native executable and PS3 firmware installed under \
+                     dev_flash to boot a game.",
+                    "No action needed.",
+                )
+            } else if assessment.firmware == FirmwareReadiness::Missing {
+                (
+                    "RPCS3 cannot launch a game until PS3 firmware is installed.",
+                    "Install PS3 firmware in RPCS3 itself, then re-run Doctor.",
+                )
+            } else if assessment.firmware == FirmwareReadiness::Unknown {
+                (
+                    "RPCS3's firmware state could not be determined from the profile's \
+                     dev_flash directory, so a launch is not attempted.",
+                    "Open RPCS3 and confirm firmware is installed, then re-run Doctor.",
+                )
+            } else {
+                (
+                    "RPCS3 cannot launch a game until a safe native executable is found.",
+                    "Fix the executable issue, then re-run Doctor.",
+                )
+            };
+            Finding::new(
+                "emulator_readiness.rpcs3",
+                DoctorCategory::EmulatorProfiles,
+                DoctorSubsystem::EmulatorReadiness,
+                severity,
+                title,
+                explanation,
+            )
+            .with_affected(assessment.root_path.clone())
+            .with_evidence(evidence)
+            .with_measurements([
+                ("profile", Measurement::text(&assessment.profile_id)),
+                (
+                    "executable_found",
+                    Measurement::Flag(assessment.executable.is_some()),
+                ),
+                (
+                    "firmware",
+                    Measurement::text(rpcs3_firmware_label(assessment.firmware)),
+                ),
+                ("ready", Measurement::Flag(ready)),
+            ])
+            .with_guidance(why_it_matters, next_step)
+        })
+        .collect()
 }
 
 #[cfg(test)]
@@ -1105,9 +2812,21 @@ mod tests {
             pcsx2_error: None,
             xenia: None,
             xenia_error: None,
+            ppsspp: None,
+            ppsspp_error: None,
+            duckstation: None,
+            duckstation_error: None,
+            xemu: None,
+            xemu_error: None,
+            rpcs3: None,
+            rpcs3_error: None,
             preferred_dolphin: None,
             preferred_pcsx2: None,
             preferred_xenia: None,
+            preferred_ppsspp: None,
+            preferred_duckstation: None,
+            preferred_xemu: None,
+            preferred_rpcs3: None,
         };
         let assessed = assess_emulator_profiles(&discoveries, None);
         assert!(assessed.profiles.is_empty());
@@ -1119,6 +2838,252 @@ mod tests {
                 .iter()
                 .any(|item| item.name.contains("Dolphin") && item.reason.contains("HOME")),
             "a failed discovery must be stated, never presented as a clean result"
+        );
+    }
+
+    #[test]
+    fn doctor_sees_ppsspp() {
+        use crate::patch_manager::{PpssppInstallationType, PpssppProfile, PpssppProfileScope};
+        let tree = TempTree::new("profiles-doctor-sees-ppsspp");
+        let root = tree.path().join("ppsspp");
+        let ppsspp_profile = PpssppProfile {
+            profile_id: "ppsspp-native".to_string(),
+            installation_type: PpssppInstallationType::Native,
+            scope: PpssppProfileScope::User,
+            configuration_path: root.clone(),
+            provenance: "documented native path",
+            eligible: true,
+            blockers: Vec::new(),
+            executable_candidates: Vec::new(),
+            memstick_path: root.join("PSP"),
+            system_path: root.join("PSP/SYSTEM"),
+            global_config_path: root.join("PSP/SYSTEM/ppsspp.ini"),
+            cheats_path: root.join("PSP/Cheats"),
+            textures_path: root.join("PSP/Textures"),
+            savedata_path: root.join("PSP/SAVEDATA"),
+            game_path: root.join("PSP/GAME"),
+            state_path: root.join("PSP/PSP/STATE"),
+        };
+        let discovery = PpssppProfileDiscovery {
+            profiles: vec![ppsspp_profile],
+            warnings: Vec::new(),
+            complete: true,
+        };
+        let discoveries = ProfileDiscoveries {
+            dolphin: None,
+            dolphin_error: None,
+            pcsx2: None,
+            pcsx2_error: None,
+            xenia: None,
+            xenia_error: None,
+            ppsspp: Some(&discovery),
+            ppsspp_error: None,
+            duckstation: None,
+            duckstation_error: None,
+            xemu: None,
+            xemu_error: None,
+            rpcs3: None,
+            rpcs3_error: None,
+            preferred_dolphin: None,
+            preferred_pcsx2: None,
+            preferred_xenia: None,
+            preferred_ppsspp: None,
+            preferred_duckstation: None,
+            preferred_xemu: None,
+            preferred_rpcs3: None,
+        };
+        let assessed = assess_emulator_profiles(&discoveries, Some(&rw_table()));
+        assert_eq!(assessed.profiles.len(), 1);
+        let profile = &assessed.profiles[0];
+        assert_eq!(profile.emulator, EmulatorKind::Ppsspp);
+        assert_eq!(profile.emulator.label(), "PPSSPP");
+        assert_eq!(profile.profile_id, "ppsspp-native");
+        assert_eq!(
+            profile.destination_path.display,
+            root.join("PSP/Cheats").display().to_string()
+        );
+    }
+
+    #[test]
+    fn doctor_sees_duckstation() {
+        use crate::patch_manager::{DuckStationInstallationType, DuckStationProfile};
+        let tree = TempTree::new("profiles-doctor-sees-duckstation");
+        let root = tree.path().join("duckstation");
+        let duckstation_profile = DuckStationProfile {
+            profile_id: "duckstation-native".to_string(),
+            installation_type: DuckStationInstallationType::Native,
+            configuration_path: root.clone(),
+            provenance: "XDG_CONFIG_HOME DuckStation directory",
+            eligible: true,
+            blocker: None,
+            executable_candidates: Vec::new(),
+            global_config_path: root.join("settings.ini"),
+            game_settings_path: root.join("gamesettings.ini"),
+            cheats_path: root.join("cheats"),
+            patches_path: root.join("patches"),
+            textures_path: root.join("textures"),
+            bios_path: root.join("bios"),
+            memory_cards_path: root.join("memcards"),
+            save_states_path: root.join("savestates"),
+        };
+        let discovery = DuckStationProfileDiscovery {
+            profiles: vec![duckstation_profile],
+            complete: true,
+        };
+        let discoveries = ProfileDiscoveries {
+            dolphin: None,
+            dolphin_error: None,
+            pcsx2: None,
+            pcsx2_error: None,
+            xenia: None,
+            xenia_error: None,
+            ppsspp: None,
+            ppsspp_error: None,
+            duckstation: Some(&discovery),
+            duckstation_error: None,
+            xemu: None,
+            xemu_error: None,
+            rpcs3: None,
+            rpcs3_error: None,
+            preferred_dolphin: None,
+            preferred_pcsx2: None,
+            preferred_xenia: None,
+            preferred_ppsspp: None,
+            preferred_duckstation: None,
+            preferred_xemu: None,
+            preferred_rpcs3: None,
+        };
+        let assessed = assess_emulator_profiles(&discoveries, Some(&rw_table()));
+        assert_eq!(assessed.profiles.len(), 1);
+        let profile = &assessed.profiles[0];
+        assert_eq!(profile.emulator, EmulatorKind::DuckStation);
+        assert_eq!(profile.emulator.label(), "DuckStation");
+        assert_eq!(profile.profile_id, "duckstation-native");
+        assert_eq!(
+            profile.destination_path.display,
+            root.join("cheats").display().to_string()
+        );
+    }
+
+    #[test]
+    fn doctor_projects_writable_ppsspp_and_duckstation_profiles_for_inspection() {
+        let tree = TempTree::new("profiles-inspection-projection");
+        let ppsspp_root = tree.path().join("ppsspp");
+        let ppsspp_cheats = ppsspp_root.join("PSP/Cheats");
+        let duckstation_root = tree.path().join("duckstation");
+        let duckstation_cheats = duckstation_root.join("cheats");
+        fs::create_dir_all(&ppsspp_cheats).expect("fixture");
+        fs::create_dir_all(&duckstation_cheats).expect("fixture");
+
+        let ppsspp = assess_one(
+            EmulatorKind::Ppsspp,
+            "ppsspp-native".to_string(),
+            "Native".to_string(),
+            "User".to_string(),
+            "documented native path".to_string(),
+            true,
+            Vec::new(),
+            &ppsspp_root,
+            &ppsspp_cheats,
+            None,
+            Some(&rw_table()),
+        );
+        let duckstation = assess_one(
+            EmulatorKind::DuckStation,
+            "duckstation-native".to_string(),
+            "Native".to_string(),
+            "N/A".to_string(),
+            "discovered configuration directory".to_string(),
+            true,
+            Vec::new(),
+            &duckstation_root,
+            &duckstation_cheats,
+            None,
+            Some(&rw_table()),
+        );
+
+        let findings = findings_from_emulator_profiles(&report(vec![ppsspp, duckstation]));
+        assert_eq!(findings.len(), 2);
+        for (id, emulator, profile, configuration_path, cheat_destination) in [
+            (
+                "emulator_profile.ppsspp_inspected",
+                "PPSSPP",
+                "ppsspp-native",
+                ppsspp_root.display().to_string(),
+                ppsspp_cheats.display().to_string(),
+            ),
+            (
+                "emulator_profile.duckstation_inspected",
+                "DuckStation",
+                "duckstation-native",
+                duckstation_root.display().to_string(),
+                duckstation_cheats.display().to_string(),
+            ),
+        ] {
+            let finding = findings
+                .iter()
+                .find(|finding| finding.id == id)
+                .expect("finding");
+            assert_eq!(finding.severity, DoctorSeverity::Info);
+            assert!(finding.evidence.contains(&format!("Emulator: {emulator}")));
+            assert!(finding.evidence.contains(&format!("Profile: {profile}")));
+            assert!(
+                finding
+                    .evidence
+                    .contains(&format!("Configuration path: {configuration_path}"))
+            );
+            assert!(
+                finding
+                    .evidence
+                    .contains(&format!("Cheat destination: {cheat_destination}"))
+            );
+            assert_eq!(
+                finding.measurements.get("eligible"),
+                Some(&Measurement::Flag(true))
+            );
+        }
+    }
+
+    #[test]
+    fn ppsspp_and_duckstation_never_become_managed_scan_targets() {
+        use crate::patch_manager::{
+            DuckStationInstallationType, PpssppInstallationType, PpssppProfileScope,
+        };
+        let tree = TempTree::new("profiles-no-managed-block");
+        let ppsspp_destination = tree.path().join("ppsspp-cheats");
+        let duckstation_destination = tree.path().join("duckstation-cheats");
+        fs::create_dir_all(&ppsspp_destination).expect("fixture");
+        fs::create_dir_all(&duckstation_destination).expect("fixture");
+        let ppsspp_assessed = assess_one(
+            EmulatorKind::Ppsspp,
+            "ppsspp-native".to_string(),
+            format!("{:?}", PpssppInstallationType::Native),
+            format!("{:?}", PpssppProfileScope::User),
+            "documented native path".to_string(),
+            true,
+            Vec::new(),
+            ppsspp_destination.parent().unwrap(),
+            &ppsspp_destination,
+            None,
+            Some(&rw_table()),
+        );
+        let duckstation_assessed = assess_one(
+            EmulatorKind::DuckStation,
+            "duckstation-native".to_string(),
+            format!("{:?}", DuckStationInstallationType::Native),
+            "N/A".to_string(),
+            "discovered configuration directory".to_string(),
+            true,
+            Vec::new(),
+            duckstation_destination.parent().unwrap(),
+            &duckstation_destination,
+            None,
+            Some(&rw_table()),
+        );
+        let targets = managed_scan_targets(&report(vec![ppsspp_assessed, duckstation_assessed]));
+        assert!(
+            targets.is_empty(),
+            "neither adapter has managed-block support yet - see the module doc comment"
         );
     }
 
@@ -1318,6 +3283,1295 @@ mod tests {
                 "emulator_profile.ambiguous_preferred_pcsx2_profile".to_string(),
             ],
             "a live scan merged these into one result when they shared an id"
+        );
+    }
+
+    /// Doctor discovers and assesses PPSSPP and DuckStation profiles through
+    /// their existing adapter discovery, with explicit call-supplied roots.
+    #[test]
+    fn doctor_discovers_ppsspp_and_duckstation_profiles() {
+        let tree = TempTree::new("profiles-ppsspp-duckstation");
+        let ppsspp_root = tree.path().join("ppsspp");
+        fs::create_dir_all(ppsspp_root.join("PSP/SYSTEM")).expect("fixture");
+        fs::write(ppsspp_root.join("PSP/SYSTEM/ppsspp.ini"), "").expect("fixture");
+        let duck_root = tree.path().join("duckstation");
+        fs::create_dir_all(&duck_root).expect("fixture");
+        fs::write(duck_root.join("settings.ini"), "").expect("fixture");
+
+        let roots = roots_for_ppsspp_and_duckstation(
+            tree.path(),
+            std::slice::from_ref(&ppsspp_root),
+            std::slice::from_ref(&duck_root),
+        );
+        let ppsspp = discover_ppsspp_profiles(&roots.ppsspp);
+        let duckstation = discover_duckstation_profiles(&roots.duckstation);
+
+        let discoveries = ProfileDiscoveries {
+            ppsspp: Some(&ppsspp),
+            duckstation: Some(&duckstation),
+            ..ProfileDiscoveries::default()
+        };
+        let assessed = assess_emulator_profiles(&discoveries, Some(&rw_table()));
+
+        let kinds: Vec<EmulatorKind> = assessed
+            .profiles
+            .iter()
+            .map(|profile| profile.emulator)
+            .collect();
+        assert!(kinds.contains(&EmulatorKind::Ppsspp));
+        assert!(kinds.contains(&EmulatorKind::DuckStation));
+
+        // Both profiles are eligible and assessed against their cheat-write
+        // destination directory.
+        let ppsspp_assessed = assessed
+            .profiles
+            .iter()
+            .find(|profile| profile.emulator == EmulatorKind::Ppsspp)
+            .expect("PPSSPP profile assessed");
+        assert!(ppsspp_assessed.eligible);
+        assert_eq!(
+            ppsspp_assessed.destination_path.display,
+            ppsspp_root.join("PSP/CHEATS").display().to_string()
+        );
+        let duck_assessed = assessed
+            .profiles
+            .iter()
+            .find(|profile| profile.emulator == EmulatorKind::DuckStation)
+            .expect("DuckStation profile assessed");
+        assert!(duck_assessed.eligible);
+        assert_eq!(
+            duck_assessed.destination_path.display,
+            duck_root.join("cheats").display().to_string()
+        );
+    }
+
+    /// A small bag of already-built discovery-root structs for Doctor's
+    /// PPSSPP and DuckStation discovery, so the test drives both without
+    /// touching environment variables.
+    struct PpssppDuckstationRoots {
+        ppsspp: PpssppProfileDiscoveryRoots,
+        duckstation: DuckStationProfileDiscoveryRoots,
+    }
+
+    /// Builds explicit-roots discovery for PPSSPP and DuckStation from a
+    /// caller-supplied base directory and separate explicit configuration
+    /// roots for each adapter. It never touches `HOME`/`XDG`.
+    fn roots_for_ppsspp_and_duckstation(
+        base: &Path,
+        ppsspp_explicit: &[PathBuf],
+        duckstation_explicit: &[PathBuf],
+    ) -> PpssppDuckstationRoots {
+        let home = base.join("home");
+        let xdg_config_home = base.join("config");
+        let xdg_data_home = base.join("data");
+        PpssppDuckstationRoots {
+            ppsspp: PpssppProfileDiscoveryRoots {
+                home: home.clone(),
+                xdg_config_home: xdg_config_home.clone(),
+                xdg_data_home: xdg_data_home.clone(),
+                explicit_configuration_roots: ppsspp_explicit.to_vec(),
+                portable_configuration_roots: Vec::new(),
+                explicit_executables: Vec::new(),
+                known_version_outputs: std::collections::BTreeMap::new(),
+                appimage_directory: None,
+                path_override: Some(Vec::new()),
+            },
+            duckstation: DuckStationProfileDiscoveryRoots {
+                home,
+                xdg_config_home,
+                xdg_data_home,
+                xdg_config_home_explicit: false,
+                explicit_configuration_roots: duckstation_explicit.to_vec(),
+                portable_configuration_roots: Vec::new(),
+                explicit_executables: Vec::new(),
+                known_version_outputs: std::collections::BTreeMap::new(),
+                appimage_directory: None,
+                path_override: Some(Vec::new()),
+            },
+        }
+    }
+
+    // -----------------------------------------------------------------
+    // xemu / Xenia launch readiness
+    // -----------------------------------------------------------------
+    //
+    // xemu's own `resolve_xemu_native_launch_binding` only ever authorizes
+    // an executable candidate whose installation type is `Native`, and
+    // `discover_xemu_profiles`'s own executable discovery only ever
+    // classifies a candidate `Native` when it is found by searching the
+    // current process's real `PATH` - exactly the same PATH/global-env
+    // testing limitation already established for xemu/PPSSPP/DuckStation's
+    // own execution-layer tests (see `xemu_execution::tests`'s own module
+    // doc comment). Mutating this test binary's real `PATH` to fabricate a
+    // match would race every other concurrently running test that also
+    // reads it, so - following that same precedent - the *finding-shaping*
+    // logic below (severity, wording, measurements) is tested directly
+    // against hand-built [`XemuReadinessAssessment`] values, never through
+    // a real `Native` binding. The one gatherer-wiring test
+    // (`xemu_readiness_is_only_assessed_for_eligible_profiles`) proves
+    // `assess_xemu_readiness` itself reads real profile/health metadata and
+    // filters ineligible profiles correctly, without depending on a
+    // genuine `Native` executable ever being reachable in a test binary.
+    //
+    // Xenia has no such limitation: `resolve_xenia_launch_binding` never
+    // searches `$PATH` at all, so its readiness tests below use real,
+    // fully genuine fixtures throughout (see `xenia_execution::tests`'s own
+    // module doc comment for the same observation at the execution layer).
+
+    use crate::patch_manager::{
+        Rpcs3FirmwareStatus, XemuGameIdMapping, XemuHealth, XemuProfileDiscoveryRoots,
+        discover_xemu_profiles, discover_xenia_profiles,
+    };
+    use std::fs;
+    use std::os::unix::fs::PermissionsExt;
+
+    fn write_executable(path: &Path, contents: &[u8]) {
+        fs::create_dir_all(path.parent().unwrap()).unwrap();
+        fs::write(path, contents).unwrap();
+        fs::set_permissions(path, fs::Permissions::from_mode(0o755)).unwrap();
+    }
+
+    fn healthy_xemu_health() -> XemuHealth {
+        XemuHealth {
+            detected: true,
+            config_readable: true,
+            mcpx: XemuSystemFileState::Present,
+            flash_bios: XemuSystemFileState::Present,
+            eeprom: XemuSystemFileState::Present,
+            hdd: XemuSystemFileState::Present,
+            game_profile_mapping: XemuGameIdMapping::Unavailable,
+            warnings: Vec::new(),
+        }
+    }
+
+    fn xemu_assessment(
+        executable: Option<&str>,
+        binding_problem: Option<&str>,
+        health: XemuHealth,
+    ) -> XemuReadinessAssessment {
+        XemuReadinessAssessment {
+            profile_id: "xemu-native".to_string(),
+            root_path: EncodedPath::from_path(Path::new("/home/user/.config/xemu")),
+            executable: executable.map(|path| EncodedPath::from_path(Path::new(path))),
+            binding_problem: binding_problem.map(str::to_string),
+            mcpx: health.mcpx,
+            flash_bios: health.flash_bios,
+            eeprom: health.eeprom,
+            hdd: health.hdd,
+        }
+    }
+
+    fn xemu_finding(assessment: XemuReadinessAssessment) -> Finding {
+        let mut findings = findings_from_xemu_readiness(&[assessment]);
+        assert_eq!(findings.len(), 1);
+        findings.remove(0)
+    }
+
+    #[test]
+    fn xemu_ready_profile_is_reported_healthy() {
+        let finding = xemu_finding(xemu_assessment(
+            Some("/home/user/.config/xemu/xemu"),
+            None,
+            healthy_xemu_health(),
+        ));
+        assert_eq!(finding.severity, DoctorSeverity::Info);
+        assert_eq!(finding.id, "emulator_readiness.xemu");
+        assert_eq!(finding.title, "xemu is ready to launch");
+        assert_eq!(
+            finding.measurements.get("ready"),
+            Some(&Measurement::Flag(true))
+        );
+        assert_eq!(
+            finding.measurements.get("mcpx"),
+            Some(&Measurement::text("present"))
+        );
+    }
+
+    #[test]
+    fn xemu_missing_mcpx_is_reported_by_name() {
+        let mut health = healthy_xemu_health();
+        health.mcpx = XemuSystemFileState::Missing;
+        let finding = xemu_finding(xemu_assessment(
+            Some("/home/user/.config/xemu/xemu"),
+            None,
+            health,
+        ));
+        assert_eq!(finding.severity, DoctorSeverity::Warning);
+        assert!(finding.explanation.contains("MCPX boot ROM is missing"));
+        assert_eq!(
+            finding.measurements.get("mcpx"),
+            Some(&Measurement::text("missing"))
+        );
+        assert_eq!(
+            finding.measurements.get("flash_bios"),
+            Some(&Measurement::text("present"))
+        );
+    }
+
+    #[test]
+    fn xemu_missing_flash_bios_is_reported_by_name() {
+        let mut health = healthy_xemu_health();
+        health.flash_bios = XemuSystemFileState::Missing;
+        let finding = xemu_finding(xemu_assessment(
+            Some("/home/user/.config/xemu/xemu"),
+            None,
+            health,
+        ));
+        assert_eq!(finding.severity, DoctorSeverity::Warning);
+        assert!(finding.explanation.contains("flash BIOS is missing"));
+        assert_eq!(
+            finding.measurements.get("flash_bios"),
+            Some(&Measurement::text("missing"))
+        );
+    }
+
+    #[test]
+    fn xemu_missing_eeprom_is_reported_by_name() {
+        let mut health = healthy_xemu_health();
+        health.eeprom = XemuSystemFileState::Missing;
+        let finding = xemu_finding(xemu_assessment(
+            Some("/home/user/.config/xemu/xemu"),
+            None,
+            health,
+        ));
+        assert_eq!(finding.severity, DoctorSeverity::Warning);
+        assert!(finding.explanation.contains("EEPROM is missing"));
+        assert_eq!(
+            finding.measurements.get("eeprom"),
+            Some(&Measurement::text("missing"))
+        );
+    }
+
+    #[test]
+    fn xemu_missing_hdd_is_reported_by_name() {
+        let mut health = healthy_xemu_health();
+        health.hdd = XemuSystemFileState::Missing;
+        let finding = xemu_finding(xemu_assessment(
+            Some("/home/user/.config/xemu/xemu"),
+            None,
+            health,
+        ));
+        assert_eq!(finding.severity, DoctorSeverity::Warning);
+        assert!(finding.explanation.contains("HDD image is missing"));
+        assert_eq!(
+            finding.measurements.get("hdd"),
+            Some(&Measurement::text("missing"))
+        );
+    }
+
+    #[test]
+    fn xemu_unsafe_executable_is_reported() {
+        let finding = xemu_finding(xemu_assessment(
+            None,
+            Some("the xemu executable is a symlink or not a regular file"),
+            healthy_xemu_health(),
+        ));
+        assert_eq!(finding.severity, DoctorSeverity::Warning);
+        assert!(
+            finding
+                .explanation
+                .contains("symlink or not a regular file")
+        );
+        assert_eq!(
+            finding.measurements.get("executable_found"),
+            Some(&Measurement::Flag(false))
+        );
+    }
+
+    #[test]
+    fn xemu_ambiguous_executables_are_reported() {
+        let finding = xemu_finding(xemu_assessment(
+            None,
+            Some("more than one native xemu executable was found and none is preferred"),
+            healthy_xemu_health(),
+        ));
+        assert_eq!(finding.severity, DoctorSeverity::Warning);
+        assert!(
+            finding
+                .explanation
+                .contains("more than one native xemu executable")
+        );
+    }
+
+    /// Proves the real, I/O-touching gatherer: an ineligible profile
+    /// contributes no assessment at all (its own writability finding
+    /// already covers it), and an eligible one is genuinely inspected via
+    /// [`inspect_xemu_game`]'s real, read-only firmware detection - not
+    /// through any hand-built value.
+    #[test]
+    fn xemu_readiness_is_only_assessed_for_eligible_profiles() {
+        let tree = TempTree::new("xemu-gatherer");
+        // A native profile root with real system files and a real
+        // xemu.toml - genuinely eligible and genuinely inspected, even
+        // though no `Native`-classified executable can be placed here
+        // without touching `$PATH` (see this section's own doc comment).
+        let root = tree.path().join("config/xemu/xemu");
+        fs::create_dir_all(root.join("system")).unwrap();
+        fs::write(root.join("system/mcpx.bin"), b"mcpx").unwrap();
+        fs::write(
+            root.join("xemu.toml"),
+            "[sys.files]\nbootrom_path = 'system/mcpx.bin'\n",
+        )
+        .unwrap();
+        let discovery = discover_xemu_profiles(&XemuProfileDiscoveryRoots {
+            home: tree.path().join("home"),
+            xdg_config_home: tree.path().join("config"),
+            xdg_data_home: tree.path().join("data-unused"),
+            explicit_configuration_roots: Vec::new(),
+            portable_configuration_roots: Vec::new(),
+            explicit_executables: Vec::new(),
+            known_version_outputs: std::collections::BTreeMap::new(),
+            appimage_directory: None,
+            path_override: Some(Vec::new()),
+        });
+        assert_eq!(discovery.profiles.len(), 1, "{discovery:?}");
+        assert!(discovery.profiles[0].eligible);
+        let assessments = assess_xemu_readiness(Some(&discovery));
+        assert_eq!(assessments.len(), 1);
+        assert_eq!(assessments[0].mcpx, XemuSystemFileState::Present);
+        assert_eq!(
+            assessments[0].flash_bios,
+            XemuSystemFileState::NotConfigured
+        );
+        // No `Native` executable is reachable here (see the doc comment
+        // above), so the binding is genuinely absent - proving the
+        // gatherer reports that honestly rather than fabricating success.
+        assert!(assessments[0].executable.is_none());
+        assert!(assessments[0].binding_problem.is_some());
+
+        assert!(assess_xemu_readiness(None).is_empty());
+    }
+
+    /// A real, eligible Xenia profile: `xenia-canary.config.toml` marker plus
+    /// a native `xenia_canary` executable directly beneath `root`.
+    fn xenia_ready_profile(root: &Path) -> XeniaProfileDiscovery {
+        fs::write(root.join("xenia-canary.config.toml"), b"").unwrap();
+        write_executable(&root.join("xenia_canary"), b"#!/bin/sh\nexit 0\n");
+        discover_xenia_profiles(&crate::patch_manager::XeniaProfileDiscoveryRoots {
+            explicit_configuration_roots: vec![root.to_path_buf()],
+        })
+    }
+
+    #[test]
+    fn xenia_ready_with_native_linux_binary_is_reported_healthy() {
+        let tree = TempTree::new("xenia-ready");
+        let discovery = xenia_ready_profile(tree.path());
+        let assessments = assess_xenia_readiness(Some(&discovery));
+        let findings = findings_from_xenia_readiness(&assessments);
+        assert_eq!(findings.len(), 1);
+        assert_eq!(findings[0].severity, DoctorSeverity::Info);
+        assert_eq!(findings[0].id, "emulator_readiness.xenia");
+        assert_eq!(
+            findings[0].measurements.get("ready"),
+            Some(&Measurement::Flag(true))
+        );
+        assert_eq!(
+            findings[0].measurements.get("windows_exe_present"),
+            Some(&Measurement::Flag(false))
+        );
+    }
+
+    #[test]
+    fn xenia_windows_exe_only_is_reported_as_not_launchable_natively() {
+        let tree = TempTree::new("xenia-exe-only");
+        fs::write(tree.path().join("xenia-canary.config.toml"), b"").unwrap();
+        fs::write(tree.path().join("xenia_canary.exe"), b"MZ fake pe").unwrap();
+        let discovery =
+            discover_xenia_profiles(&crate::patch_manager::XeniaProfileDiscoveryRoots {
+                explicit_configuration_roots: vec![tree.path().to_path_buf()],
+            });
+        let assessments = assess_xenia_readiness(Some(&discovery));
+        let findings = findings_from_xenia_readiness(&assessments);
+        assert_eq!(findings.len(), 1);
+        assert_eq!(findings[0].severity, DoctorSeverity::Warning);
+        assert_eq!(
+            findings[0].measurements.get("windows_exe_present"),
+            Some(&Measurement::Flag(true))
+        );
+        assert_eq!(
+            findings[0].measurements.get("executable_found"),
+            Some(&Measurement::Flag(false))
+        );
+        assert!(
+            findings[0]
+                .explanation
+                .contains("cannot be launched natively on Linux")
+        );
+        // Never claims the .exe is a valid native executable anywhere.
+        assert!(!findings[0].explanation.contains("A native Linux Xenia"));
+    }
+
+    #[test]
+    fn xenia_missing_native_binding_is_reported() {
+        let tree = TempTree::new("xenia-missing-binding");
+        fs::write(tree.path().join("xenia-canary.config.toml"), b"").unwrap();
+        let discovery =
+            discover_xenia_profiles(&crate::patch_manager::XeniaProfileDiscoveryRoots {
+                explicit_configuration_roots: vec![tree.path().to_path_buf()],
+            });
+        let assessments = assess_xenia_readiness(Some(&discovery));
+        let findings = findings_from_xenia_readiness(&assessments);
+        assert_eq!(findings.len(), 1);
+        assert_eq!(findings[0].severity, DoctorSeverity::Warning);
+        assert_eq!(
+            findings[0].measurements.get("windows_exe_present"),
+            Some(&Measurement::Flag(false))
+        );
+        assert!(
+            findings[0]
+                .explanation
+                .contains("no native Linux Xenia executable")
+        );
+    }
+
+    #[test]
+    fn xenia_non_executable_binary_is_reported() {
+        let tree = TempTree::new("xenia-not-executable");
+        fs::write(tree.path().join("xenia-canary.config.toml"), b"").unwrap();
+        fs::write(tree.path().join("xenia_canary"), b"#!/bin/sh\nexit 0\n").unwrap();
+        let discovery =
+            discover_xenia_profiles(&crate::patch_manager::XeniaProfileDiscoveryRoots {
+                explicit_configuration_roots: vec![tree.path().to_path_buf()],
+            });
+        let assessments = assess_xenia_readiness(Some(&discovery));
+        let findings = findings_from_xenia_readiness(&assessments);
+        assert_eq!(findings.len(), 1);
+        assert_eq!(findings[0].severity, DoctorSeverity::Warning);
+        assert!(
+            findings[0]
+                .explanation
+                .contains("does not have the execute permission")
+        );
+    }
+
+    #[test]
+    fn xenia_ambiguous_native_candidates_are_reported() {
+        let tree = TempTree::new("xenia-ambiguous");
+        fs::write(tree.path().join("xenia-canary.config.toml"), b"").unwrap();
+        write_executable(&tree.path().join("xenia_canary"), b"#!/bin/sh\nexit 0\n");
+        write_executable(&tree.path().join("xenia"), b"#!/bin/sh\nexit 0\n");
+        let discovery =
+            discover_xenia_profiles(&crate::patch_manager::XeniaProfileDiscoveryRoots {
+                explicit_configuration_roots: vec![tree.path().to_path_buf()],
+            });
+        let assessments = assess_xenia_readiness(Some(&discovery));
+        let findings = findings_from_xenia_readiness(&assessments);
+        assert_eq!(findings.len(), 1);
+        assert_eq!(findings[0].severity, DoctorSeverity::Warning);
+        assert!(
+            findings[0]
+                .explanation
+                .contains("more than one native Xenia executable")
+        );
+    }
+
+    #[test]
+    fn unrelated_emulator_rows_are_unchanged_by_xemu_and_xenia_readiness() {
+        // Adding xemu/Xenia readiness must never alter another adapter's own
+        // writability finding shape or wording.
+        let tree = TempTree::new("unrelated-unchanged");
+        let ppsspp_root = tree.path().join("ppsspp");
+        fs::create_dir_all(ppsspp_root.join("PSP/SYSTEM")).unwrap();
+        fs::write(ppsspp_root.join("PSP/SYSTEM/ppsspp.ini"), b"[General]\n").unwrap();
+        let roots = roots_for_ppsspp_and_duckstation(tree.path(), &[], &[]);
+        let discovery = discover_ppsspp_profiles(&PpssppProfileDiscoveryRoots {
+            explicit_configuration_roots: vec![ppsspp_root.clone()],
+            ..roots.ppsspp
+        });
+        let discoveries = ProfileDiscoveries {
+            ppsspp: Some(&discovery),
+            ..ProfileDiscoveries::default()
+        };
+        let assessed = assess_emulator_profiles(&discoveries, None);
+        let findings = findings_from_emulator_profiles(&assessed);
+        assert_eq!(findings.len(), 1);
+        assert_eq!(findings[0].id, "emulator_profile.ppsspp_inspected");
+        assert_eq!(findings[0].category, DoctorCategory::EmulatorProfiles);
+        assert_eq!(findings[0].subsystem, DoctorSubsystem::EmulatorProfiles);
+    }
+
+    // -----------------------------------------------------------------
+    // PPSSPP / RPCS3 launch readiness
+    // -----------------------------------------------------------------
+    //
+    // Both `resolve_ppsspp_native_launch_binding` and
+    // `resolve_rpcs3_native_launch_binding` share the exact same PATH/
+    // global-env testing limitation already documented above for xemu:
+    // only a `$PATH`-discovered executable is ever classified `Native`,
+    // and `roots.explicit_executables` is deliberately classified
+    // `Explicit` instead. So, following the same precedent, finding-shape
+    // tests use hand-built assessments, and one real gatherer-wiring test
+    // per emulator proves the I/O-touching `assess_*` function itself
+    // reads real profile/firmware metadata and filters ineligible profiles
+    // correctly.
+
+    fn ppsspp_assessment(
+        executable: Option<&str>,
+        binding_problem: Option<&str>,
+    ) -> PpssppReadinessAssessment {
+        PpssppReadinessAssessment {
+            profile_id: "ppsspp-native".to_string(),
+            root_path: EncodedPath::from_path(Path::new("/home/user/.config/ppsspp")),
+            executable: executable.map(|path| EncodedPath::from_path(Path::new(path))),
+            binding_problem: binding_problem.map(str::to_string),
+        }
+    }
+
+    fn ppsspp_finding(assessment: PpssppReadinessAssessment) -> Finding {
+        let mut findings = findings_from_ppsspp_readiness(&[assessment]);
+        assert_eq!(findings.len(), 1);
+        findings.remove(0)
+    }
+
+    #[test]
+    fn ppsspp_ready_native_executable_is_reported_healthy() {
+        let finding = ppsspp_finding(ppsspp_assessment(
+            Some("/home/user/.config/ppsspp/ppsspp"),
+            None,
+        ));
+        assert_eq!(finding.severity, DoctorSeverity::Info);
+        assert_eq!(finding.id, "emulator_readiness.ppsspp");
+        assert_eq!(finding.title, "PPSSPP is ready to launch");
+        assert_eq!(
+            finding.measurements.get("ready"),
+            Some(&Measurement::Flag(true))
+        );
+        // No firmware/BIOS requirement is ever invented for PPSSPP: no
+        // firmware measurement exists, and the explanation never claims one
+        // is needed (it may only ever say the opposite - that none is
+        // required).
+        assert!(!finding.measurements.contains_key("firmware"));
+        assert!(
+            !finding
+                .explanation
+                .to_lowercase()
+                .contains("requires firmware")
+        );
+        assert!(
+            !finding
+                .explanation
+                .to_lowercase()
+                .contains("needs firmware")
+        );
+    }
+
+    #[test]
+    fn ppsspp_missing_executable_is_reported() {
+        let finding = ppsspp_finding(ppsspp_assessment(
+            None,
+            Some("no native PPSSPP executable was found in the profile"),
+        ));
+        assert_eq!(finding.severity, DoctorSeverity::Warning);
+        assert_eq!(finding.title, "PPSSPP is not ready to launch");
+        assert!(
+            finding
+                .explanation
+                .contains("no native PPSSPP executable was found")
+        );
+        assert_eq!(
+            finding.measurements.get("executable_found"),
+            Some(&Measurement::Flag(false))
+        );
+    }
+
+    #[test]
+    fn ppsspp_unsafe_executable_is_reported() {
+        let finding = ppsspp_finding(ppsspp_assessment(
+            None,
+            Some("the PPSSPP executable is a symlink or not a regular file"),
+        ));
+        assert_eq!(finding.severity, DoctorSeverity::Warning);
+        assert!(
+            finding
+                .explanation
+                .contains("symlink or not a regular file")
+        );
+    }
+
+    #[test]
+    fn ppsspp_non_executable_binary_is_reported() {
+        let finding = ppsspp_finding(ppsspp_assessment(
+            None,
+            Some("the PPSSPP executable does not have the execute permission set"),
+        ));
+        assert_eq!(finding.severity, DoctorSeverity::Warning);
+        assert!(
+            finding
+                .explanation
+                .contains("does not have the execute permission")
+        );
+    }
+
+    #[test]
+    fn ppsspp_ambiguous_executable_is_reported() {
+        let finding = ppsspp_finding(ppsspp_assessment(
+            None,
+            Some("more than one native PPSSPP executable was found and none is preferred"),
+        ));
+        assert_eq!(finding.severity, DoctorSeverity::Warning);
+        assert!(
+            finding
+                .explanation
+                .contains("more than one native PPSSPP executable")
+        );
+    }
+
+    /// Proves the real, I/O-touching gatherer: an ineligible profile
+    /// contributes no assessment at all, and an eligible one is genuinely
+    /// discovered - even though no `Native`-classified executable can be
+    /// placed here without touching `$PATH` (see this section's own doc
+    /// comment), which also proves "missing profile" and "unusable
+    /// profile" are represented honestly (no assessment at all) rather
+    /// than as a fabricated success.
+    #[test]
+    fn ppsspp_readiness_is_only_assessed_for_eligible_profiles() {
+        let tree = TempTree::new("ppsspp-gatherer");
+        let root = tree.path().join("config/ppsspp");
+        fs::create_dir_all(root.join("PSP/SYSTEM")).unwrap();
+        fs::write(root.join("PSP/SYSTEM/ppsspp.ini"), b"[General]\n").unwrap();
+        let discovery = discover_ppsspp_profiles(&PpssppProfileDiscoveryRoots {
+            home: tree.path().join("home"),
+            xdg_config_home: tree.path().join("config"),
+            xdg_data_home: tree.path().join("data-unused"),
+            explicit_configuration_roots: Vec::new(),
+            portable_configuration_roots: Vec::new(),
+            explicit_executables: Vec::new(),
+            known_version_outputs: std::collections::BTreeMap::new(),
+            appimage_directory: None,
+            path_override: Some(Vec::new()),
+        });
+        assert_eq!(discovery.profiles.len(), 1, "{discovery:?}");
+        assert!(discovery.profiles[0].eligible);
+        let assessments = assess_ppsspp_readiness(Some(&discovery));
+        assert_eq!(assessments.len(), 1);
+        // No `Native` executable is reachable here, so the binding is
+        // genuinely absent - the gatherer reports that honestly.
+        assert!(assessments[0].executable.is_none());
+        assert!(assessments[0].binding_problem.is_some());
+
+        // No discovery at all (e.g. a missing/unreadable profile root
+        // upstream) is represented as no assessments, never fabricated.
+        assert!(assess_ppsspp_readiness(None).is_empty());
+
+        // An ineligible profile (no PSP/SYSTEM/ppsspp.ini evidence)
+        // contributes nothing here either - it is already covered by the
+        // generic writability finding's own "adapter blocker" evidence.
+        let ineligible_root = tree.path().join("config-ineligible/ppsspp");
+        fs::create_dir_all(&ineligible_root).unwrap();
+        let ineligible_discovery = discover_ppsspp_profiles(&PpssppProfileDiscoveryRoots {
+            home: tree.path().join("home"),
+            xdg_config_home: tree.path().join("config-ineligible"),
+            xdg_data_home: tree.path().join("data-unused-2"),
+            explicit_configuration_roots: Vec::new(),
+            portable_configuration_roots: Vec::new(),
+            explicit_executables: Vec::new(),
+            known_version_outputs: std::collections::BTreeMap::new(),
+            appimage_directory: None,
+            path_override: Some(Vec::new()),
+        });
+        assert_eq!(ineligible_discovery.profiles.len(), 1);
+        assert!(!ineligible_discovery.profiles[0].eligible);
+        assert!(assess_ppsspp_readiness(Some(&ineligible_discovery)).is_empty());
+    }
+
+    fn healthy_rpcs3_firmware() -> Rpcs3FirmwareStatus {
+        Rpcs3FirmwareStatus::Present(None)
+    }
+
+    fn rpcs3_assessment(
+        executable: Option<&str>,
+        binding_problem: Option<&str>,
+        firmware: Rpcs3FirmwareStatus,
+    ) -> Rpcs3ReadinessAssessment {
+        Rpcs3ReadinessAssessment {
+            profile_id: "rpcs3-native".to_string(),
+            root_path: EncodedPath::from_path(Path::new("/home/user/.config/rpcs3")),
+            executable: executable.map(|path| EncodedPath::from_path(Path::new(path))),
+            binding_problem: binding_problem.map(str::to_string),
+            firmware: rpcs3_firmware_readiness(&firmware),
+        }
+    }
+
+    fn rpcs3_finding(assessment: Rpcs3ReadinessAssessment) -> Finding {
+        let mut findings = findings_from_rpcs3_readiness(&[assessment]);
+        assert_eq!(findings.len(), 1);
+        findings.remove(0)
+    }
+
+    #[test]
+    fn rpcs3_fully_ready_state_is_reported_healthy() {
+        let finding = rpcs3_finding(rpcs3_assessment(
+            Some("/home/user/.config/rpcs3/rpcs3"),
+            None,
+            healthy_rpcs3_firmware(),
+        ));
+        assert_eq!(finding.severity, DoctorSeverity::Info);
+        assert_eq!(finding.id, "emulator_readiness.rpcs3");
+        assert_eq!(finding.title, "RPCS3 is ready to launch");
+        assert_eq!(
+            finding.measurements.get("ready"),
+            Some(&Measurement::Flag(true))
+        );
+        assert_eq!(
+            finding.measurements.get("firmware"),
+            Some(&Measurement::text("present (not hash-verified)"))
+        );
+    }
+
+    /// The deliberate current RPCS3 semantics this task must preserve:
+    /// `PresentUnverified` firmware is a real, launchable state under the
+    /// execution layer's own accepted policy
+    /// (`preflight_rpcs3_launch` accepts `ReadyWithWarnings`), so Doctor
+    /// must report this as ready - with an honest caveat in the wording,
+    /// never as fully blocked.
+    #[test]
+    fn rpcs3_present_unverified_firmware_is_ready_with_a_caveat_not_blocked() {
+        let finding = rpcs3_finding(rpcs3_assessment(
+            Some("/home/user/.config/rpcs3/rpcs3"),
+            None,
+            Rpcs3FirmwareStatus::Present(Some("1.0.0".to_string())),
+        ));
+        assert_eq!(
+            finding.severity,
+            DoctorSeverity::Info,
+            "PresentUnverified firmware must never read as blocked"
+        );
+        assert_eq!(finding.title, "RPCS3 is ready to launch");
+        assert_eq!(
+            finding.measurements.get("ready"),
+            Some(&Measurement::Flag(true))
+        );
+        assert!(finding.explanation.contains("never hash-verifies"));
+    }
+
+    #[test]
+    fn rpcs3_missing_firmware_is_reported_as_not_ready() {
+        let finding = rpcs3_finding(rpcs3_assessment(
+            Some("/home/user/.config/rpcs3/rpcs3"),
+            None,
+            Rpcs3FirmwareStatus::Missing,
+        ));
+        assert_eq!(finding.severity, DoctorSeverity::Warning);
+        assert_eq!(finding.title, "RPCS3 is not ready to launch");
+        assert_eq!(
+            finding.measurements.get("ready"),
+            Some(&Measurement::Flag(false))
+        );
+        assert_eq!(
+            finding.measurements.get("firmware"),
+            Some(&Measurement::text("missing"))
+        );
+        assert!(finding.explanation.contains("Firmware is missing"));
+    }
+
+    /// Firmware whose state could not be determined must never be
+    /// confidently reported as "missing" - that would invent certainty the
+    /// read-only check does not have - but it must also never be reported
+    /// as ready, matching `build_rpcs3_command_plan`'s own
+    /// `FirmwareReadiness::Unknown` gate.
+    #[test]
+    fn rpcs3_unknown_firmware_uses_correct_current_policy() {
+        let finding = rpcs3_finding(rpcs3_assessment(
+            Some("/home/user/.config/rpcs3/rpcs3"),
+            None,
+            Rpcs3FirmwareStatus::Unknown,
+        ));
+        assert_eq!(finding.severity, DoctorSeverity::Warning);
+        assert_eq!(finding.title, "RPCS3 is not ready to launch");
+        assert_eq!(
+            finding.measurements.get("ready"),
+            Some(&Measurement::Flag(false))
+        );
+        assert_eq!(
+            finding.measurements.get("firmware"),
+            Some(&Measurement::text("could not be determined"))
+        );
+        assert!(!finding.explanation.to_lowercase().contains("missing"));
+        assert!(finding.explanation.contains("could not be determined"));
+    }
+
+    #[test]
+    fn rpcs3_missing_executable_is_reported() {
+        let finding = rpcs3_finding(rpcs3_assessment(
+            None,
+            Some("no native RPCS3 executable was found in the profile"),
+            healthy_rpcs3_firmware(),
+        ));
+        assert_eq!(finding.severity, DoctorSeverity::Warning);
+        assert!(
+            finding
+                .explanation
+                .contains("no native RPCS3 executable was found")
+        );
+        assert_eq!(
+            finding.measurements.get("executable_found"),
+            Some(&Measurement::Flag(false))
+        );
+    }
+
+    #[test]
+    fn rpcs3_unsafe_executable_is_reported() {
+        let finding = rpcs3_finding(rpcs3_assessment(
+            None,
+            Some("the RPCS3 executable is a symlink or not a regular file"),
+            healthy_rpcs3_firmware(),
+        ));
+        assert_eq!(finding.severity, DoctorSeverity::Warning);
+        assert!(
+            finding
+                .explanation
+                .contains("symlink or not a regular file")
+        );
+    }
+
+    #[test]
+    fn rpcs3_non_executable_binary_is_reported() {
+        let finding = rpcs3_finding(rpcs3_assessment(
+            None,
+            Some("the RPCS3 executable does not have the execute permission set"),
+            healthy_rpcs3_firmware(),
+        ));
+        assert_eq!(finding.severity, DoctorSeverity::Warning);
+        assert!(
+            finding
+                .explanation
+                .contains("does not have the execute permission")
+        );
+    }
+
+    #[test]
+    fn rpcs3_ambiguous_executable_is_reported() {
+        let finding = rpcs3_finding(rpcs3_assessment(
+            None,
+            Some("more than one native RPCS3 executable was found and none is preferred"),
+            healthy_rpcs3_firmware(),
+        ));
+        assert_eq!(finding.severity, DoctorSeverity::Warning);
+        assert!(
+            finding
+                .explanation
+                .contains("more than one native RPCS3 executable")
+        );
+    }
+
+    /// Proves the real, I/O-touching gatherer: an eligible profile is
+    /// genuinely discovered and its real `dev_flash` firmware metadata is
+    /// genuinely read, even though no `Native`-classified executable can be
+    /// placed here without touching `$PATH`. Also proves "missing/ambiguous
+    /// profile" is represented as no assessment at all, never fabricated.
+    #[test]
+    fn rpcs3_readiness_is_only_assessed_for_eligible_profiles() {
+        let tree = TempTree::new("rpcs3-gatherer");
+        let root = tree.path().join("config/rpcs3");
+        fs::create_dir_all(root.join("dev_flash/vsh/module")).unwrap();
+        write_executable(&root.join("dev_flash/vsh/module/vsh.self"), b"self");
+        fs::write(root.join("config.yml"), b"---\n").unwrap();
+        let discovery = discover_rpcs3_profiles(&Rpcs3ProfileDiscoveryRoots {
+            home: tree.path().join("home"),
+            xdg_config_home: tree.path().join("config"),
+            xdg_data_home: tree.path().join("data-unused"),
+            explicit_configuration_roots: Vec::new(),
+            portable_configuration_roots: Vec::new(),
+            explicit_executables: Vec::new(),
+            known_version_outputs: std::collections::BTreeMap::new(),
+            appimage_directory: None,
+            selected_executable: None,
+            path_override: Some(Vec::new()),
+        });
+        assert_eq!(discovery.profiles.len(), 1, "{discovery:?}");
+        assert!(discovery.profiles[0].eligible);
+        let assessments = assess_rpcs3_readiness(Some(&discovery));
+        assert_eq!(assessments.len(), 1);
+        assert_eq!(
+            assessments[0].firmware,
+            FirmwareReadiness::PresentUnverified
+        );
+        // No `Native` executable is reachable here, so the binding is
+        // genuinely absent - the gatherer reports that honestly.
+        assert!(assessments[0].executable.is_none());
+        assert!(assessments[0].binding_problem.is_some());
+
+        assert!(assess_rpcs3_readiness(None).is_empty());
+    }
+
+    #[test]
+    fn unrelated_emulator_rows_are_unchanged_by_ppsspp_and_rpcs3_readiness() {
+        // Adding PPSSPP/RPCS3 readiness must never alter another adapter's
+        // own writability finding shape or wording.
+        let tree = TempTree::new("unrelated-unchanged-ppsspp-rpcs3");
+        let duckstation_root = tree.path().join("duckstation");
+        fs::create_dir_all(&duckstation_root).unwrap();
+        fs::write(duckstation_root.join("settings.ini"), b"[Main]\n").unwrap();
+        let roots = roots_for_ppsspp_and_duckstation(tree.path(), &[], &[]);
+        let discovery = discover_duckstation_profiles(&DuckStationProfileDiscoveryRoots {
+            explicit_configuration_roots: vec![duckstation_root.clone()],
+            ..roots.duckstation
+        });
+        let discoveries = ProfileDiscoveries {
+            duckstation: Some(&discovery),
+            ..ProfileDiscoveries::default()
+        };
+        let assessed = assess_emulator_profiles(&discoveries, None);
+        let findings = findings_from_emulator_profiles(&assessed);
+        assert_eq!(findings.len(), 1);
+        assert_eq!(findings[0].id, "emulator_profile.duckstation_inspected");
+        assert_eq!(findings[0].category, DoctorCategory::EmulatorProfiles);
+        assert_eq!(findings[0].subsystem, DoctorSubsystem::EmulatorProfiles);
+    }
+
+    #[test]
+    fn shadps4_discovery_is_bounded_and_reports_missing_installations() {
+        let missing = TempTree::new("shadps4-missing");
+        assert!(discover_shadps4_installations(missing.path()).is_empty());
+
+        let installed = TempTree::new("shadps4-installed");
+        let native = installed.path().join("Applications/shadPS4/shadps4");
+        let launcher = installed
+            .path()
+            .join("Applications/shadPS4/QtLauncher/shadPS4QtLauncher-qt.AppImage");
+        fs::create_dir_all(native.parent().unwrap()).unwrap();
+        fs::create_dir_all(launcher.parent().unwrap()).unwrap();
+        fs::write(&native, b"ELF fixture").unwrap();
+        fs::write(&launcher, b"AppImage fixture").unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            fs::set_permissions(&native, fs::Permissions::from_mode(0o755)).unwrap();
+            fs::set_permissions(&launcher, fs::Permissions::from_mode(0o755)).unwrap();
+        }
+        let found = discover_shadps4_installations(installed.path());
+        assert_eq!(found.len(), 2);
+        assert!(found.iter().all(|item| item.emulator == "shadPS4"));
+        assert!(found.iter().any(|item| item.installation_form == "Native"));
+        assert!(
+            found
+                .iter()
+                .any(|item| item.installation_form == "Qt launcher")
+        );
+    }
+
+    /// Lays out a successful EmuWiz-managed AppImage install for `id` under
+    /// a temp `home`: `<home>/.local/share/emuwiz/emulators/<id>/<binary>`
+    /// (executable) plus an `install.json` provenance marker.
+    fn managed_install(home: &Path, id: &str) -> PathBuf {
+        let spec = crate::emulator_download::emulator_download_spec(id).unwrap();
+        let directory = home.join(".local/share/emuwiz/emulators").join(spec.id);
+        fs::create_dir_all(&directory).unwrap();
+        let binary = directory.join(spec.installed_binary);
+        fs::write(&binary, b"\x7fELF managed fixture").unwrap();
+        fs::write(directory.join("install.json"), b"{\"emulator\":\"x\"}").unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            fs::set_permissions(&binary, fs::Permissions::from_mode(0o755)).unwrap();
+        }
+        binary
+    }
+
+    #[test]
+    fn managed_appimage_is_discovered_after_install() {
+        let home = TempTree::new("profiles-managed-found");
+        let binary = managed_install(home.path(), "pcsx2");
+        let evidence = discover_managed_emulator_installations(home.path());
+        let pcsx2 = evidence
+            .iter()
+            .find(|item| item.emulator == "PCSX2")
+            .expect("managed PCSX2 discovered");
+        assert_eq!(pcsx2.installation_form, "EmuWiz-managed AppImage");
+        assert_eq!(
+            pcsx2.executable.as_ref().map(|path| path.display.clone()),
+            Some(binary.to_string_lossy().to_string())
+        );
+    }
+
+    #[test]
+    fn missing_managed_binary_and_missing_provenance_are_not_discovered() {
+        let home = TempTree::new("profiles-managed-missing");
+        // Nothing installed at all.
+        assert!(discover_managed_emulator_installations(home.path()).is_empty());
+
+        // Binary present but no install.json provenance marker.
+        let spec = crate::emulator_download::emulator_download_spec("rpcs3").unwrap();
+        let directory = home
+            .path()
+            .join(".local/share/emuwiz/emulators")
+            .join(spec.id);
+        fs::create_dir_all(&directory).unwrap();
+        fs::write(directory.join(spec.installed_binary), b"\x7fELF").unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            fs::set_permissions(
+                directory.join(spec.installed_binary),
+                fs::Permissions::from_mode(0o755),
+            )
+            .unwrap();
+        }
+        assert!(discover_managed_emulator_installations(home.path()).is_empty());
+    }
+
+    #[test]
+    fn non_regular_managed_binary_path_is_rejected() {
+        let home = TempTree::new("profiles-managed-nonregular");
+        let spec = crate::emulator_download::emulator_download_spec("ppsspp").unwrap();
+        let directory = home
+            .path()
+            .join(".local/share/emuwiz/emulators")
+            .join(spec.id);
+        fs::create_dir_all(&directory).unwrap();
+        fs::write(directory.join("install.json"), b"{}").unwrap();
+        // The "binary" is actually a directory - never treated as an install.
+        fs::create_dir(directory.join(spec.installed_binary)).unwrap();
+        assert!(discover_managed_emulator_installations(home.path()).is_empty());
+    }
+
+    #[test]
+    fn manual_lane_emulator_never_reports_a_managed_install() {
+        let home = TempTree::new("profiles-managed-manual");
+        // Even with a provenance marker + executable laid out by hand, a
+        // Manual-distribution emulator (shadPS4) is not in the automated
+        // lane and is never reported as EmuWiz-managed.
+        let directory = home.path().join(".local/share/emuwiz/emulators/shadps4");
+        fs::create_dir_all(&directory).unwrap();
+        fs::write(directory.join("install.json"), b"{}").unwrap();
+        fs::write(directory.join("shadps4"), b"\x7fELF").unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            fs::set_permissions(directory.join("shadps4"), fs::Permissions::from_mode(0o755))
+                .unwrap();
+        }
+        assert!(
+            discover_managed_emulator_installations(home.path())
+                .iter()
+                .all(|item| item.emulator != "shadPS4")
+        );
+    }
+
+    // --- managed_appimage_executable_for: the launch-trust extraction ------
+
+    fn evidence(
+        emulator: &str,
+        installation_form: &str,
+        executable: Option<&str>,
+    ) -> LinuxEmulatorInstallationEvidence {
+        LinuxEmulatorInstallationEvidence {
+            emulator: emulator.to_string(),
+            installation_form: installation_form.to_string(),
+            executable: executable.map(|path| EncodedPath::from_path(Path::new(path))),
+            profile: None,
+            detail: String::new(),
+        }
+    }
+
+    #[test]
+    fn managed_appimage_executable_is_returned_for_the_matching_emulator_only() {
+        let installs = [
+            evidence(
+                "PPSSPP",
+                MANAGED_APPIMAGE_INSTALLATION_FORM,
+                Some("/data/emuwiz/emulators/ppsspp/ppsspp.AppImage"),
+            ),
+            evidence(
+                "PCSX2",
+                MANAGED_APPIMAGE_INSTALLATION_FORM,
+                Some("/data/emuwiz/emulators/pcsx2/pcsx2.AppImage"),
+            ),
+        ];
+        assert_eq!(
+            managed_appimage_executable_for(&installs, "PPSSPP"),
+            Some(PathBuf::from(
+                "/data/emuwiz/emulators/ppsspp/ppsspp.AppImage"
+            )),
+        );
+        assert_eq!(
+            managed_appimage_executable_for(&installs, "PCSX2"),
+            Some(PathBuf::from("/data/emuwiz/emulators/pcsx2/pcsx2.AppImage")),
+        );
+        assert_eq!(managed_appimage_executable_for(&installs, "Dolphin"), None);
+    }
+
+    #[test]
+    fn only_the_managed_installation_form_is_a_launch_trust_source() {
+        for form in [
+            "AppImage", // fixed ~/Applications path, no install.json
+            "Flatpak (user installation)",
+            "Native/PATH",
+            "AppImage/config evidence",
+        ] {
+            let installs = [evidence("PPSSPP", form, Some("/somewhere/PPSSPP.AppImage"))];
+            assert_eq!(
+                managed_appimage_executable_for(&installs, "PPSSPP"),
+                None,
+                "{form} must never be promoted to a trusted explicit executable"
+            );
+        }
+    }
+
+    #[test]
+    fn no_managed_install_leaves_the_result_empty() {
+        assert_eq!(managed_appimage_executable_for(&[], "PPSSPP"), None);
+    }
+
+    #[test]
+    fn ambiguous_multiple_managed_installs_are_refused_deterministically() {
+        let installs = [
+            evidence(
+                "PPSSPP",
+                MANAGED_APPIMAGE_INSTALLATION_FORM,
+                Some("/a/ppsspp.AppImage"),
+            ),
+            evidence(
+                "PPSSPP",
+                MANAGED_APPIMAGE_INSTALLATION_FORM,
+                Some("/b/ppsspp.AppImage"),
+            ),
+        ];
+        assert_eq!(managed_appimage_executable_for(&installs, "PPSSPP"), None);
+    }
+
+    #[test]
+    fn a_lossy_recorded_path_is_not_reconstructed() {
+        let mut item = evidence("PPSSPP", MANAGED_APPIMAGE_INSTALLATION_FORM, Some("/x"));
+        item.executable = Some(EncodedPath {
+            display: "/x/ppsspp.AppImage".to_string(),
+            lossy: true,
+        });
+        assert_eq!(managed_appimage_executable_for(&[item], "PPSSPP"), None);
+    }
+
+    #[test]
+    fn a_real_managed_install_flows_through_the_extractor() {
+        let home = TempTree::new("profiles-managed-extract");
+        let binary = managed_install(home.path(), "ppsspp");
+        let installs = discover_managed_emulator_installations(home.path());
+        assert_eq!(
+            managed_appimage_executable_for(&installs, "PPSSPP"),
+            Some(binary),
+        );
+    }
+
+    #[test]
+    fn discover_managed_appimage_installations_is_a_bounded_managed_only_slice() {
+        // Even with a full `~/Applications/PPSSPP/PPSSPP.AppImage` laid out,
+        // the managed-only slice reports only the `install.json`-backed one.
+        let home = TempTree::new("profiles-managed-slice");
+        let apps = home.path().join("Applications/PPSSPP");
+        fs::create_dir_all(&apps).unwrap();
+        let plain = apps.join("PPSSPP.AppImage");
+        fs::write(&plain, b"\x7fELF").unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            fs::set_permissions(&plain, fs::Permissions::from_mode(0o755)).unwrap();
+        }
+        let binary = managed_install(home.path(), "ppsspp");
+
+        // `discover_managed_appimage_installations` reads `$HOME`; drive it
+        // deterministically through the private helper it delegates to.
+        let slice = discover_managed_emulator_installations(home.path());
+        assert!(
+            slice
+                .iter()
+                .all(|item| item.installation_form == MANAGED_APPIMAGE_INSTALLATION_FORM)
+        );
+        assert_eq!(
+            managed_appimage_executable_for(&slice, "PPSSPP"),
+            Some(binary),
+        );
+    }
+
+    /// A GUI-supplied executable override reaches PCSX2 discovery as one
+    /// more real candidate, additive to whatever automatic discovery finds
+    /// This is exactly the "no readiness-authority bypass" requirement from
+    /// the 0.8.2 UX pass task: this is the same `explicit_executables`
+    /// channel managed-AppImage installs already use, not a new one.
+    #[test]
+    fn pcsx2_executable_override_is_folded_into_discovery() {
+        let dir = TempTree::new("pcsx2-override-fixture");
+        let executable = dir.path().join("pcsx2-qt");
+        fs::write(&executable, b"#!/bin/sh\n").unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            fs::set_permissions(&executable, fs::Permissions::from_mode(0o755)).unwrap();
+        }
+
+        // The override attaches to a PCSX2 profile discovery found. That used
+        // to be whatever PCSX2 profile the machine running the test happened
+        // to have, so the test failed anywhere PCSX2 was not configured.
+        // Create one in the private test home instead.
+        let home = crate::test_environment::private_home_for_fixtures();
+        fs::create_dir_all(home.join(".config/PCSX2/inis")).unwrap();
+        fs::write(home.join(".config/PCSX2/inis/PCSX2.ini"), "[UI]\n").unwrap();
+
+        let overrides = DiscoveredProfilesOverrides {
+            pcsx2_executable: Some(executable.clone()),
+            ..Default::default()
+        };
+        let discovered =
+            DiscoveredProfiles::from_environment_with_overrides(Vec::new(), &overrides);
+        let discovery = discovered.pcsx2.expect("PCSX2 discovery must succeed");
+        assert!(
+            discovery.profiles.iter().any(|profile| profile
+                .executable_candidates
+                .iter()
+                .any(|candidate| candidate.path == executable)),
+            "the overridden executable must appear as a candidate on at least one profile"
+        );
+
+        // Without the override, that exact temp path is never a candidate -
+        // proving the override is additive, not something automatic
+        // discovery would have found on its own.
+        let without_override = DiscoveredProfiles::from_environment(Vec::new());
+        let discovery_without = without_override
+            .pcsx2
+            .expect("PCSX2 discovery must succeed");
+        assert!(!discovery_without.profiles.iter().any(|profile| {
+            profile
+                .executable_candidates
+                .iter()
+                .any(|candidate| candidate.path == executable)
+        }),);
+    }
+
+    #[test]
+    fn azahar_doctor_projection_never_overstates_incomplete_configuration() {
+        let entries = findings_from_azahar_cemu_readiness(&[AzaharCemuReadiness {
+            adapter: "Azahar".into(),
+            executable: None,
+            version: None,
+            profile: None,
+            ready: false,
+            blockers: vec!["Azahar configuration unreadable".into()],
+            evidence: Vec::new(),
+            remediation: "Repair the configuration.".into(),
+        }]);
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].severity, DoctorSeverity::Warning);
+        assert!(entries[0].title.contains("needs setup"));
+        assert!(entries[0].explanation.contains("unreadable"));
+    }
+
+    #[test]
+    fn cemu_doctor_projection_keeps_keys_conditional_and_mlc_visible() {
+        let entries = findings_from_azahar_cemu_readiness(&[AzaharCemuReadiness {
+            adapter: "Cemu".into(),
+            executable: None,
+            version: Some("2.0".into()),
+            profile: None,
+            ready: false,
+            blockers: vec!["Cemu MLC is missing".into()],
+            evidence: vec!["Keys: not configured; some titles may require it".into()],
+            remediation: "Configure the MLC.".into(),
+        }]);
+        assert_eq!(entries.len(), 1);
+        assert!(entries[0].explanation.contains("MLC"));
+        assert!(
+            entries[0]
+                .evidence
+                .iter()
+                .any(|line| line.contains("some titles may require it"))
         );
     }
 }

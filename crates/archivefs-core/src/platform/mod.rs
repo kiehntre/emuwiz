@@ -51,6 +51,33 @@ pub use identity::{
     PlatformIdentitySource, resolve_platform_identity,
 };
 
+/// How confidently one [`MagicRule`] identifies its platform on its own.
+///
+/// This is a property of the *rule*, reviewed once by a person against what
+/// is actually known about the signature - never inferred from how many
+/// platforms in the current registry happen to declare a matching rule.
+/// Registry coverage is incomplete, so the absence of a second platform
+/// declaring the same bytes does not prove the bytes are unique to this one:
+/// Sega 32X cartridges carry the identical `SEGA` header Mega Drive checks at
+/// offset `0x100`, but 32X has no registered [`MagicRule`] of its own yet, so
+/// counting *currently matching platforms* would wrongly call that header
+/// Mega-Drive-unique. Declared weakest first so [`Ord`] gives the more
+/// confident value when more than one of a platform's rules matches the same
+/// bytes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub enum MagicConfidence {
+    /// Real evidence, but the signature is either known to be shared with
+    /// another registered platform, or is a base-hardware/family convention
+    /// a closely related platform not yet in this registry plausibly shares
+    /// too. Never treated as authority on its own.
+    Corroborated,
+    /// The signature's own semantics are genuinely, specifically tied to one
+    /// platform - a literal platform name, a documented format-specific magic
+    /// number, or a boot-sector string with no known collision - reviewed and
+    /// found distinctive, not merely unmatched by anything else today.
+    Strong,
+}
+
 /// One bounded, read-only signature check.
 ///
 /// `offset` is an absolute byte offset. Reads are always exactly
@@ -63,6 +90,9 @@ pub struct MagicRule {
     pub bytes: &'static [u8],
     /// Why this signature means what it means, in a person's words.
     pub description: &'static str,
+    /// How confidently this specific signature identifies its platform.
+    /// Reviewed per rule - see [`MagicConfidence`].
+    pub confidence: MagicConfidence,
 }
 
 /// Evidence that comes from a game being a *directory of files* rather than a
@@ -116,6 +146,17 @@ impl Platform {
     /// Whether `extension` is shared evidence that may only narrow a result.
     pub fn has_weak_extension(&self, extension: &str) -> bool {
         self.weak_extensions.contains(&extension)
+    }
+
+    /// Whether `extension` (lowercased, no dot) is valid evidence for this
+    /// platform at all - strong or weak, it makes no difference here. This
+    /// is deliberately the platform registry's own answer to "is this
+    /// extension plausible for this platform", so callers outside this
+    /// module (e.g. gating a `DirectGameImage`'s platform assignment) never
+    /// need to duplicate or re-derive `strong_extensions`/`weak_extensions`
+    /// knowledge themselves.
+    pub fn accepts_extension(&self, extension: &str) -> bool {
+        self.has_strong_extension(extension) || self.has_weak_extension(extension)
     }
 
     /// How much this platform's own evidence is worth relative to others.
@@ -198,6 +239,37 @@ pub fn normalize_alias(value: &str) -> String {
         .collect()
 }
 
+/// Fixed, conservative suffixes MAME software-list DAT names carry after the
+/// machine's base short name - `c128_flop`, `c128_cart`, `c128_cass`,
+/// `c128_rom`, `megacd_cd`.
+///
+/// This is an explicit allowlist and nothing more. It is deliberately *not* a
+/// generic "strip the final underscore-delimited token" rule: a suffix this
+/// build does not recognise might be part of the machine's real short name
+/// rather than a media-kind marker, so an unlisted suffix is left exactly as
+/// it is rather than guessed at.
+pub const MAME_SOFTWARE_LIST_SUFFIXES: &[&str] =
+    &["_flop", "_cart", "_cass", "_rom", "_cd", "_disk"];
+
+/// Strips one known MAME software-list suffix from `name`, if `name` ends in
+/// one from [`MAME_SOFTWARE_LIST_SUFFIXES`] and something is left over.
+///
+/// Returns `name` unchanged when no listed suffix matches - including when a
+/// suffix matches but stripping it would leave nothing (`"_cart"` alone stays
+/// `"_cart"`, not empty). The returned base is a plain string slice, not yet
+/// normalised: callers still run it through [`normalize_alias`] and
+/// [`platform_for_alias`] like any other hint.
+pub fn strip_mame_software_list_suffix(name: &str) -> &str {
+    for suffix in MAME_SOFTWARE_LIST_SUFFIXES {
+        if let Some(base) = name.strip_suffix(suffix)
+            && !base.is_empty()
+        {
+            return base;
+        }
+    }
+    name
+}
+
 /// The platform whose descriptor carries `id`, if any.
 pub fn platform_by_id(id: &str) -> Option<&'static Platform> {
     PLATFORMS.iter().find(|platform| platform.id == id)
@@ -239,6 +311,109 @@ pub fn platforms_with_weak_extension(extension: &str) -> Vec<&'static Platform> 
         .collect()
 }
 
+/// Every canonical platform id that treats `extension` as valid evidence at
+/// all - the union of [`platforms_with_strong_extension`] and
+/// [`platforms_with_weak_extension`], sorted and deduplicated so the result
+/// is stable regardless of registry iteration order.
+///
+/// This is a *candidate* list, never an answer: many real extensions
+/// (`.bin`, `.cue`, `.d64`) are valid for a dozen platforms at once, and that
+/// breadth is the whole point of returning every one of them rather than
+/// picking a winner. An extension no platform in [`PLATFORMS`] declares
+/// returns an empty list. `extension` may be given with or without a leading
+/// dot and in any case; both are normalised the same way
+/// [`extension_of`] already normalises a path's extension, so a caller never
+/// needs to pre-clean its input.
+pub fn platform_candidates_for_extension(extension: &str) -> Vec<&'static str> {
+    let normalized = extension.trim_start_matches('.').to_ascii_lowercase();
+    let mut ids: Vec<&'static str> = platforms_with_strong_extension(&normalized)
+        .into_iter()
+        .chain(platforms_with_weak_extension(&normalized))
+        .map(|platform| platform.id)
+        .collect();
+    ids.sort_unstable();
+    ids.dedup();
+    ids
+}
+
+/// Every canonical platform id whose registered [`MagicRule`] matches `data`.
+///
+/// Pure: `data` is a byte slice already held in memory, indexed as if it were
+/// the start of a file (`data[0]` is offset `0`). No file is opened, no path
+/// is resolved, and no symlink policy is consulted - that I/O-bound,
+/// bounded-read, symlink-safe variant of the same rules already exists as
+/// [`detect::detect_platform_report`] for a caller that has a real path. This
+/// is for a caller that already holds the bytes (or, in a test, invented
+/// them) and wants the same canonical signatures applied without any I/O of
+/// its own.
+///
+/// A rule whose offset and length would run past the end of `data` simply
+/// does not match, exactly as a short real file would not match it either.
+/// Multiple matching platforms are returned in full - this never picks a
+/// winner - sorted and deduplicated so the result is stable regardless of
+/// [`PLATFORMS`] iteration order. Bytes nothing in the registry recognises
+/// return an empty list.
+pub fn platform_candidates_from_bytes(data: &[u8]) -> Vec<&'static str> {
+    let mut ids: Vec<&'static str> = PLATFORMS
+        .iter()
+        .filter(|platform| {
+            platform
+                .magic
+                .iter()
+                .any(|rule| magic_rule_matches(rule, data))
+        })
+        .map(|platform| platform.id)
+        .collect();
+    ids.sort_unstable();
+    ids.dedup();
+    ids
+}
+
+/// Every canonical platform id whose registered [`MagicRule`] matches
+/// `data`, paired with the reviewed [`MagicConfidence`] of the best rule that
+/// matched it.
+///
+/// Distinct from [`platform_candidates_from_bytes`], which stays a plain,
+/// confidence-free candidate list: this is for a caller that needs to know
+/// how much a *specific* matching signature is actually worth, per the
+/// judgement already recorded on that rule - never inferred from how many
+/// platforms this buffer happened to match. A platform whose several rules
+/// disagree on confidence for the same buffer (not currently possible in
+/// this registry, but not structurally forbidden either) is reported at its
+/// best matching rule's confidence, never its worst.
+///
+/// Sorted by platform id and deduplicated, so the result is stable
+/// regardless of [`PLATFORMS`] iteration order. Bytes nothing in the
+/// registry recognises return an empty list.
+pub fn platform_magic_confidence_from_bytes(data: &[u8]) -> Vec<(&'static str, MagicConfidence)> {
+    let mut matches: Vec<(&'static str, MagicConfidence)> = PLATFORMS
+        .iter()
+        .filter_map(|platform| {
+            platform
+                .magic
+                .iter()
+                .filter(|rule| magic_rule_matches(rule, data))
+                .map(|rule| rule.confidence)
+                .max()
+                .map(|confidence| (platform.id, confidence))
+        })
+        .collect();
+    matches.sort_by(|left, right| left.0.cmp(right.0));
+    matches
+}
+
+/// Whether `data`, read as bytes from the start of a file, carries `rule`'s
+/// signature at its offset. This is the same equality [`detect`]'s
+/// bounded-read signature check performs on the exact bytes it reads at
+/// `rule.offset`; here the comparison is against an in-memory slice instead
+/// of a fresh bounded read, so the same [`MagicRule`] table is the only thing
+/// shared between the two, never a second copy of it.
+fn magic_rule_matches(rule: &MagicRule, data: &[u8]) -> bool {
+    data.get(rule.offset as usize..)
+        .and_then(|rest| rest.get(..rule.bytes.len()))
+        == Some(rule.bytes)
+}
+
 /// The lowercased extension of `path` without its dot, if it has one.
 pub fn extension_of(path: &Path) -> Option<String> {
     path.extension()
@@ -259,6 +434,39 @@ pub fn canonical_ids() -> Vec<&'static str> {
 /// by an older or newer build, which must still display as something).
 pub fn display_name_for(id: &str) -> &str {
     platform_by_id(id).map_or(id, |platform| platform.display_name)
+}
+
+/// Whether `name` can be a single safe filesystem folder component: one
+/// non-empty, non-control path segment that names the folder itself rather
+/// than something else. This is deliberately local to the registry so the
+/// platform layer never depends on the DAT layer's identical rule.
+fn is_safe_layout_folder(name: &str) -> bool {
+    !name.is_empty()
+        && name.len() <= 255
+        && !name.contains(['/', '\\', '\0'])
+        && name != "."
+        && name != ".."
+        && name.trim() == name
+        && !name.chars().any(char::is_control)
+}
+
+/// The neutral EmuWiz layout folder for a canonical platform: the display
+/// name exactly as the registry spells it (`"Atari 2600"`, `"Amiga"`),
+/// falling back to the canonical id when a display name would not be a safe
+/// single component, and `None` only when neither is (a registry defect).
+///
+/// This is generic organisation's own identity - stable, deterministic and
+/// independent of any frontend mapping. RomM slugs remain authority only for
+/// the explicit RomM-specific frontend-layout workflows.
+pub fn canonical_layout_folder(platform_id: &str) -> Option<String> {
+    let platform = platform_by_id(platform_id)?;
+    if is_safe_layout_folder(platform.display_name) {
+        return Some(platform.display_name.to_string());
+    }
+    if is_safe_layout_folder(platform.id) {
+        return Some(platform.id.to_string());
+    }
+    None
 }
 
 /// The registry. Sorted by display name so iteration order is stable and
@@ -334,6 +542,7 @@ pub const PLATFORMS: &[Platform] = &[
         folder_aliases: &[
             "amstrad",
             "amstradcpc",
+            "acpc", // Reviewed RomM slug for this existing canonical platform.
             "cpc",
             "cpc464",
             "cpc6128",
@@ -341,9 +550,14 @@ pub const PLATFORMS: &[Platform] = &[
             "amstradcpc6128",
         ],
         filename_aliases: &[],
-        strong_extensions: &["cdt"],
-        weak_extensions: &["dsk", "sna", "tap", "voc"],
-        magic: &[],
+        strong_extensions: &[],
+        weak_extensions: &["cdt", "dsk", "sna", "tap", "tzx"],
+        magic: &[MagicRule {
+            offset: 0,
+            bytes: b"ZXTape!\x1a",
+            description: "TZX/CDT tape containers begin with the literal `ZXTape!` signature",
+            confidence: MagicConfidence::Corroborated,
+        }],
         layout: &[],
         conflicts_with: &["ZX Spectrum", "AtariST"],
         preferred_emulator: None,
@@ -441,6 +655,7 @@ pub const PLATFORMS: &[Platform] = &[
             offset: 0x1,
             bytes: b"ATARI7800",
             description: "A 7800 header names `ATARI7800` at offset 0x01",
+            confidence: MagicConfidence::Strong,
         }],
         layout: &[],
         conflicts_with: &[],
@@ -493,6 +708,7 @@ pub const PLATFORMS: &[Platform] = &[
             offset: 0,
             bytes: b"LYNX",
             description: "Lynx cartridge images carry the `LYNX` header magic",
+            confidence: MagicConfidence::Strong,
         }],
         layout: &[],
         conflicts_with: &[],
@@ -550,13 +766,13 @@ pub const PLATFORMS: &[Platform] = &[
             "bbcmaster",
         ],
         filename_aliases: &[],
-        strong_extensions: &["ssd", "dsd"],
-        weak_extensions: &["uef", "dsk", "adf", "adl"],
+        strong_extensions: &[],
+        weak_extensions: &["uef", "ssd", "dsd", "dsk", "adf", "adl"],
         magic: &[],
         layout: &[],
         conflicts_with: &["Acorn Electron"],
         preferred_emulator: None,
-        explanation: "Acorn DFS disk images (`.ssd`/`.dsd`) are characteristic, but `.uef` tapes are shared with the Acorn Electron, so tape-only evidence stays ambiguous between the two.",
+        explanation: "Acorn DFS disk images (`.ssd`/`.dsd`) are shared with the Acorn Electron, so the extension and even a valid DFS catalogue remain family-level evidence; folder context separates the canonical platform. `.uef` tapes are shared too.",
     },
     Platform {
         id: "ColecoVision",
@@ -577,19 +793,19 @@ pub const PLATFORMS: &[Platform] = &[
         folder_aliases: &["commodore128", "c128", "commodorec128", "c128d"],
         filename_aliases: &[],
         strong_extensions: &["d71", "d81"],
-        weak_extensions: &["d64", "prg", "crt", "tap"],
+        weak_extensions: &["d64", "g64", "prg", "tap"],
         magic: &[],
         layout: &[],
         conflicts_with: &["Commodore 64"],
         preferred_emulator: None,
-        explanation: "1571/1581 images (`.d71`/`.d81`) are C128-era formats. A plain `.d64` is far more often a C64 image, so it is only weak evidence here.",
+        explanation: "1571/1581 images (`.d71`/`.d81`) are C128-era formats. A plain `.d64`/`.g64` is far more often a C64 image, so both are only weak evidence here; a 1571 drive can read GCR `.g64` images too.",
     },
     Platform {
         id: "Commodore 64",
         display_name: "Commodore 64",
         folder_aliases: &["commodore64", "c64", "commodorec64", "c64gs"],
         filename_aliases: &[],
-        strong_extensions: &["d64", "t64", "prg", "crt", "g64", "d81ns"],
+        strong_extensions: &["t64", "crt", "g64", "d81ns"],
         weak_extensions: &["tap", "cas", "bin", "zip"],
         magic: &[],
         layout: &[],
@@ -610,12 +826,13 @@ pub const PLATFORMS: &[Platform] = &[
             "amigaecs",
         ],
         filename_aliases: &[],
-        strong_extensions: &["adz", "ipf", "dms", "hdf", "lha"],
-        weak_extensions: &["adf", "zip", "iso", "lzx"],
+        strong_extensions: &["adz", "ipf", "dms", "lha"],
+        weak_extensions: &["adf", "hdf", "zip", "iso", "lzx"],
         magic: &[MagicRule {
             offset: 0,
             bytes: b"DOS\x00",
             description: "OFS/FFS floppy images begin with the `DOS` boot-block identifier",
+            confidence: MagicConfidence::Strong,
         }],
         layout: &[],
         conflicts_with: &["AmigaCD32", "Acorn Archimedes", "Commodore CDTV"],
@@ -641,12 +858,49 @@ pub const PLATFORMS: &[Platform] = &[
         folder_aliases: &["vic20", "commodorevic20", "vic"],
         filename_aliases: &[],
         strong_extensions: &[],
-        weak_extensions: &["prg", "crt", "tap", "cas", "d64"],
+        weak_extensions: &["prg", "tap", "cas", "d64"],
         magic: &[],
         layout: &[],
         conflicts_with: &["Commodore 64"],
         preferred_emulator: None,
         explanation: "The VIC-20 shares `.prg`/`.crt`/`.tap` with the rest of the Commodore range and has no extension of its own, so it is recognised from folder evidence.",
+    },
+    Platform {
+        id: "Dragon / Tandy CoCo",
+        display_name: "Dragon / Tandy CoCo",
+        folder_aliases: &[],
+        filename_aliases: &[],
+        // Ordinary CAS evidence is deliberately family-level. It does not
+        // identify a Dragon/CoCo machine variant, so no extension or magic
+        // rule is allowed to manufacture one here.
+        strong_extensions: &[],
+        weak_extensions: &[],
+        magic: &[],
+        layout: &[],
+        conflicts_with: &[],
+        preferred_emulator: Some("XRoar"),
+        explanation: "Family-level Dragon/CoCo cassette evidence is available; machine selection remains an explicit launch requirement.",
+    },
+    Platform {
+        id: "Enterprise",
+        display_name: "Enterprise 64/128",
+        folder_aliases: &[
+            "enterprise",
+            "enterprise64",
+            "enterprise128",
+            "ep64",
+            "ep128",
+        ],
+        filename_aliases: &[],
+        strong_extensions: &[],
+        weak_extensions: &[
+            "tap", "dtf", "dsk", "img", "rom", "com", "trn", "128", "bas",
+        ],
+        magic: &[],
+        layout: &[],
+        conflicts_with: &["ZX Spectrum", "Amstrad CPC"],
+        preferred_emulator: None,
+        explanation: "Enterprise 64/128 media uses shared tape and disk conventions; identity remains DAT/hash-led or dependent on bounded Enterprise evidence.",
     },
     Platform {
         id: "FM Towns",
@@ -727,7 +981,7 @@ pub const PLATFORMS: &[Platform] = &[
         }],
         conflicts_with: &["PC", "ScummVM"],
         preferred_emulator: None,
-        explanation: "`.exe`/`.com` are shared with every Windows-era release, so DOS is identified from folder evidence or a DOSBox configuration rather than from an extension.",
+        explanation: "`.exe`/`.com` are shared with every Windows-era release, so DOS is identified from folder evidence or a DOSBox configuration rather than from an extension. A file merely named `dosbox.conf` is not enough: it is read and must parse as a real DOSBox config with an `[autoexec]` section (see `crate::dosbox_config_evidence`) before it counts as layout evidence.",
     },
     Platform {
         id: "MSX",
@@ -758,7 +1012,7 @@ pub const PLATFORMS: &[Platform] = &[
     Platform {
         id: "NEC PC-8801",
         display_name: "NEC PC-8801",
-        folder_aliases: &["necpc8801", "pc8801", "pc88", "necpc88"],
+        folder_aliases: &["necpc8801", "pc8801", "pc88", "necpc88", "pc8800series"],
         filename_aliases: &[],
         strong_extensions: &["d88"],
         weak_extensions: &["dsk", "cmt", "t88"],
@@ -829,7 +1083,7 @@ pub const PLATFORMS: &[Platform] = &[
     Platform {
         id: "Neo Geo CD",
         display_name: "Neo Geo CD",
-        folder_aliases: &["neogeocd", "snkneogeocd", "ngcd"],
+        folder_aliases: &["neogeocd", "snkneogeocd", "ngcd", "neocd", "neocdz"],
         filename_aliases: &[],
         strong_extensions: &[],
         weak_extensions: &["iso", "cue", "bin", "chd", "img"],
@@ -889,6 +1143,7 @@ pub const PLATFORMS: &[Platform] = &[
             offset: 0,
             bytes: b"\x80\x37\x12\x40",
             description: "A big-endian Nintendo 64 ROM begins with 0x80371240",
+            confidence: MagicConfidence::Strong,
         }],
         layout: &[],
         conflicts_with: &[],
@@ -932,6 +1187,7 @@ pub const PLATFORMS: &[Platform] = &[
             offset: 0,
             bytes: b"NES\x1a",
             description: "An iNES ROM begins with the `NES` magic",
+            confidence: MagicConfidence::Strong,
         }],
         layout: &[],
         conflicts_with: &[],
@@ -988,11 +1244,30 @@ pub const PLATFORMS: &[Platform] = &[
             offset: 0x1c,
             bytes: b"\xc2\x33\x9f\x3d",
             description: "A GameCube disc carries the 0xC2339F3D magic word at offset 0x1C",
+            confidence: MagicConfidence::Strong,
         }],
         layout: &[],
         conflicts_with: &["Wii"],
         preferred_emulator: None,
         explanation: "The disc magic word is what separates a GameCube `.iso` from a Wii one. Preserved exactly as the existing header check behaved.",
+    },
+    Platform {
+        id: "Pokemon Mini",
+        display_name: "Nintendo Pokémon Mini",
+        folder_aliases: &["pokemonmini", "nintendopokemonmini"],
+        filename_aliases: &[],
+        strong_extensions: &[],
+        weak_extensions: &["min"],
+        magic: &[MagicRule {
+            offset: 0x21a4,
+            bytes: b"NINTENDO",
+            description: "Pokémon Mini cartridge header watermark at 0x21A4",
+            confidence: MagicConfidence::Corroborated,
+        }],
+        layout: &[],
+        conflicts_with: &[],
+        preferred_emulator: None,
+        explanation: "A `.min` file is only a Pokémon Mini candidate; the documented cartridge header must validate.",
     },
     Platform {
         id: "Switch",
@@ -1026,11 +1301,12 @@ pub const PLATFORMS: &[Platform] = &[
         folder_aliases: &["wii", "nintendowii"],
         filename_aliases: &[],
         strong_extensions: &["wbfs", "wad"],
-        weak_extensions: &["iso", "rvz", "ciso", "wia", "zip"],
+        weak_extensions: &["iso", "gcz", "rvz", "ciso", "wia", "zip"],
         magic: &[MagicRule {
             offset: 0x18,
             bytes: b"\x5d\x1c\x9e\xa3",
             description: "A Wii disc carries the 0x5D1C9EA3 magic word at offset 0x18",
+            confidence: MagicConfidence::Strong,
         }],
         layout: &[],
         conflicts_with: &["GameCube"],
@@ -1055,13 +1331,26 @@ pub const PLATFORMS: &[Platform] = &[
         display_name: "Nokia N-Gage",
         folder_aliases: &["ngage", "nokiangage"],
         filename_aliases: &[],
-        strong_extensions: &["n-gage", "sis"],
-        weak_extensions: &["zip"],
+        strong_extensions: &["n-gage"],
+        weak_extensions: &["sis", "zip"],
         magic: &[],
         layout: &[],
         conflicts_with: &[],
         preferred_emulator: None,
-        explanation: "`.sis` is a Symbian installer used by N-Gage titles.",
+        explanation: "N-Gage uses SIS installers, but SIS is shared with EPOC and other Symbian devices and cannot identify N-Gage on its own.",
+    },
+    Platform {
+        id: "Oric",
+        display_name: "Oric",
+        folder_aliases: &["oric", "oric1", "oricatmos"],
+        filename_aliases: &[],
+        strong_extensions: &[],
+        weak_extensions: &["tap", "dsk"],
+        magic: &[],
+        layout: &[],
+        conflicts_with: &[],
+        preferred_emulator: None,
+        explanation: "Oric family evidence requires validated TAP framing or the reviewed MFM_DISK subset. Shared extensions prove nothing.",
     },
     Platform {
         id: "PC",
@@ -1109,6 +1398,9 @@ pub const PLATFORMS: &[Platform] = &[
             "pcecd",
             "turbografxcdrom",
             "necturbografxcd",
+            "cdrom2",
+            "supercdrom2",
+            "turboduo",
         ],
         filename_aliases: &[],
         strong_extensions: &[],
@@ -1117,7 +1409,20 @@ pub const PLATFORMS: &[Platform] = &[
         layout: &[],
         conflicts_with: &["PC Engine", "Sega CD", "PSX"],
         preferred_emulator: None,
-        explanation: "A CD-ROM² title shares every disc extension with other CD systems, so folder or cue-sheet context is what identifies it. Never merged with cartridge PC Engine.",
+        explanation: "A CD-ROM² title shares every disc extension with other CD systems, so folder or cue-sheet context is what identifies it - or the disc's own `PC Engine CD-ROM SYSTEM` IPL signature. Never merged with cartridge PC Engine.",
+    },
+    Platform {
+        id: "PC-FX",
+        display_name: "PC-FX",
+        folder_aliases: &["pcfx", "necpcfx"],
+        filename_aliases: &[],
+        strong_extensions: &[],
+        weak_extensions: &["iso", "cue", "bin", "chd", "img"],
+        magic: &[],
+        layout: &[],
+        conflicts_with: &["PC Engine CD", "Sega CD", "PSX"],
+        preferred_emulator: None,
+        explanation: "A PC-FX title is a CD image, so it shares every disc extension with other CD systems - the `PC-FX:Hu_CD-ROM` boot-sector magic in the disc content is what confirms it. Kept a separate canonical platform from PC Engine CD, whose software is not interchangeable.",
     },
     Platform {
         id: "Philips CD-i",
@@ -1136,6 +1441,7 @@ pub const PLATFORMS: &[Platform] = &[
             offset: 0x8008,
             bytes: b"CD-RTOS",
             description: "A CD-i disc names `CD-RTOS` as the ISO 9660 system identifier at offset 0x8008",
+            confidence: MagicConfidence::Strong,
         }],
         layout: &[],
         conflicts_with: &["PSX", "Sega CD", "3DO", "PC Engine CD"],
@@ -1184,6 +1490,7 @@ pub const PLATFORMS: &[Platform] = &[
         display_name: "Sega 32X",
         folder_aliases: &[
             "sega32x",
+            "sega32", // Reviewed RomM slug; distinct from Mega Drive.
             "32x",
             "sega32x32x",
             "sega32xgenesis",
@@ -1202,7 +1509,7 @@ pub const PLATFORMS: &[Platform] = &[
     Platform {
         id: "Dreamcast",
         display_name: "Sega Dreamcast",
-        folder_aliases: &["dreamcast", "segadreamcast"],
+        folder_aliases: &["dreamcast", "segadreamcast", "dc"],
         filename_aliases: &[],
         strong_extensions: &["gdi", "cdi"],
         weak_extensions: &["iso", "cue", "bin", "chd", "mdf"],
@@ -1210,6 +1517,7 @@ pub const PLATFORMS: &[Platform] = &[
             offset: 0,
             bytes: b"SEGA SEGAKATANA",
             description: "A Dreamcast disc boot sector begins with `SEGA SEGAKATANA`",
+            confidence: MagicConfidence::Strong,
         }],
         layout: &[],
         conflicts_with: &["Saturn", "Philips CD-i"],
@@ -1227,6 +1535,7 @@ pub const PLATFORMS: &[Platform] = &[
             offset: 0x7ff0,
             bytes: b"TMR SEGA",
             description: "The Game Gear shares the `TMR SEGA` 8-bit Sega ROM header",
+            confidence: MagicConfidence::Corroborated,
         }],
         layout: &[],
         conflicts_with: &["MasterSystem"],
@@ -1253,16 +1562,19 @@ pub const PLATFORMS: &[Platform] = &[
                 offset: 0x7ff0,
                 bytes: b"TMR SEGA",
                 description: "The `TMR SEGA` ROM header appears at 0x7FF0 in most Master System dumps",
+                confidence: MagicConfidence::Corroborated,
             },
             MagicRule {
                 offset: 0x3ff0,
                 bytes: b"TMR SEGA",
                 description: "Smaller dumps carry the same header at 0x3FF0",
+                confidence: MagicConfidence::Corroborated,
             },
             MagicRule {
                 offset: 0x1ff0,
                 bytes: b"TMR SEGA",
                 description: "The smallest dumps carry it at 0x1FF0",
+                confidence: MagicConfidence::Corroborated,
             },
         ],
         layout: &[],
@@ -1291,6 +1603,7 @@ pub const PLATFORMS: &[Platform] = &[
             offset: 0x100,
             bytes: b"SEGA",
             description: "A Mega Drive cartridge header begins with `SEGA` at offset 0x100",
+            confidence: MagicConfidence::Corroborated,
         }],
         layout: &[],
         conflicts_with: &["Sega CD", "Sega 32X", "ScummVM"],
@@ -1312,16 +1625,23 @@ pub const PLATFORMS: &[Platform] = &[
         filename_aliases: &[],
         strong_extensions: &[],
         weak_extensions: &["iso", "cue", "bin", "chd", "ccd", "mdf", "img"],
+        // Both `SEGADISCSYSTEM` rules are Corroborated: a 32X-CD disc carries
+        // the same boot sector, so the bytes alone never decide here. The
+        // detector's family check (`platform::detect::optical_boot_evidence`)
+        // deliberately confirms Sega CD from a validated boot sector, with
+        // 32X-CD recorded as a known gap until a dedicated check exists.
         magic: &[
             MagicRule {
                 offset: 0,
                 bytes: b"SEGADISCSYSTEM",
                 description: "A Mega-CD boot sector begins with `SEGADISCSYSTEM`",
+                confidence: MagicConfidence::Corroborated,
             },
             MagicRule {
                 offset: 0x10,
                 bytes: b"SEGADISCSYSTEM",
                 description: "ISO-2048 Mega-CD dumps carry the same signature at offset 0x10",
+                confidence: MagicConfidence::Corroborated,
             },
         ],
         layout: &[],
@@ -1340,6 +1660,7 @@ pub const PLATFORMS: &[Platform] = &[
             offset: 0,
             bytes: b"SEGA SEGASATURN",
             description: "A Saturn disc boot sector begins with `SEGA SEGASATURN`",
+            confidence: MagicConfidence::Strong,
         }],
         layout: &[],
         conflicts_with: &["Sega CD", "Dreamcast"],
@@ -1357,8 +1678,11 @@ pub const PLATFORMS: &[Platform] = &[
             "x68000compact",
         ],
         filename_aliases: &[],
-        strong_extensions: &["xdf", "dim", "d88x"],
-        weak_extensions: &["dsk", "hdf", "hdm", "zip"],
+        // XDF/DIM are structurally checked by disk_format. Their suffixes
+        // remain weak so a renamed/random file cannot become X68000 merely
+        // from its filename. Keep the historical d88x detector unchanged.
+        strong_extensions: &["d88x"],
+        weak_extensions: &["xdf", "dim", "dsk", "hdf", "hdm", "zip"],
         magic: &[],
         layout: &[],
         conflicts_with: &["NEC PC-9801"],
@@ -1383,6 +1707,7 @@ pub const PLATFORMS: &[Platform] = &[
             offset: 0x8008,
             bytes: b"PLAYSTATION",
             description: "A PlayStation disc names `PLAYSTATION` as the ISO 9660 system identifier at offset 0x8008",
+            confidence: MagicConfidence::Corroborated,
         }],
         layout: &[],
         conflicts_with: &["PS2", "Sega CD", "Philips CD-i", "3DO", "PC Engine CD"],
@@ -1400,6 +1725,7 @@ pub const PLATFORMS: &[Platform] = &[
             offset: 0x8008,
             bytes: b"PLAYSTATION",
             description: "A PlayStation 2 disc also names `PLAYSTATION` as the ISO 9660 system identifier",
+            confidence: MagicConfidence::Corroborated,
         }],
         layout: &[],
         conflicts_with: &["PSX"],
@@ -1411,13 +1737,32 @@ pub const PLATFORMS: &[Platform] = &[
         display_name: "Sony PlayStation 3",
         folder_aliases: &["ps3", "playstation3", "sonyplaystation3"],
         filename_aliases: &[],
-        strong_extensions: &["pkg"],
-        weak_extensions: &["iso", "zip"],
+        strong_extensions: &[],
+        weak_extensions: &["pkg", "iso", "zip"],
         magic: &[],
         layout: &[],
         conflicts_with: &[],
         preferred_emulator: None,
         explanation: "`.pkg` is a PS3 package format.",
+    },
+    Platform {
+        id: "PS4",
+        display_name: "Sony PlayStation 4",
+        folder_aliases: &["ps4", "playstation4", "sonyplaystation4"],
+        filename_aliases: &[],
+        // A `.pkg` file alone is still only a shared candidate: a retail
+        // PS4 package is encrypted, so no trustworthy identity is read from
+        // it. Bounded PS4 identity now comes from an *extracted* game
+        // directory's `sce_sys/param.sfo` with a CUSA-family TITLE_ID (see
+        // `crate::ps4_layout_evidence` / `crate::game_identity`). Launch
+        // support is still deferred.
+        strong_extensions: &[],
+        weak_extensions: &["pkg"],
+        magic: &[],
+        layout: &[],
+        conflicts_with: &["PS3"],
+        preferred_emulator: None,
+        explanation: "PS4 is recognised from explicit PS4 folder names, a shared `.pkg` candidate, or a bounded `sce_sys/param.sfo` (CUSA-family TITLE_ID) in an extracted game directory. Encrypted `.pkg` identity and launch support are not yet claimed.",
     },
     Platform {
         id: "PSP",
@@ -1470,6 +1815,32 @@ pub const PLATFORMS: &[Platform] = &[
         explanation: "`.sfc`/`.smc` are SNES specific. The SNES has no header at a fixed offset, so no magic-byte rule is claimed.",
     },
     Platform {
+        id: "Thomson MO",
+        display_name: "Thomson MO",
+        folder_aliases: &["thomsonmo", "mo5", "mo6"],
+        filename_aliases: &[],
+        strong_extensions: &[],
+        weak_extensions: &["k7", "sap", "fd", "m5", "m7", "rom"],
+        magic: &[],
+        layout: &[],
+        conflicts_with: &["Thomson TO"],
+        preferred_emulator: None,
+        explanation: "MO5/MO6 are explicit Thomson MO family aliases. Thomson media extensions are shared or model-sensitive.",
+    },
+    Platform {
+        id: "Thomson TO",
+        display_name: "Thomson TO",
+        folder_aliases: &["thomsonto", "to7", "to770", "to8", "to8d", "to9", "to9plus"],
+        filename_aliases: &[],
+        strong_extensions: &[],
+        weak_extensions: &["k7", "sap", "fd", "m5", "m7", "rom"],
+        magic: &[],
+        layout: &[],
+        conflicts_with: &["Thomson MO"],
+        preferred_emulator: None,
+        explanation: "TO7/TO7-70/TO8/TO8D/TO9/TO9+ are explicit Thomson TO family aliases. Thomson media extensions are shared or model-sensitive.",
+    },
+    Platform {
         id: "TurboGrafx-16",
         display_name: "TurboGrafx-16",
         folder_aliases: &["turbografx16", "tg16", "necturbografx16", "turbografx"],
@@ -1481,6 +1852,19 @@ pub const PLATFORMS: &[Platform] = &[
         conflicts_with: &["PC Engine"],
         preferred_emulator: None,
         explanation: "Retained as its own canonical identifier because existing libraries already store it separately from `PC Engine`; the two are the same hardware under different regional names.",
+    },
+    Platform {
+        id: "Watara Supervision",
+        display_name: "Watara Supervision",
+        folder_aliases: &["supervision", "watarasupervision", "svision"],
+        filename_aliases: &[],
+        strong_extensions: &[],
+        weak_extensions: &["sv", "bin", "zip"],
+        magic: &[],
+        layout: &[],
+        conflicts_with: &[],
+        preferred_emulator: None,
+        explanation: "`.sv` is only a Supervision cartridge candidate; exact identity remains DAT/hash-led.",
     },
     Platform {
         id: "ZX Spectrum",
@@ -1496,12 +1880,19 @@ pub const PLATFORMS: &[Platform] = &[
             "zxspectrum128k",
         ],
         filename_aliases: &[],
-        strong_extensions: &["z80", "sna", "szx", "tzx", "scl", "trd"],
-        weak_extensions: &["tap", "dsk", "zip"],
+        strong_extensions: &["z80", "sna", "szx", "scl", "trd"],
+        weak_extensions: &["cdt", "tap", "dsk", "tzx", "zip"],
         magic: &[MagicRule {
             offset: 0,
             bytes: b"ZXTape!\x1a",
             description: "`.tzx` tape images begin with the literal `ZXTape!` signature",
+            // TZX/CDT is a tape-container format used by more than one
+            // platform family (ZX Spectrum and Amstrad CPC contexts both
+            // appear in real TZX/CDT usage). This signature strongly proves
+            // "TZX tape container", not uniquely "ZX Spectrum platform" -
+            // that distinction belongs to a future media/container evidence
+            // model, not to canonical platform identity.
+            confidence: MagicConfidence::Corroborated,
         }],
         layout: &[],
         conflicts_with: &["Commodore 64", "Amstrad CPC"],

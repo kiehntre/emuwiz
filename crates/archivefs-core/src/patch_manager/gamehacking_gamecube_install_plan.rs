@@ -394,6 +394,7 @@ pub fn stage_gamecube_gamehacking_install(
         let dolphin_name = dolphin_code_name(cheat);
         let code = GeckoCode {
             name: dolphin_name.clone(),
+            source_line: None,
             lines: cheat.code_lines.clone(),
             notes: Vec::new(),
             enabled_by_default: false,

@@ -1,0 +1,28 @@
+emuwiz (0.10.0-1) UNRELEASED; urgency=medium
+
+  * Prepare the EmuWiz 0.10.0 pre-1.0 release (not yet published).
+
+ -- David Armstrong <kiehntre@users.noreply.github.com>  Wed, 21 Oct 2026 00:00:00 +0000
+
+emuwiz (0.9.0-1) UNRELEASED; urgency=medium
+
+  * Prepare the EmuWiz 0.9.0 pre-1.0 release.
+
+ -- David Armstrong <kiehntre@users.noreply.github.com>  Sun, 13 Sep 2026 00:00:00 +0000
+
+emuwiz (0.8.3-1) UNRELEASED; urgency=medium
+
+  * Version bump to 0.8.3, a plain pre-1.0 release (not an alpha snapshot;
+    packaging only, not yet released). See docs/LINUX_PACKAGING.md for the
+    version-mapping rationale and the build/validation status of this
+    packaging lane.
+
+ -- David Armstrong <kiehntre@users.noreply.github.com>  Sat, 12 Sep 2026 00:00:00 +0000
+
+emuwiz (0.8.1~alpha-1) UNRELEASED; urgency=medium
+
+  * Initial Debian packaging foundation (packaging only; not yet released).
+    See docs/LINUX_PACKAGING.md for the version-mapping rationale and the
+    build/validation status of this packaging lane.
+
+ -- David Armstrong <kiehntre@users.noreply.github.com>  Mon, 07 Sep 2026 00:00:00 +0000

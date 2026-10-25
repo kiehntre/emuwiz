@@ -1,10 +1,29 @@
 # EmuWiz Persistent Library Database: Design
 
-Status: implemented foundation. This document records the small, additive
+## CURRENT BEHAVIOR
+
+The live SQLite catalogue is an additive, durable evidence projection. The
+current migration chain reaches 0010: source/archive history, platform
+assignments and aliases, scan/discovery details, persisted identity reports,
+DAT identity snapshots, DAT set/dependency verdicts, and verified identity
+facts with inspected-file freshness snapshots. Read-only catalogue/report
+paths and database-check do not create, migrate, or repair the database.
+
+Applied migrations are immutable and the chain is forward-only. Never edit,
+replay, reorder, or renumber an applied migration; do not invent migration
+0011. The stale PS2 loose-ISO work is an example of why migration 0006 must
+remain unchanged. Launch and apply paths revalidate content rather than
+treating cached rows as a trust anchor.
+
+The remainder of this document is preserved historical design context. Its
+early-stage schema proposals and implementation counts do not override the
+current guidance above.
+
+Status: historical design record. This document records the small, additive
 SQLite-backed catalogue that sits alongside the existing filesystem-scanning
 core, not underneath it. The live filename is `library.sqlite3` (not the early
 `library.db` proposal retained in historical passages below), and migrations 1
-through 3 are implemented. Read-only health diagnosis and copy-first recovery
+through 3 were implemented at the time of writing. Read-only health diagnosis and copy-first recovery
 guidance are in [`DATABASE_RECOVERY.md`](DATABASE_RECOVERY.md).
 
 This is a narrower, more immediately actionable document than the existing
@@ -26,6 +45,8 @@ that exists in the code today (it says duplicate detection "is not implemented y
 which is now stale). The schema proposed here - specifically the hash columns on
 `archives` - is what would let that richer detector eventually be built without a
 further schema change. See [section 5](#5-integration-boundaries).
+
+## HISTORICAL DESIGN CONTEXT
 
 ## Grounding
 
@@ -275,6 +296,10 @@ Columns and optionality:
   too expensive to do on every routine scan (see [section 3](#3-archive-identity)).
   `content_hash` is proposed as a SHA-256 hex digest, reusing the `sha2` crate already
   a dependency, matching `ConfigIdentity`'s existing hashing choice.
+  **Populated today only for `preservation_recording` rows** (ZX Spectrum RZX
+  gameplay recordings), as their import-time full-file SHA-256 written during the
+  scan; see `database/preservation_fingerprint.rs` and
+  `docs/ZX_SPECTRUM_SUPPORT.md`. Every other row still leaves it `NULL`.
 - `last_known_health` (required, defaulted) mirrors `ArchiveHealth`'s eight variants
   as their `Display` string (`Pending`, `Mounted`, `Failed`, `MissingParts`,
   `Corrupt`, `Unsupported`, `PermissionDenied`, `RetryAvailable`). This is explicitly

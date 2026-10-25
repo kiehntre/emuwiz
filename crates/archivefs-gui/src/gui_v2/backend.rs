@@ -1,0 +1,1189 @@
+//! The presentation's I/O boundary. Only this worker opens catalogue/config files.
+use super::{
+    library::{
+        Detail, DuplicateGroup, DuplicateMember, DuplicateReport, Filter, Game, Library,
+        SharedLibrary,
+    },
+    problems::ProblemSummary,
+    routes::Route,
+};
+use crate::playing_library_page::PlayingLibraryPageState;
+use archivefs_core::identity_source::romm::manual::ManualOpener;
+use archivefs_core::{Database, default_database_path};
+use serde::{Deserialize, Serialize};
+use std::{
+    collections::{BTreeMap, HashMap},
+    fs,
+    io::Write,
+    path::{Path, PathBuf},
+    sync::{
+        Arc,
+        atomic::{AtomicBool, Ordering},
+        mpsc::{self, Receiver, Sender},
+    },
+    time::Instant,
+};
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(default)]
+pub(super) struct Preferences {
+    pub route: Route,
+    pub filter: Filter,
+    #[serde(default)]
+    pub welcome_dismissed: bool,
+    #[serde(default = "default_beginner_hints_enabled")]
+    pub beginner_hints_enabled: bool,
+    #[serde(default)]
+    pub document_roots: Vec<PathBuf>,
+    #[serde(default)]
+    pub document_associations: BTreeMap<PathBuf, i64>,
+    #[serde(default)]
+    pub document_reading: BTreeMap<PathBuf, crate::gui_v2::documents::DocumentReadingState>,
+    /// Whether the EmuWiz Blue shell is in use. Still written so an older
+    /// build reading this file opens the same view, but no longer read:
+    /// before Blue became the standard view it was an opt-in preview, so a
+    /// stored `false` records "never opted in", not a choice of Classic.
+    #[serde(default)]
+    pub simple_shell: bool,
+    /// The person explicitly chose the Classic view (kept during the move to
+    /// EmuWiz Blue). Absent or false means EmuWiz Blue, the standard view.
+    #[serde(default)]
+    pub classic_view: bool,
+    /// Interface scale used with the Simple v1 shell; 1.0 when absent.
+    #[serde(default = "default_ui_scale")]
+    pub ui_scale: f32,
+}
+
+fn default_ui_scale() -> f32 {
+    1.0
+}
+
+fn default_beginner_hints_enabled() -> bool {
+    true
+}
+
+impl Default for Preferences {
+    fn default() -> Self {
+        Self {
+            route: Route::default(),
+            filter: Filter::default(),
+            welcome_dismissed: false,
+            beginner_hints_enabled: true,
+            document_roots: Vec::new(),
+            document_associations: BTreeMap::new(),
+            document_reading: BTreeMap::new(),
+            simple_shell: true,
+            classic_view: false,
+            ui_scale: 1.0,
+        }
+    }
+}
+
+pub(super) enum Command {
+    ReconcileLibrary {
+        library: SharedLibrary,
+        hashes: Arc<super::library_reconciliation::Hashes>,
+        source: super::library_reconciliation::ReconcileSource,
+        cancel: Arc<std::sync::atomic::AtomicBool>,
+    },
+    ReconcileHash {
+        roots: Vec<PathBuf>,
+        requests: Vec<PathBuf>,
+        cancel: Arc<std::sync::atomic::AtomicBool>,
+    },
+    /// Hash ONE selected support file and compare it with installed DATs.
+    ReconcileSupportCheck {
+        roots: Vec<PathBuf>,
+        path: PathBuf,
+        listed: archivefs_core::catalogue_reconciliation::FileIdentity,
+        catalogues: super::library_reconciliation::SupportCatalogues,
+        cache: archivefs_core::catalogue_reconciliation::catalogue_index_cache::SharedCatalogueIndexCache,
+        cancel: Arc<std::sync::atomic::AtomicBool>,
+    },
+    Load {
+        scan: bool,
+    },
+    EnvironmentCheck,
+    LoadRommLibrary,
+    NativeRomm(Box<super::native_workflows::native_romm::Work>),
+    RommOperation {
+        operation: Box<crate::romm_source::RommOperation>,
+    },
+    Filter {
+        library: SharedLibrary,
+        filter: Filter,
+        generation: u64,
+    },
+    BuildProblemSummary {
+        library: SharedLibrary,
+        duplicates: Option<DuplicateReport>,
+    },
+    Detail {
+        game: Box<Game>,
+        generation: u64,
+    },
+    Verify {
+        platform: String,
+        games: Vec<Game>,
+        cancel: Arc<AtomicBool>,
+    },
+    ScanDuplicates {
+        games: Vec<Game>,
+        cancel: Arc<AtomicBool>,
+    },
+    /// Read-only: what the saved DAT audits say about one game.
+    LoadIdentityKnowledge {
+        archive_id: i64,
+    },
+    /// The explicit, confirmed system choice for one game.
+    AssignSystem {
+        archive_id: i64,
+        archive_path: PathBuf,
+        platform: String,
+    },
+    /// Remove the person's own system choice for one game.
+    ClearSystem {
+        archive_id: i64,
+        archive_path: PathBuf,
+    },
+    PrepareDuplicateRepair {
+        group: Box<archivefs_core::repair::ExactDuplicateGroup>,
+    },
+    ApplyDuplicateRepair {
+        preview: Box<DuplicateRepairPreview>,
+        cancel: Arc<AtomicBool>,
+    },
+    UndoDuplicateRepair {
+        generation: u64,
+        record: Box<DuplicateRepairRecord>,
+        cancel: Arc<AtomicBool>,
+    },
+    LoadRepairHistory,
+    EquivalentScan {
+        kind: super::equivalent_duplicates::EquivalentKind,
+        cancel: Arc<AtomicBool>,
+    },
+    EquivalentApply {
+        group: Box<super::equivalent_duplicates::EquivalentGroup>,
+    },
+    StorageReview {
+        library: SharedLibrary,
+    },
+    MediaSetReview {
+        library: SharedLibrary,
+        key: usize,
+    },
+    MissingPreview,
+    MissingApply {
+        token: String,
+    },
+    MissingUndo {
+        receipt: PathBuf,
+    },
+    OpenFolder(PathBuf),
+    /// Create the starter configuration the person confirmed, at `expected`.
+    CreateStarterConfig {
+        expected: PathBuf,
+    },
+    /// Create the configured mount root the person confirmed, `expected`.
+    CreateMountRoot {
+        expected: PathBuf,
+    },
+    /// The read-only Doctor report, as the text "Copy summary" copies.
+    DoctorSummary,
+    OpenDocument {
+        path: PathBuf,
+        expected: archivefs_core::manual_document::ManualDocumentId,
+    },
+    Save(Preferences),
+    Restore,
+    PlayingLibraryPreview {
+        state: Box<PlayingLibraryPageState>,
+        generation: u64,
+    },
+    PlayingLibraryApply {
+        state: Box<PlayingLibraryPageState>,
+        generation: u64,
+    },
+    PlayingLibrarySpecial {
+        state: Box<PlayingLibraryPageState>,
+        generation: u64,
+        kind: super::PlayingLibraryJobKind,
+    },
+    CanonicalOrganisation {
+        state: Box<crate::rom_organisation_page::RomOrganisationPageState>,
+        generation: u64,
+        kind: super::CanonicalOrganisationJobKind,
+        cancel: Arc<AtomicBool>,
+    },
+    PersistentStateInventory {
+        roots: Vec<archivefs_core::persistent_state_inventory::PersistentStateRoot>,
+        generation: u64,
+    },
+    SaveSnapshotHistory {
+        root: std::path::PathBuf,
+        targets: Vec<super::save_snapshots::SnapshotTarget>,
+        generation: u64,
+    },
+    CreateSaveSnapshot {
+        root: std::path::PathBuf,
+        target: super::save_snapshots::SnapshotTarget,
+    },
+}
+
+pub(super) enum Payload {
+    IdentityKnowledge {
+        archive_id: i64,
+        knowledge: Option<super::identity_review::DatKnowledge>,
+    },
+    SystemCleared {
+        archive_id: i64,
+    },
+    SystemAssigned {
+        archive_id: i64,
+    },
+    Library(SharedLibrary),
+    Environment(crate::gui_v2::environment::EnvironmentSnapshot),
+    /// A confirmed setup action finished; the plain sentence to show.
+    SetupCreated(String),
+    DoctorSummary(String),
+    RommLibrary(crate::gui_v2::romm_library::RommBrowserSnapshot),
+    RommOperation {
+        operation: crate::romm_source::RommOperation,
+        outcome: Box<crate::romm_source::RommOperationOutcome>,
+        snapshot: Option<crate::gui_v2::romm_library::RommBrowserSnapshot>,
+    },
+    Filter {
+        indices: Vec<usize>,
+        generation: u64,
+    },
+    ProblemSummary(Arc<ProblemSummary>),
+    Detail {
+        detail: Detail,
+        generation: u64,
+    },
+    Verification(VerificationResult),
+    Duplicates(DuplicateReport),
+    DuplicatePreview(Box<DuplicateRepairPreview>),
+    DuplicateApplied(Box<DuplicateRepairRecord>),
+    DuplicateUndone(Box<super::duplicate_undo::DuplicateUndoResult>),
+    RepairHistory {
+        duplicates: Vec<DuplicateRepairRecord>,
+        playing_libraries: Vec<archivefs_core::dat::rename_apply::model::RenameTransaction>,
+        organisations: Vec<archivefs_core::dat::rename_apply::model::RenameTransaction>,
+        mame_reconstructions: Vec<archivefs_core::dat::rename_apply::model::RenameTransaction>,
+        evidence: Vec<archivefs_core::dat::rename_apply::seal::JournalEvidence>,
+    },
+    EquivalentScan(Box<super::equivalent_duplicates::EquivalentScan>),
+    EquivalentApplied(Box<DuplicateRepairRecord>),
+    StorageReview(Box<super::storage_review::StorageReview>),
+    /// `None`: the check was stopped, so there is no new answer.
+    Reconciliation(Option<Arc<super::library_reconciliation::View>>),
+    ReconciliationHashes(super::library_reconciliation::HashRun),
+    ReconciliationSupportCheck(Box<super::library_reconciliation::SupportCheckRun>),
+    MediaSetReview(Box<super::media_sets::MediaSetReview>),
+    MissingPreview(Box<archivefs_core::catalogue_health::ForgetMissingPlan>),
+    MissingApplied(Box<archivefs_core::catalogue_health::ForgetMissingResult>),
+    MissingUndone(usize),
+    Preferences(Preferences),
+    Done,
+    PlayingLibraryPreview {
+        state: Box<PlayingLibraryPageState>,
+        generation: u64,
+    },
+    PlayingLibraryApply {
+        state: Box<PlayingLibraryPageState>,
+        generation: u64,
+    },
+    PlayingLibrarySpecial {
+        state: Box<PlayingLibraryPageState>,
+        generation: u64,
+        kind: super::PlayingLibraryJobKind,
+    },
+    CanonicalOrganisation {
+        state: Box<crate::rom_organisation_page::RomOrganisationPageState>,
+        generation: u64,
+        kind: super::CanonicalOrganisationJobKind,
+    },
+    PersistentStateInventory {
+        inventory: archivefs_core::persistent_state_inventory::PersistentStateInventory,
+        generation: u64,
+    },
+    SaveSnapshotHistory {
+        report: super::save_snapshots::SnapshotReport,
+        generation: u64,
+    },
+    SaveSnapshotCreated {
+        result: Result<String, String>,
+    },
+}
+
+#[derive(Clone, Debug)]
+pub(super) struct DuplicateRepairPreview {
+    pub group: archivefs_core::repair::ExactDuplicateGroup,
+    pub proposals: Vec<archivefs_core::repair::RepairProposal>,
+    pub trusted_root: PathBuf,
+    pub journal_dir: PathBuf,
+}
+
+#[derive(Clone, Debug)]
+pub(super) struct DuplicateRepairRecord {
+    pub transaction: archivefs_core::dat::rename_apply::model::RenameTransaction,
+    pub trusted_root: PathBuf,
+    pub journal_dir: PathBuf,
+}
+
+#[allow(clippy::large_enum_variant)]
+pub(super) enum Event {
+    Started(u64),
+    Progress {
+        id: u64,
+        progress: super::activity::JobProgress,
+    },
+    Finished {
+        id: u64,
+        outcome: Result<Payload, String>,
+    },
+}
+
+#[derive(Clone, Debug, Default)]
+pub(super) struct VerificationResult {
+    pub platform: String,
+    pub matched: usize,
+    pub attention: usize,
+    pub unknown: usize,
+    pub missing: usize,
+    pub total: usize,
+    pub statuses: HashMap<i64, String>,
+}
+
+pub(super) struct Backend {
+    tx: Sender<(u64, Command)>,
+    pub rx: Receiver<Event>,
+}
+
+impl Backend {
+    pub fn start(context: eframe::egui::Context) -> Self {
+        let (tx, requests) = mpsc::channel();
+        let (answers, rx) = mpsc::channel();
+        std::thread::spawn(move || {
+            while let Ok((id, command)) = requests.recv() {
+                if answers.send(Event::Started(id)).is_err() {
+                    break;
+                }
+                context.request_repaint();
+                // Contain third-party decoder/backend panics at the worker boundary.
+                let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                    execute(id, command, &answers)
+                }))
+                .unwrap_or_else(|_| Err("The background operation stopped unexpectedly.".into()));
+                if answers.send(Event::Finished { id, outcome }).is_err() {
+                    break;
+                }
+                context.request_repaint();
+            }
+        });
+        Self { tx, rx }
+    }
+    /// A backend whose worker is gone: every command is refused before it can
+    /// run. Tests use it so nothing reaches the real catalogue or sources.
+    #[cfg(test)]
+    pub fn disconnected() -> Self {
+        let (tx, _) = mpsc::channel();
+        let (_, rx) = mpsc::channel();
+        Self { tx, rx }
+    }
+    pub fn send(&self, id: u64, command: Command) -> Result<(), String> {
+        self.tx.send((id, command)).map_err(|_| "The background worker is unavailable. Close and reopen GUI v2; your games have not been changed.".into())
+    }
+}
+
+fn execute(id: u64, command: Command, answers: &Sender<Event>) -> Result<Payload, String> {
+    match command {
+        Command::NativeRomm(work) => {
+            super::native_workflows::native_romm::run(*work);
+            Ok(Payload::Done)
+        }
+        Command::EquivalentScan { kind, cancel } => Ok(Payload::EquivalentScan(Box::new(
+            super::equivalent_duplicates::scan(kind, &cancel)?,
+        ))),
+        Command::EquivalentApply { group } => Ok(Payload::EquivalentApplied(Box::new(
+            super::equivalent_duplicates::apply(&group)?,
+        ))),
+        Command::MediaSetReview { library, key } => Ok(Payload::MediaSetReview(Box::new(
+            super::media_sets::analyse(&library, key),
+        ))),
+        Command::ReconcileLibrary {
+            library,
+            hashes,
+            source,
+            cancel,
+        } => super::library_reconciliation::run_reconcile(&library, &hashes, &source, &cancel),
+        Command::ReconcileHash {
+            roots,
+            requests,
+            cancel,
+        } => {
+            let mut send = |progress| {
+                let _ = answers.send(Event::Progress { id, progress });
+            };
+            Ok(Payload::ReconciliationHashes(
+                super::library_reconciliation::run_hashing(&roots, &requests, &cancel, &mut send),
+            ))
+        }
+        Command::ReconcileSupportCheck {
+            roots,
+            path,
+            listed,
+            catalogues,
+            cache,
+            cancel,
+        } => Ok(Payload::ReconciliationSupportCheck(Box::new(
+            super::library_reconciliation::run_support_check(
+                &roots,
+                &path,
+                &listed,
+                &catalogues,
+                &cache,
+                &cancel,
+            ),
+        ))),
+        Command::StorageReview { library } => Ok(Payload::StorageReview(Box::new(
+            super::storage_review::analyse(&library),
+        ))),
+        Command::MissingPreview => Ok(Payload::MissingPreview(Box::new(
+            super::missing_review::preview()?,
+        ))),
+        Command::MissingApply { token } => Ok(Payload::MissingApplied(Box::new(
+            super::missing_review::apply(&token)?,
+        ))),
+        Command::MissingUndo { receipt } => Ok(Payload::MissingUndone(
+            super::missing_review::undo(&receipt)?,
+        )),
+        Command::EnvironmentCheck => Ok(Payload::Environment(crate::gui_v2::environment::gather())),
+        Command::LoadRommLibrary => Ok(Payload::RommLibrary(
+            crate::gui_v2::romm_library::load_snapshot()?,
+        )),
+        Command::RommOperation { operation } => {
+            let operation = *operation;
+            let outcome = crate::romm_source::worker::run_romm_operation(
+                &operation,
+                &Ok(Vec::new()),
+                None,
+                0,
+                &Arc::new(AtomicBool::new(false)),
+                &|event| match event {
+                    crate::romm_source::RommProgressEvent::Import(progress) => {
+                        let _ = answers.send(Event::Progress {
+                            id,
+                            progress: super::activity::JobProgress::new(
+                                "Reading RomM games",
+                                "games",
+                            )
+                            .with_total(progress.reported_total.unwrap_or(0))
+                            .at(progress.records_fetched as u64),
+                        });
+                    }
+                    crate::romm_source::RommProgressEvent::Note(note) => {
+                        let _ = answers.send(Event::Progress {
+                            id,
+                            progress: super::activity::JobProgress::new("RomM update", "steps")
+                                .with_message(note),
+                        });
+                    }
+                    _ => {}
+                },
+            )
+            .map_err(|error| error.to_string())?;
+            let snapshot = matches!(
+                operation,
+                crate::romm_source::RommOperation::Refresh
+                    | crate::romm_source::RommOperation::FullImport
+            )
+            .then(crate::gui_v2::romm_library::load_snapshot)
+            .transpose()?;
+            Ok(Payload::RommOperation {
+                operation,
+                outcome: Box::new(outcome),
+                snapshot,
+            })
+        }
+        Command::Load { scan } => {
+            let scan_warning = if scan {
+                let summary = archivefs_core::scan_all_enabled_sources_default()
+                    .map_err(|error| error.to_string())?;
+                (!summary.folder_errors.is_empty()).then(|| format!("{} game folders could not be read. Their previous entries were kept. Reconnect the drive or review Sources, then scan again.", summary.folder_errors.len()))
+            } else {
+                None
+            };
+            let path = default_database_path().map_err(|error| error.to_string())?;
+            let sources = archivefs_core::load_source_folder_configs_default()
+                .map(|sources| sources.iter().filter(|source| source.enabled).count())
+                .unwrap_or_default();
+            let mut library = load_library(&path)?;
+            library.sources = sources;
+            library.scan_warning = scan_warning;
+            Ok(Payload::Library(Arc::new(library)))
+        }
+        Command::Filter {
+            library,
+            filter,
+            generation,
+        } => Ok(Payload::Filter {
+            indices: library.filter(&filter),
+            generation,
+        }),
+        Command::BuildProblemSummary {
+            library,
+            duplicates,
+        } => Ok(Payload::ProblemSummary(Arc::new(
+            ProblemSummary::from_library(&library, duplicates.as_ref()),
+        ))),
+        Command::Detail { game, generation } => Ok(Payload::Detail {
+            detail: load_detail(&game)?,
+            generation,
+        }),
+        Command::Verify {
+            platform,
+            games,
+            cancel,
+        } => {
+            let total = games.len() as u64;
+            let mut result = VerificationResult {
+                platform,
+                total: games.len(),
+                ..Default::default()
+            };
+            let mut send = |progress| {
+                let _ = answers.send(Event::Progress { id, progress });
+            };
+            let mut reporter = archivefs_core::job_progress::ProgressReporter::new(&mut send);
+            reporter.phase("Checking games", "games", Some(total));
+            for (index, game) in games.into_iter().enumerate() {
+                if cancel.load(Ordering::Relaxed) {
+                    break;
+                }
+                let is_present = game.archive.absolute_path.is_file()
+                    || (matches!(
+                        archivefs_core::ArchiveKind::from_storage(&game.archive.archive_kind),
+                        Some(
+                            archivefs_core::ArchiveKind::ArcadeSetDirectory
+                                | archivefs_core::ArchiveKind::ScummVmDirectory
+                        )
+                    ) && game.archive.absolute_path.is_dir());
+                let status = if !is_present {
+                    result.missing += 1;
+                    "Missing"
+                } else if game.attention {
+                    result.attention += 1;
+                    "Needs attention"
+                } else if game.identified {
+                    result.matched += 1;
+                    "Verified"
+                } else {
+                    result.unknown += 1;
+                    "Unknown"
+                };
+                result.statuses.insert(game.archive.id, status.into());
+                reporter.tick(index as u64 + 1);
+            }
+            Ok(Payload::Verification(result))
+        }
+        Command::LoadIdentityKnowledge { archive_id } => {
+            let path = default_database_path().map_err(|error| error.to_string())?;
+            Ok(Payload::IdentityKnowledge {
+                archive_id,
+                knowledge: super::identity_review_page::knowledge_at(&path, archive_id)?,
+            })
+        }
+        Command::AssignSystem {
+            archive_id,
+            archive_path,
+            platform,
+        } => {
+            let path = default_database_path().map_err(|error| error.to_string())?;
+            super::identity_review_page::assign_system_at(&path, &archive_path, &platform)?;
+            Ok(Payload::SystemAssigned { archive_id })
+        }
+        Command::ClearSystem {
+            archive_id,
+            archive_path,
+        } => {
+            let path = default_database_path().map_err(|error| error.to_string())?;
+            super::identity_review_page::clear_system_at(&path, &archive_path)?;
+            Ok(Payload::SystemCleared { archive_id })
+        }
+        Command::ScanDuplicates { games, cancel } => {
+            let candidates: Vec<_> = games
+                .iter()
+                .map(|game| game.archive.absolute_path.clone())
+                .collect();
+            let config =
+                archivefs_core::Config::load_default().map_err(|error| error.to_string())?;
+            let trusted =
+                archivefs_core::safe_read::TrustedRoots::from_paths(config.source_folders.clone());
+            let mut send = |progress| {
+                let _ = answers.send(Event::Progress { id, progress });
+            };
+            let mut reporter = archivefs_core::job_progress::ProgressReporter::new(&mut send);
+            let report = archivefs_core::repair::scan_exact_duplicates_reporting(
+                &candidates,
+                &trusted,
+                &config.source_folders,
+                &std::collections::BTreeSet::new(),
+                Some(&cancel),
+                &mut reporter,
+            )
+            .map_err(|_| super::activity::CANCELLED.to_string())?;
+            let exact_groups = report.groups.clone();
+            let groups = report
+                .groups
+                .into_iter()
+                .enumerate()
+                .filter_map(|group| {
+                    let (exact_index, group) = group;
+                    let members = group
+                        .members
+                        .into_iter()
+                        .filter_map(|member| {
+                            let game = games
+                                .iter()
+                                .find(|game| game.archive.absolute_path == member.path)?;
+                            Some(DuplicateMember {
+                                path: member.path,
+                                title: game.title.clone(),
+                                platform: game.platform.clone(),
+                                size_bytes: group.size_bytes,
+                                evidence: format!("SHA-256 {}", group.sha256),
+                            })
+                        })
+                        .collect::<Vec<_>>();
+                    (members.len() > 1).then_some(DuplicateGroup {
+                        exact_index,
+                        kind: "Exact duplicates".into(),
+                        sha256: group.sha256,
+                        size_bytes: group.size_bytes,
+                        members,
+                    })
+                })
+                .collect();
+            Ok(Payload::Duplicates(DuplicateReport {
+                groups,
+                files_examined: report.files_examined,
+                exact_groups,
+            }))
+        }
+        Command::PrepareDuplicateRepair { group } => {
+            let config =
+                archivefs_core::Config::load_default().map_err(|error| error.to_string())?;
+            let trusted =
+                archivefs_core::safe_read::TrustedRoots::from_paths(config.source_folders.clone());
+            let retained = group
+                .recommendation
+                .retained_path()
+                .ok_or_else(|| "This duplicate group has no safe retained copy.".to_string())?;
+            let trusted_root = trusted_root_for(retained, &config.source_folders)?;
+            let mut cache = archivefs_core::repair::DuplicateHashCache::new();
+            let proposals = archivefs_core::repair::build_exact_duplicate_group_proposals(
+                &group,
+                &trusted_root,
+                &mut cache,
+                &trusted,
+                None,
+            )?;
+            let journal_dir =
+                archivefs_core::dat::rename_apply::journal::default_rename_transaction_dir()
+                    .map_err(|error| error.to_string())?;
+            Ok(Payload::DuplicatePreview(Box::new(
+                DuplicateRepairPreview {
+                    group: *group,
+                    proposals,
+                    trusted_root,
+                    journal_dir,
+                },
+            )))
+        }
+        Command::ApplyDuplicateRepair { preview, cancel } => {
+            if cancel.load(Ordering::Relaxed) {
+                return Err("The repair was cancelled before it changed anything.".into());
+            }
+            let trusted = archivefs_core::safe_read::TrustedRoots::from_paths(
+                archivefs_core::Config::load_default()
+                    .map_err(|error| error.to_string())?
+                    .source_folders,
+            );
+            let retained = preview
+                .group
+                .recommendation
+                .retained_path()
+                .ok_or_else(|| {
+                    "The approved duplicate group no longer has a retained copy.".to_string()
+                })?;
+            std::fs::create_dir_all(&preview.journal_dir)
+                .map_err(|error| format!("Could not prepare repair history: {error}"))?;
+            let mut cache = archivefs_core::repair::DuplicateHashCache::new();
+            let mut transaction = archivefs_core::repair::build_quarantine_transaction(
+                &preview.proposals,
+                retained,
+                &preview.trusted_root,
+                0,
+                &mut cache,
+                &trusted,
+                Some(&cancel),
+            )
+            .map_err(|error| format!("The preview is no longer safe: {error}"))?;
+            let _ = answers.send(Event::Progress {
+                id,
+                progress: super::activity::JobProgress::new(
+                    "Validating the approved files",
+                    "files",
+                )
+                .with_total(transaction.entries.len() as u64),
+            });
+            let outcome = archivefs_core::repair::apply_quarantine_transaction(
+                &mut transaction,
+                retained,
+                &preview.trusted_root,
+                0,
+                trusted,
+                &preview.journal_dir,
+                &cancel,
+                &mut cache,
+            )
+            .map_err(|error| error.to_string())?;
+            let _ = answers.send(Event::Progress {
+                id,
+                progress: super::activity::JobProgress::new("Writing the repair receipt", "files")
+                    .with_total(outcome.transaction.entries.len() as u64)
+                    .at(outcome.transaction.applied_count() as u64),
+            });
+            Ok(Payload::DuplicateApplied(Box::new(DuplicateRepairRecord {
+                transaction: outcome.transaction,
+                trusted_root: preview.trusted_root,
+                journal_dir: preview.journal_dir,
+            })))
+        }
+        Command::UndoDuplicateRepair {
+            record,
+            cancel,
+            generation,
+        } => Ok(Payload::DuplicateUndone(Box::new(
+            super::duplicate_undo::undo(*record, &cancel, generation),
+        ))),
+        Command::LoadRepairHistory => {
+            let journal_dir =
+                archivefs_core::dat::rename_apply::journal::default_rename_transaction_dir()
+                    .map_err(|error| error.to_string())?;
+            let legacy_dirs = archivefs_core::dat::rename_apply::seal::recognised_legacy_dirs();
+            Ok(load_repair_history(&journal_dir, &legacy_dirs))
+        }
+        Command::CreateStarterConfig { expected } => {
+            create_starter_config_at(&expected)?;
+            Ok(Payload::SetupCreated(format!(
+                "Created a starter configuration at {}. Next: add a game folder.",
+                expected.display()
+            )))
+        }
+        Command::CreateMountRoot { expected } => {
+            create_mount_root_at(&expected)?;
+            Ok(Payload::SetupCreated(format!(
+                "Created the mount folder {}.",
+                expected.display()
+            )))
+        }
+        Command::DoctorSummary => {
+            let report = archivefs_core::run_doctor_read_only_default();
+            Ok(Payload::DoctorSummary(
+                crate::doctor_page::doctor_report_text(&report),
+            ))
+        }
+        Command::OpenFolder(path) => {
+            let folder = path.parent().ok_or("This game has no containing folder.")?;
+            if !folder.is_absolute() || !folder.is_dir() {
+                return Err("The game folder is no longer available.".into());
+            }
+            crate::open_folder_in_file_manager(folder).map_err(|error| error.to_string())?;
+            Ok(Payload::Done)
+        }
+        Command::OpenDocument { path, expected } => {
+            super::documents::validate_external_document(&path, &expected)?;
+            archivefs_core::identity_source::romm::manual::DesktopManualOpener
+                .open(&path)
+                .map_err(|error| error.to_string())?;
+            Ok(Payload::Done)
+        }
+        Command::Save(preferences) => {
+            save_preferences(&preferences_path()?, &preferences)?;
+            Ok(Payload::Done)
+        }
+        Command::Restore => {
+            let path = preferences_path()?;
+            let preferences = match fs::read(&path) {
+                Ok(bytes) if bytes.len() <= 32 * 1024 => {
+                    serde_json::from_slice(&bytes).map_err(|error| error.to_string())?
+                }
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                    Preferences::default()
+                }
+                _ => {
+                    return Err(
+                        "The saved GUI v2 location could not be read. Home remains available."
+                            .into(),
+                    );
+                }
+            };
+            Ok(Payload::Preferences(preferences))
+        }
+        Command::PlayingLibraryPreview {
+            mut state,
+            generation,
+        } => {
+            state.preview();
+            Ok(Payload::PlayingLibraryPreview { state, generation })
+        }
+        Command::PlayingLibraryApply {
+            mut state,
+            generation,
+        } => {
+            state.confirm_apply();
+            Ok(Payload::PlayingLibraryApply { state, generation })
+        }
+        Command::PlayingLibrarySpecial {
+            mut state,
+            generation,
+            kind,
+        } => {
+            match kind {
+                super::PlayingLibraryJobKind::PreviewRomm => state.preview_romm(),
+                super::PlayingLibraryJobKind::ApplyRomm => state.confirm_romm_apply(),
+                super::PlayingLibraryJobKind::PreviewRetroDeck => state.preview_retrodeck(),
+                super::PlayingLibraryJobKind::ApplyRetroDeck => state.confirm_retrodeck_apply(),
+                super::PlayingLibraryJobKind::PreviewEsde => state.preview_esde_publication(),
+                super::PlayingLibraryJobKind::PublishEsde => state.confirm_esde_publish(),
+                super::PlayingLibraryJobKind::RecoverEsde => state.confirm_esde_recovery(),
+                super::PlayingLibraryJobKind::Rollback => state.rollback_last(),
+                super::PlayingLibraryJobKind::RollbackRomm => state.rollback_romm_last(),
+                super::PlayingLibraryJobKind::RollbackRetroDeck => state.rollback_retrodeck(),
+                super::PlayingLibraryJobKind::Preview | super::PlayingLibraryJobKind::Apply => {
+                    unreachable!("generic Playing Library jobs use dedicated commands")
+                }
+            }
+            Ok(Payload::PlayingLibrarySpecial {
+                state,
+                generation,
+                kind,
+            })
+        }
+        Command::CanonicalOrganisation {
+            mut state,
+            generation,
+            kind,
+            cancel,
+        } => {
+            let mut send = |progress| {
+                let _ = answers.send(Event::Progress { id, progress });
+            };
+            let mut reporter = archivefs_core::job_progress::ProgressReporter::new(&mut send);
+            match kind {
+                super::CanonicalOrganisationJobKind::Preview => {
+                    // A cancelled preview only read files: drop it and keep the
+                    // person's previous plan exactly as it was.
+                    if !state.generate_plan_reporting(Some(&cancel), &mut reporter) {
+                        return Err(super::activity::CANCELLED.to_string());
+                    }
+                }
+                super::CanonicalOrganisationJobKind::Apply => {
+                    reporter.phase("Applying the approved changes", "changes", None);
+                    reporter.flush();
+                    state.apply_cancellable(&cancel);
+                }
+                super::CanonicalOrganisationJobKind::Rollback => {
+                    reporter.phase("Undoing the organisation", "changes", None);
+                    reporter.flush();
+                    state.rollback();
+                }
+            }
+            Ok(Payload::CanonicalOrganisation {
+                state,
+                generation,
+                kind,
+            })
+        }
+        Command::PersistentStateInventory { roots, generation } => {
+            Ok(Payload::PersistentStateInventory {
+                inventory: archivefs_core::persistent_state_inventory::inventory_persistent_state(
+                    &roots,
+                ),
+                generation,
+            })
+        }
+        Command::SaveSnapshotHistory {
+            root,
+            targets,
+            generation,
+        } => Ok(Payload::SaveSnapshotHistory {
+            report: super::save_snapshots::load_history(
+                &root,
+                &targets,
+                &archivefs_core::save_snapshots::history::default_closure_observer(),
+            ),
+            generation,
+        }),
+        Command::CreateSaveSnapshot { root, target } => Ok(Payload::SaveSnapshotCreated {
+            result: super::save_snapshots::create(
+                &root,
+                &target,
+                &archivefs_core::save_snapshots::history::default_closure_observer(),
+            ),
+        }),
+    }
+}
+
+pub(super) fn trusted_root_for(path: &Path, roots: &[PathBuf]) -> Result<PathBuf, String> {
+    roots
+        .iter()
+        .filter(|root| path.starts_with(root))
+        .max_by_key(|root| root.components().count())
+        .cloned()
+        .ok_or_else(|| "The duplicate is outside every configured trusted game folder.".into())
+}
+
+pub(super) fn load_library(path: &Path) -> Result<Library, String> {
+    let sources = archivefs_core::dat::sources::default_dat_sources_config_path()
+        .map(|path| archivefs_core::dat::configured_catalogues::load_configured_catalogues(&path))
+        .unwrap_or_default();
+    load_library_with_catalogues(path, &sources)
+}
+
+pub(super) fn load_library_with_catalogues(
+    path: &Path,
+    sources: &std::collections::HashMap<
+        String,
+        archivefs_core::dat::configured_catalogues::ConfiguredCatalogue,
+    >,
+) -> Result<Library, String> {
+    let start = Instant::now();
+    if !path.exists() {
+        return Ok(Library::default());
+    }
+    let database = Database::open_read_only(path).map_err(|error| error.to_string())?;
+    let archives = database
+        .load_archives()
+        .map_err(|error| error.to_string())?;
+    // EmuWiz's own applied renames are evidence that an old row has moved. They
+    // sit beside the database; nothing is written.
+    let renames = path
+        .parent()
+        .map(|dir| {
+            archivefs_core::catalogue_supersession::applied_renames_from_journals(
+                &dir.join(archivefs_core::dat::rename_apply::RENAME_TRANSACTIONS_DIRECTORY),
+            )
+        })
+        .unwrap_or_default();
+    // A source that is no longer configured is an old library location.
+    let configured: std::collections::HashSet<i64> = database
+        .list_source_folders()
+        .map_err(|error| error.to_string())?
+        .into_iter()
+        .map(|source| source.id)
+        .collect();
+    let matched: std::collections::HashSet<i64> = [
+        archivefs_core::dat::set::SetState::Complete,
+        archivefs_core::dat::set::SetState::Incomplete,
+    ]
+    .iter()
+    .filter_map(|state| database.set_audit_results_by_state(state).ok())
+    .flatten()
+    .filter(|result| !result.stale)
+    .filter_map(|result| result.archive_id)
+    .collect();
+    let mut library = Library::with_history(archives, &renames, Some(&configured));
+    library.identity_context = super::library::IdentityContext {
+        inventory: crate::dat_catalogue_picker::reference_inventory(),
+        matched,
+    };
+    let dat_evidence = database
+        .current_library_dat_evidence(sources)
+        .map_err(|error| error.to_string())?;
+    // Current source and content evidence is shared with Game Details.
+    for (archive_id, ecosystem) in dat_evidence.exact {
+        if let Some(index) = library.by_id.get(&archive_id).copied() {
+            library.games[index].mark_dat_exact(ecosystem);
+            library.games[index].dat_exact_hashes =
+                dat_evidence.exact_hashes.get(&archive_id).cloned();
+        }
+    }
+    // Other saved DAT evidence, shown as such; never a verification.
+    for (archive_id, state) in dat_evidence.states {
+        if let Some(index) = library.by_id.get(&archive_id).copied() {
+            library.games[index].dat_state = Some(state);
+        }
+    }
+    for enrichment in database
+        .load_screenscraper_enrichments()
+        .map_err(|error| error.to_string())?
+    {
+        if let Some(index) = library.by_id.get(&enrichment.archive_id).copied() {
+            library.games[index].screenscraper = Some(enrichment);
+        }
+    }
+    library.load_ms = start.elapsed().as_millis();
+    log::debug!(
+        "gui_v2 library: {} games, {} ms",
+        library.games.len(),
+        library.load_ms
+    );
+    Ok(library)
+}
+
+fn load_detail(game: &Game) -> Result<Detail, String> {
+    let metadata = fs::metadata(&game.archive.absolute_path).ok();
+    let unchanged = metadata.as_ref().is_some_and(|metadata| {
+        Some(metadata.len()) == game.archive.size_bytes
+            && metadata
+                .modified()
+                .ok()
+                .and_then(|time| time.duration_since(std::time::UNIX_EPOCH).ok())
+                .and_then(|duration| i64::try_from(duration.as_secs()).ok())
+                == game.archive.modified_time_unix_seconds
+    });
+    let database =
+        Database::open_read_only(&default_database_path().map_err(|error| error.to_string())?)
+            .map_err(|error| error.to_string())?;
+    let checks = database
+        .library_dat_identities_for_item(game.archive.id)
+        .map_err(|error| error.to_string())?;
+    let compatibility = archivefs_core::launch::platform_map::LAUNCH_COMPATIBILITY
+        .iter()
+        .find(|entry| entry.platform_id == game.platform);
+    let mut installed: Vec<_> =
+        archivefs_core::diagnostics::profiles::discover_linux_emulator_installations()
+            .into_iter()
+            .filter(|evidence| evidence.executable.is_some())
+            .filter(|evidence| {
+                compatibility.is_some_and(|entry| {
+                    entry
+                        .standalone_adapters
+                        .iter()
+                        .any(|adapter| adapter.eq_ignore_ascii_case(&evidence.emulator))
+                }) || evidence.emulator.eq_ignore_ascii_case("RetroArch")
+            })
+            .map(|evidence| evidence.emulator)
+            .collect();
+    installed.sort();
+    installed.dedup();
+    Ok(Detail {
+        game: game.archive.id,
+        file_present: metadata.is_some(),
+        unchanged,
+        saved_checks: checks.len(),
+        installed,
+        technical: format!(
+            "Saved health: {}\nSaved checks: {}\n{}",
+            game.archive.last_known_health,
+            checks.len(),
+            game.archive.absolute_path.display()
+        ),
+    })
+}
+
+/// Creates the starter configuration only where the person confirmed it.
+/// If the configuration path changed since then, nothing is written.
+pub(super) fn create_starter_config_at(expected: &Path) -> Result<(), String> {
+    let current = archivefs_core::default_config_path().map_err(|error| error.to_string())?;
+    if current != expected {
+        return Err(format!(
+            "The configuration location changed to {} since you confirmed. Nothing was created; check again and confirm the new location.",
+            current.display()
+        ));
+    }
+    // `create_starter_config` never replaces an existing file.
+    archivefs_core::create_starter_config(&current).map_err(|error| error.to_string())
+}
+
+/// Creates the mount root only when the configuration still names the folder
+/// the person confirmed. Core refuses an existing folder or a missing parent.
+pub(super) fn create_mount_root_at(expected: &Path) -> Result<(), String> {
+    let config = archivefs_core::default_config_path().map_err(|error| error.to_string())?;
+    let diagnostics = archivefs_core::run_setup_diagnostics_read_only(&config);
+    if diagnostics.mount_root.as_deref() != Some(expected) || !diagnostics.can_create_mount_root {
+        return Err(
+            "The configured mount folder changed or can no longer be created since you confirmed. Nothing was created; check again."
+                .into(),
+        );
+    }
+    archivefs_core::create_configured_mount_root_default()
+        .map(|_| ())
+        .map_err(|error| error.to_string())
+}
+
+fn preferences_path() -> Result<PathBuf, String> {
+    archivefs_core::app_dirs::config_path("gui-v2.json").map_err(|error| error.to_string())
+}
+
+pub(super) fn save_preferences(path: &Path, preferences: &Preferences) -> Result<(), String> {
+    let parent = path.parent().ok_or("No settings directory.")?;
+    fs::create_dir_all(parent).map_err(|error| error.to_string())?;
+    if fs::symlink_metadata(path).is_ok_and(|meta| !meta.file_type().is_file()) {
+        return Err("GUI v2 settings are not a regular file; no settings were replaced.".into());
+    }
+    let bytes = serde_json::to_vec(preferences).map_err(|error| error.to_string())?;
+    let mut temporary =
+        tempfile::NamedTempFile::new_in(parent).map_err(|error| error.to_string())?;
+    temporary
+        .write_all(&bytes)
+        .map_err(|error| error.to_string())?;
+    temporary
+        .as_file()
+        .sync_all()
+        .map_err(|error| error.to_string())?;
+    temporary.persist(path).map_err(|error| error.to_string())?;
+    Ok(())
+}
+
+#[cfg(test)]
+mod duplicate_undo_tests;
+
+/// History from the sealed folder and every legacy folder. Read only: records
+/// are found, classified and shown; nothing is rewritten, sealed, moved or
+/// created to display them. Only trusted sealed records can offer Undo.
+pub(super) fn load_repair_history(journal_dir: &Path, legacy_dirs: &[PathBuf]) -> Payload {
+    let found = archivefs_core::dat::rename_apply::seal::history_evidence(journal_dir, legacy_dirs);
+    let mut duplicates = Vec::new();
+    let mut playing_libraries = Vec::new();
+    let mut organisations = Vec::new();
+    let mut mame_reconstructions = Vec::new();
+    let mut evidence = Vec::new();
+    for item in found {
+        let trusted = item.status.trusted()
+            && item
+                .transaction
+                .as_ref()
+                .is_some_and(|transaction| transaction.transaction_id == item.file_id);
+        let Some(transaction) = item.transaction.clone().filter(|_| trusted) else {
+            evidence.push(item);
+            continue;
+        };
+        match super::history_view::source_of(&transaction) {
+            super::history_view::Source::DuplicateQuarantine => {
+                duplicates.push(DuplicateRepairRecord {
+                    trusted_root: PathBuf::from(&transaction.source_scan_root),
+                    transaction,
+                    journal_dir: journal_dir.to_path_buf(),
+                })
+            }
+            super::history_view::Source::MameReconstruction => {
+                mame_reconstructions.push(transaction)
+            }
+            super::history_view::Source::PlayingLibrary => playing_libraries.push(transaction),
+            _ => organisations.push(transaction),
+        }
+    }
+    Payload::RepairHistory {
+        duplicates,
+        playing_libraries,
+        organisations,
+        mame_reconstructions,
+        evidence,
+    }
+}

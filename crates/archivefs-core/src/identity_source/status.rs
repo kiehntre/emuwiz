@@ -20,7 +20,9 @@ use super::model::{ExternalIdentityRecord, IdentityImportCounts, IdentityProvide
 use super::romm::capability::RommCapabilityReport;
 use super::romm::client::{RommClient, RommRequestError, RommTransport};
 use super::romm::config::{RommSourceConfig, ValidatedRommSource};
-use super::romm::import::{ImportFailure, ImportOutcome, ImportScope, import_identity};
+use super::romm::import::{
+    ImportFailure, ImportOutcome, ImportScope, import_identity_with_deadline,
+};
 
 /// Where a source is in its lifecycle.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
@@ -212,13 +214,14 @@ impl IdentitySourceApi {
             hashes,
             page_size,
             cancel,
+            import_timeout,
         } = request;
         let ImportOutcome {
             mut cache,
             progress,
             normalisation,
             adaptive,
-        } = import_identity(
+        } = import_identity_with_deadline(
             source,
             transport,
             scope,
@@ -226,6 +229,7 @@ impl IdentitySourceApi {
             page_size,
             on_progress,
             cancel,
+            import_timeout,
         )?;
 
         // Matching happens before publication, so a published cache always has
@@ -244,6 +248,10 @@ impl IdentitySourceApi {
             records: cache.records.len(),
             invalid_hashes: normalisation.rejected_hashes.len(),
             unknown_platforms: normalisation.unknown_platforms.len(),
+            // Entries RomM returned that carried no usable identity at all,
+            // so they never became a record and were never in a position to
+            // carry game information either.
+            game_information_failed: normalisation.skipped_records,
             groups: build_groups(&cache.records),
             progress,
             adaptive,
@@ -411,6 +419,11 @@ pub struct RefreshRequest<'a, T: RommTransport> {
     /// response is too large; it is never exceeded.
     pub page_size: u32,
     pub cancel: Option<&'a AtomicBool>,
+    /// How long this import may run before it is abandoned - the previous
+    /// cache is left untouched either way. See
+    /// [`super::settings::ProviderSettings::effective_import_timeout`] for
+    /// where a caller derives this from the person's own configuration.
+    pub import_timeout: std::time::Duration,
 }
 
 /// What a successful refresh produced.
@@ -422,6 +435,10 @@ pub struct RefreshSummary {
     pub records: usize,
     pub invalid_hashes: usize,
     pub unknown_platforms: usize,
+    /// Entries RomM returned that never became a cached record at all (no
+    /// usable identity), and so could not be checked for game information
+    /// either.
+    pub game_information_failed: usize,
     pub groups: Vec<IdentityGroup>,
     pub progress: super::romm::import::ImportProgress,
     /// What adaptive paging had to do to get through the catalogue.

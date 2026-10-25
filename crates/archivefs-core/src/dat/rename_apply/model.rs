@@ -43,6 +43,16 @@ pub enum TransactionState {
     RolledBack,
     /// Rollback could not be completed safely.
     RollbackFailed,
+    /// MAME Finalise Replacement has been journalled (sealed) and the retained
+    /// Undo original may or may not have been deleted yet. Undo is already
+    /// unavailable. Only Finalise Replacement itself writes this state, and only
+    /// to finish (`Finalised`) or, while the original is proven intact, to
+    /// cancel (back to `Applied`). Older builds cannot read it and fail closed.
+    Finalising,
+    /// Terminal: the replacement is final, its retained original was deleted on
+    /// explicit confirmation and Undo can never be offered again. The journal
+    /// stays in History as the audit record and is immutable.
+    Finalised,
 }
 
 impl TransactionState {
@@ -57,7 +67,14 @@ impl TransactionState {
                 | Self::ApplyFailed
                 | Self::RollingBack
                 | Self::RollbackFailed
+                | Self::Finalising
         )
+    }
+
+    /// Whether this state surrendered Undo. No code path may offer, attempt or
+    /// reverse Undo for such a journal.
+    pub fn undo_surrendered(self) -> bool {
+        matches!(self, Self::Finalising | Self::Finalised)
     }
 
     pub fn label(self) -> &'static str {
@@ -69,6 +86,89 @@ impl TransactionState {
             Self::RollingBack => "Rolling back",
             Self::RolledBack => "Rolled back",
             Self::RollbackFailed => "Rollback failed",
+            Self::Finalising => "Finalising",
+            Self::Finalised => "Finalised",
+        }
+    }
+}
+
+/// A user's explicit decision about the crash-recovery prompt an
+/// interrupted transaction (`TransactionState::needs_recovery`) shows,
+/// persisted durably so it survives a restart.
+///
+/// This is deliberately a decision *about the prompt*, never a claim about
+/// what happened to any file - `TransactionState` and every
+/// [`TransactionEntry::state`] remain the one truthful record of that,
+/// completely unchanged by a resolution. Recording `LeaveUntouched` must
+/// never be confused with, or substitute for, marking a transaction
+/// `Applied`: an unresolved batch that is later acknowledged is still
+/// exactly as interrupted as it always was; the user has only said "stop
+/// asking me to decide right now."
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RecoveryResolution {
+    /// The user was offered "Roll back completed steps" / "Leave
+    /// untouched" and chose to leave it. Nothing was rolled back and
+    /// nothing was applied as a result of this choice alone.
+    LeaveUntouched,
+}
+
+/// The durable lifecycle of an approval-bound exact-resume record.
+///
+/// This is intentionally separate from [`TransactionState`]. The latter is
+/// the existing apply/rollback history; this state says whether an immutable
+/// approval envelope is available for an exact retry.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ExactResumeState {
+    /// The approved operation set is still pending, including after a crash
+    /// left the transaction in an in-flight state.
+    Pending,
+    /// Every approved operation is filesystem-confirmed complete.
+    Completed,
+    /// An exact attempt stopped on an execution failure and remains eligible
+    /// for a later exact reconciliation if the filesystem still proves it.
+    Failed,
+    /// An exact attempt was interrupted before all approved operations ran.
+    Interrupted,
+    /// The envelope or filesystem no longer proves a safe exact retry.
+    NotResumable,
+}
+
+/// Immutable approval evidence for one DAT-backed rename transaction.
+///
+/// The envelope is captured from the reviewed plan and explicit approvals;
+/// resume never rebuilds it from a fresh plan. The mutable entry/checkpoint
+/// state remains in the journal payload alongside [`RenameTransaction`].
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ExactResumeEnvelope {
+    pub format_version: u32,
+    pub transaction_id: String,
+    pub approved_generation: u64,
+    pub classifier_version: String,
+    pub plan_digest: String,
+    pub source_scan_root: String,
+    pub approved_source_paths: Vec<String>,
+    pub operations: Vec<ExactResumeOperation>,
+    pub created_at_unix: u64,
+}
+
+/// One exact, approval-bound operation in an [`ExactResumeEnvelope`].
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ExactResumeOperation {
+    pub index: usize,
+    pub source_path: PathBuf,
+    pub destination_path: PathBuf,
+    pub operation: TransactionOperation,
+    pub identity: ObjectIdentity,
+    pub original_basename: String,
+    pub proposed_basename: String,
+}
+
+impl RecoveryResolution {
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::LeaveUntouched => "Resolved: Left untouched by user",
         }
     }
 }
@@ -133,9 +233,9 @@ impl ObjectKind {
 }
 
 /// A snapshot of a source file's identity at the moment the transaction was
-/// built. Preflight and post-rename verification compare against this so that
-/// a file replaced, resized, or swapped for a symlink after review is never
-/// renamed by mistake.
+/// built. Preflight, post-rename verification and recovery compare both the
+/// filesystem object and its persisted content freshness proof. This does
+/// not make a later pathname mutation atomic with the check.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ObjectIdentity {
     pub size_bytes: u64,
@@ -150,6 +250,58 @@ pub struct ObjectIdentity {
     #[cfg(unix)]
     #[serde(default)]
     pub dev: u64,
+    /// Missing in legacy journals. Those remain readable for history, but
+    /// cannot authorize mutation by silently capturing a new baseline.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub freshness: Option<ObjectFreshness>,
+}
+
+/// Versioned content proof captured from a stable open regular file, or from
+/// the raw target text of a symlink object (never the target file's contents).
+/// Modification time retains full filesystem precision. ctime is used only
+/// during capture: rename legitimately changes it, so it is not persisted as
+/// a pre/post-rename equality requirement.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ObjectFreshness {
+    pub version: u32,
+    pub modified: std::time::SystemTime,
+    pub sha256: [u8; 32],
+}
+
+/// The filesystem operation explicitly authorised for one journal entry.
+/// Older journals omit this field and therefore retain rename/move behaviour.
+#[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum TransactionOperation {
+    #[default]
+    RenameMove,
+    /// Exchange a verified staged regular file with a reviewed existing target.
+    /// The exact original remains at `source_path` for durable recovery/undo.
+    ReplaceExisting {
+        original_identity: ObjectIdentity,
+        destination_root: PathBuf,
+    },
+    CreateSymlink {
+        expected_target: PathBuf,
+        /// The sole root beneath which this transaction may create or remove
+        /// its destination link. It is journalled for restart-safe rollback.
+        destination_root: PathBuf,
+    },
+    /// Create a hardlink to the recorded regular source. The source remains
+    /// in place; the destination is the only mutation target.
+    CreateHardlink {
+        expected_source: PathBuf,
+        /// The sole root beneath which this transaction may create or remove
+        /// its destination hardlink.
+        destination_root: PathBuf,
+    },
+    /// Copy the recorded regular source into a new destination. The executor
+    /// performs the copy through a same-directory temporary and a
+    /// no-clobber rename; the source remains untouched.
+    CreateCopy {
+        expected_source: PathBuf,
+        destination_root: PathBuf,
+    },
 }
 
 /// One step of a rename transaction: one approved proposal.
@@ -163,6 +315,8 @@ pub struct TransactionEntry {
     pub proposed_basename: String,
     /// The source identity captured when the transaction was built.
     pub identity: ObjectIdentity,
+    #[serde(default)]
+    pub operation: TransactionOperation,
     /// The last preflight result for this entry, when one ran.
     #[serde(default)]
     pub preflight_passed: bool,
@@ -188,6 +342,20 @@ impl TransactionEntry {
     /// not already been rolled back).
     pub fn is_eligible_for_rollback(&self) -> bool {
         self.state == EntryState::Applied
+    }
+
+    /// Whether this entry's own state rules out calling the transaction fully
+    /// rolled back: it is still applied, still in flight, or an earlier undo
+    /// of it failed. Entries that were never applied (planned, skipped, failed
+    /// to apply) and entries already rolled back do not block.
+    pub fn blocks_full_rollback(&self) -> bool {
+        matches!(
+            self.state,
+            EntryState::Applying
+                | EntryState::Applied
+                | EntryState::RollingBack
+                | EntryState::RollbackFailed
+        )
     }
 }
 
@@ -220,6 +388,16 @@ pub struct RenameTransaction {
     /// a pre-existing user directory is never recorded here and never removed.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub created_directories: Vec<PathBuf>,
+    /// The user's explicit decision about this transaction's crash-recovery
+    /// prompt, if any - see [`RecoveryResolution`]'s own doc for why this is
+    /// kept entirely separate from `state`. `None` for every journal written
+    /// before this field existed (backward compatible via `#[serde(default)]`)
+    /// and for every transaction never offered the prompt.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub recovery_resolution: Option<RecoveryResolution>,
+    /// When `recovery_resolution` was recorded, for provenance only.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub recovery_resolved_at_unix: Option<u64>,
     /// Keys a future build wrote that this one does not understand, kept
     /// verbatim so reading a journal never discards them.
     #[serde(flatten)]
@@ -228,6 +406,17 @@ pub struct RenameTransaction {
 }
 
 impl RenameTransaction {
+    /// Whether this transaction still genuinely needs a user decision right
+    /// now: it is interrupted (`state.needs_recovery()`) and has not
+    /// already been resolved. Unlike `state.needs_recovery()` itself, this
+    /// is affected by `recovery_resolution` - callers that mean "was this
+    /// batch interrupted, ever" (an honest audit trail question) must keep
+    /// using `state.needs_recovery()` directly; this is only for "should
+    /// this still nag the user right now".
+    pub fn needs_attention(&self) -> bool {
+        self.state.needs_recovery() && self.recovery_resolution.is_none()
+    }
+
     pub fn applied_count(&self) -> usize {
         self.entries
             .iter()
@@ -239,6 +428,14 @@ impl RenameTransaction {
         self.entries
             .iter()
             .filter(|entry| entry.state == EntryState::Skipped)
+            .count()
+    }
+
+    /// Entries left in flight (`Applying` / `RollingBack`).
+    pub fn unresolved_count(&self) -> usize {
+        self.entries
+            .iter()
+            .filter(|entry| matches!(entry.state, EntryState::Applying | EntryState::RollingBack))
             .count()
     }
 
@@ -269,9 +466,54 @@ impl RenameTransaction {
             TransactionState::Planned | TransactionState::Applying | TransactionState::RollingBack
         )
     }
+
+    /// Whether a persisted transaction is still actionable after a restart: a
+    /// settled `Applied` transaction that still has applied entries can be
+    /// rolled back, and any interrupted transaction must be surfaced for
+    /// recovery. A fully `RolledBack` transaction is neither, and an `Applied`
+    /// transaction whose entries are not actually Applied has nothing to
+    /// reverse and is not offered.
+    pub fn is_rollbackable(&self) -> bool {
+        !self.state.undo_surrendered()
+            && ((self.state == TransactionState::Applied && self.has_applied_entries())
+                || self.state.needs_recovery())
+    }
+
+    /// Whether the journal as a whole proves a full rollback: the transaction
+    /// is `RolledBack` and no entry contradicts that. The transaction-level
+    /// state alone is never enough.
+    pub fn is_fully_rolled_back(&self) -> bool {
+        self.state == TransactionState::RolledBack
+            && !self
+                .entries
+                .iter()
+                .any(TransactionEntry::blocks_full_rollback)
+    }
+}
+
+/// One entry whose outcome is not known to be settled: it is still in flight
+/// (`Applying`/`RollingBack`) or its rollback failed. It is reported
+/// explicitly so it is never mistaken for a success, a clean failure or an
+/// untouched file.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct UnresolvedEntry {
+    pub source_path: PathBuf,
+    pub destination_path: PathBuf,
+    pub state: EntryState,
+    /// Where it stopped, e.g. "directory synchronisation after rename".
+    pub stage: String,
+    /// The journalled reason, when one was recorded (it may be absent after a
+    /// crash; absence never means the entry is safe).
+    pub detail: Option<String>,
+    /// What must happen before anything else touches this entry.
+    pub required_action: String,
 }
 
 /// A human-readable summary of an apply or rollback run.
+///
+/// Every entry is counted in exactly one of `applied`, `skipped`, `failed`,
+/// `rolled_back`, `pending` (not yet attempted) or `unresolved`, so
+/// [`TransactionSummary::accounted`] always equals `requested`.
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct TransactionSummary {
     pub transaction_id: String,
@@ -279,6 +521,13 @@ pub struct TransactionSummary {
     pub applied: usize,
     pub skipped: usize,
     pub failed: usize,
+    /// Entries whose rename was reversed.
+    pub rolled_back: usize,
+    /// Entries not yet attempted (`Planned`/`PreflightPassed`).
+    pub pending: usize,
+    /// Entries in flight or with a failed rollback: outcome not established.
+    pub unresolved: usize,
+    pub unresolved_entries: Vec<UnresolvedEntry>,
     pub rollback: RollbackStatus,
     /// Seconds since the Unix epoch when the run started/ended, when known.
     pub started_at_unix: Option<u64>,
@@ -287,12 +536,37 @@ pub struct TransactionSummary {
 
 impl TransactionSummary {
     pub fn from_transaction(transaction: &RenameTransaction) -> Self {
+        let unresolved_entries: Vec<UnresolvedEntry> = transaction
+            .entries
+            .iter()
+            .filter(|entry| {
+                matches!(
+                    entry.state,
+                    EntryState::Applying | EntryState::RollingBack | EntryState::RollbackFailed
+                )
+            })
+            .map(unresolved_entry)
+            .collect();
+        let pending = transaction
+            .entries
+            .iter()
+            .filter(|entry| {
+                matches!(
+                    entry.state,
+                    EntryState::Planned | EntryState::PreflightPassed
+                )
+            })
+            .count();
         Self {
             transaction_id: transaction.transaction_id.clone(),
             requested: transaction.entries.len(),
             applied: transaction.applied_count(),
             skipped: transaction.skipped_count(),
             failed: transaction.failed_count(),
+            rolled_back: transaction.rolled_back_count(),
+            pending,
+            unresolved: unresolved_entries.len(),
+            unresolved_entries,
             rollback: match transaction.state {
                 TransactionState::RolledBack => RollbackStatus::FullyRolledBack,
                 TransactionState::RollbackFailed => RollbackStatus::RollbackFailed,
@@ -308,6 +582,123 @@ impl TransactionSummary {
             started_at_unix: None,
             ended_at_unix: None,
         }
+    }
+
+    /// Sum of every disjoint bucket; equals `requested` for a summary built by
+    /// [`Self::from_transaction`].
+    pub fn accounted(&self) -> usize {
+        self.applied
+            + self.skipped
+            + self.failed
+            + self.rolled_back
+            + self.pending
+            + self.unresolved
+    }
+
+    /// True only when nothing is in flight, nothing failed and nothing is
+    /// still pending: the only state in which a run may be called complete.
+    pub fn fully_resolved(&self) -> bool {
+        self.unresolved == 0 && self.pending == 0 && self.failed == 0
+    }
+}
+
+fn unresolved_entry(entry: &TransactionEntry) -> UnresolvedEntry {
+    #[cfg(target_os = "linux")]
+    if super::identity::fd_publication_probe::contract::enrolled(entry)
+        && let Some(runtime) = entry
+            .unknown
+            .get(super::identity::fd_publication_probe::contract::KEY)
+    {
+        use super::identity::fd_publication_probe::contract::{Evidence, Phase};
+        let parsed = serde_json::from_value::<Evidence>(runtime.clone());
+        let (stage, action) = match parsed.as_ref().map(|value| value.phase) {
+            Ok(Phase::CapturePending | Phase::Captured | Phase::CleanupPending) => (
+                "Undo incomplete; trusted holding recovery pending",
+                "Use signed FD recovery after revalidating authoritative evidence; legacy reconciliation is refused.",
+            ),
+            Ok(Phase::ForeignHeld) => (
+                "Held for review / Undo incomplete",
+                "Explicit operator review required before any further file-changing action.",
+            ),
+            Ok(Phase::Salvaged) => (
+                "Salvaged into a new inode / Undo incomplete",
+                "Review the retained salvage copy and original identity; do not report the copy as the original.",
+            ),
+            Ok(Phase::PossiblyUnrecoverable) => (
+                "Original-file cleanup requires review / Undo incomplete",
+                "Use read-only R2 status to inspect the original path and identity; preserve missing cleanup evidence. An observed original is not proof of completed Undo.",
+            ),
+            Ok(Phase::SalvagePending) => (
+                "Original file may be unrecoverable / Undo incomplete",
+                "Preserve all evidence and request operator review; a lost descriptor cannot be recovered by guessing names.",
+            ),
+            Ok(Phase::RetentionPending) => (
+                "Separately signed foreign retention incomplete",
+                "Preserve the foreign object and original anchor; only a fresh retain-foreign approval may continue settlement. Ordinary Undo cannot authorise it.",
+            ),
+            Ok(Phase::RetainedForeign) => (
+                "Original restored; reviewed foreign file retained",
+                "Keep the holding file, original continuity anchor and signed receipt. Use the operator retained inventory; no automatic cleanup is supported.",
+            ),
+            _ => (
+                "Recovery evidence requires review / Undo incomplete",
+                "Preserve authoritative records and holding entries; refuse automatic mutation or log cleanup.",
+            ),
+        };
+        return UnresolvedEntry {
+            source_path: entry.source_path.clone(),
+            destination_path: entry.destination_path.clone(),
+            state: entry.state,
+            stage: if parsed.as_ref().is_ok_and(|v| {
+                v.action == super::identity::fd_publication_probe::contract::Action::Apply
+            }) {
+                stage.replace("Undo", "Apply")
+            } else {
+                stage.into()
+            },
+            detail: entry.failure_reason.clone(),
+            required_action: if parsed.as_ref().is_ok_and(|v| {
+                v.action == super::identity::fd_publication_probe::contract::Action::Apply
+            }) {
+                "Apply incomplete: retain holding and request explicit operator review; automatic Apply resume is unsupported.".into()
+            } else {
+                action.into()
+            },
+        };
+    }
+    let sync_failed = entry.state == EntryState::Applying
+        && entry
+            .failure_reason
+            .as_deref()
+            .is_some_and(|reason| reason.contains(super::dirsync::SYNC_FAILURE_MARKER));
+    let (stage, required_action) = match entry.state {
+        EntryState::Applying if sync_failed => (
+            "directory synchronisation after rename",
+            "Run recovery reconciliation: the rename happened but its directory entries are not \
+             proven durable. Do not repeat the rename.",
+        ),
+        EntryState::Applying => (
+            "rename in flight (completion not recorded)",
+            "Run recovery reconciliation against the filesystem before any further action; do \
+             not replay the rename.",
+        ),
+        EntryState::RollingBack => (
+            "reverse rename in flight (completion not recorded)",
+            "Run recovery reconciliation against the filesystem before any further action; do \
+             not repeat the reverse rename.",
+        ),
+        _ => (
+            "rollback failed",
+            "Review the journalled reason; the file may still be at the destination.",
+        ),
+    };
+    UnresolvedEntry {
+        source_path: entry.source_path.clone(),
+        destination_path: entry.destination_path.clone(),
+        state: entry.state,
+        stage: stage.to_string(),
+        detail: entry.failure_reason.clone(),
+        required_action: required_action.to_string(),
     }
 }
 

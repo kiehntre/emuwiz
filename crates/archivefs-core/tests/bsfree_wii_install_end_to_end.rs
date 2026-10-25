@@ -4,6 +4,8 @@
 //! GameCube e2e suite so the Wii path is proven to reuse the same safety
 //! engine rather than a parallel one.
 
+archivefs_core::install_test_environment!();
+
 use std::fs;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, Ordering};

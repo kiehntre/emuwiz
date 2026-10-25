@@ -8,39 +8,80 @@
 //! up, or currently unavailable. Nothing on this page is a new capability -
 //! it is a front door onto capabilities that already exist.
 //!
-//! # The view model, and why some cards say "not checked yet"
+//! # The view model
 //!
 //! Following `romm_source`/`cheat_sources_page`, authoritative state is
 //! turned into a [`HomeView`] by the pure [`build_home_view`], and the
 //! drawing code only draws. `main.rs` builds [`HomeInputs`] from whatever
 //! is already loaded on `ArchiveFsApp` - never from a fresh read.
 //!
-//! Three of the seven cards (Cheats & Mods' source count, DAT Sources'
-//! registry count, RomM's provider state) read state that EmuWiz
-//! deliberately does not load until the user visits that page - loading it
-//! eagerly here would mean opening Home always triggers three background
-//! reads nobody asked for, network-shaped or not. So when the real page
-//! has not been visited yet this session, [`CardReadiness::Unknown`] is
-//! shown - "open it to check" - rather than guessing, or lying that
-//! nothing is configured.
+//! Some cards read state that EmuWiz deliberately does not load until the
+//! user visits that page. Home omits those badges until their real state is
+//! known rather than presenting an ordinary lazy load as a problem.
 
+use std::collections::HashMap;
+
+// The snapshot projection moved here from `main.rs` still spells this
+// page's own items `home_page::…`; keeping that name in scope leaves the
+// moved body byte-for-byte identical to what `main.rs` ran.
+use crate::CachedLibrarySnapshot;
+use crate::home_page;
 use crate::ui::{components as widgets, theme};
-use archivefs_core::{SetupDiagnostic, SetupDiagnosticStatus};
+use archivefs_core::identity_source::model::MediaCoverage;
 use eframe::egui;
 
-/// One of the seven task-oriented destinations Home can send a user to.
+/// One platform's collection-centric summary within [`HomeLibrarySnapshot`].
+/// A minimal typed shape - see `main.rs::home_library_snapshot` for how it is
+/// built from the already-loaded catalogue and (when present) the existing
+/// RomM snapshot. This crosses no provider boundary itself: `romm_media_coverage`
+/// is read from an already-computed RomM snapshot field, never recomputed
+/// here.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct HomePlatformSummary {
+    pub(crate) name: String,
+    pub(crate) total: usize,
+    pub(crate) identified: usize,
+    pub(crate) missing: usize,
+    pub(crate) romm_media_coverage: Option<MediaCoverage>,
+}
+
+/// A projection of the already-loaded catalogue, keyed by platform. `None`
+/// on [`HomeInputs::library`] means no catalogue snapshot is available; this
+/// type never triggers a scan or provider request of its own.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct HomeLibrarySnapshot {
+    pub(crate) total: usize,
+    pub(crate) present: usize,
+    pub(crate) identified: usize,
+    pub(crate) unresolved: usize,
+    pub(crate) missing: usize,
+    pub(crate) duplicate_groups: usize,
+    pub(crate) platforms: Vec<HomePlatformSummary>,
+    /// Coverage is authoritative only for records imported from RomM.
+    pub(crate) romm_media_coverage: Option<MediaCoverage>,
+}
+
+/// One of the task-oriented destinations Home can send a user to.
 /// `main.rs` maps each variant to the `MainView` (and, for the two that
 /// need it, the extra dispatch logic) its sidebar button already uses -
 /// Home never invents a second way to reach a destination.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub(crate) enum HomeCard {
     BuildLibrary,
+    ConvertDiscs,
     BrowseGames,
+    DuplicateReview,
     CheatsAndMods,
     CanonicalOrganisation,
-    CleanUpLibrary,
+    QuickRename,
     CheatSources,
     DatSources,
+    /// Not a card in `HomeView::cards` - returned only by the
+    /// [`HomeBanner::ConfigDisappeared`] banner's own action button, so a
+    /// user told their settings could not be found has a direct way to
+    /// reach the destination that can explain why, through the same
+    /// `Option<HomeCard>` channel every other Home action already uses.
+    CheckProblems,
     RomM,
     CheckSetup,
     Settings,
@@ -56,9 +97,9 @@ pub(crate) enum HomeCard {
 ///   is not ready). Never conflated with "not configured".
 /// - [`Self::Ready`]: configured and, as far as already-loaded state shows,
 ///   usable.
-/// - [`Self::Unknown`]: Home has not loaded enough to say. Only used for
-///   the three lazily-loaded destinations described in the module docs,
-///   and only before their real page has been visited this session.
+/// - [`Self::Unknown`]: Home has loaded an active task state but not enough
+///   evidence to claim ready or unavailable. Lazily loaded destinations
+///   omit the badge entirely until their page has established a state.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum CardReadiness {
     NotConfigured(String),
@@ -102,22 +143,16 @@ pub(crate) enum HomeCardTier {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum HomeAccent {
     Games,
-    Organise,
     Check,
-    Cheats,
     Verify,
-    Settings,
 }
 
 impl HomeAccent {
     fn color(self) -> egui::Color32 {
         match self {
             Self::Games => egui::Color32::from_rgb(88, 145, 232),
-            Self::Organise => egui::Color32::from_rgb(151, 112, 220),
             Self::Check => egui::Color32::from_rgb(72, 174, 153),
-            Self::Cheats => egui::Color32::from_rgb(211, 101, 126),
             Self::Verify => egui::Color32::from_rgb(214, 164, 67),
-            Self::Settings => egui::Color32::from_rgb(132, 151, 174),
         }
     }
 }
@@ -132,6 +167,9 @@ pub(crate) struct HomeCardView {
     pub(crate) icon: &'static str,
     pub(crate) title: &'static str,
     pub(crate) explanation: &'static str,
+    /// Optional supporting terminology, always rendered in a collapsed
+    /// disclosure rather than in the task-first summary.
+    pub(crate) technical_detail: Option<&'static str>,
     pub(crate) tier: HomeCardTier,
     pub(crate) accent: Option<HomeAccent>,
     /// `None` for the one card (Settings) with no single configured/not
@@ -162,17 +200,31 @@ pub(crate) enum HomeBanner {
 pub(crate) struct HomeView {
     pub(crate) banner: HomeBanner,
     pub(crate) cards: Vec<HomeCardView>,
+    pub(crate) attention: Vec<HomeAttentionView>,
+}
+
+/// A small, current issue that Home can explain from already-loaded state.
+/// Recovery history and recent activity are intentionally not inferred here:
+/// Home does not load those pages' state just to paint a dashboard.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct HomeAttentionView {
+    pub(crate) title: &'static str,
+    pub(crate) detail: String,
+    pub(crate) action: HomeCard,
+    pub(crate) action_label: &'static str,
+    pub(crate) tone: widgets::StatusTone,
 }
 
 /// Everything [`build_home_view`] needs, gathered by `main.rs` from state
 /// that is already loaded - building this never reads a file, starts a
 /// thread, or makes a request.
-pub(crate) struct HomeInputs<'a> {
+pub(crate) struct HomeInputs {
     pub(crate) source_folder_count: usize,
     pub(crate) has_database: bool,
-    /// `None` while diagnostics are still loading in the background, or if
-    /// the last diagnostics run itself failed.
-    pub(crate) diagnostics: Option<&'a [SetupDiagnostic]>,
+    /// A read of `ArchiveFsApp::doctor_scan` - the exact state the "Set up
+    /// emulators" card's destination renders, so the badge and that page can
+    /// never disagree.
+    pub(crate) setup_check: SetupCheckSummary,
     pub(crate) config_missing: bool,
     /// Mirrors `missing_config_is_first_run(config_previously_confirmed)`.
     pub(crate) first_run: bool,
@@ -195,7 +247,29 @@ pub(crate) enum RommReadinessLabel {
     Ready(&'static str),
 }
 
-const READ_ONLY_ROMM_NOTE: &str = "EmuWiz treats RomM as a read-only identity source: nothing in your RomM library is ever changed.";
+/// A compressed read of `ArchiveFsApp::doctor_scan` - the exact state the
+/// "Set up emulators" card's destination (Problems & Repair -> Diagnostics)
+/// renders. Built by `main.rs` (see `setup_check_summary`) so this module
+/// needs no dependency on the Doctor engine, and so the card summarises the
+/// *same* state a click opens - never the separate `self.doctor_repair.diagnostics`
+/// background report, which is a different subsystem with a different notion
+/// of "last run".
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum SetupCheckSummary {
+    /// Doctor has not finished a run this session.
+    NeverRun,
+    /// A Doctor run is in flight and there is no earlier result on screen.
+    Running,
+    /// Doctor finished, but no check could actually run (every subsystem was
+    /// unavailable). Never reported as a pass.
+    NoChecksRun,
+    /// Doctor finished with nothing actionable.
+    Healthy,
+    /// Doctor finished with warnings only (nothing blocking).
+    Warnings(usize),
+    /// Doctor finished with at least one blocking (error/critical) finding.
+    NeedsAttention(usize),
+}
 
 /// Turns already-loaded state into what Home draws. Pure: the same inputs
 /// always produce the same view, and nothing here touches disk or a
@@ -234,37 +308,77 @@ pub(crate) fn build_home_view(inputs: &HomeInputs) -> HomeView {
     };
 
     let cheats_readiness = match inputs.cheat_sources_enabled_count {
-        None => CardReadiness::Unknown("Open Cheat Sources to check status".to_string()),
-        Some(0) => CardReadiness::NotConfigured("No cheat sources enabled".to_string()),
-        Some(n) => CardReadiness::Ready(format!("{n} cheat source{} enabled", plural(n))),
+        None => None,
+        Some(0) => Some(CardReadiness::NotConfigured(
+            "No cheat sources enabled".to_string(),
+        )),
+        Some(n) => Some(CardReadiness::Ready(format!(
+            "{n} cheat source{} enabled",
+            plural(n)
+        ))),
     };
 
     let dat_readiness = match inputs.dat_sources_registered_count {
-        None => CardReadiness::Unknown("Open DAT Sources to check status".to_string()),
-        Some(0) => CardReadiness::NotConfigured("No DAT sources registered yet".to_string()),
-        Some(n) => CardReadiness::Ready(format!("{n} DAT source{} registered", plural(n))),
+        None => None,
+        Some(0) => Some(CardReadiness::NotConfigured(
+            "No trusted catalogues added yet".to_string(),
+        )),
+        Some(n) => Some(CardReadiness::Ready(format!(
+            "{n} trusted catalogue{} added",
+            plural(n)
+        ))),
     };
 
     let romm_readiness = match &inputs.romm_state_label {
-        None => CardReadiness::Unknown("Open Sources to check status".to_string()),
+        None => None,
         Some(RommReadinessLabel::NotConfigured(label)) => {
-            CardReadiness::NotConfigured((*label).to_string())
+            Some(CardReadiness::NotConfigured((*label).to_string()))
         }
         Some(RommReadinessLabel::Unavailable(label)) => {
-            CardReadiness::Unavailable((*label).to_string())
+            Some(CardReadiness::Unavailable((*label).to_string()))
         }
-        Some(RommReadinessLabel::Ready(label)) => CardReadiness::Ready((*label).to_string()),
+        Some(RommReadinessLabel::Ready(label)) => Some(CardReadiness::Ready((*label).to_string())),
     };
 
-    let setup_readiness = summarize_setup_checks(inputs.diagnostics, inputs.config_missing);
+    let setup_readiness = summarize_setup_checks(inputs.setup_check);
 
-    let cards = vec![
+    let build_library = HomeCardView {
+        card: HomeCard::BuildLibrary,
+        icon: crate::ui::icons::SOURCES,
+        title: if inputs.source_folder_count == 0 {
+            "Add your games"
+        } else {
+            "Build my library"
+        },
+        explanation: if inputs.source_folder_count == 0 {
+            "Choose the folder where your games are stored. EmuWiz will scan it without changing the files."
+        } else {
+            "Choose and review the folders EmuWiz scans for games."
+        },
+        technical_detail: None,
+        tier: if inputs.source_folder_count == 0 {
+            HomeCardTier::Primary
+        } else {
+            HomeCardTier::Secondary
+        },
+        accent: (inputs.source_folder_count == 0).then_some(HomeAccent::Games),
+        readiness: Some(library_readiness),
+        action_label: if inputs.source_folder_count == 0 {
+            "Add game folder"
+        } else {
+            "Open Sources"
+        },
+        secondary: None,
+    };
+
+    let mut cards = vec![
         // --- Primary destinations: the major jobs -------------------------
         HomeCardView {
             card: HomeCard::BrowseGames,
             icon: crate::ui::icons::GAMES,
             title: "My Games",
             explanation: "Browse your games. See the library EmuWiz has found, organised and searchable.",
+            technical_detail: None,
             tier: HomeCardTier::Primary,
             accent: Some(HomeAccent::Games),
             readiness: Some(browse_readiness),
@@ -276,21 +390,23 @@ pub(crate) fn build_home_view(inputs: &HomeInputs) -> HomeView {
             icon: crate::ui::icons::ORGANISE,
             title: "Organise",
             explanation: "Rename and tidy your library. Preview how your games can be renamed or moved into platform folders; nothing moves until you approve it.",
-            tier: HomeCardTier::Primary,
-            accent: Some(HomeAccent::Organise),
+            technical_detail: None,
+            tier: HomeCardTier::Secondary,
+            accent: None,
             readiness: None,
             action_label: "Open Organise",
-            secondary: Some((HomeCard::CleanUpLibrary, "Review filename suggestions")),
+            secondary: Some((HomeCard::QuickRename, "Quick Rename")),
         },
         HomeCardView {
             card: HomeCard::CheckSetup,
             icon: crate::ui::icons::CHECK,
-            title: "Check Library",
-            explanation: "Find problems with your EmuWiz setup and library.",
+            title: "Set up emulators",
+            explanation: "Check which emulators EmuWiz can find and whether each is ready to launch games.",
+            technical_detail: None,
             tier: HomeCardTier::Primary,
             accent: Some(HomeAccent::Check),
             readiness: Some(setup_readiness),
-            action_label: "Open Doctor",
+            action_label: "Open Emulator Setup",
             secondary: None,
         },
         HomeCardView {
@@ -298,104 +414,156 @@ pub(crate) fn build_home_view(inputs: &HomeInputs) -> HomeView {
             icon: crate::ui::icons::CHEATS,
             title: "Cheats & Mods",
             explanation: "Find cheats and game enhancements for a selected game.",
-            tier: HomeCardTier::Primary,
-            accent: Some(HomeAccent::Cheats),
-            readiness: Some(cheats_readiness),
+            technical_detail: None,
+            tier: HomeCardTier::Secondary,
+            accent: None,
+            readiness: cheats_readiness,
             action_label: "Open Cheats & Mods",
             secondary: Some((HomeCard::CheatSources, "Manage Cheat Sources")),
         },
         HomeCardView {
             card: HomeCard::DatSources,
             icon: crate::ui::icons::VERIFY,
-            title: "Verify Games",
-            explanation: "Check your games with DATs. Auditing is read-only: nothing is renamed, moved, or rewritten.",
+            title: "Verify your games",
+            explanation: "Check game names, versions, and known-good file matches using trusted game catalogues.",
+            technical_detail: Some(
+                "These trusted game catalogues are commonly called DAT files. Verification is read-only: nothing is renamed, moved, or rewritten.",
+            ),
             tier: HomeCardTier::Primary,
             accent: Some(HomeAccent::Verify),
-            readiness: Some(dat_readiness),
-            action_label: "Open DAT Sources",
+            readiness: dat_readiness,
+            action_label: "Verify games",
+            secondary: None,
+        },
+        HomeCardView {
+            card: HomeCard::DuplicateReview,
+            icon: crate::ui::icons::CHECK,
+            title: "Find duplicate games",
+            explanation: "Find identical or equivalent copies in your library, keep one, and move the rest into a recoverable quarantine. Nothing is permanently deleted.",
+            technical_detail: None,
+            tier: HomeCardTier::Secondary,
+            accent: None,
+            readiness: None,
+            action_label: "Open duplicate finder",
+            secondary: None,
+        },
+        HomeCardView {
+            card: HomeCard::ConvertDiscs,
+            icon: crate::ui::icons::GAMES,
+            title: "Convert discs",
+            explanation: "Convert supported disc images into verified CHD files.",
+            technical_detail: None,
+            tier: HomeCardTier::Secondary,
+            accent: None,
+            readiness: None,
+            action_label: "Open disc conversion",
             secondary: None,
         },
         HomeCardView {
             card: HomeCard::Settings,
             icon: crate::ui::icons::SETTINGS,
             title: "Settings",
-            explanation: "Set up EmuWiz: sources, mounts, and preferences.",
-            tier: HomeCardTier::Primary,
-            accent: Some(HomeAccent::Settings),
+            explanation: "Choose game folders and preferences. Advanced storage options are available when needed.",
+            technical_detail: None,
+            tier: HomeCardTier::Secondary,
+            accent: None,
             readiness: None,
             action_label: "Open Settings",
             secondary: None,
         },
-        // --- Secondary/admin destinations: quieter, still present ---------
         HomeCardView {
-            card: HomeCard::BuildLibrary,
-            icon: crate::ui::icons::SOURCES,
-            title: "Build my library",
-            explanation: "EmuWiz needs one or more source folders before it can scan for archives.",
-            tier: HomeCardTier::Secondary,
-            accent: None,
-            readiness: Some(library_readiness),
-            action_label: "Open Sources",
-            secondary: None,
-        },
-        HomeCardView {
-            card: HomeCard::CleanUpLibrary,
+            card: HomeCard::QuickRename,
             icon: crate::ui::icons::CLEAN_UP,
-            title: "Clean up my library",
-            explanation: "Review suggested filenames before renaming, using DAT catalogues.",
+            title: "Quick Rename",
+            explanation: "Safely identify and rename games using verified catalogue evidence.",
+            technical_detail: None,
             tier: HomeCardTier::Secondary,
             accent: None,
             readiness: None,
-            action_label: "Open DAT Sources",
+            action_label: "Choose a library",
             secondary: None,
         },
         HomeCardView {
             card: HomeCard::RomM,
             icon: crate::ui::icons::ROMM,
             title: "Connect RomM",
-            explanation: READ_ONLY_ROMM_NOTE,
+            explanation: "Connect EmuWiz to your RomM server and browse its records. RomM is treated as a read-only source: nothing in your RomM library is ever changed.",
+            technical_detail: None,
             tier: HomeCardTier::Secondary,
             accent: None,
-            readiness: Some(romm_readiness),
-            action_label: "Open Sources",
+            readiness: romm_readiness,
+            action_label: "Open RomM",
             secondary: None,
         },
     ];
 
-    HomeView { banner, cards }
+    cards.insert(
+        if inputs.source_folder_count == 0 {
+            0
+        } else {
+            8
+        },
+        build_library,
+    );
+
+    let mut attention = Vec::new();
+    if let Some(CardReadiness::Unavailable(detail)) = cards
+        .iter()
+        .find(|card| card.card == HomeCard::CheckSetup)
+        .and_then(|card| card.readiness.clone())
+    {
+        attention.push(HomeAttentionView {
+            title: "Emulator setup needs attention",
+            detail,
+            action: HomeCard::CheckSetup,
+            action_label: "Open Emulator Setup",
+            tone: widgets::StatusTone::Warning,
+        });
+    }
+    if let Some(CardReadiness::Unavailable(detail)) = cards
+        .iter()
+        .find(|card| card.card == HomeCard::RomM)
+        .and_then(|card| card.readiness.clone())
+    {
+        attention.push(HomeAttentionView {
+            title: "RomM is not available",
+            detail,
+            action: HomeCard::RomM,
+            action_label: "Open RomM",
+            tone: widgets::StatusTone::Warning,
+        });
+    }
+
+    HomeView {
+        banner,
+        cards,
+        attention,
+    }
 }
 
 fn plural(n: usize) -> &'static str {
     if n == 1 { "" } else { "s" }
 }
 
-/// Summarizes `SetupDiagnostics.checks` into one readiness for the "Check
-/// my setup" card. Reads only what diagnostics already computed - never
-/// starts a Doctor scan, which requires its own explicit action.
-fn summarize_setup_checks(
-    checks: Option<&[SetupDiagnostic]>,
-    config_missing: bool,
-) -> CardReadiness {
-    let Some(checks) = checks else {
-        return CardReadiness::Unknown("Checking...".to_string());
-    };
-    let errors = checks
-        .iter()
-        .filter(|c| c.status == SetupDiagnosticStatus::Error)
-        .count();
-    let warnings = checks
-        .iter()
-        .filter(|c| c.status == SetupDiagnosticStatus::Warning)
-        .count();
-    if errors > 0 {
-        let verb = if errors == 1 { "needs" } else { "need" };
-        CardReadiness::Unavailable(format!("{errors} check{} {verb} attention", plural(errors)))
-    } else if warnings > 0 {
-        CardReadiness::Unavailable(format!("{warnings} warning{}", plural(warnings)))
-    } else if config_missing {
-        CardReadiness::NotConfigured("Not configured yet - expected on a fresh install".to_string())
-    } else {
-        CardReadiness::Ready("All checks passed".to_string())
+/// Turns the Doctor scan summary into one readiness for the "Set up
+/// emulators" card. The card's action opens the Doctor page, which renders
+/// this exact state, so the two can never contradict each other. Only a
+/// completed, clean run with at least one check actually performed is ever
+/// shown as a pass - a never-run, in-flight, or zero-checks-performed state
+/// is `Unknown`, and any warning or blocking finding is `Unavailable`.
+fn summarize_setup_checks(summary: SetupCheckSummary) -> CardReadiness {
+    match summary {
+        SetupCheckSummary::NeverRun => CardReadiness::Unknown("Not checked yet".to_string()),
+        SetupCheckSummary::Running => CardReadiness::Unknown("Checking...".to_string()),
+        SetupCheckSummary::NoChecksRun => CardReadiness::Unknown("No checks could run".to_string()),
+        SetupCheckSummary::NeedsAttention(count) => {
+            let verb = if count == 1 { "needs" } else { "need" };
+            CardReadiness::Unavailable(format!("{count} check{} {verb} attention", plural(count)))
+        }
+        SetupCheckSummary::Warnings(count) => {
+            CardReadiness::Unavailable(format!("{count} warning{}", plural(count)))
+        }
+        SetupCheckSummary::Healthy => CardReadiness::Ready("All checks passed".to_string()),
     }
 }
 
@@ -403,6 +571,14 @@ fn summarize_setup_checks(
 /// clicked, if any. Draws only what `view` says - no state, no I/O.
 pub(crate) fn show_home_page(ui: &mut egui::Ui, view: &HomeView) -> Option<HomeCard> {
     let mut clicked = None;
+
+    // Home is intentionally wider than most detail pages: the task cards need
+    // room to form an actual grid on desktop. Keep every section inside this
+    // one frame so headings, the hero, status, grids, and attention panel all
+    // share exactly the same horizontal bounds.
+    let available_width = ui.available_width();
+    let content_width = available_width.min(theme::WIDE_CONTENT_MAX_WIDTH);
+    ui.set_width(content_width);
 
     widgets::page_header_with_icon(
         ui,
@@ -425,45 +601,417 @@ pub(crate) fn show_home_page(ui: &mut egui::Ui, view: &HomeView) -> Option<HomeC
         HomeBanner::ConfigDisappeared => {
             widgets::banner(
                 ui,
-                "Configuration file is no longer found",
-                "EmuWiz found your configuration earlier in this session, and it is no \
-                 longer present. Check Doctor before starting a new task.",
+                "EmuWiz settings could not be found",
+                "EmuWiz found your settings earlier, but they are no longer available. Check \
+                 the problem before starting another task.",
                 widgets::StatusTone::Warning,
             );
+            // `widgets::banner` itself stays a plain title/detail/tone strip -
+            // it has dozens of other callers, and giving it an action button
+            // would mean touching every one of them for a single Home-only
+            // need. The button is rendered here instead, immediately below,
+            // using the same `action_button` primitive `empty_state` already
+            // wraps for its own optional action.
+            if widgets::action_button(ui, "Check the problem", widgets::ActionStyle::Primary, true)
+                .clicked()
+            {
+                clicked = Some(HomeCard::CheckProblems);
+            }
             ui.add_space(theme::SECTION_GAP);
         }
         HomeBanner::None => {}
     }
 
-    ui.vertical(|ui| {
-        for card in &view.cards {
-            let (icon_size, title_size) = match card.tier {
-                HomeCardTier::Primary => (26.0, 18.0),
-                HomeCardTier::Secondary => (16.0, 15.0),
-            };
-            let draw = |ui: &mut egui::Ui| {
-                ui.horizontal_wrapped(|ui| {
-                    let icon = egui::RichText::new(card.icon).size(icon_size);
-                    ui.label(match card.accent {
-                        Some(accent) => icon.color(accent.color()).strong(),
-                        None => icon.color(theme::muted(ui)),
+    let card = |kind: HomeCard| view.cards.iter().find(|card| card.card == kind);
+    let library = card(HomeCard::BuildLibrary);
+    let browse = card(HomeCard::BrowseGames);
+    let library_ready = library
+        .and_then(|card| card.readiness.as_ref())
+        .map(CardReadiness::label)
+        .unwrap_or("Library state is not available yet");
+    let browse_ready = browse
+        .and_then(|card| card.readiness.as_ref())
+        .map(CardReadiness::label)
+        .unwrap_or("Browse state is not available yet");
+    let setup_state = card(HomeCard::CheckSetup)
+        .and_then(|card| card.readiness.as_ref())
+        .map(CardReadiness::label)
+        .unwrap_or("Not checked yet");
+    let no_source_folders = library_ready == "No source folders yet";
+
+    widgets::section_header(ui, "YOUR GAME LIBRARY", None);
+    let content_width = ui.available_width();
+    widgets::hero_card(ui, |ui| {
+        ui.set_width((content_width - 2.0 * theme::SPACE_SM - 2.0).max(0.0));
+        ui.set_min_height(150.0);
+        ui.horizontal_wrapped(|ui| {
+            ui.label(
+                egui::RichText::new(if view.banner == HomeBanner::FreshInstall {
+                    "Add your game library"
+                } else {
+                    "EmuWiz"
+                })
+                .size(26.0)
+                .strong()
+                .color(theme::PRIMARY_TEXT),
+            );
+            if view.banner != HomeBanner::FreshInstall {
+                ui.label(
+                    egui::RichText::new("Your Game Library")
+                        .size(20.0)
+                        .color(theme::SECONDARY_TEXT),
+                );
+            }
+        });
+        ui.add_space(theme::SPACE_XS);
+        if let Some(library) = library {
+            ui.label(library_ready);
+            ui.label(
+                egui::RichText::new(if browse_ready == "Ready to browse" {
+                    "Your library is ready to browse."
+                } else {
+                    "Library configured · catalogue not loaded yet"
+                })
+                .color(theme::muted(ui)),
+            );
+            ui.add_space(theme::SPACE_SM);
+            ui.horizontal_wrapped(|ui| {
+                if widgets::action_button(
+                    ui,
+                    if no_source_folders {
+                        "Add game folder"
+                    } else if browse_ready == "Ready to browse" {
+                        "Browse Library"
+                    } else {
+                        "Open Sources"
+                    },
+                    widgets::ActionStyle::Primary,
+                    true,
+                )
+                .clicked()
+                {
+                    clicked = Some(if no_source_folders {
+                        HomeCard::BuildLibrary
+                    } else if browse_ready == "Ready to browse" {
+                        HomeCard::BrowseGames
+                    } else {
+                        HomeCard::BuildLibrary
                     });
-                    ui.label(egui::RichText::new(card.title).size(title_size).strong());
+                }
+                if widgets::action_button(ui, "Scan", widgets::ActionStyle::Secondary, true)
+                    .clicked()
+                {
+                    clicked = Some(HomeCard::BuildLibrary);
+                }
+            });
+            let _ = library;
+        }
+    });
+
+    ui.add_space(theme::SPACE_LG);
+    widgets::section_header(ui, "STATUS", None);
+    widgets::full_width_card(ui, |ui| {
+        ui.set_min_height(58.0);
+        ui.horizontal_wrapped(|ui| {
+            status_pill(
+                ui,
+                "Library",
+                library_ready,
+                library_ready == "Ready to browse",
+            );
+            status_pill(
+                ui,
+                "Emulators",
+                setup_state,
+                setup_state == "All checks passed",
+            );
+            if let Some(dat) = card(HomeCard::DatSources).and_then(|card| card.readiness.as_ref()) {
+                status_pill(
+                    ui,
+                    "Identity / DAT",
+                    dat.label(),
+                    matches!(dat, CardReadiness::Ready(_)),
+                );
+            }
+            if let Some(romm) = card(HomeCard::RomM).and_then(|card| card.readiness.as_ref()) {
+                status_pill(
+                    ui,
+                    "RomM",
+                    romm.label(),
+                    matches!(romm, CardReadiness::Ready(_)),
+                );
+            }
+        });
+    });
+
+    if !view.attention.is_empty() {
+        ui.add_space(theme::SECTION_GAP);
+        widgets::section_header(ui, "WHAT NEEDS ATTENTION", None);
+        widgets::card(ui, |ui| {
+            ui.set_min_height(72.0);
+            for (index, issue) in view.attention.iter().enumerate() {
+                if index > 0 {
+                    ui.add_space(theme::SPACE_SM);
+                }
+                ui.horizontal_wrapped(|ui| {
+                    widgets::status_badge(ui, issue.title, issue.tone);
+                    ui.label(egui::RichText::new(&issue.detail).color(theme::muted(ui)));
+                    if widgets::action_button(
+                        ui,
+                        issue.action_label,
+                        widgets::ActionStyle::Secondary,
+                        true,
+                    )
+                    .clicked()
+                    {
+                        clicked = Some(issue.action);
+                    }
+                });
+            }
+        });
+    }
+
+    ui.add_space(theme::SECTION_GAP);
+
+    // Both task sections share one geometry. The short final More Tools row
+    // remains a partial row of this same grid rather than becoming a new
+    // two-column layout.
+    let task_geometry = home_grid_geometry(ui.available_width());
+    widgets::section_header(ui, "PRIMARY TASKS", None);
+    show_task_grid(
+        ui,
+        view.cards
+            .iter()
+            .filter(|card| card.tier == HomeCardTier::Primary),
+        task_geometry,
+        &mut clicked,
+    );
+
+    ui.add_space(theme::SECTION_GAP);
+    widgets::section_header(ui, "MORE TOOLS", None);
+    show_task_grid(
+        ui,
+        view.cards
+            .iter()
+            .filter(|card| card.tier == HomeCardTier::Secondary),
+        task_geometry,
+        &mut clicked,
+    );
+
+    if view.banner == HomeBanner::FreshInstall {
+        ui.add_space(theme::SECTION_GAP);
+        widgets::card(ui, |ui| {
+            ui.label(egui::RichText::new("How EmuWiz works").strong());
+            ui.label("Choose game folders › scan locally › verify and organise › set up emulators › play.");
+            ui.label(
+                egui::RichText::new(
+                    "Scanning and verification are read-only until you approve a change.",
+                )
+                .color(theme::muted(ui)),
+            );
+        });
+    }
+
+    clicked
+}
+
+fn status_pill(ui: &mut egui::Ui, name: &str, value: &str, ready: bool) {
+    ui.horizontal(|ui| {
+        ui.label(egui::RichText::new(name).strong());
+        widgets::status_badge(
+            ui,
+            value,
+            if ready {
+                widgets::StatusTone::Success
+            } else {
+                widgets::StatusTone::Pending
+            },
+        );
+    });
+}
+
+fn show_task_grid<'a>(
+    ui: &mut egui::Ui,
+    cards: impl Iterator<Item = &'a HomeCardView>,
+    geometry: HomeGridGeometry,
+    clicked: &mut Option<HomeCard>,
+) {
+    let cards: Vec<&HomeCardView> = cards.collect();
+    if geometry.columns == 0 {
+        return;
+    }
+    for (row_index, row) in cards.chunks(geometry.columns).enumerate() {
+        let row_height = home_card_row_height(row);
+        let row_rect = egui::Rect::from_min_size(
+            ui.cursor().left_top(),
+            egui::vec2(geometry.content_width, row_height),
+        );
+        ui.allocate_rect(row_rect, egui::Sense::hover());
+        let mut row_ui = ui.new_child(
+            egui::UiBuilder::new()
+                .max_rect(row_rect)
+                .layout(egui::Layout::left_to_right(egui::Align::Min)),
+        );
+        for (column_index, card) in row.iter().enumerate() {
+            let cell_rect = home_grid_cell_rect(
+                row_rect.left(),
+                row_rect.top(),
+                geometry,
+                column_index,
+                row_height,
+            );
+            let mut cell_ui = row_ui.new_child(
+                egui::UiBuilder::new()
+                    .max_rect(cell_rect)
+                    .layout(egui::Layout::top_down(egui::Align::Min)),
+            );
+            if let Some(action) = show_task_card(&mut cell_ui, card) {
+                *clicked = Some(action);
+            }
+        }
+        if row_index + 1 < cards.len().div_ceil(geometry.columns) {
+            ui.add_space(HOME_GRID_ROW_GAP);
+        }
+    }
+}
+
+const HOME_GRID_GAP: f32 = 16.0;
+const HOME_GRID_ROW_GAP: f32 = 18.0;
+const HOME_PRIMARY_CARD_HEIGHT: f32 = 218.0;
+const HOME_SECONDARY_CARD_HEIGHT: f32 = 188.0;
+const HOME_CARD_ACTION_ZONE_HEIGHT: f32 = 58.0;
+const HOME_CARD_BODY_ACTION_GAP: f32 = 10.0;
+const HOME_CARD_FRAME_PADDING: i8 = 14;
+const HOME_CARD_HEADER_ZONE_HEIGHT: f32 = 38.0;
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+struct HomeGridGeometry {
+    columns: usize,
+    content_width: f32,
+    column_width: f32,
+    gap: f32,
+}
+
+fn home_grid_geometry(available_width: f32) -> HomeGridGeometry {
+    let columns = home_grid_columns(available_width, 3);
+    if columns == 0 {
+        return HomeGridGeometry {
+            columns: 0,
+            content_width: 0.0,
+            column_width: 0.0,
+            gap: 0.0,
+        };
+    }
+    let total_gap = HOME_GRID_GAP * (columns.saturating_sub(1) as f32);
+    HomeGridGeometry {
+        columns,
+        content_width: available_width.max(0.0),
+        column_width: ((available_width.max(0.0) - total_gap) / columns as f32).max(1.0),
+        gap: HOME_GRID_GAP,
+    }
+}
+
+fn home_grid_cell_rect(
+    content_left: f32,
+    row_top: f32,
+    geometry: HomeGridGeometry,
+    column: usize,
+    row_height: f32,
+) -> egui::Rect {
+    let left = content_left + column as f32 * (geometry.column_width + geometry.gap);
+    egui::Rect::from_min_size(
+        egui::pos2(left, row_top),
+        egui::vec2(geometry.column_width, row_height),
+    )
+}
+
+fn home_card_row_height(row: &[&HomeCardView]) -> f32 {
+    row.iter().fold(0.0, |height, card| {
+        height.max(match card.tier {
+            HomeCardTier::Primary => HOME_PRIMARY_CARD_HEIGHT,
+            HomeCardTier::Secondary => HOME_SECONDARY_CARD_HEIGHT,
+        })
+    })
+}
+
+/// The Home breakpoints are based on the space needed for a readable card,
+/// not on individual card content. The final row remains left-aligned, which
+/// gives a deliberate 3/3/2 arrangement for the eight secondary cards.
+fn home_grid_columns(available_width: f32, item_count: usize) -> usize {
+    if item_count == 0 {
+        return 0;
+    }
+    let columns = if available_width >= 1_100.0 {
+        3
+    } else if available_width >= 700.0 {
+        2
+    } else {
+        1
+    };
+    columns.min(item_count)
+}
+
+fn show_task_card(ui: &mut egui::Ui, card: &HomeCardView) -> Option<HomeCard> {
+    let mut clicked = None;
+    // The grid owns the cell rectangle. Pin both bounds to that exact child
+    // rectangle before Frame::show so the painted border cannot shrink-wrap
+    // to the card's content.
+    let cell_size = ui.max_rect().size();
+    ui.set_min_size(cell_size);
+    ui.set_max_size(cell_size);
+    let draw = |ui: &mut egui::Ui| {
+        // Every card gets the same header allocation. A missing readiness
+        // badge therefore changes no neighbouring card's vertical geometry.
+        ui.allocate_ui_with_layout(
+            egui::vec2(ui.available_width(), HOME_CARD_HEADER_ZONE_HEIGHT),
+            egui::Layout::top_down(egui::Align::Min),
+            |ui| {
+                ui.horizontal_wrapped(|ui| {
+                    ui.label(
+                        egui::RichText::new(card.icon)
+                            .size(if card.tier == HomeCardTier::Primary {
+                                24.0
+                            } else {
+                                18.0
+                            })
+                            .color(
+                                card.accent
+                                    .map_or_else(|| theme::muted(ui), HomeAccent::color),
+                            )
+                            .strong(),
+                    );
+                    ui.label(
+                        egui::RichText::new(card.title)
+                            .size(if card.tier == HomeCardTier::Primary {
+                                18.0
+                            } else {
+                                15.0
+                            })
+                            .strong(),
+                    );
                     if let Some(readiness) = &card.readiness {
                         widgets::status_badge(ui, readiness.label(), readiness.tone());
                     }
                 });
-                ui.label(
-                    egui::RichText::new(card.explanation)
-                        .color(theme::muted(ui))
-                        .size(if card.tier == HomeCardTier::Primary {
-                            14.5
-                        } else {
-                            13.0
-                        }),
-                );
-                ui.add_space(6.0);
-                ui.horizontal(|ui| {
+            },
+        );
+        ui.label(egui::RichText::new(card.explanation).color(theme::muted(ui)));
+        if let Some(detail) = card.technical_detail {
+            widgets::technical_details(ui, ("home-card", card.card), |ui| ui.label(detail));
+        }
+        // Leave the body flexible, then reserve one shared action zone. The
+        // zone is large enough for wrapped secondary actions at narrow widths
+        // while preserving one bottom baseline at wider widths.
+        let flexible =
+            (ui.available_height() - HOME_CARD_ACTION_ZONE_HEIGHT - HOME_CARD_BODY_ACTION_GAP)
+                .max(0.0);
+        ui.add_space(flexible);
+        ui.add_space(HOME_CARD_BODY_ACTION_GAP);
+        ui.allocate_ui_with_layout(
+            egui::vec2(ui.available_width(), HOME_CARD_ACTION_ZONE_HEIGHT),
+            egui::Layout::bottom_up(egui::Align::Min),
+            |ui| {
+                ui.horizontal_wrapped(|ui| {
                     if widgets::action_button(
                         ui,
                         card.action_label,
@@ -486,18 +1034,78 @@ pub(crate) fn show_home_page(ui: &mut egui::Ui, view: &HomeView) -> Option<HomeC
                         clicked = Some(secondary_card);
                     }
                 });
-            };
-            if let Some(accent) = card.accent {
-                widgets::workflow_card(ui, accent.color(), draw);
-            } else {
-                widgets::card(ui, draw);
-            }
-            ui.add_space(theme::SECTION_GAP / 2.0);
-        }
-    });
-
+            },
+        );
+    };
+    let shown = egui::Frame::new()
+        .fill(card.accent.map_or_else(
+            || theme::card_fill(ui),
+            |accent| accent.color().gamma_multiply(0.075),
+        ))
+        .stroke(theme::border(ui))
+        .corner_radius(9)
+        .inner_margin(egui::Margin::same(HOME_CARD_FRAME_PADDING))
+        .show(ui, draw);
+    if let Some(accent) = card.accent {
+        ui.painter().line_segment(
+            [
+                shown.response.rect.left_top(),
+                shown.response.rect.right_top(),
+            ],
+            egui::Stroke::new(2.0_f32, accent.color().gamma_multiply(0.8)),
+        );
+    }
     clicked
 }
 
 #[cfg(test)]
 mod tests;
+
+///
+/// Projects the already-loaded catalogue into the small collection summary
+/// Museum's platform grid consumes. This is deliberately an in-memory
+/// projection: it never scans source folders, opens media, or asks RomM for
+/// fresh data while rendering.
+///
+/// RomM per-platform media coverage is not enriched here - that requires the
+/// RomM/Home-Intelligence snapshot's `media_coverage`/`platform_media_coverage`
+/// fields, which are a separate, not-yet-reconciled batch; every
+/// `romm_media_coverage` this function produces is `None` until that lands.
+pub(crate) fn home_library_snapshot(
+    snapshot: &CachedLibrarySnapshot,
+) -> home_page::HomeLibrarySnapshot {
+    let mut by_platform: HashMap<String, (usize, usize, usize)> = HashMap::new();
+    for archive in &snapshot.archives {
+        let Some(platform) = archive.platform.as_deref() else {
+            continue;
+        };
+        let entry = by_platform.entry(platform.to_string()).or_default();
+        entry.0 += 1;
+        entry.1 += 1;
+        entry.2 += usize::from(archive.last_verified_missing_at.is_some());
+    }
+    let mut platforms = by_platform
+        .into_iter()
+        .map(
+            |(name, (total, identified, missing))| home_page::HomePlatformSummary {
+                name,
+                total,
+                identified,
+                missing,
+                romm_media_coverage: None,
+            },
+        )
+        .collect::<Vec<_>>();
+    platforms.sort_by(|left, right| left.name.cmp(&right.name));
+
+    home_page::HomeLibrarySnapshot {
+        total: snapshot.stats.total_archives.max(0) as usize,
+        present: snapshot.stats.present_archives.max(0) as usize,
+        identified: snapshot.stats.archives_with_platform.max(0) as usize,
+        unresolved: snapshot.stats.archives_unknown_platform.max(0) as usize,
+        missing: snapshot.stats.missing_archives.max(0) as usize,
+        duplicate_groups: snapshot.duplicate_report.groups.len(),
+        platforms,
+        romm_media_coverage: None,
+    }
+}

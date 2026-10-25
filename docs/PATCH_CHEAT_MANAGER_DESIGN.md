@@ -1,7 +1,27 @@
 # EmuWiz Patch & Cheat Manager Design
 
-> Historical Phase 1 design record. Its implementation-status statements are
-> preserved for provenance and do not describe the current v0.7 workspace.
+> **Historical / superseded design**
+>
+> This document preserves the original Phase 1 design reasoning and
+> implementation boundary for provenance. It is not current capability
+> documentation. See the [current adapter matrix](ADAPTER_SUPPORT_MATRIX.md),
+> [shared preview](SHARED_CHEAT_PREVIEW.md), [safe apply and rollback](SHARED_SAFE_APPLY_ROLLBACK.md),
+> [Cheats & Mods safety model](CHEATS_MODS_SAFETY.md), and
+> [launch support](LAUNCH_SUPPORT.md).
+
+## Current status
+
+EmuWiz has grown beyond the Phase 1 PCSX2-only preview described below.
+Multiple emulator and provider workflows now exist, including shared
+preview, explicit apply, verification, journal, and rollback paths for
+selected supported operations. PCSX2 is not the sole architecture boundary;
+the current product also includes RetroArch, Dolphin, Xenia, and other
+launch or provider integrations, plus a narrow Dolphin texture-mod workflow.
+
+The historical sections below intentionally retain their original claims,
+including statements about unimplemented phases and proposed interfaces.
+Use the current documents linked above when deciding what the product does
+today.
 
 ## Status and Scope
 

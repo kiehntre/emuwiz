@@ -25,6 +25,7 @@ use zip::ZipArchive;
 
 use crate::default_database_path;
 use crate::emulator_environment::{EncodedPath, HostReadOnlyFilesystem};
+use crate::identity_source::net_policy::http_metadata::response_retry_after;
 
 use super::cheat_cache_lock::LockedCheatCache;
 use super::cheat_catalogue::{CatalogueEntryExclusionKind, MAX_CATALOGUE_EXCLUSION_EXAMPLES};
@@ -52,8 +53,10 @@ pub const CHEAT_SOURCE_CONNECT_TIMEOUT_SECONDS: u64 = 30;
 pub const CHEAT_SOURCE_IDLE_TIMEOUT_SECONDS: u64 = 60;
 pub const CHEAT_SOURCE_OVERALL_TIMEOUT_SECONDS: u64 = 15 * 60;
 pub const CHEAT_SOURCE_RETRY_ATTEMPTS: usize = 3;
+/// Maximum automatic wait budget. Provider minimums are never capped to it;
+/// waits that cannot fit the remaining operation deadline are deferred.
+pub const CHEAT_SOURCE_RETRY_AFTER_LIMIT_SECONDS: u64 = CHEAT_SOURCE_OVERALL_TIMEOUT_SECONDS;
 pub const CHEAT_SOURCE_RETRY_DELAY_SECONDS: u64 = 5;
-pub const CHEAT_SOURCE_RETRY_AFTER_LIMIT_SECONDS: u64 = 30;
 pub const CHEAT_SOURCE_NETWORK_CHUNK_BYTES: usize = 64 * 1024;
 pub const CHEAT_SOURCE_PROGRESS_EVENT_LIMIT: usize = 512;
 pub const CHEAT_SOURCE_PROGRESS_BYTE_INTERVAL: u64 = 2 * 1024 * 1024;
@@ -61,7 +64,21 @@ pub const CHEAT_SOURCE_STAGING_FILES_PER_PROVIDER: usize = 1;
 pub const CHEAT_SOURCE_CONCURRENT_OPERATIONS_PER_PROVIDER: usize = 1;
 pub const CHEAT_SOURCE_INACTIVE_STAGING_CLEANUP_LIMIT: usize = 16;
 pub const CHEAT_SOURCE_RETAINED_SNAPSHOTS_MINIMUM: usize = 2;
-const REVISION_RESPONSE_LIMIT: u64 = 64 * 1024;
+/// Raised from 64 KiB (2026-08-22, live-QA Phase 8: a real update failed
+/// with `download_too_large: received at least 67872 bytes, exceeding
+/// configured limit 65536 bytes`). This only bounds the GitHub "get commit"
+/// response used to resolve `master` to an exact SHA - the response body
+/// needed is a single 40-character hex string, but GitHub's commit API
+/// always includes the full commit object (author, message, and a `files`
+/// array of everything the commit touched), which for a frequently-updated
+/// database like libretro-database can exceed 64 KiB on an unremarkable
+/// commit. 64 KiB was never a deliberate byte budget for that payload
+/// shape, just an assumption that broke in practice. 1 MiB gives real
+/// headroom over any observed or plausible commit-object size while
+/// staying two orders of magnitude below `CHEAT_SOURCE_DEFAULT_DOWNLOAD_LIMIT`
+/// (256 MiB, the actual archive download), so the two limits can't be
+/// confused with each other.
+const REVISION_RESPONSE_LIMIT: u64 = 1024 * 1024;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -272,7 +289,7 @@ pub fn default_cheat_source_cache_root() -> Result<PathBuf, CheatSourceError> {
         .join(CACHE_DIRECTORY))
 }
 
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct CheatSourceHttpResponse {
     pub status: u16,
     pub content_type: Option<String>,
@@ -283,6 +300,74 @@ pub struct CheatSourceHttpResponse {
     pub last_modified: Option<String>,
     pub downloaded_bytes: u64,
     pub retry_after_seconds: Option<u64>,
+}
+
+impl std::fmt::Debug for CheatSourceHttpResponse {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("CheatSourceHttpResponse")
+            .field("status", &self.status)
+            .field("content_length", &self.content_length)
+            .field("downloaded_bytes", &self.downloaded_bytes)
+            .field("retry_after_seconds", &self.retry_after_seconds)
+            .finish_non_exhaustive()
+    }
+}
+
+// Error payloads never enter the archive staging writer. Incomplete or
+// unclassified responses cannot authorize retries. Preserve status and wait,
+// but never interpolate provider bytes or header values into diagnostics.
+fn inspect_error_body(
+    reader: &mut dyn Read,
+    status: u16,
+    content_type: Option<&str>,
+    retry_after_seconds: Option<u64>,
+    context: CheatSourceTransferContext<'_>,
+) -> Result<(), CheatSourceError> {
+    use crate::identity_source::net_policy::http_metadata::{
+        ERROR_BODY_LIMIT, refuses_automatic_retry,
+    };
+    let started = Instant::now();
+    let mut body = Vec::new();
+    let mut buffer = [0u8; 1024];
+    loop {
+        if context
+            .cancellation
+            .is_some_and(CheatSourceCancellation::is_cancelled)
+        {
+            return Err(cancelled_error());
+        }
+        if started.elapsed() >= context.overall_timeout {
+            return Err(CheatSourceError::new(
+                CheatSourceErrorStage::Network,
+                "error_body_unverified",
+                format!("HTTP {status}: error body inspection timed out; no automatic retry"),
+            )
+            .with_retry_after(retry_after_seconds));
+        }
+        let capacity = (ERROR_BODY_LIMIT + 1 - body.len()).min(buffer.len());
+        match reader.read(&mut buffer[..capacity]) {
+            Ok(0) => break,
+            Ok(count) => body.extend_from_slice(&buffer[..count]),
+            Err(_) => {
+                return Err(CheatSourceError::new(
+                    CheatSourceErrorStage::Network,
+                    "error_body_unverified",
+                    format!("HTTP {status}: incomplete error body; no automatic retry"),
+                )
+                .with_retry_after(retry_after_seconds));
+            }
+        }
+        if body.len() > ERROR_BODY_LIMIT {
+            break;
+        }
+    }
+    if refuses_automatic_retry(content_type, &body) {
+        return Err(CheatSourceError::new(CheatSourceErrorStage::Network,
+            "access_or_challenge_response",
+            format!("HTTP {status}: access, challenge or unclassified error response ({} bounded bytes inspected); no automatic retry", body.len()))
+            .with_retry_after(retry_after_seconds));
+    }
+    Ok(())
 }
 
 #[derive(Clone, Copy)]
@@ -310,27 +395,27 @@ pub struct HttpsCheatSourceTransport {
 
 impl HttpsCheatSourceTransport {
     pub fn new() -> Self {
-        let config = ureq::Agent::config_builder()
-            .https_only(true)
-            .proxy(None)
-            .max_redirects(0)
-            .http_status_as_error(false)
-            .timeout_global(Some(Duration::from_secs(
-                CHEAT_SOURCE_OVERALL_TIMEOUT_SECONDS,
-            )))
-            .timeout_resolve(Some(Duration::from_secs(
-                CHEAT_SOURCE_CONNECT_TIMEOUT_SECONDS,
-            )))
-            .timeout_connect(Some(Duration::from_secs(
-                CHEAT_SOURCE_CONNECT_TIMEOUT_SECONDS,
-            )))
-            // ureq 3.3 carries recv-response deadlines into body reads. Leaving
-            // this unset avoids turning a header timeout into a whole-body cap;
-            // the global bound still covers headers and the receive-body bound
-            // below is a true per-read idle timeout.
-            .timeout_recv_response(None)
-            .timeout_recv_body(Some(Duration::from_secs(CHEAT_SOURCE_IDLE_TIMEOUT_SECONDS)))
-            .build();
+        let config = crate::http_agent::config(|builder| {
+            builder
+                .https_only(true)
+                .max_redirects(0)
+                .http_status_as_error(false)
+                .timeout_global(Some(Duration::from_secs(
+                    CHEAT_SOURCE_OVERALL_TIMEOUT_SECONDS,
+                )))
+                .timeout_resolve(Some(Duration::from_secs(
+                    CHEAT_SOURCE_CONNECT_TIMEOUT_SECONDS,
+                )))
+                .timeout_connect(Some(Duration::from_secs(
+                    CHEAT_SOURCE_CONNECT_TIMEOUT_SECONDS,
+                )))
+                // ureq 3.3 carries recv-response deadlines into body reads. Leaving
+                // this unset avoids turning a header timeout into a whole-body cap;
+                // the global bound still covers headers and the receive-body bound
+                // below is a true per-read idle timeout.
+                .timeout_recv_response(None)
+                .timeout_recv_body(Some(Duration::from_secs(CHEAT_SOURCE_IDLE_TIMEOUT_SECONDS)))
+        });
         Self {
             agent: config.new_agent(),
         }
@@ -357,6 +442,7 @@ impl CheatSourceTransport for HttpsCheatSourceTransport {
         {
             return Err(cancelled_error());
         }
+        let request_started = Instant::now();
         validate_public_resolution(url)?;
         let request = self
             .agent
@@ -416,15 +502,29 @@ impl CheatSourceTransport for HttpsCheatSourceTransport {
             })?),
             None => None,
         };
-        let retry_after_seconds = header("retry-after")
-            .and_then(|value| value.trim().parse::<u64>().ok())
-            .map(|seconds| seconds.min(CHEAT_SOURCE_RETRY_AFTER_LIMIT_SECONDS));
+        let retry_after_seconds = response_retry_after(response.headers(), SystemTime::now());
         validate_declared_download_size(content_length, maximum_bytes)?;
         let status = response.status().as_u16();
-        let content_type = header("content-type");
+        let content_type =
+            crate::identity_source::net_policy::http_metadata::response_headers(response.headers())
+                .remove("content-type");
         let location = header("location");
         let etag = header("etag");
         let last_modified = header("last-modified");
+        if status >= 400 {
+            inspect_error_body(
+                &mut response.body_mut().as_reader(),
+                status,
+                content_type.as_deref(),
+                retry_after_seconds,
+                CheatSourceTransferContext {
+                    overall_timeout: context
+                        .overall_timeout
+                        .saturating_sub(request_started.elapsed()),
+                    ..context
+                },
+            )?;
+        }
         let mut downloaded_bytes = 0u64;
         let mut next_progress_bytes = CHEAT_SOURCE_PROGRESS_BYTE_INTERVAL;
         if (200..300).contains(&status) {
@@ -1432,6 +1532,10 @@ fn download_archive_with_retries(
                 }
                 check_transfer_deadline(options, transfer_started)?;
                 let delay_seconds = retry_delay_seconds(&error);
+                ensure_retry_fits_deadline(
+                    delay_seconds,
+                    remaining_transfer_time(transfer_started)?,
+                )?;
                 report_progress(
                     options,
                     CheatSourceProgressPhase::Retrying,
@@ -1473,7 +1577,18 @@ fn retry_delay_seconds(error: &CheatSourceError) -> u64 {
     error
         .retry_after_seconds
         .unwrap_or(CHEAT_SOURCE_RETRY_DELAY_SECONDS)
-        .min(CHEAT_SOURCE_RETRY_AFTER_LIMIT_SECONDS)
+}
+
+/// Pure deadline decision, also used by deterministic synthetic tests.
+fn ensure_retry_fits_deadline(seconds: u64, remaining: Duration) -> Result<(), CheatSourceError> {
+    if Duration::from_secs(seconds) >= remaining {
+        return Err(CheatSourceError::new(
+            CheatSourceErrorStage::Download,
+            "provider_cooldown_deferred",
+            format!("provider minimum cooldown is {seconds} seconds; it exceeds the remaining operation deadline; existing cached evidence was not replaced"),
+        ).with_retry_after(Some(seconds)));
+    }
+    Ok(())
 }
 
 fn with_attempt_context(mut error: CheatSourceError, attempt: usize) -> CheatSourceError {
@@ -1981,6 +2096,16 @@ fn download_with_redirects(
             continue;
         }
         if !(200..300).contains(&response.status) {
+            // HTML error/challenge pages do not authorize automatic retries.
+            if crate::identity_source::net_policy::http_metadata::refuses_automatic_retry(
+                response.content_type.as_deref(),
+                &[],
+            ) {
+                return Err(CheatSourceError::new(
+                    CheatSourceErrorStage::Network, "access_or_challenge_response",
+                    format!("server returned an access or unclassified error response (HTTP {}); no automatic retry", response.status),
+                ).with_retry_after(response.retry_after_seconds));
+            }
             let code = format!("http_{}", response.status);
             return Err(CheatSourceError::new(
                 CheatSourceErrorStage::Network,
@@ -2834,6 +2959,7 @@ impl Drop for WorkCleanup {
 mod tests {
     use super::*;
     use std::cell::RefCell;
+    use std::collections::BTreeMap;
     use std::io::Cursor;
     use zip::write::SimpleFileOptions;
     use zip::{CompressionMethod, ZipWriter};
@@ -2904,6 +3030,15 @@ mod tests {
                 });
             }
             let mut response = self.responses.borrow_mut().remove(0)?;
+            if response.metadata.status >= 400 {
+                inspect_error_body(
+                    &mut Cursor::new(&response.body),
+                    response.metadata.status,
+                    response.metadata.content_type.as_deref(),
+                    response.metadata.retry_after_seconds,
+                    context,
+                )?;
+            }
             validate_declared_download_size(response.metadata.content_length, maximum_bytes)?;
             if response.body.len() as u64 > maximum_bytes {
                 return Err(CheatSourceError::new(
@@ -2989,6 +3124,13 @@ mod tests {
             cancellation: None,
             progress: None,
         }
+    }
+
+    #[test]
+    fn recovery_cooldown_minimum_never_shortened() {
+        let error = CheatSourceError::new(CheatSourceErrorStage::Network, "http_429", "synthetic")
+            .with_retry_after(Some(120));
+        assert_eq!(retry_delay_seconds(&error), 120);
     }
 
     #[test]
@@ -3106,6 +3248,12 @@ mod tests {
                 None,
             ),
             (
+                // Invalid UTF-8 with zero usable `cheatN_*` entries: decoded
+                // via the Windows-1252 fallback (`decode_cht_text`) and then
+                // rejected as `MalformedCht`, same as `Broken.cht` above -
+                // not `UnsupportedContentEncoding`, since a legacy-encoded
+                // file is only excluded when its decoded content is also
+                // otherwise unusable (see `cheat_catalogue::parse_cht_cheats`).
                 "libretro-database-1/cht/Nintendo - Super Nintendo Entertainment System/Unsupported.cht",
                 b"cheats = 1\n\xff",
                 None,
@@ -3120,8 +3268,8 @@ mod tests {
         assert!(fetched.manifest.validation_complete);
         assert_eq!(fetched.manifest.catalogue_file_count, 3);
         assert_eq!(fetched.manifest.indexed_file_count, 1);
-        assert_eq!(fetched.manifest.malformed_cheat_count, 1);
-        assert_eq!(fetched.manifest.excluded_unsupported_count, 1);
+        assert_eq!(fetched.manifest.malformed_cheat_count, 2);
+        assert_eq!(fetched.manifest.excluded_unsupported_count, 0);
         assert_eq!(fetched.manifest.exclusion_examples.len(), 2);
         assert!(
             inspect_retroarch_cheat_source("libretro-buildbot-cheats", &temp.0)
@@ -3373,7 +3521,7 @@ mod tests {
     }
 
     #[test]
-    fn retryable_http_statuses_honor_bounded_retry_after() {
+    fn retryable_http_statuses_honor_provider_minimum_retry_after() {
         let temp = TempDirectory::new();
         let work = temp.0.join("work");
         fs::create_dir(&work).unwrap();
@@ -3405,9 +3553,343 @@ mod tests {
                 &CheatSourceError::new(CheatSourceErrorStage::Network, "http_429", "limited")
                     .with_retry_after(Some(999))
             ),
-            CHEAT_SOURCE_RETRY_AFTER_LIMIT_SECONDS
+            999
         );
-        assert_eq!(CHEAT_SOURCE_RETRY_AFTER_LIMIT_SECONDS, 30);
+        assert_eq!(
+            retry_delay_seconds(&retryable_fixture_error("http_429").with_retry_after(Some(120))),
+            120
+        );
+    }
+
+    #[test]
+    fn access_denial_and_html_challenge_are_not_automatically_retried() {
+        for (status, content_type, expected_code) in [
+            (401, "application/json", "http_401"),
+            (403, "application/json", "http_403"),
+            (
+                503,
+                "text/html; charset=utf-8",
+                "access_or_challenge_response",
+            ),
+        ] {
+            let temp = TempDirectory::new();
+            let work = temp.0.join("work");
+            fs::create_dir(&work).unwrap();
+            let mut denied = response(Vec::new());
+            denied.metadata.status = status;
+            denied.metadata.content_type = Some(content_type.into());
+            let transport = FakeTransport::new(vec![Ok(denied)]);
+            let error = download_archive_with_retries(
+                &trusted_retroarch_cheat_sources().remove(0),
+                "https://codeload.github.com/libretro/libretro-database/zip/revision",
+                1024,
+                &transport,
+                &options(&temp.0),
+                &work,
+                Instant::now(),
+            )
+            .unwrap_err();
+            assert_eq!(error.code, expected_code);
+            assert_eq!(transport.calls.borrow().len(), 1);
+            assert_eq!(fs::read_dir(work).unwrap().count(), 0);
+        }
+    }
+
+    #[test]
+    fn adversarial_error_bodies_refuse_once_and_preserve_cached_bytes() {
+        fn files(path: &Path, output: &mut BTreeMap<PathBuf, Vec<u8>>) {
+            for entry in fs::read_dir(path).unwrap() {
+                let path = entry.unwrap().path();
+                if path.is_dir() {
+                    files(&path, output);
+                } else {
+                    output.insert(path.clone(), fs::read(path).unwrap());
+                }
+            }
+        }
+        let temp = TempDirectory::new();
+        fetch_retroarch_cheat_source(
+            "libretro-buildbot-cheats",
+            &options(&temp.0),
+            &FakeTransport::new(vec![Ok(response(valid_zip()))]),
+        )
+        .unwrap();
+        let mut before = BTreeMap::new();
+        files(&temp.0, &mut before);
+        let metadata_path = temp.0.join("libretro-buildbot-cheats").join(METADATA_FILE);
+        let initial: CheatSourceCacheMetadata =
+            serde_json::from_slice(&before[&metadata_path]).unwrap();
+        // Failure reporting is mutable; immutable cache bytes and the active
+        // snapshot binding must remain intact while the refusal is recorded.
+        before.remove(&metadata_path);
+        for (status, media, body) in [
+            (503, None, b"<html>captcha fake-secret</html>".to_vec()),
+            (
+                503,
+                Some("application/xhtml+xml".into()),
+                b"<html>challenge</html>".to_vec(),
+            ),
+            (
+                503,
+                Some(format!("text/html; boundary={}", "x".repeat(1024))),
+                b"<html>challenge</html>".to_vec(),
+            ),
+            (
+                503,
+                Some("text/html".into()),
+                b"<html>challenge</html>".to_vec(),
+            ),
+            (
+                403,
+                Some("application/json".into()),
+                b"{\"error\":\"access denied fake-secret\"}".to_vec(),
+            ),
+            (
+                503,
+                Some("text/plain".into()),
+                vec![b'x'; crate::identity_source::net_policy::http_metadata::ERROR_BODY_LIMIT + 1],
+            ),
+        ] {
+            let mut denied = response(body);
+            denied.metadata.status = status;
+            denied.metadata.content_type = media;
+            denied.metadata.retry_after_seconds = Some(120);
+            let transport = FakeTransport::new(vec![Ok(denied)]);
+            let mut update = options(&temp.0);
+            update.force_refresh = true;
+            let error =
+                fetch_retroarch_cheat_source("libretro-buildbot-cheats", &update, &transport)
+                    .unwrap_err();
+            assert!(!retryable_download_error(&error));
+            assert_eq!(error.retry_after_seconds, Some(120));
+            assert_eq!(
+                transport
+                    .calls
+                    .borrow()
+                    .iter()
+                    .filter(|url| url.contains("codeload.github.com"))
+                    .count(),
+                1
+            );
+            for diagnostic in [format!("{error:?}"), error.to_string()] {
+                assert!(diagnostic.contains(&status.to_string()));
+                assert!(!diagnostic.contains("fake-secret"));
+            }
+            let mut after = BTreeMap::new();
+            files(&temp.0, &mut after);
+            let metadata: CheatSourceCacheMetadata =
+                serde_json::from_slice(&after[&metadata_path]).unwrap();
+            after.remove(&metadata_path);
+            assert_eq!(before, after);
+            assert_eq!(metadata.current_snapshot, initial.current_snapshot);
+            assert_eq!(metadata.manifest, initial.manifest);
+            assert!(!metadata.last_fetch_succeeded);
+            assert_eq!(metadata.last_error, Some(error));
+            assert!(metadata.last_error_at_unix_seconds.is_some());
+        }
+    }
+
+    #[test]
+    fn ordinary_error_body_still_allows_bounded_retry() {
+        let temp = TempDirectory::new();
+        let work = temp.0.join("work");
+        fs::create_dir(&work).unwrap();
+        let mut transient = response(b"temporary outage".to_vec());
+        transient.metadata.status = 503;
+        transient.metadata.content_type = Some("text/plain".into());
+        let transport = FakeTransport::new(vec![Ok(transient), Ok(response(valid_zip()))]);
+        download_archive_with_retries(
+            &trusted_retroarch_cheat_sources().remove(0),
+            "https://codeload.github.com/libretro/libretro-database/zip/revision",
+            100000,
+            &transport,
+            &options(&temp.0),
+            &work,
+            Instant::now(),
+        )
+        .unwrap();
+        assert_eq!(transport.calls.borrow().len(), 2);
+    }
+
+    #[test]
+    fn error_body_inspection_checks_cancellation_and_deadline() {
+        let cancellation = CheatSourceCancellation::default();
+        cancellation.cancel();
+        let context = CheatSourceTransferContext {
+            cancellation: Some(&cancellation),
+            progress: None,
+            attempt: 1,
+            overall_timeout: Duration::from_secs(5),
+        };
+        let error = inspect_error_body(
+            &mut Cursor::new(b"temporary"),
+            503,
+            Some("text/plain"),
+            Some(120),
+            context,
+        )
+        .unwrap_err();
+        assert!(!retryable_download_error(&error));
+        let error = inspect_error_body(
+            &mut Cursor::new(b"temporary"),
+            503,
+            Some("text/plain"),
+            Some(120),
+            CheatSourceTransferContext {
+                cancellation: None,
+                overall_timeout: Duration::ZERO,
+                ..context
+            },
+        )
+        .unwrap_err();
+        assert_eq!(error.code, "error_body_unverified");
+        assert_eq!(error.retry_after_seconds, Some(120));
+        assert!(!retryable_download_error(&error));
+    }
+
+    #[test]
+    fn localhost_error_reader_refuses_truncated_body_without_secret_diagnostics() {
+        use std::net::TcpListener;
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        let worker = std::thread::spawn(move || {
+            let (mut socket, _) = listener.accept().unwrap();
+            socket
+                .set_read_timeout(Some(Duration::from_secs(5)))
+                .unwrap();
+            let mut request = Vec::new();
+            let mut byte = [0];
+            while !request.ends_with(b"\r\n\r\n") {
+                assert_eq!(socket.read(&mut byte).unwrap(), 1);
+                request.push(byte[0]);
+            }
+            socket.write_all(b"HTTP/1.1 503 Synthetic\r\nContent-Length: 100\r\nContent-Type: text/plain\r\nConnection: close\r\n\r\nfake-secret").unwrap();
+            1
+        });
+        let agent: ureq::Agent = ureq::Agent::config_builder()
+            .proxy(None)
+            .max_redirects(0)
+            .http_status_as_error(false)
+            .timeout_global(Some(Duration::from_secs(5)))
+            .build()
+            .into();
+        let mut response = agent
+            .get(format!("http://{address}/synthetic"))
+            .call()
+            .unwrap();
+        let error = inspect_error_body(
+            &mut response.body_mut().as_reader(),
+            503,
+            Some("text/plain"),
+            Some(120),
+            CheatSourceTransferContext {
+                cancellation: None,
+                progress: None,
+                attempt: 1,
+                overall_timeout: Duration::from_secs(5),
+            },
+        )
+        .unwrap_err();
+        assert_eq!(worker.join().unwrap(), 1);
+        assert_eq!(error.code, "error_body_unverified");
+        assert_eq!(error.retry_after_seconds, Some(120));
+        assert!(!retryable_download_error(&error));
+        assert!(!format!("{error:?} {error}").contains("fake-secret"));
+    }
+
+    #[test]
+    fn cheat_response_debug_hides_nested_sensitive_headers() {
+        let mut response = response(b"unused".to_vec()).metadata;
+        response.status = 302;
+        response.location =
+            Some("https://example.invalid/?arbitrary=fake-secret&devpassword=second-secret".into());
+        response.etag = Some("reflected-secret".into());
+        let debug = format!("{:?}", Some(response));
+        for secret in [
+            "fake-secret",
+            "second-secret",
+            "reflected-secret",
+            "https://",
+            "devpassword",
+        ] {
+            assert!(!debug.contains(secret));
+        }
+        assert!(debug.contains("302"));
+    }
+
+    #[test]
+    fn provider_cooldown_deadline_decision_never_shortens_minimum() {
+        assert!(ensure_retry_fits_deadline(120, Duration::from_secs(121)).is_ok());
+        for (wait, remaining) in [(120, 120), (120, 60), (999, 900), (u64::MAX, 900)] {
+            let error =
+                ensure_retry_fits_deadline(wait, Duration::from_secs(remaining)).unwrap_err();
+            assert_eq!(error.code, "provider_cooldown_deferred");
+            assert_eq!(error.retry_after_seconds, Some(wait));
+            assert!(!retryable_download_error(&error));
+        }
+    }
+
+    #[test]
+    fn provider_cooldown_over_deadline_does_not_retry_or_replace_cached_snapshot() {
+        let temp = TempDirectory::new();
+        let first = fetch_retroarch_cheat_source(
+            "libretro-buildbot-cheats",
+            &options(&temp.0),
+            &FakeTransport::new(vec![Ok(response(valid_zip()))]),
+        )
+        .unwrap();
+        let mut limited = response(Vec::new());
+        limited.metadata.status = 429;
+        limited.metadata.retry_after_seconds = Some(999);
+        let transport = FakeTransport::new(vec![Ok(limited)]);
+        let mut update = options(&temp.0);
+        update.force_refresh = true;
+        let error = fetch_retroarch_cheat_source("libretro-buildbot-cheats", &update, &transport)
+            .unwrap_err();
+        assert_eq!(error.code, "provider_cooldown_deferred");
+        assert_eq!(error.retry_after_seconds, Some(999));
+        assert_eq!(
+            transport
+                .calls
+                .borrow()
+                .iter()
+                .filter(|url| url.contains("codeload.github.com"))
+                .count(),
+            1
+        );
+        let after = inspect_retroarch_cheat_source("libretro-buildbot-cheats", &temp.0).unwrap();
+        assert!(after.setup_usable);
+        assert_eq!(
+            after.manifest.unwrap().archive_sha256,
+            first.manifest.archive_sha256
+        );
+    }
+
+    #[test]
+    fn provider_120_second_cooldown_with_less_remaining_time_defers_without_sleep() {
+        let temp = TempDirectory::new();
+        let work = temp.0.join("work");
+        fs::create_dir(&work).unwrap();
+        let mut limited = response(Vec::new());
+        limited.metadata.status = 429;
+        limited.metadata.retry_after_seconds = Some(120);
+        let transport = FakeTransport::new(vec![Ok(limited)]);
+        let started =
+            Instant::now() - Duration::from_secs(CHEAT_SOURCE_OVERALL_TIMEOUT_SECONDS - 60);
+        let error = download_archive_with_retries(
+            &trusted_retroarch_cheat_sources().remove(0),
+            "https://codeload.github.com/libretro/libretro-database/zip/revision",
+            1024,
+            &transport,
+            &options(&temp.0),
+            &work,
+            started,
+        )
+        .unwrap_err();
+        assert_eq!(error.code, "provider_cooldown_deferred");
+        assert_eq!(error.retry_after_seconds, Some(120));
+        assert_eq!(transport.calls.borrow().len(), 1);
+        assert_eq!(fs::read_dir(work).unwrap().count(), 0);
     }
 
     #[test]

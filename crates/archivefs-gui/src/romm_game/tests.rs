@@ -50,6 +50,12 @@ fn record(id: &str, title: &str) -> ExternalIdentityRecord {
         verification: ExternalVerification::StrongExternal,
         conflicts: Vec::new(),
         evidence: Vec::new(),
+        synopsis: None,
+        genres: Vec::new(),
+        players: None,
+        rating: None,
+        release_year: None,
+        howlongtobeat: None,
     }
 }
 
@@ -81,6 +87,7 @@ fn probe(answers: HashMap<PathBuf, LocalPresence>) -> impl Fn(&Path) -> LocalFil
                 path: path.to_path_buf(),
                 size_bytes: 131_072,
                 modified_unix_seconds: Some(1_785_000_000),
+                object: None,
             }),
             presence,
             local_platform: None,
@@ -155,6 +162,7 @@ fn hashes_for(path: &str, md5: &str) -> LocalHashCache {
             path: PathBuf::from(path),
             size_bytes: 131_072,
             modified_unix_seconds: Some(1_785_000_000),
+            object: None,
         },
         crc32: CRC.to_string(),
         md5: md5.to_string(),
@@ -766,6 +774,9 @@ fn a_record_with_only_a_public_scraper_link_is_never_fetchable() {
     public_only.artwork = Some(ArtworkReference {
         reference: "https://images.igdb.com/cover.jpg".to_string(),
         small_reference: None,
+        large_reference: None,
+        screenshots: Vec::new(),
+        manual: None,
     });
     assert_eq!(
         availability_of(&public_only),
@@ -783,6 +794,9 @@ fn a_record_with_romms_own_small_cover_is_fetchable() {
     fetchable.artwork = Some(ArtworkReference {
         reference: "https://images.igdb.com/cover.jpg".to_string(),
         small_reference: Some("assets/romm/resources/small.png".to_string()),
+        large_reference: None,
+        screenshots: Vec::new(),
+        manual: None,
     });
     assert_eq!(availability_of(&fetchable), ArtworkAvailability::Fetchable);
     assert!(
@@ -1038,6 +1052,7 @@ fn compare_hashes_reports_every_algorithm_romm_published() {
             path: PathBuf::from(LOCAL),
             size_bytes: 131_072,
             modified_unix_seconds: Some(1),
+            object: None,
         },
         crc32: CRC.to_string(),
         md5: MD5.to_string(),
@@ -1127,6 +1142,9 @@ fn no_view_model_can_carry_a_token_or_a_url() {
     with_artwork.artwork = Some(ArtworkReference {
         reference: "https://images.igdb.com/cover.jpg".to_string(),
         small_reference: Some("assets/romm/resources/small.png?ts=1 2".to_string()),
+        large_reference: None,
+        screenshots: Vec::new(),
+        manual: None,
     });
     let panel = resolve(
         vec![with_artwork],
@@ -1424,6 +1442,9 @@ fn a_public_only_cover_is_explained_rather_than_fetched() {
     public_only.artwork = Some(ArtworkReference {
         reference: "https://images.igdb.com/cover.jpg".to_string(),
         small_reference: None,
+        large_reference: None,
+        screenshots: Vec::new(),
+        manual: None,
     });
     let mut state = GamePanelState::default();
     state.focus(Some(Path::new(LOCAL)));
@@ -1454,6 +1475,9 @@ fn a_visible_romm_thumbnail_is_requested_once_but_public_artwork_is_not() {
     fetchable.artwork = Some(ArtworkReference {
         reference: "https://images.igdb.com/cover.jpg".to_string(),
         small_reference: Some("assets/romm/resources/small.png".to_string()),
+        large_reference: None,
+        screenshots: Vec::new(),
+        manual: None,
     });
     let mut state = GamePanelState::default();
     state.focus(Some(Path::new(LOCAL)));

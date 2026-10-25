@@ -14,6 +14,8 @@ use archivefs_core::dat::parser::{DiagnosticSeverity, ParseOutcome, ParseWarning
 use archivefs_core::dat::parsers::parse_dat_file;
 use serde::Serialize;
 
+mod duel;
+
 #[derive(Debug, Serialize)]
 struct InspectOutput {
     file_path: String,
@@ -214,7 +216,7 @@ pub fn run(args: Vec<String>) -> Result<(), Box<dyn std::error::Error>> {
     let Some(command) = args.first().cloned() else {
         return Err(
             "dat requires a sub-command: inspect <path> | validate <path> | audit <path> [--json] \
-             [--file <path> ...]\n\
+             [--file <path> ...] | duel <DAT-A> <DAT-B> [--json]\n\
              \x20 --file compares the given name against the DAT. It does not open,\n\
              \x20 read or hash the file."
                 .into(),
@@ -226,8 +228,9 @@ pub fn run(args: Vec<String>) -> Result<(), Box<dyn std::error::Error>> {
         "inspect" => run_inspect(rest),
         "validate" => run_validate(rest),
         "audit" => run_audit(rest),
+        "duel" => duel::run(rest),
         _ => Err(format!(
-            "unknown dat sub-command '{command}' (expected inspect, validate, or audit)"
+            "unknown dat sub-command '{command}' (expected inspect, validate, audit, or duel)"
         )
         .into()),
     }
@@ -310,12 +313,11 @@ fn run_validate(mut args: Vec<String>) -> Result<(), Box<dyn std::error::Error>>
     let limits = DatLimits::default();
     let (dat, warnings, errors) = match parse_dat_file(&path, limits) {
         Ok(outcome) => {
+            // Whatever the format, a catalogue with nothing in it cannot verify
+            // anything; "valid" would send the person on to an audit that
+            // can only answer "not checked".
             let errors = if outcome.dat.games.is_empty() && outcome.dat.source.rom_count == 0 {
-                if outcome.dat.source.format.label() == "Logiqx XML" {
-                    vec!["file parsed but contains no game entries".to_string()]
-                } else {
-                    Vec::new()
-                }
+                vec!["file parsed but contains no game entries".to_string()]
             } else {
                 Vec::new()
             };
@@ -337,6 +339,7 @@ fn run_validate(mut args: Vec<String>) -> Result<(), Box<dyn std::error::Error>>
                 entry_count: 0,
                 rom_count: 0,
                 parse_warnings: vec!["file failed to parse".to_string()],
+                packing_policy: archivefs_core::dat::model::DatPackingPolicy::Standard,
             };
             let dat = archivefs_core::dat::model::ParsedDat {
                 source,
@@ -585,6 +588,50 @@ mod tests {
         assert!(run(args).is_err());
     }
 
+    /// A DAT-o-MATIC or Redump download is a ZIP; validating it used to
+    /// report a valid ClrMamePro catalogue with zero entries.
+    #[test]
+    fn validate_refuses_a_zip_and_names_the_container() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir
+            .path()
+            .join("Sony - PlayStation - Datfile (2026-01-01).zip");
+        std::fs::write(&path, b"PK\x03\x04\x14\x00\x00\x00\x08\x00not really a dat").unwrap();
+        let args = vec![
+            "validate".into(),
+            "--json".into(),
+            path.to_string_lossy().into_owned(),
+        ];
+        let error = run(args).unwrap_err().to_string();
+        assert!(error.contains("failed validation"), "{error}");
+        // The reason the command printed is the parser's own container refusal.
+        let reason = parse_dat_file(&path, DatLimits::default())
+            .unwrap_err()
+            .to_string();
+        assert!(reason.contains("ZIP archive"), "{reason}");
+        assert!(reason.contains("Extract the .dat"), "{reason}");
+    }
+
+    #[test]
+    fn validate_rejects_an_empty_catalogue_in_either_format() {
+        let (_dir, logiqx) = write_temp_file(
+            "empty.xml",
+            r#"<?xml version="1.0"?><datafile><header><name>Empty</name></header></datafile>"#,
+        );
+        let error = run(vec![
+            "validate".into(),
+            logiqx.to_string_lossy().into_owned(),
+        ])
+        .unwrap_err()
+        .to_string();
+        assert!(error.contains("failed validation"), "{error}");
+        let (_dir, cmp) = write_temp_file("empty.dat", "clrmamepro (\n\tname Empty\n)\n");
+        let error = run(vec!["validate".into(), cmp.to_string_lossy().into_owned()])
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("failed validation"), "{error}");
+    }
+
     #[test]
     fn audit_empty_files_succeeds() {
         let content = "clrmamepro (\n\tname Test\n)\ngame (\n\tname \"Test Game\"\n\trom ( name test.bin size 1024 crc DEADBEEF )\n)\n";
@@ -693,7 +740,7 @@ mod tests {
             "a parser note is not a warning:\n{text}"
         );
         assert!(text.contains("Parser notes:"), "{text}");
-        assert!(text.contains("DOCTYPE"), "{text}");
+        assert!(text.contains("Logiqx"), "{text}");
     }
 
     #[test]
@@ -707,7 +754,7 @@ mod tests {
             "inspect must not label a parser note as a warning:\n{text}"
         );
         assert!(text.contains("Parser notes:"), "{text}");
-        assert!(text.contains("DOCTYPE"), "{text}");
+        assert!(text.contains("Logiqx"), "{text}");
     }
 
     #[test]
@@ -748,8 +795,8 @@ mod tests {
         );
         assert_eq!(output.notes.len(), 1, "{:?}", output.notes);
         assert_eq!(output.notes[0].severity, DiagnosticSeverity::Note);
-        assert_eq!(output.notes[0].code, "doctype_ignored");
-        assert!(output.notes[0].message.contains("DOCTYPE"), "{output:?}");
+        assert_eq!(output.notes[0].code, "trusted_dtd_unavailable");
+        assert!(output.notes[0].message.contains("Logiqx"), "{output:?}");
     }
 
     #[test]
@@ -807,7 +854,7 @@ mod tests {
         );
         assert_eq!(output.notes.len(), 1, "{:?}", output.notes);
         assert_eq!(output.notes[0].severity, DiagnosticSeverity::Note);
-        assert_eq!(output.notes[0].code, "doctype_ignored");
+        assert_eq!(output.notes[0].code, "trusted_dtd_unavailable");
     }
 
     #[test]
@@ -873,8 +920,8 @@ mod tests {
         );
         assert_eq!(output.notes.len(), 1, "{:?}", output.notes);
         assert_eq!(output.notes[0].severity, DiagnosticSeverity::Note);
-        assert_eq!(output.notes[0].code, "doctype_ignored");
-        assert!(output.notes[0].message.contains("DOCTYPE"), "{output:?}");
+        assert_eq!(output.notes[0].code, "trusted_dtd_unavailable");
+        assert!(output.notes[0].message.contains("Logiqx"), "{output:?}");
         assert!(output.errors.is_empty(), "{:?}", output.errors);
     }
 
@@ -918,7 +965,7 @@ mod tests {
         assert_eq!(output.warnings[0].severity, DiagnosticSeverity::Warning);
         assert_eq!(output.notes.len(), 1, "{:?}", output.notes);
         assert_eq!(output.notes[0].severity, DiagnosticSeverity::Note);
-        assert_eq!(output.notes[0].code, "doctype_ignored");
+        assert_eq!(output.notes[0].code, "trusted_dtd_unavailable");
         assert!(output.errors.is_empty(), "{:?}", output.errors);
     }
 

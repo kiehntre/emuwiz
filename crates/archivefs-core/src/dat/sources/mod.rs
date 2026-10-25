@@ -36,7 +36,9 @@
 //! preferences file, through the shared durable-write path. Removing a source
 //! removes a registry entry and nothing else.
 
+pub mod audit_cache;
 pub mod audit_run;
+pub mod audit_targets;
 pub mod config;
 pub mod validation;
 
@@ -44,6 +46,8 @@ use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
+
+use crate::dat::model::DatEcosystem;
 
 pub use crate::dat::policy::{DatPolicyConfig, default_dat_policy};
 pub use config::{
@@ -70,6 +74,53 @@ impl DatSourceKind {
         match self {
             Self::File => "DAT file",
             Self::Folder => "DAT folder",
+        }
+    }
+}
+
+/// Who owns the bytes behind a DAT source input.
+///
+/// This is intentionally explicit.  In particular, a path, display name,
+/// free-text origin, URL-looking origin, or parsed DAT header can never turn a
+/// user-selected source into an EmuWiz-managed one.  A future updater must
+/// additionally prove that a managed entry's snapshot is represented by the
+/// typed state in [`crate::dat::updates`]; this enum alone is not replacement
+/// authority.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum DatSourceOwnership {
+    /// A path selected or registered by the user.  It is never updateable by
+    /// EmuWiz's managed-DAT updater.
+    #[default]
+    UserLocal,
+    /// A read-only projection of a snapshot held below EmuWiz's managed DAT
+    /// root and bound to typed managed-source state.
+    EmuWizManaged,
+    /// A local DAT registered by the TOSEC release-pack selection workflow.
+    /// This is separate from a manually added local TOSEC DAT so later
+    /// selection reconciliation can remove only entries it explicitly owns.
+    ImportedTosecReleasePack {
+        pack_id: String,
+        relative_path: PathBuf,
+    },
+}
+
+impl DatSourceOwnership {
+    pub fn is_user_local(&self) -> bool {
+        matches!(self, Self::UserLocal)
+    }
+
+    pub fn is_emuwiz_managed(&self) -> bool {
+        matches!(self, Self::EmuWizManaged)
+    }
+
+    pub fn imported_tosec_release_pack(&self) -> Option<(&str, &Path)> {
+        match self {
+            Self::ImportedTosecReleasePack {
+                pack_id,
+                relative_path,
+            } => Some((pack_id, relative_path)),
+            _ => None,
         }
     }
 }
@@ -133,6 +184,88 @@ impl DatHealthState {
     }
 }
 
+/// One arcade DAT catalogue's `<version>` header, observed when a source was
+/// last validated and retained on the health record.
+///
+/// It exists so Doctor's advisory MAME / FinalBurn Neo "does the catalogue I
+/// audited against match the emulator I have installed?" check can read a
+/// persisted revision instead of reopening the DAT during a scan. One entry
+/// per distinct arcade [`DatEcosystem`] present in the source; `version` is
+/// `None` when the DAT declared no `<version>` header at all (still recorded,
+/// so "arcade catalogue configured, revision unknown" stays distinct from
+/// "no arcade catalogue configured").
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ArcadeCatalogueRevision {
+    pub ecosystem: DatEcosystem,
+    pub version: Option<String>,
+}
+
+impl ArcadeCatalogueRevision {
+    /// Whether an ecosystem is one this record tracks (MAME arcade / MAME
+    /// software list / FinalBurn Neo). Every other ecosystem is ignored: an
+    /// emulator-version comparison does not apply to it.
+    pub fn is_arcade_ecosystem(ecosystem: DatEcosystem) -> bool {
+        matches!(
+            ecosystem,
+            DatEcosystem::MAMEArcade | DatEcosystem::MAMESoftwareList | DatEcosystem::FBNeo
+        )
+    }
+
+    fn ecosystem_key(ecosystem: DatEcosystem) -> Option<&'static str> {
+        match ecosystem {
+            DatEcosystem::MAMEArcade => Some("mame_arcade"),
+            DatEcosystem::MAMESoftwareList => Some("mame_software_list"),
+            DatEcosystem::FBNeo => Some("fbneo"),
+            _ => None,
+        }
+    }
+
+    fn ecosystem_from_key(key: &str) -> Option<DatEcosystem> {
+        match key {
+            "mame_arcade" => Some(DatEcosystem::MAMEArcade),
+            "mame_software_list" => Some(DatEcosystem::MAMESoftwareList),
+            "fbneo" => Some(DatEcosystem::FBNeo),
+            _ => None,
+        }
+    }
+
+    /// The flat `"<ecosystem-key>=<version>"` scalar form persisted in the
+    /// config file, so the health block stays free of TOML sub-tables. An
+    /// absent `<version>` header serialises as a trailing `=` and nothing
+    /// after it.
+    fn encode(&self) -> Option<String> {
+        let key = Self::ecosystem_key(self.ecosystem)?;
+        Some(match self.version.as_deref().map(str::trim) {
+            Some(version) if !version.is_empty() => format!("{key}={version}"),
+            _ => format!("{key}="),
+        })
+    }
+
+    /// The inverse of [`encode`]. Unknown ecosystem keys are dropped rather
+    /// than guessed.
+    fn decode(text: &str) -> Option<Self> {
+        let (key, version) = text.split_once('=')?;
+        let ecosystem = Self::ecosystem_from_key(key.trim())?;
+        let version = version.trim();
+        Some(Self {
+            ecosystem,
+            version: (!version.is_empty()).then(|| version.to_string()),
+        })
+    }
+
+    pub(crate) fn encode_all(revisions: &[Self]) -> Option<Vec<String>> {
+        let encoded: Vec<String> = revisions.iter().filter_map(Self::encode).collect();
+        (!encoded.is_empty()).then_some(encoded)
+    }
+
+    pub(crate) fn decode_all(encoded: &[String]) -> Vec<Self> {
+        encoded
+            .iter()
+            .filter_map(|text| Self::decode(text))
+            .collect()
+    }
+}
+
 /// The result of the last validation run, as persisted.
 ///
 /// `observed_size_bytes` / `observed_modified_unix_seconds` describe the DAT
@@ -154,6 +287,16 @@ pub struct DatSourceHealth {
     pub formats: Option<Vec<String>>,
     pub observed_size_bytes: Option<u64>,
     pub observed_modified_unix_seconds: Option<i64>,
+    /// The sub-second part of the modification time seen at validation, in
+    /// nanoseconds. `None` for a record written before this was kept: such a
+    /// record is compared at whole-second resolution only, because the finer
+    /// part was never observed and is not guessed. Re-validating records it.
+    pub observed_modified_subsec_nanos: Option<u32>,
+    /// The `<version>` header of each arcade DAT catalogue in the source, kept
+    /// so Doctor can compare it against the installed MAME / FinalBurn Neo
+    /// without reopening the DAT. Empty for a source with no arcade catalogue.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub arcade_catalogue_revisions: Vec<ArcadeCatalogueRevision>,
 }
 
 impl DatSourceHealth {
@@ -191,7 +334,23 @@ impl DatSourceHealth {
             .ok()
             .and_then(|time| time.duration_since(std::time::UNIX_EPOCH).ok())
             .map(|elapsed| elapsed.as_secs() as i64);
-        metadata.len() != recorded_size || modified != self.observed_modified_unix_seconds
+        if metadata.len() != recorded_size || modified != self.observed_modified_unix_seconds {
+            return true;
+        }
+        // Same size and same second: only a recorded sub-second part can tell
+        // an edit made within that second from the file we validated. A record
+        // without one stays at whole-second resolution.
+        match self.observed_modified_subsec_nanos {
+            Some(recorded) => {
+                let current = metadata
+                    .modified()
+                    .ok()
+                    .and_then(|time| time.duration_since(std::time::UNIX_EPOCH).ok())
+                    .map(|elapsed| elapsed.subsec_nanos());
+                current != Some(recorded)
+            }
+            None => false,
+        }
     }
 }
 
@@ -207,6 +366,8 @@ pub struct DatSourceEntry {
     pub display_name: String,
     pub path: PathBuf,
     pub kind: DatSourceKind,
+    /// Explicit provenance/ownership, never inferred from presentation text.
+    pub ownership: DatSourceOwnership,
     pub enabled: bool,
     pub priority: u32,
     pub platform: Option<String>,
@@ -235,6 +396,7 @@ impl DatSourceEntry {
             display_name,
             path,
             kind,
+            ownership: DatSourceOwnership::UserLocal,
             enabled: true,
             priority: DEFAULT_DAT_PRIORITY,
             platform: None,
@@ -263,6 +425,18 @@ impl DatSourceEntry {
         self.platform
             .as_ref()
             .is_none_or(|id| crate::canonical_platform_for_alias(id).is_some())
+    }
+
+    /// Managed snapshots are kept in separate typed state and exposed through
+    /// [`crate::dat::updates::ManagedDatReadOnlySource`]. The only non-user
+    /// local registry ownership is an explicitly tagged TOSEC release-pack
+    /// entry, used solely for safe selection reconciliation.
+    pub fn ownership(&self) -> &DatSourceOwnership {
+        &self.ownership
+    }
+
+    pub fn is_user_local(&self) -> bool {
+        self.ownership().is_user_local()
     }
 }
 

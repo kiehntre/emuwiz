@@ -1,0 +1,118 @@
+//! The Repair Center foundation: TRUTH -> PROPOSAL -> PREFLIGHT -> PREVIEW ->
+//! SAFE TRANSACTION -> REVERIFY / AUDIT.
+//!
+//! This is the smallest trustworthy core a future Repair Center GUI,
+//! whole-library scanner, RomM cleanup, archive rebuild, and organisation
+//! feature can consume. It deliberately does not fix everything: only
+//! same-filesystem `RenamePath` and `MovePath` are executable, and everything
+//! else is typed as a non-executable deferred action.
+//!
+//! # The governing principle
+//!
+//! **A repair proposal is NOT permission to mutate.** Every action is
+//! revalidated immediately before execution: source identity is re-captured
+//! (`symlink_metadata`, inode/device where available), the destination is
+//! re-checked for existence, and the mutation itself is an atomic
+//! no-clobber rename (`renameat2(RENAME_NOREPLACE)`). False refusal is
+//! acceptable. Wrong mutation is not.
+//!
+//! # Reuse, not reinvention
+//!
+//! The transaction, journal, rollback, recovery, identity, and no-clobber
+//! machinery all live in [`crate::dat::rename_apply`]. This module is a thin,
+//! typed vocabulary on top of it: [`proposal`] (the typed proposal model),
+//! [`plan`] (batch conflict detection), [`preflight`] (dry run), [`execute`]
+//! (the transaction driver), and [`adapter`] (the bridge from the existing
+//! hardened DAT rename plans). No parallel transaction system exists here.
+//!
+//! # Layers
+//!
+//! 1. [`RepairProposal`] - one typed, evidenced claim.
+//! 2. [`RepairPlan`] - a batch with every global conflict detected up front.
+//! 3. [`run_repair_preflight`] - the pure dry run a GUI renders.
+//! 4. [`RepairTransactionResult`] - the journaled, rollbackable outcome with a
+//!    post-apply re-verification pass.
+
+pub mod adapter;
+pub mod duplicate;
+pub mod duplicate_scan;
+pub mod exact_duplicate;
+pub mod execute;
+mod identity;
+pub mod library;
+pub mod n64_equivalent;
+pub mod optical_conversion;
+pub mod optical_equivalent;
+pub mod plan;
+pub mod preflight;
+pub mod proposal;
+pub mod quarantine;
+
+#[cfg(test)]
+mod tests;
+
+#[cfg(test)]
+mod library_tests;
+
+pub use duplicate::{
+    DuplicateContentProof, DuplicateHashCache, DuplicatePairClassification, DuplicateProofRefusal,
+    candidate_pairs, prove_duplicate_content, prove_duplicate_group,
+};
+pub use duplicate_scan::{
+    DuplicateNeedsReviewMember, DuplicateScanAccounting, plan_duplicate_quarantine_from_rename_plan,
+};
+pub use exact_duplicate::{
+    CanonicalRecommendation, EXACT_DUPLICATE_SCAN_VERSION, ExactDuplicateGroup,
+    ExactDuplicateMember, ExactDuplicateScanReport, ExcludedCandidate, FullFileIdentity,
+    FullHashRefusal, GroupQuarantineReadiness, MultiFileProtection, ScanCancelled,
+    apply_user_choice, build_exact_duplicate_group_proposals, exact_bytes_match,
+    hash_full_file_sha256, scan_exact_duplicates, scan_exact_duplicates_reporting,
+    select_canonical_copy,
+};
+pub use execute::{
+    RepairApplyExecution, RepairExecutionError, RepairExecutionOptions, RepairRecoveryReport,
+    RepairReverifyEntry, RepairReverifyOutcome, RepairTransactionResult, apply_repair_transaction,
+    build_repair_transaction, classify_persisted_transactions, execute_repair_plan,
+    reverify_transaction, rollback_repair_transaction,
+};
+pub use library::{
+    ApplySavedPlanError, ApplySavedPlanSelectedError, CombinedApplyResult, LibraryRepairPlan,
+    LibraryRepairReport, LibraryScanError, LibraryScanOutcome, LibraryScanRequest, PlanItem,
+    QuarantineApplyResult, RepairProfile, ReportCounts, SetItem, apply_library_repair_plan,
+    apply_saved_plan, apply_saved_plan_selected, build_library_repair_report, plan_file_from_scan,
+    preview_library_repair_plan, re_prove_saved_plan, run_library_scan,
+};
+pub use n64_equivalent::{
+    N64_EQUIVALENT_SCAN_VERSION, N64EquivalentGroup, N64EquivalentMember, N64EquivalentScanReport,
+    N64ExcludedCandidate, apply_n64_equivalent_group, build_n64_equivalent_repair_plan,
+    rollback_n64_equivalent_group, scan_n64_equivalent_duplicates,
+};
+pub use optical_conversion::{
+    ChdConversionError, ChdConversionExecutionState, ChdConversionPlan, ChdConversionPolicy,
+    ChdConversionRecord, ChdConversionResult, ChdConversionSourceMode, ChdConversionTransaction,
+    ChdSourceCleanup, SAFE_CUE_BIN_TO_CHD_POLICY, build_chd_conversion_plan,
+    execute_chd_conversion, execute_safe_chd_conversion, rollback_chd_conversion,
+};
+pub use optical_equivalent::{
+    OPTICAL_EQUIVALENT_SCAN_VERSION, OpticalEquivalentFile, OpticalEquivalentGroup,
+    OpticalEquivalentRepresentation, OpticalEquivalentScanReport, OpticalExcludedCandidate,
+    apply_optical_equivalent_group, rollback_optical_equivalent_group,
+    scan_optical_equivalent_duplicates,
+};
+pub use plan::{
+    PlanConflict, PlanConflictKind, RepairPlan, RepairPlanId, build_repair_plan,
+    detect_plan_conflicts, select_repair_plan_subset,
+};
+pub use preflight::{
+    RepairPreflightReport, RepairPreflightResult, RepairPreflightStatus, run_repair_preflight,
+};
+pub use proposal::{
+    DeferredActionKind, RepairAction, RepairAuditRef, RepairEvidence, RepairEvidenceKind,
+    RepairProposal, RepairProposalId, SafetyState,
+};
+pub use quarantine::{
+    KeeperEvidence, QUARANTINE_DIRECTORY_NAME, QuarantineGroupPlan, QuarantinePlanRefusal,
+    QuarantineRollbackOutcome, SurvivorSelection, apply_quarantine_transaction,
+    build_quarantine_transaction, keeper_evidence_from_rename_proposal, plan_duplicate_quarantine,
+    quarantine_destination, rollback_quarantine_transaction, select_survivor,
+};

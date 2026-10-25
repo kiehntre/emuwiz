@@ -1,0 +1,168 @@
+{
+  "evidence_schema_version": 1,
+  "base_sha": "0728ee7ce44c47817fffc419bbd77a67af19f32a",
+  "original_stack_base_sha": "1203d8bcba77da51461c2b04260518fe56820234",
+  "verified_current_main": "1467155b0dc06df4e88c016c58d962b0bd0d9cff",
+  "branch": "fix/mame-dependency-review-correction",
+  "worktree": "/home/davedap/emuwiz-mame-dependency-correction",
+  "review_report": "/tmp/emuwiz-mame-independent-cya6ef19/report.json",
+  "private_evidence_root": "/tmp/emuwiz-mame-correction-rzpid7e0",
+  "scope": "Metadata evaluation, parser provenance, test-only executable publication, synthetic fixtures. No real ROM/library/configuration changes, launch policy edits or promotion.",
+  "findings": [
+    {
+      "id": "definite_mismatch_precedence",
+      "before": "Missing parent/ROM source or unknown scan completeness hides observed CRC mismatch as Unknown.",
+      "after": "Known wrong size/CRC/SHA/CHD identity takes precedence over unresolved dependencies. Absence still needs complete observations and resolved metadata.",
+      "tests": "Complete, Partial, Unknown and NotGathered observations; split, merged, non-merged and OR alternatives; mixed fresh-subject/stale-support metadata."
+    },
+    {
+      "id": "device_rom_in_system_bios",
+      "before": "Correctly identified device ROM in system BIOS archive rejected as DeviceDependencyMissing.",
+      "after": "Permitted device locations include system, system parents and corresponding BIOS archives. Declaration and owner remain the device; observed archive stays in verified provenance.",
+      "reference": "https://docs.mamedev.org/usingmame/assetsearch.html#device-roms",
+      "negative_tests": "Missing device, wrong same-name CRC and correct bytes in unrelated archive remain Incompatible."
+    },
+    {
+      "id": "malformed_merge_with_bad_dump",
+      "before": "baddump with empty merge becomes CompatibleWithWarnings; optional baddump with empty merge becomes Compatible.",
+      "after": "Absent and malformed markers are distinct. Merge-chain validity is checked independently of dump status and before skipping optional bad-dump declarations.",
+      "tests": "Absent, empty, whitespace, contradictory and valid merge; optional bad dump. Valid bad dumps retain warning classification."
+    },
+    {
+      "id": "stale_parsed_cache",
+      "before": "Schema-1 ParsedDat drops relationship/default markers yet deserializes into confidently Compatible results even if caller pins schema 1 or 2.",
+      "after": "Each newly parsed MAME machine carries explicit parser schema 2. Missing stamps deserialize as unknown, never as current. Stale roots fail closed; stale support cannot supply inventories/edges/ownership or prove compatibility. Explicit old pins stay old; misleading current pins are cleared for stale facts.",
+      "migration": "Retained XML can be reparsed through existing import_mame_listxml and from_imported. The pure supplied-evidence evaluator performs no path IO and otherwise reports StaleMetadata with an explicit reimport instruction. Optional serde field keeps old/non-MAME data readable; no SQL migration or GUI workflow change.",
+      "tests": "Six actual original-base serialized fixtures, stripped-stamp caches, fresh JSON round trip, explicit version 0/1/2/3, and retained-XML BIOS-default reimport."
+    },
+    {
+      "id": "parallel_ETXTBSY",
+      "before": "Independent review intercepted posix_spawnp result 26; controlled sibling fork reproduces the writable-inode race even with close-and-rename publication.",
+      "mechanism": "An inherited writable descriptor survives in a pre-exec sibling after the test parent closes its copy; FD_CLOEXEC does not close it until exec. Rename preserves the inode and cannot fix this.",
+      "after": "Only a dedicated child opens the staged stub for writing. Parent sends bytes over a pipe, waits for writer exit, then chmods and renames. Sibling forks cannot inherit a writable executable descriptor from the test parent. The sibling all() assertion now requires an actual probe result.",
+      "production": "Production discovery/probe code is unchanged and never creates or overwrites emulator binaries. A real missing/unexecutable binary continues to yield unavailable version evidence. No spawn-error suppression, retry loop, global lock or serial-only workaround added.",
+      "limitation": "The exact descriptor-holder PID in the earlier stochastic review failure was not captured; the controlled failing test proves this fixture lifecycle hazard."
+    }
+  ],
+  "red_evidence": {
+    "initial_correctness": {
+      "log": "/tmp/emuwiz-mame-correction-rzpid7e0/logs/red-correctness.log",
+      "passed": 3,
+      "failed": 6
+    },
+    "controlled_fork": {
+      "log": "/tmp/emuwiz-mame-correction-rzpid7e0/logs/red-fork.log",
+      "error": "errno 26 ETXTBSY"
+    },
+    "mixed_provenance_refinement": {
+      "log": "/tmp/emuwiz-mame-correction-rzpid7e0/logs/red-mixed-provenance.log",
+      "passed": 9,
+      "failed": 2
+    },
+    "optional_merge_refinement": {
+      "log": "/tmp/emuwiz-mame-correction-rzpid7e0/logs/red-optional.log",
+      "passed": 0,
+      "failed": 1
+    },
+    "existing_unit_fixture": {
+      "captured_excerpt": "/tmp/emuwiz-mame-correction-rzpid7e0/logs/arcade-initial-excerpt.log",
+      "cause": "Synthetic declarations lacked the new parser provenance stamp; explicit current stamps added without changing assertions."
+    }
+  },
+  "validation": {
+    "status": "passed",
+    "environment": "private HOME, XDG_CONFIG/DATA/STATE/CACHE_HOME, TMPDIR and application roots; scripts/cargo-iso --low-debug; offline crates",
+    "previous_regressions": {
+      "passed": 27,
+      "failed": 0,
+      "log": "/tmp/emuwiz-mame-correction-rzpid7e0/logs/green-regressions.log",
+      "original_test_file_unchanged": true
+    },
+    "correction_regressions": {
+      "passed": 14,
+      "failed": 0,
+      "log": "/tmp/emuwiz-mame-correction-rzpid7e0/logs/green-regressions.log"
+    },
+    "affected_suites": {
+      "passed": 458,
+      "failed": 0,
+      "breakdown": {
+        "arcade": 130,
+        "clrmamepro": 13,
+        "logiqx": 48,
+        "dependency": 137,
+        "set": 97,
+        "parser": 8,
+        "importer": 16,
+        "stats": 6,
+        "ready": 3
+      },
+      "log_directory": "/tmp/emuwiz-mame-correction-rzpid7e0/logs"
+    },
+    "reviewer_matrix": {
+      "cases": 47,
+      "expected_verdict_cases": 41,
+      "passed_expected_verdict_cases": 41,
+      "stale_original_base_cache_cases": 6,
+      "all_stale_cases_unknown": true,
+      "results": "/tmp/emuwiz-mame-correction-rzpid7e0/matrix-results.json",
+      "log": "/tmp/emuwiz-mame-correction-rzpid7e0/logs/matrix-final.log"
+    },
+    "concurrency": {
+      "rounds": 64,
+      "threads_per_round": 128,
+      "tests_per_round": 130,
+      "test_executions": 8320,
+      "untraced_rounds": 32,
+      "traced_rounds": 32,
+      "failed_rounds": 0,
+      "stub_spawn_events": 96,
+      "spawn_errors": 0,
+      "ETXTBSY": 0,
+      "results": "/tmp/emuwiz-mame-correction-rzpid7e0/parallel-results.json"
+    },
+    "formatting": {
+      "passed": true,
+      "command": "scripts/cargo-iso --low-debug fmt --all -- --check",
+      "log": "/tmp/emuwiz-mame-correction-rzpid7e0/logs/fmt.log"
+    },
+    "workspace": {
+      "passed": true,
+      "command": "scripts/cargo-iso --low-debug check --workspace --all-targets --offline",
+      "log": "/tmp/emuwiz-mame-correction-rzpid7e0/logs/workspace-check.log",
+      "warnings": "Existing warnings only in unchanged source."
+    },
+    "scope": {
+      "passed": true,
+      "allowed_paths": 11,
+      "production_probe_unchanged": true,
+      "gui_launch_transaction_code_unchanged": true
+    },
+    "precommit_integration_analysis": {
+      "main": "1467155b0dc06df4e88c016c58d962b0bd0d9cff",
+      "full_stack_paths": 14,
+      "main_vs_original_base_blobs_all_match": true,
+      "overlap": [],
+      "receipt": "/tmp/emuwiz-mame-correction-rzpid7e0/integration-precommit.json"
+    }
+  },
+  "independent_review_required": true,
+  "remaining_limitations": [
+    "Old parsed-only MAME caches require explicit reimport of retained XML; without current facts a confident compatibility verdict is refused.",
+    "Evidence remains caller-supplied; no scan of real collections or installed MAME execution was performed.",
+    "Mechanical integration analysis is not runtime validation on current main. Review exact correction SHA before replay and revalidate integration."
+  ],
+  "changed_files": [
+    "crates/archivefs-core/src/arcade_compatibility.rs",
+    "crates/archivefs-core/src/arcade_mame_compatibility.rs",
+    "crates/archivefs-core/src/arcade_mame_compatibility/dependencies.rs",
+    "crates/archivefs-core/src/dat/model.rs",
+    "crates/archivefs-core/src/dat/parsers/clrmamepro.rs",
+    "crates/archivefs-core/src/dat/parsers/logiqx.rs",
+    "crates/archivefs-core/src/dat/parsers/mame_listxml.rs",
+    "crates/archivefs-core/src/diagnostics/arcade_version_probe/tests.rs",
+    "crates/archivefs-core/src/mame_collection_stats.rs",
+    "crates/archivefs-core/tests/mame_dependency_review_correction.rs",
+    "docs/design/mame_dependency_review_correction_evidence.json"
+  ]
+}

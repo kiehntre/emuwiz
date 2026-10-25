@@ -33,8 +33,9 @@ use std::path::{Path, PathBuf};
 
 use archivefs_core::patch_manager::{
     CheatProviderSourceState, CheatSourceEntry, CheatSourceHealth, CheatSourceRegistry,
-    UnresolvedPreference, build_default_registry, load_cheat_sources_config_from,
-    probe_cheat_source_health, save_cheat_sources_config_to,
+    GameGeniePlatform, GameGenieRevisionEvidence, UnresolvedPreference, build_default_registry,
+    decode_classic_game_genie, load_cheat_sources_config_from, probe_cheat_source_health,
+    save_cheat_sources_config_to,
 };
 use eframe::egui;
 
@@ -66,10 +67,10 @@ pub(crate) const ORDERING_EXPLANATION: &str =
 fn provider_kind_label(entry: &CheatSourceEntry) -> &'static str {
     let caps = &entry.spec.capabilities;
     // BSFree drives installs through the shared Dolphin adapter and only for
-    // verified GameCube hex-pair formats; the generic "Downloads and installs"
-    // would overclaim breadth, so it gets the precise statement.
+    // verified GameCube/Wii hex-pair formats; the generic "Downloads and
+    // installs" would overclaim breadth, so it gets the precise statement.
     if entry.spec.id == archivefs_core::patch_manager::BSFREE_PROVIDER_ID {
-        return "Downloads and installs (GameCube via Dolphin)";
+        return "Downloads and installs (GameCube/Wii via Dolphin)";
     }
     match (caps.remote, caps.download, caps.install) {
         (true, true, true) => "Downloads and installs",
@@ -130,10 +131,15 @@ pub(crate) struct PlatformChoice {
 
 /// How many choices the picker shows at once.
 ///
-/// The registry is finite (74 today), so this is not protection against an
-/// unbounded list - it is what keeps the picker readable and forces the
-/// search box to be the way you find something, rather than scrolling.
-pub(crate) const MAX_PLATFORM_CHOICES: usize = 12;
+/// Raised from 12 to 100 (2026-08-22, live-QA Phase 7): 12 was tight enough
+/// that on registries approaching it, a person had to search just to see a
+/// platform that was already visible on screen elsewhere in EmuWiz. The
+/// registry is finite (74 today), so 100 already covers it outright with
+/// headroom for growth; this remains a readability bound, not real
+/// unbounded-list protection - the search box (and the bounded scroll area
+/// around the rendered list) is still how someone finds something quickly
+/// once the registry outgrows what fits on screen at once.
+pub(crate) const MAX_PLATFORM_CHOICES: usize = 100;
 
 /// Canonical platforms a source could still be given an exception for.
 ///
@@ -675,7 +681,6 @@ pub(crate) const MAX_PRIORITY: u32 = 999;
 /// A half-typed priority on the way from "1" to "15" must not be applied,
 /// and an open picker is not a preference - neither belongs in something
 /// whose difference from disk defines the unsaved-change state.
-#[derive(Default)]
 pub(crate) struct CheatSourcesPageUi {
     /// In-progress priority text, keyed by source ID.
     pub(crate) priority_drafts: std::collections::HashMap<String, String>,
@@ -684,6 +689,21 @@ pub(crate) struct CheatSourcesPageUi {
     pub(crate) open_picker: Option<String>,
     /// The picker's search text.
     pub(crate) picker_query: String,
+    /// Pasted Game Genie codes are previewed locally and never applied to ROMs.
+    pub(crate) game_genie_input: String,
+    pub(crate) game_genie_platform: GameGeniePlatform,
+}
+
+impl Default for CheatSourcesPageUi {
+    fn default() -> Self {
+        Self {
+            priority_drafts: std::collections::HashMap::new(),
+            open_picker: None,
+            picker_query: String::new(),
+            game_genie_input: String::new(),
+            game_genie_platform: GameGeniePlatform::Nes,
+        }
+    }
 }
 
 impl CheatSourcesPageUi {
@@ -695,6 +715,7 @@ impl CheatSourcesPageUi {
         self.priority_drafts.clear();
         self.open_picker = None;
         self.picker_query.clear();
+        self.game_genie_input.clear();
     }
 }
 
@@ -754,6 +775,11 @@ pub(crate) fn show_cheat_sources_page(
     }
     ui.add_space(10.0);
 
+    show_open_retro_provider_catalogue(ui);
+    ui.add_space(10.0);
+    show_game_genie_preview(ui, ui_state, gamer_view);
+    ui.add_space(10.0);
+
     if let Some(bar_action) = show_save_bar(ui, view) {
         action = Some(bar_action);
     }
@@ -807,11 +833,172 @@ pub(crate) fn show_cheat_sources_page(
     action
 }
 
+fn show_game_genie_preview(ui: &mut egui::Ui, ui_state: &mut CheatSourcesPageUi, gamer_view: bool) {
+    widgets::section_header(
+        ui,
+        "Classic Game Genie preview",
+        Some("Decode local codes without changing ROM files."),
+    );
+    ui.horizontal_wrapped(|ui| {
+        ui.label("Platform:");
+        egui::ComboBox::from_id_salt("classic-game-genie-platform")
+            .selected_text(game_genie_platform_label(ui_state.game_genie_platform))
+            .show_ui(ui, |ui| {
+                for platform in [
+                    GameGeniePlatform::Nes,
+                    GameGeniePlatform::Snes,
+                    GameGeniePlatform::GameBoy,
+                    GameGeniePlatform::Genesis,
+                    GameGeniePlatform::MasterSystem,
+                    GameGeniePlatform::GameGear,
+                ] {
+                    ui.selectable_value(
+                        &mut ui_state.game_genie_platform,
+                        platform,
+                        game_genie_platform_label(platform),
+                    );
+                }
+            });
+        ui.label("Choose explicitly when code shape is shared by platforms.");
+    });
+    ui.add(
+        egui::TextEdit::multiline(&mut ui_state.game_genie_input)
+            .hint_text("Paste one code, or one code per line")
+            .desired_rows(3)
+            .desired_width(f32::INFINITY),
+    );
+    if ui_state.game_genie_input.trim().is_empty() {
+        ui.label("Nothing to preview yet. This workflow is read-only and local.");
+        return;
+    }
+    for (index, code) in ui_state
+        .game_genie_input
+        .lines()
+        .map(str::trim)
+        .filter(|line| !line.is_empty())
+        .enumerate()
+    {
+        let result = decode_classic_game_genie(
+            ui_state.game_genie_platform,
+            code,
+            &GameGenieRevisionEvidence::unverified(),
+        );
+        ui.push_id(index, |ui| {
+            widgets::card(ui, |ui| {
+                ui.label(format!("Original code: {code}"));
+                ui.label(format!("Status: {:?}", result.status));
+                if let Some(format) = result.format {
+                    ui.label(format!("Format: {:?}", format));
+                }
+                if let Some(instruction) = result.instruction {
+                    ui.label(format!(
+                        "Address: 0x{:X}  Value: 0x{:02X}  Width: {} bits",
+                        instruction.address, instruction.value, instruction.width_bits
+                    ));
+                    if let Some(compare) = instruction.compare {
+                        ui.label(format!(
+                            "Compare: 0x{compare:02X} — only applies when the original byte matches."
+                        ));
+                    }
+                    ui.label("Identity: unverified ROM revision — preview only.");
+                    ui.label("No ROM patch or hidden apply is performed.");
+                }
+                for issue in &result.issues {
+                    ui.colored_label(theme::warning(ui), format!("Issue: {issue:?}"));
+                }
+                if gamer_view {
+                    widgets::technical_details(ui, "game-genie-preview-details", |ui| {
+                        ui.label(format!("Normalized: {}", result.normalized_code));
+                        ui.label(format!("Provenance: {:?}", result.provenance.references));
+                    });
+                } else {
+                    ui.label(format!("Normalized: {}", result.normalized_code));
+                    ui.label(format!("Provenance: {:?}", result.provenance.references));
+                }
+            });
+        });
+    }
+}
+
+fn game_genie_platform_label(platform: GameGeniePlatform) -> &'static str {
+    match platform {
+        GameGeniePlatform::Nes => "NES",
+        GameGeniePlatform::Snes => "SNES",
+        GameGeniePlatform::GameBoy => "Game Boy",
+        GameGeniePlatform::Genesis => "Mega Drive / Genesis",
+        GameGeniePlatform::MasterSystem => "Master System",
+        GameGeniePlatform::GameGear => "Game Gear",
+    }
+}
+
+fn show_open_retro_provider_catalogue(ui: &mut egui::Ui) {
+    widgets::technical_details(ui, "open-retro-cheat-providers", |ui| {
+        ui.heading("Open and local cheat providers");
+        ui.label("These sources are reference/download/import options. EmuWiz does not bundle unclear or community payloads automatically.");
+        for provider in archivefs_core::patch_manager::open_cheat_provider_catalogue() {
+            ui.collapsing(&provider.name, |ui| {
+                ui.label(format!(
+                    "Platform: {}",
+                    provider.platform_coverage.join(", ")
+                ));
+                ui.label(format!("Mode: {:?}", provider.mode));
+                ui.label(format!("Licence: {}", provider.licence));
+                ui.label(format!("Status: {}", provider.redistribution_status));
+                if provider.id == "c64-user-import" || provider.id == "atari-st-user-import" {
+                    ui.label(
+                        "No clearly licensed reusable database is enabled; local import only.",
+                    );
+                }
+            });
+        }
+    });
+    widgets::technical_details(ui, "classic-poke-family", |ui| {
+        ui.heading("Classic POKE preview");
+        ui.label("Manual entries and approved local imports are normalized without running BASIC, trainer scripts or touching media.");
+        ui.label("Preparing a cheat for an emulator requires an exact media hash or verified release identity; a title-only match stays preview-only.");
+        for platform in [
+            archivefs_core::patch_manager::PokePlatform::ZxSpectrum,
+            archivefs_core::patch_manager::PokePlatform::AmstradCpc,
+            archivefs_core::patch_manager::PokePlatform::Commodore64,
+            archivefs_core::patch_manager::PokePlatform::AtariSt,
+            archivefs_core::patch_manager::PokePlatform::Msx,
+            archivefs_core::patch_manager::PokePlatform::BbcMicro,
+            archivefs_core::patch_manager::PokePlatform::Acorn8Bit,
+        ] {
+            let semantics = archivefs_core::patch_manager::poke_platform_semantics(platform);
+            ui.collapsing(platform.label(), |ui| {
+                ui.label(format!(
+                    "Address: {} bits · Value: {} bits",
+                    semantics.address_bits, semantics.value_bits
+                ));
+                ui.label(format!("Banking: {}", semantics.banking_description));
+            });
+        }
+        ui.separator();
+        ui.label("Runtime projection is explicit and inspectable; no emulator is launched from this preview.");
+        for emulator in [
+            archivefs_core::patch_manager::PokeRuntimeEmulator::Fuse,
+            archivefs_core::patch_manager::PokeRuntimeEmulator::Vice,
+            archivefs_core::patch_manager::PokeRuntimeEmulator::Hatari,
+            archivefs_core::patch_manager::PokeRuntimeEmulator::Caprice32,
+            archivefs_core::patch_manager::PokeRuntimeEmulator::OpenMsx,
+            archivefs_core::patch_manager::PokeRuntimeEmulator::BeebEm,
+        ] {
+            let capability = archivefs_core::patch_manager::poke_runtime_capability(emulator);
+            ui.label(format!(
+                "{emulator:?}: {} — {}",
+                capability.support.plain_label(),
+                capability.detail
+            ));
+        }
+    });
+}
+
 /// The save/revert bar, plus the unsaved-change state and its consequences.
 fn show_save_bar(ui: &mut egui::Ui, view: &CheatSourcesPageView) -> Option<CheatSourcesPageAction> {
     let mut action = None;
     widgets::card(ui, |ui| {
-        ui.horizontal(|ui| {
+        ui.horizontal_wrapped(|ui| {
             if view.dirty {
                 widgets::status_badge(ui, "Unsaved changes", widgets::StatusTone::Warning);
             } else {
@@ -893,7 +1080,7 @@ fn show_source_health(ui: &mut egui::Ui, health: &Option<CheatSourceHealth>) {
         );
         return;
     };
-    ui.horizontal(|ui| {
+    ui.horizontal_wrapped(|ui| {
         widgets::status_badge(
             ui,
             health_state_label(health.state),
@@ -988,7 +1175,7 @@ fn show_source_row(
 ) -> Option<CheatSourcesPageAction> {
     let mut action = None;
     widgets::card(ui, |ui| {
-        ui.horizontal(|ui| {
+        ui.horizontal_wrapped(|ui| {
             let mut enabled = row.enabled;
             if ui.checkbox(&mut enabled, "").changed() {
                 action = Some(CheatSourcesPageAction::SetEnabled {
@@ -1283,32 +1470,38 @@ fn platform_exception_picker(
             return;
         }
 
-        for choice in &choices {
-            ui.horizontal(|ui| {
-                // Stated per row, because the whole point of the control is
-                // to change it and the user should not have to infer it.
-                ui.label(
-                    egui::RichText::new("Currently used")
-                        .color(widgets::StatusTone::Success.color(ui))
-                        .small(),
-                );
-                if widgets::action_button(
-                    ui,
-                    format!("Stop using for {}", choice.display_name),
-                    widgets::ActionStyle::Secondary,
-                    true,
-                )
-                .clicked()
-                    && action.is_none()
-                {
-                    action = Some(CheatSourcesPageAction::SetPlatformParticipation {
-                        id: row.id.clone(),
-                        platform: choice.id.to_string(),
-                        participating: false,
+        egui::ScrollArea::vertical()
+            .id_salt("cheat_sources_platform_picker")
+            .max_height(280.0)
+            .auto_shrink([false, true])
+            .show(ui, |ui| {
+                for choice in &choices {
+                    ui.horizontal(|ui| {
+                        // Stated per row, because the whole point of the control is
+                        // to change it and the user should not have to infer it.
+                        ui.label(
+                            egui::RichText::new("Currently used")
+                                .color(widgets::StatusTone::Success.color(ui))
+                                .small(),
+                        );
+                        if widgets::action_button(
+                            ui,
+                            format!("Stop using for {}", choice.display_name),
+                            widgets::ActionStyle::Secondary,
+                            true,
+                        )
+                        .clicked()
+                            && action.is_none()
+                        {
+                            action = Some(CheatSourcesPageAction::SetPlatformParticipation {
+                                id: row.id.clone(),
+                                platform: choice.id.to_string(),
+                                participating: false,
+                            });
+                        }
                     });
                 }
             });
-        }
 
         if total > choices.len() {
             ui.label(

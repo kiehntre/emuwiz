@@ -60,6 +60,13 @@ pub enum GeckoCodeWarningKind {
     EmptyCode,
     /// The code name is empty after the `$`. Blocking.
     MissingName,
+    /// The code body exceeded the fixed per-code bound. Blocking: later
+    /// lines were not retained and must never be installed.
+    TooManyLines,
+    /// A supported count-declared Gecko block does not contain all of its
+    /// declared continuation lines. Blocking: the incomplete sequence must
+    /// never be installed.
+    StructuralInvalid,
 }
 
 impl GeckoCodeWarningKind {
@@ -74,6 +81,8 @@ impl GeckoCodeWarningKind {
             Self::MalformedLine => "gecko_code_malformed_line",
             Self::EmptyCode => "gecko_code_empty",
             Self::MissingName => "gecko_code_missing_name",
+            Self::TooManyLines => "gecko_code_too_many_lines",
+            Self::StructuralInvalid => "gecko_code_structural_invalid",
         }
     }
 }
@@ -81,6 +90,11 @@ impl GeckoCodeWarningKind {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct GeckoCodeWarning {
     pub kind: GeckoCodeWarningKind,
+    /// Absolute 1-based source line when available.
+    pub line: Option<u32>,
+    /// The original rejected source line for review. It is never used to
+    /// generate output.
+    pub raw_source: Option<String>,
     pub detail: String,
 }
 
@@ -94,6 +108,9 @@ pub struct GeckoCode {
     /// `"Display Name [Author]"`, but never parsed apart - Dolphin itself
     /// does not split the two.
     pub name: String,
+    /// Header line in the source INI, when this code came from a parsed
+    /// file. Provider-created codes have no file-local line number.
+    pub source_line: Option<u32>,
     /// Raw `XXXXXXXX YYYYYYYY` hex-pair lines, verbatim.
     pub lines: Vec<String>,
     /// `*Note` lines immediately following the code, verbatim minus the
@@ -137,6 +154,7 @@ pub struct DolphinIniWarning {
 struct IniSection {
     /// Exact original header text between `[` and `]`.
     name: String,
+    header_line: Option<u32>,
     /// Exact original body lines (not including the header line itself).
     raw_lines: Vec<String>,
 }
@@ -271,6 +289,7 @@ pub fn parse_dolphin_ini(text: &str) -> DolphinIniDocument {
             let name = inner[..inner.len() - 1].to_string();
             current = Some(IniSection {
                 name,
+                header_line: Some(line_number),
                 raw_lines: Vec::new(),
             });
             continue;
@@ -283,6 +302,7 @@ pub fn parse_dolphin_ini(text: &str) -> DolphinIniDocument {
                 // unnamed leading section so round-tripping stays exact.
                 let section = current.get_or_insert(IniSection {
                     name: String::new(),
+                    header_line: None,
                     raw_lines: Vec::new(),
                 });
                 section.raw_lines.push(raw_line.to_string());
@@ -302,7 +322,7 @@ pub fn parse_dolphin_ini(text: &str) -> DolphinIniDocument {
     let (gecko_codes, code_warnings) = sections
         .iter()
         .find(|section| is_gecko(&section.name))
-        .map(|section| parse_gecko_codes(&section.raw_lines, "Gecko"))
+        .map(|section| parse_gecko_codes(&section.raw_lines, "Gecko", section.header_line))
         .unwrap_or_default();
     warnings.extend(code_warnings);
 
@@ -315,7 +335,7 @@ pub fn parse_dolphin_ini(text: &str) -> DolphinIniDocument {
     let (action_replay_codes, ar_code_warnings) = sections
         .iter()
         .find(|section| is_action_replay(&section.name))
-        .map(|section| parse_gecko_codes(&section.raw_lines, "ActionReplay"))
+        .map(|section| parse_gecko_codes(&section.raw_lines, "ActionReplay", section.header_line))
         .unwrap_or_default();
     warnings.extend(ar_code_warnings);
 
@@ -348,6 +368,7 @@ fn extract_names(raw_lines: &[String]) -> Vec<String> {
 fn parse_gecko_codes(
     raw_lines: &[String],
     section_label: &str,
+    section_header_line: Option<u32>,
 ) -> (Vec<GeckoCode>, Vec<DolphinIniWarning>) {
     let mut codes: Vec<GeckoCode> = Vec::new();
     let mut warnings: Vec<DolphinIniWarning> = Vec::new();
@@ -358,19 +379,37 @@ fn parse_gecko_codes(
             if code.name.is_empty() {
                 code.warnings.push(GeckoCodeWarning {
                     kind: GeckoCodeWarningKind::MissingName,
+                    line: code.source_line,
+                    raw_source: None,
                     detail: "code header has no name after '$'".to_string(),
                 });
             } else if code.lines.is_empty() {
                 code.warnings.push(GeckoCodeWarning {
                     kind: GeckoCodeWarningKind::EmptyCode,
+                    line: code.source_line,
+                    raw_source: None,
                     detail: format!("code {:?} has no hex code lines", code.name),
+                });
+            } else if section_label.eq_ignore_ascii_case("gecko")
+                && let Some(detail) = validate_gecko_structure(&code.lines)
+            {
+                code.warnings.push(GeckoCodeWarning {
+                    kind: GeckoCodeWarningKind::StructuralInvalid,
+                    line: code.source_line,
+                    raw_source: code.lines.first().cloned(),
+                    detail,
                 });
             }
             codes.push(code);
         }
     };
 
-    for raw in raw_lines {
+    for (offset, raw) in raw_lines.iter().enumerate() {
+        let line_number = section_header_line.and_then(|header| {
+            u32::try_from(offset + 1)
+                .ok()
+                .and_then(|body| header.checked_add(body))
+        });
         if codes.len() >= MAX_GECKO_CODES {
             warnings.push(DolphinIniWarning {
                 kind: DolphinIniWarningKind::TooManyCodes,
@@ -390,6 +429,7 @@ fn parse_gecko_codes(
             let name = rest.split(['=', '\t']).next().unwrap_or_default().trim();
             current = Some(GeckoCode {
                 name: name.to_string(),
+                source_line: line_number,
                 lines: Vec::new(),
                 notes: Vec::new(),
                 enabled_by_default: false,
@@ -405,11 +445,27 @@ fn parse_gecko_codes(
             continue;
         }
         if code.lines.len() >= MAX_GECKO_CODE_LINES {
+            if !code
+                .warnings
+                .iter()
+                .any(|warning| warning.kind == GeckoCodeWarningKind::TooManyLines)
+            {
+                code.warnings.push(GeckoCodeWarning {
+                    kind: GeckoCodeWarningKind::TooManyLines,
+                    line: line_number,
+                    raw_source: Some(raw.to_string()),
+                    detail: format!(
+                        "code exceeds the {MAX_GECKO_CODE_LINES}-line limit and was skipped"
+                    ),
+                });
+            }
             continue;
         }
         if !is_gecko_code_line(line) {
             code.warnings.push(GeckoCodeWarning {
                 kind: GeckoCodeWarningKind::MalformedLine,
+                line: line_number,
+                raw_source: Some(raw.to_string()),
                 detail: format!("{line:?} is not a valid 'XXXXXXXX YYYYYYYY' code line"),
             });
             continue;
@@ -417,6 +473,8 @@ fn parse_gecko_codes(
         if line.len() > MAX_GECKO_LINE_BYTES {
             code.warnings.push(GeckoCodeWarning {
                 kind: GeckoCodeWarningKind::MalformedLine,
+                line: line_number,
+                raw_source: Some(raw.to_string()),
                 detail: "code line exceeds the maximum supported length".to_string(),
             });
             continue;
@@ -440,6 +498,36 @@ pub(crate) fn is_gecko_code_line(line: &str) -> bool {
 
 fn is_hex8(value: &str) -> bool {
     value.len() == 8 && value.bytes().all(|byte| byte.is_ascii_hexdigit())
+}
+
+/// Validates the one count-declared Gecko block form for which this reader
+/// has repository-backed semantics. `C2` starts an ASM block and its second
+/// word declares the number of continuation lines. The block must contain
+/// that many lines after the header; all other Gecko opcode families remain
+/// opaque and are deliberately not guessed here.
+fn validate_gecko_structure(lines: &[String]) -> Option<String> {
+    let first = lines.first()?.split_once(' ')?.0;
+    if !first
+        .get(..2)
+        .is_some_and(|prefix| prefix.eq_ignore_ascii_case("C2"))
+    {
+        return None;
+    }
+    let mut fields = lines[0].split_whitespace();
+    let _header = fields.next()?;
+    let declared = u32::from_str_radix(fields.next()?, 16).ok()? as usize;
+    if declared > MAX_GECKO_CODE_LINES {
+        return Some(format!(
+            "C2 Gecko block declares {declared} continuation lines, exceeding the supported limit"
+        ));
+    }
+    let available = lines.len().saturating_sub(1);
+    if declared > available {
+        return Some(format!(
+            "C2 Gecko block declares {declared} continuation lines but only {available} are present"
+        ));
+    }
+    None
 }
 
 /// Renders `[Gecko_Enabled]\n$Name\n...` for exactly the given names, in
@@ -472,6 +560,7 @@ pub fn replace_gecko_enabled_section(
         Some(section) => section.raw_lines = new_body,
         None => sections.push(IniSection {
             name: "Gecko_Enabled".to_string(),
+            header_line: None,
             raw_lines: new_body,
         }),
     }
@@ -548,6 +637,7 @@ pub fn merge_external_gecko_codes(
             None => {
                 sections.push(IniSection {
                     name: "Gecko".to_string(),
+                    header_line: None,
                     raw_lines: Vec::new(),
                 });
                 sections.last_mut().expect("just inserted Gecko section")
@@ -586,6 +676,7 @@ pub fn merge_external_gecko_codes(
         Some(section) => section.raw_lines = new_body,
         None => sections.push(IniSection {
             name: "Gecko_Enabled".to_string(),
+            header_line: None,
             raw_lines: new_body,
         }),
     }
@@ -668,6 +759,7 @@ pub fn merge_external_action_replay_codes(
             None => {
                 sections.push(IniSection {
                     name: "ActionReplay".to_string(),
+                    header_line: None,
                     raw_lines: Vec::new(),
                 });
                 sections
@@ -711,6 +803,7 @@ pub fn merge_external_action_replay_codes(
         Some(section) => section.raw_lines = new_body,
         None => sections.push(IniSection {
             name: "ActionReplay_Enabled".to_string(),
+            header_line: None,
             raw_lines: new_body,
         }),
     }
@@ -801,6 +894,7 @@ pub fn replace_named_section(
         Some(section) => section.raw_lines = lines,
         None => sections.push(IniSection {
             name: section_name.to_string(),
+            header_line: None,
             raw_lines: lines,
         }),
     }

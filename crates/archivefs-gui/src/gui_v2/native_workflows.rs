@@ -1,0 +1,4398 @@
+//! Native v2 host for the established emulator setup and launch coordinator.
+//!
+//! The coordinator remains the single owner of evidence gathering, adapter
+//! discovery, launch planning and process execution. This bridge only gives
+//! those existing workflows v2 navigation and Activity integration.
+
+#[path = "native_romm.rs"]
+pub(super) mod native_romm;
+
+#[path = "native_collection.rs"]
+mod native_collection;
+
+#[path = "native_mod_activation.rs"]
+mod native_mod_activation;
+
+#[path = "game_firmware_guidance.rs"]
+mod game_firmware_guidance;
+
+use super::{
+    activity::Activity,
+    environment::EnvironmentSnapshot,
+    launch_readiness_summary::{self, ReadinessAction, ReadinessFreshness},
+    routes::{Route, Section},
+};
+use crate::{
+    ArchiveFsApp, DolphinLocalProfilesState, FlycastProfilesState, LoadState,
+    Pcsx2FirmwareEvidenceState, Pcsx2LaunchProfilesState, RetroArchProfilesState, app_polling,
+    identity_sources_page, launch_readiness_page, selected_evidence_page,
+};
+use archivefs_core::emulator_environment::retroarch::PathPurpose;
+use archivefs_core::remote_source_health::{
+    RemoteSourceAvailability, RemoteSourceProbeRequest, RemoteSourceProbeResult,
+};
+use archivefs_core::{SourceAvailability, SourceFolderView, SourceScanStatus};
+use eframe::egui;
+use std::collections::BTreeMap;
+use std::path::{Path, PathBuf};
+use std::sync::mpsc::{self, Receiver, TryRecvError};
+
+pub(super) struct NativeWorkflows {
+    pub(super) app: ArchiveFsApp,
+    native_romm: native_romm::State,
+    selected: Option<PathBuf>,
+    catalogue_identity_report: Option<archivefs_core::game_identity::GameIdentityReport>,
+    selected_game: Option<i64>,
+    readiness_job: Option<u64>,
+    setup_job: Option<u64>,
+    launch_job: Option<u64>,
+    launch_was_active: bool,
+    launch_kind: Option<LaunchKind>,
+    launch_attempts: launch_readiness_summary::AttemptTracker,
+    source_job: Option<u64>,
+    provider_job: Option<u64>,
+    metadata_job: Option<u64>,
+    dat_job: Option<u64>,
+    /// Last audit-save generation seen, and whether the library should be
+    /// re-read because a newer one landed.
+    dat_identity_seen: u64,
+    dat_identity_reload: bool,
+    dat_verification_seen: u64,
+    /// The explicit CUE disc re-check running for one game, if any.
+    disc_recheck_job: Option<(PathBuf, std::sync::mpsc::Receiver<String>)>,
+    /// The last re-check's result, for the game it was run on.
+    disc_recheck_message: Option<(PathBuf, String)>,
+    /// The platform the Check My Games page was last aimed at from a route.
+    platform_check_applied: Option<String>,
+    cheat_job: Option<u64>,
+    source_library_reload: bool,
+    artwork_reload: bool,
+    sources_discovery: bool,
+    collection: native_collection::State,
+    pub(super) tosec_inventory: super::tosec_inventory::State,
+    firmware_guidance: game_firmware_guidance::State,
+    scummvm_trainer: crate::cheats_mods::scummvm_trainer::State,
+    remote_probe_results: BTreeMap<PathBuf, RemoteSourceProbeResult>,
+    remote_probe_jobs: BTreeMap<PathBuf, Receiver<RemoteSourceProbeResult>>,
+}
+
+#[derive(Clone, Copy)]
+enum LaunchKind {
+    RetroArch,
+    Dolphin,
+    Pcsx2,
+    Standalone,
+    AmigaWhdLoad,
+}
+
+fn dat_health_label(state: archivefs_core::dat::sources::DatHealthState) -> &'static str {
+    use archivefs_core::dat::sources::DatHealthState;
+    match state {
+        DatHealthState::NotChecked => "Not validated",
+        DatHealthState::Valid => "Valid",
+        DatHealthState::ValidWithWarnings => "Valid with warnings",
+        DatHealthState::Invalid => "Invalid",
+        DatHealthState::Unreadable => "Unreadable",
+    }
+}
+
+fn source_availability_label(availability: SourceAvailability) -> &'static str {
+    match availability {
+        SourceAvailability::Available => "Available",
+        SourceAvailability::Unavailable => "Unavailable",
+        SourceAvailability::PermissionDenied => "Permission denied",
+        SourceAvailability::Disabled => "Disabled",
+        SourceAvailability::ScanFailed => "Scan failed",
+    }
+}
+
+fn source_availability_tone(availability: SourceAvailability) -> crate::ui::components::StatusTone {
+    match availability {
+        SourceAvailability::Available => crate::ui::components::StatusTone::Success,
+        SourceAvailability::Disabled => crate::ui::components::StatusTone::Pending,
+        SourceAvailability::ScanFailed => crate::ui::components::StatusTone::Warning,
+        SourceAvailability::Unavailable | SourceAvailability::PermissionDenied => {
+            crate::ui::components::StatusTone::Blocked
+        }
+    }
+}
+
+fn show_three_ds_retail_identity(
+    ui: &mut egui::Ui,
+    report: Option<&archivefs_core::game_identity::GameIdentityReport>,
+) {
+    use archivefs_core::game_identity::{IdentityImageFormat, IdentityKind, IdentityPlatform};
+    let Some(report) = report else { return };
+    if report.platform != IdentityPlatform::ThreeDS
+        || !matches!(
+            report.format,
+            IdentityImageFormat::ThreeDsCci | IdentityImageFormat::ThreeDsCia
+        )
+    {
+        return;
+    }
+    ui.group(|ui| {
+        ui.heading("Nintendo 3DS retail identity");
+        let value = |kind| report.verified_value(kind).unwrap_or("Not available");
+        ui.label(format!("Title ID: {}", value(IdentityKind::ThreeDsTitleId)));
+        ui.label(format!("Product code: {}", value(IdentityKind::ThreeDsProductCode)));
+        ui.label(format!("Classification: {}", value(IdentityKind::ThreeDsClassification)));
+        let encryption = value(IdentityKind::ThreeDsEncryption);
+        ui.label(format!("Encryption: {encryption}"));
+        if encryption == "encrypted" {
+            ui.label("This retail image is encrypted. EmuWiz reports its readable metadata but does not decrypt content or provide keys.");
+        }
+        if report.format == IdentityImageFormat::ThreeDsCia {
+            ui.label("CIA is an installable package; EmuWiz does not claim direct file launch for it.");
+        } else {
+            ui.label("Retail NCSD identity is recognised, but the current safe Azahar launch adapter supports .3dsx homebrew only.");
+        }
+        ui.label("Region data is not reported unless it is available without decrypting protected content.");
+    });
+}
+
+fn source_type_label(source: &SourceFolderView) -> &'static str {
+    let _ = source;
+    "Game folder"
+}
+
+fn source_availability_detail(source: &SourceFolderView) -> String {
+    match source.availability {
+        SourceAvailability::Available => "The folder is available to EmuWiz.".into(),
+        SourceAvailability::Disabled => "This source is excluded until you enable it.".into(),
+        SourceAvailability::Unavailable => "The configured path could not be found.".into(),
+        SourceAvailability::PermissionDenied => "The path exists but cannot be read.".into(),
+        SourceAvailability::ScanFailed => "The last scan failed; review the warning below.".into(),
+    }
+}
+
+fn source_scan_label(status: Option<SourceScanStatus>) -> &'static str {
+    match status {
+        None => "Not scanned yet",
+        Some(SourceScanStatus::Success) => "Completed",
+        Some(SourceScanStatus::Failed) => "Failed",
+    }
+}
+
+fn remote_availability_label(availability: RemoteSourceAvailability) -> &'static str {
+    match availability {
+        RemoteSourceAvailability::Available => "Available",
+        RemoteSourceAvailability::AvailableSlow => "Slow",
+        RemoteSourceAvailability::Unavailable => "Unavailable upstream",
+        RemoteSourceAvailability::StaleMetadata => "Needs reacquisition",
+        RemoteSourceAvailability::Timeout => "Timed out",
+        RemoteSourceAvailability::Partial => "Partial",
+        RemoteSourceAvailability::Unknown => "Unknown",
+    }
+}
+
+fn remote_availability_tone(
+    availability: RemoteSourceAvailability,
+) -> crate::ui::components::StatusTone {
+    match availability {
+        RemoteSourceAvailability::Available => crate::ui::components::StatusTone::Success,
+        RemoteSourceAvailability::AvailableSlow | RemoteSourceAvailability::Partial => {
+            crate::ui::components::StatusTone::Warning
+        }
+        RemoteSourceAvailability::Unavailable
+        | RemoteSourceAvailability::StaleMetadata
+        | RemoteSourceAvailability::Timeout => crate::ui::components::StatusTone::Blocked,
+        RemoteSourceAvailability::Unknown => crate::ui::components::StatusTone::Pending,
+    }
+}
+
+fn remote_availability_detail(result: &RemoteSourceProbeResult) -> &'static str {
+    match result.availability {
+        RemoteSourceAvailability::Available => "The source responded to a bounded read.",
+        RemoteSourceAvailability::AvailableSlow => {
+            "The source responded, but the bounded read was slow."
+        }
+        RemoteSourceAvailability::StaleMetadata => {
+            "The remote entry still exists, but its backing data is currently unavailable."
+        }
+        RemoteSourceAvailability::Unavailable => {
+            "The source is unavailable right now; it may need reconnection or reacquisition."
+        }
+        RemoteSourceAvailability::Timeout => {
+            "The source did not respond within the bounded probe time."
+        }
+        RemoteSourceAvailability::Partial => "Only partial source information was available.",
+        RemoteSourceAvailability::Unknown => "The source health could not be determined safely.",
+    }
+}
+
+fn discovery_container_label(container: &archivefs_core::ingestion::ContainerKind) -> &'static str {
+    match container {
+        archivefs_core::ingestion::ContainerKind::Archive(_) => "Archive",
+        archivefs_core::ingestion::ContainerKind::Folder(_) => "Game folder",
+        archivefs_core::ingestion::ContainerKind::DirectFile => "File",
+    }
+}
+
+/// Whether the Launch page leads on to Review identity: only when launch
+/// planning stopped because the game's identity is unresolved or conflicting.
+pub(super) fn offers_review_identity(input: &launch_readiness_page::LaunchReadinessInput) -> bool {
+    matches!(
+        input,
+        launch_readiness_page::LaunchReadinessInput::IdentityUnknown
+            | launch_readiness_page::LaunchReadinessInput::DiscFilesUnresolved(_)
+            | launch_readiness_page::LaunchReadinessInput::IdentityConflicting
+    )
+}
+
+pub(super) const REVIEW_IDENTITY: &str = "Review identity";
+/// Shown with Review identity when Play cannot plan a launch yet.
+pub(super) const UNVERIFIED_LAUNCH_NEXT_STEP: &str = "Next step: Review identity shows why this game is not verified yet and what you can do about it.";
+
+/// The Launch page's scroller: the shared page-content scroller that brings a
+/// control into view when keyboard focus reaches it (see `simple_shell`).
+pub(super) fn launch_scroll<R>(
+    ui: &mut egui::Ui,
+    game_id: i64,
+    content: impl FnOnce(&mut egui::Ui) -> R,
+) -> R {
+    super::simple_shell::show_focus_reveal_scroll_entering(
+        ui,
+        ("v2_native_launch", game_id),
+        [true, true],
+        content,
+    )
+}
+
+impl NativeWorkflows {
+    /// Hand the page's own catalogue row to the launch planner (see
+    /// `ArchiveFsApp::catalogued_scummvm_folder`).
+    pub(super) fn note_catalogue_row(&mut self, archive: &archivefs_core::PersistedArchive) {
+        let scummvm = archive.archive_kind == "scummvm_directory";
+        self.app.catalogued_scummvm_folder = scummvm.then(|| archive.clone());
+        let platform_hint = archive
+            .platform
+            .clone()
+            .map(|platform| (archive.absolute_path.clone(), platform));
+        // A cached identity was gathered under the earlier catalogue hint.
+        // A changed or withdrawn choice must revoke that authority before
+        // this same path can supply a launch key again.
+        if self.selected.as_deref() == Some(archive.absolute_path.as_path())
+            && self.app.catalogued_platform_hint != platform_hint
+        {
+            self.app.cancel_selected_evidence_work();
+            self.app.selected_evidence_ui.selected_evidence_generation += 1;
+            self.app.selected_evidence_ui.selected_evidence =
+                selected_evidence_page::SelectedEvidenceState::Idle;
+            self.app.selected_evidence_ui.selected_evidence_enrichment =
+                crate::SelectedEvidenceEnrichmentState::Idle;
+            self.app.launch_standalone.clear_cue_review();
+        }
+        self.app.catalogued_platform_hint = platform_hint;
+        self.app.catalogued_row_health = Some((
+            archive.absolute_path.clone(),
+            archive.last_known_health.clone(),
+        ));
+        // ScummVM folders have their own branch above; only rows that are
+        // never mounted and not missing qualify.
+        self.app.catalogued_loose_content =
+            archivefs_core::ArchiveKind::from_storage(&archive.archive_kind)
+                .filter(|kind| {
+                    !kind.is_mount_input()
+                        && *kind != archivefs_core::ArchiveKind::ScummVmDirectory
+                        && archive.last_verified_missing_at.is_none()
+                })
+                .map(|kind| (archive.absolute_path.clone(), kind));
+    }
+
+    pub(super) fn retroarch_bezel_scope(&self) -> Option<(PathBuf, PathBuf, Option<String>)> {
+        let RetroArchProfilesState::Ready(discovery) =
+            &self.app.emulator_readiness.retroarch_profiles
+        else {
+            return None;
+        };
+        let mut profiles = discovery.environment.profiles.iter().filter(|profile| {
+            profile.config_file.path.display.starts_with('/')
+                && !profile.config_file.path.lossy
+                && profile.config_file.probe
+                    == archivefs_core::emulator_environment::FsProbe::PresentFile
+        });
+        let profile = profiles.next()?;
+        if profiles.next().is_some() {
+            return None;
+        }
+        let overlay = profile
+            .paths
+            .iter()
+            .find(|path| path.purpose == PathPurpose::Overlays)?
+            .resolved_path
+            .as_ref()?;
+        if overlay.lossy {
+            return None;
+        }
+        let core = (profile.cores.len() == 1).then(|| profile.cores[0].core_stem.clone());
+        Some((
+            PathBuf::from(profile.config_file.path.display.clone()),
+            PathBuf::from(overlay.display.clone()),
+            core,
+        ))
+    }
+
+    pub(super) fn new(context: egui::Context) -> Self {
+        #[cfg(not(test))]
+        let mut app = ArchiveFsApp::new_without_initial_load(context.clone());
+        #[cfg(test)]
+        let mut app = crate::tests::app_for_operation_tests();
+        // These are full v2 task pages, not the old shell's simplified
+        // navigation mode. Keep the shared workflow widgets and all of their
+        // safe actions visible without rendering the legacy chrome.
+        app.ui_mode = crate::GuiMode::AdvancedView;
+        // The embedded coordinator applies the legacy shell theme while it is
+        // constructed. Restore v2's typography immediately; the shared page
+        // widgets themselves remain theme-independent.
+        super::readable_style(&context);
+        Self {
+            app,
+            native_romm: native_romm::State::default(),
+            selected: None,
+            catalogue_identity_report: None,
+            selected_game: None,
+            readiness_job: None,
+            setup_job: None,
+            launch_job: None,
+            launch_was_active: false,
+            launch_kind: None,
+            launch_attempts: Default::default(),
+            source_job: None,
+            provider_job: None,
+            metadata_job: None,
+            dat_job: None,
+            dat_identity_seen: 0,
+            dat_identity_reload: false,
+            dat_verification_seen: 0,
+            disc_recheck_job: None,
+            disc_recheck_message: None,
+            platform_check_applied: None,
+            cheat_job: None,
+            source_library_reload: false,
+            artwork_reload: false,
+            sources_discovery: false,
+            collection: native_collection::State::default(),
+            tosec_inventory: Default::default(),
+            firmware_guidance: Default::default(),
+            scummvm_trainer: Default::default(),
+            remote_probe_results: BTreeMap::new(),
+            remote_probe_jobs: BTreeMap::new(),
+        }
+    }
+
+    pub(super) fn poll(&mut self, context: &egui::Context, activity: &mut Activity) {
+        self.scummvm_trainer.poll();
+        if self.native_romm.is_open()
+            && self.app.romm_ui.config_draft.is_some()
+            && context.input_mut(|i| i.consume_key(egui::Modifiers::ALT, egui::Key::ArrowLeft))
+        {
+            self.app.close_romm_configuration();
+        }
+        self.native_romm.poll(context, activity);
+        app_polling::poll_and_reconcile(&mut self.app, context);
+        self.poll_discovery_import_undo(context);
+        crate::pcsx2_page::poll_save_vault(context);
+        self.poll_native_repairs(context);
+
+        let changed = self.app.launch_retroarch.poll()
+            | self.app.launch_dolphin.poll()
+            | self.app.launch_pcsx2.poll()
+            | self.app.launch_standalone.poll()
+            | self.app.launch_amiga_whdload.poll();
+        let active = self.launch_active();
+        if changed || active {
+            context.request_repaint();
+        }
+        self.observe_launch_activity(activity);
+        self.observe_readiness_activity(activity);
+        self.observe_source_activity(activity);
+        self.poll_remote_source_probes(context);
+        self.observe_provider_activity(activity);
+        self.observe_metadata_activity(activity);
+        self.poll_dat_activity(context, activity);
+        self.poll_disc_recheck(context);
+        self.observe_cheat_activity(activity);
+
+        let checking_setup = self.app.doctor_repair.doctor_scan.is_running();
+        if checking_setup && self.setup_job.is_none() {
+            let job = activity.queue(
+                "Checking emulator readiness",
+                Route::Section(super::routes::Section::Emulators),
+                false,
+            );
+            activity.start(job);
+            self.setup_job = Some(job);
+        } else if !checking_setup && let Some(job) = self.setup_job.take() {
+            activity.finish(job, "Emulator and firmware checks are ready.".into(), None);
+        }
+    }
+
+    fn observe_launch_activity(&mut self, activity: &mut Activity) {
+        let active = self.launch_active();
+        if active && !self.launch_was_active {
+            self.launch_kind = self.active_launch_kind();
+            self.launch_attempts.started();
+            let job = activity.queue("Launching game", self.selected_route(), false);
+            activity.start(job);
+            self.launch_job = Some(job);
+        } else if !active
+            && self.launch_was_active
+            && let Some(job) = self.launch_job.take()
+        {
+            let error = self.launch_failure();
+            self.launch_attempts
+                .finished(self.selected_game, error.clone());
+            activity.finish(
+                job,
+                if error.is_some() {
+                    "The game could not be launched safely.".into()
+                } else {
+                    "The emulator launch process finished.".into()
+                },
+                error,
+            );
+            self.launch_kind = None;
+        }
+        self.launch_was_active = active;
+    }
+
+    fn observe_readiness_activity(&mut self, activity: &mut Activity) {
+        let Some(job) = self.readiness_job else {
+            return;
+        };
+        if let Some(error) = self.readiness_error() {
+            activity.finish(
+                job,
+                "EmuWiz couldn't finish checking this game for launch.".into(),
+                Some(error),
+            );
+            self.readiness_job = None;
+        } else if !matches!(
+            self.launch_input(),
+            launch_readiness_page::LaunchReadinessInput::EvidenceNotLoaded
+        ) {
+            activity.finish(job, "Launch readiness is ready to review.".into(), None);
+            self.readiness_job = None;
+        }
+    }
+
+    pub(super) fn show_launch(
+        &mut self,
+        ui: &mut egui::Ui,
+        game_id: i64,
+        path: &Path,
+        catalogue_identity_report: Option<&archivefs_core::game_identity::GameIdentityReport>,
+        activity: &mut Activity,
+    ) -> Option<Route> {
+        self.selected_game = Some(game_id);
+        self.catalogue_identity_report = catalogue_identity_report.cloned();
+        if self.selected.as_deref() != Some(path)
+            && let Some(job) = self.readiness_job.take()
+        {
+            activity.finish(
+                job,
+                "Selection changed; the previous readiness result was discarded.".into(),
+                None,
+            );
+        }
+        self.select(path);
+        self.app.launch_standalone.focus_dosbox_game(Some(path));
+        self.app.emulator_readiness.flycast_gdi.show(ui, Some(path));
+        self.app
+            .emulator_readiness
+            .xroar_cassette
+            .show(ui, Some(path));
+        self.start_launch_readiness(ui.ctx());
+
+        let input = self.launch_input();
+        let readiness_error = self.readiness_error();
+        if readiness_error.is_none()
+            && matches!(
+                input,
+                launch_readiness_page::LaunchReadinessInput::EvidenceNotLoaded
+            )
+            && self.readiness_job.is_none()
+        {
+            let job = activity.queue(
+                "Preparing launch",
+                Route::Task {
+                    section: super::routes::Section::Launch,
+                    game: game_id,
+                },
+                false,
+            );
+            activity.start(job);
+            self.readiness_job = Some(job);
+        }
+        self.observe_readiness_activity(activity);
+
+        let (recovery_route, retry_readiness) = launch_scroll(ui, game_id, |ui| {
+            ui.label("Choose an emulator, review its readiness, then launch. EmuWiz will refuse unsafe or incomplete media.");
+            show_three_ds_retail_identity(ui, self.catalogue_identity_report.as_ref());
+            if readiness_error.is_some() {
+                crate::ui::components::banner(
+                    ui,
+                    "Launch readiness could not be checked",
+                    "Your game was not changed. Retry when the file is available.",
+                    crate::ui::components::StatusTone::Warning,
+                );
+            }
+            let launch_active = self.launch_active();
+            // A readable but invalid file produces unresolved evidence, not
+            // a worker error. Let a repaired file use the same bounded retry.
+            let retry_readiness = (readiness_error.is_some() || offers_review_identity(&input))
+                && ui
+                    .add_enabled(!launch_active, egui::Button::new("Retry readiness check"))
+                    .clicked();
+            let action = ui
+                .add_enabled_ui(!launch_active, |ui| {
+                    launch_readiness_page::show_launch_readiness_panel(
+                        ui,
+                        &input,
+                        &mut self.app.launch_retroarch,
+                        &mut self.app.launch_dolphin,
+                        &mut self.app.launch_pcsx2,
+                        &mut self.app.launch_standalone,
+                        &mut self.app.launch_amiga_whdload,
+                    )
+                })
+                .inner;
+            if launch_active {
+                ui.label("A launch is already in progress. Wait for it to finish before starting another.");
+            }
+            // Unverified identity is not a dead end: the one place a game's
+            // identity is explained and finished is Review identity.
+            let review_identity = offers_review_identity(&input) && {
+                ui.label(UNVERIFIED_LAUNCH_NEXT_STEP);
+                ui.button(REVIEW_IDENTITY).clicked()
+            };
+            (
+                if review_identity {
+                    Some(Route::ReviewIdentity(game_id))
+                } else {
+                    action.and_then(|action| Self::recovery_route(self.selected_game, action))
+                },
+                retry_readiness,
+            )
+        });
+        if retry_readiness {
+            self.recheck_readiness_in_place(ui.ctx());
+        }
+        self.observe_launch_activity(activity);
+        recovery_route
+    }
+
+    /// Render the compact Game Details projection over the same launch input
+    /// used by the full Launch page. This owns no readiness facts and never
+    /// launches directly; the primary action routes to the existing workflow.
+    pub(super) fn show_readiness_summary(
+        &mut self,
+        ui: &mut egui::Ui,
+        game_id: i64,
+        path: &Path,
+        catalogue_identity_report: Option<&archivefs_core::game_identity::GameIdentityReport>,
+        catalogue_verified: bool,
+        activity: &mut Activity,
+    ) -> Option<Route> {
+        self.app.emulator_readiness.flycast_gdi.show(ui, Some(path));
+        self.app
+            .emulator_readiness
+            .xroar_cassette
+            .show(ui, Some(path));
+        let (summary, input) = self.readiness_projection(
+            ui.ctx(),
+            game_id,
+            path,
+            catalogue_identity_report,
+            catalogue_verified,
+            true,
+            activity,
+        );
+        let action = launch_readiness_summary::show(ui, &summary);
+        launch_readiness_page::show_dolphin_profile_guidance(ui, &input);
+        self.show_game_firmware_guidance(ui, game_id, path, &input);
+        self.readiness_action_route(ui.ctx(), action?, game_id)
+    }
+
+    /// The Library's selected-game panel: the same projection as Game
+    /// Details, reduced to what the compact card shows. Play stays the
+    /// existing Launch route, so the launch preflight still decides; nothing
+    /// here launches.
+    ///
+    /// Only the bounded fast pass runs from here: the whole-file checksum is
+    /// left to Game Details and Launch, so a slow drive is never hashed just
+    /// because a cover was clicked. An identity answer that still waits on
+    /// that checksum is shown as not fully checked, never as a refusal.
+    pub(super) fn compact_readiness(
+        &mut self,
+        context: &egui::Context,
+        game_id: i64,
+        path: &Path,
+        catalogue_identity_report: Option<&archivefs_core::game_identity::GameIdentityReport>,
+        catalogue_verified: bool,
+        activity: &mut Activity,
+    ) -> launch_readiness_summary::CompactReadiness {
+        let (summary, _) = self.readiness_projection(
+            context,
+            game_id,
+            path,
+            catalogue_identity_report,
+            catalogue_verified,
+            false,
+            activity,
+        );
+        launch_readiness_summary::compact(&summary, self.selected_checksum_pending())
+    }
+
+    /// True when the current selected-evidence state (loading, ready or
+    /// failed) already belongs to `path`, so it can be reused at once.
+    pub(super) fn has_evidence_for(&self, path: &Path) -> bool {
+        match &self.app.selected_evidence_ui.selected_evidence {
+            selected_evidence_page::SelectedEvidenceState::Loading { path: current, .. }
+            | selected_evidence_page::SelectedEvidenceState::Error { path: current, .. } => {
+                current == path
+            }
+            selected_evidence_page::SelectedEvidenceState::Ready { report, .. } => {
+                report.path == path
+            }
+            selected_evidence_page::SelectedEvidenceState::Idle => false,
+        }
+    }
+
+    /// A new Library selection is still settling: stop a check that is still
+    /// reading another game's file, so quick browsing never leaves work
+    /// queued behind it. A finished result is kept; it is simply not shown.
+    pub(super) fn release_other_selection(&mut self, path: &Path) {
+        if let selected_evidence_page::SelectedEvidenceState::Loading { path: current, .. } =
+            &self.app.selected_evidence_ui.selected_evidence
+            && current != path
+        {
+            self.app.cancel_selected_evidence_work();
+            self.app.selected_evidence_ui.selected_evidence =
+                selected_evidence_page::SelectedEvidenceState::Idle;
+        }
+    }
+
+    /// The selected file's whole-file checksum has not been computed yet and
+    /// its identity could still depend on it.
+    fn selected_checksum_pending(&self) -> bool {
+        match &self.app.selected_evidence_ui.selected_evidence {
+            selected_evidence_page::SelectedEvidenceState::Ready { report, .. } => {
+                self.selected.as_deref() == Some(report.path.as_path())
+                    && selected_evidence_page::needs_selected_evidence_enrichment(report)
+            }
+            _ => false,
+        }
+    }
+
+    /// Select the game, start (or keep) its read-only readiness check, and
+    /// project the current launch input. Owns no readiness facts. `checksum`
+    /// also starts the deferred whole-file checksum pass.
+    #[allow(clippy::too_many_arguments)]
+    fn readiness_projection(
+        &mut self,
+        context: &egui::Context,
+        game_id: i64,
+        path: &Path,
+        catalogue_identity_report: Option<&archivefs_core::game_identity::GameIdentityReport>,
+        catalogue_verified: bool,
+        checksum: bool,
+        activity: &mut Activity,
+    ) -> (
+        launch_readiness_summary::GameReadinessSummary,
+        launch_readiness_page::LaunchReadinessInput,
+    ) {
+        self.selected_game = Some(game_id);
+        self.catalogue_identity_report = catalogue_identity_report.cloned();
+        self.select(path);
+        self.start_launch_readiness_with(context, checksum);
+        let input = self.launch_input();
+        let freshness = if self.readiness_error().is_some() {
+            ReadinessFreshness::Stale
+        } else {
+            ReadinessFreshness::Current
+        };
+        self.observe_readiness_activity(activity);
+        let mut summary = launch_readiness_summary::project(&input, freshness);
+        if catalogue_verified {
+            launch_readiness_summary::note_catalogue_verified(&mut summary);
+        }
+        summary.attempt = self.launch_attempts.for_game(game_id).cloned();
+        (summary, input)
+    }
+
+    /// Recheck runs in place; every other action routes to its workflow.
+    pub(super) fn readiness_action_route(
+        &mut self,
+        context: &egui::Context,
+        action: ReadinessAction,
+        game_id: i64,
+    ) -> Option<Route> {
+        if action == ReadinessAction::RecheckReadiness {
+            self.recheck_readiness_in_place(context);
+        }
+        route_for_action(action, game_id)
+    }
+
+    /// Reuse the same current plan and candidate policy as Launch. Never
+    /// substitute an inventory installation or select a different candidate.
+    pub(super) fn save_state_target(
+        &self,
+        game_id: i64,
+        path: &Path,
+    ) -> Option<(
+        archivefs_core::save_state_compatibility::SaveStateCompatibilityTarget,
+        Vec<archivefs_core::launch::LaunchBlocker>,
+    )> {
+        if self.selected_game != Some(game_id)
+            || self.selected.as_deref() != Some(path)
+            || self.readiness_error().is_some()
+        {
+            return None;
+        }
+        let launch_readiness_page::LaunchReadinessInput::Plan {
+            plan, duckstation, ..
+        } = self.launch_input()
+        else {
+            return None;
+        };
+        let candidate = launch_readiness_summary::selected_candidate(&plan)?;
+        let game = self
+            .catalogue_identity_report
+            .as_ref()
+            .map(|report| report.evidence.clone())
+            .unwrap_or_default();
+        super::save_state_guidance::selected_context(
+            &candidate.target,
+            &candidate.blockers,
+            duckstation.as_ref(),
+            game,
+        )
+    }
+
+    /// The single-file RetroArch launch Play would start for this game, from
+    /// the same current plan and candidate policy as Launch (as
+    /// `save_state_target`). Never starts a readiness check itself.
+    pub(super) fn retroarch_bezel_request(
+        &self,
+        game_id: i64,
+        path: &Path,
+    ) -> Result<archivefs_core::launch::RetroArchLaunchRequest, &'static str> {
+        if self.selected_game != Some(game_id)
+            || self.selected.as_deref() != Some(path)
+            || self.readiness_error().is_some()
+        {
+            return Err(
+                "EmuWiz has not checked how this game launches yet. Open the game's details, let the launch check finish, then preview again.",
+            );
+        }
+        let launch_readiness_page::LaunchReadinessInput::Plan {
+            plan, retroarch, ..
+        } = self.launch_input()
+        else {
+            return Err("This game's launch check is not ready.");
+        };
+        let candidate = launch_readiness_summary::selected_candidate(&plan).ok_or(
+            "This game has no single launch choice, so EmuWiz can't tell which RetroArch core it uses.",
+        )?;
+        launch_readiness_page::single_content_retroarch_request(&plan, candidate, retroarch.as_ref())
+            .ok_or(
+                "This game doesn't launch in RetroArch as one plain file (for example it uses another emulator, a multi-disc playlist, an archive or a Flatpak RetroArch), so a per-game bezel can't be named safely.",
+            )
+    }
+
+    /// Multi-disc guidance for the focused game: its verified disc set, this
+    /// entry, the start disc, next discs, problems, and the same launch
+    /// decision Preview and Launch use. `None` for single-disc games.
+    pub(super) fn disc_guidance(
+        &self,
+        path: &Path,
+    ) -> Option<crate::multidisc_launch_view::DiscGuidance> {
+        let snapshot = self.app.database_state.snapshot()?;
+        let sets =
+            crate::multidisc_launch_view::library_sets(snapshot, self.app.database_generation.0);
+        let context = crate::multidisc_launch_view::MultiDiscLaunchContext::for_content(
+            &sets,
+            path,
+            &snapshot.archives,
+        )?
+        .with_disc_members(&snapshot.disc_members);
+        let set = context.sets.first()?;
+        let decision = match self.launch_input() {
+            launch_readiness_page::LaunchReadinessInput::Plan {
+                plan,
+                retroarch,
+                duckstation,
+                ..
+            } => launch_readiness_summary::selected_candidate(&plan).map(|candidate| {
+                launch_readiness_page::multidisc_decision_with(
+                    candidate,
+                    retroarch.as_ref(),
+                    duckstation.as_ref(),
+                    Some(&context),
+                )
+            }),
+            _ => None,
+        };
+        Some(crate::multidisc_launch_view::guidance(
+            set,
+            path,
+            decision.as_ref(),
+        ))
+    }
+
+    /// Native v2 presentation of the existing bounded tape-analysis result.
+    /// The selected-evidence worker remains the sole reader/parser owner; this
+    /// method only selects a path, waits for that result, and renders it.
+    pub(super) fn show_tape(&mut self, ui: &mut egui::Ui, selected: Option<(&str, &Path, &str)>) {
+        let selected_path = selected.map(|(_, path, _)| path);
+        if let Some(path) = selected_path {
+            self.select(path);
+            let stale = match &self.app.selected_evidence_ui.selected_evidence {
+                selected_evidence_page::SelectedEvidenceState::Loading {
+                    path: current, ..
+                } => current != path,
+                selected_evidence_page::SelectedEvidenceState::Ready { report, .. } => {
+                    report.path != path
+                }
+                selected_evidence_page::SelectedEvidenceState::Idle => true,
+                selected_evidence_page::SelectedEvidenceState::Error { path: current, .. } => {
+                    current != path
+                }
+            };
+            if stale {
+                self.app
+                    .start_selected_evidence_load(ui.ctx().clone(), path.to_path_buf());
+            }
+        }
+
+        // Clone this small bounded presentation result out of the embedded
+        // coordinator before entering the egui closure. Keeping no borrow of
+        // `self.app` alive lets the file-picker action update the selection.
+        let (analysis, analysis_error) = match selected_path {
+            Some(path) => match &self.app.selected_evidence_ui.selected_evidence {
+                selected_evidence_page::SelectedEvidenceState::Ready { report, .. }
+                    if report.path == path =>
+                {
+                    (report.tape_analysis.clone(), None)
+                }
+                selected_evidence_page::SelectedEvidenceState::Error {
+                    path: current,
+                    message,
+                    ..
+                } if current == path => (None, Some(message.clone())),
+                _ => (None, None),
+            },
+            None => (None, None),
+        };
+
+        egui::ScrollArea::vertical()
+            .id_salt(("v2_tape_inspector", selected_path))
+            .auto_shrink([false, false])
+            .show(ui, |ui| {
+                if let Some((title, _, platform)) = selected {
+                    ui.heading("Tape Inspector");
+                    ui.label(format!("Selected media: {title} · {platform}"));
+                    ui.label("Read-only bounded analysis. The source file is not modified.");
+                    ui.add_space(8.0);
+                }
+                let action = crate::tape_analysis_page::show_page_with_error(
+                    ui,
+                    selected_path,
+                    analysis.as_ref(),
+                    analysis_error.as_deref(),
+                    None,
+                    &mut self.app.tape_inspector_filter,
+                );
+                if let Some(action) = action {
+                    let path = match action {
+                        crate::tape_analysis_page::TapeInspectorAction::ChooseFile(path)
+                        | crate::tape_analysis_page::TapeInspectorAction::SelectLibraryTape(path) => path,
+                    };
+                    self.select(&path);
+                    self.app.start_selected_evidence_load(ui.ctx().clone(), path);
+                }
+            });
+    }
+
+    fn recovery_route(
+        game: Option<i64>,
+        action: launch_readiness_page::LaunchReadinessPageAction,
+    ) -> Option<Route> {
+        let section = match action {
+            // The launch presenter uses this action for its firmware summary;
+            // keep the repair destination aligned with the evidence shown.
+            launch_readiness_page::LaunchReadinessPageAction::OpenDoctor => Section::Firmware,
+            launch_readiness_page::LaunchReadinessPageAction::Navigate(destination) => {
+                match destination {
+                    crate::navigation::NavClick::View(crate::navigation::MainView::Sources) => {
+                        Section::Sources
+                    }
+                    crate::navigation::NavClick::View(crate::navigation::MainView::Problems) => {
+                        Section::Problems
+                    }
+                    crate::navigation::NavClick::View(crate::navigation::MainView::DatSources) => {
+                        Section::Dat
+                    }
+                    crate::navigation::NavClick::View(crate::navigation::MainView::Health)
+                    | crate::navigation::NavClick::View(crate::navigation::MainView::ReadyToPlay) => {
+                        Section::Check
+                    }
+                    crate::navigation::NavClick::View(crate::navigation::MainView::Selected) => {
+                        Section::Launch
+                    }
+                    crate::navigation::NavClick::View(
+                        crate::navigation::MainView::BiosProjection,
+                    ) => Section::Firmware,
+                    crate::navigation::NavClick::View(
+                        crate::navigation::MainView::EmulatorSetup
+                        | crate::navigation::MainView::Doctor,
+                    ) => Section::Emulators,
+                    crate::navigation::NavClick::View(crate::navigation::MainView::CheatsMods) => {
+                        Section::Mods
+                    }
+                    _ => return None,
+                }
+            }
+            launch_readiness_page::LaunchReadinessPageAction::ReviewDetails => return None,
+        };
+        let _ = game;
+        Some(Route::Section(section))
+    }
+
+    pub(super) fn show_setup(
+        &mut self,
+        ui: &mut egui::Ui,
+        environment: Option<&EnvironmentSnapshot>,
+    ) {
+        if let Some(environment) = environment {
+            lifecycle_setup_panel(ui, &environment.lifecycle, &mut self.app);
+        }
+        let context = ui.ctx().clone();
+        self.app
+            .navigate_to_main_view(crate::navigation::MainView::EmulatorSetup);
+        self.app.show_emulator_setup_page(ui, &context);
+    }
+
+    fn poll_native_repairs(&mut self, context: &egui::Context) {
+        if let Some(page) = &mut self.app.repair_review_page {
+            let changed = page.poll_input() | page.poll_apply() | page.poll_scan();
+            if changed || page.input_busy() || page.is_apply_running() || page.is_scan_running() {
+                context.request_repaint_after(std::time::Duration::from_millis(40));
+            }
+        }
+        if let Some(page) = &mut self.app.repair_history_page {
+            let changed = page.poll_background() | page.poll_undo();
+            if changed || page.background_busy() || page.is_undo_running() {
+                context.request_repaint_after(std::time::Duration::from_millis(40));
+            }
+        }
+    }
+
+    pub(super) fn show_native_exact_duplicates(&mut self, ui: &mut egui::Ui) {
+        self.app
+            .navigate_to_main_view(crate::navigation::MainView::ExactDuplicateReview);
+        self.app.show_exact_duplicate_review_page(ui);
+    }
+
+    pub(super) fn show_native_repair_review(&mut self, ui: &mut egui::Ui) {
+        let page = self
+            .app
+            .repair_review_page
+            .get_or_insert_with(Default::default);
+        page.background_ui = true;
+        crate::repair_review_page::show_repair_review_page(ui, page);
+    }
+
+    pub(super) fn show_native_repair_history(&mut self, ui: &mut egui::Ui) {
+        if self.app.repair_history_page.is_none() {
+            match archivefs_core::dat::rename_apply::default_rename_transaction_dir() {
+                Ok(path) => {
+                    self.app.repair_history_page = Some(
+                        crate::repair_history_page::RepairHistoryPageState::load_background(path),
+                    )
+                }
+                Err(error) => {
+                    ui.label(format!("Repair History unavailable: {error}"));
+                    return;
+                }
+            }
+        }
+        crate::repair_history_page::show_repair_history_page(
+            ui,
+            self.app.repair_history_page.as_mut().unwrap(),
+            &mut self.app.clipboard,
+        );
+    }
+
+    pub(super) fn show_save_vault(&mut self, ui: &mut egui::Ui, advanced: bool) {
+        let context = ui.ctx().clone();
+        let action = crate::pcsx2_page::show_save_vault_landing(
+            ui,
+            advanced,
+            None,
+            &self.app.emulator_readiness.pcsx2_status,
+            &mut self.app.emulator_readiness.pcsx2_save_vault,
+        );
+        self.app.handle_pcsx2_action(&context, action);
+    }
+
+    pub(super) fn show_firmware(&mut self, ui: &mut egui::Ui) {
+        ui.label("Review the firmware each emulator requires, what EmuWiz detected, and the next safe action.");
+        ui.small("EmuWiz does not provide copyrighted firmware or change emulator configuration from this page.");
+        egui::ScrollArea::vertical()
+            .id_salt("v2_native_firmware")
+            .auto_shrink([false, false])
+            .show(ui, |ui| {
+                self.app
+                    .emulator_readiness
+                    .bios_projection_page
+                    .show_body(ui);
+            });
+        if self
+            .app
+            .emulator_readiness
+            .bios_projection_page
+            .take_doctor_refresh_request()
+        {
+            self.app.start_doctor_scan(ui.ctx().clone());
+        }
+    }
+
+    pub(super) fn show_sources(
+        &mut self,
+        ui: &mut egui::Ui,
+        activity: &mut Activity,
+    ) -> Option<Route> {
+        self.app
+            .navigate_to_main_view(crate::navigation::MainView::Sources);
+        app_polling::start_view_gated_work(&mut self.app, ui.ctx());
+        let action = self.show_native_sources(ui, activity);
+        if let Some(action) = action {
+            self.review_or_start_source_action(ui.ctx().clone(), action);
+        }
+        self.show_source_scan_review(ui.ctx());
+        // The reviewed-rebind dialog belongs to whichever Sources page is up.
+        self.app.show_rebind_dialog_and_apply(ui.ctx());
+        self.observe_source_activity(activity);
+        self.observe_provider_activity(activity);
+        self.observe_dat_activity(activity);
+        self.collection.take_route()
+    }
+
+    fn show_native_sources(
+        &mut self,
+        ui: &mut egui::Ui,
+        activity: &mut Activity,
+    ) -> Option<crate::SourceAction> {
+        let configured = self
+            .app
+            .gui_config
+            .source_roots()
+            .ok()
+            .unwrap_or_default()
+            .to_vec();
+        let snapshot = self.app.database_state.snapshot();
+        let source_state = crate::source_state::merge_configured_sources(
+            &configured,
+            snapshot.map(|snapshot| snapshot.source_views.as_slice()),
+        );
+        let archives = snapshot
+            .map(|snapshot| snapshot.archives.clone())
+            .unwrap_or_default();
+        // The backend's source-level catalogue health, projected for display. A
+        // source it has not answered for reads as unknown, never as healthy.
+        let health_rows = crate::catalogue_health_ui::project_rows(
+            &source_state.sources,
+            snapshot
+                .map(|snapshot| snapshot.source_health.as_slice())
+                .unwrap_or(&[]),
+        );
+        let mut health_action = None;
+        let busy = !self.app.source_action_available() || self.collection.preparing();
+        let mut action = None;
+
+        self.poll_remote_source_probes(ui.ctx());
+
+        ui.label("Mr Wiz · Choose a games folder, then use the read-only preview to prepare safe import batches. You approve every import.");
+        self.show_scope_loading(ui);
+        if let Some(running) = &self.app.sources_ui.source_action {
+            ui.horizontal_wrapped(|ui| {
+                ui.spinner();
+                ui.label(
+                    crate::platform_source_actions::source_action_started_message(&running.action),
+                );
+            });
+            if matches!(
+                running.action,
+                crate::platform_source_actions::SourceAction::BoundedImport(_)
+            ) {
+                ui.small("Bounded Apply is running without a root scan. Cancellation is available in Sources › Discovery until commit; it rolls back the batch. Counts and per-path reasons appear when it finishes. Leaving this page does not stop it.");
+            } else {
+                ui.small("The source worker is running. No incremental counts or cancellation are available. Results appear when it finishes; leaving this page does not stop it.");
+            }
+            if let Some((source, elapsed)) =
+                archivefs_core::scummvm_detection::discovery_in_progress()
+            {
+                ui.label(format!(
+                    "Looking for ScummVM game folders in {} ({} s). The first check of a large library can take about a minute; later scans reuse the result while nothing changes.",
+                    source.display(),
+                    elapsed.as_secs()
+                ));
+                ui.ctx()
+                    .request_repaint_after(std::time::Duration::from_millis(500));
+            }
+        }
+        if let Some(feedback) = &self.app.feedback {
+            ui.label(format!("Latest action: {}", feedback.message));
+            if let Some(warning) = &feedback.warning {
+                ui.label(warning);
+            }
+        }
+        if let Some(message) = &self.collection.refusal {
+            ui.label(message);
+        }
+        ui.horizontal_wrapped(|ui| {
+            ui.label("Add game folder");
+            if ui
+                .add_enabled(!busy, egui::Button::new("Add source"))
+                .clicked()
+                && let Some(path) = rfd::FileDialog::new().pick_folder()
+            {
+                action = Some(crate::SourceAction::Add(path));
+            }
+            if ui
+                .add_enabled(
+                    !busy && !source_state.sources.is_empty(),
+                    egui::Button::new("Scan all enabled"),
+                )
+                .clicked()
+            {
+                action = Some(crate::SourceAction::ScanAll);
+            }
+            if ui
+                .add_enabled(!busy, egui::Button::new("Reload saved status"))
+                .clicked()
+            {
+                self.app.start_database_action(ui.ctx().clone(), false);
+            }
+            if ui
+                .selectable_label(!self.sources_discovery, "Configured folders")
+                .clicked()
+            {
+                self.sources_discovery = false;
+            }
+            if ui
+                .selectable_label(self.sources_discovery, "Discovery")
+                .clicked()
+            {
+                self.sources_discovery = true;
+            }
+        });
+
+        // A folder that needs review blocks scanning and every Missing report,
+        // so say so right here, in one line, without pushing provider setup down.
+        // Nothing is drawn unless a folder actually needs review.
+        if !self.sources_discovery {
+            health_action = crate::catalogue_health_ui::show_review_banner(
+                ui,
+                &health_rows,
+                busy || self.app.database_state.is_loading(),
+            );
+        }
+
+        // Provider setup lives on this page, directly below the primary
+        // "Add source" row so that action stays visible.
+        ui.separator();
+        if !self.sources_discovery {
+            self.show_artwork_provider_setup(ui, activity);
+        }
+        ui.separator();
+
+        if self.sources_discovery {
+            self.show_collection_report(ui);
+            self.show_native_discovery_candidates(ui, busy, &mut action);
+        } else if source_state.sources.is_empty() {
+            crate::ui::components::card(ui, |ui| {
+                ui.heading("No game folders configured");
+                ui.label("Choose an existing folder to add it. EmuWiz will not move, rename or scan anything until you request it.");
+            });
+        } else {
+            // The full health section sits in the page flow, above the folder
+            // list, not inside the list's own (short) scroll area where it would
+            // collapse to a sliver once provider setup takes the page.
+            {
+                let row_view = self
+                    .app
+                    .sources_ui
+                    .catalogue_row_check
+                    .view(self.app.database_generation.0);
+                let full = crate::catalogue_health_ui::show_health_section(
+                    ui,
+                    &health_rows,
+                    &row_view,
+                    busy || self.app.database_state.is_loading(),
+                );
+                health_action = full.or(health_action.take());
+            }
+            ui.add_space(8.0);
+            // The page itself scrolls. A nested scroll area here collapsed to a
+            // sliver once provider setup and the health section took the page.
+            ui.vertical(|ui| {
+                for source in &source_state.sources {
+                    ui.push_id(&source.path, |ui| {
+                        self.show_native_source_card(ui, source, &archives, busy, &mut action);
+                    });
+                }
+            });
+        }
+        self.app.apply_health_action(ui.ctx(), health_action);
+        action
+    }
+
+    fn show_native_source_card(
+        &mut self,
+        ui: &mut egui::Ui,
+        source: &SourceFolderView,
+        archives: &[archivefs_core::PersistedArchive],
+        busy: bool,
+        action: &mut Option<crate::SourceAction>,
+    ) {
+        crate::ui::components::card(ui, |ui| {
+            ui.horizontal_wrapped(|ui| {
+                ui.strong(source.path.display().to_string());
+                crate::ui::components::status_badge(
+                    ui,
+                    source_availability_label(source.availability),
+                    source_availability_tone(source.availability),
+                );
+                crate::ui::components::status_badge(
+                    ui,
+                    if source.enabled {
+                        "Enabled"
+                    } else {
+                        "Disabled"
+                    },
+                    if source.enabled {
+                        crate::ui::components::StatusTone::Info
+                    } else {
+                        crate::ui::components::StatusTone::Pending
+                    },
+                );
+            });
+            ui.label(format!(
+                "Source type: {} · Role: {}",
+                source_type_label(source),
+                source.role.label()
+            ));
+            egui::Grid::new(("v2_source_facts", &source.path))
+                .num_columns(2)
+                .spacing([14.0, 5.0])
+                .show(ui, |ui| {
+                    ui.weak("Availability");
+                    ui.label(source_availability_detail(source));
+                    ui.end_row();
+                    ui.weak("Last scan");
+                    ui.label(source.last_scan_at.as_deref().unwrap_or("Not scanned yet"));
+                    ui.end_row();
+                    ui.weak("Scan status");
+                    ui.label(source_scan_label(source.last_scan_status));
+                    ui.end_row();
+                    ui.weak("Game/media count");
+                    ui.label(
+                        source
+                            .last_archive_count
+                            .map_or_else(|| "Not available".into(), |count| count.to_string()),
+                    );
+                    ui.end_row();
+                    ui.weak("Remote health");
+                    if let Some(result) = self.remote_probe_results.get(&source.path) {
+                        ui.label(remote_availability_detail(result));
+                    } else if self.remote_probe_jobs.contains_key(&source.path) {
+                        ui.label("Checking backing availability…");
+                    } else {
+                        ui.label("Not checked");
+                    }
+                    ui.end_row();
+                    ui.weak("Platform hint");
+                    ui.label(crate::source_state::source_platform_value_label(
+                        &crate::source_state::source_platform_state(source, archives),
+                    ));
+                    ui.end_row();
+                });
+            if let Some(error) = &source.last_scan_error {
+                crate::ui::components::technical_details(
+                    ui,
+                    ("v2_source_error", &source.path),
+                    |ui| {
+                        ui.label(error);
+                    },
+                );
+            }
+            if let Some(result) = self.remote_probe_results.get(&source.path) {
+                ui.horizontal_wrapped(|ui| {
+                    crate::ui::components::status_badge(
+                        ui,
+                        remote_availability_label(result.availability),
+                        remote_availability_tone(result.availability),
+                    );
+                    ui.label(remote_availability_detail(result));
+                });
+                crate::ui::components::technical_details(
+                    ui,
+                    ("v2_remote_source_probe", &source.path),
+                    |ui| {
+                        ui.label(format!("Probe latency: {} ms", result.latency_ms));
+                        ui.label(format!("Bounded bytes read: {}", result.bytes_probed));
+                        ui.label(format!("Timestamp: {}", result.timestamp_unix_seconds));
+                        ui.label(format!("Provenance: {}", result.provenance));
+                        ui.label(format!("Failure class: {:?}", result.error_category));
+                        if let Some(error) = &result.error {
+                            ui.label(format!("Detail: {error}"));
+                        }
+                    },
+                );
+            }
+            ui.horizontal_wrapped(|ui| {
+                let probing = self.remote_probe_jobs.contains_key(&source.path);
+                if ui
+                    .add_enabled(
+                        !probing,
+                        egui::Button::new(if probing {
+                            "Checking backing…"
+                        } else {
+                            "Check backing availability"
+                        }),
+                    )
+                    .clicked()
+                {
+                    self.start_remote_source_probe(source.path.clone(), ui.ctx().clone());
+                }
+                let label = if source.availability == SourceAvailability::Available {
+                    "Scan this folder"
+                } else {
+                    "Reconnect and scan"
+                };
+                if ui
+                    .add_enabled(!busy && source.enabled, egui::Button::new(label))
+                    .clicked()
+                {
+                    *action = Some(crate::SourceAction::ScanOne(source.path.clone()));
+                }
+                if ui
+                    .add_enabled(
+                        !busy,
+                        egui::Button::new(if source.enabled { "Disable" } else { "Enable" }),
+                    )
+                    .clicked()
+                {
+                    *action = Some(crate::SourceAction::SetEnabled {
+                        path: source.path.clone(),
+                        enabled: !source.enabled,
+                    });
+                }
+            });
+        });
+    }
+
+    fn start_remote_source_probe(&mut self, path: PathBuf, context: egui::Context) {
+        if self.remote_probe_jobs.contains_key(&path) {
+            return;
+        }
+        let request =
+            RemoteSourceProbeRequest::new(&path).with_provenance("configured EmuWiz source path");
+        let (sender, receiver) = mpsc::channel();
+        self.remote_probe_jobs.insert(path, receiver);
+        std::thread::spawn(move || {
+            let result = archivefs_core::remote_source_health::probe_remote_source(&request);
+            let _ = sender.send(result);
+            context.request_repaint();
+        });
+    }
+
+    fn poll_remote_source_probes(&mut self, context: &egui::Context) {
+        let paths: Vec<PathBuf> = self.remote_probe_jobs.keys().cloned().collect();
+        for path in paths {
+            let Some(receiver) = self.remote_probe_jobs.get(&path) else {
+                continue;
+            };
+            match receiver.try_recv() {
+                Ok(result) => {
+                    self.remote_probe_jobs.remove(&path);
+                    self.remote_probe_results.insert(path, result);
+                    context.request_repaint();
+                }
+                Err(TryRecvError::Disconnected) => {
+                    self.remote_probe_jobs.remove(&path);
+                    context.request_repaint();
+                }
+                Err(TryRecvError::Empty) => {}
+            }
+        }
+    }
+
+    fn show_native_discovery_candidates(
+        &mut self,
+        ui: &mut egui::Ui,
+        busy: bool,
+        action: &mut Option<crate::SourceAction>,
+    ) {
+        let crate::DatabaseState::Ready {
+            snapshot,
+            last_scan_summary: Some(summary),
+        } = &self.app.database_state
+        else {
+            return;
+        };
+        if !native_collection::latest_saved_scan(snapshot)
+            .is_some_and(|scan| scan.scan_run_id == summary.scan_run_id)
+        {
+            return;
+        }
+        egui::CollapsingHeader::new("Add a folder from the retained discovery sample").show(ui, |ui| {
+        ui.label("A bounded sample, not a total. Adding a source saves its location; it does not scan it or manually classify its contents.");
+        let mut candidates = summary
+            .ingestion_recognised_sample
+            .iter()
+            .chain(summary.ingestion_skipped.iter())
+            .collect::<Vec<_>>();
+        candidates.sort_by(|left, right| left.path.cmp(&right.path));
+        candidates.dedup_by(|left, right| left.path == right.path);
+        egui::ScrollArea::vertical()
+            .id_salt("v2_source_discovery")
+            .show(ui, |ui| {
+                for candidate in candidates.into_iter().take(200) {
+                    ui.push_id(&candidate.path, |ui| {
+                        crate::ui::components::card(ui, |ui| {
+                            ui.strong(candidate.path.display().to_string());
+                            ui.label(format!(
+                                "{} · {}",
+                                discovery_container_label(&candidate.container),
+                                candidate
+                                    .platform_hint
+                                    .as_deref()
+                                    .unwrap_or("Platform not identified")
+                            ));
+                            ui.label(&candidate.explanation);
+                            let root = candidate.path.parent().map(Path::to_path_buf);
+                            if let Some(root) = root
+                                && ui
+                                    .add_enabled(
+                                        !busy,
+                                        egui::Button::new("Add this folder as a source"),
+                                    )
+                                    .clicked()
+                            {
+                                *action = Some(crate::SourceAction::Add(root));
+                            }
+                        });
+                    });
+                }
+            });
+        });
+    }
+
+    pub(super) fn show_dat_sources(
+        &mut self,
+        ui: &mut egui::Ui,
+        activity: &mut Activity,
+    ) -> Option<Route> {
+        self.app
+            .navigate_to_sources_tab(crate::navigation::SourcesTab::Dats);
+        app_polling::start_view_gated_work(&mut self.app, ui.ctx());
+        ui.label("Manage trusted DAT catalogues used to identify and verify your library.");
+        // Inventory enumeration and managed snapshot checks already run on
+        // the picker worker. Do not construct the entire DAT page a second
+        // time here just to show counts; its own renderer builds it once.
+        let picker = &mut self.app.sources_ui.dat_sources_ui.catalogue_picker;
+        picker.ensure_loaded();
+        if picker.poll() {
+            ui.ctx().request_repaint();
+        } else if picker.loading {
+            ui.ctx()
+                .request_repaint_after(std::time::Duration::from_millis(50));
+        }
+        crate::ui::components::card(ui, |ui| {
+            ui.strong("Saved catalogue inventory");
+            if picker.loading {
+                ui.label("Reading the saved catalogue inventory…");
+            } else if let Some(error) = &picker.error {
+                ui.label(format!("Catalogue inventory unavailable: {error}"));
+            } else {
+                let rows = picker.summaries();
+                let ready = rows
+                    .iter()
+                    .filter(|row| row.enabled && row.availability.is_ready())
+                    .count();
+                let disabled = rows.iter().filter(|row| !row.enabled).count();
+                ui.label(format!(
+                    "{} saved catalogues · {ready} ready · {disabled} disabled",
+                    rows.len()
+                ));
+            }
+            ui.label("These counts describe catalogue files, not compatible selections or Verified games. Choose a platform in Check Games, select compatible data, Preview, then confirm verification. Installing a catalogue does not check your games.");
+        });
+        ui.heading("Installed and imported DATs");
+        crate::ui::components::card(ui, |ui| {
+            ui.strong("No-Intro pack import");
+            // The working chooser lives in the No-Intro card further down; this
+            // card only points at it, so it must not look like a control.
+            ui.label(format!("Download the pack from No-Intro's website in your browser, then press \u{201c}{}\u{201d} in the No-Intro card below. EmuWiz checks the pack before any game check can use it.", crate::dat_sources_page::NO_INTRO_CHOOSER));
+        });
+        self.app.show_dat_sources_with_duel(ui);
+        self.observe_dat_activity(activity);
+        (self.app.view == crate::navigation::MainView::CheckGames).then(|| {
+            self.app
+                .sources_ui
+                .dat_sources_ui
+                .simple
+                .platform()
+                .map(|p| Route::PlatformCheck(p.to_string()))
+                .unwrap_or(Route::Section(Section::Check))
+        })
+    }
+
+    #[cfg(any())]
+    fn show_native_dat_content(&mut self, ui: &mut egui::Ui) {
+        let Some(view) = self.app.native_dat_sources_view(ui.ctx()) else {
+            crate::ui::components::card(ui, |ui| {
+                ui.heading("DAT setup is unavailable");
+                ui.label("EmuWiz could not open its DAT registry location.");
+            });
+            return;
+        };
+
+        let mut action = None;
+        crate::ui::components::card(ui, |ui| {
+            ui.strong("Import verification data");
+            ui.label("Choose a DAT file or folder. EmuWiz validates it before it becomes available to game checks.");
+            ui.horizontal_wrapped(|ui| {
+                if ui.button("Choose DAT file").clicked()
+                    && let Some(path) = rfd::FileDialog::new().pick_file()
+                {
+                    action = Some(
+                        crate::dat_sources_page::DatSourcesPageAction::ImportVerificationData {
+                            path,
+                        },
+                    );
+                }
+                if ui.button("Choose DAT folder").clicked()
+                    && let Some(path) = rfd::FileDialog::new().pick_folder()
+                {
+                    action =
+                        Some(crate::dat_sources_page::DatSourcesPageAction::AddFolder { path });
+                }
+            });
+            ui.weak(
+                "Supported DAT formats and detailed parser diagnostics are shown after import.",
+            );
+        });
+
+        ui.add_space(8.0);
+        crate::ui::components::card(ui, |ui| {
+            ui.strong("No-Intro pack import");
+            ui.label("Download the pack externally, choose its ZIP here, inspect its bounded DAT members, then stage and activate a content-addressed snapshot.");
+            ui.horizontal_wrapped(|ui| {
+                if ui.button("Download No-Intro pack externally").clicked() {
+                    action = Some(
+                        crate::dat_sources_page::DatSourcesPageAction::OpenNoIntroDownloadPage,
+                    );
+                }
+                if ui.button("Choose No-Intro ZIP").clicked()
+                    && let Some(path) = rfd::FileDialog::new().pick_file()
+                {
+                    action = Some(
+                        crate::dat_sources_page::DatSourcesPageAction::ChooseNoIntroPack { path },
+                    );
+                }
+                if view.no_intro_selected_pack.is_some() && ui.button("Inspect ZIP").clicked() {
+                    action =
+                        Some(crate::dat_sources_page::DatSourcesPageAction::InspectNoIntroPack);
+                }
+                if view.no_intro_inspection.is_some() && ui.button("Stage snapshot").clicked() {
+                    action = Some(crate::dat_sources_page::DatSourcesPageAction::StageNoIntroPack);
+                }
+                if view.no_intro_staged.is_some() && ui.button("Activate snapshot").clicked() {
+                    action =
+                        Some(crate::dat_sources_page::DatSourcesPageAction::ActivateNoIntroPack);
+                }
+            });
+            if let Some((name, size)) = &view.no_intro_selected_pack {
+                ui.label(format!("Selected ZIP: {name} ({size} bytes)"));
+            }
+            if let Some(inspection) = view.no_intro_inspection.as_ref() {
+                ui.label(format!(
+                    "Inspection: {} accepted member(s), {} rejected · pack SHA-256 {}",
+                    inspection.accepted.len(),
+                    inspection.rejected.len(),
+                    inspection.pack_sha256
+                ));
+            }
+            if let Some(installed) = view.no_intro_installed.as_ref() {
+                ui.label(format!(
+                    "Installed snapshot: {} member(s) · pack SHA-256 {}",
+                    installed.accepted.len(),
+                    installed.pack_sha256
+                ));
+            }
+            if let Some(error) = view.no_intro_action_error.as_deref() {
+                ui.colored_label(egui::Color32::from_rgb(180, 45, 45), error);
+            }
+        });
+
+        ui.add_space(8.0);
+        ui.heading("Installed and imported DATs");
+        if view.rows.is_empty() && view.managed_rows.iter().all(|row| !row.installed) {
+            ui.label("No local DAT sources are installed yet.");
+        }
+        for row in &view.rows {
+            ui.push_id(("dat", &row.id), |ui| {
+                crate::ui::components::card(ui, |ui| {
+                    ui.horizontal_wrapped(|ui| {
+                        ui.strong(&row.display_name);
+                        ui.label(row.kind_label);
+                        ui.label(dat_health_label(row.health_state));
+                    });
+                    ui.label(format!(
+                        "Ecosystem / platform: {}",
+                        row.platform_display.as_deref().unwrap_or("not assigned")
+                    ));
+                    ui.label(format!("Source: {}", row.path));
+                    if let Some(version) = row.arcade_verification.as_deref() {
+                        ui.label(format!("Version: {version}"));
+                    }
+                    if let Some(detail) = row.health_detail.as_deref() {
+                        ui.weak(detail);
+                    }
+                    if ui
+                        .button(
+                            if row.health_state
+                                == archivefs_core::dat::sources::DatHealthState::NotChecked
+                            {
+                                "Validate"
+                            } else {
+                                "Validate again"
+                            },
+                        )
+                        .clicked()
+                    {
+                        action = Some(crate::dat_sources_page::DatSourcesPageAction::Validate {
+                            id: row.id.clone(),
+                        });
+                    }
+                });
+            });
+        }
+        for row in view.managed_rows.iter().filter(|row| row.installed) {
+            ui.push_id(("managed-dat", format!("{:?}", row.source_id)), |ui| {
+                crate::ui::components::card(ui, |ui| {
+                    ui.strong(&row.authoritative_name);
+                    ui.label(format!(
+                        "Managed {} · status: {:?}",
+                        row.source_label, row.status
+                    ));
+                    if let Some(hash) = row.technical.sha256.as_deref() {
+                        ui.label(format!("Snapshot SHA-256: {hash}"));
+                    }
+                    if let Some(revision) = row.current_revision.as_deref() {
+                        ui.label(format!("Version / revision: {revision}"));
+                    }
+                });
+            });
+        }
+
+        if let Some(error) = view.load_error.as_deref() {
+            ui.colored_label(
+                egui::Color32::from_rgb(180, 45, 45),
+                format!("DAT registry error: {error}"),
+            );
+        }
+        if !view.load_problems.is_empty() {
+            ui.collapsing("Errors and warnings", |ui| {
+                for problem in &view.load_problems {
+                    ui.label(problem);
+                }
+            });
+        }
+        ui.collapsing("Advanced validation details", |ui| {
+            ui.label("Validation diagnostics, provenance, and coverage remain available through the existing typed DAT state.");
+            ui.label(format!("Configured local sources: {} · managed sources: {}", view.rows.len(), view.managed_rows.len()));
+        });
+
+        if let Some(action) = action
+            && let Some(page) = self.app.sources_ui.dat_sources_page.as_mut()
+        {
+            page.apply(action);
+        }
+    }
+
+    pub(super) fn show_cheats(
+        &mut self,
+        ui: &mut egui::Ui,
+        selected: Option<&crate::gui_v2::library::Game>,
+        activity: &mut Activity,
+    ) -> Option<Route> {
+        let Some(game) = selected else {
+            crate::ui::components::card(ui, |ui| {
+                ui.heading("Select a game first");
+                ui.label("Open a game from Games, then choose Mods & Cheats to review its gameplay codes.");
+                ui.label("No cheat is changed by browsing; original game files stay untouched.");
+            });
+            return None;
+        };
+        if game.platform.eq_ignore_ascii_case("ScummVM") {
+            return self
+                .scummvm_trainer
+                .show(ui, &game.archive.absolute_path, &game.title)
+                .then_some(Route::Section(Section::History));
+        }
+        // Read-only DCP review keeps existing emulator cheat controls below.
+        if super::dreamcast_ipbin::applies(game) {
+            ui.collapsing("Dreamcast IP.BIN & DCP inspection", |ui| {
+                super::dreamcast_ipbin::show(ui, game);
+            });
+        }
+        let path = game.archive.absolute_path.clone();
+        if !self
+            .app
+            .cheat_workflow
+            .as_ref()
+            .is_some_and(|workflow| workflow.archive_path == path)
+        {
+            self.app.open_cheats_mods_workspace(ui.ctx(), path);
+        } else {
+            // Same stale-target refresh as Classic's reconcile step.
+            self.app
+                .refresh_cheat_workflow_after_target_change(ui.ctx());
+        }
+        let Some(workflow) = self.app.cheat_workflow.as_ref() else {
+            if !game.identified {
+                crate::ui::components::banner(
+                    ui,
+                    "This game needs identifying first",
+                    "We need to identify this game before cheats or mods can be matched safely. No files were changed.",
+                    crate::ui::components::StatusTone::Warning,
+                );
+                if ui.button("Review identity").clicked() {
+                    return Some(Route::ReviewIdentity(game.archive.id));
+                }
+                ui.collapsing("Details", |ui| {
+                    ui.label(
+                        "The cheat workspace could not be bound to the loaded library record.",
+                    );
+                });
+                return None;
+            }
+            crate::ui::components::banner(
+                ui,
+                "Cheats are not ready for this game",
+                "EmuWiz could not bind this selection to the loaded library record. Refresh the library and try again; no files were changed.",
+                crate::ui::components::StatusTone::Warning,
+            );
+            return None;
+        };
+        // Loose ADF trainers are exact-image previews, never WHDLoad CUSTOM
+        // options or a generic RetroArch install. Keep the current launch choice.
+        if crate::cheats_mods::adf_trainer::is_candidate(&game.archive.absolute_path) {
+            if let Some(workflow) = self.app.cheat_workflow.as_mut() {
+                crate::cheats_mods::adf_trainer::show(
+                    ui,
+                    &game.archive.absolute_path,
+                    &workflow.display_name,
+                    &mut workflow.adf_trainer,
+                );
+            }
+            return None;
+        }
+        ui.label(format!("On the bench: {} · {}", game.title, game.platform));
+        ui.label(match workflow.adapter.display_name() {
+            Some(adapter) => format!("Cheat controls ready for {adapter}"),
+            None => "This game has no automatic cheat location yet".to_string(),
+        });
+        let live = match &self.app.state {
+            LoadState::Ready(data) => Some(data.as_ref()),
+            LoadState::Loading { previous, .. } => previous.as_deref(),
+            LoadState::Error(_) => None,
+        };
+        // The shared controller rejects overlapping requests as a second line
+        // of defence. Also disable its submit controls while any cheat worker
+        // is active so a double click is visibly refused at the v2 surface.
+        let busy = cheat_activity_state(self.app.cheat_workflow.as_ref()).is_some();
+        let flycast_launch = self.app.flycast_cheat_launch_view(live);
+        let rpcs3_selection = self.app.rpcs3_cheat_selection(live);
+        if let Some(workflow) = self.app.cheat_workflow.as_mut() {
+            workflow.flycast.launch = Some(flycast_launch);
+            workflow.rpcs3.selection = Some(rpcs3_selection);
+        }
+        let action = crate::cheats_mods_preview::show_cheats_mods_page(
+            ui,
+            self.app.cheat_workflow.as_mut(),
+            &self.app.emulator_readiness.retroarch_profiles,
+            &self.app.emulator_readiness.pcsx2_profiles,
+            &self.app.emulator_readiness.dolphin_profiles,
+            &self.app.emulator_readiness.xenia_profiles,
+            live,
+            self.app.database_state.snapshot(),
+            &self.app.history,
+            busy,
+            &mut self.app.clipboard,
+            &mut self.app.dolphin_texture_mod,
+            &mut self.app.local_mod_package,
+        );
+        let library = live
+            .map(|data| {
+                data.records
+                    .iter()
+                    .map(
+                        |record| archivefs_core::patch_manager::UserCheatLibraryGame {
+                            game_id: record.mount_plan.archive.path.display().to_string(),
+                            title: record
+                                .metadata
+                                .title
+                                .clone()
+                                .unwrap_or_else(|| record.identity.display_name.clone()),
+                            platform: record
+                                .metadata
+                                .platform
+                                .clone()
+                                .or_else(|| record.identity.platform.clone()),
+                            region: record
+                                .metadata
+                                .region
+                                .clone()
+                                .or_else(|| record.identity.region.clone()),
+                            serial: None,
+                            title_id: None,
+                            crc: None,
+                            content_hash: record.identity.content_hash.clone(),
+                        },
+                    )
+                    .collect::<Vec<_>>()
+            })
+            .unwrap_or_default();
+        let selected_game = self.app.cheat_workflow.as_ref().map(|workflow| {
+            (
+                workflow.archive_path.display().to_string(),
+                workflow.display_name.clone(),
+            )
+        });
+        // A pending "Your cheat files" confirmation is validated with fresh,
+        // non-blocking emulator discovery before the page can install.
+        self.app.validate_pending_local_install_confirm(ui.ctx());
+        let local_retroarch = self
+            .app
+            .cheat_workflow
+            .as_ref()
+            .filter(|workflow| workflow.adapter == crate::CheatEmulatorAdapter::RetroArch)
+            // A stale emulator/core target withholds the context, which
+            // cancels any local-file preview built for it.
+            .filter(|workflow| {
+                self.app
+                    .cheat_route_target_is_current_cached(workflow, ui.ctx())
+                    != Some(false)
+            })
+            .map(|workflow| {
+                crate::local_cheat_install_context(
+                    workflow,
+                    &self.app.emulator_readiness.retroarch_profiles,
+                )
+            });
+        let local_pcsx2 = self
+            .app
+            .cheat_workflow
+            .as_ref()
+            .filter(|workflow| workflow.adapter == crate::CheatEmulatorAdapter::Pcsx2)
+            .and_then(|workflow| {
+                crate::local_pcsx2_install_context(
+                    workflow,
+                    &self.app.emulator_readiness.pcsx2_profiles,
+                )
+            });
+        let local_dolphin = self
+            .app
+            .cheat_workflow
+            .as_ref()
+            .filter(|workflow| workflow.adapter == crate::CheatEmulatorAdapter::Dolphin)
+            .and_then(|workflow| {
+                crate::local_dolphin_install_context(
+                    workflow,
+                    &self.app.emulator_readiness.dolphin_profiles,
+                )
+            });
+        let local_xenia = self
+            .app
+            .cheat_workflow
+            .as_ref()
+            .filter(|workflow| workflow.adapter == crate::CheatEmulatorAdapter::Xenia)
+            .map(|workflow| {
+                crate::local_xenia_install_context(
+                    workflow,
+                    &self.app.emulator_readiness.xenia_profiles,
+                )
+            });
+        ui.add_space(12.0);
+        let context = ui.ctx().clone();
+        self.app.user_cheat_import_page.show(
+            ui,
+            &context,
+            &library,
+            selected_game
+                .as_ref()
+                .map(|(id, title)| (id.as_str(), title.as_str())),
+            self.app
+                .cheat_workflow
+                .as_ref()
+                .and_then(|workflow| workflow.platform.as_deref()),
+            local_retroarch.as_ref(),
+            local_pcsx2.as_ref(),
+            local_dolphin.as_ref(),
+            local_xenia.as_ref(),
+        );
+        let destination = action.and_then(|action| self.handle_cheat_action(&context, action));
+        self.observe_cheat_activity(activity);
+        destination
+    }
+
+    pub(super) fn take_source_library_reload(&mut self) -> bool {
+        std::mem::take(&mut self.source_library_reload)
+    }
+
+    /// Why the focused CUE disc's verification needs a re-check, whether one
+    /// is running, and the last re-check's result for it.
+    pub(super) fn disc_recheck_view(&self, path: &Path) -> Option<(String, bool, Option<String>)> {
+        let snapshot = self.app.database_state.snapshot()?;
+        let message = self
+            .disc_recheck_message
+            .as_ref()
+            .filter(|(seen, _)| seen == path)
+            .map(|(_, message)| message.clone());
+        let running = self
+            .disc_recheck_job
+            .as_ref()
+            .is_some_and(|(seen, _)| seen == path);
+        match snapshot.disc_recheck.get(path) {
+            Some(recheck) => Some((recheck.reason.clone(), running, message)),
+            None => message.map(|message| (String::new(), running, Some(message))),
+        }
+    }
+
+    /// Starts the explicit re-check of one CUE disc on a worker thread. Only
+    /// that disc's sheet and files are re-hashed.
+    pub(super) fn start_disc_recheck(&mut self, path: &Path) {
+        if self.disc_recheck_job.is_some() {
+            return;
+        }
+        let Some(snapshot) = self.app.database_state.snapshot() else {
+            return;
+        };
+        let Some(recheck) = snapshot.disc_recheck.get(path).cloned() else {
+            return;
+        };
+        let Ok(config) = archivefs_core::dat::sources::default_dat_sources_config_path() else {
+            self.disc_recheck_message = Some((
+                path.to_path_buf(),
+                "The DAT sources list could not be found, so the disc cannot be re-checked.".into(),
+            ));
+            return;
+        };
+        let database = snapshot.database_path.clone();
+        let (sender, receiver) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let cancel = std::sync::atomic::AtomicBool::new(false);
+            let message = crate::multidisc_launch_view::run_disc_recheck(
+                &database, &config, &recheck, &cancel,
+            );
+            let _ = sender.send(message);
+        });
+        self.disc_recheck_message = None;
+        self.disc_recheck_job = Some((path.to_path_buf(), receiver));
+    }
+
+    fn poll_disc_recheck(&mut self, context: &egui::Context) {
+        let Some((path, receiver)) = self.disc_recheck_job.as_ref() else {
+            return;
+        };
+        match receiver.try_recv() {
+            Ok(message) => {
+                self.disc_recheck_message = Some((path.clone(), message));
+                self.disc_recheck_job = None;
+                // Reload saved identities so Game Details, disc order and
+                // Launch see the renewed (or unchanged) evidence.
+                self.dat_identity_reload = true;
+            }
+            Err(std::sync::mpsc::TryRecvError::Empty) => context.request_repaint(),
+            Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+                self.disc_recheck_message = Some((
+                    path.clone(),
+                    "The disc re-check stopped unexpectedly.".into(),
+                ));
+                self.disc_recheck_job = None;
+            }
+        }
+    }
+
+    pub(super) fn take_dat_identity_reload(&mut self) -> bool {
+        std::mem::take(&mut self.dat_identity_reload)
+    }
+
+    /// Forget which platform the check page was aimed at, so the next arrival
+    /// from a route applies its platform afresh.
+    pub(super) fn leave_platform_check(&mut self) {
+        self.platform_check_applied = None;
+    }
+
+    /// The existing platform-first Check My Games flow, opened on `platform`.
+    /// Returns a route when the flow asks to leave (Advanced, View games).
+    pub(super) fn show_platform_check(
+        &mut self,
+        ui: &mut egui::Ui,
+        activity: &mut Activity,
+        platform: &str,
+    ) -> Option<Route> {
+        if self.platform_check_applied.as_deref() != Some(platform) {
+            self.app.open_platform_check(platform);
+            self.platform_check_applied = Some(platform.to_string());
+        }
+        self.app.view = crate::navigation::MainView::CheckGames;
+        app_polling::start_view_gated_work(&mut self.app, ui.ctx());
+        self.app.show_dat_sources_page(ui);
+        self.observe_dat_activity(activity);
+        match self.app.view {
+            crate::navigation::MainView::DatSources => Some(Route::Section(Section::Dat)),
+            crate::navigation::MainView::Library => Some(Route::Section(Section::Games)),
+            _ => None,
+        }
+    }
+
+    pub(super) fn take_artwork_reload(&mut self) -> bool {
+        std::mem::take(&mut self.artwork_reload)
+    }
+
+    pub(super) fn has_cheat_history(&self) -> bool {
+        self.app.history.entries().any(|entry| {
+            matches!(
+                entry.action,
+                crate::activity_history::ActivityAction::CheatSourceRetrieval
+                    | crate::activity_history::ActivityAction::CheatPreview
+                    | crate::activity_history::ActivityAction::CheatInstall
+            )
+        })
+    }
+
+    pub(super) fn prepare_blue_history(&mut self, active: bool) {
+        super::bezel_history::prepare(&mut self.app, active);
+    }
+
+    pub(super) fn prepare_bezel_history(&mut self, ctx: &egui::Context, global: bool) -> bool {
+        super::bezel_history::prepare_source(&mut self.app, ctx, global)
+    }
+
+    pub(super) fn show_bezel_history(&mut self, ui: &mut egui::Ui, global: bool) -> bool {
+        super::bezel_history::show(ui, &mut self.app, global)
+    }
+
+    /// Gold's shared Undo records that are not cheats: bezel Undo and Undo
+    /// whose record type could not be established. Labels come from Gold.
+    fn undo_activity(&self) -> Vec<&crate::activity_history::HistoryEntry> {
+        self.app
+            .history
+            .entries()
+            .filter(|entry| {
+                matches!(
+                    entry.action,
+                    crate::activity_history::ActivityAction::BezelUndo
+                        | crate::activity_history::ActivityAction::Undo
+                )
+            })
+            .collect()
+    }
+
+    pub(super) fn has_undo_activity(&self) -> bool {
+        !self.undo_activity().is_empty()
+    }
+
+    pub(super) fn show_undo_activity(&self, ui: &mut egui::Ui) {
+        let entries = self.undo_activity();
+        if entries.is_empty() {
+            return;
+        }
+        ui.heading("Undo activity");
+        activity_cards(ui, "undo-activity", entries);
+    }
+
+    pub(super) fn show_cheat_history(&self, ui: &mut egui::Ui) -> bool {
+        let entries = self
+            .app
+            .history
+            .entries()
+            .filter(|entry| {
+                matches!(
+                    entry.action,
+                    crate::activity_history::ActivityAction::CheatSourceRetrieval
+                        | crate::activity_history::ActivityAction::CheatPreview
+                        | crate::activity_history::ActivityAction::CheatInstall
+                )
+            })
+            .collect::<Vec<_>>();
+        if entries.is_empty() {
+            return false;
+        }
+        ui.heading("Cheat activity");
+        activity_cards(ui, "cheat-history", entries);
+        let undo_available = self.app.cheat_workflow.as_ref().is_some_and(|workflow| {
+            matches!(
+                workflow.transaction,
+                crate::CheatTransactionState::Result { .. }
+            )
+        });
+        if undo_available {
+            ui.label("Undo is available from the reviewed result in Mods & Cheats.");
+            ui.button("Open Mods & Cheats to review undo").clicked()
+        } else {
+            ui.label("Undo is unavailable unless the selected adapter produced a recoverable transaction.");
+            false
+        }
+    }
+
+    pub(super) fn prepare_scummvm_trainer_history(
+        &mut self,
+        ctx: &egui::Context,
+        folder: Option<&Path>,
+    ) -> bool {
+        self.scummvm_trainer.prepare_history(ctx, folder)
+    }
+
+    pub(super) fn show_scummvm_trainer_history(
+        &mut self,
+        ui: &mut egui::Ui,
+        folder: Option<&Path>,
+    ) {
+        self.scummvm_trainer.show_history(ui, folder);
+    }
+
+    pub(super) fn show_metadata_tools(
+        &mut self,
+        ui: &mut egui::Ui,
+        selected: Option<(i64, &Path)>,
+        activity: &mut Activity,
+    ) -> bool {
+        let context = ui.ctx().clone();
+        let mut changed = false;
+        ui.collapsing("ScreenScraper provider setup", |ui| {
+            crate::screenscraper_page::show_screen_scraper_settings(
+                ui,
+                &mut self.app.screenscraper_page,
+                self.app.screenscraper_enrichment.is_running(),
+            );
+        });
+        if let Some((game_id, path)) = selected {
+            self.select(path);
+            let record = match &self.app.state {
+                LoadState::Ready(data) => data
+                    .records
+                    .iter()
+                    .find(|record| record.mount_plan.archive.path == path),
+                LoadState::Loading { previous, .. } => previous.as_ref().and_then(|data| {
+                    data.records
+                        .iter()
+                        .find(|record| record.mount_plan.archive.path == path)
+                }),
+                LoadState::Error(_) => None,
+            }
+            .cloned();
+            if let Some(record) = record {
+                let existing = self
+                    .app
+                    .database_state
+                    .snapshot()
+                    .and_then(|snapshot| snapshot.screenscraper_enrichments.get(&game_id))
+                    .cloned();
+                if let Some(
+                    crate::screenscraper_enrichment_page::ScreenScraperEnrichmentAction::Apply {
+                        archive_id,
+                        values,
+                        receipt,
+                    },
+                ) = crate::screenscraper_enrichment_page::show(
+                    ui,
+                    &mut self.app.screenscraper_enrichment,
+                    &self.app.screenscraper_page,
+                    &record,
+                    game_id,
+                    existing.as_ref(),
+                ) {
+                    self.app
+                        .apply_screenscraper_enrichment(context, archive_id, values, receipt);
+                    changed = self
+                        .app
+                        .feedback
+                        .as_ref()
+                        .is_some_and(|feedback| feedback.succeeded);
+                }
+            } else {
+                ui.label("Loading the selected game's provider-safe metadata identity…");
+            }
+        }
+        self.observe_metadata_activity(activity);
+        changed
+    }
+
+    /// Native Artwork & Metadata provider setup. Provider workers and
+    /// configuration state remain owned by their existing backends; this page
+    /// only projects their status and dispatches their typed actions.
+    pub(super) fn show_artwork_provider_setup(
+        &mut self,
+        ui: &mut egui::Ui,
+        activity: &mut Activity,
+    ) {
+        let context = ui.ctx().clone();
+        ui.heading("Artwork and metadata providers");
+        ui.label("Provider status is read from the existing cache and provider snapshots. EmuWiz does not guess matches or show credentials.");
+        crate::ui::components::card(ui, |ui| {
+            ui.strong("Provider status");
+            ui.horizontal_wrapped(|ui| {
+                ui.label("Local artwork");
+                ui.label("RomM");
+                ui.label("ES-DE");
+                ui.label("ScreenScraper");
+            });
+            ui.label("Credentials: RomM token file when configured · ScreenScraper credentials for online lookup");
+            ui.weak("Open Provider setup below for configuration, health details, errors, and provenance.");
+        });
+
+        ui.collapsing("Provider setup", |ui| {
+
+        crate::ui::components::card(ui, |ui| {
+            ui.strong("Local artwork");
+            ui.label("Configured locally · no credentials required · cached platform artwork is loaded on demand.");
+            self.app.artwork_media.platform_artwork.prepare_settings(&context);
+            ui.collapsing("Configure local artwork", |ui| {
+                if let Some(action) = self.app.artwork_media.platform_artwork.show(ui) {
+                    self.app
+                        .artwork_media
+                        .platform_artwork
+                        .dispatch(context.clone(), action);
+                }
+            });
+        });
+
+        self.app.artwork_media.es_de_media.start(context.clone());
+        self.app.artwork_media.es_de_media.poll();
+        crate::ui::components::card(ui, |ui| {
+            ui.strong("ES-DE");
+            ui.label("Local provider · no credentials required · discovered only when this page is opened.");
+            match self.app.artwork_media.es_de_media.state() {
+                crate::es_de_media_state::EsDeProviderState::NotStarted => {
+                    ui.label("Not configured");
+                }
+                crate::es_de_media_state::EsDeProviderState::Loading => {
+                    ui.label("Checking ES-DE…");
+                }
+                crate::es_de_media_state::EsDeProviderState::Ready(snapshot) => {
+                    let entries: usize = snapshot.indexes.iter().map(|index| index.entries.len()).sum();
+                    ui.label(format!("Ready · {entries} indexed artwork/media entries"));
+                    ui.label(format!("Generation: {} · provenance: {}", snapshot.generation, snapshot.root.display()));
+                }
+                crate::es_de_media_state::EsDeProviderState::Error(error) => {
+                    ui.label("Unavailable");
+                    ui.weak(error);
+                }
+            }
+            if ui.button("Refresh ES-DE status").clicked() {
+                self.app.artwork_media.es_de_media.refresh(context.clone());
+            }
+        });
+
+        if self.app.romm_ui.snapshot.is_none() && self.app.romm_ui.operation.is_none() {
+            self.app.start_romm_status_load(context.clone());
+        }
+        self.show_native_romm_provider(ui, &context);
+
+        crate::ui::components::card(ui, |ui| {
+            let state = &self.app.screenscraper_page;
+            ui.strong("ScreenScraper");
+            ui.label("Optional metadata provider · credentials required for lookup · identity remains independent.");
+            ui.label(format!("Status: {} · configured: {}", state.status().label(), if state.is_configured() { "yes" } else { "no" }));
+            if let Some(timestamp) = state.last_success_unix_seconds() {
+                ui.label(format!("Last successful lookup: session timestamp {timestamp}"));
+            }
+            if let Some(error) = state.last_error() {
+                ui.weak(error);
+            }
+            ui.collapsing("Set up ScreenScraper", |ui| {
+                crate::screenscraper_page::show_screen_scraper_settings(
+                    ui,
+                    &mut self.app.screenscraper_page,
+                    self.app.screenscraper_enrichment.is_running(),
+                );
+            });
+        });
+        });
+
+        self.observe_provider_activity(activity);
+        self.observe_metadata_activity(activity);
+    }
+
+    /// One status overview over existing source/provider owners. It does not
+    /// configure anything itself; every action opens the canonical setup page.
+    pub(super) fn show_sources_providers_overview(&mut self, ui: &mut egui::Ui) -> Option<Route> {
+        use super::sources_providers::{
+            HubAction, ProviderCard, SourceGroup, SourceNature, SourceStatus,
+        };
+
+        crate::ui::components::card(ui, |ui| {
+            ui.strong("Your RomM library");
+            ui.label("Browse games on your RomM server. Read only — no downloads or changes.");
+            if ui.button("Browse RomM library").clicked() {
+                self.open_native_romm();
+            }
+        });
+        ui.add_space(8.0);
+
+        let mut cards = Vec::new();
+        let dat = self
+            .app
+            .sources_ui
+            .dat_sources_page
+            .as_ref()
+            .map(|page| page.view());
+        let mut dat_advanced = Vec::new();
+        let dat_status = if let Some(view) = dat.as_ref() {
+            dat_advanced.push(format!("validated_sources={}", view.rows.len()));
+            dat_advanced.push("provider_id=dat-sources".into());
+            dat_advanced.extend(view.rows.iter().map(|row| {
+                format!(
+                    "{} · {} · {:?}{}",
+                    row.display_name,
+                    row.path,
+                    row.health_state,
+                    if row.health_stale {
+                        " · stale validation"
+                    } else {
+                        ""
+                    }
+                )
+            }));
+            dat_advanced.extend(view.managed_rows.iter().map(|row| {
+                format!(
+                    "{} · configured={} · installed={} · status={:?}",
+                    row.source_label, row.configured, row.installed, row.status
+                )
+            }));
+            let enabled = view
+                .rows
+                .iter()
+                .filter(|row| row.enabled)
+                .collect::<Vec<_>>();
+            if view.rows.is_empty() && !view.managed_rows.iter().any(|row| row.installed) {
+                SourceStatus::NeedsSetup
+            } else if !enabled.is_empty()
+                && enabled.iter().all(|row| {
+                    row.health_state == archivefs_core::dat::sources::DatHealthState::Unreadable
+                        || row.health_state == archivefs_core::dat::sources::DatHealthState::Invalid
+                })
+            {
+                SourceStatus::Problem
+            } else if enabled.iter().any(|row| {
+                row.health_state == archivefs_core::dat::sources::DatHealthState::Unreadable
+                    || row.health_state == archivefs_core::dat::sources::DatHealthState::Invalid
+            }) {
+                SourceStatus::NeedsAttention
+            } else if enabled.iter().any(|row| row.health_stale) {
+                SourceStatus::Stale
+            } else if enabled.iter().any(|row| {
+                row.health_state == archivefs_core::dat::sources::DatHealthState::Valid
+                    || row.health_state
+                        == archivefs_core::dat::sources::DatHealthState::ValidWithWarnings
+            }) || view.managed_rows.iter().any(|row| row.installed)
+            {
+                SourceStatus::Ready
+            } else if !view.rows.is_empty() && enabled.is_empty() {
+                SourceStatus::Disabled
+            } else {
+                SourceStatus::NotChecked
+            }
+        } else {
+            dat_advanced.push("The DAT registry has not been opened in this session.".into());
+            SourceStatus::NotChecked
+        };
+        let dat_reason = match dat_status {
+            SourceStatus::NeedsSetup => "No DAT source is configured. Game identity verification needs a trusted DAT source.".into(),
+            SourceStatus::Problem => "A DAT source cannot currently be read or validated. Review its details.".into(),
+            SourceStatus::Stale => "A DAT source changed since validation. Refresh its validation.".into(),
+            SourceStatus::Disabled => "Configured DAT sources are disabled. Enable one to use it for verification.".into(),
+            SourceStatus::Ready => "A usable DAT source is available for game identity and verification.".into(),
+            _ => "DAT status has not been checked here. Open DAT Sources to review the registry.".into(),
+        };
+        cards.push(ProviderCard {
+            id: "dat-sources",
+            group: SourceGroup::Identity,
+            name: "DAT sources".into(),
+            purpose: "Game identity and verification against trusted release data.".into(),
+            status: dat_status,
+            reason: dat_reason,
+            nature: SourceNature::Local,
+            action: Some("Manage DAT sources"),
+            target: Some(HubAction::DatSources),
+            advanced: dat_advanced,
+        });
+
+        let configured_roots = self
+            .app
+            .gui_config
+            .source_roots()
+            .ok()
+            .unwrap_or_default()
+            .to_vec();
+        let snapshot = self.app.database_state.snapshot();
+        let source_state = crate::source_state::merge_configured_sources(
+            &configured_roots,
+            snapshot.map(|snapshot| snapshot.source_views.as_slice()),
+        );
+        let roots = source_state
+            .sources
+            .iter()
+            .map(|source| source.path.display().to_string())
+            .collect::<Vec<_>>();
+        let enabled_sources = source_state
+            .sources
+            .iter()
+            .filter(|source| source.enabled)
+            .collect::<Vec<_>>();
+        // Folder availability alone is not catalogue health: a folder that is
+        // reachable can still need a reviewed rebind, a scan, or a complete scan
+        // before EmuWiz can trust what it knows about it. Read the backend's own
+        // source health so this card never says Ready while any of that is open.
+        let health_overall = crate::catalogue_health_ui::Overall::from_rows(
+            &crate::catalogue_health_ui::project_rows(
+                &source_state.sources,
+                snapshot
+                    .map(|snapshot| snapshot.source_health.as_slice())
+                    .unwrap_or(&[]),
+            ),
+        );
+        let health_attention = crate::catalogue_health_ui::attention_summary(&health_overall);
+        let local_status = if source_state.sources.is_empty() {
+            SourceStatus::NeedsSetup
+        } else if enabled_sources.is_empty() {
+            SourceStatus::Disabled
+        } else if enabled_sources
+            .iter()
+            .all(|source| source.availability == SourceAvailability::Available)
+        {
+            if health_attention.is_some() {
+                SourceStatus::NeedsAttention
+            } else if health_overall.unknown > 0 {
+                SourceStatus::NotChecked
+            } else {
+                SourceStatus::Ready
+            }
+        } else if enabled_sources
+            .iter()
+            .any(|source| source.availability == SourceAvailability::ScanFailed)
+        {
+            SourceStatus::NeedsAttention
+        } else {
+            SourceStatus::Unavailable
+        };
+        cards.push(ProviderCard {
+            id: "local-game-folders", group: SourceGroup::Local, name: "Game folders".into(),
+            purpose: "Find games stored in folders you choose.".into(), status: local_status,
+            reason: match local_status {
+                SourceStatus::NeedsSetup => "No game folders are configured. Browsing remains available, but no local games are indexed yet.".into(),
+                SourceStatus::Disabled => "Configured game folders are disabled.".into(),
+                SourceStatus::Ready => format!("{} configured folder(s) are available and up to date.", enabled_sources.len()),
+                SourceStatus::NotChecked => format!("{} configured folder(s) are available; their catalogue health has not been read yet.", enabled_sources.len()),
+                SourceStatus::NeedsAttention => health_attention.clone().unwrap_or_else(|| "A recent scan needs review.".into()),
+                _ => "At least one configured path is missing or cannot be read.".into(),
+            }, nature: SourceNature::Local, action: Some("Manage local folders"), target: Some(HubAction::LocalSources), advanced: roots,
+        });
+
+        cards.push(ProviderCard {
+            id: "local-artwork",
+            group: SourceGroup::Artwork,
+            name: "Local artwork & metadata".into(),
+            purpose: "Reuse media and metadata already present in your local collection.".into(),
+            status: SourceStatus::NotChecked,
+            reason: "Optional local data; Browse & Play still works if artwork is missing.".into(),
+            nature: SourceNature::Local,
+            action: Some("Open Artwork & Metadata"),
+            target: Some(HubAction::ArtworkProviders),
+            advanced: vec!["Local/project identity evidence remains authoritative.".into()],
+        });
+        cards.push(ProviderCard {
+            id: "bundled-assets", group: SourceGroup::Local, name: "Bundled interface assets".into(),
+            purpose: "Built-in EmuWiz icons and interface artwork; not a game identity or metadata provider.".into(),
+            status: SourceStatus::Ready, reason: "Available offline.".into(), nature: SourceNature::Bundled,
+            action: None, target: None, advanced: vec!["Bundled with the application.".into()],
+        });
+
+        let es_de_state = self.app.artwork_media.es_de_media.state();
+        let (es_de_status, es_de_reason, es_de_advanced) = match es_de_state {
+            crate::es_de_media_state::EsDeProviderState::NotStarted => (SourceStatus::NotChecked, "ES-DE has not been checked yet. Open Artwork & Metadata to inspect the local ES-DE folder.".into(), vec!["Expected local folder: ~/ES-DE".into()]),
+            crate::es_de_media_state::EsDeProviderState::Loading => (SourceStatus::NotChecked, "Checking local ES-DE metadata and media references.".into(), Vec::new()),
+            crate::es_de_media_state::EsDeProviderState::Ready(snapshot) => {
+                let count: usize = snapshot.indexes.iter().map(|index| index.entries.len()).sum();
+                (if snapshot.warnings.is_empty() { SourceStatus::Ready } else { SourceStatus::NeedsAttention }, format!("Local ES-DE data contains {count} indexed artwork/media entries."), vec![format!("root={}", snapshot.root.display()), format!("generation={}", snapshot.generation), format!("warnings={:?}", snapshot.warnings)])
+            }
+            crate::es_de_media_state::EsDeProviderState::Error(error) => {
+                let status = if error.starts_with("ES-DE root is not configured") { SourceStatus::NeedsSetup } else { SourceStatus::Unavailable };
+                let reason = if status == SourceStatus::NeedsSetup {
+                    "The local ES-DE folder was not found. Check the path in your ES-DE setup.".into()
+                } else {
+                    "ES-DE data could not be read. Review the reason under Advanced details.".into()
+                };
+                (status, reason, vec![format!("error={error}")])
+            }
+        };
+        cards.push(ProviderCard {
+            id: "es-de",
+            group: SourceGroup::External,
+            name: "ES-DE".into(),
+            purpose: "Reuse local ES-DE metadata and artwork references where supported.".into(),
+            status: es_de_status,
+            reason: es_de_reason,
+            nature: SourceNature::Local,
+            action: Some("Check ES-DE in Artwork & Metadata"),
+            target: Some(HubAction::ArtworkProviders),
+            advanced: es_de_advanced,
+        });
+
+        let scraper = &self.app.screenscraper_page;
+        let scraper_status = match scraper.status() {
+            crate::screenscraper_page::ScreenScraperUiStatus::Ready => SourceStatus::Ready,
+            crate::screenscraper_page::ScreenScraperUiStatus::Testing => SourceStatus::NotChecked,
+            crate::screenscraper_page::ScreenScraperUiStatus::NotConfigured => {
+                SourceStatus::NeedsSetup
+            }
+            crate::screenscraper_page::ScreenScraperUiStatus::AuthenticationError
+            | crate::screenscraper_page::ScreenScraperUiStatus::QuotaExhausted
+            | crate::screenscraper_page::ScreenScraperUiStatus::TemporarilyUnavailable
+            | crate::screenscraper_page::ScreenScraperUiStatus::Offline => {
+                SourceStatus::NeedsAttention
+            }
+        };
+        let scraper_reason = if scraper_status == SourceStatus::NeedsSetup {
+            super::sources_providers::screenscraper_missing_credentials_reason(
+                !scraper.developer_id.trim().is_empty(),
+                !scraper.developer_password.trim().is_empty(),
+            )
+        } else {
+            match scraper.status() {
+                crate::screenscraper_page::ScreenScraperUiStatus::Ready => "Optional metadata lookup is ready when you choose to use it.".into(),
+                crate::screenscraper_page::ScreenScraperUiStatus::Testing => "Testing the ScreenScraper connection.".into(),
+                crate::screenscraper_page::ScreenScraperUiStatus::AuthenticationError => "ScreenScraper rejected the configured credentials. Review the developer and optional user details.".into(),
+                crate::screenscraper_page::ScreenScraperUiStatus::QuotaExhausted => "ScreenScraper has reached its request limit. Try again after the quota resets.".into(),
+                crate::screenscraper_page::ScreenScraperUiStatus::TemporarilyUnavailable => "ScreenScraper returned a temporary or invalid response. Try again later.".into(),
+                crate::screenscraper_page::ScreenScraperUiStatus::Offline => "ScreenScraper could not be reached. EmuWiz remains usable offline.".into(),
+                crate::screenscraper_page::ScreenScraperUiStatus::NotConfigured => unreachable!(),
+            }
+        };
+        cards.push(ProviderCard {
+            id: "screenscraper",
+            group: SourceGroup::Artwork,
+            name: "ScreenScraper".into(),
+            purpose: "Optional online metadata candidates; EmuWiz identity remains authoritative."
+                .into(),
+            status: scraper_status,
+            reason: scraper_reason,
+            nature: SourceNature::Remote,
+            action: Some("Configure ScreenScraper"),
+            target: Some(HubAction::ArtworkProviders),
+            advanced: vec![
+                "provider_id=screenscraper".into(),
+                "endpoint=https://www.screenscraper.fr/api2".into(),
+                format!("configured={}", scraper.is_configured()),
+                format!("last_success={:?}", scraper.last_success_unix_seconds()),
+                format!("raw_error={:?}", scraper.last_error()),
+            ],
+        });
+
+        let romm = crate::romm_source::build_card_view(
+            self.app.romm_ui.snapshot.as_deref(),
+            self.app
+                .romm_ui
+                .operation
+                .as_ref()
+                .map(|running| &running.operation),
+            self.app
+                .romm_ui
+                .operation
+                .as_ref()
+                .is_some_and(|running| running.cancellation_requested),
+        );
+        let romm_status = match romm.state_label.as_str() {
+            "Ready" | "Ready (offline)" => SourceStatus::Ready,
+            "Stale" => SourceStatus::Stale,
+            "Disabled" => SourceStatus::Disabled,
+            "Not configured" => SourceStatus::NeedsSetup,
+            "Error" => SourceStatus::Problem,
+            "Enabled, nothing imported yet" => SourceStatus::NeedsAttention,
+            _ => SourceStatus::NotChecked,
+        };
+        let romm_reason = match romm.state_label.as_str() {
+            "Stale" if romm.offline_browsing => "Using cached data. Refresh recommended.".into(),
+            "Stale" => "RomM data is stale and may not be usable. Review the provider status.".into(),
+            "Ready (offline)" => "Using the imported snapshot. RomM is currently unavailable; cached browsing still works.".into(),
+            "Not configured" => "RomM address and read-only token are not configured. Configure them in Artwork & Metadata.".into(),
+            "Disabled" => "The RomM source is disabled. Enable it in RomM setup to refresh data.".into(),
+            "Enabled, nothing imported yet" => "RomM is configured. Connect in the browser to see its games; no import is needed.".into(),
+            "Error" => "RomM reported a problem. Review the provider details under Advanced.".into(),
+            _ => "Connect in the RomM browser to see your server's games. Cached snapshots remain available separately.".into(),
+        };
+        // Saved, unvalidated URLs and arbitrary legacy diagnostics are not display evidence.
+        let romm_advanced = vec![
+            "provider_id=romm".into(),
+            "Live browsing uses the existing RomM connection settings.".into(),
+        ];
+        cards.push(ProviderCard {
+            id: "romm",
+            group: SourceGroup::External,
+            name: "RomM".into(),
+            purpose: super::sources_providers::romm_purpose().into(),
+            status: romm_status,
+            reason: romm_reason,
+            nature: SourceNature::Remote,
+            action: Some("Browse RomM library"),
+            target: Some(HubAction::RommLibrary),
+            advanced: romm_advanced,
+        });
+
+        let route = match super::sources_providers::show(ui, &cards) {
+            Some(HubAction::LocalSources) => Some(Route::Section(Section::Sources)),
+            Some(HubAction::DatSources) => Some(Route::Section(Section::Dat)),
+            Some(HubAction::ArtworkProviders) => Some(Route::Section(Section::Artwork)),
+            Some(HubAction::RommLibrary) => {
+                self.open_native_romm();
+                None
+            }
+            None => None,
+        };
+        if self.native_romm.is_open() && self.app.romm_ui.config_draft.is_some() {
+            if let Some(request) = self.app.show_romm_configuration_window(ui.ctx()) {
+                self.app.handle_romm_config_request(ui.ctx(), request);
+            }
+        } else if self.native_romm.show(ui.ctx()) {
+            let draft = self.native_romm.settings_draft();
+            self.native_romm.settings_opened();
+            self.app.open_romm_configuration();
+            self.app.romm_ui.config_draft = Some(Box::new(draft));
+        }
+        route
+    }
+
+    fn open_native_romm(&mut self) {
+        self.native_romm.open(
+            self.app
+                .gui_config
+                .source_roots()
+                .map_or_else(|_| Vec::new(), |roots| roots.to_vec()),
+        );
+    }
+
+    fn show_native_romm_provider(&mut self, ui: &mut egui::Ui, context: &egui::Context) {
+        let view = crate::romm_source::build_card_view(
+            self.app.romm_ui.snapshot.as_deref(),
+            self.app
+                .romm_ui
+                .operation
+                .as_ref()
+                .map(|running| &running.operation),
+            self.app
+                .romm_ui
+                .operation
+                .as_ref()
+                .is_some_and(|running| running.cancellation_requested),
+        );
+        crate::ui::components::card(ui, |ui| {
+            ui.strong("RomM");
+            ui.label("Optional metadata/artwork provider · token file required when configured · read-only towards RomM.");
+            ui.label(format!("Status: {}", view.state_label));
+            if let Some(detail) = &view.state_detail {
+                ui.weak(detail);
+            }
+            for row in &view.summary_rows {
+                ui.label(format!("{}: {}", row.label, row.value));
+            }
+            if let Some(error) = &view.last_error {
+                ui.weak(error);
+            }
+            if ui.button("Configure RomM").clicked() {
+                self.app.open_romm_configuration();
+            }
+            if ui.button("Refresh RomM status").clicked() {
+                self.app.start_romm_status_load(context.clone());
+            }
+            if self.app.romm_ui.config_draft.is_some() {
+                ui.separator();
+                ui.strong("RomM setup");
+                let mut request = self.app.show_romm_configuration(ui);
+                request = self.app.show_romm_configuration_footer(ui).or(request);
+                if let Some(request) = request {
+                    self.app.handle_romm_config_request(context, request);
+                }
+            }
+        });
+    }
+
+    fn observe_metadata_activity(&mut self, activity: &mut Activity) {
+        let running = self.app.screenscraper_enrichment.is_running();
+        if running && self.metadata_job.is_none() {
+            let job = activity.queue("Refreshing metadata", self.selected_route(), false);
+            activity.start(job);
+            self.metadata_job = Some(job);
+        } else if !running && let Some(job) = self.metadata_job.take() {
+            let feedback = self.app.feedback.as_ref();
+            let error = feedback
+                .filter(|feedback| !feedback.succeeded)
+                .map(|feedback| feedback.message.clone());
+            activity.finish(
+                job,
+                feedback.map_or_else(
+                    || "Metadata candidates are ready to review.".into(),
+                    |feedback| feedback.message.clone(),
+                ),
+                error,
+            );
+        }
+    }
+
+    pub(super) fn observe_source_activity(&mut self, activity: &mut Activity) {
+        let running = self
+            .app
+            .sources_ui
+            .source_action
+            .as_ref()
+            .map(|running| running.action.clone());
+        if self.source_job.is_none()
+            && let Some(action) = running.clone()
+        {
+            let title = match action {
+                crate::platform_source_actions::SourceAction::ScanOne(_)
+                | crate::platform_source_actions::SourceAction::ScanAll => "Scanning source",
+                crate::platform_source_actions::SourceAction::Add(_) => "Adding source",
+                crate::platform_source_actions::SourceAction::Remove { .. } => "Removing source",
+                _ => "Updating source",
+            };
+            let job = activity.queue(
+                title,
+                Route::Section(super::routes::Section::Sources),
+                false,
+            );
+            activity.start(job);
+            self.source_job = Some(job);
+        } else if running.is_none()
+            && let Some(job) = self.source_job.take()
+        {
+            let feedback = self.app.feedback.as_ref();
+            let error = feedback
+                .filter(|feedback| !feedback.succeeded)
+                .map(|feedback| feedback.message.clone());
+            let summary = feedback.map_or_else(
+                || "The source operation finished safely.".into(),
+                |feedback| feedback.message.clone(),
+            );
+            if error.is_none() {
+                self.source_library_reload = true;
+            }
+            activity.finish(job, summary, error);
+        }
+    }
+
+    fn observe_provider_activity(&mut self, activity: &mut Activity) {
+        let loading = matches!(
+            self.app.artwork_media.es_de_media.state(),
+            crate::es_de_media_state::EsDeProviderState::Loading
+        ) || matches!(
+            self.app.artwork_media.launchbox_local_media.state(),
+            crate::launchbox_local_state::LaunchBoxLocalState::Loading
+        );
+        if loading && self.provider_job.is_none() {
+            let job = activity.queue(
+                "Refreshing artwork providers",
+                Route::Section(super::routes::Section::Artwork),
+                false,
+            );
+            activity.start(job);
+            self.provider_job = Some(job);
+        } else if !loading && let Some(job) = self.provider_job.take() {
+            let errors = [
+                self.app.artwork_media.es_de_media.error(),
+                self.app.artwork_media.launchbox_local_media.error(),
+            ]
+            .into_iter()
+            .flatten()
+            .collect::<Vec<_>>();
+            activity.finish(
+                job,
+                if errors.is_empty() {
+                    "Local artwork providers are ready.".into()
+                } else {
+                    "Provider refresh finished with items needing attention.".into()
+                },
+                (!errors.is_empty()).then(|| errors.join("\n")),
+            );
+            self.artwork_reload = true;
+        }
+    }
+
+    fn poll_dat_activity(&mut self, context: &egui::Context, activity: &mut Activity) {
+        if let Some(page) = self.app.sources_ui.dat_sources_page.as_mut() {
+            if page.poll() || page.is_busy() {
+                context.request_repaint();
+            }
+            let generation = page.identity_enrichment_generation();
+            if generation != self.dat_identity_seen {
+                self.dat_identity_seen = generation;
+                self.dat_identity_reload = true;
+            }
+        }
+        // A confirmed Check My Games verification saved new DAT evidence:
+        // Browse & Play and Game Details must not keep showing "Not checked".
+        let completions = self
+            .app
+            .sources_ui
+            .dat_sources_ui
+            .simple
+            .verification_completions();
+        if completions != self.dat_verification_seen {
+            self.dat_verification_seen = completions;
+            self.dat_identity_reload = true;
+        }
+        self.observe_dat_activity(activity);
+    }
+
+    fn observe_dat_activity(&mut self, activity: &mut Activity) {
+        let state = self
+            .app
+            .sources_ui
+            .dat_sources_page
+            .as_ref()
+            .and_then(crate::dat_sources_page::DatSourcesPageState::background_activity);
+        let error = self
+            .app
+            .sources_ui
+            .dat_sources_page
+            .as_ref()
+            .and_then(crate::dat_sources_page::DatSourcesPageState::background_error);
+        observe_dat_activity_state(activity, &mut self.dat_job, state, error);
+    }
+
+    fn handle_cheat_action(
+        &mut self,
+        context: &egui::Context,
+        action: crate::CheatWorkflowAction,
+    ) -> Option<Route> {
+        use crate::CheatWorkflowAction as A;
+        match action {
+            A::ChooseArchive | A::OpenLibrary => {
+                return Some(Route::Section(super::routes::Section::Games));
+            }
+            A::ChooseCheatEmulator(target) => self.app.choose_cheat_emulator(context, Some(target)),
+            A::ClearCheatEmulatorChoice => self.app.choose_cheat_emulator(context, None),
+            A::RescanProfiles => self.app.start_retroarch_profile_scan(context.clone()),
+            A::RescanDuckStation => self.app.refresh_duckstation_resolution(),
+            A::PreviewDuckStationUndo(path) => self.app.start_duckstation_undo_preview(path),
+            A::ConfirmDuckStationUndo => self.app.confirm_duckstation_undo(context.clone()),
+            A::CancelDuckStationUndo => {
+                if let Some(workflow) = self.app.cheat_workflow.as_mut() {
+                    workflow.duckstation.undo = crate::NativeUndoState::Idle;
+                }
+            }
+            A::RefreshDuckStationHistory => self.app.refresh_duckstation_history(),
+            A::RescanPcsx2Profiles => self.app.start_pcsx2_profile_scan(context.clone()),
+            A::InspectPcsx2Profile => self.app.start_pcsx2_inventory(context.clone()),
+            A::FetchPcsx2GameHacking { force_refresh } => self
+                .app
+                .start_pcsx2_gamehacking_fetch(context.clone(), force_refresh),
+            A::ConfirmPcsx2GameHackingMatch { game_id } => self
+                .app
+                .confirm_pcsx2_gamehacking_match(context.clone(), game_id),
+            A::TogglePcsx2CheatSelected { id, selected } => {
+                self.app.update_pcsx2_cheat_selection(&id, selected);
+            }
+            A::InstallSelectedPcsx2 => self.app.start_pcsx2_install_preview(),
+            A::RescanDolphinProfiles => self.app.start_dolphin_profile_scan(context.clone()),
+            A::InspectDolphinProfile => self.app.start_dolphin_inventory(context.clone()),
+            A::InspectExistingLibrary => self
+                .app
+                .start_existing_retroarch_library_inspection(context.clone()),
+            A::RefreshSources => self.app.start_cheat_source_list(context.clone()),
+            A::ManageCatalogue => {
+                self.app
+                    .navigate_to_sources_tab(crate::navigation::SourcesTab::Cheats);
+                return Some(Route::Section(super::routes::Section::Sources));
+            }
+            A::UseCachedSnapshot => self.app.start_cheat_source_fetch(context.clone(), true),
+            A::ReviewApply => self.app.review_cheat_apply(),
+            A::ConfirmApply => self.app.start_cheat_apply(context.clone()),
+            A::CancelApply => {
+                if let Some(workflow) = self.app.cheat_workflow.as_mut() {
+                    workflow.transaction = crate::CheatTransactionState::Idle;
+                    workflow.transaction_notice = Some(
+                        "Installation cancelled before apply; no live emulator file was changed."
+                            .to_string(),
+                    );
+                }
+                self.app
+                    .history
+                    .record(crate::activity_history::HistoryEntry::new(
+                        crate::activity_history::ActivityAction::CheatInstall,
+                        self.app
+                            .cheat_workflow
+                            .as_ref()
+                            .map(|workflow| workflow.archive_path.clone()),
+                        crate::activity_history::ActivityOutcome::Cancelled,
+                        "Install cancelled before the write phase; nothing was changed.",
+                    ));
+            }
+            A::OpenApplyHistory => {
+                return Some(Route::Section(super::routes::Section::History));
+            }
+            A::MatchCandidates => self.app.start_cheat_candidate_match(context.clone()),
+            A::SelectCandidate(path) => self.app.apply_cheat_candidate_choice(&path),
+            A::ClearCandidateChoice => {
+                if let Some(workflow) = self.app.cheat_workflow.as_mut() {
+                    workflow.candidate_selection = None;
+                    workflow.candidate_load_error = None;
+                    workflow.preview = crate::CheatStepResource::NotLoaded;
+                    workflow.preview_request = None;
+                    workflow.transaction = crate::CheatTransactionState::Idle;
+                }
+            }
+            A::ToggleCheatSelected { index, selected } => {
+                self.app.update_cheat_selection(|selection| {
+                    selection.set_selected(index, selected);
+                })
+            }
+            A::ToggleCheatEnabled { index, enabled } => {
+                self.app.update_cheat_selection(|selection| {
+                    selection.set_enabled(index, enabled);
+                })
+            }
+            A::SelectAllCheats => self
+                .app
+                .update_cheat_selection(archivefs_core::patch_manager::CheatSelection::select_all),
+            A::ClearAllCheats => self
+                .app
+                .update_cheat_selection(archivefs_core::patch_manager::CheatSelection::clear_all),
+            A::BuildInstallPreview => self.app.start_generated_cheat_preview(context.clone()),
+            A::RollbackInstall => self.app.start_cheat_install_rollback(context.clone()),
+            A::FetchDolphinProvider { force_refresh } => self
+                .app
+                .start_dolphin_provider_fetch(context.clone(), force_refresh),
+            A::ToggleDolphinCodeSelected { index, selected } => {
+                self.app.update_dolphin_code_selection(|selection| {
+                    selection.set_selected(index, selected);
+                })
+            }
+            A::SelectAllDolphinCodes => self.app.update_dolphin_code_selection(
+                archivefs_core::patch_manager::DolphinProviderCodeSelection::select_all,
+            ),
+            A::ClearAllDolphinCodes => self.app.update_dolphin_code_selection(
+                archivefs_core::patch_manager::DolphinProviderCodeSelection::clear_all,
+            ),
+            A::BuildDolphinInstallPreview => self.app.start_dolphin_install_preview(),
+            A::RescanXeniaProfiles => self.app.start_xenia_profile_scan(),
+            A::FetchXeniaProvider { force_refresh } => self
+                .app
+                .start_xenia_provider_fetch(context.clone(), force_refresh),
+            A::SelectXeniaCandidate(index) => {
+                if let Some(workflow) = self.app.cheat_workflow.as_mut() {
+                    workflow.xenia_selected_candidate_index = Some(index);
+                    workflow.xenia_selection = None;
+                    workflow.xenia_destination_error = None;
+                    workflow.preview = crate::CheatStepResource::NotLoaded;
+                    workflow.preview_request = None;
+                    workflow.transaction = crate::CheatTransactionState::Idle;
+                }
+            }
+            A::ClearXeniaCandidateChoice => {
+                if let Some(workflow) = self.app.cheat_workflow.as_mut() {
+                    workflow.xenia_selected_candidate_index = None;
+                    workflow.xenia_selection = None;
+                    workflow.xenia_destination_error = None;
+                    workflow.preview = crate::CheatStepResource::NotLoaded;
+                    workflow.preview_request = None;
+                    workflow.transaction = crate::CheatTransactionState::Idle;
+                }
+            }
+            A::AcknowledgeXeniaPartialVerification(acknowledged) => {
+                if let Some(selection) = self
+                    .app
+                    .cheat_workflow
+                    .as_mut()
+                    .and_then(|workflow| workflow.xenia_selection.as_mut())
+                {
+                    selection.selection.partial_verification_acknowledged = acknowledged;
+                }
+            }
+            A::ToggleXeniaPatchSelected { index, selected } => {
+                self.app.update_xenia_patch_selection(|selection| {
+                    selection.set_selected(index, selected);
+                })
+            }
+            A::SelectAllXeniaPatches => self.app.update_xenia_patch_selection(
+                archivefs_core::patch_manager::XeniaPatchSelection::select_all,
+            ),
+            A::ClearAllXeniaPatches => self.app.update_xenia_patch_selection(
+                archivefs_core::patch_manager::XeniaPatchSelection::clear_all,
+            ),
+            A::BuildXeniaInstallPreview => self.app.start_xenia_install_preview(),
+            A::ChooseDolphinProfile(profile) => {
+                if let Some(workflow) = self.app.cheat_workflow.as_mut() {
+                    workflow.dolphin_profile_choice = Some(profile);
+                }
+                self.app.confirm_dolphin_profile_choice();
+            }
+            A::ChooseXeniaProfile(profile) => {
+                if let Some(workflow) = self.app.cheat_workflow.as_mut() {
+                    workflow.xenia_profile_choice = Some(profile);
+                }
+                self.app.confirm_xenia_profile_choice();
+            }
+            A::InstallSelectedDolphin => self.app.start_beginner_install_dolphin(),
+            A::InstallSelectedXenia => self.app.start_beginner_install_xenia(),
+            A::ToggleDolphinShowExactChanges(show) => {
+                if let Some(workflow) = self.app.cheat_workflow.as_mut() {
+                    workflow.dolphin_show_exact_changes = show;
+                }
+            }
+            A::ToggleXeniaShowExactChanges(show) => {
+                if let Some(workflow) = self.app.cheat_workflow.as_mut() {
+                    workflow.xenia_show_exact_changes = show;
+                }
+            }
+            A::ToggleDolphinDetailsOpen(open) => {
+                if let Some(workflow) = self.app.cheat_workflow.as_mut() {
+                    workflow.dolphin_details_open = open;
+                }
+            }
+            A::ToggleXeniaDetailsOpen(open) => {
+                if let Some(workflow) = self.app.cheat_workflow.as_mut() {
+                    workflow.xenia_details_open = open;
+                }
+            }
+            A::FetchGameCubeGameHacking { force_refresh } => self
+                .app
+                .start_gamecube_gamehacking_fetch(context.clone(), force_refresh),
+            A::ConfirmGameCubeGameHackingMatch { game_id } => self
+                .app
+                .confirm_gamecube_gamehacking_match(context.clone(), game_id),
+            A::ToggleGameCubeGameHackingCheatSelected { index, selected } => self
+                .app
+                .update_gamecube_gamehacking_cheat_selection(index, selected),
+            A::InstallSelectedGameCubeGameHacking => {
+                self.app.start_gamecube_gamehacking_install_preview();
+            }
+            A::RemoveSelectedGameCubeGameHacking => {
+                self.app.start_gamecube_gamehacking_removal_preview();
+            }
+            A::OpenBrowserImport(platform) => self.app.open_browser_import(platform),
+            A::CloseBrowserImport => self.app.close_browser_import(),
+            A::OpenGameHackingPageInBrowser => self.app.open_gamehacking_page_in_browser(),
+            A::CopyGameHackingPageUrl => self.app.copy_gamehacking_page_url(),
+            A::ImportBrowserSavedFile => self.app.import_browser_saved_file(context.clone()),
+            A::ToggleBrowserImportPaste(open) => {
+                if let Some(state) = self
+                    .app
+                    .cheat_workflow
+                    .as_mut()
+                    .and_then(|workflow| workflow.browser_import.as_mut())
+                {
+                    state.paste_open = open;
+                }
+            }
+            A::ImportBrowserPastedText => self.app.import_browser_pasted_text(context.clone()),
+            A::ImportBrowserClipboard => self.app.import_browser_clipboard(context.clone()),
+            A::ChooseBrowserImportKind(kind) => {
+                if let Some(state) = self
+                    .app
+                    .cheat_workflow
+                    .as_mut()
+                    .and_then(|workflow| workflow.browser_import.as_mut())
+                {
+                    state.kind = kind;
+                }
+            }
+            A::FetchBsFreeGameCube { search_title } => self
+                .app
+                .start_bsfree_gamecube_search(context.clone(), search_title),
+            A::ConfirmBsFreeGameCubeMatch { upstream_uid } => self
+                .app
+                .start_bsfree_gamecube_confirm(context.clone(), upstream_uid),
+            A::ToggleBsFreeGameCubeCheatSelected { index, selected } => self
+                .app
+                .update_bsfree_gamecube_cheat_selection(index, selected),
+            A::SelectAllBsFreeGameCubeCheats => {
+                self.app.update_bsfree_gamecube_cheat_selection_all(true)
+            }
+            A::ClearAllBsFreeGameCubeCheats => {
+                self.app.update_bsfree_gamecube_cheat_selection_all(false)
+            }
+            A::InstallSelectedBsFreeGameCube => {
+                self.app.start_bsfree_gamecube_install_preview();
+            }
+            A::FetchBsFreeWii { search_title } => self
+                .app
+                .start_bsfree_wii_search(context.clone(), search_title),
+            A::ConfirmBsFreeWiiMatch { upstream_uid } => self
+                .app
+                .start_bsfree_wii_confirm(context.clone(), upstream_uid),
+            A::ToggleBsFreeWiiCheatSelected { index, selected } => {
+                self.app.update_bsfree_wii_cheat_selection(index, selected)
+            }
+            A::SelectAllBsFreeWiiCheats => {
+                self.app.update_bsfree_wii_cheat_selection_all(true);
+            }
+            A::ClearAllBsFreeWiiCheats => {
+                self.app.update_bsfree_wii_cheat_selection_all(false);
+            }
+            A::InstallSelectedBsFreeWii => self.app.start_bsfree_wii_install_preview(),
+        }
+        None
+    }
+
+    fn observe_cheat_activity(&mut self, activity: &mut Activity) {
+        let state = cheat_activity_state(self.app.cheat_workflow.as_ref());
+        let error = self
+            .app
+            .cheat_workflow
+            .as_ref()
+            .and_then(|workflow| workflow.transaction_notice.clone())
+            .filter(|notice| notice.to_ascii_lowercase().contains("failed"));
+        observe_cheat_activity_state(activity, &mut self.cheat_job, state, error);
+    }
+
+    fn select(&mut self, path: &Path) {
+        if self.selected.as_deref() != Some(path) {
+            self.selected = Some(path.to_path_buf());
+            self.app.archive_context.select_only(path.to_path_buf());
+        }
+    }
+
+    /// Recheck from the compact card without leaving the page. A check that is
+    /// already running is never duplicated; a new one gets a new generation, so
+    /// a late result for an older check or another game is dropped by the
+    /// selected-evidence pipeline.
+    fn recheck_readiness_in_place(&mut self, context: &egui::Context) {
+        let Some(path) = self.selected.clone() else {
+            return;
+        };
+        let running = matches!(
+            &self.app.selected_evidence_ui.selected_evidence,
+            selected_evidence_page::SelectedEvidenceState::Loading { path: current, .. }
+                if current == &path
+        );
+        if !running {
+            self.app.launch_standalone.clear_cue_review();
+            self.app.start_selected_evidence_load(context.clone(), path);
+        }
+    }
+
+    fn start_launch_readiness(&mut self, context: &egui::Context) {
+        self.start_launch_readiness_with(context, true);
+    }
+
+    /// `checksum` also starts the deferred whole-file checksum pass.
+    fn start_launch_readiness_with(&mut self, context: &egui::Context, checksum: bool) {
+        let Some(path) = self.selected.clone() else {
+            return;
+        };
+        let stale = match &self.app.selected_evidence_ui.selected_evidence {
+            selected_evidence_page::SelectedEvidenceState::Loading { path: current, .. } => {
+                current != &path
+            }
+            selected_evidence_page::SelectedEvidenceState::Ready { report, .. } => {
+                report.path != path
+            }
+            selected_evidence_page::SelectedEvidenceState::Idle => true,
+            selected_evidence_page::SelectedEvidenceState::Error { path: current, .. } => {
+                current != &path
+            }
+        };
+        if stale {
+            self.app.start_selected_evidence_load(context.clone(), path);
+        }
+        if checksum {
+            self.app.maybe_start_selected_evidence_enrichment(context);
+        }
+        if matches!(
+            self.app.emulator_readiness.retroarch_profiles,
+            RetroArchProfilesState::NotScanned
+        ) {
+            self.app.start_retroarch_profile_scan(context.clone());
+        }
+        if matches!(
+            self.app.emulator_readiness.dolphin_local_profiles,
+            DolphinLocalProfilesState::NotScanned
+        ) {
+            self.app.start_dolphin_local_profile_scan(context.clone());
+        }
+        if matches!(
+            self.app.emulator_readiness.pcsx2_launch_profiles,
+            Pcsx2LaunchProfilesState::NotScanned
+        ) {
+            self.app.start_pcsx2_launch_profile_scan(context.clone());
+        }
+        if matches!(
+            self.app.emulator_readiness.pcsx2_firmware_evidence,
+            Pcsx2FirmwareEvidenceState::NotLoaded
+        ) {
+            self.app.start_pcsx2_firmware_evidence_load(context.clone());
+        }
+        if matches!(
+            self.app.emulator_readiness.flycast_profiles,
+            FlycastProfilesState::NotScanned
+        ) {
+            self.app.start_flycast_profile_scan(context.clone());
+        }
+        if matches!(
+            self.app.selected_evidence_ui.scummvm_readiness,
+            identity_sources_page::ScummVmReadinessState::NotChecked
+        ) {
+            self.app.start_scummvm_readiness_check(context.clone());
+        }
+    }
+
+    /// Test seam: the launch plan the page is showing, as text, so a
+    /// headless journey can say which readiness gate it stopped at.
+    #[cfg(test)]
+    pub(super) fn launch_plan_for_diagnosis(&self) -> String {
+        match self.launch_input() {
+            launch_readiness_page::LaunchReadinessInput::Plan { plan, .. } => {
+                format!("{plan:#?}")
+            }
+            launch_readiness_page::LaunchReadinessInput::EvidenceNotLoaded => {
+                "EvidenceNotLoaded".into()
+            }
+            launch_readiness_page::LaunchReadinessInput::RetroArchNotScanned => {
+                "RetroArchNotScanned".into()
+            }
+            launch_readiness_page::LaunchReadinessInput::IdentityUnknown => {
+                "IdentityUnknown".into()
+            }
+            launch_readiness_page::LaunchReadinessInput::DiscFilesUnresolved(_) => {
+                "DiscFilesUnresolved".into()
+            }
+            launch_readiness_page::LaunchReadinessInput::InspectionIncomplete => {
+                "InspectionIncomplete".into()
+            }
+            launch_readiness_page::LaunchReadinessInput::IdentityConflicting => {
+                "IdentityConflicting".into()
+            }
+            launch_readiness_page::LaunchReadinessInput::AtariSt(_) => "AtariSt".into(),
+        }
+    }
+
+    fn launch_input(&self) -> launch_readiness_page::LaunchReadinessInput {
+        let live = match &self.app.state {
+            LoadState::Ready(data) => Some(data.as_ref()),
+            LoadState::Loading { previous, .. } => previous.as_deref(),
+            LoadState::Error(_) => None,
+        };
+        self.app.build_launch_readiness_input(live)
+    }
+
+    fn launch_active(&self) -> bool {
+        self.app.launch_retroarch.is_active()
+            || self.app.launch_dolphin.is_active()
+            || self.app.launch_pcsx2.is_active()
+            || self.app.launch_standalone.is_active()
+            || self.app.launch_amiga_whdload.is_active()
+    }
+
+    fn launch_failure(&self) -> Option<String> {
+        match self.launch_kind {
+            Some(LaunchKind::RetroArch) => self.app.launch_retroarch.failure_detail(),
+            Some(LaunchKind::Dolphin) => self.app.launch_dolphin.failure_detail(),
+            Some(LaunchKind::Pcsx2) => self.app.launch_pcsx2.failure_detail(),
+            Some(LaunchKind::Standalone) => self.app.launch_standalone.failure_detail(),
+            Some(LaunchKind::AmigaWhdLoad) => self.app.launch_amiga_whdload.failure_detail(),
+            None => None,
+        }
+    }
+
+    fn active_launch_kind(&self) -> Option<LaunchKind> {
+        if self.app.launch_retroarch.is_active() {
+            Some(LaunchKind::RetroArch)
+        } else if self.app.launch_dolphin.is_active() {
+            Some(LaunchKind::Dolphin)
+        } else if self.app.launch_pcsx2.is_active() {
+            Some(LaunchKind::Pcsx2)
+        } else if self.app.launch_standalone.is_active() {
+            Some(LaunchKind::Standalone)
+        } else if self.app.launch_amiga_whdload.is_active() {
+            Some(LaunchKind::AmigaWhdLoad)
+        } else {
+            None
+        }
+    }
+
+    fn readiness_error(&self) -> Option<String> {
+        match &self.app.selected_evidence_ui.selected_evidence {
+            selected_evidence_page::SelectedEvidenceState::Error { path, message, .. }
+                if self.selected.as_deref() == Some(path.as_path()) =>
+            {
+                Some(message.clone())
+            }
+            _ => None,
+        }
+    }
+
+    fn selected_route(&self) -> Route {
+        self.selected_game
+            .map_or(Route::Section(super::routes::Section::Launch), |game| {
+                Route::Task {
+                    section: super::routes::Section::Launch,
+                    game,
+                }
+            })
+    }
+
+    #[cfg(test)]
+    pub(super) fn selected_path(&self) -> Option<&Path> {
+        self.selected.as_deref()
+    }
+}
+
+#[cfg(test)]
+mod source_presentation_tests {
+    use super::*;
+
+    #[test]
+    fn source_states_have_plain_language_labels() {
+        assert_eq!(
+            source_availability_label(SourceAvailability::Available),
+            "Available"
+        );
+        assert_eq!(
+            source_availability_label(SourceAvailability::Unavailable),
+            "Unavailable"
+        );
+        assert_eq!(
+            source_availability_label(SourceAvailability::PermissionDenied),
+            "Permission denied"
+        );
+        assert_eq!(source_scan_label(None), "Not scanned yet");
+        assert_eq!(
+            source_scan_label(Some(SourceScanStatus::Success)),
+            "Completed"
+        );
+    }
+
+    #[test]
+    fn discovery_container_labels_preserve_backend_shape() {
+        use archivefs_core::ingestion::ContainerKind;
+        assert_eq!(
+            discovery_container_label(&ContainerKind::DirectFile),
+            "File"
+        );
+    }
+}
+
+#[cfg(test)]
+#[path = "native_workflows/launch_recovery_tests.rs"]
+mod launch_recovery_tests;
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn blue_cheat_game(path: &str, platform: &str) -> crate::gui_v2::library::Game {
+        crate::gui_v2::library::Game::from_archive(archivefs_core::PersistedArchive {
+            id: 1,
+            source_folder_id: 1,
+            relative_path: path.trim_start_matches('/').into(),
+            absolute_path: PathBuf::from(path),
+            archive_kind: "direct_file".into(),
+            display_name: "Synthetic".into(),
+            normalized_name: "synthetic".into(),
+            size_bytes: None,
+            modified_time_unix_seconds: None,
+            platform: Some(platform.into()),
+            platform_source: None,
+            last_known_health: "unknown".into(),
+            last_seen_at: String::new(),
+            last_verified_missing_at: None,
+            identity_report: None,
+        })
+    }
+
+    /// Renders one Blue Mods & Cheats frame for `game` through the real page.
+    fn blue_frame(
+        ctx: &egui::Context,
+        workflows: &mut NativeWorkflows,
+        game: &crate::gui_v2::library::Game,
+    ) {
+        let mut activity = Activity::default();
+        let _ = ctx.run(egui::RawInput::default(), |ctx| {
+            egui::CentralPanel::default().show(ctx, |ui| {
+                let _ = workflows.show_cheats(ui, Some(game), &mut activity);
+            });
+        });
+    }
+
+    fn blue_target(
+        workflows: &NativeWorkflows,
+    ) -> Option<archivefs_core::patch_manager::CheatRouteTarget> {
+        workflows
+            .app
+            .cheat_workflow
+            .as_ref()
+            .and_then(|workflow| workflow.routing.decision.applicable_target().cloned())
+    }
+
+    #[test]
+    fn blue_rebuilds_for_a_changed_emulator_core_or_cleared_choice_and_allows_a_fresh_preview() {
+        use archivefs_core::patch_manager::CheatRouteTarget as T;
+        let path = "/roms/ff7.chd";
+        let changes: [(Option<T>, Option<T>); 3] = [
+            // Emulator change: RetroArch -> DuckStation.
+            (
+                Some(T::standalone("duckstation")),
+                Some(T::standalone("duckstation")),
+            ),
+            // Core change within RetroArch.
+            (
+                Some(T::retroarch(Some("mednafen_psx_hw"))),
+                Some(T::retroarch(Some("mednafen_psx_hw"))),
+            ),
+            // Choice cleared (cancelled): PSX falls back to DuckStation, the
+            // standalone emulator EmuWiz writes cheats for.
+            (None, Some(T::standalone("duckstation"))),
+        ];
+        for (changed, expected) in changes {
+            let ctx = egui::Context::default();
+            let mut workflows = NativeWorkflows::new(ctx.clone());
+            workflows.app = crate::tests::app_with_cheat_game(path, "PSX");
+            workflows
+                .app
+                .cheat_emulator_selections
+                .insert(PathBuf::from(path), T::retroarch(Some("pcsx_rearmed")));
+            let game = blue_cheat_game(path, "PSX");
+            blue_frame(&ctx, &mut workflows, &game);
+            assert_eq!(
+                blue_target(&workflows),
+                Some(T::retroarch(Some("pcsx_rearmed")))
+            );
+            // An unchanged target is left alone: nothing is cancelled.
+            workflows
+                .app
+                .cheat_workflow
+                .as_mut()
+                .unwrap()
+                .transaction_notice = Some("previous preview marker".into());
+            blue_frame(&ctx, &mut workflows, &game);
+            assert_eq!(
+                workflows
+                    .app
+                    .cheat_workflow
+                    .as_ref()
+                    .unwrap()
+                    .transaction_notice
+                    .as_deref(),
+                Some("previous preview marker")
+            );
+
+            match &changed {
+                Some(target) => {
+                    workflows
+                        .app
+                        .cheat_emulator_selections
+                        .insert(PathBuf::from(path), target.clone());
+                }
+                None => {
+                    workflows
+                        .app
+                        .cheat_emulator_selections
+                        .remove(&PathBuf::from(path));
+                }
+            }
+            // A stale confirmation before the page re-renders never applies.
+            workflows.app.start_cheat_apply(ctx.clone());
+            assert!(matches!(
+                workflows.app.cheat_workflow.as_ref().unwrap().transaction,
+                crate::CheatTransactionState::Idle
+            ));
+            // The next Blue frame rebuilds the page for the new target.
+            blue_frame(&ctx, &mut workflows, &game);
+            let workflow = workflows.app.cheat_workflow.as_ref().unwrap();
+            assert_eq!(blue_target(&workflows), expected, "{changed:?}");
+            assert_eq!(
+                workflow.transaction_notice.as_deref(),
+                Some(crate::cheats_mods::CHEAT_TARGET_REFRESHED)
+            );
+            assert!(matches!(
+                workflow.transaction,
+                crate::CheatTransactionState::Idle
+            ));
+            // The rebuilt page is current: a fresh preview can be reviewed
+            // and confirmed without reselecting the emulator.
+            assert!(workflows.app.revalidate_cheat_target(), "{changed:?}");
+            // And it stays stable on later frames.
+            blue_frame(&ctx, &mut workflows, &game);
+            assert_eq!(blue_target(&workflows), expected);
+        }
+    }
+
+    /// Discovery double: counts calls, reports `installed` and optionally
+    /// sleeps (a slow or unavailable folder).
+    #[derive(Clone, Default)]
+    struct FakeDiscovery {
+        calls: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+        installed: std::sync::Arc<std::sync::Mutex<Vec<String>>>,
+        delay_ms: std::sync::Arc<std::sync::atomic::AtomicU64>,
+    }
+
+    impl FakeDiscovery {
+        fn install(&self, app: &mut crate::ArchiveFsApp, interval: std::time::Duration) {
+            let this = self.clone();
+            app.standalone_emulator_discovery =
+                crate::cheats_mods::StandaloneEmulatorDiscovery::with_discover(
+                    std::sync::Arc::new(move |_platform: &str| {
+                        this.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                        let delay = this.delay_ms.load(std::sync::atomic::Ordering::SeqCst);
+                        if delay > 0 {
+                            std::thread::sleep(std::time::Duration::from_millis(delay));
+                        }
+                        this.installed.lock().unwrap().clone()
+                    }),
+                    interval,
+                );
+        }
+
+        fn calls(&self) -> usize {
+            self.calls.load(std::sync::atomic::Ordering::SeqCst)
+        }
+    }
+
+    fn psx_blue_with_fake_discovery(
+        interval: std::time::Duration,
+    ) -> (
+        egui::Context,
+        NativeWorkflows,
+        crate::gui_v2::library::Game,
+        FakeDiscovery,
+    ) {
+        let path = "/roms/ff7.chd";
+        let ctx = egui::Context::default();
+        let mut workflows = NativeWorkflows::new(ctx.clone());
+        workflows.app = crate::tests::app_with_cheat_game(path, "PSX");
+        workflows.app.cheat_emulator_selections.insert(
+            PathBuf::from(path),
+            archivefs_core::patch_manager::CheatRouteTarget::retroarch(Some("pcsx_rearmed")),
+        );
+        let fake = FakeDiscovery::default();
+        fake.install(&mut workflows.app, interval);
+        let game = blue_cheat_game(path, "PSX");
+        (ctx, workflows, game, fake)
+    }
+
+    #[test]
+    fn repeated_unchanged_blue_redraws_do_no_repeated_emulator_discovery() {
+        let (ctx, mut workflows, game, fake) =
+            psx_blue_with_fake_discovery(std::time::Duration::from_secs(3600));
+        blue_frame(&ctx, &mut workflows, &game);
+        let after_build = fake.calls();
+        assert!(after_build >= 1, "building the page discovers once");
+        for _ in 0..30 {
+            blue_frame(&ctx, &mut workflows, &game);
+        }
+        assert_eq!(fake.calls(), after_build, "redraws must not rediscover");
+
+        // A selection change needs no discovery to be noticed: the next
+        // frame rebuilds for the new core immediately.
+        workflows.app.cheat_emulator_selections.insert(
+            PathBuf::from("/roms/ff7.chd"),
+            archivefs_core::patch_manager::CheatRouteTarget::retroarch(Some("mednafen_psx_hw")),
+        );
+        blue_frame(&ctx, &mut workflows, &game);
+        assert_eq!(
+            blue_target(&workflows),
+            Some(archivefs_core::patch_manager::CheatRouteTarget::retroarch(
+                Some("mednafen_psx_hw")
+            ))
+        );
+        let after_rebuild = fake.calls();
+        for _ in 0..30 {
+            blue_frame(&ctx, &mut workflows, &game);
+        }
+        assert_eq!(fake.calls(), after_rebuild);
+    }
+
+    #[test]
+    fn stale_apply_is_refused_even_when_the_cached_discovery_has_not_caught_up() {
+        use archivefs_core::patch_manager::CheatRouteTarget as T;
+        let path = "/roms/psp.iso";
+        let ctx = egui::Context::default();
+        let mut workflows = NativeWorkflows::new(ctx.clone());
+        workflows.app = crate::tests::app_with_cheat_game(path, "PSP");
+        let fake = FakeDiscovery::default();
+        fake.install(&mut workflows.app, std::time::Duration::from_secs(3600));
+        let game = blue_cheat_game(path, "PSP");
+        blue_frame(&ctx, &mut workflows, &game);
+        // Nothing standalone detected: PSP routes to RetroArch.
+        assert_eq!(blue_target(&workflows), Some(T::retroarch(None)));
+        // PPSSPP appears on disk; the per-frame cache has not refreshed yet.
+        *fake.installed.lock().unwrap() = vec!["ppsspp".into()];
+        blue_frame(&ctx, &mut workflows, &game);
+        assert_eq!(blue_target(&workflows), Some(T::retroarch(None)));
+        // Review/Apply rediscover synchronously and refuse the stale target.
+        workflows.app.review_cheat_apply();
+        workflows.app.start_cheat_apply(ctx.clone());
+        let workflow = workflows.app.cheat_workflow.as_ref().unwrap();
+        assert!(matches!(
+            workflow.transaction,
+            crate::CheatTransactionState::Idle
+        ));
+        assert_eq!(
+            workflow.transaction_notice.as_deref(),
+            Some(crate::cheats_mods::CHEAT_TARGET_CHANGED)
+        );
+    }
+
+    #[test]
+    fn a_slow_emulator_folder_never_blocks_a_blue_frame() {
+        let (ctx, mut workflows, game, fake) =
+            psx_blue_with_fake_discovery(std::time::Duration::ZERO);
+        blue_frame(&ctx, &mut workflows, &game);
+        fake.delay_ms
+            .store(600, std::sync::atomic::Ordering::SeqCst);
+        for _ in 0..5 {
+            let started = std::time::Instant::now();
+            blue_frame(&ctx, &mut workflows, &game);
+            assert!(
+                started.elapsed() < std::time::Duration::from_millis(400),
+                "a frame waited for discovery: {:?}",
+                started.elapsed()
+            );
+        }
+    }
+
+    #[test]
+    fn confirmation_revalidation_never_blocks_on_a_slow_emulator_folder() {
+        let (ctx, mut workflows, game, fake) =
+            psx_blue_with_fake_discovery(std::time::Duration::from_secs(3600));
+        blue_frame(&ctx, &mut workflows, &game);
+        fake.delay_ms
+            .store(500, std::sync::atomic::Ordering::SeqCst);
+        // Discovery that completed before the click does not count.
+        let clicked_at = std::time::Instant::now();
+        let workflow = workflows.app.cheat_workflow.as_ref().unwrap();
+        let started = std::time::Instant::now();
+        assert_eq!(
+            workflows
+                .app
+                .cheat_route_target_validated_since(workflow, clicked_at, &ctx),
+            None
+        );
+        assert!(started.elapsed() < std::time::Duration::from_millis(200));
+        // The background re-check finishes later and validates the target.
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        loop {
+            let workflow = workflows.app.cheat_workflow.as_ref().unwrap();
+            let polled = std::time::Instant::now();
+            let validation = workflows
+                .app
+                .cheat_route_target_validated_since(workflow, clicked_at, &ctx);
+            assert!(polled.elapsed() < std::time::Duration::from_millis(200));
+            if let Some(current) = validation {
+                assert!(current);
+                break;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "re-check never finished"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        }
+    }
+
+    #[test]
+    fn blue_shows_the_target_change_notice() {
+        let (ctx, mut workflows, game, _fake) =
+            psx_blue_with_fake_discovery(std::time::Duration::from_secs(3600));
+        blue_frame(&ctx, &mut workflows, &game);
+        workflows.app.cheat_emulator_selections.insert(
+            PathBuf::from("/roms/ff7.chd"),
+            archivefs_core::patch_manager::CheatRouteTarget::retroarch(Some("mednafen_psx_hw")),
+        );
+        blue_frame(&ctx, &mut workflows, &game);
+        let mut activity = Activity::default();
+        let output = ctx.run(egui::RawInput::default(), |ctx| {
+            egui::CentralPanel::default().show(ctx, |ui| {
+                let _ = workflows.show_cheats(ui, Some(&game), &mut activity);
+            });
+        });
+        let text = format!("{:?}", output.shapes);
+        assert!(text.contains("Cheat target changed"), "notice not rendered");
+    }
+
+    #[test]
+    fn blue_explains_an_unsupported_target_after_a_change() {
+        use archivefs_core::patch_manager::CheatRouteTarget as T;
+        let path = "/roms/sf2.zip";
+        let ctx = egui::Context::default();
+        let mut workflows = NativeWorkflows::new(ctx.clone());
+        workflows.app = crate::tests::app_with_cheat_game(path, "Arcade");
+        workflows
+            .app
+            .cheat_emulator_selections
+            .insert(PathBuf::from(path), T::retroarch(Some("fbneo")));
+        let game = blue_cheat_game(path, "Arcade");
+        blue_frame(&ctx, &mut workflows, &game);
+        assert_eq!(blue_target(&workflows), Some(T::retroarch(Some("fbneo"))));
+        workflows
+            .app
+            .cheat_emulator_selections
+            .insert(PathBuf::from(path), T::standalone("mame"));
+        blue_frame(&ctx, &mut workflows, &game);
+        let workflow = workflows.app.cheat_workflow.as_ref().unwrap();
+        assert_eq!(blue_target(&workflows), None);
+        assert_eq!(
+            workflow.routing.decision.headline(),
+            archivefs_core::patch_manager::MAME_CHEAT_ROUTE_HEADLINE
+        );
+        assert!(!workflows.app.revalidate_cheat_target());
+    }
+
+    #[test]
+    fn adf_trainer_native_dispatch_is_reachable_without_promoting_identity_or_changing_launch_target()
+     {
+        for platform in [Some("Amiga"), None] {
+            let ctx = egui::Context::default();
+            let mut workflows = NativeWorkflows::new(ctx.clone());
+            workflows.app = crate::tests::app_with_cheats_mods_context();
+            let path = PathBuf::from("/synthetic/floppy.adf");
+            let workflow = workflows.app.cheat_workflow.as_mut().unwrap();
+            workflow.archive_path = path.clone();
+            workflow.platform = platform.map(str::to_owned);
+            let previous_route = workflow.routing.clone();
+            let previous_identity = workflow.identity_request.clone();
+            let game =
+                crate::gui_v2::library::Game::from_archive(archivefs_core::PersistedArchive {
+                    id: 1,
+                    source_folder_id: 1,
+                    relative_path: "floppy.adf".into(),
+                    absolute_path: path,
+                    archive_kind: "direct_file".into(),
+                    display_name: "Synthetic floppy".into(),
+                    normalized_name: "synthetic".into(),
+                    size_bytes: None,
+                    modified_time_unix_seconds: None,
+                    platform: platform.map(str::to_owned),
+                    platform_source: None,
+                    last_known_health: "unknown".into(),
+                    last_seen_at: String::new(),
+                    last_verified_missing_at: None,
+                    identity_report: None,
+                });
+            assert!(!game.identified);
+            let mut activity = Activity::default();
+            let output = ctx.run(egui::RawInput::default(), |ctx| {
+                egui::CentralPanel::default().show(ctx, |ui| {
+                    assert!(
+                        workflows
+                            .show_cheats(ui, Some(&game), &mut activity)
+                            .is_none()
+                    );
+                });
+            });
+            let text = format!("{:?}", output.shapes);
+            assert!(text.contains("Amiga ADF trainers"));
+            assert!(text.contains("Preview only"));
+            assert!(!text.contains("CUSTOM1"));
+            let workflow = workflows.app.cheat_workflow.as_ref().unwrap();
+            assert_eq!(workflow.routing, previous_route);
+            assert_eq!(workflow.identity_request, previous_identity);
+        }
+    }
+
+    #[test]
+    fn recheck_never_starts_a_second_check_for_the_same_game() {
+        let ctx = egui::Context::default();
+        let mut workflows = NativeWorkflows::new(ctx.clone());
+        workflows.select(Path::new("/synthetic/a.iso"));
+        workflows.recheck_readiness_in_place(&ctx);
+        let first = workflows
+            .app
+            .selected_evidence_ui
+            .selected_evidence_generation;
+        workflows.recheck_readiness_in_place(&ctx);
+        assert_eq!(
+            workflows
+                .app
+                .selected_evidence_ui
+                .selected_evidence_generation,
+            first,
+            "a running check must not be duplicated"
+        );
+    }
+
+    #[test]
+    fn recheck_after_a_game_change_supersedes_the_older_result() {
+        let ctx = egui::Context::default();
+        let mut workflows = NativeWorkflows::new(ctx.clone());
+        workflows.select(Path::new("/synthetic/a.iso"));
+        workflows.recheck_readiness_in_place(&ctx);
+        let first = workflows
+            .app
+            .selected_evidence_ui
+            .selected_evidence_generation;
+        workflows.select(Path::new("/synthetic/b.iso"));
+        workflows.recheck_readiness_in_place(&ctx);
+        // A late result for game A carries the old generation and is dropped by
+        // the pipeline's generation check; the state now belongs to game B.
+        assert!(
+            workflows
+                .app
+                .selected_evidence_ui
+                .selected_evidence_generation
+                > first
+        );
+        assert!(matches!(
+            &workflows.app.selected_evidence_ui.selected_evidence,
+            selected_evidence_page::SelectedEvidenceState::Loading { path, .. }
+                if path == Path::new("/synthetic/b.iso")
+        ));
+    }
+
+    #[test]
+    fn recovery_routes_use_existing_gui_v2_sections() {
+        assert_eq!(
+            NativeWorkflows::recovery_route(
+                Some(42),
+                launch_readiness_page::LaunchReadinessPageAction::Navigate(
+                    crate::navigation::NavClick::View(crate::navigation::MainView::CheatsMods),
+                )
+            ),
+            Some(Route::Section(Section::Mods))
+        );
+        assert_eq!(
+            NativeWorkflows::recovery_route(
+                Some(42),
+                launch_readiness_page::LaunchReadinessPageAction::Navigate(
+                    crate::navigation::NavClick::View(crate::navigation::MainView::Sources),
+                )
+            ),
+            Some(Route::Section(Section::Sources))
+        );
+        assert_eq!(
+            NativeWorkflows::recovery_route(
+                Some(42),
+                launch_readiness_page::LaunchReadinessPageAction::Navigate(
+                    crate::navigation::NavClick::View(crate::navigation::MainView::Problems),
+                )
+            ),
+            Some(Route::Section(Section::Problems))
+        );
+        assert_eq!(
+            NativeWorkflows::recovery_route(
+                Some(42),
+                launch_readiness_page::LaunchReadinessPageAction::Navigate(
+                    crate::navigation::NavClick::View(crate::navigation::MainView::EmulatorSetup),
+                )
+            ),
+            Some(Route::Section(Section::Emulators))
+        );
+        assert_eq!(
+            NativeWorkflows::recovery_route(
+                Some(42),
+                launch_readiness_page::LaunchReadinessPageAction::Navigate(
+                    crate::navigation::NavClick::View(crate::navigation::MainView::BiosProjection),
+                )
+            ),
+            Some(Route::Section(Section::Firmware))
+        );
+    }
+
+    #[test]
+    fn details_fallback_does_not_navigate_or_mutate() {
+        assert_eq!(
+            NativeWorkflows::recovery_route(
+                Some(42),
+                launch_readiness_page::LaunchReadinessPageAction::ReviewDetails
+            ),
+            None
+        );
+    }
+
+    #[test]
+    fn lifecycle_status_never_calls_detected_installations_not_installed() {
+        use archivefs_core::emulator_lifecycle::LifecycleState;
+
+        assert_eq!(
+            lifecycle_primary_state_label(LifecycleState::Missing, 0, false, false),
+            "Not installed"
+        );
+        assert_eq!(
+            lifecycle_primary_state_label(LifecycleState::Missing, 1, false, false),
+            "Detected"
+        );
+        assert_eq!(
+            lifecycle_primary_state_label(LifecycleState::MultipleInstallations, 2, false, false),
+            "Multiple installs · choose one"
+        );
+        assert_eq!(
+            lifecycle_primary_state_label(LifecycleState::Broken, 1, false, true),
+            "Needs setup"
+        );
+    }
+
+    #[test]
+    fn firmware_recovery_uses_the_existing_firmware_route() {
+        assert_eq!(
+            NativeWorkflows::recovery_route(
+                Some(42),
+                launch_readiness_page::LaunchReadinessPageAction::OpenDoctor,
+            ),
+            Some(Route::Section(Section::Firmware))
+        );
+    }
+}
+
+fn lifecycle_setup_panel(
+    ui: &mut egui::Ui,
+    projections: &[archivefs_core::emulator_lifecycle::EmulatorLifecycleProjection],
+    app: &mut ArchiveFsApp,
+) {
+    ui.heading("Emulator lifecycle health");
+    ui.label("This read-only view explains which installation is selected and who can update it. EmuWiz never runs package-manager updates here.");
+    for projection in projections {
+        ui.push_id(("emulator", &projection.emulator_id), |ui| {
+            egui::Frame::group(ui.style()).show(ui, |ui| {
+            ui.horizontal_wrapped(|ui| {
+                ui.strong(&projection.emulator_id);
+                ui.label(lifecycle_primary_state_label(
+                    projection.state,
+                    projection.installations.len(),
+                    projection.selected.is_some(),
+                    projection.stale_selected,
+                ));
+            });
+            if projection.stale_selected {
+                ui.colored_label(
+                    egui::Color32::from_rgb(235, 120, 100),
+                    "Your selected installation can no longer be found.",
+                );
+            }
+            if let Some(notice) =
+                lifecycle_selection_notice(projection.state, projection.selected.is_some())
+            {
+                ui.colored_label(
+                    egui::Color32::from_rgb(235, 178, 76),
+                    notice,
+                );
+            }
+            if projection.installations.is_empty() {
+                ui.label("Not installed");
+            }
+            for installation in &projection.installations {
+                ui.push_id(
+                    ("installation", format!("{:?}", installation.exact_binding)),
+                    |ui| {
+                        ui.group(|ui| {
+                    let marker = if installation.selected {
+                        " · Currently selected"
+                    } else {
+                        ""
+                    };
+                    ui.label(format!(
+                        "{}{}",
+                        installation_type_label(installation.installation_type),
+                        marker
+                    ));
+                    ui.label(format!(
+                        "Version: {} · Updates: {}",
+                        installation.version.version.as_deref().unwrap_or("unknown"),
+                        update_authority_label(installation.update_authority)
+                    ));
+                    if let Some(path) = lifecycle_executable_path(&installation.exact_binding) {
+                        ui.label(format!("Executable: {}", path.display()));
+                    }
+                    ui.label(format!(
+                        "Health: {} · Launch: {}",
+                        local_health_label(installation.local_health),
+                        installation
+                            .launch_readiness
+                            .map(launch_readiness_label)
+                            .unwrap_or("Not checked")
+                    ));
+                    ui.label(format!(
+                        "Update status: {}",
+                        installation
+                            .update_status
+                            .map(update_status_label)
+                            .unwrap_or("Latest version unknown")
+                    ));
+                    if !installation.selected
+                        && let Some(path) = lifecycle_executable_path(&installation.exact_binding)
+                        && let Some(emulator) = overridable_emulator(&projection.emulator_id)
+                        && ui.button("Use this installation").clicked()
+                    {
+                        app.emulator_readiness
+                            .emulator_setup_overrides
+                            .set_executable(emulator, Some(path.to_path_buf()));
+                        ui.label("Selection saved through the existing emulator setup backend. Refresh to inspect it again.");
+                    }
+                    ui.collapsing("Advanced details", |ui| {
+                        ui.label(format!("Ownership: {}", ownership_label(installation.ownership_category)));
+                        ui.label(format!("Channel: {:?} · Version source: {:?}", installation.channel, installation.version.source));
+                        match &installation.exact_binding {
+                            archivefs_core::emulator_lifecycle::ExactBinding::FlatpakApp { app_id } => {
+                                ui.label(format!("Flatpak app ID: {app_id}"));
+                                ui.label("Update using Flatpak; EmuWiz does not run that update.");
+                            }
+                            archivefs_core::emulator_lifecycle::ExactBinding::ManagedInstall { manifest_path, executable_path } => {
+                                ui.label(format!("Manifest: {}", manifest_path.display()));
+                                ui.label(format!("Executable: {}", executable_path.display()));
+                            }
+                            _ => {
+                                if let Some(path) = lifecycle_executable_path(&installation.exact_binding) {
+                                    ui.label(format!("Executable: {}", path.display()));
+                                }
+                            }
+                        }
+                    });
+                        });
+                    },
+                );
+            }
+            });
+        });
+    }
+    ui.separator();
+}
+
+fn lifecycle_state_label(
+    state: archivefs_core::emulator_lifecycle::LifecycleState,
+) -> &'static str {
+    use archivefs_core::emulator_lifecycle::LifecycleState::*;
+    match state {
+        InstalledCurrent => "Installed",
+        InstalledUpdateAvailable => "Update available",
+        InstalledUnknownVersion => "Installed · version unknown",
+        InstalledUnsupportedVersion => "Installed · unsupported version",
+        Missing => "Not installed",
+        Broken => "Needs attention",
+        MultipleInstallations => "Multiple installations found",
+        ManagedExternally => "Managed by another installer",
+    }
+}
+
+fn lifecycle_primary_state_label(
+    state: archivefs_core::emulator_lifecycle::LifecycleState,
+    installation_count: usize,
+    has_selection: bool,
+    stale_selected: bool,
+) -> &'static str {
+    if installation_count == 0 {
+        return lifecycle_state_label(state);
+    }
+    if stale_selected {
+        return "Needs setup";
+    }
+    if installation_count > 1 && !has_selection {
+        return "Multiple installs · choose one";
+    }
+    match state {
+        archivefs_core::emulator_lifecycle::LifecycleState::Missing => "Detected",
+        _ => lifecycle_state_label(state),
+    }
+}
+
+fn lifecycle_selection_notice(
+    state: archivefs_core::emulator_lifecycle::LifecycleState,
+    has_selection: bool,
+) -> Option<&'static str> {
+    (matches!(
+        state,
+        archivefs_core::emulator_lifecycle::LifecycleState::MultipleInstallations
+    ) && !has_selection)
+        .then_some("No installation selected. Choose one explicitly.")
+}
+
+fn installation_type_label(
+    kind: archivefs_core::emulator_inventory::InstallationType,
+) -> &'static str {
+    use archivefs_core::emulator_inventory::InstallationType::*;
+    match kind {
+        Flatpak => "Flatpak",
+        SystemPackage => "System package",
+        AppImage => "AppImage",
+        Portable => "Portable installation",
+        Managed => "EmuWiz-managed installation",
+        Manual => "Installed manually",
+        Unknown => "Installation type unknown",
+    }
+}
+
+fn ownership_label(
+    ownership: archivefs_core::emulator_lifecycle::OwnershipCategory,
+) -> &'static str {
+    use archivefs_core::emulator_lifecycle::OwnershipCategory::*;
+    match ownership {
+        OfficialManaged => "Managed by EmuWiz",
+        OfficialBrowserHandoff => "Official download handoff",
+        FlatpakManaged => "Managed by Flatpak",
+        SystemPackageManaged => "Managed by your system",
+        PortableUserManaged => "Installed manually",
+        Unknown => "Installation source unknown",
+        DoNotAutomate => "Manual updates only",
+    }
+}
+
+fn update_authority_label(
+    authority: archivefs_core::emulator_lifecycle::UpdateAuthority,
+) -> &'static str {
+    use archivefs_core::emulator_lifecycle::UpdateAuthority::*;
+    match authority {
+        EmuWizManaged => "EmuWiz",
+        Flatpak => "Flatpak",
+        SystemPackageManager => "your system package manager",
+        OfficialBrowser => "official download page",
+        UserManaged => "manual updates",
+        None => "no automatic updater",
+        Unknown => "unknown",
+    }
+}
+
+fn local_health_label(health: archivefs_core::emulator_lifecycle::LocalHealth) -> &'static str {
+    use archivefs_core::emulator_lifecycle::LocalHealth::*;
+    match health {
+        Healthy => "Healthy",
+        MissingExecutable => "Selected executable missing",
+        ChangedExecutable => "Executable changed",
+        ManifestMismatch => "Managed manifest mismatch",
+        PermissionsProblem => "Permissions need attention",
+        UnknownVersion => "Version unknown",
+        StaleConfiguredPath => "Selected path is stale",
+        MultipleCandidates => "Multiple candidates",
+        BrokenProfile => "Profile needs attention",
+        Unknown => "Unknown",
+    }
+}
+
+fn launch_readiness_label(
+    readiness: archivefs_core::launch::readiness::LaunchReadiness,
+) -> &'static str {
+    use archivefs_core::launch::readiness::LaunchReadiness::*;
+    match readiness {
+        Ready => "Ready",
+        ReadyWithWarnings => "Ready with warnings",
+        Blocked => "Blocked",
+    }
+}
+
+fn update_status_label(status: archivefs_core::emulator_update::UpdateStatus) -> &'static str {
+    use archivefs_core::emulator_update::UpdateStatus::*;
+    match status {
+        UpToDate => "Up to date",
+        UpdateAvailable => "Update available",
+        InstalledNewer => "Installed version is newer",
+        VersionUnknown => "Version unknown",
+        LatestUnknown => "Latest version unknown",
+        ChannelMismatch => "Channel mismatch",
+        ComparisonUnsupported => "Cannot compare versions",
+        Offline => "Offline",
+    }
+}
+
+fn lifecycle_executable_path(
+    binding: &archivefs_core::emulator_lifecycle::ExactBinding,
+) -> Option<&std::path::Path> {
+    match binding {
+        archivefs_core::emulator_lifecycle::ExactBinding::NativeExecutable { path }
+        | archivefs_core::emulator_lifecycle::ExactBinding::PortableExecutable { path }
+        | archivefs_core::emulator_lifecycle::ExactBinding::UnknownExternal { path } => Some(path),
+        archivefs_core::emulator_lifecycle::ExactBinding::ManagedInstall {
+            executable_path,
+            ..
+        } => Some(executable_path),
+        archivefs_core::emulator_lifecycle::ExactBinding::FlatpakApp { .. } => None,
+    }
+}
+
+fn overridable_emulator(
+    emulator_id: &str,
+) -> Option<crate::emulator_setup_overrides::OverridableEmulator> {
+    crate::emulator_setup_overrides::OverridableEmulator::from_adapter_id(
+        &emulator_id.to_ascii_lowercase(),
+    )
+}
+
+pub(super) fn observe_dat_activity_state(
+    activity: &mut Activity,
+    job: &mut Option<u64>,
+    state: Option<crate::dat_sources_page::DatBackgroundActivity>,
+    error: Option<String>,
+) {
+    if let Some(state) = state {
+        if job.is_none() {
+            let id = activity.queue(
+                state.title,
+                Route::Section(super::routes::Section::Dat),
+                false,
+            );
+            activity.start(id);
+            *job = Some(id);
+        }
+        if let Some(active) = job.and_then(|id| activity.jobs.get_mut(&id)) {
+            active.item = Some(state.detail);
+        }
+    } else if let Some(id) = job.take() {
+        activity.finish(
+            id,
+            if error.is_some() {
+                "The verification-data operation stopped safely.".into()
+            } else {
+                "Verification data is ready to review.".into()
+            },
+            error,
+        );
+    }
+}
+
+pub(super) fn observe_cheat_activity_state(
+    activity: &mut Activity,
+    job: &mut Option<u64>,
+    state: Option<(&'static str, &'static str)>,
+    error: Option<String>,
+) {
+    if let Some((title, detail)) = state {
+        if job.is_none() {
+            let id = activity.queue(title, Route::Section(super::routes::Section::Mods), false);
+            activity.start(id);
+            *job = Some(id);
+        }
+        if let Some(active) = job.and_then(|id| activity.jobs.get_mut(&id)) {
+            active.item = Some(detail.to_string());
+        }
+    } else if let Some(id) = job.take() {
+        activity.finish(
+            id,
+            if error.is_some() {
+                "The cheat operation stopped safely; nothing unapproved was applied.".into()
+            } else {
+                "Cheat information is ready to review.".into()
+            },
+            error,
+        );
+    }
+}
+
+fn cheat_activity_state(
+    workflow: Option<&crate::CheatWorkflowState>,
+) -> Option<(&'static str, &'static str)> {
+    let workflow = workflow?;
+    use crate::{CheatStepResource as R, CheatTransactionState as T};
+    if matches!(workflow.transaction, T::Applying { .. }) {
+        return Some(("Applying cheats", "Updating the selected emulator profile."));
+    }
+    if matches!(workflow.preview, R::Loading { .. }) {
+        return Some((
+            "Checking cheat compatibility",
+            "Building the safe apply preview.",
+        ));
+    }
+    if matches!(workflow.identity, R::Loading { .. })
+        || matches!(workflow.source_list, R::Loading { .. })
+        || matches!(workflow.source_fetch, R::Loading { .. })
+        || matches!(workflow.candidates, R::Loading { .. })
+        || matches!(workflow.existing_library, R::Loading { .. })
+        || matches!(workflow.pcsx2_inventory, R::Loading { .. })
+        || matches!(workflow.dolphin_inventory, R::Loading { .. })
+        || matches!(workflow.pcsx2_gamehacking, R::Loading { .. })
+        || matches!(workflow.gamecube_gamehacking, R::Loading { .. })
+        || matches!(workflow.dolphin_provider, R::Loading { .. })
+        || matches!(workflow.xenia_provider, R::Loading { .. })
+        || matches!(workflow.bsfree_gamecube, R::Loading { .. })
+        || matches!(workflow.bsfree_wii, R::Loading { .. })
+    {
+        return Some((
+            "Reading cheats",
+            "Checking identity, sources and compatibility.",
+        ));
+    }
+    None
+}
+
+#[cfg(test)]
+mod lifecycle_selection_tests {
+    use super::*;
+    use archivefs_core::emulator_lifecycle::{ExactBinding, LifecycleState};
+    use std::path::{Path, PathBuf};
+
+    #[test]
+    fn multiple_installations_without_a_binding_require_explicit_selection() {
+        assert_eq!(
+            lifecycle_selection_notice(LifecycleState::MultipleInstallations, false),
+            Some("No installation selected. Choose one explicitly.")
+        );
+        assert_eq!(
+            lifecycle_selection_notice(LifecycleState::MultipleInstallations, true),
+            None
+        );
+        assert_eq!(
+            lifecycle_selection_notice(LifecycleState::InstalledCurrent, false),
+            None
+        );
+    }
+
+    #[test]
+    fn native_binding_exposes_the_exact_executable_path() {
+        let binding = ExactBinding::NativeExecutable {
+            path: PathBuf::from("/home/test/.local/bin/mame"),
+        };
+        assert_eq!(
+            lifecycle_executable_path(&binding),
+            Some(Path::new("/home/test/.local/bin/mame"))
+        );
+    }
+}
+
+/// Where each readiness action goes. Identity problems always go to the one
+/// Review Identity screen.
+pub(super) fn route_for_action(action: ReadinessAction, game_id: i64) -> Option<Route> {
+    match action {
+        ReadinessAction::RecheckReadiness => None,
+        ReadinessAction::ReviewDiscSet => Some(Route::Section(Section::MultiDisc)),
+        ReadinessAction::OpenActivity => Some(Route::Section(Section::Activity)),
+        ReadinessAction::Play | ReadinessAction::ChooseEmulator => Some(Route::Task {
+            section: Section::Launch,
+            game: game_id,
+        }),
+        ReadinessAction::SetUpEmulator => Some(Route::Section(Section::Emulators)),
+        ReadinessAction::CheckFirmware => Some(Route::Section(Section::Firmware)),
+        ReadinessAction::ReviewIdentity => Some(Route::ReviewIdentity(game_id)),
+        ReadinessAction::CheckGamesFolder => Some(Route::Section(Section::Sources)),
+        ReadinessAction::ReviewProblem => Some(Route::Section(Section::Problems)),
+    }
+}
+
+fn activity_cards(
+    ui: &mut egui::Ui,
+    section: &'static str,
+    entries: Vec<&crate::activity_history::HistoryEntry>,
+) {
+    for entry in entries {
+        let entry_id = format!(
+            "{:?}|{:?}|{:?}|{}",
+            entry.timestamp, entry.action, entry.archive_path, entry.message
+        );
+        ui.push_id((section, entry_id), |ui| {
+            crate::ui::components::card(ui, |ui| {
+                ui.strong(entry.action.to_string());
+                ui.label(entry.outcome.to_string());
+                ui.label(&entry.message);
+                if let Some(path) = &entry.archive_path {
+                    ui.collapsing("Advanced Details", |ui| {
+                        ui.monospace(path.display().to_string());
+                    });
+                }
+            });
+        });
+    }
+}

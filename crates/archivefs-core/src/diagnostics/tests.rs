@@ -238,6 +238,7 @@ fn transaction_history(status: SharedApplyStatus) -> SharedHistoryReport {
                 },
                 approved_source_root: SharedTransactionPath::from_path(Path::new("/staging")),
                 destination_root: SharedTransactionPath::from_path(Path::new("/dolphin")),
+                created_root_directories: Vec::new(),
                 dry_run: false,
                 entries: Vec::new(),
                 status,
@@ -657,7 +658,7 @@ fn merging_keeps_the_highest_severity_the_guidance_and_the_canonical_subsystem()
     rich.next_step = Some("Grant write access.".to_string());
     rich.recovery = Some(KnownRecovery::new(
         None,
-        "Settings → Validate configuration",
+        "Settings › Validate configuration",
     ));
 
     let merged = runner::merge_duplicates(vec![terse, rich]);
@@ -1120,7 +1121,7 @@ fn a_partial_failure_transaction_is_surfaced_with_its_rollback_location() {
     );
     assert_eq!(
         finding.recovery.as_ref().expect("recovery").available_at,
-        "History & Logs → Preview rollback for this operation"
+        "History & Logs › Preview rollback for this operation"
     );
 }
 
@@ -1308,7 +1309,7 @@ fn the_finding_model_exposes_no_executable_repair() {
     let recovery = findings[0].recovery.as_ref().expect("recovery metadata");
 
     assert_eq!(recovery.action, Some(RecoveryAction::RetryMount));
-    assert_eq!(recovery.available_at, "Library → Health, Retry");
+    assert_eq!(recovery.available_at, "Library › Health, Retry");
 
     let json = serde_json::to_string(&findings[0]).expect("json");
     for forbidden in ["command", "execute", "exec", "argv", "callback"] {
@@ -1464,17 +1465,46 @@ fn a_non_utf8_path_is_flagged_lossy_rather_than_silently_mangled() {
 // --- 24. No migration ---------------------------------------------------
 
 /// Doctor stores nothing, so it must not add, renumber, or modify a
-/// migration. The integrated Wii identity feature legitimately owns 0006;
-/// this guard includes it while still proving Doctor introduced no 0007.
+/// migration. Unrelated additions already accounted for as legitimate
+/// (see `database.rs`): 0006 (Wii identity), 0007 (Collection Discovery
+/// paging), 0008 (library DAT identities), 0009 (set-audit persistence),
+/// 0010 (verified identity facts), 0011 (named expected DAT inventory), and
+/// 0012 (expected-inventory metadata), 0013 (scan fingerprints), 0014
+/// (ingestion fingerprint evidence), 0015 (discovery-detail reuse), 0016
+/// (non-archive fingerprints), 0017 (source roles), 0018 (provider mod
+/// catalogue records), 0019 (ScreenScraper enrichment), 0020 (media topology
+/// evidence), and 0021 (physical MAME member evidence). This guard still proves Doctor itself
+/// introduced no migration of its own
+/// (the string scan below, over Doctor's own source files only).
 #[test]
 fn stage_1a_introduces_no_database_migration() {
-    const EXPECTED: [&str; 6] = [
+    const EXPECTED: [&str; 26] = [
         include_str!("../migrations/0001_initial.sql"),
         include_str!("../migrations/0002_platform_aliases.sql"),
         include_str!("../migrations/0003_source_folder_scan_status.sql"),
         include_str!("../migrations/0004_scan_skip_counts.sql"),
         include_str!("../migrations/0005_source_platform_assignment.sql"),
         include_str!("../migrations/0006_game_identity_reports.sql"),
+        include_str!("../migrations/0007_discovery_details.sql"),
+        include_str!("../migrations/0008_library_dat_identities.sql"),
+        include_str!("../migrations/0009_set_audit_verdicts.sql"),
+        include_str!("../migrations/0010_verified_identity_facts.sql"),
+        include_str!("../migrations/0011_dat_expected_entries.sql"),
+        include_str!("../migrations/0012_dat_expected_inventory_meta.sql"),
+        include_str!("../migrations/0013_scan_fingerprints.sql"),
+        include_str!("../migrations/0014_ingestion_fingerprint_evidence.sql"),
+        include_str!("../migrations/0015_discovery_detail_reuse.sql"),
+        include_str!("../migrations/0016_non_archive_fingerprints.sql"),
+        include_str!("../migrations/0017_source_roles.sql"),
+        include_str!("../migrations/0018_mod_catalogue_records.sql"),
+        include_str!("../migrations/0019_screenscraper_enrichment.sql"),
+        include_str!("../migrations/0020_media_topology_evidence.sql"),
+        include_str!("../migrations/0021_mame_member_evidence.sql"),
+        include_str!("../migrations/0022_scan_source_coverage.sql"),
+        include_str!("../migrations/0023_catalogue_safety_bindings.sql"),
+        include_str!("../migrations/0024_source_enablement.sql"),
+        include_str!("../migrations/0025_discovery_import_history.sql"),
+        include_str!("../migrations/0026_dat_inventory_digest.sql"),
     ];
     assert_eq!(
         crate::latest_schema_version(),
@@ -1707,12 +1737,18 @@ fn a_complete_gather_and_scan_leaves_the_entire_data_directory_unchanged() {
     // Seven subsystems were genuinely checked, and the rest are honestly
     // recorded as unavailable rather than as passes.
     assert_eq!(scan.checked_subsystems().len(), 7, "{:?}", scan.coverage);
-    // Storage, filesystem mount state, emulator profiles and managed entries
-    // are not gathered by this test, so they must appear as unavailable
-    // alongside the snapshot, setup and RetroArch subsystems - never as passes.
+    // Storage, filesystem mount state, emulator profiles, Linux installation
+    // evidence, arcade emulator/DAT version compatibility,
+    // Azahar/Cemu, melonDS/mGBA, DeSmuME/Mesen, RMG/SameBoy, and xemu/Xenia/PPSSPP/RPCS3
+    // launch readiness, remaining native profiles, managed entries, and the verified-identity fact cache
+    // are not gathered by this test, so they
+    // must appear as unavailable alongside the snapshot, setup and
+    // RetroArch subsystems - never as passes. All four launch readiness
+    // checks share one (category, subsystem) tag but each carries different
+    // "not gathered" wording, so they count as separate entries here.
     assert_eq!(
         scan.unavailable_subsystems().len(),
-        7,
+        22,
         "{:?}",
         scan.coverage
     );

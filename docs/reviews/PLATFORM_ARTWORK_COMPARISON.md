@@ -1,5 +1,9 @@
 # Platform artwork comparison
 
+> **Completed review snapshot**
+>
+> This comparison records an earlier artwork review and is retained for provenance. It is not current product guidance; see the [README](../../README.md) for the current product view.
+
 Audit of the platform artwork held in three places: this branch
 (`feature/platform-artwork-completion`), the committed state of `main`, and the
 **uncommitted working tree** of the protected main worktree at

@@ -1,5 +1,9 @@
 # Beta 1 visual language
 
+> **Historical / superseded design**
+>
+> This document records an earlier implementation stage and is retained for provenance. It may not describe the current GUI. See the [README](../../README.md) and current [launch/support guidance](../LAUNCH_SUPPORT.md).
+
 Status: implemented in `feature/beta1-visual-language` (PR #20), on top of the
 PR #19 beta UX pass.
 

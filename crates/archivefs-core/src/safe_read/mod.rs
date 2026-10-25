@@ -212,6 +212,19 @@ pub struct SafeFile {
     file: File,
     length: u64,
     resolved_via_symlink: bool,
+    /// Test-only: lets the read fault hook recognise the file.
+    #[cfg(test)]
+    path: PathBuf,
+}
+
+#[cfg(test)]
+thread_local! {
+    /// Test-only fault injection: reads through [`SafeFile::read_exact_at`]
+    /// of a file whose path ends with the given suffix fail once they reach
+    /// at or beyond the given byte offset, so a test can stage "the first
+    /// bytes read fine, then the device failed" deterministically.
+    pub(crate) static FAIL_READS_AT_OR_BEYOND: std::cell::RefCell<Option<(String, u64)>> =
+        const { std::cell::RefCell::new(None) };
 }
 
 impl SafeFile {
@@ -253,6 +266,18 @@ impl SafeFile {
         }
         if offset.saturating_add(length as u64) > self.length {
             return None;
+        }
+        #[cfg(test)]
+        {
+            let injected = FAIL_READS_AT_OR_BEYOND.with(|fault| {
+                fault.borrow().as_ref().is_some_and(|(suffix, at)| {
+                    self.path.to_string_lossy().ends_with(suffix.as_str())
+                        && offset.saturating_add(length as u64) > *at
+                })
+            });
+            if injected {
+                return None;
+            }
         }
         self.file.seek(SeekFrom::Start(offset)).ok()?;
         let mut buffer = vec![0_u8; length];
@@ -394,6 +419,8 @@ fn open_validated(target: &Path, resolved_via_symlink: bool) -> Result<SafeFile,
         file,
         length: before.len(),
         resolved_via_symlink,
+        #[cfg(test)]
+        path: target.to_path_buf(),
     })
 }
 

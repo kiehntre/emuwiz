@@ -11,6 +11,24 @@ use std::path::{Path, PathBuf};
 
 const ROOT: &str = "/roms";
 
+#[test]
+fn ps4_is_a_conservative_canonical_platform_distinct_from_ps3() {
+    let ps4 = platform_by_id("PS4").expect("PS4 registry entry");
+    assert_eq!(ps4.display_name, "Sony PlayStation 4");
+    assert_ne!(ps4.id, "PS3");
+    assert_eq!(
+        platform_for_folder_name("PlayStation 4").map(|p| p.id),
+        Some("PS4")
+    );
+
+    let package = detect_platform_report(&DetectionRequest::new(
+        Path::new("/roms/ps4/CUSA00000.pkg"),
+        Path::new(ROOT),
+    ));
+    assert_eq!(package.platform, Some("PS4"));
+    assert!(!ps4.can_be_confirmed_by_signature());
+}
+
 /// A throwaway directory. Real trees are needed to prove the bounded reads and
 /// the read-only guarantee; nothing outside one is ever written.
 struct TempTree {
@@ -374,6 +392,9 @@ fn every_previously_supported_platform_and_alias_still_resolves() {
         ("pc9801", "NEC PC-9801"),
         ("pcenginecd", "PC Engine CD"),
         ("tgcd", "PC Engine CD"),
+        ("cdrom2", "PC Engine CD"),
+        ("supercdrom2", "PC Engine CD"),
+        ("turboduo", "PC Engine CD"),
         ("c128", "Commodore 128"),
         ("vic20", "VIC-20"),
         // libretro-database directory spellings.
@@ -633,6 +654,27 @@ fn a_tap_file_stays_ambiguous_between_the_tape_systems() {
     assert!(names.contains(&"Commodore 64"));
 }
 
+#[test]
+fn valid_commodore_tap_header_disambiguates_the_shared_tap_extension() {
+    let tree = TempTree::new("commodore-tap-structure");
+    let mut tap = Vec::from(&b"C64-TAPE-RAW"[..]);
+    tap.extend([2, 0, 0, 0]);
+    tap.extend(1_u32.to_le_bytes());
+    tap.push(0xaa);
+    let c64 = tree.file("unsorted/c64.tap", &tap);
+    let c64_report =
+        detect_platform_report(&DetectionRequest::new(&c64, tree.path()).inspecting_content());
+    assert_eq!(c64_report.platform, Some("Commodore 64"));
+    assert_eq!(c64_report.confidence, DetectionConfidence::Confirmed);
+
+    tap[13] = 1;
+    let vic20 = tree.file("unsorted/vic20.tap", &tap);
+    let vic20_report =
+        detect_platform_report(&DetectionRequest::new(&vic20, tree.path()).inspecting_content());
+    assert_eq!(vic20_report.platform, Some("VIC-20"));
+    assert_eq!(vic20_report.confidence, DetectionConfidence::Confirmed);
+}
+
 /// Test 21
 #[test]
 fn a_zip_file_never_identifies_a_platform_by_itself() {
@@ -641,6 +683,34 @@ fn a_zip_file_never_identifies_a_platform_by_itself() {
     assert!(
         report.candidates.len() > 10,
         "`.zip` is a container, not a platform"
+    );
+}
+
+#[test]
+fn sis_is_weak_n_gage_evidence_but_n_gage_extension_remains_strong() {
+    let sis = detect("/roms/unsorted/game.sis");
+    assert_eq!(sis.platform, None);
+    assert_eq!(sis.deciding_source, Some(DetectionSource::SharedExtension));
+    assert!(
+        sis.evidence
+            .iter()
+            .any(|e| { e.platform == "NGage" && e.source == DetectionSource::SharedExtension })
+    );
+    assert!(sis.requires_confirmation);
+
+    let n_gage = detect("/roms/unsorted/game.n-gage");
+    assert_eq!(n_gage.platform, Some("NGage"));
+    assert_eq!(
+        n_gage.deciding_source,
+        Some(DetectionSource::StrongExtension)
+    );
+    assert_eq!(n_gage.confidence, DetectionConfidence::Probable);
+
+    let contextual_sis = detect("/roms/ngage/game.sis");
+    assert_eq!(contextual_sis.platform, Some("NGage"));
+    assert_eq!(
+        contextual_sis.deciding_source,
+        Some(DetectionSource::FolderAlias)
     );
 }
 
@@ -653,12 +723,18 @@ fn a_strong_extension_carries_a_detection_on_its_own() {
         ("gba", "Game Boy Advance"),
         ("col", "ColecoVision"),
         ("vec", "Vectrex"),
-        ("cdt", "Amstrad CPC"),
+        ("a26", "Atari2600"),
+        ("a52", "Atari5200"),
+        ("a78", "Atari7800"),
         ("atr", "Atari 8-bit"),
-        ("d64", "Commodore 64"),
+        ("atx", "Atari 8-bit"),
+        ("xfd", "Atari 8-bit"),
         ("woz", "Apple II"),
-        ("xdf", "Sharp X68000"),
         ("j64", "Atari Jaguar"),
+        ("jag", "Atari Jaguar"),
+        ("lnx", "Atari Lynx"),
+        ("lyx", "Atari Lynx"),
+        ("stx", "AtariST"),
     ] {
         let report = detect(&format!("{ROOT}/unsorted/game.{extension}"));
         assert_eq!(
@@ -672,6 +748,102 @@ fn a_strong_extension_carries_a_detection_on_its_own() {
             "an extension is good evidence but not proof"
         );
     }
+}
+
+#[test]
+fn apple_and_macintosh_strong_extensions_are_registry_candidates() {
+    for (extension, expected) in [
+        ("do", "Apple II"),
+        ("po", "Apple II"),
+        ("woz", "Apple II"),
+        ("2mg", "Apple II"),
+        ("nib", "Apple II"),
+        ("hfv", "Macintosh"),
+        ("dc42", "Macintosh"),
+        ("sit", "Macintosh"),
+    ] {
+        let report = detect(&format!("{ROOT}/unsorted/game.{extension}"));
+        assert_eq!(report.platform, Some(expected), ".{extension}");
+        assert_eq!(
+            report.deciding_source,
+            Some(DetectionSource::StrongExtension)
+        );
+        assert_eq!(report.confidence, DetectionConfidence::Probable);
+    }
+}
+
+#[test]
+fn apple_and_macintosh_conflicting_folder_evidence_keeps_folder_precedence() {
+    for (folder, extension, expected, conflict) in [
+        ("macintosh", "woz", "Macintosh", "Apple II"),
+        ("apple2", "dc42", "Apple II", "Macintosh"),
+    ] {
+        let report = detect(&format!("{ROOT}/{folder}/game.{extension}"));
+        assert_eq!(report.platform, Some(expected));
+        assert_eq!(report.deciding_source, Some(DetectionSource::FolderAlias));
+        assert!(
+            report
+                .evidence
+                .iter()
+                .any(|e| e.source == DetectionSource::StrongExtension && e.platform == conflict)
+        );
+    }
+}
+
+#[test]
+fn shared_extensions_and_unsupported_apple_aliases_fail_closed() {
+    for (extension, forbidden) in [
+        ("dsk", "Apple II"),
+        ("dsk", "Macintosh"),
+        ("img", "Apple II"),
+        ("img", "Macintosh"),
+        ("bin", "Macintosh"),
+        ("iso", "Macintosh"),
+    ] {
+        let report = detect(&format!("{ROOT}/unsorted/game.{extension}"));
+        assert_ne!(report.platform, Some(forbidden));
+    }
+    for alias in ["apple-lisa", "apple-pippin"] {
+        assert_eq!(
+            platform_for_folder(alias),
+            None,
+            "{alias} must stay unsupported"
+        );
+    }
+}
+
+#[test]
+fn commodore_1571_and_1581_extensions_resolve_to_c128() {
+    for extension in ["d71", "d81"] {
+        let report = detect(&format!("{ROOT}/unsorted/game.{extension}"));
+        assert_eq!(report.platform, Some("Commodore 128"), ".{extension}");
+        assert_eq!(report.confidence, DetectionConfidence::Probable);
+    }
+}
+
+#[test]
+fn c128_folder_precedence_keeps_d64_and_g64_on_c128() {
+    for extension in ["d64", "g64"] {
+        let report = detect(&format!("{ROOT}/c128/game.{extension}"));
+        assert_eq!(report.platform, Some("Commodore 128"), ".{extension}");
+        assert_eq!(report.deciding_source, Some(DetectionSource::FolderAlias));
+    }
+}
+
+#[test]
+fn d81_in_c64_folder_surfaces_the_conflicting_c128_extension_evidence() {
+    let report = detect(&format!("{ROOT}/c64/game.d81"));
+    assert_eq!(report.platform, Some("Commodore 64"));
+    assert_eq!(report.deciding_source, Some(DetectionSource::FolderAlias));
+    assert!(report.evidence.iter().any(|e| {
+        e.source == DetectionSource::StrongExtension && e.platform == "Commodore 128"
+    }));
+    assert!(
+        report
+            .candidates
+            .iter()
+            .any(|candidate| candidate.platform == "Commodore 128")
+    );
 }
 
 /// Test 23
@@ -817,13 +989,105 @@ fn a_scummvm_directory_layout_identifies_scummvm_from_its_files() {
     assert_eq!(report.deciding_source, Some(DetectionSource::Layout));
 }
 
+/// A directory whose only DOS signal is a structurally verified
+/// `dosbox.conf` (real `[autoexec]` section) identifies DOS from layout.
+#[test]
+fn a_verified_dosbox_conf_identifies_dos_from_layout() {
+    let tree = TempTree::new("dosbox-verified");
+    let target = tree.file("unsorted/keen/KEEN.EXE", b"MZ not really parsed here");
+    tree.file(
+        "unsorted/keen/dosbox.conf",
+        b"[dosbox]\nmemsize=16\n[autoexec]\nmount c .\nc:\nkeen.exe\n",
+    );
+
+    let report =
+        detect_platform_report(&DetectionRequest::new(&target, tree.path()).inspecting_content());
+    assert_eq!(
+        report.platform,
+        Some("DOS"),
+        "a verified dosbox.conf should identify DOS from layout: {:?}",
+        report.evidence
+    );
+    assert_eq!(report.deciding_source, Some(DetectionSource::Layout));
+}
+
+/// A file merely *named* `dosbox.conf`, whose contents do not parse as a
+/// DOSBox config, is no longer sufficient to identify DOS.
+#[test]
+fn a_filename_only_dosbox_conf_no_longer_identifies_dos() {
+    let tree = TempTree::new("dosbox-name-only");
+    let target = tree.file("unsorted/mystery/thing.dat", b"not an exe");
+    tree.file(
+        "unsorted/mystery/dosbox.conf",
+        b"this file is called dosbox.conf but is just notes, no sections at all\n",
+    );
+
+    let report =
+        detect_platform_report(&DetectionRequest::new(&target, tree.path()).inspecting_content());
+    assert_ne!(
+        report.platform,
+        Some("DOS"),
+        "a bare dosbox.conf filename must not identify DOS: {:?}",
+        report.evidence
+    );
+    assert!(
+        !report
+            .evidence
+            .iter()
+            .any(|item| item.platform == "DOS" && item.source == DetectionSource::Layout)
+    );
+}
+
+/// An empty `dosbox.conf` is likewise not evidence.
+#[test]
+fn an_empty_dosbox_conf_is_not_dos_layout_evidence() {
+    let tree = TempTree::new("dosbox-empty");
+    let target = tree.file("unsorted/g/g.dat", b"x");
+    tree.file("unsorted/g/dosbox.conf", b"");
+
+    let report =
+        detect_platform_report(&DetectionRequest::new(&target, tree.path()).inspecting_content());
+    assert_ne!(report.platform, Some("DOS"));
+}
+
+/// A `[dosbox]`-only config with no `[autoexec]` is not DOS layout evidence.
+#[test]
+fn a_dosbox_conf_without_autoexec_is_not_dos_layout_evidence() {
+    let tree = TempTree::new("dosbox-no-autoexec");
+    let target = tree.file("unsorted/g/g.dat", b"x");
+    tree.file(
+        "unsorted/g/dosbox.conf",
+        b"[dosbox]\nmemsize=16\n[cpu]\ncycles=max\n",
+    );
+
+    let report =
+        detect_platform_report(&DetectionRequest::new(&target, tree.path()).inspecting_content());
+    assert_ne!(report.platform, Some("DOS"));
+}
+
+/// A DOS folder alias plus a verified `dosbox.conf`: the folder alias wins
+/// the deciding tier, and DOS is the answer either way.
+#[test]
+fn a_dos_folder_alias_and_a_verified_dosbox_conf_agree_on_dos() {
+    let tree = TempTree::new("dosbox-folder-and-config");
+    let target = tree.file("dos/keen/KEEN.EXE", b"MZ");
+    tree.file(
+        "dos/keen/dosbox.conf",
+        b"[autoexec]\nmount c .\nc:\nkeen.exe\n",
+    );
+
+    let report =
+        detect_platform_report(&DetectionRequest::new(&target, tree.path()).inspecting_content());
+    assert_eq!(report.platform, Some("DOS"));
+}
+
 /// Test 30
 #[test]
 fn a_real_mega_drive_rom_is_still_detected_from_its_cartridge_header() {
     let tree = TempTree::new("megadrive-header");
     // A Mega Drive header: `SEGA` at 0x100, in a folder that says nothing.
     let mut rom = vec![0_u8; 0x200];
-    rom[0x100..0x104].copy_from_slice(b"SEGA");
+    rom[0x100..0x10f].copy_from_slice(b"SEGA MEGA DRIVE");
     let target = tree.file("unsorted/mystery.bin", &rom);
 
     let report =
@@ -1030,7 +1294,7 @@ fn a_symlink_is_never_followed_to_read_a_signature() {
     {
         let tree = TempTree::new("symlink");
         let mut rom = vec![0_u8; 0x200];
-        rom[0x100..0x104].copy_from_slice(b"SEGA");
+        rom[0x100..0x10f].copy_from_slice(b"SEGA MEGA DRIVE");
         let real = tree.file("elsewhere/real.bin", &rom);
         let link = tree.path().join("unsorted/link.bin");
         fs::create_dir_all(link.parent().expect("parent")).expect("fixture");
@@ -1121,20 +1385,25 @@ fn a_huge_file_is_not_read_beyond_its_signature_offsets() {
     // 64 KiB is larger than every offset the registry uses, so this proves the
     // read is positional rather than a scan.
     let mut image = vec![0_u8; 0x10000];
-    image[0x100..0x104].copy_from_slice(b"SEGA");
+    image[0x100..0x10f].copy_from_slice(b"SEGA MEGA DRIVE");
     let target = tree.file("unsorted/big.bin", &image);
     let report =
         detect_platform_report(&DetectionRequest::new(&target, tree.path()).inspecting_content());
     assert_eq!(report.platform, Some("MegaDrive"));
-    // Nothing at any other offset was interpreted.
-    assert_eq!(
-        report
-            .evidence
-            .iter()
-            .filter(|item| item.source == DetectionSource::Signature)
-            .count(),
-        1
+    // Nothing at any other offset was interpreted: every signature item is
+    // the Mega Drive header at 0x100 (the shared `SEGA` bytes and the console
+    // name read from the same 0x200-byte prefix), and no other platform
+    // gained signature evidence.
+    let signatures: Vec<&DetectionEvidence> = report
+        .evidence
+        .iter()
+        .filter(|item| item.source == DetectionSource::Signature)
+        .collect();
+    assert!(
+        signatures.iter().all(|item| item.platform == "MegaDrive"),
+        "{signatures:?}"
     );
+    assert_eq!(signatures.len(), 2);
 }
 
 // --- 24, 25, 26. Purity, determinism, JSON -------------------------------
@@ -1144,7 +1413,7 @@ fn a_huge_file_is_not_read_beyond_its_signature_offsets() {
 fn detection_never_writes_to_the_filesystem() {
     let tree = TempTree::new("read-only");
     let mut rom = vec![0_u8; 0x200];
-    rom[0x100..0x104].copy_from_slice(b"SEGA");
+    rom[0x100..0x10f].copy_from_slice(b"SEGA MEGA DRIVE");
     let target = tree.file("scummvm/laurabow2/RESOURCE.GEN", b"resource");
     tree.file("scummvm/laurabow2/RESOURCE.MAP", b"map");
     tree.file("unsorted/rom.bin", &rom);
@@ -1256,6 +1525,7 @@ fn confidence_and_source_names_are_snake_case_for_scripts() {
 fn a_folder_and_a_signature_that_agree_confirm_the_platform() {
     let tree = TempTree::new("corroborated");
     let mut rom = vec![0_u8; 0x200];
+    // Only the shared `SEGA` bytes: corroborating, never decisive on their own.
     rom[0x100..0x104].copy_from_slice(b"SEGA");
     let target = tree.file("megadrive/Sonic.bin", &rom);
 
@@ -1273,6 +1543,11 @@ fn a_folder_and_a_signature_that_agree_confirm_the_platform() {
     );
     // The folder still decided; the signature raised the confidence.
     assert_eq!(report.deciding_source, Some(DetectionSource::FolderAlias));
+    assert!(
+        !report.evidence.iter().any(|item| item.conclusive),
+        "this is the corroboration path: nothing here was decisive on its own: {:?}",
+        report.evidence
+    );
 }
 
 /// Test 56c
@@ -1281,7 +1556,7 @@ fn a_folder_that_contradicts_a_signature_still_wins_but_only_as_probable() {
     let tree = TempTree::new("contradicted");
     // A genuine Mega Drive header inside a folder that says Master System.
     let mut rom = vec![0_u8; 0x200];
-    rom[0x100..0x104].copy_from_slice(b"SEGA");
+    rom[0x100..0x10f].copy_from_slice(b"SEGA MEGA DRIVE");
     let target = tree.file("mastersystem/mystery.bin", &rom);
 
     let report =
@@ -1515,7 +1790,7 @@ fn playstation_image() -> Vec<u8> {
 
 fn mega_drive_rom() -> Vec<u8> {
     let mut rom = vec![0_u8; 0x200];
-    rom[0x100..0x104].copy_from_slice(b"SEGA");
+    rom[0x100..0x10f].copy_from_slice(b"SEGA MEGA DRIVE");
     rom
 }
 
@@ -1750,4 +2025,1115 @@ fn a_plain_file_behaves_exactly_as_it_did_before_trusted_roots_existed() {
             .all(|item| !item.detail.contains("symlink")),
         "a plain file must not claim a link was followed"
     );
+}
+
+// --- MAME machine/software-list identity hygiene --------------------------
+
+/// The bare MAME front-loader shortname `neocd` must resolve to the same
+/// canonical `Neo Geo CD` platform as its existing aliases, and must never be
+/// pulled into the separate cartridge `NeoGeo` platform.
+#[test]
+fn bare_neocd_alias_resolves_to_neo_geo_cd_and_never_to_cartridge_neo_geo() {
+    assert_eq!(
+        platform_for_alias("neocd").map(|p| p.id),
+        Some("Neo Geo CD")
+    );
+    assert_eq!(
+        platform_for_alias("neocdz").map(|p| p.id),
+        Some("Neo Geo CD")
+    );
+    assert_ne!(platform_for_alias("neocd").map(|p| p.id), Some("NeoGeo"));
+}
+
+/// The new canonical `PC-FX` row exists and every reviewed alias spelling
+/// resolves to it - closing the registry gap the PC-FX identity stack
+/// (`pcfx_boot_evidence`, `inspect_pcfx_source`, `evidence_bridge`) already
+/// depended on.
+#[test]
+fn pcfx_canonical_row_and_aliases_resolve() {
+    assert!(platform_by_id("PC-FX").is_some());
+    assert_eq!(
+        platform_by_id("PC-FX").map(|p| p.display_name),
+        Some("PC-FX")
+    );
+    for hint in [
+        "PC-FX",
+        "pc-fx",
+        "pcfx",
+        "PCFX",
+        "nec pc-fx",
+        "NEC PCFX",
+        "necpcfx",
+    ] {
+        assert_eq!(
+            platform_for_alias(hint).map(|p| p.id),
+            Some("PC-FX"),
+            "`{hint}` should resolve to PC-FX"
+        );
+    }
+    // A shared optical extension alone never names PC-FX (or anything).
+    assert!(!platform_by_id("PC-FX").unwrap().has_strong_extension("chd"));
+    assert!(platform_by_id("PC-FX").unwrap().has_weak_extension("chd"));
+}
+
+#[test]
+fn mame_software_list_suffix_strip_uses_a_fixed_allowlist_only() {
+    for (raw, expected_base) in [
+        ("c128_flop", "c128"),
+        ("c128_cart", "c128"),
+        ("c128_cass", "c128"),
+        ("c128_rom", "c128"),
+        ("megacd_cd", "megacd"),
+    ] {
+        assert_eq!(
+            strip_mame_software_list_suffix(raw),
+            expected_base,
+            "`{raw}` should strip to `{expected_base}`"
+        );
+    }
+
+    // A suffix outside the fixed allowlist is never stripped, generically or
+    // otherwise - it might be part of the machine's real short name.
+    for raw in ["c128_unknown", "c128_flop3", "c128", "_flop"] {
+        assert_eq!(
+            strip_mame_software_list_suffix(raw),
+            raw,
+            "`{raw}` must be left unchanged"
+        );
+    }
+}
+
+/// The suffix strip is only half the job: the resulting base name still has
+/// to resolve through the ordinary alias pipeline like any other hint.
+#[test]
+fn mame_software_list_suffix_strip_resolves_toward_the_right_canonical_platform() {
+    let base = strip_mame_software_list_suffix("c128_flop");
+    assert_eq!(base, "c128");
+    assert_eq!(
+        platform_for_alias(base).map(|p| p.id),
+        Some("Commodore 128")
+    );
+
+    // An unrecognised suffix is never stripped, so it must not accidentally
+    // resolve to anything either.
+    let unstripped = strip_mame_software_list_suffix("c128_unknown");
+    assert_eq!(platform_for_alias(unstripped), None);
+}
+
+// --- Extension candidate registry ------------------------------------------
+
+#[test]
+fn extension_candidates_are_case_insensitive_and_leading_dot_tolerant() {
+    let plain = platform_candidates_for_extension("nes");
+    assert_eq!(plain, vec!["NES"]);
+    assert_eq!(platform_candidates_for_extension(".nes"), plain);
+    assert_eq!(platform_candidates_for_extension("NES"), plain);
+    assert_eq!(platform_candidates_for_extension(".NES"), plain);
+}
+
+#[test]
+fn an_unknown_extension_has_no_candidates() {
+    assert_eq!(
+        platform_candidates_for_extension("not-a-real-extension"),
+        Vec::<&str>::new()
+    );
+}
+
+#[test]
+fn d64_includes_both_c64_and_c128() {
+    let candidates = platform_candidates_for_extension("d64");
+    assert!(candidates.contains(&"Commodore 128"));
+    assert!(candidates.contains(&"VIC-20"));
+    assert!(!candidates.contains(&"Commodore 64"));
+}
+
+#[test]
+fn cue_returns_several_optical_candidates() {
+    let candidates = platform_candidates_for_extension("cue");
+    assert!(
+        candidates.len() >= 5,
+        "expected several optical-disc platforms for `.cue`, got {candidates:?}"
+    );
+}
+
+#[test]
+fn bin_is_ambiguous_across_many_platforms() {
+    let candidates = platform_candidates_for_extension("bin");
+    assert!(
+        candidates.len() > 5,
+        "`.bin` should be shared by many platforms, got {candidates:?}"
+    );
+}
+
+#[test]
+fn extension_candidate_ordering_is_deterministic() {
+    let first = platform_candidates_for_extension("bin");
+    let second = platform_candidates_for_extension("bin");
+    assert_eq!(first, second);
+    let mut sorted = first.clone();
+    sorted.sort_unstable();
+    assert_eq!(first, sorted, "candidates should already be sorted by id");
+}
+
+#[test]
+fn every_extension_candidate_id_exists_in_the_registry() {
+    for platform in PLATFORMS {
+        for extension in platform
+            .strong_extensions
+            .iter()
+            .chain(platform.weak_extensions)
+        {
+            for id in platform_candidates_for_extension(extension) {
+                assert!(
+                    platform_by_id(id).is_some(),
+                    "`{id}` returned for `.{extension}` is not a registered platform"
+                );
+            }
+        }
+    }
+}
+
+#[test]
+fn extension_candidates_never_contain_a_duplicate_platform_id() {
+    for extension in ["bin", "cue", "d64", "nes", "zip", "iso", "rom"] {
+        let candidates = platform_candidates_for_extension(extension);
+        let mut deduped = candidates.clone();
+        deduped.sort_unstable();
+        deduped.dedup();
+        assert_eq!(
+            candidates.len(),
+            deduped.len(),
+            "`.{extension}` returned a duplicate platform id: {candidates:?}"
+        );
+    }
+}
+
+#[test]
+fn archive_container_formats_never_resolve_a_platform_by_themselves() {
+    // `.zip`/`.7z` are shared with too many platforms to mean anything; this
+    // asserts the registry does not pretend an archive container identifies
+    // one, whatever candidates it happens to list.
+    for extension in ["zip", "7z"] {
+        let candidates = platform_candidates_for_extension(extension);
+        assert_ne!(
+            candidates.len(),
+            1,
+            "`.{extension}` must never look like a single-platform match"
+        );
+    }
+}
+
+// --- Magic candidate registry -----------------------------------------
+
+/// A zero-filled buffer with `pattern` placed at `offset`, exactly long
+/// enough to hold it - enough to exercise a real [`MagicRule`] without ever
+/// touching a filesystem.
+fn bytes_with_signature_at(offset: usize, pattern: &[u8]) -> Vec<u8> {
+    let mut buffer = vec![0u8; offset + pattern.len()];
+    buffer[offset..offset + pattern.len()].copy_from_slice(pattern);
+    buffer
+}
+
+#[test]
+fn distinctive_magic_returns_the_expected_canonical_candidate() {
+    let nes = bytes_with_signature_at(0, b"NES\x1a");
+    assert_eq!(platform_candidates_from_bytes(&nes), vec!["NES"]);
+
+    let dreamcast = bytes_with_signature_at(0, b"SEGA SEGAKATANA");
+    assert_eq!(
+        platform_candidates_from_bytes(&dreamcast),
+        vec!["Dreamcast"]
+    );
+
+    let n64 = bytes_with_signature_at(0, &[0x80, 0x37, 0x12, 0x40]);
+    assert_eq!(platform_candidates_from_bytes(&n64), vec!["N64"]);
+}
+
+#[test]
+fn unknown_bytes_have_no_magic_candidates() {
+    let random = vec![1u8, 2, 3, 4, 5, 6, 7, 8, 9, 10];
+    assert_eq!(platform_candidates_from_bytes(&random), Vec::<&str>::new());
+    assert_eq!(platform_candidates_from_bytes(&[]), Vec::<&str>::new());
+}
+
+#[test]
+fn magic_candidate_ordering_is_deterministic() {
+    let buffer = bytes_with_signature_at(0x7ff0, b"TMR SEGA");
+    let first = platform_candidates_from_bytes(&buffer);
+    let second = platform_candidates_from_bytes(&buffer);
+    assert_eq!(first, second);
+    let mut sorted = first.clone();
+    sorted.sort_unstable();
+    assert_eq!(first, sorted);
+}
+
+#[test]
+fn every_magic_candidate_id_exists_in_the_registry() {
+    for platform in PLATFORMS {
+        for rule in platform.magic {
+            let buffer = bytes_with_signature_at(rule.offset as usize, rule.bytes);
+            for id in platform_candidates_from_bytes(&buffer) {
+                assert!(
+                    platform_by_id(id).is_some(),
+                    "`{id}` matched from a registered rule is not a registered platform"
+                );
+            }
+        }
+    }
+}
+
+#[test]
+fn a_platform_with_several_rules_matching_the_same_buffer_is_not_duplicated() {
+    // The Master System declares three `TMR SEGA` rules at three different
+    // offsets. A buffer big enough to satisfy all three must still report
+    // `MasterSystem` exactly once.
+    let mut buffer = vec![0u8; 0x7ff0 + 8];
+    for offset in [0x7ff0usize, 0x3ff0, 0x1ff0] {
+        buffer[offset..offset + 8].copy_from_slice(b"TMR SEGA");
+    }
+    let candidates = platform_candidates_from_bytes(&buffer);
+    assert_eq!(
+        candidates
+            .iter()
+            .filter(|id| **id == "MasterSystem")
+            .count(),
+        1
+    );
+}
+
+#[test]
+fn shared_magic_bytes_report_every_platform_that_declares_them() {
+    // `TMR SEGA` is deliberately shared by the Master System and Game Gear;
+    // `PLAYSTATION` is deliberately shared by the PS1 and PS2. Neither
+    // signature alone should look like a single-platform match.
+    let sega_header = bytes_with_signature_at(0x7ff0, b"TMR SEGA");
+    let sega_candidates = platform_candidates_from_bytes(&sega_header);
+    assert!(sega_candidates.contains(&"MasterSystem"));
+    assert!(sega_candidates.contains(&"GameGear"));
+
+    let playstation_header = bytes_with_signature_at(0x8008, b"PLAYSTATION");
+    let playstation_candidates = platform_candidates_from_bytes(&playstation_header);
+    assert!(playstation_candidates.contains(&"PSX"));
+    assert!(playstation_candidates.contains(&"PS2"));
+}
+
+#[test]
+fn platform_candidates_from_bytes_behaviour_is_unchanged_by_the_confidence_field() {
+    // The plain candidate function must still answer only "which platforms
+    // match", exactly as before - the Mega Drive `SEGA` header still yields
+    // exactly one candidate, even though that candidate is no longer treated
+    // as Strong anywhere downstream.
+    let mega_drive_header = bytes_with_signature_at(0x100, b"SEGA");
+    assert_eq!(
+        platform_candidates_from_bytes(&mega_drive_header),
+        vec!["MegaDrive"]
+    );
+    assert_eq!(platform_candidates_from_bytes(&[]), Vec::<&str>::new());
+}
+
+// --- Explicit, reviewed magic confidence -----------------------------------
+
+/// One row per [`MagicRule`] currently in the registry: `(platform id,
+/// offset, bytes, expected confidence)`. This table is the audit this chunk
+/// exists to produce - every rule in [`PLATFORMS`] must appear here exactly
+/// once, and every entry's confidence must match what the registry actually
+/// declares. Adding a new rule to the registry without adding it here is
+/// caught by [`every_magic_rule_in_the_registry_has_a_reviewed_confidence`].
+const REVIEWED_MAGIC_CONFIDENCE: &[(&str, u64, &[u8], MagicConfidence)] = &[
+    ("Atari7800", 0x1, b"ATARI7800", MagicConfidence::Strong),
+    ("Atari Lynx", 0, b"LYNX", MagicConfidence::Strong),
+    ("Amiga", 0, b"DOS\x00", MagicConfidence::Strong),
+    ("N64", 0, &[0x80, 0x37, 0x12, 0x40], MagicConfidence::Strong),
+    ("NES", 0, b"NES\x1a", MagicConfidence::Strong),
+    (
+        "GameCube",
+        0x1c,
+        &[0xc2, 0x33, 0x9f, 0x3d],
+        MagicConfidence::Strong,
+    ),
+    (
+        "Wii",
+        0x18,
+        &[0x5d, 0x1c, 0x9e, 0xa3],
+        MagicConfidence::Strong,
+    ),
+    ("Philips CD-i", 0x8008, b"CD-RTOS", MagicConfidence::Strong),
+    (
+        "Pokemon Mini",
+        0x21a4,
+        b"NINTENDO",
+        MagicConfidence::Corroborated,
+    ),
+    ("Dreamcast", 0, b"SEGA SEGAKATANA", MagicConfidence::Strong),
+    (
+        "GameGear",
+        0x7ff0,
+        b"TMR SEGA",
+        MagicConfidence::Corroborated,
+    ),
+    (
+        "MasterSystem",
+        0x7ff0,
+        b"TMR SEGA",
+        MagicConfidence::Corroborated,
+    ),
+    (
+        "MasterSystem",
+        0x3ff0,
+        b"TMR SEGA",
+        MagicConfidence::Corroborated,
+    ),
+    (
+        "MasterSystem",
+        0x1ff0,
+        b"TMR SEGA",
+        MagicConfidence::Corroborated,
+    ),
+    ("MegaDrive", 0x100, b"SEGA", MagicConfidence::Corroborated),
+    (
+        "Sega CD",
+        0,
+        b"SEGADISCSYSTEM",
+        MagicConfidence::Corroborated,
+    ),
+    (
+        "Sega CD",
+        0x10,
+        b"SEGADISCSYSTEM",
+        MagicConfidence::Corroborated,
+    ),
+    ("Saturn", 0, b"SEGA SEGASATURN", MagicConfidence::Strong),
+    ("PSX", 0x8008, b"PLAYSTATION", MagicConfidence::Corroborated),
+    ("PS2", 0x8008, b"PLAYSTATION", MagicConfidence::Corroborated),
+    (
+        "ZX Spectrum",
+        0,
+        b"ZXTape!\x1a",
+        MagicConfidence::Corroborated,
+    ),
+    (
+        "Amstrad CPC",
+        0,
+        b"ZXTape!\x1a",
+        MagicConfidence::Corroborated,
+    ),
+];
+
+#[test]
+fn every_magic_rule_in_the_registry_has_a_reviewed_confidence() {
+    // This is the audit table itself: every rule currently in `PLATFORMS`
+    // must have exactly one row here, and a future rule added to the
+    // registry without a matching row here fails this test loudly rather
+    // than silently inheriting some default confidence.
+    let mut registry_rules: Vec<(&str, u64, &[u8])> = Vec::new();
+    for platform in PLATFORMS {
+        for rule in platform.magic {
+            registry_rules.push((platform.id, rule.offset, rule.bytes));
+        }
+    }
+    let mut reviewed_rules: Vec<(&str, u64, &[u8])> = REVIEWED_MAGIC_CONFIDENCE
+        .iter()
+        .map(|(platform, offset, bytes, _)| (*platform, *offset, *bytes))
+        .collect();
+
+    registry_rules.sort();
+    reviewed_rules.sort();
+    assert_eq!(
+        registry_rules, reviewed_rules,
+        "every MagicRule in PLATFORMS must have exactly one row in \
+         REVIEWED_MAGIC_CONFIDENCE, and vice versa"
+    );
+
+    for platform in PLATFORMS {
+        for rule in platform.magic {
+            let expected = REVIEWED_MAGIC_CONFIDENCE
+                .iter()
+                .find(|(id, offset, bytes, _)| {
+                    *id == platform.id && *offset == rule.offset && *bytes == rule.bytes
+                })
+                .map(|(_, _, _, confidence)| *confidence)
+                .unwrap_or_else(|| {
+                    panic!(
+                        "{} rule at offset {:#x} has no reviewed confidence entry",
+                        platform.id, rule.offset
+                    )
+                });
+            assert_eq!(
+                rule.confidence, expected,
+                "{} rule at offset {:#x} does not match its reviewed confidence",
+                platform.id, rule.offset
+            );
+        }
+    }
+}
+
+#[test]
+fn known_shared_signatures_remain_corroborated() {
+    for (platform, offset, bytes) in [
+        ("GameGear", 0x7ff0u64, b"TMR SEGA".as_slice()),
+        ("MasterSystem", 0x7ff0, b"TMR SEGA"),
+        ("PSX", 0x8008, b"PLAYSTATION"),
+        ("PS2", 0x8008, b"PLAYSTATION"),
+    ] {
+        let rule = platform_by_id(platform)
+            .unwrap()
+            .magic
+            .iter()
+            .find(|rule| rule.offset == offset && rule.bytes == bytes)
+            .unwrap_or_else(|| panic!("{platform} has no rule at {offset:#x}"));
+        assert_eq!(
+            rule.confidence,
+            MagicConfidence::Corroborated,
+            "{platform}'s rule at {offset:#x} must remain Corroborated"
+        );
+    }
+}
+
+#[test]
+fn mega_drive_sega_header_is_corroborated_not_strong() {
+    let rule = platform_by_id("MegaDrive")
+        .unwrap()
+        .magic
+        .iter()
+        .find(|rule| rule.offset == 0x100)
+        .expect("Mega Drive has a SEGA header rule");
+    assert_eq!(
+        rule.confidence,
+        MagicConfidence::Corroborated,
+        "Sega 32X carts share this exact header and have no rule of their \
+         own yet, so this must not be treated as Mega-Drive-unique"
+    );
+}
+
+#[test]
+fn at_least_one_reviewed_rule_is_genuinely_strong() {
+    let nes_rule = platform_by_id("NES")
+        .unwrap()
+        .magic
+        .iter()
+        .find(|rule| rule.bytes == b"NES\x1a")
+        .expect("NES has an iNES header rule");
+    assert_eq!(nes_rule.confidence, MagicConfidence::Strong);
+}
+
+#[test]
+fn magic_confidence_lookup_ordering_is_deterministic() {
+    let buffer = bytes_with_signature_at(0x7ff0, b"TMR SEGA");
+    let first = platform_magic_confidence_from_bytes(&buffer);
+    let second = platform_magic_confidence_from_bytes(&buffer);
+    assert_eq!(first, second);
+    let mut sorted = first.clone();
+    sorted.sort_by(|left, right| left.0.cmp(right.0));
+    assert_eq!(first, sorted);
+}
+
+#[test]
+fn a_platform_with_mixed_confidence_rules_reports_its_best_match() {
+    // Not a real registry scenario today (every platform's rules currently
+    // share one confidence), but the lookup's own "best match wins" rule is
+    // still worth proving directly against the actual Master System entry:
+    // matching only the Strong-if-it-were-Strong offset should never be
+    // silently downgraded by an unrelated Corroborated rule on the same
+    // platform. Here all three Master System rules are Corroborated, so the
+    // result should simply be Corroborated - this is the "no accidental
+    // upgrade or downgrade across a platform's own rules" check.
+    let buffer = bytes_with_signature_at(0x1ff0, b"TMR SEGA");
+    let matches = platform_magic_confidence_from_bytes(&buffer);
+    let master_system = matches
+        .iter()
+        .find(|(id, _)| *id == "MasterSystem")
+        .expect("Master System matches its smallest-dump offset");
+    assert_eq!(master_system.1, MagicConfidence::Corroborated);
+}
+
+#[test]
+fn total_magic_rule_coverage_is_twenty_two_rules_across_nineteen_platforms() {
+    let mut rule_count = 0usize;
+    let mut platform_count = 0usize;
+    for platform in PLATFORMS {
+        if !platform.magic.is_empty() {
+            platform_count += 1;
+        }
+        rule_count += platform.magic.len();
+    }
+    assert_eq!(rule_count, 22);
+    assert_eq!(
+        platform_count, 19,
+        "Pokemon Mini adds the newest magic-rule platform"
+    );
+}
+
+#[test]
+fn zxtape_is_corroborated_not_strong() {
+    let rule = platform_by_id("ZX Spectrum")
+        .unwrap()
+        .magic
+        .iter()
+        .find(|rule| rule.bytes == b"ZXTape!\x1a")
+        .expect("ZX Spectrum has a ZXTape rule");
+    assert_eq!(
+        rule.confidence,
+        MagicConfidence::Corroborated,
+        "TZX/CDT is a tape-container format shared across more than one \
+         platform family; it must not be treated as unique ZX Spectrum \
+         platform evidence"
+    );
+}
+
+#[test]
+fn bare_tzx_zxtape_content_is_ambiguous_between_spectrum_and_cpc() {
+    let tree = TempTree::new("zxtape-tzx-parity");
+    let path = tree.file("unsorted/game.tzx", b"ZXTape!\x1a");
+    let report =
+        detect_platform_report(&DetectionRequest::new(&path, tree.path()).inspecting_content());
+
+    assert_eq!(report.platform, None);
+    assert_eq!(report.confidence, DetectionConfidence::Ambiguous);
+    assert_eq!(
+        report
+            .candidates
+            .iter()
+            .map(|candidate| candidate.platform)
+            .collect::<Vec<_>>(),
+        vec!["Amstrad CPC", "ZX Spectrum"]
+    );
+}
+
+#[test]
+fn bare_cdt_zxtape_content_is_ambiguous_between_spectrum_and_cpc() {
+    let tree = TempTree::new("zxtape-cdt-parity");
+    let path = tree.file("unsorted/game.cdt", b"ZXTape!\x1a");
+    let report =
+        detect_platform_report(&DetectionRequest::new(&path, tree.path()).inspecting_content());
+
+    assert_eq!(report.platform, None);
+    assert_eq!(report.confidence, DetectionConfidence::Ambiguous);
+    assert_eq!(
+        report
+            .candidates
+            .iter()
+            .map(|candidate| candidate.platform)
+            .collect::<Vec<_>>(),
+        vec!["Amstrad CPC", "ZX Spectrum"]
+    );
+}
+
+#[test]
+fn unsigned_tape_extensions_do_not_prefer_spectrum_or_cpc() {
+    let tree = TempTree::new("unsigned-tape-parity");
+    for extension in ["tzx", "cdt"] {
+        let path = tree.file(&format!("unsorted/game.{extension}"), b"not a signed tape");
+        let report =
+            detect_platform_report(&DetectionRequest::new(&path, tree.path()).inspecting_content());
+        assert_eq!(report.platform, None, ".{extension} selected a platform");
+        assert_eq!(
+            report.confidence,
+            DetectionConfidence::Ambiguous,
+            ".{extension}"
+        );
+        assert_eq!(
+            report
+                .candidates
+                .iter()
+                .map(|candidate| candidate.platform)
+                .collect::<Vec<_>>(),
+            vec!["Amstrad CPC", "ZX Spectrum"],
+            ".{extension} must retain both tape-platform candidates"
+        );
+    }
+}
+
+#[test]
+fn generic_voc_does_not_identify_amstrad_cpc() {
+    let report = detect(&format!("{ROOT}/unsorted/game.voc"));
+    assert_ne!(report.platform, Some("Amstrad CPC"));
+    assert!(
+        !report
+            .candidates
+            .iter()
+            .any(|candidate| candidate.platform == "Amstrad CPC")
+    );
+}
+
+#[test]
+fn commodore_prg_remains_ambiguous_and_not_strong_c64_evidence() {
+    let report = detect(&format!("{ROOT}/unsorted/game.prg"));
+    assert_ne!(report.platform, Some("Commodore 64"));
+    assert!(matches!(
+        report.confidence,
+        DetectionConfidence::Ambiguous | DetectionConfidence::Unknown
+    ));
+}
+
+#[test]
+fn zxtape_folder_aliases_break_the_spectrum_cpc_tie() {
+    let tree = TempTree::new("zxtape-folder-parity");
+    let spectrum = tree.file("spectrum/game.tzx", b"ZXTape!\x1a");
+    let cpc = tree.file("cpc/game.cdt", b"ZXTape!\x1a");
+
+    let spectrum_report =
+        detect_platform_report(&DetectionRequest::new(&spectrum, tree.path()).inspecting_content());
+    let cpc_report =
+        detect_platform_report(&DetectionRequest::new(&cpc, tree.path()).inspecting_content());
+
+    assert_eq!(spectrum_report.platform, Some("ZX Spectrum"));
+    assert_eq!(cpc_report.platform, Some("Amstrad CPC"));
+}
+
+#[test]
+fn trusted_cpc_metadata_breaks_zxtape_tie() {
+    let tree = TempTree::new("zxtape-trusted-parity");
+    let path = tree.file("unsorted/game.tzx", b"ZXTape!\x1a");
+    let report = detect_platform_report(
+        &DetectionRequest::new(&path, tree.path())
+            .inspecting_content()
+            .with_trusted_platform(Some("Amstrad CPC")),
+    );
+
+    assert_eq!(report.platform, Some("Amstrad CPC"));
+    assert_eq!(
+        report.deciding_source,
+        Some(DetectionSource::TrustedMetadata)
+    );
+}
+
+#[test]
+fn content_without_zxtape_signature_adds_no_cpc_signature_evidence() {
+    let tree = TempTree::new("zxtape-no-signature");
+    let path = tree.file("unsorted/random.bin", b"not a tape container");
+    let report =
+        detect_platform_report(&DetectionRequest::new(&path, tree.path()).inspecting_content());
+
+    assert_ne!(report.platform, Some("Amstrad CPC"));
+    assert!(!report.evidence.iter().any(|evidence| {
+        evidence.platform == "Amstrad CPC" && evidence.source == DetectionSource::Signature
+    }));
+}
+
+#[test]
+fn segadiscsystem_rules_are_corroborated_not_strong() {
+    for offset in [0u64, 0x10] {
+        let rule = platform_by_id("Sega CD")
+            .unwrap()
+            .magic
+            .iter()
+            .find(|rule| rule.offset == offset)
+            .unwrap_or_else(|| panic!("Sega CD has a rule at {offset:#x}"));
+        assert_eq!(
+            rule.confidence,
+            MagicConfidence::Corroborated,
+            "SEGADISCSYSTEM at {offset:#x} is not established as unique \
+             across every related Sega CD / 32X-CD-compatible case"
+        );
+    }
+}
+
+#[test]
+fn watara_supervision_has_scoped_aliases_and_candidate_sv_media() {
+    for alias in ["Watara Supervision", "Supervision", "svision"] {
+        assert_eq!(
+            platform_for_alias(alias).map(|platform| platform.id),
+            Some("Watara Supervision")
+        );
+    }
+    let platform = platform_by_id("Watara Supervision").expect("Supervision registry row");
+    assert!(platform.weak_extensions.contains(&"sv"));
+    assert!(!platform.strong_extensions.contains(&"sv"));
+    assert!(platform.weak_extensions.contains(&"bin"));
+}
+
+mod format_specific_structural_evidence {
+    //! Formats whose bytes identify a platform but which no fixed-offset
+    //! magic can express (see `detect::format_specific_evidence`).
+    use crate::platform::detect::{DetectionRequest, detect_platform_report};
+    use crate::platform::{DetectionConfidence, DetectionSource};
+    use crate::synthetic_media;
+
+    fn detect(name: &str, bytes: &[u8]) -> crate::platform::PlatformDetectionReport {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join("unsorted");
+        std::fs::create_dir_all(&root).unwrap();
+        let path = root.join(name);
+        std::fs::write(&path, bytes).unwrap();
+        let mut request = DetectionRequest::new(&path, &root);
+        request.read_signatures = true;
+        detect_platform_report(&request)
+    }
+
+    fn confirmed_by_signature(report: &crate::platform::PlatformDetectionReport, platform: &str) {
+        assert_eq!(report.platform, Some(platform), "{report:?}");
+        assert_eq!(
+            report.confidence,
+            DetectionConfidence::Confirmed,
+            "{report:?}"
+        );
+        assert_eq!(report.deciding_source, Some(DetectionSource::Signature));
+    }
+
+    #[test]
+    fn a_valid_ffs_floppy_without_the_dos0_magic_is_confirmed_amiga() {
+        confirmed_by_signature(
+            &detect("disk.adf", &synthetic_media::amiga_adf(1, b"FFS")),
+            "Amiga",
+        );
+        confirmed_by_signature(
+            &detect("disk.adf", &synthetic_media::amiga_adf(5, b"INTL")),
+            "Amiga",
+        );
+    }
+
+    #[test]
+    fn sinclair_snapshots_are_confirmed_from_their_structure() {
+        confirmed_by_signature(
+            &detect("game.sna", &synthetic_media::zx_sna_48k()),
+            "ZX Spectrum",
+        );
+        confirmed_by_signature(
+            &detect("game.z80", &synthetic_media::zx_z80_v1()),
+            "ZX Spectrum",
+        );
+    }
+
+    #[test]
+    fn the_detector_leaves_game_boy_headers_to_the_scans_own_header_rule() {
+        // `detect_game_boy_header_platform` owns .gb/.gbc (header_identity
+        // provenance, extension/colour-flag contract); a second verdict here
+        // would pre-empt it.
+        for (name, flag) in [("game.gb", 0x00), ("game.gbc", 0xC0), ("game.gbc", 0x80)] {
+            let report = detect(name, &synthetic_media::gameboy(flag));
+            assert!(
+                !report
+                    .evidence
+                    .iter()
+                    .any(|item| item.source == DetectionSource::Signature),
+                "{name}/{flag:#x}: {report:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_super_magic_drive_dump_is_confirmed_from_its_deinterleaved_header() {
+        confirmed_by_signature(
+            &detect("game.smd", &synthetic_media::megadrive_smd()),
+            "MegaDrive",
+        );
+    }
+
+    #[test]
+    fn junk_bytes_contribute_no_format_specific_evidence() {
+        for name in [
+            "disk.adf", "game.sna", "game.z80", "game.gb", "game.gbc", "game.smd",
+        ] {
+            let report = detect(name, &[0x5A; 20000]);
+            assert!(
+                !report
+                    .evidence
+                    .iter()
+                    .any(|item| item.source == DetectionSource::Signature),
+                "{name}: {report:?}"
+            );
+            assert_ne!(report.confidence, DetectionConfidence::Confirmed, "{name}");
+        }
+    }
+}
+
+mod shared_signature_families {
+    //! Signatures the registry marks `Corroborated` are shared between two
+    //! machines. They must never confirm a platform on their own; the
+    //! bounded family checks in `detect::format_specific_evidence` name the
+    //! machine where the bytes can, and ambiguity is reported otherwise.
+    use crate::platform::detect::{DetectionRequest, detect_platform_report};
+    use crate::platform::{DetectionConfidence, DetectionSource, PlatformDetectionReport};
+    use crate::synthetic_media;
+
+    fn detect_in(folder: &str, name: &str, bytes: &[u8]) -> PlatformDetectionReport {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join("collection");
+        let folder = root.join(folder);
+        std::fs::create_dir_all(&folder).unwrap();
+        let path = folder.join(name);
+        std::fs::write(&path, bytes).unwrap();
+        let mut request = DetectionRequest::new(&path, &root);
+        request.read_signatures = true;
+        detect_platform_report(&request)
+    }
+
+    fn detect(name: &str, bytes: &[u8]) -> PlatformDetectionReport {
+        detect_in("unsorted", name, bytes)
+    }
+
+    fn confirmed(report: &PlatformDetectionReport, platform: &str) {
+        assert_eq!(report.platform, Some(platform), "{report:?}");
+        assert_eq!(
+            report.confidence,
+            DetectionConfidence::Confirmed,
+            "{report:?}"
+        );
+        assert_eq!(report.deciding_source, Some(DetectionSource::Signature));
+    }
+
+    fn ambiguous_between(report: &PlatformDetectionReport, platforms: &[&str]) {
+        assert_eq!(report.platform, None, "{report:?}");
+        assert_eq!(
+            report.confidence,
+            DetectionConfidence::Ambiguous,
+            "{report:?}"
+        );
+        let names: Vec<&str> = report.candidates.iter().map(|c| c.platform).collect();
+        for platform in platforms {
+            assert!(
+                names.contains(platform),
+                "{platform} missing from {names:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn mega_drive_and_32x_cartridges_are_told_apart_by_the_console_name() {
+        confirmed(
+            &detect("game.md", &synthetic_media::megadrive_bin(0x400)),
+            "MegaDrive",
+        );
+        confirmed(
+            &detect("game.bin", &synthetic_media::megadrive_bin(0x400)),
+            "MegaDrive",
+        );
+        confirmed(
+            &detect("game.32x", &synthetic_media::sega32x_bin(0x400)),
+            "Sega 32X",
+        );
+        confirmed(
+            &detect("game.bin", &synthetic_media::sega32x_bin(0x400)),
+            "Sega 32X",
+        );
+        confirmed(
+            &detect("game.md", &synthetic_media::sega32x_bin(0x400)),
+            "Sega 32X",
+        );
+    }
+
+    #[test]
+    fn playstation_and_playstation_2_discs_are_told_apart_by_system_cnf() {
+        confirmed(&detect("game.iso", &synthetic_media::psx_iso()), "PSX");
+        confirmed(&detect("game.iso", &synthetic_media::ps2_iso()), "PS2");
+        confirmed(&detect("game.img", &synthetic_media::ps2_iso()), "PS2");
+    }
+
+    #[test]
+    fn master_system_and_game_gear_are_told_apart_by_the_region_nibble() {
+        confirmed(
+            &detect("game.sms", &synthetic_media::tmr_sega_cartridge(4)),
+            "MasterSystem",
+        );
+        confirmed(
+            &detect("game.sms", &synthetic_media::tmr_sega_cartridge(3)),
+            "MasterSystem",
+        );
+        confirmed(
+            &detect("game.gg", &synthetic_media::tmr_sega_cartridge(6)),
+            "GameGear",
+        );
+        confirmed(
+            &detect("game.bin", &synthetic_media::tmr_sega_cartridge(5)),
+            "GameGear",
+        );
+        // The nibble and the file's own extension disagree (a Game Gear
+        // cartridge in Master System mode, or a misnamed file): neither fact
+        // outranks the other, so the file is ambiguous and asks.
+        ambiguous_between(
+            &detect("game.sms", &synthetic_media::tmr_sega_cartridge(7)),
+            &["MasterSystem", "GameGear"],
+        );
+        ambiguous_between(
+            &detect("game.gg", &synthetic_media::tmr_sega_cartridge(4)),
+            &["MasterSystem", "GameGear"],
+        );
+    }
+
+    #[test]
+    fn a_32x_file_whose_header_says_genesis_asks_instead_of_being_confirmed() {
+        let mut rom = synthetic_media::sega32x_bin(0x400);
+        rom[0x100..0x110].copy_from_slice(b"SEGA GENESIS    ");
+        let report = detect("game.32x", &rom);
+        assert_ne!(
+            report.confidence,
+            DetectionConfidence::Confirmed,
+            "{report:?}"
+        );
+        assert!(report.requires_confirmation);
+        assert!(report.candidates.iter().any(|c| c.platform == "Sega 32X"));
+        // Without the extension's say-so the documented name is what it is:
+        // a known limit, stated in the CHANGELOG.
+        confirmed(&detect("game.bin", &rom), "MegaDrive");
+    }
+
+    #[test]
+    fn an_undocumented_sega_console_name_is_family_evidence_not_a_confirmation() {
+        let mut rom = synthetic_media::megadrive_bin(0x400);
+        rom[0x100..0x110].copy_from_slice(b"SEGA PICO       ");
+        let report = detect("game.md", &rom);
+        assert_ne!(
+            report.confidence,
+            DetectionConfidence::Confirmed,
+            "{report:?}"
+        );
+        assert!(report.requires_confirmation);
+        assert!(report.candidates.iter().any(|c| c.platform == "MegaDrive"));
+        let report = detect("game.bin", &rom);
+        assert_ne!(
+            report.confidence,
+            DetectionConfidence::Confirmed,
+            "{report:?}"
+        );
+    }
+
+    #[test]
+    fn a_sega_cd_boot_sector_is_a_sega_cd_not_a_mega_drive_cartridge() {
+        confirmed(
+            &detect("disc.iso", &synthetic_media::segacd_iso()),
+            "Sega CD",
+        );
+        confirmed(
+            &detect("disc.bin", &synthetic_media::segacd_iso()),
+            "Sega CD",
+        );
+    }
+
+    #[test]
+    fn a_shared_signature_alone_never_confirms_a_platform() {
+        // `PLAYSTATION` in the volume descriptor with no SYSTEM.CNF.
+        let mut image = vec![0u8; 0x8800];
+        image[0x8008..0x8013].copy_from_slice(b"PLAYSTATION");
+        ambiguous_between(&detect("disc.iso", &image), &["PSX", "PS2"]);
+
+        // `TMR SEGA` with a region nibble the header module does not know.
+        ambiguous_between(
+            &detect("game.bin", &synthetic_media::tmr_sega_cartridge(0xF)),
+            &["MasterSystem", "GameGear"],
+        );
+
+        // `ZXTape!` is shared by the Spectrum and the Amstrad CPC.
+        ambiguous_between(
+            &detect("tape.tzx", &synthetic_media::zx_tzx()),
+            &["ZX Spectrum", "Amstrad CPC"],
+        );
+
+        // `NINTENDO` at the Pokémon Mini offset is corroborating only.
+        let mut rom = vec![0u8; 0x2200];
+        let rule = crate::platform::platform_by_id("Pokemon Mini")
+            .unwrap()
+            .magic[0];
+        rom[rule.offset as usize..rule.offset as usize + rule.bytes.len()]
+            .copy_from_slice(rule.bytes);
+        let report = detect("game.min", &rom);
+        assert_ne!(
+            report.confidence,
+            DetectionConfidence::Confirmed,
+            "{report:?}"
+        );
+        assert!(report.requires_confirmation);
+    }
+
+    #[test]
+    fn a_folder_that_contradicts_a_32x_header_still_wins_but_only_as_probable() {
+        let report = detect_in(
+            "megadrive",
+            "game.bin",
+            &synthetic_media::sega32x_bin(0x400),
+        );
+        assert_eq!(report.platform, Some("MegaDrive"), "{report:?}");
+        assert_eq!(report.confidence, DetectionConfidence::Probable);
+        assert!(report.requires_confirmation);
+        assert!(report.candidates.iter().any(|c| c.platform == "Sega 32X"));
+
+        let agreeing = detect_in("sega32x", "game.bin", &synthetic_media::sega32x_bin(0x400));
+        assert_eq!(agreeing.platform, Some("Sega 32X"));
+        assert_eq!(agreeing.confidence, DetectionConfidence::Confirmed);
+    }
+
+    #[test]
+    fn decisive_evidence_outranks_the_shared_signature_it_sits_beside() {
+        // A PS2 disc still carries the shared `PLAYSTATION` bytes the PS1
+        // rule matches; BOOT2= decides and PS1 remains a visible candidate.
+        let report = detect("game.iso", &synthetic_media::ps2_iso());
+        confirmed(&report, "PS2");
+        assert!(report.candidates.iter().any(|c| c.platform == "PSX"));
+    }
+}
+
+mod inspection_completeness {
+    //! A "no platform" verdict is only a verdict when every read the
+    //! detector tried completed; otherwise the report says so.
+    use crate::platform::DetectionConfidence;
+    use crate::platform::detect::{DetectionRequest, detect_platform_report};
+    use crate::synthetic_media;
+
+    fn detect(name: &str, bytes: &[u8]) -> crate::platform::PlatformDetectionReport {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join("unsorted");
+        std::fs::create_dir_all(&root).unwrap();
+        let path = root.join(name);
+        std::fs::write(&path, bytes).unwrap();
+        let mut request = DetectionRequest::new(&path, &root);
+        request.read_signatures = true;
+        detect_platform_report(&request)
+    }
+
+    #[test]
+    fn a_completed_inspection_reports_no_problems_whatever_it_concludes() {
+        let confirmed = detect("game.md", &synthetic_media::megadrive_bin(0x400));
+        assert_eq!(confirmed.confidence, DetectionConfidence::Confirmed);
+        assert!(confirmed.inspection_problems.is_empty(), "{confirmed:?}");
+        let mut pico = synthetic_media::megadrive_bin(0x400);
+        pico[0x100..0x110].copy_from_slice(b"SEGA PICO       ");
+        let ambiguous = detect("game.md", &pico);
+        assert_ne!(ambiguous.confidence, DetectionConfidence::Confirmed);
+        assert!(ambiguous.inspection_problems.is_empty(), "{ambiguous:?}");
+    }
+
+    #[test]
+    fn a_read_that_fails_after_the_first_bytes_is_reported_as_incomplete() {
+        crate::safe_read::FAIL_READS_AT_OR_BEYOND
+            .with(|fault| *fault.borrow_mut() = Some(("game.md".into(), 0x80)));
+        let report = detect("game.md", &synthetic_media::megadrive_bin(0x400));
+        crate::safe_read::FAIL_READS_AT_OR_BEYOND.with(|fault| *fault.borrow_mut() = None);
+        assert_ne!(
+            report.confidence,
+            DetectionConfidence::Confirmed,
+            "{report:?}"
+        );
+        assert!(!report.inspection_problems.is_empty(), "{report:?}");
+        assert!(
+            report
+                .inspection_problems
+                .iter()
+                .any(|p| p.contains("0x100") || p.contains("prefix")),
+            "{report:?}"
+        );
+    }
+
+    #[test]
+    fn a_snapshot_replaced_under_inspection_is_reported_as_incomplete() {
+        let fired = std::rc::Rc::new(std::cell::Cell::new(false));
+        let flag = fired.clone();
+        crate::zx_spectrum_snapshot::BETWEEN_OPEN_AND_READ.with(|hook| {
+            *hook.borrow_mut() = Some(Box::new(move |opened: &std::path::Path| {
+                if !flag.get() {
+                    flag.set(true);
+                    std::fs::write(opened, b"replaced").unwrap();
+                }
+            }));
+        });
+        let report = detect("game.z80", &synthetic_media::zx_z80_v1());
+        crate::zx_spectrum_snapshot::BETWEEN_OPEN_AND_READ.with(|hook| *hook.borrow_mut() = None);
+        assert!(fired.get());
+        assert!(
+            report
+                .inspection_problems
+                .iter()
+                .any(|p| p.contains("changed")),
+            "{report:?}"
+        );
+        assert_ne!(report.confidence, DetectionConfidence::Confirmed);
+    }
 }

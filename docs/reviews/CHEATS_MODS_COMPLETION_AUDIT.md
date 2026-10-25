@@ -1,5 +1,9 @@
 # Current-main Cheats & Mods completion audit
 
+> **Completed review snapshot**
+>
+> This audit records an earlier implementation review and is retained for provenance. It is not current capability guidance; see the [README](../../README.md) and [cheat/mod safety guidance](../CHEATS_MODS_SAFETY.md).
+
 Date: 2026-08-08. Branch: `feature/cheat-provider-finishing` (== `origin/main` @ `a2e5c56`).
 
 This is a completion audit of the Cheats & Mods implementation as it actually
@@ -263,8 +267,9 @@ read-only cached fallback so a failed refresh never bricks discovery.
   explicitly reserves it for a future stage.
 - **CheatBase** (item 12): new provider, no architecture support; the
   `feature/cheatbase-provider-stage1` branch would need a proper review.
-- **`game_presentation.rs`** is dead code (`SelectedGamePresentation` with
-  `cheats_mods_available` is never referenced by production code).
+- **`game_presentation.rs`** was dead code (`SelectedGamePresentation` with
+  `cheats_mods_available` was never referenced by production code). Removed
+  2026-09-16; the module now holds only live platform identity wording.
 - **`--resume`** on the three `gamehacking-*-index-refresh` CLI verbs is
   parsed and ignored (the crawl already resumes from cache by default).
 

@@ -1,5 +1,7 @@
 # CHD-Aware DAT Verification: Research & Architecture
 
+> **Research snapshot** — This document records earlier research and design reasoning. It is not current capability documentation; see the [README](../../README.md), [current capabilities](../LAUNCH_SUPPORT.md), and [roadmap](../../ROADMAP.md) for present guidance.
+
 Status: research only. No application code was changed for this document. Repo `kiehntre/emuwiz`. Researched against `origin/main` at `f7c450c` (merge of PR #29); every repository file:line citation below was re-verified against current `origin/main` at `7c8d6ea` (merge of PR #33) and remains accurate — PR #33 changed only desktop/icon/install/release areas, none of which this report cites. Companion document: `docs/research/ARCHIVE_AWARE_DAT_VERIFICATION_RESEARCH.md`, which defines the general verification pipeline (outer file/container → inspect payload/member → raw verification → optional platform-specific normalization → exact DAT match → provenance-rich result). ZIP is the first container P0; NES header normalization is the first platform normalizer. This document answers: where does CHD belong in that architecture, and how is CHD verification made safe without rewriting user files?
 
 Tagging key: **DOCUMENTED FACT** (external, cited source), **CONCLUSION FROM SOURCE** (file:line in this repo), **INFERENCE** (reasoning stated), **UNCERTAIN** (flagged explicitly, not guessed).

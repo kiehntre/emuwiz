@@ -1,0 +1,652 @@
+//! The Review Identity screen: why a game did not verify automatically, and
+//! what the person can do about it. Browsing it is read-only; the only
+//! mutation is the explicit, confirmed "Choose system" action, which goes
+//! through the canonical manual platform assignment.
+use super::{
+    App,
+    activity::CancelPolicy,
+    backend::Command,
+    identity_review::{
+        DatKnowledge, DumpQuality, Review, ReviewState, provenance_text, review_for,
+    },
+    library::Game,
+    routes::{Route, Section},
+};
+use eframe::egui;
+use std::path::Path;
+
+mod contextual_actions;
+mod selected_evidence;
+
+#[cfg(test)]
+mod dat_freshness_tests;
+
+/// The system picker: nothing is preselected and nothing changes until the
+/// person confirms.
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
+pub(super) struct SystemChoice {
+    pub query: String,
+    pub selected: Option<&'static str>,
+}
+
+/// A platform's identity tally, from the same state function every page uses.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub(super) struct CheckSummary {
+    pub verified: usize,
+    pub matched: usize,
+    pub need_choice: usize,
+    /// Ready to verify: data may exist, but nothing has been compared yet.
+    pub not_checked: usize,
+    /// No usable identification data is installed for this platform.
+    pub no_data: usize,
+    /// The data was searched (or the file could not be read) and nothing matched.
+    pub no_match: usize,
+    /// The games that failed automatic verification, in library order.
+    pub rows: Vec<(i64, &'static str)>,
+}
+
+pub(super) fn summarize_platform(
+    library: &super::library::Library,
+    platform: &str,
+) -> CheckSummary {
+    let mut summary = CheckSummary::default();
+    for game in library
+        .games
+        .iter()
+        .filter(|game| game.platform == platform)
+    {
+        let review = review_for(game, &library.identity_context, None);
+        match review.state {
+            ReviewState::Verified(_) => {
+                summary.verified += 1;
+                continue;
+            }
+            ReviewState::ReferenceMatched => {
+                summary.matched += 1;
+                continue;
+            }
+            ReviewState::Conflict { .. }
+            | ReviewState::Ambiguous { .. }
+            | ReviewState::NoSystem => {
+                summary.need_choice += 1;
+            }
+            ReviewState::NotCompared => summary.not_checked += 1,
+            ReviewState::NoData { .. } => summary.no_data += 1,
+            ReviewState::NoMatch(_) => summary.no_match += 1,
+        }
+        summary.rows.push((game.archive.id, review.list_label()));
+    }
+    summary
+}
+
+#[derive(Default)]
+pub(super) struct ReviewUi {
+    /// Read-only Game Details guidance; separate from identity decisions.
+    pub verification_guidance: super::game_verification_guidance::State,
+    /// The platform tally last computed, keyed by library snapshot and platform.
+    pub check_cache: Option<(usize, String, CheckSummary)>,
+    /// Recorded DAT answer for `knowledge_for`, once loaded.
+    pub knowledge: Option<DatKnowledge>,
+    pub knowledge_for: Option<i64>,
+    pub knowledge_job: Option<u64>,
+    pub choosing: Option<SystemChoice>,
+    pub assign_job: Option<(u64, i64)>,
+    /// Set when a setup page was opened from a review, so it can offer a way back.
+    pub dat_context: Option<(i64, String)>,
+}
+
+impl ReviewUi {
+    /// Forget what was loaded so the next view re-reads it (for example after
+    /// returning from identification-data setup).
+    pub(super) fn invalidate(&mut self) {
+        self.knowledge = None;
+        self.knowledge_for = None;
+    }
+}
+
+/// How many systems the picker lists at once.
+const MAX_CHOICES: usize = 12;
+
+/// Canonical systems matching `query`, plus how many matched in all.
+pub(super) fn system_choices(query: &str) -> (Vec<(&'static str, &'static str)>, usize) {
+    let needle = query.trim().to_lowercase();
+    let all: Vec<_> = archivefs_core::platform::canonical_ids()
+        .into_iter()
+        .map(|id| (id, archivefs_core::platform::display_name_for(id)))
+        .filter(|(id, name)| {
+            needle.is_empty()
+                || name.to_lowercase().contains(&needle)
+                || id.to_lowercase().contains(&needle)
+        })
+        .collect();
+    let total = all.len();
+    (all.into_iter().take(MAX_CHOICES).collect(), total)
+}
+
+/// Read-only: the recorded DAT answer for one library item.
+pub(super) fn knowledge_at(
+    database_path: &Path,
+    archive_id: i64,
+) -> Result<Option<DatKnowledge>, String> {
+    let catalogues = archivefs_core::dat::sources::default_dat_sources_config_path()
+        .map(|path| archivefs_core::dat::configured_catalogues::load_configured_catalogues(&path))
+        .unwrap_or_default();
+    knowledge_with_catalogues(database_path, archive_id, &catalogues)
+}
+
+pub(super) fn knowledge_with_catalogues(
+    database_path: &Path,
+    archive_id: i64,
+    catalogues: &std::collections::HashMap<
+        String,
+        archivefs_core::dat::configured_catalogues::ConfiguredCatalogue,
+    >,
+) -> Result<Option<DatKnowledge>, String> {
+    let database = archivefs_core::Database::open_read_only(database_path)
+        .map_err(|error| error.to_string())?;
+    let mut all = Vec::new();
+    for persisted in database
+        .library_dat_identities_for_item(archive_id)
+        .map_err(|error| error.to_string())?
+    {
+        let Some(source) = catalogues.get(&persisted.source.source_id) else {
+            continue;
+        };
+        if let Some(mut summary) = database
+            .library_dat_identity_summary_for_item(
+                archive_id,
+                &persisted.source.source_id,
+                None,
+                source.revision.as_deref(),
+                true,
+            )
+            .map_err(|error| error.to_string())?
+        {
+            source.check_saved_identity(&mut summary);
+            // Browsing saved evidence cannot renew an unavailable, changed or
+            // unproven audit. Full per-source history remains in the DAT panel.
+            if summary.provenance_freshness
+                == archivefs_core::dat::library_identity_summary::DatProvenanceFreshness::Current
+            {
+                all.push(DatKnowledge::from_summary(&summary));
+            }
+        }
+    }
+    Ok(DatKnowledge::best(all))
+}
+
+/// A completed per-game lookup supersedes the library's older DAT flag.
+/// Independent file evidence still goes through the canonical review function.
+fn review_with_current_knowledge(
+    game: &Game,
+    context: &super::library::IdentityContext,
+    knowledge: Option<&DatKnowledge>,
+) -> Review {
+    let mut current = game.clone();
+    current.dat_exact = None;
+    review_for(&current, context, knowledge)
+}
+
+/// Where the recorded system came from, in words.
+pub(super) fn system_source_note(source: Option<&str>) -> &'static str {
+    match source {
+        Some(archivefs_core::MANUAL_PLATFORM_SOURCE) => "You chose this system.",
+        Some("header_identity") => "Detected from the file's own header.",
+        Some("verified_dat") | Some("verified_dat+romm") => {
+            "Established by a verified catalogue match."
+        }
+        Some("source_assignment") => "Assigned to this folder in Sources.",
+        Some("folder_alias") | Some("custom_folder_alias") => "Taken from the folder name.",
+        Some(_) => "Detected automatically.",
+        None => "How this system was set is not recorded.",
+    }
+}
+
+/// Removes the person's own system choice; the canonical clear restores the
+/// automatic assignment that was recorded before it, if any.
+pub(super) fn clear_system_at(database_path: &Path, archive_path: &Path) -> Result<(), String> {
+    crate::platform_source_actions::apply_platform_action_at(
+        database_path,
+        archive_path,
+        &crate::platform_source_actions::PlatformAction::Clear,
+    )
+    .map(|_| ())
+    .map_err(|error| error.to_string())
+}
+
+/// The explicit system choice, through the canonical manual assignment. Only a
+/// system from the registry is accepted: nothing is guessed or typed freehand.
+pub(super) fn assign_system_at(
+    database_path: &Path,
+    archive_path: &Path,
+    platform_id: &str,
+) -> Result<(), String> {
+    if !archivefs_core::platform::canonical_ids().contains(&platform_id) {
+        return Err("That is not a system EmuWiz knows.".into());
+    }
+    crate::platform_source_actions::apply_platform_action_at(
+        database_path,
+        archive_path,
+        &crate::platform_source_actions::PlatformAction::Set(platform_id.to_string()),
+    )
+    .map(|_| ())
+    .map_err(|error| error.to_string())
+}
+
+fn file_name(game: &Game) -> String {
+    game.archive.relative_path.file_name().map_or_else(
+        || game.title.clone(),
+        |name| name.to_string_lossy().into_owned(),
+    )
+}
+
+impl App {
+    /// Where a person goes to set up identification data for `game`'s system,
+    /// remembering which game they came from.
+    pub(super) fn open_identification_data(&mut self, game: i64, platform: &str) {
+        self.review.dat_context = Some((game, platform.to_string()));
+        self.go(Route::Section(Section::Dat));
+    }
+
+    pub(super) fn review_identity(&mut self, ui: &mut egui::Ui, id: i64) {
+        let library = self.library.clone();
+        let Some(game) = library.game(id) else {
+            ui.heading("Review identity");
+            ui.label("This game is not in the current game list. It may have moved or its folder may be disconnected.");
+            if ui.button("Return to games").clicked() {
+                self.go(Route::Section(Section::Games));
+            }
+            return;
+        };
+        if self.review.knowledge_for != Some(id) && self.review.knowledge_job.is_none() {
+            let job = self.activity.queue_with(
+                "Reading what EmuWiz knows about this game",
+                Route::ReviewIdentity(id),
+                CancelPolicy::NotCancellable,
+            );
+            self.review.knowledge_job = Some(job);
+            self.send(job, Command::LoadIdentityKnowledge { archive_id: id });
+        }
+        let loaded = self.review.knowledge_for == Some(id);
+        let knowledge = loaded.then(|| self.review.knowledge.clone()).flatten();
+        let review =
+            review_with_current_knowledge(game, &library.identity_context, knowledge.as_ref());
+        let mut route = None;
+        let mut choose_system = false;
+        let mut clear_system = false;
+        let mut contextual_action = None;
+        egui::ScrollArea::vertical()
+            .id_salt(("v2_review_identity", id))
+            .show(ui, |ui| {
+                ui.heading("Review identity");
+                ui.strong(file_name(game));
+                ui.label(if game.platform == super::library::UNKNOWN_PLATFORM {
+                    "System not chosen yet".to_string()
+                } else {
+                    game.platform.clone()
+                });
+                ui.add_space(8.0);
+                if !loaded {
+                    ui.label("Checking what EmuWiz has recorded for this game…");
+                }
+                if loaded {
+                    egui::Frame::group(ui.style()).show(ui, |ui| {
+                        ui.set_min_width(ui.available_width());
+                        show_state(
+                            ui,
+                            game,
+                            &review,
+                            knowledge.as_ref(),
+                            &mut route,
+                            &mut choose_system,
+                        );
+                    });
+                }
+                ui.add_space(8.0);
+                egui::CollapsingHeader::new("Why this identity?").show(ui, |ui| {
+                    let guidance = self
+                        .review
+                        .verification_guidance
+                        .current(game, ui.ctx())
+                        .cloned();
+                    contextual_action = contextual_actions::show(
+                        ui,
+                        game,
+                        &review,
+                        loaded,
+                        guidance.as_ref(),
+                        &self.router.current,
+                    );
+                    selected_evidence::show(
+                        ui,
+                        &game.archive.absolute_path,
+                        game.archive.identity_report.as_ref(),
+                    );
+                });
+                ui.collapsing("Technical details", |ui| {
+                    ui.label(format!(
+                        "File: {}",
+                        provenance_text(&game.archive.absolute_path.display().to_string())
+                    ));
+                    ui.label(format!("Catalogue id: {}", game.archive.id));
+                    match &knowledge {
+                        Some(known) => ui.label(&known.technical),
+                        None => ui.label("No recorded identification-data check for this game."),
+                    };
+                });
+                ui.add_space(8.0);
+                if game.platform != super::library::UNKNOWN_PLATFORM {
+                    let manual = game.archive.platform_source.as_deref()
+                        == Some(archivefs_core::MANUAL_PLATFORM_SOURCE);
+                    ui.small(system_source_note(game.archive.platform_source.as_deref()));
+                    ui.horizontal(|ui| {
+                        if ui.button("Change system").clicked() {
+                            choose_system = true;
+                        }
+                        if manual
+                            && ui
+                                .button("Use the detected system again")
+                                .on_hover_text("Removes your choice. The system EmuWiz detected before applies again, if there was one.")
+                                .clicked()
+                        {
+                            clear_system = true;
+                        }
+                    });
+                }
+                if ui.button("Back to game").clicked() {
+                    route = Some(Route::Game(id));
+                }
+            });
+        if choose_system {
+            self.review.choosing = Some(SystemChoice::default());
+        }
+        if clear_system {
+            self.start_system_clear(id);
+        }
+        if let Some(action) = contextual_action {
+            self.run_identity_context_action(id, action);
+            return;
+        }
+        self.show_system_chooser(ui.ctx(), id);
+        if let Some(route) = route {
+            self.go(route);
+        }
+    }
+
+    fn show_system_chooser(&mut self, context: &egui::Context, id: i64) {
+        let Some(mut choice) = self.review.choosing.clone() else {
+            return;
+        };
+        let Some(game) = self.library.game(id) else {
+            self.review.choosing = None;
+            return;
+        };
+        let name = file_name(game);
+        let current_system = game.platform.clone();
+        // Leave room for the heading, search, confirmation text and buttons.
+        let list_height = (context.screen_rect().height() - 330.0).clamp(80.0, 260.0);
+        let busy = self.review.assign_job.is_some();
+        let mut confirm = None;
+        let mut cancel = false;
+        egui::Window::new("Choose system")
+            .collapsible(false)
+            .resizable(false)
+            .anchor(egui::Align2::CENTER_CENTER, egui::Vec2::ZERO)
+            .show(context, |ui| {
+                ui.set_max_width(460.0);
+                ui.label(format!("Which system is {name} for?"));
+                ui.label("EmuWiz does not guess. Pick the system yourself; nothing changes until you confirm.");
+                if current_system != super::library::UNKNOWN_PLATFORM {
+                    ui.label(format!("Currently: {current_system}. Your choice replaces it for this game only."));
+                }
+                ui.add(egui::TextEdit::singleline(&mut choice.query).hint_text("Search systems"));
+                let (matches, total) = system_choices(&choice.query);
+                // The list scrolls so the confirmation row below always stays
+                // on screen, even in a short window.
+                egui::ScrollArea::vertical()
+                    .id_salt("v2_choose_system_list")
+                    .max_height(list_height)
+                    .show(ui, |ui| {
+                        for (system, display) in &matches {
+                            if ui
+                                .selectable_label(choice.selected == Some(*system), *display)
+                                .clicked()
+                            {
+                                choice.selected = Some(*system);
+                            }
+                        }
+                    });
+                if total > matches.len() {
+                    ui.label(format!("Showing {} of {total}. Type to narrow the list.", matches.len()));
+                }
+                if let Some(selected) = choice.selected {
+                    ui.separator();
+                    ui.strong(format!(
+                        "Assign {} to {name}?",
+                        archivefs_core::platform::display_name_for(selected)
+                    ));
+                    ui.label("This records your choice for this one game. No game file is changed.");
+                }
+                ui.horizontal(|ui| {
+                    if ui
+                        .add_enabled(choice.selected.is_some() && !busy, egui::Button::new("Confirm system"))
+                        .clicked()
+                    {
+                        confirm = choice.selected;
+                    }
+                    if ui.button("Cancel").clicked() {
+                        cancel = true;
+                    }
+                });
+            });
+        if cancel {
+            self.review.choosing = None;
+        } else if let Some(system) = confirm {
+            self.start_system_assignment(id, system);
+        } else {
+            self.review.choosing = Some(choice);
+        }
+    }
+
+    fn start_system_assignment(&mut self, id: i64, system: &'static str) {
+        if self.review.assign_job.is_some() {
+            return;
+        }
+        let Some(game) = self.library.game(id) else {
+            self.review.choosing = None;
+            return;
+        };
+        let archive_path = game.archive.absolute_path.clone();
+        let job = self.activity.queue_with(
+            "Saving your system choice",
+            Route::ReviewIdentity(id),
+            CancelPolicy::NotCancellable,
+        );
+        self.review.assign_job = Some((job, id));
+        self.review.choosing = None;
+        self.send(
+            job,
+            Command::AssignSystem {
+                archive_id: id,
+                archive_path,
+                platform: system.to_string(),
+            },
+        );
+    }
+
+    fn start_system_clear(&mut self, id: i64) {
+        if self.review.assign_job.is_some() {
+            return;
+        }
+        let Some(game) = self.library.game(id) else {
+            return;
+        };
+        let archive_path = game.archive.absolute_path.clone();
+        let job = self.activity.queue_with(
+            "Removing your system choice",
+            Route::ReviewIdentity(id),
+            CancelPolicy::NotCancellable,
+        );
+        self.review.assign_job = Some((job, id));
+        self.send(
+            job,
+            Command::ClearSystem {
+                archive_id: id,
+                archive_path,
+            },
+        );
+    }
+
+    /// The assignment finished: re-read only what changed (this game's recorded
+    /// answer) and reload the saved library so every page sees the new system.
+    pub(super) fn finish_system_assignment(&mut self, id: i64) {
+        self.review.assign_job = None;
+        self.review.invalidate();
+        let _ = id;
+        self.load(false);
+    }
+
+    /// The tally Check Games shows, recomputed only when the library or the
+    /// chosen platform changes.
+    pub(super) fn check_summary(&mut self, platform: &str) -> CheckSummary {
+        let key = std::sync::Arc::as_ptr(&self.library) as usize;
+        if let Some((cached, name, summary)) = &self.review.check_cache
+            && *cached == key
+            && name == platform
+        {
+            return summary.clone();
+        }
+        let summary = summarize_platform(&self.library, platform);
+        self.review.check_cache = Some((key, platform.to_string(), summary.clone()));
+        summary
+    }
+
+    /// The one-line identity status every page shows for a game.
+    pub(super) fn identity_review_for(&self, id: i64) -> Option<Review> {
+        let game = self.library.game(id)?;
+        Some(if self.review.knowledge_for == Some(id) {
+            review_with_current_knowledge(
+                game,
+                &self.library.identity_context,
+                self.review.knowledge.as_ref(),
+            )
+        } else {
+            review_for(game, &self.library.identity_context, None)
+        })
+    }
+}
+
+fn show_state(
+    ui: &mut egui::Ui,
+    game: &Game,
+    review: &Review,
+    knowledge: Option<&DatKnowledge>,
+    route: &mut Option<Route>,
+    choose_system: &mut bool,
+) {
+    ui.heading(review.headline());
+    match &review.state {
+        ReviewState::Verified(facts) => {
+            ui.strong(&facts.title);
+            ui.label(format!(
+                "{}{}",
+                game.platform,
+                facts
+                    .region
+                    .as_ref()
+                    .map_or(String::new(), |region| format!(" · {region}"))
+            ));
+            if let Some(release) = facts.release {
+                ui.label(format!("Release: {release}"));
+            }
+            if let Some(label) = facts.dump.label() {
+                ui.colored_label(
+                    egui::Color32::from_rgb(200, 120, 20),
+                    format!("{label}. Identified, but not a clean preservation dump."),
+                );
+            }
+            ui.label(match (&facts.source, facts.by_file_evidence) {
+                (Some(source), _) => {
+                    format!("Evidence: trusted hash match · Reference source: {source}")
+                }
+                (None, true) => "Evidence: the file's own contents".to_string(),
+                (None, false) => "Evidence: trusted identification data".to_string(),
+            });
+            // Automatic: there is deliberately nothing to confirm.
+        }
+        _ => {
+            ui.label(verification_guidance(review));
+            if let ReviewState::Ambiguous { candidates } = &review.state {
+                ui.strong("Possible matches");
+                if candidates.is_empty() {
+                    ui.label("The candidate names were not kept with this check.");
+                }
+                for candidate in candidates.iter().take(12) {
+                    ui.label(format!("• {candidate}"));
+                }
+                ui.label("EmuWiz cannot choose between these for you yet. More evidence (a different dump or data source) is needed.");
+            }
+            if let (ReviewState::Conflict { .. }, Some(known)) = (&review.state, knowledge) {
+                ui.label(format!("Reference source: {}", known.source_name));
+            }
+            ui.add_space(4.0);
+            match &review.state {
+                ReviewState::NoSystem => {
+                    if ui.button("Choose system").clicked() {
+                        *choose_system = true;
+                    }
+                }
+                ReviewState::NoData {
+                    reference_source_exists: true,
+                }
+                | ReviewState::NotCompared
+                | ReviewState::NoMatch(_) => {
+                    if ui.button("View file details").clicked() {
+                        *route = Some(Route::Task {
+                            section: Section::Advanced,
+                            game: game.archive.id,
+                        });
+                    }
+                }
+                ReviewState::Conflict { .. } | ReviewState::Ambiguous { .. } => {
+                    if ui.button("View file details").clicked() {
+                        *route = Some(Route::Task {
+                            section: Section::Advanced,
+                            game: game.archive.id,
+                        });
+                    }
+                }
+                _ => {}
+            }
+        }
+    }
+    let _ = DumpQuality::Clean;
+}
+
+/// Navigation and explanations only: installed catalogues never establish a
+/// content-verification result or permission to skip the existing Preview.
+pub(super) fn setup_verification_route(platform: Option<&str>) -> Route {
+    platform
+        .and_then(archivefs_core::canonical_platform_for_alias)
+        .map(|p| Route::PlatformCheck(p.to_owned()))
+        .unwrap_or(Route::Section(Section::Check))
+}
+
+fn verification_guidance(review: &Review) -> String {
+    let mut guidance: String = match &review.state {
+        ReviewState::NoData { reference_source_exists:true } => "Install compatible identification data, then select it in Check Games. Preview the library population and confirm verification; installation alone does not check or verify any game.".into(),
+        ReviewState::NotCompared => "Catalogue data may be installed, but no completed content check is recorded for this game. Select a compatible catalogue, Preview, then confirm verification. The game remains Not checked until that check completes.".into(),
+        ReviewState::NoMatch(super::identity_review::NoMatchReason::NoUsableEvidence) => "No usable content-verification result is recorded. This does not prove that the file is bad. A check may still be required, or its format/evidence may be unsupported or unavailable; Preview explains what can be checked. Catalogue installation is not a Verified match.".into(),
+        _ => return review.explanation(),
+    };
+    if let Some(release) = review.apparent_release {
+        guidance.push_str(&format!(
+            " This appears to be a {} release. It may not exist in the standard identification data; that is not a fault with the file.",
+            release.to_ascii_lowercase()
+        ));
+    }
+    guidance
+}
+
+#[cfg(test)]
+mod catalogue_journey_tests;

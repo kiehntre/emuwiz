@@ -296,8 +296,10 @@ fn retroarch_cht_folder_platform_alias_matches_canonical_catalogue_platform() {
     );
 }
 
+/// A stray line beside metadata-only `cheatN_*` fields is not a usable
+/// candidate: no non-empty code can be selected or installed safely.
 #[test]
-fn malformed_cht_is_a_bounded_non_fatal_exclusion() {
+fn malformed_line_with_no_code_is_excluded_from_installable_candidates() {
     let root = temp_root("malformed-cht");
     fs::write(
         root.join("Game.cht"),
@@ -305,17 +307,38 @@ fn malformed_cht_is_a_bounded_non_fatal_exclusion() {
     )
     .unwrap();
     let snapshot = load_cheat_catalogue_snapshot(&HostReadOnlyFilesystem, "Fixture", &root);
-    assert!(snapshot.complete);
     assert_eq!(snapshot.index_state, CatalogueIndexState::UsablePartial);
     assert!(snapshot.games.is_empty());
-    assert_eq!(snapshot.excluded_entries.len(), 1);
-    assert_eq!(
-        snapshot.excluded_entries[0].kind,
-        CatalogueEntryExclusionKind::MalformedCht
+    assert_eq!(snapshot.excluded_malformed_count(), 1);
+}
+
+/// A `cheats=N` header that disagrees with the actual number of `cheatN_...`
+/// entries present must NOT be treated as malformed (2026-08-22, live-QA
+/// Phase 8: real, working Libretro `.cht` files hand-edited over time
+/// routinely drift out of sync between the two, and RetroArch itself never
+/// enforces them matching - the earlier strict check was excluding
+/// genuinely usable files under a "MalformedCht" label). Every syntactically
+/// valid line here is otherwise well-formed; only the declared count (3) is
+/// wrong for the 2 entries actually present.
+#[test]
+fn a_cheats_header_count_mismatch_alone_does_not_mark_a_cht_file_malformed() {
+    let root = temp_root("cheats-count-mismatch");
+    fs::write(
+        root.join("Game.cht"),
+        "cheats = 3\ncheat0_desc = \"A\"\ncheat0_enable = true\ncheat1_desc = \"B\"\n",
+    )
+    .unwrap();
+    let snapshot = load_cheat_catalogue_snapshot(&HostReadOnlyFilesystem, "Fixture", &root);
+    assert!(snapshot.complete);
+    assert!(
+        snapshot.excluded_entries.is_empty(),
+        "a header/entry-count mismatch alone must not exclude the file: {:?}",
+        snapshot.excluded_entries
     );
     assert_eq!(
-        snapshot.excluded_entries[0].source_game_name.as_deref(),
-        Some("Game")
+        snapshot.games.len(),
+        1,
+        "the two well-formed cheat entries must still be usable"
     );
 }
 
@@ -354,8 +377,17 @@ fn non_utf8_filename_is_skipped_with_diagnostic() {
     assert!(snapshot.diagnostics.is_empty());
 }
 
+/// Invalid UTF-8 content is no longer rejected purely for its encoding
+/// (see [`decode_cht_text`]) - it is decoded via the Windows-1252 fallback
+/// and judged on the resulting text like any other file. `Bad.cht` here has
+/// no `cheatN_*` entries at all and, after decoding, one stray non-`=` line
+/// (the lone high byte) - i.e. it is genuinely unusable content, so it is
+/// still excluded, just under `MalformedCht` rather than
+/// `UnsupportedContentEncoding`. `latin1_or_cp1252_high_byte_description_is_accepted`
+/// covers the corpus's actual case: a legacy high-byte character inside an
+/// otherwise-valid `cheatN_desc` value, which IS accepted.
 #[test]
-fn invalid_utf8_content_is_excluded_without_poisoning_valid_entries() {
+fn invalid_utf8_content_without_usable_entries_is_excluded_without_poisoning_valid_entries() {
     let root = temp_root("invalid-content-encoding");
     fs::write(root.join("Good.cht"), "cheats = 0\n").unwrap();
     fs::write(root.join("Bad.cht"), b"cheats = 1\n\xff").unwrap();
@@ -365,11 +397,128 @@ fn invalid_utf8_content_is_excluded_without_poisoning_valid_entries() {
     assert!(snapshot.complete);
     assert_eq!(snapshot.index_state, CatalogueIndexState::UsablePartial);
     assert_eq!(snapshot.games.len(), 1);
-    assert_eq!(snapshot.excluded_unsupported_count(), 1);
+    assert_eq!(snapshot.excluded_malformed_count(), 1);
     assert_eq!(
         snapshot.excluded_entries[0].kind,
-        CatalogueEntryExclusionKind::UnsupportedContentEncoding
+        CatalogueEntryExclusionKind::MalformedCht
     );
+}
+
+// ---------------------------------------------------------------------
+// P0/P1/P2 real-corpus compatibility fixes (2026-08-23)
+// ---------------------------------------------------------------------
+
+/// An isolated stray line is likewise fatal to this incomplete record when
+/// no non-empty `cheatN_code` is present.
+#[test]
+fn stray_line_without_code_is_excluded() {
+    let root = temp_root("stray-line-without-equals");
+    fs::write(
+        root.join("Game.cht"),
+        "cheats = 1\nfalse\ncheat0_desc = \"Infinite Lives\"\ncheat0_enable = true\n",
+    )
+    .unwrap();
+    let snapshot = load_cheat_catalogue_snapshot(&HostReadOnlyFilesystem, "Fixture", &root);
+    assert_eq!(snapshot.index_state, CatalogueIndexState::UsablePartial);
+    assert!(snapshot.games.is_empty());
+    assert_eq!(snapshot.excluded_malformed_count(), 1);
+}
+
+/// A file with only stray/malformed lines and zero real `cheatN_*` entries
+/// - a genuinely non-RetroArch stub - is still rejected.
+#[test]
+fn file_with_no_cheatn_entries_is_rejected() {
+    let root = temp_root("no-cheatn-entries");
+    fs::write(
+        root.join("Stub.cht"),
+        "Game Genie codes:\nAB12-CD34\n(not a RetroArch cheat file)\n",
+    )
+    .unwrap();
+    let snapshot = load_cheat_catalogue_snapshot(&HostReadOnlyFilesystem, "Fixture", &root);
+    assert!(snapshot.complete);
+    assert!(snapshot.games.is_empty());
+    assert_eq!(snapshot.excluded_malformed_count(), 1);
+    assert_eq!(
+        snapshot.excluded_entries[0].kind,
+        CatalogueEntryExclusionKind::MalformedCht
+    );
+}
+
+/// `cheats = 0` with no entries and no malformed lines remains valid - a
+/// clean, structurally sound file simply declaring it has no cheats.
+#[test]
+fn valid_empty_file_cheats_zero_is_accepted() {
+    let root = temp_root("valid-empty-cheats-zero");
+    fs::write(root.join("Empty.cht"), "cheats = 0\n").unwrap();
+    let snapshot = load_cheat_catalogue_snapshot(&HostReadOnlyFilesystem, "Fixture", &root);
+    assert!(snapshot.complete);
+    assert!(snapshot.excluded_entries.is_empty());
+    assert_eq!(snapshot.games.len(), 1);
+    assert_eq!(snapshot.games[0].cheat_count, 0);
+}
+
+/// A legacy `.cht` file with a Windows-1252/Latin-1 high byte (not valid
+/// UTF-8) in a `cheatN_desc` value is decoded via the bounded fallback and
+/// accepted, matching the 6-of-28,308 real-corpus case.
+#[test]
+fn latin1_or_cp1252_high_byte_description_is_accepted() {
+    let root = temp_root("latin1-high-byte-description");
+    let mut content = b"cheats = 1\ncheat0_desc = \"Vidas Extra".to_vec();
+    content.push(0xE9); // 'e' + acute accent in Latin-1/CP1252, invalid UTF-8 alone
+    content.extend_from_slice(b"s\"\ncheat0_enable = true\n");
+    fs::write(root.join("Legacy.cht"), &content).unwrap();
+
+    let snapshot = load_cheat_catalogue_snapshot(&HostReadOnlyFilesystem, "Fixture", &root);
+    assert!(snapshot.complete);
+    assert!(
+        snapshot.excluded_entries.is_empty(),
+        "legacy-encoded but otherwise valid content must not be excluded: {:?}",
+        snapshot.excluded_entries
+    );
+    assert_eq!(snapshot.games.len(), 1);
+    let game = &snapshot.games[0];
+    assert_eq!(game.cheat_count, 1);
+    assert_eq!(game.cheats[0].description.as_deref(), Some("Vidas Extraés"));
+}
+
+/// A real `cheatN_*` index above the old `MAX_CHEATS_PER_GAME` cap no
+/// longer makes an otherwise-valid file `MalformedCht`.
+#[test]
+fn index_beyond_old_max_cap_is_accepted() {
+    let root = temp_root("index-beyond-old-max-cap");
+    let high_index = MAX_CHEATS_PER_GAME + 1;
+    fs::write(
+        root.join("HighIndex.cht"),
+        format!("cheats = 1\ncheat{high_index}_desc = \"Late Entry\"\n"),
+    )
+    .unwrap();
+    let snapshot = load_cheat_catalogue_snapshot(&HostReadOnlyFilesystem, "Fixture", &root);
+    assert!(snapshot.complete);
+    assert!(snapshot.excluded_entries.is_empty());
+    assert_eq!(snapshot.games.len(), 1);
+    assert_eq!(snapshot.games[0].cheat_count, 1);
+    assert_eq!(
+        snapshot.games[0].cheats[0].declared_index,
+        Some(high_index as u32)
+    );
+}
+
+/// The `cheats = N` header/entry-count mismatch fix stays non-fatal
+/// alongside the new stray-line tolerance - both are non-fatal for the same
+/// underlying reason (a single line's defect never poisons the whole file).
+#[test]
+fn cheats_header_mismatch_still_remains_nonfatal() {
+    let root = temp_root("cheats-header-mismatch-nonfatal");
+    fs::write(
+        root.join("Game.cht"),
+        "cheats = 99\ncheat0_desc = \"A\"\ncheat0_enable = true\ncheat1_desc = \"B\"\n",
+    )
+    .unwrap();
+    let snapshot = load_cheat_catalogue_snapshot(&HostReadOnlyFilesystem, "Fixture", &root);
+    assert!(snapshot.complete);
+    assert!(snapshot.excluded_entries.is_empty());
+    assert_eq!(snapshot.games.len(), 1);
+    assert_eq!(snapshot.games[0].cheat_count, 2);
 }
 
 #[test]
@@ -1732,4 +1881,43 @@ fn module_source_never_reads_home_or_xdg_env_directly() {
             "cheat_catalogue.rs must never read {forbidden} directly"
         );
     }
+}
+
+#[test]
+fn shared_parser_diagnostics_preserve_mixed_catalogue_evidence_and_source_hash() {
+    let root = temp_root("cht-shared-diagnostics");
+    let text = "cheats = 99\ncheat0_desc = Lives\ncheat0_code = A\ncheat1_desc = Broken\ncheat1_code = \"unfinished\ncheat2_desc = Levels\ncheat2_code = B\ncheat2_code = C\n";
+    let path = root.join("Game.cht");
+    fs::write(&path, text).unwrap();
+    let snapshot = load_cheat_catalogue_snapshot(&HostReadOnlyFilesystem, "Fixture", &root);
+    assert_eq!(snapshot.games.len(), 1);
+    let record = &snapshot.games[0];
+    assert_eq!(
+        record.cheat_count, 3,
+        "metadata retains malformed evidence for review"
+    );
+    for code in [
+        "cht_declared_count_mismatch",
+        "cht_entry_truncated_value",
+        "cht_entry_conflicting_duplicate",
+    ] {
+        assert!(
+            record
+                .parsing_diagnostics
+                .iter()
+                .any(|diagnostic| diagnostic.code == code),
+            "{code}"
+        );
+    }
+    assert_eq!(
+        record.source_file_hash.as_deref(),
+        Some(hex_sha256(text.as_bytes()).as_str())
+    );
+    assert_eq!(fs::read(&path).unwrap(), text.as_bytes());
+    assert_eq!(
+        super::super::cht_document::parse_cht_bytes(text.as_bytes())
+            .unwrap()
+            .selectable_count(),
+        1
+    );
 }

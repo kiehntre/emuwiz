@@ -12,6 +12,75 @@ use crate::platform::{
 };
 use std::path::PathBuf;
 
+fn hdi_image(
+    header_size: u32,
+    sector_size: u32,
+    sectors: u32,
+    heads: u32,
+    cylinders: u32,
+) -> Vec<u8> {
+    let payload = u64::from(sector_size)
+        .checked_mul(u64::from(sectors))
+        .and_then(|value| value.checked_mul(u64::from(heads)))
+        .and_then(|value| value.checked_mul(u64::from(cylinders)))
+        .unwrap() as usize;
+    let mut image = vec![0; header_size as usize + payload];
+    image[8..12].copy_from_slice(&header_size.to_le_bytes());
+    image[12..16].copy_from_slice(&(payload as u32).to_le_bytes());
+    image[16..20].copy_from_slice(&sector_size.to_le_bytes());
+    image[20..24].copy_from_slice(&sectors.to_le_bytes());
+    image[24..28].copy_from_slice(&heads.to_le_bytes());
+    image[28..32].copy_from_slice(&cylinders.to_le_bytes());
+    image
+}
+
+fn nhd_image(
+    header_size: u32,
+    sector_size: u16,
+    sectors: u16,
+    heads: u16,
+    cylinders: u32,
+) -> Vec<u8> {
+    let payload = u64::from(sector_size)
+        .checked_mul(u64::from(sectors))
+        .and_then(|value| value.checked_mul(u64::from(heads)))
+        .and_then(|value| value.checked_mul(u64::from(cylinders)))
+        .unwrap() as usize;
+    let mut image = vec![0; header_size as usize + payload];
+    image[..15].copy_from_slice(b"T98HDDIMAGE.R0\0");
+    image[0x110..0x114].copy_from_slice(&header_size.to_le_bytes());
+    image[0x114..0x118].copy_from_slice(&cylinders.to_le_bytes());
+    image[0x118..0x11a].copy_from_slice(&heads.to_le_bytes());
+    image[0x11a..0x11c].copy_from_slice(&sectors.to_le_bytes());
+    image[0x11c..0x11e].copy_from_slice(&sector_size.to_le_bytes());
+    image[0x10..0x18].copy_from_slice(b"TEST NHD");
+    image
+}
+
+fn crt_image(version: u16, hardware_type: u16, packets: &[(u16, u16, u16, usize)]) -> Vec<u8> {
+    let packet_bytes: usize = packets.iter().map(|(_, _, _, size)| 0x10 + size).sum();
+    let mut image = vec![0; 0x40 + packet_bytes];
+    image[..16].copy_from_slice(b"C64 CARTRIDGE   ");
+    image[0x10..0x14].copy_from_slice(&0x40u32.to_be_bytes());
+    image[0x14..0x16].copy_from_slice(&version.to_be_bytes());
+    image[0x16..0x18].copy_from_slice(&hardware_type.to_be_bytes());
+    image[0x18] = 0;
+    image[0x19] = 1;
+    image[0x20..0x2a].copy_from_slice(b"TEST CART\0");
+    let mut cursor = 0x40;
+    for (chip_type, bank, load_address, size) in packets {
+        image[cursor..cursor + 4].copy_from_slice(b"CHIP");
+        image[cursor + 4..cursor + 8].copy_from_slice(&(0x10u32 + *size as u32).to_be_bytes());
+        image[cursor + 8..cursor + 10].copy_from_slice(&chip_type.to_be_bytes());
+        image[cursor + 10..cursor + 12].copy_from_slice(&bank.to_be_bytes());
+        image[cursor + 12..cursor + 14].copy_from_slice(&load_address.to_be_bytes());
+        image[cursor + 14..cursor + 16].copy_from_slice(&(*size as u16).to_be_bytes());
+        image[cursor + 0x10..cursor + 0x10 + *size].fill(0xea);
+        cursor += 0x10 + size;
+    }
+    image
+}
+
 /// A throwaway tree with a trusted library root and an untrusted one beside it.
 struct Fixture {
     root: PathBuf,
@@ -120,6 +189,296 @@ impl Drop for Fixture {
     }
 }
 
+fn dfs_side(total_sectors: u16, title: &str, filename: &[u8; 7], start: u16) -> Vec<u8> {
+    let mut image = vec![0_u8; usize::from(total_sectors) * 256];
+    let title = title.as_bytes();
+    image[0..8].fill(b' ');
+    image[0..title.len().min(8)].copy_from_slice(&title[..title.len().min(8)]);
+    image[256..260].fill(b' ');
+    if title.len() > 8 {
+        image[256..256 + (title.len() - 8).min(4)].copy_from_slice(&title[8..title.len().min(12)]);
+    }
+    image[260] = 0x12; // valid BCD catalogue cycle number
+    image[261] = 8; // one eight-byte entry
+    image[262] = ((total_sectors >> 8) & 3) as u8; // disk-size high bits; boot option 0
+    image[263] = total_sectors as u8;
+    image[8..15].copy_from_slice(filename);
+    image[15] = b'$' | 0x80; // root directory, locked
+    let details = 256 + 8;
+    image[details..details + 2].copy_from_slice(&0x1900_u16.to_le_bytes());
+    image[details + 2..details + 4].copy_from_slice(&0x1900_u16.to_le_bytes());
+    image[details + 4..details + 6].copy_from_slice(&3_u16.to_le_bytes());
+    image[details + 6] = ((start >> 8) & 3) as u8;
+    image[details + 7] = start as u8;
+    image
+}
+
+fn valid_dfs_ssd() -> Vec<u8> {
+    dfs_side(400, "EXAMPLE DFS", b"!BOOT  ", 2)
+}
+
+fn valid_dfs_dsd() -> Vec<u8> {
+    let mut image = vec![0_u8; 800 * 256];
+    let side0 = dfs_side(400, "SIDE ZERO", b"ONE    ", 2);
+    let side1 = dfs_side(400, "SIDE ONE", b"TWO    ", 2);
+    image[..512].copy_from_slice(&side0[..512]);
+    image[0x0a00..0x0a00 + 512].copy_from_slice(&side1[..512]);
+    image
+}
+
+fn valid_fds(with_header: bool) -> Vec<u8> {
+    let mut side = vec![0_u8; FDS_SIDE_BYTES as usize];
+    side[0] = 0x01;
+    side[1..15].copy_from_slice(b"*NINTENDO-HVC*");
+    side[0x10..0x14].copy_from_slice(b"TST ");
+    side[0x13] = b' ';
+    side[0x15] = 0;
+    side[0x16] = 0;
+    side[0x17] = 0;
+    side[0x19] = 0;
+    side[0x35] = 0;
+    side[0x36] = 0;
+    side[56] = 0x02;
+    side[57] = 1;
+    side[58] = 0x03;
+    side[59] = 0;
+    side[60] = 1;
+    side[61..69].copy_from_slice(b"TEST    ");
+    side[69..71].copy_from_slice(&0x8000_u16.to_le_bytes());
+    side[71..73].copy_from_slice(&4_u16.to_le_bytes());
+    side[73] = 0;
+    side[75] = 0x04;
+    side[76..80].copy_from_slice(b"FDS!");
+
+    if with_header {
+        let mut image = vec![0_u8; 16];
+        image[..4].copy_from_slice(b"FDS\x1a");
+        image[4] = 1;
+        image.extend_from_slice(&side);
+        image
+    } else {
+        side
+    }
+}
+
+#[test]
+fn raw_fds_structure_is_validated_without_claiming_game_identity() {
+    let fixture = Fixture::new("fds-valid");
+    for (name, bytes) in [
+        ("headered.fds", valid_fds(true)),
+        ("raw.fds", valid_fds(false)),
+    ] {
+        let evidence = fixture.inspect(&fixture.write(&format!("library/{name}"), &bytes));
+        assert_eq!(evidence.format, Some(DiskFormat::FamicomDiskSystem));
+        assert_eq!(evidence.platform, Some("NES"));
+        assert!(evidence.conclusive);
+        assert!(
+            evidence
+                .evidence
+                .iter()
+                .any(|line| line.contains("not a particular game"))
+        );
+        assert!(matches!(
+            evidence.metadata,
+            Some(DiskFormatMetadata::Fds(_))
+        ));
+    }
+}
+
+#[test]
+fn malformed_raw_fds_is_refused_fail_closed() {
+    let fixture = Fixture::new("fds-invalid");
+    let valid = valid_fds(false);
+    let cases = [
+        ("random.fds", vec![0x5a; FDS_SIDE_BYTES as usize]),
+        ("truncated.fds", valid[..75].to_vec()),
+        ("bad-order.fds", {
+            let mut bytes = valid.clone();
+            bytes[56] = 0x03;
+            bytes
+        }),
+        ("bad-length.fds", {
+            let mut bytes = valid.clone();
+            bytes[71..73].copy_from_slice(&u16::MAX.to_le_bytes());
+            bytes
+        }),
+        ("bad-metadata.fds", {
+            let mut bytes = valid.clone();
+            bytes[61] = 0x01;
+            bytes
+        }),
+        ("wrong-extension.bin", valid),
+    ];
+    for (name, bytes) in cases {
+        let path = fixture.write(&format!("library/{name}"), &bytes);
+        let evidence = fixture.inspect(&path);
+        assert!(evidence.format.is_none(), "{name} was accepted");
+    }
+}
+
+#[test]
+fn standard_dfs_ssd_catalogue_is_valid_and_exposes_title_and_entry_metadata() {
+    let fixture = Fixture::new("dfs-ssd");
+    let path = fixture.write("library/example.ssd", &valid_dfs_ssd());
+    let evidence = fixture.inspect(&path);
+    assert_eq!(
+        evidence.format,
+        Some(DiskFormat::AcornDfsDisk),
+        "{evidence:?}"
+    );
+    assert!(!evidence.conclusive);
+    let Some(DiskFormatMetadata::Dfs(layout)) = evidence.metadata else {
+        panic!("expected DFS metadata: {:?}", evidence.metadata);
+    };
+    assert_eq!(layout.sides.len(), 1);
+    assert_eq!(layout.sides[0].title, "EXAMPLE DFS");
+    assert_eq!(layout.sides[0].files[0].filename, "!BOOT");
+    assert!(layout.sides[0].files[0].locked);
+    assert_eq!(layout.sides[0].files[0].start_sector, 2);
+    assert_eq!(layout.sides[0].files[0].load_address, 0x1900);
+}
+
+#[test]
+fn standard_dfs_dsd_catalogues_validate_on_both_interleaved_sides() {
+    let fixture = Fixture::new("dfs-dsd");
+    let path = fixture.write("library/example.dsd", &valid_dfs_dsd());
+    let evidence = fixture.inspect(&path);
+    assert_eq!(
+        evidence.format,
+        Some(DiskFormat::AcornDfsDisk),
+        "{evidence:?}"
+    );
+    let Some(DiskFormatMetadata::Dfs(layout)) = evidence.metadata else {
+        panic!("expected DFS metadata: {:?}", evidence.metadata);
+    };
+    assert!(layout.double_sided);
+    assert_eq!(layout.sides.len(), 2);
+    assert_eq!(layout.sides[0].title, "SIDE ZERO");
+    assert_eq!(layout.sides[1].title, "SIDE ONE");
+}
+
+#[test]
+fn standard_dfs_80_track_ssd_and_dsd_geometries_are_supported() {
+    let fixture = Fixture::new("dfs-80-track");
+    let ssd = fixture.write(
+        "library/example-80.ssd",
+        &dfs_side(800, "EIGHTY", b"ONE    ", 2),
+    );
+    let mut dsd_bytes = vec![0_u8; 2 * 800 * 256];
+    let side0 = dfs_side(800, "SIDE ZERO", b"ONE    ", 2);
+    let side1 = dfs_side(800, "SIDE ONE", b"TWO    ", 2);
+    dsd_bytes[..512].copy_from_slice(&side0[..512]);
+    dsd_bytes[0x0a00..0x0a00 + 512].copy_from_slice(&side1[..512]);
+    let dsd = fixture.write("library/example-80.dsd", &dsd_bytes);
+
+    assert_eq!(fixture.inspect(&ssd).format, Some(DiskFormat::AcornDfsDisk));
+    assert_eq!(fixture.inspect(&dsd).format, Some(DiskFormat::AcornDfsDisk));
+}
+
+#[test]
+fn dfs_random_truncated_and_impossible_entries_fail_closed() {
+    let fixture = Fixture::new("dfs-negative");
+    for (extension, size) in [("ssd", 100 * 1024), ("dsd", 200 * 1024)] {
+        let random = fixture.write(&format!("library/random.{extension}"), &vec![0xA5; size]);
+        assert!(!fixture.inspect(&random).is_recognised());
+    }
+    let short = fixture.write("library/short.ssd", &vec![0; 511]);
+    assert!(!fixture.inspect(&short).is_recognised());
+    let mut impossible = valid_dfs_ssd();
+    impossible[256 + 8 + 6] = 1; // start sector 0x190, past a 400-sector side once length is applied
+    impossible[256 + 8 + 7] = 0x90;
+    impossible[256 + 8 + 4] = 0xff;
+    impossible[256 + 8 + 5] = 0xff;
+    let impossible = fixture.write("library/impossible.ssd", &impossible);
+    assert!(!fixture.inspect(&impossible).is_recognised());
+    let mut malformed = valid_dfs_ssd();
+    malformed[8] = 0x01; // control byte in a declared filename
+    let malformed = fixture.write("library/malformed.ssd", &malformed);
+    assert!(!fixture.inspect(&malformed).is_recognised());
+}
+
+#[test]
+fn dfs_overlapping_and_overlong_file_extents_fail_closed_without_overflow() {
+    let fixture = Fixture::new("dfs-arithmetic");
+
+    let mut overlapping = valid_dfs_ssd();
+    overlapping[261] = 16; // two eight-byte catalogue entries
+    overlapping[16..23].copy_from_slice(b"SECOND ");
+    overlapping[23] = b'$';
+    overlapping[256 + 8 + 8..256 + 8 + 10].copy_from_slice(&0x1900_u16.to_le_bytes());
+    overlapping[256 + 8 + 10..256 + 8 + 12].copy_from_slice(&0x1900_u16.to_le_bytes());
+    overlapping[256 + 8 + 12..256 + 8 + 14].copy_from_slice(&3_u16.to_le_bytes());
+    overlapping[256 + 8 + 14] = 0;
+    overlapping[256 + 8 + 15] = 2;
+    let overlapping = fixture.write("library/overlapping.ssd", &overlapping);
+    assert!(!fixture.inspect(&overlapping).is_recognised());
+
+    let mut overlong = valid_dfs_ssd();
+    overlong[256 + 8 + 6] = 0x30; // maximum 24-bit file length high bits
+    overlong[256 + 8 + 4] = 0xff;
+    overlong[256 + 8 + 5] = 0xff;
+    let overlong = fixture.write("library/overlong.ssd", &overlong);
+    assert!(!fixture.inspect(&overlong).is_recognised());
+}
+
+#[test]
+fn dfs_inspection_reads_only_bounded_catalogue_data_and_not_adfs_extensions() {
+    let fixture = Fixture::new("dfs-bounds");
+    let path = fixture.write("library/example.ssd", &valid_dfs_ssd());
+    let evidence = fixture.inspect(&path);
+    assert!(evidence.bytes_inspected <= 2048);
+    for extension in ["adl", "adf"] {
+        let path = fixture.write(&format!("library/not-dfs.{extension}"), &valid_dfs_ssd());
+        assert_eq!(
+            fixture
+                .inspect(&path)
+                .refusal
+                .as_ref()
+                .map(DiskFormatRefusal::code),
+            Some("no_adapter")
+        );
+    }
+}
+
+#[test]
+fn dfs_structure_is_ambiguous_but_folder_evidence_resolves_the_canonical_platform() {
+    let fixture = Fixture::new("dfs-platform");
+    let bare = fixture.write("library/unsorted/example.ssd", &valid_dfs_ssd());
+    let bare_report = detect_platform_report(
+        &DetectionRequest::new(&bare, &fixture.path("library"))
+            .inspecting_content()
+            .with_trusted_roots(fixture.trusted()),
+    );
+    assert_eq!(bare_report.platform, None);
+    assert_eq!(bare_report.confidence, DetectionConfidence::Ambiguous);
+    assert!(
+        bare_report
+            .candidates
+            .iter()
+            .any(|candidate| candidate.platform == "BBC Micro")
+    );
+    assert!(
+        bare_report
+            .candidates
+            .iter()
+            .any(|candidate| candidate.platform == "Acorn Electron")
+    );
+
+    for (folder, expected) in [
+        ("bbcmicro", "BBC Micro"),
+        ("bbcmaster", "BBC Micro"),
+        ("electron", "Acorn Electron"),
+    ] {
+        let path = fixture.write(&format!("library/{folder}/example.ssd"), &valid_dfs_ssd());
+        let report = detect_platform_report(
+            &DetectionRequest::new(&path, &fixture.path("library"))
+                .inspecting_content()
+                .with_trusted_roots(fixture.trusted()),
+        );
+        assert_eq!(report.platform, Some(expected), "folder {folder}");
+    }
+}
+
 // --- Image builders -------------------------------------------------------
 
 /// One Atari ST floppy image, built exactly from a geometry.
@@ -146,6 +505,241 @@ fn st_image(sides: u16, sectors_per_track: u16, tracks: u16) -> Vec<u8> {
     image[0x18..0x1A].copy_from_slice(&sectors_per_track.to_le_bytes());
     image[0x1A..0x1C].copy_from_slice(&sides.to_le_bytes());
     image
+}
+
+fn d64_offset(track: u8, sector: u8) -> usize {
+    let sectors: u16 = (1..track)
+        .map(|t| match t {
+            1..=17 => 21,
+            18..=24 => 19,
+            25..=30 => 18,
+            _ => 17,
+        })
+        .sum();
+    (usize::from(sectors) + usize::from(sector)) * 256
+}
+
+/// Minimal real 35-track DOS 2.0 image: BAM, one directory sector, and an
+/// optional PRG chain. The BAM free counts and bitmaps are kept consistent so
+/// the fixture exercises the same invariants as a formatted disk.
+fn d64_image(file_blocks: usize) -> Vec<u8> {
+    let mut image = vec![0_u8; 174_848];
+    let bam_offset = d64_offset(18, 0);
+    image[bam_offset] = 18;
+    image[bam_offset + 1] = 1;
+    image[bam_offset + 2] = 0x41;
+    image[bam_offset + 0x90..bam_offset + 0xA0].copy_from_slice(b"TEST DISK       ");
+    image[bam_offset + 0xA2..bam_offset + 0xA4].copy_from_slice(b"01");
+    image[bam_offset + 0xA5..bam_offset + 0xA7].copy_from_slice(b"2A");
+    for track in 1..=35_u8 {
+        let base = bam_offset + 4 + (usize::from(track) - 1) * 4;
+        let count: u8 = match track {
+            1..=17 => 21,
+            18..=24 => 19,
+            25..=30 => 18,
+            _ => 17,
+        };
+        for sector in 0..count {
+            image[base + 1 + usize::from(sector / 8)] |= 1 << (sector % 8);
+        }
+        image[base] = count;
+    }
+    let mut used = vec![(18_u8, 0_u8), (18, 1)];
+    for sector in 0..file_blocks as u8 {
+        used.push((1, sector));
+    }
+    for (track, sector) in used {
+        let base = bam_offset + 4 + (usize::from(track) - 1) * 4;
+        image[base + 1 + usize::from(sector / 8)] &= !(1 << (sector % 8));
+    }
+    for track in 1..=35_u8 {
+        let base = bam_offset + 4 + (usize::from(track) - 1) * 4;
+        let count: u8 = match track {
+            1..=17 => 21,
+            18..=24 => 19,
+            25..=30 => 18,
+            _ => 17,
+        };
+        image[base] = (0..count)
+            .filter(|sector| image[base + 1 + usize::from(*sector / 8)] & (1 << (*sector % 8)) != 0)
+            .count() as u8;
+    }
+    let directory = d64_offset(18, 1);
+    image[directory] = 0;
+    image[directory + 1] = 0xFF;
+    if file_blocks > 0 {
+        image[directory + 2] = 0x82; // closed PRG
+        image[directory + 3] = 1;
+        image[directory + 4] = 0;
+        image[directory + 5..directory + 21].copy_from_slice(b"HELLO           ");
+        image[directory + 30..directory + 32].copy_from_slice(&(file_blocks as u16).to_le_bytes());
+        for sector in 0..file_blocks {
+            let current = d64_offset(1, sector as u8);
+            if sector + 1 == file_blocks {
+                image[current] = 0;
+                image[current + 1] = 2;
+            } else {
+                image[current] = 1;
+                image[current + 1] = (sector + 1) as u8;
+            }
+        }
+    }
+    image
+}
+
+#[test]
+fn d64_minimal_bam_directory_and_provenance_validate() {
+    let fixture = Fixture::new("d64-minimal");
+    let evidence = fixture.inspect(&fixture.write("library/minimal.d64", &d64_image(0)));
+    assert_eq!(
+        evidence.format,
+        Some(DiskFormat::Commodore1541D64),
+        "{:?}",
+        evidence.refusal
+    );
+    assert_eq!(evidence.platform, None);
+    assert!(!evidence.conclusive);
+    let Some(DiskFormatMetadata::D64(layout)) = evidence.metadata else {
+        panic!("D64 metadata")
+    };
+    assert_eq!(layout.tracks, 35);
+    assert_eq!(layout.disk_name, *b"TEST DISK       ");
+    assert_eq!(layout.disk_id, *b"01");
+    assert_eq!(layout.dos_type, *b"2A");
+    assert!(layout.directory.is_empty());
+}
+
+#[test]
+fn d64_prg_and_multi_sector_chain_validate() {
+    let fixture = Fixture::new("d64-file");
+    let evidence = fixture.inspect(&fixture.write("library/file.d64", &d64_image(2)));
+    let Some(DiskFormatMetadata::D64(layout)) = evidence.metadata else {
+        panic!("D64 metadata")
+    };
+    assert_eq!(layout.directory.len(), 1);
+    let entry = &layout.directory[0];
+    assert_eq!(
+        (entry.file_type, entry.closed, entry.locked),
+        (2, true, false)
+    );
+    assert_eq!(
+        (entry.start_track, entry.start_sector, entry.blocks),
+        (1, 0, 2)
+    );
+}
+
+#[test]
+fn d64_error_info_tail_is_supported_without_normalising_it() {
+    let fixture = Fixture::new("d64-error-tail");
+    let mut image = d64_image(0);
+    image.extend(std::iter::repeat_n(0xA5, 683));
+    let evidence = fixture.inspect(&fixture.write("library/tail.d64", &image));
+    let Some(DiskFormatMetadata::D64(layout)) = evidence.metadata else {
+        panic!("D64 metadata")
+    };
+    assert!(layout.has_error_info_tail);
+    assert_eq!(evidence.format, Some(DiskFormat::Commodore1541D64));
+}
+
+#[test]
+fn d64_bad_bam_directory_and_file_chain_are_fail_closed() {
+    let fixture = Fixture::new("d64-negative");
+    let path = fixture.write("library/bad.d64", &d64_image(1));
+    let bam = d64_offset(18, 0);
+    let mut bytes = std::fs::read(&path).unwrap();
+    bytes[bam + 4] = 0;
+    std::fs::write(&path, &bytes).unwrap();
+    assert!(fixture.inspect(&path).refusal.is_some());
+
+    let mut bytes = d64_image(1);
+    let directory = d64_offset(18, 1);
+    bytes[directory] = 99;
+    std::fs::write(&path, bytes).unwrap();
+    assert!(fixture.inspect(&path).refusal.is_some());
+
+    let mut bytes = d64_image(1);
+    bytes[directory] = 18;
+    bytes[directory + 1] = 1;
+    std::fs::write(&path, bytes).unwrap();
+    assert!(fixture.inspect(&path).refusal.is_some());
+
+    let mut bytes = d64_image(2);
+    let first = d64_offset(1, 0);
+    bytes[first] = 1;
+    bytes[first + 1] = 21;
+    std::fs::write(&path, bytes).unwrap();
+    assert!(fixture.inspect(&path).refusal.is_some());
+}
+
+#[test]
+fn d64_random_wrong_size_and_other_commodore_extensions_are_not_claimed() {
+    let fixture = Fixture::new("d64-extensions");
+    let random = fixture.write("library/random.d64", &[0xA5; 174_848]);
+    assert!(fixture.inspect(&random).refusal.is_some());
+    let wrong = fixture.write("library/wrong.d64", &[0; 123]);
+    assert!(fixture.inspect(&wrong).refusal.is_some());
+    for (name, length) in [("40-track.d64", 196_608), ("40-track-errors.d64", 197_376)] {
+        let path = fixture.write(name, &vec![0; length]);
+        let evidence = fixture.inspect(&path);
+        assert_eq!(
+            evidence.format, None,
+            "{name} must remain outside the supported scope"
+        );
+        assert!(
+            evidence.refusal.is_some(),
+            "{name} must be refused explicitly"
+        );
+    }
+    for extension in ["g64", "d71", "d81"] {
+        let path = fixture.write(&format!("library/untouched.{extension}"), &[0; 16]);
+        assert_eq!(
+            fixture.inspect(&path).format,
+            None,
+            ".{extension} must not dispatch to D64"
+        );
+    }
+}
+
+#[test]
+fn d64_folder_evidence_selects_c64_or_c128_but_bare_stays_ambiguous() {
+    let fixture = Fixture::new("d64-platform");
+    let bare = fixture.write("library/bare.d64", &d64_image(0));
+    let c64 = fixture.write("library/c64/game.d64", &d64_image(0));
+    let c128 = fixture.write("library/c128/game.d64", &d64_image(0));
+    let source_root = fixture.path("library");
+    let detect = |path: &std::path::Path| {
+        detect_platform_report(&DetectionRequest {
+            path,
+            source_root: &source_root,
+            manual_platform: None,
+            trusted_platform: None,
+            read_signatures: true,
+            inspect_layout: false,
+            emulator_context: None,
+            trusted_roots: fixture.trusted(),
+        })
+    };
+    assert_eq!(detect(&bare).platform, None);
+    assert_eq!(detect(&bare).confidence, DetectionConfidence::Ambiguous);
+    assert_eq!(detect(&c64).platform, Some("Commodore 64"));
+    assert_eq!(detect(&c128).platform, Some("Commodore 128"));
+}
+
+#[test]
+fn d64_ingestion_accepts_media_and_keeps_bare_platform_ambiguous() {
+    let fixture = Fixture::new("d64-ingestion");
+    let root = fixture.path("library");
+    std::fs::write(root.join("bare.d64"), d64_image(0)).unwrap();
+    let report = crate::ingestion::discovery::discover_source(&root).unwrap();
+    assert_eq!(report.items.len(), 1);
+    assert_eq!(
+        report.items[0].content,
+        Some(crate::ingestion::content_registry::ContentKind::ComputerDisk)
+    );
+    assert_eq!(
+        report.items[0].skip_reason,
+        Some(crate::ingestion::discovery::SkipReason::AmbiguousPlatform)
+    );
 }
 
 /// The standard double-sided 720 KB ST disk.
@@ -181,6 +775,30 @@ fn stx_image(version: u16, track_count: u8, record_length: u32) -> Vec<u8> {
 
 fn valid_stx() -> Vec<u8> {
     stx_image(3, 10, 64)
+}
+
+/// A minimal one-track, one-sector D88 container.
+fn d88_image(name: &str) -> Vec<u8> {
+    let track_offset = D88_HEADER_BYTES as u32;
+    let track_bytes = 16 + 128;
+    let mut image = vec![0u8; D88_HEADER_BYTES + track_bytes];
+    let name_bytes = name.as_bytes();
+    image[..name_bytes.len().min(17)].copy_from_slice(&name_bytes[..name_bytes.len().min(17)]);
+    image[0x1a] = 0; // write enabled
+    image[0x1b] = 0; // 2D media
+    image[0x1c..0x20].copy_from_slice(&track_offset.to_le_bytes());
+    let track = D88_HEADER_BYTES;
+    image[track] = 0; // C
+    image[track + 1] = 0; // H
+    image[track + 2] = 1; // R
+    image[track + 3] = 0; // N = 128 bytes
+    image[track + 4..track + 6].copy_from_slice(&1u16.to_le_bytes());
+    image[track + 6] = 0; // density
+    image[track + 7] = 0; // deleted-data flag
+    image[track + 8] = 0; // status/CRC
+    image[track + 14..track + 16].copy_from_slice(&128u16.to_le_bytes());
+    image[track + 16..].fill(0xe5);
+    image
 }
 
 // --- Limits ---------------------------------------------------------------
@@ -240,6 +858,179 @@ fn a_standard_720k_st_image_is_recognised() {
         "the limit of what this proves must be stated: {:?}",
         evidence.evidence
     );
+}
+
+#[test]
+fn a_minimal_d88_container_is_recognised_without_platform_identity() {
+    let fixture = Fixture::new("d88-minimal");
+    let image = fixture.write("library/disk.d88", &d88_image("PC88 TEST DISK"));
+    let evidence = fixture.inspect(&image);
+
+    assert_eq!(evidence.format, Some(DiskFormat::D88Container));
+    assert_eq!(evidence.platform, Some("NEC PC-8801"));
+    assert_eq!(evidence.confidence, DetectionConfidence::Probable);
+    assert!(!evidence.conclusive);
+    assert!(
+        evidence
+            .evidence
+            .iter()
+            .any(|item| item.contains("PC88 TEST DISK"))
+    );
+    assert!(
+        evidence
+            .evidence
+            .iter()
+            .any(|item| item.contains("write-protect"))
+    );
+    assert!(evidence.evidence.iter().any(|item| item.contains("0x00")));
+    match evidence.metadata {
+        Some(DiskFormatMetadata::D88(layout)) => {
+            assert_eq!(layout.disk_name[..14], *b"PC88 TEST DISK");
+            assert!(!layout.write_protected);
+            assert_eq!(layout.media_type, 0);
+            assert_eq!(layout.declared_track_entries, 1);
+            assert_eq!(layout.validated_track_entries, 1);
+            assert_eq!(layout.declared_sectors, 1);
+            assert_eq!(layout.declared_data_bytes, 128);
+        }
+        metadata => panic!("expected D88 metadata, got {metadata:?}"),
+    }
+}
+
+#[test]
+fn crt_header_and_multiple_chip_packets_are_recognised_as_shared_commodore_evidence() {
+    let fixture = Fixture::new("crt-valid");
+    let image = fixture.write(
+        "library/game.crt",
+        &crt_image(
+            0x0200,
+            0x0020,
+            &[(0, 0, 0x8000, 0x20), (2, 1, 0xa000, 0x10)],
+        ),
+    );
+    let evidence = fixture.inspect(&image);
+    assert_eq!(evidence.format, Some(DiskFormat::CommodoreCrt));
+    assert_eq!(evidence.platform, Some("Commodore 64"));
+    assert_eq!(evidence.confidence, DetectionConfidence::Probable);
+    assert!(!evidence.conclusive);
+    assert!(
+        evidence
+            .evidence
+            .iter()
+            .any(|line| line.contains("TEST CART"))
+    );
+    assert!(
+        evidence
+            .evidence
+            .iter()
+            .any(|line| line.contains("shared across"))
+    );
+    match evidence.metadata {
+        Some(DiskFormatMetadata::Crt(layout)) => {
+            assert_eq!(layout.version, 0x0200);
+            assert_eq!(layout.hardware_type, 0x0020);
+            assert_eq!(layout.packets, 2);
+            assert_eq!(layout.banks, vec![0, 1]);
+            assert_eq!(layout.total_image_bytes, 0x30);
+        }
+        metadata => panic!("expected CRT metadata, got {metadata:?}"),
+    }
+}
+
+#[test]
+fn crt_accepts_documented_versions_chip_types_and_unknown_hardware_id() {
+    let fixture = Fixture::new("crt-versions");
+    for (index, version) in [0x0100, 0x0101, 0x0200].into_iter().enumerate() {
+        let image = fixture.write(
+            &format!("library/version-{index}.crt"),
+            &crt_image(version, 0xfefe, &[(index as u16, index as u16, 0x8000, 1)]),
+        );
+        assert_eq!(
+            fixture.inspect(&image).format,
+            Some(DiskFormat::CommodoreCrt)
+        );
+    }
+}
+
+#[test]
+fn malformed_crt_structures_fail_closed() {
+    let fixture = Fixture::new("crt-invalid");
+    let valid = crt_image(0x0200, 0, &[(0, 0, 0x8000, 4)]);
+    let mut bad_signature = valid.clone();
+    bad_signature[0] = b'X';
+    let mut bad_header_length = valid.clone();
+    bad_header_length[0x10..0x14].copy_from_slice(&0x20u32.to_be_bytes());
+    let mut bad_version = valid.clone();
+    bad_version[0x14..0x16].copy_from_slice(&0x0300u16.to_be_bytes());
+    let mut bad_chip_signature = valid.clone();
+    bad_chip_signature[0x40] = b'X';
+    let mut bad_packet_length = valid.clone();
+    bad_packet_length[0x44..0x48].copy_from_slice(&0x0fu32.to_be_bytes());
+    let mut bad_image_size = valid.clone();
+    bad_image_size[0x4e..0x50].copy_from_slice(&0x20u16.to_be_bytes());
+    let mut trailing = valid.clone();
+    trailing.push(0xff);
+    for (label, bytes) in [
+        ("signature", bad_signature),
+        ("header", bad_header_length),
+        ("version", bad_version),
+        ("chip-signature", bad_chip_signature),
+        ("packet-length", bad_packet_length),
+        ("image-size", bad_image_size),
+        ("trailing", trailing),
+    ] {
+        let image = fixture.write(&format!("library/{label}.crt"), &bytes);
+        assert!(
+            fixture.inspect(&image).refusal.is_some(),
+            "{label} accepted"
+        );
+    }
+    let truncated = fixture.write("library/truncated.crt", &valid[..0x4f]);
+    assert!(fixture.inspect(&truncated).refusal.is_some());
+}
+
+#[test]
+fn d88_folder_context_does_not_turn_shared_structure_into_machine_proof() {
+    let fixture = Fixture::new("d88-context");
+    let image = fixture.write("library/disk.d88", &d88_image("SHARED"));
+    let evidence = fixture.inspect_in_folder(&image, "PC-98");
+    assert_eq!(evidence.format, Some(DiskFormat::D88Container));
+    assert_eq!(evidence.confidence, DetectionConfidence::Ambiguous);
+    assert!(!evidence.conclusive);
+}
+
+#[test]
+fn malformed_d88_structures_fail_closed() {
+    let fixture = Fixture::new("d88-invalid");
+    let cases = [
+        ("random", vec![0x5a; D88_HEADER_BYTES + 144]),
+        (
+            "truncated",
+            d88_image("TRUNCATED")[..D88_HEADER_BYTES - 1].to_vec(),
+        ),
+        ("past-eof", {
+            let mut bytes = d88_image("PAST EOF");
+            bytes[0x1c..0x20].copy_from_slice(&0xffff_ffffu32.to_le_bytes());
+            bytes
+        }),
+        ("bad-sector-header", {
+            let mut bytes = d88_image("BAD HEADER");
+            bytes[D88_HEADER_BYTES + 3] = 7;
+            bytes
+        }),
+        ("bad-sector-size", {
+            let mut bytes = d88_image("BAD SIZE");
+            bytes[D88_HEADER_BYTES + 14..D88_HEADER_BYTES + 16]
+                .copy_from_slice(&64u16.to_le_bytes());
+            bytes
+        }),
+    ];
+    for (label, bytes) in cases {
+        let image = fixture.write(&format!("library/{label}.d88"), &bytes);
+        let evidence = fixture.inspect(&image);
+        assert_eq!(evidence.format, None, "{label} was accepted: {evidence:?}");
+        assert!(evidence.refusal.is_some(), "{label} had no refusal");
+    }
 }
 
 /// Test 3
@@ -733,13 +1524,7 @@ fn a_pasti_track_table_longer_than_the_budget_stops_at_the_bound() {
 #[test]
 fn an_unhandled_extension_is_refused_without_opening_the_file() {
     let fixture = Fixture::new("dispatch");
-    for name in [
-        "game.bin",
-        "game.iso",
-        "game.dsk",
-        "RESOURCE.GEN",
-        "game.msa",
-    ] {
+    for name in ["game.bin", "game.iso", "RESOURCE.GEN", "game.msa"] {
         let path = fixture.write(&format!("library/{name}"), &st_720k());
         let evidence = fixture.inspect(&path);
         assert_eq!(evidence.format, None, "{name} has no adapter");
@@ -749,6 +1534,15 @@ fn an_unhandled_extension_is_refused_without_opening_the_file() {
         );
         assert_eq!(evidence.bytes_inspected, 0);
     }
+    // `.dsk` now has an adapter, so a non-DSK payload under it is a
+    // *malformed* refusal, not a missing adapter - but still no format claim.
+    let path = fixture.write("library/not-really.dsk", &st_720k());
+    let evidence = fixture.inspect(&path);
+    assert_eq!(evidence.format, None);
+    assert_eq!(
+        evidence.refusal.as_ref().map(DiskFormatRefusal::code),
+        Some("malformed")
+    );
     // And a file with no extension at all.
     let path = fixture.write("library/plain", &st_720k());
     assert_eq!(
@@ -1155,8 +1949,10 @@ fn generic_shared_extensions_stay_ambiguous() {
 #[test]
 fn a_mega_drive_rom_is_still_confirmed_from_its_header() {
     let fixture = Fixture::new("regression-megadrive");
+    // A real cartridge header names the console in full; the bare `SEGA`
+    // bytes are shared with the 32X and no longer confirm on their own.
     let mut rom = vec![0_u8; 0x200];
-    rom[0x100..0x104].copy_from_slice(b"SEGA");
+    rom[0x100..0x10f].copy_from_slice(b"SEGA MEGA DRIVE");
     let path = fixture.write("library/unsorted/mystery.bin", &rom);
     let report = detect_platform_report(
         &DetectionRequest::new(&path, &fixture.path("library"))
@@ -1167,14 +1963,910 @@ fn a_mega_drive_rom_is_still_confirmed_from_its_header() {
     assert_eq!(report.confidence, DetectionConfidence::Confirmed);
 }
 
-/// Test 45: the schema is untouched. This milestone adds no migration, so the
-/// version and the migration list must be exactly what they were.
+/// Test 45: this milestone (Atari ST/STX detection) adds no migration of
+/// its own. The migration list is still pinned exactly, so an *unrelated*
+/// future change that quietly adds one here is still caught. Two unrelated
+/// additions are already accounted for as legitimate (see `database.rs`):
+/// 0007 (`migrations/0007_discovery_details.sql`, Collection Discovery
+/// paging), 0008 (`migrations/0008_library_dat_identities.sql`, per-item DAT
+/// identity persistence), 0009 (`migrations/0009_set_audit_verdicts.sql`,
+/// set-audit persistence), and 0010
+/// (`migrations/0010_verified_identity_facts.sql`, verified identity cache),
+/// 0011 (`migrations/0011_dat_expected_entries.sql`, named expected DAT
+/// inventory), and 0012 (`migrations/0012_dat_expected_inventory_meta.sql`,
+/// expected-inventory metadata), 0013 (scan fingerprints), 0014 (ingestion
+/// fingerprint evidence), 0015 (discovery-detail reuse), 0016 (non-archive
+/// fingerprints), 0017 (source roles), and 0018 (provider mod catalogue
+/// records), 0019 (explicit ScreenScraper enrichment receipts), 0020 (media
+/// topology evidence), 0021 (physical MAME member evidence), 0022 (source
+/// scan coverage), 0023 (catalogue safety bindings), 0024 (source enablement), and 0025
+/// (discovery-import history for guarded Undo), and 0026 (DAT inventory digest) are already
+/// accounted for as legitimate
+/// unrelated additions.
 #[test]
 fn the_database_schema_and_migrations_are_unchanged() {
     let versions = crate::database::migration_versions_for_tests();
     assert_eq!(
         versions,
-        vec![1_i64, 2, 3, 4, 5, 6],
-        "migrations must remain exactly 0001 through 0006"
+        vec![
+            1_i64, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23,
+            24, 25, 26
+        ],
+        "migrations must remain contiguous and registered"
     );
+}
+
+// --- CPCEMU DSK / ZX Spectrum +3 ---------------------------------------
+
+const DSK_INFO: usize = 256;
+
+/// One CPCEMU `.dsk`, built exactly from a geometry. When `plus3dos` is set,
+/// track 0's first sector carries a valid +3DOS/PCW disk-specification block
+/// of the given `disk_type`; when `bootable` is also set the whole first
+/// sector is tuned so its byte sum mod 256 is 3.
+fn dsk_image(
+    extended: bool,
+    tracks: u8,
+    sides: u8,
+    sectors_per_track: u8,
+    plus3dos: Option<(u8 /*disk_type*/, bool /*bootable*/)>,
+) -> Vec<u8> {
+    let sector_bytes = 512usize;
+    let track_size = DSK_INFO + usize::from(sectors_per_track) * sector_bytes;
+    let entries = usize::from(tracks) * usize::from(sides);
+
+    let mut info = vec![0u8; DSK_INFO];
+    if extended {
+        info[..0x22].copy_from_slice(b"EXTENDED CPC DSK File\r\nDisk-Info\r\n");
+    } else {
+        info[..0x22].copy_from_slice(b"MV - CPCEMU Disk-File\r\nDisk-Info\r\n");
+    }
+    info[0x22..0x30].copy_from_slice(b"archivefs test");
+    info[0x30] = tracks;
+    info[0x31] = sides;
+    if extended {
+        let hi = u8::try_from(track_size / 256).expect("track fits in a byte*256");
+        for entry in 0..entries {
+            info[0x34 + entry] = hi;
+        }
+    } else {
+        info[0x32..0x34].copy_from_slice(&u16::try_from(track_size).unwrap().to_le_bytes());
+    }
+
+    let mut image = info;
+    for track_index in 0..entries {
+        let track = u8::try_from(track_index / usize::from(sides)).unwrap();
+        let side = u8::try_from(track_index % usize::from(sides)).unwrap();
+        let mut header = vec![0u8; DSK_INFO];
+        header[..0x0C].copy_from_slice(b"Track-Info\r\n");
+        header[0x10] = track;
+        header[0x11] = side;
+        header[0x14] = 2; // sector size code -> 512
+        header[0x15] = sectors_per_track;
+        header[0x16] = 0x4E; // GAP#3
+        header[0x17] = 0xE5; // filler
+        for sector in 0..usize::from(sectors_per_track) {
+            let base = 0x18 + sector * 8;
+            header[base] = track;
+            header[base + 1] = side;
+            header[base + 2] = 0xC1 + u8::try_from(sector).unwrap(); // sector ID
+            header[base + 3] = 2; // N
+            if extended {
+                header[base + 6..base + 8].copy_from_slice(&512u16.to_le_bytes());
+            }
+        }
+        image.extend_from_slice(&header);
+        let mut data = vec![0xE5u8; usize::from(sectors_per_track) * sector_bytes];
+
+        if track_index == 0
+            && let Some((disk_type, bootable)) = plus3dos
+        {
+            // +3DOS / PCW disk specification in the first 16 bytes of the
+            // first sector (which starts at image offset 0x200).
+            data[0] = disk_type;
+            data[1] = 0; // sidedness: single
+            data[2] = tracks;
+            data[3] = sectors_per_track;
+            data[4] = 2; // log2(512) - 7
+            data[5] = 1; // reserved tracks
+            data[6] = 3; // block shift
+            data[7] = 2; // directory blocks
+            data[8] = 0x2A; // gap r/w
+            data[9] = 0x52; // gap format
+            for byte in data.iter_mut().take(15).skip(10) {
+                *byte = 0; // reserved
+            }
+            data[15] = 0; // spec-block checksum slot (not validated here)
+            if bootable {
+                let sum: u32 = data[..512].iter().map(|b| u32::from(*b)).sum();
+                let want = 3u32;
+                let have = sum % 256;
+                // Nudge a scratch byte well outside the spec block.
+                data[64] = data[64].wrapping_add(((want + 256 - have) % 256) as u8);
+            }
+        }
+        image.extend_from_slice(&data);
+    }
+    image
+}
+
+/// A standard 40-track single-sided +3 "CF2" disk with a bootable +3DOS spec.
+fn plus3_cf2_disk() -> Vec<u8> {
+    dsk_image(false, 40, 1, 9, Some((0, true)))
+}
+
+/// A plain double-sided 80-track CPC data disk: valid container, no +3DOS.
+fn cpc_data_disk() -> Vec<u8> {
+    dsk_image(false, 80, 2, 9, None)
+}
+
+#[test]
+fn dsk_standard_container_is_recognised_but_not_a_platform() {
+    let fixture = Fixture::new("dsk-standard");
+    let path = fixture.write("library/game.dsk", &cpc_data_disk());
+    let evidence = fixture.inspect(&path);
+    assert_eq!(evidence.format, Some(DiskFormat::CpcEmuDsk));
+    assert!(!evidence.conclusive, "a bare .dsk never settles a platform");
+    assert_eq!(evidence.confidence, DetectionConfidence::Probable);
+    let Some(DiskFormatMetadata::Dsk(layout)) = evidence.metadata else {
+        panic!("expected dsk layout");
+    };
+    assert!(!layout.extended);
+    assert!(!layout.plus3dos_disk_spec);
+    assert_eq!(layout.declared_tracks, 80);
+    assert!(evidence.bytes_inspected <= MAX_DISK_FORMAT_BYTES_READ);
+}
+
+// --- ZX Spectrum SCL ("SINCLAIR") archive -----------------------------
+
+/// Build an `.scl` from a list of per-file sector counts.
+fn scl_archive(files: &[u8], with_checksum: bool) -> Vec<u8> {
+    let mut v = Vec::new();
+    v.extend_from_slice(b"SINCLAIR");
+    v.push(u8::try_from(files.len()).expect("<=128 files"));
+    for &sectors in files {
+        let mut entry = [0u8; 14];
+        entry[..8].copy_from_slice(b"GAME    ");
+        entry[8] = b'C';
+        entry[13] = sectors; // length in 256-byte sectors
+        v.extend_from_slice(&entry);
+    }
+    let payload: usize = files.iter().map(|&s| usize::from(s) * 256).sum();
+    v.extend(std::iter::repeat_n(0u8, payload));
+    if with_checksum {
+        let sum = v
+            .iter()
+            .fold(0u32, |acc, &b| acc.wrapping_add(u32::from(b)));
+        v.extend_from_slice(&sum.to_le_bytes());
+    }
+    v
+}
+
+#[test]
+fn scl_empty_archive_is_valid_zx_spectrum_evidence() {
+    let fixture = Fixture::new("scl-empty");
+    let path = fixture.write("library/empty.scl", &scl_archive(&[], false));
+    let evidence = fixture.inspect(&path);
+    assert_eq!(evidence.format, Some(DiskFormat::SpectrumSclArchive));
+    assert_eq!(evidence.platform, Some("ZX Spectrum"));
+    assert!(evidence.conclusive);
+    assert_eq!(evidence.confidence, DetectionConfidence::Confirmed);
+    let Some(DiskFormatMetadata::Scl(layout)) = evidence.metadata else {
+        panic!("expected scl layout");
+    };
+    assert_eq!(layout.file_count, 0);
+    assert_eq!(layout.declared_sectors, 0);
+    assert!(evidence.bytes_inspected <= MAX_DISK_FORMAT_BYTES_READ);
+}
+
+#[test]
+fn dsk_extended_container_is_recognised() {
+    let fixture = Fixture::new("dsk-extended");
+    let image = dsk_image(true, 42, 1, 9, None);
+    let path = fixture.write("library/game.dsk", &image);
+    let evidence = fixture.inspect(&path);
+    assert_eq!(evidence.format, Some(DiskFormat::CpcEmuDsk));
+    let Some(DiskFormatMetadata::Dsk(layout)) = evidence.metadata else {
+        panic!("expected dsk layout");
+    };
+    assert!(layout.extended);
+    assert!(!layout.plus3dos_disk_spec);
+}
+
+#[test]
+fn dsk_with_plus3dos_disk_spec_is_zx_spectrum() {
+    let fixture = Fixture::new("dsk-plus3");
+    let path = fixture.write("library/Game (1987).dsk", &plus3_cf2_disk());
+    let evidence = fixture.inspect(&path);
+    assert_eq!(evidence.format, Some(DiskFormat::SpectrumPlus3Disk));
+    assert_eq!(evidence.platform, Some("ZX Spectrum"));
+    assert!(evidence.conclusive);
+    assert_eq!(evidence.confidence, DetectionConfidence::Confirmed);
+    let Some(DiskFormatMetadata::Dsk(layout)) = evidence.metadata else {
+        panic!("expected dsk layout");
+    };
+    assert!(layout.plus3dos_disk_spec);
+    assert_eq!(layout.plus3dos_disk_type, Some(0));
+    assert!(layout.plus3_bootable);
+}
+
+#[test]
+fn cpc_disk_type_in_the_spec_block_is_never_spectrum() {
+    let fixture = Fixture::new("dsk-cpc-spec");
+    // disk type 2 = CPC data - the spec block validates structurally but must
+    // not be read as ZX Spectrum.
+    let path = fixture.write(
+        "library/game.dsk",
+        &dsk_image(false, 40, 1, 9, Some((2, false))),
+    );
+    let evidence = fixture.inspect(&path);
+    assert_eq!(evidence.format, Some(DiskFormat::CpcEmuDsk));
+    assert_ne!(evidence.platform, Some("ZX Spectrum"));
+    let Some(DiskFormatMetadata::Dsk(layout)) = evidence.metadata else {
+        panic!("expected dsk layout");
+    };
+    assert_eq!(layout.plus3dos_disk_type, Some(2));
+}
+
+#[test]
+fn a_plus3_disk_in_an_amstrad_cpc_folder_is_reported_ambiguous_not_forced() {
+    let fixture = Fixture::new("dsk-plus3-cpc-folder");
+    let path = fixture.write("library/game.dsk", &plus3_cf2_disk());
+    let evidence = fixture.inspect_in_folder(&path, "Amstrad CPC");
+    assert_eq!(evidence.format, Some(DiskFormat::SpectrumPlus3Disk));
+    assert_eq!(evidence.confidence, DetectionConfidence::Ambiguous);
+    assert!(!evidence.conclusive);
+}
+
+#[test]
+fn dsk_truncated_into_its_track_data_is_a_geometry_mismatch() {
+    let fixture = Fixture::new("dsk-truncated");
+    let mut image = cpc_data_disk();
+    image.truncate(image.len() - 4096);
+    let path = fixture.write("library/game.dsk", &image);
+    let evidence = fixture.inspect(&path);
+    assert_eq!(evidence.format, None);
+    assert_eq!(
+        evidence.refusal.as_ref().map(DiskFormatRefusal::code),
+        Some("geometry_mismatch")
+    );
+}
+
+#[test]
+fn scl_one_and_many_file_archives_validate_with_and_without_checksum() {
+    let fixture = Fixture::new("scl-files");
+    let one = fixture.write("library/one.scl", &scl_archive(&[4], false));
+    let ev = fixture.inspect(&one);
+    assert_eq!(ev.format, Some(DiskFormat::SpectrumSclArchive));
+    let Some(DiskFormatMetadata::Scl(layout)) = ev.metadata else {
+        panic!()
+    };
+    assert_eq!(layout.file_count, 1);
+    assert_eq!(layout.declared_sectors, 4);
+    assert!(!layout.has_trailing_checksum);
+
+    let many = fixture.write("library/many.scl", &scl_archive(&[1, 2, 3, 9], true));
+    let ev = fixture.inspect(&many);
+    let Some(DiskFormatMetadata::Scl(layout)) = ev.metadata else {
+        panic!()
+    };
+    assert_eq!(layout.file_count, 4);
+    assert_eq!(layout.declared_sectors, 15);
+    assert!(layout.has_trailing_checksum);
+}
+
+#[test]
+fn scl_wrong_magic_is_refused() {
+    let fixture = Fixture::new("scl-magic");
+    let mut bytes = scl_archive(&[1], false);
+    bytes[3] = b'X';
+    let path = fixture.write("library/x.scl", &bytes);
+    let evidence = fixture.inspect(&path);
+    assert_eq!(evidence.format, None);
+    assert_eq!(
+        evidence.refusal.as_ref().map(DiskFormatRefusal::code),
+        Some("malformed")
+    );
+}
+
+#[test]
+fn scl_truncated_header_is_refused() {
+    let fixture = Fixture::new("scl-short-header");
+    let path = fixture.write("library/short.scl", b"SINCL");
+    assert_eq!(
+        fixture
+            .inspect(&path)
+            .refusal
+            .as_ref()
+            .map(DiskFormatRefusal::code),
+        Some("too_small")
+    );
+}
+
+#[test]
+fn scl_directory_table_beyond_eof_is_refused() {
+    let fixture = Fixture::new("scl-table-oob");
+    // Claims 50 files but carries no directory at all.
+    let mut bytes = Vec::new();
+    bytes.extend_from_slice(b"SINCLAIR");
+    bytes.push(50);
+    let path = fixture.write("library/liar.scl", &bytes);
+    let evidence = fixture.inspect(&path);
+    assert_eq!(evidence.format, None);
+    assert_eq!(
+        evidence.refusal.as_ref().map(DiskFormatRefusal::code),
+        Some("malformed")
+    );
+}
+
+#[test]
+fn scl_payload_shorter_or_longer_than_declared_is_refused() {
+    let fixture = Fixture::new("scl-payload");
+    let mut short = scl_archive(&[4], false);
+    short.truncate(short.len() - 300); // lose part of the declared payload
+    let path = fixture.write("library/short.scl", &short);
+    assert_eq!(
+        fixture
+            .inspect(&path)
+            .refusal
+            .as_ref()
+            .map(DiskFormatRefusal::code),
+        Some("geometry_mismatch")
+    );
+
+    let mut long = scl_archive(&[2], false);
+    long.extend_from_slice(&[0u8; 64]); // trailing bytes the entries do not account for
+    let path = fixture.write("library/long.scl", &long);
+    assert_eq!(
+        fixture
+            .inspect(&path)
+            .refusal
+            .as_ref()
+            .map(DiskFormatRefusal::code),
+        Some("geometry_mismatch")
+    );
+}
+
+#[test]
+fn dsk_random_bytes_and_zip_are_refused() {
+    let fixture = Fixture::new("dsk-random");
+    let path = fixture.write("library/game.dsk", &vec![0x5Au8; 8192]);
+    assert_eq!(fixture.inspect(&path).format, None);
+
+    let mut zip = vec![0u8; 8192];
+    zip[..4].copy_from_slice(b"PK\x03\x04");
+    let path = fixture.write("library/z.dsk", &zip);
+    assert_eq!(fixture.inspect(&path).format, None);
+}
+
+#[test]
+fn scl_absurd_file_count_is_refused() {
+    let fixture = Fixture::new("scl-absurd");
+    let mut bytes = Vec::new();
+    bytes.extend_from_slice(b"SINCLAIR");
+    bytes.push(200); // over the 128-entry TR-DOS maximum
+    bytes.extend(std::iter::repeat_n(0u8, 200 * 14));
+    let path = fixture.write("library/big.scl", &bytes);
+    assert_eq!(fixture.inspect(&path).format, None);
+}
+
+#[test]
+fn dsk_absurd_geometry_is_refused_without_huge_allocation() {
+    let fixture = Fixture::new("dsk-absurd");
+    let mut info = vec![0u8; DSK_INFO];
+    info[..8].copy_from_slice(b"MV - CPC");
+    info[0x30] = 255; // 255 tracks
+    info[0x31] = 2;
+    info[0x32..0x34].copy_from_slice(&0xFFFFu16.to_le_bytes()); // 64KB tracks
+    // File is tiny; the declared geometry cannot possibly fit.
+    let path = fixture.write("library/evil.dsk", &info);
+    let evidence = fixture.inspect(&path);
+    assert_eq!(evidence.format, None);
+    assert!(evidence.refusal.is_some());
+}
+
+#[test]
+fn scl_random_bytes_named_scl_are_refused() {
+    let fixture = Fixture::new("scl-random");
+    let path = fixture.write("library/game.scl", &vec![0x5Au8; 4096]);
+    assert_eq!(fixture.inspect(&path).format, None);
+}
+
+// --- ZX Spectrum TR-DOS disk image ----------------------------------
+
+fn trd_geometry(disk_type: u8) -> (u16, u8) {
+    match disk_type {
+        0x16 => (80, 2),
+        0x17 => (40, 2),
+        0x18 => (80, 1),
+        0x19 => (40, 1),
+        _ => panic!("unsupported test disk type"),
+    }
+}
+
+/// Build a structurally valid TR-DOS image, then let `tweak` corrupt it.
+fn trd_disk(
+    disk_type: u8,
+    file_count: u8,
+    label: &[u8; 8],
+    tweak: impl FnOnce(&mut [u8]),
+) -> Vec<u8> {
+    let (tps, sides) = trd_geometry(disk_type);
+    let total_tracks = u64::from(tps) * u64::from(sides);
+    let total_sectors = total_tracks * 16;
+    let mut v = vec![0u8; usize::try_from(total_sectors * 256).unwrap()];
+
+    if file_count > 0 {
+        v[0..8].copy_from_slice(b"BOOT    ");
+        v[8] = b'B';
+        v[13] = 1;
+    }
+
+    let d = 0x800usize;
+    v[d] = 0; // catalogue end marker
+    let first_free_track = 1u16;
+    let first_free_sector = 0u8;
+    let free_sectors = u16::try_from(total_sectors - 16).unwrap(); // whole disk bar track 0
+    v[d + 0xE1] = first_free_sector;
+    v[d + 0xE2] = u8::try_from(first_free_track).unwrap();
+    v[d + 0xE3] = disk_type;
+    v[d + 0xE4] = file_count;
+    v[d + 0xE5..d + 0xE7].copy_from_slice(&free_sectors.to_le_bytes());
+    v[d + 0xE7] = 0x10;
+    v[d + 0xF5..d + 0xF5 + 8].copy_from_slice(label);
+
+    tweak(&mut v);
+    v
+}
+
+#[test]
+fn trd_standard_double_sided_image_is_valid_zx_spectrum_evidence() {
+    let fixture = Fixture::new("trd-80ds");
+    let path = fixture.write(
+        "library/Game (1989).trd",
+        &trd_disk(0x16, 5, b"MYDISK  ", |_| {}),
+    );
+    let evidence = fixture.inspect(&path);
+    assert_eq!(evidence.format, Some(DiskFormat::SpectrumTrDosDisk));
+    assert_eq!(evidence.platform, Some("ZX Spectrum"));
+    assert!(evidence.conclusive);
+    assert_eq!(evidence.confidence, DetectionConfidence::Confirmed);
+    let Some(DiskFormatMetadata::TrDos(descriptor)) = evidence.metadata else {
+        panic!("expected trdos descriptor");
+    };
+    assert_eq!(descriptor.disk_type, 0x16);
+    assert_eq!(descriptor.tracks_per_side, 80);
+    assert_eq!(descriptor.sides, 2);
+    assert_eq!(descriptor.file_count, 5);
+    assert_eq!(descriptor.label, Some(*b"MYDISK  "));
+    assert!(evidence.bytes_inspected <= MAX_DISK_FORMAT_BYTES_READ);
+}
+
+#[test]
+fn dsk_detection_reaches_platform_detection_for_a_plus3_disk_only() {
+    let fixture = Fixture::new("dsk-platform");
+    // A +3 disk resolves to ZX Spectrum through the shared structural layer.
+    let plus3 = fixture.write("library/unsorted/game.dsk", &plus3_cf2_disk());
+    let report = detect_platform_report(
+        &DetectionRequest::new(&plus3, &fixture.path("library"))
+            .inspecting_content()
+            .with_trusted_roots(fixture.trusted()),
+    );
+    assert_eq!(report.platform, Some("ZX Spectrum"));
+    assert_eq!(report.confidence, DetectionConfidence::Confirmed);
+
+    // A generic CPC data disk does not force any platform.
+    let cpc = fixture.write("library/unsorted/data.dsk", &cpc_data_disk());
+    let report = detect_platform_report(
+        &DetectionRequest::new(&cpc, &fixture.path("library"))
+            .inspecting_content()
+            .with_trusted_roots(fixture.trusted()),
+    );
+    assert_ne!(report.platform, Some("ZX Spectrum"));
+}
+
+#[test]
+fn trd_all_four_documented_geometries_validate() {
+    let fixture = Fixture::new("trd-geometries");
+    for (disk_type, tps, sides) in [(0x16, 80, 2), (0x17, 40, 2), (0x18, 80, 1), (0x19, 40, 1)] {
+        let path = fixture.write(
+            &format!("library/type{disk_type:02x}.trd"),
+            &trd_disk(disk_type, 0, b"        ", |_| {}),
+        );
+        let evidence = fixture.inspect(&path);
+        assert_eq!(
+            evidence.format,
+            Some(DiskFormat::SpectrumTrDosDisk),
+            "disk type 0x{disk_type:02X}"
+        );
+        let Some(DiskFormatMetadata::TrDos(descriptor)) = evidence.metadata else {
+            panic!()
+        };
+        assert_eq!(descriptor.tracks_per_side, tps);
+        assert_eq!(descriptor.sides, sides);
+        assert_eq!(descriptor.label, None); // all spaces -> no label
+    }
+}
+
+#[test]
+fn trd_truncated_to_used_sectors_is_still_accepted() {
+    // Archives commonly trim trailing free sectors; the descriptor is intact.
+    let fixture = Fixture::new("trd-trimmed");
+    let mut image = trd_disk(0x19, 3, b"TRIMMED ", |_| {});
+    image.truncate(image.len() - 40 * 256); // drop 40 trailing sectors
+    let path = fixture.write("library/trimmed.trd", &image);
+    assert_eq!(
+        fixture.inspect(&path).format,
+        Some(DiskFormat::SpectrumTrDosDisk)
+    );
+}
+
+#[test]
+fn trd_missing_or_wrong_id_byte_is_refused() {
+    let fixture = Fixture::new("trd-id");
+    let path = fixture.write(
+        "library/noid.trd",
+        &trd_disk(0x16, 1, b"X       ", |v| v[0x800 + 0xE7] = 0x00),
+    );
+    let evidence = fixture.inspect(&path);
+    assert_eq!(evidence.format, None);
+    assert_eq!(
+        evidence.refusal.as_ref().map(DiskFormatRefusal::code),
+        Some("malformed")
+    );
+}
+
+#[test]
+fn trd_undocumented_disk_type_is_refused() {
+    let fixture = Fixture::new("trd-type");
+    let path = fixture.write(
+        "library/badtype.trd",
+        &trd_disk(0x16, 1, b"X       ", |v| v[0x800 + 0xE3] = 0x99),
+    );
+    assert_eq!(fixture.inspect(&path).format, None);
+}
+
+#[test]
+fn trd_impossible_file_count_or_free_cursor_is_refused() {
+    let fixture = Fixture::new("trd-impossible");
+    let count = fixture.write(
+        "library/count.trd",
+        &trd_disk(0x16, 1, b"X       ", |v| v[0x800 + 0xE4] = 200),
+    );
+    assert_eq!(fixture.inspect(&count).format, None);
+
+    let sector = fixture.write(
+        "library/sector.trd",
+        &trd_disk(0x16, 1, b"X       ", |v| v[0x800 + 0xE1] = 40),
+    );
+    assert_eq!(fixture.inspect(&sector).format, None);
+
+    let track = fixture.write(
+        "library/track.trd",
+        &trd_disk(0x16, 1, b"X       ", |v| v[0x800 + 0xE2] = 250),
+    );
+    assert_eq!(fixture.inspect(&track).format, None);
+}
+
+#[test]
+fn trd_inconsistent_free_space_is_refused() {
+    let fixture = Fixture::new("trd-freespace");
+    // Free-sector count that does not reconcile with the free cursor.
+    let path = fixture.write(
+        "library/free.trd",
+        &trd_disk(0x16, 1, b"X       ", |v| {
+            v[0x800 + 0xE5] = 0x00;
+            v[0x800 + 0xE6] = 0x00; // claims zero free but the cursor says otherwise
+        }),
+    );
+    assert_eq!(fixture.inspect(&path).format, None);
+}
+
+#[test]
+fn trd_geometry_larger_than_the_disk_type_allows_is_refused() {
+    let fixture = Fixture::new("trd-toobig");
+    let mut image = trd_disk(0x19, 0, b"        ", |_| {}); // 40 SS -> 163840
+    image.extend(std::iter::repeat_n(0u8, 4096)); // one track too many
+    let path = fixture.write("library/toobig.trd", &image);
+    assert_eq!(
+        fixture
+            .inspect(&path)
+            .refusal
+            .as_ref()
+            .map(DiskFormatRefusal::code),
+        Some("geometry_mismatch")
+    );
+}
+
+#[test]
+fn trd_truncated_below_the_descriptor_and_unaligned_lengths_are_refused() {
+    let fixture = Fixture::new("trd-short");
+    let mut image = trd_disk(0x19, 0, b"        ", |_| {});
+    let full = image.clone();
+
+    image.truncate(0x880); // descriptor sector no longer present
+    let path = fixture.write("library/tiny.trd", &image);
+    assert_eq!(
+        fixture
+            .inspect(&path)
+            .refusal
+            .as_ref()
+            .map(DiskFormatRefusal::code),
+        Some("too_small")
+    );
+
+    let mut unaligned = full;
+    unaligned.truncate(unaligned.len() - 100); // not a whole number of sectors
+    let path = fixture.write("library/unaligned.trd", &unaligned);
+    assert_eq!(
+        fixture
+            .inspect(&path)
+            .refusal
+            .as_ref()
+            .map(DiskFormatRefusal::code),
+        Some("not_sector_aligned")
+    );
+}
+
+#[test]
+fn trd_random_correctly_sized_image_is_not_spectrum_evidence() {
+    let fixture = Fixture::new("trd-random");
+    // Exactly the size of an 80-track DS TR-DOS disk, but random content.
+    let bytes: Vec<u8> = (0..655360).map(|i| (i * 131 + 7) as u8).collect();
+    let path = fixture.write("library/game.trd", &bytes);
+    assert_eq!(fixture.inspect(&path).format, None);
+}
+
+#[test]
+fn trd_recognition_does_not_swallow_an_mgt_sam_coupe_image() {
+    let fixture = Fixture::new("trd-mgt");
+    // A common MGT/SAM Coupe size (80 x 2 x 10 x 512), 256-aligned, but with
+    // no TR-DOS descriptor - must not be read as ZX Spectrum TR-DOS media.
+    let bytes = vec![0xE5u8; 819200];
+    let path = fixture.write("library/sam.trd", &bytes);
+    assert_eq!(fixture.inspect(&path).format, None);
+}
+
+#[test]
+fn trd_and_scl_in_an_amstrad_cpc_folder_report_ambiguous_not_forced() {
+    let fixture = Fixture::new("trdos-cpc-folder");
+    let trd = fixture.write("library/game.trd", &trd_disk(0x16, 1, b"X       ", |_| {}));
+    let ev = fixture.inspect_in_folder(&trd, "Amstrad CPC");
+    assert_eq!(ev.format, Some(DiskFormat::SpectrumTrDosDisk));
+    assert_eq!(ev.confidence, DetectionConfidence::Ambiguous);
+    assert!(!ev.conclusive);
+
+    let scl = fixture.write("library/game.scl", &scl_archive(&[2], false));
+    let ev = fixture.inspect_in_folder(&scl, "Amstrad CPC");
+    assert_eq!(ev.confidence, DetectionConfidence::Ambiguous);
+}
+
+#[test]
+fn trdos_media_reaches_platform_detection_as_confirmed_zx_spectrum() {
+    let fixture = Fixture::new("trdos-platform");
+    for (name, bytes) in [
+        (
+            "library/unsorted/a.trd",
+            trd_disk(0x16, 2, b"DISK    ", |_| {}),
+        ),
+        ("library/unsorted/b.scl", scl_archive(&[1, 1], false)),
+    ] {
+        let path = fixture.write(name, &bytes);
+        let report = detect_platform_report(
+            &DetectionRequest::new(&path, &fixture.path("library"))
+                .inspecting_content()
+                .with_trusted_roots(fixture.trusted()),
+        );
+        assert_eq!(report.platform, Some("ZX Spectrum"), "{name}");
+        assert_eq!(report.confidence, DetectionConfidence::Confirmed, "{name}");
+    }
+}
+
+#[test]
+fn hdi_and_nhd_validate_geometry_without_proving_pc98() {
+    let fixture = Fixture::new("hdi-nhd-positive");
+    let hdi = fixture.write("library/disk.hdi", &hdi_image(0x20, 512, 1, 1, 1));
+    let nhd = fixture.write("library/disk.nhd", &nhd_image(0x200, 512, 1, 1, 1));
+
+    let hdi_evidence = fixture.inspect(&hdi);
+    assert_eq!(hdi_evidence.format, Some(DiskFormat::HdiContainer));
+    assert_eq!(hdi_evidence.platform, Some("PC-98"));
+    assert_eq!(hdi_evidence.confidence, DetectionConfidence::Probable);
+    assert!(!hdi_evidence.conclusive);
+    assert!(
+        hdi_evidence
+            .evidence
+            .iter()
+            .any(|item| item.contains("0x00000000"))
+    );
+    assert!(matches!(
+        hdi_evidence.metadata,
+        Some(DiskFormatMetadata::Hdi(_))
+    ));
+
+    let nhd_evidence = fixture.inspect(&nhd);
+    assert_eq!(nhd_evidence.format, Some(DiskFormat::NhdContainer));
+    assert_eq!(nhd_evidence.confidence, DetectionConfidence::Probable);
+    assert!(!nhd_evidence.conclusive);
+    assert!(
+        nhd_evidence
+            .evidence
+            .iter()
+            .any(|item| item.contains("TEST NHD"))
+    );
+    assert!(matches!(
+        nhd_evidence.metadata,
+        Some(DiskFormatMetadata::Nhd(_))
+    ));
+}
+
+#[test]
+fn hdi_and_nhd_folder_context_confirms_existing_pc98_equivalence() {
+    let fixture = Fixture::new("hdi-nhd-context");
+    for folder in ["PC-98", "NEC PC-9801"] {
+        let hdi = fixture.write(
+            &format!("library/{folder}/disk.hdi"),
+            &hdi_image(0x20, 512, 1, 1, 1),
+        );
+        let nhd = fixture.write(
+            &format!("library/{folder}/disk.nhd"),
+            &nhd_image(0x200, 512, 1, 1, 1),
+        );
+        for path in [hdi, nhd] {
+            let evidence = fixture.inspect_in_folder(&path, folder);
+            assert_eq!(evidence.confidence, DetectionConfidence::Confirmed);
+            assert!(evidence.conclusive);
+            assert_eq!(evidence.platform, Some("PC-98"));
+        }
+    }
+}
+
+#[test]
+fn malformed_hdi_and_nhd_structures_fail_closed() {
+    let fixture = Fixture::new("hdi-nhd-negative");
+    let cases = [
+        ("truncated.hdi", vec![0; 12]),
+        ("bad-signature.nhd", vec![0; 512]),
+        ("zero-geometry.hdi", hdi_image(0x20, 512, 0, 1, 1)),
+        ("bad-sector-size.hdi", hdi_image(0x20, 123, 1, 1, 1)),
+        ("random.nhd", vec![0x5a; 1024]),
+    ];
+    for (name, bytes) in cases {
+        let path = fixture.write(&format!("library/{name}"), &bytes);
+        assert!(
+            fixture.inspect(&path).format.is_none(),
+            "{name} must be refused"
+        );
+    }
+
+    let mut bad_offset = hdi_image(0x20, 512, 1, 1, 1);
+    bad_offset[8..12].copy_from_slice(&0x1000_u32.to_le_bytes());
+    let path = fixture.write("library/bad-offset.hdi", &bad_offset);
+    assert!(fixture.inspect(&path).format.is_none());
+
+    let mut bad_payload = hdi_image(0x20, 512, 1, 1, 1);
+    bad_payload[12..16].copy_from_slice(&0_u32.to_le_bytes());
+    let path = fixture.write("library/bad-payload.hdi", &bad_payload);
+    assert!(fixture.inspect(&path).format.is_none());
+
+    let mut overflow = nhd_image(0x200, 512, 1, 1, 1);
+    overflow[0x114..0x118].copy_from_slice(&u32::MAX.to_le_bytes());
+    let path = fixture.write("library/overflow.nhd", &overflow);
+    assert!(fixture.inspect(&path).format.is_none());
+}
+
+fn dc42_checksum(bytes: &[u8], skip: usize) -> u32 {
+    let mut sum = 0u32;
+    for pair in bytes[skip..].chunks(2) {
+        let word = ((pair[0] as u32) << 8) | pair.get(1).copied().unwrap_or(0) as u32;
+        sum = sum.wrapping_add(word).rotate_right(1);
+    }
+    sum
+}
+
+fn dc42_image(mutate: impl FnOnce(&mut Vec<u8>)) -> Vec<u8> {
+    let data_size = 409_600usize;
+    let tag_size = 9_600usize;
+    let mut data = vec![0u8; data_size];
+    data[1024..1026].copy_from_slice(&0x4244u16.to_be_bytes());
+    let tags = vec![0u8; tag_size];
+    let mut image = vec![0u8; 84];
+    image[0] = 4;
+    image[1..5].copy_from_slice(b"Test");
+    image[0x40..0x44].copy_from_slice(&(data_size as u32).to_be_bytes());
+    image[0x44..0x48].copy_from_slice(&(tag_size as u32).to_be_bytes());
+    image[0x48..0x4c].copy_from_slice(&dc42_checksum(&data, 0).to_be_bytes());
+    image[0x4c..0x50].copy_from_slice(&dc42_checksum(&tags, 12).to_be_bytes());
+    image[0x50] = 0;
+    image[0x51] = 0x02;
+    image[0x52..0x54].copy_from_slice(&0x0100u16.to_be_bytes());
+    image.extend(data);
+    image.extend(tags);
+    mutate(&mut image);
+    image
+}
+
+#[test]
+fn valid_dc42_reports_macintosh_and_hfs_without_release_identity() {
+    let fixture = Fixture::new("dc42-valid");
+    let path = fixture.write("library/System 6.dc42", &dc42_image(|_| {}));
+    let evidence = fixture.inspect(&path);
+    assert_eq!(evidence.format, Some(DiskFormat::MacintoshDiskCopy42));
+    assert_eq!(evidence.platform, Some("Macintosh"));
+    assert!(evidence.conclusive);
+    assert!(
+        evidence
+            .evidence
+            .iter()
+            .any(|line| line.contains("HFS signature"))
+    );
+    assert!(
+        evidence
+            .evidence
+            .iter()
+            .any(|line| line.contains("provenance only"))
+    );
+    assert!(
+        evidence
+            .evidence
+            .iter()
+            .any(|line| line.contains("checksums verified"))
+    );
+}
+
+#[test]
+fn dc42_refuses_truncation_layout_checksum_and_encoding_errors() {
+    let fixture = Fixture::new("dc42-negative");
+    let valid = dc42_image(|_| {});
+    for (name, bytes, expected) in [
+        ("random.dc42", vec![0x5a; 84], "disk-name length"),
+        ("truncated.dc42", valid[..83].to_vec(), "below"),
+        (
+            "checksum.dc42",
+            dc42_image(|image| image[0x48] ^= 1),
+            "checksum mismatch",
+        ),
+        (
+            "encoding.dc42",
+            dc42_image(|image| image[0x50] = 0xff),
+            "encoding is unsupported",
+        ),
+    ] {
+        let path = fixture.write(&format!("library/{name}"), &bytes);
+        let evidence = fixture.inspect(&path);
+        assert!(evidence.format.is_none(), "{name} was accepted");
+        assert!(
+            evidence
+                .refusal
+                .as_ref()
+                .unwrap()
+                .detail()
+                .contains(expected),
+            "{name}: {:?}",
+            evidence.refusal
+        );
+    }
+    let path = fixture.write(
+        "library/beyond-eof.dc42",
+        &dc42_image(|image| {
+            image[0x44..0x48].copy_from_slice(&1u32.to_be_bytes());
+        }),
+    );
+    assert!(fixture.inspect(&path).format.is_none());
+}
+
+#[test]
+fn non_macintosh_disk_extensions_remain_unclaimed() {
+    let fixture = Fixture::new("dc42-negative-shared");
+    for (name, bytes) in [
+        ("apple.woz", b"WOZ1".to_vec()),
+        ("generic.img", vec![0; 1024]),
+        ("shared.dsk", vec![0; 1024]),
+    ] {
+        let path = fixture.write(&format!("library/{name}"), &bytes);
+        assert!(
+            fixture.inspect(&path).format.is_none(),
+            "{name} gained a DC42 claim"
+        );
+    }
 }

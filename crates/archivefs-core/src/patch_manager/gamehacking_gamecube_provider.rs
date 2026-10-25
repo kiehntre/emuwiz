@@ -395,8 +395,12 @@ pub fn diagnose_gamecube_cheat_code_format(
                 .to_string()
         }
         GameCubeCodeFormat::Unsupported => {
-            "one or more lines did not match the well-formed 8-hex/8-hex code line shape"
-                .to_string()
+            if cheat.code_lines.is_empty() {
+                "provider record has no code lines and was skipped".to_string()
+            } else {
+                "one or more lines did not match the well-formed 8-hex/8-hex code line shape"
+                    .to_string()
+            }
         }
     };
     GameCubeCheatCodeDiagnostic {
@@ -1457,6 +1461,39 @@ fn parse_gamecube_game_page_cheats(bytes: &[u8]) -> Vec<GameCubePageCheat> {
         });
     }
     cheats
+}
+
+/// What one real GameCube game page's own cheat entries carry, counted
+/// without touching the Text export at all. Used by the browser-assisted
+/// import path to report what an imported page actually contained.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize)]
+pub struct GameCubeGamePageSummary {
+    pub entry_count: usize,
+    pub action_replay_count: usize,
+    pub gecko_count: usize,
+    pub unlabelled_count: usize,
+    pub entry_titles: Vec<String>,
+}
+
+pub fn summarize_gamecube_game_page(page_bytes: &[u8]) -> GameCubeGamePageSummary {
+    let entries = parse_gamecube_game_page_cheats(page_bytes);
+    let mut summary = GameCubeGamePageSummary {
+        entry_count: entries.len(),
+        ..Default::default()
+    };
+    for entry in &entries {
+        match entry
+            .format_label
+            .as_deref()
+            .and_then(map_gamecube_page_label)
+        {
+            Some(GameCubeCodeFormat::ActionReplay) => summary.action_replay_count += 1,
+            Some(GameCubeCodeFormat::Gecko) => summary.gecko_count += 1,
+            _ => summary.unlabelled_count += 1,
+        }
+        summary.entry_titles.push(entry.title.clone());
+    }
+    summary
 }
 
 /// Maps the page's own label text to a format - the only place a cheat

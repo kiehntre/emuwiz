@@ -9,6 +9,7 @@ use super::*;
 use archivefs_core::identity_source::cache::IdentityCache;
 use archivefs_core::identity_source::model::{
     ArtworkReference, ExternalIdentityRecord, ExternalVerification, IdentityProvider,
+    MediaReference, MetadataProviderId,
 };
 
 const SERVER: &str = "https://romm.example";
@@ -38,6 +39,12 @@ fn record(id: &str, artwork: Option<ArtworkReference>) -> ExternalIdentityRecord
         evidence: Vec::new(),
         verification: ExternalVerification::Unmatched,
         conflicts: Vec::new(),
+        synopsis: None,
+        genres: Vec::new(),
+        players: None,
+        rating: None,
+        release_year: None,
+        howlongtobeat: None,
     }
 }
 
@@ -48,6 +55,9 @@ fn romm_hosted() -> ArtworkReference {
         small_reference: Some(
             "/assets/romm/resources/roms/149/1/cover/small.png?ts=17".to_string(),
         ),
+        large_reference: None,
+        screenshots: Vec::new(),
+        manual: None,
     }
 }
 
@@ -56,11 +66,381 @@ fn public_only() -> ArtworkReference {
     ArtworkReference {
         reference: "https://images.igdb.com/igdb/image/upload/t_cover_big/co1234.png".to_string(),
         small_reference: None,
+        large_reference: None,
+        screenshots: Vec::new(),
+        manual: None,
     }
+}
+
+fn launchbox_only() -> ArtworkReference {
+    ArtworkReference {
+        reference: "https://images.launchbox-app.com/cover/19538.png".to_string(),
+        small_reference: None,
+        large_reference: None,
+        screenshots: vec![MediaReference {
+            hosted_reference: None,
+            public_reference: Some(
+                "https://images.launchbox-app.com/screens/19538-1.png".to_string(),
+            ),
+        }],
+        manual: None,
+    }
+}
+
+#[test]
+fn unified_projection_keeps_launchbox_screenshots_separate_from_direct_cover() {
+    let mut artwork = romm_hosted();
+    artwork.screenshots = (1..=3)
+        .map(|index| MediaReference {
+            hosted_reference: None,
+            public_reference: Some(format!(
+                "https://images.launchbox-app.com/screens/19538-{index}.png"
+            )),
+        })
+        .collect();
+    let resolved = archivefs_core::identity_source::media_resolver::resolve_media(
+        &resolver_input_for_record(&record("19538", Some(artwork)), 11, None, 0, None),
+    );
+    assert_eq!(
+        resolved.cover.as_ref().map(|item| item.provider),
+        Some(archivefs_core::identity_source::media_resolver::MediaProvider::RommDirect)
+    );
+    assert_eq!(resolved.screenshots.len(), 3);
+    assert!(resolved.screenshots.iter().all(|item| {
+        item.provider
+            == archivefs_core::identity_source::media_resolver::MediaProvider::LaunchBoxViaRomm
+    }));
+}
+
+#[test]
+fn unified_projection_rejects_unapproved_public_media_without_a_cover() {
+    let resolved = archivefs_core::identity_source::media_resolver::resolve_media(
+        &resolver_input_for_record(&record("public", Some(public_only())), 12, None, 0, None),
+    );
+    assert!(resolved.cover.is_none());
+    assert_eq!(
+        resolved.cover_delivery,
+        archivefs_core::identity_source::media_resolver::MediaDelivery::Unavailable
+    );
+}
+
+#[test]
+fn exact_launchbox_id_projects_local_media_into_the_shared_resolver() {
+    let root = tempfile::tempdir().unwrap();
+    let local_cover = root.path().join("cover.png");
+    std::fs::write(&local_cover, b"fixture").unwrap();
+    let index = archivefs_core::identity_source::launchbox_local::LaunchBoxLocalProviderIndex {
+        root: root.path().to_path_buf(),
+        generation: 4,
+        games: vec![
+            archivefs_core::identity_source::launchbox_local::LaunchBoxLocalGame {
+                launchbox_id: "lb-19538".into(),
+                database_id: Some("19538".into()),
+                platform: "Atari Lynx".into(),
+                title: "Local Game".into(),
+                application_path: None,
+                media: vec![archivefs_core::identity_source::launchbox_local::LaunchBoxLocalMedia {
+                role: archivefs_core::identity_source::launchbox_local::LaunchBoxMediaRole::Cover,
+                category: "Box - Front".into(),
+                path: local_cover,
+            }],
+                provenance: "fixture".into(),
+            },
+        ],
+        by_database_id: [("19538".into(), 0)].into_iter().collect(),
+        by_exact_path: Default::default(),
+        by_platform_path: Default::default(),
+        media_files_indexed: 1,
+        warnings: Vec::new(),
+    };
+    let mut selected = record("romm-1", None);
+    selected.metadata_provider_ids.push(MetadataProviderId {
+        provider: "launchbox".into(),
+        id: "19538".into(),
+    });
+    let resolved = archivefs_core::identity_source::media_resolver::resolve_media(
+        &resolver_input_for_record(&selected, 3, None, 4, Some(&index)),
+    );
+    assert_eq!(
+        resolved.cover.as_ref().map(|item| item.provider),
+        Some(archivefs_core::identity_source::media_resolver::MediaProvider::LaunchBoxLocal)
+    );
+    assert_eq!(resolved.provider_generation, 4);
+}
+
+#[test]
+fn an_unindexed_game_gets_no_launchbox_local_contribution() {
+    let index = archivefs_core::identity_source::launchbox_local::LaunchBoxLocalProviderIndex {
+        root: PathBuf::from("/launchbox"),
+        generation: 1,
+        games: Vec::new(),
+        by_database_id: Default::default(),
+        by_exact_path: Default::default(),
+        by_platform_path: Default::default(),
+        media_files_indexed: 0,
+        warnings: Vec::new(),
+    };
+    let mut selected = record("romm-44360", Some(launchbox_only()));
+    selected.metadata_provider_ids.push(MetadataProviderId {
+        provider: "launchbox".into(),
+        id: "19538".into(),
+    });
+    let resolved = archivefs_core::identity_source::media_resolver::resolve_media(
+        &resolver_input_for_record(&selected, 1, None, 1, Some(&index)),
+    );
+    assert!(resolved.screenshots.iter().all(|item| item.provider
+        != archivefs_core::identity_source::media_resolver::MediaProvider::LaunchBoxLocal));
 }
 
 fn path(id: &str) -> PathBuf {
     PathBuf::from(format!("/roms/{id}.sfc"))
+}
+
+#[test]
+fn selected_details_screenshot_requests_are_bounded_after_exact_path_resolution() {
+    let mut cache = GamerScreenshotCache::default();
+    let local_path = path("42");
+    let first = cache.visible(&local_path);
+    assert_eq!(first.len(), 1, "probe only the first screenshot initially");
+    assert_eq!(first[0].kind, GamerArtworkKind::Screenshot(0));
+
+    let generation = cache.generation;
+    assert!(cache.absorb(
+        &context(),
+        CoverReply {
+            generation,
+            local_path: local_path.clone(),
+            provider_game_id: Some("42".to_string()),
+            kind: GamerArtworkKind::Screenshot(0),
+            screenshot_count: Some(99),
+            answer: CoverAnswer::None(NoCover::Failed),
+        }
+    ));
+    let rest = cache.visible(&local_path);
+    assert_eq!(rest.len(), MAX_DETAILS_SCREENSHOTS - 1);
+    assert!(rest.iter().all(|job| matches!(
+        job.kind,
+        GamerArtworkKind::Screenshot(index) if (1..MAX_DETAILS_SCREENSHOTS).contains(&index)
+    )));
+    assert!(cache.tracked() <= MAX_DETAILS_SCREENSHOTS);
+}
+
+#[test]
+fn screenshot_section_is_visible_while_the_initial_probe_is_loading() {
+    let mut cache = GamerScreenshotCache::default();
+    let local_path = path("probe");
+
+    cache.visible(&local_path);
+
+    assert_eq!(cache.screenshot_count(&local_path), None);
+    assert_eq!(cache.section_count(&local_path), Some(1));
+}
+
+#[test]
+fn resolver_pending_delivery_keeps_a_zero_count_from_becoming_empty() {
+    let mut cache = GamerScreenshotCache::default();
+    let local_path = path("resolver-pending");
+
+    assert!(cache.absorb_delivery(&MediaDeliveryUpdate {
+        generation: cache.generation,
+        local_path: local_path.clone(),
+        cover: archivefs_core::identity_source::media_resolver::MediaDelivery::Unavailable,
+        screenshots: archivefs_core::identity_source::media_resolver::MediaDelivery::RemotePending,
+    }));
+    cache.screenshot_count.insert(local_path.clone(), 0);
+
+    assert_eq!(cache.section_count(&local_path), Some(1));
+    assert_eq!(
+        cache.delivery(&local_path),
+        Some(archivefs_core::identity_source::media_resolver::MediaDelivery::RemotePending)
+    );
+}
+
+#[test]
+fn stale_resolver_delivery_cannot_change_the_current_generation() {
+    let mut cache = GamerScreenshotCache::default();
+    let local_path = path("resolver-stale");
+    let stale_generation = cache.generation;
+    cache.identity_refreshed();
+
+    assert!(!cache.absorb_delivery(&MediaDeliveryUpdate {
+        generation: stale_generation,
+        local_path: local_path.clone(),
+        cover: archivefs_core::identity_source::media_resolver::MediaDelivery::Unavailable,
+        screenshots: archivefs_core::identity_source::media_resolver::MediaDelivery::Unavailable,
+    }));
+    assert_eq!(cache.delivery(&local_path), None);
+}
+
+#[test]
+fn screenshot_gallery_delivers_partial_results_while_more_are_loading() {
+    let mut cache = GamerScreenshotCache::default();
+    let local_path = path("partial");
+    let generation = cache.generation;
+
+    cache.visible(&local_path);
+    assert!(cache.absorb(
+        &context(),
+        CoverReply {
+            generation,
+            local_path: local_path.clone(),
+            provider_game_id: Some("partial".to_string()),
+            kind: GamerArtworkKind::Screenshot(0),
+            screenshot_count: Some(3),
+            answer: CoverAnswer::Ready(image("partial-0")),
+        }
+    ));
+
+    let remaining = cache.visible(&local_path);
+    assert_eq!(remaining.len(), 2);
+    assert_eq!(cache.ready_count(&local_path), 1);
+    assert!(cache.has_loading(&local_path));
+
+    assert!(cache.absorb(
+        &context(),
+        CoverReply {
+            generation,
+            local_path: local_path.clone(),
+            provider_game_id: Some("partial".to_string()),
+            kind: GamerArtworkKind::Screenshot(1),
+            screenshot_count: Some(3),
+            answer: CoverAnswer::None(NoCover::Failed),
+        }
+    ));
+    assert_eq!(cache.ready_count(&local_path), 1);
+    assert!(cache.has_loading(&local_path));
+
+    assert!(cache.absorb(
+        &context(),
+        CoverReply {
+            generation,
+            local_path: local_path.clone(),
+            provider_game_id: Some("partial".to_string()),
+            kind: GamerArtworkKind::Screenshot(2),
+            screenshot_count: Some(3),
+            answer: CoverAnswer::Ready(image("partial-2")),
+        }
+    ));
+    assert_eq!(cache.ready_count(&local_path), 2);
+    assert!(!cache.has_loading(&local_path));
+}
+
+#[test]
+fn provider_refresh_keeps_ready_screenshots_and_releases_stale_requests() {
+    let mut cache = GamerScreenshotCache::default();
+    let local_path = path("refresh");
+    let generation = cache.generation;
+
+    cache.visible(&local_path);
+    assert!(cache.absorb(
+        &context(),
+        CoverReply {
+            generation,
+            local_path: local_path.clone(),
+            provider_game_id: Some("refresh".to_string()),
+            kind: GamerArtworkKind::Screenshot(0),
+            screenshot_count: Some(3),
+            answer: CoverAnswer::Ready(image("refresh-0")),
+        }
+    ));
+    let pending = cache.visible(&local_path);
+    assert_eq!(pending.len(), 2);
+    let old_generation = cache.generation;
+
+    cache.identity_refreshed();
+
+    assert_eq!(cache.ready_count(&local_path), 1);
+    assert!(!cache.has_loading(&local_path));
+    assert_eq!(cache.generation, old_generation.wrapping_add(1));
+    assert!(!cache.absorb(
+        &context(),
+        CoverReply {
+            generation: old_generation,
+            local_path: local_path.clone(),
+            provider_game_id: Some("refresh".to_string()),
+            kind: GamerArtworkKind::Screenshot(1),
+            screenshot_count: Some(3),
+            answer: CoverAnswer::Ready(image("stale")),
+        }
+    ));
+
+    let reasked = cache.visible(&local_path);
+    assert_eq!(reasked.len(), 2);
+    assert!(reasked.iter().all(|job| matches!(
+        job.kind,
+        GamerArtworkKind::Screenshot(index) if (1..3).contains(&index)
+    )));
+}
+
+#[test]
+fn screenshot_section_shows_an_intentional_empty_state_after_a_record_has_no_screenshots() {
+    let mut cache = GamerScreenshotCache::default();
+    let local_path = path("none");
+    let generation = cache.generation;
+
+    cache.visible(&local_path);
+    assert!(cache.absorb(
+        &context(),
+        CoverReply {
+            generation,
+            local_path: local_path.clone(),
+            provider_game_id: Some("none".to_string()),
+            kind: GamerArtworkKind::Screenshot(0),
+            screenshot_count: Some(0),
+            answer: CoverAnswer::None(NoCover::NoArtwork),
+        }
+    ));
+
+    assert_eq!(cache.section_count(&local_path), Some(0));
+}
+
+#[test]
+fn screenshot_section_caps_real_records_at_the_display_limit() {
+    let mut cache = GamerScreenshotCache::default();
+    let local_path = path("many");
+    let generation = cache.generation;
+
+    cache.visible(&local_path);
+    assert!(cache.absorb(
+        &context(),
+        CoverReply {
+            generation,
+            local_path: local_path.clone(),
+            provider_game_id: Some("many".to_string()),
+            kind: GamerArtworkKind::Screenshot(0),
+            screenshot_count: Some(99),
+            answer: CoverAnswer::Ready(image("shot-0")),
+        }
+    ));
+
+    assert_eq!(
+        cache.section_count(&local_path),
+        Some(MAX_DETAILS_SCREENSHOTS)
+    );
+}
+
+#[test]
+fn imported_screenshot_reference_keeps_provider_order_and_is_not_a_public_cover() {
+    let mut artwork = romm_hosted();
+    artwork.screenshots = vec![
+        MediaReference {
+            hosted_reference: Some("/assets/romm/shot-1.png".to_string()),
+            public_reference: Some("https://public.example/shot-1.png".to_string()),
+        },
+        MediaReference {
+            hosted_reference: Some("/assets/romm/shot-2.png".to_string()),
+            public_reference: None,
+        },
+    ];
+    let imported = record("42", Some(artwork));
+    assert_eq!(imported.artwork.as_ref().unwrap().screenshots.len(), 2);
+    assert_eq!(
+        imported.artwork.as_ref().unwrap().screenshots[0]
+            .hosted_reference
+            .as_deref(),
+        Some("/assets/romm/shot-1.png")
+    );
+    assert!(matches!(plan_for(&imported), CoverPlan::UseRommHostedCover));
 }
 
 /// A decoded cover, as the worker would hand one over. Tiny: these tests are
@@ -85,6 +465,8 @@ fn ready(generation: u64, id: &str) -> CoverReply {
         generation,
         local_path: path(id),
         provider_game_id: Some(id.to_string()),
+        kind: GamerArtworkKind::Cover,
+        screenshot_count: None,
         answer: CoverAnswer::Ready(image(id)),
     }
 }
@@ -94,6 +476,8 @@ fn placeholder(generation: u64, id: &str, reason: NoCover) -> CoverReply {
         generation,
         local_path: path(id),
         provider_game_id: Some(id.to_string()),
+        kind: GamerArtworkKind::Cover,
+        screenshot_count: None,
         answer: CoverAnswer::None(reason),
     }
 }
@@ -122,6 +506,41 @@ fn a_public_url_cover_is_never_fetched() {
     assert_eq!(
         plan_for(&record("102", Some(public_only()))),
         CoverPlan::Placeholder(NoCover::PublicOnly)
+    );
+}
+
+#[test]
+fn an_approved_launchbox_cover_uses_the_shared_artwork_resolver() {
+    assert_eq!(
+        plan_for(&record("104", Some(launchbox_only()))),
+        CoverPlan::UseRommHostedCover
+    );
+}
+
+#[test]
+fn an_approved_launchbox_screenshot_is_eligible_for_the_shared_worker() {
+    let artwork = launchbox_only();
+    let media = artwork.screenshots.first().expect("fixture screenshot");
+    assert!(
+        media.hosted_reference.is_none()
+            && media
+                .public_reference
+                .as_deref()
+                .is_some_and(is_approved_launchbox_reference)
+    );
+}
+
+#[test]
+fn unrelated_public_screenshot_references_remain_refused() {
+    let media = MediaReference {
+        hosted_reference: None,
+        public_reference: Some("https://public.example/screenshot.png".to_string()),
+    };
+    assert!(
+        !media
+            .public_reference
+            .as_deref()
+            .is_some_and(is_approved_launchbox_reference)
     );
 }
 
@@ -284,6 +703,8 @@ fn two_files_of_one_game_each_draw_that_games_cover() {
                 generation: cache.generation(),
                 local_path: local_path.clone(),
                 provider_game_id: Some("shared-game".to_string()),
+                kind: GamerArtworkKind::Cover,
+                screenshot_count: None,
                 answer: CoverAnswer::Ready(image("shared-key")),
             }
         ));
@@ -392,6 +813,8 @@ fn a_cover_with_no_record_to_attach_it_to_is_refused() {
         generation: cache.generation(),
         local_path: path("1"),
         provider_game_id: None,
+        kind: GamerArtworkKind::Cover,
+        screenshot_count: None,
         answer: CoverAnswer::Ready(image("1")),
     };
     assert!(
@@ -535,6 +958,96 @@ fn an_indexed_record_keeps_its_own_identity_and_artwork() {
 }
 
 #[test]
+fn duplicate_titles_bind_media_to_the_exact_selected_path() {
+    let loose_path = PathBuf::from("/mnt/usbdrive/games/lynx/Awesome Golf.lnx");
+    let archive_path = PathBuf::from("/mnt/usbdrive/games/lynx/Awesome Golf (USA, Europe).zip");
+
+    let mut loose = record("44360", Some(romm_hosted()));
+    loose.archivefs_path = Some(loose_path.clone());
+    loose.title = Some("Awesome Golf".into());
+    loose.metadata_provider_ids = vec![MetadataProviderId {
+        provider: "launchbox".into(),
+        id: "19538".into(),
+    }];
+    loose.artwork.as_mut().unwrap().screenshots = (1..=3)
+        .map(|index| MediaReference {
+            hosted_reference: None,
+            public_reference: Some(format!(
+                "https://images.launchbox-app.com/screens/19538-{index}.png"
+            )),
+        })
+        .collect();
+
+    let mut archive = record("100983", Some(romm_hosted()));
+    archive.archivefs_path = Some(archive_path.clone());
+    archive.title = Some("Awesome Golf".into());
+    archive.metadata_provider_ids = vec![MetadataProviderId {
+        provider: "launchbox".into(),
+        id: "100983".into(),
+    }];
+    archive.artwork.as_mut().unwrap().screenshots.clear();
+
+    let index = index_by_path(&catalogue(vec![loose.clone(), archive.clone()]));
+    assert_eq!(index[&loose_path].provider_game_id, "44360");
+    assert_eq!(
+        index[&PathBuf::from("/mnt/usbdrive/games/lynx/./Awesome Golf.lnx")].provider_game_id,
+        "44360",
+        "lexical path normalization must not fall through to the same-title ZIP"
+    );
+    assert_eq!(index[&archive_path].provider_game_id, "100983");
+
+    let loose_media = archivefs_core::identity_source::media_resolver::resolve_media(
+        &resolver_input_for_record(&index[&loose_path], 1, None, 0, None),
+    );
+    let archive_media = archivefs_core::identity_source::media_resolver::resolve_media(
+        &resolver_input_for_record(&index[&archive_path], 2, None, 0, None),
+    );
+    assert_eq!(loose_media.screenshots.len(), 3);
+    assert_eq!(archive_media.screenshots.len(), 0);
+    assert_eq!(
+        index[&loose_path]
+            .metadata_provider_ids
+            .iter()
+            .find(|id| id.provider == "launchbox")
+            .unwrap()
+            .id,
+        "19538"
+    );
+    assert_eq!(
+        index[&archive_path]
+            .metadata_provider_ids
+            .iter()
+            .find(|id| id.provider == "launchbox")
+            .unwrap()
+            .id,
+        "100983"
+    );
+}
+
+#[test]
+fn a_second_duplicate_title_pair_remains_path_specific() {
+    let first_path = PathBuf::from("/library/nes/Star Quest.nes");
+    let second_path = PathBuf::from("/library/nes/Star Quest (Rev A).zip");
+
+    let mut first = record("nes-loose", Some(romm_hosted()));
+    first.archivefs_path = Some(first_path.clone());
+    first.title = Some("Star Quest".into());
+
+    let mut second = record("nes-archive", Some(public_only()));
+    second.archivefs_path = Some(second_path.clone());
+    second.title = Some("Star Quest".into());
+
+    let index = index_by_path(&catalogue(vec![first, second]));
+    assert_eq!(index[&first_path].provider_game_id, "nes-loose");
+    assert_eq!(index[&second_path].provider_game_id, "nes-archive");
+    assert_eq!(plan_for(&index[&first_path]), CoverPlan::UseRommHostedCover);
+    assert_eq!(
+        plan_for(&index[&second_path]),
+        CoverPlan::Placeholder(NoCover::PublicOnly)
+    );
+}
+
+#[test]
 fn a_catalogue_with_no_mapped_paths_indexes_nothing_rather_than_guessing() {
     let mut unmapped = record("100", Some(romm_hosted()));
     unmapped.archivefs_path = None;
@@ -555,6 +1068,8 @@ fn unchanged(generation: u64, id: &str, key: &str) -> CoverReply {
         generation,
         local_path: path(id),
         provider_game_id: Some(id.to_string()),
+        kind: GamerArtworkKind::Cover,
+        screenshot_count: None,
         answer: CoverAnswer::Unchanged {
             key: key.to_string(),
         },
@@ -567,6 +1082,8 @@ fn ready_with_key(generation: u64, id: &str, key: &str) -> CoverReply {
         generation,
         local_path: path(id),
         provider_game_id: Some(id.to_string()),
+        kind: GamerArtworkKind::Cover,
+        screenshot_count: None,
         answer: CoverAnswer::Ready(image(key)),
     }
 }
@@ -828,6 +1345,7 @@ fn queued(priority: CoverPriority, id: &str, sequence: u64) -> QueuedJob {
         job: CoverJob {
             local_path: path(id),
             priority,
+            kind: GamerArtworkKind::Cover,
             held_key: None,
         },
         sequence,
@@ -1141,6 +1659,7 @@ fn the_featured_cover_is_a_readable_size_at_1920x1080() {
     let box_size = featured_cover_box(
         GAMER_FEATURED_CONTENT_MAX_WIDTH,
         budget(780.0, FEATURED_RESERVED_BELOW),
+        true,
     )
     .expect("1080p has room for a featured cover");
     assert!(
@@ -1157,7 +1676,7 @@ fn the_featured_cover_scales_down_rather_than_pushing_the_actions_off() {
     let mut previous = f32::MAX;
     for height in [1100.0_f32, 780.0, 540.0, 430.0, 360.0] {
         let available = budget(height, FEATURED_RESERVED_BELOW);
-        let box_size = featured_cover_box(GAMER_FEATURED_CONTENT_MAX_WIDTH, available);
+        let box_size = featured_cover_box(GAMER_FEATURED_CONTENT_MAX_WIDTH, available, true);
         let drawn = box_size.map(|size| size.y).unwrap_or(0.0);
         assert!(
             drawn <= previous,
@@ -1178,7 +1697,8 @@ fn a_panel_too_short_for_artwork_drops_the_artwork_not_the_actions() {
     assert!(
         featured_cover_box(
             GAMER_FEATURED_CONTENT_MAX_WIDTH,
-            budget(340.0, FEATURED_RESERVED_BELOW)
+            budget(340.0, FEATURED_RESERVED_BELOW),
+            true,
         )
         .is_none(),
         "a cramped panel still reserved space for a cover"
@@ -1189,8 +1709,8 @@ fn a_panel_too_short_for_artwork_drops_the_artwork_not_the_actions() {
 fn a_measured_action_block_taller_than_the_estimate_still_shrinks_the_cover() {
     // A wrapped title and a stacked action column make the block far taller than
     // the first-frame estimate. The cover has to give that space back.
-    let tight = featured_cover_box(GAMER_FEATURED_CONTENT_MAX_WIDTH, budget(560.0, 420.0));
-    let roomy = featured_cover_box(GAMER_FEATURED_CONTENT_MAX_WIDTH, budget(560.0, 240.0));
+    let tight = featured_cover_box(GAMER_FEATURED_CONTENT_MAX_WIDTH, budget(560.0, 420.0), true);
+    let roomy = featured_cover_box(GAMER_FEATURED_CONTENT_MAX_WIDTH, budget(560.0, 240.0), true);
     let tight_height = tight.map(|size| size.y).unwrap_or(0.0);
     let roomy_height = roomy.map(|size| size.y).unwrap_or(0.0);
     assert!(
@@ -1202,13 +1722,60 @@ fn a_measured_action_block_taller_than_the_estimate_still_shrinks_the_cover() {
 #[test]
 fn the_featured_cover_never_exceeds_the_panel_width() {
     for width in [220.0_f32, 300.0, 460.0] {
-        if let Some(size) = featured_cover_box(width, 1200.0) {
+        if let Some(size) = featured_cover_box(width, 1200.0, true) {
             assert!(
                 size.x <= width,
                 "a {size:?} cover overflowed a {width}px panel"
             );
         }
     }
+}
+
+#[test]
+fn a_real_cover_is_noticeably_larger_than_the_1100x720_physical_target_used_to_produce() {
+    // Reproduces the stage's own inner-height budget at the real 1100x720
+    // physical target (see `GamerStageLayout` at ~1052x680, stage_height
+    // ~343, minus the stage's inner padding) with the panel width
+    // `GamerStageLayout::compute` now hands the media plate at that size.
+    // Before this fix a real cover measured about 164x247 there - too small
+    // relative to the hero space it sat in.
+    let panel_width = 280.0; // `GamerStageLayout::stage_media_width` at the target
+    let budget = 295.0; // the stage's inner height at the target
+    let real = featured_cover_box(panel_width, budget, true).expect("room for a real cover");
+    assert!(
+        real.x >= 200.0 && real.y >= 260.0,
+        "a real cover at the physical target measured only {real:?}"
+    );
+}
+
+#[test]
+fn a_real_cover_is_larger_than_the_fallback_plate_at_the_same_budget() {
+    let panel_width = 280.0;
+    let budget = 295.0;
+    let real = featured_cover_box(panel_width, budget, true).expect("room for a real cover");
+    let fallback =
+        featured_cover_box(panel_width, budget, false).expect("room for a fallback plate");
+    assert!(
+        real.y > fallback.y || real.x > fallback.x,
+        "a real cover ({real:?}) was not larger than the fallback plate ({fallback:?})"
+    );
+}
+
+#[test]
+fn the_fallback_plate_stays_bounded_even_on_a_generous_budget() {
+    // A tall/wide window gives the real cover far more room to grow (see
+    // `FEATURED_COVER_MAX_HEIGHT`), but the fallback platform-art plate keeps
+    // its own, more restrained ceiling regardless.
+    let fallback = featured_cover_box(600.0, 1000.0, false).expect("fallback still draws");
+    assert!(
+        fallback.y <= FEATURED_COVER_MAX_HEIGHT_FALLBACK + 0.01,
+        "the fallback plate grew past its restrained ceiling: {fallback:?}"
+    );
+    let real = featured_cover_box(600.0, 1000.0, true).expect("real cover still draws");
+    assert!(
+        real.y > fallback.y,
+        "a generous budget did not let the real cover outgrow the fallback ({real:?} vs {fallback:?})"
+    );
 }
 
 #[test]

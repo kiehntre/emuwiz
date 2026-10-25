@@ -1,0 +1,605 @@
+//! Unified Launch Planning - Phase 1.
+//!
+//! Given a canonically identified game and the emulator/RetroArch-core
+//! environment already discovered on this machine, this module produces a
+//! read-only [`planning::LaunchPlan`] describing which launches are
+//! possible and, for each, whether it is ready, ready with warnings, or
+//! blocked - and why.
+//!
+//! # What this module is not
+//!
+//! - Every submodule except [`execution`] never starts a process.
+//!   [`planning::build_launch_plan`] is a pure function and never spawns
+//!   anything; [`execution`] is the one deliberate, narrowly-scoped
+//!   exception - see its own module doc comment for exactly what it does
+//!   and does not launch (Phase 1: one native RetroArch process, one direct
+//!   loose regular content file, nothing else).
+//! - It never mutates an emulator's configuration, mounts an archive,
+//!   downloads firmware, or writes anything to disk.
+//! - It does not replace any adapter's own BIOS/firmware state enum (see
+//!   [`readiness`]'s module doc) and it does not retrofit the nine
+//!   `patch_manager::*_local` adapters behind one trait.
+//! - It does not perform identity fusion. Canonical identity is resolved
+//!   entirely upstream (`platform_evidence_fusion`, `platform::identity`,
+//!   `game_identity`); this module only ever consumes an already-resolved
+//!   [`planning::CanonicalIdentityStatus`] and fails closed whenever it is
+//!   not [`planning::CanonicalIdentityStatus::Resolved`].
+//!
+//! # Layout
+//!
+//! - [`readiness`] - the shared vocabulary for "is this playable right
+//!   now" ([`readiness::FirmwareReadiness`], [`readiness::LaunchReadiness`],
+//!   blocker/warning kinds) plus pure projections from each adapter's own
+//!   existing BIOS/firmware/TOS state enum - none of which are changed or
+//!   replaced.
+//! - [`platform_map`] - the small, reviewed canonical-platform ->
+//!   standalone-adapter table covering the platforms already supported by
+//!   an adapter in this build.
+//! - [`planning`] - the content/target/candidate/plan data model and the
+//!   pure [`planning::build_launch_plan`] planner.
+//! - [`input_projection`] - pure projection from already-verified identity
+//!   facts to each Phase 1 adapter's own launch-input request type (or an
+//!   explicit unavailable result); never executes anything and never
+//!   fuses or promotes identity itself.
+//! - [`es_de_export`] - a read-only ES-DE export/launch-entry plan built
+//!   from an already-resolved canonical identity and content path; never
+//!   writes `es_systems.xml`/`gamelist.xml` and never launches ES-DE.
+//! - [`evidence_bridge`] - the narrow, pure conversion from EmuWiz's
+//!   existing authoritative identity/content evidence
+//!   ([`crate::game_identity::GameIdentityReport`], [`crate::ArchiveRecord`])
+//!   into [`planning::CanonicalIdentityStatus`]/[`input_projection::VerifiedIdentityFact`]/
+//!   [`planning::LaunchContentRef`]; never resolves identity or mounts
+//!   anything itself.
+//! - [`execution`] - the first supported slice of real launch execution:
+//!   live-revalidates a user-authorized launch request from scratch
+//!   (fresh identity re-inspection, fresh RetroArch environment discovery,
+//!   a freshly rebuilt plan/command) and, only if every check still holds,
+//!   spawns exactly one native RetroArch process via
+//!   `std::process::Command` - never a shell. Nothing else in this module
+//!   spawns anything; see its own module doc comment for the exact scope.
+//!
+//! See `docs/PATCH_CHEAT_MANAGER_DESIGN.md` and `ROADMAP.md`'s
+//! "Launch-preparation workflows" note for the wider design context this
+//! module implements the first slice of.
+
+pub mod amiberry_cd_command;
+pub mod amiberry_cd_discovery;
+pub mod amiberry_cd_execution;
+pub mod amiberry_command;
+pub mod amiberry_execution;
+pub mod amiga_whdload_command;
+pub mod amiga_whdload_execution;
+pub mod amiga_whdload_trainer_launch;
+#[cfg(target_os = "linux")]
+pub mod atari800;
+pub mod azahar_command;
+pub mod azahar_execution;
+#[cfg(target_os = "linux")]
+pub mod b_em;
+#[cfg(target_os = "linux")]
+pub mod caprice32;
+pub mod cemu_command;
+pub mod cemu_execution;
+pub mod cemu_readiness;
+pub mod desmume_command;
+pub mod desmume_execution;
+pub mod desmume_profile;
+pub mod dolphin_command;
+pub mod dolphin_execution;
+pub mod dosbox_autoexec;
+pub mod dosbox_command;
+pub mod dosbox_execution;
+pub mod dosbox_sandbox;
+pub mod duckstation_command;
+pub mod duckstation_execution;
+#[cfg(target_os = "linux")]
+pub mod elkulator;
+pub mod es_de_export;
+pub mod es_de_publish;
+pub mod evidence_bridge;
+pub mod evidence_freshness;
+pub mod execution;
+pub mod fbneo_command;
+pub mod fbneo_execution;
+pub mod flycast_command;
+pub mod flycast_execution;
+pub mod flycast_gdi_readiness;
+pub mod fsuae_adf;
+pub mod fsuae_command;
+pub mod fsuae_execution;
+pub mod fuse_command;
+pub mod hatari_command;
+pub mod hatari_execution;
+pub mod input_projection;
+pub mod integration;
+pub mod mame_command;
+pub mod mame_execution;
+pub mod media_handoff;
+pub mod multidisc_launch;
+pub use multidisc_launch::{MultiDiscLaunch, MultiDiscPlaylist, plan_multidisc_launch};
+#[cfg(target_os = "linux")]
+pub mod libretro_probe;
+pub mod melonds_command;
+pub mod melonds_execution;
+pub mod mesen_command;
+pub mod mesen_execution;
+pub mod mgba_command;
+pub mod mgba_execution;
+#[cfg(target_os = "linux")]
+pub mod native_support;
+#[cfg(target_os = "linux")]
+pub mod np2kai;
+pub mod openmsx_command;
+pub mod openmsx_execution;
+#[cfg(target_os = "linux")]
+pub mod oricutron;
+pub mod pcsx2_command;
+pub mod pcsx2_execution;
+pub mod planning;
+pub mod platform_map;
+pub mod ppsspp_command;
+pub mod ppsspp_execution;
+pub mod process_spawn;
+pub mod retroarch_cheat_candidates;
+pub mod retroarch_overrides;
+pub use process_spawn::LaunchCommandSpec;
+pub mod cheat_launch_plan;
+pub mod cheat_runtime;
+pub mod cheat_runtime_mame;
+pub mod cheat_runtime_melonds;
+pub mod cheat_runtime_retroarch;
+pub mod installation;
+#[cfg(test)]
+mod installation_kinds_tests;
+pub mod installation_known;
+pub mod installation_support;
+pub mod readiness;
+pub mod resource_grants;
+pub mod retroarch_command;
+pub mod retroarch_launch_visibility;
+pub mod retroarch_resource_projection;
+pub mod rmg_command;
+pub mod rmg_execution;
+pub mod rpcs3_command;
+pub mod rpcs3_execution;
+#[cfg(target_os = "linux")]
+pub mod safe_launch_sandbox;
+pub mod sameboy_command;
+pub mod sameboy_execution;
+pub mod scummvm_command;
+pub mod scummvm_execution;
+#[cfg(target_os = "linux")]
+pub mod shadps4;
+#[cfg(target_os = "linux")]
+pub mod shadps4_input;
+#[cfg(target_os = "linux")]
+pub mod shadps4_profile;
+pub mod snes9x_command;
+pub mod snes9x_execution;
+pub mod stella_command;
+pub mod stella_execution;
+pub mod topology;
+pub mod tsugaru_command;
+pub mod tsugaru_execution;
+pub mod vice_command;
+pub mod vice_execution;
+pub mod vita3k_command;
+pub mod vita3k_execution;
+pub mod xemu_command;
+pub mod xemu_execution;
+pub mod xenia_command;
+pub mod xenia_execution;
+pub mod xroar_command;
+pub mod xroar_dat_identity;
+pub mod xroar_execution;
+
+#[cfg(test)]
+mod plan_to_spawn_tests;
+#[cfg(test)]
+mod tests;
+
+pub use amiberry_cd_command::{
+    AmiberryCdCommand, AmiberryCdCommandPlan, AmiberryCdFileBinding, AmiberryCdLaunchRequest,
+    build_amiberry_cd_command_plan,
+};
+pub use amiberry_cd_discovery::{
+    AmiberryCdDiscoveryStatus, AmiberryCdMediaDependency, AmiberryCdMediaDiscovery,
+    AmiberryCdProfileDiscovery, discover_amiberry_cd_media, discover_amiberry_cd_profile,
+};
+pub use amiberry_cd_execution::{
+    AmiberryCdLaunchExecutionError, AmiberryCdLaunchExitReport, AmiberryCdLaunchPreflightError,
+    AmiberryCdLaunchPreflightErrorKind, AmiberryCdLaunchSpawnError, LaunchedAmiberryCdProcess,
+    preflight_amiberry_cd_launch, preflight_and_launch_amiberry_cd, spawn_amiberry_cd,
+};
+pub use amiberry_execution::{
+    AmiberryLaunchExecutionError, AmiberryLaunchExitReport, AmiberryLaunchPreflightError,
+    AmiberryLaunchPreflightErrorKind, AmiberryLaunchSpawnError, LaunchedAmiberryProcess,
+    preflight_amiberry_launch, preflight_and_launch_amiberry, spawn_amiberry,
+};
+pub use amiga_whdload_command::{
+    AmigaWHDLoadCommand, AmigaWHDLoadCommandPlan, SelectedWHDLoadSlave, VerifiedWHDLoadTarget,
+    WHDLOAD_TRAINER_RUNTIME_UNSUPPORTED, WHDLoadLaunchInput, WHDLoadProfileInput,
+    WHDLoadRequirements, WhdloadLaunchTrainer, WhdloadPackageFormat,
+    build_amiberry_whdload_command_plan, build_fsuae_whdload_command_plan,
+    build_fsuae_whdload_command_plan_with_trainer, fsuae_whdload_args_value,
+    whdload_trainer_runtime_support,
+};
+pub use amiga_whdload_execution::{
+    AmigaWHDLoadLaunchError, LaunchedAmigaWHDLoadProcess, preflight_amiga_whdload_launch,
+    preflight_and_launch_amiga_whdload, spawn_amiga_whdload,
+};
+pub use amiga_whdload_trainer_launch::{
+    WhdloadLaunchTrainerResolution, plan_fsuae_whdload_launch_with_saved_trainers,
+    resolve_saved_whdload_launch_trainer,
+};
+pub use azahar_command::{
+    AZAHAR_SUPPORTED_PLATFORM_ID, AzaharCommand, AzaharCommandPlan, AzaharLaunchRequest,
+    build_azahar_command_plan,
+};
+pub use azahar_execution::{
+    AzaharPreflightError, AzaharPreflightErrorKind, LaunchedAzaharProcess, preflight_azahar_launch,
+    spawn_azahar,
+};
+pub use cemu_command::{
+    CEMU_SUPPORTED_PLATFORM_ID, CemuCommand, CemuCommandPlan, CemuCommandSelection,
+    CemuLaunchRequest, CemuReadiness, build_cemu_command_plan, classify_cemu_readiness,
+};
+pub use cemu_execution::{
+    CemuLaunchCommandFacts, CemuLaunchExecutionError, CemuLaunchExitReport,
+    CemuLaunchPreflightError, CemuLaunchPreflightErrorKind, CemuLaunchSpawnError,
+    CemuPreflightRequest, LaunchedCemuProcess, preflight_and_launch_cemu, preflight_cemu_launch,
+    spawn_cemu,
+};
+pub use cheat_launch_plan::{
+    ApplicabilityVerdict, CheatCandidate, CheatEmulatorCapability, CheatLaunchBlockReason,
+    CheatLaunchCommandError, CheatLaunchFormat, CheatLaunchMode, CheatLaunchPlan,
+    CheatLaunchPlanStatus, CheatLaunchRequest, CheatLaunchSelection, CheatLaunchTarget,
+    CheatVariant, LaunchStateClass, LaunchStateExpectation, RetroArchLaunchFacts,
+    RetroArchProfileIsolation, applicability_verdict, capture_baseline, cheat_launch_capability,
+    command_with_cheat_launch_plan, plan_cheat_launch, verify_expectation,
+};
+pub use desmume_command::{
+    DESMUME_SUPPORTED_PLATFORM_ID, DesmumeCommand, DesmumeCommandPlan, DesmumeCommandSelection,
+    build_desmume_command_plan,
+};
+pub use desmume_execution::{
+    DesmumeLaunchPreflightError, DesmumeLaunchPreflightErrorKind, DesmumeLaunchRequest,
+    preflight_desmume_launch, spawn_desmume,
+};
+pub use desmume_profile::{
+    DESMUME_MAX_EXPLICIT_EXECUTABLES, DesmumeExecutable, DesmumeInstallationType,
+    DesmumeLaunchBlocker, DesmumeLaunchBlockerKind, DesmumeNativeLaunchBinding, DesmumeProfile,
+    DesmumeProfileDiscovery, DesmumeProfileDiscoveryRoots, discover_desmume_profiles,
+    parse_desmume_version, resolve_desmume_native_launch_binding,
+};
+pub use dolphin_command::{
+    DOLPHIN_SUPPORTED_PLATFORM_ID, DolphinCommand, DolphinCommandPlan, DolphinCommandSelection,
+    build_dolphin_command_plan,
+};
+pub use dolphin_execution::{
+    DolphinLaunchCommandFacts, DolphinLaunchExecutionError, DolphinLaunchExitReport,
+    DolphinLaunchPreflightError, DolphinLaunchPreflightErrorKind, DolphinLaunchRequest,
+    DolphinLaunchSpawnError, LaunchedDolphinProcess, preflight_and_launch_dolphin,
+    preflight_dolphin_launch, spawn_dolphin,
+};
+pub use dosbox_autoexec::{
+    ApprovalMismatch, DosBoxGameReview, DosBoxReviewProblem, DosBoxStartApproval, ReviewedStart,
+    locate_dosbox_game_directory, review_dosbox_game_directory,
+};
+pub use dosbox_command::{
+    DOSBOX_CONFIG_FILE_NAME, DOSBOX_CONFIG_FLAG, DOSBOX_SUPPORTED_PLATFORM_ID,
+    DosBoxBindingRefusal, DosBoxCommand, DosBoxCommandPlan, DosBoxCommandSelection,
+    DosBoxConfigStatus, DosBoxNativeLaunchBinding, DosBoxVariant, build_dosbox_command_plan,
+    discover_dosbox_config, dosbox_config_status_from_inspection, dosbox_variant_from_id,
+    resolve_dosbox_native_launch_binding, resolve_dosbox_native_launch_binding_at,
+    resolve_dosbox_native_launch_binding_from_id,
+};
+pub use dosbox_execution::{
+    DosBoxLaunchExecutionError, DosBoxLaunchExitReport, DosBoxLaunchPreflightError,
+    DosBoxLaunchPreflightErrorKind, DosBoxLaunchRequest, DosBoxLaunchSpawnError,
+    LaunchedDosBoxProcess, preflight_and_launch_dosbox, preflight_dosbox_launch, spawn_dosbox,
+};
+pub use dosbox_sandbox::{BWRAP_PATH, DosBoxHostAccess, DosBoxSandboxError, probe_sandbox};
+pub use duckstation_command::{
+    DUCKSTATION_SUPPORTED_PLATFORM_ID, DuckStationCommand, DuckStationCommandPlan,
+    DuckStationCommandSelection, build_duckstation_command_plan,
+};
+pub use duckstation_execution::{
+    DuckStationLaunchCommandFacts, DuckStationLaunchExecutionError, DuckStationLaunchExitReport,
+    DuckStationLaunchPreflightError, DuckStationLaunchPreflightErrorKind, DuckStationLaunchRequest,
+    DuckStationLaunchSpawnError, LaunchedDuckStationProcess, preflight_and_launch_duckstation,
+    preflight_and_launch_duckstation_with_playlist, preflight_duckstation_launch,
+    preflight_duckstation_launch_with_playlist, spawn_duckstation,
+};
+pub use es_de_export::{
+    ES_DE_SYSTEM_MAP, EsDeEntryBlocker, EsDeEntryBlockerKind, EsDeEntryPlan, EsDeEntryStatus,
+    EsDeExportOutcome, EsDeSystemMapping, NoEntryReason, build_es_de_entry_plan,
+    es_de_system_for_platform,
+};
+pub use evidence_bridge::{
+    canonical_identity_from_game_report, launch_content_ref_for_unmounted,
+    launch_content_ref_from_archive_record,
+};
+pub use evidence_freshness::{
+    EvidenceFreshness, INSPECTION_INCOMPLETE_REASON, canonical_identity_for_saved_report,
+};
+pub use execution::{
+    LAUNCH_STDERR_CAPTURE_LIMIT, LaunchCommandFacts, LaunchContentIdentity, LaunchExecutionError,
+    LaunchExitReport, LaunchPreflightError, LaunchPreflightErrorKind, LaunchSpawnError,
+    LaunchedRetroArchProcess, RetroArchLaunchRequest, preflight_and_launch_retroarch,
+    preflight_and_launch_retroarch_with_playlist, preflight_retroarch_launch,
+    preflight_retroarch_launch_with_playlist, spawn_retroarch,
+};
+pub use fbneo_command::{
+    FBNEO_SUPPORTED_PLATFORM_ID, FbneoCommand, FbneoCommandPlan, FbneoIdentityEvidence,
+    FbneoSetEvidence, build_fbneo_command_plan,
+};
+pub use fbneo_execution::{
+    FbneoLaunchExecutionError, FbneoLaunchPreflightError, FbneoLaunchRequest,
+    preflight_and_launch_fbneo, preflight_fbneo_launch, spawn_fbneo,
+};
+pub use flycast_command::{
+    FLYCAST_SUPPORTED_PLATFORM_ID, FlycastCommand, FlycastCommandPlan, FlycastCommandSelection,
+    build_flycast_command_plan,
+};
+pub use flycast_execution::{
+    FlycastLaunchCommandFacts, FlycastLaunchExecutionError, FlycastLaunchExitReport,
+    FlycastLaunchPreflightError, FlycastLaunchPreflightErrorKind, FlycastLaunchRequest,
+    FlycastLaunchSpawnError, LaunchedFlycastProcess, preflight_and_launch_flycast,
+    preflight_flycast_launch, spawn_flycast,
+};
+pub use fsuae_adf::{
+    FsUaeAdfLaunchError, FsUaeAdfLaunchRequest, adf_canonical_identity, build_fsuae_adf_request,
+    current_adf_launch_identity, default_adf_identity_paths, fsuae_adf_config,
+    fsuae_adf_profile_refusal, preflight_and_launch_fsuae_adf, preflight_fsuae_adf_launch,
+};
+pub use fsuae_command::{
+    FSUAE_SUPPORTED_PLATFORM_ID, FsUaeCommand, FsUaeCommandPlan, FsUaeCommandSelection,
+    FsUaeLaunchBlocker, FsUaeLaunchBlockerKind, FsUaeNativeLaunchBinding, build_fsuae_command_plan,
+    resolve_fsuae_native_launch_binding,
+};
+pub use fsuae_execution::{
+    FsUaeLaunchPreflightError, FsUaeLaunchPreflightErrorKind, FsUaeLaunchRequest,
+    preflight_fsuae_launch, spawn_fsuae,
+};
+pub use fuse_command::{
+    FUSE_SUPPORTED_PLATFORM_ID, FuseCommand, FuseCommandPlan, FuseCommandSelection,
+    build_fuse_command_plan,
+};
+pub use hatari_command::{
+    HATARI_SUPPORTED_PLATFORM_ID, HatariCommand, HatariCommandPlan, HatariCommandSelection,
+    HatariMediaFormat, build_hatari_command_plan, hatari_media_format,
+};
+pub use hatari_execution::{
+    HatariLaunchExecutionError, HatariLaunchPreflightError, HatariLaunchPreflightErrorKind,
+    HatariLaunchRequest, preflight_and_launch_hatari, preflight_hatari_launch, spawn_hatari,
+};
+pub use input_projection::{
+    LaunchInputProjection, SegaCdGameRequest, VerifiedIdentityFact,
+    project_amiga_whdload_launch_input, project_dolphin_gamecube_launch_input,
+    project_dolphin_wii_launch_input, project_duckstation_launch_input,
+    project_flycast_launch_input, project_hatari_launch_input, project_melonds_launch_input,
+    project_pcsx2_launch_input, project_ppsspp_launch_input, project_rpcs3_launch_input,
+    project_scummvm_launch_input, project_sega_cd_launch_input, project_xemu_launch_input,
+    project_xenia_launch_input,
+};
+pub use integration::{
+    DiscoveredStandaloneProfile, LaunchPlanResults, azahar_profile_eligible,
+    build_launch_plan_from_results, melonds_firmware_readiness,
+};
+pub use mame_command::{
+    MAME_SUPPORTED_PLATFORM_IDS, MameCommand, MameCommandPlan, build_mame_command_plan,
+};
+pub use mame_execution::{
+    MameLaunchExecutionError, MameLaunchPreflightError, MameLaunchRequest,
+    preflight_and_launch_mame, preflight_mame_launch, spawn_mame,
+};
+pub use melonds_command::{
+    MELONDS_SUPPORTED_PLATFORM_ID, MelonDsCommand, MelonDsCommandPlan, MelonDsCommandSelection,
+    build_melonds_command_plan,
+};
+pub use melonds_execution::{
+    MelonDsLaunchPreflightError, MelonDsLaunchPreflightErrorKind, MelonDsLaunchRequest,
+    preflight_melonds_launch, spawn_melonds,
+};
+pub use mesen_command::{
+    MESEN_DO_NOT_SAVE_SETTINGS, MESEN_SUPPORTED_PLATFORM_IDS, MesenCommand, MesenCommandPlan,
+    MesenCommandSelection, build_mesen_command_plan,
+};
+pub use mesen_execution::{
+    MesenLaunchPreflightError, MesenLaunchPreflightErrorKind, MesenLaunchRequest,
+    preflight_mesen_launch, spawn_mesen,
+};
+pub use mgba_command::{
+    MGBA_SUPPORTED_PLATFORM_IDS, MgbaCommand, MgbaCommandPlan, MgbaCommandSelection,
+    build_mgba_command_plan,
+};
+pub use mgba_execution::{
+    MgbaLaunchPreflightError, MgbaLaunchPreflightErrorKind, MgbaLaunchRequest,
+    preflight_mgba_launch, spawn_mgba,
+};
+pub use openmsx_execution::{
+    OpenMsxLaunchExecutionError, OpenMsxLaunchPreflightError, OpenMsxLaunchPreflightErrorKind,
+    OpenMsxLaunchRequest, preflight_and_launch_openmsx, preflight_openmsx_launch, spawn_openmsx,
+};
+pub use pcsx2_command::{
+    PCSX2_SUPPORTED_PLATFORM_ID, Pcsx2Command, Pcsx2CommandPlan, Pcsx2CommandSelection,
+    build_pcsx2_command_plan,
+};
+pub use pcsx2_execution::{
+    LaunchedPcsx2Process, Pcsx2LaunchCommandFacts, Pcsx2LaunchExecutionError,
+    Pcsx2LaunchExitReport, Pcsx2LaunchPreflightError, Pcsx2LaunchPreflightErrorKind,
+    Pcsx2LaunchRequest, Pcsx2LaunchSpawnError, preflight_and_launch_pcsx2, preflight_pcsx2_launch,
+    spawn_pcsx2,
+};
+pub use planning::{
+    CandidatePreference, CanonicalIdentityStatus, LaunchCandidate, LaunchContainerKind,
+    LaunchContentKind, LaunchContentRef, LaunchPlan, LaunchPlanSummary, LaunchTarget,
+    RememberedPreference, ResolvedIdentity, StandaloneProfileInput, VerifiedWHDLoadContent,
+    build_launch_plan,
+};
+pub use platform_map::{
+    LAUNCH_COMPATIBILITY, LaunchCompatibility, MappingConfidence, extension_narrows_candidate,
+    launch_compatibility_for_platform, platforms_for_standalone_adapter,
+    retroarch_platform_candidate,
+};
+pub use ppsspp_command::{
+    PPSSPP_SUPPORTED_PLATFORM_ID, PpssppCommand, PpssppCommandPlan, PpssppCommandSelection,
+    build_ppsspp_command_plan,
+};
+pub use ppsspp_execution::{
+    LaunchedPpssppProcess, PpssppLaunchCommandFacts, PpssppLaunchExecutionError,
+    PpssppLaunchExitReport, PpssppLaunchPreflightError, PpssppLaunchPreflightErrorKind,
+    PpssppLaunchRequest, PpssppLaunchSpawnError, preflight_and_launch_ppsspp,
+    preflight_ppsspp_launch, spawn_ppsspp,
+};
+pub use readiness::{
+    FirmwareReadiness, LaunchBlocker, LaunchBlockerKind, LaunchReadiness, LaunchWarning,
+    LaunchWarningKind, duckstation_firmware_readiness, flycast_firmware_readiness,
+    hatari_firmware_readiness, pcengine_cd_firmware_readiness, pcsx2_firmware_readiness,
+    ppsspp_firmware_readiness, retroarch_core_firmware_readiness, rpcs3_firmware_readiness,
+    xemu_firmware_readiness, xenia_firmware_readiness,
+};
+pub use resource_grants::{
+    LaunchAccessScope, LaunchProjectionMethod, LaunchResourceAccess, LaunchResourceGrant,
+    LaunchResourceGrantError, LaunchResourceGrantSet, LaunchResourceLifetime, LaunchResourceRole,
+};
+pub use retroarch_command::{
+    RetroArchCommand, RetroArchCommandPlan, RetroArchCommandSelection, build_retroarch_command_plan,
+};
+pub use retroarch_resource_projection::{
+    RetroArchBiosRequirement, RetroArchProjectionError, RetroArchProjectionReceipt,
+    RetroArchResourcePlan, RetroArchResourcePlanError, RetroArchResourceRequest,
+    approved_retroarch_data_launch_root, approved_retroarch_launch_root,
+    approved_retroarch_launch_roots, cleanup_retroarch_projection,
+    command_with_retroarch_resource_plan, materialize_retroarch_resource_plan,
+    plan_retroarch_resource_grants,
+};
+pub use rmg_command::{
+    RMG_SUPPORTED_PLATFORM_ID, RmgCommand, RmgCommandPlan, RmgCommandSelection,
+    build_rmg_command_plan,
+};
+pub use rmg_execution::{
+    RmgLaunchPreflightError, RmgLaunchPreflightErrorKind, RmgLaunchRequest, preflight_rmg_launch,
+    spawn_rmg,
+};
+pub use rpcs3_command::{
+    RPCS3_SUPPORTED_PLATFORM_ID, Rpcs3Command, Rpcs3CommandPlan, Rpcs3CommandSelection,
+    build_rpcs3_command_plan,
+};
+pub use rpcs3_execution::{
+    LaunchedRpcs3Process, Rpcs3LaunchCommandFacts, Rpcs3LaunchExecutionError,
+    Rpcs3LaunchExitReport, Rpcs3LaunchPreflightError, Rpcs3LaunchPreflightErrorKind,
+    Rpcs3LaunchRequest, Rpcs3LaunchSpawnError, preflight_and_launch_rpcs3, preflight_rpcs3_launch,
+    spawn_rpcs3,
+};
+pub use sameboy_command::{
+    SAMEBOY_SUPPORTED_PLATFORM_IDS, SameBoyCommand, SameBoyCommandPlan, SameBoyCommandSelection,
+    SameBoyContentForm, SameBoyLaunchRequest, SameBoyReadiness, build_sameboy_command_plan,
+    classify_sameboy_readiness, form_for_path as sameboy_form_for_path,
+};
+pub use sameboy_execution::{
+    LaunchedSameBoyProcess, SameBoyLaunchCommandFacts, SameBoyLaunchExecutionError,
+    SameBoyLaunchExitReport, SameBoyLaunchPreflightError, SameBoyLaunchPreflightErrorKind,
+    SameBoyLaunchSpawnError, SameBoyPreflightRequest, preflight_and_launch_sameboy,
+    preflight_sameboy_launch, spawn_sameboy,
+};
+pub use scummvm_command::{
+    SCUMMVM_SUPPORTED_PLATFORM_ID, ScummVmCommand, ScummVmCommandPlan, ScummVmCommandSelection,
+    ScummVmNativeLaunchBinding, ScummVmTrainerLaunchBinding, build_scummvm_command_plan,
+    build_scummvm_command_plan_with_trainer, resolve_scummvm_native_launch_binding,
+    resolve_scummvm_native_launch_binding_at,
+};
+pub use scummvm_execution::{
+    LaunchedScummVmProcess, ScummVmLaunchExecutionError, ScummVmLaunchPreflightError,
+    ScummVmLaunchPreflightErrorKind, ScummVmLaunchRequest, ScummVmLaunchSpawnError,
+    preflight_and_launch_scummvm, preflight_scummvm_launch, spawn_scummvm,
+    trainer_profile::{
+        LaunchedTrainerScummVm, TrainerLaunchError, TrainerLaunchRequest, TrainerProfileState,
+        TrainerProfileSummary, inspect_trainer_profile, preflight_and_launch_with_trainer_profile,
+    },
+};
+pub use snes9x_command::{
+    SNES9X_SUPPORTED_PLATFORM_IDS, Snes9xCommand, Snes9xCommandPlan, Snes9xCommandSelection,
+    Snes9xReadiness, build_snes9x_command_plan, classify_snes9x_readiness,
+};
+pub use snes9x_execution::{
+    Snes9xLaunchPreflightError, Snes9xLaunchPreflightErrorKind, Snes9xLaunchRequest,
+    preflight_snes9x_launch, spawn_snes9x,
+};
+pub use stella_command::{
+    STELLA_SUPPORTED_PLATFORM_ID, StellaCommand, StellaCommandPlan, StellaCommandSelection,
+    StellaReadiness, build_stella_command_plan, classify_stella_readiness,
+};
+pub use stella_execution::{
+    StellaLaunchPreflightError, StellaLaunchPreflightErrorKind, StellaLaunchRequest,
+    preflight_stella_launch, spawn_stella,
+};
+pub use topology::{
+    MediaTopologyActionSafety, MediaTopologyLaunchProjection, MediaTopologyMissingMedia,
+    build_launch_plan_with_media_set, project_media_set_for_launch,
+};
+pub use tsugaru_command::{
+    TSUGARU_SUPPORTED_PLATFORM_ID, TsugaruCommand, TsugaruCommandPlan, TsugaruMediaFormat,
+    build_tsugaru_command_plan, tsugaru_media_format,
+};
+pub use tsugaru_execution::{
+    TsugaruLaunchExecutionError, TsugaruLaunchPreflightError, TsugaruLaunchPreflightErrorKind,
+    TsugaruLaunchRequest, preflight_and_launch_tsugaru, preflight_tsugaru_launch, spawn_tsugaru,
+};
+pub use vice_command::{
+    VICE_ATTACH_CRT, VICE_AUTOSTART, VICE_DISABLE_SAVE_RESOURCES, VICE_SUPPORTED_PLATFORM_ID,
+    ViceCommand, ViceCommandPlan, ViceCommandSelection, build_vice_command_plan,
+};
+pub use vice_execution::{
+    ViceLaunchPreflightError, ViceLaunchPreflightErrorKind, ViceLaunchRequest,
+    preflight_vice_launch, spawn_vice,
+};
+pub use vita3k_command::{
+    VITA3K_SUPPORTED_PLATFORM_ID, Vita3kCommand, Vita3kCommandPlan, Vita3kCommandSelection,
+    build_vita3k_command_plan,
+};
+pub use vita3k_execution::{
+    Vita3kLaunchPreflightError, Vita3kLaunchPreflightErrorKind, Vita3kLaunchRequest,
+    preflight_vita3k_launch, spawn_vita3k,
+};
+pub use xemu_command::{
+    XEMU_SUPPORTED_PLATFORM_ID, XemuCommand, XemuCommandPlan, XemuCommandSelection,
+    build_xemu_command_plan,
+};
+pub use xemu_execution::{
+    LaunchedXemuProcess, XemuLaunchCommandFacts, XemuLaunchExecutionError, XemuLaunchExitReport,
+    XemuLaunchPreflightError, XemuLaunchPreflightErrorKind, XemuLaunchRequest,
+    XemuLaunchSpawnError, preflight_and_launch_xemu, preflight_xemu_launch, spawn_xemu,
+};
+pub use xenia_command::{
+    XENIA_SUPPORTED_PLATFORM_ID, XeniaCommand, XeniaCommandPlan, XeniaCommandSelection,
+    build_xenia_command_plan,
+};
+pub use xenia_execution::{
+    LaunchedXeniaProcess, XeniaLaunchCommandFacts, XeniaLaunchExecutionError,
+    XeniaLaunchExitReport, XeniaLaunchPreflightError, XeniaLaunchPreflightErrorKind,
+    XeniaLaunchRequest, XeniaLaunchSpawnError, preflight_and_launch_xenia, preflight_xenia_launch,
+    spawn_xenia,
+};
+pub use xroar_command::{
+    XROAR_SUPPORTED_TAPE_PLATFORM_IDS, XRoarCommand, XRoarCommandPlan, XRoarMediaFormat,
+    build_xroar_command_plan, xroar_media_format,
+};
+pub use xroar_dat_identity::{
+    DRAGON_COCO_PLATFORM_ID, DragonCocoCassetteEvidence, DragonCocoCatalogue,
+    DragonCocoCatalogueMatch, DragonCocoRefusal, DragonCocoRefusalKind,
+    verify_dragon_coco_cassette,
+};
+pub use xroar_execution::{
+    XRoarLaunchExecutionError, XRoarLaunchPreflightError, XRoarLaunchPreflightErrorKind,
+    XRoarLaunchRequest, preflight_and_launch_xroar, preflight_xroar_launch, spawn_xroar,
+};
+
+/// Read-only per-game Dolphin profile guidance.
+pub mod dolphin_profile_composition;
+
+/// NES/FDS media and firmware launch gates.
+pub mod mesen_nes;
+
+pub mod nkit_readiness;

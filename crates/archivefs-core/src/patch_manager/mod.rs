@@ -1,5 +1,8 @@
 //! Patch, cheat, preview, and shared transaction foundations.
 //!
+//! RetroArch bezel ownership is exported below only after the same shared
+//! transaction contract used by the other write-capable adapters.
+//!
 //! The original read-only PCSX2 metadata adapter remains available in
 //! `pcsx2.rs`. The install-capable PCSX2 path is deliberately separate:
 //! `pcsx2_identity`, `pcsx2_provider`, `pcsx2_pnach`, and
@@ -16,25 +19,53 @@
 //! `retrieval.rs` was changed to add it; every PCSX2 type, plan ID, JSON
 //! shape, and CLI output listed above remains exactly as it was.
 
+mod action_replay;
 mod adapter;
+mod amiga_whdload_local;
+mod azahar_local;
 mod bsfree;
 mod bsfree_gamecube;
 mod bsfree_wii;
+mod cemu_graphic_pack;
+mod cemu_local;
+mod cheat_applicability;
 mod cheat_cache_lock;
 mod cheat_cache_maintenance;
 mod cheat_candidates;
 mod cheat_catalogue;
+mod cheat_compatibility;
+#[cfg(test)]
+mod cheat_consolidation_tests;
+/// Synthetic WHDLoad slave and inspection fixtures shared with the launch tests.
+#[cfg(test)]
+pub(crate) use whdload_trainer_discovery::tests as whdload_trainer_discovery_fixtures;
+mod cheat_conversion;
 mod cheat_coverage;
 mod cheat_history;
 mod cheat_install_plan;
 mod cheat_install_result;
 mod cheat_installer;
+mod cheat_ir;
+mod cheat_journey;
+mod cheat_launch_derivative;
+mod cheat_loadability;
+mod cheat_pack_preview;
+mod cheat_provenance;
 mod cheat_provider;
+pub use cheat_provenance::{
+    CheatApplicabilityEvidence, CheatApplicabilityKind, CheatNormalizationStatus,
+    CheatRecordProvenance, CheatSourceKind, CheatSourceQuality, cheat_evidence_source_count,
+    order_cheat_provenance,
+};
+mod cheat_reconciliation_plan;
 mod cheat_rollback;
 mod cheat_rollback_result;
+mod cheat_route;
 mod cheat_source_registry;
 mod cheat_sources;
+mod cheatbase;
 mod cht_document;
+mod classic_game_genie;
 mod destination_safety;
 mod dolphin_cheat_catalogue;
 mod dolphin_code;
@@ -42,7 +73,25 @@ mod dolphin_dedup;
 mod dolphin_gecko_install_plan;
 mod dolphin_gecko_provider;
 mod dolphin_local;
-mod emulator_profile_memory;
+mod dolphin_onframe_install_plan;
+mod dolphin_onframe_source;
+mod dolphin_texture_mod;
+mod dolphin_texture_pack;
+mod duckstation_cheat;
+mod duckstation_disc_authority;
+mod duckstation_firmware;
+pub(crate) mod duckstation_local;
+pub(crate) mod duckstation_native;
+mod duckstation_native_history;
+pub(crate) mod emulator_profile_memory;
+mod emulator_request_bridge;
+mod fbneo_cheat;
+mod flycast_cheats;
+pub mod flycast_install;
+mod flycast_local;
+mod fuse_local;
+mod gamecube_wii_ar_decrypt;
+mod gamehacking_browser_import;
 mod gamehacking_catalogue;
 mod gamehacking_gamecube_install_plan;
 mod gamehacking_gamecube_provider;
@@ -50,27 +99,81 @@ mod gamehacking_provider;
 mod gamehacking_shared;
 mod gamehacking_wii_provider;
 mod gecko_document;
+mod hatari_local;
 mod import_safety;
+mod local_cheat_install;
+mod local_cheat_install_dolphin;
+mod local_cheat_install_pcsx2;
+mod mame_cheat;
 mod matching;
+mod mednafen_cheat;
+mod melonds_cheat;
+mod melonds_install;
+pub use melonds_install::{
+    MelonDsInstallPreview, MelonDsInstallRequest, MelonDsInstallSource, apply_melonds_install,
+    inspect_melonds_local_cheats, melonds_entry_installable, melonds_install_attention,
+    preview_melonds_install, select_melonds_cheat_profile,
+};
+mod melonds_local;
+mod mesen_local;
+mod mgba_cheats;
+mod mgba_install;
+pub use mgba_install::*;
+mod mgba_local;
+mod n64_gameshark;
+mod openmsx_local;
+mod pcengine_cd_firmware;
 mod pcsx2;
+mod pcsx2_firmware;
 mod pcsx2_identity;
 mod pcsx2_install_plan;
 mod pcsx2_local;
 mod pcsx2_pnach;
 mod pcsx2_provider;
+mod pcsx2_temp_cheat_readiness;
+mod pcsx2_texture_pack;
+mod ppsspp_cwcheat;
+pub mod ppsspp_install;
+pub(crate) mod ppsspp_local;
+mod ppsspp_texture_pack;
 mod resolved_emulator_profile;
 mod retrieval;
 mod retroarch;
+mod retroarch_bezel;
 mod retroarch_cheat_library;
 mod retroarch_cheat_setup;
 mod retroarch_inventory;
 mod retroarch_materialization;
+mod rmg_local;
+mod rpcs3_activation;
+mod rpcs3_local;
+mod rpcs3_ordinary_mod;
+mod rpcs3_patch;
+pub use rpcs3_activation::*;
+mod sameboy_local;
+mod saturn_action_replay;
+mod whdload_trainer;
+mod whdload_trainer_discovery;
+mod whdload_trainer_storage;
+// ScummVM’s documented gameplay options stay separate from memory-write cheats.
+mod scummvm_trainer;
 mod shared_preview;
 mod shared_transaction;
+mod snes9x_local;
+mod staging_job;
+mod stella_local;
+mod three_ds_cheat;
+mod tsugaru_local;
+mod user_cheat_import;
+mod vice_c64_cheat;
+mod vice_local;
+mod vita3k_local;
+mod xemu_local;
 mod xenia_install_plan;
 mod xenia_local;
 mod xenia_patch_document;
 mod xenia_provider;
+mod xroar_local;
 
 use std::collections::BTreeSet;
 use std::fmt;
@@ -79,11 +182,50 @@ use std::path::Path;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
+pub use azahar_local::{
+    AZAHAR_MAX_3DSX_INSPECTION_BYTES, AZAHAR_MAX_CONFIG_BYTES, AzaharContentForm,
+    AzaharDiscoveryRoots, AzaharEvidenceState, AzaharProfile, AzaharTitleIdentity,
+    discover_azahar_executable, discover_azahar_profile, inspect_azahar_3dsx,
+    inspect_azahar_content, parse_azahar_version,
+};
+
 use crate::{Database, PersistedArchive};
 
+pub use crate::classic_poke_family::{
+    POKE_MAX_EXPRESSION_BYTES, POKE_MAX_LINES, POKE_MAX_OPERATIONS, POKE_MAX_TITLE_BYTES,
+    PokeAddress, PokeBank, PokeCheat, PokeCondition, PokeConflict, PokeConflictKind,
+    PokeExpressionResult, PokeIssue, PokeMemorySpace, PokeOperation, PokeOriginalValue,
+    PokeParseError, PokePlatform, PokePlatformSemantics, PokeProjectionRefusal,
+    PokeRuntimeCapability, PokeRuntimeEmulator, PokeRuntimeProjection, PokeRuntimeSupport,
+    PokeValue, find_poke_conflicts, manual_poke, normalize_zx_pok_family, parse_poke_expression,
+    parse_simple_pokes, poke_apply_allowed, poke_identity_state, poke_platform_semantics,
+    poke_runtime_capability, project_poke_runtime,
+};
+
+pub use crate::open_retro_cheat_providers::{
+    LIBRETRO_CHEAT_URL, OpenCheatProvider, OpenCheatProviderMode, OpenCheatTrustState,
+    WHDLOAD_OPTIONS_URL, WhdloadCustomOption, ZXDB_URL, ZxPokError, ZxPokOperation, ZxPokTrainer,
+    normalize_zx_pok, open_cheat_provider_catalogue, parse_whdload_custom_options, parse_zx_pok,
+};
+pub use action_replay::{
+    CheatAdapterProjection, CheatCodeDecodeResult, CheatCodeEncoding, CheatCodeFormat,
+    CheatDecoderProvenance, CheatDetection, CheatInstruction, CheatTargetPlatform,
+    CheatValidationIssue, decode_action_replay, decode_ds_action_replay,
+    decode_gamecube_action_replay, decode_gba_action_replay, decode_ps2_action_replay,
+    detect_action_replay_format, project_action_replay, refuse_encrypted_action_replay,
+};
 pub use adapter::{
     AdapterCapabilities, AdapterId, AdapterIdentityEvidence, DiscoveryConfidence, EmulatorAdapter,
     HypotheticalDestination, InstallationCandidate,
+};
+pub use amiga_whdload_local::{
+    AMIGA_MAX_CONFIG_BYTES, AMIGA_MAX_PROFILES, AMIGA_MAX_SAVE_STATE_CANDIDATES, AmigaConfig,
+    AmigaEmulatorKind, AmigaExecutable, AmigaGameInspection, AmigaGameMapping, AmigaGameRequest,
+    AmigaHdfInspection, AmigaHdfPartitionInspection, AmigaHealth, AmigaInstallationType,
+    AmigaKickstart, AmigaKickstartState, AmigaMachineProfile, AmigaProfile, AmigaProfileDiscovery,
+    AmigaProfileDiscoveryRoots, AmigaProfileScope, AmigaSlaveCandidate, AmigaWarning,
+    AmigaWarningKind, discover_amiga_profiles, inspect_amiga_hdf, inspect_amiga_whdload_game,
+    parse_amiga_version,
 };
 pub use bsfree::{
     BSFREE_DATABASE_FILE, BSFREE_DATABASE_URL, BSFREE_DOWNLOAD_HOST, BSFREE_EXPECTED_SHA256,
@@ -100,13 +242,14 @@ pub use bsfree::{
 };
 pub use bsfree_gamecube::{
     BSFREE_GAMECUBE_PROVIDER_LABEL, BsFreeDedupFinding, BsFreeDedupFindingKind,
-    BsFreeGameCubeCheat, BsFreeGameCubeCheatSelection, BsFreeGameCubeCodeFormat,
-    BsFreeGameCubeError, BsFreeGameCubeErrorKind, BsFreeGameCubeInstallPreview,
-    BsFreeGameCubeInstallPreviewRequest, BsFreeGameCubeMatch, BsFreeGameCubeSearchOutcome,
-    BsFreeGameCubeSearchStatus, BsFreeGameCubeSelectionEntry, BsFreeStagedGameCubeInstall,
-    analyze_bsfree_gamecube_duplicates, bsfree_cheat_as_gamehacking, bsfree_dolphin_code_name,
-    bsfree_gamecube_cheats, bsfree_gamecube_load_confirmed, bsfree_gamecube_match,
-    bsfree_gamecube_search, build_bsfree_gamecube_install_preview, classify_bsfree_gamecube_cheat,
+    BsFreeGameCubeArDecryption, BsFreeGameCubeCheat, BsFreeGameCubeCheatSelection,
+    BsFreeGameCubeCodeFormat, BsFreeGameCubeError, BsFreeGameCubeErrorKind,
+    BsFreeGameCubeInstallPreview, BsFreeGameCubeInstallPreviewRequest, BsFreeGameCubeMatch,
+    BsFreeGameCubeSearchOutcome, BsFreeGameCubeSearchStatus, BsFreeGameCubeSelectionEntry,
+    BsFreeStagedGameCubeInstall, analyze_bsfree_gamecube_duplicates, bsfree_cheat_as_gamehacking,
+    bsfree_dolphin_code_name, bsfree_gamecube_cheats, bsfree_gamecube_load_confirmed,
+    bsfree_gamecube_match, bsfree_gamecube_search, build_bsfree_gamecube_install_preview,
+    classify_bsfree_gamecube_cheat, classify_bsfree_gamecube_cheat_with_provenance,
     stage_bsfree_gamecube_install,
 };
 pub use bsfree_wii::{
@@ -117,6 +260,33 @@ pub use bsfree_wii::{
     analyze_bsfree_wii_duplicates, bsfree_cheat_as_wii, bsfree_dolphin_wii_code_name,
     bsfree_wii_cheats, bsfree_wii_load_confirmed, bsfree_wii_match, bsfree_wii_search,
     build_bsfree_wii_install_preview, classify_bsfree_wii_cheat, stage_bsfree_wii_install,
+};
+pub use cemu_graphic_pack::{
+    CEMU_GRAPHIC_PACK_MAX_FILES, CEMU_GRAPHIC_PACK_MAX_RULES_BYTES,
+    CEMU_GRAPHIC_PACK_MAX_TOTAL_BYTES, CEMU_GRAPHIC_PACK_SOURCE_MODE, CemuGraphicPackApplyResult,
+    CemuGraphicPackArchiveInspection, CemuGraphicPackError, CemuGraphicPackErrorKind,
+    CemuGraphicPackInspection, CemuGraphicPackPlan, apply_cemu_graphic_pack,
+    build_cemu_graphic_pack_plan, build_cemu_graphic_pack_transaction_plan,
+    cemu_graphic_packs_root, inspect_cemu_graphic_pack, inspect_cemu_graphic_pack_zip,
+    preview_cemu_graphic_pack_rollback, rollback_cemu_graphic_pack, verified_cemu_title_id,
+};
+pub use cemu_local::{
+    CEMU_MAX_CONFIG_BYTES, CEMU_MAX_META_XML_BYTES, CEMU_MAX_PROFILES, CemuConfigInspection,
+    CemuContentForm, CemuContentSupport, CemuDiscoveryError, CemuExecutable, CemuExtractedLayout,
+    CemuInstallationType, CemuKeysEvidence, CemuKeysState, CemuLaunchBlocker,
+    CemuLaunchBlockerKind, CemuLayoutError, CemuLayoutErrorKind, CemuMlcEvidence, CemuMlcState,
+    CemuNativeLaunchBinding, CemuProfile, CemuProfileDiscovery, CemuProfileDiscoveryRoots,
+    CemuTitleIdentity, CemuTitleKind, classify_title_kind, config_path as cemu_config_path,
+    discover_cemu_profiles, extract_title_identity, form_for_path as cemu_form_for_path,
+    inspect_config as cemu_inspect_config, inspect_extracted_layout,
+    keys_evidence as cemu_keys_evidence, parse_cemu_version, resolve_cemu_native_launch_binding,
+};
+pub use cheat_applicability::{
+    CheatApplicabilityFinding, CheatApplicabilityFindingKind, CheatApplicabilityInput,
+    CheatApplicabilityIssue, CheatApplicabilityMatch, CheatApplicabilityPresentation,
+    CheatApplicabilityReport, CheatApplicabilityState, CheatApplicabilitySupport,
+    CheatGameAssociation, CheatIdentityRequirement, CheatParseEvidence, CheatReleaseEvidence,
+    CheatSelectedGame, CheatSupportState, assess_cheat_applicability,
 };
 pub use cheat_cache_maintenance::{
     CHEAT_CACHE_MAINTENANCE_SCHEMA_VERSION, CachePruneDisposition, CachePruneEntryKind,
@@ -145,6 +315,15 @@ pub use cheat_catalogue::{
     RetroarchChtDirectorySource, build_cheat_availability_report, load_cheat_catalogue_snapshot,
     match_cheat_game_record, matching_excluded_entry,
 };
+pub use cheat_compatibility::{
+    CheatCompatibilityEntry, CheatCompatibilityOperation, CheatCompatibilityReport, CheatCondition,
+    CheatConflict, CheatConflictKind, CheatConflictSeverity, CheatMasterCodeRequirement,
+    CheatMemoryRange, CheatRevisionEvidence, CheatStackReadiness, analyze_cheat_stack,
+};
+pub use cheat_conversion::{
+    CheatConversionMismatchReason, CheatConversionPlan, CheatConversionRequest,
+    CheatConversionVerification, verify_conversion,
+};
 pub use cheat_coverage::{
     CHEAT_PROVIDER_COVERAGE_FORMAT_VERSION, CheatCoverageEntry, CheatCoverageSummary,
     CheatProviderCoverageReport, CoverageGameIdentity, CoverageProvider, CoverageRejection,
@@ -163,8 +342,9 @@ pub use cheat_install_plan::{
     CheatInstallPlanErrorKind, CheatInstallPreview, CheatInstallPreviewRequest,
     CheatPlatformDirectorySource, CheatSelection, CheatSelectionEntry, GENERATED_FILE_PROVENANCE,
     LoadedCandidate, MAX_CANDIDATE_FILE_BYTES, MAX_GENERATED_FILE_BYTES,
-    MAX_PLATFORM_DIRECTORY_CANDIDATES, ResolvedCheatDestination, StagedCheatFile,
-    build_cheat_install_preview, load_candidate_document, match_strength_for_candidate,
+    MAX_PLATFORM_DIRECTORY_CANDIDATES, ResolvedCheatDestination, RetroArchCheatMigrationPreview,
+    RetroArchCheatMigrationStatus, StagedCheatFile, build_cheat_install_preview,
+    load_candidate_document, match_strength_for_candidate, preview_retroarch_cheat_migration,
     resolve_cheat_destination, stage_generated_cheat_file,
 };
 pub use cheat_install_result::{
@@ -177,12 +357,58 @@ pub use cheat_installer::{
     CHEAT_INSTALL_BACKUPS_DIRECTORY_NAME, CHEAT_INSTALL_RUNS_DIRECTORY_NAME, CheatInstallOptions,
     CheatInstallRunOutcome, execute_cheat_install_run,
 };
+pub use cheat_ir::{
+    CheatApplicability, CheatConversionPreview, CheatDocument, CheatDuplicateKind,
+    CheatEvidenceQuality, CheatIssue, CheatOperation, CheatPlatform, CheatReconciliationEntry,
+    CheatReconciliationGroup, CheatReconciliationOutcome, CheatReconciliationResult,
+    CheatRelationship, CheatSourceFieldEvidence, CheatSourceFormat, CheatTargetFormat,
+    ConversionCapability, DsActionReplayClassification, DsActionReplayUnsupported,
+    DsActionReplayUnsupportedKind, OperationConversionStatus, TargetCapability,
+    assess_document_conversion, convert_cheat_document, dolphin_line_to_ir,
+    dolphin_on_frame_line_to_ir, ds_action_replay_line_to_ir, encode_ds_action_replay_operation,
+    encode_operation, export_conversion_preview, parse_ds_action_replay_document, pnach_line_to_ir,
+    reconcile_cheats_for_game, supported_targets_for,
+};
+pub use cheat_journey::{
+    CheatJourneyApplyApproval, CheatJourneyApplyOptions, CheatJourneyApplyResult,
+    CheatJourneyCandidate, CheatJourneyCandidateList, CheatJourneyDestinationFingerprint,
+    CheatJourneyDiscovery, CheatJourneyError, CheatJourneyErrorKind, CheatJourneyGameIdentity,
+    CheatJourneyIdentityEvidence, CheatJourneyIdentityEvidenceKind, CheatJourneyIdentityState,
+    CheatJourneyPreview, CheatJourneyPreviewAction, CheatJourneySelection,
+    CheatJourneyUndoConfirmation, CheatJourneyUndoOptions, CheatJourneyUndoPreview,
+    apply_cheat_journey, discover_cheat_journey, preview_cheat_journey, preview_cheat_journey_undo,
+    select_cheat_journey_candidate, undo_cheat_journey,
+};
+pub use cheat_launch_derivative::{
+    CheatDerivativeEntryRecord, CheatDerivativeError, CheatDerivativeInput, CheatLaunchDerivative,
+    CheatLaunchDerivativeKind, CheatSourceReference, MAX_LAUNCH_DERIVATIVE_ENTRIES,
+    is_safe_cheat_name_part, render_retroarch_selected_derivative,
+};
+pub use cheat_loadability::{
+    CheatEnablementEvidence, CheatIdentityStrength, CheatInstalledFileCheck,
+    CheatLoadPathConvention, CheatLoadabilityEvidence, CheatLoadabilityInput,
+    CheatLoadabilityIssue, CheatLoadabilityReport, CheatLoadabilityState, CheatRestartRequirement,
+    EmulatorProcessObservation, assess_cheat_loadability, cheat_restart_requirement,
+    observe_emulator_process, parse_config_bool, read_config_bool, verify_installed_cheat_file,
+};
+pub use cheat_pack_preview::{
+    CheatPackAction, CheatPackAssociation, CheatPackCatalogueGame, CheatPackDiagnostic,
+    CheatPackFile, CheatPackFileState, CheatPackGame, CheatPackGameMatch,
+    CheatPackIdentityRequirement, CheatPackLimits, CheatPackLogicalCheat, CheatPackMatchStrength,
+    CheatPackObservation, CheatPackPreview, CheatPackTotals, plan_cheat_pack_preview,
+    preview_cheat_pack,
+};
 pub use cheat_provider::{
     CheatProviderIdentity, CheatProviderLicence, CheatProviderLicenceStatus,
     CheatProviderProvenance, CheatProviderSourceState, DeviceFormatCompatibility,
     ImmutableSourceFingerprint, PageRequest, PlatformMappingStatus, ProviderDeviceMapping,
     ProviderGameMatchConfidence, ProviderPage, ProviderPlatformMapping, ProviderValidationResult,
     ProviderValidationStatus, ReadOnlyCheatCatalogue,
+};
+pub use cheat_reconciliation_plan::{
+    CheatReviewChoice, ResolvedCheatApplyEligibility, ResolvedCheatDiagnostic, ResolvedCheatEntry,
+    ResolvedCheatPlan, ResolvedCheatPlanDestination, ResolvedCheatPlanRequest,
+    resolve_reviewed_cheat_plan,
 };
 pub use cheat_rollback::{
     CHEAT_ROLLBACK_RUNS_DIRECTORY_NAME, CheatRollbackOptions, CheatRollbackRunOutcome,
@@ -192,6 +418,12 @@ pub use cheat_rollback_result::{
     CHEAT_ROLLBACK_RUN_SCHEMA_VERSION, CheatRollbackEntryResult, CheatRollbackOutcome,
     CheatRollbackRun, CheatRollbackRunSchemaError, CheatRollbackRunStatus, CheatRollbackSummary,
     parse_cheat_rollback_run,
+};
+pub use cheat_route::{
+    ARCADE_PLATFORM_ID, CheatApplySupport, CheatRoute, CheatRouteBasis, CheatRouteDecision,
+    CheatRouteRefusal, CheatRouteRequest, CheatRouteTarget, FBNEO_STANDALONE_CHEAT_ROUTE_HEADLINE,
+    MAME_CHEAT_ROUTE_HEADLINE, RETROARCH_ROUTE_ID, canonical_cheat_platform, cheat_apply_support,
+    native_cheat_format, route_cheat_install, standalone_display_name,
 };
 pub use cheat_source_registry::{
     CheatSourceCapabilities, CheatSourceEntry, CheatSourceHealth, CheatSourceRegistry,
@@ -223,12 +455,34 @@ pub use cheat_sources::{
     inspect_retroarch_cheat_source_snapshot, list_retroarch_cheat_sources,
     trusted_retroarch_cheat_sources,
 };
+pub use cheatbase::{
+    CHEATBASE_CHEAT_COVERAGE_PLATFORM, CHEATBASE_CHEAT_DEVICE_FORMAT, CHEATBASE_DATABASE_FILE,
+    CHEATBASE_DATABASE_URL, CHEATBASE_DOWNLOAD_HOST, CHEATBASE_EXPECTED_SHA256,
+    CHEATBASE_EXPECTED_SIZE_BYTES, CHEATBASE_MAX_DATABASE_BYTES, CHEATBASE_PROVIDER_FORMAT_VERSION,
+    CHEATBASE_PROVIDER_ID, CHEATBASE_UPSTREAM_COMMIT, CHEATBASE_UPSTREAM_PROJECT,
+    CheatBaseActivationResult, CheatBaseAttribution, CheatBaseCatalogue, CheatBaseCheat,
+    CheatBaseCounts, CheatBaseDevice, CheatBaseDeviceSummary, CheatBaseDownloadOptions,
+    CheatBaseError, CheatBaseErrorKind, CheatBaseGame, CheatBaseGameSearchRequest,
+    CheatBaseGameSearchResult, CheatBaseHashAlgorithm, CheatBaseIdentityLookup, CheatBasePaths,
+    CheatBaseSourceStatus, CheatBaseSystem, CheatBaseValidation, cheatbase_attribution,
+    cheatbase_device_mapping, cheatbase_licence, cheatbase_platform_mapping, cheatbase_provenance,
+    cheatbase_provider_identity, default_cheatbase_source_root, download_cheatbase_database,
+    import_local_cheatbase_database, inspect_cheatbase_source, remove_local_cheatbase_source,
+    set_cheatbase_enabled, validate_cheatbase_database, validate_installed_cheatbase_source,
+};
 pub use cht_document::{
     ChtDocument, ChtDocumentWarning, ChtDocumentWarningKind, ChtEntry, ChtEntryWarning,
-    ChtEntryWarningKind, ChtInstallEntry, ChtParseError, ChtParseErrorKind,
-    MAX_CHT_DOCUMENT_WARNINGS, MAX_CHT_ENTRIES, MAX_CHT_EXTRA_FIELDS_PER_ENTRY,
-    MAX_CHT_FIELD_BYTES, MAX_CHT_GLOBAL_FIELDS, MAX_CHT_PRESERVED_COMMENTS, parse_cht_bytes,
-    parse_cht_text, render_cht_file,
+    ChtEntryWarningKind, ChtInstallEntry, ChtParseError, ChtParseErrorKind, MAX_CHT_CODE_BYTES,
+    MAX_CHT_CODE_LINES, MAX_CHT_DOCUMENT_WARNINGS, MAX_CHT_ENTRIES, MAX_CHT_ENTRY_WARNINGS,
+    MAX_CHT_EXTRA_FIELDS_PER_ENTRY, MAX_CHT_FIELD_BYTES, MAX_CHT_FILE_BYTES, MAX_CHT_GLOBAL_FIELDS,
+    MAX_CHT_LINE_BYTES, MAX_CHT_PRESERVED_COMMENTS, parse_cht_bytes, parse_cht_text,
+    render_cht_file,
+};
+pub use classic_game_genie::{
+    ClassicCheatFormat, GameGenieDecodeResult, GameGenieDecodeStatus, GameGenieDetection,
+    GameGenieInstruction, GameGenieIssue, GameGeniePlatform, GameGenieProvenance,
+    GameGenieRevisionEvidence, GameGenieRevisionSafety, decode_classic_game_genie,
+    detect_classic_game_genie, game_genie_to_document,
 };
 pub use destination_safety::{
     DestinationRootState, DestinationSafetyAssessment, DestinationSafetyError,
@@ -276,16 +530,103 @@ pub use dolphin_gecko_provider::{
     peek_cached_gecko_result, region_for_game_id, revision_applicability,
 };
 pub use dolphin_local::{
-    DOLPHIN_MAX_ENTRIES_VISITED, DOLPHIN_MAX_GAME_INI_BYTES, DOLPHIN_MAX_GAME_INI_FILES,
-    DOLPHIN_MAX_LINE_BYTES, DOLPHIN_MAX_LINES_PER_FILE, DOLPHIN_MAX_PROFILES,
-    DOLPHIN_MAX_TOTAL_GAME_INI_BYTES, DolphinCodeKind, DolphinCommandLine,
-    DolphinDirectoryIdentity, DolphinDiscoveryError, DolphinGameIniFile, DolphinGameIniInventory,
-    DolphinInspectionError, DolphinInspectionWarning, DolphinInspectionWarningKind,
-    DolphinInstallationType, DolphinMatchResult, DolphinMatchState, DolphinProfile,
-    DolphinProfileBlocker, DolphinProfileBlockerKind, DolphinProfileDiscovery,
-    DolphinProfileDiscoveryRoots, DolphinProfileScope, DolphinSettingsDirectoryState,
-    discover_dolphin_profiles, dolphin_user_path, inspect_dolphin_profile, match_dolphin_inventory,
-    select_dolphin_profile,
+    DOLPHIN_LOCAL_MAX_CONFIG_BYTES, DOLPHIN_LOCAL_MAX_SAVE_CANDIDATES,
+    DOLPHIN_LOCAL_MAX_TEXTURE_DEPTH, DOLPHIN_LOCAL_MAX_TEXTURE_FILES, DOLPHIN_MAX_ENTRIES_VISITED,
+    DOLPHIN_MAX_GAME_INI_BYTES, DOLPHIN_MAX_GAME_INI_FILES, DOLPHIN_MAX_LINE_BYTES,
+    DOLPHIN_MAX_LINES_PER_FILE, DOLPHIN_MAX_PROFILES, DOLPHIN_MAX_TOTAL_GAME_INI_BYTES,
+    DolphinCheatInspection, DolphinCheatInventory, DolphinCodeKind, DolphinCommandLine,
+    DolphinConfigInspection, DolphinDirectoryIdentity, DolphinDiscContext, DolphinDiscFormat,
+    DolphinDiscoveryError, DolphinExecutable, DolphinGameIdMapping, DolphinGameIniFile,
+    DolphinGameIniInventory, DolphinGameInspection, DolphinGameRequest,
+    DolphinGameSettingsInspection, DolphinHealth, DolphinInspectionError, DolphinInspectionWarning,
+    DolphinInspectionWarningKind, DolphinInstallationType, DolphinLaunchBlocker,
+    DolphinLaunchBlockerKind, DolphinLocalDiscoveryRoots, DolphinLocalInstallationType,
+    DolphinLocalProfile, DolphinLocalProfileDiscovery, DolphinMatchResult, DolphinMatchState,
+    DolphinNativeLaunchBinding, DolphinProfile, DolphinProfileBlocker, DolphinProfileBlockerKind,
+    DolphinProfileDiscovery, DolphinProfileDiscoveryRoots, DolphinProfileScope,
+    DolphinSaveInventory, DolphinSettings, DolphinSettingsDirectoryState, DolphinTargetPlatform,
+    DolphinTextureInventory, DolphinUserDirectoryMode, discover_dolphin_local_profiles,
+    discover_dolphin_profiles, dolphin_user_path, inspect_dolphin_local_game,
+    inspect_dolphin_profile, inspect_dolphin_profile_with_activation, match_dolphin_inventory,
+    parse_dolphin_version, resolve_dolphin_native_launch_binding, select_dolphin_profile,
+};
+pub use dolphin_onframe_install_plan::{
+    DolphinOnFrameInstallPlan, DolphinOnFrameInstallPlanError, DolphinOnFrameInstallPreview,
+    DolphinOnFrameInstallPreviewRequest, DolphinOnFrameInstallRequest, DolphinOnFrameInstallStatus,
+    StagedDolphinOnFrameIni, build_dolphin_onframe_install_preview, plan_dolphin_onframe_install,
+    stage_dolphin_onframe_install,
+};
+pub use dolphin_onframe_source::{
+    DolphinOnFrameBinding, DolphinOnFrameCandidate, DolphinOnFrameSourceError,
+    bind_dolphin_onframe_candidate, discover_dolphin_onframe_candidates,
+};
+pub use dolphin_texture_mod::{
+    DOLPHIN_TEXTURE_MOD_SOURCE_MODE, DolphinTextureModError, DolphinTextureModErrorKind,
+    DolphinTextureModIdentity, DolphinTextureModPlan, DolphinTextureModPreviewRequest,
+    DolphinTextureModSource, build_dolphin_texture_mod_preview,
+    dolphin_texture_mod_destination_root, validate_dolphin_texture_source,
+    verified_dolphin_texture_identity,
+};
+pub use dolphin_texture_pack::{
+    DOLPHIN_TEXTURE_PACK_MANIFEST_FORMAT, DOLPHIN_TEXTURE_PACK_MAX_MANIFEST_BYTES,
+    DOLPHIN_TEXTURE_PACK_SOURCE_MODE, DolphinTexturePackApplyResult,
+    DolphinTexturePackArchivePreview, DolphinTexturePackBuildPreview,
+    DolphinTexturePackBuildRequest, DolphinTexturePackFile, DolphinTexturePackManifest,
+    DolphinTexturePackPlan, DolphinTexturePackPreviewRequest, DolphinTexturePackRejectedFile,
+    build_dolphin_texture_pack_manifest, build_dolphin_texture_pack_preview,
+    build_dolphin_texture_pack_transaction_plan, execute_dolphin_texture_pack_apply,
+    inspect_dolphin_texture_pack_zip, validate_dolphin_texture_pack_manifest,
+};
+pub use duckstation_cheat::{
+    DUCKSTATION_CHEAT_MAX_BYTES, DUCKSTATION_CHEAT_MAX_LINES, DuckStationCheatApplyPlan,
+    DuckStationCheatApplyRequest, DuckStationCheatCode, DuckStationCheatEntry,
+    DuckStationCheatFile, DuckStationCheatParseIssue, DuckStationCheatParseResult,
+    DuckStationCheatState, DuckStationEnablement, DuckStationIdentity, DuckStationLoadabilityFacts,
+    apply_duckstation_cheat_plan, build_duckstation_cheat_apply_plan,
+    duckstation_loadability_facts, merge_duckstation_cheat, parse_duckstation_cheat_file,
+    remove_duckstation_cheat, render_duckstation_cheat_file, update_duckstation_enablement,
+};
+pub use duckstation_disc_authority::{
+    DiscAuthority, DiscCountAuthority, DiscOpinion, DiscQuery, DiscTopologyProof,
+    DuckStationDatabaseAuthority, DuckStationGameDatabase, MissingDiscProof, TrustedDatAuthority,
+    prove_disc_topology,
+};
+pub use duckstation_firmware::{
+    DuckStationBiosVerificationOutcome, DuckStationGameInspectionWithFirmware, DuckStationRegion,
+    DuckStationVerifiedBios, inspect_duckstation_game_with_firmware_evidence,
+    resolve_duckstation_bios,
+};
+pub use duckstation_local::{
+    DUCKSTATION_MAX_CHEAT_BYTES, DUCKSTATION_MAX_CONFIG_BYTES, DUCKSTATION_MAX_DIRECTORY_ENTRIES,
+    DUCKSTATION_MAX_PATCH_BYTES, DUCKSTATION_MAX_PLAYLIST_BYTES, DUCKSTATION_MAX_PLAYLIST_ENTRIES,
+    DUCKSTATION_MAX_PROFILES, DUCKSTATION_MAX_SAVE_STATE_CANDIDATES, DUCKSTATION_MAX_TEXTURE_DEPTH,
+    DUCKSTATION_MAX_TEXTURE_FILES, DuckStationBiosInventory, DuckStationBiosState,
+    DuckStationCheatInventory, DuckStationConfigInspection, DuckStationDiscContext,
+    DuckStationDiscoveryError, DuckStationExecutable, DuckStationGameInspection,
+    DuckStationGameRequest, DuckStationHealth, DuckStationInstallationType,
+    DuckStationLaunchBlocker, DuckStationLaunchBlockerKind, DuckStationMemoryCardInventory,
+    DuckStationNativeLaunchBinding, DuckStationPatchInventory, DuckStationPlaylistInventory,
+    DuckStationProfile, DuckStationProfileDiscovery, DuckStationProfileDiscoveryRoots,
+    DuckStationSaveStateInventory, DuckStationSerialMapping, DuckStationSettings,
+    DuckStationTextureInventory, DuckStationUserDirectoryMode, DuckStationWarning,
+    DuckStationWarningKind, discover_duckstation_profiles, inspect_duckstation_game,
+    inspect_duckstation_playlist, normalize_duckstation_ps1_serial, parse_duckstation_version,
+    resolve_duckstation_native_launch_binding,
+};
+pub use duckstation_native::{
+    DuckStationBatchConflict, DuckStationDiscTopology, DuckStationFolders,
+    DuckStationNativeApplyFailure, DuckStationNativeApplyOptions, DuckStationNativeBatchCheat,
+    DuckStationNativeCheat, DuckStationNativeFileReceipt, DuckStationNativeOperation,
+    DuckStationNativePlan, DuckStationNativePreview, DuckStationNativeReceipt,
+    DuckStationNativeRefusal, DuckStationNativeRequest, DuckStationNativeUndoPreview,
+    DuckStationNativeWarning, EnableCheatsChange, apply_duckstation_native_plan,
+    duckstation_disc_topology_from_media_sets, duckstation_native_batch_from_catalogue,
+    duckstation_native_section_digest, plan_duckstation_native, preview_duckstation_native_undo,
+    read_duckstation_native_receipt, resolve_duckstation_folders, undo_duckstation_native,
+};
+pub use duckstation_native_history::{
+    DUCKSTATION_NATIVE_SOURCE_MODE, GroupedHistoryRow, NativeGroupState, NativeHistoryGroup,
+    discover_duckstation_native_receipts, group_shared_history,
 };
 pub use emulator_profile_memory::{
     EmulatorProfileCandidate, EmulatorProfileSelectReason, EmulatorProfileSelection,
@@ -293,6 +634,61 @@ pub use emulator_profile_memory::{
     forget_emulator_profile_default, load_remembered_emulator_profiles_default,
     load_remembered_emulator_profiles_from, remember_emulator_profile_default,
     remember_emulator_profile_to, remembered_profile_for, select_emulator_profile,
+};
+pub use emulator_request_bridge::{
+    duckstation_request, inspect_duckstation_game_for_verified, inspect_ppsspp_game_for_verified,
+    ppsspp_request,
+};
+pub use fbneo_cheat::{
+    FBNEO_MAX_CHEATS, FBNEO_MAX_FILE_BYTES, FBNEO_MAX_LINE_BYTES, FBNEO_MAX_LINES,
+    FBNEO_MAX_OPERATIONS_PER_OPTION, FBNEO_MAX_OPTIONS_PER_CHEAT, FbneoCheatApplyOptions,
+    FbneoCheatApplyPlan, FbneoCheatDestination, FbneoCheatEntry, FbneoCheatFile, FbneoCheatFormat,
+    FbneoCheatIssue, FbneoCheatLoadabilityFacts, FbneoCheatOperation, FbneoCheatOption,
+    FbneoCheatReadiness, FbneoCheatState, FbneoCheatTarget, apply_fbneo_cheat_plan,
+    build_fbneo_cheat_apply_plan, fbneo_readiness, merge_fbneo_cheat_file, parse_fbneo_cheat_file,
+    render_fbneo_cheat_file,
+};
+pub use flycast_cheats::{
+    DreamcastCheatCode, DreamcastCheatIdentity, FLYCAST_CHEAT_MAX_BYTES, FLYCAST_CHEAT_MAX_ENTRIES,
+    FLYCAST_CHEAT_MAX_LINE_BYTES, FLYCAST_CHEAT_MAX_LINES, FlycastCheatApplyOptions,
+    FlycastCheatConflict, FlycastCheatConflictKind, FlycastCheatEntry, FlycastCheatError,
+    FlycastCheatFile, FlycastCheatParseIssue, FlycastCheatPreview, FlycastCheatReadiness,
+    FlycastCheatRequest, FlycastCheatSelection, FlycastCheatState, FlycastCheatType,
+    apply_flycast_cheat_preview, build_flycast_cheat_preview, parse_flycast_cheat_file,
+};
+pub use flycast_local::{
+    FLYCAST_MAX_CHEAT_BYTES, FLYCAST_MAX_CONFIG_BYTES, FLYCAST_MAX_DIRECTORY_ENTRIES,
+    FLYCAST_MAX_PROFILES, FLYCAST_MAX_SAVE_CANDIDATES, FLYCAST_MAX_TEXTURE_DEPTH,
+    FLYCAST_MAX_TEXTURE_FILES, FlycastCheatInventory, FlycastConfigInspection, FlycastDiscContext,
+    FlycastDiscoveryError, FlycastExecutable, FlycastGameInspection, FlycastGameKeyMapping,
+    FlycastGameRequest, FlycastHealth, FlycastInstallationType, FlycastLaunchBlocker,
+    FlycastLaunchBlockerKind, FlycastNativeLaunchBinding, FlycastPlatform, FlycastProfile,
+    FlycastProfileDiscovery, FlycastProfileDiscoveryRoots, FlycastSaveStateInventory,
+    FlycastSettings, FlycastSystemFileState, FlycastSystemHealth, FlycastTextureInventory,
+    FlycastVmuInventory, FlycastWarning, FlycastWarningKind, discover_flycast_profiles,
+    inspect_flycast_game, parse_flycast_version, resolve_flycast_native_launch_binding,
+};
+pub use fuse_local::{
+    FUSE_MAX_PROFILES, FUSE_NATIVE_BINARY_NAMES, FuseExecutable, FuseInstallationType,
+    FuseLaunchBlocker, FuseLaunchBlockerKind, FuseNativeLaunchBinding, FuseProfile,
+    FuseProfileDiscovery, FuseProfileDiscoveryRoots, discover_fuse_profiles,
+    resolve_fuse_native_launch_binding,
+};
+pub use gamecube_wii_ar_decrypt::{
+    GAMECUBE_AR_DECODER_VERSION, GameCubeArDecodeError, GameCubeArVerification, VerifiedGameCubeAr,
+    decode_gamecube_ar,
+};
+pub use gamehacking_browser_import::{
+    BROWSER_IMPORT_PARSER_SCHEMA_VERSION, BROWSER_IMPORT_PROVENANCE_SCHEMA_VERSION,
+    BrowserImportDestination, BrowserImportError, BrowserImportErrorKind, BrowserImportKind,
+    BrowserImportLocalIdentity, BrowserImportOutcome, BrowserImportPlan, BrowserImportPlatform,
+    BrowserImportProvenance, BrowserImportRequest, BrowserImportSource, BrowserImportTextOrigin,
+    BrowserLauncher, DesktopBrowserLauncher, ExistingBrowserImportCache,
+    GAMEHACKING_BROWSER_IMPORT_BLOCKED_BODY, GAMEHACKING_BROWSER_IMPORT_BLOCKED_TITLE,
+    MANUAL_BROWSER_IMPORT_SOURCE, MAX_BROWSER_IMPORT_BYTES, gamehacking_browser_launch_command,
+    gamehacking_game_id_from_url, gamehacking_game_page_url, import_gamehacking_browser_content,
+    open_gamehacking_url_in_browser, plan_gamehacking_browser_import,
+    read_browser_import_provenance, sanitize_imported_html, validate_gamehacking_browser_url,
 };
 pub use gamehacking_gamecube_install_plan::{
     GameCubeCheatSelection, GameCubeCheatSelectionEntry, GameCubeGameHackingInstallPreview,
@@ -304,16 +700,17 @@ pub use gamehacking_gamecube_install_plan::{
 };
 pub use gamehacking_gamecube_provider::{
     GAMEHACKING_GAMECUBE_PROVIDER_ID, GameCubeCheatCodeDiagnostic, GameCubeCodeFormat,
-    GameCubeGameHackingAdapter, GameCubeGameIdentity, GameCubeIdentityState,
-    GameCubeSysIdDiagnostics, GameHackingGameCubeCatalogue, GameHackingGameCubeCheat,
-    GameHackingGameCubeFetchOptions, GameHackingGameCubeGame, GameHackingGameCubeIndexPage,
-    GameHackingGameCubeIndexProgress, GameHackingGameCubeIndexRecord,
+    GameCubeGameHackingAdapter, GameCubeGameIdentity, GameCubeGamePageSummary,
+    GameCubeIdentityState, GameCubeSysIdDiagnostics, GameHackingGameCubeCatalogue,
+    GameHackingGameCubeCheat, GameHackingGameCubeFetchOptions, GameHackingGameCubeGame,
+    GameHackingGameCubeIndexPage, GameHackingGameCubeIndexProgress, GameHackingGameCubeIndexRecord,
     GameHackingGameCubeIndexRefreshResult, GameHackingGameCubeMatch,
     GameHackingGameCubeMatchCandidate, GameHackingGameCubeMatchStatus,
     GameHackingGameCubeMatchStrength, GameHackingGameCubeProvider,
     apply_gamecube_page_format_labels, diagnose_gamecube_cheat_code_format,
     load_gamecube_catalogue, normalize_gamecube_game_id, parse_gamecube_sysid_diagnostics,
     parse_gamehacking_gamecube_export, parse_gamehacking_gamecube_index_page,
+    summarize_gamecube_game_page,
 };
 pub use gamehacking_provider::{
     GAMEHACKING_PROVIDER_CHALLENGE_MESSAGE, GAMEHACKING_PROVIDER_ID, GameHackingCheat,
@@ -346,14 +743,123 @@ pub use gecko_document::{
     merge_external_gecko_codes, parse_dolphin_ini, remove_named_codes,
     replace_gecko_enabled_section, replace_named_section,
 };
+pub use hatari_local::{
+    HATARI_MAX_CONFIG_BYTES, HATARI_MAX_METADATA_BYTES, HATARI_MAX_PROFILES,
+    HATARI_MAX_SAVE_STATE_CANDIDATES, HATARI_MAX_TOS_BYTES, HatariAudioSettings, HatariConfig,
+    HatariDiscoveryError, HatariExecutable, HatariFloppy, HatariFloppyRepresentation,
+    HatariGameInspection, HatariHealth, HatariIdentityAssociation, HatariIdentityState,
+    HatariInputSettings, HatariInspectionWarning, HatariInstallationType, HatariMachineModel,
+    HatariMachineSettings, HatariPathState, HatariProfile, HatariProfileDiscovery,
+    HatariProfileDiscoveryRoots, HatariReadinessEvidence, HatariSaveStateInventory,
+    HatariSelectedGame, HatariSelectedGameRequest, HatariStorage, HatariStorageMechanism,
+    HatariTosHealth, HatariTosReference, HatariTosRom, HatariVideoSettings,
+    assess_hatari_readiness, discover_hatari_profiles, inspect_hatari_game, parse_hatari_version,
+};
 pub use import_safety::{
     ActiveContentDisposition, ActiveContentPolicy, ImportConsentSummary, ImportInspectionState,
     ImportSourceKind, ImportTrustState, LocalSafetyScanningState, UNKNOWN_CODE_POLICY,
     automatic_execution_allowed, classify_active_content, trust_after_inspection,
 };
+pub use local_cheat_install::{
+    LOCAL_CHEAT_SOURCE_NAME, LocalCheatFileDiscovery, LocalCheatFileError, LocalCheatFileLocation,
+    discover_local_retroarch_cheat_file,
+};
+pub use local_cheat_install_dolphin::{
+    LocalDolphinCodeKind, LocalDolphinDiscovery, LocalDolphinFileError, LocalDolphinInstallState,
+    MAX_LOCAL_DOLPHIN_INI_BYTES, check_local_dolphin_install_state,
+    discover_local_dolphin_cheat_file, stage_local_dolphin_codes,
+};
+pub use local_cheat_install_pcsx2::{
+    LocalPcsx2Discovery, LocalPcsx2FileError, LocalPcsx2InstallState,
+    check_local_pcsx2_install_state, discover_local_pcsx2_pnach_file,
+};
+pub use mame_cheat::{
+    MAME_CHEAT_MAX_ACTIONS, MAME_CHEAT_MAX_DEPTH, MAME_CHEAT_MAX_ENTRIES,
+    MAME_CHEAT_MAX_FILE_BYTES, MAME_CHEAT_MAX_PARAMETERS, MAME_CHEAT_MAX_SCRIPTS,
+    MAME_CHEAT_MAX_TEXT_BYTES, MameCheatAction, MameCheatEntry, MameCheatFile, MameCheatInspection,
+    MameCheatOutput, MameCheatParameter, MameCheatParameterItem, MameCheatParseError,
+    MameCheatParseIssue, MameCheatPreview, MameCheatPreviewError, MameCheatPreviewRequest,
+    MameCheatProvenance, MameCheatReadiness, MameCheatRuntimeState, MameCheatScript,
+    MameNativeExpression, MameNormalizedWrite, MameScriptState, build_mame_cheat_preview,
+    inspect_mame_cheat, load_mame_cheat, merge_mame_cheat, parse_mame_cheat_xml,
+    render_mame_cheat_xml, set_mame_cheat_enabled,
+};
+pub use mednafen_cheat::{
+    MEDNAFEN_CHEAT_MAX_BYTES, MEDNAFEN_CHEAT_MAX_ENTRIES, MEDNAFEN_CHEAT_MAX_LINE_BYTES,
+    MEDNAFEN_CHEAT_MAX_LINES, MEDNAFEN_CHEAT_SOURCE_MODE, MednafenCheatEntry, MednafenCheatError,
+    MednafenCheatFile, MednafenCheatOperation, MednafenCheatParseIssue, MednafenCheatPlan,
+    MednafenCheatReadiness, MednafenCheatState, MednafenCheatTarget, MednafenEndian,
+    MednafenLoadabilityFacts, MednafenMemorySpace, apply_mednafen_cheat_plan,
+    build_mednafen_cheat_plan, mednafen_compatibility, mednafen_loadability_facts,
+    mednafen_supported_systems, mednafen_system_for_platform, merge_mednafen_cheat_files,
+    parse_mednafen_cheat_file, preview_mednafen_cheat_rollback, render_mednafen_cheat_file,
+    rollback_mednafen_cheat,
+};
+pub use melonds_cheat::{
+    MELONDS_CHEAT_MAX_BYTES, MELONDS_CHEAT_MAX_CODES, MELONDS_CHEAT_MAX_LINES,
+    MELONDS_CHEAT_MAX_STRING_BYTES, MELONDS_CHEAT_MAX_WORDS_PER_CODE, MelonDsCheatApplyPlan,
+    MelonDsCheatApplyRequest, MelonDsCheatCategory, MelonDsCheatCode, MelonDsCheatEntry,
+    MelonDsCheatFile, MelonDsCheatFormat, MelonDsCheatItem, MelonDsCheatParseIssue,
+    MelonDsCheatState, MelonDsLoadabilityFacts, MelonDsRomIdentity, MelonDsUsrCheatStatus,
+    apply_melonds_cheat_plan, build_melonds_cheat_apply_plan, melonds_loadability_facts,
+    parse_melonds_cheat_file, remove_melonds_cheat, render_melonds_cheat_file,
+    set_melonds_cheat_state,
+};
+pub use melonds_local::{
+    MELONDS_MAX_CONFIG_BYTES, MELONDS_MAX_PROFILES, MelonDsConfigInspection, MelonDsDiscoveryError,
+    MelonDsExecutable, MelonDsFirmwareEvidence, MelonDsFirmwareMode, MelonDsFirmwareState,
+    MelonDsGameRequest, MelonDsInstallationType, MelonDsLaunchBlocker, MelonDsLaunchBlockerKind,
+    MelonDsNativeLaunchBinding, MelonDsProfile, MelonDsProfileDiscovery,
+    MelonDsProfileDiscoveryRoots, discover_melonds_profiles, parse_melonds_version,
+    resolve_melonds_native_launch_binding,
+};
+pub use mesen_local::{
+    MESEN_MAX_CONFIG_BYTES, MESEN_MAX_PROFILES, MesenConfigInspection, MesenDiscoveryError,
+    MesenExecutable, MesenInstallationType, MesenLaunchBlocker, MesenLaunchBlockerKind,
+    MesenNativeLaunchBinding, MesenProfile, MesenProfileDiscovery, MesenProfileDiscoveryRoots,
+    discover_mesen_profiles, parse_mesen_version, resolve_mesen_native_launch_binding,
+};
+pub use mgba_cheats::{
+    MGBA_CHEAT_MAX_BYTES, MGBA_CHEAT_MAX_ENTRIES, MGBA_CHEAT_MAX_LINES_PER_ENTRY,
+    MgbaCheatApplyPlan, MgbaCheatApplyReceipt, MgbaCheatCode, MgbaCheatEntry, MgbaCheatFile,
+    MgbaCheatFormat, MgbaCheatIdentity, MgbaCheatIdentityEvidence, MgbaCheatIssue,
+    MgbaCheatParseError, MgbaCheatReadiness, MgbaCheatState, MgbaCheatWriteError,
+    MgbaCheatWriteResult, apply_mgba_cheat_plan, build_mgba_cheat_apply_plan,
+    merge_mgba_cheat_entry, parse_mgba_cheat_file, remove_mgba_cheat_entry, render_mgba_cheat_file,
+    set_mgba_cheat_state,
+};
+pub use mgba_local::{
+    MGBA_MAX_CONFIG_BYTES, MGBA_MAX_PROFILES, MgbaBiosState, MgbaConfigInspection,
+    MgbaDiscoveryError, MgbaExecutable, MgbaGameRequest, MgbaInstallationType, MgbaLaunchBlocker,
+    MgbaLaunchBlockerKind, MgbaNativeLaunchBinding, MgbaProfile, MgbaProfileDiscovery,
+    MgbaProfileDiscoveryRoots, discover_mgba_profiles, parse_mgba_version,
+    resolve_mgba_native_launch_binding,
+};
+pub use n64_gameshark::{
+    N64CheatCode, N64CheatDecodeResult, N64CheatIssue, N64CheatOpcode, N64CheatProjection,
+    N64CheatReadiness, N64CheatRegion, N64CheatRevisionEvidence, N64MasterCodeState,
+    N64NormalizedOperation, N64ProjectionTarget, N64RomByteOrder, N64RomIdentity,
+    decode_n64_gameshark, inspect_n64_rom_header, project_n64_cheat,
+};
+pub use openmsx_local::{
+    OpenMsxExecutable, OpenMsxInstallationType, OpenMsxProfile, OpenMsxProfileDiscovery,
+    OpenMsxProfileDiscoveryRoots, OpenMsxReadinessEvidence, assess_openmsx_readiness,
+    discover_openmsx_profiles,
+};
+pub use pcengine_cd_firmware::{
+    KNOWN_SYSTEM_CARDS, KnownSystemCard, MAX_SYSTEM_CARD_BYTES, MAX_SYSTEM_CARD_CANDIDATES,
+    PceCdEmulatorFirmwarePolicy, PceCdFirmwareOutcome, PceCdFirmwareReadiness,
+    PceCdTitleRequirement, SystemCardClass, SystemCardRegion, VerifiedSystemCard,
+    any_unverified_candidate_present, best_verified_card_class, classify_system_card_file,
+    inventory_system_cards, match_known_system_card, resolve_pcengine_cd_firmware,
+};
 pub use pcsx2::{
     HostReadOnlyFilesystem, Pcsx2CandidateKind, Pcsx2DiscoveryConfidence, Pcsx2DiscoveryRoots,
     Pcsx2InstallationCandidate, ReadOnlyFilesystem, ReadOnlyPcsx2Adapter,
+};
+pub use pcsx2_firmware::{
+    Pcsx2BiosVerificationOutcome, Pcsx2GameInspectionWithFirmware, Pcsx2VerifiedBios,
+    inspect_pcsx2_game_with_firmware_evidence, resolve_pcsx2_bios,
 };
 pub use pcsx2_identity::{
     Pcsx2GameIdentity, Pcsx2IdentityState, Pcsx2ProfileChoiceError, confirmed_pcsx2_profile,
@@ -366,15 +872,23 @@ pub use pcsx2_install_plan::{
     pcsx2_crc_filename, pcsx2_pnach_filename, stage_pcsx2_pnach,
 };
 pub use pcsx2_local::{
-    PCSX2_MAX_DIRECTORIES_TRAVERSED, PCSX2_MAX_DIRECTORY_DEPTH, PCSX2_MAX_ENTRIES_VISITED,
-    PCSX2_MAX_LINE_BYTES, PCSX2_MAX_LINES_PER_FILE, PCSX2_MAX_PATCH_DIRECTORIES_PER_PROFILE,
+    PCSX2_MAX_CONFIG_BYTES, PCSX2_MAX_DIRECTORIES_TRAVERSED, PCSX2_MAX_DIRECTORY_DEPTH,
+    PCSX2_MAX_ENTRIES_VISITED, PCSX2_MAX_LINE_BYTES, PCSX2_MAX_LINES_PER_FILE,
+    PCSX2_MAX_MEMCARD_CANDIDATES, PCSX2_MAX_PATCH_DIRECTORIES_PER_PROFILE,
     PCSX2_MAX_PNACH_FILE_BYTES, PCSX2_MAX_PNACH_FILES, PCSX2_MAX_PROFILES,
-    PCSX2_MAX_TOTAL_PNACH_BYTES, Pcsx2DirectoryIdentity, Pcsx2DiscoveryError, Pcsx2InspectionError,
-    Pcsx2InspectionWarning, Pcsx2InspectionWarningKind, Pcsx2InstallationType, Pcsx2MatchResult,
-    Pcsx2MatchState, Pcsx2PatchCategory, Pcsx2PatchDirectory, Pcsx2PatchDirectoryState,
+    PCSX2_MAX_SAVESTATE_CANDIDATES, PCSX2_MAX_TEXTURE_FILES, PCSX2_MAX_TOTAL_PNACH_BYTES,
+    Pcsx2BiosInfo, Pcsx2BiosVerification, Pcsx2CheatInspection, Pcsx2Config, Pcsx2ControllerInfo,
+    Pcsx2DirectoryIdentity, Pcsx2DiscoveryError, Pcsx2Executable, Pcsx2GameInspection,
+    Pcsx2GameRequest, Pcsx2Health, Pcsx2InspectionError, Pcsx2InspectionWarning,
+    Pcsx2InspectionWarningKind, Pcsx2InstallationType, Pcsx2LaunchBlocker, Pcsx2LaunchBlockerKind,
+    Pcsx2MatchResult, Pcsx2MatchState, Pcsx2MemcardInfo, Pcsx2MemcardKind,
+    Pcsx2NativeLaunchBinding, Pcsx2PatchCategory, Pcsx2PatchDirectory, Pcsx2PatchDirectoryState,
     Pcsx2PnachFile, Pcsx2PnachInventory, Pcsx2Profile, Pcsx2ProfileBlocker,
     Pcsx2ProfileBlockerKind, Pcsx2ProfileDiscovery, Pcsx2ProfileDiscoveryRoots, Pcsx2ProfileScope,
-    discover_pcsx2_profiles, inspect_pcsx2_profile, match_pcsx2_inventory,
+    Pcsx2SaveStateInventory, Pcsx2SerialMapping, Pcsx2Settings, Pcsx2TextureInventory,
+    Pcsx2UserDirectoryMode, discover_pcsx2_profiles, inspect_pcsx2_game, inspect_pcsx2_profile,
+    inspect_pcsx2_profile_with_activation, match_pcsx2_inventory, parse_pcsx2_version,
+    resolve_pcsx2_native_launch_binding,
 };
 pub use pcsx2_pnach::{
     MAX_MANAGED_PNACH_BLOCKS, MAX_MANAGED_PNACH_BYTES, ManagedPnachCheat, PnachDocument,
@@ -388,6 +902,52 @@ pub use pcsx2_provider::{
     Pcsx2CheatSelection, Pcsx2ProviderTrust, build_pcsx2_cheat_candidates,
     selected_pcsx2_managed_cheats,
 };
+pub use pcsx2_temp_cheat_readiness::{
+    PCSX2_USER_DATA_FOLDER_KEYS, Pcsx2FolderEntry, Pcsx2FolderRouting, Pcsx2RuntimeProofItem,
+    Pcsx2StagingRequirement, Pcsx2TempCheatBlocker, Pcsx2TempCheatBlockerKind, Pcsx2TempCheatInput,
+    Pcsx2TempCheatReadiness, Pcsx2TempCheatVerdict, plan_pcsx2_temporary_cheat_launch,
+};
+pub use pcsx2_texture_pack::{
+    PCSX2_TEXTURE_PACK_FORMAT, PCSX2_TEXTURE_PACK_MAX_FILES, PCSX2_TEXTURE_PACK_MAX_TOTAL_BYTES,
+    PCSX2_TEXTURE_PACK_SOURCE_MODE, Pcsx2TextureIdentity, Pcsx2TexturePackApplyResult,
+    Pcsx2TexturePackError, Pcsx2TexturePackErrorKind, Pcsx2TexturePackFile,
+    Pcsx2TexturePackInspection, Pcsx2TexturePackPlan, Pcsx2TexturePackPreviewRequest,
+    Pcsx2TexturePackRejectedFile, build_pcsx2_texture_pack_preview,
+    build_pcsx2_texture_pack_transaction_plan, execute_pcsx2_texture_pack_apply,
+    inspect_pcsx2_texture_pack, pcsx2_texture_destination_root, verified_pcsx2_texture_identity,
+};
+pub use ppsspp_cwcheat::{
+    PPSSPP_CWCHEAT_MAX_BYTES, PPSSPP_CWCHEAT_MAX_CODE_LINES, PPSSPP_CWCHEAT_MAX_ENTRIES,
+    PPSSPP_CWCHEAT_MAX_LINE_BYTES, PPSSPP_CWCHEAT_MAX_LINES, PpssppCheatEntry, PpssppCheatFile,
+    PpssppCheatGame, PpssppCheatLine, PpssppCheatParseIssue, PpssppCheatState,
+    PpssppCwCheatPreview, PpssppCwCheatStaged, PpssppGlobalCheatState, PpssppReloadRequirement,
+    build_ppsspp_cwcheat_preview, merge_ppsspp_cheat, normalize_game_id, parse_ppsspp_cwcheat,
+    parse_ppsspp_cwcheat_file, ppsspp_global_cheat_state, remove_ppsspp_cheat,
+    render_ppsspp_cwcheat, set_ppsspp_cheat_state,
+};
+pub use ppsspp_local::{
+    PPSSPP_MAX_CHEAT_BYTES, PPSSPP_MAX_CHEAT_ENTRIES, PPSSPP_MAX_CONFIG_BYTES,
+    PPSSPP_MAX_ENTRIES_VISITED, PPSSPP_MAX_PROFILES, PPSSPP_MAX_TEXTURE_DEPTH,
+    PPSSPP_MAX_TEXTURE_FILES, PpssppCheatInventory, PpssppDiscoveryError, PpssppExecutable,
+    PpssppGameIdMapping, PpssppGameInspection, PpssppGameRequest, PpssppGlobalConfig, PpssppHealth,
+    PpssppInspectionWarning, PpssppInspectionWarningKind, PpssppInstallationType,
+    PpssppLaunchBlocker, PpssppLaunchBlockerKind, PpssppNativeLaunchBinding, PpssppProfile,
+    PpssppProfileBlocker, PpssppProfileBlockerKind, PpssppProfileDiscovery,
+    PpssppProfileDiscoveryRoots, PpssppProfileScope, PpssppSaveDataInventory, PpssppSettings,
+    PpssppTextureInventory, discover_ppsspp_profiles, inspect_ppsspp_game, parse_ppsspp_version,
+    resolve_ppsspp_native_launch_binding,
+};
+pub use ppsspp_texture_pack::{
+    PPSSPP_TEXTURE_PACK_MANIFEST_FORMAT, PPSSPP_TEXTURE_PACK_MAX_FILES,
+    PPSSPP_TEXTURE_PACK_MAX_TOTAL_BYTES, PPSSPP_TEXTURE_PACK_SOURCE_MODE, PpssppTextureIdentity,
+    PpssppTexturePackApplyResult, PpssppTexturePackBuildPreview, PpssppTexturePackBuildRequest,
+    PpssppTexturePackError, PpssppTexturePackErrorKind, PpssppTexturePackFile,
+    PpssppTexturePackManifest, PpssppTexturePackPlan, PpssppTexturePackPreviewRequest,
+    PpssppTexturePackRejectedFile, build_ppsspp_texture_pack_manifest,
+    build_ppsspp_texture_pack_preview, build_ppsspp_texture_pack_transaction_plan,
+    execute_ppsspp_texture_pack_apply, ppsspp_texture_destination_root,
+    validate_ppsspp_texture_pack_manifest, verified_ppsspp_texture_identity,
+};
 pub use resolved_emulator_profile::{
     EmulatorDestinationDirectories, EmulatorInstallationType, EmulatorProfileConfidence,
     ResolvedEmulatorProfile,
@@ -398,6 +958,10 @@ pub use retroarch::{
     PlaylistMatchConfidence, ProposedDestination, RetroArchAdvisoryEntry, RetroArchAdvisoryPlan,
     RetroArchAdvisorySummary, RetroArchProfileOutcome,
     preview_retroarch_patch_and_cheat_destinations,
+};
+pub use retroarch_bezel::{
+    RetroArchBezelApplyError, RetroArchBezelApplyOptions, apply_retroarch_bezel_plan,
+    prepare_retroarch_bezel_plan,
 };
 pub use retroarch_cheat_library::{
     RETROARCH_CHEAT_LIBRARY_MAX_DEPTH, RETROARCH_CHEAT_LIBRARY_MAX_ENTRIES,
@@ -413,7 +977,9 @@ pub use retroarch_cheat_setup::{
     RetroArchCheatSetupPreviewSummary, RetroArchCheatSetupProfile,
     RetroArchCheatSetupProfileBlocker, RetroArchCheatSetupProfileState, RetroArchCheatSetupResult,
     RetroArchCheatSetupStatus, build_retroarch_cheat_setup_plan,
-    discover_retroarch_cheat_setup_profiles, resolve_retroarch_cheat_setup_profile,
+    discover_retroarch_cheat_setup_profiles,
+    discover_retroarch_cheat_setup_profiles_with_core_directory_override,
+    resolve_retroarch_cheat_setup_profile,
 };
 pub use retroarch_inventory::{
     ArtifactAssociation, ArtifactAssociationConfidence, ArtifactCatalogueGame,
@@ -427,6 +993,63 @@ pub use retroarch_materialization::{
     RetroArchMaterializedPreview, RetroArchMaterializedSource,
     materialize_retroarch_shared_preview,
 };
+pub use rmg_local::{
+    RMG_MAX_EXPLICIT_EXECUTABLES, RmgExecutable, RmgInstallationType, RmgLaunchBlocker,
+    RmgLaunchBlockerKind, RmgNativeLaunchBinding, RmgProfile, RmgProfileDiscovery,
+    RmgProfileDiscoveryRoots, discover_rmg_profiles, parse_rmg_version,
+    resolve_rmg_native_launch_binding,
+};
+pub use rpcs3_local::{
+    RPCS3_MAX_DLC_ENTRIES, RPCS3_MAX_ENTRIES_VISITED, RPCS3_MAX_PATCH_ENTRIES, RPCS3_MAX_PROFILES,
+    RPCS3_MAX_SAVE_TROPHY_CANDIDATES, RPCS3_MAX_SFO_SCAN_ENTRIES, Rpcs3DiscoveryError,
+    Rpcs3DlcEntry, Rpcs3DlcInventory, Rpcs3Executable, Rpcs3FirmwareStatus, Rpcs3GameIdMapping,
+    Rpcs3GameInspection, Rpcs3GameRequest, Rpcs3Health, Rpcs3InspectionWarning,
+    Rpcs3InspectionWarningKind, Rpcs3InstallationType, Rpcs3InstalledGame, Rpcs3LaunchBinding,
+    Rpcs3LaunchBlocker, Rpcs3LaunchBlockerKind, Rpcs3PatchEntry, Rpcs3PatchInventory,
+    Rpcs3PerGameConfig, Rpcs3Profile, Rpcs3ProfileBlocker, Rpcs3ProfileBlockerKind,
+    Rpcs3ProfileDiscovery, Rpcs3ProfileDiscoveryRoots, Rpcs3ProfileScope, Rpcs3SaveTrophyInventory,
+    Rpcs3Settings, Rpcs3UpdateInfo, discover_rpcs3_profiles, inspect_rpcs3_game,
+    parse_rpcs3_version, resolve_rpcs3_native_launch_binding,
+};
+pub use rpcs3_ordinary_mod::{
+    RPCS3_ORDINARY_MOD_MAX_FILES, RPCS3_ORDINARY_MOD_MAX_SFO_BYTES,
+    RPCS3_ORDINARY_MOD_MAX_TOTAL_BYTES, RPCS3_ORDINARY_MOD_SOURCE_MODE,
+    Rpcs3OrdinaryModApplyResult, Rpcs3OrdinaryModArchiveInspection, Rpcs3OrdinaryModError,
+    Rpcs3OrdinaryModErrorKind, Rpcs3OrdinaryModInspection, Rpcs3OrdinaryModPlan,
+    apply_rpcs3_ordinary_mod, build_rpcs3_ordinary_mod_plan,
+    build_rpcs3_ordinary_mod_transaction_plan, inspect_rpcs3_ordinary_mod,
+    inspect_rpcs3_ordinary_mod_zip, preview_rpcs3_ordinary_mod_rollback,
+    rollback_rpcs3_ordinary_mod, rpcs3_ordinary_mod_destination_root,
+};
+pub use rpcs3_patch::{
+    RPCS3_PATCH_ENGINE_VERSION, RPCS3_PATCH_MAX_BYTES, RPCS3_PATCH_MAX_ENTRIES,
+    RPCS3_PATCH_MAX_LINES, RPCS3_PATCH_MAX_OPS, RPCS3_PATCH_SOURCE_MODE, Rpcs3PatchEntryDefinition,
+    Rpcs3PatchError, Rpcs3PatchFile, Rpcs3PatchGroup, Rpcs3PatchIssue, Rpcs3PatchLoadabilityFacts,
+    Rpcs3PatchOperation, Rpcs3PatchPlan, Rpcs3PatchReadiness, Rpcs3PatchSelection, Rpcs3PatchState,
+    apply_rpcs3_patch, build_rpcs3_patch_plan, inspect_rpcs3_patch_subset, merge_rpcs3_patch_files,
+    parse_rpcs3_patch_yaml, preview_rpcs3_patch_rollback, readiness as rpcs3_patch_readiness,
+    render_rpcs3_patch_activation_config, render_rpcs3_patch_yaml, rollback_rpcs3_patch,
+    rpcs3_patch_loadability_facts,
+};
+pub use sameboy_local::{
+    SAMEBOY_MAX_CONFIG_BYTES, SAMEBOY_MAX_PROFILES, SameBoyBootRomEvidence, SameBoyBootRomState,
+    SameBoyConfigInspection, SameBoyDiscoveryError, SameBoyExecutable, SameBoyInstallationType,
+    SameBoyLaunchBlocker, SameBoyLaunchBlockerKind, SameBoyNativeLaunchBinding, SameBoyProfile,
+    SameBoyProfileDiscovery, SameBoyProfileDiscoveryRoots, discover_sameboy_profiles,
+    parse_sameboy_version, resolve_sameboy_native_launch_binding,
+};
+pub use saturn_action_replay::{
+    SATURN_ACTION_REPLAY_MAX_BYTES, SATURN_ACTION_REPLAY_MAX_CODES, SaturnCheatCode,
+    SaturnCheatDecodeResult, SaturnCheatIdentityEvidence, SaturnCheatIssue, SaturnCheatOpcode,
+    SaturnCheatReadiness, decode_saturn_action_replay, saturn_cheat_document,
+};
+pub use scummvm_trainer::{
+    ScummVmTrainerApplyOptions, ScummVmTrainerConflict, ScummVmTrainerConflictKind,
+    ScummVmTrainerError, ScummVmTrainerIdentity, ScummVmTrainerOption, ScummVmTrainerOptionKind,
+    ScummVmTrainerPreview, ScummVmTrainerReadiness, ScummVmTrainerRequest, ScummVmTrainerSelection,
+    ScummVmTrainerValue, apply_scummvm_trainer_preview, build_scummvm_trainer_preview,
+    scummvm_trainer_options,
+};
 pub use shared_preview::{
     PREVIEW_MAX_BYTES_PER_FILE, PREVIEW_MAX_CONFLICTS, PREVIEW_MAX_DESTINATION_FILES_HASHED,
     PREVIEW_MAX_DESTINATION_PATHS, PREVIEW_MAX_ENTRIES, PREVIEW_MAX_SOURCE_FILES_HASHED,
@@ -438,20 +1061,106 @@ pub use shared_preview::{
     SharedPreviewReport, SharedPreviewRequest, build_shared_preview,
 };
 pub use shared_transaction::{
-    SHARED_APPLY_SCHEMA_VERSION, SHARED_MAX_BACKUP_BYTES, SHARED_MAX_CREATED_DIRECTORIES,
-    SHARED_MAX_ENTRIES, SHARED_MAX_FAILURES, SHARED_MAX_HISTORY_JOURNALS, SHARED_MAX_JOURNAL_BYTES,
+    SHARED_APPLY_SCHEMA_VERSION, SHARED_DURABLE_JOURNAL_SCHEMA_VERSION, SHARED_MAX_BACKUP_BYTES,
+    SHARED_MAX_CREATED_DIRECTORIES, SHARED_MAX_ENTRIES, SHARED_MAX_FAILURES,
+    SHARED_MAX_HISTORY_JOURNALS, SHARED_MAX_JOURNAL_BYTES, SHARED_MAX_MATERIALIZED_BYTES,
     SHARED_MAX_ROLLBACK_ENTRIES, SHARED_MAX_SOURCE_BYTES, SHARED_MAX_TEMP_FILES,
     SHARED_MAX_TOTAL_WRITTEN_BYTES, SHARED_MAX_WARNINGS, SharedAdapterWriteSupport,
     SharedApplyConfirmation, SharedApplyContext, SharedApplyEntry, SharedApplyFailure,
     SharedApplyFailureKind, SharedApplyJournal, SharedApplyOptions, SharedApplyOutcome,
-    SharedApplyResult, SharedApplyStatus, SharedHistoryReport, SharedJournalWarning,
-    SharedPlanEntry, SharedRollbackConfirmation, SharedRollbackEntry, SharedRollbackOptions,
+    SharedApplyResult, SharedApplyStatus, SharedContentVerification, SharedDurableEntry,
+    SharedDurableJournal, SharedEntryRecoveryState, SharedHistoryReport, SharedJournalWarning,
+    SharedMaterializedOutput, SharedPendingOperation, SharedPendingRecoveryPlan, SharedPlanEntry,
+    SharedRecoveryState, SharedRollbackConfirmation, SharedRollbackEntry, SharedRollbackOptions,
     SharedRollbackOutcome, SharedRollbackPreview, SharedRollbackResult, SharedTransactionPath,
     SharedTransactionPlan, SharedTransactionStage, adapter_write_support,
     build_shared_transaction_plan, default_shared_backup_root, default_shared_history_root,
-    discover_shared_apply_history, execute_shared_apply, execute_shared_rollback,
-    generate_shared_operation_id, preview_shared_rollback,
-    require_dolphin_managed_gamehacking_verification,
+    discover_pending_operations, discover_shared_apply_history, execute_shared_apply,
+    execute_shared_materialized_apply, execute_shared_rollback, generate_shared_operation_id,
+    plan_pending_recovery, preview_shared_rollback,
+    require_dolphin_managed_gamehacking_verification, require_local_mod_package_verification,
+    require_retroarch_bezel_verification, seal_shared_transaction_plan,
+};
+pub use snes9x_local::{
+    SNES9X_MAX_PROFILES, SNES9X_NATIVE_BINARY_NAMES, Snes9xExecutable, Snes9xInstallationType,
+    Snes9xLaunchBlocker, Snes9xLaunchBlockerKind, Snes9xNativeLaunchBinding, Snes9xProfile,
+    Snes9xProfileDiscovery, Snes9xProfileDiscoveryRoots, discover_snes9x_profiles,
+    parse_snes9x_version, resolve_snes9x_native_launch_binding,
+};
+pub use staging_job::{new_staging_job_root, retire_completed_staging_job};
+pub use stella_local::{
+    STELLA_MAX_EXPLICIT_EXECUTABLES, StellaExecutable, StellaInstallationType, StellaLaunchBlocker,
+    StellaLaunchBlockerKind, StellaNativeLaunchBinding, StellaProfile, StellaProfileDiscovery,
+    StellaProfileDiscoveryRoots, discover_stella_profiles, parse_stella_version,
+    resolve_stella_native_launch_binding,
+};
+pub use three_ds_cheat::{
+    THREE_DS_CHEAT_MAX_BYTES, THREE_DS_CHEAT_MAX_ENTRIES, THREE_DS_CHEAT_MAX_LINES,
+    ThreeDsCheatCode, ThreeDsCheatEntry, ThreeDsCheatFile, ThreeDsCheatIssue,
+    ThreeDsCheatReadiness, ThreeDsCheatState, ThreeDsCheatVersion, assess_three_ds_version,
+    merge_three_ds_cheat_file, parse_three_ds_cheat_file, render_three_ds_cheat_file,
+    three_ds_cheat_document,
+};
+pub use tsugaru_local::{
+    TSUGARU_EXECUTABLE_NAME, TSUGARU_FIRMWARE_DIRECTORY_ENV, TSUGARU_ROM_DIRECTORY_ENV,
+    TsugaruExecutable, TsugaruFirmwareState, TsugaruInstallationType, TsugaruProfile,
+    TsugaruProfileDiscovery, TsugaruProfileDiscoveryRoots, discover_tsugaru_profiles,
+    resolve_tsugaru_native_launch_binding,
+};
+pub use user_cheat_import::{
+    USER_CHEAT_MAX_CHEATS_PER_FILE, USER_CHEAT_MAX_DEPTH, USER_CHEAT_MAX_FILE_BYTES,
+    USER_CHEAT_MAX_FILES_VISITED, USER_CHEAT_MAX_PATH_BYTES, USER_CHEAT_MAX_TOTAL_BYTES,
+    USER_CHEAT_MAX_WARNINGS, UserCheatCandidate, UserCheatDiagnostic, UserCheatDiagnosticKind,
+    UserCheatDuplicate, UserCheatEvidence, UserCheatFormat, UserCheatImportError,
+    UserCheatImportLimits, UserCheatImportReport, UserCheatLibraryGame, UserCheatMatch,
+    UserCheatMatchState, UserCheatProvenance, UserCheatSourceOrigin, scan_user_cheat_directory,
+    scan_user_cheat_directory_with_limits, scan_user_cheat_file, scan_user_cheat_file_with_limits,
+};
+pub use vice_c64_cheat::{
+    ViceCheatCommand, ViceCheatIdentity, ViceCheatIssue, ViceCheatProjection, ViceCheatReadiness,
+    ViceMemoryTarget, classify_c64_memory, project_vice_c64_pokes, vice_cheat_identity_strength,
+};
+pub use vice_local::{
+    VICE_MAX_EXPLICIT_EXECUTABLES, ViceC64ExecutableKind, ViceExecutable, ViceInstallationType,
+    ViceLaunchBlocker, ViceLaunchBlockerKind, ViceNativeLaunchBinding, ViceProfile,
+    ViceProfileDiscovery, ViceProfileDiscoveryRoots, ViceReadinessEvidence, assess_vice_readiness,
+    discover_vice_profiles, parse_vice_version, resolve_vice_native_launch_binding,
+};
+pub use vita3k_local::{
+    VITA3K_MAX_CONFIG_BYTES, VITA3K_MAX_PROFILES, VITA3K_MAX_SFO_BYTES, Vita3kConfigInspection,
+    Vita3kContentDisposition, Vita3kDiscoveryError, Vita3kExecutable, Vita3kFirmwareState,
+    Vita3kInstallationType, Vita3kInstalledTitle, Vita3kLaunchBlocker, Vita3kLaunchBlockerKind,
+    Vita3kLicenseState, Vita3kNativeLaunchBinding, Vita3kProfile, Vita3kProfileBlocker,
+    Vita3kProfileBlockerKind, Vita3kProfileDiscovery, Vita3kProfileDiscoveryRoots,
+    Vita3kProfileReadiness, Vita3kReadinessEvidence, assess_vita3k_profile,
+    assess_vita3k_readiness, classify_vita3k_content, discover_vita3k_profiles,
+    inspect_installed_title, parse_vita3k_version, resolve_vita3k_native_launch_binding,
+};
+pub use whdload_trainer::{
+    TrainerOption, TrainerOptionChoice, TrainerOptionConflict, TrainerOptionConflictKind,
+    TrainerOptionKind, TrainerOptionReadiness, TrainerOptionSelection, TrainerOptionSource,
+    TrainerOptionValue, WHDLOAD_TRAINER_MAX_CONFIG_BYTES, WhdloadTrainerApplyOptions,
+    WhdloadTrainerError, WhdloadTrainerIdentity, WhdloadTrainerLaunchProjection,
+    WhdloadTrainerPreview, WhdloadTrainerReadiness, WhdloadTrainerRequest,
+    apply_whdload_trainer_preview, build_whdload_trainer_preview,
+    project_whdload_trainer_launch_options, project_whdload_trainer_options,
+    render_whdload_arguments,
+};
+pub use whdload_trainer_discovery::{
+    WhdloadTrainerDiscovery, WhdloadTrainerDiscoveryState, discover_whdload_trainer_options,
+};
+pub use whdload_trainer_storage::{
+    WHDLOAD_TRAINER_OPTION_EXTENSION, WHDLOAD_TRAINER_OPTION_FOLDER, WhdloadTrainerStorageError,
+    whdload_trainer_option_file, whdload_trainer_option_file_in,
+};
+pub use xemu_local::{
+    XEMU_MAX_CONFIG_BYTES, XEMU_MAX_PROFILES, XemuConfig, XemuDiscoveryError, XemuExecutable,
+    XemuGameIdMapping, XemuGameInspection, XemuGameRequest, XemuHealth, XemuInstallationType,
+    XemuLaunchBlocker, XemuLaunchBlockerKind, XemuNativeLaunchBinding, XemuProfile,
+    XemuProfileBlocker, XemuProfileBlockerKind, XemuProfileDiscovery, XemuProfileDiscoveryRoots,
+    XemuProfileScope, XemuSystemFile, XemuSystemFileKind, XemuSystemFileState, XemuWarning,
+    XemuWarningKind, discover_xemu_profiles, inspect_xemu_game, parse_xemu_version,
+    resolve_xemu_native_launch_binding,
 };
 pub use xenia_install_plan::{
     LoadedXeniaDestination, MAX_EXISTING_XENIA_PATCH_BYTES, MAX_STAGED_XENIA_PATCH_BYTES,
@@ -462,9 +1171,13 @@ pub use xenia_install_plan::{
     load_xenia_destination, stage_xenia_patch_file,
 };
 pub use xenia_local::{
-    XENIA_MAX_PROFILES, XeniaDirectoryIdentity, XeniaInstallationType, XeniaPatchesDirectoryState,
-    XeniaProfile, XeniaProfileBlocker, XeniaProfileBlockerKind, XeniaProfileDiscovery,
-    XeniaProfileDiscoveryRoots, XeniaProfileScope, discover_xenia_profiles,
+    LocalXeniaDiscovery, LocalXeniaFileError, LocalXeniaInstallState, MAX_LOCAL_XENIA_PATCH_BYTES,
+    XENIA_MAX_PROFILES, XeniaDirectoryIdentity, XeniaInstallationType, XeniaLaunchBinding,
+    XeniaLaunchBlocker, XeniaLaunchBlockerKind, XeniaPatchesDirectoryState, XeniaProfile,
+    XeniaProfileBlocker, XeniaProfileBlockerKind, XeniaProfileDiscovery,
+    XeniaProfileDiscoveryRoots, XeniaProfileScope, check_local_xenia_install_state,
+    discover_local_xenia_patch_file, discover_xenia_profiles, load_local_xenia_destination,
+    resolve_xenia_launch_binding, stage_local_xenia_patch_file,
 };
 pub use xenia_patch_document::{
     MAX_BYTE_ARRAY_BYTES, MAX_HASHES_PER_FILE, MAX_MEDIA_IDS_PER_FILE, MAX_PATCH_FILE_BYTES,
@@ -482,6 +1195,12 @@ pub use xenia_provider::{
     XeniaProviderFetchErrorKind, XeniaProviderFetchOptions, XeniaProviderFetchResult,
     XeniaProviderFetchStatus, XeniaProviderResult, default_xenia_provider_cache_root,
     fetch_xenia_provider_patches, fetch_xenia_provider_patches_with_transport,
+};
+pub use xroar_local::{
+    XROAR_EXECUTABLE_NAME, XROAR_FIRMWARE_DIRECTORY_ENV, XROAR_MACHINE_ENV, XRoarExecutable,
+    XRoarExplicitProfile, XRoarFirmwareState, XRoarInstallationType, XRoarMachine, XRoarProfile,
+    XRoarProfileDiscovery, XRoarProfileDiscoveryRoots, discover_xroar_profiles,
+    resolve_xroar_native_launch_binding,
 };
 
 pub const BUILT_IN_SOURCE_ID: &str = "pcsx2-official-patches-tree";

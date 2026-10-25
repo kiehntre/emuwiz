@@ -12,6 +12,7 @@
 use serde::{Deserialize, Serialize};
 
 use super::classification::{DatContentClassification, DatOriginalMetadata};
+use super::mame_input_metadata::MameInputMetadata;
 
 /// Which ecosystem a DAT file represents.
 ///
@@ -23,6 +24,9 @@ pub enum DatEcosystem {
     GenericLogiqx,
     NoIntro,
     Redump,
+    FBNeo,
+    MAMESoftwareList,
+    MAMEArcade,
     GenericClrMamePro,
     Tosec,
 }
@@ -33,6 +37,9 @@ impl DatEcosystem {
             Self::GenericLogiqx => "Generic Logiqx",
             Self::NoIntro => "No-Intro",
             Self::Redump => "Redump",
+            Self::FBNeo => "FinalBurn Neo",
+            Self::MAMESoftwareList => "MAME software list",
+            Self::MAMEArcade => "MAME listxml",
             Self::GenericClrMamePro => "Generic ClrMamePro",
             Self::Tosec => "TOSEC",
         }
@@ -71,6 +78,50 @@ pub struct DatSource {
     pub entry_count: usize,
     pub rom_count: usize,
     pub parse_warnings: Vec<String>,
+    /// Explicit packing-policy metadata declared by the DAT itself (e.g.
+    /// RomVault's `<romvault forcepacking="..." />` header extension) -
+    /// see [`DatPackingPolicy`]. Always [`DatPackingPolicy::Standard`] for
+    /// a DAT that declares no such marker; never inferred from filename,
+    /// description, provider, or archive extension.
+    pub packing_policy: DatPackingPolicy,
+}
+
+/// Explicit archive-packing policy declared by a DAT file's own structural
+/// metadata - never guessed from filename, description, provider, or
+/// archive extension.
+///
+/// This is a whole-DAT (header-level) policy, matching where RomVault's own
+/// `<romvault forcepacking="..." />` extension lives: one DAT file declares
+/// one policy for every game it contains.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum DatPackingPolicy {
+    /// No explicit packing-policy marker - the existing member-based
+    /// archive inspection applies unchanged. This is the default for
+    /// every DAT that does not carry the marker, and for every non-Logiqx
+    /// format (the marker is a Logiqx header extension).
+    #[default]
+    Standard,
+    /// RomVault `<romvault forcepacking="fileonly" />` (or its `"file"`
+    /// alias): the archive file itself is the hashed DAT item. Its
+    /// members must never be inspected for identity/audit matching -
+    /// see `crate::dat::sources::audit_run`'s consumption of this policy.
+    FileOnly,
+    /// RomVault `<romvault forcepacking="unzip" />`: a structured loose
+    /// collection - files are stored individually, preserving the
+    /// path/group structure the DAT declares, never packed into an
+    /// archive. Recognised at parse time; audit execution currently
+    /// treats this the same as `Standard` (loose files are already
+    /// matched by content hash regardless of DAT type) - see this
+    /// variant's own module-level design note for why broader
+    /// path/group-aware execution was left out of this pass.
+    StructuredLoose,
+    /// A `<romvault forcepacking="...">` marker was present but its value
+    /// is not one this crate recognises. Carries the raw, unmodified
+    /// attribute value for diagnostics. Fails closed at audit time
+    /// (`crate::dat::sources::audit_run::DatAuditError`) rather than
+    /// guessing `Standard` or `FileOnly`.
+    Unrecognized(String),
 }
 
 /// A checksum algorithm as it appears in a DAT file.
@@ -129,7 +180,7 @@ impl DatChecksum {
 }
 
 /// One ROM entry within a game entry.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct DatRomEntry {
     pub name: String,
     pub size_bytes: Option<u64>,
@@ -140,6 +191,29 @@ pub struct DatRomEntry {
     pub status: Option<String>,
     pub merge: Option<String>,
     pub date: Option<String>,
+    /// Raw placement and loading attributes retained for later set semantics.
+    #[serde(default)]
+    pub offset: Option<String>,
+    /// Raw `loadflag` value, when the DAT declares one (Logiqx `<rom
+    /// loadflag="...">`, ClrMamePro `loadflag value`).
+    ///
+    /// Not interpreted: this is provenance, not an operational model. MAME
+    /// uses `loadflag` to mark ROM entries that are not an ordinary physical
+    /// dump at all - `fill`/`reload`/`continue` describe how to synthesize
+    /// or reuse bytes rather than a file to locate - and this codebase has
+    /// no logic anywhere that understands what to do with any `loadflag`
+    /// value. A consumer that needs to know "is this an ordinary physical
+    /// ROM" should treat `Some(_)` here as "no", regardless of the value.
+    #[serde(default)]
+    pub loadflag: Option<String>,
+    #[serde(default)]
+    pub value: Option<String>,
+    #[serde(default)]
+    pub optional: Option<String>,
+    #[serde(default)]
+    pub bios: Option<String>,
+    #[serde(default)]
+    pub region: Option<String>,
 }
 
 impl DatRomEntry {
@@ -173,14 +247,132 @@ impl DatRomEntry {
     }
 }
 
+/// One disk/CHD declaration within a DAT entry.
+///
+/// These fields are provenance only. In particular, the SHA-1 is not treated
+/// as an ordinary ROM-file hash and no CHD content is opened or verified here.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DatDiskEntry {
+    #[serde(default)]
+    pub name: Option<String>,
+    #[serde(default)]
+    pub sha1: Option<String>,
+    #[serde(default)]
+    pub merge: Option<String>,
+    #[serde(default)]
+    pub region: Option<String>,
+    #[serde(default)]
+    pub index: Option<String>,
+    #[serde(default)]
+    pub writable: Option<String>,
+    #[serde(default)]
+    pub status: Option<String>,
+    #[serde(default)]
+    pub optional: Option<String>,
+}
+
+/// A referenced device set.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DatDeviceRefEntry {
+    #[serde(default)]
+    pub name: Option<String>,
+}
+
+/// A sample-file declaration.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DatSampleEntry {
+    #[serde(default)]
+    pub name: Option<String>,
+}
+
+/// One BIOS variant declaration.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DatBiosSetEntry {
+    #[serde(default)]
+    pub name: Option<String>,
+    #[serde(default)]
+    pub description: Option<String>,
+    #[serde(default)]
+    pub default: Option<String>,
+}
+
+/// A software-list data area. Member interpretation remains deferred.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DatDataAreaEntry {
+    #[serde(default)]
+    pub name: Option<String>,
+    #[serde(default)]
+    pub roms: Vec<DatRomEntry>,
+}
+
+/// A software-list disk area. Member interpretation remains deferred.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DatDiskAreaEntry {
+    #[serde(default)]
+    pub name: Option<String>,
+    #[serde(default)]
+    pub disks: Vec<DatDiskEntry>,
+}
+
+/// One software-list part and the structural areas declared inside it.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DatPartEntry {
+    #[serde(default)]
+    pub name: Option<String>,
+    #[serde(default)]
+    pub interface: Option<String>,
+    #[serde(default)]
+    pub data_areas: Vec<DatDataAreaEntry>,
+    #[serde(default)]
+    pub disk_areas: Vec<DatDiskAreaEntry>,
+}
+
 /// One game entry from a DAT file.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct DatGameEntry {
     pub name: String,
+    /// Raw `<game id="...">` declaration, when the DAT publishes one.
+    ///
+    /// No-Intro DATs assign a stable numeric-or-alphanumeric `id` to every
+    /// entry and reference it from a clone via `cloneofid` instead of (or
+    /// alongside) a name-based `cloneof`. This field preserves that literal
+    /// value so a `cloneofid` can be resolved as a second, ID-keyed identity,
+    /// never as a name lookup against an ID string (which is what silently
+    /// broke that resolution before this field existed).
+    #[serde(default)]
+    pub id: Option<String>,
     pub description: Option<String>,
     pub roms: Vec<DatRomEntry>,
     pub clone_of: Option<String>,
+    #[serde(default)]
+    pub rom_of: Option<String>,
     pub sample_of: Option<String>,
+    #[serde(default)]
+    pub is_bios: Option<String>,
+    /// Raw `isdevice` declaration. A `<device_ref>` must resolve to a node
+    /// that declares itself a device; without this field a malformed
+    /// catalogue could point a device requirement at an ordinary game and
+    /// have it silently satisfied by that game's own storage. Captured as the
+    /// raw string so an unexpected value stays visible rather than being
+    /// coerced to `false`.
+    #[serde(default)]
+    pub is_device: Option<String>,
+    #[serde(default)]
+    pub runnable: Option<String>,
+    /// Raw software-list support declaration (`yes`, `partial`, or `no`).
+    /// Preserved as provenance; no completeness semantics are applied yet.
+    #[serde(default)]
+    pub supported: Option<String>,
+    #[serde(default)]
+    pub disks: Vec<DatDiskEntry>,
+    #[serde(default)]
+    pub device_refs: Vec<DatDeviceRefEntry>,
+    #[serde(default)]
+    pub samples: Vec<DatSampleEntry>,
+    #[serde(default)]
+    pub bios_sets: Vec<DatBiosSetEntry>,
+    #[serde(default)]
+    pub parts: Vec<DatPartEntry>,
     pub board: Option<String>,
     pub rebuild_to: Option<String>,
     pub year: Option<String>,
@@ -190,9 +382,34 @@ pub struct DatGameEntry {
     /// Structured upstream fields retained verbatim for technical review.
     #[serde(default)]
     pub original_metadata: DatOriginalMetadata,
+    /// Optional raw static input evidence emitted by the MAME listxml parser.
+    /// This is deliberately MAME-specific and is not a controller requirement.
+    #[serde(default)]
+    pub mame_input: Option<MameInputMetadata>,
+    /// Parser provenance for MAME listxml dependency facts. Older parsed caches
+    /// omitted BIOS/default declarations and empty relationship markers. Their
+    /// missing stamp must remain unknown rather than inherit today's version.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub mame_listxml_schema_version: Option<u32>,
     /// Derived EmuWiz annotation. Never changes upstream identity semantics.
     #[serde(default)]
     pub content_classification: DatContentClassification,
+    /// Whether the source parser detected structure it could not preserve or
+    /// cannot prove the absence of at all.
+    ///
+    /// This remains a capability signal even when the raw elements are
+    /// preserved by the additive Stage 2 model. Fully represented disks,
+    /// parts, areas, samples, BIOS declarations, and device references do not
+    /// set it; malformed nesting and unrepresented structures still do.
+    ///
+    /// `false` is a positive claim that the parser preserved every structural
+    /// element it recognizes, never a default assumed without evidence. Every
+    /// entry the ClrMamePro parser produces sets this
+    /// `true` unconditionally: that parser does not currently attempt to
+    /// detect any of this structure, so it cannot honestly claim `false`
+    /// for anything.
+    #[serde(default)]
+    pub unsupported_structure: bool,
 }
 
 impl DatGameEntry {
@@ -211,5 +428,21 @@ pub struct ParsedDat {
 impl ParsedDat {
     pub fn total_roms(&self) -> usize {
         self.games.iter().map(|g| g.rom_count()).sum()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{DatDataAreaEntry, DatDiskAreaEntry};
+
+    #[test]
+    fn area_member_vectors_default_when_deserializing_older_data() {
+        let data_area: DatDataAreaEntry =
+            serde_json::from_str(r#"{"name":"prg"}"#).expect("data area should deserialize");
+        let disk_area: DatDiskAreaEntry =
+            serde_json::from_str(r#"{"name":"cdrom"}"#).expect("disk area should deserialize");
+
+        assert!(data_area.roms.is_empty());
+        assert!(disk_area.disks.is_empty());
     }
 }

@@ -55,8 +55,8 @@ fn every_registered_source_is_listed() {
     let view = fresh("lists-all").view();
     assert_eq!(
         view.rows.len(),
-        9,
-        "all nine registered sources must appear, got {:?}",
+        10,
+        "all ten registered sources must appear, got {:?}",
         view.rows.iter().map(|r| &r.id).collect::<Vec<_>>()
     );
 }
@@ -141,7 +141,7 @@ fn consulted_position_counts_only_enabled_sources_lowest_first() {
         .collect();
     assert_eq!(
         positions,
-        (1..=8).collect::<Vec<_>>(),
+        (1..=9).collect::<Vec<_>>(),
         "positions must stay contiguous over enabled sources"
     );
 }
@@ -539,15 +539,23 @@ fn the_picker_offers_only_canonical_platforms() {
 #[test]
 fn the_picker_is_bounded_and_reports_what_it_truncated() {
     let all = available_platform_choices(&[], "");
+    let total = available_platform_count(&[], "");
     assert!(
         all.len() <= MAX_PLATFORM_CHOICES,
         "the list shown must stay bounded, got {}",
         all.len()
     );
-    assert!(
-        available_platform_count(&[], "") > all.len(),
-        "the registry has more platforms than the picker shows, so the count must differ \
-         and the UI can say 'showing N of M'"
+    // The registry (74 today) fits comfortably under the 100-choice
+    // headroom, so nothing is truncated right now - that is expected, not
+    // a regression (2026-08-22, live-QA Phase 7: headroom raised from 12
+    // to 100). The invariant this test actually protects is that showing
+    // fewer choices than the total count can only ever happen because of
+    // the cap, never because of a bug that silently drops entries.
+    assert_eq!(
+        all.len(),
+        total.min(MAX_PLATFORM_CHOICES),
+        "shown choices must be exactly min(total matches, the cap), got {} shown of {total} total",
+        all.len()
     );
 }
 
@@ -1762,19 +1770,19 @@ fn an_unreadable_existing_cache_is_drawn_as_invalid_not_not_checked() {
 }
 
 #[test]
-fn bsfree_is_labeled_with_its_honest_gamecube_capability() {
+fn bsfree_is_labeled_with_its_honest_gamecube_and_wii_capability() {
     let registry = archivefs_core::patch_manager::build_default_registry();
     let bsfree = registry.get("bsfree-archive").expect("bsfree entry");
     assert_eq!(
         super::provider_kind_label(bsfree),
-        "Downloads and installs (GameCube via Dolphin)",
-        "BSFree must state its GameCube install capability without claiming other formats install"
+        "Downloads and installs (GameCube/Wii via Dolphin)",
+        "BSFree must state its GameCube/Wii install capability without claiming other formats install"
     );
     assert!(
         bsfree
             .spec
             .description
-            .contains("GameCube hex-pair codes are installable"),
+            .contains("GameCube and Wii hex-pair codes are installable"),
         "the row description must carry the same honest capability"
     );
 }
@@ -1783,6 +1791,27 @@ fn bsfree_is_labeled_with_its_honest_gamecube_capability() {
 fn the_page_header_shows_its_icon_alongside_the_title() {
     let view = fresh("icon-header").view();
     let output = render(&view);
-    assert!(rendered_text_contains(&output, "<3 x99"));
+    assert!(rendered_text_contains(&output, crate::ui::icons::CHEATS));
     assert!(rendered_text_contains(&output, "Cheat sources"));
+}
+
+#[test]
+fn game_genie_preview_renders_game_boy_compare_guidance_without_apply() {
+    let view = fresh("game-genie-preview").view();
+    let mut ui_state = CheatSourcesPageUi {
+        game_genie_input: "068-5FF-E66".into(),
+        game_genie_platform: archivefs_core::patch_manager::GameGeniePlatform::GameBoy,
+        ..CheatSourcesPageUi::default()
+    };
+    let output = render_with(&view, &mut ui_state, false);
+    assert!(rendered_text_contains(
+        &output,
+        "Classic Game Genie preview"
+    ));
+    assert!(rendered_text_contains(&output, "Compare: 0x03"));
+    assert!(rendered_text_contains(&output, "unverified ROM revision"));
+    assert!(rendered_text_contains(
+        &output,
+        "No ROM patch or hidden apply"
+    ));
 }

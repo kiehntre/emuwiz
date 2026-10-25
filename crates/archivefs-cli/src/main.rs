@@ -1,8 +1,12 @@
+#[cfg(test)]
+archivefs_core::install_test_environment!();
+
 use std::env;
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 use std::sync::OnceLock;
 
+use archivefs_core::catalogue_health::{FORGET_PLAN_STALE, MissingClassification};
 use archivefs_core::diagnostics::environment::{
     FreeSpacePolicy, assess_storage, mount_table, storage_resources,
 };
@@ -59,8 +63,8 @@ use archivefs_core::{
     ConfigCheckStatus, Database, DatabaseHealth, DatabaseHealthReport, DoctorReport,
     DuplicateDetector, DuplicateEntry, DuplicateReport, FilenameDuplicateDetector,
     LibraryViewApplyOutcome, LibraryViewApplyReport, LibraryViewConfig, LibraryViewPlan,
-    LibraryViewPlanAction, LibraryViewPlanEntry, MissingArchiveRemovalResult, MountPlan,
-    PersistedArchive, PlatformAlias, PlatformAssignmentChange, ScanPersistSummary,
+    LibraryViewPlanAction, LibraryViewPlanEntry, MissingArchiveRemovalResult, MissingCleanupTarget,
+    MountPlan, PersistedArchive, PlatformAlias, PlatformAssignmentChange, ScanPersistSummary,
     SourceAvailability, SourceFolderView, WatchRebuildSummary, add_source_folder_default,
     apply_library_view_default, build_and_write_archive_index, canonical_platform_names,
     catalogue_health_report, check_archive_index_freshness, check_database_health,
@@ -80,14 +84,25 @@ use archivefs_core::{
 use serde::Serialize;
 
 mod bsfree;
+mod cheat_reconcile;
 mod cheat_source;
+mod cheatbase;
 mod dat;
+mod discovery;
+mod inspect;
+mod mame_evidence;
+mod mame_normalise;
+mod mame_staging;
+mod media_set;
 mod platform_artwork;
+mod read_only_status;
+mod repair;
 mod retroarch_cheat_cache;
 mod retroarch_cheat_setup;
 mod retroarch_cheat_sources;
 mod rom_organise;
 mod romm_identity;
+mod saves;
 
 static LOGGER: StderrLogger = StderrLogger;
 static LOGGER_INIT: OnceLock<()> = OnceLock::new();
@@ -115,11 +130,77 @@ struct CliArgs {
     args: Vec<String>,
 }
 
+/// How a command registers before it runs. Only the place a registration goes
+/// changes: gate decisions still rest on records verified against `/proc`, and
+/// any journal work passes `writer_gate::check`, which registers this process
+/// in the data directory first.
+#[derive(Debug, PartialEq, Eq)]
+enum StartupRegistration {
+    /// Read-only (version and help included): the per-user runtime registry
+    /// only, never the data directory and no seal store.
+    Reader,
+    /// May write journals: the full data-directory registration.
+    Writer,
+}
+
+thread_local! {
+    /// Why a read-only command runs unregistered; reported once logging is up.
+    static REGISTRATION_NOTE: std::cell::RefCell<Option<String>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+fn startup_registration(cli: &CliArgs) -> StartupRegistration {
+    if is_read_only_invocation(cli) {
+        StartupRegistration::Reader
+    } else {
+        StartupRegistration::Writer
+    }
+}
+
+/// Commands that only read journals, seals and the catalogue.
+fn is_read_only_invocation(cli: &CliArgs) -> bool {
+    matches!(
+        cli.command.as_str(),
+        "--version"
+            | "-V"
+            | "help"
+            | "-h"
+            | "--help"
+            | "inspect"
+            | "saves"
+            | "emulators"
+            | "activity"
+            | "history"
+            | "config-check"
+            | "library-status"
+            | "database-check"
+    )
+}
+
 fn main() -> ExitCode {
+    use archivefs_core::dat::rename_apply::writer_gate;
+    // Registered before any journal work so a running Blue never mistakes
+    // this command-line tool for an older build. A read-only command never
+    // falls back to writing the data directory: without a private runtime
+    // registry it runs unregistered, and a concurrent EmuWiz then pauses
+    // organising, renaming and Undo (fails closed) until it ends.
+    let _sealed_writer = match startup_registration(&parse_cli_args(env::args().skip(1))) {
+        StartupRegistration::Reader => writer_gate::register_reader_at_startup()
+            .map_err(|error| {
+                REGISTRATION_NOTE.with(|note| *note.borrow_mut() = Some(error));
+            })
+            .ok(),
+        StartupRegistration::Writer => writer_gate::register_at_startup()
+            .map_err(|error| eprintln!("emuwiz-cli: {error}"))
+            .ok(),
+    };
+    if env::args().nth(1).as_deref() == Some("--r2-operator") {
+        return archivefs_cli::r2_operator::dispatch(&env::args().skip(2).collect::<Vec<_>>());
+    }
     match run() {
         Ok(()) => ExitCode::SUCCESS,
         Err(error) => {
-            eprintln!("archivefs: {error}");
+            eprintln!("emuwiz-cli: {error}");
             ExitCode::FAILURE
         }
     }
@@ -184,7 +265,7 @@ fn config_confirmed_missing(path: &std::path::Path) -> bool {
 ///
 /// Every command below `config-check` and `doctor` needs a config the same
 /// way they do, but until now only those two gave an actionable message -
-/// everything else surfaced the bare OS error (e.g. "archivefs:
+/// everything else surfaced the bare OS error (e.g. "emuwiz-cli:
 /// /home/user/.config/archivefs/config.toml: No such file or directory (os
 /// error 2)") with no indication of what to do next. This appends the same
 /// guidance those two already give, without changing the underlying error
@@ -220,10 +301,21 @@ fn explain_config_load_error(error: ArchiveFsError) -> Box<dyn std::error::Error
 fn run() -> Result<(), Box<dyn std::error::Error>> {
     let cli = parse_cli_args(env::args().skip(1));
     init_logging(cli.log_level);
+    if let Some(reason) = REGISTRATION_NOTE.with(|note| note.borrow_mut().take()) {
+        log::info!(
+            "running unregistered ({reason}): a concurrent EmuWiz pauses organising, renaming \
+             and Undo until this command ends"
+        );
+    }
     let command = cli.command;
     let mut args = cli.args.into_iter();
 
     match command.as_str() {
+        "emulators" | "activity" | "history" => read_only_status::run(&command, args.collect())?,
+        "inspect" => inspect::run(args.collect())?,
+        "discovery" => discovery::run(args)?,
+        "saves" => saves::run(args.collect())?,
+        "media-set" => media_set::run(args)?,
         "scan" => {
             let config = load_config()?;
             let scanner = ArchiveScanner::new(&config);
@@ -383,13 +475,27 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
         }
         "cheats" => {
             let mut input_args = args.collect::<Vec<_>>();
-            if input_args.first().map(String::as_str) != Some("source")
-                || input_args.get(1).map(String::as_str) != Some("bsfree")
-            {
-                return Err("cheats currently supports only `source bsfree <command>`".into());
+            if input_args.first().map(String::as_str) == Some("reconcile") {
+                input_args.remove(0);
+                cheat_reconcile::run(input_args)?;
+                return Ok(());
             }
+            if input_args.first().map(String::as_str) != Some("source") {
+                return Err(
+                    "cheats requires `source <bsfree|cheatbase> <command>` or `reconcile <entries.json>`"
+                        .into(),
+                );
+            }
+            let provider = input_args
+                .get(1)
+                .cloned()
+                .ok_or("cheats source requires a provider")?;
             input_args.drain(0..2);
-            bsfree::run(input_args)?;
+            match provider.as_str() {
+                "bsfree" => bsfree::run(input_args)?,
+                "cheatbase" => cheatbase::run(input_args)?,
+                _ => return Err(format!("unknown cheat source {provider:?}").into()),
+            }
         }
         "platform-artwork" => {
             platform_artwork::run(args.collect())?;
@@ -400,6 +506,15 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
         }
         "rom-organise" => {
             rom_organise::run(args.collect())?;
+        }
+        "mame-normalise" => {
+            mame_normalise::run(args.collect())?;
+        }
+        "mame" => {
+            mame_evidence::run(args.collect())?;
+        }
+        "repair" => {
+            repair::run(args.collect())?;
         }
         "pcsx2-patch-preview" => {
             let mut input_args = args.collect::<Vec<_>>();
@@ -1170,6 +1285,17 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
                 print_library_scan(&report);
             }
         }
+        "library-upgrade" => {
+            let input_args: Vec<String> = args.collect();
+            if let Some(unknown) = input_args.iter().find(|arg| *arg != "--confirm") {
+                return Err(format!("library-upgrade: unknown argument {unknown}").into());
+            }
+            let confirm = input_args.iter().any(|arg| arg == "--confirm");
+            print!(
+                "{}",
+                run_library_upgrade(&default_database_path()?, confirm)?
+            );
+        }
         "library-list" => {
             let input_args: Vec<String> = args.collect();
             let json = input_args.iter().any(|arg| arg == "--json");
@@ -1308,6 +1434,37 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
                 print!("{}", format_missing_removal(&result));
             }
         }
+        "library-forget-missing" => {
+            let mut input_args: Vec<String> = args.collect();
+            let json = extract_flag(&mut input_args, "--json");
+            let forget = extract_flag(&mut input_args, "--forget-confirmed");
+            let token = extract_named_string_flag(&mut input_args, "--plan")?;
+            let undo = extract_named_string_flag(&mut input_args, "--undo")?;
+            if !input_args.is_empty() {
+                return Err("library-forget-missing accepts only --json, --forget-confirmed --plan <token>, or --undo <receipt>".into());
+            }
+            let database_path = default_database_path()?;
+            if let Some(receipt) = undo {
+                let restored = run_library_forget_undo(&database_path, Path::new(&receipt))?;
+                println!(
+                    "EmuWiz Library Forget Missing\nRestored: {restored} catalogue entr{}.",
+                    if restored == 1 { "y" } else { "ies" }
+                );
+            } else {
+                let roots: Vec<PathBuf> = load_source_folder_configs_default()?
+                    .into_iter()
+                    .map(|s| s.path)
+                    .collect();
+                let output = run_library_forget_missing(
+                    &database_path,
+                    &roots,
+                    forget,
+                    token.as_deref(),
+                    json,
+                )?;
+                print!("{output}");
+            }
+        }
         "platform-alias-list" => {
             let json = args.any(|arg| arg == "--json");
             let database_path = default_database_path()?;
@@ -1327,6 +1484,25 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
                 println!("{}", serde_json::to_string_pretty(&saved)?);
             } else {
                 print_platform_alias_saved(&saved);
+            }
+        }
+        "platform-coverage" => {
+            let mut input_args: Vec<String> = args.collect();
+            let json = extract_flag(&mut input_args, "--json");
+            if !input_args.is_empty() {
+                return Err(format!("platform-coverage does not accept {input_args:?}").into());
+            }
+            let matrix = archivefs_core::format_coverage_matrix::static_matrix();
+            if json {
+                print!(
+                    "{}",
+                    archivefs_core::format_coverage_matrix::render_json(&matrix)
+                );
+            } else {
+                print!(
+                    "{}",
+                    archivefs_core::format_coverage_matrix::render_markdown(&matrix, None)
+                );
             }
         }
         "platform-detect" => {
@@ -2963,6 +3139,14 @@ fn path_finding_summary(
         ),
         ResolutionState::RuntimeDefaultUnknown => "runtime default unknown".to_string(),
         ResolutionState::NoReadableConfig => "no readable config".to_string(),
+        ResolutionState::EmuWizCoreDirectoryOverride => {
+            let path = finding
+                .resolved_path
+                .as_ref()
+                .map(|path| path.display.as_str())
+                .unwrap_or("(unusable)");
+            format!("EmuWiz core-directory override -> {path}")
+        }
     }
 }
 
@@ -3026,6 +3210,66 @@ fn print_index_warnings(freshness: &ArchiveIndexFreshness) {
 // They never touch mount or unmount behavior, and index-build/index-show/
 // index-find are unchanged and unaffected by any of this.
 // ---------------------------------------------------------------------
+
+/// `library-upgrade`: the explicit headless form of the app's protected
+/// "Scan and upgrade library" step. Without `confirm` it only reports; with
+/// it, [`archivefs_core::upgrade_library_database`] does all checks, the verified backup and
+/// the migration. It never scans and is never reached implicitly.
+fn run_library_upgrade(
+    database_path: &Path,
+    confirm: bool,
+) -> Result<String, Box<dyn std::error::Error>> {
+    let view = build_library_status_view(database_path);
+    let latest = view.latest_known_schema_version;
+    let current = match view.health.schema_version {
+        _ if !view.health.database_exists => {
+            return Err(format!(
+                "no library database at {}. Nothing was changed.",
+                database_path.display()
+            )
+            .into());
+        }
+        Some(version) => version,
+        None => {
+            return Err(format!(
+                "the library database at {} could not be read, so it was not upgraded. \
+                 Nothing was changed. Run: emuwiz-cli database-check",
+                database_path.display()
+            )
+            .into());
+        }
+    };
+    if current == latest {
+        return Ok(format!(
+            "The library database is already at schema {latest}. Nothing was changed.\n"
+        ));
+    }
+    if current > latest {
+        return Err(format!(
+            "the library database uses schema {current}, newer than this build supports \
+             (schema {latest}). Nothing was changed."
+        )
+        .into());
+    }
+    if !confirm {
+        return Ok(format!(
+            "Library database: {}\nSchema {current} would be upgraded to schema {latest}.\n\
+             A verified backup is taken first and kept. Nothing was changed.\n\
+             To upgrade, run: emuwiz-cli library-upgrade --confirm\n",
+            database_path.display()
+        ));
+    }
+    let report = archivefs_core::upgrade_library_database(database_path)?;
+    Ok(format!(
+        "Upgraded the library database from schema {} to schema {}.\n\
+         Backup kept at: {}\nBackup SHA-256: {}\n\
+         Run emuwiz-cli library-scan to refresh the catalogue.\n",
+        report.from_version,
+        report.to_version,
+        report.backup_path.display(),
+        report.backup_sha256
+    ))
+}
 
 /// Combined status view for `library-status`. Built from
 /// [`check_database_health`] plus, only when the schema is already
@@ -3215,9 +3459,13 @@ fn format_library_status(view: &LibraryStatusView) -> String {
                     view.latest_known_schema_version
                 ));
             } else {
+                // library-scan refuses an outdated database; only the
+                // protected upgrade (verified backup first) migrates it.
                 output.push_str(
-                    "\nThis database's schema is outdated. Run: emuwiz-cli library-scan \
-                     to upgrade it.\n",
+                    "\nThis database's schema is outdated and has not been changed. \
+                     Upgrade it with: emuwiz-cli library-upgrade --confirm, or in the \
+                     EmuWiz app: All Tools > Database status > \"Scan and upgrade \
+                     library\". Both take a verified backup first.\n",
                 );
             }
         }
@@ -3440,9 +3688,26 @@ fn format_library_scan(report: &LibraryScanReport) -> String {
 fn resolve_source_identifier(identifier: &str) -> Result<PathBuf, Box<dyn std::error::Error>> {
     let sources = load_source_folder_configs_default().map_err(|error| error.to_string())?;
     let database_path = default_database_path()?;
+    if !database_path.exists() {
+        return resolve_source_identifier_without_catalogue(identifier, &sources);
+    }
     let database = Database::open_read_only(&database_path)?;
     let records = database.list_source_folders()?;
     resolve_source_folder_identifier(identifier, &sources, &records)
+        .map_err(|error| error.to_string().into())
+}
+
+fn resolve_source_identifier_without_catalogue(
+    identifier: &str,
+    sources: &[archivefs_core::SourceFolderConfig],
+) -> Result<PathBuf, Box<dyn std::error::Error>> {
+    if identifier.parse::<i64>().is_ok() {
+        return Err(
+            "No EmuWiz catalogue exists yet. Initialize the library or run the normal library scan first."
+                .into(),
+        );
+    }
+    resolve_source_folder_identifier(identifier, sources, &[])
         .map_err(|error| error.to_string().into())
 }
 
@@ -3469,6 +3734,7 @@ fn format_source_folder_views(views: &[SourceFolderView]) -> String {
     }
     for view in views {
         output.push_str(&format!("{}\n", view.path.display()));
+        output.push_str(&format!("  Role:             {}\n", view.role.label()));
         output.push_str(&format!(
             "  Id:               {}\n",
             view.id
@@ -3564,6 +3830,16 @@ fn print_library_view_plan(view: &LibraryViewConfig, plan: &LibraryViewPlan) {
     if let Some(error) = &plan.unsafe_root_error {
         println!();
         println!("UNSAFE - Apply is refused: {error}");
+        return;
+    }
+    if let Some(error) = &plan.profile_error {
+        println!();
+        println!("UNSUPPORTED PROFILE - Apply is refused: {error}");
+        return;
+    }
+    if let Some(conflict) = &plan.fingerprint_conflict {
+        println!();
+        println!("REVIEW NEEDED - Apply is refused: {conflict}");
         return;
     }
     println!();
@@ -4506,10 +4782,11 @@ fn run_library_clear_platform_bulk(
     Ok(database.clear_manual_platform_for_archives(&target_ids)?)
 }
 
-/// Removes catalogue rows selected only by exact persisted id/path. All paths
-/// are resolved before the database transaction begins; the core API then
-/// validates that every deduplicated id exists and is currently missing before
-/// deleting anything. This never scans and never accesses an archive file.
+/// Removes catalogue rows selected only by exact persisted id/path. Paths are
+/// resolved inside the write transaction (never beforehand); the core API
+/// validates current source authority and freshly probes every selected path
+/// inside the write transaction. Historical Missing alone cannot authorise
+/// removal. This never writes to an archive file or performs a library scan.
 fn run_library_remove_missing(
     database_path: &Path,
     ids: &[i64],
@@ -4523,13 +4800,108 @@ fn run_library_remove_missing(
         .into());
     }
     let mut database = Database::open_or_create(database_path)?;
-    let target_ids = resolve_bulk_target_ids(&database, ids, paths)?;
-    Ok(database.remove_missing_archives(&target_ids)?)
+    // `--id` values keep their meaning (the id the user typed). `--path` values
+    // are NOT turned into ids here: SQLite reuses ids, so a path resolved before
+    // the write transaction could name a different record by the time it runs.
+    // The core resolves each path inside the transaction.
+    let targets: Vec<MissingCleanupTarget> = ids
+        .iter()
+        .copied()
+        .map(MissingCleanupTarget::by_id)
+        .chain(paths.iter().cloned().map(MissingCleanupTarget::by_path))
+        .collect();
+    Ok(database.remove_missing_archive_targets(&targets)?)
+}
+
+/// `library-forget-missing`: read-only preview by default. With `forget` it
+/// re-previews and applies only if the fresh plan matches the reviewed `token`.
+/// Catalogue rows only; never accesses an archive file.
+fn run_library_forget_missing(
+    database_path: &Path,
+    roots: &[PathBuf],
+    forget: bool,
+    token: Option<&str>,
+    json: bool,
+) -> Result<String, Box<dyn std::error::Error>> {
+    if !database_path.exists() {
+        return Err(format!(
+            "No library database found at {}. Run: emuwiz-cli library-scan",
+            database_path.display()
+        )
+        .into());
+    }
+    if forget {
+        let token = token.ok_or("--forget-confirmed requires --plan <token> from a preview")?;
+        let mut database = Database::open_or_create(database_path)?;
+        let plan = database.preview_forget_confirmed_missing(roots)?;
+        if plan.token() != token {
+            return Err(format!("{FORGET_PLAN_STALE}: the library changed since the preview; preview again; nothing was removed").into());
+        }
+        let result = database.apply_forget_confirmed_missing(&plan)?;
+        return Ok(match &result.receipt_path {
+            Some(receipt) => format!(
+                "EmuWiz Library Forget Missing\nForgotten: {} catalogue entr{}.\nNo archive files were deleted.\nUndo receipt: {}\n",
+                result.forgotten,
+                if result.forgotten == 1 { "y" } else { "ies" },
+                receipt.display()
+            ),
+            None => "EmuWiz Library Forget Missing\nNothing to forget.\n".to_string(),
+        });
+    }
+    if token.is_some() {
+        return Err("--plan only applies together with --forget-confirmed".into());
+    }
+    let database = Database::open_catalogue_health_read_only(database_path)?;
+    let plan = database.preview_forget_confirmed_missing(roots)?;
+    if json {
+        return Ok(serde_json::to_string_pretty(&serde_json::json!({
+            "counts": plan.counts,
+            "plan": plan.token(),
+            "entries": plan.entries,
+        }))? + "\n");
+    }
+    let c = &plan.counts;
+    let mut out = format!(
+        "EmuWiz Library Missing Entries (preview, nothing changed)\n{} confirmed missing (eligible)\n{} possibly moved\n{} source unavailable\n{} scan incomplete\n{} review required\n",
+        c.confirmed_missing,
+        c.possibly_moved,
+        c.source_unavailable,
+        c.scan_incomplete,
+        c.review_required
+    );
+    for e in plan
+        .entries
+        .iter()
+        .filter(|e| e.classification == MissingClassification::ConfirmedMissing)
+    {
+        out.push_str(&format!(
+            "  [{}] {} - {}\n",
+            e.archive_id,
+            e.absolute_path.display(),
+            e.reason
+        ));
+    }
+    if c.confirmed_missing > 0 {
+        out.push_str(&format!(
+            "To forget the {} confirmed entries (files are never deleted):\n  emuwiz-cli library-forget-missing --forget-confirmed --plan {}\n",
+            c.confirmed_missing,
+            plan.token()
+        ));
+    }
+    Ok(out)
+}
+
+fn run_library_forget_undo(
+    database_path: &Path,
+    receipt: &Path,
+) -> Result<usize, Box<dyn std::error::Error>> {
+    let mut database = Database::open_or_create(database_path)?;
+    Ok(database.undo_forget_missing(receipt)?)
 }
 
 fn format_missing_removal(result: &MissingArchiveRemovalResult) -> String {
     format!(
-        "EmuWiz Library Remove Missing\nRemoved: {} missing catalogue entr{}.\nNo archive files or mounted contents were deleted.\n",
+        "EmuWiz Library Remove Missing\nRemoved: {} missing catalogue entr{}.\nCurrent source authority and path absence were rechecked.\nNo archive files or mounted contents were deleted.\n",
         result.removed,
         if result.removed == 1 { "y" } else { "ies" }
     )
@@ -4801,11 +5173,68 @@ fn gather_doctor_scan() -> DoctorScan {
         },
         storage: Gathered::Ready(&storage),
         emulator_profiles: Gathered::Ready(&profile_report),
+        // Installation-form discovery walks bounded filesystem roots. The
+        // CLI Doctor scan remains diagnostics-only, so it reports this as
+        // not loaded rather than fabricating installation evidence or
+        // silently performing an additional discovery scan.
+        linux_emulator_installations: Gathered::NotLoaded(
+            "Linux emulator installation evidence has not been gathered in this CLI session.",
+        ),
+        azahar_cemu_readiness: Gathered::NotLoaded(
+            "Azahar and Cemu readiness has not been checked in this CLI session.",
+        ),
+        melonds_mgba_readiness: Gathered::NotLoaded(
+            "melonDS and mGBA readiness has not been checked in this CLI session.",
+        ),
+        desmume_mesen_readiness: Gathered::NotLoaded(
+            "DeSmuME and Mesen readiness has not been checked in this CLI session.",
+        ),
+        rmg_sameboy_readiness: Gathered::NotLoaded(
+            "RMG and SameBoy readiness has not been checked in this CLI session.",
+        ),
+        // Arcade emulator / DAT version compatibility is assembled from that
+        // installation evidence, so it is likewise not gathered by the
+        // diagnostics-only CLI Doctor scan.
+        arcade_dat_version: Gathered::NotLoaded(
+            "Arcade emulator / DAT version compatibility has not been assembled in this CLI session.",
+        ),
+        arcade_readiness: Gathered::NotLoaded(
+            "MAME and FBNeo launch readiness has not been checked in this CLI session.",
+        ),
+        scummvm_readiness: Gathered::NotLoaded(
+            "ScummVM readiness has not been checked in this CLI session.",
+        ),
+        dosbox_staging_readiness: Gathered::NotLoaded(
+            "DOSBox Staging readiness has not been checked in this CLI session.",
+        ),
+        // Emulator launch-readiness assessment walks discovered install
+        // directories, which is a scan. Doctor never starts one from the
+        // CLI (the same reason RetroArch discovery above is NotLoaded).
+        xemu_readiness: Gathered::NotLoaded(
+            "xemu launch readiness has not been checked in this session.",
+        ),
+        xenia_readiness: Gathered::NotLoaded(
+            "Xenia launch readiness has not been checked in this session.",
+        ),
+        ppsspp_readiness: Gathered::NotLoaded(
+            "PPSSPP launch readiness has not been checked in this session.",
+        ),
+        rpcs3_readiness: Gathered::NotLoaded(
+            "RPCS3 launch readiness has not been checked in this session.",
+        ),
+        remaining_profiles: Gathered::NotLoaded(
+            "Remaining emulator readiness has not been checked in this CLI session.",
+        ),
         managed_entries: match &managed {
             Gathered::Ready(scan) => Gathered::Ready(scan),
             Gathered::Failed(reason) => Gathered::Failed(reason.clone()),
             Gathered::NotLoaded(reason) => Gathered::NotLoaded(reason),
         },
+        // The verified-identity fact cache is not loaded by the CLI Doctor
+        // path yet; a later typed consumer will supply it.
+        verified_identity: Gathered::NotLoaded(
+            "the verified-identity fact cache has not been loaded in this CLI session.",
+        ),
         free_space_policy: FreeSpacePolicy::default(),
     };
     run_doctor_scan(&inputs)
@@ -5493,8 +5922,16 @@ fn print_help() {
     println!("  --debug        Show diagnostic logs");
     println!();
     println!("Commands:");
+    println!("{}", read_only_status::HELP);
+    println!("  media-set <inspect|explain|plan>  Read-only optical/floppy/tape topology (JSON)");
+    println!(
+        "  inspect <path>  Read-only view of what EmuWiz believes one file is, the evidence and provenance, launch topology readiness and why an operation would be blocked. Views: --identity --evidence --readiness --media --provenance (default: all); --json, --platform <name>, --root <dir>. Never opens the database or writes anything."
+    );
     println!("  scan           List supported archives from configured source folders");
     println!("  doctor         Check whether EmuWiz is ready to run");
+    println!(
+        "  platform-coverage  Print the generated platform × format coverage matrix: for every registered platform and every extension it claims, whether the Library scan stores it, how discovery categorises it, what the extension alone would be offered as, and the reviewed launch/evidence state of the platform. --json for tooling. Read-only; computed from the live registries, so it cannot be stale."
+    );
     println!(
         "  platform-detect <path>  Explain how platform detection sees one path: canonical platform, confidence (confirmed/probable/ambiguous/unknown), what decided it, and the full evidence with any conflicting candidates. --json for the complete structured evidence, --root <dir> to set the source-folder boundary, --assume-manual <platform> to see how an explicit assignment would override detection. Read-only: bounded header reads and one directory listing, nothing written."
     );
@@ -5510,6 +5947,9 @@ fn print_help() {
     println!("  config-check   Validate EmuWiz configuration");
     println!(
         "  cheats source bsfree <status|validate|download|import-local|enable|disable|remove|systems|devices|search|game|gamecube-preview|gamecube-apply|gamecube-rollback|wii-preview|wii-apply|wii-rollback>  Manage and browse the optional immutable BSFree Archive source. GameCube and (verified) Wii hex-pair codes are installable via the existing Dolphin adapter (gamecube/wii-preview/gamecube/wii-apply, --confirm to apply, rollback to restore); all other platforms and formats - including encrypted Wii codes - remain browse-only"
+    );
+    println!(
+        "  cheats source cheatbase <status|validate|download|import-local|enable|disable|remove|systems|devices|search|lookup-hash|lookup-serial|game>  Validate, import, search, and browse the pinned CheatBase catalogue. Nintendo DS Action Replay records are browse-only; no command installs or executes codes"
     );
     println!(
         "  platform-artwork <status|import|import-folder|rescan|remove|open-folder>  Manage local canonical platform artwork overrides; import-folder supports --dry-run and no command uses the network"
@@ -5643,6 +6083,9 @@ fn print_help() {
         "  health         Show catalogue archive health (missing, unknown platform) - no scan, mount, or unmount"
     );
     println!("  library-scan   Scan configured source folders into the library database");
+    println!(
+        "  library-upgrade [--confirm]  Upgrade an older library database to this version's schema. Without --confirm it only reports what would happen. With --confirm it takes and verifies a backup first, exactly like the app's \"Scan and upgrade library\"; it never scans"
+    );
     println!("  library-list   List archives from the library database (no rescan)");
     println!("  library-find   Search the library database by path or platform");
     println!(
@@ -5656,7 +6099,10 @@ fn print_help() {
         "  library-clear-platform-bulk Clear manual platform assignments from several archives at once"
     );
     println!(
-        "  library-remove-missing Remove missing catalogue entries by exact id/path (never deletes files)"
+        "  library-remove-missing Recheck source/path freshness, then remove eligible missing records (never deletes files)"
+    );
+    println!(
+        "  library-forget-missing Preview (default) or forget confirmed-missing catalogue entries (never deletes files)"
     );
     println!("  platform-alias-list    List persistent custom folder-name platform aliases");
     println!(
@@ -5829,6 +6275,23 @@ mod tests {
             explained.contains("emuwiz-cli config-check"),
             "expected the hint to point at config-check, got: {explained}"
         );
+    }
+
+    #[test]
+    fn source_scan_before_catalogue_initialization_resolves_path_or_explains_id() {
+        let sources = [archivefs_core::SourceFolderConfig {
+            path: PathBuf::from("/data/roms"),
+            enabled: true,
+            created_at: None,
+        }];
+
+        assert_eq!(
+            resolve_source_identifier_without_catalogue("/data/roms", &sources).unwrap(),
+            PathBuf::from("/data/roms")
+        );
+        let error = resolve_source_identifier_without_catalogue("7", &sources).unwrap_err();
+        assert!(error.to_string().contains("No EmuWiz catalogue exists yet"));
+        assert!(error.to_string().contains("library scan first"));
     }
 
     /// A dangling symlink at the config path is a real misconfiguration
@@ -6242,6 +6705,11 @@ mod tests {
                         display_version: None,
                         system_name: Some("Super Nintendo Entertainment System".to_string()),
                         supported_extensions: vec!["zip".to_string(), "sfc".to_string()],
+                        core_name: None,
+                        manufacturer: None,
+                        categories: None,
+                        database: None,
+                        firmware: Vec::new(),
                     },
                 },
             ],
@@ -6838,6 +7306,50 @@ mod tests {
     }
 
     #[test]
+    fn only_read_only_commands_register_as_readers() {
+        let invocation = |args: &[&str]| {
+            is_read_only_invocation(&parse_cli_args(args.iter().map(|arg| arg.to_string())))
+        };
+        for read_only in [
+            &["--version"][..],
+            &["-v", "--version"],
+            &[],
+            &["help"],
+            &["inspect", "/x"],
+            &["saves", "list"],
+            &["history", "--json"],
+            &["emulators"],
+            &["activity", "--json"],
+            &["database-check"],
+            &["library-status"],
+            &["config-check"],
+        ] {
+            assert!(invocation(read_only), "{read_only:?}");
+        }
+        let registration = |args: &[&str]| {
+            startup_registration(&parse_cli_args(args.iter().map(|arg| arg.to_string())))
+        };
+        assert_eq!(registration(&["--version"]), StartupRegistration::Reader);
+        assert_eq!(registration(&[]), StartupRegistration::Reader);
+        assert_eq!(registration(&["history"]), StartupRegistration::Reader);
+        assert_eq!(
+            registration(&["repair", "apply"]),
+            StartupRegistration::Writer
+        );
+        for writer in [
+            &["repair", "apply"][..],
+            &["repair", "rollback"],
+            &["library-scan"],
+            &["library-upgrade", "--confirm"],
+            &["organise"],
+            &["--r2-operator"],
+            &["unknown-command"],
+        ] {
+            assert!(!invocation(writer), "{writer:?}");
+        }
+    }
+
+    #[test]
     fn parse_cli_args_defaults_to_quiet_help() {
         let args = parse_cli_args(Vec::<String>::new());
 
@@ -7042,6 +7554,23 @@ mod tests {
         dir
     }
 
+    #[test]
+    fn forget_missing_defaults_to_read_only_and_apply_needs_the_reviewed_plan() {
+        let root = temp_dir("cli-forget-missing");
+        let database_path = root.join("library.sqlite3");
+        Database::open_or_create(&database_path).unwrap();
+        let before = std::fs::read(&database_path).unwrap();
+        let out = run_library_forget_missing(&database_path, &[], false, None, false).unwrap();
+        assert!(out.contains("nothing changed"), "{out}");
+        assert_eq!(std::fs::read(&database_path).unwrap(), before);
+        assert!(run_library_forget_missing(&database_path, &[], true, None, false).is_err());
+        let err = run_library_forget_missing(&database_path, &[], true, Some("bogus"), false)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("STALE PLAN"), "{err}");
+        assert!(run_library_forget_missing(&database_path, &[], false, Some("x"), false).is_err());
+    }
+
     fn write_archive_file(dir: &Path, relative_path: &str, content: &[u8]) -> PathBuf {
         let full_path = dir.join(relative_path);
         if let Some(parent) = full_path.parent() {
@@ -7145,6 +7674,91 @@ mod tests {
         let output = format_library_status(&view);
         assert!(output.contains("Exists: no"));
         assert!(output.contains("No library database yet. Run: emuwiz-cli library-scan"));
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn library_status_on_a_published_v0_9_0_database_names_the_upgrade_that_works() {
+        let root = temp_dir("status-v0-9-0");
+        let database_path = root.join("library.sqlite3");
+        rusqlite::Connection::open(&database_path)
+            .unwrap()
+            .execute_batch(include_str!(
+                "../../archivefs-core/tests/fixtures/published_v0_9_0/library.sql"
+            ))
+            .unwrap();
+        let before = std::fs::read(&database_path).unwrap();
+
+        let output = format_library_status(&build_library_status_view(&database_path));
+        assert!(output.contains("Schema version: 16"), "{output}");
+        assert!(output.contains("Scan and upgrade library"), "{output}");
+        assert!(
+            output.contains("emuwiz-cli library-upgrade --confirm"),
+            "{output}"
+        );
+        // library-scan refuses an outdated database, so it must not be advised.
+        assert!(!output.contains("library-scan"), "{output}");
+        let config = config_for(&root.join("source"), &root.join("mount"));
+        let scan = run_library_scan(&config, &database_path, "test");
+        assert!(
+            scan.is_err(),
+            "library-scan must not migrate an outdated database"
+        );
+        assert_eq!(std::fs::read(&database_path).unwrap(), before);
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn library_upgrade_previews_without_writing_and_migrates_a_published_v0_9_0_database_only_when_confirmed()
+     {
+        let root = temp_dir("upgrade-v0-9-0");
+        let database_path = root.join("library.sqlite3");
+        rusqlite::Connection::open(&database_path)
+            .unwrap()
+            .execute_batch(include_str!(
+                "../../archivefs-core/tests/fixtures/published_v0_9_0/library.sql"
+            ))
+            .unwrap();
+        let original = std::fs::read(&database_path).unwrap();
+        let names = |root: &Path| -> Vec<String> {
+            let mut names: Vec<String> = std::fs::read_dir(root)
+                .unwrap()
+                .map(|entry| entry.unwrap().file_name().to_string_lossy().into_owned())
+                .collect();
+            names.sort();
+            names
+        };
+        let before = names(&root);
+
+        let preview = run_library_upgrade(&database_path, false).unwrap();
+        assert!(preview.contains("Schema 16 would be upgraded"), "{preview}");
+        assert!(preview.contains("Nothing was changed"), "{preview}");
+        assert_eq!(std::fs::read(&database_path).unwrap(), original);
+        assert_eq!(names(&root), before, "a preview created a file");
+
+        let done = run_library_upgrade(&database_path, true).unwrap();
+        let latest = latest_schema_version();
+        assert!(
+            done.contains(&format!("from schema 16 to schema {latest}")),
+            "{done}"
+        );
+        let view = build_library_status_view(&database_path);
+        assert_eq!(view.health.schema_version, Some(latest));
+        assert_eq!(view.stats.as_ref().unwrap().total_archives, 5);
+        let backup = root.join(format!("library.sqlite3.schema-16-before-{latest}.backup"));
+        assert!(backup.is_file(), "{done}");
+        assert!(done.contains(&backup.display().to_string()), "{done}");
+
+        let migrated = std::fs::read(&database_path).unwrap();
+        let again = run_library_upgrade(&database_path, true).unwrap();
+        assert!(again.contains("already at schema"), "{again}");
+        assert_eq!(std::fs::read(&database_path).unwrap(), migrated);
+
+        let missing = run_library_upgrade(&root.join("absent.sqlite3"), true);
+        assert!(missing.is_err());
+        assert!(!root.join("absent.sqlite3").exists());
 
         let _ = std::fs::remove_dir_all(&root);
     }
@@ -9119,7 +9733,7 @@ mod tests {
     }
 
     #[test]
-    fn library_remove_missing_never_scans_or_alters_an_archive_file() {
+    fn library_remove_missing_refuses_returned_files_without_scanning_or_altering_them() {
         let root = temp_dir("cli-remove-missing-no-filesystem");
         let source = root.join("source");
         let mount = root.join("mount");
@@ -9139,10 +9753,15 @@ mod tests {
             .scan_run_id;
         database.close().unwrap();
 
-        run_library_remove_missing(&database_path, &[id], &[]).unwrap();
+        let error = run_library_remove_missing(&database_path, &[id], &[]).unwrap_err();
+        assert!(error.to_string().contains("present"));
 
         assert_eq!(std::fs::read(&archive_path).unwrap(), b"reappeared");
+        std::fs::rename(&source, root.join("offline")).unwrap();
+        let error = run_library_remove_missing(&database_path, &[id], &[]).unwrap_err();
+        assert!(error.to_string().contains("unavailable"));
         let database = Database::open_or_create(&database_path).unwrap();
+        assert_eq!(database.load_archives().unwrap()[0].id, id);
         assert_eq!(
             database
                 .latest_completed_scan()
@@ -9150,6 +9769,67 @@ mod tests {
                 .unwrap()
                 .scan_run_id,
             scan_id_before
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn library_remove_missing_paths_are_bound_inside_the_transaction_and_survive_id_reuse() {
+        let root = temp_dir("cli-remove-missing-id-reuse");
+        let source = root.join("source");
+        let mount = root.join("mount");
+        let database_path = root.join("library.sqlite3");
+        write_archive_file(&source, "a-keep.zip", b"kept");
+        let gone = write_archive_file(&source, "z-gone.zip", b"gone");
+        let config = config_for(&source, &mount);
+        run_library_scan(&config, &database_path, "initial").unwrap();
+        let entries = build_library_entries(&database_path, false).unwrap();
+        let gone_id = entries.iter().find(|e| e.path == gone).unwrap().id;
+        std::fs::remove_file(&gone).unwrap();
+        run_library_scan(&config, &database_path, "missing").unwrap();
+        // The explicit-id form keeps working exactly as before.
+        assert_eq!(
+            run_library_remove_missing(&database_path, &[gone_id], &[])
+                .unwrap()
+                .removed,
+            1
+        );
+        // A different archive is catalogued under the REUSED id and goes missing.
+        let different = write_archive_file(&source, "different.zip", b"another");
+        run_library_scan(&config, &database_path, "new").unwrap();
+        std::fs::remove_file(&different).unwrap();
+        run_library_scan(&config, &database_path, "gone-again").unwrap();
+        let database = Database::open_or_create(&database_path).unwrap();
+        let reused = database
+            .load_archives()
+            .unwrap()
+            .into_iter()
+            .find(|a| a.absolute_path == different)
+            .unwrap();
+        assert_eq!(reused.id, gone_id, "SQLite must have reused the id");
+        let before = database.load_archives().unwrap();
+        database.close().unwrap();
+
+        // The user selected gone.zip by path: that record no longer exists, so
+        // the selection must be refused rather than re-pointed at different.zip.
+        let error = run_library_remove_missing(&database_path, &[], std::slice::from_ref(&gone))
+            .unwrap_err();
+        assert!(error.to_string().contains("no catalogue record"), "{error}");
+        // A mixed id + path selection fails atomically too.
+        let error = run_library_remove_missing(
+            &database_path,
+            &[reused.id],
+            &[source.join("a-keep.zip"), gone],
+        );
+        assert!(error.is_err());
+        let database = Database::open_or_create(&database_path).unwrap();
+        assert_eq!(database.load_archives().unwrap(), before);
+        assert!(
+            database
+                .load_archives()
+                .unwrap()
+                .iter()
+                .any(|a| a.absolute_path == different && a.id == gone_id)
         );
         let _ = std::fs::remove_dir_all(&root);
     }
@@ -10152,4 +10832,20 @@ struct DiskFormatAuditAccumulator {
     refused: usize,
     refusal_counts: std::collections::BTreeMap<String, usize>,
     bytes_inspected: u64,
+}
+
+#[cfg(test)]
+mod test_environment_isolation {
+    #[test]
+    fn cli_unit_tests_run_in_the_private_test_environment() {
+        let Some(root) = archivefs_core::test_environment::isolated_root() else {
+            assert_eq!(
+                std::env::var("EMUWIZ_TEST_REAL_ENVIRONMENT").as_deref(),
+                Ok("1")
+            );
+            return;
+        };
+        let home = std::path::PathBuf::from(std::env::var_os("HOME").unwrap());
+        assert!(home.starts_with(root), "{home:?} escapes {root:?}");
+    }
 }

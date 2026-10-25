@@ -10,19 +10,37 @@
 //! * Multi-line:  `game (\n\tname "Game Name"\n\t...\n)`
 //!
 //! The same two styles apply to ROM blocks.
+//!
+//! Stage 2a preserves game and ROM key/value fields this line parser can
+//! observe safely. Nested `disk (...)`, `sample (...)`, `biosset (...)`,
+//! `device_ref (...)`, `part (...)`, `dataarea (...)`, and `diskarea (...)`
+//! blocks remain intentionally unparsed: the current single-block state
+//! machine cannot represent them without restructuring. Consequently every
+//! emitted game keeps `unsupported_structure = true` and set classification remains
+//! fail-closed for all ClrMamePro inputs.
 
-use std::fs;
+use std::fs::File;
+use std::io::{BufRead, BufReader};
 use std::path::Path;
 
 use super::super::classification::{DatContentClassification, DatOriginalMetadata};
 use super::super::hash::{normalise_crc32, normalise_md5, normalise_sha1, normalise_sha256};
 use super::super::limits::DatLimits;
 use super::super::model::{
-    DatEcosystem, DatFormat, DatGameEntry, DatRomEntry, DatSource, ParsedDat,
+    DatEcosystem, DatFormat, DatGameEntry, DatPackingPolicy, DatRomEntry, DatSource, ParsedDat,
 };
 use super::super::parser::{DiagnosticSeverity, ParseError, ParseOutcome, ParseWarning};
+use encoding_rs::WINDOWS_1252;
 
 pub fn parse_clrmamepro(path: &Path, limits: DatLimits) -> Result<ParseOutcome, ParseError> {
+    parse_clrmamepro_with_sink(path, limits, super::EntrySink::collect())
+}
+
+pub(super) fn parse_clrmamepro_with_sink(
+    path: &Path,
+    limits: DatLimits,
+    mut games: super::EntrySink<'_>,
+) -> Result<ParseOutcome, ParseError> {
     let metadata = std::fs::metadata(path).map_err(|error| ParseError::Io {
         path: path.to_path_buf(),
         error,
@@ -36,35 +54,22 @@ pub fn parse_clrmamepro(path: &Path, limits: DatLimits) -> Result<ParseOutcome, 
         });
     }
 
-    let content = fs::read_to_string(path).map_err(|error| ParseError::Io {
+    let file = File::open(path).map_err(|error| ParseError::Io {
         path: path.to_path_buf(),
         error,
     })?;
-
-    let lines: Vec<&str> = content.lines().collect();
+    // ClrMamePro DATs are line-oriented legacy catalogue files. Read one line
+    // at a time so input size does not create a second whole-file allocation
+    // before the typed catalogue model is built. Real-world preservation
+    // catalogues sometimes retain Windows-1252 titles; decode each line with
+    // the same deterministic fallback used by the former whole-file path.
+    let mut reader = BufReader::with_capacity(64 * 1024, file);
 
     let mut warnings: Vec<ParseWarning> = Vec::new();
-    let push_warning = |warnings: &mut Vec<ParseWarning>, offset: usize, msg: &str| {
-        if warnings.len() < limits.max_warnings {
-            let line_num = lines
-                .iter()
-                .enumerate()
-                .rfind(|(_, l)| {
-                    let line_start = l.as_ptr() as usize - content.as_ptr() as usize;
-                    line_start <= offset
-                })
-                .map(|(i, _)| i + 1);
-            warnings.push(ParseWarning {
-                byte_offset: Some(offset),
-                line: line_num,
-                column: None,
-                context: String::new(),
-                message: msg.to_string(),
-                severity: DiagnosticSeverity::Warning,
-                code: "description_truncated",
-            });
-        }
-    };
+    let mut raw_line = Vec::new();
+    let mut byte_offset = 0usize;
+    let mut line_number = 0usize;
+    let mut legacy_warning_recorded = false;
 
     let mut name: Option<String> = None;
     let mut description: Option<String> = None;
@@ -72,13 +77,13 @@ pub fn parse_clrmamepro(path: &Path, limits: DatLimits) -> Result<ParseOutcome, 
     let mut author: Option<String> = None;
     let mut clrmamepro_header: Vec<String> = Vec::new();
 
-    let mut games: Vec<DatGameEntry> = Vec::new();
     let mut in_clrmamepro = false;
     let mut in_game = false;
     let mut in_rom = false;
     let mut current_game_name: Option<String> = None;
     let mut current_game_desc: Option<String> = None;
     let mut current_game_clone_of: Option<String> = None;
+    let mut current_game_fidelity = CurrentGameFidelity::default();
     let mut current_rom_name: Option<String> = None;
     let mut current_rom_size: Option<u64> = None;
     let mut current_rom_crc: Option<String> = None;
@@ -88,15 +93,59 @@ pub fn parse_clrmamepro(path: &Path, limits: DatLimits) -> Result<ParseOutcome, 
     let mut current_rom_status: Option<String> = None;
     let mut current_rom_merge: Option<String> = None;
     let mut current_rom_date: Option<String> = None;
+    let mut current_rom_loadflag: Option<String> = None;
+    let mut current_rom_fidelity = CurrentRomFidelity::default();
     let mut current_roms: Vec<DatRomEntry> = Vec::new();
 
-    for line in &lines {
+    loop {
+        raw_line.clear();
+        let read = read_bounded_line(
+            &mut reader,
+            &mut raw_line,
+            limits
+                .max_identifier_length
+                .saturating_add(limits.max_description_length)
+                .saturating_add(16 * 1024),
+            path,
+        )?;
+        if read == 0 {
+            break;
+        }
+        line_number += 1;
+        let line_offset = byte_offset;
+        byte_offset = byte_offset.saturating_add(read);
+        while raw_line
+            .last()
+            .is_some_and(|byte| *byte == b'\n' || *byte == b'\r')
+        {
+            raw_line.pop();
+        }
+        let (line, decoded_windows_1252) = match String::from_utf8(raw_line.clone()) {
+            Ok(line) => (line, false),
+            Err(error) => {
+                let bytes = error.into_bytes();
+                let (decoded, _, _) = WINDOWS_1252.decode(&bytes);
+                (decoded.into_owned(), true)
+            }
+        };
+        if decoded_windows_1252 && !legacy_warning_recorded {
+            if warnings.len() < limits.max_warnings {
+                warnings.push(ParseWarning {
+                    byte_offset: Some(line_offset),
+                    line: Some(line_number),
+                    column: None,
+                    context: String::new(),
+                    message: "decoded non-UTF-8 ClrMamePro text as Windows-1252".to_string(),
+                    severity: DiagnosticSeverity::Warning,
+                    code: "legacy_windows_1252",
+                });
+            }
+            legacy_warning_recorded = true;
+        }
         let trimmed_line = line.trim();
         if trimmed_line.is_empty() {
             continue;
         }
-
-        let offset = line.as_ptr() as usize - content.as_ptr() as usize;
 
         if trimmed_line == "clrmamepro (" {
             in_clrmamepro = true;
@@ -115,9 +164,9 @@ pub fn parse_clrmamepro(path: &Path, limits: DatLimits) -> Result<ParseOutcome, 
                 &mut version,
                 &mut author,
                 &limits,
-                offset,
+                line_offset,
+                line_number,
                 &mut warnings,
-                &push_warning,
             );
             continue;
         }
@@ -138,6 +187,8 @@ pub fn parse_clrmamepro(path: &Path, limits: DatLimits) -> Result<ParseOutcome, 
                 &mut current_rom_status,
                 &mut current_rom_merge,
                 &mut current_rom_date,
+                &mut current_rom_loadflag,
+                &mut current_rom_fidelity,
                 &mut current_roms,
                 &mut in_rom,
             );
@@ -145,6 +196,7 @@ pub fn parse_clrmamepro(path: &Path, limits: DatLimits) -> Result<ParseOutcome, 
                 &mut current_game_name,
                 &mut current_game_desc,
                 &mut current_game_clone_of,
+                &mut current_game_fidelity,
                 &mut current_roms,
                 &mut games,
                 &limits,
@@ -165,13 +217,11 @@ pub fn parse_clrmamepro(path: &Path, limits: DatLimits) -> Result<ParseOutcome, 
                     "description" => {
                         current_game_desc = Some(v.to_string());
                     }
-                    // `cloneof` / `romof` both declare a parent relationship;
-                    // `romof` names the parent's ROM set, so either is a parent
-                    // reference for the clone policy. `cloneof` wins when both
-                    // are present.
-                    "cloneof" | "romof" => {
-                        capture_parent(&mut current_game_clone_of, k, v);
-                    }
+                    "cloneof" => current_game_clone_of = Some(v.to_string()),
+                    "romof" => current_game_fidelity.rom_of = Some(v.to_string()),
+                    "sampleof" => current_game_fidelity.sample_of = Some(v.to_string()),
+                    "isbios" => current_game_fidelity.is_bios = Some(v.to_string()),
+                    "runnable" => current_game_fidelity.runnable = Some(v.to_string()),
                     _ => {}
                 });
             }
@@ -181,6 +231,7 @@ pub fn parse_clrmamepro(path: &Path, limits: DatLimits) -> Result<ParseOutcome, 
                     &mut current_game_name,
                     &mut current_game_desc,
                     &mut current_game_clone_of,
+                    &mut current_game_fidelity,
                     &mut current_roms,
                     &mut games,
                     &limits,
@@ -206,6 +257,8 @@ pub fn parse_clrmamepro(path: &Path, limits: DatLimits) -> Result<ParseOutcome, 
                     &mut current_rom_status,
                     &mut current_rom_merge,
                     &mut current_rom_date,
+                    &mut current_rom_loadflag,
+                    &mut current_rom_fidelity,
                     &mut current_roms,
                     &mut in_rom,
                 );
@@ -215,6 +268,7 @@ pub fn parse_clrmamepro(path: &Path, limits: DatLimits) -> Result<ParseOutcome, 
                     &mut current_game_name,
                     &mut current_game_desc,
                     &mut current_game_clone_of,
+                    &mut current_game_fidelity,
                     &mut current_roms,
                     &mut games,
                     &limits,
@@ -239,6 +293,8 @@ pub fn parse_clrmamepro(path: &Path, limits: DatLimits) -> Result<ParseOutcome, 
                 &mut current_rom_status,
                 &mut current_rom_merge,
                 &mut current_rom_date,
+                &mut current_rom_loadflag,
+                &mut current_rom_fidelity,
                 &mut current_roms,
                 &mut in_rom,
             );
@@ -277,6 +333,8 @@ pub fn parse_clrmamepro(path: &Path, limits: DatLimits) -> Result<ParseOutcome, 
                         &mut current_rom_status,
                         &mut current_rom_merge,
                         &mut current_rom_date,
+                        &mut current_rom_loadflag,
+                        &mut current_rom_fidelity,
                     );
                 });
             }
@@ -294,6 +352,8 @@ pub fn parse_clrmamepro(path: &Path, limits: DatLimits) -> Result<ParseOutcome, 
                     &mut current_rom_status,
                     &mut current_rom_merge,
                     &mut current_rom_date,
+                    &mut current_rom_loadflag,
+                    &mut current_rom_fidelity,
                     &mut current_roms,
                     &mut in_rom,
                 );
@@ -314,6 +374,8 @@ pub fn parse_clrmamepro(path: &Path, limits: DatLimits) -> Result<ParseOutcome, 
                     &mut current_rom_status,
                     &mut current_rom_merge,
                     &mut current_rom_date,
+                    &mut current_rom_loadflag,
+                    &mut current_rom_fidelity,
                 );
             });
         } else if in_game {
@@ -324,8 +386,16 @@ pub fn parse_clrmamepro(path: &Path, limits: DatLimits) -> Result<ParseOutcome, 
                         current_game_name = Some(v.to_string());
                     } else if k == "description" {
                         current_game_desc = Some(v.to_string());
-                    } else if k == "cloneof" || k == "romof" {
-                        capture_parent(&mut current_game_clone_of, k, v);
+                    } else if k == "cloneof" {
+                        current_game_clone_of = Some(v.to_string());
+                    } else if k == "romof" {
+                        current_game_fidelity.rom_of = Some(v.to_string());
+                    } else if k == "sampleof" {
+                        current_game_fidelity.sample_of = Some(v.to_string());
+                    } else if k == "isbios" {
+                        current_game_fidelity.is_bios = Some(v.to_string());
+                    } else if k == "runnable" {
+                        current_game_fidelity.runnable = Some(v.to_string());
                     }
                 });
                 in_game = false;
@@ -335,12 +405,27 @@ pub fn parse_clrmamepro(path: &Path, limits: DatLimits) -> Result<ParseOutcome, 
                         current_game_name = Some(v.to_string());
                     } else if k == "description" {
                         current_game_desc = Some(v.to_string());
-                    } else if k == "cloneof" || k == "romof" {
-                        capture_parent(&mut current_game_clone_of, k, v);
+                    } else if k == "cloneof" {
+                        current_game_clone_of = Some(v.to_string());
+                    } else if k == "romof" {
+                        current_game_fidelity.rom_of = Some(v.to_string());
+                    } else if k == "sampleof" {
+                        current_game_fidelity.sample_of = Some(v.to_string());
+                    } else if k == "isbios" {
+                        current_game_fidelity.is_bios = Some(v.to_string());
+                    } else if k == "runnable" {
+                        current_game_fidelity.runnable = Some(v.to_string());
                     }
                 });
             }
         }
+    }
+
+    if in_game || in_rom {
+        return Err(ParseError::MalformedXml {
+            detail: "unterminated ClrMamePro game or ROM block".into(),
+            byte_offset: Some(byte_offset),
+        });
     }
 
     emit_rom_flush(
@@ -353,6 +438,8 @@ pub fn parse_clrmamepro(path: &Path, limits: DatLimits) -> Result<ParseOutcome, 
         &mut current_rom_status,
         &mut current_rom_merge,
         &mut current_rom_date,
+        &mut current_rom_loadflag,
+        &mut current_rom_fidelity,
         &mut current_roms,
         &mut in_rom,
     );
@@ -360,12 +447,14 @@ pub fn parse_clrmamepro(path: &Path, limits: DatLimits) -> Result<ParseOutcome, 
         &mut current_game_name,
         &mut current_game_desc,
         &mut current_game_clone_of,
+        &mut current_game_fidelity,
         &mut current_roms,
         &mut games,
         &limits,
     )?;
 
-    let ecosystem = detect_clrmamepro_ecosystem(&name, &description, &clrmamepro_header);
+    let ecosystem =
+        detect_clrmamepro_ecosystem(&name, &description, &version, &author, &clrmamepro_header);
 
     let source = DatSource {
         format: DatFormat::ClrMamePro,
@@ -382,25 +471,51 @@ pub fn parse_clrmamepro(path: &Path, limits: DatLimits) -> Result<ParseOutcome, 
             Some(clrmamepro_header.join("\n"))
         },
         entry_count: games.len(),
-        rom_count: games.iter().map(|g| g.roms.len()).sum(),
+        rom_count: games.rom_count(),
         parse_warnings: warnings.iter().map(|w| w.to_string()).collect(),
+        packing_policy: DatPackingPolicy::Standard,
     };
 
     Ok(ParseOutcome {
-        dat: ParsedDat { source, games },
+        dat: ParsedDat {
+            source,
+            games: games.into_games(),
+        },
         warnings,
     })
 }
 
-/// Records a parent reference, with `cloneof` taking precedence over `romof`.
-///
-/// Both keys declare a parent relationship (a `romof` names the parent's ROM
-/// set), so either is a parent reference for the clone policy; `cloneof` wins
-/// when both are present on one game.
-fn capture_parent(clone_of: &mut Option<String>, key: &str, value: &str) {
-    if key == "cloneof" || clone_of.is_none() {
-        *clone_of = Some(value.to_string());
+fn read_bounded_line(
+    reader: &mut BufReader<File>,
+    line: &mut Vec<u8>,
+    limit: usize,
+    path: &Path,
+) -> Result<usize, ParseError> {
+    let mut total = 0usize;
+    loop {
+        let chunk = reader.fill_buf().map_err(|error| ParseError::Io {
+            path: path.to_path_buf(),
+            error,
+        })?;
+        if chunk.is_empty() {
+            break;
+        }
+        let newline = chunk.iter().position(|byte| *byte == b'\n');
+        let take = newline.map_or(chunk.len(), |index| index + 1);
+        if line.len().saturating_add(take) > limit {
+            return Err(ParseError::DescriptionTooLong {
+                length: line.len().saturating_add(take),
+                limit,
+            });
+        }
+        line.extend_from_slice(&chunk[..take]);
+        reader.consume(take);
+        total = total.saturating_add(take);
+        if newline.is_some() {
+            break;
+        }
     }
+    Ok(total)
 }
 
 /// Extract the content inside `prefix(...)`, stripping the closing `)` if present.
@@ -498,6 +613,8 @@ fn apply_rom_kv(
     status: &mut Option<String>,
     merge: &mut Option<String>,
     date: &mut Option<String>,
+    loadflag: &mut Option<String>,
+    fidelity: &mut CurrentRomFidelity,
 ) {
     match key {
         "name" => {
@@ -539,6 +656,15 @@ fn apply_rom_kv(
         "date" => {
             *date = Some(value.to_string());
         }
+        "offset" => fidelity.offset = Some(value.to_string()),
+        // Raw passthrough only, never interpreted - see `DatRomEntry::loadflag`.
+        "loadflag" => {
+            *loadflag = Some(value.to_string());
+        }
+        "value" => fidelity.value = Some(value.to_string()),
+        "optional" => fidelity.optional = Some(value.to_string()),
+        "bios" => fidelity.bios = Some(value.to_string()),
+        "region" => fidelity.region = Some(value.to_string()),
         _ => {}
     }
 }
@@ -554,12 +680,15 @@ fn emit_rom_flush(
     status: &mut Option<String>,
     merge: &mut Option<String>,
     date: &mut Option<String>,
+    loadflag: &mut Option<String>,
+    fidelity: &mut CurrentRomFidelity,
     roms: &mut Vec<DatRomEntry>,
     in_rom: &mut bool,
 ) {
     if !*in_rom {
         return;
     }
+    let fidelity = std::mem::take(fidelity);
     if let Some(rom_name) = name.take() {
         roms.push(DatRomEntry {
             name: rom_name,
@@ -571,6 +700,12 @@ fn emit_rom_flush(
             status: status.take(),
             merge: merge.take(),
             date: date.take(),
+            offset: fidelity.offset,
+            loadflag: loadflag.take(),
+            value: fidelity.value,
+            optional: fidelity.optional,
+            bios: fidelity.bios,
+            region: fidelity.region,
         });
     }
     *in_rom = false;
@@ -580,10 +715,12 @@ fn emit_game(
     name: &mut Option<String>,
     desc: &mut Option<String>,
     clone_of: &mut Option<String>,
+    fidelity: &mut CurrentGameFidelity,
     roms: &mut Vec<DatRomEntry>,
-    games: &mut Vec<DatGameEntry>,
+    games: &mut super::EntrySink<'_>,
     limits: &DatLimits,
 ) -> Result<(), ParseError> {
+    let fidelity = std::mem::take(fidelity);
     if let Some(game_name) = name.take() {
         if games.len() >= limits.max_entries {
             return Err(ParseError::EntryLimitExceeded {
@@ -592,11 +729,30 @@ fn emit_game(
             });
         }
         games.push(DatGameEntry {
+            mame_listxml_schema_version: None,
             name: game_name,
+            // ClrMamePro has no `id`/`cloneofid` concept in the subset this
+            // parser understands.
+            id: None,
             description: desc.take(),
-            roms: std::mem::take(roms),
+            roms: take_exact(roms),
             clone_of: clone_of.take(),
-            sample_of: None,
+            rom_of: fidelity.rom_of,
+            sample_of: fidelity.sample_of,
+            is_bios: fidelity.is_bios,
+            // ClrMamePro has no device concept at all. Every ClrMamePro game
+            // already carries `unsupported_structure = true`, so no dependency
+            // resolution reaches a confident verdict through one regardless.
+            is_device: None,
+            runnable: fidelity.runnable,
+            // ClrMamePro has no safely equivalent software-list `supported`
+            // field in the subset this parser understands.
+            supported: None,
+            disks: Vec::new(),
+            device_refs: Vec::new(),
+            samples: Vec::new(),
+            bios_sets: Vec::new(),
+            parts: Vec::new(),
             board: None,
             rebuild_to: None,
             year: None,
@@ -604,8 +760,18 @@ fn emit_game(
             source_file: None,
             comment: None,
             original_metadata: DatOriginalMetadata::default(),
+            mame_input: None,
             content_classification: DatContentClassification::unknown(),
-        });
+            // Fail-closed for set completeness (see `DatGameEntry::unsupported_structure`):
+            // this parser does not currently detect ClrMamePro `disk (...)`,
+            // `sample (...)`, `part (...)`, `dataarea (...)`, or device/
+            // dependency-style blocks at all, so it cannot honestly claim
+            // `false` for any entry - only Logiqx currently proves coverage.
+            // Every set originating here is therefore refused into
+            // NeedsReview by `dat::set` until this parser can prove complete
+            // set-structure observation.
+            unsupported_structure: true,
+        })?;
     }
     Ok(())
 }
@@ -619,8 +785,8 @@ fn parse_header_field(
     author: &mut Option<String>,
     limits: &DatLimits,
     offset: usize,
+    line_number: usize,
     warnings: &mut Vec<ParseWarning>,
-    push_warning: &dyn Fn(&mut Vec<ParseWarning>, usize, &str),
 ) {
     let lower = line.to_ascii_lowercase();
     if lower.starts_with("name ") {
@@ -628,15 +794,21 @@ fn parse_header_field(
     } else if lower.starts_with("description ") {
         let text = unquote(&line[12..]);
         if text.len() > limits.max_description_length {
-            push_warning(
-                warnings,
-                offset,
-                &format!(
-                    "description truncated from {} to {} bytes",
-                    text.len(),
-                    limits.max_description_length
-                ),
-            );
+            if warnings.len() < limits.max_warnings {
+                warnings.push(ParseWarning {
+                    byte_offset: Some(offset),
+                    line: Some(line_number),
+                    column: None,
+                    context: String::new(),
+                    message: format!(
+                        "description truncated from {} to {} bytes",
+                        text.len(),
+                        limits.max_description_length
+                    ),
+                    severity: DiagnosticSeverity::Warning,
+                    code: "description_truncated",
+                });
+            }
             *description = Some(text.chars().take(limits.max_description_length).collect());
         } else {
             *description = Some(text);
@@ -663,24 +835,73 @@ fn unquote(raw: &str) -> String {
     unquoted.to_string()
 }
 
+/// The value of one `key "value"` header line, when `line` carries that key.
+fn header_field<'a>(line: &'a str, key: &str) -> Option<&'a str> {
+    let (candidate, rest) = line.split_once(char::is_whitespace)?;
+    candidate.eq_ignore_ascii_case(key).then_some(rest)
+}
+
+/// Reads the publisher identity a ClrMamePro header declares.
+///
+/// DAT-o-MATIC and Redump both publish the same catalogue in ClrMamePro and
+/// Logiqx form, with the same `name`, `author`, `homepage` and `url` fields,
+/// so the publisher rules are the shared ones in `parsers::mod`: a No-Intro
+/// catalogue downloaded in ClrMamePro format must identify as No-Intro the
+/// way its XML twin does, or every import that checks the ecosystem refuses
+/// it as "not No-Intro". The parser only keeps name/description/version/
+/// author as fields; `homepage` and `url` are read from the retained header
+/// lines here.
 fn detect_clrmamepro_ecosystem(
     name: &Option<String>,
     description: &Option<String>,
+    version: &Option<String>,
+    author: &Option<String>,
     header: &[String],
 ) -> DatEcosystem {
-    let name_lower = name.as_deref().unwrap_or("").to_ascii_lowercase();
-    let desc_lower = description.as_deref().unwrap_or("").to_ascii_lowercase();
-
-    if name_lower.contains("tosec") || desc_lower.contains("tosec") {
-        return DatEcosystem::Tosec;
+    let header_value = |key: &str| {
+        header
+            .iter()
+            .find_map(|line| header_field(line, key))
+            .map(unquote)
+    };
+    let homepage = header_value("homepage");
+    let url = header_value("url");
+    if let Some(ecosystem) = super::detect_publisher_ecosystem(
+        name.as_deref(),
+        author.as_deref(),
+        description.as_deref(),
+        version.as_deref(),
+        homepage.as_deref(),
+        url.as_deref(),
+    ) {
+        return ecosystem;
     }
 
+    // TOSEC also brands its `category`/`comment` header lines, which are not
+    // standard fields; keep the whole-header check that found them before.
     let header_text = header.join("\n").to_ascii_lowercase();
     if header_text.contains("tosec") {
         return DatEcosystem::Tosec;
     }
 
     DatEcosystem::GenericClrMamePro
+}
+
+#[derive(Default)]
+struct CurrentGameFidelity {
+    rom_of: Option<String>,
+    sample_of: Option<String>,
+    is_bios: Option<String>,
+    runnable: Option<String>,
+}
+
+#[derive(Default)]
+struct CurrentRomFidelity {
+    offset: Option<String>,
+    value: Option<String>,
+    optional: Option<String>,
+    bios: Option<String>,
+    region: Option<String>,
 }
 
 #[cfg(test)]
@@ -723,6 +944,118 @@ mod tests {
     }
 
     #[test]
+    fn rom_loadflag_is_captured_verbatim() {
+        // Never interpreted downstream - just passed through, same as
+        // status/merge. See DatRomEntry::loadflag.
+        let content = concat!(
+            "clrmamepro (\n",
+            "\tname Test\n",
+            ")\n",
+            "game (\n",
+            "\tname \"mame-set\"\n",
+            "\trom ( name fill.bin size 4 crc AAAAAAAA loadflag fill )\n",
+            "\trom ( name cpu.bin size 4 crc BBBBBBBB )\n",
+            ")\n"
+        );
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("loadflag.dat");
+        std::fs::write(&path, content).unwrap();
+        let limits = DatLimits::default();
+        let result = parse_clrmamepro(&path, limits).unwrap();
+        let roms = &result.dat.games[0].roms;
+        assert_eq!(roms[0].loadflag.as_deref(), Some("fill"));
+        assert_eq!(roms[1].loadflag, None);
+    }
+
+    #[test]
+    fn every_game_entry_is_fail_closed_as_unsupported_structure() {
+        // Stage 1 rule: this parser cannot prove full set-structure coverage
+        // for any entry (no disk/sample/part/dataarea/device detection at
+        // all), so every entry it produces claims unsupported_structure
+        // unconditionally - even a perfectly ordinary single-ROM game - so
+        // `dat::set` refuses every ClrMamePro-sourced set into NeedsReview
+        // rather than risking a false Complete on unproven coverage.
+        let content = concat!(
+            "clrmamepro (\n",
+            "\tname Test\n",
+            ")\n",
+            "game (\n",
+            "\tname \"Test Game\"\n",
+            "\trom ( name test.bin size 1024 crc DEADBEEF )\n",
+            ")\n"
+        );
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("test.dat");
+        std::fs::write(&path, content).unwrap();
+        let limits = DatLimits::default();
+        let result = parse_clrmamepro(&path, limits).unwrap();
+        assert!(result.dat.games[0].unsupported_structure);
+    }
+
+    /// DAT-o-MATIC offers every No-Intro catalogue in ClrMamePro form with
+    /// the same header fields as the XML. It must identify as No-Intro, or
+    /// every import that checks the ecosystem refuses it as "not No-Intro".
+    #[test]
+    fn no_intro_clrmamepro_header_identifies_as_no_intro() {
+        let dir = tempfile::tempdir().unwrap();
+        for (name, header) in [
+            (
+                "official.dat",
+                "\tname \"Nintendo - Game Boy Color\"\n\tdescription \"Nintendo - Game Boy Color\"\n\tversion 20261001-000000\n\tauthor \"No-Intro\"\n\thomepage \"No-Intro\"\n\turl \"https://www.no-intro.org\"\n",
+            ),
+            (
+                "homepage-url-only.dat",
+                "\tname \"Nintendo - Game Boy Color\"\n\thomepage \"No-Intro\"\n\turl \"http://www.no-intro.org/\"\n",
+            ),
+            (
+                "legacy-author.dat",
+                "\tname \"Nintendo - Game Boy Color\"\n\tauthor \"No-Intro Team\"\n",
+            ),
+        ] {
+            let path = dir.path().join(name);
+            std::fs::write(
+                &path,
+                format!(
+                    "clrmamepro (\n{header})\n\ngame (\n\tname \"Fixture (USA)\"\n\trom ( name \"Fixture (USA).gbc\" size 5 crc 3610a686 )\n)\n"
+                ),
+            )
+            .unwrap();
+            let result = parse_clrmamepro(&path, DatLimits::default()).unwrap();
+            assert_eq!(result.dat.source.ecosystem, DatEcosystem::NoIntro, "{name}");
+            assert_eq!(
+                result.dat.source.name.as_deref(),
+                Some("Nintendo - Game Boy Color")
+            );
+        }
+    }
+
+    #[test]
+    fn redump_clrmamepro_header_identifies_as_redump() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("redump.dat");
+        std::fs::write(
+            &path,
+            "clrmamepro (\n\tname \"Sony - PlayStation\"\n\tdescription \"Sony - PlayStation - Discs\"\n\tauthor \"redump.org\"\n\thomepage \"redump.org\"\n\turl \"http://redump.org/\"\n)\n",
+        )
+        .unwrap();
+        let result = parse_clrmamepro(&path, DatLimits::default()).unwrap();
+        assert_eq!(result.dat.source.ecosystem, DatEcosystem::Redump);
+    }
+
+    #[test]
+    fn a_clrmamepro_header_naming_no_publisher_stays_generic() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("generic.dat");
+        std::fs::write(
+            &path,
+            "clrmamepro (\n\tname \"My Collection\"\n\tauthor \"me\"\n\thomepage \"https://example.org\"\n)\n",
+        )
+        .unwrap();
+        let result = parse_clrmamepro(&path, DatLimits::default()).unwrap();
+        assert_eq!(result.dat.source.ecosystem, DatEcosystem::GenericClrMamePro);
+    }
+
+    #[test]
     fn tosec_ecosystem_detected_in_header() {
         let content = "clrmamepro (\n\tname TOSEC (2024-01-01)\n)\n";
         let dir = tempfile::tempdir().unwrap();
@@ -731,6 +1064,32 @@ mod tests {
         let limits = DatLimits::default();
         let result = parse_clrmamepro(&path, limits).unwrap();
         assert_eq!(result.dat.source.ecosystem, DatEcosystem::Tosec);
+    }
+
+    #[test]
+    fn legacy_windows_1252_catalogue_text_preserves_checksums_and_warns() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("legacy.dat");
+        let mut bytes = b"clrmamepro (\n\tname Legacy\n)\ngame (\n\tname \"M".to_vec();
+        bytes.push(0xfc); // Windows-1252 'ü', not valid standalone UTF-8.
+        bytes.extend_from_slice(
+            b"nchen\"\n\trom ( name game.lha size 4 crc DEADBEEF md5 00000000000000000000000000000001 sha1 0000000000000000000000000000000000000001 )\n)\n",
+        );
+        std::fs::write(&path, bytes).unwrap();
+
+        let result = parse_clrmamepro(&path, DatLimits::default()).unwrap();
+        assert_eq!(result.dat.games[0].name, "München");
+        assert_eq!(
+            result.dat.games[0].roms[0].sha1.as_deref(),
+            Some("0000000000000000000000000000000000000001")
+        );
+        assert!(
+            result
+                .warnings
+                .iter()
+                .any(|warning| warning.code == "legacy_windows_1252"),
+            "legacy decoding must be visible, never silent"
+        );
     }
 
     #[test]
@@ -756,7 +1115,7 @@ mod tests {
     }
 
     #[test]
-    fn cloneof_and_romof_declare_the_parent_entry() {
+    fn cloneof_and_romof_are_preserved_separately() {
         let content = concat!(
             "clrmamepro (\n",
             "\tname Test\n",
@@ -784,7 +1143,8 @@ mod tests {
         assert_eq!(result.dat.games.len(), 3);
         assert_eq!(result.dat.games[0].clone_of, None);
         assert_eq!(result.dat.games[1].clone_of.as_deref(), Some("Parent Game"));
-        assert_eq!(result.dat.games[2].clone_of.as_deref(), Some("Parent Game"));
+        assert_eq!(result.dat.games[2].clone_of, None);
+        assert_eq!(result.dat.games[2].rom_of.as_deref(), Some("Parent Game"));
     }
 
     #[test]
@@ -798,6 +1158,8 @@ mod tests {
         let mut status = None;
         let mut merge = None;
         let mut date = None;
+        let mut loadflag = None;
+        let mut fidelity = CurrentRomFidelity::default();
         apply_kvs("name test.bin size 1024 crc DEADBEEF", &mut |k, v| {
             apply_rom_kv(
                 k,
@@ -811,6 +1173,8 @@ mod tests {
                 &mut status,
                 &mut merge,
                 &mut date,
+                &mut loadflag,
+                &mut fidelity,
             );
         });
         assert_eq!(name, Some("test.bin".into()));
@@ -829,6 +1193,8 @@ mod tests {
         let mut status = None;
         let mut merge = None;
         let mut date = None;
+        let mut loadflag = None;
+        let mut fidelity = CurrentRomFidelity::default();
         apply_kvs(
             "name \"Super Mario (World)\" size 4096 crc ABCD1234",
             &mut |k, v| {
@@ -844,6 +1210,8 @@ mod tests {
                     &mut status,
                     &mut merge,
                     &mut date,
+                    &mut loadflag,
+                    &mut fidelity,
                 );
             },
         );
@@ -851,4 +1219,100 @@ mod tests {
         assert_eq!(size, Some(4096));
         assert_eq!(crc, Some("abcd1234".into()));
     }
+
+    #[test]
+    fn supported_game_and_rom_fidelity_fields_are_preserved_without_leakage() {
+        let content = concat!(
+            "clrmamepro (\n",
+            "\tname Test\n",
+            ")\n",
+            "game (\n",
+            "\tname detailed\n",
+            "\tcloneof clone-parent\n",
+            "\tromof rom-parent\n",
+            "\tsampleof samples\n",
+            "\tisbios yes\n",
+            "\trunnable no\n",
+            "\trom ( name detailed.bin size 4 crc AAAAAAAA offset 1000 loadflag reload value ff optional yes bios us region maincpu )\n",
+            "\trom ( name ordinary.bin size 4 crc BBBBBBBB )\n",
+            ")\n",
+            "game (\n",
+            "\tname ordinary\n",
+            "\trom ( name final.bin size 4 crc CCCCCCCC )\n",
+            ")\n"
+        );
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("fidelity.dat");
+        std::fs::write(&path, content).unwrap();
+        let result = parse_clrmamepro(&path, DatLimits::default()).unwrap();
+
+        let detailed = &result.dat.games[0];
+        assert_eq!(detailed.clone_of.as_deref(), Some("clone-parent"));
+        assert_eq!(detailed.rom_of.as_deref(), Some("rom-parent"));
+        assert_eq!(detailed.sample_of.as_deref(), Some("samples"));
+        assert_eq!(detailed.is_bios.as_deref(), Some("yes"));
+        assert_eq!(detailed.runnable.as_deref(), Some("no"));
+        let rom = &detailed.roms[0];
+        assert_eq!(rom.offset.as_deref(), Some("1000"));
+        assert_eq!(rom.loadflag.as_deref(), Some("reload"));
+        assert_eq!(rom.value.as_deref(), Some("ff"));
+        assert_eq!(rom.optional.as_deref(), Some("yes"));
+        assert_eq!(rom.bios.as_deref(), Some("us"));
+        assert_eq!(rom.region.as_deref(), Some("maincpu"));
+        assert_eq!(detailed.roms[1].offset, None);
+        assert_eq!(detailed.roms[1].optional, None);
+        assert!(detailed.unsupported_structure);
+
+        let ordinary = &result.dat.games[1];
+        assert_eq!(ordinary.rom_of, None);
+        assert_eq!(ordinary.sample_of, None);
+        assert_eq!(ordinary.is_bios, None);
+        assert_eq!(ordinary.runnable, None);
+        assert!(ordinary.unsupported_structure);
+    }
+
+    #[test]
+    fn ten_thousand_game_catalogue_streams_and_preserves_order() {
+        use std::io::Write;
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("large-tosec.dat");
+        let mut file = std::fs::File::create(&path).unwrap();
+        writeln!(file, "clrmamepro (\n\tname Synthetic\n)").unwrap();
+        for index in 0..10_000 {
+            writeln!(
+                file,
+                "game (\n\tname \"Game {index}\"\n\trom ( name \"rom-{index}.bin\" size 4 crc {index:08X} )\n\trom ( name \"extra-{index}.bin\" size 8 md5 {index:032X} )\n)"
+            )
+            .unwrap();
+        }
+        let result = parse_clrmamepro(&path, DatLimits::default()).unwrap();
+        assert_eq!(result.dat.games.len(), 10_000);
+        assert_eq!(result.dat.games[0].name, "Game 0");
+        assert_eq!(result.dat.games[9_999].name, "Game 9999");
+        assert_eq!(result.dat.games[9_999].roms.len(), 2);
+    }
+
+    #[test]
+    fn unterminated_tail_is_refused_instead_of_returning_partial_catalogue() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("truncated.dat");
+        std::fs::write(
+            &path,
+            "clrmamepro (\n\tname Broken\n)\ngame (\n\tname \"Incomplete\"\n\trom ( name bad.bin size 4 crc DEADBEEF )\n",
+        )
+        .unwrap();
+        let error = parse_clrmamepro(&path, DatLimits::default()).unwrap_err();
+        assert!(matches!(error, ParseError::MalformedXml { .. }));
+    }
+}
+
+/// Moves a game's ROMs out of the parser's scratch vector without carrying its
+/// spare capacity into the retained catalogue. A fresh `Vec` reserves four
+/// slots on the first push, which for the usual one-ROM game kept three
+/// unused `DatRomEntry`-sized slots per game alive for the whole catalogue.
+fn take_exact(roms: &mut Vec<DatRomEntry>) -> Vec<DatRomEntry> {
+    let mut taken = std::mem::take(roms);
+    taken.shrink_to_fit();
+    taken
 }

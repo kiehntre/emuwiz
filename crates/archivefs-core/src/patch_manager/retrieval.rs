@@ -19,17 +19,17 @@ pub struct HttpsMetadataFetcher {
 
 impl HttpsMetadataFetcher {
     pub fn new() -> Self {
-        let config = ureq::Agent::config_builder()
-            .https_only(true)
-            .proxy(None)
-            .max_redirects(0)
-            .http_status_as_error(false)
-            .timeout_global(Some(Duration::from_secs(15)))
-            .timeout_resolve(Some(Duration::from_secs(3)))
-            .timeout_connect(Some(Duration::from_secs(5)))
-            .timeout_recv_response(Some(Duration::from_secs(5)))
-            .timeout_recv_body(Some(Duration::from_secs(10)))
-            .build();
+        let config = crate::http_agent::config(|builder| {
+            builder
+                .https_only(true)
+                .max_redirects(0)
+                .http_status_as_error(false)
+                .timeout_global(Some(Duration::from_secs(15)))
+                .timeout_resolve(Some(Duration::from_secs(3)))
+                .timeout_connect(Some(Duration::from_secs(5)))
+                .timeout_recv_response(Some(Duration::from_secs(5)))
+                .timeout_recv_body(Some(Duration::from_secs(10)))
+        });
         Self {
             agent: config.new_agent(),
         }

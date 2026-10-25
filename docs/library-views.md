@@ -1,106 +1,40 @@
-# Managed Library Views
+# Library organisation and projections
 
-A Library View is a named, symlink-based organized view of the catalogue.
-It lets you browse archives grouped a particular way (currently:
-`{platform}/{filename}`) in a separate directory tree, without moving,
-copying, or extracting the underlying archives, and without changing your
-`source_folders`.
+## CURRENT BEHAVIOR
 
-This is a preview/organization feature, not a mount backend: the symlinks a
-view creates point at your source archive files, the same way a normal
-symlink would. Mounting archives for read access remains a separate,
-explicit operation (`mount`, `mount-one`, or the GUI mount actions).
+EmuWiz has several related but distinct outputs:
 
-## Why it exists
+- **Library View:** a named, managed local symlink layout over catalogue items.
+  Preview plans changes; apply/repair creates or fixes only manifest-owned
+  symlinks; remove is bounded by that manifest.
+- **Playing Library / 1G1R:** evidence-backed planning and selection of one
+  preferred playable entry per release/group. Its plan can be previewed and,
+  where the operation is approved, applied through the shared transaction
+  and history model.
+- **RomM projection:** local-path-aware mapping/import/reporting against RomM.
+  It is a projection of local identity and does not make RomM the identity
+  authority.
+- **ES-DE export:** a launch-facing metadata/path projection. It does not
+  rewrite source media.
 
-Archives discovered from `source_folders` may be laid out however you
-originally organized them - by download date, by source, by nothing in
-particular. A Library View lets you additionally see the same archives
-organized by platform (today's only layout template) in one destination
-directory, for browsing or for pointing another tool at a predictable
-structure, while your original folders stay untouched.
+All of these consume identity evidence. Unknown or weakly identified items
+remain visible as unresolved or skipped rather than being silently renamed.
 
-## Configuration
+## Managed Library Views
 
-Views are stored at `~/.config/archivefs/library_views.json`, one entry per
-view:
+Views are configured with a destination root, source/platform filters, and the
+current supported layout. Planning is read-only and classifies create,
+already-correct, repair, stale removal, collision, and safety-skip outcomes.
+Apply and repair create directories/symlinks only within the approved root and
+only for manifest-owned paths. They never move, copy, extract, mount, or edit a
+source archive.
 
-- `id` - a stable identifier generated once (`generate_library_view_id`)
-  and never reused, independent of `name`. Manifests are keyed by `id`, so
-  renaming a view never orphans its manifest.
-- `name` - a human-readable label.
-- `destination_root` - where the view's managed symlinks are created. It
-  must not be inside any configured source folder, and no source folder may
-  be inside it; this is validated the same way source-folder overlap is
-  validated.
-- `enabled` - whether the view is currently active.
-- `source_folders` - which configured source folders to include; empty
-  means all of them.
-- `platforms` - which platforms to include; empty means every known
-  (non-`Unknown`) platform. Archives with an `Unknown` platform are always
-  skipped, regardless of this setting.
-- `layout_template` - currently only `PlatformFilename` (`{platform}/{filename}`)
-  is supported. This is a fixed enum, not a free-form string template, so an
-  invalid layout can never be configured.
+The exact CLI surface is view list, preview, apply, repair, and remove; use
+the command help for current flags. The legacy ArchiveFS config paths remain
+compatibility paths.
 
-## Commands
+## Historical design context
 
-```sh
-emuwiz-cli view list
-emuwiz-cli view preview <name-or-id>
-emuwiz-cli view apply <name-or-id>
-emuwiz-cli view repair <name-or-id>
-emuwiz-cli view remove <name-or-id> [--keep-definition]
-```
-
-- `list` prints configured views.
-- `preview` computes and prints the current plan for a view - what would be
-  created, repaired, removed, or skipped - without touching the filesystem.
-  Safe to run as often as you like.
-- `apply` creates and repairs a view's managed symlinks according to the
-  current plan.
-- `repair` is the same operation as `apply`: it both creates anything
-  missing and fixes drift (for example a symlink whose target has changed).
-- `remove` removes a view's managed symlinks. By default it also removes the
-  view's own configuration entry; `--keep-definition` removes only the
-  symlinks and keeps the view configured so it can be applied again later.
-
-All four `view` subcommands accept `--json` for machine-readable output.
-
-## What a plan can say
-
-Planning classifies every catalogue entry against the view's current
-manifest (its record of exactly which symlinks it previously created) into
-one of:
-
-- **Create** - the symlink doesn't exist yet and would be created.
-- **AlreadyCorrect** - the symlink exists and already points at the right
-  target.
-- **Repair** - the symlink exists but is wrong (for example stale, or
-  pointing at a moved archive) and would be corrected.
-- **RemoveStale** - a previously created symlink no longer corresponds to a
-  current catalogue entry and would be removed.
-- **Collision** - two archives would map to the same destination path, or
-  the destination path is already occupied by something the view did not
-  create. Apply never overwrites a collision.
-- **SkipUnknownPlatform** / **SkipMissingSourceArchive** / **SkipInvalidPath** -
-  the entry is intentionally left alone, with the specific reason recorded.
-
-If the view's `destination_root` itself is unsafe (inside a source folder,
-containing one, or unresolvable), planning sets `unsafe_root_error` and
-`apply`/`repair` refuse to run, no matter how clean the individual entries
-look.
-
-## Safety properties
-
-- Views only ever create, repair, or remove symlinks that the view's own
-  manifest recorded as belonging to it. `repair` and `remove` never touch a
-  path the view didn't create itself.
-- Planning performs no filesystem mutation - it only reads existing
-  symlink/file state to classify what's already there.
-- A view never mounts or unmounts anything, and never touches a source
-  archive file.
-- Manifests are plain JSON, one per view, under
-  `~/.local/share/archivefs/library_views/{id}.manifest.json`. A missing
-  manifest is treated as "this view has never been applied yet," not an
-  error, exactly like a missing top-level config.
+The original Stage-1 symlink view is still supported, but it is not the whole
+current product. Playing Library/1G1R, RomM, and ES-DE have separate plans,
+projection rules, and write boundaries.

@@ -161,6 +161,21 @@ impl PlatformIdentityEvidence {
             | AuditVerdict::ExactMultipleCandidates { algorithm, .. } => *algorithm,
             _ => return None,
         };
+        // A CUE sheet's own match is not the disc: only a disc verified as
+        // the sheet plus every file it references is platform evidence.
+        let is_cue = local_path
+            .extension()
+            .and_then(|extension| extension.to_str())
+            .is_some_and(|extension| extension.eq_ignore_ascii_case("cue"));
+        if is_cue {
+            let AuditVerdict::Exact { game_name, .. } = &entry.verdict else {
+                return None;
+            };
+            outcome.loose_discs.iter().find(|disc| {
+                disc.cue_path == entry.local_path
+                    && disc.verified_game.as_deref() == Some(game_name.as_str())
+            })?;
+        }
         Some(Self {
             platform: platform.id.to_string(),
             source: PlatformIdentitySource::VerifiedDat,

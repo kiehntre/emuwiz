@@ -27,17 +27,32 @@
 
 use serde::Serialize;
 
+use super::arcade_dat_version::{ArcadeEmulatorDatReadiness, findings_from_arcade_dat_version};
+use super::arcade_profiles::{ArcadeReadiness, findings_from_arcade_readiness};
 use super::environment::{
     FreeSpacePolicy, StorageAssessment, findings_from_free_space,
     findings_from_read_only_filesystems, not_checked_from_storage,
 };
+use super::handheld_profiles::{MelonDsMgbaReadiness, findings_from_melonds_mgba_readiness};
 use super::managed::{
     ManagedEntryScan, findings_from_managed_entries, not_checked_from_managed_entries,
 };
+use super::native_profiles::{DesmumeMesenReadiness, findings_from_desmume_mesen_readiness};
 use super::profiles::{
-    ProfileAssessmentReport, findings_from_emulator_profiles, not_checked_from_emulator_profiles,
+    AzaharCemuReadiness, LinuxEmulatorInstallationEvidence, PpssppReadinessAssessment,
+    ProfileAssessmentReport, Rpcs3ReadinessAssessment, XemuReadinessAssessment,
+    XeniaReadinessAssessment, findings_from_azahar_cemu_readiness, findings_from_emulator_profiles,
+    findings_from_linux_emulator_installations, findings_from_ppsspp_readiness,
+    findings_from_rpcs3_readiness, findings_from_xemu_readiness, findings_from_xenia_readiness,
+    not_checked_from_emulator_profiles,
 };
 use super::repair::{findings_from_index_freshness, findings_from_stale_mount_directories};
+use super::rmg_sameboy::{RmgSameBoyReadiness, findings_from_rmg_sameboy_readiness};
+use super::scummvm_dosbox::{
+    DosBoxStagingDoctorReadiness, ScummVmDoctorReadiness, findings_from_dosbox_staging_readiness,
+    findings_from_scummvm_readiness,
+};
+use super::verified_identity::{ArchiveIdentityFactStatus, findings_from_verified_identity_facts};
 use super::{
     CoverageStatus, DEFERRED_CHECKS, DeferredCheck, DoctorCategory, DoctorSeverity,
     DoctorSubsystem, Finding, MountRootSafety, NotCheckedCheck, SubsystemCoverage,
@@ -126,8 +141,37 @@ pub struct DoctorScanInputs<'a> {
     pub storage: Gathered<&'a StorageAssessment>,
     /// From `profiles::assess_emulator_profiles`.
     pub emulator_profiles: Gathered<&'a ProfileAssessmentReport>,
+    /// Bounded installation-form evidence gathered outside this pure runner.
+    pub linux_emulator_installations: Gathered<&'a [LinuxEmulatorInstallationEvidence]>,
+    pub azahar_cemu_readiness: Gathered<&'a [AzaharCemuReadiness]>,
+    pub melonds_mgba_readiness: Gathered<&'a [MelonDsMgbaReadiness]>,
+    pub desmume_mesen_readiness: Gathered<&'a [DesmumeMesenReadiness]>,
+    pub rmg_sameboy_readiness: Gathered<&'a [RmgSameBoyReadiness]>,
+    /// From `arcade_dat_version::arcade_dat_version_readiness` - advisory
+    /// MAME / FBNeo emulator-vs-DAT version compatibility, assembled outside
+    /// this pure runner from the installation evidence and configured arcade
+    /// DAT catalogue versions.
+    pub arcade_dat_version: Gathered<&'a [ArcadeEmulatorDatReadiness]>,
+    pub arcade_readiness: Gathered<&'a [ArcadeReadiness]>,
+    pub scummvm_readiness: Gathered<&'a ScummVmDoctorReadiness>,
+    pub dosbox_staging_readiness: Gathered<&'a DosBoxStagingDoctorReadiness>,
+    /// From `profiles::assess_xemu_readiness`.
+    pub xemu_readiness: Gathered<&'a [XemuReadinessAssessment]>,
+    /// From `profiles::assess_xenia_readiness`.
+    pub xenia_readiness: Gathered<&'a [XeniaReadinessAssessment]>,
+    /// From `profiles::assess_ppsspp_readiness`.
+    pub ppsspp_readiness: Gathered<&'a [PpssppReadinessAssessment]>,
+    /// From `profiles::assess_rpcs3_readiness`.
+    pub rpcs3_readiness: Gathered<&'a [Rpcs3ReadinessAssessment]>,
+    pub remaining_profiles: Gathered<&'a [Finding]>,
     /// From `managed::scan_managed_entries`.
     pub managed_entries: Gathered<&'a ManagedEntryScan>,
+    /// Per-archive persisted verified-identity facts, each already paired
+    /// with its freshness against the archive file's current identity
+    /// (gathered outside this pure runner, like every other input here).
+    /// A read-only projection of [`crate::verified_identity_cache`]; never a
+    /// launch trust anchor.
+    pub verified_identity: Gathered<&'a [ArchiveIdentityFactStatus]>,
     /// The free-space thresholds to apply. Not a `Gathered`: policy is always
     /// available, and the default is the documented one.
     pub free_space_policy: FreeSpacePolicy,
@@ -158,8 +202,53 @@ impl<'a> DoctorScanInputs<'a> {
             emulator_profiles: Gathered::NotLoaded(
                 "Emulator profiles have not been discovered in this session.",
             ),
+            linux_emulator_installations: Gathered::NotLoaded(
+                "Linux emulator installation evidence has not been gathered in this session.",
+            ),
+            azahar_cemu_readiness: Gathered::NotLoaded(
+                "Azahar and Cemu readiness has not been checked in this session.",
+            ),
+            melonds_mgba_readiness: Gathered::NotLoaded(
+                "melonDS and mGBA readiness has not been checked in this session.",
+            ),
+            desmume_mesen_readiness: Gathered::NotLoaded(
+                "DeSmuME and Mesen readiness has not been checked in this session.",
+            ),
+            rmg_sameboy_readiness: Gathered::NotLoaded(
+                "RMG and SameBoy readiness has not been checked in this session.",
+            ),
+            arcade_dat_version: Gathered::NotLoaded(
+                "Arcade emulator / DAT version compatibility has not been assembled in this session.",
+            ),
+            arcade_readiness: Gathered::NotLoaded(
+                "MAME and FBNeo launch readiness has not been checked in this session.",
+            ),
+            scummvm_readiness: Gathered::NotLoaded(
+                "ScummVM readiness has not been checked in this session.",
+            ),
+            dosbox_staging_readiness: Gathered::NotLoaded(
+                "DOSBox Staging readiness has not been checked in this session.",
+            ),
+            xemu_readiness: Gathered::NotLoaded(
+                "xemu launch readiness has not been checked in this session.",
+            ),
+            xenia_readiness: Gathered::NotLoaded(
+                "Xenia launch readiness has not been checked in this session.",
+            ),
+            ppsspp_readiness: Gathered::NotLoaded(
+                "PPSSPP launch readiness has not been checked in this session.",
+            ),
+            rpcs3_readiness: Gathered::NotLoaded(
+                "RPCS3 launch readiness has not been checked in this session.",
+            ),
+            remaining_profiles: Gathered::NotLoaded(
+                "Remaining emulator readiness has not been checked in this session.",
+            ),
             managed_entries: Gathered::NotLoaded(
                 "EmuWiz-managed cheat entries have not been scanned yet.",
+            ),
+            verified_identity: Gathered::NotLoaded(
+                "The verified-identity fact cache has not been loaded in this session.",
             ),
             free_space_policy: FreeSpacePolicy::default(),
         }
@@ -474,10 +563,104 @@ pub fn run_doctor_scan(inputs: &DoctorScanInputs<'_>) -> DoctorScan {
         |report: &&ProfileAssessmentReport| findings_from_emulator_profiles(report)
     );
     subsystem!(
+        inputs.linux_emulator_installations,
+        DoctorCategory::EmulatorProfiles,
+        DoctorSubsystem::EmulatorReadiness,
+        |evidence: &&[LinuxEmulatorInstallationEvidence]| {
+            findings_from_linux_emulator_installations(evidence)
+        }
+    );
+    subsystem!(
+        inputs.azahar_cemu_readiness,
+        DoctorCategory::EmulatorProfiles,
+        DoctorSubsystem::EmulatorReadiness,
+        |entries: &&[AzaharCemuReadiness]| findings_from_azahar_cemu_readiness(entries)
+    );
+    subsystem!(
+        inputs.melonds_mgba_readiness,
+        DoctorCategory::EmulatorProfiles,
+        DoctorSubsystem::EmulatorReadiness,
+        |entries: &&[MelonDsMgbaReadiness]| findings_from_melonds_mgba_readiness(entries)
+    );
+    subsystem!(
+        inputs.desmume_mesen_readiness,
+        DoctorCategory::EmulatorProfiles,
+        DoctorSubsystem::EmulatorReadiness,
+        |entries: &&[DesmumeMesenReadiness]| findings_from_desmume_mesen_readiness(entries)
+    );
+    subsystem!(
+        inputs.rmg_sameboy_readiness,
+        DoctorCategory::EmulatorProfiles,
+        DoctorSubsystem::EmulatorReadiness,
+        |entries: &&[RmgSameBoyReadiness]| findings_from_rmg_sameboy_readiness(entries)
+    );
+    subsystem!(
+        inputs.arcade_dat_version,
+        DoctorCategory::Emulators,
+        DoctorSubsystem::EmulatorReadiness,
+        |readiness: &&[ArcadeEmulatorDatReadiness]| { findings_from_arcade_dat_version(readiness) }
+    );
+    subsystem!(
+        inputs.arcade_readiness,
+        DoctorCategory::Emulators,
+        DoctorSubsystem::EmulatorReadiness,
+        |readiness: &&[ArcadeReadiness]| findings_from_arcade_readiness(readiness)
+    );
+    subsystem!(
+        inputs.scummvm_readiness,
+        DoctorCategory::Emulators,
+        DoctorSubsystem::EmulatorReadiness,
+        |readiness: &&ScummVmDoctorReadiness| findings_from_scummvm_readiness(readiness)
+    );
+    subsystem!(
+        inputs.dosbox_staging_readiness,
+        DoctorCategory::Emulators,
+        DoctorSubsystem::EmulatorReadiness,
+        |readiness: &&DosBoxStagingDoctorReadiness| {
+            findings_from_dosbox_staging_readiness(readiness)
+        }
+    );
+    subsystem!(
+        inputs.xemu_readiness,
+        DoctorCategory::EmulatorProfiles,
+        DoctorSubsystem::EmulatorReadiness,
+        |assessments: &&[XemuReadinessAssessment]| findings_from_xemu_readiness(assessments)
+    );
+    subsystem!(
+        inputs.xenia_readiness,
+        DoctorCategory::EmulatorProfiles,
+        DoctorSubsystem::EmulatorReadiness,
+        |assessments: &&[XeniaReadinessAssessment]| findings_from_xenia_readiness(assessments)
+    );
+    subsystem!(
+        inputs.ppsspp_readiness,
+        DoctorCategory::EmulatorProfiles,
+        DoctorSubsystem::EmulatorReadiness,
+        |assessments: &&[PpssppReadinessAssessment]| findings_from_ppsspp_readiness(assessments)
+    );
+    subsystem!(
+        inputs.rpcs3_readiness,
+        DoctorCategory::EmulatorProfiles,
+        DoctorSubsystem::EmulatorReadiness,
+        |assessments: &&[Rpcs3ReadinessAssessment]| findings_from_rpcs3_readiness(assessments)
+    );
+    subsystem!(
+        inputs.remaining_profiles,
+        DoctorCategory::EmulatorProfiles,
+        DoctorSubsystem::EmulatorReadiness,
+        |findings: &&[Finding]| findings.to_vec()
+    );
+    subsystem!(
         inputs.managed_entries,
         DoctorCategory::ManagedEntries,
         DoctorSubsystem::ManagedEntries,
         |scan: &&ManagedEntryScan| findings_from_managed_entries(scan)
+    );
+    subsystem!(
+        inputs.verified_identity,
+        DoctorCategory::Emulators,
+        DoctorSubsystem::EmulatorReadiness,
+        |statuses: &&[ArchiveIdentityFactStatus]| findings_from_verified_identity_facts(statuses)
     );
 
     let mut not_checked = inputs
@@ -501,6 +684,13 @@ pub fn run_doctor_scan(inputs: &DoctorScanInputs<'_>) -> DoctorScan {
 
     findings.sort_by(|left, right| left.sort_key().cmp(&right.sort_key()));
     coverage.sort_by_key(|entry| (entry.category, entry.subsystem));
+    // xemu and Xenia readiness share one (category, subsystem) tag - see
+    // their own `subsystem!` calls above - so an identical pair of entries
+    // (both checked, or both unavailable for the same reason) collapses to
+    // one coverage line rather than showing a confusing duplicate. A
+    // genuine difference (one available, one not) is never collapsed: only
+    // consecutive, fully identical entries are.
+    coverage.dedup();
 
     DoctorScan {
         findings,

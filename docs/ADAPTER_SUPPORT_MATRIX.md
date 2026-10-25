@@ -1,57 +1,58 @@
-# Cheats & Mods adapter support matrix
+# Adapter support matrix
 
-A concise, current-state summary of what each Cheats & Mods emulator
-adapter can actually do. See
-[`docs/CHEATS_MODS_SAFETY.md`](CHEATS_MODS_SAFETY.md) and
-[`docs/CHEATS_MODS_USER_POLICY.md`](CHEATS_MODS_USER_POLICY.md) for the
-trust and safety model behind every row below, and the per-adapter
-documents linked in each row for full detail.
+## CURRENT BEHAVIOR
 
-## Cheats, patches, and mods are not the same thing
+This matrix describes capability shape, not a promise that every emulator or
+platform has equal coverage. The authoritative launch rows are in
+[LAUNCH_SUPPORT.md](LAUNCH_SUPPORT.md).
 
-- **Cheats** are small, targeted value changes (a RetroArch `.cht` entry,
-  a Dolphin `[ActionReplay]`/`[Gecko]` code) - the only category any
-  adapter below can currently install.
-- **Patches** are broader per-game fixes distributed as files (a PCSX2
-  `.pnach` can contain a widescreen-hack patch alongside cheat codes in
-  the same file; RetroArch also has separate soft-patch formats). EmuWiz
-  inspects these the same conservative way it inspects cheats - as inert,
-  unevaluated data - but does not yet distinguish "patch" from "cheat" as
-  a first-class category anywhere in the GUI.
-- **Mods** (textures, graphics packs, resource packs, Riivolution assets,
-  and similar larger content replacements) are **not implemented in any
-  form**. No mod adapter exists, no mod inspection exists, and the "Mods"
-  section of the Cheats & Mods workspace is a labelled placeholder only.
+These terms are intentionally separate:
 
-## Matrix
+- **Recognised** means the file/container shape is known.
+- **Identified** means EmuWiz has a bounded platform/game identity result;
+  it may still be ambiguous or unverified.
+- **DAT-verified** means the identity matches an applicable managed DAT
+  authority with recorded provenance and freshness.
+- **Organised** means a Library View, Playing Library, RomM, or ES-DE
+  projection can plan/apply a supported destination for that item.
+- **Emulator-ready** means the selected emulator/profile/firmware and content
+  preconditions pass readiness checks.
+- **Launchable** means EmuWiz can revalidate and execute the supported launch
+  path. Readiness or command planning alone is not launchability.
+- **Cheats/mods**, **repair support**, and launch are separate workflows; one
+  does not imply the others.
 
-| Adapter | Identity | Local inspection | Trusted provider | Preview | Apply | Backup | Rollback | Mods | Current blocker |
-|---|---|---|---|---|---|---|---|---|---|
-| **RetroArch** | Verified exact/strong trusted-catalogue match; weak/ambiguous candidates never count as coverage | N/A - the source is the trusted catalogue itself, not an emulator-managed directory to inventory | **Yes** - reviewed `libretro-database` provider, Download/Update/Verify from Sources, immutable content-addressed snapshots | Yes, shared model; bounded coverage audit available | **Yes** - explicit confirmation, separate replacement approval, background execution | Yes - verified, never-overwritten backup before any replacement | Yes - fresh preview re-derived before acting, blocks on user-modified content or a missing/changed backup | Not implemented | Catalogue breadth varies by system/title; ordinary `.cht` files usually lack explicit serial, region, revision, hash, and core fields. See [`CHEAT_PROVIDER_COVERAGE.md`](CHEAT_PROVIDER_COVERAGE.md) |
-| **PCSX2** | Verified executable CRC required; verified serial and trusted region constraints checked when present | Yes - inventories existing `cheats`/`cheats_ws`/`patches` directories and `.pnach` files, read-only | Provider-neutral approved-record model; no bundled downloadable ordinary-cheat provider | Yes, shared model with selected managed PNACH blocks | **Yes** - the GUI stages exact selected approved records, previews the final PNACH, and requires explicit confirmation | Yes - verified, never-overwritten backup before replacement | Yes - exact prior bytes or removal of a transaction-created file, with stale/external-change blocking | Not implemented | Approve and integrate a licensed ordinary-cheat provider; see [`PCSX2_CHEAT_ADAPTER.md`](PCSX2_CHEAT_ADAPTER.md) |
-| **Dolphin** | Verified Game ID, encoded region, and revision via the shared bounded disc reader | Yes - inventories optional existing `GameSettings/*.ini` files, including Gecko and Action Replay names | **Yes** - exact-ID lookup in the official Dolphin upstream GameSettings dataset, with bounded retrieval and local cache | Yes, including individual Gecko-code selection, complete generated sections, preserved sections, final hash, and bounded coverage audit | **Yes** - safely merges `[Gecko]` and `[Gecko_Enabled]` after explicit preview/confirmation; creates the exact INI when absent | Yes - verified, never-overwritten backup before replacement | Yes - restores exact previous bytes or removes an INI created by the transaction | Not implemented | Provider apply is Gecko-only; upstream coverage varies and does not normally declare per-code disc revisions. See [`CHEAT_PROVIDER_COVERAGE.md`](CHEAT_PROVIDER_COVERAGE.md) |
-| **Xenia (Xbox 360)** | Verified Title ID and Media ID from the unencrypted XEX2 module header (direct `.xex` or a single `.xex` inside a ZIP) | N/A - no local bulk inventory; the exact destination file is checked individually once a candidate is chosen | **Yes** - exact-Title-ID lookup in `xenia-canary/game-patches`, via a cached, revision-pinned repository index (never a full clone per lookup) and per-file immutable caching | Yes, shared model, including individual patch selection, the exact merged `.patch.toml`, preserved unrelated definitions, and final hash | **Yes** - merges selected patches into the exact destination `.patch.toml` after explicit preview/confirmation; a `PartiallyVerified` candidate (module hash never computed/verified by EmuWiz) additionally requires an explicit acknowledgement before it can be staged at all | Yes - verified, never-overwritten backup before replacement | Yes - restores exact previous bytes or removes a file created by the transaction | Not implemented | See [`XENIA_PROVIDER.md`](XENIA_PROVIDER.md) for the full identity/compatibility model; no native Xenia Canary install path is auto-detected (explicit directory only) |
+An item can therefore be recognised without being identified, DAT-verified,
+organised, emulator-ready, launchable, or eligible for cheats/mods or repair.
+Unknown, conflicting, stale, or incomplete evidence remains visible and fails
+closed downstream.
 
-## Notes on "Apply" specifically
+| Area | Discovery/inventory | Preview | Apply / rollback |
+|---|---|---|---|
+| RetroArch cheats/patches | Read-only profiles, cores, playlists, artifacts | Yes | Supported catalogue-backed CHT materialization where identity and destination are exact |
+| PCSX2 PNACH | Read-only profile and PNACH inventory | Yes | Supported selected verified PNACH installation through the shared transaction path |
+| Dolphin GameSettings/Gecko | Read-only profile and INI inventory; provider retrieval is separate | Yes | Supported selected verified Gecko installation; texture-pack flow is separate |
+| GameCube/Wii provider flows | Read-only source validation and staging preview | Yes | Selected supported provider records can use shared apply, journal, and rollback |
+| Local mod packages | Bounded local inspection | Plan/preview | Only formats with an approved materializer; unsupported formats fail closed |
 
-"Apply" above means: the GUI offers a real Install/Replace control backed
-by the shared safe-apply transaction engine (atomic write, verified
-backup before replacement, journal, and rollback). It does **not** mean
-"EmuWiz runs the cheat" - EmuWiz never executes cheat, patch, or mod
-content at any stage, for any adapter, in preview, apply, or rollback.
-PCSX2's apply/rollback contract is available only for caller-provided, approved,
-verified ordinary-cheat records; the GUI wires those records into the shared
-preview, confirmation, apply, history, and rollback flow. EmuWiz does not bundle
-a downloadable ordinary-cheat catalogue for PCSX2. Dolphin's reviewed Gecko path can merge selected upstream definitions into an existing
-exact-ID GameSettings file or create that file when absent. Xenia's reviewed
-patch path does the same for `.patch.toml`. Neither installs other mod types.
+## State boundaries
 
-## Snapshot vs. individual-entry trust
+| User-facing question | What must be true | What it does not imply |
+|---|---|---|
+| Is this media recognised? | The format/container observer accepts it | A game identity, DAT match, organisation, launch, cheats/mods, or repair path |
+| Is this game identified? | Bounded evidence produces an identity result | DAT authority or launchability |
+| Is it DAT-verified? | An applicable managed DAT match is present and fresh | A working emulator profile or a supported destination |
+| Can it be organised? | A supported projection can build a safe plan | Emulator readiness or launch |
+| Is it emulator-ready/launchable? | Profile, firmware, identity, content, and launch preconditions pass; launchable additionally has an execution path | Cheats/mods or repair support |
+| Can cheats/mods be used? | The format, provider/local source, exact identity, destination, and transaction path are supported | Universal mod installation or launch |
+| Can it be repaired? | The specific repair operation has bounded evidence, preview, revalidation, and a supported transaction | That other repair types are supported |
 
-A **Trusted** provider (RetroArch's `libretro-database`) means EmuWiz
-has reviewed the source's ownership, format, host, and retrieval limits -
-it does **not** mean every individual cheat entry inside that catalogue
-has been reviewed for correctness. An entry can be structurally valid and
-still simply not work as expected in a given game/region/revision; that is
-a catalogue-content question, separate from EmuWiz's own trust and
-safety guarantees.
+Read-only means discovery, provider browsing, source validation, inventory,
+and preview do not mutate emulator files. Apply always requires selected
+verified records, explicit confirmation, fresh revalidation, and the shared
+transaction engine. Downloads and external installers are outside local mod
+package Stage 1.
+
+Some filenames retain READONLY_ADAPTER for compatibility with the historical
+module boundary. The name describes the inspection adapter, not a claim that
+all current workflows are universally read-only.

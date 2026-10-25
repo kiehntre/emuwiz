@@ -5,7 +5,7 @@
 //! trusted caller, rejects symlinked roots, and opens regular GameSettings INI
 //! files with `O_NOFOLLOW` on Unix.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, VecDeque};
 use std::env;
 use std::ffi::OsString;
 use std::fs::{self, File, OpenOptions};
@@ -15,12 +15,13 @@ use std::path::{Path, PathBuf};
 #[cfg(unix)]
 use std::os::unix::ffi::{OsStrExt, OsStringExt};
 #[cfg(unix)]
-use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
+use std::os::unix::fs::{MetadataExt, OpenOptionsExt, PermissionsExt};
 
 use serde::Serialize;
 use sha2::{Digest, Sha256};
 
 use crate::emulator_environment::EncodedPath;
+use crate::platform_evidence_fusion::evidence_lineage::{ClaimType, Representation};
 
 use super::destination_safety::{
     DestinationRootState, DestinationSafetyFailureReason, validate_destination_root,
@@ -38,6 +39,12 @@ pub const DOLPHIN_MAX_GAME_INI_BYTES: u64 = 256 * 1024;
 pub const DOLPHIN_MAX_TOTAL_GAME_INI_BYTES: u64 = 16 * 1024 * 1024;
 pub const DOLPHIN_MAX_LINES_PER_FILE: usize = 8_192;
 pub const DOLPHIN_MAX_LINE_BYTES: usize = 8 * 1024;
+/// Bounds the global Dolphin configuration and graphics configuration reads
+/// performed by the modern local inspection API.
+pub const DOLPHIN_LOCAL_MAX_CONFIG_BYTES: u64 = 256 * 1024;
+pub const DOLPHIN_LOCAL_MAX_TEXTURE_FILES: usize = 2_048;
+pub const DOLPHIN_LOCAL_MAX_TEXTURE_DEPTH: usize = 2;
+pub const DOLPHIN_LOCAL_MAX_SAVE_CANDIDATES: usize = 128;
 
 const FLATPAK_APP_ID: &str = "org.DolphinEmu.dolphin-emu";
 const MAX_RETAINED_NAMES_PER_KIND: usize = 128;
@@ -973,6 +980,25 @@ pub fn inspect_dolphin_profile(
     inspect_dolphin_profile_with_limit(profile, DOLPHIN_MAX_GAME_INI_FILES)
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DolphinCheatInspection {
+    pub inventory: DolphinGameIniInventory,
+    pub cheats_enabled: Option<bool>,
+}
+
+pub fn inspect_dolphin_profile_with_activation(
+    profile: &DolphinProfile,
+) -> Result<DolphinCheatInspection, DolphinInspectionError> {
+    let inventory = inspect_dolphin_profile(profile)?;
+    let dolphin_ini = profile.resolved.configuration_root.join("Dolphin.ini");
+    let graphics_ini = profile.resolved.configuration_root.join("GFX.ini");
+    let config = inspect_dolphin_config_paths(&dolphin_ini, &graphics_ini);
+    Ok(DolphinCheatInspection {
+        inventory,
+        cheats_enabled: config.settings.cheats_enabled,
+    })
+}
+
 fn inspect_dolphin_profile_with_limit(
     profile: &DolphinProfile,
     file_limit: usize,
@@ -1359,7 +1385,9 @@ fn section_kind(value: &str) -> Option<(DolphinCodeKind, bool)> {
     }
 }
 
-fn parse_game_identity(stem: &std::ffi::OsStr) -> (Option<String>, Option<u16>, Option<String>) {
+pub(crate) fn parse_game_identity(
+    stem: &std::ffi::OsStr,
+) -> (Option<String>, Option<u16>, Option<String>) {
     let Some(stem) = stem.to_str() else {
         return (None, None, None);
     };
@@ -1583,6 +1611,1437 @@ fn directory_identity(metadata: &fs::Metadata) -> Option<DolphinDirectoryIdentit
 #[cfg(not(unix))]
 fn directory_identity(_metadata: &fs::Metadata) -> Option<DolphinDirectoryIdentity> {
     None
+}
+
+// -------------------------------------------------------------------------
+// Modern local inspection
+//
+// The original Dolphin GameSettings API above remains the compatibility API
+// used by the cheat workflow.  The types below deliberately add a narrow,
+// read-only health and selected-game view comparable with the newer local
+// adapters.  They do not emit preservation evidence: a Dolphin game ID is a
+// useful association key only after core has independently established it.
+
+const DOLPHIN_LOCAL_MAX_UNKNOWN_SETTINGS: usize = 256;
+const DOLPHIN_LOCAL_MAX_LINES: usize = 8_192;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum DolphinLocalInstallationType {
+    Native,
+    FlatpakUser,
+    AppImage,
+    Portable,
+    Explicit,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum DolphinTargetPlatform {
+    GameCube,
+    Wii,
+    Other,
+}
+
+/// Container context supplied by core.  This enum is intentionally not
+/// inferred from a filename: `.iso`, `.gcm`, `.wbfs`, `.rvz`, `.wia`, and
+/// `.chd` remain different representations.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum DolphinDiscFormat {
+    Iso,
+    Gcm,
+    Wbfs,
+    Rvz,
+    Wia,
+    Chd,
+    Other,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DolphinDiscContext {
+    pub disc_number: u8,
+    pub format: DolphinDiscFormat,
+    pub representation: Representation,
+    pub claim: ClaimType,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DolphinExecutable {
+    pub path: PathBuf,
+    pub installation_type: DolphinLocalInstallationType,
+    /// This adapter parses only text supplied by an authorized outer probe;
+    /// discovery never executes a Dolphin binary.
+    pub version: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DolphinLocalProfile {
+    pub profile_id: String,
+    pub installation_type: DolphinLocalInstallationType,
+    pub configuration_root: PathBuf,
+    pub data_root: PathBuf,
+    pub eligible: bool,
+    pub blocker: Option<String>,
+    pub executable_candidates: Vec<DolphinExecutable>,
+    pub dolphin_ini_path: PathBuf,
+    pub graphics_ini_path: PathBuf,
+    pub game_settings_path: PathBuf,
+    pub textures_path: PathBuf,
+    pub memory_cards_path: PathBuf,
+    pub wii_data_path: PathBuf,
+    pub save_states_path: PathBuf,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DolphinLocalProfileDiscovery {
+    pub profiles: Vec<DolphinLocalProfile>,
+    pub complete: bool,
+}
+
+/// Discovery stays limited to known XDG/Flatpak paths plus exact caller
+/// supplied portable/custom locations.  It never walks a home directory.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DolphinLocalDiscoveryRoots {
+    pub home: PathBuf,
+    pub xdg_config_home: PathBuf,
+    pub xdg_data_home: PathBuf,
+    pub explicit_configuration_roots: Vec<PathBuf>,
+    pub portable_configuration_roots: Vec<PathBuf>,
+    pub explicit_executables: Vec<PathBuf>,
+    pub known_version_outputs: BTreeMap<PathBuf, String>,
+    pub appimage_directory: Option<PathBuf>,
+    /// Present whenever `DOLPHIN_EMU_USERPATH` is set in the environment.
+    /// Any value overrides Dolphin's default directory resolution, so its
+    /// mere presence - not its content - is what launch-binding cares about.
+    pub dolphin_emu_userpath_override: Option<PathBuf>,
+    /// Optional controlled PATH directories for deterministic callers and
+    /// tests. `None` means use the process environment in production.
+    pub path_override: Option<Vec<PathBuf>>,
+}
+
+impl DolphinLocalDiscoveryRoots {
+    pub fn from_environment() -> Result<Self, DolphinDiscoveryError> {
+        let home = env::var_os("HOME")
+            .map(PathBuf::from)
+            .ok_or(DolphinDiscoveryError::HomeUnavailable)?;
+        let xdg_config_home = env::var_os("XDG_CONFIG_HOME")
+            .map(PathBuf::from)
+            .unwrap_or_else(|| home.join(".config"));
+        let xdg_data_home = env::var_os("XDG_DATA_HOME")
+            .map(PathBuf::from)
+            .unwrap_or_else(|| home.join(".local/share"));
+        let appimage_directory = env::var_os("APPIMAGE")
+            .map(PathBuf::from)
+            .and_then(|path| path.parent().map(Path::to_path_buf));
+        Ok(Self {
+            home,
+            xdg_config_home,
+            xdg_data_home,
+            explicit_configuration_roots: Vec::new(),
+            portable_configuration_roots: Vec::new(),
+            explicit_executables: Vec::new(),
+            known_version_outputs: BTreeMap::new(),
+            appimage_directory,
+            dolphin_emu_userpath_override: env::var_os("DOLPHIN_EMU_USERPATH").map(PathBuf::from),
+            path_override: None,
+        })
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum DolphinGameIdMapping {
+    /// A GameCube/Wii header identity core independently verified.  It is
+    /// association metadata, not a Redump or container-hash equivalence.
+    CoreVerifiedMetadata,
+    EmulatorMetadataOnly,
+    ConflictingEmulatorMetadata,
+    Unavailable,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct DolphinGameRequest {
+    /// Core's canonical platform is retained as supplied; Dolphin never
+    /// rewrites it from a profile, filename, or game ID.
+    pub canonical_platform: Option<String>,
+    pub target_platform: Option<DolphinTargetPlatform>,
+    /// A core-verified disc-header Game ID, never a preservation match.
+    pub verified_game_id: Option<String>,
+    pub verified_revision: Option<u16>,
+    /// Metadata reported by Dolphin, a frontend, or a caller.  It cannot
+    /// create verified identity and is retained only for context.
+    pub emulator_game_id: Option<String>,
+    pub disc_contexts: Vec<DolphinDiscContext>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct DolphinSettings {
+    pub renderer: Option<String>,
+    pub internal_resolution: Option<String>,
+    pub widescreen: Option<bool>,
+    pub vsync: Option<bool>,
+    pub texture_filtering: Option<String>,
+    pub texture_cache: Option<bool>,
+    pub audio_backend: Option<String>,
+    pub cheats_enabled: Option<bool>,
+    pub controller_profile_present: Option<bool>,
+    pub unknown: BTreeMap<String, String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DolphinConfigInspection {
+    pub dolphin_ini_path: PathBuf,
+    pub graphics_ini_path: PathBuf,
+    pub exists: bool,
+    pub readable: bool,
+    pub settings: DolphinSettings,
+    pub warnings: Vec<DolphinInspectionWarning>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DolphinGameSettingsInspection {
+    pub path: PathBuf,
+    pub exists: bool,
+    pub readable: bool,
+    pub definition_count: usize,
+    pub enabled_count: usize,
+    pub warnings: Vec<DolphinInspectionWarning>,
+}
+
+/// Code definitions in a local Dolphin GameSettings file.  The file path is
+/// association context only; it cannot establish a game identity.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DolphinCheatInventory {
+    pub path: PathBuf,
+    pub exists: bool,
+    pub readable: bool,
+    pub definitions: usize,
+    pub enabled_definitions: usize,
+    pub warnings: Vec<DolphinInspectionWarning>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DolphinTextureInventory {
+    pub path: PathBuf,
+    pub present: bool,
+    pub file_count: usize,
+    pub total_size_bytes: u64,
+    pub complete: bool,
+    pub warnings: Vec<DolphinInspectionWarning>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DolphinSaveInventory {
+    /// These are candidates only.  A memory-card image or Wii NAND directory
+    /// is not proof that it belongs to the selected game.
+    pub candidate_paths: Vec<PathBuf>,
+    pub wii_data_present: bool,
+    pub complete: bool,
+    pub warnings: Vec<DolphinInspectionWarning>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DolphinHealth {
+    pub detected: bool,
+    pub config_readable: bool,
+    pub game_settings_available: bool,
+    pub memory_cards_present: bool,
+    pub wii_data_present: bool,
+    pub game_id_mapping: DolphinGameIdMapping,
+    pub warnings: Vec<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DolphinGameInspection {
+    pub game_id: Option<String>,
+    pub emulator_game_id_context: Option<String>,
+    pub game_id_mapping: DolphinGameIdMapping,
+    pub identity_mismatch: Option<String>,
+    pub canonical_platform: Option<String>,
+    pub target_platform: Option<DolphinTargetPlatform>,
+    pub disc_contexts: Vec<DolphinDiscContext>,
+    pub global_config: DolphinConfigInspection,
+    pub game_settings: Option<DolphinGameSettingsInspection>,
+    pub cheats: Option<DolphinCheatInventory>,
+    pub textures: Option<DolphinTextureInventory>,
+    pub saves: DolphinSaveInventory,
+    pub health: DolphinHealth,
+}
+
+#[derive(Clone)]
+struct DolphinLocalCandidate {
+    installation_type: DolphinLocalInstallationType,
+    configuration_root: PathBuf,
+    data_root: PathBuf,
+}
+
+pub fn discover_dolphin_local_profiles(
+    roots: &DolphinLocalDiscoveryRoots,
+) -> DolphinLocalProfileDiscovery {
+    let flatpak_root = roots.home.join(".var/app").join(FLATPAK_APP_ID);
+    let mut candidates = vec![
+        DolphinLocalCandidate {
+            installation_type: DolphinLocalInstallationType::Native,
+            configuration_root: roots.xdg_config_home.join("dolphin-emu"),
+            data_root: roots.xdg_data_home.join("dolphin-emu"),
+        },
+        DolphinLocalCandidate {
+            installation_type: DolphinLocalInstallationType::FlatpakUser,
+            configuration_root: flatpak_root.join("config/dolphin-emu"),
+            data_root: flatpak_root.join("data/dolphin-emu"),
+        },
+    ];
+    candidates.extend(
+        roots
+            .portable_configuration_roots
+            .iter()
+            .cloned()
+            .map(|root| DolphinLocalCandidate {
+                installation_type: DolphinLocalInstallationType::Portable,
+                configuration_root: root.clone(),
+                data_root: root,
+            }),
+    );
+    for image in dolphin_known_appimages(roots) {
+        let directory = image.path.parent().unwrap_or_else(|| Path::new("/"));
+        let portable_root = [directory.join("User"), directory.join("user")]
+            .into_iter()
+            .find(|root| root.join("Config/Dolphin.ini").is_file());
+        let (configuration_root, data_root) = portable_root.map_or_else(
+            || {
+                (
+                    roots.xdg_config_home.join("dolphin-emu"),
+                    roots.xdg_data_home.join("dolphin-emu"),
+                )
+            },
+            |root| (root.clone(), root),
+        );
+        candidates.push(DolphinLocalCandidate {
+            installation_type: DolphinLocalInstallationType::AppImage,
+            configuration_root,
+            data_root,
+        });
+    }
+    if let Some(directory) = &roots.appimage_directory {
+        candidates.push(DolphinLocalCandidate {
+            installation_type: DolphinLocalInstallationType::Portable,
+            configuration_root: directory.join("User"),
+            data_root: directory.join("User"),
+        });
+    }
+    candidates.extend(
+        roots
+            .explicit_configuration_roots
+            .iter()
+            .cloned()
+            .map(|root| DolphinLocalCandidate {
+                installation_type: DolphinLocalInstallationType::Explicit,
+                configuration_root: root.clone(),
+                data_root: root,
+            }),
+    );
+    candidates.sort_by(|left, right| {
+        left.configuration_root
+            .cmp(&right.configuration_root)
+            .then_with(|| left.data_root.cmp(&right.data_root))
+    });
+    candidates.dedup_by(|left, right| {
+        left.installation_type == right.installation_type
+            && left.configuration_root == right.configuration_root
+            && left.data_root == right.data_root
+    });
+    let executables = discover_dolphin_local_executables(roots);
+    DolphinLocalProfileDiscovery {
+        profiles: candidates
+            .into_iter()
+            .take(DOLPHIN_MAX_PROFILES)
+            .map(|candidate| dolphin_local_profile(candidate, &executables))
+            .collect(),
+        complete: true,
+    }
+}
+
+/// Parses supplied version output only; it never launches Dolphin.
+pub fn parse_dolphin_version(output: &str) -> Option<String> {
+    output.lines().find_map(|line| {
+        let lower = line.to_ascii_lowercase();
+        let index = lower.find("dolphin")?;
+        let tail = line[index + "dolphin".len()..]
+            .trim_start_matches(|value: char| {
+                value.is_ascii_whitespace() || value == ':' || value == '-'
+            })
+            .trim_start_matches("Emulator")
+            .trim();
+        let version: String = tail
+            .chars()
+            .take_while(|value| value.is_ascii_alphanumeric() || matches!(value, '.' | '-'))
+            .collect();
+        (!version.is_empty() && version.chars().any(|value| value.is_ascii_digit()))
+            .then_some(version)
+    })
+}
+
+pub fn inspect_dolphin_local_game(
+    profile: &DolphinLocalProfile,
+    request: &DolphinGameRequest,
+) -> DolphinGameInspection {
+    let global_config = inspect_dolphin_local_config(profile);
+    let (game_id, game_id_mapping, identity_mismatch) = dolphin_local_game_id(request);
+    let game_settings = game_id.as_deref().map(|id| {
+        let path = dolphin_local_game_settings_path(profile, id, request.verified_revision);
+        inspect_dolphin_local_game_settings(&path)
+    });
+    let cheats = game_settings
+        .as_ref()
+        .map(|settings| DolphinCheatInventory {
+            path: settings.path.clone(),
+            exists: settings.exists,
+            readable: settings.readable,
+            definitions: settings.definition_count,
+            enabled_definitions: settings.enabled_count,
+            warnings: settings.warnings.clone(),
+        });
+    let textures = game_id
+        .as_deref()
+        .map(|id| inspect_dolphin_local_textures(&profile.textures_path.join(id)));
+    let saves = inspect_dolphin_local_saves(profile);
+    let mut warnings: Vec<String> = profile.blocker.iter().cloned().collect();
+    warnings.extend(
+        global_config
+            .warnings
+            .iter()
+            .map(|warning| warning.detail.clone()),
+    );
+    if let Some(mismatch) = &identity_mismatch {
+        warnings.push(mismatch.clone());
+    }
+    let health = DolphinHealth {
+        detected: profile.eligible || !profile.executable_candidates.is_empty(),
+        config_readable: global_config.readable,
+        game_settings_available: is_real_directory_local(&profile.game_settings_path),
+        memory_cards_present: saves
+            .candidate_paths
+            .iter()
+            .any(|path| path.starts_with(&profile.memory_cards_path)),
+        wii_data_present: saves.wii_data_present,
+        game_id_mapping,
+        warnings,
+    };
+    DolphinGameInspection {
+        game_id,
+        emulator_game_id_context: request.emulator_game_id.clone(),
+        game_id_mapping,
+        identity_mismatch,
+        canonical_platform: request.canonical_platform.clone(),
+        target_platform: request.target_platform,
+        disc_contexts: request.disc_contexts.iter().take(32).cloned().collect(),
+        global_config,
+        game_settings,
+        cheats,
+        textures,
+        saves,
+        health,
+    }
+}
+
+fn dolphin_local_profile(
+    candidate: DolphinLocalCandidate,
+    executables: &[DolphinExecutable],
+) -> DolphinLocalProfile {
+    let dolphin_ini_path = if candidate.installation_type == DolphinLocalInstallationType::AppImage
+        && is_regular_file_local(&candidate.configuration_root.join("Config/Dolphin.ini"))
+    {
+        candidate.configuration_root.join("Config/Dolphin.ini")
+    } else {
+        candidate.configuration_root.join("Dolphin.ini")
+    };
+    let blocker =
+        if !candidate.configuration_root.is_absolute() || !candidate.data_root.is_absolute() {
+            Some("configuration and data roots must be absolute".to_string())
+        } else if !is_real_directory_local(&candidate.configuration_root) {
+            Some("configuration directory is absent, unsafe, or not a real directory".to_string())
+        } else if !is_regular_file_local(&dolphin_ini_path) {
+            Some("Dolphin.ini was not found as a regular file".to_string())
+        } else {
+            None
+        };
+    DolphinLocalProfile {
+        profile_id: if candidate.installation_type == DolphinLocalInstallationType::AppImage {
+            format!(
+                "dolphin:appimage:{}",
+                candidate.configuration_root.display()
+            )
+        } else {
+            format!("dolphin:{}", candidate.configuration_root.display())
+        },
+        installation_type: candidate.installation_type,
+        configuration_root: candidate.configuration_root.clone(),
+        data_root: candidate.data_root.clone(),
+        eligible: blocker.is_none(),
+        blocker,
+        executable_candidates: executables.to_vec(),
+        dolphin_ini_path,
+        graphics_ini_path: candidate.configuration_root.join("GFX.ini"),
+        game_settings_path: candidate.data_root.join("GameSettings"),
+        textures_path: candidate.data_root.join("Load/Textures"),
+        memory_cards_path: candidate.data_root.join("GC"),
+        wii_data_path: candidate.data_root.join("Wii"),
+        save_states_path: candidate.data_root.join("StateSaves"),
+    }
+}
+
+fn dolphin_local_game_settings_path(
+    profile: &DolphinLocalProfile,
+    game_id: &str,
+    revision: Option<u16>,
+) -> PathBuf {
+    if let Some(revision) = revision {
+        let revision_path = profile
+            .game_settings_path
+            .join(format!("{game_id}r{revision}.ini"));
+        if is_regular_file_local(&revision_path) {
+            return revision_path;
+        }
+    }
+    profile.game_settings_path.join(format!("{game_id}.ini"))
+}
+
+fn discover_dolphin_local_executables(
+    roots: &DolphinLocalDiscoveryRoots,
+) -> Vec<DolphinExecutable> {
+    let mut paths = roots.explicit_executables.clone();
+    paths.extend(
+        dolphin_known_appimages(roots)
+            .into_iter()
+            .map(|image| image.path),
+    );
+    if let Some(directory) = &roots.appimage_directory {
+        paths.extend([
+            directory.join("Dolphin.AppImage"),
+            directory.join("dolphin-emu.AppImage"),
+            directory.join("dolphin-emu"),
+        ]);
+    }
+    let path_directories = roots
+        .path_override
+        .clone()
+        .or_else(|| env::var_os("PATH").map(|path| env::split_paths(&path).collect()));
+    if let Some(path_directories) = path_directories {
+        for directory in path_directories.into_iter().take(128) {
+            paths.extend([directory.join("dolphin-emu"), directory.join("dolphin-qt2")]);
+        }
+    }
+    paths.sort();
+    paths.dedup();
+    paths
+        .into_iter()
+        .filter(|path| crate::launch::installation_known::flatpak_wrapper_app_id(path).is_none())
+        .filter(|path| is_regular_file_local(path))
+        .map(|path| DolphinExecutable {
+            installation_type: if roots.explicit_executables.contains(&path) {
+                DolphinLocalInstallationType::Explicit
+            } else if path
+                .extension()
+                .is_some_and(|extension| extension.eq_ignore_ascii_case("appimage"))
+            {
+                DolphinLocalInstallationType::AppImage
+            } else if roots
+                .appimage_directory
+                .as_ref()
+                .is_some_and(|directory| path.starts_with(directory))
+            {
+                DolphinLocalInstallationType::Portable
+            } else {
+                DolphinLocalInstallationType::Native
+            },
+            version: roots
+                .known_version_outputs
+                .get(&path)
+                .and_then(|output| parse_dolphin_version(output)),
+            path,
+        })
+        .collect()
+}
+
+fn dolphin_known_appimages(
+    roots: &DolphinLocalDiscoveryRoots,
+) -> Vec<crate::launch::installation_known::FoundAppImage> {
+    let known = known_install_roots(
+        &roots.home,
+        &roots.xdg_data_home,
+        roots.path_override.as_deref(),
+    );
+    crate::launch::installation_known::discover_appimages(
+        &crate::launch::installation_known::DOLPHIN,
+        &known,
+    )
+}
+
+fn known_install_roots(
+    home: &Path,
+    user_data: &Path,
+    path_override: Option<&[PathBuf]>,
+) -> crate::launch::installation_known::KnownInstallRoots {
+    crate::launch::installation_known::KnownInstallRoots {
+        home: home.to_path_buf(),
+        user_data: user_data.to_path_buf(),
+        system_data: PathBuf::from("/var/lib"),
+        path_dirs: path_override.map_or_else(
+            || {
+                env::var_os("PATH")
+                    .map(|path| env::split_paths(&path).take(64).collect())
+                    .unwrap_or_default()
+            },
+            <[PathBuf]>::to_vec,
+        ),
+    }
+}
+
+// --- Native launch binding -------------------------------------------------
+//
+// A profile's `executable_candidates` alone do not authorize a launch: the
+// list is populated once for every discovered profile regardless of which
+// installation it actually belongs to, and `data_root` is never a valid
+// Dolphin `-u` argument on its own (Dolphin derives `Config/` beneath
+// whatever `-u` receives, which would silently relocate a split XDG
+// configuration root). This section proves, freshly and read-only, exactly
+// which executable belongs to a profile and whether the profile's roots
+// correspond to Dolphin's *default* directory resolution (no `-u`) or to a
+// single genuine Dolphin user root (`-u <root>`). It never launches Dolphin,
+// writes configuration, or creates directories.
+
+/// How the eventual launch command should select Dolphin's user directory.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum DolphinUserDirectoryMode {
+    /// No `-u` argument; Dolphin resolves its own default directories.
+    DefaultNative,
+    /// `-u <root>`; Dolphin derives `Config/`, `GameSettings/`, `GC/`,
+    /// `Wii/`, etc. beneath this single verified root.
+    ExplicitRoot(PathBuf),
+}
+
+/// A freshly proven executable/profile pairing, safe to use as the first two
+/// (or three) tokens of a Dolphin native launch command. Callers must treat
+/// this as re-derivable state, not a cache: call
+/// [`resolve_dolphin_native_launch_binding`] again at the moment of launch.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DolphinNativeLaunchBinding {
+    pub executable: PathBuf,
+    pub installation: crate::launch::installation::LaunchInstallation,
+    pub user_directory_mode: DolphinUserDirectoryMode,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum DolphinLaunchBlockerKind {
+    /// Flatpak, or a portable/AppImage profile that cannot be proven
+    /// native-equivalent by this adapter.
+    UnsupportedInstallationType,
+    /// More than one viable executable candidate matches the profile and no
+    /// authority distinguishes them.
+    AmbiguousExecutable,
+    /// No candidate executable exists on disk.
+    ExecutableMissing,
+    /// A candidate executable exists but is a symlink or not a regular file.
+    ExecutableUnsafe,
+    /// A candidate executable exists as a regular file but lacks the
+    /// executable permission bit.
+    ExecutableNotExecutable,
+    /// The profile's configuration/data roots (or Dolphin.ini) no longer
+    /// match what discovery originally observed.
+    ProfileRootMismatch,
+    /// The profile's roots do not match Dolphin's current default XDG
+    /// resolution, so `DefaultNative` cannot be proven.
+    DefaultResolutionMismatch,
+    /// The candidate explicit root is not an absolute, existing,
+    /// non-symlinked directory with `Config/Dolphin.ini` beneath it.
+    ExplicitRootInvalid,
+    /// An environment variable (`DOLPHIN_EMU_USERPATH`) would override
+    /// Dolphin's default directory resolution.
+    EnvironmentOverridePresent,
+    /// A `portable.txt` marker or legacy `~/.dolphin-emu` directory would
+    /// change which directories Dolphin actually resolves to.
+    PortableOrLegacyLayoutConflict,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DolphinLaunchBlocker {
+    pub kind: DolphinLaunchBlockerKind,
+    pub detail: String,
+}
+
+fn launch_blocker(
+    kind: DolphinLaunchBlockerKind,
+    detail: impl Into<String>,
+) -> DolphinLaunchBlocker {
+    DolphinLaunchBlocker {
+        kind,
+        detail: detail.into(),
+    }
+}
+
+/// Freshly revalidates `profile` against `roots` and either proves a launch
+/// binding or returns a structured blocker. Pure and read-only: it inspects
+/// filesystem metadata and the supplied environment-derived roots only, and
+/// never spawns a process, writes Dolphin configuration, or creates
+/// directories. Safe - and intended - to call again at future launch time.
+pub fn resolve_dolphin_native_launch_binding(
+    profile: &DolphinLocalProfile,
+    roots: &DolphinLocalDiscoveryRoots,
+) -> Result<DolphinNativeLaunchBinding, DolphinLaunchBlocker> {
+    if !profile.eligible {
+        return Err(launch_blocker(
+            DolphinLaunchBlockerKind::ProfileRootMismatch,
+            "profile is not eligible",
+        ));
+    }
+    match profile.installation_type {
+        DolphinLocalInstallationType::Native => resolve_default_native_binding(profile, roots),
+        DolphinLocalInstallationType::AppImage => resolve_appimage_binding(profile, roots),
+        DolphinLocalInstallationType::Explicit => resolve_explicit_root_binding(profile),
+        DolphinLocalInstallationType::FlatpakUser => resolve_flatpak_binding(profile, roots),
+        DolphinLocalInstallationType::Portable => Err(launch_blocker(
+            DolphinLaunchBlockerKind::UnsupportedInstallationType,
+            "portable/AppImage Dolphin profiles cannot be proven native-equivalent; failing closed",
+        )),
+    }
+}
+
+fn resolve_default_native_binding(
+    profile: &DolphinLocalProfile,
+    roots: &DolphinLocalDiscoveryRoots,
+) -> Result<DolphinNativeLaunchBinding, DolphinLaunchBlocker> {
+    let expected_config = roots.xdg_config_home.join("dolphin-emu");
+    let expected_data = roots.xdg_data_home.join("dolphin-emu");
+    if profile.configuration_root != expected_config || profile.data_root != expected_data {
+        return Err(launch_blocker(
+            DolphinLaunchBlockerKind::DefaultResolutionMismatch,
+            format!(
+                "profile roots {} / {} do not match the current default XDG resolution {} / {}",
+                profile.configuration_root.display(),
+                profile.data_root.display(),
+                expected_config.display(),
+                expected_data.display(),
+            ),
+        ));
+    }
+    if let Some(userpath) = &roots.dolphin_emu_userpath_override {
+        return Err(launch_blocker(
+            DolphinLaunchBlockerKind::EnvironmentOverridePresent,
+            format!(
+                "DOLPHIN_EMU_USERPATH is set to {} and would override the default directory resolution",
+                userpath.display()
+            ),
+        ));
+    }
+    let legacy_root = roots.home.join(".dolphin-emu");
+    if is_real_directory_local(&legacy_root) {
+        return Err(launch_blocker(
+            DolphinLaunchBlockerKind::PortableOrLegacyLayoutConflict,
+            format!(
+                "legacy Dolphin user directory {} exists and takes precedence over the XDG default",
+                legacy_root.display()
+            ),
+        ));
+    }
+    if !is_real_directory_local(&profile.configuration_root)
+        || !is_real_directory_local(&profile.data_root)
+        || !is_regular_file_local(&profile.dolphin_ini_path)
+    {
+        return Err(launch_blocker(
+            DolphinLaunchBlockerKind::ProfileRootMismatch,
+            "configuration root, data root, or Dolphin.ini no longer match the discovered profile",
+        ));
+    }
+    let executable = resolve_native_executable(profile)?;
+    if let Some(blocker) = portable_txt_conflict(&executable) {
+        return Err(blocker);
+    }
+    Ok(DolphinNativeLaunchBinding {
+        installation: dolphin_launch_installation(profile.installation_type, &executable),
+        executable,
+        user_directory_mode: DolphinUserDirectoryMode::DefaultNative,
+    })
+}
+
+fn resolve_appimage_binding(
+    profile: &DolphinLocalProfile,
+    roots: &DolphinLocalDiscoveryRoots,
+) -> Result<DolphinNativeLaunchBinding, DolphinLaunchBlocker> {
+    let default_config = roots.xdg_config_home.join("dolphin-emu");
+    if profile.configuration_root == default_config {
+        resolve_default_native_binding(profile, roots)
+    } else {
+        resolve_explicit_root_binding(profile)
+    }
+}
+
+fn resolve_flatpak_binding(
+    profile: &DolphinLocalProfile,
+    roots: &DolphinLocalDiscoveryRoots,
+) -> Result<DolphinNativeLaunchBinding, DolphinLaunchBlocker> {
+    let expected_config = roots
+        .home
+        .join(".var/app")
+        .join(crate::launch::installation_known::DOLPHIN.flatpak_ids[0])
+        .join("config/dolphin-emu");
+    let expected_data = roots
+        .home
+        .join(".var/app")
+        .join(crate::launch::installation_known::DOLPHIN.flatpak_ids[0])
+        .join("data/dolphin-emu");
+    if profile.configuration_root != expected_config || profile.data_root != expected_data {
+        return Err(launch_blocker(
+            DolphinLaunchBlockerKind::ProfileRootMismatch,
+            "profile is not the exact Dolphin Flatpak configuration/data location",
+        ));
+    }
+    let known = known_install_roots(
+        &roots.home,
+        &roots.xdg_data_home,
+        roots.path_override.as_deref(),
+    );
+    let found_flatpaks = crate::launch::installation_known::discover_flatpaks(
+        &crate::launch::installation_known::DOLPHIN,
+        &known,
+    );
+    let Some(found) = found_flatpaks.first() else {
+        return Err(launch_blocker(
+            DolphinLaunchBlockerKind::UnsupportedInstallationType,
+            "Dolphin Flatpak deployment was not found",
+        ));
+    };
+    let executable =
+        crate::launch::installation_known::flatpak_binary(&known).ok_or_else(|| {
+            launch_blocker(
+                DolphinLaunchBlockerKind::ExecutableMissing,
+                "the flatpak command was not found on PATH",
+            )
+        })?;
+    Ok(DolphinNativeLaunchBinding {
+        installation: crate::launch::installation::LaunchInstallation::flatpak(&found.app_id)
+            .map_err(|error| {
+                launch_blocker(
+                    DolphinLaunchBlockerKind::UnsupportedInstallationType,
+                    error.to_string(),
+                )
+            })?,
+        executable,
+        user_directory_mode: DolphinUserDirectoryMode::DefaultNative,
+    })
+}
+
+fn dolphin_launch_installation(
+    kind: DolphinLocalInstallationType,
+    executable: &Path,
+) -> crate::launch::installation::LaunchInstallation {
+    use crate::launch::installation::LaunchInstallation;
+    if executable
+        .extension()
+        .is_some_and(|extension| extension.eq_ignore_ascii_case("appimage"))
+    {
+        LaunchInstallation::AppImage {
+            extract_and_run: false,
+        }
+    } else if kind == DolphinLocalInstallationType::FlatpakUser {
+        LaunchInstallation::flatpak(crate::launch::installation_known::DOLPHIN.flatpak_ids[0])
+            .expect("the built-in Dolphin app id is valid")
+    } else {
+        LaunchInstallation::Native
+    }
+}
+
+fn resolve_explicit_root_binding(
+    profile: &DolphinLocalProfile,
+) -> Result<DolphinNativeLaunchBinding, DolphinLaunchBlocker> {
+    if profile.configuration_root != profile.data_root {
+        return Err(launch_blocker(
+            DolphinLaunchBlockerKind::ExplicitRootInvalid,
+            "configuration and data roots differ; a single Dolphin user root could not be proven",
+        ));
+    }
+    let root = profile.configuration_root.clone();
+    if !root.is_absolute() || root.parent().is_none() {
+        return Err(launch_blocker(
+            DolphinLaunchBlockerKind::ExplicitRootInvalid,
+            "root is not an absolute, non-filesystem-root path",
+        ));
+    }
+    match fs::symlink_metadata(&root) {
+        Ok(metadata) if metadata.file_type().is_symlink() => {
+            return Err(launch_blocker(
+                DolphinLaunchBlockerKind::ExplicitRootInvalid,
+                format!("{} is a symlink", root.display()),
+            ));
+        }
+        Ok(metadata) if metadata.is_dir() => {}
+        Ok(_) => {
+            return Err(launch_blocker(
+                DolphinLaunchBlockerKind::ExplicitRootInvalid,
+                format!("{} is not a directory", root.display()),
+            ));
+        }
+        Err(_) => {
+            return Err(launch_blocker(
+                DolphinLaunchBlockerKind::ExplicitRootInvalid,
+                format!("{} does not exist", root.display()),
+            ));
+        }
+    }
+    // Never infer a single-root layout from `data_root`/`GameSettings`
+    // evidence alone: a genuine `-u <root>` layout must show Dolphin's own
+    // `Config/Dolphin.ini` beneath the candidate root.
+    let config_dir = root.join("Config");
+    if !is_real_directory_local(&config_dir) {
+        return Err(launch_blocker(
+            DolphinLaunchBlockerKind::ExplicitRootInvalid,
+            format!(
+                "{} does not exist; a single Dolphin user root layout could not be proven",
+                config_dir.display()
+            ),
+        ));
+    }
+    if !is_regular_file_local(&config_dir.join("Dolphin.ini")) {
+        return Err(launch_blocker(
+            DolphinLaunchBlockerKind::ExplicitRootInvalid,
+            format!(
+                "{} was not found as a regular file",
+                config_dir.join("Dolphin.ini").display()
+            ),
+        ));
+    }
+    let executable = resolve_native_executable(profile)?;
+    Ok(DolphinNativeLaunchBinding {
+        installation: dolphin_launch_installation(profile.installation_type, &executable),
+        executable,
+        user_directory_mode: DolphinUserDirectoryMode::ExplicitRoot(root),
+    })
+}
+
+/// `portable.txt` next to the executable forces Dolphin into portable mode,
+/// which redirects directory resolution away from the profile just proven.
+fn portable_txt_conflict(executable: &Path) -> Option<DolphinLaunchBlocker> {
+    let marker = executable.parent()?.join("portable.txt");
+    is_regular_file_local(&marker).then(|| {
+        launch_blocker(
+            DolphinLaunchBlockerKind::PortableOrLegacyLayoutConflict,
+            format!(
+                "{} exists next to the executable and would force portable mode",
+                marker.display()
+            ),
+        )
+    })
+}
+
+/// Binds exactly one executable to `profile`, matching candidates only by
+/// the profile's own installation type - `executable_candidates` is shared
+/// across every discovered profile and is not otherwise scoped per-profile.
+/// Never falls back to a hard-coded name: a profile with no matching,
+/// verified-safe candidate is always blocked.
+fn resolve_native_executable(
+    profile: &DolphinLocalProfile,
+) -> Result<PathBuf, DolphinLaunchBlocker> {
+    let matching: Vec<&DolphinExecutable> = profile
+        .executable_candidates
+        .iter()
+        .filter(|candidate| candidate.installation_type == profile.installation_type)
+        .collect();
+    if matching.is_empty() {
+        return Err(launch_blocker(
+            DolphinLaunchBlockerKind::ExecutableMissing,
+            "no discovered executable is associated with this profile's installation type",
+        ));
+    }
+    let mut valid = Vec::new();
+    let mut last_error = None;
+    for candidate in matching {
+        match validate_native_executable(&candidate.path) {
+            Ok(()) => valid.push(candidate.path.clone()),
+            Err(error) => last_error = Some(error),
+        }
+    }
+    match valid.len() {
+        0 => Err(last_error.expect("at least one candidate was inspected")),
+        1 => Ok(valid.into_iter().next().expect("length checked above")),
+        _ if profile.installation_type == DolphinLocalInstallationType::AppImage => {
+            valid.sort();
+            Ok(valid.remove(0))
+        }
+        count => Err(launch_blocker(
+            DolphinLaunchBlockerKind::AmbiguousExecutable,
+            format!(
+                "{count} viable executables match this profile and none is distinguished as authoritative"
+            ),
+        )),
+    }
+}
+
+fn validate_native_executable(path: &Path) -> Result<(), DolphinLaunchBlocker> {
+    let metadata = fs::symlink_metadata(path).map_err(|_| {
+        launch_blocker(
+            DolphinLaunchBlockerKind::ExecutableMissing,
+            format!("{} does not exist", path.display()),
+        )
+    })?;
+    if metadata.file_type().is_symlink() {
+        return Err(launch_blocker(
+            DolphinLaunchBlockerKind::ExecutableUnsafe,
+            format!("{} is a symlink", path.display()),
+        ));
+    }
+    if !metadata.is_file() {
+        return Err(launch_blocker(
+            DolphinLaunchBlockerKind::ExecutableUnsafe,
+            format!("{} is not a regular file", path.display()),
+        ));
+    }
+    #[cfg(unix)]
+    if metadata.permissions().mode() & 0o111 == 0 {
+        return Err(launch_blocker(
+            DolphinLaunchBlockerKind::ExecutableNotExecutable,
+            format!("{} is not executable", path.display()),
+        ));
+    }
+    Ok(())
+}
+
+fn dolphin_local_game_id(
+    request: &DolphinGameRequest,
+) -> (Option<String>, DolphinGameIdMapping, Option<String>) {
+    let verified = request
+        .verified_game_id
+        .as_deref()
+        .and_then(normalize_verified_game_id);
+    let emulator = request
+        .emulator_game_id
+        .as_deref()
+        .and_then(normalize_verified_game_id);
+    match (verified, emulator) {
+        (Some(verified), Some(emulator)) if verified != emulator => (
+            Some(verified.clone()),
+            DolphinGameIdMapping::ConflictingEmulatorMetadata,
+            Some(format!(
+                "Dolphin metadata game ID {emulator} conflicts with core-verified disc-header game ID {verified}"
+            )),
+        ),
+        (Some(verified), _) => (
+            Some(verified),
+            DolphinGameIdMapping::CoreVerifiedMetadata,
+            None,
+        ),
+        (None, Some(emulator)) => (
+            Some(emulator),
+            DolphinGameIdMapping::EmulatorMetadataOnly,
+            None,
+        ),
+        (None, None) => (None, DolphinGameIdMapping::Unavailable, None),
+    }
+}
+
+fn inspect_dolphin_local_config(profile: &DolphinLocalProfile) -> DolphinConfigInspection {
+    inspect_dolphin_config_paths(&profile.dolphin_ini_path, &profile.graphics_ini_path)
+}
+
+fn inspect_dolphin_config_paths(
+    dolphin_ini_path: &Path,
+    graphics_ini_path: &Path,
+) -> DolphinConfigInspection {
+    let mut warnings = Vec::new();
+    let dolphin = read_dolphin_local_text(
+        dolphin_ini_path,
+        DOLPHIN_LOCAL_MAX_CONFIG_BYTES,
+        &mut warnings,
+    );
+    let graphics = read_dolphin_local_text(
+        graphics_ini_path,
+        DOLPHIN_LOCAL_MAX_CONFIG_BYTES,
+        &mut warnings,
+    );
+    let mut settings = DolphinSettings::default();
+    if let Some(text) = dolphin.as_deref() {
+        parse_dolphin_local_ini(text, dolphin_ini_path, &mut settings, &mut warnings);
+    }
+    if let Some(text) = graphics.as_deref() {
+        parse_dolphin_local_ini(text, graphics_ini_path, &mut settings, &mut warnings);
+    }
+    DolphinConfigInspection {
+        dolphin_ini_path: dolphin_ini_path.to_path_buf(),
+        graphics_ini_path: graphics_ini_path.to_path_buf(),
+        exists: dolphin_ini_path.exists() || graphics_ini_path.exists(),
+        readable: dolphin.is_some(),
+        settings,
+        warnings,
+    }
+}
+
+fn parse_dolphin_local_ini(
+    text: &str,
+    path: &Path,
+    settings: &mut DolphinSettings,
+    warnings: &mut Vec<DolphinInspectionWarning>,
+) {
+    let mut section = String::new();
+    for (index, raw) in text.lines().enumerate() {
+        if index >= DOLPHIN_LOCAL_MAX_LINES {
+            push_dolphin_local_warning(
+                warnings,
+                DolphinInspectionWarningKind::LineCountLimitReached,
+                path,
+                format!("INI parsing stopped at {DOLPHIN_LOCAL_MAX_LINES} lines"),
+            );
+            break;
+        }
+        if raw.len() > DOLPHIN_MAX_LINE_BYTES {
+            push_dolphin_local_warning(
+                warnings,
+                DolphinInspectionWarningKind::LineTooLong,
+                path,
+                format!("INI line exceeds {DOLPHIN_MAX_LINE_BYTES} bytes"),
+            );
+            continue;
+        }
+        let line = raw.trim();
+        if line.is_empty() || line.starts_with(';') || line.starts_with('#') {
+            continue;
+        }
+        if line.starts_with('[') {
+            if let Some(section_name) = line.strip_suffix(']') {
+                section = section_name[1..].trim().to_ascii_lowercase();
+            } else {
+                push_dolphin_local_warning(
+                    warnings,
+                    DolphinInspectionWarningKind::MalformedIni,
+                    path,
+                    "INI section does not end with ']'",
+                );
+            }
+            continue;
+        }
+        let Some((key, value)) = line.split_once('=') else {
+            push_dolphin_local_warning(
+                warnings,
+                DolphinInspectionWarningKind::MalformedIni,
+                path,
+                "INI setting has no '=' separator",
+            );
+            continue;
+        };
+        let key = key.trim().to_ascii_lowercase();
+        let value = value.trim();
+        let boolean = parse_dolphin_local_bool(value);
+        match key.as_str() {
+            "backend" | "renderer" => settings.renderer = Some(value.to_string()),
+            "internalresolution" | "internal_resolution" | "efbresolution" => {
+                settings.internal_resolution = Some(value.to_string())
+            }
+            "widescreenhack" | "widescreen_hack" | "widescreen" => settings.widescreen = boolean,
+            "vsync" | "vsyncenabled" => settings.vsync = boolean,
+            "texturefiltering" | "texture_filtering" => {
+                settings.texture_filtering = Some(value.to_string())
+            }
+            "texturecache" | "texture_cache" => settings.texture_cache = boolean,
+            "backendname" | "audio_backend" => settings.audio_backend = Some(value.to_string()),
+            "enablecheats" | "enable_cheats" => settings.cheats_enabled = boolean,
+            "profile" | "controllerprofile" | "controller_profile" => {
+                settings.controller_profile_present = Some(!value.is_empty())
+            }
+            _ if settings.unknown.len() < DOLPHIN_LOCAL_MAX_UNKNOWN_SETTINGS => {
+                settings
+                    .unknown
+                    .insert(format!("{section}.{key}"), value.to_string());
+            }
+            _ => {}
+        }
+    }
+}
+
+fn inspect_dolphin_local_game_settings(path: &Path) -> DolphinGameSettingsInspection {
+    let mut warnings = Vec::new();
+    let exists = path.exists();
+    let Some(text) = read_dolphin_local_text(path, DOLPHIN_MAX_GAME_INI_BYTES, &mut warnings)
+    else {
+        return DolphinGameSettingsInspection {
+            path: path.to_path_buf(),
+            exists,
+            readable: false,
+            definition_count: 0,
+            enabled_count: 0,
+            warnings,
+        };
+    };
+    let mut parsed = ParsedIni::default();
+    let mut local_warnings = Vec::new();
+    parse_ini_text(&text, &mut parsed, &mut local_warnings);
+    for kind in local_warnings {
+        push_dolphin_local_warning(&mut warnings, kind, path, "GameSettings parse warning");
+    }
+    DolphinGameSettingsInspection {
+        path: path.to_path_buf(),
+        exists,
+        readable: true,
+        definition_count: parsed.frame.len()
+            + parsed.ar.len()
+            + parsed.gecko.len()
+            + parsed.riivolution.len(),
+        enabled_count: parsed.frame_enabled.len()
+            + parsed.ar_enabled.len()
+            + parsed.gecko_enabled.len()
+            + parsed.riivolution_enabled.len(),
+        warnings,
+    }
+}
+
+fn inspect_dolphin_local_textures(path: &Path) -> DolphinTextureInventory {
+    let mut output = DolphinTextureInventory {
+        path: path.to_path_buf(),
+        present: is_real_directory_local(path),
+        file_count: 0,
+        total_size_bytes: 0,
+        complete: true,
+        warnings: Vec::new(),
+    };
+    if !output.present {
+        return output;
+    }
+    let mut todo = VecDeque::from([(path.to_path_buf(), 0usize)]);
+    let mut entries_seen = 0usize;
+    while let Some((directory, depth)) = todo.pop_front() {
+        let Ok(entries) = fs::read_dir(&directory) else {
+            output.complete = false;
+            push_dolphin_local_warning(
+                &mut output.warnings,
+                DolphinInspectionWarningKind::UnreadablePath,
+                &directory,
+                "texture directory cannot be read",
+            );
+            continue;
+        };
+        for entry in entries.flatten() {
+            if entries_seen >= DOLPHIN_MAX_ENTRIES_VISITED {
+                output.complete = false;
+                push_dolphin_local_warning(
+                    &mut output.warnings,
+                    DolphinInspectionWarningKind::EntryLimitReached,
+                    &directory,
+                    format!("texture traversal stopped at {DOLPHIN_MAX_ENTRIES_VISITED} entries"),
+                );
+                return output;
+            }
+            entries_seen += 1;
+            let entry_path = entry.path();
+            let Ok(metadata) = fs::symlink_metadata(&entry_path) else {
+                output.complete = false;
+                continue;
+            };
+            if metadata.file_type().is_symlink() {
+                push_dolphin_local_warning(
+                    &mut output.warnings,
+                    DolphinInspectionWarningKind::SymlinkSkipped,
+                    &entry_path,
+                    "symlink was not followed",
+                );
+            } else if metadata.is_file() {
+                if output.file_count >= DOLPHIN_LOCAL_MAX_TEXTURE_FILES {
+                    output.complete = false;
+                    push_dolphin_local_warning(
+                        &mut output.warnings,
+                        DolphinInspectionWarningKind::FileCountLimitReached,
+                        &entry_path,
+                        format!(
+                            "texture traversal stopped at {DOLPHIN_LOCAL_MAX_TEXTURE_FILES} files"
+                        ),
+                    );
+                    return output;
+                }
+                output.file_count += 1;
+                output.total_size_bytes = output.total_size_bytes.saturating_add(metadata.len());
+            } else if metadata.is_dir() {
+                if depth >= DOLPHIN_LOCAL_MAX_TEXTURE_DEPTH {
+                    output.complete = false;
+                    push_dolphin_local_warning(
+                        &mut output.warnings,
+                        DolphinInspectionWarningKind::EntryLimitReached,
+                        &entry_path,
+                        format!(
+                            "texture traversal depth exceeds {DOLPHIN_LOCAL_MAX_TEXTURE_DEPTH}"
+                        ),
+                    );
+                } else {
+                    todo.push_back((entry_path, depth + 1));
+                }
+            }
+        }
+    }
+    output
+}
+
+fn inspect_dolphin_local_saves(profile: &DolphinLocalProfile) -> DolphinSaveInventory {
+    let mut output = DolphinSaveInventory {
+        candidate_paths: Vec::new(),
+        wii_data_present: is_real_directory_local(&profile.wii_data_path),
+        complete: true,
+        warnings: Vec::new(),
+    };
+    for directory in [&profile.memory_cards_path, &profile.save_states_path] {
+        collect_dolphin_local_save_candidates(directory, &mut output);
+    }
+    output
+}
+
+fn collect_dolphin_local_save_candidates(path: &Path, output: &mut DolphinSaveInventory) {
+    let Ok(entries) = fs::read_dir(path) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        if output.candidate_paths.len() >= DOLPHIN_LOCAL_MAX_SAVE_CANDIDATES {
+            output.complete = false;
+            push_dolphin_local_warning(
+                &mut output.warnings,
+                DolphinInspectionWarningKind::FileCountLimitReached,
+                path,
+                format!("save inventory stopped at {DOLPHIN_LOCAL_MAX_SAVE_CANDIDATES} candidates"),
+            );
+            return;
+        }
+        let entry_path = entry.path();
+        match fs::symlink_metadata(&entry_path) {
+            Ok(metadata) if metadata.file_type().is_symlink() => {
+                push_dolphin_local_warning(
+                    &mut output.warnings,
+                    DolphinInspectionWarningKind::SymlinkSkipped,
+                    &entry_path,
+                    "symlink was not followed",
+                );
+            }
+            Ok(metadata) if metadata.is_file() => output.candidate_paths.push(entry_path),
+            Ok(_) => {}
+            Err(_) => output.complete = false,
+        }
+    }
+}
+
+fn read_dolphin_local_text(
+    path: &Path,
+    limit: u64,
+    warnings: &mut Vec<DolphinInspectionWarning>,
+) -> Option<String> {
+    let metadata = match fs::symlink_metadata(path) {
+        Ok(metadata) if metadata.file_type().is_symlink() => {
+            push_dolphin_local_warning(
+                warnings,
+                DolphinInspectionWarningKind::SymlinkSkipped,
+                path,
+                "symlink was not followed",
+            );
+            return None;
+        }
+        Ok(metadata) if metadata.is_file() => metadata,
+        Ok(_) => {
+            push_dolphin_local_warning(
+                warnings,
+                DolphinInspectionWarningKind::SpecialFileSkipped,
+                path,
+                "path is not a regular file",
+            );
+            return None;
+        }
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return None,
+        Err(error) => {
+            push_dolphin_local_warning(
+                warnings,
+                DolphinInspectionWarningKind::UnreadablePath,
+                path,
+                format!("path cannot be inspected: {error}"),
+            );
+            return None;
+        }
+    };
+    if metadata.len() > limit {
+        push_dolphin_local_warning(
+            warnings,
+            DolphinInspectionWarningKind::FileTooLarge,
+            path,
+            format!("file exceeds {limit} bytes"),
+        );
+        return None;
+    }
+    let mut options = OpenOptions::new();
+    options.read(true);
+    #[cfg(unix)]
+    options.custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC);
+    let mut file = match options.open(path) {
+        Ok(file) => file,
+        Err(error) => {
+            push_dolphin_local_warning(
+                warnings,
+                DolphinInspectionWarningKind::UnreadablePath,
+                path,
+                format!("path cannot be opened safely: {error}"),
+            );
+            return None;
+        }
+    };
+    let mut bytes = Vec::with_capacity(metadata.len() as usize);
+    if file
+        .by_ref()
+        .take(limit + 1)
+        .read_to_end(&mut bytes)
+        .is_err()
+        || bytes.len() as u64 != metadata.len()
+    {
+        push_dolphin_local_warning(
+            warnings,
+            DolphinInspectionWarningKind::UnreadablePath,
+            path,
+            "file changed or could not be read completely",
+        );
+        return None;
+    }
+    match String::from_utf8(bytes) {
+        Ok(text) => Some(text),
+        Err(error) => {
+            push_dolphin_local_warning(
+                warnings,
+                DolphinInspectionWarningKind::InvalidUtf8,
+                path,
+                "file is not valid UTF-8",
+            );
+            Some(String::from_utf8_lossy(error.as_bytes()).into_owned())
+        }
+    }
+}
+
+fn is_regular_file_local(path: &Path) -> bool {
+    fs::symlink_metadata(path)
+        .is_ok_and(|metadata| metadata.is_file() && !metadata.file_type().is_symlink())
+}
+
+fn is_real_directory_local(path: &Path) -> bool {
+    fs::symlink_metadata(path)
+        .is_ok_and(|metadata| metadata.is_dir() && !metadata.file_type().is_symlink())
+}
+
+fn parse_dolphin_local_bool(value: &str) -> Option<bool> {
+    match value.trim().to_ascii_lowercase().as_str() {
+        "1" | "true" | "yes" | "on" | "enabled" => Some(true),
+        "0" | "false" | "no" | "off" | "disabled" => Some(false),
+        _ => None,
+    }
+}
+
+fn push_dolphin_local_warning(
+    warnings: &mut Vec<DolphinInspectionWarning>,
+    kind: DolphinInspectionWarningKind,
+    path: &Path,
+    detail: impl Into<String>,
+) {
+    warnings.push(DolphinInspectionWarning {
+        kind,
+        path: path.to_path_buf(),
+        detail: detail.into(),
+    });
 }
 
 #[cfg(test)]
@@ -2140,6 +3599,773 @@ mod tests {
                 .iter()
                 .any(|w| w.kind == DolphinInspectionWarningKind::LineTooLong)
         );
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    fn local_roots(root: &Path) -> DolphinLocalDiscoveryRoots {
+        DolphinLocalDiscoveryRoots {
+            home: root.join("home"),
+            xdg_config_home: root.join("config"),
+            xdg_data_home: root.join("data"),
+            explicit_configuration_roots: Vec::new(),
+            portable_configuration_roots: Vec::new(),
+            explicit_executables: Vec::new(),
+            known_version_outputs: BTreeMap::new(),
+            appimage_directory: None,
+            dolphin_emu_userpath_override: None,
+            path_override: Some(Vec::new()),
+        }
+    }
+
+    fn make_local_profile(config: &Path, data: &Path) {
+        fs::create_dir_all(config).unwrap();
+        fs::create_dir_all(data).unwrap();
+        fs::write(config.join("Dolphin.ini"), b"[Core]\nEnableCheats = True\n").unwrap();
+    }
+
+    #[test]
+    fn modern_local_discovery_covers_native_flatpak_portable_and_supplied_version() {
+        let root = fixture("modern-discovery");
+        let native_config = root.join("config/dolphin-emu");
+        let native_data = root.join("data/dolphin-emu");
+        make_local_profile(&native_config, &native_data);
+        let flatpak_config =
+            root.join("home/.var/app/org.DolphinEmu.dolphin-emu/config/dolphin-emu");
+        let flatpak_data = root.join("home/.var/app/org.DolphinEmu.dolphin-emu/data/dolphin-emu");
+        make_local_profile(&flatpak_config, &flatpak_data);
+        let portable = root.join("portable/User");
+        make_local_profile(&portable, &portable);
+        let executable = root.join("bin/dolphin-emu");
+        fs::create_dir_all(executable.parent().unwrap()).unwrap();
+        fs::write(&executable, b"not executed").unwrap();
+        let mut roots = local_roots(&root);
+        roots.portable_configuration_roots.push(portable.clone());
+        roots.explicit_executables.push(executable.clone());
+        roots
+            .known_version_outputs
+            .insert(executable.clone(), "Dolphin 2409-17\n".into());
+        let discovery = discover_dolphin_local_profiles(&roots);
+        assert!(discovery.profiles.iter().any(|profile| {
+            profile.installation_type == DolphinLocalInstallationType::Native
+                && profile.eligible
+                && profile.configuration_root == native_config
+                && profile.data_root == native_data
+        }));
+        assert!(discovery.profiles.iter().any(|profile| {
+            profile.installation_type == DolphinLocalInstallationType::FlatpakUser
+                && profile.eligible
+                && profile.configuration_root == flatpak_config
+                && profile.data_root == flatpak_data
+        }));
+        let portable_profile = discovery
+            .profiles
+            .iter()
+            .find(|profile| profile.configuration_root == portable)
+            .unwrap();
+        assert_eq!(
+            portable_profile.executable_candidates[0].version.as_deref(),
+            Some("2409-17")
+        );
+        assert_eq!(parse_dolphin_version("unrelated text"), None);
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn modern_inspection_reads_context_without_creating_identity_or_writing() {
+        let root = fixture("modern-inspection");
+        let config = root.join("portable");
+        make_local_profile(&config, &config);
+        fs::write(
+            config.join("GFX.ini"),
+            b"[Settings]\nBackend = Vulkan\nInternalResolution = 3\nVSync = True\n",
+        )
+        .unwrap();
+        fs::create_dir_all(config.join("GameSettings")).unwrap();
+        let game_settings = config.join("GameSettings/GALE01.ini");
+        let game_settings_bytes = b"[Gecko]\n$Wide\n[Gecko_Enabled]\n$Wide\n";
+        fs::write(&game_settings, game_settings_bytes).unwrap();
+        fs::create_dir_all(config.join("Load/Textures/GALE01/nested")).unwrap();
+        fs::write(
+            config.join("Load/Textures/GALE01/nested/texture.png"),
+            b"texture",
+        )
+        .unwrap();
+        fs::create_dir_all(config.join("GC")).unwrap();
+        fs::write(config.join("GC/MemoryCardA.USA.raw"), b"card").unwrap();
+        fs::create_dir_all(config.join("Wii/title")).unwrap();
+        fs::create_dir_all(config.join("StateSaves")).unwrap();
+        fs::write(config.join("StateSaves/GALE01.sav"), b"state").unwrap();
+        let mut roots = local_roots(&root);
+        roots.portable_configuration_roots.push(config.clone());
+        let profile = discover_dolphin_local_profiles(&roots)
+            .profiles
+            .into_iter()
+            .find(|profile| profile.configuration_root == config)
+            .unwrap();
+        let inspection = inspect_dolphin_local_game(
+            &profile,
+            &DolphinGameRequest {
+                canonical_platform: Some("GameCube".into()),
+                target_platform: Some(DolphinTargetPlatform::GameCube),
+                verified_game_id: Some("GALE01".into()),
+                verified_revision: Some(0),
+                emulator_game_id: Some("GALE01".into()),
+                disc_contexts: vec![DolphinDiscContext {
+                    disc_number: 1,
+                    format: DolphinDiscFormat::Gcm,
+                    representation: Representation::RawDisc,
+                    claim: ClaimType::ExactBytesMatch,
+                }],
+            },
+        );
+        assert_eq!(
+            inspection.game_id_mapping,
+            DolphinGameIdMapping::CoreVerifiedMetadata
+        );
+        assert_eq!(inspection.canonical_platform.as_deref(), Some("GameCube"));
+        assert_eq!(
+            inspection.global_config.settings.renderer.as_deref(),
+            Some("Vulkan")
+        );
+        assert_eq!(inspection.game_settings.as_ref().unwrap().enabled_count, 1);
+        assert_eq!(inspection.cheats.as_ref().unwrap().enabled_definitions, 1);
+        assert_eq!(inspection.textures.as_ref().unwrap().file_count, 1);
+        assert!(inspection.saves.wii_data_present);
+        assert!(inspection.health.memory_cards_present);
+        assert_eq!(fs::read(game_settings).unwrap(), game_settings_bytes);
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn emulator_game_id_and_filenames_never_override_core_identity() {
+        let root = fixture("modern-identity");
+        let config = root.join("portable");
+        make_local_profile(&config, &config);
+        fs::create_dir_all(config.join("GameSettings")).unwrap();
+        // The only matching filename belongs to the emulator metadata ID;
+        // it cannot cause a core identity winner to change.
+        fs::write(config.join("GameSettings/WRONG1.ini"), b"[Gecko]\n$Code\n").unwrap();
+        let mut roots = local_roots(&root);
+        roots.portable_configuration_roots.push(config.clone());
+        let profile = discover_dolphin_local_profiles(&roots)
+            .profiles
+            .into_iter()
+            .find(|profile| profile.configuration_root == config)
+            .unwrap();
+        let inspection = inspect_dolphin_local_game(
+            &profile,
+            &DolphinGameRequest {
+                canonical_platform: Some("Wii".into()),
+                target_platform: Some(DolphinTargetPlatform::Wii),
+                verified_game_id: Some("RMGE01".into()),
+                verified_revision: None,
+                emulator_game_id: Some("WRONG1".into()),
+                disc_contexts: vec![
+                    DolphinDiscContext {
+                        disc_number: 1,
+                        format: DolphinDiscFormat::Wbfs,
+                        representation: Representation::RawDisc,
+                        claim: ClaimType::ExactBytesMatch,
+                    },
+                    DolphinDiscContext {
+                        disc_number: 2,
+                        format: DolphinDiscFormat::Chd,
+                        representation: Representation::LogicalChd,
+                        claim: ClaimType::ExactLogicalDiscMatch,
+                    },
+                ],
+            },
+        );
+        assert_eq!(inspection.game_id.as_deref(), Some("RMGE01"));
+        assert_eq!(
+            inspection.game_id_mapping,
+            DolphinGameIdMapping::ConflictingEmulatorMetadata
+        );
+        assert!(inspection.identity_mismatch.is_some());
+        assert_eq!(
+            inspection.game_settings.as_ref().unwrap().path,
+            config.join("GameSettings/RMGE01.ini")
+        );
+        assert_eq!(inspection.disc_contexts[0].format, DolphinDiscFormat::Wbfs);
+        assert_eq!(inspection.disc_contexts[1].format, DolphinDiscFormat::Chd);
+        assert_eq!(
+            inspection.disc_contexts[1].representation,
+            Representation::LogicalChd
+        );
+
+        let metadata_only = inspect_dolphin_local_game(
+            &profile,
+            &DolphinGameRequest {
+                emulator_game_id: Some("WRONG1".into()),
+                ..DolphinGameRequest::default()
+            },
+        );
+        assert_eq!(
+            metadata_only.game_id_mapping,
+            DolphinGameIdMapping::EmulatorMetadataOnly
+        );
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn modern_config_malformed_and_oversized_input_fails_soft() {
+        let root = fixture("modern-bounds");
+        let config = root.join("portable");
+        make_local_profile(&config, &config);
+        fs::write(config.join("GFX.ini"), b"[Settings\nNoSeparator\n").unwrap();
+        let mut roots = local_roots(&root);
+        roots.portable_configuration_roots.push(config.clone());
+        let profile = discover_dolphin_local_profiles(&roots)
+            .profiles
+            .into_iter()
+            .find(|profile| profile.configuration_root == config)
+            .unwrap();
+        let inspection = inspect_dolphin_local_game(&profile, &DolphinGameRequest::default());
+        assert!(
+            inspection
+                .global_config
+                .warnings
+                .iter()
+                .any(|warning| warning.kind == DolphinInspectionWarningKind::MalformedIni)
+        );
+        fs::write(
+            config.join("GFX.ini"),
+            vec![b'x'; DOLPHIN_LOCAL_MAX_CONFIG_BYTES as usize + 1],
+        )
+        .unwrap();
+        let oversized = inspect_dolphin_local_game(&profile, &DolphinGameRequest::default());
+        assert!(
+            oversized
+                .global_config
+                .warnings
+                .iter()
+                .any(|warning| warning.kind == DolphinInspectionWarningKind::FileTooLarge)
+        );
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn modern_game_settings_uses_verified_revision_but_filenames_stay_context_only() {
+        let root = fixture("modern-revision");
+        let config = root.join("portable");
+        make_local_profile(&config, &config);
+        fs::create_dir_all(config.join("GameSettings")).unwrap();
+        fs::write(
+            config.join("GameSettings/GALE01r2.ini"),
+            b"[ActionReplay]\n$Code\n[ActionReplay_Enabled]\n$Code\n",
+        )
+        .unwrap();
+        let mut roots = local_roots(&root);
+        roots.portable_configuration_roots.push(config.clone());
+        let profile = discover_dolphin_local_profiles(&roots)
+            .profiles
+            .into_iter()
+            .find(|profile| profile.configuration_root == config)
+            .unwrap();
+        let inspection = inspect_dolphin_local_game(
+            &profile,
+            &DolphinGameRequest {
+                verified_game_id: Some("GALE01".into()),
+                verified_revision: Some(2),
+                ..DolphinGameRequest::default()
+            },
+        );
+        assert_eq!(
+            inspection.game_settings.unwrap().path,
+            config.join("GameSettings/GALE01r2.ini")
+        );
+        assert_eq!(inspection.cheats.as_ref().unwrap().definitions, 1);
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn disc_format_contexts_remain_distinct_without_filename_inference() {
+        let formats = [
+            DolphinDiscFormat::Iso,
+            DolphinDiscFormat::Gcm,
+            DolphinDiscFormat::Wbfs,
+            DolphinDiscFormat::Rvz,
+            DolphinDiscFormat::Wia,
+            DolphinDiscFormat::Chd,
+        ];
+        assert_eq!(formats.len(), 6);
+        assert_ne!(DolphinDiscFormat::Iso, DolphinDiscFormat::Gcm);
+        assert_ne!(DolphinDiscFormat::Wbfs, DolphinDiscFormat::Rvz);
+        assert_ne!(DolphinDiscFormat::Wia, DolphinDiscFormat::Chd);
+    }
+
+    // --- Native launch binding ---------------------------------------------
+
+    fn make_executable(path: &Path) {
+        fs::create_dir_all(path.parent().unwrap()).unwrap();
+        fs::write(path, b"not executed").unwrap();
+        #[cfg(unix)]
+        {
+            let mut perms = fs::metadata(path).unwrap().permissions();
+            perms.set_mode(0o755);
+            fs::set_permissions(path, perms).unwrap();
+        }
+    }
+
+    fn executable(
+        path: PathBuf,
+        installation_type: DolphinLocalInstallationType,
+    ) -> DolphinExecutable {
+        DolphinExecutable {
+            path,
+            installation_type,
+            version: None,
+        }
+    }
+
+    fn native_profile(
+        roots: &DolphinLocalDiscoveryRoots,
+        executable_candidates: Vec<DolphinExecutable>,
+    ) -> DolphinLocalProfile {
+        let config = roots.xdg_config_home.join("dolphin-emu");
+        let data = roots.xdg_data_home.join("dolphin-emu");
+        make_local_profile(&config, &data);
+        DolphinLocalProfile {
+            profile_id: "test-native".into(),
+            installation_type: DolphinLocalInstallationType::Native,
+            configuration_root: config.clone(),
+            data_root: data.clone(),
+            eligible: true,
+            blocker: None,
+            executable_candidates,
+            dolphin_ini_path: config.join("Dolphin.ini"),
+            graphics_ini_path: config.join("GFX.ini"),
+            game_settings_path: data.join("GameSettings"),
+            textures_path: data.join("Load/Textures"),
+            memory_cards_path: data.join("GC"),
+            wii_data_path: data.join("Wii"),
+            save_states_path: data.join("StateSaves"),
+        }
+    }
+
+    fn explicit_profile(
+        root: &Path,
+        executable_candidates: Vec<DolphinExecutable>,
+    ) -> DolphinLocalProfile {
+        DolphinLocalProfile {
+            profile_id: "test-explicit".into(),
+            installation_type: DolphinLocalInstallationType::Explicit,
+            configuration_root: root.to_path_buf(),
+            data_root: root.to_path_buf(),
+            eligible: true,
+            blocker: None,
+            executable_candidates,
+            dolphin_ini_path: root.join("Dolphin.ini"),
+            graphics_ini_path: root.join("GFX.ini"),
+            game_settings_path: root.join("GameSettings"),
+            textures_path: root.join("Load/Textures"),
+            memory_cards_path: root.join("GC"),
+            wii_data_path: root.join("Wii"),
+            save_states_path: root.join("StateSaves"),
+        }
+    }
+
+    #[test]
+    fn standard_native_xdg_profile_produces_default_native() {
+        let root = fixture("launch-native-default");
+        let roots = local_roots(&root);
+        let dolphin = roots
+            .xdg_data_home
+            .parent()
+            .unwrap()
+            .join("bin/dolphin-emu");
+        make_executable(&dolphin);
+        let profile = native_profile(
+            &roots,
+            vec![executable(
+                dolphin.clone(),
+                DolphinLocalInstallationType::Native,
+            )],
+        );
+        let binding = resolve_dolphin_native_launch_binding(&profile, &roots).unwrap();
+        assert_eq!(binding.executable, dolphin);
+        assert_eq!(
+            binding.user_directory_mode,
+            DolphinUserDirectoryMode::DefaultNative
+        );
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn flatpak_and_appimage_profiles_bind_the_exact_installation_kind() {
+        let root = fixture("launch-installation-kinds");
+        let mut roots = local_roots(&root);
+        let flatpak = root.join("bin/flatpak");
+        make_executable(&flatpak);
+        roots.path_override = Some(vec![flatpak.parent().unwrap().to_path_buf()]);
+        let app_id = crate::launch::installation_known::DOLPHIN.flatpak_ids[0];
+        let deployment = roots
+            .xdg_data_home
+            .join("flatpak/app")
+            .join(app_id)
+            .join("current/active/metadata");
+        fs::create_dir_all(deployment.parent().unwrap()).unwrap();
+        fs::write(deployment, b"[Application]\n").unwrap();
+        let flatpak_config = root
+            .join("home/.var/app")
+            .join(app_id)
+            .join("config/dolphin-emu");
+        make_local_profile(&flatpak_config, &flatpak_config);
+        let flatpak_profile = discover_dolphin_local_profiles(&roots)
+            .profiles
+            .into_iter()
+            .find(|profile| profile.installation_type == DolphinLocalInstallationType::FlatpakUser)
+            .unwrap();
+        let binding = resolve_dolphin_native_launch_binding(&flatpak_profile, &roots).unwrap();
+        assert_eq!(binding.executable, flatpak);
+        assert!(matches!(
+            binding.installation,
+            crate::launch::installation::LaunchInstallation::Flatpak { app_id: ref id }
+                if id == app_id
+        ));
+
+        let image = root.join("home/Applications/Dolphin/Dolphin.AppImage");
+        make_executable(&image);
+        let user_root = image.parent().unwrap().join("User");
+        fs::create_dir_all(user_root.join("Config")).unwrap();
+        fs::write(user_root.join("Config/Dolphin.ini"), b"[Core]\n").unwrap();
+        let image_profile = discover_dolphin_local_profiles(&roots)
+            .profiles
+            .into_iter()
+            .find(|profile| profile.installation_type == DolphinLocalInstallationType::AppImage)
+            .unwrap();
+        let binding = resolve_dolphin_native_launch_binding(&image_profile, &roots).unwrap();
+        assert_eq!(binding.executable, image);
+        assert_eq!(
+            binding.installation,
+            crate::launch::installation::LaunchInstallation::AppImage {
+                extract_and_run: false
+            }
+        );
+        assert_eq!(
+            binding.user_directory_mode,
+            DolphinUserDirectoryMode::ExplicitRoot(user_root)
+        );
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn genuine_single_user_root_produces_explicit_root() {
+        let root = fixture("launch-explicit-root");
+        let profile_root = root.join("portable");
+        fs::create_dir_all(profile_root.join("Config")).unwrap();
+        fs::write(profile_root.join("Config/Dolphin.ini"), b"[Core]\n").unwrap();
+        let dolphin = root.join("bin/dolphin-emu");
+        make_executable(&dolphin);
+        let profile = explicit_profile(
+            &profile_root,
+            vec![executable(
+                dolphin.clone(),
+                DolphinLocalInstallationType::Explicit,
+            )],
+        );
+        let binding = resolve_dolphin_native_launch_binding(&profile, &local_roots(&root)).unwrap();
+        assert_eq!(binding.executable, dolphin);
+        assert_eq!(
+            binding.user_directory_mode,
+            DolphinUserDirectoryMode::ExplicitRoot(profile_root)
+        );
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn explicit_dolphin_executable_is_not_replaced_by_discovered_package_kinds() {
+        let root = fixture("launch-explicit-precedence");
+        let explicit_root = root.join("chosen/User");
+        fs::create_dir_all(explicit_root.join("Config")).unwrap();
+        fs::write(explicit_root.join("Dolphin.ini"), b"[Core]\n").unwrap();
+        fs::write(explicit_root.join("Config/Dolphin.ini"), b"[Core]\n").unwrap();
+        let selected = root.join("chosen/dolphin-emu");
+        make_executable(&selected);
+        let appimage = root.join("home/Applications/Dolphin/Dolphin.AppImage");
+        make_executable(&appimage);
+        let flatpak_dir = root
+            .join("data/flatpak/app")
+            .join(crate::launch::installation_known::DOLPHIN.flatpak_ids[0])
+            .join("current/active");
+        fs::create_dir_all(&flatpak_dir).unwrap();
+        fs::write(flatpak_dir.join("metadata"), b"[Application]\n").unwrap();
+        let mut roots = local_roots(&root);
+        roots
+            .explicit_configuration_roots
+            .push(explicit_root.clone());
+        roots.explicit_executables.push(selected.clone());
+        let profile = discover_dolphin_local_profiles(&roots)
+            .profiles
+            .into_iter()
+            .find(|profile| profile.installation_type == DolphinLocalInstallationType::Explicit)
+            .unwrap();
+        let binding = resolve_dolphin_native_launch_binding(&profile, &roots).unwrap();
+        assert_eq!(binding.executable, selected);
+        assert_eq!(
+            binding.installation,
+            crate::launch::installation::LaunchInstallation::Native
+        );
+        assert_eq!(
+            binding.user_directory_mode,
+            DolphinUserDirectoryMode::ExplicitRoot(explicit_root)
+        );
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn data_root_alone_never_becomes_explicit_root() {
+        let root = fixture("launch-data-root-only");
+        let profile_root = root.join("portable");
+        fs::create_dir_all(profile_root.join("GameSettings")).unwrap();
+        // No Config/ beneath the root: only data-shaped evidence exists.
+        let profile = explicit_profile(&profile_root, Vec::new());
+        let blocker =
+            resolve_dolphin_native_launch_binding(&profile, &local_roots(&root)).unwrap_err();
+        assert_eq!(blocker.kind, DolphinLaunchBlockerKind::ExplicitRootInvalid);
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn single_unambiguous_executable_binds() {
+        let root = fixture("launch-single-executable");
+        let roots = local_roots(&root);
+        let dolphin = root.join("bin/dolphin-emu");
+        make_executable(&dolphin);
+        let profile = native_profile(
+            &roots,
+            vec![executable(
+                dolphin.clone(),
+                DolphinLocalInstallationType::Native,
+            )],
+        );
+        assert_eq!(resolve_native_executable(&profile).unwrap(), dolphin);
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn multiple_indistinguishable_executables_are_blocked() {
+        let root = fixture("launch-ambiguous-executable");
+        let roots = local_roots(&root);
+        let first = root.join("bin/dolphin-emu");
+        let second = root.join("alt-bin/dolphin-emu");
+        make_executable(&first);
+        make_executable(&second);
+        let profile = native_profile(
+            &roots,
+            vec![
+                executable(first, DolphinLocalInstallationType::Native),
+                executable(second, DolphinLocalInstallationType::Native),
+            ],
+        );
+        let blocker = resolve_native_executable(&profile).unwrap_err();
+        assert_eq!(blocker.kind, DolphinLaunchBlockerKind::AmbiguousExecutable);
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn missing_executable_is_blocked() {
+        let root = fixture("launch-missing-executable");
+        let roots = local_roots(&root);
+        let dolphin = root.join("bin/dolphin-emu");
+        let profile = native_profile(
+            &roots,
+            vec![executable(dolphin, DolphinLocalInstallationType::Native)],
+        );
+        let blocker = resolve_native_executable(&profile).unwrap_err();
+        assert_eq!(blocker.kind, DolphinLaunchBlockerKind::ExecutableMissing);
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn symlinked_executable_is_blocked() {
+        let root = fixture("launch-symlink-executable");
+        let roots = local_roots(&root);
+        let real = root.join("bin/dolphin-emu-real");
+        make_executable(&real);
+        let link = root.join("bin/dolphin-emu");
+        std::os::unix::fs::symlink(&real, &link).unwrap();
+        let profile = native_profile(
+            &roots,
+            vec![executable(link, DolphinLocalInstallationType::Native)],
+        );
+        let blocker = resolve_native_executable(&profile).unwrap_err();
+        assert_eq!(blocker.kind, DolphinLaunchBlockerKind::ExecutableUnsafe);
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn non_regular_executable_is_blocked() {
+        let root = fixture("launch-non-regular-executable");
+        let roots = local_roots(&root);
+        let dolphin = root.join("bin/dolphin-emu");
+        fs::create_dir_all(&dolphin).unwrap();
+        let profile = native_profile(
+            &roots,
+            vec![executable(dolphin, DolphinLocalInstallationType::Native)],
+        );
+        let blocker = resolve_native_executable(&profile).unwrap_err();
+        assert_eq!(blocker.kind, DolphinLaunchBlockerKind::ExecutableUnsafe);
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn non_executable_permission_is_blocked() {
+        let root = fixture("launch-non-executable-permission");
+        let roots = local_roots(&root);
+        let dolphin = root.join("bin/dolphin-emu");
+        fs::create_dir_all(dolphin.parent().unwrap()).unwrap();
+        fs::write(&dolphin, b"not executed").unwrap();
+        let mut perms = fs::metadata(&dolphin).unwrap().permissions();
+        perms.set_mode(0o644);
+        fs::set_permissions(&dolphin, perms).unwrap();
+        let profile = native_profile(
+            &roots,
+            vec![executable(dolphin, DolphinLocalInstallationType::Native)],
+        );
+        let blocker = resolve_native_executable(&profile).unwrap_err();
+        assert_eq!(
+            blocker.kind,
+            DolphinLaunchBlockerKind::ExecutableNotExecutable
+        );
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn flatpak_profile_is_blocked_for_native_launch_binding() {
+        let root = fixture("launch-flatpak-blocked");
+        let roots = local_roots(&root);
+        let mut profile = native_profile(&roots, Vec::new());
+        profile.installation_type = DolphinLocalInstallationType::FlatpakUser;
+        let blocker = resolve_dolphin_native_launch_binding(&profile, &roots).unwrap_err();
+        assert_eq!(blocker.kind, DolphinLaunchBlockerKind::ProfileRootMismatch);
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn portable_profile_is_blocked_for_native_launch_binding() {
+        let root = fixture("launch-portable-blocked");
+        let profile_root = root.join("AppImage/User");
+        fs::create_dir_all(profile_root.join("Config")).unwrap();
+        fs::write(profile_root.join("Config/Dolphin.ini"), b"[Core]\n").unwrap();
+        let mut profile = explicit_profile(&profile_root, Vec::new());
+        profile.installation_type = DolphinLocalInstallationType::Portable;
+        let blocker =
+            resolve_dolphin_native_launch_binding(&profile, &local_roots(&root)).unwrap_err();
+        assert_eq!(
+            blocker.kind,
+            DolphinLaunchBlockerKind::UnsupportedInstallationType
+        );
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn dolphin_emu_userpath_override_rejects_default_native() {
+        let root = fixture("launch-userpath-override");
+        let mut roots = local_roots(&root);
+        let dolphin = root.join("bin/dolphin-emu");
+        make_executable(&dolphin);
+        let profile = native_profile(
+            &roots,
+            vec![executable(dolphin, DolphinLocalInstallationType::Native)],
+        );
+        roots.dolphin_emu_userpath_override = Some(root.join("override"));
+        let blocker = resolve_dolphin_native_launch_binding(&profile, &roots).unwrap_err();
+        assert_eq!(
+            blocker.kind,
+            DolphinLaunchBlockerKind::EnvironmentOverridePresent
+        );
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn portable_txt_marker_rejects_default_native() {
+        let root = fixture("launch-portable-txt");
+        let roots = local_roots(&root);
+        let dolphin = root.join("bin/dolphin-emu");
+        make_executable(&dolphin);
+        fs::write(dolphin.parent().unwrap().join("portable.txt"), b"").unwrap();
+        let profile = native_profile(
+            &roots,
+            vec![executable(dolphin, DolphinLocalInstallationType::Native)],
+        );
+        let blocker = resolve_dolphin_native_launch_binding(&profile, &roots).unwrap_err();
+        assert_eq!(
+            blocker.kind,
+            DolphinLaunchBlockerKind::PortableOrLegacyLayoutConflict
+        );
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn legacy_dolphin_emu_directory_rejects_default_native() {
+        let root = fixture("launch-legacy-precedence");
+        let roots = local_roots(&root);
+        let dolphin = root.join("bin/dolphin-emu");
+        make_executable(&dolphin);
+        fs::create_dir_all(roots.home.join(".dolphin-emu")).unwrap();
+        let profile = native_profile(
+            &roots,
+            vec![executable(dolphin, DolphinLocalInstallationType::Native)],
+        );
+        let blocker = resolve_dolphin_native_launch_binding(&profile, &roots).unwrap_err();
+        assert_eq!(
+            blocker.kind,
+            DolphinLaunchBlockerKind::PortableOrLegacyLayoutConflict
+        );
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn drifted_roots_reject_default_native() {
+        let root = fixture("launch-drifted-roots");
+        let roots = local_roots(&root);
+        let dolphin = root.join("bin/dolphin-emu");
+        make_executable(&dolphin);
+        let mut profile = native_profile(
+            &roots,
+            vec![executable(dolphin, DolphinLocalInstallationType::Native)],
+        );
+        // Simulate a profile snapshot that no longer matches the fresh
+        // default XDG resolution (e.g. XDG_CONFIG_HOME changed since
+        // discovery ran).
+        profile.configuration_root = root.join("stale-config/dolphin-emu");
+        let blocker = resolve_dolphin_native_launch_binding(&profile, &roots).unwrap_err();
+        assert_eq!(
+            blocker.kind,
+            DolphinLaunchBlockerKind::DefaultResolutionMismatch
+        );
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn symlinked_explicit_root_is_rejected() {
+        let root = fixture("launch-symlinked-root");
+        let real_root = root.join("real-portable");
+        fs::create_dir_all(real_root.join("Config")).unwrap();
+        fs::write(real_root.join("Config/Dolphin.ini"), b"[Core]\n").unwrap();
+        let linked_root = root.join("portable");
+        std::os::unix::fs::symlink(&real_root, &linked_root).unwrap();
+        let profile = explicit_profile(&linked_root, Vec::new());
+        let blocker =
+            resolve_dolphin_native_launch_binding(&profile, &local_roots(&root)).unwrap_err();
+        assert_eq!(blocker.kind, DolphinLaunchBlockerKind::ExplicitRootInvalid);
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn no_hard_coded_executable_fallback() {
+        let root = fixture("launch-no-fallback");
+        let roots = local_roots(&root);
+        // No executable candidates supplied at all; a well-known name like
+        // "dolphin-emu" must never be assumed even though the profile is
+        // otherwise eligible and native.
+        let profile = native_profile(&roots, Vec::new());
+        let blocker = resolve_dolphin_native_launch_binding(&profile, &roots).unwrap_err();
+        assert_eq!(blocker.kind, DolphinLaunchBlockerKind::ExecutableMissing);
         fs::remove_dir_all(root).unwrap();
     }
 }
