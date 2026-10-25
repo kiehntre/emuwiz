@@ -2784,7 +2784,9 @@ fn atomic_write_bytes(
             return Err(SharedApplyFailureKind::WriteFailed);
         }
         match &displaces {
-            Some(displaced) => publish_displacing(&temp, destination, displaced, &mut keep_temp)?,
+            Some(displaced) => {
+                publish_displacing(&temp, destination, displaced, temp_hash.pin, &mut keep_temp)?
+            }
             None if no_replace => rename_no_replace(&temp, destination)
                 .map_err(|_| SharedApplyFailureKind::DestinationChanged)?,
             None => {
@@ -2815,6 +2817,9 @@ thread_local! {
     /// Runs between observation and publication, to force a race.
     static BEFORE_PUBLISH: std::cell::RefCell<Option<PublishHook>> =
         std::cell::RefCell::new(None);
+    /// Runs after a refused exchange, before it is reversed.
+    static BEFORE_REVERSE: std::cell::RefCell<Option<PublishHook>> =
+        std::cell::RefCell::new(None);
 }
 
 #[cfg(test)]
@@ -2822,9 +2827,24 @@ fn set_before_publish(hook: Option<PublishHook>) {
     BEFORE_PUBLISH.with(|slot| *slot.borrow_mut() = hook);
 }
 
+#[cfg(test)]
+fn set_before_reverse(hook: Option<PublishHook>) {
+    BEFORE_REVERSE.with(|slot| *slot.borrow_mut() = hook);
+}
+
 fn before_publish(_destination: &Path) {
     #[cfg(test)]
     BEFORE_PUBLISH.with(|slot| {
+        if let Some(hook) = slot.borrow_mut().as_mut() {
+            hook(_destination);
+        }
+    });
+}
+
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+fn before_reverse(_destination: &Path) {
+    #[cfg(test)]
+    BEFORE_REVERSE.with(|slot| {
         if let Some(hook) = slot.borrow_mut().as_mut() {
             hook(_destination);
         }
@@ -2841,11 +2861,14 @@ fn before_publish(_destination: &Path) {
 /// exchange refuses rather than falling back to an unchecked rename. A
 /// verified displaced file is removed (its bytes are in the transaction's
 /// backup or were EmuWiz's own install).
+/// `ours`: the pin of our own temporary file, so after a reversed exchange
+/// only our file is ever left for deletion.
 #[cfg(target_os = "linux")]
 fn publish_displacing(
     temp: &Path,
     destination: &Path,
     displaced: &Displaced,
+    ours: Option<FilePin>,
     keep_temp: &mut bool,
 ) -> Result<(), SharedApplyFailureKind> {
     before_publish(destination);
@@ -2877,8 +2900,21 @@ fn publish_displacing(
         let _ = fs::remove_file(temp);
         return Ok(());
     }
+    before_reverse(destination);
     if should_inject(FaultPoint::ReverseExchange) || rename_exchange(temp, destination).is_err() {
         // Ours stays published; the other file is kept under `temp`.
+        *keep_temp = true;
+        return Err(SharedApplyFailureKind::DisplacedFileKept);
+    }
+    // Something else may have been renamed onto the destination meanwhile and
+    // come back under `temp`: delete it only if it is still our own file.
+    let returned = stable_hash(
+        temp,
+        SHARED_MAX_SOURCE_BYTES.max(SHARED_MAX_MATERIALIZED_BYTES),
+    )
+    .ok()
+    .and_then(|hash| hash.pin);
+    if ours.is_none() || returned != ours {
         *keep_temp = true;
         return Err(SharedApplyFailureKind::DisplacedFileKept);
     }
@@ -2892,6 +2928,7 @@ fn publish_displacing(
     temp: &Path,
     destination: &Path,
     displaced: &Displaced,
+    _ours: Option<FilePin>,
     _keep_temp: &mut bool,
 ) -> Result<(), SharedApplyFailureKind> {
     before_publish(destination);
@@ -3471,6 +3508,25 @@ fn rollback_entry_preview(
     }
     if already_rolled_back {
         result.outcome = SharedRollbackOutcome::AlreadyRolledBack;
+        return result;
+    }
+    // An apply that published EmuWiz's file but kept the changed file it
+    // displaced is not "nothing to undo": block the whole Undo until someone
+    // has looked at the kept file.
+    if let Some(kept) = entry
+        .failures
+        .iter()
+        .find(|f| f.kind == SharedApplyFailureKind::DisplacedFileKept)
+    {
+        result.outcome = SharedRollbackOutcome::DestinationChanged;
+        result.failure = Some(SharedApplyFailure {
+            kind: SharedApplyFailureKind::DisplacedFileKept,
+            path: kept.path.clone(),
+            detail: format!(
+                "{} Undo is blocked until that is resolved by hand.",
+                kept.detail
+            ),
+        });
         return result;
     }
     if !matches!(
@@ -5529,6 +5585,70 @@ mod tests {
         assert_eq!(fs::read(&live).unwrap(), b"new");
         // Recovery would not call this settled while the kept file exists.
         assert!(stray_publication_file_beside(&live));
+        // Nor can a later Undo pretend this entry needs nothing.
+        let rollback = preview_shared_rollback(
+            result.journal_path.as_ref().unwrap(),
+            &fixture.destination_root(),
+            &fixture.backup_root(),
+        );
+        assert!(!rollback.available);
+        assert_eq!(
+            rollback.entries[0].failure.as_ref().map(|f| f.kind),
+            Some(SharedApplyFailureKind::DisplacedFileKept)
+        );
+        assert!(
+            rollback.entries[0]
+                .failure
+                .as_ref()
+                .unwrap()
+                .detail
+                .contains(&kept.display().to_string())
+        );
+    }
+
+    /// A file renamed onto the destination while a refused exchange is being
+    /// reversed comes back under the temporary name: it is kept, never
+    /// deleted as if it were EmuWiz's own.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn a_file_arriving_during_the_reverse_exchange_is_kept() {
+        let fixture = Fixture::new("race-arrival");
+        let report = preview(&fixture, b"new", Some(b"old"));
+        let live = fixture.destination_root().join("Nintendo - NES/game.cht");
+        chmod(&live, 0o664);
+        let plan = make_plan(&fixture, &report);
+        set_before_publish(Some(Box::new(|destination: &Path| {
+            chmod(destination, 0o640)
+        })));
+        set_before_reverse(Some(Box::new(|destination: &Path| {
+            let arrival = destination.with_file_name("arrival.cht");
+            fs::write(&arrival, b"arrival").unwrap();
+            fs::rename(&arrival, destination).unwrap();
+        })));
+        let result = execute_shared_apply(
+            &plan,
+            &options(&fixture, &plan, "race-arrival", false, true, true),
+        );
+        set_before_reverse(None);
+        set_before_publish(None);
+        let entry = &result.journal.entries[0];
+        assert!(
+            entry
+                .failures
+                .iter()
+                .any(|f| f.kind == SharedApplyFailureKind::DisplacedFileKept),
+            "{:?}",
+            entry.failures
+        );
+        let kept = entry
+            .temporary_path
+            .as_ref()
+            .unwrap()
+            .to_path_buf()
+            .unwrap();
+        assert_eq!(fs::read(&kept).unwrap(), b"arrival", "never deleted");
+        assert_eq!(fs::read(&live).unwrap(), b"old");
+        assert_eq!(mode_of(&live), 0o640);
     }
 
     /// Same size and the old mtime but different bytes is a changed file.
