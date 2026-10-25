@@ -2186,7 +2186,7 @@ impl ArchiveFsApp {
         let (sender, receiver) = mpsc::channel();
         self.shared_history = SharedHistoryState::Loading { receiver };
         self.history.record(HistoryEntry::new(
-            ActivityAction::CheatPreview,
+            ActivityAction::Refresh,
             None,
             ActivityOutcome::Started,
             "Refreshing bounded shared transaction history.",
@@ -2213,7 +2213,7 @@ impl ArchiveFsApp {
         match receiver.try_recv() {
             Ok(Ok(loaded)) => {
                 self.history.record(HistoryEntry::new(
-                    ActivityAction::CheatPreview,
+                    ActivityAction::Refresh,
                     None,
                     ActivityOutcome::Completed,
                     format!(
@@ -2226,7 +2226,7 @@ impl ArchiveFsApp {
             }
             Ok(Err(message)) => {
                 self.history.record(HistoryEntry::new(
-                    ActivityAction::CheatPreview,
+                    ActivityAction::Refresh,
                     None,
                     ActivityOutcome::Failed,
                     format!("Shared transaction history refresh failed: {message}"),
@@ -2334,26 +2334,59 @@ impl ArchiveFsApp {
         });
     }
 
+    /// Bezel journals share the rollback executor with cheats; label their
+    /// activity by the journal's recorded source mode, not by the executor.
+    /// Display only: an unknown journal (e.g. History still reloading) gets
+    /// a neutral label rather than a guessed cheat or bezel one.
+    pub(crate) fn shared_rollback_activity(&self, journal_path: &Path) -> ActivityAction {
+        let cached = match &self.shared_history {
+            SharedHistoryState::Ready(loaded) => loaded
+                .report
+                .journals
+                .iter()
+                .find(|(path, _)| path.to_path_buf().ok().as_deref() == Some(journal_path))
+                .map(|(_, journal)| journal),
+            _ => None,
+        };
+        let installed =
+            self.cheat_workflow
+                .as_ref()
+                .and_then(|workflow| match &workflow.transaction {
+                    CheatTransactionState::Result { result, .. }
+                        if result.journal_path.as_deref() == Some(journal_path) =>
+                    {
+                        Some(&result.journal)
+                    }
+                    _ => None,
+                });
+        match cached.or(installed) {
+            Some(journal) if journal.context.source_mode == "retroarch_bezel" => {
+                ActivityAction::BezelUndo
+            }
+            Some(_) => ActivityAction::CheatPreview,
+            None => ActivityAction::Undo,
+        }
+    }
+
     pub(crate) fn start_shared_rollback_preview(
         &mut self,
         context: egui::Context,
         journal_path: PathBuf,
         destination_root: PathBuf,
     ) {
-        let Ok(history_root) = default_shared_history_root() else {
-            self.shared_rollback =
-                SharedRollbackState::Failed("Managed history root is unavailable.".to_string());
+        let Some((history_root, backup_root)) =
+            crate::cheats_mods::duckstation_environment::shared_history_roots()
+        else {
+            self.shared_rollback = SharedRollbackState::Failed(
+                "Managed history or backup root is unavailable.".into(),
+            );
             return;
         };
-        let Ok(backup_root) = default_shared_backup_root() else {
-            self.shared_rollback =
-                SharedRollbackState::Failed("Managed backup root is unavailable.".to_string());
-            return;
-        };
+        self.shared_rollback_action = self.shared_rollback_activity(&journal_path);
         let (sender, receiver) = mpsc::channel();
         self.shared_rollback = SharedRollbackState::Previewing { receiver };
         self.history.record(HistoryEntry::new(
-            ActivityAction::CheatPreview,
+            self.shared_rollback_action,
             None,
             ActivityOutcome::Started,
             "Rollback preview started; no files are being changed.",
@@ -2407,7 +2440,7 @@ impl ArchiveFsApp {
         let (sender, receiver) = mpsc::channel();
         self.shared_rollback = SharedRollbackState::Applying { receiver };
         self.history.record(HistoryEntry::new(
-            ActivityAction::CheatPreview,
+            self.shared_rollback_action,
             None,
             ActivityOutcome::Started,
             format!(
@@ -2459,7 +2492,7 @@ impl ArchiveFsApp {
             SharedRollbackState::Previewing { receiver } => match receiver.try_recv() {
                 Ok(Ok((preview, history_root, backup_root))) => {
                     self.history.record(HistoryEntry::new(
-                        ActivityAction::CheatPreview,
+                        self.shared_rollback_action,
                         None,
                         if preview.available {
                             ActivityOutcome::Completed
@@ -2489,7 +2522,7 @@ impl ArchiveFsApp {
             SharedRollbackState::Applying { receiver } => match receiver.try_recv() {
                 Ok(Ok(result)) => {
                     self.history.record(HistoryEntry::new(
-                        ActivityAction::CheatPreview,
+                        self.shared_rollback_action,
                         None,
                         if result.status == SharedApplyStatus::Success {
                             ActivityOutcome::Completed

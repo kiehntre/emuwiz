@@ -1265,10 +1265,18 @@ impl super::App {
                     super::native_workflows::NativeWorkflows::new(ui.ctx().clone())
                 })
                 .prepare_scummvm_trainer_history(ui.ctx(), game_path.as_deref());
+        let has_bezel_history = self
+            .native_workflows
+            .get_or_insert_with(|| super::native_workflows::NativeWorkflows::new(ui.ctx().clone()))
+            .prepare_bezel_history(ui.ctx(), scoped_game.is_none());
         let has_cheat_history = self
             .native_workflows
             .as_ref()
             .is_some_and(super::native_workflows::NativeWorkflows::has_cheat_history);
+        let has_undo_activity = self
+            .native_workflows
+            .as_ref()
+            .is_some_and(super::native_workflows::NativeWorkflows::has_undo_activity);
         // Resolve completed loads before deciding whether history is empty.
         // Starting a load also makes its pending outcome distinct from empty.
         self.duckstation_history.poll();
@@ -1298,9 +1306,11 @@ impl super::App {
 
         let result = filter_entries(&view.entries, &view, scoped_game);
         match result {
-            Err(EmptyCause::NoGameHistory) if has_trainer_history => {}
+            Err(EmptyCause::NoGameHistory) if has_trainer_history || has_bezel_history => {}
             Err(EmptyCause::NoHistory)
                 if has_cheat_history
+                    || has_undo_activity
+                    || has_bezel_history
                     || has_trainer_history
                     || self.duckstation_history.is_loading()
                     || !self.duckstation_history.operations().is_empty()
@@ -1396,6 +1406,14 @@ impl super::App {
             if open_cheats {
                 go = Some(Route::Section(Section::Mods));
             }
+            // Gold records carry no game, so like cheat activity this is global.
+            if let Some(workflows) = self.native_workflows.as_ref() {
+                workflows.show_undo_activity(ui);
+            }
+        }
+
+        if let Some(workflows) = self.native_workflows.as_mut() {
+            workflows.show_bezel_history(ui, scoped_game.is_none());
         }
 
         // Keep recovery navigation after the existing receipts so opening

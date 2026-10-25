@@ -2072,6 +2072,47 @@ impl NativeWorkflows {
         })
     }
 
+    pub(super) fn prepare_blue_history(&mut self, active: bool) {
+        super::bezel_history::prepare(&mut self.app, active);
+    }
+
+    pub(super) fn prepare_bezel_history(&mut self, ctx: &egui::Context, global: bool) -> bool {
+        super::bezel_history::prepare_source(&mut self.app, ctx, global)
+    }
+
+    pub(super) fn show_bezel_history(&mut self, ui: &mut egui::Ui, global: bool) -> bool {
+        super::bezel_history::show(ui, &mut self.app, global)
+    }
+
+    /// Gold's shared Undo records that are not cheats: bezel Undo and Undo
+    /// whose record type could not be established. Labels come from Gold.
+    fn undo_activity(&self) -> Vec<&crate::activity_history::HistoryEntry> {
+        self.app
+            .history
+            .entries()
+            .filter(|entry| {
+                matches!(
+                    entry.action,
+                    crate::activity_history::ActivityAction::BezelUndo
+                        | crate::activity_history::ActivityAction::Undo
+                )
+            })
+            .collect()
+    }
+
+    pub(super) fn has_undo_activity(&self) -> bool {
+        !self.undo_activity().is_empty()
+    }
+
+    pub(super) fn show_undo_activity(&self, ui: &mut egui::Ui) {
+        let entries = self.undo_activity();
+        if entries.is_empty() {
+            return;
+        }
+        ui.heading("Undo activity");
+        activity_cards(ui, "undo-activity", entries);
+    }
+
     pub(super) fn show_cheat_history(&self, ui: &mut egui::Ui) -> bool {
         let entries = self
             .app
@@ -2090,24 +2131,7 @@ impl NativeWorkflows {
             return false;
         }
         ui.heading("Cheat activity");
-        for entry in entries {
-            let entry_id = format!(
-                "{:?}|{:?}|{:?}|{}",
-                entry.timestamp, entry.action, entry.archive_path, entry.message
-            );
-            ui.push_id(("cheat-history", entry_id), |ui| {
-                crate::ui::components::card(ui, |ui| {
-                    ui.strong(entry.action.to_string());
-                    ui.label(entry.outcome.to_string());
-                    ui.label(&entry.message);
-                    if let Some(path) = &entry.archive_path {
-                        ui.collapsing("Advanced Details", |ui| {
-                            ui.monospace(path.display().to_string());
-                        });
-                    }
-                });
-            });
-        }
+        activity_cards(ui, "cheat-history", entries);
         let undo_available = self.app.cheat_workflow.as_ref().is_some_and(|workflow| {
             matches!(
                 workflow.transaction,
@@ -4337,5 +4361,30 @@ pub(super) fn route_for_action(action: ReadinessAction, game_id: i64) -> Option<
         ReadinessAction::ReviewIdentity => Some(Route::ReviewIdentity(game_id)),
         ReadinessAction::CheckGamesFolder => Some(Route::Section(Section::Sources)),
         ReadinessAction::ReviewProblem => Some(Route::Section(Section::Problems)),
+    }
+}
+
+fn activity_cards(
+    ui: &mut egui::Ui,
+    section: &'static str,
+    entries: Vec<&crate::activity_history::HistoryEntry>,
+) {
+    for entry in entries {
+        let entry_id = format!(
+            "{:?}|{:?}|{:?}|{}",
+            entry.timestamp, entry.action, entry.archive_path, entry.message
+        );
+        ui.push_id((section, entry_id), |ui| {
+            crate::ui::components::card(ui, |ui| {
+                ui.strong(entry.action.to_string());
+                ui.label(entry.outcome.to_string());
+                ui.label(&entry.message);
+                if let Some(path) = &entry.archive_path {
+                    ui.collapsing("Advanced Details", |ui| {
+                        ui.monospace(path.display().to_string());
+                    });
+                }
+            });
+        });
     }
 }

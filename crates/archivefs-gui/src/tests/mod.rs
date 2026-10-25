@@ -1116,6 +1116,7 @@ pub(crate) fn app_for_operation_tests() -> ArchiveFsApp {
         shared_history: SharedHistoryState::NotLoaded,
         shared_history_operation: None,
         shared_rollback: SharedRollbackState::Idle,
+        shared_rollback_action: ActivityAction::CheatPreview,
         emulator_readiness: EmulatorReadinessState::default(),
         tape_inspector_filter: tape_analysis_page::LibraryTapeFilterState::default(),
         cheat_workflow: None,
