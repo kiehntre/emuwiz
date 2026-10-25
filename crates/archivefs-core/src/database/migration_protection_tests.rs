@@ -133,9 +133,10 @@ fn a_completed_creator_lock_does_not_authorize_an_automatic_upgrade() {
     make_real_old_database(&path, 7);
     drop(UpgradeLock::acquire(&path).unwrap());
     let before = snapshot(directory.path());
-    let error = Database::open_or_create(&path)
-        .err()
-        .expect("old schemas still require explicit upgrade");
+    let error = match Database::open_or_create(&path) {
+        Ok(_) => panic!("old schemas still require explicit upgrade"),
+        Err(error) => error,
+    };
     assert!(error.to_string().contains("upgrade"));
     assert_eq!(user_version(&path), 7);
     assert_eq!(snapshot(directory.path()), before);
