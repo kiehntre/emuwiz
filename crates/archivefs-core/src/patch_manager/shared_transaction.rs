@@ -90,6 +90,8 @@ pub(super) enum FaultPoint {
     TerminalJournal,
     DurableJournalWrite,
     Permissions,
+    ExchangeUnsupported,
+    ReverseExchange,
 }
 
 #[cfg(test)]
@@ -281,6 +283,12 @@ pub enum SharedApplyFailureKind {
     BackupChanged,
     AlreadyRolledBack,
     RollbackBlocked,
+    /// The folder's filesystem cannot exchange two names atomically, so a
+    /// file there cannot be replaced or restored safely; nothing changed.
+    AtomicReplaceUnsupported,
+    /// The file being displaced had changed and could not be put back: ours
+    /// is published and the displaced file is kept under the temporary name.
+    DisplacedFileKept,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -1811,7 +1819,14 @@ fn apply_one(
     // A replacement may only displace the file observed above, whose bytes
     // were backed up and whose mode was recorded.
     let displaces = (plan.proposed_action == PreviewProposedAction::Replace)
-        .then(|| current.as_ref().and_then(|existing| existing.pin))
+        .then(|| {
+            current.as_ref().and_then(|existing| {
+                existing.pin.map(|pin| Displaced {
+                    pin,
+                    digest: existing.digest.clone(),
+                })
+            })
+        })
         .flatten();
     let write_result = match materialized {
         Some(value) => atomic_write_bytes(
@@ -1820,7 +1835,7 @@ fn apply_one(
             &output_digest,
             plan.proposed_action == PreviewProposedAction::Install,
             write_mode,
-            displaces,
+            displaces.clone(),
         ),
         None => atomic_write(
             &source,
@@ -1889,17 +1904,8 @@ fn apply_one(
         }
         Err((kind, temp)) => {
             result.temporary_path = temp.as_deref().map(SharedTransactionPath::from_path);
-            result = fail_result(
-                result,
-                if kind == SharedApplyFailureKind::VerificationFailed {
-                    SharedApplyOutcome::VerificationFailed
-                } else {
-                    SharedApplyOutcome::WriteFailed
-                },
-                kind,
-                Some(&destination),
-                "atomic destination write failed",
-            );
+            let (outcome, detail) = publication_failure(kind, temp.as_deref());
+            result = fail_result(result, outcome, kind, Some(&destination), &detail);
         }
     }
     result
@@ -2109,18 +2115,50 @@ fn restore_after_failed_verification(
         .map_err(|(kind, _)| kind)
 }
 
+/// The outcome and plain detail for a refused or failed publication.
+fn publication_failure(
+    kind: SharedApplyFailureKind,
+    temp: Option<&Path>,
+) -> (SharedApplyOutcome, String) {
+    match kind {
+        SharedApplyFailureKind::VerificationFailed => (
+            SharedApplyOutcome::VerificationFailed,
+            "atomic destination write failed".into(),
+        ),
+        SharedApplyFailureKind::DestinationChanged => (
+            SharedApplyOutcome::DestinationChanged,
+            "the file changed after it was checked and backed up; it was left as it is and nothing was changed".into(),
+        ),
+        SharedApplyFailureKind::AtomicReplaceUnsupported => (
+            SharedApplyOutcome::WriteFailed,
+            "this folder's filesystem cannot replace files atomically, so EmuWiz refused and changed nothing".into(),
+        ),
+        SharedApplyFailureKind::DisplacedFileKept => (
+            SharedApplyOutcome::WriteFailed,
+            format!(
+                "EmuWiz's file is now in place, but the file it displaced had changed and could not be put back; it is kept at {}. Review both before retrying",
+                temp.map_or_else(|| "an unknown temporary name".into(), |path| path.display().to_string())
+            ),
+        ),
+        _ => (SharedApplyOutcome::WriteFailed, "atomic destination write failed".into()),
+    }
+}
+
 /// The pin of the file a restore displaces: it must still hold exactly the
 /// bytes this transaction installed.
 fn pinned_installed_file(
     destination: &Path,
     installed_digest: &str,
-) -> Result<Option<FilePin>, SharedApplyFailureKind> {
+) -> Result<Option<Displaced>, SharedApplyFailureKind> {
     let installed = stable_hash(destination, SHARED_MAX_MATERIALIZED_BYTES)
         .map_err(|_| SharedApplyFailureKind::DestinationChanged)?;
     if installed.digest != installed_digest {
         return Err(SharedApplyFailureKind::DestinationChanged);
     }
-    Ok(installed.pin)
+    Ok(installed.pin.map(|pin| Displaced {
+        pin,
+        digest: installed.digest,
+    }))
 }
 
 pub fn discover_shared_apply_history(history_root: &Path) -> SharedHistoryReport {
@@ -2386,14 +2424,14 @@ pub fn execute_shared_rollback(
                         SharedRollbackPermissions::for_recorded_mode(install.destination_pre_mode)
                     })
                     .restored_mode();
-                let installed = match pinned_installed_file(
+                // A refusal falls through to the durable NeedsReview update.
+                match pinned_installed_file(
                     &destination,
                     install
                         .final_destination_digest
                         .as_deref()
                         .unwrap_or_default(),
                 ) {
-                    Ok(pin) => pin,
                     Err(kind) => {
                         rollback.outcome = SharedRollbackOutcome::Failed;
                         rollback.failure = Some(failure(
@@ -2401,18 +2439,30 @@ pub fn execute_shared_rollback(
                             Some(&destination),
                             "the installed file changed before it could be restored",
                         ));
-                        continue;
                     }
-                };
-                match atomic_write(&backup, &destination, expected, false, mode, installed) {
-                    Ok(_) => rollback.outcome = SharedRollbackOutcome::RestoredBackup,
-                    Err((kind, _)) => {
-                        rollback.outcome = SharedRollbackOutcome::Failed;
-                        rollback.failure = Some(failure(
-                            kind,
-                            Some(&destination),
-                            "previous destination bytes could not be restored and verified",
-                        ));
+                    Ok(installed) => {
+                        match atomic_write(&backup, &destination, expected, false, mode, installed)
+                        {
+                            Ok(_) => rollback.outcome = SharedRollbackOutcome::RestoredBackup,
+                            Err((kind, temp)) => {
+                                let detail = match kind {
+                                    // Nothing was undone: say so, and how to
+                                    // recover by hand from the kept backup.
+                                    SharedApplyFailureKind::AtomicReplaceUnsupported => format!(
+                                        "This folder's filesystem cannot replace files atomically, so EmuWiz did not undo this change and left every file as it is. The original file is kept in EmuWiz's backup at {}. To restore it by hand, close the emulator and copy that file over {}. This change stays in History.",
+                                        backup.display(),
+                                        destination.display()
+                                    ),
+                                    SharedApplyFailureKind::DisplacedFileKept
+                                    | SharedApplyFailureKind::DestinationChanged => {
+                                        publication_failure(kind, temp.as_deref()).1
+                                    }
+                                    _ => "previous destination bytes could not be restored and verified".into(),
+                                };
+                                rollback.outcome = SharedRollbackOutcome::Failed;
+                                rollback.failure = Some(failure(kind, Some(&destination), &detail));
+                            }
+                        }
                     }
                 }
             }
@@ -2553,18 +2603,12 @@ impl FilePin {
     }
 }
 
-/// The pin of the regular file at `path`, read through an `O_NOFOLLOW`
-/// descriptor; `None` for anything else (missing, link, special file).
-#[cfg(unix)]
-fn pin_no_follow(path: &Path) -> Option<FilePin> {
-    use std::os::unix::fs::OpenOptionsExt;
-    let file = OpenOptions::new()
-        .read(true)
-        .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC | libc::O_NONBLOCK)
-        .open(path)
-        .ok()?;
-    let metadata = file.metadata().ok()?;
-    metadata.is_file().then(|| FilePin::of(&metadata))
+/// The file a replacement or restore must displace: its pin and the digest of
+/// the bytes it held when observed (the backed-up or installed bytes).
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct Displaced {
+    pin: FilePin,
+    digest: String,
 }
 
 fn stable_hash(path: &Path, max: u64) -> Result<StableHash, SharedApplyFailureKind> {
@@ -2671,7 +2715,7 @@ fn atomic_write(
     expected: &str,
     no_replace: bool,
     mode: u32,
-    displaces: Option<FilePin>,
+    displaces: Option<Displaced>,
 ) -> Result<PathBuf, (SharedApplyFailureKind, Option<PathBuf>)> {
     if should_inject(FaultPoint::TemporaryWrite) {
         return Err((SharedApplyFailureKind::WriteFailed, None));
@@ -2689,7 +2733,7 @@ fn atomic_write_bytes(
     expected: &str,
     no_replace: bool,
     mode: u32,
-    displaces: Option<FilePin>,
+    displaces: Option<Displaced>,
 ) -> Result<PathBuf, (SharedApplyFailureKind, Option<PathBuf>)> {
     if bytes.len() as u64 > SHARED_MAX_MATERIALIZED_BYTES {
         return Err((SharedApplyFailureKind::ResourceLimitReached, None));
@@ -2739,8 +2783,8 @@ fn atomic_write_bytes(
         if should_inject(FaultPoint::Rename) {
             return Err(SharedApplyFailureKind::WriteFailed);
         }
-        match displaces {
-            Some(pin) => publish_displacing(&temp, destination, pin, &mut keep_temp)?,
+        match &displaces {
+            Some(displaced) => publish_displacing(&temp, destination, displaced, &mut keep_temp)?,
             None if no_replace => rename_no_replace(&temp, destination)
                 .map_err(|_| SharedApplyFailureKind::DestinationChanged)?,
             None => {
@@ -2788,49 +2832,78 @@ fn before_publish(_destination: &Path) {
 }
 
 /// Publishes `temp` at `destination` only if what it displaces is still the
-/// exact pinned file: same inode, size, mtime, permission bits, owner and
-/// link count. On Linux the two names are exchanged atomically and the
-/// displaced file is then checked through an `O_NOFOLLOW` descriptor, so no
-/// change between observation and publication can slip through; on a
-/// mismatch the exchange is reversed, putting the other file back untouched,
-/// and the write is refused. A verified displaced file is removed (its bytes
-/// are in the transaction's backup or were EmuWiz's own install).
+/// exact observed file: same inode, size, mtime, permission bits, owner and
+/// link count, and the same bytes. On Linux the two names are exchanged
+/// atomically and the displaced file is then hashed through an `O_NOFOLLOW`
+/// descriptor, so no change between observation and publication can slip
+/// through; on a mismatch the exchange is reversed, putting the other file
+/// back untouched, and the write is refused. A filesystem without atomic
+/// exchange refuses rather than falling back to an unchecked rename. A
+/// verified displaced file is removed (its bytes are in the transaction's
+/// backup or were EmuWiz's own install).
 #[cfg(target_os = "linux")]
 fn publish_displacing(
     temp: &Path,
     destination: &Path,
-    pin: FilePin,
+    displaced: &Displaced,
     keep_temp: &mut bool,
 ) -> Result<(), SharedApplyFailureKind> {
     before_publish(destination);
-    rename_exchange(temp, destination).map_err(|_| SharedApplyFailureKind::DestinationChanged)?;
+    let exchanged = if should_inject(FaultPoint::ExchangeUnsupported) {
+        Err(std::io::Error::from_raw_os_error(libc::EINVAL))
+    } else {
+        rename_exchange(temp, destination)
+    };
+    if let Err(error) = exchanged {
+        return Err(
+            if matches!(
+                error.raw_os_error(),
+                Some(libc::EINVAL | libc::EOPNOTSUPP | libc::ENOSYS)
+            ) {
+                SharedApplyFailureKind::AtomicReplaceUnsupported
+            } else {
+                SharedApplyFailureKind::DestinationChanged
+            },
+        );
+    }
     // `temp` now names the displaced file and `destination` our new one.
-    if pin_no_follow(temp) == Some(pin) {
-        fs::remove_file(temp).map_err(|_| SharedApplyFailureKind::WriteFailed)?;
+    let observed = stable_hash(
+        temp,
+        SHARED_MAX_SOURCE_BYTES.max(SHARED_MAX_MATERIALIZED_BYTES),
+    );
+    if observed.is_ok_and(|hash| hash.pin == Some(displaced.pin) && hash.digest == displaced.digest)
+    {
+        // Ours is published; a leftover displaced copy is only litter.
+        let _ = fs::remove_file(temp);
         return Ok(());
     }
-    if rename_exchange(temp, destination).is_err() {
+    if should_inject(FaultPoint::ReverseExchange) || rename_exchange(temp, destination).is_err() {
         // Ours stays published; the other file is kept under `temp`.
         *keep_temp = true;
+        return Err(SharedApplyFailureKind::DisplacedFileKept);
     }
     Err(SharedApplyFailureKind::DestinationChanged)
 }
 
-/// Without an atomic exchange the pin is re-checked immediately before the
-/// rename; only Linux offers the stronger guarantee above.
+/// Without an atomic exchange the pin and bytes are re-checked immediately
+/// before the rename; only Linux offers the stronger guarantee above.
 #[cfg(not(target_os = "linux"))]
 fn publish_displacing(
     temp: &Path,
     destination: &Path,
-    pin: FilePin,
+    displaced: &Displaced,
     _keep_temp: &mut bool,
 ) -> Result<(), SharedApplyFailureKind> {
     before_publish(destination);
     #[cfg(unix)]
-    let unchanged = pin_no_follow(destination) == Some(pin);
+    let unchanged = stable_hash(
+        destination,
+        SHARED_MAX_SOURCE_BYTES.max(SHARED_MAX_MATERIALIZED_BYTES),
+    )
+    .is_ok_and(|hash| hash.pin == Some(displaced.pin) && hash.digest == displaced.digest);
     #[cfg(not(unix))]
     let unchanged = {
-        let _ = pin;
+        let _ = displaced;
         false
     };
     if !unchanged {
@@ -3202,6 +3275,25 @@ pub fn plan_pending_recovery(operation: &SharedPendingOperation) -> SharedPendin
     }
 }
 
+/// A regular file named like this module's temporary publication files in the
+/// destination's folder. They are always removed on the normal paths, so one
+/// that remains marks an interrupted or refused publication.
+fn stray_publication_file_beside(destination: &Path) -> bool {
+    let Some(parent) = destination.parent() else {
+        return false;
+    };
+    let Ok(entries) = fs::read_dir(parent) else {
+        return false;
+    };
+    entries.flatten().any(|entry| {
+        entry
+            .file_name()
+            .to_string_lossy()
+            .starts_with(".archivefs-apply-")
+            && entry.file_type().is_ok_and(|kind| kind.is_file())
+    })
+}
+
 fn reconcile_durable_entry(
     entry: &SharedDurableEntry,
     transaction_state: SharedRecoveryState,
@@ -3228,6 +3320,12 @@ fn reconcile_durable_entry(
     } else {
         true
     };
+    // An interrupted exchange can leave the displaced file under a hidden
+    // publication name beside the destination; until someone looks at it the
+    // entry is not settled, whatever the destination itself holds.
+    if stray_publication_file_beside(&destination) {
+        return SharedEntryRecoveryState::NeedsReview;
+    }
     match transaction_state {
         SharedRecoveryState::RollingBack | SharedRecoveryState::RollbackFailed => {
             if (entry.destination_existed_before_apply == Some(false)
@@ -5179,7 +5277,7 @@ mod tests {
         );
         set_before_publish(None);
         let entry = &result.journal.entries[0];
-        assert_ne!(entry.outcome, SharedApplyOutcome::ReplacedExisting);
+        assert_eq!(entry.outcome, SharedApplyOutcome::DestinationChanged);
         assert!(
             entry
                 .failures
@@ -5266,6 +5364,13 @@ mod tests {
             refused.preview.entries[0].failure.as_ref().map(|f| f.kind),
             Some(SharedApplyFailureKind::DestinationChanged)
         );
+        let pending = discover_pending_operations(&fixture.history_root());
+        assert_eq!(pending.len(), 1);
+        assert_eq!(
+            pending[0].journal.entries[0].state,
+            SharedEntryRecoveryState::NeedsReview,
+            "the refusal is recorded durably"
+        );
         assert_eq!(fs::read(&live).unwrap(), b"new");
         assert_eq!(mode_of(&live), 0o600);
         assert!(stray_temporaries(live.parent().unwrap()).is_empty());
@@ -5308,6 +5413,183 @@ mod tests {
         assert_eq!(fs::read(&live).unwrap(), b"new");
         assert_eq!(mode_of(&live), 0o644);
         assert!(stray_temporaries(live.parent().unwrap()).is_empty());
+    }
+
+    /// A filesystem that can't exchange names atomically refuses Apply and
+    /// Undo of a replacement with that reason, never "destination changed",
+    /// and changes nothing.
+    #[cfg(unix)]
+    #[test]
+    fn filesystems_without_atomic_exchange_refuse_with_an_accurate_reason() {
+        let fixture = Fixture::new("race-no-exchange");
+        let report = preview(&fixture, b"new", Some(b"old"));
+        let live = fixture.destination_root().join("Nintendo - NES/game.cht");
+        chmod(&live, 0o664);
+        let plan = make_plan(&fixture, &report);
+        inject_fault(Some(FaultPoint::ExchangeUnsupported));
+        let refused = execute_shared_apply(
+            &plan,
+            &options(&fixture, &plan, "no-exchange", false, true, true),
+        );
+        inject_fault(None);
+        let entry = &refused.journal.entries[0];
+        assert!(
+            entry.failures.iter().any(|f| f.kind
+                == SharedApplyFailureKind::AtomicReplaceUnsupported
+                && f.detail.contains("cannot replace files atomically")),
+            "{:?}",
+            entry.failures
+        );
+        assert_eq!(fs::read(&live).unwrap(), b"old");
+        assert_eq!(mode_of(&live), 0o664);
+        assert!(stray_temporaries(live.parent().unwrap()).is_empty());
+        // Undo of a replacement on such a filesystem is refused the same way.
+        let applied = execute_shared_apply(
+            &plan,
+            &options(&fixture, &plan, "no-exchange-2", false, true, true),
+        );
+        let journal_path = applied.journal_path.clone().unwrap();
+        let rollback = preview_shared_rollback(
+            &journal_path,
+            &fixture.destination_root(),
+            &fixture.backup_root(),
+        );
+        inject_fault(Some(FaultPoint::ExchangeUnsupported));
+        let undo = confirm_rollback(&fixture, &rollback, "no-exchange-undo");
+        inject_fault(None);
+        assert_eq!(
+            undo.preview.entries[0].failure.as_ref().map(|f| f.kind),
+            Some(SharedApplyFailureKind::AtomicReplaceUnsupported)
+        );
+        // Never reported as done; the journal stays and names the backup for
+        // a manual restore.
+        assert_eq!(undo.status, SharedApplyStatus::Failed);
+        assert!(undo.journal_path.is_none(), "no rollback marker is written");
+        let detail = &undo.preview.entries[0].failure.as_ref().unwrap().detail;
+        let backup = applied.journal.entries[0]
+            .backup_path
+            .as_ref()
+            .unwrap()
+            .to_path_buf()
+            .unwrap();
+        assert!(detail.contains("did not undo this change"), "{detail}");
+        assert!(detail.contains(&backup.display().to_string()), "{detail}");
+        assert_eq!(fs::read(&backup).unwrap(), b"old");
+        assert_eq!(fs::read(&live).unwrap(), b"new");
+        assert!(stray_temporaries(live.parent().unwrap()).is_empty());
+        assert!(journal_path.is_file());
+        let again = preview_shared_rollback(
+            &journal_path,
+            &fixture.destination_root(),
+            &fixture.backup_root(),
+        );
+        assert!(again.available, "the change can still be undone later");
+    }
+
+    /// If the changed file can't be put back, it is kept (never deleted) and
+    /// its location is named.
+    #[cfg(unix)]
+    #[test]
+    fn a_displaced_file_that_cannot_be_put_back_is_kept_and_named() {
+        let fixture = Fixture::new("race-keep");
+        let report = preview(&fixture, b"new", Some(b"old"));
+        let live = fixture.destination_root().join("Nintendo - NES/game.cht");
+        chmod(&live, 0o664);
+        let plan = make_plan(&fixture, &report);
+        set_before_publish(Some(Box::new(|destination: &Path| {
+            chmod(destination, 0o640)
+        })));
+        inject_fault(Some(FaultPoint::ReverseExchange));
+        let result = execute_shared_apply(
+            &plan,
+            &options(&fixture, &plan, "race-keep", false, true, true),
+        );
+        inject_fault(None);
+        set_before_publish(None);
+        let entry = &result.journal.entries[0];
+        assert_ne!(entry.outcome, SharedApplyOutcome::ReplacedExisting);
+        let failure = entry
+            .failures
+            .iter()
+            .find(|f| f.kind == SharedApplyFailureKind::DisplacedFileKept)
+            .expect("kept-file failure");
+        let kept = entry
+            .temporary_path
+            .as_ref()
+            .unwrap()
+            .to_path_buf()
+            .unwrap();
+        assert!(
+            failure.detail.contains(&kept.display().to_string()),
+            "{}",
+            failure.detail
+        );
+        assert_eq!(fs::read(&kept).unwrap(), b"old");
+        assert_eq!(mode_of(&kept), 0o640);
+        assert_eq!(fs::read(&live).unwrap(), b"new");
+        // Recovery would not call this settled while the kept file exists.
+        assert!(stray_publication_file_beside(&live));
+    }
+
+    /// Same size and the old mtime but different bytes is a changed file.
+    #[cfg(unix)]
+    #[test]
+    fn a_content_rewrite_that_keeps_size_and_mtime_is_refused() {
+        let fixture = Fixture::new("race-rewrite");
+        let report = preview(&fixture, b"new", Some(b"old"));
+        let live = fixture.destination_root().join("Nintendo - NES/game.cht");
+        chmod(&live, 0o664);
+        let plan = make_plan(&fixture, &report);
+        set_before_publish(Some(Box::new(|destination: &Path| {
+            let modified = fs::metadata(destination).unwrap().modified().unwrap();
+            let file = OpenOptions::new().write(true).open(destination).unwrap();
+            (&file).write_all(b"OLD").unwrap();
+            file.set_modified(modified).unwrap();
+        })));
+        let result = execute_shared_apply(
+            &plan,
+            &options(&fixture, &plan, "race-rewrite", false, true, true),
+        );
+        set_before_publish(None);
+        assert_eq!(
+            result.journal.entries[0].outcome,
+            SharedApplyOutcome::DestinationChanged
+        );
+        assert_eq!(
+            fs::read(&live).unwrap(),
+            b"OLD",
+            "the user's bytes are kept"
+        );
+        assert!(stray_temporaries(live.parent().unwrap()).is_empty());
+    }
+
+    /// A crash between exchange and verification leaves a hidden publication
+    /// file; recovery reports the entry for review instead of settled.
+    #[cfg(unix)]
+    #[test]
+    fn recovery_flags_a_stray_publication_file_for_review() {
+        let fixture = Fixture::new("race-recovery");
+        let report = preview(&fixture, b"new", Some(b"old"));
+        let live = fixture.destination_root().join("Nintendo - NES/game.cht");
+        let plan = make_plan(&fixture, &report);
+        inject_fault(Some(FaultPoint::TerminalJournal));
+        execute_shared_apply(
+            &plan,
+            &options(&fixture, &plan, "race-recovery", false, true, true),
+        );
+        inject_fault(None);
+        let settled = discover_pending_operations(&fixture.history_root());
+        assert_eq!(
+            settled[0].reconciled_entries,
+            vec![SharedEntryRecoveryState::Applied]
+        );
+        fs::write(live.with_file_name(".archivefs-apply-999-0"), b"displaced").unwrap();
+        let pending = discover_pending_operations(&fixture.history_root());
+        assert_eq!(
+            pending[0].reconciled_entries,
+            vec![SharedEntryRecoveryState::NeedsReview]
+        );
+        assert!(!plan_pending_recovery(&pending[0]).can_safe_rollback);
     }
 
     /// Apply's own automatic restore after a failed content check uses the

@@ -528,7 +528,13 @@ impl ApplyOutcome {
                 .journal
                 .entries
                 .iter()
-                .flat_map(|entry| entry.warnings.iter().cloned())
+                .flat_map(|entry| {
+                    entry
+                        .warnings
+                        .iter()
+                        .cloned()
+                        .chain(entry.failures.iter().map(|failure| failure.detail.clone()))
+                })
                 .collect(),
         }
     }
