@@ -2334,6 +2334,21 @@ impl ArchiveFsApp {
         });
     }
 
+    /// Bezel journals share the rollback executor with cheats; label their
+    /// activity by the journal's recorded source mode, not by the executor.
+    fn shared_rollback_activity(&self, journal_path: &Path) -> ActivityAction {
+        let bezel = matches!(&self.shared_history, SharedHistoryState::Ready(loaded)
+            if loaded.report.journals.iter().any(|(path, journal)| {
+                path.to_path_buf().ok().as_deref() == Some(journal_path)
+                    && journal.context.source_mode == "retroarch_bezel"
+            }));
+        if bezel {
+            ActivityAction::BezelUndo
+        } else {
+            ActivityAction::CheatPreview
+        }
+    }
+
     pub(crate) fn start_shared_rollback_preview(
         &mut self,
         context: egui::Context,
@@ -2348,10 +2363,11 @@ impl ArchiveFsApp {
             );
             return;
         };
+        self.shared_rollback_action = self.shared_rollback_activity(&journal_path);
         let (sender, receiver) = mpsc::channel();
         self.shared_rollback = SharedRollbackState::Previewing { receiver };
         self.history.record(HistoryEntry::new(
-            ActivityAction::CheatPreview,
+            self.shared_rollback_action,
             None,
             ActivityOutcome::Started,
             "Rollback preview started; no files are being changed.",
@@ -2405,7 +2421,7 @@ impl ArchiveFsApp {
         let (sender, receiver) = mpsc::channel();
         self.shared_rollback = SharedRollbackState::Applying { receiver };
         self.history.record(HistoryEntry::new(
-            ActivityAction::CheatPreview,
+            self.shared_rollback_action,
             None,
             ActivityOutcome::Started,
             format!(
@@ -2457,7 +2473,7 @@ impl ArchiveFsApp {
             SharedRollbackState::Previewing { receiver } => match receiver.try_recv() {
                 Ok(Ok((preview, history_root, backup_root))) => {
                     self.history.record(HistoryEntry::new(
-                        ActivityAction::CheatPreview,
+                        self.shared_rollback_action,
                         None,
                         if preview.available {
                             ActivityOutcome::Completed
@@ -2487,7 +2503,7 @@ impl ArchiveFsApp {
             SharedRollbackState::Applying { receiver } => match receiver.try_recv() {
                 Ok(Ok(result)) => {
                     self.history.record(HistoryEntry::new(
-                        ActivityAction::CheatPreview,
+                        self.shared_rollback_action,
                         None,
                         if result.status == SharedApplyStatus::Success {
                             ActivityOutcome::Completed

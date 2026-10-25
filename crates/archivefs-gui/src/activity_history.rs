@@ -88,12 +88,15 @@ pub(crate) enum ActivityAction {
     DatRenameApply,
     /// A rollback of a DAT rename transaction.
     DatRenameRollback,
+    /// Preview or Undo of a saved RetroArch bezel apply. Uses the shared
+    /// rollback executor but is not a cheat operation.
+    BezelUndo,
 }
 
 /// Every `ActivityAction`, for the History & Logs "Operation" filter.
 /// Must list each variant exactly once (checked by
 /// `activity_filter_lists_cover_every_variant`).
-pub(crate) const ALL_ACTIVITY_ACTIONS: [ActivityAction; 45] = [
+pub(crate) const ALL_ACTIVITY_ACTIONS: [ActivityAction; 46] = [
     ActivityAction::Refresh,
     ActivityAction::Mount,
     ActivityAction::MountAll,
@@ -139,6 +142,7 @@ pub(crate) const ALL_ACTIVITY_ACTIONS: [ActivityAction; 45] = [
     ActivityAction::RommSource,
     ActivityAction::DatRenameApply,
     ActivityAction::DatRenameRollback,
+    ActivityAction::BezelUndo,
 ];
 
 /// Every `ActivityOutcome`, for the History & Logs "Result" filter.
@@ -266,6 +270,7 @@ impl std::fmt::Display for ActivityAction {
             Self::RommSource => "RomM identity source",
             Self::DatRenameApply => "DAT rename apply",
             Self::DatRenameRollback => "DAT rename rollback",
+            Self::BezelUndo => "Bezel Undo",
         })
     }
 }

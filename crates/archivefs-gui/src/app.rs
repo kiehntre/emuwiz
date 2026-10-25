@@ -27,6 +27,8 @@ pub(crate) struct ArchiveFsApp {
     pub(crate) shared_history: SharedHistoryState,
     pub(crate) shared_history_operation: Option<String>,
     pub(crate) shared_rollback: SharedRollbackState,
+    /// Activity label for the current shared rollback, chosen from its journal.
+    pub(crate) shared_rollback_action: ActivityAction,
     pub(crate) doctor_repair: DoctorRepairState,
     pub(crate) emulator_readiness: EmulatorReadinessState,
     /// The Tape Inspector library browser's persisted search/platform/format
@@ -453,6 +455,7 @@ impl ArchiveFsApp {
             shared_history: SharedHistoryState::NotLoaded,
             shared_history_operation: None,
             shared_rollback: SharedRollbackState::Idle,
+            shared_rollback_action: ActivityAction::CheatPreview,
             doctor_repair: DoctorRepairState::new(context.clone(), generation),
             emulator_readiness: EmulatorReadinessState::new(),
             storage_health_page: storage_health_page::StorageHealthPageState::default(),

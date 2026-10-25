@@ -205,6 +205,13 @@ fn durable_bezel_record_reuses_gold_preview_confirmation_and_executor_after_rest
     assert!(
         matches!(&app.shared_rollback, SharedRollbackState::Result(result) if result.status == SharedApplyStatus::Success)
     );
+    // Blue's Cheat activity lists CheatPreview entries; bezel Undo is not one.
+    let actions: Vec<_> = app.history.entries().map(|entry| entry.action).collect();
+    assert!(actions.contains(&crate::ActivityAction::BezelUndo), "{actions:?}");
+    assert!(
+        !actions.contains(&crate::ActivityAction::CheatPreview),
+        "{actions:?}"
+    );
     assert_eq!(
         fs::read(f.destination.join("retroarch.cfg")).unwrap(),
         before
