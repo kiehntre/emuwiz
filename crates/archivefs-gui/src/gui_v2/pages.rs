@@ -1718,18 +1718,21 @@ impl App {
                 .is_some_and(|source| matches!(source, Source::Remote { record, .. }
                     if record.verification == archivefs_core::identity_source::model::ExternalVerification::Stale))
             {
-                let galley = ui.painter().layout(
-                    "Saved artwork · stale record".into(),
-                    egui::FontId::proportional(theme::METADATA_SIZE),
+                let compact = rect.width() < 100.0 || rect.height() < 100.0;
+                let painter = ui.painter().with_clip_rect(ui.clip_rect().intersect(rect));
+                let galley = painter.layout(
+                    if compact { "Stale" } else { "Saved artwork · stale record" }.into(),
+                    egui::FontId::proportional(if compact { 11.0 } else { theme::METADATA_SIZE }),
                     theme::SECONDARY_TEXT,
                     (rect.width() - 12.0).max(1.0),
                 );
+                let height = (galley.size().y + 8.0).min(rect.height());
                 let plate = egui::Rect::from_min_size(
-                    egui::pos2(rect.left(), rect.bottom() - galley.size().y - 8.0),
-                    egui::vec2(rect.width(), galley.size().y + 8.0),
+                    egui::pos2(rect.left(), rect.bottom() - height),
+                    egui::vec2(rect.width(), height),
                 );
-                ui.painter().rect_filled(plate, 4.0, theme::deep_fill(ui));
-                ui.painter().galley(plate.min + egui::vec2(6.0, 4.0), galley, theme::SECONDARY_TEXT);
+                painter.rect_filled(plate, 4.0, theme::deep_fill(ui));
+                painter.galley(plate.min + egui::vec2(6.0, 4.0), galley, theme::SECONDARY_TEXT);
                 response.on_hover_text("RomM's saved record is out of date because its game file changed or disappeared. This picture is retained as display evidence. Refresh the RomM index to recheck its association.");
             }
         } else {
@@ -3737,7 +3740,7 @@ impl App {
             matches!(source, Source::Remote { record, .. }
                 if record.verification == archivefs_core::identity_source::model::ExternalVerification::Stale))
         {
-            ui.label("Saved artwork · stale record. RomM's game association needs a refresh; the saved picture is retained as display evidence.");
+            ui.label("Saved artwork · stale record. RomM's game association needs a refresh. Any displayed picture is saved provider evidence.");
         }
         let resolved_winner =
             index

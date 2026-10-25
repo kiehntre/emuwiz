@@ -74,8 +74,7 @@ fn job40_small_provider_thumbnail_remains_available_when_large_cover_is_uncached
     );
 }
 
-#[test]
-fn job40_cached_artwork_from_a_stale_record_stays_visible_with_a_warning() {
+fn stale_picture_fixture() -> (egui::Context, App, Library) {
     use archivefs_core::identity_source::model::ExternalIdentityRecord;
     let context = egui::Context::default();
     let mut app = fixture(&context);
@@ -113,6 +112,73 @@ fn job40_cached_artwork_from_a_stale_record_stays_visible_with_a_warning() {
             },
         },
     );
+    (context, app, library)
+}
+
+#[test]
+fn job40_stale_indicator_fits_actual_list_cover_bounds() {
+    let (context, mut app, library) = stale_picture_fixture();
+    for size in [
+        egui::vec2(52.0, 68.0),
+        egui::vec2(46.0, 62.0),
+        egui::vec2(180.0, 240.0),
+    ] {
+        let mut cover = egui::Rect::NOTHING;
+        let output = context.run(egui::RawInput::default(), |ctx| {
+            egui::CentralPanel::default().show(ctx, |ui| {
+                cover = egui::Rect::from_min_size(ui.cursor().min, size);
+                app.picture(ui, library.game(40).unwrap(), Kind::Cover, size);
+            });
+        });
+        let bounds: Vec<_> = ["Saved artwork · stale record", "Stale"]
+            .into_iter()
+            .flat_map(|label| text_bounds(&output, label))
+            .collect();
+        assert_eq!(
+            bounds.len(),
+            1,
+            "stale evidence must still have an indicator"
+        );
+        assert!(
+            cover.contains_rect(bounds[0]),
+            "badge {:?} escapes the {:?} picture",
+            bounds[0],
+            cover
+        );
+    }
+}
+
+#[test]
+fn job40_stale_provenance_does_not_claim_an_unavailable_picture_is_retained() {
+    use archivefs_core::identity_source::romm::connectivity::RommConnectivity;
+    let (context, mut app, library) = stale_picture_fixture();
+    app.library = Arc::new(library);
+    let key = app.artwork.key(40, Kind::Cover);
+    app.artwork.pictures.insert(
+        key,
+        Picture::Unavailable {
+            issue: RommConnectivity::DnsFailure,
+            message: "RomM cannot currently be reached.".into(),
+        },
+    );
+    app.router.current = Route::Task {
+        section: Section::Artwork,
+        game: 40,
+    };
+    let strings = text(&frame(&context, &mut app, [1280.0, 1100.0]));
+    assert!(strings.iter().any(|text| text.contains("stale record")));
+    assert!(
+        !strings
+            .iter()
+            .any(|text| text.contains("picture is retained")),
+        "a stale provider reference does not prove that a cached picture exists"
+    );
+}
+
+#[test]
+fn job40_cached_artwork_from_a_stale_record_stays_visible_with_a_warning() {
+    let (context, mut app, library) = stale_picture_fixture();
+    let key = app.artwork.key(40, Kind::Cover);
     let output = context.run(egui::RawInput::default(), |ctx| {
         egui::CentralPanel::default().show(ctx, |ui| {
             app.picture(
