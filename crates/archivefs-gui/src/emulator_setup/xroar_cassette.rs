@@ -114,6 +114,17 @@ impl Controller {
                     for step in evidence.loading_steps() {
                         ui.label(step);
                     }
+                    ui.label(
+                        "If your XRoar build provides a file chooser, its optional \
+                         automatic loading is File → Run (Ctrl+Shift+L): select the cassette. XRoar detects \
+                         the first program's type. Special loaders may still need \
+                         the game's own instructions. EmuWiz only inserts the tape; \
+                         loading starts when you choose it.",
+                    );
+                    ui.hyperlink_to(
+                        "XRoar loading instructions",
+                        "https://www.6809.org.uk/xroar/doc/xroar.shtml#Running-programs",
+                    );
                     ui.small(
                         "Choose the machine with EMUWIZ_XROAR_MACHINE (dragon32, dragon64, coco2 or \
                          coco3) and, if needed, EMUWIZ_XROAR_FIRMWARE_DIRECTORY.",

@@ -571,6 +571,93 @@ mod tests {
     }
 
     #[test]
+    fn exited_cassette_offers_retry_and_rechecks_current_bytes() {
+        let fixture = fixture();
+        let request = request_for(&fixture);
+        let process = request
+            .clone()
+            .execute_with(&catalogues(&fixture.sources), &fixture.roots)
+            .unwrap();
+        let mut state = StandaloneLaunchState::default();
+        state.tracked = Some((
+            fixture.tape.clone(),
+            "xroar".into(),
+            StandaloneLaunchStage::Running(StandaloneProcess::XRoar(process)),
+        ));
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while state.is_active() {
+            state.poll();
+            assert!(std::time::Instant::now() < deadline);
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+        assert!(matches!(
+            state.tracked,
+            Some((_, _, StandaloneLaunchStage::Exited(_)))
+        ));
+        let context = egui::Context::default();
+        let mut frame = |events| {
+            context.run(
+                egui::RawInput {
+                    events,
+                    ..Default::default()
+                },
+                |ctx| {
+                    egui::CentralPanel::default().show(ctx, |ui| {
+                        show_standalone_launch_action(
+                            ui,
+                            &mut state,
+                            StandaloneLaunchRequest::XRoar(request.clone()),
+                        );
+                    });
+                },
+            )
+        };
+        fn button_center(shape: &egui::Shape) -> Option<egui::Pos2> {
+            match shape {
+                egui::Shape::Text(text) if text.galley.text() == "Launch XRoar again (recheck)" => {
+                    Some(text.pos + text.galley.size() / 2.0)
+                }
+                egui::Shape::Vec(shapes) => shapes.iter().find_map(button_center),
+                _ => None,
+            }
+        }
+        frame(Vec::new());
+        let output = frame(Vec::new());
+        let position = output
+            .shapes
+            .iter()
+            .find_map(|s| button_center(&s.shape))
+            .expect("an exited XRoar cassette must offer retry without restarting Blue");
+        // Retry must dispatch fresh verification, not replay the old command.
+        std::fs::write(&fixture.tape, b"changed since the first play").unwrap();
+        for pressed in [true, false] {
+            frame(vec![
+                egui::Event::PointerMoved(position),
+                egui::Event::PointerButton {
+                    pos: position,
+                    button: egui::PointerButton::Primary,
+                    pressed,
+                    modifiers: egui::Modifiers::NONE,
+                },
+            ]);
+        }
+        assert!(
+            state.is_active(),
+            "retry must start the existing revalidation worker"
+        );
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while state.is_active() {
+            state.poll();
+            assert!(std::time::Instant::now() < deadline);
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+        assert!(matches!(
+            state.tracked,
+            Some((_, _, StandaloneLaunchStage::Failed(_)))
+        ));
+    }
+
+    #[test]
     fn checked_bios_is_bound_to_spawn_and_removed_bios_refuses() {
         let mut fixture = fixture();
         let bios = fixture._dir.path().join("bios");
