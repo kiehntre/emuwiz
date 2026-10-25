@@ -63,6 +63,8 @@ use archivefs_core::safe_read::TrustedRoots;
 use eframe::egui;
 
 mod background;
+mod preview;
+use preview::{PreparedPreview, PreviewSnapshot};
 
 use crate::dat_catalogue_picker::{DatCataloguePickerState, DatCatalogueWorkflow};
 use crate::ui::{components as widgets, theme};
@@ -255,29 +257,9 @@ pub(crate) fn build_rows(
     rows
 }
 
-/// Validate the preview count even for older saved plans with overstated counts.
+#[cfg(test)]
 fn preview_counts(plan: &LibraryRepairPlan) -> ReportCounts {
-    let mut counts = plan.report.counts;
-    counts.safe_repairs = plan
-        .repair_plan
-        .executable_proposals()
-        .filter(|proposal| {
-            matches!(
-                proposal.action,
-                archivefs_core::repair::proposal::RepairAction::RenamePath { .. }
-            )
-        })
-        .count();
-    let rows = build_rows(plan, None);
-    counts.needs_review = rows
-        .iter()
-        .filter(|row| row.kind == RepairRowKind::NeedsReview)
-        .count();
-    counts.blocked_repair = rows
-        .iter()
-        .filter(|row| row.kind == RepairRowKind::Blocked)
-        .count();
-    counts
+    PreviewSnapshot::new(plan).counts
 }
 
 /// Which of [`ReportCounts`]'s additive fields were actually present in the
@@ -483,7 +465,7 @@ pub(crate) struct ScanSetupState {
 
 /// The one terminal message a background whole-library scan sends back.
 enum RepairScanMessage {
-    Completed(Box<LibraryRepairPlan>),
+    Completed(Box<PreparedPreview>),
     Failed(String),
 }
 
@@ -527,9 +509,9 @@ pub(crate) struct RepairReviewPageState {
     /// change.
     plan_version: u64,
     /// The last-built row list, keyed by the plan version and filter it was
-    /// built from. `rows()` also invalidates on Core conflict changes.
+    /// built from. Validation is shared by rows, counts and selection until reload.
     rows_cache: Option<(u64, Option<RepairFilter>, Rc<Vec<RepairReviewRow>>)>,
-    rows_conflicts: Vec<archivefs_core::repair::plan::PlanConflict>,
+    preview: std::cell::OnceCell<PreviewSnapshot>,
     /// A pending "Apply Selected" confirmation, frozen when the dialog opens.
     /// `None` means no confirmation is showing.
     pub(crate) apply_confirm: Option<RepairApplyConfirmation>,
@@ -648,7 +630,17 @@ impl RepairReviewPageState {
         plan_path: Option<PathBuf>,
         availability: CountsAvailability,
     ) {
-        self.plan = Some(plan);
+        self.adopt_prepared_plan(PreparedPreview::new(plan), plan_path, availability);
+    }
+
+    fn adopt_prepared_plan(
+        &mut self,
+        prepared: PreparedPreview,
+        plan_path: Option<PathBuf>,
+        availability: CountsAvailability,
+    ) {
+        self.preview = std::cell::OnceCell::from(prepared.snapshot);
+        self.plan = Some(prepared.plan);
         self.plan_path = plan_path;
         self.selected.clear();
         self.details_id = None;
@@ -771,9 +763,9 @@ impl RepairReviewPageState {
                     );
                     let trusted = TrustedRoots::from_paths([&request.scan_root]);
                     match run_library_scan(&request, &trusted, &cancel, &|_| {}) {
-                        Ok(outcome) => {
-                            RepairScanMessage::Completed(Box::new(plan_file_from_scan(&outcome)))
-                        }
+                        Ok(outcome) => RepairScanMessage::Completed(Box::new(
+                            PreparedPreview::new(plan_file_from_scan(&outcome)),
+                        )),
                         Err(error) => RepairScanMessage::Failed(error.to_string()),
                     }
                 }
@@ -820,9 +812,9 @@ impl RepairReviewPageState {
         let (sender, messages) = std::sync::mpsc::channel();
         std::thread::spawn(move || {
             let message = match run_library_scan(&request, &trusted, &cancel, &|_| {}) {
-                Ok(outcome) => {
-                    RepairScanMessage::Completed(Box::new(plan_file_from_scan(&outcome)))
-                }
+                Ok(outcome) => RepairScanMessage::Completed(Box::new(PreparedPreview::new(
+                    plan_file_from_scan(&outcome),
+                ))),
                 Err(error) => RepairScanMessage::Failed(error.to_string()),
             };
             let _ = sender.send(message);
@@ -861,7 +853,7 @@ impl RepairReviewPageState {
     fn handle_scan_message(&mut self, message: RepairScanMessage) {
         match message {
             RepairScanMessage::Completed(plan) => {
-                self.adopt_loaded_plan(*plan, None, CountsAvailability::CURRENT);
+                self.adopt_prepared_plan(*plan, None, CountsAvailability::CURRENT);
                 self.scan_status = Some(LibraryScanStatus::Completed);
             }
             RepairScanMessage::Failed(detail) => {
@@ -874,29 +866,31 @@ impl RepairReviewPageState {
         self.filter = filter;
     }
 
-    /// The current filtered row view. Rebuilds via [`build_rows`] only when
-    /// the loaded plan, filter, or Core validation conflicts have changed; a
-    /// cache hit is a cheap `Rc` clone rather than a full row rebuild. No
-    /// plan means no rows and no cache to keep.
+    /// One validation snapshot per explicit load/scan. Production workers prepare
+    /// it before adoption; the lazy path also supports synchronous/test callers.
+    fn preview(&self) -> Option<&PreviewSnapshot> {
+        let plan = self.plan.as_ref()?;
+        Some(self.preview.get_or_init(|| PreviewSnapshot::new(plan)))
+    }
+
+    /// The current filtered rows. Rendering and filter changes reuse validation;
+    /// reload/rescan explicitly refreshes filesystem observations. Apply always
+    /// performs authoritative fresh validation through the existing backend.
     pub(crate) fn rows(&mut self) -> Rc<Vec<RepairReviewRow>> {
-        let Some(plan) = self.plan.as_ref() else {
+        if self.plan.is_none() {
             self.rows_cache = None;
             return Rc::new(Vec::new());
-        };
-        let conflicts =
-            archivefs_core::repair::plan::detect_plan_conflicts(&plan.repair_plan.proposals);
-        let cache_hit = conflicts == self.rows_conflicts
-            && matches!(
-                &self.rows_cache,
-                Some((version, filter, _)) if *version == self.plan_version && *filter == self.filter
-            );
+        }
+        let cache_hit = matches!(
+            &self.rows_cache,
+            Some((version, filter, _)) if *version == self.plan_version && *filter == self.filter
+        );
         if !cache_hit {
-            self.rows_conflicts = conflicts;
-            self.rows_cache = Some((
-                self.plan_version,
-                self.filter,
-                Rc::new(build_rows(plan, self.filter)),
-            ));
+            let rows = self
+                .preview()
+                .expect("plan exists")
+                .filtered_rows(self.filter);
+            self.rows_cache = Some((self.plan_version, self.filter, Rc::new(rows)));
         }
         Rc::clone(&self.rows_cache.as_ref().expect("just set above").2)
     }
@@ -963,17 +957,12 @@ impl RepairReviewPageState {
     /// NeedsReview/Blocked rows come from the report's id-less `PlanItem`s
     /// (see [`build_rows`]), never from `plan.repair_plan.proposals`.
     pub(crate) fn actionable_selected_ids(&self) -> Vec<RepairProposalId> {
-        let Some(plan) = self.plan.as_ref() else {
+        let Some(preview) = self.preview() else {
             return Vec::new();
         };
-        let verified: BTreeSet<_> = plan
-            .repair_plan
-            .executable_proposals()
-            .map(|proposal| &proposal.id)
-            .collect();
         self.selected
             .iter()
-            .filter(|id| verified.contains(id))
+            .filter(|id| preview.safe_ids.contains(*id))
             .cloned()
             .collect()
     }
@@ -1353,7 +1342,7 @@ pub(crate) fn show_repair_review_page(ui: &mut egui::Ui, state: &mut RepairRevie
         );
         ui.label(
             egui::RichText::new(summary_line(
-                &preview_counts(plan),
+                &state.preview().expect("plan exists").counts,
                 state.counts_availability,
             ))
             .monospace(),
@@ -1365,7 +1354,7 @@ pub(crate) fn show_repair_review_page(ui: &mut egui::Ui, state: &mut RepairRevie
             ))
             .color(theme::muted(ui)),
         );
-        ui.label("Safe candidates passed Core plan validation. Apply still requires a conflict-free plan, confirmation and fresh verification.");
+        ui.label("Safe candidates passed Core validation when this preview loaded. Reload or rescan to refresh the preview. Apply requires a conflict-free plan, confirmation and fresh verification.");
         // Backend/provenance identifiers: not user-facing on their own (a raw
         // generation number reads as noise in the primary summary), so they
         // live in a collapsed technical-details section instead.

@@ -2261,7 +2261,7 @@ fn colliding_saved_plan_renders_corrected_count_and_blocked_rows() {
 }
 
 #[test]
-fn cached_rows_follow_core_validation_when_a_destination_appears() {
+fn cached_preview_is_shared_until_explicit_reload_and_apply_still_refuses_stale_destination() {
     let dir = TestDir::new("validation-cache");
     let source = dir.path().join("source.bin");
     let destination = dir.path().join("destination.bin");
@@ -2269,6 +2269,8 @@ fn cached_rows_follow_core_validation_when_a_destination_appears() {
     let mut plan = fixture_plan();
     plan.repair_plan.proposals.truncate(1);
     let proposal = &mut plan.repair_plan.proposals[0];
+    proposal.expected_source_identity =
+        Some(archivefs_core::dat::rename_apply::identity::capture_identity(&source).unwrap());
     proposal.source_path = source;
     proposal.action = RepairAction::RenamePath {
         destination: destination.clone(),
@@ -2281,8 +2283,28 @@ fn cached_rows_follow_core_validation_when_a_destination_appears() {
     assert_eq!(before[0].kind, RepairRowKind::Safe);
     std::fs::write(&destination, b"occupied").unwrap();
     let after = state.rows();
-    assert!(!Rc::ptr_eq(&before, &after));
-    assert_eq!(after[0].kind, RepairRowKind::Blocked);
-    assert!(after[0].reason.contains("destination already exists"));
-    assert_eq!(preview_counts(state.plan.as_ref().unwrap()).safe_repairs, 0);
+    assert!(Rc::ptr_eq(&before, &after));
+    assert_eq!(state.preview().unwrap().counts.safe_repairs, 1);
+    let id = before[0].proposal_id.clone().unwrap();
+    state.toggle_selected(&id);
+    assert_eq!(state.actionable_selected_ids(), vec![id]);
+    // The preview cache is never an execution authorization. Fresh Core
+    // preflight must observe the destination that appeared after loading.
+    let preflight = archivefs_core::repair::run_repair_preflight(
+        &state.plan.as_ref().unwrap().repair_plan,
+        state.plan.as_ref().unwrap().repair_plan.generation,
+    );
+    assert!(!preflight.all_ready);
+    state.filter = Some(RepairFilter::Safe);
+    assert_eq!(state.rows().len(), 1, "filter changes share the snapshot");
+    let plan = state.plan.as_ref().unwrap().clone();
+    state.adopt_loaded_plan(plan, None, CountsAvailability::CURRENT);
+    let refreshed = state.rows();
+    assert!(refreshed.is_empty(), "Safe filter reflects explicit reload");
+    state.filter = None;
+    let refreshed = state.rows();
+    assert_eq!(refreshed[0].kind, RepairRowKind::Blocked);
+    assert!(refreshed[0].reason.contains("destination already exists"));
+    assert_eq!(state.preview().unwrap().counts.safe_repairs, 0);
+    assert!(!state.can_apply());
 }
