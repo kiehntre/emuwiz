@@ -17,6 +17,7 @@ pub(crate) struct EmulatorReadinessState {
     pub(crate) mesen: std::sync::Arc<std::sync::Mutex<crate::emulator_setup::mesen::Controller>>,
     pub(crate) hatari: std::sync::Arc<std::sync::Mutex<crate::emulator_setup::hatari::Controller>>,
     pub(crate) flycast_gdi: crate::emulator_setup::flycast_gdi::Controller,
+    pub(crate) vice: crate::launch_readiness_page::vice::Controller,
     pub(crate) xroar_cassette: crate::emulator_setup::xroar_cassette::Controller,
     pub(crate) cemu: crate::emulator_setup::cemu::Controller,
     #[cfg(target_os = "linux")]
@@ -65,6 +66,7 @@ impl Default for EmulatorReadinessState {
             hatari: Default::default(),
             flycast_gdi: Default::default(),
             xroar_cassette: Default::default(),
+            vice: Default::default(),
             #[cfg(target_os = "linux")]
             shadps4: Default::default(),
             retroarch_installation_picker: Default::default(),

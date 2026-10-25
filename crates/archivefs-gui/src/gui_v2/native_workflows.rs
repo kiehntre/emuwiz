@@ -499,6 +499,7 @@ impl NativeWorkflows {
         self.select(path);
         self.app.launch_standalone.focus_dosbox_game(Some(path));
         self.app.emulator_readiness.flycast_gdi.show(ui, Some(path));
+        self.app.emulator_readiness.vice.show(ui, Some(path));
         self.app
             .emulator_readiness
             .xroar_cassette
@@ -596,6 +597,7 @@ impl NativeWorkflows {
         activity: &mut Activity,
     ) -> Option<Route> {
         self.app.emulator_readiness.flycast_gdi.show(ui, Some(path));
+        self.app.emulator_readiness.vice.show(ui, Some(path));
         self.app
             .emulator_readiness
             .xroar_cassette
