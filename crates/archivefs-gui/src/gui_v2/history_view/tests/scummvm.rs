@@ -63,32 +63,6 @@ fn scummvm_native_blue_cheats_opens_the_trainer_controls_without_a_generic_adapt
     );
 }
 
-/// The private test home is shared by every test in this process, so a receipt
-/// this test writes would otherwise appear in every other test's History page
-/// (and hide its "No history yet" state). Removes only this operation's files.
-struct RemoveReceiptOnDrop {
-    root: std::path::PathBuf,
-    operation: String,
-}
-
-impl Drop for RemoveReceiptOnDrop {
-    fn drop(&mut self) {
-        let Ok(entries) = fs::read_dir(&self.root) else {
-            return;
-        };
-        for entry in entries.flatten() {
-            let path = entry.path();
-            if path.is_file()
-                && path
-                    .file_name()
-                    .is_some_and(|name| name.to_string_lossy().contains(&self.operation))
-            {
-                let _ = fs::remove_file(path);
-            }
-        }
-    }
-}
-
 #[test]
 fn scummvm_fresh_blue_history_and_exact_game_scope_reload_receipts() {
     // A real catalogue already owns its application-data directory. The
@@ -124,11 +98,19 @@ fn scummvm_fresh_blue_history_and_exact_game_scope_reload_receipts() {
         expected_configuration_sha256: None,
     })
     .unwrap();
+    // This test's own History store: the reload below reads it, and parallel
+    // History tests (for example the empty state) never see this receipt.
+    let machine = tempfile::tempdir().unwrap();
+    let history_root = machine.path().join("history");
+    let backup_root = machine.path().join("backups");
+    let _machine = crate::cheats_mods::duckstation_environment::test_environment::install(
+        crate::cheats_mods::duckstation_environment::test_environment::TestMachine {
+            duckstation: None,
+            history_root: history_root.clone(),
+            backup_root: backup_root.clone(),
+        },
+    );
     let operation = generate_shared_operation_id();
-    let _receipt_cleanup = RemoveReceiptOnDrop {
-        root: default_shared_history_root().unwrap(),
-        operation: operation.clone(),
-    };
     let result = apply_scummvm_trainer_preview(
         &preview,
         &ScummVmTrainerApplyOptions {
@@ -136,8 +118,8 @@ fn scummvm_fresh_blue_history_and_exact_game_scope_reload_receipts() {
             replacement_approved: true,
             operation_id: operation.clone(),
             timestamp_unix_seconds: 123,
-            history_root: default_shared_history_root().unwrap(),
-            backup_root: default_shared_backup_root().unwrap(),
+            history_root,
+            backup_root,
         },
     )
     .unwrap();
@@ -147,6 +129,15 @@ fn scummvm_fresh_blue_history_and_exact_game_scope_reload_receipts() {
         "journal: {:#?}; failure: {:?}",
         result.journal,
         result.journal_failure
+    );
+    let shared = fs::read_dir(default_shared_history_root().unwrap())
+        .into_iter()
+        .flatten()
+        .flatten()
+        .map(|entry| entry.file_name().to_string_lossy().into_owned());
+    assert!(
+        !shared.into_iter().any(|name| name.contains(&operation)),
+        "the receipt stays in this test's own History store"
     );
     let original = fs::read(&config).unwrap();
     let context = egui::Context::default();

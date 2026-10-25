@@ -290,8 +290,9 @@ impl State {
         if !self.history_loaded && self.pending.is_none() {
             self.history_loaded = true;
             self.undo = None;
-            self.start(ctx, || {
-                let roots = Roots::managed()?;
+            let roots = Roots::managed();
+            self.start(ctx, move || {
+                let roots = roots?;
                 let (receipts, problems) = backend::history(&roots);
                 Ok(Completed::History(roots, receipts, problems))
             });
