@@ -70,17 +70,16 @@ pub struct DuplicateScanAccounting {
 }
 
 /// One member of a group [`plan_duplicate_quarantine_from_rename_plan`]
-/// could not turn into any Safe proposal because the group itself had no
-/// unique objective survivor - never an executable candidate, but never
-/// silently dropped either: a caller (the CLI, a future GUI) surfaces this
-/// exactly like any other non-executable report row.
+/// could not turn into a Safe proposal: no unique survivor, or an individual
+/// content/identity/planning refusal. Never executable, never silently dropped:
+/// callers surface this like other non-executable report rows.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct DuplicateNeedsReviewMember {
     pub path: PathBuf,
     /// The verified DAT game/rom identity the group shares, when known.
     pub game_name: Option<String>,
     pub rom_name: Option<String>,
-    /// Why [`super::quarantine::select_survivor`] found no unique winner.
+    /// The original survivor-selection, proof, or planning refusal.
     pub reason: String,
 }
 
@@ -161,12 +160,18 @@ pub fn plan_duplicate_quarantine_from_rename_plan(
             Ok(group_plan) => {
                 accounting.groups_content_proven += 1;
                 accounting.quarantine_safe += group_plan.proposals.len();
-                for (_, reason) in &group_plan.skipped {
+                for (path, reason) in &group_plan.skipped {
                     if reason.contains("hard-linked") {
                         accounting.same_object_ignored += 1;
                     } else {
                         accounting.content_mismatch_refused += 1;
                     }
+                    needs_review.push(DuplicateNeedsReviewMember {
+                        path: path.clone(),
+                        game_name: group[0].game_name.clone(),
+                        rom_name: group[0].rom_name.clone(),
+                        reason: reason.clone(),
+                    });
                 }
                 proposals.extend(group_plan.proposals);
             }

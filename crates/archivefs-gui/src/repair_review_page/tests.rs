@@ -2314,3 +2314,30 @@ fn cached_preview_is_shared_until_explicit_reload_and_apply_still_refuses_stale_
     assert_eq!(state.preview_safe_count(), 0);
     assert!(!state.can_apply());
 }
+
+#[test]
+fn job10_new_duplicate_refusal_information_is_visible_without_selectable_ids() {
+    let mut plan = fixture_plan();
+    plan.repair_plan.proposals.clear();
+    plan.report
+        .duplicate_needs_review
+        .push(archivefs_core::repair::library::PlanItem {
+            path: "roms/refused.bin".into(),
+            reason: "duplicate source: candidate refused by Core plan validation".into(),
+        });
+    plan.report.counts.duplicate_plan_refused = 1;
+    let mut state = RepairReviewPageState {
+        plan: Some(plan),
+        ..Default::default()
+    };
+    let ctx = egui::Context::default();
+    let output = ctx.run(egui::RawInput::default(), |ctx| {
+        egui::CentralPanel::default().show(ctx, |ui| show_repair_review_page(ui, &mut state));
+    });
+    assert!(rendered_text_contains(
+        &output,
+        "Duplicate diagnostics (1 items)"
+    ));
+    assert!(!state.can_apply());
+    assert!(state.actionable_selected_ids().is_empty());
+}

@@ -345,8 +345,10 @@ fn build_quarantine_proposal(
 ) -> Result<RepairProposal, String> {
     let destination = quarantine_destination(trusted_root, proof, redundant_source)?;
     let content_bucket = &proof.hash[..proof.hash.len().min(16)];
-    let disambiguator = Crc32::of(redundant_source.to_string_lossy().as_bytes());
-    let id = RepairProposalId::new(format!("quarantine-{content_bucket}-{disambiguator}"))
+    // Preserve the destination layout; proposal identity uses the full content
+    // proof and exact path bytes, not the destination's short readable label.
+    let digest = super::identity::content_path_digest(&proof.hash, redundant_source);
+    let id = RepairProposalId::new(format!("quarantine-{content_bucket}-sha256-{digest}"))
         .ok_or_else(|| "could not build a safe proposal id".to_string())?;
     let reason = format!(
         "'{}' is a redundant byte-identical copy of the kept file '{}'; moved to quarantine \

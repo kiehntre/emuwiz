@@ -1200,3 +1200,41 @@ fn a_symlinked_content_bucket_directory_refuses_before_any_mutation() {
         "nothing was ever written outside the trusted root"
     );
 }
+
+#[test]
+fn job10_crc_colliding_paths_have_distinct_stable_quarantine_proposal_ids() {
+    let fx = Fixture::new();
+    let survivor = write(fx.root(), "keep.bin", b"identical payload");
+    // Equal-length CRC32 collision, which remains a collision under a common prefix.
+    let a = write(fx.root(), "96b47251062a0edc.bin", b"identical payload");
+    let b = write(fx.root(), "b78b2442aae112bc.bin", b"identical payload");
+    assert_eq!(
+        Crc32::of(a.to_str().unwrap().as_bytes()),
+        Crc32::of(b.to_str().unwrap().as_bytes())
+    );
+    let evidence = [
+        keeper(&survivor, true, true),
+        keeper(&a, false, false),
+        keeper(&b, false, false),
+    ];
+    let mut cache = DuplicateHashCache::new();
+    let first =
+        plan_duplicate_quarantine(&evidence, fx.root(), &fx.trusted(), &mut cache, None).unwrap();
+    assert_eq!(first.proposals.len(), 2);
+    assert_ne!(first.proposals[0].id, first.proposals[1].id);
+    let mut reverse = evidence.to_vec();
+    reverse.reverse();
+    let again =
+        plan_duplicate_quarantine(&reverse, fx.root(), &fx.trusted(), &mut cache, None).unwrap();
+    for proposal in &first.proposals {
+        let repeated = again
+            .proposals
+            .iter()
+            .find(|p| p.source_path == proposal.source_path)
+            .unwrap();
+        assert_eq!(proposal.id, repeated.id);
+        assert!(proposal.id.as_str().len() <= 128);
+    }
+    assert!(a.exists() && b.exists() && survivor.exists());
+    assert!(!fx.root().join(QUARANTINE_DIRECTORY_NAME).exists());
+}
