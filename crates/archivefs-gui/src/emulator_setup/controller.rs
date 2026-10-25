@@ -1061,7 +1061,12 @@ impl ArchiveFsApp {
                 {
                     return LaunchReadinessInput::DiscFilesUnresolved(detail);
                 }
-                return if evidence_freshness.is_incomplete() {
+                return if !evidence_freshness.is_incomplete()
+                    && focused.is_some_and(|path| {
+                        archivefs_core::launch::locate_dosbox_game_directory(path, None).is_some()
+                    }) {
+                    LaunchReadinessInput::DosBoxReview
+                } else if evidence_freshness.is_incomplete() {
                     LaunchReadinessInput::InspectionIncomplete
                 } else {
                     LaunchReadinessInput::IdentityUnknown

@@ -895,6 +895,8 @@ impl Drop for ArchiveFsApp {
 impl ArchiveFsApp {
     pub(crate) fn update(&mut self, context: &egui::Context, _frame: &mut eframe::Frame) {
         app_polling::poll_and_reconcile(self, context);
+        self.launch_standalone
+            .focus_dosbox_game(self.archive_context.focused.as_deref());
         app_polling::start_view_gated_work(self, context);
         let app_frame::FrameReadiness {
             loading,
@@ -937,6 +939,8 @@ impl ArchiveFsApp {
             },
         );
         app_reactions::apply_page_requests(self, context, outcome);
+        self.launch_standalone
+            .focus_dosbox_game(self.archive_context.focused.as_deref());
     }
 }
 

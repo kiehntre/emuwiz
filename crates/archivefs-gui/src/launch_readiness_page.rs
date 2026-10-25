@@ -123,6 +123,8 @@ pub(crate) enum LaunchReadinessInput {
     /// `CanonicalIdentityStatus::Unknown` - identity could not be resolved
     /// at all.
     IdentityUnknown,
+    /// A folder with a DOSBox config is only a candidate for explicit approval.
+    DosBoxReview,
     /// A CUE/BIN disc whose files could not be resolved. The text is the
     /// selected-evidence worker's own diagnostic (which track is missing,
     /// unsafe or ambiguous), never a guess.
@@ -225,7 +227,8 @@ pub(crate) fn ready_to_play_result(
             arcade_dependency_blocked: false,
             save_state_version_sensitive: false,
         },
-        LaunchReadinessInput::IdentityUnknown
+        LaunchReadinessInput::DosBoxReview
+        | LaunchReadinessInput::IdentityUnknown
         | LaunchReadinessInput::DiscFilesUnresolved(_)
         | LaunchReadinessInput::InspectionIncomplete => ReadyToPlayEvidence {
             item_identity,
@@ -673,6 +676,10 @@ pub(crate) fn gamer_play_action(input: &LaunchReadinessInput) -> GamerPlayAction
             LaunchReadinessInput::RetroArchNotScanned => GamerBlocker::new(
                 GamerBlockerKind::EmulatorNotChecked,
                 "RetroArch has not been checked yet.",
+            ),
+            LaunchReadinessInput::DosBoxReview => GamerBlocker::new(
+                GamerBlockerKind::UnknownSystem,
+                "Review and approve the DOSBox folder and start target on the Launch page.",
             ),
             LaunchReadinessInput::IdentityUnknown => GamerBlocker::new(
                 GamerBlockerKind::UnknownSystem,
@@ -3043,12 +3050,17 @@ pub(crate) fn show_launch_readiness_panel(
         ui,
         "Play / Launch readiness",
         Some(
-            "Ways this game can be played. Check emulator readiness, then launch only a command backed by verified identity and resolved content.",
+            "Ways this game can be played. Check emulator readiness and content. DOSBox also requires explicit approval of its local folder and start target; that approval does not verify a release.",
         ),
     );
 
     match input {
         LaunchReadinessInput::AtariSt(snapshot) => snapshot.show(ui),
+        LaunchReadinessInput::DosBoxReview => dosbox::show(
+            ui,
+            &CanonicalIdentityStatus::Unknown,
+            standalone_launch_state,
+        ),
         LaunchReadinessInput::EvidenceNotLoaded => {
             widgets::card(ui, |ui| {
                 ui.label("Load ROM Identity & Evidence first.");
