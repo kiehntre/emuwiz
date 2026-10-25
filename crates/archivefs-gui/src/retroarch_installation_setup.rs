@@ -2,8 +2,8 @@
 //! this control only saves their validated choice beside the core override.
 use archivefs_core::emulator_environment::HostReadOnlyFilesystem;
 use archivefs_core::emulator_environment::retroarch::installation_selection::{
-    EXECUTABLE_OVERRIDE_FILE, InstallationExecutable, classify_installation_executable,
-    load_executable_override_at,
+    EXECUTABLE_OVERRIDE_FILE, InstallationExecutable, SelectedExecutableProblem,
+    classify_installation_executable, load_executable_override_at, selected_executable_problem,
 };
 use archivefs_core::emulator_environment::retroarch::{
     AppImageIdentificationConfidence, ConfigAssociation, DiscoveryEnvironment, ExecutableState,
@@ -12,6 +12,183 @@ use archivefs_core::emulator_environment::retroarch::{
 use eframe::egui;
 use std::path::{Path, PathBuf};
 use std::sync::mpsc::{self, Receiver, TryRecvError};
+
+/// Why the saved RetroArch choice can't be used, in the words Play, the
+/// bezel panel and Emulator Setup all show.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) enum SelectionIssue {
+    /// The saved choice file itself can't be read safely.
+    Unreadable(String),
+    Unusable {
+        path: PathBuf,
+        problem: SelectedExecutableProblem,
+    },
+}
+
+impl SelectionIssue {
+    pub(crate) fn message(&self) -> String {
+        match self {
+            Self::Unreadable(detail) => format!(
+                "EmuWiz can't read your saved RetroArch choice ({detail}). Choose the installation again in Emulator Setup."
+            ),
+            Self::Unusable { path, problem } => {
+                let path = path.display();
+                let reason = match problem {
+                    SelectedExecutableProblem::Missing => {
+                        format!("The RetroArch program you chose ({path}) is no longer there.")
+                    }
+                    SelectedExecutableProblem::NotExecutable => format!(
+                        "The RetroArch program you chose ({path}) is not a runnable program file."
+                    ),
+                    SelectedExecutableProblem::FlatpakLauncher => format!(
+                        "The RetroArch program you chose ({path}) is a launcher for the Flatpak RetroArch, which can't be used for Play or bezel Apply."
+                    ),
+                    SelectedExecutableProblem::UnsupportedProgram => format!(
+                        "The RetroArch program you chose ({path}) is a script or program EmuWiz can't confirm is RetroArch."
+                    ),
+                    SelectedExecutableProblem::NotDiscovered => format!(
+                        "The RetroArch program you chose ({path}) is no longer found with RetroArch settings EmuWiz can use."
+                    ),
+                };
+                format!(
+                    "{reason} Choose a native or verified AppImage installation in Emulator Setup, or use automatic detection. Nothing was started or changed."
+                )
+            }
+        }
+    }
+}
+
+/// The saved choice's problem right now, from the same checks discovery
+/// makes before honouring it. `None` for automatic detection or a usable
+/// program. A few small reads; call it on a refusal or a Setup frame, not in
+/// a hot loop.
+pub(crate) fn current_selection_issue() -> Option<SelectionIssue> {
+    let override_file = archivefs_core::app_dirs::config_path(EXECUTABLE_OVERRIDE_FILE)
+        .map_err(|error| SelectionIssue::Unreadable(error.to_string()));
+    let selected = override_file
+        .and_then(|path| load_executable_override_at(&path).map_err(SelectionIssue::Unreadable));
+    match selected {
+        Err(issue) => Some(issue),
+        Ok(None) => None,
+        Ok(Some(path)) => selected_executable_problem(&HostReadOnlyFilesystem, &path)
+            .map(|problem| SelectionIssue::Unusable { path, problem }),
+    }
+}
+
+/// For a discovery that refused the saved choice: its program-level problem,
+/// or that discovery no longer pairs it with usable settings.
+pub(crate) fn selection_issue_after_refused_discovery() -> Option<SelectionIssue> {
+    current_selection_issue().or_else(|| match saved_selection() {
+        Ok(Some(path)) => Some(SelectionIssue::Unusable {
+            path,
+            problem: SelectedExecutableProblem::NotDiscovered,
+        }),
+        _ => None,
+    })
+}
+
+/// What a RetroArch scan was based on: the saved choice when it started and
+/// each program it found when it finished. A difference later means the
+/// cached result may no longer be true, so the caller rescans; it never
+/// decides readiness itself.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub(crate) struct InstallationFingerprint {
+    selection: Option<Result<Option<PathBuf>, String>>,
+    programs: Vec<(PathBuf, Option<ProgramIdentity>)>,
+}
+
+/// Followed metadata, so a PATH symlink such as /usr/bin/retroarch is judged
+/// by the program it names.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct ProgramIdentity {
+    dev: u64,
+    ino: u64,
+    len: u64,
+    mtime: i64,
+    mtime_nsec: i64,
+    mode: u32,
+}
+
+fn program_identity(path: &Path) -> Option<ProgramIdentity> {
+    use std::os::unix::fs::MetadataExt;
+    std::fs::metadata(path)
+        .ok()
+        .map(|metadata| ProgramIdentity {
+            dev: metadata.dev(),
+            ino: metadata.ino(),
+            len: metadata.len(),
+            mtime: metadata.mtime(),
+            mtime_nsec: metadata.mtime_nsec(),
+            mode: metadata.mode(),
+        })
+}
+
+fn saved_selection() -> Result<Option<PathBuf>, String> {
+    archivefs_core::app_dirs::config_path(EXECUTABLE_OVERRIDE_FILE)
+        .map_err(|error| error.to_string())
+        .and_then(|path| load_executable_override_at(&path))
+}
+
+impl InstallationFingerprint {
+    /// Taken as a scan starts: the saved choice and, when there is one, its
+    /// program, so restoring or replacing it later is noticed even when the
+    /// scan refused it.
+    pub(crate) fn at_scan_start() -> Self {
+        let selection = saved_selection();
+        let programs = match &selection {
+            Ok(Some(path)) => vec![(path.clone(), program_identity(path))],
+            _ => Vec::new(),
+        };
+        Self {
+            selection: Some(selection),
+            programs,
+        }
+    }
+
+    /// Adds the programs a finished scan found.
+    pub(crate) fn with_programs(mut self, report: &RetroArchEnvironmentReport) -> Self {
+        self.programs = report_programs(report)
+            .into_iter()
+            .map(|path| {
+                let identity = program_identity(&path);
+                (path, identity)
+            })
+            .collect();
+        self
+    }
+
+    /// True when the saved choice or any found program differs from what
+    /// the scan saw.
+    pub(crate) fn changed(&self) -> bool {
+        self.selection
+            .as_ref()
+            .is_some_and(|selection| *selection != saved_selection())
+            || self
+                .programs
+                .iter()
+                .any(|(path, identity)| program_identity(path) != *identity)
+    }
+}
+
+fn report_programs(report: &RetroArchEnvironmentReport) -> Vec<PathBuf> {
+    let mut programs: Vec<PathBuf> = report
+        .profiles
+        .iter()
+        .filter(|profile| profile.profile_kind != ProfileKind::Flatpak)
+        .flat_map(|profile| {
+            profile
+                .evidence
+                .executables
+                .iter()
+                .chain(profile.app_images.iter().map(|image| &image.path))
+        })
+        .filter(|path| !path.lossy)
+        .map(|path| PathBuf::from(&path.display))
+        .collect();
+    programs.sort();
+    programs.dedup();
+    programs
+}
 
 /// Only the EmuWiz sidecar is written; emulator installations are untouched.
 fn save_executable_override_at(path: &Path, selected: Option<&Path>) -> Result<(), String> {
@@ -139,6 +316,9 @@ impl InstallationPicker {
                             self.choices = choices;
                             self.unsupported = unsupported;
                             self.message = None;
+                            // A rediscovery can change what Play would use,
+                            // so RetroArch's readiness is checked again too.
+                            refresh = true;
                         }
                         Err(message) => self.message = Some(message),
                     }
@@ -170,6 +350,13 @@ impl InstallationPicker {
         match &current {
             Ok(Some(path)) => {
                 ui.label(format!("Selected: {}", path.display()));
+                if let Some(problem) = selected_executable_problem(&HostReadOnlyFilesystem, path) {
+                    let issue = SelectionIssue::Unusable {
+                        path: path.clone(),
+                        problem,
+                    };
+                    ui.colored_label(ui.visuals().error_fg_color, issue.message());
+                }
             }
             Ok(None) => {
                 ui.label(

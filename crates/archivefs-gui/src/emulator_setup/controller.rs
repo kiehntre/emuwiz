@@ -385,6 +385,7 @@ impl ArchiveFsApp {
         ) {
             self.start_retroarch_profile_scan(context.clone());
         }
+        self.revalidate_retroarch_installation(context);
         widgets::workflow_header(
             ui,
             "Emulators",
@@ -685,7 +686,28 @@ impl ArchiveFsApp {
                 RetroArchProfilesState::Error(message) => CoreFolderScan::Failed(message.as_str()),
                 RetroArchProfilesState::Ready(discovery) => CoreFolderScan::Ready(discovery),
             };
-            core_folder_readiness(scan, &mode)
+            let mut readiness = core_folder_readiness(scan, &mode);
+            // An unusable saved installation choice is the reason, not the
+            // game-support folder: name it (from the same checks discovery
+            // applies) instead of the generic scan failure, and never keep a
+            // green badge for a choice Play would refuse.
+            let selection_issue = match &self.emulator_readiness.retroarch_profiles {
+                RetroArchProfilesState::Error(_) => {
+                    crate::retroarch_installation_setup::selection_issue_after_refused_discovery()
+                }
+                RetroArchProfilesState::Ready(_) => {
+                    crate::retroarch_installation_setup::current_selection_issue()
+                }
+                _ => None,
+            };
+            if let Some(issue) = selection_issue {
+                readiness.kind = CoreFolderReadinessKind::Error;
+                readiness.badge_label = "Needs attention";
+                readiness.badge_tone = crate::ui::components::StatusTone::Blocked;
+                readiness.headline = Some("The chosen RetroArch installation can't be used");
+                readiness.sentence = issue.message();
+            }
+            readiness
         };
         let rejected_pick = self
             .emulator_readiness
@@ -2785,6 +2807,8 @@ impl ArchiveFsApp {
             "RetroArch profile discovery started.",
         ));
         self.emulator_readiness.retroarch_profiles = RetroArchProfilesState::Scanning { receiver };
+        self.emulator_readiness.retroarch_installation_fingerprint =
+            Some(crate::retroarch_installation_setup::InstallationFingerprint::at_scan_start());
         let core_directory_override = self
             .emulator_readiness
             .retroarch_core_directory_override
@@ -2885,6 +2909,11 @@ impl ArchiveFsApp {
                         let eligible = eligible_profile_ids(&discovery);
                         (eligible.len() == 1).then(|| eligible[0].to_string())
                     };
+                    self.emulator_readiness.retroarch_installation_fingerprint = self
+                        .emulator_readiness
+                        .retroarch_installation_fingerprint
+                        .take()
+                        .map(|fingerprint| fingerprint.with_programs(&discovery.environment));
                     self.emulator_readiness.retroarch_profiles =
                         RetroArchProfilesState::Ready(discovery);
                     if let Some(workflow) = self.cheat_workflow.as_mut()
@@ -2912,6 +2941,40 @@ impl ArchiveFsApp {
                     );
                 }
             }
+        }
+    }
+
+    /// Rescans RetroArch when the saved installation choice or a program the
+    /// last scan found has changed since, so a cached Ready (or a cached
+    /// refusal) can't outlive the installation it described. Checked at most
+    /// every two seconds while a page that shows RetroArch readiness is drawn;
+    /// a scan already running is left alone. It never decides readiness
+    /// itself.
+    pub(crate) fn revalidate_retroarch_installation(&mut self, context: &egui::Context) {
+        const INTERVAL: std::time::Duration = std::time::Duration::from_secs(2);
+        if !matches!(
+            self.emulator_readiness.retroarch_profiles,
+            RetroArchProfilesState::Ready(_) | RetroArchProfilesState::Error(_)
+        ) {
+            return;
+        }
+        context.request_repaint_after(INTERVAL);
+        let now = std::time::Instant::now();
+        if self
+            .emulator_readiness
+            .retroarch_revalidated_at
+            .is_some_and(|at| now.duration_since(at) < INTERVAL)
+        {
+            return;
+        }
+        self.emulator_readiness.retroarch_revalidated_at = Some(now);
+        if self
+            .emulator_readiness
+            .retroarch_installation_fingerprint
+            .as_ref()
+            .is_some_and(crate::retroarch_installation_setup::InstallationFingerprint::changed)
+        {
+            self.start_retroarch_profile_scan(context.clone());
         }
     }
 
