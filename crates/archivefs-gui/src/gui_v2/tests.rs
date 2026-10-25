@@ -10931,3 +10931,6 @@ mod launch_focus;
 mod large_library_performance;
 #[path = "tests/large_library_regressions.rs"]
 mod large_library_regressions;
+
+#[path = "tests/artwork_journey.rs"]
+mod artwork_journey;

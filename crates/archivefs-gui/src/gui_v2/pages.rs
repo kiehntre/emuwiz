@@ -2769,7 +2769,7 @@ impl App {
                                 self.show_arcade_input_details(ui, game);
                                 self.classic_trainers.show(ui, game);
                             });
-                            super::game_detail_blue::information_card(ui, game);
+                            super::game_detail_blue::information_card(ui, game, self.artwork.index.as_deref());
                             super::game_detail_blue::side_card(ui, "", |ui| {
                                 ui.collapsing("Advanced details", |ui| {
                                     self.detail_advanced(ui, &library, game, &key);
@@ -2795,7 +2795,7 @@ impl App {
                 });
             });
             if blue {
-                super::game_detail_blue::information_card(ui, game);
+                super::game_detail_blue::information_card(ui, game, self.artwork.index.as_deref());
             }
             self.detail_body(ui, game, &key);
             self.classic_trainers.show(ui, game);
@@ -3173,6 +3173,7 @@ impl App {
             }
             _ => {}
         }
+        self.artwork_provenance(ui, id, game.screenscraper.as_ref());
         self.artwork_provider_details(ui, id);
         if crate::tape_analysis_page::is_tape_path(&game.archive.absolute_path)
             && ui.button("Inspect tape").clicked()
@@ -3530,7 +3531,10 @@ impl App {
                     ui.heading("Library artwork");
                     ui.label(format!("{covers} covers · {screenshots} games with screenshots · {descriptions} metadata descriptions"));
                     let mut folders = super::local_artwork_folders::configured();
-                    if super::local_artwork_folders::show(ui, &mut folders) && !self.artwork.index_loading {
+                    let folders_changed = ui.add_enabled_ui(!self.artwork.index_loading, |ui| {
+                        super::local_artwork_folders::show(ui, &mut folders)
+                    }).inner;
+                    if folders_changed {
                         self.refresh_artwork_index();
                     }
                     if ui.button("Configure artwork sources").clicked() {
@@ -3645,7 +3649,7 @@ impl App {
                                 ui.label(format!("{kind:?}: {} · {} · cached={}", candidate.provenance.provider.label(), candidate.path.display(), candidate.cached));
                                 ui.label(format!("Provenance: {:?}", candidate.provenance));
                             }
-                            ui.label(format!("Retained metadata alternatives: {}", resolved.conflicts.len()));
+                            super::game_detail_blue::metadata_sources(ui, &resolved);
                         }
                         if let Some(diagnostic) = index.diagnostic_for(game) { ui.label(diagnostic); }
                         ui.label(format!("Cover diagnosis: {}", index.explain_cover(&game)));
@@ -3715,7 +3719,7 @@ impl App {
                 candidate.provenance.detail
             ));
             if candidate.cached {
-                ui.label("Using a cached copy of this artwork.");
+                ui.label("Artwork is read from this local file. Display thumbnails use a separate cache.");
             }
         } else if let Some(source) = index.and_then(|index| index.covers.get(&game)) {
             ui.label(match source {
