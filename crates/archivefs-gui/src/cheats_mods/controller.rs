@@ -2336,16 +2336,35 @@ impl ArchiveFsApp {
 
     /// Bezel journals share the rollback executor with cheats; label their
     /// activity by the journal's recorded source mode, not by the executor.
-    fn shared_rollback_activity(&self, journal_path: &Path) -> ActivityAction {
-        let bezel = matches!(&self.shared_history, SharedHistoryState::Ready(loaded)
-            if loaded.report.journals.iter().any(|(path, journal)| {
-                path.to_path_buf().ok().as_deref() == Some(journal_path)
-                    && journal.context.source_mode == "retroarch_bezel"
-            }));
-        if bezel {
-            ActivityAction::BezelUndo
-        } else {
-            ActivityAction::CheatPreview
+    /// Display only: an unknown journal (e.g. History still reloading) gets
+    /// a neutral label rather than a guessed cheat or bezel one.
+    pub(crate) fn shared_rollback_activity(&self, journal_path: &Path) -> ActivityAction {
+        let cached = match &self.shared_history {
+            SharedHistoryState::Ready(loaded) => loaded
+                .report
+                .journals
+                .iter()
+                .find(|(path, _)| path.to_path_buf().ok().as_deref() == Some(journal_path))
+                .map(|(_, journal)| journal),
+            _ => None,
+        };
+        let installed =
+            self.cheat_workflow
+                .as_ref()
+                .and_then(|workflow| match &workflow.transaction {
+                    CheatTransactionState::Result { result, .. }
+                        if result.journal_path.as_deref() == Some(journal_path) =>
+                    {
+                        Some(&result.journal)
+                    }
+                    _ => None,
+                });
+        match cached.or(installed) {
+            Some(journal) if journal.context.source_mode == "retroarch_bezel" => {
+                ActivityAction::BezelUndo
+            }
+            Some(_) => ActivityAction::CheatPreview,
+            None => ActivityAction::Undo,
         }
     }
 

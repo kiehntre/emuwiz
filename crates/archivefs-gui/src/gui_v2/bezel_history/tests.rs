@@ -479,3 +479,40 @@ fn returning_to_history_reloads_a_previously_empty_gold_source() {
     }
     assert!(f.destination.join("overlays/bezel.png").exists());
 }
+
+#[test]
+fn undo_activity_label_follows_the_journal_and_is_neutral_when_unknown() {
+    let f = fixture();
+    let (mut app, _guard) = app(&f);
+    assert_eq!(
+        app.shared_rollback_activity(&f.journal_path),
+        crate::ActivityAction::BezelUndo
+    );
+    // A cheat journal keeps the existing cheat label.
+    let mut report = discover_shared_apply_history(&f.history);
+    for (_, journal) in &mut report.journals {
+        journal.context.source_mode = "retroarch_cheat".into();
+    }
+    app.shared_history =
+        SharedHistoryState::Ready(crate::LoadedHistory::group(report, vec![], &f.backups));
+    assert_eq!(
+        app.shared_rollback_activity(&f.journal_path),
+        crate::ActivityAction::CheatPreview
+    );
+    // A record missing from the loaded list is not guessed.
+    assert_eq!(
+        app.shared_rollback_activity(&f.history.join("other.json")),
+        crate::ActivityAction::Undo
+    );
+    // History reloading: Preview still runs through Gold, labelled neutrally.
+    app.shared_history = SharedHistoryState::NotLoaded;
+    preview(&mut app, &f);
+    let actions: Vec<_> = app.history.entries().map(|entry| entry.action).collect();
+    assert!(actions.contains(&crate::ActivityAction::Undo), "{actions:?}");
+    assert!(
+        !actions.contains(&crate::ActivityAction::CheatPreview)
+            && !actions.contains(&crate::ActivityAction::BezelUndo),
+        "{actions:?}"
+    );
+    assert!(f.destination.join("overlays/bezel.png").exists());
+}
