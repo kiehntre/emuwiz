@@ -276,8 +276,9 @@ Both match only the Tandy Games CAS DAT across the 36 registered catalogues:
 `f7bd1493d8b770d104bbdc7b708f889141138a2503c0f214c47062fc77dea313`.
 Blue displayed that exact whole-file match in each session. Trex remains
 Dragon-only under the registered evidence; it was not forced into CoCo by its
-release filename. Existing ambiguity, unreadable/enabled DAT, disabled/folder
-source, machine-family, changed identity and missing/wrong BIOS refusals remain.
+release filename. Existing ambiguity, unreadable enabled DAT, enabled folder-source,
+machine-family, changed identity and missing/wrong BIOS refusals remain.
+Disabled catalogue sources are intentionally not consulted.
 
 For reproduction, follow the initial journey with a separate disposable
 profile per row, select the row's `EMUWIZ_XROAR_MACHINE`, provide all its
