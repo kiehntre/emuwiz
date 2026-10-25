@@ -1,9 +1,9 @@
 //! EmuWiz Blue Game Details pieces (boards `D6/D7-Game-*`): the hero card,
 //! the right-hand cards and Game information (decision D4).
 //!
-//! Presentation only. Game information shows saved ScreenScraper values the
-//! person already accepted (`AcceptedScreenScraperMetadata`), one row per
-//! value that exists; nothing is looked up, guessed or filled in.
+//! Presentation only. Game information uses the shared resolved evidence,
+//! with accepted ScreenScraper values while indexing is pending. Rendering
+//! never looks up providers, changes precedence, or fills in unknown values.
 
 use eframe::egui::{self, RichText};
 
@@ -76,40 +76,106 @@ pub(super) fn information_rows(game: &Game) -> Vec<(&'static str, String)> {
     rows
 }
 
-/// Game information (D4): saved values only, collapsed by default as on the
-/// board. With nothing saved it says so instead of showing empty rows.
-pub(super) fn information_card(ui: &mut egui::Ui, game: &Game) {
-    let rows = information_rows(game);
+/// Saved values that the shared resolver selected, with a source for each row.
+/// Languages are not part of the neutral model, so retain their accepted record.
+fn resolved_information_rows(
+    game: &Game,
+    resolved: Option<&archivefs_core::metadata_aggregation::ResolvedMetadata>,
+) -> Vec<(&'static str, String, String)> {
+    use archivefs_core::metadata_aggregation::MetadataField as Field;
+    let saved = information_rows(game);
+    let mut rows = Vec::new();
+    for (label, field) in [
+        ("Developer", Field::Developer),
+        ("Publisher", Field::Publisher),
+        ("Year", Field::ReleaseDate),
+        ("Genre", Field::Genre),
+        ("Players", Field::Players),
+        ("Rating", Field::Rating),
+        ("Region", Field::Region),
+    ] {
+        if let Some(candidate) = resolved.and_then(|evidence| evidence.fields.get(&field)) {
+            if !candidate.value.trim().is_empty() {
+                let label = if field == Field::ReleaseDate
+                    && !(candidate.value.len() == 4
+                        && candidate.value.bytes().all(|byte| byte.is_ascii_digit()))
+                {
+                    "Release date"
+                } else {
+                    label
+                };
+                rows.push((
+                    label,
+                    candidate.value.clone(),
+                    candidate.provenance.provider.label().into(),
+                ));
+            }
+        } else if let Some((_, value)) = saved.iter().find(|(name, _)| *name == label) {
+            rows.push((label, value.clone(), "ScreenScraper (saved record)".into()));
+        }
+    }
+    if let Some((label, value)) = saved.iter().find(|(label, _)| *label == "Languages") {
+        rows.push((*label, value.clone(), "ScreenScraper (saved record)".into()));
+    }
+    rows
+}
+
+/// Shared explanation used by Game Details and Artwork, Manuals & Extras.
+pub(super) fn metadata_sources(
+    ui: &mut egui::Ui,
+    evidence: &archivefs_core::metadata_aggregation::ResolvedMetadata,
+) {
+    ui.collapsing("Metadata sources & alternatives", |ui| {
+        ui.label("Source priority is applied per field. Equal-priority saved metadata follows catalogue, ES-DE, RomM, then ScreenScraper order. Selected values are shown first; different saved values are retained as alternatives.");
+        for (field, selected) in &evidence.fields {
+            ui.label(format!("{field:?}: {} · {} · {}", selected.value, selected.provenance.provider.label(), selected.provenance.detail));
+            for alternative in evidence.conflicts.iter().filter(|candidate| candidate.field == *field) {
+                ui.label(format!("Alternative {field:?}: {} · {} · {}", alternative.value, alternative.provenance.provider.label(), alternative.provenance.detail));
+            }
+        }
+        if evidence.conflicts.is_empty() {
+            ui.label("No conflicting metadata values were found in the checked sources.");
+        }
+    });
+}
+
+/// Collapsed information card backed by the same evidence as artwork delivery.
+pub(super) fn information_card(
+    ui: &mut egui::Ui,
+    game: &Game,
+    index: Option<&super::media_sources::MediaIndex>,
+) {
+    let resolved = index.map(|index| index.resolved_for(game));
+    let rows = resolved_information_rows(game, resolved.as_deref());
     side_card(ui, "", |ui| {
         egui::CollapsingHeader::new(RichText::new("Game information").strong())
             .id_salt(("v2_detail_information", game.archive.id))
             .default_open(false)
             .show(ui, |ui| {
                 if rows.is_empty() {
-                    ui.label(
-                        RichText::new(
-                            "No game information is saved for this game yet. Artwork, Manuals & Extras can look it up from your providers.",
-                        )
-                        .color(palette::SECONDARY_TEXT),
-                    );
-                    return;
+                    ui.label(RichText::new(if index.is_none() {
+                        "Game information sources are still being checked."
+                    } else {
+                        "No game information was found in the checked sources. Artwork, Manuals & Extras can recheck your providers."
+                    }).color(palette::SECONDARY_TEXT));
+                } else {
+                    egui::Grid::new(("v2_detail_information_rows", game.archive.id))
+                        .num_columns(2)
+                        .spacing(egui::vec2(16.0, 6.0))
+                        .show(ui, |ui| {
+                            for (label, value, source) in &rows {
+                                ui.label(RichText::new(*label).color(palette::DIM_TEXT));
+                                ui.vertical(|ui| {
+                                    ui.label(value);
+                                    ui.label(RichText::new(format!("From {source}")).size(13.0).color(palette::DIM_TEXT));
+                                });
+                                ui.end_row();
+                            }
+                        });
                 }
-                egui::Grid::new(("v2_detail_information_rows", game.archive.id))
-                    .num_columns(2)
-                    .spacing(egui::vec2(16.0, 6.0))
-                    .show(ui, |ui| {
-                        for (label, value) in &rows {
-                            ui.label(RichText::new(*label).color(palette::DIM_TEXT));
-                            ui.label(value);
-                            ui.end_row();
-                        }
-                    });
-                ui.add_space(4.0);
-                ui.label(
-                    RichText::new("From your saved ScreenScraper record.")
-                        .size(13.0)
-                        .color(palette::DIM_TEXT),
-                );
+                if let Some(resolved) = resolved.as_deref() {
+                    metadata_sources(ui, resolved);
+                }
             });
     });
 }
