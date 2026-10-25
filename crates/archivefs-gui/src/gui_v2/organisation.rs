@@ -557,6 +557,7 @@ impl App {
                 }
                 OrganisationView::PlayingLibrary => {
                     self.invalidate_changed_playing_library_plan();
+                    let saved = crate::playing_library_page::preferences::SavedPreferences::from_state(&self.playing_library);
                     let kind = destination_kind(self.playing_library.destination);
                     ui.horizontal_wrapped(|ui| {
                         if ui.button("‹ Organisation").clicked() {
@@ -581,6 +582,10 @@ impl App {
                         &mut self.playing_library,
                         self.playing_library_job.is_some(),
                     );
+                    if saved != crate::playing_library_page::preferences::SavedPreferences::from_state(&self.playing_library) {
+                        self.interacted = true;
+                        self.preferences_dirty = Some(std::time::Instant::now());
+                    }
                 }
                 OrganisationView::MameNormalizer => {
                     ui.horizontal_wrapped(|ui| {

@@ -3165,6 +3165,7 @@ fn gui_v2_preferences_round_trip_is_separate_from_legacy_mode() {
         &path,
         &Preferences {
             route: Route::Game(22),
+            playing_library: Default::default(),
             filter: Filter {
                 search: "Zelda".into(),
                 ..Default::default()
@@ -3190,6 +3191,62 @@ fn gui_v2_preferences_round_trip_is_separate_from_legacy_mode() {
 #[test]
 fn gui_v2_preferences_default_beginner_hints_on() {
     assert!(Preferences::default().beginner_hints_enabled);
+}
+
+#[test]
+fn job37_playing_library_preferences_survive_settings_restart() {
+    let directory = tempfile::tempdir().unwrap();
+    let path = directory.path().join("gui-v2.json");
+    let saved = serde_json::json!({
+        "route": {"BrowsePlayGame": 22},
+        "playing_library": {
+            "preferred_regions": "USA, Europe, Japan",
+            "preferred_languages": "French, English",
+            "prefer_newest_revision": false,
+            "prefer_parent": false,
+            "exclude_beta": false,
+            "exclude_proto": true,
+            "exclude_demo": false,
+            "exclude_sample": true
+        }
+    });
+    let preferences: Preferences = serde_json::from_value(saved.clone()).unwrap();
+    backend::save_preferences(&path, &preferences).unwrap();
+    let reopened: serde_json::Value = serde_json::from_slice(&fs::read(path).unwrap()).unwrap();
+    assert_eq!(reopened["playing_library"], saved["playing_library"]);
+    assert_eq!(reopened["route"], saved["route"]);
+}
+
+#[test]
+fn job37_game_details_mr_wiz_explains_unknown_and_unavailable_games() {
+    let context = egui::Context::default();
+    let mut app = fixture(&context);
+    let mut row = archive(37, "Uncertain release", Some("Game Boy"));
+    app.library = Arc::new(Library::new(vec![row.clone()]));
+    let guidance = app.guidance_context(&Route::Game(37)).unwrap();
+    let tip = app.guidance.select(&guidance).unwrap();
+    assert!(
+        tip.message.contains("cannot safely identify"),
+        "{}",
+        tip.message
+    );
+    row.last_verified_missing_at = Some("2026-10-25".into());
+    app.library = Arc::new(Library::new(vec![row]));
+    let guidance = app.guidance_context(&Route::Game(37)).unwrap();
+    let tip = app.guidance.select(&guidance).unwrap();
+    assert!(
+        tip.message.contains("game file is unavailable"),
+        "{}",
+        tip.message
+    );
+    assert!(tip.message.contains("catalogue entry"));
+    let game = Arc::make_mut(&mut app.library).games.first_mut().unwrap();
+    game.archive.last_verified_missing_at = None;
+    game.mark_dat_exact(None);
+    let guidance = app.guidance_context(&Route::Game(37)).unwrap();
+    let tip = app.guidance.select(&guidance).unwrap();
+    assert!(!tip.message.contains("cannot safely identify"));
+    assert!(!tip.message.contains("game file is unavailable"));
 }
 
 #[test]

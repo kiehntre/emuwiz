@@ -868,8 +868,9 @@ impl App {
                 context.evidence.has_games = Some(!self.library.games.is_empty())
             }
             Route::Game(id) | Route::Task { game: id, .. } => {
-                context.evidence.launch_identity_verified =
-                    self.library.game(*id).map(|game| game.identified);
+                if let Some(game) = self.library.game(*id) {
+                    super::guidance::add_selected_game(&mut context, game);
+                }
             }
             Route::Section(Section::Problems) => {
                 if let Some(summary) = &self.problem_summary {

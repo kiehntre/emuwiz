@@ -1891,6 +1891,9 @@ impl App {
                                             self.router.current = preferences.route;
                                         }
                                         self.filter = preferences.filter;
+                                        preferences
+                                            .playing_library
+                                            .restore(&mut self.playing_library);
                                         self.filter_dirty = Some(Instant::now());
                                     }
                                 }
@@ -2156,6 +2159,10 @@ impl App {
                 Command::Save(Preferences {
                     route: self.router.current.clone(),
                     filter: self.filter.clone(),
+                    playing_library:
+                        crate::playing_library_page::preferences::SavedPreferences::from_state(
+                            &self.playing_library,
+                        ),
                     welcome_dismissed: self.welcome_dismissed,
                     beginner_hints_enabled: self.beginner_hints_enabled,
                     document_roots: self.document_preferences.roots.clone(),
