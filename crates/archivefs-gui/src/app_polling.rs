@@ -15,6 +15,7 @@ use crate::{
 };
 
 pub(crate) fn poll_and_reconcile(app: &mut ArchiveFsApp, context: &egui::Context) {
+    crate::emulator_setup::zx_snapshot::poll(context);
     #[cfg(target_os = "linux")]
     app.emulator_readiness
         .shadps4

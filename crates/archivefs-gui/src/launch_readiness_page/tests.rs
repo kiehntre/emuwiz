@@ -506,6 +506,7 @@ fn render_with_states(
 /// executable plus argv, exactly like [`RetroArchCommand`] requires.
 fn spawn_test_process(executable: &str, arguments: &[&str]) -> LaunchedRetroArchProcess {
     let command = RetroArchCommand {
+        snapshot_evidence: None,
         executable: PathBuf::from(executable),
         arguments: arguments
             .iter()

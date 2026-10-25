@@ -16,6 +16,7 @@
 
 pub mod launch;
 pub mod pinning;
+pub mod snapshot;
 
 use std::io::Read;
 use std::path::{Path, PathBuf};

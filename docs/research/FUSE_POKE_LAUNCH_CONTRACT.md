@@ -111,3 +111,60 @@ cover semantic regressions, generated native code, unsupported operations,
 stale association/identity/bytes/entries, unsafe sources, the final runtime
 handoff check and actual chooser clicks. The unmodified normal CI workflow
 is the final automated gate; independent review covers the launch boundary.
+
+
+## Source-aware snapshot launch authority (Job #20)
+
+`classic_trainer_evidence::snapshot::SnapshotEvidence` is a private-field proof
+shared by Blue readiness and canonical RetroArch execution. Its constructor
+loads the configured trusted roots, the read-only library and Gold's current
+source-aware DAT projection, then checks actual uncompressed v1 48K snapshot
+bytes against the audited strong hashes. It refuses missing, incomplete,
+withdrawn, stale, ambiguous, conflicting or member-only evidence, unsafe files,
+and unsupported snapshot variants. A filename, trainer pin, expected key or
+caller-supplied verification boolean cannot create this authority.
+
+Readiness resolves proofs on one bounded background worker and reuses stable
+results without hashing catalogues on the GUI thread. Selection changes cannot
+adopt another snapshot's pending result.
+
+The normal request retains the exact readiness proof. Canonical preflight
+revalidates it and compares the canonical snapshot SHA-256 key; the command
+retains it for another fresh revalidation immediately before spawn. Snapshot
+commands also bind and recheck the selected frontend/core object identities,
+permissions and ctime across that resolver, including plain baseline launches.
+The other
+platform paths keep their existing identity logic. The POKE projection and
+approved binary digests are unchanged.
+
+The POKE chooser separately requires the existing planner review
+acknowledgement. Its approval is scoped to the request, exact preview and
+selected entries, and resets on refresh, entry or request changes and after
+submission. The worker rechecks scope, sources and current identity before
+passing the explicit acknowledgement through `CheatLaunchSelection`; neither
+the applicability state nor hard refusal policy is changed. Ordinary Play
+supplies no POKE selection and creates no cheat runtime.
+
+The opt-in real Blue journey uses original CC0 content and an actual scan,
+DAT audit, pin creation, normal readiness, chooser/review clicks and the normal
+launch workers. Its probe child executes the production isolated core probe;
+there is no fabricated core response or diagnostic identity bypass. Normal CI
+leaves this installed-software test ignored. Build the GUI library tests with
+`scripts/cargo-iso test -p archivefs-gui --lib --no-run`, then pass the resulting
+`archivefs_gui-*` test executable to:
+
+```
+python3 scripts/qa/fuse-snapshot-smoke.py /absolute/path/to/archivefs_gui-test-binary
+```
+
+The driver creates private HOME/XDG/application roots and a private Xvfb
+display. It keeps screenshots, process arguments, Blue UI text, the generated
+profile, truthful receipts and source hashes in a printed disposable directory.
+The private profile exposes a regular, digest-verified copy of only the approved
+installed Fuse core, so another installed `.z80` core cannot receive the Play
+click. Canonical preflight checks that actual selected copy and the native
+frontend before launch. The test binary retains these explicit private roots
+through its existing test-environment opt-in; its root assertions remain active.
+It checks baseline red, explicitly selected green and OFF-again red, with the
+unselected lower screen remaining blue. Only observed visual changes establish
+activation for this fixture/backend; receipts continue to report UNKNOWN.

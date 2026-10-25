@@ -126,6 +126,7 @@ fn no_cheats_selected_changes_nothing() {
 #[test]
 fn no_cheats_leaves_the_command_unchanged_even_for_unsupported_targets() {
     let command = RetroArchCommand {
+        snapshot_evidence: None,
         executable: PathBuf::from("/usr/bin/retroarch"),
         arguments: vec![
             "-L".into(),
