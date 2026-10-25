@@ -824,7 +824,12 @@ impl MediaIndex {
                     "RomM identity cache",
                 );
             }
-            let local_count = index.screenshots.get(&id).map_or(0, Vec::len);
+            let local_count = artwork_candidates
+                .iter()
+                .filter(|(candidate, source)| {
+                    candidate.kind == AssetKind::Screenshot && matches!(source, Source::Local(_))
+                })
+                .count();
             if let Some(record) = matched_record
                 && record.artwork.is_some()
             {
@@ -953,21 +958,26 @@ impl MediaIndex {
                     index.covers.insert(id, source.clone());
                 }
             }
-            for (ordinal, candidate) in resolved
-                .artwork
-                .values()
-                .filter(|candidate| candidate.kind == AssetKind::Screenshot)
-                .enumerate()
-            {
-                if let Some((_, source)) = artwork_candidates
+            // The neutral resolver chooses a representative per artwork kind.
+            // Keep the full screenshot gallery belonging to that selected source,
+            // in provider order, instead of treating the representative as the
+            // entire gallery. Other providers' screenshots cannot enter it.
+            if let Some(winner) = resolved.artwork.get(&AssetKind::Screenshot) {
+                let mut seen = HashSet::new();
+                let gallery: Vec<_> = artwork_candidates
                     .iter()
-                    .find(|(item, _)| item.kind == candidate.kind && item.path == candidate.path)
-                {
-                    index
-                        .screenshots
-                        .entry(id)
-                        .or_default()
-                        .insert(ordinal, source.clone());
+                    .filter(|(candidate, _)| {
+                        candidate.kind == AssetKind::Screenshot
+                            && candidate.provenance.provider == winner.provenance.provider
+                            && candidate.provenance.source_class == winner.provenance.source_class
+                            && candidate.provenance.detail == winner.provenance.detail
+                            && seen.insert(candidate.path.clone())
+                    })
+                    .take(8)
+                    .map(|(_, source)| source.clone())
+                    .collect();
+                if !gallery.is_empty() {
+                    index.screenshots.insert(id, gallery);
                 }
             }
             if let Some(description) = resolved.fields.get(&MetadataField::Description) {

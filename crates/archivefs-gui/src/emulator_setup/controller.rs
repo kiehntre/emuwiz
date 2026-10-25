@@ -1026,6 +1026,13 @@ impl ArchiveFsApp {
         if let Some((identity, _)) = &flycast_inputs {
             identity_status = identity.clone();
         }
+        let vice_context = self.emulator_readiness.vice.context(focused);
+        let vice_inputs = vice_context
+            .as_ref()
+            .and_then(|c| c.inputs(&identity_status));
+        if let Some((identity, _)) = &vice_inputs {
+            identity_status = identity.clone();
+        }
         let xroar_context = self.emulator_readiness.xroar_cassette.context(focused);
         let xroar_inputs = xroar_context
             .as_ref()
@@ -1059,6 +1066,16 @@ impl ArchiveFsApp {
             identity_status = identity.clone();
         }
 
+        // The snapshot adapter is shared with canonical preflight. It can
+        // only mint authority from current DAT evidence and matching bytes.
+        if matches!(
+            identity_status,
+            archivefs_core::launch::CanonicalIdentityStatus::Unknown
+        ) && let Some(path) = focused
+            && let Some(evidence) = crate::emulator_setup::zx_snapshot::readiness(path)
+        {
+            identity_status = evidence.identity();
+        }
         match identity_status {
             archivefs_core::launch::CanonicalIdentityStatus::Unknown => {
                 // The worker's own report already says which track of a CUE
@@ -1068,7 +1085,12 @@ impl ArchiveFsApp {
                 {
                     return LaunchReadinessInput::DiscFilesUnresolved(detail);
                 }
-                return if evidence_freshness.is_incomplete() {
+                return if !evidence_freshness.is_incomplete()
+                    && focused.is_some_and(|path| {
+                        archivefs_core::launch::locate_dosbox_game_directory(path, None).is_some()
+                    }) {
+                    LaunchReadinessInput::DosBoxReview
+                } else if evidence_freshness.is_incomplete() {
                     LaunchReadinessInput::InspectionIncomplete
                 } else {
                     LaunchReadinessInput::IdentityUnknown
@@ -1140,6 +1162,9 @@ impl ArchiveFsApp {
             content = selected_content;
         }
         if let Some((_, selected_content)) = cemu_inputs {
+            content = selected_content;
+        }
+        if let Some((_, selected_content)) = vice_inputs {
             content = selected_content;
         }
         if let Some((_, selected_content)) = xroar_inputs {
@@ -1446,6 +1471,10 @@ impl ArchiveFsApp {
                 .chain(amiga_whdload_profiles)
                 .chain(amiga_adf_profiles)
                 .collect();
+
+        if let Some(context) = &vice_context {
+            standalone_profiles.extend(context.profiles());
+        }
 
         // Read-only openMSX discovery contributes only real executable
         // bindings. Core's launch planner selects the explicit C-BIOS machine
@@ -2027,12 +2056,16 @@ impl ArchiveFsApp {
             retroarch_environment,
             &remembered,
         );
+        launch_readiness_page::saturn_core::apply(&mut plan, retroarch_environment);
         archivefs_core::launch::nkit_readiness::inspect_and_apply(&mut plan);
         archivefs_core::launch::cemu_readiness::apply_cemu_readiness(
             &mut plan,
             self.emulator_readiness.cemu.inspection_for(focused),
         );
         if let Some(context) = &flycast_context {
+            context.apply(&mut plan);
+        }
+        if let Some(context) = &vice_context {
             context.apply(&mut plan);
         }
         if let Some(context) = &cemu_context {
@@ -2076,6 +2109,7 @@ impl ArchiveFsApp {
             cemu: cemu_context,
             flycast: flycast_context,
             xroar: xroar_context,
+            vice: vice_context,
             amiga_whdload: amiga_whdload_context,
             #[cfg(target_os = "linux")]
             shadps4: shadps4_context,

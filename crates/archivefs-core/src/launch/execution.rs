@@ -83,6 +83,11 @@ pub const LAUNCH_STDERR_CAPTURE_LIMIT: usize = process_spawn::PROCESS_STDERR_CAP
 /// two that could silently drift apart.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RetroArchLaunchRequest {
+    /// Explicit native Saturn authority; absent for every other platform.
+    pub saturn_core_selection: Option<super::saturn_core_selection::SaturnCoreSelection>,
+    /// Source-aware snapshot authority shown at readiness; absent on other platforms.
+    pub expected_snapshot_evidence:
+        Option<crate::classic_trainer_evidence::snapshot::SnapshotEvidence>,
     /// The exact, direct content file the user selected - never an outer
     /// archive path and never a mount point.
     pub selected_content_path: PathBuf,
@@ -364,7 +369,43 @@ pub fn preflight_retroarch_launch(
     }
 
     // --- 5: fresh identity re-inspection ---
-    let identity_status = fresh_identity_status(content_path, request)?;
+    let snapshot_evidence = if request.expected_platform_id == "ZX Spectrum" {
+        let evidence = request
+            .expected_snapshot_evidence
+            .as_ref()
+            .filter(|e| e.path() == content_path)
+            .ok_or_else(|| {
+                preflight_error(
+                    LaunchPreflightErrorKind::IdentityUnresolved,
+                    "Missing snapshot readiness authority; recheck this game.",
+                )
+            })?;
+        let current = evidence.revalidate().map_err(|detail| {
+            preflight_error(LaunchPreflightErrorKind::IdentityUnresolved, detail)
+        })?;
+        Some(current)
+    } else {
+        if request.expected_snapshot_evidence.is_some() {
+            return Err(preflight_error(
+                LaunchPreflightErrorKind::IdentityMismatch,
+                "Snapshot evidence does not match the selected platform.",
+            ));
+        }
+        None
+    };
+    let identity_status = if let Some(evidence) = &snapshot_evidence {
+        let identity = evidence.identity();
+        if !matches!(&identity, CanonicalIdentityStatus::Resolved(r) if r.game_key == request.expected_game_key)
+        {
+            return Err(preflight_error(
+                LaunchPreflightErrorKind::IdentityMismatch,
+                "Snapshot identity changed since readiness.",
+            ));
+        }
+        identity
+    } else {
+        fresh_identity_status(content_path, request)?
+    };
     super::nkit_readiness::check_raw_nkit_launch(&request.expected_platform_id, content_path)
         .map_err(|detail| {
             preflight_error(
@@ -417,7 +458,18 @@ pub fn preflight_retroarch_launch(
         requires_mount: false,
         provenance: "launch execution preflight: revalidated direct regular file".to_string(),
     };
-    let plan = build_launch_plan(&identity_status, &content_ref, &[], &fresh_environment, &[]);
+    let mut plan = build_launch_plan(&identity_status, &content_ref, &[], &fresh_environment, &[]);
+    if request.expected_platform_id != "Saturn" && request.saturn_core_selection.is_some() {
+        return Err(preflight_error(
+            LaunchPreflightErrorKind::IdentityMismatch,
+            "Saturn core authority does not match this platform.",
+        ));
+    }
+    super::saturn_core_selection::apply(
+        &mut plan,
+        &fresh_environment,
+        Ok(request.saturn_core_selection.as_ref()),
+    );
     let candidate = plan
         .candidates
         .iter()
@@ -481,13 +533,31 @@ pub fn preflight_retroarch_launch(
             ),
         ));
     }
-    let command = command_plan.command.ok_or_else(|| {
+    let mut command = command_plan.command.ok_or_else(|| {
         preflight_error(
             LaunchPreflightErrorKind::CommandMissing,
             "command plan reported no blockers but also no command",
         )
     })?;
 
+    if request.expected_platform_id == "Saturn" {
+        let selected = request.saturn_core_selection.as_ref().ok_or_else(|| {
+            preflight_error(
+                LaunchPreflightErrorKind::CandidateNotReady,
+                "Select a Saturn core first.",
+            )
+        })?;
+        selected
+            .validate(&fresh_environment)
+            .map_err(|detail| preflight_error(LaunchPreflightErrorKind::CoreUnsafe, detail))?;
+        if !selected.matches_command(&command) {
+            return Err(preflight_error(
+                LaunchPreflightErrorKind::CoreUnsafe,
+                "The Saturn command differs from the selected core or installation.",
+            ));
+        }
+        command.saturn_core_selection = Some(selected.clone());
+    }
     // --- 10: recheck immediately before spawn ---
     if request.profile.profile_kind == ProfileKind::AppImage
         && request.expected_appimage_executable.as_deref() != Some(command.executable.as_path())
@@ -527,6 +597,7 @@ pub fn preflight_retroarch_launch(
         ));
     }
 
+    command.snapshot_evidence = snapshot_evidence;
     Ok(command)
 }
 
@@ -833,8 +904,108 @@ impl LaunchedRetroArchProcess {
 pub fn spawn_retroarch(
     command: RetroArchCommand,
 ) -> Result<LaunchedRetroArchProcess, LaunchSpawnError> {
+    spawn_retroarch_guarded(command, || Ok(()))
+}
+
+/// Bind the selected backend objects across snapshot/DAT resolution. Ordinary
+/// non-snapshot launch behavior remains unchanged.
+#[derive(PartialEq, Eq)]
+struct SnapshotBackendStamp {
+    identity: process_spawn::CapturedFileIdentity,
+    changed: (i64, i64),
+    mode: u32,
+    links: u64,
+}
+impl SnapshotBackendStamp {
+    fn capture(path: &Path) -> Result<Self, LaunchSpawnError> {
+        use std::os::unix::fs::MetadataExt;
+        let metadata = fs::symlink_metadata(path).map_err(LaunchSpawnError::Spawn)?;
+        if !metadata.is_file() || metadata.file_type().is_symlink() {
+            return Err(LaunchSpawnError::Spawn(std::io::Error::other(
+                "Unsafe snapshot backend object.",
+            )));
+        }
+        Ok(Self {
+            identity: process_spawn::CapturedFileIdentity::capture(&metadata),
+            changed: (metadata.ctime(), metadata.ctime_nsec()),
+            mode: metadata.mode(),
+            links: metadata.nlink(),
+        })
+    }
+}
+
+pub(crate) fn spawn_retroarch_guarded(
+    command: RetroArchCommand,
+    final_sources: impl FnOnce() -> Result<(), String>,
+) -> Result<LaunchedRetroArchProcess, LaunchSpawnError> {
+    if command.selection.platform_id == "Saturn" {
+        let selected = command.saturn_core_selection.as_ref().ok_or_else(|| {
+            LaunchSpawnError::Spawn(std::io::Error::other(
+                "Missing explicit Saturn core authority.",
+            ))
+        })?;
+        if !selected.matches_command(&command) {
+            return Err(LaunchSpawnError::Spawn(std::io::Error::other(
+                "Saturn core authority changed.",
+            )));
+        }
+        selected
+            .revalidate_files()
+            .map_err(|e| LaunchSpawnError::Spawn(std::io::Error::other(e)))?;
+    }
+    let mut backend_stamps = None;
+    let current_snapshot = if command.selection.platform_id == "ZX Spectrum" {
+        let evidence = command
+            .snapshot_evidence
+            .as_ref()
+            .filter(|e| e.path() == command.selection.content_path)
+            .ok_or_else(|| {
+                LaunchSpawnError::Spawn(std::io::Error::other(
+                    "Missing bound snapshot launch evidence.",
+                ))
+            })?;
+        backend_stamps = Some((
+            SnapshotBackendStamp::capture(&command.executable)?,
+            SnapshotBackendStamp::capture(&command.selection.core_library)?,
+        ));
+        Some(
+            evidence
+                .revalidate()
+                .map_err(|e| LaunchSpawnError::Spawn(std::io::Error::other(e)))?,
+        )
+    } else if command.snapshot_evidence.is_some() {
+        return Err(LaunchSpawnError::Spawn(std::io::Error::other(
+            "Snapshot evidence does not match launch platform.",
+        )));
+    } else {
+        None
+    };
     let facts = command_facts(&command);
     let prepared = command.command_spec();
+    final_sources().map_err(|e| LaunchSpawnError::Spawn(std::io::Error::other(e)))?;
+    if let Some(selected) = &command.saturn_core_selection {
+        selected
+            .revalidate_files()
+            .map_err(|e| LaunchSpawnError::Spawn(std::io::Error::other(e)))?;
+    }
+    if let Some(evidence) = current_snapshot {
+        evidence
+            .verify_read_guards()
+            .map_err(|e| LaunchSpawnError::Spawn(std::io::Error::other(e)))?;
+    }
+    if let Some((frontend, core)) = backend_stamps {
+        recheck_selected_executable(&command.executable, command.selection.profile.profile_kind)
+            .map_err(|e| LaunchSpawnError::Spawn(std::io::Error::other(e.detail)))?;
+        recheck_core_library(&command.selection.core_library)
+            .map_err(|e| LaunchSpawnError::Spawn(std::io::Error::other(e.detail)))?;
+        if frontend != SnapshotBackendStamp::capture(&command.executable)?
+            || core != SnapshotBackendStamp::capture(&command.selection.core_library)?
+        {
+            return Err(LaunchSpawnError::Spawn(std::io::Error::other(
+                "The selected snapshot frontend or core changed during verification; recheck the installation.",
+            )));
+        }
+    }
     let watched =
         process_spawn::spawn_watched_process(&prepared).map_err(LaunchSpawnError::Spawn)?;
     Ok(LaunchedRetroArchProcess {

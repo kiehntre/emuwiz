@@ -58,6 +58,7 @@ fn plan_input(plan: LaunchPlan) -> LaunchReadinessInput {
         cemu: None,
         flycast: None,
         xroar: None,
+        vice: None,
         amiga_whdload: None,
         #[cfg(target_os = "linux")]
         shadps4: None,
@@ -81,6 +82,7 @@ fn dolphin_plan_input(plan: LaunchPlan, context: DolphinLaunchContext) -> Launch
         cemu: None,
         flycast: None,
         xroar: None,
+        vice: None,
         amiga_whdload: None,
         #[cfg(target_os = "linux")]
         shadps4: None,
@@ -104,6 +106,7 @@ fn pcsx2_plan_input(plan: LaunchPlan, context: Pcsx2LaunchContext) -> LaunchRead
         cemu: None,
         flycast: None,
         xroar: None,
+        vice: None,
         amiga_whdload: None,
         #[cfg(target_os = "linux")]
         shadps4: None,
@@ -503,6 +506,8 @@ fn render_with_states(
 /// executable plus argv, exactly like [`RetroArchCommand`] requires.
 fn spawn_test_process(executable: &str, arguments: &[&str]) -> LaunchedRetroArchProcess {
     let command = RetroArchCommand {
+        saturn_core_selection: None,
+        snapshot_evidence: None,
         executable: PathBuf::from(executable),
         arguments: arguments
             .iter()
@@ -691,6 +696,7 @@ fn gamer_action_can_launch_pcsx2_without_retroarch_discovery() {
         cemu: None,
         flycast: None,
         xroar: None,
+        vice: None,
         amiga_whdload: None,
         #[cfg(target_os = "linux")]
         shadps4: None,
@@ -725,6 +731,7 @@ fn gamer_action_can_launch_dolphin_without_retroarch_discovery() {
         cemu: None,
         flycast: None,
         xroar: None,
+        vice: None,
         amiga_whdload: None,
         #[cfg(target_os = "linux")]
         shadps4: None,
@@ -761,6 +768,7 @@ fn gamer_blockers_are_typed_and_name_the_actual_standalone_emulator() {
         cemu: None,
         flycast: None,
         xroar: None,
+        vice: None,
         amiga_whdload: None,
         #[cfg(target_os = "linux")]
         shadps4: None,
@@ -796,6 +804,7 @@ fn gamer_blockers_are_typed_and_name_the_actual_standalone_emulator() {
         cemu: None,
         flycast: None,
         xroar: None,
+        vice: None,
         amiga_whdload: None,
         #[cfg(target_os = "linux")]
         shadps4: None,
@@ -2903,6 +2912,7 @@ mod multidisc {
             cemu: None,
             flycast: None,
             xroar: None,
+            vice: None,
             amiga_whdload: None,
             #[cfg(target_os = "linux")]
             shadps4: None,

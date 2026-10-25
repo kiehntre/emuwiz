@@ -37,7 +37,7 @@ use crate::launch::dosbox_command::{
 use crate::launch::dosbox_sandbox::{
     BWRAP_PATH, DosBoxHostAccess, DosBoxSandboxError, probe_sandbox, sandboxed_command,
 };
-use crate::launch::planning::CanonicalIdentityStatus;
+use crate::launch::dosbox_target::DosBoxLaunchIdentity;
 use crate::launch::process_spawn::{self, WatchedProcess};
 use crate::safe_read::TrustedRoots;
 
@@ -53,10 +53,10 @@ use crate::safe_read::TrustedRoots;
 pub struct DosBoxLaunchRequest {
     /// The absolute DOS game directory (also the launch working directory).
     pub game_directory: PathBuf,
-    /// The already-resolved canonical identity the user was shown. Preflight
-    /// never re-fuses identity; it passes this straight to the planner,
-    /// which fails closed on anything that is not `Resolved(DOS)`.
-    pub identity: CanonicalIdentityStatus,
+    /// Canonical identity supplied by an existing caller, or a distinct
+    /// user-approved local target. The latter is revalidated against the fresh
+    /// review before adapting it to the unchanged DOS-only command planner.
+    pub identity: DosBoxLaunchIdentity,
     /// The exact DOSBox executable the readiness step selected - revalidated
     /// at this path, never re-discovered.
     pub expected_executable: PathBuf,
@@ -254,12 +254,19 @@ pub fn preflight_dosbox_launch(
         return Err(error(kind, mismatch.describe()));
     }
 
-    let plan = build_dosbox_command_plan(
-        &request.identity,
-        game_directory,
-        &config_status,
-        &Ok(binding),
-    );
+    let identity = match &request.identity {
+        DosBoxLaunchIdentity::Canonical(identity) => identity.clone(),
+        DosBoxLaunchIdentity::UserApproved(target) => {
+            if !target.matches(&review) || target.approval() != &request.approval {
+                return Err(error(
+                    DosBoxLaunchPreflightErrorKind::StartCommandNotApproved,
+                    "the user-approved folder or start target changed; review and approve again",
+                ));
+            }
+            target.planner_identity()
+        }
+    };
+    let plan = build_dosbox_command_plan(&identity, game_directory, &config_status, &Ok(binding));
     if !plan.blockers.is_empty() {
         return Err(error(
             DosBoxLaunchPreflightErrorKind::CommandBlocked,

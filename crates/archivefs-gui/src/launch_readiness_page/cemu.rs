@@ -395,6 +395,7 @@ mod tests {
             cemu: Some(context),
             flycast: None,
             xroar: None,
+            vice: None,
             retroarch: None,
             retroarch_scanned: true,
             standalone_scans_complete: true,

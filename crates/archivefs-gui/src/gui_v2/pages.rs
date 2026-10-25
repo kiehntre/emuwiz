@@ -868,8 +868,9 @@ impl App {
                 context.evidence.has_games = Some(!self.library.games.is_empty())
             }
             Route::Game(id) | Route::Task { game: id, .. } => {
-                context.evidence.launch_identity_verified =
-                    self.library.game(*id).map(|game| game.identified);
+                if let Some(game) = self.library.game(*id) {
+                    super::guidance::add_selected_game(&mut context, game);
+                }
             }
             Route::Section(Section::Problems) => {
                 if let Some(summary) = &self.problem_summary {
@@ -2769,7 +2770,7 @@ impl App {
                                 self.show_arcade_input_details(ui, game);
                                 self.classic_trainers.show(ui, game);
                             });
-                            super::game_detail_blue::information_card(ui, game);
+                            super::game_detail_blue::information_card(ui, game, self.artwork.index.as_deref());
                             super::game_detail_blue::side_card(ui, "", |ui| {
                                 ui.collapsing("Advanced details", |ui| {
                                     self.detail_advanced(ui, &library, game, &key);
@@ -2795,7 +2796,7 @@ impl App {
                 });
             });
             if blue {
-                super::game_detail_blue::information_card(ui, game);
+                super::game_detail_blue::information_card(ui, game, self.artwork.index.as_deref());
             }
             self.detail_body(ui, game, &key);
             self.classic_trainers.show(ui, game);
@@ -3071,28 +3072,39 @@ impl App {
             // The first screenshot is shown straight away; the rest load
             // only when asked for, keeping a game visit to two pictures.
             let shown = if self.screenshots { count } else { 1 };
-            ui.horizontal_wrapped(|ui| {
-                for ordinal in 0..shown {
-                    ui.vertical(|ui| {
-                        self.picture(
-                            ui,
-                            game,
-                            Kind::Screenshot(ordinal),
-                            egui::vec2(320.0, 240.0),
-                        );
-                        let key = self.artwork.key(id, Kind::Screenshot(ordinal));
-                        if matches!(
-                            self.artwork.pictures.get(&key),
-                            Some(Picture::Failed(_) | Picture::Unavailable { .. })
-                        ) && ui
-                            .button(format!("Retry screenshot {}", ordinal + 1))
-                            .clicked()
-                        {
-                            self.artwork.retry(key);
+            let gap = ui.spacing().item_spacing.x;
+            let columns = ((ui.available_width() + gap) / (320.0 + gap))
+                .floor()
+                .max(1.0) as usize;
+            egui::Grid::new(("v2_detail_screenshot_gallery", id))
+                .num_columns(columns)
+                .spacing(egui::vec2(gap, theme::SPACE_SM))
+                .show(ui, |ui| {
+                    for ordinal in 0..shown {
+                        ui.vertical(|ui| {
+                            ui.set_width(320.0);
+                            self.picture(
+                                ui,
+                                game,
+                                Kind::Screenshot(ordinal),
+                                egui::vec2(320.0, 240.0),
+                            );
+                            let key = self.artwork.key(id, Kind::Screenshot(ordinal));
+                            if matches!(
+                                self.artwork.pictures.get(&key),
+                                Some(Picture::Failed(_) | Picture::Unavailable { .. })
+                            ) && ui
+                                .button(format!("Retry screenshot {}", ordinal + 1))
+                                .clicked()
+                            {
+                                self.artwork.retry(key);
+                            }
+                        });
+                        if (ordinal + 1) % columns == 0 {
+                            ui.end_row();
                         }
-                    });
-                }
-            });
+                    }
+                });
             if !self.screenshots
                 && count > 1
                 && ui
@@ -3173,6 +3185,7 @@ impl App {
             }
             _ => {}
         }
+        self.artwork_provenance(ui, id, game.screenscraper.as_ref());
         self.artwork_provider_details(ui, id);
         if crate::tape_analysis_page::is_tape_path(&game.archive.absolute_path)
             && ui.button("Inspect tape").clicked()
@@ -3530,7 +3543,10 @@ impl App {
                     ui.heading("Library artwork");
                     ui.label(format!("{covers} covers · {screenshots} games with screenshots · {descriptions} metadata descriptions"));
                     let mut folders = super::local_artwork_folders::configured();
-                    if super::local_artwork_folders::show(ui, &mut folders) && !self.artwork.index_loading {
+                    let folders_changed = ui.add_enabled_ui(!self.artwork.index_loading, |ui| {
+                        super::local_artwork_folders::show(ui, &mut folders)
+                    }).inner;
+                    if folders_changed {
                         self.refresh_artwork_index();
                     }
                     if ui.button("Configure artwork sources").clicked() {
@@ -3646,7 +3662,7 @@ impl App {
                                 ui.label(format!("{kind:?}: {} · {} · cached={}", candidate.provenance.provider.label(), candidate.path.display(), candidate.cached));
                                 ui.label(format!("Provenance: {:?}", candidate.provenance));
                             }
-                            ui.label(format!("Retained metadata alternatives: {}", resolved.conflicts.len()));
+                            super::game_detail_blue::metadata_sources(ui, &resolved);
                         }
                         if let Some(diagnostic) = index.diagnostic_for(game) { ui.label(diagnostic); }
                         ui.label(format!("Cover diagnosis: {}", index.explain_cover(&game)));
@@ -3716,7 +3732,7 @@ impl App {
                 candidate.provenance.detail
             ));
             if candidate.cached {
-                ui.label("Using a cached copy of this artwork.");
+                ui.label("Artwork is read from this local file. Display thumbnails use a separate cache.");
             }
         } else if let Some(source) = index.and_then(|index| index.covers.get(&game)) {
             ui.label(match source {

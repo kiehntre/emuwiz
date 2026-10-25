@@ -4,7 +4,7 @@
 //! LaunchBox-derived identity. XML is parsed and the bounded media tree is
 //! indexed during refresh; selected-game lookup is map access only.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
 use std::io::Read as _;
 use std::path::{Path, PathBuf};
@@ -201,7 +201,13 @@ pub fn discover_launchbox_local(
             }
         };
         let platform = parsed_platform(&path, &parsed.games);
-        let platform_media = if safe_component(&platform) {
+        let titles: BTreeSet<_> = parsed
+            .games
+            .iter()
+            .filter_map(|game| game.title.as_deref())
+            .map(title_key)
+            .collect();
+        let mut platform_media = if safe_component(&platform) {
             index_platform_media(root, &platform, &mut index.media_files_indexed)
         } else {
             index.warnings.push(format!(
@@ -210,6 +216,14 @@ pub fn discover_launchbox_local(
             ));
             Vec::new()
         };
+        // An exact catalogue title takes priority over interpreting its final
+        // -NN as another game's gallery number. Do not steal a sibling's art.
+        for media in &mut platform_media {
+            let exact = title_key(&media.path.file_stem().unwrap_or_default().to_string_lossy());
+            if titles.contains(&exact) {
+                media.key = exact;
+            }
+        }
         for game in parsed.games {
             let position = index.games.len();
             let launchbox_id = game.id.unwrap_or_default();
@@ -438,7 +452,13 @@ fn title_key_from_filename(path: &Path) -> String {
         .file_stem()
         .map(|value| value.to_string_lossy())
         .unwrap_or_default();
-    let stem = stem.strip_suffix("-01").unwrap_or(&stem);
+    // LaunchBox numbers multiple images of one title as -01, -02, ... .
+    // Only its two-digit suffix is removed; release years and title numbers
+    // of other lengths stay part of the title key.
+    let stem = stem
+        .rsplit_once('-')
+        .filter(|(_, suffix)| suffix.len() == 2 && suffix.bytes().all(|byte| byte.is_ascii_digit()))
+        .map_or(stem.as_ref(), |(title, _)| title);
     title_key(stem)
 }
 
@@ -630,6 +650,20 @@ mod tests {
             normalized_path(Path::new("/mnt/roms/Example.z64")),
             "/mnt/roms/example.z64"
         );
+    }
+
+    #[test]
+    fn numbered_gallery_images_share_the_title_key_without_stripping_years() {
+        for name in ["Example-01.png", "Example-02.png", "Example-03.png"] {
+            assert_eq!(
+                title_key_from_filename(Path::new(name)),
+                title_key("Example")
+            );
+        }
+        for name in ["Example-1999.png", "Example-2.png", "Example-AB.png"] {
+            let stem = Path::new(name).file_stem().unwrap().to_str().unwrap();
+            assert_eq!(title_key_from_filename(Path::new(name)), title_key(stem));
+        }
     }
 
     fn fixture() -> (tempfile::TempDir, LaunchBoxLocalProviderIndex) {

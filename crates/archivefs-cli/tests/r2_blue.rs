@@ -1,5 +1,8 @@
 //! Disposable Blue operator boundary, using the same packaged CLI entry point.
 #![cfg(target_os = "linux")]
+
+archivefs_core::install_test_environment!();
+
 use serde_json::Value;
 use std::{
     fs,
@@ -12,6 +15,65 @@ fn flag(name: &str) -> bool {
 }
 struct Blue {
     home: tempfile::TempDir,
+}
+
+#[test]
+fn an_older_writer_in_the_isolated_process_table_still_refuses_journal_work() {
+    let blue = Blue::new();
+    let root = blue.root();
+    if !blue.qualified(&root) {
+        return;
+    }
+    let info = blue.ok(&["blue-init", &root, &blue.path("workspaces/refused")]);
+    let state = info["state"].as_str().unwrap();
+    let plan_file = blue.path("refused-plan.json");
+    let plan = blue.ok(&["plan", state, &plan_file, "a.bin", "b.bin"]);
+    let table = blue.home.path().join("processes");
+    let process = table.join("4000001");
+    fs::create_dir_all(&process).unwrap();
+    let executable = blue.home.path().join("older/emuwiz");
+    fs::create_dir_all(executable.parent().unwrap()).unwrap();
+    fs::write(&executable, b"synthetic older writer").unwrap();
+    std::os::unix::fs::symlink(&executable, process.join("exe")).unwrap();
+    fs::write(
+        process.join("stat"),
+        "4000001 (emuwiz) S 1 1 1 0 -1 0 0 0 0 0 0 0 0 0 20 0 1 0 777 0 0",
+    )
+    .unwrap();
+    // Eligibility and workspace setup are read-only with respect to recovery
+    // journals. Enrollment reaches the protected descriptor publication boundary.
+    let output = Command::new(env!("CARGO_BIN_EXE_emuwiz-cli"))
+        .args([
+            "--r2-operator",
+            "enroll",
+            state,
+            &plan_file,
+            "--confirm",
+            plan["confirmation"].as_str().unwrap(),
+            "--enable-contract-1-i",
+        ])
+        .env("HOME", blue.home.path())
+        .env("XDG_DATA_HOME", blue.home.path())
+        .env("XDG_CONFIG_HOME", blue.home.path())
+        .env(
+            archivefs_core::dat::rename_apply::writer_gate::PROC_ROOT_ENV,
+            &table,
+        )
+        .output()
+        .unwrap();
+    assert!(
+        !output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stdout)
+    );
+    let error = String::from_utf8_lossy(&output.stderr);
+    assert!(error.contains("an older EmuWiz is running"), "{error}");
+    assert!(error.contains("PID 4000001"), "{error}");
+    assert_eq!(
+        fs::read(Path::new(&root).join("a.bin")).unwrap(),
+        b"synthetic original"
+    );
+    assert!(!Path::new(&root).join("b.bin").exists());
 }
 impl Blue {
     fn new() -> Self {

@@ -1161,9 +1161,9 @@ fn the_catalogue_has_the_42_designed_scripts_their_variants_and_the_35_legacy_ke
     assert_eq!(r.design_numbered, 42, "{r}");
     assert!(r.design_numbers_missing.is_empty(), "{r}");
     assert!(r.design_numbers_duplicated.is_empty(), "{r}");
-    assert_eq!(r.design_variants, 4, "{r}");
+    assert_eq!(r.design_variants, 5, "{r}");
     assert_eq!(r.legacy, 35, "{r}");
-    assert_eq!(r.total, 42 + 4 + 35);
+    assert_eq!(r.total, 42 + 5 + 35);
     // Every pre-engine message key survives with the same identity.
     for key in LEGACY_KEYS {
         let legacy = script(key);

@@ -543,7 +543,7 @@ fn the_coverage_table_matches_what_the_adapters_emit() {
 #[test]
 fn coverage_report_is_complete_and_honest() {
     let report = report(super::catalogue::CATALOGUE);
-    assert_eq!(report.scripts.len(), 81);
+    assert_eq!(report.scripts.len(), 82);
     // Unsupported claims: nothing marked available/simple without a source.
     for kind in ALL_KINDS {
         let row = coverage_of(*kind);
@@ -564,7 +564,10 @@ fn coverage_report_is_complete_and_honest() {
             assert!(ALL_KINDS.contains(kind), "{kind:?}");
         }
     }
-    assert!(report.receivable_now().len() + report.without_adapter().len() == 81);
+    assert_eq!(
+        report.receivable_now().len() + report.without_adapter().len(),
+        report.scripts.len()
+    );
 }
 
 #[test]

@@ -595,7 +595,7 @@ impl CheatRuntimePlan {
         sha256_hex(&serde_json::to_vec(&view).unwrap_or_default())
     }
 
-    fn verify_sources(&self) -> Result<(), RuntimeRefusal> {
+    pub(crate) fn verify_sources(&self) -> Result<(), RuntimeRefusal> {
         for source in &self.sources {
             match hash_source(&source.path) {
                 Ok(hash) if hash == source.expected_sha256 => {}

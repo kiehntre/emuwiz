@@ -334,6 +334,7 @@ impl NativeWorkflows {
     }
 
     pub(super) fn new(context: egui::Context) -> Self {
+        crate::emulator_setup::zx_snapshot::poll(&context);
         #[cfg(not(test))]
         let mut app = ArchiveFsApp::new_without_initial_load(context.clone());
         #[cfg(test)]
@@ -499,6 +500,7 @@ impl NativeWorkflows {
         self.select(path);
         self.app.launch_standalone.focus_dosbox_game(Some(path));
         self.app.emulator_readiness.flycast_gdi.show(ui, Some(path));
+        self.app.emulator_readiness.vice.show(ui, Some(path));
         self.app
             .emulator_readiness
             .xroar_cassette
@@ -596,6 +598,7 @@ impl NativeWorkflows {
         activity: &mut Activity,
     ) -> Option<Route> {
         self.app.emulator_readiness.flycast_gdi.show(ui, Some(path));
+        self.app.emulator_readiness.vice.show(ui, Some(path));
         self.app
             .emulator_readiness
             .xroar_cassette
@@ -3216,7 +3219,11 @@ impl NativeWorkflows {
     }
 
     fn select(&mut self, path: &Path) {
+        self.app
+            .launch_standalone
+            .focus_vice_trainer_game(Some(path));
         if self.selected.as_deref() != Some(path) {
+            self.app.launch_standalone.focus_dosbox_game(Some(path));
             self.selected = Some(path.to_path_buf());
             self.app.archive_context.select_only(path.to_path_buf());
         }
@@ -3334,6 +3341,7 @@ impl NativeWorkflows {
                 "IdentityConflicting".into()
             }
             launch_readiness_page::LaunchReadinessInput::AtariSt(_) => "AtariSt".into(),
+            launch_readiness_page::LaunchReadinessInput::DosBoxReview => "DosBoxReview".into(),
         }
     }
 
