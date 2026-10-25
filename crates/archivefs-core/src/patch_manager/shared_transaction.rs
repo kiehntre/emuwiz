@@ -1758,7 +1758,7 @@ fn apply_one(
                 *backup_bytes += existing.bytes;
                 result.backup_path = Some(SharedTransactionPath::from_path(&path));
                 result.backup_digest = Some(existing.digest.clone());
-                result.destination_pre_mode = existing.mode;
+                result.destination_pre_mode = existing.pin.map(|pin| pin.mode);
                 result.stages.push(SharedTransactionStage::BackupCreated);
                 if !checkpoint(SharedEntryRecoveryState::BackupCreated, &result) {
                     return fail_result(
@@ -1808,6 +1808,11 @@ fn apply_one(
     } else {
         OWNER_ONLY_MODE
     };
+    // A replacement may only displace the file observed above, whose bytes
+    // were backed up and whose mode was recorded.
+    let displaces = (plan.proposed_action == PreviewProposedAction::Replace)
+        .then(|| current.as_ref().and_then(|existing| existing.pin))
+        .flatten();
     let write_result = match materialized {
         Some(value) => atomic_write_bytes(
             &value.bytes,
@@ -1815,6 +1820,7 @@ fn apply_one(
             &output_digest,
             plan.proposed_action == PreviewProposedAction::Install,
             write_mode,
+            displaces,
         ),
         None => atomic_write(
             &source,
@@ -1822,6 +1828,7 @@ fn apply_one(
             &output_digest,
             plan.proposed_action == PreviewProposedAction::Install,
             write_mode,
+            displaces,
         ),
     };
     match write_result {
@@ -1858,7 +1865,12 @@ fn apply_one(
                     *written += output_bytes;
                 }
                 Err(detail) => {
-                    let restore = restore_after_failed_verification(plan, &result, &destination);
+                    let restore = restore_after_failed_verification(
+                        plan,
+                        &result,
+                        &destination,
+                        &output_digest,
+                    );
                     let detail = match restore {
                         Ok(()) => format!("{detail}; previous live file state restored"),
                         Err(kind) => format!(
@@ -2075,6 +2087,7 @@ fn restore_after_failed_verification(
     plan: &SharedPlanEntry,
     result: &SharedApplyEntry,
     destination: &Path,
+    installed_digest: &str,
 ) -> Result<(), SharedApplyFailureKind> {
     if plan.proposed_action == PreviewProposedAction::Install {
         return remove_and_verify_new_destination(destination);
@@ -2090,9 +2103,24 @@ fn restore_after_failed_verification(
         .ok_or(SharedApplyFailureKind::BackupChanged)?;
     let mode =
         SharedRollbackPermissions::for_recorded_mode(result.destination_pre_mode).restored_mode();
-    atomic_write(&backup, destination, digest, false, mode)
+    let installed = pinned_installed_file(destination, installed_digest)?;
+    atomic_write(&backup, destination, digest, false, mode, installed)
         .map(|_| ())
         .map_err(|(kind, _)| kind)
+}
+
+/// The pin of the file a restore displaces: it must still hold exactly the
+/// bytes this transaction installed.
+fn pinned_installed_file(
+    destination: &Path,
+    installed_digest: &str,
+) -> Result<Option<FilePin>, SharedApplyFailureKind> {
+    let installed = stable_hash(destination, SHARED_MAX_MATERIALIZED_BYTES)
+        .map_err(|_| SharedApplyFailureKind::DestinationChanged)?;
+    if installed.digest != installed_digest {
+        return Err(SharedApplyFailureKind::DestinationChanged);
+    }
+    Ok(installed.pin)
 }
 
 pub fn discover_shared_apply_history(history_root: &Path) -> SharedHistoryReport {
@@ -2358,7 +2386,25 @@ pub fn execute_shared_rollback(
                         SharedRollbackPermissions::for_recorded_mode(install.destination_pre_mode)
                     })
                     .restored_mode();
-                match atomic_write(&backup, &destination, expected, false, mode) {
+                let installed = match pinned_installed_file(
+                    &destination,
+                    install
+                        .final_destination_digest
+                        .as_deref()
+                        .unwrap_or_default(),
+                ) {
+                    Ok(pin) => pin,
+                    Err(kind) => {
+                        rollback.outcome = SharedRollbackOutcome::Failed;
+                        rollback.failure = Some(failure(
+                            kind,
+                            Some(&destination),
+                            "the installed file changed before it could be restored",
+                        ));
+                        continue;
+                    }
+                };
+                match atomic_write(&backup, &destination, expected, false, mode, installed) {
                     Ok(_) => rollback.outcome = SharedRollbackOutcome::RestoredBackup,
                     Err((kind, _)) => {
                         rollback.outcome = SharedRollbackOutcome::Failed;
@@ -2466,8 +2512,59 @@ pub fn execute_shared_rollback(
 struct StableHash {
     digest: String,
     bytes: u64,
-    /// Permission bits of the descriptor that was hashed (Unix only).
-    mode: Option<u32>,
+    /// Identity of the descriptor that was hashed (Unix only).
+    pin: Option<FilePin>,
+}
+
+/// What a replacement or restore may displace: the identity and permission
+/// bits of the exact file that was hashed (and, on Apply, whose mode was
+/// recorded). Publication refuses unless the file it displaces still matches
+/// all of it. ctime is deliberately absent: a rename updates it, while mode,
+/// owner and link count are compared directly.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct FilePin {
+    dev: u64,
+    ino: u64,
+    len: u64,
+    mtime: i64,
+    mtime_nsec: i64,
+    /// `st_mode & 0o7777`.
+    mode: u32,
+    uid: u32,
+    gid: u32,
+    nlink: u64,
+}
+
+impl FilePin {
+    #[cfg(unix)]
+    fn of(metadata: &fs::Metadata) -> Self {
+        use std::os::unix::fs::MetadataExt;
+        Self {
+            dev: metadata.dev(),
+            ino: metadata.ino(),
+            len: metadata.len(),
+            mtime: metadata.mtime(),
+            mtime_nsec: metadata.mtime_nsec(),
+            mode: metadata.mode() & 0o7777,
+            uid: metadata.uid(),
+            gid: metadata.gid(),
+            nlink: metadata.nlink(),
+        }
+    }
+}
+
+/// The pin of the regular file at `path`, read through an `O_NOFOLLOW`
+/// descriptor; `None` for anything else (missing, link, special file).
+#[cfg(unix)]
+fn pin_no_follow(path: &Path) -> Option<FilePin> {
+    use std::os::unix::fs::OpenOptionsExt;
+    let file = OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC | libc::O_NONBLOCK)
+        .open(path)
+        .ok()?;
+    let metadata = file.metadata().ok()?;
+    metadata.is_file().then(|| FilePin::of(&metadata))
 }
 
 fn stable_hash(path: &Path, max: u64) -> Result<StableHash, SharedApplyFailureKind> {
@@ -2528,16 +2625,13 @@ fn stable_hash(path: &Path, max: u64) -> Result<StableHash, SharedApplyFailureKi
         return Err(SharedApplyFailureKind::SourceChanged);
     }
     #[cfg(unix)]
-    let mode = {
-        use std::os::unix::fs::PermissionsExt;
-        Some(opened.permissions().mode() & 0o7777)
-    };
+    let pin = Some(FilePin::of(&opened));
     #[cfg(not(unix))]
-    let mode = None;
+    let pin = None;
     Ok(StableHash {
         digest: hex_bytes(&digest.finalize()),
         bytes,
-        mode,
+        pin,
     })
 }
 
@@ -2569,12 +2663,15 @@ fn create_backup(
     Ok(final_path)
 }
 
+/// `displaces`: for a replacement or restore, the pinned file it must
+/// displace (see [`publish_displacing`]); `None` publishes as before.
 fn atomic_write(
     source: &Path,
     destination: &Path,
     expected: &str,
     no_replace: bool,
     mode: u32,
+    displaces: Option<FilePin>,
 ) -> Result<PathBuf, (SharedApplyFailureKind, Option<PathBuf>)> {
     if should_inject(FaultPoint::TemporaryWrite) {
         return Err((SharedApplyFailureKind::WriteFailed, None));
@@ -2583,7 +2680,7 @@ fn atomic_write(
     if digest_bytes(&bytes) != expected {
         return Err((SharedApplyFailureKind::SourceChanged, None));
     }
-    atomic_write_bytes(&bytes, destination, expected, no_replace, mode)
+    atomic_write_bytes(&bytes, destination, expected, no_replace, mode, displaces)
 }
 
 fn atomic_write_bytes(
@@ -2592,6 +2689,7 @@ fn atomic_write_bytes(
     expected: &str,
     no_replace: bool,
     mode: u32,
+    displaces: Option<FilePin>,
 ) -> Result<PathBuf, (SharedApplyFailureKind, Option<PathBuf>)> {
     if bytes.len() as u64 > SHARED_MAX_MATERIALIZED_BYTES {
         return Err((SharedApplyFailureKind::ResourceLimitReached, None));
@@ -2604,6 +2702,9 @@ fn atomic_write_bytes(
         std::process::id(),
         NEXT_ID.fetch_add(1, Ordering::Relaxed)
     ));
+    // `keep_temp`: the temporary name holds a file that is not ours (a
+    // displaced file that could not be put back) and must never be deleted.
+    let mut keep_temp = false;
     let write_result = (|| {
         let mut options = OpenOptions::new();
         options.write(true).create_new(true);
@@ -2638,11 +2739,13 @@ fn atomic_write_bytes(
         if should_inject(FaultPoint::Rename) {
             return Err(SharedApplyFailureKind::WriteFailed);
         }
-        if no_replace {
-            rename_no_replace(&temp, destination)
-                .map_err(|_| SharedApplyFailureKind::DestinationChanged)?;
-        } else {
-            fs::rename(&temp, destination).map_err(|_| SharedApplyFailureKind::WriteFailed)?;
+        match displaces {
+            Some(pin) => publish_displacing(&temp, destination, pin, &mut keep_temp)?,
+            None if no_replace => rename_no_replace(&temp, destination)
+                .map_err(|_| SharedApplyFailureKind::DestinationChanged)?,
+            None => {
+                fs::rename(&temp, destination).map_err(|_| SharedApplyFailureKind::WriteFailed)?
+            }
         }
         sync_directory(parent);
         let final_hash = stable_hash(destination, SHARED_MAX_MATERIALIZED_BYTES)?;
@@ -2652,10 +2755,109 @@ fn atomic_write_bytes(
         Ok(())
     })();
     if let Err(kind) = write_result {
-        let _ = fs::remove_file(&temp);
+        if !keep_temp {
+            let _ = fs::remove_file(&temp);
+        }
         return Err((kind, Some(temp)));
     }
     Ok(temp)
+}
+
+#[cfg(test)]
+type PublishHook = Box<dyn FnMut(&Path)>;
+
+#[cfg(test)]
+thread_local! {
+    /// Runs between observation and publication, to force a race.
+    static BEFORE_PUBLISH: std::cell::RefCell<Option<PublishHook>> =
+        std::cell::RefCell::new(None);
+}
+
+#[cfg(test)]
+fn set_before_publish(hook: Option<PublishHook>) {
+    BEFORE_PUBLISH.with(|slot| *slot.borrow_mut() = hook);
+}
+
+fn before_publish(_destination: &Path) {
+    #[cfg(test)]
+    BEFORE_PUBLISH.with(|slot| {
+        if let Some(hook) = slot.borrow_mut().as_mut() {
+            hook(_destination);
+        }
+    });
+}
+
+/// Publishes `temp` at `destination` only if what it displaces is still the
+/// exact pinned file: same inode, size, mtime, permission bits, owner and
+/// link count. On Linux the two names are exchanged atomically and the
+/// displaced file is then checked through an `O_NOFOLLOW` descriptor, so no
+/// change between observation and publication can slip through; on a
+/// mismatch the exchange is reversed, putting the other file back untouched,
+/// and the write is refused. A verified displaced file is removed (its bytes
+/// are in the transaction's backup or were EmuWiz's own install).
+#[cfg(target_os = "linux")]
+fn publish_displacing(
+    temp: &Path,
+    destination: &Path,
+    pin: FilePin,
+    keep_temp: &mut bool,
+) -> Result<(), SharedApplyFailureKind> {
+    before_publish(destination);
+    rename_exchange(temp, destination).map_err(|_| SharedApplyFailureKind::DestinationChanged)?;
+    // `temp` now names the displaced file and `destination` our new one.
+    if pin_no_follow(temp) == Some(pin) {
+        fs::remove_file(temp).map_err(|_| SharedApplyFailureKind::WriteFailed)?;
+        return Ok(());
+    }
+    if rename_exchange(temp, destination).is_err() {
+        // Ours stays published; the other file is kept under `temp`.
+        *keep_temp = true;
+    }
+    Err(SharedApplyFailureKind::DestinationChanged)
+}
+
+/// Without an atomic exchange the pin is re-checked immediately before the
+/// rename; only Linux offers the stronger guarantee above.
+#[cfg(not(target_os = "linux"))]
+fn publish_displacing(
+    temp: &Path,
+    destination: &Path,
+    pin: FilePin,
+    _keep_temp: &mut bool,
+) -> Result<(), SharedApplyFailureKind> {
+    before_publish(destination);
+    #[cfg(unix)]
+    let unchanged = pin_no_follow(destination) == Some(pin);
+    #[cfg(not(unix))]
+    let unchanged = {
+        let _ = pin;
+        false
+    };
+    if !unchanged {
+        return Err(SharedApplyFailureKind::DestinationChanged);
+    }
+    fs::rename(temp, destination).map_err(|_| SharedApplyFailureKind::WriteFailed)
+}
+
+#[cfg(target_os = "linux")]
+fn rename_exchange(left: &Path, right: &Path) -> std::io::Result<()> {
+    use std::os::unix::ffi::OsStrExt;
+    let left = std::ffi::CString::new(left.as_os_str().as_bytes())?;
+    let right = std::ffi::CString::new(right.as_os_str().as_bytes())?;
+    let result = unsafe {
+        libc::renameat2(
+            libc::AT_FDCWD,
+            left.as_ptr(),
+            libc::AT_FDCWD,
+            right.as_ptr(),
+            libc::RENAME_EXCHANGE,
+        )
+    };
+    if result == 0 {
+        Ok(())
+    } else {
+        Err(std::io::Error::last_os_error())
+    }
 }
 
 fn atomic_managed_write(path: &Path, bytes: &[u8]) -> Result<(), SharedApplyFailureKind> {
@@ -4942,6 +5144,172 @@ mod tests {
         );
     }
 
+    #[cfg(unix)]
+    fn stray_temporaries(dir: &Path) -> Vec<String> {
+        fs::read_dir(dir)
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name().to_string_lossy().into_owned())
+            .filter(|name| name.starts_with(".archivefs-apply-"))
+            .collect()
+    }
+
+    #[cfg(unix)]
+    fn ino_of(path: &Path) -> u64 {
+        use std::os::unix::fs::MetadataExt;
+        fs::symlink_metadata(path).unwrap().ino()
+    }
+
+    /// Job #22: a permission change between observing the file (whose mode is
+    /// recorded) and publishing the replacement is refused; the user's change
+    /// stays and no stale mode is applied.
+    #[cfg(unix)]
+    #[test]
+    fn apply_refuses_a_permission_change_between_observation_and_publication() {
+        let fixture = Fixture::new("race-apply-chmod");
+        let report = preview(&fixture, b"new", Some(b"old"));
+        let live = fixture.destination_root().join("Nintendo - NES/game.cht");
+        chmod(&live, 0o664);
+        let plan = make_plan(&fixture, &report);
+        set_before_publish(Some(Box::new(|destination: &Path| {
+            chmod(destination, 0o640)
+        })));
+        let result = execute_shared_apply(
+            &plan,
+            &options(&fixture, &plan, "race-chmod", false, true, true),
+        );
+        set_before_publish(None);
+        let entry = &result.journal.entries[0];
+        assert_ne!(entry.outcome, SharedApplyOutcome::ReplacedExisting);
+        assert!(
+            entry
+                .failures
+                .iter()
+                .any(|f| f.kind == SharedApplyFailureKind::DestinationChanged),
+            "{:?}",
+            entry.failures
+        );
+        assert_eq!(fs::read(&live).unwrap(), b"old");
+        assert_eq!(
+            mode_of(&live),
+            0o640,
+            "the user's change is kept, not the stale 0664"
+        );
+        assert!(stray_temporaries(live.parent().unwrap()).is_empty());
+    }
+
+    /// The same file content under a different inode is a different file.
+    #[cfg(unix)]
+    #[test]
+    fn apply_refuses_a_same_content_swap_between_observation_and_publication() {
+        let fixture = Fixture::new("race-apply-swap");
+        let report = preview(&fixture, b"new", Some(b"old"));
+        let live = fixture.destination_root().join("Nintendo - NES/game.cht");
+        chmod(&live, 0o664);
+        let plan = make_plan(&fixture, &report);
+        let swapped = std::rc::Rc::new(std::cell::Cell::new(0_u64));
+        let seen = swapped.clone();
+        set_before_publish(Some(Box::new(move |destination: &Path| {
+            let other = destination.with_file_name("other.cht");
+            fs::write(&other, b"old").unwrap();
+            chmod(&other, 0o664);
+            fs::rename(&other, destination).unwrap();
+            seen.set(ino_of(destination));
+        })));
+        let result = execute_shared_apply(
+            &plan,
+            &options(&fixture, &plan, "race-swap", false, true, true),
+        );
+        set_before_publish(None);
+        let entry = &result.journal.entries[0];
+        assert_ne!(entry.outcome, SharedApplyOutcome::ReplacedExisting);
+        assert_eq!(fs::read(&live).unwrap(), b"old");
+        assert_eq!(
+            ino_of(&live),
+            swapped.get(),
+            "the swapped-in file is put back untouched"
+        );
+        assert!(stray_temporaries(live.parent().unwrap()).is_empty());
+    }
+
+    /// Undo pins the installed file: a permission change before publication
+    /// refuses the restore and leaves it as found; a fresh retry succeeds.
+    #[cfg(unix)]
+    #[test]
+    fn rollback_refuses_a_change_to_the_installed_file_before_publication() {
+        let fixture = Fixture::new("race-undo");
+        let report = preview(&fixture, b"new", Some(b"old"));
+        let live = fixture.destination_root().join("Nintendo - NES/game.cht");
+        chmod(&live, 0o664);
+        let plan = make_plan(&fixture, &report);
+        let result = execute_shared_apply(
+            &plan,
+            &options(&fixture, &plan, "race-undo", false, true, true),
+        );
+        let journal_path = result.journal_path.clone().unwrap();
+        let rollback = preview_shared_rollback(
+            &journal_path,
+            &fixture.destination_root(),
+            &fixture.backup_root(),
+        );
+        assert!(rollback.available);
+        set_before_publish(Some(Box::new(|destination: &Path| {
+            chmod(destination, 0o600)
+        })));
+        let refused = confirm_rollback(&fixture, &rollback, "race-undo-1");
+        set_before_publish(None);
+        assert_ne!(refused.status, SharedApplyStatus::Success);
+        assert_eq!(
+            refused.preview.entries[0].outcome,
+            SharedRollbackOutcome::Failed
+        );
+        assert_eq!(
+            refused.preview.entries[0].failure.as_ref().map(|f| f.kind),
+            Some(SharedApplyFailureKind::DestinationChanged)
+        );
+        assert_eq!(fs::read(&live).unwrap(), b"new");
+        assert_eq!(mode_of(&live), 0o600);
+        assert!(stray_temporaries(live.parent().unwrap()).is_empty());
+        let retry = preview_shared_rollback(
+            &journal_path,
+            &fixture.destination_root(),
+            &fixture.backup_root(),
+        );
+        assert!(retry.available);
+        let outcome = confirm_rollback(&fixture, &retry, "race-undo-2");
+        assert_eq!(outcome.status, SharedApplyStatus::Success);
+        assert_eq!(fs::read(&live).unwrap(), b"old");
+        assert_eq!(mode_of(&live), 0o664);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn automatic_restore_refuses_a_changed_installed_file() {
+        let fixture = Fixture::new("race-verify-restore");
+        let report = preview(&fixture, b"new", Some(b"old"));
+        let live = fixture.destination_root().join("Nintendo - NES/game.cht");
+        chmod(&live, 0o664);
+        let plan = make_plan(&fixture, &report);
+        let result = execute_shared_apply(
+            &plan,
+            &options(&fixture, &plan, "race-verify", false, true, true),
+        );
+        let entry = &result.journal.entries[0];
+        set_before_publish(Some(Box::new(|destination: &Path| {
+            chmod(destination, 0o644)
+        })));
+        let restored = restore_after_failed_verification(
+            &entry.plan_entry,
+            entry,
+            &live,
+            entry.final_destination_digest.as_deref().unwrap(),
+        );
+        set_before_publish(None);
+        assert_eq!(restored, Err(SharedApplyFailureKind::DestinationChanged));
+        assert_eq!(fs::read(&live).unwrap(), b"new");
+        assert_eq!(mode_of(&live), 0o644);
+        assert!(stray_temporaries(live.parent().unwrap()).is_empty());
+    }
+
     /// Apply's own automatic restore after a failed content check uses the
     /// recorded mode too.
     #[cfg(unix)]
@@ -4957,7 +5325,13 @@ mod tests {
             &options(&fixture, &plan, "mode-verify", false, true, true),
         );
         let entry = &result.journal.entries[0];
-        restore_after_failed_verification(&entry.plan_entry, entry, &live).unwrap();
+        restore_after_failed_verification(
+            &entry.plan_entry,
+            entry,
+            &live,
+            entry.final_destination_digest.as_deref().unwrap(),
+        )
+        .unwrap();
         assert_eq!(fs::read(&live).unwrap(), b"old");
         assert_eq!(mode_of(&live), 0o664);
     }
