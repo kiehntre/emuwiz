@@ -139,11 +139,19 @@ pub enum Ps2CodebreakerError {
     InputTooLarge,
     TooManyLines,
     NonAsciiInput,
-    MalformedLine { line: usize },
+    MalformedLine {
+        line: usize,
+    },
     InvalidName,
     IdentityUnresolved,
-    IdentityConflict { detail: String },
-    Pnach { detail: String },
+    /// Acknowledged lines were supplied but the list has no hooks to exclude.
+    UnexpectedAcknowledgement,
+    IdentityConflict {
+        detail: String,
+    },
+    Pnach {
+        detail: String,
+    },
 }
 
 impl fmt::Display for Ps2CodebreakerError {
@@ -171,6 +179,8 @@ impl fmt::Display for Ps2CodebreakerError {
             Self::IdentityUnresolved => {
                 formatter.write_str("the selected game has no verified PCSX2 executable CRC yet")
             }
+            Self::UnexpectedAcknowledgement => formatter
+                .write_str("hook lines were acknowledged but this list has no hook to exclude"),
             Self::IdentityConflict { detail } => formatter.write_str(detail),
             Self::Pnach { detail } => write!(formatter, "PNACH preview failed: {detail}"),
         }
@@ -245,8 +255,6 @@ pub enum Ps2CodebreakerRefusal {
     ConflictingWrites {
         address: u32,
     },
-    /// A multi-line code is cut off at the end of the list.
-    TruncatedCode,
 }
 
 impl Ps2CodebreakerRefusal {
@@ -278,9 +286,6 @@ impl Ps2CodebreakerRefusal {
                 .to_string(),
             Self::ConflictingWrites { address } => {
                 format!("address {address:08X} is written more than once with different values")
-            }
-            Self::TruncatedCode => {
-                "a multi-line code is cut off at the end of the list".to_string()
             }
         }
     }
@@ -511,6 +516,10 @@ fn preview_with_cipher(
         .map(|hook| hook.line)
         .collect::<Vec<_>>();
 
+    if reasons.is_empty() && hook_lines.is_empty() && !acknowledged.is_empty() {
+        return Err(Ps2CodebreakerError::UnexpectedAcknowledgement);
+    }
+
     let outcome = if reasons.is_empty() && acknowledged != hook_lines {
         // Also covers an acknowledgement naming lines that are not hooks.
         Ps2CodebreakerOutcome::AcknowledgementRequired {
@@ -530,7 +539,7 @@ fn preview_with_cipher(
                 detail: error.detail,
             })?;
         let cheat = ManagedPnachCheat {
-            id: format!("cb-{}", &input_sha256[..16]),
+            id: managed_id(version, &input_sha256),
             name: name.to_string(),
             description: Some(format!(
                 "Translated from {} codes (source sha256 {})",
@@ -567,6 +576,18 @@ fn preview_with_cipher(
         records,
         outcome,
     })
+}
+
+/// The same text read as another version decrypts to different patch lines,
+/// so the version is part of the managed id.
+fn managed_id(version: Ps2CodebreakerVersion, input_sha256: &str) -> String {
+    let digest = Sha256::digest(format!("{}\n{input_sha256}", version.label()).as_bytes());
+    let hex = digest
+        .iter()
+        .take(8)
+        .map(|byte| format!("{byte:02x}"))
+        .collect::<String>();
+    format!("cb-{hex}")
 }
 
 fn parse_lines(input: &str) -> Result<Vec<ParsedLine>, Ps2CodebreakerError> {
@@ -805,24 +826,11 @@ fn classify_records(records: &mut [Ps2CodebreakerRecord]) {
             Err(reason) => Ps2CodebreakerRole::Refused { reason },
         };
     }
-    check_whole_sequence(records, remaining_continuations);
+    check_whole_sequence(records);
 }
 
 /// Sequence-level checks that no single line can show.
-fn check_whole_sequence(records: &mut [Ps2CodebreakerRecord], missing_continuations: usize) {
-    if missing_continuations > 0
-        && let Some(last_head) = records.iter_mut().rev().find(|record| {
-            !matches!(
-                record.role,
-                Ps2CodebreakerRole::Continuation { .. } | Ps2CodebreakerRole::NotDecrypted
-            )
-        })
-        && !matches!(last_head.role, Ps2CodebreakerRole::Refused { .. })
-    {
-        last_head.role = Ps2CodebreakerRole::Refused {
-            reason: Ps2CodebreakerRefusal::TruncatedCode,
-        };
-    }
+fn check_whole_sequence(records: &mut [Ps2CodebreakerRecord]) {
     // PNACH applies lines in order like the device does, so a repeated
     // address is only safe when every write to it agrees.
     let mut seen: Vec<(String, String)> = Vec::new();

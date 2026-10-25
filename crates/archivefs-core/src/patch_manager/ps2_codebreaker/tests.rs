@@ -518,12 +518,14 @@ fn sequence_level_checks_catch_conflicts_and_truncation() {
         "identical repeats do not conflict"
     );
 
+    // A cut-off multi-line code is refused at its head record.
     let truncated = preview(V1_TRUNCATED_SLIDE, Ps2CodebreakerVersion::V1ToV6);
     assert_refused(&truncated);
-    assert!(
-        refusals(&truncated).contains(&Ps2CodebreakerRefusal::NotDirectWrite {
+    assert_eq!(
+        refusals(&truncated),
+        [Ps2CodebreakerRefusal::NotDirectWrite {
             family: Ps2CodebreakerFamily::Slide
-        }) || refusals(&truncated).contains(&Ps2CodebreakerRefusal::TruncatedCode)
+        }]
     );
 }
 
@@ -903,4 +905,79 @@ fn only_a_clean_single_line_type_nine_is_a_hook() {
     ] {
         assert!(!is_hook(address), "{address:08X}");
     }
+}
+
+#[test]
+fn acknowledged_line_numbers_count_blank_lines_and_ignore_crlf_in_every_mode() {
+    for (input, version, hook_line) in [
+        (HOOK_V1, Ps2CodebreakerVersion::V1ToV6, 3),
+        (HOOK_V7_SETUP, Ps2CodebreakerVersion::V7WithSetupLine, 4),
+        (HOOK_V7_COMMON, Ps2CodebreakerVersion::V7CommonKey, 3),
+    ] {
+        let padded = format!("\r\n\r\n{}", input.replace('\n', "\r\n"));
+        let pending = preview_ack(&padded, version, &[]);
+        let Ps2CodebreakerOutcome::AcknowledgementRequired { excluded_hooks, .. } =
+            &pending.outcome
+        else {
+            panic!("{:?}", pending.outcome);
+        };
+        assert_eq!(excluded_hooks[0].line, hook_line);
+        // The reported line number is the pasted line number.
+        assert_eq!(
+            padded.lines().nth(hook_line - 1).map(str::trim),
+            Some(excluded_hooks[0].original.as_str())
+        );
+        assert!(matches!(
+            preview_ack(&padded, version, &[hook_line]).outcome,
+            Ps2CodebreakerOutcome::Translatable { .. }
+        ));
+    }
+    // A lone carriage return is not a line separator here.
+    assert_eq!(
+        preview_ps2_codebreaker(
+            "2AFF014C 2411FFFF\r0AF344DE 000000FF",
+            Ps2CodebreakerVersion::V1ToV6,
+            "x",
+            &verified(),
+            None,
+            &[],
+        ),
+        Err(Ps2CodebreakerError::MalformedLine { line: 1 })
+    );
+}
+
+#[test]
+fn acknowledging_a_list_without_hooks_is_an_error() {
+    assert_eq!(
+        preview_ps2_codebreaker(
+            V1_DIRECT,
+            Ps2CodebreakerVersion::V1ToV6,
+            "x",
+            &verified(),
+            None,
+            &[1],
+        ),
+        Err(Ps2CodebreakerError::UnexpectedAcknowledgement)
+    );
+}
+
+#[test]
+fn the_managed_id_depends_on_the_version() {
+    let id = |version| match preview(V7_COMMON_DIRECT, version).outcome {
+        Ps2CodebreakerOutcome::Translatable { cheat, .. } => cheat.id,
+        other => panic!("{other:?}"),
+    };
+    let first = id(Ps2CodebreakerVersion::V7CommonKey);
+    assert!(first.starts_with("cb-") && first.len() == 19);
+    assert_eq!(first, id(Ps2CodebreakerVersion::V7CommonKey));
+    // The same text under a version that also translates gets another id.
+    let other = match preview(V1_DIRECT, Ps2CodebreakerVersion::V1ToV6).outcome {
+        Ps2CodebreakerOutcome::Translatable { cheat, .. } => cheat.id,
+        other => panic!("{other:?}"),
+    };
+    assert_ne!(first, other);
+    assert_ne!(
+        managed_id(Ps2CodebreakerVersion::V1ToV6, "abc"),
+        managed_id(Ps2CodebreakerVersion::V7CommonKey, "abc")
+    );
 }
