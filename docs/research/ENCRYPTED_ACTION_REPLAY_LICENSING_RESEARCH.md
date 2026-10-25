@@ -1,11 +1,18 @@
 # Encrypted GameCube/Wii Action Replay Decryption — Licensing Research
 
-Status: research only. This document was originally written as pure research
+Status: research only. Reconciled with main on 2026-10-25 (section 0). This document was originally written as pure research
 with no branch, commit, or PR created; it was subsequently preserved on the
 `research/encrypted-action-replay-licensing` branch as PR #30 (draft). This
 revision reverifies the findings against current sources as of main SHA
 `ca2236110b4210f75d8cf223d8ec1a7ac556ff33` — no code has been added or changed
 in this repository as a result of this research; it remains draft-only.
+
+> **Reconciled 2026-10-25 against `origin/main` `fdff2a86`.** The premise of the
+> earlier revisions of this report, that EmuWiz has no GameCube dash-format
+> Action Replay decryptor and that the cipher's constants have no independent
+> source, is **out of date**. Read section 0 first. Sections 1-14 are kept as
+> the record of the original GPL-provenance research; statements that section 0
+> contradicts are marked *superseded*.
 
 Scope: determine whether EmuWiz (MIT licensed) can legally and safely implement
 support for encrypted GameCube/Wii Action Replay (`XXXX-XXXX-XXXXX`, a
@@ -28,7 +35,95 @@ licensed.
 
 ---
 
-## 1. Executive conclusion
+---
+
+## 0. Reconciliation with the decoder already merged to main
+
+### 0.1 What main contains
+
+`crates/archivefs-core/src/patch_manager/gamecube_wii_ar_decrypt.rs` was merged
+on 2026-10-03 (`461ff87a`, "integrate verified GameCube AR decoding") and is
+consumed by `bsfree_gamecube.rs`. Its research and integration notes are
+`docs/research/GC_WII_AR_DASH_DECRYPTOR.md` and
+`docs/research/GAMECUBE_AR_PRODUCTION_INTEGRATION.md`. This report was written
+without reference to them; they were not on the branch it was based on.
+
+### 0.2 Provenance claimed by the merged decoder `[FACT - read from the repository]`
+
+- The cipher is **standard single DES** with the fixed key
+  `341C849EFDA4B67B`: reverse the four bytes of each 32-bit word of the
+  8-byte block, DES-decrypt, reverse each output word's bytes. The module's
+  tables are the plain FIPS 46-3 `IP`, `FP`, `E`, `P`, `PC1`, `PC2` and eight
+  `SBOXES`, not Dolphin's pre-combined `table0-7`, and its key schedule and
+  rounds are written directly from the standard.
+- The alphabet is `0123456789ABCDEFGHJKMNPQRTUVWXYZ`; the checksum is
+  CRC-16/KERMIT over the decoded words, with a parity check per line.
+- Dolphin `ARDecrypt.cpp` (pinned at `a475aba7...`, GPL-2.0-or-later) was used
+  only as a behavioural oracle in temporary research files and is not in the
+  tree. The research note says plainly that this is **not** a separately
+  staffed clean room and not a legal opinion.
+- Four independently published encrypted/decrypted sets (EnHacklopedia, the
+  GCNcrypt README example, a Metagames forum post, a Mogelpower forum post)
+  match both the pinned Dolphin decoder and plain OpenSSL DES; encryption in
+  the reverse direction reconstructs every original line; 512 deterministic
+  random blocks agree between the implementations.
+
+### 0.3 What the merged decoder supports and refuses
+
+Supported: GameCube only, fixed-key, unexpanded verifier records, producing
+canonical raw AR text that the existing BSFree GameCube classifier, opcode,
+device and identity gates then judge.
+Refused: Wii-native dash encryption (no independent vector exists), expanded
+or alternate-seed verifiers, reserved flag/region/unused bits, truncated sets,
+mixed raw and encrypted input, non-ASCII input, inputs over 16 KiB or 256
+lines, parity or checksum failure, and master verifiers (kept visible to the
+downstream safety gate).
+
+### 0.4 Which findings below are superseded
+
+| Earlier statement | Status |
+| --- | --- |
+| Section 1/4.1: no independent implementation or specification of the scheme exists | **Superseded in part.** Standard DES plus a published key reproduces four independent vectors. There is still no *permissively licensed third-party implementation* to adopt; EmuWiz wrote its own. |
+| Section 6: `gentable0-3`/`gensubtable` are opaque scheme constants with no independent source | **Superseded.** Those are Dolphin's implementation detail (pre-combined DES tables and a seed schedule). The merged decoder does not use them; the only scheme-specific constants it needs are the 64-bit key and the alphabet. |
+| Section 7: clean-room derivation from vectors is the recommended path | **Largely done**, without the separation of roles that section describes. |
+| Section 10-11: "provenance must be resolved before an MIT-native implementation" | **Overtaken by events.** The implementation exists on main; the question is now whether to leave it, strengthen it, or seek permission. |
+| Sections 2, 3, 4.1 facts about Dolphin, GCNcrypt and omniconvert licences | **Still valid.** |
+
+### 0.5 Remaining legal and provenance uncertainty `[INTERPRETATION - not legal advice]`
+
+1. **The key and alphabet are factual format parameters**, but the only places
+   they were found written down are Parasyte's GCNcrypt (no licence grant) and
+   its GPL descendants. Facts and functional parameters are not generally
+   copyrightable, yet that has not been tested for this case, and no permission
+   was sought.
+2. **The decoder author consulted GPL source** as an oracle. Using behaviour
+   observed from a GPL program to check an independent implementation is
+   different from copying its expression, but without a staffed clean room the
+   independence rests on the author's account and on the code itself, which
+   uses the standard's tables and a different structure from Dolphin's.
+3. **Datel's rights** in the device scheme were not investigated; no patent
+   was looked for beyond this report's earlier absence-of-evidence search.
+4. **Wii** remains unestablished and unsupported.
+
+None of this is a finding of non-compliance. Nothing here claims legal
+clearance.
+
+### 0.6 Options for the owner
+
+| Option | Effect |
+| --- | --- |
+| A. Accept the merged decoder as is, with section 0.5 recorded as the known residual risk | No code change. |
+| B. Also send the Parasyte enquiry in section 12 (it should now ask about the *key and alphabet*, not tables) | Could convert uncertainty into permission; needs owner sign-off before sending. |
+| C. Commission a documented second review of the decoder against the standard (no Dolphin source), recording who saw what | Strengthens the independence record. |
+| D. Disable the decoder until A-C are resolved | Reverts to browse-only; removes shipped behaviour. |
+
+Recommendation: A now, B when convenient, C if the owner wants a stronger
+record. This PR is documentation only and changes no code. The instruction
+not to implement another GameCube decryptor or copy Dolphin source stands.
+
+---
+
+## 1. Executive conclusion (original, partly superseded by section 0)
 
 **YELLOW — a potential path exists, but permission/provenance must be resolved
 before an MIT-native implementation.**
@@ -431,7 +526,8 @@ remains YELLOW, unchanged from the original research.**
 
 ---
 
-**Verdict: YELLOW.**
+**Original verdict: YELLOW.** (Now: a decoder exists on main; see section 0 for the residual
+uncertainty and options.)
 
 Potential path exists (DES-based structure is public; the author is known and
 likely approachable; clean-room derivation from independent test vectors is
