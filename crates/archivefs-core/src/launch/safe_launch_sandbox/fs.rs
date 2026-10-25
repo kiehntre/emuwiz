@@ -16,7 +16,7 @@ fn name(value: &OsStr) -> io::Result<CString> {
     CString::new(value.as_bytes()).map_err(io::Error::other)
 }
 
-pub(super) fn child(parent: &File, value: &OsStr, flags: i32) -> io::Result<File> {
+pub(crate) fn child(parent: &File, value: &OsStr, flags: i32) -> io::Result<File> {
     let value = name(value)?;
     // SAFETY: parent remains live, name is NUL terminated, and the returned
     // descriptor is uniquely owned. O_NONBLOCK prevents a substituted FIFO
@@ -73,7 +73,7 @@ pub(super) fn cleanup_directory(parent: &File, value: &OsStr) -> io::Result<File
     Ok(unsafe { File::from_raw_fd(fd as i32) })
 }
 
-pub(super) fn absolute(path: &Path, is_directory: bool) -> io::Result<File> {
+pub(crate) fn absolute(path: &Path, is_directory: bool) -> io::Result<File> {
     if !path.is_absolute()
         || path
             .as_os_str()
@@ -121,7 +121,7 @@ pub(super) fn private(file: &File, is_directory: bool) -> io::Result<()> {
     Ok(())
 }
 
-pub(super) fn mkdir(parent: &File, value: &OsStr, allow_existing: bool) -> io::Result<File> {
+pub(crate) fn mkdir(parent: &File, value: &OsStr, allow_existing: bool) -> io::Result<File> {
     let value_c = name(value)?;
     // SAFETY: fd and name live through call; mode is deliberately private.
     let result = unsafe { libc::mkdirat(parent.as_raw_fd(), value_c.as_ptr(), 0o700) };
@@ -136,7 +136,7 @@ pub(super) fn mkdir(parent: &File, value: &OsStr, allow_existing: bool) -> io::R
     Ok(file)
 }
 
-pub(super) fn create(parent: &File, value: &OsStr) -> io::Result<File> {
+pub(crate) fn create(parent: &File, value: &OsStr) -> io::Result<File> {
     child(parent, value, libc::O_RDWR | libc::O_CREAT | libc::O_EXCL)
 }
 
@@ -148,7 +148,7 @@ pub(super) fn lock(file: &File) -> io::Result<()> {
     Ok(())
 }
 
-pub(super) fn entries(dir: &File, limit: usize) -> io::Result<Vec<OsString>> {
+pub(crate) fn entries(dir: &File, limit: usize) -> io::Result<Vec<OsString>> {
     // A fresh open gives an independent directory offset (dup would share it).
     let dot = c".";
     // SAFETY: dir is live; fdopendir takes ownership only on success.

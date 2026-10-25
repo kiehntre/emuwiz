@@ -752,6 +752,11 @@ pub(crate) fn featured_typed_launch_action(
     retroarch_launch_state: &mut launch_readiness_page::RetroArchLaunchState,
     enabled: bool,
 ) -> bool {
+    if matches!(request, launch_readiness_page::TypedLaunchRequest::AmigaWHDLoad(request)
+        if request.profile.emulator == archivefs_core::patch_manager::AmigaEmulatorKind::FsUae)
+    {
+        ui.small("Disposable WHDLoad session: new saves are discarded after exit.");
+    }
     match request {
         launch_readiness_page::TypedLaunchRequest::RetroArch(request, _) => {
             featured_retroarch_launch_action(ui, retroarch_launch_state, request, enabled)

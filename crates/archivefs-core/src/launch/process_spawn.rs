@@ -372,7 +372,7 @@ fn pidfd_has_exited(fd: i32) -> std::io::Result<bool> {
 /// - No timeout, no automatic kill: see [`WatchedProcess`]'s own doc
 ///   comment.
 pub fn spawn_watched_process(command: &PreparedProcessCommand) -> std::io::Result<WatchedProcess> {
-    spawn_watched_process_inner(command, &[], None, None, None, false)
+    spawn_watched_process_inner(command, &[], None, None, None, false, None)
 }
 
 /// Like [`spawn_watched_process`] but the child starts with an EMPTY
@@ -386,7 +386,7 @@ pub fn spawn_watched_process(command: &PreparedProcessCommand) -> std::io::Resul
 pub(crate) fn spawn_watched_process_closing_fds(
     command: &PreparedProcessCommand,
 ) -> std::io::Result<WatchedProcess> {
-    spawn_watched_process_inner(command, &[], None, None, None, true)
+    spawn_watched_process_inner(command, &[], None, None, None, true, None)
 }
 
 /// Like [`spawn_watched_process`] but sets `environment` on the child only
@@ -396,7 +396,7 @@ pub(crate) fn spawn_watched_process_with_environment(
     command: &PreparedProcessCommand,
     environment: &[(std::ffi::OsString, std::ffi::OsString)],
 ) -> std::io::Result<WatchedProcess> {
-    spawn_watched_process_inner(command, environment, None, None, None, false)
+    spawn_watched_process_inner(command, environment, None, None, None, false, None)
 }
 
 /// Opt-in preservation workspace seam. Legacy callers retain their exact
@@ -419,6 +419,28 @@ pub(crate) fn spawn_watched_process_isolated(
         Some(Box::new(on_start)),
         Some(Box::new(on_exit)),
         false,
+        None,
+    )
+}
+
+/// Pin a validated native ELF descriptor while retaining the original argv[0]
+/// for emulator resource discovery. The caller holds the descriptor through exec.
+#[cfg(target_os = "linux")]
+pub(crate) fn spawn_watched_process_private_pinned(
+    command: &PreparedProcessCommand,
+    environment: &[(std::ffi::OsString, std::ffi::OsString)],
+    executable: &std::fs::File,
+    on_exit: impl FnOnce(&ProcessExitReport) + Send + 'static,
+) -> std::io::Result<WatchedProcess> {
+    use std::os::fd::AsRawFd;
+    spawn_watched_process_inner(
+        command,
+        environment,
+        None,
+        None,
+        Some(Box::new(on_exit)),
+        true,
+        Some(executable.as_raw_fd()),
     )
 }
 
@@ -431,11 +453,25 @@ fn spawn_watched_process_inner(
     on_start: Option<Box<dyn FnOnce(u32)>>,
     on_exit: Option<ExitCallback>,
     close_inherited_fds: bool,
+    pinned_executable: Option<i32>,
 ) -> std::io::Result<WatchedProcess> {
     // Each test-only ETXTBSY retry needs a fresh command and ownership
     // channel, so a failed exec's descriptor can never name a later child.
     let (mut child, stop_identity) = spawn_child(|| {
-        let mut process = Command::new(&command.executable);
+        #[cfg(target_os = "linux")]
+        let mut process = if let Some(fd) = pinned_executable {
+            use std::os::unix::process::CommandExt;
+            let mut process = Command::new(format!("/proc/self/fd/{fd}"));
+            process.arg0(&command.executable);
+            process
+        } else {
+            Command::new(&command.executable)
+        };
+        #[cfg(not(target_os = "linux"))]
+        let mut process = {
+            let _ = pinned_executable;
+            Command::new(&command.executable)
+        };
         process.args(&command.arguments);
         if close_inherited_fds {
             process.env_clear();

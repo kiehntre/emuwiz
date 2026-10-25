@@ -5,7 +5,7 @@
 //! Nothing here marks an emulator read-only, parses media, exports saves, or
 //! changes existing adapters. Preparation must happen off the GUI render thread.
 
-mod fs;
+pub(crate) mod fs;
 #[cfg(test)]
 mod tests;
 
