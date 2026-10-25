@@ -223,6 +223,93 @@ fn unknown_empty_and_unsupported_selections_do_not_prepare_commands() {
     assert!(!f.lab.path.with_file_name("args").exists());
 }
 
+fn render_panel(input: &LaunchReadinessInput, state: &mut StandaloneLaunchState) {
+    let ctx = egui::Context::default();
+    let _ = ctx.run(egui::RawInput::default(), |ctx| {
+        egui::CentralPanel::default().show(ctx, |ui| {
+            show_launch_readiness_panel(
+                ui,
+                input,
+                &mut Default::default(),
+                &mut Default::default(),
+                &mut Default::default(),
+                state,
+                &mut Default::default(),
+            );
+        });
+    });
+}
+
+#[test]
+fn two_vice_cards_do_not_clear_the_first_cards_selection_each_frame() {
+    let f = fixture("POKE $C000,42");
+    let second = f.lab.path.with_file_name("second-bin").join("x64sc");
+    fs::create_dir(second.parent().unwrap()).unwrap();
+    fs::copy(&f.request.launch.expected_executable, &second).unwrap();
+    let roots = ViceProfileDiscoveryRoots {
+        explicit_executables: vec![f.request.launch.expected_executable.clone(), second],
+        path_env: None,
+        ..Default::default()
+    };
+    let context = Context::inspect_with(
+        f.lab.path.clone(),
+        f.lab.evidence().unwrap(),
+        roots,
+        &f.request.executable_sha256,
+    )
+    .unwrap();
+    assert_eq!(context.profiles.len(), 2);
+    let mut choice = chooser(&f);
+    choice.enabled = true;
+    choice.selected.insert(0);
+    let mut state = StandaloneLaunchState {
+        vice_trainers: choice,
+        ..Default::default()
+    };
+    let input = super::super::tests::input(context);
+    for _ in 0..2 {
+        render_panel(&input, &mut state);
+    }
+    assert!(state.vice_trainers.enabled);
+    assert_eq!(state.vice_trainers.selected, BTreeSet::from([0]));
+}
+
+#[test]
+fn leaving_the_supported_lane_revokes_trainer_approval() {
+    let f = fixture("POKE $C000,42");
+    let mut choice = chooser(&f);
+    choice.enabled = true;
+    choice.approved = true;
+    choice.selected.insert(0);
+    let mut state = StandaloneLaunchState {
+        vice_trainers: choice,
+        ..Default::default()
+    };
+    render_panel(&LaunchReadinessInput::IdentityUnknown, &mut state);
+    assert!(
+        !state.vice_trainers.enabled
+            && !state.vice_trainers.approved
+            && state.vice_trainers.selected.is_empty()
+    );
+}
+
+fn assert_shared_refusal(session: CheatRuntimeSession<WatchedProcess>, f: &Fixture) {
+    let mut state = StandaloneLaunchState {
+        tracked: Some((
+            f.lab.path.clone(),
+            "vice".into(),
+            StandaloneLaunchStage::Running(StandaloneProcess::ViceTrainers(Box::new(session))),
+        )),
+        ..Default::default()
+    };
+    state.poll();
+    assert!(!state.is_active());
+    assert!(
+        state.failure_detail().is_some_and(|e| !e.is_empty()),
+        "canonical refusal must reach Activity/attempt failure reporting"
+    );
+}
+
 fn frame(
     ctx: &egui::Context,
     chooser: &mut Chooser,
@@ -427,6 +514,7 @@ fn unsafe_workspace_root_produces_refusal_receipt_and_no_process() {
     assert_eq!(phase_label(&session), "Trainer launch refused");
     assert_eq!(session.receipt().cleanup, CleanupOutcome::NotNeeded);
     assert!(!f.lab.path.with_file_name("args").exists());
+    assert_shared_refusal(session, &f);
 }
 
 #[test]
@@ -456,4 +544,5 @@ fn trainer_changed_after_materialisation_is_refused_at_final_handoff() {
         fs::read_to_string(f.lab.path.with_extension("pok")).unwrap(),
         "POKE $C000,7"
     );
+    assert_shared_refusal(session, &f);
 }

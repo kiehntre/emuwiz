@@ -36,7 +36,7 @@ fn fixture(exit: i32) -> Fixture {
     assert_eq!(context.profiles.len(), 1);
     Fixture { lab, context }
 }
-fn input(context: Context) -> LaunchReadinessInput {
+pub(super) fn input(context: Context) -> LaunchReadinessInput {
     let (identity, content) = context.inputs(&CanonicalIdentityStatus::Unknown).unwrap();
     let environment = RetroArchEnvironmentReport {
         format_version: 2,
