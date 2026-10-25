@@ -572,7 +572,10 @@ fn imported_artifact_digest_names_the_exact_parsed_snapshot() {
     let source = import_tosec_dat(&path).unwrap();
     assert_eq!(
         source.artifact_sha256,
-        format!("{:x}", Sha256::digest(TOSEC_LOGIQX.as_bytes()))
+        Sha256::digest(TOSEC_LOGIQX.as_bytes())
+            .iter()
+            .map(|byte| format!("{byte:02x}"))
+            .collect::<String>()
     );
     assert_eq!(source.dat.source.file_path, path.to_string_lossy());
     assert_eq!(source.system_name, "TOSEC - ZX Spectrum - Games - TZX");
