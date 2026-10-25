@@ -1203,6 +1203,28 @@ fn show_attempt(ui: &mut egui::Ui, attempt: &Attempt) -> Option<ReadinessAction>
 /// identity is "not confirmed". Launch is deliberately unchanged: it still
 /// requires the file's own identity evidence (and re-reads the file when it
 /// starts), so say exactly that instead of contradicting the verified status.
+/// A Ready projection whose RetroArch launch is withheld for an installation
+/// problem (an unusable saved choice, or a program that changed since the
+/// last check) is not Ready: say why and route to Emulator Setup. Game-level
+/// refusals are left to the projection.
+pub(crate) fn note_retroarch_installation_refusal(
+    summary: &mut GameReadinessSummary,
+    refusal: &crate::launch_readiness_page::RetroArchRequestRefusal,
+) {
+    if !refusal.installation_problem()
+        || !matches!(
+            summary.status,
+            ReadinessPresentationState::Ready | ReadinessPresentationState::ReadyWithWarnings
+        )
+    {
+        return;
+    }
+    summary.status = ReadinessPresentationState::NeedsEmulator;
+    summary.headline = "RetroArch can't be used as chosen".into();
+    summary.explanation = refusal.message();
+    summary.primary_action = Some(ReadinessAction::SetUpEmulator);
+}
+
 pub(crate) fn note_catalogue_verified(summary: &mut GameReadinessSummary) {
     if summary.status == ReadinessPresentationState::NeedsIdentityReview
         && summary.identity == IdentitySummary::NeedsReview
@@ -1560,6 +1582,78 @@ mod tests {
             summary.primary_action,
             Some(ReadinessAction::ChooseEmulator)
         );
+    }
+
+    /// Job #22: an installation refusal withdraws Ready and routes to Setup
+    /// with its own reason; game-format refusals never do.
+    #[test]
+    fn installation_refusal_withdraws_ready_but_game_refusals_do_not() {
+        use crate::launch_readiness_page::RetroArchRequestRefusal as R;
+        use crate::retroarch_installation_setup::SelectionIssue;
+        use archivefs_core::emulator_environment::retroarch::installation_selection::SelectedExecutableProblem as P;
+        let ready = || {
+            project(
+                &plan(vec![candidate(
+                    LaunchReadiness::Ready,
+                    FirmwareReadiness::NotRequired,
+                    vec![],
+                    vec![],
+                    CandidatePreference::SoleEligible,
+                    Some("/game.iso"),
+                )]),
+                ReadinessFreshness::Current,
+            )
+        };
+        let selection = |problem| {
+            R::Installation(SelectionIssue::Unusable {
+                path: "/chosen/retroarch".into(),
+                problem,
+            })
+        };
+        let mut messages = Vec::new();
+        for refusal in [
+            selection(P::Missing),
+            selection(P::NotExecutable),
+            selection(P::FlatpakLauncher),
+            selection(P::UnsupportedProgram),
+            selection(P::NotDiscovered),
+            R::Installation(SelectionIssue::Unreadable("not a regular file".into())),
+            R::ProgramChanged("/usr/games/retroarch".into()),
+        ] {
+            let mut summary = ready();
+            assert_eq!(summary.status, ReadinessPresentationState::Ready);
+            note_retroarch_installation_refusal(&mut summary, &refusal);
+            assert_eq!(
+                summary.status,
+                ReadinessPresentationState::NeedsEmulator,
+                "{refusal:?}"
+            );
+            assert_eq!(summary.primary_action, Some(ReadinessAction::SetUpEmulator));
+            assert_eq!(summary.explanation, refusal.message());
+            messages.push(refusal.message());
+        }
+        assert!(messages[0].contains("no longer there"));
+        assert!(messages[2].contains("Flatpak"));
+        let mut distinct = messages.clone();
+        distinct.sort();
+        distinct.dedup();
+        assert_eq!(distinct.len(), messages.len(), "each reason is told apart");
+        for refusal in [
+            R::NotPlainFile,
+            R::MultiDisc,
+            R::NeedsMount,
+            R::NotRetroArch,
+        ] {
+            assert!(!refusal.installation_problem());
+            let mut summary = ready();
+            note_retroarch_installation_refusal(&mut summary, &refusal);
+            assert_eq!(
+                summary.status,
+                ReadinessPresentationState::Ready,
+                "{refusal:?}"
+            );
+            assert!(!refusal.message().contains("RetroArch program you chose"));
+        }
     }
 
     #[test]

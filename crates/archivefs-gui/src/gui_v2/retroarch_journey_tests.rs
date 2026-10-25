@@ -229,7 +229,7 @@ fn child_entry() {
     let fixture = VerifiedGameFixture::reopen(&root).unwrap();
     let cheats = root.join("cheats");
     let record = root.join("retroarch/record");
-    if scenario.starts_with("selected-") {
+    if scenario.starts_with("selected-") || scenario.starts_with("truth-") {
         let selected = root.join("second/retroarch");
         let context = eframe::egui::Context::default();
         let mut picker = crate::retroarch_installation_setup::InstallationPicker::default();
@@ -250,7 +250,7 @@ fn child_entry() {
     }
     let mut blue = Blue::open(&fixture);
     blue.wait_for_readiness();
-    if scenario.starts_with("selected-") {
+    if scenario.starts_with("selected-") || scenario.starts_with("truth-") {
         assert_eq!(
             blue.discovered_executables(),
             vec![root.join("second/retroarch").display().to_string()]
@@ -285,6 +285,9 @@ fn child_entry() {
         }
         "save-stale" | "save-missing" | "save-write-failed" => {
             installation_save::refused_save(&mut blue, &fixture, &root, &scenario);
+        }
+        truth if truth.starts_with("truth-") => {
+            selection_truth::run(&mut blue, &fixture, &root, truth);
         }
         "plain" | "selected-plain" => {
             blue.guard_executables(&root);
@@ -974,5 +977,6 @@ fn find_file(dir: &Path, name: &str) -> Option<PathBuf> {
 
 mod cartridge_cue;
 mod installation_save;
+mod selection_truth;
 
 mod fuse_snapshot;
