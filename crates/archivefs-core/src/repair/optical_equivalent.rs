@@ -230,6 +230,15 @@ fn quarantine_destination(
         .join(name))
 }
 
+fn optical_proposal_id(content: &str, path: &Path) -> Result<RepairProposalId, String> {
+    let bucket = content
+        .get(..16)
+        .ok_or("optical content identity is incomplete")?;
+    let digest = super::identity::content_path_digest(content, path);
+    RepairProposalId::new(format!("optical-equivalent-{bucket}-sha256-{digest}"))
+        .ok_or_else(|| "could not create optical proposal id".to_string())
+}
+
 fn build_optical_plan(
     group: &OpticalEquivalentGroup,
     root: &Path,
@@ -243,14 +252,7 @@ fn build_optical_plan(
         }
         let destination = quarantine_destination(root, group, &file.path)?;
         let identity = capture_identity(&file.path).map_err(|error| error.to_string())?;
-        let path_crc =
-            crate::identity_source::hashing::Crc32::of(file.path.to_string_lossy().as_bytes());
-        let id = RepairProposalId::new(format!(
-            "optical-equivalent-{}-{}",
-            &group.canonical_sha256[..16],
-            path_crc
-        ))
-        .ok_or_else(|| "could not create optical proposal id".to_string())?;
+        let id = optical_proposal_id(&group.canonical_sha256, &file.path)?;
         proposals.push(RepairProposal {
             id,
             action: RepairAction::MovePath { destination },

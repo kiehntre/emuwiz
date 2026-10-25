@@ -48,7 +48,7 @@ use crate::dat::sources::audit_run::{
 use crate::dat::sources::now_unix;
 use crate::safe_read::TrustedRoots;
 
-use super::adapter::repair_proposal_from_suggested_rename;
+use super::adapter::{dat_repair_plan_id, repair_proposal_from_suggested_rename};
 use super::duplicate_scan::{
     DuplicateNeedsReviewMember, DuplicateScanAccounting, plan_duplicate_quarantine_from_rename_plan,
 };
@@ -200,7 +200,8 @@ pub struct ReportCounts {
     pub ignored_ancillary: usize,
     /// `dat_candidates` minus every candidate this report already accounts
     /// for elsewhere (already-canonical, a safe repair, needs-review,
-    /// blocked, or unsupported). Purely arithmetic over counts this same
+    /// blocked, unsupported, or resolved by verified quarantine). Arithmetic
+    /// over counts this same
     /// function already computed - not a new classification pass - so it
     /// stays `0` whenever the existing buckets are exhaustive, and only ever
     /// surfaces a real accounting gap rather than fabricating one.
@@ -239,6 +240,11 @@ pub struct ReportCounts {
     /// Members skipped because content proof refused for any other reason.
     #[serde(default)]
     pub duplicate_content_mismatch_refused: usize,
+    /// Emitted quarantine candidates refused by global Core plan validation.
+    /// Separate from content-proof skips and DAT classifications; counted once
+    /// per proposal even when several conflicts explain the refusal.
+    #[serde(default)]
+    pub duplicate_plan_refused: usize,
 }
 
 /// The categorised, non-executable half of a scan report.
@@ -267,12 +273,11 @@ pub struct LibraryRepairReport {
     /// Additive field, defaults to empty for an old saved plan.
     #[serde(default)]
     pub ignored_ancillary_by_extension: std::collections::BTreeMap<String, usize>,
-    /// One row per member of a duplicate-quarantine candidate group that had
-    /// no unique objective survivor
-    /// ([`ReportCounts::duplicate_quarantine_needs_review`]) - never an
-    /// executable proposal, but never silently dropped either. `reason` is
-    /// [`super::quarantine::QuarantinePlanRefusal::NeedsReview`]'s own
-    /// explanation, verbatim.
+    /// Duplicate-quarantine diagnostics: unresolved survivor groups,
+    /// individual content/identity/planning skips, and global plan refusals.
+    /// Reasons are preserved from the existing proof/planning layers. Counters
+    /// distinguish group ambiguity, same-object skips, proof skips and plan
+    /// refusals; this list itself never authorizes an executable proposal.
     ///
     /// Additive field, defaults to empty for an old saved plan.
     #[serde(default)]
@@ -435,7 +440,7 @@ fn fnv1a64(bytes: &[u8]) -> u64 {
 /// for whole outer archives. A loose-file rename is just as identity-bound at
 /// execution time, so this captures each loose source's identity here — while
 /// the file is still the exact object the audit verified — never later.
-fn repair_plan_from_scan_rename_plan(
+pub(super) fn repair_plan_from_scan_rename_plan(
     plan: &RenamePlan,
     created_at_unix: u64,
     trusted: &TrustedRoots,
@@ -452,7 +457,13 @@ fn repair_plan_from_scan_rename_plan(
             continue;
         };
         if repair.expected_source_identity.is_none() {
-            repair.expected_source_identity = capture_identity(&proposal.source_path).ok();
+            match capture_identity(&proposal.source_path) {
+                Ok(identity) => repair.expected_source_identity = Some(identity),
+                Err(error) => repair.blockers.push(format!(
+                    "DAT source identity capture failed for '{}': {error}",
+                    proposal.source_path.display()
+                )),
+            }
         }
         // The adapter carries the rename plan's policy explanations verbatim; a
         // single exact match has none, so fill in a readable reason here.
@@ -486,12 +497,7 @@ fn repair_plan_from_scan_rename_plan(
         plan_duplicate_quarantine_from_rename_plan(plan, scan_root, trusted, Some(cancel));
     proposals.extend(quarantine_proposals);
 
-    let id = RepairPlanId::new(format!(
-        "dat-{}-{}",
-        plan.source_id.replace(['/', '\\'], "_"),
-        plan.generation
-    ))
-    .unwrap_or_else(|| RepairPlanId::new("dat-rename").expect("static id"));
+    let id = dat_repair_plan_id(plan);
     let repair_plan = build_repair_plan(
         id,
         plan.generation,
@@ -503,7 +509,7 @@ fn repair_plan_from_scan_rename_plan(
 }
 
 /// Builds the categorised report from the audit, the rename plan, and the
-/// executable repair plan. Pure: no filesystem access.
+/// executable repair plan. One read-only Core validation; no mutation or scan.
 pub fn build_library_repair_report(
     audit: &DatAuditOutcome,
     rename_plan: &RenamePlan,
@@ -512,7 +518,20 @@ pub fn build_library_repair_report(
     duplicate_needs_review: &[DuplicateNeedsReviewMember],
 ) -> LibraryRepairReport {
     let mut report = LibraryRepairReport::default();
+    // All classifications/counts in this report share one Core validation
+    // observation, so filesystem changes between repeated checks cannot make
+    // a candidate both Safe and refused in the same report.
     let conflicts = super::plan::detect_plan_conflicts(&repair_plan.proposals);
+    let verified: Vec<_> = repair_plan
+        .proposals
+        .iter()
+        .filter(|proposal| {
+            proposal.actionable()
+                && !conflicts
+                    .iter()
+                    .any(|conflict| conflict.proposal_ids.contains(&proposal.id))
+        })
+        .collect();
 
     // Files encountered vs DAT-relevant vs ignored ancillary. Derived purely
     // from evidence the audit already produced - no new file walk, no new
@@ -573,14 +592,16 @@ pub fn build_library_repair_report(
     // never suppresses a `Conflict` source that has no such resolution, and
     // never touches `ProposalState::Blocked` (which
     // `duplicate_candidate_groups` never even considers a candidate).
-    let quarantine_superseded_sources: std::collections::HashSet<&Path> = repair_plan
-        .executable_proposals()
+    let quarantine_superseded_sources: std::collections::HashSet<&Path> = verified
+        .iter()
+        .copied()
         .filter(|proposal| proposal.is_duplicate_quarantine())
         .map(|proposal| proposal.source_path.as_path())
         .collect();
 
     // Per-file classification from the hardened rename plan. Only `Suggested`
     // proposals become executable; every other state is surfaced verbatim.
+    let mut quarantine_resolved_candidates = 0;
     for proposal in &rename_plan.proposals {
         match proposal.state {
             ProposalState::Suggested => {
@@ -596,6 +617,7 @@ pub fn build_library_repair_report(
                             .map(|conflict| {
                                 format!("{}: {}", conflict.kind.clone().label(), conflict.detail)
                             })
+                            .chain(repair.blockers.iter().cloned())
                             .collect()
                     })
                     .unwrap_or_default();
@@ -634,8 +656,10 @@ pub fn build_library_repair_report(
             ProposalState::Conflict
                 if quarantine_superseded_sources.contains(proposal.source_path.as_path()) =>
             {
-                // Resolved by a Safe duplicate-quarantine proposal for this
-                // exact source; see `quarantine_superseded_sources` above.
+                // Count this DAT candidate once as resolved. Other quarantine
+                // proposals may overlap AlreadyCanonical/other DAT buckets,
+                // so adding every quarantine move would double-count them.
+                quarantine_resolved_candidates += 1;
             }
             ProposalState::Conflict | ProposalState::Blocked => {
                 report.counts.blocked_repair += 1;
@@ -724,8 +748,9 @@ pub fn build_library_repair_report(
     // proposal it refused, e.g. a missing identity). `MovePath` proposals in
     // the same plan are duplicate-quarantine moves, accounted for separately
     // below so this count keeps its original, DAT-rename-only meaning.
-    report.counts.safe_repairs = repair_plan
-        .executable_proposals()
+    report.counts.safe_repairs = verified
+        .iter()
+        .copied()
         .filter(|proposal| matches!(proposal.action, RepairAction::RenamePath { .. }))
         .count();
 
@@ -733,8 +758,9 @@ pub fn build_library_repair_report(
     // DAT candidate/ancillary/unmatched bucket above.
     report.counts.duplicate_groups_examined = duplicate_accounting.groups_examined;
     report.counts.duplicate_groups_content_proven = duplicate_accounting.groups_content_proven;
-    report.counts.duplicate_quarantine_safe = repair_plan
-        .executable_proposals()
+    report.counts.duplicate_quarantine_safe = verified
+        .iter()
+        .copied()
         .filter(|proposal| proposal.is_duplicate_quarantine())
         .count();
     report.counts.duplicate_quarantine_needs_review = duplicate_accounting.quarantine_needs_review;
@@ -754,6 +780,33 @@ pub fn build_library_repair_report(
         })
         .collect();
 
+    let verified_ids: std::collections::HashSet<_> =
+        verified.iter().map(|proposal| &proposal.id).collect();
+    for proposal in repair_plan
+        .proposals
+        .iter()
+        .filter(|proposal| proposal.is_duplicate_quarantine())
+    {
+        if verified_ids.contains(&proposal.id) {
+            continue;
+        }
+        report.counts.duplicate_plan_refused += 1;
+        let reasons: Vec<_> = conflicts
+            .iter()
+            .filter(|conflict| conflict.proposal_ids.contains(&proposal.id))
+            .map(|conflict| format!("{}: {}", conflict.kind.clone().label(), conflict.detail))
+            .chain(proposal.blockers.iter().cloned())
+            .collect();
+        report.duplicate_needs_review.push(PlanItem {
+            path: proposal.source_path.to_string_lossy().into_owned(),
+            reason: if reasons.is_empty() {
+                "duplicate quarantine candidate is not safe to execute".into()
+            } else {
+                reasons.join("; ")
+            },
+        });
+    }
+
     // Purely arithmetic, over counts this function already finished
     // computing above: any DAT candidate not already accounted for by one of
     // the existing buckets. Not a new classification pass, so it cannot
@@ -764,7 +817,8 @@ pub fn build_library_repair_report(
         .saturating_add(report.counts.safe_repairs)
         .saturating_add(report.counts.needs_review)
         .saturating_add(report.counts.blocked_repair)
-        .saturating_add(report.counts.unsupported);
+        .saturating_add(report.counts.unsupported)
+        .saturating_add(quarantine_resolved_candidates);
     report.counts.unmatched_candidates = report.counts.dat_candidates.saturating_sub(accounted_for);
 
     report
@@ -868,7 +922,7 @@ impl std::error::Error for ApplySavedPlanError {}
 /// A saved plan is evidence, never permission. Every executable proposal it
 /// names must be independently reproduced by a fresh scan over the trusted
 /// inputs before anything may be executed. Any mismatch — in scan root, DAT,
-/// generation, or any proposal's source, destination, action, or audited
+/// generation, or any proposal's ID, source, destination, action, or audited
 /// identity — refuses.
 pub fn re_prove_saved_plan(
     saved: &LibraryRepairPlan,
@@ -902,7 +956,8 @@ pub fn re_prove_saved_plan(
         ));
     }
     for (saved_proposal, fresh_proposal) in saved_proposals.iter().zip(fresh_proposals.iter()) {
-        if saved_proposal.source_path != fresh_proposal.source_path
+        if saved_proposal.id != fresh_proposal.id
+            || saved_proposal.source_path != fresh_proposal.source_path
             || saved_proposal.action != fresh_proposal.action
             || saved_proposal.expected_source_identity != fresh_proposal.expected_source_identity
             || saved_proposal.survivor_path != fresh_proposal.survivor_path

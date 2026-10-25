@@ -966,7 +966,68 @@ fn slug(path: &Path) -> String {
 fn format_report(plan: &LibraryRepairPlan) -> String {
     use std::fmt::Write;
     let mut out = String::new();
-    let counts = &plan.report.counts;
+    // Saved report classifications may be stale. Share one Core validation
+    // observation for Safe sections, counts and any missing refusal details.
+    let conflicts =
+        archivefs_core::repair::plan::detect_plan_conflicts(&plan.repair_plan.proposals);
+    let valid = |proposal: &&archivefs_core::repair::proposal::RepairProposal| {
+        proposal.actionable()
+            && !conflicts
+                .iter()
+                .any(|conflict| conflict.proposal_ids.contains(&proposal.id))
+    };
+    let (verified, refused): (Vec<_>, Vec<_>) = plan.repair_plan.proposals.iter().partition(valid);
+    let mut counts = plan.report.counts;
+    counts.safe_repairs = verified
+        .iter()
+        .filter(|p| {
+            matches!(
+                p.action,
+                archivefs_core::repair::proposal::RepairAction::RenamePath { .. }
+            )
+        })
+        .count();
+    counts.duplicate_quarantine_safe = verified
+        .iter()
+        .filter(|p| p.is_duplicate_quarantine())
+        .count();
+    counts.duplicate_plan_refused = refused
+        .iter()
+        .filter(|p| p.is_duplicate_quarantine())
+        .count();
+    let mut extra_refusals: Vec<(String, String)> = Vec::new();
+    for proposal in &refused {
+        let reasons: Vec<_> = conflicts
+            .iter()
+            .filter(|conflict| conflict.proposal_ids.contains(&proposal.id))
+            .map(|conflict| format!("{}: {}", conflict.kind.clone().label(), conflict.detail))
+            .chain(proposal.blockers.iter().cloned())
+            .collect();
+        let reason = reasons.join("; ");
+        let path = proposal.source_path.to_string_lossy().into_owned();
+        let existing = plan
+            .report
+            .blocked
+            .iter()
+            .chain(&plan.report.needs_review)
+            .chain(&plan.report.duplicate_needs_review);
+        if !existing
+            .clone()
+            .any(|item| item.path == path && item.reason == reason)
+        {
+            if !proposal.is_duplicate_quarantine()
+                && !existing.clone().any(|item| item.path == path)
+            {
+                counts.blocked_repair += 1;
+            }
+            if !extra_refusals
+                .iter()
+                .any(|(other_path, other_reason)| other_path == &path && other_reason == &reason)
+            {
+                extra_refusals.push((path, reason));
+            }
+        }
+    }
     let _ = writeln!(out, "Whole-Library Repair Scan");
     let _ = writeln!(out, "  Profile: {}", plan.profile);
     let _ = writeln!(
@@ -1021,6 +1082,7 @@ fn format_report(plan: &LibraryRepairPlan) -> String {
         counts.duplicate_groups_content_proven
     );
     let _ = writeln!(out, "  Safe: {}", counts.duplicate_quarantine_safe);
+    let _ = writeln!(out, "  Plan refused: {}", counts.duplicate_plan_refused);
     let _ = writeln!(
         out,
         "  NeedsReview: {}",
@@ -1042,10 +1104,8 @@ fn format_report(plan: &LibraryRepairPlan) -> String {
     // batch: `survivor_path` is set only for a duplicate-quarantine
     // `MovePath` proposal (see `RepairProposal::survivor_path`'s doc), never
     // for a `RenamePath` or any other `MovePath` this foundation might grow.
-    let (quarantine_proposals, rename_proposals): (Vec<_>, Vec<_>) = plan
-        .repair_plan
-        .proposals
-        .iter()
+    let (quarantine_proposals, rename_proposals): (Vec<_>, Vec<_>) = verified
+        .into_iter()
         .partition(|proposal| proposal.is_duplicate_quarantine());
 
     let _ = writeln!(out, "SAFE");
@@ -1120,6 +1180,12 @@ fn format_report(plan: &LibraryRepairPlan) -> String {
         }
     }
 
+    if !extra_refusals.is_empty() {
+        let _ = writeln!(out, "PLAN REFUSALS");
+        for (path, reason) in extra_refusals {
+            let _ = writeln!(out, "{path}\n  Reason: {reason}");
+        }
+    }
     let _ = writeln!(out, "COMPLETE SETS");
     for item in &plan.report.complete_sets {
         let _ = writeln!(out, "{}", item.game_name);
@@ -1533,6 +1599,51 @@ mod tests {
         std::fs::write(roms.join("canon.bin"), b"test").unwrap();
         std::fs::write(roms.join("redundant-copy.bin"), b"test").unwrap();
         (dir, dat, roms)
+    }
+
+    #[test]
+    fn job10_formatter_does_not_label_refused_saved_candidates_safe() {
+        let (dir, dat, roms) = duplicate_fixture();
+        let plan_path = dir.path().join("plan.json");
+        scan_to_plan_path(&roms, &dat, &plan_path).unwrap();
+        let mut plan = read_saved_plan(&plan_path);
+        let quarantine = plan
+            .repair_plan
+            .proposals
+            .iter()
+            .find(|p| p.is_duplicate_quarantine())
+            .unwrap()
+            .clone();
+        let mut rename = quarantine.clone();
+        rename.id = RepairProposalId::new("conflicting-rename").unwrap();
+        rename.action = RepairAction::RenamePath {
+            destination: roms.join("new.bin"),
+        };
+        rename.survivor_path = None;
+        plan.repair_plan.proposals.push(rename);
+        // The persisted report still calls the quarantine Safe and has no
+        // refusals: display must validate it rather than trust saved counts.
+        assert_eq!(plan.report.counts.duplicate_quarantine_safe, 1);
+        assert!(plan.report.duplicate_needs_review.is_empty());
+        let report = format_report(&plan);
+        assert!(report.contains("  Safe: 0"));
+        assert!(report.contains("  Plan refused: 1"));
+        let safe = report
+            .split("SAFE DUPLICATE QUARANTINE\n")
+            .nth(1)
+            .unwrap()
+            .split("NEEDS REVIEW\n")
+            .next()
+            .unwrap();
+        assert!(!safe.contains(&quarantine.source_path.display().to_string()));
+        assert!(report.contains("PLAN REFUSALS"));
+        assert_eq!(
+            report.matches("  Reason: duplicate source").count(),
+            1,
+            "identical refusal detail is displayed once"
+        );
+        assert!(quarantine.source_path.exists());
+        assert!(!roms.join(".emuwiz-quarantine").exists());
     }
 
     /// A DAT declaring one game/rom `canon.bin`; two wrongly-named loose copies

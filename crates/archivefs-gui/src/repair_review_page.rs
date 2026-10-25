@@ -1387,6 +1387,25 @@ pub(crate) fn show_repair_review_page(ui: &mut egui::Ui, state: &mut RepairRevie
             }
         });
     }
+    if !plan.report.duplicate_needs_review.is_empty() {
+        ui.collapsing(
+            format!(
+                "Duplicate diagnostics ({} items)",
+                plan.report.duplicate_needs_review.len()
+            ),
+            |ui| {
+                ui.label(format!(
+                    "{} same-object skips; {} proof/planning refusals; {} global plan refusals",
+                    plan.report.counts.duplicate_same_object_ignored,
+                    plan.report.counts.duplicate_content_mismatch_refused,
+                    plan.report.counts.duplicate_plan_refused
+                ));
+                for diagnostic in &plan.report.duplicate_needs_review {
+                    ui.label(format!("{}: {}", diagnostic.path, diagnostic.reason));
+                }
+            },
+        );
+    }
     if plan.report.counts.scan_errors > 0 {
         ui.add_space(6.0);
         widgets::banner(

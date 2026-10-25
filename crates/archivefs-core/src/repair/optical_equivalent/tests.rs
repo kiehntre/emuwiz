@@ -217,3 +217,23 @@ fn requested_pregap_and_postgap_and_unaccounted_leading_sectors_block_equivalenc
         1
     );
 }
+
+#[test]
+fn job10_optical_ids_separate_crc_collisions_and_full_content_identities() {
+    let a = Path::new("roms/96b47251062a0edc.bin");
+    let b = Path::new("roms/b78b2442aae112bc.bin");
+    assert_eq!(
+        crate::identity_source::hashing::Crc32::of(a.to_str().unwrap().as_bytes()),
+        crate::identity_source::hashing::Crc32::of(b.to_str().unwrap().as_bytes())
+    );
+    let content = "a".repeat(64);
+    let first = optical_proposal_id(&content, a).unwrap();
+    assert_ne!(first, optical_proposal_id(&content, b).unwrap());
+    assert_eq!(first, optical_proposal_id(&content, a).unwrap());
+    assert_ne!(
+        first,
+        optical_proposal_id(&format!("{}b", "a".repeat(63)), a).unwrap()
+    );
+    let long = PathBuf::from("deep/".repeat(500)).join("track.bin");
+    assert!(optical_proposal_id(&content, &long).unwrap().as_str().len() <= 128);
+}

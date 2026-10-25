@@ -38,6 +38,7 @@ pub mod duplicate;
 pub mod duplicate_scan;
 pub mod exact_duplicate;
 pub mod execute;
+mod identity;
 pub mod library;
 pub mod n64_equivalent;
 pub mod optical_conversion;

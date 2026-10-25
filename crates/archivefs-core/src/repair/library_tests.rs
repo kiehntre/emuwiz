@@ -2440,3 +2440,190 @@ fn skipped_non_utf8_containers_leave_dependency_presence_unavailable() {
         );
     }
 }
+
+#[test]
+fn job10_long_plan_ids_are_deterministic_and_distinguish_sources_generations_and_roots() {
+    let dir = temp();
+    let (dat, roms) = three_proposal_fixture(dir.path());
+    let mut request = request(&dat, &roms);
+    request.source_id = "long-catalogue/".repeat(20);
+    let scan = run_library_scan(&request, &TrustedRoots::none(), &no_cancel(), &|_| {}).unwrap();
+    let first = scan.repair_plan.id.clone();
+    let mut rename = scan.rename_plan.clone();
+    let adapted = crate::repair::adapter::repair_plan_from_rename_plan(&rename, 1);
+    assert_eq!(first, adapted.id, "both constructors use the same identity");
+    assert_ne!(first.as_str(), "dat-rename");
+    assert!(first.as_str().len() <= 128);
+    assert_eq!(
+        first,
+        crate::repair::adapter::repair_plan_from_rename_plan(&rename, 999).id
+    );
+    rename.source_id.push('x');
+    assert_ne!(
+        first,
+        crate::repair::adapter::repair_plan_from_rename_plan(&rename, 1).id
+    );
+    rename = scan.rename_plan.clone();
+    rename.generation += 1;
+    assert_ne!(
+        first,
+        crate::repair::adapter::repair_plan_from_rename_plan(&rename, 1).id
+    );
+    rename = scan.rename_plan.clone();
+    rename.scan_root.push_str("/other");
+    assert_ne!(
+        first,
+        crate::repair::adapter::repair_plan_from_rename_plan(&rename, 1).id
+    );
+    rename.source_id = "catalogue/source".into();
+    assert_eq!(
+        crate::repair::adapter::repair_plan_from_rename_plan(&rename, 1)
+            .id
+            .as_str(),
+        format!("dat-catalogue_source-{}", rename.generation)
+    );
+}
+
+#[test]
+fn job10_swapped_saved_proposal_ids_refuse_before_selected_apply_or_journaling() {
+    let dir = temp();
+    let (dat, roms) = three_proposal_fixture(dir.path());
+    let mut plan = saved_plan(&dat, &roms);
+    let first_id = plan.repair_plan.proposals[0].id.clone();
+    plan.repair_plan.proposals[0].id = plan.repair_plan.proposals[1].id.clone();
+    plan.repair_plan.proposals[1].id = first_id;
+    let selected = plan.repair_plan.proposals[0].id.clone();
+    let options = options(dir.path());
+    let result = apply_saved_plan_selected(
+        &plan,
+        &roms,
+        &dat,
+        plan.generation,
+        &[selected],
+        &options,
+        &no_cancel(),
+    );
+    assert!(
+        matches!(result, Err(ApplySavedPlanSelectedError::NotAuthorized(_))),
+        "{result:?}"
+    );
+    for source in ["a.bin", "b.bin", "c.bin"] {
+        assert!(roms.join(source).exists());
+    }
+    assert_eq!(std::fs::read_dir(&options.journal_dir).unwrap().count(), 0);
+}
+
+#[test]
+fn job10_quarantine_resolution_does_not_leave_an_unmatched_dat_candidate() {
+    let dir = temp();
+    let (dat, roms) = realistic_duplicate_fixture(dir.path());
+    let outcome = scan(&dat, &roms);
+    let counts = outcome.report.counts;
+    assert_eq!(counts.duplicate_quarantine_safe, 1);
+    assert_eq!(counts.blocked_repair, 0);
+    assert_eq!(counts.unmatched_candidates, 0);
+    assert_eq!(
+        counts.dat_candidates,
+        counts.already_canonical + counts.duplicate_quarantine_safe
+    );
+}
+
+#[test]
+fn job10_identity_capture_refusal_keeps_its_specific_cause_and_is_counted_once() {
+    let dir = temp();
+    let (dat, roms) = three_proposal_fixture(dir.path());
+    let outcome = scan(&dat, &roms);
+    let removed = outcome.rename_plan.proposals[0].source_path.clone();
+    std::fs::remove_file(&removed).unwrap();
+    let (plan, accounting, diagnostics) = crate::repair::library::repair_plan_from_scan_rename_plan(
+        &outcome.rename_plan,
+        1,
+        &TrustedRoots::from_paths([dir.path()]),
+        &no_cancel(),
+    );
+    let report = crate::repair::library::build_library_repair_report(
+        &outcome.audit,
+        &outcome.rename_plan,
+        &plan,
+        &accounting,
+        &diagnostics,
+    );
+    assert_eq!(report.counts.safe_repairs, 2);
+    assert_eq!(report.counts.blocked_repair, 1);
+    assert_eq!(report.counts.unmatched_candidates, 0);
+    assert_eq!(report.blocked.len(), 1);
+    assert_eq!(report.blocked[0].path, removed.to_str().unwrap());
+    assert!(
+        report.blocked[0]
+            .reason
+            .contains("DAT source identity capture failed"),
+        "{}",
+        report.blocked[0].reason
+    );
+}
+
+#[test]
+fn job10_global_quarantine_refusals_balance_emitted_candidates_without_duplicate_rows() {
+    let dir = temp();
+    let (dat, roms) = overlapping_duplicate_and_rename_fixture(dir.path());
+    let outcome = scan(&dat, &roms);
+    let emitted = outcome
+        .repair_plan
+        .proposals
+        .iter()
+        .filter(|p| p.is_duplicate_quarantine())
+        .count();
+    let counts = outcome.report.counts;
+    assert_eq!(emitted, 1);
+    assert_eq!(
+        emitted,
+        counts.duplicate_quarantine_safe + counts.duplicate_plan_refused
+    );
+    assert_eq!(counts.duplicate_plan_refused, 1);
+    assert_eq!(outcome.report.duplicate_needs_review.len(), 1);
+    assert!(
+        outcome.report.duplicate_needs_review[0]
+            .reason
+            .contains("duplicate source")
+    );
+    assert_eq!(
+        counts.dat_candidates,
+        counts.already_canonical
+            + counts.safe_repairs
+            + counts.needs_review
+            + counts.blocked_repair
+            + counts.unsupported
+    );
+    assert_eq!(counts.unmatched_candidates, 0);
+}
+
+#[test]
+fn job10_legacy_quarantine_ids_are_refused_without_guessing_a_replacement() {
+    let dir = temp();
+    let (dat, roms) = realistic_duplicate_fixture(dir.path());
+    let fresh = scan(&dat, &roms);
+    let mut saved = plan_file_from_scan(&fresh);
+    let proposal = saved
+        .repair_plan
+        .proposals
+        .iter_mut()
+        .find(|p| p.is_duplicate_quarantine())
+        .unwrap();
+    let bucket = proposal.id.as_str().split('-').nth(1).unwrap();
+    let crc = crate::identity_source::hashing::Crc32::of(
+        proposal.source_path.to_str().unwrap().as_bytes(),
+    );
+    proposal.id = RepairProposalId::new(format!("quarantine-{bucket}-{crc}")).unwrap();
+    let error = crate::repair::library::re_prove_saved_plan(&saved, &fresh).unwrap_err();
+    assert!(error.contains("not independently reproduced"));
+    assert!(roms.join("redundant-copy.bin").exists());
+    assert!(!roms.join(".emuwiz-quarantine").exists());
+    // Older report JSON remains readable; there is no ID migration or alias.
+    let mut json = serde_json::to_value(&saved).unwrap();
+    json["report"]["counts"]
+        .as_object_mut()
+        .unwrap()
+        .remove("duplicate_plan_refused");
+    let old: LibraryRepairPlan = serde_json::from_value(json).unwrap();
+    assert_eq!(old.report.counts.duplicate_plan_refused, 0);
+}

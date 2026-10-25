@@ -372,3 +372,32 @@ fn unconfident_states_never_seed_a_group() {
     assert!(proposals.is_empty());
     assert_eq!(accounting.groups_examined, 0);
 }
+
+#[test]
+fn job10_duplicate_proof_refusals_keep_one_specific_diagnostic_per_skipped_member() {
+    let dir = temp();
+    let keeper = write(dir.path(), "canon.bin", b"test");
+    let other = write(dir.path(), "other.bin", b"xyzz");
+    let plan = rename_plan(
+        dir.path(),
+        vec![
+            member(keeper, ProposalState::AlreadyCanonical, true),
+            member(other.clone(), ProposalState::Conflict, true),
+        ],
+    );
+    let (proposals, accounting, diagnostics) = plan_duplicate_quarantine_from_rename_plan(
+        &plan,
+        dir.path(),
+        &TrustedRoots::from_paths([dir.path()]),
+        None,
+    );
+    assert!(proposals.is_empty());
+    assert_eq!(accounting.content_mismatch_refused, 1);
+    assert_eq!(diagnostics.len(), 1);
+    assert_eq!(diagnostics[0].path, other);
+    assert!(!diagnostics[0].reason.is_empty());
+    assert_eq!(
+        accounting.quarantine_needs_review, 0,
+        "no survivor ambiguity was introduced"
+    );
+}

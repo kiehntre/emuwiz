@@ -154,12 +154,7 @@ pub fn repair_plan_from_rename_plan(plan: &RenamePlan, now_unix: u64) -> RepairP
         }
     }
 
-    let id = RepairPlanId::new(format!(
-        "dat-{}-{}",
-        plan.source_id.replace(['/', '\\'], "_"),
-        plan.generation
-    ))
-    .unwrap_or_else(|| RepairPlanId::new("dat-rename").expect("static id is valid"));
+    let id = dat_repair_plan_id(plan);
 
     build_repair_plan(
         id,
@@ -168,6 +163,26 @@ pub fn repair_plan_from_rename_plan(plan: &RenamePlan, now_unix: u64) -> RepairP
         Some(plan.scan_root.clone()),
         proposals,
     )
+}
+
+/// Keep existing readable plan labels. Overlong/invalid labels must not all
+/// become `dat-rename`: digest the exact catalogue, generation and scan scope.
+/// Plan labels are persisted metadata, never execution authorization.
+pub(super) fn dat_repair_plan_id(plan: &RenamePlan) -> RepairPlanId {
+    RepairPlanId::new(format!(
+        "dat-{}-{}",
+        plan.source_id.replace(['/', '\\'], "_"),
+        plan.generation
+    ))
+    .unwrap_or_else(|| {
+        let digest = super::identity::digest_parts(&[
+            b"dat-plan-v1",
+            plan.source_id.as_bytes(),
+            &plan.generation.to_le_bytes(),
+            plan.scan_root.as_bytes(),
+        ]);
+        RepairPlanId::new(format!("dat~{digest}")).expect("bounded SHA-256 plan id")
+    })
 }
 
 /// The destination a trusted DAT rename implies, for callers that only need
