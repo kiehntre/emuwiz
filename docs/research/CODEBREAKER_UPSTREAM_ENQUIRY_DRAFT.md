@@ -1,7 +1,10 @@
-# Draft enquiry to the `codebreaker` / cb2util author
+# Enquiry to the `codebreaker` / cb2util author
 
-Status: **draft, not sent.** Needs the owner's sign-off before anything is
-posted or emailed. Nothing in this note is a claim of legal clearance: the
+Status: **sent 2026-10-25** with the owner's approval as a public issue,
+[mlafeldt/codebreaker-rs#11](https://github.com/mlafeldt/codebreaker-rs/issues/11),
+signed by the owner. No reply yet; record any answer here by quoting it. The
+text below is the draft as approved; the posted wording differs slightly (it
+links the harness on the `feature/ps2-codebreaker-preview` branch). Nothing in this note is a claim of legal clearance: the
 crate and `cb2util` are published under MIT (and Apache-2.0 for the crate), and
 EmuWiz relies on those licences as written. This enquiry exists to learn what
 the licences cannot tell us.
