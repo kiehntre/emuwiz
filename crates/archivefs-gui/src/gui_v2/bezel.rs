@@ -493,6 +493,8 @@ struct ApplyOutcome {
     detail: &'static str,
     undo_available: bool,
     technical: String,
+    /// Per-file notes from the journal, such as permissions not kept.
+    warnings: Vec<String>,
 }
 
 impl ApplyOutcome {
@@ -503,6 +505,7 @@ impl ApplyOutcome {
             detail: "Nothing has changed.",
             undo_available: false,
             technical,
+            warnings: Vec::new(),
         }
     }
 
@@ -521,6 +524,12 @@ impl ApplyOutcome {
             detail,
             undo_available: wrote && result.journal_path.is_some(),
             technical,
+            warnings: result
+                .journal
+                .entries
+                .iter()
+                .flat_map(|entry| entry.warnings.iter().cloned())
+                .collect(),
         }
     }
 }
@@ -589,6 +598,9 @@ fn refusal_label(refusal: &BezelPlanRefusal) -> &'static str {
 
 fn show_apply_outcome(ui: &mut egui::Ui, outcome: &ApplyOutcome) {
     banner(ui, outcome.headline, outcome.detail, outcome.tone);
+    for warning in &outcome.warnings {
+        ui.label(warning);
+    }
     ui.label(if outcome.undo_available {
         "Undo available"
     } else {
@@ -1168,9 +1180,13 @@ mod tests {
             detail: "",
             undo_available: true,
             technical: "Success".into(),
+            warnings: vec!["existing permissions 4755 were not kept".into()],
         };
         assert!(render(&ok).contains("Undo available"));
         assert!(!render(&ok).contains("Undo not available"));
+        // Journal notes (for example dropped special permission bits) are
+        // shown with the result, not only in a later Undo preview.
+        assert!(render(&ok).contains("existing permissions 4755 were not kept"));
         assert_eq!(
             ApplyOutcome::refused("x".into()).tone,
             StatusTone::Blocked,

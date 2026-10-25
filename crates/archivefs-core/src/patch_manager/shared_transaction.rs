@@ -89,6 +89,7 @@ pub(super) enum FaultPoint {
     RollbackAfterMutation,
     TerminalJournal,
     DurableJournalWrite,
+    Permissions,
 }
 
 #[cfg(test)]
@@ -2604,9 +2605,16 @@ fn atomic_write_bytes(
         NEXT_ID.fetch_add(1, Ordering::Relaxed)
     ));
     let write_result = (|| {
-        let mut file = OpenOptions::new()
-            .write(true)
-            .create_new(true)
+        let mut options = OpenOptions::new();
+        options.write(true).create_new(true);
+        // Owner-only from creation, so the bytes are never briefly readable
+        // under the process umask before the final mode is set.
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            options.mode(OWNER_ONLY_MODE);
+        }
+        let mut file = options
             .open(&temp)
             .map_err(|_| SharedApplyFailureKind::WriteFailed)?;
         file.write_all(bytes)
@@ -2614,11 +2622,15 @@ fn atomic_write_bytes(
         if should_inject(FaultPoint::Flush) {
             return Err(SharedApplyFailureKind::WriteFailed);
         }
+        // Set through the open descriptor of the new temporary file, before
+        // it is synced and renamed into place: never via a path that could be
+        // swapped, and durable together with the bytes.
+        if should_inject(FaultPoint::Permissions) {
+            return Err(SharedApplyFailureKind::WriteFailed);
+        }
+        set_permissions(&file, mode).map_err(|_| SharedApplyFailureKind::WriteFailed)?;
         file.sync_all()
             .map_err(|_| SharedApplyFailureKind::WriteFailed)?;
-        // Set through the open descriptor of the new temporary file, before
-        // it is renamed into place: never via a path that could be swapped.
-        set_permissions(&file, mode).map_err(|_| SharedApplyFailureKind::WriteFailed)?;
         let temp_hash = stable_hash(&temp, SHARED_MAX_MATERIALIZED_BYTES)?;
         if should_inject(FaultPoint::Verification) || temp_hash.digest != expected {
             return Err(SharedApplyFailureKind::VerificationFailed);
@@ -4820,8 +4832,9 @@ mod tests {
         );
     }
 
-    /// A failed restore leaves the installed file (bytes and bits) alone and
-    /// is reported as a failure; a retry then restores both.
+    /// A restore whose permission change fails leaves the installed file
+    /// (bytes and bits) alone and is reported as a failure; a retry then
+    /// restores both.
     #[cfg(unix)]
     #[test]
     fn failed_permission_restore_is_reported_and_retry_restores_bits() {
@@ -4840,7 +4853,7 @@ mod tests {
             &fixture.destination_root(),
             &fixture.backup_root(),
         );
-        inject_fault(Some(FaultPoint::Flush));
+        inject_fault(Some(FaultPoint::Permissions));
         let failed = confirm_rollback(&fixture, &rollback, "mode-fault-undo");
         inject_fault(None);
         assert_ne!(failed.status, SharedApplyStatus::Success);
