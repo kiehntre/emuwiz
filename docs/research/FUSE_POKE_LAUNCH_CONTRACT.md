@@ -124,6 +124,10 @@ withdrawn, stale, ambiguous, conflicting or member-only evidence, unsafe files,
 and unsupported snapshot variants. A filename, trainer pin, expected key or
 caller-supplied verification boolean cannot create this authority.
 
+Readiness resolves proofs on one bounded background worker and reuses stable
+results without hashing catalogues on the GUI thread. Selection changes cannot
+adopt another snapshot's pending result.
+
 The normal request retains the exact readiness proof. Canonical preflight
 revalidates it and compares the canonical snapshot SHA-256 key; the command
 retains it for another fresh revalidation immediately before spawn. The other

@@ -334,6 +334,7 @@ impl NativeWorkflows {
     }
 
     pub(super) fn new(context: egui::Context) -> Self {
+        crate::emulator_setup::zx_snapshot::poll(&context);
         #[cfg(not(test))]
         let mut app = ArchiveFsApp::new_without_initial_load(context.clone());
         #[cfg(test)]
