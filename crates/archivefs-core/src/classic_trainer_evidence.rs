@@ -16,6 +16,7 @@
 
 pub mod launch;
 pub mod pinning;
+pub mod snapshot;
 pub mod vice;
 
 use std::io::Read;

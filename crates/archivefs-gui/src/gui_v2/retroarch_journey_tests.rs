@@ -949,3 +949,5 @@ fn find_file(dir: &Path, name: &str) -> Option<PathBuf> {
 
 mod cartridge_cue;
 mod installation_save;
+
+mod fuse_snapshot;
