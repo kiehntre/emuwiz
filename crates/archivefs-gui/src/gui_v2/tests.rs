@@ -11066,3 +11066,5 @@ mod large_library_regressions;
 
 #[path = "tests/artwork_journey.rs"]
 mod artwork_journey;
+
+mod provider_validation;

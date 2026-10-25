@@ -1714,6 +1714,24 @@ impl App {
                 egui::Rect::from_min_max(egui::Pos2::ZERO, egui::pos2(1.0, 1.0)),
                 Color32::WHITE,
             );
+            if self.artwork.index.as_ref().and_then(|index| index.source(game.archive.id, kind))
+                .is_some_and(|source| matches!(source, Source::Remote { record, .. }
+                    if record.verification == archivefs_core::identity_source::model::ExternalVerification::Stale))
+            {
+                let galley = ui.painter().layout(
+                    "Saved artwork · stale record".into(),
+                    egui::FontId::proportional(theme::METADATA_SIZE),
+                    theme::SECONDARY_TEXT,
+                    (rect.width() - 12.0).max(1.0),
+                );
+                let plate = egui::Rect::from_min_size(
+                    egui::pos2(rect.left(), rect.bottom() - galley.size().y - 8.0),
+                    egui::vec2(rect.width(), galley.size().y + 8.0),
+                );
+                ui.painter().rect_filled(plate, 4.0, theme::deep_fill(ui));
+                ui.painter().galley(plate.min + egui::vec2(6.0, 4.0), galley, theme::SECONDARY_TEXT);
+                response.on_hover_text("RomM's saved record is out of date because its game file changed or disappeared. This picture is retained as display evidence. Refresh the RomM index to recheck its association.");
+            }
         } else {
             // No cover (yet): the game's own platform hardware, dimmed, on the
             // same plate, so an uncovered shelf still reads as distinct systems.
@@ -3715,6 +3733,12 @@ impl App {
     ) {
         ui.strong("Artwork source");
         let index = self.artwork.index.as_ref();
+        if index.and_then(|index| index.covers.get(&game)).is_some_and(|source|
+            matches!(source, Source::Remote { record, .. }
+                if record.verification == archivefs_core::identity_source::model::ExternalVerification::Stale))
+        {
+            ui.label("Saved artwork · stale record. RomM's game association needs a refresh; the saved picture is retained as display evidence.");
+        }
         let resolved_winner =
             index
                 .and_then(|index| index.resolved.get(&game))
