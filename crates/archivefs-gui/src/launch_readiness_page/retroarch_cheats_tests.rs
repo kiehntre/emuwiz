@@ -14,7 +14,7 @@ use archivefs_core::launch::cheat_runtime_retroarch::RetroArchCheatLaunch;
 use archivefs_core::launch::libretro_probe::{ProbeLauncher, run_probe_child};
 use std::fs;
 use std::io;
-use std::os::unix::fs::{PermissionsExt, symlink};
+use std::os::unix::fs::symlink;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -127,7 +127,11 @@ impl World {
             .replace("\\n", "\n")
             .as_bytes(),
         );
-        fs::set_permissions(&script, fs::Permissions::from_mode(0o755)).unwrap();
+        archivefs_core::verified_game_fixture::compile_native_test_executable(
+            &script,
+            &fs::read_to_string(&script).unwrap(),
+        )
+        .unwrap();
         fs::create_dir_all(root.join("saves")).unwrap();
         fs::create_dir_all(root.join("states")).unwrap();
         fs::create_dir_all(root.join("cores")).unwrap();
@@ -165,6 +169,8 @@ impl World {
             },
             core_stem: core_stem.into(),
             expected_appimage_executable: None,
+            expected_executable_binding: None,
+            expected_configuration_file: None,
         };
         let environment = DiscoveryEnvironment {
             home: Some(root.clone().into_os_string()),
@@ -174,6 +180,7 @@ impl World {
             system_flatpak_root: root.join("system-flatpak"),
             app_image_search_roots: Vec::new(),
             desktop_file_roots: Vec::new(),
+            explicit_executables: Vec::new(),
         };
         Self {
             root,
@@ -580,8 +587,8 @@ fn a_retroarch_that_cannot_start_is_reported_as_a_failure_and_leaves_nothing_beh
     let world = World::new("Genesis Plus GX");
     let choice = world.choice(CHT, &["Infinite Lives"]);
     let exe = world.root.join("bin/retroarch");
-    fs::write(&exe, b"#!/nonexistent/interpreter\n").unwrap();
-    fs::set_permissions(&exe, fs::Permissions::from_mode(0o755)).unwrap();
+    archivefs_core::verified_game_fixture::compile_unstartable_native_test_executable(&exe)
+        .unwrap();
     let error = world.launch(&choice).err().expect("must fail");
     assert!(error.contains("RetroArch was not started"), "{error}");
     assert!(error.contains("could not be started"), "{error}");

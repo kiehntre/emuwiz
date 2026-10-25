@@ -203,6 +203,11 @@ pub trait ReadOnlyHostFilesystem {
     /// the file is larger; the oversized content is never partially
     /// trusted as a truncated prefix.
     fn read_bounded(&self, path: &Path, max_bytes: usize) -> BoundedReadResult;
+    /// Bounded executable header, used only to distinguish native binaries
+    /// from launcher scripts. An oversized script is never parsed partially.
+    fn executable_header(&self, path: &Path) -> BoundedReadResult {
+        self.read_bounded(path, 16 * 1024)
+    }
     /// Non-recursive listing bounded to `max_entries`.
     /// `BoundedListResult::TooLarge` if the directory has more entries;
     /// no partial listing is returned in that case.
@@ -250,6 +255,28 @@ fn io_error_to_probe(error: &io::Error) -> FsProbe {
 }
 
 impl ReadOnlyHostFilesystem for HostReadOnlyFilesystem {
+    fn executable_header(&self, path: &Path) -> BoundedReadResult {
+        use std::io::Read;
+        use std::os::unix::fs::OpenOptionsExt;
+        let file = match fs::OpenOptions::new()
+            .read(true)
+            .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK)
+            .open(path)
+        {
+            Ok(file) => file,
+            Err(error) => return bounded_read_error(&error),
+        };
+        if !file.metadata().is_ok_and(|metadata| metadata.is_file()) {
+            return BoundedReadResult::WrongType;
+        }
+        let mut bytes = Vec::new();
+        match file.take(16 * 1024 + 1).read_to_end(&mut bytes) {
+            Ok(_) if bytes.starts_with(b"\x7fELF") => BoundedReadResult::Ok(bytes[..4].to_vec()),
+            Ok(_) if bytes.len() > 16 * 1024 => BoundedReadResult::TooLarge,
+            Ok(_) => BoundedReadResult::Ok(bytes),
+            Err(error) => bounded_read_error(&error),
+        }
+    }
     fn probe(&self, path: &Path) -> FsProbe {
         Self::probe_metadata(fs::symlink_metadata(path))
     }

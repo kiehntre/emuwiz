@@ -96,7 +96,7 @@ pub(crate) fn poll_and_reconcile(app: &mut ArchiveFsApp, context: &egui::Context
     app.poll_operation(context);
     app.poll_mount_all(context);
     app.poll_unmount_all(context);
-    app.poll_retroarch_profiles();
+    app.poll_retroarch_profiles(context);
     app.poll_pcsx2_profiles();
     app.poll_dolphin_profiles();
     app.poll_dolphin_local_profiles();

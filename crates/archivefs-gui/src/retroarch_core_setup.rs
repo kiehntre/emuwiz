@@ -319,6 +319,7 @@ mod tests {
                 system_flatpak_root: self.root.join("system-flatpak"),
                 app_image_search_roots: Vec::new(),
                 desktop_file_roots: Vec::new(),
+                explicit_executables: Vec::new(),
             }
         }
 

@@ -12,6 +12,8 @@
 //! This module owns no shared state with `crate::patch_manager` and is not
 //! imported by it.
 
+pub mod installation_selection;
+
 use std::collections::BTreeMap;
 use std::ffi::OsStr;
 use std::fmt;
@@ -716,6 +718,8 @@ pub struct DiscoveryEnvironment {
     pub home: Option<std::ffi::OsString>,
     pub xdg_config_home: Option<std::ffi::OsString>,
     pub path: Option<std::ffi::OsString>,
+    /// An explicit installation choice; empty means automatic, never first-on-PATH.
+    pub explicit_executables: Vec<PathBuf>,
     pub user_flatpak_root: PathBuf,
     pub system_flatpak_root: PathBuf,
     /// Bounded, non-recursive AppImage search roots - see
@@ -756,6 +760,13 @@ impl DiscoveryEnvironment {
             home,
             xdg_config_home: std::env::var_os("XDG_CONFIG_HOME"),
             path: std::env::var_os("PATH"),
+            explicit_executables: crate::app_dirs::config_path(
+                installation_selection::EXECUTABLE_OVERRIDE_FILE,
+            )
+            .map_err(|e| e.to_string())
+            .and_then(|path| installation_selection::load_executable_override_at(&path))
+            .map(|path| path.into_iter().collect())
+            .unwrap_or_else(|_| vec![PathBuf::new()]),
             user_flatpak_root,
             system_flatpak_root: PathBuf::from("/var/lib/flatpak"),
             app_image_search_roots,
@@ -815,11 +826,16 @@ pub enum DiscoveryError {
     /// `patch_manager::pcsx2::Pcsx2DiscoveryRoots::from_environment`'s
     /// existing precedent exactly.
     NoHome,
+    ExecutableSelectionUnavailable,
 }
 
 impl fmt::Display for DiscoveryError {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
+            Self::ExecutableSelectionUnavailable => write!(
+                formatter,
+                "The chosen RetroArch installation is unavailable or unsupported. Choose a native or verified AppImage installation in Emulator Setup, or reset to automatic detection."
+            ),
             Self::NoHome => write!(
                 formatter,
                 "HOME is not set; cannot determine any RetroArch discovery roots"
@@ -968,6 +984,43 @@ pub fn discover_retroarch_environment_with_core_directory_override(
         )),
         core_directory_override,
     ));
+
+    // A literal Flatpak launcher is evidence for the Flatpak installation,
+    // never a native executable serving native settings.
+    let wrappers = discover_path_executables(filesystem, environment.path.as_deref())
+        .into_iter()
+        .filter(|path| {
+            installation_selection::classify_installation_executable(filesystem, path)
+                == installation_selection::InstallationExecutable::Flatpak
+        })
+        .map(|path| EncodedPath::from_path(&path))
+        .collect::<Vec<_>>();
+    for path in discover_path_executables(filesystem, environment.path.as_deref()) {
+        if installation_selection::classify_installation_executable(filesystem, &path)
+            == installation_selection::InstallationExecutable::Unknown
+        {
+            report_diagnostics.push(RawDiagnostic::new(
+                "retroarch_launcher_script_unresolved",
+                DiagnosticSeverity::Warning,
+                DiagnosticCategory::Discovery,
+                None,
+                None,
+                Some(path),
+            ));
+        }
+    }
+    if !wrappers.is_empty() {
+        for (profile, _, _) in &mut profiles {
+            if profile.profile_kind == ProfileKind::Flatpak && profile.scope == ProfileScope::User {
+                profile.evidence.executables = wrappers.clone();
+            }
+        }
+    }
+    installation_selection::apply_selection(
+        filesystem,
+        &mut profiles,
+        &environment.explicit_executables,
+    )?;
 
     profiles.sort_by(|left, right| {
         (left.0.profile_kind, left.0.scope, &left.1).cmp(&(
@@ -1230,22 +1283,32 @@ fn discover_native_executables(
     filesystem: &dyn ReadOnlyHostFilesystem,
     path_value: &OsStr,
 ) -> Vec<EncodedPath> {
-    let mut seen: Vec<PathBuf> = Vec::new();
-    for directory_bytes in path_value.as_bytes().split(|&byte| byte == b':') {
-        if directory_bytes.is_empty() {
-            continue;
-        }
-        let directory = PathBuf::from(OsStr::from_bytes(directory_bytes));
-        let candidate = directory.join("retroarch");
-        if let Some(resolved) = filesystem.resolve_executable(&candidate)
+    discover_path_executables(filesystem, Some(path_value))
+        .iter()
+        .filter(|path| {
+            installation_selection::classify_installation_executable(filesystem, path)
+                == installation_selection::InstallationExecutable::Native
+        })
+        .map(|path| EncodedPath::from_path(path))
+        .collect()
+}
+
+fn discover_path_executables(
+    filesystem: &dyn ReadOnlyHostFilesystem,
+    path_value: Option<&OsStr>,
+) -> Vec<PathBuf> {
+    let mut seen = Vec::new();
+    let Some(path_value) = path_value else {
+        return seen;
+    };
+    for directory in std::env::split_paths(path_value).filter(|path| path.is_absolute()) {
+        if let Some(resolved) = filesystem.resolve_executable(&directory.join("retroarch"))
             && !seen.contains(&resolved)
         {
             seen.push(resolved);
         }
     }
-    seen.iter()
-        .map(|path| EncodedPath::from_path(path))
-        .collect()
+    seen
 }
 
 struct ParsedConfig {
@@ -2619,7 +2682,12 @@ fn exec_explicit_config_value(tokens: &[String]) -> Option<Option<String>> {
         let value = if let Some(rest) = token.strip_prefix("--config=") {
             Some(rest.to_string())
         } else if token == "--config" || token == "-c" {
-            tokens.get(index + 1).cloned()
+            // A present flag without a value is unresolved, not absent:
+            // otherwise selection would silently fall back to native settings.
+            let Some(value) = tokens.get(index + 1) else {
+                return Some(None);
+            };
+            Some(value.clone())
         } else {
             None
         };
@@ -3143,6 +3211,7 @@ mod tests {
                 system_flatpak_root: self.path("system-flatpak"),
                 app_image_search_roots: Vec::new(),
                 desktop_file_roots: Vec::new(),
+                explicit_executables: Vec::new(),
             }
         }
 
@@ -3177,6 +3246,7 @@ mod tests {
             system_flatpak_root: PathBuf::from("/nonexistent"),
             app_image_search_roots: Vec::new(),
             desktop_file_roots: Vec::new(),
+            explicit_executables: Vec::new(),
         };
         assert_eq!(
             discover_retroarch_environment(&filesystem, &env).unwrap_err(),
@@ -4556,8 +4626,8 @@ mod tests {
         let fixture = Fixture::new("path-candidates");
         fixture.mkdir("bin1");
         fixture.mkdir("bin2");
-        fixture.write("bin1/retroarch", "#!/bin/sh\n");
-        fixture.write("bin2/retroarch", "#!/bin/sh\n");
+        fixture.write("bin1/retroarch", "\x7fELF");
+        fixture.write("bin2/retroarch", "\x7fELF");
         make_executable(&fixture.path("bin1/retroarch"));
         make_executable(&fixture.path("bin2/retroarch"));
 
@@ -4593,7 +4663,7 @@ mod tests {
         let fixture = Fixture::new("path-symlink-resolved");
         fixture.mkdir("bin");
         fixture.mkdir("games");
-        fixture.write("games/retroarch", "#!/bin/sh\n");
+        fixture.write("games/retroarch", "\x7fELF");
         make_executable(&fixture.path("games/retroarch"));
         symlink(
             fixture.path("games/retroarch"),
