@@ -597,12 +597,14 @@ mod tests {
             .clone()
             .execute_with(&catalogues(&fixture.sources), &fixture.roots)
             .unwrap();
-        let mut state = StandaloneLaunchState::default();
-        state.tracked = Some((
-            fixture.tape.clone(),
-            "xroar".into(),
-            StandaloneLaunchStage::Running(StandaloneProcess::XRoar(process)),
-        ));
+        let mut state = StandaloneLaunchState {
+            tracked: Some((
+                fixture.tape.clone(),
+                "xroar".into(),
+                StandaloneLaunchStage::Running(StandaloneProcess::XRoar(process)),
+            )),
+            ..Default::default()
+        };
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
         while state.is_active() {
             state.poll();
