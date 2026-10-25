@@ -37,7 +37,7 @@ Use absolute paths with real directory ancestors, not symlinked aliases.
   "authorized_firmware": true,
   "disposable_saves": true,
   "provenance": "REPLACE with the authorization and source of each supplied input",
-  "game_key": "REPLACE with the exact verified EmuWiz game key",
+  "game_key": "REPLACE with the exact verified slave SHA-256 (64 lowercase hex characters)",
   "package_sha256": "REPLACE with the complete package SHA-256",
   "slave_member": "GameDirectory/Game.slave",
   "template_root": "/absolute/path/to/authorized-template",

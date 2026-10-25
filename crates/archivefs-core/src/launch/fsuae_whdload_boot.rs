@@ -284,7 +284,11 @@ pub fn inspect_boot(request: &WHDLoadLaunchInput) -> Result<BootApproval, String
         return Err(fail("verified identity required"));
     };
     if identity.platform_id != "Amiga"
-        || identity.game_key.trim().is_empty()
+        || !hash_valid(&identity.game_key)
+        || request
+            .slave
+            .as_ref()
+            .is_none_or(|slave| !hash_valid(&slave.sha256) || slave.sha256 != identity.game_key)
         || request.profile.profile_id.trim().is_empty()
         || identity.game_key != request.profile.verified_identity
         || request.profile.emulator != AmigaEmulatorKind::FsUae
