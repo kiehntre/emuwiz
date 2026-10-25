@@ -176,6 +176,7 @@ fn attention_shared_successful_rollback_resolves_only_the_matching_operation() {
             observed_backup_digest: None,
             outcome: SharedRollbackOutcome::RemovedInstalledFile,
             failure: None,
+            permissions: None,
         });
     receipt.original_operation_id = "wrong".into();
     project_completed_shared_rollback(&mut wrong, &receipt);

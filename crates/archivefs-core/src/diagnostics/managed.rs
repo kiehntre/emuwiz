@@ -914,6 +914,7 @@ mod tests {
             observed_destination_digest: None,
             backup_path: None,
             backup_digest: None,
+            destination_pre_mode: None,
             temporary_path: None,
             final_destination_digest: final_digest,
             created_directories: Vec::new(),

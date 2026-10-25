@@ -658,6 +658,7 @@ fn sample_apply_result(
             observed_destination_digest: None,
             backup_path: None,
             backup_digest: None,
+            destination_pre_mode: None,
             temporary_path: None,
             final_destination_digest: Some("digest".to_string()),
             created_directories: Vec::new(),

@@ -1621,6 +1621,7 @@ mod tests {
                 observed_destination_digest: None,
                 backup_path: Some(SharedTransactionPath::from_path(Path::new("/backup/game"))),
                 backup_digest: Some("backup-digest".into()),
+                destination_pre_mode: None,
                 temporary_path: None,
                 final_destination_digest: Some("installed-digest".into()),
                 created_directories: Vec::new(),

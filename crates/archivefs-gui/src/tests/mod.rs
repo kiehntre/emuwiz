@@ -928,6 +928,7 @@ fn successful_shared_apply_result() -> SharedApplyResult {
         observed_destination_digest: None,
         backup_path: None,
         backup_digest: None,
+        destination_pre_mode: None,
         temporary_path: None,
         final_destination_digest: Some("a".repeat(64)),
         created_directories: Vec::new(),

@@ -415,6 +415,11 @@ pub struct SharedApplyEntry {
     pub observed_destination_digest: Option<String>,
     pub backup_path: Option<SharedTransactionPath>,
     pub backup_digest: Option<String>,
+    /// Permission bits (`st_mode & 0o7777`) of the replaced file, read from
+    /// the same descriptor whose bytes became `backup_digest`. Absent in
+    /// journals written before it was recorded: Undo then never guesses.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub destination_pre_mode: Option<u32>,
     pub temporary_path: Option<SharedTransactionPath>,
     pub final_destination_digest: Option<String>,
     pub created_directories: Vec<SharedTransactionPath>,
@@ -475,6 +480,10 @@ pub struct SharedDurableEntry {
     pub observed_destination_digest: Option<String>,
     pub backup_path: Option<SharedTransactionPath>,
     pub backup_digest: Option<String>,
+    /// Copied from [`SharedApplyEntry::destination_pre_mode`] once the backup
+    /// exists, so an interrupted transaction keeps the same evidence.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub destination_pre_mode: Option<u32>,
     pub resulting_destination_digest: Option<String>,
     pub temporary_path: Option<SharedTransactionPath>,
     pub destination_existed_before_apply: Option<bool>,
@@ -632,7 +641,56 @@ pub struct SharedRollbackEntry {
     pub observed_backup_digest: Option<String>,
     pub outcome: SharedRollbackOutcome,
     pub failure: Option<SharedApplyFailure>,
+    /// What a restored backup's permission bits will be; only set for a
+    /// replaced file. Shown in the preview, so it is part of what is confirmed.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub permissions: Option<SharedRollbackPermissions>,
 }
+
+/// Permission bits for a restored backup. Only a mode the journal recorded
+/// at apply time is restored, and only ordinary owner-readable bits; anything
+/// else keeps EmuWiz's owner-only default and says so instead of guessing.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SharedRollbackPermissions {
+    Original { mode: u32 },
+    NotRecorded,
+    NotRestorable { mode: u32 },
+}
+
+impl SharedRollbackPermissions {
+    pub fn for_recorded_mode(mode: Option<u32>) -> Self {
+        match mode {
+            None => Self::NotRecorded,
+            Some(mode) if mode & !0o777 == 0 && mode & 0o400 != 0 => Self::Original { mode },
+            Some(mode) => Self::NotRestorable { mode },
+        }
+    }
+
+    /// The mode the restored file is written with.
+    pub fn restored_mode(self) -> u32 {
+        match self {
+            Self::Original { mode } => mode,
+            Self::NotRecorded | Self::NotRestorable { .. } => OWNER_ONLY_MODE,
+        }
+    }
+
+    pub fn summary(self) -> String {
+        match self {
+            Self::Original { mode } => {
+                format!("original {mode:04o}, as recorded before the change")
+            }
+            Self::NotRecorded => format!(
+                "owner-only {OWNER_ONLY_MODE:04o}; this older change did not record the original permissions"
+            ),
+            Self::NotRestorable { mode } => format!(
+                "owner-only {OWNER_ONLY_MODE:04o}; the original {mode:04o} is not restored automatically"
+            ),
+        }
+    }
+}
+
+const OWNER_ONLY_MODE: u32 = 0o600;
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SharedRollbackPreview {
@@ -1360,6 +1418,7 @@ fn apply_one(
         observed_destination_digest: None,
         backup_path: None,
         backup_digest: None,
+        destination_pre_mode: None,
         temporary_path: None,
         final_destination_digest: None,
         created_directories: Vec::new(),
@@ -1698,6 +1757,7 @@ fn apply_one(
                 *backup_bytes += existing.bytes;
                 result.backup_path = Some(SharedTransactionPath::from_path(&path));
                 result.backup_digest = Some(existing.digest.clone());
+                result.destination_pre_mode = existing.mode;
                 result.stages.push(SharedTransactionStage::BackupCreated);
                 if !checkpoint(SharedEntryRecoveryState::BackupCreated, &result) {
                     return fail_result(
@@ -1734,18 +1794,33 @@ fn apply_one(
         || source_hash.digest.clone(),
         |value| value.output_digest.clone(),
     );
+    // A replaced user file keeps the bits recorded with its backup; a new
+    // file keeps the owner-only creation policy.
+    let write_mode = if plan.proposed_action == PreviewProposedAction::Replace {
+        let permissions = SharedRollbackPermissions::for_recorded_mode(result.destination_pre_mode);
+        if let SharedRollbackPermissions::NotRestorable { mode } = permissions {
+            result.warnings.push(format!(
+                "existing permissions {mode:04o} were not kept; the replaced file is owner-only {OWNER_ONLY_MODE:04o}"
+            ));
+        }
+        permissions.restored_mode()
+    } else {
+        OWNER_ONLY_MODE
+    };
     let write_result = match materialized {
         Some(value) => atomic_write_bytes(
             &value.bytes,
             &destination,
             &output_digest,
             plan.proposed_action == PreviewProposedAction::Install,
+            write_mode,
         ),
         None => atomic_write(
             &source,
             &destination,
             &output_digest,
             plan.proposed_action == PreviewProposedAction::Install,
+            write_mode,
         ),
     };
     match write_result {
@@ -2012,7 +2087,9 @@ fn restore_after_failed_verification(
         .backup_digest
         .as_deref()
         .ok_or(SharedApplyFailureKind::BackupChanged)?;
-    atomic_write(&backup, destination, digest, false)
+    let mode =
+        SharedRollbackPermissions::for_recorded_mode(result.destination_pre_mode).restored_mode();
+    atomic_write(&backup, destination, digest, false, mode)
         .map(|_| ())
         .map_err(|(kind, _)| kind)
 }
@@ -2096,6 +2173,7 @@ pub fn preview_shared_rollback(
                         SharedRollbackOutcome::JournalMalformed
                     },
                     failure: Some(error),
+                    permissions: None,
                 }],
                 available: false,
             };
@@ -2271,7 +2349,15 @@ pub fn execute_shared_rollback(
                     rollback.outcome = SharedRollbackOutcome::Failed;
                     continue;
                 }
-                match atomic_write(&backup, &destination, expected, false) {
+                // The confirmed preview fixed the permissions; fall back to the
+                // journal only if a preview somehow lacks them.
+                let mode = rollback
+                    .permissions
+                    .unwrap_or_else(|| {
+                        SharedRollbackPermissions::for_recorded_mode(install.destination_pre_mode)
+                    })
+                    .restored_mode();
+                match atomic_write(&backup, &destination, expected, false, mode) {
                     Ok(_) => rollback.outcome = SharedRollbackOutcome::RestoredBackup,
                     Err((kind, _)) => {
                         rollback.outcome = SharedRollbackOutcome::Failed;
@@ -2379,6 +2465,8 @@ pub fn execute_shared_rollback(
 struct StableHash {
     digest: String,
     bytes: u64,
+    /// Permission bits of the descriptor that was hashed (Unix only).
+    mode: Option<u32>,
 }
 
 fn stable_hash(path: &Path, max: u64) -> Result<StableHash, SharedApplyFailureKind> {
@@ -2438,9 +2526,17 @@ fn stable_hash(path: &Path, max: u64) -> Result<StableHash, SharedApplyFailureKi
     if !same_file(&before, &after) {
         return Err(SharedApplyFailureKind::SourceChanged);
     }
+    #[cfg(unix)]
+    let mode = {
+        use std::os::unix::fs::PermissionsExt;
+        Some(opened.permissions().mode() & 0o7777)
+    };
+    #[cfg(not(unix))]
+    let mode = None;
     Ok(StableHash {
         digest: hex_bytes(&digest.finalize()),
         bytes,
+        mode,
     })
 }
 
@@ -2477,6 +2573,7 @@ fn atomic_write(
     destination: &Path,
     expected: &str,
     no_replace: bool,
+    mode: u32,
 ) -> Result<PathBuf, (SharedApplyFailureKind, Option<PathBuf>)> {
     if should_inject(FaultPoint::TemporaryWrite) {
         return Err((SharedApplyFailureKind::WriteFailed, None));
@@ -2485,7 +2582,7 @@ fn atomic_write(
     if digest_bytes(&bytes) != expected {
         return Err((SharedApplyFailureKind::SourceChanged, None));
     }
-    atomic_write_bytes(&bytes, destination, expected, no_replace)
+    atomic_write_bytes(&bytes, destination, expected, no_replace, mode)
 }
 
 fn atomic_write_bytes(
@@ -2493,6 +2590,7 @@ fn atomic_write_bytes(
     destination: &Path,
     expected: &str,
     no_replace: bool,
+    mode: u32,
 ) -> Result<PathBuf, (SharedApplyFailureKind, Option<PathBuf>)> {
     if bytes.len() as u64 > SHARED_MAX_MATERIALIZED_BYTES {
         return Err((SharedApplyFailureKind::ResourceLimitReached, None));
@@ -2518,7 +2616,9 @@ fn atomic_write_bytes(
         }
         file.sync_all()
             .map_err(|_| SharedApplyFailureKind::WriteFailed)?;
-        set_permissions(&file).map_err(|_| SharedApplyFailureKind::WriteFailed)?;
+        // Set through the open descriptor of the new temporary file, before
+        // it is renamed into place: never via a path that could be swapped.
+        set_permissions(&file, mode).map_err(|_| SharedApplyFailureKind::WriteFailed)?;
         let temp_hash = stable_hash(&temp, SHARED_MAX_MATERIALIZED_BYTES)?;
         if should_inject(FaultPoint::Verification) || temp_hash.digest != expected {
             return Err(SharedApplyFailureKind::VerificationFailed);
@@ -2664,6 +2764,7 @@ fn durable_journal_from_plan(
                     entry,
                 ),
                 backup_digest: entry.destination_pre_digest.clone(),
+                destination_pre_mode: None,
                 resulting_destination_digest: None,
                 temporary_path: None,
                 destination_existed_before_apply: Some(matches!(
@@ -2704,6 +2805,7 @@ fn durable_journal_from_completed(
                 observed_destination_digest: entry.observed_destination_digest.clone(),
                 backup_path: entry.backup_path.clone(),
                 backup_digest: entry.backup_digest.clone(),
+                destination_pre_mode: entry.destination_pre_mode,
                 resulting_destination_digest: entry.final_destination_digest.clone(),
                 temporary_path: entry.temporary_path.clone(),
                 destination_existed_before_apply: entry.destination_existed_before_apply,
@@ -2726,6 +2828,7 @@ fn update_durable_entry(
     target.observed_destination_digest = entry.observed_destination_digest.clone();
     target.backup_path = entry.backup_path.clone();
     target.backup_digest = entry.backup_digest.clone();
+    target.destination_pre_mode = entry.destination_pre_mode;
     target.resulting_destination_digest = entry.final_destination_digest.clone();
     target.temporary_path = entry.temporary_path.clone();
     target.destination_existed_before_apply = entry.destination_existed_before_apply;
@@ -3048,6 +3151,7 @@ fn rollback_entry_preview(
         observed_backup_digest: None,
         outcome: SharedRollbackOutcome::Available,
         failure: None,
+        permissions: None,
     };
     if !root_matches {
         result.outcome = SharedRollbackOutcome::RootMismatch;
@@ -3100,6 +3204,9 @@ fn rollback_entry_preview(
         }
     }
     if entry.outcome == SharedApplyOutcome::ReplacedExisting {
+        result.permissions = Some(SharedRollbackPermissions::for_recorded_mode(
+            entry.destination_pre_mode,
+        ));
         let Some(backup) = entry.backup_path.as_ref() else {
             result.outcome = SharedRollbackOutcome::BackupMissing;
             return result;
@@ -3777,15 +3884,15 @@ fn same_file(left: &fs::Metadata, right: &fs::Metadata) -> bool {
     }
 }
 
-fn set_permissions(file: &File) -> std::io::Result<()> {
+fn set_permissions(file: &File, mode: u32) -> std::io::Result<()> {
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
-        file.set_permissions(fs::Permissions::from_mode(0o600))
+        file.set_permissions(fs::Permissions::from_mode(mode))
     }
     #[cfg(not(unix))]
     {
-        let _ = file;
+        let _ = (file, mode);
         Ok(())
     }
 }
@@ -3909,6 +4016,7 @@ fn failed_entry(
             observed_destination_digest: None,
             backup_path: None,
             backup_digest: None,
+            destination_pre_mode: None,
             temporary_path: None,
             final_destination_digest: None,
             created_directories: Vec::new(),
@@ -4516,6 +4624,329 @@ mod tests {
             b"old"
         );
         assert!(backup.exists(), "backup retention is deliberate");
+    }
+
+    #[cfg(unix)]
+    fn mode_of(path: &Path) -> u32 {
+        use std::os::unix::fs::PermissionsExt;
+        fs::symlink_metadata(path).unwrap().permissions().mode() & 0o7777
+    }
+
+    #[cfg(unix)]
+    fn chmod(path: &Path, mode: u32) {
+        use std::os::unix::fs::PermissionsExt;
+        fs::set_permissions(path, fs::Permissions::from_mode(mode)).unwrap();
+    }
+
+    #[cfg(unix)]
+    fn confirm_rollback(
+        fixture: &Fixture,
+        preview: &SharedRollbackPreview,
+        id: &str,
+    ) -> SharedRollbackResult {
+        execute_shared_rollback(
+            preview,
+            &SharedRollbackOptions {
+                confirmation: SharedRollbackConfirmation {
+                    preview_id: preview.preview_id.clone(),
+                    approved: true,
+                },
+                rollback_operation_id: id.into(),
+                timestamp_unix_seconds: 1_700_000_002,
+                history_root: fixture.history_root(),
+                backup_root: fixture.backup_root(),
+            },
+        )
+    }
+
+    /// Job #22: replacing a user's file keeps its permission bits, and Undo
+    /// puts back both its bytes and its bits.
+    #[cfg(unix)]
+    #[test]
+    fn replacement_keeps_and_rollback_restores_existing_permission_bits() {
+        for mode in [0o600, 0o644, 0o664] {
+            let fixture = Fixture::new(&format!("mode-{mode:o}"));
+            let report = preview(&fixture, b"new", Some(b"old"));
+            let live = fixture.destination_root().join("Nintendo - NES/game.cht");
+            chmod(&live, mode);
+            let plan = make_plan(&fixture, &report);
+            let result = execute_shared_apply(
+                &plan,
+                &options(
+                    &fixture,
+                    &plan,
+                    &format!("mode-apply-{mode:o}"),
+                    false,
+                    true,
+                    true,
+                ),
+            );
+            let entry = &result.journal.entries[0];
+            assert_eq!(
+                entry.outcome,
+                SharedApplyOutcome::ReplacedExisting,
+                "{mode:o}"
+            );
+            assert_eq!(entry.destination_pre_mode, Some(mode));
+            assert_eq!(fs::read(&live).unwrap(), b"new");
+            assert_eq!(mode_of(&live), mode, "Apply changed {mode:o}");
+            let rollback = preview_shared_rollback(
+                result.journal_path.as_ref().unwrap(),
+                &fixture.destination_root(),
+                &fixture.backup_root(),
+            );
+            assert!(rollback.available);
+            assert_eq!(
+                rollback.entries[0].permissions,
+                Some(SharedRollbackPermissions::Original { mode })
+            );
+            // A later user chmod of the installed file is not the original.
+            chmod(&live, 0o640);
+            let outcome = confirm_rollback(&fixture, &rollback, &format!("mode-undo-{mode:o}"));
+            assert_eq!(outcome.status, SharedApplyStatus::Success);
+            assert_eq!(fs::read(&live).unwrap(), b"old");
+            assert_eq!(mode_of(&live), mode, "Undo did not restore {mode:o}");
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn newly_created_files_keep_the_owner_only_creation_policy() {
+        let fixture = Fixture::new("mode-new");
+        let report = preview(&fixture, b"new", None);
+        let plan = make_plan(&fixture, &report);
+        let result = execute_shared_apply(
+            &plan,
+            &options(&fixture, &plan, "mode-new", false, true, false),
+        );
+        let entry = &result.journal.entries[0];
+        assert_eq!(entry.outcome, SharedApplyOutcome::InstalledNew);
+        assert_eq!(entry.destination_pre_mode, None);
+        let live = fixture.destination_root().join("Nintendo - NES/game.cht");
+        assert_eq!(mode_of(&live), OWNER_ONLY_MODE);
+        let rollback = preview_shared_rollback(
+            result.journal_path.as_ref().unwrap(),
+            &fixture.destination_root(),
+            &fixture.backup_root(),
+        );
+        assert_eq!(rollback.entries[0].permissions, None);
+    }
+
+    /// A journal from before modes were recorded, or a mode EmuWiz will not
+    /// reproduce, is restored owner-only and the preview says so.
+    #[cfg(unix)]
+    #[test]
+    fn unknown_or_special_original_modes_are_reported_not_invented() {
+        for (label, recorded, expected) in [
+            ("legacy", None, SharedRollbackPermissions::NotRecorded),
+            (
+                "setgid",
+                Some(0o2664),
+                SharedRollbackPermissions::NotRestorable { mode: 0o2664 },
+            ),
+            (
+                "unreadable",
+                Some(0o200),
+                SharedRollbackPermissions::NotRestorable { mode: 0o200 },
+            ),
+        ] {
+            let fixture = Fixture::new(&format!("mode-{label}"));
+            let report = preview(&fixture, b"new", Some(b"old"));
+            let live = fixture.destination_root().join("Nintendo - NES/game.cht");
+            chmod(&live, 0o664);
+            let plan = make_plan(&fixture, &report);
+            let result = execute_shared_apply(
+                &plan,
+                &options(
+                    &fixture,
+                    &plan,
+                    &format!("mode-apply-{label}"),
+                    false,
+                    true,
+                    true,
+                ),
+            );
+            let journal_path = result.journal_path.clone().unwrap();
+            // Rewrite the immutable journal to simulate the recorded evidence.
+            let mut journal = read_journal(&journal_path).unwrap();
+            journal.entries[0].destination_pre_mode = recorded;
+            let text = serde_json::to_string_pretty(&journal).unwrap();
+            if recorded.is_none() {
+                assert!(
+                    !text.contains("destination_pre_mode"),
+                    "older journal shape"
+                );
+            }
+            chmod(&journal_path, 0o600);
+            fs::write(&journal_path, text).unwrap();
+            let rollback = preview_shared_rollback(
+                &journal_path,
+                &fixture.destination_root(),
+                &fixture.backup_root(),
+            );
+            assert!(rollback.available, "{label}");
+            assert_eq!(rollback.entries[0].permissions, Some(expected), "{label}");
+            assert!(expected.summary().contains("0600"), "{label}");
+            let outcome = confirm_rollback(&fixture, &rollback, &format!("mode-undo-{label}"));
+            assert_eq!(outcome.status, SharedApplyStatus::Success, "{label}");
+            assert_eq!(fs::read(&live).unwrap(), b"old");
+            assert_eq!(mode_of(&live), OWNER_ONLY_MODE, "{label}");
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn existing_special_mode_is_not_carried_into_a_replacement() {
+        let fixture = Fixture::new("mode-special-apply");
+        let report = preview(&fixture, b"new", Some(b"old"));
+        let live = fixture.destination_root().join("Nintendo - NES/game.cht");
+        chmod(&live, 0o4755);
+        let plan = make_plan(&fixture, &report);
+        let result = execute_shared_apply(
+            &plan,
+            &options(&fixture, &plan, "mode-special", false, true, true),
+        );
+        let entry = &result.journal.entries[0];
+        assert_eq!(entry.outcome, SharedApplyOutcome::ReplacedExisting);
+        assert_eq!(entry.destination_pre_mode, Some(0o4755));
+        assert_eq!(mode_of(&live), OWNER_ONLY_MODE);
+        assert!(
+            entry
+                .warnings
+                .iter()
+                .any(|warning| warning.contains("4755")),
+            "{:?}",
+            entry.warnings
+        );
+    }
+
+    /// A failed restore leaves the installed file (bytes and bits) alone and
+    /// is reported as a failure; a retry then restores both.
+    #[cfg(unix)]
+    #[test]
+    fn failed_permission_restore_is_reported_and_retry_restores_bits() {
+        let fixture = Fixture::new("mode-restore-fault");
+        let report = preview(&fixture, b"new", Some(b"old"));
+        let live = fixture.destination_root().join("Nintendo - NES/game.cht");
+        chmod(&live, 0o644);
+        let plan = make_plan(&fixture, &report);
+        let result = execute_shared_apply(
+            &plan,
+            &options(&fixture, &plan, "mode-fault", false, true, true),
+        );
+        let journal_path = result.journal_path.clone().unwrap();
+        let rollback = preview_shared_rollback(
+            &journal_path,
+            &fixture.destination_root(),
+            &fixture.backup_root(),
+        );
+        inject_fault(Some(FaultPoint::Flush));
+        let failed = confirm_rollback(&fixture, &rollback, "mode-fault-undo");
+        inject_fault(None);
+        assert_ne!(failed.status, SharedApplyStatus::Success);
+        assert_eq!(
+            failed.preview.entries[0].outcome,
+            SharedRollbackOutcome::Failed
+        );
+        assert_eq!(fs::read(&live).unwrap(), b"new");
+        assert_eq!(mode_of(&live), 0o644);
+        let retry = preview_shared_rollback(
+            &journal_path,
+            &fixture.destination_root(),
+            &fixture.backup_root(),
+        );
+        assert!(retry.available);
+        let outcome = confirm_rollback(&fixture, &retry, "mode-fault-retry");
+        assert_eq!(outcome.status, SharedApplyStatus::Success);
+        assert_eq!(fs::read(&live).unwrap(), b"old");
+        assert_eq!(mode_of(&live), 0o644);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn interrupted_replacement_keeps_mode_evidence_in_the_pending_journal() {
+        let fixture = Fixture::new("mode-interrupted");
+        let report = preview(&fixture, b"new", Some(b"old"));
+        let live = fixture.destination_root().join("Nintendo - NES/game.cht");
+        chmod(&live, 0o664);
+        let plan = make_plan(&fixture, &report);
+        inject_fault(Some(FaultPoint::TerminalJournal));
+        let result = execute_shared_apply(
+            &plan,
+            &options(&fixture, &plan, "mode-interrupted", false, true, true),
+        );
+        inject_fault(None);
+        assert!(result.journal_path.is_none());
+        assert_eq!(mode_of(&live), 0o664);
+        let pending = discover_pending_operations(&fixture.history_root());
+        assert_eq!(pending.len(), 1);
+        assert_eq!(
+            pending[0].journal.entries[0].destination_pre_mode,
+            Some(0o664)
+        );
+        assert!(!plan_pending_recovery(&pending[0]).can_resume);
+    }
+
+    /// Undo never follows a destination that became a symlink, so no
+    /// permission bits are copied onto the link's target.
+    #[cfg(unix)]
+    #[test]
+    fn rollback_through_a_swapped_symlink_is_refused_and_target_bits_untouched() {
+        let fixture = Fixture::new("mode-symlink");
+        let report = preview(&fixture, b"new", Some(b"old"));
+        let live = fixture.destination_root().join("Nintendo - NES/game.cht");
+        chmod(&live, 0o664);
+        let plan = make_plan(&fixture, &report);
+        let result = execute_shared_apply(
+            &plan,
+            &options(&fixture, &plan, "mode-symlink", false, true, true),
+        );
+        let journal_path = result.journal_path.clone().unwrap();
+        let outside = fixture.0.join("outside.cht");
+        fs::write(&outside, b"new").unwrap();
+        chmod(&outside, 0o600);
+        fs::remove_file(&live).unwrap();
+        std::os::unix::fs::symlink(&outside, &live).unwrap();
+        let rollback = preview_shared_rollback(
+            &journal_path,
+            &fixture.destination_root(),
+            &fixture.backup_root(),
+        );
+        assert!(!rollback.available);
+        assert_eq!(
+            rollback.entries[0].outcome,
+            SharedRollbackOutcome::DestinationUnsafe
+        );
+        let refused = confirm_rollback(&fixture, &rollback, "mode-symlink-undo");
+        assert_eq!(refused.status, SharedApplyStatus::Failed);
+        assert_eq!(fs::read(&outside).unwrap(), b"new");
+        assert_eq!(mode_of(&outside), 0o600);
+        assert!(
+            fs::symlink_metadata(&live)
+                .unwrap()
+                .file_type()
+                .is_symlink()
+        );
+    }
+
+    /// Apply's own automatic restore after a failed content check uses the
+    /// recorded mode too.
+    #[cfg(unix)]
+    #[test]
+    fn restore_after_failed_verification_restores_recorded_bits() {
+        let fixture = Fixture::new("mode-verify-restore");
+        let report = preview(&fixture, b"new", Some(b"old"));
+        let live = fixture.destination_root().join("Nintendo - NES/game.cht");
+        chmod(&live, 0o664);
+        let plan = make_plan(&fixture, &report);
+        let result = execute_shared_apply(
+            &plan,
+            &options(&fixture, &plan, "mode-verify", false, true, true),
+        );
+        let entry = &result.journal.entries[0];
+        restore_after_failed_verification(&entry.plan_entry, entry, &live).unwrap();
+        assert_eq!(fs::read(&live).unwrap(), b"old");
+        assert_eq!(mode_of(&live), 0o664);
     }
 
     #[test]
