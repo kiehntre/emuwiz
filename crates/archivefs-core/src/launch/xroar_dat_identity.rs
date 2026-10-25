@@ -9,7 +9,7 @@
 //! What this does and does not establish:
 //! - platform family: "Dragon / Tandy CoCo" - from the matching catalogue.
 //! - dump identity: the exact hashes. The title is display-only metadata.
-//! - NOT machine choice (Dragon 32/64 vs CoCo 2/3 stays an explicit setting),
+//! - catalogue family constrains machine choice; hardware revision stays explicit,
 //!   NOT media completeness, NOT that the game boots or loads.
 //!
 //! Fail-closed: a hash that also appears in a catalogue for any other or
@@ -50,8 +50,8 @@ const REVIEWED_SYSTEMS: &[(&str, DragonCocoCatalogue)] = &[
     ),
 ];
 
-/// Which catalogue family matched. Informational only: it never selects the
-/// XRoar machine, and the two families share some identical dumps.
+/// The catalogue family constrains compatible profiles. Hardware revision
+/// remains explicit; dumps catalogued in both families refuse as ambiguous.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 pub enum DragonCocoCatalogue {
     Dragon,
@@ -96,6 +96,7 @@ pub enum DragonCocoRefusalKind {
     NoExactMatch,
     EntryDisagrees,
     ForeignCatalogueMatch,
+    AmbiguousCatalogueMatch,
     NotCassetteCatalogue,
 }
 
@@ -284,6 +285,15 @@ pub fn verify_dragon_coco_cassette(
             ),
         });
     }
+    if matches
+        .iter()
+        .any(|entry| entry.catalogue != matches[0].catalogue)
+    {
+        return Err(refuse(
+            DragonCocoRefusalKind::AmbiguousCatalogueMatch,
+            "the exact cassette is catalogued for both Dragon and CoCo; machine family is ambiguous",
+        ));
+    }
     Ok(DragonCocoCassetteEvidence {
         path: path.to_path_buf(),
         file_identity: hashes.identity,
@@ -296,6 +306,15 @@ pub fn verify_dragon_coco_cassette(
 }
 
 impl DragonCocoCassetteEvidence {
+    pub fn supports_machine(&self, machine: crate::patch_manager::XRoarMachine) -> bool {
+        use crate::patch_manager::XRoarMachine;
+        let expected = match machine {
+            XRoarMachine::Dragon32 | XRoarMachine::Dragon64 => DragonCocoCatalogue::Dragon,
+            XRoarMachine::CoCo2 | XRoarMachine::CoCo3 => DragonCocoCatalogue::TandyColorComputer,
+        };
+        !self.matches.is_empty() && self.matches.iter().all(|entry| entry.catalogue == expected)
+    }
+
     /// Family-level identity keyed by the verified dump hash.
     pub fn identity_status(&self) -> CanonicalIdentityStatus {
         CanonicalIdentityStatus::Resolved(ResolvedIdentity {
@@ -331,8 +350,8 @@ impl DragonCocoCassetteEvidence {
         vec![
             "XRoar opens with this cassette inserted; it does not start the tape by itself.".into(),
             "Type CLOAD then RUN for a BASIC program, or CLOADM then EXEC for machine code.".into(),
-            "The machine is the one selected in Emulator Setup. The catalogue does not choose \
-             it, and a tape for the other machine may not run."
+            "Select a compatible machine revision explicitly. The catalogue verifies the \
+             Dragon or CoCo family, not hardware requirements or bootability."
                 .into(),
         ]
     }
@@ -409,6 +428,30 @@ mod tests {
     }
 
     #[test]
+    fn exact_catalogue_family_constrains_all_supported_machines() {
+        use crate::patch_manager::XRoarMachine;
+        let dir = tempfile::tempdir().unwrap();
+        let tape = cassette(dir.path(), "unhelpful-name.cas", GAME);
+        for (name, dragon_family) in [
+            ("Dragon Data Dragon - Games - [CAS]", true),
+            (
+                "Tandy Radio Shack TRS-80 Color Computer - Games - [CAS]",
+                false,
+            ),
+        ] {
+            let dat = source(dir.path(), "family.dat", name, GAME, GAME.len() as u64);
+            let evidence = verify_dragon_coco_cassette(&tape, &[dat]).unwrap();
+            for machine in XRoarMachine::ALL {
+                assert_eq!(
+                    evidence.supports_machine(machine),
+                    dragon_family
+                        == matches!(machine, XRoarMachine::Dragon32 | XRoarMachine::Dragon64)
+                );
+            }
+        }
+    }
+
+    #[test]
     fn matching_name_without_matching_bytes_is_not_identity() {
         let dir = tempfile::tempdir().unwrap();
         let tape = cassette(
@@ -423,7 +466,7 @@ mod tests {
     }
 
     #[test]
-    fn dragon_and_coco_catalogues_both_match_without_choosing_a_machine() {
+    fn dragon_and_coco_catalogue_collision_refuses_ambiguous_machine_family() {
         let dir = tempfile::tempdir().unwrap();
         let coco = source(
             dir.path(),
@@ -433,9 +476,13 @@ mod tests {
             GAME.len() as u64,
         );
         let tape = cassette(dir.path(), "t.cas", GAME);
-        let evidence = verify_dragon_coco_cassette(&tape, &[dragon(dir.path()), coco]).unwrap();
-        assert_eq!(evidence.matches.len(), 2);
-        assert!(evidence.catalogue_summary().contains("Color Computer"));
+        assert_eq!(
+            kind(verify_dragon_coco_cassette(
+                &tape,
+                &[dragon(dir.path()), coco]
+            )),
+            DragonCocoRefusalKind::AmbiguousCatalogueMatch
+        );
     }
 
     #[test]

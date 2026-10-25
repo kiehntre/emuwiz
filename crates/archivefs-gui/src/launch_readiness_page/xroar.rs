@@ -132,7 +132,12 @@ impl Context {
             candidate.readiness,
             LaunchReadiness::Ready | LaunchReadiness::ReadyWithWarnings
         );
+        let machine = profile_id
+            .rsplit(':')
+            .next()
+            .and_then(archivefs_core::patch_manager::XRoarMachine::parse)?;
         (ready
+            && evidence.supports_machine(machine)
             && candidate.blockers.is_empty()
             && !candidate.content.requires_mount
             && candidate.content.resolved_path.as_deref() == Some(self.selected.as_path())
@@ -191,8 +196,19 @@ impl Request {
     ) -> Result<archivefs_core::launch::process_spawn::WatchedProcess, String> {
         let fresh = verify_against(&self.evidence.path, catalogues)
             .map_err(|refusal| format!("XRoar was not started: {}", refusal.detail))?;
-        if fresh.sha1 != self.evidence.sha1 || fresh.file_identity != self.evidence.file_identity {
+        if fresh.sha1 != self.evidence.sha1
+            || fresh.file_identity != self.evidence.file_identity
+            || fresh.matches != self.evidence.matches
+        {
             return Err("XRoar was not started: the cassette changed since it was verified".into());
+        }
+        let profile = archivefs_core::patch_manager::discover_xroar_profiles(roots)
+            .profiles
+            .into_iter()
+            .find(|p| p.profile_id == self.profile_id)
+            .ok_or("XRoar was not started: the selected profile is unavailable")?;
+        if !fresh.supports_machine(profile.machine) {
+            return Err("XRoar was not started: the selected machine does not match the cassette catalogue family".into());
         }
         let request = XRoarLaunchRequest {
             selected_content_path: fresh.path.clone(),
@@ -280,6 +296,7 @@ mod tests {
                 .unwrap_or_default(),
             path_env: None,
             selected_machine: Some(selected),
+            firmware_directory: None,
             firmware,
         }
     }
@@ -426,6 +443,27 @@ mod tests {
     }
 
     #[test]
+    fn a_dragon_match_cannot_launch_a_coco_profile() {
+        let fixture = fixture();
+        let mut request = request_for(&fixture);
+        let executable = request.expected_executable.clone();
+        let coco = roots(
+            Some(&executable),
+            XRoarMachine::CoCo2,
+            XRoarMachine::CoCo2,
+            XRoarFirmwareState::PresentUnverified,
+        );
+        request.profile_id = discover_xroar_profiles(&coco).profiles[0]
+            .profile_id
+            .clone();
+        assert!(
+            request
+                .execute_with(&catalogues(&fixture.sources), &coco)
+                .is_err()
+        );
+    }
+
+    #[test]
     fn unverified_cassette_gets_no_play_button() {
         let dir = tempfile::tempdir().unwrap();
         let tape = dir.path().join("tape.cas");
@@ -522,6 +560,55 @@ mod tests {
             panic!("launch should start");
         };
         assert!(wait_exit(process), "process exit was not reported");
+    }
+
+    #[test]
+    fn checked_bios_is_bound_to_spawn_and_removed_bios_refuses() {
+        let mut fixture = fixture();
+        let bios = fixture._dir.path().join("bios");
+        std::fs::create_dir(&bios).unwrap();
+        fixture.roots.firmware_directory = Some(bios.clone());
+        assert!(
+            request_for(&fixture)
+                .execute_with(&catalogues(&fixture.sources), &fixture.roots)
+                .is_err()
+        );
+        std::fs::write(bios.join("d32.rom"), vec![0u8; 16384]).unwrap();
+        let request = request_for(&fixture);
+        let native = XRoarLaunchRequest {
+            selected_content_path: fixture.tape.clone(),
+            expected_platform_id: DRAGON_COCO_PLATFORM_ID.into(),
+            profile_id: request.profile_id.clone(),
+            expected_executable: request.expected_executable.clone(),
+            expected_content_identity: request.evidence.file_identity,
+        };
+        let command = archivefs_core::launch::preflight_xroar_launch(
+            &native,
+            &fixture.roots,
+            &fixture.context.result.as_ref().unwrap().identity_status(),
+        )
+        .unwrap();
+        assert_eq!(command.arguments[0], "-no-c");
+        assert!(
+            command
+                .arguments
+                .windows(2)
+                .any(|args| args[0] == "-extbas" && args[1] == bios.join("d32.rom").as_os_str())
+        );
+        let original = std::fs::read(&fixture.tape).unwrap();
+        assert!(wait_exit(
+            request
+                .clone()
+                .execute_with(&catalogues(&fixture.sources), &fixture.roots)
+                .unwrap()
+        ));
+        assert_eq!(std::fs::read(&fixture.tape).unwrap(), original);
+        std::fs::remove_file(bios.join("d32.rom")).unwrap();
+        assert!(
+            request
+                .execute_with(&catalogues(&fixture.sources), &fixture.roots)
+                .is_err()
+        );
     }
 
     #[test]

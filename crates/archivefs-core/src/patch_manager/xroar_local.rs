@@ -93,6 +93,8 @@ pub struct XRoarProfileDiscoveryRoots {
     pub path_env: Option<std::ffi::OsString>,
     pub selected_machine: Option<XRoarMachine>,
     pub firmware: XRoarFirmwareState,
+    /// Explicit directory used for machine-specific ROM checks and command binding.
+    pub firmware_directory: Option<PathBuf>,
 }
 
 impl Default for XRoarProfileDiscoveryRoots {
@@ -101,6 +103,7 @@ impl Default for XRoarProfileDiscoveryRoots {
             explicit_profiles: Vec::new(),
             path_env: None,
             selected_machine: None,
+            firmware_directory: None,
             firmware: XRoarFirmwareState::Unknown,
         }
     }
@@ -111,17 +114,65 @@ impl XRoarProfileDiscoveryRoots {
         let selected_machine = env::var(XROAR_MACHINE_ENV)
             .ok()
             .and_then(|value| XRoarMachine::parse(&value));
-        let firmware = match env::var_os(XROAR_FIRMWARE_DIRECTORY_ENV) {
-            Some(path) if Path::new(&path).is_dir() => XRoarFirmwareState::PresentUnverified,
-            Some(_) => XRoarFirmwareState::Missing,
-            None => XRoarFirmwareState::Unknown,
+        let firmware_directory = env::var_os(XROAR_FIRMWARE_DIRECTORY_ENV)
+            .map(PathBuf::from)
+            .and_then(|path| fs::canonicalize(path).ok());
+        let firmware = match (selected_machine, firmware_directory.as_deref()) {
+            (Some(machine), Some(path)) => inspect_xroar_firmware(path, machine),
+            (_, _) if env::var_os(XROAR_FIRMWARE_DIRECTORY_ENV).is_some() => {
+                XRoarFirmwareState::Missing
+            }
+            _ => XRoarFirmwareState::Unknown,
         };
         Self {
             path_env: env::var_os("PATH"),
             selected_machine,
             firmware,
+            firmware_directory,
             ..Self::default()
         }
+    }
+}
+
+/// Canonical ROM names/sizes from the XRoar manual. This checks presence and
+/// readability only; it never claims a verified BIOS hash.
+/// https://www.6809.org.uk/xroar/doc/xroar.shtml#Prerequisites
+impl XRoarMachine {
+    pub(crate) fn cassette_roms(self) -> &'static [(&'static str, &'static str, u64)] {
+        match self {
+            XRoarMachine::Dragon32 => &[("-extbas", "d32.rom", 16384)],
+            XRoarMachine::Dragon64 => &[
+                ("-extbas", "d64_1.rom", 16384),
+                ("-altbas", "d64_2.rom", 16384),
+            ],
+            XRoarMachine::CoCo2 => &[
+                ("-bas", "bas13.rom", 8192),
+                ("-extbas", "extbas11.rom", 8192),
+            ],
+            XRoarMachine::CoCo3 => &[("-extbas", "coco3.rom", 32768)],
+        }
+    }
+}
+
+fn inspect_xroar_firmware(directory: &Path, machine: XRoarMachine) -> XRoarFirmwareState {
+    use std::io::Read;
+    use std::os::unix::fs::OpenOptionsExt;
+    let present = machine.cassette_roms().iter().all(|(_, name, size)| {
+        let Ok(mut file) = fs::OpenOptions::new()
+            .read(true)
+            .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK)
+            .open(directory.join(name))
+        else {
+            return false;
+        };
+        file.metadata()
+            .is_ok_and(|meta| meta.is_file() && meta.len() == *size)
+            && file.read_exact(&mut [0u8; 1]).is_ok()
+    });
+    if present {
+        XRoarFirmwareState::PresentUnverified
+    } else {
+        XRoarFirmwareState::Missing
     }
 }
 
@@ -185,6 +236,12 @@ pub fn discover_xroar_profiles(roots: &XRoarProfileDiscoveryRoots) -> XRoarProfi
             machine_profiles
         };
         for (machine, firmware) in machine_profiles {
+            let firmware = roots
+                .firmware_directory
+                .as_deref()
+                .map_or(firmware, |directory| {
+                    inspect_xroar_firmware(directory, machine)
+                });
             let selected = roots.selected_machine;
             let blocker = if selected.is_none() {
                 Some("an explicit Dragon/CoCo machine must be selected".to_string())
@@ -233,6 +290,42 @@ mod tests {
     use super::*;
     use std::fs;
     use tempfile::tempdir;
+
+    #[test]
+    fn cassette_bios_must_be_readable_regular_and_machine_specific() {
+        use std::os::unix::fs::symlink;
+        let directory = tempdir().unwrap();
+        for machine in XRoarMachine::ALL {
+            let root = directory.path().join(machine.flag());
+            fs::create_dir(&root).unwrap();
+            assert_eq!(
+                inspect_xroar_firmware(&root, machine),
+                XRoarFirmwareState::Missing
+            );
+            for (_, name, size) in machine.cassette_roms() {
+                fs::write(root.join(name), vec![0u8; *size as usize]).unwrap();
+            }
+            assert_eq!(
+                inspect_xroar_firmware(&root, machine),
+                XRoarFirmwareState::PresentUnverified
+            );
+            let (_, name, _) = machine.cassette_roms()[0];
+            let original = root.join(name);
+            let moved = root.join("saved.rom");
+            fs::rename(&original, &moved).unwrap();
+            symlink(&moved, &original).unwrap();
+            assert_eq!(
+                inspect_xroar_firmware(&root, machine),
+                XRoarFirmwareState::Missing
+            );
+            fs::remove_file(&original).unwrap();
+            fs::write(&original, b"truncated").unwrap();
+            assert_eq!(
+                inspect_xroar_firmware(&root, machine),
+                XRoarFirmwareState::Missing
+            );
+        }
+    }
 
     #[cfg(unix)]
     #[test]

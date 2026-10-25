@@ -1509,28 +1509,37 @@ impl ArchiveFsApp {
         let xroar_roots =
             archivefs_core::patch_manager::XRoarProfileDiscoveryRoots::from_environment();
         let xroar_discovery = archivefs_core::patch_manager::discover_xroar_profiles(&xroar_roots);
-        standalone_profiles.extend(xroar_discovery.profiles.iter().map(|profile| {
-            archivefs_core::launch::StandaloneProfileInput {
-                adapter_id: "xroar",
-                profile_id: profile.profile_id.clone(),
-                profile_path: Some(profile.executable.path.clone()),
-                eligible: profile.eligible,
-                firmware: match profile.firmware {
-                    archivefs_core::patch_manager::XRoarFirmwareState::Verified => {
-                        archivefs_core::launch::FirmwareReadiness::Verified
-                    }
-                    archivefs_core::patch_manager::XRoarFirmwareState::PresentUnverified => {
-                        archivefs_core::launch::FirmwareReadiness::PresentUnverified
-                    }
-                    archivefs_core::patch_manager::XRoarFirmwareState::Missing => {
-                        archivefs_core::launch::FirmwareReadiness::Missing
-                    }
-                    archivefs_core::patch_manager::XRoarFirmwareState::Unknown => {
-                        archivefs_core::launch::FirmwareReadiness::Unknown
-                    }
-                },
-            }
-        }));
+        standalone_profiles.extend(
+            xroar_discovery
+                .profiles
+                .iter()
+                .filter(|profile| {
+                    xroar_context
+                        .as_ref()
+                        .and_then(|context| context.result.as_ref().ok())
+                        .is_some_and(|evidence| evidence.supports_machine(profile.machine))
+                })
+                .map(|profile| archivefs_core::launch::StandaloneProfileInput {
+                    adapter_id: "xroar",
+                    profile_id: profile.profile_id.clone(),
+                    profile_path: Some(profile.executable.path.clone()),
+                    eligible: profile.eligible,
+                    firmware: match profile.firmware {
+                        archivefs_core::patch_manager::XRoarFirmwareState::Verified => {
+                            archivefs_core::launch::FirmwareReadiness::Verified
+                        }
+                        archivefs_core::patch_manager::XRoarFirmwareState::PresentUnverified => {
+                            archivefs_core::launch::FirmwareReadiness::PresentUnverified
+                        }
+                        archivefs_core::patch_manager::XRoarFirmwareState::Missing => {
+                            archivefs_core::launch::FirmwareReadiness::Missing
+                        }
+                        archivefs_core::patch_manager::XRoarFirmwareState::Unknown => {
+                            archivefs_core::launch::FirmwareReadiness::Unknown
+                        }
+                    },
+                }),
+        );
 
         // The remaining native adapters are additive inputs to the same
         // shared planner. Discovery and inspection are kept read-only and

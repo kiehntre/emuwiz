@@ -148,8 +148,14 @@ pub fn build_xroar_command_plan(
         command: Some(XRoarCommand {
             executable: profile.executable.path.clone(),
             arguments: vec![
+                "-no-c".into(),
                 "-machine".into(),
-                profile.machine.flag().into(),
+                match profile.machine {
+                    XRoarMachine::CoCo2 => "coco",
+                    machine => machine.flag(),
+                }
+                .into(),
+                "-no-machine-cart".into(),
                 "-load-tape".into(),
                 content.clone().into_os_string(),
             ],
@@ -225,8 +231,10 @@ mod tests {
         );
         let command = plan.command.unwrap();
         let expected: Vec<OsString> = [
+            "-no-c",
             "-machine",
             "dragon32",
+            "-no-machine-cart",
             "-load-tape",
             "/media/Dragon Game.cas",
         ]
@@ -244,6 +252,23 @@ mod tests {
             &profile(XRoarMachine::CoCo3),
         );
         assert!(plan.command.is_some());
+    }
+
+    #[test]
+    fn coco2_uses_a_documented_builtin_profile() {
+        let command = build_xroar_command_plan(
+            &id("Dragon / Tandy CoCo"),
+            &candidate("game.cas"),
+            &profile(XRoarMachine::CoCo2),
+        )
+        .command
+        .unwrap();
+        assert!(
+            command
+                .arguments
+                .windows(2)
+                .any(|args| args[0] == "-machine" && args[1] == "coco")
+        );
     }
 
     #[test]
