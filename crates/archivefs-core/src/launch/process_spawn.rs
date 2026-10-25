@@ -445,6 +445,31 @@ pub(crate) fn spawn_watched_process_with_assets(
     spawn_watched_process_inner(command, &[], &fds, None, Some(Box::new(on_exit)), false)
 }
 
+/// Native SRAM observation owns only child environment, selected descriptors
+/// and completion callbacks; the canonical watcher still owns process lifetime.
+#[cfg(target_os = "linux")]
+pub(crate) fn spawn_watched_process_observed(
+    command: &PreparedProcessCommand,
+    environment: &[(std::ffi::OsString, std::ffi::OsString)],
+    files: &[&std::fs::File],
+    on_start: impl FnOnce(u32) + 'static,
+    on_exit: impl FnOnce(&ProcessExitReport) + Send + 'static,
+) -> std::io::Result<WatchedProcess> {
+    use std::os::fd::AsRawFd;
+    let fds: Vec<_> = files.iter().map(|file| file.as_raw_fd()).collect();
+    if fds.iter().any(|fd| *fd < 3) {
+        return Err(std::io::Error::other("Invalid observation descriptor"));
+    }
+    spawn_watched_process_inner(
+        command,
+        environment,
+        &fds,
+        Some(Box::new(on_start)),
+        Some(Box::new(on_exit)),
+        false,
+    )
+}
+
 fn spawn_watched_process_inner(
     command: &PreparedProcessCommand,
     environment: &[(std::ffi::OsString, std::ffi::OsString)],

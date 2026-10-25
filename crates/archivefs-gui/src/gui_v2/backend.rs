@@ -913,9 +913,7 @@ fn execute(id: u64, command: Command, answers: &Sender<Event>) -> Result<Payload
         }
         Command::PersistentStateInventory { roots, generation } => {
             Ok(Payload::PersistentStateInventory {
-                inventory: archivefs_core::persistent_state_inventory::inventory_persistent_state(
-                    &roots,
-                ),
+                inventory: archivefs_core::sram_provenance::inventory_with_sram_origins(&roots),
                 generation,
             })
         }

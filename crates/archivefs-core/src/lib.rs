@@ -135,6 +135,7 @@ pub mod save_migration_planner;
 /// Local immutable emulator-save snapshots and conservative restore previews.
 pub mod save_snapshots;
 pub mod self_update;
+pub mod sram_provenance;
 /// Legally generated media samples for the platform × format coverage suite.
 #[cfg(any(test, feature = "test-support"))]
 pub mod synthetic_media;
