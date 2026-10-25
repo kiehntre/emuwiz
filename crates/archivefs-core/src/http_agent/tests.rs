@@ -75,6 +75,7 @@ fn child() {
     let Ok(mode) = std::env::var(MODE) else {
         return;
     };
+    eprintln!("HTTP helper entered mode {mode}");
     if mode == "hang" {
         std::thread::sleep(Duration::from_secs(60));
         return;
@@ -119,6 +120,7 @@ fn child() {
         ),
         other => panic!("unknown child mode {other}"),
     };
+    eprintln!("HTTP helper requesting {url} in mode {mode}");
     let request = agent.get(&url);
     let outcome = if mode == "request_config" {
         request
@@ -129,6 +131,7 @@ fn child() {
     } else {
         request.call()
     };
+    eprintln!("HTTP helper completed: {outcome:?}");
     if mode == "resolver_refuses" {
         assert!(matches!(outcome, Err(ureq::Error::HostNotFound)));
     }

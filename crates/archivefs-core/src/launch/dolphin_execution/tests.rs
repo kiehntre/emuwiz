@@ -72,9 +72,17 @@ while running and not (root / 'release').exists():
     heartbeat += 1
     (root / (mode + '.heartbeat')).write_text(str(heartbeat))
     time.sleep(0.01)
+# A late stop may arrive after cooperative release, including while Python
+# resets handlers during interpreter shutdown. Keep TERM blocked throughout
+# teardown so this successful fixture exit stays successful.
+signal.pthread_sigmask(signal.SIG_BLOCK, {signal.SIGTERM})
 if child is not None:
     child.wait(timeout=5)
 (root / (mode + '.done')).write_text('done')
+if mode == 'exit-race':
+    while not (root / 'finish').exists():
+        time.sleep(0.01)
+    assert terms == 0, 'TERM was delivered during fixture teardown'
 "#;
 
     fn until(mut condition: impl FnMut() -> bool) {
@@ -174,6 +182,7 @@ if child is not None:
     impl Drop for SyntheticProcess {
         fn drop(&mut self) {
             self.release();
+            fs::write(self.fixture.path("finish"), b"finish").unwrap();
             // Wait for the existing watcher/callback, even if its public
             // handle was dropped. Private descendants exit on the same file.
             until(|| self.exit_callbacks.load(Ordering::SeqCst) == 1);
@@ -323,9 +332,12 @@ if child is not None:
 
     #[test]
     fn process_spawn_exit_concurrent_with_stop_has_no_unowned_fallback() {
-        let mut owned = SyntheticProcess::new("single");
+        let mut owned = SyntheticProcess::new("exit-race");
         let unrelated = SyntheticProcess::new("separate-group");
         owned.release();
+        until(|| owned.fixture.path("exit-race.done").exists());
+        // Release from a known teardown checkpoint, then race exit with stop.
+        fs::write(owned.fixture.path("finish"), b"finish").unwrap();
         let outcome = owned.stop(GracefulStopScope::LaunchedChild, Duration::from_secs(3));
         assert!(matches!(
             outcome,
@@ -333,6 +345,32 @@ if child is not None:
         ));
         assert!(owned.exit_report().status.as_ref().unwrap().success());
         unrelated.assert_alive("separate-group");
+    }
+
+    #[test]
+    fn process_spawn_stop_at_fixture_teardown_preserves_success_and_ownership() {
+        let mut owned = SyntheticProcess::new("exit-race");
+        let unrelated = SyntheticProcess::new("separate-group");
+        owned.watched.as_mut().unwrap().pid = unrelated.watched.as_ref().unwrap().pid;
+        owned.release();
+        until(|| owned.fixture.path("exit-race.done").exists());
+        // Force the late-signal window: the child is alive but has completed
+        // its work. Its teardown gate prevents an accidental early exit.
+        assert_eq!(
+            owned.stop(GracefulStopScope::LaunchedChild, Duration::ZERO),
+            GracefulStopOutcome::StillRunning {
+                request_already_pending: false
+            }
+        );
+        assert!(!owned.fixture.path("exit-race.terms").exists());
+        unrelated.assert_alive("separate-group");
+        fs::write(owned.fixture.path("finish"), b"finish").unwrap();
+        assert!(owned.exit_report().status.as_ref().unwrap().success());
+        assert_eq!(owned.exit_callbacks.load(Ordering::SeqCst), 1);
+        assert_eq!(
+            owned.stop(GracefulStopScope::LaunchedChild, Duration::ZERO),
+            GracefulStopOutcome::AlreadyExited
+        );
     }
 
     #[test]

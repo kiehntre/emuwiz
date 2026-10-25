@@ -255,7 +255,13 @@ impl ManagedChild {
                 self.terminate();
                 return Err(io::Error::new(
                     io::ErrorKind::TimedOut,
-                    "child deadline exceeded",
+                    format!(
+                        "child deadline exceeded; stdout: {}; stderr: {}",
+                        read_output(&mut self.stdout)
+                            .unwrap_or_else(|error| format!("<unavailable: {error}>")),
+                        read_output(&mut self.stderr)
+                            .unwrap_or_else(|error| format!("<unavailable: {error}>"))
+                    ),
                 ));
             }
             thread::sleep(POLL);
