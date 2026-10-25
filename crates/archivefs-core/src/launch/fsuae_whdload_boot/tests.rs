@@ -783,7 +783,7 @@ fn canonical_identity_must_match_selected_slave_digest() {
 fn executable_symlink_is_refused_instead_of_silently_followed() {
     let mut lab = Lab::new();
     let link = lab.root.path().join("linked-true");
-    symlink(lab.root.path().join("true"), &link).unwrap();
+    std::os::unix::fs::symlink(lab.root.path().join("true"), &link).unwrap();
     lab.request.profile.executable = Some(link);
     assert!(inspect_boot(&lab.request).is_err());
 }
