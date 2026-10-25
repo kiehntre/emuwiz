@@ -876,10 +876,38 @@ pub fn spawn_retroarch(
     spawn_retroarch_guarded(command, || Ok(()))
 }
 
+/// Bind the selected backend objects across snapshot/DAT resolution. Ordinary
+/// non-snapshot launch behavior remains unchanged.
+#[derive(PartialEq, Eq)]
+struct SnapshotBackendStamp {
+    identity: process_spawn::CapturedFileIdentity,
+    changed: (i64, i64),
+    mode: u32,
+    links: u64,
+}
+impl SnapshotBackendStamp {
+    fn capture(path: &Path) -> Result<Self, LaunchSpawnError> {
+        use std::os::unix::fs::MetadataExt;
+        let metadata = fs::symlink_metadata(path).map_err(LaunchSpawnError::Spawn)?;
+        if !metadata.is_file() || metadata.file_type().is_symlink() {
+            return Err(LaunchSpawnError::Spawn(std::io::Error::other(
+                "Unsafe snapshot backend object.",
+            )));
+        }
+        Ok(Self {
+            identity: process_spawn::CapturedFileIdentity::capture(&metadata),
+            changed: (metadata.ctime(), metadata.ctime_nsec()),
+            mode: metadata.mode(),
+            links: metadata.nlink(),
+        })
+    }
+}
+
 pub(crate) fn spawn_retroarch_guarded(
     command: RetroArchCommand,
     final_sources: impl FnOnce() -> Result<(), String>,
 ) -> Result<LaunchedRetroArchProcess, LaunchSpawnError> {
+    let mut backend_stamps = None;
     let current_snapshot = if command.selection.platform_id == "ZX Spectrum" {
         let evidence = command
             .snapshot_evidence
@@ -890,6 +918,10 @@ pub(crate) fn spawn_retroarch_guarded(
                     "Missing bound snapshot launch evidence.",
                 ))
             })?;
+        backend_stamps = Some((
+            SnapshotBackendStamp::capture(&command.executable)?,
+            SnapshotBackendStamp::capture(&command.selection.core_library)?,
+        ));
         Some(
             evidence
                 .revalidate()
@@ -909,6 +941,19 @@ pub(crate) fn spawn_retroarch_guarded(
         evidence
             .verify_read_guards()
             .map_err(|e| LaunchSpawnError::Spawn(std::io::Error::other(e)))?;
+    }
+    if let Some((frontend, core)) = backend_stamps {
+        recheck_selected_executable(&command.executable, command.selection.profile.profile_kind)
+            .map_err(|e| LaunchSpawnError::Spawn(std::io::Error::other(e.detail)))?;
+        recheck_core_library(&command.selection.core_library)
+            .map_err(|e| LaunchSpawnError::Spawn(std::io::Error::other(e.detail)))?;
+        if frontend != SnapshotBackendStamp::capture(&command.executable)?
+            || core != SnapshotBackendStamp::capture(&command.selection.core_library)?
+        {
+            return Err(LaunchSpawnError::Spawn(std::io::Error::other(
+                "The selected snapshot frontend or core changed during verification; recheck the installation.",
+            )));
+        }
     }
     let watched =
         process_spawn::spawn_watched_process(&prepared).map_err(LaunchSpawnError::Spawn)?;

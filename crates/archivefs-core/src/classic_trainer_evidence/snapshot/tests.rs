@@ -92,6 +92,30 @@ impl World {
             bytes,
         }
     }
+    fn command(&self) -> crate::launch::retroarch_command::RetroArchCommand {
+        use crate::emulator_environment::retroarch::{ProfileKind, ProfileRef, ProfileScope};
+        use crate::launch::retroarch_command::{RetroArchCommand, RetroArchCommandSelection};
+        let executable = self.root.join("frontend");
+        std::fs::copy("/usr/bin/true", &executable).unwrap();
+        let core = self.root.join("core.so");
+        std::fs::write(&core, b"original fixture core").unwrap();
+        RetroArchCommand {
+            snapshot_evidence: Some(self.load().unwrap()),
+            executable,
+            arguments: vec![],
+            working_directory: None,
+            selection: RetroArchCommandSelection {
+                profile: ProfileRef {
+                    profile_kind: ProfileKind::Native,
+                    scope: ProfileScope::User,
+                },
+                core_stem: "fuse".into(),
+                platform_id: "ZX Spectrum".into(),
+                core_library: core,
+                content_path: self.path.clone(),
+            },
+        }
+    }
     fn load(&self) -> Result<SnapshotEvidence, String> {
         SnapshotEvidence::load_at(
             &self.path,
@@ -202,25 +226,8 @@ fn unsafe_file_and_platform_drift_refuse() {
 
 #[test]
 fn final_spawn_refuses_changed_or_missing_snapshot_authority() {
-    use crate::emulator_environment::retroarch::{ProfileKind, ProfileRef, ProfileScope};
-    use crate::launch::retroarch_command::{RetroArchCommand, RetroArchCommandSelection};
     let w = World::new();
-    let mut command = RetroArchCommand {
-        snapshot_evidence: Some(w.load().unwrap()),
-        executable: "/usr/bin/true".into(),
-        arguments: vec![],
-        working_directory: None,
-        selection: RetroArchCommandSelection {
-            profile: ProfileRef {
-                profile_kind: ProfileKind::Native,
-                scope: ProfileScope::User,
-            },
-            core_stem: "fuse".into(),
-            platform_id: "ZX Spectrum".into(),
-            core_library: "/missing/core".into(),
-            content_path: w.path.clone(),
-        },
-    };
+    let mut command = w.command();
     std::fs::write(w.root.join("dat-sources.toml"), "sources = []\n").unwrap();
     assert!(crate::launch::spawn_retroarch(command.clone()).is_err());
     command.snapshot_evidence = None;
@@ -257,25 +264,8 @@ fn config_withdrawal_during_catalogue_resolution_is_refused() {
 }
 #[test]
 fn final_runtime_sources_run_after_identity_and_guards_run_after_sources() {
-    use crate::emulator_environment::retroarch::{ProfileKind, ProfileRef, ProfileScope};
-    use crate::launch::retroarch_command::{RetroArchCommand, RetroArchCommandSelection};
     let w = World::new();
-    let command = RetroArchCommand {
-        snapshot_evidence: Some(w.load().unwrap()),
-        executable: "/usr/bin/true".into(),
-        arguments: vec![],
-        working_directory: None,
-        selection: RetroArchCommandSelection {
-            profile: ProfileRef {
-                profile_kind: ProfileKind::Native,
-                scope: ProfileScope::User,
-            },
-            core_stem: "fuse".into(),
-            platform_id: "ZX Spectrum".into(),
-            core_library: "/missing/core".into(),
-            content_path: w.path.clone(),
-        },
-    };
+    let command = w.command();
     let called = std::cell::Cell::new(false);
     let outcome = crate::launch::execution::spawn_retroarch_guarded(command, || {
         called.set(true);
@@ -290,4 +280,36 @@ fn final_runtime_sources_run_after_identity_and_guards_run_after_sources() {
         outcome.is_err(),
         "source withdrawal during final checks must prevent spawn"
     );
+}
+
+#[test]
+fn snapshot_backend_changes_during_final_verification_refuse_even_without_cheats() {
+    use std::os::unix::fs::PermissionsExt;
+    for mutation in 0..4 {
+        let w = World::new();
+        let command = w.command();
+        let frontend = command.executable.clone();
+        let core = command.selection.core_library.clone();
+        let result = crate::launch::execution::spawn_retroarch_guarded(command, || {
+            match mutation {
+                0 => {
+                    let replacement = w.root.join("replacement");
+                    std::fs::copy("/usr/bin/false", &replacement).unwrap();
+                    std::fs::rename(replacement, &frontend).unwrap();
+                }
+                1 => std::fs::write(&core, b"changed fixture core!").unwrap(),
+                2 => std::fs::set_permissions(&frontend, std::fs::Permissions::from_mode(0o600))
+                    .unwrap(),
+                _ => {
+                    std::fs::remove_file(&core).unwrap();
+                    std::os::unix::fs::symlink(w.root.join("fixture.dat"), &core).unwrap();
+                }
+            }
+            Ok(())
+        });
+        assert!(
+            result.is_err(),
+            "backend mutation {mutation} must prevent spawn"
+        );
+    }
 }

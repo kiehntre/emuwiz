@@ -130,7 +130,10 @@ adopt another snapshot's pending result.
 
 The normal request retains the exact readiness proof. Canonical preflight
 revalidates it and compares the canonical snapshot SHA-256 key; the command
-retains it for another fresh revalidation immediately before spawn. The other
+retains it for another fresh revalidation immediately before spawn. Snapshot
+commands also bind and recheck the selected frontend/core object identities,
+permissions and ctime across that resolver, including plain baseline launches.
+The other
 platform paths keep their existing identity logic. The POKE projection and
 approved binary digests are unchanged.
 
