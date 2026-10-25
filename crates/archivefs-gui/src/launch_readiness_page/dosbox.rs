@@ -82,6 +82,22 @@ pub(crate) fn check_dosbox_game(
             );
         }
     }
+    match std::fs::canonicalize(selected) {
+        Ok(real) if real != selected => {
+            return refused(format!(
+                "The selected game path {} is not canonical or passes through a symbolic link. Select the real folder or executable at {}, then check again.",
+                selected.display(),
+                real.display()
+            ));
+        }
+        Err(error) => {
+            return refused(format!(
+                "The selected game path {} is unavailable: {error}. Restore it, then check again.",
+                selected.display()
+            ));
+        }
+        _ => {}
+    }
     let Some(game_directory) = locate_dosbox_game_directory(selected, None) else {
         return refused(format!(
             "No folder with a usable dosbox.conf was found at {} or the folders just above it. \
