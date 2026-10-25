@@ -189,6 +189,8 @@ pub mod xemu_command;
 pub mod xemu_execution;
 pub mod xenia_command;
 pub mod xenia_execution;
+#[cfg(target_os = "linux")]
+mod xroar_bound_launch;
 pub mod xroar_command;
 pub mod xroar_dat_identity;
 pub mod xroar_execution;
@@ -592,8 +594,9 @@ pub use xroar_dat_identity::{
     verify_dragon_coco_cassette,
 };
 pub use xroar_execution::{
-    XRoarLaunchExecutionError, XRoarLaunchPreflightError, XRoarLaunchPreflightErrorKind,
-    XRoarLaunchRequest, preflight_and_launch_xroar, preflight_xroar_launch, spawn_xroar,
+    PreparedXRoarLaunch, XRoarLaunchExecutionError, XRoarLaunchPreflightError,
+    XRoarLaunchPreflightErrorKind, XRoarLaunchRequest, preflight_and_launch_xroar,
+    preflight_xroar_launch, spawn_xroar,
 };
 
 /// Read-only per-game Dolphin profile guidance.
