@@ -11,7 +11,7 @@ use std::path::{Component, Path, PathBuf};
 
 use crate::bezel_apply::{
     BezelApplyPlan, BezelApplyRequest, BezelApplyStatus, BezelConfigEntry, BezelFilePurpose,
-    BezelPlanError, BezelPlanRefusal, BezelPlannedFile,
+    BezelPlanError, BezelPlanRefusal, BezelPlannedFile, RetroArchContentIdentity,
 };
 use crate::patch_manager::{
     PreviewAdapter, PreviewIdentity, PreviewIdentityKind, PreviewIdentityState,
@@ -86,27 +86,30 @@ pub fn prepare_retroarch_bezel_plan(
             "source bezel filename is not a safe single path component",
         ));
     };
-    if !safe_component(core) || !safe_component(&plan.target.resolved_identity) {
+    let Some(launch) = request.retroarch_launch.as_ref() else {
         return Ok(refuse(
             plan,
-            BezelPlanRefusal::RetroArchUnsafeName,
-            "RetroArch core and game identity must be safe path components",
+            BezelPlanRefusal::RetroArchLaunchIdentityUnknown,
+            "the exact content file and RetroArch core this game launches with are not confirmed, so no per-game override is written (RetroArch never loads one named after a display title)",
+        ));
+    };
+    if core != launch.core_library_name {
+        return Ok(refuse(
+            plan,
+            BezelPlanRefusal::RetroArchLaunchIdentityUnknown,
+            "the selected core is not the core this game launches with",
         ));
     }
+    let override_path = match retroarch_game_override_path(&config_path, &config_root, launch) {
+        Ok(path) => path,
+        Err((refusal, detail)) => return Ok(refuse(plan, refusal, &detail)),
+    };
     let descriptor_name = format!("emuwiz-{}.cfg", stem(&image_name));
     let descriptor = overlay_root.join(&descriptor_name);
-    let override_path = config_root
-        .join("config")
-        .join(core)
-        .join(format!("{}.cfg", plan.target.resolved_identity));
     let overlay_ref = descriptor.display().to_string();
     let existing_override = read_optional(&override_path)?;
     let merged_override = merge_override(existing_override.as_deref(), &overlay_ref);
-    let descriptor_bytes = format!(
-        "overlays = 1\noverlay0_overlay = \"{}\"\noverlay0_full_screen = true\n",
-        image_name.replace('"', "")
-    )
-    .into_bytes();
+    let descriptor_bytes = overlay_descriptor(&image_name);
     let destinations = [
         (
             overlay_root.join(&image_name),
@@ -221,15 +224,12 @@ pub fn apply_retroarch_bezel_plan(
     let image_name = safe_name(plan.source.path.file_name())
         .ok_or_else(|| apply_error("unsafe source filename"))?;
     let descriptor = overlay_root.join(format!("emuwiz-{}.cfg", stem(&image_name)));
-    let override_path = config_root
-        .join("config")
-        .join(
-            plan.target
-                .core
-                .as_deref()
-                .ok_or_else(|| apply_error("RetroArch core is missing"))?,
-        )
-        .join(format!("{}.cfg", plan.target.resolved_identity));
+    // The sealed plan recorded where RetroArch looks for this game's override.
+    let override_path = plan
+        .config_entries
+        .first()
+        .map(|entry| entry.path.clone())
+        .ok_or_else(|| apply_error("RetroArch plan has no per-game override entry"))?;
     let existing_override =
         read_optional(&override_path).map_err(|e| apply_error(&e.to_string()))?;
     let merged = merge_override(
@@ -241,18 +241,36 @@ pub fn apply_retroarch_bezel_plan(
             "existing user overlay setting requires explicit replacement approval",
         ));
     }
-    let descriptor_bytes = format!(
-        "overlays = 1\noverlay0_overlay = \"{}\"\noverlay0_full_screen = true\n",
-        image_name.replace('"', "")
-    )
-    .into_bytes();
+    let descriptor_bytes = overlay_descriptor(&image_name);
+    // Changing any existing file is a replacement. Refuse before staging so
+    // an unapproved run never half-applies and then rolls itself back.
+    if !options.replacement_approved {
+        let new_digest = |path: &Path| {
+            if path == override_path {
+                Some(crate::bezel_apply::digest_bytes(&merged.bytes))
+            } else if path == descriptor {
+                Some(crate::bezel_apply::digest_bytes(&descriptor_bytes))
+            } else {
+                Some(plan.source.sha256.clone())
+            }
+        };
+        if plan
+            .files
+            .iter()
+            .any(|file| file.exists && file.existing_sha256 != new_digest(&file.path))
+        {
+            return Err(apply_error(
+                "changing existing RetroArch files requires explicit replacement approval",
+            ));
+        }
+    }
     let stage = tempfile::tempdir().map_err(|e| apply_error(&e.to_string()))?;
     let staged_image = stage.path().join("source.bin");
     let staged_descriptor = stage.path().join("overlay.cfg");
     let staged_override = stage.path().join("override.cfg");
     fs::copy(&plan.source.path, &staged_image).map_err(|e| apply_error(&e.to_string()))?;
     fs::write(&staged_descriptor, &descriptor_bytes).map_err(|e| apply_error(&e.to_string()))?;
-    fs::write(&staged_override, merged.bytes).map_err(|e| apply_error(&e.to_string()))?;
+    fs::write(&staged_override, &merged.bytes).map_err(|e| apply_error(&e.to_string()))?;
     let relative = |path: &Path| {
         path.strip_prefix(config_root)
             .map(Path::to_path_buf)
@@ -350,6 +368,97 @@ pub fn apply_retroarch_bezel_plan(
     Ok(result)
 }
 
+/// RetroArch's per-game override for `launch`:
+/// `<config directory>/<core library_name>/<content file stem>.cfg`, where
+/// the config directory is `rgui_config_directory` or, when unset or
+/// `default`, `config` beside retroarch.cfg (the same rules as
+/// `launch::retroarch_overrides`). Anything that cannot be resolved exactly
+/// inside the selected RetroArch folder is refused, never guessed.
+fn retroarch_game_override_path(
+    config_path: &Path,
+    config_root: &Path,
+    launch: &RetroArchContentIdentity,
+) -> Result<PathBuf, (BezelPlanRefusal, String)> {
+    if !launch.content_path.is_absolute() {
+        return Err((
+            BezelPlanRefusal::RetroArchLaunchIdentityUnknown,
+            "the launch content path is not absolute".into(),
+        ));
+    }
+    let content_stem = launch
+        .content_path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .map(stem)
+        .filter(|value| safe_component(value))
+        .ok_or_else(|| {
+            (
+                BezelPlanRefusal::RetroArchUnsafeName,
+                "the launch content file name cannot name a RetroArch override".to_string(),
+            )
+        })?;
+    if !safe_component(&launch.core_library_name) {
+        return Err((
+            BezelPlanRefusal::RetroArchUnsafeName,
+            "the core library name cannot name a RetroArch override folder".into(),
+        ));
+    }
+    let text = read_optional(config_path)
+        .map_err(|error| (error.refusal, error.detail))?
+        .map(|bytes| String::from_utf8_lossy(&bytes).into_owned())
+        .unwrap_or_default();
+    // The last assignment wins, as in RetroArch.
+    let configured = text
+        .lines()
+        .filter_map(|line| {
+            let (key, value) = line.split_once('=')?;
+            (key.trim() == "rgui_config_directory")
+                .then(|| value.trim().trim_matches('"').to_string())
+        })
+        .next_back();
+    let directory = match configured.as_deref() {
+        None | Some("") | Some("default") => config_root.join("config"),
+        Some(value) => {
+            let expanded = crate::launch::retroarch_overrides::expand_directory(
+                value,
+                launch.home.as_deref(),
+            )
+            .map_err(|reason| {
+                (
+                    BezelPlanRefusal::RetroArchConfigScopeInvalid,
+                    format!(
+                        "RetroArch's rgui_config_directory {value:?} cannot be used ({reason})"
+                    ),
+                )
+            })?;
+            if !is_safe_relative(config_root, &expanded) {
+                return Err((
+                    BezelPlanRefusal::RetroArchConfigScopeInvalid,
+                    format!(
+                        "RetroArch's rgui_config_directory {value:?} is outside the selected RetroArch folder, so EmuWiz cannot place the override safely"
+                    ),
+                ));
+            }
+            expanded
+        }
+    };
+    Ok(directory
+        .join(&launch.core_library_name)
+        .join(format!("{content_stem}.cfg")))
+}
+
+/// The overlay descriptor RetroArch's `input_overlay` points at. RetroArch
+/// refuses an overlay without `overlayN_descs` ("Failed to read number of
+/// descs"), so the bezel-only overlay declares zero input descriptors.
+/// Checked against RetroArch 1.22.2 (Flatpak) with FCEUmm.
+fn overlay_descriptor(image_name: &str) -> Vec<u8> {
+    format!(
+        "overlays = 1\noverlay0_overlay = \"{}\"\noverlay0_full_screen = true\noverlay0_descs = 0\n",
+        image_name.replace('"', "")
+    )
+    .into_bytes()
+}
+
 fn refuse(mut plan: BezelApplyPlan, refusal: BezelPlanRefusal, detail: &str) -> BezelApplyPlan {
     plan.status = BezelApplyStatus::Refused;
     plan.refusals = vec![refusal];
@@ -444,33 +553,43 @@ struct MergedOverride {
     old_enabled: Option<String>,
 }
 
+/// Merge the two overlay keys into a per-game override. Conflicting values
+/// are rewritten (the caller requires replacement approval for that); every
+/// other line, including its line ending, is preserved byte for byte.
 fn merge_override(existing: Option<&[u8]>, overlay: &str) -> MergedOverride {
-    let mut text = existing
+    let original = existing
         .map(|b| String::from_utf8_lossy(b).into_owned())
         .unwrap_or_default();
+    let mut text = String::with_capacity(original.len());
     let mut old_overlay = None;
     let mut old_enabled = None;
     let mut conflict = false;
-    for line in text.lines() {
-        let Some((key, value)) = line.split_once('=') else {
+    for line in original.split_inclusive('\n') {
+        let body = line.trim_end_matches(['\r', '\n']);
+        let ending = &line[body.len()..];
+        let Some((key, value)) = body.split_once('=') else {
+            text.push_str(line);
             continue;
         };
-        let key = key.trim();
         let value = value.trim().trim_matches('"').to_string();
-        match key {
+        let replacement = match key.trim() {
             "input_overlay" => {
                 old_overlay = Some(value.clone());
-                if value != overlay {
-                    conflict = true;
-                }
+                (value != overlay).then(|| format!("input_overlay = \"{overlay}\""))
             }
             "input_overlay_enable" => {
                 old_enabled = Some(value.clone());
-                if value != "true" {
-                    conflict = true;
-                }
+                (value != "true").then(|| "input_overlay_enable = \"true\"".to_string())
             }
-            _ => {}
+            _ => None,
+        };
+        match replacement {
+            Some(replacement) => {
+                conflict = true;
+                text.push_str(&replacement);
+                text.push_str(ending);
+            }
+            None => text.push_str(line),
         }
     }
     if old_overlay.is_none() {
@@ -544,6 +663,11 @@ mod tests {
             config_path: Some(root.join("retroarch.cfg")),
             overlay_root: Some(root.join("overlays")),
             approved_roots: vec![root.to_path_buf()],
+            retroarch_launch: Some(RetroArchContentIdentity {
+                content_path: root.join("roms/game-id.sfc"),
+                core_library_name: "snes9x".into(),
+                home: None,
+            }),
         }
     }
 
@@ -556,6 +680,49 @@ mod tests {
             history_root: root.with_extension("history"),
             backup_root: root.with_extension("backups"),
         }
+    }
+
+    #[test]
+    fn binary_png_bezel_installs_byte_for_byte_and_undoes() {
+        let root = tempfile::tempdir().unwrap();
+        let source = root.path().join("bezel.png");
+        // A real PNG is not UTF-8; the post-write check must not reject it.
+        let png = [
+            0x89, b'P', b'N', b'G', 0x0D, 0x0A, 0x1A, 0x0A, 0xFF, 0xFE, 0x00, 0xC3,
+        ];
+        fs::write(&source, png).unwrap();
+        let plan = prepare_retroarch_bezel_plan(&request(root.path(), &source)).unwrap();
+        assert_eq!(plan.status, BezelApplyStatus::Ready);
+        let result = apply_retroarch_bezel_plan(&plan, &options(root.path(), "bezel-png")).unwrap();
+        assert_eq!(
+            result.journal.status,
+            crate::patch_manager::SharedApplyStatus::Success
+        );
+        let installed = root.path().join("overlays/bezel.png");
+        assert_eq!(fs::read(&installed).unwrap(), png);
+        let rollback = preview_shared_rollback(
+            &result.journal_path.unwrap(),
+            root.path(),
+            &root.path().with_extension("backups"),
+        );
+        let undone = execute_shared_rollback(
+            &rollback,
+            &SharedRollbackOptions {
+                confirmation: SharedRollbackConfirmation {
+                    preview_id: rollback.preview_id.clone(),
+                    approved: true,
+                },
+                rollback_operation_id: "bezel-png-undo".into(),
+                timestamp_unix_seconds: 2,
+                history_root: root.path().with_extension("history"),
+                backup_root: root.path().with_extension("backups"),
+            },
+        );
+        assert_eq!(
+            undone.status,
+            crate::patch_manager::SharedApplyStatus::Success
+        );
+        assert!(!installed.exists());
     }
 
     #[test]
@@ -614,7 +781,7 @@ mod tests {
         fs::write(root.path().join("overlays/bezel.png"), b"source-bytes").unwrap();
         fs::write(
             root.path().join("overlays/emuwiz-bezel.cfg"),
-            b"overlays = 1\noverlay0_overlay = \"bezel.png\"\noverlay0_full_screen = true\n",
+            b"overlays = 1\noverlay0_overlay = \"bezel.png\"\noverlay0_full_screen = true\noverlay0_descs = 0\n",
         )
         .unwrap();
         let compatible = String::from("# user comment\ninput_overlay = \"")
@@ -677,5 +844,306 @@ mod tests {
             plan.refusals,
             vec![BezelPlanRefusal::RetroArchDestinationUnsafe]
         );
+    }
+
+    fn undo(root: &Path, journal: &Path, id: &str) -> crate::patch_manager::SharedApplyStatus {
+        let rollback = preview_shared_rollback(journal, root, &root.with_extension("backups"));
+        assert!(rollback.available, "{:?}", rollback);
+        execute_shared_rollback(
+            &rollback,
+            &SharedRollbackOptions {
+                confirmation: SharedRollbackConfirmation {
+                    preview_id: rollback.preview_id.clone(),
+                    approved: true,
+                },
+                rollback_operation_id: id.into(),
+                timestamp_unix_seconds: 2,
+                history_root: root.with_extension("history"),
+                backup_root: root.with_extension("backups"),
+            },
+        )
+        .status
+    }
+
+    /// End-to-end against a disposable RetroArch root with a pre-existing
+    /// user override: only the two overlay keys are added, the rest of the
+    /// file and retroarch.cfg are byte-identical, and Undo restores the
+    /// original override bytes exactly.
+    #[test]
+    fn existing_override_gets_only_overlay_keys_and_undo_restores_exact_bytes() {
+        let root = tempfile::tempdir().unwrap();
+        let source = root.path().join("bezel.png");
+        fs::write(&source, b"source-bytes").unwrap();
+        let main_cfg = root.path().join("retroarch.cfg");
+        fs::write(
+            &main_cfg,
+            b"video_driver = \"gl\"\ninput_overlay = \"global.cfg\"\n",
+        )
+        .unwrap();
+        let override_path = root.path().join("config/snes9x/game-id.cfg");
+        fs::create_dir_all(override_path.parent().unwrap()).unwrap();
+        let original = b"# mine\r\naspect_ratio_index = \"22\"\nvideo_smooth = \"false\"".to_vec();
+        fs::write(&override_path, &original).unwrap();
+        let main_before = fs::read(&main_cfg).unwrap();
+
+        let plan = prepare_retroarch_bezel_plan(&request(root.path(), &source)).unwrap();
+        assert_eq!(plan.status, BezelApplyStatus::Ready);
+        assert!(plan.conflicts.is_empty());
+        assert_eq!(plan.rollback.backup_paths, vec![override_path.clone()]);
+        // Editing the user's existing override is a replacement: refused up
+        // front, with nothing written, until it is explicitly approved.
+        assert!(
+            apply_retroarch_bezel_plan(&plan, &options(root.path(), "bezel-unapproved")).is_err()
+        );
+        assert_eq!(fs::read(&override_path).unwrap(), original);
+        assert!(!root.path().join("overlays").exists());
+        let mut approved = options(root.path(), "bezel-existing");
+        approved.replacement_approved = true;
+        let result = apply_retroarch_bezel_plan(&plan, &approved).unwrap();
+        assert_eq!(
+            result.journal.status,
+            crate::patch_manager::SharedApplyStatus::Success
+        );
+        let written = fs::read_to_string(&override_path).unwrap();
+        let descriptor = root.path().join("overlays/emuwiz-bezel.cfg");
+        assert_eq!(
+            written,
+            format!(
+                "# mine\r\naspect_ratio_index = \"22\"\nvideo_smooth = \"false\"\ninput_overlay = \"{}\"\ninput_overlay_enable = \"true\"\n",
+                descriptor.display()
+            )
+        );
+        assert_eq!(fs::read(&main_cfg).unwrap(), main_before);
+
+        // A second Apply of the same (now stale) plan is refused, not repeated.
+        assert!(apply_retroarch_bezel_plan(&plan, &approved).is_err());
+
+        let journal = result.journal_path.unwrap();
+        assert_eq!(
+            undo(root.path(), &journal, "bezel-existing-undo"),
+            crate::patch_manager::SharedApplyStatus::Success
+        );
+        assert_eq!(fs::read(&override_path).unwrap(), original);
+        assert!(!descriptor.exists());
+        assert!(!root.path().join("overlays/bezel.png").exists());
+        assert_eq!(fs::read(&main_cfg).unwrap(), main_before);
+    }
+
+    #[test]
+    fn override_edited_after_preview_refuses_apply_and_writes_nothing() {
+        let root = tempfile::tempdir().unwrap();
+        let source = root.path().join("bezel.png");
+        fs::write(&source, b"source-bytes").unwrap();
+        let override_path = root.path().join("config/snes9x/game-id.cfg");
+        fs::create_dir_all(override_path.parent().unwrap()).unwrap();
+        fs::write(&override_path, b"video_smooth = \"false\"\n").unwrap();
+        let plan = prepare_retroarch_bezel_plan(&request(root.path(), &source)).unwrap();
+        fs::write(&override_path, b"video_smooth = \"true\"\n").unwrap();
+        assert!(apply_retroarch_bezel_plan(&plan, &options(root.path(), "bezel-edited")).is_err());
+        assert_eq!(
+            fs::read(&override_path).unwrap(),
+            b"video_smooth = \"true\"\n"
+        );
+        assert!(!root.path().join("overlays").exists());
+    }
+
+    /// An approved replacement must really point RetroArch at the new
+    /// overlay; reporting success while the user's old value stays in place
+    /// would be a false result.
+    #[test]
+    fn approved_replacement_rewrites_conflicting_keys_and_undo_restores_them() {
+        let root = tempfile::tempdir().unwrap();
+        let source = root.path().join("bezel.png");
+        fs::write(&source, b"source-bytes").unwrap();
+        let override_path = root.path().join("config/snes9x/game-id.cfg");
+        fs::create_dir_all(override_path.parent().unwrap()).unwrap();
+        let original =
+            b"video_smooth = \"false\"\ninput_overlay = \"user.cfg\"\ninput_overlay_enable = \"false\"\n".to_vec();
+        fs::write(&override_path, &original).unwrap();
+        let plan = prepare_retroarch_bezel_plan(&request(root.path(), &source)).unwrap();
+        assert!(!plan.conflicts.is_empty());
+        let mut approved = options(root.path(), "bezel-replace");
+        approved.replacement_approved = true;
+        let result = apply_retroarch_bezel_plan(&plan, &approved).unwrap();
+        assert_eq!(
+            result.journal.status,
+            crate::patch_manager::SharedApplyStatus::Success
+        );
+        let descriptor = root.path().join("overlays/emuwiz-bezel.cfg");
+        assert_eq!(
+            fs::read_to_string(&override_path).unwrap(),
+            format!(
+                "video_smooth = \"false\"\ninput_overlay = \"{}\"\ninput_overlay_enable = \"true\"\n",
+                descriptor.display()
+            )
+        );
+        assert_eq!(
+            undo(
+                root.path(),
+                &result.journal_path.unwrap(),
+                "bezel-replace-undo"
+            ),
+            crate::patch_manager::SharedApplyStatus::Success
+        );
+        assert_eq!(fs::read(&override_path).unwrap(), original);
+    }
+
+    fn override_of(plan: &BezelApplyPlan) -> PathBuf {
+        assert_eq!(plan.status, BezelApplyStatus::Ready, "{:?}", plan.warnings);
+        plan.config_entries[0].path.clone()
+    }
+
+    fn launched(root: &Path, file: &str, core: &str) -> BezelApplyRequest {
+        let source = root.join("bezel.png");
+        fs::write(&source, b"source-bytes").unwrap();
+        let mut request = request(root, &source);
+        request.resolved_identity = "Super Mario World".into(); // display title
+        request.core = Some(core.into());
+        request.retroarch_launch = Some(RetroArchContentIdentity {
+            content_path: root.join("roms/snes").join(file),
+            core_library_name: core.into(),
+            home: Some(root.to_path_buf()),
+        });
+        request
+    }
+
+    #[test]
+    fn override_is_named_from_the_launched_file_not_the_display_title() {
+        let root = tempfile::tempdir().unwrap();
+        let plan = prepare_retroarch_bezel_plan(&launched(
+            root.path(),
+            "SMW renamed by user.sfc",
+            "Snes9x",
+        ))
+        .unwrap();
+        assert_eq!(
+            override_of(&plan),
+            root.path().join("config/Snes9x/SMW renamed by user.cfg")
+        );
+        assert!(plan.files.iter().all(|file| {
+            !file
+                .path
+                .display()
+                .to_string()
+                .contains("Super Mario World")
+        }));
+    }
+
+    #[test]
+    fn region_suffixes_and_extra_dots_keep_retroarchs_stem() {
+        let root = tempfile::tempdir().unwrap();
+        for (file, expected) in [
+            ("Super Mario World (USA).sfc", "Super Mario World (USA).cfg"),
+            (
+                "Game (Europe) (En,Fr,De) (Rev 1).v1.1.smc",
+                "Game (Europe) (En,Fr,De) (Rev 1).v1.1.cfg",
+            ),
+        ] {
+            let plan =
+                prepare_retroarch_bezel_plan(&launched(root.path(), file, "Snes9x")).unwrap();
+            assert_eq!(
+                override_of(&plan),
+                root.path().join("config/Snes9x").join(expected)
+            );
+        }
+    }
+
+    #[test]
+    fn different_cores_get_their_own_library_name_folders() {
+        let root = tempfile::tempdir().unwrap();
+        let snes9x =
+            prepare_retroarch_bezel_plan(&launched(root.path(), "Game (USA).sfc", "Snes9x"))
+                .unwrap();
+        let bsnes =
+            prepare_retroarch_bezel_plan(&launched(root.path(), "Game (USA).sfc", "bsnes-hd beta"))
+                .unwrap();
+        assert_eq!(
+            override_of(&snes9x),
+            root.path().join("config/Snes9x/Game (USA).cfg")
+        );
+        assert_eq!(
+            override_of(&bsnes),
+            root.path().join("config/bsnes-hd beta/Game (USA).cfg")
+        );
+        // A core stem that is not the launch core's library name is refused.
+        let mut stem = launched(root.path(), "Game (USA).sfc", "Snes9x");
+        stem.core = Some("snes9x_libretro".into());
+        let plan = prepare_retroarch_bezel_plan(&stem).unwrap();
+        assert_eq!(
+            plan.refusals,
+            vec![BezelPlanRefusal::RetroArchLaunchIdentityUnknown]
+        );
+    }
+
+    #[test]
+    fn missing_or_relative_launch_identity_is_refused_without_writing() {
+        let root = tempfile::tempdir().unwrap();
+        let mut missing = launched(root.path(), "Game (USA).sfc", "Snes9x");
+        missing.retroarch_launch = None;
+        let plan = prepare_retroarch_bezel_plan(&missing).unwrap();
+        assert_eq!(plan.status, BezelApplyStatus::Refused);
+        assert_eq!(
+            plan.refusals,
+            vec![BezelPlanRefusal::RetroArchLaunchIdentityUnknown]
+        );
+        assert!(apply_retroarch_bezel_plan(&plan, &options(root.path(), "no-id")).is_err());
+        let mut relative = launched(root.path(), "Game (USA).sfc", "Snes9x");
+        relative.retroarch_launch.as_mut().unwrap().content_path = "Game (USA).sfc".into();
+        let plan = prepare_retroarch_bezel_plan(&relative).unwrap();
+        assert_eq!(plan.status, BezelApplyStatus::Refused);
+        assert!(!root.path().join("config").exists());
+        assert!(!root.path().join("overlays").exists());
+    }
+
+    #[test]
+    fn configured_override_directory_is_used_only_inside_the_selected_root() {
+        let root = tempfile::tempdir().unwrap();
+        let inside = root.path().join("my-overrides");
+        fs::write(
+            root.path().join("retroarch.cfg"),
+            format!("rgui_config_directory = \"{}\"\n", inside.display()),
+        )
+        .unwrap();
+        let plan = prepare_retroarch_bezel_plan(&launched(root.path(), "Game (USA).sfc", "Snes9x"))
+            .unwrap();
+        assert_eq!(override_of(&plan), inside.join("Snes9x/Game (USA).cfg"));
+        // RetroArch saves this setting as `~/...` with a trailing slash.
+        fs::write(
+            root.path().join("retroarch.cfg"),
+            "rgui_config_directory = \"~/my-overrides/\"\n",
+        )
+        .unwrap();
+        let plan = prepare_retroarch_bezel_plan(&launched(root.path(), "Game (USA).sfc", "Snes9x"))
+            .unwrap();
+        assert_eq!(override_of(&plan), inside.join("Snes9x/Game (USA).cfg"));
+        for value in [
+            "~other/config",
+            ":/config",
+            "relative/config",
+            "/elsewhere/config",
+        ] {
+            fs::write(
+                root.path().join("retroarch.cfg"),
+                format!("rgui_config_directory = \"{value}\"\n"),
+            )
+            .unwrap();
+            let plan =
+                prepare_retroarch_bezel_plan(&launched(root.path(), "Game (USA).sfc", "Snes9x"))
+                    .unwrap();
+            assert_eq!(
+                plan.refusals,
+                vec![BezelPlanRefusal::RetroArchConfigScopeInvalid],
+                "{value}"
+            );
+        }
+    }
+
+    /// RetroArch rejects an overlay config without `overlay0_descs`; the
+    /// written descriptor must always declare it.
+    #[test]
+    fn descriptor_declares_descs_so_retroarch_accepts_it() {
+        let text = String::from_utf8(overlay_descriptor("bezel.png")).unwrap();
+        assert!(text.contains("overlay0_descs = 0\n"));
+        assert!(text.contains("overlay0_overlay = \"bezel.png\"\n"));
     }
 }

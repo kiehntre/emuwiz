@@ -242,16 +242,14 @@ impl ArchiveFsApp {
             if let Some(page) = &self.repair_review_page
                 && !page.plan_stale
                 && let Some(plan) = &page.plan
-                && plan.has_safe_repairs()
+                && let safe_count = page.preview_safe_count()
+                && safe_count > 0
             {
                 let mut item = AttentionItem::new(
                     format!("repair-review:{}", plan.scan_root),
                     AttentionCategory::Repair,
                     AttentionSeverity::ActionNeeded,
-                    format!(
-                        "{} proposed repairs are waiting for review",
-                        plan.safe_repair_count()
-                    ),
+                    format!("{} proposed repairs are waiting for review", safe_count),
                     AttentionDestination::Problems,
                 );
                 item.summary = "The loaded repair plan contains executable proposals. Review and freshness checks remain in Problems & Repair; nothing is applied here.".into();
@@ -259,7 +257,7 @@ impl ArchiveFsApp {
                 item.source_records
                     .push(format!("{}:{}", plan.source_id, plan.generation));
                 item.affected = Some(plan.scan_root.clone());
-                item.affected_count = plan.safe_repair_count() as u64;
+                item.affected_count = safe_count as u64;
                 item.last_observed = Some(plan.created_at_unix as i64);
                 item.provenance = "Current non-stale LibraryRepairPlan".into();
                 snapshot.insert(item);

@@ -348,6 +348,7 @@ pub(crate) mod repair_history_page;
 #[allow(dead_code)]
 pub(crate) mod repair_review_page;
 pub(crate) mod retroarch_core_setup;
+mod retroarch_installation_setup;
 use retroarch_core_setup::{
     load_retroarch_core_directory_override, retroarch_core_directory_override_path,
 };

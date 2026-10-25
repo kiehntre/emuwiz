@@ -283,6 +283,11 @@ fn identity_summary(conflicting: bool) -> GameReadinessSummary {
     )
 }
 
+/// Why a DOS game shows Play before its DOSBox checks have run.
+pub(crate) const DOSBOX_REVIEW_EXPLANATION: &str = "DOS games run only in DOSBox inside a sandbox. \
+     Play shows the game folder and start command for you to approve; nothing starts until you \
+     approve them and every check passes.";
+
 fn project_plan(
     plan: &LaunchPlan,
     retroarch_scanned: bool,
@@ -292,6 +297,28 @@ fn project_plan(
     details.push(format!("Launch candidates: {}", plan.candidates.len()));
     if let Some(platform) = &plan.platform_id {
         details.push(format!("Platform: {platform}"));
+    }
+
+    // DOS games are not planned through the shared candidate list: the
+    // Launch page runs the DOSBox folder review and sandbox checks, and asks
+    // for approval before anything starts. Play opens that page.
+    if plan.candidates.is_empty()
+        && plan.platform_id.as_deref()
+            == Some(crate::launch_readiness_page::dosbox::DOS_PLATFORM_ID)
+    {
+        return with_details(
+            base(
+                ReadinessPresentationState::Blocked,
+                "Review the DOSBox start before playing",
+                DOSBOX_REVIEW_EXPLANATION,
+                IdentitySummary::StrongLocal,
+                SourceSummary::Available,
+                FirmwareSummary::Unknown,
+                None,
+                Some(ReadinessAction::Play),
+            ),
+            details,
+        );
     }
 
     if plan.candidates.is_empty() {
@@ -1560,6 +1587,41 @@ mod tests {
         );
         assert_eq!(summary.status, ReadinessPresentationState::NeedsEmulator);
         assert_eq!(summary.primary_action, Some(ReadinessAction::SetUpEmulator));
+    }
+
+    #[test]
+    fn a_dos_game_routes_play_to_the_dosbox_review_not_emulator_setup() {
+        let mut input = plan(vec![]);
+        let LaunchReadinessInput::Plan {
+            plan: dos_plan,
+            retroarch_scanned,
+            ..
+        } = &mut input
+        else {
+            unreachable!()
+        };
+        dos_plan.platform_id = Some("DOS".into());
+        // RetroArch has no DOS lane, so an unscanned RetroArch must not hold
+        // the DOS game in Checking.
+        *retroarch_scanned = false;
+        let summary = project(&input, ReadinessFreshness::Current);
+        assert_eq!(summary.primary_action, Some(ReadinessAction::Play));
+        assert_eq!(summary.status, ReadinessPresentationState::Blocked);
+        assert_eq!(summary.explanation, DOSBOX_REVIEW_EXPLANATION);
+        let view = compact(&summary, false);
+        assert!(view.play_enabled);
+        assert_eq!(view.fix, None);
+        assert_eq!(
+            route_for_play(),
+            Some(crate::gui_v2::routes::Route::Task {
+                section: crate::gui_v2::routes::Section::Launch,
+                game: 7,
+            })
+        );
+    }
+
+    fn route_for_play() -> Option<crate::gui_v2::routes::Route> {
+        crate::gui_v2::native_workflows::route_for_action(ReadinessAction::Play, 7)
     }
 
     #[test]

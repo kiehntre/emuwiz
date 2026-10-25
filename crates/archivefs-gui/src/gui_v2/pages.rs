@@ -311,7 +311,7 @@ impl App {
             self.load(false);
         }
         super::simple_shell::prepare_keyboard_reveal(context);
-        if self.show_manual_viewer(context) {
+        if self.show_manual_viewer(context) || self.show_text_guide_viewer(context) {
             return;
         }
         let modal_open = self.confirm_scan
@@ -678,13 +678,30 @@ impl App {
                             }
                             self.organisation_page(ui)
                         }
+                        Route::TosecInventory => {
+                            let route = self
+                                .native_workflows
+                                .get_or_insert_with(|| {
+                                    super::native_workflows::NativeWorkflows::new(ui.ctx().clone())
+                                })
+                                .tosec_inventory
+                                .show(ui);
+                            if let Some(route) = route {
+                                self.go(route);
+                            }
+                        }
                         Route::Section(Section::Games | Section::Launch) => self.games(ui),
                         Route::Section(Section::Saves) => self.saves_states(ui, None),
                         Route::Section(Section::Emulators) => self.emulator_setup(ui),
                         Route::Section(Section::Firmware) => self.firmware(ui),
                         Route::Section(Section::Sources) => self.sources(ui),
                         Route::Section(Section::Romm) => self.romm_library_page(ui),
-                        Route::Section(Section::Dat) => self.dat_sources(ui),
+                        Route::Section(Section::Dat) => {
+                            if ui.button("Open TOSEC Collection Inventory").clicked() {
+                                self.go(Route::TosecInventory);
+                            }
+                            self.dat_sources(ui);
+                        }
                         Route::Section(Section::Artwork) => self.artwork_metadata(ui, None),
                         Route::Section(Section::Mods) => self.mods_page(ui, None),
                         Route::Section(Section::Check) => self.check_games(ui, None),
@@ -2749,6 +2766,8 @@ impl App {
                             ui.set_width(right);
                             super::game_detail_blue::side_card(ui, "Can I play it?", |ui| {
                                 self.detail_readiness(ui, game, latest_verification.as_deref());
+                                self.show_arcade_input_details(ui, game);
+                                self.classic_trainers.show(ui, game);
                             });
                             super::game_detail_blue::information_card(ui, game);
                             super::game_detail_blue::side_card(ui, "", |ui| {
@@ -2770,6 +2789,7 @@ impl App {
                     self.detail_heading(ui, &library, game);
                     ui.add_space(theme::SPACE_SM);
                     self.detail_readiness(ui, game, latest_verification.as_deref());
+                    self.show_arcade_input_details(ui, game);
                     ui.add_space(theme::SPACE_SM);
                     self.detail_more(ui, game);
                 });
@@ -2778,6 +2798,7 @@ impl App {
                 super::game_detail_blue::information_card(ui, game);
             }
             self.detail_body(ui, game, &key);
+            self.classic_trainers.show(ui, game);
             ui.add_space(theme::SPACE_MD);
             ui.collapsing("Advanced details", |ui| {
                 self.detail_advanced(ui, &library, game, &key);
@@ -2816,6 +2837,26 @@ impl App {
             .flatten()
         {
             ui.label(RichText::new(hint).small().color(theme::muted(ui)));
+        }
+    }
+
+    fn show_arcade_input_details(&mut self, ui: &mut egui::Ui, game: &Game) {
+        let arcade_platform = game.platform.eq_ignore_ascii_case("arcade");
+        let arcade_identity = game.archive.identity_report.as_ref().is_some_and(|report| {
+            report.platform == archivefs_core::game_identity::IdentityPlatform::Arcade
+        });
+        if !arcade_platform && !arcade_identity {
+            return;
+        }
+        let open_catalogue_setup = self.arcade_input_details.show(
+            ui,
+            game.archive.id,
+            game.archive.identity_report.as_ref(),
+            &self.organisation.mame_health,
+        );
+        if open_catalogue_setup {
+            self.organisation.view = super::organisation::OrganisationView::MameHealth;
+            self.go(Route::MameWorkflow);
         }
     }
 
@@ -3317,7 +3358,27 @@ impl App {
         let workflows = self
             .native_workflows
             .get_or_insert_with(|| super::native_workflows::NativeWorkflows::new(ui.ctx().clone()));
+        let readiness = &mut workflows.app.emulator_readiness;
+        readiness
+            .bios_projection_page
+            .information()
+            .set_installed(readiness.emulator_inventory_page.inventory.as_ref());
         workflows.show_firmware(ui);
+        let navigation = workflows
+            .app
+            .emulator_readiness
+            .bios_projection_page
+            .information()
+            .take_navigation();
+        match navigation {
+            Some(crate::bios_projection_page::FirmwareNavigation::SetupDoctor) => {
+                self.go(Route::Section(Section::Setup));
+            }
+            Some(crate::bios_projection_page::FirmwareNavigation::EmulatorSetup) => {
+                self.go(Route::Section(Section::Emulators));
+            }
+            None => {}
+        }
     }
 
     fn sources(&mut self, ui: &mut egui::Ui) {
@@ -3515,9 +3576,12 @@ impl App {
                     super::native_workflows::NativeWorkflows::new(ui.ctx().clone())
                 });
                 let retroarch_scope = workflows.retroarch_bezel_scope();
+                let launch_request =
+                    workflows.retroarch_bezel_request(game_id, &game.archive.absolute_path);
                 if let Some((config, overlays, core)) = retroarch_scope {
                     self.bezel.set_retroarch_scope(Some(config), Some(overlays), core);
                 }
+                self.bezel.set_launch_request(launch_request.map_err(str::to_string));
                 ui.heading("Extras");
                 self.bezel.set_game(&game.title, &game.platform);
                 egui::CollapsingHeader::new("Bezel & decorations")

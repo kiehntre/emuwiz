@@ -20,7 +20,7 @@
 use super::RetroArchLaunchState;
 use archivefs_core::emulator_environment::retroarch::discover_retroarch_environment;
 use archivefs_core::emulator_environment::retroarch::{
-    DiscoveryEnvironment, ProfileKind, ProfileRef,
+    DiscoveryEnvironment, PathPurpose, ProfileKind, ProfileRef,
 };
 use archivefs_core::emulator_environment::{FsProbe, HostReadOnlyFilesystem};
 use archivefs_core::launch::cheat_launch_plan::{
@@ -50,6 +50,9 @@ use std::sync::Arc;
 
 pub(super) const START_NOTE: &str = "RetroArch does not say whether a cheat loaded, and EmuWiz has not seen one work in a game. For this launch RetroArch gets a temporary profile holding only the cheats you ticked (and cheats switched on); your ROM, cheat file, saves and RetroArch settings are not changed, and the temporary profile is removed after RetroArch exits.";
 
+/// A reviewed cheat is the player's approval, not proof it fits the game.
+pub(super) const APPROVED_LABEL: &str = "  User-approved (not checksum-verified). Your ROM's identity is verified; this cheat's link to it is your review, and whether the core applies it is unconfirmed.";
+
 /// One cheat in the chooser.
 #[derive(Clone, Debug)]
 pub(super) struct Row {
@@ -65,6 +68,14 @@ impl Row {
     /// Several implementations, or an unresolved conflict: the user must pick.
     fn needs_choice(&self) -> bool {
         self.candidate.variants.len() > 1 || self.candidate.unresolved_conflict
+    }
+
+    /// The source file marks this cheat as enabled. Shown, never honoured.
+    pub(super) fn on_by_default(&self) -> bool {
+        self.candidate
+            .variants
+            .iter()
+            .any(|v| v.entry.as_ref().is_some_and(|e| e.enabled_by_default))
     }
 
     fn needs_review(&self) -> bool {
@@ -83,6 +94,9 @@ impl Row {
 #[derive(Clone, Debug)]
 pub(super) struct Choice {
     pub(super) content: PathBuf,
+    /// The verified game identity the review was given for.
+    pub(super) game_key: String,
+    pub(super) platform: String,
     pub(super) profile: ProfileRef,
     pub(super) core_stem: String,
     pub(super) file: PathBuf,
@@ -147,6 +161,8 @@ impl Choice {
         }
         Ok(Self {
             content: request.selected_content_path.clone(),
+            game_key: request.expected_game_key.clone(),
+            platform: request.expected_platform_id.clone(),
             profile: request.profile,
             core_stem: request.core_stem.clone(),
             file: file.to_path_buf(),
@@ -166,6 +182,8 @@ impl Choice {
 
     pub(super) fn matches(&self, request: &RetroArchLaunchRequest) -> bool {
         self.content == request.selected_content_path
+            && self.game_key == request.expected_game_key
+            && self.platform == request.expected_platform_id
             && self.profile == request.profile
             && self.core_stem == request.core_stem
     }
@@ -384,6 +402,55 @@ pub(super) fn launch(
     .map_err(|e| refuse(describe(e)))
 }
 
+/// The exact content file, core `library_name`, settings file and overlay
+/// folder a plain launch of `request` would use: the same preflight as Play
+/// and the same core probe as a cheat launch. The settings come from the one
+/// profile Play selected, so other RetroArch installs never change the answer.
+/// Nothing is launched; the probe child only asks the core its name.
+pub(super) fn bezel_identity(
+    request: &RetroArchLaunchRequest,
+) -> Result<super::RetroArchBezelLaunch, String> {
+    let filesystem = HostReadOnlyFilesystem;
+    let environment = DiscoveryEnvironment::from_process_environment();
+    let command = preflight_retroarch_launch(request, &filesystem, &environment).map_err(|e| {
+        symlinked_settings_explanation(request, &filesystem, &environment)
+            .unwrap_or_else(|| preflight_message(e))
+    })?;
+    let probed =
+        probe_core_library_name(&command.selection.core_library, &CurrentExecutableLauncher)
+            .map_err(|e| e.explanation())?;
+    let report = discover_retroarch_environment(&filesystem, &environment)
+        .map_err(|e| format!("RetroArch could not be checked: {e:?}"))?;
+    let profile = report
+        .profiles
+        .iter()
+        .find(|p| {
+            p.profile_kind == command.selection.profile.profile_kind
+                && p.scope == command.selection.profile.scope
+        })
+        .ok_or("the RetroArch profile this game launches with is no longer discoverable")?;
+    if profile.config_file.path.lossy {
+        return Err("RetroArch's settings path is not valid UTF-8".into());
+    }
+    let overlays = profile
+        .paths
+        .iter()
+        .find(|path| path.purpose == PathPurpose::Overlays)
+        .and_then(|path| path.resolved_path.as_ref())
+        .filter(|path| !path.lossy)
+        .ok_or("EmuWiz can't tell which overlay folder the RetroArch settings this game launches with use, so the bezel has nowhere safe to go.")?;
+    probed.ensure_unchanged().map_err(|e| e.explanation())?;
+    Ok(super::RetroArchBezelLaunch {
+        identity: archivefs_core::bezel_apply::RetroArchContentIdentity {
+            content_path: command.selection.content_path.clone(),
+            core_library_name: probed.library_name.clone(),
+            home: environment.home.as_ref().map(PathBuf::from),
+        },
+        config: PathBuf::from(&profile.config_file.path.display),
+        overlays: PathBuf::from(&overlays.display),
+    })
+}
+
 /// The lines shown once a cheat launch has finished.
 pub(super) fn session_summary(
     session: &archivefs_core::launch::cheat_runtime::CheatRuntimeSession<
@@ -443,6 +510,7 @@ pub(super) fn show_chooser(
         ui.label(reason);
         return;
     }
+    super::retroarch_cheat_sets::show(ui, state, request);
     let picked = if ui.button("Choose a cheat file (.cht)…").clicked() {
         rfd::FileDialog::new()
             .add_filter("RetroArch cheat file", &["cht"])
@@ -466,8 +534,14 @@ pub(super) fn show_chooser(
     }
     let mut clear = false;
     if let Some(choice) = state.cheats.as_mut() {
+        if let Some(name) = choice.file.file_name() {
+            ui.small(format!("Previewing {}", name.to_string_lossy()));
+        }
         for row in &mut choice.rows {
             ui.checkbox(&mut row.ticked, &row.candidate.title);
+            if row.on_by_default() {
+                ui.small("  The cheat file switches this on by default; EmuWiz leaves it off unless you tick it.");
+            }
             if row.ticked {
                 if row.needs_choice() {
                     let labels: Vec<String> = row
@@ -489,6 +563,9 @@ pub(super) fn show_chooser(
                 }
                 if row.needs_review() {
                     ui.checkbox(&mut row.acknowledged, "I reviewed this cheat for this game");
+                    if row.acknowledged {
+                        ui.small(APPROVED_LABEL);
+                    }
                 }
             }
         }

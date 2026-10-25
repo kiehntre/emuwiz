@@ -2106,6 +2106,7 @@ mod tests {
             system_flatpak_root: root.join("var-lib-flatpak-does-not-exist"),
             app_image_search_roots: Vec::new(),
             desktop_file_roots: Vec::new(),
+            explicit_executables: Vec::new(),
         };
 
         let plan = preview_retroarch_patch_and_cheat_destinations(

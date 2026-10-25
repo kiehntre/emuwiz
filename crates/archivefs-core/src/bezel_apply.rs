@@ -29,6 +29,23 @@ pub struct BezelApplyRequest {
     pub overlay_root: Option<PathBuf>,
     /// Roots approved by the caller for any future destination/config write.
     pub approved_roots: Vec<PathBuf>,
+    /// For RetroArch: the exact content file and core a launch uses. Without
+    /// it no per-game override is written (a display title never names one).
+    #[serde(default)]
+    pub retroarch_launch: Option<RetroArchContentIdentity>,
+}
+
+/// What RetroArch itself keys a per-game override on: the content file it is
+/// given and the core's own `library_name` (not the core file stem and not
+/// the library's display title). Callers take both from launch evidence.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RetroArchContentIdentity {
+    pub content_path: PathBuf,
+    pub core_library_name: String,
+    /// The home folder from the launch's discovery environment, used to
+    /// expand `~` in `rgui_config_directory` as RetroArch does.
+    #[serde(default)]
+    pub home: Option<PathBuf>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -149,6 +166,7 @@ pub enum BezelPlanRefusal {
     RetroArchOverlayOutsideConfigRoot,
     RetroArchUnsafeName,
     RetroArchDestinationUnsafe,
+    RetroArchLaunchIdentityUnknown,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -457,6 +475,7 @@ mod tests {
             config_path: Some(root.join("retroarch.cfg")),
             overlay_root: Some(root.join("overlays")),
             approved_roots: vec![root.to_path_buf()],
+            retroarch_launch: None,
         }
     }
 

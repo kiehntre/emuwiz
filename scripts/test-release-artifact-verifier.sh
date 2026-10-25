@@ -48,8 +48,10 @@ expect_failure bad-checksum "$TEMP_ROOT/bad-checksum/$ARCHIVE_NAME" "archive che
 # the current bin/docs/SBOM layout. The verifier remains the system under
 # test; this helper only performs controlled archive mutations.
 python3 - "$TEMP_ROOT" "$VALID_ARTIFACT" <<'PY'
+import concurrent.futures
 import copy
 import io
+import os
 import pathlib
 import sys
 import tarfile
@@ -135,13 +137,21 @@ def malformed_member(members):
     members[position] = (member, None)
 
 
-write_case("missing-file", missing_binary)
-write_case("modified-binary", modified_binary)
-write_case("manifest-mismatch", modified_manifest)
-write_case("corrupted-metadata", corrupted_metadata)
-write_case("wrong-permissions", wrong_permissions)
-write_case("unexpected-member", unexpected_member)
-write_case("malformed-package", malformed_member)
+# Each case re-compresses the whole archive at xz preset 9 (~90 s on a CI
+# runner). lzma releases the GIL, so the cases compress concurrently; every
+# fixture's bytes are the same as when written one after another.
+cases = [
+    ("missing-file", missing_binary),
+    ("modified-binary", modified_binary),
+    ("manifest-mismatch", modified_manifest),
+    ("corrupted-metadata", corrupted_metadata),
+    ("wrong-permissions", wrong_permissions),
+    ("unexpected-member", unexpected_member),
+    ("malformed-package", malformed_member),
+]
+with concurrent.futures.ThreadPoolExecutor(max_workers=os.cpu_count() or 1) as pool:
+    for future in [pool.submit(write_case, name, mutation) for name, mutation in cases]:
+        future.result()
 
 # Keep fixtures aligned with the current allow-listed installer payload.
 if not any(member.name == f"{root_name}/install.sh" and member.isfile()

@@ -204,6 +204,13 @@ fn the_organise_hub_keeps_its_organisation_back_label() {
 
 // ------------------------------------------------------- D5 PageDown
 
+/// The DAT page's always-visible introduction, and a card that starts below
+/// the fold of a 600-pixel window. Text outside the viewport is not painted,
+/// so the card is only found once the page has scrolled.
+const DAT_PAGE_INTRO: &str =
+    "Manage the trusted game identification data EmuWiz uses to check releases.";
+const DAT_PAGE_BELOW_FOLD: &str = "Saved catalogue inventory";
+
 /// A long page outside Check (DATs & Verification, the smoke's D5 page) pages
 /// with PageDown and PageUp, even while a button has keyboard focus.
 #[test]
@@ -214,20 +221,38 @@ fn page_down_and_page_up_scroll_ordinary_pages() {
     let size = [1024.0, 600.0];
     frame(&context, &mut app, size);
     let start = frame(&context, &mut app, size);
-    let heading = "Saved catalogue inventory";
-    let before = top_of(&start, heading).expect("DAT page content");
+    let before = top_of(&start, DAT_PAGE_INTRO).expect("DAT page content");
+    assert_eq!(
+        top_of(&start, DAT_PAGE_BELOW_FOLD),
+        None,
+        "starts below the fold"
+    );
     input(&context, &mut app, size, vec![key(egui::Key::PageDown)]);
     let paged = frame(&context, &mut app, size);
-    assert_ne!(top_of(&paged, heading), Some(before), "PageDown scrolled");
+    assert_ne!(
+        top_of(&paged, DAT_PAGE_INTRO),
+        Some(before),
+        "PageDown scrolled"
+    );
+    assert!(
+        top_of(&paged, DAT_PAGE_BELOW_FOLD).is_some(),
+        "PageDown revealed content below the fold"
+    );
     input(&context, &mut app, size, vec![key(egui::Key::PageUp)]);
     let back = frame(&context, &mut app, size);
-    assert_eq!(top_of(&back, heading), Some(before), "PageUp returned");
+    assert_eq!(
+        top_of(&back, DAT_PAGE_INTRO),
+        Some(before),
+        "PageUp returned"
+    );
+    assert_eq!(top_of(&back, DAT_PAGE_BELOW_FOLD), None);
     // Button focus (keyboard users) must not disable paging.
     input(&context, &mut app, size, vec![key(egui::Key::Tab)]);
     assert!(!context.text_edit_focused());
     input(&context, &mut app, size, vec![key(egui::Key::PageDown)]);
     let focused_paged = frame(&context, &mut app, size);
-    assert_ne!(top_of(&focused_paged, heading), Some(before));
+    assert_ne!(top_of(&focused_paged, DAT_PAGE_INTRO), Some(before));
+    assert!(top_of(&focused_paged, DAT_PAGE_BELOW_FOLD).is_some());
 }
 
 /// A focused text field keeps PageUp/PageDown for itself.
@@ -239,14 +264,18 @@ fn page_keys_are_left_to_a_focused_text_field() {
     let size = [1024.0, 600.0];
     frame(&context, &mut app, size);
     let start = frame(&context, &mut app, size);
-    let heading = "Saved catalogue inventory";
-    let before = top_of(&start, heading).expect("DAT page content");
+    let before = top_of(&start, DAT_PAGE_INTRO).expect("DAT page content");
     let search = text_bounds(&start, "Search your games or systems…")[0].center();
     click(&context, &mut app, size, search);
     assert!(context.text_edit_focused(), "the header search is focused");
     input(&context, &mut app, size, vec![key(egui::Key::PageDown)]);
     let after = frame(&context, &mut app, size);
-    assert_eq!(top_of(&after, heading), Some(before));
+    assert_eq!(top_of(&after, DAT_PAGE_INTRO), Some(before));
+    assert_eq!(
+        top_of(&after, DAT_PAGE_BELOW_FOLD),
+        None,
+        "the page did not scroll"
+    );
 }
 
 // ------------------------------------------------- D3 Review identity

@@ -40,9 +40,12 @@ mod dolphin_profile_guidance;
 
 #[path = "launch_readiness_page/cemu.rs"]
 pub(crate) mod cemu;
+pub(crate) mod controller_readiness;
+pub(crate) mod dosbox;
 #[path = "launch_readiness_page/flycast.rs"]
 pub(crate) mod flycast;
 mod melonds_cheats;
+mod retroarch_cheat_sets;
 mod retroarch_cheats;
 mod scummvm_profile;
 pub(crate) mod xroar;
@@ -66,8 +69,9 @@ use archivefs_core::launch::{
     build_amiberry_whdload_command_plan, build_dolphin_command_plan,
     build_duckstation_command_plan, build_fsuae_whdload_command_plan, build_pcsx2_command_plan,
     build_ppsspp_command_plan, build_retroarch_command_plan, build_rpcs3_command_plan,
-    build_xenia_command_plan, preflight_and_launch_amiga_whdload, preflight_and_launch_ppsspp,
-    preflight_and_launch_rpcs3, preflight_and_launch_xemu, preflight_and_launch_xenia,
+    build_xenia_command_plan, preflight_and_launch_amiga_whdload, preflight_and_launch_openmsx,
+    preflight_and_launch_ppsspp, preflight_and_launch_rpcs3, preflight_and_launch_xemu,
+    preflight_and_launch_xenia,
 };
 use archivefs_core::launch::{
     CandidatePreference, DOLPHIN_SUPPORTED_PLATFORM_ID, DolphinLaunchExecutionError,
@@ -851,6 +855,12 @@ pub(crate) struct XeniaLaunchContext {
 
 pub(crate) struct AmigaWHDLoadLaunchContext {
     pub(crate) requests: Vec<(String, String, WHDLoadLaunchInput)>,
+    /// FS-UAE requests for a verified single-disk ADF, keyed like `requests`.
+    pub(crate) adf: Vec<(
+        String,
+        String,
+        archivefs_core::launch::FsUaeAdfLaunchRequest,
+    )>,
 }
 
 enum AmigaWHDLoadProcess {
@@ -966,6 +976,7 @@ pub(crate) enum StandaloneProcess {
     ),
     DuckStation(LaunchedDuckStationProcess),
     Ppsspp(LaunchedPpssppProcess),
+    FsUae(archivefs_core::launch::process_spawn::WatchedProcess),
     MelonDs(archivefs_core::launch::process_spawn::WatchedProcess),
     /// melonDS started through the per-launch cheat runtime; the session owns
     /// the temporary cheat workspace and removes it after melonDS exits.
@@ -983,6 +994,9 @@ pub(crate) enum StandaloneProcess {
     Flycast(archivefs_core::launch::LaunchedFlycastProcess),
     XRoar(archivefs_core::launch::process_spawn::WatchedProcess),
     ScummVm(archivefs_core::launch::LaunchedScummVmProcess),
+    OpenMsx(archivefs_core::launch::process_spawn::WatchedProcess),
+    /// DOSBox running inside the bubblewrap sandbox.
+    DosBox(archivefs_core::launch::LaunchedDosBoxProcess),
     /// ScummVM started on a private copy of a saved trainer profile the user
     /// chose for this launch; the copy is removed once it has exited.
     ScummVmTrainer(Box<archivefs_core::launch::LaunchedTrainerScummVm>),
@@ -1013,11 +1027,18 @@ pub(crate) struct StandaloneLaunchState {
     /// Where temporary cheat workspaces go; `None` is the runtime's default.
     cheat_roots: Option<archivefs_core::launch::cheat_runtime::CheatRuntimeRoots>,
     scummvm_profile: scummvm_profile::Choice,
+    /// The DOSBox check and the user's approval for the game on screen.
+    dosbox: dosbox::Panel,
 }
 
 impl StandaloneLaunchState {
     pub(crate) fn clear_cue_review(&mut self) {
         self.cue_review = None;
+    }
+
+    /// The game the Launch page shows, for the DOSBox check.
+    pub(crate) fn focus_dosbox_game(&mut self, path: Option<&Path>) {
+        self.dosbox.focus(path);
     }
 
     fn bind_cue_review(&mut self, request: &mut StandaloneLaunchRequest) -> Result<(), String> {
@@ -1209,10 +1230,13 @@ impl StandaloneLaunchState {
                     StandaloneProcess::Rpcs3(p) => p.poll().is_some(),
                     StandaloneProcess::Xemu(p) => p.poll().is_some(),
                     StandaloneProcess::Xenia(p) => p.poll().is_some(),
+                    StandaloneProcess::FsUae(p) => p.poll().is_some(),
                     StandaloneProcess::Cemu(p) => p.poll().is_some(),
                     StandaloneProcess::Flycast(p) => p.poll().is_some(),
                     StandaloneProcess::XRoar(p) => p.poll().is_some(),
                     StandaloneProcess::ScummVm(p) => p.poll().is_some(),
+                    StandaloneProcess::OpenMsx(p) => p.poll().is_some(),
+                    StandaloneProcess::DosBox(p) => p.poll().is_some(),
                     StandaloneProcess::ScummVmTrainer(p) => p.poll().is_some(),
                 };
                 (
@@ -1292,6 +1316,31 @@ fn duckstation_refusal_text(error: &DuckStationLaunchExecutionError) -> String {
         DuckStationLaunchExecutionError::Spawn(spawn) => {
             format!("DuckStation could not be started: {spawn:?}")
         }
+    }
+}
+
+fn openmsx_refusal_text(error: &archivefs_core::launch::OpenMsxLaunchPreflightError) -> String {
+    use archivefs_core::launch::OpenMsxLaunchPreflightErrorKind as K;
+    match error.kind {
+        K::ContentNotFound | K::ContentIsSymlink | K::ContentNotRegularFile => {
+            "The cartridge is no longer a regular file at its checked location. Restore the file and retry readiness.".into()
+        }
+        K::ContentChangedBeforeSpawn => {
+            "The cartridge changed after it was checked. Recheck identity and readiness before playing.".into()
+        }
+        K::ContentFormatUnsupported => {
+            "openMSX launch supports direct .mx1 cartridges for MSX and .mx2 cartridges for MSX2. Tape, disk, generic ROM and archive inputs stay blocked.".into()
+        }
+        K::IdentityUnresolved | K::IdentityMismatch => {
+            "The current file no longer verifies as the same MSX game. Recheck its identity before playing.".into()
+        }
+        K::MachineMismatch => {
+            "The checked C-BIOS machine no longer matches the verified MSX system. Recheck launch readiness.".into()
+        }
+        K::ProfileNotFound | K::ProfileIneligible | K::BindingUnavailable | K::BindingDrift => {
+            "The checked openMSX installation changed or is unavailable. Check its installation and retry readiness.".into()
+        }
+        K::ContentPathNotAbsolute => "The cartridge path is invalid. Recheck the library location.".into(),
     }
 }
 
@@ -1404,6 +1453,16 @@ pub(crate) enum StandaloneLaunchRequest {
     /// Plain native ScummVM launch of an extracted game folder; core re-runs
     /// detection and checks the executable at execute time.
     ScummVm(archivefs_core::launch::ScummVmLaunchRequest),
+    /// One verified single-disk ADF; core re-derives its DAT identity and
+    /// re-runs the FS-UAE preflight at click time.
+    FsUaeAdf(Box<archivefs_core::launch::FsUaeAdfLaunchRequest>),
+    OpenMsx(
+        archivefs_core::launch::OpenMsxLaunchRequest,
+        archivefs_core::patch_manager::OpenMsxProfileDiscoveryRoots,
+    ),
+    /// A DOS game folder and start command the user approved; core
+    /// re-reviews it and only runs DOSBox inside the sandbox.
+    DosBox(Box<archivefs_core::launch::DosBoxLaunchRequest>),
 }
 
 impl StandaloneLaunchRequest {
@@ -1418,10 +1477,13 @@ impl StandaloneLaunchRequest {
             Self::Rpcs3(_, _) => "RPCS3",
             Self::Xemu(_, _) => "xemu",
             Self::Xenia(_, _) => "Xenia",
+            Self::FsUaeAdf(_) => "FS-UAE",
             Self::Cemu(_) => "Cemu",
             Self::Flycast(_) => "Flycast",
             Self::XRoar(_) => "XRoar",
             Self::ScummVm(_) => "ScummVM",
+            Self::OpenMsx(..) => "openMSX",
+            Self::DosBox(_) => "DOSBox",
         }
     }
 
@@ -1436,10 +1498,13 @@ impl StandaloneLaunchRequest {
             Self::Rpcs3(r, _) => (r.selected_content_path.clone(), "rpcs3".into()),
             Self::Xemu(r, _) => (r.selected_content_path.clone(), "xemu".into()),
             Self::Xenia(r, _) => (r.selected_content_path.clone(), "xenia".into()),
+            Self::FsUaeAdf(r) => (r.fsuae.selected_content_path.clone(), "fsuae".into()),
             Self::Cemu(r) => r.key(),
             Self::Flycast(r) => r.key(),
             Self::XRoar(r) => r.key(),
             Self::ScummVm(r) => (r.selected_game_folder.clone(), "scummvm".into()),
+            Self::OpenMsx(r, _) => (r.selected_content_path.clone(), "openmsx".into()),
+            Self::DosBox(r) => (r.game_directory.clone(), dosbox::ADAPTER_KEY.into()),
         }
     }
     pub(crate) fn execute(self) -> Result<StandaloneProcess, String> {
@@ -1480,6 +1545,32 @@ impl StandaloneLaunchRequest {
             Self::ScummVm(r) => archivefs_core::launch::preflight_and_launch_scummvm(&r)
                 .map(StandaloneProcess::ScummVm)
                 .map_err(|error| scummvm_launch_error_message(&error)),
+            Self::DosBox(r) => archivefs_core::launch::preflight_and_launch_dosbox(&r)
+                .map(StandaloneProcess::DosBox)
+                .map_err(|error| dosbox::dosbox_refusal_text(&error)),
+            Self::FsUaeAdf(r) => archivefs_core::launch::preflight_and_launch_fsuae_adf(&r)
+                .map(StandaloneProcess::FsUae)
+                .map_err(|error| error.reason()),
+            Self::OpenMsx(r, roots) => {
+                let report = crate::selected_evidence_page::gather_selected_evidence_fast(
+                    &r.selected_content_path,
+                    Some(&r.expected_platform_id),
+                )
+                .map_err(|error| format!("openMSX identity could not be rechecked: {error}"))?;
+                let (identity, _) = archivefs_core::launch::canonical_identity_from_game_report(
+                    &report.game_identity_report,
+                );
+                preflight_and_launch_openmsx(&r, &roots, &identity)
+                    .map(StandaloneProcess::OpenMsx)
+                    .map_err(|error| match error {
+                        archivefs_core::launch::OpenMsxLaunchExecutionError::Preflight(e) => {
+                            format!("{} ({:?}: {})", openmsx_refusal_text(&e), e.kind, e.detail)
+                        }
+                        archivefs_core::launch::OpenMsxLaunchExecutionError::Spawn(e) => {
+                            format!("openMSX could not be started: {e}")
+                        }
+                    })
+            }
             Self::Xenia(r, roots) => preflight_and_launch_xenia(&r, &roots)
                 .map(StandaloneProcess::Xenia)
                 .map_err(|e: XeniaLaunchExecutionError| format!("{e:?}")),
@@ -1531,6 +1622,9 @@ struct RetroArchLaunchKey {
     profile: ProfileRef,
     core_stem: String,
     expected_appimage_executable: Option<PathBuf>,
+    expected_executable_binding:
+        Option<archivefs_core::launch::execution::RetroArchExecutableBinding>,
+    expected_configuration_file: Option<PathBuf>,
 }
 
 impl RetroArchLaunchKey {
@@ -1540,6 +1634,8 @@ impl RetroArchLaunchKey {
             profile: request.profile,
             core_stem: request.core_stem.clone(),
             expected_appimage_executable: request.expected_appimage_executable.clone(),
+            expected_executable_binding: request.expected_executable_binding.clone(),
+            expected_configuration_file: request.expected_configuration_file.clone(),
         }
     }
 }
@@ -1611,6 +1707,12 @@ pub(crate) struct RetroArchLaunchState {
     /// The user's optional cheat file and choices for the game on screen.
     cheats: Option<retroarch_cheats::Choice>,
     cheats_message: Option<String>,
+    /// The read-only lookup of cheat sets already on this computer.
+    cheat_sets: retroarch_cheat_sets::Lookup,
+    /// The cheat cache the lookup reads; `None` is EmuWiz's default cache.
+    cheat_cache_root: Option<PathBuf>,
+    /// The player asked to continue in Cheats & Mods.
+    open_cheats_mods: bool,
     /// How the core-name probe is run; `None` is the production launcher.
     probe: Option<
         std::sync::Arc<dyn archivefs_core::launch::libretro_probe::ProbeLauncher + Send + Sync>,
@@ -1629,6 +1731,11 @@ pub(crate) struct RetroArchLaunchState {
 impl RetroArchLaunchState {
     /// Run the core-name probe through `probe` instead of re-executing the
     /// current binary (a test binary cannot serve the production probe).
+    /// Read cheat sets from `root` instead of EmuWiz's default cheat cache.
+    pub(crate) fn use_cheat_cache(&mut self, root: PathBuf) {
+        self.cheat_cache_root = Some(root);
+    }
+
     pub(crate) fn use_probe(
         &mut self,
         probe: std::sync::Arc<
@@ -2612,6 +2719,39 @@ fn retroarch_playlist(
     retroarch?.multidisc.as_ref()?.handoff(&decision)
 }
 
+/// The request Play uses for `candidate`, only when RetroArch is handed that
+/// one content file (no multi-disc playlist). Features that must name files
+/// after what RetroArch loads, such as per-game bezel overrides, use this.
+pub(crate) fn single_content_retroarch_request(
+    plan: &LaunchPlan,
+    candidate: &LaunchCandidate,
+    retroarch: Option<&RetroArchLaunchContext>,
+) -> Option<RetroArchLaunchRequest> {
+    if retroarch_playlist(candidate, retroarch).is_some() {
+        return None;
+    }
+    retroarch_launch_request(plan, candidate, retroarch)
+}
+
+/// What a plain launch of `request` would hand RetroArch: see
+/// [`retroarch_cheats::bezel_identity`]. Starts a probe child; call it from a
+/// worker thread.
+pub(crate) fn retroarch_bezel_identity(
+    request: &RetroArchLaunchRequest,
+) -> Result<RetroArchBezelLaunch, String> {
+    retroarch_cheats::bezel_identity(request)
+}
+
+/// The RetroArch install a plain launch uses, as far as a per-game bezel
+/// needs it: the launched content and core, plus that profile's own settings
+/// file and overlay folder.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct RetroArchBezelLaunch {
+    pub(crate) identity: archivefs_core::bezel_apply::RetroArchContentIdentity,
+    pub(crate) config: PathBuf,
+    pub(crate) overlays: PathBuf,
+}
+
 fn retroarch_launch_request(
     plan: &LaunchPlan,
     candidate: &LaunchCandidate,
@@ -2659,6 +2799,48 @@ fn retroarch_launch_request(
         profile: *profile,
         core_stem: core_stem.clone(),
         expected_appimage_executable,
+        expected_configuration_file: if let Some(context) = retroarch {
+            let selected = context
+                .environment
+                .profiles
+                .iter()
+                .find(|p| p.profile_kind == profile.profile_kind && p.scope == profile.scope)?;
+            if selected.config_file.path.lossy {
+                return None;
+            }
+            Some(PathBuf::from(&selected.config_file.path.display))
+        } else {
+            None
+        },
+        expected_executable_binding: if retroarch.is_some() {
+            let profile = retroarch?
+                .environment
+                .profiles
+                .iter()
+                .find(|p| p.profile_kind == profile.profile_kind && p.scope == profile.scope)?;
+            let executable_paths: Vec<_> = if profile.profile_kind == ProfileKind::AppImage {
+                profile
+                    .app_images
+                    .iter()
+                    .map(|candidate| &candidate.path)
+                    .collect()
+            } else {
+                profile.evidence.executables.iter().collect()
+            };
+            match executable_paths.as_slice() {
+                [executable] if !executable.lossy => Some(
+                    archivefs_core::launch::execution::RetroArchExecutableBinding::capture(
+                        PathBuf::from(&executable.display),
+                    )
+                    .ok()?,
+                ),
+                // Retain the normal preflight's actionable missing/ambiguous
+                // refusal; it never chooses the first PATH executable.
+                _ => None,
+            }
+        } else {
+            None
+        },
     })
 }
 
@@ -2688,9 +2870,8 @@ fn launch_error_message(error: &LaunchExecutionError) -> (&'static str, String) 
         {
             (
                 "More than one RetroArch program was found, so EmuWiz did not start either. \
-                 Keep only the RetroArch you want on your PATH (for example remove or rename an \
-                 extra launcher script), then check readiness again. Technical details list the \
-                 programs found.",
+                 Choose the RetroArch installation you want in Emulator Setup, then check \
+                 readiness again. Technical details list the programs found.",
                 format!("{:?}: {}", preflight.kind, preflight.detail),
             )
         }
@@ -2698,6 +2879,9 @@ fn launch_error_message(error: &LaunchExecutionError) -> (&'static str, String) 
             let message = match preflight.kind {
                 LaunchPreflightErrorKind::ExecutableAmbiguous => {
                     "More than one RetroArch program was found, so EmuWiz did not start either."
+                }
+                LaunchPreflightErrorKind::ExecutableSelectionStale => {
+                    "The chosen RetroArch installation or its settings scope changed. Choose it again in Emulator Setup, then recheck readiness. Nothing was started."
                 }
                 LaunchPreflightErrorKind::ContentNotFound
                 | LaunchPreflightErrorKind::ContentIsSymlink
@@ -2900,28 +3084,39 @@ pub(crate) fn show_launch_readiness_panel(
                     }
                 }
             }
-            if show_plan(
-                ui,
-                plan,
-                retroarch.as_ref(),
-                dolphin.as_ref(),
-                pcsx2.as_ref(),
-                duckstation.as_ref(),
-                ppsspp.as_ref(),
-                rpcs3.as_ref(),
-                xemu.as_ref(),
-                xenia.as_ref(),
-                melonds.as_ref(),
-                retroarch_launch_state,
-                dolphin_launch_state,
-                pcsx2_launch_state,
-                standalone_launch_state,
-                amiga_whdload.as_ref(),
-                amiga_whdload_launch_state,
-            ) {
+            let dos = plan.platform_id.as_deref() == Some(dosbox::DOS_PLATFORM_ID);
+            if dos {
+                dosbox::show(ui, &preview_identity(plan), standalone_launch_state);
+            }
+            if !(dos && plan.candidates.is_empty())
+                && show_plan(
+                    ui,
+                    plan,
+                    retroarch.as_ref(),
+                    dolphin.as_ref(),
+                    pcsx2.as_ref(),
+                    duckstation.as_ref(),
+                    ppsspp.as_ref(),
+                    rpcs3.as_ref(),
+                    xemu.as_ref(),
+                    xenia.as_ref(),
+                    melonds.as_ref(),
+                    retroarch_launch_state,
+                    dolphin_launch_state,
+                    pcsx2_launch_state,
+                    standalone_launch_state,
+                    amiga_whdload.as_ref(),
+                    amiga_whdload_launch_state,
+                )
+            {
                 action = Some(LaunchReadinessPageAction::OpenDoctor);
             }
         }
+    }
+    if std::mem::take(&mut retroarch_launch_state.open_cheats_mods) {
+        action = Some(LaunchReadinessPageAction::Navigate(
+            crate::navigation::NavClick::View(crate::navigation::MainView::CheatsMods),
+        ));
     }
 
     action
@@ -2969,7 +3164,11 @@ fn show_plan(
         widgets::empty_state(
             ui,
             "No launch options found",
-            "No installed RetroArch core is a candidate for this game's platform yet.",
+            if matches!(plan.platform_id.as_deref(), Some("MSX" | "MSX2")) {
+                "No openMSX installation or compatible RetroArch core was found. Install openMSX or configure it on PATH, then check readiness again. No configuration was changed."
+            } else {
+                "No installed RetroArch core is a candidate for this game's platform yet."
+            },
             None,
         );
         return false;
@@ -3519,6 +3718,41 @@ fn standalone_launch_request(
                 })
                 .flatten()
         }
+        "openmsx" => {
+            let identity = CanonicalIdentityStatus::Resolved(ResolvedIdentity {
+                platform_id: platform.clone(),
+                game_key: game_key.clone(),
+            });
+            let planned = archivefs_core::launch::openmsx_command::build_openmsx_command_plan(
+                &identity, candidate,
+            );
+            let command = planned.command?;
+            let executable = command.executable.clone();
+            let content_metadata = std::fs::symlink_metadata(&path).ok()?;
+            let executable_metadata = std::fs::symlink_metadata(&command.executable).ok()?;
+            Some(StandaloneLaunchRequest::OpenMsx(
+                archivefs_core::launch::OpenMsxLaunchRequest {
+                    selected_content_path: path,
+                    expected_platform_id: platform,
+                    expected_game_key: game_key,
+                    profile_id: profile_id.clone(),
+                    expected_executable: command.executable,
+                    expected_machine: command.machine.into(),
+                    content_identity:
+                        archivefs_core::launch::process_spawn::CapturedFileIdentity::capture(
+                            &content_metadata,
+                        ),
+                    executable_identity:
+                        archivefs_core::launch::process_spawn::CapturedFileIdentity::capture(
+                            &executable_metadata,
+                        ),
+                },
+                archivefs_core::patch_manager::OpenMsxProfileDiscoveryRoots {
+                    explicit_executables: vec![executable],
+                    path_env: None,
+                },
+            ))
+        }
         "mame" => mame_launch_request(plan, candidate)
             .ok()
             .map(StandaloneLaunchRequest::Mame),
@@ -3950,6 +4184,24 @@ fn typed_launch_request(
         let _ = (candidate_adapter, candidate_profile);
         return Some(TypedLaunchRequest::AmigaWHDLoad(request.clone()));
     }
+    if let Some(context) = amiga_whdload
+        && let LaunchTarget::Standalone {
+            adapter_id,
+            profile_id,
+            ..
+        } = &candidate.target
+        && let Some((_, _, request)) = context
+            .adf
+            .iter()
+            .find(|(adapter, profile, _)| adapter == adapter_id && profile == profile_id)
+        && candidate.readiness == LaunchReadiness::Ready
+        && candidate.blockers.is_empty()
+        && candidate.warnings.is_empty()
+    {
+        return Some(TypedLaunchRequest::Standalone(
+            StandaloneLaunchRequest::FsUaeAdf(Box::new(request.clone())),
+        ));
+    }
     standalone_launch_request(
         plan,
         candidate,
@@ -4258,6 +4510,7 @@ fn show_candidate(
         if let Some(context) = dolphin {
             dolphin_profile_guidance::show(ui, plan, candidate, context);
         }
+        controller_readiness::show(ui, plan, candidate, pcsx2);
 
         open_doctor = show_firmware_summary(ui, candidate);
 
@@ -4325,6 +4578,17 @@ fn show_candidate(
             melonds,
         ) {
             ui.add_space(6.0);
+            if let StandaloneLaunchRequest::OpenMsx(ref request, _) = request {
+                ui.small(format!(
+                    "openMSX installation found · planned machine {} · direct {} cartridge (machine files are not inspected)",
+                    request.expected_machine,
+                    if request.expected_platform_id == "MSX" {
+                        ".mx1"
+                    } else {
+                        ".mx2"
+                    },
+                ));
+            }
             show_standalone_launch_action(ui, standalone_launch_state, request);
         }
         if let Some(context) = amiga_whdload
@@ -4345,6 +4609,27 @@ fn show_candidate(
         {
             ui.add_space(6.0);
             show_amiga_whdload_launch_action(ui, amiga_whdload_launch_state, request);
+        }
+        if let Some(context) = amiga_whdload
+            && let Some(TypedLaunchRequest::Standalone(
+                request @ StandaloneLaunchRequest::FsUaeAdf(_),
+            )) = typed_launch_request(
+                plan,
+                candidate,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                Some(context),
+            )
+        {
+            ui.add_space(6.0);
+            show_standalone_launch_action(ui, standalone_launch_state, request);
         }
     });
     open_doctor
@@ -4450,6 +4735,17 @@ fn show_standalone_launch_action(
             Some((_, _, StandaloneLaunchStage::Running(StandaloneProcess::ScummVm(_)))) => {
                 ui.small("ScummVM process started; EmuWiz cannot tell whether the game itself is running.");
             }
+            Some((_, _, StandaloneLaunchStage::Running(StandaloneProcess::OpenMsx(process)))) => {
+                ui.small(format!("openMSX running · PID {}", process.pid));
+                ui.small("Starting the process does not prove the game ran.");
+            }
+            Some((_, _, StandaloneLaunchStage::Running(StandaloneProcess::DosBox(process)))) => {
+                ui.small(format!(
+                    "DOSBox running in the sandbox · PID {}",
+                    process.pid
+                ));
+                ui.small("Starting the process does not prove the game ran.");
+            }
             Some((_, _, StandaloneLaunchStage::Exited(process))) => {
                 ui.small("Historical result from the last launch attempt; current readiness is shown above.");
                 if let StandaloneProcess::DuckStation(process) = process
@@ -4466,6 +4762,16 @@ fn show_standalone_launch_action(
                     && let Some(report) = process.poll()
                 {
                     ui.label(exit_line("ScummVM", report));
+                }
+                if let StandaloneProcess::OpenMsx(process) = process
+                    && let Some(report) = process.poll()
+                {
+                    ui.label(exit_line("openMSX", report));
+                }
+                if let StandaloneProcess::DosBox(process) = process
+                    && let Some(report) = process.poll()
+                {
+                    ui.label(exit_line("DOSBox", report));
                 }
                 if let StandaloneProcess::ScummVmTrainer(process) = process {
                     if let Some(report) = process.poll() {
@@ -4525,6 +4831,13 @@ fn show_standalone_launch_action(
             state.start(request);
             return;
         }
+        if adapter == dosbox::ADAPTER_KEY
+            && !state.is_active()
+            && ui.button("Play in DOSBox again (recheck)").clicked()
+        {
+            state.start(request);
+            return;
+        }
         #[cfg(target_os = "linux")]
         if adapter == "shadps4"
             && !state.is_active()
@@ -4538,6 +4851,9 @@ fn show_standalone_launch_action(
         Some(choice) if adapter == "melonds" && choice.chosen_count() > 0 => {
             format!("Launch {adapter} with {} cheat(s)", choice.chosen_count())
         }
+        _ if adapter == dosbox::ADAPTER_KEY => "Play in DOSBox".to_string(),
+        // ScummVM's Play reads as the product name, like its recheck button.
+        _ if adapter == "scummvm" => format!("Launch {}", request.adapter_name()),
         _ => format!("Launch {adapter}"),
     };
     if ui.button(label).clicked() {
@@ -4969,6 +5285,8 @@ fn detail_label(ui: &mut egui::Ui, label: &str, value: &str) {
 
 #[cfg(test)]
 mod melonds_tests;
+#[cfg(test)]
+mod retroarch_cheat_sets_tests;
 #[cfg(test)]
 mod retroarch_cheats_tests;
 #[cfg(test)]

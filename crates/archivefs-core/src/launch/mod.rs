@@ -86,8 +86,10 @@ pub mod desmume_execution;
 pub mod desmume_profile;
 pub mod dolphin_command;
 pub mod dolphin_execution;
+pub mod dosbox_autoexec;
 pub mod dosbox_command;
 pub mod dosbox_execution;
+pub mod dosbox_sandbox;
 pub mod duckstation_command;
 pub mod duckstation_execution;
 #[cfg(target_os = "linux")]
@@ -102,6 +104,7 @@ pub mod fbneo_execution;
 pub mod flycast_command;
 pub mod flycast_execution;
 pub mod flycast_gdi_readiness;
+pub mod fsuae_adf;
 pub mod fsuae_command;
 pub mod fsuae_execution;
 pub mod fuse_command;
@@ -279,6 +282,10 @@ pub use dolphin_execution::{
     DolphinLaunchSpawnError, LaunchedDolphinProcess, preflight_and_launch_dolphin,
     preflight_dolphin_launch, spawn_dolphin,
 };
+pub use dosbox_autoexec::{
+    ApprovalMismatch, DosBoxGameReview, DosBoxReviewProblem, DosBoxStartApproval, ReviewedStart,
+    locate_dosbox_game_directory, review_dosbox_game_directory,
+};
 pub use dosbox_command::{
     DOSBOX_CONFIG_FILE_NAME, DOSBOX_CONFIG_FLAG, DOSBOX_SUPPORTED_PLATFORM_ID,
     DosBoxBindingRefusal, DosBoxCommand, DosBoxCommandPlan, DosBoxCommandSelection,
@@ -292,6 +299,7 @@ pub use dosbox_execution::{
     DosBoxLaunchPreflightErrorKind, DosBoxLaunchRequest, DosBoxLaunchSpawnError,
     LaunchedDosBoxProcess, preflight_and_launch_dosbox, preflight_dosbox_launch, spawn_dosbox,
 };
+pub use dosbox_sandbox::{BWRAP_PATH, DosBoxHostAccess, DosBoxSandboxError, probe_sandbox};
 pub use duckstation_command::{
     DUCKSTATION_SUPPORTED_PLATFORM_ID, DuckStationCommand, DuckStationCommandPlan,
     DuckStationCommandSelection, build_duckstation_command_plan,
@@ -339,6 +347,11 @@ pub use flycast_execution::{
     FlycastLaunchPreflightError, FlycastLaunchPreflightErrorKind, FlycastLaunchRequest,
     FlycastLaunchSpawnError, LaunchedFlycastProcess, preflight_and_launch_flycast,
     preflight_flycast_launch, spawn_flycast,
+};
+pub use fsuae_adf::{
+    FsUaeAdfLaunchError, FsUaeAdfLaunchRequest, adf_canonical_identity, build_fsuae_adf_request,
+    current_adf_launch_identity, default_adf_identity_paths, fsuae_adf_config,
+    fsuae_adf_profile_refusal, preflight_and_launch_fsuae_adf, preflight_fsuae_adf_launch,
 };
 pub use fsuae_command::{
     FSUAE_SUPPORTED_PLATFORM_ID, FsUaeCommand, FsUaeCommandPlan, FsUaeCommandSelection,

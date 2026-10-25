@@ -33,6 +33,7 @@
 //! - Unknown status values are preserved rather than discarded.
 
 pub mod acquisition;
+pub mod amiga_adf_identity;
 pub mod archive;
 pub mod audit;
 pub mod authority;

@@ -711,6 +711,10 @@ impl ArchiveFsApp {
             if let Some(headline) = readiness.headline {
                 ui.label(egui::RichText::new(headline).strong());
             }
+            self.emulator_readiness
+                .retroarch_installation_picker
+                .show(ui, context);
+            ui.add_space(theme::SECTION_GAP);
             ui.label(readiness.sentence.as_str());
             if scanning {
                 ui.horizontal(|ui| {
@@ -939,6 +943,25 @@ impl ArchiveFsApp {
                 },
             );
             mame_set_resolutions.push(resolution);
+        }
+
+        // A loose ADF has no header identity; its only launch identity is a
+        // current DAT match that also proves a single-disk game.
+        let amiga_adf = matches!(
+            identity_status,
+            archivefs_core::launch::CanonicalIdentityStatus::Unknown
+        )
+        .then(|| {
+            focused.and_then(|path| {
+                crate::emulator_setup::amiga_adf::launch_inputs(
+                    path,
+                    focused_record.and_then(|r| r.mount_plan.archive.identity.platform.as_deref()),
+                )
+            })
+        })
+        .flatten();
+        if let Some(inputs) = &amiga_adf {
+            identity_status = inputs.identity.clone();
         }
 
         // Read-only Atari ST setup/media projection has no typed launch request.
@@ -1226,11 +1249,16 @@ impl ArchiveFsApp {
                 }
             }
         }
-        let amiga_whdload_context = (!amiga_whdload_requests.is_empty()).then_some(
-            launch_readiness_page::AmigaWHDLoadLaunchContext {
-                requests: amiga_whdload_requests,
-            },
-        );
+        let (amiga_adf_profiles, amiga_adf_requests, amiga_adf_scanned) = match amiga_adf {
+            Some(inputs) => (inputs.profiles, inputs.requests, true),
+            None => (Vec::new(), Vec::new(), false),
+        };
+        let amiga_whdload_context = (!amiga_whdload_requests.is_empty()
+            || !amiga_adf_requests.is_empty())
+        .then_some(launch_readiness_page::AmigaWHDLoadLaunchContext {
+            requests: amiga_whdload_requests,
+            adf: amiga_adf_requests,
+        });
         if let Some(binding) = verified_whdload_content {
             content.kind = Some(archivefs_core::launch::LaunchContentKind::Whdload(binding));
         }
@@ -1392,7 +1420,25 @@ impl ArchiveFsApp {
                 .chain(pcsx2_standalone_profiles)
                 .chain(flycast_standalone_profiles)
                 .chain(amiga_whdload_profiles)
+                .chain(amiga_adf_profiles)
                 .collect();
+
+        // Read-only openMSX discovery contributes only real executable
+        // bindings. Core's launch planner selects the explicit C-BIOS machine
+        // and refuses unsupported MSX media and identity.
+        let openmsx_roots =
+            archivefs_core::patch_manager::OpenMsxProfileDiscoveryRoots::from_environment();
+        let openmsx_discovery =
+            archivefs_core::patch_manager::discover_openmsx_profiles(&openmsx_roots);
+        standalone_profiles.extend(openmsx_discovery.profiles.iter().map(|profile| {
+            archivefs_core::launch::StandaloneProfileInput {
+                adapter_id: "openmsx",
+                profile_id: profile.profile_id.clone(),
+                profile_path: Some(profile.executable.path.clone()),
+                eligible: profile.eligible,
+                firmware: archivefs_core::launch::FirmwareReadiness::NotRequired,
+            }
+        }));
 
         // MAME has no profile directory; its lifecycle binding is the exact
         // executable selected through Emulator Setup, while its game
@@ -1871,7 +1917,7 @@ impl ArchiveFsApp {
                     // this read-only input builder using their existing
                     // adapter roots.
                     "PSX" | "PSP" | "PS3" | "Xbox" => true,
-                    "Amiga" => amiga_whdload_context.is_some(),
+                    "Amiga" => amiga_whdload_context.is_some() || amiga_adf_scanned,
                     _ => true,
                 }
             }
@@ -2795,7 +2841,17 @@ impl ArchiveFsApp {
         }
     }
 
-    pub(crate) fn poll_retroarch_profiles(&mut self) {
+    pub(crate) fn poll_retroarch_profiles(&mut self, context: &egui::Context) {
+        if self
+            .emulator_readiness
+            .retroarch_installation_picker
+            .poll(context)
+        {
+            // Drop the previous result/receiver before any page builds Play,
+            // cheat, save or bezel scope. An older scan cannot restore it.
+            self.start_retroarch_profile_scan(context.clone());
+            return;
+        }
         if let RetroArchProfilesState::Scanning { receiver } =
             &self.emulator_readiness.retroarch_profiles
         {

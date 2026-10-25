@@ -479,6 +479,142 @@ pub fn resolve_decoration(
     }
 }
 
+/// Whether a catalogued local image is still usable at preview time.
+/// Discovery is a snapshot, so files can disappear or be replaced later.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub enum LocalBezelFileStatus {
+    Available,
+    Missing,
+    NotRegularFile,
+    InvalidPath,
+    NotLocal,
+}
+
+impl LocalBezelFileStatus {
+    pub fn label(&self) -> &'static str {
+        match self {
+            Self::Available => "image available",
+            Self::Missing => "image missing since the last scan",
+            Self::NotRegularFile => "not a regular image file",
+            Self::InvalidPath => "image location is not a safe absolute path",
+            Self::NotLocal => "no local image (provider reference only)",
+        }
+    }
+}
+
+/// Read-only check of a candidate's local file. Never follows the path
+/// outside a plain `symlink_metadata` probe and never opens the image.
+pub fn local_bezel_file_status(asset: &DecorationAsset) -> LocalBezelFileStatus {
+    let path = match &asset.source {
+        DecorationSource::LocalPack { path } | DecorationSource::UserOverride { path } => {
+            Path::new(path)
+        }
+        DecorationSource::Provider { .. } => return LocalBezelFileStatus::NotLocal,
+    };
+    if !path.is_absolute()
+        || path
+            .components()
+            .any(|part| matches!(part, std::path::Component::ParentDir))
+    {
+        return LocalBezelFileStatus::InvalidPath;
+    }
+    match fs::metadata(path) {
+        Ok(metadata) if metadata.is_file() => LocalBezelFileStatus::Available,
+        Ok(_) => LocalBezelFileStatus::NotRegularFile,
+        Err(_) => LocalBezelFileStatus::Missing,
+    }
+}
+
+/// What EmuWiz can honestly say about an emulator's decoration support.
+/// In-game display is never claimed: no launch integration passes a bezel
+/// or overlay to an emulator today.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct DecorationEmulatorSupport {
+    pub emulator: String,
+    pub local_preview: bool,
+    pub reviewed_apply: bool,
+    pub in_game_display: DecorationInGameDisplay,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub enum DecorationInGameDisplay {
+    /// A reviewed config write exists, but EmuWiz launch does not load it.
+    Unconfirmed {
+        reason: String,
+    },
+    NotSupported {
+        reason: String,
+    },
+}
+
+pub fn decoration_emulator_support(target: &DecorationTarget) -> DecorationEmulatorSupport {
+    let retroarch = target.emulator.eq_ignore_ascii_case("retroarch");
+    DecorationEmulatorSupport {
+        emulator: target.emulator.clone(),
+        local_preview: true,
+        reviewed_apply: retroarch,
+        in_game_display: if retroarch {
+            DecorationInGameDisplay::Unconfirmed {
+                reason: "EmuWiz writes a reviewed RetroArch per-game override named for the \
+                         exact file and core a normal launch uses. RetroArch 1.22.2 was seen \
+                         loading such an override and accepting its overlay, but the bezel being \
+                         drawn on screen has not been checked. Cheat launches ignore per-game \
+                         overrides."
+                    .into(),
+            }
+        } else {
+            DecorationInGameDisplay::NotSupported {
+                reason: "EmuWiz has no bezel apply or launch integration for this emulator; the \
+                         image is a preview only."
+                    .into(),
+            }
+        },
+    }
+}
+
+/// A read-only bezel preview: the resolver result over candidates whose
+/// local image still exists, plus the candidates set aside and why.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct LocalBezelPreview {
+    pub resolution: DecorationResolution,
+    pub unavailable: Vec<(DecorationAsset, LocalBezelFileStatus)>,
+    pub support: DecorationEmulatorSupport,
+}
+
+/// Resolve like [`resolve_local_bezel_catalogue`], but fall back past
+/// candidates whose image vanished or became unsafe since discovery so a
+/// stale catalogue never selects a missing file.
+pub fn resolve_local_bezel_preview(
+    catalogue: &LocalBezelCatalogue,
+    context: &BezelMatchContext,
+    target: &DecorationTarget,
+) -> LocalBezelPreview {
+    let mut unavailable = Vec::new();
+    let candidates = catalogue
+        .assets
+        .iter()
+        .filter_map(|asset| match_asset(asset, context))
+        .filter(|asset| match local_bezel_file_status(asset) {
+            LocalBezelFileStatus::Available => true,
+            status => {
+                unavailable.push((asset.clone(), status));
+                false
+            }
+        })
+        .collect();
+    let mut resolution = resolve_decoration(candidates, target.clone());
+    if resolution.selected.is_none() && !unavailable.is_empty() {
+        resolution.reason = "matching local decorations exist but none of their images are \
+                             currently available"
+            .into();
+    }
+    LocalBezelPreview {
+        resolution,
+        unavailable,
+        support: decoration_emulator_support(target),
+    }
+}
+
 impl DecorationAsset {
     fn source_rank(&self) -> u8 {
         match self.source {
@@ -792,5 +928,121 @@ mod tests {
         );
         assert_eq!(result.candidates.len(), 3);
         assert!(!result.conflicts.is_empty());
+    }
+
+    #[test]
+    fn preview_falls_back_past_an_image_deleted_after_discovery() {
+        let root = tempfile::tempdir().unwrap();
+        let game = root.path().join("Game.png");
+        let system = root.path().join("snes.png");
+        png(&game, 16, 16);
+        png(&system, 16, 16);
+        fs::write(
+            format!("{}.json", system.display()),
+            r#"{"platform":"SNES"}"#,
+        )
+        .unwrap();
+        let catalogue = discover_local_bezel_catalogue(&LocalBezelConfig {
+            roots: vec![root.path().to_path_buf()],
+            ..LocalBezelConfig::default()
+        });
+        let context = BezelMatchContext {
+            platform: Some("SNES".into()),
+            game_title: Some("Game".into()),
+            ..BezelMatchContext::default()
+        };
+        let before = resolve_local_bezel_preview(&catalogue, &context, &target());
+        assert_eq!(
+            before.resolution.selected.unwrap().id,
+            game.display().to_string()
+        );
+        fs::remove_file(&game).unwrap();
+        let after = resolve_local_bezel_preview(&catalogue, &context, &target());
+        assert_eq!(
+            after.resolution.selected.unwrap().id,
+            system.display().to_string()
+        );
+        assert_eq!(after.unavailable.len(), 1);
+        assert_eq!(after.unavailable[0].1, LocalBezelFileStatus::Missing);
+    }
+
+    #[test]
+    fn preview_reports_when_every_matching_image_is_gone() {
+        let root = tempfile::tempdir().unwrap();
+        let game = root.path().join("Game.png");
+        png(&game, 16, 16);
+        let catalogue = discover_local_bezel_catalogue(&LocalBezelConfig {
+            roots: vec![root.path().to_path_buf()],
+            ..LocalBezelConfig::default()
+        });
+        fs::remove_file(&game).unwrap();
+        let preview = resolve_local_bezel_preview(
+            &catalogue,
+            &BezelMatchContext {
+                game_title: Some("Game".into()),
+                ..BezelMatchContext::default()
+            },
+            &target(),
+        );
+        assert!(preview.resolution.selected.is_none());
+        assert!(preview.resolution.reason.contains("none of their images"));
+    }
+
+    #[test]
+    fn file_status_refuses_relative_parent_and_directory_paths() {
+        let root = tempfile::tempdir().unwrap();
+        let mut candidate = asset(
+            "x",
+            DecorationScope::Game,
+            DecorationEvidence::FilenameHint { value: "x".into() },
+        );
+        for (path, expected) in [
+            (
+                "relative.png".to_string(),
+                LocalBezelFileStatus::InvalidPath,
+            ),
+            (
+                format!("{}/../x.png", root.path().display()),
+                LocalBezelFileStatus::InvalidPath,
+            ),
+            (
+                root.path().display().to_string(),
+                LocalBezelFileStatus::NotRegularFile,
+            ),
+            (
+                root.path().join("absent.png").display().to_string(),
+                LocalBezelFileStatus::Missing,
+            ),
+        ] {
+            candidate.source = DecorationSource::LocalPack { path };
+            assert_eq!(local_bezel_file_status(&candidate), expected);
+        }
+        candidate.source = DecorationSource::Provider {
+            name: "p".into(),
+            reference: "r".into(),
+        };
+        assert_eq!(
+            local_bezel_file_status(&candidate),
+            LocalBezelFileStatus::NotLocal
+        );
+    }
+
+    #[test]
+    fn emulator_support_never_claims_in_game_display() {
+        let retroarch = decoration_emulator_support(&target());
+        assert!(retroarch.reviewed_apply);
+        assert!(matches!(
+            retroarch.in_game_display,
+            DecorationInGameDisplay::Unconfirmed { .. }
+        ));
+        let dolphin = decoration_emulator_support(&DecorationTarget {
+            emulator: "dolphin".into(),
+            core: None,
+        });
+        assert!(!dolphin.reviewed_apply);
+        assert!(matches!(
+            dolphin.in_game_display,
+            DecorationInGameDisplay::NotSupported { .. }
+        ));
     }
 }

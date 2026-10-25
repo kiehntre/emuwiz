@@ -853,6 +853,7 @@ pub(super) enum Route {
     BrowsePlay,
     BrowsePlayGame(i64),
     MameWorkflow,
+    TosecInventory,
     Section(Section),
     Game(i64),
     /// The one place a game's identity is explained and, where it failed to
@@ -878,6 +879,7 @@ impl Route {
             Self::Home => Section::Home,
             Self::BrowsePlay | Self::BrowsePlayGame(_) => Section::Games,
             Self::MameWorkflow => Section::Mame,
+            Self::TosecInventory => Section::Dat,
             Self::Section(section) | Self::Task { section, .. } => *section,
             Self::Game(_) => Section::Games,
             Self::ReviewIdentity(_) => Section::Check,

@@ -788,6 +788,7 @@ mod tests {
                 system_flatpak_root: self.root.join("system-flatpak"),
                 app_image_search_roots: vec![self.root.join("Applications")],
                 desktop_file_roots: vec![self.root.join("applications")],
+                explicit_executables: Vec::new(),
             }
         }
 
@@ -804,7 +805,7 @@ mod tests {
             )
             .unwrap();
             let executable = bin.join("retroarch");
-            fs::write(&executable, b"test executable").unwrap();
+            fs::write(&executable, b"\x7fELFtest executable").unwrap();
             #[cfg(unix)]
             {
                 use std::os::unix::fs::PermissionsExt;

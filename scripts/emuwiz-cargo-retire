@@ -238,6 +238,7 @@ def parse_iso(text):
 
 SNAPSHOT_LIMIT = 1_000_000
 JOURNAL_MAX_PATHS = 20_000
+FULL_CENSUS_INTERVAL = 2.0  # seconds between complete process censuses while unlinking
 JOURNAL_SUFFIX = ".journal.jsonl"
 
 
@@ -1703,20 +1704,29 @@ def execute_group(entry, selected, out, journal, identities=None, mutation_guard
                 refuse_all(code, "fresh deletion-boundary safety check refused: " + str(fresh.refs))
                 break
             known_pids = set(fresh.pids_seen)
+            full_at = time.monotonic()
 
             def process_guard(check_only=False):
-                nonlocal known_pids
+                nonlocal known_pids, full_at
                 try:
                     current = {int(p) for p in os.listdir("/proc") if p.isdigit()}
                 except OSError as error:
                     raise Refusal("INCOMPLETE_PROCESS_VISIBILITY", str(error)) from error
-                if not current - known_pids:
+                stale = time.monotonic() - full_at >= FULL_CENSUS_INTERVAL
+                if not stale and not current - known_pids:
                     return True
                 if check_only:
                     return False
-                latest = F.Census([target] + entry["sources"])
+                # Between full censuses only PIDs not yet inspected are examined: a full
+                # census before every unlink made retirement crawl at a few files per
+                # second on a busy host.  The root listing inside Census decides what is
+                # new, and a full census still runs at least every FULL_CENSUS_INTERVAL so
+                # already-seen processes that later touch the target are caught too.
+                latest = F.Census([target] + entry["sources"], skip_pids=None if stale else known_pids)
                 latest.match_inodes(identities or set(), target)
                 known_pids = set(latest.pids_seen)
+                if stale:
+                    full_at = time.monotonic()
                 code = ("INCOMPLETE_PROCESS_VISIBILITY" if latest.unreadable_foreign else
                         "LIVE_PROCESS_REFERENCE" if any(latest.refs.values()) else None)
                 if code:

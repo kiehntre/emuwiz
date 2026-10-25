@@ -100,7 +100,7 @@ impl App {
                 ui.label("Local documents and saved associations are shown here. EmuWiz never downloads or changes document files.");
                 ui.horizontal_wrapped(|ui| {
                     if ui.button("Associate local document…").clicked()
-                        && let Some(path) = rfd::FileDialog::new().set_title("Associate a manual or guide with this game").add_filter("Manuals and guides", &["pdf", "cbz", "cbr"]).pick_file()
+                        && let Some(path) = rfd::FileDialog::new().set_title("Associate a manual or guide with this game").add_filter("Manuals and guides", &["pdf", "cbz", "cbr", "txt"]).pick_file()
                     {
                         match documents::associate_local_document(&path, game_id, &mut self.document_preferences) {
                             Ok(()) => {
@@ -122,7 +122,11 @@ impl App {
                 egui::Frame::group(ui.style()).show(ui, |ui| {
                 ui.horizontal_wrapped(|ui| {
                     ui.strong(&document.title);
-                    ui.label(format!("{} · {}", document.format.label(), document.page_count.map_or("page count unknown".into(), |count| format!("{count} pages"))));
+                    ui.label(if document.format == super::documents::GameDocumentFormat::Text {
+                        format!("Text guide · {} KB", document.file_size.div_ceil(1024))
+                    } else {
+                        format!("{} · {}", document.format.label(), document.page_count.map_or("page count unknown".into(), |count| format!("{count} pages")))
+                    });
                     ui.weak(document.kind.label());
                 });
                 match &document.association {
@@ -135,10 +139,18 @@ impl App {
                         ui.label("Needs review · this document is nearby or its filename resembles the game; ownership is not confirmed.");
                     }
                 }
-                ui.weak(super::manual_viewer::capability_text(document.readiness));
+                ui.weak(if document.format == super::documents::GameDocumentFormat::Text {
+                    if document.document_id.is_some() { "Plain text · Read inside EmuWiz." } else { "Plain text · EmuWiz cannot show this file." }
+                } else {
+                    super::manual_viewer::capability_text(document.readiness)
+                });
                 if let Some(reason) = &document.refusal_reason { ui.label(reason); }
                 ui.horizontal_wrapped(|ui| {
-                    self.manual_document_actions(ui, game_id, &document);
+                    if document.format == super::documents::GameDocumentFormat::Text {
+                        self.text_guide_actions(ui, game_id, &document);
+                    } else {
+                        self.manual_document_actions(ui, game_id, &document);
+                    }
                     if document.association != super::documents::GameDocumentAssociation::Explicit
                         && ui.button("Associate").clicked()
                     {

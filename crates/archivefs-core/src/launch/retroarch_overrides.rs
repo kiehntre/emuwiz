@@ -262,7 +262,10 @@ pub fn discover_retroarch_overrides(
 
 /// Expands RetroArch's `~` for a directory value. Other shortcuts (`:` is the
 /// application folder) and `~user` forms are not resolvable and are refused.
-fn expand_directory(value: &str, home: Option<&Path>) -> Result<PathBuf, &'static str> {
+/// Expands a RetroArch directory setting the way RetroArch does: a leading
+/// `~/` is the home folder; `~user`, `:` shortcuts and relative paths are
+/// refused rather than guessed.
+pub fn expand_directory(value: &str, home: Option<&Path>) -> Result<PathBuf, &'static str> {
     if let Some(rest) = value.strip_prefix('~') {
         let home = home
             .filter(|h| h.is_absolute())

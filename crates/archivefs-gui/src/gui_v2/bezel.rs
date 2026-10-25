@@ -1,19 +1,24 @@
 //! GUI-v2 presentation for the local-first bezel/decorations resolver.
 //!
-//! RetroArch apply is limited to the exact discovered config scope and uses
-//! the core shared transaction/history executor for all mutation.
+//! RetroArch apply is limited to the settings of the RetroArch install Play
+//! selected for the game and uses the core shared transaction/history
+//! executor for all mutation.
 
+use crate::launch_readiness_page::RetroArchBezelLaunch;
 use crate::ui::components::{StatusTone, banner, technical_details};
 use archivefs_core::bezel_apply::BezelPlanRefusal;
 use archivefs_core::bezel_apply::{
     BezelApplyPlan, BezelApplyRequest, BezelApplyStatus, BezelPlanError,
 };
 use archivefs_core::bezel_decorations::{
-    BezelMatchContext, DecorationAsset, DecorationEvidence, DecorationResolution, DecorationScope,
-    DecorationSource, DecorationTarget, LocalBezelCatalogue, LocalBezelConfig, LocalBezelImageInfo,
-    discover_local_bezel_catalogue, load_local_bezel_config, resolve_decoration,
-    resolve_local_bezel_catalogue, save_local_bezel_config,
+    BezelMatchContext, DecorationAsset, DecorationEmulatorSupport, DecorationEvidence,
+    DecorationInGameDisplay, DecorationResolution, DecorationScope, DecorationSource,
+    DecorationTarget, LocalBezelCatalogue, LocalBezelConfig, LocalBezelFileStatus,
+    LocalBezelImageInfo, decoration_emulator_support, discover_local_bezel_catalogue,
+    load_local_bezel_config, local_bezel_file_status, resolve_decoration,
+    resolve_local_bezel_preview, save_local_bezel_config,
 };
+use archivefs_core::launch::RetroArchLaunchRequest;
 use archivefs_core::patch_manager::{
     RetroArchBezelApplyOptions, apply_retroarch_bezel_plan, default_shared_backup_root,
     default_shared_history_root, prepare_retroarch_bezel_plan,
@@ -21,9 +26,21 @@ use archivefs_core::patch_manager::{
 use archivefs_core::patch_manager::{SharedApplyResult, SharedApplyStatus};
 use eframe::egui;
 use std::path::PathBuf;
+use std::sync::mpsc::{self, Receiver, TryRecvError};
 use std::time::{SystemTime, UNIX_EPOCH};
 
-#[derive(Clone)]
+type DiscoveryResult = Result<(LocalBezelConfig, LocalBezelCatalogue), String>;
+
+/// Folder scans decode every candidate image, so they run off the UI thread
+/// and only start once the panel is first shown.
+#[derive(Default)]
+enum Discovery {
+    #[default]
+    NotStarted,
+    Running(Receiver<DiscoveryResult>),
+    Done,
+}
+
 pub(super) struct BezelPanelState {
     pub selected_game: Option<String>,
     pub selected_platform: Option<String>,
@@ -39,8 +56,23 @@ pub(super) struct BezelPanelState {
     apply_error: Option<BezelPlanError>,
     apply_result: Option<ApplyOutcome>,
     apply_confirmation: bool,
+    /// Separate consent to change files that already exist (a user's
+    /// per-game override or a previous overlay). Never inferred.
+    replacement_confirmation: bool,
     retroarch_config_path: Option<PathBuf>,
     retroarch_overlay_root: Option<PathBuf>,
+    unavailable: Vec<(DecorationAsset, LocalBezelFileStatus)>,
+    support: DecorationEmulatorSupport,
+    discovery: Discovery,
+    preview_job: Option<(String, Receiver<Result<egui::ColorImage, String>>)>,
+    /// A candidate the user chose to look at; never changes the resolver's
+    /// selection or what Apply uses.
+    inspected_id: Option<String>,
+    stale_notice: Option<String>,
+    /// The single-file RetroArch launch Play would start for this game, or
+    /// why there is none. Apply never guesses past an `Err`.
+    launch_request: Result<RetroArchLaunchRequest, String>,
+    identity_job: Option<Receiver<Result<RetroArchBezelLaunch, String>>>,
 }
 
 impl Default for BezelPanelState {
@@ -49,18 +81,16 @@ impl Default for BezelPanelState {
             emulator: "retroarch".into(),
             core: None,
         };
-        let config = load_local_bezel_config().unwrap_or_default().bounded();
-        let catalogue = discover_local_bezel_catalogue(&config);
-        let resolution =
-            resolve_local_bezel_catalogue(&catalogue, &BezelMatchContext::default(), &target);
+        let resolution = resolve_decoration(Vec::new(), target.clone());
         Self {
+            support: decoration_emulator_support(&target),
             selected_game: None,
             selected_platform: None,
             target,
             candidates: resolution.candidates.clone(),
             resolution,
-            config,
-            catalogue,
+            config: LocalBezelConfig::default().bounded(),
+            catalogue: LocalBezelCatalogue::default(),
             preview_id: None,
             preview_texture: None,
             preview_error: None,
@@ -68,8 +98,16 @@ impl Default for BezelPanelState {
             apply_error: None,
             apply_result: None,
             apply_confirmation: false,
+            replacement_confirmation: false,
             retroarch_config_path: None,
             retroarch_overlay_root: None,
+            unavailable: Vec::new(),
+            discovery: Discovery::NotStarted,
+            preview_job: None,
+            inspected_id: None,
+            stale_notice: None,
+            launch_request: Err("EmuWiz has not checked how this game launches yet.".into()),
+            identity_job: None,
         }
     }
 }
@@ -78,6 +116,7 @@ impl BezelPanelState {
     /// Re-resolve after a local cache/import refresh.  The GUI never changes
     /// provider data while doing this.
     pub(super) fn resolve(&mut self) {
+        self.support = decoration_emulator_support(&self.target);
         if self.catalogue.assets.is_empty() && !self.candidates.is_empty() {
             self.resolution = resolve_decoration(self.candidates.clone(), self.target.clone());
             return;
@@ -87,18 +126,40 @@ impl BezelPanelState {
             platform: self.selected_platform.clone(),
             ..BezelMatchContext::default()
         };
-        self.resolution = resolve_local_bezel_catalogue(&self.catalogue, &context, &self.target);
+        let preview = resolve_local_bezel_preview(&self.catalogue, &context, &self.target);
+        self.resolution = preview.resolution;
+        self.unavailable = preview.unavailable;
         self.candidates = self.resolution.candidates.clone();
+        if let Some(id) = self.inspected_id.take() {
+            if self.candidates.iter().any(|candidate| candidate.id == id) {
+                self.inspected_id = Some(id);
+            } else {
+                self.stale_notice = Some(format!(
+                    "The image you were looking at ({id}) is no longer a usable candidate, so the resolved choice is shown instead."
+                ));
+            }
+        }
         self.preview_id = None;
+        self.preview_job = None;
         self.preview_texture = None;
         self.preview_error = None;
         self.apply_plan = None;
         self.apply_error = None;
         self.apply_result = None;
         self.apply_confirmation = false;
+        self.replacement_confirmation = false;
     }
 
+    /// Called every frame by the Artwork page; only a real change of game
+    /// re-resolves, so previews, reviewed plans and apply results survive.
     pub(super) fn set_game(&mut self, title: &str, platform: &str) {
+        if self.selected_game.as_deref() == Some(title)
+            && self.selected_platform.as_deref() == Some(platform)
+        {
+            return;
+        }
+        self.inspected_id = None;
+        self.stale_notice = None;
         self.selected_game = Some(title.to_string());
         self.selected_platform = Some(platform.to_string());
         self.resolve();
@@ -110,16 +171,49 @@ impl BezelPanelState {
         overlays: Option<PathBuf>,
         core: Option<String>,
     ) {
+        if self.retroarch_config_path == config
+            && self.retroarch_overlay_root == overlays
+            && self.target.core == core
+        {
+            return;
+        }
         self.retroarch_config_path = config;
         self.retroarch_overlay_root = overlays;
         self.target.core = core;
+        self.resolve();
     }
 
-    fn refresh_catalogue(&mut self) {
-        match load_local_bezel_config() {
-            Ok(config) => {
-                self.config = config.bounded();
-                self.catalogue = discover_local_bezel_catalogue(&self.config);
+    fn refresh_catalogue(&mut self, ctx: &egui::Context) {
+        let (sender, receiver) = mpsc::channel();
+        let ctx = ctx.clone();
+        std::thread::spawn(move || {
+            let result = load_local_bezel_config().map(|config| {
+                let config = config.bounded();
+                let catalogue = discover_local_bezel_catalogue(&config);
+                (config, catalogue)
+            });
+            let _ = sender.send(result);
+            ctx.request_repaint();
+        });
+        self.discovery = Discovery::Running(receiver);
+    }
+
+    fn poll_discovery(&mut self) {
+        let Discovery::Running(receiver) = &self.discovery else {
+            return;
+        };
+        let result = match receiver.try_recv() {
+            Ok(result) => result,
+            Err(TryRecvError::Empty) => return,
+            Err(TryRecvError::Disconnected) => {
+                Err("the local bezel scan stopped before finishing".into())
+            }
+        };
+        self.discovery = Discovery::Done;
+        match result {
+            Ok((config, catalogue)) => {
+                self.config = config;
+                self.catalogue = catalogue;
             }
             Err(error) => {
                 self.catalogue = LocalBezelCatalogue {
@@ -131,38 +225,89 @@ impl BezelPanelState {
         self.resolve();
     }
 
-    fn add_root(&mut self, root: PathBuf) {
+    fn add_root(&mut self, ctx: &egui::Context, root: PathBuf) {
         self.config.roots.push(root);
         self.config = self.config.clone().bounded();
         if let Err(error) = save_local_bezel_config(&self.config) {
             self.catalogue.warnings.push(error);
         }
-        self.refresh_catalogue();
+        self.refresh_catalogue(ctx);
     }
 
-    fn ensure_preview(&mut self, ui: &egui::Ui, asset: &DecorationAsset) {
+    /// The asset shown in the picture: the user's inspected candidate when it
+    /// is still a candidate, otherwise the resolver's selection.
+    fn previewed_asset(&self) -> Option<DecorationAsset> {
+        self.inspected_id
+            .as_ref()
+            .and_then(|id| {
+                self.resolution
+                    .candidates
+                    .iter()
+                    .find(|asset| &asset.id == id)
+            })
+            .or(self.resolution.selected.as_ref())
+            .cloned()
+    }
+
+    /// Decoding runs on a worker; the thumbnail loader bounds source bytes,
+    /// dimensions and output size. Results for an asset no longer being
+    /// previewed are dropped.
+    fn ensure_preview(&mut self, ctx: &egui::Context, asset: &DecorationAsset) {
+        self.poll_preview(ctx);
         if self.preview_id.as_deref() == Some(asset.id.as_str()) {
             return;
         }
         self.preview_id = Some(asset.id.clone());
         self.preview_texture = None;
         self.preview_error = None;
+        self.preview_job = None;
         let (DecorationSource::LocalPack { path } | DecorationSource::UserOverride { path }) =
             &asset.source
         else {
             self.preview_error = Some("This provider does not expose a local preview.".into());
             return;
         };
+        let status = local_bezel_file_status(asset);
+        if status != LocalBezelFileStatus::Available {
+            self.preview_error = Some(format!("{path}: {}", status.label()));
+            return;
+        }
         let path = PathBuf::from(path);
         let Ok(cache) = super::thumbnail::cache_root() else {
             self.preview_error = Some("The preview cache is unavailable.".into());
             return;
         };
-        match super::thumbnail::load_local(&path, &cache) {
-            Ok(pixels) => {
-                self.preview_texture = Some(ui.ctx().load_texture(
-                    format!("bezel-preview-{}", asset.id),
-                    pixels.image,
+        let (sender, receiver) = mpsc::channel();
+        let worker_ctx = ctx.clone();
+        std::thread::spawn(move || {
+            let result = super::thumbnail::load_local(&path, &cache).map(|pixels| pixels.image);
+            let _ = sender.send(result);
+            worker_ctx.request_repaint();
+        });
+        self.preview_job = Some((asset.id.clone(), receiver));
+    }
+
+    fn poll_preview(&mut self, ctx: &egui::Context) {
+        let Some((id, receiver)) = &self.preview_job else {
+            return;
+        };
+        let result = match receiver.try_recv() {
+            Ok(result) => result,
+            Err(TryRecvError::Empty) => return,
+            Err(TryRecvError::Disconnected) => {
+                Err("The preview stopped before finishing. Refresh to try again.".into())
+            }
+        };
+        let id = id.clone();
+        self.preview_job = None;
+        if self.preview_id.as_deref() != Some(id.as_str()) {
+            return;
+        }
+        match result {
+            Ok(image) => {
+                self.preview_texture = Some(ctx.load_texture(
+                    format!("bezel-preview-{id}"),
+                    image,
                     egui::TextureOptions::LINEAR,
                 ));
             }
@@ -176,11 +321,80 @@ impl BezelPanelState {
             .is_some_and(|plan| plan.status == BezelApplyStatus::Ready)
     }
 
-    fn preview_apply(&mut self) {
+    /// Called every frame by the Artwork page with the launch Play would use.
+    /// A different launch invalidates any reviewed plan.
+    pub(super) fn set_launch_request(&mut self, request: Result<RetroArchLaunchRequest, String>) {
+        if self.launch_request == request {
+            return;
+        }
+        self.launch_request = request;
+        self.identity_job = None;
+        self.apply_plan = None;
+        self.apply_error = None;
+        self.apply_confirmation = false;
+        self.replacement_confirmation = false;
+    }
+
+    /// Planning needs what RetroArch will actually load: the launch preflight
+    /// and the core's probed library name, gathered on a worker because the
+    /// probe starts a child process.
+    fn preview_apply(&mut self, ctx: &egui::Context) {
         self.apply_plan = None;
         self.apply_error = None;
         self.apply_result = None;
         self.apply_confirmation = false;
+        self.replacement_confirmation = false;
+        self.identity_job = None;
+        let request = match &self.launch_request {
+            Ok(request) => request.clone(),
+            Err(detail) => {
+                self.apply_error = Some(BezelPlanError {
+                    refusal: BezelPlanRefusal::RetroArchLaunchIdentityUnknown,
+                    path: None,
+                    detail: detail.clone(),
+                });
+                return;
+            }
+        };
+        let (sender, receiver) = mpsc::channel();
+        let worker_ctx = ctx.clone();
+        std::thread::spawn(move || {
+            let _ = sender.send(crate::launch_readiness_page::retroarch_bezel_identity(
+                &request,
+            ));
+            worker_ctx.request_repaint();
+        });
+        self.identity_job = Some(receiver);
+    }
+
+    fn poll_identity(&mut self) {
+        let Some(receiver) = &self.identity_job else {
+            return;
+        };
+        let result = match receiver.try_recv() {
+            Ok(result) => result,
+            Err(TryRecvError::Empty) => return,
+            Err(TryRecvError::Disconnected) => {
+                Err("The launch check stopped before finishing. Preview again.".into())
+            }
+        };
+        self.identity_job = None;
+        match result {
+            Ok(launch) => self.plan_with_launch(launch),
+            Err(detail) => {
+                self.apply_error = Some(BezelPlanError {
+                    refusal: BezelPlanRefusal::RetroArchLaunchIdentityUnknown,
+                    path: None,
+                    detail,
+                });
+            }
+        }
+    }
+
+    /// Plans against the RetroArch profile Play selected for this game, not
+    /// the panel's own discovery, which has no answer when several RetroArch
+    /// installs exist.
+    fn plan_with_launch(&mut self, launch: RetroArchBezelLaunch) {
         let Some(asset) = self.resolution.selected.clone() else {
             self.apply_error = Some(BezelPlanError {
                 refusal: archivefs_core::bezel_apply::BezelPlanRefusal::InvalidIdentity,
@@ -210,21 +424,17 @@ impl BezelPanelState {
             resolved_identity: identity,
             platform: self.selected_platform.clone().unwrap_or_default(),
             emulator: self.target.emulator.clone(),
-            core: self.target.core.clone(),
-            config_path: self.retroarch_config_path.clone(),
-            overlay_root: self.retroarch_overlay_root.clone(),
+            core: Some(launch.identity.core_library_name.clone()),
             approved_roots: self
                 .config
                 .roots
                 .iter()
                 .cloned()
-                .chain(
-                    self.retroarch_config_path
-                        .as_ref()
-                        .and_then(|path| path.parent())
-                        .map(PathBuf::from),
-                )
+                .chain(launch.config.parent().map(PathBuf::from))
                 .collect(),
+            config_path: Some(launch.config),
+            overlay_root: Some(launch.overlays),
+            retroarch_launch: Some(launch.identity),
         };
         match prepare_retroarch_bezel_plan(&request) {
             Ok(plan) => self.apply_plan = Some(plan),
@@ -236,6 +446,10 @@ impl BezelPanelState {
         let Some(plan) = self.apply_plan.as_ref() else {
             return;
         };
+        let replacement_approved = self.replacement_confirmation && plan_changes_existing(plan);
+        // One click, one attempt: a repeat needs a fresh review.
+        self.apply_confirmation = false;
+        self.replacement_confirmation = false;
         let history = match default_shared_history_root() {
             Ok(path) => path,
             Err(error) => {
@@ -255,7 +469,7 @@ impl BezelPanelState {
             plan,
             &RetroArchBezelApplyOptions {
                 general_approved: true,
-                replacement_approved: !plan.conflicts.is_empty(),
+                replacement_approved,
                 operation_id,
                 timestamp_unix_seconds: SystemTime::now()
                     .duration_since(UNIX_EPOCH)
@@ -367,6 +581,9 @@ fn refusal_label(refusal: &BezelPlanRefusal) -> &'static str {
         }
         RetroArchUnsafeName => "The game or core name can't be used safely as a file name.",
         RetroArchDestinationUnsafe => "The destination isn't safe to write to.",
+        RetroArchLaunchIdentityUnknown => {
+            "EmuWiz can't confirm the exact game file and RetroArch core this game launches with, so it won't write a settings file RetroArch might never use."
+        }
     }
 }
 
@@ -395,13 +612,24 @@ pub(super) fn show(ui: &mut egui::Ui, state: &mut BezelPanelState) {
             ui.label(format!("Core: {core}"));
         }
     });
-    if ui.button("Refresh local bezel preview").clicked() {
-        state.refresh_catalogue();
+    show_support(ui, &state.support);
+    if matches!(state.discovery, Discovery::NotStarted) {
+        state.refresh_catalogue(ui.ctx());
     }
-    if ui.button("Add local bezel folder").clicked()
+    state.poll_discovery();
+    let scanning = matches!(state.discovery, Discovery::Running(_));
+    if ui
+        .add_enabled(!scanning, egui::Button::new("Refresh local bezel preview"))
+        .clicked()
+    {
+        state.refresh_catalogue(ui.ctx());
+    }
+    if ui
+        .add_enabled(!scanning, egui::Button::new("Add local bezel folder"))
+        .clicked()
         && let Some(root) = rfd::FileDialog::new().pick_folder()
     {
-        state.add_root(root);
+        state.add_root(ui.ctx(), root);
     }
     ui.collapsing("Local bezel folders", |ui| {
         if state.config.roots.is_empty() {
@@ -417,6 +645,16 @@ pub(super) fn show(ui: &mut egui::Ui, state: &mut BezelPanelState) {
         ));
     });
 
+    if scanning {
+        ui.horizontal(|ui| {
+            ui.spinner();
+            ui.label("Scanning local bezel folders…");
+        });
+        return;
+    }
+    if let Some(notice) = &state.stale_notice {
+        ui.label(notice);
+    }
     let Some(selected) = state.resolution.selected.as_ref() else {
         ui.separator();
         ui.strong("No compatible local bezel is ready");
@@ -427,6 +665,7 @@ pub(super) fn show(ui: &mut egui::Ui, state: &mut BezelPanelState) {
         for warning in state.catalogue.warnings.iter().take(3) {
             ui.small(warning);
         }
+        show_unavailable(ui, &state.unavailable);
         ui.label("There is no compatible image to apply. Add or check a local bezel folder, then refresh the preview. No emulator settings were changed by this check.");
         return;
     };
@@ -462,42 +701,88 @@ pub(super) fn show(ui: &mut egui::Ui, state: &mut BezelPanelState) {
     ui.label("Preview relationship: emulator viewport remains unchanged; no files are written.");
 
     let selected = selected.clone();
-    state.ensure_preview(ui, &selected);
+    let previewed = state.previewed_asset().unwrap_or_else(|| selected.clone());
+    if previewed.id != selected.id {
+        ui.label(format!(
+            "Looking at alternate candidate {}. The resolver still selects {}, and Preview Apply uses that selection.",
+            previewed.id, selected.id
+        ));
+        if ui.button("Show the resolved selection").clicked() {
+            state.inspected_id = None;
+        }
+    }
+    state.ensure_preview(ui.ctx(), &previewed);
     ui.group(|ui| match (&state.preview_texture, &state.preview_error) {
         (Some(texture), _) => paint_preview(
             ui,
             texture,
-            &selected,
-            state.catalogue.images.get(&selected.id),
+            &previewed,
+            state.catalogue.images.get(&previewed.id),
         ),
         (_, Some(error)) => {
             ui.label("The border image could not be displayed. Check its location and use Refresh local bezel preview to try again. Previewing changes no emulator settings.");
             technical_details(ui, "bezel_image_error", |ui| { ui.label(error); });
         }
         (None, None) => {
-            ui.centered_and_justified(|ui| ui.spinner());
+            ui.horizontal(|ui| {
+                ui.spinner();
+                ui.label("Loading preview…");
+            });
         }
     });
 
-    if !state.resolution.conflicts.is_empty() {
-        ui.collapsing("Conflicts and alternate candidates", |ui| {
-            for conflict in &state.resolution.conflicts {
-                ui.label(conflict);
-            }
-            for alternate in state.resolution.candidates.iter().skip(1) {
+    let candidate_count = state.resolution.candidates.len();
+    egui::CollapsingHeader::new(format!(
+        "Candidates in precedence order ({candidate_count})"
+    ))
+    .id_salt("bezel_candidates")
+    .show(ui, |ui| {
+        ui.small(PRECEDENCE_RULE);
+        for conflict in &state.resolution.conflicts {
+            ui.colored_label(egui::Color32::YELLOW, format!("Conflict: {conflict}"));
+        }
+        let previewed_id = previewed.id.clone();
+        for (rank, candidate) in state.resolution.candidates.iter().enumerate() {
+            ui.horizontal_wrapped(|ui| {
                 ui.label(format!(
-                    "{} · {} · {}",
-                    alternate.id,
-                    alternate.provenance.provider,
-                    evidence_label(&alternate.evidence)
+                    "{}. {} · {} · {} · {}",
+                    rank + 1,
+                    precedence_reason(candidate),
+                    evidence_label(&candidate.evidence),
+                    candidate.provenance.provider,
+                    candidate.id
                 ));
-            }
-        });
-    }
+                if let Some(info) = state.catalogue.images.get(&candidate.id) {
+                    ui.small(format!("{}×{}", info.width, info.height));
+                }
+                if rank == 0 {
+                    ui.small("selected");
+                }
+                if candidate.id == previewed_id {
+                    ui.small("in preview");
+                } else if ui.small_button("Look at this one").clicked() {
+                    state.inspected_id = Some(candidate.id.clone());
+                    state.stale_notice = None;
+                }
+            });
+        }
+        show_unavailable(ui, &state.unavailable);
+    });
 
     ui.separator();
-    if ui.button("Preview Apply").clicked() {
-        state.preview_apply();
+    state.poll_identity();
+    let checking = state.identity_job.is_some();
+    if ui
+        .add_enabled(!checking, egui::Button::new("Preview Apply"))
+        .clicked()
+    {
+        state.preview_apply(ui.ctx());
+    }
+    if checking {
+        ui.horizontal(|ui| {
+            ui.spinner();
+            ui.label("Checking exactly how this game launches in RetroArch…");
+        });
     }
     if let Some(error) = &state.apply_error {
         banner(
@@ -522,6 +807,12 @@ pub(super) fn show(ui: &mut egui::Ui, state: &mut BezelPanelState) {
             ui.label(format!("Target: {}", plan.target.emulator));
             if let Some(destination) = &plan.target.destination_root {
                 ui.label(format!("Overlay destination: {}", destination.display()));
+            }
+            if let Some(entry) = plan.config_entries.first() {
+                ui.label(format!(
+                    "RetroArch reads this per-game override only when this exact file is launched normally with this core: {}. Cheat launches from EmuWiz use a temporary profile and ignore it.",
+                    entry.path.display()
+                ));
             }
             ui.label(format!("Files to change: {}", plan.files.len()));
             ui.label(format!("Config entries: {}", plan.config_entries.len()));
@@ -548,9 +839,18 @@ pub(super) fn show(ui: &mut egui::Ui, state: &mut BezelPanelState) {
                 &mut state.apply_confirmation,
                 "I reviewed this plan and explicitly confirm it",
             );
+            let needs_replacement = plan_changes_existing(&plan);
+            if needs_replacement {
+                ui.checkbox(
+                    &mut state.replacement_confirmation,
+                    "I also approve changing the existing files marked \"change\" above",
+                );
+            }
             if ui
                 .add_enabled(
-                    state.apply_confirmation && state.apply_supported(),
+                    state.apply_confirmation
+                        && (!needs_replacement || state.replacement_confirmation)
+                        && state.apply_supported(),
                     egui::Button::new("Apply bezel configuration"),
                 )
                 .clicked()
@@ -570,15 +870,70 @@ pub(super) fn show(ui: &mut egui::Ui, state: &mut BezelPanelState) {
     }
     if let Some(result) = &state.apply_result {
         show_apply_outcome(ui, result);
+        ui.label(format!(
+            "Written configuration is not proof of in-game display. {}",
+            in_game_text(&state.support.in_game_display)
+        ));
+    } else {
+        ui.label("Status: preview only. Nothing on this panel has been applied.");
     }
     if state.apply_supported() {
         ui.label("Apply is available after confirmation.");
     } else {
-        ui.label("Preview Apply is available; Apply requires a discovered RetroArch scope and explicit confirmation.");
+        ui.label("Preview Apply is available; Apply uses the RetroArch settings this game launches with and needs explicit confirmation.");
     }
     ui.small(
         "Source artwork and ROMs are untouched; retroarch.cfg is never edited by this workflow.",
     );
+}
+
+/// Whether applying `plan` may change a file that already exists, which the
+/// shared transaction only allows with separate replacement approval.
+fn plan_changes_existing(plan: &BezelApplyPlan) -> bool {
+    !plan.conflicts.is_empty() || plan.files.iter().any(|file| file.exists)
+}
+
+const PRECEDENCE_RULE: &str = "Order: user override, then local pack, then provider; within each, game-specific, then system, then default; then evidence (verified identity, DAT identity, user mapping, platform, filename hint).";
+
+fn in_game_text(display: &DecorationInGameDisplay) -> String {
+    match display {
+        DecorationInGameDisplay::Unconfirmed { reason } => {
+            format!("In-game display: not confirmed. {reason}")
+        }
+        DecorationInGameDisplay::NotSupported { reason } => {
+            format!("In-game display: not supported. {reason}")
+        }
+    }
+}
+
+fn show_support(ui: &mut egui::Ui, support: &DecorationEmulatorSupport) {
+    ui.group(|ui| {
+        ui.strong(format!("Emulator support: {}", support.emulator));
+        ui.label(if support.local_preview {
+            "Local image preview: available (read-only)"
+        } else {
+            "Local image preview: not available"
+        });
+        ui.label(if support.reviewed_apply {
+            "Reviewed apply: available after explicit confirmation, with backup and Undo"
+        } else {
+            "Reviewed apply: not available for this emulator"
+        });
+        ui.label(in_game_text(&support.in_game_display));
+    });
+}
+
+fn show_unavailable(ui: &mut egui::Ui, unavailable: &[(DecorationAsset, LocalBezelFileStatus)]) {
+    if unavailable.is_empty() {
+        return;
+    }
+    ui.strong(format!(
+        "Skipped matching images ({}). Refresh after fixing them.",
+        unavailable.len()
+    ));
+    for (asset, status) in unavailable {
+        ui.small(format!("{} · {}", asset.id, status.label()));
+    }
 }
 
 fn paint_preview(
@@ -751,6 +1106,7 @@ mod tests {
                 assets: vec![candidate],
                 ..LocalBezelCatalogue::default()
             },
+            discovery: Discovery::Done,
             ..BezelPanelState::default()
         };
         let context = egui::Context::default();
@@ -778,6 +1134,14 @@ mod tests {
             egui::CentralPanel::default().show(context, |ui| show_apply_outcome(ui, outcome));
         });
         texts(&output)
+    }
+
+    #[test]
+    fn unknown_launch_identity_refusal_is_plain() {
+        let refusal = BezelPlanRefusal::RetroArchLaunchIdentityUnknown;
+        let label = refusal_label(&refusal);
+        assert_ne!(label, format!("{refusal:?}"));
+        assert!(label.contains("exact game file"));
     }
 
     #[test]
@@ -842,6 +1206,7 @@ mod tests {
             },
             apply_plan: Some(plan),
             preview_id: Some("game".to_string()),
+            discovery: Discovery::Done,
             ..BezelPanelState::default()
         }
     }
@@ -991,5 +1356,402 @@ mod tests {
         assert_eq!(headline, "Apply failed");
         assert!(detail.contains("Nothing was written"));
         assert!(!wrote, "Failed must never claim anything was written");
+    }
+
+    fn png(path: &std::path::Path) {
+        image::RgbaImage::from_pixel(32, 16, image::Rgba([1, 2, 3, 255]))
+            .save(path)
+            .unwrap();
+    }
+
+    fn scanned_state(root: &std::path::Path, title: &str) -> BezelPanelState {
+        let config = LocalBezelConfig {
+            roots: vec![root.to_path_buf()],
+            ..LocalBezelConfig::default()
+        };
+        let mut state = BezelPanelState {
+            catalogue: discover_local_bezel_catalogue(&config),
+            config,
+            discovery: Discovery::Done,
+            ..BezelPanelState::default()
+        };
+        state.set_game(title, "SNES");
+        state
+    }
+
+    /// Clicks the first on-screen text equal to `label`, then renders twice.
+    fn click_text(
+        context: &egui::Context,
+        raw_input: &egui::RawInput,
+        state: &mut BezelPanelState,
+        label: &str,
+    ) -> egui::FullOutput {
+        let layout = context.run(raw_input.clone(), |context| {
+            egui::CentralPanel::default().show(context, |ui| show(ui, state));
+        });
+        let point = text_bounds(&layout, label)
+            .into_iter()
+            .next()
+            .unwrap_or_else(|| panic!("{label:?} must be on screen"))
+            .center();
+        for pressed in [true, false] {
+            let mut input = raw_input.clone();
+            input.events = vec![
+                egui::Event::PointerMoved(point),
+                egui::Event::PointerButton {
+                    pos: point,
+                    button: egui::PointerButton::Primary,
+                    pressed,
+                    modifiers: egui::Modifiers::NONE,
+                },
+            ];
+            let _ = context.run(input, |context| {
+                egui::CentralPanel::default().show(context, |ui| show(ui, state));
+            });
+        }
+        let _ = context.run(raw_input.clone(), |context| {
+            egui::CentralPanel::default().show(context, |ui| show(ui, state));
+        });
+        context.run(raw_input.clone(), |context| {
+            egui::CentralPanel::default().show(context, |ui| show(ui, state));
+        })
+    }
+
+    #[test]
+    fn per_frame_set_game_keeps_the_reviewed_plan_until_the_game_changes() {
+        let mut state = state_with_selected_asset_and_plan(plan_with_rollback(true, "ok"));
+        state.set_game("Game", "SNES");
+        state.set_retroarch_scope(None, None, None);
+        assert!(
+            state.apply_plan.is_some(),
+            "same game must not drop the plan"
+        );
+        assert_eq!(state.preview_id.as_deref(), Some("game"));
+        state.set_game("Other Game", "SNES");
+        assert!(state.apply_plan.is_none());
+        assert!(state.preview_id.is_none());
+    }
+
+    #[test]
+    fn stale_inspected_candidate_falls_back_to_the_resolved_choice() {
+        let root = tempfile::tempdir().unwrap();
+        let game = root.path().join("Game.png");
+        let system = root.path().join("snes.png");
+        png(&game);
+        png(&system);
+        std::fs::write(
+            format!("{}.json", system.display()),
+            r#"{"platform":"SNES"}"#,
+        )
+        .unwrap();
+        let mut state = scanned_state(root.path(), "Game");
+        let system_id = system.display().to_string();
+        assert_eq!(
+            state.resolution.selected.as_ref().unwrap().id,
+            game.display().to_string()
+        );
+        state.inspected_id = Some(system_id.clone());
+        assert_eq!(state.previewed_asset().unwrap().id, system_id);
+        std::fs::remove_file(&system).unwrap();
+        state.resolve();
+        assert!(state.inspected_id.is_none());
+        assert!(state.stale_notice.as_deref().unwrap().contains("no longer"));
+        assert_eq!(
+            state.previewed_asset().unwrap().id,
+            game.display().to_string()
+        );
+        assert_eq!(state.unavailable.len(), 1);
+    }
+
+    #[test]
+    fn missing_selected_image_falls_back_and_reports_without_loading() {
+        let root = tempfile::tempdir().unwrap();
+        let game = root.path().join("Game.png");
+        png(&game);
+        let mut state = scanned_state(root.path(), "Game");
+        std::fs::remove_file(&game).unwrap();
+        let context = egui::Context::default();
+        let output = context.run(Default::default(), |context| {
+            egui::CentralPanel::default().show(context, |ui| show(ui, &mut state));
+        });
+        let rendered = texts(&output);
+        assert!(state.preview_job.is_none());
+        // The stale selection was found at render-time preview, not by a rescan.
+        assert!(
+            state
+                .preview_error
+                .as_deref()
+                .is_some_and(|error| error.contains("missing")),
+            "{rendered}"
+        );
+        state.resolve();
+        assert!(state.resolution.selected.is_none());
+        assert!(state.resolution.reason.contains("none of their images"));
+    }
+
+    #[test]
+    fn late_preview_result_for_another_asset_is_dropped() {
+        let context = egui::Context::default();
+        let (sender, receiver) = mpsc::channel();
+        sender
+            .send(Ok(egui::ColorImage::new(
+                [1, 1],
+                vec![egui::Color32::WHITE],
+            )))
+            .unwrap();
+        let mut state = BezelPanelState {
+            preview_id: Some("current".into()),
+            preview_job: Some(("old".into(), receiver)),
+            discovery: Discovery::Done,
+            ..BezelPanelState::default()
+        };
+        state.poll_preview(&context);
+        assert!(state.preview_job.is_none());
+        assert!(state.preview_texture.is_none());
+    }
+
+    #[test]
+    fn default_state_does_not_scan_until_the_panel_is_shown() {
+        let state = BezelPanelState::default();
+        assert!(matches!(state.discovery, Discovery::NotStarted));
+        assert!(state.catalogue.assets.is_empty());
+    }
+
+    #[test]
+    fn panel_states_support_honestly_and_never_claims_in_game_display() {
+        for emulator in ["retroarch", "dolphin"] {
+            let mut state = state_with_selected_asset_and_plan(plan_with_rollback(true, "ok"));
+            state.apply_plan = None;
+            state.target.emulator = emulator.into();
+            state.resolve();
+            let context = egui::Context::default();
+            let output = context.run(Default::default(), |context| {
+                egui::CentralPanel::default().show(context, |ui| show(ui, &mut state));
+            });
+            let rendered = texts(&output);
+            assert!(rendered.contains(&format!("Emulator support: {emulator}")));
+            assert!(rendered.contains("In-game display: not"), "{rendered}");
+            assert!(!rendered.to_lowercase().contains("will display"));
+            assert!(!rendered.to_lowercase().contains("will appear"));
+        }
+    }
+
+    #[test]
+    fn compact_1024x600_layout_keeps_candidates_and_support_within_width() {
+        let root = tempfile::tempdir().unwrap();
+        let deep = root
+            .path()
+            .join("a-very-long-local-bezel-pack-folder-name-for-layout-checks")
+            .join("another-deeply-nested-system-folder-with-a-long-name");
+        std::fs::create_dir_all(&deep).unwrap();
+        for name in ["Game.png", "game.PNG"] {
+            png(&deep.join(name));
+        }
+        let mut state = scanned_state(root.path(), "Game");
+        assert_eq!(state.resolution.candidates.len(), 2);
+        // Keep the picture worker (and its app-data thumbnail cache) out of
+        // this layout check; the spinner placeholder is rendered instead.
+        state.preview_id = state
+            .resolution
+            .selected
+            .as_ref()
+            .map(|asset| asset.id.clone());
+        let context = egui::Context::default();
+        context.style_mut(|style| style.animation_time = 0.0);
+        let raw_input = egui::RawInput {
+            screen_rect: Some(egui::Rect::from_min_size(
+                egui::Pos2::ZERO,
+                egui::vec2(1024.0, 600.0),
+            )),
+            ..Default::default()
+        };
+        let output = click_text(
+            &context,
+            &raw_input,
+            &mut state,
+            "Candidates in precedence order (2)",
+        );
+        let rendered = texts(&output);
+        assert!(rendered.contains("1. game-specific asset"), "{rendered}");
+        assert!(rendered.contains("Conflict:"), "{rendered}");
+        for wanted in ["Look at this one", "Emulator support: retroarch"] {
+            let bounds = text_bounds(&output, wanted);
+            assert!(!bounds.is_empty(), "{wanted} missing");
+        }
+        let mut widest = 0.0_f32;
+        fn walk(shape: &egui::Shape, widest: &mut f32) {
+            match shape {
+                egui::Shape::Text(text) => {
+                    *widest = widest.max(text.pos.x + text.galley.size().x);
+                }
+                egui::Shape::Vec(nested) => nested.iter().for_each(|shape| walk(shape, widest)),
+                _ => {}
+            }
+        }
+        for clipped in &output.shapes {
+            walk(&clipped.shape, &mut widest);
+        }
+        assert!(
+            widest <= 1024.0,
+            "text overflows the 1024px window: {widest}"
+        );
+    }
+
+    #[test]
+    fn replacement_needs_its_own_confirmation_and_is_never_inferred() {
+        let mut plan = plan_with_rollback(true, "ok");
+        assert!(!plan_changes_existing(&plan));
+        plan.files
+            .push(archivefs_core::bezel_apply::BezelPlannedFile {
+                path: "/cfg/config/snes9x/game.cfg".into(),
+                purpose: archivefs_core::bezel_apply::BezelFilePurpose::EmulatorConfig,
+                exists: true,
+                existing_sha256: Some("0".repeat(64)),
+            });
+        assert!(plan_changes_existing(&plan));
+        let rendered = render_planned_changes(plan);
+        assert!(rendered.contains("I also approve changing the existing files"));
+    }
+
+    #[test]
+    fn apply_attempt_clears_both_confirmations() {
+        let mut state = state_with_selected_asset_and_plan(plan_with_rollback(true, "ok"));
+        state.apply_confirmation = true;
+        state.replacement_confirmation = true;
+        // The stub plan has no config scope, so the attempt is refused
+        // without touching the filesystem.
+        state.apply();
+        assert!(!state.apply_confirmation);
+        assert!(!state.replacement_confirmation);
+        assert!(state.apply_result.is_some());
+    }
+
+    #[test]
+    fn preview_apply_without_a_launch_refuses_and_starts_nothing() {
+        let mut state = state_with_selected_asset_and_plan(plan_with_rollback(true, "ok"));
+        state.launch_request =
+            Err("This game doesn't launch in RetroArch as one plain file.".into());
+        state.preview_apply(&egui::Context::default());
+        assert!(state.identity_job.is_none());
+        assert!(state.apply_plan.is_none());
+        let error = state.apply_error.as_ref().unwrap();
+        assert_eq!(
+            error.refusal,
+            BezelPlanRefusal::RetroArchLaunchIdentityUnknown
+        );
+        assert!(error.detail.contains("one plain file"));
+    }
+
+    /// A bezel pack with one viewport-tagged image for "Game", plus a native
+    /// and a Flatpak-style RetroArch install, each with its own settings.
+    fn two_installs(root: &std::path::Path) -> (BezelPanelState, PathBuf, PathBuf) {
+        let bezels = root.join("bezels");
+        std::fs::create_dir_all(&bezels).unwrap();
+        png(&bezels.join("Game.png"));
+        std::fs::write(
+            bezels.join("Game.png.json"),
+            r#"{"viewport":{"left":4,"top":2,"width":24,"height":12}}"#,
+        )
+        .unwrap();
+        let mut configs = Vec::new();
+        for install in ["native", "flatpak"] {
+            let dir = root.join(install).join("retroarch");
+            std::fs::create_dir_all(dir.join("overlays")).unwrap();
+            std::fs::write(dir.join("retroarch.cfg"), "video_driver = \"gl\"\n").unwrap();
+            configs.push(dir.join("retroarch.cfg"));
+        }
+        let state = scanned_state(&bezels, "Game");
+        (state, configs.remove(0), configs.remove(0))
+    }
+
+    fn launch_from(config: &std::path::Path) -> RetroArchBezelLaunch {
+        RetroArchBezelLaunch {
+            identity: archivefs_core::bezel_apply::RetroArchContentIdentity {
+                content_path: "/roms/Game (USA).sfc".into(),
+                core_library_name: "Snes9x".into(),
+                home: None,
+            },
+            config: config.to_path_buf(),
+            overlays: config.parent().unwrap().join("overlays"),
+        }
+    }
+
+    fn planned_override(state: &BezelPanelState) -> PathBuf {
+        let plan = state
+            .apply_plan
+            .as_ref()
+            .unwrap_or_else(|| panic!("expected a plan, got {:?}", state.apply_error));
+        assert_eq!(plan.status, BezelApplyStatus::Ready);
+        plan.config_entries[0].path.clone()
+    }
+
+    #[test]
+    fn one_install_plans_against_the_settings_play_uses() {
+        let root = tempfile::tempdir().unwrap();
+        let (mut state, native, _) = two_installs(root.path());
+        let overlays = native.parent().unwrap().join("overlays");
+        state.set_retroarch_scope(Some(native.clone()), Some(overlays.clone()), None);
+        state.plan_with_launch(launch_from(&native));
+        let root_dir = native.parent().unwrap();
+        assert_eq!(
+            planned_override(&state),
+            root_dir.join("config/Snes9x/Game (USA).cfg")
+        );
+        let plan = state.apply_plan.as_ref().unwrap();
+        assert_eq!(plan.target.config_path.as_ref(), Some(&native));
+        assert!(
+            plan.files
+                .iter()
+                .all(|file| file.path.starts_with(root_dir))
+        );
+    }
+
+    #[test]
+    fn several_installs_still_plan_against_the_one_play_selected() {
+        let root = tempfile::tempdir().unwrap();
+        // The panel's own discovery finds no single install when there are
+        // several, so it has no scope; Play's profile decides.
+        let (mut state, native, _) = two_installs(root.path());
+        state.plan_with_launch(launch_from(&native));
+        assert_eq!(
+            planned_override(&state),
+            native
+                .parent()
+                .unwrap()
+                .join("config/Snes9x/Game (USA).cfg")
+        );
+    }
+
+    #[test]
+    fn a_mismatched_panel_scope_never_redirects_the_bezel() {
+        let root = tempfile::tempdir().unwrap();
+        let (mut state, native, flatpak) = two_installs(root.path());
+        let flatpak_overlays = flatpak.parent().unwrap().join("overlays");
+        state.set_retroarch_scope(Some(flatpak.clone()), Some(flatpak_overlays), None);
+        state.plan_with_launch(launch_from(&native));
+        let native_root = native.parent().unwrap();
+        assert!(planned_override(&state).starts_with(native_root));
+        let plan = state.apply_plan.as_ref().unwrap();
+        assert!(
+            plan.files
+                .iter()
+                .all(|file| file.path.starts_with(native_root))
+        );
+        assert!(
+            !plan
+                .files
+                .iter()
+                .any(|file| file.path.starts_with(flatpak.parent().unwrap()))
+        );
+    }
+
+    #[test]
+    fn a_different_launch_invalidates_the_reviewed_plan() {
+        let mut state = state_with_selected_asset_and_plan(plan_with_rollback(true, "ok"));
+        state.launch_request = Err("a".into());
+        state.set_launch_request(Err("a".into()));
+        assert!(state.apply_plan.is_some());
+        state.set_launch_request(Err("b".into()));
+        assert!(state.apply_plan.is_none());
     }
 }
