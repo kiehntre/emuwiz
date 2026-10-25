@@ -873,6 +873,11 @@ impl RepairReviewPageState {
         Some(self.preview.get_or_init(|| PreviewSnapshot::new(plan)))
     }
 
+    /// Shared with the attention summary; never revalidates filesystem state.
+    pub(crate) fn preview_safe_count(&self) -> usize {
+        self.preview().map_or(0, |preview| preview.safe_ids.len())
+    }
+
     /// The current filtered rows. Rendering and filter changes reuse validation;
     /// reload/rescan explicitly refreshes filesystem observations. Apply always
     /// performs authoritative fresh validation through the existing backend.

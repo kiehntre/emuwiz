@@ -2285,6 +2285,11 @@ fn cached_preview_is_shared_until_explicit_reload_and_apply_still_refuses_stale_
     let after = state.rows();
     assert!(Rc::ptr_eq(&before, &after));
     assert_eq!(state.preview().unwrap().counts.safe_repairs, 1);
+    assert_eq!(
+        state.preview_safe_count(),
+        1,
+        "attention shares the snapshot"
+    );
     let id = before[0].proposal_id.clone().unwrap();
     state.toggle_selected(&id);
     assert_eq!(state.actionable_selected_ids(), vec![id]);
@@ -2306,5 +2311,6 @@ fn cached_preview_is_shared_until_explicit_reload_and_apply_still_refuses_stale_
     assert_eq!(refreshed[0].kind, RepairRowKind::Blocked);
     assert!(refreshed[0].reason.contains("destination already exists"));
     assert_eq!(state.preview().unwrap().counts.safe_repairs, 0);
+    assert_eq!(state.preview_safe_count(), 0);
     assert!(!state.can_apply());
 }
