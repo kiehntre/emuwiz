@@ -203,8 +203,9 @@ Started from fetched `origin/main` `b2bb4dc0c597c3bf3adf2b42548afadf3e1e70b4`,
 the merge of [PR #136](https://github.com/kiehntre/emuwiz/pull/136), and inspected
 PR #100 again. Reused the original XRoar 1.12.1 native SDL2 build, Trex bytes
 and 36 registered CAS catalogues. Corrected production tree tested here:
-`399562200f77c44cdd878fd964259901b387c7a2`. Later test-initializer/documentation
-changes do not alter that production tree.
+`399562200f77c44cdd878fd964259901b387c7a2`. Later changes affect test
+initialization, instruction typography and documentation; launch/gameplay
+code remains unchanged.
 
 ### Retry and explicit loading
 

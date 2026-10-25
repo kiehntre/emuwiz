@@ -116,7 +116,7 @@ impl Controller {
                     }
                     ui.label(
                         "If your XRoar build provides a file chooser, its optional \
-                         automatic loading is File → Run (Ctrl+Shift+L): select the cassette. XRoar detects \
+                         automatic loading is File > Run (Ctrl+Shift+L): select the cassette. XRoar detects \
                          the first program's type. Special loaders may still need \
                          the game's own instructions. EmuWiz only inserts the tape; \
                          loading starts when you choose it.",
