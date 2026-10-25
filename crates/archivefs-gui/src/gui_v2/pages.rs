@@ -3575,9 +3575,12 @@ impl App {
                     super::native_workflows::NativeWorkflows::new(ui.ctx().clone())
                 });
                 let retroarch_scope = workflows.retroarch_bezel_scope();
+                let launch_request =
+                    workflows.retroarch_bezel_request(game_id, &game.archive.absolute_path);
                 if let Some((config, overlays, core)) = retroarch_scope {
                     self.bezel.set_retroarch_scope(Some(config), Some(overlays), core);
                 }
+                self.bezel.set_launch_request(launch_request.map_err(str::to_string));
                 ui.heading("Extras");
                 self.bezel.set_game(&game.title, &game.platform);
                 egui::CollapsingHeader::new("Bezel & decorations")

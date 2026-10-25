@@ -186,8 +186,8 @@ class Resolution(R.Corrections):
         base = self.mod.F.Census
 
         class Referenced(base):
-            def __init__(inner, targets):
-                super().__init__(targets)
+            def __init__(inner, targets, **kw):
+                super().__init__(targets, **kw)
                 inner.refs = {os.path.realpath(t): [{"comm": "rustc", "pid": 4242, "kind": "cwd"}]}
 
         self.mod.F.Census = Referenced
@@ -197,8 +197,8 @@ class Resolution(R.Corrections):
         self.assertIn("LIVE_PROCESS_REFERENCE", self.codes(out))
 
         class Blind(base):
-            def __init__(inner, targets):
-                super().__init__(targets)
+            def __init__(inner, targets, **kw):
+                super().__init__(targets, **kw)
                 inner.unreadable_foreign = 3
 
         self.mod.F.Census = Blind
