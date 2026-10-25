@@ -14519,12 +14519,27 @@ echo "$out"
         let archives = database.load_archives().unwrap();
         assert_eq!(
             archives.len(),
-            1,
-            "the cartridge keeps its own row; nothing is a ScummVM game: {archives:?}"
+            2,
+            "both media keep their own rows; nothing is a ScummVM game: {archives:?}"
         );
-        assert_eq!(archives[0].absolute_path, cartridge);
-        assert_eq!(archives[0].archive_kind, "direct_game_image");
-        assert_eq!(archives[0].platform.as_deref(), Some("Game Boy Advance"));
+        let cartridge_row = archives
+            .iter()
+            .find(|row| row.absolute_path == cartridge)
+            .unwrap();
+        assert_eq!(cartridge_row.archive_kind, "direct_game_image");
+        assert_eq!(cartridge_row.platform.as_deref(), Some("Game Boy Advance"));
+        let cassette_path = tapes.join("Jet Set Willy.cas");
+        let cassette_row = archives
+            .iter()
+            .find(|row| row.absolute_path == cassette_path)
+            .unwrap();
+        assert_eq!(cassette_row.archive_kind, "direct_game_image");
+        assert!(
+            cassette_row.platform.is_none(),
+            "shared cassette media must remain unverified"
+        );
+        assert!(cassette_row.platform_source.is_none());
+        assert_eq!(fs::read(cassette_path).unwrap(), b"synthetic tape");
         let _ = fs::remove_dir_all(&root);
     }
 

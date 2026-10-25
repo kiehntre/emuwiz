@@ -1,16 +1,13 @@
 //! Local TOSEC DAT import: bounded parser reuse and artifact provenance.
 
 use std::fmt;
-use std::io::Read;
 use std::path::{Path, PathBuf};
-
-use sha2::{Digest, Sha256};
 
 use crate::dat::index::DatIndex;
 use crate::dat::limits::DatLimits;
 use crate::dat::model::{DatEcosystem, ParsedDat};
 use crate::dat::parser::ParseError;
-use crate::dat::parsers::parse_dat_file;
+use crate::dat::parsers::parse_dat_file_bound;
 
 /// Errors importing a local DAT as a classic TOSEC source.
 #[derive(Debug)]
@@ -90,26 +87,6 @@ impl ImportedTosecSource {
     }
 }
 
-/// Streams the DAT artifact rather than retaining a second giant in-memory
-/// copy while it is being parsed/indexed.
-fn sha256_file(path: &Path) -> std::io::Result<String> {
-    let mut file = std::fs::File::open(path)?;
-    let mut hasher = Sha256::new();
-    let mut buffer = [0_u8; 64 * 1024];
-    loop {
-        let read = file.read(&mut buffer)?;
-        if read == 0 {
-            break;
-        }
-        hasher.update(&buffer[..read]);
-    }
-    Ok(hasher
-        .finalize()
-        .iter()
-        .map(|byte| format!("{byte:02x}"))
-        .collect())
-}
-
 fn deferred_catalogue_kind(dat: &ParsedDat) -> Option<&'static str> {
     let header = format!(
         "{} {}",
@@ -160,15 +137,12 @@ fn header_identifies_tosec_dataset(dat: &ParsedDat) -> bool {
 }
 
 /// Imports one local classic TOSEC DAT. Parsing remains entirely in
-/// [`parse_dat_file`] with [`DatLimits::default`]; this adapter only rejects
+/// [`parse_dat_file_bound`] with [`DatLimits::default`]; this adapter only rejects
 /// non-TOSEC internal metadata, records the local artifact, and builds the
 /// existing collision-preserving [`DatIndex`].
 pub fn import_tosec_dat(path: &Path) -> Result<ImportedTosecSource, TosecImportError> {
-    let artifact_sha256 = sha256_file(path).map_err(|error| TosecImportError::Io {
-        path: path.to_path_buf(),
-        error,
-    })?;
-    let outcome = parse_dat_file(path, DatLimits::default()).map_err(TosecImportError::Parse)?;
+    let (outcome, artifact_sha256) =
+        parse_dat_file_bound(path, DatLimits::default()).map_err(TosecImportError::Parse)?;
     let dat = outcome.dat;
 
     if dat.source.ecosystem != DatEcosystem::Tosec || !header_identifies_tosec_dataset(&dat) {

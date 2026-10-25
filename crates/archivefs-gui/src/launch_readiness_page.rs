@@ -48,6 +48,7 @@ mod melonds_cheats;
 mod retroarch_cheat_sets;
 mod retroarch_cheats;
 mod scummvm_profile;
+pub(crate) mod xroar;
 use std::path::{Path, PathBuf};
 use std::sync::mpsc::{self, Receiver, TryRecvError};
 use std::thread;
@@ -168,6 +169,7 @@ pub(crate) enum LaunchReadinessInput {
         melonds: Option<MelonDsLaunchContext>,
         cemu: Option<cemu::Context>,
         flycast: Option<flycast::Context>,
+        xroar: Option<xroar::Context>,
         amiga_whdload: Option<AmigaWHDLoadLaunchContext>,
         #[cfg(target_os = "linux")]
         shadps4: Option<crate::emulator_setup::shadps4::Snapshot>,
@@ -647,6 +649,7 @@ pub(crate) fn gamer_play_action(input: &LaunchReadinessInput) -> GamerPlayAction
         melonds,
         cemu,
         flycast,
+        xroar,
         amiga_whdload,
         #[cfg(target_os = "linux")]
         shadps4,
@@ -726,6 +729,14 @@ pub(crate) fn gamer_play_action(input: &LaunchReadinessInput) -> GamerPlayAction
             if let Some(request) = flycast.as_ref().and_then(|c| c.request(plan, candidate)) {
                 return Some(TypedLaunchRequest::Standalone(
                     StandaloneLaunchRequest::Flycast(request),
+                ));
+            }
+            if let Some(request) = xroar
+                .as_ref()
+                .and_then(|context| context.request(plan, candidate))
+            {
+                return Some(TypedLaunchRequest::Standalone(
+                    StandaloneLaunchRequest::XRoar(request),
                 ));
             }
             if let Some(request) = cemu
@@ -981,6 +992,7 @@ pub(crate) enum StandaloneProcess {
     Xenia(LaunchedXeniaProcess),
     Cemu(archivefs_core::launch::LaunchedCemuProcess),
     Flycast(archivefs_core::launch::LaunchedFlycastProcess),
+    XRoar(archivefs_core::launch::process_spawn::WatchedProcess),
     ScummVm(archivefs_core::launch::LaunchedScummVmProcess),
     OpenMsx(archivefs_core::launch::process_spawn::WatchedProcess),
     /// DOSBox running inside the bubblewrap sandbox.
@@ -1221,6 +1233,7 @@ impl StandaloneLaunchState {
                     StandaloneProcess::FsUae(p) => p.poll().is_some(),
                     StandaloneProcess::Cemu(p) => p.poll().is_some(),
                     StandaloneProcess::Flycast(p) => p.poll().is_some(),
+                    StandaloneProcess::XRoar(p) => p.poll().is_some(),
                     StandaloneProcess::ScummVm(p) => p.poll().is_some(),
                     StandaloneProcess::OpenMsx(p) => p.poll().is_some(),
                     StandaloneProcess::DosBox(p) => p.poll().is_some(),
@@ -1407,6 +1420,7 @@ fn launch_mame_with_cheats(
 pub(crate) enum StandaloneLaunchRequest {
     Cemu(cemu::Request),
     Flycast(flycast::Request),
+    XRoar(xroar::Request),
     #[cfg(target_os = "linux")]
     ShadPs4(crate::emulator_setup::shadps4::Request),
     Mame(MameLaunchRequest),
@@ -1466,6 +1480,7 @@ impl StandaloneLaunchRequest {
             Self::FsUaeAdf(_) => "FS-UAE",
             Self::Cemu(_) => "Cemu",
             Self::Flycast(_) => "Flycast",
+            Self::XRoar(_) => "XRoar",
             Self::ScummVm(_) => "ScummVM",
             Self::OpenMsx(..) => "openMSX",
             Self::DosBox(_) => "DOSBox",
@@ -1486,6 +1501,7 @@ impl StandaloneLaunchRequest {
             Self::FsUaeAdf(r) => (r.fsuae.selected_content_path.clone(), "fsuae".into()),
             Self::Cemu(r) => r.key(),
             Self::Flycast(r) => r.key(),
+            Self::XRoar(r) => r.key(),
             Self::ScummVm(r) => (r.selected_game_folder.clone(), "scummvm".into()),
             Self::OpenMsx(r, _) => (r.selected_content_path.clone(), "openmsx".into()),
             Self::DosBox(r) => (r.game_directory.clone(), dosbox::ADAPTER_KEY.into()),
@@ -1495,6 +1511,7 @@ impl StandaloneLaunchRequest {
         match self {
             Self::Cemu(r) => r.execute().map(StandaloneProcess::Cemu),
             Self::Flycast(r) => r.execute().map(StandaloneProcess::Flycast),
+            Self::XRoar(r) => r.execute().map(StandaloneProcess::XRoar),
             #[cfg(target_os = "linux")]
             Self::ShadPs4(r) => r
                 .execute()
@@ -3008,11 +3025,25 @@ pub(crate) fn show_launch_readiness_panel(
             melonds,
             cemu,
             flycast,
+            xroar,
             amiga_whdload,
             #[cfg(target_os = "linux")]
             shadps4,
             ..
         } => {
+            if let Some(context) = xroar {
+                for candidate in &plan.candidates {
+                    if matches!(
+                        candidate.target,
+                        LaunchTarget::Standalone {
+                            adapter_id: "xroar",
+                            ..
+                        }
+                    ) {
+                        context.show(ui, plan, candidate, standalone_launch_state);
+                    }
+                }
+            }
             if let Some(context) = flycast {
                 for candidate in &plan.candidates {
                     context.show(ui, plan, candidate, standalone_launch_state);

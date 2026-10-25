@@ -262,6 +262,12 @@ pub const MEDIA_FORMATS: &[MediaFormat] = &[
         extension: "nhd",
         kind: ArchiveKind::DirectGameImage,
     },
+    // Shared cassette container: library inclusion grants no system identity.
+    // Dragon/CoCo launch still requires exact registered TOSEC evidence.
+    MediaFormat {
+        extension: "cas",
+        kind: ArchiveKind::DirectGameImage,
+    },
     MediaFormat {
         extension: "cdt",
         kind: ArchiveKind::DirectGameImage,
@@ -984,7 +990,11 @@ mod tests {
                 ".{extension} must be a direct Atari media registration"
             );
         }
-        assert_eq!(kind_for_extension("cas"), None);
+        // Shared tapes can be catalogued without assigning an Atari identity.
+        assert_eq!(
+            kind_for_extension("cas"),
+            Some(ArchiveKind::DirectGameImage)
+        );
     }
 
     #[test]

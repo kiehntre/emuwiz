@@ -218,6 +218,7 @@ const CONTENT_FORMATS: &[ContentFormat] = &[
     cf("scl", ContentKind::ComputerDisk),
     // These extensions identify a media family, not a system. Keep them out
     // of platform extension evidence unless another source can prove it.
+    cf("cas", ContentKind::TapeImage),
     cf("cdt", ContentKind::TapeImage),
     cf("tap", ContentKind::TapeImage),
     cf("tzx", ContentKind::TapeImage),
@@ -399,7 +400,10 @@ mod tests {
                 ".{extension} must be computer-disk content"
             );
         }
-        assert_eq!(content_kind_for_extension("cas"), None);
+        assert_eq!(
+            content_kind_for_extension("cas"),
+            Some(ContentKind::TapeImage)
+        );
     }
 
     #[test]

@@ -499,6 +499,10 @@ impl NativeWorkflows {
         self.select(path);
         self.app.launch_standalone.focus_dosbox_game(Some(path));
         self.app.emulator_readiness.flycast_gdi.show(ui, Some(path));
+        self.app
+            .emulator_readiness
+            .xroar_cassette
+            .show(ui, Some(path));
         self.start_launch_readiness(ui.ctx());
 
         let input = self.launch_input();
@@ -592,6 +596,10 @@ impl NativeWorkflows {
         activity: &mut Activity,
     ) -> Option<Route> {
         self.app.emulator_readiness.flycast_gdi.show(ui, Some(path));
+        self.app
+            .emulator_readiness
+            .xroar_cassette
+            .show(ui, Some(path));
         let (summary, input) = self.readiness_projection(
             ui.ctx(),
             game_id,

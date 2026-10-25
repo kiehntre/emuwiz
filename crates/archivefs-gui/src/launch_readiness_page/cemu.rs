@@ -394,6 +394,7 @@ mod tests {
             plan,
             cemu: Some(context),
             flycast: None,
+            xroar: None,
             retroarch: None,
             retroarch_scanned: true,
             standalone_scans_complete: true,

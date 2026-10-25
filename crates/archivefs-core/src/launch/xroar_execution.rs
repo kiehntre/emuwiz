@@ -163,7 +163,7 @@ pub fn preflight_xroar_launch(
         XRoarFirmwareState::Unknown => FirmwareReadiness::Unknown,
     };
     let plan = build_xroar_command_plan(identity, &candidate(request, firmware), &profile);
-    let Some(command) = plan.command else {
+    let Some(mut command) = plan.command else {
         return Err(error(
             XRoarLaunchPreflightErrorKind::CommandBlocked,
             plan.blockers
@@ -179,6 +179,15 @@ pub fn preflight_xroar_launch(
             detail,
         )
     })?;
+    if let Some(directory) = &roots.firmware_directory {
+        // Bind precisely the machine ROMs checked during fresh discovery.
+        for (option, name, _) in profile.machine.cassette_roms() {
+            command.arguments.push((*option).into());
+            command
+                .arguments
+                .push(directory.join(name).into_os_string());
+        }
+    }
     Ok(command)
 }
 

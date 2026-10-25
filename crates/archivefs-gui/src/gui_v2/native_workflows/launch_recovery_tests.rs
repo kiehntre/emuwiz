@@ -281,3 +281,51 @@ fn unchanged_catalogued_platform_does_not_restart_the_evidence_worker() {
         launch_readiness_page::LaunchReadinessInput::Plan { .. }
     ));
 }
+
+#[test]
+fn blue_launch_and_details_start_cassette_verification() {
+    for details in [false, true] {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("synthetic.cas");
+        std::fs::write(&path, b"synthetic unverified tape").unwrap();
+        let context = egui::Context::default();
+        let mut workflows = NativeWorkflows::new(context.clone());
+        workflows.app = crate::tests::app_with_cheat_game(path.to_str().unwrap(), "Unknown");
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(3);
+        loop {
+            let _ = context.run(egui::RawInput::default(), |ctx| {
+                egui::CentralPanel::default().show(ctx, |ui| {
+                    if details {
+                        workflows.show_readiness_summary(
+                            ui,
+                            1,
+                            &path,
+                            None,
+                            false,
+                            &mut Activity::default(),
+                        );
+                    } else {
+                        workflows.show_launch(ui, 1, &path, None, &mut Activity::default());
+                    }
+                });
+            });
+            if let Some(checked) = workflows
+                .app
+                .emulator_readiness
+                .xroar_cassette
+                .context(Some(&path))
+            {
+                assert!(
+                    checked.result.is_err(),
+                    "synthetic bytes must remain unverified"
+                );
+                break;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "Blue never started its cassette worker (details={details})"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+    }
+}
