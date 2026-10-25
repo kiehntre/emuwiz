@@ -160,8 +160,8 @@ class ReproducibilityTests(unittest.TestCase):
             result = run("git", "-C", str(root), *args)
             self.assertEqual(result.returncode, 0, result.stdout)
 
-    def test_builds_use_distinct_detached_source_target_and_output_roots(self):
-        root = self.make_repo("orchestration")
+    def stubbed_repo(self, name):
+        root = self.make_repo(name)
         # Stub only the expensive compiler/package boundary; run the actual
         # comparison driver, local clones, artifact naming and archive checks.
         (root / "scripts/build-release.sh").write_text('''#!/usr/bin/env python3
@@ -188,13 +188,12 @@ path.with_name(path.name+'.sha256').write_text(hashlib.sha256(path.read_bytes())
         cargo.write_text('#!/bin/sh\nprintf \'%s\\n\' \'{"packages":[{"name":"archivefs-cli","version":"0.9.0"}]}\'\n')
         cargo.chmod(0o755)
         self.commit(root)
-        output = self.root / "comparison-output"
-        result = run("bash", str(root / "scripts/compare-release-builds.sh"),
-                     "--output-dir", str(output), env=dict(os.environ, PATH=f"{tools}:{os.environ['PATH']}",
-                     TMPDIR=str(self.root), TMP="must-not-use", TEMP="must-not-use",
-                     RUSTC_WRAPPER="must-not-run", RUSTC_WORKSPACE_WRAPPER="must-not-run", CARGO_INCREMENTAL="1"))
-        self.assertEqual(result.returncode, 0, result.stdout)
-        a, b = [json.loads((output / f"run{i}/roots.json").read_text()) for i in (1, 2)]
+        env = dict(os.environ, PATH=f"{tools}:{os.environ['PATH']}",
+                   TMPDIR=str(self.root), TMP="must-not-use", TEMP="must-not-use",
+                   RUSTC_WRAPPER="must-not-run", RUSTC_WORKSPACE_WRAPPER="must-not-run", CARGO_INCREMENTAL="1")
+        return root, env
+
+    def assert_isolated_builds(self, root, a, b):
         for key in ("source", "target", "output", "temporary", "tmp", "temp"):
             self.assertNotEqual(a[key], b[key])
         for record in (a, b):
@@ -207,6 +206,39 @@ path.with_name(path.name+'.sha256').write_text(hashlib.sha256(path.read_bytes())
         self.assertEqual(a["head"], b["head"])
         self.assertEqual((a["branch"], b["branch"]), ("", ""))
         self.assertFalse(Path(a["source"]).exists())  # disposable clone cleaned
+
+    def test_builds_use_distinct_detached_source_target_and_output_roots(self):
+        root, env = self.stubbed_repo("orchestration")
+        output = self.root / "comparison-output"
+        result = run("bash", str(root / "scripts/compare-release-builds.sh"), "--output-dir", str(output), env=env)
+        self.assertEqual(result.returncode, 0, result.stdout)
+        a, b = [json.loads((output / f"run{i}/roots.json").read_text()) for i in (1, 2)]
+        self.assert_isolated_builds(root, a, b)
+
+    def test_single_runs_build_separately_with_the_same_isolation_and_compare(self):
+        # CI runs each build on its own runner, then compares with --archives.
+        root, env = self.stubbed_repo("single-runs")
+        compare = str(root / "scripts/compare-release-builds.sh")
+        outputs = {i: self.root / f"machine{i}" for i in (1, 2)}
+        for i, output in outputs.items():
+            result = run("bash", compare, "--run", str(i), "--output-dir", str(output), env=env)
+            self.assertEqual(result.returncode, 0, result.stdout)
+            self.assertIn(f"build {i} only", result.stdout)
+            self.assertEqual(sorted(p.name for p in output.iterdir()), [f"run{i}"])
+        a, b = [json.loads((outputs[i] / f"run{i}/roots.json").read_text()) for i in (1, 2)]
+        self.assert_isolated_builds(root, a, b)
+        archives = [next((outputs[i] / f"run{i}").glob("*.tar.xz")) for i in (1, 2)]
+        result = run("bash", compare, "--archives", *map(str, archives))
+        self.assertEqual(result.returncode, 0, result.stdout)
+        self.assertIn("byte-for-byte archive reproduction verified", result.stdout)
+
+    def test_single_run_arguments_are_refused_unless_valid(self):
+        compare = str(REPO / "scripts/compare-release-builds.sh")
+        for args in (["--run"], ["--run", "3"], ["--run", "0"],
+                     ["--run", "1", "--archives", "a.tar.xz", "b.tar.xz"]):
+            with self.subTest(args=args):
+                result = run("bash", compare, *args)
+                self.assertNotEqual(result.returncode, 0, result.stdout)
 
     def test_real_rust_paths_differ_without_remapping_and_match_with_build_flags(self):
         tools = self.root / "capture-tools"

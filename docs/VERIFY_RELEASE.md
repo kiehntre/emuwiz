@@ -123,7 +123,9 @@ that release.
 
 `scripts/compare-release-builds.sh --output-dir /tmp/emuwiz-reproduction` builds
 the current clean commit twice in separate, disposable folders and reports
-whether the two archives are byte-identical. See
+whether the two archives are byte-identical. CI runs the same two builds on
+separate runners (`--run 1`, `--run 2`) and compares the downloaded archives
+with `--archives`. See
 [`scripts/release/README.md`](../scripts/release/README.md) for what this does
 and does not prove.
 

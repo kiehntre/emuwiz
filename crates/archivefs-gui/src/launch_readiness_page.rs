@@ -2702,6 +2702,39 @@ fn retroarch_playlist(
     retroarch?.multidisc.as_ref()?.handoff(&decision)
 }
 
+/// The request Play uses for `candidate`, only when RetroArch is handed that
+/// one content file (no multi-disc playlist). Features that must name files
+/// after what RetroArch loads, such as per-game bezel overrides, use this.
+pub(crate) fn single_content_retroarch_request(
+    plan: &LaunchPlan,
+    candidate: &LaunchCandidate,
+    retroarch: Option<&RetroArchLaunchContext>,
+) -> Option<RetroArchLaunchRequest> {
+    if retroarch_playlist(candidate, retroarch).is_some() {
+        return None;
+    }
+    retroarch_launch_request(plan, candidate, retroarch)
+}
+
+/// What a plain launch of `request` would hand RetroArch: see
+/// [`retroarch_cheats::bezel_identity`]. Starts a probe child; call it from a
+/// worker thread.
+pub(crate) fn retroarch_bezel_identity(
+    request: &RetroArchLaunchRequest,
+) -> Result<RetroArchBezelLaunch, String> {
+    retroarch_cheats::bezel_identity(request)
+}
+
+/// The RetroArch install a plain launch uses, as far as a per-game bezel
+/// needs it: the launched content and core, plus that profile's own settings
+/// file and overlay folder.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct RetroArchBezelLaunch {
+    pub(crate) identity: archivefs_core::bezel_apply::RetroArchContentIdentity,
+    pub(crate) config: PathBuf,
+    pub(crate) overlays: PathBuf,
+}
+
 fn retroarch_launch_request(
     plan: &LaunchPlan,
     candidate: &LaunchCandidate,

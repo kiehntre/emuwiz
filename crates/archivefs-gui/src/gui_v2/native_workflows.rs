@@ -763,6 +763,37 @@ impl NativeWorkflows {
         )
     }
 
+    /// The single-file RetroArch launch Play would start for this game, from
+    /// the same current plan and candidate policy as Launch (as
+    /// `save_state_target`). Never starts a readiness check itself.
+    pub(super) fn retroarch_bezel_request(
+        &self,
+        game_id: i64,
+        path: &Path,
+    ) -> Result<archivefs_core::launch::RetroArchLaunchRequest, &'static str> {
+        if self.selected_game != Some(game_id)
+            || self.selected.as_deref() != Some(path)
+            || self.readiness_error().is_some()
+        {
+            return Err(
+                "EmuWiz has not checked how this game launches yet. Open the game's details, let the launch check finish, then preview again.",
+            );
+        }
+        let launch_readiness_page::LaunchReadinessInput::Plan {
+            plan, retroarch, ..
+        } = self.launch_input()
+        else {
+            return Err("This game's launch check is not ready.");
+        };
+        let candidate = launch_readiness_summary::selected_candidate(&plan).ok_or(
+            "This game has no single launch choice, so EmuWiz can't tell which RetroArch core it uses.",
+        )?;
+        launch_readiness_page::single_content_retroarch_request(&plan, candidate, retroarch.as_ref())
+            .ok_or(
+                "This game doesn't launch in RetroArch as one plain file (for example it uses another emulator, a multi-disc playlist, an archive or a Flatpak RetroArch), so a per-game bezel can't be named safely.",
+            )
+    }
+
     /// Multi-disc guidance for the focused game: its verified disc set, this
     /// entry, the start disc, next discs, problems, and the same launch
     /// decision Preview and Launch use. `None` for single-disc games.

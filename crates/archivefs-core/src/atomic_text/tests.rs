@@ -671,3 +671,33 @@ fn fixture_child() {
         _ => panic!("unknown synthetic child case"),
     }
 }
+
+#[test]
+fn exclusive_publication_never_clobbers_a_late_creation() {
+    let root = fixture();
+    let metadata = fs::metadata(root.path()).unwrap();
+    let target = root.path().join("game.pok.target");
+    let captured = target.clone();
+    let _reset = install_hook(move |event, _| {
+        if event == Event::BeforeRename {
+            fs::write(&captured, "concurrent pin")?;
+        }
+        Ok(())
+    });
+    assert!(super::create_new(&target, "approved pin", (metadata.dev(), metadata.ino())).is_err());
+    assert_eq!(fs::read_to_string(&target).unwrap(), "concurrent pin");
+    assert!(stages(root.path()).is_empty());
+}
+
+#[test]
+fn exclusive_publication_checks_reviewed_parent_and_preserves_existing_file() {
+    let root = fixture();
+    let target = root.path().join("game.pok.target");
+    assert!(super::create_new(&target, "pin", (0, 0)).is_err());
+    assert!(!target.exists());
+    fs::write(&target, "existing").unwrap();
+    let metadata = fs::metadata(root.path()).unwrap();
+    assert!(super::create_new(&target, "pin", (metadata.dev(), metadata.ino())).is_err());
+    assert_eq!(fs::read_to_string(&target).unwrap(), "existing");
+    assert!(stages(root.path()).is_empty());
+}

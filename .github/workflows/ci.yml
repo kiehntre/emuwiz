@@ -23,6 +23,7 @@ jobs:
     runs-on: ubuntu-latest
     outputs:
       tier: ${{ steps.classify.outputs.tier }}
+      shards: ${{ steps.classify.outputs.shards }}
     steps:
       - uses: actions/checkout@v5
         with:
@@ -44,8 +45,10 @@ jobs:
               tier=$(scripts/classify-ci-changes.sh "${changed[@]}")
             fi
           fi
+          shards=$(python3 -I scripts/ci_test_shards.py shards "$tier")
           echo "tier=$tier" >> "$GITHUB_OUTPUT"
-          echo "Selected CI tier: $tier"
+          echo "shards=$shards" >> "$GITHUB_OUTPUT"
+          echo "Selected CI tier: $tier, test shards: $shards"
 
   repository-guardrails:
     name: Repository guardrails
@@ -64,10 +67,20 @@ jobs:
       - name: Check main.rs boundary against PR base
         run: scripts/check-main-rs-boundary.sh --base "${{ github.event.pull_request.base.sha }}"
 
+  # The core and full tiers run their one `cargo test` command in parallel
+  # shards defined by scripts/ci_test_shards.py: each shard runs its own libtest
+  # name filters and --skips every earlier shard's, the last skips them all, so
+  # every test (unit, integration and doc) runs in exactly one shard. Every shard
+  # keeps the tier's package selection and therefore its unified feature set.
+  # test-shard-coverage proves the partition from each shard's real --list.
   validation:
-    name: Formatting and relevant tests
+    name: Formatting and relevant tests (${{ matrix.shard }})
     runs-on: ubuntu-latest
     needs: [classify]
+    strategy:
+      fail-fast: false
+      matrix:
+        shard: ${{ fromJSON(needs.classify.outputs.shards) }}
     steps:
       - uses: actions/checkout@v5
       - name: Install tools for real patch and optical-conversion tests
@@ -116,19 +129,38 @@ jobs:
           findmnt -no FSTYPE "$mnt" | grep -qx ext4
           echo "TMPDIR=$mnt" >> "$GITHUB_ENV"
           echo "EMUWIZ_R2_REQUIRE_QUALIFIED=1" >> "$GITHUB_ENV"
+      - id: enumerate
+        name: Build and enumerate this shard's tests
+        env:
+          CI_TIER: ${{ needs.classify.outputs.tier }}
+          SHARD: ${{ matrix.shard }}
+        run: |
+          source scripts/ci-test-shard-args.sh
+          lists="$RUNNER_TEMP/test-shard-lists"
+          mkdir -p "$lists"
+          cargo test "${packages[@]}" --no-run
+          cargo test "${packages[@]}" --no-fail-fast -- --list > "$lists/$SHARD.all" 2>&1
+          cargo test "${packages[@]}" --no-fail-fast -- --list "${selection[@]}" > "$lists/$SHARD.selected" 2>&1
+          printf '%s: %s of %s listed entries\n' "$SHARD" \
+            "$(grep -cE ': (test|bench)$' "$lists/$SHARD.selected")" "$(grep -cE ': (test|bench)$' "$lists/$SHARD.all")"
+      - name: Upload this shard's test enumeration
+        uses: actions/upload-artifact@v4
+        with:
+          name: test-shard-list-${{ matrix.shard }}
+          path: ${{ runner.temp }}/test-shard-lists/
+          if-no-files-found: error
+          retention-days: 3
       - name: Run tests selected for the change
         env:
           CI_TIER: ${{ needs.classify.outputs.tier }}
+          SHARD: ${{ matrix.shard }}
         run: |
-          case "$CI_TIER" in
-            gui) cargo test -p archivefs-gui --no-fail-fast ;;
-            core)
-              cargo test -p archivefs-core --no-fail-fast
-              cargo check -p archivefs-cli -p archivefs-gui --locked
-              ;;
-            full) cargo test --workspace --no-fail-fast ;;
-            *) echo "Unknown CI tier: $CI_TIER" >&2; exit 2 ;;
-          esac
+          # Same arguments as the enumerated run: derived again from the same script.
+          source scripts/ci-test-shard-args.sh
+          cargo test "${packages[@]}" --no-fail-fast -- "${selection[@]}"
+          if [[ "$CI_TIER" == core && "$SHARD" == rest ]]; then
+            cargo check -p archivefs-cli -p archivefs-gui --locked
+          fi
       - name: Report and enforce formatting outcome
         if: always()
         env:
@@ -139,6 +171,33 @@ jobs:
             echo "- Formatting: $FMT_OUTCOME"
           } >> "$GITHUB_STEP_SUMMARY"
           [[ "$FMT_OUTCOME" != failure ]] || exit 1
+
+  # Fails unless the shards' own enumerations show every test in exactly one
+  # shard. A shard that failed before enumerating leaves its list missing, which
+  # fails this job too; test failures still fail their own shard.
+  test-shard-coverage:
+    name: Test shard coverage
+    runs-on: ubuntu-latest
+    needs: [classify, validation]
+    if: ${{ !cancelled() && needs.classify.result == 'success' }}
+    steps:
+      - uses: actions/checkout@v5
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: "1.97.1"
+      - name: Test shard partitioning against a real libtest binary
+        run: python3 -B scripts/test_ci_test_shards.py
+      - uses: actions/download-artifact@v5
+        with:
+          pattern: test-shard-list-*
+          merge-multiple: true
+          path: ${{ runner.temp }}/test-shard-lists
+      - name: Every test runs in exactly one shard
+        env:
+          SHARDS: ${{ needs.classify.outputs.shards }}
+        run: |
+          printf '%s\n' "$SHARDS" > "$RUNNER_TEMP/test-shard-lists/shards.json"
+          python3 -I scripts/ci_test_shards.py check "$RUNNER_TEMP/test-shard-lists"
 
   # Runs on every PR (fast and full tier), on main and on manual runs, so a new
   # warning fails the PR that introduces it instead of surfacing after merge.
@@ -360,7 +419,9 @@ jobs:
     runs-on: ubuntu-latest
     # Keep release qualification observable even when a workspace test fails;
     # the failed validation job still fails CI and blocks merging normally.
-    needs: [classify, security, install-script-tests]
+    # Installer tests run in parallel rather than first: they share no output
+    # with this job, and a failure there still fails CI.
+    needs: [classify, security]
     if: needs.classify.outputs.tier == 'full' || github.event_name != 'pull_request'
     steps:
       - uses: actions/checkout@v5
@@ -413,10 +474,39 @@ jobs:
         run: sudo apt-get update && sudo apt-get install -y desktop-file-utils
       - run: scripts/verify-release-artifact.sh "$RUNNER_TEMP/download/"*.tar.xz
 
+  # The two clean builds run on separate runners, each with the same isolation
+  # as before (disposable shared clone, own target, TMPDIR and output root, no
+  # compiler wrapper, no incremental, no rust-cache); the comparison is the
+  # unchanged byte-for-byte --archives check of both downloaded outputs.
+  reproducibility-build:
+    name: Reproducibility build ${{ matrix.run }}
+    runs-on: ubuntu-latest
+    needs: [classify, security]
+    if: needs.classify.outputs.tier == 'full' || github.event_name != 'pull_request'
+    strategy:
+      fail-fast: false
+      matrix:
+        run: [1, 2]
+    steps:
+      - uses: actions/checkout@v5
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: "1.97.1"
+      - name: Build once in an independent clean directory
+        run: scripts/compare-release-builds.sh --run ${{ matrix.run }} --output-dir "$RUNNER_TEMP/reproducibility"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: reproducibility-run${{ matrix.run }}
+          path: |
+            ${{ runner.temp }}/reproducibility/run${{ matrix.run }}/*.tar.xz
+            ${{ runner.temp }}/reproducibility/run${{ matrix.run }}/*.tar.xz.sha256
+          if-no-files-found: error
+          retention-days: 3
+
   reproducibility:
     name: Reproducibility
     runs-on: ubuntu-latest
-    needs: [classify, security]
+    needs: [classify, reproducibility-build]
     if: needs.classify.outputs.tier == 'full' || github.event_name != 'pull_request'
     steps:
       - uses: actions/checkout@v5
@@ -425,5 +515,14 @@ jobs:
           toolchain: "1.97.1"
       - name: Test reproducibility orchestration and archive diagnostics
         run: python3 -B scripts/release/test_release_reproducibility.py
-      - name: Build twice in independent clean directories
-        run: scripts/compare-release-builds.sh --output-dir "$RUNNER_TEMP/reproducibility"
+      - uses: actions/download-artifact@v5
+        with:
+          pattern: reproducibility-run*
+          path: ${{ runner.temp }}/reproducibility
+      - name: Compare both independent builds byte for byte
+        run: |
+          shopt -s nullglob
+          first=("$RUNNER_TEMP"/reproducibility/reproducibility-run1/*.tar.xz)
+          second=("$RUNNER_TEMP"/reproducibility/reproducibility-run2/*.tar.xz)
+          ((${#first[@]} == 1 && ${#second[@]} == 1)) || { echo "expected one archive per build" >&2; exit 1; }
+          scripts/compare-release-builds.sh --archives "${first[0]}" "${second[0]}"

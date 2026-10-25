@@ -143,20 +143,50 @@ class WorkflowConditionTests(unittest.TestCase):
     def test_full_workspace_tests_stay_tier_gated(self) -> None:
         validation = job_block(self.workflow, "validation")
         self.assertIn("CI_TIER: ${{ needs.classify.outputs.tier }}", validation)
-        # Only the full tier runs the whole workspace; gui/core PRs stay narrow.
-        self.assertIn('case "$CI_TIER" in', validation)
-        self.assertEqual(validation.count("cargo test --workspace"), 1)
-        self.assertIn("full) cargo test --workspace --no-fail-fast ;;", validation)
-        self.assertIn("gui) cargo test -p archivefs-gui --no-fail-fast ;;", validation)
+        # The tier picks the packages (only full runs the whole workspace) and the
+        # shard picks the tests; scripts/test_ci_test_shards.py proves the partition.
+        self.assertEqual(validation.count("source scripts/ci-test-shard-args.sh"), 2)
+        self.assertEqual(validation.count("cargo test "), 4)
+        self.assertIn('cargo test "${packages[@]}" --no-fail-fast -- "${selection[@]}"', validation)
+        self.assertIn('-- --list "${selection[@]}" > "$lists/$SHARD.selected"', validation)
+        self.assertNotRegex(validation, r"(?m)^    if:")
+        self.assertIn("fail-fast: false", validation)
+        self.assertIn('shards=$(python3 -I scripts/ci_test_shards.py shards "$tier")',
+                      job_block(self.workflow, "classify"))
         # Every tier's tests run on the qualified ext4 TMPDIR (tmpfs /tmp on
         # ubuntu-26.04 cannot host ext4-only publication).
         ext4 = re.search(r"(?ms)^      - name: Create qualified disposable ext4.*?(?=^      - )", validation).group(0)
         self.assertNotRegex(ext4, r"(?m)^        if:")
         self.assertIn('echo "TMPDIR=$mnt" >> "$GITHUB_ENV"', ext4)
-        for job in ["install-script-tests", "release-artifact", "verify-artifact", "reproducibility"]:
+        for job in ["install-script-tests", "release-artifact", "verify-artifact", "reproducibility-build",
+                    "reproducibility"]:
             with self.subTest(job=job):
                 self.assertIn("if: needs.classify.outputs.tier == 'full' || github.event_name != 'pull_request'",
                               job_block(self.workflow, job))
+
+    def test_shard_coverage_is_checked_from_every_shards_enumeration(self) -> None:
+        coverage = job_block(self.workflow, "test-shard-coverage")
+        self.assertIn("needs: [classify, validation]", coverage)
+        self.assertIn("if: ${{ !cancelled() && needs.classify.result == 'success' }}", coverage)
+        self.assertNotIn("outputs.tier", coverage)
+        self.assertIn("python3 -B scripts/test_ci_test_shards.py", coverage)
+        self.assertIn('python3 -I scripts/ci_test_shards.py check "$RUNNER_TEMP/test-shard-lists"', coverage)
+        self.assertIn("SHARDS: ${{ needs.classify.outputs.shards }}", coverage)
+
+    def test_reproducibility_builds_twice_independently_and_compares_bytes(self) -> None:
+        build = job_block(self.workflow, "reproducibility-build")
+        self.assertIn("run: [1, 2]", build)
+        self.assertIn('scripts/compare-release-builds.sh --run ${{ matrix.run }} --output-dir', build)
+        self.assertNotIn("rust-cache", build)  # clean builds only
+        compare = job_block(self.workflow, "reproducibility")
+        self.assertIn("needs: [classify, reproducibility-build]", compare)
+        self.assertIn('scripts/compare-release-builds.sh --archives "${first[0]}" "${second[0]}"', compare)
+        self.assertIn("scripts/release/test_release_reproducibility.py", compare)
+
+    def test_release_artifact_does_not_wait_for_installer_tests(self) -> None:
+        release = job_block(self.workflow, "release-artifact")
+        self.assertIn("needs: [classify, security]", release)
+        self.assertNotIn("install-script-tests", re.search(r"(?m)^    needs:.*$", release).group(0))
 
 
 if __name__ == "__main__":
