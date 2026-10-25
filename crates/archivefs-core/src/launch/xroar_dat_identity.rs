@@ -498,6 +498,27 @@ mod tests {
     }
 
     #[test]
+    fn shared_cas_is_visible_as_media_without_granting_a_system_identity() {
+        let dir = tempfile::tempdir().unwrap();
+        let tape = cassette(dir.path(), "unhelpful.cas", b"unverified shared cassette");
+        let archive = crate::Archive::from_path(&tape)
+            .expect("cassette must be representable in the library");
+        assert_eq!(archive.kind, crate::ArchiveKind::DirectGameImage);
+        assert!(
+            archive.identity.platform.is_none(),
+            "the extension must not identify Dragon, CoCo, MSX or Atari"
+        );
+        let report = crate::ingestion::discovery::discover_source(dir.path()).unwrap();
+        let item = report.items.iter().find(|item| item.path == tape).unwrap();
+        assert_eq!(
+            item.content,
+            Some(crate::ingestion::content_registry::ContentKind::TapeImage)
+        );
+        assert!(item.platform_hint.is_none());
+        assert!(verify_dragon_coco_cassette(&tape, &[]).is_err());
+    }
+
+    #[test]
     fn matching_name_without_matching_bytes_is_not_identity() {
         let dir = tempfile::tempdir().unwrap();
         let tape = cassette(
