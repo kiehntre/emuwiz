@@ -1134,8 +1134,23 @@ fn snapshot_trainer_mode_refuses_a_script_frontend_before_materialising() {
     let world = World::new("snapshot-wrapper", true);
     let mut cheats = selection();
     cheats.start_from_snapshot = true;
+    let command =
+        preflight_retroarch_launch(&world.request, &HostReadOnlyFilesystem, &world.environment)
+            .unwrap();
+    // Current preflight rejects scripts itself. Replace the native fixture
+    // after preflight to retain coverage of the trainer's final wrapper gate.
+    fs::write(&command.executable, b"#!/bin/sh\nexit 0\n").unwrap();
     let id = unique("snapshot-wrapper");
-    let result = launch(&world, &cheats, &id);
+    let result = launch_prepared_command(
+        &world.request,
+        command,
+        &HostReadOnlyFilesystem,
+        &world.environment,
+        &cheats,
+        &CheatRuntimeRoots::default(),
+        &id,
+        None,
+    );
     assert!(
         matches!(result, Err(RetroArchCheatLaunchError::Facts(ref why)) if why.contains("wrapper script"))
     );

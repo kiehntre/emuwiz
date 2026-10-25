@@ -196,6 +196,8 @@ mod tests {
             },
             core_stem: "fuse".into(),
             expected_appimage_executable: None,
+            expected_executable_binding: None,
+            expected_configuration_file: None,
         };
         (dir, request, preview)
     }
