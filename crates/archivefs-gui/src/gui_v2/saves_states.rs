@@ -892,6 +892,61 @@ mod tests {
     }
 
     #[test]
+    fn verified_cartridge_and_hashed_saves_do_not_manufacture_save_ownership() {
+        use archivefs_core::game_identity::{IdentityKind, IdentityStatus};
+        use archivefs_core::persistent_state_inventory::inventory_persistent_state;
+        use archivefs_core::verified_game_fixture::VerifiedGameFixture;
+
+        let root = tempfile::tempdir().unwrap();
+        let rom = archivefs_core::synthetic_media::gameboy(0);
+        let fixture = VerifiedGameFixture::build_at_with_game(
+            &root.path().join("profile"),
+            "Save QA.gb",
+            &rom,
+            "Nintendo - Game Boy",
+            &[],
+        )
+        .unwrap();
+        let library = super::super::verified_game_fixture_tests::load(&fixture);
+        let game = &library.games[0];
+        assert_eq!(game.identity_summary(), "Verified");
+        assert!(
+            game.archive
+                .identity_report
+                .as_ref()
+                .unwrap()
+                .evidence
+                .iter()
+                .any(|evidence| evidence.kind == IdentityKind::LooseRomSha256
+                    && evidence.status == IdentityStatus::Verified)
+        );
+
+        for (extension, kind, bytes) in [
+            ("srm", PersistentStateType::NativeSave, vec![0xff; 8192]),
+            (
+                "state",
+                PersistentStateType::SaveState,
+                b"opaque state".to_vec(),
+            ),
+        ] {
+            let path = root.path().join(format!("Save QA.{extension}"));
+            std::fs::write(&path, &bytes).unwrap();
+            let inventory = inventory_persistent_state(&[PersistentStateRoot::configured(
+                StateEmulator::RetroArch,
+                &path,
+                Some(kind),
+            )]);
+            let [record] = inventory.records.as_slice() else {
+                panic!("the configured save must remain visible in the full inventory");
+            };
+            assert!(record.sha256.is_some(), "save integrity was checked");
+            assert!(record.game_identity.is_empty());
+            assert!(!record_belongs_to_game(record, game));
+            assert_eq!(std::fs::read(&path).unwrap(), bytes);
+        }
+    }
+
+    #[test]
     fn ordinary_save_association_survives_auxiliary_invalid_identity() {
         use archivefs_core::game_identity::*;
         let identity = IdentityEvidence {
