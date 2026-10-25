@@ -26,7 +26,7 @@ use archivefs_core::launch::planning::CanonicalIdentityStatus;
 use archivefs_core::launch::{
     BWRAP_PATH, DosBoxBindingRefusal, DosBoxConfigStatus, DosBoxGameReview, DosBoxHostAccess,
     DosBoxLaunchExecutionError, DosBoxLaunchPreflightErrorKind, DosBoxLaunchRequest,
-    DosBoxLaunchSpawnError, DosBoxNativeLaunchBinding, DosBoxSandboxError, DosBoxStartApproval,
+    DosBoxLaunchSpawnError, DosBoxNativeLaunchBinding, DosBoxSandboxError,
     build_dosbox_command_plan, discover_dosbox_config, locate_dosbox_game_directory, probe_sandbox,
     resolve_dosbox_native_launch_binding,
 };
@@ -74,6 +74,7 @@ pub(crate) fn check_dosbox_game(
     bwrap: &Path,
 ) -> DosBoxCheck {
     match identity {
+        CanonicalIdentityStatus::Unknown => {}
         CanonicalIdentityStatus::Resolved(resolved) if resolved.platform_id == DOS_PLATFORM_ID => {}
         _ => {
             return refused(
@@ -105,12 +106,25 @@ pub(crate) fn check_dosbox_game(
         }
     };
     reasons.extend(review.problems.iter().map(|problem| problem.explanation()));
+    if review.is_approvable()
+        && let Err(reason) =
+            archivefs_core::launch::UserApprovedDosBoxTarget::validate_review_paths(&review)
+    {
+        reasons.push(reason);
+    }
+
     let config = discover_dosbox_config(&game_directory, &TrustedRoots::none());
     if !matches!(&config, DosBoxConfigStatus::Verified { config_path, .. } if *config_path == review.config_path)
     {
         reasons.push("dosbox.conf changed while it was being checked. Check again.".into());
     }
-    let plan = build_dosbox_command_plan(identity, &game_directory, &config, &binding);
+    // Preview validation only. No launch identity is minted until approval.
+    let preview_identity =
+        CanonicalIdentityStatus::Resolved(archivefs_core::launch::ResolvedIdentity {
+            platform_id: DOS_PLATFORM_ID.into(),
+            game_key: "dosbox-review-only".into(),
+        });
+    let plan = build_dosbox_command_plan(&preview_identity, &game_directory, &config, &binding);
     // Binding refusals were already explained above in plainer words.
     reasons.extend(
         plan.blockers
@@ -212,16 +226,15 @@ pub(super) fn dosbox_refusal_text(error: &DosBoxLaunchExecutionError) -> String 
 /// What the user has approved, for exactly the check on screen.
 pub(crate) fn launch_request(
     ready: &DosBoxReady,
-    identity: &CanonicalIdentityStatus,
-    approval: &DosBoxStartApproval,
+    target: &archivefs_core::launch::UserApprovedDosBoxTarget,
 ) -> StandaloneLaunchRequest {
     StandaloneLaunchRequest::DosBox(Box::new(DosBoxLaunchRequest {
         game_directory: ready.review.game_directory.clone(),
-        identity: identity.clone(),
+        identity: archivefs_core::launch::DosBoxLaunchIdentity::UserApproved(target.clone()),
         expected_executable: ready.binding.executable.clone(),
         expected_variant: ready.binding.variant,
         expected_config_path: ready.review.config_path.clone(),
-        approval: approval.clone(),
+        approval: target.approval().clone(),
         host_access: ready.access.clone(),
     }))
 }
@@ -254,7 +267,7 @@ fn effect_label(effect: &AutoexecEffect) -> String {
         AutoexecEffect::SwitchDrive(drive) => format!("switches to {drive}:"),
         AutoexecEffect::ChangeDirectory => "changes folder inside a mounted drive".into(),
         AutoexecEffect::Exit => "closes DOSBox".into(),
-        AutoexecEffect::Start => "starts the game".into(),
+        AutoexecEffect::Start => "starts the selected program".into(),
     }
 }
 
@@ -270,12 +283,19 @@ pub(crate) struct Panel {
     result: Option<DosBoxCheck>,
     /// Minted from `result`'s review when the user approved it; cleared by
     /// every new check.
-    approval: Option<DosBoxStartApproval>,
+    approval: Option<archivefs_core::launch::UserApprovedDosBoxTarget>,
 }
 
 impl Panel {
     pub(crate) fn focus(&mut self, path: Option<&Path>) {
-        self.focus = path.map(Path::to_path_buf);
+        let next = path.map(Path::to_path_buf);
+        if self.focus != next {
+            self.approval = None;
+            self.key = None;
+            self.result = None;
+            self.job = None;
+        }
+        self.focus = next;
     }
 
     fn restart(&mut self, ctx: &egui::Context, key: CheckKey) {
@@ -323,22 +343,32 @@ impl Panel {
         let Some(DosBoxCheck::Ready(ready)) = &self.result else {
             return false;
         };
-        self.approval = ready.review.approve();
+        let Some(start) = &ready.review.start else {
+            return false;
+        };
+        self.approval = archivefs_core::launch::UserApprovedDosBoxTarget::approve(
+            &ready.review,
+            &ready.review.game_directory,
+            &start.program_file,
+        );
         self.approval.is_some()
     }
 
     fn request(&self) -> Option<StandaloneLaunchRequest> {
-        let (Some(DosBoxCheck::Ready(ready)), Some(approval), Some((_, identity))) =
+        let (Some(DosBoxCheck::Ready(ready)), Some(approval), Some((path, _))) =
             (&self.result, &self.approval, &self.key)
         else {
             return None;
         };
-        Some(launch_request(ready, identity, approval))
+        if self.focus.as_ref().is_some_and(|focused| focused != path) {
+            return None;
+        }
+        Some(launch_request(ready, approval))
     }
 }
 
-/// The DOSBox card on the Launch page for a game whose verified identity is
-/// DOS. Never launches without a clean check and an explicit approval.
+/// Shared Blue/Gold review of a possible DOS launch target. A folder/config
+/// suggests a review only; explicit approval creates local launch authority.
 pub(super) fn show(
     ui: &mut egui::Ui,
     identity: &CanonicalIdentityStatus,
@@ -400,6 +430,7 @@ fn show_ready(ui: &mut egui::Ui, ready: &DosBoxReady, state: &mut StandaloneLaun
     let Some(start) = review.start.as_ref() else {
         return false;
     };
+    ui.label("Local DOS launch target — not a DAT-verified game release.");
     ui.label(format!("Game folder: {}", review.game_directory.display()));
     ui.label(
         "DOSBox runs in a sandbox. The game can read and change every file in this folder \
@@ -445,7 +476,7 @@ fn show_ready(ui: &mut egui::Ui, ready: &DosBoxReady, state: &mut StandaloneLaun
         }
         Some(request) => {
             ui.label(
-                egui::RichText::new("Approved for this session. EmuWiz checks everything again before DOSBox starts.")
+                egui::RichText::new("User-approved for this session. EmuWiz checks everything again before DOSBox starts.")
                     .small()
                     .color(theme::muted(ui)),
             );
@@ -466,3 +497,16 @@ fn show_ready(ui: &mut egui::Ui, ready: &DosBoxReady, state: &mut StandaloneLaun
 #[cfg(test)]
 #[path = "dosbox_tests.rs"]
 mod tests;
+
+#[cfg(test)]
+impl super::StandaloneLaunchState {
+    pub(crate) fn dosbox_approval_for_test(
+        &mut self,
+        target: Option<archivefs_core::launch::UserApprovedDosBoxTarget>,
+    ) -> bool {
+        if let Some(target) = target {
+            self.dosbox.approval = Some(target);
+        }
+        self.dosbox.approval.is_some()
+    }
+}

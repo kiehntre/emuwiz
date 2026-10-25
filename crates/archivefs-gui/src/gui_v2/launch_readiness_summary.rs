@@ -118,6 +118,16 @@ pub(crate) fn project(
             summary.details.push("This read-only media/profile projection never verifies a release or authorises Launch. Open Advanced details for each profile's TOS evidence and the existing backend command preview.".into());
             summary
         }
+        LaunchReadinessInput::DosBoxReview => base(
+            ReadinessPresentationState::Blocked,
+            "Review the DOSBox start before playing",
+            "Choose whether to approve the displayed game folder and start executable. User approval identifies a local launch target; it does not verify a game release against a DAT.",
+            IdentitySummary::NeedsReview,
+            SourceSummary::Available,
+            FirmwareSummary::Unknown,
+            None,
+            Some(ReadinessAction::Play),
+        ),
         LaunchReadinessInput::IdentityUnknown => identity_summary(false),
         LaunchReadinessInput::DiscFilesUnresolved(detail) => base(
             ReadinessPresentationState::NeedsIdentityReview,
@@ -210,7 +220,9 @@ fn attach_findings(summary: &mut GameReadinessSummary, input: &LaunchReadinessIn
             diagnosis::single(Cause::IdentityNotConfirmed)
         }
         // Carries its own named reason and rescan action.
-        LaunchReadinessInput::DiscFilesUnresolved(_) => Vec::new(),
+        LaunchReadinessInput::DosBoxReview | LaunchReadinessInput::DiscFilesUnresolved(_) => {
+            Vec::new()
+        }
         // Already carries its own reason and rescan action.
         LaunchReadinessInput::InspectionIncomplete => Vec::new(),
         LaunchReadinessInput::Plan { plan, .. } => {
@@ -2125,5 +2137,25 @@ mod tests {
             ReadinessFreshness::Current,
         );
         assert!(summary.warnings.is_empty(), "{:?}", summary.warnings);
+    }
+}
+
+#[cfg(test)]
+mod dosbox_approval_tests {
+    use super::*;
+    #[test]
+    fn local_dos_review_offers_play_without_claiming_verified_identity() {
+        let summary = project(
+            &LaunchReadinessInput::DosBoxReview,
+            ReadinessFreshness::Current,
+        );
+        assert_eq!(summary.primary_action, Some(ReadinessAction::Play));
+        assert_eq!(summary.identity, IdentitySummary::NeedsReview);
+        assert!(
+            summary
+                .explanation
+                .contains("does not verify a game release")
+        );
+        assert!(compact(&summary, false).play_enabled);
     }
 }
