@@ -9,6 +9,8 @@
 //! All data is synthetic and lives in per-test temporary directories.
 #![cfg(target_os = "linux")]
 
+archivefs_core::install_test_environment!();
+
 use std::fs::{self, File, FileTimes};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::AtomicBool;

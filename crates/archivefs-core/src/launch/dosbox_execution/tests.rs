@@ -98,7 +98,7 @@ fn request_for(fixture: &ReadyFixture) -> DosBoxLaunchRequest {
         approval: approval_for(fixture),
         host_access: DosBoxHostAccess::none(),
         game_directory: fixture.game_directory.clone(),
-        identity: dos_identity(),
+        identity: dos_identity().into(),
         expected_executable: fixture.executable.clone(),
         expected_variant: DosBoxVariant::Classic,
         expected_config_path: fixture.config_path.clone(),
@@ -245,7 +245,8 @@ fn a_non_dos_resolved_identity_is_blocked_before_any_spawn() {
     request.identity = CanonicalIdentityStatus::Resolved(ResolvedIdentity {
         platform_id: "PC".into(),
         game_key: "k".into(),
-    });
+    })
+    .into();
     let error = preflight_dosbox_launch(&request).unwrap_err();
     assert_eq!(error.kind, DosBoxLaunchPreflightErrorKind::CommandBlocked);
 }
@@ -254,7 +255,7 @@ fn a_non_dos_resolved_identity_is_blocked_before_any_spawn() {
 fn an_unknown_identity_cannot_reach_execution() {
     let fixture = ready_fixture("unknown", "Keen", "#!/bin/sh\nexit 0\n");
     let mut request = request_for(&fixture);
-    request.identity = CanonicalIdentityStatus::Unknown;
+    request.identity = CanonicalIdentityStatus::Unknown.into();
     let error = preflight_dosbox_launch(&request).unwrap_err();
     assert_eq!(error.kind, DosBoxLaunchPreflightErrorKind::CommandBlocked);
 }
@@ -263,7 +264,7 @@ fn an_unknown_identity_cannot_reach_execution() {
 fn a_conflicting_identity_cannot_reach_execution() {
     let fixture = ready_fixture("conflict", "Keen", "#!/bin/sh\nexit 0\n");
     let mut request = request_for(&fixture);
-    request.identity = CanonicalIdentityStatus::Conflicting;
+    request.identity = CanonicalIdentityStatus::Conflicting.into();
     assert_eq!(
         preflight_dosbox_launch(&request).unwrap_err().kind,
         DosBoxLaunchPreflightErrorKind::CommandBlocked
@@ -274,7 +275,7 @@ fn a_conflicting_identity_cannot_reach_execution() {
 fn a_relative_game_directory_is_refused_before_spawn() {
     let error = preflight_dosbox_launch(&DosBoxLaunchRequest {
         game_directory: PathBuf::from("relative/dir"),
-        identity: dos_identity(),
+        identity: dos_identity().into(),
         expected_executable: PathBuf::from("/usr/games/dosbox"),
         expected_variant: DosBoxVariant::Classic,
         expected_config_path: PathBuf::from("relative/dir/dosbox.conf"),
@@ -292,7 +293,7 @@ fn a_relative_game_directory_is_refused_before_spawn() {
 fn a_missing_game_directory_is_refused() {
     let error = preflight_dosbox_launch(&DosBoxLaunchRequest {
         game_directory: PathBuf::from("/archivefs/does/not/exist/here"),
-        identity: dos_identity(),
+        identity: dos_identity().into(),
         expected_executable: PathBuf::from("/usr/games/dosbox"),
         expected_variant: DosBoxVariant::Classic,
         expected_config_path: PathBuf::from("/archivefs/does/not/exist/here/dosbox.conf"),
@@ -507,4 +508,42 @@ fn the_dos_program_is_never_run_on_the_host() {
     );
     let argv = std::fs::read_to_string(&capture).unwrap();
     assert_eq!(argv.lines().count(), 2);
+}
+
+#[test]
+fn a_user_approved_target_uses_the_same_preflight_and_detects_changes() {
+    use crate::launch::{DosBoxLaunchIdentity, UserApprovedDosBoxTarget};
+    let fixture = ready_fixture("approved-target", "Keen", "#!/bin/sh\nexit 0\n");
+    let review = review_dosbox_game_directory(&fixture.game_directory).unwrap();
+    let start = &review.start.as_ref().unwrap().program_file;
+    let target =
+        UserApprovedDosBoxTarget::approve(&review, &fixture.game_directory, start).unwrap();
+    let mut request = request_for(&fixture);
+    request.identity = DosBoxLaunchIdentity::UserApproved(target);
+    assert!(preflight_dosbox_launch(&request).is_ok());
+    std::fs::write(start, b"MZ-changed-after-approval").unwrap();
+    assert_eq!(
+        preflight_dosbox_launch(&request).unwrap_err().kind,
+        DosBoxLaunchPreflightErrorKind::StartCommandNotApproved
+    );
+}
+
+#[test]
+fn a_user_approved_target_cannot_be_transplanted_to_another_folder() {
+    use crate::launch::{DosBoxLaunchIdentity, UserApprovedDosBoxTarget};
+    let first = ready_fixture("target-first", "Keen", "#!/bin/sh\nexit 0\n");
+    let second = ready_fixture("target-second", "Keen", "#!/bin/sh\nexit 0\n");
+    let review = review_dosbox_game_directory(&first.game_directory).unwrap();
+    let target = UserApprovedDosBoxTarget::approve(
+        &review,
+        &first.game_directory,
+        &review.start.as_ref().unwrap().program_file,
+    )
+    .unwrap();
+    let mut request = request_for(&second);
+    request.identity = DosBoxLaunchIdentity::UserApproved(target);
+    assert_eq!(
+        preflight_dosbox_launch(&request).unwrap_err().kind,
+        DosBoxLaunchPreflightErrorKind::StartCommandNotApproved
+    );
 }

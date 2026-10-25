@@ -1,8 +1,8 @@
 //! The authored script catalogue.
 //!
 //! Typed production data: the 42 designed scripts of
-//! `docs/design/MR_WIZ_GUIDANCE_AND_AI_ASSISTANT_V1.md` section 11 (with their four
-//! documented variants), and the 35 messages the pre-engine implementation
+//! `docs/design/MR_WIZ_GUIDANCE_AND_AI_ASSISTANT_V1.md` section 11 (with their
+//! documented variants and the unavailable-game variant), and the 35 messages the pre-engine implementation
 //! shipped. Wording is the approved wording; the stable IDs are the identity, so
 //! copy can be revised without changing what an event *is*.
 //!
@@ -216,6 +216,27 @@ pub(crate) static CATALOGUE: &[GuidanceScript] = &[
             "Technical details show the report status, the inspected format, the available checksums, the candidate evidence and the DAT provenance.",
         ),
         action: Some(A::ReviewGameEvidence),
+        ..BASE
+    },
+    GuidanceScript {
+        id: "game.file_unavailable",
+        variant_of: Some("sources.unavailable"),
+        category: C::Warning,
+        topics: &[T::Sources],
+        pages: &[P::Games],
+        scope: S::Game,
+        requires: &[K::LegacyProblemBlocker],
+        priority: 70,
+        mascot: M::Warning,
+        quick: "This game file is unavailable. Its catalogue entry has been kept. Reconnect its drive or review its folder, then check again.",
+        minimal: Some("Game file unavailable; catalogue entry kept."),
+        explain: Some(
+            "The last scan could not find this game file. A disconnected drive or changed folder can hide it, so EmuWiz keeps its catalogue entry. Reconnect its location and scan again before trying to play.",
+        ),
+        technical: Some(
+            "Technical details show the last scan's missing-file status and the recorded game path. Selecting this message does not inspect the file again.",
+        ),
+        action: Some(A::ReviewGameFolder),
         ..BASE
     },
     // Variant of 08: with no blocked operation the same facts are an explanation,

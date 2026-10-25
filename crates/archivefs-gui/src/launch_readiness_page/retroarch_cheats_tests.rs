@@ -168,6 +168,7 @@ impl World {
                 scope: ProfileScope::User,
             },
             core_stem: core_stem.into(),
+            saturn_core_selection: None,
             expected_snapshot_evidence: None,
             expected_appimage_executable: None,
             expected_executable_binding: None,

@@ -1,5 +1,7 @@
 //! Bounded Blue Play bridge over Gold's existing VICE planner/preflight/spawn.
-//! No trainer selection, monitor command or emulator configuration writes.
+//! Plain Play and explicitly approved trainers share this request/preflight.
+//! Emulator configuration is never rewritten.
+pub(super) mod trainers;
 use super::*;
 use crate::gui_v2::vice_evidence::{self, Evidence, read_regular};
 use archivefs_core::launch::{
@@ -267,7 +269,15 @@ impl Context {
                 // Keep historical process feedback visible when current
                 // readiness fails, while disabling new launch actions.
                 ui.add_enabled_ui(command.is_some(), |ui| {
-                    show_standalone_launch_action(ui, state, StandaloneLaunchRequest::Vice(request));
+                    show_standalone_launch_action(ui, state, StandaloneLaunchRequest::Vice(request.clone()));
+                    let busy = state.is_active();
+                    if trainers::is_selected(self, plan, &request) {
+                        if let Some(selection) = state.vice_trainers.show(ui, &request, busy) {
+                            trainers::start(state, request, selection);
+                        }
+                    } else {
+                        ui.small("Trainer selection is available only for the sole eligible or remembered VICE profile.");
+                    }
                 });
             }
         });
@@ -295,7 +305,15 @@ impl Request {
         self,
         fresh: Evidence,
     ) -> Result<archivefs_core::launch::process_spawn::WatchedProcess, String> {
-        if fresh != self.evidence {
+        let command = self.command_with(&fresh)?;
+        spawn_vice(&command).map_err(|e| format!("VICE could not be started: {e}"))
+    }
+
+    fn command_with(
+        &self,
+        fresh: &Evidence,
+    ) -> Result<archivefs_core::launch::process_spawn::PreparedProcessCommand, String> {
+        if fresh != &self.evidence {
             return Err(
                 "VICE was not started: game or DAT evidence changed; refresh readiness.".into(),
             );
@@ -307,9 +325,9 @@ impl Request {
         {
             return Err("VICE was not started: executable changed; refresh readiness.".into());
         }
-        let command = preflight_vice_launch(&self.launch, &self.roots, &identity(&fresh))
+        let command = preflight_vice_launch(&self.launch, &self.roots, &identity(fresh))
             .map_err(|e| format!("VICE was not started: {} ({:?})", e.detail, e.kind))?;
-        spawn_vice(&command).map_err(|e| format!("VICE could not be started: {e}"))
+        Ok(command)
     }
 }
 

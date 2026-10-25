@@ -100,7 +100,10 @@ fn a_clean_folder_with_a_working_sandbox_is_offered_for_approval_only() {
     assert_eq!(request.expected_executable, f.executable);
     assert_eq!(request.expected_config_path, f.game.join("dosbox.conf"));
     assert_eq!(request.approval.start_command, "game.exe");
-    assert_eq!(request.identity, dos());
+    assert!(matches!(
+        request.identity,
+        archivefs_core::launch::DosBoxLaunchIdentity::UserApproved(_)
+    ));
 }
 
 #[test]
@@ -118,7 +121,6 @@ fn an_approval_is_never_minted_from_a_refused_check() {
 fn an_unverified_or_non_dos_identity_is_refused_before_anything_is_read() {
     let f = fixture(CLEAN);
     for identity in [
-        CanonicalIdentityStatus::Unknown,
         CanonicalIdentityStatus::Conflicting,
         CanonicalIdentityStatus::Resolved(ResolvedIdentity {
             platform_id: "ScummVM".into(),
@@ -329,4 +331,74 @@ fn host_end_to_end_check_approve_launch_and_exit() {
     assert!(line.starts_with("DOSBox "));
     // The game folder is untouched apart from what the game itself may write.
     assert!(f.game.join("GAME.EXE").is_file());
+}
+
+#[test]
+fn an_unknown_release_can_be_reviewed_but_needs_explicit_target_approval() {
+    let f = fixture(CLEAN);
+    let check = check_dosbox_game(
+        &f.game,
+        &CanonicalIdentityStatus::Unknown,
+        binding(&f),
+        DosBoxHostAccess::none(),
+        &f.bwrap_ok,
+    );
+    assert!(matches!(check, DosBoxCheck::Ready(_)), "{check:?}");
+    let mut panel = Panel {
+        focus: Some(f.game.clone()),
+        key: Some((f.game.clone(), CanonicalIdentityStatus::Unknown)),
+        result: Some(check),
+        ..Panel::default()
+    };
+    assert!(panel.request().is_none());
+    assert!(panel.approve());
+    let Some(StandaloneLaunchRequest::DosBox(request)) = panel.request() else {
+        panic!()
+    };
+    assert!(matches!(
+        request.identity,
+        archivefs_core::launch::DosBoxLaunchIdentity::UserApproved(_)
+    ));
+    panel.focus(Some(&f.game.join("different.exe")));
+    assert!(panel.request().is_none());
+    panel.focus(Some(&f.game));
+    assert!(
+        panel.request().is_none(),
+        "returning to the game must not revive approval"
+    );
+}
+
+#[test]
+fn a_missing_start_executable_has_a_named_refusal() {
+    let f = fixture(CLEAN);
+    std::fs::remove_file(f.game.join("GAME.EXE")).unwrap();
+    let text = reasons(check_dosbox_game(
+        &f.game,
+        &CanonicalIdentityStatus::Unknown,
+        binding(&f),
+        DosBoxHostAccess::none(),
+        &f.bwrap_ok,
+    ));
+    assert!(
+        text.iter()
+            .any(|r| r.contains("start program that cannot be used")),
+        "{text:?}"
+    );
+}
+
+#[test]
+fn a_folder_below_a_linked_parent_is_refused_before_approval_is_offered() {
+    let f = fixture(CLEAN);
+    let aliases = tempfile::tempdir().unwrap();
+    let alias = aliases.path().join("linked-parent");
+    std::os::unix::fs::symlink(f.game.parent().unwrap(), &alias).unwrap();
+    let folder = alias.join(f.game.file_name().unwrap());
+    let text = reasons(check_dosbox_game(
+        &folder,
+        &CanonicalIdentityStatus::Unknown,
+        binding(&f),
+        DosBoxHostAccess::none(),
+        &f.bwrap_ok,
+    ));
+    assert!(text.iter().any(|r| r.contains("symbolic link")), "{text:?}");
 }

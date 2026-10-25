@@ -48,6 +48,7 @@ pub(crate) mod flycast;
 mod melonds_cheats;
 mod retroarch_cheat_sets;
 mod retroarch_cheats;
+pub(crate) mod saturn_core;
 mod scummvm_profile;
 pub(crate) mod vice;
 pub(crate) mod xroar;
@@ -122,6 +123,8 @@ pub(crate) enum LaunchReadinessInput {
     /// `CanonicalIdentityStatus::Unknown` - identity could not be resolved
     /// at all.
     IdentityUnknown,
+    /// A folder with a DOSBox config is only a candidate for explicit approval.
+    DosBoxReview,
     /// A CUE/BIN disc whose files could not be resolved. The text is the
     /// selected-evidence worker's own diagnostic (which track is missing,
     /// unsafe or ambiguous), never a guess.
@@ -224,7 +227,8 @@ pub(crate) fn ready_to_play_result(
             arcade_dependency_blocked: false,
             save_state_version_sensitive: false,
         },
-        LaunchReadinessInput::IdentityUnknown
+        LaunchReadinessInput::DosBoxReview
+        | LaunchReadinessInput::IdentityUnknown
         | LaunchReadinessInput::DiscFilesUnresolved(_)
         | LaunchReadinessInput::InspectionIncomplete => ReadyToPlayEvidence {
             item_identity,
@@ -673,6 +677,10 @@ pub(crate) fn gamer_play_action(input: &LaunchReadinessInput) -> GamerPlayAction
                 GamerBlockerKind::EmulatorNotChecked,
                 "RetroArch has not been checked yet.",
             ),
+            LaunchReadinessInput::DosBoxReview => GamerBlocker::new(
+                GamerBlockerKind::UnknownSystem,
+                "Review and approve the DOSBox folder and start target on the Launch page.",
+            ),
             LaunchReadinessInput::IdentityUnknown => GamerBlocker::new(
                 GamerBlockerKind::UnknownSystem,
                 "Game identity could not be resolved.",
@@ -1009,6 +1017,13 @@ pub(crate) enum StandaloneProcess {
     Flycast(archivefs_core::launch::LaunchedFlycastProcess),
     XRoar(archivefs_core::launch::process_spawn::WatchedProcess),
     Vice(archivefs_core::launch::process_spawn::WatchedProcess),
+    ViceTrainers(
+        Box<
+            archivefs_core::launch::cheat_runtime::CheatRuntimeSession<
+                archivefs_core::launch::process_spawn::WatchedProcess,
+            >,
+        >,
+    ),
     ScummVm(archivefs_core::launch::LaunchedScummVmProcess),
     OpenMsx(archivefs_core::launch::process_spawn::WatchedProcess),
     /// DOSBox running inside the bubblewrap sandbox.
@@ -1045,6 +1060,7 @@ pub(crate) struct StandaloneLaunchState {
     scummvm_profile: scummvm_profile::Choice,
     /// The DOSBox check and the user's approval for the game on screen.
     dosbox: dosbox::Panel,
+    vice_trainers: vice::trainers::Chooser,
 }
 
 impl StandaloneLaunchState {
@@ -1055,6 +1071,10 @@ impl StandaloneLaunchState {
     /// The game the Launch page shows, for the DOSBox check.
     pub(crate) fn focus_dosbox_game(&mut self, path: Option<&Path>) {
         self.dosbox.focus(path);
+    }
+
+    pub(crate) fn focus_vice_trainer_game(&mut self, path: Option<&Path>) {
+        self.vice_trainers.focus(path);
     }
 
     fn bind_cue_review(&mut self, request: &mut StandaloneLaunchRequest) -> Result<(), String> {
@@ -1251,6 +1271,10 @@ impl StandaloneLaunchState {
                     StandaloneProcess::Flycast(p) => p.poll().is_some(),
                     StandaloneProcess::XRoar(p) => p.poll().is_some(),
                     StandaloneProcess::Vice(p) => p.poll().is_some(),
+                    StandaloneProcess::ViceTrainers(session) => {
+                        let _ = session.poll();
+                        session.is_finished()
+                    }
                     StandaloneProcess::ScummVm(p) => p.poll().is_some(),
                     StandaloneProcess::OpenMsx(p) => p.poll().is_some(),
                     StandaloneProcess::DosBox(p) => p.poll().is_some(),
@@ -1287,11 +1311,18 @@ impl StandaloneLaunchState {
     pub(crate) fn failure_detail(&self) -> Option<String> {
         match &self.tracked {
             Some((_, _, StandaloneLaunchStage::Failed(error))) => Some(error.clone()),
+            Some((
+                _,
+                _,
+                StandaloneLaunchStage::Running(StandaloneProcess::ViceTrainers(session))
+                | StandaloneLaunchStage::Exited(StandaloneProcess::ViceTrainers(session)),
+            )) => vice::trainers::failure_detail(session),
             _ => None,
         }
     }
 
     fn start(&mut self, request: StandaloneLaunchRequest) {
+        self.vice_trainers.cancel_approval();
         let (path, adapter) = request.key();
         if let Some(receiver) = scummvm_profile::start_with_profile(self, &request) {
             self.tracked = Some((path, adapter, StandaloneLaunchStage::Starting(receiver)));
@@ -1642,6 +1673,8 @@ struct RetroArchLaunchKey {
     content_path: PathBuf,
     profile: ProfileRef,
     core_stem: String,
+    saturn_core_selection:
+        Option<archivefs_core::launch::saturn_core_selection::SaturnCoreSelection>,
     expected_snapshot_evidence:
         Option<archivefs_core::classic_trainer_evidence::snapshot::SnapshotEvidence>,
     expected_appimage_executable: Option<PathBuf>,
@@ -1656,6 +1689,7 @@ impl RetroArchLaunchKey {
             content_path: request.selected_content_path.clone(),
             profile: request.profile,
             core_stem: request.core_stem.clone(),
+            saturn_core_selection: request.saturn_core_selection.clone(),
             expected_snapshot_evidence: request.expected_snapshot_evidence.clone(),
             expected_appimage_executable: request.expected_appimage_executable.clone(),
             expected_executable_binding: request.expected_executable_binding.clone(),
@@ -2865,6 +2899,11 @@ fn retroarch_launch_request(
         expected_game_key: game_key.clone(),
         profile: *profile,
         core_stem: core_stem.clone(),
+        saturn_core_selection: if platform_id == "Saturn" {
+            saturn_core::load().ok().flatten()
+        } else {
+            None
+        },
         expected_snapshot_evidence: if platform_id == "ZX Spectrum" {
             let evidence = crate::emulator_setup::zx_snapshot::readiness(&content_path)?;
             if !matches!(evidence.identity(), CanonicalIdentityStatus::Resolved(ref identity) if &identity.game_key == game_key)
@@ -3035,16 +3074,22 @@ pub(crate) fn show_launch_readiness_panel(
     amiga_whdload_launch_state: &mut AmigaWHDLoadLaunchState,
 ) -> Option<LaunchReadinessPageAction> {
     let mut action = None;
+    standalone_launch_state.vice_trainers.reconcile(input);
     widgets::section_header(
         ui,
         "Play / Launch readiness",
         Some(
-            "Ways this game can be played. Check emulator readiness, then launch only a command backed by verified identity and resolved content.",
+            "Ways this game can be played. Check emulator readiness and content. DOSBox also requires explicit approval of its local folder and start target; that approval does not verify a release.",
         ),
     );
 
     match input {
         LaunchReadinessInput::AtariSt(snapshot) => snapshot.show(ui),
+        LaunchReadinessInput::DosBoxReview => dosbox::show(
+            ui,
+            &CanonicalIdentityStatus::Unknown,
+            standalone_launch_state,
+        ),
         LaunchReadinessInput::EvidenceNotLoaded => {
             widgets::card(ui, |ui| {
                 ui.label("Load ROM Identity & Evidence first.");
@@ -3109,6 +3154,11 @@ pub(crate) fn show_launch_readiness_panel(
             shadps4,
             ..
         } => {
+            if plan.platform_id.as_deref() == Some("Saturn")
+                && let Some(context) = retroarch
+            {
+                saturn_core::show(ui, &context.environment);
+            }
             if let Some(context) = vice {
                 for candidate in &plan.candidates {
                     context.show(ui, plan, candidate, standalone_launch_state);
@@ -4768,6 +4818,10 @@ fn show_standalone_launch_action(
     if same {
         let label = match state.tracked.as_ref().map(|(_, _, stage)| stage) {
             Some(StandaloneLaunchStage::Starting(_)) => "Launching…",
+            Some(
+                StandaloneLaunchStage::Running(StandaloneProcess::ViceTrainers(session))
+                | StandaloneLaunchStage::Exited(StandaloneProcess::ViceTrainers(session)),
+            ) => vice::trainers::phase_label(session),
             Some(StandaloneLaunchStage::Running(_)) => "Running",
             Some(StandaloneLaunchStage::Exited(_)) => "Process exited",
             Some(StandaloneLaunchStage::Failed(_)) => "Launch failed",
@@ -4820,6 +4874,13 @@ fn show_standalone_launch_action(
             Some((_, _, StandaloneLaunchStage::Running(StandaloneProcess::ScummVm(_)))) => {
                 ui.small("ScummVM process started; EmuWiz cannot tell whether the game itself is running.");
             }
+            Some((
+                _,
+                _,
+                StandaloneLaunchStage::Running(StandaloneProcess::ViceTrainers(session)),
+            )) => {
+                vice::trainers::show_receipt(ui, session);
+            }
             Some((_, _, StandaloneLaunchStage::Running(StandaloneProcess::Vice(process)))) => {
                 ui.small(format!("VICE running · PID {}", process.pid));
                 ui.small("Starting the process does not prove the game ran.");
@@ -4851,6 +4912,9 @@ fn show_standalone_launch_action(
                     && let Some(report) = process.poll()
                 {
                     ui.label(exit_line("ScummVM", report));
+                }
+                if let StandaloneProcess::ViceTrainers(session) = process {
+                    vice::trainers::show_receipt(ui, session);
                 }
                 if let StandaloneProcess::Vice(process) = process
                     && let Some(report) = process.poll()
@@ -4903,6 +4967,13 @@ fn show_standalone_launch_action(
                 state.start(request);
                 return;
             }
+        }
+        if adapter == "xroar"
+            && !state.is_active()
+            && ui.button("Launch XRoar again (recheck)").clicked()
+        {
+            state.start(request);
+            return;
         }
         if adapter == "flycast"
             && !state.is_active()
