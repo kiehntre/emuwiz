@@ -908,8 +908,16 @@ mod tests {
         )
         .unwrap();
         let library = super::super::verified_game_fixture_tests::load(&fixture);
-        let game = &library.games[0];
+        let mut game = library.games[0].clone();
         assert_eq!(game.identity_summary(), "Verified");
+        // Library DAT verification and selected-game cartridge inspection are
+        // separate observations. Inspect real fixture bytes, as Launch does.
+        game.archive.identity_report = Some(
+            archivefs_core::game_identity::inspect_catalogued_game_identity(
+                &fixture.rom_path,
+                Some("Game Boy"),
+            ),
+        );
         assert!(
             game.archive
                 .identity_report
@@ -941,7 +949,7 @@ mod tests {
             };
             assert!(record.sha256.is_some(), "save integrity was checked");
             assert!(record.game_identity.is_empty());
-            assert!(!record_belongs_to_game(record, game));
+            assert!(!record_belongs_to_game(record, &game));
             assert_eq!(std::fs::read(&path).unwrap(), bytes);
         }
     }
