@@ -2800,7 +2800,10 @@ pub(crate) enum RetroArchRequestRefusal {
 impl RetroArchRequestRefusal {
     /// A problem with the RetroArch installation rather than the game.
     pub(crate) fn installation_problem(&self) -> bool {
-        matches!(self, Self::Installation(_) | Self::ProgramChanged(_))
+        matches!(
+            self,
+            Self::Installation(_) | Self::ProgramChanged(_) | Self::FlatpakProfile
+        )
     }
 
     pub(crate) fn message(&self) -> String {
@@ -2843,8 +2846,8 @@ pub(crate) fn retroarch_launch_request_checked(
     retroarch_launch_request_unexplained(plan, candidate, retroarch).map_err(|refusal| {
         let game_format = matches!(
             refusal,
-            R::MultiDisc | R::NeedsMount | R::NotPlainFile | R::FlatpakProfile
-        ) || (refusal == R::NotRetroArch && retroarch.is_some());
+            R::MultiDisc | R::NeedsMount | R::NotPlainFile | R::NotRetroArch
+        );
         if game_format {
             return refusal;
         }

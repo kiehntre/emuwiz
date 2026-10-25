@@ -692,8 +692,10 @@ impl ArchiveFsApp {
             // applies) instead of the generic scan failure, and never keep a
             // green badge for a choice Play would refuse.
             let selection_issue = match &self.emulator_readiness.retroarch_profiles {
-                RetroArchProfilesState::Error(_) => {
-                    crate::retroarch_installation_setup::selection_issue_after_refused_discovery()
+                RetroArchProfilesState::Error(message) => {
+                    crate::retroarch_installation_setup::selection_issue_after_refused_discovery(
+                        message,
+                    )
                 }
                 RetroArchProfilesState::Ready(_) => {
                     crate::retroarch_installation_setup::current_selection_issue()
@@ -2807,6 +2809,7 @@ impl ArchiveFsApp {
             "RetroArch profile discovery started.",
         ));
         self.emulator_readiness.retroarch_profiles = RetroArchProfilesState::Scanning { receiver };
+        crate::retroarch_installation_setup::forget_selection_issue();
         self.emulator_readiness.retroarch_installation_fingerprint =
             Some(crate::retroarch_installation_setup::InstallationFingerprint::at_scan_start());
         let core_directory_override = self
@@ -2968,6 +2971,7 @@ impl ArchiveFsApp {
             return;
         }
         self.emulator_readiness.retroarch_revalidated_at = Some(now);
+        crate::retroarch_installation_setup::forget_selection_issue();
         if self
             .emulator_readiness
             .retroarch_installation_fingerprint

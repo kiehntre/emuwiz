@@ -12,6 +12,7 @@ fn unusable_installations_are_named_and_play_returns_after_repair() {
         "truth-selected-missing",
         "truth-selected-wrapper",
         "truth-program-missing",
+        "truth-window",
     ] {
         let profile = Profile::new();
         let second_dir = profile.fixture.root().join("second");
@@ -63,22 +64,66 @@ pub(super) fn run(blue: &mut Blue, fixture: &VerifiedGameFixture, root: &Path, s
             blue.wait_until(|b| b.shown(PLAY), 30);
         }
         "truth-program-missing" => {
-            // Automatic detection: no saved choice, the found program goes.
+            // Automatic detection: no saved choice and a single program, the
+            // fixture's own; then that program goes.
             fs::remove_file(&sidecar).unwrap();
+            fs::remove_file(&second).unwrap();
             refresh_via_setup(blue);
-            blue.wait_until(|b| b.shown(PLAY), 30);
-            let parked = root.join("second/parked");
-            fs::rename(&second, &parked).unwrap();
-            blue.wait_until(|b| !b.shown(PLAY), 30);
-            if let Err(reason) = bezel_request(blue, fixture) {
-                for blame in GAME_FORMAT_BLAME {
-                    assert!(!reason.contains(blame), "{reason}");
-                }
+            blue.wait_until(|b| b.shown(PLAY) && !scanning(b), 30);
+            let program = root.join("retroarch/bin/retroarch");
+            assert_eq!(blue.discovered_executables(), vec![program.display().to_string()]);
+            let parked = root.join("retroarch/parked");
+            fs::rename(&program, &parked).unwrap();
+            blue.wait_until(|b| !b.shown(PLAY) && !scanning(b), 30);
+            // Settled, not just a scanning frame: Play stays withheld.
+            for _ in 0..5 {
+                std::thread::sleep(Duration::from_millis(100));
+                blue.paint();
+                assert!(!blue.shown(PLAY), "{:?}", blue.last);
+                assert!(!ready_badge(blue), "{:?}", blue.last);
+            }
+            let reason = bezel_request(blue, fixture).expect_err("bezel Apply is refused");
+            for blame in GAME_FORMAT_BLAME {
+                assert!(!reason.contains(blame), "{reason}");
             }
             // Reinstalling is picked up by Setup's rediscovery, which now
             // also refreshes RetroArch readiness.
-            fs::rename(&parked, &second).unwrap();
+            fs::rename(&parked, &program).unwrap();
             refresh_via_setup(blue);
+            blue.wait_until(|b| b.shown(PLAY), 30);
+        }
+        "truth-window" => {
+            // Before revalidation's next tick the cached scan still lists the
+            // program: the Launch page itself must withdraw Ready and Play.
+            blue.app
+                .native_workflows
+                .as_mut()
+                .unwrap()
+                .app
+                .emulator_readiness
+                .retroarch_revalidated_at = Some(Instant::now());
+            let parked = root.join("second/parked");
+            fs::rename(&second, &parked).unwrap();
+            crate::retroarch_installation_setup::forget_selection_issue();
+            blue.paint();
+            assert!(
+                matches!(
+                    blue.app
+                        .native_workflows
+                        .as_ref()
+                        .unwrap()
+                        .app
+                        .emulator_readiness
+                        .retroarch_profiles,
+                    RetroArchProfilesState::Ready(_)
+                ),
+                "still the cached scan"
+            );
+            assert!(!blue.shown(PLAY), "{:?}", blue.last);
+            assert!(blue.shown("Needs attention"), "{:?}", blue.last);
+            assert!(blue.shown("is no longer there"), "{:?}", blue.last);
+            assert!(!ready_badge(blue), "{:?}", blue.last);
+            fs::rename(&parked, &second).unwrap();
             blue.wait_until(|b| b.shown(PLAY), 30);
         }
         other => panic!("unknown selection-truth scenario {other}"),
@@ -89,6 +134,7 @@ pub(super) fn run(blue: &mut Blue, fixture: &VerifiedGameFixture, root: &Path, s
 /// guess or a green status.
 fn withdrawn(blue: &mut Blue, fixture: &VerifiedGameFixture, reason: &str) {
     blue.wait_until(|b| !b.shown(PLAY) && !scanning(b), 30);
+    assert!(!ready_badge(blue), "{:?}", blue.last);
     let bezel = bezel_request(blue, fixture).expect_err("bezel Apply is refused");
     assert!(bezel.contains(reason), "{bezel}");
     for blame in GAME_FORMAT_BLAME {
@@ -101,6 +147,14 @@ fn withdrawn(blue: &mut Blue, fixture: &VerifiedGameFixture, reason: &str) {
     );
     assert!(setup.iter().any(|t| t.contains(reason)), "{setup:?}");
     assert!(!setup.iter().any(|t| t == "Ready"), "{setup:?}");
+}
+
+/// A Ready status badge on the Launch page (the footer's "Ready · ..." is
+/// the app status, not readiness).
+fn ready_badge(blue: &Blue) -> bool {
+    blue.last
+        .iter()
+        .any(|text| text == "Ready" || text.contains("Ready to play"))
 }
 
 fn scanning(blue: &Blue) -> bool {
@@ -139,8 +193,8 @@ fn setup_card(blue: &mut Blue) -> Vec<String> {
     texts(&output)
 }
 
-/// Opening Setup runs the installation picker's rediscovery; its completion
-/// must start a fresh RetroArch readiness scan.
+/// "Check installations again" in Setup: its completion must start a fresh
+/// RetroArch readiness scan.
 fn refresh_via_setup(blue: &mut Blue) {
     let context = blue.context.clone();
     blue.app
@@ -149,8 +203,8 @@ fn refresh_via_setup(blue: &mut Blue) {
         .unwrap()
         .app
         .emulator_readiness
-        .retroarch_installation_picker = Default::default();
-    setup_card(blue);
+        .retroarch_installation_picker
+        .check_again(context.clone());
     let deadline = Instant::now() + Duration::from_secs(20);
     loop {
         let inner = &mut blue.app.native_workflows.as_mut().unwrap().app;

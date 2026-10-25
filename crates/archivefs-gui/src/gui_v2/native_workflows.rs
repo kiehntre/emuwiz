@@ -790,6 +790,21 @@ impl NativeWorkflows {
     /// The single-file RetroArch launch Play would start for this game, from
     /// the same current plan and candidate policy as Launch (as
     /// `save_state_target`). Never starts a readiness check itself.
+    /// The saved RetroArch choice's problem as Setup names it: after a failed
+    /// discovery only when that failure was the choice being refused.
+    fn retroarch_selection_issue(
+        &self,
+    ) -> Option<crate::retroarch_installation_setup::SelectionIssue> {
+        match &self.app.emulator_readiness.retroarch_profiles {
+            RetroArchProfilesState::Error(message) => {
+                crate::retroarch_installation_setup::selection_issue_after_refused_discovery(
+                    message,
+                )
+            }
+            _ => crate::retroarch_installation_setup::current_selection_issue(),
+        }
+    }
+
     /// Rechecks RetroArch when its installation changed since the last scan.
     pub(super) fn revalidate_retroarch(&mut self, context: &egui::Context) {
         self.app.revalidate_retroarch_installation(context);
@@ -814,15 +829,13 @@ impl NativeWorkflows {
         else {
             // RetroArch discovery itself refused (for example an unusable
             // saved installation): say so rather than "not ready".
-            return Err(
-                crate::retroarch_installation_setup::current_selection_issue().map_or_else(
-                    || "This game's launch check is not ready.".to_string(),
-                    |issue| issue.message(),
-                ),
-            );
+            return Err(self.retroarch_selection_issue().map_or_else(
+                || "This game's launch check is not ready.".to_string(),
+                |issue| issue.message(),
+            ));
         };
         let candidate = launch_readiness_summary::selected_candidate(&plan).ok_or_else(|| {
-            crate::retroarch_installation_setup::current_selection_issue().map_or_else(
+            self.retroarch_selection_issue().map_or_else(
                 || "This game has no single launch choice, so EmuWiz can't tell which RetroArch core it uses.".to_string(),
                 |issue| issue.message(),
             )
