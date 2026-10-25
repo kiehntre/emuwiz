@@ -5,7 +5,8 @@
 //! verified association only when its target file pins it to a hash that
 //! equals this game's current DAT-verified hash; everything else is a
 //! candidate. Explicit pin creation is available after preview; applying
-//! POKEs and launching with them remain unsupported.
+//! trainers is separate from this evidence and requires explicit selection
+//! at the supported RetroArch launch boundary.
 
 mod pinning;
 
@@ -86,6 +87,25 @@ fn trainer_game(game: &Game) -> ClassicTrainerGame {
     }
 }
 
+/// Current source-aware DAT evidence for a trainer launch, independent of the
+/// cached Game Details card. The Gold bridge re-hashes the actual files.
+pub(crate) fn current_launch_evidence(
+    path: &Path,
+) -> Result<(ClassicTrainerGame, archivefs_core::safe_read::TrustedRoots), String> {
+    let database = archivefs_core::default_database_path().map_err(|e| e.to_string())?;
+    let library = super::backend::load_library(&database)?;
+    let game = library
+        .games
+        .iter()
+        .find(|g| g.archive.absolute_path == path)
+        .ok_or("Game no longer exists in the current library.")?;
+    let config = archivefs_core::Config::load_default().map_err(|e| e.to_string())?;
+    Ok((
+        trainer_game(game),
+        archivefs_core::safe_read::TrustedRoots::from_paths(config.source_folders),
+    ))
+}
+
 impl State {
     pub(super) fn show(&mut self, ui: &mut egui::Ui, game: &Game) {
         if poke_platform_for_label(&game.platform).is_none() {
@@ -138,11 +158,11 @@ fn line(ui: &mut egui::Ui, text: impl Into<String>) {
     ui.add(egui::Label::new(RichText::new(text.into()).size(13.0).color(blue::BODY_TEXT)).wrap());
 }
 
-/// The plain refusal shown on every card: no state here applies anything.
-const APPLY_UNSUPPORTED: &str = "Applying POKEs is not supported yet. EmuWiz never applies a trainer, changes a game or launches an emulator with POKEs from this list, even for a verified association; that stays off until each emulator's support and launch checks are proven.";
+/// This evidence card never enables a trainer.
+const ACTIVATION_NOTE: &str = "Trainers are OFF by default. Use Play to open launch readiness, then POKE trainers to explicitly select individual entries for a supported native RetroArch/Fuse snapshot launch. A verified association is not proof of emulator compatibility. Prepared files do not confirm activation.";
 
 fn render(ui: &mut egui::Ui, result: &Result<Option<ClassicTrainerReport>, String>) {
-    line(ui, APPLY_UNSUPPORTED);
+    line(ui, ACTIVATION_NOTE);
     line(
         ui,
         "A trainer matched by file name is a candidate, not verified compatibility with this release. It is a verified association only when its .pok.target file pins it to the same hash as this game's current DAT-verified copy.",
@@ -300,7 +320,7 @@ mod tests {
         assert!(all.contains("Verified for this release"));
         assert!(!all.contains("Unverified candidates"));
         assert!(all.contains("pinned by its target file"));
-        assert!(all.contains("Applying POKEs is not supported yet"));
+        assert!(all.contains("Trainers are OFF by default"));
         assert!(all.contains("exact projection possible · not applied"));
         assert!(!all.to_lowercase().contains("apply now"));
 
@@ -359,7 +379,7 @@ mod tests {
         let report = report_for(dir.path(), "ZX Spectrum");
         let context = egui::Context::default();
         let all = texts(&context, |ui| render(ui, &report)).join("\n");
-        assert!(all.contains("Applying POKEs is not supported yet"));
+        assert!(all.contains("Trainers are OFF by default"));
         assert!(all.contains("Unverified candidates"));
         assert!(!all.contains("Verified for this release"));
         assert!(all.contains("not verified compatibility"));

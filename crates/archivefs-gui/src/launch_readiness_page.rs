@@ -40,6 +40,7 @@ mod dolphin_profile_guidance;
 
 #[path = "launch_readiness_page/cemu.rs"]
 pub(crate) mod cemu;
+mod classic_pokes;
 pub(crate) mod controller_readiness;
 pub(crate) mod dosbox;
 #[path = "launch_readiness_page/flycast.rs"]
@@ -1681,6 +1682,7 @@ pub(crate) enum RetroArchLaunchDisplay {
 /// ever shows it when the currently displayed candidate's key matches.
 #[derive(Default)]
 pub(crate) struct RetroArchLaunchState {
+    classic_pokes: classic_pokes::Chooser,
     tracked: Option<(RetroArchLaunchKey, RetroArchLaunchStage)>,
     /// The user's optional cheat file and choices for the game on screen.
     cheats: Option<retroarch_cheats::Choice>,
@@ -1895,12 +1897,42 @@ impl RetroArchLaunchState {
         self.tracked = Some((key, RetroArchLaunchStage::StartingCheats { receiver }));
     }
 
+    fn start_with_pokes(
+        &mut self,
+        request: RetroArchLaunchRequest,
+        selected: classic_pokes::Selection,
+    ) {
+        let key = RetroArchLaunchKey::from_request(&request);
+        let probe = self
+            .probe
+            .clone()
+            .unwrap_or_else(retroarch_cheats::production_probe);
+        let environment = self.environment.clone();
+        let (sender, receiver) = mpsc::channel();
+        thread::spawn(move || {
+            let environment =
+                environment.unwrap_or_else(DiscoveryEnvironment::from_process_environment);
+            let _ = sender.send(classic_pokes::launch(
+                &request,
+                &selected,
+                probe.as_ref(),
+                &environment,
+            ));
+        });
+        self.tracked = Some((key, RetroArchLaunchStage::StartingCheats { receiver }));
+    }
+
     /// Cheat-specific lines for the launch tracked for `request`, if any.
     pub(crate) fn cheat_lines(&mut self, request: &RetroArchLaunchRequest) -> Vec<String> {
         let this_key = RetroArchLaunchKey::from_request(request);
         match self.tracked.as_mut() {
-            Some((key, RetroArchLaunchStage::RunningCheats { .. })) if *key == this_key => {
-                vec![retroarch_cheats::activation_label()]
+            Some((key, RetroArchLaunchStage::RunningCheats { session, .. }))
+                if *key == this_key =>
+            {
+                vec![
+                    retroarch_cheats::requested_label(session),
+                    retroarch_cheats::activation_label(),
+                ]
             }
             Some((key, RetroArchLaunchStage::ExitedCheats { session })) if *key == this_key => {
                 retroarch_cheats::session_summary(session)
@@ -4842,6 +4874,10 @@ fn show_launch_action(
     request: RetroArchLaunchRequest,
     playlist: Option<crate::multidisc_launch_view::PlaylistHandoff>,
 ) {
+    let busy = launch_state.is_active();
+    if let Some(selected) = launch_state.classic_pokes.show(ui, &request, busy) {
+        launch_state.start_with_pokes(request.clone(), selected);
+    }
     let display = launch_state.display_for(&request);
     show_retroarch_launch_feedback(ui, &display);
     for line in launch_state.cheat_lines(&request) {

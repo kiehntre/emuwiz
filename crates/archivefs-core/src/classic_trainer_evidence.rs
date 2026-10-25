@@ -3,7 +3,8 @@
 //! Read-only evidence: it parses a trainer file that sits next to the game,
 //! says where it came from, which emulators could use it and why it is or is
 //! not eligible. It never writes memory, launches an emulator or applies
-//! anything: no launch path consumes a POKE projection yet.
+//! anything. The separate `launch` bridge validates an explicit selection
+//! and a verified native backend before consuming a Fuse projection.
 //!
 //! A `.pok` beside a game is a filename association. It cannot prove the
 //! trainer was written for this exact release, so such trainers stay
@@ -13,6 +14,7 @@
 //! pin is a claim; only the DAT-verified hash of the unchanged game file can
 //! confirm it, so a pin never verifies anything on its own.
 
+pub mod launch;
 pub mod pinning;
 
 use std::io::Read;
@@ -143,8 +145,7 @@ impl ClassicTrainerOption {
             && self.emulators.iter().any(|e| e.exact_when_verified)
     }
 
-    /// Plain statement of what this trainer is to the game. Applying POKEs is
-    /// not supported in any state.
+    /// Association and projection evidence; never proof of backend activation.
     #[must_use]
     pub fn state_label(&self) -> &'static str {
         match self.association {
@@ -159,10 +160,10 @@ impl ClassicTrainerOption {
                 "Candidate only: matched by file name, not verified compatibility. Preview only"
             }
             ClassicTrainerMatch::VerifiedIdentity if self.eligible_for_preparation() => {
-                "Verified for this release: pinned hash matches the DAT-verified game. Applying POKEs is not supported yet, so EmuWiz does not apply it or launch with it"
+                "Verified for this release: pinned hash matches the DAT-verified game. No trainer is enabled here; launch requires explicit selection and a separately verified backend"
             }
             ClassicTrainerMatch::VerifiedIdentity => {
-                "Verified for this release, but no emulator can use it exactly: preview only. Applying POKEs is not supported yet"
+                "Verified for this release, but no emulator can use it exactly: preview only"
             }
         }
     }
@@ -536,7 +537,7 @@ mod tests {
         let option = &report.options[0];
         assert_eq!(option.association, ClassicTrainerMatch::VerifiedIdentity);
         assert!(option.eligible_for_preparation());
-        assert!(option.state_label().contains("does not apply it or launch"));
+        assert!(option.state_label().contains("No trainer is enabled here"));
         assert_eq!(report.verified().count(), 1);
         assert_eq!(report.candidates().count(), 0);
     }

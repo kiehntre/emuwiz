@@ -5,16 +5,16 @@ use crate::patch_manager::validate_destination_root;
 use crate::safe_read::{TrustedRoots, open_bounded_read};
 use std::os::unix::fs::MetadataExt;
 
-const GAME_MAX: u64 = 64 * 1024 * 1024;
+pub(super) const GAME_MAX: u64 = 64 * 1024 * 1024;
 
 #[derive(Clone, Debug, PartialEq, Eq)]
-struct Observation {
+pub(super) struct Observation {
     device: u64,
     inode: u64,
     size: u64,
     modified: (i64, i64),
     changed: (i64, i64),
-    sha256: String,
+    pub(super) sha256: String,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -41,7 +41,7 @@ impl PinPreview {
     }
 }
 
-fn observe(
+pub(super) fn observe(
     path: &Path,
     roots: &TrustedRoots,
     limit: u64,

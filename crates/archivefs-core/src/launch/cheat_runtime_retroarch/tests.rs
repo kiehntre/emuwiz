@@ -172,7 +172,10 @@ fn selection() -> RetroArchCheatSelection {
         }],
     };
     RetroArchCheatSelection {
+        additional_sources: Vec::new(),
+        start_from_snapshot: false,
         expected_core: None,
+        expected_executable: None,
         candidates: vec![candidate("lives", 0), candidate("ammo", 1)],
         selections: vec![CheatLaunchSelection {
             logical_id: "lives".into(),
@@ -978,4 +981,72 @@ fn a_settings_file_that_vanishes_before_the_launch_refuses_instead_of_using_defa
     let world = World::new("vanished", true);
     fs::remove_file(world.real_config()).unwrap();
     assert_refused_before_anything_starts(&world, &unique("vanished"));
+}
+
+#[test]
+fn snapshot_trainer_mode_refuses_a_script_frontend_before_materialising() {
+    let world = World::new("snapshot-wrapper", true);
+    let mut cheats = selection();
+    cheats.start_from_snapshot = true;
+    let id = unique("snapshot-wrapper");
+    let result = launch(&world, &cheats, &id);
+    assert!(
+        matches!(result, Err(RetroArchCheatLaunchError::Facts(ref why)) if why.contains("wrapper script"))
+    );
+    assert!(!workspace(&id).exists());
+    assert!(!world.root.join("record").exists());
+}
+
+#[test]
+fn snapshot_trainer_mode_overrides_auto_state_loading_only_in_scratch() {
+    let world = World::new("snapshot-start", true);
+    let mut original = fs::read_to_string(world.real_config()).unwrap();
+    original.push_str("savestate_auto_load = \"true\"\n");
+    fs::write(world.real_config(), &original).unwrap();
+    let mut cheats = selection();
+    cheats.start_from_snapshot = true;
+    let mut command =
+        preflight_retroarch_launch(&world.request, &HostReadOnlyFilesystem, &world.environment)
+            .unwrap();
+    // A harmless real ELF process replaces the fake shell emulator, so the
+    // native-frontend gate and full planner/seeding/runtime path are exercised.
+    command.executable = fs::canonicalize("/usr/bin/true").unwrap();
+    let id = unique("snapshot-start");
+    let roots = CheatRuntimeRoots::default();
+    let mut launched = launch_prepared_command(
+        &world.request,
+        command,
+        &HostReadOnlyFilesystem,
+        &world.environment,
+        &cheats,
+        &roots,
+        &id,
+        None,
+    )
+    .unwrap();
+    let receipt = receipt_of(&launched).unwrap();
+    let config = receipt
+        .workspace_root
+        .as_ref()
+        .unwrap()
+        .join("retroarch/profile/retroarch.cfg");
+    let generated = fs::read_to_string(config).unwrap();
+    assert!(generated.contains("savestate_auto_load = \"false\""));
+    assert!(!generated.contains("savestate_auto_load = \"true\""));
+    assert_eq!(fs::read_to_string(world.real_config()).unwrap(), original);
+    wait_finished(&mut launched);
+}
+
+#[test]
+fn a_different_frontend_than_the_verified_one_refuses_before_materialising() {
+    let world = World::new("frontend-path", true);
+    let mut cheats = selection();
+    cheats.expected_executable = Some(world.root.join("different-retroarch"));
+    let id = unique("frontend-path");
+    let result = launch(&world, &cheats, &id);
+    assert!(
+        matches!(result, Err(RetroArchCheatLaunchError::Facts(ref why)) if why.contains("executable changed"))
+    );
+    assert!(!workspace(&id).exists());
+    assert!(!world.root.join("record").exists());
 }

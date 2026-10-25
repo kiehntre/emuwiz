@@ -86,7 +86,12 @@ pub struct PokeOperation {
     pub bank: PokeBank,
     pub address: PokeAddress,
     pub value: PokeValue,
+    /// Legacy/manual expected memory value. This remains a guard, never a POK restore field.
     pub original_value: Option<PokeOriginalValue>,
+    /// POK undo value: zero means capture memory at activation; nonzero is the
+    /// value to restore. Neither case checks current memory before writing.
+    #[serde(default)]
+    pub restore_value: Option<PokeOriginalValue>,
     pub condition: Option<PokeCondition>,
 }
 
@@ -347,6 +352,7 @@ pub fn manual_poke(
             address: PokeAddress(address),
             value,
             original_value: original,
+            restore_value: None,
             condition,
         }],
         target_identity,
@@ -561,6 +567,7 @@ pub enum PokeProjectionRefusal {
     MemorySpaceUnproven,
     WidthUnsupported,
     OriginalGuardUnsupported,
+    RestorationUnsupported,
     InvalidAddress,
     IdentityNotEligible,
     InvalidTitle,
@@ -577,7 +584,7 @@ pub struct PokeRuntimeProjection {
 
 pub fn poke_runtime_capability(emulator: PokeRuntimeEmulator) -> PokeRuntimeCapability {
     match emulator {
-        PokeRuntimeEmulator::Fuse => PokeRuntimeCapability { emulator, platform: PokePlatform::ZxSpectrum, support: PokeRuntimeSupport::SupportedNativeRuntime, preserves_banking: true, preserves_original_guards: true, detail: "Fuse multiface .pok files document bank, address, value and original value".into() },
+        PokeRuntimeEmulator::Fuse => PokeRuntimeCapability { emulator, platform: PokePlatform::ZxSpectrum, support: PokeRuntimeSupport::SupportedNativeRuntime, preserves_banking: true, preserves_original_guards: false, detail: "Fuse .pok preserves banks and restore values; it does not enforce memory guards".into() },
         PokeRuntimeEmulator::Vice => PokeRuntimeCapability { emulator, platform: PokePlatform::Commodore64, support: PokeRuntimeSupport::SupportedMonitorCommand, preserves_banking: false, preserves_original_guards: false, detail: "VICE monitor documents the > memory-write command; this adapter only projects explicit unbanked byte writes".into() },
         PokeRuntimeEmulator::Hatari => PokeRuntimeCapability { emulator, platform: PokePlatform::AtariSt, support: PokeRuntimeSupport::PreviewOnly, preserves_banking: false, preserves_original_guards: false, detail: "Hatari documents memwrite and --parse, but exact scripted command syntax and guard semantics are not proven here".into() },
         PokeRuntimeEmulator::Caprice32 => PokeRuntimeCapability { emulator, platform: PokePlatform::AmstradCpc, support: PokeRuntimeSupport::PreviewOnly, preserves_banking: false, preserves_original_guards: false, detail: "Caprice32 documents --autocmd but not a stable memory-write command contract".into() },
@@ -639,10 +646,23 @@ fn project_fuse_pok(cheat: &PokeCheat, capability: PokeRuntimeCapability) -> Pok
     }
     let mut lines = vec![format!("N{}", cheat.title)];
     for (index, operation) in cheat.operations.iter().enumerate() {
-        if operation.memory_space != PokeMemorySpace::BankedRam
-            || operation.value.width_bits != 8
-            || operation.original_value.is_none()
-        {
+        if operation.condition.is_some() || operation.original_value.is_some() {
+            return PokeRuntimeProjection {
+                capability,
+                commands_or_files: Vec::new(),
+                preview: "Fuse cannot enforce a memory guard; POK original fields are restoration values.".into(),
+                refusal: Some(PokeProjectionRefusal::OriginalGuardUnsupported),
+            };
+        }
+        if operation.restore_value.is_none() {
+            return PokeRuntimeProjection {
+                capability,
+                commands_or_files: Vec::new(),
+                preview: "Fuse requires an explicit POK restoration value (zero captures current memory).".into(),
+                refusal: Some(PokeProjectionRefusal::RestorationUnsupported),
+            };
+        }
+        if operation.memory_space != PokeMemorySpace::BankedRam || operation.value.width_bits != 8 {
             return PokeRuntimeProjection { capability, commands_or_files: Vec::new(), preview: "Fuse projection blocked: every write must be an 8-bit banked write with an original-value field.".into(), refusal: Some(if operation.memory_space != PokeMemorySpace::BankedRam { PokeProjectionRefusal::MemorySpaceUnproven } else if operation.value.width_bits != 8 { PokeProjectionRefusal::WidthUnsupported } else { PokeProjectionRefusal::OriginalGuardUnsupported }) };
         }
         let PokeBank::Number(bank) = operation.bank else {
@@ -666,7 +686,16 @@ fn project_fuse_pok(cheat: &PokeCheat, capability: PokeRuntimeCapability) -> Pok
                 refusal: Some(PokeProjectionRefusal::InvalidAddress),
             };
         }
-        let original = operation.original_value.expect("checked above").value;
+        let restore = operation.restore_value.expect("checked above");
+        if restore.width_bits != 8 || restore.value > u8::MAX as u32 {
+            return PokeRuntimeProjection {
+                capability,
+                commands_or_files: Vec::new(),
+                preview: "Fuse restoration value must be an 8-bit value.".into(),
+                refusal: Some(PokeProjectionRefusal::RestorationUnsupported),
+            };
+        }
+        let original = restore.value;
         let kind = if index + 1 == cheat.operations.len() {
             'Z'
         } else {
@@ -698,6 +727,14 @@ fn project_vice_monitor(
         {
             return PokeRuntimeProjection { capability, commands_or_files: Vec::new(), preview: "VICE projection blocked: only explicit unbanked main-memory writes are representable.".into(), refusal: Some(if operation.memory_space != PokeMemorySpace::MainRam { PokeProjectionRefusal::MemorySpaceUnproven } else { PokeProjectionRefusal::BankingUnproven }) };
         }
+        if operation.restore_value.is_some() {
+            return PokeRuntimeProjection {
+                capability,
+                commands_or_files: Vec::new(),
+                preview: "VICE monitor projection cannot preserve POK restoration values.".into(),
+                refusal: Some(PokeProjectionRefusal::RestorationUnsupported),
+            };
+        }
         if operation.value.width_bits != 8 {
             return PokeRuntimeProjection {
                 capability,
@@ -706,7 +743,7 @@ fn project_vice_monitor(
                 refusal: Some(PokeProjectionRefusal::WidthUnsupported),
             };
         }
-        if operation.original_value.is_some() {
+        if operation.original_value.is_some() || operation.condition.is_some() {
             return PokeRuntimeProjection { capability, commands_or_files: Vec::new(), preview: "VICE projection blocked: monitor command projection cannot preserve an original-value guard.".into(), refusal: Some(PokeProjectionRefusal::OriginalGuardUnsupported) };
         }
         if operation.address.0 > u16::MAX as u32 || operation.value.value > u8::MAX as u32 {
@@ -763,16 +800,12 @@ pub fn normalize_zx_pok_family(trainer: &ZxPokTrainer) -> PokeCheat {
                 value: operation.value as u32,
                 width_bits: 8,
             },
-            original_value: operation.original_value.map(|value| PokeOriginalValue {
+            original_value: None,
+            restore_value: operation.original_value.map(|value| PokeOriginalValue {
                 value: value as u32,
                 width_bits: 8,
             }),
-            condition: operation.original_value.map(|value| {
-                PokeCondition::OriginalEquals(PokeOriginalValue {
-                    value: value as u32,
-                    width_bits: 8,
-                })
-            }),
+            condition: None,
         })
         .collect();
     PokeCheat {
@@ -782,7 +815,9 @@ pub fn normalize_zx_pok_family(trainer: &ZxPokTrainer) -> PokeCheat {
         target_identity: None,
         target_verified: false,
         source: "ZX .pok".into(),
-        provenance: vec!["Existing ZX .pok parser; bank and original-value guard retained".into()],
+        provenance: vec![
+            "Existing ZX .pok parser; bank and restoration value retained; no memory guard".into(),
+        ],
     }
 }
 
@@ -790,6 +825,7 @@ pub fn normalize_zx_pok_family(trainer: &ZxPokTrainer) -> PokeCheat {
 pub enum PokeConflictKind {
     SameLocationDifferentValue,
     OriginalGuardMismatch,
+    RestoreValueMismatch,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -841,11 +877,17 @@ pub fn find_poke_conflicts(cheats: &[PokeCheat]) -> Vec<PokeConflict> {
                     right: ri,
                     kind: PokeConflictKind::SameLocationDifferentValue,
                 });
-            } else if lop.original_value != rop.original_value {
+            } else if lop.original_value != rop.original_value || lop.condition != rop.condition {
                 conflicts.push(PokeConflict {
                     left: li,
                     right: ri,
                     kind: PokeConflictKind::OriginalGuardMismatch,
+                });
+            } else if lop.restore_value != rop.restore_value {
+                conflicts.push(PokeConflict {
+                    left: li,
+                    right: ri,
+                    kind: PokeConflictKind::RestoreValueMismatch,
                 });
             }
         }
@@ -886,7 +928,8 @@ impl PokeRuntimeSupport {
     /// Whether this adapter can generate a real, exact artifact (a Fuse `.pok`
     /// file or VICE monitor commands) once identity is verified. Preview-only
     /// and unsupported runtimes never produce one. Generating an artifact is
-    /// not launching an emulator: no launch path consumes it yet.
+    /// not launching an emulator: the separate trainer launch bridge must
+    /// validate the selected entries, current identity and exact backend.
     #[must_use]
     pub const fn can_prepare(self) -> bool {
         matches!(
@@ -917,13 +960,13 @@ mod tests {
     use crate::open_retro_cheat_providers::{ZxPokOperation, parse_zx_pok};
 
     #[test]
-    fn zx_pok_preserves_bank_and_original_guard() {
+    fn zx_pok_preserves_bank_and_restoration_value() {
         let trainer = parse_zx_pok("N Lives\nZ 5 32768 255 3\nY\n")
             .unwrap()
             .remove(0);
         let cheat = normalize_zx_pok_family(&trainer);
         assert_eq!(cheat.operations[0].bank, PokeBank::Number(5));
-        assert_eq!(cheat.operations[0].original_value.unwrap().value, 3);
+        assert_eq!(cheat.operations[0].restore_value.unwrap().value, 3);
     }
 
     #[test]
@@ -1059,34 +1102,13 @@ mod tests {
 
     #[test]
     fn fuse_native_and_vice_monitor_projection_are_deterministic() {
-        let mut fuse = manual_poke(
-            PokePlatform::ZxSpectrum,
-            "Lives",
-            32768,
-            255,
-            Some(3),
-            PokeBank::Number(5),
-            None,
-            Some("verified-release".into()),
-            true,
-        )
-        .unwrap();
-        fuse.operations.push(
-            manual_poke(
-                PokePlatform::ZxSpectrum,
-                "Lives",
-                32769,
-                1,
-                Some(0),
-                PokeBank::Number(5),
-                None,
-                Some("verified-release".into()),
-                true,
-            )
-            .unwrap()
-            .operations
-            .remove(0),
+        let mut fuse = normalize_zx_pok_family(
+            &parse_zx_pok("NLives\nM 5 32768 255 3\nZ 5 32769 1 0\nY\n")
+                .unwrap()
+                .remove(0),
         );
+        fuse.target_identity = Some("verified-release".into());
+        fuse.target_verified = true;
         let projection = project_poke_runtime(&fuse, PokeRuntimeEmulator::Fuse);
         assert!(projection.refusal.is_none());
         assert_eq!(
@@ -1293,7 +1315,7 @@ mod identity_gate_regressions {
                     } else {
                         32768
                     };
-                    let cheat = manual_poke(
+                    let mut cheat = manual_poke(
                         platform,
                         "Lives",
                         address,
@@ -1305,6 +1327,11 @@ mod identity_gate_regressions {
                         verified,
                     )
                     .unwrap();
+                    if platform == PokePlatform::ZxSpectrum {
+                        cheat.operations[0].restore_value =
+                            cheat.operations[0].original_value.take();
+                        cheat.operations[0].condition = None;
+                    }
                     let projection = project_poke_runtime(&cheat, emulator);
                     let allowed = verified && identity.is_some_and(|s| !s.trim().is_empty());
                     assert_eq!(
@@ -1484,5 +1511,137 @@ mod platform_notation_and_projection_regressions {
             PokeExpressionResult::UnsupportedExpression(_)
         ));
         assert!(parse_simple_pokes(PokePlatform::ZxSpectrum, "ZX", "?32768=1").is_err());
+    }
+}
+
+#[cfg(test)]
+mod restoration_regressions {
+    use super::*;
+    use crate::open_retro_cheat_providers::parse_zx_pok;
+
+    #[test]
+    fn pok_m_and_z_restore_fields_are_not_memory_guards() {
+        let trainer = parse_zx_pok("N Lives\nM 5 32768 255 3\nZ 8 40000 9 0\nY\n")
+            .unwrap()
+            .remove(0);
+        let cheat = normalize_zx_pok_family(&trainer);
+        assert!(cheat.operations.iter().all(|op| op.condition.is_none()));
+    }
+
+    #[test]
+    fn restore_values_round_trip_and_legacy_manual_guards_remain_guards() {
+        let trainer = parse_zx_pok("N Lives\nM 5 32768 255 3\nZ 8 40000 9 0\nY\n")
+            .unwrap()
+            .remove(0);
+        let mut cheat = normalize_zx_pok_family(&trainer);
+        assert_eq!(cheat.operations[0].restore_value.unwrap().value, 3);
+        assert_eq!(cheat.operations[1].restore_value.unwrap().value, 0);
+        assert!(cheat.operations.iter().all(|o| o.original_value.is_none()));
+        cheat.target_identity = Some("release".into());
+        cheat.target_verified = true;
+        let projection = project_poke_runtime(&cheat, PokeRuntimeEmulator::Fuse);
+        assert!(projection.refusal.is_none());
+        let back = parse_zx_pok(&projection.commands_or_files[0]).unwrap();
+        assert_eq!(back, vec![trainer]);
+        assert!(!poke_runtime_capability(PokeRuntimeEmulator::Fuse).preserves_original_guards);
+
+        let manual = manual_poke(
+            PokePlatform::ZxSpectrum,
+            "Manual",
+            32768,
+            9,
+            Some(3),
+            PokeBank::Number(5),
+            None,
+            Some("release".into()),
+            true,
+        )
+        .unwrap();
+        assert_eq!(
+            manual.operations[0].condition,
+            Some(PokeCondition::OriginalEquals(PokeOriginalValue {
+                value: 3,
+                width_bits: 8
+            }))
+        );
+        assert!(manual.operations[0].restore_value.is_none());
+        // Old serialized operations have no restore field. They retain their
+        // guard and may never be silently reinterpreted as POK restoration.
+        let mut json = serde_json::to_value(&manual).unwrap();
+        json["operations"][0]
+            .as_object_mut()
+            .unwrap()
+            .remove("restore_value");
+        let old: PokeCheat = serde_json::from_value(json).unwrap();
+        assert_eq!(old, manual);
+        assert_eq!(
+            project_poke_runtime(&old, PokeRuntimeEmulator::Fuse).refusal,
+            Some(PokeProjectionRefusal::OriginalGuardUnsupported)
+        );
+    }
+
+    #[test]
+    fn projections_refuse_lost_conditions_and_restoration_and_conflicts_distinguish_them() {
+        let mut cheat =
+            normalize_zx_pok_family(&parse_zx_pok("Nx\nZ 8 40000 9 3\nY\n").unwrap().remove(0));
+        cheat.target_identity = Some("release".into());
+        cheat.target_verified = true;
+        let mut other = cheat.clone();
+        other.operations[0].restore_value.as_mut().unwrap().value = 4;
+        assert_eq!(
+            find_poke_conflicts(&[cheat.clone(), other])[0].kind,
+            PokeConflictKind::RestoreValueMismatch
+        );
+        for condition in [
+            PokeCondition::OriginalEquals(PokeOriginalValue {
+                value: 3,
+                width_bits: 8,
+            }),
+            PokeCondition::Native("guard".into()),
+        ] {
+            cheat.operations[0].condition = Some(condition);
+            let refused = project_poke_runtime(&cheat, PokeRuntimeEmulator::Fuse);
+            assert_eq!(
+                refused.refusal,
+                Some(PokeProjectionRefusal::OriginalGuardUnsupported)
+            );
+            assert!(refused.commands_or_files.is_empty());
+        }
+        cheat.operations[0].condition = None;
+        cheat.operations[0].restore_value.as_mut().unwrap().value = 256;
+        assert_eq!(
+            project_poke_runtime(&cheat, PokeRuntimeEmulator::Fuse).refusal,
+            Some(PokeProjectionRefusal::RestorationUnsupported)
+        );
+        cheat.platform = PokePlatform::Commodore64;
+        cheat.operations[0].memory_space = PokeMemorySpace::MainRam;
+        cheat.operations[0].bank = PokeBank::Unspecified;
+        cheat.operations[0].address = PokeAddress(1024);
+        assert_eq!(
+            project_poke_runtime(&cheat, PokeRuntimeEmulator::Vice).refusal,
+            Some(PokeProjectionRefusal::RestorationUnsupported)
+        );
+    }
+
+    #[test]
+    fn fuse_must_not_silently_drop_a_manual_memory_guard() {
+        let cheat = manual_poke(
+            PokePlatform::ZxSpectrum,
+            "Guarded",
+            32768,
+            9,
+            Some(3),
+            PokeBank::Number(5),
+            None,
+            Some("release".into()),
+            true,
+        )
+        .unwrap();
+        let projection = project_poke_runtime(&cheat, PokeRuntimeEmulator::Fuse);
+        assert_eq!(
+            projection.refusal,
+            Some(PokeProjectionRefusal::OriginalGuardUnsupported)
+        );
+        assert!(projection.commands_or_files.is_empty());
     }
 }
