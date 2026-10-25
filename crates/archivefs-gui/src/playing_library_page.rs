@@ -15,6 +15,7 @@
 //! apply path in this app already uses; there is no second filesystem
 //! engine anywhere in this file.
 
+pub(crate) mod preferences;
 mod presentation;
 mod retrodeck;
 

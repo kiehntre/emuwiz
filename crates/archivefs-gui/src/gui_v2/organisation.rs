@@ -557,6 +557,7 @@ impl App {
                 }
                 OrganisationView::PlayingLibrary => {
                     self.invalidate_changed_playing_library_plan();
+                    let saved = crate::playing_library_page::preferences::SavedPreferences::from_state(&self.playing_library);
                     let kind = destination_kind(self.playing_library.destination);
                     ui.horizontal_wrapped(|ui| {
                         if ui.button("‹ Organisation").clicked() {
@@ -576,11 +577,19 @@ impl App {
                     if self.playing_library.destination == PlayingLibraryDestination::RetroDeck {
                         ui.label("RetroDECK runs ES-DE inside a sandbox, so both the original and linked folders must be visible to it.");
                     }
-                    playing_action = crate::playing_library_page::show_playing_library_page_with_busy(
-                        ui,
-                        &mut self.playing_library,
-                        self.playing_library_job.is_some(),
-                    );
+                    if self.preferences_restored {
+                        playing_action = crate::playing_library_page::show_playing_library_page_with_busy(
+                            ui,
+                            &mut self.playing_library,
+                            self.playing_library_job.is_some(),
+                        );
+                    } else {
+                        ui.label("Loading saved version preferences…");
+                    }
+                    if saved != crate::playing_library_page::preferences::SavedPreferences::from_state(&self.playing_library) {
+                        self.interacted = true;
+                        self.preferences_dirty = Some(std::time::Instant::now());
+                    }
                 }
                 OrganisationView::MameNormalizer => {
                     ui.horizontal_wrapped(|ui| {
