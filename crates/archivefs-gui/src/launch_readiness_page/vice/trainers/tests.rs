@@ -241,7 +241,7 @@ fn render_panel(input: &LaunchReadinessInput, state: &mut StandaloneLaunchState)
 }
 
 #[test]
-fn two_vice_cards_do_not_clear_the_first_cards_selection_each_frame() {
+fn multiple_vice_profiles_preserve_gold_ambiguity_refusal_and_clear_approval() {
     let f = fixture("POKE $C000,42");
     let second = f.lab.path.with_file_name("second-bin").join("x64sc");
     fs::create_dir(second.parent().unwrap()).unwrap();
@@ -267,11 +267,32 @@ fn two_vice_cards_do_not_clear_the_first_cards_selection_each_frame() {
         ..Default::default()
     };
     let input = super::super::tests::input(context);
+    let LaunchReadinessInput::Plan {
+        plan,
+        vice: Some(context),
+        ..
+    } = &input
+    else {
+        panic!("expected VICE plan")
+    };
+    assert!(
+        plan.candidates
+            .iter()
+            .all(|c| context.request(plan, c).is_none())
+    );
+    assert!(plan.candidates.iter().any(|c| {
+        c.warnings
+            .iter()
+            .any(|w| w.kind == archivefs_core::launch::LaunchWarningKind::MultipleEligibleProfiles)
+    }));
     for _ in 0..2 {
         render_panel(&input, &mut state);
     }
-    assert!(state.vice_trainers.enabled);
-    assert_eq!(state.vice_trainers.selected, BTreeSet::from([0]));
+    assert!(
+        !state.vice_trainers.enabled
+            && !state.vice_trainers.approved
+            && state.vice_trainers.selected.is_empty()
+    );
 }
 
 #[test]
@@ -285,11 +306,37 @@ fn leaving_the_supported_lane_revokes_trainer_approval() {
         vice_trainers: choice,
         ..Default::default()
     };
+    let context = Context::inspect_with(
+        f.lab.path.clone(),
+        f.lab.evidence().unwrap(),
+        f.request.roots.clone(),
+        &f.request.executable_sha256,
+    )
+    .unwrap();
+    let supported = super::super::tests::input(context);
+    render_panel(&supported, &mut state);
+    assert!(
+        state.vice_trainers.enabled
+            && state.vice_trainers.approved
+            && state.vice_trainers.selected.contains(&0)
+    );
     render_panel(&LaunchReadinessInput::IdentityUnknown, &mut state);
     assert!(
         !state.vice_trainers.enabled
             && !state.vice_trainers.approved
             && state.vice_trainers.selected.is_empty()
+    );
+    render_panel(&supported, &mut state);
+    let ctx = egui::Context::default();
+    assert!(
+        frame(&ctx, &mut state.vice_trainers, &f.request, vec![])
+            .1
+            .is_none()
+    );
+    assert!(
+        !state.vice_trainers.enabled
+            && !state.vice_trainers.approved
+            && state.vice_trainers.preview.is_none()
     );
 }
 
@@ -310,6 +357,30 @@ fn assert_shared_refusal(session: CheatRuntimeSession<WatchedProcess>, f: &Fixtu
     );
 }
 
+#[test]
+fn changing_blue_game_focus_without_drawing_launch_panel_revokes_approval() {
+    let f = fixture("POKE $C000,42");
+    let mut choice = chooser(&f);
+    choice.enabled = true;
+    choice.approved = true;
+    choice.selected.insert(0);
+    let mut state = StandaloneLaunchState {
+        vice_trainers: choice,
+        ..Default::default()
+    };
+    state.focus_vice_trainer_game(Some(&f.lab.path));
+    assert!(state.vice_trainers.approved);
+    let other = f.lab.path.with_file_name("unsupported-game.tap");
+    state.focus_vice_trainer_game(Some(&other));
+    state.focus_vice_trainer_game(Some(&f.lab.path));
+    assert!(
+        !state.vice_trainers.enabled
+            && !state.vice_trainers.approved
+            && state.vice_trainers.selected.is_empty()
+            && state.vice_trainers.preview.is_none()
+    );
+}
+
 fn frame(
     ctx: &egui::Context,
     chooser: &mut Chooser,
@@ -317,7 +388,7 @@ fn frame(
     events: Vec<egui::Event>,
 ) -> (egui::FullOutput, Option<Selection>) {
     let mut selected = None;
-    let time = ctx.input(|i| i.time) + 1.0;
+    let time = ctx.input(|i| i.time) + 1.0 / 60.0;
     let out = ctx.run(
         egui::RawInput {
             time: Some(time),
@@ -392,6 +463,7 @@ fn chooser(f: &Fixture) -> Chooser {
 fn chooser_requires_default_off_opt_in_entry_selection_and_distinct_approval() {
     let f = fixture("POKE $C000,42");
     let ctx = egui::Context::default();
+    ctx.style_mut(|style| style.animation_time = 0.0);
     let mut chooser = chooser(&f);
     assert!(!chooser.enabled && !chooser.approved && chooser.selected.is_empty());
     assert!(frame(&ctx, &mut chooser, &f.request, vec![]).1.is_none());

@@ -3169,6 +3169,9 @@ impl NativeWorkflows {
     }
 
     fn select(&mut self, path: &Path) {
+        self.app
+            .launch_standalone
+            .focus_vice_trainer_game(Some(path));
         if self.selected.as_deref() != Some(path) {
             self.selected = Some(path.to_path_buf());
             self.app.archive_context.select_only(path.to_path_buf());

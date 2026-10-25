@@ -60,6 +60,42 @@ fn current(request: &Request) -> Result<(Evidence, TrustedRoots), String> {
 }
 
 impl Chooser {
+    pub(in crate::launch_readiness_page) fn focus(&mut self, path: Option<&Path>) {
+        if self
+            .scope
+            .as_ref()
+            .is_some_and(|scope| Some(scope.launch.selected_content_path.as_path()) != path)
+        {
+            self.cancel_approval();
+            self.scope = None;
+            self.preview = None;
+            self.problem = None;
+        }
+    }
+
+    pub(in crate::launch_readiness_page) fn reconcile(&mut self, input: &LaunchReadinessInput) {
+        let retained = match input {
+            LaunchReadinessInput::Plan {
+                plan,
+                vice: Some(context),
+                ..
+            } => plan
+                .candidates
+                .iter()
+                .filter_map(|candidate| context.request(plan, candidate))
+                .any(|request| self.scope.as_ref() == Some(&Scope::of(&request))),
+            _ => false,
+        };
+        if !retained {
+            self.cancel_approval();
+            self.scope = None;
+            self.preview = None;
+            self.problem = None;
+            // Keep at most one old worker; show() discards a result whose
+            // complete scope no longer matches. No approval survives.
+        }
+    }
+
     pub(in crate::launch_readiness_page) fn cancel_approval(&mut self) {
         self.enabled = false;
         self.selected.clear();
@@ -258,6 +294,25 @@ pub(in crate::launch_readiness_page) fn phase_label(
         Some(process) if process.exit.is_some() => "Process exited",
         Some(_) => "Running",
     }
+}
+
+pub(in crate::launch_readiness_page) fn failure_detail(
+    session: &CheatRuntimeSession<WatchedProcess>,
+) -> Option<String> {
+    use archivefs_core::launch::cheat_runtime::HandoffOutcome;
+    let receipt = session.receipt();
+    (receipt.process.is_none()
+        || receipt.handoff != HandoffOutcome::PassedToEmulator
+        || !receipt.errors.is_empty())
+    .then(|| {
+        format!(
+            "VICE trainer launch: preparation {:?}; handoff {:?}; cleanup {:?}; {}",
+            receipt.materialisation,
+            receipt.handoff,
+            receipt.cleanup,
+            receipt.errors.join("; ")
+        )
+    })
 }
 
 pub(in crate::launch_readiness_page) fn show_receipt(

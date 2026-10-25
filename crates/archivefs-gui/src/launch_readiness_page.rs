@@ -1060,6 +1060,10 @@ impl StandaloneLaunchState {
         self.dosbox.focus(path);
     }
 
+    pub(crate) fn focus_vice_trainer_game(&mut self, path: Option<&Path>) {
+        self.vice_trainers.focus(path);
+    }
+
     fn bind_cue_review(&mut self, request: &mut StandaloneLaunchRequest) -> Result<(), String> {
         let StandaloneLaunchRequest::DuckStation(request, ..) = request else {
             return Ok(());
@@ -1294,14 +1298,18 @@ impl StandaloneLaunchState {
     pub(crate) fn failure_detail(&self) -> Option<String> {
         match &self.tracked {
             Some((_, _, StandaloneLaunchStage::Failed(error))) => Some(error.clone()),
+            Some((
+                _,
+                _,
+                StandaloneLaunchStage::Running(StandaloneProcess::ViceTrainers(session))
+                | StandaloneLaunchStage::Exited(StandaloneProcess::ViceTrainers(session)),
+            )) => vice::trainers::failure_detail(session),
             _ => None,
         }
     }
 
     fn start(&mut self, request: StandaloneLaunchRequest) {
-        if matches!(&request, StandaloneLaunchRequest::Vice(_)) {
-            self.vice_trainers.cancel_approval();
-        }
+        self.vice_trainers.cancel_approval();
         let (path, adapter) = request.key();
         if let Some(receiver) = scummvm_profile::start_with_profile(self, &request) {
             self.tracked = Some((path, adapter, StandaloneLaunchStage::Starting(receiver)));
@@ -3045,6 +3053,7 @@ pub(crate) fn show_launch_readiness_panel(
     amiga_whdload_launch_state: &mut AmigaWHDLoadLaunchState,
 ) -> Option<LaunchReadinessPageAction> {
     let mut action = None;
+    standalone_launch_state.vice_trainers.reconcile(input);
     widgets::section_header(
         ui,
         "Play / Launch readiness",
