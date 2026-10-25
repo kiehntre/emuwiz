@@ -32,6 +32,15 @@ fn temp() -> TempDir {
     tempfile::tempdir().expect("a temporary directory")
 }
 
+// ID-shape tests need a bounded root, independent of the host's TMPDIR.
+// TempDir securely creates and owns a unique directory; /tmp is only its parent.
+fn proposal_id_temp() -> TempDir {
+    tempfile::Builder::new()
+        .prefix("emuwiz-id-")
+        .tempdir_in("/tmp")
+        .expect("a short private temporary directory")
+}
+
 fn write(dir: &Path, name: &str, contents: &[u8]) -> PathBuf {
     let path = dir.join(name);
     std::fs::write(&path, contents).expect("write fixture");
@@ -2211,7 +2220,7 @@ fn a_full_apply_of_a_mixed_plan_refuses_before_any_mutation() {
 // proposal id derived from a long source path must not make the repair vanish.
 #[test]
 fn a_long_source_path_keeps_its_safe_repair_and_a_unique_valid_id() {
-    let dir = temp();
+    let dir = proposal_id_temp();
     let deep = dir.path().join("N".repeat(90)).join("S".repeat(90));
     std::fs::create_dir_all(&deep).unwrap();
     let (dat, roms) = three_proposal_fixture(&deep);
@@ -2233,6 +2242,7 @@ fn a_long_source_path_keeps_its_safe_repair_and_a_unique_valid_id() {
     let unique: std::collections::BTreeSet<_> = ids.iter().collect();
     assert_eq!(unique.len(), 3, "every proposal id is distinct: {ids:?}");
     assert!(ids.iter().all(|id| id.len() <= 128), "{ids:?}");
+    assert!(ids.iter().all(|id| id.starts_with("dat~")), "{ids:?}");
 
     // The fallback id is stable across rescans, so a saved plan still matches.
     let again: Vec<String> = scan(&dat, &roms)
@@ -2262,7 +2272,7 @@ fn a_long_source_path_keeps_its_safe_repair_and_a_unique_valid_id() {
 // A short path keeps exactly the readable id it always had.
 #[test]
 fn a_short_source_path_keeps_its_readable_proposal_id() {
-    let dir = temp();
+    let dir = proposal_id_temp();
     let (dat, roms) = three_proposal_fixture(dir.path());
     let outcome = scan(&dat, &roms);
     let proposal = outcome
@@ -2277,7 +2287,42 @@ fn a_short_source_path_keeps_its_readable_proposal_id() {
             .to_string_lossy()
             .replace(['/', '\\'], "_")
     );
+    assert!(
+        expected.len() <= 128,
+        "the fixture must exercise readable IDs"
+    );
     assert_eq!(proposal.id.as_str(), expected);
+}
+
+#[test]
+fn proposal_ids_preserve_repairs_at_the_readable_length_boundary() {
+    let dir = proposal_id_temp();
+    for readable_len in [128, 129] {
+        // Account for the separator, fixture directories and filename instead
+        // of assuming any particular length for the random temporary root.
+        let base_len = dir.path().join("roms/a.bin").as_os_str().len() + 1;
+        let root = dir.path().join("p".repeat(readable_len - 4 - base_len));
+        std::fs::create_dir(&root).unwrap();
+        let (dat, roms) = three_proposal_fixture(&root);
+        let source = roms.join("a.bin");
+        let readable = format!("dat-{}", source.to_str().unwrap().replace(['/', '\\'], "_"));
+        assert_eq!(readable.len(), readable_len);
+        assert_eq!(
+            RepairProposalId::new(readable.clone()).is_some(),
+            readable_len == 128
+        );
+
+        let outcome = scan(&dat, &roms);
+        assert_eq!(outcome.report.counts.safe_repairs, 3);
+        let id = proposal_id_for(&dat, &roms, "a.bin");
+        if readable_len == 128 {
+            assert_eq!(id.as_str(), readable);
+        } else {
+            assert!(id.as_str().starts_with("dat~"));
+            assert_eq!(id.as_str().len(), 4 + 64);
+        }
+        assert_eq!(id, proposal_id_for(&dat, &roms, "a.bin"));
+    }
 }
 
 #[test]
@@ -2303,7 +2348,7 @@ fn reference_gap_repair_report_explains_undumped_material_without_claiming_a_mis
 
 #[test]
 fn readable_id_collisions_are_explained_and_not_counted_safe() {
-    let dir = temp();
+    let dir = proposal_id_temp();
     let (dat, roms) = three_proposal_fixture(dir.path());
     std::fs::create_dir(roms.join("q")).unwrap();
     std::fs::rename(roms.join("a.bin"), roms.join("q_r.bin")).unwrap();
