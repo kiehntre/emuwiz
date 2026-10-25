@@ -311,6 +311,7 @@ fn launch_attention(
             snapshot.coverage_notes.push("Selected-game launch evidence is not loaded; no launch failure has been inferred.".into());
             return snapshot;
         },
+        LaunchReadinessInput::DosBoxReview => ("DOSBox needs folder approval".into(), "Review and approve the local folder and start executable; this does not verify a game release.".into(), AttentionCategory::Launch, AttentionDestination::LaunchReadiness, Some("DOS".into())),
         LaunchReadinessInput::AtariSt(snapshot) => ("Atari ST launch needs attention".into(),snapshot.reason(),AttentionCategory::Launch,AttentionDestination::LaunchReadiness,None),
         LaunchReadinessInput::DiscFilesUnresolved(detail) => (
             "Disc files need attention".into(),

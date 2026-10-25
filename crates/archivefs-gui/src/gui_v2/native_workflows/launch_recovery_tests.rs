@@ -329,3 +329,81 @@ fn blue_launch_and_details_start_cassette_verification() {
         }
     }
 }
+
+#[test]
+fn blue_and_gold_dosbox_folder_review_is_reachable_without_release_identity() {
+    let directory = tempfile::tempdir().unwrap();
+    let path = directory.path().join("homebrew.zip");
+    std::fs::write(&path, b"synthetic catalogue selection").unwrap();
+    std::fs::write(directory.path().join("GAME.EXE"), b"MZ").unwrap();
+    std::fs::write(
+        directory.path().join("dosbox.conf"),
+        "[dosbox]\nmemsize=16\n[autoexec]\nmount c .\nc:\ngame.exe\nexit\n",
+    )
+    .unwrap();
+    let context = egui::Context::default();
+    let mut workflows = NativeWorkflows::new(context.clone());
+    workflows.app = crate::tests::app_with_cheat_game(path.to_str().unwrap(), "Unknown");
+    workflows.select(&path);
+    let report = crate::selected_evidence_page::gather_selected_evidence_with_platform(
+        &path,
+        Some("DOS"),
+        None,
+    )
+    .unwrap();
+    assert!(matches!(
+        archivefs_core::launch::canonical_identity_from_game_report(&report.game_identity_report).0,
+        archivefs_core::launch::CanonicalIdentityStatus::Unknown
+    ));
+    workflows.app.selected_evidence_ui.selected_evidence = SelectedEvidenceState::Ready {
+        generation: 0,
+        report: Box::new(report),
+        hasheous: HasheousState::Idle,
+    };
+    assert!(matches!(
+        workflows.launch_input(),
+        launch_readiness_page::LaunchReadinessInput::DosBoxReview
+    ));
+}
+
+#[test]
+fn changing_blue_details_selection_clears_dosbox_approval_before_returning_to_launch() {
+    let directory = tempfile::tempdir().unwrap();
+    let a = directory.path().join("a.zip");
+    let b = directory.path().join("b.zip");
+    std::fs::write(directory.path().join("GAME.EXE"), b"MZ").unwrap();
+    std::fs::write(
+        directory.path().join("dosbox.conf"),
+        "[dosbox]\nmemsize=16\n[autoexec]\nmount c .\nc:\ngame.exe\nexit\n",
+    )
+    .unwrap();
+    let review = archivefs_core::launch::review_dosbox_game_directory(directory.path()).unwrap();
+    let target = archivefs_core::launch::UserApprovedDosBoxTarget::approve(
+        &review,
+        directory.path(),
+        &directory.path().join("GAME.EXE"),
+    )
+    .unwrap();
+    let mut workflows = NativeWorkflows::new(egui::Context::default());
+    workflows.select(&a);
+    assert!(
+        workflows
+            .app
+            .launch_standalone
+            .dosbox_approval_for_test(Some(target))
+    );
+    workflows.select(&b);
+    assert!(
+        !workflows
+            .app
+            .launch_standalone
+            .dosbox_approval_for_test(None)
+    );
+    workflows.select(&a);
+    assert!(
+        !workflows
+            .app
+            .launch_standalone
+            .dosbox_approval_for_test(None)
+    );
+}
