@@ -1011,6 +1011,13 @@ pub(crate) enum StandaloneProcess {
     Flycast(archivefs_core::launch::LaunchedFlycastProcess),
     XRoar(archivefs_core::launch::process_spawn::WatchedProcess),
     Vice(archivefs_core::launch::process_spawn::WatchedProcess),
+    ViceTrainers(
+        Box<
+            archivefs_core::launch::cheat_runtime::CheatRuntimeSession<
+                archivefs_core::launch::process_spawn::WatchedProcess,
+            >,
+        >,
+    ),
     ScummVm(archivefs_core::launch::LaunchedScummVmProcess),
     OpenMsx(archivefs_core::launch::process_spawn::WatchedProcess),
     /// DOSBox running inside the bubblewrap sandbox.
@@ -1047,6 +1054,7 @@ pub(crate) struct StandaloneLaunchState {
     scummvm_profile: scummvm_profile::Choice,
     /// The DOSBox check and the user's approval for the game on screen.
     dosbox: dosbox::Panel,
+    vice_trainers: vice::trainers::Chooser,
 }
 
 impl StandaloneLaunchState {
@@ -1057,6 +1065,10 @@ impl StandaloneLaunchState {
     /// The game the Launch page shows, for the DOSBox check.
     pub(crate) fn focus_dosbox_game(&mut self, path: Option<&Path>) {
         self.dosbox.focus(path);
+    }
+
+    pub(crate) fn focus_vice_trainer_game(&mut self, path: Option<&Path>) {
+        self.vice_trainers.focus(path);
     }
 
     fn bind_cue_review(&mut self, request: &mut StandaloneLaunchRequest) -> Result<(), String> {
@@ -1253,6 +1265,10 @@ impl StandaloneLaunchState {
                     StandaloneProcess::Flycast(p) => p.poll().is_some(),
                     StandaloneProcess::XRoar(p) => p.poll().is_some(),
                     StandaloneProcess::Vice(p) => p.poll().is_some(),
+                    StandaloneProcess::ViceTrainers(session) => {
+                        let _ = session.poll();
+                        session.is_finished()
+                    }
                     StandaloneProcess::ScummVm(p) => p.poll().is_some(),
                     StandaloneProcess::OpenMsx(p) => p.poll().is_some(),
                     StandaloneProcess::DosBox(p) => p.poll().is_some(),
@@ -1289,11 +1305,18 @@ impl StandaloneLaunchState {
     pub(crate) fn failure_detail(&self) -> Option<String> {
         match &self.tracked {
             Some((_, _, StandaloneLaunchStage::Failed(error))) => Some(error.clone()),
+            Some((
+                _,
+                _,
+                StandaloneLaunchStage::Running(StandaloneProcess::ViceTrainers(session))
+                | StandaloneLaunchStage::Exited(StandaloneProcess::ViceTrainers(session)),
+            )) => vice::trainers::failure_detail(session),
             _ => None,
         }
     }
 
     fn start(&mut self, request: StandaloneLaunchRequest) {
+        self.vice_trainers.cancel_approval();
         let (path, adapter) = request.key();
         if let Some(receiver) = scummvm_profile::start_with_profile(self, &request) {
             self.tracked = Some((path, adapter, StandaloneLaunchStage::Starting(receiver)));
@@ -3037,6 +3060,7 @@ pub(crate) fn show_launch_readiness_panel(
     amiga_whdload_launch_state: &mut AmigaWHDLoadLaunchState,
 ) -> Option<LaunchReadinessPageAction> {
     let mut action = None;
+    standalone_launch_state.vice_trainers.reconcile(input);
     widgets::section_header(
         ui,
         "Play / Launch readiness",
@@ -4775,6 +4799,10 @@ fn show_standalone_launch_action(
     if same {
         let label = match state.tracked.as_ref().map(|(_, _, stage)| stage) {
             Some(StandaloneLaunchStage::Starting(_)) => "Launching…",
+            Some(
+                StandaloneLaunchStage::Running(StandaloneProcess::ViceTrainers(session))
+                | StandaloneLaunchStage::Exited(StandaloneProcess::ViceTrainers(session)),
+            ) => vice::trainers::phase_label(session),
             Some(StandaloneLaunchStage::Running(_)) => "Running",
             Some(StandaloneLaunchStage::Exited(_)) => "Process exited",
             Some(StandaloneLaunchStage::Failed(_)) => "Launch failed",
@@ -4827,6 +4855,13 @@ fn show_standalone_launch_action(
             Some((_, _, StandaloneLaunchStage::Running(StandaloneProcess::ScummVm(_)))) => {
                 ui.small("ScummVM process started; EmuWiz cannot tell whether the game itself is running.");
             }
+            Some((
+                _,
+                _,
+                StandaloneLaunchStage::Running(StandaloneProcess::ViceTrainers(session)),
+            )) => {
+                vice::trainers::show_receipt(ui, session);
+            }
             Some((_, _, StandaloneLaunchStage::Running(StandaloneProcess::Vice(process)))) => {
                 ui.small(format!("VICE running · PID {}", process.pid));
                 ui.small("Starting the process does not prove the game ran.");
@@ -4858,6 +4893,9 @@ fn show_standalone_launch_action(
                     && let Some(report) = process.poll()
                 {
                     ui.label(exit_line("ScummVM", report));
+                }
+                if let StandaloneProcess::ViceTrainers(session) = process {
+                    vice::trainers::show_receipt(ui, session);
                 }
                 if let StandaloneProcess::Vice(process) = process
                     && let Some(report) = process.poll()

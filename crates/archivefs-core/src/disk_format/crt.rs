@@ -201,3 +201,36 @@ fn malformed(detail: impl Into<String>) -> DiskFormatRefusal {
         detail: detail.into(),
     }
 }
+
+/// The existing bounded Blue VICE cartridge contract, shared with trainer review.
+pub fn verify_standard_8k_rom(path: &std::path::Path, bytes: &[u8]) -> Result<(), String> {
+    use crate::disk_format::{DiskFormatContext, DiskFormatMetadata, inspect_disk_format};
+    let inspected = inspect_disk_format(
+        path,
+        &crate::safe_read::TrustedRoots::none(),
+        DiskFormatContext {
+            folder_platform: Some("Commodore 64"),
+        },
+        None,
+    );
+    let Some(DiskFormatMetadata::Crt(layout)) = inspected.metadata else {
+        return Err("Gold's CRT structural inspection refused this cartridge.".into());
+    };
+    // Qualification over Gold's validated layout, not another CRT parser.
+    // The validated first CHIP load address is not exposed by CrtLayout.
+    if layout.header_length != 64
+        || layout.version != 0x0100
+        || layout.hardware_type != 0
+        || layout.exrom != 0
+        || layout.game != 1
+        || layout.packets != 1
+        || layout.chip_types != [0]
+        || layout.banks != [0]
+        || layout.total_image_bytes != 8192
+        || bytes.len() != 64 + 16 + 8192
+        || bytes.get(0x4c..0x4e) != Some(&[0x80, 0x00])
+    {
+        return Err("VICE Play currently supports only standard 8 KiB ROM cartridges (CRT v1, hardware 0, bank 0 at $8000).".into());
+    }
+    Ok(())
+}
