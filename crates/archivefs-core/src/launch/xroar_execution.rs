@@ -7,10 +7,7 @@ use crate::launch::planning::{
     CandidatePreference, CanonicalIdentityStatus, LaunchCandidate, LaunchContainerKind,
     LaunchContentKind, LaunchContentRef, LaunchTarget,
 };
-use crate::launch::process_spawn::{
-    CapturedFileIdentity, PreparedProcessCommand, WatchedProcess, capture_file_identity,
-    spawn_watched_process,
-};
+use crate::launch::process_spawn::{CapturedFileIdentity, WatchedProcess, capture_file_identity};
 use crate::launch::readiness::{FirmwareReadiness, LaunchReadiness};
 use crate::launch::xroar_command::{XRoarCommand, build_xroar_command_plan, xroar_media_format};
 use crate::patch_manager::{
@@ -25,6 +22,8 @@ pub struct XRoarLaunchRequest {
     pub profile_id: String,
     pub expected_executable: PathBuf,
     pub expected_content_identity: CapturedFileIdentity,
+    pub expected_content_md5: String,
+    pub expected_content_crc32: String,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -38,6 +37,7 @@ pub enum XRoarLaunchPreflightErrorKind {
     ExecutableBindingDrift,
     FirmwareUnavailable,
     CommandBlocked,
+    BoundAssetsUnavailable,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -50,6 +50,22 @@ pub struct XRoarLaunchPreflightError {
 pub enum XRoarLaunchExecutionError {
     Preflight(XRoarLaunchPreflightError),
     Spawn(std::io::Error),
+}
+
+/// An inspected command bound to sealed launch assets. There is deliberately
+/// no public constructor or path-only spawn fallback. The logical command is
+/// available for inspection but cannot mutate the prepared launch.
+#[derive(Debug)]
+pub struct PreparedXRoarLaunch {
+    command: XRoarCommand,
+    #[cfg(target_os = "linux")]
+    bound: super::xroar_bound_launch::BoundXRoarLaunch,
+}
+
+impl PreparedXRoarLaunch {
+    pub fn logical_command(&self) -> &XRoarCommand {
+        &self.command
+    }
 }
 
 fn error(
@@ -106,7 +122,7 @@ pub fn preflight_xroar_launch(
     request: &XRoarLaunchRequest,
     roots: &XRoarProfileDiscoveryRoots,
     identity: &CanonicalIdentityStatus,
-) -> Result<XRoarCommand, XRoarLaunchPreflightError> {
+) -> Result<PreparedXRoarLaunch, XRoarLaunchPreflightError> {
     let (_, current_identity) = direct_file(&request.selected_content_path)?;
     if current_identity != request.expected_content_identity {
         return Err(error(
@@ -187,16 +203,48 @@ pub fn preflight_xroar_launch(
                 .arguments
                 .push(directory.join(name).into_os_string());
         }
+    } else {
+        return Err(error(
+            XRoarLaunchPreflightErrorKind::FirmwareUnavailable,
+            "bound XRoar launch requires an explicit machine firmware directory",
+        ));
     }
-    Ok(command)
+    #[cfg(target_os = "linux")]
+    {
+        let game_key = match identity {
+            CanonicalIdentityStatus::Resolved(value) => value.game_key.as_str(),
+            _ => unreachable!("identity checked above"),
+        };
+        let bound =
+            super::xroar_bound_launch::BoundXRoarLaunch::prepare(&command, request, game_key)
+                .map_err(|e| {
+                    error(
+                        XRoarLaunchPreflightErrorKind::BoundAssetsUnavailable,
+                        e.to_string(),
+                    )
+                })?;
+        Ok(PreparedXRoarLaunch { command, bound })
+    }
+    #[cfg(not(target_os = "linux"))]
+    Err(error(
+        XRoarLaunchPreflightErrorKind::BoundAssetsUnavailable,
+        "descriptor-bound XRoar launch requires Linux; no pathname fallback is used",
+    ))
 }
 
-pub fn spawn_xroar(command: &XRoarCommand) -> std::io::Result<WatchedProcess> {
-    spawn_watched_process(&PreparedProcessCommand {
-        executable: command.executable.clone(),
-        arguments: command.arguments.clone(),
-        working_directory: command.working_directory.clone(),
-    })
+pub fn spawn_xroar(prepared: &PreparedXRoarLaunch) -> std::io::Result<WatchedProcess> {
+    #[cfg(target_os = "linux")]
+    {
+        prepared.bound.spawn()
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        let _ = prepared;
+        Err(std::io::Error::new(
+            std::io::ErrorKind::Unsupported,
+            "Linux bound launch unavailable",
+        ))
+    }
 }
 
 pub fn preflight_and_launch_xroar(
@@ -208,3 +256,7 @@ pub fn preflight_and_launch_xroar(
         .map_err(XRoarLaunchExecutionError::Preflight)?;
     spawn_xroar(&command).map_err(XRoarLaunchExecutionError::Spawn)
 }
+
+#[cfg(test)]
+#[path = "xroar_execution_tests.rs"]
+mod tests;

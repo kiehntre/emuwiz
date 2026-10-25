@@ -224,6 +224,8 @@ impl Request {
             profile_id: self.profile_id,
             expected_executable: self.expected_executable,
             expected_content_identity: fresh.file_identity,
+            expected_content_md5: fresh.md5.clone(),
+            expected_content_crc32: fresh.crc32.clone(),
         };
         preflight_and_launch_xroar(&request, roots, &fresh.identity_status()).map_err(|error| {
             match error {
@@ -292,6 +294,23 @@ mod tests {
         selected: XRoarMachine,
         firmware: XRoarFirmwareState,
     ) -> XRoarProfileDiscoveryRoots {
+        let firmware_directory = executable.map(|path| {
+            let directory = path.parent().unwrap().join("fixture-bios");
+            std::fs::create_dir_all(&directory).unwrap();
+            if firmware == XRoarFirmwareState::PresentUnverified {
+                for (name, size) in [
+                    ("d32.rom", 16384),
+                    ("d64_1.rom", 16384),
+                    ("d64_2.rom", 16384),
+                    ("bas13.rom", 8192),
+                    ("extbas11.rom", 8192),
+                    ("coco3.rom", 32768),
+                ] {
+                    std::fs::write(directory.join(name), vec![0u8; size]).unwrap();
+                }
+            }
+            directory
+        });
         XRoarProfileDiscoveryRoots {
             explicit_profiles: executable
                 .map(|path| {
@@ -304,7 +323,7 @@ mod tests {
                 .unwrap_or_default(),
             path_env: None,
             selected_machine: Some(selected),
-            firmware_directory: None,
+            firmware_directory,
             firmware,
         }
     }
@@ -676,6 +695,8 @@ mod tests {
             profile_id: request.profile_id.clone(),
             expected_executable: request.expected_executable.clone(),
             expected_content_identity: request.evidence.file_identity,
+            expected_content_md5: request.evidence.md5.clone(),
+            expected_content_crc32: request.evidence.crc32.clone(),
         };
         let command = archivefs_core::launch::preflight_xroar_launch(
             &native,
@@ -683,6 +704,7 @@ mod tests {
             &fixture.context.result.as_ref().unwrap().identity_status(),
         )
         .unwrap();
+        let command = command.logical_command();
         assert_eq!(command.arguments[0], "-no-c");
         assert!(
             command
