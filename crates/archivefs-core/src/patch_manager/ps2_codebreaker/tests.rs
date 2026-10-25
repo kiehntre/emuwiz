@@ -981,3 +981,36 @@ fn the_managed_id_depends_on_the_version() {
         managed_id(Ps2CodebreakerVersion::V7CommonKey, "abc")
     );
 }
+
+#[test]
+fn hook_acknowledgement_cannot_bypass_the_verified_game_identity() {
+    let version = Ps2CodebreakerVersion::V1ToV6;
+    // No verified CRC: an exact acknowledgement still produces nothing.
+    let unresolved = identity(Some("SLUS-20312"), None);
+    assert_eq!(
+        preview_ps2_codebreaker(HOOK_V1, version, "x", &unresolved, None, &[1]),
+        Err(Ps2CodebreakerError::IdentityUnresolved)
+    );
+    assert_eq!(
+        preview_ps2_codebreaker(HOOK_V1, version, "x", &unresolved, None, &[]),
+        Err(Ps2CodebreakerError::IdentityUnresolved)
+    );
+    // A declared game that disagrees with the verified one is refused too.
+    let id = verified();
+    let wrong = Ps2CodebreakerDeclaredGame {
+        serial: None,
+        crc: Some("DEADBEEF".to_string()),
+    };
+    assert!(matches!(
+        preview_ps2_codebreaker(HOOK_V1, version, "x", &id, Some(&wrong), &[1]),
+        Err(Ps2CodebreakerError::IdentityConflict { .. })
+    ));
+    // The accepted result is bound to the verified CRC.
+    let accepted = preview_ack(HOOK_V1, version, &[1]);
+    assert_eq!(accepted.provenance.bound_crc, "A1B2C3D4");
+    assert!(matches!(
+        accepted.outcome,
+        Ps2CodebreakerOutcome::Translatable { ref destination_file_name, .. }
+            if destination_file_name == "SLUS-20312_A1B2C3D4.pnach"
+    ));
+}
