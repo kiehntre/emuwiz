@@ -141,7 +141,6 @@ fn hash_cassette(path: &Path) -> Result<Hashes, DragonCocoRefusal> {
             "the cassette exceeds the 8 MiB verification limit",
         ));
     }
-    let mut bytes = Vec::new();
     // Never follow a link or block on a FIFO swapped in after the check above.
     let file = {
         use std::os::unix::fs::OpenOptionsExt;
@@ -151,17 +150,41 @@ fn hash_cassette(path: &Path) -> Result<Hashes, DragonCocoRefusal> {
             .open(path)
             .map_err(unreadable)?
     };
-    if !file.metadata().map_err(unreadable)?.is_file() {
+    hash_opened_cassette(path, before, file)
+}
+
+fn hash_opened_cassette(
+    path: &Path,
+    before: CapturedFileIdentity,
+    mut file: fs::File,
+) -> Result<Hashes, DragonCocoRefusal> {
+    let unreadable = |_| {
+        refuse(
+            DragonCocoRefusalKind::Unreadable,
+            "the cassette file could not be read",
+        )
+    };
+    let opened = file.metadata().map_err(unreadable)?;
+    if !opened.is_file() {
         return Err(refuse(
             DragonCocoRefusalKind::NotRegularFile,
             "the cassette is not a regular file (links and folders are refused)",
         ));
     }
-    file.take(MAX_CASSETTE_BYTES + 1)
+    if CapturedFileIdentity::capture(&opened) != before {
+        return Err(refuse(
+            DragonCocoRefusalKind::ChangedWhileReading,
+            "the cassette was replaced before it could be read",
+        ));
+    }
+    let mut bytes = Vec::new();
+    (&mut file)
+        .take(MAX_CASSETTE_BYTES + 1)
         .read_to_end(&mut bytes)
         .map_err(unreadable)?;
+    let read_identity = CapturedFileIdentity::capture(&file.metadata().map_err(unreadable)?);
     let (_, after) = capture_file_identity(path).map_err(unreadable)?;
-    if after != before || bytes.len() as u64 != before.size {
+    if read_identity != before || after != before || bytes.len() as u64 != before.size {
         return Err(refuse(
             DragonCocoRefusalKind::ChangedWhileReading,
             "the cassette changed while it was being read",
@@ -449,6 +472,29 @@ mod tests {
                 );
             }
         }
+    }
+
+    #[test]
+    fn a_transient_regular_file_substitution_cannot_supply_the_hashed_bytes() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = cassette(dir.path(), "selected.cas", b"AAAA");
+        let other = cassette(dir.path(), "other.cas", b"BBBB");
+        let (_, before) = capture_file_identity(&path).unwrap();
+        let parked = dir.path().join("parked.cas");
+        fs::rename(&path, &parked).unwrap();
+        fs::rename(&other, &path).unwrap();
+        let opened = fs::File::open(&path).unwrap();
+        fs::rename(&path, &other).unwrap();
+        fs::rename(&parked, &path).unwrap();
+        assert_eq!(capture_file_identity(&path).unwrap().1, before);
+        assert_eq!(
+            hash_opened_cassette(&path, before, opened)
+                .err()
+                .unwrap()
+                .kind,
+            DragonCocoRefusalKind::ChangedWhileReading
+        );
+        assert_eq!(fs::read(&path).unwrap(), b"AAAA");
     }
 
     #[test]

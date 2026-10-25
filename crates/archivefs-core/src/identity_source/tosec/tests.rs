@@ -563,3 +563,31 @@ fn representation_mismatch_is_not_implicitly_folded() {
         AgreementStatus::RepresentationConflict
     );
 }
+
+#[test]
+fn imported_artifact_digest_names_the_exact_parsed_snapshot() {
+    use sha2::{Digest, Sha256};
+    let dir = tempdir().unwrap();
+    let path = write_dat(dir.path(), "snapshot.dat", TOSEC_LOGIQX);
+    let source = import_tosec_dat(&path).unwrap();
+    assert_eq!(
+        source.artifact_sha256,
+        format!("{:x}", Sha256::digest(TOSEC_LOGIQX.as_bytes()))
+    );
+    assert_eq!(source.dat.source.file_path, path.to_string_lossy());
+    assert_eq!(source.system_name, "TOSEC - ZX Spectrum - Games - TZX");
+}
+
+#[cfg(unix)]
+#[test]
+fn tosec_import_refuses_fifo_without_waiting_for_a_writer() {
+    let dir = tempdir().unwrap();
+    let path = dir.path().join("source.dat");
+    let cpath = std::ffi::CString::new(path.as_os_str().as_encoded_bytes()).unwrap();
+    assert_eq!(unsafe { libc::mkfifo(cpath.as_ptr(), 0o600) }, 0);
+    let (tx, rx) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        let _ = tx.send(import_tosec_dat(&path).is_err());
+    });
+    assert!(rx.recv_timeout(std::time::Duration::from_secs(2)).unwrap());
+}

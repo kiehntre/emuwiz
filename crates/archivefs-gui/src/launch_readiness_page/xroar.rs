@@ -63,13 +63,21 @@ pub(crate) fn load_registered_tosec_sources() -> RegisteredCatalogues {
     let Ok(config) = archivefs_core::dat::sources::load_dat_sources_config_default() else {
         return RegisteredCatalogues::default();
     };
-    let (registry, _) = archivefs_core::dat::sources::DatSourceRegistry::from_config(&config);
-    consult_catalogues(
+    catalogues_from_config(&config)
+}
+
+fn catalogues_from_config(
+    config: &archivefs_core::dat::sources::DatSourcesConfig,
+) -> RegisteredCatalogues {
+    let (registry, problems) = archivefs_core::dat::sources::DatSourceRegistry::from_config(config);
+    let mut catalogues = consult_catalogues(
         registry
             .sorted_enabled()
             .into_iter()
             .map(|entry| (entry.path.as_path(), entry.kind)),
-    )
+    );
+    catalogues.unconsulted.extend(problems);
+    catalogues
 }
 
 fn verify_against(
@@ -697,6 +705,49 @@ mod tests {
             assert_eq!(
                 result.unwrap_err().kind,
                 DragonCocoRefusalKind::CatalogueIncomplete
+            );
+        }
+    }
+
+    #[test]
+    fn dropped_registry_entries_cannot_hide_a_foreign_collision() {
+        use archivefs_core::dat::sources::{DatSourceEntry, DatSourceKind, DatSourceRegistry};
+        let fixture = fixture();
+        let dir = tempfile::tempdir().unwrap();
+        let foreign = dat(dir.path(), "MSX MSX - Games - [CAS]", TAPE);
+        let mut registry = DatSourceRegistry::new();
+        registry
+            .add(DatSourceEntry::new(
+                "one".into(),
+                "Dragon".into(),
+                fixture.sources[0].artifact_path.clone(),
+                DatSourceKind::File,
+            ))
+            .unwrap();
+        registry
+            .add(DatSourceEntry::new(
+                "two".into(),
+                "MSX".into(),
+                foreign.artifact_path.clone(),
+                DatSourceKind::File,
+            ))
+            .unwrap();
+        for bad_id in ["one", "../escape"] {
+            let mut config = registry.to_config();
+            config.sources.as_mut().unwrap()[1].id = bad_id.into();
+            let loaded = catalogues_from_config(&config);
+            assert!(!loaded.unconsulted.is_empty());
+            assert_eq!(
+                Context::inspect_with(fixture.tape.clone(), &loaded)
+                    .result
+                    .unwrap_err()
+                    .kind,
+                DragonCocoRefusalKind::CatalogueIncomplete
+            );
+            assert!(
+                request_for(&fixture)
+                    .execute_with(&loaded, &fixture.roots)
+                    .is_err()
             );
         }
     }
