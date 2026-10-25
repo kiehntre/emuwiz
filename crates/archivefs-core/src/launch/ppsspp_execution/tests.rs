@@ -107,24 +107,72 @@ fn directory_record(name: &[u8], extent: u32, size: u32, directory: bool) -> Vec
 /// mirrors `game_identity`'s own private `psp_sfo` test helper exactly,
 /// since that helper is not itself exported.
 fn psp_sfo(disc_id: &[u8]) -> Vec<u8> {
-    let mut value = disc_id.to_vec();
-    value.push(0);
-    let key = b"DISC_ID\0";
-    let key_start = 20 + 16;
-    let data_start = key_start + 8;
-    let mut out = vec![0_u8; data_start];
+    let entries = [
+        ("DISC_ID", disc_id.to_vec(), 0x0204_u16),
+        ("CATEGORY", b"MG\0".to_vec(), 0x0204_u16),
+        ("BOOTABLE", 1_i32.to_le_bytes().to_vec(), 0x0404_u16),
+    ];
+    let key_start = 20 + entries.len() * 16;
+    let mut keys = Vec::new();
+    let mut data = Vec::new();
+    let mut indices = Vec::new();
+    for (key, value, format) in entries {
+        let key_offset = keys.len() as u16;
+        keys.extend_from_slice(key.as_bytes());
+        keys.push(0);
+        indices.push((key_offset, format, value.len() as u32, data.len() as u32));
+        data.extend_from_slice(&value);
+    }
+    let data_start = key_start + keys.len();
+    let mut out = vec![0_u8; key_start];
     out[0..4].copy_from_slice(crate::param_sfo::SFO_MAGIC);
     out[4..8].copy_from_slice(&0x0101_u32.to_le_bytes());
     out[8..12].copy_from_slice(&(key_start as u32).to_le_bytes());
     out[12..16].copy_from_slice(&(data_start as u32).to_le_bytes());
-    out[16..20].copy_from_slice(&1_u32.to_le_bytes());
-    out[20..22].copy_from_slice(&0_u16.to_le_bytes());
-    out[22..24].copy_from_slice(&0x0204_u16.to_le_bytes());
-    out[24..28].copy_from_slice(&(value.len() as u32).to_le_bytes());
-    out[28..32].copy_from_slice(&(value.len() as u32).to_le_bytes());
-    out[32..36].copy_from_slice(&0_u32.to_le_bytes());
-    out[key_start..key_start + key.len()].copy_from_slice(key);
-    out.extend_from_slice(&value);
+    out[16..20].copy_from_slice(&(indices.len() as u32).to_le_bytes());
+    for (index, (key_offset, format, len, data_offset)) in indices.iter().enumerate() {
+        let start = 20 + index * 16;
+        out[start..start + 2].copy_from_slice(&key_offset.to_le_bytes());
+        out[start + 2..start + 4].copy_from_slice(&format.to_le_bytes());
+        out[start + 4..start + 8].copy_from_slice(&len.to_le_bytes());
+        out[start + 8..start + 12].copy_from_slice(&len.to_le_bytes());
+        out[start + 12..start + 16].copy_from_slice(&data_offset.to_le_bytes());
+    }
+    out.extend_from_slice(&keys);
+    out.extend_from_slice(&data);
+    out
+}
+
+fn psp_pbp_bytes(disc_id: &[u8]) -> Vec<u8> {
+    let sfo = psp_sfo(disc_id);
+    let prx = {
+        const HEADER: usize = 0x150;
+        const PAYLOAD: usize = 16;
+        let mut prx = vec![0_u8; HEADER + PAYLOAD];
+        prx[..4].copy_from_slice(b"~PSP");
+        prx[0x27] = 1;
+        prx[0x28..0x2c].copy_from_slice(&(PAYLOAD as u32).to_le_bytes());
+        let psp_size = prx.len() as u32;
+        prx[0x2c..0x30].copy_from_slice(&psp_size.to_le_bytes());
+        prx[0x30..0x34].copy_from_slice(&0x0880_0000_u32.to_le_bytes());
+        prx[0x44..0x48].copy_from_slice(&0x0880_0000_u32.to_le_bytes());
+        prx[0x54..0x58].copy_from_slice(&(PAYLOAD as i32).to_le_bytes());
+        prx[0xb0..0xb4].copy_from_slice(&(PAYLOAD as i32).to_le_bytes());
+        prx
+    };
+    let sfo_start = crate::psp_pbp_evidence::PBP_HEADER_BYTES as u32;
+    let data_start = sfo_start + sfo.len() as u32;
+    let mut out = vec![0_u8; crate::psp_pbp_evidence::PBP_HEADER_BYTES];
+    out[..4].copy_from_slice(crate::psp_pbp_evidence::PBP_MAGIC);
+    out[4..8].copy_from_slice(&0x0001_0000_u32.to_le_bytes());
+    let mut offsets = [data_start; crate::psp_pbp_evidence::PBP_SECTION_COUNT];
+    offsets[crate::psp_pbp_evidence::PBP_SECTION_PARAM_SFO] = sfo_start;
+    offsets[crate::psp_pbp_evidence::PBP_SECTION_DATA_PSAR] = data_start + prx.len() as u32;
+    for (index, offset) in offsets.iter().enumerate() {
+        out[8 + index * 4..12 + index * 4].copy_from_slice(&offset.to_le_bytes());
+    }
+    out.extend_from_slice(&sfo);
+    out.extend_from_slice(&prx);
     out
 }
 
@@ -217,6 +265,7 @@ fn build_ready_fixture(label: &str) -> ReadyFixture {
         expected_platform_id: "PSP".to_string(),
         expected_game_key: PSP_DISC_ID.to_string(),
         expected_psp_disc_id: PSP_DISC_ID.to_string(),
+        expected_standalone_pbp_sha256: None,
         profile_id,
         expected_executable: executable,
         expected_installation: crate::launch::installation::LaunchInstallation::Native,
@@ -283,10 +332,9 @@ fn symlink_content_is_rejected() {
 
 #[test]
 fn unsupported_psp_container_remains_refused() {
-    // CSO/CHD/PBP-style extensions must never be accepted - only a direct
-    // `.iso` is supported in this phase.
+    // CSO/CHD and malformed PBP-looking content must never be accepted.
     let ready = build_ready_fixture("unsupported-format");
-    for extension in ["cso", "chd", "pbp"] {
+    for extension in ["cso", "chd"] {
         let path = ready.fixture.write(
             &format!("games/game.{extension}"),
             &psp_iso_bytes(PSP_DISC_ID.as_bytes()),
@@ -300,6 +348,41 @@ fn unsupported_psp_container_remains_refused() {
             "extension .{extension} must be refused"
         );
     }
+    let path = ready.fixture.write(
+        "games/malformed.pbp",
+        &psp_iso_bytes(PSP_DISC_ID.as_bytes()),
+    );
+    let mut request = ready.request.clone();
+    request.selected_content_path = path;
+    let error = preflight_ppsspp_launch(&request, &ready.roots).unwrap_err();
+    assert_eq!(error.kind, PpssppLaunchPreflightErrorKind::IdentityMismatch);
+}
+
+#[test]
+fn positively_classified_pbp_launches_and_digest_drift_is_refused() {
+    use sha2::{Digest, Sha256};
+
+    let mut ready = build_ready_fixture("pbp-launch");
+    let pbp = psp_pbp_bytes(PSP_DISC_ID.as_bytes());
+    let digest = Sha256::digest(&pbp)
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect::<String>();
+    let path = ready.fixture.write("games/EBOOT.PBP", &pbp);
+    ready.request.selected_content_path = path.clone();
+    ready.request.expected_standalone_pbp_sha256 = Some(digest);
+
+    let command = preflight_ppsspp_launch(&ready.request, &ready.roots)
+        .expect("the proven standalone PBP subset should use the existing PPSSPP plan");
+    assert_eq!(command.arguments, vec![OsString::from(path.clone())]);
+
+    let mut stale = pbp;
+    let last = stale.len();
+    stale[last - 4..].copy_from_slice(b"NOPE");
+    fs::write(&path, stale).unwrap();
+    let error = preflight_ppsspp_launch(&ready.request, &ready.roots).unwrap_err();
+    assert_eq!(error.kind, PpssppLaunchPreflightErrorKind::IdentityMismatch);
+    assert!(error.detail.contains("PBP executable classification"));
 }
 
 #[test]
@@ -649,6 +732,7 @@ fn build_explicit_appimage_fixture(label: &str) -> ExplicitAppImageFixture {
         expected_platform_id: "PSP".to_string(),
         expected_game_key: PSP_DISC_ID.to_string(),
         expected_psp_disc_id: PSP_DISC_ID.to_string(),
+        expected_standalone_pbp_sha256: None,
         profile_id,
         expected_executable: appimage.clone(),
         expected_installation: crate::launch::installation::LaunchInstallation::AppImage {

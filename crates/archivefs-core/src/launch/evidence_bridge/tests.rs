@@ -161,6 +161,47 @@ fn verified_psp_disc_id_resolves_to_ppsspp_fact() {
 }
 
 #[test]
+fn standalone_pbp_digest_projects_only_when_unique_and_exact() {
+    let mut source = report(
+        IdentityPlatform::Psp,
+        vec![
+            evidence(
+                IdentityKind::PspDiscId,
+                IdentityStatus::Verified,
+                Some("ULUS10000"),
+                IdentityConfidence::StructuredMetadata,
+            ),
+            evidence(
+                IdentityKind::PspStandalonePbp,
+                IdentityStatus::Verified,
+                Some(&"a".repeat(64)),
+                IdentityConfidence::ExactBytes,
+            ),
+        ],
+    );
+    source.format = IdentityImageFormat::Pbp;
+    let (_, facts) = canonical_identity_from_game_report(&source);
+    assert!(
+        facts.contains(&VerifiedIdentityFact::PspStandalonePbpSha256(
+            "a".repeat(64)
+        ))
+    );
+
+    source.evidence.push(evidence(
+        IdentityKind::PspStandalonePbp,
+        IdentityStatus::Verified,
+        Some(&"b".repeat(64)),
+        IdentityConfidence::ExactBytes,
+    ));
+    let (_, facts) = canonical_identity_from_game_report(&source);
+    assert!(
+        !facts
+            .iter()
+            .any(|fact| matches!(fact, VerifiedIdentityFact::PspStandalonePbpSha256(_)))
+    );
+}
+
+#[test]
 fn verified_ps3_title_id_resolves_to_rpcs3_fact() {
     let source = report(
         IdentityPlatform::PlayStation3,

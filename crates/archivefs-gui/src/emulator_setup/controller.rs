@@ -1855,6 +1855,10 @@ impl ArchiveFsApp {
                             }
                             _ => None,
                         }),
+                        verified_standalone_pbp_sha256: verified_facts.iter().find_map(|fact| match fact {
+                            archivefs_core::launch::VerifiedIdentityFact::PspStandalonePbpSha256(hash) => Some(hash.clone()),
+                            _ => None,
+                        }),
                     }
                 });
         let rpcs3_context =

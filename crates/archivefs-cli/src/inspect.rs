@@ -305,6 +305,7 @@ fn category(kind: IdentityKind) -> &'static str {
         | N64CrcValidation
         | PceCdBootStructure
         | NeoGeoCdBootStructure
+        | PspStandalonePbp
         | NesHeader
         | SnesHeader
         | TapeFormat

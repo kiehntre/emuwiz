@@ -173,6 +173,10 @@ const MAX_XEX_OPT_HEADERS: u32 = 512;
 /// parsing. Real Xenia headers are a few KiB; this is generous enough for
 /// any legitimate header while remaining a small, fixed, safe read.
 const XEX_HEADER_PREFIX_BYTES: u64 = 16 * 1024;
+/// `PSP_Header` from PPSSPP's `Core/ELF/PrxDecrypter.h` is exactly 0x150
+/// bytes. A `~PSP` marker without this fixed PRX structure is not executable
+/// evidence.
+const PSP_PRX_HEADER_BYTES: usize = 0x150;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -213,6 +217,9 @@ pub enum IdentityKind {
     Ps1Serial,
     Ps2Serial,
     PspDiscId,
+    /// SHA-256 of a positively classified standalone PSP executable PBP.
+    /// Runnable-container evidence only; it never contributes to game identity.
+    PspStandalonePbp,
     Ps3TitleId,
     /// A verified PlayStation 4 title ID in the `CUSA` application-ID
     /// family, read from a bounded `sce_sys/param.sfo` in an extracted PS4
@@ -307,6 +314,7 @@ impl fmt::Display for IdentityKind {
             Self::Ps1Serial => "PS1 serial",
             Self::Ps2Serial => "PS2 serial",
             Self::PspDiscId => "PSP disc ID",
+            Self::PspStandalonePbp => "PSP standalone executable PBP",
             Self::Ps3TitleId => "PS3 title ID",
             Self::Ps4TitleId => "PS4 title ID",
             Self::Ps4ContentId => "PS4 Content ID",
@@ -3759,13 +3767,119 @@ fn inspect_pbp(report: &mut GameIdentityReport, trusted: &TrustedRoots) {
             report,
             IdentityKind::PspDiscId,
             IdentityStatus::Verified,
-            Some(id),
+            Some(id.clone()),
             IdentityConfidence::StructuredMetadata,
             None,
             None,
             "PBP fixed header plus PARAM.SFO DISC_ID",
             "verified from a structurally valid PBP container",
         );
+        // PPSSPP's generic PBP path is broader than the launch subset we can
+        // safely prove. Admit only bounded, complete `MG` standalone apps
+        // with a bootable SFO, an executable DATA.PSP signature and no PSAR.
+        // Hash all bytes so readiness can bind the exact inspected file.
+        let classified = (|| {
+            if file_len != bytes.len() as u64 || file_len > MAX_BYTES_READ {
+                return None;
+            }
+            if header.version != 0x0001_0000 {
+                return None;
+            }
+            let sfo = sfo.as_ref()?;
+            let unique_text = |key: &str| {
+                let mut entries = sfo.entries.iter().filter(|entry| entry.key == key);
+                let first = entries.next()?;
+                if entries.next().is_some() {
+                    return None;
+                }
+                match &first.value {
+                    crate::param_sfo::SfoValue::Text(value) => Some(value.as_str()),
+                    _ => None,
+                }
+            };
+            if unique_text("DISC_ID")? != id
+                || unique_text("CATEGORY")? != "MG"
+                || sfo.entries.iter().any(|entry| entry.key == "UPDATER_VER")
+            {
+                return None;
+            }
+            let mut bootable_entries = sfo.entries.iter().filter(|entry| entry.key == "BOOTABLE");
+            let bootable = bootable_entries.next()?;
+            if bootable.value != crate::param_sfo::SfoValue::Int32(1)
+                || bootable_entries.next().is_some()
+            {
+                return None;
+            }
+            let data_start =
+                header.section_offsets[crate::psp_pbp_evidence::PBP_SECTION_DATA_PSP] as usize;
+            let psar_start =
+                header.section_offsets[crate::psp_pbp_evidence::PBP_SECTION_DATA_PSAR] as usize;
+            if psar_start != bytes.len() || data_start >= psar_start {
+                return None;
+            }
+            let executable = bytes.get(data_start..psar_start)?;
+            let tag = executable
+                .get(0xd0..0xd4)
+                .and_then(|bytes| bytes.try_into().ok())
+                .map(u32::from_le_bytes);
+            if matches!(tag, Some(0x0b00_0000 | 0x0e00_0000)) {
+                return None;
+            }
+            if !valid_standalone_psp_prx(executable) {
+                return None;
+            }
+            let digest = Sha256::digest(&bytes);
+            Some(
+                digest
+                    .iter()
+                    .map(|byte| format!("{byte:02x}"))
+                    .collect::<String>(),
+            )
+        })();
+        if let Some(digest) = classified {
+            push_with_source(
+                report,
+                IdentityKind::PspStandalonePbp,
+                IdentityStatus::Verified,
+                Some(digest),
+                IdentityConfidence::ExactBytes,
+                None,
+                None,
+                "validated PBP/SFO standalone executable structure and full-file SHA-256",
+                "supported standalone PSP executable PBP",
+            );
+        } else {
+            let category = sfo.as_ref().and_then(|sfo| sfo.get_text("CATEGORY"));
+            let has_update_key = sfo
+                .as_ref()
+                .is_some_and(|sfo| sfo.entries.iter().any(|entry| entry.key == "UPDATER_VER"));
+            let data_start =
+                header.section_offsets[crate::psp_pbp_evidence::PBP_SECTION_DATA_PSP] as usize;
+            let update_prx_tag = bytes
+                .get(data_start + 0xd0..data_start + 0xd4)
+                .and_then(|bytes| bytes.try_into().ok())
+                .map(u32::from_le_bytes)
+                .is_some_and(|tag| matches!(tag, 0x0b00_0000 | 0x0e00_0000));
+            let psar_start =
+                header.section_offsets[crate::psp_pbp_evidence::PBP_SECTION_DATA_PSAR] as usize;
+            let psar = bytes.get(psar_start..).unwrap_or_default();
+            let ps1_psar = psar.starts_with(b"PSISOIMG0000");
+            let update_psar = psar.starts_with(b"MUPN");
+            let detail = if category == Some("ME") {
+                "PBP identified as the PS1 Classics category; PPSSPP standalone PSP launch refuses it"
+            } else if ps1_psar {
+                "PBP DATA.PSAR has the PS1 Classics PSISOIMG container marker; launch is refused"
+            } else if has_update_key || update_prx_tag || update_psar {
+                "PBP contains updater metadata; update packages are not runnable PSP games"
+            } else if category.is_some_and(|category| category != "MG") {
+                "PBP category is not the supported standalone PSP homebrew/demo category MG"
+            } else if file_len > MAX_BYTES_READ {
+                "PBP exceeds the complete-file identity bound and cannot be admitted for launch"
+            } else {
+                "PBP is not proven to be a bootable standalone PSP executable (requires valid MG SFO, BOOTABLE=1, ~PSP DATA.PSP and empty DATA.PSAR)"
+            };
+            report.warnings.push(detail.to_string());
+        }
         report.complete = true;
     } else {
         add_unavailable(
@@ -3774,6 +3888,60 @@ fn inspect_pbp(report: &mut GameIdentityReport, trusted: &TrustedRoots) {
             "PBP structure is shared with PS1 Classics; no PS1 serial is manufactured from PSAR markers",
         );
     }
+}
+
+/// Validates the fixed encrypted PRX header and its declared lengths without
+/// decrypting or modifying the payload. PPSSPP's loader requires the full
+/// 0x150-byte `PSP_Header`; the file-size fields and segment table must also
+/// describe a bounded non-empty executable within DATA.PSP.
+fn valid_standalone_psp_prx(data: &[u8]) -> bool {
+    fn u32le(data: &[u8], offset: usize) -> Option<u32> {
+        Some(u32::from_le_bytes(
+            data.get(offset..offset + 4)?.try_into().ok()?,
+        ))
+    }
+    fn i32le(data: &[u8], offset: usize) -> Option<i32> {
+        Some(i32::from_le_bytes(
+            data.get(offset..offset + 4)?.try_into().ok()?,
+        ))
+    }
+
+    if data.len() < PSP_PRX_HEADER_BYTES || data.get(..4) != Some(b"~PSP") {
+        return false;
+    }
+    let elf_size = u32le(data, 0x28).unwrap_or(0) as usize;
+    let psp_size = u32le(data, 0x2c).unwrap_or(0) as usize;
+    let entry = u32le(data, 0x30).unwrap_or(0);
+    let segment_count = data[0x27] as usize;
+    let compressed_size = i32le(data, 0xb0).unwrap_or(0);
+    if psp_size != data.len()
+        || elf_size == 0
+        || elf_size > MAX_BYTES_READ as usize
+        || entry == 0
+        || !(1..=4).contains(&segment_count)
+        || compressed_size <= 0
+        || compressed_size as usize != data.len() - PSP_PRX_HEADER_BYTES
+    {
+        return false;
+    }
+    let mut total_segment_bytes = 0usize;
+    let mut entry_in_segment = false;
+    for index in 0..segment_count {
+        let address = u32le(data, 0x44 + index * 4).unwrap_or(0);
+        let size = i32le(data, 0x54 + index * 4).unwrap_or(0);
+        let Some(segment_end) = address.checked_add(size.max(0) as u32) else {
+            return false;
+        };
+        if size <= 0 {
+            return false;
+        }
+        entry_in_segment |= entry >= address && entry < segment_end;
+        let Some(total) = total_segment_bytes.checked_add(size as usize) else {
+            return false;
+        };
+        total_segment_bytes = total;
+    }
+    entry_in_segment && total_segment_bytes <= elf_size
 }
 
 fn inspect_iso_source(
@@ -7839,19 +8007,76 @@ mod tests {
         iso
     }
 
+    fn psp_standalone_sfo(disc_id: &[u8]) -> Vec<u8> {
+        let entries = [
+            ("DISC_ID", disc_id.to_vec(), 0x0204_u16),
+            ("CATEGORY", b"MG\0".to_vec(), 0x0204_u16),
+            ("BOOTABLE", 1_i32.to_le_bytes().to_vec(), 0x0404_u16),
+        ];
+        let key_start = 20 + entries.len() * 16;
+        let mut keys = Vec::new();
+        let mut data = Vec::new();
+        let mut indices = Vec::new();
+        for (key, value, format) in entries {
+            let key_offset = keys.len() as u16;
+            keys.extend_from_slice(key.as_bytes());
+            keys.push(0);
+            indices.push((key_offset, format, value.len() as u32, data.len() as u32));
+            data.extend_from_slice(&value);
+        }
+        let data_start = key_start + keys.len();
+        let mut sfo = vec![0_u8; key_start];
+        sfo[..4].copy_from_slice(crate::param_sfo::SFO_MAGIC);
+        sfo[4..8].copy_from_slice(&0x0101_u32.to_le_bytes());
+        sfo[8..12].copy_from_slice(&(key_start as u32).to_le_bytes());
+        sfo[12..16].copy_from_slice(&(data_start as u32).to_le_bytes());
+        sfo[16..20].copy_from_slice(&(indices.len() as u32).to_le_bytes());
+        for (index, (key_offset, format, len, data_offset)) in indices.iter().enumerate() {
+            let start = 20 + index * 16;
+            sfo[start..start + 2].copy_from_slice(&key_offset.to_le_bytes());
+            sfo[start + 2..start + 4].copy_from_slice(&format.to_le_bytes());
+            sfo[start + 4..start + 8].copy_from_slice(&len.to_le_bytes());
+            sfo[start + 8..start + 12].copy_from_slice(&len.to_le_bytes());
+            sfo[start + 12..start + 16].copy_from_slice(&data_offset.to_le_bytes());
+        }
+        sfo.extend_from_slice(&keys);
+        sfo.extend_from_slice(&data);
+        sfo
+    }
+
     fn psp_pbp(disc_id: &[u8]) -> Vec<u8> {
-        let sfo = psp_sfo(disc_id);
+        let sfo = psp_standalone_sfo(disc_id);
         let sfo_start = crate::psp_pbp_evidence::PBP_HEADER_BYTES as u32;
         let sfo_end = sfo_start + sfo.len() as u32;
+        let prx = standalone_prx_fixture();
         let mut offsets = [sfo_end; crate::psp_pbp_evidence::PBP_SECTION_COUNT];
         offsets[crate::psp_pbp_evidence::PBP_SECTION_PARAM_SFO] = sfo_start;
+        offsets[crate::psp_pbp_evidence::PBP_SECTION_DATA_PSAR] = sfo_end + prx.len() as u32;
         let mut out = vec![0_u8; crate::psp_pbp_evidence::PBP_HEADER_BYTES];
         out[..4].copy_from_slice(crate::psp_pbp_evidence::PBP_MAGIC);
+        out[4..8].copy_from_slice(&0x0001_0000_u32.to_le_bytes());
         for (index, offset) in offsets.iter().enumerate() {
             out[8 + index * 4..12 + index * 4].copy_from_slice(&offset.to_le_bytes());
         }
         out.extend_from_slice(&sfo);
+        out.extend_from_slice(&prx);
         out
+    }
+
+    fn standalone_prx_fixture() -> Vec<u8> {
+        const HEADER: usize = 0x150;
+        const PAYLOAD: usize = 16;
+        let mut prx = vec![0_u8; HEADER + PAYLOAD];
+        let psp_size = prx.len() as u32;
+        prx[..4].copy_from_slice(b"~PSP");
+        prx[0x27] = 1;
+        prx[0x28..0x2c].copy_from_slice(&(PAYLOAD as u32).to_le_bytes());
+        prx[0x2c..0x30].copy_from_slice(&psp_size.to_le_bytes());
+        prx[0x30..0x34].copy_from_slice(&0x0880_0000_u32.to_le_bytes());
+        prx[0x44..0x48].copy_from_slice(&0x0880_0000_u32.to_le_bytes());
+        prx[0x54..0x58].copy_from_slice(&(PAYLOAD as i32).to_le_bytes());
+        prx[0xb0..0xb4].copy_from_slice(&(PAYLOAD as i32).to_le_bytes());
+        prx
     }
 
     fn saturn_iso(product_number: &[u8]) -> Vec<u8> {
@@ -8764,7 +8989,13 @@ mod tests {
         );
         let report = inspect_game_identity(&path, Some("PSP"));
         assert_eq!(report.platform, IdentityPlatform::Psp);
-        assert_eq!(report.verified_psp_disc_id(), Some("ULUS10000"));
+        assert_eq!(
+            report.verified_psp_disc_id(),
+            Some("ULUS10000"),
+            "evidence={:?}; warnings={:?}",
+            report.evidence,
+            report.warnings
+        );
         let (status, facts) =
             crate::launch::evidence_bridge::canonical_identity_from_game_report(&report);
         assert!(matches!(
@@ -8820,11 +9051,89 @@ mod tests {
         let report = inspect_game_identity(&path, Some("PSP"));
         assert_eq!(report.format, IdentityImageFormat::Pbp);
         assert_eq!(report.verified_psp_disc_id(), Some("ULUS10000"));
+        assert!(
+            report
+                .verified_value(IdentityKind::PspStandalonePbp)
+                .is_some()
+        );
         assert!(report.complete);
 
         let ps1 = inspect_game_identity(&path, Some("PS1"));
         assert_eq!(ps1.format, IdentityImageFormat::Pbp);
         assert_eq!(ps1.verified_ps1_serial(), None);
+    }
+
+    #[test]
+    fn pbp_requires_executable_evidence_and_rejects_ps1_category() {
+        let directory = FixtureDir::new("psp-pbp-classification");
+        let mut invalid_executable = psp_pbp(b"ULUS10000");
+        let data_start =
+            u32::from_le_bytes(invalid_executable[32..36].try_into().unwrap()) as usize;
+        invalid_executable[data_start + 0x2c..data_start + 0x30]
+            .copy_from_slice(&0x100_u32.to_le_bytes());
+        let path = write_fixture(&directory, "bad-executable.pbp", &invalid_executable);
+        let report = inspect_game_identity(&path, Some("PSP"));
+        assert_eq!(report.verified_psp_disc_id(), Some("ULUS10000"));
+        assert_eq!(report.verified_value(IdentityKind::PspStandalonePbp), None);
+
+        let mut out_of_range_entry = psp_pbp(b"ULUS10000");
+        let data_start =
+            u32::from_le_bytes(out_of_range_entry[32..36].try_into().unwrap()) as usize;
+        out_of_range_entry[data_start + 0x30..data_start + 0x34]
+            .copy_from_slice(&0x0900_0000_u32.to_le_bytes());
+        let path = write_fixture(
+            &directory,
+            "entry-outside-segments.pbp",
+            &out_of_range_entry,
+        );
+        let report = inspect_game_identity(&path, Some("PSP"));
+        assert_eq!(report.verified_value(IdentityKind::PspStandalonePbp), None);
+
+        let mut truncated = psp_pbp(b"ULUS10000");
+        let data_start = u32::from_le_bytes(truncated[32..36].try_into().unwrap()) as usize;
+        truncated.truncate(data_start + 4);
+        let truncated_len = truncated.len() as u32;
+        truncated[36..40].copy_from_slice(&truncated_len.to_le_bytes());
+        let path = write_fixture(&directory, "truncated-prx.pbp", &truncated);
+        let report = inspect_game_identity(&path, Some("PSP"));
+        assert_eq!(report.verified_psp_disc_id(), Some("ULUS10000"));
+        assert_eq!(report.verified_value(IdentityKind::PspStandalonePbp), None);
+
+        // A `ME` category is the PS1 Classic family even when its SFO also
+        // carries a syntactically valid-looking DISC_ID and DATA.PSP bytes.
+        let mut ps1_classic = psp_pbp(b"ULUS10000");
+        let sfo_start = crate::psp_pbp_evidence::PBP_HEADER_BYTES;
+        let sfo_end = u32::from_le_bytes(ps1_classic[12..16].try_into().unwrap()) as usize;
+        let sfo = crate::param_sfo::parse_param_sfo(&ps1_classic[sfo_start..sfo_end]).unwrap();
+        let category = sfo
+            .entries
+            .iter()
+            .find(|entry| entry.key == "CATEGORY")
+            .unwrap();
+        // Replace MG with ME within the SFO's raw declared text value.
+        let _ = category;
+        let category_pos = ps1_classic
+            .windows(2)
+            .position(|window| window == b"MG")
+            .unwrap();
+        ps1_classic[category_pos..category_pos + 2].copy_from_slice(b"ME");
+        let path = write_fixture(&directory, "ps1-classic.pbp", &ps1_classic);
+        let report = inspect_game_identity(&path, Some("PSP"));
+        assert_eq!(report.verified_value(IdentityKind::PspStandalonePbp), None);
+
+        let mut updater = psp_pbp(b"ULUS10000");
+        let data_start = u32::from_le_bytes(updater[32..36].try_into().unwrap()) as usize;
+        updater[data_start + 0xd0..data_start + 0xd4]
+            .copy_from_slice(&0x0b00_0000_u32.to_le_bytes());
+        let path = write_fixture(&directory, "updater.pbp", &updater);
+        let report = inspect_game_identity(&path, Some("PSP"));
+        assert_eq!(report.verified_value(IdentityKind::PspStandalonePbp), None);
+        assert!(
+            report
+                .warnings
+                .iter()
+                .any(|warning| warning.contains("updater metadata"))
+        );
     }
 
     #[test]
