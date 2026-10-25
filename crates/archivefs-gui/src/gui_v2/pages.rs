@@ -3071,28 +3071,39 @@ impl App {
             // The first screenshot is shown straight away; the rest load
             // only when asked for, keeping a game visit to two pictures.
             let shown = if self.screenshots { count } else { 1 };
-            ui.horizontal_wrapped(|ui| {
-                for ordinal in 0..shown {
-                    ui.vertical(|ui| {
-                        self.picture(
-                            ui,
-                            game,
-                            Kind::Screenshot(ordinal),
-                            egui::vec2(320.0, 240.0),
-                        );
-                        let key = self.artwork.key(id, Kind::Screenshot(ordinal));
-                        if matches!(
-                            self.artwork.pictures.get(&key),
-                            Some(Picture::Failed(_) | Picture::Unavailable { .. })
-                        ) && ui
-                            .button(format!("Retry screenshot {}", ordinal + 1))
-                            .clicked()
-                        {
-                            self.artwork.retry(key);
+            let gap = ui.spacing().item_spacing.x;
+            let columns = ((ui.available_width() + gap) / (320.0 + gap))
+                .floor()
+                .max(1.0) as usize;
+            egui::Grid::new(("v2_detail_screenshot_gallery", id))
+                .num_columns(columns)
+                .spacing(egui::vec2(gap, theme::SPACE_SM))
+                .show(ui, |ui| {
+                    for ordinal in 0..shown {
+                        ui.vertical(|ui| {
+                            ui.set_width(320.0);
+                            self.picture(
+                                ui,
+                                game,
+                                Kind::Screenshot(ordinal),
+                                egui::vec2(320.0, 240.0),
+                            );
+                            let key = self.artwork.key(id, Kind::Screenshot(ordinal));
+                            if matches!(
+                                self.artwork.pictures.get(&key),
+                                Some(Picture::Failed(_) | Picture::Unavailable { .. })
+                            ) && ui
+                                .button(format!("Retry screenshot {}", ordinal + 1))
+                                .clicked()
+                            {
+                                self.artwork.retry(key);
+                            }
+                        });
+                        if (ordinal + 1) % columns == 0 {
+                            ui.end_row();
                         }
-                    });
-                }
-            });
+                    }
+                });
             if !self.screenshots
                 && count > 1
                 && ui

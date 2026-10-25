@@ -242,3 +242,87 @@ fn job36_numbered_image_never_overrides_an_exact_sibling_title() {
     assert!(!first.game.media.iter().any(|media| media.path == image));
     assert!(second.game.media.iter().any(|media| media.path == image));
 }
+
+#[test]
+fn job36_complete_gallery_keeps_the_details_side_column_inside_the_viewport() {
+    let directory = tempfile::tempdir().unwrap();
+    let context = egui::Context::default();
+    let mut app = fixture(&context);
+    app.simple.enabled = true;
+    context.style_mut(|style| style.debug.warn_if_rect_changes_id = false);
+    app.library = Arc::new(Library::new(vec![archive(
+        36,
+        "Synthetic gallery",
+        Some("N64"),
+    )]));
+    app.artwork = Artwork::with_indexer(
+        context.clone(),
+        Some(directory.path().join("cache")),
+        Arc::new(|_| MediaIndex::default()),
+    );
+    let mut index = MediaIndex::default();
+    let mut gallery = Vec::new();
+    for ordinal in 0..3 {
+        let path = directory.path().join(format!("shot{ordinal}.png"));
+        image::RgbaImage::from_pixel(24, 18, image::Rgba([30, 60, 90, 255]))
+            .save(&path)
+            .unwrap();
+        gallery.push(Source::Local(path));
+    }
+    index.screenshots.insert(36, gallery);
+    app.artwork.index = Some(Arc::new(index));
+    app.screenshots = true;
+    app.router.current = Route::Game(36);
+    let size = [1440.0, 1000.0];
+    frame(&context, &mut app, size);
+    let output = frame(&context, &mut app, size);
+    let heading = text_bounds(&output, "Can I play it?")[0];
+    assert!(
+        heading.min.x <= size[0] - 340.0,
+        "gallery pushed the 360px side card out of the viewport: {heading:?}"
+    );
+}
+
+#[test]
+fn job36_details_entry_remains_visible_in_a_compact_selected_game_card() {
+    use super::super::launch_readiness_summary as readiness;
+    let context = egui::Context::default();
+    readable_style(&context);
+    let view = readiness::CompactReadiness {
+        badge: "Emulator needed",
+        tone: readiness::ReadinessPresentationState::NeedsEmulator,
+        spinner: false,
+        reason: "Synthetic local game has no configured emulator.".into(),
+        headline: "Emulator needed".into(),
+        play_enabled: false,
+        fix: Some(readiness::ReadinessAction::SetUpEmulator),
+        pending: false,
+        more_findings: 0,
+    };
+    let output = context.run(
+        egui::RawInput {
+            screen_rect: Some(egui::Rect::from_min_size(
+                egui::Pos2::ZERO,
+                egui::vec2(620.0, 480.0),
+            )),
+            ..Default::default()
+        },
+        |context| {
+            egui::CentralPanel::default().show(context, |ui| {
+                ui.allocate_ui_with_layout(
+                    egui::vec2(320.0, 400.0),
+                    egui::Layout::top_down(egui::Align::Min),
+                    |ui| {
+                        ui.set_clip_rect(ui.max_rect().intersect(ui.clip_rect()));
+                        readiness::show_compact(ui, &view, 320.0, 3, Some("Game details"));
+                    },
+                );
+            });
+        },
+    );
+    assert!(
+        visible_text(&output, "Game details"),
+        "the entry to artwork details is clipped in the compact card"
+    );
+    assert!(visible_text(&output, "Set up emulator"));
+}

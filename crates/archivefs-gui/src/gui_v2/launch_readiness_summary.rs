@@ -1062,7 +1062,7 @@ pub(crate) fn show_compact(
     let slot = ((width - gap * (slots - 1) as f32) / slots as f32).max(72.0);
     let fix_button = |ui: &mut egui::Ui, primary: bool| {
         let fix = view.fix?;
-        let mut button = egui::Button::new(egui::RichText::new(action_label(fix)).strong());
+        let mut button = egui::Button::new(egui::RichText::new(action_label(fix)).strong()).wrap();
         if primary {
             button = button.fill(fill);
         }
@@ -1072,7 +1072,7 @@ pub(crate) fn show_compact(
             .then_some(CompactChoice::Action(fix))
     };
     let trailing_button = |ui: &mut egui::Ui, label: &str, width: f32| {
-        ui.add_sized([width, 34.0], egui::Button::new(label))
+        ui.add_sized([width, 34.0], egui::Button::new(label).wrap())
             .clicked()
             .then_some(CompactChoice::Trailing)
     };
