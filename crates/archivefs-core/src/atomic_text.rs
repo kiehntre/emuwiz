@@ -151,6 +151,16 @@ fn target_permissions(parent: &ParentDir, name: &Leaf, path: &Path) -> Result<Op
 }
 
 pub(super) fn write(path: &Path, contents: &str) -> Result<()> {
+    write_mode(path, contents, None)
+}
+
+/// Exclusive publication for reviewed new files; never replaces a destination.
+pub(crate) fn create_new(path: &Path, contents: &str, parent_identity: (u64, u64)) -> Result<()> {
+    write_mode(path, contents, Some(parent_identity))
+}
+
+fn write_mode(path: &Path, contents: &str, expected_parent: Option<(u64, u64)>) -> Result<()> {
+    let exclusive = expected_parent.is_some();
     let parent = path.parent().ok_or_else(|| {
         ArchiveFsError::Config(format!("config path has no parent: {}", path.display()))
     })?;
@@ -160,12 +170,24 @@ pub(super) fn write(path: &Path, contents: &str) -> Result<()> {
         parent
     };
     let name = Leaf::from_path(path).map_err(|error| ArchiveFsError::io(path, error))?;
-    fs::create_dir_all(parent).map_err(|error| ArchiveFsError::io(parent, error))?;
+    if !exclusive {
+        fs::create_dir_all(parent).map_err(|error| ArchiveFsError::io(parent, error))?;
+    }
     let directory = ParentDir::open(parent).map_err(|error| ArchiveFsError::io(parent, error))?;
     directory
         .require_binding()
         .map_err(|error| ArchiveFsError::io(parent, error))?;
+    if expected_parent.is_some_and(|expected| !directory.matches_identity(expected)) {
+        return Err(ArchiveFsError::Config(
+            "destination parent changed after preview".into(),
+        ));
+    }
     let initial_permissions = target_permissions(&directory, &name, path)?;
+    if exclusive && initial_permissions.is_some() {
+        return Err(ArchiveFsError::Config(
+            "destination already exists; creation refused".into(),
+        ));
+    }
     // No OwnedStage exists on failure, so a failed exclusive create never
     // grants authority to remove any pre-existing candidate name.
     let mut stage = OwnedStage::create(&directory, parent, initial_permissions.as_ref())
@@ -226,9 +248,12 @@ pub(super) fn write(path: &Path, contents: &str) -> Result<()> {
         #[cfg(test)]
         tests::event(Event::BeforeRename, stage.path())
             .map_err(|error| ArchiveFsError::io(stage.path(), error))?;
-        directory
-            .replace(&stage.name, &name)
-            .map_err(|error| ArchiveFsError::io(path, error))?;
+        if exclusive {
+            directory.publish_new(&stage.name, &name)
+        } else {
+            directory.replace(&stage.name, &name)
+        }
+        .map_err(|error| ArchiveFsError::io(path, error))?;
         Ok(())
     })();
     result.map_err(|error| stage.failure(error))?;

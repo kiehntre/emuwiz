@@ -60,6 +60,10 @@ impl ParentDir {
         })
     }
 
+    pub(super) fn matches_identity(&self, expected: (u64, u64)) -> bool {
+        self.identity == expected
+    }
+
     pub(super) fn require_binding(&self) -> io::Result<()> {
         let current = fs::metadata(&self.path).map_err(|error| {
             io::Error::new(
@@ -122,6 +126,29 @@ impl ParentDir {
                 destination.0.as_ptr(),
             )
         })
+    }
+
+    pub(super) fn publish_new(&self, stage: &Leaf, destination: &Leaf) -> io::Result<()> {
+        #[cfg(target_os = "linux")]
+        {
+            // Use Gold's verified no-clobber primitive beneath the retained
+            // directory fd; renaming the parent cannot redirect publication.
+            use std::os::unix::ffi::OsStringExt;
+            let root = PathBuf::from(format!("/proc/self/fd/{}", self.handle.as_raw_fd()));
+            let source = root.join(std::ffi::OsString::from_vec(stage.0.as_bytes().to_vec()));
+            let target = root.join(std::ffi::OsString::from_vec(
+                destination.0.as_bytes().to_vec(),
+            ));
+            crate::dat::rename_apply::noclobber::rename_noreplace(&source, &target)
+                .map_err(io::Error::other)
+        }
+        #[cfg(not(target_os = "linux"))]
+        {
+            let _ = (stage, destination);
+            Err(io::Error::other(
+                "exclusive publication unsupported on this platform",
+            ))
+        }
     }
 
     pub(super) fn remove_stage(&self, stage: &Leaf) -> io::Result<()> {

@@ -333,3 +333,35 @@ fn rename_executor_journal_refusal_is_outer_error_before_any_source_mutation() {
     assert_eq!(transaction.entries[0].state, EntryState::Planned);
     assert!(stages(&parked).is_empty());
 }
+
+#[test]
+fn exclusive_parent_swap_after_last_check_cannot_redirect_publication() {
+    let root = fixture();
+    let parent = root.path().join("parent");
+    let parked = root.path().join("original");
+    fs::create_dir(&parent).unwrap();
+    let metadata = fs::metadata(&parent).unwrap();
+    let target = parent.join("game.pok.target");
+    let (p, a) = (parent.clone(), parked.clone());
+    let _reset = install_hook(move |event, _| {
+        if event == Event::BeforeRename {
+            fs::rename(&p, &a)?;
+            fs::create_dir(&p)?;
+            fs::write(p.join("game.pok.target"), "unrelated pin")?;
+        }
+        Ok(())
+    });
+    let error = super::super::create_new(&target, "approved pin", (metadata.dev(), metadata.ino()))
+        .unwrap_err();
+    assert!(
+        error
+            .to_string()
+            .contains("publication completed in the pinned original directory")
+    );
+    assert_eq!(fs::read_to_string(&target).unwrap(), "unrelated pin");
+    assert_eq!(
+        fs::read_to_string(parked.join("game.pok.target")).unwrap(),
+        "approved pin"
+    );
+    assert!(stages(&parked).is_empty());
+}

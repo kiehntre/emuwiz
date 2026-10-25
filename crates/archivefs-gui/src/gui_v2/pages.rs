@@ -2767,7 +2767,7 @@ impl App {
                             super::game_detail_blue::side_card(ui, "Can I play it?", |ui| {
                                 self.detail_readiness(ui, game, latest_verification.as_deref());
                                 self.show_arcade_input_details(ui, game);
-                    self.classic_trainers.show(ui, game);
+                                self.classic_trainers.show(ui, game);
                             });
                             super::game_detail_blue::information_card(ui, game);
                             super::game_detail_blue::side_card(ui, "", |ui| {
@@ -2798,6 +2798,7 @@ impl App {
                 super::game_detail_blue::information_card(ui, game);
             }
             self.detail_body(ui, game, &key);
+            self.classic_trainers.show(ui, game);
             ui.add_space(theme::SPACE_MD);
             ui.collapsing("Advanced details", |ui| {
                 self.detail_advanced(ui, &library, game, &key);

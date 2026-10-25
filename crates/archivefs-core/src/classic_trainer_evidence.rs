@@ -13,6 +13,8 @@
 //! pin is a claim; only the DAT-verified hash of the unchanged game file can
 //! confirm it, so a pin never verifies anything on its own.
 
+pub mod pinning;
+
 use std::io::Read;
 use std::path::{Path, PathBuf};
 
