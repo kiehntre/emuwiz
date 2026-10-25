@@ -54,15 +54,17 @@ mod tests {
 
     #[test]
     fn restart_restores_policy_without_restoring_apply_authority() {
-        let mut before = PlayingLibraryPageState::default();
-        before.preferred_regions_draft = "USA, Europe".into();
-        before.preferred_languages_draft = "French, English".into();
-        before.prefer_newest_revision = false;
-        before.prefer_parent = false;
-        before.exclude_beta = false;
-        before.exclude_demo = false;
-        before.pending_apply = Some(7);
-        before.confirm_text = "CREATE 7 LINKS".into();
+        let before = PlayingLibraryPageState {
+            preferred_regions_draft: "USA, Europe".into(),
+            preferred_languages_draft: "French, English".into(),
+            prefer_newest_revision: false,
+            prefer_parent: false,
+            exclude_beta: false,
+            exclude_demo: false,
+            pending_apply: Some(7),
+            confirm_text: "CREATE 7 LINKS".into(),
+            ..Default::default()
+        };
         let bytes = serde_json::to_vec(&SavedPreferences::from_state(&before)).unwrap();
         let saved: SavedPreferences = serde_json::from_slice(&bytes).unwrap();
         let mut after = PlayingLibraryPageState::default();
