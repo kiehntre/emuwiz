@@ -4913,6 +4913,13 @@ fn show_standalone_launch_action(
                 return;
             }
         }
+        if adapter == "xroar"
+            && !state.is_active()
+            && ui.button("Launch XRoar again (recheck)").clicked()
+        {
+            state.start(request);
+            return;
+        }
         if adapter == "flycast"
             && !state.is_active()
             && ui.button("Launch Flycast again (recheck)").clicked()
