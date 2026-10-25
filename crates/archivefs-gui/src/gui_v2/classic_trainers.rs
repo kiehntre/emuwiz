@@ -159,7 +159,7 @@ fn line(ui: &mut egui::Ui, text: impl Into<String>) {
 }
 
 /// This evidence card never enables a trainer.
-const ACTIVATION_NOTE: &str = "Trainers are OFF by default. Use Play to open launch readiness, then POKE trainers to explicitly select individual entries for a supported native RetroArch/Fuse snapshot launch. A verified association is not proof of emulator compatibility. Prepared files do not confirm activation.";
+const ACTIVATION_NOTE: &str = "Trainers are OFF by default. Use Play to open launch readiness, then POKE trainers to explicitly select entries for a supported configuration. A verified association is not proof of emulator compatibility. Prepared files do not confirm activation.";
 
 fn render(ui: &mut egui::Ui, result: &Result<Option<ClassicTrainerReport>, String>) {
     line(ui, ACTIVATION_NOTE);
@@ -204,6 +204,12 @@ fn section(ui: &mut egui::Ui, title: &str) {
 }
 
 fn render_option(ui: &mut egui::Ui, option: &ClassicTrainerOption) {
+    if option.platform == archivefs_core::classic_poke_family::PokePlatform::Commodore64 {
+        line(
+            ui,
+            archivefs_core::classic_trainer_evidence::vice::LIMITATION,
+        );
+    }
     ui.add_space(6.0);
     ui.label(
         RichText::new(&option.title)
