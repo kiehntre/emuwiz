@@ -1377,3 +1377,75 @@ fn a_world_writable_root_or_workspace_is_never_listed_as_ours_or_cleaned() {
     );
     assert!(path.exists());
 }
+
+#[test]
+fn launch_boundary_rechecks_added_pin_game_and_core_bindings_after_materialisation() {
+    for label in ["trainer-pin", "snapshot", "fuse-core", "retroarch-frontend"] {
+        let env = Env::new(label);
+        let evidence = env.user_file(label, b"original");
+        let built = build(&env, "late-evidence");
+        let original_digest = built.plan.digest().to_string();
+        let plan = built.plan.with_source_bindings(&[SourceBinding {
+            path: evidence.clone(),
+            expected_sha256: sha256_hex(b"original"),
+        }]);
+        assert_ne!(plan.digest(), original_digest);
+        let spawned = Cell::new(false);
+        let session = execute_cheat_runtime::<_, Fake>(
+            &plan,
+            &binding(),
+            &env.roots,
+            (),
+            |(), _| {
+                fs::write(&evidence, b"changed after materialisation").unwrap();
+            },
+            |()| {
+                spawned.set(true);
+                unreachable!("stale evidence must not reach the emulator")
+            },
+        );
+        assert!(!spawned.get());
+        assert_eq!(session.receipt().handoff, HandoffOutcome::NotReached);
+        assert_eq!(session.receipt().cleanup, CleanupOutcome::Completed);
+        assert!(!plan.root().exists());
+        assert!(
+            session
+                .receipt()
+                .errors
+                .iter()
+                .any(|e| e.contains("before handoff"))
+        );
+    }
+}
+
+#[test]
+fn a_source_replaced_by_a_fifo_before_handoff_is_refused_without_blocking() {
+    let env = Env::new("late-fifo");
+    let source = env.user_file("pin", b"original");
+    let built = build_with(
+        &env,
+        "late-fifo",
+        vec![],
+        vec![SourceBinding {
+            path: source.clone(),
+            expected_sha256: sha256_hex(b"original"),
+        }],
+    );
+    let before = std::time::Instant::now();
+    let session = execute_cheat_runtime::<_, Fake>(
+        &built.plan,
+        &binding(),
+        &env.roots,
+        (),
+        |(), _| {
+            fs::remove_file(&source).unwrap();
+            let name = std::ffi::CString::new(source.as_os_str().as_encoded_bytes()).unwrap();
+            // SAFETY: name is a live NUL-terminated path in this disposable fixture.
+            assert_eq!(unsafe { libc::mkfifo(name.as_ptr(), 0o600) }, 0);
+        },
+        |()| unreachable!("a FIFO is not launch evidence"),
+    );
+    assert!(before.elapsed() < std::time::Duration::from_secs(2));
+    assert_eq!(session.receipt().handoff, HandoffOutcome::NotReached);
+    assert_eq!(session.receipt().cleanup, CleanupOutcome::Completed);
+}

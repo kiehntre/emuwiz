@@ -339,28 +339,62 @@ pub(super) fn launch(
         return Err(refuse(why.into()));
     }
     let selections = choice.selections().map_err(refuse)?;
+    let candidates = choice.rows.iter().map(|r| r.candidate.clone()).collect();
+    launch_selection(
+        request,
+        RetroArchCheatSelection {
+            candidates,
+            selections,
+            core_library_name: String::new(),
+            effective_overrides: Vec::new(),
+            expected_core: None,
+            expected_executable: None,
+            additional_sources: Vec::new(),
+            start_from_snapshot: false,
+        },
+        probe,
+        environment,
+    )
+}
+
+/// Common canonical handoff for native .cht choices and verified Fuse POK
+/// projections. Callers own format-specific compatibility and evidence checks.
+pub(super) fn launch_selection(
+    request: &RetroArchLaunchRequest,
+    mut selection: RetroArchCheatSelection,
+    probe: &dyn ProbeLauncher,
+    environment: &DiscoveryEnvironment,
+) -> Result<RetroArchCheatLaunch, String> {
+    let refuse = |why: String| format!("RetroArch was not started: {why}");
     let filesystem = HostReadOnlyFilesystem;
-    // The canonical preflight tells us which core file and profile will be used.
     let command = preflight_retroarch_launch(request, &filesystem, environment).map_err(|e| {
         refuse(
             symlinked_settings_explanation(request, &filesystem, environment)
                 .unwrap_or_else(|| preflight_message(e)),
         )
     })?;
+    if selection
+        .expected_executable
+        .as_ref()
+        .is_some_and(|path| path != &command.executable)
+    {
+        return Err(refuse(
+            "The verified RetroArch executable changed; refresh trainer selection.".into(),
+        ));
+    }
     let core_path = command.selection.core_library.clone();
-    // 1. The core's own library name, from the core itself.
+    if selection
+        .expected_core
+        .as_ref()
+        .is_some_and(|p| p != &core_path)
+    {
+        return Err(refuse(
+            "The selected core changed; refresh trainer selection.".into(),
+        ));
+    }
     let probed = probe_core_library_name(&core_path, probe).map_err(|e| refuse(e.explanation()))?;
-    // 2. Override files, read-only.
-    let candidates: Vec<CheatCandidate> = choice.rows.iter().map(|r| r.candidate.clone()).collect();
-    let mut selection = RetroArchCheatSelection {
-        candidates,
-        selections,
-        core_library_name: probed.library_name.clone(),
-        effective_overrides: Vec::new(),
-        // The adapter runs its own launch check; it must pick the very core
-        // that was probed.
-        expected_core: Some(core_path.clone()),
-    };
+    selection.core_library_name = probed.library_name.clone();
+    selection.expected_core = Some(core_path);
     let facts = retroarch_facts(
         &command,
         &filesystem,
@@ -451,6 +485,23 @@ pub(super) fn bezel_identity(
     })
 }
 
+pub(super) fn requested_label(
+    session: &archivefs_core::launch::cheat_runtime::CheatRuntimeSession<
+        archivefs_core::launch::LaunchedRetroArchProcess,
+    >,
+) -> String {
+    format!(
+        "Requested cheats: {}",
+        session
+            .receipt()
+            .cheats
+            .iter()
+            .map(|c| c.title.as_str())
+            .collect::<Vec<_>>()
+            .join(", ")
+    )
+}
+
 /// The lines shown once a cheat launch has finished.
 pub(super) fn session_summary(
     session: &archivefs_core::launch::cheat_runtime::CheatRuntimeSession<
@@ -467,6 +518,7 @@ pub(super) fn session_summary(
         "RetroArch {exit}; temporary cheat profile: {:?}. EmuWiz did not see the cheats work.",
         receipt.cleanup
     )];
+    lines.insert(0, requested_label(session));
     lines.extend(receipt.notes.iter().cloned());
     lines.extend(receipt.errors.iter().cloned());
     lines

@@ -70,7 +70,9 @@ pub const DEFAULT_STALE_GRACE_SECS: u64 = 120;
 const MAX_MARKER_BYTES: u64 = 64 * 1024;
 const MAX_RUNTIME_FILE_BYTES: usize = 1024 * 1024;
 const MAX_RUNTIME_FILES: usize = 32;
-const MAX_SOURCE_HASH_BYTES: u64 = 8 * 1024 * 1024;
+// Includes the verified native RetroArch executable (about 16 MiB). Format
+// parsers retain their smaller independent limits.
+const MAX_SOURCE_HASH_BYTES: u64 = 32 * 1024 * 1024;
 const MAX_RECEIPT_ERRORS: usize = 16;
 const MAX_ERROR_CHARS: usize = 300;
 const MAX_LAUNCH_ID_CHARS: usize = 64;
@@ -516,6 +518,15 @@ impl CheatRuntimePlan {
         Ok(plan)
     }
 
+    /// Add immutable launch-boundary evidence (e.g. a trainer pin and core)
+    /// before materialisation. These bindings participate in the plan digest
+    /// and the runtime's pre-handoff revalidation.
+    pub(crate) fn with_source_bindings(mut self, bindings: &[SourceBinding]) -> Self {
+        self.sources.extend_from_slice(bindings);
+        self.digest = self.compute_digest();
+        self
+    }
+
     #[must_use]
     pub fn launch_id(&self) -> &str {
         &self.launch_id
@@ -582,6 +593,25 @@ impl CheatRuntimePlan {
             cheats: &self.cheats,
         };
         sha256_hex(&serde_json::to_vec(&view).unwrap_or_default())
+    }
+
+    fn verify_sources(&self) -> Result<(), RuntimeRefusal> {
+        for source in &self.sources {
+            match hash_source(&source.path) {
+                Ok(hash) if hash == source.expected_sha256 => {}
+                Ok(_) => {
+                    return Err(RuntimeRefusal::CheatEvidenceChanged {
+                        source: file_label(&source.path),
+                    });
+                }
+                Err(()) => {
+                    return Err(RuntimeRefusal::CheatMaterialMissing {
+                        source: file_label(&source.path),
+                    });
+                }
+            }
+        }
+        Ok(())
     }
 
     fn verify_digest(&self) -> Result<(), RuntimeRefusal> {
@@ -671,9 +701,12 @@ fn hash_source(path: &Path) -> Result<String, ()> {
         return Err(());
     }
     let mut bytes = Vec::new();
-    fs::File::open(path)
+    super::process_spawn::open_regular_file_nonblocking(path)
         .and_then(|f| f.take(MAX_SOURCE_HASH_BYTES + 1).read_to_end(&mut bytes))
         .map_err(|_| ())?;
+    if bytes.len() as u64 > MAX_SOURCE_HASH_BYTES {
+        return Err(());
+    }
     Ok(sha256_hex(&bytes))
 }
 
@@ -843,21 +876,8 @@ impl CheatRuntimeWorkspace {
         if !normal_absolute(approved) || plan.root.parent() != Some(approved.as_path()) {
             return refuse(RuntimeRefusal::WorkspaceOutsideApprovedRoot);
         }
-        // Cheat evidence must still be what the plan was built from.
-        for source in &plan.sources {
-            match hash_source(&source.path) {
-                Ok(hash) if hash == source.expected_sha256 => {}
-                Ok(_) => {
-                    return refuse(RuntimeRefusal::CheatEvidenceChanged {
-                        source: file_label(&source.path),
-                    });
-                }
-                Err(()) => {
-                    return refuse(RuntimeRefusal::CheatMaterialMissing {
-                        source: file_label(&source.path),
-                    });
-                }
-            }
+        if let Err(reason) = plan.verify_sources() {
+            return refuse(reason);
         }
         // The approved root is EmuWiz's own temporary area. It may be created,
         // but never a symlink.
@@ -1281,6 +1301,17 @@ pub fn execute_cheat_runtime<C, P: RuntimeProcess>(
     receipt.handoff = HandoffOutcome::NotAttempted;
 
     let command = with_arguments(command, plan.extra_arguments());
+    // Materialisation can take time. Recheck every source after preparing
+    // arguments, at the last shared boundary before the canonical spawn.
+    if let Err(reason) = plan.verify_sources() {
+        receipt.error(format!("Launch evidence changed before handoff: {reason}"));
+        receipt.handoff = HandoffOutcome::NotReached;
+        session.workspace = Some(workspace);
+        session.expectations = expectations;
+        session.receipt = receipt;
+        session.finalise();
+        return session;
+    }
     match spawn(command) {
         Ok(process) => {
             let pid = process.pid();

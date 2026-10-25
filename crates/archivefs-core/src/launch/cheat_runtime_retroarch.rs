@@ -407,6 +407,13 @@ pub struct RetroArchCheatSelection {
     /// refused. Guards against the core changing between the caller's checks
     /// and this adapter's own launch check.
     pub expected_core: Option<PathBuf>,
+    /// Exact frontend selected when a verified backend pair was approved.
+    pub expected_executable: Option<PathBuf>,
+    /// Additional evidence that must remain unchanged through handoff.
+    pub additional_sources: Vec<SourceBinding>,
+    /// A verified snapshot trainer must start from that snapshot, not a
+    /// subsequently auto-loaded save state. Ordinary launches ignore this.
+    pub start_from_snapshot: bool,
 }
 
 fn real_path(value: &Option<EncodedPath>) -> Option<PathBuf> {
@@ -605,6 +612,32 @@ pub fn launch_prepared_command(
         let process = spawn_retroarch(command).map_err(RetroArchCheatLaunchError::Spawn)?;
         return Ok(RetroArchCheatLaunch::Plain(process));
     }
+    if cheats
+        .expected_executable
+        .as_ref()
+        .is_some_and(|path| path != &command.executable)
+    {
+        return Err(RetroArchCheatLaunchError::Facts(
+            "The verified RetroArch executable changed; refresh trainer selection.".into(),
+        ));
+    }
+    if cheats.start_from_snapshot {
+        // A PATH script can actually launch Flatpak, despite being discovered
+        // as a native profile. That is not the frontend verified for POKs.
+        let mut magic = [0; 4];
+        let native = super::process_spawn::open_regular_file_nonblocking(&command.executable)
+            .and_then(|mut file| file.read_exact(&mut magic))
+            .is_ok()
+            && magic == *b"\x7fELF";
+        if !native
+            || request.profile.profile_kind
+                != crate::emulator_environment::retroarch::ProfileKind::Native
+        {
+            return Err(RetroArchCheatLaunchError::Facts(
+                "POKE activation requires native RetroArch; a wrapper script, Flatpak or AppImage is not a verified backend. Ordinary Play remains available.".into()
+            ));
+        }
+    }
     let launch_root = roots.approved_root.join(workspace_name(launch_id));
     let facts = retroarch_facts(
         &command,
@@ -665,7 +698,14 @@ pub fn launch_prepared_command(
         selections: cheats.selections.clone(),
         retroarch: Some(facts),
     };
-    let plan = plan_cheat_launch(&planner_request);
+    let mut plan = plan_cheat_launch(&planner_request);
+    if cheats.start_from_snapshot
+        && let Some(settings) = &mut plan.retroarch
+    {
+        settings
+            .base_config_contents
+            .push_str("savestate_auto_load = \"false\"\n");
+    }
 
     // The user's own settings (controls, video, audio) must carry into the
     // temporary profile. If a settings file exists but cannot be used, the
@@ -699,6 +739,7 @@ pub fn launch_prepared_command(
         return Ok(RetroArchCheatLaunch::Plain(process));
     };
 
+    let runtime = runtime.with_source_bindings(&cheats.additional_sources);
     let binding = LiveLaunchBinding {
         game_identity: request.expected_game_key.clone(),
         adapter_id: RETROARCH_ADAPTER_ID.into(),

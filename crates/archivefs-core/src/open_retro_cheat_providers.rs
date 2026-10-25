@@ -174,6 +174,7 @@ pub struct ZxPokOperation {
     pub bank: u8,
     pub address: u16,
     pub value: u8,
+    /// POK restoration field, not an equality guard. Zero captures current memory.
     pub original_value: Option<u8>,
 }
 

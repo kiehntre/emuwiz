@@ -10,7 +10,7 @@ mod bezel;
 mod bezel_history;
 mod browse_play;
 mod cheat_extras_page;
-mod classic_trainers;
+pub(crate) mod classic_trainers;
 #[cfg(test)]
 mod dat_exact_tests;
 mod database_status_page;
