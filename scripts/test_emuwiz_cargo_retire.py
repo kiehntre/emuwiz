@@ -61,8 +61,8 @@ class Base(T.Env):
         base = self.mod.F.Census
 
         class Full(base):
-            def __init__(inner, targets):
-                super().__init__(targets)
+            def __init__(inner, targets, **kw):
+                super().__init__(targets, **kw)
                 inner.unreadable_foreign = 0
 
         self.mod.F.Census = Full
@@ -644,8 +644,8 @@ class Corrections(Base):
                 "mod = importlib.util.module_from_spec(spec); loader.exec_module(mod)\n"
                 "base = mod.F.Census\n"
                 "class Full(base):\n"
-                "    def __init__(self, t):\n"
-                "        super().__init__(t); self.unreadable_foreign = 0\n"
+                "    def __init__(self, t, **kw):\n"
+                "        super().__init__(t, **kw); self.unreadable_foreign = 0\n"
                 "mod.F.Census = Full\n"
                 + body +
                 "sys.exit(mod.main(ARGS))\n"

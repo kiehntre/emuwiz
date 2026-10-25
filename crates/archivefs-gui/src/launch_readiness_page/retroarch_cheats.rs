@@ -20,7 +20,7 @@
 use super::RetroArchLaunchState;
 use archivefs_core::emulator_environment::retroarch::discover_retroarch_environment;
 use archivefs_core::emulator_environment::retroarch::{
-    DiscoveryEnvironment, ProfileKind, ProfileRef,
+    DiscoveryEnvironment, PathPurpose, ProfileKind, ProfileRef,
 };
 use archivefs_core::emulator_environment::{FsProbe, HostReadOnlyFilesystem};
 use archivefs_core::launch::cheat_launch_plan::{
@@ -400,6 +400,55 @@ pub(super) fn launch(
         &launch_id(),
     )
     .map_err(|e| refuse(describe(e)))
+}
+
+/// The exact content file, core `library_name`, settings file and overlay
+/// folder a plain launch of `request` would use: the same preflight as Play
+/// and the same core probe as a cheat launch. The settings come from the one
+/// profile Play selected, so other RetroArch installs never change the answer.
+/// Nothing is launched; the probe child only asks the core its name.
+pub(super) fn bezel_identity(
+    request: &RetroArchLaunchRequest,
+) -> Result<super::RetroArchBezelLaunch, String> {
+    let filesystem = HostReadOnlyFilesystem;
+    let environment = DiscoveryEnvironment::from_process_environment();
+    let command = preflight_retroarch_launch(request, &filesystem, &environment).map_err(|e| {
+        symlinked_settings_explanation(request, &filesystem, &environment)
+            .unwrap_or_else(|| preflight_message(e))
+    })?;
+    let probed =
+        probe_core_library_name(&command.selection.core_library, &CurrentExecutableLauncher)
+            .map_err(|e| e.explanation())?;
+    let report = discover_retroarch_environment(&filesystem, &environment)
+        .map_err(|e| format!("RetroArch could not be checked: {e:?}"))?;
+    let profile = report
+        .profiles
+        .iter()
+        .find(|p| {
+            p.profile_kind == command.selection.profile.profile_kind
+                && p.scope == command.selection.profile.scope
+        })
+        .ok_or("the RetroArch profile this game launches with is no longer discoverable")?;
+    if profile.config_file.path.lossy {
+        return Err("RetroArch's settings path is not valid UTF-8".into());
+    }
+    let overlays = profile
+        .paths
+        .iter()
+        .find(|path| path.purpose == PathPurpose::Overlays)
+        .and_then(|path| path.resolved_path.as_ref())
+        .filter(|path| !path.lossy)
+        .ok_or("EmuWiz can't tell which overlay folder the RetroArch settings this game launches with use, so the bezel has nowhere safe to go.")?;
+    probed.ensure_unchanged().map_err(|e| e.explanation())?;
+    Ok(super::RetroArchBezelLaunch {
+        identity: archivefs_core::bezel_apply::RetroArchContentIdentity {
+            content_path: command.selection.content_path.clone(),
+            core_library_name: probed.library_name.clone(),
+            home: environment.home.as_ref().map(PathBuf::from),
+        },
+        config: PathBuf::from(&profile.config_file.path.display),
+        overlays: PathBuf::from(&overlays.display),
+    })
 }
 
 /// The lines shown once a cheat launch has finished.

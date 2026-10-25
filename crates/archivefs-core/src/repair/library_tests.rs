@@ -2300,3 +2300,143 @@ fn reference_gap_repair_report_explains_undumped_material_without_claiming_a_mis
     assert!(reason.contains("alone"), "{reason}");
     assert!(!reason.contains("bad metadata: NoDump"), "{reason}");
 }
+
+#[test]
+fn readable_id_collisions_are_explained_and_not_counted_safe() {
+    let dir = temp();
+    let (dat, roms) = three_proposal_fixture(dir.path());
+    std::fs::create_dir(roms.join("q")).unwrap();
+    std::fs::rename(roms.join("a.bin"), roms.join("q_r.bin")).unwrap();
+    std::fs::rename(roms.join("b.bin"), roms.join("q/r.bin")).unwrap();
+    let outcome = scan(&dat, &roms);
+    assert!(
+        outcome
+            .repair_plan
+            .conflicts
+            .iter()
+            .any(|c| c.kind == PlanConflictKind::DuplicateProposalId)
+    );
+    assert_eq!(outcome.report.counts.safe_repairs, 1);
+    assert_eq!(plan_file_from_scan(&outcome).safe_repair_count(), 1);
+    assert_eq!(outcome.report.counts.blocked_repair, 2);
+    assert!(
+        outcome
+            .report
+            .blocked
+            .iter()
+            .all(|item| item.reason.contains("duplicate proposal id"))
+    );
+    assert_eq!(outcome.report.counts.unmatched_candidates, 0);
+    assert!(roms.join("q_r.bin").exists());
+    assert!(roms.join("q/r.bin").exists());
+}
+
+#[cfg(unix)]
+#[test]
+fn non_utf8_source_paths_have_explicit_scan_diagnostics() {
+    use std::os::unix::ffi::OsStringExt;
+    for deep in [false, true] {
+        let dir = temp();
+        let root = if deep {
+            dir.path().join("x".repeat(150))
+        } else {
+            dir.path().join("short")
+        };
+        std::fs::create_dir(&root).unwrap();
+        let (dat, roms) = three_proposal_fixture(&root);
+        for (source, bytes) in [("a.bin", b"a\xff.bin"), ("b.bin", b"a\xfe.bin")] {
+            std::fs::rename(
+                roms.join(source),
+                roms.join(std::ffi::OsString::from_vec(bytes.to_vec())),
+            )
+            .unwrap();
+        }
+        // A real UTF-8 filename with the same lossy display must never stand
+        // in for either raw-byte path during downstream source lookup.
+        std::fs::rename(roms.join("c.bin"), roms.join("a\u{fffd}.bin")).unwrap();
+        let outcome = scan(&dat, &roms);
+        assert_eq!(outcome.report.counts.safe_repairs, 1);
+        assert_eq!(outcome.report.counts.scan_errors, 2);
+        assert!(
+            outcome
+                .report
+                .scan_errors
+                .iter()
+                .all(|reason| reason.contains("non-UTF-8 source path"))
+        );
+        assert_eq!(outcome.repair_plan.proposals.len(), 1);
+    }
+}
+
+#[test]
+fn suggested_adapter_refusals_are_explained_in_the_report() {
+    let dir = temp();
+    let (dat, roms) = three_proposal_fixture(dir.path());
+    let mut outcome = scan(&dat, &roms);
+    let proposal = &mut outcome.rename_plan.proposals[0];
+    let path = proposal.source_path.clone();
+    proposal.proposed_basename = None;
+    outcome
+        .repair_plan
+        .proposals
+        .retain(|repair| repair.source_path != path);
+    let report = crate::repair::library::build_library_repair_report(
+        &outcome.audit,
+        &outcome.rename_plan,
+        &outcome.repair_plan,
+        &Default::default(),
+        &[],
+    );
+    assert_eq!(report.counts.safe_repairs, 2);
+    assert_eq!(report.counts.blocked_repair, 1);
+    assert!(report.blocked[0].reason.contains("no proposed basename"));
+    assert_eq!(report.counts.unmatched_candidates, 0);
+}
+
+#[cfg(unix)]
+#[test]
+fn skipped_non_utf8_containers_leave_dependency_presence_unavailable() {
+    use std::io::Write as _;
+    use std::os::unix::ffi::OsStringExt;
+    for extension in ["zip", "chd"] {
+        let dir = temp();
+        let dat = write(
+            dir.path(),
+            "dependency.dat",
+            format!(
+                r#"<datafile>
+<game name="provider"><rom name="shared.bin" size="3" sha1="{SHA1_ABC}"/></game>
+<game name="child" romof="provider"><rom name="own.bin" size="4" sha1="{SHA1_TEST}"/>
+<rom name="shared.bin" merge="shared.bin" size="3" sha1="{SHA1_ABC}"/></game>
+</datafile>"#
+            )
+            .as_bytes(),
+        );
+        let roms = dir.path().join("roms");
+        std::fs::create_dir(&roms).unwrap();
+        let mut zip = zip::ZipWriter::new(std::fs::File::create(roms.join("child.zip")).unwrap());
+        zip.start_file("own.bin", zip::write::SimpleFileOptions::default())
+            .unwrap();
+        zip.write_all(b"test").unwrap();
+        zip.finish().unwrap();
+        let mut name = b"provider\xff.".to_vec();
+        name.extend_from_slice(extension.as_bytes());
+        std::fs::write(
+            roms.join(std::ffi::OsString::from_vec(name)),
+            b"unobserved provider",
+        )
+        .unwrap();
+        let outcome = scan(&dat, &roms);
+        assert_eq!(outcome.report.counts.scan_errors, 1);
+        let child = outcome
+            .audit
+            .sets
+            .iter()
+            .find(|set| set.identity.game_name == "child")
+            .unwrap();
+        assert_eq!(
+            child.dependencies.state,
+            crate::dat::dependency::DependencyState::EvidenceUnavailable
+        );
+    }
+}

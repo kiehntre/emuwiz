@@ -305,12 +305,12 @@ pub struct LibraryRepairPlan {
 impl LibraryRepairPlan {
     /// The number of executable proposals in the plan.
     pub fn safe_repair_count(&self) -> usize {
-        self.repair_plan.proposals.len()
+        self.repair_plan.executable_proposals().count()
     }
 
     /// Whether the plan has any executable proposal.
     pub fn has_safe_repairs(&self) -> bool {
-        !self.repair_plan.proposals.is_empty()
+        self.safe_repair_count() > 0
     }
 }
 
@@ -512,6 +512,7 @@ pub fn build_library_repair_report(
     duplicate_needs_review: &[DuplicateNeedsReviewMember],
 ) -> LibraryRepairReport {
     let mut report = LibraryRepairReport::default();
+    let conflicts = super::plan::detect_plan_conflicts(&repair_plan.proposals);
 
     // Files encountered vs DAT-relevant vs ignored ancillary. Derived purely
     // from evidence the audit already produced - no new file walk, no new
@@ -573,9 +574,8 @@ pub fn build_library_repair_report(
     // never touches `ProposalState::Blocked` (which
     // `duplicate_candidate_groups` never even considers a candidate).
     let quarantine_superseded_sources: std::collections::HashSet<&Path> = repair_plan
-        .proposals
-        .iter()
-        .filter(|proposal| proposal.is_duplicate_quarantine() && proposal.actionable())
+        .executable_proposals()
+        .filter(|proposal| proposal.is_duplicate_quarantine())
         .map(|proposal| proposal.source_path.as_path())
         .collect();
 
@@ -583,7 +583,43 @@ pub fn build_library_repair_report(
     // proposals become executable; every other state is surfaced verbatim.
     for proposal in &rename_plan.proposals {
         match proposal.state {
-            ProposalState::Suggested => {}
+            ProposalState::Suggested => {
+                let repair = repair_plan.proposals.iter().find(|repair| {
+                    repair.source_path == proposal.source_path
+                        && matches!(repair.action, RepairAction::RenamePath { .. })
+                });
+                let reasons: Vec<String> = repair
+                    .map(|repair| {
+                        conflicts
+                            .iter()
+                            .filter(|conflict| conflict.proposal_ids.contains(&repair.id))
+                            .map(|conflict| {
+                                format!("{}: {}", conflict.kind.clone().label(), conflict.detail)
+                            })
+                            .collect()
+                    })
+                    .unwrap_or_default();
+                let reason = if !reasons.is_empty() {
+                    Some(reasons.join("; "))
+                } else if repair.is_none_or(|repair| !repair.actionable()) {
+                    Some(
+                        super::adapter::suggested_rename_refusal(proposal)
+                            .unwrap_or(
+                                "DAT repair candidate has no audited source identity or is unsafe",
+                            )
+                            .to_string(),
+                    )
+                } else {
+                    None
+                };
+                if let Some(reason) = reason {
+                    report.counts.blocked_repair += 1;
+                    report.blocked.push(PlanItem {
+                        path: proposal.source_path.to_string_lossy().into_owned(),
+                        reason,
+                    });
+                }
+            }
             ProposalState::AlreadyCanonical => report.counts.already_canonical += 1,
             ProposalState::Ambiguous | ProposalState::UnclassifiedContent => {
                 report.counts.needs_review += 1;
@@ -689,8 +725,7 @@ pub fn build_library_repair_report(
     // the same plan are duplicate-quarantine moves, accounted for separately
     // below so this count keeps its original, DAT-rename-only meaning.
     report.counts.safe_repairs = repair_plan
-        .proposals
-        .iter()
+        .executable_proposals()
         .filter(|proposal| matches!(proposal.action, RepairAction::RenamePath { .. }))
         .count();
 
@@ -698,7 +733,10 @@ pub fn build_library_repair_report(
     // DAT candidate/ancillary/unmatched bucket above.
     report.counts.duplicate_groups_examined = duplicate_accounting.groups_examined;
     report.counts.duplicate_groups_content_proven = duplicate_accounting.groups_content_proven;
-    report.counts.duplicate_quarantine_safe = duplicate_accounting.quarantine_safe;
+    report.counts.duplicate_quarantine_safe = repair_plan
+        .executable_proposals()
+        .filter(|proposal| proposal.is_duplicate_quarantine())
+        .count();
     report.counts.duplicate_quarantine_needs_review = duplicate_accounting.quarantine_needs_review;
     report.counts.duplicate_same_object_ignored = duplicate_accounting.same_object_ignored;
     report.counts.duplicate_content_mismatch_refused =

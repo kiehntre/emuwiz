@@ -4,7 +4,7 @@ use super::*;
 pub(super) enum Input {
     Plan(
         PathBuf,
-        Result<(Box<LibraryRepairPlan>, CountsAvailability), String>,
+        Result<(Box<PreparedPreview>, CountsAvailability), String>,
     ),
     Setup(Vec<PathBuf>),
 }
@@ -27,7 +27,12 @@ impl RepairReviewPageState {
                 .map_err(|e| format!("could not read '{}': {e}", path.display()))
                 .and_then(|text| {
                     serde_json::from_str::<LibraryRepairPlan>(&text)
-                        .map(|plan| (Box::new(plan), CountsAvailability::from_raw_json(&text)))
+                        .map(|plan| {
+                            (
+                                Box::new(PreparedPreview::new(plan)),
+                                CountsAvailability::from_raw_json(&text),
+                            )
+                        })
                         .map_err(|e| format!("could not parse repair plan: {e}"))
                 });
             let _ = sender.send(Input::Plan(path, result));
@@ -58,7 +63,7 @@ impl RepairReviewPageState {
                 self.input_job = None;
                 match input {
                     Input::Plan(path, Ok((plan, counts))) => {
-                        self.adopt_loaded_plan(*plan, Some(path), counts)
+                        self.adopt_prepared_plan(*plan, Some(path), counts)
                     }
                     Input::Plan(_, Err(error)) => self.error = Some(error),
                     Input::Setup(library_folders) => {

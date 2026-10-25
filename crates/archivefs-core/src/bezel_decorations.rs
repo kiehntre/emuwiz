@@ -555,9 +555,11 @@ pub fn decoration_emulator_support(target: &DecorationTarget) -> DecorationEmula
         reviewed_apply: retroarch,
         in_game_display: if retroarch {
             DecorationInGameDisplay::Unconfirmed {
-                reason: "EmuWiz can write a reviewed RetroArch per-game overlay override, but \
-                         EmuWiz launch does not pass it to RetroArch. Whether it shows in-game \
-                         depends on RetroArch loading that override for the exact core and game."
+                reason: "EmuWiz writes a reviewed RetroArch per-game override named for the \
+                         exact file and core a normal launch uses. RetroArch 1.22.2 was seen \
+                         loading such an override and accepting its overlay, but the bezel being \
+                         drawn on screen has not been checked. Cheat launches ignore per-game \
+                         overrides."
                     .into(),
             }
         } else {

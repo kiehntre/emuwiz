@@ -73,6 +73,8 @@ mod saturn_manifest;
 mod save_snapshots;
 mod save_state_guidance;
 mod saves_states;
+#[cfg(test)]
+mod scummvm_journey_tests;
 mod setup_portability;
 #[cfg(test)]
 #[path = "tests/shared_scroll.rs"]
