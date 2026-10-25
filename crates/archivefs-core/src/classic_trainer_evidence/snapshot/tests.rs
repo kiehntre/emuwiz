@@ -100,6 +100,7 @@ impl World {
         let core = self.root.join("core.so");
         std::fs::write(&core, b"original fixture core").unwrap();
         RetroArchCommand {
+            saturn_core_selection: None,
             snapshot_evidence: Some(self.load().unwrap()),
             executable,
             arguments: vec![],

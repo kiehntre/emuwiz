@@ -2027,6 +2027,7 @@ impl ArchiveFsApp {
             retroarch_environment,
             &remembered,
         );
+        launch_readiness_page::saturn_core::apply(&mut plan, retroarch_environment);
         archivefs_core::launch::nkit_readiness::inspect_and_apply(&mut plan);
         archivefs_core::launch::cemu_readiness::apply_cemu_readiness(
             &mut plan,

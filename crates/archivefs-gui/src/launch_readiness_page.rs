@@ -48,6 +48,7 @@ pub(crate) mod flycast;
 mod melonds_cheats;
 mod retroarch_cheat_sets;
 mod retroarch_cheats;
+pub(crate) mod saturn_core;
 mod scummvm_profile;
 pub(crate) mod vice;
 pub(crate) mod xroar;
@@ -1637,6 +1638,8 @@ struct RetroArchLaunchKey {
     content_path: PathBuf,
     profile: ProfileRef,
     core_stem: String,
+    saturn_core_selection:
+        Option<archivefs_core::launch::saturn_core_selection::SaturnCoreSelection>,
     expected_snapshot_evidence:
         Option<archivefs_core::classic_trainer_evidence::snapshot::SnapshotEvidence>,
     expected_appimage_executable: Option<PathBuf>,
@@ -1651,6 +1654,7 @@ impl RetroArchLaunchKey {
             content_path: request.selected_content_path.clone(),
             profile: request.profile,
             core_stem: request.core_stem.clone(),
+            saturn_core_selection: request.saturn_core_selection.clone(),
             expected_snapshot_evidence: request.expected_snapshot_evidence.clone(),
             expected_appimage_executable: request.expected_appimage_executable.clone(),
             expected_executable_binding: request.expected_executable_binding.clone(),
@@ -2860,6 +2864,11 @@ fn retroarch_launch_request(
         expected_game_key: game_key.clone(),
         profile: *profile,
         core_stem: core_stem.clone(),
+        saturn_core_selection: if platform_id == "Saturn" {
+            saturn_core::load().ok().flatten()
+        } else {
+            None
+        },
         expected_snapshot_evidence: if platform_id == "ZX Spectrum" {
             let evidence = crate::emulator_setup::zx_snapshot::readiness(&content_path)?;
             if !matches!(evidence.identity(), CanonicalIdentityStatus::Resolved(ref identity) if &identity.game_key == game_key)
@@ -3104,6 +3113,11 @@ pub(crate) fn show_launch_readiness_panel(
             shadps4,
             ..
         } => {
+            if plan.platform_id.as_deref() == Some("Saturn")
+                && let Some(context) = retroarch
+            {
+                saturn_core::show(ui, &context.environment);
+            }
             if let Some(context) = vice {
                 for candidate in &plan.candidates {
                     context.show(ui, plan, candidate, standalone_launch_state);

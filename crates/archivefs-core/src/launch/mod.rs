@@ -166,6 +166,7 @@ pub mod rpcs3_execution;
 pub mod safe_launch_sandbox;
 pub mod sameboy_command;
 pub mod sameboy_execution;
+pub mod saturn_core_selection;
 pub mod scummvm_command;
 pub mod scummvm_execution;
 #[cfg(target_os = "linux")]
