@@ -185,6 +185,76 @@ pub(super) struct UpgradeLock {
 }
 
 impl UpgradeLock {
+    fn path(database_path: &Path) -> Result<PathBuf> {
+        let mut name = file_name_of(database_path)?.to_os_string();
+        name.push(".upgrade.lock");
+        Ok(parent_of(database_path).join(name))
+    }
+
+    /// Wait for an already-visible creator/upgrader without creating a lock
+    /// sidecar. Normal opens of old, current or invalid databases must not
+    /// create files merely to classify them. Hold the returned lock through
+    /// classification, and reuse it if an empty database needs initialising.
+    pub(super) fn acquire_existing_waiting(
+        database_path: &Path,
+        timeout: std::time::Duration,
+    ) -> Result<Option<Self>> {
+        let lock_path = Self::path(database_path)?;
+        // Match the creator's exclusive-lock access mode, but never create
+        // or truncate a sidecar during classification.
+        let file = match OpenOptions::new()
+            .write(true)
+            .truncate(false)
+            .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK)
+            .open(&lock_path)
+        {
+            Ok(file) => file,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+            Err(error) => {
+                return Err(db_error(format!(
+                    "could not inspect the existing upgrade lock {}. The library database was not changed: {error}",
+                    lock_path.display()
+                )));
+            }
+        };
+        if !file
+            .metadata()
+            .map_err(|error| {
+                db_error(format!(
+                    "could not inspect the existing upgrade lock {}: {error}",
+                    lock_path.display()
+                ))
+            })?
+            .is_file()
+        {
+            return Err(db_error(format!(
+                "existing upgrade lock {} is not a regular file. Nothing was changed.",
+                lock_path.display()
+            )));
+        }
+        let deadline = std::time::Instant::now() + timeout;
+        loop {
+            match file.try_lock() {
+                Ok(()) => return Ok(Some(Self { _file: file })),
+                Err(fs::TryLockError::WouldBlock) if std::time::Instant::now() < deadline => {
+                    std::thread::sleep(std::time::Duration::from_millis(20));
+                }
+                Err(fs::TryLockError::WouldBlock) => {
+                    return Err(db_error(format!(
+                        "another upgrade or creation of {} is already running; refusing to inspect its intermediate schema. Nothing was changed.",
+                        database_path.display()
+                    )));
+                }
+                Err(fs::TryLockError::Error(error)) => {
+                    return Err(db_error(format!(
+                        "could not take the existing upgrade lock {}. The library database was not changed: {error}",
+                        lock_path.display()
+                    )));
+                }
+            }
+        }
+    }
+
     /// Like [`acquire`](Self::acquire) but waits (bounded) for another holder,
     /// for callers that must serialise rather than fail, such as concurrent
     /// first-run database creation.
@@ -208,9 +278,7 @@ impl UpgradeLock {
     }
 
     pub(super) fn acquire(database_path: &Path) -> Result<Self> {
-        let mut name = file_name_of(database_path)?.to_os_string();
-        name.push(".upgrade.lock");
-        let lock_path = parent_of(database_path).join(name);
+        let lock_path = Self::path(database_path)?;
         let file = OpenOptions::new()
             .write(true)
             .create(true)

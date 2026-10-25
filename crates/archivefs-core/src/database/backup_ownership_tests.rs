@@ -512,3 +512,62 @@ fn only_recognised_backup_names_count_toward_the_cap() {
     assert_eq!(inspect_upgrade_backups(&db).unwrap().len(), 3);
     let _ = fs::remove_dir_all(root);
 }
+
+#[test]
+fn an_existing_creation_lock_is_waited_on_without_creating_or_rewriting_files() {
+    use std::time::Duration;
+    let directory = tempfile::tempdir().unwrap();
+    let path = directory.path().join("library.sqlite3");
+    let lock_path = directory.path().join("library.sqlite3.upgrade.lock");
+    assert!(
+        UpgradeLock::acquire_existing_waiting(&path, Duration::ZERO)
+            .unwrap()
+            .is_none()
+    );
+    assert!(!lock_path.exists());
+    assert!(!path.exists());
+
+    let creator = UpgradeLock::acquire(&path).unwrap();
+    fs::write(&lock_path, b"existing lock contents").unwrap();
+    let before = listing(directory.path());
+    let start = std::time::Instant::now();
+    assert!(UpgradeLock::acquire_existing_waiting(&path, Duration::from_millis(40)).is_err());
+    assert!(start.elapsed() < Duration::from_secs(2));
+    assert_eq!(listing(directory.path()), before);
+    drop(creator);
+
+    let existing = UpgradeLock::acquire_existing_waiting(&path, Duration::ZERO)
+        .unwrap()
+        .unwrap();
+    assert!(
+        UpgradeLock::acquire(&path).is_err(),
+        "returned lock must remain held"
+    );
+    assert_eq!(listing(directory.path()), before);
+    drop(existing);
+    assert!(UpgradeLock::acquire(&path).is_ok());
+    assert_eq!(listing(directory.path()), before);
+}
+
+#[test]
+fn existing_creation_lock_links_and_special_files_are_refused_without_following_or_blocking() {
+    use std::os::unix::fs::symlink;
+    use std::time::Duration;
+    let directory = tempfile::tempdir().unwrap();
+    let path = directory.path().join("library.sqlite3");
+    let lock_path = directory.path().join("library.sqlite3.upgrade.lock");
+    let target = directory.path().join("unrelated");
+    fs::write(&target, b"preserve unrelated bytes").unwrap();
+    symlink(&target, &lock_path).unwrap();
+    assert!(UpgradeLock::acquire_existing_waiting(&path, Duration::ZERO).is_err());
+    assert_eq!(fs::read(&target).unwrap(), b"preserve unrelated bytes");
+    fs::remove_file(&lock_path).unwrap();
+    let name = std::ffi::CString::new(lock_path.as_os_str().as_encoded_bytes()).unwrap();
+    // SAFETY: name is a live C path to a disposable fixture entry.
+    assert_eq!(unsafe { libc::mkfifo(name.as_ptr(), 0o600) }, 0);
+    let start = std::time::Instant::now();
+    assert!(UpgradeLock::acquire_existing_waiting(&path, Duration::ZERO).is_err());
+    assert!(start.elapsed() < Duration::from_secs(2));
+    assert!(!path.exists());
+    assert_eq!(fs::read(target).unwrap(), b"preserve unrelated bytes");
+}

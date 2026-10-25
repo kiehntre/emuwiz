@@ -127,6 +127,22 @@ fn direct_open_of_an_outdated_database_does_not_migrate_or_back_up() {
 }
 
 #[test]
+fn a_completed_creator_lock_does_not_authorize_an_automatic_upgrade() {
+    let directory = tempfile::tempdir().unwrap();
+    let path = directory.path().join("library.sqlite3");
+    make_real_old_database(&path, 7);
+    drop(UpgradeLock::acquire(&path).unwrap());
+    let before = snapshot(directory.path());
+    let error = match Database::open_or_create(&path) {
+        Ok(_) => panic!("old schemas still require explicit upgrade"),
+        Err(error) => error,
+    };
+    assert!(error.to_string().contains("upgrade"));
+    assert_eq!(user_version(&path), 7);
+    assert_eq!(snapshot(directory.path()), before);
+}
+
+#[test]
 fn newer_or_ambiguous_databases_are_refused_clearly() {
     let root = temp_root("ambiguous");
     let newer = root.join("newer.sqlite3");
@@ -221,6 +237,54 @@ fn concurrent_creators_serialise_and_each_get_a_complete_schema() {
         .unwrap();
     assert_eq!(rows as usize, MIGRATIONS.len());
     let _ = fs::remove_dir_all(root);
+}
+
+/// Hold the creator's real lock across an intermediate committed schema.
+/// A second normal creator must wait, not classify that temporary schema as
+/// an old library requiring a protected upgrade.
+#[test]
+fn a_creator_waits_for_an_in_progress_creation_before_classifying_its_schema() {
+    use std::sync::mpsc;
+    use std::time::Duration;
+
+    let directory = tempfile::tempdir().unwrap();
+    let path = directory.path().join("library.sqlite3");
+    let lock = UpgradeLock::acquire(&path).unwrap();
+    let mut connection = open_connection(&path).unwrap();
+    apply_migrations(&mut connection, &MIGRATIONS[..1]).unwrap();
+    assert_eq!(schema_version(&connection).unwrap(), 1);
+
+    let (started, entered) = mpsc::channel();
+    let (sender, receiver) = mpsc::channel();
+    let other_path = path.clone();
+    let reader = std::thread::spawn(move || {
+        started.send(()).unwrap();
+        let result =
+            Database::open_or_create(other_path).map(|database| database.schema_version().unwrap());
+        sender.send(result).unwrap();
+    });
+    entered.recv_timeout(Duration::from_secs(5)).unwrap();
+    let early = receiver.recv_timeout(Duration::from_secs(1));
+    let observed_intermediate = early.is_ok();
+
+    // Finish the real migration chain and release its lock even when the
+    // pre-fix implementation returned an intermediate-schema error.
+    apply_migrations(&mut connection, MIGRATIONS).unwrap();
+    connection.close().unwrap();
+    drop(lock);
+    let result = match early {
+        Ok(result) => result,
+        Err(mpsc::RecvTimeoutError::Timeout) => {
+            receiver.recv_timeout(Duration::from_secs(5)).unwrap()
+        }
+        Err(error) => panic!("creator stopped before completing: {error}"),
+    };
+    reader.join().unwrap();
+    assert!(
+        !observed_intermediate,
+        "another creator returned while schema 1 was visible and the creation lock was held: {result:?}"
+    );
+    assert_eq!(result.unwrap(), latest_known_version(MIGRATIONS));
 }
 
 #[test]
