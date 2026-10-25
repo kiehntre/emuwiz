@@ -2056,6 +2056,7 @@ mod game_metadata_enrichment_tests {
                 scope: archivefs_core::emulator_environment::retroarch::ProfileScope::User,
             },
             core_stem: "pcsx2".to_string(),
+            saturn_core_selection: None,
             expected_snapshot_evidence: None,
             expected_appimage_executable: None,
             expected_executable_binding: None,

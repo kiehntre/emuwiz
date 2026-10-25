@@ -29,6 +29,7 @@ use std::{
 pub(super) struct Preferences {
     pub route: Route,
     pub filter: Filter,
+    pub playing_library: crate::playing_library_page::preferences::SavedPreferences,
     #[serde(default)]
     pub welcome_dismissed: bool,
     #[serde(default = "default_beginner_hints_enabled")]
@@ -67,6 +68,7 @@ impl Default for Preferences {
         Self {
             route: Route::default(),
             filter: Filter::default(),
+            playing_library: Default::default(),
             welcome_dismissed: false,
             beginner_hints_enabled: true,
             document_roots: Vec::new(),

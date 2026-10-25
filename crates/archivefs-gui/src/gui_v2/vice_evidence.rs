@@ -110,7 +110,7 @@ pub(crate) fn inspect(
         return Err("No current C64 DAT identity remains.".into());
     }
     let (bytes, file) = read_regular(path, MAX_CARTRIDGE_BYTES)?;
-    qualify_cartridge(path, &bytes)?;
+    archivefs_core::disk_format::crt::verify_standard_8k_rom(path, &bytes)?;
     let sha256 = crate::gui_v2::vice_evidence::hex(&sha2::Sha256::digest(&bytes));
     let actual = [
         (hashes.sha256.as_deref(), sha256.clone()),
@@ -142,38 +142,6 @@ pub(crate) fn inspect(
         file,
         catalogues,
     })
-}
-
-fn qualify_cartridge(path: &Path, bytes: &[u8]) -> Result<(), String> {
-    use archivefs_core::disk_format::{DiskFormatContext, DiskFormatMetadata, inspect_disk_format};
-    let inspected = inspect_disk_format(
-        path,
-        &archivefs_core::safe_read::TrustedRoots::none(),
-        DiskFormatContext {
-            folder_platform: Some("Commodore 64"),
-        },
-        None,
-    );
-    let Some(DiskFormatMetadata::Crt(layout)) = inspected.metadata else {
-        return Err("Gold's CRT structural inspection refused this cartridge.".into());
-    };
-    // Qualification over Gold's validated layout, not another CRT parser.
-    // The validated first CHIP load address is not exposed by CrtLayout.
-    if layout.header_length != 64
-        || layout.version != 0x0100
-        || layout.hardware_type != 0
-        || layout.exrom != 0
-        || layout.game != 1
-        || layout.packets != 1
-        || layout.chip_types != [0]
-        || layout.banks != [0]
-        || layout.total_image_bytes != 8192
-        || bytes.len() != 64 + 16 + 8192
-        || bytes.get(0x4c..0x4e) != Some(&[0x80, 0x00])
-    {
-        return Err("VICE Play currently supports only standard 8 KiB ROM cartridges (CRT v1, hardware 0, bank 0 at $8000).".into());
-    }
-    Ok(())
 }
 
 /// Nonblocking, no-follow bounded read; never opens a FIFO or imported command.
