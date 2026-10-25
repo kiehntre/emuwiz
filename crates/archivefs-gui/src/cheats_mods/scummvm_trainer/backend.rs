@@ -24,9 +24,23 @@ pub(super) struct Roots {
 
 impl Roots {
     pub fn managed() -> Result<Self, String> {
+        let profiles = archivefs_core::app_dirs::data_path("scummvm-trainer-options")
+            .map_err(|e| e.to_string())?;
+        // A test that installed its own temporary machine keeps its receipts
+        // out of every other test's History, as the other cheat routes do.
+        // Thread-local: resolve on the caller's thread, not inside a worker.
+        #[cfg(test)]
+        if let Some((history, backups)) =
+            crate::cheats_mods::duckstation_environment::shared_history_roots()
+        {
+            return Ok(Self {
+                profiles,
+                history,
+                backups,
+            });
+        }
         Ok(Self {
-            profiles: archivefs_core::app_dirs::data_path("scummvm-trainer-options")
-                .map_err(|e| e.to_string())?,
+            profiles,
             history: default_shared_history_root().map_err(|e| e.detail)?,
             backups: default_shared_backup_root().map_err(|e| e.detail)?,
         })
