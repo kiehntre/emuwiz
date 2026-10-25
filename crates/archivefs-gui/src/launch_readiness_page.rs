@@ -49,6 +49,7 @@ mod melonds_cheats;
 mod retroarch_cheat_sets;
 mod retroarch_cheats;
 mod scummvm_profile;
+pub(crate) mod vice;
 pub(crate) mod xroar;
 use std::path::{Path, PathBuf};
 use std::sync::mpsc::{self, Receiver, TryRecvError};
@@ -171,6 +172,7 @@ pub(crate) enum LaunchReadinessInput {
         cemu: Option<cemu::Context>,
         flycast: Option<flycast::Context>,
         xroar: Option<xroar::Context>,
+        vice: Option<vice::Context>,
         amiga_whdload: Option<AmigaWHDLoadLaunchContext>,
         #[cfg(target_os = "linux")]
         shadps4: Option<crate::emulator_setup::shadps4::Snapshot>,
@@ -368,6 +370,7 @@ impl TypedLaunchRequest {
             Self::Standalone(StandaloneLaunchRequest::ShadPs4(request)) => {
                 request.plan.warnings().to_vec()
             }
+            Self::Standalone(StandaloneLaunchRequest::Vice(_)) => vec![vice::LIMITATION],
             _ => Vec::new(),
         }
     }
@@ -651,6 +654,7 @@ pub(crate) fn gamer_play_action(input: &LaunchReadinessInput) -> GamerPlayAction
         cemu,
         flycast,
         xroar,
+        vice,
         amiga_whdload,
         #[cfg(target_os = "linux")]
         shadps4,
@@ -730,6 +734,11 @@ pub(crate) fn gamer_play_action(input: &LaunchReadinessInput) -> GamerPlayAction
             if let Some(request) = flycast.as_ref().and_then(|c| c.request(plan, candidate)) {
                 return Some(TypedLaunchRequest::Standalone(
                     StandaloneLaunchRequest::Flycast(request),
+                ));
+            }
+            if let Some(request) = vice.as_ref().and_then(|c| c.request(plan, candidate)) {
+                return Some(TypedLaunchRequest::Standalone(
+                    StandaloneLaunchRequest::Vice(request),
                 ));
             }
             if let Some(request) = xroar
@@ -994,6 +1003,7 @@ pub(crate) enum StandaloneProcess {
     Cemu(archivefs_core::launch::LaunchedCemuProcess),
     Flycast(archivefs_core::launch::LaunchedFlycastProcess),
     XRoar(archivefs_core::launch::process_spawn::WatchedProcess),
+    Vice(archivefs_core::launch::process_spawn::WatchedProcess),
     ScummVm(archivefs_core::launch::LaunchedScummVmProcess),
     OpenMsx(archivefs_core::launch::process_spawn::WatchedProcess),
     /// DOSBox running inside the bubblewrap sandbox.
@@ -1235,6 +1245,7 @@ impl StandaloneLaunchState {
                     StandaloneProcess::Cemu(p) => p.poll().is_some(),
                     StandaloneProcess::Flycast(p) => p.poll().is_some(),
                     StandaloneProcess::XRoar(p) => p.poll().is_some(),
+                    StandaloneProcess::Vice(p) => p.poll().is_some(),
                     StandaloneProcess::ScummVm(p) => p.poll().is_some(),
                     StandaloneProcess::OpenMsx(p) => p.poll().is_some(),
                     StandaloneProcess::DosBox(p) => p.poll().is_some(),
@@ -1422,6 +1433,7 @@ pub(crate) enum StandaloneLaunchRequest {
     Cemu(cemu::Request),
     Flycast(flycast::Request),
     XRoar(xroar::Request),
+    Vice(vice::Request),
     #[cfg(target_os = "linux")]
     ShadPs4(crate::emulator_setup::shadps4::Request),
     Mame(MameLaunchRequest),
@@ -1482,6 +1494,7 @@ impl StandaloneLaunchRequest {
             Self::Cemu(_) => "Cemu",
             Self::Flycast(_) => "Flycast",
             Self::XRoar(_) => "XRoar",
+            Self::Vice(_) => "VICE",
             Self::ScummVm(_) => "ScummVM",
             Self::OpenMsx(..) => "openMSX",
             Self::DosBox(_) => "DOSBox",
@@ -1503,6 +1516,7 @@ impl StandaloneLaunchRequest {
             Self::Cemu(r) => r.key(),
             Self::Flycast(r) => r.key(),
             Self::XRoar(r) => r.key(),
+            Self::Vice(r) => r.key(),
             Self::ScummVm(r) => (r.selected_game_folder.clone(), "scummvm".into()),
             Self::OpenMsx(r, _) => (r.selected_content_path.clone(), "openmsx".into()),
             Self::DosBox(r) => (r.game_directory.clone(), dosbox::ADAPTER_KEY.into()),
@@ -1513,6 +1527,7 @@ impl StandaloneLaunchRequest {
             Self::Cemu(r) => r.execute().map(StandaloneProcess::Cemu),
             Self::Flycast(r) => r.execute().map(StandaloneProcess::Flycast),
             Self::XRoar(r) => r.execute().map(StandaloneProcess::XRoar),
+            Self::Vice(r) => r.execute().map(StandaloneProcess::Vice),
             #[cfg(target_os = "linux")]
             Self::ShadPs4(r) => r
                 .execute()
@@ -3058,11 +3073,17 @@ pub(crate) fn show_launch_readiness_panel(
             cemu,
             flycast,
             xroar,
+            vice,
             amiga_whdload,
             #[cfg(target_os = "linux")]
             shadps4,
             ..
         } => {
+            if let Some(context) = vice {
+                for candidate in &plan.candidates {
+                    context.show(ui, plan, candidate, standalone_launch_state);
+                }
+            }
             if let Some(context) = xroar {
                 for candidate in &plan.candidates {
                     if matches!(
@@ -3446,6 +3467,7 @@ fn launch_command_preview(
             profile_id,
             ..
         } => match *adapter_id {
+            "vice" => vice::command_preview(plan, candidate),
             "dolphin" => {
                 let context = dolphin?;
                 let profile = context
@@ -4267,6 +4289,7 @@ fn candidate_emulator_name(candidate: &LaunchCandidate) -> Option<&'static str> 
             "fuse" => Some("Fuse"),
             "tsugaru" => Some("Tsugaru"),
             "xroar" => Some("XRoar"),
+            "vice" => Some("VICE"),
             _ => None,
         },
         LaunchTarget::RetroArchCore { .. } => Some("RetroArch"),
@@ -4767,6 +4790,10 @@ fn show_standalone_launch_action(
             Some((_, _, StandaloneLaunchStage::Running(StandaloneProcess::ScummVm(_)))) => {
                 ui.small("ScummVM process started; EmuWiz cannot tell whether the game itself is running.");
             }
+            Some((_, _, StandaloneLaunchStage::Running(StandaloneProcess::Vice(process)))) => {
+                ui.small(format!("VICE running · PID {}", process.pid));
+                ui.small("Starting the process does not prove the game ran.");
+            }
             Some((_, _, StandaloneLaunchStage::Running(StandaloneProcess::OpenMsx(process)))) => {
                 ui.small(format!("openMSX running · PID {}", process.pid));
                 ui.small("Starting the process does not prove the game ran.");
@@ -4794,6 +4821,11 @@ fn show_standalone_launch_action(
                     && let Some(report) = process.poll()
                 {
                     ui.label(exit_line("ScummVM", report));
+                }
+                if let StandaloneProcess::Vice(process) = process
+                    && let Some(report) = process.poll()
+                {
+                    ui.label(exit_line("VICE", report));
                 }
                 if let StandaloneProcess::OpenMsx(process) = process
                     && let Some(report) = process.poll()
@@ -4849,6 +4881,13 @@ fn show_standalone_launch_action(
             state.start(request);
             return;
         }
+        if adapter == "vice"
+            && !state.is_active()
+            && ui.button("Play in VICE again (recheck)").clicked()
+        {
+            state.start(request);
+            return;
+        }
         if adapter == "melonds"
             && !state.is_active()
             && ui.button("Launch melonDS again (recheck)").clicked()
@@ -4884,6 +4923,7 @@ fn show_standalone_launch_action(
             format!("Launch {adapter} with {} cheat(s)", choice.chosen_count())
         }
         _ if adapter == dosbox::ADAPTER_KEY => "Play in DOSBox".to_string(),
+        _ if adapter == "vice" => "Play in VICE".to_string(),
         // ScummVM's Play reads as the product name, like its recheck button.
         _ if adapter == "scummvm" => format!("Launch {}", request.adapter_name()),
         _ => format!("Launch {adapter}"),

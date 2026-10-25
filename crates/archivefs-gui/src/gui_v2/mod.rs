@@ -100,6 +100,7 @@ pub(crate) mod verified_game_fixture;
 mod verified_game_fixture_tests;
 #[cfg(test)]
 mod verify_journey_tests;
+pub(crate) mod vice_evidence;
 mod view_history_page;
 mod visual_pages;
 mod wiiu_disc;
