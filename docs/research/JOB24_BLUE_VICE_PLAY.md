@@ -78,6 +78,7 @@ Focused regression command (test processes use private HOME/XDG/TMP roots):
 
 ```text
 scripts/cargo-iso test -p archivefs-gui --lib -- launch_readiness_page:: gui_v2::vice_evidence:: --test-threads=2
+scripts/cargo-iso check -p archivefs-gui --lib
 ```
 
 Result: 226 passed, 0 failed, 1 existing ignored test. Workspace formatting
@@ -101,6 +102,10 @@ path; production checks were retained. Independent review also identified an
 early preview refusal hiding historical process feedback when the executable
 disappeared. A new regression failed before the correction; the panel now keeps
 that feedback visible and disables launch controls until preview succeeds again.
+The first full CI run also caught production use of SHA-1/MD5 while their
+existing dependency declarations were test-only. A normal library check
+reproduced that compiler failure; the same locked versions are now production
+dependencies, with no new packages or changes to the VICE engine.
 Normal CI and an independent launch-safety
 review of the final candidate are required before promotion. Stage 2 remains
 gated on Stage 1 merge and validation.

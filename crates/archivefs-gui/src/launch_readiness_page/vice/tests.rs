@@ -132,12 +132,14 @@ fn exact_dat_through_real_planner_offers_explicit_play_and_tracks_process_exit()
             f.lab.evidence()
         })
         .unwrap();
-    let mut state = StandaloneLaunchState::default();
-    state.tracked = Some((
-        f.lab.path.clone(),
-        "vice".into(),
-        StandaloneLaunchStage::Running(StandaloneProcess::Vice(process)),
-    ));
+    let mut state = StandaloneLaunchState {
+        tracked: Some((
+            f.lab.path.clone(),
+            "vice".into(),
+            StandaloneLaunchStage::Running(StandaloneProcess::Vice(process)),
+        )),
+        ..Default::default()
+    };
     let deadline = Instant::now() + Duration::from_secs(3);
     while state.is_active() && Instant::now() < deadline {
         state.poll();
@@ -410,12 +412,14 @@ fn removed_executable_does_not_hide_historical_exit_reporting() {
     }
     assert!(process.poll().is_some());
     fs::remove_file(executable).unwrap();
-    let mut state = StandaloneLaunchState::default();
-    state.tracked = Some((
-        f.lab.path.clone(),
-        "vice".into(),
-        StandaloneLaunchStage::Exited(StandaloneProcess::Vice(process)),
-    ));
+    let mut state = StandaloneLaunchState {
+        tracked: Some((
+            f.lab.path.clone(),
+            "vice".into(),
+            StandaloneLaunchStage::Exited(StandaloneProcess::Vice(process)),
+        )),
+        ..Default::default()
+    };
     let LaunchReadinessInput::Plan { plan, .. } = input(f.context.clone()) else {
         unreachable!()
     };
