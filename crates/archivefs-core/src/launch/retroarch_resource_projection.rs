@@ -889,6 +889,7 @@ mod tests {
         let request = request(&temp);
         let plan = plan_retroarch_resource_grants(&request).unwrap();
         let command = RetroArchCommand {
+            snapshot_evidence: None,
             executable: PathBuf::from("/retroarch"),
             arguments: vec!["-L".into(), "/core.so".into(), "/game.hdf".into()],
             working_directory: None,

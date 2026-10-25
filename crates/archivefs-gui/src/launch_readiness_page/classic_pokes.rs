@@ -9,16 +9,16 @@ use archivefs_core::launch::libretro_probe::ProbeLauncher;
 use archivefs_core::launch::{RetroArchLaunchRequest, preflight_retroarch_launch};
 use eframe::egui;
 use std::collections::BTreeSet;
-use std::path::PathBuf;
 use std::sync::mpsc::{self, Receiver};
 
-type Scope = (PathBuf, String);
+type Scope = RetroArchLaunchRequest;
 type PreviewResult = Result<PokeLaunchPreview, String>;
 #[derive(Default)]
 pub(super) struct Chooser {
     scope: Option<Scope>,
     enabled: bool,
     selected: BTreeSet<usize>,
+    acknowledged: bool,
     preview: Option<PokeLaunchPreview>,
     pending: Option<Receiver<PreviewResult>>,
     problem: Option<String>,
@@ -28,6 +28,8 @@ pub(super) struct Chooser {
 pub(super) struct Selection {
     preview: PokeLaunchPreview,
     entries: Vec<usize>,
+    acknowledged: bool,
+    request: RetroArchLaunchRequest,
 }
 
 impl Chooser {
@@ -37,10 +39,7 @@ impl Chooser {
         request: &RetroArchLaunchRequest,
         busy: bool,
     ) -> Option<Selection> {
-        let scope = (
-            request.selected_content_path.clone(),
-            request.expected_game_key.clone(),
-        );
+        let scope = request.clone();
         if self.scope.as_ref() != Some(&scope) {
             *self = Self {
                 scope: Some(scope),
@@ -63,7 +62,7 @@ impl Chooser {
             }
             ui.add_enabled_ui(!busy, |ui| {
                 ui.checkbox(&mut self.enabled, "Use explicitly selected POKE trainers for this launch");
-                if !self.enabled { self.selected.clear(); return; }
+                if !self.enabled { self.selected.clear(); self.acknowledged = false; return; }
                 if let Some(receiver) = &self.pending {
                     match receiver.try_recv() {
                         Ok(Ok(preview)) => { self.preview = Some(preview); self.pending = None; }
@@ -73,7 +72,7 @@ impl Chooser {
                     }
                 }
                 if self.pending.is_none() && ui.button("Load / refresh verified POKE entries").clicked() {
-                    self.preview = None; self.selected.clear(); self.problem = None;
+                    self.preview = None; self.selected.clear(); self.acknowledged = false; self.problem = None;
                     let path = request.selected_content_path.clone();
                     let (sender, receiver) = mpsc::channel(); self.pending = Some(receiver);
                     let context = ui.ctx().clone();
@@ -88,16 +87,19 @@ impl Chooser {
                     for (index, title) in preview.titles().iter().enumerate() {
                         let mut selected = self.selected.contains(&index);
                         if ui.checkbox(&mut selected, format!("{}: {title}", index + 1)).changed() {
+                            self.acknowledged = false;
                             if selected { self.selected.insert(index); } else { self.selected.remove(&index); }
                         }
                     }
                     let requested: Vec<_> = self.selected.iter().map(|&i| preview.titles()[i].clone()).collect();
                     ui.label(format!("Requested POKEs: {}", if requested.is_empty() { "none".into() } else { requested.join(", ") }));
                     ui.label("This action launches only these selected POKE entries. Sources, pin, game identity and core are checked again before launch. This launch starts from the snapshot with automatic state loading disabled. In-game activation remains unconfirmed.");
-                    if ui.add_enabled(!requested.is_empty(), egui::Button::new("Launch with selected POKE trainers")).clicked() {
+                    ui.label("These trainers require review before launch. Approval does not confirm that they work in this game.");
+                    ui.add_enabled_ui(!requested.is_empty(), |ui| { ui.checkbox(&mut self.acknowledged, "I reviewed these POKE trainers for this game"); });
+                    if ui.add_enabled(!requested.is_empty() && self.acknowledged, egui::Button::new("Launch with selected POKE trainers")).clicked() {
                         self.requested = requested;
-                        selection = Some(Selection { preview: preview.clone(), entries: self.selected.iter().copied().collect() });
-                        self.enabled = false; self.selected.clear();
+                        selection = Some(Selection { preview: preview.clone(), entries: self.selected.iter().copied().collect(), acknowledged: self.acknowledged, request: request.clone() });
+                        self.enabled = false; self.selected.clear(); self.acknowledged = false;
                     }
                 }
             });
@@ -112,6 +114,9 @@ pub(super) fn launch(
     probe: &dyn ProbeLauncher,
     environment: &DiscoveryEnvironment,
 ) -> Result<RetroArchCheatLaunch, String> {
+    if !selected.acknowledged || &selected.request != request {
+        return Err("Trainer review approval is absent or stale; select and review again.".into());
+    }
     if request.profile.profile_kind != ProfileKind::Native
         || request.core_stem != "fuse"
         || request.expected_platform_id != "ZX Spectrum"
@@ -123,7 +128,7 @@ pub(super) fn launch(
         .map_err(|e| format!("Trainer launch preflight refused: {e:?}"))?;
     let (game, roots) =
         crate::gui_v2::classic_trainers::current_launch_evidence(&request.selected_content_path)?;
-    let prepared = launch::prepare(
+    let mut prepared = launch::prepare(
         &selected.preview,
         &game,
         &roots,
@@ -131,6 +136,11 @@ pub(super) fn launch(
         &command.executable,
         &selected.entries,
     )?;
+    // Preserve the assessor's NeedsReview state. Only this explicit, scoped
+    // user acknowledgement authorizes the existing planner's review gate.
+    for selection in &mut prepared.selections {
+        selection.review_acknowledged = selected.acknowledged;
+    }
     super::retroarch_cheats::launch_selection(
         request,
         RetroArchCheatSelection {
@@ -195,6 +205,7 @@ mod tests {
                 scope: ProfileScope::User,
             },
             core_stem: "fuse".into(),
+            expected_snapshot_evidence: None,
             expected_appimage_executable: None,
             expected_executable_binding: None,
             expected_configuration_file: None,
@@ -309,6 +320,21 @@ mod tests {
                 .iter()
                 .any(|(s, _)| s.contains("activation remains unconfirmed"))
         );
+        assert!(
+            click(
+                &mut chooser,
+                &ctx,
+                &request,
+                "Launch with selected POKE trainers"
+            )
+            .is_none()
+        );
+        click(
+            &mut chooser,
+            &ctx,
+            &request,
+            "I reviewed these POKE trainers for this game",
+        );
         let selected = click(
             &mut chooser,
             &ctx,
@@ -317,6 +343,8 @@ mod tests {
         )
         .unwrap();
         assert_eq!(selected.entries, vec![0]);
+        assert!(selected.acknowledged);
+        assert!(!chooser.acknowledged);
         assert!(!chooser.enabled);
         assert!(chooser.selected.is_empty());
     }
@@ -367,5 +395,58 @@ mod tests {
                 .iter()
                 .any(|(s, _)| s == "Launch with selected POKE trainers")
         );
+    }
+    #[test]
+    fn changing_entries_or_installation_revokes_review_approval() {
+        let (_dir, request, preview) = fixture();
+        let ctx = egui::Context::default();
+        let mut chooser = Chooser::default();
+        frame(&mut chooser, &ctx, &request, vec![]);
+        click(
+            &mut chooser,
+            &ctx,
+            &request,
+            "POKE trainers (optional, default OFF)",
+        );
+        click(
+            &mut chooser,
+            &ctx,
+            &request,
+            "Use explicitly selected POKE trainers for this launch",
+        );
+        chooser.preview = Some(preview);
+        click(&mut chooser, &ctx, &request, "1: Lives");
+        click(
+            &mut chooser,
+            &ctx,
+            &request,
+            "I reviewed these POKE trainers for this game",
+        );
+        assert!(chooser.acknowledged);
+        click(&mut chooser, &ctx, &request, "2: Energy");
+        assert!(!chooser.acknowledged);
+        assert!(
+            click(
+                &mut chooser,
+                &ctx,
+                &request,
+                "Launch with selected POKE trainers"
+            )
+            .is_none()
+        );
+        click(
+            &mut chooser,
+            &ctx,
+            &request,
+            "I reviewed these POKE trainers for this game",
+        );
+        assert!(chooser.acknowledged);
+        let mut changed = request.clone();
+        changed.expected_configuration_file = Some("/different/settings.cfg".into());
+        frame(&mut chooser, &ctx, &changed, vec![]);
+        assert!(!chooser.acknowledged);
+        assert!(!chooser.enabled);
+        assert!(chooser.preview.is_none());
+        assert!(chooser.selected.is_empty());
     }
 }

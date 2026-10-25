@@ -1622,6 +1622,8 @@ struct RetroArchLaunchKey {
     content_path: PathBuf,
     profile: ProfileRef,
     core_stem: String,
+    expected_snapshot_evidence:
+        Option<archivefs_core::classic_trainer_evidence::snapshot::SnapshotEvidence>,
     expected_appimage_executable: Option<PathBuf>,
     expected_executable_binding:
         Option<archivefs_core::launch::execution::RetroArchExecutableBinding>,
@@ -1634,6 +1636,7 @@ impl RetroArchLaunchKey {
             content_path: request.selected_content_path.clone(),
             profile: request.profile,
             core_stem: request.core_stem.clone(),
+            expected_snapshot_evidence: request.expected_snapshot_evidence.clone(),
             expected_appimage_executable: request.expected_appimage_executable.clone(),
             expected_executable_binding: request.expected_executable_binding.clone(),
             expected_configuration_file: request.expected_configuration_file.clone(),
@@ -1736,6 +1739,18 @@ impl RetroArchLaunchState {
     /// Read cheat sets from `root` instead of EmuWiz's default cheat cache.
     pub(crate) fn use_cheat_cache(&mut self, root: PathBuf) {
         self.cheat_cache_root = Some(root);
+    }
+
+    pub(crate) fn smoke_receipt(
+        &self,
+    ) -> Option<archivefs_core::launch::cheat_runtime::CheatRuntimeReceipt> {
+        match self.tracked.as_ref().map(|(_, stage)| stage) {
+            Some(
+                RetroArchLaunchStage::RunningCheats { session }
+                | RetroArchLaunchStage::ExitedCheats { session },
+            ) => Some(session.receipt().clone()),
+            _ => None,
+        }
     }
 
     pub(crate) fn use_probe(
@@ -2825,11 +2840,21 @@ fn retroarch_launch_request(
         ProfileKind::Flatpak => return None,
     };
     Some(RetroArchLaunchRequest {
-        selected_content_path: content_path,
+        selected_content_path: content_path.clone(),
         expected_platform_id: platform_id.clone(),
         expected_game_key: game_key.clone(),
         profile: *profile,
         core_stem: core_stem.clone(),
+        expected_snapshot_evidence: if platform_id == "ZX Spectrum" {
+            let evidence = crate::emulator_setup::zx_snapshot::readiness(&content_path)?;
+            if !matches!(evidence.identity(), CanonicalIdentityStatus::Resolved(ref identity) if &identity.game_key == game_key)
+            {
+                return None;
+            }
+            Some(evidence)
+        } else {
+            None
+        },
         expected_appimage_executable,
         expected_configuration_file: if let Some(context) = retroarch {
             let selected = context

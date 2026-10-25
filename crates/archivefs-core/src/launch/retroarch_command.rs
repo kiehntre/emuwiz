@@ -30,6 +30,8 @@ use crate::launch::readiness::{LaunchBlocker, LaunchBlockerKind, LaunchReadiness
 /// process spawning.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RetroArchCommand {
+    /// Minted by source-aware preflight, checked again at the spawn boundary.
+    pub snapshot_evidence: Option<crate::classic_trainer_evidence::snapshot::SnapshotEvidence>,
     pub executable: PathBuf,
     pub arguments: Vec<OsString>,
     pub working_directory: Option<PathBuf>,
@@ -341,6 +343,7 @@ pub fn build_retroarch_command_plan(
     ]);
     RetroArchCommandPlan {
         command: Some(RetroArchCommand {
+            snapshot_evidence: None,
             executable,
             arguments,
             working_directory: None,

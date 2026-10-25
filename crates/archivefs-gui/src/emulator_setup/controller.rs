@@ -1035,6 +1035,16 @@ impl ArchiveFsApp {
             identity_status = identity.clone();
         }
 
+        // The snapshot adapter is shared with canonical preflight. It can
+        // only mint authority from current DAT evidence and matching bytes.
+        if matches!(
+            identity_status,
+            archivefs_core::launch::CanonicalIdentityStatus::Unknown
+        ) && let Some(path) = focused
+            && let Some(evidence) = crate::emulator_setup::zx_snapshot::readiness(path)
+        {
+            identity_status = evidence.identity();
+        }
         match identity_status {
             archivefs_core::launch::CanonicalIdentityStatus::Unknown => {
                 // The worker's own report already says which track of a CUE

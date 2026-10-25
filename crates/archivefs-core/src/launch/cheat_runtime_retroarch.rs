@@ -763,7 +763,16 @@ pub fn launch_prepared_command(
             command.arguments.extend(extra.iter().cloned());
             command
         },
-        |command| spawn_retroarch(command).map_err(|e| format!("{e:?}")),
+        |command| {
+            if command.snapshot_evidence.is_some() {
+                super::execution::spawn_retroarch_guarded(command, || {
+                    runtime.verify_sources().map_err(|e| e.to_string())
+                })
+                .map_err(|e| format!("{e:?}"))
+            } else {
+                spawn_retroarch(command).map_err(|e| format!("{e:?}"))
+            }
+        },
     );
     // Only a real hand-off is a launch. Anything else is reported as the
     // failure it is, with the receipt, never as "launched with cheats".
