@@ -53,6 +53,10 @@ impl Lab {
     fn new() -> Self {
         let root = tempfile::tempdir().unwrap();
         let path = root.path();
+        // Host utilities may be symlinks on CI. Only fixture copies enter the
+        // no-follow launch contract; production paths must remain link-free.
+        std::fs::copy("/usr/bin/true", path.join("true")).unwrap();
+        std::fs::copy("/usr/bin/dash", path.join("dash")).unwrap();
         let slave = slave_bytes();
         let package = lha(&[
             ("Nested/Game.slave", &slave),
@@ -124,7 +128,7 @@ impl Lab {
             profile: WHDLoadProfileInput {
                 emulator: AmigaEmulatorKind::FsUae,
                 profile_id: "test".into(),
-                executable: Some(PathBuf::from("/usr/bin/true")),
+                executable: Some(path.join("true")),
                 configuration: Some(path.join("fs-uae.conf")),
                 candidate_count: 1,
                 eligible: true,
@@ -362,8 +366,8 @@ fn watcher_retains_workspace_after_gui_handle_drop_and_deletes_only_after_exit()
     let mut prepared = prepare_boot(&lab.request, &approval).unwrap();
     let root = prepared.workspace_path().to_path_buf();
     let barrier = lab.root.path().join("release");
-    prepared.command.executable = "/usr/bin/dash".into();
-    prepared.executable = read(Path::new("/usr/bin/dash"), MAX_FILE).unwrap().1;
+    prepared.command.executable = lab.root.path().join("dash");
+    prepared.executable = read(&prepared.command.executable, MAX_FILE).unwrap().1;
     // Synthetic process only; production prepared commands are not mutable at the API boundary.
     prepared.command.arguments = vec![
         "-c".into(),
@@ -602,7 +606,7 @@ fn canonical_executor_prepares_private_config_with_an_inert_test_process() {
     assert!(super::super::amiga_whdload_execution::preflight_amiga_whdload_launch(&plan).is_err());
     let mut process =
         super::super::amiga_whdload_execution::preflight_and_launch_amiga_whdload(&plan).unwrap();
-    assert_eq!(process.command.executable, PathBuf::from("/usr/bin/true"));
+    assert_eq!(process.command.executable, lab.root.path().join("true"));
     assert_eq!(process.command.arguments.len(), 1);
     assert!(
         process.command.arguments[0]
@@ -773,4 +777,13 @@ fn canonical_identity_must_match_selected_slave_digest() {
         inspect_boot(&lab.request).is_err(),
         "matching manifest/profile keys cannot relabel a different selected slave"
     );
+}
+
+#[test]
+fn executable_symlink_is_refused_instead_of_silently_followed() {
+    let mut lab = Lab::new();
+    let link = lab.root.path().join("linked-true");
+    symlink(lab.root.path().join("true"), &link).unwrap();
+    lab.request.profile.executable = Some(link);
+    assert!(inspect_boot(&lab.request).is_err());
 }
