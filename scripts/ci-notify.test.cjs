@@ -118,6 +118,48 @@ test('posts exact PR/head, final status, workflow links and owner mention', asyn
   assert.match(h.posted[0].body, /actions\/runs\/2/);
   assert.ok(h.requested.filter(r => r.method === 'runs').every(r => r.args.head_sha === sha));
 });
+test('notification tests finishing after CI and CodeQL trigger exactly one final notification', async () => {
+  const workflow = require('node:fs').readFileSync(pathFor('../.github/workflows/ci-notify.yml'), 'utf8');
+  const triggers = workflow.match(/workflow_run:\s*\n\s+workflows: \[([^\]]+)\]/)[1]
+    .split(',').map(name => name.trim());
+  const h = harness();
+  const original = h.github.paginate;
+  let testsCompleted = false;
+  h.github.paginate = async (method, args) => {
+    if (method === 'comments') return h.posted.map(c => ({
+      user: {login: 'github-actions[bot]'}, body: c.body,
+    }));
+    const values = await original(method, args);
+    if (method === 'checks') return [...values, {
+      id: 1000, name: 'test', app: {slug: 'github-actions'},
+      status: testsCompleted ? 'completed' : 'in_progress',
+      conclusion: testsCompleted ? 'success' : null,
+    }];
+    return values;
+  };
+  const complete = async name => {
+    if (!triggers.includes(name)) return;
+    h.context.payload.workflow_run = {name, head_sha: sha, status: 'completed'};
+    await notify(h);
+  };
+  // Both required workflows are already successful in the fixture. Only the
+  // notification-tests check is outstanding, and Actions check_run cannot wake us.
+  await complete('CI');
+  assert.equal(h.posted.length, 0);
+  await complete('CodeQL');
+  assert.equal(h.posted.length, 0);
+  testsCompleted = true;
+  await complete('CI notification tests');
+  assert.equal(h.posted.length, 1);
+  assert.match(h.posted[0].body, /\*\*READY\*\*.*PR #7/);
+  assert.ok(h.posted[0].body.includes(marker(7, sha)));
+  assert.ok(h.requested.filter(r => r.method === 'checks').every(r => r.args.ref === sha));
+  await complete('CI notification tests');
+  assert.equal(h.posted.length, 1, 'duplicate completion must remain deduplicated');
+  const requests = h.requested.length;
+  await complete('CI completion notification');
+  assert.equal(h.requested.length, requests, 'the notifier must not trigger itself');
+});
 for (const mode of ['duplicate', 'stale', 'staleBase', 'foreign', 'pending']) {
   test(`${mode}: no notification`, async () => {
     const h = harness({[mode]: true}); await notify(h); assert.equal(h.posted.length, 0);

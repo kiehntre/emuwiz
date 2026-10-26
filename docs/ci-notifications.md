@@ -1,7 +1,8 @@
 # CI completion notifications
 
 After this feature is approved and merged into `main`, GitHub Actions runs
-`CI completion notification` on completion of **CI** or default-setup **CodeQL**.
+`CI completion notification` on completion of **CI**, default-setup **CodeQL**,
+or **CI notification tests**.
 No service, PAT, extra secret, schedule, Rust build or agent watcher is needed.
 The existing CI gates and risk tiers are unchanged. A separate read-only
 `CI notification tests` workflow runs on PRs touching the notifier; the

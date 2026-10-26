@@ -2,7 +2,7 @@ name: CI completion notification
 
 on:
   workflow_run:
-    workflows: [CI, CodeQL]
+    workflows: [CI, CodeQL, CI notification tests]
     types: [completed]
   # Supplemental external checks; GitHub suppresses Actions check_run recursion.
   check_run:
@@ -17,7 +17,7 @@ on:
 permissions:
   contents: read
 
-# Serialize both workflow completion events for a head. A replacement pending
+# Serialize watched workflow completion events for a head. A replacement pending
 # event reads the complete current state, so coalescing events is safe.
 concurrency:
   group: ci-notify-${{ github.event.workflow_run.head_sha || github.event.check_run.head_sha || inputs.head_sha }}
