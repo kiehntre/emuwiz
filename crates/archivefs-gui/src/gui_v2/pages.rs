@@ -624,7 +624,12 @@ impl App {
             // does not, so the selected game and its Play button stay in view.
             if let Route::BrowsePlay | Route::BrowsePlayGame(_) = route {
                 let selected = route.game();
-                if ui.available_height() < super::browse_play::MIN_BODY_HEIGHT {
+                let minimum = super::browse_play::minimum_body_height(
+                    ui.available_width(),
+                    selected.is_some(),
+                    self.simple.simple_navigation(),
+                );
+                if ui.available_height() < minimum {
                     // A large size on a small window: keep the application
                     // layout at a usable height and let the page scroll to it,
                     // so Play is reachable instead of cut off.
@@ -632,10 +637,9 @@ impl App {
                     // card or Play brings it into view like on every page.
                     super::simple_shell::show_page_scroll(ui, Section::Games, false, |ui| {
                         let width = ui.available_width();
-                        ui.allocate_ui(
-                            egui::vec2(width, super::browse_play::MIN_BODY_HEIGHT),
-                            |ui| self.browse_play(ui, selected),
-                        );
+                        ui.allocate_ui(egui::vec2(width, minimum), |ui| {
+                            self.browse_play(ui, selected)
+                        });
                     });
                 } else {
                     self.browse_play(ui, selected);
@@ -3022,6 +3026,9 @@ impl App {
     fn detail_more(&mut self, ui: &mut egui::Ui, game: &Game) {
         let id = game.archive.id;
         ui.label(RichText::new("More for this game").color(theme::muted(ui)));
+        let button_width = ((ui.available_width() - ui.spacing().item_spacing.x) / 2.0)
+            .clamp(140.0, 240.0)
+            .min(ui.available_width());
         ui.horizontal_wrapped(|ui| {
             for (label, section) in [
                 ("Verify", Section::Check),
@@ -3030,14 +3037,20 @@ impl App {
                 ("Saves & States", Section::Saves),
                 ("Fix Problems", Section::Problems),
             ] {
-                if ui.button(label).clicked() {
+                if ui
+                    .add_sized([button_width, 64.0], egui::Button::new(label).wrap())
+                    .clicked()
+                {
                     if matches!(section, Section::Check) {
                         self.check_platform = Some(game.platform.clone());
                     }
                     self.go(Route::Task { section, game: id });
                 }
             }
-            if ui.button("Open Folder").clicked() {
+            if ui
+                .add_sized([button_width, 64.0], egui::Button::new("Open Folder"))
+                .clicked()
+            {
                 let job = self
                     .activity
                     .queue("Opening the game folder", Route::Game(id), false);
