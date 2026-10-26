@@ -48,7 +48,12 @@ impl Observation {
         let hash = known(self.sha256).map(|s| s.to_ascii_lowercase());
         Ok(NetplayPeer {
             peer_id: id.into(),
-            emulator_identity: self.provider.clone(),
+            emulator_identity: match &provider {
+                NetplayProvider::RetroArch => "RetroArch",
+                NetplayProvider::Dolphin => "Dolphin",
+                NetplayProvider::Unknown(_) => unreachable!("provider validated above"),
+            }
+            .into(),
             provider,
             emulator_version: known(self.emulator_version),
             core: known(self.core).map(|name| NetplayCoreIdentity {
@@ -194,6 +199,18 @@ mod tests {
             plan.issues
                 .contains(&NetplayIssue::DuplicatePlayerAssignment(1))
         );
+    }
+    #[test]
+    fn matching_provider_names_do_not_create_identity_mismatches() {
+        for provider in ["retroarch", "dolphin"] {
+            let plan = compare(&EXAMPLE.replace("retroarch", provider)).unwrap();
+            assert!(
+                !plan
+                    .issues
+                    .contains(&NetplayIssue::EmulatorIdentityMismatch),
+                "{provider}"
+            );
+        }
     }
     #[test]
     fn blue_page_renders() {
