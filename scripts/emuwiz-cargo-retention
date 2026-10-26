@@ -756,10 +756,55 @@ class Census:
                 owner = os.stat(base).st_uid
             except OSError:
                 continue  # exited meanwhile
-            same_user = owner == uid
-            readable = self.scan(pid, base, same_user)
-            if not readable and os.path.exists(base) and self.is_userspace(base):
-                self.unreadable_foreign += 1
+            self.inspect(pid, base, owner == uid)
+
+    # How long a process that could not be inspected is given to finish exiting.
+    EXIT_SETTLE = (0.001, 0.002, 0.005, 0.01, 0.02, 0.05)
+    MAX_REUSE_RESCANS = 3
+
+    @staticmethod
+    def start_time(base):
+        """The kernel start time (clock ticks) that, with the PID, names one process;
+        None when it cannot be read."""
+        try:
+            with open(f"{base}/stat", "rb") as handle:
+                return int(handle.read().rsplit(b")", 1)[1].split()[19])
+        except (OSError, IndexError, ValueError):
+            return None
+
+    def inspect(self, pid, base, same_user):
+        """Scan one PID.  A failed scan is a visibility gap unless the process that was
+        being read is verifiably gone.
+
+        A short-lived process that ends while it is read leaves /proc/<pid> visible
+        for a moment with a command line but unreadable cwd, exe or fds.  A process
+        that is gone holds no reference, so that is not a gap.  "Gone" means its
+        /proc entry vanished, or the PID now has a different start time (the PID was
+        reused; the new process is then inspected in its own right).  A process that
+        stays, whose start time cannot be compared, or whose PID keeps being reused
+        remains a gap, as does any permission failure."""
+        for _ in range(self.MAX_REUSE_RESCANS):
+            born = self.start_time(base)
+            if self.scan(pid, base, same_user):
+                return
+            if not os.path.exists(base) or not self.is_userspace(base):
+                return
+            outcome = "present"
+            if not self.unreadable_foreign:  # already incomplete: no need to wait
+                for delay in self.EXIT_SETTLE:
+                    time.sleep(delay)
+                    if not os.path.exists(base):
+                        outcome = "gone"
+                        break
+                    now = self.start_time(base)
+                    if born is not None and now is not None and now != born:
+                        outcome = "reused"
+                        break
+            if outcome == "gone":
+                return
+            if outcome == "present":
+                break
+        self.unreadable_foreign += 1
 
     @staticmethod
     def is_userspace(base):
@@ -796,7 +841,7 @@ class Census:
         try:
             st = os.stat(path)
             self._inode_refs.append(((st.st_dev, st.st_ino), pid, kind))
-        except FileNotFoundError:
+        except (FileNotFoundError, ProcessLookupError):
             pass  # a process or descriptor exited during inspection
         except PermissionError:
             if owner_retry and os.getresuid()[2] == 0:
