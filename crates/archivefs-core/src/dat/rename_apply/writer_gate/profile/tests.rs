@@ -270,3 +270,14 @@ fn home_alone_without_verified_profile_directories_is_insufficient() {
     std::fs::remove_dir_all(f.peer.path().join(".local/share")).unwrap();
     assert!(!f.isolated());
 }
+
+#[test]
+fn duplicate_canonical_roots_from_xdg_and_home_remain_isolated() {
+    let f = Fixture::new();
+    f.peer_env(&format!(
+        "XDG_CONFIG_HOME={}\0XDG_DATA_HOME={}\0",
+        f.peer.path().join(".config").display(),
+        f.peer.path().join(".local/share").display()
+    ));
+    assert!(f.isolated());
+}

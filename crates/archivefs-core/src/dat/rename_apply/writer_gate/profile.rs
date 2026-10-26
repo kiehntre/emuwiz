@@ -129,8 +129,12 @@ fn state(roots: &[PathBuf]) -> Option<State> {
     let paths: Vec<_> = roots.iter().map(|p| resolved(p)).collect::<Option<_>>()?;
     let mut identities = HashSet::new();
     let mut pending = paths.clone();
+    let mut visited_paths = HashSet::new();
     let mut visited = 0;
     while let Some(path) = pending.pop() {
+        if !visited_paths.insert(path.clone()) {
+            continue;
+        }
         visited += 1;
         if visited > 16_384 {
             return None;
@@ -146,7 +150,9 @@ fn state(roots: &[PathBuf]) -> Option<State> {
             return None;
         }
         if !identities.insert((m.dev(), m.ino())) {
-            continue;
+            // Distinct bind aliases can have different child mount topology.
+            // Identical inode numbers do not justify skipping the second tree.
+            return None;
         }
         if m.is_dir() {
             for entry in std::fs::read_dir(&path).ok()? {
