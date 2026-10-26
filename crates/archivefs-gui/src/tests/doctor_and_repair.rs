@@ -4437,3 +4437,10 @@ fn navigating_to_the_page_never_scans_or_mutates_anything() {
 // (already proven by `problems_repair_repair_tab_renders_review_and_history_together`
 // and `problems_repair_history_deep_link_also_renders_both_sections` above,
 // re-run unmodified as part of this same test binary.)
+
+#[test]
+fn snapshot_missing_wording_does_not_claim_a_fresh_check() {
+    let label = RowOrigin::CachedMissing.gamer_view_label();
+    assert!(label.contains("Previously"), "{label}");
+    assert!(!label.contains("just now"));
+}

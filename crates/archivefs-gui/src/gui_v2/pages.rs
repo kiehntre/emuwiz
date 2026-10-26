@@ -2472,12 +2472,6 @@ impl App {
             if let Some(preview) = self.repair_preview.clone() {
                 self.duplicate_preview(ui, &preview);
             }
-            if game_id.is_none() {
-                if std::mem::take(&mut self.problem_nav.focus_missing_review) {
-                    ui.scroll_to_cursor(Some(egui::Align::TOP));
-                }
-                self.missing_review_panel(ui);
-            }
             let Some(summary) = summary else {
                 egui::Frame::group(ui.style()).show(ui, |ui| {
                     ui.horizontal(|ui| { ui.spinner(); ui.label("Checking the saved catalogue evidence… You can keep browsing while this finishes."); });
@@ -2524,7 +2518,14 @@ impl App {
                     ui.label("No current file, identity, or duplicate findings are recorded.");
                     if primary(ui, "Verify my games") { self.go(Route::Section(Section::Check)); }
                 });
+                if game_id.is_none() { self.missing_review_panel(ui); }
                 return;
+            }
+            if game_id.is_none() {
+                if std::mem::take(&mut self.problem_nav.focus_missing_review) {
+                    ui.scroll_to_cursor(Some(egui::Align::TOP));
+                }
+                self.missing_review_panel(ui);
             }
             let informational = summary
                 .problems
