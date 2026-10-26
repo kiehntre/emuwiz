@@ -321,13 +321,12 @@ pub(super) fn show(app: &mut App, ui: &mut egui::Ui, game: &Game) {
             }
             if changed { panel.report = None; panel.error = None; }
             let records = panel.source.zip(panel.target).and_then(|(s,t)| Some((inventory.records.get(s)?, inventory.records.get(t)?)));
-            if ui.add_enabled(records.is_some(), egui::Button::new("Check observed compatibility (read only)")).clicked() {
-                if let Some((source, target)) = records {
-                    let (source, target, game) = (source.clone(), target.clone(), game.clone());
-                    let (tx,rx) = mpsc::sync_channel(1);
-                    panel.report = None; panel.error = None; panel.job = Some(rx);
-                    std::thread::spawn(move || { let _ = tx.send(compare(&source, &target, &game)); });
-                }
+            if ui.add_enabled(records.is_some(), egui::Button::new("Check observed compatibility (read only)")).clicked()
+                && let Some((source, target)) = records {
+                let (source, target, game) = (source.clone(), target.clone(), game.clone());
+                let (tx,rx) = mpsc::sync_channel(1);
+                panel.report = None; panel.error = None; panel.job = Some(rx);
+                std::thread::spawn(move || { let _ = tx.send(compare(&source, &target, &game)); });
             }
         });
         if panel.job.is_some() { ui.spinner(); ui.label("Checking observed save bytes…"); }
