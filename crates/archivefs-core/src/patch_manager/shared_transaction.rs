@@ -2758,7 +2758,17 @@ fn create_backup(
     }
     prepare_managed_root(backup_root)?;
     let operation = backup_root.join(safe_identifier(operation_id)?);
-    fs::create_dir(&operation).map_err(|_| SharedApplyFailureKind::BackupFailed)?;
+    match fs::create_dir(&operation) {
+        Ok(()) => {}
+        // A later replaced file in the same transaction reuses its own
+        // operation folder. Anything else at that name (a link, a file) is
+        // refused, and each backup file below is created without
+        // overwriting, so a name collision is refused too.
+        Err(error)
+            if error.kind() == std::io::ErrorKind::AlreadyExists
+                && fs::symlink_metadata(&operation).is_ok_and(|metadata| metadata.is_dir()) => {}
+        Err(_) => return Err(SharedApplyFailureKind::BackupFailed),
+    }
     let final_path = operation.join(format!(
         "{}.bak",
         digest_text(&destination.to_string_lossy())
@@ -6054,6 +6064,251 @@ mod tests {
         let kept: Vec<_> = stray_temporaries(&dir);
         assert_eq!(kept.len(), 1, "{kept:?}");
         assert_eq!(fs::read(dir.join(&kept[0])).unwrap(), b"new");
+    }
+
+    /// Job #22: one transaction replacing two existing files and adding one
+    /// keeps a distinct backup for each replaced file (bytes and mode), and
+    /// Undo restores both byte for byte and removes the new file.
+    #[cfg(unix)]
+    #[test]
+    fn two_replaced_files_and_one_new_file_back_up_and_undo_exactly() {
+        let fixture = Fixture::new("multi-backup");
+        let plan = mixed_plan(
+            &fixture,
+            &[
+                ("Nintendo - NES/aaa-overlay.cfg", None, b"overlay"),
+                ("Nintendo - NES/a.cht", Some(b"old-a"), b"new-a"),
+                ("Nintendo - NES/b.cht", Some(b"old-b"), b"new-b"),
+            ],
+        );
+        let dir = fixture.destination_root().join("Nintendo - NES");
+        chmod(&dir.join("b.cht"), 0o644);
+        let applied = execute_shared_apply(
+            &plan,
+            &options(&fixture, &plan, "multi-backup", false, true, true),
+        );
+        assert_eq!(
+            applied.journal.status,
+            SharedApplyStatus::Success,
+            "{:?}",
+            applied.journal.entries
+        );
+        let backups: Vec<_> = applied
+            .journal
+            .entries
+            .iter()
+            .filter_map(|entry| entry.backup_path.as_ref())
+            .map(|path| path.to_path_buf().unwrap())
+            .collect();
+        assert_eq!(backups.len(), 2);
+        assert_ne!(backups[0], backups[1], "distinct backup identities");
+        let mut contents: Vec<_> = backups.iter().map(|path| fs::read(path).unwrap()).collect();
+        contents.sort();
+        assert_eq!(contents, vec![b"old-a".to_vec(), b"old-b".to_vec()]);
+        assert_eq!(fs::read(dir.join("a.cht")).unwrap(), b"new-a");
+        assert_eq!(mode_of(&dir.join("a.cht")), 0o664);
+        assert_eq!(mode_of(&dir.join("b.cht")), 0o644);
+        let journal_path = applied.journal_path.clone().unwrap();
+        let rollback = preview_shared_rollback(
+            &journal_path,
+            &fixture.destination_root(),
+            &fixture.backup_root(),
+        );
+        assert!(rollback.available);
+        let done = confirm_rollback(&fixture, &rollback, "multi-backup-undo");
+        assert_eq!(done.status, SharedApplyStatus::Success);
+        assert_eq!(fs::read(dir.join("a.cht")).unwrap(), b"old-a");
+        assert_eq!(fs::read(dir.join("b.cht")).unwrap(), b"old-b");
+        assert_eq!(mode_of(&dir.join("a.cht")), 0o664);
+        assert_eq!(mode_of(&dir.join("b.cht")), 0o644);
+        assert!(!dir.join("aaa-overlay.cfg").exists());
+        assert!(
+            backups.iter().all(|path| path.is_file()),
+            "backups are retained"
+        );
+    }
+
+    /// An interrupted multi-replacement transaction keeps every backup valid
+    /// and recovery sees all three entries applied.
+    #[cfg(unix)]
+    #[test]
+    fn interrupted_multi_replacement_keeps_every_backup_recoverable() {
+        let fixture = Fixture::new("multi-backup-interrupted");
+        let plan = mixed_plan(
+            &fixture,
+            &[
+                ("Nintendo - NES/aaa-overlay.cfg", None, b"overlay"),
+                ("Nintendo - NES/a.cht", Some(b"old-a"), b"new-a"),
+                ("Nintendo - NES/b.cht", Some(b"old-b"), b"new-b"),
+            ],
+        );
+        inject_fault(Some(FaultPoint::TerminalJournal));
+        let result = execute_shared_apply(
+            &plan,
+            &options(&fixture, &plan, "multi-interrupted", false, true, true),
+        );
+        inject_fault(None);
+        assert!(result.journal_path.is_none());
+        let pending = discover_pending_operations(&fixture.history_root());
+        assert_eq!(pending.len(), 1);
+        assert_eq!(
+            pending[0].reconciled_entries,
+            vec![SharedEntryRecoveryState::Applied; 3]
+        );
+        let backups: Vec<_> = pending[0]
+            .journal
+            .entries
+            .iter()
+            .filter_map(|entry| entry.backup_path.as_ref())
+            .collect();
+        assert_eq!(backups.len(), 2);
+        assert!(plan_pending_recovery(&pending[0]).can_safe_rollback);
+    }
+
+    /// A partial Apply among several replacements: the changed file is
+    /// refused untouched, the other replacement and the new file apply, and
+    /// Undo restores exactly what was changed.
+    #[cfg(unix)]
+    #[test]
+    fn partial_multi_replacement_apply_undoes_exactly_what_changed() {
+        let fixture = Fixture::new("multi-backup-partial");
+        let plan = mixed_plan(
+            &fixture,
+            &[
+                ("Nintendo - NES/aaa-overlay.cfg", None, b"overlay"),
+                ("Nintendo - NES/a.cht", Some(b"old-a"), b"new-a"),
+                ("Nintendo - NES/b.cht", Some(b"old-b"), b"new-b"),
+            ],
+        );
+        let dir = fixture.destination_root().join("Nintendo - NES");
+        fs::write(dir.join("b.cht"), b"user-b").unwrap();
+        let applied = execute_shared_apply(
+            &plan,
+            &options(&fixture, &plan, "multi-partial", false, true, true),
+        );
+        assert_eq!(applied.journal.status, SharedApplyStatus::PartialFailure);
+        assert_eq!(fs::read(dir.join("a.cht")).unwrap(), b"new-a");
+        assert_eq!(fs::read(dir.join("b.cht")).unwrap(), b"user-b");
+        let journal_path = applied.journal_path.clone().unwrap();
+        let rollback = preview_shared_rollback(
+            &journal_path,
+            &fixture.destination_root(),
+            &fixture.backup_root(),
+        );
+        assert!(rollback.available);
+        let done = confirm_rollback(&fixture, &rollback, "multi-partial-undo");
+        assert_eq!(done.status, SharedApplyStatus::Success);
+        assert_eq!(fs::read(dir.join("a.cht")).unwrap(), b"old-a");
+        assert_eq!(fs::read(dir.join("b.cht")).unwrap(), b"user-b");
+        assert!(!dir.join("aaa-overlay.cfg").exists());
+    }
+
+    /// With several replacements, a restore refused after another succeeded
+    /// keeps the earlier one restored, keeps the rest, and says exactly that.
+    #[cfg(unix)]
+    #[test]
+    fn undo_refused_after_an_earlier_restore_reports_what_stayed_restored() {
+        let fixture = Fixture::new("multi-backup-undo-partial");
+        let plan = mixed_plan(
+            &fixture,
+            &[
+                ("Nintendo - NES/aaa-overlay.cfg", None, b"overlay"),
+                ("Nintendo - NES/a.cht", Some(b"old-a"), b"new-a"),
+                ("Nintendo - NES/b.cht", Some(b"old-b"), b"new-b"),
+            ],
+        );
+        let applied = execute_shared_apply(
+            &plan,
+            &options(&fixture, &plan, "multi-undo-partial", false, true, true),
+        );
+        assert_eq!(applied.journal.status, SharedApplyStatus::Success);
+        let journal_path = applied.journal_path.clone().unwrap();
+        let rollback = preview_shared_rollback(
+            &journal_path,
+            &fixture.destination_root(),
+            &fixture.backup_root(),
+        );
+        inject_fault_after(FaultPoint::ExchangeUnsupported, 1);
+        let partial = confirm_rollback(&fixture, &rollback, "multi-undo-partial-1");
+        inject_fault(None);
+        assert_eq!(partial.status, SharedApplyStatus::PartialFailure);
+        let dir = fixture.destination_root().join("Nintendo - NES");
+        let restored: Vec<_> = ["a.cht", "b.cht"]
+            .iter()
+            .filter(|name| {
+                entry_for(&partial.preview, name).outcome == SharedRollbackOutcome::RestoredBackup
+            })
+            .collect();
+        assert_eq!(restored.len(), 1, "exactly one restore completed");
+        let refused_name = if *restored[0] == "a.cht" {
+            "b.cht"
+        } else {
+            "a.cht"
+        };
+        let refused = entry_for(&partial.preview, refused_name);
+        assert_eq!(refused.outcome, SharedRollbackOutcome::Failed);
+        let detail = &refused.failure.as_ref().unwrap().detail;
+        assert!(
+            detail.contains("Files EmuWiz had already restored stay restored; every other file was kept as it is."),
+            "{detail}"
+        );
+        assert!(!detail.contains("Nothing was changed"), "{detail}");
+        assert_eq!(
+            entry_for(&partial.preview, "aaa-overlay.cfg").outcome,
+            SharedRollbackOutcome::Retained
+        );
+        assert!(dir.join("aaa-overlay.cfg").exists());
+        let restored_name = restored[0];
+        let old = if *restored_name == "a.cht" {
+            b"old-a"
+        } else {
+            b"old-b"
+        };
+        assert_eq!(fs::read(dir.join(restored_name)).unwrap(), old);
+    }
+
+    /// The operation's backup folder is reused only when it is a real
+    /// directory, and an existing backup file is never overwritten.
+    #[cfg(unix)]
+    #[test]
+    fn backup_folder_link_and_backup_name_collision_are_refused() {
+        let fixture = Fixture::new("multi-backup-unsafe");
+        let report = preview(&fixture, b"new", Some(b"old"));
+        let live = fixture.destination_root().join("Nintendo - NES/game.cht");
+        let plan = make_plan(&fixture, &report);
+        // A link at the operation's backup folder name.
+        fs::create_dir_all(fixture.backup_root()).unwrap();
+        let elsewhere = fixture.0.join("elsewhere");
+        fs::create_dir(&elsewhere).unwrap();
+        std::os::unix::fs::symlink(&elsewhere, fixture.backup_root().join("linked-op")).unwrap();
+        let refused = execute_shared_apply(
+            &plan,
+            &options(&fixture, &plan, "linked-op", false, true, true),
+        );
+        assert_ne!(
+            refused.journal.entries[0].outcome,
+            SharedApplyOutcome::ReplacedExisting
+        );
+        assert_eq!(fs::read(&live).unwrap(), b"old");
+        assert!(
+            fs::read_dir(&elsewhere).unwrap().next().is_none(),
+            "nothing written through the link"
+        );
+        // A file already at this destination's backup name.
+        let folder = fixture.backup_root().join("collide-op");
+        fs::create_dir(&folder).unwrap();
+        let taken = folder.join(format!("{}.bak", digest_text(&live.to_string_lossy())));
+        fs::write(&taken, b"someone else's backup").unwrap();
+        let refused = execute_shared_apply(
+            &plan,
+            &options(&fixture, &plan, "collide-op", false, true, true),
+        );
+        assert_ne!(
+            refused.journal.entries[0].outcome,
+            SharedApplyOutcome::ReplacedExisting
+        );
+        assert_eq!(fs::read(&live).unwrap(), b"old");
+        assert_eq!(fs::read(&taken).unwrap(), b"someone else's backup");
     }
 
     /// Apply's own automatic restore after a failed content check uses the
