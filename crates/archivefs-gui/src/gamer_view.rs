@@ -752,6 +752,11 @@ pub(crate) fn featured_typed_launch_action(
     retroarch_launch_state: &mut launch_readiness_page::RetroArchLaunchState,
     enabled: bool,
 ) -> bool {
+    if matches!(request, launch_readiness_page::TypedLaunchRequest::AmigaWHDLoad(request)
+        if request.profile.emulator == archivefs_core::patch_manager::AmigaEmulatorKind::FsUae)
+    {
+        ui.small("Disposable WHDLoad session: new saves are discarded after exit.");
+    }
     match request {
         launch_readiness_page::TypedLaunchRequest::RetroArch(request, _) => {
             featured_retroarch_launch_action(ui, retroarch_launch_state, request, enabled)
@@ -2056,6 +2061,8 @@ mod game_metadata_enrichment_tests {
                 scope: archivefs_core::emulator_environment::retroarch::ProfileScope::User,
             },
             core_stem: "pcsx2".to_string(),
+            saturn_core_selection: None,
+            expected_snapshot_evidence: None,
             expected_appimage_executable: None,
             expected_executable_binding: None,
             expected_configuration_file: None,

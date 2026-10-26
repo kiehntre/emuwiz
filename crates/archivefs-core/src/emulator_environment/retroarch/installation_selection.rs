@@ -107,6 +107,50 @@ pub fn load_executable_override_at(path: &Path) -> Result<Option<PathBuf>, Strin
     Ok(Some(PathBuf::from(text)))
 }
 
+/// Why a saved RetroArch installation choice cannot be used. These are the
+/// same checks [`apply_selection`] makes before honouring a choice, so every
+/// refusal names the reason discovery actually applied.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SelectedExecutableProblem {
+    /// The saved path no longer names anything.
+    Missing,
+    /// It exists but is not a regular file with an execute bit (a folder,
+    /// a link, a special file, or the execute permission was removed).
+    NotExecutable,
+    /// A launcher script that starts the Flatpak RetroArch.
+    FlatpakLauncher,
+    /// Any other script or unrecognised program; scripts are never run to
+    /// find out what they start.
+    UnsupportedProgram,
+    /// A usable program that discovery no longer finds beside RetroArch
+    /// settings it can pair it with.
+    NotDiscovered,
+}
+
+/// The program-level checks for a saved choice; `None` means the program
+/// itself is acceptable (discovery may still report `NotDiscovered`).
+pub fn selected_executable_problem(
+    filesystem: &dyn ReadOnlyHostFilesystem,
+    path: &Path,
+) -> Option<SelectedExecutableProblem> {
+    if !path.is_absolute() {
+        return Some(SelectedExecutableProblem::NotExecutable);
+    }
+    match filesystem.probe(path) {
+        FsProbe::Missing => return Some(SelectedExecutableProblem::Missing),
+        FsProbe::PresentFile => {}
+        _ => return Some(SelectedExecutableProblem::NotExecutable),
+    }
+    if filesystem.probe_regular_file_executable_bit(path) != Some(true) {
+        return Some(SelectedExecutableProblem::NotExecutable);
+    }
+    match classify_installation_executable(filesystem, path) {
+        InstallationExecutable::Native => None,
+        InstallationExecutable::Flatpak => Some(SelectedExecutableProblem::FlatpakLauncher),
+        InstallationExecutable::Unknown => Some(SelectedExecutableProblem::UnsupportedProgram),
+    }
+}
+
 pub(super) fn apply_selection(
     filesystem: &dyn ReadOnlyHostFilesystem,
     profiles: &mut Vec<(RetroArchProfile, PathBuf, Vec<RawDiagnostic>)>,
@@ -120,13 +164,7 @@ pub(super) fn apply_selection(
     };
     // Keep the exact saved path: canonicalizing a changed symlink would
     // silently authorize a different program.
-    if !path.is_absolute()
-        || filesystem.probe(path) != FsProbe::PresentFile
-        || filesystem.probe_regular_file_executable_bit(path) != Some(true)
-    {
-        return Err(DiscoveryError::ExecutableSelectionUnavailable);
-    }
-    if classify_installation_executable(filesystem, path) != InstallationExecutable::Native {
+    if selected_executable_problem(filesystem, path).is_some() {
         return Err(DiscoveryError::ExecutableSelectionUnavailable);
     }
     let appimage = profiles
@@ -194,6 +232,51 @@ mod tests {
     use crate::emulator_environment::HostReadOnlyFilesystem;
     use std::fs;
     use std::os::unix::fs::{PermissionsExt, symlink};
+
+    #[test]
+    fn selected_executable_problem_names_each_refusal_reason() {
+        let root = tempfile::tempdir().unwrap();
+        let fs_ = HostReadOnlyFilesystem;
+        let native = executable(root.path(), "native/retroarch", b"\x7fELF-native");
+        assert_eq!(selected_executable_problem(&fs_, &native), None);
+        assert_eq!(
+            selected_executable_problem(&fs_, &root.path().join("gone/retroarch")),
+            Some(SelectedExecutableProblem::Missing)
+        );
+        assert_eq!(
+            selected_executable_problem(&fs_, Path::new("relative/retroarch")),
+            Some(SelectedExecutableProblem::NotExecutable)
+        );
+        let plain = root.path().join("plain/retroarch");
+        fs::create_dir_all(plain.parent().unwrap()).unwrap();
+        fs::write(&plain, b"\x7fELF-no-exec-bit").unwrap();
+        fs::set_permissions(&plain, fs::Permissions::from_mode(0o644)).unwrap();
+        assert_eq!(
+            selected_executable_problem(&fs_, &plain),
+            Some(SelectedExecutableProblem::NotExecutable)
+        );
+        let link = root.path().join("link/retroarch");
+        fs::create_dir_all(link.parent().unwrap()).unwrap();
+        symlink(&native, &link).unwrap();
+        assert_eq!(
+            selected_executable_problem(&fs_, &link),
+            Some(SelectedExecutableProblem::NotExecutable)
+        );
+        let wrapper = executable(
+            root.path(),
+            "wrapper/retroarch",
+            b"#!/usr/bin/env bash\nexec flatpak run \"org.libretro.RetroArch\" \"$@\"\n",
+        );
+        assert_eq!(
+            selected_executable_problem(&fs_, &wrapper),
+            Some(SelectedExecutableProblem::FlatpakLauncher)
+        );
+        let script = executable(root.path(), "script/retroarch", b"#!/bin/sh\necho hi\n");
+        assert_eq!(
+            selected_executable_problem(&fs_, &script),
+            Some(SelectedExecutableProblem::UnsupportedProgram)
+        );
+    }
 
     fn executable(root: &Path, name: &str, bytes: &[u8]) -> PathBuf {
         let path = root.join(name);

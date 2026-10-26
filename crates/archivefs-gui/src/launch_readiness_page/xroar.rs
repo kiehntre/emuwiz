@@ -224,6 +224,8 @@ impl Request {
             profile_id: self.profile_id,
             expected_executable: self.expected_executable,
             expected_content_identity: fresh.file_identity,
+            expected_content_md5: fresh.md5.clone(),
+            expected_content_crc32: fresh.crc32.clone(),
         };
         preflight_and_launch_xroar(&request, roots, &fresh.identity_status()).map_err(|error| {
             match error {
@@ -292,6 +294,23 @@ mod tests {
         selected: XRoarMachine,
         firmware: XRoarFirmwareState,
     ) -> XRoarProfileDiscoveryRoots {
+        let firmware_directory = executable.map(|path| {
+            let directory = path.parent().unwrap().join("fixture-bios");
+            std::fs::create_dir_all(&directory).unwrap();
+            if firmware == XRoarFirmwareState::PresentUnverified {
+                for (name, size) in [
+                    ("d32.rom", 16384),
+                    ("d64_1.rom", 16384),
+                    ("d64_2.rom", 16384),
+                    ("bas13.rom", 8192),
+                    ("extbas11.rom", 8192),
+                    ("coco3.rom", 32768),
+                ] {
+                    std::fs::write(directory.join(name), vec![0u8; size]).unwrap();
+                }
+            }
+            directory
+        });
         XRoarProfileDiscoveryRoots {
             explicit_profiles: executable
                 .map(|path| {
@@ -304,7 +323,7 @@ mod tests {
                 .unwrap_or_default(),
             path_env: None,
             selected_machine: Some(selected),
-            firmware_directory: None,
+            firmware_directory,
             firmware,
         }
     }
@@ -419,6 +438,7 @@ mod tests {
             cemu: None,
             flycast: None,
             xroar: Some(fixture.context.clone()),
+            vice: None,
             amiga_whdload: None,
             #[cfg(target_os = "linux")]
             shadps4: None,
@@ -571,6 +591,95 @@ mod tests {
     }
 
     #[test]
+    fn exited_cassette_offers_retry_and_rechecks_current_bytes() {
+        let fixture = fixture();
+        let request = request_for(&fixture);
+        let process = request
+            .clone()
+            .execute_with(&catalogues(&fixture.sources), &fixture.roots)
+            .unwrap();
+        let mut state = StandaloneLaunchState {
+            tracked: Some((
+                fixture.tape.clone(),
+                "xroar".into(),
+                StandaloneLaunchStage::Running(StandaloneProcess::XRoar(process)),
+            )),
+            ..Default::default()
+        };
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while state.is_active() {
+            state.poll();
+            assert!(std::time::Instant::now() < deadline);
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+        assert!(matches!(
+            state.tracked,
+            Some((_, _, StandaloneLaunchStage::Exited(_)))
+        ));
+        let context = egui::Context::default();
+        let mut frame = |events| {
+            context.run(
+                egui::RawInput {
+                    events,
+                    ..Default::default()
+                },
+                |ctx| {
+                    egui::CentralPanel::default().show(ctx, |ui| {
+                        show_standalone_launch_action(
+                            ui,
+                            &mut state,
+                            StandaloneLaunchRequest::XRoar(request.clone()),
+                        );
+                    });
+                },
+            )
+        };
+        fn button_center(shape: &egui::Shape) -> Option<egui::Pos2> {
+            match shape {
+                egui::Shape::Text(text) if text.galley.text() == "Launch XRoar again (recheck)" => {
+                    Some(text.pos + text.galley.size() / 2.0)
+                }
+                egui::Shape::Vec(shapes) => shapes.iter().find_map(button_center),
+                _ => None,
+            }
+        }
+        frame(Vec::new());
+        let output = frame(Vec::new());
+        let position = output
+            .shapes
+            .iter()
+            .find_map(|s| button_center(&s.shape))
+            .expect("an exited XRoar cassette must offer retry without restarting Blue");
+        // Retry must dispatch fresh verification, not replay the old command.
+        std::fs::write(&fixture.tape, b"changed since the first play").unwrap();
+        for pressed in [true, false] {
+            frame(vec![
+                egui::Event::PointerMoved(position),
+                egui::Event::PointerButton {
+                    pos: position,
+                    button: egui::PointerButton::Primary,
+                    pressed,
+                    modifiers: egui::Modifiers::NONE,
+                },
+            ]);
+        }
+        assert!(
+            state.is_active(),
+            "retry must start the existing revalidation worker"
+        );
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while state.is_active() {
+            state.poll();
+            assert!(std::time::Instant::now() < deadline);
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+        assert!(matches!(
+            state.tracked,
+            Some((_, _, StandaloneLaunchStage::Failed(_)))
+        ));
+    }
+
+    #[test]
     fn checked_bios_is_bound_to_spawn_and_removed_bios_refuses() {
         let mut fixture = fixture();
         let bios = fixture._dir.path().join("bios");
@@ -589,6 +698,8 @@ mod tests {
             profile_id: request.profile_id.clone(),
             expected_executable: request.expected_executable.clone(),
             expected_content_identity: request.evidence.file_identity,
+            expected_content_md5: request.evidence.md5.clone(),
+            expected_content_crc32: request.evidence.crc32.clone(),
         };
         let command = archivefs_core::launch::preflight_xroar_launch(
             &native,
@@ -596,6 +707,7 @@ mod tests {
             &fixture.context.result.as_ref().unwrap().identity_status(),
         )
         .unwrap();
+        let command = command.logical_command();
         assert_eq!(command.arguments[0], "-no-c");
         assert!(
             command

@@ -372,7 +372,7 @@ fn pidfd_has_exited(fd: i32) -> std::io::Result<bool> {
 /// - No timeout, no automatic kill: see [`WatchedProcess`]'s own doc
 ///   comment.
 pub fn spawn_watched_process(command: &PreparedProcessCommand) -> std::io::Result<WatchedProcess> {
-    spawn_watched_process_inner(command, &[], None, None, None, false)
+    spawn_watched_process_inner(command, &[], &[], None, None, false, None)
 }
 
 /// Like [`spawn_watched_process`] but the child starts with an EMPTY
@@ -386,7 +386,7 @@ pub fn spawn_watched_process(command: &PreparedProcessCommand) -> std::io::Resul
 pub(crate) fn spawn_watched_process_closing_fds(
     command: &PreparedProcessCommand,
 ) -> std::io::Result<WatchedProcess> {
-    spawn_watched_process_inner(command, &[], None, None, None, true)
+    spawn_watched_process_inner(command, &[], &[], None, None, true, None)
 }
 
 /// Like [`spawn_watched_process`] but sets `environment` on the child only
@@ -396,7 +396,7 @@ pub(crate) fn spawn_watched_process_with_environment(
     command: &PreparedProcessCommand,
     environment: &[(std::ffi::OsString, std::ffi::OsString)],
 ) -> std::io::Result<WatchedProcess> {
-    spawn_watched_process_inner(command, environment, None, None, None, false)
+    spawn_watched_process_inner(command, environment, &[], None, None, false, None)
 }
 
 /// Opt-in preservation workspace seam. Legacy callers retain their exact
@@ -415,27 +415,92 @@ pub(crate) fn spawn_watched_process_isolated(
     spawn_watched_process_inner(
         command,
         environment,
-        Some(lease.as_raw_fd()),
+        &[lease.as_raw_fd()],
         Some(Box::new(on_start)),
         Some(Box::new(on_exit)),
         false,
+        None,
+    )
+}
+
+/// Pin a validated native ELF descriptor while retaining the original argv[0]
+/// for emulator resource discovery. The caller holds the descriptor through exec.
+#[cfg(target_os = "linux")]
+pub(crate) fn spawn_watched_process_private_pinned(
+    command: &PreparedProcessCommand,
+    environment: &[(std::ffi::OsString, std::ffi::OsString)],
+    executable: &std::fs::File,
+    on_exit: impl FnOnce(&ProcessExitReport) + Send + 'static,
+) -> std::io::Result<WatchedProcess> {
+    use std::os::fd::AsRawFd;
+    spawn_watched_process_inner(
+        command,
+        environment,
+        &[],
+        None,
+        Some(Box::new(on_exit)),
+        true,
+        Some(executable.as_raw_fd()),
     )
 }
 
 type ExitCallback = Box<dyn FnOnce(&ProcessExitReport) + Send>;
 
+/// Opt-in descriptor-bound assets. The caller retains the files through spawn
+/// and the callback retains their workspace until the watched child exits.
+/// Descriptor inheritance changes only in the child; unrelated launches keep
+/// their existing environment, stdio and descriptor behavior.
+#[cfg(target_os = "linux")]
+pub(crate) fn spawn_watched_process_with_assets(
+    command: &PreparedProcessCommand,
+    files: &[&std::fs::File],
+    on_exit: impl FnOnce(&ProcessExitReport) + Send + 'static,
+) -> std::io::Result<WatchedProcess> {
+    use std::os::fd::AsRawFd;
+    let fds: Vec<_> = files.iter().map(|file| file.as_raw_fd()).collect();
+    if fds.iter().any(|fd| *fd < 3) {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "launch assets must be above stdin/stdout/stderr",
+        ));
+    }
+    spawn_watched_process_inner(
+        command,
+        &[],
+        &fds,
+        None,
+        Some(Box::new(on_exit)),
+        false,
+        None,
+    )
+}
+
 fn spawn_watched_process_inner(
     command: &PreparedProcessCommand,
     environment: &[(std::ffi::OsString, std::ffi::OsString)],
-    inherited_lease: Option<i32>,
+    inherited_files: &[i32],
     on_start: Option<Box<dyn FnOnce(u32)>>,
     on_exit: Option<ExitCallback>,
     close_inherited_fds: bool,
+    pinned_executable: Option<i32>,
 ) -> std::io::Result<WatchedProcess> {
     // Each test-only ETXTBSY retry needs a fresh command and ownership
     // channel, so a failed exec's descriptor can never name a later child.
     let (mut child, stop_identity) = spawn_child(|| {
-        let mut process = Command::new(&command.executable);
+        #[cfg(target_os = "linux")]
+        let mut process = if let Some(fd) = pinned_executable {
+            use std::os::unix::process::CommandExt;
+            let mut process = Command::new(format!("/proc/self/fd/{fd}"));
+            process.arg0(&command.executable);
+            process
+        } else {
+            Command::new(&command.executable)
+        };
+        #[cfg(not(target_os = "linux"))]
+        let mut process = {
+            let _ = pinned_executable;
+            Command::new(&command.executable)
+        };
         process.args(&command.arguments);
         if close_inherited_fds {
             process.env_clear();
@@ -448,22 +513,25 @@ fn spawn_watched_process_inner(
             process.current_dir(working_directory);
         }
         #[cfg(target_os = "linux")]
-        if let Some(fd) = inherited_lease {
+        if !inherited_files.is_empty() {
             use std::os::unix::process::CommandExt;
+            let fds = inherited_files.to_vec();
             // SAFETY: only async-signal-safe fcntl is called after fork. The
             // caller keeps this fd alive through spawn; CLOEXEC changes only in
             // the child, never in another thread/the parent environment.
             unsafe {
                 process.pre_exec(move || {
-                    if libc::fcntl(fd, libc::F_SETFD, 0) < 0 {
-                        return Err(std::io::Error::last_os_error());
+                    for fd in &fds {
+                        if libc::fcntl(*fd, libc::F_SETFD, 0) < 0 {
+                            return Err(std::io::Error::last_os_error());
+                        }
                     }
                     Ok(())
                 });
             }
         }
         #[cfg(not(target_os = "linux"))]
-        let _ = inherited_lease;
+        let _ = inherited_files;
         #[cfg(target_os = "linux")]
         if close_inherited_fds {
             use std::os::unix::process::CommandExt;

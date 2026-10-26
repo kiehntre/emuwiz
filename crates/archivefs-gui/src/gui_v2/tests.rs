@@ -68,6 +68,7 @@ pub(super) fn fixture(context: &egui::Context) -> App {
         index_job: None,
         browse_play: Default::default(),
         preferences_dirty: None,
+        preferences_restored: true,
         interacted: false,
         loaded: true,
         library_failure: None,
@@ -3165,6 +3166,7 @@ fn gui_v2_preferences_round_trip_is_separate_from_legacy_mode() {
         &path,
         &Preferences {
             route: Route::Game(22),
+            playing_library: Default::default(),
             filter: Filter {
                 search: "Zelda".into(),
                 ..Default::default()
@@ -3190,6 +3192,136 @@ fn gui_v2_preferences_round_trip_is_separate_from_legacy_mode() {
 #[test]
 fn gui_v2_preferences_default_beginner_hints_on() {
     assert!(Preferences::default().beginner_hints_enabled);
+}
+
+#[test]
+fn job37_playing_library_preferences_survive_settings_restart() {
+    let directory = tempfile::tempdir().unwrap();
+    let path = directory.path().join("gui-v2.json");
+    let saved = serde_json::json!({
+        "route": {"BrowsePlayGame": 22},
+        "playing_library": {
+            "preferred_regions": "USA, Europe, Japan",
+            "preferred_languages": "French, English",
+            "prefer_newest_revision": false,
+            "prefer_parent": false,
+            "exclude_beta": false,
+            "exclude_proto": true,
+            "exclude_demo": false,
+            "exclude_sample": true
+        }
+    });
+    let preferences: Preferences = serde_json::from_value(saved.clone()).unwrap();
+    backend::save_preferences(&path, &preferences).unwrap();
+    let reopened: serde_json::Value = serde_json::from_slice(&fs::read(path).unwrap()).unwrap();
+    assert_eq!(reopened["playing_library"], saved["playing_library"]);
+    assert_eq!(reopened["route"], saved["route"]);
+}
+
+#[test]
+fn job37_early_navigation_waits_for_restore_before_saving_rules() {
+    let context = egui::Context::default();
+    let mut app = fixture(&context);
+    app.backend = Backend::disconnected();
+    app.preferences_restored = false;
+    app.go(Route::Section(Section::Settings));
+    app.preferences_dirty = Some(Instant::now() - Duration::from_secs(1));
+    app.poll(&context);
+    assert!(
+        app.preferences_dirty.is_some(),
+        "no default snapshot may be queued before Restore"
+    );
+    assert!(app.notice.is_none());
+    let saved: Preferences = serde_json::from_value(serde_json::json!({
+        "route": "Home",
+        "playing_library": {
+            "preferred_regions": "USA, Japan, Europe",
+            "preferred_languages": "French",
+            "prefer_newest_revision": false,
+            "prefer_parent": false,
+            "exclude_beta": false,
+            "exclude_proto": true,
+            "exclude_demo": false,
+            "exclude_sample": true
+        }
+    }))
+    .unwrap();
+    let expected = saved.playing_library.clone();
+    app.restore_preferences(saved);
+    assert!(app.preferences_restored);
+    assert_eq!(app.router.current, Route::Section(Section::Settings));
+    assert_eq!(
+        crate::playing_library_page::preferences::SavedPreferences::from_state(
+            &app.playing_library
+        ),
+        expected
+    );
+    assert!(
+        app.preferences_dirty.is_some(),
+        "the navigation save remains pending with restored rules"
+    );
+    app.poll(&context);
+    assert!(
+        app.preferences_dirty.is_none(),
+        "saving is admitted after Restore"
+    );
+}
+
+#[test]
+fn job37_version_editors_wait_for_initial_restore() {
+    let context = egui::Context::default();
+    let mut app = fixture(&context);
+    app.backend = Backend::disconnected();
+    app.preferences_restored = false;
+    app.go(Route::Section(Section::Build));
+    app.organisation.view = super::organisation::OrganisationView::PlayingLibrary;
+    let loading = text(&frame(&context, &mut app, [1280.0, 2000.0]));
+    assert!(
+        loading
+            .iter()
+            .any(|line| line.contains("Loading saved version preferences"))
+    );
+    assert!(!loading.iter().any(|line| line.contains("Region order")));
+    app.restore_preferences(Preferences::default());
+    let ready = text(&frame(&context, &mut app, [1280.0, 2000.0]));
+    assert!(
+        !ready
+            .iter()
+            .any(|line| line.contains("Loading saved version preferences"))
+    );
+    assert!(ready.iter().any(|line| line.contains("Region order")));
+}
+
+#[test]
+fn job37_game_details_mr_wiz_explains_unknown_and_unavailable_games() {
+    let context = egui::Context::default();
+    let mut app = fixture(&context);
+    let mut row = archive(37, "Uncertain release", Some("Game Boy"));
+    app.library = Arc::new(Library::new(vec![row.clone()]));
+    let guidance = app.guidance_context(&Route::Game(37)).unwrap();
+    let tip = app.guidance.select(&guidance).unwrap();
+    assert!(
+        tip.message.contains("cannot safely identify"),
+        "{}",
+        tip.message
+    );
+    row.last_verified_missing_at = Some("2026-10-25".into());
+    app.library = Arc::new(Library::new(vec![row]));
+    let guidance = app.guidance_context(&Route::Game(37)).unwrap();
+    let tip = app.guidance.select(&guidance).unwrap();
+    assert!(
+        tip.message.contains("game file is unavailable"),
+        "{}",
+        tip.message
+    );
+    assert!(tip.message.contains("catalogue entry"));
+    let game = Arc::make_mut(&mut app.library).games.first_mut().unwrap();
+    game.archive.last_verified_missing_at = None;
+    game.mark_dat_exact(None);
+    let guidance = app.guidance_context(&Route::Game(37)).unwrap();
+    let tip = app.guidance.select(&guidance).unwrap();
+    assert!(!tip.message.contains("cannot safely identify"));
+    assert!(!tip.message.contains("game file is unavailable"));
 }
 
 #[test]
@@ -10931,3 +11063,8 @@ mod launch_focus;
 mod large_library_performance;
 #[path = "tests/large_library_regressions.rs"]
 mod large_library_regressions;
+
+#[path = "tests/artwork_journey.rs"]
+mod artwork_journey;
+
+mod provider_validation;

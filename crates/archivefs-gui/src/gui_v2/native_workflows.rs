@@ -334,6 +334,7 @@ impl NativeWorkflows {
     }
 
     pub(super) fn new(context: egui::Context) -> Self {
+        crate::emulator_setup::zx_snapshot::poll(&context);
         #[cfg(not(test))]
         let mut app = ArchiveFsApp::new_without_initial_load(context.clone());
         #[cfg(test)]
@@ -499,6 +500,7 @@ impl NativeWorkflows {
         self.select(path);
         self.app.launch_standalone.focus_dosbox_game(Some(path));
         self.app.emulator_readiness.flycast_gdi.show(ui, Some(path));
+        self.app.emulator_readiness.vice.show(ui, Some(path));
         self.app
             .emulator_readiness
             .xroar_cassette
@@ -596,6 +598,7 @@ impl NativeWorkflows {
         activity: &mut Activity,
     ) -> Option<Route> {
         self.app.emulator_readiness.flycast_gdi.show(ui, Some(path));
+        self.app.emulator_readiness.vice.show(ui, Some(path));
         self.app
             .emulator_readiness
             .xroar_cassette
@@ -715,6 +718,22 @@ impl NativeWorkflows {
         };
         self.observe_readiness_activity(activity);
         let mut summary = launch_readiness_summary::project(&input, freshness);
+        if let launch_readiness_page::LaunchReadinessInput::Plan {
+            plan, retroarch, ..
+        } = &input
+            && let Some(candidate) = launch_readiness_summary::selected_candidate(plan)
+            && matches!(
+                candidate.target,
+                archivefs_core::launch::LaunchTarget::RetroArchCore { .. }
+            )
+            && let Err(refusal) = launch_readiness_page::retroarch_launch_request_checked(
+                plan,
+                candidate,
+                retroarch.as_ref(),
+            )
+        {
+            launch_readiness_summary::note_retroarch_installation_refusal(&mut summary, &refusal);
+        }
         if catalogue_verified {
             launch_readiness_summary::note_catalogue_verified(&mut summary);
         }
@@ -774,32 +793,66 @@ impl NativeWorkflows {
     /// The single-file RetroArch launch Play would start for this game, from
     /// the same current plan and candidate policy as Launch (as
     /// `save_state_target`). Never starts a readiness check itself.
+    /// The saved RetroArch choice's problem as Setup names it: after a failed
+    /// discovery only when that failure was the choice being refused.
+    fn retroarch_selection_issue(
+        &self,
+    ) -> Option<crate::retroarch_installation_setup::SelectionIssue> {
+        match &self.app.emulator_readiness.retroarch_profiles {
+            RetroArchProfilesState::Error(message) => {
+                crate::retroarch_installation_setup::selection_issue_after_refused_discovery(
+                    message,
+                )
+            }
+            _ => crate::retroarch_installation_setup::current_selection_issue(),
+        }
+    }
+
+    /// Rechecks RetroArch when its installation changed since the last scan.
+    pub(super) fn revalidate_retroarch(&mut self, context: &egui::Context) {
+        self.app.revalidate_retroarch_installation(context);
+    }
+
     pub(super) fn retroarch_bezel_request(
         &self,
         game_id: i64,
         path: &Path,
-    ) -> Result<archivefs_core::launch::RetroArchLaunchRequest, &'static str> {
+    ) -> Result<archivefs_core::launch::RetroArchLaunchRequest, String> {
         if self.selected_game != Some(game_id)
             || self.selected.as_deref() != Some(path)
             || self.readiness_error().is_some()
         {
             return Err(
-                "EmuWiz has not checked how this game launches yet. Open the game's details, let the launch check finish, then preview again.",
+                "EmuWiz has not checked how this game launches yet. Open the game's details, let the launch check finish, then preview again.".into(),
             );
         }
         let launch_readiness_page::LaunchReadinessInput::Plan {
             plan, retroarch, ..
         } = self.launch_input()
         else {
-            return Err("This game's launch check is not ready.");
+            // RetroArch discovery itself refused (for example an unusable
+            // saved installation): say so rather than "not ready".
+            return Err(self.retroarch_selection_issue().map_or_else(
+                || "This game's launch check is not ready.".to_string(),
+                |issue| issue.message(),
+            ));
         };
-        let candidate = launch_readiness_summary::selected_candidate(&plan).ok_or(
-            "This game has no single launch choice, so EmuWiz can't tell which RetroArch core it uses.",
-        )?;
-        launch_readiness_page::single_content_retroarch_request(&plan, candidate, retroarch.as_ref())
-            .ok_or(
-                "This game doesn't launch in RetroArch as one plain file (for example it uses another emulator, a multi-disc playlist, an archive or a Flatpak RetroArch), so a per-game bezel can't be named safely.",
+        let candidate = launch_readiness_summary::selected_candidate(&plan).ok_or_else(|| {
+            self.retroarch_selection_issue().map_or_else(
+                || "This game has no single launch choice, so EmuWiz can't tell which RetroArch core it uses.".to_string(),
+                |issue| issue.message(),
             )
+        })?;
+        if launch_readiness_page::retroarch_playlist(candidate, retroarch.as_ref()).is_some() {
+            return Err("This game launches as a multi-disc playlist, so a per-game bezel can't be named for one file.".into());
+        }
+        launch_readiness_page::retroarch_launch_request_checked(&plan, candidate, retroarch.as_ref())
+            .map_err(|refusal| {
+                format!(
+                    "{} A per-game bezel can only be named for the exact file and core a normal launch uses.",
+                    refusal.message()
+                )
+            })
     }
 
     /// Multi-disc guidance for the focused game: its verified disc set, this
@@ -3166,7 +3219,11 @@ impl NativeWorkflows {
     }
 
     fn select(&mut self, path: &Path) {
+        self.app
+            .launch_standalone
+            .focus_vice_trainer_game(Some(path));
         if self.selected.as_deref() != Some(path) {
+            self.app.launch_standalone.focus_dosbox_game(Some(path));
             self.selected = Some(path.to_path_buf());
             self.app.archive_context.select_only(path.to_path_buf());
         }
@@ -3224,6 +3281,7 @@ impl NativeWorkflows {
         ) {
             self.app.start_retroarch_profile_scan(context.clone());
         }
+        self.app.revalidate_retroarch_installation(context);
         if matches!(
             self.app.emulator_readiness.dolphin_local_profiles,
             DolphinLocalProfilesState::NotScanned
@@ -3283,6 +3341,7 @@ impl NativeWorkflows {
                 "IdentityConflicting".into()
             }
             launch_readiness_page::LaunchReadinessInput::AtariSt(_) => "AtariSt".into(),
+            launch_readiness_page::LaunchReadinessInput::DosBoxReview => "DosBoxReview".into(),
         }
     }
 

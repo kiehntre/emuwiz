@@ -112,6 +112,7 @@ fn play(lab: &Lab) -> (AdfLaunchInputs, GamerPlayAction) {
         cemu: None,
         flycast: None,
         xroar: None,
+        vice: None,
         amiga_whdload: Some(AmigaWHDLoadLaunchContext {
             requests: Vec::new(),
             adf: inputs.requests.clone(),

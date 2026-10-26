@@ -104,17 +104,12 @@ pub(super) fn prepare(
     folder: &Path,
     expected_id: Option<&str>,
     selections: Vec<ScummVmTrainerSelection>,
+    roots: Roots,
 ) -> Result<Prepared, String> {
     let executable = resolve_scummvm_executable().ok_or(
         "Native ScummVM is unavailable. Install it before checking trainer compatibility.",
     )?;
-    prepare_with(
-        folder,
-        expected_id,
-        selections,
-        executable,
-        Roots::managed()?,
-    )
+    prepare_with(folder, expected_id, selections, executable, roots)
 }
 
 pub(super) fn prepare_with(

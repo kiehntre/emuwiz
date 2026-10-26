@@ -136,6 +136,7 @@ mod ppsspp_cwcheat;
 pub mod ppsspp_install;
 pub(crate) mod ppsspp_local;
 mod ppsspp_texture_pack;
+mod ps2_codebreaker;
 mod resolved_emulator_profile;
 mod retrieval;
 mod retroarch;
@@ -947,6 +948,14 @@ pub use ppsspp_texture_pack::{
     build_ppsspp_texture_pack_preview, build_ppsspp_texture_pack_transaction_plan,
     execute_ppsspp_texture_pack_apply, ppsspp_texture_destination_root,
     validate_ppsspp_texture_pack_manifest, verified_ppsspp_texture_identity,
+};
+pub use ps2_codebreaker::{
+    MAX_CODEBREAKER_INPUT_BYTES, MAX_CODEBREAKER_LINES, PS2_CODEBREAKER_CIPHER_CRATE,
+    PS2_CODEBREAKER_HOOK_EXCLUSION_RATIONALE, PS2_CODEBREAKER_PREVIEW_VERSION,
+    Ps2CodebreakerDeclaredGame, Ps2CodebreakerError, Ps2CodebreakerExcludedHook,
+    Ps2CodebreakerFamily, Ps2CodebreakerKeyMode, Ps2CodebreakerOutcome, Ps2CodebreakerPreview,
+    Ps2CodebreakerProvenance, Ps2CodebreakerRecord, Ps2CodebreakerRefusal, Ps2CodebreakerRole,
+    Ps2CodebreakerVersion, preview_ps2_codebreaker,
 };
 pub use resolved_emulator_profile::{
     EmulatorDestinationDirectories, EmulatorInstallationType, EmulatorProfileConfidence,

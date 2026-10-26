@@ -17,6 +17,7 @@ pub(crate) struct EmulatorReadinessState {
     pub(crate) mesen: std::sync::Arc<std::sync::Mutex<crate::emulator_setup::mesen::Controller>>,
     pub(crate) hatari: std::sync::Arc<std::sync::Mutex<crate::emulator_setup::hatari::Controller>>,
     pub(crate) flycast_gdi: crate::emulator_setup::flycast_gdi::Controller,
+    pub(crate) vice: crate::launch_readiness_page::vice::Controller,
     pub(crate) xroar_cassette: crate::emulator_setup::xroar_cassette::Controller,
     pub(crate) cemu: crate::emulator_setup::cemu::Controller,
     #[cfg(target_os = "linux")]
@@ -25,6 +26,11 @@ pub(crate) struct EmulatorReadinessState {
     pub(crate) retroarch_installation_picker:
         crate::retroarch_installation_setup::InstallationPicker,
     pub(crate) retroarch_profiles: RetroArchProfilesState,
+    /// What the current RetroArch scan was based on; a later difference
+    /// triggers a rescan (see `revalidate_retroarch_installation`).
+    pub(crate) retroarch_installation_fingerprint:
+        Option<crate::retroarch_installation_setup::InstallationFingerprint>,
+    pub(crate) retroarch_revalidated_at: Option<std::time::Instant>,
     pub(crate) retroarch_core_directory_override: Option<PathBuf>,
     pub(crate) retroarch_core_folder_rejected_pick: Option<PathBuf>,
     pub(crate) emulator_setup_focus: Option<EmulatorSetupFocus>,
@@ -65,10 +71,13 @@ impl Default for EmulatorReadinessState {
             hatari: Default::default(),
             flycast_gdi: Default::default(),
             xroar_cassette: Default::default(),
+            vice: Default::default(),
             #[cfg(target_os = "linux")]
             shadps4: Default::default(),
             retroarch_installation_picker: Default::default(),
             retroarch_profiles: RetroArchProfilesState::NotScanned,
+            retroarch_installation_fingerprint: None,
+            retroarch_revalidated_at: None,
             retroarch_core_directory_override: None,
             retroarch_core_folder_rejected_pick: None,
             emulator_setup_focus: None,

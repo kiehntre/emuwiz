@@ -229,7 +229,7 @@ fn child_entry() {
     let fixture = VerifiedGameFixture::reopen(&root).unwrap();
     let cheats = root.join("cheats");
     let record = root.join("retroarch/record");
-    if scenario.starts_with("selected-") {
+    if scenario.starts_with("selected-") || scenario.starts_with("truth-") {
         let selected = root.join("second/retroarch");
         let context = eframe::egui::Context::default();
         let mut picker = crate::retroarch_installation_setup::InstallationPicker::default();
@@ -250,7 +250,7 @@ fn child_entry() {
     }
     let mut blue = Blue::open(&fixture);
     blue.wait_for_readiness();
-    if scenario.starts_with("selected-") {
+    if scenario.starts_with("selected-") || scenario.starts_with("truth-") {
         assert_eq!(
             blue.discovered_executables(),
             vec![root.join("second/retroarch").display().to_string()]
@@ -286,6 +286,9 @@ fn child_entry() {
         "save-stale" | "save-missing" | "save-write-failed" => {
             installation_save::refused_save(&mut blue, &fixture, &root, &scenario);
         }
+        truth if truth.starts_with("truth-") => {
+            selection_truth::run(&mut blue, &fixture, &root, truth);
+        }
         "plain" | "selected-plain" => {
             blue.guard_executables(&root);
             blue.click(PLAY);
@@ -319,7 +322,6 @@ fn child_entry() {
                 "unreviewed cheats never launch"
             );
             blue.click(REVIEWED);
-            assert!(blue.shown(PLAY_ONE), "{:?}", blue.last);
             blue.guard_executables(&root);
             blue.click(PLAY_ONE);
             let args = blue.wait_for_exit(&record);
@@ -831,13 +833,35 @@ impl Blue {
     }
 
     fn click(&mut self, label: &str) {
-        let layout = self.paint();
-        let point = bounds(&layout, label)
-            .into_iter()
-            .find(|rect| rect.min.y > 64.0)
-            .unwrap_or_else(|| panic!("{label} not on screen: {:?}", self.last))
-            .center();
-        self.click_at(point);
+        // Approval and error text, and long private paths, can push the
+        // next control below the viewport. Only click painted, unclipped
+        // text, and use the same scroll input a player would use to reach it.
+        for attempt in 0..18 {
+            let layout = self.paint();
+            if let Some(rect) = bounds(&layout, label)
+                .into_iter()
+                .find(|rect| rect.min.y > 64.0)
+            {
+                self.click_at(rect.center());
+                return;
+            }
+            let mut raw = input(None, SIZE);
+            raw.events = vec![
+                eframe::egui::Event::PointerMoved(eframe::egui::pos2(
+                    SIZE[0] * 0.7,
+                    SIZE[1] - 150.0,
+                )),
+                eframe::egui::Event::MouseWheel {
+                    phase: eframe::egui::TouchPhase::Move,
+                    unit: eframe::egui::MouseWheelUnit::Point,
+                    delta: eframe::egui::vec2(0.0, if attempt == 0 { 10000.0 } else { -300.0 }),
+                    modifiers: eframe::egui::Modifiers::NONE,
+                },
+            ];
+            let _ = self.context.run(raw, |ctx| self.app.show(ctx));
+            self.paint();
+        }
+        panic!("{label} not reachable by scrolling: {:?}", self.last);
     }
 
     fn open_launch_error(&mut self) {
@@ -917,10 +941,14 @@ fn bounds(output: &eframe::egui::FullOutput, wanted: &str) -> Vec<eframe::egui::
         }
     }
     let mut out = Vec::new();
-    output
-        .shapes
-        .iter()
-        .for_each(|s| gather(&s.shape, wanted, &mut out));
+    for shape in &output.shapes {
+        let mut candidates = Vec::new();
+        gather(&shape.shape, wanted, &mut candidates);
+        out.extend(candidates.into_iter().filter_map(|rect| {
+            let visible = rect.intersect(shape.clip_rect);
+            visible.is_positive().then_some(visible)
+        }));
+    }
     out
 }
 
@@ -949,3 +977,6 @@ fn find_file(dir: &Path, name: &str) -> Option<PathBuf> {
 
 mod cartridge_cue;
 mod installation_save;
+mod selection_truth;
+
+mod fuse_snapshot;

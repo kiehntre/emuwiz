@@ -100,6 +100,7 @@ pub(crate) mod verified_game_fixture;
 mod verified_game_fixture_tests;
 #[cfg(test)]
 mod verify_journey_tests;
+pub(crate) mod vice_evidence;
 mod view_history_page;
 mod visual_pages;
 mod wiiu_disc;
@@ -344,6 +345,8 @@ pub(super) struct App {
     /// How many shelf cards Browse & Play draws, and the scope it was chosen for.
     browse_play: browse_play::BrowsePlayState,
     preferences_dirty: Option<Instant>,
+    /// Initial Restore must finish before a settings snapshot can be queued.
+    preferences_restored: bool,
     interacted: bool,
     loaded: bool,
     /// Why the library could not load; `None` once a load succeeds.
@@ -461,6 +464,7 @@ impl App {
             index_job: None,
             browse_play: Default::default(),
             preferences_dirty: None,
+            preferences_restored: false,
             interacted: false,
             loaded: false,
             library_failure: None,
@@ -905,6 +909,32 @@ impl App {
         self.router.back();
         self.navigation_changed();
     }
+    fn restore_preferences(&mut self, mut preferences: Preferences) {
+        self.welcome_dismissed = preferences.welcome_dismissed;
+        self.beginner_hints_enabled = preferences.beginner_hints_enabled;
+        self.simple.enabled = simple_shell::blue_enabled(&preferences);
+        self.simple.set_ui_scale(preferences.ui_scale);
+        self.document_preferences.roots = preferences.document_roots.clone();
+        self.document_preferences.associations = preferences.document_associations.clone();
+        self.document_preferences.reading = preferences.document_reading.clone();
+        preferences.route = migrate_route(preferences.route);
+        preferences
+            .playing_library
+            .restore(&mut self.playing_library);
+        if !self.interacted {
+            let keep_onboarding = self
+                .environment
+                .as_ref()
+                .is_some_and(|snapshot| snapshot.is_fresh() && !self.welcome_dismissed);
+            if !keep_onboarding {
+                self.router.current = preferences.route;
+            }
+            self.filter = preferences.filter;
+            self.filter_dirty = Some(Instant::now());
+        }
+        self.preferences_restored = true;
+    }
+
     fn change_filter(&mut self) {
         self.filter_generation += 1;
         self.filter_dirty = Some(Instant::now());
@@ -1868,30 +1898,7 @@ impl App {
                                     self.missing_undo_done(restored)
                                 }
                                 Payload::Preferences(preferences) => {
-                                    self.welcome_dismissed = preferences.welcome_dismissed;
-                                    self.beginner_hints_enabled =
-                                        preferences.beginner_hints_enabled;
-                                    self.simple.enabled = simple_shell::blue_enabled(&preferences);
-                                    self.simple.set_ui_scale(preferences.ui_scale);
-                                    self.document_preferences.roots =
-                                        preferences.document_roots.clone();
-                                    self.document_preferences.associations =
-                                        preferences.document_associations.clone();
-                                    self.document_preferences.reading =
-                                        preferences.document_reading.clone();
-                                    let mut preferences = preferences;
-                                    preferences.route = migrate_route(preferences.route);
-                                    if !self.interacted {
-                                        let keep_onboarding =
-                                            self.environment.as_ref().is_some_and(|snapshot| {
-                                                snapshot.is_fresh() && !self.welcome_dismissed
-                                            });
-                                        if !keep_onboarding {
-                                            self.router.current = preferences.route;
-                                        }
-                                        self.filter = preferences.filter;
-                                        self.filter_dirty = Some(Instant::now());
-                                    }
+                                    self.restore_preferences(preferences)
                                 }
                                 Payload::PlayingLibraryPreview { state, generation } => {
                                     self.finish_playing_library_job(
@@ -2145,9 +2152,10 @@ impl App {
                 },
             );
         }
-        if self
-            .preferences_dirty
-            .is_some_and(|time| time.elapsed() > Duration::from_millis(500))
+        if self.preferences_restored
+            && self
+                .preferences_dirty
+                .is_some_and(|time| time.elapsed() > Duration::from_millis(500))
         {
             self.preferences_dirty = None;
             self.send(
@@ -2155,6 +2163,10 @@ impl App {
                 Command::Save(Preferences {
                     route: self.router.current.clone(),
                     filter: self.filter.clone(),
+                    playing_library:
+                        crate::playing_library_page::preferences::SavedPreferences::from_state(
+                            &self.playing_library,
+                        ),
                     welcome_dismissed: self.welcome_dismissed,
                     beginner_hints_enabled: self.beginner_hints_enabled,
                     document_roots: self.document_preferences.roots.clone(),

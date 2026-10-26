@@ -1,5 +1,9 @@
 # Real Emulator Launch Matrix
 
+Subsequent validation: [Job #21 — XRoar real cassette playback](XROAR_REAL_CASSETTE_PLAY.md)
+records an actual Blue → Dragon 32 → Cross Trex load, interactive jump/score,
+and emulator exit on 2026-10-25. The historical snapshot below is unchanged.
+
 > **Recovered historical research — status against current main (`b66422c2`).**
 > Source: branch `qa/real-emulator-launch-matrix` at `c10c9fcb`. Recovered unchanged below this block except where marked `[refreshed]`.
 > - **QA framework and a historical snapshot (2026-09-22, main `41c9a645`) — not launch evidence.** It records *no* completed real launch: every row is "Not tested". No row may be read as a pass, and no untested row has been converted to one here.

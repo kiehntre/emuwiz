@@ -18,6 +18,11 @@ semver = "1"
 # and full default case folding, including composed accents and sharp-s.
 caseless = "0.2.2"
 unicode-normalization = "0.1"
+# PS2 CodeBreaker cipher (preview-only decryption in ps2_codebreaker). Exact
+# pin: MIT OR Apache-2.0, no_std, one transitive dependency (bytemuck, already
+# in the lockfile). Validated against the original MIT C implementation; see
+# docs/research/PS2_CODEBREAKER_PNACH_PREVIEW.md.
+codebreaker = "=0.4.0"
 log = "0.4"
 libc = "0.2"
 notify = "8"

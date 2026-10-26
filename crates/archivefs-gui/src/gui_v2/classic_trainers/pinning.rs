@@ -35,6 +35,10 @@ fn current(game: &Game) -> Result<(ClassicTrainerGame, TrustedRoots), String> {
         );
     }
     let config = archivefs_core::Config::load_default().map_err(|e| e.to_string())?;
+    if fresh.platform == "Commodore 64" {
+        // The same bounded cartridge/DAT contract used by Blue VICE Play.
+        let _ = super::super::vice_evidence::current(&fresh.archive.absolute_path)?;
+    }
     Ok((
         trainer_game(fresh),
         TrustedRoots::from_paths(config.source_folders),

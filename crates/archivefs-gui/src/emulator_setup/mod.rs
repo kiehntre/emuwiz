@@ -31,6 +31,7 @@ pub(crate) mod profile_resolution;
 pub(crate) mod shadps4;
 mod state;
 pub(crate) mod xroar_cassette;
+pub(crate) mod zx_snapshot;
 
 #[allow(unused_imports)]
 pub(crate) use controller::*;

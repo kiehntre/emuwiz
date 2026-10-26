@@ -90,9 +90,12 @@ pub fn preview_pin(
     roots: &TrustedRoots,
 ) -> Result<PinPreview, String> {
     if !game.identity_verified
-        || poke_platform_for_label(&game.platform) != Some(PokePlatform::ZxSpectrum)
+        || !matches!(
+            poke_platform_for_label(&game.platform),
+            Some(PokePlatform::ZxSpectrum | PokePlatform::Commodore64)
+        )
     {
-        return Err("A current DAT-verified ZX Spectrum identity is required.".into());
+        return Err("A current DAT-verified ZX Spectrum or C64 identity is required.".into());
     }
     let parent = game_path.parent().ok_or("Game has no parent directory.")?;
     validate_destination_root(parent).map_err(|e| format!("Unsafe destination: {e}"))?;
@@ -145,7 +148,7 @@ pub fn preview_pin(
     }
     let (trainer_bytes, trainer_file) = observe(&trainer_path, roots, TRAINER_FILE_MAX_BYTES)?;
     let text = std::str::from_utf8(&trainer_bytes).map_err(|_| "Trainer is not plain text.")?;
-    let trainers = parse_zx_pok(text).map_err(|e| format!("Invalid .pok: {e:?}"))?;
+    let trainers = parse_sidecar_trainers(game, text)?;
     if trainers.is_empty() {
         return Err("Trainer has no options to associate.".into());
     }

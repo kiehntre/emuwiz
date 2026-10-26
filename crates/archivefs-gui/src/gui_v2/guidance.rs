@@ -39,6 +39,38 @@ mod tests;
 
 pub(super) use model::{GuidanceCategory, GuidanceContext, GuidancePage, MascotState};
 
+/// Project the selected catalogue row without probing a file during rendering.
+pub(super) fn add_selected_game(context: &mut GuidanceContext, game: &super::library::Game) {
+    use archivefs_core::launch::{
+        CanonicalIdentityStatus, EvidenceFreshness, canonical_identity_for_saved_report,
+    };
+    context.evidence.launch_identity_verified = Some(game.identified);
+    let identity = game.dat_exact.is_none().then(|| {
+        game.archive
+            .identity_report
+            .as_ref()
+            .map(|report| {
+                canonical_identity_for_saved_report(
+                    report,
+                    EvidenceFreshness::from_stored_health(&game.archive.last_known_health),
+                )
+                .0
+            })
+            .unwrap_or(CanonicalIdentityStatus::Unknown)
+    });
+    context.evidence.facts.extend(
+        evidence::GameGuidanceEvidence {
+            game_selected: Some(true),
+            identity,
+            ..Default::default()
+        }
+        .facts(),
+    );
+    if game.archive.last_verified_missing_at.is_some() {
+        context.evidence.blocker = Some("The last scan could not find this game file.".into());
+    }
+}
+
 impl GuidanceCategory {
     fn label(self) -> &'static str {
         match self {

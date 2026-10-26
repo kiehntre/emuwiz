@@ -233,35 +233,7 @@ impl ViceMonitorScript {
         projection: &ViceCheatProjection,
         game_key: &str,
     ) -> Result<(Self, ViceCheatLaunch), ViceCheatLaunchError> {
-        if game_key.trim().is_empty() {
-            return Err(cheat_error("cheats need a verified game key"));
-        }
-        if projection.readiness != ViceCheatReadiness::ReadyForLaunchReview
-            || projection.commands.is_empty()
-        {
-            return Err(cheat_error(
-                "these cheats are preview-only and cannot be used for a launch",
-            ));
-        }
-        let mut text = String::from("radix H\n");
-        for command in &projection.commands {
-            if !matches!(
-                command.memory,
-                ViceMemoryTarget::Ram | ViceMemoryTarget::ColourRam
-            ) {
-                return Err(cheat_error(
-                    "only normal RAM and colour RAM writes can be applied at launch",
-                ));
-            }
-            text.push_str(&format!(
-                "> {:04X} {:02X}\n",
-                command.address, command.value
-            ));
-        }
-        text.push_str("x\n");
-        if text.len() > MAX_MONITOR_SCRIPT_BYTES {
-            return Err(cheat_error("too many cheat commands for one launch"));
-        }
+        let text = Self::render(projection, game_key)?;
         if !scratch_root.is_absolute() {
             return Err(cheat_error("the launch scratch directory must be absolute"));
         }
@@ -293,14 +265,14 @@ impl ViceMonitorScript {
             let mut file = options
                 .open(&path)
                 .map_err(|e| cheat_error(format!("could not write the cheat command file: {e}")))?;
-            file.write_all(text.as_bytes())
+            file.write_all(&text)
                 .and_then(|()| file.sync_all())
                 .map_err(|e| cheat_error(format!("could not write the cheat command file: {e}")))?;
         }
         let launch = ViceCheatLaunch {
             game_key: game_key.to_string(),
             script_path: path.clone(),
-            script_sha256: sha256_hex(text.as_bytes()),
+            script_sha256: sha256_hex(&text),
         };
         Ok((
             Self {
@@ -309,6 +281,44 @@ impl ViceMonitorScript {
             },
             launch,
         ))
+    }
+
+    /// Regenerate monitor bytes only from typed operations. The shared runtime
+    /// uses these same bytes for receipt-backed disposable materialisation.
+    pub fn render(
+        projection: &ViceCheatProjection,
+        game_key: &str,
+    ) -> Result<Vec<u8>, ViceCheatLaunchError> {
+        if game_key.trim().is_empty() {
+            return Err(cheat_error("cheats need a verified game key"));
+        }
+        if projection.readiness != ViceCheatReadiness::ReadyForLaunchReview
+            || projection.commands.is_empty()
+        {
+            return Err(cheat_error(
+                "these cheats are preview-only and cannot be used for a launch",
+            ));
+        }
+        let mut text = String::from("radix H\n");
+        for command in &projection.commands {
+            if !matches!(
+                command.memory,
+                ViceMemoryTarget::Ram | ViceMemoryTarget::ColourRam
+            ) {
+                return Err(cheat_error(
+                    "only normal RAM and colour RAM writes can be applied at launch",
+                ));
+            }
+            text.push_str(&format!(
+                "> {:04X} {:02X}\n",
+                command.address, command.value
+            ));
+        }
+        text.push_str("x\n");
+        if text.len() > MAX_MONITOR_SCRIPT_BYTES {
+            return Err(cheat_error("too many cheat commands for one launch"));
+        }
+        Ok(text.into_bytes())
     }
 
     pub fn path(&self) -> &Path {
@@ -360,8 +370,17 @@ pub fn preflight_vice_launch_with_cheats(
     {
         return Err(bad("the cheat command file is not a safe regular file"));
     }
-    let bytes = fs::read(&cheats.script_path)
+    use std::io::Read;
+    let mut script = process_spawn::open_regular_file_nonblocking(&cheats.script_path)
+        .map_err(|_| bad("the cheat command file could not be read safely"))?;
+    let mut bytes = Vec::new();
+    (&mut script)
+        .take(MAX_MONITOR_SCRIPT_BYTES as u64 + 1)
+        .read_to_end(&mut bytes)
         .map_err(|_| bad("the cheat command file could not be read"))?;
+    if bytes.len() > MAX_MONITOR_SCRIPT_BYTES {
+        return Err(bad("the cheat command file grew beyond the safe bound"));
+    }
     if !sha256_hex(&bytes).eq_ignore_ascii_case(cheats.script_sha256.trim()) {
         return Err(bad("the cheat command file changed since it was written"));
     }

@@ -351,13 +351,29 @@ impl App {
         } else {
             measure("Clear") + gap
         };
+        let blue = theme::blue_profile(ui);
+        let attention = if blue {
+            measure("Needs attention") + gap
+        } else {
+            0.0
+        };
         let available = ui.available_width();
-        let search = (available - switch - clear - gap).min(300.0);
+        let search = (available - switch - clear - attention - gap).min(300.0);
         let stacked = search < SEARCH_MIN_WIDTH;
         let search = if stacked {
             (available - clear - gap).clamp(SEARCH_MIN_WIDTH.min(available), 300.0)
         } else {
             search
+        };
+        let attention_filter = |this: &mut Self, ui: &mut egui::Ui| {
+            if blue
+                && ui
+                    .selectable_label(this.filter.attention_only, "Needs attention")
+                    .on_hover_text("Show only games that need attention.")
+                    .clicked()
+            {
+                this.filter.attention_only = !this.filter.attention_only;
+            }
         };
         let view_switch = |this: &mut Self, ui: &mut egui::Ui| {
             ui.selectable_value(&mut this.filter.list, false, "Grid");
@@ -373,17 +389,8 @@ impl App {
             if !self.filter.search.is_empty() && ui.button("Clear").clicked() {
                 self.filter.search.clear();
             }
-            // The existing "Needs attention" library filter, shown in Blue
-            // beside the search as on the board.
-            if theme::blue_profile(ui)
-                && ui
-                    .selectable_label(self.filter.attention_only, "Needs attention")
-                    .on_hover_text("Show only games that need attention.")
-                    .clicked()
-            {
-                self.filter.attention_only = !self.filter.attention_only;
-            }
             if !stacked {
+                attention_filter(self, ui);
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                     ui.selectable_value(&mut self.filter.list, true, "List");
                     ui.selectable_value(&mut self.filter.list, false, "Grid");
@@ -391,7 +398,10 @@ impl App {
             }
         });
         if stacked {
-            ui.horizontal(|ui| view_switch(self, ui));
+            ui.horizontal_wrapped(|ui| {
+                attention_filter(self, ui);
+                view_switch(self, ui);
+            });
         }
     }
 

@@ -16,6 +16,8 @@
 
 pub mod launch;
 pub mod pinning;
+pub mod snapshot;
+pub mod vice;
 
 use std::io::Read;
 use std::path::{Path, PathBuf};
@@ -24,7 +26,7 @@ use sha2::{Digest, Sha256};
 
 use crate::classic_poke_family::{
     PokeCheat, PokePlatform, PokeProjectionRefusal, PokeRuntimeEmulator, PokeRuntimeSupport,
-    normalize_zx_pok_family, poke_runtime_capability, project_poke_runtime,
+    normalize_zx_pok_family, parse_simple_pokes, poke_runtime_capability, project_poke_runtime,
 };
 use crate::dat::library_identity_summary::LibraryItemHashes;
 use crate::open_retro_cheat_providers::parse_zx_pok;
@@ -341,6 +343,14 @@ pub fn assess_sidecar_pok(
             pin: ClassicTrainerPin::Absent,
         }))
     };
+    if ["pok", "POK"]
+        .iter()
+        .filter(|ext| game_path.with_extension(ext).symlink_metadata().is_ok())
+        .count()
+        != 1
+    {
+        return problem("Multiple .pok/.POK sidecars are ambiguous; no entry is eligible.".into());
+    }
     let metadata = match std::fs::symlink_metadata(&path) {
         Ok(metadata) if metadata.is_file() => metadata,
         Ok(_) => return problem("not a regular file, ignored".into()),
@@ -350,25 +360,37 @@ pub fn assess_sidecar_pok(
         return problem("too large to be a trainer file, ignored".into());
     }
     let mut bytes = Vec::new();
-    let read = std::fs::File::open(&path).and_then(|file| {
-        file.take(TRAINER_FILE_MAX_BYTES + 1)
-            .read_to_end(&mut bytes)
-    });
+    let read =
+        crate::launch::process_spawn::open_regular_file_nonblocking(&path).and_then(|file| {
+            file.take(TRAINER_FILE_MAX_BYTES + 1)
+                .read_to_end(&mut bytes)
+        });
     if let Err(error) = read {
         return problem(format!("cannot be read ({error})"));
     }
     let Ok(text) = String::from_utf8(bytes) else {
         return problem("is not plain text, ignored".into());
     };
-    let trainers = match parse_zx_pok(&text) {
+    let trainers = match parse_sidecar_trainers(game, &text) {
         Ok(trainers) => trainers,
-        Err(error) => return problem(format!("is not a valid ZX .pok file ({error:?})")),
+        Err(error) => {
+            // Reporting only: preserve recognition of an existing ZX trainer
+            // beside a C64 game as WrongPlatform. Pinning and VICE preparation
+            // still use the strict C64 parser and can never apply these entries.
+            if poke_platform_for_label(&game.platform) == Some(PokePlatform::Commodore64) {
+                match parse_zx_pok(&text) {
+                    Ok(zx) if !zx.is_empty() => zx.iter().map(normalize_zx_pok_family).collect(),
+                    _ => return problem(error),
+                }
+            } else {
+                return problem(error);
+            }
+        }
     };
     let pin = read_pin(game_path, &hex_sha256(text.as_bytes()));
     let cheats: Vec<PokeCheat> = trainers
-        .iter()
-        .map(|trainer| {
-            let mut cheat = normalize_zx_pok_family(trainer);
+        .into_iter()
+        .map(|mut cheat| {
             if let ClassicTrainerPin::Pinned { game_identity } = &pin {
                 cheat.source = format!("{source} (next to the game, pinned by its target file)");
                 cheat.target_identity = Some(game_identity.clone());
@@ -384,6 +406,27 @@ pub fn assess_sidecar_pok(
     let mut report = assess_poke_cheats(game, &cheats);
     report.pin = pin;
     Ok(Some(report))
+}
+
+/// Existing parsers only. A C64 sidecar is one bundled entry: never silently
+/// split a multi-write trainer into independently selectable partial effects.
+pub(super) fn parse_sidecar_trainers(
+    game: &ClassicTrainerGame,
+    text: &str,
+) -> Result<Vec<PokeCheat>, String> {
+    if poke_platform_for_label(&game.platform) == Some(PokePlatform::Commodore64) {
+        parse_simple_pokes(
+            PokePlatform::Commodore64,
+            "Local C64 POKEs (whole bundle)",
+            text,
+        )
+        .map(|cheat| vec![cheat])
+        .map_err(|e| format!("Invalid C64 simple POKE file: {e:?}"))
+    } else {
+        parse_zx_pok(text)
+            .map(|trainers| trainers.iter().map(normalize_zx_pok_family).collect())
+            .map_err(|e| format!("is not a valid ZX .pok file ({e:?})"))
+    }
 }
 
 fn hex_sha256(bytes: &[u8]) -> String {

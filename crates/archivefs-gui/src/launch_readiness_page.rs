@@ -48,7 +48,9 @@ pub(crate) mod flycast;
 mod melonds_cheats;
 mod retroarch_cheat_sets;
 mod retroarch_cheats;
+pub(crate) mod saturn_core;
 mod scummvm_profile;
+pub(crate) mod vice;
 pub(crate) mod xroar;
 use std::path::{Path, PathBuf};
 use std::sync::mpsc::{self, Receiver, TryRecvError};
@@ -121,6 +123,8 @@ pub(crate) enum LaunchReadinessInput {
     /// `CanonicalIdentityStatus::Unknown` - identity could not be resolved
     /// at all.
     IdentityUnknown,
+    /// A folder with a DOSBox config is only a candidate for explicit approval.
+    DosBoxReview,
     /// A CUE/BIN disc whose files could not be resolved. The text is the
     /// selected-evidence worker's own diagnostic (which track is missing,
     /// unsafe or ambiguous), never a guess.
@@ -171,6 +175,7 @@ pub(crate) enum LaunchReadinessInput {
         cemu: Option<cemu::Context>,
         flycast: Option<flycast::Context>,
         xroar: Option<xroar::Context>,
+        vice: Option<vice::Context>,
         amiga_whdload: Option<AmigaWHDLoadLaunchContext>,
         #[cfg(target_os = "linux")]
         shadps4: Option<crate::emulator_setup::shadps4::Snapshot>,
@@ -222,7 +227,8 @@ pub(crate) fn ready_to_play_result(
             arcade_dependency_blocked: false,
             save_state_version_sensitive: false,
         },
-        LaunchReadinessInput::IdentityUnknown
+        LaunchReadinessInput::DosBoxReview
+        | LaunchReadinessInput::IdentityUnknown
         | LaunchReadinessInput::DiscFilesUnresolved(_)
         | LaunchReadinessInput::InspectionIncomplete => ReadyToPlayEvidence {
             item_identity,
@@ -368,6 +374,7 @@ impl TypedLaunchRequest {
             Self::Standalone(StandaloneLaunchRequest::ShadPs4(request)) => {
                 request.plan.warnings().to_vec()
             }
+            Self::Standalone(StandaloneLaunchRequest::Vice(_)) => vec![vice::LIMITATION],
             _ => Vec::new(),
         }
     }
@@ -651,6 +658,7 @@ pub(crate) fn gamer_play_action(input: &LaunchReadinessInput) -> GamerPlayAction
         cemu,
         flycast,
         xroar,
+        vice,
         amiga_whdload,
         #[cfg(target_os = "linux")]
         shadps4,
@@ -668,6 +676,10 @@ pub(crate) fn gamer_play_action(input: &LaunchReadinessInput) -> GamerPlayAction
             LaunchReadinessInput::RetroArchNotScanned => GamerBlocker::new(
                 GamerBlockerKind::EmulatorNotChecked,
                 "RetroArch has not been checked yet.",
+            ),
+            LaunchReadinessInput::DosBoxReview => GamerBlocker::new(
+                GamerBlockerKind::UnknownSystem,
+                "Review and approve the DOSBox folder and start target on the Launch page.",
             ),
             LaunchReadinessInput::IdentityUnknown => GamerBlocker::new(
                 GamerBlockerKind::UnknownSystem,
@@ -730,6 +742,11 @@ pub(crate) fn gamer_play_action(input: &LaunchReadinessInput) -> GamerPlayAction
             if let Some(request) = flycast.as_ref().and_then(|c| c.request(plan, candidate)) {
                 return Some(TypedLaunchRequest::Standalone(
                     StandaloneLaunchRequest::Flycast(request),
+                ));
+            }
+            if let Some(request) = vice.as_ref().and_then(|c| c.request(plan, candidate)) {
+                return Some(TypedLaunchRequest::Standalone(
+                    StandaloneLaunchRequest::Vice(request),
                 ));
             }
             if let Some(request) = xroar
@@ -933,6 +950,11 @@ impl AmigaWHDLoadLaunchState {
     }
 
     fn start(&mut self, request: WHDLoadLaunchInput) {
+        // Shared by Game Details and the Launch panel: a selection change
+        // must not replace the process watcher while it is still active.
+        if self.is_active() {
+            return;
+        }
         let path = request
             .target
             .as_ref()
@@ -994,6 +1016,14 @@ pub(crate) enum StandaloneProcess {
     Cemu(archivefs_core::launch::LaunchedCemuProcess),
     Flycast(archivefs_core::launch::LaunchedFlycastProcess),
     XRoar(archivefs_core::launch::process_spawn::WatchedProcess),
+    Vice(archivefs_core::launch::process_spawn::WatchedProcess),
+    ViceTrainers(
+        Box<
+            archivefs_core::launch::cheat_runtime::CheatRuntimeSession<
+                archivefs_core::launch::process_spawn::WatchedProcess,
+            >,
+        >,
+    ),
     ScummVm(archivefs_core::launch::LaunchedScummVmProcess),
     OpenMsx(archivefs_core::launch::process_spawn::WatchedProcess),
     /// DOSBox running inside the bubblewrap sandbox.
@@ -1030,6 +1060,7 @@ pub(crate) struct StandaloneLaunchState {
     scummvm_profile: scummvm_profile::Choice,
     /// The DOSBox check and the user's approval for the game on screen.
     dosbox: dosbox::Panel,
+    vice_trainers: vice::trainers::Chooser,
 }
 
 impl StandaloneLaunchState {
@@ -1040,6 +1071,10 @@ impl StandaloneLaunchState {
     /// The game the Launch page shows, for the DOSBox check.
     pub(crate) fn focus_dosbox_game(&mut self, path: Option<&Path>) {
         self.dosbox.focus(path);
+    }
+
+    pub(crate) fn focus_vice_trainer_game(&mut self, path: Option<&Path>) {
+        self.vice_trainers.focus(path);
     }
 
     fn bind_cue_review(&mut self, request: &mut StandaloneLaunchRequest) -> Result<(), String> {
@@ -1235,6 +1270,11 @@ impl StandaloneLaunchState {
                     StandaloneProcess::Cemu(p) => p.poll().is_some(),
                     StandaloneProcess::Flycast(p) => p.poll().is_some(),
                     StandaloneProcess::XRoar(p) => p.poll().is_some(),
+                    StandaloneProcess::Vice(p) => p.poll().is_some(),
+                    StandaloneProcess::ViceTrainers(session) => {
+                        let _ = session.poll();
+                        session.is_finished()
+                    }
                     StandaloneProcess::ScummVm(p) => p.poll().is_some(),
                     StandaloneProcess::OpenMsx(p) => p.poll().is_some(),
                     StandaloneProcess::DosBox(p) => p.poll().is_some(),
@@ -1271,11 +1311,18 @@ impl StandaloneLaunchState {
     pub(crate) fn failure_detail(&self) -> Option<String> {
         match &self.tracked {
             Some((_, _, StandaloneLaunchStage::Failed(error))) => Some(error.clone()),
+            Some((
+                _,
+                _,
+                StandaloneLaunchStage::Running(StandaloneProcess::ViceTrainers(session))
+                | StandaloneLaunchStage::Exited(StandaloneProcess::ViceTrainers(session)),
+            )) => vice::trainers::failure_detail(session),
             _ => None,
         }
     }
 
     fn start(&mut self, request: StandaloneLaunchRequest) {
+        self.vice_trainers.cancel_approval();
         let (path, adapter) = request.key();
         if let Some(receiver) = scummvm_profile::start_with_profile(self, &request) {
             self.tracked = Some((path, adapter, StandaloneLaunchStage::Starting(receiver)));
@@ -1422,6 +1469,7 @@ pub(crate) enum StandaloneLaunchRequest {
     Cemu(cemu::Request),
     Flycast(flycast::Request),
     XRoar(xroar::Request),
+    Vice(vice::Request),
     #[cfg(target_os = "linux")]
     ShadPs4(crate::emulator_setup::shadps4::Request),
     Mame(MameLaunchRequest),
@@ -1482,6 +1530,7 @@ impl StandaloneLaunchRequest {
             Self::Cemu(_) => "Cemu",
             Self::Flycast(_) => "Flycast",
             Self::XRoar(_) => "XRoar",
+            Self::Vice(_) => "VICE",
             Self::ScummVm(_) => "ScummVM",
             Self::OpenMsx(..) => "openMSX",
             Self::DosBox(_) => "DOSBox",
@@ -1503,6 +1552,7 @@ impl StandaloneLaunchRequest {
             Self::Cemu(r) => r.key(),
             Self::Flycast(r) => r.key(),
             Self::XRoar(r) => r.key(),
+            Self::Vice(r) => r.key(),
             Self::ScummVm(r) => (r.selected_game_folder.clone(), "scummvm".into()),
             Self::OpenMsx(r, _) => (r.selected_content_path.clone(), "openmsx".into()),
             Self::DosBox(r) => (r.game_directory.clone(), dosbox::ADAPTER_KEY.into()),
@@ -1513,6 +1563,7 @@ impl StandaloneLaunchRequest {
             Self::Cemu(r) => r.execute().map(StandaloneProcess::Cemu),
             Self::Flycast(r) => r.execute().map(StandaloneProcess::Flycast),
             Self::XRoar(r) => r.execute().map(StandaloneProcess::XRoar),
+            Self::Vice(r) => r.execute().map(StandaloneProcess::Vice),
             #[cfg(target_os = "linux")]
             Self::ShadPs4(r) => r
                 .execute()
@@ -1622,6 +1673,10 @@ struct RetroArchLaunchKey {
     content_path: PathBuf,
     profile: ProfileRef,
     core_stem: String,
+    saturn_core_selection:
+        Option<archivefs_core::launch::saturn_core_selection::SaturnCoreSelection>,
+    expected_snapshot_evidence:
+        Option<archivefs_core::classic_trainer_evidence::snapshot::SnapshotEvidence>,
     expected_appimage_executable: Option<PathBuf>,
     expected_executable_binding:
         Option<archivefs_core::launch::execution::RetroArchExecutableBinding>,
@@ -1634,6 +1689,8 @@ impl RetroArchLaunchKey {
             content_path: request.selected_content_path.clone(),
             profile: request.profile,
             core_stem: request.core_stem.clone(),
+            saturn_core_selection: request.saturn_core_selection.clone(),
+            expected_snapshot_evidence: request.expected_snapshot_evidence.clone(),
             expected_appimage_executable: request.expected_appimage_executable.clone(),
             expected_executable_binding: request.expected_executable_binding.clone(),
             expected_configuration_file: request.expected_configuration_file.clone(),
@@ -1736,6 +1793,18 @@ impl RetroArchLaunchState {
     /// Read cheat sets from `root` instead of EmuWiz's default cheat cache.
     pub(crate) fn use_cheat_cache(&mut self, root: PathBuf) {
         self.cheat_cache_root = Some(root);
+    }
+
+    pub(crate) fn smoke_receipt(
+        &self,
+    ) -> Option<archivefs_core::launch::cheat_runtime::CheatRuntimeReceipt> {
+        match self.tracked.as_ref().map(|(_, stage)| stage) {
+            Some(
+                RetroArchLaunchStage::RunningCheats { session }
+                | RetroArchLaunchStage::ExitedCheats { session },
+            ) => Some(session.receipt().clone()),
+            _ => None,
+        }
     }
 
     pub(crate) fn use_probe(
@@ -2743,26 +2812,12 @@ pub(crate) fn multidisc_decision_with(
     }
 }
 
-fn retroarch_playlist(
+pub(crate) fn retroarch_playlist(
     candidate: &LaunchCandidate,
     retroarch: Option<&RetroArchLaunchContext>,
 ) -> Option<crate::multidisc_launch_view::PlaylistHandoff> {
     let decision = multidisc_decision(candidate, retroarch, None);
     retroarch?.multidisc.as_ref()?.handoff(&decision)
-}
-
-/// The request Play uses for `candidate`, only when RetroArch is handed that
-/// one content file (no multi-disc playlist). Features that must name files
-/// after what RetroArch loads, such as per-game bezel overrides, use this.
-pub(crate) fn single_content_retroarch_request(
-    plan: &LaunchPlan,
-    candidate: &LaunchCandidate,
-    retroarch: Option<&RetroArchLaunchContext>,
-) -> Option<RetroArchLaunchRequest> {
-    if retroarch_playlist(candidate, retroarch).is_some() {
-        return None;
-    }
-    retroarch_launch_request(plan, candidate, retroarch)
 }
 
 /// What a plain launch of `request` would hand RetroArch: see
@@ -2789,67 +2844,181 @@ fn retroarch_launch_request(
     candidate: &LaunchCandidate,
     retroarch: Option<&RetroArchLaunchContext>,
 ) -> Option<RetroArchLaunchRequest> {
+    retroarch_launch_request_unexplained(plan, candidate, retroarch).ok()
+}
+
+/// Why a candidate has no plain RetroArch launch request, from the same
+/// checks that build one, so Play, the launch page and the bezel panel
+/// explain the refusal that actually applied.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) enum RetroArchRequestRefusal {
+    /// The saved installation choice (or the program found) can't be used.
+    Installation(crate::retroarch_installation_setup::SelectionIssue),
+    /// The RetroArch program this launch was checked with has gone or
+    /// changed since; a recheck is due.
+    ProgramChanged(PathBuf),
+    NotRetroArch,
+    NotReady,
+    MultiDisc,
+    NeedsMount,
+    NotPlainFile,
+    FlatpakProfile,
+    Unconfirmed,
+}
+
+impl RetroArchRequestRefusal {
+    /// A problem with the RetroArch installation rather than the game.
+    pub(crate) fn installation_problem(&self) -> bool {
+        matches!(
+            self,
+            Self::Installation(_) | Self::ProgramChanged(_) | Self::FlatpakProfile
+        )
+    }
+
+    pub(crate) fn message(&self) -> String {
+        match self {
+            Self::Installation(issue) => issue.message(),
+            Self::ProgramChanged(path) => format!(
+                "The RetroArch program {} has changed or is no longer available since this game was checked. EmuWiz is checking RetroArch again; nothing was started.",
+                path.display()
+            ),
+            Self::NotRetroArch => "This game launches with another emulator, not RetroArch.".into(),
+            Self::NotReady => "This game's launch check has not found a ready RetroArch launch.".into(),
+            Self::MultiDisc => {
+                "This multi-disc game can't be launched safely as a single file.".into()
+            }
+            Self::NeedsMount => {
+                "This game's content has to be mounted before RetroArch can open it.".into()
+            }
+            Self::NotPlainFile => {
+                "This game is not a single plain file RetroArch opens directly (for example it is inside an archive).".into()
+            }
+            Self::FlatpakProfile => "The Flatpak RetroArch can't be used for Play or bezel Apply. Choose a native or verified AppImage installation in Emulator Setup.".into(),
+            Self::Unconfirmed => {
+                "EmuWiz can't confirm the RetroArch settings this game launches with.".into()
+            }
+        }
+    }
+}
+
+/// [`retroarch_launch_request`] with the reason when there is none. Only a
+/// refusal reads the saved installation choice: when that choice is unusable
+/// it is the reason discovery and preflight would give, so it is named
+/// instead of a game-level guess. Genuine game-format refusals stay as they
+/// are.
+pub(crate) fn retroarch_launch_request_checked(
+    plan: &LaunchPlan,
+    candidate: &LaunchCandidate,
+    retroarch: Option<&RetroArchLaunchContext>,
+) -> Result<RetroArchLaunchRequest, RetroArchRequestRefusal> {
+    use RetroArchRequestRefusal as R;
+    retroarch_launch_request_unexplained(plan, candidate, retroarch).map_err(|refusal| {
+        let game_format = matches!(
+            refusal,
+            R::MultiDisc | R::NeedsMount | R::NotPlainFile | R::NotRetroArch
+        );
+        if game_format {
+            return refusal;
+        }
+        crate::retroarch_installation_setup::current_selection_issue()
+            .map(R::Installation)
+            .unwrap_or(refusal)
+    })
+}
+
+fn retroarch_launch_request_unexplained(
+    plan: &LaunchPlan,
+    candidate: &LaunchCandidate,
+    retroarch: Option<&RetroArchLaunchContext>,
+) -> Result<RetroArchLaunchRequest, RetroArchRequestRefusal> {
+    use RetroArchRequestRefusal as R;
+    let LaunchTarget::RetroArchCore {
+        profile, core_stem, ..
+    } = &candidate.target
+    else {
+        return Err(R::NotRetroArch);
+    };
     // A supported multi-disc game whose playlist cannot be prepared safely is
     // not offered as a single-disc Play.
     if matches!(
         multidisc_decision(candidate, retroarch, None),
         archivefs_core::launch::MultiDiscLaunch::Refused { .. }
     ) {
-        return None;
+        return Err(R::MultiDisc);
     }
     let (Some(platform_id), Some(game_key)) = (&plan.platform_id, &plan.game_key) else {
-        return None;
+        return Err(R::NotReady);
     };
     if candidate.readiness != LaunchReadiness::Ready {
-        return None;
+        return Err(R::NotReady);
     }
     if !candidate.blockers.is_empty() || !candidate.warnings.is_empty() {
-        return None;
+        return Err(R::NotReady);
     }
     if candidate.content.requires_mount {
-        return None;
+        return Err(R::NeedsMount);
     }
     if candidate.content.container != Some(LaunchContainerKind::PlainFile) {
-        return None;
+        return Err(R::NotPlainFile);
     }
-    let content_path = candidate.content.resolved_path.clone()?;
-    let LaunchTarget::RetroArchCore {
-        profile, core_stem, ..
-    } = &candidate.target
-    else {
-        return None;
-    };
+    let content_path = candidate
+        .content
+        .resolved_path
+        .clone()
+        .ok_or(R::NotPlainFile)?;
     let expected_appimage_executable = match profile.profile_kind {
         ProfileKind::Native => None,
-        ProfileKind::AppImage => retroarch?.exact_appimage_executable(*profile),
-        ProfileKind::Flatpak => return None,
+        ProfileKind::AppImage => retroarch
+            .ok_or(R::Unconfirmed)?
+            .exact_appimage_executable(*profile),
+        ProfileKind::Flatpak => return Err(R::FlatpakProfile),
     };
-    Some(RetroArchLaunchRequest {
-        selected_content_path: content_path,
+    Ok(RetroArchLaunchRequest {
+        selected_content_path: content_path.clone(),
         expected_platform_id: platform_id.clone(),
         expected_game_key: game_key.clone(),
         profile: *profile,
         core_stem: core_stem.clone(),
+        saturn_core_selection: if platform_id == "Saturn" {
+            saturn_core::load().ok().flatten()
+        } else {
+            None
+        },
+        expected_snapshot_evidence: if platform_id == "ZX Spectrum" {
+            // An unproven snapshot is a game-level refusal, never an
+            // installation one.
+            let evidence =
+                crate::emulator_setup::zx_snapshot::readiness(&content_path).ok_or(R::NotReady)?;
+            if !matches!(evidence.identity(), CanonicalIdentityStatus::Resolved(ref identity) if &identity.game_key == game_key)
+            {
+                return Err(R::NotReady);
+            }
+            Some(evidence)
+        } else {
+            None
+        },
         expected_appimage_executable,
         expected_configuration_file: if let Some(context) = retroarch {
             let selected = context
                 .environment
                 .profiles
                 .iter()
-                .find(|p| p.profile_kind == profile.profile_kind && p.scope == profile.scope)?;
+                .find(|p| p.profile_kind == profile.profile_kind && p.scope == profile.scope)
+                .ok_or(R::Unconfirmed)?;
             if selected.config_file.path.lossy {
-                return None;
+                return Err(R::Unconfirmed);
             }
             Some(PathBuf::from(&selected.config_file.path.display))
         } else {
             None
         },
-        expected_executable_binding: if retroarch.is_some() {
-            let profile = retroarch?
+        expected_executable_binding: if let Some(context) = retroarch {
+            let profile = context
                 .environment
                 .profiles
                 .iter()
-                .find(|p| p.profile_kind == profile.profile_kind && p.scope == profile.scope)?;
+                .find(|p| p.profile_kind == profile.profile_kind && p.scope == profile.scope)
+                .ok_or(R::Unconfirmed)?;
             let executable_paths: Vec<_> = if profile.profile_kind == ProfileKind::AppImage {
                 profile
                     .app_images
@@ -2860,12 +3029,15 @@ fn retroarch_launch_request(
                 profile.evidence.executables.iter().collect()
             };
             match executable_paths.as_slice() {
-                [executable] if !executable.lossy => Some(
-                    archivefs_core::launch::execution::RetroArchExecutableBinding::capture(
-                        PathBuf::from(&executable.display),
+                [executable] if !executable.lossy => {
+                    let path = PathBuf::from(&executable.display);
+                    Some(
+                        archivefs_core::launch::execution::RetroArchExecutableBinding::capture(
+                            path.clone(),
+                        )
+                        .map_err(|_| R::ProgramChanged(path))?,
                     )
-                    .ok()?,
-                ),
+                }
                 // Retain the normal preflight's actionable missing/ambiguous
                 // refusal; it never chooses the first PATH executable.
                 _ => None,
@@ -2990,16 +3162,22 @@ pub(crate) fn show_launch_readiness_panel(
     amiga_whdload_launch_state: &mut AmigaWHDLoadLaunchState,
 ) -> Option<LaunchReadinessPageAction> {
     let mut action = None;
+    standalone_launch_state.vice_trainers.reconcile(input);
     widgets::section_header(
         ui,
         "Play / Launch readiness",
         Some(
-            "Ways this game can be played. Check emulator readiness, then launch only a command backed by verified identity and resolved content.",
+            "Ways this game can be played. Check emulator readiness and content. DOSBox also requires explicit approval of its local folder and start target; that approval does not verify a release.",
         ),
     );
 
     match input {
         LaunchReadinessInput::AtariSt(snapshot) => snapshot.show(ui),
+        LaunchReadinessInput::DosBoxReview => dosbox::show(
+            ui,
+            &CanonicalIdentityStatus::Unknown,
+            standalone_launch_state,
+        ),
         LaunchReadinessInput::EvidenceNotLoaded => {
             widgets::card(ui, |ui| {
                 ui.label("Load ROM Identity & Evidence first.");
@@ -3058,11 +3236,22 @@ pub(crate) fn show_launch_readiness_panel(
             cemu,
             flycast,
             xroar,
+            vice,
             amiga_whdload,
             #[cfg(target_os = "linux")]
             shadps4,
             ..
         } => {
+            if plan.platform_id.as_deref() == Some("Saturn")
+                && let Some(context) = retroarch
+            {
+                saturn_core::show(ui, &context.environment);
+            }
+            if let Some(context) = vice {
+                for candidate in &plan.candidates {
+                    context.show(ui, plan, candidate, standalone_launch_state);
+                }
+            }
             if let Some(context) = xroar {
                 for candidate in &plan.candidates {
                     if matches!(
@@ -3325,6 +3514,7 @@ fn show_launch_recipe(
     rpcs3: Option<&Rpcs3LaunchContext>,
     xenia: Option<&XeniaLaunchContext>,
     melonds: Option<&MelonDsLaunchContext>,
+    readiness_override: Option<(&'static str, widgets::StatusTone)>,
 ) {
     let (emulator, profile) = target_labels(&candidate.target);
     let system = plan.platform_id.as_deref().unwrap_or("Unknown system");
@@ -3346,7 +3536,8 @@ fn show_launch_recipe(
         xenia,
         melonds,
     );
-    let readiness = readiness_label_and_tone(candidate.readiness);
+    let readiness =
+        readiness_override.unwrap_or_else(|| readiness_label_and_tone(candidate.readiness));
 
     widgets::card(ui, |ui| {
         ui.label(egui::RichText::new("Launch recipe").strong());
@@ -3446,6 +3637,7 @@ fn launch_command_preview(
             profile_id,
             ..
         } => match *adapter_id {
+            "vice" => vice::command_preview(plan, candidate),
             "dolphin" => {
                 let context = dolphin?;
                 let profile = context
@@ -4267,6 +4459,7 @@ fn candidate_emulator_name(candidate: &LaunchCandidate) -> Option<&'static str> 
             "fuse" => Some("Fuse"),
             "tsugaru" => Some("Tsugaru"),
             "xroar" => Some("XRoar"),
+            "vice" => Some("VICE"),
             _ => None,
         },
         LaunchTarget::RetroArchCore { .. } => Some("RetroArch"),
@@ -4498,11 +4691,18 @@ fn show_candidate(
                     ..
                 }
             );
-        let (readiness_label, readiness_tone) = if strict_mame_blocked {
-            ("Needs attention", widgets::StatusTone::Blocked)
-        } else {
-            readiness_label_and_tone(candidate.readiness)
-        };
+        // Built once and used for both the badge and Play, so the page can't
+        // say Ready while Play is withheld for an installation problem.
+        let retroarch_request = matches!(candidate.target, LaunchTarget::RetroArchCore { .. })
+            .then(|| retroarch_launch_request_checked(plan, candidate, retroarch));
+        let installation_blocked = matches!(
+            &retroarch_request,
+            Some(Err(refusal)) if refusal.installation_problem()
+        );
+        let readiness_override = (strict_mame_blocked || installation_blocked)
+            .then_some(("Needs attention", widgets::StatusTone::Blocked));
+        let (readiness_label, readiness_tone) =
+            readiness_override.unwrap_or_else(|| readiness_label_and_tone(candidate.readiness));
 
         ui.horizontal_wrapped(|ui| {
             widgets::status_badge(ui, readiness_label, readiness_tone);
@@ -4537,6 +4737,7 @@ fn show_candidate(
             rpcs3,
             xenia,
             melonds,
+            installation_blocked.then_some(("Needs attention", widgets::StatusTone::Blocked)),
         );
 
         if let Some(context) = dolphin {
@@ -4577,10 +4778,23 @@ fn show_candidate(
             ui.add_enabled(false, egui::Button::new("Launch Mesen"))
                 .on_hover_text(crate::emulator_setup::mesen::NATIVE_CONTRACT_BLOCKER);
         }
-        if let Some(request) = retroarch_launch_request(plan, candidate, retroarch) {
-            ui.add_space(6.0);
-            let playlist = retroarch_playlist(candidate, retroarch);
-            show_launch_action(ui, retroarch_launch_state, request, playlist);
+        match retroarch_request {
+            Some(Ok(request)) => {
+                ui.add_space(6.0);
+                let playlist = retroarch_playlist(candidate, retroarch);
+                show_launch_action(ui, retroarch_launch_state, request, playlist);
+            }
+            // Say why Play is withheld instead of leaving a Ready card with no
+            // action. Refusals for a candidate that never reached Ready are
+            // already explained by its blockers above.
+            Some(Err(refusal))
+                if refusal.installation_problem()
+                    || candidate.readiness == LaunchReadiness::Ready =>
+            {
+                ui.add_space(6.0);
+                ui.colored_label(ui.visuals().warn_fg_color, refusal.message());
+            }
+            _ => {}
         }
         if let Some(context) = dolphin
             && let Some(request) = dolphin_launch_request(plan, candidate, context)
@@ -4715,6 +4929,10 @@ fn show_standalone_launch_action(
     if same {
         let label = match state.tracked.as_ref().map(|(_, _, stage)| stage) {
             Some(StandaloneLaunchStage::Starting(_)) => "Launching…",
+            Some(
+                StandaloneLaunchStage::Running(StandaloneProcess::ViceTrainers(session))
+                | StandaloneLaunchStage::Exited(StandaloneProcess::ViceTrainers(session)),
+            ) => vice::trainers::phase_label(session),
             Some(StandaloneLaunchStage::Running(_)) => "Running",
             Some(StandaloneLaunchStage::Exited(_)) => "Process exited",
             Some(StandaloneLaunchStage::Failed(_)) => "Launch failed",
@@ -4767,6 +4985,17 @@ fn show_standalone_launch_action(
             Some((_, _, StandaloneLaunchStage::Running(StandaloneProcess::ScummVm(_)))) => {
                 ui.small("ScummVM process started; EmuWiz cannot tell whether the game itself is running.");
             }
+            Some((
+                _,
+                _,
+                StandaloneLaunchStage::Running(StandaloneProcess::ViceTrainers(session)),
+            )) => {
+                vice::trainers::show_receipt(ui, session);
+            }
+            Some((_, _, StandaloneLaunchStage::Running(StandaloneProcess::Vice(process)))) => {
+                ui.small(format!("VICE running · PID {}", process.pid));
+                ui.small("Starting the process does not prove the game ran.");
+            }
             Some((_, _, StandaloneLaunchStage::Running(StandaloneProcess::OpenMsx(process)))) => {
                 ui.small(format!("openMSX running · PID {}", process.pid));
                 ui.small("Starting the process does not prove the game ran.");
@@ -4794,6 +5023,14 @@ fn show_standalone_launch_action(
                     && let Some(report) = process.poll()
                 {
                     ui.label(exit_line("ScummVM", report));
+                }
+                if let StandaloneProcess::ViceTrainers(session) = process {
+                    vice::trainers::show_receipt(ui, session);
+                }
+                if let StandaloneProcess::Vice(process) = process
+                    && let Some(report) = process.poll()
+                {
+                    ui.label(exit_line("VICE", report));
                 }
                 if let StandaloneProcess::OpenMsx(process) = process
                     && let Some(report) = process.poll()
@@ -4842,9 +5079,23 @@ fn show_standalone_launch_action(
                 return;
             }
         }
+        if adapter == "xroar"
+            && !state.is_active()
+            && ui.button("Launch XRoar again (recheck)").clicked()
+        {
+            state.start(request);
+            return;
+        }
         if adapter == "flycast"
             && !state.is_active()
             && ui.button("Launch Flycast again (recheck)").clicked()
+        {
+            state.start(request);
+            return;
+        }
+        if adapter == "vice"
+            && !state.is_active()
+            && ui.button("Play in VICE again (recheck)").clicked()
         {
             state.start(request);
             return;
@@ -4884,6 +5135,7 @@ fn show_standalone_launch_action(
             format!("Launch {adapter} with {} cheat(s)", choice.chosen_count())
         }
         _ if adapter == dosbox::ADAPTER_KEY => "Play in DOSBox".to_string(),
+        _ if adapter == "vice" => "Play in VICE".to_string(),
         // ScummVM's Play reads as the product name, like its recheck button.
         _ if adapter == "scummvm" => format!("Launch {}", request.adapter_name()),
         _ => format!("Launch {adapter}"),
@@ -4902,6 +5154,9 @@ fn show_amiga_whdload_launch_action(
         ui,
         Some(request.profile.emulator),
     );
+    if request.profile.emulator == archivefs_core::patch_manager::AmigaEmulatorKind::FsUae {
+        ui.small("Disposable WHDLoad session: new saves are discarded after exit.");
+    }
     let same_request = state.tracked.as_ref().is_some_and(|(path, adapter, _)| {
         let request_path = request
             .target
@@ -4932,13 +5187,22 @@ fn show_amiga_whdload_launch_action(
             }
             None => {}
         }
-        return;
+        if state.is_active() {
+            return;
+        }
     }
     let label = match request.profile.emulator {
         archivefs_core::patch_manager::AmigaEmulatorKind::Amiberry => "Amiberry",
         archivefs_core::patch_manager::AmigaEmulatorKind::FsUae => "FS-UAE",
     };
-    if ui.button(format!("Launch {label} WHDLoad")).clicked() {
+    let action = if same_request { "Retry" } else { "Launch" };
+    if ui
+        .add_enabled(
+            !state.is_active(),
+            egui::Button::new(format!("{action} {label} WHDLoad")),
+        )
+        .clicked()
+    {
         state.start(request);
     }
 }
@@ -5346,3 +5610,8 @@ pub(crate) fn show_dolphin_profile_guidance(ui: &mut egui::Ui, input: &LaunchRea
         }
     }
 }
+
+#[cfg(all(test, unix))]
+mod amiga_retry_tests;
+
+pub(crate) mod amiga_boot;
