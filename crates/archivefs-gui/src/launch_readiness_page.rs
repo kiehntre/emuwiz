@@ -33,10 +33,11 @@
 //!   content, or a `Blocked` candidate. shadPS4 alone accepts its sealed
 //!   `ReadyWithWarnings` plan with explicit unverified-compatibility warnings. Standalone
 //!   candidates are limited to adapters with an existing typed GUI executor.
-//! - It never exposes a Stop/Kill action and never automatically relaunches
-//!   a process that has exited.
+//! - Dolphin exposes an explicitly confirmed normal-stop request for the owned
+//!   launcher only. No forced kill, process-tree stop or automatic relaunch exists.
 
 mod dolphin_profile_guidance;
+mod dolphin_stop;
 
 #[path = "launch_readiness_page/cemu.rs"]
 pub(crate) mod cemu;
@@ -2140,6 +2141,7 @@ enum DolphinLaunchStage {
     },
     Running {
         process: LaunchedDolphinProcess,
+        stop: dolphin_stop::StopControl,
     },
     Exited {
         process: LaunchedDolphinProcess,
@@ -2170,7 +2172,13 @@ impl DolphinLaunchState {
         match stage {
             DolphinLaunchStage::Starting { receiver } => match receiver.try_recv() {
                 Ok(Ok(process)) => {
-                    self.tracked = Some((key, DolphinLaunchStage::Running { process }));
+                    self.tracked = Some((
+                        key,
+                        DolphinLaunchStage::Running {
+                            process,
+                            stop: Default::default(),
+                        },
+                    ));
                     true
                 }
                 Ok(Err(error)) => {
@@ -2195,12 +2203,12 @@ impl DolphinLaunchState {
                     true
                 }
             },
-            DolphinLaunchStage::Running { mut process } => {
+            DolphinLaunchStage::Running { mut process, stop } => {
                 if process.poll().is_some() {
                     self.tracked = Some((key, DolphinLaunchStage::Exited { process }));
                     true
                 } else {
-                    self.tracked = Some((key, DolphinLaunchStage::Running { process }));
+                    self.tracked = Some((key, DolphinLaunchStage::Running { process, stop }));
                     false
                 }
             }
@@ -5389,7 +5397,7 @@ fn show_dolphin_launch_action(
     let display = match launch_state.tracked.as_mut() {
         Some((key, stage)) if *key == this_key => match stage {
             DolphinLaunchStage::Starting { .. } => Display::Starting,
-            DolphinLaunchStage::Running { process } => Display::Running { pid: process.pid },
+            DolphinLaunchStage::Running { process, .. } => Display::Running { pid: process.pid },
             DolphinLaunchStage::Exited { process } => {
                 let report: &DolphinLaunchExitReport = process
                     .poll()
@@ -5428,6 +5436,11 @@ fn show_dolphin_launch_action(
             widgets::status_badge(ui, "Dolphin running", widgets::StatusTone::Success);
             ui.label(egui::RichText::new(format!("PID {pid}")).small());
             ui.add_enabled(false, egui::Button::new("Launch Dolphin"));
+            if let Some((_, DolphinLaunchStage::Running { process, stop })) =
+                launch_state.tracked.as_mut()
+            {
+                stop.show(ui, process);
+            }
         }
         Display::Exited {
             success,

@@ -1835,7 +1835,7 @@ fn dolphin_plan_with(candidates: Vec<LaunchCandidate>, game_id: &str) -> LaunchP
     }
 }
 
-fn spawn_test_dolphin_process(
+pub(super) fn spawn_test_dolphin_process(
     executable: &str,
     arguments: &[&str],
     content_path: &Path,
@@ -2120,13 +2120,20 @@ fn dolphin_running_stage_shows_running_status_and_pid() {
         spawn_test_dolphin_process("/bin/sleep", &["1"], &ready.content_path, &ready.profile_id);
     let pid = process.pid;
     let mut state = DolphinLaunchState {
-        tracked: Some((key, DolphinLaunchStage::Running { process })),
+        tracked: Some((
+            key,
+            DolphinLaunchStage::Running {
+                process,
+                stop: Default::default(),
+            },
+        )),
     };
 
     let output = render_with_dolphin_state(&dolphin_plan_input(plan, ready.context), &mut state);
     assert!(rendered_text_contains(&output, "Dolphin running"));
     assert!(rendered_text_contains(&output, &pid.to_string()));
-    assert!(!rendered_text_contains(&output, "Stop"));
+    assert!(rendered_text_contains(&output, "Request normal stop"));
+    assert!(rendered_text_contains(&output, "owned launcher"));
     assert!(!rendered_text_contains(&output, "Kill"));
 }
 
@@ -2242,7 +2249,13 @@ fn dolphin_switching_selection_never_shows_stale_state_and_still_reaps_the_old_w
     let process =
         spawn_test_dolphin_process("/bin/sleep", &["1"], &ready.content_path, &ready.profile_id);
     let mut state = DolphinLaunchState {
-        tracked: Some((other_key, DolphinLaunchStage::Running { process })),
+        tracked: Some((
+            other_key,
+            DolphinLaunchStage::Running {
+                process,
+                stop: Default::default(),
+            },
+        )),
     };
 
     // A different game's content, from the same profile discovery, is
