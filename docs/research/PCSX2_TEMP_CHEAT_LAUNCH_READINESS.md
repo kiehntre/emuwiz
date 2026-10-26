@@ -4,6 +4,10 @@ Module: `crates/archivefs-core/src/patch_manager/pcsx2_temp_cheat_readiness.rs`
 (`plan_pcsx2_temporary_cheat_launch`). Pure projection over existing evidence;
 it writes no PNACH, no `PCSX2.ini`, launches nothing and touches no memory card.
 
+The [2026-10-26 disposable probe](PCSX2_TEMP_CHEAT_PROBE_20261026.md)
+observed selected PNACH loading and enablement, but did not establish safe
+production support. Blue still uses the ordinary PCSX2 launch path.
+
 ## Correction to the feasibility report
 
 `PCSX2_CHEAT_RUNTIME_FEASIBILITY.md` (2026-10-04) states that EmuWiz launches
@@ -54,6 +58,12 @@ folder) until a validated workspace-pinning contract exists. A duplicate
 save states, BIOS, ...) are not blockers but become mandatory
 `PinUserFolderToRealDefault` staging requirements so a redirected launch can
 never silently use an empty memory-card folder.
+
+Routing also covers `Patches`, `Covers`, `GameSettings`, `UserResources`,
+`DebuggerLayouts` and `DebuggerSettings`. Game settings use the existing
+copy-to-workspace requirement, never a writable production pin; debugger
+defaults are under `inis`. The installed v2.8.2 appends `PCSX2` to the
+`-datapath` argument, so its resulting data root needs direct observation.
 
 ## Remaining requirements for real cheat-on-launch execution
 
