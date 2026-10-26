@@ -5651,6 +5651,43 @@ mod tests {
         assert_eq!(mode_of(&live), 0o640);
     }
 
+    /// Runs against whatever filesystem holds the temporary directory, with
+    /// no fault injection: where the kernel offers RENAME_EXCHANGE the
+    /// replacement keeps the file's bits; where it refuses (for example
+    /// exFAT, ntfs3, many FUSE mounts - run with TMPDIR there) the outcome is
+    /// AtomicReplaceUnsupported and the live file is untouched.
+    #[cfg(unix)]
+    #[test]
+    fn replacement_on_the_real_filesystem_keeps_bits_or_refuses_untouched() {
+        let fixture = Fixture::new("real-fs");
+        let report = preview(&fixture, b"new", Some(b"old"));
+        let live = fixture.destination_root().join("Nintendo - NES/game.cht");
+        chmod(&live, 0o644);
+        let before = mode_of(&live);
+        let plan = make_plan(&fixture, &report);
+        let result = execute_shared_apply(
+            &plan,
+            &options(&fixture, &plan, "real-fs", false, true, true),
+        );
+        let entry = &result.journal.entries[0];
+        if entry.outcome == SharedApplyOutcome::ReplacedExisting {
+            assert_eq!(fs::read(&live).unwrap(), b"new");
+            assert_eq!(mode_of(&live), before);
+        } else {
+            assert!(
+                entry
+                    .failures
+                    .iter()
+                    .any(|f| f.kind == SharedApplyFailureKind::AtomicReplaceUnsupported),
+                "{:?}",
+                entry.failures
+            );
+            assert_eq!(fs::read(&live).unwrap(), b"old");
+            assert_eq!(mode_of(&live), before);
+            assert!(stray_temporaries(live.parent().unwrap()).is_empty());
+        }
+    }
+
     /// Same size and the old mtime but different bytes is a changed file.
     #[cfg(unix)]
     #[test]
