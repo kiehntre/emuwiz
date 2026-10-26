@@ -298,3 +298,15 @@ fn case_insensitive_lookup_detects_per_game_bios_overrides() {
         assert_eq!(ini.get("Filenames", "BIOS"), Some("/original/bios.bin"));
     }
 }
+
+#[test]
+fn spaced_section_aliases_cannot_bypass_protected_ini_settings() {
+    for text in [
+        "[ Filenames ]\nbios=/original/bios.bin\n",
+        "[ MemoryCards ]\nSlot1_Filename=../outside.ps2\n",
+        "[ Achievements ]\nEnabled=true\nChallengeMode=true\n",
+        "[Folders]\nBios=bios\n[ Folders ]\nBios=other\n",
+    ] {
+        assert!(config::Ini::parse(text).is_err(), "{text}");
+    }
+}

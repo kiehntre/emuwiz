@@ -30,6 +30,9 @@ impl Ini {
                     .and_then(|s| s.strip_suffix(']'))
                     .filter(|s| !s.is_empty())
                     .ok_or("Malformed PCSX2 settings section")?;
+                if name != name.trim() {
+                    return Err("Ambiguous whitespace inside PCSX2 settings section".into());
+                }
                 if !seen_sections.insert(name.to_ascii_lowercase()) {
                     return Err(format!("Repeated PCSX2 settings section: {name}"));
                 }
