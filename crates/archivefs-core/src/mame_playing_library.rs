@@ -15,6 +15,8 @@ use crate::mame_collection_analyser::{
 };
 use crate::playing_library::evidence::dat_release_evidence;
 
+mod eligibility;
+
 pub const MAME_PLAYING_LIBRARY_SCHEMA_VERSION: u32 = 1;
 
 #[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd, Serialize, Deserialize)]
@@ -100,6 +102,7 @@ pub struct MameSelectedSet {
     pub clones: Vec<String>,
     pub regional_alternatives: Vec<String>,
     pub required_dependencies: Vec<String>,
+    /// Verified collection material and required support closure; not machine runnability.
     pub complete: bool,
     pub meaningfully_distinct_clone: bool,
     pub estimated_storage_bytes: Option<u64>,
@@ -186,6 +189,17 @@ pub fn build_mame_playing_library_plan(
         })
         .collect();
 
+    let required_support =
+        eligibility::RequiredSupport::new(&request.catalogue.games, health.clone());
+    let storage_evidence: BTreeMap<_, _> = request
+        .analysis
+        .set_results
+        .iter()
+        .filter(|r| health.get(r.name.as_str()) == Some(&MameSetHealth::Good))
+        .map(|r| (r.name.as_str(), &r.evidence))
+        .collect();
+    let mut required_evidence = BTreeMap::new();
+
     let mut families: BTreeMap<String, Vec<usize>> = BTreeMap::new();
     for (index, game) in request.catalogue.games.iter().enumerate() {
         if game
@@ -231,6 +245,10 @@ pub fn build_mame_playing_library_plan(
             if health.get(game.name.as_str()) != Some(&MameSetHealth::Good) {
                 reasons.push("collection evidence is incomplete or unknown".into());
             }
+            let evidence =
+                required_support.assess(index, storage_evidence.get(game.name.as_str()).copied());
+            reasons.extend(evidence.reasons.iter().cloned());
+            required_evidence.insert(index, evidence);
             for category in &categories {
                 if !category_allowed(*category, &request.preferences) {
                     reasons.push(format!("excluded category: {}", category.label()));
@@ -303,14 +321,15 @@ pub fn build_mame_playing_library_plan(
             .collect();
         for index in retained {
             let game = &request.catalogue.games[index];
-            let dependencies = declared_dependencies(game);
+            let evidence = &required_evidence[&index];
+            let dependencies = evidence.support_sets.keys().cloned().collect();
             plan.selected_sets.push(MameSelectedSet {
                 name: game.name.clone(),
                 parent: game.clone_of.clone(),
                 clones: eligible.iter().filter(|other| request.catalogue.games[**other].clone_of.as_deref() == Some(game.name.as_str())).map(|other| request.catalogue.games[*other].name.clone()).collect(),
                 regional_alternatives: alternatives.clone(),
                 required_dependencies: dependencies,
-                complete: health.get(game.name.as_str()) == Some(&MameSetHealth::Good),
+                complete: health.get(game.name.as_str()) == Some(&MameSetHealth::Good) && evidence.reasons.is_empty(),
                 meaningfully_distinct_clone: index != winner,
                 estimated_storage_bytes: observed.get(game.name.as_str()).and_then(|set| set_storage(set)),
                 reason: if index == winner { "preferred family representative".into() } else { "retained because metadata shows a meaningful regional/control-panel distinction".into() },
@@ -318,15 +337,9 @@ pub fn build_mame_playing_library_plan(
         }
     }
 
-    let mut support_names = BTreeSet::new();
+    let mut support_names = BTreeMap::new();
     for index in selected_indices {
-        let game = &request.catalogue.games[index];
-        if let Some(parent) = game.clone_of.as_deref() {
-            support_names.insert((parent.to_string(), "parent".to_string()));
-        }
-        for dependency in declared_dependencies(game) {
-            support_names.insert((dependency, "BIOS/device dependency".into()));
-        }
+        support_names.extend(required_evidence[&index].support_sets.clone());
     }
     for (name, kind) in support_names {
         if plan.selected_sets.iter().any(|set| set.name == name) {
@@ -336,7 +349,7 @@ pub fn build_mame_playing_library_plan(
         let available = storage.is_some() || observed.contains_key(name.as_str());
         plan.required_support_sets.push(MameRequiredSupportSet {
             name,
-            kind,
+            kind: kind.into(),
             available,
             estimated_storage_bytes: storage,
         });
@@ -514,16 +527,6 @@ fn same_region(
     right: &crate::dat::model::DatGameEntry,
 ) -> bool {
     dat_release_evidence(&left.name).regions == dat_release_evidence(&right.name).regions
-}
-
-fn declared_dependencies(game: &crate::dat::model::DatGameEntry) -> Vec<String> {
-    let mut dependencies: BTreeSet<String> = game
-        .device_refs
-        .iter()
-        .filter_map(|item| item.name.clone())
-        .collect();
-    dependencies.extend(game.bios_sets.iter().filter_map(|item| item.name.clone()));
-    dependencies.into_iter().collect()
 }
 
 fn parenthesized_tokens(name: &str) -> Vec<String> {
