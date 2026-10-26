@@ -604,13 +604,26 @@ fn whdload_runtime_status_distinguishes_support_from_saved_choices() {
                 crate::cheats_mods::whdload_trainer_flow::show_launch_status(ui, Some(emulator));
             });
         });
-        for expected in [
-            "trainer launch unsupported",
-            "EmuWiz saved CUSTOM options passed into launch: none.",
-            "Enable trainers at launch",
-        ] {
-            assert!(rendered_text_contains(&output, expected), "{expected}");
+        let expected_route = match emulator {
+            AmigaEmulatorKind::FsUae => "authorized EmuWiz WHDLoad boot sequence",
+            AmigaEmulatorKind::Amiberry => "CUSTOM trainer launch unsupported",
+        };
+        assert!(rendered_text_contains(&output, expected_route));
+        assert!(rendered_text_contains(
+            &output,
+            "Saving choices alone does not prove gameplay activation"
+        ));
+        if emulator == AmigaEmulatorKind::FsUae {
+            assert!(rendered_text_contains(&output, "gameplay NOT CONFIRMED"));
         }
+        assert!(!rendered_text_contains(
+            &output,
+            "EmuWiz saved CUSTOM options passed into launch: none."
+        ));
+        assert!(!rendered_text_contains(
+            &output,
+            "Enable trainers at launch"
+        ));
     }
 }
 

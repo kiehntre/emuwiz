@@ -130,5 +130,36 @@ package, template and every firmware/support input. In an isolated HOME/XDG and
 disposable graphical session, use normal Blue Game Details → Play, reach gameplay,
 demonstrate keyboard/controller response, exit, and repeat without restarting
 Blue. Capture missing-firmware, stale-package and unsupported-input refusals and
-before/after hashes of originals. Trainer activation remains disabled until that
-ordinary gameplay gate is independently evidenced.
+before/after hashes of originals. Saved trainer handoff can be verified
+independently of this gameplay gate; do not claim trainer effects or gameplay
+activation from a generated command alone.
+
+## Saved trainer handoff
+
+Blue reads the existing per-game `whdload-trainer-options/<identity digest>.options`
+file using the trainer editor's storage contract. The verified game key must equal
+both the slave SHA-256 and the authorized manifest game key. CUSTOM1–CUSTOM5 values
+are checked against the selected slave's own `ws_config`: duplicate slots,
+undeclared bits, invalid choices/booleans, unsupported declarations, non-decimal or
+overflowing values, symlinks, non-regular and oversized saved files are refused.
+Zero values add no arguments. Other preserved tooltypes never enter the command.
+
+The LHA adapter re-reads saved bytes before and after staging, and requires the
+extracted slave hash and parsed structure to equal the selected evidence. Only
+then are nonzero CUSTOM values appended to the generated guest command:
+
+```text
+C:WHDLoad "Game.slave" PRELOAD CUSTOM1=3 CUSTOM2=2
+```
+
+No `x_whdload_args`, CUSTOM emulator switches, source-package edits, live profile
+writes, or template-gate exceptions are used. Installed-folder and Amiberry trainer
+activation remain unsupported. Blue's WHDLoad details show the selected values,
+package/slave, guest invocation and isolated machine/mount policy. Malformed or
+stale choices block launch rather than silently launching without them.
+
+Deterministic tests verify this handoff with synthetic packages and inert tools.
+No authorized manifest/boot environment was available for this integration's
+runtime demonstration: **gameplay and actual trainer activation NOT CONFIRMED**.
+An installed emulator or existing firmware files alone do not establish permission
+or satisfy the explicit boot-template gate.

@@ -787,3 +787,223 @@ fn executable_symlink_is_refused_instead_of_silently_followed() {
     lab.request.profile.executable = Some(link);
     assert!(inspect_boot(&lab.request).is_err());
 }
+
+// Synthetic HUNK/ROM/tool fixtures verify handoff only, never gameplay.
+impl Lab {
+    fn trainers(
+        &mut self,
+        saved: &[u8],
+    ) -> super::super::amiga_whdload_command::WhdloadLaunchTrainer {
+        use crate::patch_manager::whdload_trainer_discovery_fixtures::synthetic_slave;
+        let bytes = synthetic_slave(
+            "C1:X:Infinite lives:0;C1:X:Infinite energy:1;C2:L:Level:one,two,three;C3:B:Practice;C4:Q:Unknown:0;",
+        );
+        self.repackage(&[("Nested/Game.slave", &bytes), ("Nested/data", b"game data")]);
+        self.manifest.game_key = digest(&bytes);
+        self.save();
+        self.request.identity = CanonicalIdentityStatus::Resolved(ResolvedIdentity {
+            platform_id: "Amiga".into(),
+            game_key: digest(&bytes),
+        });
+        self.request.profile.verified_identity = digest(&bytes);
+        let slave = self.request.slave.as_mut().unwrap();
+        slave.sha256 = digest(&bytes);
+        slave.parsed = parse_whdload_slave(&bytes).unwrap();
+        self.approve();
+        std::fs::write(self.root.path().join("saved.options"), saved).unwrap();
+        self.resolve().unwrap().unwrap()
+    }
+    fn resolve(
+        &self,
+    ) -> Result<Option<super::super::amiga_whdload_command::WhdloadLaunchTrainer>, String> {
+        super::super::amiga_whdload_trainer_launch::resolve_boot_trainers(
+            &self.request,
+            |discovery| {
+                // Same identity and storage contract as the editor; location injected
+                // so tests never touch a real user's EmuWiz data directory.
+                assert_eq!(
+                    discovery.identity.as_ref().unwrap().verified_game_identity,
+                    self.manifest.game_key
+                );
+                Ok(self.root.path().join("saved.options"))
+            },
+        )
+    }
+}
+
+#[test]
+fn saved_custom_values_reach_only_the_guest_whdload_invocation() {
+    let mut lab = Lab::new();
+    let trainer = lab
+        .trainers(b"; editor saved choices\nCUSTOM1=3\nC2=2\nCUSTOM3=0\nPRELOAD\nCUSTOMSAVE=1\n");
+    assert_eq!(trainer.arguments, ["CUSTOM1=3", "CUSTOM2=2"]);
+    let plan = super::super::amiga_whdload_command::build_fsuae_whdload_command_plan_with_trainer(
+        &lab.request,
+        Some(&trainer),
+    );
+    let command = plan.command.unwrap();
+    assert!(command.arguments.is_empty());
+    assert!(command.preview.contains("CUSTOM1=3 CUSTOM2=2"));
+    assert!(command.preview.contains("gameplay NOT CONFIRMED"));
+    let approval = lab.request.boot.as_ref().unwrap();
+    let prepared = prepare_boot_with_trainer(&lab.request, approval, Some(&trainer)).unwrap();
+    let sequence =
+        std::fs::read_to_string(prepared.workspace_path().join("Boot/S/Startup-Sequence")).unwrap();
+    assert_eq!(
+        sequence,
+        "C:SetPatch QUIET\nCD \"Games:Nested\"\nC:WHDLoad \"Game.slave\" PRELOAD CUSTOM1=3 CUSTOM2=2\nC:uae-configuration SPC_QUIT 1\n"
+    );
+    let config = std::fs::read_to_string(prepared.workspace_path().join("session.fs-uae")).unwrap();
+    assert!(!config.contains("CUSTOM"));
+    assert!(!config.contains("/real/user/data"));
+    assert_eq!(
+        read(&approval.package.path, MAX_TOTAL).unwrap().1,
+        approval.package
+    );
+    assert_eq!(
+        std::fs::read(&trainer.option_file).unwrap(),
+        b"; editor saved choices\nCUSTOM1=3\nC2=2\nCUSTOM3=0\nPRELOAD\nCUSTOMSAVE=1\n"
+    );
+    assert_eq!(
+        std::fs::read(&approval.profile.path).unwrap(),
+        b"amiga_model=A500\nhard_drive_9=/real/user/data\n"
+    );
+}
+
+#[test]
+fn boot_saved_options_validate_all_values_and_file_types() {
+    let mut lab = Lab::new();
+    let trainer = lab.trainers(b"CUSTOM1=1");
+    for bytes in [
+        b"CUSTOM1=4".as_slice(),
+        b"CUSTOM2=99",
+        b"CUSTOM3=2",
+        b"CUSTOM4=1",
+        b"CUSTOM5=1",
+        b"CUSTOM1=4294967296",
+        b"CUSTOM1=1\nC1=2",
+        b"CUSTOM1=1\nCUSTOM2=bad",
+        b"CUSTOM1=1;ok\nCUSTOM2=$(x)",
+        b"CUSTOM1=1\nCUSTOM3",
+        b"\xff",
+    ] {
+        std::fs::write(&trainer.option_file, bytes).unwrap();
+        assert!(lab.resolve().is_err(), "{bytes:?}");
+    }
+    std::fs::remove_file(&trainer.option_file).unwrap();
+    assert!(lab.resolve().unwrap().is_none());
+    std::fs::write(&trainer.option_file, b"CUSTOM1=0\nCUSTOM2=0").unwrap();
+    assert!(lab.resolve().unwrap().is_none());
+    std::fs::remove_file(&trainer.option_file).unwrap();
+    std::os::unix::fs::symlink(lab.root.path().join("fs-uae.conf"), &trainer.option_file).unwrap();
+    assert!(lab.resolve().is_err());
+    std::fs::remove_file(&trainer.option_file).unwrap();
+    std::fs::create_dir(&trainer.option_file).unwrap();
+    assert!(lab.resolve().is_err());
+}
+
+#[test]
+fn trainer_handoff_refuses_stale_choices_forgery_and_missing_authority() {
+    let mut lab = Lab::new();
+    let trainer = lab.trainers(b"CUSTOM1=1");
+    let approval = lab.request.boot.as_ref().unwrap().clone();
+    let mut forged = trainer.clone();
+    forged.arguments = vec!["CUSTOM1=3".into()];
+    assert!(prepare_boot_with_trainer(&lab.request, &approval, Some(&forged)).is_err());
+    forged = trainer.clone();
+    forged.verified_game_identity = "other game".into();
+    assert!(prepare_boot_with_trainer(&lab.request, &approval, Some(&forged)).is_err());
+    std::fs::write(&trainer.option_file, b"CUSTOM1=2").unwrap();
+    assert!(prepare_boot_with_trainer(&lab.request, &approval, Some(&trainer)).is_err());
+    std::fs::write(&trainer.option_file, b"CUSTOM1=1").unwrap();
+    lab.request.slave.as_mut().unwrap().parsed.config = Some("C1:B:Different;".into());
+    assert!(
+        prepare_boot_with_trainer(&lab.request, &approval, Some(&trainer))
+            .err()
+            .unwrap()
+            .contains("selected slave evidence changed")
+    );
+    lab.request.boot = Err("boot template not ready".into());
+    assert!(lab.resolve().is_err());
+    assert!(
+        super::super::amiga_whdload_command::build_fsuae_whdload_command_plan_with_trainer(
+            &lab.request,
+            Some(&trainer)
+        )
+        .command
+        .is_none()
+    );
+}
+
+#[test]
+fn public_executor_rederives_saved_storage_and_detects_newly_enabled_choices() {
+    // Private process environment: no global HOME/XDG mutation or real data.
+    const CHILD: &str = "EMUWIZ_WHDLOAD_STORAGE_TEST_CHILD";
+    if std::env::var_os(CHILD).is_none() {
+        let private = tempfile::tempdir().unwrap();
+        let status = std::process::Command::new(std::env::current_exe().unwrap())
+            .args(["--exact", "launch::fsuae_whdload_boot::tests::public_executor_rederives_saved_storage_and_detects_newly_enabled_choices", "--nocapture"])
+            .env(CHILD, "1")
+            .env("HOME", private.path())
+            .env("XDG_DATA_HOME", private.path().join("xdg"))
+            .env("EMUWIZ_DATA_HOME", private.path().join("data"))
+            .status().unwrap();
+        assert!(status.success());
+        return;
+    }
+    let mut lab = Lab::new();
+    let trainer = lab.trainers(b"CUSTOM1=1");
+    let forged = super::super::amiga_whdload_command::build_fsuae_whdload_command_plan_with_trainer(
+        &lab.request,
+        Some(&trainer),
+    );
+    assert!(
+        super::super::amiga_whdload_execution::preflight_and_launch_amiga_whdload(&forged).is_err(),
+        "caller-selected saved file must not be trusted"
+    );
+    let plain = super::super::amiga_whdload_trainer_launch::plan_fsuae_boot_with_saved_trainers(
+        &lab.request,
+    );
+    assert!(plain.command.as_ref().unwrap().trainer.is_none());
+    let saved = crate::app_dirs::data_path("whdload-trainer-options")
+        .unwrap()
+        .join(format!(
+            "{}.options",
+            digest(lab.manifest.game_key.as_bytes())
+        ));
+    std::fs::create_dir_all(saved.parent().unwrap()).unwrap();
+    std::fs::write(&saved, b"CUSTOM1=1").unwrap();
+    assert!(
+        super::super::amiga_whdload_execution::preflight_and_launch_amiga_whdload(&plain).is_err(),
+        "newly enabled saved choices must invalidate the old plain plan"
+    );
+    let plan = super::super::amiga_whdload_trainer_launch::plan_fsuae_boot_with_saved_trainers(
+        &lab.request,
+    );
+    assert_eq!(
+        plan.command
+            .as_ref()
+            .unwrap()
+            .trainer
+            .as_ref()
+            .unwrap()
+            .option_file,
+        saved
+    );
+    // Inert host process proves the complete public preparation/spawn handoff;
+    // it is not an Amiga or gameplay activation demonstration.
+    let mut process =
+        super::super::amiga_whdload_execution::preflight_and_launch_amiga_whdload(&plan).unwrap();
+    assert_eq!(process.command.arguments.len(), 1);
+    assert!(
+        process.command.arguments[0]
+            .to_string_lossy()
+            .ends_with("session.fs-uae")
+    );
+    let deadline = std::time::Instant::now() + Duration::from_secs(5);
+    while process.is_running() && std::time::Instant::now() < deadline {
+        process.poll();
+        std::thread::sleep(Duration::from_millis(5));
+    }
+    assert!(process.poll().unwrap().status.as_ref().unwrap().success());
+}

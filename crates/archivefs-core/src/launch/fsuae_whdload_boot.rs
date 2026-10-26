@@ -75,6 +75,12 @@ pub struct BootApproval {
     dependencies: Vec<Evidence>,
 }
 
+impl BootApproval {
+    pub(crate) fn manifest(&self) -> &BootManifest {
+        &self.manifest
+    }
+}
+
 pub fn manifest_path(configuration: &Path) -> PathBuf {
     configuration.with_extension("whdload.json")
 }
@@ -460,6 +466,39 @@ pub fn prepare_boot(
     request: &WHDLoadLaunchInput,
     approval: &BootApproval,
 ) -> Result<PreparedBoot, String> {
+    prepare_boot_with_trainer(request, approval, None)
+}
+
+pub(crate) fn prepare_boot_with_trainer(
+    request: &WHDLoadLaunchInput,
+    approval: &BootApproval,
+    trainer: Option<&super::amiga_whdload_command::WhdloadLaunchTrainer>,
+) -> Result<PreparedBoot, String> {
+    // Re-read the exact saved file at both ends of preparation. The actual
+    // extracted slave is separately hashed and parsed below before rendering.
+    let verify_options = || -> Result<(), String> {
+        if let Some(expected) = trainer {
+            let actual =
+                super::amiga_whdload_trainer_launch::resolve_boot_trainers(request, |_| {
+                    Ok(expected.option_file.clone())
+                })?;
+            if actual.as_ref() != Some(expected) {
+                return Err(fail("saved trainer options changed; review launch again"));
+            }
+        } else if super::amiga_whdload_trainer_launch::resolve_boot_trainers(
+            request,
+            |discovery| {
+                crate::patch_manager::whdload_trainer_option_file(discovery)
+                    .map_err(|e| e.to_string())
+            },
+        )?
+        .is_some()
+        {
+            return Err(fail("saved trainer choices enabled; review launch again"));
+        }
+        Ok(())
+    };
+    verify_options()?;
     let fresh = inspect_boot(request)?;
     if &fresh != approval {
         return Err(fail("boot approval is stale; review readiness again"));
@@ -625,8 +664,11 @@ pub fn prepare_boot(
         .unwrap_or("");
     let name = Path::new(path).file_name().unwrap().to_str().unwrap();
     // Safe path grammar forbids Amiga shell quotes, colon, escapes and controls.
+    let custom = trainer
+        .map(|t| format!(" {}", t.arguments.join(" ")))
+        .unwrap_or_default();
     let sequence = format!(
-        "C:SetPatch QUIET\nCD \"Games:{parent}\"\nC:WHDLoad \"{name}\" PRELOAD\nC:uae-configuration SPC_QUIT 1\n"
+        "C:SetPatch QUIET\nCD \"Games:{parent}\"\nC:WHDLoad \"{name}\" PRELOAD{custom}\nC:uae-configuration SPC_QUIT 1\n"
     );
     write_new(&root, "Boot/S/Startup-Sequence", sequence.as_bytes())?;
     let path_text = workspace
@@ -671,6 +713,7 @@ pub fn prepare_boot(
     if inspect_boot(request)? != *approval {
         return Err(fail("inputs changed during preparation"));
     }
+    verify_options()?;
     let command = PreparedProcessCommand {
         executable: approval.executable.path.clone(),
         arguments: vec![workspace.path().join("session.fs-uae").into_os_string()],

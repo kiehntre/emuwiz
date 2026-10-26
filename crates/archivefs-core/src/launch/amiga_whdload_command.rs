@@ -16,12 +16,12 @@ pub const AMIGA_PLATFORM_ID: &str = "Amiga";
 
 /// EmuWiz currently launches plain emulator binaries, not FS-UAE Launcher.
 /// No version string or accepted CLI key proves a WHDLoad bootstrap consumer.
-pub const WHDLOAD_TRAINER_RUNTIME_UNSUPPORTED: &str = "WHDLoad trainer launch unsupported: plain FS-UAE does not consume the Launcher's x_whdload_args bootstrap channel; Amiberry CUSTOM launch has not been verified. Saved options are not passed to the emulator.";
+pub const WHDLOAD_TRAINER_RUNTIME_UNSUPPORTED: &str = "WHDLoad trainer launch unsupported through direct emulator argv: FS-UAE requires the authorized EmuWiz boot sequence; Amiberry CUSTOM launch has not been verified.";
 
 pub fn whdload_trainer_runtime_support(emulator: AmigaEmulatorKind) -> &'static str {
     match emulator {
         AmigaEmulatorKind::FsUae => {
-            "FS-UAE: CUSTOM trainer launch unsupported in EmuWiz's plain-binary route (FS-UAE Launcher is not integrated)."
+            "FS-UAE: saved CUSTOM values are supported only through the authorized EmuWiz WHDLoad boot sequence; gameplay NOT CONFIRMED."
         }
         AmigaEmulatorKind::Amiberry => {
             "Amiberry: CUSTOM trainer launch unsupported; no verified option channel is integrated."
@@ -33,10 +33,8 @@ pub fn whdload_trainer_runtime_support(emulator: AmigaEmulatorKind) -> &'static 
 pub enum WhdloadPackageFormat {
     Lha,
     /// An installed (extracted) WHDLoad game folder holding the selected host
-    /// slave directly. FS-UAE only: it is passed as a folder hard drive on the
-    /// same `--x-whdload-args` channel the LHA contract uses. This is the only
-    /// format for which saved trainer choices can be resolved, because only a host
-    /// slave can be re-hashed against the declarations the options came from.
+    /// slave directly. Saved choices can be inspected, but the authorized boot
+    /// adapter currently supports only LHA/LZH packages, so activation is refused.
     InstalledDirectory,
 }
 
@@ -353,8 +351,8 @@ pub fn build_amiberry_whdload_command_plan(input: &WHDLoadLaunchInput) -> AmigaW
 /// slave it was declared by and to the exact option-file bytes it was read
 /// from, so a selection for another game, a replaced slave or an option file
 /// edited since planning is refused. This is a saved-choice projection, not
-/// evidence of a runtime consumer. Planning and preflight currently refuse
-/// nonempty projections. Nothing here edits a game or configuration.
+/// evidence of gameplay activation. Only the authorized LHA boot route can
+/// consume it, after revalidation. Nothing here edits a game or configuration.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct WhdloadLaunchTrainer {
     pub verified_game_identity: String,
@@ -382,6 +380,7 @@ fn safe_trainer_argument(argument: &str) -> bool {
     ) && !value.is_empty()
         && value.len() <= 10
         && value.bytes().all(|b| b.is_ascii_digit())
+        && value.parse::<u32>().is_ok()
 }
 
 impl WhdloadLaunchTrainer {
@@ -417,9 +416,9 @@ pub fn build_fsuae_whdload_command_plan(input: &WHDLoadLaunchInput) -> AmigaWHDL
     build_fsuae_whdload_command_plan_with_trainer(input, None)
 }
 
-/// Validates exact-game trainer bindings, then refuses nonempty options:
-/// plain FS-UAE has no verified consumer for the Launcher bootstrap channel.
-/// `None` or an empty selection produces exactly the ordinary command.
+/// Validate exact-game trainer bindings for the EmuWiz-controlled boot sequence.
+/// CUSTOM values never enter emulator argv. `None` or an empty selection produces
+/// exactly the ordinary command; actual preparation revalidates all evidence.
 pub fn build_fsuae_whdload_command_plan_with_trainer(
     input: &WHDLoadLaunchInput,
     trainer: Option<&WhdloadLaunchTrainer>,
@@ -440,7 +439,7 @@ pub fn build_fsuae_whdload_command_plan_with_trainer(
             }
             if trainer.slave_name != slave.name
                 || trainer.slave_path != slave.artifact_path
-                || trainer.slave_sha256.trim().is_empty()
+                || trainer.slave_sha256 != slave.sha256
                 || trainer.option_file_sha256.trim().is_empty()
             {
                 blockers.push(blocker(
@@ -462,16 +461,16 @@ pub fn build_fsuae_whdload_command_plan_with_trainer(
                 ));
             }
         }
-        // An LHA package runs the slave inside the archive, which is not the
-        // host file the options were checked against.
+        // Only the boot adapter's verified package extraction has a proven
+        // guest command consumer; installed-folder activation remains refused.
         if input
             .target
             .as_ref()
-            .is_some_and(|target| target.format != WhdloadPackageFormat::InstalledDirectory)
+            .is_some_and(|target| target.format != WhdloadPackageFormat::Lha)
         {
             blockers.push(blocker(
                 LaunchBlockerKind::WhdloadTrainerOptionsRefused,
-                "trainer options apply only to an installed WHDLoad folder, not a packaged game",
+                "WHDLoad trainer launch unsupported: installed-folder boot is unsupported; saved options require the authorized LHA boot route",
             ));
         }
         if !trainer.arguments_are_safe() {
@@ -481,12 +480,7 @@ pub fn build_fsuae_whdload_command_plan_with_trainer(
             ));
         }
     }
-    if trainer.is_some() {
-        blockers.push(blocker(
-            LaunchBlockerKind::WhdloadTrainerOptionsRefused,
-            WHDLOAD_TRAINER_RUNTIME_UNSUPPORTED,
-        ));
-    }
+
     #[cfg(target_os = "linux")]
     if let Err(detail) = &input.boot {
         blockers.push(blocker(
@@ -524,7 +518,13 @@ pub fn build_fsuae_whdload_command_plan_with_trainer(
         executable: executable.clone(),
         arguments: arguments.clone(),
         working_directory: None,
-        preview: "FS-UAE: prepare an authorized disposable WHDLoad session at Play".into(),
+        preview: format!(
+            "FS-UAE: prepare an authorized disposable WHDLoad session at Play; A1200, chip 2048 KiB, fast 8192 KiB; Startup-Sequence: C:WHDLoad \"{}\" PRELOAD{}; gameplay NOT CONFIRMED",
+            slave.name,
+            trainer
+                .map(|t| format!(" {}", t.arguments.join(" ")))
+                .unwrap_or_default()
+        ),
         profile_id: input.profile.profile_id.clone(),
         profile_configuration: input
             .profile
@@ -704,7 +704,7 @@ pub(crate) mod tests {
         assert!(
             plan.blockers
                 .iter()
-                .any(|b| b.detail == WHDLOAD_TRAINER_RUNTIME_UNSUPPORTED)
+                .any(|b| b.detail.contains("installed-folder boot is unsupported"))
         );
     }
     #[test]
@@ -748,6 +748,7 @@ pub(crate) mod tests {
         for bad in [
             vec!["CUSTOM1=1 CUSTOM2=2"],
             vec!["CUSTOM1=$(x)"],
+            vec!["CUSTOM1=4294967296"],
             vec!["custom1=1"],
             vec!["CUSTOM1="],
             vec!["CUSTOM1=1", "CUSTOM1=2"],
