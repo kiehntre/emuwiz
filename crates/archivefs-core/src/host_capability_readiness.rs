@@ -284,15 +284,22 @@ pub fn assess_host_capabilities(
                 ));
             }
             Some(capability) => {
-                if graphics.minimum_version.is_some_and(|minimum| {
-                    capability.version.is_none_or(|version| version < minimum)
-                }) {
-                    issues.push(issue(
-                        HostCapabilityReadiness::GraphicsApiMissing,
-                        format!("{} version", graphics.api),
-                        "graphics API version is below the hard minimum",
-                        capability.evidence.clone(),
-                    ));
+                if let Some(minimum) = graphics.minimum_version {
+                    match capability.version {
+                        None => issues.push(issue(
+                            HostCapabilityReadiness::RequirementsUnknown,
+                            format!("{} version", graphics.api),
+                            "graphics API version evidence is unavailable",
+                            capability.evidence.clone(),
+                        )),
+                        Some(version) if version < minimum => issues.push(issue(
+                            HostCapabilityReadiness::GraphicsApiMissing,
+                            format!("{} version", graphics.api),
+                            "graphics API version is below the hard minimum",
+                            capability.evidence.clone(),
+                        )),
+                        Some(_) => {}
+                    }
                 }
                 for extension in &graphics.required_extensions {
                     if !capability.extensions.contains(extension) {
@@ -446,6 +453,92 @@ mod tests {
         assert_eq!(
             assess_host_capabilities(&requirements, &host).readiness,
             HostCapabilityReadiness::RequirementMissing
+        );
+    }
+
+    #[test]
+    fn graphics_version_evidence_distinguishes_unknown_missing_and_satisfied() {
+        let mut requirements = requirements();
+        requirements.graphics = Some(GraphicsApiRequirement {
+            api: "Vulkan".into(),
+            minimum_version: Some((1, 2)),
+            required_extensions: BTreeSet::new(),
+        });
+        for (version, expected) in [
+            (None, HostCapabilityReadiness::RequirementsUnknown),
+            (Some((1, 1)), HostCapabilityReadiness::RequirementMissing),
+            (Some((1, 2)), HostCapabilityReadiness::Ready),
+            (Some((1, 3)), HostCapabilityReadiness::Ready),
+        ] {
+            let mut host = host();
+            let evidence = vec![HostCapabilityEvidence {
+                source: "synthetic graphics adapter".into(),
+                state: HostCapabilityEvidenceState::Known,
+                detail: "API observed; version supplied separately".into(),
+            }];
+            host.gpu.apis.insert(
+                "Vulkan".into(),
+                GraphicsApiCapabilities {
+                    api: "Vulkan".into(),
+                    version,
+                    extensions: BTreeSet::new(),
+                    evidence_state: HostCapabilityEvidenceState::Known,
+                    evidence: evidence.clone(),
+                },
+            );
+            let report = assess_host_capabilities(&requirements, &host);
+            assert_eq!(report.readiness, expected, "version: {version:?}");
+            assert!(report.read_only);
+            match version {
+                None => {
+                    assert_eq!(report.issues.len(), 1);
+                    assert_eq!(report.issues[0].readiness, expected);
+                    assert_eq!(report.issues[0].evidence, evidence);
+                }
+                Some((1, 1)) => {
+                    assert_eq!(report.issues.len(), 1);
+                    assert_eq!(
+                        report.issues[0].readiness,
+                        HostCapabilityReadiness::GraphicsApiMissing
+                    );
+                }
+                Some(_) => assert!(report.issues.is_empty()),
+            }
+        }
+    }
+
+    #[test]
+    fn unknown_graphics_version_does_not_hide_a_missing_extension() {
+        let mut requirements = requirements();
+        requirements.graphics = Some(GraphicsApiRequirement {
+            api: "Vulkan".into(),
+            minimum_version: Some((1, 2)),
+            required_extensions: ["VK_synthetic_extension".into()].into_iter().collect(),
+        });
+        let mut host = host();
+        host.gpu.apis.insert(
+            "Vulkan".into(),
+            GraphicsApiCapabilities {
+                api: "Vulkan".into(),
+                version: None,
+                extensions: BTreeSet::new(),
+                evidence_state: HostCapabilityEvidenceState::Known,
+                evidence: Vec::new(),
+            },
+        );
+        let report = assess_host_capabilities(&requirements, &host);
+        assert_eq!(
+            report.readiness,
+            HostCapabilityReadiness::RequirementMissing
+        );
+        assert_eq!(report.issues.len(), 2);
+        assert_eq!(
+            report.issues[0].readiness,
+            HostCapabilityReadiness::RequirementsUnknown
+        );
+        assert_eq!(
+            report.issues[1].readiness,
+            HostCapabilityReadiness::GraphicsApiMissing
         );
     }
 
