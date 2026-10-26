@@ -5,8 +5,8 @@ members = [
     "crates/archivefs-gui",
 ]
 resolver = "2"
-# Vendored third-party patch (see third_party/chd-0.3.4/PATCH.md); not a member.
-exclude = ["third_party/chd-0.3.4"]
+# Vendored dependency security patches; neither is a workspace member.
+exclude = ["third_party/chd-0.3.4", "third_party/nod-1.4.4"]
 
 [workspace.package]
 version = "0.10.0"
@@ -17,3 +17,8 @@ edition = "2024"
 # conditions and provenance are in third_party/chd-0.3.4/PATCH.md.
 [patch.crates-io]
 chd = { path = "third_party/chd-0.3.4" }
+
+# TEMPORARY: nod 1.4.4 requires vulnerable zstd ^0.13. Move its requirement
+# to patched zstd >=0.14.3 / zstd-safe >=8.2.0 without decoder algorithm changes.
+# Provenance and removal condition: third_party/nod-1.4.4/PATCH.md.
+nod = { path = "third_party/nod-1.4.4" }

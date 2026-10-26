@@ -334,6 +334,17 @@ rules; efficiency never overrides those guarantees.
     validation or preservation guarantees to save usage.
 14. Do not start a new development campaign while assigned work is unfinished
     unless explicitly authorised.
+15. After focused local tests and required source checks, push only when authorised,
+    open/update the PR, verify CI targets the exact reviewed head, and check once
+    for immediate failures. If checks remain running, report the PR, full head SHA,
+    run links and PENDING, then end the development session. Never use
+    `gh run watch`, repeated status/log polling or artifact downloads to wait for CI.
+    GitHub's completion notifier handles the final notification; see
+    `docs/ci-notifications.md`. After completion, perform a separate short
+    merge-readiness check using completed results for that exact head. Collect
+    detailed logs only for failures or a specific evidence requirement. Never
+    claim green CI early or merge without approval; all security, preservation,
+    reproducibility and exact-head merge protections remain mandatory.
 
 ### Completion standard
 
