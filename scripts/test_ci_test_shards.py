@@ -198,5 +198,23 @@ class SelectionTests(unittest.TestCase):
                 self.assertNotEqual(result.returncode, 0)
 
 
+class ConcurrencyTests(unittest.TestCase):
+    """Pull requests cancel superseded runs; every other commit gets its own group and so its own run."""
+
+    def block(self) -> str:
+        match = re.search(r"(?m)^concurrency:\n((?:  .*\n)+)", WORKFLOW.read_text(encoding="utf-8"))
+        self.assertIsNotNone(match, "workflow-level concurrency block not found")
+        return match.group(1)
+
+    def test_only_pull_requests_cancel_in_progress_runs(self) -> None:
+        self.assertIn("cancel-in-progress: ${{ github.event_name == 'pull_request' }}", self.block())
+
+    def test_group_is_per_pull_request_else_per_commit(self) -> None:
+        block = self.block()
+        self.assertIn("group: ci-${{ github.workflow }}-${{ github.event.pull_request.number || github.sha }}", block)
+        self.assertNotIn("github.ref", block)
+        self.assertNotIn("queue:", block)
+
+
 if __name__ == "__main__":
     unittest.main()
