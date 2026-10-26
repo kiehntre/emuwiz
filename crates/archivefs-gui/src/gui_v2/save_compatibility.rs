@@ -351,6 +351,29 @@ fn draw_report(ui: &mut egui::Ui, report: &SaveMigrationReadiness) {
         Outcome::NeedsEvidence => "More evidence is needed",
         Outcome::Unsupported => "This save representation is unsupported here",
     });
+    let environment = &report.target_environment;
+    for (label, value) in [
+        ("Target emulator", environment.emulator.as_deref()),
+        ("Target profile", environment.profile.as_deref()),
+        ("Target core", environment.core.as_deref()),
+        ("Target version", environment.emulator_version.as_deref()),
+    ] {
+        ui.label(format!("{label}: {}", value.unwrap_or("Unknown")));
+    }
+    ui.label(match report.container {
+        archivefs_core::save_migration_readiness::SaveContainerSemantics::RawSingleFile => {
+            "Source: one persistent-save file."
+        }
+        archivefs_core::save_migration_readiness::SaveContainerSemantics::SharedContainer => {
+            "Source: a shared card or container; individual saves cannot be copied as raw files."
+        }
+        archivefs_core::save_migration_readiness::SaveContainerSemantics::DirectorySet {
+            ..
+        } => "Source: a directory save set; completeness must be proved separately.",
+        archivefs_core::save_migration_readiness::SaveContainerSemantics::Other => {
+            "Source representation is unknown."
+        }
+    });
     if let Some(plan) = &report.planner_plan {
         ui.label(&plan.explanation);
     }
