@@ -15,25 +15,24 @@ pub fn inventory_with_sram_origins(roots: &[PersistentStateRoot]) -> PersistentS
     };
     let scope = discover_scope(profile);
     let mut roots = roots.to_vec();
-    if let Ok(s) = &scope {
-        if !roots
+    if let Ok(s) = &scope
+        && !roots
             .iter()
             .any(|r| r.path == s.saves && r.emulator == StateEmulator::RetroArch)
-        {
-            roots.push(PersistentStateRoot::configured(
-                StateEmulator::RetroArch,
-                s.saves.clone(),
-                Some(PersistentStateType::NativeSave),
-            ));
-        }
+    {
+        roots.push(PersistentStateRoot::configured(
+            StateEmulator::RetroArch,
+            s.saves.clone(),
+            Some(PersistentStateType::NativeSave),
+        ));
     }
     let mut result = inventory::inventory_persistent_state(&roots);
-    if let Ok(d) = DIAGNOSTIC.lock() {
-        if let Some(reason) = d.as_ref() {
-            result.warnings.push(format!(
-                "Last SRAM capture was unavailable: {reason}. Unattested saves stay unassigned."
-            ));
-        }
+    if let Ok(d) = DIAGNOSTIC.lock()
+        && let Some(reason) = d.as_ref()
+    {
+        result.warnings.push(format!(
+            "Last SRAM capture was unavailable: {reason}. Unattested saves stay unassigned."
+        ));
     }
     let Ok(root) = catalogue_root() else {
         return result;
@@ -130,7 +129,10 @@ pub(super) fn project(
         for record in result.records.iter_mut().filter(|r| {
             r.path == path
                 && r.emulator == StateEmulator::RetroArch
-                && r.state_type == PersistentStateType::NativeSave
+                && matches!(
+                    r.state_type,
+                    PersistentStateType::NativeSave | PersistentStateType::Unknown
+                )
         }) {
             found = true;
             let mut origin = selected.clone();
@@ -139,6 +141,14 @@ pub(super) fn project(
             {
                 origin.state = OriginState::NeedsReview;
                 origin.explanation = "Save bytes differ from the captured artifact.".into();
+            }
+            if origin.state == OriginState::Associated
+                && record.state_type == PersistentStateType::Unknown
+            {
+                record.state_type = PersistentStateType::NativeSave;
+                record.provenance.push_str(
+                    "; this artifact's SRAM kind was witnessed during the verified session",
+                );
             }
             record.sram_origin = Some(origin);
         }

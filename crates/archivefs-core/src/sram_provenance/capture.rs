@@ -266,10 +266,9 @@ impl Prepared {
             for origin in receipt.origins {
                 if let Some(previous) =
                     claims.insert(origin.artifact.path.clone(), origin.context.clone())
+                    && previous != origin.context
                 {
-                    if previous != origin.context {
-                        return Err("Conflicting historical artifact ownership".into());
-                    }
+                    return Err("Conflicting historical artifact ownership".into());
                 }
                 if origin.context == ctx && current(&origin.artifact).is_ok() {
                     eligible.insert(origin.artifact.path.clone(), origin);

@@ -244,6 +244,74 @@ fn association_persists_and_changed_or_conflicting_evidence_needs_review() {
         OriginState::Associated
     );
     assert!(inventory.records[0].game_identity.is_empty());
+    let sibling = ctx.scope.saves.join("historical.srm");
+    fs::write(&sibling, b"unattested historical save").unwrap();
+    let generic_roots = [PersistentStateRoot::configured(
+        StateEmulator::RetroArch,
+        ctx.scope.saves.clone(),
+        None,
+    )];
+    let mut generic = inventory_persistent_state(&generic_roots);
+    assert!(
+        generic
+            .records
+            .iter()
+            .all(|r| r.state_type == PersistentStateType::Unknown)
+    );
+    let old_portability = generic
+        .records
+        .iter()
+        .find(|r| r.path == artifact.path)
+        .unwrap()
+        .portability_class;
+    inventory::project(&mut generic, vec![receipt.clone()], Some(&ctx.scope));
+    let attested = generic
+        .records
+        .iter()
+        .find(|r| r.path == artifact.path)
+        .unwrap();
+    assert_eq!(attested.state_type, PersistentStateType::NativeSave);
+    assert_eq!(attested.portability_class, old_portability);
+    assert!(attested.game_identity.is_empty());
+    assert_eq!(
+        attested.sram_origin.as_ref().unwrap().state,
+        OriginState::Associated
+    );
+    let historical = generic.records.iter().find(|r| r.path == sibling).unwrap();
+    assert_eq!(historical.state_type, PersistentStateType::Unknown);
+    assert!(historical.sram_origin.is_none());
+    let known_state_roots = [PersistentStateRoot::configured(
+        StateEmulator::RetroArch,
+        ctx.scope.saves.clone(),
+        Some(PersistentStateType::SaveState),
+    )];
+    let mut states = inventory_persistent_state(&known_state_roots);
+    inventory::project(&mut states, vec![receipt.clone()], Some(&ctx.scope));
+    assert!(
+        states
+            .records
+            .iter()
+            .all(|r| r.state_type == PersistentStateType::SaveState && r.sram_origin.is_none())
+    );
+    let mut conflicting = receipt.clone();
+    conflicting.context.cartridge.sha256 = "conflicting cartridge".into();
+    conflicting.origins[0].context = conflicting.context.clone();
+    let mut uncertain = inventory_persistent_state(&generic_roots);
+    inventory::project(
+        &mut uncertain,
+        vec![receipt.clone(), conflicting],
+        Some(&ctx.scope),
+    );
+    let uncertain = uncertain
+        .records
+        .iter()
+        .find(|r| r.path == artifact.path)
+        .unwrap();
+    assert_eq!(uncertain.state_type, PersistentStateType::Unknown);
+    assert_eq!(
+        uncertain.sram_origin.as_ref().unwrap().state,
+        OriginState::NeedsReview
+    );
     let mut eligible = std::collections::BTreeMap::new();
     eligible.insert(artifact.path.clone(), origin.clone());
     assert!(observe(t.path(), ctx.clone(), "historical", eligible).complete());
@@ -281,6 +349,18 @@ fn association_persists_and_changed_or_conflicting_evidence_needs_review() {
     );
     fs::rename(&moved, &artifact.path).unwrap();
     fs::write(&artifact.path, b"edited save").unwrap();
+    let mut stale = inventory_persistent_state(&generic_roots);
+    inventory::project(&mut stale, vec![receipt.clone()], Some(&ctx.scope));
+    let stale = stale
+        .records
+        .iter()
+        .find(|r| r.path == artifact.path)
+        .unwrap();
+    assert_eq!(stale.state_type, PersistentStateType::Unknown);
+    assert_eq!(
+        stale.sram_origin.as_ref().unwrap().state,
+        OriginState::NeedsReview
+    );
     let mut inventory = inventory_persistent_state(&roots);
     inventory::project(&mut inventory, vec![receipt], Some(&ctx.scope));
     assert_eq!(

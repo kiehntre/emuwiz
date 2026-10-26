@@ -545,41 +545,40 @@ fn summary(ui: &mut egui::Ui, records: &[&PersistentStateRecord]) {
 fn record_belongs_to_game(record: &PersistentStateRecord, game: &Game) -> bool {
     if record.state_type == PersistentStateType::NativeSave
         && record.emulator == StateEmulator::RetroArch
+        && let Some(origin) = record.sram_origin.as_ref()
     {
-        if let Some(origin) = record.sram_origin.as_ref() {
-            // The worker revalidated the sealed content digest and exact path.
-            // No UI title or filename participates in this join.
-            use archivefs_core::game_identity::{IdentityKind, IdentityStatus};
-            let gold = &origin.context.cartridge_identity;
-            let digest = origin.context.cartridge.sha256.as_str();
-            // A DAT-only library row need not cache SHA256. The authority is
-            // current, sealed Gold byte evidence from the inventory worker.
-            // Any redundant strong cache evidence still refuses disagreement.
-            let mut cached = game
-                .dat_exact_hashes
-                .as_ref()
-                .and_then(|h| h.sha256.as_deref())
-                .into_iter()
-                .chain(
-                    game.archive
-                        .identity_report
-                        .as_ref()
-                        .into_iter()
-                        .flat_map(|r| r.evidence.iter())
-                        .filter(|e| {
-                            e.kind == IdentityKind::LooseRomSha256
-                                && e.status == IdentityStatus::Verified
-                        })
-                        .filter_map(|e| e.value.as_deref()),
-                );
-            return origin.state == archivefs_core::sram_provenance::OriginState::Associated
-                && gold.kind == IdentityKind::LooseRomSha256
-                && gold.status == IdentityStatus::Verified
-                && gold.value.as_deref() == Some(digest)
-                && !game.inspection_incomplete
-                && cached.all(|value| value == digest)
-                && origin.context.cartridge.path == game.archive.absolute_path;
-        }
+        // The worker revalidated the sealed content digest and exact path.
+        // No UI title or filename participates in this join.
+        use archivefs_core::game_identity::{IdentityKind, IdentityStatus};
+        let gold = &origin.context.cartridge_identity;
+        let digest = origin.context.cartridge.sha256.as_str();
+        // A DAT-only library row need not cache SHA256. The authority is
+        // current, sealed Gold byte evidence from the inventory worker.
+        // Any redundant strong cache evidence still refuses disagreement.
+        let mut cached = game
+            .dat_exact_hashes
+            .as_ref()
+            .and_then(|h| h.sha256.as_deref())
+            .into_iter()
+            .chain(
+                game.archive
+                    .identity_report
+                    .as_ref()
+                    .into_iter()
+                    .flat_map(|r| r.evidence.iter())
+                    .filter(|e| {
+                        e.kind == IdentityKind::LooseRomSha256
+                            && e.status == IdentityStatus::Verified
+                    })
+                    .filter_map(|e| e.value.as_deref()),
+            );
+        return origin.state == archivefs_core::sram_provenance::OriginState::Associated
+            && gold.kind == IdentityKind::LooseRomSha256
+            && gold.status == IdentityStatus::Verified
+            && gold.value.as_deref() == Some(digest)
+            && !game.inspection_incomplete
+            && cached.all(|value| value == digest)
+            && origin.context.cartridge.path == game.archive.absolute_path;
     }
     let Some(report) = game.archive.identity_report.as_ref() else {
         return false;
