@@ -82,6 +82,7 @@ mod setup_portability;
 mod shared_scroll_tests;
 mod simple_shell;
 mod source_impact;
+mod optical_compare;
 mod sources_providers;
 #[cfg(test)]
 mod stale_inspection_tests;
