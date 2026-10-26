@@ -265,9 +265,8 @@ fn alternate_case_memory_card_and_hardcore_keys_cannot_bypass_validation() {
         "[achievements]\nEnabled=true\nchallengemode=true\n",
         "[Achievements]\nEnabled=true\nChallengeMode=YES\n",
     ] {
-        match config::Ini::parse(text) {
-            Ok(ini) => assert!(ini.validate_hardcore(None).is_err(), "{text}"),
-            Err(_) => {}
+        if let Ok(ini) = config::Ini::parse(text) {
+            assert!(ini.validate_hardcore(None).is_err(), "{text}");
         }
     }
 }

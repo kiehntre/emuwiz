@@ -468,13 +468,13 @@ pub(super) fn probe_and_spawn(
                         &mut observation.lock().unwrap_or_else(|e| e.into_inner()),
                     );
                 }
-                if let Some(exit) = current.as_mut().unwrap().poll() {
-                    if stopped(binary, &id) {
-                        return Ok(ExitSummary {
-                            success: exit.status.as_ref().is_ok_and(|s| s.success()),
-                            code: exit.status.as_ref().ok().and_then(|s| s.code()),
-                        });
-                    }
+                if let Some(exit) = current.as_mut().unwrap().poll()
+                    && stopped(binary, &id)
+                {
+                    return Ok(ExitSummary {
+                        success: exit.status.as_ref().is_ok_and(|s| s.success()),
+                        code: exit.status.as_ref().ok().and_then(|s| s.code()),
+                    });
                 }
                 std::thread::sleep(Duration::from_millis(250));
             }

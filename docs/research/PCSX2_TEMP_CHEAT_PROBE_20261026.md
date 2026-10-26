@@ -6,7 +6,7 @@ in [the activation report](PCSX2_TEMP_CHEAT_ACTIVATION_20261026.md); the
 limitations and unvalidated results below describe this initial probe only.
 
 Base: `origin/main` at `bd3b859fecb10c6232286a9a881fbed1f0f8f2e5`.
-This job does **not** deliver production temporary-cheat integration.
+This initial stage did **not** deliver production temporary-cheat integration.
 The disposable runtime can consume and enable a selected PNACH. Safe
 production staging, cleanup/recovery and Blue handoff remain unproven, so
 activation is withheld under the job's explicit refusal condition.

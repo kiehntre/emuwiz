@@ -89,9 +89,12 @@ Local evidence root: `/tmp/emuwiz-pcsx2-journey-5cdp2zve/evidence`.
 | Existing per-game `PreservedBaseline` patch | observed enabled |
 | Emulator overlay | `1 game patch is active. 1 cheat patch is active.` |
 | Normal window close | process exit 0; canonical receipt cleanup completed |
+| Forced termination of the exact owned sandbox | exit 137 reported; cleanup completed; workspace removed |
 | Launch owner interruption | sandbox survived; recovery retained live workspace |
 | Explicit recovery after sandbox exit | canonical stale cleanup removed workspace |
 | Original INIs, BIOS, synthetic cards, patches and cheat files | before/after SHA-256 maps identical |
+| Rebuilt Blue selection → preview → approval → launch → normal close | log-observed load/enablement, consumed approval, normal exit and cleanup shown |
+| Blue source changed after preview | refused before staging; no ordinary-launch fallback |
 | Gameplay save writes | not exercised by the branch-loop fixture |
 | In-game cheat effects | **NOT CONFIRMED**; fixture has no gameplay |
 
@@ -103,4 +106,16 @@ Blue uses the real clock and normal grace.
 Independent review identified deployment-update and INI-case bypasses. The
 owner added commit-pinned execution/live metadata checks and centralized
 case-insensitive lookup plus filename validation and focused regressions.
+A follow-up review found whitespace section aliases; these are refused before
+section storage. Independent safety review passed exact runtime-tested code
+`4a1864df407ee6f403c54eb5d5c365da3a1c1ab0`. Final Clippy-only control-flow
+simplifications preserve those checks; the final reviewed head is recorded
+on PR #167.
+
+Final focused owner gates: 87 runtime tests passed (3 existing ignored),
+24 readiness tests, 92 PCSX2 GUI tests, 11 recovery GUI tests and 8 Python
+probe tests passed. Final runtime logs include `adapter-activate-final.log`,
+`adapter-crash.log`, and `adapter-interrupt-final.log`; Blue evidence includes
+`blue-final-report.json`, `blue-final-11.png` (emulator overlay and honest
+status) and `blue-final-12.png` (normal exit, removal and consumed approval).
 Final test totals, exact reviewed head and CI belong to the PR evidence.
