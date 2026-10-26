@@ -41,6 +41,15 @@ impl Authority {
         let _: UniqueJson = serde_json::from_slice(bytes).map_err(|_| Error::Malformed)?;
         let transaction: RenameTransaction =
             serde_json::from_slice(bytes).map_err(|_| Error::Malformed)?;
+        // This protocol has no catalogue completion checkpoints. Never admit
+        // a bound organisation through an executor that would omit them.
+        if transaction
+            .entries
+            .iter()
+            .any(|e| e.unknown.contains_key("organisation_catalogue_v1"))
+        {
+            return Err(Error::Binding);
+        }
         if transaction.transaction_id.is_empty() {
             return Err(Error::Binding);
         }

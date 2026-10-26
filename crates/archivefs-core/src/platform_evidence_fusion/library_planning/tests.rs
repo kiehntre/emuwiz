@@ -264,6 +264,8 @@ fn entry(
     status: OrganisationStatus,
 ) -> OrganisationPlanEntry {
     OrganisationPlanEntry {
+        source_identity: None,
+        catalogue_binding: None,
         source_path: PathBuf::from("/tmp/whatever"),
         destination_path: PathBuf::new(),
         platform: platform.map(String::from),

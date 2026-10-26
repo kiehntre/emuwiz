@@ -540,7 +540,7 @@ impl RomOrganisationPageState {
         }
         // No RomM mapping is consulted: generic destinations derive from the
         // neutral EmuWiz platform layout identity.
-        let Some(plan) = build_organisation_plan_reporting(
+        let Some(mut plan) = build_organisation_plan_reporting(
             &OrganisationPlanRequest {
                 master_root: &master_root,
                 mode: self.mode,
@@ -554,6 +554,21 @@ impl RomOrganisationPageState {
         ) else {
             return false;
         };
+        if plan.suggested().next().is_some() {
+            let catalogue = default_database_path()
+                .and_then(Database::open_read_only)
+                .map_err(|e| e.to_string())
+                .and_then(|database| {
+                    archivefs_core::dat::rom_organisation::prepare_organisation_catalogue(
+                        &mut plan, &database,
+                    )
+                });
+            if let Err(reason) = catalogue {
+                self.error = Some(reason);
+                self.plan = None;
+                return true;
+            }
+        }
         self.approved = plan
             .suggested()
             .map(|entry| entry.source_path.to_string_lossy().into_owned())
@@ -608,27 +623,20 @@ impl RomOrganisationPageState {
         let cache = load_romm_cache();
         let canonical_name_for = |source: &Path| canonical_name_for(source, cache.as_ref());
         let database_path = default_database_path();
-        match database_path {
-            Ok(path) => {
-                match archivefs_core::dat::rom_organisation::revalidate_organisation_plan(
-                    plan,
-                    &path,
-                    &canonical_name_for,
-                ) {
-                    Ok(()) => {}
-                    Err(reason) => {
-                        self.error = Some(reason);
-                        return;
-                    }
-                }
-            }
-            Err(_) => {
-                self.error = Some(
-                    "could not resolve the platform identity database; the plan is stale"
-                        .to_string(),
-                );
+        let database = match database_path.and_then(archivefs_core::Database::open_read_only) {
+            Ok(database) => database,
+            Err(error) => {
+                self.error = Some(error.to_string());
                 return;
             }
+        };
+        if let Err(reason) = archivefs_core::dat::rom_organisation::revalidate_organisation_plan(
+            plan,
+            database.path(),
+            &canonical_name_for,
+        ) {
+            self.error = Some(reason);
+            return;
         }
         let approved = self.approved.clone();
         let mut transaction = match build_organisation_transaction(plan, &approved, plan.generation)
@@ -658,6 +666,7 @@ impl RomOrganisationPageState {
             cancel,
             self.mode,
             &master_root,
+            &database,
         );
         self.record_apply_result(result, transaction);
     }
@@ -1170,6 +1179,12 @@ pub(crate) fn validate_r2_selection(
     plan: &OrganisationPlan,
     approved: &BTreeSet<String>,
 ) -> Result<archivefs_core::dat::rename_apply::RenameTransaction, String> {
+    if plan.suggested().any(|e| {
+        e.catalogue_binding.is_some()
+            && approved.contains(&e.source_path.to_string_lossy().into_owned())
+    }) {
+        return Err("Catalogue-backed organisation requires Standard Apply so filesystem and catalogue Undo remain coordinated.".into());
+    }
     let cache = load_romm_cache();
     let database = default_database_path().map_err(|e| e.to_string())?;
     revalidate_organisation_plan(plan, &database, &|p| canonical_name_for(p, cache.as_ref()))?;
@@ -3170,8 +3185,28 @@ mod tests {
         );
     }
 
+    #[test]
+    fn advanced_protection_refuses_catalogue_bound_selection_before_io() {
+        let mut entry = linked_library_plan_entry(OrganisationStatus::Suggested);
+        entry.catalogue_binding = Some(serde_json::json!({"reviewed":true}));
+        let approved =
+            std::collections::BTreeSet::from([entry.source_path.to_string_lossy().into_owned()]);
+        let plan = OrganisationPlan {
+            master_root: PathBuf::from("/does-not-exist"),
+            mode: OrganisationMode::RenameInPlace,
+            content_policy: archivefs_core::dat::classification::ContentSelectionPolicy::AllEntries,
+            classifier_version: archivefs_core::dat::classification::CLASSIFIER_VERSION.into(),
+            generation: 1,
+            entries: vec![entry],
+        };
+        let error = validate_r2_selection(&plan, &approved).unwrap_err();
+        assert!(error.contains("Standard Apply"), "{error}");
+    }
+
     fn linked_library_plan_entry(status: OrganisationStatus) -> OrganisationPlanEntry {
         OrganisationPlanEntry {
+            source_identity: None,
+            catalogue_binding: None,
             source_path: PathBuf::from("/sources/Combat.bin"),
             destination_path: PathBuf::from("/library/atari2600/Combat.bin"),
             platform: Some("Atari2600".to_string()),
@@ -3224,6 +3259,8 @@ mod tests {
             classifier_version: archivefs_core::dat::classification::CLASSIFIER_VERSION.to_string(),
             generation: 1,
             entries: vec![OrganisationPlanEntry {
+                source_identity: None,
+                catalogue_binding: None,
                 source_path: PathBuf::from("/sources/Combat.bin"),
                 destination_path: library_root.join("atari2600").join("Combat (USA).bin"),
                 platform: Some("Atari2600".to_string()),

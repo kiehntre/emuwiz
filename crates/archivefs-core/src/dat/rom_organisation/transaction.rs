@@ -67,11 +67,16 @@ pub fn build_organisation_transaction(
         if entry.destination_path.as_os_str().is_empty() {
             continue;
         }
-        let Ok(identity) = capture_identity(&entry.source_path) else {
-            // The source vanished between planning and building; the entry
-            // cannot carry a recorded identity, so it is excluded.
-            continue;
-        };
+        let identity = entry.source_identity.clone().ok_or_else(|| {
+            "the organisation preview has no source identity; regenerate it".to_string()
+        })?;
+        let current = capture_identity(&entry.source_path).map_err(|e| e.to_string())?;
+        if !crate::dat::rename_apply::identity::identity_matches(&identity, &current) {
+            return Err(format!(
+                "source identity changed since preview: {}; regenerate the plan",
+                entry.source_path.display()
+            ));
+        }
         // Linked-library defence in depth: only a regular file may become a
         // link source, and both the recorded link target and the approved
         // destination root must be absolute so recovery/rollback can trust
@@ -111,7 +116,16 @@ pub fn build_organisation_transaction(
             failure_reason: None,
             applied_at_unix: None,
             rolled_back_at_unix: None,
-            unknown: Default::default(),
+            unknown: entry
+                .catalogue_binding
+                .as_ref()
+                .map(|binding| {
+                    std::collections::BTreeMap::from([(
+                        "organisation_catalogue_v1".into(),
+                        binding.clone(),
+                    )])
+                })
+                .unwrap_or_default(),
         });
     }
     if entries.is_empty() {
@@ -136,6 +150,66 @@ pub fn build_organisation_transaction(
         recovery_resolved_at_unix: None,
         unknown: Default::default(),
     })
+}
+
+/// Read-only: bind each Suggested preview to the exact catalogue game and
+/// associations it describes. A failed/stale preview must be regenerated.
+pub fn prepare_organisation_catalogue(
+    plan: &mut OrganisationPlan,
+    database: &crate::Database,
+) -> Result<(), String> {
+    let approved = plan
+        .suggested()
+        .map(|e| e.source_path.to_string_lossy().into_owned())
+        .collect();
+    if plan.suggested().next().is_none() {
+        return Ok(());
+    }
+    let mut transaction = build_organisation_transaction(plan, &approved, plan.generation)?;
+    crate::database::organisation_paths::bind(&mut transaction, database)?;
+    for entry in &mut plan.entries {
+        if let Some(bound) = transaction
+            .entries
+            .iter()
+            .find(|e| e.source_path == entry.source_path)
+        {
+            entry.catalogue_binding = bound.unknown.get("organisation_catalogue_v1").cloned();
+        }
+    }
+    Ok(())
+}
+
+/// Apply an approved organisation with exact catalogue bindings sealed before
+/// mutation. The caller must revalidate the preview's platform/destination.
+#[allow(clippy::too_many_arguments)]
+pub fn apply_organisation_transaction(
+    transaction: &mut RenameTransaction,
+    approved_sources: &BTreeSet<String>,
+    generation: u64,
+    trusted: TrustedRoots,
+    journal_dir: &Path,
+    cancel: &AtomicBool,
+    mode: OrganisationMode,
+    master_root: &Path,
+    database: &crate::Database,
+) -> Result<ApplyOutcome, ApplyError> {
+    if transaction.state != TransactionState::Planned {
+        return Err(ApplyError::Journal(
+            "organisation has already started; use recovery or Undo".into(),
+        ));
+    }
+    crate::database::organisation_paths::validate_bound(transaction, database)
+        .map_err(ApplyError::Journal)?;
+    apply_filesystem_organisation_transaction(
+        transaction,
+        approved_sources,
+        generation,
+        trusted,
+        journal_dir,
+        cancel,
+        mode,
+        master_root,
+    )
 }
 
 /// Whether `parent` is a plausible canonical platform directory this
@@ -260,7 +334,7 @@ fn live_resolution_for(
 /// write, the directory is unproven: recovery conservatively leaves it alone
 /// rather than deleting it.
 #[allow(clippy::too_many_arguments)]
-pub fn apply_organisation_transaction(
+pub(crate) fn apply_filesystem_organisation_transaction(
     transaction: &mut RenameTransaction,
     approved_sources: &BTreeSet<String>,
     generation: u64,

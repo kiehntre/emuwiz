@@ -47,5 +47,6 @@ pub use plan::{
 };
 pub use transaction::{
     OrganisationRollbackOutcome, apply_organisation_transaction, build_organisation_transaction,
-    revalidate_organisation_plan, rollback_organisation_transaction,
+    prepare_organisation_catalogue, revalidate_organisation_plan,
+    rollback_organisation_transaction,
 };
