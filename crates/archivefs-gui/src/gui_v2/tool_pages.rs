@@ -8,6 +8,7 @@ use super::routes::ToolPage;
 
 #[derive(Default)]
 pub(super) struct ToolPagesState {
+    pub homebrew_browser: super::homebrew_browser::State,
     pub needs_attention: super::needs_attention_page::NeedsAttentionState,
     pub mounts: super::mounts_page::MountsState,
     pub media_sets: super::media_sets_tool::MediaSetsToolState,
@@ -29,6 +30,7 @@ impl ToolPagesState {
             platform_aliases: super::platform_aliases_page::PlatformAliasesState::live(),
             database: super::database_status_page::DatabaseStatusState::live(),
             cheat_extras: Default::default(),
+            homebrew_browser: Default::default(),
         }
     }
 }
@@ -36,6 +38,9 @@ impl ToolPagesState {
 impl App {
     pub(super) fn tool_page(&mut self, ui: &mut egui::Ui, tool: ToolPage) {
         match tool {
+            ToolPage::HomebrewBrowser => {
+                super::homebrew_browser::show(ui, &mut self.tools.homebrew_browser)
+            }
             ToolPage::NeedsAttention => {
                 self.tools.needs_attention.poll(ui.ctx());
                 if let Some(route) =

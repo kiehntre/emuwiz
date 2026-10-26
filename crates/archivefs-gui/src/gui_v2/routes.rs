@@ -774,10 +774,11 @@ pub(super) enum ToolPage {
     PlatformAliases,
     DatabaseStatus,
     CheatExtras,
+    HomebrewBrowser,
 }
 
 impl ToolPage {
-    pub const ALL: [Self; 8] = [
+    pub const ALL: [Self; 9] = [
         Self::NeedsAttention,
         Self::Mounts,
         Self::MediaSets,
@@ -786,6 +787,7 @@ impl ToolPage {
         Self::PlatformAliases,
         Self::DatabaseStatus,
         Self::CheatExtras,
+        Self::HomebrewBrowser,
     ];
 
     pub fn title(self) -> &'static str {
@@ -797,6 +799,7 @@ impl ToolPage {
             Self::LibraryViews => "Library Views",
             Self::PlatformAliases => "Platform aliases",
             Self::DatabaseStatus => "Database status",
+            Self::HomebrewBrowser => "Offline homebrew catalogue",
             Self::CheatExtras => "Providers and code previews",
         }
     }
@@ -814,6 +817,9 @@ impl ToolPage {
             }
             Self::PlatformAliases => "Teach EmuWiz what your folder names mean.",
             Self::DatabaseStatus => "Where EmuWiz keeps what it knows about your library.",
+            Self::HomebrewBrowser => {
+                "Search a local catalogue and review dated claims without acquiring games."
+            }
             Self::CheatExtras => {
                 "Licences for open and local cheat providers, and read-only code previews."
             }
@@ -829,6 +835,7 @@ impl ToolPage {
             Self::ViewHistory | Self::LibraryViews => Section::Build,
             Self::PlatformAliases => Section::Settings,
             Self::DatabaseStatus => Section::Settings,
+            Self::HomebrewBrowser => Section::Games,
             Self::CheatExtras => Section::Mods,
         }
     }
@@ -841,6 +848,7 @@ impl ToolPage {
             Self::MediaSets => "Multi-disc games",
             Self::ViewHistory | Self::LibraryViews => "Organise & Export",
             Self::PlatformAliases | Self::DatabaseStatus => "Settings",
+            Self::HomebrewBrowser => "Tools",
             Self::CheatExtras => "Enhance",
         }
     }
