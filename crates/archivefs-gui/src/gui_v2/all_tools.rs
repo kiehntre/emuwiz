@@ -195,6 +195,12 @@ pub(super) fn groups() -> Vec<ToolGroup> {
         safety: ToolSafety::LookingOnly,
     });
     cheats.tools.push(Tool {
+        route: Route::Tool(ToolPage::PatchPackagePreview),
+        title: ToolPage::PatchPackagePreview.title(),
+        purpose: ToolPage::PatchPackagePreview.purpose(),
+        safety: ToolSafety::LookingOnly,
+    });
+    cheats.tools.push(Tool {
         route: Route::Tool(ToolPage::CheatExtras),
         title: ToolPage::CheatExtras.title(),
         purpose: ToolPage::CheatExtras.purpose(),

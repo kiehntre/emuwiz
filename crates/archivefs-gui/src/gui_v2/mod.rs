@@ -60,6 +60,7 @@ mod nkit;
 mod onboarding;
 mod organisation;
 mod pages;
+mod patch_package_preview;
 mod platform_aliases_page;
 mod problem_actions;
 mod problems;
@@ -82,7 +83,6 @@ mod setup_portability;
 mod shared_scroll_tests;
 mod simple_shell;
 mod source_impact;
-mod whdload_option_preview;
 mod sources_providers;
 #[cfg(test)]
 mod stale_inspection_tests;
@@ -106,6 +106,7 @@ mod verify_journey_tests;
 pub(crate) mod vice_evidence;
 mod view_history_page;
 mod visual_pages;
+mod whdload_option_preview;
 mod wiiu_disc;
 
 use crate::optical_conversion_page::OpticalConversionPageState;

@@ -81,7 +81,6 @@ pub mod game_firmware_adapters;
 /// already selected launch candidate. Explains; never decides or mutates.
 pub mod game_firmware_readiness;
 pub mod game_profile_planner;
-pub mod whdload_options;
 /// Provider-neutral homebrew project, release and artifact metadata types.
 pub mod homebrew_artifact;
 /// Offline discovery from an explicitly supplied local metadata catalogue.
@@ -152,6 +151,7 @@ pub mod uef_tape;
 /// A disposable profile holding one production-verified synthetic game.
 #[cfg(any(test, feature = "test-support"))]
 pub mod verified_game_fixture;
+pub mod whdload_options;
 use database::scan_and_persist_folders;
 pub use database::{
     ArchiveChangeKind, ArchiveObservationKind, ArchiveUpsertOutcome, AutomaticPlatformDetails,

@@ -774,6 +774,7 @@ pub(super) enum ToolPage {
     PlatformAliases,
     DatabaseStatus,
     CheatExtras,
+    PatchPackagePreview,
     SourceImpact,
     WhdloadOptions,
 }
@@ -788,6 +789,7 @@ impl ToolPage {
         Self::PlatformAliases,
         Self::DatabaseStatus,
         Self::CheatExtras,
+        Self::PatchPackagePreview,
         Self::SourceImpact,
         Self::WhdloadOptions,
     ];
@@ -802,6 +804,7 @@ impl ToolPage {
             Self::PlatformAliases => "Platform aliases",
             Self::DatabaseStatus => "Database status",
             Self::WhdloadOptions => "WHDLoad ToolType review",
+            Self::PatchPackagePreview => "Patch-package inspection",
             Self::SourceImpact => "Source-location impact preview",
             Self::CheatExtras => "Providers and code previews",
         }
@@ -823,6 +826,9 @@ impl ToolPage {
             Self::WhdloadOptions => {
                 "Explain supplied ToolTypes and Config metadata without changing an installation."
             }
+            Self::PatchPackagePreview => {
+                "Inspect patches and untrusted package metadata without applying anything."
+            }
             Self::SourceImpact => {
                 "Preview one library source at a new folder without relocating anything."
             }
@@ -842,6 +848,7 @@ impl ToolPage {
             Self::PlatformAliases => Section::Settings,
             Self::DatabaseStatus => Section::Settings,
             Self::WhdloadOptions => Section::Mods,
+            Self::PatchPackagePreview => Section::Mods,
             Self::SourceImpact => Section::Sources,
             Self::CheatExtras => Section::Mods,
         }
@@ -856,6 +863,7 @@ impl ToolPage {
             Self::ViewHistory | Self::LibraryViews => "Organise & Export",
             Self::PlatformAliases | Self::DatabaseStatus => "Settings",
             Self::WhdloadOptions => "Tools",
+            Self::PatchPackagePreview => "Tools",
             Self::SourceImpact => "Tools",
             Self::CheatExtras => "Enhance",
         }
