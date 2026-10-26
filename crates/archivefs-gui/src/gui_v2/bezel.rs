@@ -20,7 +20,7 @@ use archivefs_core::bezel_decorations::{
 };
 use archivefs_core::launch::RetroArchLaunchRequest;
 use archivefs_core::patch_manager::{
-    RetroArchBezelApplyOptions, apply_retroarch_bezel_plan, default_shared_backup_root,
+    RetroArchBezelApplyOptions, apply_retroarch_bezel_plan_reported, default_shared_backup_root,
     default_shared_history_root, prepare_retroarch_bezel_plan,
 };
 use archivefs_core::patch_manager::{SharedApplyResult, SharedApplyStatus};
@@ -465,7 +465,7 @@ impl BezelPanelState {
             }
         };
         let operation_id = archivefs_core::patch_manager::generate_shared_operation_id();
-        match apply_retroarch_bezel_plan(
+        match apply_retroarch_bezel_plan_reported(
             plan,
             &RetroArchBezelApplyOptions {
                 general_approved: true,
@@ -478,7 +478,7 @@ impl BezelPanelState {
                 backup_root: backup,
             },
         ) {
-            Ok(result) => self.apply_result = Some(ApplyOutcome::from_result(&result)),
+            Ok(report) => self.apply_result = Some(ApplyOutcome::from_report(&report)),
             Err(error) => self.apply_result = Some(ApplyOutcome::refused(error.to_string())),
         }
     }
@@ -495,6 +495,8 @@ struct ApplyOutcome {
     technical: String,
     /// Per-file notes from the journal, such as permissions not kept.
     warnings: Vec<String>,
+    /// Everything this Apply did was rolled back: there is nothing to undo.
+    nothing_remains: bool,
 }
 
 impl ApplyOutcome {
@@ -506,7 +508,47 @@ impl ApplyOutcome {
             undo_available: false,
             technical,
             warnings: Vec::new(),
+            nothing_remains: true,
         }
+    }
+
+    /// The final state after the core's automatic rollback, not what the
+    /// Apply attempted: a fully rolled-back Apply is a refusal with nothing
+    /// to undo, and Undo is offered only when a fresh preview can run it.
+    fn from_report(report: &archivefs_core::patch_manager::RetroArchBezelApplyReport) -> Self {
+        use archivefs_core::patch_manager::BezelAutomaticRollback as R;
+        let mut outcome = Self::from_result(&report.result);
+        match report.automatic_rollback {
+            R::NotNeeded => {}
+            R::Completed => {
+                outcome.tone = StatusTone::Blocked;
+                outcome.headline = "Apply refused";
+                outcome.detail = "EmuWiz could not finish this bezel change, so it undid the part it had made. No changes remain.";
+                outcome.undo_available = false;
+                outcome.nothing_remains = true;
+            }
+            R::Incomplete { undo_available } => {
+                outcome.tone = StatusTone::Warning;
+                outcome.headline = "Bezel only partly applied";
+                outcome.detail = "Some changes remain and EmuWiz could not undo them automatically. Review History before retrying.";
+                outcome.undo_available = undo_available && report.result.journal_path.is_some();
+            }
+        }
+        // A retained backup is never hidden, whatever the outcome.
+        outcome.warnings.extend(
+            report
+                .result
+                .journal
+                .entries
+                .iter()
+                .filter_map(|entry| entry.backup_path.as_ref())
+                .map(|path| format!("A backup of the original file is kept at {}.", path.display)),
+        );
+        outcome.technical = format!(
+            "{}; automatic rollback: {:?}",
+            outcome.technical, report.automatic_rollback
+        );
+        outcome
     }
 
     fn from_result(result: &SharedApplyResult) -> Self {
@@ -523,6 +565,7 @@ impl ApplyOutcome {
             headline,
             detail,
             undo_available: wrote && result.journal_path.is_some(),
+            nothing_remains: !wrote,
             technical,
             warnings: result
                 .journal
@@ -609,6 +652,8 @@ fn show_apply_outcome(ui: &mut egui::Ui, outcome: &ApplyOutcome) {
     }
     ui.label(if outcome.undo_available {
         "Undo available"
+    } else if outcome.nothing_remains {
+        "Nothing to undo: no changes remain."
     } else {
         "Undo not available"
     });
@@ -1172,7 +1217,8 @@ mod tests {
         assert!(outcome.detail.contains("Nothing has changed"));
         let rendered = render(&outcome);
         assert!(rendered.contains("Nothing has changed"));
-        assert!(rendered.contains("Undo not available"));
+        assert!(rendered.contains("Nothing to undo: no changes remain."));
+        assert!(!rendered.contains("Undo available"));
         // Raw code stays behind the collapsed Technical details disclosure.
         assert!(rendered.contains("Technical details"));
         assert!(!rendered.contains("SourceOutsideApprovedRoot"));
@@ -1187,6 +1233,7 @@ mod tests {
             undo_available: true,
             technical: "Success".into(),
             warnings: vec!["existing permissions 4755 were not kept".into()],
+            nothing_remains: false,
         };
         assert!(render(&ok).contains("Undo available"));
         assert!(!render(&ok).contains("Undo not available"));
@@ -1198,6 +1245,157 @@ mod tests {
             StatusTone::Blocked,
             "failure must never use the success tone"
         );
+    }
+
+    /// A partly failed bezel Apply: the override replacement refused after its
+    /// backup was made, the overlay file installed.
+    fn partial_result() -> SharedApplyResult {
+        use archivefs_core::patch_manager::{
+            PreviewAdapter, PreviewDestinationState, PreviewProposedAction, SharedApplyContext,
+            SharedApplyEntry, SharedApplyFailure, SharedApplyFailureKind, SharedApplyJournal,
+            SharedApplyOutcome, SharedPlanEntry, SharedTransactionPath,
+        };
+        let path = |p: &str| SharedTransactionPath::from_path(std::path::Path::new(p));
+        let entry = |relative: &str, outcome, backup: Option<&str>, failure: bool| {
+            SharedApplyEntry {
+                plan_entry: SharedPlanEntry {
+                    adapter: PreviewAdapter::RetroArch,
+                    selected_archive: path("/bezels/game.png"),
+                    verified_game_identity: "game".into(),
+                    source_path: path("/stage/source"),
+                    source_digest: "a".repeat(64),
+                    destination_root: path("/retroarch"),
+                    destination_relative_path: path(relative),
+                    destination_pre_state: PreviewDestinationState::Missing,
+                    destination_pre_digest: None,
+                    proposed_action: PreviewProposedAction::Install,
+                    backup_required: backup.is_some(),
+                    parent_creation_approved: true,
+                    content_verification: None,
+                },
+                destination_existed_before_apply: Some(backup.is_some()),
+                destination_parent_existed_before_apply: Some(true),
+                observed_source_digest: None,
+                observed_destination_digest: None,
+                backup_path: backup.map(path),
+                backup_digest: None,
+                destination_pre_mode: None,
+                temporary_path: None,
+                final_destination_digest: None,
+                created_directories: Vec::new(),
+                replacement_approved: true,
+                verification_succeeded: !failure,
+                outcome,
+                stages: Vec::new(),
+                warnings: Vec::new(),
+                failures: if failure {
+                    vec![SharedApplyFailure {
+                    kind: SharedApplyFailureKind::AtomicReplaceUnsupported,
+                    path: None,
+                    detail: "this folder's filesystem cannot replace files atomically, so EmuWiz refused and changed nothing".into(),
+                }]
+                } else {
+                    Vec::new()
+                },
+            }
+        };
+        SharedApplyResult {
+            journal: SharedApplyJournal {
+                schema_version: 1,
+                operation_id: "op".into(),
+                plan_id: "plan".into(),
+                timestamp_unix_seconds: 0,
+                context: SharedApplyContext {
+                    adapter: PreviewAdapter::RetroArch,
+                    selected_archive: path("/bezels/game.png"),
+                    verified_game_identity: "game".into(),
+                    profile_id: "retroarch".into(),
+                    source_mode: "retroarch_bezel".into(),
+                },
+                approved_source_root: path("/stage"),
+                destination_root: path("/retroarch"),
+                created_root_directories: Vec::new(),
+                dry_run: false,
+                entries: vec![
+                    entry(
+                        "overlays/game.png",
+                        SharedApplyOutcome::InstalledNew,
+                        None,
+                        false,
+                    ),
+                    entry(
+                        "config/core/game.cfg",
+                        SharedApplyOutcome::WriteFailed,
+                        Some("/backups/op/override.bak"),
+                        true,
+                    ),
+                ],
+                status: SharedApplyStatus::PartialFailure,
+                rollback_operation_id: None,
+            },
+            journal_path: Some(std::path::PathBuf::from("/history/op.json")),
+            journal_failure: None,
+        }
+    }
+
+    fn report(
+        automatic_rollback: archivefs_core::patch_manager::BezelAutomaticRollback,
+    ) -> archivefs_core::patch_manager::RetroArchBezelApplyReport {
+        archivefs_core::patch_manager::RetroArchBezelApplyReport {
+            result: partial_result(),
+            automatic_rollback,
+        }
+    }
+
+    /// Job #22 (exFAT): everything rolled back is a refusal with nothing to
+    /// undo, never "partly applied" with Undo; the kept backup stays visible.
+    #[test]
+    fn fully_rolled_back_apply_is_refused_with_nothing_to_undo() {
+        use archivefs_core::patch_manager::BezelAutomaticRollback as R;
+        let outcome = ApplyOutcome::from_report(&report(R::Completed));
+        assert_eq!(outcome.tone, StatusTone::Blocked);
+        assert!(!outcome.undo_available);
+        let rendered = render(&outcome);
+        assert!(rendered.contains("Apply refused"), "{rendered}");
+        assert!(rendered.contains("No changes remain"), "{rendered}");
+        assert!(
+            rendered.contains("Nothing to undo: no changes remain."),
+            "{rendered}"
+        );
+        assert!(!rendered.contains("partly applied"), "{rendered}");
+        assert!(!rendered.contains("Some changes were made"), "{rendered}");
+        assert!(!rendered.contains("Undo available"), "{rendered}");
+        assert!(
+            rendered.contains("cannot replace files atomically"),
+            "{rendered}"
+        );
+        assert!(
+            rendered.contains("A backup of the original file is kept at /backups/op/override.bak."),
+            "{rendered}"
+        );
+    }
+
+    /// Changes genuinely remain: partial wording, and Undo only when a fresh
+    /// preview says it can run; the backup is shown either way.
+    #[test]
+    fn genuinely_partial_apply_keeps_partial_wording_and_offers_only_real_undo() {
+        use archivefs_core::patch_manager::BezelAutomaticRollback as R;
+        for undo_available in [true, false] {
+            let outcome = ApplyOutcome::from_report(&report(R::Incomplete { undo_available }));
+            assert_eq!(outcome.tone, StatusTone::Warning);
+            assert_eq!(outcome.undo_available, undo_available);
+            let rendered = render(&outcome);
+            assert!(rendered.contains("Bezel only partly applied"), "{rendered}");
+            assert!(rendered.contains("Some changes remain"), "{rendered}");
+            assert!(!rendered.contains("No changes remain"), "{rendered}");
+            assert!(!rendered.contains("Nothing to undo"), "{rendered}");
+            assert_eq!(
+                rendered.contains("Undo available"),
+                undo_available,
+                "{rendered}"
+            );
+            assert!(rendered.contains("/backups/op/override.bak"), "{rendered}");
+        }
     }
 
     /// A state with a selected, resolved asset and a stubbed preview texture
