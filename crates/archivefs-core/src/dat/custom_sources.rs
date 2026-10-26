@@ -314,7 +314,13 @@ impl CustomDatSourceRegistry {
             .write(true)
             .create_new(true)
             .open(&lock_path)
-            .map_err(|_| config("custom DAT registry is busy; reload before retrying"))?;
+            .map_err(|error| {
+                if error.kind() == std::io::ErrorKind::AlreadyExists {
+                    config("custom DAT source registrations are locked; saving is refused")
+                } else {
+                    ArchiveFsError::io(lock_path.clone(), error)
+                }
+            })?;
         let result = (|| {
             if Self::load(path)? != *expected {
                 return Err(config("custom DAT registry changed; reload before saving"));

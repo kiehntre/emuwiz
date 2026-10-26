@@ -604,3 +604,21 @@ fn blue_local_staging_and_registry_refuse_links_and_special_files() {
     );
     assert_eq!(fs::read(file).unwrap(), dat("one"));
 }
+
+#[test]
+fn blue_registry_io_failure_is_not_reported_as_another_busy_writer() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join(format!("{}.json", "a".repeat(260)));
+    let registry = CustomDatSourceRegistry::default();
+    let error = registry.save_if_current(&path, &registry).unwrap_err();
+    match error {
+        ArchiveFsError::Io {
+            path: Some(actual),
+            source,
+        } => {
+            assert_eq!(actual, path.with_extension("json.lock"));
+            assert_eq!(source.raw_os_error(), Some(libc::ENAMETOOLONG));
+        }
+        other => panic!("lock I/O failure was misreported: {other}"),
+    }
+}
