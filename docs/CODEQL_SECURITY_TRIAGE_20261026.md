@@ -146,11 +146,27 @@ introduced to manufacture a clean scan.
 The initial Rust scan completed with only the four widget-ID findings because
 sandboxed extraction could not load either Cargo manifest and skipped macro
 expansion. An offline retry confirmed the same limitation. Those missing 26
-findings are a coverage failure, not resolved alerts. A further run with access to
-the installed toolchain loads workspace semantics; its extraction diagnostics,
-full-suite results and baseline comparison are retained in the evidence archive.
+findings are a coverage failure, not resolved alerts. The final semantic run
+completed the full Rust code-scanning suite and reproduced all 30 Rust findings
+at their original rule/location pairs. Combined with the two Python findings,
+all 32 baseline alerts remain reported. #29's behavior is repaired, but no query
+finding has disappeared. The per-ID comparison is in `final-validation.json` in
+the evidence archive.
+
+CodeQL reports 1,866/1,866 Rust files scanned. Its metric labels three vendored
+CHD files as extracted with errors; the underlying diagnostics are seven warnings
+about benchmark/scan macro expansion and existing strings/features in
+`third_party/chd-0.3.4/{benches/bench.rs,src/lib.rs,src/header.rs}`. Four include!-module
+semantic notices and one internal data-flow consistency diagnostic (`Node should
+have one toString`) are also retained. These limit whole-program completeness;
+they must not be hidden behind a claim of a clean scan. All 30 targeted baseline
+Rust findings were reproduced despite those limitations. No vendor code, query,
+or configuration was changed to remove the diagnostics.
+
 No Rust files have changed, so no Rust alert is claimed fixed by this candidate.
-The extractor is explicitly assigned this worktree's isolated Cargo target.
+The extractor was explicitly assigned this worktree's isolated Cargo target.
+The final query evaluation used 16 GiB after the first budget caused repeated
+cache eviction; the same database and complete query suite were retained.
 
 There are **zero verified GitHub alert closures**. #29's conditional disclosure is
 fixed by regression evidence, while its query finding persists. The other 31
