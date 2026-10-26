@@ -639,6 +639,9 @@ pub enum SharedRollbackOutcome {
     RemovedInstalledFile,
     RestoredBackup,
     Failed,
+    /// Deliberately left as it is: an earlier file could not be restored,
+    /// so Undo stopped before removing or changing anything else.
+    Retained,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -2340,12 +2343,35 @@ pub fn execute_shared_rollback(
         };
     }
     let mut applied = fresh.clone();
-    for (index, (rollback, install)) in applied
-        .entries
-        .iter_mut()
-        .zip(&original.entries)
-        .enumerate()
-    {
+    // Restores first: removing the files a change created while the file they
+    // belong with cannot be put back would leave that file pointing at
+    // missing files. The first restore that does not complete stops Undo, so
+    // nothing else is removed or changed.
+    let mut order: Vec<usize> = (0..original.entries.len().min(applied.entries.len())).collect();
+    order.sort_by_key(|&index| {
+        original.entries[index].outcome != SharedApplyOutcome::ReplacedExisting
+    });
+    let mut processed: Vec<usize> = Vec::new();
+    let mut halted_by: Option<usize> = None;
+    for index in order {
+        if halted_by.is_none() {
+            halted_by = processed.iter().copied().find(|&done| {
+                original.entries[done].outcome == SharedApplyOutcome::ReplacedExisting
+                    && applied.entries[done].outcome != SharedRollbackOutcome::RestoredBackup
+            });
+        }
+        if halted_by.is_some() {
+            let kept = &mut applied.entries[index];
+            kept.outcome = SharedRollbackOutcome::Retained;
+            kept.failure = Some(SharedApplyFailure {
+                kind: SharedApplyFailureKind::RollbackBlocked,
+                path: kept.destination.clone(),
+                detail: "Kept as it is: an earlier file could not be restored, so EmuWiz stopped before removing or changing this one.".into(),
+            });
+            continue;
+        }
+        processed.push(index);
+        let (rollback, install) = (&mut applied.entries[index], &original.entries[index]);
         durable.transaction_state = SharedRecoveryState::RollingBack;
         if let Some(entry) = durable.entries.get_mut(index) {
             entry.state = SharedEntryRecoveryState::RollingBack;
@@ -2449,7 +2475,7 @@ pub fn execute_shared_rollback(
                                     // Nothing was undone: say so, and how to
                                     // recover by hand from the kept backup.
                                     SharedApplyFailureKind::AtomicReplaceUnsupported => format!(
-                                        "This folder's filesystem cannot replace files atomically, so EmuWiz did not undo this change and left every file as it is. The original file is kept in EmuWiz's backup at {}. To restore it by hand, close the emulator and copy that file over {}. This change stays in History.",
+                                        "This folder's filesystem cannot replace files atomically, so EmuWiz did not restore this file. The original file is kept in EmuWiz's backup at {}. To restore it by hand, close the emulator and copy that file over {}. This change stays in History.",
                                         backup.display(),
                                         destination.display()
                                     ),
@@ -2510,6 +2536,48 @@ pub fn execute_shared_rollback(
     // root at all (including every journal written before that field
     // existed).
     cleanup_transaction_created_root_directories(&original, &root);
+    // A late restore failure (the last entry processed) also halts nothing
+    // further but still decides the summary below.
+    let halted_by = halted_by.or_else(|| {
+        processed.iter().copied().find(|&done| {
+            original.entries[done].outcome == SharedApplyOutcome::ReplacedExisting
+                && applied.entries[done].outcome != SharedRollbackOutcome::RestoredBackup
+        })
+    });
+    // A restore that published but kept a changed displaced file did change
+    // the destination, even though it is reported as a failure.
+    let changed = applied.entries.iter().any(|entry| {
+        matches!(
+            entry.outcome,
+            SharedRollbackOutcome::RestoredBackup | SharedRollbackOutcome::RemovedInstalledFile
+        ) || entry
+            .failure
+            .as_ref()
+            .is_some_and(|failure| failure.kind == SharedApplyFailureKind::DisplacedFileKept)
+    });
+    // Say exactly what this Undo changed; never claim nothing changed when
+    // something did.
+    if let Some(index) = halted_by
+        && let Some(entry) = applied.entries.get_mut(index)
+    {
+        let summary = if changed {
+            "Files EmuWiz had already restored stay restored; every other file was kept as it is."
+        } else {
+            "Nothing was changed: every file was kept as it is."
+        };
+        match entry.failure.as_mut() {
+            Some(failure) => {
+                failure.detail = format!("{} {summary}", failure.detail);
+            }
+            None => {
+                entry.failure = Some(SharedApplyFailure {
+                    kind: SharedApplyFailureKind::RollbackBlocked,
+                    path: entry.destination.clone(),
+                    detail: format!("This file could not be restored. {summary}"),
+                });
+            }
+        }
+    }
     let success = applied.entries.iter().all(|entry| {
         matches!(
             entry.outcome,
@@ -2550,7 +2618,7 @@ pub fn execute_shared_rollback(
         journal_path,
         status: if success && marker_written {
             SharedApplyStatus::Success
-        } else if success {
+        } else if success || changed {
             SharedApplyStatus::PartialFailure
         } else {
             SharedApplyStatus::Failed
@@ -2872,7 +2940,9 @@ fn publish_displacing(
     keep_temp: &mut bool,
 ) -> Result<(), SharedApplyFailureKind> {
     before_publish(destination);
-    let exchanged = if should_inject(FaultPoint::ExchangeUnsupported) {
+    let exchanged = if should_inject(FaultPoint::ExchangeUnsupported)
+        || should_inject_after(FaultPoint::ExchangeUnsupported)
+    {
         Err(std::io::Error::from_raw_os_error(libc::EINVAL))
     } else {
         rename_exchange(temp, destination)
@@ -5515,7 +5585,11 @@ mod tests {
             .unwrap()
             .to_path_buf()
             .unwrap();
-        assert!(detail.contains("did not undo this change"), "{detail}");
+        assert!(detail.contains("did not restore this file"), "{detail}");
+        assert!(
+            detail.contains("Nothing was changed: every file was kept as it is."),
+            "{detail}"
+        );
         assert!(detail.contains(&backup.display().to_string()), "{detail}");
         assert_eq!(fs::read(&backup).unwrap(), b"old");
         assert_eq!(fs::read(&live).unwrap(), b"new");
@@ -5768,6 +5842,218 @@ mod tests {
             vec![SharedEntryRecoveryState::NeedsReview]
         );
         assert!(!plan_pending_recovery(&pending[0]).can_safe_rollback);
+    }
+
+    /// A transaction mixing new and replaced files, in the given journal order:
+    /// `(relative path, existing bytes if any, new bytes)`.
+    #[cfg(unix)]
+    fn mixed_plan(
+        fixture: &Fixture,
+        items: &[(&str, Option<&[u8]>, &[u8])],
+    ) -> SharedTransactionPlan {
+        fs::create_dir(fixture.source_root()).unwrap();
+        fs::create_dir_all(fixture.destination_root().join("Nintendo - NES")).unwrap();
+        let source_items = items
+            .iter()
+            .enumerate()
+            .map(|(index, (relative, existing, new))| {
+                let source = fixture.source_root().join(format!("source-{index}"));
+                fs::write(&source, new).unwrap();
+                if let Some(bytes) = existing {
+                    let live = fixture.destination_root().join(relative);
+                    fs::write(&live, bytes).unwrap();
+                    chmod(&live, 0o664);
+                }
+                PreviewSourceItem {
+                    adapter: PreviewAdapter::RetroArch,
+                    source_path: source,
+                    expected_source_digest: None,
+                    destination_relative_paths: vec![PathBuf::from(relative)],
+                    match_strength: PreviewMatchStrength::VerifiedExact,
+                }
+            })
+            .collect();
+        let report = build_shared_preview(&SharedPreviewRequest {
+            adapter: PreviewAdapter::RetroArch,
+            selected_archive: fixture.0.join("selected.zip"),
+            platform: Some("NES".into()),
+            identity: PreviewIdentity {
+                kind: PreviewIdentityKind::RetroArchCatalogueMatch,
+                state: PreviewIdentityState::Verified,
+                value: Some("archive-1".into()),
+                archive_path: fixture.0.join("selected.zip"),
+                revision: None,
+            },
+            destination_root: fixture.destination_root(),
+            source_items,
+        })
+        .unwrap();
+        make_plan(fixture, &report)
+    }
+
+    #[cfg(unix)]
+    fn entry_for<'a>(
+        preview: &'a SharedRollbackPreview,
+        relative: &str,
+    ) -> &'a SharedRollbackEntry {
+        preview
+            .entries
+            .iter()
+            .find(|entry| {
+                entry
+                    .destination
+                    .as_ref()
+                    .is_some_and(|path| path.display.ends_with(relative))
+            })
+            .unwrap()
+    }
+
+    /// Job #22 (exFAT): when the replaced file cannot be restored atomically,
+    /// Undo stops before removing the new file that belongs with it, even
+    /// though that file comes first in the journal; nothing changes, the
+    /// result says so, and the journal and backup stay recoverable.
+    #[cfg(unix)]
+    #[test]
+    fn undo_refused_restore_keeps_dependent_new_files_and_changes_nothing() {
+        let fixture = Fixture::new("undo-ordering");
+        let plan = mixed_plan(
+            &fixture,
+            &[
+                ("Nintendo - NES/aaa-overlay.cfg", None, b"overlay"),
+                ("Nintendo - NES/game.cht", Some(b"old"), b"new"),
+            ],
+        );
+        let applied = execute_shared_apply(
+            &plan,
+            &options(&fixture, &plan, "undo-ordering", false, true, true),
+        );
+        assert_eq!(applied.journal.status, SharedApplyStatus::Success);
+        let journal_path = applied.journal_path.clone().unwrap();
+        let live = fixture.destination_root().join("Nintendo - NES/game.cht");
+        let overlay = fixture
+            .destination_root()
+            .join("Nintendo - NES/aaa-overlay.cfg");
+        let rollback = preview_shared_rollback(
+            &journal_path,
+            &fixture.destination_root(),
+            &fixture.backup_root(),
+        );
+        inject_fault(Some(FaultPoint::ExchangeUnsupported));
+        let refused = confirm_rollback(&fixture, &rollback, "undo-ordering-1");
+        inject_fault(None);
+        assert_eq!(refused.status, SharedApplyStatus::Failed);
+        assert!(refused.journal_path.is_none(), "never marked undone");
+        let restore = entry_for(&refused.preview, "game.cht");
+        assert_eq!(restore.outcome, SharedRollbackOutcome::Failed);
+        let detail = &restore.failure.as_ref().unwrap().detail;
+        assert_eq!(
+            restore.failure.as_ref().unwrap().kind,
+            SharedApplyFailureKind::AtomicReplaceUnsupported
+        );
+        assert!(detail.contains("did not restore this file"), "{detail}");
+        assert!(
+            detail.contains("Nothing was changed: every file was kept as it is."),
+            "{detail}"
+        );
+        let kept = entry_for(&refused.preview, "overlay.cfg");
+        assert_eq!(kept.outcome, SharedRollbackOutcome::Retained);
+        assert!(
+            kept.failure
+                .as_ref()
+                .unwrap()
+                .detail
+                .starts_with("Kept as it is")
+        );
+        // Nothing changed on disk; recovery records intact.
+        assert_eq!(fs::read(&live).unwrap(), b"new");
+        assert_eq!(fs::read(&overlay).unwrap(), b"overlay");
+        let backup = applied
+            .journal
+            .entries
+            .iter()
+            .find_map(|entry| entry.backup_path.as_ref())
+            .unwrap()
+            .to_path_buf()
+            .unwrap();
+        assert_eq!(fs::read(&backup).unwrap(), b"old");
+        assert!(journal_path.is_file());
+        // On a filesystem that can swap, the same Undo still works later.
+        let retry = preview_shared_rollback(
+            &journal_path,
+            &fixture.destination_root(),
+            &fixture.backup_root(),
+        );
+        assert!(retry.available);
+        let done = confirm_rollback(&fixture, &retry, "undo-ordering-2");
+        assert_eq!(done.status, SharedApplyStatus::Success);
+        assert_eq!(fs::read(&live).unwrap(), b"old");
+        assert_eq!(mode_of(&live), 0o664);
+        assert!(!overlay.exists());
+    }
+
+    /// A genuinely partial Undo: the restore was published but the installed
+    /// file had been changed meanwhile and could not be put back, so it is
+    /// kept aside. That is a change, so the text never says "nothing
+    /// changed"; the dependent new file is still kept and the status is
+    /// partial.
+    #[cfg(unix)]
+    #[test]
+    fn partial_undo_reports_what_changed_and_keeps_dependent_files() {
+        let fixture = Fixture::new("undo-partial");
+        let plan = mixed_plan(
+            &fixture,
+            &[
+                ("Nintendo - NES/aaa-overlay.cfg", None, b"overlay"),
+                ("Nintendo - NES/game.cht", Some(b"old"), b"new"),
+            ],
+        );
+        let applied = execute_shared_apply(
+            &plan,
+            &options(&fixture, &plan, "undo-partial", false, true, true),
+        );
+        assert_eq!(applied.journal.status, SharedApplyStatus::Success);
+        let journal_path = applied.journal_path.clone().unwrap();
+        let rollback = preview_shared_rollback(
+            &journal_path,
+            &fixture.destination_root(),
+            &fixture.backup_root(),
+        );
+        set_before_publish(Some(Box::new(|destination: &Path| {
+            chmod(destination, 0o600)
+        })));
+        inject_fault(Some(FaultPoint::ReverseExchange));
+        let partial = confirm_rollback(&fixture, &rollback, "undo-partial-1");
+        inject_fault(None);
+        set_before_publish(None);
+        assert_eq!(partial.status, SharedApplyStatus::PartialFailure);
+        assert!(partial.journal_path.is_none(), "never marked undone");
+        let restore = entry_for(&partial.preview, "game.cht");
+        assert_eq!(restore.outcome, SharedRollbackOutcome::Failed);
+        let failure = restore.failure.as_ref().unwrap();
+        assert_eq!(failure.kind, SharedApplyFailureKind::DisplacedFileKept);
+        assert!(
+            failure.detail.contains(
+                "Files EmuWiz had already restored stay restored; every other file was kept as it is."
+            ),
+            "{}",
+            failure.detail
+        );
+        assert!(
+            !failure.detail.contains("Nothing was changed"),
+            "{}",
+            failure.detail
+        );
+        let dir = fixture.destination_root().join("Nintendo - NES");
+        assert_eq!(fs::read(dir.join("game.cht")).unwrap(), b"old");
+        assert_eq!(
+            entry_for(&partial.preview, "overlay.cfg").outcome,
+            SharedRollbackOutcome::Retained
+        );
+        assert_eq!(fs::read(dir.join("aaa-overlay.cfg")).unwrap(), b"overlay");
+        // The user's changed file is kept, never deleted.
+        let kept: Vec<_> = stray_temporaries(&dir);
+        assert_eq!(kept.len(), 1, "{kept:?}");
+        assert_eq!(fs::read(dir.join(&kept[0])).unwrap(), b"new");
     }
 
     /// Apply's own automatic restore after a failed content check uses the
