@@ -465,6 +465,7 @@ fn flatpak_checks_read_only_files_companions_and_symlink_ancestors() {
             .iter()
             .all(|arg| arg.to_str().unwrap().ends_with(":ro"))
     );
+    std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644)).unwrap();
     std::fs::write(&path, b"changed").unwrap();
     assert_ne!(flatpak::inspect(&path).unwrap(), first);
     std::fs::write(&companion, b"continuation").unwrap();
@@ -475,10 +476,10 @@ fn flatpak_checks_read_only_files_companions_and_symlink_ancestors() {
     std::fs::remove_file(&companion).unwrap();
     std::fs::write(path.with_extension("WBF2"), b"gap").unwrap();
     assert!(flatpak::inspect(&path).is_err());
+    std::fs::remove_file(path.with_extension("WBF2")).unwrap();
     let alias = directory.path().join("alias");
     symlink(directory.path(), &alias).unwrap();
     assert!(flatpak::inspect(&alias.join("disc.WBFS")).is_err());
-    std::fs::remove_file(path.with_extension("WBF2")).unwrap();
     std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o000)).unwrap();
     assert!(flatpak::inspect(&path).is_err());
 }
