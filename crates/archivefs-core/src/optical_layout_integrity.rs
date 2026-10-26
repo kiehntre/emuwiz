@@ -551,14 +551,16 @@ mod tests {
     }
 
     #[test]
-    fn identical_layout_is_exact() {
-        let left = layout(vec![track(
+    fn proven_payload_identical_layout_is_exact() {
+        let mut left = layout(vec![track(
             1,
             OpticalTrackMode::Data {
                 sector_size: 2048,
                 mode: OpticalDataMode::Mode1_2048,
             },
         )]);
+        // Positive equivalence fixtures must supply payload evidence.
+        left.tracks[0].payload_sha256 = Some("ab".repeat(32));
         assert_eq!(
             compare_optical_layouts(&left, &left).kind,
             OpticalLayoutComparisonKind::ExactEquivalent
@@ -566,7 +568,7 @@ mod tests {
     }
 
     #[test]
-    fn index_00_preserved_is_exact_and_removed_is_index_mismatch() {
+    fn proven_payload_index_00_preserved_is_exact_and_removed_is_index_mismatch() {
         let mut left_track = track(
             1,
             OpticalTrackMode::Data {
@@ -574,6 +576,7 @@ mod tests {
                 mode: OpticalDataMode::Mode1_2352,
             },
         );
+        left_track.payload_sha256 = Some("ab".repeat(32));
         left_track.gap.encoding = OpticalPregapEncoding::Index00;
         left_track.gap.index_00_frame = Some(0);
         let left = layout(vec![left_track.clone()]);
@@ -591,7 +594,7 @@ mod tests {
     }
 
     #[test]
-    fn explicit_pregap_and_index_00_need_proof() {
+    fn proven_payload_explicit_pregap_and_index_00_need_proof() {
         let mut indexed = track(
             1,
             OpticalTrackMode::Data {
@@ -599,6 +602,7 @@ mod tests {
                 mode: OpticalDataMode::Mode1_2352,
             },
         );
+        indexed.payload_sha256 = Some("ab".repeat(32));
         indexed.gap.encoding = OpticalPregapEncoding::Index00;
         indexed.gap.index_00_frame = Some(0);
         indexed.gap.index_01_frame = Some(150);
