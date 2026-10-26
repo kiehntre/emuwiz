@@ -1661,6 +1661,9 @@ def reconcile_legacy_worktree(path, preserved_ref=None, remove=False):
                         ("index.lock", "HEAD.lock", "MERGE_HEAD", "CHERRY_PICK_HEAD", "REVERT_HEAD",
                          "rebase-merge", "rebase-apply", "BISECT_START")),
                 "GIT_WORKTREE_PROTECTED", "unfinished Git operation or lock")
+        tracked = git("ls-files", "-v", "-z").split("\0")
+        require(not any(line and (line[0].islower() or line[0] == "S") for line in tracked),
+                "CHECKOUT_INDEX_UNVERIFIED", "assume-unchanged or skip-worktree entries can hide unfinished code")
         require(not git("status", "--porcelain=v1", "--untracked-files=all", "--ignored=matching"),
                 "CHECKOUT_NOT_CLEAN", "tracked, untracked or ignored files require preservation")
         head = git("rev-parse", "HEAD")

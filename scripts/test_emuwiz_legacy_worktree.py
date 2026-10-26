@@ -96,6 +96,22 @@ class LegacyCheckout(M.MaintBase):
         with open(self.wt + '/source', 'w') as h: h.write('unfinished')
         self.hold('CHECKOUT_NOT_CLEAN')
 
+    def test_assume_unchanged_and_skip_worktree_cannot_hide_local_code(self):
+        source = Path(self.wt, 'source.rs')
+        source.write_text('committed')
+        self.git('-C', self.wt, 'add', 'source.rs')
+        self.git('-C', self.wt, '-c', 'user.name=t', '-c', 'user.email=t@t', 'commit', '-qm', 'source')
+        self.git('-C', self.wt, 'update-ref', 'refs/remotes/origin/main', self.m.F.head_of(self.wt))
+        for flag, clear in [('--assume-unchanged', '--no-assume-unchanged'),
+                            ('--skip-worktree', '--no-skip-worktree')]:
+            with self.subTest(flag=flag):
+                self.git('-C', self.wt, 'update-index', flag, 'source.rs')
+                source.write_text('UNIQUE UNFINISHED LOCAL CODE')
+                self.hold('CHECKOUT_INDEX_UNVERIFIED', remove=True)
+                self.assertEqual(source.read_text(), 'UNIQUE UNFINISHED LOCAL CODE')
+                self.git('-C', self.wt, 'update-index', clear, 'source.rs')
+                source.write_text('committed')
+
     def test_pin_active_job_and_lifecycle_lock_refuse_even_when_target_absent(self):
         key = self.key_of(self.target)
         pin = self.reg + '/pins/' + key + '.json'
