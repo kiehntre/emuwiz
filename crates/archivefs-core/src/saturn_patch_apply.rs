@@ -7,7 +7,7 @@ use crate::optical_patch_tree::{Content, Contents, file_content, refuse};
 use crate::patch_output_recovery::tree::{self, PreparedTreePatch, TreePatchPlan};
 use crate::saturn_disc_manifest::{
     SaturnDescriptorType, SaturnDiscManifest, SaturnManifestStatus, SaturnTrackMode,
-    SaturnTrackType, inspect_saturn_disc, verify_saturn_manifest,
+    SaturnTrackType, inspect_saturn_disc,
 };
 use crate::saturn_patch_readiness::SaturnPatchTarget;
 use crate::standalone_patch::{
@@ -45,80 +45,6 @@ pub struct SaturnPatchPlan {
     target: PathBuf,
     cue: PathBuf,
     allowance: u64,
-}
-// Admission only, not a second CUE parser: the canonical parser below owns
-// paths, tracks and timestamps. Refuse directives/FILE types it drops rather
-// than allowing an incomplete projection to authorize a component write.
-fn admit_cue(path: &Path) -> io::Result<()> {
-    let mut text = String::new();
-    fs::File::open(path)?
-        .take(crate::ingestion::cue_bin::MAX_CUE_BYTES + 1)
-        .read_to_string(&mut text)?;
-    if text.len() as u64 > crate::ingestion::cue_bin::MAX_CUE_BYTES {
-        return Err(refuse("CUE size bound"));
-    }
-    for raw in text.lines() {
-        let line = raw.trim_matches([' ', '\t', '\r']);
-        if line.is_empty() {
-            continue;
-        }
-        if line.chars().any(|c| c.is_control() && c != '\t') {
-            return Err(refuse("CUE control character"));
-        }
-        let mut fields = line.split_ascii_whitespace();
-        let directive = fields
-            .next()
-            .ok_or_else(|| refuse("missing CUE directive"))?;
-        let rest = line[directive.len()..].trim_matches([' ', '\t']);
-        let supported = match directive.to_ascii_uppercase().as_str() {
-            "FILE" => rest
-                .strip_prefix('"')
-                .and_then(|s| s.split_once('"'))
-                .is_some_and(|(name, kind)| {
-                    !name.is_empty()
-                        && !name.contains('\\')
-                        && kind.trim().eq_ignore_ascii_case("BINARY")
-                }),
-            "TRACK" => {
-                fields
-                    .next()
-                    .and_then(|v| v.parse::<u32>().ok())
-                    .is_some_and(|n| (1..=99).contains(&n))
-                    && fields.next().is_some_and(|v| {
-                        matches!(
-                            v.to_ascii_uppercase().as_str(),
-                            "MODE1/2048" | "MODE1/2352" | "MODE2/2352" | "AUDIO"
-                        )
-                    })
-                    && fields.next().is_none()
-            }
-            "INDEX" => {
-                fields
-                    .next()
-                    .and_then(|v| v.parse::<u8>().ok())
-                    .is_some_and(|n| n <= 1)
-                    && fields.next().is_some()
-                    && fields.next().is_none()
-            }
-            "PREGAP" | "POSTGAP" => fields.next().is_some() && fields.next().is_none(),
-            "REM" => fields.next().is_some_and(|v| {
-                v.eq_ignore_ascii_case("COMMENT") || v.eq_ignore_ascii_case("GENRE")
-            }),
-            "TITLE" => {
-                rest.len() >= 2
-                    && rest.starts_with('"')
-                    && rest.ends_with('"')
-                    && !rest[1..rest.len() - 1].contains('"')
-            }
-            _ => false,
-        };
-        if !supported {
-            return Err(refuse(
-                "CUE directive is outside the verified component-patch layout",
-            ));
-        }
-    }
-    Ok(())
 }
 pub fn review_saturn_patch(
     patch: &Path,
@@ -188,7 +114,10 @@ pub fn review_saturn_patch(
         destination,
         allowance,
     )?;
-    admit_cue(&manifest.source_descriptor)?;
+    let optical = crate::saturn_patch_readiness::optical::assess(manifest);
+    if !optical.refusals.is_empty() {
+        return Err(refuse(optical.refusals.join("; ")));
+    }
     if manifest
         .tracks
         .iter()
@@ -197,9 +126,7 @@ pub fn review_saturn_patch(
     {
         return Err(refuse("CUE tracks must be consecutively ordered from 01"));
     }
-    if !verify_saturn_manifest(manifest).issues.is_empty()
-        || inspect_saturn_disc(&manifest.source_descriptor).map_err(refuse)? != *manifest
-    {
+    if inspect_saturn_disc(&manifest.source_descriptor).map_err(refuse)? != *manifest {
         return Err(refuse("reviewed CUE/component manifest changed"));
     }
     let (component, sha256) = match &binding.target {
