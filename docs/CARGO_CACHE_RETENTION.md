@@ -272,6 +272,9 @@ invocation. Valuable unfinished features remain retained until a recovery decisi
 
 The command checks target absence using `lstat`, exclusive target ownership, pins,
 recorded live jobs and a complete host process census for checkout and target.
+Checkout inode identities are matched against that census so hard-link, bind-mount
+and namespace aliases cannot bypass the open-handle check. Incomplete or cross-device
+checkout identity scans refuse removal.
 R2/R3 branch, path or recorded task identities retain an unresolved production
 deployment HOLD, explicitly distinguished from proof of a currently active owner.
 No deployment override is provided. Root operation requires the existing trusted

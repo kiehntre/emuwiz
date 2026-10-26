@@ -5,6 +5,7 @@ import json
 import os
 from pathlib import Path
 import shutil
+import subprocess
 import sys
 import types
 import unittest
@@ -23,10 +24,16 @@ class LegacyCheckout(M.MaintBase):
         shutil.rmtree(self.target)  # simulate historical loss ONLY inside this test
         self.git('-C', self.wt, 'update-ref', 'refs/remotes/origin/main',
                  self.m.F.head_of(self.wt))
-        self.census = patch.object(self.m.F, 'Census', return_value=types.SimpleNamespace(
-            refs={}, unreadable_foreign=0))
+        self.real_census = self.m.F.Census
+        self.census = patch.object(self.m.F, 'Census', return_value=self.process_view())
         self.census.start()
         self.addCleanup(self.census.stop)
+
+    def process_view(self, refs=None, unreadable_foreign=0):
+        view = types.SimpleNamespace(refs=refs or {}, unreadable_foreign=unreadable_foreign,
+                                     _inode_refs=[])
+        view.match_inodes = types.MethodType(self.real_census.match_inodes, view)
+        return view
 
     def check(self, **kw):
         return self.m.reconcile_legacy_worktree(self.wt, **kw)
@@ -70,9 +77,45 @@ class LegacyCheckout(M.MaintBase):
     def test_live_process_and_incomplete_visibility_refuse(self):
         for refs, unreadable, code in [({self.wt: [{'pid': 42}]}, 0, 'LIVE_PROCESS_REFERENCE'),
                                        ({}, 1, 'INCOMPLETE_PROCESS_VISIBILITY')]:
-            with patch.object(self.m.F, 'Census', return_value=types.SimpleNamespace(
+            with patch.object(self.m.F, 'Census', return_value=self.process_view(
                     refs=refs, unreadable_foreign=unreadable)):
                 self.hold(code)
+
+    def test_live_external_hardlink_handle_preserves_checkout(self):
+        source = Path(self.wt, 'source.rs')
+        source.write_text('tracked source must survive while in use')
+        self.git('-C', self.wt, 'add', 'source.rs')
+        self.git('-C', self.wt, '-c', 'user.name=t', '-c', 'user.email=t@t',
+                 'commit', '-qm', 'source held through external alias')
+        self.git('-C', self.wt, 'update-ref', 'refs/remotes/origin/main', self.m.F.head_of(self.wt))
+        alias = Path(self.tmp, 'external-hardlink.rs')
+        os.link(source, alias)
+        child = subprocess.Popen([sys.executable, '-c',
+            "import sys,time; f=open(sys.argv[1]); print('ready',flush=True); time.sleep(30)",
+            str(alias)], cwd=self.tmp, stdout=subprocess.PIPE, text=True)
+        # The fixture's sandbox cannot establish global visibility. Keep the real
+        # process/inode census and suppress only unrelated fixture visibility holds.
+        class FixtureCensus(self.real_census):
+            def __init__(inner, *args, **kw):
+                super().__init__(*args, **kw)
+                inner.unreadable_foreign = 0
+        try:
+            self.assertEqual(child.stdout.readline().strip(), 'ready')
+            with patch.object(self.m.F, 'Census', FixtureCensus):
+                self.hold('LIVE_PROCESS_REFERENCE', remove=True)
+            self.assertIsNone(child.poll())
+            self.assertEqual(source.read_text(), 'tracked source must survive while in use')
+        finally:
+            child.terminate()
+            child.wait()
+            child.stdout.close()
+
+    def test_incomplete_or_cross_device_checkout_identity_scan_refuses(self):
+        for errors, cross_device in [(1, 0), (0, 1)]:
+            with self.subTest(errors=errors, cross_device=cross_device):
+                with patch.object(self.m.F, 'measure_tree', return_value={
+                        'errors': errors, 'cross_device': cross_device, 'identities': set()}):
+                    self.hold('CHECKOUT_IDENTITIES_UNVERIFIED', remove=True)
 
     def test_dirty_untracked_and_ignored_evidence_are_preserved(self):
         for filename, ignored in [('new-code.rs', False), ('evidence.log', True)]:
@@ -194,7 +237,7 @@ class LegacyCheckout(M.MaintBase):
             scans.append(True)
             if len(scans) == 2:
                 evidence.write_text('unique QA evidence')
-            return types.SimpleNamespace(refs={}, unreadable_foreign=0)
+            return self.process_view()
         with patch.object(self.m.F, 'Census', side_effect=arrival):
             result = self.hold('CHECKOUT_NOT_CLEAN', remove=True)
         self.assertEqual(result['outcome'], 'NOT_REMOVED')

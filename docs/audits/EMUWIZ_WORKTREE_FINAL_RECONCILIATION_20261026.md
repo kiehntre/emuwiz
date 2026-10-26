@@ -49,6 +49,8 @@ Checkout eligibility requires an unlocked registered secondary worktree, no unfi
 
 With `--remove`, the command holds the exclusive target lifecycle and registry metadata locks, records an intent, repeats checks and invokes normal Git worktree removal. Its outcome is `CHECKOUT_REMOVED` with `historical_cache_retirement: UNKNOWN`. Dry-run results and old intents never become reusable authorization. Existing Cargo deletion, pin, release, approval and production recovery behavior is not weakened.
 
+The final merge gate also identified an inode-alias process-reference defect in the initially approved head `3446c8df`: a live external hard link could escape pathname-only checks. That head's independent PASS was withdrawn after reproduction. The correction reuses the existing checkout identity measurement and `Census.match_inodes` primitives in both authorization passes, refuses incomplete/cross-device scans, and adds real-process hard-link and incomplete-scan regressions. The corrected exact head requires independent review and renewed expected-head approval; no affected legacy disposal has been executed.
+
 ## Validation and remaining authorization
 
 Focused deterministic regressions exercise missing targets; recreated directories/files/symlinks; target reuse after intent; active and uninspectable processes; dirty, untracked and ignored evidence; pins and build locks; shared/alternate ownership; malformed registry records; exact-ref preservation; changed source after intent; R2/R3 conditions; and preservation of external evidence and Git refs during normal removal. Synthetic fixtures are private temporary repositories and registries, with no Rust builds or production cleanup.

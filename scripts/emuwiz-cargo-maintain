@@ -1721,6 +1721,10 @@ def reconcile_legacy_worktree(path, preserved_ref=None, remove=False):
             raise LegacyCheckoutHold("PRODUCTION_DEPLOYMENT_UNRESOLVED",
                                      "R2/R3 deployment and ownership conditions need independent resolution; this is not proof of a live owner")
         census = F.Census([wt, target])
+        measured = F.measure_tree(wt, set(), with_identities=True)
+        require(not measured["errors"] and not measured["cross_device"],
+                "CHECKOUT_IDENTITIES_UNVERIFIED", "checkout inode identities could not be completely inspected")
+        census.match_inodes(measured["identities"], wt)
         require(not census.unreadable_foreign, "INCOMPLETE_PROCESS_VISIBILITY",
                 "cannot independently exclude host process references")
         require(not census.refs.get(wt) and not census.refs.get(target),
