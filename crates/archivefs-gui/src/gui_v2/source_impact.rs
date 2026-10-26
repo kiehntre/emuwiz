@@ -167,7 +167,7 @@ pub(super) fn show(ui: &mut egui::Ui, state: &mut State) {
             p.reference_id == format!("source-folder:{}", state.selected.unwrap_or_default())
         }) {
             ui.label(format!(
-                "{} → {} · {:?}: {}",
+                "{} -> {} · {:?}: {}",
                 proposal.old_path.display(),
                 proposal
                     .candidate_path
