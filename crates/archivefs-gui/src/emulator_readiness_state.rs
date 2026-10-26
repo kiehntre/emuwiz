@@ -26,6 +26,11 @@ pub(crate) struct EmulatorReadinessState {
     pub(crate) retroarch_installation_picker:
         crate::retroarch_installation_setup::InstallationPicker,
     pub(crate) retroarch_profiles: RetroArchProfilesState,
+    /// What the current RetroArch scan was based on; a later difference
+    /// triggers a rescan (see `revalidate_retroarch_installation`).
+    pub(crate) retroarch_installation_fingerprint:
+        Option<crate::retroarch_installation_setup::InstallationFingerprint>,
+    pub(crate) retroarch_revalidated_at: Option<std::time::Instant>,
     pub(crate) retroarch_core_directory_override: Option<PathBuf>,
     pub(crate) retroarch_core_folder_rejected_pick: Option<PathBuf>,
     pub(crate) emulator_setup_focus: Option<EmulatorSetupFocus>,
@@ -71,6 +76,8 @@ impl Default for EmulatorReadinessState {
             shadps4: Default::default(),
             retroarch_installation_picker: Default::default(),
             retroarch_profiles: RetroArchProfilesState::NotScanned,
+            retroarch_installation_fingerprint: None,
+            retroarch_revalidated_at: None,
             retroarch_core_directory_override: None,
             retroarch_core_folder_rejected_pick: None,
             emulator_setup_focus: None,

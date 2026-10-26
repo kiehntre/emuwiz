@@ -1714,6 +1714,27 @@ impl App {
                 egui::Rect::from_min_max(egui::Pos2::ZERO, egui::pos2(1.0, 1.0)),
                 Color32::WHITE,
             );
+            if self.artwork.index.as_ref().and_then(|index| index.source(game.archive.id, kind))
+                .is_some_and(|source| matches!(source, Source::Remote { record, .. }
+                    if record.verification == archivefs_core::identity_source::model::ExternalVerification::Stale))
+            {
+                let compact = rect.width() < 100.0 || rect.height() < 100.0;
+                let painter = ui.painter().with_clip_rect(ui.clip_rect().intersect(rect));
+                let galley = painter.layout(
+                    if compact { "Stale" } else { "Saved artwork · stale record" }.into(),
+                    egui::FontId::proportional(if compact { 11.0 } else { theme::METADATA_SIZE }),
+                    theme::SECONDARY_TEXT,
+                    (rect.width() - 12.0).max(1.0),
+                );
+                let height = (galley.size().y + 8.0).min(rect.height());
+                let plate = egui::Rect::from_min_size(
+                    egui::pos2(rect.left(), rect.bottom() - height),
+                    egui::vec2(rect.width(), height),
+                );
+                painter.rect_filled(plate, 4.0, theme::deep_fill(ui));
+                painter.galley(plate.min + egui::vec2(6.0, 4.0), galley, theme::SECONDARY_TEXT);
+                response.on_hover_text("RomM's saved record is out of date because its game file changed or disappeared. This picture is retained as display evidence. Refresh the RomM index to recheck its association.");
+            }
         } else {
             // No cover (yet): the game's own platform hardware, dimmed, on the
             // same plate, so an uncovered shelf still reads as distinct systems.
@@ -3591,13 +3612,14 @@ impl App {
                 let workflows = self.native_workflows.get_or_insert_with(|| {
                     super::native_workflows::NativeWorkflows::new(ui.ctx().clone())
                 });
+                workflows.revalidate_retroarch(ui.ctx());
                 let retroarch_scope = workflows.retroarch_bezel_scope();
                 let launch_request =
                     workflows.retroarch_bezel_request(game_id, &game.archive.absolute_path);
                 if let Some((config, overlays, core)) = retroarch_scope {
                     self.bezel.set_retroarch_scope(Some(config), Some(overlays), core);
                 }
-                self.bezel.set_launch_request(launch_request.map_err(str::to_string));
+                self.bezel.set_launch_request(launch_request);
                 ui.heading("Extras");
                 self.bezel.set_game(&game.title, &game.platform);
                 egui::CollapsingHeader::new("Bezel & decorations")
@@ -3715,6 +3737,12 @@ impl App {
     ) {
         ui.strong("Artwork source");
         let index = self.artwork.index.as_ref();
+        if index.and_then(|index| index.covers.get(&game)).is_some_and(|source|
+            matches!(source, Source::Remote { record, .. }
+                if record.verification == archivefs_core::identity_source::model::ExternalVerification::Stale))
+        {
+            ui.label("Saved artwork · stale record. RomM's game association needs a refresh. Any displayed picture is saved provider evidence.");
+        }
         let resolved_winner =
             index
                 .and_then(|index| index.resolved.get(&game))

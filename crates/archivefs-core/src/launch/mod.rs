@@ -609,3 +609,6 @@ pub mod dolphin_profile_composition;
 pub mod mesen_nes;
 
 pub mod nkit_readiness;
+
+#[cfg(target_os = "linux")]
+pub mod fsuae_whdload_boot;

@@ -670,8 +670,8 @@ impl ArtworkCache {
         if let Some(thumbnail) = self.lookup_key(server_id, &key) {
             return Some(thumbnail);
         }
+        request.large_reference?;
         let fallback = request.without_large();
-        fallback.large_reference?;
         self.lookup_key(server_id, &Self::key_for(server_id, &fallback))
     }
 

@@ -385,6 +385,7 @@ impl ArchiveFsApp {
         ) {
             self.start_retroarch_profile_scan(context.clone());
         }
+        self.revalidate_retroarch_installation(context);
         widgets::workflow_header(
             ui,
             "Emulators",
@@ -685,7 +686,30 @@ impl ArchiveFsApp {
                 RetroArchProfilesState::Error(message) => CoreFolderScan::Failed(message.as_str()),
                 RetroArchProfilesState::Ready(discovery) => CoreFolderScan::Ready(discovery),
             };
-            core_folder_readiness(scan, &mode)
+            let mut readiness = core_folder_readiness(scan, &mode);
+            // An unusable saved installation choice is the reason, not the
+            // game-support folder: name it (from the same checks discovery
+            // applies) instead of the generic scan failure, and never keep a
+            // green badge for a choice Play would refuse.
+            let selection_issue = match &self.emulator_readiness.retroarch_profiles {
+                RetroArchProfilesState::Error(message) => {
+                    crate::retroarch_installation_setup::selection_issue_after_refused_discovery(
+                        message,
+                    )
+                }
+                RetroArchProfilesState::Ready(_) => {
+                    crate::retroarch_installation_setup::current_selection_issue()
+                }
+                _ => None,
+            };
+            if let Some(issue) = selection_issue {
+                readiness.kind = CoreFolderReadinessKind::Error;
+                readiness.badge_label = "Needs attention";
+                readiness.badge_tone = crate::ui::components::StatusTone::Blocked;
+                readiness.headline = Some("The chosen RetroArch installation can't be used");
+                readiness.sentence = issue.message();
+            }
+            readiness
         };
         let rejected_pick = self
             .emulator_readiness
@@ -1192,6 +1216,7 @@ impl ArchiveFsApp {
                         format: archivefs_core::launch::WhdloadPackageFormat::Lha,
                     };
                     let selected_slave = archivefs_core::launch::SelectedWHDLoadSlave {
+                        sha256: artifact.hashes.sha256.clone(),
                         artifact_path: record.mount_plan.archive.path.clone(),
                         name: selected_name.clone(),
                         parsed: artifact.parsed.clone(),
@@ -1233,7 +1258,12 @@ impl ArchiveFsApp {
                                 [executable] => Some(executable.path.clone()),
                                 _ => None,
                             };
-                            let request = archivefs_core::launch::WHDLoadLaunchInput {
+                            let mut request = archivefs_core::launch::WHDLoadLaunchInput {
+                                #[cfg(target_os = "linux")]
+                                boot: Err(
+                                    "No authorized WHDLoad boot template has been inspected."
+                                        .into(),
+                                ),
                                 identity: identity_status.clone(),
                                 target: Some(target.clone()),
                                 slave: Some(selected_slave.clone()),
@@ -1248,6 +1278,13 @@ impl ArchiveFsApp {
                                     verified_identity: identity.game_key.clone(),
                                 },
                             };
+                            #[cfg(target_os = "linux")]
+                            if emulator == archivefs_core::patch_manager::AmigaEmulatorKind::FsUae {
+                                request.boot =
+                                    archivefs_core::launch::fsuae_whdload_boot::inspect_boot(
+                                        &request,
+                                    );
+                            }
                             let adapter_id = match emulator {
                                 archivefs_core::patch_manager::AmigaEmulatorKind::Amiberry => {
                                     "amiberry"
@@ -2046,6 +2083,9 @@ impl ArchiveFsApp {
         if let Some(context) = &cemu_context {
             context.apply(&mut plan);
         }
+        if let Some(context) = &amiga_whdload_context {
+            launch_readiness_page::amiga_boot::apply(&mut plan, context);
+        }
         launch_readiness_page::apply_mame_strict_preflight(&mut plan);
         if let Some(snapshot) = &mesen_context {
             snapshot.apply(&mut plan);
@@ -2818,6 +2858,9 @@ impl ArchiveFsApp {
             "RetroArch profile discovery started.",
         ));
         self.emulator_readiness.retroarch_profiles = RetroArchProfilesState::Scanning { receiver };
+        crate::retroarch_installation_setup::forget_selection_issue();
+        self.emulator_readiness.retroarch_installation_fingerprint =
+            Some(crate::retroarch_installation_setup::InstallationFingerprint::at_scan_start());
         let core_directory_override = self
             .emulator_readiness
             .retroarch_core_directory_override
@@ -2918,6 +2961,11 @@ impl ArchiveFsApp {
                         let eligible = eligible_profile_ids(&discovery);
                         (eligible.len() == 1).then(|| eligible[0].to_string())
                     };
+                    self.emulator_readiness.retroarch_installation_fingerprint = self
+                        .emulator_readiness
+                        .retroarch_installation_fingerprint
+                        .take()
+                        .map(|fingerprint| fingerprint.with_programs(&discovery.environment));
                     self.emulator_readiness.retroarch_profiles =
                         RetroArchProfilesState::Ready(discovery);
                     if let Some(workflow) = self.cheat_workflow.as_mut()
@@ -2945,6 +2993,41 @@ impl ArchiveFsApp {
                     );
                 }
             }
+        }
+    }
+
+    /// Rescans RetroArch when the saved installation choice or a program the
+    /// last scan found has changed since, so a cached Ready (or a cached
+    /// refusal) can't outlive the installation it described. Checked at most
+    /// every two seconds while a page that shows RetroArch readiness is drawn;
+    /// a scan already running is left alone. It never decides readiness
+    /// itself.
+    pub(crate) fn revalidate_retroarch_installation(&mut self, context: &egui::Context) {
+        const INTERVAL: std::time::Duration = std::time::Duration::from_secs(2);
+        if !matches!(
+            self.emulator_readiness.retroarch_profiles,
+            RetroArchProfilesState::Ready(_) | RetroArchProfilesState::Error(_)
+        ) {
+            return;
+        }
+        context.request_repaint_after(INTERVAL);
+        let now = std::time::Instant::now();
+        if self
+            .emulator_readiness
+            .retroarch_revalidated_at
+            .is_some_and(|at| now.duration_since(at) < INTERVAL)
+        {
+            return;
+        }
+        self.emulator_readiness.retroarch_revalidated_at = Some(now);
+        crate::retroarch_installation_setup::forget_selection_issue();
+        if self
+            .emulator_readiness
+            .retroarch_installation_fingerprint
+            .as_ref()
+            .is_some_and(crate::retroarch_installation_setup::InstallationFingerprint::changed)
+        {
+            self.start_retroarch_profile_scan(context.clone());
         }
     }
 
