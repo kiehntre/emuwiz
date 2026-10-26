@@ -99,3 +99,7 @@ archivefs-core = { path = "../archivefs-core", features = ["test-support"] }
 rusqlite = { version = "0.40.1", default-features = false, features = ["bundled"] }
 # Test fixtures only: a few-hundred-byte synthetic RAR5 CBR (see archivefs-core).
 rars = { version = "=0.10.2", default-features = false, features = ["write"] }
+
+[target.'cfg(target_os = "linux")'.dev-dependencies]
+# Native visual fixtures run on libtest's worker thread in private Xvfb.
+winit = { version = "0.30.13", default-features = false, features = ["x11"] }

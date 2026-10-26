@@ -827,14 +827,26 @@ pub(crate) fn show(ui: &mut egui::Ui, summary: &GameReadinessSummary) -> Option<
         });
         // The action sits directly under the state so it stays on screen in a
         // short window; the explanation and evidence chips follow it.
+        let action_count = 1 + usize::from(
+            summary.primary_action.is_some()
+                && summary.primary_action != Some(ReadinessAction::Play),
+        );
+        let available = ui.available_width();
+        let gap = ui.spacing().item_spacing.x;
+        let slot = if available >= 320.0 && action_count == 2 {
+            (available - gap) / 2.0
+        } else {
+            available.min(260.0)
+        };
         ui.horizontal_wrapped(|ui| {
             if let Some(primary) = summary.primary_action {
                 let fill = crate::ui::theme::primary_action_fill(ui);
                 if ui
-                    .add(
+                    .add_sized(
+                        [slot, 64.0],
                         egui::Button::new(egui::RichText::new(action_label(primary)).strong())
                             .fill(fill)
-                            .min_size(egui::vec2(180.0, 42.0)),
+                            .wrap(),
                     )
                     .clicked()
                 {
@@ -845,13 +857,13 @@ pub(crate) fn show(ui: &mut egui::Ui, summary: &GameReadinessSummary) -> Option<
             // it cannot run, it is disabled and the headline above says why.
             if summary.primary_action != Some(ReadinessAction::Play) {
                 let blue = crate::ui::theme::blue_profile(ui);
-                let mut play = egui::Button::new(egui::RichText::new("Play").strong())
-                    .min_size(egui::vec2(120.0, 42.0));
+                let mut play = egui::Button::new(egui::RichText::new("Play").strong()).wrap();
                 if blue {
                     play = play.fill(egui::Color32::TRANSPARENT);
                 }
                 let response = ui
-                    .add_enabled(false, play)
+                    .add_enabled_ui(false, |ui| ui.add_sized([slot, 64.0], play))
+                    .inner
                     .on_disabled_hover_text(summary.headline.as_str());
                 // Blue: disabled is dashed; the headline above is the reason.
                 if blue {
@@ -1063,69 +1075,85 @@ pub(crate) fn show_compact(
         break_anywhere: false,
         overflow_character: Some('…'),
     };
-    ui.add(egui::Label::new(reason).selectable(false))
+    ui.add(egui::Label::new(reason).wrap().selectable(false))
         .on_hover_text(view.reason.as_str());
     let gap = ui.spacing().item_spacing.x;
     let fill = crate::ui::theme::primary_action_fill(ui);
     let fix_is_primary = view.fix.is_some() && !view.pending;
     let count = 1 + usize::from(view.fix.is_some());
-    let inline_trailing = trailing.is_some() && width >= (count + 1) as f32 * 100.0;
+    let inline_trailing =
+        trailing.is_some() && width >= (count + 1) as f32 * 144.0 + gap * count as f32;
     let slots = count + usize::from(inline_trailing);
-    let slot = ((width - gap * (slots - 1) as f32) / slots as f32).max(72.0);
+    let stacked = width < count as f32 * 144.0 + gap * (count - 1) as f32;
+    let slot = if stacked {
+        width
+    } else {
+        (width - gap * (slots - 1) as f32) / slots as f32
+    };
+    // Equal height also leaves room for a two-line action label.
+    let action_size = [slot, 64.0];
     let fix_button = |ui: &mut egui::Ui, primary: bool| {
         let fix = view.fix?;
         let mut button = egui::Button::new(egui::RichText::new(action_label(fix)).strong()).wrap();
         if primary {
             button = button.fill(fill);
         }
-        ui.add_sized([slot, 40.0], button)
+        ui.add_sized(action_size, button)
             .on_hover_text(action_label(fix))
             .clicked()
             .then_some(CompactChoice::Action(fix))
     };
     let trailing_button = |ui: &mut egui::Ui, label: &str, width: f32| {
-        ui.add_sized([width, 34.0], egui::Button::new(label).wrap())
+        ui.add_sized([width, 64.0], egui::Button::new(label).wrap())
             .clicked()
             .then_some(CompactChoice::Trailing)
     };
-    ui.horizontal(|ui| {
-        if fix_is_primary && let Some(clicked) = fix_button(ui, true) {
-            choice = Some(clicked);
-        }
-        let mut play = egui::Button::new(egui::RichText::new("Play").strong());
-        if view.play_enabled && !fix_is_primary {
-            play = play.fill(fill);
-        } else if blue {
-            play = play.fill(egui::Color32::TRANSPARENT);
-        }
-        let response = ui
-            .add_enabled_ui(view.play_enabled, |ui| ui.add_sized([slot, 40.0], play))
-            .inner;
-        if view.play_enabled {
-            if response.clicked() {
-                choice = Some(CompactChoice::Action(ReadinessAction::Play));
-            }
+    ui.allocate_ui_with_layout(
+        egui::vec2(width, 0.0),
+        if stacked {
+            egui::Layout::top_down(egui::Align::Min)
         } else {
-            let rect = response.rect;
-            response.on_disabled_hover_text(view.headline.as_str());
-            if blue {
-                crate::ui::components::paint_dashed_outline(
-                    ui.painter(),
-                    rect,
-                    crate::ui::theme::blue::BORDER_STRONG,
-                );
+            egui::Layout::left_to_right(egui::Align::Min)
+        },
+        |ui| {
+            if fix_is_primary && let Some(clicked) = fix_button(ui, true) {
+                choice = Some(clicked);
             }
-        }
-        if !fix_is_primary && let Some(clicked) = fix_button(ui, false) {
-            choice = Some(clicked);
-        }
-        if inline_trailing
-            && let Some(label) = trailing
-            && let Some(clicked) = trailing_button(ui, label, slot)
-        {
-            choice = Some(clicked);
-        }
-    });
+            let mut play = egui::Button::new(egui::RichText::new("Play").strong());
+            if view.play_enabled && !fix_is_primary {
+                play = play.fill(fill);
+            } else if blue {
+                play = play.fill(egui::Color32::TRANSPARENT);
+            }
+            let response = ui
+                .add_enabled_ui(view.play_enabled, |ui| ui.add_sized(action_size, play))
+                .inner;
+            if view.play_enabled {
+                if response.clicked() {
+                    choice = Some(CompactChoice::Action(ReadinessAction::Play));
+                }
+            } else {
+                let rect = response.rect;
+                response.on_disabled_hover_text(view.headline.as_str());
+                if blue {
+                    crate::ui::components::paint_dashed_outline(
+                        ui.painter(),
+                        rect,
+                        crate::ui::theme::blue::BORDER_STRONG,
+                    );
+                }
+            }
+            if !fix_is_primary && let Some(clicked) = fix_button(ui, false) {
+                choice = Some(clicked);
+            }
+            if inline_trailing
+                && let Some(label) = trailing
+                && let Some(clicked) = trailing_button(ui, label, slot)
+            {
+                choice = Some(clicked);
+            }
+        },
+    );
     if !inline_trailing
         && let Some(label) = trailing
         && let Some(clicked) = trailing_button(ui, label, width)

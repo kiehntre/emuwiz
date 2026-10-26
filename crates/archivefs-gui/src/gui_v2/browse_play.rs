@@ -37,7 +37,7 @@ const LIST_COVER_SIZE: egui::Vec2 = egui::vec2(52.0, 68.0);
 const SELECTED_COVER_SIZE: egui::Vec2 = egui::vec2(150.0, 196.0);
 const COMPACT_COVER_SIZE: egui::Vec2 = egui::vec2(70.0, 92.0);
 /// Below this width the selected-game panel becomes a strip above the shelf.
-const SIDE_BY_SIDE_MIN_WIDTH: f32 = 900.0;
+const SIDE_BY_SIDE_MIN_WIDTH: f32 = 1100.0;
 /// Narrowest the Library search field is allowed to become before the
 /// List/Grid switch moves to its own row.
 const SEARCH_MIN_WIDTH: f32 = 140.0;
@@ -47,6 +47,15 @@ const TIGHT_PANEL_HEIGHT: f32 = 440.0;
 /// The shortest body the Library lays itself out in; a shorter window scrolls
 /// the page to it rather than squeezing the shelf and the selected game.
 pub(super) const MIN_BODY_HEIGHT: f32 = 300.0;
+/// A compact selection needs space for its strip and a reachable shelf.
+pub(super) fn minimum_body_height(width: f32, selected: bool) -> f32 {
+    if selected && width < SIDE_BY_SIDE_MIN_WIDTH {
+        520.0
+    } else {
+        MIN_BODY_HEIGHT
+    }
+}
+
 const ATTENTION_TEXT: Color32 = Color32::from_rgb(232, 170, 62);
 /// How long a selection must stay put before its readiness check starts, so
 /// moving quickly through the shelf reads no game files.
@@ -226,7 +235,7 @@ fn status_line(game: &Game, width: f32, blue: bool) -> egui::text::LayoutJob {
     job.wrap = egui::text::TextWrapping {
         max_width: width,
         max_rows: 1,
-        break_anywhere: true,
+        break_anywhere: false,
         overflow_character: Some('…'),
     };
     job
@@ -744,11 +753,27 @@ impl App {
             );
             self.note_cover_problem(game, note);
             child.add_space(6.0);
-            child.add(
-                egui::Label::new(two_line_title(&game.title, inner.width())).selectable(false),
+            // Reserve two rows even for a short title: metadata aligns across
+            // the shelf while covers and placeholders keep identical bounds.
+            child.allocate_ui_with_layout(
+                egui::vec2(inner.width(), 42.0),
+                egui::Layout::top_down(egui::Align::Min),
+                |ui| {
+                    ui.set_min_height(42.0);
+                    ui.add(
+                        egui::Label::new(two_line_title(&game.title, inner.width()))
+                            .wrap()
+                            .show_tooltip_when_elided(false)
+                            .selectable(false),
+                    );
+                },
             );
             let blue = theme::blue_profile(&child);
-            child.add(egui::Label::new(status_line(game, inner.width(), blue)).selectable(false));
+            child.add(
+                egui::Label::new(status_line(game, inner.width(), blue))
+                    .wrap()
+                    .selectable(false),
+            );
             let response = response
                 .on_hover_cursor(egui::CursorIcon::PointingHand)
                 .on_hover_text(format!("{}\n{}", game.title, game.platform));
@@ -797,7 +822,11 @@ impl App {
                     .selectable(false),
                 );
                 let blue = theme::blue_profile(ui);
-                ui.add(egui::Label::new(status_line(game, text_width, blue)).selectable(false));
+                ui.add(
+                    egui::Label::new(status_line(game, text_width, blue))
+                        .wrap()
+                        .selectable(false),
+                );
             });
             let response = response.on_hover_cursor(egui::CursorIcon::PointingHand);
             if response.clicked() {
@@ -826,13 +855,50 @@ impl App {
                     // A short panel keeps the small cover and puts Play beside
                     // it, so Play is on screen without scrolling.
                     let tight = compact || ui.available_height() < TIGHT_PANEL_HEIGHT;
-                    let cover = if tight {
+                    let cover = if tight || inner < 420.0 {
                         COMPACT_COVER_SIZE
                     } else {
                         SELECTED_COVER_SIZE
                     };
                     let text_width = (inner - cover.x - gap).max(120.0);
                     let heading = |this: &mut Self, ui: &mut egui::Ui| {
+                        // In a short, narrow window title and actions share a strip.
+                        // Stacking every piece would put Play below the footer.
+                        if compact && inner >= 600.0 {
+                            let remaining = inner - cover.x - gap * 2.0;
+                            let title_width = remaining * 0.38;
+                            let action_width = remaining - title_width;
+                            ui.horizontal_top(|ui| {
+                                this.picture_tile(ui, game, Kind::Cover, cover);
+                                ui.allocate_ui_with_layout(
+                                    egui::vec2(title_width, 0.0),
+                                    egui::Layout::top_down(egui::Align::Min),
+                                    |ui| {
+                                        super::title_fit::title_label(
+                                            ui,
+                                            &game.title,
+                                            theme::TextRole::CardTitle,
+                                            2,
+                                        );
+                                        ui.add(
+                                            egui::Label::new(status_line(
+                                                game,
+                                                title_width,
+                                                theme::blue_profile(ui),
+                                            ))
+                                            .wrap()
+                                            .selectable(false),
+                                        );
+                                    },
+                                );
+                                ui.allocate_ui_with_layout(
+                                    egui::vec2(action_width, 0.0),
+                                    egui::Layout::top_down(egui::Align::Min),
+                                    |ui| Self::play_row(this, ui, game, action_width, true),
+                                );
+                            });
+                            return;
+                        }
                         ui.horizontal_top(|ui| {
                             this.picture_tile(ui, game, Kind::Cover, cover);
                             ui.vertical(|ui| {
@@ -848,6 +914,7 @@ impl App {
                                     // One line, so Play stays above the fold.
                                     ui.add(
                                         egui::Label::new(status_line(game, text_width, blue))
+                                            .wrap()
                                             .selectable(false),
                                     );
                                 } else {

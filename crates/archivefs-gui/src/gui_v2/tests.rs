@@ -1,5 +1,8 @@
 use super::*;
 
+#[path = "tests/visual_polish.rs"]
+mod visual_polish;
+
 #[path = "tests/page_reachability.rs"]
 pub(super) mod page_reachability;
 use super::{

@@ -140,6 +140,19 @@ fn unix_label(value: Option<i64>) -> String {
 
 /// Renders the page; returns where to go when an Open button was pressed.
 pub(super) fn show(ui: &mut egui::Ui, state: &mut NeedsAttentionState) -> Option<Route> {
+    // Bound reading distance on desktop displays without widening compact pages.
+    ui.allocate_ui_with_layout(
+        egui::vec2(ui.available_width().min(1400.0), 0.0),
+        egui::Layout::top_down(egui::Align::Min),
+        |ui| {
+            ui.set_width(ui.available_width().min(1400.0));
+            show_content(ui, state)
+        },
+    )
+    .inner
+}
+
+fn show_content(ui: &mut egui::Ui, state: &mut NeedsAttentionState) -> Option<Route> {
     let mut go = None;
     if !state.loaded {
         ui.horizontal(|ui| {
@@ -166,7 +179,7 @@ pub(super) fn show(ui: &mut egui::Ui, state: &mut NeedsAttentionState) -> Option
     let wide = ui.available_width() >= SIDE_BY_SIDE_MIN_WIDTH;
     if wide {
         let gap = 20.0;
-        let right = (ui.available_width() * 0.32).clamp(340.0, 560.0);
+        let right = (ui.available_width() * 0.32).clamp(380.0, 460.0);
         let left = ui.available_width() - right - gap;
         ui.horizontal_top(|ui| {
             ui.spacing_mut().item_spacing.x = gap;
@@ -190,7 +203,14 @@ pub(super) fn show(ui: &mut egui::Ui, state: &mut NeedsAttentionState) -> Option
     } else {
         go = list(ui, state);
         ui.add_space(theme::SPACE_SM);
-        side_panels(ui, state);
+        ui.allocate_ui_with_layout(
+            egui::vec2(ui.available_width().min(760.0), 0.0),
+            egui::Layout::top_down(egui::Align::Min),
+            |ui| {
+                ui.set_width(ui.available_width().min(760.0));
+                side_panels(ui, state);
+            },
+        );
     }
     go
 }
@@ -500,7 +520,7 @@ fn side_panels(ui: &mut egui::Ui, state: &NeedsAttentionState) {
         .selected
         .as_ref()
         .and_then(|id| state.snapshot.items().find(|item| &item.id == id));
-    super::game_detail_blue::side_card(ui, "EVIDENCE AND RECOVERY DETAILS", |ui| {
+    super::game_detail_blue::side_card(ui, "Evidence and recovery details", |ui| {
         let Some(item) = selected else {
             ui.label(
                 RichText::new("Choose an item to see its evidence.").color(palette::SECONDARY_TEXT),
@@ -509,7 +529,14 @@ fn side_panels(ui: &mut egui::Ui, state: &NeedsAttentionState) {
         };
         // Plain rows, not a Grid: wrapped values in a Grid size their column
         // to the text and push the page wider than the window.
+        let stacked = ui.available_width() < 360.0;
         let mut row = |label: &str, value: String| {
+            if stacked {
+                ui.label(RichText::new(label).color(blue::SECONDARY_TEXT));
+                ui.add(egui::Label::new(RichText::new(value).color(blue::BODY_TEXT)).wrap());
+                ui.add_space(theme::SPACE_XS);
+                return;
+            }
             ui.horizontal_top(|ui| {
                 let label_width = 140.0_f32.min(ui.available_width() * 0.4);
                 ui.allocate_ui_with_layout(
@@ -553,11 +580,11 @@ fn side_panels(ui: &mut egui::Ui, state: &NeedsAttentionState) {
             RichText::new(format!(
                 "Times are Unix seconds; unknown is not inferred. {READ_ONLY_NOTE}"
             ))
-            .size(13.0)
-            .color(blue::DIM_TEXT),
+            .size(15.0)
+            .color(blue::SECONDARY_TEXT),
         );
     });
-    super::game_detail_blue::side_card(ui, "COVERAGE AND FRESHNESS", |ui| {
+    super::game_detail_blue::side_card(ui, "Coverage and freshness", |ui| {
         let snapshot = &state.snapshot;
         ui.label(
             RichText::new(format!(
@@ -724,8 +751,8 @@ mod tests {
             "2 unresolved",
             "Title a",
             "Title b",
-            "EVIDENCE AND RECOVERY DETAILS",
-            "COVERAGE AND FRESHNESS",
+            "Evidence and recovery details",
+            "Coverage and freshness",
             "Open DAT Management",
             "Open History",
         ] {

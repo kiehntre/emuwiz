@@ -66,7 +66,12 @@ pub(super) fn title_label(
         break_anywhere: false,
         overflow_character: Some('…'),
     };
-    let response = ui.add(egui::Label::new(job).sense(egui::Sense::hover()));
+    let response = ui.add(
+        egui::Label::new(job)
+            .wrap()
+            .show_tooltip_when_elided(false)
+            .sense(egui::Sense::hover()),
+    );
     response.on_hover_text(text)
 }
 
