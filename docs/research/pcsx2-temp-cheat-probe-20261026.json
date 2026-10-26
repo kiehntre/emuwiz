@@ -1,0 +1,32 @@
+{
+  "production_support": "UNSUPPORTED_PENDING_PRESERVATION_PROOF",
+  "in_game_effect": "NOT CONFIRMED",
+  "missing_proof": [
+    "RealUserDataUntouched: no real memory-card/save routing exercise",
+    "RealConfigurationUnchanged: no production-root before/after comparison",
+    "PatchBehaviourPreserved: no normal-versus-staged game baseline",
+    "SandboxSawRealUserFolders: real user-folder routing was not exercised",
+    "Production staging, crash recovery and Blue handoff have not been validated"
+  ],
+  "flatpak_deployment": "f8162e3d6b0ce75f54d0e10605d368b3678fda969bb1e806277500156c85fa10",
+  "configuration_probe": {
+    "exit_code": 0,
+    "bounded_stop": false,
+    "instance": "829194035",
+    "instance_absent_after_stop": true,
+    "filesystem_grants_verified": true
+  },
+  "bios_sha256": "87f6b61cf51876f676f4962e94cf68c250b90a93b09d28a9b5d54d0a531f439f",
+  "fixture_crc": "76E7FB84",
+  "boot_probe": {
+    "exit_code": -15,
+    "bounded_stop": true,
+    "instance": "61955206",
+    "instance_absent_after_stop": true,
+    "filesystem_grants_verified": true
+  },
+  "data_root_observed": true,
+  "cheats_folder_observed": true,
+  "pnach_consumption_observed": true,
+  "named_cheat_enabled_observed": true
+}

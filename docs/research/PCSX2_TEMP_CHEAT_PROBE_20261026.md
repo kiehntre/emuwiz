@@ -56,6 +56,11 @@ The display-assisted run reported:
 | Normal exit / crash / interrupted launch recovery | **NOT VALIDATED** |
 | Production support | **UNSUPPORTED_PENDING_PRESERVATION_PROOF** |
 
+The [machine-readable report](pcsx2-temp-cheat-probe-20261026.json) records
+the corrected probe's two exact instance IDs, filesystem-context verification,
+and their observed absence after stopping. Raw local evidence is retained at
+`/tmp/emuwiz-pcsx2-probe-y_2dpfcm` on the test host.
+
 The probe is stopped after a bounded observation period. A stopped synthetic
 run is not a normal-exit test. Evidence directories are deliberately retained;
 this probe does not claim canonical-runtime cleanup or recovery coverage.
@@ -79,6 +84,17 @@ The private directory, raw logs and JSON report are printed. The report
 always withholds production support, including when loading and enablement
 are observed. It is evidence for a human review, never a proof token accepted
 by Core or the GUI.
+
+Independent review of the initial candidate found that a host process-group
+stop could leave Flatpak helpers listed, and that `--nofilesystem=host` plus
+`--nofilesystem=home` retained inherited `/mnt` grants. The corrected probe
+uses `--die-with-parent`, captures `--instance-id-fd`, stops/verifies only
+that instance, applies `--nofilesystem=host:reset`, and refuses unexpected
+filesystem grants in the live instance context. Earlier probe instances were
+stopped only after their metadata proved this job's private root. Flatpak's
+intrinsic app storage is not a user filesystem grant: the probe's HOME/XDG
+overrides and explicit data path remain necessary. No claim of a complete
+production-root integrity audit is made.
 
 ## Preservation defect found and corrected
 

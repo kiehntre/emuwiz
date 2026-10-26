@@ -20,6 +20,7 @@ import stat
 import struct
 import subprocess
 import tempfile
+import time
 
 
 APP_ID = "net.pcsx2.PCSX2"
@@ -27,7 +28,7 @@ MISSING_PROOF = [
     "RealUserDataUntouched: no real memory-card/save routing exercise",
     "RealConfigurationUnchanged: no production-root before/after comparison",
     "PatchBehaviourPreserved: no normal-versus-staged game baseline",
-    "SandboxSawRealUserFolders: only disposable folders were exposed",
+    "SandboxSawRealUserFolders: real user-folder routing was not exercised",
     "Production staging, crash recovery and Blue handoff have not been validated",
 ]
 
@@ -61,29 +62,92 @@ def observations(log, root, crc):
     }
 
 
-def run_bounded(command, output, env, timeout):
-    # Files avoid PIPE deadlock; a bounded probe is allowed to stop only its
-    # own synthetic emulator. Evidence stays on disk even after interruption.
-    with output.open("xb") as stream:
-        process = subprocess.Popen(command, stdout=stream, stderr=subprocess.STDOUT,
-                                   env=env, start_new_session=True)
+def flatpak_instances(binary, env):
+    result = subprocess.run([binary, "ps", "--columns=instance"], env=env,
+                            capture_output=True, text=True, timeout=5, check=True)
+    return set(result.stdout.split())
+
+
+def stop_instance(binary, instance, env):
+    if not instance.isdecimal() or len(instance) > 20:
+        raise ValueError("Flatpak returned an invalid instance ID; no broad stop attempted")
+    if instance in flatpak_instances(binary, env):
+        subprocess.run([binary, "kill", instance], env=env, capture_output=True, timeout=5)
+    deadline = time.monotonic() + 5
+    while instance in flatpak_instances(binary, env):
+        if time.monotonic() >= deadline:
+            raise ValueError(f"probe instance {instance} is still listed; cleanup NOT CONFIRMED")
+        time.sleep(0.1)
+
+
+def capture_context(instance, workspace, output, env):
+    if not instance.isdecimal() or len(instance) > 20:
+        raise ValueError("Flatpak returned an invalid instance ID")
+    runtime = Path(env.get("XDG_RUNTIME_DIR", f"/run/user/{os.getuid()}"))
+    info = runtime / ".flatpak" / instance / "info"
+    with os.fdopen(os.open(info, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK), "rb") as stream:
+        metadata = os.fstat(stream.fileno())
+        if not stat.S_ISREG(metadata.st_mode) or metadata.st_size > 64 * 1024:
+            raise ValueError("Flatpak context is not a bounded regular file")
+        data = stream.read(64 * 1024 + 1)
+    if len(data) > 64 * 1024:
+        raise ValueError("Flatpak context grew beyond its size bound")
+    context = configparser.ConfigParser(interpolation=None)
+    context.read_string(data.decode())
+    grants = context.get("Context", "filesystems", fallback="").split(";")
+    grants = [grant for grant in grants if grant and not grant.startswith("!")]
+    with output.with_suffix(".context.json").open("x") as stream:
+        json.dump({"filesystem_grants": grants}, stream, indent=2)
+    if set(grants) not in ({str(workspace)}, {str(workspace) + ":rw"}):
+        raise ValueError("sandbox retained unexpected filesystem grants; boot refused")
+
+
+def run_bounded(command, output, env, timeout, workspace=None):
+    # Flatpak children can leave the host launcher's process group. The FD
+    # binds cleanup to this exact instance, never an app-wide `flatpak kill`.
+    instance_path = output.with_suffix(".instance")
+    with output.open("xb") as stream, instance_path.open("xb") as instance_stream:
+        descriptor = instance_stream.fileno()
+        invocation = command[:2] + ["--die-with-parent", f"--instance-id-fd={descriptor}"] + command[2:]
+        process = subprocess.Popen(invocation, stdout=stream, stderr=subprocess.STDOUT,
+                                   env=env, pass_fds=(descriptor,), start_new_session=True)
         timed_out = False
+        instance = ""
         try:
+            if workspace is not None:
+                deadline = time.monotonic() + 2
+                while not instance_path.read_text().strip() and time.monotonic() < deadline:
+                    if process.poll() is not None:
+                        break
+                    time.sleep(.02)
+                instance = instance_path.read_text().strip()
+                capture_context(instance, workspace, output, env)
             try:
-                code = process.wait(timeout=timeout)
+                process.wait(timeout=timeout)
             except subprocess.TimeoutExpired:
                 timed_out = True
-                os.killpg(process.pid, signal.SIGTERM)
-                try:
-                    code = process.wait(timeout=5)
-                except subprocess.TimeoutExpired:
-                    os.killpg(process.pid, signal.SIGKILL)
-                    code = process.wait(timeout=5)
         finally:
-            if process.poll() is None:
-                os.killpg(process.pid, signal.SIGKILL)
-                process.wait(timeout=5)
-    return {"exit_code": code, "bounded_stop": timed_out}
+            try:
+                instance = instance_path.read_text().strip()
+                if instance:
+                    stop_instance(command[0], instance, env)
+            finally:
+                if process.poll() is None:
+                    os.killpg(process.pid, signal.SIGTERM)
+                    try:
+                        process.wait(timeout=3)
+                    except subprocess.TimeoutExpired:
+                        os.killpg(process.pid, signal.SIGKILL)
+                        process.wait(timeout=3)
+                # Recheck after the host has exited as well. Missing IDs are
+                # not evidence of cleanup and must never become a success.
+                if instance:
+                    stop_instance(command[0], instance, env)
+    if not instance:
+        raise ValueError("Flatpak returned no instance ID; lifecycle NOT CONFIRMED")
+    return {"exit_code": process.returncode, "bounded_stop": timed_out,
+            "instance": instance, "instance_absent_after_stop": True,
+            "filesystem_grants_verified": workspace is not None}
 
 
 def copy_bios(source, target):
@@ -122,7 +186,7 @@ def probe(bios, use_display=False):
             (root / name).mkdir(mode=0o700)
         private_env = {**os.environ}
         command = [flatpak, "run", "--nosocket=wayland",
-                   "--nofilesystem=host", "--nofilesystem=home", f"--filesystem={root}",
+                   "--nofilesystem=host:reset", f"--filesystem={root}",
                    f"--env=QT_QPA_PLATFORM={'xcb' if use_display else 'offscreen'}"]
         if use_display:
             if not private_env.get("DISPLAY"):
@@ -135,7 +199,7 @@ def probe(bios, use_display=False):
             command.append(f"--env={variable}={root / folder}")
         command += [APP_ID, "-datapath", str(root / "stage"), "-earlyconsolelog"]
         report["configuration_probe"] = run_bounded(
-            command + ["-testconfig"], root / "configuration.log", private_env, 15)
+            command + ["-testconfig"], root / "configuration.log", private_env, 15, root)
         data_root = root / "stage" / "PCSX2"
         configuration = data_root / "inis" / "PCSX2.ini"
         if report["configuration_probe"]["exit_code"] != 0 or not configuration.is_file():
@@ -173,7 +237,7 @@ def probe(bios, use_display=False):
             "[EMUWIZ Probe]\npatch=1,EE,00110000,word,12345678\n")
         report["boot_probe"] = run_bounded(
             command + ["-logfile", str(root / "emulog.txt"), "-nogui", "-elf", str(root / "probe.elf")],
-            root / "boot.log", private_env, 10)
+            root / "boot.log", private_env, 10, root)
         log = (root / "boot.log").read_text(errors="replace")
         if (root / "emulog.txt").is_file():
             log += "\n" + (root / "emulog.txt").read_text(errors="replace")
