@@ -202,4 +202,137 @@ class LifecycleSafety(I.Immediate):
             self.assertGreater(census([]).unreadable_foreign, 0)
 
 
+    def census_of_one_pid(self, *, scan, exists, start, **patches):
+        """Census over exactly one fake PID 4242 (root-owned, user-space command line)."""
+        import test_emuwiz_cargo_maintain as M
+        cls = M.load_maintain().F.Census
+        census = cls.__new__(cls)
+        census.skip_pids, census.unreadable_foreign, census.examined = frozenset(), 0, 0
+        census.pids_seen, census.refs = set(), {}
+        with patch('os.listdir', return_value=['4242']), \
+                patch('os.stat', return_value=type('S', (), {'st_uid': 0})()), \
+                patch.object(cls, 'scan', side_effect=scan), patch.object(cls, 'is_userspace', return_value=True), \
+                patch.object(cls, 'start_time', side_effect=start), patch('os.path.exists', side_effect=exists), \
+                patch.object(cls, 'EXIT_SETTLE', (0, 0, 0)):
+            census._scan_all(0)
+        return census
+
+    def test_process_exiting_during_inspection_is_not_a_gap(self):
+        # Short-lived processes ending mid-scan were counted as unreadable
+        # (INCOMPLETE_PROCESS_VISIBILITY) while a retirement ran on a busy host.
+        census = self.census_of_one_pid(scan=lambda *a: False, exists=[True, True, False], start=lambda b: 100)
+        self.assertEqual(census.unreadable_foreign, 0)
+        self.assertEqual(census.examined, 1)
+
+    def test_process_that_stays_unreadable_is_still_a_gap(self):
+        census = self.census_of_one_pid(scan=lambda *a: False, exists=lambda p: True, start=lambda b: 100)
+        self.assertEqual(census.unreadable_foreign, 1)
+
+    def test_start_time_that_cannot_be_compared_is_a_gap(self):
+        census = self.census_of_one_pid(scan=lambda *a: False, exists=lambda p: True, start=lambda b: None)
+        self.assertEqual(census.unreadable_foreign, 1)
+
+    def test_reused_pid_is_inspected_again_not_assumed_gone(self):
+        times = iter([100, 200, 200])  # first scan saw start 100; the PID now names start 200
+        scans = iter([False, True])
+        calls = []
+        census = self.census_of_one_pid(scan=lambda *a: calls.append(a) or next(scans), exists=lambda p: True,
+                                        start=lambda b: next(times))
+        self.assertEqual(len(calls), 2, 'the process now holding the PID must be scanned itself')
+        self.assertEqual(census.unreadable_foreign, 0)
+
+    def test_reused_pid_whose_new_process_is_unreadable_is_a_gap(self):
+        starts = iter(range(100, 1000, 100))
+        census = self.census_of_one_pid(scan=lambda *a: False, exists=lambda p: True, start=lambda b: next(starts))
+        self.assertEqual(census.unreadable_foreign, 1)
+
+    def test_pid_reused_over_and_over_is_a_gap(self):
+        starts = iter(range(1, 1000))
+        census = self.census_of_one_pid(scan=lambda *a: False, exists=lambda p: True, start=lambda b: next(starts))
+        self.assertEqual(census.unreadable_foreign, 1)
+
+    def test_process_lookup_error_on_inode_check_means_exited(self):
+        import test_emuwiz_cargo_maintain as M
+        census = M.load_maintain().F.Census.__new__(M.load_maintain().F.Census)
+        census._inode_refs, census._owner_inode_retries, census.unreadable_foreign = [], [], 0
+        with patch('os.stat', side_effect=ProcessLookupError):
+            census.note_inode('/proc/123/fd/3', 123, 'fd')
+        self.assertEqual(census.unreadable_foreign, 0)
+        with patch('os.stat', side_effect=PermissionError):
+            census.note_inode('/proc/123/fd/3', 123, 'fd')
+        self.assertEqual(census.unreadable_foreign, 1)
+        with patch('os.stat', side_effect=OSError):
+            census.note_inode('/proc/123/fd/3', 123, 'fd')
+        self.assertEqual(census.unreadable_foreign, 2)
+
+    def test_real_start_time_names_this_process_and_pid_one_differs(self):
+        import test_emuwiz_cargo_maintain as M
+        cls = M.load_maintain().F.Census
+        mine, other = cls.start_time('/proc/self'), cls.start_time('/proc/1')
+        self.assertIsInstance(mine, int)
+        self.assertNotEqual(mine, other)
+        self.assertIsNone(cls.start_time('/proc/999999999'))
+
+    def test_new_process_holding_the_cache_is_still_found_incrementally(self):
+        import test_emuwiz_cargo_maintain as M
+        cls = M.load_maintain().F.Census
+        import tempfile
+        with tempfile.TemporaryDirectory() as root:
+            target = os.path.join(root, 't')
+            os.mkdir(target)
+            known = cls([target])
+            holder = subprocess.Popen([sys.executable, '-I', '-c', 'import time;time.sleep(30)'], cwd=target)
+            try:
+                latest = cls([target], skip_pids=known.pids_seen)
+                self.assertTrue(any(r['pid'] == holder.pid for r in latest.refs.get(target, [])))
+            finally:
+                holder.kill()
+                holder.wait()
+
+
+    def test_no_waiting_once_the_census_is_already_incomplete(self):
+        import test_emuwiz_cargo_maintain as M
+        cls = M.load_maintain().F.Census
+        census = cls.__new__(cls)
+        census.unreadable_foreign = 1
+        with patch.object(cls, 'scan', return_value=False), patch.object(cls, 'is_userspace', return_value=True), \
+                patch('os.path.exists', return_value=True), patch.object(cls, 'start_time', return_value=5), \
+                patch('time.sleep') as sleep:
+            census.inspect(4242, '/proc/4242', False)
+        sleep.assert_not_called()
+        self.assertEqual(census.unreadable_foreign, 2)
+
+    def test_settle_budget_is_bounded_and_then_fails_closed(self):
+        import test_emuwiz_cargo_maintain as M
+        cls = M.load_maintain().F.Census
+        census = cls.__new__(cls)
+        census.unreadable_foreign = 0
+        census._settled = cls.SETTLE_BUDGET
+        with patch.object(cls, 'scan', return_value=False), patch.object(cls, 'is_userspace', return_value=True), \
+                patch('os.path.exists', return_value=True), patch.object(cls, 'start_time', return_value=5), \
+                patch('time.sleep') as sleep:
+            census.inspect(4242, '/proc/4242', False)
+        sleep.assert_not_called()
+        self.assertEqual(census.unreadable_foreign, 1)
+
+    def test_process_without_readable_start_time_that_vanishes_is_gone(self):
+        census = self.census_of_one_pid(scan=lambda *a: False, exists=[True, True, False], start=lambda b: None)
+        self.assertEqual(census.unreadable_foreign, 0)
+
+    def test_references_noted_before_the_process_vanished_are_kept(self):
+        def scan(census_self, pid, base, same_user):
+            census_self.refs.setdefault('/t', []).append({'pid': pid, 'comm': 'x', 'kind': 'cwd'})
+            return False
+        import test_emuwiz_cargo_maintain as M
+        cls = M.load_maintain().F.Census
+        census = cls.__new__(cls)
+        census.unreadable_foreign, census.refs = 0, {}
+        with patch.object(cls, 'scan', autospec=True, side_effect=scan), patch.object(cls, 'is_userspace', return_value=True), \
+                patch('os.path.exists', side_effect=[True, False]), patch.object(cls, 'start_time', return_value=7), \
+                patch.object(cls, 'EXIT_SETTLE', (0,)):
+            census.inspect(4242, '/proc/4242', False)
+        self.assertEqual(census.unreadable_foreign, 0)
+        self.assertEqual(len(census.refs['/t']), 1)
+
+
 if __name__ == '__main__': unittest.main()

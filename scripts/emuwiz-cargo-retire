@@ -239,6 +239,7 @@ def parse_iso(text):
 SNAPSHOT_LIMIT = 1_000_000
 JOURNAL_MAX_PATHS = 20_000
 FULL_CENSUS_INTERVAL = 2.0  # seconds between complete process censuses while unlinking
+RESERVED_PIDS = 300  # the kernel's cyclic PID allocator wraps back to this value
 JOURNAL_SUFFIX = ".journal.jsonl"
 
 
@@ -1663,6 +1664,74 @@ def hold_all(entry, out, code):
     return out
 
 
+def read_fork_state():
+    """(allocator cursor, forks since boot, pid_max) from the kernel, or None when any is unreadable.
+
+    Forks are read first and the cursor second: the cursor is never behind the fork count."""
+    try:
+        with open("/proc/stat") as handle:
+            forks = next(int(line.split()[1]) for line in handle if line.startswith("processes "))
+        with open("/proc/sys/kernel/ns_last_pid") as handle:
+            cursor = int(handle.read())
+        with open("/proc/sys/kernel/pid_max") as handle:
+            pid_max = int(handle.read())
+    except (OSError, ValueError, StopIteration, IndexError):
+        return None
+    return (cursor, forks, pid_max) if 0 < cursor < pid_max else None
+
+
+def pid_snapshot():
+    """(PIDs alive, allocator state), the PID listing taken first."""
+    try:
+        alive = {int(name) for name in os.listdir("/proc") if name.isdigit()}
+    except OSError:
+        alive = set()
+    return alive, read_fork_state()
+
+
+class PidReuseGuard:
+    """Proves that no PID inspected by the last full census can have been recycled since, so
+    the incremental census may skip it by number.  A new process only receives a number the
+    kernel's cyclic allocator reaches, so while the allocator cursor (ns_last_pid) has not
+    wrapped and has not reached the nearest PID that was alive when the baseline was taken,
+    no such number was handed out.  The cursor moves for every PID taken, including thread
+    IDs and forks that later failed.  The fork counter is only a backstop for a full lap."""
+
+    def __init__(self):
+        self.baseline = None
+        self.limit = None  # nearest PID above the cursor that was alive at the baseline
+
+    def arm(self, alive, before):
+        """`alive`, `before`: pid_snapshot() taken BEFORE the census listed /proc."""
+        self.baseline = before
+        self.limit = None
+        if before is not None:
+            ahead = [pid for pid in alive if pid > before[0]]
+            self.limit = min(ahead) if ahead else None
+
+    def safe(self):
+        now = read_fork_state()
+        base = self.baseline
+        if now is None or base is None or now[2] != base[2]:
+            return False
+        if now[0] < base[0]:
+            return False  # the allocator wrapped: numbers can be recycled
+        if self.limit is not None and now[0] >= self.limit:
+            return False
+        return 0 <= now[1] - base[1] < base[2] // 2
+
+
+PID_REUSE_CENSUS_ATTEMPTS = 5
+
+
+def pid_reuse_detail(attempts):
+    if read_fork_state() is None:
+        return ("PID allocator state (/proc/sys/kernel/ns_last_pid, /proc/stat, pid_max) is unreadable; "
+                "cannot prove that no inspected PID was recycled")
+    return (f"cannot prove that no inspected PID was recycled during the census: the PID allocator "
+            f"wrapped or reached an inspected PID in each of {attempts} attempts")
+
+
 def execute_group(entry, selected, out, journal, identities=None, mutation_guard=None):
     group = entry["group"]
     target = group["directory"]
@@ -1692,11 +1761,18 @@ def execute_group(entry, selected, out, journal, identities=None, mutation_guard
             rel = os.path.relpath(item["path"], target).split("/")
             hook("before-entry:" + item["path"])
             # Selection/snapshot may take time: recheck live use at mutation boundary.
-            fresh = F.Census([target] + entry["sources"])
+            reuse = PidReuseGuard()
+            for _attempt in range(PID_REUSE_CENSUS_ATTEMPTS):
+                alive_before, fork_before = pid_snapshot()
+                fresh = F.Census([target] + entry["sources"])
+                reuse.arm(alive_before, fork_before)
+                proven = reuse.safe()
+                if proven:
+                    break
             fresh.match_inodes(identities or set(), target)
             refs = any(fresh.refs.values())
             mounts = F.mountinfo()
-            code = ("INCOMPLETE_PROCESS_VISIBILITY" if fresh.unreadable_foreign else
+            code = ("INCOMPLETE_PROCESS_VISIBILITY" if fresh.unreadable_foreign or not proven else
                     "LIVE_PROCESS_REFERENCE" if refs else
                     "MOUNT_VISIBILITY_UNKNOWN" if not mounts else
                     "CONTAINS_MOUNT_POINT" if any(m == target or m.startswith(target + "/") for m, _ in mounts) else None)
@@ -1712,7 +1788,7 @@ def execute_group(entry, selected, out, journal, identities=None, mutation_guard
                     current = {int(p) for p in os.listdir("/proc") if p.isdigit()}
                 except OSError as error:
                     raise Refusal("INCOMPLETE_PROCESS_VISIBILITY", str(error)) from error
-                stale = time.monotonic() - full_at >= FULL_CENSUS_INTERVAL
+                stale = time.monotonic() - full_at >= FULL_CENSUS_INTERVAL or not reuse.safe()
                 if not stale and not current - known_pids:
                     return True
                 if check_only:
@@ -1722,11 +1798,30 @@ def execute_group(entry, selected, out, journal, identities=None, mutation_guard
                 # second on a busy host.  The root listing inside Census decides what is
                 # new, and a full census still runs at least every FULL_CENSUS_INTERVAL so
                 # already-seen processes that later touch the target are caught too.
-                latest = F.Census([target] + entry["sources"], skip_pids=None if stale else known_pids)
+                proven = False
+                for _attempt in range(PID_REUSE_CENSUS_ATTEMPTS):
+                    alive_before, fork_before = pid_snapshot()
+                    latest = F.Census([target] + entry["sources"], skip_pids=None if stale else known_pids)
+                    if not stale:
+                        if reuse.safe():  # skipping stayed valid while the census ran
+                            proven = True
+                            break
+                        stale = True  # a PID may have been recycled meanwhile: inspect everything
+                        continue
+                    reuse.arm(alive_before, fork_before)
+                    proven = reuse.safe()
+                    if proven:
+                        break
                 latest.match_inodes(identities or set(), target)
                 known_pids = set(latest.pids_seen)
                 if stale:
                     full_at = time.monotonic()
+                if not proven:
+                    # Cannot prove no inspected PID was recycled while the census ran
+                    # (allocator unreadable, wrapped, or crossed an inspected PID every time).
+                    detail = pid_reuse_detail(PID_REUSE_CENSUS_ATTEMPTS)
+                    out["holds"].append({"code": "INCOMPLETE_PROCESS_VISIBILITY", "detail": detail})
+                    raise Refusal("INCOMPLETE_PROCESS_VISIBILITY", detail)
                 code = ("INCOMPLETE_PROCESS_VISIBILITY" if latest.unreadable_foreign else
                         "LIVE_PROCESS_REFERENCE" if any(latest.refs.values()) else None)
                 if code:
