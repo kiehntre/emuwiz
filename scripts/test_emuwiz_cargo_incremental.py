@@ -271,41 +271,47 @@ class PidReuse(R.Base):
     """The incremental census skips PIDs it already inspected, by number.  That is only sound
     while the kernel cannot have recycled one of those numbers."""
 
-    def test_budget_is_the_distance_to_the_nearest_inspected_pid(self):
-        budget = self.mod.pid_reuse_budget
-        self.assertEqual(budget({50, 150, 160}, (100, 0, 1000)), 50)
-        self.assertEqual(budget({160}, (100, 0, 1000)), 60)
-        self.assertEqual(budget({101}, (100, 0, 1000)), 1)
-        self.assertEqual(budget({101, 102, 103}, (100, 0, 1000)), 1)
-        self.assertEqual(budget({500}, (100, 0, 1000)), 400)
-        self.assertEqual(budget({500}, (800, 0, 1000)), 200 + 200)
-        self.assertEqual(budget(set(), (100, 0, 1000)), 1000)
+    def guard(self, alive, before):
+        guard = self.mod.PidReuseGuard()
+        guard.arm(alive, before)
+        return guard
 
-    def test_budget_is_zero_when_the_allocator_cannot_be_read(self):
-        self.assertEqual(self.mod.pid_reuse_budget({1000}, None), 0)
+    def safe_with(self, guard, state):
+        from unittest.mock import patch
+        with patch.object(self.mod, "read_fork_state", return_value=state):
+            return guard.safe()
+
+    def test_guard_is_safe_only_while_the_allocator_has_not_reached_an_inspected_pid(self):
+        guard = self.guard({50, 150, 160}, (100, 1000, 1000))
+        for state, expected, why in (
+                ((100, 1000, 1000), True, "nothing happened"),
+                ((149, 1000, 1000), True, "just below the nearest inspected PID"),
+                ((150, 1000, 1000), False, "reached it (a failed fork or a thread does not move the fork counter)"),
+                ((400, 1000, 1000), False, "went past it"),
+                ((99, 1000, 1000), False, "wrapped"),
+                ((120, 1000, 2000), False, "pid_max changed"),
+                ((120, 1499, 1000), True, "just under half a lap of forks"),
+                ((120, 1500, 1000), False, "half a lap of forks"),
+                ((120, 999, 1000), False, "fork counter went backwards"),
+                (None, False, "allocator unreadable")):
+            self.assertEqual(self.safe_with(guard, state), expected, why)
+
+    def test_guard_without_an_inspected_pid_ahead_only_watches_for_a_wrap(self):
+        guard = self.guard({50, 60}, (100, 1000, 1000))
+        self.assertTrue(self.safe_with(guard, (999, 1000, 1000)))
+        self.assertFalse(self.safe_with(guard, (5, 1000, 1000)))
+
+    def test_unarmed_or_unreadable_baseline_is_never_safe(self):
+        self.assertFalse(self.safe_with(self.mod.PidReuseGuard(), (100, 1, 1000)))
+        self.assertFalse(self.safe_with(self.guard({150}, None), (100, 1, 1000)))
+
+    def test_allocator_state_must_be_readable_and_consistent(self):
         from unittest.mock import patch
         with patch("builtins.open", side_effect=OSError):
             self.assertIsNone(self.mod.read_fork_state())
-
-    def test_guard_requires_fewer_forks_than_the_budget(self):
-        from unittest.mock import patch
-        guard = self.mod.PidReuseGuard()
-        guard.arm({150}, (100, 1000, 1000))
-        self.assertEqual(guard.budget, 50)
-        for forks, safe in ((1000, True), (1049, True), (1050, False), (5000, False), (999, False)):
-            with patch.object(self.mod, "read_fork_state", return_value=(100, forks, 1000)):
-                self.assertEqual(guard.safe(), safe, forks)
-        with patch.object(self.mod, "read_fork_state", return_value=None):
-            self.assertFalse(guard.safe())
-
-    def test_unarmed_or_unreadable_guard_is_never_safe(self):
-        from unittest.mock import patch
-        guard = self.mod.PidReuseGuard()
-        with patch.object(self.mod, "read_fork_state", return_value=(100, 1, 1000)):
-            self.assertFalse(guard.safe())
-        guard.arm({150}, None)
-        with patch.object(self.mod, "read_fork_state", return_value=(100, 1, 1000)):
-            self.assertFalse(guard.safe())
+        state = self.mod.read_fork_state()
+        if state is not None:
+            self.assertTrue(0 < state[0] < state[2])
 
     def deletion_censuses(self, states, expect_removed=True):
         """Censuses started while the executor removes a real incremental tree; the fork
@@ -348,20 +354,20 @@ class PidReuse(R.Base):
         calls = self.deletion_censuses(lambda n: (2_000_000, 1000, 4194304))
         self.assertLessEqual(sum(skip is None for skip in calls), 4, calls)
 
-    def test_a_burst_of_forks_forces_one_more_full_census_without_skipping(self):
+    def test_a_wrapped_allocator_forces_one_more_full_census_without_skipping(self):
         steady = sum(skip is None for skip in self.deletion_censuses(lambda n: (2_000_000, 1000, 4194304)))
-        burst = self.deletion_censuses(lambda n: (2_000_000, 1000 if n < 2 else 50_000_000, 4194304))
-        self.assertGreater(sum(skip is None for skip in burst), steady, burst)
+        wrapped = self.deletion_censuses(lambda n: (2_000_000 if n < 2 else 1_000, 1000, 4194304))
+        self.assertGreater(sum(skip is None for skip in wrapped), steady, wrapped)
 
-    def test_unreadable_fork_state_refuses_instead_of_skipping_pids(self):
+    def test_unreadable_allocator_refuses_instead_of_skipping_pids(self):
         calls, result = self.deletion_censuses(lambda n: None, expect_removed=False)
         codes = {h["code"] for h in result["groups"][0]["holds"]}
         codes.update(p["reason"] for p in result["groups"][0]["paths"])
         self.assertIn("INCOMPLETE_PROCESS_VISIBILITY", codes, result)
         self.assertTrue(all(skip is None for skip in calls), calls)
 
-    def test_forks_during_the_census_beyond_the_budget_refuse(self):
-        calls, result = self.deletion_censuses(lambda n: (4_194_000, 1000 + 10_000_000 * (n - 1), 4194304),
+    def test_allocator_that_keeps_wrapping_during_every_census_refuses(self):
+        calls, result = self.deletion_censuses(lambda n: (2_000_000 if n % 2 else 1_000, 1000, 4194304),
                                                expect_removed=False)
         codes = {h["code"] for h in result["groups"][0]["holds"]}
         codes.update(p["reason"] for p in result["groups"][0]["paths"])
