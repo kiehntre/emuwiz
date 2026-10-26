@@ -150,6 +150,9 @@ pub fn inspect_collection(
     cancel: &AtomicBool,
     progress: &mut dyn FnMut(InspectionProgress),
 ) -> Result<CollectionInspection, String> {
+    if crate::dat::rename_apply::is_private_recovery_root(root) {
+        return Err("Private recovery data cannot be inspected as a collection.".into());
+    }
     let stamp = SourceStamp::observe(root)?;
     if !stamp.directory {
         return Err("Choose a collection folder, not a file.".into());
@@ -283,7 +286,11 @@ impl Scan<'_> {
                     }
                     self.entries += 1;
                     match entry {
-                        Ok(entry) => paths.push(entry.path()),
+                        Ok(entry) => {
+                            if !crate::dat::rename_apply::is_private_recovery_path(&entry.path()) {
+                                paths.push(entry.path());
+                            }
+                        }
                         Err(e) => self.refuse(format!("Cannot list an entry: {e}")),
                     }
                 }

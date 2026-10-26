@@ -59,6 +59,27 @@ pub(crate) struct Snapshot {
     pub(crate) summary: Summary,
 }
 
+/// Describe the existing executor's effect, including retained copy Undo.
+pub(crate) fn undo_confirmation_description(
+    transaction: Option<&RenameTransaction>,
+) -> &'static str {
+    let internal_copies = transaction.is_some_and(|tx| {
+        tx.unknown.contains_key("mame_internal_repair_plan_digest")
+            && !tx.entries.is_empty()
+            && tx.entries.iter().all(|entry| {
+                matches!(
+                    entry.operation,
+                    archivefs_core::dat::rename_apply::TransactionOperation::CreateCopy { .. }
+                )
+            })
+    });
+    if internal_copies {
+        "Undo moves the verified copies created by this MAME repair into their private recovery staging slots. Original source files stay in place. Changed files or ambiguous recovery evidence are refused."
+    } else {
+        "This will rename the affected files back to their original paths on disk. Each file is re-verified against its recorded identity immediately before the reverse rename; if anything has changed, nothing is touched."
+    }
+}
+
 fn technically_invalid(transaction: &RenameTransaction) -> bool {
     transaction.state == TransactionState::RolledBack
         && transaction

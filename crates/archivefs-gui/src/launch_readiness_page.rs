@@ -46,6 +46,8 @@ pub(crate) mod dosbox;
 #[path = "launch_readiness_page/flycast.rs"]
 pub(crate) mod flycast;
 mod melonds_cheats;
+#[cfg(target_os = "linux")]
+mod pcsx2_cheats;
 mod retroarch_cheat_sets;
 mod retroarch_cheats;
 pub(crate) mod saturn_core;
@@ -70,10 +72,10 @@ use archivefs_core::launch::{
     PpssppLaunchRequest, Rpcs3LaunchExecutionError, Rpcs3LaunchRequest, WHDLoadLaunchInput,
     XemuLaunchExecutionError, XemuLaunchRequest, XeniaLaunchExecutionError, XeniaLaunchRequest,
     build_amiberry_whdload_command_plan, build_dolphin_command_plan,
-    build_duckstation_command_plan, build_fsuae_whdload_command_plan, build_pcsx2_command_plan,
-    build_retroarch_command_plan, build_rpcs3_command_plan, build_xenia_command_plan,
-    preflight_and_launch_amiga_whdload, preflight_and_launch_openmsx, preflight_and_launch_ppsspp,
-    preflight_and_launch_rpcs3, preflight_and_launch_xemu, preflight_and_launch_xenia,
+    build_duckstation_command_plan, build_pcsx2_command_plan, build_retroarch_command_plan,
+    build_rpcs3_command_plan, build_xenia_command_plan, preflight_and_launch_amiga_whdload,
+    preflight_and_launch_openmsx, preflight_and_launch_ppsspp, preflight_and_launch_rpcs3,
+    preflight_and_launch_xemu, preflight_and_launch_xenia,
 };
 use archivefs_core::launch::{
     CandidatePreference, DOLPHIN_SUPPORTED_PLATFORM_ID, DolphinLaunchExecutionError,
@@ -972,7 +974,7 @@ impl AmigaWHDLoadLaunchState {
                     build_amiberry_whdload_command_plan(&request)
                 }
                 archivefs_core::patch_manager::AmigaEmulatorKind::FsUae => {
-                    build_fsuae_whdload_command_plan(&request)
+                    amiga_boot::saved_plan(&request)
                 }
             };
             let result = preflight_and_launch_amiga_whdload(&plan)
@@ -2297,15 +2299,21 @@ enum Pcsx2LaunchStage {
 #[derive(Default)]
 pub(crate) struct Pcsx2LaunchState {
     tracked: Option<(Pcsx2LaunchKey, Pcsx2LaunchStage)>,
+    #[cfg(target_os = "linux")]
+    cheats: pcsx2_cheats::State,
 }
 
 impl Pcsx2LaunchState {
     /// Non-blocking. Returns whether anything changed (a repaint hint).
     pub(crate) fn poll(&mut self) -> bool {
+        #[cfg(target_os = "linux")]
+        let changed = self.cheats.poll();
+        #[cfg(not(target_os = "linux"))]
+        let changed = false;
         let Some((key, stage)) = self.tracked.take() else {
-            return false;
+            return changed;
         };
-        match stage {
+        let ordinary_changed = match stage {
             Pcsx2LaunchStage::Starting { receiver } => match receiver.try_recv() {
                 Ok(Ok(process)) => {
                     self.tracked = Some((key, Pcsx2LaunchStage::Running { process }));
@@ -2346,12 +2354,17 @@ impl Pcsx2LaunchState {
                 self.tracked = Some((key, other));
                 false
             }
-        }
+        };
+        changed || ordinary_changed
     }
 
     /// Whether the caller should keep repainting - a `Starting` preflight
     /// or a `Running` process can change state without any user input.
     pub(crate) fn is_active(&self) -> bool {
+        #[cfg(target_os = "linux")]
+        if self.cheats.is_active() {
+            return true;
+        }
         matches!(
             self.tracked,
             Some((
@@ -2362,6 +2375,10 @@ impl Pcsx2LaunchState {
     }
 
     pub(crate) fn failure_detail(&self) -> Option<String> {
+        #[cfg(target_os = "linux")]
+        if let Some(detail) = self.cheats.failure_detail() {
+            return Some(detail);
+        }
         match &self.tracked {
             Some((_, Pcsx2LaunchStage::Failed { error })) => Some(format!("{error:?}")),
             _ => None,
@@ -2380,6 +2397,11 @@ impl Pcsx2LaunchState {
     /// on every click, the same way this whole panel does not re-scan
     /// RetroArch/Dolphin/PCSX2 profiles on every click either.
     fn start(&mut self, request: Pcsx2LaunchRequest, evidence: Vec<FirmwareIdentityRecord>) {
+        if self.is_active() {
+            return;
+        }
+        #[cfg(target_os = "linux")]
+        self.cheats.plain_start();
         let key = Pcsx2LaunchKey::from_request(&request);
         let (sender, receiver) = mpsc::channel();
         thread::spawn(move || {
@@ -4813,6 +4835,10 @@ fn show_candidate(
             && let Some(request) = pcsx2_launch_request(plan, candidate, context)
         {
             ui.add_space(6.0);
+            #[cfg(target_os = "linux")]
+            pcsx2_launch_state
+                .cheats
+                .show(ui, &request, &context.firmware_evidence);
             show_pcsx2_launch_action(
                 ui,
                 pcsx2_launch_state,
@@ -4843,6 +4869,9 @@ fn show_candidate(
                 ));
             }
             show_standalone_launch_action(ui, standalone_launch_state, request);
+        }
+        if let Some(context) = amiga_whdload {
+            amiga_boot::show_configuration(ui, candidate, context);
         }
         if let Some(context) = amiga_whdload
             && let Some(TypedLaunchRequest::AmigaWHDLoad(request)) = typed_launch_request(

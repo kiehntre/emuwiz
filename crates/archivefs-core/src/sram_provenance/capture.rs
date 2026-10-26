@@ -565,8 +565,44 @@ fn spawn_unobserved(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // Other libtest threads can fork between a local close and the next lease
+    // registration. CLOEXEC closes those accidental copies only at exec. Run
+    // these close/reap assertions after exec in a single-test process, without
+    // changing the production rule that any live inherited lease is tainted.
+    fn in_lease_test_process(name: &str) -> bool {
+        const CHILD: &str = "EMUWIZ_SRAM_LEASE_TEST_CHILD";
+        let name = format!("sram_provenance::capture::tests::{name}");
+        if std::env::var(CHILD).ok().as_deref() == Some(name.as_str()) {
+            return true;
+        }
+        let output = std::process::Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                &name,
+                "--nocapture",
+                "--test-threads=1",
+                "--color",
+                "never",
+            ])
+            .env(CHILD, &name)
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success()
+                && String::from_utf8_lossy(&output.stdout).contains("test result: ok. 1 passed;"),
+            "{name}:\n{}\n{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        false
+    }
+
     #[test]
     fn inherited_lease_stays_visible_after_parent_completion() {
+        if !in_lease_test_process("inherited_lease_stays_visible_after_parent_completion") {
+            return;
+        }
         let t = tempfile::tempdir().unwrap();
         let store = store::Store::open(&t.path().join("origins"), true).unwrap();
         let first = Lease::register(&store.root, "first").unwrap();
@@ -584,6 +620,9 @@ mod tests {
     }
     #[test]
     fn concurrent_sessions_are_tainted_and_leases_remain_pinned() {
+        if !in_lease_test_process("concurrent_sessions_are_tainted_and_leases_remain_pinned") {
+            return;
+        }
         let t = tempfile::tempdir().unwrap();
         let store = store::Store::open(&t.path().join("origins"), true).unwrap();
         let first = Lease::register(&store.root, "first").unwrap();
@@ -595,5 +634,73 @@ mod tests {
         drop(second);
         let third = Lease::register(&store.root, "third").unwrap();
         assert!(third.untainted());
+    }
+
+    #[test]
+    fn forked_pre_exec_holder_keeps_lease_tainted_until_exec() {
+        use std::os::unix::process::CommandExt;
+        if !in_lease_test_process("forked_pre_exec_holder_keeps_lease_tainted_until_exec") {
+            return;
+        }
+        let t = tempfile::tempdir().unwrap();
+        let store = store::Store::open(&t.path().join("origins"), true).unwrap();
+        let first = Lease::register(&store.root, "first").unwrap();
+        let (parent, child) = UnixStream::pair().unwrap();
+        let fork = std::thread::spawn(move || {
+            let fd = child.as_raw_fd();
+            let mut command = std::process::Command::new("/bin/true");
+            // SAFETY: the fork child uses only async-signal-safe libc calls
+            // until exec. The socket handshake holds a deterministic pre-exec
+            // window; the alarm bounds failures without timing the assertion.
+            unsafe {
+                command.pre_exec(move || {
+                    libc::alarm(10);
+                    let ready = [1u8];
+                    if libc::write(fd, ready.as_ptr().cast(), 1) != 1 {
+                        return Err(std::io::Error::last_os_error());
+                    }
+                    let mut release = [0u8];
+                    if libc::read(fd, release.as_mut_ptr().cast(), 1) != 1 {
+                        return Err(std::io::Error::last_os_error());
+                    }
+                    libc::alarm(0);
+                    Ok(())
+                });
+            }
+            let result = command.spawn().and_then(|mut process| process.wait());
+            drop(child);
+            result
+        });
+        // Release the child even if an assertion unwinds, so a failed safety
+        // regression never leaves a deliberately blocked fork behind.
+        struct Release(UnixStream);
+        impl Drop for Release {
+            fn drop(&mut self) {
+                let _ = self.0.write_all(&[1]);
+            }
+        }
+        let mut release = Release(parent);
+        let mut ready_fd = libc::pollfd {
+            fd: release.0.as_raw_fd(),
+            events: libc::POLLIN,
+            revents: 0,
+        };
+        // The only reader owns this socket; once ready, read_exact cannot
+        // wait for another consumer. Bound the handshake, not lease cleanup.
+        assert_eq!(unsafe { libc::poll(&mut ready_fd, 1, 10_000) }, 1);
+        let mut ready = [0u8];
+        release.0.read_exact(&mut ready).unwrap();
+        assert_eq!(ready, [1]);
+        drop(first);
+        let second = Lease::register(&store.root, "second").unwrap();
+        assert!(
+            !second.untainted(),
+            "a fork-inherited CLOEXEC lease is still live before exec"
+        );
+        drop(second);
+        drop(release);
+        assert!(fork.join().unwrap().unwrap().success());
+        let third = Lease::register(&store.root, "third").unwrap();
+        assert!(third.untainted(), "exec/exit released the inherited lease");
     }
 }

@@ -1058,6 +1058,21 @@ impl NativeWorkflows {
         crate::repair_review_page::show_repair_review_page(ui, page);
     }
 
+    pub(super) fn reload_repair_history(&mut self) {
+        if self
+            .app
+            .repair_history_page
+            .as_ref()
+            .is_some_and(|p| p.is_undo_running())
+        {
+            return;
+        }
+        if let Ok(path) = archivefs_core::dat::rename_apply::default_rename_transaction_dir() {
+            self.app.repair_history_page =
+                Some(crate::repair_history_page::RepairHistoryPageState::load_background(path));
+        }
+    }
+
     pub(super) fn show_native_repair_history(&mut self, ui: &mut egui::Ui) {
         if self.app.repair_history_page.is_none() {
             match archivefs_core::dat::rename_apply::default_rename_transaction_dir() {

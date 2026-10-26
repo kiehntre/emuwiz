@@ -429,6 +429,19 @@ fn unspecified_user_folders_become_pin_requirements_not_blockers() {
     let readiness = case.plan();
     assert!(readiness.blockers.is_empty());
     for key in PCSX2_USER_DATA_FOLDER_KEYS {
+        if *key == "GameSettings" {
+            assert!(
+                readiness
+                    .staging_requirements
+                    .contains(&Pcsx2StagingRequirement::CarryPerGameSettings)
+            );
+            assert!(!readiness.staging_requirements.contains(
+                &Pcsx2StagingRequirement::PinUserFolderToRealDefault {
+                    key: key.to_string()
+                }
+            ));
+            continue;
+        }
         assert!(
             readiness.staging_requirements.contains(
                 &Pcsx2StagingRequirement::PinUserFolderToRealDefault {
@@ -436,6 +449,43 @@ fn unspecified_user_folders_become_pin_requirements_not_blockers() {
                 }
             ),
             "{key}"
+        );
+    }
+}
+
+#[test]
+fn redirected_launch_must_preserve_patch_and_additional_settings_folders() {
+    // These v2.8.2 routing keys were omitted by the first readiness planner.
+    // A relative Patches path must not silently switch to an empty workspace.
+    for key in [
+        "Patches",
+        "Covers",
+        "GameSettings",
+        "UserResources",
+        "DebuggerLayouts",
+        "DebuggerSettings",
+    ] {
+        let mut case = Case::native();
+        case.routing = Pcsx2FolderRouting::from_ini_text(&format!("[Folders]\n{key} = custom\n"));
+        let readiness = case.plan();
+        assert_eq!(
+            kinds(&readiness),
+            vec![Pcsx2TempCheatBlockerKind::FolderRoutingUnsafe]
+        );
+        assert!(readiness.blockers[0].reason.contains(key));
+
+        case.routing =
+            Pcsx2FolderRouting::from_ini_text(&format!("[Folders]\n{key} = /real/custom\n"));
+        assert_eq!(
+            case.plan().verdict,
+            Pcsx2TempCheatVerdict::RequiresRuntimeProof
+        );
+
+        case.routing =
+            Pcsx2FolderRouting::from_ini_text(&format!("[Folders]\n{key} = ../escape\n"));
+        assert_eq!(
+            kinds(&case.plan()),
+            vec![Pcsx2TempCheatBlockerKind::FolderRoutingUnsafe]
         );
     }
 }

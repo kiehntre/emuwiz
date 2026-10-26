@@ -37,6 +37,7 @@
 //! exchange preserves the exact original at the staged source path. Both file
 //! identities are journalled and checked for publication, recovery and undo.
 
+pub mod copy;
 mod dirsync;
 pub mod exact_resume;
 pub mod executor;

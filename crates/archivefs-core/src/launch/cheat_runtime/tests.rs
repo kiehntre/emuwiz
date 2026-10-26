@@ -953,6 +953,125 @@ fn a_stale_owned_workspace_is_recognised_and_only_then_cleaned_explicitly() {
     assert!(young.exists() && live_owner.exists() && live_emulator.exists());
 }
 
+#[cfg(target_os = "linux")]
+#[test]
+fn pcsx2_launcher_death_without_sandbox_lifetime_proof_never_authorizes_cleanup() {
+    let env = Env::new("pcsx2-orphan");
+    let dead = dead_pid();
+    let root = orphan(&env, "pcsx2", 3600, dead, Some(dead));
+    let mut marker = verify_owned(&env.roots.approved_root, &root).unwrap();
+    marker.adapter_id = "pcsx2".into();
+    marker.state = MarkerState::EmulatorStarted;
+    update_marker(&root, &marker).unwrap();
+    fs::write(root.join("pcsx2-flatpak.instance"), b"unrecorded\n").unwrap();
+    let scan = scan_with_env(&env.roots, now_unix(), 0, Some(1), true);
+    assert_eq!(
+        scan.iter().find(|e| e.path == root).unwrap().disposition,
+        WorkspaceDisposition::OwnedAmbiguous
+    );
+    assert!(cleanup_with_env(&env.roots, &root, now_unix(), 0, Some(1), true).is_err());
+    assert!(root.exists());
+}
+
+#[test]
+fn verified_resources_keep_config_limits_require_sources_and_materialize_read_only() {
+    let env = Env::new("verified-resource");
+    let bytes = vec![0x5a; 2 * 1024 * 1024];
+    let source = env.user_file("bios.bin", &bytes);
+    let root = env.root_for("resource");
+    let resource = RuntimeFile::new(
+        root.join("bios/image.bin"),
+        bytes.clone(),
+        RuntimeFileKind::VerifiedResource,
+    );
+    let mut parts = CheatRuntimePlanParts {
+        launch_id: "resource".into(),
+        adapter_id: "test-emulator".into(),
+        game_identity: "game-key".into(),
+        root: root.clone(),
+        directories: vec![root.join("bios")],
+        files: vec![resource],
+        extra_arguments: vec![],
+        sources: vec![],
+        expectations: vec![],
+        cheats: vec![],
+    };
+    assert!(CheatRuntimePlan::new(parts.clone()).is_err());
+    parts.sources.push(SourceBinding {
+        path: source.clone(),
+        expected_sha256: sha256_hex(&bytes),
+    });
+    parts.files[0].kind = RuntimeFileKind::Config;
+    assert!(CheatRuntimePlan::new(parts.clone()).is_err());
+    parts.files[0].kind = RuntimeFileKind::VerifiedResource;
+    let plan = CheatRuntimePlan::new(parts.clone()).unwrap();
+    let (workspace, _) = CheatRuntimeWorkspace::materialise(&plan, &binding(), &env.roots).unwrap();
+    assert_eq!(fs::read(root.join("bios/image.bin")).unwrap(), bytes);
+    assert_eq!(
+        fs::metadata(root.join("bios/image.bin"))
+            .unwrap()
+            .permissions()
+            .mode()
+            & 0o222,
+        0
+    );
+    assert_eq!(fs::read(&source).unwrap(), bytes);
+    workspace.cleanup().unwrap();
+    let oversized = RuntimeFile::new(
+        root.join("bios/image.bin"),
+        vec![0; MAX_VERIFIED_RESOURCE_BYTES + 1],
+        RuntimeFileKind::VerifiedResource,
+    );
+    parts.sources[0].expected_sha256 = oversized.sha256.clone();
+    parts.files = vec![oversized];
+    assert!(CheatRuntimePlan::new(parts).is_err());
+    assert!(!root.exists());
+}
+
+#[test]
+fn failure_after_a_verified_resource_rolls_back_only_owned_material() {
+    let env = Env::new("resource-rollback");
+    let root = env.root_for("resource");
+    let bytes = b"synthetic BIOS".to_vec();
+    let source = env.user_file("bios.bin", &bytes);
+    let plan = CheatRuntimePlan::new(CheatRuntimePlanParts {
+        launch_id: "resource".into(),
+        adapter_id: "test-emulator".into(),
+        game_identity: "game-key".into(),
+        root: root.clone(),
+        directories: vec![root.join("bios")],
+        files: vec![
+            RuntimeFile::new(
+                root.join("bios/image.bin"),
+                bytes.clone(),
+                RuntimeFileKind::VerifiedResource,
+            ),
+            RuntimeFile::new(
+                root.join("missing/after.ini"),
+                vec![],
+                RuntimeFileKind::Config,
+            ),
+        ],
+        extra_arguments: vec![],
+        sources: vec![SourceBinding {
+            path: source.clone(),
+            expected_sha256: sha256_hex(&bytes),
+        }],
+        expectations: vec![],
+        cheats: vec![],
+    })
+    .unwrap();
+    assert!(matches!(
+        CheatRuntimeWorkspace::materialise(&plan, &binding(), &env.roots),
+        Err(MaterialiseError::Failed {
+            rolled_back: true,
+            ..
+        })
+    ));
+    assert!(!root.exists());
+    assert_eq!(fs::read(source).unwrap(), bytes);
+}
+
 #[test]
 fn a_foreign_directory_is_never_deleted_by_the_scan_or_the_cleanup() {
     let env = Env::new("foreign");

@@ -126,17 +126,22 @@ pub fn preflight_and_launch_amiga_whdload(
             .boot_request
             .as_ref()
             .ok_or_else(|| blocked("Missing WHDLoad boot request".into()))?;
-        let canonical = super::amiga_whdload_command::build_fsuae_whdload_command_plan(request);
-        if canonical.command.as_ref() != Some(command)
-            || command.trainer.as_ref().is_some_and(|t| !t.is_empty())
-        {
+        // Derive storage from exact identity, never caller-supplied evidence.
+        // Also detect saved values enabled since a previously plain plan.
+        let canonical =
+            super::amiga_whdload_trainer_launch::plan_fsuae_boot_with_saved_trainers(request);
+        if canonical.command.as_ref() != Some(command) {
             return Err(blocked(
                 "WHDLoad plan changed or trainer activation refused".into(),
             ));
         }
         let approval = request.boot.as_ref().map_err(|e| blocked(e.clone()))?;
-        let prepared =
-            super::fsuae_whdload_boot::prepare_boot(request, approval).map_err(blocked)?;
+        let prepared = super::fsuae_whdload_boot::prepare_boot_with_trainer(
+            request,
+            approval,
+            command.trainer.as_ref(),
+        )
+        .map_err(blocked)?;
         let (command, watched) = prepared.spawn().map_err(blocked)?;
         let pid = watched.pid;
         return Ok(LaunchedAmigaWHDLoadProcess {

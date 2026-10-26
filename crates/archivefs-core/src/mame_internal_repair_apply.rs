@@ -371,6 +371,19 @@ fn operation_for_requirement(
         refusal_reason: None,
         post_apply_verification: None,
     };
+    if requirement.requirement_class == crate::mame_internal_repair::MameRepairRequirementClass::Chd
+        || requirement.relationship.kind == MameRepairRelationshipKind::Chd
+    {
+        operation.state = MameRepairOperationState::ApplyUnsupported;
+        operation.refusal_reason = Some("CHD repair requires container-aware verification; ordinary file hashes are not CHD evidence".into());
+        return operation;
+    }
+    if !crate::dat::rename_apply::preflight::is_safe_basename(&operation.destination_member) {
+        operation.state = MameRepairOperationState::ApplyUnsupported;
+        operation.refusal_reason =
+            Some("nested or unsafe destination member is unsupported".into());
+        return operation;
+    }
     if source.is_none()
         || !source.is_some_and(|source| source.container_is_directory)
         || !requirement.expected_destination_is_directory
@@ -547,6 +560,18 @@ mod tests {
             top_repairs_by_impact: vec![],
             warnings: vec![],
         };
+        // CHD internal identities cannot authorize copying arbitrary bytes,
+        // even when their SHA-1 happens to equal an ordinary local file.
+        let mut disk_plan = plan.clone();
+        disk_plan.requirements[0].requirement_class =
+            crate::mame_internal_repair::MameRepairRequirementClass::Chd;
+        disk_plan.requirements[0].relationship.kind = MameRepairRelationshipKind::Chd;
+        let refused = plan_mame_internal_repair_apply(&disk_plan, &Default::default());
+        assert_eq!(
+            refused.operations[0].state,
+            MameRepairOperationState::ApplyUnsupported
+        );
+        assert!(refused.transaction.is_none());
         let mut apply_plan = plan_mame_internal_repair_apply(&plan, &Default::default());
         assert_eq!(
             apply_plan.operations[0].state,

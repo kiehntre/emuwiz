@@ -4,6 +4,15 @@ Module: `crates/archivefs-core/src/patch_manager/pcsx2_temp_cheat_readiness.rs`
 (`plan_pcsx2_temporary_cheat_launch`). Pure projection over existing evidence;
 it writes no PNACH, no `PCSX2.ini`, launches nothing and touches no memory card.
 
+The [2026-10-26 disposable probe](PCSX2_TEMP_CHEAT_PROBE_20261026.md)
+observed selected PNACH loading and enablement. The pure planner remains
+unchanged; the separately reviewed `launch::cheat_runtime_pcsx2` adapter now
+adds exact-deployment capability checks, immutable approval, a scoped runtime
+configuration probe and the canonical staging/recovery executor. Blue exposes
+that explicit action beside ordinary launch. See the
+[activation report](PCSX2_TEMP_CHEAT_ACTIVATION_20261026.md) for supported scope
+and observed results.
+
 ## Correction to the feasibility report
 
 `PCSX2_CHEAT_RUNTIME_FEASIBILITY.md` (2026-10-04) states that EmuWiz launches
@@ -36,8 +45,8 @@ from "can launch".
   yet *observed*. EmuWiz must not enable cheats for a launch on this basis.
 
 There is deliberately **no** supported verdict in V1. The planner accepts no
-runtime proof: a caller-supplied flag set is not evidence, and no trusted
-producer exists. `runtime_proof_needed` lists what a future, separately
+runtime proof: a caller-supplied flag set is not evidence, and it is not itself a trusted
+producer. `runtime_proof_needed` lists what a future, separately
 reviewed probe must establish (Flatpak adds `SandboxSawStagedRoot` and
 `SandboxSawRealUserFolders`; an absolute host path is not assumed visible in
 the sandbox).
@@ -55,7 +64,17 @@ save states, BIOS, ...) are not blockers but become mandatory
 `PinUserFolderToRealDefault` staging requirements so a redirected launch can
 never silently use an empty memory-card folder.
 
-## Remaining requirements for real cheat-on-launch execution
+Routing also covers `Patches`, `Covers`, `GameSettings`, `UserResources`,
+`DebuggerLayouts` and `DebuggerSettings`. Game settings use the existing
+copy-to-workspace requirement, never a writable production pin; debugger
+defaults are under `inis`. The installed v2.8.2 appends `PCSX2` to the
+`-datapath` argument, so its resulting data root needs direct observation.
+
+## Original executor requirements
+
+These motivated the separate adapter; they are not a supported verdict in
+this pure planner. The adapter privately copies BIOS/console state as well
+as game settings, because PCSX2 may create `.mec`/`.nvm` beside the BIOS.
 
 1. A boot probe on a legal homebrew ELF with a working display, using the
    installed PCSX2 version, proving each `Pcsx2RuntimeProofItem`: `-datapath`
