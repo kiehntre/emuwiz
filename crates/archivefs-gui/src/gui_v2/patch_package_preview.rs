@@ -133,7 +133,7 @@ pub(super) fn show(ui: &mut egui::Ui, state: &mut State) {
         if let Some(order) = &report.metadata_patch_order {
             ui.label(format!(
                 "Unverified package order claim: {}",
-                order.join(" → ")
+                order.join(" -> ")
             ));
         }
         if let Some(identity) = &report.metadata_source_identity {
