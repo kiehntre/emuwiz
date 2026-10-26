@@ -374,5 +374,90 @@ class PidReuse(R.Base):
         self.assertIn("INCOMPLETE_PROCESS_VISIBILITY", codes, result)
 
 
+    def guard_run(self, states, light_missing_own_pid=False, full_interval=3600):
+        """Like deletion_censuses, but also records the order of snapshots and censuses."""
+        from unittest.mock import patch
+        events, calls = [], []
+        base = self.mod.F.Census
+
+        class Light(base):
+            def __init__(inner, targets, skip_pids=None):
+                first_after_snapshot = events[-1:] == ["snapshot"] and events.count("snapshot") == 1
+                events.append("census")
+                calls.append(skip_pids)
+                inner.skip_pids, inner.targets = frozenset(skip_pids or ()), list(targets)
+                inner.refs, inner.unreadable_foreign, inner.examined, inner._inode_refs = {}, 0, 0, []
+                inner.pids_seen = {int(p) for p in os.listdir("/proc") if p.isdigit()}
+                if light_missing_own_pid and first_after_snapshot:  # the initial census of execute_group
+                    inner.pids_seen.discard(os.getpid())  # only the first census: one "new" PID later
+
+        self.mod.F.Census = Light
+        wt, target = self.managed_cache("wt-order%d" % len(self.__dict__.setdefault("_runs", [])), completed=False)
+        populate_incremental(target)
+        self.assertEqual(self.ret("finish", wt, "--task", "order-fixture").returncode, 0)
+        path, digest = self.manifest([self.group(wt, target, ["debug/incremental"])])
+        self._runs.append(1)
+        reads = [0]
+        real_snapshot = self.mod.pid_snapshot
+
+        def state():
+            reads[0] += 1
+            return states(reads[0])
+
+        def snapshot():
+            events.append("snapshot")
+            return real_snapshot()
+
+        with patch.object(self.mod, "read_fork_state", side_effect=state), \
+                patch.object(self.mod, "pid_snapshot", side_effect=snapshot), \
+                patch.object(self.mod, "FULL_CENSUS_INTERVAL", full_interval):
+            rc, result = self.run_retire(path, digest, execute=True)
+        return events, calls, result, os.path.isdir(os.path.join(target, "debug", "incremental"))
+
+    def test_the_allocator_is_snapshotted_before_every_census(self):
+        events, _, _, still_there = self.guard_run(
+            lambda n: (1_000, 1000, 4194304) if n == 3 else (2_000_000, 1000, 4194304))
+        self.assertFalse(still_there)
+        self.assertGreater(events.count("snapshot"), 1, events)
+        # the planning census before execution is not used for skipping; every census after the first
+        # snapshot (the initial and all guard censuses) must have been preceded by its own snapshot
+        events = events[events.index("snapshot"):]
+        for i, event in enumerate(events):
+            if event == "census":
+                self.assertEqual(events[i - 1], "snapshot", events)
+
+    def test_a_guard_census_that_cannot_be_proven_refuses_even_after_a_proven_start(self):
+        from unittest.mock import patch
+        proofs = []
+
+        def safe(guard):
+            proofs.append(1)
+            return len(proofs) == 1  # the initial census is proven; nothing afterwards is
+
+        with patch.object(self.mod.PidReuseGuard, "safe", autospec=True, side_effect=safe):
+            events, calls, result, still_there = self.guard_run(lambda n: (2_000_000, 1000, 4194304))
+        self.assertTrue(still_there, "nothing may be removed")
+        codes = {h["code"] for h in result["groups"][0]["holds"]}
+        codes.update(p["reason"] for p in result["groups"][0]["paths"])
+        self.assertIn("INCOMPLETE_PROCESS_VISIBILITY", codes, result)
+        details = " ".join(h.get("detail", "") for h in result["groups"][0]["holds"])
+        self.assertIn("recycled", details)
+
+    def test_an_incremental_census_is_redone_in_full_when_the_allocator_moved_during_it(self):
+        # reads: 1 snapshot, 2 proof (initial); 3 guard check, 4 snapshot, 5 proof after the incremental census
+        events, calls, result, still_there = self.guard_run(
+            lambda n: (1_000, 1000, 4194304) if n == 5 else (2_000_000, 1000, 4194304), light_missing_own_pid=True)
+        self.assertFalse(still_there, result)
+        first_incremental = next(i for i, skip in enumerate(calls) if skip is not None)
+        self.assertIsNone(calls[first_incremental + 1], calls)
+
+    def test_unreadable_allocator_is_reported_distinctly(self):
+        from unittest.mock import patch
+        with patch.object(self.mod, "read_fork_state", return_value=None):
+            self.assertIn("unreadable", self.mod.pid_reuse_detail(5))
+        with patch.object(self.mod, "read_fork_state", return_value=(5, 5, 100)):
+            self.assertIn("5 attempts", self.mod.pid_reuse_detail(5))
+
+
 if __name__ == "__main__":
     unittest.main()
