@@ -815,6 +815,7 @@ fn click_label(
 
 fn state_record(state_type: PersistentStateType, emulator: StateEmulator) -> PersistentStateRecord {
     PersistentStateRecord {
+        sram_origin: None,
         emulator,
         selected_installation: None,
         state_type,

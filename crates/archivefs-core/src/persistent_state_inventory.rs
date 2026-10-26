@@ -144,6 +144,8 @@ pub struct PersistentStateRecord {
     pub selected_installation: Option<StateInstallation>,
     pub state_type: PersistentStateType,
     pub game_identity: Vec<IdentityEvidence>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sram_origin: Option<crate::sram_provenance::SramOrigin>,
     pub path: PathBuf,
     pub container_path: Option<PathBuf>,
     pub slot_profile_account: Option<String>,
@@ -460,6 +462,7 @@ fn add_record_with_identity(
         selected_installation: root.installation.clone(),
         state_type,
         game_identity: identity,
+        sram_origin: None,
         path: path.to_path_buf(),
         container_path,
         slot_profile_account: root

@@ -234,6 +234,7 @@ mod tests {
     fn blue_state_guidance_renders_unknown_and_no_restore_claim() {
         use archivefs_core::persistent_state_inventory::{PortabilityClass, StatePathOrigin};
         let record = PersistentStateRecord {
+            sram_origin: None,
             emulator: StateEmulator::DuckStation,
             selected_installation: None,
             state_type: PersistentStateType::SaveState,

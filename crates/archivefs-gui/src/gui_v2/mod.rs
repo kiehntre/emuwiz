@@ -2249,6 +2249,7 @@ impl eframe::App for App {
                 reload_artwork = workflows.take_artwork_reload();
             }
         }
+        saves_states::poll_completed_sessions(self);
         if reload_library {
             self.load(false);
         }

@@ -40,6 +40,7 @@ pub(super) struct SavesStatesState {
     pub(super) loading: bool,
     pub(super) job: Option<u64>,
     pub(super) generation: u64,
+    pub(super) observed_completion: u64,
     pub(super) filter: Filter,
     pub(super) search: String,
     pub(super) error: Option<String>,
@@ -53,6 +54,16 @@ impl SavesStatesState {
     fn clear_filters(&mut self) {
         self.filter = Filter::All;
         self.search.clear();
+    }
+}
+
+/// Completion is published only after the reaper commits its receipt. A
+/// restart uses the same worker projection on the first inventory request.
+pub(super) fn poll_completed_sessions(app: &mut App) {
+    let revision = archivefs_core::sram_provenance::completion_revision();
+    if revision != app.saves_states.observed_completion && !app.saves_states.loading {
+        app.saves_states.observed_completion = revision;
+        app.start_saves_inventory();
     }
 }
 
@@ -532,6 +543,43 @@ fn summary(ui: &mut egui::Ui, records: &[&PersistentStateRecord]) {
 }
 
 fn record_belongs_to_game(record: &PersistentStateRecord, game: &Game) -> bool {
+    if record.state_type == PersistentStateType::NativeSave
+        && record.emulator == StateEmulator::RetroArch
+        && let Some(origin) = record.sram_origin.as_ref()
+    {
+        // The worker revalidated the sealed content digest and exact path.
+        // No UI title or filename participates in this join.
+        use archivefs_core::game_identity::{IdentityKind, IdentityStatus};
+        let gold = &origin.context.cartridge_identity;
+        let digest = origin.context.cartridge.sha256.as_str();
+        // A DAT-only library row need not cache SHA256. The authority is
+        // current, sealed Gold byte evidence from the inventory worker.
+        // Any redundant strong cache evidence still refuses disagreement.
+        let mut cached = game
+            .dat_exact_hashes
+            .as_ref()
+            .and_then(|h| h.sha256.as_deref())
+            .into_iter()
+            .chain(
+                game.archive
+                    .identity_report
+                    .as_ref()
+                    .into_iter()
+                    .flat_map(|r| r.evidence.iter())
+                    .filter(|e| {
+                        e.kind == IdentityKind::LooseRomSha256
+                            && e.status == IdentityStatus::Verified
+                    })
+                    .filter_map(|e| e.value.as_deref()),
+            );
+        return origin.state == archivefs_core::sram_provenance::OriginState::Associated
+            && gold.kind == IdentityKind::LooseRomSha256
+            && gold.status == IdentityStatus::Verified
+            && gold.value.as_deref() == Some(digest)
+            && !game.inspection_incomplete
+            && cached.all(|value| value == digest)
+            && origin.context.cartridge.path == game.archive.absolute_path;
+    }
     let Some(report) = game.archive.identity_report.as_ref() else {
         return false;
     };
@@ -641,7 +689,15 @@ fn record_card(
             PersistentStateType::CloudManaged => "Managed outside EmuWiz.",
             PersistentStateType::Unknown => "EmuWiz could not safely classify this state.",
         });
-        if !record.game_identity.is_empty() {
+        if let Some(origin)=record.sram_origin.as_ref(){
+            let label=match origin.state{
+                archivefs_core::sram_provenance::OriginState::Associated=>"Associated · observed SRAM write",
+                archivefs_core::sram_provenance::OriginState::NeedsReview=>"Needs review · origin evidence changed",
+            };
+            ui.strong(label);
+            ui.label(&origin.explanation);
+            ui.small(format!("Verified cartridge SHA-256: {}",origin.context.cartridge.sha256));
+        } else if !record.game_identity.is_empty() {
             ui.add_space(theme::SPACE_XS);
             ui.label(egui::RichText::new("Game identity").strong());
             ui.label(
@@ -653,7 +709,7 @@ fn record_card(
                     .join(", "),
             );
         } else if matches!(record.state_type, PersistentStateType::NativeSave | PersistentStateType::SaveState) {
-            ui.label(egui::RichText::new("Needs review · game ownership is not confirmed.").color(theme::warning(ui)));
+            ui.label(egui::RichText::new("Unassigned · no trusted cartridge-to-save observation. Historical saves are never matched by filename.").color(theme::warning(ui)));
         }
         ui.label(match record.state_type {
             PersistentStateType::SaveState => format!(
@@ -687,6 +743,11 @@ fn record_card(
             ui.label(format!("Portability: {}", portability_label(record.portability_class)));
             ui.label(format!("Size: {} bytes", record.size_bytes));
             ui.label(&record.provenance);
+            if let Some(origin)=&record.sram_origin{
+                ui.label(format!("Observed installation: {}",origin.context.executable.path.display()));
+                ui.label(format!("Observed core: {} · SHA-256 {}",origin.context.core.path.display(),origin.context.core.sha256));
+                ui.label(format!("Settings scope: {} · session {}",origin.context.scope.configuration.path.display(),origin.session));
+            }
             for warning in &record.warnings { ui.label(warning); }
         });
     });
@@ -779,6 +840,7 @@ mod tests {
 
     fn record_at(path: &str) -> PersistentStateRecord {
         PersistentStateRecord {
+            sram_origin: None,
             emulator: StateEmulator::DuckStation,
             selected_installation: None,
             state_type: PersistentStateType::NativeSave,
@@ -807,6 +869,116 @@ mod tests {
     /// card's "Advanced details" header resolves to the *same* persisted
     /// open/closed id and one record's toggle bleeds into every other
     /// record's card, appearing as a flash when the list repaints.
+    #[test]
+    fn witnessed_sram_joins_exact_content_path_and_never_grants_state_ownership() {
+        use archivefs_core::sram_provenance::*;
+        let stamp = Stamp {
+            device: 1,
+            inode: 2,
+            size: 8192,
+            modified: 0,
+            modified_ns: 0,
+            changed: 0,
+            changed_ns: 0,
+            links: 1,
+            mode: 0o100600,
+            uid: 1,
+        };
+        let object = Object {
+            path: "/games/one/Game.gb".into(),
+            stamp,
+            sha256: "verified bytes".into(),
+        };
+        let mut archive = super::super::tests::archive(91, "A cartridge", Some("Game Boy"));
+        archive.absolute_path = object.path.clone();
+        let mut game = Game::from_archive(archive);
+        game.dat_exact_hashes = Some(
+            archivefs_core::dat::library_identity_summary::LibraryItemHashes {
+                sha256: Some(object.sha256.clone()),
+                ..Default::default()
+            },
+        );
+        let mut record = record_at("/saves/arbitrary.srm");
+        record.emulator = StateEmulator::RetroArch;
+        let identity = archivefs_core::game_identity::IdentityEvidence {
+            kind: archivefs_core::game_identity::IdentityKind::LooseRomSha256,
+            status: archivefs_core::game_identity::IdentityStatus::Verified,
+            value: Some(object.sha256.clone()),
+            confidence: archivefs_core::game_identity::IdentityConfidence::StructuredMetadata,
+            provenance: archivefs_core::game_identity::IdentityProvenance {
+                archive_path: object.path.clone(),
+                member_path: None,
+                member_index: None,
+                method: "worker fixture".into(),
+            },
+            diagnostic: "fixture".into(),
+        };
+        record.sram_origin = Some(SramOrigin {
+            state: OriginState::Associated,
+            session: "session".into(),
+            context: Context {
+                cartridge: object.clone(),
+                cartridge_identity: identity,
+                core: object.clone(),
+                executable: object.clone(),
+                scope: Scope {
+                    selected_executable: object.path.clone(),
+                    selected_core: object.path.clone(),
+                    configuration: object.clone(),
+                    saves: "/saves".into(),
+                    saves_identity: DirectoryIdentity {
+                        device: 1,
+                        inode: 3,
+                    },
+                    profile: "Native/User".into(),
+                },
+            },
+            artifact: object,
+            explanation: "witness".into(),
+        });
+        assert!(record_belongs_to_game(&record, &game));
+        game.dat_exact_hashes = None;
+        assert!(
+            record_belongs_to_game(&record, &game),
+            "fresh sealed Gold evidence works without redundant library SHA256"
+        );
+        game.dat_exact_hashes = Some(
+            archivefs_core::dat::library_identity_summary::LibraryItemHashes {
+                sha256: Some("conflicting cached digest".into()),
+                ..Default::default()
+            },
+        );
+        assert!(!record_belongs_to_game(&record, &game));
+        game.dat_exact_hashes = None;
+        game.inspection_incomplete = true;
+        assert!(!record_belongs_to_game(&record, &game));
+        game.inspection_incomplete = false;
+        record
+            .sram_origin
+            .as_mut()
+            .unwrap()
+            .context
+            .cartridge_identity
+            .status = archivefs_core::game_identity::IdentityStatus::Candidate;
+        assert!(!record_belongs_to_game(&record, &game));
+        record
+            .sram_origin
+            .as_mut()
+            .unwrap()
+            .context
+            .cartridge_identity
+            .status = archivefs_core::game_identity::IdentityStatus::Verified;
+        assert!(record.game_identity.is_empty());
+        let mut other = game.clone();
+        other.archive.absolute_path = "/games/two/Game.gb".into();
+        assert!(!record_belongs_to_game(&record, &other));
+        record.sram_origin.as_mut().unwrap().state = OriginState::NeedsReview;
+        assert!(!record_belongs_to_game(&record, &game));
+        record.sram_origin.as_mut().unwrap().state = OriginState::Associated;
+        record.state_type = PersistentStateType::SaveState;
+        assert!(!record_belongs_to_game(&record, &game));
+    }
+
     #[test]
     fn clearing_save_filters_keeps_inspection_and_selection_evidence() {
         let mut state = SavesStatesState {

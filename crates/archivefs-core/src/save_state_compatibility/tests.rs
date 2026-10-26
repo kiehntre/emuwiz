@@ -28,6 +28,7 @@ fn fixture() -> (
 ) {
     let game = vec![identity(IdentityKind::Ps1Serial, "SCUS-12345")];
     let record = PersistentStateRecord {
+        sram_origin: None,
         emulator: StateEmulator::DuckStation,
         selected_installation: None,
         state_type: PersistentStateType::SaveState,

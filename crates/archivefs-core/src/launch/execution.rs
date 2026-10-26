@@ -892,10 +892,10 @@ impl LaunchedRetroArchProcess {
 /// - `stderr` is `Stdio::piped()` and drained on a background thread,
 ///   bounded at [`LAUNCH_STDERR_CAPTURE_LIMIT`], purely as a diagnostic aid
 ///   if the launch fails or crashes.
-/// - No environment variables are injected or overridden - the spawned
-///   process inherits this process's environment exactly (display/XDG/
-///   RetroArch environment stays intact), and nothing user-derived is ever
-///   added to it.
+/// - Display/XDG/RetroArch settings are inherited. A supported native SRAM
+///   observer adds only private per-child loader/IPC variables; the parent
+///   environment and emulator configuration are unchanged. Native sessions
+///   must retain save-session coordination before child creation.
 /// - The working directory is exactly `command.working_directory` (`None`
 ///   today, per the command planner - inherited from this process, not set
 ///   to some new directory).
@@ -982,6 +982,7 @@ pub(crate) fn spawn_retroarch_guarded(
     };
     let facts = command_facts(&command);
     let prepared = command.command_spec();
+    let observation = crate::sram_provenance::prepare(&command).map_err(LaunchSpawnError::Spawn)?;
     final_sources().map_err(|e| LaunchSpawnError::Spawn(std::io::Error::other(e)))?;
     if let Some(selected) = &command.saturn_core_selection {
         selected
@@ -1006,8 +1007,9 @@ pub(crate) fn spawn_retroarch_guarded(
             )));
         }
     }
-    let watched =
-        process_spawn::spawn_watched_process(&prepared).map_err(LaunchSpawnError::Spawn)?;
+    let watched = observation
+        .spawn(&prepared)
+        .map_err(LaunchSpawnError::Spawn)?;
     Ok(LaunchedRetroArchProcess {
         pid: watched.pid,
         command_facts: facts,
