@@ -5940,13 +5940,13 @@ mod tests {
         assert!(!plan_pending_recovery(&pending[0]).can_safe_rollback);
     }
 
-    /// A transaction mixing new and replaced files, in the given journal order:
     /// `(relative path, existing bytes if any, new bytes)`.
     #[cfg(unix)]
-    fn mixed_plan(
-        fixture: &Fixture,
-        items: &[(&str, Option<&[u8]>, &[u8])],
-    ) -> SharedTransactionPlan {
+    type MixedItem<'a> = (&'a str, Option<&'a [u8]>, &'a [u8]);
+
+    /// A transaction mixing new and replaced files, in the given journal order.
+    #[cfg(unix)]
+    fn mixed_plan(fixture: &Fixture, items: &[MixedItem]) -> SharedTransactionPlan {
         fs::create_dir(fixture.source_root()).unwrap();
         fs::create_dir_all(fixture.destination_root().join("Nintendo - NES")).unwrap();
         let source_items = items

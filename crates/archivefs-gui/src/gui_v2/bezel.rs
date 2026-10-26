@@ -920,14 +920,12 @@ pub(super) fn show(ui: &mut egui::Ui, state: &mut BezelPanelState) {
             {
                 state.apply();
             }
-            ui.label(format!(
-                "Undo: {}",
-                if plan.rollback.supported {
-                    "Available"
-                } else {
-                    "Not available"
-                }
-            ));
+            // Nothing has been applied yet: describe Undo after Apply.
+            ui.label(if plan.rollback.supported {
+                "After Apply, Undo will be available in History."
+            } else {
+                "After Apply, Undo will not be available."
+            });
             ui.small(&plan.rollback.reason);
         });
     }
@@ -1552,8 +1550,9 @@ mod tests {
     fn planned_changes_explicitly_states_undo_available() {
         let rendered =
             render_planned_changes(plan_with_rollback(true, "An exact backup was recorded."));
-        assert!(rendered.contains("Undo: Available"));
-        assert!(!rendered.contains("Undo: Not available"));
+        assert!(rendered.contains("After Apply, Undo will be available in History."));
+        assert!(!rendered.contains("Undo will not be available"));
+        assert!(!rendered.contains("Undo: "));
         assert!(rendered.contains("An exact backup was recorded."));
     }
 
@@ -1561,8 +1560,9 @@ mod tests {
     fn planned_changes_explicitly_states_undo_not_available() {
         let rendered =
             render_planned_changes(plan_with_rollback(false, "No backup root was configured."));
-        assert!(rendered.contains("Undo: Not available"));
-        assert!(!rendered.contains("Undo: Available"));
+        assert!(rendered.contains("After Apply, Undo will not be available."));
+        assert!(!rendered.contains("Undo will be available"));
+        assert!(!rendered.contains("Undo: "));
         assert!(rendered.contains("No backup root was configured."));
     }
 

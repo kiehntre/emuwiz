@@ -188,7 +188,8 @@ pub fn prepare_retroarch_bezel_plan(
         .filter(|file| file.exists)
         .map(|file| file.path.clone())
         .collect();
-    plan.rollback.reason = "shared RetroArch transaction journal stores exact prior bytes".into();
+    plan.rollback.reason =
+        "Apply will keep the exact original bytes in EmuWiz's shared RetroArch journal".into();
     plan.warnings.push("Only EmuWiz-owned overlay files and this per-game override are managed; retroarch.cfg remains untouched.".into());
     crate::bezel_apply::reseal_bezel_apply_plan(&mut plan)?;
     Ok(plan)
