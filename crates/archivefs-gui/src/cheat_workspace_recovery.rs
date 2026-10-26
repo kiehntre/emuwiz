@@ -1,6 +1,6 @@
-//! Leftover launch-time cheat files (MAME and melonDS).
+//! Leftover launch-time cheat files (MAME, melonDS and PCSX2).
 //!
-//! If EmuWiz stops while MAME or melonDS is still running, the temporary
+//! If EmuWiz stops while one of these emulators is still running, the temporary
 //! copy of the chosen cheats stays behind. This surface finds such copies and,
 //! on explicit approval, removes the ones that are provably abandoned.
 //!
@@ -60,6 +60,7 @@ fn emulator_label(adapter: &str) -> Option<&'static str> {
     match adapter {
         "mame" => Some("MAME"),
         "melonds" => Some("melonDS"),
+        "pcsx2" => Some("PCSX2"),
         _ => None,
     }
 }
@@ -242,10 +243,10 @@ fn age_text(now: u64, created: u64) -> String {
 
 /// The panel. Looking happens only when the button is pressed.
 pub(crate) fn show(ui: &mut egui::Ui, state: &mut State) {
-    egui::CollapsingHeader::new("Leftover launch-time cheat files (MAME, melonDS)")
+    egui::CollapsingHeader::new("Leftover launch-time cheat files (MAME, melonDS, PCSX2)")
         .default_open(false)
         .show(ui, |ui| {
-            ui.label("If EmuWiz stops while MAME or melonDS is running, the temporary copy of the cheats you chose stays behind. Looking is read-only; nothing is removed unless you approve it.");
+            ui.label("If EmuWiz stops while an emulator is running, its temporary cheat profile stays behind. Looking is read-only; nothing is removed unless you approve it and its process/sandbox is provably gone.");
             if ui.button("Check for leftover cheat files").clicked() {
                 state.scan(unix_now());
             }
@@ -535,6 +536,51 @@ mod tests {
         }
         emulator.kill().unwrap();
         emulator.wait().unwrap();
+    }
+
+    #[test]
+    fn pcsx2_prelaunch_workspace_uses_existing_explicit_recovery() {
+        let fx = Fx::new();
+        let dead = dead_pid();
+        let path = fx.workspace(
+            "pcsx2-unused",
+            "pcsx2",
+            MarkerState::Materialised,
+            dead,
+            None,
+        );
+        let mut state = fx.state();
+        state.scan(unix_now());
+        assert_eq!(verdict(&state, &path), Verdict::Removable);
+        assert_eq!(
+            state.rows.iter().find(|r| r.path == path).unwrap().emulator,
+            "PCSX2"
+        );
+        state.start_review(&path);
+        assert!(path.exists());
+        state.confirm(unix_now());
+        assert!(!path.exists());
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn pcsx2_unknown_sandbox_is_kept_after_launcher_death() {
+        let fx = Fx::new();
+        let dead = dead_pid();
+        let path = fx.workspace(
+            "pcsx2-unknown",
+            "pcsx2",
+            MarkerState::EmulatorStarted,
+            dead,
+            Some(dead),
+        );
+        fs::write(path.join("pcsx2-flatpak.instance"), b"unknown\n").unwrap();
+        let mut state = fx.state();
+        state.scan(unix_now());
+        assert_eq!(verdict(&state, &path), Verdict::MayBeRunning);
+        state.start_review(&path);
+        assert!(state.review.is_none());
+        assert!(path.exists());
     }
 
     #[test]

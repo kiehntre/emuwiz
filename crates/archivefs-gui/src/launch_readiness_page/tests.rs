@@ -2678,6 +2678,7 @@ fn pcsx2_starting_and_running_states_show_status_and_pid_without_stop_controls()
     let (_sender, receiver) = mpsc::channel();
     let mut starting = Pcsx2LaunchState {
         tracked: Some((key.clone(), Pcsx2LaunchStage::Starting { receiver })),
+        ..Default::default()
     };
     let output = render_with_pcsx2_state(
         &pcsx2_plan_input(plan.clone(), ready.context),
@@ -2696,6 +2697,7 @@ fn pcsx2_starting_and_running_states_show_status_and_pid_without_stop_controls()
     let pid = process.pid;
     let mut running = Pcsx2LaunchState {
         tracked: Some((key, Pcsx2LaunchStage::Running { process })),
+        ..Default::default()
     };
     let output = render_with_pcsx2_state(&pcsx2_plan_input(plan, ready.context), &mut running);
     assert!(rendered_text_contains(&output, "PCSX2 running"));
@@ -2716,6 +2718,7 @@ fn pcsx2_exit_states_show_clean_or_nonzero_status_without_exposing_stderr_inline
     wait_until_pcsx2_exited(&mut process);
     let mut state = Pcsx2LaunchState {
         tracked: Some((key, Pcsx2LaunchStage::Exited { process })),
+        ..Default::default()
     };
     let output = render_with_pcsx2_state(&pcsx2_plan_input(plan, ready.context), &mut state);
     assert!(rendered_text_contains(&output, "PCSX2 exited"));
@@ -2735,6 +2738,7 @@ fn pcsx2_exit_states_show_clean_or_nonzero_status_without_exposing_stderr_inline
     wait_until_pcsx2_exited(&mut process);
     let mut state = Pcsx2LaunchState {
         tracked: Some((key, Pcsx2LaunchStage::Exited { process })),
+        ..Default::default()
     };
     let output = render_with_pcsx2_state(&pcsx2_plan_input(plan, ready.context), &mut state);
     assert!(rendered_text_contains(&output, "PCSX2 exited unexpectedly"));
@@ -2769,6 +2773,7 @@ fn pcsx2_preflight_failure_and_stale_selection_are_isolated_honestly() {
         });
     let mut failed = Pcsx2LaunchState {
         tracked: Some((key, Pcsx2LaunchStage::Failed { error })),
+        ..Default::default()
     };
     let output = render_with_pcsx2_state(&pcsx2_plan_input(plan, ready.context), &mut failed);
     assert!(rendered_text_contains(&output, "Launch failed"));
@@ -2788,6 +2793,7 @@ fn pcsx2_preflight_failure_and_stale_selection_are_isolated_honestly() {
             Pcsx2LaunchKey::from_request(&first_request),
             Pcsx2LaunchStage::Running { process },
         )),
+        ..Default::default()
     };
     let other_content = ready.fixture.path("games/other.iso");
     std::fs::write(&other_content, ps2_iso_bytes()).unwrap();

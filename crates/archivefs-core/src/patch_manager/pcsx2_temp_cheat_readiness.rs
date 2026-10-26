@@ -59,10 +59,16 @@ pub const PCSX2_USER_DATA_FOLDER_KEYS: &[&str] = &[
     "Savestates",
     "MemoryCards",
     "Logs",
+    "Patches",
+    "Covers",
+    "GameSettings",
+    "UserResources",
     "Cache",
     "Textures",
     "InputProfiles",
     "Videos",
+    "DebuggerLayouts",
+    "DebuggerSettings",
 ];
 
 /// How one `[Folders]` entry of `PCSX2.ini` is written.
@@ -264,7 +270,9 @@ pub struct Pcsx2TempCheatBlocker {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum Pcsx2StagingRequirement {
-    /// Launch with an explicit `-datapath <per-launch workspace>`.
+    /// Launch with an explicit `-datapath <per-launch workspace>`. The
+    /// installed runtime must prove its resulting data root: v2.8.2 appends
+    /// `PCSX2` to this argument. The argument is not itself a data-root proof.
     ExplicitDataPathArgument,
     /// Stage `<serial>_<CRC>.pnach` in the workspace `Cheats` folder, with
     /// `[EmuCore] EnableCheats` and `[Cheats] Enable = <chosen names>` in the
@@ -274,8 +282,10 @@ pub enum Pcsx2StagingRequirement {
     /// changes patch or widescreen behaviour.
     SeedConfigurationFromUserIni,
     /// This user-data folder is unspecified (default under the real data
-    /// root); pin it to the real absolute default so the redirected launch
-    /// does not see an empty one.
+    /// root, or settings root for DebuggerLayouts/DebuggerSettings); pin it
+    /// to the real absolute default so the redirected launch does not see
+    /// an empty one. GameSettings must instead be copied into the workspace
+    /// by CarryPerGameSettings; it must never be writable in the real root.
     PinUserFolderToRealDefault { key: String },
     /// Copy this game's per-game settings into the workspace.
     CarryPerGameSettings,
@@ -365,7 +375,7 @@ pub fn plan_pcsx2_temporary_cheat_launch(
     }
     if let Pcsx2FolderRouting::Known { user_data, .. } = input.folder_routing {
         for (key, entry) in user_data {
-            if *entry == Pcsx2FolderEntry::Unspecified {
+            if *entry == Pcsx2FolderEntry::Unspecified && key != "GameSettings" {
                 staging
                     .push(Pcsx2StagingRequirement::PinUserFolderToRealDefault { key: key.clone() });
             }
