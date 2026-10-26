@@ -129,6 +129,30 @@ pub(super) fn project(
             .records
             .iter()
             .any(|r| r.path == path && r.emulator == StateEmulator::RetroArch);
+        let kind_conflict = result.records.iter().any(|r| {
+            r.path == path
+                && r.emulator == StateEmulator::RetroArch
+                && !matches!(
+                    r.state_type,
+                    PersistentStateType::NativeSave | PersistentStateType::Unknown
+                )
+        });
+        let identity_conflict = result
+            .records
+            .iter()
+            .filter(|r| r.path == path && r.emulator == StateEmulator::RetroArch)
+            .flat_map(|r| r.game_identity.iter())
+            .any(|e| {
+                e.kind == crate::game_identity::IdentityKind::LooseRomSha256
+                    && e.status == crate::game_identity::IdentityStatus::Verified
+                    && e.value
+                        .as_ref()
+                        .is_some_and(|v| v != &selected.context.cartridge.sha256)
+            });
+        if kind_conflict || identity_conflict {
+            selected.state = OriginState::NeedsReview;
+            selected.explanation="Conflicting inventory kind or cartridge identity metadata; no automatic association.".into();
+        }
         let mut found = false;
         for record in result.records.iter_mut().filter(|r| {
             r.path == path
@@ -153,6 +177,11 @@ pub(super) fn project(
                 record.provenance.push_str(
                     "; this artifact's SRAM kind was witnessed during the verified session",
                 );
+            }
+            if origin.state == OriginState::NeedsReview {
+                record
+                    .warnings
+                    .push(format!("SRAM origin needs review: {}", origin.explanation));
             }
             record.sram_origin = Some(origin);
         }

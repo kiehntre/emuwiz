@@ -269,7 +269,7 @@ fn association_persists_and_changed_or_conflicting_evidence_needs_review() {
     second_receipt.origins[0].artifact = second_artifact.clone();
     store.publish("second.json", &second_receipt).unwrap();
     let sibling = ctx.scope.saves.join("save-history.srm");
-    fs::write(&sibling, b"unattested historical save").unwrap();
+    fs::write(&sibling, fs::read(&artifact.path).unwrap()).unwrap();
     let generic_roots = [PersistentStateRoot::configured(
         StateEmulator::RetroArch,
         ctx.scope.saves.clone(),
@@ -326,6 +326,32 @@ fn association_persists_and_changed_or_conflicting_evidence_needs_review() {
             .iter()
             .all(|r| r.state_type == PersistentStateType::SaveState && r.sram_origin.is_none())
     );
+    let overlap_roots = [generic_roots[0].clone(), known_state_roots[0].clone()];
+    let mut overlap = inventory_persistent_state(&overlap_roots);
+    inventory::project(&mut overlap, store.receipts().unwrap(), Some(&ctx.scope));
+    assert!(overlap.records.iter().all(|r| {
+        r.sram_origin
+            .as_ref()
+            .is_none_or(|o| o.state == OriginState::NeedsReview)
+    }));
+    assert!(
+        overlap
+            .records
+            .iter()
+            .filter(|r| r.path == second_artifact.path)
+            .all(|r| r.state_type != PersistentStateType::NativeSave)
+    );
+    let mut identity_root = roots[0].clone();
+    let mut foreign = ctx.cartridge_identity.clone();
+    foreign.value = Some("different cartridge identity".into());
+    identity_root.identity_evidence = vec![foreign];
+    let mut ownership = inventory_persistent_state(&[identity_root]);
+    inventory::project(&mut ownership, store.receipts().unwrap(), Some(&ctx.scope));
+    assert!(ownership.records.iter().all(|r| {
+        r.sram_origin
+            .as_ref()
+            .is_none_or(|o| o.state == OriginState::NeedsReview)
+    }));
     let mut conflicting = second_receipt.clone();
     conflicting.context.cartridge.sha256 = "conflicting cartridge".into();
     conflicting.origins[0].context = conflicting.context.clone();
