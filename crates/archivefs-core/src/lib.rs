@@ -81,6 +81,7 @@ pub mod game_firmware_adapters;
 /// already selected launch candidate. Explains; never decides or mutates.
 pub mod game_firmware_readiness;
 pub mod game_profile_planner;
+pub mod whdload_options;
 /// Provider-neutral homebrew project, release and artifact metadata types.
 pub mod homebrew_artifact;
 /// Offline discovery from an explicitly supplied local metadata catalogue.
