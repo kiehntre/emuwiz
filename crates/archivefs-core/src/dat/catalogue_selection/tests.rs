@@ -1069,3 +1069,57 @@ fn explicitly_imported_fbneo_is_listed_with_pinned_provenance_and_rechecks_its_b
     fs::write(row.technical_path.as_ref().unwrap(), b"changed snapshot").unwrap();
     assert!(resolve_catalogue(&row.reference, inventory).is_err());
 }
+
+#[test]
+fn disabled_installed_managed_sources_stay_visible_but_cannot_resolve_or_make_setup_ready() {
+    use crate::dat::updates::{ManagedDatUpdateOptions, import_managed_fbneo_dat};
+    for fbneo in [true, false] {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().join("managed");
+        let mut sources = ManagedDatSources::new();
+        if fbneo {
+            let dat = write_dat(
+                temp.path(),
+                "fbneo.dat",
+                &logiqx_dat("FBNeo - Neo Geo", "game"),
+            );
+            import_managed_fbneo_dat(
+                &ManagedDatSourceDescriptor::fbneo().unwrap(),
+                &ManagedDatUpdateOptions::new(root.clone(), 123),
+                &dat,
+            )
+            .unwrap();
+            sources.add_fbneo(ManagedDatUpdatePolicy::Disabled).unwrap();
+        } else {
+            install_mame(&root, "gamecom", &mame_softwarelist_dat("gamecom", "game"));
+            sources
+                .add_mame_software_list("gamecom", ManagedDatUpdatePolicy::Disabled)
+                .unwrap();
+        }
+        let registry = DatSourceRegistry::new();
+        let inventory = inputs(&registry, &sources, &root);
+        let rows = list_installed_catalogues(inventory);
+        assert_eq!(rows.len(), 1);
+        let row = &rows[0];
+        let snapshot = row.technical_path.as_ref().unwrap();
+        let before = fs::read(snapshot).unwrap();
+        let resolution = resolve_catalogue(&row.reference, inventory);
+        assert_eq!(
+            (
+                row.enabled,
+                row.capabilities.verify,
+                matches!(resolution, Err(CatalogueResolveError::Disabled { .. }))
+            ),
+            (false, false, true),
+            "disabled managed source must be withheld (FBNeo={fbneo})"
+        );
+        assert!(!row.capabilities.combined_evidence);
+        assert!(!row.capabilities.repair);
+        assert!(!row.capabilities.single_catalogue_1g1r);
+        assert_eq!(
+            super::setup_status::DatSetupStatus::from_catalogues(&rows).ready,
+            0
+        );
+        assert_eq!(fs::read(snapshot).unwrap(), before);
+    }
+}

@@ -508,12 +508,19 @@ pub fn list_installed_catalogues(
                 Ok(descriptor) => descriptor,
                 Err(_) => continue,
             };
-            rows.push(summarise_managed(
+            let mut summary = summarise_managed(
                 store,
                 descriptor.source_id().clone(),
                 load_managed_row(inputs.managed_root, &descriptor),
                 is_game,
-            ));
+            );
+            // Keep disabled registrations visible without offering them as
+            // verification data or contradicting current identity loading.
+            if descriptor.update_policy() == crate::dat::updates::ManagedDatUpdatePolicy::Disabled {
+                summary.enabled = false;
+                summary.capabilities = CatalogueCapabilities::NONE;
+            }
+            rows.push(summary);
         }
     }
 
@@ -1188,6 +1195,14 @@ fn load_managed_current(
                 source_id.source_key
             ),
         })?;
+
+    // Recheck policy at resolution too: an already-open selection must not
+    // bypass a source disabled since its inventory was displayed.
+    if descriptor.update_policy() == crate::dat::updates::ManagedDatUpdatePolicy::Disabled {
+        return Err(CatalogueResolveError::Disabled {
+            source_id: managed_dat_audit_source_id(source_id),
+        });
+    }
 
     match load_managed_row(managed_root, &descriptor) {
         ManagedRowState::Installed {
