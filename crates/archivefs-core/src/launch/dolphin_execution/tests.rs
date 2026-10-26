@@ -1082,3 +1082,138 @@ fn supported_wrappers_keep_existing_identity_and_native_preflight_contract() {
         assert_eq!(fs::read(&path).unwrap(), bytes);
     }
 }
+
+fn build_flatpak_fixture(label: &str) -> ReadyFixture {
+    let mut ready = build_ready_fixture(label);
+    let app_id = crate::launch::installation_known::DOLPHIN.flatpak_ids[0];
+    let profile = ready.roots.home.join(".var/app").join(app_id);
+    let config = profile.join("config/dolphin-emu");
+    fs::create_dir_all(&config).unwrap();
+    fs::create_dir_all(profile.join("data/dolphin-emu")).unwrap();
+    fs::write(config.join("Dolphin.ini"), b"[Core]\n").unwrap();
+    ready.request.profile_id = format!("dolphin:{}", config.display());
+    ready.request.expected_user_directory_mode = DolphinUserDirectoryMode::DefaultNative;
+    let binary = ready
+        .fixture
+        .write_executable("bin/flatpak", b"#!/bin/sh\nexit 0\n");
+    ready.roots.path_override = Some(vec![binary.parent().unwrap().to_path_buf()]);
+    ready.request.expected_executable = binary;
+    ready.fixture.write(
+        &format!("data/flatpak/app/{app_id}/current/active/metadata"),
+        b"[Application]\n[Context]\nfilesystems=host:ro;\n",
+    );
+    ready
+}
+
+#[test]
+fn flatpak_preflight_revalidates_default_profile_and_preserves_owned_process_tracking() {
+    let mut ready = build_flatpak_fixture("flatpak-lifecycle");
+    let command = preflight(&ready).unwrap();
+    assert_eq!(command.arguments[0], "run");
+    assert!(command.arguments[1].to_str().unwrap().ends_with(":ro"));
+    let mut launched = preflight_and_launch_dolphin(&ready.request, &ready.roots).unwrap();
+    let deadline = std::time::Instant::now() + Duration::from_secs(5);
+    while launched.poll().is_none() {
+        assert!(std::time::Instant::now() < deadline);
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    assert!(!launched.is_running());
+    ready.roots.dolphin_emu_userpath_override = Some(ready.fixture.path("other-profile"));
+    assert_eq!(
+        preflight(&ready).unwrap_err().kind,
+        DolphinLaunchPreflightErrorKind::BindingUnavailable
+    );
+}
+
+/// Explicit opt-in QA: the caller must provide a private HOME/XDG session,
+/// initialized Dolphin profile, and a disposable copy of authorised media.
+/// Set EMUWIZ_TEST_REAL_ENVIRONMENT=1 only with those private environment
+/// roots, so the global test constructor preserves the explicit QA session.
+#[test]
+#[ignore = "requires an installed Flatpak, graphical session and authorised disposable media"]
+fn dolphin_flatpak_disposable_live() {
+    let qa = PathBuf::from(std::env::var_os("EMUWIZ_DOLPHIN_QA_ROOT").expect("private QA root"));
+    let roots = DolphinLocalDiscoveryRoots::from_environment().unwrap();
+    assert_eq!(roots.home, qa.join("home"));
+    assert!(roots.xdg_config_home.starts_with(&qa));
+    assert!(roots.xdg_data_home.starts_with(&qa));
+    let content = qa.join("media/game.rvz");
+    let discovery = discover_dolphin_local_profiles(&roots);
+    let profile = discovery
+        .profiles
+        .iter()
+        .find(|profile| {
+            profile.installation_type
+                == crate::patch_manager::DolphinLocalInstallationType::FlatpakUser
+        })
+        .unwrap();
+    let binding = resolve_dolphin_native_launch_binding(profile, &roots).unwrap();
+    let request = DolphinLaunchRequest {
+        selected_content_path: content,
+        expected_game_id: std::env::var("EMUWIZ_DOLPHIN_QA_GAME_ID").unwrap(),
+        profile_id: profile.profile_id.clone(),
+        expected_executable: binding.executable,
+        expected_user_directory_mode: binding.user_directory_mode,
+    };
+    let command = preflight_dolphin_launch(&request, &roots).unwrap();
+    println!("LIVE command: {:?}", command.command_spec());
+    let mut launched = preflight_and_launch_dolphin(&request, &roots).unwrap();
+    fs::write(qa.join("launched.pid"), launched.pid.to_string()).unwrap();
+    std::thread::sleep(Duration::from_secs(25));
+    assert!(
+        launched.is_running(),
+        "Dolphin exited before the gameplay observation"
+    );
+    let outcome =
+        launched.request_graceful_stop(GracefulStopScope::LaunchedChild, Duration::from_secs(10));
+    println!("LIVE stop: {outcome:?}");
+    let deadline = std::time::Instant::now() + Duration::from_secs(15);
+    while launched.poll().is_none() {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "exit report is still draining; close surviving Dolphin descendants normally"
+        );
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    println!("LIVE exit: {:?}", launched.poll().unwrap());
+}
+
+#[test]
+fn flatpak_launch_keeps_lazy_data_initialization_and_refuses_unsafe_ancestry() {
+    let ready = build_flatpak_fixture("flatpak-lazy-data");
+    let data = ready
+        .roots
+        .home
+        .join(".var/app/org.DolphinEmu.dolphin-emu/data/dolphin-emu");
+    fs::remove_dir(&data).unwrap();
+    fs::remove_dir(data.parent().unwrap()).unwrap();
+    assert!(
+        preflight(&ready).is_ok(),
+        "sandbox may initialise its own missing data tree"
+    );
+    assert!(
+        !data.exists(),
+        "preflight must not create profile directories"
+    );
+    fs::create_dir_all(data.parent().unwrap()).unwrap();
+    fs::write(&data, b"not a directory").unwrap();
+    assert_eq!(
+        preflight(&ready).unwrap_err().kind,
+        DolphinLaunchPreflightErrorKind::BindingUnavailable
+    );
+    fs::remove_file(&data).unwrap();
+    symlink(ready.fixture.path("missing-target"), &data).unwrap();
+    assert_eq!(
+        preflight(&ready).unwrap_err().kind,
+        DolphinLaunchPreflightErrorKind::BindingUnavailable
+    );
+    fs::remove_file(&data).unwrap();
+    fs::remove_dir(data.parent().unwrap()).unwrap();
+    let elsewhere = ready.fixture.path("elsewhere");
+    fs::create_dir(&elsewhere).unwrap();
+    symlink(&elsewhere, data.parent().unwrap()).unwrap();
+    assert_eq!(
+        preflight(&ready).unwrap_err().kind,
+        DolphinLaunchPreflightErrorKind::BindingUnavailable
+    );
+}

@@ -4,7 +4,7 @@
 //!
 //! # Scope (Phase 2, first slice)
 //!
-//! - Native Dolphin profiles only - Flatpak, AppImage, and any profile
+//! - Supported native, AppImage and official Linux Flatpak Dolphin profiles; any profile
 //!   [`crate::patch_manager::resolve_dolphin_native_launch_binding`] itself
 //!   refuses are never attempted.
 //! - Direct loose regular `.iso`/`.gcm`/`.rvz`/`.ciso`/`.wbfs` content - no
@@ -18,7 +18,7 @@
 //! # What this module is not
 //!
 //! - It never builds a GUI Launch button and is not wired to one yet.
-//! - It never launches Flatpak/AppImage Dolphin, PCSX2, PPSSPP, or
+//! - It never launches PCSX2, PPSSPP, or
 //!   DuckStation.
 //! - It never touches Dolphin texture mods, cheats, RomM, DAT, Library View
 //!   History, ES-DE writes, or the shared transaction system.
@@ -307,6 +307,19 @@ pub fn preflight_dolphin_launch(
         ));
     }
 
+    let flatpak_resources = if matches!(
+        binding.installation,
+        crate::launch::installation::LaunchInstallation::Flatpak { .. }
+    ) {
+        Some(
+            super::dolphin_command::flatpak::inspect(content_path).map_err(|detail| {
+                preflight_error(DolphinLaunchPreflightErrorKind::CommandBlocked, detail)
+            })?,
+        )
+    } else {
+        None
+    };
+
     // --- 8: rebuild the plan, find the exact requested candidate ---
     let content_ref = LaunchContentRef {
         kind: Some(LaunchContentKind::OpticalDisc),
@@ -379,8 +392,13 @@ pub fn preflight_dolphin_launch(
         return Err(preflight_error(
             DolphinLaunchPreflightErrorKind::CommandBlocked,
             format!(
-                "command plan reported {} blocker(s)",
-                command_plan.blockers.len()
+                "command plan refused launch: {}",
+                command_plan
+                    .blockers
+                    .iter()
+                    .map(|blocker| blocker.detail.as_str())
+                    .collect::<Vec<_>>()
+                    .join("; ")
             ),
         ));
     }
@@ -402,6 +420,18 @@ pub fn preflight_dolphin_launch(
             DolphinLaunchPreflightErrorKind::ContentChangedBeforeSpawn,
             "content file changed during preflight",
         ));
+    }
+
+    if let Some(expected) = flatpak_resources {
+        let current = super::dolphin_command::flatpak::inspect(content_path).map_err(|detail| {
+            preflight_error(DolphinLaunchPreflightErrorKind::CommandBlocked, detail)
+        })?;
+        if current != expected {
+            return Err(preflight_error(
+                DolphinLaunchPreflightErrorKind::ContentChangedBeforeSpawn,
+                "Flatpak game files or companions changed during preflight",
+            ));
+        }
     }
 
     Ok(command)
@@ -615,7 +645,7 @@ impl LaunchedDolphinProcess {
     /// child. Whole-tree requests refuse; a wrapper's exit is not proof
     /// that its descendants exited. No second signal or forced kill is
     /// sent, and polling remains necessary for stderr and the exit report.
-    /// This does not widen native launch support to Flatpak or AppImage.
+    /// The same ownership checks apply to the Flatpak launcher process.
     pub fn request_graceful_stop(
         &mut self,
         scope: GracefulStopScope,
