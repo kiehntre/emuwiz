@@ -71,10 +71,9 @@ use archivefs_core::launch::{
     XemuLaunchExecutionError, XemuLaunchRequest, XeniaLaunchExecutionError, XeniaLaunchRequest,
     build_amiberry_whdload_command_plan, build_dolphin_command_plan,
     build_duckstation_command_plan, build_fsuae_whdload_command_plan, build_pcsx2_command_plan,
-    build_ppsspp_command_plan, build_retroarch_command_plan, build_rpcs3_command_plan,
-    build_xenia_command_plan, preflight_and_launch_amiga_whdload, preflight_and_launch_openmsx,
-    preflight_and_launch_ppsspp, preflight_and_launch_rpcs3, preflight_and_launch_xemu,
-    preflight_and_launch_xenia,
+    build_retroarch_command_plan, build_rpcs3_command_plan, build_xenia_command_plan,
+    preflight_and_launch_amiga_whdload, preflight_and_launch_openmsx, preflight_and_launch_ppsspp,
+    preflight_and_launch_rpcs3, preflight_and_launch_xemu, preflight_and_launch_xenia,
 };
 use archivefs_core::launch::{
     CandidatePreference, DOLPHIN_SUPPORTED_PLATFORM_ID, DolphinLaunchExecutionError,
@@ -847,6 +846,7 @@ pub(crate) struct PpssppLaunchContext {
     pub(crate) discovery: archivefs_core::patch_manager::PpssppProfileDiscovery,
     pub(crate) roots: archivefs_core::patch_manager::PpssppProfileDiscoveryRoots,
     pub(crate) verified_psp_disc_id: Option<String>,
+    pub(crate) verified_standalone_pbp_sha256: Option<String>,
 }
 pub(crate) struct MelonDsLaunchContext {
     pub(crate) discovery: archivefs_core::patch_manager::MelonDsProfileDiscovery,
@@ -3724,9 +3724,15 @@ fn launch_command_preview(
                     .find(|profile| &profile.profile_id == profile_id)?;
                 let binding =
                     archivefs_core::patch_manager::resolve_ppsspp_native_launch_binding(profile);
-                build_ppsspp_command_plan(&identity, disc_id, candidate, &binding)
-                    .command
-                    .map(|command| command.command_spec())
+                archivefs_core::launch::ppsspp_command::build_ppsspp_command_plan_with_pbp(
+                    &identity,
+                    disc_id,
+                    context.verified_standalone_pbp_sha256.as_deref(),
+                    candidate,
+                    &binding,
+                )
+                .command
+                .map(|command| command.command_spec())
             }
             "rpcs3" => {
                 let context = rpcs3?;
@@ -4083,6 +4089,7 @@ fn standalone_launch_request(
                     expected_platform_id: platform,
                     expected_game_key: game_key,
                     expected_psp_disc_id: disc_id,
+                    expected_standalone_pbp_sha256: context.verified_standalone_pbp_sha256.clone(),
                     profile_id: profile.profile_id.clone(),
                     expected_executable: binding.executable,
                     expected_installation: binding.installation,

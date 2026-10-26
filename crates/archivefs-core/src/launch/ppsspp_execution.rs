@@ -56,7 +56,8 @@ use crate::launch::planning::{
     CanonicalIdentityStatus, LaunchContainerKind, LaunchContentKind, LaunchContentRef, LaunchTarget,
 };
 use crate::launch::ppsspp_command::{
-    PPSSPP_SUPPORTED_PLATFORM_ID, PpssppCommand, build_ppsspp_command_plan, direct_psp_extension,
+    PPSSPP_SUPPORTED_PLATFORM_ID, PpssppCommand, build_ppsspp_command_plan_with_pbp,
+    direct_psp_extension,
 };
 use crate::launch::process_spawn::{self, CapturedFileIdentity, ProcessExitReport, WatchedProcess};
 use crate::launch::readiness::LaunchReadiness;
@@ -92,6 +93,8 @@ pub struct PpssppLaunchRequest {
     pub expected_platform_id: String,
     pub expected_game_key: String,
     pub expected_psp_disc_id: String,
+    /// Exact classified PBP digest approved at readiness time; absent for ISO.
+    pub expected_standalone_pbp_sha256: Option<String>,
     /// Which discovered [`crate::patch_manager::PpssppProfile::profile_id`]
     /// the binding must belong to.
     pub profile_id: String,
@@ -280,7 +283,8 @@ pub fn preflight_ppsspp_launch(
     let content_identity = inspect_and_capture_content_identity(content_path)?;
 
     // --- 4: fresh identity re-inspection + verified PSP disc ID ---
-    let (identity_status, facts, verified_disc_id) = fresh_identity_status(content_path, request)?;
+    let (identity_status, facts, verified_disc_id, verified_pbp_hash) =
+        fresh_identity_status(content_path, request)?;
 
     // --- 5-6: fresh profile discovery, find the exact requested profile ---
     let discovery = discover_ppsspp_profiles(roots);
@@ -374,9 +378,10 @@ pub fn preflight_ppsspp_launch(
     }
 
     // --- 9: rebuild the command plan ---
-    let command_plan = build_ppsspp_command_plan(
+    let command_plan = build_ppsspp_command_plan_with_pbp(
         &identity_status,
         Some(&verified_disc_id),
+        verified_pbp_hash.as_deref(),
         candidate,
         &binding_result,
     );
@@ -399,7 +404,9 @@ pub fn preflight_ppsspp_launch(
     // --- 10: recheck immediately before spawn ---
     recheck_executable(&command.executable)?;
     let current_identity = inspect_and_capture_content_identity(&command.selection.content_path)?;
-    if current_identity != content_identity {
+    let (_, _, _, current_pbp_hash) =
+        fresh_identity_status(&command.selection.content_path, request)?;
+    if current_identity != content_identity || current_pbp_hash != verified_pbp_hash {
         return Err(preflight_error(
             PpssppLaunchPreflightErrorKind::ContentChangedBeforeSpawn,
             "content file changed during preflight",
@@ -436,11 +443,15 @@ fn inspect_and_capture_content_identity(
             "content path is an outer archive/mount-input path, not direct content",
         ));
     }
-    if !direct_psp_extension(path) {
+    let extension_supported = direct_psp_extension(path)
+        || path
+            .extension()
+            .and_then(|e| e.to_str())
+            .is_some_and(|e| e.eq_ignore_ascii_case("pbp"));
+    if !extension_supported {
         return Err(preflight_error(
             PpssppLaunchPreflightErrorKind::ContentFormatUnsupported,
-            "only a direct .iso file is supported by this native PPSSPP launch slice - CSO, \
-             CHD, PBP, and ZIP-contained PSP games are all refused",
+            "only direct .iso or classified standalone EBOOT.PBP content is supported; CSO, CHD, and ZIP-contained PSP games are refused",
         ));
     }
     Ok(CapturedFileIdentity::capture(&metadata))
@@ -449,14 +460,38 @@ fn inspect_and_capture_content_identity(
 fn fresh_identity_status(
     content_path: &Path,
     request: &PpssppLaunchRequest,
-) -> Result<(CanonicalIdentityStatus, Vec<VerifiedIdentityFact>, String), PpssppLaunchPreflightError>
-{
+) -> Result<
+    (
+        CanonicalIdentityStatus,
+        Vec<VerifiedIdentityFact>,
+        String,
+        Option<String>,
+    ),
+    PpssppLaunchPreflightError,
+> {
     // `inspect_catalogued_game_identity`, not the plain `inspect_game_identity` -
     // this request only ever exists because the game was already
     // catalogued/identified earlier; the platform hint here is fixed to
     // this slice's own supported platform, never derived from this path's
     // name or extension.
     let report = inspect_catalogued_game_identity(content_path, Some(PPSSPP_SUPPORTED_PLATFORM_ID));
+    let extension = content_path
+        .extension()
+        .and_then(|value| value.to_str())
+        .unwrap_or_default();
+    let format_matches_path = if extension.eq_ignore_ascii_case("pbp") {
+        report.format == crate::game_identity::IdentityImageFormat::Pbp
+    } else if extension.eq_ignore_ascii_case("iso") {
+        report.format == crate::game_identity::IdentityImageFormat::Iso
+    } else {
+        false
+    };
+    if !format_matches_path {
+        return Err(preflight_error(
+            PpssppLaunchPreflightErrorKind::IdentityMismatch,
+            "inspected PSP container format does not match the selected ISO/PBP path",
+        ));
+    }
     let (identity_status, facts) = canonical_identity_from_game_report(&report);
     match &identity_status {
         CanonicalIdentityStatus::Resolved(resolved) => {
@@ -502,7 +537,33 @@ fn fresh_identity_status(
             ),
         ));
     }
-    Ok((identity_status, facts, disc_id))
+    let pbp_hash = facts.iter().find_map(|fact| match fact {
+        VerifiedIdentityFact::PspStandalonePbpSha256(value) => Some(value.clone()),
+        _ => None,
+    });
+    if content_path
+        .extension()
+        .and_then(|e| e.to_str())
+        .is_some_and(|e| e.eq_ignore_ascii_case("pbp"))
+        && request.expected_standalone_pbp_sha256.as_deref() != pbp_hash.as_deref()
+    {
+        return Err(preflight_error(
+            PpssppLaunchPreflightErrorKind::IdentityMismatch,
+            "fresh PBP executable classification or exact file digest does not match the approved content",
+        ));
+    }
+    if content_path
+        .extension()
+        .and_then(|e| e.to_str())
+        .is_some_and(|e| e.eq_ignore_ascii_case("iso"))
+        && request.expected_standalone_pbp_sha256.is_some()
+    {
+        return Err(preflight_error(
+            PpssppLaunchPreflightErrorKind::IdentityMismatch,
+            "PBP container evidence was supplied for an ISO launch request",
+        ));
+    }
+    Ok((identity_status, facts, disc_id, pbp_hash))
 }
 
 fn recheck_executable(path: &Path) -> Result<(), PpssppLaunchPreflightError> {

@@ -77,6 +77,9 @@ pub enum VerifiedIdentityFact {
     Ps3TitleId(String),
     /// A verified PSP disc ID.
     PspDiscId(String),
+    /// Exact SHA-256 binding for a positively classified standalone PSP PBP.
+    /// This is launch-container evidence, not game identity.
+    PspStandalonePbpSha256(String),
     /// A verified original-Xbox title ID.
     XboxTitleId(String),
     /// A verified GameCube disc-header Game ID.

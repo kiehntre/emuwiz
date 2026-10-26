@@ -139,6 +139,33 @@ fn only_direct_plain_iso_is_supported() {
 }
 
 #[test]
+fn standalone_pbp_requires_positive_container_digest() {
+    let game = candidate(Some(PathBuf::from("/games/EBOOT.PBP")));
+    let refused = build_ppsspp_command_plan(&resolved(), Some("ULUS-10000"), &game, &binding());
+    assert!(refused.command.is_none());
+    let malformed_digest = build_ppsspp_command_plan_with_pbp(
+        &resolved(),
+        Some("ULUS-10000"),
+        Some("not-a-sha256"),
+        &game,
+        &binding(),
+    );
+    assert!(malformed_digest.command.is_none());
+    let ready = build_ppsspp_command_plan_with_pbp(
+        &resolved(),
+        Some("ULUS-10000"),
+        Some("a".repeat(64).as_str()),
+        &game,
+        &binding(),
+    );
+    assert_eq!(ready.blockers, Vec::new());
+    assert_eq!(
+        ready.command.unwrap().arguments,
+        vec![OsString::from("/games/EBOOT.PBP")]
+    );
+}
+
+#[test]
 fn unresolved_mount_and_blocked_candidate_are_refused() {
     let mut mounted = candidate(None);
     mounted.content.requires_mount = true;

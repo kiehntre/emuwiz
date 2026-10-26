@@ -161,6 +161,47 @@ fn verified_psp_disc_id_resolves_to_ppsspp_fact() {
 }
 
 #[test]
+fn standalone_pbp_digest_projects_only_when_unique_and_exact() {
+    let mut source = report(
+        IdentityPlatform::Psp,
+        vec![
+            evidence(
+                IdentityKind::PspDiscId,
+                IdentityStatus::Verified,
+                Some("ULUS10000"),
+                IdentityConfidence::StructuredMetadata,
+            ),
+            evidence(
+                IdentityKind::PspStandalonePbp,
+                IdentityStatus::Verified,
+                Some(&"a".repeat(64)),
+                IdentityConfidence::ExactBytes,
+            ),
+        ],
+    );
+    source.format = IdentityImageFormat::Pbp;
+    let (_, facts) = canonical_identity_from_game_report(&source);
+    assert!(
+        facts.contains(&VerifiedIdentityFact::PspStandalonePbpSha256(
+            "a".repeat(64)
+        ))
+    );
+
+    source.evidence.push(evidence(
+        IdentityKind::PspStandalonePbp,
+        IdentityStatus::Verified,
+        Some(&"b".repeat(64)),
+        IdentityConfidence::ExactBytes,
+    ));
+    let (_, facts) = canonical_identity_from_game_report(&source);
+    assert!(
+        !facts
+            .iter()
+            .any(|fact| matches!(fact, VerifiedIdentityFact::PspStandalonePbpSha256(_)))
+    );
+}
+
+#[test]
 fn verified_ps3_title_id_resolves_to_rpcs3_fact() {
     let source = report(
         IdentityPlatform::PlayStation3,
@@ -909,6 +950,43 @@ fn direct_game_image_resolves_to_its_own_path() {
     );
     assert!(!content.requires_mount);
     assert!(content.has_runnable_path());
+}
+
+#[test]
+fn direct_iso_and_pbp_are_optical_shapes_without_conferring_identity() {
+    use super::canonical_identity_from_game_report;
+    use crate::game_identity::{GameIdentityReport, IdentityImageFormat, IdentityPlatform};
+
+    for path in ["/library/Game.iso", "/library/EBOOT.PBP"] {
+        let record = sample_record(
+            sample_archive(path, ArchiveKind::DirectGameImage),
+            MountState::NotMountable,
+        );
+        let content = launch_content_ref_from_archive_record(&record, None);
+        assert_eq!(content.kind, Some(LaunchContentKind::OpticalDisc));
+        assert_eq!(content.container, Some(LaunchContainerKind::PlainFile));
+        assert_eq!(content.resolved_path.as_deref(), Some(Path::new(path)));
+        assert!(!content.requires_mount);
+    }
+
+    // A file extension classifies only the direct content shape. Without a
+    // verified identity report, the canonical identity bridge remains closed.
+    let unresolved = GameIdentityReport {
+        archive_path: PathBuf::from("/library/EBOOT.PBP"),
+        platform: IdentityPlatform::Other,
+        format: IdentityImageFormat::Pbp,
+        evidence: Vec::new(),
+        warnings: Vec::new(),
+        bytes_read: 0,
+        archive_members_inspected: 0,
+        metadata_paths_inspected: 0,
+        nested_container_depth: 0,
+        complete: true,
+    };
+    assert_eq!(
+        canonical_identity_from_game_report(&unresolved).0,
+        CanonicalIdentityStatus::Unknown
+    );
 }
 
 #[test]

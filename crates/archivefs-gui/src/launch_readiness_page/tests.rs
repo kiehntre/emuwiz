@@ -260,6 +260,119 @@ fn openmsx_request_refuses_an_unsupported_cartridge_extension() {
 }
 
 #[test]
+fn verified_pbp_candidate_reaches_the_existing_ppsspp_launch_request() {
+    let temp = tempfile::tempdir().unwrap();
+    let home = temp.path().join("home");
+    let xdg_config_home = home.join(".config");
+    let xdg_data_home = home.join(".local/share");
+    let configuration_path = temp.path().join("ppsspp-config");
+    let settings = configuration_path.join("PSP/SYSTEM/ppsspp.ini");
+    std::fs::create_dir_all(settings.parent().unwrap()).unwrap();
+    std::fs::write(&settings, "").unwrap();
+
+    let executable = temp.path().join("PPSSPP");
+    std::fs::write(&executable, b"test executable fixture").unwrap();
+    std::fs::set_permissions(&executable, std::fs::Permissions::from_mode(0o755)).unwrap();
+    let roots = archivefs_core::patch_manager::PpssppProfileDiscoveryRoots {
+        home,
+        xdg_config_home,
+        xdg_data_home,
+        explicit_configuration_roots: vec![configuration_path.clone()],
+        portable_configuration_roots: Vec::new(),
+        explicit_executables: vec![executable],
+        known_version_outputs: BTreeMap::new(),
+        appimage_directory: None,
+        path_override: Some(Vec::new()),
+    };
+    let discovery = archivefs_core::patch_manager::discover_ppsspp_profiles(&roots);
+    let profile = discovery
+        .profiles
+        .iter()
+        .find(|profile| profile.eligible)
+        .expect("fixture PPSSPP profile should be eligible");
+
+    let pbp = temp.path().join("EBOOT.PBP");
+    std::fs::write(
+        &pbp,
+        b"validated fixture is represented by the identity facts below",
+    )
+    .unwrap();
+    let candidate = LaunchCandidate {
+        target: LaunchTarget::Standalone {
+            adapter_id: "ppsspp",
+            profile_id: profile.profile_id.clone(),
+            profile_path: Some(profile.configuration_path.clone()),
+        },
+        content: LaunchContentRef {
+            kind: Some(LaunchContentKind::OpticalDisc),
+            container: Some(LaunchContainerKind::PlainFile),
+            resolved_path: Some(pbp.clone()),
+            requires_mount: false,
+            provenance: "fixture with positively verified PSP PBP evidence".into(),
+        },
+        firmware: FirmwareReadiness::NotRequired,
+        blockers: Vec::new(),
+        warnings: Vec::new(),
+        readiness: LaunchReadiness::Ready,
+        preference: CandidatePreference::SoleEligible,
+    };
+    let mut plan = plan_with(vec![candidate.clone()]);
+    plan.platform_id = Some("PSP".into());
+    plan.game_key = Some("UCES00302".into());
+    let identity = LaunchReadinessInput::Plan {
+        plan: plan.clone(),
+        retroarch: None,
+        retroarch_scanned: true,
+        standalone_scans_complete: true,
+        dolphin: None,
+        pcsx2: None,
+        duckstation: None,
+        ppsspp: Some(PpssppLaunchContext {
+            discovery,
+            roots,
+            verified_psp_disc_id: Some("UCES00302".into()),
+            verified_standalone_pbp_sha256: Some("a".repeat(64)),
+        }),
+        rpcs3: None,
+        xemu: None,
+        xenia: None,
+        melonds: None,
+        cemu: None,
+        flycast: None,
+        xroar: None,
+        vice: None,
+        amiga_whdload: None,
+        #[cfg(target_os = "linux")]
+        shadps4: None,
+    };
+    let LaunchReadinessInput::Plan {
+        ppsspp: Some(context),
+        ..
+    } = identity
+    else {
+        unreachable!();
+    };
+
+    let request = standalone_launch_request(
+        &plan,
+        &candidate,
+        None,
+        Some(&context),
+        None,
+        None,
+        None,
+        None,
+    )
+    .expect("verified standalone PBP should reach Blue's PPSSPP launch request");
+    let StandaloneLaunchRequest::Ppsspp(request, _) = request else {
+        panic!("PBP candidate did not use the existing PPSSPP lifecycle");
+    };
+    assert_eq!(request.selected_content_path, pbp);
+    assert_eq!(request.expected_psp_disc_id, "UCES00302");
+    assert_eq!(request.expected_standalone_pbp_sha256, Some("a".repeat(64)));
+}
+
+#[test]
 fn planned_openmsx_msx2_cartridge_handoff_keeps_the_msx2_cbios_binding() {
     let directory = tempfile::tempdir().unwrap();
     let content = directory.path().join("verified.mx2");

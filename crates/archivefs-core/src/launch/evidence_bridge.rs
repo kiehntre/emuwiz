@@ -116,6 +116,18 @@ fn verified_identity_values(report: &GameIdentityReport) -> Vec<(IdentityKind, S
         .collect()
 }
 
+fn verified_standalone_pbp_digest(report: &GameIdentityReport) -> Option<&str> {
+    let mut evidence = report.evidence.iter().filter(|item| {
+        item.kind == IdentityKind::PspStandalonePbp && item.status == IdentityStatus::Verified
+    });
+    let fact = evidence.next()?;
+    if evidence.next().is_some() || fact.confidence != IdentityConfidence::ExactBytes {
+        return None;
+    }
+    let value = fact.value.as_deref()?;
+    (value.len() == 64 && value.bytes().all(|byte| byte.is_ascii_hexdigit())).then_some(value)
+}
+
 /// Whether `resolved` contains two different verified values for the same
 /// [`IdentityKind`] - the one shape of genuine, provable conflict this
 /// bridge can see without fabricating a broader heuristic: the identity
@@ -458,7 +470,20 @@ pub fn canonical_identity_from_game_report(
                 platform_id: platform_id.to_string(),
                 game_key,
             }),
-            facts,
+            {
+                let mut facts = facts;
+                // This evidence is intentionally excluded from the canonical
+                // identity key: it authorizes only the exact PBP container.
+                if report.platform == IdentityPlatform::Psp
+                    && report.format == crate::game_identity::IdentityImageFormat::Pbp
+                    && let Some(hash) = verified_standalone_pbp_digest(report)
+                {
+                    facts.push(VerifiedIdentityFact::PspStandalonePbpSha256(
+                        hash.to_string(),
+                    ));
+                }
+                facts
+            },
         ),
         None => (CanonicalIdentityStatus::Unknown, Vec::new()),
     }
@@ -579,6 +604,21 @@ pub fn launch_content_ref_for_unmounted(
                     }) =>
             {
                 Some(LaunchContentKind::Cartridge)
+            }
+            // These direct files are only a *content-shape* hint here. They
+            // do not establish a platform or game identity: adapter planners
+            // still require their own verified identity and format evidence
+            // before they can offer a launch action.
+            ArchiveKind::DirectGameImage
+                if archive_path
+                    .extension()
+                    .and_then(|extension| extension.to_str())
+                    .is_some_and(|extension| {
+                        extension.eq_ignore_ascii_case("iso")
+                            || extension.eq_ignore_ascii_case("pbp")
+                    }) =>
+            {
+                Some(LaunchContentKind::OpticalDisc)
             }
             ArchiveKind::ArcadeSetDirectory => Some(LaunchContentKind::ExtractedArcadeSet),
             // `DirectGameImage` covers more than one real platform/format;

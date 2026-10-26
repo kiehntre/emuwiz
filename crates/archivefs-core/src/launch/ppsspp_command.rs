@@ -1,12 +1,13 @@
 //! Read-only native PPSSPP command planning.
 //!
 //! PPSSPP's documented application usage is `PPSSPP [options] [FILE]`; this
-//! slice uses the direct positional-file form for a verified PSP ISO.  The
+//! slice uses the direct positional-file form for verified PSP ISOs and the
+//! bounded, positively classified standalone PBP subset. The
 //! executable and content are kept as separate `OsString` values and are
 //! never interpreted by a shell.
 //!
 //! This planner is deliberately narrower than PPSSPP itself.  It does not
-//! claim support for CSO, CHD, PBP, ZIP, mounted content, or other layouts
+//! claim support for CSO, CHD, other PBP variants, ZIP, mounted content, or other layouts
 //! until EmuWiz can both inspect and bind those representations
 //! authoritatively.
 
@@ -72,12 +73,34 @@ pub(crate) fn direct_psp_extension(path: &Path) -> bool {
         .is_some_and(|extension| extension.eq_ignore_ascii_case("iso"))
 }
 
+fn direct_pbp_extension(path: &Path) -> bool {
+    path.extension()
+        .and_then(|extension| extension.to_str())
+        .is_some_and(|extension| extension.eq_ignore_ascii_case("pbp"))
+}
+
+fn valid_sha256_hex(value: &str) -> bool {
+    value.len() == 64 && value.bytes().all(|byte| byte.is_ascii_hexdigit())
+}
+
 /// Builds a native PPSSPP command from an already resolved identity,
 /// planner candidate, freshly projected verified disc ID, and freshly
 /// revalidated executable binding.
 pub fn build_ppsspp_command_plan(
     identity: &CanonicalIdentityStatus,
     verified_psp_disc_id: Option<&str>,
+    candidate: &LaunchCandidate,
+    binding: &Result<PpssppNativeLaunchBinding, PpssppLaunchBlocker>,
+) -> PpssppCommandPlan {
+    build_ppsspp_command_plan_with_pbp(identity, verified_psp_disc_id, None, candidate, binding)
+}
+
+/// Same plan as [`build_ppsspp_command_plan`] with the separately verified
+/// full-file digest that authorizes only a standalone PBP container.
+pub fn build_ppsspp_command_plan_with_pbp(
+    identity: &CanonicalIdentityStatus,
+    verified_psp_disc_id: Option<&str>,
+    verified_standalone_pbp_sha256: Option<&str>,
     candidate: &LaunchCandidate,
     binding: &Result<PpssppNativeLaunchBinding, PpssppLaunchBlocker>,
 ) -> PpssppCommandPlan {
@@ -159,14 +182,16 @@ pub fn build_ppsspp_command_plan(
             if !candidate.content.requires_mount
                 && candidate.content.kind
                     == Some(crate::launch::planning::LaunchContentKind::OpticalDisc)
-                && direct_psp_extension(path) =>
+                && (direct_psp_extension(path)
+                    || (direct_pbp_extension(path)
+                        && verified_standalone_pbp_sha256.is_some_and(valid_sha256_hex))) =>
         {
             Some(path.clone())
         }
         (Some(_), _) => {
             blockers.push(blocker(
                 LaunchBlockerKind::PpssppContentFormatUnsupported,
-                "only a direct PSP .iso file is supported; archives, mounts, and other PSP layouts are refused",
+                "only a direct PSP .iso or positively classified standalone EBOOT.PBP is supported; other archives and PSP layouts are refused",
             ));
             None
         }

@@ -34,13 +34,7 @@ impl PpssppResolutionInputs {
     pub(crate) fn from_environment(overrides: &EmulatorPathOverrides) -> Result<Self, String> {
         let mut roots =
             PpssppProfileDiscoveryRoots::from_environment().map_err(|e| e.to_string())?;
-        // An old override is evidence for the resolver, never an order.
-        if let Some(executable) = &overrides.ppsspp_executable {
-            roots.explicit_executables.push(executable.clone());
-        }
-        if let Some(folder) = &overrides.ppsspp_configuration_folder {
-            roots.explicit_configuration_roots.push(folder.clone());
-        }
+        apply_overrides_to_roots(&mut roots, overrides);
         let desktop_directories = default_desktop_directories(&roots.home, &roots.xdg_data_home);
         Ok(Self {
             roots,
@@ -48,6 +42,22 @@ impl PpssppResolutionInputs {
             selection_path:
                 archivefs_core::emulator_profile_resolver::persist::default_selection_path().ok(),
         })
+    }
+}
+
+/// Apply the existing Setup overrides to a read-only PPSSPP discovery root.
+/// They are executable/profile evidence only; native preflight still checks
+/// the same exact paths and every content identity fact.
+pub(crate) fn apply_overrides_to_roots(
+    roots: &mut PpssppProfileDiscoveryRoots,
+    overrides: &EmulatorPathOverrides,
+) {
+    // A remembered path is evidence for discovery, never an order.
+    if let Some(executable) = &overrides.ppsspp_executable {
+        roots.explicit_executables.push(executable.clone());
+    }
+    if let Some(folder) = &overrides.ppsspp_configuration_folder {
+        roots.explicit_configuration_roots.push(folder.clone());
     }
 }
 
