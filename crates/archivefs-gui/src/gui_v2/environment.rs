@@ -44,6 +44,7 @@ pub(super) struct EnvironmentSnapshot {
     pub source_error: Option<String>,
     pub identification_data_count: usize,
     pub identification_data_ready: bool,
+    pub dat_setup: Option<archivefs_core::dat::catalogue_selection::setup_status::DatSetupStatus>,
     pub lifecycle: Vec<EmulatorLifecycleProjection>,
     pub legacy_config_present: bool,
     pub legacy_data_present: bool,
@@ -110,6 +111,7 @@ impl Default for EnvironmentSnapshot {
             source_error: None,
             identification_data_count: 0,
             identification_data_ready: false,
+            dat_setup: None,
             lifecycle: Vec::new(),
             legacy_config_present: false,
             legacy_data_present: false,
@@ -162,8 +164,17 @@ pub(super) fn gather() -> EnvironmentSnapshot {
             Err(error) => (0, 0, Vec::new(), Some(error.to_string())),
         };
 
-    let identification_data_count = local_dat_count() + managed_dat_count();
-    let identification_data_ready = identification_data_count > 0;
+    let dat_setup = crate::dat_catalogue_picker::load_inventory_snapshot()
+        .ok()
+        .map(|snapshot| {
+            archivefs_core::dat::catalogue_selection::setup_status::DatSetupStatus::from_catalogues(
+                &archivefs_core::dat::catalogue_selection::list_installed_catalogues(
+                    snapshot.inputs(),
+                ),
+            )
+        });
+    let identification_data_count = dat_setup.as_ref().map_or(0, |status| status.configured);
+    let identification_data_ready = dat_setup.as_ref().is_some_and(|status| status.ready > 0);
 
     let lifecycle = lifecycle_projections();
     let (database_schema, database_error) = if database_present {
@@ -207,6 +218,7 @@ pub(super) fn gather() -> EnvironmentSnapshot {
         source_error,
         identification_data_count,
         identification_data_ready,
+        dat_setup,
         lifecycle,
         legacy_config_present,
         legacy_data_present,
@@ -223,30 +235,6 @@ fn path_present(path: &std::path::Path) -> bool {
         Ok(_) => true,
         Err(error) => error.kind() != std::io::ErrorKind::NotFound,
     }
-}
-
-fn local_dat_count() -> usize {
-    archivefs_core::dat::sources::default_dat_sources_config_path()
-        .ok()
-        .and_then(|path| archivefs_core::dat::sources::load_dat_sources_config_from(path).ok())
-        .and_then(|config| config.sources)
-        .map_or(0, |sources| sources.len())
-}
-
-fn managed_dat_count() -> usize {
-    archivefs_core::dat::managed_sources::default_managed_dat_sources_config_path()
-        .ok()
-        .and_then(|path| {
-            archivefs_core::dat::managed_sources::load_managed_dat_sources_from(path).ok()
-        })
-        .map(|sources| {
-            let config = sources.to_config();
-            config.mame_software_lists.len()
-                + config.redump_bios.len()
-                + config.redump_games.len()
-                + usize::from(config.fbneo.is_some())
-        })
-        .unwrap_or_default()
 }
 
 fn lifecycle_projections() -> Vec<EmulatorLifecycleProjection> {

@@ -65,6 +65,7 @@ use crate::dat::updates::{
     ManagedDatProvider, ManagedDatSourceDescriptor, ManagedDatSourceId, ManagedDatState,
     load_managed_dat_state, resolve_current_managed_dat_source,
 };
+pub mod setup_status;
 #[cfg(test)]
 mod tests;
 
@@ -344,6 +345,7 @@ pub enum CatalogueStore {
     ManagedMameSoftwareList,
     ManagedRedumpGames,
     ManagedRedumpBios,
+    ManagedFbneo,
 }
 
 impl CatalogueStore {
@@ -353,6 +355,7 @@ impl CatalogueStore {
             Self::ManagedMameSoftwareList => 1,
             Self::ManagedRedumpGames => 2,
             Self::ManagedRedumpBios => 3,
+            Self::ManagedFbneo => 4,
         }
     }
 
@@ -362,6 +365,7 @@ impl CatalogueStore {
             Self::ManagedMameSoftwareList => "Managed · MAME software list",
             Self::ManagedRedumpGames => "Managed · Redump games",
             Self::ManagedRedumpBios => "Managed · Redump BIOS",
+            Self::ManagedFbneo => "Managed · FBNeo",
         }
     }
 }
@@ -492,6 +496,11 @@ pub fn list_installed_catalogues(
             CatalogueStore::ManagedRedumpBios,
             ManagedDatProvider::RedumpBios,
             false,
+        ),
+        (
+            CatalogueStore::ManagedFbneo,
+            ManagedDatProvider::Fbneo,
+            true,
         ),
     ] {
         for descriptor in managed_descriptors(inputs.managed_sources, provider) {

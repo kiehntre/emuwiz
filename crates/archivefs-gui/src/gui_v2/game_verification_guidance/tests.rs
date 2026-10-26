@@ -121,7 +121,7 @@ fn every_system_has_truthful_guidance_for_assignment_validation_and_audit_result
         );
         assert_eq!(
             (missing.reason, missing.action),
-            ("No compatible DAT assigned", Action::SelectDat)
+            ("No trusted DAT configured", Action::SelectDat)
         );
         let saved = f.catalogues[0].availability.clone();
         for availability in [
@@ -301,7 +301,7 @@ fn hundreds_of_unrelated_or_unresolved_catalogues_do_not_assign_a_dat() {
         Ok(&rows),
         None,
     );
-    assert_eq!(result.reason, "No compatible DAT assigned");
+    assert_eq!(result.reason, "Catalogue system coverage unresolved");
     assert_eq!(result.action, Action::SelectDat);
 }
 
@@ -588,5 +588,59 @@ fn changed_cue_companions_are_stale_even_when_the_sheet_is_unchanged() {
     assert_eq!(
         saved_evidence(game, &database).unwrap().1,
         DatProvenanceFreshness::Stale
+    );
+}
+
+#[test]
+fn configuration_coverage_and_unattempted_check_are_distinct_without_changing_identity() {
+    let mut f = fixture("BBC Micro", "ssd");
+    let explain_rows = |rows: &[InstalledCatalogueSummary]| {
+        explain(
+            &f.game,
+            true,
+            true,
+            0,
+            DatProvenanceFreshness::Unknown,
+            Ok(rows),
+            None,
+        )
+    };
+    assert_eq!(explain_rows(&[]).reason, "No trusted DAT configured");
+    assert_eq!(
+        explain_rows(&f.catalogues).reason,
+        "Audit not yet performed"
+    );
+    let mut disabled = f.catalogues.clone();
+    disabled[0].enabled = false;
+    assert_eq!(
+        explain_rows(&disabled).reason,
+        "Configured DAT unavailable or disabled"
+    );
+    let mut other = f.catalogues.clone();
+    other[0].platform = EvidenceValue::Assigned("Amiga".into());
+    let gap = explain_rows(&other);
+    assert_eq!(gap.reason, "Catalogue does not cover this system");
+    assert!(gap.explanation.contains("not a mismatch"));
+    other[0].platform = EvidenceValue::Unknown;
+    assert_eq!(
+        explain_rows(&other).reason,
+        "Catalogue system coverage unresolved"
+    );
+    assert!(f.game.dat_exact.is_none());
+    assert!(f.game.dat_state.is_none());
+    // A real completed result remains separate from every configuration state.
+    f.game.dat_state = Some(archivefs_core::LibraryDatState::NoMatch);
+    assert_eq!(
+        explain(
+            &f.game,
+            true,
+            true,
+            1,
+            DatProvenanceFreshness::Current,
+            Ok(&f.catalogues),
+            None
+        )
+        .reason,
+        "No catalogue match"
     );
 }

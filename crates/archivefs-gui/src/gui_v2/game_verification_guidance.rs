@@ -280,11 +280,36 @@ pub(super) fn explain(
         })
         .collect();
     if compatible.is_empty() {
-        return guidance(
-            "No compatible DAT assigned",
-            "No enabled catalogue has a confirmed or assigned system matching this game. Installed catalogues for other systems, or catalogues whose system is unresolved, do not verify it. Select a DAT in the existing verification workflow.",
-            Action::SelectDat,
-        );
+        let enabled: Vec<_> = catalogues.iter().filter(|row| row.enabled).collect();
+        let (reason, explanation) = if catalogues.is_empty() {
+            (
+                "No trusted DAT configured",
+                "No enabled DAT is configured. Explicitly import or enable compatible local game identification data, then Preview and confirm a check. No game verification has been attempted by opening this page.",
+            )
+        } else if enabled.is_empty() {
+            (
+                "Configured DAT unavailable or disabled",
+                "DAT sources are registered, but none is enabled and available in the catalogue inventory. Restore or enable compatible local data before checking content; no mismatch was concluded.",
+            )
+        } else if platform.is_some()
+            && enabled.iter().all(|row| {
+                row.platform
+                    .confirmed()
+                    .and_then(|p| archivefs_core::canonical_platform_for_alias(p))
+                    .is_some()
+            })
+        {
+            (
+                "Catalogue does not cover this system",
+                "The enabled catalogues are assigned to other systems. This is a coverage gap, not a mismatch with this game. Import or select compatible data explicitly; no game check starts here.",
+            )
+        } else {
+            (
+                "Catalogue system coverage unresolved",
+                "An enabled catalogue has unknown or ambiguous system coverage, or this game's system is unresolved. Review its system assignment before checking content. This does not establish a match or a mismatch.",
+            )
+        };
+        return guidance(reason, explanation, Action::SelectDat);
     }
     if !compatible
         .iter()
