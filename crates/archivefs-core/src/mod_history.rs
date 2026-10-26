@@ -859,6 +859,7 @@ mod tests {
                 observed_destination_digest: None,
                 backup_path: None,
                 backup_digest: None,
+                destination_pre_mode: None,
                 temporary_path: None,
                 final_destination_digest: Some("b".repeat(64)),
                 created_directories: Vec::new(),
@@ -893,6 +894,7 @@ mod tests {
                 observed_backup_digest: None,
                 outcome,
                 failure: None,
+                permissions: None,
             }],
             available: outcome == SharedRollbackOutcome::Available,
         }

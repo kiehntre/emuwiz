@@ -1542,6 +1542,9 @@ pub(super) fn show_shared_rollback_card(
                 if let Some(backup) = &entry.backup {
                     ui.label(format!("Backup: {}", backup.display));
                 }
+                if let Some(permissions) = entry.permissions {
+                    ui.label(format!("Permissions: {}", permissions.summary()));
+                }
                 if let Some(failure) = &entry.failure {
                     ui.label(format!("Blocker: {:?} · {}", failure.kind, failure.detail));
                 }
@@ -1581,6 +1584,15 @@ pub(super) fn show_shared_rollback_card(
             );
             for entry in &result.preview.entries {
                 ui.label(format!("Rollback result: {:?}", entry.outcome));
+                if let Some(failure) = &entry.failure {
+                    ui.label(format!("Why: {}", failure.detail));
+                }
+                if entry.outcome
+                    == archivefs_core::patch_manager::SharedRollbackOutcome::RestoredBackup
+                    && let Some(permissions) = entry.permissions
+                {
+                    ui.label(format!("Permissions: {}", permissions.summary()));
+                }
             }
             if widgets::action_button(ui, "Close result", widgets::ActionStyle::Quiet, true)
                 .clicked()
