@@ -70,7 +70,7 @@ fn exit_message(outcome: GracefulStopOutcome) -> &'static str {
     if matches!(outcome, GracefulStopOutcome::Refused(_)) {
         "The normal-stop request was refused; the owned launcher later exited. This does not prove Dolphin or its descendants closed, or that saves completed."
     } else {
-        "The owned launcher exited after your normal-stop attempt. This does not prove Dolphin or its descendants closed, or that saves completed."
+        "The owned launcher has exited; your normal-stop attempt is recorded. This does not prove Dolphin or its descendants closed, or that saves completed."
     }
 }
 
@@ -98,6 +98,8 @@ mod tests {
     fn all_outcomes_describe_the_launcher_and_preserve_uncertainty() {
         use archivefs_core::launch::process_spawn::GracefulStopRefusal;
         assert!(message(GracefulStopOutcome::AlreadyExited).contains("launcher"));
+        assert!(!exit_message(GracefulStopOutcome::AlreadyExited).contains("after"));
+        assert!(exit_message(GracefulStopOutcome::AlreadyExited).contains("attempt is recorded"));
         assert!(message(GracefulStopOutcome::ExitedAfterRequest).contains("final exit report"));
         assert!(
             message(GracefulStopOutcome::StillRunning {
