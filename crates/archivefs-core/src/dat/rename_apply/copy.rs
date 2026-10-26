@@ -320,7 +320,9 @@ fn edge(_: Edge, _: &Path) -> io::Result<()> {
     Ok(())
 }
 #[cfg(test)]
-thread_local! { static HOOK: std::cell::RefCell<Option<(Edge, Box<dyn FnOnce(&Path) -> io::Result<()>>)>> = const { std::cell::RefCell::new(None) }; }
+type FaultHook = Box<dyn FnOnce(&Path) -> io::Result<()>>;
+#[cfg(test)]
+thread_local! { static HOOK: std::cell::RefCell<Option<(Edge, FaultHook)>> = const { std::cell::RefCell::new(None) }; }
 #[cfg(test)]
 fn edge(at: Edge, path: &Path) -> io::Result<()> {
     let hook = HOOK.with(|h| {
