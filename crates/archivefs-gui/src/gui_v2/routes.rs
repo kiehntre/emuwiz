@@ -775,10 +775,11 @@ pub(super) enum ToolPage {
     DatabaseStatus,
     CheatExtras,
     PatchPackagePreview,
+    SourceImpact,
 }
 
 impl ToolPage {
-    pub const ALL: [Self; 9] = [
+    pub const ALL: [Self; 10] = [
         Self::NeedsAttention,
         Self::Mounts,
         Self::MediaSets,
@@ -788,6 +789,7 @@ impl ToolPage {
         Self::DatabaseStatus,
         Self::CheatExtras,
         Self::PatchPackagePreview,
+        Self::SourceImpact,
     ];
 
     pub fn title(self) -> &'static str {
@@ -800,6 +802,7 @@ impl ToolPage {
             Self::PlatformAliases => "Platform aliases",
             Self::DatabaseStatus => "Database status",
             Self::PatchPackagePreview => "Patch-package inspection",
+            Self::SourceImpact => "Source-location impact preview",
             Self::CheatExtras => "Providers and code previews",
         }
     }
@@ -820,6 +823,9 @@ impl ToolPage {
             Self::PatchPackagePreview => {
                 "Inspect patches and untrusted package metadata without applying anything."
             }
+            Self::SourceImpact => {
+                "Preview one library source at a new folder without relocating anything."
+            }
             Self::CheatExtras => {
                 "Licences for open and local cheat providers, and read-only code previews."
             }
@@ -836,6 +842,7 @@ impl ToolPage {
             Self::PlatformAliases => Section::Settings,
             Self::DatabaseStatus => Section::Settings,
             Self::PatchPackagePreview => Section::Mods,
+            Self::SourceImpact => Section::Sources,
             Self::CheatExtras => Section::Mods,
         }
     }
@@ -849,6 +856,7 @@ impl ToolPage {
             Self::ViewHistory | Self::LibraryViews => "Organise & Export",
             Self::PlatformAliases | Self::DatabaseStatus => "Settings",
             Self::PatchPackagePreview => "Tools",
+            Self::SourceImpact => "Tools",
             Self::CheatExtras => "Enhance",
         }
     }
