@@ -203,6 +203,7 @@ mod tests {
     #[test]
     fn type_filter_is_case_insensitive() {
         let record = PersistentStateRecord {
+            sram_origin: None,
             emulator: archivefs_core::persistent_state_inventory::StateEmulator::Pcsx2,
             selected_installation: None,
             state_type: PersistentStateType::SaveState,
