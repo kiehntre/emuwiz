@@ -14,7 +14,7 @@ use std::{
 const LIMIT: &str = "Impact preview only. No folders, database paths, archive keys or history are changed. This is an observation, not approval to relocate anything. Reload and preview again after changes.";
 enum Loaded {
     Sources(Vec<SourceFolderRecord>),
-    Report(SourceFolderMigrationReport),
+    Report(Box<SourceFolderMigrationReport>),
 }
 #[derive(Default)]
 pub(super) struct State {
@@ -75,7 +75,9 @@ impl State {
         let context = context.clone();
         std::thread::spawn(move || {
             let result = match source {
-                Some(source) => preview(&database, source, &destination).map(Loaded::Report),
+                Some(source) => preview(&database, source, &destination)
+                    .map(Box::new)
+                    .map(Loaded::Report),
                 None => Database::open_read_only(database)
                     .and_then(|db| db.list_source_folders())
                     .map(Loaded::Sources)
@@ -95,7 +97,7 @@ impl State {
         self.loading = None;
         match result {
             Ok(Loaded::Sources(rows)) => self.sources = rows,
-            Ok(Loaded::Report(report)) => self.report = Some(report),
+            Ok(Loaded::Report(report)) => self.report = Some(*report),
             Err(error) => self.error = Some(error),
         }
     }
