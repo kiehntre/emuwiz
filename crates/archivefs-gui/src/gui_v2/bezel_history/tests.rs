@@ -644,4 +644,18 @@ fn refused_and_rolled_back_apply_is_not_shown_as_needing_attention() {
     );
     // The successful fixture apply is the only record that offers Undo.
     assert_eq!(shown.matches("Bezel applied from").count(), 1, "{shown}");
+    // Once undone (marker written by the executor), it no longer offers Undo
+    // after a restart either.
+    fs::write(f.journal_path.with_extension("rollback.json"), b"{}").unwrap();
+    reload(&mut app, &f);
+    let shown = render(&mut app, None);
+    assert!(shown.contains("Bezel changes undone from"), "{shown}");
+    assert!(!shown.contains("Bezel applied from"), "{shown}");
+    assert_eq!(
+        shown
+            .matches("Already undone. This record is read-only.")
+            .count(),
+        1,
+        "{shown}"
+    );
 }
