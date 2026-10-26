@@ -2,7 +2,7 @@
 //!
 //! This module turns one already-authorized Dolphin [`LaunchCandidate`] and
 //! an already-computed [`DolphinNativeLaunchBinding`] into argv-shaped data.
-//! It never re-discovers a profile, checks the live filesystem, mounts
+//! It never re-discovers a profile, mounts
 //! content, writes a configuration file, or starts a process - the binding
 //! it is handed must already have come from a fresh call to
 //! [`crate::patch_manager::resolve_dolphin_native_launch_binding`] (see
@@ -12,8 +12,9 @@
 //!
 //! Native Dolphin launch accepts direct regular GameCube/Wii disc images,
 //! a verified Dolphin GameID, and an exact eligible
-//! [`DolphinNativeLaunchBinding`]. Mounted/archive content, Flatpak, and
-//! AppImage remain refused here - never silently widened.
+//! [`DolphinNativeLaunchBinding`]. Mounted/archive content remains refused.
+//! Official Linux Flatpak launches validate game files and use per-file
+//! transient read-only grants through the shared installation API.
 //!
 //! # Exact argv
 //!
@@ -22,6 +23,8 @@
 //!
 //! Every argument is carried as its own `OsString` - spaces, quotes, and
 //! shell-looking characters in a path are inert data, never shell syntax.
+
+pub(crate) mod flatpak;
 
 use std::ffi::OsString;
 use std::path::PathBuf;
@@ -264,12 +267,29 @@ pub fn build_dolphin_command_plan(
     }
     emulator_arguments.push(OsString::from("-e"));
     emulator_arguments.push(content_path.clone().into_os_string());
-    let mut visibility = crate::launch::installation::VisibilityPlan::new();
-    if std::fs::metadata(&content_path).is_ok_and(|metadata| metadata.is_dir()) {
-        visibility.read_only(&content_path, "Dolphin directory content");
+    let visibility = if let crate::launch::installation::LaunchInstallation::Flatpak { app_id } =
+        &binding.installation
+    {
+        if app_id != crate::launch::installation_known::DOLPHIN.flatpak_ids[0]
+            || binding.user_directory_mode != DolphinUserDirectoryMode::DefaultNative
+        {
+            return DolphinCommandPlan::blocked(vec![blocker(
+                LaunchBlockerKind::DolphinBindingUnavailable,
+                "Flatpak Dolphin requires the official application and its default sandbox profile",
+            )]);
+        }
+        match flatpak::inspect(&content_path) {
+            Ok(resources) => resources.visibility,
+            Err(detail) => {
+                return DolphinCommandPlan::blocked(vec![blocker(
+                    LaunchBlockerKind::DolphinBindingUnavailable,
+                    detail,
+                )]);
+            }
+        }
     } else {
-        visibility.content(&content_path);
-    }
+        crate::launch::installation::VisibilityPlan::new()
+    };
     let arguments = match binding
         .installation
         .wrap_arguments(&visibility, emulator_arguments)

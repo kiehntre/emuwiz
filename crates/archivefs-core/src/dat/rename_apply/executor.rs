@@ -430,6 +430,9 @@ fn apply_transaction_inner(execution: &mut ApplyExecution<'_>) -> Result<ApplyOu
         // A fresh link entry journals, before the checkpoint below, whether its
         // already-correct link existed beforehand, so Undo never removes a link
         // this transaction did not create (see `LINK_ADOPTED_KEY`).
+        let catalogue =
+            crate::database::organisation_paths::begin(&transaction.entries[index], false, false)
+                .map_err(ApplyError::Journal)?;
         let prior_state = transaction.entries[index].state;
         if prior_state == EntryState::Planned {
             if let Err(reason) = record_link_adoption(&mut transaction.entries[index]) {
@@ -490,6 +493,9 @@ fn apply_transaction_inner(execution: &mut ApplyExecution<'_>) -> Result<ApplyOu
             .unwrap_or_else(|| apply_mutation_in(&transaction.entries[index], &execution.trusted))
         {
             Ok(()) => {
+                if let Some(catalogue) = catalogue {
+                    catalogue.commit().map_err(ApplyError::Journal)?;
+                }
                 transaction.entries[index].state = EntryState::Applied;
                 transaction.entries[index].applied_at_unix = Some(crate::dat::sources::now_unix());
             }
