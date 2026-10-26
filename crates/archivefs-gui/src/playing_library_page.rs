@@ -426,8 +426,27 @@ impl PlayingLibraryPageState {
         self.romm_preview_transaction = None;
         self.retrodeck_projection = None;
         self.retrodeck_preview_transaction = None;
-        self.romm_error = None;
-        self.retrodeck_error = None;
+        // Approval belongs to the displayed destination and preview, never
+        // to a later plan with the same election count. Keep completed
+        // receipts and publication/recovery state available to History/Undo.
+        self.dat_platform_identity = None;
+        self.selected_family = None;
+        self.pending_apply = None;
+        self.confirm_text.clear();
+        self.romm_pending_apply = false;
+        self.romm_confirm_text.clear();
+        self.retrodeck_pending_apply = false;
+        self.retrodeck_confirm_text.clear();
+        self.error = None;
+        if self.applied.is_none() {
+            self.apply_error = None;
+        }
+        if self.romm_applied.is_none() {
+            self.romm_error = None;
+        }
+        if self.retrodeck_applied.is_none() && self.retrodeck_selected_id.is_none() {
+            self.retrodeck_error = None;
+        }
     }
 
     #[cfg(test)]
