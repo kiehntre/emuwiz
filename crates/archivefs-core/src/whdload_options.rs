@@ -155,6 +155,16 @@ pub fn project_supplied_options(
     (options, config_metadata, diagnostics)
 }
 
+fn unambiguous_metadata(
+    slot: u8,
+    metadata: &[WhdloadCustomMetadata],
+) -> Option<&WhdloadCustomMetadata> {
+    let mut matching = metadata.iter().filter(|item| item.slot == slot);
+    let first = matching.next()?;
+    (first.applicability == WhdloadOptionApplicability::Applicable && matching.next().is_none())
+        .then_some(first)
+}
+
 fn parse_tooltype(raw: &str, metadata: &[WhdloadCustomMetadata]) -> WhdloadOption {
     let trimmed = raw.trim();
     let (key_raw, value_raw) = trimmed.split_once('=').unwrap_or((trimmed, ""));
@@ -205,7 +215,7 @@ fn parse_tooltype(raw: &str, metadata: &[WhdloadCustomMetadata]) -> WhdloadOptio
         ),
         _ if custom_slot(&key).is_some() => {
             let slot = custom_slot(&key).unwrap();
-            let metadata_present = metadata.iter().any(|item| item.slot == slot);
+            let metadata_present = unambiguous_metadata(slot, metadata).is_some();
             (
                 WhdloadOptionKind::Custom(slot),
                 Some(WhdloadOptionValue::Text(value.into())),
@@ -230,7 +240,7 @@ fn parse_tooltype(raw: &str, metadata: &[WhdloadCustomMetadata]) -> WhdloadOptio
         ),
     };
     let custom_metadata = match kind {
-        WhdloadOptionKind::Custom(slot) => metadata.iter().find(|item| item.slot == slot).cloned(),
+        WhdloadOptionKind::Custom(slot) => unambiguous_metadata(slot, metadata).cloned(),
         _ => None,
     };
     WhdloadOption {
@@ -238,7 +248,7 @@ fn parse_tooltype(raw: &str, metadata: &[WhdloadCustomMetadata]) -> WhdloadOptio
         kind,
         value: parsed,
         applicability,
-        evidence: evidence("raw ToolType from the discovered install"),
+        evidence: evidence("supplied ToolType text"),
         custom_metadata,
     }
 }
@@ -358,7 +368,7 @@ pub fn parse_config_metadata(config: &str) -> (Vec<WhdloadCustomMetadata>, Vec<S
             evidence: WhdloadOptionEvidence {
                 source: WhdloadOptionEvidenceSource::SlaveConfig,
                 raw: raw.into(),
-                detail: "Config metadata from the discovered slave".into(),
+                detail: "supplied Config metadata".into(),
             },
             applicability: WhdloadOptionApplicability::Applicable,
         });
@@ -586,5 +596,15 @@ mod tests {
             option(&projection, "NOWRITEINFO").kind,
             WhdloadOptionKind::NoWriteInfo
         );
+    }
+    #[test]
+    fn malformed_or_duplicate_custom_definitions_cannot_establish_meaning() {
+        for config in ["C1:B", "C1:B:One;C1:B:Two;", "C1:B:One;C1:B"] {
+            let (options, _, _) = project_supplied_options(&["CUSTOM1=1".into()], config);
+            let option = options.iter().find(|o| o.key == "CUSTOM1").unwrap();
+            assert_eq!(option.applicability, WhdloadOptionApplicability::Unknown);
+            assert!(option.custom_metadata.is_none());
+            assert!(!option.evidence.detail.contains("discovered"));
+        }
     }
 }

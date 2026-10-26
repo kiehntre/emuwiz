@@ -14,7 +14,11 @@ pub(super) struct State {
 fn preview(text: &str, config: &str) -> Result<Report, String> {
     if text.len() + config.len() > 65536
         || text.lines().count() > 256
-        || config.matches(';').count() > 256
+        || config
+            .split(';')
+            .filter(|record| !record.trim().is_empty())
+            .count()
+            > 256
     {
         return Err("Use at most 64 KiB, 256 ToolType lines and 256 Config records.".into());
     }
@@ -105,5 +109,18 @@ mod tests {
         let _ = ctx.run(Default::default(), |ctx| {
             egui::CentralPanel::default().show(ctx, |ui| show(ui, &mut s));
         });
+    }
+    #[test]
+    fn config_record_budget_counts_an_unterminated_last_record() {
+        assert!(preview("CUSTOM1=1", &vec!["C1:B:Example"; 257].join(";")).is_err());
+        let (options, _, _) = preview("CUSTOM1=1", "C1:B").unwrap();
+        assert_eq!(
+            options
+                .iter()
+                .find(|o| o.key == "CUSTOM1")
+                .unwrap()
+                .applicability,
+            WhdloadOptionApplicability::Unknown
+        );
     }
 }
