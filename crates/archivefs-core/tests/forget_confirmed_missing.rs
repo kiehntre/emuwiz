@@ -403,9 +403,12 @@ fn preview_performs_no_writes() {
     let listing = dir(&f);
     let a = f.plan();
     let ro = Database::open_catalogue_health_read_only(f.db.path()).unwrap();
-    let b = ro.preview_forget_confirmed_missing(&f.roots).unwrap();
-    assert_eq!(a, b);
+    let mut b = ro.preview_forget_confirmed_missing(&f.roots).unwrap();
     assert_eq!(a.token(), b.token());
+    // checked_at is display-only wall-clock time (excluded from the token);
+    // the two previews may straddle a second boundary. Everything else must match.
+    b.checked_at = a.checked_at.clone();
+    assert_eq!(a, b);
     assert_eq!(fs::read(f.db.path()).unwrap(), bytes);
     assert_eq!(dir(&f), listing);
 }

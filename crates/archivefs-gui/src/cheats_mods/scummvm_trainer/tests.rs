@@ -550,7 +550,19 @@ fn scummvm_gui_workers_keep_history_and_backups_in_test_machine() {
             );
         }
     }
+    // The first frame starts the automatic History load, which keeps Check
+    // disabled until it finishes. Settle it first, or a load finishing
+    // mid-click silently swallows the Check click.
+    frame(&ctx, &mut state, &f.game, vec![]);
+    assert!(state.pending.is_some(), "the first frame loads History");
+    inspect_worker(&mut state, |result| {
+        assert!(
+            matches!(result, Ok(Completed::History(..))),
+            "the first worker must be the History load"
+        );
+    });
     click(&ctx, &mut state, &f.game, "Check trainer compatibility");
+    assert!(state.pending.is_some(), "Check must start its worker");
     inspect_worker(&mut state, |result| {
         let Ok(Completed::Checked(prepared)) = result else {
             panic!("Check worker must return a prepared compatibility result");
