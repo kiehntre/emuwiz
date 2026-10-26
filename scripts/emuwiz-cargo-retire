@@ -239,6 +239,7 @@ def parse_iso(text):
 SNAPSHOT_LIMIT = 1_000_000
 JOURNAL_MAX_PATHS = 20_000
 FULL_CENSUS_INTERVAL = 2.0  # seconds between complete process censuses while unlinking
+RESERVED_PIDS = 300  # the kernel's cyclic PID allocator wraps back to this value
 JOURNAL_SUFFIX = ".journal.jsonl"
 
 
@@ -1663,6 +1664,72 @@ def hold_all(entry, out, code):
     return out
 
 
+def read_fork_state():
+    """(allocator cursor, forks since boot, pid_max) from the kernel, or None when any is unreadable.
+
+    Forks are read first and the cursor second: the cursor is never behind the fork count."""
+    try:
+        with open("/proc/stat") as handle:
+            forks = next(int(line.split()[1]) for line in handle if line.startswith("processes "))
+        with open("/proc/sys/kernel/ns_last_pid") as handle:
+            cursor = int(handle.read())
+        with open("/proc/sys/kernel/pid_max") as handle:
+            pid_max = int(handle.read())
+    except (OSError, ValueError, StopIteration, IndexError):
+        return None
+    return (cursor, forks, pid_max) if 0 < cursor < pid_max else None
+
+
+def pid_reuse_budget(known, state):
+    """Fewest forks after `state` that could hand an already-inspected PID to a new process.
+
+    The kernel gives out PIDs cyclically: the allocator moves forward from its cursor and takes
+    the next free number.  A number that is in `known` (and so may since have been freed) can
+    only name a new process once the cursor has travelled to it, and every free number on the
+    way costs one fork.  Numbers occupied on the way are skipped, so they are subtracted (all
+    of `known` is treated as occupied, which only shortens the budget).  0 = cannot be bounded."""
+    if state is None:
+        return 0
+    cursor, _, pid_max = state
+    ordered = sorted(p for p in known if 0 < p < pid_max)
+    if not ordered:
+        return pid_max
+    best = pid_max
+    import bisect
+    for p in ordered:
+        if p > cursor:
+            ahead = bisect.bisect_left(ordered, p) - bisect.bisect_right(ordered, cursor)
+            distance = p - cursor - ahead
+        else:
+            on_tail = len(ordered) - bisect.bisect_right(ordered, cursor)
+            on_head = bisect.bisect_left(ordered, p) - bisect.bisect_left(ordered, RESERVED_PIDS)
+            distance = (pid_max - cursor) + (p - RESERVED_PIDS) - on_tail - max(on_head, 0)
+        best = min(best, max(distance, 1))
+    return best
+
+
+class PidReuseGuard:
+    """Proves from the kernel's fork counter that no PID inspected by the last full census can
+    have been recycled since.  Without that proof the incremental census must not skip PIDs by
+    number: a recycled number would hide a new process (for example a new holder of the cache)."""
+
+    def __init__(self):
+        self.baseline = None
+        self.budget = 0
+
+    def arm(self, known, before):
+        """`before`: read_fork_state() taken BEFORE the census listed /proc."""
+        self.baseline = before
+        self.budget = pid_reuse_budget(known, before)
+
+    def safe(self):
+        now = read_fork_state()
+        if now is None or self.baseline is None or self.budget <= 0:
+            return False
+        elapsed = now[1] - self.baseline[1]
+        return 0 <= elapsed < self.budget
+
+
 def execute_group(entry, selected, out, journal, identities=None, mutation_guard=None):
     group = entry["group"]
     target = group["directory"]
@@ -1692,6 +1759,8 @@ def execute_group(entry, selected, out, journal, identities=None, mutation_guard
             rel = os.path.relpath(item["path"], target).split("/")
             hook("before-entry:" + item["path"])
             # Selection/snapshot may take time: recheck live use at mutation boundary.
+            reuse = PidReuseGuard()
+            fork_before = read_fork_state()
             fresh = F.Census([target] + entry["sources"])
             fresh.match_inodes(identities or set(), target)
             refs = any(fresh.refs.values())
@@ -1704,6 +1773,7 @@ def execute_group(entry, selected, out, journal, identities=None, mutation_guard
                 refuse_all(code, "fresh deletion-boundary safety check refused: " + str(fresh.refs))
                 break
             known_pids = set(fresh.pids_seen)
+            reuse.arm(known_pids, fork_before)
             full_at = time.monotonic()
 
             def process_guard(check_only=False):
@@ -1712,7 +1782,7 @@ def execute_group(entry, selected, out, journal, identities=None, mutation_guard
                     current = {int(p) for p in os.listdir("/proc") if p.isdigit()}
                 except OSError as error:
                     raise Refusal("INCOMPLETE_PROCESS_VISIBILITY", str(error)) from error
-                stale = time.monotonic() - full_at >= FULL_CENSUS_INTERVAL
+                stale = time.monotonic() - full_at >= FULL_CENSUS_INTERVAL or not reuse.safe()
                 if not stale and not current - known_pids:
                     return True
                 if check_only:
@@ -1722,9 +1792,18 @@ def execute_group(entry, selected, out, journal, identities=None, mutation_guard
                 # second on a busy host.  The root listing inside Census decides what is
                 # new, and a full census still runs at least every FULL_CENSUS_INTERVAL so
                 # already-seen processes that later touch the target are caught too.
+                fork_before = read_fork_state()
                 latest = F.Census([target] + entry["sources"], skip_pids=None if stale else known_pids)
                 latest.match_inodes(identities or set(), target)
                 known_pids = set(latest.pids_seen)
+                if stale:
+                    reuse.arm(known_pids, fork_before)
+                    if not reuse.safe():
+                        # Cannot prove no inspected PID was recycled while this census ran
+                        # (counter unreadable, or more forks than the PID space allows).
+                        detail = "cannot prove that no inspected PID was recycled during the census"
+                        out["holds"].append({"code": "INCOMPLETE_PROCESS_VISIBILITY", "detail": detail})
+                        raise Refusal("INCOMPLETE_PROCESS_VISIBILITY", detail)
                 if stale:
                     full_at = time.monotonic()
                 code = ("INCOMPLETE_PROCESS_VISIBILITY" if latest.unreadable_foreign else

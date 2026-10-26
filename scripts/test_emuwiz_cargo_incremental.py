@@ -267,5 +267,106 @@ class Incremental(R.Base):
         self.assertEqual(result["groups"][0]["accounted_freed_bytes"], expected)
 
 
+class PidReuse(R.Base):
+    """The incremental census skips PIDs it already inspected, by number.  That is only sound
+    while the kernel cannot have recycled one of those numbers."""
+
+    def test_budget_is_the_distance_to_the_nearest_inspected_pid(self):
+        budget = self.mod.pid_reuse_budget
+        self.assertEqual(budget({50, 150, 160}, (100, 0, 1000)), 50)
+        self.assertEqual(budget({160}, (100, 0, 1000)), 60)
+        self.assertEqual(budget({101}, (100, 0, 1000)), 1)
+        self.assertEqual(budget({101, 102, 103}, (100, 0, 1000)), 1)
+        self.assertEqual(budget({500}, (100, 0, 1000)), 400)
+        self.assertEqual(budget({500}, (800, 0, 1000)), 200 + 200)
+        self.assertEqual(budget(set(), (100, 0, 1000)), 1000)
+
+    def test_budget_is_zero_when_the_allocator_cannot_be_read(self):
+        self.assertEqual(self.mod.pid_reuse_budget({1000}, None), 0)
+        from unittest.mock import patch
+        with patch("builtins.open", side_effect=OSError):
+            self.assertIsNone(self.mod.read_fork_state())
+
+    def test_guard_requires_fewer_forks_than_the_budget(self):
+        from unittest.mock import patch
+        guard = self.mod.PidReuseGuard()
+        guard.arm({150}, (100, 1000, 1000))
+        self.assertEqual(guard.budget, 50)
+        for forks, safe in ((1000, True), (1049, True), (1050, False), (5000, False), (999, False)):
+            with patch.object(self.mod, "read_fork_state", return_value=(100, forks, 1000)):
+                self.assertEqual(guard.safe(), safe, forks)
+        with patch.object(self.mod, "read_fork_state", return_value=None):
+            self.assertFalse(guard.safe())
+
+    def test_unarmed_or_unreadable_guard_is_never_safe(self):
+        from unittest.mock import patch
+        guard = self.mod.PidReuseGuard()
+        with patch.object(self.mod, "read_fork_state", return_value=(100, 1, 1000)):
+            self.assertFalse(guard.safe())
+        guard.arm({150}, None)
+        with patch.object(self.mod, "read_fork_state", return_value=(100, 1, 1000)):
+            self.assertFalse(guard.safe())
+
+    def deletion_censuses(self, states, expect_removed=True):
+        """Censuses started while the executor removes a real incremental tree; the fork
+        counter follows `states`, a function of how many times it has been read."""
+        from unittest.mock import patch
+        calls = []
+        base = self.mod.F.Census
+
+        class Light(base):
+            def __init__(inner, targets, skip_pids=None):
+                calls.append(skip_pids)
+                inner.skip_pids, inner.targets = frozenset(skip_pids or ()), list(targets)
+                inner.refs, inner.unreadable_foreign, inner.examined = {}, 0, 0
+                inner._inode_refs = []
+                inner.pids_seen = {int(p) for p in os.listdir("/proc") if p.isdigit()}
+
+        self.mod.F.Census = Light
+        wt, target = self.managed_cache("wt-reuse%d" % len(self.__dict__.setdefault("_runs", [])), completed=False)
+        populate_incremental(target)
+        self.assertEqual(self.ret("finish", wt, "--task", "reuse-fixture").returncode, 0)
+        path, digest = self.manifest([self.group(wt, target, ["debug/incremental"])])
+        self._runs.append(1)
+        reads = [0]
+
+        def state():
+            reads[0] += 1
+            return states(reads[0])
+
+        with patch.object(self.mod, "read_fork_state", side_effect=state), \
+                patch.object(self.mod, "FULL_CENSUS_INTERVAL", 3600):
+            rc, result = self.run_retire(path, digest, execute=True)
+        gone = not os.path.isdir(os.path.join(target, "debug", "incremental"))
+        if expect_removed:
+            self.assertTrue(gone, result)
+            return calls
+        self.assertFalse(gone, "nothing may be removed when PID reuse cannot be excluded")
+        return calls, result
+
+    def test_no_extra_censuses_while_no_pid_can_have_been_recycled(self):
+        calls = self.deletion_censuses(lambda n: (2_000_000, 1000, 4194304))
+        self.assertLessEqual(sum(skip is None for skip in calls), 4, calls)
+
+    def test_a_burst_of_forks_forces_one_more_full_census_without_skipping(self):
+        steady = sum(skip is None for skip in self.deletion_censuses(lambda n: (2_000_000, 1000, 4194304)))
+        burst = self.deletion_censuses(lambda n: (2_000_000, 1000 if n < 2 else 50_000_000, 4194304))
+        self.assertGreater(sum(skip is None for skip in burst), steady, burst)
+
+    def test_unreadable_fork_state_refuses_instead_of_skipping_pids(self):
+        calls, result = self.deletion_censuses(lambda n: None, expect_removed=False)
+        codes = {h["code"] for h in result["groups"][0]["holds"]}
+        codes.update(p["reason"] for p in result["groups"][0]["paths"])
+        self.assertIn("INCOMPLETE_PROCESS_VISIBILITY", codes, result)
+        self.assertTrue(all(skip is None for skip in calls), calls)
+
+    def test_forks_during_the_census_beyond_the_budget_refuse(self):
+        calls, result = self.deletion_censuses(lambda n: (4_194_000, 1000 + 10_000_000 * (n - 1), 4194304),
+                                               expect_removed=False)
+        codes = {h["code"] for h in result["groups"][0]["holds"]}
+        codes.update(p["reason"] for p in result["groups"][0]["paths"])
+        self.assertIn("INCOMPLETE_PROCESS_VISIBILITY", codes, result)
+
+
 if __name__ == "__main__":
     unittest.main()
