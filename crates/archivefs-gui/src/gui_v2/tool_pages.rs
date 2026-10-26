@@ -9,6 +9,7 @@ use super::routes::ToolPage;
 #[derive(Default)]
 pub(super) struct ToolPagesState {
     pub optical_compare: super::optical_compare::State,
+    pub patch_package_preview: super::patch_package_preview::State,
     pub source_impact: super::source_impact::State,
     pub needs_attention: super::needs_attention_page::NeedsAttentionState,
     pub mounts: super::mounts_page::MountsState,
@@ -32,6 +33,7 @@ impl ToolPagesState {
             database: super::database_status_page::DatabaseStatusState::live(),
             cheat_extras: Default::default(),
             optical_compare: Default::default(),
+            patch_package_preview: Default::default(),
             source_impact: super::source_impact::State::live(),
         }
     }
@@ -42,6 +44,9 @@ impl App {
         match tool {
             ToolPage::OpticalCompare => {
                 super::optical_compare::show(ui, &mut self.tools.optical_compare)
+            }
+            ToolPage::PatchPackagePreview => {
+                super::patch_package_preview::show(ui, &mut self.tools.patch_package_preview)
             }
             ToolPage::SourceImpact => super::source_impact::show(ui, &mut self.tools.source_impact),
             ToolPage::NeedsAttention => {
@@ -136,6 +141,36 @@ impl App {
                     None => {}
                 }
             }
+        }
+    }
+}
+
+#[cfg(test)]
+mod integration_tests {
+    use super::*;
+    use crate::gui_v2::{Route, all_tools, tests};
+
+    #[test]
+    fn both_preview_routes_remain_reachable_after_integration() {
+        let context = egui::Context::default();
+        let mut app = tests::fixture(&context);
+        let tools: Vec<_> = all_tools::groups()
+            .into_iter()
+            .flat_map(|group| group.tools)
+            .collect();
+        for page in [ToolPage::SourceImpact, ToolPage::PatchPackagePreview] {
+            let route = Route::Tool(page);
+            assert_eq!(tools.iter().filter(|tool| tool.route == route).count(), 1);
+            assert!(ToolPage::ALL.contains(&page));
+            app.go(route.clone());
+            let output = tests::frame(&context, &mut app, [1280.0, 900.0]);
+            assert_eq!(app.router.current, route);
+            assert!(tests::page_reachability::visible_text(
+                &output,
+                page.title()
+            ));
+            app.back();
+            assert_eq!(app.router.current, Route::Home);
         }
     }
 }

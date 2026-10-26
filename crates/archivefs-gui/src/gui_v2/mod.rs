@@ -58,8 +58,10 @@ mod needs_attention_page;
 mod next_disc_guidance;
 mod nkit;
 mod onboarding;
+mod optical_compare;
 mod organisation;
 mod pages;
+mod patch_package_preview;
 mod platform_aliases_page;
 mod problem_actions;
 mod problems;
@@ -82,7 +84,6 @@ mod setup_portability;
 mod shared_scroll_tests;
 mod simple_shell;
 mod source_impact;
-mod optical_compare;
 mod sources_providers;
 #[cfg(test)]
 mod stale_inspection_tests;
