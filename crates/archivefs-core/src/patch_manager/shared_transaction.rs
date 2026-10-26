@@ -2136,7 +2136,7 @@ fn publication_failure(
         SharedApplyFailureKind::DisplacedFileKept => (
             SharedApplyOutcome::WriteFailed,
             format!(
-                "EmuWiz's file is now in place, but the file it displaced had changed and could not be put back; it is kept at {}. Review both before retrying",
+                "The file changed while EmuWiz was writing it. To avoid losing anything, a file EmuWiz did not write is kept at {}. Review it and the live file before retrying",
                 temp.map_or_else(|| "an unknown temporary name".into(), |path| path.display().to_string())
             ),
         ),
@@ -2789,9 +2789,9 @@ fn atomic_write_bytes(
             }
             None if no_replace => rename_no_replace(&temp, destination)
                 .map_err(|_| SharedApplyFailureKind::DestinationChanged)?,
-            None => {
-                fs::rename(&temp, destination).map_err(|_| SharedApplyFailureKind::WriteFailed)?
-            }
+            // A replacement or restore without a pinned file to displace (no
+            // file identity on this platform) is never published unchecked.
+            None => return Err(SharedApplyFailureKind::AtomicReplaceUnsupported),
         }
         sync_directory(parent);
         let final_hash = stable_hash(destination, SHARED_MAX_MATERIALIZED_BYTES)?;
@@ -2921,32 +2921,19 @@ fn publish_displacing(
     Err(SharedApplyFailureKind::DestinationChanged)
 }
 
-/// Without an atomic exchange the pin and bytes are re-checked immediately
-/// before the rename; only Linux offers the stronger guarantee above.
+/// Only Linux offers the atomic exchange the guarantee above needs. Elsewhere
+/// a replacement or restore is refused outright: there is deliberately no
+/// re-check-then-rename fallback.
 #[cfg(not(target_os = "linux"))]
 fn publish_displacing(
-    temp: &Path,
+    _temp: &Path,
     destination: &Path,
-    displaced: &Displaced,
+    _displaced: &Displaced,
     _ours: Option<FilePin>,
     _keep_temp: &mut bool,
 ) -> Result<(), SharedApplyFailureKind> {
     before_publish(destination);
-    #[cfg(unix)]
-    let unchanged = stable_hash(
-        destination,
-        SHARED_MAX_SOURCE_BYTES.max(SHARED_MAX_MATERIALIZED_BYTES),
-    )
-    .is_ok_and(|hash| hash.pin == Some(displaced.pin) && hash.digest == displaced.digest);
-    #[cfg(not(unix))]
-    let unchanged = {
-        let _ = displaced;
-        false
-    };
-    if !unchanged {
-        return Err(SharedApplyFailureKind::DestinationChanged);
-    }
-    fs::rename(temp, destination).map_err(|_| SharedApplyFailureKind::WriteFailed)
+    Err(SharedApplyFailureKind::AtomicReplaceUnsupported)
 }
 
 #[cfg(target_os = "linux")]
@@ -5647,6 +5634,18 @@ mod tests {
             .to_path_buf()
             .unwrap();
         assert_eq!(fs::read(&kept).unwrap(), b"arrival", "never deleted");
+        // The kept file is the arrival, not EmuWiz's: the text says so.
+        let detail = &entry
+            .failures
+            .iter()
+            .find(|f| f.kind == SharedApplyFailureKind::DisplacedFileKept)
+            .unwrap()
+            .detail;
+        assert!(detail.contains("a file EmuWiz did not write"), "{detail}");
+        assert!(
+            !detail.contains("EmuWiz's file is now in place"),
+            "{detail}"
+        );
         assert_eq!(fs::read(&live).unwrap(), b"old");
         assert_eq!(mode_of(&live), 0o640);
     }
@@ -5686,6 +5685,28 @@ mod tests {
             assert_eq!(mode_of(&live), before);
             assert!(stray_temporaries(live.parent().unwrap()).is_empty());
         }
+    }
+
+    /// A replacement or restore with no pinned file to displace - what a
+    /// platform without file identity produces - is refused, never published
+    /// with a plain rename.
+    #[cfg(unix)]
+    #[test]
+    fn a_replacement_without_a_pinned_file_is_refused_not_renamed() {
+        let fixture = Fixture::new("no-pin");
+        fs::create_dir_all(fixture.destination_root()).unwrap();
+        let live = fixture.destination_root().join("game.cht");
+        fs::write(&live, b"old").unwrap();
+        chmod(&live, 0o664);
+        let expected = digest_bytes(b"new");
+        let refused = atomic_write_bytes(b"new", &live, &expected, false, 0o664, None);
+        assert_eq!(
+            refused.map(|_| ()).map_err(|(kind, _)| kind),
+            Err(SharedApplyFailureKind::AtomicReplaceUnsupported)
+        );
+        assert_eq!(fs::read(&live).unwrap(), b"old");
+        assert_eq!(mode_of(&live), 0o664);
+        assert!(stray_temporaries(live.parent().unwrap()).is_empty());
     }
 
     /// Same size and the old mtime but different bytes is a changed file.
