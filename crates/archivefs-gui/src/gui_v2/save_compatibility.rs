@@ -518,4 +518,88 @@ mod tests {
         render(&mut app, &game);
         assert!(app.saves_states.compatibility.source.is_none());
     }
+    #[test]
+    fn associated_sram_projection_keeps_game_identity_and_refuses_forged_refresh() {
+        use archivefs_core::sram_provenance::{
+            Context, DirectoryIdentity, Object, OriginState, Scope, SramOrigin, Stamp,
+        };
+        let dir = tempfile::tempdir().unwrap();
+        let mut source = record(&dir.path().join("source.srm"));
+        let game = game();
+        let stamp = Stamp {
+            device: 0,
+            inode: 0,
+            size: 16,
+            modified: 0,
+            modified_ns: 0,
+            changed: 0,
+            changed_ns: 0,
+            links: 1,
+            mode: 0o100600,
+            uid: 0,
+        };
+        let artifact = Object {
+            path: source.path.clone(),
+            stamp: stamp.clone(),
+            sha256: source.sha256.clone().unwrap(),
+        };
+        let cartridge = Object {
+            path: game.archive.absolute_path.clone(),
+            stamp: stamp.clone(),
+            sha256: "a".repeat(64),
+        };
+        let gold = IdentityEvidence {
+            kind: IdentityKind::LooseRomSha256,
+            status: IdentityStatus::Verified,
+            value: Some(cartridge.sha256.clone()),
+            confidence: IdentityConfidence::StructuredMetadata,
+            provenance: IdentityProvenance {
+                archive_path: cartridge.path.clone(),
+                member_path: None,
+                member_index: None,
+                method: "synthetic observation".into(),
+            },
+            diagnostic: "test fixture, not a sealed receipt".into(),
+        };
+        source.sram_origin = Some(SramOrigin {
+            state: OriginState::Associated,
+            session: "synthetic observation".into(),
+            artifact: artifact.clone(),
+            explanation: "trusted-observation projection fixture only".into(),
+            context: Context {
+                cartridge,
+                cartridge_identity: gold,
+                executable: artifact.clone(),
+                core: artifact.clone(),
+                scope: Scope {
+                    configuration: artifact.clone(),
+                    selected_executable: artifact.path.clone(),
+                    selected_core: artifact.path.clone(),
+                    saves: dir.path().into(),
+                    saves_identity: DirectoryIdentity {
+                        device: 0,
+                        inode: 0,
+                    },
+                    profile: "fixture".into(),
+                },
+            },
+        });
+        // Pure adapter projection of a trusted observation; no claim this
+        // fabricated fixture is cryptographic association evidence.
+        let model = observed(&source, &game);
+        assert_eq!(model.platform, Some(game.platform.clone()));
+        assert_eq!(
+            model.game_identity,
+            Some(format!("LooseRomSha256:{}", "a".repeat(64)))
+        );
+        assert_eq!(model.format, Format::RawSram);
+        let mut other_game = game.clone();
+        other_game.archive.absolute_path = dir.path().join("another-game.gb");
+        assert!(observed(&source, &other_game).platform.is_none());
+        // Production compare reopens the existing provider. A fabricated
+        // Associated flag cannot pass its receipt refresh.
+        let result = compare(&source, &source, &game);
+        assert_ne!(result.outcome, SaveMigrationOutcome::DirectlyCompatible);
+        assert_eq!(std::fs::read(&source.path).unwrap(), [1u8; 16]);
+    }
 }
