@@ -106,7 +106,7 @@ pub(crate) fn fixture() -> (tempfile::TempDir, SaturnPatchPlan, PathBuf) {
     fs::create_dir(&root).unwrap();
     fs::create_dir(root.join("empty")).unwrap();
     let cue = root.join("game.cue");
-    fs::write(&cue, concat!("REM COMMENT \"kept annotation\"\nTITLE \"Reviewed disc\"\n", "FILE \"data.bin\" BINARY\n TRACK 01 MODE1/2048\n INDEX 00 00:00:00\n INDEX 01 00:00:10\n PREGAP 00:00:10\n", "FILE \"audio.bin\" BINARY\n TRACK 02 AUDIO\n INDEX 01 00:00:00\n POSTGAP 00:00:02\n")).unwrap();
+    fs::write(&cue, concat!("REM COMMENT \"kept annotation\"\nTITLE \"Reviewed disc\"\n", "FILE \"data.bin\" BINARY\n TRACK 01 MODE1/2048\n INDEX 00 00:00:00\n INDEX 01 00:00:10\n", "FILE \"audio.bin\" BINARY\n TRACK 02 AUDIO\n INDEX 01 00:00:00\n POSTGAP 00:00:02\n")).unwrap();
     let mut data = vec![0x11; 2048 * 20];
     data[2048 * 10..2048 * 10 + 256].copy_from_slice(&system_id());
     fs::write(root.join("data.bin"), &data).unwrap();
