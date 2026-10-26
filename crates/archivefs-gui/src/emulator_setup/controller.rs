@@ -1604,6 +1604,17 @@ impl ArchiveFsApp {
             managed_appimage_explicit_executables(&managed_appimage_installs, "DuckStation");
         let managed_xemu_appimages: Vec<PathBuf> =
             managed_appimage_explicit_executables(&managed_appimage_installs, "xemu");
+        let ppsspp_launch_roots = PpssppResolutionInputs::from_environment(
+            &self.emulator_readiness.emulator_setup_overrides,
+        )
+        .ok()
+        .map(|inputs| {
+            let mut roots = inputs.roots;
+            roots
+                .explicit_executables
+                .extend(managed_ppsspp_appimages.iter().cloned());
+            roots
+        });
         // Launch consumes the shared resolver's answer for DuckStation: only
         // the pair it authorises is offered, and a refusal blocks DuckStation
         // outright instead of falling back to a separate discovery.
@@ -1657,13 +1668,8 @@ impl ArchiveFsApp {
                 });
             }
         }
-        if let Ok(mut roots) =
-            archivefs_core::patch_manager::PpssppProfileDiscoveryRoots::from_environment()
-        {
-            roots
-                .explicit_executables
-                .extend(managed_ppsspp_appimages.iter().cloned());
-            let discovery = archivefs_core::patch_manager::discover_ppsspp_profiles(&roots);
+        if let Some(roots) = ppsspp_launch_roots.as_ref() {
+            let discovery = archivefs_core::patch_manager::discover_ppsspp_profiles(roots);
             standalone_profiles.extend(discovery.profiles.iter().map(|profile| {
                 archivefs_core::launch::StandaloneProfileInput {
                     adapter_id: "ppsspp",
@@ -1836,31 +1842,20 @@ impl ArchiveFsApp {
             }
         });
         let ppsspp_context =
-            archivefs_core::patch_manager::PpssppProfileDiscoveryRoots::from_environment()
-                .ok()
-                .map(|mut roots| {
-                    // Same validated managed-AppImage evidence as the
-                    // standalone-profile projection above; the launch
-                    // context re-runs discovery at preflight time, so its
-                    // roots must carry the exact same explicit executable.
-                    roots
-                        .explicit_executables
-                        .extend(managed_ppsspp_appimages.iter().cloned());
-                    launch_readiness_page::PpssppLaunchContext {
-                        discovery: archivefs_core::patch_manager::discover_ppsspp_profiles(&roots),
-                        roots,
-                        verified_psp_disc_id: verified_facts.iter().find_map(|fact| match fact {
-                            archivefs_core::launch::VerifiedIdentityFact::PspDiscId(id) => {
-                                Some(id.clone())
-                            }
-                            _ => None,
-                        }),
-                        verified_standalone_pbp_sha256: verified_facts.iter().find_map(|fact| match fact {
-                            archivefs_core::launch::VerifiedIdentityFact::PspStandalonePbpSha256(hash) => Some(hash.clone()),
-                            _ => None,
-                        }),
+            ppsspp_launch_roots.map(|roots| launch_readiness_page::PpssppLaunchContext {
+                discovery: archivefs_core::patch_manager::discover_ppsspp_profiles(&roots),
+                roots,
+                verified_psp_disc_id: verified_facts.iter().find_map(|fact| match fact {
+                    archivefs_core::launch::VerifiedIdentityFact::PspDiscId(id) => Some(id.clone()),
+                    _ => None,
+                }),
+                verified_standalone_pbp_sha256: verified_facts.iter().find_map(|fact| match fact {
+                    archivefs_core::launch::VerifiedIdentityFact::PspStandalonePbpSha256(hash) => {
+                        Some(hash.clone())
                     }
-                });
+                    _ => None,
+                }),
+            });
         let rpcs3_context =
             archivefs_core::patch_manager::Rpcs3ProfileDiscoveryRoots::from_environment()
                 .ok()

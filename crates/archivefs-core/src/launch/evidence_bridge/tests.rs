@@ -953,6 +953,43 @@ fn direct_game_image_resolves_to_its_own_path() {
 }
 
 #[test]
+fn direct_iso_and_pbp_are_optical_shapes_without_conferring_identity() {
+    use super::canonical_identity_from_game_report;
+    use crate::game_identity::{GameIdentityReport, IdentityImageFormat, IdentityPlatform};
+
+    for path in ["/library/Game.iso", "/library/EBOOT.PBP"] {
+        let record = sample_record(
+            sample_archive(path, ArchiveKind::DirectGameImage),
+            MountState::NotMountable,
+        );
+        let content = launch_content_ref_from_archive_record(&record, None);
+        assert_eq!(content.kind, Some(LaunchContentKind::OpticalDisc));
+        assert_eq!(content.container, Some(LaunchContainerKind::PlainFile));
+        assert_eq!(content.resolved_path.as_deref(), Some(Path::new(path)));
+        assert!(!content.requires_mount);
+    }
+
+    // A file extension classifies only the direct content shape. Without a
+    // verified identity report, the canonical identity bridge remains closed.
+    let unresolved = GameIdentityReport {
+        archive_path: PathBuf::from("/library/EBOOT.PBP"),
+        platform: IdentityPlatform::Other,
+        format: IdentityImageFormat::Pbp,
+        evidence: Vec::new(),
+        warnings: Vec::new(),
+        bytes_read: 0,
+        archive_members_inspected: 0,
+        metadata_paths_inspected: 0,
+        nested_container_depth: 0,
+        complete: true,
+    };
+    assert_eq!(
+        canonical_identity_from_game_report(&unresolved).0,
+        CanonicalIdentityStatus::Unknown
+    );
+}
+
+#[test]
 fn a_complete_cue_bin_sheet_is_cue_bin_content_and_an_incomplete_one_is_not() {
     let dir = tempfile::tempdir().unwrap();
     std::fs::write(dir.path().join("Game.bin"), vec![0u8; 2352 * 10]).unwrap();

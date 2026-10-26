@@ -605,6 +605,21 @@ pub fn launch_content_ref_for_unmounted(
             {
                 Some(LaunchContentKind::Cartridge)
             }
+            // These direct files are only a *content-shape* hint here. They
+            // do not establish a platform or game identity: adapter planners
+            // still require their own verified identity and format evidence
+            // before they can offer a launch action.
+            ArchiveKind::DirectGameImage
+                if archive_path
+                    .extension()
+                    .and_then(|extension| extension.to_str())
+                    .is_some_and(|extension| {
+                        extension.eq_ignore_ascii_case("iso")
+                            || extension.eq_ignore_ascii_case("pbp")
+                    }) =>
+            {
+                Some(LaunchContentKind::OpticalDisc)
+            }
             ArchiveKind::ArcadeSetDirectory => Some(LaunchContentKind::ExtractedArcadeSet),
             // `DirectGameImage` covers more than one real platform/format;
             // this bridge does not know which without guessing.

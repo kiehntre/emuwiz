@@ -5,6 +5,7 @@ use std::fs;
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 
+use crate::emulator_setup_overrides::EmulatorPathOverrides;
 use archivefs_core::emulator_inventory::InventoryEmulator;
 use archivefs_core::emulator_profile_resolver::{
     CandidateIdentity, EmulatorSelectionMode, remember_selection_to,
@@ -30,6 +31,34 @@ fn write(path: &Path, text: &str) {
 fn executable(path: &Path) {
     write(path, "#!/bin/sh\n");
     fs::set_permissions(path, fs::Permissions::from_mode(0o755)).unwrap();
+}
+
+#[test]
+fn launch_and_setup_roots_preserve_the_confirmed_executable_and_profile_overrides() {
+    let machine = Machine::new();
+    let mut roots = archivefs_core::patch_manager::PpssppProfileDiscoveryRoots {
+        home: machine.home.clone(),
+        xdg_config_home: machine.home.join(".config"),
+        xdg_data_home: machine.home.join(".local/share"),
+        explicit_configuration_roots: Vec::new(),
+        portable_configuration_roots: Vec::new(),
+        explicit_executables: Vec::new(),
+        known_version_outputs: BTreeMap::new(),
+        appimage_directory: None,
+        path_override: Some(Vec::new()),
+    };
+    let executable = machine.bin().join("PPSSPPSDL");
+    let profile = machine.home.join("authorised-profile");
+    let overrides = EmulatorPathOverrides {
+        ppsspp_executable: Some(executable.clone()),
+        ppsspp_configuration_folder: Some(profile.clone()),
+        ..Default::default()
+    };
+
+    apply_overrides_to_roots(&mut roots, &overrides);
+
+    assert_eq!(roots.explicit_executables, [executable]);
+    assert_eq!(roots.explicit_configuration_roots, [profile]);
 }
 
 fn profile(root: &Path, used: bool) {
