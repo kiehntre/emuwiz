@@ -370,6 +370,13 @@ impl App {
                 };
             }
             super::mame_collection_health::show_read_only(ui, &mut self.organisation.mame_health);
+            if self.organisation.mame_health.take_repair_history_request() {
+                self.send(0, super::Command::LoadRepairHistory);
+                if let Some(workflows) = &mut self.native_workflows {
+                    workflows.reload_repair_history();
+                }
+                self.organisation.view = OrganisationView::RepairHistory;
+            }
             return;
         }
         let mut selected = None;

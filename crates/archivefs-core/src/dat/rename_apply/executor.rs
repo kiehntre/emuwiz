@@ -451,6 +451,17 @@ fn apply_transaction_inner(execution: &mut ApplyExecution<'_>) -> Result<ApplyOu
             }
         }
 
+        let prepared_copy = match super::copy::prepare(&mut transaction.entries[index]) {
+            Ok(prepared) => prepared,
+            Err(reason) => {
+                transaction.entries[index].state = EntryState::ApplyFailed;
+                transaction.entries[index].failure_reason = Some(reason);
+                transaction.state = TransactionState::ApplyFailed;
+                write_journal(&execution.journal_dir, transaction)
+                    .map_err(|e| ApplyError::Journal(e.to_string()))?;
+                break;
+            }
+        };
         // Durable `Applying` checkpoint BEFORE the rename syscall. If this
         // write fails, no mutation may happen.
         transaction.entries[index].state = EntryState::Applying;
@@ -489,6 +500,7 @@ fn apply_transaction_inner(execution: &mut ApplyExecution<'_>) -> Result<ApplyOu
                 _ => None,
             }
         });
+        let mutation = prepared_copy.map(|copy| copy.publish()).or(mutation);
         match mutation
             .unwrap_or_else(|| apply_mutation_in(&transaction.entries[index], &execution.trusted))
         {
@@ -734,119 +746,14 @@ fn run_test_before_rename(source: &std::path::Path, _destination: &std::path::Pa
 fn run_test_before_rename(_source: &std::path::Path, _destination: &std::path::Path) {}
 
 fn apply_copy_mutation(
-    entry: &TransactionEntry,
-    expected_source: &std::path::Path,
-    destination_root: &std::path::Path,
+    _entry: &TransactionEntry,
+    _expected_source: &std::path::Path,
+    _destination_root: &std::path::Path,
 ) -> Result<(), (EntryState, String)> {
-    if !expected_source.is_absolute()
-        || expected_source != entry.source_path
-        || !super::preflight::destination_is_confined(&entry.destination_path, destination_root)
-    {
-        return Err((
-            EntryState::ApplyFailed,
-            "invalid journalled copy source or destination".into(),
-        ));
-    }
-    let source = capture_identity(&entry.source_path).map_err(|_| {
-        (
-            EntryState::ApplyFailed,
-            "copy source no longer exists".into(),
-        )
-    })?;
-    if source.kind != super::model::ObjectKind::RegularFile
-        || !super::identity::identity_matches(&entry.identity, &source)
-    {
-        return Err((
-            EntryState::ApplyFailed,
-            "copy source changed since review".into(),
-        ));
-    }
-    if std::fs::symlink_metadata(&entry.destination_path).is_ok() {
-        return Err((
-            EntryState::ApplyFailed,
-            "destination already exists and was not replaced".into(),
-        ));
-    }
-    let Some(parent) = entry.destination_path.parent() else {
-        return Err((
-            EntryState::ApplyFailed,
-            "copy destination has no parent".into(),
-        ));
-    };
-    if entry.proposed_basename.is_empty()
-        || entry.proposed_basename == "."
-        || entry.proposed_basename == ".."
-        || entry.proposed_basename.contains('/')
-        || entry.proposed_basename.contains('\\')
-    {
-        return Err((
-            EntryState::ApplyFailed,
-            "copy destination member is not a safe basename".into(),
-        ));
-    }
-    let nonce = format!(
-        ".emuwiz-copy-{}-{}",
-        std::process::id(),
-        crate::dat::sources::now_unix()
-    );
-    let temporary = parent.join(format!("{}{}", entry.proposed_basename, nonce));
-    if std::fs::symlink_metadata(&temporary).is_ok() {
-        return Err((
-            EntryState::ApplyFailed,
-            "copy temporary path already exists".into(),
-        ));
-    }
-    let mut published = false;
-    let result = (|| {
-        std::fs::copy(&entry.source_path, &temporary)
-            .map_err(|error| (EntryState::ApplyFailed, error.to_string()))?;
-        let copy_roots = crate::safe_read::TrustedRoots::from_paths([destination_root]);
-        let dirs =
-            super::dirsync::RenameDirs::open_in(&temporary, &entry.destination_path, &copy_roots)
-                .map_err(|error| {
-                (
-                    EntryState::ApplyFailed,
-                    format!("could not bind the copy's parent directories: {error}"),
-                )
-            })?;
-        dirs.rename_noreplace(false)
-            .map_err(|error| (EntryState::ApplyFailed, error.to_string()))?;
-        published = true;
-        dirs.sync_and_verify(false).map_err(|error| {
-            (
-                EntryState::ApplyFailed,
-                format!("the copy was published but its directory entry could not be synchronised: {error}"),
-            )
-        })?;
-        let source_after = capture_identity(&entry.source_path)
-            .map_err(|_| (EntryState::ApplyFailed, "copy source disappeared".into()))?;
-        let destination_after = capture_identity(&entry.destination_path).map_err(|_| {
-            (
-                EntryState::ApplyFailed,
-                "copied destination disappeared".into(),
-            )
-        })?;
-        if super::identity::identity_matches(&entry.identity, &source_after)
-            && super::identity::content_identity_matches(&entry.identity, &destination_after)
-        {
-            Ok(())
-        } else {
-            Err((
-                EntryState::ApplyFailed,
-                "copied destination failed identity verification".into(),
-            ))
-        }
-    })();
-    if result.is_err() {
-        let _ = std::fs::remove_file(&temporary);
-        if published
-            && let Ok(destination) = capture_identity(&entry.destination_path)
-            && super::identity::content_identity_matches(&entry.identity, &destination)
-        {
-            let _ = std::fs::remove_file(&entry.destination_path);
-        }
-    }
-    result
+    Err((
+        EntryState::ApplyFailed,
+        "copy requires journalled exclusive staging through apply_transaction".into(),
+    ))
 }
 
 fn apply_hardlink_mutation(

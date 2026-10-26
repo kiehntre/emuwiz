@@ -47,6 +47,7 @@ pub(super) enum Source {
     PlayingLibrary,
     CanonicalOrganisation,
     MameReconstruction,
+    MameInternalRepair,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
@@ -291,6 +292,9 @@ fn summary_of(transaction: &RenameTransaction, source: Source) -> String {
             "Built a Playing Library ({})",
             plural(count, "link", "links")
         ),
+        Source::MameInternalRepair => {
+            format!("MAME internal repair ({} member(s))", count)
+        }
         Source::MameReconstruction => {
             match transaction
                 .unknown
@@ -328,7 +332,7 @@ fn family_of(transaction: &RenameTransaction, source: Source) -> Family {
     match source {
         Source::DuplicateQuarantine => Family::Repair,
         Source::PlayingLibrary => Family::Organisation,
-        Source::MameReconstruction => Family::Mame,
+        Source::MameReconstruction | Source::MameInternalRepair => Family::Mame,
         Source::CanonicalOrganisation => {
             if transaction
                 .entries
@@ -365,7 +369,7 @@ fn handoff_for(source: Source, family: Family) -> Handoff {
             label: "Open Duplicates",
             route: Route::Section(Section::Duplicates),
         },
-        (Source::MameReconstruction, _) => Handoff {
+        (Source::MameReconstruction | Source::MameInternalRepair, _) => Handoff {
             label: "Open MAME workflow",
             route: Route::MameWorkflow,
         },
@@ -715,6 +719,11 @@ pub(super) fn source_of(transaction: &RenameTransaction) -> Source {
         Source::DuplicateQuarantine
     } else if transaction
         .unknown
+        .contains_key("mame_internal_repair_plan_digest")
+    {
+        Source::MameInternalRepair
+    } else if transaction
+        .unknown
         .get("workflow")
         .and_then(serde_json::Value::as_str)
         == Some(archivefs_core::dat::mame_merged_reconstruction::MAME_RECONSTRUCTION_WORKFLOW)
@@ -756,7 +765,7 @@ pub(super) fn build_entries(
     for transaction in sources.organisation {
         entries.push(HistoryEntry::from_transaction(
             transaction,
-            Source::CanonicalOrganisation,
+            source_of(transaction),
             None,
         ));
     }
@@ -1064,7 +1073,17 @@ fn check_entry(entry: &TransactionEntry, blockers: &mut Vec<Blocker>) {
             }
             Ok(_) => {}
         },
-        TransactionOperation::CreateHardlink { .. } | TransactionOperation::CreateCopy { .. } => {
+        TransactionOperation::CreateCopy { .. } => {
+            match archivefs_core::dat::rename_apply::capture_identity(&entry.destination_path) {
+                Ok(actual)
+                    if archivefs_core::dat::rename_apply::copy::destination_matches(
+                        entry, &actual,
+                    ) => {}
+                Ok(_) => blockers.push(Blocker::OutputChanged(name)),
+                Err(_) => blockers.push(Blocker::OutputMissing(name)),
+            }
+        }
+        TransactionOperation::CreateHardlink { .. } => {
             if std::fs::symlink_metadata(&entry.destination_path).is_err() {
                 blockers.push(Blocker::OutputMissing(name));
             }
@@ -1145,6 +1164,7 @@ pub(super) fn check_undo_safety(entry: &HistoryEntry) -> UndoPreview {
             "Remove {} the Playing Library created. Your original games are not touched.",
             plural(applied, "link", "links")
         )],
+        Source::MameInternalRepair => vec!["Move the created MAME copies into their private recovery staging slots. Original source files are retained.".into()],
         Source::MameReconstruction => vec![
             if super::mame_reconstruction::is_replacement(transaction) {
                 "Put the original archive back. The rebuilt set is kept in EmuWiz's recovery folder; your source archives are not touched."
