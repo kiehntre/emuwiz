@@ -774,11 +774,12 @@ pub(super) enum ToolPage {
     PlatformAliases,
     DatabaseStatus,
     CheatExtras,
+    PatchPackagePreview,
     SourceImpact,
 }
 
 impl ToolPage {
-    pub const ALL: [Self; 9] = [
+    pub const ALL: [Self; 10] = [
         Self::NeedsAttention,
         Self::Mounts,
         Self::MediaSets,
@@ -787,6 +788,7 @@ impl ToolPage {
         Self::PlatformAliases,
         Self::DatabaseStatus,
         Self::CheatExtras,
+        Self::PatchPackagePreview,
         Self::SourceImpact,
     ];
 
@@ -799,6 +801,7 @@ impl ToolPage {
             Self::LibraryViews => "Library Views",
             Self::PlatformAliases => "Platform aliases",
             Self::DatabaseStatus => "Database status",
+            Self::PatchPackagePreview => "Patch-package inspection",
             Self::SourceImpact => "Source-location impact preview",
             Self::CheatExtras => "Providers and code previews",
         }
@@ -817,6 +820,9 @@ impl ToolPage {
             }
             Self::PlatformAliases => "Teach EmuWiz what your folder names mean.",
             Self::DatabaseStatus => "Where EmuWiz keeps what it knows about your library.",
+            Self::PatchPackagePreview => {
+                "Inspect patches and untrusted package metadata without applying anything."
+            }
             Self::SourceImpact => {
                 "Preview one library source at a new folder without relocating anything."
             }
@@ -835,6 +841,7 @@ impl ToolPage {
             Self::ViewHistory | Self::LibraryViews => Section::Build,
             Self::PlatformAliases => Section::Settings,
             Self::DatabaseStatus => Section::Settings,
+            Self::PatchPackagePreview => Section::Mods,
             Self::SourceImpact => Section::Sources,
             Self::CheatExtras => Section::Mods,
         }
@@ -848,6 +855,7 @@ impl ToolPage {
             Self::MediaSets => "Multi-disc games",
             Self::ViewHistory | Self::LibraryViews => "Organise & Export",
             Self::PlatformAliases | Self::DatabaseStatus => "Settings",
+            Self::PatchPackagePreview => "Tools",
             Self::SourceImpact => "Tools",
             Self::CheatExtras => "Enhance",
         }
