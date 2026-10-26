@@ -419,6 +419,9 @@ impl PlayingLibraryPageState {
 
     pub(crate) fn set_destination(&mut self, destination: PlayingLibraryDestination) {
         self.destination = destination;
+        // Reuse the preview revision so even same-destination re-entry
+        // invalidates an older worker carrying a superseded approval.
+        self.plan_generation = self.plan_generation.wrapping_add(1);
         self.plan = None;
         self.preview_transaction = None;
         self.output_projection = None;
@@ -469,7 +472,8 @@ impl PlayingLibraryPageState {
 
     pub(crate) fn input_fingerprint(&self) -> String {
         format!(
-            "{:?}|{:?}|{}|{}|{}|{}|{}|{}|{}|{}|{}|{}",
+            "{}|{:?}|{:?}|{}|{}|{}|{}|{}|{}|{}|{}|{}|{}",
+            self.plan_generation,
             self.destination,
             self.selected_catalogue,
             self.source_root_draft,
