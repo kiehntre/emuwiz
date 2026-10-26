@@ -317,10 +317,16 @@ pub(super) fn read(
                 }
                 4 | 5 | 8 | 10 => t.file(kind, &bytes, &ctx, &eligible)?,
                 9 if n == 4 => {
-                    if bytes != 0u32.to_le_bytes() {
-                        return Err(
-                            "Unsupported state load, fork, partial I/O or observer failure".into(),
-                        );
+                    let flags = u32::from_le_bytes(bytes.as_slice().try_into().unwrap());
+                    if flags != 0 {
+                        let why = if flags & 2 != 0 {
+                            "The native session spawned child processes; origin capture was refused"
+                        } else if flags & 1 != 0 {
+                            "A save state or subsystem was loaded; SRAM origin capture was refused"
+                        } else {
+                            "Unsupported or ambiguous native I/O/memory lifecycle; no SRAM provenance"
+                        };
+                        return Err(why.into());
                     }
                     t.ended = true;
                     break;

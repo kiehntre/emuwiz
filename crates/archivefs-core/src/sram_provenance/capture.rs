@@ -26,7 +26,6 @@ use std::{
 const OBSERVER: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/sram-observer.so"));
 struct Lease {
     root: PathBuf,
-    path: PathBuf,
     file: File,
     _directory: File,
 }
@@ -76,7 +75,27 @@ impl Lease {
                 return Err("Capture lease limit exceeded".into());
             }
             let other = private_rw(&p)?;
-            if flock(&other, libc::LOCK_EX | libc::LOCK_NB).is_err() {
+            let mut value = [0];
+            if other.metadata().map_err(|e| e.to_string())?.len() != 1
+                || other.read_at(&mut value, 0).map_err(|e| e.to_string())? != 1
+                || !matches!(value[0], b'0' | b'!')
+                || !p
+                    .file_name()
+                    .is_some_and(|n| n.to_string_lossy().starts_with("active-"))
+            {
+                return Err(
+                    "Unknown or malformed session lease; review coordination metadata".into(),
+                );
+            }
+            if flock(&other, libc::LOCK_EX | libc::LOCK_NB).is_ok() {
+                let held = Stamp::from_metadata(&other.metadata().map_err(|e| e.to_string())?);
+                let named =
+                    Stamp::from_metadata(&fs::symlink_metadata(&p).map_err(|e| e.to_string())?);
+                if held != named {
+                    return Err("Coordination lease identity changed".into());
+                }
+                fs::remove_file(&p).map_err(|e| e.to_string())?;
+            } else {
                 other.write_at(b"!", 0).map_err(|e| e.to_string())?;
                 file.write_at(b"!", 0).map_err(|e| e.to_string())?;
             }
@@ -85,7 +104,6 @@ impl Lease {
         let retained = directory.try_clone().map_err(|e| e.to_string())?;
         let own_root = PathBuf::from(format!("/proc/self/fd/{}", retained.as_raw_fd()));
         Ok(Self {
-            path: own_root.join(format!("active-{id}.lease")),
             root: own_root,
             file,
             _directory: retained,
@@ -99,11 +117,9 @@ impl Lease {
             .is_ok_and(|n| n == 1 && b[0] == b'0')
     }
 }
-impl Drop for Lease {
-    fn drop(&mut self) {
-        let _ = fs::remove_file(&self.path);
-    }
-}
+// Keep the filename after the watched parent exits: an inherited descriptor
+// can still hold the flock in a descendant. A later registration reaps only
+// unlocked, identity-checked coordination metadata under the global lock.
 fn flock(file: &File, how: i32) -> Result<(), String> {
     if unsafe { libc::flock(file.as_raw_fd(), how) } < 0 {
         Err(std::io::Error::last_os_error().to_string())
@@ -550,6 +566,23 @@ fn spawn_unobserved(
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn inherited_lease_stays_visible_after_parent_completion() {
+        let t = tempfile::tempdir().unwrap();
+        let store = store::Store::open(&t.path().join("origins"), true).unwrap();
+        let first = Lease::register(&store.root, "first").unwrap();
+        let inherited = first.file.try_clone().unwrap();
+        drop(first);
+        let second = Lease::register(&store.root, "second").unwrap();
+        assert!(
+            !second.untainted(),
+            "live inherited ownership must remain discoverable"
+        );
+        drop(second);
+        drop(inherited);
+        let third = Lease::register(&store.root, "third").unwrap();
+        assert!(third.untainted());
+    }
     #[test]
     fn concurrent_sessions_are_tainted_and_leases_remain_pinned() {
         let t = tempfile::tempdir().unwrap();

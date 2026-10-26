@@ -48,7 +48,7 @@ static bool transfer(const void *b,size_t z) {
         if(n<0 && (errno==EAGAIN||errno==EWOULDBLOCK) && millis()<deadline) {
             struct pollfd p={channel,POLLOUT,0}; poll(&p,1,10);continue;
         }
-        atomic_store(&invalid,1);syscall(SYS_close,channel);channel=-1;return false;
+        atomic_fetch_or(&invalid,4);syscall(SYS_close,channel);channel=-1;return false;
     }
     return z==0;
 }
@@ -65,7 +65,7 @@ static bool ack(void) {
         if(n<0 && (errno==EAGAIN||errno==EINTR)){struct pollfd p={channel,POLLIN,0};poll(&p,1,10);continue;}
         break;
     }
-    atomic_store(&invalid,1);return false;
+    atomic_fetch_or(&invalid,4);return false;
 }
 static void stat_wire(struct stamp *w,const struct stat *s) {
     uint64_t v[10]={s->st_dev,s->st_ino,s->st_size,(uint64_t)s->st_mtim.tv_sec,s->st_mtim.tv_nsec,(uint64_t)s->st_ctim.tv_sec,s->st_ctim.tv_nsec,s->st_nlink,s->st_mode,s->st_uid};memcpy(w->v,v,sizeof v);
@@ -81,15 +81,15 @@ static struct slot *find(int fd) {for(unsigned i=0;i<SLOTS;i++)if(slots[i].used&
 static struct slot *track(int fd,const struct stat *s) {
     struct slot *t=find(fd);
     if(!t)for(unsigned i=0;i<SLOTS;i++)if(!slots[i].used){t=&slots[i];break;}
-    if(!t){atomic_store(&invalid,1);return NULL;}
+    if(!t){atomic_fetch_or(&invalid,4);return NULL;}
     *t=(struct slot){1,fd,++sequence,s->st_dev,s->st_ino};return t;
 }
 static void file_event(unsigned kind,int fd,unsigned flags,const struct stat *s,const char *path,const void *bytes,size_t len) {
-    struct slot *t=find(fd);if(!t){atomic_store(&invalid,1);return;}
-    if(t->dev!=s->st_dev||t->ino!=s->st_ino){atomic_store(&invalid,1);return;}
+    struct slot *t=find(fd);if(!t){atomic_fetch_or(&invalid,4);return;}
+    if(t->dev!=s->st_dev||t->ino!=s->st_ino){atomic_fetch_or(&invalid,4);return;}
     uint32_t plen=(uint32_t)strlen(path), n=(uint32_t)len;
     size_t z=16+sizeof(struct stamp)+4+plen+4+len;
-    unsigned char *b=malloc(z);if(!b){atomic_store(&invalid,1);return;}
+    unsigned char *b=malloc(z);if(!b){atomic_fetch_or(&invalid,4);return;}
     struct stamp w;stat_wire(&w,s);uint32_t f=(uint32_t)fd;
     memcpy(b,&f,4);memcpy(b+4,&flags,4);memcpy(b+8,&t->token,8);memcpy(b+16,&w,sizeof w);
     memcpy(b+16+sizeof w,&plen,4);memcpy(b+20+sizeof w,path,plen);memcpy(b+20+sizeof w+plen,&n,4);
@@ -110,7 +110,7 @@ static void opened_inner(int fd,bool read_mode) {
     pthread_mutex_unlock(&mutex);inside=0;
 }
 static void opened(int fd,bool read_mode){int saved=errno;opened_inner(fd,read_mode);errno=saved;}
-static void fork_parent(void){atomic_store(&invalid,1);}
+static void fork_parent(void){atomic_fetch_or(&invalid,2);}
 static void fork_child(void){if(channel>=0)syscall(SYS_close,channel);channel=-1;}
 __attribute__((constructor))static void start_observer(void) {
     const char *fd=getenv("EMUWIZ_SRAM_OBSERVER_FD");root=getenv("EMUWIZ_SRAM_ROOT");core_path=getenv("EMUWIZ_SRAM_CORE");config_path=getenv("EMUWIZ_SRAM_CONFIG");
@@ -129,7 +129,7 @@ __attribute__((constructor))static void start_observer(void) {
 __attribute__((destructor))static void finish_observer(void) {
     if(channel<0)return;
     inside=1;pthread_mutex_lock(&mutex);
-    uint32_t bad=(uint32_t)(atomic_load(&invalid)||atomic_load(&relevant_io));frame(9,&bad,4);syscall(SYS_close,channel);channel=-1;
+    uint32_t bad=(uint32_t)atomic_load(&invalid)|(atomic_load(&relevant_io)?4u:0u);frame(9,&bad,4);syscall(SYS_close,channel);channel=-1;
     pthread_mutex_unlock(&mutex);
 }
 struct game {const char *path;const void *data;size_t size;const char *meta;};
@@ -144,10 +144,10 @@ static void restore_errno(int *saved){errno=*saved;}
 static bool observed_load(const struct game *g) {
     ERRNO_GUARD;
     if(channel<0){errno=saved_errno;bool result=load_game(g);saved_errno=errno;return result;}
-    if(atomic_load(&relevant_io))atomic_store(&invalid,1);
+    if(atomic_load(&relevant_io))atomic_fetch_or(&invalid,4);
     pthread_mutex_lock(&mutex);inside=1;active=false;ram=NULL;ram_size=0;
     bool supported=g&&g->data&&g->size&&g->size<=MAX_ROM;
-    if(!supported || !frame(3,g->data,g->size) || !ack())atomic_store(&invalid,1);
+    if(!supported || !frame(3,g->data,g->size) || !ack())atomic_fetch_or(&invalid,4);
     inside=0;pthread_mutex_unlock(&mutex);
     errno=saved_errno;bool result=load_game(g);saved_errno=errno;
     pthread_mutex_lock(&mutex);inside=1;uint32_t yes=result;active=result;
@@ -155,19 +155,19 @@ static bool observed_load(const struct game *g) {
 }
 static void observed_unload(void){
     ERRNO_GUARD;
-    if(channel>=0){if(atomic_load(&relevant_io))atomic_store(&invalid,1);pthread_mutex_lock(&mutex);active=false;frame(7,NULL,0);pthread_mutex_unlock(&mutex);}
+    if(channel>=0){if(atomic_load(&relevant_io))atomic_fetch_or(&invalid,4);pthread_mutex_lock(&mutex);active=false;frame(7,NULL,0);pthread_mutex_unlock(&mutex);}
     errno=saved_errno;unload_game();saved_errno=errno;
 }
 static void *observed_data(unsigned id){
     ERRNO_GUARD;errno=saved_errno;void *p=memory_data(id);saved_errno=errno;
-    if(channel>=0&&id==0){if(atomic_load(&relevant_io))atomic_store(&invalid,1);pthread_mutex_lock(&mutex);ram=p;pthread_mutex_unlock(&mutex);}return p;
+    if(channel>=0&&id==0){if(atomic_load(&relevant_io))atomic_fetch_or(&invalid,4);pthread_mutex_lock(&mutex);ram=p;pthread_mutex_unlock(&mutex);}return p;
 }
 static size_t observed_size(unsigned id){
     ERRNO_GUARD;errno=saved_errno;size_t n=memory_size(id);saved_errno=errno;
-    if(channel>=0&&id==0){if(atomic_load(&relevant_io))atomic_store(&invalid,1);pthread_mutex_lock(&mutex);ram_size=n;pthread_mutex_unlock(&mutex);}return n;
+    if(channel>=0&&id==0){if(atomic_load(&relevant_io))atomic_fetch_or(&invalid,4);pthread_mutex_lock(&mutex);ram_size=n;pthread_mutex_unlock(&mutex);}return n;
 }
-static bool observed_unserialize(const void *p,size_t n){atomic_store(&invalid,1);return unserialize_game(p,n);}
-static bool observed_special(unsigned id,const struct game *g,size_t n){atomic_store(&invalid,1);return load_special(id,g,n);}
+static bool observed_unserialize(const void *p,size_t n){atomic_fetch_or(&invalid,1);return unserialize_game(p,n);}
+static bool observed_special(unsigned id,const struct game *g,size_t n){atomic_fetch_or(&invalid,1);return load_special(id,g,n);}
 
 // glibc resolves special dlsym handles using its caller's return address.
 // A C forwarding frame changes RTLD_NEXT/default lookup scope. This x86-64
@@ -197,12 +197,12 @@ void *emuwiz_dlsym_explicit(void *handle,const char *name) {
     int entry_errno=errno;void *(*real)(void*,const char*)=real_symbol("dlsym");errno=entry_errno;void *p=real(handle,name);saved_errno=errno;
     if(inside||channel<0||strncmp(name,"retro_",6)||!p||handle==RTLD_DEFAULT||handle==RTLD_NEXT)return p;
     struct link_map *map=NULL;if(dlinfo(handle,RTLD_DI_LINKMAP,&map)||!map)return p;
-    if(strcmp(map->l_name,core_path)){atomic_store(&invalid,1);return p;}
-    if(core_handle&&core_handle!=handle){atomic_store(&invalid,1);return p;}
+    if(strcmp(map->l_name,core_path)){atomic_fetch_or(&invalid,4);return p;}
+    if(core_handle&&core_handle!=handle){atomic_fetch_or(&invalid,4);return p;}
     core_handle=handle;
     if(!strcmp(name,"retro_load_game")){
         inside=1;pthread_mutex_lock(&mutex);load_game=p;uint64_t addr=(uint64_t)(uintptr_t)p;
-        if(!frame(2,&addr,8)||!ack())atomic_store(&invalid,1);
+        if(!frame(2,&addr,8)||!ack())atomic_fetch_or(&invalid,4);
         pthread_mutex_unlock(&mutex);inside=0;return observed_load;
     }
     if(!strcmp(name,"retro_unload_game")){unload_game=p;return observed_unload;}
@@ -229,9 +229,9 @@ FOPEN_WRAP(fopen)
 FOPEN_WRAP(fopen64)
 static void written(int fd,const void *b,size_t n,ssize_t result,off_t offset,const unsigned char *copy,bool qualifies) {
     char path[4096];struct stat s;if(!related(fd,path,&s))return;
-    if(!find(fd)){atomic_store(&invalid,1);return;}
-    if(result!=(ssize_t)n||offset!=0){atomic_store(&invalid,1);qualifies=false;}
-    if(qualifies&&memcmp(copy,b,n)){atomic_store(&invalid,1);qualifies=false;}
+    if(!find(fd)){atomic_fetch_or(&invalid,4);return;}
+    if(result!=(ssize_t)n||offset!=0){atomic_fetch_or(&invalid,4);qualifies=false;}
+    if(qualifies&&memcmp(copy,b,n)){atomic_fetch_or(&invalid,4);qualifies=false;}
     file_event(8,fd,qualifies?2:0,&s,path,qualifies?copy:NULL,qualifies?n:0);
 }
 // Unrelated host I/O bypasses capture entirely. Never hold the capture lock
@@ -240,7 +240,7 @@ static bool begin_io(int fd){
     if(inside||channel<0)return false;
     int saved=errno;char path[4096];struct stat stat;
     bool yes=related(fd,path,&stat);errno=saved;
-    if(yes&&atomic_fetch_add(&relevant_io,1)!=0)atomic_store(&invalid,1);
+    if(yes&&atomic_fetch_add(&relevant_io,1)!=0)atomic_fetch_or(&invalid,4);
     return yes;
 }
 static void end_io(void){atomic_fetch_sub(&relevant_io,1);}
@@ -249,10 +249,10 @@ size_t fwrite(const void *b,size_t size,size_t count,FILE *f) {
     size_t(*real)(const void*,size_t,size_t,FILE*)=real_symbol("fwrite");
     int fd=fileno(f);bool observe=begin_io(fd);
     if(!observe){errno=saved_errno;size_t result=real(b,size,count,f);saved_errno=errno;return result;}
-    if(size&&count>SIZE_MAX/size){atomic_store(&invalid,1);end_io();errno=saved_errno;size_t result=real(b,size,count,f);saved_errno=errno;return result;}
+    if(size&&count>SIZE_MAX/size){atomic_fetch_or(&invalid,4);end_io();errno=saved_errno;size_t result=real(b,size,count,f);saved_errno=errno;return result;}
     size_t n=size*count;inside=1;pthread_mutex_lock(&mutex);off_t off=ftello(f);
     bool q=active&&b==ram&&n==ram_size&&n&&n<=MAX_RAM;
-    unsigned char *copy=q?malloc(n):NULL;if(q&&!copy){q=false;atomic_store(&invalid,1);}if(q)memcpy(copy,b,n);
+    unsigned char *copy=q?malloc(n):NULL;if(q&&!copy){q=false;atomic_fetch_or(&invalid,4);}if(q)memcpy(copy,b,n);
     pthread_mutex_unlock(&mutex);
     errno=saved_errno;size_t result=real(b,size,count,f);saved_errno=errno;
     pthread_mutex_lock(&mutex);written(fd,b,n,(ssize_t)(result*size),off,copy,q);free(copy);pthread_mutex_unlock(&mutex);
@@ -263,7 +263,7 @@ ssize_t write(int fd,const void*b,size_t n) {
     bool observe=begin_io(fd);if(!observe){errno=saved_errno;ssize_t result=real(fd,b,n);saved_errno=errno;return result;}
     inside=1;pthread_mutex_lock(&mutex);off_t off=lseek(fd,0,SEEK_CUR);
     bool q=active&&b==ram&&n==ram_size&&n&&n<=MAX_RAM;
-    unsigned char *copy=q?malloc(n):NULL;if(q&&!copy){q=false;atomic_store(&invalid,1);}if(q)memcpy(copy,b,n);
+    unsigned char *copy=q?malloc(n):NULL;if(q&&!copy){q=false;atomic_fetch_or(&invalid,4);}if(q)memcpy(copy,b,n);
     pthread_mutex_unlock(&mutex);
     errno=saved_errno;ssize_t result=real(fd,b,n);saved_errno=errno;
     pthread_mutex_lock(&mutex);written(fd,b,n,result,off,copy,q);free(copy);pthread_mutex_unlock(&mutex);
@@ -271,13 +271,13 @@ ssize_t write(int fd,const void*b,size_t n) {
 }
 static void read_event(int fd,const void*b,size_t n){
     char path[4096];struct stat s;
-    if(related(fd,path,&s)){if(find(fd))file_event(5,fd,0,&s,path,n<=MAX_RAM?b:NULL,n<=MAX_RAM?n:0);else atomic_store(&invalid,1);}
+    if(related(fd,path,&s)){if(find(fd))file_event(5,fd,0,&s,path,n<=MAX_RAM?b:NULL,n<=MAX_RAM?n:0);else atomic_fetch_or(&invalid,4);}
 }
 size_t fread(void*b,size_t size,size_t count,FILE*f){
     ERRNO_GUARD;size_t(*real)(void*,size_t,size_t,FILE*)=real_symbol("fread");
     int fd=fileno(f);bool observe=begin_io(fd);if(observe)inside=1;
     errno=saved_errno;size_t n=real(b,size,count,f);saved_errno=errno;
-    if(observe){pthread_mutex_lock(&mutex);if(size&&n>SIZE_MAX/size)atomic_store(&invalid,1);else read_event(fd,b,n*size);pthread_mutex_unlock(&mutex);inside=0;end_io();}return n;
+    if(observe){pthread_mutex_lock(&mutex);if(size&&n>SIZE_MAX/size)atomic_fetch_or(&invalid,4);else read_event(fd,b,n*size);pthread_mutex_unlock(&mutex);inside=0;end_io();}return n;
 }
 ssize_t read(int fd,void*b,size_t z){
     ERRNO_GUARD;ssize_t(*real)(int,void*,size_t)=real_symbol("read");
@@ -291,11 +291,11 @@ static int finish_fd(int fd,FILE*f,bool stream){
     if(!observe){errno=saved_errno;int result=stream?realfclose(f):realclose(fd);saved_errno=errno;return result;}
     inside=1;pthread_mutex_lock(&mutex);struct slot *t=find(fd);
     uint64_t token=t?t->token:0;int duplicate=t?fcntl(fd,F_DUPFD_CLOEXEC,3):-1;
-    if(!t){atomic_store(&invalid,1);}
+    if(!t){atomic_fetch_or(&invalid,4);}
     pthread_mutex_unlock(&mutex);
     errno=saved_errno;int result=stream?realfclose(f):realclose(fd);saved_errno=errno;
     pthread_mutex_lock(&mutex);t=find(fd);
-    if(t&&t->token==token){struct stat s;char path[4096];if(result||duplicate<0||!related(duplicate,path,&s)){atomic_store(&invalid,1);}else file_event(10,fd,0,&s,path,NULL,0);t->used=0;}else atomic_store(&invalid,1);
+    if(t&&t->token==token){struct stat s;char path[4096];if(result||duplicate<0||!related(duplicate,path,&s)){atomic_fetch_or(&invalid,4);}else file_event(10,fd,0,&s,path,NULL,0);t->used=0;}else atomic_fetch_or(&invalid,4);
     if(duplicate>=0)syscall(SYS_close,duplicate);
     pthread_mutex_unlock(&mutex);inside=0;end_io();return result;
 }
@@ -306,7 +306,7 @@ int close(int fd){return finish_fd(fd,NULL,false);}
 static void unsupported_fd(int fd){
     if(inside||channel<0)return;
     int saved=errno;char path[4096];struct stat stat;
-    if(related(fd,path,&stat))atomic_store(&invalid,1);
+    if(related(fd,path,&stat))atomic_fetch_or(&invalid,4);
     errno=saved;
 }
 int dup(int fd){ERRNO_GUARD;unsupported_fd(fd);int(*real)(int)=real_symbol("dup");errno=saved_errno;int r=real(fd);saved_errno=errno;return r;}
@@ -321,13 +321,13 @@ void *mmap(void*a,size_t n,int prot,int flags,int fd,off_t off){ERRNO_GUARD;unsu
 
 #include <spawn.h>
 int posix_spawn(pid_t*p,const char*path,const posix_spawn_file_actions_t*a,const posix_spawnattr_t*attr,char*const argv[],char*const env[]){
-    ERRNO_GUARD;if(channel>=0)atomic_store(&invalid,1);
+    ERRNO_GUARD;if(channel>=0)atomic_fetch_or(&invalid,2);
     int(*real)(pid_t*,const char*,const posix_spawn_file_actions_t*,const posix_spawnattr_t*,char*const[],char*const[])=real_symbol("posix_spawn");
     errno=saved_errno;int r=real(p,path,a,attr,argv,env);saved_errno=errno;return r;
 }
 int posix_spawnp(pid_t*p,const char*path,const posix_spawn_file_actions_t*a,const posix_spawnattr_t*attr,char*const argv[],char*const env[]){
-    ERRNO_GUARD;if(channel>=0)atomic_store(&invalid,1);
+    ERRNO_GUARD;if(channel>=0)atomic_fetch_or(&invalid,2);
     int(*real)(pid_t*,const char*,const posix_spawn_file_actions_t*,const posix_spawnattr_t*,char*const[],char*const[])=real_symbol("posix_spawnp");
     errno=saved_errno;int r=real(p,path,a,attr,argv,env);saved_errno=errno;return r;
 }
-int system(const char*command){ERRNO_GUARD;if(channel>=0)atomic_store(&invalid,1);int(*real)(const char*)=real_symbol("system");errno=saved_errno;int r=real(command);saved_errno=errno;return r;}
+int system(const char*command){ERRNO_GUARD;if(channel>=0)atomic_fetch_or(&invalid,2);int(*real)(const char*)=real_symbol("system");errno=saved_errno;int r=real(command);saved_errno=errno;return r;}
