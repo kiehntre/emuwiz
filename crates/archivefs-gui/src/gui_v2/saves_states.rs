@@ -549,19 +549,35 @@ fn record_belongs_to_game(record: &PersistentStateRecord, game: &Game) -> bool {
         if let Some(origin) = record.sram_origin.as_ref() {
             // The worker revalidated the sealed content digest and exact path.
             // No UI title or filename participates in this join.
+            use archivefs_core::game_identity::{IdentityKind, IdentityStatus};
+            let gold = &origin.context.cartridge_identity;
+            let digest = origin.context.cartridge.sha256.as_str();
+            // A DAT-only library row need not cache SHA256. The authority is
+            // current, sealed Gold byte evidence from the inventory worker.
+            // Any redundant strong cache evidence still refuses disagreement.
+            let mut cached = game
+                .dat_exact_hashes
+                .as_ref()
+                .and_then(|h| h.sha256.as_deref())
+                .into_iter()
+                .chain(
+                    game.archive
+                        .identity_report
+                        .as_ref()
+                        .into_iter()
+                        .flat_map(|r| r.evidence.iter())
+                        .filter(|e| {
+                            e.kind == IdentityKind::LooseRomSha256
+                                && e.status == IdentityStatus::Verified
+                        })
+                        .filter_map(|e| e.value.as_deref()),
+                );
             return origin.state == archivefs_core::sram_provenance::OriginState::Associated
+                && gold.kind == IdentityKind::LooseRomSha256
+                && gold.status == IdentityStatus::Verified
+                && gold.value.as_deref() == Some(digest)
                 && !game.inspection_incomplete
-                && game
-                    .dat_exact_hashes
-                    .as_ref()
-                    .and_then(|h| h.sha256.as_deref())
-                    .or_else(|| {
-                        game.archive
-                            .identity_report
-                            .as_ref()
-                            .and_then(|r| r.verified_loose_rom_sha256())
-                    })
-                    == Some(origin.context.cartridge.sha256.as_str())
+                && cached.all(|value| value == digest)
                 && origin.context.cartridge.path == game.archive.absolute_path;
         }
     }
@@ -922,6 +938,37 @@ mod tests {
             explanation: "witness".into(),
         });
         assert!(record_belongs_to_game(&record, &game));
+        game.dat_exact_hashes = None;
+        assert!(
+            record_belongs_to_game(&record, &game),
+            "fresh sealed Gold evidence works without redundant library SHA256"
+        );
+        game.dat_exact_hashes = Some(
+            archivefs_core::dat::library_identity_summary::LibraryItemHashes {
+                sha256: Some("conflicting cached digest".into()),
+                ..Default::default()
+            },
+        );
+        assert!(!record_belongs_to_game(&record, &game));
+        game.dat_exact_hashes = None;
+        game.inspection_incomplete = true;
+        assert!(!record_belongs_to_game(&record, &game));
+        game.inspection_incomplete = false;
+        record
+            .sram_origin
+            .as_mut()
+            .unwrap()
+            .context
+            .cartridge_identity
+            .status = archivefs_core::game_identity::IdentityStatus::Candidate;
+        assert!(!record_belongs_to_game(&record, &game));
+        record
+            .sram_origin
+            .as_mut()
+            .unwrap()
+            .context
+            .cartridge_identity
+            .status = archivefs_core::game_identity::IdentityStatus::Verified;
         assert!(record.game_identity.is_empty());
         let mut other = game.clone();
         other.archive.absolute_path = "/games/two/Game.gb".into();
