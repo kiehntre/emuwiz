@@ -6,6 +6,7 @@
 //! supplied explicitly by the caller; a title, product number, filename, or
 //! emulator boot result is never a base identity.
 
+pub mod optical;
 pub mod ssp;
 
 use std::collections::BTreeSet;
@@ -15,9 +16,7 @@ use std::path::{Path, PathBuf};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
-use crate::saturn_disc_manifest::{
-    SaturnDiscManifest, SaturnManifestStatus, SaturnTrackType, verify_saturn_manifest,
-};
+use crate::saturn_disc_manifest::{SaturnDiscManifest, SaturnManifestStatus, SaturnTrackType};
 use crate::standalone_patch::{
     PatchInspectionState, StandalonePatchFormat, StandalonePatchInspection,
     inspect_standalone_patch,
@@ -152,11 +151,13 @@ pub enum SaturnPatchReadinessReason {
     NativeIdentityConflict,
     ProviderEvidenceConflict,
     UnsupportedRepresentation,
+    OpticalLayoutRefused { detail: String },
 }
 
 impl std::fmt::Display for SaturnPatchReadinessReason {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         let text = match self {
+            Self::OpticalLayoutRefused { detail } => detail.as_str(),
             Self::IncompleteManifest => "the Saturn manifest is incomplete",
             Self::ManifestUnsafe => "the Saturn manifest is unsafe or invalid",
             Self::SourceHashMismatch => "the exact source hash does not match",
@@ -201,6 +202,8 @@ pub struct SaturnPatchReadiness {
     pub topology_expected_untouched: bool,
     pub changed_ranges: Option<String>,
     pub explanation: String,
+    #[serde(default)]
+    pub optical_layout: Option<optical::SaturnOpticalPreflight>,
 }
 
 fn digest<T: Serialize>(value: &T) -> String {
@@ -341,6 +344,7 @@ fn initial_result(request: &SaturnPatchReadinessRequest) -> SaturnPatchReadiness
         topology_expected_untouched: false,
         changed_ranges: None,
         explanation: String::new(),
+        optical_layout: None,
     }
 }
 
@@ -478,13 +482,18 @@ pub fn assess_saturn_patch_readiness(
         return result;
     }
 
-    let verification = verify_saturn_manifest(&request.manifest);
-    if !verification.issues.is_empty() {
-        result
-            .reasons
-            .push(SaturnPatchReadinessReason::SourceHashMismatch);
-        result.explanation =
-            "The selected Saturn source no longer matches its reviewed manifest.".into();
+    let optical = optical::assess(&request.manifest);
+    result.reasons.extend(
+        optical
+            .refusals
+            .iter()
+            .cloned()
+            .map(|detail| SaturnPatchReadinessReason::OpticalLayoutRefused { detail }),
+    );
+    let refused = !optical.refusals.is_empty();
+    result.optical_layout = Some(optical);
+    if refused {
+        result.explanation = "Optical preflight refused this source; review the companion, freshness and layout reasons before Apply.".into();
         return result;
     }
 
