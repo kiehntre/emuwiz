@@ -80,6 +80,7 @@ mod setup_portability;
 #[path = "tests/shared_scroll.rs"]
 mod shared_scroll_tests;
 mod simple_shell;
+mod source_impact;
 mod sources_providers;
 #[cfg(test)]
 mod stale_inspection_tests;
