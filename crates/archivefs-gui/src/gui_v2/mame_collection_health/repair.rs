@@ -326,7 +326,7 @@ impl State {
             self.confirmation_digest = reviewed.digest.clone();
         }
         ui.label(format!(
-            "Registered catalogue {} · version {} · SHA-256 {}",
+            "Registered catalogue {:?} · version {:?} · SHA-256 {}",
             report.catalogue.reference,
             reviewed
                 .plan
@@ -339,10 +339,10 @@ impl State {
         ui.label("Only independent copies to missing members of existing machine folders are supported. Existing files are never replaced. CHDs and archive writes are unsupported. Close other collection writers before Apply.");
         egui::CollapsingHeader::new("Exact affected files and expected results").default_open(true).show(ui, |ui| {
             for o in &reviewed.apply.operations {
-                ui.label(format!("{} · {:?} · {:?}\n{} → {}\nExpected SHA-1 {} · size {:?}\n{}", o.affected_set, o.relationship, o.state, o.selected_source.display(), o.destination_path.display(), o.expected_sha1, o.expected_size, o.refusal_reason.as_deref().unwrap_or("Copy missing member; source retained; destination content verified")));
+                ui.label(format!("{:?} · {:?} · {:?}\n{:?} → {:?}\nExpected SHA-1 {} · size {:?}\n{}", o.affected_set, o.relationship, o.state, o.selected_source, o.destination_path, o.expected_sha1, o.expected_size, o.refusal_reason.as_deref().unwrap_or("Copy missing member; source retained; destination content verified")));
             }
             for r in &reviewed.plan.requirements {
-                ui.label(format!("{} / {} · {} · {} · dependency {:?}, parent {:?}, merge {:?}, devices {:?}", r.affected_set, r.required_filename, r.requirement_class.label(), r.disposition.label(), r.relationship.kind, r.relationship.parent, r.relationship.merge_member, r.relationship.device_refs));
+                ui.label(format!("{:?} / {:?} · {} · {} · dependency {:?}, parent {:?}, merge {:?}, devices {:?}", r.affected_set, r.required_filename, r.requirement_class.label(), r.disposition.label(), r.relationship.kind, r.relationship.parent, r.relationship.merge_member, r.relationship.device_refs));
             }
         });
         let count = reviewed

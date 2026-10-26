@@ -345,3 +345,46 @@ fn duplicate_observed_containers_and_supplied_release_mismatch_block_apply() {
     assert!(report.repair.is_none());
     assert!(report.repair_unavailable.unwrap().contains("version"));
 }
+
+#[test]
+fn exact_preview_escapes_control_characters_in_affected_paths() {
+    use eframe::egui;
+    let f = fixture();
+    // An actual fixture filename, including newline and bidi control.
+    let hostile = f.request.root.join("donor/line\n\u{202e}.bin");
+    std::fs::rename(f.request.root.join("donor/main.bin"), &hostile).unwrap();
+    let report = f.report();
+    assert_eq!(
+        report.repair.as_ref().unwrap().apply.operations[0].selected_source,
+        hostile
+    );
+    let context = egui::Context::default();
+    let mut state = State::default();
+    let out = context.run(
+        egui::RawInput {
+            screen_rect: Some(egui::Rect::from_min_size(
+                egui::Pos2::ZERO,
+                egui::vec2(1400.0, 2200.0),
+            )),
+            ..Default::default()
+        },
+        |ctx| {
+            egui::CentralPanel::default().show(ctx, |ui| state.show(ui, Some(&report)));
+        },
+    );
+    let labels: Vec<_> = out
+        .shapes
+        .iter()
+        .filter_map(|s| match &s.shape {
+            egui::Shape::Text(t) => Some(t.galley.text()),
+            _ => None,
+        })
+        .collect();
+    assert!(labels.iter().all(|s| !s.contains('\u{202e}')));
+    assert!(
+        labels
+            .iter()
+            .any(|s| s.contains("\\u{202e}") && s.contains("\\n")),
+        "{labels:?}"
+    );
+}
