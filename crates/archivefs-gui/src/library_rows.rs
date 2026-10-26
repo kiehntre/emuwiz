@@ -82,8 +82,8 @@ impl RowOrigin {
         match self {
             Self::Live => "Live",
             Self::CachedAwaitingValidation => "Cached: awaiting validation",
-            Self::CachedMissing => "Cached: missing",
-            Self::CachedUnavailable => "Cached: source unavailable",
+            Self::CachedMissing => "Previously recorded missing",
+            Self::CachedUnavailable => "Recorded path not confirmed",
         }
     }
 
@@ -96,9 +96,11 @@ impl RowOrigin {
     pub(crate) fn gamer_view_label(self) -> &'static str {
         match self {
             Self::Live => "",
-            Self::CachedAwaitingValidation => "Checking this game...",
-            Self::CachedMissing => "We couldn't find this game's file just now.",
-            Self::CachedUnavailable => "We can't reach this game's location right now.",
+            Self::CachedAwaitingValidation => "Awaiting a file check.",
+            Self::CachedMissing => "Previously recorded missing; this view has not reverified it.",
+            Self::CachedUnavailable => {
+                "This path could not be confirmed; review its source folder."
+            }
         }
     }
 }

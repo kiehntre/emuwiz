@@ -414,10 +414,10 @@ fn file_problem(game: &Game) -> Problem {
     Problem {
         id: format!("missing-{id}"),
         game_id: Some(id),
-        title: format!("{} is missing or has a saved health problem", game.title),
+        title: format!("{} needs a file check", game.title),
         category: Category::Files,
         severity: Severity::NeedsAttention,
-        state: ProblemState::Current,
+        state: ProblemState::NeedsEvidence,
         kind,
         primary: Some(primary),
         secondary: Some(ProblemAction::show_game(id)),
@@ -427,16 +427,27 @@ fn file_problem(game: &Game) -> Problem {
         } else {
             format!("Last recorded path: {}", game.archive.absolute_path.display())
         },
-        why: "EmuWiz cannot safely verify or prepare this game until the recorded file is available and readable.".into(),
+        why: format!(
+            "Saved health and missing flags are historical evidence, not a fresh verification. Path observation for this view: {}. Game contents have not been reverified.",
+            if present {
+                "the recorded file or folder is present"
+            } else if folder_reachable {
+                "the recorded path could not be confirmed, but its parent folder is reachable"
+            } else {
+                "neither the recorded path nor its parent folder could be confirmed; the source may be offline or access may have failed"
+            }
+        ),
         action,
         safety: "Read-only. Browsing and verification do not rename, move, delete, or repair the source file.".into(),
         undo: "No file change was made, so there is nothing to undo.".into(),
         technical: format!(
-            "Catalogue id {} · source folder {} · recorded path {} · health {}",
+            "Catalogue id {} · source folder {} · recorded path {} · saved health {} · last seen {} · missing recorded {}",
             game.archive.id,
             game.archive.source_folder_id,
             game.archive.absolute_path.display(),
-            game.archive.last_known_health
+            game.archive.last_known_health,
+            game.archive.last_seen_at,
+            game.archive.last_verified_missing_at.as_deref().unwrap_or("never")
         ),
     }
 }
@@ -671,6 +682,19 @@ pub(in crate::gui_v2) mod tests {
             screenscraper: None,
             search: title.to_lowercase(),
         }
+    }
+
+    #[test]
+    fn saved_health_is_never_presented_as_a_current_verification() {
+        let mut saved = game(42, "Restored", false, false);
+        saved.archive.last_verified_missing_at = Some("2026-10-20".into());
+        saved.archive.last_seen_at = "2026-10-19".into();
+        let finding = file_problem(&saved);
+        assert_eq!(finding.state, ProblemState::NeedsEvidence);
+        assert!(finding.why.contains("historical"));
+        assert!(finding.technical.contains("2026-10-20"));
+        assert!(finding.technical.contains("2026-10-19"));
+        assert!(finding.why.contains("present"));
     }
 
     #[test]

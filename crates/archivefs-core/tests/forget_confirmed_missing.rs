@@ -409,3 +409,68 @@ fn preview_performs_no_writes() {
     assert_eq!(fs::read(f.db.path()).unwrap(), bytes);
     assert_eq!(dir(&f), listing);
 }
+
+#[test]
+fn preview_separates_historical_missing_from_current_source_availability() {
+    use archivefs_core::catalogue_health::SourceHealthState;
+    let (f, gone, _, _) = F::confirmed();
+    let archives = f.db.load_archives().unwrap();
+    let historical = archives.iter().find(|a| a.id == gone).unwrap();
+    fs::rename(&f.roots[0], f.temp.path().join("offline")).unwrap();
+    let before = fs::read(f.db.path()).unwrap();
+    let readonly = Database::open_catalogue_health_read_only(f.db.path()).unwrap();
+    let plan = readonly.preview_forget_confirmed_missing(&f.roots).unwrap();
+    assert!(!plan.checked_at.is_empty());
+    assert_eq!(plan.counts.confirmed_missing, 0);
+    let entry = plan.entries.iter().find(|e| e.archive_id == gone).unwrap();
+    assert_eq!(entry.classification, C::SourceUnavailable);
+    assert_eq!(
+        entry.source_health,
+        Some(SourceHealthState::SourceUnavailable)
+    );
+    assert_eq!(entry.last_seen_at, historical.last_seen_at);
+    assert_eq!(
+        entry.historical_missing_at,
+        historical.last_verified_missing_at
+    );
+    assert!(
+        entry.evidence.is_none(),
+        "offline history is not current removal evidence"
+    );
+    assert_eq!(fs::read(f.db.path()).unwrap(), before);
+    assert_eq!(f.db.load_archives().unwrap(), archives);
+}
+
+#[test]
+fn preview_refresh_time_is_not_part_of_the_reviewed_selection_token() {
+    let (f, _, _, _) = F::confirmed();
+    let mut plan = f.plan();
+    let token = plan.token();
+    plan.checked_at = "another display timestamp".into();
+    assert_eq!(plan.token(), token);
+}
+
+#[test]
+fn incomplete_scan_retains_history_without_claiming_fresh_missing_evidence() {
+    let (mut f, gone, _, _) = F::confirmed();
+    let recorded =
+        f.db.load_archives()
+            .unwrap()
+            .into_iter()
+            .find(|a| a.id == gone)
+            .unwrap()
+            .last_verified_missing_at;
+    let offline = f.temp.path().join("offline");
+    fs::rename(&f.roots[0], &offline).unwrap();
+    f.scan();
+    fs::rename(&offline, &f.roots[0]).unwrap();
+    let before = f.db.load_archives().unwrap();
+    let database = Database::open_catalogue_health_read_only(f.db.path()).unwrap();
+    let plan = database.preview_forget_confirmed_missing(&f.roots).unwrap();
+    let entry = plan.entries.iter().find(|e| e.archive_id == gone).unwrap();
+    assert_eq!(entry.classification, C::ScanIncomplete);
+    assert_eq!(entry.historical_missing_at, recorded);
+    assert!(entry.evidence.is_none());
+    assert_eq!(plan.counts.confirmed_missing, 0);
+    assert_eq!(f.db.load_archives().unwrap(), before);
+}

@@ -76,6 +76,11 @@ pub struct ForgetMissingEntry {
     #[serde(serialize_with = "lossy_path")]
     pub absolute_path: PathBuf,
     pub classification: MissingClassification,
+    /// Source state observed for this preview, not proof of file contents.
+    pub source_health: Option<SourceHealthState>,
+    /// Historical catalogue evidence. Previewing never refreshes these dates.
+    pub last_seen_at: String,
+    pub historical_missing_at: Option<String>,
     pub reason: String,
     /// Present exactly for `ConfirmedMissing`.
     pub evidence: Option<ForgetEvidence>,
@@ -105,6 +110,9 @@ pub struct ForgetMissingCounts {
 /// piece of evidence it used; apply refuses unless a fresh preview matches it.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ForgetMissingPlan {
+    /// When this read-only preview completed. Display freshness only; excluded
+    /// from the selection token and never used to authorize removal.
+    pub checked_at: String,
     pub counts: ForgetMissingCounts,
     /// Every non-`NotMissing` row, ordered by archive id.
     pub entries: Vec<ForgetMissingEntry>,
@@ -276,6 +284,9 @@ impl Database {
                 source_path,
                 absolute_path: a.absolute_path.clone(),
                 classification,
+                source_health: health.get(&a.source_folder_id).map(|h| h.state),
+                last_seen_at: a.last_seen_at.clone(),
+                historical_missing_at: a.last_verified_missing_at.clone(),
                 reason,
                 evidence,
                 removes,
@@ -289,6 +300,7 @@ impl Database {
         }
         entries.sort_by_key(|e| e.archive_id);
         Ok(ForgetMissingPlan {
+            checked_at: now_utc_string(),
             counts,
             entries,
             database_path: self.path.clone(),

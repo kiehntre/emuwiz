@@ -6,6 +6,7 @@ use crate::ui::theme;
 use archivefs_core::Database;
 use archivefs_core::catalogue_health::{
     ForgetMissingEntry, ForgetMissingPlan, ForgetMissingResult, MissingClassification,
+    SourceHealthState,
 };
 use eframe::egui::{self, RichText};
 use std::path::{Path, PathBuf};
@@ -33,24 +34,40 @@ pub(super) fn group_copy(class: MissingClassification) -> (&'static str, &'stati
     match class {
         MissingClassification::ConfirmedMissing => (
             "Confirmed missing",
-            "EmuWiz scanned this folder completely and the file is not there, and nothing looks like it was moved. Safe to remove from your catalogue.",
+            "The recorded path was absent at preview time, and the latest complete scan recorded it missing with no move candidate. Removal is rechecked before applying.",
         ),
         MissingClassification::PossiblyMoved => (
             "Possibly moved",
-            "A matching file exists elsewhere. Nothing is removed; rescan or update the game folder instead.",
+            "At preview time, another catalogued file looked like a possible match. A matching name or size does not prove a move. Review the candidates; nothing is relinked.",
         ),
         MissingClassification::SourceUnavailable => (
             "Folder or drive not reachable",
-            "The folder these games live on can't be reached right now. Reconnect it; nothing is removed.",
+            "At preview time, the source folder could not be reached. Historical missing flags were not reverified. Reconnect it, then check again; nothing is removed.",
         ),
         MissingClassification::ScanIncomplete => (
             "Last scan did not finish",
-            "EmuWiz can't be sure these are gone. Run a full scan; nothing is removed.",
+            "The latest scan did not establish complete coverage. Earlier missing flags are historical evidence. When you choose, run a full scan, then check again; nothing is removed.",
         ),
         _ => (
             "Needs review",
             "The evidence is not conclusive. Nothing is removed.",
         ),
+    }
+}
+
+fn source_state_label(state: Option<SourceHealthState>) -> &'static str {
+    match state {
+        Some(SourceHealthState::Healthy) => "Reachable; latest scan complete",
+        Some(SourceHealthState::SourceUnavailable) => {
+            "Unavailable or disabled; entries not verified missing"
+        }
+        Some(SourceHealthState::NeedsScan) => "Reachable; scan needed",
+        Some(SourceHealthState::PartialScan | SourceHealthState::CoverageIncomplete) => {
+            "Scan coverage incomplete; entries not verified missing"
+        }
+        Some(SourceHealthState::RebindRequired) => "Storage identity needs review",
+        Some(SourceHealthState::NotGameScanned) => "Not scanned for games",
+        None => "Unknown; entries not verified missing",
     }
 }
 
@@ -142,6 +159,8 @@ impl App {
             Route::Section(Section::Problems),
             false,
         );
+        self.missing.confirm = false;
+        self.missing.plan = None;
         self.missing.job = Some(id);
         self.send(id, Command::MissingPreview);
     }
@@ -185,7 +204,13 @@ impl App {
     pub(super) fn missing_review_panel(&mut self, ui: &mut egui::Ui) {
         if self.missing.plan.is_none() && self.missing.job.is_none() && self.missing.error.is_none()
         {
-            self.start_missing_preview();
+            egui::Frame::group(ui.style()).show(ui, |ui| {
+                ui.strong("Missing games review");
+                ui.label("Saved missing flags describe earlier scans. Opening this page does not reverify them. Request a read-only check of recorded paths and source availability when you are ready.");
+                if ui.button("Check missing-game evidence").clicked() {
+                    self.start_missing_preview();
+                }
+            });
         }
         if let Some(error) = self.missing.error.clone() {
             egui::Frame::group(ui.style()).show(ui, |ui| {
@@ -197,6 +222,7 @@ impl App {
                 if ui.add_enabled(self.missing.job.is_none(), egui::Button::new("Check again")).clicked() {
                     self.missing.error = None;
                     self.missing.plan = None;
+                    self.start_missing_preview();
                 }
             });
         }
@@ -220,9 +246,7 @@ impl App {
                 }
             });
         }
-        if self.missing.job.is_some()
-            && (self.missing.receipt.is_some() || self.missing.plan.is_some())
-        {
+        if self.missing.job.is_some() {
             ui.horizontal_wrapped(|ui| {
                 ui.spinner();
                 ui.small("Checking or updating the game list… No game files are deleted.");
@@ -232,12 +256,25 @@ impl App {
         let Some(plan) = self.missing.plan.clone() else {
             return;
         };
+        ui.small(format!("Evidence preview completed: {}", plan.checked_at));
+        ui.label("This is a snapshot of the check, not a live monitor. Historical scan dates below are unchanged; unreachable or incompletely scanned records have not been freshly verified missing.");
+        if ui
+            .add_enabled(
+                self.missing.job.is_none(),
+                egui::Button::new("Check evidence again"),
+            )
+            .clicked()
+        {
+            self.start_missing_preview();
+            return;
+        }
         if !has_findings(&plan) {
+            ui.label("No missing-game findings in this preview.");
             return;
         }
         egui::Frame::group(ui.style()).show(ui, |ui| {
             ui.heading("Missing games");
-            ui.label("EmuWiz checked every missing game against its folder's last scan. Only entries it can prove are gone can be removed. Your game files, artwork, saves and manuals are never touched.");
+            ui.label("This preview combines recorded scan evidence with path and source checks made at preview time. Only confirmed-missing entries are eligible for removal, with another check before applying. Your game files, artwork, saves and manuals are never touched.");
             for class in GROUPS {
                 let entries = entries_in(&plan, class);
                 if entries.is_empty() {
@@ -260,6 +297,10 @@ impl App {
                             ui.small(format!("Last known path: {}", entry.absolute_path.display()));
                             ui.collapsing(format!("Why — {}", entry.display_name), |ui| {
                                 ui.label(&entry.reason);
+                                ui.label(format!("Source folder: {}", entry.source_path.display()));
+                                ui.label(format!("Last seen in catalogue: {}", entry.last_seen_at));
+                                ui.label(format!("Historically recorded missing: {}", entry.historical_missing_at.as_deref().unwrap_or("never")));
+                                ui.label(format!("Source at preview: {}", source_state_label(entry.source_health)));
                                 if let Some(ev) = &entry.evidence {
                                     ui.monospace(format!(
                                         "scan #{} · source generation {} · recorded {}",
@@ -420,6 +461,66 @@ mod tests {
         fs::remove_file(&gone).unwrap();
         f.scan();
         (f, gone)
+    }
+
+    fn panel_frame(context: &egui::Context, app: &mut App, size: [f32; 2]) -> egui::FullOutput {
+        context.run(
+            egui::RawInput {
+                screen_rect: Some(egui::Rect::from_min_size(
+                    egui::Pos2::ZERO,
+                    egui::vec2(size[0], size[1]),
+                )),
+                ..Default::default()
+            },
+            |ctx| {
+                egui::CentralPanel::default().show(ctx, |ui| app.missing_review_panel(ui));
+            },
+        )
+    }
+
+    #[test]
+    fn opening_review_does_not_start_a_filesystem_preview() {
+        for size in [[1024.0, 600.0], [1440.0, 900.0]] {
+            let context = egui::Context::default();
+            context.style_mut(|style| style.debug.warn_if_rect_changes_id = false);
+            let mut app = super::super::tests::fixture(&context);
+            panel_frame(&context, &mut app, size);
+            let output = panel_frame(&context, &mut app, size);
+            assert!(app.missing.job.is_none());
+            assert!(super::super::tests::page_reachability::visible_text(
+                &output,
+                "Check missing-game evidence"
+            ));
+        }
+    }
+
+    #[test]
+    fn offline_snapshot_shows_its_age_and_no_removal_action_at_both_window_sizes() {
+        use super::super::tests::page_reachability::visible_text;
+        let (f, _) = fixture();
+        fs::rename(&f.roots[0], f.temp.path().join("offline")).unwrap();
+        let mut plan = preview_at(&f.db_path(), &f.roots).unwrap();
+        plan.checked_at = "2026-10-26 10:00:00 UTC".into();
+        for size in [[1024.0, 600.0], [1440.0, 900.0]] {
+            let context = egui::Context::default();
+            context.style_mut(|style| style.debug.warn_if_rect_changes_id = false);
+            let mut app = super::super::tests::fixture(&context);
+            app.missing.plan = Some(Box::new(plan.clone()));
+            panel_frame(&context, &mut app, size);
+            let output = panel_frame(&context, &mut app, size);
+            assert!(visible_text(&output, "2026-10-26 10:00:00 UTC"));
+            assert!(visible_text(&output, "not been freshly verified missing"));
+            assert!(visible_text(&output, "Folder or drive not reachable (2)"));
+            assert!(visible_text(
+                &output,
+                "Nothing can be removed safely right now."
+            ));
+            assert!(visible_text(&output, "Check evidence again"));
+            assert!(!visible_text(&output, "Forget 1 confirmed-missing"));
+            assert!(app.missing.job.is_none());
+            assert!(!app.missing.confirm);
+        }
+        assert_eq!(f.count(), 2);
     }
 
     #[test]
