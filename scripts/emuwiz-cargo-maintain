@@ -576,10 +576,35 @@ def write_policy(policy):
     durable_write(policy_path(), policy)
 
 
+def policy_for_display(policy):
+    """Expose documented diagnostics, redacting unrecognised keys AND values.
+
+    Validation accepts extension metadata, which may contain credentials. Keep
+    that metadata out of stdout without altering the policy used for integrity
+    checks, approval reconciliation or execution.
+    """
+    if policy is None:
+        return None
+
+    def public_fields(section, allowed):
+        out = {key: section[key] for key in allowed if key in section}
+        if section.keys() - allowed:
+            out["redacted_fields"] = "[REDACTED]"
+        return out
+
+    out = public_fields(policy, {"schema", "approved_by", "approved_at", "enabled", "digest", "scope", "limits"})
+    out["scope"] = public_fields(policy["scope"], {"target_root", "owners", "kinds"})
+    out["limits"] = public_fields(policy["limits"], {
+        "soft_budget_bytes", "hard_budget_bytes", "min_idle_hours", "reserve_free_bytes",
+        "max_targets_per_cycle", "max_bytes_per_cycle",
+    })
+    return out
+
+
 def cmd_policy(args):
     if args.action == "show":
         state, policy, why = load_policy()
-        out = {"state": state, "why": why, "policy": policy, "path": policy_path()}
+        out = {"state": state, "why": why, "policy": policy_for_display(policy), "path": policy_path()}
         print(json.dumps(out, indent=1, sort_keys=True))
         return 0 if state in ("ok", "absent") else 1
     if args.action == "approve":
