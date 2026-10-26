@@ -2145,6 +2145,7 @@ enum DolphinLaunchStage {
     },
     Exited {
         process: LaunchedDolphinProcess,
+        stop: dolphin_stop::StopControl,
     },
     Failed {
         error: DolphinLaunchExecutionError,
@@ -2205,7 +2206,7 @@ impl DolphinLaunchState {
             },
             DolphinLaunchStage::Running { mut process, stop } => {
                 if process.poll().is_some() {
-                    self.tracked = Some((key, DolphinLaunchStage::Exited { process }));
+                    self.tracked = Some((key, DolphinLaunchStage::Exited { process, stop }));
                     true
                 } else {
                     self.tracked = Some((key, DolphinLaunchStage::Running { process, stop }));
@@ -5386,6 +5387,7 @@ fn show_dolphin_launch_action(
             success: bool,
             status_detail: String,
             stderr_tail: Option<String>,
+            stop_outcome: Option<archivefs_core::launch::process_spawn::GracefulStopOutcome>,
         },
         Failed {
             message: &'static str,
@@ -5398,7 +5400,7 @@ fn show_dolphin_launch_action(
         Some((key, stage)) if *key == this_key => match stage {
             DolphinLaunchStage::Starting { .. } => Display::Starting,
             DolphinLaunchStage::Running { process, .. } => Display::Running { pid: process.pid },
-            DolphinLaunchStage::Exited { process } => {
+            DolphinLaunchStage::Exited { process, stop } => {
                 let report: &DolphinLaunchExitReport = process
                     .poll()
                     .expect("Exited stage always has a cached exit report");
@@ -5413,6 +5415,7 @@ fn show_dolphin_launch_action(
                     success,
                     status_detail,
                     stderr_tail,
+                    stop_outcome: stop.outcome(),
                 }
             }
             DolphinLaunchStage::Failed { error } => {
@@ -5446,8 +5449,11 @@ fn show_dolphin_launch_action(
             success,
             status_detail,
             stderr_tail,
+            stop_outcome,
         } => {
-            if success {
+            if let Some(outcome) = stop_outcome {
+                dolphin_stop::show_exit(ui, outcome, &status_detail, stderr_tail.as_deref());
+            } else if success {
                 widgets::banner(
                     ui,
                     "Dolphin exited",

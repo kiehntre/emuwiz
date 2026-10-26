@@ -14,6 +14,10 @@ pub(super) struct StopControl {
 }
 
 impl StopControl {
+    pub(super) fn outcome(&self) -> Option<GracefulStopOutcome> {
+        self.outcome
+    }
+
     fn request(&mut self, process: &mut LaunchedDolphinProcess) {
         if !self.confirmed || self.outcome.is_some() {
             return;
@@ -44,6 +48,29 @@ impl StopControl {
         {
             self.request(process);
         }
+    }
+}
+
+pub(super) fn show_exit(
+    ui: &mut egui::Ui,
+    outcome: GracefulStopOutcome,
+    status: &str,
+    stderr: Option<&str>,
+) {
+    ui.label(exit_message(outcome));
+    ui.label(format!("Owned launcher exit status: {status}"));
+    if let Some(stderr) = stderr {
+        crate::ui::components::technical_details(ui, "dolphin-requested-exit-stderr", |ui| {
+            ui.add(egui::Label::new(egui::RichText::new(stderr).monospace()).wrap());
+        });
+    }
+}
+
+fn exit_message(outcome: GracefulStopOutcome) -> &'static str {
+    if matches!(outcome, GracefulStopOutcome::Refused(_)) {
+        "The normal-stop request was refused; the owned launcher later exited. This does not prove Dolphin or its descendants closed, or that saves completed."
+    } else {
+        "The owned launcher exited after your normal-stop attempt. This does not prove Dolphin or its descendants closed, or that saves completed."
     }
 }
 
@@ -120,14 +147,42 @@ mod process_tests {
         control.confirmed = true;
         control.request(&mut process);
         assert_eq!(control.outcome, first);
+        let key = super::super::DolphinLaunchKey {
+            content_path: content.clone(),
+            profile_id: "private-test-profile".into(),
+        };
+        let mut state = super::super::DolphinLaunchState {
+            tracked: Some((
+                key,
+                super::super::DolphinLaunchStage::Running {
+                    process,
+                    stop: control,
+                },
+            )),
+        };
         let deadline = Instant::now() + Duration::from_secs(5);
-        while process.poll().is_none() {
+        while !matches!(
+            state.tracked,
+            Some((_, super::super::DolphinLaunchStage::Exited { .. }))
+        ) {
+            state.poll();
             assert!(
                 Instant::now() < deadline,
                 "normal watcher did not report launcher exit"
             );
             std::thread::sleep(Duration::from_millis(10));
         }
+        let Some((_, super::super::DolphinLaunchStage::Exited { mut process, stop })) =
+            state.tracked
+        else {
+            panic!("missing exit state")
+        };
+        assert_eq!(stop.outcome(), first);
+        let feedback = exit_message(stop.outcome().unwrap());
+        assert!(feedback.contains("owned launcher"));
+        assert!(feedback.contains("does not prove"));
+        assert!(!feedback.contains("unexpectedly"));
+        assert!(!feedback.contains("closed normally"));
         use std::os::unix::process::ExitStatusExt;
         assert_eq!(
             process.poll().unwrap().status.as_ref().unwrap().signal(),

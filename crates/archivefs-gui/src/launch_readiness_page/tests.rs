@@ -2150,7 +2150,13 @@ fn dolphin_clean_process_exit_enters_exited_and_shows_a_clean_exit_message() {
         spawn_test_dolphin_process("/bin/true", &[], &ready.content_path, &ready.profile_id);
     wait_until_dolphin_exited(&mut process);
     let mut state = DolphinLaunchState {
-        tracked: Some((key, DolphinLaunchStage::Exited { process })),
+        tracked: Some((
+            key,
+            DolphinLaunchStage::Exited {
+                process,
+                stop: Default::default(),
+            },
+        )),
     };
 
     let output = render_with_dolphin_state(&dolphin_plan_input(plan, ready.context), &mut state);
@@ -2177,7 +2183,13 @@ fn dolphin_non_zero_exit_shows_bounded_stderr_behind_technical_details() {
     );
     wait_until_dolphin_exited(&mut process);
     let mut state = DolphinLaunchState {
-        tracked: Some((key, DolphinLaunchStage::Exited { process })),
+        tracked: Some((
+            key,
+            DolphinLaunchStage::Exited {
+                process,
+                stop: Default::default(),
+            },
+        )),
     };
 
     let output = render_with_dolphin_state(&dolphin_plan_input(plan, ready.context), &mut state);
