@@ -761,6 +761,7 @@ class Census:
     # How long a process that could not be inspected is given to finish exiting.
     EXIT_SETTLE = (0.001, 0.002, 0.005, 0.01, 0.02, 0.05)
     MAX_REUSE_RESCANS = 3
+    SETTLE_BUDGET = 1.0  # seconds of waiting per census (signals are blocked while elevated)
 
     @staticmethod
     def start_time(base):
@@ -790,16 +791,21 @@ class Census:
             if not os.path.exists(base) or not self.is_userspace(base):
                 return
             outcome = "present"
-            if not self.unreadable_foreign:  # already incomplete: no need to wait
-                for delay in self.EXIT_SETTLE:
-                    time.sleep(delay)
-                    if not os.path.exists(base):
-                        outcome = "gone"
-                        break
-                    now = self.start_time(base)
-                    if born is not None and now is not None and now != born:
-                        outcome = "reused"
-                        break
+            # The only ways a PID is not counted: its /proc entry vanished, or it now has
+            # another start time.  Once the census is incomplete, or its waiting budget
+            # is spent, nothing more is waited for and the PID is counted.
+            for delay in () if self.unreadable_foreign else self.EXIT_SETTLE:
+                if getattr(self, "_settled", 0.0) >= self.SETTLE_BUDGET:
+                    break
+                self._settled = getattr(self, "_settled", 0.0) + delay
+                time.sleep(delay)
+                if not os.path.exists(base):
+                    outcome = "gone"
+                    break
+                now = self.start_time(base)
+                if born is not None and now is not None and now != born:
+                    outcome = "reused"
+                    break
             if outcome == "gone":
                 return
             if outcome == "present":
