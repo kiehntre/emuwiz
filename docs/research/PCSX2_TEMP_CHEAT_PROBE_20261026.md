@@ -1,4 +1,9 @@
-# PCSX2 temporary-cheat integration: refused pending preservation proof
+# PCSX2 initial temporary-cheat probe (historical)
+
+This is the initial evidence-only stage of PR #167. Its refusal was correct
+for that candidate. The subsequent executor and Blue journey are documented
+in [the activation report](PCSX2_TEMP_CHEAT_ACTIVATION_20261026.md); the
+limitations and unvalidated results below describe this initial probe only.
 
 Base: `origin/main` at `bd3b859fecb10c6232286a9a881fbed1f0f8f2e5`.
 This job does **not** deliver production temporary-cheat integration.

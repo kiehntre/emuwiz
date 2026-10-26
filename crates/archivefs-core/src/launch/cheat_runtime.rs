@@ -69,6 +69,7 @@ pub const DEFAULT_STALE_GRACE_SECS: u64 = 120;
 
 const MAX_MARKER_BYTES: u64 = 64 * 1024;
 const MAX_RUNTIME_FILE_BYTES: usize = 1024 * 1024;
+const MAX_VERIFIED_RESOURCE_BYTES: usize = 8 * 1024 * 1024;
 const MAX_RUNTIME_FILES: usize = 32;
 // Includes the verified native RetroArch executable (about 16 MiB). Format
 // parsers retain their smaller independent limits.
@@ -342,6 +343,10 @@ pub enum RuntimeFileKind {
     Config,
     /// Generated cheat material.
     CheatMaterial,
+    /// A bounded resource copy with an immutable source hash (e.g. a PS2
+    /// BIOS). Config/cheat limits do not change. Materialized read-only;
+    /// associated writable state belongs in separate workspace files.
+    VerifiedResource,
 }
 
 /// One file to create. `sha256` is checked against `bytes` before writing.
@@ -493,7 +498,21 @@ impl CheatRuntimePlan {
             }
         }
         for file in &parts.files {
-            if file.bytes.len() > MAX_RUNTIME_FILE_BYTES || sha256_hex(&file.bytes) != file.sha256 {
+            let limit = if file.kind == RuntimeFileKind::VerifiedResource {
+                if !parts
+                    .sources
+                    .iter()
+                    .any(|source| source.expected_sha256 == file.sha256)
+                {
+                    return Err(RuntimeRefusal::PlanShape {
+                        detail: "resource has no immutable source binding".into(),
+                    });
+                }
+                MAX_VERIFIED_RESOURCE_BYTES
+            } else {
+                MAX_RUNTIME_FILE_BYTES
+            };
+            if file.bytes.len() > limit || sha256_hex(&file.bytes) != file.sha256 {
                 return Err(RuntimeRefusal::PlanShape {
                     detail: format!("file {}", file.path.display()),
                 });
@@ -984,6 +1003,10 @@ impl CheatRuntimeWorkspace {
             }
             let result = private_file(&file.path).and_then(|mut f| {
                 f.write_all(&file.bytes)?;
+                if file.kind == RuntimeFileKind::VerifiedResource {
+                    use std::os::unix::fs::PermissionsExt;
+                    f.set_permissions(fs::Permissions::from_mode(0o400))?;
+                }
                 f.sync_all()
             });
             if let Err(e) = result {
@@ -1515,6 +1538,11 @@ fn scan_with_env(
                 WorkspaceDisposition::OwnedAmbiguous,
                 "EmuWiz stopped right after starting the emulator without recording it, so it may still be running",
             )
+        } else if pcsx2_sandbox_may_be_active(&marker, &path, boot_unix) {
+            (
+                WorkspaceDisposition::OwnedAmbiguous,
+                "the PCSX2 sandbox is still present or its lifetime is unknown; temporary files are retained",
+            )
         } else if age < grace_seconds {
             (
                 WorkspaceDisposition::OwnedYoung,
@@ -1534,6 +1562,25 @@ fn scan_with_env(
         });
     }
     out
+}
+
+fn pcsx2_sandbox_may_be_active(
+    marker: &WorkspaceMarker,
+    path: &Path,
+    boot_unix: Option<u64>,
+) -> bool {
+    #[cfg(target_os = "linux")]
+    if marker.adapter_id == "pcsx2"
+        && matches!(
+            marker.state,
+            MarkerState::LaunchAttempted | MarkerState::EmulatorStarted
+        )
+        && !boot_unix.is_some_and(|boot| boot > marker.created_unix + REBOOT_MARGIN_SECS)
+    {
+        return super::cheat_runtime_pcsx2::workspace_may_be_active(path);
+    }
+    let _ = (marker, path, boot_unix);
+    false
 }
 
 /// Whether the emulator may have been started without its process being

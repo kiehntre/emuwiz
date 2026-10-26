@@ -149,6 +149,8 @@ pub mod cheat_launch_plan;
 pub mod cheat_runtime;
 pub mod cheat_runtime_mame;
 pub mod cheat_runtime_melonds;
+#[cfg(target_os = "linux")]
+pub mod cheat_runtime_pcsx2;
 pub mod cheat_runtime_retroarch;
 pub mod installation;
 #[cfg(test)]
