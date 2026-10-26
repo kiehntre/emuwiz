@@ -15291,14 +15291,15 @@ impl ArchiveFsApp {
                     managed_root: page.managed_root.clone(),
                 });
         }
-        if !simple_check && !identify_rename {
-            if let Some(path) = page.custom.show(
+        if !simple_check
+            && !identify_rename
+            && let Some(path) = page.custom.show(
                 ui,
                 page.config_path.with_file_name("custom_dat_sources.json"),
                 page.managed_root.join("custom"),
-            ) {
-                page.apply(DatSourcesPageAction::AddFile { path });
-            }
+            )
+        {
+            page.apply(DatSourcesPageAction::AddFile { path });
         }
         let view = page.view_with_romm_summary(self.romm_ui.verify_summary);
         let assignment_action = if simple_check {
