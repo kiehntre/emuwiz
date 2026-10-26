@@ -964,3 +964,162 @@ fn enumeration_deduplicates_by_reference() {
     refs.dedup();
     assert_eq!(before, refs.len(), "no duplicate references");
 }
+
+#[test]
+fn setup_inventory_includes_configured_fbneo_without_installing_it() {
+    let temp = tempfile::tempdir().unwrap();
+    let registry = DatSourceRegistry::new();
+    let mut sources = ManagedDatSources::new();
+    sources.add_fbneo(ManagedDatUpdatePolicy::Manual).unwrap();
+    let rows = list_installed_catalogues(inputs(&registry, &sources, temp.path()));
+    assert_eq!(
+        rows.len(),
+        1,
+        "configured FBNeo must not disappear from setup"
+    );
+    assert!(matches!(
+        rows[0].availability,
+        CatalogueAvailability::Missing { .. }
+    ));
+    assert!(!rows[0].capabilities.verify);
+    let status = super::setup_status::DatSetupStatus::from_catalogues(&rows);
+    assert_eq!((status.configured, status.ready), (1, 0));
+    assert!(!temp.path().read_dir().unwrap().any(|_| true));
+}
+
+#[test]
+fn setup_status_uses_availability_not_registry_count_and_never_changes_sources() {
+    let temp = tempfile::tempdir().unwrap();
+    let dat = write_dat(temp.path(), "game.dat", &logiqx_dat("Nintendo NES", "Game"));
+    let registry = registry(&[LocalEntrySpec {
+        id: "local",
+        display_name: "Local",
+        path: dat.clone(),
+        platform: Some("nes"),
+        enabled: true,
+        ..Default::default()
+    }]);
+    let sources = ManagedDatSources::new();
+    let mut rows = list_installed_catalogues(inputs(&registry, &sources, temp.path()));
+    let before = fs::read(&dat).unwrap();
+    use super::setup_status::DatSetupStatus;
+    assert_eq!(
+        DatSetupStatus::from_catalogues(&[]).label(),
+        "No trusted DAT configured"
+    );
+    assert_eq!(
+        DatSetupStatus::from_catalogues(&rows).label(),
+        "Catalogue needs validation"
+    );
+    rows[0].availability = CatalogueAvailability::Ready;
+    assert_eq!(
+        DatSetupStatus::from_catalogues(&rows).label(),
+        "Game catalogue available"
+    );
+    rows[0].capabilities.verify = false; // BIOS/non-game data cannot make setup ready.
+    assert_eq!(DatSetupStatus::from_catalogues(&rows).ready, 0);
+    rows[0].availability = CatalogueAvailability::Missing {
+        reason: "fixture".into(),
+    };
+    assert_eq!(
+        DatSetupStatus::from_catalogues(&rows).label(),
+        "No game catalogue available"
+    );
+    rows[0].enabled = false;
+    assert_eq!(
+        DatSetupStatus::from_catalogues(&rows).label(),
+        "Configured DAT unavailable or disabled"
+    );
+    assert_eq!(fs::read(dat).unwrap(), before);
+}
+
+#[test]
+fn explicitly_imported_fbneo_is_listed_with_pinned_provenance_and_rechecks_its_bytes() {
+    use crate::dat::updates::{
+        ManagedDatUpdateOptions, ManagedDatUpdateOutcome, import_managed_fbneo_dat,
+    };
+    let temp = tempfile::tempdir().unwrap();
+    let dat = write_dat(
+        temp.path(),
+        "fbneo.dat",
+        &logiqx_dat("FBNeo - Neo Geo", "game"),
+    );
+    let descriptor = ManagedDatSourceDescriptor::fbneo().unwrap();
+    let options = ManagedDatUpdateOptions::new(temp.path().join("managed"), 123);
+    assert!(matches!(
+        import_managed_fbneo_dat(&descriptor, &options, &dat).unwrap(),
+        ManagedDatUpdateOutcome::Updated { .. }
+    ));
+    let mut sources = ManagedDatSources::new();
+    sources.add_fbneo(ManagedDatUpdatePolicy::Manual).unwrap();
+    let registry = DatSourceRegistry::new();
+    let inventory = inputs(&registry, &sources, &options.managed_root);
+    let rows = list_installed_catalogues(inventory);
+    assert_eq!(rows.len(), 1);
+    let row = &rows[0];
+    assert_eq!(row.store, CatalogueStore::ManagedFbneo);
+    assert_eq!(row.availability, CatalogueAvailability::Ready);
+    assert_eq!(row.ecosystem.confirmed(), Some(&DatEcosystem::FBNeo));
+    assert!(row.content_sha256.is_some());
+    assert_eq!(
+        super::setup_status::DatSetupStatus::from_catalogues(&rows).ready,
+        1
+    );
+    assert!(resolve_catalogue(&row.reference, inventory).is_ok());
+    fs::write(row.technical_path.as_ref().unwrap(), b"changed snapshot").unwrap();
+    assert!(resolve_catalogue(&row.reference, inventory).is_err());
+}
+
+#[test]
+fn disabled_installed_managed_sources_stay_visible_but_cannot_resolve_or_make_setup_ready() {
+    use crate::dat::updates::{ManagedDatUpdateOptions, import_managed_fbneo_dat};
+    for fbneo in [true, false] {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().join("managed");
+        let mut sources = ManagedDatSources::new();
+        if fbneo {
+            let dat = write_dat(
+                temp.path(),
+                "fbneo.dat",
+                &logiqx_dat("FBNeo - Neo Geo", "game"),
+            );
+            import_managed_fbneo_dat(
+                &ManagedDatSourceDescriptor::fbneo().unwrap(),
+                &ManagedDatUpdateOptions::new(root.clone(), 123),
+                &dat,
+            )
+            .unwrap();
+            sources.add_fbneo(ManagedDatUpdatePolicy::Disabled).unwrap();
+        } else {
+            install_mame(&root, "gamecom", &mame_softwarelist_dat("gamecom", "game"));
+            sources
+                .add_mame_software_list("gamecom", ManagedDatUpdatePolicy::Disabled)
+                .unwrap();
+        }
+        let registry = DatSourceRegistry::new();
+        let inventory = inputs(&registry, &sources, &root);
+        let rows = list_installed_catalogues(inventory);
+        assert_eq!(rows.len(), 1);
+        let row = &rows[0];
+        let snapshot = row.technical_path.as_ref().unwrap();
+        let before = fs::read(snapshot).unwrap();
+        let resolution = resolve_catalogue(&row.reference, inventory);
+        assert_eq!(
+            (
+                row.enabled,
+                row.capabilities.verify,
+                matches!(resolution, Err(CatalogueResolveError::Disabled { .. }))
+            ),
+            (false, false, true),
+            "disabled managed source must be withheld (FBNeo={fbneo})"
+        );
+        assert!(!row.capabilities.combined_evidence);
+        assert!(!row.capabilities.repair);
+        assert!(!row.capabilities.single_catalogue_1g1r);
+        assert_eq!(
+            super::setup_status::DatSetupStatus::from_catalogues(&rows).ready,
+            0
+        );
+        assert_eq!(fs::read(snapshot).unwrap(), before);
+    }
+}

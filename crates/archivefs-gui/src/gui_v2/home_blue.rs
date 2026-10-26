@@ -193,11 +193,11 @@ impl App {
             SetupRow {
                 name: "Game catalogues",
                 detail: format!("{catalogues} catalogues"),
-                state: if environment.identification_data_ready {
-                    "Ready".into()
-                } else {
-                    "Not set up".into()
-                },
+                state: environment
+                    .dat_setup
+                    .as_ref()
+                    .map_or("Catalogue status unavailable", |status| status.label())
+                    .into(),
                 tone: if environment.identification_data_ready {
                     SetupTone::Ready
                 } else {

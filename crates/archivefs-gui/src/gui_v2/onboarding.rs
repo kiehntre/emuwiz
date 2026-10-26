@@ -887,14 +887,12 @@ pub(super) fn setup_steps(snapshot: &EnvironmentSnapshot, library: &Library) -> 
             } else {
                 StepState::Optional
             },
-            label: if snapshot.identification_data_ready {
-                "Catalogue available"
-            } else {
-                "Not added yet"
-            },
-            detail: "Trusted catalogues identify exact releases and regions.".into(),
-            action: (!snapshot.identification_data_ready)
-                .then_some(("Open identification data", Section::Dat)),
+            label: snapshot.dat_setup.as_ref().map_or("Catalogue status unavailable", |status| status.label()),
+            detail: snapshot.dat_setup.as_ref().map_or_else(
+                || "The catalogue inventory has not been read successfully. Open identification data to inspect it; no game check was concluded.".into(),
+                |status| status.detail(),
+            ),
+            action: Some(("Open identification data", Section::Dat)),
         },
         SetupStep {
             title: "4. System software",
@@ -1360,5 +1358,66 @@ mod tests {
             update_authority_label(UpdateAuthority::None),
             "no automatic updater"
         );
+    }
+}
+
+#[cfg(test)]
+mod dat_setup_tests {
+    use super::*;
+    use archivefs_core::dat::catalogue_selection::setup_status::DatSetupStatus;
+
+    #[test]
+    fn setup_reports_inventory_status_and_keeps_explicit_data_navigation_available() {
+        let library = Library::default();
+        let mut snapshot = EnvironmentSnapshot::default();
+        assert_eq!(
+            setup_steps(&snapshot, &library)[2].label,
+            "Catalogue status unavailable"
+        );
+        for (status, label) in [
+            (DatSetupStatus::default(), "No trusted DAT configured"),
+            (
+                DatSetupStatus {
+                    configured: 1,
+                    enabled: 1,
+                    needs_validation: 1,
+                    ..Default::default()
+                },
+                "Catalogue needs validation",
+            ),
+            (
+                DatSetupStatus {
+                    configured: 1,
+                    enabled: 1,
+                    ready: 1,
+                    ..Default::default()
+                },
+                "Game catalogue available",
+            ),
+            (
+                DatSetupStatus {
+                    configured: 1,
+                    enabled: 1,
+                    ..Default::default()
+                },
+                "No game catalogue available",
+            ),
+        ] {
+            snapshot.identification_data_count = status.configured;
+            snapshot.identification_data_ready = status.ready > 0;
+            snapshot.dat_setup = Some(status);
+            let step = setup_steps(&snapshot, &library).remove(2);
+            assert_eq!(step.label, label);
+            assert_eq!(
+                step.action,
+                Some(("Open identification data", Section::Dat))
+            );
+            assert!(step.detail.contains("does not verify any game"));
+            assert_eq!(
+                step.state == StepState::Ready,
+                snapshot.identification_data_ready
+            );
+            assert!(library.games.is_empty());
+        }
     }
 }

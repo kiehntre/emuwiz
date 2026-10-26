@@ -65,6 +65,7 @@ use crate::dat::updates::{
     ManagedDatProvider, ManagedDatSourceDescriptor, ManagedDatSourceId, ManagedDatState,
     load_managed_dat_state, resolve_current_managed_dat_source,
 };
+pub mod setup_status;
 #[cfg(test)]
 mod tests;
 
@@ -344,6 +345,7 @@ pub enum CatalogueStore {
     ManagedMameSoftwareList,
     ManagedRedumpGames,
     ManagedRedumpBios,
+    ManagedFbneo,
 }
 
 impl CatalogueStore {
@@ -353,6 +355,7 @@ impl CatalogueStore {
             Self::ManagedMameSoftwareList => 1,
             Self::ManagedRedumpGames => 2,
             Self::ManagedRedumpBios => 3,
+            Self::ManagedFbneo => 4,
         }
     }
 
@@ -362,6 +365,7 @@ impl CatalogueStore {
             Self::ManagedMameSoftwareList => "Managed · MAME software list",
             Self::ManagedRedumpGames => "Managed · Redump games",
             Self::ManagedRedumpBios => "Managed · Redump BIOS",
+            Self::ManagedFbneo => "Managed · FBNeo",
         }
     }
 }
@@ -493,18 +497,30 @@ pub fn list_installed_catalogues(
             ManagedDatProvider::RedumpBios,
             false,
         ),
+        (
+            CatalogueStore::ManagedFbneo,
+            ManagedDatProvider::Fbneo,
+            true,
+        ),
     ] {
         for descriptor in managed_descriptors(inputs.managed_sources, provider) {
             let descriptor = match descriptor {
                 Ok(descriptor) => descriptor,
                 Err(_) => continue,
             };
-            rows.push(summarise_managed(
+            let mut summary = summarise_managed(
                 store,
                 descriptor.source_id().clone(),
                 load_managed_row(inputs.managed_root, &descriptor),
                 is_game,
-            ));
+            );
+            // Keep disabled registrations visible without offering them as
+            // verification data or contradicting current identity loading.
+            if descriptor.update_policy() == crate::dat::updates::ManagedDatUpdatePolicy::Disabled {
+                summary.enabled = false;
+                summary.capabilities = CatalogueCapabilities::NONE;
+            }
+            rows.push(summary);
         }
     }
 
@@ -1179,6 +1195,14 @@ fn load_managed_current(
                 source_id.source_key
             ),
         })?;
+
+    // Recheck policy at resolution too: an already-open selection must not
+    // bypass a source disabled since its inventory was displayed.
+    if descriptor.update_policy() == crate::dat::updates::ManagedDatUpdatePolicy::Disabled {
+        return Err(CatalogueResolveError::Disabled {
+            source_id: managed_dat_audit_source_id(source_id),
+        });
+    }
 
     match load_managed_row(managed_root, &descriptor) {
         ManagedRowState::Installed {
