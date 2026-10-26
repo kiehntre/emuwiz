@@ -47,7 +47,7 @@
 use std::path::Path;
 use std::sync::atomic::{AtomicBool, Ordering};
 
-use super::identity::{capture_identity, content_identity_matches, identity_matches};
+use super::identity::{capture_identity, identity_matches};
 use super::journal::checkpoint_journal as write_journal;
 use super::model::{
     EntryState, RenameTransaction, RollbackResult, TransactionOperation, TransactionState,
@@ -56,7 +56,7 @@ use super::noclobber::NoClobberError;
 use crate::safe_read::TrustedRoots;
 
 /// Internal marker: the reverse rename happened but its directory sync failed.
-const IN_FLIGHT_MARK: &str = "\u{1}in-flight:";
+pub(super) const IN_FLIGHT_MARK: &str = "\u{1}in-flight:";
 /// Internal marker: the reverse rename happened but the restored object could
 /// not be confirmed. Treated as in-flight.
 const MOVED_MARK: &str = "\u{1}moved:";
@@ -908,19 +908,7 @@ fn rollback_mutation(
         {
             return Err("rollback refused: invalid journalled copy source".into());
         }
-        let source = capture_identity(&entry.source_path)
-            .map_err(|_| "rollback refused: copy source no longer exists".to_string())?;
-        let destination = capture_identity(&entry.destination_path)
-            .map_err(|_| "rollback refused: copy destination no longer exists".to_string())?;
-        if !identity_matches(&entry.identity, &source)
-            || !content_identity_matches(&entry.identity, &destination)
-        {
-            return Err("rollback refused: copied destination or source changed".into());
-        }
-        std::fs::remove_file(&entry.destination_path).map_err(|error| {
-            format!("rollback refused: could not remove copied destination: {error}")
-        })?;
-        return Ok(());
+        return super::copy::undo(entry, destination_root);
     }
     // Destination must still exist and still be the recorded object.
     match capture_identity(&entry.destination_path) {

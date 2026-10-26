@@ -26,7 +26,7 @@ pub(super) fn text(value: &str) -> String {
 pub(super) fn show(ui: &mut egui::Ui, page: &mut HealthPage) {
     ui.heading("MAME Collection Health");
     ui.label("Inspect your arcade sets without changing them. Good means verified storage at the time of inspection; it does not prove game runnability.");
-    let busy = page.job.is_some();
+    let busy = page.job.is_some() || page.repair.busy();
     ui.add_enabled_ui(!busy, |ui| {
         ui.horizontal_wrapped(|ui| {
             ui.label("Collection folder");
@@ -76,6 +76,7 @@ pub(super) fn show(ui: &mut egui::Ui, page: &mut HealthPage) {
         ui.label(text(message));
     }
     ui.collapsing("What do these results mean?", result_explanations);
+    page.repair.show(ui, page.report.as_deref());
     if page.checking_sources() {
         ui.horizontal_wrapped(|ui| {
             ui.spinner();

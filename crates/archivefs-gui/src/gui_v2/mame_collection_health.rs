@@ -9,6 +9,7 @@ use archivefs_core::mame_playing_library::MamePlayingLibraryPlan;
 use eframe::egui;
 
 mod page;
+mod repair;
 mod view;
 mod worker;
 pub(super) use page::HealthPage;

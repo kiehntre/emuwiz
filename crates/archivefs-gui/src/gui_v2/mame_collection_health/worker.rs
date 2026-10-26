@@ -16,7 +16,7 @@ use serde::Serialize;
 
 use crate::dat_catalogue_picker::CatalogueInventorySnapshot;
 
-#[derive(Clone)]
+#[derive(Clone, Debug)]
 pub(in crate::gui_v2) struct Request {
     pub id: u64,
     pub reference: CatalogueRef,
@@ -54,6 +54,10 @@ pub(in crate::gui_v2) struct SetContext {
 #[derive(Clone, Debug, Serialize)]
 pub(in crate::gui_v2) struct Report {
     pub job_id: u64,
+    #[serde(skip)]
+    pub(super) repair: Option<std::sync::Arc<super::repair::Reviewed>>,
+    #[serde(skip)]
+    pub(super) repair_unavailable: Option<String>,
     pub catalogue: CatalogueEvidence,
     pub inspection: CollectionInspection,
     pub analysis: MameCollectionAnalysis,
@@ -99,7 +103,15 @@ pub(in crate::gui_v2) fn run(
                 .into(),
         );
     }
-    let dat = resolved.parsed;
+    // Parse and hash one private byte snapshot; a hash of a separate read is
+    // not authority for parsed declarations.
+    let (bound, digest) =
+        archivefs_core::dat::parsers::parse_dat_file_bound(&request.catalogue_path, inputs.limits)
+            .map_err(|e| e.to_string())?;
+    if digest != hash.hashes.sha256 || !before.still_matches() {
+        return Err("Selected catalogue changed while capturing its snapshot.".into());
+    }
+    let dat = bound.dat;
     if dat
         .source
         .version
@@ -220,6 +232,8 @@ pub(in crate::gui_v2) fn run(
         .collect();
     let mut report = Report {
         job_id: request.id,
+        repair: None,
+        repair_unavailable: None,
         catalogue: CatalogueEvidence {
             reference: request.reference.token(),
             source_id: resolved.source_id,
@@ -243,6 +257,10 @@ pub(in crate::gui_v2) fn run(
         json: String::new(),
         json_unavailable: None,
     };
+    match super::repair::prepare(request, &report, &dat, cancel) {
+        Ok(reviewed) => report.repair = Some(std::sync::Arc::new(reviewed)),
+        Err(reason) => report.repair_unavailable = Some(reason),
+    }
     match bounded_json(&report, 32 * 1024 * 1024) {
         Ok(json) => report.json = json,
         Err(error) => report.json_unavailable = Some(error),

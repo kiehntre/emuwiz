@@ -20,7 +20,7 @@
 
 use std::path::Path;
 
-use super::identity::{capture_identity, content_identity_matches, identity_matches};
+use super::identity::{capture_identity, identity_matches};
 use super::journal::checkpoint_journal as write_journal;
 use super::model::{
     EntryState, RenameTransaction, TransactionEntry, TransactionOperation, TransactionState,
@@ -153,7 +153,13 @@ pub(super) fn reconcile_owned(
             transaction.entries[index].operation,
             TransactionOperation::RenameMove
         );
-        let bound = if rename_move {
+        let copy = matches!(
+            transaction.entries[index].operation,
+            TransactionOperation::CreateCopy { .. }
+        );
+        let bound = if copy {
+            super::copy::recovery_binding(&transaction.entries[index]).ok()
+        } else if rename_move {
             // Anchored at the journalled collection root when the entry lies below
             // it; otherwise the path must be its own real path. A redirected,
             // moved or symlink-substituted ancestor cannot bind, so the entry stays
@@ -168,15 +174,41 @@ pub(super) fn reconcile_owned(
         } else {
             None
         };
-        let mut issue = match &bound {
-            Some(dirs) => classify_entry_bound(&transaction.entries[index], index, dirs),
-            None => classify_entry(&transaction.entries[index], index),
+        let mut issue = if copy {
+            let result = bound
+                .as_ref()
+                .ok_or_else(|| "copy directory evidence unavailable".into())
+                .and_then(|dirs| super::copy::classify(&transaction.entries[index], dirs));
+            let (kind, detail) = match result {
+                Ok(true) => (
+                    RecoveryIssueKind::RenameConfirmed,
+                    "exact journalled copy is at destination".into(),
+                ),
+                Ok(false) => (
+                    RecoveryIssueKind::RenameDidNotHappen,
+                    "exact journalled copy retained in private staging".into(),
+                ),
+                Err(e) => (RecoveryIssueKind::EvidenceUnavailable, e),
+            };
+            RecoveryIssue {
+                entry_index: index,
+                kind,
+                detail,
+            }
+        } else {
+            match &bound {
+                Some(dirs) => classify_entry_bound(&transaction.entries[index], index, dirs),
+                None => classify_entry(&transaction.entries[index], index),
+            }
         };
         // A rename's directories that could not be bound (redirected or moved
         // ancestor, symlink substitution, outside the anchor) never promote an
         // entry: "the object looks right" through an unverified path proves
         // nothing about where it is.  Applying and RollingBack alike.
-        if rename_move && bound.is_none() && issue.kind == RecoveryIssueKind::RenameConfirmed {
+        if (rename_move || copy)
+            && bound.is_none()
+            && issue.kind == RecoveryIssueKind::RenameConfirmed
+        {
             issue = RecoveryIssue {
                 entry_index: index,
                 kind: RecoveryIssueKind::DirectorySyncFailed,
@@ -195,7 +227,7 @@ pub(super) fn reconcile_owned(
             RecoveryIssueKind::RenameDidNotHappen => state == EntryState::RollingBack,
             _ => false,
         };
-        if mutated && rename_move {
+        if mutated && (rename_move || copy) {
             // Applying + confirmed: the entry is at the destination.
             // RollingBack + not happened: the reverse happened, entry at source.
             let synced = match &bound {
@@ -551,7 +583,7 @@ pub(super) fn classify_entry(entry: &TransactionEntry, index: usize) -> Recovery
     if let TransactionOperation::CreateCopy { .. } = &entry.operation {
         let destination_matches = destination_identity
             .as_ref()
-            .is_some_and(|identity| content_identity_matches(&entry.identity, identity));
+            .is_some_and(|identity| super::copy::destination_matches(entry, identity));
         return if source_matches && destination_matches {
             RecoveryIssue {
                 entry_index: index,

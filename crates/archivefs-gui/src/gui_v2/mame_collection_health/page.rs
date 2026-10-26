@@ -61,6 +61,7 @@ pub(in crate::gui_v2) struct HealthPage {
     pub(in crate::gui_v2) selected_set: Option<String>,
     pub(in crate::gui_v2) offset: usize,
     pub(in crate::gui_v2) generation: u64,
+    pub(super) repair: super::repair::State,
     source_check: Option<SourceCheck>,
     next_source_check: Option<Instant>,
     export: Option<(Arc<Report>, Receiver<Result<String, String>>)>,
@@ -73,12 +74,21 @@ impl Drop for Job {
 }
 
 impl HealthPage {
+    pub(in crate::gui_v2) fn take_repair_history_request(&mut self) -> bool {
+        std::mem::take(&mut self.repair.open_history)
+    }
+
     pub(in crate::gui_v2) fn show(&mut self, ui: &mut egui::Ui) {
         self.picker.poll();
+        if self.repair.poll() {
+            self.report = None;
+            self.source_check = None;
+        }
         self.poll();
         self.poll_export(ui.ctx());
         view::show(ui, self);
-        if self.job.is_some()
+        if self.repair.busy()
+            || self.job.is_some()
             || self.picker.loading
             || self.source_check.is_some()
             || self.export.is_some()
@@ -91,6 +101,7 @@ impl HealthPage {
     }
 
     pub(in crate::gui_v2) fn invalidate_inputs(&mut self) {
+        self.repair.confirmation.clear();
         self.report = None;
         self.source_check = None;
         self.next_source_check = None;
@@ -104,6 +115,7 @@ impl HealthPage {
         if self.job.is_some() {
             return;
         }
+        self.repair.confirmation.clear();
         self.report = None;
         self.source_check = None;
         self.next_source_check = None;
@@ -224,7 +236,9 @@ impl HealthPage {
                 }
             }
         }
-        self.poll_sources();
+        if !self.repair.busy() {
+            self.poll_sources();
+        }
     }
 
     pub(in crate::gui_v2) fn checking_sources(&self) -> bool {
