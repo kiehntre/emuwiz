@@ -151,6 +151,9 @@ pub struct MameExpectedDisk {
     pub sha1: Option<String>,
     pub status: Option<String>,
     pub merge: Option<String>,
+    /// Permitted presence locations. A filename or generic file hash at any
+    /// location does not prove CHD content or the required parent CHD chain.
+    pub search_locations: Vec<MameRomLocation>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize)]
@@ -1773,6 +1776,7 @@ mod tests {
             sha1: Some("2222222222222222222222222222222222222222".into()),
             status: None,
             merge: Some("parent-disk".into()),
+            search_locations: vec![],
         });
         let group = MameRequirementGroup::from_expectation(expectation);
         assert_eq!(

@@ -17,8 +17,11 @@ pub(super) fn compare(dat: &ParsedDat, installed: Option<&str>) -> MameVersionCo
         return MameVersionCompatibility::ExactSourceVersionUnknown;
     }
     match (
-        dat.source.version.as_deref().and_then(version),
-        installed.and_then(version),
+        dat.source
+            .version
+            .as_deref()
+            .and_then(parse_version_evidence),
+        installed.and_then(parse_version_evidence),
     ) {
         (Some(a), Some(b)) if a == b => MameVersionCompatibility::CatalogueVersionMatch,
         (Some(_), Some(_)) => MameVersionCompatibility::CatalogueVersionMismatch,
@@ -26,7 +29,7 @@ pub(super) fn compare(dat: &ParsedDat, installed: Option<&str>) -> MameVersionCo
     }
 }
 
-fn version(text: &str) -> Option<MameVersion> {
+pub fn parse_version_evidence(text: &str) -> Option<MameVersion> {
     if !text.is_ascii()
         || text
             .bytes()

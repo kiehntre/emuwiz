@@ -1654,6 +1654,28 @@ fn versioned_xml(version: &str, clone_bytes: &[u8]) -> String {
 }
 
 #[test]
+fn catalogue_version_cannot_be_guessed_from_unrelated_header_text() {
+    for version in ["untrusted 0.280", "0.280 trailing", "unknown"] {
+        let lab = Lab::new();
+        std::fs::write(lab.inputs("clone").dat, versioned_xml(version, CLONE)).unwrap();
+        let environment = MameEnvironment {
+            database_path: Some(lab.dir.path().join("evidence.db")),
+            journal_dir: Some(lab.journal()),
+            catalogue_inventory: Some(catalogue_inventory(&lab)),
+        };
+        let error = catalogue::load_selected(&lab.inputs("clone"), &environment)
+            .err()
+            .unwrap();
+        assert!(
+            error.contains("declared MAME version"),
+            "{version}: {error}"
+        );
+        assert!(!environment.database_path.unwrap().exists());
+        assert!(!lab.journal().exists());
+    }
+}
+
+#[test]
 fn explicitly_selected_versioned_mame_dat_is_not_restricted_to_0174() {
     for version in ["0.250", "0.260"] {
         let lab = Lab::new();
