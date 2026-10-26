@@ -59,6 +59,7 @@ pub struct Preview {
     pub manifest_sha256: String,
     pub compatibility: Compatibility,
     pub sources: Vec<SourceStamp>,
+    pub optical_layout: super::optical::SaturnOpticalPreflight,
 }
 impl Preview {
     pub fn can_apply(&self) -> bool {
@@ -319,6 +320,10 @@ pub fn preview(package: &Path, disc: &Path) -> Result<Preview, String> {
     if !package_report.source.still_matches() || sources.iter().any(|s| !s.still_matches()) {
         return Err("Saturn source changed during inspection.".into());
     }
+    let optical = super::optical::assess(&manifest);
+    if !optical.refusals.is_empty() {
+        return Err(optical.refusals.join("; "));
+    }
     let manifest_sha256 = super::saturn_manifest_fingerprint(&manifest);
     Ok(Preview {
         package: package_report,
@@ -326,6 +331,7 @@ pub fn preview(package: &Path, disc: &Path) -> Result<Preview, String> {
         manifest_sha256,
         compatibility: Compatibility::UnknownBaseBinding,
         sources,
+        optical_layout: optical,
     })
 }
 

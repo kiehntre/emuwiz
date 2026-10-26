@@ -4644,12 +4644,9 @@ fn gui_v2_selected_saturn_game_shows_read_only_disc_manifest_boundary() {
     let closed = text(&frame(&context, &mut app, [1280.0, 1600.0]));
     assert!(closed.iter().any(|value| value == "Disc & ROM evidence"));
     assert!(!closed.iter().any(|value| value == "Saturn disc layout"));
-    let strings = text(&click_label(
-        &context,
-        &mut app,
-        [1280.0, 2600.0],
-        "Disc & ROM evidence",
-    ));
+    let _ = click_label(&context, &mut app, [1280.0, 2600.0], "Disc & ROM evidence");
+    super::saturn_manifest::finish_worker_for_test(&context);
+    let strings = text(&frame(&context, &mut app, [1280.0, 2600.0]));
     assert!(strings.iter().any(|value| value == "Saturn disc layout"));
     assert!(
         strings
