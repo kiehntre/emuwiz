@@ -50,7 +50,7 @@ fn system_id() -> [u8; 256] {
 }
 fn disc(root: &Path) -> PathBuf {
     let cue = root.join("game.cue");
-    fs::write(&cue, "FILE \"data.bin\" BINARY\nTRACK 01 MODE1/2048\nINDEX 00 00:00:00\nINDEX 01 00:00:01\nPREGAP 00:00:02\nFILE \"audio.bin\" BINARY\nTRACK 02 AUDIO\nINDEX 01 00:00:00\n").unwrap();
+    fs::write(&cue, "FILE \"data.bin\" BINARY\nTRACK 01 MODE1/2048\nINDEX 00 00:00:00\nINDEX 01 00:00:01\nFILE \"audio.bin\" BINARY\nTRACK 02 AUDIO\nINDEX 01 00:00:00\n").unwrap();
     let mut data = vec![0; 2048 * 3];
     data[2048..2304].copy_from_slice(&system_id());
     fs::write(root.join("data.bin"), data).unwrap();
@@ -174,7 +174,7 @@ fn native_identity_and_full_layout_bind_preview_but_not_compatibility() {
     );
     assert_eq!(report.manifest.tracks[0].index_00_frame, Some(0));
     assert_eq!(report.manifest.tracks[0].in_file_pregap_frames, Some(1));
-    assert_eq!(report.manifest.tracks[0].declared_pregap_frames, Some(2));
+    assert_eq!(report.manifest.tracks[0].declared_pregap_frames, None);
     assert_eq!(report.manifest.tracks[0].sector_count, 2);
     assert_eq!(report.manifest.components.len(), 2);
     assert_eq!(report.manifest.tracks[1].sector_size, 2352);
@@ -415,4 +415,20 @@ fn symlink_patch_inputs_are_not_followed() {
     let alias = root.path().join("alias.ssp");
     std::os::unix::fs::symlink(p, &alias).unwrap();
     assert!(inspect_package(&alias).is_err());
+}
+
+#[test]
+fn fresh_ssp_context_refuses_ambiguous_gap_evidence_before_apply() {
+    let root = tempfile::tempdir().unwrap();
+    let patch = patch(root.path());
+    let cue = disc(root.path());
+    let text = fs::read_to_string(&cue).unwrap();
+    fs::write(
+        &cue,
+        text.replace("INDEX 01 00:00:01", "INDEX 01 00:00:01\nPREGAP 00:00:02"),
+    )
+    .unwrap();
+    let error = preview(&patch, &cue).unwrap_err();
+    assert!(error.contains("Ambiguous"), "{error}");
+    assert!(!root.path().join("output.bin").exists());
 }
