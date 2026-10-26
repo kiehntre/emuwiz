@@ -8,6 +8,7 @@ use super::routes::ToolPage;
 
 #[derive(Default)]
 pub(super) struct ToolPagesState {
+    pub profile_settings_preview: super::profile_settings_preview::State,
     pub source_impact: super::source_impact::State,
     pub needs_attention: super::needs_attention_page::NeedsAttentionState,
     pub mounts: super::mounts_page::MountsState,
@@ -30,6 +31,7 @@ impl ToolPagesState {
             platform_aliases: super::platform_aliases_page::PlatformAliasesState::live(),
             database: super::database_status_page::DatabaseStatusState::live(),
             cheat_extras: Default::default(),
+            profile_settings_preview: Default::default(),
             source_impact: super::source_impact::State::live(),
         }
     }
@@ -38,6 +40,9 @@ impl ToolPagesState {
 impl App {
     pub(super) fn tool_page(&mut self, ui: &mut egui::Ui, tool: ToolPage) {
         match tool {
+            ToolPage::ProfileSettings => {
+                super::profile_settings_preview::show(ui, &mut self.tools.profile_settings_preview)
+            }
             ToolPage::SourceImpact => super::source_impact::show(ui, &mut self.tools.source_impact),
             ToolPage::NeedsAttention => {
                 self.tools.needs_attention.poll(ui.ctx());
