@@ -233,6 +233,8 @@ pub use amiga_whdload_execution::{
     AmigaWHDLoadLaunchError, LaunchedAmigaWHDLoadProcess, preflight_amiga_whdload_launch,
     preflight_and_launch_amiga_whdload, spawn_amiga_whdload,
 };
+#[cfg(target_os = "linux")]
+pub use amiga_whdload_trainer_launch::plan_fsuae_boot_with_saved_trainers;
 pub use amiga_whdload_trainer_launch::{
     WhdloadLaunchTrainerResolution, plan_fsuae_whdload_launch_with_saved_trainers,
     resolve_saved_whdload_launch_trainer,

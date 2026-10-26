@@ -18,7 +18,7 @@ pub(crate) fn apply(plan: &mut LaunchPlan, context: &AmigaWHDLoadLaunchContext) 
         else {
             continue;
         };
-        let boot = build_fsuae_whdload_command_plan(request);
+        let boot = saved_plan(request);
         if !boot.blockers.is_empty() {
             candidate.blockers.extend(boot.blockers);
             candidate.readiness = LaunchReadiness::Blocked;
@@ -39,6 +39,53 @@ pub(crate) fn apply(plan: &mut LaunchPlan, context: &AmigaWHDLoadLaunchContext) 
         .iter()
         .filter(|c| c.readiness == LaunchReadiness::Blocked)
         .count();
+}
+
+pub(super) fn saved_plan(
+    request: &WHDLoadLaunchInput,
+) -> archivefs_core::launch::AmigaWHDLoadCommandPlan {
+    #[cfg(target_os = "linux")]
+    {
+        archivefs_core::launch::plan_fsuae_boot_with_saved_trainers(request)
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        archivefs_core::launch::build_fsuae_whdload_command_plan(request)
+    }
+}
+
+pub(super) fn show_configuration(
+    ui: &mut egui::Ui,
+    candidate: &LaunchCandidate,
+    context: &AmigaWHDLoadLaunchContext,
+) {
+    let LaunchTarget::Standalone {
+        adapter_id: "fsuae",
+        profile_id,
+        ..
+    } = &candidate.target
+    else {
+        return;
+    };
+    let Some((_, _, request)) = context
+        .requests
+        .iter()
+        .find(|(adapter, profile, _)| adapter == "fsuae" && profile == profile_id)
+    else {
+        return;
+    };
+    ui.collapsing("WHDLoad saved options and effective launch", |ui| {
+        let plan = saved_plan(request);
+        if let Some(command) = plan.command {
+            ui.label(format!("Selected CUSTOM values: {}", command.trainer.as_ref().map(|t| t.arguments.join(" ")).unwrap_or_else(|| "none".into())));
+            ui.label(format!("Verified package: {} · slave: {}", command.target.display(), command.selected_slave));
+            ui.label(command.preview);
+            ui.small("Generated isolated configuration: template firmware; System read-only; disposable Games writable; no live profile mounts. Source package and emulator settings are preserved. New session saves are discarded.");
+        } else {
+            for blocker in plan.blockers { ui.label(blocker.detail); }
+            ui.label("Saved options have not been handed to a game. Gameplay NOT CONFIRMED.");
+        }
+    });
 }
 
 #[cfg(all(test, target_os = "linux"))]

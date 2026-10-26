@@ -70,10 +70,10 @@ use archivefs_core::launch::{
     PpssppLaunchRequest, Rpcs3LaunchExecutionError, Rpcs3LaunchRequest, WHDLoadLaunchInput,
     XemuLaunchExecutionError, XemuLaunchRequest, XeniaLaunchExecutionError, XeniaLaunchRequest,
     build_amiberry_whdload_command_plan, build_dolphin_command_plan,
-    build_duckstation_command_plan, build_fsuae_whdload_command_plan, build_pcsx2_command_plan,
-    build_retroarch_command_plan, build_rpcs3_command_plan, build_xenia_command_plan,
-    preflight_and_launch_amiga_whdload, preflight_and_launch_openmsx, preflight_and_launch_ppsspp,
-    preflight_and_launch_rpcs3, preflight_and_launch_xemu, preflight_and_launch_xenia,
+    build_duckstation_command_plan, build_pcsx2_command_plan, build_retroarch_command_plan,
+    build_rpcs3_command_plan, build_xenia_command_plan, preflight_and_launch_amiga_whdload,
+    preflight_and_launch_openmsx, preflight_and_launch_ppsspp, preflight_and_launch_rpcs3,
+    preflight_and_launch_xemu, preflight_and_launch_xenia,
 };
 use archivefs_core::launch::{
     CandidatePreference, DOLPHIN_SUPPORTED_PLATFORM_ID, DolphinLaunchExecutionError,
@@ -972,7 +972,7 @@ impl AmigaWHDLoadLaunchState {
                     build_amiberry_whdload_command_plan(&request)
                 }
                 archivefs_core::patch_manager::AmigaEmulatorKind::FsUae => {
-                    build_fsuae_whdload_command_plan(&request)
+                    amiga_boot::saved_plan(&request)
                 }
             };
             let result = preflight_and_launch_amiga_whdload(&plan)
@@ -4843,6 +4843,9 @@ fn show_candidate(
                 ));
             }
             show_standalone_launch_action(ui, standalone_launch_state, request);
+        }
+        if let Some(context) = amiga_whdload {
+            amiga_boot::show_configuration(ui, candidate, context);
         }
         if let Some(context) = amiga_whdload
             && let Some(TypedLaunchRequest::AmigaWHDLoad(request)) = typed_launch_request(

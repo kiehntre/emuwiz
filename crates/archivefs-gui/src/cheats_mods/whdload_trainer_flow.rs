@@ -609,18 +609,14 @@ mod tests {
 }
 
 /// Runtime support is independent of the editor's ability to save choices.
-/// All existing EmuWiz Amiga routes currently lack a verified CUSTOM consumer.
+/// Only the authorized EmuWiz FS-UAE boot route consumes saved CUSTOM values.
 pub(crate) fn show_launch_status(
     ui: &mut eframe::egui::Ui,
     emulator: Option<archivefs_core::patch_manager::AmigaEmulatorKind>,
 ) {
     ui.label(match emulator {
         Some(emulator) => archivefs_core::launch::whdload_trainer_runtime_support(emulator),
-        None => "Emulator support: CUSTOM trainer launch unsupported in current EmuWiz FS-UAE and Amiberry routes.",
+        None => "Saved CUSTOM values require the authorized EmuWiz FS-UAE boot sequence. Amiberry trainer activation is unsupported.",
     });
-    ui.label("EmuWiz saved CUSTOM options passed into launch: none.");
-    ui.add_enabled(
-        false,
-        eframe::egui::Button::new("Enable trainers at launch"),
-    );
+    ui.small("Check saved options and the effective configuration in Blue's WHDLoad launch details. Saving choices alone does not prove gameplay activation.");
 }

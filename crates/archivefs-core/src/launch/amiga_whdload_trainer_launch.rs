@@ -15,8 +15,10 @@
 //! - Anything malformed, conflicting, undeclared or changed is refused rather
 //!   than partly applied. No saved file, or a file with nothing enabled,
 //!   leaves the launch byte-identical to a launch without trainers.
-//! - Packaged (LHA) games, HDF slaves, unverified games and Amiberry never
-//!   receive options; their launches are unchanged.
+//! - The legacy host resolver below remains inspection-only for installed
+//!   folders. The authorized LHA boot resolver shares its parser/validation and
+//!   storage contract, and re-proves the extracted slave at preparation.
+//! - HDF, unverified games and Amiberry have no supported activation path.
 
 use std::collections::BTreeMap;
 use std::fs;
@@ -312,8 +314,126 @@ pub fn resolve_saved_whdload_launch_trainer(
     }
 }
 
+/// Resolve saved choices for the authorized LHA boot route. The boot adapter
+/// re-proves the parsed slave against the extracted bytes before using these
+/// values. Storage uses the same exact-game identity contract as the editor.
+#[cfg(target_os = "linux")]
+pub fn resolve_boot_trainers(
+    input: &WHDLoadLaunchInput,
+    option_file: impl FnOnce(&WhdloadTrainerDiscovery) -> Result<PathBuf, String>,
+) -> Result<Option<WhdloadLaunchTrainer>, String> {
+    use crate::patch_manager::{
+        TrainerOptionSource, WhdloadTrainerIdentity, parse_whdload_custom_options,
+        project_whdload_trainer_options,
+    };
+    let approval = input.boot.as_ref().map_err(Clone::clone)?;
+    let slave = input.slave.as_ref().ok_or("missing selected slave")?;
+    let CanonicalIdentityStatus::Resolved(identity) = &input.identity else {
+        return Err("verified Amiga identity required".into());
+    };
+    if identity.platform_id != "Amiga"
+        || identity.game_key != input.profile.verified_identity
+        || identity.game_key != slave.sha256
+        || identity.game_key != approval.manifest().game_key
+        || input.profile.emulator != crate::patch_manager::AmigaEmulatorKind::FsUae
+        || input
+            .target
+            .as_ref()
+            .is_none_or(|t| t.format != WhdloadPackageFormat::Lha)
+    {
+        return Err(
+            "saved options require the exact authorized FS-UAE package and slave identity".into(),
+        );
+    }
+    let declarations = slave
+        .parsed
+        .config
+        .as_deref()
+        .map(parse_whdload_custom_options)
+        .unwrap_or_default();
+    let source = TrainerOptionSource {
+        slave_path: slave.artifact_path.clone(),
+        slave_sha256: slave.sha256.clone(),
+        verified_game_identity: identity.game_key.clone(),
+        package_version: None,
+    };
+    let discovery = WhdloadTrainerDiscovery {
+        state: WhdloadTrainerDiscoveryState::Ready,
+        detail: String::new(),
+        slave_path: Some(slave.artifact_path.clone()),
+        slave_sha256: Some(slave.sha256.clone()),
+        slave_runtime_version: Some(slave.parsed.runtime_version),
+        declarations: declarations.clone(),
+        options: vec![],
+        identity: Some(WhdloadTrainerIdentity {
+            slave_path: slave.artifact_path.clone(),
+            expected_slave_sha256: slave.sha256.clone(),
+            verified_game_identity: identity.game_key.clone(),
+            package_version: None,
+        }),
+        candidates: vec![],
+    };
+    let path = option_file(&discovery)?;
+    let Some(bytes) = read_option_file(&path)? else {
+        return Ok(None);
+    };
+    let values = parse_saved_values(&bytes)?;
+    let options = project_whdload_trainer_options(&declarations, &source, &bytes)
+        .map_err(|e| e.to_string())?;
+    for (slot, value) in &values {
+        check_slot(
+            slot,
+            *value,
+            &options
+                .iter()
+                .filter(|o| &o.custom_slot == slot)
+                .collect::<Vec<_>>(),
+        )?;
+    }
+    let arguments = values
+        .iter()
+        .filter(|(_, value)| **value != 0)
+        .map(|(slot, value)| format!("{slot}={value}"))
+        .collect::<Vec<_>>();
+    if arguments.is_empty() {
+        return Ok(None);
+    }
+    Ok(Some(WhdloadLaunchTrainer {
+        verified_game_identity: identity.game_key.clone(),
+        slave_name: slave.name.clone(),
+        slave_path: slave.artifact_path.clone(),
+        slave_sha256: slave.sha256.clone(),
+        option_file: path,
+        option_file_sha256: sha256_hex(&bytes),
+        arguments,
+    }))
+}
+
+/// Plan the saved options through the EmuWiz boot sequence, retaining the
+/// existing boot-template readiness gate. No CUSTOM emulator argv is used.
+#[cfg(target_os = "linux")]
+pub fn plan_fsuae_boot_with_saved_trainers(input: &WHDLoadLaunchInput) -> AmigaWHDLoadCommandPlan {
+    let resolved = resolve_boot_trainers(input, |discovery| {
+        crate::patch_manager::whdload_trainer_option_file(discovery).map_err(|e| e.to_string())
+    });
+    match resolved {
+        Ok(trainer) => build_fsuae_whdload_command_plan_with_trainer(input, trainer.as_ref()),
+        Err(reason) => {
+            let mut plan = build_fsuae_whdload_command_plan(input);
+            plan.command = None;
+            plan.readiness = LaunchReadiness::Blocked;
+            plan.blockers.push(LaunchBlocker::new(
+                LaunchBlockerKind::WhdloadTrainerOptionsRefused,
+                reason,
+            ));
+            plan
+        }
+    }
+}
+
 /// Resolve the saved choices and request a launch plan. Nonempty choices are
-/// currently blocked because the plain-binary route cannot consume them.
+/// blocked because installed-folder boot has no supported consumer. LHA callers
+/// use `plan_fsuae_boot_with_saved_trainers` instead.
 ///
 /// `SavedOptions` is refused by the runtime gate; `NoSavedOptions` and
 /// `NotApplicable` give exactly [`build_fsuae_whdload_command_plan`];
