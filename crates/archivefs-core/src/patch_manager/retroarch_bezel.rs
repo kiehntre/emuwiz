@@ -1039,6 +1039,41 @@ mod tests {
         );
     }
 
+    /// If the override is changed straight after EmuWiz writes it, nothing
+    /// may be reported as fully undone: the outcome is Incomplete without a
+    /// usable Undo, never Completed.
+    #[test]
+    fn override_changed_after_publication_is_incomplete_not_completed() {
+        use crate::patch_manager::shared_transaction::set_after_publish;
+        let root = tempfile::tempdir().unwrap();
+        let source = root.path().join("bezel.png");
+        fs::write(&source, b"source-bytes").unwrap();
+        let override_path = root.path().join("config/snes9x/game-id.cfg");
+        fs::create_dir_all(override_path.parent().unwrap()).unwrap();
+        fs::write(&override_path, b"video_smooth = \"false\"\n").unwrap();
+        let plan = prepare_retroarch_bezel_plan(&request(root.path(), &source)).unwrap();
+        let mut approved = options(root.path(), "bezel-after-publish");
+        approved.replacement_approved = true;
+        let watched = override_path.clone();
+        set_after_publish(Some(Box::new(move |destination: &Path| {
+            if destination == watched {
+                fs::write(destination, b"edited by something else\n").unwrap();
+            }
+        })));
+        let report = apply_retroarch_bezel_plan_reported(&plan, &approved).unwrap();
+        set_after_publish(None);
+        assert_eq!(
+            report.automatic_rollback,
+            BezelAutomaticRollback::Incomplete {
+                undo_available: false
+            }
+        );
+        assert_eq!(
+            fs::read(&override_path).unwrap(),
+            b"edited by something else\n"
+        );
+    }
+
     /// An ordinary successful Apply needs no automatic rollback.
     #[test]
     fn successful_apply_reports_no_automatic_rollback() {

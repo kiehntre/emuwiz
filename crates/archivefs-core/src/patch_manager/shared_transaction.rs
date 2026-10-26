@@ -2925,7 +2925,7 @@ fn atomic_write_bytes(
 }
 
 #[cfg(test)]
-type PublishHook = Box<dyn FnMut(&Path)>;
+pub(super) type PublishHook = Box<dyn FnMut(&Path)>;
 
 #[cfg(test)]
 thread_local! {
@@ -2941,7 +2941,7 @@ thread_local! {
 }
 
 #[cfg(test)]
-fn set_after_publish(hook: Option<PublishHook>) {
+pub(super) fn set_after_publish(hook: Option<PublishHook>) {
     AFTER_PUBLISH.with(|slot| *slot.borrow_mut() = hook);
 }
 
@@ -3647,6 +3647,29 @@ fn rollback_entry_preview(
                 "{} Undo is blocked until that is resolved by hand.",
                 kept.detail
             ),
+        });
+        return result;
+    }
+    // EmuWiz's file was published and then changed by something else: the
+    // destination holds neither EmuWiz's file nor (for a replacement) the
+    // user's original, which only the backup has. Not "nothing to undo".
+    if let Some(changed) = entry
+        .failures
+        .iter()
+        .find(|f| f.kind == SharedApplyFailureKind::PublishedUnverified)
+    {
+        let detail = match entry.backup_path.as_ref() {
+            Some(backup) => format!(
+                "EmuWiz's file was replaced by something else straight after it was written; the original is kept in EmuWiz's backup at {}. Undo is blocked until that is resolved by hand.",
+                backup.display
+            ),
+            None => "A file EmuWiz installed was changed by something else straight after it was written. Undo is blocked until that is resolved by hand.".into(),
+        };
+        result.outcome = SharedRollbackOutcome::DestinationChanged;
+        result.failure = Some(SharedApplyFailure {
+            kind: SharedApplyFailureKind::PublishedUnverified,
+            path: changed.path.clone(),
+            detail,
         });
         return result;
     }
@@ -6344,6 +6367,60 @@ mod tests {
         assert_eq!(fs::read(dir.join("a.cht")).unwrap(), b"old-a");
         assert_eq!(fs::read(dir.join("b.cht")).unwrap(), b"old-b");
         assert!(!dir.join("aaa-overlay.cfg").exists());
+    }
+
+    /// An Apply whose replacement was changed straight after it was written
+    /// blocks Undo (the original is only in the backup) instead of letting
+    /// the other entries roll back and call the change undone.
+    #[cfg(unix)]
+    #[test]
+    fn apply_changed_after_publication_blocks_undo_and_names_the_backup() {
+        let fixture = Fixture::new("apply-after-publish");
+        let plan = mixed_plan(
+            &fixture,
+            &[
+                ("Nintendo - NES/aaa-overlay.cfg", None, b"overlay"),
+                ("Nintendo - NES/game.cht", Some(b"old"), b"new"),
+            ],
+        );
+        set_after_publish(Some(Box::new(|destination: &Path| {
+            if destination.ends_with("game.cht") {
+                fs::write(destination, b"edited").unwrap();
+            }
+        })));
+        let applied = execute_shared_apply(
+            &plan,
+            &options(&fixture, &plan, "apply-after-publish", false, true, true),
+        );
+        set_after_publish(None);
+        assert_eq!(applied.journal.status, SharedApplyStatus::PartialFailure);
+        let replaced = applied
+            .journal
+            .entries
+            .iter()
+            .find(|entry| entry.backup_path.is_some())
+            .unwrap();
+        assert!(
+            replaced
+                .failures
+                .iter()
+                .any(|failure| failure.kind == SharedApplyFailureKind::PublishedUnverified)
+        );
+        let rollback = preview_shared_rollback(
+            applied.journal_path.as_ref().unwrap(),
+            &fixture.destination_root(),
+            &fixture.backup_root(),
+        );
+        assert!(
+            !rollback.available,
+            "never rolled back as if nothing remained"
+        );
+        let blocked = entry_for(&rollback, "game.cht");
+        let failure = blocked.failure.as_ref().unwrap();
+        assert_eq!(failure.kind, SharedApplyFailureKind::PublishedUnverified);
+        let backup = replaced.backup_path.as_ref().unwrap().display.clone();
+        assert!(failure.detail.contains(&backup), "{}", failure.detail);
+        assert_eq!(fs::read(&backup).unwrap(), b"old");
     }
 
     /// A restore that published but whose destination changed straight
