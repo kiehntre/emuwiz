@@ -55,6 +55,7 @@ mod mods;
 mod mounts_page;
 mod native_workflows;
 mod needs_attention_page;
+mod netplay_preview;
 mod nkit;
 mod onboarding;
 mod organisation;

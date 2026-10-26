@@ -115,6 +115,8 @@ pub mod managed_emulator_install;
 pub mod metadata_aggregation;
 /// Bounded MSX standard cassette WAV evidence.
 pub mod msx_tape;
+/// Read-only comparison of explicitly supplied netplay observations.
+pub mod netplay_readiness;
 pub mod nintendo3ds_retail;
 /// Shared read-only projections of workflow journals into operation receipts
 /// and conservative recovery capabilities.
