@@ -144,8 +144,8 @@ opticaldiscs = { version = "0.15", default-features = false, optional = true }
 # not just uncompressed WBFS/ISO. `compress-bzip2`/`compress-lzma` are
 # deliberately left disabled: no real specimen in this project's corpus
 # uses them, and unlike zstd (already a real, compiled dependency of this
-# crate via `zip`'s own default `zstd`/`zstd-safe`/`zstd-sys` 0.13.3/7.2.4/
-# 2.0.16 - this feature adds zero new crates to the dependency graph),
+# crate via ZIP test fixtures; nod now uses the same patched zstd 0.14.3 /
+# zstd-safe 8.2.0, see third_party/nod-1.4.4/PATCH.md),
 # `compress-bzip2` would pull a second, different major version of the
 # `bzip2` crate (nod wants 0.4.x; `zip` already uses 0.6.1) and
 # `compress-lzma` would activate a currently-inactive native `liblzma`
@@ -190,6 +190,8 @@ chd-optical-specialist = ["dep:opticaldiscs", "opticaldiscs/chd"]
 test-support = []
 
 [dev-dependencies]
+# Exercise the patched shared decoder directly; no extra runtime dependency.
+zstd = { version = "0.14.3", default-features = false }
 # Existing Ed25519 protocol; only the enrolled unit-test path uses these.
 getrandom = "0.3"
 # Integration tests link the library without `cfg(test)`; this self-dependency
