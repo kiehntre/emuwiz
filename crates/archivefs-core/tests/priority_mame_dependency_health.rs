@@ -604,3 +604,30 @@ fn inactive_bios_material_does_not_require_empty_selected_variant_health() {
         assert_selected(&plan(&dat, &inv), "host");
     }
 }
+
+#[test]
+fn verified_borrowed_alias_covers_only_its_exact_parent_material() {
+    for extra in [
+        "".to_string(),
+        disk_xml(),
+        format!(
+            "<rom name=\"extra.bin\" size=\"4\" sha1=\"{}\"/>",
+            rom_sha1()
+        ),
+    ] {
+        let dat = parsed(&format!(
+            "<machine name=\"parent\">{}{extra}</machine><machine name=\"host\" cloneof=\"parent\" romof=\"parent\"><rom name=\"alias.bin\" merge=\"rom.bin\" size=\"4\" sha1=\"{}\"/></machine>",
+            rom_xml(),
+            rom_sha1()
+        ));
+        let mut alias = rom_member();
+        alias.name = "alias.bin".into();
+        let inv = inventory(vec![observed("host", vec![alias])]);
+        let plan = plan(&dat, &inv);
+        if extra.is_empty() {
+            assert_selected(&plan, "host");
+        } else {
+            assert_withheld(&plan, "host");
+        }
+    }
+}

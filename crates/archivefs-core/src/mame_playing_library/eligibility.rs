@@ -4,8 +4,9 @@
 use std::collections::{BTreeMap, BTreeSet};
 
 use crate::dat::dependency::graph::{
-    ChainGuard, DeclaredName, DependencyGraph, Flag, SetRef, declared_name, parse_flag,
+    ChainGuard, DeclaredName, DependencyGraph, Flag, MemberRef, SetRef, declared_name, parse_flag,
 };
+use crate::dat::dependency::owner::{OwnerHop, rom_owner_with};
 use crate::dat::model::DatGameEntry;
 use crate::dat::set::{
     MemberClass, classify_disk_member, classify_rom_member, declared_disks, declared_roms,
@@ -44,6 +45,41 @@ impl<'a> RequiredSupport<'a> {
             .into_iter()
             .flat_map(|e| e.requirements.iter().map(|r| r.declaring_set.as_str()))
             .collect();
+        // A verified child alias can discharge its exact parent declaration in
+        // a non-merged layout. Reuse the validated borrow chain, never a global
+        // hash/name match or an assumption that the whole provider is healthy.
+        let mut borrowed_declarations = BTreeSet::new();
+        for requirement in evidence
+            .filter(|e| e.verified_complete())
+            .into_iter()
+            .flat_map(|e| &e.requirements)
+            .filter(|r| !r.disk)
+        {
+            let SetRef::Unique(declaring) = self.graph.resolve_set(&requirement.declaring_set)
+            else {
+                continue;
+            };
+            let MemberRef::Unique((_, rom)) =
+                self.graph.rom_declared_as(declaring, &requirement.member)
+            else {
+                continue;
+            };
+            let mut chain = Vec::new();
+            if rom_owner_with(&self.graph, declaring, rom, |hop| {
+                if let OwnerHop::Declaration {
+                    provider,
+                    declaration,
+                } = hop
+                {
+                    chain.push((provider, declaration.name.as_str()));
+                }
+                Ok(())
+            })
+            .is_ok()
+            {
+                borrowed_declarations.extend(chain);
+            }
+        }
         let mut result = RequiredEvidence::default();
         let mut reasons = BTreeSet::new();
         // Exit markers distinguish a shared dependency (a diamond) from a
@@ -99,9 +135,24 @@ impl<'a> RequiredSupport<'a> {
                         MemberClass::OptionalPhysical | MemberClass::NonFile
                     )
                 });
+            let uncovered = declared_roms(index, game)
+                .filter(|(_, rom)| active_rom(rom))
+                .any(|(_, rom)| {
+                    !matches!(
+                        classify_rom_member(rom),
+                        MemberClass::OptionalPhysical | MemberClass::NonFile
+                    ) && !borrowed_declarations.contains(&(index, rom.name.as_str()))
+                })
+                || declared_disks(index, game).any(|(_, disk)| {
+                    !matches!(
+                        classify_disk_member(disk),
+                        MemberClass::OptionalPhysical | MemberClass::NonFile
+                    )
+                });
             if index != subject && material {
                 result.support_sets.insert(game.name.clone(), kind);
                 if !covered.contains(game.name.as_str())
+                    && uncovered
                     && self.health.get(game.name.as_str()) != Some(&MameSetHealth::Good)
                 {
                     reasons.insert(format!(
