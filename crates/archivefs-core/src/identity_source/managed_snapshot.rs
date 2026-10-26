@@ -420,6 +420,10 @@ impl ManagedSourceStore {
         Ok(Self { root, descriptor })
     }
 
+    pub(crate) fn object_path(&self, hash: &str) -> PathBuf {
+        self.objects_dir().join(hash)
+    }
+
     pub fn descriptor(&self) -> &ManagedSourceDescriptor {
         &self.descriptor
     }
@@ -556,8 +560,8 @@ impl ManagedSourceStore {
         if source_metadata.len() > self.descriptor.maximum_size_bytes {
             return Err(config("local source exceeds configured size limit"));
         }
-        let mut input =
-            File::open(path).map_err(|error| ArchiveFsError::io(path.clone(), error))?;
+        let mut input = crate::launch::process_spawn::open_regular_file_nonblocking(path)
+            .map_err(|error| ArchiveFsError::io(path.clone(), error))?;
         self.stage_reader(&mut input, metadata)
     }
 
@@ -668,6 +672,10 @@ impl ManagedSourceStore {
     ) -> Result<ActivationResult> {
         let _lock = self.lock()?;
         self.validate_snapshot_record(&candidate.snapshot)?;
+        let stored = self.load_snapshot(&candidate.snapshot.sha256)?;
+        if stored != candidate.snapshot {
+            return Err(config("candidate metadata changed since validation"));
+        }
         let mut state = self.load_state()?;
         if state.active_sha256.as_deref() != expected_active {
             return Err(config(
@@ -701,9 +709,29 @@ impl ManagedSourceStore {
     }
 
     pub fn rollback_snapshot(&self, hash: &str) -> Result<ActivationResult> {
+        self.rollback_snapshot_inner(hash, None)
+    }
+
+    /// Roll back only the active snapshot the user actually reviewed.
+    pub fn rollback_snapshot_if_current(
+        &self,
+        hash: &str,
+        expected_active: Option<&str>,
+    ) -> Result<ActivationResult> {
+        self.rollback_snapshot_inner(hash, Some(expected_active))
+    }
+
+    fn rollback_snapshot_inner(
+        &self,
+        hash: &str,
+        expected_active: Option<Option<&str>>,
+    ) -> Result<ActivationResult> {
         validate_sha(hash)?;
         let _lock = self.lock()?;
         let mut state = self.load_state()?;
+        if expected_active.is_some_and(|expected| state.active_sha256.as_deref() != expected) {
+            return Err(config("rollback request is stale; active snapshot changed"));
+        }
         let previous = state.active_sha256.clone();
         if !state.history.iter().any(|item| item == hash) {
             return Err(config("rollback target is not in snapshot history"));
@@ -871,6 +899,7 @@ impl ManagedSourceStore {
     fn validate_snapshot_record(&self, snapshot: &ManagedSourceSnapshot) -> Result<()> {
         if snapshot.provider_id != self.descriptor.provider_id
             || snapshot.source != self.descriptor.source
+            || snapshot.trust != self.descriptor.trust
         {
             return Err(config("snapshot does not belong to this managed source"));
         }

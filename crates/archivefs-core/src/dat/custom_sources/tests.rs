@@ -512,3 +512,95 @@ fn registry_is_bounded_and_tampered_files_are_refused() {
         assert!(CustomDatSourceRegistry::load(&path).is_err());
     }
 }
+
+#[test]
+fn blue_activation_rechecks_candidate_object_before_publishing() {
+    let dir = tempfile::tempdir().unwrap();
+    let file = dir.path().join("mine.dat");
+    fs::write(&file, dat("one")).unwrap();
+    let source = CustomDatSource::local(&file, "Mine").unwrap();
+    let lifecycle = CustomDatLifecycle::new(&source, &dir.path().join("managed")).unwrap();
+    let candidate = lifecycle.import_local().unwrap();
+    fs::write(&candidate.candidate.object_path, b"tampered").unwrap();
+    assert!(lifecycle.activate(&candidate).is_err());
+    assert!(lifecycle.active().unwrap().is_none());
+    assert_eq!(fs::read(&file).unwrap(), dat("one"));
+}
+
+#[test]
+fn blue_rollback_refuses_changed_active_and_retains_history() {
+    let dir = tempfile::tempdir().unwrap();
+    let file = dir.path().join("mine.dat");
+    let source = CustomDatSource::local(&file, "Mine").unwrap();
+    let lifecycle = CustomDatLifecycle::new(&source, &dir.path().join("managed")).unwrap();
+    let mut hashes = Vec::new();
+    for version in ["one", "two", "three"] {
+        fs::write(&file, dat(version)).unwrap();
+        let candidate = lifecycle.import_local().unwrap();
+        hashes.push(lifecycle.activate(&candidate).unwrap().active.sha256);
+    }
+    assert!(
+        lifecycle
+            .rollback_if_current(&hashes[0], Some(&hashes[1]))
+            .is_err()
+    );
+    assert_eq!(lifecycle.active().unwrap().unwrap().sha256, hashes[2]);
+    lifecycle
+        .rollback_if_current(&hashes[0], Some(&hashes[2]))
+        .unwrap();
+    assert_eq!(lifecycle.active().unwrap().unwrap().sha256, hashes[0]);
+    assert!(
+        lifecycle
+            .history()
+            .unwrap()
+            .iter()
+            .any(|s| s.sha256 == hashes[2])
+    );
+}
+
+#[test]
+fn blue_registry_compare_save_refuses_stale_and_busy_without_losing_sources() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("sources.json");
+    let original = CustomDatSourceRegistry::default();
+    let mut first = original.clone();
+    first
+        .add(CustomDatSource::local(&dir.path().join("first.dat"), "First").unwrap())
+        .unwrap();
+    first.save_if_current(&path, &original).unwrap();
+    assert!(original.save_if_current(&path, &original).is_err());
+    assert_eq!(CustomDatSourceRegistry::load(&path).unwrap(), first);
+    fs::write(path.with_extension("json.lock"), "owned by another writer").unwrap();
+    assert!(original.save_if_current(&path, &first).is_err());
+    assert_eq!(CustomDatSourceRegistry::load(&path).unwrap(), first);
+}
+
+#[test]
+fn blue_local_staging_and_registry_refuse_links_and_special_files() {
+    use std::os::unix::fs::symlink;
+    let dir = tempfile::tempdir().unwrap();
+    let file = dir.path().join("original.dat");
+    fs::write(&file, dat("one")).unwrap();
+    let link = dir.path().join("link.dat");
+    symlink(&file, &link).unwrap();
+    let source = CustomDatSource::local(&link, "Link").unwrap();
+    assert!(
+        CustomDatLifecycle::new(&source, &dir.path().join("managed"))
+            .unwrap()
+            .import_local()
+            .is_err()
+    );
+    assert!(CustomDatSourceRegistry::load(&link).is_err());
+    let fifo = dir.path().join("fifo.dat");
+    let path = std::ffi::CString::new(fifo.as_os_str().as_encoded_bytes()).unwrap();
+    assert_eq!(unsafe { libc::mkfifo(path.as_ptr(), 0o600) }, 0);
+    assert!(CustomDatSourceRegistry::load(&fifo).is_err());
+    let source = CustomDatSource::local(&fifo, "Pipe").unwrap();
+    assert!(
+        CustomDatLifecycle::new(&source, &dir.path().join("managed"))
+            .unwrap()
+            .import_local()
+            .is_err()
+    );
+    assert_eq!(fs::read(file).unwrap(), dat("one"));
+}
