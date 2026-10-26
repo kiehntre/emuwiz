@@ -8,7 +8,8 @@
 //! data directory (pid plus kernel start time, so a reused pid never counts).
 //! Before any journal write or Undo, the running processes of this user are
 //! inspected (read-only, `/proc`). An EmuWiz executable that is not a
-//! registered sealing writer is an older writer and closes the gate.
+//! registered sealing writer closes the gate unless verified to use an isolated
+//! default GUI profile. Uncertain profile or process evidence always blocks.
 //!
 //! Test binaries point `PROC_ROOT_ENV` at an empty private directory before
 //! `main`, so tests never inspect real processes; gate tests supply a fake
@@ -17,6 +18,8 @@
 //! closes the gate rather than opening it.
 
 use std::path::{Path, PathBuf};
+
+mod profile;
 
 /// Alternate process-table root (default `/proc`). Set by test isolation and
 /// compiled only into test builds: an environment variable must never be able
@@ -345,6 +348,47 @@ pub fn register_reader_at_startup() -> Result<Registration, String> {
     })
 }
 
+/// Inspect candidate identity without interpreting an unreadable live process
+/// as absent. ENOENT on `exe` alone also occurs for zombies and is not proof
+/// that the process directory has disappeared.
+fn candidate_executable(process: &Path) -> Result<Option<PathBuf>, String> {
+    use std::os::unix::fs::MetadataExt;
+    let inspection_error = |error| {
+        format!(
+            "cannot inspect running process {}: {error}; journal work is disabled. Nothing was changed",
+            process.display()
+        )
+    };
+    let metadata = match std::fs::metadata(process) {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => return Err(inspection_error(error)),
+    };
+    if metadata.uid() != unsafe { libc::geteuid() } {
+        return Ok(None);
+    }
+    match std::fs::read_link(process.join("exe")) {
+        Ok(executable) => Ok(Some(executable)),
+        Err(error) => {
+            if std::fs::metadata(process).is_err_and(|e| e.kind() == std::io::ErrorKind::NotFound) {
+                return Ok(None);
+            }
+            let zombie = std::fs::read_to_string(process.join("stat"))
+                .ok()
+                .and_then(|stat| {
+                    stat.rsplit_once(')')
+                        .map(|(_, rest)| rest.split_whitespace().next() == Some("Z"))
+                })
+                .unwrap_or(false);
+            if zombie {
+                Ok(None)
+            } else {
+                Err(inspection_error(error))
+            }
+        }
+    }
+}
+
 /// Running EmuWiz processes of this user (other than this one) that cannot
 /// read the Finalise states: any process that is not a verified
 /// finalise-capable registrant, sealing or not. Read-only, for display: an
@@ -358,7 +402,8 @@ fn try_finalise_incompatible_writers() -> Result<Vec<OlderWriter>, String> {
     let own = std::process::id();
     let entries = process_entries(&root)?;
     let mut found = Vec::new();
-    for entry in entries.flatten() {
+    for entry in entries {
+        let entry = entry.map_err(|error| format!("cannot inspect running processes: {error}; journal work is disabled. Nothing was changed"))?;
         let Some(pid) = entry
             .file_name()
             .to_str()
@@ -366,10 +411,10 @@ fn try_finalise_incompatible_writers() -> Result<Vec<OlderWriter>, String> {
         else {
             continue;
         };
-        if pid == own || !same_user(&entry.path()) {
+        if pid == own {
             continue;
         }
-        let Ok(executable) = std::fs::read_link(entry.path().join("exe")) else {
+        let Some(executable) = candidate_executable(&entry.path())? else {
             continue;
         };
         let name = executable
@@ -377,7 +422,10 @@ fn try_finalise_incompatible_writers() -> Result<Vec<OlderWriter>, String> {
             .and_then(|name| name.to_str())
             .unwrap_or_default()
             .trim_end_matches(" (deleted)");
-        if EMUWIZ_EXECUTABLES.contains(&name) && !finalise_capable(&root, pid) {
+        if EMUWIZ_EXECUTABLES.contains(&name)
+            && !finalise_capable(&root, pid)
+            && !profile::verified_isolated(&root, pid)
+        {
             found.push(OlderWriter { pid, executable });
         }
     }
@@ -550,15 +598,19 @@ fn sweep_dir(root: &Path, dir: &Path) {
 /// writers. Read-only, for display: an
 /// unreadable process table lists none here, but the gate itself refuses.
 pub fn older_writers() -> Vec<OlderWriter> {
-    try_older_writers().unwrap_or_default()
+    try_older_writers()
+        .map(|(writers, _)| writers)
+        .unwrap_or_default()
 }
 
-fn try_older_writers() -> Result<Vec<OlderWriter>, String> {
+fn try_older_writers() -> Result<(Vec<OlderWriter>, bool), String> {
     let root = proc_root();
     let own = std::process::id();
     let entries = process_entries(&root)?;
     let mut found = Vec::new();
-    for entry in entries.flatten() {
+    let mut excluded_profile = false;
+    for entry in entries {
+        let entry = entry.map_err(|error| format!("cannot inspect running processes: {error}; journal work is disabled. Nothing was changed"))?;
         let Some(pid) = entry
             .file_name()
             .to_str()
@@ -566,10 +618,10 @@ fn try_older_writers() -> Result<Vec<OlderWriter>, String> {
         else {
             continue;
         };
-        if pid == own || !same_user(&entry.path()) {
+        if pid == own {
             continue;
         }
-        let Ok(executable) = std::fs::read_link(entry.path().join("exe")) else {
+        let Some(executable) = candidate_executable(&entry.path())? else {
             continue;
         };
         let name = executable
@@ -583,10 +635,14 @@ fn try_older_writers() -> Result<Vec<OlderWriter>, String> {
         if registered(&root, pid) {
             continue;
         }
+        if profile::verified_isolated(&root, pid) {
+            excluded_profile = true;
+            continue;
+        }
         found.push(OlderWriter { pid, executable });
     }
     found.sort_by_key(|writer| writer.pid);
-    Ok(found)
+    Ok((found, excluded_profile))
 }
 
 /// Opens the gate for journal work, or explains which older EmuWiz must be
@@ -609,12 +665,17 @@ pub fn check() -> Result<(), String> {
     let root = proc_root();
     process_entries(&root)?;
     sweep_stale(&root);
-    let older = try_older_writers()?;
+    let (older, excluded_profile) = try_older_writers()?;
     if older.is_empty() {
         register_self()?;
         // An open gate is re-inspected at most every two seconds; a closed
         // one is never cached.
-        if cacheable && let Ok(mut guard) = OPEN_UNTIL.lock() {
+        // Profile evidence is live filesystem evidence and must be rechecked
+        // on every gate invocation, rather than receiving the no-peer cache.
+        if cacheable
+            && !excluded_profile
+            && let Ok(mut guard) = OPEN_UNTIL.lock()
+        {
             *guard = Some(now + std::time::Duration::from_secs(2));
         }
         return Ok(());
@@ -660,6 +721,80 @@ pub(crate) mod tests {
             format!("{pid} ({name}) S 1 1 1 0 -1 0 0 0 0 0 0 0 0 0 20 0 1 0 {started} 0 0"),
         )
         .unwrap();
+    }
+
+    #[test]
+    fn genuinely_isolated_profiles_do_not_block_journal_work() {
+        let table = fake_table("emuwiz-gui", 4_800_001, "81");
+        set_process_root_for_this_thread(Some(table.path().to_path_buf()));
+        let _reset = Reset;
+        let peer = tempfile::tempdir().unwrap();
+        for tail in [".config/emuwiz", ".local/share/emuwiz"] {
+            std::fs::create_dir_all(peer.path().join(tail)).unwrap();
+        }
+        let ours = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(ours.path().join(".local/share/emuwiz")).unwrap();
+        std::fs::create_dir_all(ours.path().join(".config/emuwiz")).unwrap();
+        let process = table.path().join("4800001");
+        std::fs::write(
+            process.join("environ"),
+            format!("HOME={}\0", peer.path().display()),
+        )
+        .unwrap();
+        std::fs::write(process.join("cmdline"), b"emuwiz-gui\0").unwrap();
+        std::fs::create_dir(process.join("fd")).unwrap();
+        std::os::unix::fs::symlink(peer.path(), process.join("cwd")).unwrap();
+        std::fs::create_dir(process.join("ns")).unwrap();
+        std::os::unix::fs::symlink(
+            std::fs::read_link("/proc/self/ns/mnt").unwrap(),
+            process.join("ns/mnt"),
+        )
+        .unwrap();
+        std::os::unix::fs::symlink("/", process.join("root")).unwrap();
+        let own = std::process::id();
+        add_process(table.path(), "emuwiz-gui", own, "82");
+        std::fs::write(
+            table.path().join(own.to_string()).join("environ"),
+            format!("HOME={}\0", ours.path().display()),
+        )
+        .unwrap();
+        std::fs::write(
+            table.path().join(own.to_string()).join("cmdline"),
+            b"emuwiz-gui\0",
+        )
+        .unwrap();
+        assert!(
+            older_writers().is_empty(),
+            "isolated profile must not close the gate"
+        );
+        assert!(finalise_incompatible_writers().is_empty());
+        assert!(
+            try_older_writers().unwrap().1,
+            "profile exception must disable caching"
+        );
+        assert!(check().is_ok());
+        assert!(check_finalise().is_ok());
+        // The next check must re-evaluate newly shared journal aliases.
+        std::os::unix::fs::symlink(
+            ours.path().join(".local/share/emuwiz"),
+            peer.path().join(".local/share/emuwiz/shared-journals"),
+        )
+        .unwrap();
+        assert!(check().is_err());
+    }
+
+    #[test]
+    fn unreadable_live_executable_is_unknown_but_confirmed_exit_and_zombie_are_safe() {
+        let table = fake_table("emuwiz-gui", 4_800_003, "84");
+        let process = table.path().join("4800003");
+        std::fs::remove_file(process.join("exe")).unwrap();
+        assert!(candidate_executable(&process).is_err());
+        std::fs::write(process.join("exe"), b"not a readable executable link").unwrap();
+        assert!(candidate_executable(&process).is_err());
+        std::fs::write(process.join("stat"), "4800003 (emuwiz-gui) Z 1 1").unwrap();
+        assert!(candidate_executable(&process).unwrap().is_none());
+        std::fs::remove_dir_all(&process).unwrap();
+        assert!(candidate_executable(&process).unwrap().is_none());
     }
 
     /// Writes the registration a sealing-capable instance would write.
