@@ -45,6 +45,7 @@ pub(super) struct SavesStatesState {
     pub(super) search: String,
     pub(super) error: Option<String>,
     pub(super) snapshots: super::save_snapshots::SnapshotPanelState,
+    pub(super) compatibility: super::save_compatibility::Panel,
 }
 
 impl SavesStatesState {
@@ -356,6 +357,7 @@ pub(super) fn show(app: &mut App, ui: &mut egui::Ui, game_id: Option<i64>) {
             .collect();
         super::save_snapshots::ensure_history(app, game.archive.id, targets);
         snapshot_overview(ui, &app.saves_states.snapshots);
+        super::save_compatibility::show(app, ui, game);
     }
     let Some(inventory) = app.saves_states.inventory.as_ref() else {
         return;
@@ -542,7 +544,7 @@ fn summary(ui: &mut egui::Ui, records: &[&PersistentStateRecord]) {
     });
 }
 
-fn record_belongs_to_game(record: &PersistentStateRecord, game: &Game) -> bool {
+pub(super) fn record_belongs_to_game(record: &PersistentStateRecord, game: &Game) -> bool {
     if record.state_type == PersistentStateType::NativeSave
         && record.emulator == StateEmulator::RetroArch
         && let Some(origin) = record.sram_origin.as_ref()
