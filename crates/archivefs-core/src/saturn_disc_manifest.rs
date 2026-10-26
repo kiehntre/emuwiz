@@ -706,9 +706,25 @@ pub fn verify_saturn_manifest(expected: &SaturnDiscManifest) -> SaturnManifestVe
             || left.mode != right.mode
             || left.source_file != right.source_file
             || left.sector_count != right.sector_count
+            || left.track_type != right.track_type
+            || left.source_component_index != right.source_component_index
+            || left.file_byte_offset != right.file_byte_offset
+            || left.data_byte_offset != right.data_byte_offset
+            || left.sector_size != right.sector_size
+            || left.logical_start_frame != right.logical_start_frame
+            || left.logical_data_start_frame != right.logical_data_start_frame
+            || left.logical_end_frame != right.logical_end_frame
         {
             issues.push(SaturnManifestIssue::TrackTopologyMismatch {
                 detail: format!("track {} topology changed", left.number),
+            });
+        }
+        if left.postgap_frames != right.postgap_frames {
+            issues.push(SaturnManifestIssue::TrackTopologyMismatch {
+                detail: format!(
+                    "track {} POSTGAP changed: {:?} -> {:?}",
+                    left.number, left.postgap_frames, right.postgap_frames
+                ),
             });
         }
         if left.index_00_frame != right.index_00_frame
