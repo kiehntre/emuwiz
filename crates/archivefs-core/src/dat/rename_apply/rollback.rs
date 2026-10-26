@@ -317,6 +317,8 @@ fn rollback_transaction_inner(
             }
         }
 
+        let catalogue =
+            crate::database::organisation_paths::begin(&transaction.entries[index], true, false)?;
         // Durable `RollingBack` checkpoint BEFORE the reverse rename syscall.
         transaction.entries[index].state = EntryState::RollingBack;
         persist(journal_dir, transaction, &mut fence)?;
@@ -329,6 +331,9 @@ fn rollback_transaction_inner(
         let attempted = rollback_mutation(&transaction.entries[index], trusted);
         match attempted {
             Ok(()) => {
+                if let Some(catalogue) = catalogue {
+                    catalogue.commit()?;
+                }
                 transaction.entries[index].state = EntryState::RolledBack;
                 transaction.entries[index].rolled_back_at_unix =
                     Some(crate::dat::sources::now_unix());

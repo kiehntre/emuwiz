@@ -82,7 +82,9 @@ pub struct RecoveryIssue {
 /// returns the findings.
 ///
 /// Read-only with respect to files (only `symlink_metadata`/`read`-style
-/// identity capture); never resumes a rename. Entries that cannot be cleanly
+/// identity capture); never resumes a rename. Journal-bound catalogue path
+/// associations are completed transactionally before confirming an entry.
+/// Entries that cannot be cleanly
 /// classified are left unresolved so manual review is required.
 pub fn reconcile_recovery(
     transaction: &mut RenameTransaction,
@@ -211,6 +213,22 @@ pub(super) fn reconcile_owned(
                          could not be synchronised: {error}"
                     ),
                 };
+            }
+        }
+        if matches!(
+            issue.kind,
+            RecoveryIssueKind::RenameConfirmed | RecoveryIssueKind::RenameDidNotHappen
+        ) {
+            let reverse = issue.kind == RecoveryIssueKind::RenameDidNotHappen;
+            let completion = crate::database::organisation_paths::begin(
+                &transaction.entries[index],
+                reverse,
+                true,
+            )
+            .and_then(|guard| guard.map(|g| g.commit()).unwrap_or(Ok(())));
+            if let Err(error) = completion {
+                issue.kind = RecoveryIssueKind::EvidenceUnavailable;
+                issue.detail = format!("catalogue completion requires recovery: {error}");
             }
         }
         match issue.kind {

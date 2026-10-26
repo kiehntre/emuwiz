@@ -4,6 +4,7 @@
 //! Every mutation test uses temporary directories only - never a real user ROM
 //! directory. Planning tests snapshot the source tree and assert zero changes.
 
+use super::transaction::apply_filesystem_organisation_transaction as apply_organisation_transaction;
 use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::AtomicBool;
@@ -2035,3 +2036,6 @@ fn persisted_canonical_atari2600_assignment_survives_into_the_plan_but_a_folder_
     assert_eq!(plan.entries[1].status, OrganisationStatus::Blocked);
     assert!(reason(1).contains("no platform identity could be resolved"));
 }
+
+#[path = "catalogue_tests.rs"]
+mod catalogue_tests;

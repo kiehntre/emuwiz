@@ -97,6 +97,12 @@ impl OrganisationStatus {
 /// One proposed organisation for one source file.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct OrganisationPlanEntry {
+    /// Object approved in preview. Legacy plans must be regenerated.
+    #[serde(default)]
+    pub source_identity: Option<crate::dat::rename_apply::model::ObjectIdentity>,
+    /// Exact catalogue identity and path associations reviewed in this preview.
+    #[serde(default)]
+    pub catalogue_binding: Option<serde_json::Value>,
     pub source_path: PathBuf,
     pub destination_path: PathBuf,
     /// Canonical platform id, when resolved strongly enough.

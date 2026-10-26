@@ -5,6 +5,7 @@
 //! Every mutation test uses temporary directories only. The source tree and
 //! the linked-library root are deliberately separate directories.
 
+use super::transaction::apply_filesystem_organisation_transaction as apply_organisation_transaction;
 use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::AtomicBool;

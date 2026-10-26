@@ -125,12 +125,14 @@ fn plan_entry(
         .file_name()
         .map(|name| name.to_string_lossy().into_owned())
         .unwrap_or_default();
-    let object_kind = crate::dat::rename_apply::identity::capture_identity(&candidate.source_path)
-        .map(|identity| identity.kind)
-        .ok();
+    let source_identity =
+        crate::dat::rename_apply::identity::capture_identity(&candidate.source_path).ok();
+    let object_kind = source_identity.as_ref().map(|identity| identity.kind);
     let mode = request.mode;
 
     let blocked = |reason: &str| OrganisationPlanEntry {
+        source_identity: source_identity.clone(),
+        catalogue_binding: None,
         source_path: candidate.source_path.clone(),
         destination_path: PathBuf::new(),
         platform: None,
@@ -147,6 +149,8 @@ fn plan_entry(
 
     let unsupported = |reason: &str, platform: Option<String>, display: &str, source: &str| {
         OrganisationPlanEntry {
+            source_identity: source_identity.clone(),
+            catalogue_binding: None,
             source_path: candidate.source_path.clone(),
             destination_path: PathBuf::new(),
             platform,
@@ -333,6 +337,8 @@ fn plan_entry(
     };
 
     OrganisationPlanEntry {
+        source_identity: source_identity.clone(),
+        catalogue_binding: None,
         source_path: candidate.source_path.clone(),
         destination_path,
         platform: Some(platform),

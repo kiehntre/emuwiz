@@ -4,6 +4,8 @@ use std::{collections::BTreeSet, path::PathBuf};
 fn selection(count: usize) -> Selection {
     let entries = (0..count)
         .map(|n| OrganisationPlanEntry {
+            source_identity: None,
+            catalogue_binding: None,
             source_path: PathBuf::from(format!("/collection/{n}.bin")),
             destination_path: PathBuf::from(format!("/collection/new{n}.bin")),
             platform: None,

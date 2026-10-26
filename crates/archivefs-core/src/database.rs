@@ -72,6 +72,7 @@ pub use discovery_import::{
 };
 mod catalogue_health;
 mod cue_revalidation;
+pub(crate) mod organisation_paths;
 pub use cue_revalidation::{CueDiscCatalogue, CueDiscRevalidation};
 mod amiga_adf_identity;
 #[cfg(test)]
