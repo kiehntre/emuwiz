@@ -192,11 +192,22 @@ pub fn project_provider(
             AlternativeLaunchReadiness::Ambiguous,
             "required asset evidence targets a different or unknown edition".into(),
         )
+    } else if provider
+        .requirements
+        .iter()
+        .map(|r| r.asset_kind)
+        .collect::<BTreeSet<_>>()
+        .len()
+        != provider.requirements.len()
+    {
+        (AlternativeLaunchReadiness::Ambiguous,
+         "multiple required roles share an asset kind; kind-only evidence cannot prove each role".into())
     } else if provider.requirements.iter().any(|requirement| {
         !assets.iter().any(|asset| {
             asset.present
                 && asset.asset_kind == requirement.asset_kind
                 && asset.identity.as_deref() == game.canonical_id.as_deref()
+                && asset.edition == game.edition
                 && (requirement.edition.is_none() || asset.edition == requirement.edition)
         })
     }) {
@@ -415,6 +426,73 @@ mod tests {
         assert_eq!(
             projection.evidence.source,
             "caller-supplied launch evidence"
+        );
+    }
+}
+
+#[cfg(test)]
+mod review_regressions {
+    use super::*;
+    fn edition_fixture() -> (
+        AlternativeLaunchProvider,
+        AlternativeLaunchGameIdentity,
+        AlternativeLaunchAssetEvidence,
+    ) {
+        (
+            AlternativeLaunchProvider {
+                id: "synthetic".into(),
+                name: "Synthetic".into(),
+                kind: AlternativeLaunchKind::SourcePort,
+                version: Some("1".into()),
+                version_supported: Some(true),
+                installed: true,
+                supported_game_ids: ["example".into()].into_iter().collect(),
+                requirements: vec![AlternativeLaunchRequirement {
+                    asset_kind: AlternativeLaunchAssetKind::GameDataArchive,
+                    role: "main data".into(),
+                    edition: None,
+                }],
+            },
+            AlternativeLaunchGameIdentity {
+                canonical_id: Some("example".into()),
+                edition: Some("A".into()),
+                confidence: AlternativeLaunchIdentityConfidence::Exact,
+            },
+            AlternativeLaunchAssetEvidence {
+                asset_kind: AlternativeLaunchAssetKind::GameDataArchive,
+                identity: Some("example".into()),
+                edition: Some("A".into()),
+                present: true,
+                source: "synthetic observation".into(),
+                reason: "fixture".into(),
+            },
+        )
+    }
+    #[test]
+    fn asset_editions_must_agree_with_the_selected_game() {
+        let (provider, game, asset) = edition_fixture();
+        assert_eq!(
+            project_provider(provider.clone(), game.clone(), vec![asset.clone()]).readiness,
+            AlternativeLaunchReadiness::Ready
+        );
+        for edition in [None, Some("B".into())] {
+            let mut other = asset.clone();
+            other.edition = edition;
+            assert_eq!(
+                project_provider(provider.clone(), game.clone(), vec![other]).readiness,
+                AlternativeLaunchReadiness::OriginalAssetsMissing
+            );
+        }
+    }
+    #[test]
+    fn one_kind_cannot_prove_two_different_required_roles() {
+        let (mut provider, game, asset) = edition_fixture();
+        let mut second_role = provider.requirements[0].clone();
+        second_role.role = "expansion data".into();
+        provider.requirements.push(second_role);
+        assert_eq!(
+            project_provider(provider, game, vec![asset]).readiness,
+            AlternativeLaunchReadiness::Ambiguous
         );
     }
 }
