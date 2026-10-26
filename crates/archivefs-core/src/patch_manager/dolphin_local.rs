@@ -2398,6 +2398,28 @@ fn resolve_flatpak_binding(
             "profile is not the exact Dolphin Flatpak configuration/data location",
         ));
     }
+    if !cfg!(target_os = "linux") {
+        return Err(launch_blocker(
+            DolphinLaunchBlockerKind::UnsupportedInstallationType,
+            "Dolphin Flatpak launch requires native Linux",
+        ));
+    }
+    if roots.dolphin_emu_userpath_override.is_some() {
+        return Err(launch_blocker(
+            DolphinLaunchBlockerKind::EnvironmentOverridePresent,
+            "DOLPHIN_EMU_USERPATH would override the Flatpak profile",
+        ));
+    }
+    if !is_real_directory_local(&profile.configuration_root)
+        || !is_real_directory_local(&profile.data_root)
+        || profile.dolphin_ini_path != expected_config.join("Dolphin.ini")
+        || !is_regular_file_local(&profile.dolphin_ini_path)
+    {
+        return Err(launch_blocker(
+            DolphinLaunchBlockerKind::ProfileRootMismatch,
+            "Flatpak profile roots or Dolphin.ini no longer match discovery",
+        ));
+    }
     let known = known_install_roots(
         &roots.home,
         &roots.xdg_data_home,
@@ -4010,7 +4032,13 @@ mod tests {
             .join("home/.var/app")
             .join(app_id)
             .join("config/dolphin-emu");
-        make_local_profile(&flatpak_config, &flatpak_config);
+        let flatpak_data = flatpak_config
+            .parent()
+            .unwrap()
+            .parent()
+            .unwrap()
+            .join("data/dolphin-emu");
+        make_local_profile(&flatpak_config, &flatpak_data);
         let flatpak_profile = discover_dolphin_local_profiles(&roots)
             .profiles
             .into_iter()
@@ -4018,6 +4046,25 @@ mod tests {
             .unwrap();
         let binding = resolve_dolphin_native_launch_binding(&flatpak_profile, &roots).unwrap();
         assert_eq!(binding.executable, flatpak);
+        #[cfg(unix)]
+        {
+            let alias = root.join("bin-alias");
+            std::os::unix::fs::symlink(flatpak.parent().unwrap(), &alias).unwrap();
+            roots.path_override = Some(vec![flatpak.parent().unwrap().to_path_buf(), alias]);
+            assert_eq!(
+                resolve_dolphin_native_launch_binding(&flatpak_profile, &roots)
+                    .unwrap()
+                    .executable,
+                flatpak
+            );
+        }
+        fs::remove_file(&flatpak_profile.dolphin_ini_path).unwrap();
+        assert_eq!(
+            resolve_dolphin_native_launch_binding(&flatpak_profile, &roots)
+                .unwrap_err()
+                .kind,
+            DolphinLaunchBlockerKind::ProfileRootMismatch
+        );
         assert!(matches!(
             binding.installation,
             crate::launch::installation::LaunchInstallation::Flatpak { app_id: ref id }

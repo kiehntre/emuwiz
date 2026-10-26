@@ -124,31 +124,25 @@ fn appimage_and_flatpak_wrap_dolphin_arguments_without_rewriting_them() {
         vec!["-e".into(), path.clone().into_os_string()]
     );
 
+    let directory = tempfile::tempdir().unwrap();
+    let path = directory.path().join("GC Collection ; $(inert).iso");
+    std::fs::write(&path, b"disc").unwrap();
     let flatpak = build_dolphin_command_plan(
         &resolved(),
         &candidate(Some(path.clone())),
-        &Ok(DolphinNativeLaunchBinding {
-            executable: "/usr/bin/flatpak".into(),
-            installation: crate::launch::installation::LaunchInstallation::flatpak(
-                "org.DolphinEmu.dolphin-emu",
-            )
-            .unwrap(),
-            user_directory_mode: DolphinUserDirectoryMode::ExplicitRoot(
-                "/profiles/Dolphin User".into(),
-            ),
-        }),
+        &flatpak_binding(),
     )
     .command
     .unwrap();
-    assert_eq!(flatpak.executable, PathBuf::from("/usr/bin/flatpak"));
+    let mut grant = OsString::from("--filesystem=");
+    grant.push(&path);
+    grant.push(":ro");
     assert_eq!(
         flatpak.arguments,
         vec![
             "run".into(),
-            "--filesystem=/games/GC Collection:ro".into(),
+            grant,
             "org.DolphinEmu.dolphin-emu".into(),
-            "-u".into(),
-            "/profiles/Dolphin User".into(),
             "-e".into(),
             path.into_os_string(),
         ]
@@ -402,4 +396,89 @@ fn blocked_candidate_is_not_reauthorized() {
     );
     assert!(plan.command.is_none());
     assert!(has_blocker(&plan, LaunchBlockerKind::ProfileIneligible));
+}
+
+fn flatpak_binding() -> Result<DolphinNativeLaunchBinding, DolphinLaunchBlocker> {
+    Ok(DolphinNativeLaunchBinding {
+        executable: "/usr/bin/flatpak".into(),
+        installation: crate::launch::installation::LaunchInstallation::flatpak(
+            "org.DolphinEmu.dolphin-emu",
+        )
+        .unwrap(),
+        user_directory_mode: DolphinUserDirectoryMode::DefaultNative,
+    })
+}
+
+#[test]
+fn flatpak_refuses_missing_content_and_reserved_runtime_paths() {
+    for path in [
+        "/games/missing.iso",
+        "/usr/share/game.iso",
+        "/run/host/game.iso",
+    ] {
+        let plan = build_dolphin_command_plan(
+            &resolved(),
+            &candidate(Some(path.into())),
+            &flatpak_binding(),
+        );
+        assert!(plan.command.is_none(), "must refuse {path}");
+    }
+}
+
+#[test]
+fn flatpak_refuses_foreign_app_or_explicit_user_root() {
+    let directory = tempfile::tempdir().unwrap();
+    let path = directory.path().join("game.iso");
+    std::fs::write(&path, b"disc").unwrap();
+    for foreign_app in [false, true] {
+        let mut binding = flatpak_binding().unwrap();
+        if foreign_app {
+            binding.installation =
+                crate::launch::installation::LaunchInstallation::flatpak("org.other.Emulator")
+                    .unwrap();
+        } else {
+            binding.user_directory_mode =
+                DolphinUserDirectoryMode::ExplicitRoot(directory.path().into());
+        }
+        let plan =
+            build_dolphin_command_plan(&resolved(), &candidate(Some(path.clone())), &Ok(binding));
+        assert!(plan.command.is_none());
+    }
+}
+
+#[test]
+#[cfg(unix)]
+fn flatpak_checks_read_only_files_companions_and_symlink_ancestors() {
+    use std::os::unix::fs::{PermissionsExt, symlink};
+    let directory = tempfile::tempdir().unwrap();
+    let path = directory.path().join("disc.WBFS");
+    std::fs::write(&path, b"disc").unwrap();
+    std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o444)).unwrap();
+    let companion = path.with_extension("WBF1");
+    let first = flatpak::inspect(&path).unwrap();
+    assert_eq!(first.visibility.grants().len(), 1);
+    assert!(
+        first
+            .visibility
+            .flatpak_options()
+            .unwrap()
+            .iter()
+            .all(|arg| arg.to_str().unwrap().ends_with(":ro"))
+    );
+    std::fs::write(&path, b"changed").unwrap();
+    assert_ne!(flatpak::inspect(&path).unwrap(), first);
+    std::fs::write(&companion, b"continuation").unwrap();
+    assert!(flatpak::inspect(&path).is_err());
+    std::fs::remove_file(&companion).unwrap();
+    symlink(&path, &companion).unwrap();
+    assert!(flatpak::inspect(&path).is_err());
+    std::fs::remove_file(&companion).unwrap();
+    std::fs::write(path.with_extension("WBF2"), b"gap").unwrap();
+    assert!(flatpak::inspect(&path).is_err());
+    let alias = directory.path().join("alias");
+    symlink(directory.path(), &alias).unwrap();
+    assert!(flatpak::inspect(&alias.join("disc.WBFS")).is_err());
+    std::fs::remove_file(path.with_extension("WBF2")).unwrap();
+    std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o000)).unwrap();
+    assert!(flatpak::inspect(&path).is_err());
 }
