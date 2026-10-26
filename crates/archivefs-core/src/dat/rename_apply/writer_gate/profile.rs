@@ -9,6 +9,7 @@ use super::{executable_identity, start_time};
 use std::collections::HashSet;
 use std::ffi::OsString;
 use std::io::Read;
+use std::os::fd::AsRawFd;
 use std::os::unix::{
     ffi::OsStringExt,
     fs::{MetadataExt, OpenOptionsExt},
@@ -21,6 +22,31 @@ type Environment = Vec<(OsString, OsString)>;
 fn identity(path: &Path) -> Option<Identity> {
     let m = std::fs::metadata(path).ok()?;
     Some((m.dev(), m.ino()))
+}
+
+struct RootContext {
+    // Retaining the mount object prevents its kernel ID being recycled while
+    // this evidence is in use, even if a mount is detached during inspection.
+    _directory: std::fs::File,
+    identity: (u64, u64, u64),
+}
+
+fn root_context(path: &Path) -> Option<RootContext> {
+    let directory = std::fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_PATH | libc::O_DIRECTORY)
+        .open(path)
+        .ok()?;
+    let metadata = directory.metadata().ok()?;
+    let info =
+        std::fs::read_to_string(format!("/proc/self/fdinfo/{}", directory.as_raw_fd())).ok()?;
+    let mount = info
+        .lines()
+        .find_map(|line| line.strip_prefix("mnt_id:")?.trim().parse::<u64>().ok())?;
+    Some(RootContext {
+        _directory: directory,
+        identity: (metadata.dev(), metadata.ino(), mount),
+    })
 }
 
 fn process_identity(root: &Path, pid: u32) -> Option<(String, Identity)> {
@@ -175,6 +201,16 @@ fn disjoint(a: &State, b: &State) -> bool {
 }
 
 fn isolated(root: &Path, pid: u32, ours: &Environment, after: impl FnOnce()) -> Option<()> {
+    isolated_in_context(root, pid, ours, after, root_context)
+}
+
+fn isolated_in_context(
+    root: &Path,
+    pid: u32,
+    ours: &Environment,
+    after: impl FnOnce(),
+    mut context: impl FnMut(&Path) -> Option<RootContext>,
+) -> Option<()> {
     let process = root.join(pid.to_string());
     // Retain the kernel process-directory object: a replacement with the same
     // PID and a coincidentally equal start-time tick is still a different task.
@@ -187,11 +223,12 @@ fn isolated(root: &Path, pid: u32, ours: &Environment, after: impl FnOnce()) -> 
     let directory_identity = (metadata.dev(), metadata.ino());
     let before = process_identity(root, pid)?;
     let namespace = std::fs::read_link(process.join("ns/mnt")).ok()?;
-    let peer_root = identity(&process.join("root"))?;
+    let peer_root = context(&process.join("root"))?;
+    let own_root = context(Path::new("/"))?;
     let command = read_bounded(&process.join("cmdline"))?;
     // Environment paths must mean the same thing in both processes.
     if namespace != std::fs::read_link("/proc/self/ns/mnt").ok()?
-        || peer_root != identity(Path::new("/"))?
+        || peer_root.identity != own_root.identity
     {
         return None;
     }
@@ -228,7 +265,7 @@ fn isolated(root: &Path, pid: u32, ours: &Environment, after: impl FnOnce()) -> 
     (identity(&process)? == directory_identity
         && process_identity(root, pid)? == before
         && std::fs::read_link(process.join("ns/mnt")).ok()? == namespace
-        && identity(&process.join("root"))? == peer_root
+        && context(&process.join("root"))?.identity == peer_root.identity
         && read_bounded(&process.join("cmdline"))? == command
         && environment(&process.join("environ"))? == peer_env
         && state(&our_roots)? == our_state

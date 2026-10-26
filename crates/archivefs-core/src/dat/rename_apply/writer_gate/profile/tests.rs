@@ -281,3 +281,34 @@ fn duplicate_canonical_roots_from_xdg_and_home_remain_isolated() {
     ));
     assert!(f.isolated());
 }
+
+#[test]
+fn equal_root_inodes_with_different_mount_contexts_are_not_isolated() {
+    for changed_during_inspection in [false, true] {
+        let f = Fixture::new();
+        assert!(f.isolated());
+        let mut peer_observations = 0;
+        let result = isolated_in_context(
+            f.table.path(),
+            4_800_002,
+            &f.env(),
+            || {},
+            |path| {
+                let mut observed = root_context(path)?;
+                if path == f.process().join("root") {
+                    peer_observations += 1;
+                    if !changed_during_inspection || peer_observations == 2 {
+                        // Simulate a different mount object exposing the same
+                        // device/inode. No privileged mount or real data is used.
+                        observed.identity.2 += 1;
+                    }
+                }
+                Some(observed)
+            },
+        );
+        assert!(
+            result.is_none(),
+            "changed during inspection: {changed_during_inspection}"
+        );
+    }
+}
