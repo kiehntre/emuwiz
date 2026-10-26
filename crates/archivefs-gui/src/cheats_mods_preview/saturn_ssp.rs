@@ -125,6 +125,10 @@ impl State {
 }
 
 fn render(ui: &mut egui::Ui, report: &Preview) {
+    ui.label("Source optical preflight: current structure and companion hashes checked");
+    for limit in &report.optical_layout.limits {
+        ui.label(limit);
+    }
     ui.strong("Compatibility: Unknown — no verified SSP base binding");
     ui.label("An inspected ZIP and native Saturn identity do not prove that this patch fits this game or disc revision. Title/filename matches and per-file changes.md5 declarations are not disc compatibility evidence.");
     if let Some(id) = &report.manifest.system_id {
@@ -168,7 +172,7 @@ fn render(ui: &mut egui::Ui, report: &Preview) {
         },
     );
     ui.collapsing("Original optical layout evidence", |ui| {
-        for track in &report.manifest.tracks { ui.label(format!("Track {} · {:?} · {} sectors · INDEX00 {:?} · INDEX01 {} · stored pregap {:?} · generated pregap {:?} · {}", track.number, track.mode, track.sector_count, track.index_00_frame, track.index_01_frame, track.in_file_pregap_frames, track.declared_pregap_frames, track.source_file.display())); }
+        for track in &report.manifest.tracks { ui.label(format!("Track {} · {:?} · {} sectors · INDEX00 {:?} · INDEX01 {} · stored pregap {:?} · generated pregap {:?} · POSTGAP {:?} · {}", track.number, track.mode, track.sector_count, track.index_00_frame, track.index_01_frame, track.in_file_pregap_frames, track.declared_pregap_frames, track.postgap_frames, track.source_file.display())); }
         ui.label("Stored pregap bytes and declared/generated gaps remain distinct. This preview writes no tracks or CUE files and makes no byte-exact output claim.");
     });
     ui.label("Requirements: complete CUE/BIN set, native Saturn System ID, local unencrypted stored/deflated ZIP; package ≤64 MiB, expanded ≤128 MiB, ≤512 entries, metadata text ≤16 KiB, disc components ≤1 GiB. UTF-8 member names/text only. Unknown payload features remain unsupported.");

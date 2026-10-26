@@ -131,7 +131,7 @@ fn render_manifest(ui: &mut egui::Ui, manifest: &SaturnDiscManifest) {
         }
         for track in &manifest.tracks {
             ui.label(format!("Track {:02} · {:?} · {:?} · {} sectors", track.number, track.track_type, track.mode, track.sector_count));
-            ui.monospace(format!("INDEX 00 {:?} · INDEX 01 {} · pregap {:?} · postgap {:?}", track.index_00_frame, track.index_01_frame, track.in_file_pregap_frames.or(track.declared_pregap_frames), track.postgap_frames));
+            ui.monospace(format!("INDEX 00 {:?} · INDEX 01 {} · stored pregap {:?} · synthetic PREGAP {:?} · POSTGAP {:?}", track.index_00_frame, track.index_01_frame, track.in_file_pregap_frames, track.declared_pregap_frames, track.postgap_frames));
             if let Some(hash) = &track.audio_sha256 { ui.monospace(format!("Audio SHA-256: {hash}")); }
             if let Some(hash) = &track.data_logical_sha256 { ui.monospace(format!("Data logical SHA-256: {hash}")); }
         }
@@ -158,6 +158,16 @@ fn render_patch_readiness_boundary(ui: &mut egui::Ui, manifest: &SaturnDiscManif
     egui::CollapsingHeader::new("Saturn patch readiness")
         .default_open(true)
         .show(ui, |ui| {
+            let optical = archivefs_core::saturn_patch_readiness::optical::assess(manifest);
+            ui.label(if optical.refusals.is_empty() {
+                "Source optical preflight: current structure and companion hashes checked"
+            } else {
+                "Source optical preflight: refused"
+            });
+            for reason in &optical.refusals {
+                ui.colored_label(crate::ui::theme::warning(ui), reason);
+            }
+            for limit in &optical.limits { ui.label(limit); }
             ui.label("No patch selected");
             ui.label("Choose a patch to preview its source identity, target, and preservation impact.");
             ui.label("Status: Not ready");
@@ -175,4 +185,30 @@ fn render_patch_readiness_boundary(ui: &mut egui::Ui, manifest: &SaturnDiscManif
 
 fn return_issue_text(issue: &SaturnManifestIssue) -> String {
     format!("{issue:?}")
+}
+
+#[cfg(test)]
+mod optical_preflight_tests {
+    use super::*;
+    #[test]
+    fn readiness_displays_ambiguous_gap_refusal_and_evidence_limits() {
+        let root = tempfile::tempdir().unwrap();
+        let mut data = vec![b' '; 2048 * 2];
+        data[2048..2064].copy_from_slice(b"SEGA SEGASATURN ");
+        std::fs::write(root.path().join("data.bin"), data).unwrap();
+        let cue = root.path().join("disc.cue");
+        std::fs::write(&cue, "FILE \"data.bin\" BINARY\nTRACK 01 MODE1/2048\nINDEX 00 00:00:00\nINDEX 01 00:00:01\nPREGAP 00:00:01\n").unwrap();
+        let manifest = inspect_saturn_disc(&cue).unwrap();
+        let context = egui::Context::default();
+        let output = context.run(Default::default(), |ctx| {
+            egui::CentralPanel::default().show(ctx, |ui| {
+                render_patch_readiness_boundary(ui, &manifest);
+            });
+        });
+        let shapes = format!("{:?}", output.shapes);
+        assert!(shapes.contains("Source optical preflight: refused"));
+        assert!(shapes.contains("Ambiguous"));
+        assert!(shapes.contains("full disc equivalence"));
+        assert!(shapes.contains("Apply is unavailable"));
+    }
 }
