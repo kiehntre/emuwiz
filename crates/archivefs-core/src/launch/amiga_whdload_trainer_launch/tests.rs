@@ -73,6 +73,7 @@ impl Lab {
         });
         let parsed = value.slave.take().unwrap().parsed;
         value.slave = Some(SelectedWHDLoadSlave {
+            sha256: "ab".repeat(32),
             artifact_path: self.slave.clone(),
             name: "MyGame.slave".into(),
             parsed,
@@ -113,7 +114,12 @@ impl Lab {
             ));
             args
         } else {
-            preflight_amiga_whdload_launch(&plan).unwrap().arguments
+            {
+                // Ordinary FS-UAE argv now requires the authorized private boot
+                // adapter. These legacy CUSTOM strings remain display-only.
+                assert!(preflight_amiga_whdload_launch(&plan).is_err());
+                self.baseline_args()
+            }
         }
     }
 
@@ -126,10 +132,9 @@ impl Lab {
     }
 
     fn baseline_args(&self) -> Vec<OsString> {
-        build_fsuae_whdload_command_plan(&self.input(AmigaEmulatorKind::FsUae))
-            .command
-            .unwrap()
-            .arguments
+        // Historical projection used only to inspect CUSTOM serialization;
+        // never executable by the canonical preflight.
+        self.expected("MyGame.slave")
     }
 
     fn expected(&self, whdload_args: &str) -> Vec<OsString> {
@@ -433,10 +438,12 @@ fn list_values_are_checked_by_declared_number_not_list_position() {
 }
 
 #[test]
-fn the_installed_folder_is_mounted_read_only() {
+fn installed_folder_cannot_bypass_private_boot_preparation() {
     let lab = lab();
-    let baseline = lab.baseline_args();
-    assert!(baseline.contains(&OsString::from("--hard-drive-0-read-only=1")));
+    let plan = build_fsuae_whdload_command_plan(&lab.input(AmigaEmulatorKind::FsUae));
+    assert!(plan.command.as_ref().unwrap().arguments.is_empty());
+    assert!(preflight_amiga_whdload_launch(&plan).is_err());
+    lab.assert_untouched();
 }
 
 #[test]
@@ -521,7 +528,7 @@ fn a_hdf_slave_never_receives_options() {
 }
 
 #[test]
-fn an_lha_package_launches_unchanged_and_never_takes_options() {
+fn an_lha_package_never_takes_options_and_requires_private_boot() {
     let lab = lab();
     fs::write(&lab.options, b"CUSTOM1=1").unwrap();
     let package = lab.game.parent().unwrap().join("My Game.lha");
@@ -544,13 +551,10 @@ fn an_lha_package_launches_unchanged_and_never_takes_options() {
         WhdloadLaunchTrainerResolution::NotApplicable { .. }
     ));
     assert_eq!(plan, build_fsuae_whdload_command_plan(&value));
-    assert_eq!(
-        plan.command.unwrap().arguments,
-        vec![
-            lab.configuration.clone().into_os_string(),
-            OsString::from(format!("--hard-drive-0={}", package.display())),
-            OsString::from("--x-whdload-args=MyGame.slave"),
-        ]
+    assert!(plan.command.as_ref().unwrap().arguments.is_empty());
+    assert!(
+        preflight_amiga_whdload_launch(&plan).is_err(),
+        "a plain archive preview cannot bypass private boot preparation"
     );
     // Forcing a trainer onto an LHA plan is refused by the planner itself.
     lab.save(&[("Infinite lives", true)]);

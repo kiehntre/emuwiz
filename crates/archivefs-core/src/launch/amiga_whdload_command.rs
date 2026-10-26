@@ -48,6 +48,8 @@ pub struct VerifiedWHDLoadTarget {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SelectedWHDLoadSlave {
+    /// Exact bytes from the identity-bound slave inspection.
+    pub sha256: String,
     /// The exact selected artifact path for loose-install provenance.
     pub artifact_path: PathBuf,
     /// The exact slave basename passed to FS-UAE's WHDLoad bridge.
@@ -69,6 +71,8 @@ pub struct WHDLoadProfileInput {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct WHDLoadLaunchInput {
+    #[cfg(target_os = "linux")]
+    pub boot: Result<super::fsuae_whdload_boot::BootApproval, String>,
     pub identity: CanonicalIdentityStatus,
     pub target: Option<VerifiedWHDLoadTarget>,
     pub slave: Option<SelectedWHDLoadSlave>,
@@ -86,6 +90,9 @@ pub struct WHDLoadRequirements {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct AmigaWHDLoadCommand {
+    pub emulator: AmigaEmulatorKind,
+    /// FS-UAE requires private boot preparation, never a raw archive argv.
+    pub boot_request: Option<Box<WHDLoadLaunchInput>>,
     pub executable: PathBuf,
     pub arguments: Vec<OsString>,
     pub working_directory: Option<PathBuf>,
@@ -183,12 +190,21 @@ fn common_blockers(input: &WHDLoadLaunchInput, emulator: AmigaEmulatorKind) -> V
             },
         ));
     }
-    if matches!(
-        input.profile.kickstart,
-        AmigaKickstartState::Missing
-            | AmigaKickstartState::Unreadable
-            | AmigaKickstartState::NotConfigured
-    ) {
+    // The isolated FS-UAE config consumes the explicitly approved template
+    // ROM, never the live profile's ROM path. Keep the legacy firmware gate
+    // for every other route and for requests without template authority.
+    #[cfg(target_os = "linux")]
+    let template_firmware = emulator == AmigaEmulatorKind::FsUae && input.boot.is_ok();
+    #[cfg(not(target_os = "linux"))]
+    let template_firmware = false;
+    if !template_firmware
+        && matches!(
+            input.profile.kickstart,
+            AmigaKickstartState::Missing
+                | AmigaKickstartState::Unreadable
+                | AmigaKickstartState::NotConfigured
+        )
+    {
         blockers.push(blocker(
             LaunchBlockerKind::WhdloadKickstartUnavailable,
             "required Kickstart readiness gate is not satisfied",
@@ -304,12 +320,18 @@ pub fn build_amiberry_whdload_command_plan(input: &WHDLoadLaunchInput) -> AmigaW
         target.package_path.clone().into_os_string(),
     ];
     let command = AmigaWHDLoadCommand {
+        emulator: input.profile.emulator,
+        boot_request: None,
         executable: executable.clone(),
         arguments: arguments.clone(),
         working_directory: target.package_path.parent().map(Path::to_path_buf),
         preview: preview(&executable, &arguments),
         profile_id: input.profile.profile_id.clone(),
-        profile_configuration: configuration.clone(),
+        profile_configuration: input
+            .profile
+            .configuration
+            .clone()
+            .expect("configuration checked"),
         target: target.package_path.clone(),
         target_format: target.format,
         selected_slave: slave.name.clone(),
@@ -465,6 +487,18 @@ pub fn build_fsuae_whdload_command_plan_with_trainer(
             WHDLOAD_TRAINER_RUNTIME_UNSUPPORTED,
         ));
     }
+    #[cfg(target_os = "linux")]
+    if let Err(detail) = &input.boot {
+        blockers.push(blocker(
+            LaunchBlockerKind::WhdloadProfileMissing,
+            detail.clone(),
+        ));
+    }
+    #[cfg(not(target_os = "linux"))]
+    blockers.push(blocker(
+        LaunchBlockerKind::WhdloadProfileMissing,
+        "The isolated WHDLoad boot adapter requires Linux.",
+    ));
     if !blockers.is_empty() {
         return AmigaWHDLoadCommandPlan {
             command: None,
@@ -480,33 +514,23 @@ pub fn build_fsuae_whdload_command_plan_with_trainer(
         .as_ref()
         .expect("executable checked")
         .clone();
-    let configuration = input
-        .profile
-        .configuration
-        .as_ref()
-        .expect("configuration checked");
-    // The selected configuration is FS-UAE's first positional argument:
-    // FS-UAE ignores `--config=` and would start with its default setup.
-    let mut arguments = vec![
-        crate::launch::fsuae_command::fsuae_config_argument(configuration),
-        crate::launch::fsuae_command::fsuae_option("--hard-drive-0=", &target.package_path),
-    ];
-    // FS-UAE mounts a folder hard drive writable by default; the original
-    // installed game must never be modified by the emulated Amiga.
-    if target.format == WhdloadPackageFormat::InstalledDirectory {
-        arguments.push(OsString::from("--hard-drive-0-read-only=1"));
-    }
-    arguments.push(OsString::from(format!(
-        "--x-whdload-args={}",
-        fsuae_whdload_args_value(&slave.name, trainer)
-    )));
+    // Final argv exists only after the authorized inputs have been freshly
+    // revalidated and prepared in a private workspace. Never preview an LHA
+    // mount as though it were a bootable disk.
+    let arguments = Vec::new();
     let command = AmigaWHDLoadCommand {
+        emulator: input.profile.emulator,
+        boot_request: Some(Box::new(input.clone())),
         executable: executable.clone(),
         arguments: arguments.clone(),
         working_directory: None,
-        preview: preview(&executable, &arguments),
+        preview: "FS-UAE: prepare an authorized disposable WHDLoad session at Play".into(),
         profile_id: input.profile.profile_id.clone(),
-        profile_configuration: configuration.clone(),
+        profile_configuration: input
+            .profile
+            .configuration
+            .clone()
+            .expect("configuration checked"),
         target: target.package_path.clone(),
         target_format: target.format,
         selected_slave: slave.name.clone(),
@@ -527,6 +551,8 @@ pub(crate) mod tests {
 
     pub(crate) fn input(emulator: AmigaEmulatorKind) -> WHDLoadLaunchInput {
         WHDLoadLaunchInput {
+            #[cfg(target_os = "linux")]
+            boot: Ok(super::super::fsuae_whdload_boot::preview_fixture()),
             identity: CanonicalIdentityStatus::Resolved(ResolvedIdentity {
                 platform_id: "Amiga".into(),
                 game_key: "game".into(),
@@ -536,6 +562,7 @@ pub(crate) mod tests {
                 format: WhdloadPackageFormat::Lha,
             }),
             slave: Some(SelectedWHDLoadSlave {
+                sha256: "ab".repeat(32),
                 artifact_path: "/games/My Game.slave".into(),
                 name: "My Game.Slave".into(),
                 parsed: ParsedWHDLoadSlave {
@@ -587,17 +614,12 @@ pub(crate) mod tests {
         );
     }
     #[test]
-    fn fsuae_uses_profile_hard_drive_and_slave_argv() {
+    fn fsuae_defers_argv_until_private_boot_preparation() {
         let plan = build_fsuae_whdload_command_plan(&input(AmigaEmulatorKind::FsUae));
-        assert_eq!(
-            plan.command.unwrap().arguments,
-            vec![
-                // Positional: FS-UAE ignores an unknown `--config=` option.
-                OsString::from("/games/profile.uae"),
-                OsString::from("--hard-drive-0=/games/My Game.lha"),
-                OsString::from("--x-whdload-args=My Game.Slave")
-            ]
-        );
+        let command = plan.command.unwrap();
+        assert!(command.arguments.is_empty());
+        assert!(command.boot_request.is_some());
+        assert!(command.preview.contains("disposable WHDLoad"));
     }
     #[test]
     fn fsuae_without_an_emulator_configuration_explains_the_fix() {
@@ -628,23 +650,16 @@ pub(crate) mod tests {
     }
 
     #[test]
-    fn fsuae_whdload_selects_the_configuration_positionally_for_every_target() {
+    fn fsuae_whdload_never_emits_raw_package_mount_argv() {
         for value in [
             input(AmigaEmulatorKind::FsUae),
             installed(AmigaEmulatorKind::FsUae),
         ] {
-            let selected = value.profile.configuration.clone().unwrap();
-            let arguments = build_fsuae_whdload_command_plan(&value)
-                .command
-                .expect("valid FS-UAE WHDLoad plan")
-                .arguments;
-            assert_eq!(arguments[0], selected.into_os_string());
-            // FS-UAE silently ignores `--config=`; never emit it again.
-            assert!(
-                !arguments
-                    .iter()
-                    .any(|a| a.to_string_lossy().starts_with("--config")),
-                "{arguments:?}"
+            let command = build_fsuae_whdload_command_plan(&value).command.unwrap();
+            assert!(command.arguments.is_empty());
+            assert_eq!(
+                command.boot_request.as_ref().unwrap().profile.configuration,
+                value.profile.configuration
             );
         }
     }

@@ -950,6 +950,11 @@ impl AmigaWHDLoadLaunchState {
     }
 
     fn start(&mut self, request: WHDLoadLaunchInput) {
+        // Shared by Game Details and the Launch panel: a selection change
+        // must not replace the process watcher while it is still active.
+        if self.is_active() {
+            return;
+        }
         let path = request
             .target
             .as_ref()
@@ -2807,26 +2812,12 @@ pub(crate) fn multidisc_decision_with(
     }
 }
 
-fn retroarch_playlist(
+pub(crate) fn retroarch_playlist(
     candidate: &LaunchCandidate,
     retroarch: Option<&RetroArchLaunchContext>,
 ) -> Option<crate::multidisc_launch_view::PlaylistHandoff> {
     let decision = multidisc_decision(candidate, retroarch, None);
     retroarch?.multidisc.as_ref()?.handoff(&decision)
-}
-
-/// The request Play uses for `candidate`, only when RetroArch is handed that
-/// one content file (no multi-disc playlist). Features that must name files
-/// after what RetroArch loads, such as per-game bezel overrides, use this.
-pub(crate) fn single_content_retroarch_request(
-    plan: &LaunchPlan,
-    candidate: &LaunchCandidate,
-    retroarch: Option<&RetroArchLaunchContext>,
-) -> Option<RetroArchLaunchRequest> {
-    if retroarch_playlist(candidate, retroarch).is_some() {
-        return None;
-    }
-    retroarch_launch_request(plan, candidate, retroarch)
 }
 
 /// What a plain launch of `request` would hand RetroArch: see
@@ -2853,42 +2844,136 @@ fn retroarch_launch_request(
     candidate: &LaunchCandidate,
     retroarch: Option<&RetroArchLaunchContext>,
 ) -> Option<RetroArchLaunchRequest> {
+    retroarch_launch_request_unexplained(plan, candidate, retroarch).ok()
+}
+
+/// Why a candidate has no plain RetroArch launch request, from the same
+/// checks that build one, so Play, the launch page and the bezel panel
+/// explain the refusal that actually applied.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) enum RetroArchRequestRefusal {
+    /// The saved installation choice (or the program found) can't be used.
+    Installation(crate::retroarch_installation_setup::SelectionIssue),
+    /// The RetroArch program this launch was checked with has gone or
+    /// changed since; a recheck is due.
+    ProgramChanged(PathBuf),
+    NotRetroArch,
+    NotReady,
+    MultiDisc,
+    NeedsMount,
+    NotPlainFile,
+    FlatpakProfile,
+    Unconfirmed,
+}
+
+impl RetroArchRequestRefusal {
+    /// A problem with the RetroArch installation rather than the game.
+    pub(crate) fn installation_problem(&self) -> bool {
+        matches!(
+            self,
+            Self::Installation(_) | Self::ProgramChanged(_) | Self::FlatpakProfile
+        )
+    }
+
+    pub(crate) fn message(&self) -> String {
+        match self {
+            Self::Installation(issue) => issue.message(),
+            Self::ProgramChanged(path) => format!(
+                "The RetroArch program {} has changed or is no longer available since this game was checked. EmuWiz is checking RetroArch again; nothing was started.",
+                path.display()
+            ),
+            Self::NotRetroArch => "This game launches with another emulator, not RetroArch.".into(),
+            Self::NotReady => "This game's launch check has not found a ready RetroArch launch.".into(),
+            Self::MultiDisc => {
+                "This multi-disc game can't be launched safely as a single file.".into()
+            }
+            Self::NeedsMount => {
+                "This game's content has to be mounted before RetroArch can open it.".into()
+            }
+            Self::NotPlainFile => {
+                "This game is not a single plain file RetroArch opens directly (for example it is inside an archive).".into()
+            }
+            Self::FlatpakProfile => "The Flatpak RetroArch can't be used for Play or bezel Apply. Choose a native or verified AppImage installation in Emulator Setup.".into(),
+            Self::Unconfirmed => {
+                "EmuWiz can't confirm the RetroArch settings this game launches with.".into()
+            }
+        }
+    }
+}
+
+/// [`retroarch_launch_request`] with the reason when there is none. Only a
+/// refusal reads the saved installation choice: when that choice is unusable
+/// it is the reason discovery and preflight would give, so it is named
+/// instead of a game-level guess. Genuine game-format refusals stay as they
+/// are.
+pub(crate) fn retroarch_launch_request_checked(
+    plan: &LaunchPlan,
+    candidate: &LaunchCandidate,
+    retroarch: Option<&RetroArchLaunchContext>,
+) -> Result<RetroArchLaunchRequest, RetroArchRequestRefusal> {
+    use RetroArchRequestRefusal as R;
+    retroarch_launch_request_unexplained(plan, candidate, retroarch).map_err(|refusal| {
+        let game_format = matches!(
+            refusal,
+            R::MultiDisc | R::NeedsMount | R::NotPlainFile | R::NotRetroArch
+        );
+        if game_format {
+            return refusal;
+        }
+        crate::retroarch_installation_setup::current_selection_issue()
+            .map(R::Installation)
+            .unwrap_or(refusal)
+    })
+}
+
+fn retroarch_launch_request_unexplained(
+    plan: &LaunchPlan,
+    candidate: &LaunchCandidate,
+    retroarch: Option<&RetroArchLaunchContext>,
+) -> Result<RetroArchLaunchRequest, RetroArchRequestRefusal> {
+    use RetroArchRequestRefusal as R;
+    let LaunchTarget::RetroArchCore {
+        profile, core_stem, ..
+    } = &candidate.target
+    else {
+        return Err(R::NotRetroArch);
+    };
     // A supported multi-disc game whose playlist cannot be prepared safely is
     // not offered as a single-disc Play.
     if matches!(
         multidisc_decision(candidate, retroarch, None),
         archivefs_core::launch::MultiDiscLaunch::Refused { .. }
     ) {
-        return None;
+        return Err(R::MultiDisc);
     }
     let (Some(platform_id), Some(game_key)) = (&plan.platform_id, &plan.game_key) else {
-        return None;
+        return Err(R::NotReady);
     };
     if candidate.readiness != LaunchReadiness::Ready {
-        return None;
+        return Err(R::NotReady);
     }
     if !candidate.blockers.is_empty() || !candidate.warnings.is_empty() {
-        return None;
+        return Err(R::NotReady);
     }
     if candidate.content.requires_mount {
-        return None;
+        return Err(R::NeedsMount);
     }
     if candidate.content.container != Some(LaunchContainerKind::PlainFile) {
-        return None;
+        return Err(R::NotPlainFile);
     }
-    let content_path = candidate.content.resolved_path.clone()?;
-    let LaunchTarget::RetroArchCore {
-        profile, core_stem, ..
-    } = &candidate.target
-    else {
-        return None;
-    };
+    let content_path = candidate
+        .content
+        .resolved_path
+        .clone()
+        .ok_or(R::NotPlainFile)?;
     let expected_appimage_executable = match profile.profile_kind {
         ProfileKind::Native => None,
-        ProfileKind::AppImage => retroarch?.exact_appimage_executable(*profile),
-        ProfileKind::Flatpak => return None,
+        ProfileKind::AppImage => retroarch
+            .ok_or(R::Unconfirmed)?
+            .exact_appimage_executable(*profile),
+        ProfileKind::Flatpak => return Err(R::FlatpakProfile),
     };
-    Some(RetroArchLaunchRequest {
+    Ok(RetroArchLaunchRequest {
         selected_content_path: content_path.clone(),
         expected_platform_id: platform_id.clone(),
         expected_game_key: game_key.clone(),
@@ -2900,10 +2985,13 @@ fn retroarch_launch_request(
             None
         },
         expected_snapshot_evidence: if platform_id == "ZX Spectrum" {
-            let evidence = crate::emulator_setup::zx_snapshot::readiness(&content_path)?;
+            // An unproven snapshot is a game-level refusal, never an
+            // installation one.
+            let evidence =
+                crate::emulator_setup::zx_snapshot::readiness(&content_path).ok_or(R::NotReady)?;
             if !matches!(evidence.identity(), CanonicalIdentityStatus::Resolved(ref identity) if &identity.game_key == game_key)
             {
-                return None;
+                return Err(R::NotReady);
             }
             Some(evidence)
         } else {
@@ -2915,20 +3003,22 @@ fn retroarch_launch_request(
                 .environment
                 .profiles
                 .iter()
-                .find(|p| p.profile_kind == profile.profile_kind && p.scope == profile.scope)?;
+                .find(|p| p.profile_kind == profile.profile_kind && p.scope == profile.scope)
+                .ok_or(R::Unconfirmed)?;
             if selected.config_file.path.lossy {
-                return None;
+                return Err(R::Unconfirmed);
             }
             Some(PathBuf::from(&selected.config_file.path.display))
         } else {
             None
         },
-        expected_executable_binding: if retroarch.is_some() {
-            let profile = retroarch?
+        expected_executable_binding: if let Some(context) = retroarch {
+            let profile = context
                 .environment
                 .profiles
                 .iter()
-                .find(|p| p.profile_kind == profile.profile_kind && p.scope == profile.scope)?;
+                .find(|p| p.profile_kind == profile.profile_kind && p.scope == profile.scope)
+                .ok_or(R::Unconfirmed)?;
             let executable_paths: Vec<_> = if profile.profile_kind == ProfileKind::AppImage {
                 profile
                     .app_images
@@ -2939,12 +3029,15 @@ fn retroarch_launch_request(
                 profile.evidence.executables.iter().collect()
             };
             match executable_paths.as_slice() {
-                [executable] if !executable.lossy => Some(
-                    archivefs_core::launch::execution::RetroArchExecutableBinding::capture(
-                        PathBuf::from(&executable.display),
+                [executable] if !executable.lossy => {
+                    let path = PathBuf::from(&executable.display);
+                    Some(
+                        archivefs_core::launch::execution::RetroArchExecutableBinding::capture(
+                            path.clone(),
+                        )
+                        .map_err(|_| R::ProgramChanged(path))?,
                     )
-                    .ok()?,
-                ),
+                }
                 // Retain the normal preflight's actionable missing/ambiguous
                 // refusal; it never chooses the first PATH executable.
                 _ => None,
@@ -3421,6 +3514,7 @@ fn show_launch_recipe(
     rpcs3: Option<&Rpcs3LaunchContext>,
     xenia: Option<&XeniaLaunchContext>,
     melonds: Option<&MelonDsLaunchContext>,
+    readiness_override: Option<(&'static str, widgets::StatusTone)>,
 ) {
     let (emulator, profile) = target_labels(&candidate.target);
     let system = plan.platform_id.as_deref().unwrap_or("Unknown system");
@@ -3442,7 +3536,8 @@ fn show_launch_recipe(
         xenia,
         melonds,
     );
-    let readiness = readiness_label_and_tone(candidate.readiness);
+    let readiness =
+        readiness_override.unwrap_or_else(|| readiness_label_and_tone(candidate.readiness));
 
     widgets::card(ui, |ui| {
         ui.label(egui::RichText::new("Launch recipe").strong());
@@ -4596,11 +4691,18 @@ fn show_candidate(
                     ..
                 }
             );
-        let (readiness_label, readiness_tone) = if strict_mame_blocked {
-            ("Needs attention", widgets::StatusTone::Blocked)
-        } else {
-            readiness_label_and_tone(candidate.readiness)
-        };
+        // Built once and used for both the badge and Play, so the page can't
+        // say Ready while Play is withheld for an installation problem.
+        let retroarch_request = matches!(candidate.target, LaunchTarget::RetroArchCore { .. })
+            .then(|| retroarch_launch_request_checked(plan, candidate, retroarch));
+        let installation_blocked = matches!(
+            &retroarch_request,
+            Some(Err(refusal)) if refusal.installation_problem()
+        );
+        let readiness_override = (strict_mame_blocked || installation_blocked)
+            .then_some(("Needs attention", widgets::StatusTone::Blocked));
+        let (readiness_label, readiness_tone) =
+            readiness_override.unwrap_or_else(|| readiness_label_and_tone(candidate.readiness));
 
         ui.horizontal_wrapped(|ui| {
             widgets::status_badge(ui, readiness_label, readiness_tone);
@@ -4635,6 +4737,7 @@ fn show_candidate(
             rpcs3,
             xenia,
             melonds,
+            installation_blocked.then_some(("Needs attention", widgets::StatusTone::Blocked)),
         );
 
         if let Some(context) = dolphin {
@@ -4675,10 +4778,23 @@ fn show_candidate(
             ui.add_enabled(false, egui::Button::new("Launch Mesen"))
                 .on_hover_text(crate::emulator_setup::mesen::NATIVE_CONTRACT_BLOCKER);
         }
-        if let Some(request) = retroarch_launch_request(plan, candidate, retroarch) {
-            ui.add_space(6.0);
-            let playlist = retroarch_playlist(candidate, retroarch);
-            show_launch_action(ui, retroarch_launch_state, request, playlist);
+        match retroarch_request {
+            Some(Ok(request)) => {
+                ui.add_space(6.0);
+                let playlist = retroarch_playlist(candidate, retroarch);
+                show_launch_action(ui, retroarch_launch_state, request, playlist);
+            }
+            // Say why Play is withheld instead of leaving a Ready card with no
+            // action. Refusals for a candidate that never reached Ready are
+            // already explained by its blockers above.
+            Some(Err(refusal))
+                if refusal.installation_problem()
+                    || candidate.readiness == LaunchReadiness::Ready =>
+            {
+                ui.add_space(6.0);
+                ui.colored_label(ui.visuals().warn_fg_color, refusal.message());
+            }
+            _ => {}
         }
         if let Some(context) = dolphin
             && let Some(request) = dolphin_launch_request(plan, candidate, context)
@@ -5038,6 +5154,9 @@ fn show_amiga_whdload_launch_action(
         ui,
         Some(request.profile.emulator),
     );
+    if request.profile.emulator == archivefs_core::patch_manager::AmigaEmulatorKind::FsUae {
+        ui.small("Disposable WHDLoad session: new saves are discarded after exit.");
+    }
     let same_request = state.tracked.as_ref().is_some_and(|(path, adapter, _)| {
         let request_path = request
             .target
@@ -5068,13 +5187,22 @@ fn show_amiga_whdload_launch_action(
             }
             None => {}
         }
-        return;
+        if state.is_active() {
+            return;
+        }
     }
     let label = match request.profile.emulator {
         archivefs_core::patch_manager::AmigaEmulatorKind::Amiberry => "Amiberry",
         archivefs_core::patch_manager::AmigaEmulatorKind::FsUae => "FS-UAE",
     };
-    if ui.button(format!("Launch {label} WHDLoad")).clicked() {
+    let action = if same_request { "Retry" } else { "Launch" };
+    if ui
+        .add_enabled(
+            !state.is_active(),
+            egui::Button::new(format!("{action} {label} WHDLoad")),
+        )
+        .clicked()
+    {
         state.start(request);
     }
 }
@@ -5482,3 +5610,8 @@ pub(crate) fn show_dolphin_profile_guidance(ui: &mut egui::Ui, input: &LaunchRea
         }
     }
 }
+
+#[cfg(all(test, unix))]
+mod amiga_retry_tests;
+
+pub(crate) mod amiga_boot;
