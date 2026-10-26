@@ -54,5 +54,12 @@ of removal actions for unavailable entries, and no background preview on opening
 The PR records final GUI results and the independent review of the exact commit.
 
 Targeted rustfmt, diff whitespace, file scope, and GUI-root boundary guards pass.
-All Cargo work uses the worktree's private low-debug target and the shared heavy
-build lock; no target belonging to another task is reused or cleaned.
+All Cargo work uses the worktree's private low-debug target. Post-correction
+validation also holds the shared heavy build lock; no target belonging to another
+task is reused or cleaned.
+
+Independent review found that unavailable-for-verification can mean disabled or
+no longer configured even when storage is reachable. The group now names all
+three cases and retains the backend's per-entry reason. “Scan coverage
+incomplete” also avoids inventing a failed scan for a never-scanned source.
+A disabled-but-reachable synthetic fixture protects this distinction.

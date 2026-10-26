@@ -41,12 +41,12 @@ pub(super) fn group_copy(class: MissingClassification) -> (&'static str, &'stati
             "At preview time, another catalogued file looked like a possible match. A matching name or size does not prove a move. Review the candidates; nothing is relinked.",
         ),
         MissingClassification::SourceUnavailable => (
-            "Folder or drive not reachable",
-            "At preview time, the source folder could not be reached. Historical missing flags were not reverified. Reconnect it, then check again; nothing is removed.",
+            "Source unavailable for verification",
+            "At preview time, this source was unavailable for verification: disconnected, disabled, or no longer configured. Each entry explains why. Historical missing flags were not reverified; review the source and check again.",
         ),
         MissingClassification::ScanIncomplete => (
-            "Last scan did not finish",
-            "The latest scan did not establish complete coverage. Earlier missing flags are historical evidence. When you choose, run a full scan, then check again; nothing is removed.",
+            "Scan coverage incomplete",
+            "A complete scan does not cover this source: it may need a first scan, a new scan, or a game-scanning role. Earlier missing flags are historical evidence. Review the source and scan only when you choose.",
         ),
         _ => (
             "Needs review",
@@ -57,7 +57,7 @@ pub(super) fn group_copy(class: MissingClassification) -> (&'static str, &'stati
 
 fn source_state_label(state: Option<SourceHealthState>) -> &'static str {
     match state {
-        Some(SourceHealthState::Healthy) => "Reachable; latest scan complete",
+        Some(SourceHealthState::Healthy) => "Reachable; recorded scan coverage complete",
         Some(SourceHealthState::SourceUnavailable) => {
             "Unavailable or disabled; entries not verified missing"
         }
@@ -300,7 +300,7 @@ impl App {
                                 ui.label(format!("Source folder: {}", entry.source_path.display()));
                                 ui.label(format!("Last seen in catalogue: {}", entry.last_seen_at));
                                 ui.label(format!("Historically recorded missing: {}", entry.historical_missing_at.as_deref().unwrap_or("never")));
-                                ui.label(format!("Source at preview: {}", source_state_label(entry.source_health)));
+                                ui.label(format!("Storage/scan observation: {}", source_state_label(entry.source_health)));
                                 if let Some(ev) = &entry.evidence {
                                     ui.monospace(format!(
                                         "scan #{} · source generation {} · recorded {}",
@@ -510,7 +510,10 @@ mod tests {
             let output = panel_frame(&context, &mut app, size);
             assert!(visible_text(&output, "2026-10-26 10:00:00 UTC"));
             assert!(visible_text(&output, "not been freshly verified missing"));
-            assert!(visible_text(&output, "Folder or drive not reachable (2)"));
+            assert!(visible_text(
+                &output,
+                "Source unavailable for verification (2)"
+            ));
             assert!(visible_text(
                 &output,
                 "Nothing can be removed safely right now."
@@ -521,6 +524,32 @@ mod tests {
             assert!(!app.missing.confirm);
         }
         assert_eq!(f.count(), 2);
+    }
+
+    #[test]
+    fn disabled_but_reachable_source_is_explained_without_claiming_it_is_offline() {
+        let (mut f, _) = fixture();
+        assert!(f.roots[0].is_dir());
+        f.db.sync_source_enablement(&[(f.roots[0].clone(), false)])
+            .unwrap();
+        let plan = preview_at(&f.db_path(), &f.roots).unwrap();
+        assert_eq!(plan.counts.confirmed_missing, 0);
+        let entries = entries_in(&plan, MissingClassification::SourceUnavailable);
+        assert_eq!(entries.len(), 1);
+        assert!(entries[0].reason.contains("disabled"));
+        let (title, copy) = group_copy(entries[0].classification);
+        assert_eq!(title, "Source unavailable for verification");
+        assert!(copy.contains("disabled"));
+        assert!(!copy.contains("could not be reached"));
+        assert_eq!(f.count(), 2);
+    }
+
+    #[test]
+    fn incomplete_coverage_heading_does_not_invent_a_failed_scan() {
+        assert_eq!(
+            group_copy(MissingClassification::ScanIncomplete).0,
+            "Scan coverage incomplete"
+        );
     }
 
     #[test]
