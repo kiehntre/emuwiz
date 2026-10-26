@@ -87,6 +87,7 @@ pub mod homebrew_artifact;
 pub mod homebrew_catalogue;
 /// GitHub Releases provider for already-known homebrew repositories.
 pub mod homebrew_github;
+pub mod host_capability_readiness;
 mod http_agent;
 pub mod identity_attention;
 pub mod job_progress;
