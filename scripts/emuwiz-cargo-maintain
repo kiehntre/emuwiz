@@ -1625,10 +1625,10 @@ def reconcile_legacy_worktree(path, preserved_ref=None, remove=False):
         if not ok:
             raise LegacyCheckoutHold(code, explanation)
 
-    # No inherited GIT_DIR/GIT_WORK_TREE/alternates, and no replace refs that could make
-    # unmerged history look merged.
+    # No inherited GIT_DIR/GIT_WORK_TREE/alternates, and no replace refs or grafts that
+    # could make unmerged history look merged.
     git_env = {k: v for k, v in os.environ.items() if not k.startswith("GIT_")}
-    git_env.update(GIT_NO_REPLACE_OBJECTS="1", GIT_CONFIG_NOSYSTEM="1")
+    git_env.update(GIT_NO_REPLACE_OBJECTS="1", GIT_GRAFT_FILE="/nonexistent", GIT_CONFIG_NOSYSTEM="1")
 
     def git(*args):
         proc = F.run_as_owner(["git", "-C", wt, *args], capture_output=True,

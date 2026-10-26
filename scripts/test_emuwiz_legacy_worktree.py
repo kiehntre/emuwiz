@@ -317,6 +317,22 @@ class LegacyCheckout(M.MaintBase):
         self.git('-C', self.wt, 'replace', unique, main)
         self.hold('GIT_HISTORY_NOT_PRESERVED')
 
+    def test_grafts_cannot_fake_merged_history(self):
+        main = self.m.F.head_of(self.wt)
+        unique = self.commit_in_wt('unique.txt')
+        self.git('-C', self.wt, 'checkout', '-q', '--detach', main)
+        self.git('-C', self.wt, 'update-ref', 'refs/preservation/unique', unique)
+        self.git('-C', self.wt, '-c', 'user.name=t', '-c', 'user.email=t@t',
+                 'commit', '-q', '--allow-empty', '-m', 'next')
+        tip = self.m.F.head_of(self.wt)
+        self.git('-C', self.wt, 'update-ref', 'refs/remotes/origin/main', tip)
+        self.git('-C', self.wt, 'checkout', '-q', '--detach', unique)
+        common = subprocess.run(['git', '-C', self.wt, 'rev-parse', '--path-format=absolute', '--git-common-dir'],
+                                capture_output=True, text=True, check=True).stdout.strip()
+        os.makedirs(os.path.join(common, 'info'), exist_ok=True)
+        Path(common, 'info', 'grafts').write_text(f'{tip} {unique}\n')   # claims unique is on main
+        self.hold('GIT_HISTORY_NOT_PRESERVED')
+
     def test_inherited_git_dir_cannot_redirect_the_checks(self):
         main = self.m.F.head_of(self.wt)
         self.commit_in_wt('unique.txt')

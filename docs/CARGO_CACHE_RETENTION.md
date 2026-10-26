@@ -272,9 +272,11 @@ per-worktree refs (`refs/worktree`, `refs/bisect`, `refs/rewritten`), so any per
 ref refuses, and every commit named by either ID of any HEAD reflog entry or by
 `ORIG_HEAD` must be on `origin/main` or reachable from a ref (for example a
 `refs/preservation/...` ref) or the command refuses with `GIT_HISTORY_NOT_PRESERVED`.
-Git runs without inherited `GIT_*` variables and with replace refs ignored, so neither
-can make unmerged history look merged; `sequencer` counts as an unfinished operation
-and submodule changes are never ignored.
+Git runs without inherited `GIT_*` variables and with replace refs and grafts ignored,
+so none of them can make unmerged history look merged; `sequencer` counts as an
+unfinished operation and submodule changes are never ignored. `FETCH_HEAD` is not
+checked: commits named only there were fetched from a remote and are not preserved by
+this command.
 Normal campaign disposition must still identify the checkout as obsolete before
 invocation. Valuable unfinished features remain retained until a recovery decision.
 
