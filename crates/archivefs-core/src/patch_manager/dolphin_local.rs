@@ -2411,7 +2411,7 @@ fn resolve_flatpak_binding(
         ));
     }
     if !is_real_directory_local(&profile.configuration_root)
-        || !is_real_directory_local(&profile.data_root)
+        || !flatpak_data_directory_safe(&profile.data_root)
         || profile.dolphin_ini_path != expected_config.join("Dolphin.ini")
         || !is_regular_file_local(&profile.dolphin_ini_path)
     {
@@ -2453,6 +2453,18 @@ fn resolve_flatpak_binding(
         executable,
         user_directory_mode: DolphinUserDirectoryMode::DefaultNative,
     })
+}
+
+// Flatpak/Dolphin creates its default data tree lazily. It need not exist,
+// but no existing ancestor may redirect that creation through a symlink.
+fn flatpak_data_directory_safe(path: &Path) -> bool {
+    path.is_absolute()
+        && path
+            .ancestors()
+            .all(|ancestor| match fs::symlink_metadata(ancestor) {
+                Ok(metadata) => metadata.is_dir() && !metadata.file_type().is_symlink(),
+                Err(error) => error.kind() == std::io::ErrorKind::NotFound,
+            })
 }
 
 fn dolphin_launch_installation(

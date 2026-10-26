@@ -1127,6 +1127,8 @@ fn flatpak_preflight_revalidates_default_profile_and_preserves_owned_process_tra
 
 /// Explicit opt-in QA: the caller must provide a private HOME/XDG session,
 /// initialized Dolphin profile, and a disposable copy of authorised media.
+/// Set EMUWIZ_TEST_REAL_ENVIRONMENT=1 only with those private environment
+/// roots, so the global test constructor preserves the explicit QA session.
 #[test]
 #[ignore = "requires an installed Flatpak, graphical session and authorised disposable media"]
 fn dolphin_flatpak_disposable_live() {
@@ -1169,9 +1171,49 @@ fn dolphin_flatpak_disposable_live() {
     while launched.poll().is_none() {
         assert!(
             std::time::Instant::now() < deadline,
-            "owned launcher did not exit after stop"
+            "exit report is still draining; close surviving Dolphin descendants normally"
         );
         std::thread::sleep(Duration::from_millis(50));
     }
     println!("LIVE exit: {:?}", launched.poll().unwrap());
+}
+
+#[test]
+fn flatpak_launch_keeps_lazy_data_initialization_and_refuses_unsafe_ancestry() {
+    let ready = build_flatpak_fixture("flatpak-lazy-data");
+    let data = ready
+        .roots
+        .home
+        .join(".var/app/org.DolphinEmu.dolphin-emu/data/dolphin-emu");
+    fs::remove_dir(&data).unwrap();
+    fs::remove_dir(data.parent().unwrap()).unwrap();
+    assert!(
+        preflight(&ready).is_ok(),
+        "sandbox may initialise its own missing data tree"
+    );
+    assert!(
+        !data.exists(),
+        "preflight must not create profile directories"
+    );
+    fs::create_dir_all(data.parent().unwrap()).unwrap();
+    fs::write(&data, b"not a directory").unwrap();
+    assert_eq!(
+        preflight(&ready).unwrap_err().kind,
+        DolphinLaunchPreflightErrorKind::BindingUnavailable
+    );
+    fs::remove_file(&data).unwrap();
+    symlink(ready.fixture.path("missing-target"), &data).unwrap();
+    assert_eq!(
+        preflight(&ready).unwrap_err().kind,
+        DolphinLaunchPreflightErrorKind::BindingUnavailable
+    );
+    fs::remove_file(&data).unwrap();
+    fs::remove_dir(data.parent().unwrap()).unwrap();
+    let elsewhere = ready.fixture.path("elsewhere");
+    fs::create_dir(&elsewhere).unwrap();
+    symlink(&elsewhere, data.parent().unwrap()).unwrap();
+    assert_eq!(
+        preflight(&ready).unwrap_err().kind,
+        DolphinLaunchPreflightErrorKind::BindingUnavailable
+    );
 }
