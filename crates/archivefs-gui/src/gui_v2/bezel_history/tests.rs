@@ -600,3 +600,48 @@ fn blue_history_lists_gold_undo_activity_with_its_classification_and_refreshes()
     assert!(shown.contains("Bezel history & Undo"), "{shown}");
     assert!(f.destination.join("overlays/bezel.png").exists());
 }
+
+/// Job #22 (exFAT): a partly failed Apply whose automatic rollback finished
+/// is shown as refused with nothing to undo, not "needs attention"; one
+/// without the rollback marker still asks for review. Neither offers Undo,
+/// and the kept backup is visible on both.
+#[test]
+fn refused_and_rolled_back_apply_is_not_shown_as_needing_attention() {
+    let f = fixture();
+    let mut journal = f.journal.clone();
+    journal.status = SharedApplyStatus::PartialFailure;
+    journal.entries[0].backup_path = Some(SharedTransactionPath::from_path(
+        &f.backups.join("refused/override.bak"),
+    ));
+    for (id, rolled_back) in [("refused-op", true), ("unresolved-op", false)] {
+        journal.operation_id = id.into();
+        journal.timestamp_unix_seconds += 1;
+        fs::write(
+            f.history.join(format!("{id}.json")),
+            serde_json::to_vec_pretty(&journal).unwrap(),
+        )
+        .unwrap();
+        if rolled_back {
+            fs::write(f.history.join(format!("{id}.rollback.json")), b"{}").unwrap();
+        }
+    }
+    let (mut app, _guard) = app(&f);
+    let shown = render(&mut app, None);
+    assert!(shown.contains("Bezel change refused from"), "{shown}");
+    assert!(
+        shown.contains("Refused and undone automatically: no changes remain"),
+        "{shown}"
+    );
+    assert_eq!(
+        shown.matches("Bezel changes need attention from").count(),
+        1,
+        "only the unresolved record asks for review: {shown}"
+    );
+    assert_eq!(
+        shown.matches("Backup kept: ").count(),
+        2,
+        "the kept backup is shown on both records: {shown}"
+    );
+    // The successful fixture apply is the only record that offers Undo.
+    assert_eq!(shown.matches("Bezel applied from").count(), 1, "{shown}");
+}
