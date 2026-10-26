@@ -20,7 +20,8 @@ Visual references are the October 26 Sunshine `:0` captures in
   accommodating two-line labels without shifting neighboring buttons.
 - Below the desktop breakpoint, the selected game uses a compact strip with
   title and actions beside each other. Short windows use the existing page
-  scroller so both the actions and the game shelf remain reachable.
+  scroller so both the actions and the game shelf remain reachable. Classic
+  keeps its previous 900-point breakpoint and layout.
 - Health & Recovery content is bounded to 1400 points. Stacked supporting panels
   are bounded to 760 points; narrow evidence rows stack their label and value.
   Supporting text and headings have more readable sizing and casing.

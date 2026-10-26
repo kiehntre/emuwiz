@@ -48,8 +48,8 @@ const TIGHT_PANEL_HEIGHT: f32 = 440.0;
 /// the page to it rather than squeezing the shelf and the selected game.
 pub(super) const MIN_BODY_HEIGHT: f32 = 300.0;
 /// A compact selection needs space for its strip and a reachable shelf.
-pub(super) fn minimum_body_height(width: f32, selected: bool) -> f32 {
-    if selected && width < SIDE_BY_SIDE_MIN_WIDTH {
+pub(super) fn minimum_body_height(width: f32, selected: bool, blue: bool) -> f32 {
+    if blue && selected && width < SIDE_BY_SIDE_MIN_WIDTH {
         520.0
     } else {
         MIN_BODY_HEIGHT
@@ -279,7 +279,12 @@ impl App {
 
         let size = egui::vec2(page_width, ui.available_height());
         let height = size.y.max(260.0);
-        if size.x >= SIDE_BY_SIDE_MIN_WIDTH {
+        let side_by_side_min = if theme::blue_profile(ui) {
+            SIDE_BY_SIDE_MIN_WIDTH
+        } else {
+            900.0
+        };
+        if size.x >= side_by_side_min {
             let panel_width = (size.x * 0.32).clamp(340.0, 420.0);
             let gap = ui.spacing().item_spacing.x;
             let shelf_width = size.x - panel_width - gap;
@@ -864,7 +869,7 @@ impl App {
                     let heading = |this: &mut Self, ui: &mut egui::Ui| {
                         // In a short, narrow window title and actions share a strip.
                         // Stacking every piece would put Play below the footer.
-                        if compact && inner >= 600.0 {
+                        if compact && theme::blue_profile(ui) && inner >= 600.0 {
                             let remaining = inner - cover.x - gap * 2.0;
                             let title_width = remaining * 0.38;
                             let action_width = remaining - title_width;

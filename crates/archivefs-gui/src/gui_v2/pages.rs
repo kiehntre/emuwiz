@@ -627,6 +627,7 @@ impl App {
                 let minimum = super::browse_play::minimum_body_height(
                     ui.available_width(),
                     selected.is_some(),
+                    self.simple.simple_navigation(),
                 );
                 if ui.available_height() < minimum {
                     // A large size on a small window: keep the application
