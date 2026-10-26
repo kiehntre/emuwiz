@@ -125,6 +125,10 @@ pub(super) fn project(
             selected.explanation =
                 "Conflicting cartridge/core/scope origin records; no automatic association.".into();
         }
+        let represented = result
+            .records
+            .iter()
+            .any(|r| r.path == path && r.emulator == StateEmulator::RetroArch);
         let mut found = false;
         for record in result.records.iter_mut().filter(|r| {
             r.path == path
@@ -151,6 +155,31 @@ pub(super) fn project(
                 );
             }
             record.sram_origin = Some(origin);
+        }
+        // Generic inventory deliberately omits some unknown filenames. A
+        // sealed, current SRAM witness may materialize its exact artifact;
+        // neither the name nor its containing directory supplies identity.
+        if !represented && selected.state == OriginState::Associated && result.records.len() < 4096
+        {
+            let root = PersistentStateRoot::configured(
+                StateEmulator::RetroArch,
+                path.clone(),
+                Some(PersistentStateType::NativeSave),
+            );
+            let single = inventory::inventory_persistent_state(&[root]);
+            if let Some(mut record) = single.records.into_iter().find(|r| {
+                r.path == path
+                    && r.state_type == PersistentStateType::NativeSave
+                    && r.sha256.as_ref() == Some(&selected.artifact.sha256)
+                    && r.size_bytes == selected.artifact.stamp.size
+            }) && current(&selected.artifact).is_ok()
+            {
+                record.portability_class = inventory::PortabilityClass::DoNotTouch;
+                record.provenance.push_str("; exact artifact materialized from a current SRAM witness; no restore authority");
+                record.sram_origin = Some(selected.clone());
+                result.records.push(record);
+                found = true;
+            }
         }
         if !found {
             result.warnings.push(format!("SRAM evidence needs review: {} is missing, moved, unreadable, or outside the selected inventory scope. No filename search was used.",path.display()));

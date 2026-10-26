@@ -92,6 +92,16 @@ fn observe(
     mode: &str,
     eligible: std::collections::BTreeMap<PathBuf, SramOrigin>,
 ) -> protocol::Transcript {
+    observe_named(t, ctx, mode, eligible, "arbitrary-name.srm")
+}
+#[cfg(all(target_os = "linux", target_arch = "x86_64", target_env = "gnu"))]
+fn observe_named(
+    t: &Path,
+    ctx: Context,
+    mode: &str,
+    eligible: std::collections::BTreeMap<PathBuf, SramOrigin>,
+    name: &str,
+) -> protocol::Transcript {
     use std::{
         os::{
             fd::AsRawFd,
@@ -138,7 +148,7 @@ fn observe(
         .args([
             ctx.core.path.as_os_str(),
             ctx.cartridge.path.as_os_str(),
-            ctx.scope.saves.join("arbitrary-name.srm").as_os_str(),
+            ctx.scope.saves.join(name).as_os_str(),
             ctx.scope.configuration.path.as_os_str(),
             std::ffi::OsStr::new(mode),
         ])
@@ -244,7 +254,21 @@ fn association_persists_and_changed_or_conflicting_evidence_needs_review() {
         OriginState::Associated
     );
     assert!(inventory.records[0].game_identity.is_empty());
-    let sibling = ctx.scope.saves.join("historical.srm");
+    let second = observe_named(
+        t.path(),
+        ctx.clone(),
+        "normal",
+        Default::default(),
+        "save-witness.srm",
+    );
+    assert!(second.complete());
+    let second_artifact = second.artifacts.into_values().next().unwrap();
+    let mut second_receipt = receipt.clone();
+    second_receipt.session = "second".into();
+    second_receipt.origins[0].session = "second".into();
+    second_receipt.origins[0].artifact = second_artifact.clone();
+    store.publish("second.json", &second_receipt).unwrap();
+    let sibling = ctx.scope.saves.join("save-history.srm");
     fs::write(&sibling, b"unattested historical save").unwrap();
     let generic_roots = [PersistentStateRoot::configured(
         StateEmulator::RetroArch,
@@ -261,17 +285,26 @@ fn association_persists_and_changed_or_conflicting_evidence_needs_review() {
     let old_portability = generic
         .records
         .iter()
-        .find(|r| r.path == artifact.path)
+        .find(|r| r.path == second_artifact.path)
         .unwrap()
         .portability_class;
-    inventory::project(&mut generic, vec![receipt.clone()], Some(&ctx.scope));
+    assert!(generic.records.iter().all(|r| r.path != artifact.path));
+    inventory::project(&mut generic, store.receipts().unwrap(), Some(&ctx.scope));
     let attested = generic
         .records
         .iter()
         .find(|r| r.path == artifact.path)
         .unwrap();
     assert_eq!(attested.state_type, PersistentStateType::NativeSave);
-    assert_eq!(attested.portability_class, old_portability);
+    assert_eq!(attested.portability_class, PortabilityClass::DoNotTouch);
+    let classified = generic
+        .records
+        .iter()
+        .find(|r| r.path == second_artifact.path)
+        .unwrap();
+    assert_eq!(classified.state_type, PersistentStateType::NativeSave);
+    assert_eq!(classified.portability_class, old_portability);
+    assert!(classified.game_identity.is_empty());
     assert!(attested.game_identity.is_empty());
     assert_eq!(
         attested.sram_origin.as_ref().unwrap().state,
@@ -293,19 +326,19 @@ fn association_persists_and_changed_or_conflicting_evidence_needs_review() {
             .iter()
             .all(|r| r.state_type == PersistentStateType::SaveState && r.sram_origin.is_none())
     );
-    let mut conflicting = receipt.clone();
+    let mut conflicting = second_receipt.clone();
     conflicting.context.cartridge.sha256 = "conflicting cartridge".into();
     conflicting.origins[0].context = conflicting.context.clone();
     let mut uncertain = inventory_persistent_state(&generic_roots);
     inventory::project(
         &mut uncertain,
-        vec![receipt.clone(), conflicting],
+        vec![second_receipt.clone(), conflicting],
         Some(&ctx.scope),
     );
     let uncertain = uncertain
         .records
         .iter()
-        .find(|r| r.path == artifact.path)
+        .find(|r| r.path == second_artifact.path)
         .unwrap();
     assert_eq!(uncertain.state_type, PersistentStateType::Unknown);
     assert_eq!(
@@ -349,12 +382,13 @@ fn association_persists_and_changed_or_conflicting_evidence_needs_review() {
     );
     fs::rename(&moved, &artifact.path).unwrap();
     fs::write(&artifact.path, b"edited save").unwrap();
+    fs::write(&second_artifact.path, b"changed witnessed save").unwrap();
     let mut stale = inventory_persistent_state(&generic_roots);
-    inventory::project(&mut stale, vec![receipt.clone()], Some(&ctx.scope));
+    inventory::project(&mut stale, vec![second_receipt.clone()], Some(&ctx.scope));
     let stale = stale
         .records
         .iter()
-        .find(|r| r.path == artifact.path)
+        .find(|r| r.path == second_artifact.path)
         .unwrap();
     assert_eq!(stale.state_type, PersistentStateType::Unknown);
     assert_eq!(
