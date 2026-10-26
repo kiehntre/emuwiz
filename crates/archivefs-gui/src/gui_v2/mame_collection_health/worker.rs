@@ -100,6 +100,15 @@ pub(in crate::gui_v2) fn run(
         );
     }
     let dat = resolved.parsed;
+    if dat
+        .source
+        .version
+        .as_deref()
+        .and_then(archivefs_core::mame_collection_analyser::parse_version_evidence)
+        .is_none()
+    {
+        return Err("Health needs a supported declared MAME version. Import a versioned MAME -listxml catalogue; no version is guessed.".into());
+    }
     if dat.source.ecosystem != DatEcosystem::MAMEArcade
         || dat.games.is_empty()
         || dat

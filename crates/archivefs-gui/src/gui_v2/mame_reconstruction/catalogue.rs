@@ -8,8 +8,8 @@ use archivefs_core::dat::catalogue_selection::{CatalogueRef, resolve_catalogue};
 use archivefs_core::dat::mame_arcade_join::VerifiedMameDat;
 use archivefs_core::dat::model::DatEcosystem;
 use archivefs_core::dat::parsers::{mame_listxml::parse_mame_listxml, parse_dat_file};
-use archivefs_core::diagnostics::arcade_dat_version::MameVersion;
 use archivefs_core::mame_collection_analyser::inspection::SourceStamp;
+use archivefs_core::mame_collection_analyser::parse_version_evidence;
 use archivefs_core::safe_read::{TrustedRoots, open_bounded_read};
 use sha2::{Digest, Sha256};
 
@@ -147,7 +147,7 @@ pub(super) fn load_selected(
         return Err("Catalogue declares conflicting versions; Preview is refused.".into());
     }
     let version = parsed.source.version.as_deref().or(header.source.version.as_deref()).map(str::trim)
-        .filter(|v| !v.is_empty() && v.len() <= 128 && !v.chars().any(char::is_control) && MameVersion::parse(v).is_some())
+        .filter(|v| !v.is_empty() && v.len() <= 128 && !v.chars().any(char::is_control) && parse_version_evidence(v).is_some())
         .ok_or("Catalogue has no supported declared MAME version. Import a versioned MAME -listxml DAT; no version is guessed.")?.to_string();
     parsed.source.version = Some(version.clone());
     parsed.source.file_path = resolved.backing_path.display().to_string();

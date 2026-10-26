@@ -22,6 +22,9 @@ pub use storage::{
     MameMemberEvidence, MameRequirementEvidence, MameRunnability, MameStorageEvidence,
     MameVerifiedChd,
 };
+/// Parse one whole supported MAME version/build declaration, without searching
+/// unrelated text for a numeric token.
+pub use versions::parse_version_evidence;
 
 // Schema 2 could omit BAD_DUMP limitations from explicit merge providers.
 // Its persisted Good reports must be reanalysed before trusted selection.

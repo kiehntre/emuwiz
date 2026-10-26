@@ -51,6 +51,34 @@ impl Fixture {
 pub(in crate::gui_v2) const GOOD: &str = r#"<machine name="g"><description>Test Game</description><rom name="main.bin" size="11" sha1="2aae6c35c94fcfb415dbe95f408b9ce91ee846ed" crc="0d4a1185"/></machine>"#;
 
 #[test]
+fn health_requires_a_supported_declared_catalogue_version() {
+    let f = Fixture::new(GOOD);
+    f.rom("g", b"hello world");
+    for build in ["", "unknown", "untrusted 0.280", "0.280 trailing"] {
+        fs::write(
+            &f.request.catalogue_path,
+            format!("<mame build=\"{build}\">{GOOD}</mame>"),
+        )
+        .unwrap();
+        let error =
+            worker::run(f.request.clone(), &AtomicBool::new(false), &mut |_| {}).unwrap_err();
+        assert!(error.contains("declared MAME version"), "{build}: {error}");
+    }
+    fs::write(&f.request.catalogue_path, format!("<mame>{GOOD}</mame>")).unwrap();
+    assert!(worker::run(f.request.clone(), &AtomicBool::new(false), &mut |_| {}).is_err());
+    for build in ["0.174", "0.280", "0.280 (mame0280)"] {
+        fs::write(
+            &f.request.catalogue_path,
+            format!("<mame build=\"{build}\">{GOOD}</mame>"),
+        )
+        .unwrap();
+        let report = f.report();
+        assert_eq!(report.analysis.catalogue_version.as_deref(), Some(build));
+        assert_eq!(report.analysis.passing_sets, 1);
+    }
+}
+
+#[test]
 fn populated_worker_report_preserves_actual_sources_hashes_and_receipt() {
     let f = Fixture::new(GOOD);
     f.rom("g", b"hello world");
@@ -152,6 +180,39 @@ fn misleading_chd_filename_is_unverified_and_absence_is_missing() {
             .is_none()
     );
 }
+#[test]
+fn parent_stored_chd_is_present_but_not_verified_by_health_inspection() {
+    let disk = format!(r#"<disk name="disk" sha1="{}"/>"#, "a".repeat(40));
+    let xml = format!(
+        "{}<machine name=\"parent\">{disk}</machine>",
+        GOOD.replace("name=\"g\">", "name=\"g\" cloneof=\"parent\">")
+            .replace("</machine>", &format!("{disk}</machine>"))
+    );
+    let f = Fixture::new(&xml);
+    f.rom("g", b"hello world");
+    fs::create_dir(f.request.root.join("parent")).unwrap();
+    let disk_path = f.request.root.join("parent/disk.chd");
+    fs::write(&disk_path, b"presence only, not a verified CHD").unwrap();
+    let report = f.report();
+    let g = report
+        .analysis
+        .set_results
+        .iter()
+        .find(|r| r.name == "g")
+        .unwrap();
+    assert_eq!(
+        g.health,
+        archivefs_core::mame_collection_analyser::MameSetHealth::Unknown
+    );
+    assert!(g.missing_members.is_empty());
+    assert_eq!(report.analysis.chd_coverage.sets_missing_chd, 0);
+    assert_eq!(report.analysis.chd_coverage.sets_unverified_chd, 2);
+    assert_eq!(
+        fs::read(disk_path).unwrap(),
+        b"presence only, not a verified CHD"
+    );
+}
+
 #[test]
 fn malformed_software_list_and_stale_catalogue_fail_closed() {
     let f = Fixture::new(GOOD);

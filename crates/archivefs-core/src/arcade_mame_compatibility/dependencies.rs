@@ -237,28 +237,28 @@ fn validate_graph(
     expectation: &mut MameSetExpectation,
 ) {
     enum Step {
-        Enter(usize, ChainGuard),
-        Exit(usize),
+        Enter(usize, bool, ChainGuard),
+        Exit(usize, bool),
     }
-    let mut stack = vec![Step::Enter(selected, ChainGuard::default())];
+    let mut stack = vec![Step::Enter(selected, true, ChainGuard::default())];
     let mut done = BTreeSet::new();
     let mut names = BTreeSet::from([expectation.set_name.clone()]);
     while let Some(step) = stack.pop() {
-        let (index, mut guard) = match step {
-            Step::Exit(index) => {
-                done.insert(index);
+        let (index, dependencies, mut guard) = match step {
+            Step::Exit(index, dependencies) => {
+                done.insert((index, dependencies));
                 continue;
             }
-            Step::Enter(index, guard) => (index, guard),
+            Step::Enter(index, dependencies, guard) => (index, dependencies, guard),
         };
-        if done.contains(&index) {
+        if done.contains(&(index, dependencies)) {
             continue;
         }
         if guard.visit(index).is_err() {
             continue;
         } // Checked on the declaring edge below.
         let game = graph.game(index);
-        stack.push(Step::Exit(index));
+        stack.push(Step::Exit(index, dependencies));
         if game.mame_listxml_schema_version != Some(MAME_LISTXML_PARSER_SCHEMA_VERSION) {
             expectation
                 .dependencies
@@ -268,6 +268,12 @@ fn validate_graph(
             continue;
         }
         for (kind, target) in edges(game).into_iter().rev() {
+            // Lineage integrity matters for family storage, but an ancestor's
+            // unrelated BIOS/device requirements do not belong to this subject.
+            // A node reached separately through romof/device is validated fully.
+            if !dependencies && kind != DependencyKind::ParentSet {
+                continue;
+            }
             let mut outcome;
             match declared_name(&target) {
                 DeclaredName::Absent | DeclaredName::Malformed => {
@@ -284,7 +290,11 @@ fn validate_graph(
                                 Err(ChainFault::Cycle) => DependencyOutcome::Cycle,
                                 Err(ChainFault::DepthExceeded) => DependencyOutcome::Unsupported,
                                 Ok(()) => {
-                                    stack.push(Step::Enter(next, guard.clone()));
+                                    stack.push(Step::Enter(
+                                        next,
+                                        kind != DependencyKind::ParentSet,
+                                        guard.clone(),
+                                    ));
                                     DependencyOutcome::Satisfied
                                 }
                             };
@@ -324,7 +334,7 @@ fn validate_graph(
                     None,
                 ));
         }
-        if game.unsupported_structure {
+        if dependencies && game.unsupported_structure {
             expectation
                 .dependencies
                 .resolution
@@ -568,8 +578,39 @@ fn append_members<'a>(
             sha1: disk.sha1.clone(),
             status: disk.status.clone(),
             merge: disk.merge.clone(),
+            search_locations: disk_search_locations(expectation, game, disk, graph),
         });
     }
+}
+
+fn disk_search_locations(
+    expectation: &MameSetExpectation,
+    game: &DatGameEntry,
+    disk: &crate::dat::model::DatDiskEntry,
+    graph: Option<(&DependencyGraph<'_>, usize)>,
+) -> Vec<MameRomLocation> {
+    let Some(name) = disk.name.as_deref().filter(|n| !n.trim().is_empty()) else {
+        return Vec::new();
+    };
+    let mut sets = BTreeSet::from([game.name.clone()]);
+    if let Some((graph, index)) = graph {
+        sets.extend(search_chain(graph, index, true));
+        sets.extend(search_chain(graph, index, false));
+        // Required support-device disks may also live with the system.
+        if game.name != expectation.set_name {
+            sets.insert(expectation.set_name.clone());
+            if let SetRef::Unique(system) = graph.resolve_set(&expectation.set_name) {
+                sets.extend(search_chain(graph, system, true));
+                sets.extend(search_chain(graph, system, false));
+            }
+        }
+    }
+    sets.into_iter()
+        .map(|set_name| MameRomLocation {
+            set_name,
+            member_name: name.into(),
+        })
+        .collect()
 }
 
 /// Resolves an explicit `merge=` through the shared catalogue owner resolver

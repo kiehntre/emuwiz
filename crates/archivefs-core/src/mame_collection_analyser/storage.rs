@@ -355,17 +355,36 @@ fn evaluate_expectation(
         let name = disk.name.as_deref().unwrap_or("(unnamed CHD)");
         let verified: Vec<_> = chds
             .iter()
-            .filter(|d| d.set_name == disk.set_name && d.name == name)
-            .collect();
-        let containers = sets.get(disk.set_name.as_str());
-        let present = containers.is_some_and(|ss| {
-            ss.iter().any(|s| {
-                s.members
-                    .iter()
-                    .any(|m| m.name == name || m.name == format!("{name}.chd"))
+            .filter(|d| {
+                disk.search_locations.iter().any(|location| {
+                    d.set_name == location.set_name && d.name == location.member_name
+                })
             })
+            .collect();
+        let ambiguous = disk.search_locations.iter().any(|location| {
+            sets.get(location.set_name.as_str())
+                .is_some_and(|ss| ss.len() > 1)
         });
-        let content = if verified.len() > 1 || containers.is_some_and(|ss| ss.len() > 1) {
+        let present: Vec<_> = disk
+            .search_locations
+            .iter()
+            .filter(|location| {
+                sets.get(location.set_name.as_str()).is_some_and(|ss| {
+                    ss.iter().any(|s| {
+                        s.members.iter().any(|m| {
+                            m.name == location.member_name
+                                || m.name == format!("{}.chd", location.member_name)
+                        })
+                    })
+                })
+            })
+            .collect();
+        let unverified_alternative = present.iter().any(|location| {
+            !verified
+                .iter()
+                .any(|d| d.set_name == location.set_name && d.name == location.member_name)
+        });
+        let content = if verified.len() > 1 || ambiguous {
             MameMemberEvidence::Uninspectable
         } else if let Some(d) = verified.first() {
             match (
@@ -375,10 +394,14 @@ fn evaluate_expectation(
                 crate::dat::index::parse_disk_sha1(&d.verified_overall_sha1),
             ) {
                 (Some(a), Some(b)) if a == b => MameMemberEvidence::Verified,
-                (Some(_), Some(_)) => MameMemberEvidence::Contradictory,
+                // A wrong copy at one search location does not disprove a
+                // different copy whose CHD content has not been verified.
+                (Some(_), Some(_)) if !unverified_alternative => MameMemberEvidence::Contradictory,
                 _ => MameMemberEvidence::Uninspectable,
             }
-        } else if present {
+        } else if !present.is_empty() || disk.merge.is_some() {
+            // Merged disk ownership/aliases remain unsupported. Neither the
+            // filename nor an unresolved storage binding proves absence.
             MameMemberEvidence::Uninspectable
         } else {
             absent(inventory)
