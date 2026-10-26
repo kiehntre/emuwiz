@@ -969,7 +969,8 @@ pub use retroarch::{
     preview_retroarch_patch_and_cheat_destinations,
 };
 pub use retroarch_bezel::{
-    RetroArchBezelApplyError, RetroArchBezelApplyOptions, apply_retroarch_bezel_plan,
+    BezelAutomaticRollback, RetroArchBezelApplyError, RetroArchBezelApplyOptions,
+    RetroArchBezelApplyReport, apply_retroarch_bezel_plan, apply_retroarch_bezel_plan_reported,
     prepare_retroarch_bezel_plan,
 };
 pub use retroarch_cheat_library::{

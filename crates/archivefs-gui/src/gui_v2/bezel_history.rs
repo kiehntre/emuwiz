@@ -43,6 +43,29 @@ fn supported(journal: &SharedApplyJournal) -> bool {
         })
 }
 
+/// A partly failed Apply whose automatic rollback finished: its rollback
+/// marker (`<operation>.rollback.json`) sits beside the journal. Nothing it
+/// did remains, so it is a refusal, not an unresolved change.
+fn refused_and_rolled_back(journal_path: &std::path::Path, journal: &SharedApplyJournal) -> bool {
+    journal.status == SharedApplyStatus::PartialFailure && rollback_marker(journal_path)
+}
+
+/// The executor writes `<operation>.rollback.json` only after a successful
+/// rollback; the apply journal itself is never rewritten.
+fn rollback_marker(journal_path: &std::path::Path) -> bool {
+    journal_path.with_extension("rollback.json").is_file()
+}
+
+/// The backups an operation kept, for the record's own text.
+fn kept_backups(journal: &SharedApplyJournal) -> Vec<String> {
+    journal
+        .entries
+        .iter()
+        .filter_map(|entry| entry.backup_path.as_ref())
+        .map(|path| path.display.clone())
+        .collect()
+}
+
 fn preview_allowed(journal: &SharedApplyJournal) -> bool {
     supported(journal)
         && journal.status == SharedApplyStatus::Success
@@ -171,16 +194,39 @@ pub(super) fn show(ui: &mut egui::Ui, app: &mut ArchiveFsApp, global: bool) -> b
             for (path, journal) in rows.into_iter().take(200) {
                 ui.push_id(&journal.operation_id, |ui| {
                 ui.group(|ui| {
-                    ui.strong(crate::administration_pages::shared_history_title(journal));
+                    let refused = path
+                        .to_path_buf()
+                        .is_ok_and(|journal_path| refused_and_rolled_back(&journal_path, journal));
+                    let undone = !refused
+                        && path.to_path_buf().is_ok_and(|journal_path| rollback_marker(&journal_path));
+                    if undone {
+                        ui.strong(format!(
+                            "Bezel changes undone from {}",
+                            crate::administration_pages::shared_history_game_title(journal)
+                        ));
+                    } else if refused {
+                        ui.strong(format!(
+                            "Bezel change refused from {}",
+                            crate::administration_pages::shared_history_game_title(journal)
+                        ));
+                    } else {
+                        ui.strong(crate::administration_pages::shared_history_title(journal));
+                    }
                     ui.label(crate::administration_pages::format_shared_history_time(journal.timestamp_unix_seconds, std::time::SystemTime::now()));
                     let read_only = if !supported(journal) {
                         Some("Read-only: this operation has no supported bezel Undo contract.")
-                    } else if journal.rollback_operation_id.is_some() {
+                    } else if journal.rollback_operation_id.is_some() || undone {
                         Some("Already undone. This record is read-only.")
+                    } else if refused {
+                        Some("Refused and undone automatically: no changes remain, so there is nothing to undo.")
                     } else if !preview_allowed(journal) {
                         Some("Read-only: this operation did not record a completed bezel apply. Review recovery records for interrupted changes.")
                     } else { None };
                     if let Some(reason) = read_only { ui.label(reason); }
+                    // A kept backup is never hidden behind the details.
+                    for backup in kept_backups(journal) {
+                        ui.small(format!("Backup kept: {backup}"));
+                    }
                     ui.collapsing("Files and operation details", |ui| {
                         ui.monospace(&journal.operation_id);
                         ui.monospace(&journal.destination_root.display);

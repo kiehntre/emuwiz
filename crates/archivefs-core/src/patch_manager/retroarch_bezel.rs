@@ -188,10 +188,31 @@ pub fn prepare_retroarch_bezel_plan(
         .filter(|file| file.exists)
         .map(|file| file.path.clone())
         .collect();
-    plan.rollback.reason = "shared RetroArch transaction journal stores exact prior bytes".into();
+    plan.rollback.reason =
+        "Apply will keep the exact original bytes in EmuWiz's shared RetroArch journal".into();
     plan.warnings.push("Only EmuWiz-owned overlay files and this per-game override are managed; retroarch.cfg remains untouched.".into());
     crate::bezel_apply::reseal_bezel_apply_plan(&mut plan)?;
     Ok(plan)
+}
+
+/// What an Apply finally left behind, after its automatic rollback.
+#[derive(Debug)]
+pub struct RetroArchBezelApplyReport {
+    pub result: SharedApplyResult,
+    pub automatic_rollback: BezelAutomaticRollback,
+}
+
+/// The automatic rollback a partly failed Apply runs, judged by its actual
+/// result rather than by what the Apply attempted.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BezelAutomaticRollback {
+    /// The Apply did not partly fail, so nothing was rolled back.
+    NotNeeded,
+    /// Every change the Apply made was undone: no changes remain.
+    Completed,
+    /// Some changes remain. `undo_available` is whether a fresh Undo preview
+    /// of the Apply is actually available.
+    Incomplete { undo_available: bool },
 }
 
 /// Apply a sealed plan through the shared transaction/history executor.
@@ -199,6 +220,15 @@ pub fn apply_retroarch_bezel_plan(
     plan: &BezelApplyPlan,
     options: &RetroArchBezelApplyOptions,
 ) -> Result<SharedApplyResult, RetroArchBezelApplyError> {
+    apply_retroarch_bezel_plan_reported(plan, options).map(|report| report.result)
+}
+
+/// [`apply_retroarch_bezel_plan`] together with what its automatic rollback
+/// actually achieved, so callers report the final state truthfully.
+pub fn apply_retroarch_bezel_plan_reported(
+    plan: &BezelApplyPlan,
+    options: &RetroArchBezelApplyOptions,
+) -> Result<RetroArchBezelApplyReport, RetroArchBezelApplyError> {
     if plan.status != BezelApplyStatus::Ready {
         return Err(apply_error("RetroArch bezel plan is refused"));
     }
@@ -345,11 +375,15 @@ pub fn apply_retroarch_bezel_plan(
             backup_root: options.backup_root.clone(),
         },
     );
+    let mut automatic_rollback = BezelAutomaticRollback::NotNeeded;
     if result.journal.status == crate::patch_manager::SharedApplyStatus::PartialFailure {
+        automatic_rollback = BezelAutomaticRollback::Incomplete {
+            undo_available: false,
+        };
         if let Some(journal_path) = result.journal_path.as_ref() {
             let rollback = preview_shared_rollback(journal_path, config_root, &options.backup_root);
             if rollback.available {
-                let _ = execute_shared_rollback(
+                let rolled_back = execute_shared_rollback(
                     &rollback,
                     &crate::patch_manager::SharedRollbackOptions {
                         confirmation: crate::patch_manager::SharedRollbackConfirmation {
@@ -362,10 +396,27 @@ pub fn apply_retroarch_bezel_plan(
                         backup_root: options.backup_root.clone(),
                     },
                 );
+                if rolled_back.status == crate::patch_manager::SharedApplyStatus::Success {
+                    automatic_rollback = BezelAutomaticRollback::Completed;
+                }
+            }
+            if automatic_rollback != BezelAutomaticRollback::Completed {
+                // Offer Undo only if a fresh preview says it can really run.
+                automatic_rollback = BezelAutomaticRollback::Incomplete {
+                    undo_available: preview_shared_rollback(
+                        journal_path,
+                        config_root,
+                        &options.backup_root,
+                    )
+                    .available,
+                };
             }
         }
     }
-    Ok(result)
+    Ok(RetroArchBezelApplyReport {
+        result,
+        automatic_rollback,
+    })
 }
 
 /// RetroArch's per-game override for `launch`:
@@ -927,6 +978,117 @@ mod tests {
         assert!(!descriptor.exists());
         assert!(!root.path().join("overlays/bezel.png").exists());
         assert_eq!(fs::read(&main_cfg).unwrap(), main_before);
+    }
+
+    /// Job #22: where the folder cannot replace files atomically, the
+    /// override replacement is refused and the automatic rollback removes the
+    /// overlay files it had created. The report says nothing remains (so no
+    /// Undo is offered) while the backup and both journals are kept.
+    #[test]
+    fn refused_replacement_rolls_back_fully_and_reports_nothing_remaining() {
+        use crate::patch_manager::shared_transaction::{FaultPoint, inject_fault};
+        let root = tempfile::tempdir().unwrap();
+        let source = root.path().join("bezel.png");
+        fs::write(&source, b"source-bytes").unwrap();
+        let override_path = root.path().join("config/snes9x/game-id.cfg");
+        fs::create_dir_all(override_path.parent().unwrap()).unwrap();
+        let original = b"video_smooth = \"false\"\n".to_vec();
+        fs::write(&override_path, &original).unwrap();
+        let plan = prepare_retroarch_bezel_plan(&request(root.path(), &source)).unwrap();
+        let mut approved = options(root.path(), "bezel-no-exchange");
+        approved.replacement_approved = true;
+        inject_fault(Some(FaultPoint::ExchangeUnsupported));
+        let report = apply_retroarch_bezel_plan_reported(&plan, &approved).unwrap();
+        inject_fault(None);
+        assert_eq!(
+            report.result.journal.status,
+            crate::patch_manager::SharedApplyStatus::PartialFailure
+        );
+        assert_eq!(report.automatic_rollback, BezelAutomaticRollback::Completed);
+        // No changes remain.
+        assert_eq!(fs::read(&override_path).unwrap(), original);
+        assert!(!root.path().join("overlays/emuwiz-bezel.cfg").exists());
+        assert!(!root.path().join("overlays/bezel.png").exists());
+        // Recovery records are preserved.
+        let replaced = report
+            .result
+            .journal
+            .entries
+            .iter()
+            .find(|entry| entry.backup_path.is_some())
+            .expect("the override was backed up before the refusal");
+        assert!(replaced.failures.iter().any(|failure| failure.kind
+            == crate::patch_manager::SharedApplyFailureKind::AtomicReplaceUnsupported));
+        let backup = replaced
+            .backup_path
+            .as_ref()
+            .unwrap()
+            .to_path_buf()
+            .unwrap();
+        assert_eq!(fs::read(&backup).unwrap(), original);
+        let journal = report.result.journal_path.clone().unwrap();
+        assert!(journal.is_file());
+        assert!(journal.with_extension("rollback.json").is_file());
+        // Nothing is left to undo.
+        assert!(
+            !crate::patch_manager::preview_shared_rollback(
+                &journal,
+                root.path(),
+                &root.path().with_extension("backups"),
+            )
+            .available
+        );
+    }
+
+    /// If the override is changed straight after EmuWiz writes it, nothing
+    /// may be reported as fully undone: the outcome is Incomplete without a
+    /// usable Undo, never Completed.
+    #[test]
+    fn override_changed_after_publication_is_incomplete_not_completed() {
+        use crate::patch_manager::shared_transaction::set_after_publish;
+        let root = tempfile::tempdir().unwrap();
+        let source = root.path().join("bezel.png");
+        fs::write(&source, b"source-bytes").unwrap();
+        let override_path = root.path().join("config/snes9x/game-id.cfg");
+        fs::create_dir_all(override_path.parent().unwrap()).unwrap();
+        fs::write(&override_path, b"video_smooth = \"false\"\n").unwrap();
+        let plan = prepare_retroarch_bezel_plan(&request(root.path(), &source)).unwrap();
+        let mut approved = options(root.path(), "bezel-after-publish");
+        approved.replacement_approved = true;
+        let watched = override_path.clone();
+        set_after_publish(Some(Box::new(move |destination: &Path| {
+            if destination == watched {
+                fs::write(destination, b"edited by something else\n").unwrap();
+            }
+        })));
+        let report = apply_retroarch_bezel_plan_reported(&plan, &approved).unwrap();
+        set_after_publish(None);
+        assert_eq!(
+            report.automatic_rollback,
+            BezelAutomaticRollback::Incomplete {
+                undo_available: false
+            }
+        );
+        assert_eq!(
+            fs::read(&override_path).unwrap(),
+            b"edited by something else\n"
+        );
+    }
+
+    /// An ordinary successful Apply needs no automatic rollback.
+    #[test]
+    fn successful_apply_reports_no_automatic_rollback() {
+        let root = tempfile::tempdir().unwrap();
+        let source = root.path().join("bezel.png");
+        fs::write(&source, b"source-bytes").unwrap();
+        let plan = prepare_retroarch_bezel_plan(&request(root.path(), &source)).unwrap();
+        let report =
+            apply_retroarch_bezel_plan_reported(&plan, &options(root.path(), "bezel-ok")).unwrap();
+        assert_eq!(
+            report.result.journal.status,
+            crate::patch_manager::SharedApplyStatus::Success
+        );
+        assert_eq!(report.automatic_rollback, BezelAutomaticRollback::NotNeeded);
     }
 
     #[test]
