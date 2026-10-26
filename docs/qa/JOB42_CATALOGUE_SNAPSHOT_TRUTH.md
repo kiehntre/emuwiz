@@ -2,7 +2,8 @@
 
 Base: `0f941734144412d3e2103cdafee175512cf7079f` (origin/main on October 26).
 Owned areas: catalogue missing-preview evidence, cached-row wording, Blue file
-problem presentation and missing-review UI, their focused tests, and this note.
+problem presentation and missing-review UI, its Problems-page placement, their
+focused tests, and this note.
 Job #22 PR #157 owns bezel apply/history; no overlap with that scope.
 
 The reported October 26 counts (19,004 possibly moved, 13,405 source-unreachable,
@@ -46,7 +47,7 @@ environment-dependent tests were ignored. New read-only tests check unchanged
 catalogue rows/database bytes, offline and incomplete coverage, preserved
 historical timestamps, and the selection token's independence from display time.
 
-GUI validation uses `scripts/cargo-iso test --offline --locked -p archivefs-gui
+GUI validation: **52 passed**. It uses `scripts/cargo-iso test --offline --locked -p archivefs-gui
 --lib <filter>` for `gui_v2::missing_review::`, `gui_v2::problems::`,
 `catalogue_health_ui::`, and the two row-wording tests. The headless egui checks
 exercise 1024×600 and 1440×900 layouts, dated unavailable-source results, absence
@@ -63,3 +64,7 @@ no longer configured even when storage is reachable. The group now names all
 three cases and retains the backend's per-entry reason. “Scan coverage
 incomplete” also avoids inventing a failed scan for a never-scanned source.
 A disabled-but-reachable synthetic fixture protects this distinction.
+
+A broader existing Problems-page GUI check caught the explicit-check panel
+pushing the loading status below the viewport. The panel now follows loading
+and empty-state messages, preserving their visibility without starting checks.
