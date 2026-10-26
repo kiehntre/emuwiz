@@ -268,6 +268,26 @@ fn association_persists_and_changed_or_conflicting_evidence_needs_review() {
     second_receipt.origins[0].session = "second".into();
     second_receipt.origins[0].artifact = second_artifact.clone();
     store.publish("second.json", &second_receipt).unwrap();
+    protocol::check_probe_refusals(&ctx, &origin);
+    let mut probed = std::collections::BTreeMap::new();
+    probed.insert(artifact.path.clone(), origin.clone());
+    let probe = observe(t.path(), ctx.clone(), "probe", probed);
+    assert!(probe.complete(), "{:?}", probe.reason);
+    // That write refreshed file stamps; only its exact new artifact may be read.
+    let mut probe_origin = origin.clone();
+    probe_origin.artifact = probe.artifacts.into_values().next().unwrap();
+    let mut partial = std::collections::BTreeMap::new();
+    partial.insert(probe_origin.artifact.path.clone(), probe_origin.clone());
+    assert!(!observe(t.path(), ctx.clone(), "probe-only", partial).complete());
+    // The two read-gate exercises intentionally changed artifact stamps; use
+    // a fresh complete write for subsequent persistence/projection assertions.
+    let fresh = observe(t.path(), ctx.clone(), "normal", Default::default());
+    assert!(fresh.complete());
+    let artifact = fresh.artifacts.into_values().next().unwrap();
+    let mut origin = origin.clone();
+    origin.artifact = artifact.clone();
+    let mut receipt = receipt.clone();
+    receipt.origins = vec![origin.clone()];
     let sibling = ctx.scope.saves.join("save-history.srm");
     fs::write(&sibling, fs::read(&artifact.path).unwrap()).unwrap();
     let generic_roots = [PersistentStateRoot::configured(
@@ -289,7 +309,11 @@ fn association_persists_and_changed_or_conflicting_evidence_needs_review() {
         .unwrap()
         .portability_class;
     assert!(generic.records.iter().all(|r| r.path != artifact.path));
-    inventory::project(&mut generic, store.receipts().unwrap(), Some(&ctx.scope));
+    inventory::project(
+        &mut generic,
+        vec![receipt.clone(), second_receipt.clone()],
+        Some(&ctx.scope),
+    );
     let attested = generic
         .records
         .iter()
@@ -328,7 +352,11 @@ fn association_persists_and_changed_or_conflicting_evidence_needs_review() {
     );
     let overlap_roots = [generic_roots[0].clone(), known_state_roots[0].clone()];
     let mut overlap = inventory_persistent_state(&overlap_roots);
-    inventory::project(&mut overlap, store.receipts().unwrap(), Some(&ctx.scope));
+    inventory::project(
+        &mut overlap,
+        vec![receipt.clone(), second_receipt.clone()],
+        Some(&ctx.scope),
+    );
     assert!(overlap.records.iter().all(|r| {
         r.sram_origin
             .as_ref()
@@ -346,7 +374,11 @@ fn association_persists_and_changed_or_conflicting_evidence_needs_review() {
     foreign.value = Some("different cartridge identity".into());
     identity_root.identity_evidence = vec![foreign];
     let mut ownership = inventory_persistent_state(&[identity_root]);
-    inventory::project(&mut ownership, store.receipts().unwrap(), Some(&ctx.scope));
+    inventory::project(
+        &mut ownership,
+        vec![receipt.clone(), second_receipt.clone()],
+        Some(&ctx.scope),
+    );
     assert!(ownership.records.iter().all(|r| {
         r.sram_origin
             .as_ref()

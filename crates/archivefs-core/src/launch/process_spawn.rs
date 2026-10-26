@@ -497,6 +497,7 @@ pub(crate) fn spawn_watched_process_observed(
         Some(Box::new(on_start)),
         Some(Box::new(on_exit)),
         false,
+        None,
     )
 }
 

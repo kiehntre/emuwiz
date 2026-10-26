@@ -17,6 +17,11 @@ struct Pending {
     bytes: Option<Vec<u8>>,
 }
 #[derive(Default)]
+struct ReadEvidence {
+    full: Option<Vec<u8>>,
+    probes: Vec<(usize, Vec<u8>)>,
+}
+#[derive(Default)]
 pub(super) struct Transcript {
     initialized: bool,
     mapped: bool,
@@ -29,6 +34,8 @@ pub(super) struct Transcript {
     open: BTreeMap<(u32, u64), Pending>,
     read_paths: BTreeSet<PathBuf>,
     read_verified: BTreeSet<PathBuf>,
+    reads: BTreeMap<PathBuf, ReadEvidence>,
+    read_bytes: usize,
     pub artifacts: BTreeMap<PathBuf, Object>,
 }
 impl Transcript {
@@ -46,6 +53,7 @@ impl Transcript {
             && self.ended
             && !self.active
             && self.open.is_empty()
+            && self.read_paths.is_subset(&self.read_verified)
             && self.reason.is_none()
     }
     fn file(
@@ -110,17 +118,48 @@ impl Transcript {
                 if p.path != path || !p.stamp.object(&stamp) {
                     return Err("Read descriptor identity changed".into());
                 }
-                if let Some(e) = eligible.get(&path) {
-                    if e.artifact.stamp == stamp
-                        && bytes.len() as u64 == stamp.size
-                        && sha(&bytes) == e.artifact.sha256
+                let e = eligible
+                    .get(&path)
+                    .ok_or("Unattested historical SRAM read")?;
+                if e.artifact.stamp != stamp {
+                    return Err("Historical SRAM changed while being read".into());
+                }
+                let offset = flags
+                    .checked_sub(1)
+                    .ok_or("Historical SRAM read offset unavailable")?
+                    as usize;
+                let end = offset
+                    .checked_add(bytes.len())
+                    .filter(|end| *end <= stamp.size as usize && *end <= MAX_RAM)
+                    .ok_or("Historical SRAM read range exceeds sealed evidence")?;
+                if bytes.is_empty() {
+                    return Ok(());
+                }
+                self.read_bytes = self
+                    .read_bytes
+                    .checked_add(bytes.len())
+                    .filter(|n| *n <= 4 * MAX_RAM)
+                    .ok_or("Historical SRAM read evidence limit exceeded")?;
+                let input = self.reads.entry(path.clone()).or_default();
+                if offset == 0 && bytes.len() as u64 == stamp.size {
+                    if sha(&bytes) != e.artifact.sha256
+                        || input.probes.iter().any(|(offset, probe)| {
+                            bytes[*offset..*offset + probe.len()] != probe[..]
+                        })
                     {
-                        self.read_verified.insert(path);
-                    } else {
-                        return Err("Historical SRAM read did not match its sealed evidence".into());
+                        return Err("Historical SRAM read did not match its sealed evidence or prior probes".into());
+                    }
+                    input.full = Some(bytes);
+                    input.probes.clear();
+                    self.read_verified.insert(path);
+                } else if let Some(full) = &input.full {
+                    if full[offset..end] != bytes[..] {
+                        return Err(
+                            "Historical SRAM probe disagrees with verified full read".into()
+                        );
                     }
                 } else {
-                    return Err("Unattested historical SRAM read".into());
+                    input.probes.push((offset, bytes));
                 }
             }
             8 => {
@@ -328,6 +367,9 @@ pub(super) fn read(
                         };
                         return Err(why.into());
                     }
+                    if !t.read_paths.is_subset(&t.read_verified) {
+                        return Err("Historical SRAM lacked a complete verified read; probes alone establish no origin".into());
+                    }
                     t.ended = true;
                     break;
                 }
@@ -363,4 +405,112 @@ fn read_exact(s: &mut UnixStream, mut b: &mut [u8], stop: &AtomicBool) -> Result
         }
     }
     Ok(())
+}
+
+#[cfg(test)]
+pub(super) fn check_probe_refusals(ctx: &Context, origin: &SramOrigin) {
+    use std::os::unix::ffi::OsStrExt;
+    fn event(origin: &SramOrigin, flags: u32, bytes: &[u8]) -> Vec<u8> {
+        let mut out = Vec::new();
+        out.extend(4u32.to_le_bytes());
+        out.extend(flags.to_le_bytes());
+        out.extend(1u64.to_le_bytes());
+        let s = &origin.artifact.stamp;
+        for n in [
+            s.device,
+            s.inode,
+            s.size,
+            s.modified as u64,
+            s.modified_ns as u64,
+            s.changed as u64,
+            s.changed_ns as u64,
+            s.links,
+            s.mode as u64,
+            s.uid as u64,
+        ] {
+            out.extend(n.to_le_bytes());
+        }
+        let path = origin.artifact.path.as_os_str().as_bytes();
+        out.extend((path.len() as u32).to_le_bytes());
+        out.extend(path);
+        out.extend((bytes.len() as u32).to_le_bytes());
+        out.extend(bytes);
+        out
+    }
+    let eligible = BTreeMap::from([(origin.artifact.path.clone(), origin.clone())]);
+    let bytes = fs::read(&origin.artifact.path).unwrap();
+    assert!(bytes.len() > 20);
+    let open = || {
+        let mut t = Transcript::default();
+        t.file(4, &event(origin, 1, &[]), ctx, &eligible).unwrap();
+        t
+    };
+    let mut t = open();
+    t.file(5, &event(origin, 1, &bytes[..20]), ctx, &eligible)
+        .unwrap();
+    assert!(t.read_verified.is_empty());
+    t.file(5, &event(origin, 1, &bytes), ctx, &eligible)
+        .unwrap();
+    t.file(
+        5,
+        &event(origin, bytes.len() as u32 + 1, &[]),
+        ctx,
+        &eligible,
+    )
+    .unwrap();
+    assert!(t.read_paths.is_subset(&t.read_verified));
+    let mut wrong = bytes[..20].to_vec();
+    wrong[0] ^= 1;
+    let mut t = open();
+    t.file(5, &event(origin, 1, &wrong), ctx, &eligible)
+        .unwrap();
+    assert!(
+        t.file(5, &event(origin, 1, &bytes), ctx, &eligible)
+            .is_err()
+    );
+    let mut t = open();
+    t.file(5, &event(origin, 1, &bytes), ctx, &eligible)
+        .unwrap();
+    assert!(
+        t.file(5, &event(origin, 1, &wrong), ctx, &eligible)
+            .is_err()
+    );
+    let mut wrong_full = bytes.clone();
+    wrong_full[20] ^= 1;
+    assert!(
+        open()
+            .file(5, &event(origin, 1, &wrong_full), ctx, &eligible)
+            .is_err()
+    );
+    assert!(
+        open()
+            .file(
+                5,
+                &event(origin, bytes.len() as u32 + 1, &[0]),
+                ctx,
+                &eligible
+            )
+            .is_err()
+    );
+    assert!(
+        open()
+            .file(5, &event(origin, 0, &bytes), ctx, &eligible)
+            .is_err()
+    );
+    let mut changed = origin.clone();
+    changed.artifact.stamp.changed_ns += 1;
+    assert!(
+        open()
+            .file(5, &event(&changed, 1, &bytes), ctx, &eligible)
+            .is_err()
+    );
+    let mut t = open();
+    t.file(
+        5,
+        &event(origin, bytes.len() as u32 + 1, &[]),
+        ctx,
+        &eligible,
+    )
+    .unwrap();
+    assert!(t.read_verified.is_empty(), "EOF alone cannot attest a read");
 }

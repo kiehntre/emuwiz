@@ -269,21 +269,23 @@ ssize_t write(int fd,const void*b,size_t n) {
     pthread_mutex_lock(&mutex);written(fd,b,n,result,off,copy,q);free(copy);pthread_mutex_unlock(&mutex);
     inside=0;end_io();return result;
 }
-static void read_event(int fd,const void*b,size_t n){
+static void read_event(int fd,const void*b,size_t n,off_t offset){
     char path[4096];struct stat s;
-    if(related(fd,path,&s)){if(find(fd))file_event(5,fd,0,&s,path,n<=MAX_RAM?b:NULL,n<=MAX_RAM?n:0);else atomic_fetch_or(&invalid,4);}
+    if(related(fd,path,&s)){if(find(fd)){unsigned flags=offset>=0&&(uint64_t)offset<=MAX_RAM&&n<=MAX_RAM&&(uint64_t)offset+n<=MAX_RAM?(unsigned)offset+1u:0;file_event(5,fd,flags,&s,path,n<=MAX_RAM?b:NULL,n<=MAX_RAM?n:0);}else atomic_fetch_or(&invalid,4);}
 }
 size_t fread(void*b,size_t size,size_t count,FILE*f){
     ERRNO_GUARD;size_t(*real)(void*,size_t,size_t,FILE*)=real_symbol("fread");
     int fd=fileno(f);bool observe=begin_io(fd);if(observe)inside=1;
+    off_t offset=observe?ftello(f):-1;
     errno=saved_errno;size_t n=real(b,size,count,f);saved_errno=errno;
-    if(observe){pthread_mutex_lock(&mutex);if(size&&n>SIZE_MAX/size)atomic_fetch_or(&invalid,4);else read_event(fd,b,n*size);pthread_mutex_unlock(&mutex);inside=0;end_io();}return n;
+    if(observe){pthread_mutex_lock(&mutex);if(size&&n>SIZE_MAX/size)atomic_fetch_or(&invalid,4);else read_event(fd,b,n*size,offset);pthread_mutex_unlock(&mutex);inside=0;end_io();}return n;
 }
 ssize_t read(int fd,void*b,size_t z){
     ERRNO_GUARD;ssize_t(*real)(int,void*,size_t)=real_symbol("read");
     bool observe=begin_io(fd);if(observe)inside=1;
+    off_t offset=observe?lseek(fd,0,SEEK_CUR):-1;
     errno=saved_errno;ssize_t n=real(fd,b,z);saved_errno=errno;
-    if(observe){pthread_mutex_lock(&mutex);if(n>0)read_event(fd,b,(size_t)n);pthread_mutex_unlock(&mutex);inside=0;end_io();}return n;
+    if(observe){pthread_mutex_lock(&mutex);if(n>0)read_event(fd,b,(size_t)n,offset);pthread_mutex_unlock(&mutex);inside=0;end_io();}return n;
 }
 static int finish_fd(int fd,FILE*f,bool stream){
     ERRNO_GUARD;int(*realclose)(int)=real_symbol("close");int(*realfclose)(FILE*)=real_symbol("fclose");

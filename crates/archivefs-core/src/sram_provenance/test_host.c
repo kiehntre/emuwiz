@@ -23,7 +23,10 @@ int main(int argc,char **argv){
     unsigned char rom[4];FILE *in=fopen(argv[2],"rb");if(!in||fread(rom,1,4,in)!=4)return 5;fclose(in);
     struct game g={argv[2],rom,sizeof rom,NULL};if(!load(&g))return 6;
     void *ram=data(0);size_t n=size(0);
-    if(!strcmp(mode,"historical")){FILE*f=fopen(argv[3],"rb");unsigned char b[8192];if(f){fread(b,1,sizeof b,f);fclose(f);}}
+    if(!strcmp(mode,"historical")||!strcmp(mode,"probe")||!strcmp(mode,"probe-only")){
+        FILE*f=fopen(argv[3],"rb");unsigned char b[8192];
+        if(f){if(strcmp(mode,"historical")){fread(b,1,20,f);rewind(f);}if(strcmp(mode,"probe-only")){fread(b,1,sizeof b,f);fread(b,1,1,f);}fclose(f);}
+    }
     if(!strcmp(mode,"state"))state(ram,n);
     if(!strcmp(mode,"mixed"))load(&g);
     pthread_t thread;
