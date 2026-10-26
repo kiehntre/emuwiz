@@ -1576,11 +1576,9 @@ fn show_undo_confirmation_dialog(ui: &mut egui::Ui, state: &mut RepairHistoryPag
             );
             ui.add_space(6.0);
             ui.label(
-                egui::RichText::new(
-                    "This will rename the affected files back to their original paths on disk. \
-                     Each file is re-verified against its recorded identity immediately before \
-                     the reverse rename; if anything has changed, nothing is touched.",
-                )
+                egui::RichText::new(presentation::undo_confirmation_description(
+                    state.transaction_by_id(&confirmation.transaction_id),
+                ))
                 .color(theme::muted(ui)),
             );
             ui.add_space(8.0);

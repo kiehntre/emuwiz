@@ -388,3 +388,44 @@ fn exact_preview_escapes_control_characters_in_affected_paths() {
         "{labels:?}"
     );
 }
+
+#[test]
+fn blue_repair_undo_runs_through_the_native_history_controller() {
+    let f = fixture();
+    let report = f.report();
+    let opts = options(&f);
+    execute(report.repair.as_ref().unwrap(), &opts, &mut |_| {}).unwrap();
+    let mut history = crate::repair_history_page::RepairHistoryPageState::load_with_journal_dir(
+        opts.journal_dir.unwrap(),
+    );
+    let id = history.transactions[0].transaction_id.clone();
+    assert!(history.can_undo(&id));
+    let description = crate::repair_history_page::presentation::undo_confirmation_description(
+        history.transaction_by_id(&id),
+    );
+    assert!(description.contains("private recovery staging"));
+    assert!(description.contains("Original source files stay in place"));
+    history.open_undo_confirmation(&id);
+    assert_eq!(history.undo_confirm.as_ref().unwrap().transaction_id, id);
+    history.confirm_undo();
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+    while history.is_undo_running() && std::time::Instant::now() < deadline {
+        history.poll_undo();
+        std::thread::sleep(std::time::Duration::from_millis(2));
+    }
+    assert!(!history.is_undo_running());
+    assert!(history.undo_error.is_none(), "{:?}", history.undo_error);
+    assert_eq!(
+        history.undo_outcome.as_ref().unwrap().result,
+        RollbackResult::FullyRolledBack
+    );
+    assert!(!f.request.root.join("g/main.bin").exists());
+    assert_eq!(
+        std::fs::read(f.request.root.join("donor/main.bin")).unwrap(),
+        b"hello world"
+    );
+    assert_eq!(
+        history.transaction_by_id(&id).unwrap().state,
+        TransactionState::RolledBack
+    );
+}
