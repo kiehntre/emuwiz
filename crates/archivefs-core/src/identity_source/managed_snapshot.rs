@@ -260,6 +260,20 @@ pub struct HttpsManagedSourceTransport {
 
 impl Default for HttpsManagedSourceTransport {
     fn default() -> Self {
+        Self::with_resolver(SystemResolver)
+    }
+}
+
+impl HttpsManagedSourceTransport {
+    fn with_resolver<R>(resolver: R) -> Self
+    where
+        R: crate::identity_source::net_policy::HostResolver
+            + std::fmt::Debug
+            + Send
+            + Sync
+            + Clone
+            + 'static,
+    {
         let config = crate::http_agent::config(|builder| {
             builder
                 .https_only(true)
@@ -270,7 +284,10 @@ impl Default for HttpsManagedSourceTransport {
                 .timeout_recv_body(Some(IDLE_TIMEOUT))
         });
         Self {
-            agent: config.new_agent(),
+            agent: config.with_parts(
+                ureq::unversioned::transport::DefaultConnector::default(),
+                crate::mod_download_transport::PolicyResolver(resolver),
+            ),
         }
     }
 }
@@ -1270,6 +1287,40 @@ mod tests {
             summary: format!("{} bytes", body.len()),
             record_count: Some(1),
             warnings: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn connection_resolver_refuses_rebinding_and_mixed_addresses() {
+        use crate::identity_source::net_policy::{HostResolver, validate_public_https_url};
+        use std::net::IpAddr;
+        use std::sync::{Arc, Mutex};
+        #[derive(Clone, Debug)]
+        struct RebindingResolver(Arc<Mutex<Vec<Vec<IpAddr>>>>);
+        impl HostResolver for RebindingResolver {
+            fn resolve(&self, _: &str, _: u16) -> std::result::Result<Vec<IpAddr>, String> {
+                let mut answers = self.0.lock().unwrap();
+                if answers.is_empty() {
+                    return Err("unexpected extra lookup".into());
+                }
+                Ok(answers.remove(0))
+            }
+        }
+        for second in [vec!["127.0.0.1"], vec!["8.8.8.8", "169.254.169.254"]] {
+            let resolver = RebindingResolver(Arc::new(Mutex::new(vec![
+                vec!["8.8.8.8".parse().unwrap()],
+                second.iter().map(|a| a.parse().unwrap()).collect(),
+            ])));
+            let url = "https://rebind.example.test/feed.dat";
+            validate_public_https_url(url, &resolver).unwrap();
+            // Exercise the actual production agent configuration. No connection
+            // is attempted: its second DNS answer is rejected by the resolver.
+            let transport = HttpsManagedSourceTransport::with_resolver(resolver.clone());
+            assert!(matches!(
+                transport.agent.get(url).call(),
+                Err(ureq::Error::HostNotFound)
+            ));
+            assert!(resolver.0.lock().unwrap().is_empty());
         }
     }
 
