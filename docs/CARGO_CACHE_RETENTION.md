@@ -261,7 +261,9 @@ requires the normal Cargo lifecycle. Incomplete or ambiguous registry ownership 
 refuses; every checked record is considered, rather than dropping corrupt records.
 
 The checkout must be a registered secondary worktree with no Git lock/operation,
-tracked change, untracked file or ignored artifact. HEAD must be contained in
+tracked change, untracked file or ignored artifact. Index entries marked
+assume-unchanged or skip-worktree are refused because Git status can hide their
+local edits. HEAD must be contained in
 `origin/main`; for an explicitly archived unmerged branch, `--preserved-ref refs/...`
 must name an existing local branch/tag/archive/preservation ref at exactly HEAD.
 This flag preserves code; it is not evidence that a feature was integrated.
