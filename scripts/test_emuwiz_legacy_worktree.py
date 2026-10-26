@@ -263,6 +263,72 @@ class LegacyCheckout(M.MaintBase):
         T.jdump(data, record)
         self.hold('PRODUCTION_DEPLOYMENT_UNRESOLVED')
 
+    # --- history that `git worktree remove` deletes with the checkout -------------
+
+    def commit_in_wt(self, name):
+        Path(self.wt, name).write_text(name + '\n')
+        self.git('-C', self.wt, 'add', name)
+        self.git('-C', self.wt, '-c', 'user.name=t', '-c', 'user.email=t@t', 'commit', '-qm', name)
+        return self.m.F.head_of(self.wt)
+
+    def admin(self):
+        return subprocess.run(['git', '-C', self.wt, 'rev-parse', '--absolute-git-dir'],
+                              capture_output=True, text=True, check=True).stdout.strip()
+
+    def test_reflog_only_commit_holds_until_retained_by_a_ref(self):
+        main = self.m.F.head_of(self.wt)
+        self.git('-C', self.wt, 'checkout', '-q', '--detach')
+        lost = self.commit_in_wt('lost.txt')
+        self.git('-C', self.wt, 'checkout', '-q', '--detach', main)
+        self.hold('GIT_HISTORY_NOT_PRESERVED')
+        self.git('-C', self.wt, 'update-ref', 'refs/preservation/lost', lost)
+        self.assertEqual(self.check()['status'], 'CLEAR')
+
+    def test_old_id_of_the_only_surviving_reflog_entry_is_protected(self):
+        main = self.m.F.head_of(self.wt)
+        self.git('-C', self.wt, 'checkout', '-q', '--detach')
+        self.commit_in_wt('x.txt')
+        y = self.commit_in_wt('y.txt')
+        self.git('-C', self.wt, 'checkout', '-q', '--detach', main)
+        log = Path(self.admin(), 'logs', 'HEAD')
+        last = log.read_text().splitlines()[-1]
+        self.assertTrue(last.startswith(y))
+        log.write_text(last + '\n')   # expiry left only the "y -> main" entry
+        self.hold('GIT_HISTORY_NOT_PRESERVED')
+
+    def test_orig_head_must_be_an_object_id(self):
+        Path(self.admin(), 'ORIG_HEAD').write_text('--all\n')
+        self.hold('GIT_STATE_UNVERIFIED')
+
+    def test_per_worktree_refs_and_sequencer_hold(self):
+        self.git('-C', self.wt, 'update-ref', 'refs/worktree/keep', 'HEAD')
+        self.hold('GIT_HISTORY_NOT_PRESERVED')
+        self.git('-C', self.wt, 'update-ref', '-d', 'refs/worktree/keep')
+        self.git('-C', self.wt, 'update-ref', 'refs/bisect/bad', 'HEAD')
+        self.hold('GIT_HISTORY_NOT_PRESERVED')
+        self.git('-C', self.wt, 'update-ref', '-d', 'refs/bisect/bad')
+        os.mkdir(Path(self.admin(), 'sequencer'))
+        self.hold('GIT_WORKTREE_PROTECTED')
+
+    def test_replace_refs_cannot_fake_merged_history(self):
+        main = self.m.F.head_of(self.wt)
+        unique = self.commit_in_wt('unique.txt')
+        self.git('-C', self.wt, 'update-ref', 'refs/remotes/origin/main', main)
+        self.git('-C', self.wt, 'replace', unique, main)
+        self.hold('GIT_HISTORY_NOT_PRESERVED')
+
+    def test_inherited_git_dir_cannot_redirect_the_checks(self):
+        main = self.m.F.head_of(self.wt)
+        self.commit_in_wt('unique.txt')
+        self.git('-C', self.wt, 'update-ref', 'refs/remotes/origin/main', main)
+        other = Path(self.wt).parent / 'other-repo'
+        subprocess.run(['git', 'init', '-q', '-b', 'main', str(other)], check=True)
+        subprocess.run(['git', '-C', str(other), '-c', 'user.name=t', '-c', 'user.email=t@t',
+                        'commit', '-q', '--allow-empty', '-m', 'x'], check=True)
+        subprocess.run(['git', '-C', str(other), 'update-ref', 'refs/remotes/origin/main', 'HEAD'], check=True)
+        with patch.dict(os.environ, {'GIT_DIR': str(other / '.git'), 'GIT_WORK_TREE': str(self.wt)}):
+            self.hold('GIT_HISTORY_NOT_PRESERVED')
+
 
 if __name__ == '__main__':
     unittest.main()

@@ -282,3 +282,26 @@ These ordinary receipts cover **16 additional checkouts** and **2,628,493,312 al
 | `batch6-A.json` | `0c088d9bfc78c5a99d79fc0968b34b59da545f543211fd2095775cdef725cd0f` |
 | `batch6-B.json` | `62a18bb251c3fa0fafa5b79589bee6e1d3417563c1dea8ea1a1fcbc17aaecbf5` |
 | `batch6-B2.json` | `2180b104b34c4a1c585ebdc0c593b0d132ac899532f2d4f13bf86acc1f551f92` |
+
+## Post-cleanup preservation findings
+
+### Reflog-only history
+
+`git worktree remove` deletes a checkout's own HEAD reflog and `ORIG_HEAD`. None of today's removal paths (lean batches 1–6 and the 51 legacy disposals) inspected them, so commits named only there became unreferenced. No history has been lost:
+
+- No `git gc` or `git prune` has run on the shared repository since 2026-08-13 (the oldest pack index still present; a gc consolidates packs). Unreachable objects therefore still exist.
+- `git fsck --unreachable --no-reflogs` (reflogs not treated as roots) found **1,864 unreachable commits** at 08:45, before the legacy batches, and the identical set at 08:58, after them: **0** newly orphaned commits outside the snapshot, **0** missing.
+- All 1,864 are preserved in one bundle built from a private repository that only reads the shared object store through an alternate. It verifies, and its heads equal the unreachable set exactly. SHA-256 `3565e98aa1badf77c200ff095b7ad7f36ce820a702e3281e73f78474012b5c99` (7,384,339 bytes), kept with its commit list in the local ledger outside any worktree. **4** of these commits were already inside earlier preservation bundles; **1,860** are newly preserved.
+- Not establishable: which removed checkout's reflog named which commit. The reflogs are gone, so attribution cannot be reconstructed; the commit contents are preserved regardless. Most are expected to be superseded rewrites.
+- Do not run `git gc`, `git prune` or object-expiring maintenance on the shared repository until the owner has reviewed this snapshot.
+
+The legacy `worktree-reconcile` command now refuses such history (see `docs/CARGO_CACHE_RETENTION.md`).
+
+### Valuable-work guard in the ordinary batch runner
+
+Nine checkouts classified **VALUABLE UNMERGED** in an earlier inventory were removed in ordinary batches batch6-A/B after that runner's guard was relaxed to accept entries recorded in the final 2026-10-26 preservation manifest: `archivefs-dat-summary-hidden-fields`, `emuwiz-canon-rename`, `emuwiz-cue-chd-current-main`, `emuwiz-esde-rereview`, `emuwiz-internal-gold`, `emuwiz-main-release-fix`, `emuwiz-mame-chd-repair-boundary-successor`, `emuwiz-mame-family-performance` and `emuwiz-zip-reviewed-preview`. An independent read-only verification found **preservation PASS for all nine**: every off-main commit is on a retained branch and in a bundle whose SHA-256 matches the record (including all 47 off-main commits of `emuwiz-internal-gold`); every recorded tracked edit and untracked file is in a checksummed archive (all 28 for `emuwiz-internal-gold`, all 20 for `emuwiz-main-release-fix`), each tracked diff reproduces the archived bytes from HEAD, and no ignored content existed. Equality with the live files at deletion rests on the runner's own byte comparison, corroborated by earlier archive snapshots. The default protection is restored: VALUABLE UNMERGED checkouts are refused unless an individually recorded owner authorisation names that exact path.
+
+### Single disposal mechanism
+
+`worktree-reconcile` remains the only legacy disposal mechanism. A separately developed and independently reviewed tool was used only as a reference for porting the missing safeguards above; it is not published. No further legacy removals are run until this hardening is merged.
+
