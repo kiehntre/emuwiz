@@ -355,7 +355,10 @@ fn unsupported_psp_container_remains_refused() {
     let mut request = ready.request.clone();
     request.selected_content_path = path;
     let error = preflight_ppsspp_launch(&request, &ready.roots).unwrap_err();
-    assert_eq!(error.kind, PpssppLaunchPreflightErrorKind::IdentityMismatch);
+    assert_eq!(
+        error.kind,
+        PpssppLaunchPreflightErrorKind::IdentityUnresolved
+    );
 }
 
 #[test]
