@@ -253,14 +253,21 @@ checks succeed. Use this option only for conclusive task completion.
 This releases the worktree's Cargo cache for automatic retirement (idempotent; pins remain).
 The release refuses while a `cargo-iso` build holds the target's shared lifecycle lock; retry
 after it exits. It reports whether the worktree may be removed. Keep the
-worktree until `scripts/emuwiz-cargo-maintain worktree-check <worktree>` reports `CLEAR`:
-retirement verifies ownership from the source worktree, so removing the worktree first
+worktree until `scripts/emuwiz-cargo-maintain worktree-check <worktree>` reports `CLEAR`.
+Retirement verifies ownership from the source worktree, so removing the worktree first
 strands the cache for manual cleanup. There is no mandatory inactivity delay. Release only
 when the task is conclusively completed, promoted or explicitly abandoned, required commits
 and evidence are preserved, and no agent owns or expects to reuse the target. Age alone
 never authorises retirement. All process, open-handle, executable, pin, owner, path identity,
 symlink/mount, approval and audit gates remain mandatory. Never release the running GUI target. The check never removes anything. There is no automatic hook into `git worktree
 remove`; any cleanup workflow must call `worktree-check` before removing a worktree.
+
+The explicit exception for a genuinely absent historical target is
+`scripts/emuwiz-cargo-maintain worktree-reconcile <worktree> --remove`. This separate
+command repeats independent Git, ownership, pin and host-process checks under lifecycle
+locks and removes only the checkout; old cache retirement remains `UNKNOWN`. Never
+substitute a saved reconciliation result for fresh authorization. See the legacy
+reconciliation section of `docs/CARGO_CACHE_RETENTION.md`.
 
 ### Automatic completion
 

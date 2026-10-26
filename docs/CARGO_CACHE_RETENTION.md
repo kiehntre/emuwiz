@@ -242,6 +242,54 @@ exits. The gate never removes anything, and there is no hook into
 after its checks pass. Without that explicit completion attestation, postcheck never
 releases a task. Build registration durably records a task label (explicit `EMUWIZ_TASK`,
 or the canonical worktree identity); completion also records source HEAD and worktree.
+
+### Explicit reconciliation of a genuinely absent legacy target
+
+`worktree-check` continues to report `ARTIFACTS_MISSING_UNVERIFIED` when historical
+retirement cannot be proved. That cache-history result is independent of whether
+an obsolete Git checkout can now be disposed of. The separate owner-invoked path is:
+
+```
+scripts/emuwiz-cargo-maintain worktree-reconcile <wt> --json
+scripts/emuwiz-cargo-maintain worktree-reconcile <wt> --remove --json
+```
+
+Both commands return `historical_cache_retirement: UNKNOWN`. They never manufacture
+retirement receipts, edit old records or delete external cache content. Any existing
+target object (directory, file or even a dangling symlink) refuses this path and
+requires the normal Cargo lifecycle. Incomplete or ambiguous registry ownership also
+refuses; every checked record is considered, rather than dropping corrupt records.
+
+The checkout must be a registered secondary worktree with no Git lock/operation,
+tracked change, untracked file or ignored artifact. Index entries marked
+assume-unchanged or skip-worktree are refused because Git status can hide their
+local edits. HEAD must be contained in
+`origin/main`; for an explicitly archived unmerged branch, `--preserved-ref refs/...`
+must name an existing local branch/tag/archive/preservation ref at exactly HEAD.
+This flag preserves code; it is not evidence that a feature was integrated.
+Normal campaign disposition must still identify the checkout as obsolete before
+invocation. Valuable unfinished features remain retained until a recovery decision.
+
+The command checks target absence using `lstat`, exclusive target ownership, pins,
+recorded live jobs and a complete host process census for checkout and target.
+Checkout inode identities are matched against that census so hard-link, bind-mount
+and namespace aliases cannot bypass the open-handle check. Incomplete or cross-device
+checkout identity scans refuse removal.
+R2/R3 branch, path or recorded task identities retain an unresolved production
+deployment HOLD, explicitly distinguished from proof of a currently active owner.
+No deployment override is provided. Root operation requires the existing trusted
+installation and `--as-user`; Git subprocesses run entirely as that owner.
+
+`--remove` holds the target's exclusive lifecycle lock and registry metadata lock,
+records an intent, repeats all checks, then invokes `git worktree remove` without
+`--force`. It records `CHECKOUT_REMOVED` only after Git succeeds. An eligibility
+result or historical intent is never read as reusable authorization: every call
+revalidates target recreation, ownership, Git state and process references. Current
+same-account nonparticipating writers cannot be prevented by Cargo locks; normal
+Git refusal and immediate rechecks remain necessary. Reconciliation does not prove
+that an old cache deletion was safe and does not weaken the cache retirement engine.
+
+Focused synthetic regressions: `python3 scripts/test_emuwiz_legacy_worktree.py`.
 A later wrapper build removes the release, including after successful retirement.
 
 ### Policy, budgets, cycle
@@ -335,7 +383,7 @@ the same rules whenever they start as root:
   no capabilities. The registry (`$EMUWIZ_RETENTION_DIR`, default `$HOME/.cache/emuwiz-cargo-retention`)
   and, for the maintenance commands, the target root must be real directories owned by OWNER.
 - **Limited commands.** As root, `emuwiz-cargo-maintain` accepts only `status`, `plan`, `run`,
-  `history`, `worktree-check`, `units` and `verify-install`; policy changes, `task-complete` and
+  `history`, `worktree-check`, `worktree-reconcile`, `units` and `verify-install`; policy changes, `task-complete` and
   `admit` are owner actions. `EMUWIZ_RETENTION_NOW` is refused.
 - **Locks.** Lifecycle and registry locks are opened with `O_NOFOLLOW` and must be regular files owned
   by the acting user; otherwise the target is HELD (`LIFECYCLE_LOCK_UNAVAILABLE` / `LOCK_STATE_UNKNOWN`).
@@ -407,7 +455,9 @@ Admission is advisory and cannot guarantee a physical cap. The policy, enable re
 evidence are protected by ownership, permissions and unkeyed SHA-256 digests plus a cross-checked
 history: this is structural verification, not authenticity. Anyone controlling the approving account
 (or root) can forge a self-consistent set. Worktrees whose build produced no output are held rather
-than guessed clear (`ARTIFACTS_MISSING_UNVERIFIED`) and need a human review.
+than guessed clear (`ARTIFACTS_MISSING_UNVERIFIED`) and need a human review. For a
+genuinely absent legacy target, the independent checkout reconciliation above can
+permit Git checkout disposal while keeping that historical uncertainty explicit.
 
 ## Required before hard enforcement or deletion (phase 2+)
 

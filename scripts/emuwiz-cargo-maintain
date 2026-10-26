@@ -28,6 +28,8 @@ Commands
   task-complete              release this worktree's cache (idempotent), then report
                              whether the worktree may be removed (explicit invocation)
   worktree-check PATH        CLEAR/HOLD gate: remove a worktree only on CLEAR
+  worktree-reconcile PATH    explicit independent checkout gate for an absent
+                             legacy target; history stays UNKNOWN; --remove uses Git
   admit --target DIR         admission check used by cargo-iso for cold targets
   units                      print the systemd service/timer units for the root-owned
                              installed copy (installs and enables nothing)
@@ -1603,6 +1605,183 @@ def cmd_worktree_check(args):
     return 0 if res["status"] == "CLEAR" else EXIT_WORKTREE_HOLD
 
 
+class LegacyCheckoutHold(Exception):
+    def __init__(self, code, explanation):
+        self.code, self.explanation = code, explanation
+
+
+def reconcile_legacy_worktree(path, preserved_ref=None, remove=False):
+    """Separate checkout authorization, never a Cargo-retirement receipt.
+
+    Only genuinely absent targets qualify. No saved outcome is consumed as future
+    authorization: every invocation repeats the checks, under the existing target
+    and registry locks. The normal gate and the cache deletion engine are untouched.
+    """
+    wt, target = target_for_worktree(path)
+    result = dict(worktree=wt, target=target, historical_cache_retirement="UNKNOWN",
+                  status="HOLD", outcome="NOT_REMOVED")
+
+    def require(ok, code, explanation):
+        if not ok:
+            raise LegacyCheckoutHold(code, explanation)
+
+    def git(*args):
+        proc = F.run_as_owner(["git", "-C", wt, *args], capture_output=True,
+                              text=True, timeout=30)
+        require(proc.returncode == 0, "GIT_STATE_UNVERIFIED", proc.stderr.strip())
+        return proc.stdout.strip()
+
+    def absent():
+        # exists/isdir would misclassify dangling symlinks and permission failures.
+        try:
+            os.lstat(target)
+        except FileNotFoundError:
+            require(os.path.isdir(os.path.dirname(target)) and
+                    os.path.realpath(os.path.dirname(target)) == os.path.dirname(target),
+                    "TARGET_PATH_UNVERIFIED", "target parent must exist without symlink aliases")
+            return
+        raise LegacyCheckoutHold("TARGET_PRESENT_USE_NORMAL_LIFECYCLE",
+                                 "a target object exists; use normal Cargo lifecycle rules")
+
+    def checkout():
+        require(os.path.abspath(path) == wt and os.path.isdir(wt),
+                "CHECKOUT_PATH_UNVERIFIED", "checkout must be its existing canonical path")
+        require(git("rev-parse", "--show-toplevel") == wt,
+                "CHECKOUT_PATH_UNVERIFIED", "path is not a Git checkout root")
+        listing = git("worktree", "list", "--porcelain")
+        blocks = [dict(line.partition(" ")[::2] for line in b.splitlines())
+                  for b in listing.split("\n\n")]
+        rows = [b for b in blocks if b.get("worktree") == wt]
+        require(len(rows) == 1 and not any(k in rows[0] for k in ("locked", "prunable")),
+                "GIT_WORKTREE_PROTECTED", "checkout must be registered, unlocked and not prunable")
+        admin = git("rev-parse", "--absolute-git-dir")
+        common = git("rev-parse", "--path-format=absolute", "--git-common-dir")
+        require(admin != common, "GIT_WORKTREE_PROTECTED", "never reconcile the main checkout")
+        require(not any(os.path.lexists(os.path.join(admin, n)) for n in
+                        ("index.lock", "HEAD.lock", "MERGE_HEAD", "CHERRY_PICK_HEAD", "REVERT_HEAD",
+                         "rebase-merge", "rebase-apply", "BISECT_START")),
+                "GIT_WORKTREE_PROTECTED", "unfinished Git operation or lock")
+        tracked = git("ls-files", "-v", "-z").split("\0")
+        require(not any(line and (line[0].islower() or line[0] == "S") for line in tracked),
+                "CHECKOUT_INDEX_UNVERIFIED", "assume-unchanged or skip-worktree entries can hide unfinished code")
+        require(not git("status", "--porcelain=v1", "--untracked-files=all", "--ignored=matching"),
+                "CHECKOUT_NOT_CLEAN", "tracked, untracked or ignored files require preservation")
+        head = git("rev-parse", "HEAD")
+        main = git("rev-parse", "--verify", "refs/remotes/origin/main^{commit}")
+        merged = F.run_as_owner(["git", "-C", wt, "merge-base", "--is-ancestor", head, main],
+                                capture_output=True, text=True, timeout=30).returncode == 0
+        preserved = None
+        if not merged:
+            require(isinstance(preserved_ref, str) and preserved_ref.startswith(("refs/heads/", "refs/tags/", "refs/preservation/", "refs/archive/")),
+                    "GIT_HISTORY_NOT_PRESERVED", "unmerged HEAD needs an explicit retained local ref")
+            preserved = git("rev-parse", "--verify", preserved_ref + "^{commit}")
+            require(preserved == head, "GIT_HISTORY_NOT_PRESERVED", "preserved ref must name exact HEAD")
+        st = os.stat(wt)
+        return dict(head=head, branch=rows[0].get("branch", ""), main=main,
+                    preserved_ref=preserved_ref, preserved_head=preserved,
+                    checkout_identity=[st.st_dev, st.st_ino])
+
+    def ownership(registry, key, branch):
+        records = []
+        # all_records() silently drops corrupt records: that cannot prove exclusivity.
+        for name in sorted(os.listdir(os.path.join(registry.root, "targets"))):
+            if not name.endswith(".json"):
+                continue
+            filename = registry.path("targets", name[:-5])
+            st = os.lstat(filename)
+            state, record = registry.read_checked("targets", name[:-5], F.valid_target_record)
+            require(stat.S_ISREG(st.st_mode) and st.st_uid == os.geteuid() and state == "ok",
+                    "TARGET_OWNERSHIP_UNVERIFIED", "unreadable, aliased or malformed registry record")
+            require(record["target"] == os.path.normpath(record["target"]) and
+                    os.path.isabs(record["target"]) and name[:-5] == F.key_for(record["target"]) and
+                    record.get("key", name[:-5]) == name[:-5],
+                    "TARGET_OWNERSHIP_UNVERIFIED", "record target/key identity is inconsistent")
+            if record.get("worktree") and os.path.realpath(record["worktree"]) == wt:
+                require(record["target"] == target, "TARGET_OWNERSHIP_UNVERIFIED",
+                        "checkout also owns a different recorded target")
+            if os.path.realpath(record["target"]) == target:
+                require(record.get("worktree") == wt, "TARGET_OWNERSHIP_UNVERIFIED",
+                        "target is shared or claimed by another checkout")
+                records.append(record)
+        require(len(records) <= 1, "TARGET_OWNERSHIP_UNVERIFIED", "target has multiple owners")
+        state, pins = registry.pin_state(key)
+        require(state != "invalid", "PIN_STATE_UNKNOWN", "pin record is unreadable or malformed")
+        require(not pins, "PINNED", "target retains an explicit pin")
+        for record in records:
+            for entry in record.get("active", []):
+                require(entry.get("boot_id") is not None and entry.get("starttime") is not None,
+                        "RECORDED_BUILD_UNVERIFIED", "recorded build identity cannot be resolved")
+                require(not (entry["boot_id"] == F.boot_id() and
+                             F.proc_starttime(entry["pid"]) == entry["starttime"]),
+                        "RECORDED_BUILD_ALIVE", "recorded Cargo build is still alive")
+        identities = [wt, branch] + [str(r.get(k) or "") for r in records
+                                     for k in ("task", "worktree")]
+        if any(re.search(r"(?:^|[/_-])r[23](?:$|[/_-])", value, re.I) for value in identities):
+            result["deployment_conditions"] = "UNKNOWN"
+            raise LegacyCheckoutHold("PRODUCTION_DEPLOYMENT_UNRESOLVED",
+                                     "R2/R3 deployment and ownership conditions need independent resolution; this is not proof of a live owner")
+        census = F.Census([wt, target])
+        measured = F.measure_tree(wt, set(), with_identities=True)
+        require(not measured["errors"] and not measured["cross_device"],
+                "CHECKOUT_IDENTITIES_UNVERIFIED", "checkout inode identities could not be completely inspected")
+        census.match_inodes(measured["identities"], wt)
+        require(not census.unreadable_foreign, "INCOMPLETE_PROCESS_VISIBILITY",
+                "cannot independently exclude host process references")
+        require(not census.refs.get(wt) and not census.refs.get(target),
+                "LIVE_PROCESS_REFERENCE", "a process references the checkout or target")
+
+    try:
+        absent()
+        registry = F.Registry(create=True)
+        key = F.key_for(target)
+        with contextlib.ExitStack() as stack:
+            # Same ordering as task completion: target lock, then metadata lock.
+            for lockpath in (registry.lifecycle_lock_path(key), os.path.join(registry.root, "locks", "registry.meta")):
+                fd = F.open_lock_file(lockpath, os.O_RDWR | os.O_CREAT)
+                stack.callback(os.close, fd)
+                try:
+                    fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                except BlockingIOError:
+                    raise LegacyCheckoutHold("LIFECYCLE_LOCKED", "build or registry ownership transition is in progress")
+            absent()
+            snapshot = checkout()
+            ownership(registry, key, snapshot["branch"])
+            result.update(snapshot, status="CLEAR", code="LEGACY_ABSENT_TARGET_RECONCILED",
+                          outcome="CHECKOUT_ELIGIBLE", explanation="independent checkout checks passed; historical cache retirement remains UNKNOWN")
+            if remove:
+                event = dict(result, event="legacy_checkout_reconciliation", outcome="CHECKOUT_REMOVAL_INTENT")
+                append_history(event)
+                # An intent is evidence, never reusable authorization. Revalidate after publication.
+                absent()
+                ownership(registry, key, snapshot["branch"])
+                # Census can take time; ignored QA evidence appearing during it must
+                # be found before Git, which otherwise silently removes ignored files.
+                require(checkout() == snapshot, "CHECKOUT_CHANGED", "checkout or preservation ref changed")
+                absent()
+                git("worktree", "remove", wt)  # intentionally never --force
+                result["outcome"] = "CHECKOUT_REMOVED"
+                append_history(dict(result, event="legacy_checkout_reconciliation"))
+    except LegacyCheckoutHold as error:
+        result.update(status="HOLD", code=error.code, explanation=error.explanation)
+        if result["outcome"] != "CHECKOUT_REMOVED":
+            result["outcome"] = "NOT_REMOVED"
+    except (OSError, ValueError, subprocess.SubprocessError) as error:
+        result.update(status="HOLD", code="RECONCILIATION_UNVERIFIED", explanation=str(error))
+        if result["outcome"] != "CHECKOUT_REMOVED":
+            result["outcome"] = "NOT_REMOVED"
+    return result
+
+
+def cmd_worktree_reconcile(args):
+    result = reconcile_legacy_worktree(args.worktree, args.preserved_ref, args.remove)
+    if args.json:
+        print(json.dumps(result, indent=1, sort_keys=True))
+    else:
+        print(f"{result['status']}: {result['worktree']}: {result['code']}; historical cache retirement UNKNOWN")
+        print("  " + result["explanation"])
+    return 0 if result["status"] == "CLEAR" else EXIT_WORKTREE_HOLD
+
+
 def cmd_task_complete(args):
     """The explicit task-completion step: release the cache (idempotent) while the
     worktree still exists, then report whether the worktree may be removed.  It does
@@ -1897,7 +2076,7 @@ def cmd_verify_install(args):
 # ---------------------------------------------------------- privileged start
 
 
-PRIVILEGED_COMMANDS = ("status", "plan", "run", "history", "worktree-check", "units", "verify-install")
+PRIVILEGED_COMMANDS = ("status", "plan", "run", "history", "worktree-check", "worktree-reconcile", "units", "verify-install")
 
 
 def enter_privileged(args):
@@ -1963,6 +2142,12 @@ def build_parser():
     wc.add_argument("worktree")
     wc.add_argument("--json", action="store_true")
     wc.set_defaults(func=cmd_worktree_check)
+    wr = sub.add_parser("worktree-reconcile", help="independent legacy checkout reconciliation; never claims cache retirement")
+    wr.add_argument("worktree")
+    wr.add_argument("--preserved-ref", help="explicit retained local ref naming exact unmerged HEAD")
+    wr.add_argument("--remove", action="store_true", help="recheck under lifecycle locks and run git worktree remove without force")
+    wr.add_argument("--json", action="store_true")
+    wr.set_defaults(func=cmd_worktree_reconcile)
     tc = sub.add_parser("task-complete", help="release this worktree's cache (idempotent) and report whether it may be removed")
     tc.add_argument("--worktree", default=os.getcwd())
     tc.add_argument("--task")
