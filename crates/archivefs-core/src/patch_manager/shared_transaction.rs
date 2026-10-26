@@ -289,6 +289,9 @@ pub enum SharedApplyFailureKind {
     /// The file being displaced had changed and could not be put back: ours
     /// is published and the displaced file is kept under the temporary name.
     DisplacedFileKept,
+    /// EmuWiz's file was published, but the destination no longer matched
+    /// it when checked straight afterwards: something changed it.
+    PublishedUnverified,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -2143,6 +2146,10 @@ fn publication_failure(
                 temp.map_or_else(|| "an unknown temporary name".into(), |path| path.display().to_string())
             ),
         ),
+        SharedApplyFailureKind::PublishedUnverified => (
+            SharedApplyOutcome::VerificationFailed,
+            "EmuWiz wrote this file, but it changed straight afterwards, so the result could not be confirmed. Review it before retrying".into(),
+        ),
         _ => (SharedApplyOutcome::WriteFailed, "atomic destination write failed".into()),
     }
 }
@@ -2357,10 +2364,17 @@ pub fn execute_shared_rollback(
         if halted_by.is_none() {
             halted_by = processed.iter().copied().find(|&done| {
                 original.entries[done].outcome == SharedApplyOutcome::ReplacedExisting
-                    && applied.entries[done].outcome != SharedRollbackOutcome::RestoredBackup
+                    && !matches!(
+                        applied.entries[done].outcome,
+                        SharedRollbackOutcome::RestoredBackup
+                            | SharedRollbackOutcome::NoChangeRequired
+                    )
             });
         }
         if halted_by.is_some() {
+            if let Some(entry) = durable.entries.get_mut(index) {
+                entry.state = SharedEntryRecoveryState::NeedsReview;
+            }
             let kept = &mut applied.entries[index];
             kept.outcome = SharedRollbackOutcome::Retained;
             kept.failure = Some(SharedApplyFailure {
@@ -2371,6 +2385,16 @@ pub fn execute_shared_rollback(
             continue;
         }
         processed.push(index);
+        // The fresh preview found this replaced file already back to its
+        // backup (an earlier, partly finished Undo): nothing to do here.
+        if applied.entries[index].outcome == SharedRollbackOutcome::NoChangeRequired
+            && original.entries[index].outcome == SharedApplyOutcome::ReplacedExisting
+        {
+            if let Some(entry) = durable.entries.get_mut(index) {
+                entry.state = SharedEntryRecoveryState::RolledBack;
+            }
+            continue;
+        }
         let (rollback, install) = (&mut applied.entries[index], &original.entries[index]);
         durable.transaction_state = SharedRecoveryState::RollingBack;
         if let Some(entry) = durable.entries.get_mut(index) {
@@ -2483,6 +2507,11 @@ pub fn execute_shared_rollback(
                                     | SharedApplyFailureKind::DestinationChanged => {
                                         publication_failure(kind, temp.as_deref()).1
                                     }
+                                    SharedApplyFailureKind::PublishedUnverified => format!(
+                                        "EmuWiz restored this file, but it changed straight afterwards, so the result could not be confirmed. Review {} before retrying; the original is still kept in EmuWiz's backup at {}.",
+                                        destination.display(),
+                                        backup.display()
+                                    ),
                                     _ => "previous destination bytes could not be restored and verified".into(),
                                 };
                                 rollback.outcome = SharedRollbackOutcome::Failed;
@@ -2541,7 +2570,10 @@ pub fn execute_shared_rollback(
     let halted_by = halted_by.or_else(|| {
         processed.iter().copied().find(|&done| {
             original.entries[done].outcome == SharedApplyOutcome::ReplacedExisting
-                && applied.entries[done].outcome != SharedRollbackOutcome::RestoredBackup
+                && !matches!(
+                    applied.entries[done].outcome,
+                    SharedRollbackOutcome::RestoredBackup | SharedRollbackOutcome::NoChangeRequired
+                )
         })
     });
     // A restore that published but kept a changed displaced file did change
@@ -2550,10 +2582,13 @@ pub fn execute_shared_rollback(
         matches!(
             entry.outcome,
             SharedRollbackOutcome::RestoredBackup | SharedRollbackOutcome::RemovedInstalledFile
-        ) || entry
-            .failure
-            .as_ref()
-            .is_some_and(|failure| failure.kind == SharedApplyFailureKind::DisplacedFileKept)
+        ) || entry.failure.as_ref().is_some_and(|failure| {
+            matches!(
+                failure.kind,
+                SharedApplyFailureKind::DisplacedFileKept
+                    | SharedApplyFailureKind::PublishedUnverified
+            )
+        })
     });
     // Say exactly what this Undo changed; never claim nothing changed when
     // something did.
@@ -2872,11 +2907,13 @@ fn atomic_write_bytes(
             None => return Err(SharedApplyFailureKind::AtomicReplaceUnsupported),
         }
         sync_directory(parent);
-        let final_hash = stable_hash(destination, SHARED_MAX_MATERIALIZED_BYTES)?;
-        if final_hash.digest != expected {
-            return Err(SharedApplyFailureKind::VerificationFailed);
+        after_publish(destination);
+        // From here on the destination has changed: a failed check is
+        // reported as such, never as "nothing written".
+        match stable_hash(destination, SHARED_MAX_MATERIALIZED_BYTES) {
+            Ok(final_hash) if final_hash.digest == expected => Ok(()),
+            _ => Err(SharedApplyFailureKind::PublishedUnverified),
         }
-        Ok(())
     })();
     if let Err(kind) = write_result {
         if !keep_temp {
@@ -2898,6 +2935,23 @@ thread_local! {
     /// Runs after a refused exchange, before it is reversed.
     static BEFORE_REVERSE: std::cell::RefCell<Option<PublishHook>> =
         std::cell::RefCell::new(None);
+    /// Runs right after publication, before the final check.
+    static AFTER_PUBLISH: std::cell::RefCell<Option<PublishHook>> =
+        std::cell::RefCell::new(None);
+}
+
+#[cfg(test)]
+fn set_after_publish(hook: Option<PublishHook>) {
+    AFTER_PUBLISH.with(|slot| *slot.borrow_mut() = hook);
+}
+
+fn after_publish(_destination: &Path) {
+    #[cfg(test)]
+    AFTER_PUBLISH.with(|slot| {
+        if let Some(hook) = slot.borrow_mut().as_mut() {
+            hook(_destination);
+        }
+    });
 }
 
 #[cfg(test)]
@@ -3625,6 +3679,15 @@ fn rollback_entry_preview(
         Ok(hash) => {
             result.observed_destination_digest = Some(hash.digest.clone());
             if Some(hash.digest.as_str()) != entry.final_destination_digest.as_deref() {
+                // Already back to the backed-up bytes (a partly finished
+                // Undo restored it): nothing left to do for this file, so a
+                // retry can finish the rest.
+                if entry.outcome == SharedApplyOutcome::ReplacedExisting
+                    && entry.backup_digest.as_deref() == Some(hash.digest.as_str())
+                {
+                    result.outcome = SharedRollbackOutcome::NoChangeRequired;
+                    return result;
+                }
                 result.outcome = SharedRollbackOutcome::DestinationChanged;
                 return result;
             }
@@ -6265,6 +6328,77 @@ mod tests {
             b"old-b"
         };
         assert_eq!(fs::read(dir.join(restored_name)).unwrap(), old);
+        // A retry finishes the rest: the restored file counts as done.
+        let retry = preview_shared_rollback(
+            &journal_path,
+            &fixture.destination_root(),
+            &fixture.backup_root(),
+        );
+        assert!(retry.available, "{:?}", retry.entries);
+        assert_eq!(
+            entry_for(&retry, restored_name).outcome,
+            SharedRollbackOutcome::NoChangeRequired
+        );
+        let done = confirm_rollback(&fixture, &retry, "multi-undo-partial-2");
+        assert_eq!(done.status, SharedApplyStatus::Success);
+        assert_eq!(fs::read(dir.join("a.cht")).unwrap(), b"old-a");
+        assert_eq!(fs::read(dir.join("b.cht")).unwrap(), b"old-b");
+        assert!(!dir.join("aaa-overlay.cfg").exists());
+    }
+
+    /// A restore that published but whose destination changed straight
+    /// afterwards is a change: never "Nothing was changed", status partial,
+    /// and the dependent new file is kept.
+    #[cfg(unix)]
+    #[test]
+    fn undo_restore_changed_after_publication_is_reported_as_a_change() {
+        let fixture = Fixture::new("undo-after-publish");
+        let plan = mixed_plan(
+            &fixture,
+            &[
+                ("Nintendo - NES/aaa-overlay.cfg", None, b"overlay"),
+                ("Nintendo - NES/game.cht", Some(b"old"), b"new"),
+            ],
+        );
+        let applied = execute_shared_apply(
+            &plan,
+            &options(&fixture, &plan, "undo-after-publish", false, true, true),
+        );
+        assert_eq!(applied.journal.status, SharedApplyStatus::Success);
+        let journal_path = applied.journal_path.clone().unwrap();
+        let rollback = preview_shared_rollback(
+            &journal_path,
+            &fixture.destination_root(),
+            &fixture.backup_root(),
+        );
+        set_after_publish(Some(Box::new(|destination: &Path| {
+            fs::write(destination, b"edited").unwrap();
+        })));
+        let result = confirm_rollback(&fixture, &rollback, "undo-after-publish-1");
+        set_after_publish(None);
+        assert_eq!(result.status, SharedApplyStatus::PartialFailure);
+        let restore = entry_for(&result.preview, "game.cht");
+        let failure = restore.failure.as_ref().unwrap();
+        assert_eq!(failure.kind, SharedApplyFailureKind::PublishedUnverified);
+        assert!(
+            failure
+                .detail
+                .contains("EmuWiz restored this file, but it changed straight afterwards"),
+            "{}",
+            failure.detail
+        );
+        assert!(
+            !failure.detail.contains("Nothing was changed"),
+            "{}",
+            failure.detail
+        );
+        assert_eq!(
+            entry_for(&result.preview, "aaa-overlay.cfg").outcome,
+            SharedRollbackOutcome::Retained
+        );
+        let dir = fixture.destination_root().join("Nintendo - NES");
+        assert!(dir.join("aaa-overlay.cfg").exists());
+        assert_eq!(fs::read(dir.join("game.cht")).unwrap(), b"edited");
     }
 
     /// The operation's backup folder is reused only when it is a real
