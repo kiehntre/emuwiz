@@ -342,12 +342,11 @@ pub fn assess_host_capabilities(
         .any(|issue| issue.readiness == HostCapabilityReadiness::Stale)
     {
         HostCapabilityReadiness::Stale
-    } else if issues
-        .iter()
-        .any(|issue| issue.readiness == HostCapabilityReadiness::RequirementsUnknown)
+    } else if !checked_requirement
+        || issues
+            .iter()
+            .any(|issue| issue.readiness == HostCapabilityReadiness::RequirementsUnknown)
     {
-        HostCapabilityReadiness::RequirementsUnknown
-    } else if !checked_requirement {
         HostCapabilityReadiness::RequirementsUnknown
     } else if !requirements.performance_guidance.is_empty() {
         HostCapabilityReadiness::PerformanceUnknown
