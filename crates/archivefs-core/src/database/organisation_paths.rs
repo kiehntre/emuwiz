@@ -34,6 +34,22 @@ struct Binding {
     fingerprint: bool,
 }
 
+impl Binding {
+    fn verify_storage(&self) -> std::result::Result<(), String> {
+        let m = fs::symlink_metadata(&self.database)
+            .map_err(|e| format!("catalogue database unavailable; recovery required: {e}"))?;
+        if !m.is_file() || m.dev() != self.device || m.ino() != self.inode {
+            return Err("catalogue database identity changed; recovery required".into());
+        }
+        for a in [&self.old, &self.new] {
+            if SourceRootBinding::inspect(&a.root).as_ref() != Some(&a.root_identity) {
+                return Err("catalogue source root identity changed; recovery required".into());
+            }
+        }
+        Ok(())
+    }
+}
+
 fn row_ids(
     c: &Connection,
     table: &str,
@@ -177,18 +193,11 @@ impl CatalogueMove {
         {
             return Err("catalogue binding does not match the sealed move".into());
         }
-        let check_db = || -> std::result::Result<(), String> {
-            let m = fs::symlink_metadata(&b.database).map_err(|e| e.to_string())?;
-            if !m.is_file() || m.dev() != b.device || m.ino() != b.inode {
-                return Err("catalogue database identity changed".into());
-            }
-            Ok(())
-        };
-        check_db()?;
+        b.verify_storage()?;
         let c = open_connection_with(&b.database, false).map_err(|e| e.to_string())?;
         c.execute_batch("BEGIN IMMEDIATE")
             .map_err(|e| e.to_string())?;
-        check_db()?;
+        b.verify_storage()?;
         for a in [&b.old, &b.new] {
             let path: Vec<u8> = c.query_row("SELECT path FROM source_folders WHERE id=?1 AND removed_from_config_at IS NULL AND NOT EXISTS(SELECT 1 FROM source_enablement e WHERE e.source_folder_id=source_folders.id AND e.enabled=0)",[a.folder],|r|r.get(0)).map_err(|e|e.to_string())?;
             if path != a.root.as_os_str().as_bytes()
@@ -266,6 +275,8 @@ impl CatalogueMove {
         })
     }
     pub(crate) fn commit(self) -> std::result::Result<(), String> {
+        // SQLite serializes database writers, not namespace replacements.
+        self.binding.verify_storage()?;
         if !self.already {
             let b = &self.binding;
             let (from, to) = if self.reverse {
@@ -298,9 +309,11 @@ impl CatalogueMove {
                 }
             }
         }
+        self.binding.verify_storage()?;
         self.connection
             .execute_batch("COMMIT")
-            .map_err(|e| format!("catalogue commit failed; recovery required: {e}"))
+            .map_err(|e| format!("catalogue commit failed; recovery required: {e}"))?;
+        self.binding.verify_storage()
     }
 }
 

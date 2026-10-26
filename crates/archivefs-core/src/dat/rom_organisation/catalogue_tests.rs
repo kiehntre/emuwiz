@@ -538,3 +538,41 @@ fn unrelated_audit_and_fingerprint_collisions_are_never_rewritten() {
         assert_eq!(before, after);
     }
 }
+
+#[test]
+fn backing_replacement_during_mutation_cannot_commit_catalogue_success() {
+    for database in [false, true] {
+        let mut f = Fixture::new(OrganisationMode::RenameInPlace);
+        f.tx.state = TransactionState::Applying;
+        f.tx.entries[0].state = EntryState::Applying;
+        crate::dat::rename_apply::write_journal(&f.journal(), &f.tx).unwrap();
+        let guard = crate::database::organisation_paths::begin(&f.tx.entries[0], false, false)
+            .unwrap()
+            .unwrap();
+        // Disposable simulation of the mutation window while the SQLite
+        // writer lock is held; namespace renames are not SQLite writers.
+        std::fs::rename(&f.source, &f.destination).unwrap();
+        if database {
+            let path = f.db.path().to_path_buf();
+            std::fs::rename(&path, f.temp.path().join("preserved-db")).unwrap();
+            std::fs::write(&path, b"replacement database object").unwrap();
+        } else {
+            std::fs::rename(&f.plan.master_root, f.temp.path().join("preserved-games")).unwrap();
+            std::fs::create_dir(&f.plan.master_root).unwrap();
+        }
+        let error = guard.commit().unwrap_err();
+        assert!(error.contains("identity changed"), "{error}");
+        assert_eq!(f.path_id(&f.source), Some(f.id));
+        f.reload();
+        assert_eq!(f.tx.entries[0].state, EntryState::Applying);
+    }
+}
+
+#[test]
+fn changed_expected_destination_is_refused_before_apply() {
+    let mut f = Fixture::new(OrganisationMode::RenameInPlace);
+    f.tx.entries[0].destination_path = f.source.with_file_name("Unreviewed.zip");
+    assert!(f.apply().unwrap_err().to_string().contains("sealed move"));
+    assert!(f.source.exists());
+    assert!(!f.destination.exists());
+}
