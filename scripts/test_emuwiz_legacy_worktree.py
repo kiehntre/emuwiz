@@ -168,6 +168,22 @@ class LegacyCheckout(M.MaintBase):
         with patch.object(self.m, 'append_history', dirty):
             self.hold('CHECKOUT_NOT_CLEAN', remove=True)
 
+    def test_ignored_evidence_arriving_during_final_census_is_preserved(self):
+        excludes = Path(self.tmp, 'synthetic-excludes')
+        excludes.write_text('late-evidence.json\n')
+        self.git('-C', self.wt, 'config', 'core.excludesFile', str(excludes))
+        scans = []
+        evidence = Path(self.wt, 'late-evidence.json')
+        def arrival(*args, **kw):
+            scans.append(True)
+            if len(scans) == 2:
+                evidence.write_text('unique QA evidence')
+            return types.SimpleNamespace(refs={}, unreadable_foreign=0)
+        with patch.object(self.m.F, 'Census', side_effect=arrival):
+            result = self.hold('CHECKOUT_NOT_CLEAN', remove=True)
+        self.assertEqual(result['outcome'], 'NOT_REMOVED')
+        self.assertEqual(evidence.read_text(), 'unique QA evidence')
+
     def test_unknown_lock_and_unfinished_git_operation_fail_closed(self):
         admin = self.m.F.run_as_owner(['git', '-C', self.wt, 'rev-parse', '--absolute-git-dir'],
                                       capture_output=True, text=True).stdout.strip()

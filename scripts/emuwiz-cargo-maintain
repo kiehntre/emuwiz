@@ -1746,16 +1746,22 @@ def reconcile_legacy_worktree(path, preserved_ref=None, remove=False):
                 append_history(event)
                 # An intent is evidence, never reusable authorization. Revalidate after publication.
                 absent()
-                require(checkout() == snapshot, "CHECKOUT_CHANGED", "checkout or preservation ref changed")
                 ownership(registry, key, snapshot["branch"])
+                # Census can take time; ignored QA evidence appearing during it must
+                # be found before Git, which otherwise silently removes ignored files.
+                require(checkout() == snapshot, "CHECKOUT_CHANGED", "checkout or preservation ref changed")
                 absent()
                 git("worktree", "remove", wt)  # intentionally never --force
                 result["outcome"] = "CHECKOUT_REMOVED"
                 append_history(dict(result, event="legacy_checkout_reconciliation"))
     except LegacyCheckoutHold as error:
         result.update(status="HOLD", code=error.code, explanation=error.explanation)
+        if result["outcome"] != "CHECKOUT_REMOVED":
+            result["outcome"] = "NOT_REMOVED"
     except (OSError, ValueError, subprocess.SubprocessError) as error:
         result.update(status="HOLD", code="RECONCILIATION_UNVERIFIED", explanation=str(error))
+        if result["outcome"] != "CHECKOUT_REMOVED":
+            result["outcome"] = "NOT_REMOVED"
     return result
 
 
