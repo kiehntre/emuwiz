@@ -92,10 +92,10 @@ fn visual_polish_card_metadata_has_one_baseline_per_row() {
     let output = frame(&context, &mut app, [1920.0, 1080.0]);
     let mut tops = Vec::new();
     for clipped in &output.shapes {
-        if let egui::Shape::Text(text) = &clipped.shape {
-            if text.galley.text().starts_with("Not checked") {
-                tops.push(text.pos.y);
-            }
+        if let egui::Shape::Text(text) = &clipped.shape
+            && text.galley.text().starts_with("Not checked")
+        {
+            tops.push(text.pos.y);
         }
     }
     assert!(tops.len() >= 2, "metadata missing");
@@ -204,12 +204,11 @@ fn visual_polish_health_content_has_a_readable_line_length() {
             },
         );
         for shape in &output.shapes {
-            if let egui::Shape::Rect(rect) = &shape.shape {
-                if rect.fill == theme::blue::CARD_SURFACE_TOP
-                    || rect.fill == theme::blue::SELECTED_FILL
-                {
-                    used = used.max(rect.rect.right() - 8.0);
-                }
+            if let egui::Shape::Rect(rect) = &shape.shape
+                && (rect.fill == theme::blue::CARD_SURFACE_TOP
+                    || rect.fill == theme::blue::SELECTED_FILL)
+            {
+                used = used.max(rect.rect.right() - 8.0);
             }
         }
     }
