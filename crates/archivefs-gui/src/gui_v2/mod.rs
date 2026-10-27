@@ -65,6 +65,7 @@ mod patch_package_preview;
 mod platform_aliases_page;
 mod problem_actions;
 mod problems;
+mod profile_settings_preview;
 mod psp_iso_analyser;
 mod quarantine_confirm;
 mod r2_rename;
@@ -107,6 +108,7 @@ mod verify_journey_tests;
 pub(crate) mod vice_evidence;
 mod view_history_page;
 mod visual_pages;
+mod whdload_option_preview;
 mod wiiu_disc;
 
 use crate::optical_conversion_page::OpticalConversionPageState;
