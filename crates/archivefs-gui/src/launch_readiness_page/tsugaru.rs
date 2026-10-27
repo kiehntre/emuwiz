@@ -178,23 +178,31 @@ impl Request {
 type Results = Vec<(String, Result<Request, String>)>;
 #[derive(Default)]
 pub(super) struct Panel {
+    focused: Option<PathBuf>,
     key: Option<(Option<PathBuf>, CanonicalIdentityStatus)>,
     pending: Option<Receiver<Results>>,
     results: Results,
     chosen: Option<String>,
 }
+impl Panel {
+    pub(super) fn focus(&mut self, path: Option<&Path>) {
+        self.focused = path.map(Path::to_path_buf);
+    }
+}
 pub(super) fn show(ui: &mut egui::Ui, plan: &LaunchPlan, state: &mut StandaloneLaunchState) {
     if plan.platform_id.as_deref() != Some("FM Towns") {
         return;
     }
-    let selected = plan
-        .candidates
-        .iter()
-        .find_map(|c| c.content.resolved_path.clone());
+    let selected = state.tsugaru.focused.clone().or_else(|| {
+        plan.candidates
+            .iter()
+            .find_map(|c| c.content.resolved_path.clone())
+    });
     let identity = preview_identity(plan);
     let key = (selected.clone(), identity.clone());
     if state.tsugaru.key.as_ref() != Some(&key) {
         state.tsugaru = Panel {
+            focused: selected.clone(),
             key: Some(key),
             ..Default::default()
         };

@@ -1077,6 +1077,7 @@ impl StandaloneLaunchState {
     /// The game the Launch page shows, for the DOSBox check.
     pub(crate) fn focus_dosbox_game(&mut self, path: Option<&Path>) {
         self.dosbox.focus(path);
+        self.tsugaru.focus(path);
     }
 
     pub(crate) fn focus_vice_trainer_game(&mut self, path: Option<&Path>) {
