@@ -766,6 +766,7 @@ pub(super) fn family_children(family: FeatureFamily) -> Vec<FamilyAction> {
 /// (Batch 10, boards `D11-LG-*`). Each one has its own module.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub(super) enum ToolPage {
+    AlternativeProviders,
     NeedsAttention,
     Mounts,
     MediaSets,
@@ -782,7 +783,8 @@ pub(super) enum ToolPage {
 }
 
 impl ToolPage {
-    pub const ALL: [Self; 13] = [
+    pub const ALL: [Self; 14] = [
+        Self::AlternativeProviders,
         Self::NeedsAttention,
         Self::Mounts,
         Self::MediaSets,
@@ -800,6 +802,7 @@ impl ToolPage {
 
     pub fn title(self) -> &'static str {
         match self {
+            Self::AlternativeProviders => "Alternative-provider requirements",
             Self::NeedsAttention => "Needs Attention",
             Self::Mounts => "Mounts",
             Self::MediaSets => "Media Sets",
@@ -818,6 +821,9 @@ impl ToolPage {
 
     pub fn purpose(self) -> &'static str {
         match self {
+            Self::AlternativeProviders => {
+                "Compare supplied provider requirements and original-asset observations."
+            }
             Self::NeedsAttention => {
                 "Current saved evidence, with actions in the workflows that own it."
             }
@@ -851,6 +857,7 @@ impl ToolPage {
     /// The section whose sidebar row and family the page belongs to.
     pub fn home(self) -> Section {
         match self {
+            Self::AlternativeProviders => Section::Launch,
             Self::NeedsAttention => Section::Problems,
             Self::Mounts => Section::Storage,
             Self::MediaSets => Section::MultiDisc,
@@ -869,6 +876,7 @@ impl ToolPage {
     /// The breadcrumb parent, as on the board.
     fn parent_label(self) -> &'static str {
         match self {
+            Self::AlternativeProviders => "Games & collection",
             Self::NeedsAttention => "Health & Recovery",
             Self::Mounts => "Tools",
             Self::MediaSets => "Multi-disc games",
