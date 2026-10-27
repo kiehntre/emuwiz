@@ -30,7 +30,7 @@ pub(super) fn show(ui: &mut egui::Ui, plan: &LaunchPlan) {
             .collect();
         if native.is_empty() {
             ui.label(
-                "No standalone FBNeo profile is configured. RetroArch core discovery is separate.",
+                "No standalone FBNeo profile is available in this launch plan. RetroArch core discovery is separate.",
             );
         }
         for candidate in native {
@@ -40,7 +40,7 @@ pub(super) fn show(ui: &mut egui::Ui, plan: &LaunchPlan) {
                         ui.small(format!("Configured executable: {}", path.display()));
                     }
                     None => {
-                        ui.label("Choose a standalone FBNeo executable in emulator setup.");
+                        ui.label("Standalone executable binding is unavailable; native setup needs the ROM search binding integration.");
                     }
                 }
             }
