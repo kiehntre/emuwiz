@@ -65,6 +65,7 @@
 pub mod amiberry_cd_command;
 pub mod amiberry_cd_discovery;
 pub mod amiberry_cd_execution;
+pub mod amiberry_cd_profile;
 pub mod amiberry_command;
 pub mod amiberry_execution;
 pub mod amiga_whdload_command;
