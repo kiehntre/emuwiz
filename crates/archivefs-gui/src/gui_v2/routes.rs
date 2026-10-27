@@ -775,6 +775,7 @@ pub(super) enum ToolPage {
     PlatformAliases,
     DatabaseStatus,
     CheatExtras,
+    NetplayPreview,
     HomebrewBrowser,
     PatchPackagePreview,
     ProfileSettings,
@@ -784,7 +785,7 @@ pub(super) enum ToolPage {
 }
 
 impl ToolPage {
-    pub const ALL: [Self; 15] = [
+    pub const ALL: [Self; 16] = [
         Self::AlternativeProviders,
         Self::NeedsAttention,
         Self::Mounts,
@@ -794,6 +795,7 @@ impl ToolPage {
         Self::PlatformAliases,
         Self::DatabaseStatus,
         Self::CheatExtras,
+        Self::NetplayPreview,
         Self::HomebrewBrowser,
         Self::PatchPackagePreview,
         Self::ProfileSettings,
@@ -818,6 +820,7 @@ impl ToolPage {
             Self::OpticalCompare => "Compare optical layouts",
             Self::SourceImpact => "Source-location impact preview",
             Self::HomebrewBrowser => "Offline homebrew catalogue",
+            Self::NetplayPreview => "Netplay comparison",
             Self::CheatExtras => "Providers and code previews",
         }
     }
@@ -854,6 +857,9 @@ impl ToolPage {
             Self::HomebrewBrowser => {
                 "Search a local catalogue and review dated claims without acquiring games."
             }
+            Self::NetplayPreview => {
+                "Compare two manually supplied peer observations without connecting."
+            }
             Self::CheatExtras => {
                 "Licences for open and local cheat providers, and read-only code previews."
             }
@@ -876,6 +882,7 @@ impl ToolPage {
             Self::OpticalCompare => Section::Converter,
             Self::SourceImpact => Section::Sources,
             Self::HomebrewBrowser => Section::Games,
+            Self::NetplayPreview => Section::Launch,
             Self::CheatExtras => Section::Mods,
         }
     }
@@ -895,6 +902,7 @@ impl ToolPage {
             Self::OpticalCompare => "Tools",
             Self::SourceImpact => "Tools",
             Self::HomebrewBrowser => "Tools",
+            Self::NetplayPreview => "Games & collection",
             Self::CheatExtras => "Enhance",
         }
     }

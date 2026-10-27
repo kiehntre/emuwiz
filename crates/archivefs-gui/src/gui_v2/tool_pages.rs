@@ -22,6 +22,7 @@ pub(super) struct ToolPagesState {
     pub platform_aliases: super::platform_aliases_page::PlatformAliasesState,
     pub database: super::database_status_page::DatabaseStatusState,
     pub alternative_provider_preview: super::alternative_provider_preview::State,
+    pub netplay: super::netplay_preview::State,
     pub cheat_extras: super::cheat_extras_page::CheatExtrasState,
 }
 
@@ -36,6 +37,7 @@ impl ToolPagesState {
             platform_aliases: super::platform_aliases_page::PlatformAliasesState::live(),
             database: super::database_status_page::DatabaseStatusState::live(),
             alternative_provider_preview: Default::default(),
+            netplay: Default::default(),
             cheat_extras: Default::default(),
             homebrew_browser: Default::default(),
             patch_package_preview: Default::default(),
@@ -50,6 +52,7 @@ impl ToolPagesState {
 impl App {
     pub(super) fn tool_page(&mut self, ui: &mut egui::Ui, tool: ToolPage) {
         match tool {
+            ToolPage::NetplayPreview => super::netplay_preview::show(ui, &mut self.tools.netplay),
             ToolPage::HomebrewBrowser => {
                 super::homebrew_browser::show(ui, &mut self.tools.homebrew_browser)
             }
