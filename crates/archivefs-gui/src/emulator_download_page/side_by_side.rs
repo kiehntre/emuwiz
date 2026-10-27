@@ -118,7 +118,9 @@ fn show_review(ui: &mut egui::Ui, review: &AppImageInstallReview) {
             &parent.display().to_string(),
         );
     }
-    if review.current_installations.is_empty() {
+    if !review.current_installations_inspected {
+        ui.label("Current installations were not inspected because source or destination checks failed. Existing installations remain untouched.");
+    } else if review.current_installations.is_empty() {
         ui.label("No existing managed-layout installation was observed. External/system installations and profile selections are not adopted; inspect Emulator inventory for those installations.");
     }
     for current in &review.current_installations {

@@ -15,6 +15,7 @@ pub struct AppImageInstallReview {
     pub proposed_destination: Option<PathBuf>,
     pub staging_parent: Option<PathBuf>,
     pub current_installations: Vec<String>,
+    pub current_installations_inspected: bool,
     pub artifact: Option<PathBuf>,
     pub artifact_sha256: Option<String>,
     pub artifact_size: Option<u64>,
@@ -43,6 +44,7 @@ pub fn review_appimage_install(
         proposed_destination: None,
         staging_parent: None,
         current_installations: Vec::new(),
+        current_installations_inspected: false,
         artifact: artifact.map(Path::to_path_buf),
         artifact_sha256: None,
         artifact_size: None,
@@ -82,6 +84,7 @@ pub fn review_appimage_install(
             }
             // Only list paths and pointer targets; do not hash or follow an
             // existing installation just to present what will be preserved.
+            review.current_installations_inspected = true;
             let emulator_root = root.join("emulators").join(spec.id);
             let receipt = emulator_root.join("install.json");
             if fs::symlink_metadata(&receipt).is_ok() {
