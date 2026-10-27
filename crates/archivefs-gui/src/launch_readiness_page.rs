@@ -42,6 +42,7 @@ mod fbneo;
 
 #[path = "launch_readiness_page/cemu.rs"]
 pub(crate) mod cemu;
+mod cemu_stop;
 mod classic_pokes;
 pub(crate) mod controller_readiness;
 pub(crate) mod dosbox;
@@ -1017,7 +1018,7 @@ pub(crate) enum StandaloneProcess {
     Rpcs3(LaunchedRpcs3Process),
     Xemu(LaunchedXemuProcess),
     Xenia(LaunchedXeniaProcess),
-    Cemu(archivefs_core::launch::LaunchedCemuProcess),
+    Cemu(cemu_stop::Session),
     Flycast(archivefs_core::launch::LaunchedFlycastProcess),
     XRoar(archivefs_core::launch::process_spawn::WatchedProcess),
     Vice(archivefs_core::launch::process_spawn::WatchedProcess),
@@ -1564,7 +1565,10 @@ impl StandaloneLaunchRequest {
     }
     pub(crate) fn execute(self) -> Result<StandaloneProcess, String> {
         match self {
-            Self::Cemu(r) => r.execute().map(StandaloneProcess::Cemu),
+            Self::Cemu(r) => r
+                .execute()
+                .map(cemu_stop::Session::new)
+                .map(StandaloneProcess::Cemu),
             Self::Flycast(r) => r.execute().map(StandaloneProcess::Flycast),
             Self::XRoar(r) => r.execute().map(StandaloneProcess::XRoar),
             Self::Vice(r) => r.execute().map(StandaloneProcess::Vice),
@@ -3195,6 +3199,9 @@ pub(crate) fn show_launch_readiness_panel(
 ) -> Option<LaunchReadinessPageAction> {
     let mut action = None;
     standalone_launch_state.vice_trainers.reconcile(input);
+    if ui.is_enabled() {
+        standalone_launch_state.show_cemu_lifecycle(ui);
+    }
     widgets::section_header(
         ui,
         "Play / Launch readiness",
@@ -4974,6 +4981,19 @@ fn show_standalone_launch_action(
     melonds_cheats::show_chooser(ui, state, &request);
     scummvm_profile::show_chooser(ui, state, &request);
     if same {
+        // Cemu's owned lifecycle is rendered independently of readiness, so
+        // Stop remains usable when this preview expires or becomes blocked.
+        if matches!(
+            state.tracked,
+            Some((
+                _,
+                _,
+                StandaloneLaunchStage::Running(StandaloneProcess::Cemu(_))
+                    | StandaloneLaunchStage::Exited(StandaloneProcess::Cemu(_))
+            ))
+        ) {
+            return;
+        }
         let label = match state.tracked.as_ref().map(|(_, _, stage)| stage) {
             Some(StandaloneLaunchStage::Starting(_)) => "Launching…",
             Some(
