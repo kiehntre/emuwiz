@@ -1847,6 +1847,10 @@ fn gui_v2_organisation_primary_action_is_on_screen_at_640x375_points() {
     frame(&context, &mut app, size);
     let output = frame(&context, &mut app, size);
     assert_viewport_is(&context, &output, size);
+    assert!(organisation_label_is_visible(
+        &output,
+        "Choose what you want to organise"
+    ));
     assert!(
         organisation_label_is_visible(&output, "Preview Playing Library"),
         "not visible without scrolling"
@@ -1871,6 +1875,10 @@ fn gui_v2_organisation_primary_action_is_on_screen_at_the_160_percent_ui_scale()
     }
     let output = frame(&context, &mut app, size);
     assert_viewport_is(&context, &output, size);
+    assert!(organisation_label_is_visible(
+        &output,
+        "Choose what you want to organise"
+    ));
     assert!(organisation_label_is_visible(
         &output,
         "Preview Playing Library"

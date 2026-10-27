@@ -412,6 +412,7 @@ impl App {
                     // below the fold, where it cannot be focused. Keep the page
                     // title and the safety statement, drop the illustration.
                     if compact {
+                        ui.heading("Choose what you want to organise");
                         widgets::status_badge(
                             ui,
                             "Nothing changes until you preview and confirm",
