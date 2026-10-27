@@ -2,7 +2,20 @@
 use super::*;
 use std::os::fd::AsRawFd;
 
-pub(super) fn lock(card: &Path) -> Result<fs::File, Ps2PsuRestoreError> {
+pub(super) struct OperationLock {
+    directory: fs::File,
+}
+
+impl Drop for OperationLock {
+    fn drop(&mut self) {
+        // flock belongs to the open file description. A concurrent fork can
+        // retain a copy until exec, so close alone may outlive this operation.
+        // Unlock only our description, after all guarded work has finished.
+        let _ = self.directory.unlock();
+    }
+}
+
+pub(super) fn lock(card: &Path) -> Result<OperationLock, Ps2PsuRestoreError> {
     let parent = card
         .parent()
         .ok_or_else(|| Ps2PsuRestoreError::InvalidPlan("Card has no parent directory".into()))?;
@@ -14,7 +27,7 @@ pub(super) fn lock(card: &Path) -> Result<fs::File, Ps2PsuRestoreError> {
             "Another card operation is active in this directory. Retry after it finishes.".into(),
         ));
     }
-    Ok(directory)
+    Ok(OperationLock { directory })
 }
 
 pub(super) fn validate(file: &fs::File) -> Result<fs::Metadata, Ps2PsuRestoreError> {
@@ -38,4 +51,34 @@ pub(super) fn preserve(file: &fs::File, metadata: &fs::Metadata) -> Result<(), P
     }
     file.set_permissions(metadata.permissions())
         .map_err(restore_error)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn completed_operation_releases_lock_with_inherited_descriptor() {
+        let dir = tempfile::tempdir().unwrap();
+        let card = dir.path().join("synthetic.ps2");
+        let owner = lock(&card).unwrap();
+        // dup and fork share the same open file description. Keep a duplicate
+        // alive to reproduce a sibling thread's helper waiting to exec.
+        let inherited = owner.directory.try_clone().unwrap();
+        assert!(matches!(
+            lock(&card),
+            Err(Ps2PsuRestoreError::RecoveryRequired(_))
+        ));
+        drop(owner);
+        let next =
+            lock(&card).expect("completed operation must release its lock before helper exec");
+        // Closing an old inherited handle must not release the next owner's lock.
+        drop(inherited);
+        assert!(matches!(
+            lock(&card),
+            Err(Ps2PsuRestoreError::RecoveryRequired(_))
+        ));
+        drop(next);
+        lock(&card).unwrap();
+    }
 }
