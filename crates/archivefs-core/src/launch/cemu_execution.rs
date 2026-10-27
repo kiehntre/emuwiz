@@ -433,7 +433,32 @@ impl LaunchedCemuProcess {
     pub fn is_running(&self) -> bool {
         self.watched.is_running()
     }
+
+    /// Request one graceful stop of the launch-owned child, never a PID or
+    /// process group supplied by the caller. Polling still owns exit reporting;
+    /// repeated requests cannot escalate or send a second signal.
+    pub fn request_graceful_stop(
+        &mut self,
+        scope: process_spawn::GracefulStopScope,
+        grace_period: std::time::Duration,
+    ) -> process_spawn::GracefulStopOutcome {
+        // The public PID is display metadata, never signalling authority. If
+        // it no longer describes this handle, refuse an ambiguous UI receipt.
+        if self.pid != self.watched.pid {
+            return process_spawn::GracefulStopOutcome::Refused(
+                process_spawn::GracefulStopRefusal::OwnershipUnavailable {
+                    operation: "Cemu launch PID does not match its owned process handle",
+                    raw_os_error: None,
+                },
+            );
+        }
+        self.watched.request_graceful_stop(scope, grace_period)
+    }
 }
+
+#[cfg(all(test, target_os = "linux"))]
+#[path = "cemu_stop_tests.rs"]
+mod stop_tests;
 
 /// Spawns exactly the process `command` describes - never a shell.
 /// `command` must already have passed [`preflight_cemu_launch`].
