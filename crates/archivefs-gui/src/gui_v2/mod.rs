@@ -35,6 +35,7 @@ mod history_duckstation;
 mod history_view;
 mod home_blue;
 mod homebrew_browser;
+mod host_diagnostics;
 mod identity_review;
 mod identity_review_page;
 mod imagery;

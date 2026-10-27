@@ -775,6 +775,7 @@ pub(super) enum ToolPage {
     PlatformAliases,
     DatabaseStatus,
     CheatExtras,
+    HostDiagnostics,
     NetplayPreview,
     HomebrewBrowser,
     PatchPackagePreview,
@@ -785,7 +786,7 @@ pub(super) enum ToolPage {
 }
 
 impl ToolPage {
-    pub const ALL: [Self; 16] = [
+    pub const ALL: [Self; 17] = [
         Self::AlternativeProviders,
         Self::NeedsAttention,
         Self::Mounts,
@@ -795,6 +796,7 @@ impl ToolPage {
         Self::PlatformAliases,
         Self::DatabaseStatus,
         Self::CheatExtras,
+        Self::HostDiagnostics,
         Self::NetplayPreview,
         Self::HomebrewBrowser,
         Self::PatchPackagePreview,
@@ -821,6 +823,7 @@ impl ToolPage {
             Self::SourceImpact => "Source-location impact preview",
             Self::HomebrewBrowser => "Offline homebrew catalogue",
             Self::NetplayPreview => "Netplay comparison",
+            Self::HostDiagnostics => "Host capability diagnostics",
             Self::CheatExtras => "Providers and code previews",
         }
     }
@@ -860,6 +863,9 @@ impl ToolPage {
             Self::NetplayPreview => {
                 "Compare two manually supplied peer observations without connecting."
             }
+            Self::HostDiagnostics => {
+                "Observe CPU and memory facts while keeping unknown graphics and emulator requirements explicit."
+            }
             Self::CheatExtras => {
                 "Licences for open and local cheat providers, and read-only code previews."
             }
@@ -883,6 +889,7 @@ impl ToolPage {
             Self::SourceImpact => Section::Sources,
             Self::HomebrewBrowser => Section::Games,
             Self::NetplayPreview => Section::Launch,
+            Self::HostDiagnostics => Section::Setup,
             Self::CheatExtras => Section::Mods,
         }
     }
@@ -903,6 +910,7 @@ impl ToolPage {
             Self::SourceImpact => "Tools",
             Self::HomebrewBrowser => "Tools",
             Self::NetplayPreview => "Games & collection",
+            Self::HostDiagnostics => "Tools",
             Self::CheatExtras => "Enhance",
         }
     }

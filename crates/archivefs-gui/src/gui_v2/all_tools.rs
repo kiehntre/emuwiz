@@ -240,6 +240,12 @@ pub(super) fn groups() -> Vec<ToolGroup> {
         "Advanced diagnostics",
         &[S::AdvancedDiagnostics, S::Settings, S::Advanced],
     );
+    advanced.tools.push(Tool {
+        route: Route::Tool(ToolPage::HostDiagnostics),
+        title: ToolPage::HostDiagnostics.title(),
+        purpose: ToolPage::HostDiagnostics.purpose(),
+        safety: ToolSafety::LookingOnly,
+    });
     advanced.tools.insert(
         2,
         Tool {

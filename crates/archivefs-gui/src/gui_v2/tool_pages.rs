@@ -8,6 +8,7 @@ use super::routes::ToolPage;
 
 #[derive(Default)]
 pub(super) struct ToolPagesState {
+    pub host_diagnostics: super::host_diagnostics::State,
     pub homebrew_browser: super::homebrew_browser::State,
     pub patch_package_preview: super::patch_package_preview::State,
     pub profile_settings_preview: super::profile_settings_preview::State,
@@ -39,6 +40,7 @@ impl ToolPagesState {
             alternative_provider_preview: Default::default(),
             netplay: Default::default(),
             cheat_extras: Default::default(),
+            host_diagnostics: Default::default(),
             homebrew_browser: Default::default(),
             patch_package_preview: Default::default(),
             profile_settings_preview: Default::default(),
@@ -52,6 +54,9 @@ impl ToolPagesState {
 impl App {
     pub(super) fn tool_page(&mut self, ui: &mut egui::Ui, tool: ToolPage) {
         match tool {
+            ToolPage::HostDiagnostics => {
+                super::host_diagnostics::show(ui, &mut self.tools.host_diagnostics)
+            }
             ToolPage::NetplayPreview => super::netplay_preview::show(ui, &mut self.tools.netplay),
             ToolPage::HomebrewBrowser => {
                 super::homebrew_browser::show(ui, &mut self.tools.homebrew_browser)
