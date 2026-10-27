@@ -227,4 +227,24 @@ fn reviewed_action_fits_small_viewport_and_opening_does_not_launch() {
     assert!(rect.right() <= 1024. && rect.bottom() <= 600.);
     assert!(!state.is_active());
     assert!(!f.root.path().join("Tsugaru_CUI.argv").exists());
+    let (_tx, rx) = mpsc::channel();
+    state.tracked = Some((
+        PathBuf::from("/different/game"),
+        "other".into(),
+        super::super::StandaloneLaunchStage::Starting(rx),
+    ));
+    let output = context.run(
+        egui::RawInput {
+            screen_rect: Some(egui::Rect::from_min_size(
+                egui::Pos2::ZERO,
+                egui::vec2(1024., 600.),
+            )),
+            ..Default::default()
+        },
+        |ctx| {
+            egui::CentralPanel::default().show(ctx, |ui| show(ui, &plan, &mut state));
+        },
+    );
+    assert!(output.shapes.iter().all(|s| action(&s.shape).is_none()));
+    assert_eq!(state.tracked.as_ref().unwrap().1, "other");
 }

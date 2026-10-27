@@ -252,6 +252,14 @@ pub(super) fn show(ui: &mut egui::Ui, plan: &LaunchPlan, state: &mut StandaloneL
         }
     });
     if let Some(request) = launch {
+        if state.is_active()
+            && !state.tracked.as_ref().is_some_and(|(path, adapter, _)| {
+                path == &request.core.selected_content_path && adapter == "tsugaru"
+            })
+        {
+            ui.label("Another standalone launch is active; wait before starting Tsugaru.");
+            return;
+        }
         show_standalone_launch_action(ui, state, StandaloneLaunchRequest::Tsugaru(request));
     }
 }
