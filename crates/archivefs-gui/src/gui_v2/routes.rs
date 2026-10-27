@@ -775,10 +775,15 @@ pub(super) enum ToolPage {
     PlatformAliases,
     DatabaseStatus,
     CheatExtras,
+    PatchPackagePreview,
+    ProfileSettings,
+    WhdloadOptions,
+    OpticalCompare,
+    SourceImpact,
 }
 
 impl ToolPage {
-    pub const ALL: [Self; 9] = [
+    pub const ALL: [Self; 14] = [
         Self::AlternativeProviders,
         Self::NeedsAttention,
         Self::Mounts,
@@ -788,6 +793,11 @@ impl ToolPage {
         Self::PlatformAliases,
         Self::DatabaseStatus,
         Self::CheatExtras,
+        Self::PatchPackagePreview,
+        Self::ProfileSettings,
+        Self::WhdloadOptions,
+        Self::OpticalCompare,
+        Self::SourceImpact,
     ];
 
     pub fn title(self) -> &'static str {
@@ -800,6 +810,11 @@ impl ToolPage {
             Self::LibraryViews => "Library Views",
             Self::PlatformAliases => "Platform aliases",
             Self::DatabaseStatus => "Database status",
+            Self::PatchPackagePreview => "Patch-package inspection",
+            Self::ProfileSettings => "Per-game settings explanation",
+            Self::WhdloadOptions => "WHDLoad ToolType review",
+            Self::OpticalCompare => "Compare optical layouts",
+            Self::SourceImpact => "Source-location impact preview",
             Self::CheatExtras => "Providers and code previews",
         }
     }
@@ -820,6 +835,19 @@ impl ToolPage {
             }
             Self::PlatformAliases => "Teach EmuWiz what your folder names mean.",
             Self::DatabaseStatus => "Where EmuWiz keeps what it knows about your library.",
+            Self::PatchPackagePreview => {
+                "Inspect patches and untrusted package metadata without applying anything."
+            }
+            Self::ProfileSettings => "Classify pasted emulator settings without applying them.",
+            Self::WhdloadOptions => {
+                "Explain supplied ToolTypes and Config metadata without changing an installation."
+            }
+            Self::OpticalCompare => {
+                "Compare two local CUE structures without claiming payload preservation."
+            }
+            Self::SourceImpact => {
+                "Preview one library source at a new folder without relocating anything."
+            }
             Self::CheatExtras => {
                 "Licences for open and local cheat providers, and read-only code previews."
             }
@@ -836,6 +864,11 @@ impl ToolPage {
             Self::ViewHistory | Self::LibraryViews => Section::Build,
             Self::PlatformAliases => Section::Settings,
             Self::DatabaseStatus => Section::Settings,
+            Self::PatchPackagePreview => Section::Mods,
+            Self::ProfileSettings => Section::Emulators,
+            Self::WhdloadOptions => Section::Mods,
+            Self::OpticalCompare => Section::Converter,
+            Self::SourceImpact => Section::Sources,
             Self::CheatExtras => Section::Mods,
         }
     }
@@ -849,6 +882,11 @@ impl ToolPage {
             Self::MediaSets => "Multi-disc games",
             Self::ViewHistory | Self::LibraryViews => "Organise & Export",
             Self::PlatformAliases | Self::DatabaseStatus => "Settings",
+            Self::PatchPackagePreview => "Tools",
+            Self::ProfileSettings => "Tools",
+            Self::WhdloadOptions => "Tools",
+            Self::OpticalCompare => "Tools",
+            Self::SourceImpact => "Tools",
             Self::CheatExtras => "Enhance",
         }
     }
