@@ -2,7 +2,23 @@
 use super::*;
 use std::os::fd::AsRawFd;
 
-pub(super) fn lock(card: &Path) -> Result<fs::File, Ps2PsuRestoreError> {
+pub(super) struct OperationLock {
+    directory: fs::File,
+    owner: u32,
+}
+
+impl Drop for OperationLock {
+    fn drop(&mut self) {
+        // A pre-exec child can retain this open file description after our
+        // File closes. End the lock at the operation boundary explicitly.
+        // A forked child must not unlock its parent's active operation.
+        if std::process::id() == self.owner {
+            unsafe { libc::flock(self.directory.as_raw_fd(), libc::LOCK_UN) };
+        }
+    }
+}
+
+pub(super) fn lock(card: &Path) -> Result<OperationLock, Ps2PsuRestoreError> {
     let parent = card
         .parent()
         .ok_or_else(|| Ps2PsuRestoreError::InvalidPlan("Card has no parent directory".into()))?;
@@ -14,7 +30,10 @@ pub(super) fn lock(card: &Path) -> Result<fs::File, Ps2PsuRestoreError> {
             "Another card operation is active in this directory. Retry after it finishes.".into(),
         ));
     }
-    Ok(directory)
+    Ok(OperationLock {
+        directory,
+        owner: std::process::id(),
+    })
 }
 
 pub(super) fn validate(file: &fs::File) -> Result<fs::Metadata, Ps2PsuRestoreError> {
@@ -38,4 +57,32 @@ pub(super) fn preserve(file: &fs::File, metadata: &fs::Metadata) -> Result<(), P
     }
     file.set_permissions(metadata.permissions())
         .map_err(restore_error)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn operation_end_releases_lock_with_inherited_descriptor() {
+        let dir = tempfile::tempdir().unwrap();
+        let card = dir.path().join("synthetic.ps2");
+        let operation = lock(&card).unwrap();
+        // dup and fork share the same open file description. Retain that
+        // description exactly as a concurrent pre-exec child can retain it.
+        let inherited = operation.directory.try_clone().unwrap();
+        assert!(
+            lock(&card).is_err(),
+            "live operations must remain exclusive"
+        );
+        drop(operation);
+        let next = lock(&card).expect("completed operation must release its lock");
+        drop(inherited);
+        assert!(
+            lock(&card).is_err(),
+            "the next operation still owns the lock"
+        );
+        drop(next);
+        assert!(lock(&card).is_ok());
+    }
 }
