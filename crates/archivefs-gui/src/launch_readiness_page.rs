@@ -39,6 +39,7 @@
 mod amiberry_cd;
 mod dolphin_profile_guidance;
 mod dolphin_stop;
+mod native_cd_feedback;
 mod native_cd_identity;
 mod tsugaru;
 

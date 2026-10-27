@@ -345,3 +345,63 @@ fn complete_blue_launch_uses_private_registry_and_real_production_entrypoint() {
         String::from_utf8_lossy(&output.stderr)
     );
 }
+
+#[test]
+fn returning_to_game_retains_process_feedback_without_a_reviewed_request() {
+    let f = fixture();
+    let process = request(&f).execute_verified(&f.identity).unwrap();
+    let mut state = StandaloneLaunchState::default();
+    state.focus_dosbox_game(Some(&f.path));
+    state.tracked = Some((
+        f.path.clone(),
+        "tsugaru".into(),
+        super::super::StandaloneLaunchStage::Running(super::super::StandaloneProcess::Tsugaru(
+            process,
+        )),
+    ));
+    let plan = LaunchPlan {
+        platform_id: Some("FM Towns".into()),
+        game_key: Some("synthetic".into()),
+        candidates: Vec::new(),
+        summary: Default::default(),
+        media_topology: None,
+    };
+    fn text(shape: &egui::Shape) -> String {
+        match shape {
+            egui::Shape::Text(t) => t.galley.text().into(),
+            egui::Shape::Vec(v) => v.iter().map(text).collect::<Vec<_>>().join(" "),
+            _ => String::new(),
+        }
+    }
+    let context = egui::Context::default();
+    let output = context.run(egui::RawInput::default(), |ctx| {
+        egui::CentralPanel::default().show(ctx, |ui| show(ui, &plan, &mut state));
+    });
+    assert!(
+        output
+            .shapes
+            .iter()
+            .map(|s| text(&s.shape))
+            .collect::<Vec<_>>()
+            .join(" ")
+            .contains("Tsugaru running · PID")
+    );
+    assert!(state.tsugaru.results.is_empty());
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while state.is_active() {
+        state.poll();
+        assert!(Instant::now() < deadline);
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    let output = context.run(egui::RawInput::default(), |ctx| {
+        egui::CentralPanel::default().show(ctx, |ui| show(ui, &plan, &mut state));
+    });
+    let rendered = output
+        .shapes
+        .iter()
+        .map(|s| text(&s.shape))
+        .collect::<Vec<_>>()
+        .join(" ");
+    assert!(rendered.contains("Process exited"));
+    assert!(rendered.contains('7'));
+}
