@@ -9,7 +9,7 @@ int main(int argc,char**argv){
   int mode=atoi(argv[1]); /* 0=v1 stream (reset), 1=common v7 */
   int streams=atoi(argv[2]); int prof=argc>3?atoi(argv[3]):2;
   for(int t=0;t<streams;t++){
-    int n=4+rnd()%60; if(prof==5 && n<6)n=6; 
+    int n=4+rnd()%60; if(prof==5 && n<6)n=6;
     printf("%d %d\n",mode,n);
     /* encrypt pass */
     uint32_t pa[80],pv[80],ea[80],ev[80];
