@@ -766,6 +766,7 @@ pub(super) fn family_children(family: FeatureFamily) -> Vec<FamilyAction> {
 /// (Batch 10, boards `D11-LG-*`). Each one has its own module.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub(super) enum ToolPage {
+    AlternativeProviders,
     NeedsAttention,
     Mounts,
     MediaSets,
@@ -775,10 +776,18 @@ pub(super) enum ToolPage {
     DatabaseStatus,
     CheatExtras,
     HostDiagnostics,
+    NetplayPreview,
+    HomebrewBrowser,
+    PatchPackagePreview,
+    ProfileSettings,
+    WhdloadOptions,
+    OpticalCompare,
+    SourceImpact,
 }
 
 impl ToolPage {
-    pub const ALL: [Self; 9] = [
+    pub const ALL: [Self; 17] = [
+        Self::AlternativeProviders,
         Self::NeedsAttention,
         Self::Mounts,
         Self::MediaSets,
@@ -788,10 +797,18 @@ impl ToolPage {
         Self::DatabaseStatus,
         Self::CheatExtras,
         Self::HostDiagnostics,
+        Self::NetplayPreview,
+        Self::HomebrewBrowser,
+        Self::PatchPackagePreview,
+        Self::ProfileSettings,
+        Self::WhdloadOptions,
+        Self::OpticalCompare,
+        Self::SourceImpact,
     ];
 
     pub fn title(self) -> &'static str {
         match self {
+            Self::AlternativeProviders => "Alternative-provider requirements",
             Self::NeedsAttention => "Needs Attention",
             Self::Mounts => "Mounts",
             Self::MediaSets => "Media Sets",
@@ -799,6 +816,13 @@ impl ToolPage {
             Self::LibraryViews => "Library Views",
             Self::PlatformAliases => "Platform aliases",
             Self::DatabaseStatus => "Database status",
+            Self::PatchPackagePreview => "Patch-package inspection",
+            Self::ProfileSettings => "Per-game settings explanation",
+            Self::WhdloadOptions => "WHDLoad ToolType review",
+            Self::OpticalCompare => "Compare optical layouts",
+            Self::SourceImpact => "Source-location impact preview",
+            Self::HomebrewBrowser => "Offline homebrew catalogue",
+            Self::NetplayPreview => "Netplay comparison",
             Self::HostDiagnostics => "Host capability diagnostics",
             Self::CheatExtras => "Providers and code previews",
         }
@@ -806,6 +830,9 @@ impl ToolPage {
 
     pub fn purpose(self) -> &'static str {
         match self {
+            Self::AlternativeProviders => {
+                "Compare supplied provider requirements and original-asset observations."
+            }
             Self::NeedsAttention => {
                 "Current saved evidence, with actions in the workflows that own it."
             }
@@ -817,6 +844,25 @@ impl ToolPage {
             }
             Self::PlatformAliases => "Teach EmuWiz what your folder names mean.",
             Self::DatabaseStatus => "Where EmuWiz keeps what it knows about your library.",
+            Self::PatchPackagePreview => {
+                "Inspect patches and untrusted package metadata without applying anything."
+            }
+            Self::ProfileSettings => "Classify pasted emulator settings without applying them.",
+            Self::WhdloadOptions => {
+                "Explain supplied ToolTypes and Config metadata without changing an installation."
+            }
+            Self::OpticalCompare => {
+                "Compare two local CUE structures without claiming payload preservation."
+            }
+            Self::SourceImpact => {
+                "Preview one library source at a new folder without relocating anything."
+            }
+            Self::HomebrewBrowser => {
+                "Search a local catalogue and review dated claims without acquiring games."
+            }
+            Self::NetplayPreview => {
+                "Compare two manually supplied peer observations without connecting."
+            }
             Self::HostDiagnostics => {
                 "Observe CPU and memory facts while keeping unknown graphics and emulator requirements explicit."
             }
@@ -829,12 +875,20 @@ impl ToolPage {
     /// The section whose sidebar row and family the page belongs to.
     pub fn home(self) -> Section {
         match self {
+            Self::AlternativeProviders => Section::Launch,
             Self::NeedsAttention => Section::Problems,
             Self::Mounts => Section::Storage,
             Self::MediaSets => Section::MultiDisc,
             Self::ViewHistory | Self::LibraryViews => Section::Build,
             Self::PlatformAliases => Section::Settings,
             Self::DatabaseStatus => Section::Settings,
+            Self::PatchPackagePreview => Section::Mods,
+            Self::ProfileSettings => Section::Emulators,
+            Self::WhdloadOptions => Section::Mods,
+            Self::OpticalCompare => Section::Converter,
+            Self::SourceImpact => Section::Sources,
+            Self::HomebrewBrowser => Section::Games,
+            Self::NetplayPreview => Section::Launch,
             Self::HostDiagnostics => Section::Setup,
             Self::CheatExtras => Section::Mods,
         }
@@ -843,11 +897,19 @@ impl ToolPage {
     /// The breadcrumb parent, as on the board.
     fn parent_label(self) -> &'static str {
         match self {
+            Self::AlternativeProviders => "Games & collection",
             Self::NeedsAttention => "Health & Recovery",
             Self::Mounts => "Tools",
             Self::MediaSets => "Multi-disc games",
             Self::ViewHistory | Self::LibraryViews => "Organise & Export",
             Self::PlatformAliases | Self::DatabaseStatus => "Settings",
+            Self::PatchPackagePreview => "Tools",
+            Self::ProfileSettings => "Tools",
+            Self::WhdloadOptions => "Tools",
+            Self::OpticalCompare => "Tools",
+            Self::SourceImpact => "Tools",
+            Self::HomebrewBrowser => "Tools",
+            Self::NetplayPreview => "Games & collection",
             Self::HostDiagnostics => "Tools",
             Self::CheatExtras => "Enhance",
         }

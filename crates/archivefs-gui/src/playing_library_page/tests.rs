@@ -2632,3 +2632,88 @@ fn real_profile_previews_apply_and_undo_unchanged_files_with_persisted_receipts(
 
 #[path = "retrodeck_tests.rs"]
 mod retrodeck_campaign;
+
+#[test]
+fn destination_change_requires_a_new_confirmation_after_repreview() {
+    for destination in [
+        PlayingLibraryDestination::Romm,
+        PlayingLibraryDestination::EsDe,
+        PlayingLibraryDestination::RetroDeck,
+    ] {
+        let fixture = Fixture::new("destination-confirmation-reset");
+        let (mut state, source, _) = preview_a_single_election(&fixture);
+        let output = state.plan().unwrap().operations[0].destination_path.clone();
+        state.request_apply();
+        state.confirm_text = "previous approval".into();
+        state.romm_pending_apply = true;
+        state.romm_confirm_text = "previous RomM approval".into();
+        state.retrodeck_pending_apply = true;
+        state.retrodeck_confirm_text = "previous RetroDECK approval".into();
+        state.selected_family = Some("old election".into());
+        state.error = Some("old preview error".into());
+        state.apply_error = Some("old apply error".into());
+        state.set_destination(destination);
+        assert!(state.pending_apply.is_none());
+        assert!(!state.romm_pending_apply && !state.retrodeck_pending_apply);
+        assert!(
+            state.confirm_text.is_empty()
+                && state.romm_confirm_text.is_empty()
+                && state.retrodeck_confirm_text.is_empty()
+        );
+        assert!(state.selected_family.is_none() && state.dat_platform_identity.is_none());
+        assert!(state.error.is_none() && state.apply_error.is_none());
+        state.set_destination(PlayingLibraryDestination::Generic);
+        state.preview();
+        assert!(state.plan().is_some());
+        state.confirm_apply(); // stale approval must not authorize a new preview
+        assert!(state.applied().is_none());
+        assert!(std::fs::symlink_metadata(&output).is_err());
+        assert_eq!(std::fs::read(&source).unwrap(), b"test");
+        state.request_apply();
+        state.confirm_apply();
+        assert!(
+            state.applied().is_some(),
+            "fresh explicit confirmation still works"
+        );
+    }
+}
+
+#[test]
+fn destination_change_preserves_completed_receipts_and_undo() {
+    let fixture = Fixture::new("destination-receipt-preservation");
+    let (mut state, source, _) = preview_a_single_election(&fixture);
+    state.request_apply();
+    state.confirm_apply();
+    let receipt = state.applied().unwrap().clone();
+    let output = receipt.entries[0].destination_path.clone();
+    state.apply_error = Some("Retained receipt diagnostic".into());
+    state.romm_applied = Some(receipt.clone());
+    state.romm_error = Some("Retained RomM receipt diagnostic".into());
+    state.retrodeck_selected_id = Some("retained-publication-operation".into());
+    state.retrodeck_error = Some("Retained recovery diagnostic".into());
+    state.set_destination(PlayingLibraryDestination::Romm);
+    assert_eq!(state.applied().unwrap(), &receipt);
+    assert_eq!(state.romm_applied.as_ref(), Some(&receipt));
+    assert_eq!(
+        state.apply_error.as_deref(),
+        Some("Retained receipt diagnostic")
+    );
+    assert_eq!(
+        state.romm_error.as_deref(),
+        Some("Retained RomM receipt diagnostic")
+    );
+    assert_eq!(
+        state.retrodeck_error.as_deref(),
+        Some("Retained recovery diagnostic")
+    );
+    assert_eq!(
+        state.retrodeck_selected_id.as_deref(),
+        Some("retained-publication-operation")
+    );
+    assert!(state.applied_plan.is_some());
+    assert!(output.is_symlink());
+    // Existing receipt-owned rollback remains available after changing destination.
+    state.rollback_last();
+    assert!(std::fs::symlink_metadata(&output).is_err());
+    assert_eq!(std::fs::read(&source).unwrap(), b"test");
+}

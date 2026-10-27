@@ -22,6 +22,8 @@ use sha2::{Digest, Sha256};
 // Launch-option trainer adapters keep preview, identity, and transaction
 // semantics in the core crate for all GUI surfaces.
 
+/// Advisory requirements planning for caller-supplied launch-provider evidence.
+pub mod alternative_launch_provider_planner;
 /// Bounded gzip decompression of `.adz` (compressed Amiga floppy) containers,
 /// projected through the existing ADF parser - no new filesystem, no new
 /// ADF parsing.
@@ -116,6 +118,8 @@ pub mod managed_emulator_install;
 pub mod metadata_aggregation;
 /// Bounded MSX standard cassette WAV evidence.
 pub mod msx_tape;
+/// Read-only comparison of explicitly supplied netplay observations.
+pub mod netplay_readiness;
 pub mod nintendo3ds_retail;
 /// Shared read-only projections of workflow journals into operation receipts
 /// and conservative recovery capabilities.
@@ -152,6 +156,7 @@ pub mod uef_tape;
 /// A disposable profile holding one production-verified synthetic game.
 #[cfg(any(test, feature = "test-support"))]
 pub mod verified_game_fixture;
+pub mod whdload_options;
 use database::scan_and_persist_folders;
 pub use database::{
     ArchiveChangeKind, ArchiveObservationKind, ArchiveUpsertOutcome, AutomaticPlatformDetails,
@@ -366,6 +371,7 @@ pub mod fmtowns_container_evidence;
 /// Narrow, representation-independent optical-disc fingerprinting seam.
 pub mod optical_fingerprint;
 pub mod optical_layout_inspection;
+pub mod optical_layout_integrity;
 
 /// Shared preservation admission and output verification for CD conversion.
 pub(crate) mod optical_preservation;
