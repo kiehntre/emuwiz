@@ -173,7 +173,7 @@ impl App {
             let pages = shown.len().div_ceil(PAGE_SIZE).max(1);
             state.page = state.page.min(pages - 1);
             for set in shown.iter().skip(state.page * PAGE_SIZE).take(PAGE_SIZE) {
-                if let Some(route) = set_row(ui, set, &mut state.open) {
+                if let Some(route) = set_row(ui, set, &mut state.open, !stale && !failed) {
                     go = Some(route);
                 }
             }
@@ -282,7 +282,12 @@ fn chips(ui: &mut egui::Ui, state: &mut MediaSetsToolState) {
 }
 
 /// One set; returns a navigation when "Open game details" is pressed.
-fn set_row(ui: &mut egui::Ui, set: &SetView, open: &mut Option<String>) -> Option<Route> {
+fn set_row(
+    ui: &mut egui::Ui,
+    set: &SetView,
+    open: &mut Option<String>,
+    fresh: bool,
+) -> Option<Route> {
     let mut go = None;
     let expanded = open.as_deref() == Some(set.title.as_str());
     ui.push_id(("v2_media_set", &set.title), |ui| {
@@ -387,6 +392,7 @@ fn set_row(ui: &mut egui::Ui, set: &SetView, open: &mut Option<String>) -> Optio
                     )
                     .color(palette::SECONDARY_TEXT),
                 );
+                super::next_disc_guidance::show(ui, set, fresh);
                 ui.collapsing("Why EmuWiz says this", |ui| {
                     for line in &set.why {
                         ui.add(egui::Label::new(RichText::new(line).size(12.5)).wrap());
@@ -468,6 +474,7 @@ mod tests {
             conflicts: Vec::new(),
             why: Vec::new(),
             swap: Vec::new(),
+            disc_order: Vec::new(),
             game_id: None,
             search: title.to_lowercase(),
         }
@@ -533,7 +540,7 @@ mod tests {
                         egui::CentralPanel::default().show(context, |ui| {
                             egui::ScrollArea::vertical().show(ui, |ui| {
                                 texts.clear();
-                                assert_eq!(set_row(ui, &incomplete, &mut open), None);
+                                assert_eq!(set_row(ui, &incomplete, &mut open, true), None);
                                 used = ui.min_rect().right();
                             });
                         });

@@ -55,13 +55,16 @@ mod mods;
 mod mounts_page;
 mod native_workflows;
 mod needs_attention_page;
+mod next_disc_guidance;
 mod nkit;
 mod onboarding;
 mod organisation;
 mod pages;
+mod patch_package_preview;
 mod platform_aliases_page;
 mod problem_actions;
 mod problems;
+mod profile_settings_preview;
 mod psp_iso_analyser;
 mod quarantine_confirm;
 mod r2_rename;
@@ -80,6 +83,7 @@ mod setup_portability;
 #[path = "tests/shared_scroll.rs"]
 mod shared_scroll_tests;
 mod simple_shell;
+mod source_impact;
 mod sources_providers;
 #[cfg(test)]
 mod stale_inspection_tests;
