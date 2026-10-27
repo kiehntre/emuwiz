@@ -455,8 +455,82 @@ fn hex(bytes: &[u8]) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::io::{self, BufRead, Write};
     use std::os::unix::fs::PermissionsExt;
     use tempfile::tempdir;
+
+    const FIXTURE_READY_ARGUMENT: &str = "--emuwiz-fixture-ready";
+
+    fn fixture_probe(executable: &Path, deadline: Instant) -> io::Result<()> {
+        let mut child = Command::new(executable)
+            .arg(FIXTURE_READY_ARGUMENT)
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()?;
+        loop {
+            let status = match child.try_wait() {
+                Ok(status) => status,
+                Err(error) => {
+                    let _ = child.kill();
+                    let _ = child.wait();
+                    return Err(error);
+                }
+            };
+            if let Some(status) = status {
+                return if status.success() {
+                    Ok(())
+                } else {
+                    Err(io::Error::other(format!("fixture probe exited {status}")))
+                };
+            }
+            if Instant::now() >= deadline {
+                let _ = child.kill();
+                let _ = child.wait();
+                return Err(io::Error::new(
+                    io::ErrorKind::TimedOut,
+                    "fixture probe timed out",
+                ));
+            }
+            thread::sleep(Duration::from_millis(1));
+        }
+    }
+
+    fn wait_for_fixture_ready(
+        executable: &Path,
+        timeout: Duration,
+        mut on_text_busy: impl FnMut(),
+    ) -> io::Result<()> {
+        let deadline = Instant::now() + timeout;
+        loop {
+            match fixture_probe(executable, deadline) {
+                Err(error)
+                    if error.raw_os_error() == Some(libc::ETXTBSY) && Instant::now() < deadline =>
+                {
+                    on_text_busy();
+                    thread::sleep(Duration::from_millis(1));
+                }
+                result => return result,
+            }
+        }
+    }
+
+    fn executable_fixture(executable: &Path, body: &str) {
+        // Parallel test processes can inherit a writer between fork and exec.
+        // Prove the fixture is executable before testing the production outcome.
+        // This private probe never retries a production verification operation.
+        fs::write(
+            executable,
+            format!(
+                "#!/bin/sh\nif [ \"$1\" = \"{FIXTURE_READY_ARGUMENT}\" ]; then exit 0; fi\n{body}"
+            ),
+        )
+        .unwrap();
+        fs::set_permissions(executable, fs::Permissions::from_mode(0o755)).unwrap();
+        wait_for_fixture_ready(executable, Duration::from_secs(2), || {}).unwrap_or_else(|error| {
+            panic!("fixture {} is not ready: {error:?}", executable.display())
+        });
+    }
 
     fn request(root: &Path, executable: Option<PathBuf>) -> MamePostRepairVerificationRequest {
         let file = root.join("pacman").join("rom.bin");
@@ -508,12 +582,7 @@ mod tests {
     fn fake_mame_receives_only_one_explicit_set_and_passes() {
         let dir = tempdir().unwrap();
         let executable = dir.path().join("mame");
-        fs::write(
-            &executable,
-            "#!/bin/sh\nprintf 'romset pacman is good\\n'\n",
-        )
-        .unwrap();
-        fs::set_permissions(&executable, fs::Permissions::from_mode(0o755)).unwrap();
+        executable_fixture(&executable, "printf 'romset pacman is good\\n'\n");
         let result = verify_mame_repair(&request(dir.path(), Some(executable)));
         assert_eq!(result.state, MameRepairVerificationState::VerifiedComplete);
         let argv = &result.targeted_mame.unwrap().argv;
@@ -527,18 +596,12 @@ mod tests {
     fn missing_output_is_incomplete_and_wrong_set_is_not_a_pass() {
         let dir = tempdir().unwrap();
         let executable = dir.path().join("mame");
-        fs::write(
-            &executable,
-            "#!/bin/sh\nprintf 'romset pacman is missing\\n'\n",
-        )
-        .unwrap();
-        fs::set_permissions(&executable, fs::Permissions::from_mode(0o755)).unwrap();
+        executable_fixture(&executable, "printf 'romset pacman is missing\\n'\n");
         let result = verify_mame_repair(&request(dir.path(), Some(executable)));
         assert_eq!(result.state, MameRepairVerificationState::StillIncomplete);
 
         let executable = dir.path().join("wrong-mame");
-        fs::write(&executable, "#!/bin/sh\nprintf 'romset other is good\\n'\n").unwrap();
-        fs::set_permissions(&executable, fs::Permissions::from_mode(0o755)).unwrap();
+        executable_fixture(&executable, "printf 'romset other is good\\n'\n");
         let result = verify_mame_repair(&request(dir.path(), Some(executable)));
         assert_eq!(
             result.state,
@@ -550,28 +613,114 @@ mod tests {
     fn nonzero_exit_and_timeout_are_not_verified() {
         let dir = tempdir().unwrap();
         let executable = dir.path().join("nonzero-mame");
-        fs::write(
-            &executable,
-            "#!/bin/sh\nprintf 'romset pacman is good\\n'\nexit 2\n",
-        )
+        executable_fixture(&executable, "printf 'romset pacman is good\\n'\nexit 2\n");
+        let result = verify_mame_repair(&request(dir.path(), Some(executable)));
+        assert_eq!(
+            result.targeted_mame.as_ref().unwrap().state,
+            MameTargetedVerificationState::NonZeroExit,
+            "unexpected targeted verification: {:?}",
+            result.targeted_mame
+        );
+
+        let executable = dir.path().join("timeout-mame");
+        executable_fixture(&executable, "sleep 1\n");
+        let mut request = request(dir.path(), Some(executable));
+        request.timeout = Duration::from_millis(1);
+        let result = verify_mame_repair(&request);
+        assert_eq!(
+            result.targeted_mame.as_ref().unwrap().state,
+            MameTargetedVerificationState::Timeout,
+            "unexpected targeted verification: {:?}",
+            result.targeted_mame
+        );
+    }
+
+    #[test]
+    fn fixture_readiness_waits_for_an_inherited_writer_without_retrying_verification() {
+        struct Holder(std::process::Child);
+        impl Drop for Holder {
+            fn drop(&mut self) {
+                let _ = self.0.kill();
+                let _ = self.0.wait();
+            }
+        }
+        let dir = tempdir().unwrap();
+        let executable = dir.path().join("nonzero-mame");
+        executable_fixture(&executable, "printf 'romset pacman is good\\n'\nexit 2\n");
+        let writer = fs::OpenOptions::new()
+            .write(true)
+            .open(&executable)
+            .unwrap();
+        let mut holder = Holder(
+            Command::new("/bin/sh")
+                .args(["-c", "printf 'ready\\n' >&2; read release"])
+                .stdin(Stdio::piped())
+                .stdout(Stdio::from(writer))
+                .stderr(Stdio::piped())
+                .spawn()
+                .unwrap(),
+        );
+        let mut ready = String::new();
+        io::BufReader::new(holder.0.stderr.take().unwrap())
+            .read_line(&mut ready)
+            .unwrap();
+        assert_eq!(ready, "ready\n");
+        let busy = Command::new(&executable)
+            .arg(FIXTURE_READY_ARGUMENT)
+            .status()
+            .unwrap_err();
+        eprintln!("controlled inherited-writer spawn error: {busy:?}");
+        assert_eq!(busy.raw_os_error(), Some(libc::ETXTBSY), "{busy:?}");
+        let blocked = verify_mame_repair(&request(dir.path(), Some(executable.clone())));
+        assert_eq!(
+            blocked.targeted_mame.unwrap().state,
+            MameTargetedVerificationState::Unavailable
+        );
+        let mut retries = 0;
+        wait_for_fixture_ready(&executable, Duration::from_secs(2), || {
+            retries += 1;
+            holder
+                .0
+                .stdin
+                .take()
+                .unwrap()
+                .write_all(b"release\n")
+                .unwrap();
+            holder.0.wait().unwrap();
+        })
         .unwrap();
-        fs::set_permissions(&executable, fs::Permissions::from_mode(0o755)).unwrap();
+        assert_eq!(retries, 1);
         let result = verify_mame_repair(&request(dir.path(), Some(executable)));
         assert_eq!(
             result.targeted_mame.unwrap().state,
             MameTargetedVerificationState::NonZeroExit
         );
+    }
 
-        let executable = dir.path().join("timeout-mame");
-        fs::write(&executable, "#!/bin/sh\nsleep 1\n").unwrap();
-        fs::set_permissions(&executable, fs::Permissions::from_mode(0o755)).unwrap();
-        let mut request = request(dir.path(), Some(executable));
-        request.timeout = Duration::from_millis(1);
-        let result = verify_mame_repair(&request);
+    #[test]
+    fn fixture_readiness_fails_other_spawn_errors_and_busy_deadline() {
+        let dir = tempdir().unwrap();
+        let executable = dir.path().join("missing-mame");
+        let error = wait_for_fixture_ready(&executable, Duration::from_secs(2), || {
+            panic!("missing executable must not be retried")
+        })
+        .unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::NotFound);
+        let result = verify_mame_repair(&request(dir.path(), Some(executable.clone())));
         assert_eq!(
             result.targeted_mame.unwrap().state,
-            MameTargetedVerificationState::Timeout
+            MameTargetedVerificationState::Unavailable
         );
+        executable_fixture(&executable, "exit 0\n");
+        let _writer = fs::OpenOptions::new()
+            .write(true)
+            .open(&executable)
+            .unwrap();
+        let error = wait_for_fixture_ready(&executable, Duration::ZERO, || {
+            panic!("expired readiness deadline must not retry")
+        })
+        .unwrap_err();
+        assert_eq!(error.raw_os_error(), Some(libc::ETXTBSY));
     }
 
     #[test]
