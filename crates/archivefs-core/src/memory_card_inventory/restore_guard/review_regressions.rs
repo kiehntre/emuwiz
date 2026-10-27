@@ -310,6 +310,73 @@ fn concurrent_cooperating_restore_is_refused_before_mutation() {
     world.apply().unwrap();
 }
 
+fn assert_lock_free(world: &World) {
+    drop(ownership::lock(&world.card).expect("the operation must not retain the directory lock"));
+}
+
+#[test]
+fn failed_apply_releases_the_operation_lock() {
+    let world = World::new();
+    let result = world.apply_hooked(&CLOSED, &|step| {
+        if step == Ps2RestoreStep::BeforeRename {
+            EXCHANGE_ERRORS.with(|errors| errors.borrow_mut().push_back(libc::ENOSYS));
+        }
+        Ok(())
+    });
+    assert_eq!(
+        result.unwrap_err(),
+        Ps2PsuRestoreError::UnsupportedAtomicExchange
+    );
+    assert_lock_free(&world);
+}
+
+#[test]
+fn cancelled_apply_releases_the_operation_lock() {
+    let world = World::new();
+    let result = world.apply_hooked(&CLOSED, &|step| {
+        if step == Ps2RestoreStep::BeforeRename {
+            return Err(std::io::Error::other("operator cancelled"));
+        }
+        Ok(())
+    });
+    assert!(result.is_err());
+    assert_eq!(world.card_bytes(), world.original);
+    assert_lock_free(&world);
+}
+
+#[test]
+fn failed_undo_releases_the_operation_lock_and_can_be_retried() {
+    let world = World::new();
+    let applied = world.apply().unwrap();
+    let post = world.card_bytes();
+    let result = undo_with_hook(&applied.journal_path, &CLOSED, 2, &|step| {
+        if step == Ps2RestoreStep::BeforeUndoRename {
+            EXCHANGE_ERRORS.with(|errors| errors.borrow_mut().push_back(libc::ENOSYS));
+        }
+        Ok(())
+    });
+    assert!(result.is_err());
+    assert_lock_free(&world);
+    // The failed Undo left the applied card alone, so a later Undo can run.
+    assert_eq!(world.card_bytes(), post);
+}
+
+#[test]
+fn recovery_after_a_crash_holds_and_then_releases_the_lock() {
+    let world = World::new();
+    let _ = world.apply_hooked(&CLOSED, &|step| crash(step, Ps2RestoreStep::AfterRename));
+    assert_lock_free(&world);
+    let journal = world.journal_files()[0].clone();
+    let held = ownership::lock(&world.card).unwrap();
+    assert!(matches!(
+        recover_ps2_psu_restore(&journal, 2),
+        Err(Ps2PsuRestoreError::RecoveryRequired(_))
+    ));
+    drop(held);
+    recover_ps2_psu_restore(&journal, 2).unwrap();
+    assert_lock_free(&world);
+}
+
 #[test]
 fn hardlinked_card_is_refused_before_backup() {
     let world = World::new();
