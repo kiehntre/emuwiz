@@ -411,10 +411,12 @@ impl MediaIndex {
                     && folder.layout == super::local_artwork_folders::Layout::EsDe
                     && super::local_artwork_folders::safe_existing(folder)
             })
-            .map(|folder| folder.path.clone())
+            .map(|folder| (folder.path.clone(), folder.rom_root.clone()))
             .collect();
         let mut esde_root_specs: Vec<(PathBuf, Option<PathBuf>)> = Vec::new();
-        if let Some(root) = &es_de_root {
+        if let Some(root) = &es_de_root
+            && !custom_esde_overrides_default(root, &local_folders)
+        {
             let mut roots = Vec::new();
             for candidate in [
                 archivefs_core::emulator_environment::es_de_metadata::configured_rom_directory(
@@ -433,28 +435,17 @@ impl MediaIndex {
             }
             esde_root_specs.extend(roots.into_iter().map(|rom_root| (root.clone(), rom_root)));
         }
-        for root in custom_esde {
-            let rom_roots = [
-                archivefs_core::emulator_environment::es_de_metadata::configured_rom_directory(
-                    &root,
-                ),
-                config
-                    .as_ref()
-                    .and_then(|config| config.master_rom_root.clone()),
-            ];
-            let mut candidates = Vec::new();
-            for candidate in rom_roots {
-                if candidate.is_some() && !candidates.contains(&candidate) {
-                    candidates.push(candidate);
-                }
-            }
-            if candidates.is_empty() {
-                candidates.push(None);
-            }
+        for (root, explicit_rom_root) in custom_esde {
             esde_root_specs.extend(
-                candidates
-                    .into_iter()
-                    .map(|rom_root| (root.clone(), rom_root)),
+                custom_esde_rom_roots(
+                    &root,
+                    explicit_rom_root.as_deref(),
+                    config
+                        .as_ref()
+                        .and_then(|config| config.master_rom_root.as_deref()),
+                )
+                .into_iter()
+                .map(|rom_root| (root.clone(), rom_root)),
             );
         }
         let esde_collections: Vec<_> = esde_root_specs.iter()
@@ -1246,6 +1237,46 @@ pub(super) fn esde_artwork_candidates(
     out
 }
 
+// Suppress automatic discovery for the same provider root even if its
+// explicitly chosen ROM tree became unavailable: absence is not fallback consent.
+fn custom_esde_overrides_default(
+    root: &std::path::Path,
+    folders: &[super::local_artwork_folders::Folder],
+) -> bool {
+    let canonical = std::fs::canonicalize(root).ok();
+    folders.iter().any(|folder| {
+        folder.enabled
+            && folder.layout == super::local_artwork_folders::Layout::EsDe
+            && folder.rom_root.is_some()
+            && (folder.path == root || canonical.as_ref() == Some(&folder.path))
+    })
+}
+
+/// An explicit root is authoritative for this provider's path mapping; never
+/// mix it with older roots and accidentally associate the same relative name.
+fn custom_esde_rom_roots(
+    root: &std::path::Path,
+    explicit: Option<&std::path::Path>,
+    master: Option<&std::path::Path>,
+) -> Vec<Option<PathBuf>> {
+    if let Some(explicit) = explicit {
+        return vec![Some(explicit.to_path_buf())];
+    }
+    let mut roots = Vec::new();
+    for candidate in [
+        archivefs_core::emulator_environment::es_de_metadata::configured_rom_directory(root),
+        master.map(std::path::Path::to_path_buf),
+    ] {
+        if candidate.is_some() && !roots.contains(&candidate) {
+            roots.push(candidate);
+        }
+    }
+    if roots.is_empty() {
+        roots.push(None);
+    }
+    roots
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1878,5 +1909,73 @@ mod tests {
             discover_game_documents(&game, &DocumentPreferences::default(), Some(&index));
         assert!(docs.is_empty());
         assert!(issue.unwrap().contains("conflicts"));
+    }
+}
+
+#[cfg(test)]
+mod separate_rom_root_tests {
+    use super::super::local_artwork_folders::{Folder, Layout, safe_existing};
+    use super::*;
+    #[test]
+    fn explicit_rom_tree_uses_existing_parser_without_old_root_fallback_or_writes() {
+        let dir = tempfile::tempdir().unwrap();
+        let provider = dir.path().join("ES DE art");
+        let roms = dir.path().join("separate ROMs");
+        let previous = dir.path().join("old ROMs");
+        std::fs::create_dir_all(provider.join("gamelists/nes")).unwrap();
+        std::fs::create_dir_all(provider.join("downloaded_media")).unwrap();
+        for root in [&roms, &previous] {
+            std::fs::create_dir_all(root.join("nes")).unwrap();
+            std::fs::write(root.join("nes/game.zip"), b"original").unwrap();
+        }
+        let gamelist = provider.join("gamelists/nes/gamelist.xml");
+        let xml = b"<gameList><game><path>./game.zip</path><name>Exact path game</name></game></gameList>";
+        std::fs::write(&gamelist, xml).unwrap();
+        let roots = custom_esde_rom_roots(&provider, Some(&roms), Some(&previous));
+        assert_eq!(roots, vec![Some(roms.clone())]);
+        let collection = archivefs_core::emulator_environment::es_de_metadata::discover_provider_snapshot_with_rom_root(&provider, 1, roots[0].as_deref());
+        assert!(
+            collection
+                .lookup_path("NES", &roms.join("nes/game.zip"))
+                .is_some()
+        );
+        assert!(
+            collection
+                .lookup_path("NES", &previous.join("nes/game.zip"))
+                .is_none()
+        );
+        assert_eq!(std::fs::read(&gamelist).unwrap(), xml);
+        for root in [&roms, &previous] {
+            assert_eq!(
+                std::fs::read(root.join("nes/game.zip")).unwrap(),
+                b"original"
+            );
+        }
+    }
+    #[test]
+    fn missing_or_linked_explicit_tree_never_enables_automatic_default_discovery() {
+        let dir = tempfile::tempdir().unwrap();
+        let provider = dir.path().join("ES-DE");
+        std::fs::create_dir_all(provider.join("gamelists")).unwrap();
+        std::fs::create_dir_all(provider.join("downloaded_media")).unwrap();
+        let mut folder = Folder {
+            path: provider.clone(),
+            layout: Layout::EsDe,
+            enabled: true,
+            rom_root: Some(dir.path().join("missing")),
+        };
+        assert!(!safe_existing(&folder));
+        assert!(custom_esde_overrides_default(&provider, &[folder.clone()]));
+        #[cfg(unix)]
+        {
+            let alias = dir.path().join("linked-roms");
+            std::os::unix::fs::symlink(&provider, &alias).unwrap();
+            folder.rom_root = Some(alias);
+            assert!(!safe_existing(&folder));
+        }
+        folder.rom_root = None;
+        assert!(safe_existing(&folder));
+        assert!(!custom_esde_overrides_default(&provider, &[folder]));
+        assert_eq!(custom_esde_rom_roots(&provider, None, None), vec![None]);
     }
 }

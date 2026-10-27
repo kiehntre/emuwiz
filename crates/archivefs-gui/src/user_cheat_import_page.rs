@@ -30,18 +30,21 @@ use archivefs_core::patch_manager::{
     XeniaInstallPreviewRequest, XeniaProfile, apply_cheat_journey, build_dolphin_install_preview,
     build_pcsx2_install_preview, build_shared_transaction_plan, build_xenia_install_preview,
     check_local_dolphin_install_state, check_local_pcsx2_install_state,
-    check_local_xenia_install_state, convert_cheat_document, decode_action_replay,
-    default_shared_backup_root, default_shared_history_root, detect_action_replay_format,
-    discover_local_dolphin_cheat_file, discover_local_pcsx2_pnach_file,
-    discover_local_retroarch_cheat_file, discover_local_xenia_patch_file, dolphin_line_to_ir,
-    dolphin_on_frame_line_to_ir, execute_shared_apply, execute_shared_rollback,
-    generate_shared_operation_id, load_dolphin_destination, load_local_xenia_destination,
-    parse_ds_action_replay_document, pnach_line_to_ir, preview_cheat_journey,
-    preview_cheat_journey_undo, preview_cheat_pack, preview_shared_rollback,
-    scan_user_cheat_directory, scan_user_cheat_file, select_cheat_journey_candidate,
-    stage_local_dolphin_codes, stage_local_xenia_patch_file, stage_pcsx2_pnach,
-    supported_targets_for, undo_cheat_journey,
+    check_local_xenia_install_state, decode_action_replay, default_shared_backup_root,
+    default_shared_history_root, detect_action_replay_format, discover_local_dolphin_cheat_file,
+    discover_local_pcsx2_pnach_file, discover_local_retroarch_cheat_file,
+    discover_local_xenia_patch_file, dolphin_line_to_ir, dolphin_on_frame_line_to_ir,
+    execute_shared_apply, execute_shared_rollback, generate_shared_operation_id,
+    load_dolphin_destination, load_local_xenia_destination, parse_ds_action_replay_document,
+    pnach_line_to_ir, preview_cheat_journey, preview_cheat_journey_undo, preview_cheat_pack,
+    preview_shared_rollback, scan_user_cheat_directory, scan_user_cheat_file,
+    select_cheat_journey_candidate, stage_local_dolphin_codes, stage_local_xenia_patch_file,
+    stage_pcsx2_pnach, supported_targets_for, undo_cheat_journey,
 };
+#[path = "user_cheat_import_page/verified_conversion.rs"]
+mod verified_conversion;
+#[cfg(test)]
+use archivefs_core::patch_manager::convert_cheat_document;
 use eframe::egui;
 
 use crate::ui::components as widgets;
@@ -3267,7 +3270,10 @@ impl UserCheatImportPageState {
                             }
                         }
                         Ok(document) => {
-                            let capabilities = supported_targets_for(&document);
+                            let capabilities = supported_targets_for(&document).into_iter().filter(|item| !matches!(item.target,
+                                CheatTargetFormat::RetroArch | CheatTargetFormat::GameSharkPs2 | CheatTargetFormat::CodeBreakerPs2
+                            )).collect::<Vec<_>>();
+                            ui.label("Only targets with a round-trip parser are offered. Encoding verification does not establish game identity, address-map compatibility or an in-game effect.");
                             for item in &capabilities {
                                 let status = match &item.capability {
                                     ConversionCapability::Exact => "Exact for all parsed operations".to_string(),
@@ -3291,7 +3297,10 @@ impl UserCheatImportPageState {
                                             ui.selectable_value(&mut self.converter_target_format, Some(item.target.clone()), target_label(&item.target));
                                         }
                                     });
-                                let preview = convert_cheat_document(&document, target);
+                                // Re-read the selection after the ComboBox: never display the
+                                // previous target's verified output on the selection frame.
+                                let current_target = self.converter_target_format.clone().unwrap_or(target);
+                                let preview = verified_conversion::verified_preview(&document, current_target);
                                 ui.label(format!("Preview: {} exact, {} unsupported", preview.exact_operations, preview.unsupported_operations));
                                 if !preview.warnings.is_empty() {
                                     ui.colored_label(
@@ -3307,7 +3316,7 @@ impl UserCheatImportPageState {
                                         ui.ctx().copy_text(output.to_string());
                                     }
                                 } else {
-                                    ui.label("No output is available because the selected target cannot safely represent every operation.");
+                                    ui.label("No output is available: every operation must be representable and pass target-parser round-trip verification.");
                                 }
                             }
                         }

@@ -186,8 +186,38 @@ pub(super) fn groups() -> Vec<ToolGroup> {
         purpose: ToolPage::HomebrewBrowser.purpose(),
         safety: ToolSafety::LookingOnly,
     });
+    games.tools.push(Tool {
+        route: Route::Tool(ToolPage::SourceImpact),
+        title: ToolPage::SourceImpact.title(),
+        purpose: ToolPage::SourceImpact.purpose(),
+        safety: ToolSafety::LookingOnly,
+    });
     let mut storage = group("Storage & duplicates", &[S::Storage, S::Duplicates]);
+    games.tools.push(Tool {
+        route: Route::Tool(ToolPage::ProfileSettings),
+        title: ToolPage::ProfileSettings.title(),
+        purpose: ToolPage::ProfileSettings.purpose(),
+        safety: ToolSafety::LookingOnly,
+    });
+    storage.tools.push(Tool {
+        route: Route::Tool(ToolPage::OpticalCompare),
+        title: ToolPage::OpticalCompare.title(),
+        purpose: ToolPage::OpticalCompare.purpose(),
+        safety: ToolSafety::LookingOnly,
+    });
     let mut cheats = group("Cheats, mods & patches", &[S::CheatsMods, S::Mods]);
+    cheats.tools.push(Tool {
+        route: Route::Tool(ToolPage::WhdloadOptions),
+        title: ToolPage::WhdloadOptions.title(),
+        purpose: ToolPage::WhdloadOptions.purpose(),
+        safety: ToolSafety::LookingOnly,
+    });
+    cheats.tools.push(Tool {
+        route: Route::Tool(ToolPage::PatchPackagePreview),
+        title: ToolPage::PatchPackagePreview.title(),
+        purpose: ToolPage::PatchPackagePreview.purpose(),
+        safety: ToolSafety::LookingOnly,
+    });
     cheats.tools.push(Tool {
         route: Route::Tool(ToolPage::CheatExtras),
         title: ToolPage::CheatExtras.title(),
@@ -457,6 +487,26 @@ pub(super) fn unlisted_sections() -> Vec<Section> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn every_native_tool_is_registered_exactly_once() {
+        let listed: Vec<_> = groups()
+            .into_iter()
+            .flat_map(|group| group.tools.into_iter())
+            .filter_map(|tool| match tool.route {
+                Route::Tool(page) => Some(page),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(listed.len(), ToolPage::ALL.len());
+        for page in ToolPage::ALL {
+            assert_eq!(
+                listed.iter().filter(|&&listed| listed == page).count(),
+                1,
+                "{page:?} must remain reachable exactly once in All Tools"
+            );
+        }
+    }
 
     #[test]
     fn every_section_but_home_is_listed_exactly_once() {
