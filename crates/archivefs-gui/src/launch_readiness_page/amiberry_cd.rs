@@ -149,6 +149,7 @@ pub(super) fn show(ui: &mut egui::Ui, plan: &LaunchPlan, state: &mut StandaloneL
             .iter()
             .find_map(|c| c.content.resolved_path.clone())
     });
+    let feedback_path = selected.clone();
     let identity = preview_identity(plan);
     let key = (selected.clone(), identity.clone());
     if state.amiberry_cd.key.as_ref() != Some(&key) {
@@ -216,6 +217,26 @@ pub(super) fn show(ui: &mut egui::Ui, plan: &LaunchPlan, state: &mut StandaloneL
             return;
         }
         show_standalone_launch_action(ui, state, StandaloneLaunchRequest::AmiberryCd(request));
+    } else {
+        super::native_cd_feedback::show(
+            ui,
+            state,
+            feedback_path.as_deref(),
+            "amiberry_cd",
+            "Amiberry CD",
+            |process| {
+                if let super::StandaloneProcess::AmiberryCd(p) = process {
+                    let pid = p.pid;
+                    Some((
+                        pid,
+                        p.poll()
+                            .map(|report| super::exit_line("Amiberry CD", report)),
+                    ))
+                } else {
+                    None
+                }
+            },
+        );
     }
 }
 #[cfg(test)]

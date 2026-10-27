@@ -197,3 +197,66 @@ fn complete_blue_launch_uses_actual_registered_dat_and_configured_profile() {
         String::from_utf8_lossy(&output.stderr)
     );
 }
+
+#[test]
+fn returning_to_amiberry_game_retains_status_without_reviewed_selection() {
+    let f = fixture();
+    let process = ready(&f).reviewed.launch(&f.identity).unwrap();
+    let mut state = StandaloneLaunchState::default();
+    state.focus_dosbox_game(Some(&f.media));
+    state.tracked = Some((
+        f.media.clone(),
+        "amiberry_cd".into(),
+        super::super::StandaloneLaunchStage::Running(super::super::StandaloneProcess::AmiberryCd(
+            process,
+        )),
+    ));
+    let plan = LaunchPlan {
+        platform_id: Some("AmigaCD32".into()),
+        game_key: match &f.identity {
+            CanonicalIdentityStatus::Resolved(i) => Some(i.game_key.clone()),
+            _ => None,
+        },
+        candidates: Vec::new(),
+        summary: Default::default(),
+        media_topology: None,
+    };
+    fn text(shape: &egui::Shape) -> String {
+        match shape {
+            egui::Shape::Text(t) => t.galley.text().into(),
+            egui::Shape::Vec(v) => v.iter().map(text).collect::<Vec<_>>().join(" "),
+            _ => String::new(),
+        }
+    }
+    let context = egui::Context::default();
+    let output = context.run(egui::RawInput::default(), |ctx| {
+        egui::CentralPanel::default().show(ctx, |ui| show(ui, &plan, &mut state));
+    });
+    assert!(
+        output
+            .shapes
+            .iter()
+            .map(|s| text(&s.shape))
+            .collect::<Vec<_>>()
+            .join(" ")
+            .contains("Amiberry CD running · PID")
+    );
+    assert!(state.amiberry_cd.results.is_empty());
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while state.is_active() {
+        state.poll();
+        assert!(Instant::now() < deadline);
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    let output = context.run(egui::RawInput::default(), |ctx| {
+        egui::CentralPanel::default().show(ctx, |ui| show(ui, &plan, &mut state));
+    });
+    let rendered = output
+        .shapes
+        .iter()
+        .map(|s| text(&s.shape))
+        .collect::<Vec<_>>()
+        .join(" ");
+    assert!(rendered.contains("Process exited"));
+    assert!(rendered.contains('9'));
+}
