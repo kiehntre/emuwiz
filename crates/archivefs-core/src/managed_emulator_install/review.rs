@@ -528,6 +528,7 @@ mod tests {
         assert!(
             review
                 .staging_parent
+                .as_ref()
                 .unwrap()
                 .ends_with("emulators/pcsx2/installs")
         );
