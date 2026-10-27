@@ -180,8 +180,38 @@ pub(super) fn groups() -> Vec<ToolGroup> {
         purpose: ToolPage::MediaSets.purpose(),
         safety: ToolSafety::LookingOnly,
     });
+    games.tools.push(Tool {
+        route: Route::Tool(ToolPage::SourceImpact),
+        title: ToolPage::SourceImpact.title(),
+        purpose: ToolPage::SourceImpact.purpose(),
+        safety: ToolSafety::LookingOnly,
+    });
     let mut storage = group("Storage & duplicates", &[S::Storage, S::Duplicates]);
+    games.tools.push(Tool {
+        route: Route::Tool(ToolPage::ProfileSettings),
+        title: ToolPage::ProfileSettings.title(),
+        purpose: ToolPage::ProfileSettings.purpose(),
+        safety: ToolSafety::LookingOnly,
+    });
+    storage.tools.push(Tool {
+        route: Route::Tool(ToolPage::OpticalCompare),
+        title: ToolPage::OpticalCompare.title(),
+        purpose: ToolPage::OpticalCompare.purpose(),
+        safety: ToolSafety::LookingOnly,
+    });
     let mut cheats = group("Cheats, mods & patches", &[S::CheatsMods, S::Mods]);
+    cheats.tools.push(Tool {
+        route: Route::Tool(ToolPage::WhdloadOptions),
+        title: ToolPage::WhdloadOptions.title(),
+        purpose: ToolPage::WhdloadOptions.purpose(),
+        safety: ToolSafety::LookingOnly,
+    });
+    cheats.tools.push(Tool {
+        route: Route::Tool(ToolPage::PatchPackagePreview),
+        title: ToolPage::PatchPackagePreview.title(),
+        purpose: ToolPage::PatchPackagePreview.purpose(),
+        safety: ToolSafety::LookingOnly,
+    });
     cheats.tools.push(Tool {
         route: Route::Tool(ToolPage::CheatExtras),
         title: ToolPage::CheatExtras.title(),

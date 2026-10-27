@@ -36,7 +36,13 @@ pub(crate) trait ClipboardBackend {
 }
 
 pub(crate) fn clipboard_environment_summary() -> String {
-    let session_type = std::env::var("XDG_SESSION_TYPE").unwrap_or_else(|_| "unset".to_string());
+    let session_type = match std::env::var("XDG_SESSION_TYPE").as_deref() {
+        Ok("x11") => "x11",
+        Ok("wayland") => "wayland",
+        Ok("tty") => "tty",
+        Err(std::env::VarError::NotPresent) => "unset",
+        _ => "unknown",
+    };
     let display = if std::env::var_os("DISPLAY").is_some() {
         "present"
     } else {
@@ -74,13 +80,13 @@ pub(crate) fn clipboard_environment_summary() -> String {
 /// then holds *why*, so a broken clipboard is never silently reported as
 /// merely empty. Every operation safely reports `Unavailable` instead of
 /// panicking. Diagnostics (the environment summary, whether init
-/// succeeded, and the exact init error if it failed) are printed to
-/// stderr exactly once, at construction - never on every frame, and
-/// never including clipboard content.
+/// succeeded, or a fixed failure summary) are printed to stderr exactly
+/// once at construction. Backend errors remain available to the UI, but
+/// arbitrary error text and clipboard content must never enter stderr.
 pub(crate) struct NativeClipboard {
     pub(crate) inner: Option<arboard::Clipboard>,
     pub(crate) init_error: Option<String>,
-    /// The last `Unavailable` reason actually printed to stderr, so a
+    /// The last `Unavailable` reason reported with a fixed stderr summary, so a
     /// repeated identical failure (e.g. the context menu re-checking
     /// Paste's enabled state on every frame it stays open) is logged
     /// once, not every frame - while a *new* or *changed* failure is
@@ -105,7 +111,7 @@ impl NativeClipboard {
             }
             Err(error) => {
                 let message = error.to_string();
-                eprintln!("archivefs-gui: clipboard backend initialisation failed: {message}");
+                eprintln!("archivefs-gui: clipboard backend initialisation failed");
                 Self {
                     inner: None,
                     init_error: Some(message),
@@ -115,11 +121,11 @@ impl NativeClipboard {
         }
     }
 
-    /// Logs `message` to stderr, but only the first time (or the first
-    /// time it changes) - see `last_logged_error`'s doc comment.
+    /// Logs a fixed summary once per changed backend failure. The raw message
+    /// is retained for UI state and deduplication, never interpolated into logs.
     pub(crate) fn log_error_once(&mut self, message: &str) {
         if self.last_logged_error.as_deref() != Some(message) {
-            eprintln!("archivefs-gui: clipboard error: {message}");
+            eprintln!("archivefs-gui: clipboard error: backend unavailable");
             self.last_logged_error = Some(message.to_string());
         }
     }
@@ -172,5 +178,66 @@ pub(crate) fn clipboard_status_label(status: &ClipboardTextStatus) -> String {
         ClipboardTextStatus::Ready(_) => "Clipboard ready".to_string(),
         ClipboardTextStatus::Empty => "Clipboard contains no text".to_string(),
         ClipboardTextStatus::Unavailable(reason) => format!("Clipboard unavailable: {reason}"),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn diagnostic_probe() {
+        if std::env::var_os("EMUWIZ_CLIPBOARD_DIAGNOSTIC_PROBE").is_none() {
+            return;
+        }
+        let mut clipboard = NativeClipboard {
+            inner: None,
+            init_error: Some("synthetic-private-backend-detail".into()),
+            last_logged_error: None,
+        };
+        assert!(matches!(
+            clipboard.get_text_status(),
+            ClipboardTextStatus::Unavailable(reason) if reason == "synthetic-private-backend-detail"
+        ));
+        assert!(
+            clipboard
+                .set_text("synthetic-private-clipboard-text".into())
+                .is_err_and(|reason| reason == "synthetic-private-backend-detail")
+        );
+        assert!(clipboard.last_logged_error.is_some());
+        eprintln!("{}", clipboard_environment_summary());
+    }
+
+    #[test]
+    fn diagnostics_do_not_echo_backend_errors_or_unrecognised_session_values() {
+        let output = std::process::Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "clipboard::tests::diagnostic_probe",
+                "--nocapture",
+            ])
+            .env("EMUWIZ_CLIPBOARD_DIAGNOSTIC_PROBE", "1")
+            .env("XDG_SESSION_TYPE", "synthetic-private-session")
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "isolated clipboard diagnostic probe failed"
+        );
+        for bytes in [&output.stdout, &output.stderr] {
+            let text = String::from_utf8_lossy(bytes);
+            for private in [
+                "synthetic-private-backend-detail",
+                "synthetic-private-clipboard-text",
+                "synthetic-private-session",
+            ] {
+                assert!(
+                    !text.contains(private),
+                    "clipboard diagnostics exposed private data"
+                );
+            }
+        }
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert_eq!(stderr.matches("archivefs-gui: clipboard error:").count(), 1);
     }
 }
