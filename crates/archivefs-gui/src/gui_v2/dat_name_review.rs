@@ -57,6 +57,17 @@ impl State {
                 Err(mpsc::TryRecvError::Empty) => {}
             }
         }
+        // Keep the primary action above the catalogue inventory, which can be
+        // taller than a small viewport. All existing eligibility gates remain.
+        if ui
+            .add_enabled(
+                self.worker.is_none() && self.selected.is_some() && !self.root.trim().is_empty(),
+                egui::Button::new("Build fresh read-only preview"),
+            )
+            .clicked()
+        {
+            self.start();
+        }
         let busy = self.worker.is_some();
         ui.add_enabled_ui(!busy, |ui| {
             let prior = (self.selected.clone(), self.root.clone());
@@ -79,15 +90,6 @@ impl State {
             if ui.button("Refresh installed catalogues").clicked() {
                 self.picker.refresh();
                 self.result = None;
-            }
-            if ui
-                .add_enabled(
-                    self.selected.is_some() && !self.root.trim().is_empty(),
-                    egui::Button::new("Build fresh read-only preview"),
-                )
-                .clicked()
-            {
-                self.start();
             }
         });
         if busy {

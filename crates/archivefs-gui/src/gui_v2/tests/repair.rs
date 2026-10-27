@@ -30,10 +30,10 @@ fn blue_dat_name_review_keeps_primary_navigation_visible_and_clickable() {
         );
         let output = frame(&ctx, &mut app, size);
         assert_viewport_is(&ctx, &output, size);
-        assert!(organisation_label_is_visible(
-            &output,
-            "Build fresh read-only preview"
-        ));
+        assert!(
+            organisation_label_is_visible(&output, "Build fresh read-only preview"),
+            "Fresh preview action clipped at {size:?}"
+        );
         assert!(
             app.native_workflows
                 .as_ref()
