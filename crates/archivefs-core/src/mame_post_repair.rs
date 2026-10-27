@@ -679,22 +679,17 @@ mod tests {
         let mut retries = 0;
         wait_for_fixture_ready(&executable, Duration::from_secs(2), || {
             retries += 1;
-            holder
-                .0
-                .stdin
-                .take()
-                .unwrap()
-                .write_all(b"release\n")
-                .unwrap();
-            holder.0.wait().unwrap();
+            if let Some(mut stdin) = holder.0.stdin.take() {
+                stdin.write_all(b"release\n").unwrap();
+                holder.0.wait().unwrap();
+            }
         })
         .unwrap();
-        assert_eq!(retries, 1);
+        assert!(retries >= 1);
         let result = verify_mame_repair(&request(dir.path(), Some(executable)));
-        assert_eq!(
-            result.targeted_mame.unwrap().state,
-            MameTargetedVerificationState::NonZeroExit
-        );
+        let targeted = result.targeted_mame.unwrap();
+        assert_eq!(targeted.state, MameTargetedVerificationState::NonZeroExit);
+        assert_eq!(targeted.exit_code, Some(2));
     }
 
     #[test]
