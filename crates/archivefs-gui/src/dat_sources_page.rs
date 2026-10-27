@@ -133,6 +133,7 @@ mod native_verification;
 mod save_result;
 #[cfg(test)]
 pub(crate) use save_result::{DatSaveOutcome as FixtureDatSaveOutcome, persist_audit};
+pub(crate) mod canonical_preview;
 pub(crate) mod simple;
 mod update_health;
 use save_result::{DatSaveOperation, DatSaveOutcome, DatSaveResult};
@@ -14511,11 +14512,7 @@ fn show_rename_plan_section(
     action
 }
 
-fn show_rename_plan_row(
-    ui: &mut egui::Ui,
-    row: &RenamePlanRowView,
-    action: &mut Option<DatSourcesPageAction>,
-) {
+fn show_rename_plan_row_details(ui: &mut egui::Ui, row: &RenamePlanRowView) {
     ui.horizontal_wrapped(|ui| {
         widgets::status_badge(ui, row.state.label(), plan_state_tone(row.state));
         let current = egui::RichText::new(row.current_basename.clone()).monospace();
@@ -14633,6 +14630,14 @@ fn show_rename_plan_row(
                 .small(),
         );
     }
+}
+
+fn show_rename_plan_row(
+    ui: &mut egui::Ui,
+    row: &RenamePlanRowView,
+    action: &mut Option<DatSourcesPageAction>,
+) {
+    show_rename_plan_row_details(ui, row);
     ui.add_space(6.0);
     ui.horizontal_wrapped(|ui| {
         if let Some(proposed) = &row.proposed_basename

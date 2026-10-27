@@ -20,6 +20,9 @@ mod native_mod_activation;
 #[path = "game_firmware_guidance.rs"]
 mod game_firmware_guidance;
 
+#[path = "dat_name_review.rs"]
+mod dat_name_review;
+
 use super::{
     activity::Activity,
     environment::EnvironmentSnapshot,
@@ -73,6 +76,7 @@ pub(super) struct NativeWorkflows {
     artwork_reload: bool,
     sources_discovery: bool,
     collection: native_collection::State,
+    dat_name_review: dat_name_review::State,
     pub(super) tosec_inventory: super::tosec_inventory::State,
     firmware_guidance: game_firmware_guidance::State,
     scummvm_trainer: crate::cheats_mods::scummvm_trainer::State,
@@ -378,6 +382,7 @@ impl NativeWorkflows {
             artwork_reload: false,
             sources_discovery: false,
             collection: native_collection::State::default(),
+            dat_name_review: Default::default(),
             tosec_inventory: Default::default(),
             firmware_guidance: Default::default(),
             scummvm_trainer: Default::default(),
@@ -1054,6 +1059,23 @@ impl NativeWorkflows {
         self.app
             .navigate_to_main_view(crate::navigation::MainView::ExactDuplicateReview);
         self.app.show_exact_duplicate_review_page(ui);
+    }
+
+    pub(super) fn show_dat_name_review(&mut self, ui: &mut egui::Ui) {
+        self.dat_name_review.show(ui);
+        ui.collapsing("Last loaded DAT audit snapshot", |ui| {
+            self.show_dat_name_snapshot(ui);
+        });
+    }
+
+    fn show_dat_name_snapshot(&self, ui: &mut egui::Ui) {
+        // A snapshot must never initialize the controller that reconciles DAT
+        // recovery journals. Only borrow data that the user already loaded.
+        if let Some(page) = self.app.sources_ui.dat_sources_page.as_ref() {
+            crate::dat_sources_page::canonical_preview::show(ui, &page.view());
+        } else {
+            ui.label("No DAT audit is loaded. Build a fresh preview above, or load an audit in DATs & Verification. This snapshot does not initialize recovery or change files.");
+        }
     }
 
     pub(super) fn show_native_repair_review(&mut self, ui: &mut egui::Ui) {
@@ -3480,6 +3502,17 @@ mod launch_recovery_tests;
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn dat_name_snapshot_does_not_initialize_recovery_controller() {
+        let ctx = egui::Context::default();
+        let workflows = NativeWorkflows::new(ctx.clone());
+        assert!(workflows.app.sources_ui.dat_sources_page.is_none());
+        let _ = ctx.run(Default::default(), |ctx| {
+            egui::CentralPanel::default().show(ctx, |ui| workflows.show_dat_name_snapshot(ui));
+        });
+        assert!(workflows.app.sources_ui.dat_sources_page.is_none());
+    }
 
     fn blue_cheat_game(path: &str, platform: &str) -> crate::gui_v2::library::Game {
         crate::gui_v2::library::Game::from_archive(archivefs_core::PersistedArchive {
