@@ -403,7 +403,10 @@ impl App {
                 | OrganisationView::ExactDuplicates => repair::show(self, ui),
                 OrganisationView::FrontendExport => frontend_export::show(self, ui),
                 OrganisationView::Landing => {
-                    let compact = ui.ctx().content_rect().height() < COMPACT_HERO_VIEWPORT_HEIGHT;
+                    // The scroll viewport excludes the shell/header. Using the
+                    // full window height lets the hero clip navigation even at
+                    // 1024x600 once another review destination is available.
+                    let compact = ui.clip_rect().height() < COMPACT_HERO_VIEWPORT_HEIGHT;
                     // On a short window (for example 1024x600 at 160% scaling is
                     // 640x375 points) the hero would push the primary action
                     // below the fold, where it cannot be focused. Keep the page
