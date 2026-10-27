@@ -15,6 +15,7 @@ const FULL = [
   'Installer script tests', 'Create canonical artifact', 'Verify downloaded artifact',
   'Reproducibility build 1', 'Reproducibility build 2', 'Reproducibility',
 ];
+const UNEXPANDED_BUILD = 'Reproducibility build ${{ matrix.run }}';
 const ANALYZE = ['actions', 'c-cpp', 'python', 'rust'].map(x => `Analyze (${x})`);
 const marker = (number, sha) => `<!-- emuwiz-ci-final:${number}:${sha} -->`;
 
@@ -31,8 +32,20 @@ function decide({runs, jobs, tier, checks, statuses, mergeable, mergeStateStatus
       statuses.some(s => s.state === 'pending')) return {status: 'PENDING'};
 
   const shards = tier === 'gui' ? ['all'] : ['recovery', 'dat', 'gui-v2', 'rest'];
+  const ciJobs = jobs.filter(j => j.run_id === runs[0].id);
+  const classifiedFast = (tier === 'core' || tier === 'gui') && ciJobs.some(j =>
+    j.name === 'Classify change risk' && j.conclusion === 'success');
+  // Actions evaluates the job-level if before expanding a skipped matrix.
+  // Accept only that exact single skipped CI job, never missing full builds.
+  const unexpanded = ciJobs.filter(j => j.name === UNEXPANDED_BUILD);
+  const collapsedBuilds = classifiedFast && unexpanded.length === 1 &&
+    unexpanded[0].conclusion === 'skipped' &&
+    !ciJobs.some(j => /^Reproducibility build [12]$/.test(j.name));
+  const fullJobs = collapsedBuilds
+    ? [...FULL.filter(n => !/^Reproducibility build [12]$/.test(n)), UNEXPANDED_BUILD]
+    : FULL;
   const expected = [
-    [...ALWAYS, ...FULL, ...shards.map(s => `Formatting and relevant tests (${s})`)],
+    [...ALWAYS, ...fullJobs, ...shards.map(s => `Formatting and relevant tests (${s})`)],
     ANALYZE,
   ];
   const problems = [];
@@ -49,9 +62,8 @@ function decide({runs, jobs, tier, checks, statuses, mergeable, mergeStateStatus
   }
   // Only the six existing full-tier jobs may skip, only on core/gui PRs,
   // and only when classification itself succeeded. Never allowlist by name alone.
-  const expectedSkip = j => tier !== 'full' && FULL.includes(j.name) &&
-    j.run_id === runs[0].id && jobs.some(c => c.run_id === runs[0].id &&
-      c.name === 'Classify change risk' && c.conclusion === 'success');
+  const expectedSkip = j => classifiedFast && j.run_id === runs[0].id &&
+    (FULL.includes(j.name) || (collapsedBuilds && j.name === UNEXPANDED_BUILD));
   const allowedCheckIds = new Set(jobs.filter(j => expectedSkip(j) &&
     j.conclusion === 'skipped').map(j => Number(j.check_run_url.split('/').pop())));
   for (const j of jobs) {
