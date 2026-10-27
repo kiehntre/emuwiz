@@ -64,6 +64,7 @@ mod patch_package_preview;
 mod platform_aliases_page;
 mod problem_actions;
 mod problems;
+mod profile_settings_preview;
 mod psp_iso_analyser;
 mod quarantine_confirm;
 mod r2_rename;

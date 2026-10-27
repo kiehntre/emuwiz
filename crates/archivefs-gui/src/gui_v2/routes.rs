@@ -775,12 +775,13 @@ pub(super) enum ToolPage {
     DatabaseStatus,
     CheatExtras,
     PatchPackagePreview,
-    SourceImpact,
+    ProfileSettings,
     WhdloadOptions,
+    SourceImpact,
 }
 
 impl ToolPage {
-    pub const ALL: [Self; 11] = [
+    pub const ALL: [Self; 12] = [
         Self::NeedsAttention,
         Self::Mounts,
         Self::MediaSets,
@@ -790,8 +791,9 @@ impl ToolPage {
         Self::DatabaseStatus,
         Self::CheatExtras,
         Self::PatchPackagePreview,
-        Self::SourceImpact,
+        Self::ProfileSettings,
         Self::WhdloadOptions,
+        Self::SourceImpact,
     ];
 
     pub fn title(self) -> &'static str {
@@ -803,8 +805,9 @@ impl ToolPage {
             Self::LibraryViews => "Library Views",
             Self::PlatformAliases => "Platform aliases",
             Self::DatabaseStatus => "Database status",
-            Self::WhdloadOptions => "WHDLoad ToolType review",
             Self::PatchPackagePreview => "Patch-package inspection",
+            Self::ProfileSettings => "Per-game settings explanation",
+            Self::WhdloadOptions => "WHDLoad ToolType review",
             Self::SourceImpact => "Source-location impact preview",
             Self::CheatExtras => "Providers and code previews",
         }
@@ -823,11 +826,12 @@ impl ToolPage {
             }
             Self::PlatformAliases => "Teach EmuWiz what your folder names mean.",
             Self::DatabaseStatus => "Where EmuWiz keeps what it knows about your library.",
-            Self::WhdloadOptions => {
-                "Explain supplied ToolTypes and Config metadata without changing an installation."
-            }
             Self::PatchPackagePreview => {
                 "Inspect patches and untrusted package metadata without applying anything."
+            }
+            Self::ProfileSettings => "Classify pasted emulator settings without applying them.",
+            Self::WhdloadOptions => {
+                "Explain supplied ToolTypes and Config metadata without changing an installation."
             }
             Self::SourceImpact => {
                 "Preview one library source at a new folder without relocating anything."
@@ -847,8 +851,9 @@ impl ToolPage {
             Self::ViewHistory | Self::LibraryViews => Section::Build,
             Self::PlatformAliases => Section::Settings,
             Self::DatabaseStatus => Section::Settings,
-            Self::WhdloadOptions => Section::Mods,
             Self::PatchPackagePreview => Section::Mods,
+            Self::ProfileSettings => Section::Emulators,
+            Self::WhdloadOptions => Section::Mods,
             Self::SourceImpact => Section::Sources,
             Self::CheatExtras => Section::Mods,
         }
@@ -862,8 +867,9 @@ impl ToolPage {
             Self::MediaSets => "Multi-disc games",
             Self::ViewHistory | Self::LibraryViews => "Organise & Export",
             Self::PlatformAliases | Self::DatabaseStatus => "Settings",
-            Self::WhdloadOptions => "Tools",
             Self::PatchPackagePreview => "Tools",
+            Self::ProfileSettings => "Tools",
+            Self::WhdloadOptions => "Tools",
             Self::SourceImpact => "Tools",
             Self::CheatExtras => "Enhance",
         }
