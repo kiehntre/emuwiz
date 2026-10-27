@@ -294,6 +294,20 @@ fn complete_blue_launch_uses_private_registry_and_real_production_entrypoint() {
             .into_iter()
             .next()
             .unwrap();
+        let config_path = archivefs_core::dat::sources::default_dat_sources_config_path().unwrap();
+        assert!(config_path.starts_with(PathBuf::from(std::env::var_os("HOME").unwrap())));
+        std::fs::create_dir_all(config_path.parent().unwrap()).unwrap();
+        let dat = path.parent().unwrap().join("registered.dat");
+        std::fs::write(&config_path,format!("[[sources]]\nid='fixture'\ndisplay_name='Synthetic optical catalogue'\npath='{}'\nkind='file'\nenabled=true\n",dat.display())).unwrap();
+        let config = archivefs_core::dat::sources::load_dat_sources_config_default().unwrap();
+        let (registry, problems) =
+            archivefs_core::dat::sources::DatSourceRegistry::from_config(&config);
+        assert!(problems.is_empty(), "{problems:?}");
+        assert_eq!(
+            registry.sorted_enabled().len(),
+            1,
+            "private registry must have one source"
+        );
         let identity = super::super::native_cd_identity::verify(&path).unwrap();
         let request = Request::inspect(&path, &identity, &roots, &profile.profile_id).unwrap();
         let mut state = StandaloneLaunchState::default();
