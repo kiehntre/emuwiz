@@ -47,14 +47,16 @@ fn blue_retains_amiberry_exit_and_preserves_source_profile() {
     let f = fixture();
     let before = std::fs::read(&f.profile).unwrap();
     let process = ready(&f).reviewed.launch(&f.identity).unwrap();
-    let mut state = StandaloneLaunchState::default();
-    state.tracked = Some((
-        f.media.clone(),
-        "amiberry_cd".into(),
-        super::super::StandaloneLaunchStage::Running(super::super::StandaloneProcess::AmiberryCd(
-            process,
+    let mut state = StandaloneLaunchState {
+        tracked: Some((
+            f.media.clone(),
+            "amiberry_cd".into(),
+            super::super::StandaloneLaunchStage::Running(
+                super::super::StandaloneProcess::AmiberryCd(process),
+            ),
         )),
-    ));
+        ..Default::default()
+    };
     let deadline = Instant::now() + Duration::from_secs(5);
     while state.is_active() {
         state.poll();
@@ -83,14 +85,16 @@ fn small_viewport_keeps_action_visible_and_blocks_another_active_launch() {
         summary: LaunchPlanSummary::default(),
         media_topology: None,
     };
-    let mut state = StandaloneLaunchState::default();
-    state.amiberry_cd = Panel {
-        focused: Some(f.media.clone()),
-        key: Some((Some(f.media.clone()), f.identity.clone())),
-        results: (0..12)
-            .map(|i| (format!("configured {i}"), Ok(request.clone())))
-            .collect(),
-        chosen: Some("configured 0".into()),
+    let mut state = StandaloneLaunchState {
+        amiberry_cd: Panel {
+            focused: Some(f.media.clone()),
+            key: Some((Some(f.media.clone()), f.identity.clone())),
+            results: (0..12)
+                .map(|i| (format!("configured {i}"), Ok(request.clone())))
+                .collect(),
+            chosen: Some("configured 0".into()),
+            ..Default::default()
+        },
         ..Default::default()
     };
     let context = egui::Context::default();

@@ -14,7 +14,7 @@ use eframe::egui;
 use std::path::{Path, PathBuf};
 use std::sync::mpsc::{self, Receiver};
 #[derive(Debug, Clone)]
-pub(super) struct Request {
+pub(crate) struct Request {
     reviewed: ReviewedAmiberryCdProfile,
 }
 impl Request {
