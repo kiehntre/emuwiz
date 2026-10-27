@@ -38,6 +38,7 @@
 
 mod dolphin_profile_guidance;
 mod dolphin_stop;
+mod fbneo;
 
 #[path = "launch_readiness_page/cemu.rs"]
 pub(crate) mod cemu;
@@ -3273,6 +3274,7 @@ pub(crate) fn show_launch_readiness_panel(
             shadps4,
             ..
         } => {
+            fbneo::show(ui, plan);
             if plan.platform_id.as_deref() == Some("Saturn")
                 && let Some(context) = retroarch
             {
