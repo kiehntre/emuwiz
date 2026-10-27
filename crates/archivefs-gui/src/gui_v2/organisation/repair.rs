@@ -8,6 +8,15 @@ pub(super) fn show(app: &mut App, ui: &mut egui::Ui) {
         }
         if ui
             .selectable_label(
+                app.organisation.view == OrganisationView::DatNameReview,
+                "DAT name review",
+            )
+            .clicked()
+        {
+            app.organisation.view = OrganisationView::DatNameReview;
+        }
+        if ui
+            .selectable_label(
                 app.organisation.view == OrganisationView::RepairReview,
                 "Repair Review",
             )
@@ -39,6 +48,7 @@ pub(super) fn show(app: &mut App, ui: &mut egui::Ui) {
         super::super::native_workflows::NativeWorkflows::new(ui.ctx().clone())
     });
     match app.organisation.view {
+        OrganisationView::DatNameReview => workflows.show_dat_name_review(ui),
         OrganisationView::RepairHistory => workflows.show_native_repair_history(ui),
         OrganisationView::ExactDuplicates => workflows.show_native_exact_duplicates(ui),
         _ => workflows.show_native_repair_review(ui),

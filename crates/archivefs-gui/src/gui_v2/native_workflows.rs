@@ -16,6 +16,9 @@ mod native_mod_activation;
 #[path = "game_firmware_guidance.rs"]
 mod game_firmware_guidance;
 
+#[path = "dat_name_review.rs"]
+mod dat_name_review;
+
 use super::{
     activity::Activity,
     environment::EnvironmentSnapshot,
@@ -69,6 +72,7 @@ pub(super) struct NativeWorkflows {
     artwork_reload: bool,
     sources_discovery: bool,
     collection: native_collection::State,
+    dat_name_review: dat_name_review::State,
     pub(super) tosec_inventory: super::tosec_inventory::State,
     firmware_guidance: game_firmware_guidance::State,
     scummvm_trainer: crate::cheats_mods::scummvm_trainer::State,
@@ -374,6 +378,7 @@ impl NativeWorkflows {
             artwork_reload: false,
             sources_discovery: false,
             collection: native_collection::State::default(),
+            dat_name_review: Default::default(),
             tosec_inventory: Default::default(),
             firmware_guidance: Default::default(),
             scummvm_trainer: Default::default(),
@@ -1047,6 +1052,10 @@ impl NativeWorkflows {
         self.app
             .navigate_to_main_view(crate::navigation::MainView::ExactDuplicateReview);
         self.app.show_exact_duplicate_review_page(ui);
+    }
+
+    pub(super) fn show_dat_name_review(&mut self, ui: &mut egui::Ui) {
+        self.dat_name_review.show(ui);
     }
 
     pub(super) fn show_native_repair_review(&mut self, ui: &mut egui::Ui) {
