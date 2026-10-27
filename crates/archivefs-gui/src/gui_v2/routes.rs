@@ -776,10 +776,11 @@ pub(super) enum ToolPage {
     CheatExtras,
     PatchPackagePreview,
     SourceImpact,
+    ProfileSettings,
 }
 
 impl ToolPage {
-    pub const ALL: [Self; 10] = [
+    pub const ALL: [Self; 11] = [
         Self::NeedsAttention,
         Self::Mounts,
         Self::MediaSets,
@@ -790,6 +791,7 @@ impl ToolPage {
         Self::CheatExtras,
         Self::PatchPackagePreview,
         Self::SourceImpact,
+        Self::ProfileSettings,
     ];
 
     pub fn title(self) -> &'static str {
@@ -801,6 +803,7 @@ impl ToolPage {
             Self::LibraryViews => "Library Views",
             Self::PlatformAliases => "Platform aliases",
             Self::DatabaseStatus => "Database status",
+            Self::ProfileSettings => "Per-game settings explanation",
             Self::PatchPackagePreview => "Patch-package inspection",
             Self::SourceImpact => "Source-location impact preview",
             Self::CheatExtras => "Providers and code previews",
@@ -820,6 +823,7 @@ impl ToolPage {
             }
             Self::PlatformAliases => "Teach EmuWiz what your folder names mean.",
             Self::DatabaseStatus => "Where EmuWiz keeps what it knows about your library.",
+            Self::ProfileSettings => "Classify pasted emulator settings without applying them.",
             Self::PatchPackagePreview => {
                 "Inspect patches and untrusted package metadata without applying anything."
             }
@@ -841,6 +845,7 @@ impl ToolPage {
             Self::ViewHistory | Self::LibraryViews => Section::Build,
             Self::PlatformAliases => Section::Settings,
             Self::DatabaseStatus => Section::Settings,
+            Self::ProfileSettings => Section::Emulators,
             Self::PatchPackagePreview => Section::Mods,
             Self::SourceImpact => Section::Sources,
             Self::CheatExtras => Section::Mods,
@@ -855,6 +860,7 @@ impl ToolPage {
             Self::MediaSets => "Multi-disc games",
             Self::ViewHistory | Self::LibraryViews => "Organise & Export",
             Self::PlatformAliases | Self::DatabaseStatus => "Settings",
+            Self::ProfileSettings => "Tools",
             Self::PatchPackagePreview => "Tools",
             Self::SourceImpact => "Tools",
             Self::CheatExtras => "Enhance",
