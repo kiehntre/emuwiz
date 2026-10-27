@@ -1903,7 +1903,11 @@ fn gui_v2_organisation_primary_action_scrolls_into_reach_when_clipped() {
     // The pointer must be over the page body for the wheel to scroll it.
     let body = egui::pos2(size[0] * 0.7, size[1] - 70.0);
     let mut after = before;
-    for _ in 0..12 {
+    // The 40-point viewport leaves a 19-point interval in which the whole
+    // 21-point label is visible. Coarse 40-point steps can skip that interval.
+    // Keep the same 480-point travel budget, sampled finely enough to observe
+    // reachability; the clipping, viewport and activation assertions stay strict.
+    for _ in 0..48 {
         after = frame_with(
             &context,
             &mut app,
@@ -1913,7 +1917,7 @@ fn gui_v2_organisation_primary_action_scrolls_into_reach_when_clipped() {
                 egui::Event::MouseWheel {
                     phase: egui::TouchPhase::Move,
                     unit: egui::MouseWheelUnit::Point,
-                    delta: egui::vec2(0.0, -40.0),
+                    delta: egui::vec2(0.0, -10.0),
                     modifiers: egui::Modifiers::NONE,
                 },
             ],
