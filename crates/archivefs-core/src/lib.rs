@@ -151,6 +151,7 @@ pub mod uef_tape;
 /// A disposable profile holding one production-verified synthetic game.
 #[cfg(any(test, feature = "test-support"))]
 pub mod verified_game_fixture;
+pub mod whdload_options;
 use database::scan_and_persist_folders;
 pub use database::{
     ArchiveChangeKind, ArchiveObservationKind, ArchiveUpsertOutcome, AutomaticPlatformDetails,
@@ -365,6 +366,7 @@ pub mod fmtowns_container_evidence;
 /// Narrow, representation-independent optical-disc fingerprinting seam.
 pub mod optical_fingerprint;
 pub mod optical_layout_inspection;
+pub mod optical_layout_integrity;
 
 /// Shared preservation admission and output verification for CD conversion.
 pub(crate) mod optical_preservation;

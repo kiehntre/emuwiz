@@ -58,6 +58,7 @@ mod needs_attention_page;
 mod next_disc_guidance;
 mod nkit;
 mod onboarding;
+mod optical_compare;
 mod organisation;
 mod pages;
 mod patch_package_preview;
@@ -107,6 +108,7 @@ mod verify_journey_tests;
 pub(crate) mod vice_evidence;
 mod view_history_page;
 mod visual_pages;
+mod whdload_option_preview;
 mod wiiu_disc;
 
 use crate::optical_conversion_page::OpticalConversionPageState;
