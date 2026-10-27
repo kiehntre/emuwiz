@@ -248,3 +248,86 @@ fn reviewed_action_fits_small_viewport_and_opening_does_not_launch() {
     assert!(output.shapes.iter().all(|s| action(&s.shape).is_none()));
     assert_eq!(state.tracked.as_ref().unwrap().1, "other");
 }
+
+#[test]
+fn production_identity_producer_rechecks_actual_dat_before_mock_launch() {
+    let mut f = fixture();
+    let dat = f.root.path().join("registered.dat");
+    super::super::native_cd_identity::tests::dat(&dat, &f.path, "Fujitsu - FM Towns");
+    f.identity =
+        super::super::native_cd_identity::verify_from_paths(&f.path, &[dat.clone()]).unwrap();
+    let request = request(&f);
+    let mut process = request
+        .clone()
+        .execute_with_verifier(|path| {
+            super::super::native_cd_identity::verify_from_paths(path, &[dat.clone()])
+        })
+        .unwrap();
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while process.poll().is_none() {
+        assert!(Instant::now() < deadline);
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    std::fs::write(
+        &dat,
+        b"<datafile><header><name>Fujitsu - FM Towns</name></header></datafile>",
+    )
+    .unwrap();
+    assert!(
+        request
+            .execute_with_verifier(|path| super::super::native_cd_identity::verify_from_paths(
+                path,
+                &[dat]
+            ))
+            .is_err()
+    );
+}
+
+#[test]
+fn complete_blue_launch_uses_private_registry_and_real_production_entrypoint() {
+    const MARKER: &str = "EMUWIZ_TSUGARU_SYNTHETIC_CHILD";
+    if let Some(path) = std::env::var_os(MARKER) {
+        let path = PathBuf::from(path);
+        let roots = TsugaruProfileDiscoveryRoots::from_environment();
+        let profile = discover_tsugaru_profiles(&roots)
+            .profiles
+            .into_iter()
+            .next()
+            .unwrap();
+        let identity = super::super::native_cd_identity::verify(&path).unwrap();
+        let request = Request::inspect(&path, &identity, &roots, &profile.profile_id).unwrap();
+        let mut state = StandaloneLaunchState::default();
+        state.start(StandaloneLaunchRequest::Tsugaru(request));
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while state.is_active() {
+            state.poll();
+            assert!(Instant::now() < deadline);
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        match state.tracked.as_mut().unwrap().2 {
+            super::super::StandaloneLaunchStage::Exited(
+                super::super::StandaloneProcess::Tsugaru(ref mut process),
+            ) => assert_eq!(
+                process.poll().unwrap().status.as_ref().unwrap().code(),
+                Some(7)
+            ),
+            _ => panic!("production launch failed: {:?}", state.failure_detail()),
+        }
+        return;
+    }
+    let f = fixture();
+    let dat = f.root.path().join("registered.dat");
+    super::super::native_cd_identity::tests::dat(&dat, &f.path, "Fujitsu - FM Towns");
+    let config = f.root.path().join("private-config");
+    std::fs::create_dir(&config).unwrap();
+    std::fs::write(config.join("dat_sources.toml"),format!("[[sources]]\nid='fixture'\ndisplay_name='Synthetic optical catalogue'\npath='{}'\nkind='file'\nenabled=true\n",dat.display())).unwrap();
+    let output=std::process::Command::new(std::env::current_exe().unwrap()).args(["--exact","launch_readiness_page::tsugaru::tests::complete_blue_launch_uses_private_registry_and_real_production_entrypoint","--nocapture"])
+        .env(MARKER,&f.path).env("HOME",f.root.path()).env("XDG_CONFIG_HOME",f.root.path().join("xdg-config")).env("XDG_DATA_HOME",f.root.path().join("xdg-data")).env("TMPDIR",f.root.path())
+        .env("EMUWIZ_CONFIG_HOME",&config).env("EMUWIZ_DATA_HOME",f.root.path().join("data")).env("PATH",f.root.path()).env("EMUWIZ_TSUGARU_ROM_DIRECTORY",&f.roots.explicit_profiles[0].1).output().unwrap();
+    assert!(
+        output.status.success(),
+        "{}\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+}

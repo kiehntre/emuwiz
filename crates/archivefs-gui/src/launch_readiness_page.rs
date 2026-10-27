@@ -38,6 +38,7 @@
 
 mod dolphin_profile_guidance;
 mod dolphin_stop;
+mod native_cd_identity;
 mod tsugaru;
 
 #[path = "launch_readiness_page/cemu.rs"]
@@ -3229,6 +3230,7 @@ pub(crate) fn show_launch_readiness_panel(
             });
         }
         LaunchReadinessInput::IdentityUnknown => {
+            tsugaru::show_unresolved(ui, standalone_launch_state);
             widgets::banner(
                 ui,
                 "Identity unresolved",

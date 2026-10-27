@@ -162,16 +162,15 @@ impl Request {
             }
         })
     }
-    pub(super) fn execute(self) -> Result<WatchedProcess, String> {
-        let report = crate::selected_evidence_page::gather_selected_evidence_fast(
-            &self.core.selected_content_path,
-            Some("FM Towns"),
-        )
-        .map_err(|e| format!("FM Towns identity could not be rechecked: {e}"))?;
-        let (identity, _) = archivefs_core::launch::canonical_identity_from_game_report(
-            &report.game_identity_report,
-        );
+    fn execute_with_verifier(
+        self,
+        verify: impl FnOnce(&Path) -> Result<CanonicalIdentityStatus, String>,
+    ) -> Result<WatchedProcess, String> {
+        let identity = verify(&self.core.selected_content_path)?;
         self.execute_verified(&identity)
+    }
+    pub(super) fn execute(self) -> Result<WatchedProcess, String> {
+        self.execute_with_verifier(super::native_cd_identity::verify)
     }
 }
 
@@ -189,8 +188,25 @@ impl Panel {
         self.focused = path.map(Path::to_path_buf);
     }
 }
+pub(super) fn show_unresolved(ui: &mut egui::Ui, state: &mut StandaloneLaunchState) {
+    let plan = LaunchPlan {
+        platform_id: None,
+        game_key: None,
+        candidates: Vec::new(),
+        summary: Default::default(),
+        media_topology: None,
+    };
+    show(ui, &plan, state);
+}
 pub(super) fn show(ui: &mut egui::Ui, plan: &LaunchPlan, state: &mut StandaloneLaunchState) {
-    if plan.platform_id.as_deref() != Some("FM Towns") {
+    if plan.platform_id.as_deref() != Some("FM Towns")
+        && !(plan.platform_id.is_none()
+            && state
+                .tsugaru
+                .focused
+                .as_ref()
+                .is_some_and(|p| p.extension().is_some_and(|s| s.eq_ignore_ascii_case("iso"))))
+    {
         return;
     }
     let selected = state.tsugaru.focused.clone().or_else(|| {
@@ -225,7 +241,9 @@ pub(super) fn show(ui: &mut egui::Ui, plan: &LaunchPlan, state: &mut StandaloneL
                 } else {
                     profiles.into_iter().map(|p| {
                         let result = selected.as_deref().ok_or("No selected media candidate is available. Configure the profile and refresh launch readiness.".into())
-                            .and_then(|path| Request::inspect(path, &identity, &roots, &p.profile_id));
+                            .and_then(|path| { let verified = super::native_cd_identity::verify(path)?;
+                                if !matches!(identity, CanonicalIdentityStatus::Unknown) && identity != verified { return Err("The current catalogue identity differs from the launch plan. Refresh readiness.".into()); }
+                                Request::inspect(path, &verified, &roots, &p.profile_id) });
                         (p.profile_id, result)
                     }).collect()
                 };
@@ -239,6 +257,7 @@ pub(super) fn show(ui: &mut egui::Ui, plan: &LaunchPlan, state: &mut StandaloneL
                 Err(mpsc::TryRecvError::Empty) => { ui.label("Checking…"); ui.ctx().request_repaint_after(std::time::Duration::from_millis(100)); }
             }
         }
+        egui::ScrollArea::vertical().id_salt("tsugaru-profile-results").max_height(180.).show(ui, |ui| {
         for (name, result) in &state.tsugaru.results {
             ui.small(name);
             match result {
@@ -250,6 +269,7 @@ pub(super) fn show(ui: &mut egui::Ui, plan: &LaunchPlan, state: &mut StandaloneL
                 }
             }
         }
+        });
     });
     if let Some(request) = launch {
         if state.is_active()
