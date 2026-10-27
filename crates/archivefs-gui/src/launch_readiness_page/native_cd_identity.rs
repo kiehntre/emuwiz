@@ -157,7 +157,7 @@ pub(super) mod tests {
             std::fs::write(&iso, b"synthetic direct disc bytes").unwrap();
             let source = dir.path().join("local.dat");
             dat(&source, &iso, name);
-            let identity = verify_from_paths(&iso, &[source.clone()]).unwrap();
+            let identity = verify_from_paths(&iso, std::slice::from_ref(&source)).unwrap();
             assert!(
                 matches!(identity,CanonicalIdentityStatus::Resolved(ref i) if i.platform_id==expected)
             );

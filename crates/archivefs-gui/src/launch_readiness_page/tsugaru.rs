@@ -80,7 +80,7 @@ fn firmware(directory: &Path) -> Result<Vec<FileBinding>, String> {
 }
 
 #[derive(Clone, Debug)]
-pub(super) struct Request {
+pub(crate) struct Request {
     core: TsugaruLaunchRequest,
     roots: TsugaruProfileDiscoveryRoots,
     identity: CanonicalIdentityStatus,

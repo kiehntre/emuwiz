@@ -132,14 +132,16 @@ fn combined_rom_override_added_after_review_is_refused() {
 fn blue_watches_the_process_to_exit_and_keeps_its_report() {
     let f = fixture();
     let process = request(&f).execute_verified(&f.identity).unwrap();
-    let mut state = StandaloneLaunchState::default();
-    state.tracked = Some((
-        f.path.clone(),
-        "tsugaru".into(),
-        super::super::StandaloneLaunchStage::Running(super::super::StandaloneProcess::Tsugaru(
-            process,
+    let mut state = StandaloneLaunchState {
+        tracked: Some((
+            f.path.clone(),
+            "tsugaru".into(),
+            super::super::StandaloneLaunchStage::Running(super::super::StandaloneProcess::Tsugaru(
+                process,
+            )),
         )),
-    ));
+        ..Default::default()
+    };
     assert!(state.is_active());
     let deadline = Instant::now() + Duration::from_secs(5);
     while state.is_active() {
@@ -190,11 +192,13 @@ fn reviewed_action_fits_small_viewport_and_opening_does_not_launch() {
             readiness: archivefs_core::launch::LaunchReadiness::ReadyWithWarnings,
             preference: archivefs_core::launch::CandidatePreference::SoleEligible,
         });
-    let mut state = StandaloneLaunchState::default();
-    state.tsugaru = Panel {
-        key: Some((Some(f.path.clone()), f.identity.clone())),
-        results: vec![(f.profile.clone(), Ok(request))],
-        chosen: Some(f.profile.clone()),
+    let mut state = StandaloneLaunchState {
+        tsugaru: Panel {
+            key: Some((Some(f.path.clone()), f.identity.clone())),
+            results: vec![(f.profile.clone(), Ok(request))],
+            chosen: Some(f.profile.clone()),
+            ..Default::default()
+        },
         ..Default::default()
     };
     let context = egui::Context::default();
@@ -255,12 +259,13 @@ fn production_identity_producer_rechecks_actual_dat_before_mock_launch() {
     let dat = f.root.path().join("registered.dat");
     super::super::native_cd_identity::tests::dat(&dat, &f.path, "Fujitsu - FM Towns");
     f.identity =
-        super::super::native_cd_identity::verify_from_paths(&f.path, &[dat.clone()]).unwrap();
+        super::super::native_cd_identity::verify_from_paths(&f.path, std::slice::from_ref(&dat))
+            .unwrap();
     let request = request(&f);
     let mut process = request
         .clone()
         .execute_with_verifier(|path| {
-            super::super::native_cd_identity::verify_from_paths(path, &[dat.clone()])
+            super::super::native_cd_identity::verify_from_paths(path, std::slice::from_ref(&dat))
         })
         .unwrap();
     let deadline = Instant::now() + Duration::from_secs(5);
