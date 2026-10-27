@@ -3244,8 +3244,8 @@ pub(crate) fn show_launch_readiness_panel(
             widgets::banner(
                 ui,
                 "Identity unresolved",
-                "This game's identity could not be verified, so no launch options can be \
-                 safely planned yet.",
+                "This game's identity could not be verified by the standard scan. \
+                 Native CD review, when available, checks separate catalogue evidence before offering launch.",
                 widgets::StatusTone::Pending,
             );
         }
