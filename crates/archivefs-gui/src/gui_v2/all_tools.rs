@@ -193,6 +193,12 @@ pub(super) fn groups() -> Vec<ToolGroup> {
         purpose: ToolPage::ProfileSettings.purpose(),
         safety: ToolSafety::LookingOnly,
     });
+    storage.tools.push(Tool {
+        route: Route::Tool(ToolPage::OpticalCompare),
+        title: ToolPage::OpticalCompare.title(),
+        purpose: ToolPage::OpticalCompare.purpose(),
+        safety: ToolSafety::LookingOnly,
+    });
     let mut cheats = group("Cheats, mods & patches", &[S::CheatsMods, S::Mods]);
     cheats.tools.push(Tool {
         route: Route::Tool(ToolPage::WhdloadOptions),

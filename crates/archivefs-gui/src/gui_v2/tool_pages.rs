@@ -11,6 +11,7 @@ pub(super) struct ToolPagesState {
     pub patch_package_preview: super::patch_package_preview::State,
     pub profile_settings_preview: super::profile_settings_preview::State,
     pub whdload_option_preview: super::whdload_option_preview::State,
+    pub optical_compare: super::optical_compare::State,
     pub source_impact: super::source_impact::State,
     pub needs_attention: super::needs_attention_page::NeedsAttentionState,
     pub mounts: super::mounts_page::MountsState,
@@ -36,6 +37,7 @@ impl ToolPagesState {
             patch_package_preview: Default::default(),
             profile_settings_preview: Default::default(),
             whdload_option_preview: Default::default(),
+            optical_compare: Default::default(),
             source_impact: super::source_impact::State::live(),
         }
     }
@@ -52,6 +54,9 @@ impl App {
             }
             ToolPage::WhdloadOptions => {
                 super::whdload_option_preview::show(ui, &mut self.tools.whdload_option_preview)
+            }
+            ToolPage::OpticalCompare => {
+                super::optical_compare::show(ui, &mut self.tools.optical_compare)
             }
             ToolPage::SourceImpact => super::source_impact::show(ui, &mut self.tools.source_impact),
             ToolPage::NeedsAttention => {
@@ -168,6 +173,7 @@ mod integration_tests {
             ToolPage::PatchPackagePreview,
             ToolPage::ProfileSettings,
             ToolPage::WhdloadOptions,
+            ToolPage::OpticalCompare,
         ] {
             let route = Route::Tool(page);
             assert_eq!(tools.iter().filter(|tool| tool.route == route).count(), 1);

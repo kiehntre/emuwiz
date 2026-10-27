@@ -777,11 +777,12 @@ pub(super) enum ToolPage {
     PatchPackagePreview,
     ProfileSettings,
     WhdloadOptions,
+    OpticalCompare,
     SourceImpact,
 }
 
 impl ToolPage {
-    pub const ALL: [Self; 12] = [
+    pub const ALL: [Self; 13] = [
         Self::NeedsAttention,
         Self::Mounts,
         Self::MediaSets,
@@ -793,6 +794,7 @@ impl ToolPage {
         Self::PatchPackagePreview,
         Self::ProfileSettings,
         Self::WhdloadOptions,
+        Self::OpticalCompare,
         Self::SourceImpact,
     ];
 
@@ -808,6 +810,7 @@ impl ToolPage {
             Self::PatchPackagePreview => "Patch-package inspection",
             Self::ProfileSettings => "Per-game settings explanation",
             Self::WhdloadOptions => "WHDLoad ToolType review",
+            Self::OpticalCompare => "Compare optical layouts",
             Self::SourceImpact => "Source-location impact preview",
             Self::CheatExtras => "Providers and code previews",
         }
@@ -833,6 +836,9 @@ impl ToolPage {
             Self::WhdloadOptions => {
                 "Explain supplied ToolTypes and Config metadata without changing an installation."
             }
+            Self::OpticalCompare => {
+                "Compare two local CUE structures without claiming payload preservation."
+            }
             Self::SourceImpact => {
                 "Preview one library source at a new folder without relocating anything."
             }
@@ -854,6 +860,7 @@ impl ToolPage {
             Self::PatchPackagePreview => Section::Mods,
             Self::ProfileSettings => Section::Emulators,
             Self::WhdloadOptions => Section::Mods,
+            Self::OpticalCompare => Section::Converter,
             Self::SourceImpact => Section::Sources,
             Self::CheatExtras => Section::Mods,
         }
@@ -870,6 +877,7 @@ impl ToolPage {
             Self::PatchPackagePreview => "Tools",
             Self::ProfileSettings => "Tools",
             Self::WhdloadOptions => "Tools",
+            Self::OpticalCompare => "Tools",
             Self::SourceImpact => "Tools",
             Self::CheatExtras => "Enhance",
         }

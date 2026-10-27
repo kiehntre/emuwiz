@@ -366,6 +366,7 @@ pub mod fmtowns_container_evidence;
 /// Narrow, representation-independent optical-disc fingerprinting seam.
 pub mod optical_fingerprint;
 pub mod optical_layout_inspection;
+pub mod optical_layout_integrity;
 
 /// Shared preservation admission and output verification for CD conversion.
 pub(crate) mod optical_preservation;
