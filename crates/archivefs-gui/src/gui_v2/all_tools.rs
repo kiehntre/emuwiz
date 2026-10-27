@@ -181,6 +181,12 @@ pub(super) fn groups() -> Vec<ToolGroup> {
         safety: ToolSafety::LookingOnly,
     });
     games.tools.push(Tool {
+        route: Route::Tool(ToolPage::AlternativeProviders),
+        title: ToolPage::AlternativeProviders.title(),
+        purpose: ToolPage::AlternativeProviders.purpose(),
+        safety: ToolSafety::LookingOnly,
+    });
+    games.tools.push(Tool {
         route: Route::Tool(ToolPage::HomebrewBrowser),
         title: ToolPage::HomebrewBrowser.title(),
         purpose: ToolPage::HomebrewBrowser.purpose(),

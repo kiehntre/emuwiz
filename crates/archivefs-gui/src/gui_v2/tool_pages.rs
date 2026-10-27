@@ -21,6 +21,7 @@ pub(super) struct ToolPagesState {
     pub view_history: super::view_history_page::ViewHistoryState,
     pub platform_aliases: super::platform_aliases_page::PlatformAliasesState,
     pub database: super::database_status_page::DatabaseStatusState,
+    pub alternative_provider_preview: super::alternative_provider_preview::State,
     pub cheat_extras: super::cheat_extras_page::CheatExtrasState,
 }
 
@@ -34,6 +35,7 @@ impl ToolPagesState {
             view_history: Default::default(),
             platform_aliases: super::platform_aliases_page::PlatformAliasesState::live(),
             database: super::database_status_page::DatabaseStatusState::live(),
+            alternative_provider_preview: Default::default(),
             cheat_extras: Default::default(),
             homebrew_browser: Default::default(),
             patch_package_preview: Default::default(),
@@ -51,6 +53,10 @@ impl App {
             ToolPage::HomebrewBrowser => {
                 super::homebrew_browser::show(ui, &mut self.tools.homebrew_browser)
             }
+            ToolPage::AlternativeProviders => super::alternative_provider_preview::show(
+                ui,
+                &mut self.tools.alternative_provider_preview,
+            ),
             ToolPage::PatchPackagePreview => {
                 super::patch_package_preview::show(ui, &mut self.tools.patch_package_preview)
             }
