@@ -38,6 +38,7 @@
 
 mod dolphin_profile_guidance;
 mod dolphin_stop;
+mod tsugaru;
 
 #[path = "launch_readiness_page/cemu.rs"]
 pub(crate) mod cemu;
@@ -991,6 +992,7 @@ pub(crate) enum StandaloneProcess {
     #[cfg(target_os = "linux")]
     ShadPs4(archivefs_core::launch::process_spawn::WatchedProcess),
     Mame(archivefs_core::launch::process_spawn::WatchedProcess),
+    Tsugaru(archivefs_core::launch::process_spawn::WatchedProcess),
     /// MAME started through the canonical per-launch cheat runtime; the session
     /// owns the temporary cheat workspace and removes it after MAME exits.
     MameCheats(
@@ -1063,6 +1065,7 @@ pub(crate) struct StandaloneLaunchState {
     scummvm_profile: scummvm_profile::Choice,
     /// The DOSBox check and the user's approval for the game on screen.
     dosbox: dosbox::Panel,
+    tsugaru: tsugaru::Panel,
     vice_trainers: vice::trainers::Chooser,
 }
 
@@ -1255,6 +1258,7 @@ impl StandaloneLaunchState {
                     #[cfg(target_os = "linux")]
                     StandaloneProcess::ShadPs4(p) => p.poll().is_some(),
                     StandaloneProcess::Mame(p) => p.poll().is_some(),
+                    StandaloneProcess::Tsugaru(p) => p.poll().is_some(),
                     StandaloneProcess::MameCheats(session) => {
                         session.poll();
                         session.is_finished()
@@ -1476,6 +1480,7 @@ pub(crate) enum StandaloneLaunchRequest {
     #[cfg(target_os = "linux")]
     ShadPs4(crate::emulator_setup::shadps4::Request),
     Mame(MameLaunchRequest),
+    Tsugaru(tsugaru::Request),
     DuckStation(
         DuckStationLaunchRequest,
         archivefs_core::patch_manager::DuckStationProfileDiscoveryRoots,
@@ -1523,6 +1528,7 @@ impl StandaloneLaunchRequest {
             #[cfg(target_os = "linux")]
             Self::ShadPs4(_) => "shadPS4",
             Self::Mame(_) => "MAME",
+            Self::Tsugaru(_) => "Tsugaru",
             Self::DuckStation(..) => "DuckStation",
             Self::Ppsspp(_, _) => "PPSSPP",
             Self::MelonDs(_, _) => "melonDS",
@@ -1545,6 +1551,7 @@ impl StandaloneLaunchRequest {
             #[cfg(target_os = "linux")]
             Self::ShadPs4(r) => (r.plan.game().executable().into(), "shadps4".into()),
             Self::Mame(r) => (r.selected_content.clone(), "mame".into()),
+            Self::Tsugaru(r) => r.key(),
             Self::DuckStation(r, ..) => (r.selected_content_path.clone(), "duckstation".into()),
             Self::Ppsspp(r, _) => (r.selected_content_path.clone(), "ppsspp".into()),
             Self::MelonDs(r, _) => (r.selected_content_path.clone(), "melonds".into()),
@@ -1572,6 +1579,7 @@ impl StandaloneLaunchRequest {
                 .execute()
                 .map(StandaloneProcess::ShadPs4)
                 .map_err(|e| format!("{:?}: {}", e.kind, e.detail)),
+            Self::Tsugaru(r) => r.execute().map(StandaloneProcess::Tsugaru),
             Self::Mame(r) => archivefs_core::launch::preflight_and_launch_mame(&r)
                 .map(StandaloneProcess::Mame)
                 .map_err(|error| format!("{error:?}")),
@@ -3273,6 +3281,7 @@ pub(crate) fn show_launch_readiness_panel(
             shadps4,
             ..
         } => {
+            tsugaru::show(ui, plan, standalone_launch_state);
             if plan.platform_id.as_deref() == Some("Saturn")
                 && let Some(context) = retroarch
             {
@@ -5027,6 +5036,10 @@ fn show_standalone_launch_action(
                 ui.small(format!("DuckStation running · PID {}", process.pid));
                 ui.small("Starting the process does not prove the game ran.");
             }
+            Some((_, _, StandaloneLaunchStage::Running(StandaloneProcess::Tsugaru(p)))) => {
+                ui.small(format!("Tsugaru running · PID {}", p.pid));
+                ui.small("Starting the process does not prove the game ran.");
+            }
             Some((_, _, StandaloneLaunchStage::Running(StandaloneProcess::ScummVm(_)))) => {
                 ui.small("ScummVM process started; EmuWiz cannot tell whether the game itself is running.");
             }
@@ -5054,6 +5067,11 @@ fn show_standalone_launch_action(
             }
             Some((_, _, StandaloneLaunchStage::Exited(process))) => {
                 ui.small("Historical result from the last launch attempt; current readiness is shown above.");
+                if let StandaloneProcess::Tsugaru(p) = process
+                    && let Some(report) = p.poll()
+                {
+                    ui.label(exit_line("Tsugaru", report));
+                }
                 if let StandaloneProcess::DuckStation(process) = process
                     && let Some(report) = process.poll()
                 {
@@ -5123,6 +5141,13 @@ fn show_standalone_launch_action(
                 state.start(request);
                 return;
             }
+        }
+        if adapter == "tsugaru"
+            && !state.is_active()
+            && ui.button("Launch Tsugaru again (recheck)").clicked()
+        {
+            state.start(request);
+            return;
         }
         if adapter == "xroar"
             && !state.is_active()
