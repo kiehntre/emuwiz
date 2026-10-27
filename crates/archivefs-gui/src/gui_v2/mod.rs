@@ -107,6 +107,7 @@ mod verify_journey_tests;
 pub(crate) mod vice_evidence;
 mod view_history_page;
 mod visual_pages;
+mod whdload_option_preview;
 mod wiiu_disc;
 
 use crate::optical_conversion_page::OpticalConversionPageState;
