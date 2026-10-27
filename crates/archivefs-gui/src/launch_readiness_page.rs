@@ -38,6 +38,7 @@
 
 mod dolphin_profile_guidance;
 mod dolphin_stop;
+mod fbneo;
 mod native_cd_feedback;
 mod native_cd_identity;
 mod tsugaru;
@@ -3285,6 +3286,7 @@ pub(crate) fn show_launch_readiness_panel(
             shadps4,
             ..
         } => {
+            fbneo::show(ui, plan);
             tsugaru::show(ui, plan, standalone_launch_state);
             if plan.platform_id.as_deref() == Some("Saturn")
                 && let Some(context) = retroarch
