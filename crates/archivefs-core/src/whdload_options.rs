@@ -324,9 +324,15 @@ fn flag_status(value: &str) -> WhdloadOptionApplicability {
 }
 
 fn custom_slot(key: &str) -> Option<u8> {
-    key.strip_prefix("CUSTOM")
-        .and_then(|n| n.parse().ok())
-        .filter(|n| (1..=5).contains(n))
+    key.strip_prefix("CUSTOM").and_then(slot_digit)
+}
+
+/// Exactly one ASCII digit 1-5: no sign, padding or other numerals.
+fn slot_digit(digits: &str) -> Option<u8> {
+    match digits.as_bytes() {
+        [digit @ b'1'..=b'5'] => Some(digit - b'0'),
+        _ => None,
+    }
 }
 
 fn mark_conflicts(options: &mut [WhdloadOption], diagnostics: &mut Vec<String>) {
@@ -365,8 +371,7 @@ pub fn parse_config_metadata(config: &str) -> (Vec<WhdloadCustomMetadata>, Vec<S
         let slot = fields
             .first()
             .and_then(|field| field.strip_prefix('C'))
-            .and_then(|n| n.parse().ok())
-            .filter(|n| (1..=5).contains(n));
+            .and_then(slot_digit);
         let evidence = |detail: &str| WhdloadOptionEvidence {
             source: WhdloadOptionEvidenceSource::SlaveConfig,
             raw: raw.into(),
@@ -467,26 +472,21 @@ fn declaration_shape(option_type: &str, spec: Option<&str>) -> DeclarationShape 
             ),
             None => malformed("X requires a bit number from 0 to 31"),
         },
-        "L" => {
-            let choices = parse_choices(spec_text);
-            if choices.is_empty() {
-                malformed("L requires a comma-separated choice list")
-            } else {
-                shape(
-                    WhdloadOptionApplicability::Applicable,
-                    choices,
-                    None,
-                    "supplied list Config metadata",
-                )
-            }
-        }
+        "L" => match parse_choices(spec_text) {
+            Some(choices) => shape(
+                WhdloadOptionApplicability::Applicable,
+                choices,
+                None,
+                "supplied list Config metadata",
+            ),
+            None => malformed("L requires a comma-separated list with no empty entries"),
+        },
         "M" => {
             let (labels, range) = spec_text
                 .split_once(':')
                 .map_or((spec_text, None), |(a, b)| (a, parse_bit_range(b)));
-            let choices = parse_choices(labels);
-            match range {
-                Some(range) if !choices.is_empty() => shape(
+            match (parse_choices(labels), range) {
+                (Some(choices), Some(range)) => shape(
                     WhdloadOptionApplicability::Applicable,
                     choices,
                     Some(range),
@@ -504,19 +504,18 @@ fn declaration_shape(option_type: &str, spec: Option<&str>) -> DeclarationShape 
     }
 }
 
-fn parse_choices(spec: &str) -> Vec<String> {
-    spec.split(',')
-        .map(str::trim)
-        .filter(|label| !label.is_empty())
-        .take(MAX_CONFIG_CHOICES)
-        .map(str::to_string)
-        .collect()
+/// A choice's value is its position, so an empty entry or a list over the
+/// bound cannot be read without shifting or dropping values: reject it.
+fn parse_choices(spec: &str) -> Option<Vec<String>> {
+    let choices: Vec<_> = spec.split(',').map(str::trim).collect();
+    (choices.len() <= MAX_CONFIG_CHOICES && choices.iter().all(|label| !label.is_empty()))
+        .then(|| choices.into_iter().map(str::to_string).collect())
 }
 
 fn parse_bit_range(value: &str) -> Option<(u8, u8)> {
     let (low, high) = value.split_once('-')?;
-    let low = low.trim().parse::<u8>().ok()?;
-    let high = high.trim().parse::<u8>().ok()?;
+    let low = low.parse::<u8>().ok()?;
+    let high = high.parse::<u8>().ok()?;
     (low <= high && high <= 31 && high - low >= 1).then_some((low, high))
 }
 
@@ -873,6 +872,66 @@ mod tests {
             assert_eq!(options[0].applicability, expected, "{raw}");
             assert!(
                 options[0].value.is_some() || expected == WhdloadOptionApplicability::Malformed
+            );
+        }
+    }
+
+    // Review finding: a position is the value, so gaps must not shift it.
+    #[test]
+    fn empty_or_oversized_choice_lists_are_malformed_not_shifted() {
+        for config in [
+            "C1:L:Mode:A,,B;",
+            "C1:L:Mode:A,B,;",
+            "C1:L:Mode:,A;",
+            "C1:M:Mode:A,,B:0-1;",
+        ] {
+            assert_eq!(
+                config_status(config).0,
+                WhdloadOptionApplicability::Malformed,
+                "{config}"
+            );
+            assert_eq!(
+                custom_status_for(config, "CUSTOM1=1"),
+                WhdloadOptionApplicability::Unknown,
+                "{config}"
+            );
+        }
+        let many = vec!["x"; 65].join(",");
+        assert_eq!(
+            config_status(&format!("C1:L:Big:{many};")).0,
+            WhdloadOptionApplicability::Malformed
+        );
+        let max = vec!["x"; 64].join(",");
+        assert_eq!(
+            config_status(&format!("C1:L:Big:{max};")).0,
+            WhdloadOptionApplicability::Applicable
+        );
+    }
+
+    #[test]
+    fn m_bit_range_rejects_inner_whitespace() {
+        assert_eq!(
+            config_status("C1:M:Mode:A,B: 0 - 1;").0,
+            WhdloadOptionApplicability::Malformed
+        );
+    }
+
+    #[test]
+    fn slot_numbers_are_a_single_ascii_digit() {
+        for config in ["C+1:B:x;", "C01:B:x;", "C0:B:x;", "C6:B:x;"] {
+            let (metadata, diagnostics) = parse_config_metadata(config);
+            assert_eq!(
+                metadata[0].applicability,
+                WhdloadOptionApplicability::Malformed,
+                "{config}"
+            );
+            assert_eq!(diagnostics.len(), 1, "{config}");
+        }
+        for key in ["CUSTOM+1", "CUSTOM01", "CUSTOM0", "CUSTOM6", "CUSTOM"] {
+            let (options, _, _) = project_supplied_options(&[format!("{key}=1")], "C1:B:x;");
+            assert!(
+                matches!(options[0].kind, WhdloadOptionKind::Unknown(_)),
+                "{key} is not a CUSTOM slot"
             );
         }
     }
