@@ -9353,3 +9353,85 @@ fn quick_rename_card_renders_recovery_information_for_an_unresolved_batch() {
     ));
     assert!(!rendered_text_contains(&output, "Quick Rename complete"));
 }
+
+fn render_canonical_preview(view: &DatSourcesPageView) -> egui::FullOutput {
+    egui::Context::default().run(
+        egui::RawInput {
+            screen_rect: Some(egui::Rect::from_min_size(
+                egui::Pos2::ZERO,
+                egui::vec2(1024.0, 2000.0),
+            )),
+            ..Default::default()
+        },
+        |ctx| {
+            egui::CentralPanel::default().show(ctx, |ui| canonical_preview::show(ui, view));
+        },
+    )
+}
+
+#[test]
+fn canonical_blue_preview_reuses_dat_names_and_preserves_files() {
+    let (fixture, mut page, root) = audit_fixture();
+    let before = snapshot(&fixture.root);
+    page.apply(DatSourcesPageAction::Audit {
+        id: "collection".into(),
+        scan_root: root,
+    });
+    run_to_completion(&mut page);
+    let view = page.view();
+    let output = render_canonical_preview(&view);
+    for text in [
+        "DAT name preview",
+        "Source authority:",
+        "super.bin",
+        "audit snapshot",
+        "no approval",
+    ] {
+        assert!(rendered_text_contains(&output, text), "missing {text}");
+    }
+    for text in ["Apply", "Needs review", "Ignore", "Undo", "Install"] {
+        assert!(
+            !rendered_text_contains(&output, text),
+            "unexpected action {text}"
+        );
+    }
+    assert_eq!(snapshot(&fixture.root), before);
+    assert!(page.review_decisions.is_empty());
+}
+
+#[test]
+fn canonical_blue_preview_preserves_ambiguity_and_conflict_refusals() {
+    let mut ambiguous = plan_proposal("/tmp/a.bin", "a.bin", None, ProposalState::Ambiguous);
+    ambiguous.ambiguity_reason = Some("Two DAT entries share this hash".into());
+    let mut conflict = plan_proposal(
+        "/tmp/b.bin",
+        "b.bin",
+        Some("taken.bin"),
+        ProposalState::Conflict,
+    );
+    conflict.collision = Some(archivefs_core::dat::rename_plan::CollisionInfo {
+        kind: archivefs_core::dat::rename_plan::CollisionKind::ExistingTarget,
+        colliding_with: Some("taken.bin".into()),
+        colliding_is_symlink: false,
+        detail: "Destination already exists".into(),
+    });
+    let (_fixture, page) = page_with_plan(vec![ambiguous, conflict]);
+    let output = render_canonical_preview(&page.view());
+    for text in [
+        "Ambiguous",
+        "Two DAT entries",
+        "Conflict",
+        "Destination already exists",
+        "taken.bin",
+    ] {
+        assert!(rendered_text_contains(&output, text), "missing {text}");
+    }
+}
+
+#[test]
+fn canonical_blue_preview_explains_missing_evidence() {
+    let fixture = Fixture::new();
+    let page = fixture.page();
+    let output = render_canonical_preview(&page.view());
+    assert!(rendered_text_contains(&output, "No DAT rename plan"));
+}

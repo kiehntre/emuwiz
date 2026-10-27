@@ -6,6 +6,9 @@ pub(super) fn show(app: &mut App, ui: &mut egui::Ui) {
         if ui.button("Back to Organisation").clicked() {
             app.organisation.view = OrganisationView::Landing;
         }
+        if ui.button("DAT name preview (read-only)").clicked() {
+            app.organisation.view = OrganisationView::DatNamePreview;
+        }
         if ui
             .selectable_label(
                 app.organisation.view == OrganisationView::RepairReview,
@@ -39,6 +42,7 @@ pub(super) fn show(app: &mut App, ui: &mut egui::Ui) {
         super::super::native_workflows::NativeWorkflows::new(ui.ctx().clone())
     });
     match app.organisation.view {
+        OrganisationView::DatNamePreview => workflows.show_dat_name_preview(ui),
         OrganisationView::RepairHistory => workflows.show_native_repair_history(ui),
         OrganisationView::ExactDuplicates => workflows.show_native_exact_duplicates(ui),
         _ => workflows.show_native_repair_review(ui),

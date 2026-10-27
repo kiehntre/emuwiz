@@ -28,6 +28,7 @@ pub(super) enum OrganisationView {
     PlayingLibrary,
     MameNormalizer,
     MameHealth,
+    DatNamePreview,
     RepairReview,
     RepairHistory,
     ExactDuplicates,
@@ -396,7 +397,8 @@ impl App {
             })
             .auto_shrink([false, false])
             .show(ui, |ui| match self.organisation.view {
-                OrganisationView::RepairReview
+                OrganisationView::DatNamePreview
+                | OrganisationView::RepairReview
                 | OrganisationView::RepairHistory
                 | OrganisationView::ExactDuplicates => repair::show(self, ui),
                 OrganisationView::FrontendExport => frontend_export::show(self, ui),
@@ -476,6 +478,7 @@ impl App {
                                 selected = Some(Some(PlayingLibraryDestination::Generic));
                             }
                             if ui.button("Frontend export profiles").clicked() { self.organisation.view = OrganisationView::FrontendExport; }
+                            if ui.button("DAT name preview (read-only)").clicked() { self.organisation.view = OrganisationView::DatNamePreview; }
                             if ui.button("Repair Review").clicked() { self.organisation.view = OrganisationView::RepairReview; }
                             if ui.button("Repair History").clicked() { self.organisation.view = OrganisationView::RepairHistory; }
                         });

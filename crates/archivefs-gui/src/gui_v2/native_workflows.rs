@@ -1049,6 +1049,16 @@ impl NativeWorkflows {
         self.app.show_exact_duplicate_review_page(ui);
     }
 
+    pub(super) fn show_dat_name_preview(&mut self, ui: &mut egui::Ui) {
+        if let Err(error) = self.app.ensure_dat_sources_page_loaded() {
+            ui.label(format!("DAT name preview unavailable: {error}"));
+            return;
+        }
+        if let Some(page) = self.app.sources_ui.dat_sources_page.as_ref() {
+            crate::dat_sources_page::canonical_preview::show(ui, &page.view());
+        }
+    }
+
     pub(super) fn show_native_repair_review(&mut self, ui: &mut egui::Ui) {
         let page = self
             .app
