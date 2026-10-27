@@ -19,6 +19,12 @@ pub struct ReviewedAmiberryCdProfile {
     pub machine: AmigaMachineProfile,
 }
 fn binding(path: &Path) -> Result<AmiberryCdFileBinding, String> {
+    if path.as_os_str().len() > 255 {
+        return Err(format!(
+            "{} exceeds Blue's supported native path length (255 bytes).",
+            path.display()
+        ));
+    }
     if !path.is_absolute() || std::fs::canonicalize(path).ok().as_deref() != Some(path) {
         return Err(format!(
             "{} is missing, non-canonical or passes through a symbolic link.",
@@ -63,17 +69,36 @@ fn settings(path: &Path) -> Result<BTreeMap<String, String>, String> {
         return Err("Amiberry profile exceeds the bounded review size.".into());
     }
     let text = String::from_utf8(bytes).map_err(|_| "Amiberry profile must be UTF-8 text.")?;
+    if text
+        .chars()
+        .any(|c| c.is_control() && !matches!(c, '\t' | '\r' | '\n'))
+    {
+        return Err("Amiberry profile contains unsupported control characters.".into());
+    }
     let mut result = BTreeMap::new();
     for line in text.lines() {
-        let line = line.trim();
+        if line.len() > 1023 {
+            return Err(
+                "Amiberry profile line exceeds the native review limit (1023 bytes).".into(),
+            );
+        }
+        let line = line.trim_matches([' ', '\t', '\r', '\n']);
         if line.is_empty() || line.starts_with(';') || line.starts_with('#') {
             continue;
         }
         let (key, value) = line
             .split_once('=')
             .ok_or("Malformed or sectioned Amiberry profile; no launch was authorized.")?;
-        let key = key.trim().to_ascii_lowercase();
-        let value = value.trim();
+        let key = key.trim_matches([' ', '\t', '\r', '\n']).to_string();
+        let value = value.trim_matches([' ', '\t', '\r', '\n']);
+        if key != key.to_ascii_lowercase() {
+            return Err("Native UAE setting names must use their exact lowercase spelling.".into());
+        }
+        if key.len() > 63 || value.len() > 255 {
+            return Err(
+                "Amiberry setting name or value exceeds the bounded native profile subset.".into(),
+            );
+        }
         // A deliberately narrow native UAE subset. Includes, quickstart,
         // savestates, Lua, extra drives and host filesystem mounts cannot
         // introduce dependencies or override the selected machine unnoticed.
@@ -171,6 +196,8 @@ pub fn review_amiberry_cd_profile(
     if format == AmigaCdMediaFormat::CueBin {
         // Shared strict generic CUE resolver enumerates every FILE and refuses
         // escapes/missing members; no platform inference from the descriptor.
+        crate::ingestion::cue_bin::resolve_cue_layout(selected)
+            .map_err(|e| format!("CUE layout: {e}"))?;
         for path in crate::ingestion::cue_bin::resolve_cue_all_files(selected)
             .map_err(|e| format!("CUE dependencies: {e}"))?
         {

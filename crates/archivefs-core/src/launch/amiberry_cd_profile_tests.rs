@@ -189,3 +189,50 @@ fn missing_companion_and_firmware_are_named() {
             .contains("extended.rom")
     );
 }
+
+#[test]
+fn native_key_casing_unicode_whitespace_controls_and_buffer_limits_refuse() {
+    for (from, to) in [
+        ("chipset_compatible", "CHIPSET_COMPATIBLE"),
+        ("cdimage0", "CDIMAGE0"),
+        ("kickstart_rom_file", "KICKSTART_ROM_FILE"),
+        ("chipset_compatible", "\u{a0}chipset_compatible"),
+    ] {
+        let f = fixture("CD32", false);
+        let text = std::fs::read_to_string(&f.profile).unwrap();
+        std::fs::write(&f.profile, text.replace(from, to)).unwrap();
+        assert!(
+            review_amiberry_cd_profile(&f.exe, &f.profile, &f.media, &f.identity).is_err(),
+            "{to}"
+        );
+    }
+    for suffix in [
+        format!("config_description={}\n", "x".repeat(2600)),
+        "config_description=bad\0text\n".into(),
+    ] {
+        let f = fixture("CD32", false);
+        use std::io::Write;
+        write!(
+            std::fs::OpenOptions::new()
+                .append(true)
+                .open(&f.profile)
+                .unwrap(),
+            "{suffix}"
+        )
+        .unwrap();
+        assert!(review_amiberry_cd_profile(&f.exe, &f.profile, &f.media, &f.identity).is_err());
+    }
+    let f = fixture("CD32", false);
+    let mut long = f.root.path().to_path_buf();
+    for i in 0..6 {
+        long = long.join(format!("segment{i}{}", "x".repeat(35)));
+        std::fs::create_dir(&long).unwrap();
+    }
+    let media = long.join("disc.iso");
+    std::fs::write(&media, b"synthetic").unwrap();
+    let text = std::fs::read_to_string(&f.profile)
+        .unwrap()
+        .replace(f.media.to_str().unwrap(), media.to_str().unwrap());
+    std::fs::write(&f.profile, text).unwrap();
+    assert!(review_amiberry_cd_profile(&f.exe, &f.profile, &media, &f.identity).is_err());
+}
