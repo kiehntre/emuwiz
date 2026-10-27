@@ -2,6 +2,30 @@ use super::*;
 use std::collections::BTreeSet;
 
 #[test]
+fn amiga_floppy_formats_share_topology_without_creating_authority() {
+    for extension in ["adf", "adz", "dms", "ipf", "hfe", "HFE"] {
+        let records = (1..=2)
+            .map(|n| {
+                rec(
+                    &format!("/amiga/Clockwork (Disk {n} of 2).{extension}"),
+                    "Amiga",
+                )
+            })
+            .collect::<Vec<_>>();
+        assert!(
+            records
+                .iter()
+                .all(|r| r.family == Some(MediaFamily::Floppy))
+        );
+        let grouped = sets(records);
+        assert_eq!(grouped.len(), 1, "{extension}");
+        assert_eq!(grouped[0].members.len(), 2, "{extension}");
+        assert_eq!(grouped[0].state, MediaSetState::UnverifiedSet);
+        assert!(!grouped[0].identity.verified);
+    }
+}
+
+#[test]
 fn plausible_amiga_floppy_adds_no_release_or_medium_authority() {
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("Famous Game (Disk 1 of 1).adf");
