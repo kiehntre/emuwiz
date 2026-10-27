@@ -483,6 +483,11 @@ mod tests {
     use super::*;
     fn fixture() -> (tempfile::TempDir, EmulatorDownloadPlan, PathBuf) {
         let dir = tempfile::tempdir().unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            fs::set_permissions(dir.path(), fs::Permissions::from_mode(0o700)).unwrap();
+        }
         let artifact = dir.path().join("download.AppImage");
         let mut bytes = vec![0u8; MIN_APPIMAGE_BYTES];
         bytes[..4].copy_from_slice(b"\x7fELF");
@@ -514,6 +519,20 @@ mod tests {
             replaces_existing_managed: false,
         };
         (dir, plan, artifact)
+    }
+    #[cfg(unix)]
+    fn private_test_directories(fixture: &Path, path: &Path) {
+        use std::os::unix::fs::PermissionsExt;
+        let mut current = fixture.to_path_buf();
+        for component in path.strip_prefix(fixture).unwrap().components() {
+            current.push(component.as_os_str());
+            match fs::create_dir(&current) {
+                Ok(()) => {}
+                Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {}
+                Err(error) => panic!("{error}"),
+            }
+            fs::set_permissions(&current, fs::Permissions::from_mode(0o700)).unwrap();
+        }
     }
     #[test]
     fn local_artifact_review_is_useful_and_does_not_create_installation_or_approval() {
@@ -627,7 +646,7 @@ mod tests {
             .parent()
             .unwrap()
             .to_path_buf();
-        fs::create_dir_all(&install).unwrap();
+        private_test_directories(dir.path(), &install);
         let saved = install.join("preserved.cfg");
         fs::write(&saved, b"config").unwrap();
         let review = review_appimage_install(&root, &plan, None);
@@ -640,7 +659,7 @@ mod tests {
         let (dir, plan, _) = fixture();
         let root = dir.path().join("data");
         let emulator = root.join("emulators/pcsx2");
-        fs::create_dir_all(&emulator).unwrap();
+        private_test_directories(dir.path(), &emulator);
         fs::write(emulator.join("pcsx2.AppImage"), b"previous").unwrap();
         std::os::unix::fs::symlink("installs/previous", emulator.join("current")).unwrap();
         let review = review_appimage_install(&root, &plan, None);
