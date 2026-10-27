@@ -1050,12 +1050,13 @@ impl NativeWorkflows {
     }
 
     pub(super) fn show_dat_name_preview(&mut self, ui: &mut egui::Ui) {
-        if let Err(error) = self.app.ensure_dat_sources_page_loaded() {
-            ui.label(format!("DAT name preview unavailable: {error}"));
-            return;
-        }
+        // Do not initialize the DAT controller here: its normal startup also
+        // reconciles recovery journals. This preview only borrows loaded data.
         if let Some(page) = self.app.sources_ui.dat_sources_page.as_ref() {
             crate::dat_sources_page::canonical_preview::show(ui, &page.view());
+        } else {
+            ui.heading("DAT name preview");
+            ui.label("No DAT audit is loaded. Open DATs & Verification and run its existing catalogue audit first, then return here. This preview does not initialize recovery or change files.");
         }
     }
 
@@ -3483,6 +3484,20 @@ mod launch_recovery_tests;
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn canonical_blue_preview_does_not_initialize_dat_recovery() {
+        let ctx = egui::Context::default();
+        let mut workflows = NativeWorkflows::new(ctx.clone());
+        assert!(workflows.app.sources_ui.dat_sources_page.is_none());
+        let _ = ctx.run(egui::RawInput::default(), |ctx| {
+            egui::CentralPanel::default().show(ctx, |ui| workflows.show_dat_name_preview(ui));
+        });
+        assert!(
+            workflows.app.sources_ui.dat_sources_page.is_none(),
+            "a snapshot preview must not load the controller that reconciles recovery journals"
+        );
+    }
 
     fn blue_cheat_game(path: &str, platform: &str) -> crate::gui_v2::library::Game {
         crate::gui_v2::library::Game::from_archive(archivefs_core::PersistedArchive {

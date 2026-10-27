@@ -9371,7 +9371,12 @@ fn render_canonical_preview(view: &DatSourcesPageView) -> egui::FullOutput {
 
 #[test]
 fn canonical_blue_preview_reuses_dat_names_and_preserves_files() {
-    let (fixture, mut page, root) = audit_fixture();
+    let fixture = Fixture::new();
+    let dat = fixture.write("collection.dat", LOGIQX);
+    let root = fixture.dir("roms");
+    std::fs::write(root.join("not-canonical.bin"), SUPER_BIN).unwrap();
+    let mut page = fixture.page_with_library(vec![root.clone()]);
+    page.apply(DatSourcesPageAction::AddFile { path: dat });
     let before = snapshot(&fixture.root);
     page.apply(DatSourcesPageAction::Audit {
         id: "collection".into(),
@@ -9384,6 +9389,7 @@ fn canonical_blue_preview_reuses_dat_names_and_preserves_files() {
         "DAT name preview",
         "Source authority:",
         "super.bin",
+        "not-canonical.bin",
         "audit snapshot",
         "no approval",
     ] {
