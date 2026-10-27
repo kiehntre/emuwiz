@@ -301,6 +301,16 @@ the `docs/` tree for provenance and are not current capability promises.
 
 EmuWiz is dedicated to [my dad](DEDICATION.md).
 
+## Credits
+
+The preview-only PS2 CodeBreaker decoder uses
+[codebreaker-rs](https://github.com/mlafeldt/codebreaker-rs) by **Mathias Lafeldt**,
+Copyright (c) Mathias Lafeldt, licensed under MIT OR Apache-2.0 (used under MIT).
+Its original C implementation, [cb2util](https://github.com/mlafeldt/cb2util),
+Copyright (C) 2006-2013 Mathias Lafeldt, MIT licensed, is the differential-test
+reference. See [third-party notices](docs/THIRD_PARTY_NOTICES.md) and the
+[upstream fix research](docs/research/CODEBREAKER_UPSTREAM_FIX_FOLLOWUP.md).
+
 ## Documentation index
 
 - [Roadmap](ROADMAP.md)
