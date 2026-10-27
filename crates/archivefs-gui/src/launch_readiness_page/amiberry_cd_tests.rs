@@ -96,7 +96,7 @@ fn small_viewport_keeps_action_visible_and_blocks_another_active_launch() {
     let context = egui::Context::default();
     fn action(shape: &egui::Shape) -> Option<egui::Rect> {
         match shape {
-            egui::Shape::Text(t) if t.galley.text() == "Launch amiberry_cd" => {
+            egui::Shape::Text(t) if t.galley.text() == "Launch Amiberry CD" => {
                 Some(egui::Rect::from_min_size(t.pos, t.galley.size()))
             }
             egui::Shape::Vec(v) => v.iter().find_map(action),
@@ -305,7 +305,7 @@ fn full_unresolved_page_keeps_native_action_visible_at_1024_by_600() {
     );
     fn action(shape: &egui::Shape) -> Option<egui::Rect> {
         match shape {
-            egui::Shape::Text(t) if t.galley.text() == "Launch amiberry_cd" => {
+            egui::Shape::Text(t) if t.galley.text() == "Launch Amiberry CD" => {
                 Some(egui::Rect::from_min_size(t.pos, t.galley.size()))
             }
             egui::Shape::Vec(v) => v.iter().find_map(action),

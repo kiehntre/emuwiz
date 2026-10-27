@@ -5235,6 +5235,7 @@ fn show_standalone_launch_action(
         Some(choice) if adapter == "melonds" && choice.chosen_count() > 0 => {
             format!("Launch {adapter} with {} cheat(s)", choice.chosen_count())
         }
+        _ if adapter == "amiberry_cd" => "Launch Amiberry CD".to_string(),
         _ if adapter == dosbox::ADAPTER_KEY => "Play in DOSBox".to_string(),
         _ if adapter == "vice" => "Play in VICE".to_string(),
         // ScummVM's Play reads as the product name, like its recheck button.
