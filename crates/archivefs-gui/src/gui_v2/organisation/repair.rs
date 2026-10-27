@@ -8,15 +8,6 @@ pub(super) fn show(app: &mut App, ui: &mut egui::Ui) {
         }
         if ui
             .selectable_label(
-                app.organisation.view == OrganisationView::DatNameReview,
-                "DAT name review",
-            )
-            .clicked()
-        {
-            app.organisation.view = OrganisationView::DatNameReview;
-        }
-        if ui
-            .selectable_label(
                 app.organisation.view == OrganisationView::RepairReview,
                 "Repair Review",
             )
@@ -41,6 +32,15 @@ pub(super) fn show(app: &mut App, ui: &mut egui::Ui) {
             .clicked()
         {
             app.organisation.view = OrganisationView::ExactDuplicates;
+        }
+        if ui
+            .selectable_label(
+                app.organisation.view == OrganisationView::DatNameReview,
+                "DAT name review",
+            )
+            .clicked()
+        {
+            app.organisation.view = OrganisationView::DatNameReview;
         }
     });
     ui.label("Preview is read-only; Apply and Undo require confirmation. Leaving this page does not cancel accepted work.");

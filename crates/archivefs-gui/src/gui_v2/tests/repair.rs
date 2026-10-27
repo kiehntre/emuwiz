@@ -2,6 +2,68 @@ use super::super::organisation::OrganisationView;
 use super::*;
 
 #[test]
+fn blue_dat_name_review_keeps_primary_navigation_visible_and_clickable() {
+    for size in [[1920.0, 1080.0], [1440.0, 900.0], [1024.0, 600.0]] {
+        let ctx = egui::Context::default();
+        ctx.style_mut(|style| style.debug.warn_if_rect_changes_id = false);
+        let mut app = organisation_app(&ctx);
+        frame(&ctx, &mut app, size);
+        let output = frame(&ctx, &mut app, size);
+        assert_viewport_is(&ctx, &output, size);
+        for label in [
+            "Preview Playing Library",
+            "Repair Review",
+            "Repair History",
+            "DAT canonical name review",
+        ] {
+            assert!(
+                organisation_label_is_visible(&output, label),
+                "{label} clipped at {size:?}"
+            );
+        }
+        let point = text_bounds(&output, "DAT canonical name review")[0].center();
+        click_at(&ctx, &mut app, size, point);
+        assert_eq!(
+            app.organisation.view,
+            OrganisationView::DatNameReview,
+            "{size:?}"
+        );
+        let output = frame(&ctx, &mut app, size);
+        assert_viewport_is(&ctx, &output, size);
+        assert!(organisation_label_is_visible(
+            &output,
+            "Build fresh read-only preview"
+        ));
+        assert!(
+            app.native_workflows
+                .as_ref()
+                .unwrap()
+                .app
+                .sources_ui
+                .dat_sources_page
+                .is_none()
+        );
+        for (label, expected) in [
+            ("Repair Review", OrganisationView::RepairReview),
+            ("Repair History", OrganisationView::RepairHistory),
+        ] {
+            let output = frame(&ctx, &mut app, size);
+            assert!(
+                organisation_label_is_visible(&output, label),
+                "{label} clipped at {size:?}"
+            );
+            click_at(
+                &ctx,
+                &mut app,
+                size,
+                text_bounds(&output, label)[0].center(),
+            );
+            assert_eq!(app.organisation.view, expected, "{label} at {size:?}");
+        }
+    }
+}
+
+#[test]
 fn blue_repair_navigation_embeds_review_and_history_at_supported_sizes() {
     for size in [[1920.0, 1080.0], [1440.0, 900.0], [1024.0, 600.0]] {
         let ctx = egui::Context::default();

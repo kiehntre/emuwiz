@@ -478,9 +478,9 @@ impl App {
                                 selected = Some(Some(PlayingLibraryDestination::Generic));
                             }
                             if ui.button("Frontend export profiles").clicked() { self.organisation.view = OrganisationView::FrontendExport; }
-                            if ui.button("DAT canonical name review").clicked() { self.organisation.view = OrganisationView::DatNameReview; }
                             if ui.button("Repair Review").clicked() { self.organisation.view = OrganisationView::RepairReview; }
                             if ui.button("Repair History").clicked() { self.organisation.view = OrganisationView::RepairHistory; }
+                            if ui.button("DAT canonical name review").clicked() { self.organisation.view = OrganisationView::DatNameReview; }
                         });
                         ui.label("A clean play-focused view made from your existing verified games.");
                         ui.label("Reads originals · Creates separate linked output · Originals preserved · Preview required · Undo available for supported operations");
