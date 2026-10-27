@@ -260,3 +260,63 @@ fn returning_to_amiberry_game_retains_status_without_reviewed_selection() {
     assert!(rendered.contains("Process exited"));
     assert!(rendered.contains('9'));
 }
+
+#[test]
+fn full_unresolved_page_keeps_native_action_visible_at_1024_by_600() {
+    let f = fixture();
+    let request = ready(&f);
+    let mut state = StandaloneLaunchState::default();
+    state.focus_dosbox_game(Some(&f.media));
+    state.amiberry_cd = Panel {
+        focused: Some(f.media.clone()),
+        key: Some((Some(f.media.clone()), CanonicalIdentityStatus::Unknown)),
+        results: (0..12)
+            .map(|i| (format!("configured {i}"), Ok(request.clone())))
+            .collect(),
+        chosen: Some("configured 0".into()),
+        ..Default::default()
+    };
+    let mut retroarch = super::super::RetroArchLaunchState::default();
+    let mut dolphin = super::super::DolphinLaunchState::default();
+    let mut pcsx2 = super::super::Pcsx2LaunchState::default();
+    let mut whdload = super::super::AmigaWHDLoadLaunchState::default();
+    let context = egui::Context::default();
+    let output = context.run(
+        egui::RawInput {
+            screen_rect: Some(egui::Rect::from_min_size(
+                egui::Pos2::ZERO,
+                egui::vec2(1024., 600.),
+            )),
+            ..Default::default()
+        },
+        |ctx| {
+            egui::CentralPanel::default().show(ctx, |ui| {
+                super::super::show_launch_readiness_panel(
+                    ui,
+                    &super::super::LaunchReadinessInput::IdentityUnknown,
+                    &mut retroarch,
+                    &mut dolphin,
+                    &mut pcsx2,
+                    &mut state,
+                    &mut whdload,
+                );
+            });
+        },
+    );
+    fn action(shape: &egui::Shape) -> Option<egui::Rect> {
+        match shape {
+            egui::Shape::Text(t) if t.galley.text() == "Launch amiberry_cd" => {
+                Some(egui::Rect::from_min_size(t.pos, t.galley.size()))
+            }
+            egui::Shape::Vec(v) => v.iter().find_map(action),
+            _ => None,
+        }
+    }
+    let rect = output
+        .shapes
+        .iter()
+        .find_map(|s| action(&s.shape))
+        .expect("configured CD launch action visible on combined optical page");
+    assert!(rect.bottom() <= 600. && rect.right() <= 1024., "{rect:?}");
+    assert!(!state.is_active());
+}
