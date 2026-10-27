@@ -412,7 +412,14 @@ impl App {
                     // below the fold, where it cannot be focused. Keep the page
                     // title and the safety statement, drop the illustration.
                     if compact {
-                        ui.heading("Choose what you want to organise");
+                        // In an exceptionally short viewport, reserve space
+                        // for the primary control before adding another title.
+                        if ui.clip_rect().height()
+                            >= ui.text_style_height(&egui::TextStyle::Heading)
+                                + ui.spacing().interact_size.y
+                        {
+                            ui.heading("Choose what you want to organise");
+                        }
                         widgets::status_badge(
                             ui,
                             "Nothing changes until you preview and confirm",
