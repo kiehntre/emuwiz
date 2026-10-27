@@ -19,6 +19,8 @@ use std::time::Duration;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
+pub mod side_by_side;
+
 pub const MAX_DOWNLOAD_BYTES: usize = 1_073_741_824;
 pub const MIN_APPIMAGE_BYTES: usize = 1_048_576;
 pub const MAX_RELEASE_METADATA_BYTES: usize = 2 * 1024 * 1024;
