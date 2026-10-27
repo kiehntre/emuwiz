@@ -775,6 +775,7 @@ pub(super) enum ToolPage {
     PlatformAliases,
     DatabaseStatus,
     CheatExtras,
+    HomebrewBrowser,
     PatchPackagePreview,
     ProfileSettings,
     WhdloadOptions,
@@ -783,7 +784,7 @@ pub(super) enum ToolPage {
 }
 
 impl ToolPage {
-    pub const ALL: [Self; 14] = [
+    pub const ALL: [Self; 15] = [
         Self::AlternativeProviders,
         Self::NeedsAttention,
         Self::Mounts,
@@ -793,6 +794,7 @@ impl ToolPage {
         Self::PlatformAliases,
         Self::DatabaseStatus,
         Self::CheatExtras,
+        Self::HomebrewBrowser,
         Self::PatchPackagePreview,
         Self::ProfileSettings,
         Self::WhdloadOptions,
@@ -815,6 +817,7 @@ impl ToolPage {
             Self::WhdloadOptions => "WHDLoad ToolType review",
             Self::OpticalCompare => "Compare optical layouts",
             Self::SourceImpact => "Source-location impact preview",
+            Self::HomebrewBrowser => "Offline homebrew catalogue",
             Self::CheatExtras => "Providers and code previews",
         }
     }
@@ -848,6 +851,9 @@ impl ToolPage {
             Self::SourceImpact => {
                 "Preview one library source at a new folder without relocating anything."
             }
+            Self::HomebrewBrowser => {
+                "Search a local catalogue and review dated claims without acquiring games."
+            }
             Self::CheatExtras => {
                 "Licences for open and local cheat providers, and read-only code previews."
             }
@@ -869,6 +875,7 @@ impl ToolPage {
             Self::WhdloadOptions => Section::Mods,
             Self::OpticalCompare => Section::Converter,
             Self::SourceImpact => Section::Sources,
+            Self::HomebrewBrowser => Section::Games,
             Self::CheatExtras => Section::Mods,
         }
     }
@@ -887,6 +894,7 @@ impl ToolPage {
             Self::WhdloadOptions => "Tools",
             Self::OpticalCompare => "Tools",
             Self::SourceImpact => "Tools",
+            Self::HomebrewBrowser => "Tools",
             Self::CheatExtras => "Enhance",
         }
     }
