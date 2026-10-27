@@ -537,7 +537,7 @@ where
 }
 
 #[derive(Debug, Clone)]
-struct PolicyResolver<R>(R);
+pub(crate) struct PolicyResolver<R>(pub(crate) R);
 
 impl<R> ureq::unversioned::resolver::Resolver for PolicyResolver<R>
 where

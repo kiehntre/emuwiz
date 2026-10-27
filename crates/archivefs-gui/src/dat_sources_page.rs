@@ -128,6 +128,7 @@ use crate::{
     database_state_path,
 };
 
+mod custom;
 mod native_verification;
 mod save_result;
 #[cfg(test)]
@@ -3166,6 +3167,7 @@ enum CoverageCoreOutcome {
 }
 
 pub(crate) struct DatSourcesPageState {
+    custom: custom::Controller,
     config_path: PathBuf,
     /// Dedicated configuration and storage for explicitly managed DATs. This
     /// remains wholly separate from the user-local DAT registry above.
@@ -3446,6 +3448,7 @@ impl DatSourcesPageState {
                 .contains(&transaction.transaction_id)
         });
         let mut state = Self {
+            custom: custom::Controller::default(),
             config_path,
             managed_config_path,
             managed_root,
@@ -15287,6 +15290,16 @@ impl ArchiveFsApp {
                     managed_sources: page.managed_sources.clone(),
                     managed_root: page.managed_root.clone(),
                 });
+        }
+        if !simple_check
+            && !identify_rename
+            && let Some(path) = page.custom.show(
+                ui,
+                page.config_path.with_file_name("custom_dat_sources.json"),
+                page.managed_root.join("custom"),
+            )
+        {
+            page.apply(DatSourcesPageAction::AddFile { path });
         }
         let view = page.view_with_romm_summary(self.romm_ui.verify_summary);
         let assignment_action = if simple_check {

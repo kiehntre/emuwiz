@@ -271,13 +271,17 @@ impl CustomDatSourceRegistry {
     /// Loads the registry. A missing file is an empty registry; a corrupt or
     /// tampered file is refused rather than partially trusted.
     pub fn load(path: &Path) -> Result<Self> {
-        let body = match fs::read_to_string(path) {
-            Ok(body) => body,
+        let file = match crate::launch::process_spawn::open_regular_file_nonblocking(path) {
+            Ok(file) => file,
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
                 return Ok(Self::default());
             }
             Err(error) => return Err(ArchiveFsError::io(path.to_path_buf(), error)),
         };
+        let mut body = String::new();
+        file.take(4 * 1024 * 1024 + 1)
+            .read_to_string(&mut body)
+            .map_err(|e| ArchiveFsError::io(path.to_path_buf(), e))?;
         if body.len() > 4 * 1024 * 1024 {
             return Err(config("custom DAT registry is too large"));
         }
@@ -297,6 +301,35 @@ impl CustomDatSourceRegistry {
             }
         }
         Ok(registry)
+    }
+
+    /// Compare and save under a cooperating-writer lock. A busy or abandoned
+    /// lock refuses; it is never reclaimed using age or a guessed PID.
+    pub fn save_if_current(&self, path: &Path, expected: &Self) -> Result<()> {
+        if let Some(parent) = path.parent() {
+            fs::create_dir_all(parent).map_err(|e| ArchiveFsError::io(parent.to_path_buf(), e))?;
+        }
+        let lock_path = path.with_extension("json.lock");
+        let lock = fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&lock_path)
+            .map_err(|error| {
+                if error.kind() == std::io::ErrorKind::AlreadyExists {
+                    config("custom DAT source registrations are locked; saving is refused")
+                } else {
+                    ArchiveFsError::io(lock_path.clone(), error)
+                }
+            })?;
+        let result = (|| {
+            if Self::load(path)? != *expected {
+                return Err(config("custom DAT registry changed; reload before saving"));
+            }
+            self.save(path)
+        })();
+        drop(lock);
+        let removed = fs::remove_file(&lock_path).map_err(|e| ArchiveFsError::io(lock_path, e));
+        result.and(removed)
     }
 
     pub fn save(&self, path: &Path) -> Result<()> {
@@ -430,6 +463,21 @@ impl<'a> CustomDatLifecycle<'a> {
     /// Snapshots eligible for rollback, in the store's own history order.
     pub fn history(&self) -> Result<Vec<ManagedSourceSnapshot>> {
         self.store.history_snapshots()
+    }
+
+    pub fn rollback_if_current(
+        &self,
+        sha256: &str,
+        expected_active: Option<&str>,
+    ) -> Result<ActivationResult> {
+        self.store
+            .rollback_snapshot_if_current(sha256, expected_active)
+    }
+
+    /// Path of the immutable, integrity-checked active DAT for explicit local
+    /// catalogue registration. It conveys user-provided trust only.
+    pub fn active_dat_path(&self) -> Result<Option<std::path::PathBuf>> {
+        Ok(self.active()?.map(|s| self.store.object_path(&s.sha256)))
     }
 
     pub fn rollback(&self, sha256: &str) -> Result<ActivationResult> {
@@ -656,8 +704,8 @@ fn read_bounded(path: &Path) -> Result<Vec<u8>> {
     if metadata.len() > CUSTOM_DAT_MAX_BYTES {
         return Err(config("staged DAT exceeds the size limit"));
     }
-    let file =
-        fs::File::open(path).map_err(|error| ArchiveFsError::io(path.to_path_buf(), error))?;
+    let file = crate::launch::process_spawn::open_regular_file_nonblocking(path)
+        .map_err(|error| ArchiveFsError::io(path.to_path_buf(), error))?;
     let mut bytes = Vec::new();
     file.take(CUSTOM_DAT_MAX_BYTES + 1)
         .read_to_end(&mut bytes)
