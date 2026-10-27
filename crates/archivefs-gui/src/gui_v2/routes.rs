@@ -766,7 +766,6 @@ pub(super) fn family_children(family: FeatureFamily) -> Vec<FamilyAction> {
 /// (Batch 10, boards `D11-LG-*`). Each one has its own module.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub(super) enum ToolPage {
-    NetplayPreview,
     NeedsAttention,
     Mounts,
     MediaSets,
@@ -775,11 +774,16 @@ pub(super) enum ToolPage {
     PlatformAliases,
     DatabaseStatus,
     CheatExtras,
+    NetplayPreview,
+    PatchPackagePreview,
+    ProfileSettings,
+    WhdloadOptions,
+    OpticalCompare,
+    SourceImpact,
 }
 
 impl ToolPage {
-    pub const ALL: [Self; 9] = [
-        Self::NetplayPreview,
+    pub const ALL: [Self; 14] = [
         Self::NeedsAttention,
         Self::Mounts,
         Self::MediaSets,
@@ -788,11 +792,16 @@ impl ToolPage {
         Self::PlatformAliases,
         Self::DatabaseStatus,
         Self::CheatExtras,
+        Self::NetplayPreview,
+        Self::PatchPackagePreview,
+        Self::ProfileSettings,
+        Self::WhdloadOptions,
+        Self::OpticalCompare,
+        Self::SourceImpact,
     ];
 
     pub fn title(self) -> &'static str {
         match self {
-            Self::NetplayPreview => "Netplay comparison",
             Self::NeedsAttention => "Needs Attention",
             Self::Mounts => "Mounts",
             Self::MediaSets => "Media Sets",
@@ -800,15 +809,18 @@ impl ToolPage {
             Self::LibraryViews => "Library Views",
             Self::PlatformAliases => "Platform aliases",
             Self::DatabaseStatus => "Database status",
+            Self::PatchPackagePreview => "Patch-package inspection",
+            Self::ProfileSettings => "Per-game settings explanation",
+            Self::WhdloadOptions => "WHDLoad ToolType review",
+            Self::OpticalCompare => "Compare optical layouts",
+            Self::SourceImpact => "Source-location impact preview",
+            Self::NetplayPreview => "Netplay comparison",
             Self::CheatExtras => "Providers and code previews",
         }
     }
 
     pub fn purpose(self) -> &'static str {
         match self {
-            Self::NetplayPreview => {
-                "Compare two manually supplied peer observations without connecting."
-            }
             Self::NeedsAttention => {
                 "Current saved evidence, with actions in the workflows that own it."
             }
@@ -820,6 +832,22 @@ impl ToolPage {
             }
             Self::PlatformAliases => "Teach EmuWiz what your folder names mean.",
             Self::DatabaseStatus => "Where EmuWiz keeps what it knows about your library.",
+            Self::PatchPackagePreview => {
+                "Inspect patches and untrusted package metadata without applying anything."
+            }
+            Self::ProfileSettings => "Classify pasted emulator settings without applying them.",
+            Self::WhdloadOptions => {
+                "Explain supplied ToolTypes and Config metadata without changing an installation."
+            }
+            Self::OpticalCompare => {
+                "Compare two local CUE structures without claiming payload preservation."
+            }
+            Self::SourceImpact => {
+                "Preview one library source at a new folder without relocating anything."
+            }
+            Self::NetplayPreview => {
+                "Compare two manually supplied peer observations without connecting."
+            }
             Self::CheatExtras => {
                 "Licences for open and local cheat providers, and read-only code previews."
             }
@@ -829,13 +857,18 @@ impl ToolPage {
     /// The section whose sidebar row and family the page belongs to.
     pub fn home(self) -> Section {
         match self {
-            Self::NetplayPreview => Section::Launch,
             Self::NeedsAttention => Section::Problems,
             Self::Mounts => Section::Storage,
             Self::MediaSets => Section::MultiDisc,
             Self::ViewHistory | Self::LibraryViews => Section::Build,
             Self::PlatformAliases => Section::Settings,
             Self::DatabaseStatus => Section::Settings,
+            Self::PatchPackagePreview => Section::Mods,
+            Self::ProfileSettings => Section::Emulators,
+            Self::WhdloadOptions => Section::Mods,
+            Self::OpticalCompare => Section::Converter,
+            Self::SourceImpact => Section::Sources,
+            Self::NetplayPreview => Section::Launch,
             Self::CheatExtras => Section::Mods,
         }
     }
@@ -843,12 +876,17 @@ impl ToolPage {
     /// The breadcrumb parent, as on the board.
     fn parent_label(self) -> &'static str {
         match self {
-            Self::NetplayPreview => "Games & collection",
             Self::NeedsAttention => "Health & Recovery",
             Self::Mounts => "Tools",
             Self::MediaSets => "Multi-disc games",
             Self::ViewHistory | Self::LibraryViews => "Organise & Export",
             Self::PlatformAliases | Self::DatabaseStatus => "Settings",
+            Self::PatchPackagePreview => "Tools",
+            Self::ProfileSettings => "Tools",
+            Self::WhdloadOptions => "Tools",
+            Self::OpticalCompare => "Tools",
+            Self::SourceImpact => "Tools",
+            Self::NetplayPreview => "Games & collection",
             Self::CheatExtras => "Enhance",
         }
     }

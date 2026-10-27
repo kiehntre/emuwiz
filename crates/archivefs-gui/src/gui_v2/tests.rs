@@ -4644,12 +4644,9 @@ fn gui_v2_selected_saturn_game_shows_read_only_disc_manifest_boundary() {
     let closed = text(&frame(&context, &mut app, [1280.0, 1600.0]));
     assert!(closed.iter().any(|value| value == "Disc & ROM evidence"));
     assert!(!closed.iter().any(|value| value == "Saturn disc layout"));
-    let strings = text(&click_label(
-        &context,
-        &mut app,
-        [1280.0, 2600.0],
-        "Disc & ROM evidence",
-    ));
+    let _ = click_label(&context, &mut app, [1280.0, 2600.0], "Disc & ROM evidence");
+    super::saturn_manifest::finish_worker_for_test(&context);
+    let strings = text(&frame(&context, &mut app, [1280.0, 2600.0]));
     assert!(strings.iter().any(|value| value == "Saturn disc layout"));
     assert!(
         strings
@@ -11164,3 +11161,33 @@ mod large_library_regressions;
 mod artwork_journey;
 
 mod provider_validation;
+
+#[test]
+fn gui_v2_same_destination_reentry_discards_an_older_preview() {
+    use crate::playing_library_page::PlayingLibraryDestination;
+    let context = egui::Context::default();
+    let mut app = fixture(&context);
+    let id = app
+        .activity
+        .queue("Old preview", Route::Section(Section::Build), false);
+    let old_state = app.playing_library.clone();
+    app.playing_library_job = Some(super::PlayingLibraryJob {
+        id,
+        kind: super::PlayingLibraryJobKind::Preview,
+        generation: 1,
+        input_fingerprint: old_state.input_fingerprint(),
+    });
+    app.playing_library_generation = 1;
+    // Reset approvals by re-entering the same route while its old worker is
+    // still running. Path/preferences and destination value have not changed.
+    app.playing_library
+        .set_destination(PlayingLibraryDestination::Generic);
+    app.finish_playing_library_job(
+        id,
+        super::PlayingLibraryJobKind::Preview,
+        Box::new(old_state),
+        1,
+    );
+    assert!(app.playing_library_job.is_none());
+    assert!(app.activity.jobs[&id].summary.contains("discarded"));
+}
