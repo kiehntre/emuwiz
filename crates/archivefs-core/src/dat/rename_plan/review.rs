@@ -64,7 +64,7 @@ fn catalogue_problem(outcome: &DatAuditOutcome) -> Option<String> {
             .ok_or("No single catalogue digest: use an installed single-file catalogue")?;
         let path = Path::new(&outcome.dat_path);
         let before = FileFingerprint::observe(path).ok_or("Catalogue is unavailable")?;
-        let safe = open_bounded_read(path, &TrustedRoots::none()).map_err(|e| e.to_string())?;
+        let safe = open_bounded_read(path, &TrustedRoots::none()).map_err(|e| e.detail())?;
         let max = crate::dat::limits::DEFAULT_MAX_FILE_SIZE;
         if before.size_bytes > max {
             return Err("Catalogue exceeds preview read limit".into());
@@ -81,7 +81,14 @@ fn catalogue_problem(outcome: &DatAuditOutcome) -> Option<String> {
             bytes += read as u64;
             digest.update(&buffer[..read]);
         }
-        if bytes > max || !before.still_current() || format!("{:x}", digest.finalize()) != *expected
+        if bytes > max
+            || !before.still_current()
+            || digest
+                .finalize()
+                .iter()
+                .map(|byte| format!("{byte:02x}"))
+                .collect::<String>()
+                != *expected
         {
             return Err(
                 "Stale catalogue evidence: bytes changed since the audit; run a fresh preview"
