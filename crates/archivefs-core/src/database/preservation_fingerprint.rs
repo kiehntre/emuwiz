@@ -117,7 +117,7 @@ impl Database {
         Ok(None)
     }
 
-    pub(super) fn is_preservation_recording(&self, archive_id: i64) -> Result<bool> {
+    pub fn is_preservation_recording(&self, archive_id: i64) -> Result<bool> {
         self.connection
             .query_row(
                 "SELECT archive_kind = 'preservation_recording' FROM archives WHERE id = ?1",
