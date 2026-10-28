@@ -510,6 +510,17 @@ mod tests {
         const CHILD: &str = "EMUWIZ_SRAM_BLUE_INTEGRATION_CHILD";
         if std::env::var_os(CHILD).is_some() {
             let root = std::path::PathBuf::from(std::env::var_os("EMUWIZ_SRAM_BLUE_ROOT").unwrap());
+            let marker_name = std::env::var_os("EMUWIZ_SRAM_BLUE_MARKER").unwrap();
+            let marker_name = Path::new(&marker_name);
+            assert!(matches!(
+                marker_name.components().collect::<Vec<_>>().as_slice(),
+                [std::path::Component::Normal(_)]
+            ));
+            use std::os::unix::fs::PermissionsExt;
+            let directory = std::fs::symlink_metadata(&root).unwrap();
+            let marker = std::fs::symlink_metadata(root.join(marker_name)).unwrap();
+            assert!(directory.is_dir() && directory.permissions().mode() & 0o077 == 0);
+            assert!(marker.is_file() && marker.permissions().mode() & 0o077 == 0);
             let core = root.join("cores/gambatte_libretro.so");
             let config = root.join("home/.config/retroarch/retroarch.cfg");
             let saves = root.join("saves");
@@ -694,6 +705,13 @@ mod tests {
 
         let temp = tempfile::tempdir().unwrap();
         let root = temp.path();
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(root, std::fs::Permissions::from_mode(0o700)).unwrap();
+        let marker = tempfile::Builder::new()
+            .prefix("sram-blue-owned-")
+            .tempfile_in(root)
+            .unwrap();
+        let marker_name = marker.path().file_name().unwrap();
         for relative in [
             "bin",
             "cores",
@@ -756,6 +774,7 @@ mod tests {
             .env_clear()
             .env(CHILD, "1")
             .env("EMUWIZ_SRAM_BLUE_ROOT", root)
+            .env("EMUWIZ_SRAM_BLUE_MARKER", marker_name)
             .env("HOME", root.join("home"))
             .env("PATH", root.join("bin"))
             .env("XDG_CONFIG_HOME", root.join("home/.config"))
