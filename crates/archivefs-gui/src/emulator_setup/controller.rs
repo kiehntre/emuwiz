@@ -1798,7 +1798,10 @@ impl ArchiveFsApp {
                     adapter_id: "mgba",
                     profile_id: profile.profile_id.clone(),
                     profile_path: profile.config_path.clone(),
-                    eligible: profile.eligible,
+                    eligible: archivefs_core::patch_manager::resolve_mgba_native_launch_binding(
+                        profile,
+                    )
+                    .is_ok(),
                     // A BIOS is optional for ordinary GBA/GB/GBC launch;
                     // mGBA's own preflight retains any configured BIOS
                     // evidence without turning absence into a blocker.

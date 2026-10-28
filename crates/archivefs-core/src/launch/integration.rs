@@ -542,7 +542,7 @@ fn project_standalone_profiles(input: &LaunchPlanResults<'_>) -> Vec<StandaloneP
                     adapter_id: "mgba",
                     profile_id: profile.profile_id.clone(),
                     profile_path: profile.config_path.clone(),
-                    eligible: profile.eligible,
+                    eligible: crate::patch_manager::resolve_mgba_native_launch_binding(profile).is_ok(),
                     firmware: FirmwareReadiness::NotRequired,
                 })
             }

@@ -830,11 +830,11 @@ pub use mgba_cheats::{
     set_mgba_cheat_state,
 };
 pub use mgba_local::{
-    MGBA_MAX_CONFIG_BYTES, MGBA_MAX_PROFILES, MgbaBiosState, MgbaConfigInspection,
-    MgbaDiscoveryError, MgbaExecutable, MgbaGameRequest, MgbaInstallationType, MgbaLaunchBlocker,
-    MgbaLaunchBlockerKind, MgbaNativeLaunchBinding, MgbaProfile, MgbaProfileDiscovery,
-    MgbaProfileDiscoveryRoots, discover_mgba_profiles, parse_mgba_version,
-    resolve_mgba_native_launch_binding,
+    MGBA_MAX_CONFIG_BYTES, MGBA_MAX_EXECUTABLE_BYTES, MGBA_MAX_PROFILES, MgbaBiosState,
+    MgbaConfigInspection, MgbaDiscoveryError, MgbaExecutable, MgbaGameRequest,
+    MgbaInstallationType, MgbaLaunchBlocker, MgbaLaunchBlockerKind, MgbaNativeLaunchBinding,
+    MgbaProfile, MgbaProfileDiscovery, MgbaProfileDiscoveryRoots, discover_mgba_profiles,
+    parse_mgba_version, resolve_mgba_native_launch_binding,
 };
 pub use n64_gameshark::{
     N64CheatCode, N64CheatDecodeResult, N64CheatIssue, N64CheatOpcode, N64CheatProjection,
