@@ -174,7 +174,15 @@ pub fn hash_full_file_sha256(
     trusted: &TrustedRoots,
     cancel: Option<&AtomicBool>,
 ) -> Result<FullFileIdentity, FullHashRefusal> {
-    hash_full_file_sha256_inner(path, trusted, cancel, None, || {}, || {})
+    hash_full_file_sha256_inner(
+        path,
+        trusted,
+        cancel,
+        None,
+        FileFingerprint::observe,
+        || {},
+        || {},
+    )
 }
 
 /// Hash only the object observed by `expected`. Used when a caller has already
@@ -185,7 +193,15 @@ pub fn hash_full_file_sha256_bound(
     cancel: Option<&AtomicBool>,
     expected: &FileFingerprint,
 ) -> Result<FullFileIdentity, FullHashRefusal> {
-    hash_full_file_sha256_inner(path, trusted, cancel, Some(expected), || {}, || {})
+    hash_full_file_sha256_inner(
+        path,
+        trusted,
+        cancel,
+        Some(expected),
+        FileFingerprint::observe,
+        || {},
+        || {},
+    )
 }
 
 fn hash_full_file_sha256_inner(
@@ -193,10 +209,11 @@ fn hash_full_file_sha256_inner(
     trusted: &TrustedRoots,
     cancel: Option<&AtomicBool>,
     expected: Option<&FileFingerprint>,
+    observe: impl Fn(&Path) -> Option<FileFingerprint>,
     before_open: impl FnOnce(),
     after_open: impl FnOnce(),
 ) -> Result<FullFileIdentity, FullHashRefusal> {
-    let before = FileFingerprint::observe(path).ok_or_else(|| {
+    let before = observe(path).ok_or_else(|| {
         FullHashRefusal::NotReadable(format!("{} is not a readable regular file", path.display()))
     })?;
     if expected.is_some_and(|expected| expected != &before) {
@@ -256,7 +273,7 @@ fn hash_full_file_sha256_inner(
         total = total.saturating_add(read as u64);
     }
 
-    let after = FileFingerprint::observe(path).ok_or(FullHashRefusal::ChangedWhileReading)?;
+    let after = observe(path).ok_or(FullHashRefusal::ChangedWhileReading)?;
     if after != before || after.size_bytes != total {
         return Err(FullHashRefusal::ChangedWhileReading);
     }

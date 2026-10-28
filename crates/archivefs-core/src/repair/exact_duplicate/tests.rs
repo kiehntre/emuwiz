@@ -982,11 +982,18 @@ fn full_hash_refuses_an_opened_replacement_even_after_original_path_is_restored(
     std::fs::write(&replacement, b"replacement!!!").unwrap();
     let clicked = FileFingerprint::observe(&path).unwrap();
 
+    // Model a filesystem whose final metadata is indistinguishable from the
+    // clicked stamp. The opened descriptor is the only remaining distinction.
+    let observations = std::cell::Cell::new(0);
     let result = hash_full_file_sha256_inner(
         &path,
         &TrustedRoots::none(),
         None,
         Some(&clicked),
+        |_| {
+            observations.set(observations.get() + 1);
+            Some(clicked.clone())
+        },
         || {
             std::fs::rename(&path, &held_original).unwrap();
             std::fs::rename(&replacement, &path).unwrap();
@@ -997,6 +1004,11 @@ fn full_hash_refuses_an_opened_replacement_even_after_original_path_is_restored(
         },
     );
     assert!(matches!(result, Err(FullHashRefusal::ChangedWhileReading)));
+    assert_eq!(
+        observations.get(),
+        1,
+        "the opened-object check must refuse before hashing"
+    );
     let restored = FileFingerprint::observe(&path).unwrap();
     assert_eq!(
         restored.object.unwrap().device,
