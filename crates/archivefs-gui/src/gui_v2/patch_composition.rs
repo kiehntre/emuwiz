@@ -359,13 +359,13 @@ pub(super) fn show(ui: &mut egui::Ui, state: &mut State, game: Option<&Game>) {
                     patch.inspection.format,
                     patch.inspection.patch_sha256
                 ));
-                if position > 0 && ui.button("↑").clicked() {
+                if position > 0 && ui.button("Up").clicked() {
                     state.order.swap(position, position - 1);
                     state.order_reviewed = false;
                     state.plan = None;
                     state.confirmed = false;
                 }
-                if position + 1 < patches.len() && ui.button("↓").clicked() {
+                if position + 1 < patches.len() && ui.button("Down").clicked() {
                     state.order.swap(position, position + 1);
                     state.order_reviewed = false;
                     state.plan = None;

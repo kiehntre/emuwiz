@@ -9,7 +9,7 @@ use std::{
     path::{Path, PathBuf},
     sync::mpsc::{self, Receiver, TryRecvError},
 };
-const LIMIT: &str = "Inspect a ZIP snapshot only. Source files and games are unchanged. A private temporary copy is discarded after inspection. Patch structure and package metadata do not establish base-game identity, compatibility or a safe patch order. To create a verified derived copy, select a game and open Mods & Cheats → Available packages.";
+const LIMIT: &str = "Inspect a ZIP snapshot only. Source files and games are unchanged. A private temporary copy is discarded after inspection. Patch structure and package metadata do not establish base-game identity, compatibility or a safe patch order. To create a verified derived copy, select a game and open Mods & Cheats, then Available packages.";
 #[derive(Default)]
 pub(super) struct State {
     path: Option<PathBuf>,
