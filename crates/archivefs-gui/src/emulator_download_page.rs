@@ -837,6 +837,8 @@ impl EmulatorDownloadPageState {
             ),
         );
 
+        show_side_by_side_assessment(ui, plan);
+
         let confirmed = matches!(state, EmulatorDownloadEntryState::AwaitingConfirmation(_));
         if plan.replaces_existing_managed {
             widgets::banner(
@@ -870,6 +872,20 @@ impl EmulatorDownloadPageState {
         });
         action
     }
+}
+
+/// Read-only recovery slice; this cannot dispatch an installation action.
+fn show_side_by_side_assessment(ui: &mut egui::Ui, plan: &EmulatorDownloadPlan) {
+    use archivefs_core::emulator_download::side_by_side;
+    ui.group(|ui| {
+        ui.strong("Side-by-side AppImage readiness");
+        match side_by_side::assess_metadata(plan) {
+            Ok(()) => { ui.label("Declared release metadata is consistent with the configured source and published SHA-256. Publisher authenticity and executable bytes have not been verified by this assessment."); }
+            Err(reason) => { ui.label(format!("Metadata refused: {}", reason.explanation())); }
+        }
+        ui.label(side_by_side::DISABLED_REASON);
+        ui.label("The existing Install emulator action below uses the ordinary downloader and keeps its existing replacement rules.");
+    });
 }
 
 /// Resolve a possibly-arbitrary id string to a `'static` catalogue id, or
@@ -951,6 +967,50 @@ mod tests {
         EmulatorDownloadPlan, EmulatorDownloadReceipt, ReleaseSelectionPolicy, install_appimage_at,
     };
     use std::path::PathBuf;
+
+    #[test]
+    fn side_by_side_assessment_is_reachable_in_bootstrap_confirmation() {
+        fn text(shape: &egui::epaint::Shape, lines: &mut Vec<String>) {
+            match shape {
+                egui::epaint::Shape::Text(t) => lines.push(t.galley.text().to_string()),
+                egui::epaint::Shape::Vec(shapes) => {
+                    for shape in shapes {
+                        text(shape, lines);
+                    }
+                }
+                _ => {}
+            }
+        }
+        let mut state = EmulatorDownloadPageState::default();
+        let p = plan("pcsx2", false, "/nonexistent/not-written".into());
+        state.test_ingest("pcsx2", TaskResult::Resolved(Ok(p)));
+        let output = egui::Context::default().run(
+            egui::RawInput {
+                screen_rect: Some(egui::Rect::from_min_size(
+                    egui::Pos2::ZERO,
+                    egui::vec2(1024.0, 2000.0),
+                )),
+                ..Default::default()
+            },
+            |ctx| {
+                egui::CentralPanel::default().show(ctx, |ui| {
+                    assert!(state.show_bootstrap(ui).is_none());
+                });
+            },
+        );
+        let mut lines = Vec::new();
+        for shape in output.shapes {
+            text(&shape.shape, &mut lines);
+        }
+        let text = lines.join("\n");
+        assert!(text.contains("Side-by-side AppImage readiness"), "{text}");
+        assert!(
+            text.contains("Side-by-side installation is disabled"),
+            "{text}"
+        );
+        assert!(text.contains("Metadata refused:"), "{text}");
+        assert!(state.task.is_none());
+    }
 
     fn plan(id: &str, replaces: bool, dest: PathBuf) -> EmulatorDownloadPlan {
         EmulatorDownloadPlan {
