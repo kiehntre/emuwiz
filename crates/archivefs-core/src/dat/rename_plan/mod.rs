@@ -39,6 +39,7 @@ pub mod derive;
 pub mod model;
 pub mod plan;
 pub mod portability;
+pub mod review;
 
 pub use collisions::{DirSiblings, detect_proposal_collisions, detect_target_collision};
 pub use derive::{DeriveOutcome, DerivedName, derive_proposed_basename};

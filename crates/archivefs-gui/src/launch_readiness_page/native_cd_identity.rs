@@ -65,9 +65,21 @@ pub(super) fn verify_from_paths(
             .map_err(|e| format!("DAT {} unavailable: {e}", dat_path.display()))?;
         let before = archivefs_core::identity_source::hashing::FileFingerprint::observe(dat_path)
             .ok_or("A registered DAT is unavailable.")?;
-        let dat = parse_dat_file(dat_path, DatLimits::default())
-            .map_err(|e| format!("DAT {} could not be parsed: {e}", dat_path.display()))?
-            .dat;
+        let parsed = parse_dat_file(dat_path, DatLimits::default())
+            .map_err(|e| format!("DAT {} could not be parsed: {e}", dat_path.display()))?;
+        // A recovered match is not authority if this or any other enabled
+        // catalogue is incomplete. An unmatched partial source could hide a
+        // conflicting entry later in the file. Parser notes about trusted DTD
+        // availability do not affect the catalogue contents.
+        if let Some(diagnostic) = parsed.warnings.iter().find(|warning| !warning.is_note()) {
+            return Err(format!(
+                "DAT {} has incomplete or malformed catalogue evidence ({}): {}. Resolve its source diagnostics, then check again.",
+                dat_path.display(),
+                diagnostic.code(),
+                diagnostic.message
+            ));
+        }
+        let dat = parsed.dat;
         if archivefs_core::identity_source::hashing::FileFingerprint::observe(dat_path).as_ref()
             != Some(&before)
         {
@@ -177,5 +189,80 @@ pub(super) mod tests {
         dat(&b, &iso, "Commodore - Amiga CD32");
         assert!(verify_from_paths(&iso, &[a.clone(), b]).is_err());
         assert!(verify_from_paths(&iso, &[a, dir.path().join("missing.dat")]).is_err());
+    }
+
+    #[test]
+    fn truncated_matching_dat_cannot_authorize_launch() {
+        let dir = tempfile::tempdir().unwrap();
+        let iso = dir.path().join("disc.iso");
+        std::fs::write(&iso, b"synthetic disc").unwrap();
+        let source = dir.path().join("truncated.dat");
+        dat(&source, &iso, "Fujitsu - FM Towns");
+        let complete = std::fs::read_to_string(&source).unwrap();
+        std::fs::write(&source, complete.trim_end_matches("</datafile>")).unwrap();
+        let refusal = verify_from_paths(&iso, &[source]).unwrap_err();
+        assert!(refusal.contains("document_truncated"), "{refusal}");
+    }
+
+    #[test]
+    fn truncated_nonmatching_dat_cannot_hide_a_conflicting_entry() {
+        let dir = tempfile::tempdir().unwrap();
+        let iso = dir.path().join("disc.iso");
+        let other = dir.path().join("other.iso");
+        std::fs::write(&iso, b"synthetic disc").unwrap();
+        std::fs::write(&other, b"different disc").unwrap();
+        let matching = dir.path().join("matching.dat");
+        let truncated = dir.path().join("truncated.dat");
+        dat(&matching, &iso, "Fujitsu - FM Towns");
+        dat(&truncated, &other, "Commodore - Amiga CD32");
+        let complete = std::fs::read_to_string(&truncated).unwrap();
+        std::fs::write(&truncated, complete.trim_end_matches("</datafile>")).unwrap();
+        let refusal = verify_from_paths(&iso, &[matching, truncated]).unwrap_err();
+        assert!(refusal.contains("document_truncated"), "{refusal}");
+    }
+
+    #[test]
+    fn malformed_dat_cannot_authorize_launch() {
+        let dir = tempfile::tempdir().unwrap();
+        let iso = dir.path().join("disc.iso");
+        std::fs::write(&iso, b"synthetic disc").unwrap();
+        let source = dir.path().join("malformed.dat");
+        dat(&source, &iso, "Fujitsu - FM Towns");
+        let complete = std::fs::read_to_string(&source).unwrap();
+        std::fs::write(&source, complete.replace("</datafile>", "<broken")).unwrap();
+        assert!(verify_from_paths(&iso, &[source]).is_err());
+    }
+
+    #[test]
+    fn incomplete_checksum_evidence_cannot_authorize_launch() {
+        let dir = tempfile::tempdir().unwrap();
+        let iso = dir.path().join("disc.iso");
+        std::fs::write(&iso, b"synthetic disc").unwrap();
+        let source = dir.path().join("incomplete.dat");
+        dat(&source, &iso, "Fujitsu - FM Towns");
+        let complete = std::fs::read_to_string(&source).unwrap();
+        std::fs::write(
+            &source,
+            complete.replace(
+                "</game>",
+                "<rom name=\"bad.iso\" size=\"4\" sha1=\"invalid\"/></game>",
+            ),
+        )
+        .unwrap();
+        let refusal = verify_from_paths(&iso, &[source]).unwrap_err();
+        assert!(refusal.contains("checksum_dropped"), "{refusal}");
+    }
+
+    #[test]
+    fn complete_valid_dat_still_authorizes_launch() {
+        let dir = tempfile::tempdir().unwrap();
+        let iso = dir.path().join("disc.iso");
+        std::fs::write(&iso, b"synthetic disc").unwrap();
+        let source = dir.path().join("complete.dat");
+        dat(&source, &iso, "Fujitsu - FM Towns");
+        assert!(matches!(
+            verify_from_paths(&iso, &[source]).unwrap(),
+            CanonicalIdentityStatus::Resolved(identity) if identity.platform_id == "FM Towns"
+        ));
     }
 }

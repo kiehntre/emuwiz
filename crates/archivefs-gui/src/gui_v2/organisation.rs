@@ -28,6 +28,7 @@ pub(super) enum OrganisationView {
     PlayingLibrary,
     MameNormalizer,
     MameHealth,
+    DatNameReview,
     RepairReview,
     RepairHistory,
     ExactDuplicates,
@@ -396,17 +397,22 @@ impl App {
             })
             .auto_shrink([false, false])
             .show(ui, |ui| match self.organisation.view {
-                OrganisationView::RepairReview
+                OrganisationView::DatNameReview
+                | OrganisationView::RepairReview
                 | OrganisationView::RepairHistory
                 | OrganisationView::ExactDuplicates => repair::show(self, ui),
                 OrganisationView::FrontendExport => frontend_export::show(self, ui),
                 OrganisationView::Landing => {
-                    let compact = ui.ctx().content_rect().height() < COMPACT_HERO_VIEWPORT_HEIGHT;
+                    // The scroll viewport excludes the shell/header. Using the
+                    // full window height lets the hero clip navigation even at
+                    // 1024x600 once another review destination is available.
+                    let compact = ui.clip_rect().height() < COMPACT_HERO_VIEWPORT_HEIGHT;
                     // On a short window (for example 1024x600 at 160% scaling is
                     // 640x375 points) the hero would push the primary action
                     // below the fold, where it cannot be focused. Keep the page
                     // title and the safety statement, drop the illustration.
                     if compact {
+                        ui.heading("Choose what you want to organise");
                         widgets::status_badge(
                             ui,
                             "Nothing changes until you preview and confirm",
@@ -478,6 +484,7 @@ impl App {
                             if ui.button("Frontend export profiles").clicked() { self.organisation.view = OrganisationView::FrontendExport; }
                             if ui.button("Repair Review").clicked() { self.organisation.view = OrganisationView::RepairReview; }
                             if ui.button("Repair History").clicked() { self.organisation.view = OrganisationView::RepairHistory; }
+                            if ui.button("DAT canonical name review").clicked() { self.organisation.view = OrganisationView::DatNameReview; }
                         });
                         ui.label("A clean play-focused view made from your existing verified games.");
                         ui.label("Reads originals · Creates separate linked output · Originals preserved · Preview required · Undo available for supported operations");
