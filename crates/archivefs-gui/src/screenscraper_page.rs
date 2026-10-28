@@ -138,12 +138,12 @@ impl ScreenScraperPageState {
             storage_message: None,
             unsaved_edits: false,
         };
-        if let Some(record) = record {
-            if state.set_loaded(record).is_err() {
-                state.stored = false;
-                state.invalid_stored = true;
-                state.storage_message = Some("Stored credentials are invalid; enter them again.");
-            }
+        if let Some(record) = record
+            && state.set_loaded(record).is_err()
+        {
+            state.stored = false;
+            state.invalid_stored = true;
+            state.storage_message = Some("Stored credentials are invalid; enter them again.");
         }
         state
     }
