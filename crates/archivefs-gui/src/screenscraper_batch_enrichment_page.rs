@@ -7,10 +7,12 @@
 use std::path::PathBuf;
 use std::sync::mpsc::{self, Receiver, TryRecvError};
 use std::thread;
+use std::time::{Duration, Instant};
 
 use archivefs_core::identity_source::screenscraper::{
-    LookupKind, LookupOutcome, ScreenScraperClient, ScreenScraperConfig, ScreenScraperCredentials,
-    ScreenScraperEnrichment, ScreenScraperError, ScreenScraperLookup, UreqTransport,
+    LookupKind, LookupOutcome, QuotaSnapshot, ScreenScraperClient, ScreenScraperConfig,
+    ScreenScraperCredentials, ScreenScraperEnrichment, ScreenScraperError, ScreenScraperLookup,
+    UreqTransport,
 };
 use archivefs_core::screenscraper_enrichment::{
     AcceptedScreenScraperMetadata, EnrichmentField, MAX_EXPLICIT_BATCH_SIZE,
@@ -75,13 +77,43 @@ struct BatchSession {
     current: usize,
     started: bool,
     cancelled: bool,
-    reply: Option<Receiver<Result<LookupOutcome, ScreenScraperError>>>,
+    reply: Option<Receiver<(Result<LookupOutcome, ScreenScraperError>, Instant)>>,
+    lookup_credentials: Option<ScreenScraperCredentials>,
     candidate: Option<ScreenScraperEnrichment>,
     candidate_options: Vec<ScreenScraperEnrichment>,
     choices: [bool; 9],
-    quota: Option<String>,
+    quota: Option<ObservedQuota>,
     requests_used: usize,
     message: Option<String>,
+}
+
+// A provider report is usable for preflight only while it is recent and for
+// the same credentials. The service's reset time is not known locally.
+const QUOTA_PREFLIGHT_MAX_AGE: Duration = Duration::from_secs(60);
+
+#[derive(Debug)]
+struct ObservedQuota {
+    snapshot: QuotaSnapshot,
+    observed_at: Instant,
+    credentials: ScreenScraperCredentials,
+}
+
+impl ObservedQuota {
+    fn daily_limit_exhausted_for(
+        &self,
+        credentials: &ScreenScraperCredentials,
+        now: Instant,
+    ) -> bool {
+        self.credentials == *credentials
+            && now
+                .checked_duration_since(self.observed_at)
+                .is_some_and(|age| age <= QUOTA_PREFLIGHT_MAX_AGE)
+            && self
+                .snapshot
+                .requests_today
+                .zip(self.snapshot.max_requests_per_day)
+                .is_some_and(|(used, limit)| used >= limit)
+    }
 }
 
 #[derive(Debug, Default)]
@@ -158,6 +190,7 @@ impl ScreenScraperBatchState {
             started: false,
             cancelled: false,
             reply: None,
+            lookup_credentials: None,
             candidate: None,
             candidate_options: Vec::new(),
             choices: [false; 9],
@@ -208,6 +241,7 @@ impl ScreenScraperBatchState {
             started: false,
             cancelled: false,
             reply: None,
+            lookup_credentials: None,
             candidate: None,
             candidate_options: Vec::new(),
             choices: [false; 9],
@@ -259,6 +293,7 @@ impl ScreenScraperBatchState {
     fn cancel_remaining(session: &mut BatchSession) {
         session.cancelled = true;
         session.reply = None;
+        session.lookup_credentials = None;
     }
 
     fn begin_current(session: &mut BatchSession, credentials: ScreenScraperCredentials) {
@@ -266,6 +301,18 @@ impl ScreenScraperBatchState {
             return;
         };
         if session.reply.is_some() || session.candidate.is_some() || session.cancelled {
+            return;
+        }
+        if session
+            .quota
+            .as_ref()
+            .is_some_and(|quota| quota.daily_limit_exhausted_for(&credentials, Instant::now()))
+        {
+            session.states[session.current] = BatchItemState::QuotaStopped;
+            session.message = Some(
+                "A recent ScreenScraper quota report says the daily request limit is exhausted. No request was sent for this game.".into(),
+            );
+            Self::cancel_remaining(session);
             return;
         }
         let title = item
@@ -288,6 +335,7 @@ impl ScreenScraperBatchState {
         let (sender, receiver) = mpsc::channel();
         session.states[session.current] = BatchItemState::LookingUp;
         session.reply = Some(receiver);
+        session.lookup_credentials = Some(credentials.clone());
         session.requests_used += 1;
         thread::spawn(move || {
             let client = ScreenScraperClient::new(
@@ -307,7 +355,7 @@ impl ScreenScraperBatchState {
                     ..ScreenScraperLookup::default()
                 },
             );
-            let _ = sender.send(result);
+            let _ = sender.send((result, Instant::now()));
         });
     }
 
@@ -317,14 +365,22 @@ impl ScreenScraperBatchState {
         };
         if session.cancelled {
             session.reply = None;
+            session.lookup_credentials = None;
             return;
         }
         let Some(reply) = session.reply.take() else {
             return;
         };
         match reply.try_recv() {
-            Ok(Ok(LookupOutcome::Candidates { candidates, quota })) => {
-                session.quota = quota.map(|value| format!("{value:?}"));
+            Ok((Ok(LookupOutcome::Candidates { candidates, quota }), observed_at)) => {
+                session.quota =
+                    quota
+                        .zip(session.lookup_credentials.take())
+                        .map(|(snapshot, credentials)| ObservedQuota {
+                            snapshot,
+                            observed_at,
+                            credentials,
+                        });
                 if candidates.len() == 1 {
                     let candidate = candidates.into_iter().next().expect("length checked");
                     session.choices = single::default_choices(
@@ -342,13 +398,21 @@ impl ScreenScraperBatchState {
                         Some("No metadata candidate was returned. The game was unchanged.".into());
                 }
             }
-            Ok(Ok(LookupOutcome::NoResult { quota })) => {
-                session.quota = quota.map(|value| format!("{value:?}"));
+            Ok((Ok(LookupOutcome::NoResult { quota }), observed_at)) => {
+                session.quota =
+                    quota
+                        .zip(session.lookup_credentials.take())
+                        .map(|(snapshot, credentials)| ObservedQuota {
+                            snapshot,
+                            observed_at,
+                            credentials,
+                        });
                 session.states[session.current] = BatchItemState::NoResult;
                 session.message =
                     Some("No metadata candidate was returned. The game was unchanged.".into());
             }
-            Ok(Err(error)) => {
+            Ok((Err(error), _)) => {
+                session.lookup_credentials = None;
                 session.states[session.current] = match error {
                     ScreenScraperError::Authentication { .. } => {
                         BatchItemState::AuthenticationFailed
@@ -366,6 +430,7 @@ impl ScreenScraperBatchState {
             }
             Err(TryRecvError::Empty) => session.reply = Some(reply),
             Err(TryRecvError::Disconnected) => {
+                session.lookup_credentials = None;
                 session.states[session.current] = BatchItemState::ProviderUnavailable;
                 session.message =
                     Some("The metadata request ended unexpectedly. The game was unchanged.".into());
@@ -461,6 +526,8 @@ pub(crate) fn show(
                 return;
             }
             ui.label("Preview ready. Each game will be processed one at a time and reviewed before its own atomic apply.");
+            ui.weak("Cancel stops future lookups and ignores replies in flight. An HTTP request already sent may still finish at ScreenScraper.");
+            ui.weak("Each game keeps one current provenance receipt. Approved re-enrichment replaces it; earlier receipt history is not retained.");
             let direct = session
                 .items
                 .iter()
@@ -524,7 +591,10 @@ pub(crate) fn show(
             ));
         }
         if let Some(quota) = &session.quota {
-            ui.weak(format!("Provider quota: {quota}"));
+            ui.weak(format!(
+                "Last reported provider quota (may change): {:?}",
+                quota.snapshot
+            ));
         }
         ui.collapsing("Per-game outcomes", |ui| {
             for (item, status) in session.items.iter().zip(&session.states) {
@@ -543,7 +613,12 @@ pub(crate) fn show(
                 state.session = None;
             }
         } else if session.cancelled {
-            ui.label("Batch cancelled. Completed games remain committed; remaining games were untouched.");
+            ui.label(
+                "Batch stopped. Completed games remain committed; remaining games were untouched.",
+            );
+            if let Some(message) = &session.message {
+                ui.weak(message);
+            }
             if ui.button("Close batch").clicked() {
                 state.session = None;
             }
@@ -679,6 +754,7 @@ pub(crate) fn show(
             if ui.button("Cancel remaining games").clicked() {
                 ScreenScraperBatchState::cancel_remaining(session);
             }
+            ui.weak("Cancellation prevents future requests; an HTTP request already sent may still finish. Its reply is ignored.");
         }
     });
     action
@@ -741,7 +817,9 @@ pub(crate) fn show_blue(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use archivefs_core::identity_source::screenscraper::IdentityContribution;
+    use archivefs_core::identity_source::screenscraper::{
+        IdentityContribution, ScreenScraperSecret,
+    };
     use archivefs_core::screenscraper_enrichment::MAX_EXPLICIT_BATCH_SIZE;
 
     fn candidate(id: &str) -> ScreenScraperEnrichment {
@@ -782,12 +860,33 @@ mod tests {
             started: true,
             cancelled: false,
             reply: None,
+            lookup_credentials: None,
             candidate: None,
             candidate_options: Vec::new(),
             choices: [false; 9],
             quota: None,
             requests_used: 0,
             message: None,
+        }
+    }
+
+    fn credentials(secret: &str) -> ScreenScraperCredentials {
+        ScreenScraperCredentials::new(
+            "fixture-developer",
+            ScreenScraperSecret::parse(secret).unwrap(),
+            None,
+            None,
+        )
+        .unwrap()
+    }
+
+    fn daily_quota(used: Option<u64>, limit: Option<u64>) -> QuotaSnapshot {
+        QuotaSnapshot {
+            requests_today: used,
+            negative_requests_today: None,
+            max_requests_per_minute: None,
+            max_requests_per_day: limit,
+            max_negative_requests_per_day: None,
         }
     }
 
@@ -808,6 +907,58 @@ mod tests {
     }
 
     #[test]
+    fn current_exhausted_quota_prevents_next_provider_request() {
+        let credentials = credentials("fixture-secret");
+        let mut state = ScreenScraperBatchState {
+            session: Some(session()),
+        };
+        let (sender, receiver) = mpsc::channel();
+        state.session.as_mut().unwrap().reply = Some(receiver);
+        state.session.as_mut().unwrap().lookup_credentials = Some(credentials.clone());
+        state.session.as_mut().unwrap().requests_used = 1;
+        sender
+            .send((
+                Ok(LookupOutcome::NoResult {
+                    quota: Some(daily_quota(Some(25), Some(25))),
+                }),
+                Instant::now(),
+            ))
+            .unwrap();
+        state.poll();
+        let session = state.session.as_mut().unwrap();
+        ScreenScraperBatchState::advance(session);
+        assert_eq!(session.current, 1);
+        ScreenScraperBatchState::begin_current(session, credentials);
+        assert_eq!(session.states[1], BatchItemState::QuotaStopped);
+        assert!(session.cancelled);
+        assert!(
+            session.reply.is_none(),
+            "no provider request was dispatched"
+        );
+        assert!(session.lookup_credentials.is_none());
+        assert_eq!(session.requests_used, 1);
+    }
+
+    #[test]
+    fn stale_unknown_or_other_account_quota_is_not_a_preflight_refusal() {
+        let current_credentials = credentials("fixture-secret");
+        let now = Instant::now();
+        let mut observation = ObservedQuota {
+            snapshot: daily_quota(Some(25), Some(25)),
+            observed_at: now - QUOTA_PREFLIGHT_MAX_AGE - Duration::from_secs(1),
+            credentials: current_credentials.clone(),
+        };
+        assert!(!observation.daily_limit_exhausted_for(&current_credentials, now));
+        observation.observed_at = now;
+        observation.snapshot = daily_quota(Some(25), None);
+        assert!(!observation.daily_limit_exhausted_for(&current_credentials, now));
+        observation.snapshot = daily_quota(None, Some(25));
+        assert!(!observation.daily_limit_exhausted_for(&current_credentials, now));
+        observation.snapshot = daily_quota(Some(25), Some(25));
+        assert!(!observation.daily_limit_exhausted_for(&credentials("other-secret"), now));
+    }
+
+    #[test]
     fn states_remain_per_game() {
         assert_ne!(BatchItemState::Applied, BatchItemState::QuotaStopped);
         assert_ne!(BatchItemState::Skipped, BatchItemState::NoResult);
@@ -821,10 +972,13 @@ mod tests {
         let (sender, receiver) = mpsc::channel();
         state.session.as_mut().unwrap().reply = Some(receiver);
         sender
-            .send(Ok(LookupOutcome::Candidates {
-                candidates: vec![candidate("1"), candidate("2")],
-                quota: None,
-            }))
+            .send((
+                Ok(LookupOutcome::Candidates {
+                    candidates: vec![candidate("1"), candidate("2")],
+                    quota: None,
+                }),
+                Instant::now(),
+            ))
             .unwrap();
         state.poll();
         let session = state.session.as_ref().unwrap();
@@ -837,10 +991,13 @@ mod tests {
         let (sender, receiver) = mpsc::channel();
         session.reply = Some(receiver);
         sender
-            .send(Err(ScreenScraperError::QuotaExhausted {
-                status: 429,
-                retry_after: None,
-            }))
+            .send((
+                Err(ScreenScraperError::QuotaExhausted {
+                    status: 429,
+                    retry_after: None,
+                }),
+                Instant::now(),
+            ))
             .unwrap();
         state.poll();
         assert_eq!(
