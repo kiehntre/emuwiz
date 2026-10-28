@@ -278,8 +278,14 @@ pub fn cdi_file_stamp(path: &Path) -> Result<CdiFileStamp, CdiIdentityError> {
     Ok(stamp_metadata(&metadata))
 }
 
-fn open_cdi_file(path: &Path) -> Result<(std::fs::File, CdiFileStamp), CdiIdentityError> {
+fn open_cdi_file(
+    path: &Path,
+    expected: Option<&CdiFileStamp>,
+) -> Result<(std::fs::File, CdiFileStamp), CdiIdentityError> {
     let before = cdi_file_stamp(path)?;
+    if expected.is_some_and(|expected| *expected != before) {
+        return Err(CdiIdentityError::Changed);
+    }
     #[cfg(unix)]
     let file = {
         use std::os::unix::fs::OpenOptionsExt;
@@ -447,8 +453,19 @@ fn status_for_error(error: &CdiIdentityError) -> CdiStatus {
 /// Inspect descriptor topology without reading track payloads or granting
 /// Dreamcast identity. Boot evidence must come from the shared IP.BIN reader.
 pub fn inspect_cdi_structure(path: &Path) -> CdiStructure {
+    inspect_cdi_structure_with_stamp(path, None)
+}
+
+pub fn inspect_cdi_structure_with_expected_stamp(
+    path: &Path,
+    expected: &CdiFileStamp,
+) -> CdiStructure {
+    inspect_cdi_structure_with_stamp(path, Some(expected))
+}
+
+fn inspect_cdi_structure_with_stamp(path: &Path, expected: Option<&CdiFileStamp>) -> CdiStructure {
     let result = (|| {
-        let (mut file, stamp) = open_cdi_file(path)?;
+        let (mut file, stamp) = open_cdi_file(path, expected)?;
         let file_len = stamp.len;
         if file_len > MAX_CDI_BYTES {
             return Err(CdiIdentityError::TooLarge {
@@ -723,7 +740,21 @@ impl CdiLogicalMedia {
 /// exact selection rule and every bound enforced before any sector is
 /// read.
 pub fn open_dreamcast_cdi_logical_media(path: &Path) -> Result<CdiLogicalMedia, CdiIdentityError> {
-    let (mut file, stamp) = open_cdi_file(path)?;
+    open_dreamcast_cdi_logical_media_with_stamp(path, None)
+}
+
+pub fn open_dreamcast_cdi_logical_media_with_expected_stamp(
+    path: &Path,
+    expected: &CdiFileStamp,
+) -> Result<CdiLogicalMedia, CdiIdentityError> {
+    open_dreamcast_cdi_logical_media_with_stamp(path, Some(expected))
+}
+
+fn open_dreamcast_cdi_logical_media_with_stamp(
+    path: &Path,
+    expected: Option<&CdiFileStamp>,
+) -> Result<CdiLogicalMedia, CdiIdentityError> {
+    let (mut file, stamp) = open_cdi_file(path, expected)?;
     let file_len = stamp.len;
     if file_len > MAX_CDI_BYTES {
         return Err(CdiIdentityError::TooLarge {
@@ -1448,7 +1479,7 @@ mod tests {
         let path = directory.path().join("game.cdi");
         let bytes = build_cdi(&[vec![(1, 0, 0, 4, 0)]], None);
         std::fs::write(&path, &bytes).unwrap();
-        let (mut file, stamp) = open_cdi_file(&path).unwrap();
+        let (mut file, stamp) = open_cdi_file(&path, None).unwrap();
         let (descriptor, data_end, _) = read_descriptor(&mut file, bytes.len() as u64).unwrap();
         assert!(parse_descriptor(&descriptor, data_end).is_ok());
         let replacement = directory.path().join("replacement.cdi");
