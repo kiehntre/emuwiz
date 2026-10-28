@@ -78,6 +78,7 @@ mod retroarch_journey_tests;
 mod romm_library;
 mod routes;
 mod saturn_manifest;
+mod save_compatibility;
 mod save_snapshots;
 mod save_state_guidance;
 mod saves_states;

@@ -215,6 +215,91 @@ fn actual_native_witness_and_refusals() {
 }
 #[test]
 #[cfg(all(target_os = "linux", target_arch = "x86_64", target_env = "gnu"))]
+fn two_native_witnesses_survive_sealed_refresh_and_one_stale_artifact_is_refused() {
+    use crate::persistent_state_inventory::*;
+    let t = tempfile::tempdir().unwrap();
+    build_host(t.path());
+    let ctx = context(t.path());
+    let mut receipts = Vec::new();
+    for (session, filename) in [("first", "first.srm"), ("second", "second.srm")] {
+        let transcript = observe_named(
+            t.path(),
+            ctx.clone(),
+            "normal",
+            Default::default(),
+            filename,
+        );
+        assert!(transcript.complete(), "{:?}", transcript.reason);
+        let artifact = transcript.artifacts.into_values().next().unwrap();
+        receipts.push(Receipt {
+            version: 1,
+            session: session.into(),
+            context: ctx.clone(),
+            origins: vec![SramOrigin {
+                state: OriginState::Associated,
+                session: session.into(),
+                context: ctx.clone(),
+                artifact,
+                explanation: "isolated native witness".into(),
+            }],
+            reason: None,
+        });
+    }
+    let store = store::Store::open(&t.path().join("origins"), true).unwrap();
+    for receipt in &receipts {
+        store
+            .publish(&format!("{}.json", receipt.session), receipt)
+            .unwrap();
+    }
+    drop(store);
+    let store = store::Store::open(&t.path().join("origins"), false).unwrap();
+    let roots = [PersistentStateRoot::configured(
+        StateEmulator::RetroArch,
+        ctx.scope.saves.clone(),
+        Some(PersistentStateType::NativeSave),
+    )];
+    let mut inventory = inventory_persistent_state(&roots);
+    inventory::project(&mut inventory, store.receipts().unwrap(), Some(&ctx.scope));
+    assert_eq!(inventory.records.len(), 2);
+    assert!(inventory.records.iter().all(|r| {
+        r.sram_origin.as_ref().is_some_and(|origin| {
+            origin.state == OriginState::Associated
+                && origin.context == ctx
+                && origin.artifact.path == r.path
+                && Some(&origin.artifact.sha256) == r.sha256.as_ref()
+        })
+    }));
+
+    fs::write(ctx.scope.saves.join("second.srm"), b"changed save bytes").unwrap();
+    let mut stale = inventory_persistent_state(&roots);
+    inventory::project(&mut stale, store.receipts().unwrap(), Some(&ctx.scope));
+    assert_eq!(
+        stale
+            .records
+            .iter()
+            .find(|r| r.path.ends_with("first.srm"))
+            .unwrap()
+            .sram_origin
+            .as_ref()
+            .unwrap()
+            .state,
+        OriginState::Associated
+    );
+    assert_eq!(
+        stale
+            .records
+            .iter()
+            .find(|r| r.path.ends_with("second.srm"))
+            .unwrap()
+            .sram_origin
+            .as_ref()
+            .unwrap()
+            .state,
+        OriginState::NeedsReview
+    );
+}
+#[test]
+#[cfg(all(target_os = "linux", target_arch = "x86_64", target_env = "gnu"))]
 fn association_persists_and_changed_or_conflicting_evidence_needs_review() {
     use crate::persistent_state_inventory::*;
     let t = tempfile::tempdir().unwrap();
