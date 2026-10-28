@@ -287,7 +287,7 @@ impl App {
                     if ui.button("Refresh documents").clicked() { self.document_cache = None; }
                 });
                 if let Some(issue) = &self.document_issue { ui.label(issue); }
-                if unverified { ui.label("Document files are being checked in the background. Opening is paused until they can be verified."); }
+                if unverified { ui.label("Document freshness is unconfirmed. Opening is paused until the background check can finish."); }
                 if documents.is_empty() {
                     if !unverified { ui.weak("No manual or guide is associated with this game. Choose a local document to add one."); }
                     return;
