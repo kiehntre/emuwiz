@@ -340,7 +340,20 @@ fn selected_game_details_refreshes_a_removed_document_at_1024_by_600() {
             .is_some()
     );
     fs::remove_file(&path).unwrap();
-    frame(&context, &mut app, [1024.0, 600.0]);
+    let deadline = Instant::now() + Duration::from_secs(10);
+    loop {
+        frame(&context, &mut app, [1024.0, 600.0]);
+        if app.document_cache.as_ref().unwrap().2[0].viewer
+            == documents::DocumentOpenCapability::MissingFile
+        {
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "background refresh did not detect removal"
+        );
+        std::thread::sleep(Duration::from_millis(10));
+    }
     let document = &app.document_cache.as_ref().unwrap().2[0];
     assert_eq!(
         document.viewer,
@@ -351,4 +364,92 @@ fn selected_game_details_refreshes_a_removed_document_at_1024_by_600() {
         document.association,
         documents::GameDocumentAssociation::Explicit
     );
+}
+
+#[test]
+fn selected_game_details_refreshes_changed_comic_format() {
+    let context = egui::Context::default();
+    let mut app = fixture(&context);
+    let root = tempfile::tempdir().unwrap();
+    let path = root.path().join("Rez.cbz");
+    cbz(&path);
+    let mut game = archive(9, "Rez", Some("Dreamcast"));
+    game.absolute_path = root.path().join("Rez.iso");
+    app.library = Arc::new(Library::new(vec![game]));
+    app.router.current = Route::Game(9);
+    frame(&context, &mut app, [1024.0, 600.0]);
+    assert_eq!(
+        app.document_cache.as_ref().unwrap().2[0].format,
+        documents::GameDocumentFormat::Cbz
+    );
+    cbr(&path);
+    let deadline = Instant::now() + Duration::from_secs(10);
+    loop {
+        frame(&context, &mut app, [1024.0, 600.0]);
+        if app.document_cache.as_ref().unwrap().2[0].format == documents::GameDocumentFormat::Cbr {
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "background refresh did not detect replacement"
+        );
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    assert!(
+        app.document_cache.as_ref().unwrap().2[0]
+            .document_id
+            .is_some()
+    );
+}
+
+#[test]
+fn blocked_document_mount_does_not_stall_game_details_or_leave_readiness_trusted() {
+    let context = egui::Context::default();
+    let mut app = fixture(&context);
+    let root = tempfile::tempdir().unwrap();
+    let path = root.path().join("Rez.cbz");
+    cbz(&path);
+    let mut game = archive(9, "Rez", Some("Dreamcast"));
+    game.absolute_path = root.path().join("Rez.iso");
+    app.library = Arc::new(Library::new(vec![game.clone()]));
+    let game = app.library.game(9).unwrap().clone();
+    app.router.current = Route::Game(9);
+    frame(&context, &mut app, [1024.0, 600.0]);
+    let release = app.document_refresh.block_worker_for_test();
+    let start = Instant::now();
+    frame(&context, &mut app, [1024.0, 600.0]);
+    assert!(
+        start.elapsed() < Duration::from_secs(2),
+        "slow mount blocked the GUI frame"
+    );
+    app.document_refresh.expire_for_test();
+    let output = context.run(
+        egui::RawInput {
+            screen_rect: Some(egui::Rect::from_min_size(
+                egui::Pos2::ZERO,
+                egui::vec2(1024.0, 600.0),
+            )),
+            ..Default::default()
+        },
+        |ctx| {
+            egui::CentralPanel::default().show(ctx, |ui| app.documents_panel(ui, 9, &game));
+        },
+    );
+    let strings = text(&output);
+    assert!(
+        strings
+            .iter()
+            .any(|line| line.contains("Opening is paused")),
+        "stale readiness was not labelled: {strings:?}"
+    );
+    release.send(()).unwrap();
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while app.document_refresh.stale() {
+        frame(&context, &mut app, [1024.0, 600.0]);
+        assert!(
+            Instant::now() < deadline,
+            "freshness did not recover after the mount returned"
+        );
+        std::thread::sleep(Duration::from_millis(10));
+    }
 }

@@ -137,6 +137,7 @@ pub(super) fn fixture(context: &egui::Context) -> App {
         text_guide_viewer: Default::default(),
         document_preferences: super::documents::DocumentPreferences::default(),
         document_cache: None,
+        document_refresh: Default::default(),
         document_index: None,
         document_issue: None,
         setup_portability: super::setup_portability::SetupPortabilityState::default(),
