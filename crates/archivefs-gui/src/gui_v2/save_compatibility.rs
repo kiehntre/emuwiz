@@ -246,8 +246,12 @@ fn compare_with_refresh(
                 .sram_origin
                 .as_ref()
                 .map(|o| o.context.core.path.display().to_string()),
-            profile: installation
-                .map(|i| i.installation_id.clone())
+            profile: target
+                .sram_origin
+                .as_ref()
+                .filter(|o| o.state == archivefs_core::sram_provenance::OriginState::Associated)
+                .map(|o| o.context.scope.profile.clone())
+                .or_else(|| installation.map(|i| i.installation_id.clone()))
                 .or_else(|| target.slot_profile_account.clone()),
             // Proven native SRAM is raw persistent data, not a version-bound state.
             version_matters: false,
@@ -323,8 +327,8 @@ pub(super) fn show(app: &mut App, ui: &mut egui::Ui, game: &Game) {
             Err(mpsc::TryRecvError::Empty) => {}
         }
     }
-    ui.collapsing("Check compatibility with another profile or emulator", |ui| {
-        ui.label("Compare two observed save locations. This is an advisory preview of inventory evidence; it cannot move or restore saves. Missing format, identity, version or complete-set evidence stays unknown. Refresh inventory and recheck after external changes.");
+    ui.collapsing("Check observed save compatibility", |ui| {
+        ui.label("Compare two observed save locations. Direct SRAM compatibility currently requires independently witnessed saves in the supported Native/User RetroArch scope. This build does not establish direct SRAM compatibility across different profiles or emulators. This advisory preview cannot move or restore saves. Missing format, identity, version or complete-set evidence stays unknown. Refresh inventory and recheck after external changes.");
         let Some(inventory) = &app.saves_states.inventory else { ui.label("Inspect save locations first."); return; };
         let mut changed = false;
         ui.add_enabled_ui(panel.job.is_none() && !app.saves_states.loading, |ui| {
@@ -520,34 +524,34 @@ mod tests {
                         device: 0,
                         inode: 0,
                     },
-                    profile: session.into(),
+                    profile: "Native/User".into(),
                 },
             },
         });
-        record.slot_profile_account = Some(session.into());
         record
     }
 
     #[test]
-    fn refreshed_cross_profile_sram_reports_compatibility_and_refuses_stale_or_wrong_game() {
+    fn refreshed_native_scope_sram_reports_compatibility_and_refuses_stale_or_wrong_game() {
         let dir = tempfile::tempdir().unwrap();
         let game = game();
-        let source_dir = dir.path().join("source-profile");
-        let target_dir = dir.path().join("target-profile");
-        std::fs::create_dir_all(&source_dir).unwrap();
-        std::fs::create_dir_all(&target_dir).unwrap();
         let source = witnessed_record(
-            &source_dir.join("source.srm"),
+            &dir.path().join("source.srm"),
             &game,
             "source",
             &"a".repeat(64),
         );
-        let target = witnessed_record(
-            &target_dir.join("target.srm"),
+        let mut target = witnessed_record(
+            &dir.path().join("target.srm"),
             &game,
             "target",
             &"a".repeat(64),
         );
+        target.sram_origin.as_mut().unwrap().context =
+            source.sram_origin.as_ref().unwrap().context.clone();
+        // Model the inventory response after Core has verified its sealed
+        // receipts. Core's native observer/store test covers that boundary;
+        // this exercises Blue's comparison and refusal path with real files.
         let refreshed = |source: &PersistentStateRecord, target: &PersistentStateRecord| {
             let mut inventory = inventory_persistent_state(&[]);
             inventory.records = vec![source.clone(), target.clone()];
@@ -555,18 +559,52 @@ mod tests {
         };
         let report = compare_with_refresh(&source, &target, &game, |_| refreshed(&source, &target));
         assert_eq!(report.outcome, SaveMigrationOutcome::DirectlyCompatible);
-        assert_eq!(report.target_environment.profile.as_deref(), Some("target"));
+        assert_eq!(
+            report.target_environment.profile.as_deref(),
+            Some("Native/User")
+        );
         assert_eq!(
             report.target_environment.core,
-            Some(target.path.display().to_string())
+            Some(source.path.display().to_string())
         );
         assert_eq!(report.source_path.as_deref(), Some(source.path.as_path()));
         assert!(report.read_only);
         assert!(!report.automatic_migration_available);
         assert!(!report.restore.existing_restore_apply_ready);
+        fn collect(shape: &egui::epaint::Shape, text: &mut String) {
+            match shape {
+                egui::epaint::Shape::Text(shape) => {
+                    text.push_str(shape.galley.text());
+                    text.push('\n');
+                }
+                egui::epaint::Shape::Vec(shapes) => {
+                    for shape in shapes {
+                        collect(shape, text);
+                    }
+                }
+                _ => {}
+            }
+        }
+        let context = egui::Context::default();
+        let output = context.run(Default::default(), |ctx| {
+            egui::CentralPanel::default().show(ctx, |ui| draw_report(ui, &report));
+        });
+        let mut text = String::new();
+        for shape in output.shapes {
+            collect(&shape.shape, &mut text);
+        }
+        assert!(
+            text.contains("Observed save formats are directly compatible"),
+            "{text}"
+        );
+        assert!(text.contains("Target profile: Native/User"), "{text}");
+        assert!(
+            text.contains("No migration writer or converter is enabled here"),
+            "{text}"
+        );
 
         let wrong = witnessed_record(
-            &target_dir.join("wrong.srm"),
+            &dir.path().join("wrong.srm"),
             &game,
             "wrong",
             &"b".repeat(64),
