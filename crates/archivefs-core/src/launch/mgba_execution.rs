@@ -5,7 +5,7 @@
 //! layer and are checked again immediately before spawn.
 
 use std::fs;
-use std::io::{self, Read};
+use std::io::{self, Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 
 use sha2::{Digest, Sha256};
@@ -202,12 +202,13 @@ pub fn preflight_mgba_launch(
     }
     let mut current_config_path = None;
     for name in ["config.ini", "config.ini.bak"] {
+        if current_config_path.is_some() {
+            break;
+        }
         let path = profile.configuration_path.join(name);
         match fs::symlink_metadata(&path) {
             Ok(metadata) if metadata.is_file() && !metadata.file_type().is_symlink() => {
-                if current_config_path.is_none() {
-                    current_config_path = Some(path);
-                }
+                current_config_path = Some(path);
             }
             Ok(_) => {
                 return Err(error(
@@ -304,8 +305,247 @@ pub fn preflight_mgba_launch(
     })
 }
 
-pub fn spawn_mgba(command: &PreparedProcessCommand) -> std::io::Result<WatchedProcess> {
-    process_spawn::spawn_watched_process(command)
+#[cfg(target_os = "linux")]
+fn sealed_launch_file(
+    path: &Path,
+    expected: CapturedFileIdentity,
+) -> io::Result<(fs::File, [u8; 32])> {
+    use std::os::fd::{AsRawFd, FromRawFd};
+    let mut source = process_spawn::open_regular_file_nonblocking(path)?;
+    if CapturedFileIdentity::capture(&source.metadata()?) != expected {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "mGBA launch file changed before binding",
+        ));
+    }
+    let raw = unsafe {
+        libc::memfd_create(
+            c"emuwiz-mgba-launch".as_ptr(),
+            libc::MFD_CLOEXEC | libc::MFD_ALLOW_SEALING,
+        )
+    };
+    if raw < 0 {
+        return Err(io::Error::last_os_error());
+    }
+    let mut sealed = unsafe { fs::File::from_raw_fd(raw) };
+    let mut digest = Sha256::new();
+    let mut buffer = [0u8; 64 * 1024];
+    let mut total = 0u64;
+    loop {
+        let count = source.read(&mut buffer)?;
+        if count == 0 {
+            break;
+        }
+        total += count as u64;
+        if total > MAX_MGBA_VERIFIED_FILE_BYTES {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "mGBA launch file exceeds the verification limit",
+            ));
+        }
+        digest.update(&buffer[..count]);
+        sealed.write_all(&buffer[..count])?;
+    }
+    if CapturedFileIdentity::capture(&source.metadata()?) != expected
+        || file(path).ok() != Some(expected)
+    {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "mGBA launch file changed during binding",
+        ));
+    }
+    sealed.seek(SeekFrom::Start(0))?;
+    let seals = libc::F_SEAL_WRITE | libc::F_SEAL_GROW | libc::F_SEAL_SHRINK | libc::F_SEAL_SEAL;
+    if unsafe { libc::fcntl(sealed.as_raw_fd(), libc::F_ADD_SEALS, seals) } < 0 {
+        return Err(io::Error::last_os_error());
+    }
+    Ok((sealed, digest.finalize().into()))
+}
+
+#[cfg(target_os = "linux")]
+fn writable_verified_config(
+    path: &Path,
+    expected: CapturedFileIdentity,
+    expected_sha256: [u8; 32],
+) -> io::Result<fs::File> {
+    let mut opened = process_spawn::open_regular_file_nonblocking(path)?;
+    if CapturedFileIdentity::capture(&opened.metadata()?) != expected {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "mGBA configuration changed before binding",
+        ));
+    }
+    let mut digest = Sha256::new();
+    let mut buffer = [0u8; 64 * 1024];
+    let mut total = 0u64;
+    loop {
+        let count = opened.read(&mut buffer)?;
+        if count == 0 {
+            break;
+        }
+        total += count as u64;
+        if total > MAX_MGBA_VERIFIED_FILE_BYTES {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "mGBA configuration exceeds the verification limit",
+            ));
+        }
+        digest.update(&buffer[..count]);
+    }
+    if CapturedFileIdentity::capture(&opened.metadata()?) != expected
+        || file(path).ok() != Some(expected)
+        || <[u8; 32]>::from(digest.finalize()) != expected_sha256
+    {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "mGBA configuration changed before spawn",
+        ));
+    }
+    opened.seek(SeekFrom::Start(0))?;
+    Ok(opened)
+}
+
+/// Spawn through a private mount view so the verified executable and ROM
+/// remain the exact files mGBA opens, at their original paths. The rest of
+/// the filesystem and environment retain the user's normal mGBA behavior.
+pub fn spawn_mgba(
+    command: &PreparedProcessCommand,
+    request: &MgbaLaunchRequest,
+) -> io::Result<WatchedProcess> {
+    #[cfg(not(target_os = "linux"))]
+    {
+        let _ = (command, request);
+        return Err(io::Error::new(
+            io::ErrorKind::Unsupported,
+            "bound native mGBA launch requires Linux",
+        ));
+    }
+    #[cfg(target_os = "linux")]
+    {
+        spawn_mgba_with_before_spawn(command, request, || {})
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn spawn_mgba_with_before_spawn(
+    command: &PreparedProcessCommand,
+    request: &MgbaLaunchRequest,
+    before_spawn: impl FnOnce(),
+) -> io::Result<WatchedProcess> {
+    {
+        use std::os::fd::AsRawFd;
+        if command.executable != request.expected_executable
+            || command.arguments != [request.selected_content_path.as_os_str().to_os_string()]
+            || command.working_directory.is_some()
+        {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "mGBA command differs from the verified request",
+            ));
+        }
+        let bwrap = Path::new("/usr/bin/bwrap");
+        let bwrap_metadata = fs::symlink_metadata(bwrap).map_err(|e| {
+            io::Error::new(
+                e.kind(),
+                format!("Bubblewrap is required for bound mGBA launch: {e}"),
+            )
+        })?;
+        if !bwrap_metadata.is_file() || bwrap_metadata.file_type().is_symlink() {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "Bubblewrap is not a regular executable at /usr/bin/bwrap",
+            ));
+        }
+        let (executable, executable_sha256) =
+            sealed_launch_file(&request.expected_executable, request.executable_identity)?;
+        if executable_sha256 != request.executable_sha256 {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "mGBA executable changed before spawn",
+            ));
+        }
+        let (content, content_sha256) =
+            sealed_launch_file(&request.selected_content_path, request.content_identity)?;
+        let content_key = content_sha256
+            .iter()
+            .map(|byte| format!("{byte:02x}"))
+            .collect::<String>();
+        if content_key != request.expected_game_key {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "selected cartridge changed before spawn",
+            ));
+        }
+        let config = match (
+            request.expected_config_path.as_ref(),
+            request.config_identity,
+            request.config_sha256,
+        ) {
+            (Some(path), Some(identity), Some(expected_sha256)) => {
+                Some(writable_verified_config(path, identity, expected_sha256)?)
+            }
+            (None, None, None) => None,
+            _ => {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    "mGBA configuration authorization is incomplete",
+                ));
+            }
+        };
+        let mut arguments = vec![
+            "--bind".into(),
+            "/".into(),
+            "/".into(),
+            "--dev-bind".into(),
+            "/dev".into(),
+            "/dev".into(),
+            "--proc".into(),
+            "/proc".into(),
+            "--perms".into(),
+            "0755".into(),
+            "--ro-bind-data".into(),
+            executable.as_raw_fd().to_string().into(),
+            request.expected_executable.clone().into_os_string(),
+            "--ro-bind-data".into(),
+            content.as_raw_fd().to_string().into(),
+            request.selected_content_path.clone().into_os_string(),
+        ];
+        if let (Some(path), Some(config)) = (&request.expected_config_path, &config) {
+            arguments.extend([
+                "--bind-fd".into(),
+                config.as_raw_fd().to_string().into(),
+                path.clone().into_os_string(),
+            ]);
+        }
+        arguments.extend([
+            "--".into(),
+            request.expected_executable.clone().into_os_string(),
+            request.selected_content_path.clone().into_os_string(),
+        ]);
+        let bound = PreparedProcessCommand {
+            executable: bwrap.to_path_buf(),
+            arguments,
+            working_directory: None,
+        };
+        before_spawn();
+        if let (Some(path), Some(expected_identity), Some(expected_sha256)) = (
+            request.expected_config_path.as_ref(),
+            request.config_identity,
+            request.config_sha256,
+        ) {
+            if capture_mgba_config(path).ok() != Some((expected_identity, expected_sha256)) {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "mGBA configuration changed immediately before spawn",
+                ));
+            }
+        }
+        let mut files = vec![&executable, &content];
+        if let Some(config) = &config {
+            files.push(config);
+        }
+        process_spawn::spawn_watched_process_with_assets(&bound, &files, |_| {})
+    }
 }
 
 #[cfg(test)]
@@ -391,7 +631,7 @@ mod tests {
                 command.arguments,
                 vec![request.selected_content_path.as_os_str().to_os_string()]
             );
-            let mut process = spawn_mgba(&command).unwrap();
+            let mut process = spawn_mgba(&command, &request).unwrap();
             let report = loop {
                 if let Some(report) = process.poll() {
                     break report;
@@ -470,6 +710,13 @@ mod tests {
 
     #[test]
     fn configuration_and_executable_drift_refuse() {
+        #[cfg(unix)]
+        {
+            let (_dir, roots, request, identity) = fixture("gb", "Game Boy");
+            let unused_backup = roots.explicit_configuration_roots[0].join("config.ini.bak");
+            std::os::unix::fs::symlink("missing-backup", unused_backup).unwrap();
+            assert!(preflight_mgba_launch(&request, &roots, &identity).is_ok());
+        }
         let (_dir, roots, request, identity) = fixture("gb", "Game Boy");
         fs::write(
             request.expected_config_path.as_ref().unwrap(),
@@ -541,7 +788,7 @@ mod tests {
         (request.executable_identity, request.executable_sha256) =
             capture_mgba_executable(&request.expected_executable).unwrap();
         let command = preflight_mgba_launch(&request, &roots, &identity).unwrap();
-        let mut process = spawn_mgba(&command).unwrap();
+        let mut process = spawn_mgba(&command, &request).unwrap();
         let report = loop {
             if let Some(report) = process.poll() {
                 break report;
@@ -549,5 +796,93 @@ mod tests {
             std::thread::sleep(std::time::Duration::from_millis(10));
         };
         assert_eq!(report.status.as_ref().unwrap().code(), Some(7));
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn launch_uses_verified_bytes_when_paths_are_replaced_after_binding() {
+        use std::os::unix::fs::PermissionsExt;
+        let (dir, roots, mut request, identity) = fixture("gba", "Game Boy Advance");
+        let observed = dir.path().join("observed-rom");
+        fs::write(
+            &request.expected_executable,
+            format!("#!/bin/sh\ncat \"$1\" > \"{}\"\n", observed.display()),
+        )
+        .unwrap();
+        fs::set_permissions(
+            &request.expected_executable,
+            fs::Permissions::from_mode(0o755),
+        )
+        .unwrap();
+        (request.executable_identity, request.executable_sha256) =
+            capture_mgba_executable(&request.expected_executable).unwrap();
+        let command = preflight_mgba_launch(&request, &roots, &identity).unwrap();
+        let mut process = spawn_mgba_with_before_spawn(&command, &request, || {
+            fs::remove_file(&request.expected_executable).unwrap();
+            executable(&request.expected_executable, 42);
+            fs::remove_file(&request.selected_content_path).unwrap();
+            fs::write(&request.selected_content_path, b"replaced cartridge").unwrap();
+        })
+        .unwrap();
+        let report = loop {
+            if let Some(report) = process.poll() {
+                break report;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        };
+        assert!(report.status.as_ref().unwrap().success());
+        assert_eq!(fs::read(observed).unwrap(), b"synthetic cartridge");
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn replaced_configuration_refuses_at_spawn_boundary() {
+        let (_dir, roots, request, identity) = fixture("gba", "Game Boy Advance");
+        let command = preflight_mgba_launch(&request, &roots, &identity).unwrap();
+        let config = request.expected_config_path.as_ref().unwrap();
+        let result = spawn_mgba_with_before_spawn(&command, &request, || {
+            fs::remove_file(config).unwrap();
+            fs::write(config, b"[changed]\n").unwrap();
+        });
+        assert!(
+            result
+                .err()
+                .unwrap()
+                .to_string()
+                .contains("configuration changed")
+        );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn launched_mgba_can_persist_configuration_changes() {
+        use std::os::unix::fs::PermissionsExt;
+        let (_dir, roots, mut request, identity) = fixture("gb", "Game Boy");
+        let config = request.expected_config_path.as_ref().unwrap();
+        fs::write(
+            &request.expected_executable,
+            format!(
+                "#!/bin/sh\nprintf '[updated]\\n' > \"{}\"\n",
+                config.display()
+            ),
+        )
+        .unwrap();
+        fs::set_permissions(
+            &request.expected_executable,
+            fs::Permissions::from_mode(0o755),
+        )
+        .unwrap();
+        (request.executable_identity, request.executable_sha256) =
+            capture_mgba_executable(&request.expected_executable).unwrap();
+        let command = preflight_mgba_launch(&request, &roots, &identity).unwrap();
+        let mut process = spawn_mgba(&command, &request).unwrap();
+        let report = loop {
+            if let Some(report) = process.poll() {
+                break report;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        };
+        assert!(report.status.as_ref().unwrap().success());
+        assert_eq!(fs::read(config).unwrap(), b"[updated]\n");
     }
 }

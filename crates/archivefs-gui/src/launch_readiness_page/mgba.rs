@@ -21,6 +21,14 @@ struct Reviewed {
 
 impl Request {
     pub(crate) fn offer(plan: &LaunchPlan, candidate: &LaunchCandidate) -> Result<Self, String> {
+        #[cfg(not(target_os = "linux"))]
+        return Err("Bound native mGBA launch currently requires Linux and Bubblewrap.".into());
+        #[cfg(target_os = "linux")]
+        if !std::fs::symlink_metadata("/usr/bin/bwrap")
+            .is_ok_and(|m| m.is_file() && !m.file_type().is_symlink())
+        {
+            return Err("Bubblewrap is required for a file-safe native mGBA launch. Install it and recheck readiness.".into());
+        }
         if !matches!(
             &candidate.target,
             LaunchTarget::Standalone {
@@ -99,7 +107,7 @@ impl Request {
                     e.detail
                 )
             })?;
-        spawn_mgba(&command).map_err(|e| format!("mGBA could not start: {e}"))
+        spawn_mgba(&command, &reviewed.core).map_err(|e| format!("mGBA could not start: {e}"))
     }
 }
 
