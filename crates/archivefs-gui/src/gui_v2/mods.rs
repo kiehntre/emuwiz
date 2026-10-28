@@ -270,15 +270,15 @@ fn show_cheatbase(
     if game.is_some() && cheatbase_seed(game).is_none() {
         ui.label("This game's current identity is not verified. Search CheatBase manually if you want to inspect its catalogue.");
     }
-    if let Some(action) = show_cheatbase_browse_page(ui, state, cheatbase_seed(game)) {
-        if matches!(
+    if let Some(action) = show_cheatbase_browse_page(ui, state, cheatbase_seed(game))
+        && matches!(
             action,
             crate::cheatbase_page::CheatBasePageAction::Refresh
                 | crate::cheatbase_page::CheatBasePageAction::Search
                 | crate::cheatbase_page::CheatBasePageAction::Inspect(_)
-        ) {
-            state.handle(action, ui.ctx().clone());
-        }
+        )
+    {
+        state.handle(action, ui.ctx().clone());
     }
 }
 
