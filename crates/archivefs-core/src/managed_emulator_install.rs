@@ -5,6 +5,8 @@
 //! into a dedicated EmuWiz-owned tree only after the artifact has a published
 //! SHA-256.  Detection of an external install never creates ownership.
 
+pub mod review;
+
 use std::fs::{self, File, OpenOptions};
 use std::io::{Read, Write};
 use std::path::{Component, Path, PathBuf};

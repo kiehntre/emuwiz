@@ -9,6 +9,8 @@
 //! authoritative for whether Play is available - "Installed" here never
 //! means "Ready to play".
 
+mod side_by_side;
+
 use std::collections::BTreeMap;
 use std::path::PathBuf;
 use std::sync::mpsc::{self, Receiver, TryRecvError};
@@ -101,6 +103,8 @@ impl EmulatorDownloadEntryState {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum EmulatorDownloadPageAction {
+    /// Resolve metadata and inspect inputs only; the bool requests a local picker.
+    ReviewSideBySide(String, bool),
     /// Resolve the exact release/asset for `id`, read-only.
     Resolve(String),
     /// Install the plan currently held for `id` (Install emulator click).
@@ -118,6 +122,11 @@ pub(crate) enum EmulatorDownloadPageAction {
 }
 
 enum TaskResult {
+    SideBySide(
+        Box<
+            Result<archivefs_core::managed_emulator_install::review::AppImageInstallReview, String>,
+        >,
+    ),
     Resolved(Result<EmulatorDownloadPlan, DownloadError>),
     Installed(Result<EmulatorDownloadReceipt, DownloadError>),
     Initialized(Result<ManagedAppImageBootstrapReceipt, ManagedAppImageBootstrapError>),
@@ -126,6 +135,11 @@ enum TaskResult {
 /// Shared page state, held once on the app and threaded into Emulator Setup.
 #[derive(Default)]
 pub(crate) struct EmulatorDownloadPageState {
+    side_by_side_busy: bool,
+    side_by_side_reviews: BTreeMap<
+        &'static str,
+        Result<archivefs_core::managed_emulator_install::review::AppImageInstallReview, String>,
+    >,
     entries: BTreeMap<&'static str, EmulatorDownloadEntryState>,
     task: Option<(String, Receiver<TaskResult>)>,
     cancellation: Option<EmulatorDownloadCancellation>,
@@ -255,6 +269,12 @@ impl EmulatorDownloadPageState {
                 context.request_repaint_after(Duration::from_millis(120));
                 return;
             }
+            Err(TryRecvError::Disconnected) if self.side_by_side_busy => {
+                TaskResult::SideBySide(Box::new(Err(
+                    "The side-by-side review worker stopped; retry review. Nothing was installed."
+                        .into(),
+                )))
+            }
             Err(TryRecvError::Disconnected) => TaskResult::Installed(Err(DownloadError::Io(
                 "the emulator download background task stopped unexpectedly".into(),
             ))),
@@ -276,6 +296,10 @@ impl EmulatorDownloadPageState {
             return;
         }
         match result {
+            TaskResult::SideBySide(result) => {
+                self.side_by_side_busy = false;
+                self.side_by_side_reviews.insert(key, *result);
+            }
             TaskResult::Resolved(Ok(plan)) => {
                 self.entries.insert(
                     key,
@@ -321,6 +345,9 @@ impl EmulatorDownloadPageState {
 
     pub(crate) fn handle(&mut self, action: EmulatorDownloadPageAction, context: egui::Context) {
         match action {
+            EmulatorDownloadPageAction::ReviewSideBySide(id, picker) => {
+                self.start_side_by_side(id, picker, context)
+            }
             EmulatorDownloadPageAction::Resolve(id) => self.start_resolve(id, context),
             EmulatorDownloadPageAction::Install(id) => self.start_install(id, context),
             EmulatorDownloadPageAction::Initialize(id) => self.request_initialization(id),
@@ -541,7 +568,8 @@ impl EmulatorDownloadPageState {
     /// Render the approval-bound workflow for the two integrated policy
     /// targets. Other catalogue entries are intentionally not presented here.
     pub(crate) fn show_bootstrap(&self, ui: &mut egui::Ui) -> Option<EmulatorDownloadPageAction> {
-        self.show_specs(ui, Self::managed_bootstrap_specs())
+        let action = self.show_specs(ui, Self::managed_bootstrap_specs());
+        self.show_side_by_side(ui).or(action)
     }
 
     fn show_entry(
