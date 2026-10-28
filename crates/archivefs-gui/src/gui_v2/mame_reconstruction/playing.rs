@@ -20,7 +20,8 @@ use archivefs_core::{
         preflight_mame_launch,
     },
     mame_collection_analyser::{
-        MameCollectionInventory, MameCollectionStyle, MameSetResult, analyse_collection,
+        MameCollectionInventory, MameCollectionStyle, MameLaunchEvidenceStatus, MameSetResult,
+        analyse_collection,
         inspection::{InspectionLimits, SourceStamp, inspect_collection},
     },
     mame_playing_library::{
@@ -29,6 +30,7 @@ use archivefs_core::{
 };
 use eframe::egui;
 use std::{
+    collections::{BTreeMap, BTreeSet},
     path::PathBuf,
     sync::{
         Arc,
@@ -44,6 +46,8 @@ pub(super) struct Machine {
     normal: bool,
     pub result: MameSetResult,
     anchor: Option<PathBuf>,
+    sources: Vec<SourceStamp>,
+    sources_complete: bool,
     samples: bool,
     recommended: bool,
 }
@@ -76,6 +80,17 @@ pub(super) fn inspect(
         preferences: MamePlayingLibraryPreferences::default(),
     })?;
     let index = MameExpectationIndex::new(&selected.dat.parsed);
+    let stamps: BTreeMap<_, _> = inspection
+        .sources
+        .iter()
+        .map(|source| (&source.path, source))
+        .collect();
+    let observed: BTreeMap<_, _> = inspection
+        .inventory
+        .sets
+        .iter()
+        .map(|set| (set.name.as_str(), set))
+        .collect();
     let machines = analysis
         .set_results
         .into_iter()
@@ -104,6 +119,21 @@ pub(super) fn inspect(
                 _ => MameCollectionLayout::RuntimeSearch,
             };
             let expectation = index.expectation_for_layout(&game.name, layout);
+            let mut relevant_paths = BTreeSet::from([inputs.root.clone()]);
+            if let Some(expectation) = &expectation {
+                for requirement in &expectation.dependencies.resolution.roms {
+                    for location in &requirement.locations {
+                        if let Some(set) = observed.get(location.set_name.as_str()) {
+                            relevant_paths.insert(set.location.clone());
+                            if set.directory {
+                                relevant_paths.insert(set.location.join(&location.member_name));
+                            }
+                        }
+                    }
+                }
+            }
+            let sources: Vec<_> = relevant_paths.iter().filter_map(|path| stamps.get(path).map(|stamp| (*stamp).clone())).collect();
+            let sources_complete = sources.len() == relevant_paths.len();
             let anchor = expectation.as_ref().and_then(|e| {
                 let mut requirements = e
                     .dependencies
@@ -155,6 +185,8 @@ pub(super) fn inspect(
                 recommended: curated.selected_sets.iter().any(|s| s.name == game.name),
                 result,
                 anchor,
+                sources,
+                sources_complete,
             })
         })
         .collect();
@@ -288,6 +320,79 @@ pub(super) fn request(
     Ok(request)
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(super) enum Readiness {
+    Ready,
+    MissingDependency,
+    IncompleteEvidence,
+    Unsupported,
+    NeedsConfiguration,
+}
+
+impl Readiness {
+    fn label(self) -> &'static str {
+        match self {
+            Self::Ready => "Ready",
+            Self::MissingDependency => "Missing dependency",
+            Self::IncompleteEvidence => "Incomplete evidence",
+            Self::Unsupported => "Unsupported",
+            Self::NeedsConfiguration => "Needs configuration",
+        }
+    }
+}
+
+pub(super) fn readiness(
+    report: &Report,
+    machine: &str,
+    executable: Option<PathBuf>,
+) -> (Readiness, Result<MameLaunchRequest, String>) {
+    let Some(item) = report.machines.iter().find(|m| m.name == machine) else {
+        return (
+            Readiness::Unsupported,
+            Err("Machine is unavailable; refresh Playing Library.".into()),
+        );
+    };
+    if !item.normal {
+        return (
+            Readiness::Unsupported,
+            Err("The selected catalogue does not declare an ordinary runnable machine.".into()),
+        );
+    }
+    if !item.sources_complete
+        || !report.binding.source.still_matches()
+        || item.sources.iter().any(|source| !source.still_matches())
+    {
+        return (
+            Readiness::IncompleteEvidence,
+            Err("Catalogue or collection changed; refresh Playing Library before launch.".into()),
+        );
+    }
+    match item.result.evidence.launch_evidence_status() {
+        MameLaunchEvidenceStatus::MissingDependency => return (Readiness::MissingDependency, Err("A required ROM, BIOS, device or CHD is missing or has conflicting bytes. Review the requirements below.".into())),
+        MameLaunchEvidenceStatus::IncompleteEvidence => return (Readiness::IncompleteEvidence, Err("Required storage evidence is incomplete. A CHD header alone does not verify its contents or parent chain.".into())),
+        MameLaunchEvidenceStatus::Verified => {}
+    }
+    let Some(executable) = executable else {
+        return (
+            Readiness::NeedsConfiguration,
+            Err("Configure the native MAME executable in Emulator Setup first.".into()),
+        );
+    };
+    if item.anchor.is_none() {
+        return (
+            Readiness::Unsupported,
+            Err("No resolver-approved physical container supports this machine layout.".into()),
+        );
+    }
+    match request(report, machine, executable) {
+        Ok(request) => (Readiness::Ready, Ok(request)),
+        Err(reason) if reason.contains("MAME executable") => {
+            (Readiness::NeedsConfiguration, Err(reason))
+        }
+        Err(reason) => (Readiness::IncompleteEvidence, Err(reason)),
+    }
+}
+
 /// Rehash the collection and resolve the exact installed catalogue again in
 /// the launch worker. Metadata stamps alone never authorize changed content.
 pub(super) fn revalidate(
@@ -310,7 +415,7 @@ pub(super) fn revalidate(
 pub(super) struct Panel {
     pub(super) report: Option<Arc<Report>>,
     job: Option<Receiver<Result<Report, String>>>,
-    selected: String,
+    pub(super) selected: String,
     query: String,
     confirm: bool,
     displayed_executable: Option<PathBuf>,
@@ -548,29 +653,28 @@ impl Panel {
                 self.cheat_message = None;
             }
             if let Some(machine) = report.machines.iter().find(|m| m.name == self.selected) {
-                ui.label(if machine.result.evidence.verified_complete() {
-                    "Last inspection: required ROM storage verified · machine runnability not assessed"
-                } else {
-                    "ROM/dependency evidence incomplete or unverified · launch refused"
+                let executable = EmulatorPathOverrides::load().mame_executable;
+                self.bind_executable(executable.clone());
+                let (readiness, review) = readiness(&report, &self.selected, executable.clone());
+                ui.strong(format!("Readiness: {}", readiness.label()));
+                ui.small("Storage evidence and native preflight only; actual machine boot is not verified.");
+                ui.collapsing("ROM, BIOS, device and CHD evidence", |ui| {
+                    for requirement in &machine.result.evidence.requirements {
+                        ui.label(format!(
+                            "{}/{}: {:?} · {:?}",
+                            requirement.declaring_set,
+                            requirement.member,
+                            requirement.content,
+                            requirement.preservation
+                        ));
+                    }
+                    for reason in &machine.result.evidence.unresolved_dependencies {
+                        ui.label(reason);
+                    }
                 });
-                for requirement in &machine.result.evidence.requirements {
-                    ui.label(format!(
-                        "{}/{}: {:?} · {:?}",
-                        requirement.declaring_set,
-                        requirement.member,
-                        requirement.content,
-                        requirement.preservation
-                    ));
-                }
-                for reason in &machine.result.evidence.unresolved_dependencies {
-                    ui.label(reason);
-                }
                 if machine.samples {
                     ui.label("Sample sets are separate and not verified by this inspection; sound completeness is not established.");
                 }
-                let executable = EmulatorPathOverrides::load().mame_executable;
-                self.bind_executable(executable.clone());
-                let review = executable.clone().ok_or_else(|| "Configure the native MAME executable in Emulator Setup first; launch overrides remain unchanged.".into()).and_then(|e| request(&report, &self.selected, e));
                 match &review {
                     Ok(r) => {
                         ui.label(format!(
