@@ -1402,7 +1402,7 @@ mod tests {
         let inspection = inspect_patch_package(&package).unwrap();
         let plan = build_patch_composition_plan(
             &inspection,
-            &[source.clone()],
+            std::slice::from_ref(&source),
             &output,
             &output_root,
             None,
@@ -1412,7 +1412,7 @@ mod tests {
         fs::remove_file(provenance_path(&output)).unwrap();
         let pending = build_patch_composition_plan(
             &inspection,
-            &[source.clone()],
+            std::slice::from_ref(&source),
             &output,
             &output_root,
             None,

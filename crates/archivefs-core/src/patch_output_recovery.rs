@@ -1156,7 +1156,10 @@ mod tests {
         let plan = plan_patch_output_recovery(&pending[0].journal_path).unwrap();
         fs::write(&pending[0].journal.temporary_output_path, b"unowned").unwrap();
         assert!(dismiss_failed_patch_output(&plan).is_err());
-        assert_eq!(fs::read(&pending[0].journal.temporary_output_path).unwrap(), b"unowned");
+        assert_eq!(
+            fs::read(&pending[0].journal.temporary_output_path).unwrap(),
+            b"unowned"
+        );
         fs::remove_file(&pending[0].journal.temporary_output_path).unwrap();
         dismiss_failed_patch_output(&plan).unwrap();
         assert!(!directory.path().join("output.bin").exists());

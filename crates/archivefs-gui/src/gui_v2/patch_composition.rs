@@ -87,7 +87,7 @@ fn verified_source(id: i64, path: &Path) -> Result<(PatchCompositionCandidate, S
     let metadata = fs::symlink_metadata(path).map_err(|e| e.to_string())?;
     if !metadata.is_file()
         || metadata.file_type().is_symlink()
-        || metadata.len() > archivefs_core::standalone_patch::MAX_APPLY_BYTES as u64
+        || metadata.len() > archivefs_core::standalone_patch::MAX_APPLY_BYTES
     {
         return Err(
             "The selected game must be a bounded regular file, not a link or archive member."
