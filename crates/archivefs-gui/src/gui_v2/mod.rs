@@ -65,6 +65,7 @@ mod onboarding;
 mod optical_compare;
 mod organisation;
 mod pages;
+mod patch_composition;
 mod patch_package_preview;
 mod platform_aliases_page;
 mod problem_actions;

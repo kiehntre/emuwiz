@@ -5,7 +5,7 @@
 //! chain planning, staging, repeatability, and package-level provenance.
 
 use std::fs;
-use std::io::Read;
+use std::io::{Read, Write};
 use std::path::{Component, Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
@@ -76,6 +76,7 @@ pub struct PatchCompositionProvenance {
 pub enum PatchCompositionReadiness {
     Ready,
     AlreadyCreated { output_sha256: String },
+    NeedsProvenanceRecovery { output_sha256: String },
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize)]
@@ -274,14 +275,32 @@ fn walk_folder(
 }
 
 fn inspect_zip(path: &Path) -> Result<PatchPackageInspection, PatchCompositionError> {
-    let package_bytes = fs::read(path).map_err(io_err)?;
+    let file = crate::launch::process_spawn::open_regular_file_nonblocking(path)
+        .map_err(|e| PatchCompositionError::UnsafePackage(e.to_string()))?;
+    if file.metadata().map_err(io_err)?.len() > MAX_PACKAGE_BYTES {
+        return Err(PatchCompositionError::PackageLimit(
+            "compressed package bytes".into(),
+        ));
+    }
+    let mut package_bytes = Vec::new();
+    file.take(MAX_PACKAGE_BYTES + 1)
+        .read_to_end(&mut package_bytes)
+        .map_err(io_err)?;
     if package_bytes.len() as u64 > MAX_PACKAGE_BYTES {
         return Err(PatchCompositionError::PackageLimit(
             "compressed package bytes".into(),
         ));
     }
-    let mut archive = zip::ZipArchive::new(fs::File::open(path).map_err(io_err)?)
+    let mut archive = zip::ZipArchive::new(std::io::Cursor::new(&package_bytes))
         .map_err(|e| PatchCompositionError::MalformedPackage(e.to_string()))?;
+    // zip 9 indexes members by name and may collapse duplicate central
+    // directory entries. Compare the raw declared count before trusting its
+    // by-name lookups, so an ambiguous package cannot select one silently.
+    if declared_zip_entry_count(&package_bytes)? != archive.len() {
+        return Err(PatchCompositionError::MalformedPackage(
+            "ZIP entries were collapsed or are ambiguous".into(),
+        ));
+    }
     if archive.len() > MAX_PACKAGE_ENTRIES {
         return Err(PatchCompositionError::PackageLimit(
             "too many entries".into(),
@@ -317,6 +336,11 @@ fn inspect_zip(path: &Path) -> Result<PatchPackageInspection, PatchCompositionEr
         names.push(name);
     }
     names.sort();
+    if names.windows(2).any(|pair| pair[0] == pair[1]) {
+        return Err(PatchCompositionError::MalformedPackage(
+            "duplicate ZIP member names".into(),
+        ));
+    }
     let mut patches = Vec::new();
     let mut metadata_text = None;
     let mut identity = None;
@@ -372,6 +396,34 @@ fn inspect_zip(path: &Path) -> Result<PatchPackageInspection, PatchCompositionEr
         order,
         warnings,
     )
+}
+
+fn declared_zip_entry_count(bytes: &[u8]) -> Result<usize, PatchCompositionError> {
+    const EOCD_LEN: usize = 22;
+    if bytes.len() < EOCD_LEN {
+        return Err(PatchCompositionError::MalformedPackage(
+            "missing ZIP end record".into(),
+        ));
+    }
+    let start = bytes.len().saturating_sub(EOCD_LEN + u16::MAX as usize);
+    for offset in (start..=bytes.len() - EOCD_LEN).rev() {
+        if &bytes[offset..offset + 4] != b"PK\x05\x06" {
+            continue;
+        }
+        let field = |at: usize| u16::from_le_bytes([bytes[offset + at], bytes[offset + at + 1]]);
+        if offset + EOCD_LEN + usize::from(field(20)) != bytes.len() {
+            continue;
+        }
+        if field(4) != 0 || field(6) != 0 || field(8) != field(10) || field(10) == u16::MAX {
+            return Err(PatchCompositionError::MalformedPackage(
+                "split or ZIP64 package entry count is unsupported".into(),
+            ));
+        }
+        return Ok(usize::from(field(10)));
+    }
+    Err(PatchCompositionError::MalformedPackage(
+        "missing ZIP end record".into(),
+    ))
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -508,6 +560,42 @@ pub fn build_patch_composition_plan(
                 ));
             }
         }
+    } else if output.is_file() && !sidecar.exists() {
+        let receipt = output.with_file_name(format!(
+            "{}.emuwiz-patch.json",
+            output
+                .file_name()
+                .and_then(|name| name.to_str())
+                .unwrap_or("patched-rom")
+        ));
+        let bytes = fs::read(&receipt).map_err(|_| {
+            PatchCompositionError::UnsafeOutput(
+                "existing output has no standalone recovery receipt".into(),
+            )
+        })?;
+        if bytes.len() > MAX_METADATA_BYTES as usize {
+            return Err(PatchCompositionError::UnsafeOutput(
+                "standalone receipt is too large".into(),
+            ));
+        }
+        let record: serde_json::Value = serde_json::from_slice(&bytes).map_err(|_| {
+            PatchCompositionError::UnsafeOutput("standalone receipt is unreadable".into())
+        })?;
+        let output_hash = hex_digest(Sha256::digest(fs::read(&output).map_err(io_err)?));
+        if record.get("output_path").and_then(|value| value.as_str()) != output.to_str()
+            || record.get("output_sha256").and_then(|value| value.as_str())
+                != Some(output_hash.as_str())
+            || record.get("patch_sha256").and_then(|value| value.as_str())
+                != steps.last().map(|step| step.patch_sha256.as_str())
+        {
+            return Err(PatchCompositionError::UnsafeOutput(
+                "existing output does not match its standalone receipt and selected patch chain"
+                    .into(),
+            ));
+        }
+        PatchCompositionReadiness::NeedsProvenanceRecovery {
+            output_sha256: output_hash,
+        }
     } else if output.exists() || sidecar.exists() {
         return Err(PatchCompositionError::UnsafeOutput(
             "derived output or provenance sidecar already exists".into(),
@@ -576,6 +664,14 @@ pub fn apply_patch_composition(
             provenance,
         });
     }
+    if matches!(
+        plan.readiness,
+        PatchCompositionReadiness::NeedsProvenanceRecovery { .. }
+    ) {
+        return Err(PatchCompositionError::UnsafeOutput(
+            "existing output needs explicit provenance recovery".into(),
+        ));
+    }
     if hex_digest(Sha256::digest(
         &fs::read(&plan.source_path).map_err(io_err)?,
     )) != plan.source_sha256
@@ -585,11 +681,30 @@ pub fn apply_patch_composition(
     if package_fingerprint(&plan.package_path)? != plan.package_sha256 {
         return Err(PatchCompositionError::StalePackage);
     }
+    // Planning is only a preview. A destination or sidecar may have appeared
+    // while the user was reviewing it; neither may ever be replaced.
+    if fs::symlink_metadata(&plan.output_path).is_ok()
+        || fs::symlink_metadata(provenance_path(&plan.output_path)).is_ok()
+    {
+        return Err(PatchCompositionError::UnsafeOutput(
+            "derived output or provenance appeared after preview".into(),
+        ));
+    }
     let parent = plan
         .output_path
         .parent()
         .ok_or_else(|| PatchCompositionError::UnsafeOutput("output has no parent".into()))?;
+    if !is_safe_child(parent, &plan.output_path) {
+        return Err(PatchCompositionError::UnsafeOutput(
+            "derived output root is a symlink".into(),
+        ));
+    }
     fs::create_dir_all(parent).map_err(io_err)?;
+    if !is_safe_child(parent, &plan.output_path) {
+        return Err(PatchCompositionError::UnsafeOutput(
+            "derived output root changed or is a symlink".into(),
+        ));
+    }
     if let Some(stat) = crate::diagnostics::environment::filesystem_stat(parent)
         && stat.available_bytes < plan.required_bytes
     {
@@ -601,6 +716,9 @@ pub fn apply_patch_composition(
     let temp = tempfile::tempdir_in(parent).map_err(io_err)?;
     let mut current = temp.path().join("source");
     fs::copy(&plan.source_path, &current).map_err(io_err)?;
+    if hex_digest(Sha256::digest(&fs::read(&current).map_err(io_err)?)) != plan.source_sha256 {
+        return Err(PatchCompositionError::StaleSource);
+    }
     let mut last: Option<StandalonePatchApplyResult> = None;
     for (position, step) in plan.patches.iter().enumerate() {
         let patch_path = materialize_patch(inspection, step, temp.path())?;
@@ -621,8 +739,23 @@ pub fn apply_patch_composition(
             next.parent().unwrap(),
         )
         .map_err(|e| PatchCompositionError::Patch(e.to_string()))?;
-        let result = apply_standalone_patch(&patch_plan)
-            .map_err(|e| PatchCompositionError::Patch(e.to_string()))?;
+        let result = match apply_standalone_patch(&patch_plan) {
+            Ok(result) => result,
+            Err(error) => {
+                // A durable journal may need the staged source and patch to
+                // resume. Retain only that operation's private staging tree.
+                let (pending, _) = crate::patch_output_recovery::discover_pending_patch_outputs(
+                    next.parent().unwrap(),
+                );
+                if pending
+                    .iter()
+                    .any(|record| record.journal.destination_path == next)
+                {
+                    let _ = temp.keep();
+                }
+                return Err(PatchCompositionError::Patch(error.to_string()));
+            }
+        };
         if position + 1 != plan.patches.len() {
             let _ = fs::remove_file(provenance_path(&next));
         }
@@ -631,15 +764,21 @@ pub fn apply_patch_composition(
     }
     let result = last.ok_or(PatchCompositionError::NoPatch)?;
     let output_hash = result.output_sha256.clone();
-    let standalone_sidecar = result.output_path.with_file_name(format!(
-        "{}.emuwiz-patch.json",
-        result
-            .output_path
-            .file_name()
-            .and_then(|name| name.to_str())
-            .unwrap_or("patched-rom")
-    ));
-    let _ = fs::remove_file(standalone_sidecar);
+    // Keep the durable standalone receipt. If this process stops before the
+    // package receipt is published, the output still has a truthful record.
+    let provenance = publish_composition_provenance(plan, &output_hash)?;
+    Ok(PatchCompositionResult {
+        output_path: plan.output_path.clone(),
+        output_sha256: output_hash,
+        readiness: PatchCompositionReadiness::Ready,
+        provenance,
+    })
+}
+
+fn publish_composition_provenance(
+    plan: &PatchCompositionPlan,
+    output_hash: &str,
+) -> Result<PatchCompositionProvenance, PatchCompositionError> {
     let provenance = PatchCompositionProvenance {
         source_path: plan.source_path.clone(),
         source_sha256: plan.source_sha256.clone(),
@@ -648,24 +787,111 @@ pub fn apply_patch_composition(
         patches: plan.patches.clone(),
         verified_identity: plan.verified_identity.clone(),
         output_path: plan.output_path.clone(),
-        output_sha256: output_hash.clone(),
+        output_sha256: output_hash.to_owned(),
         applied_at_unix_seconds: now(),
         application: "EmuWiz patch-package composition".into(),
     };
     let sidecar = provenance_path(&plan.output_path);
-    let _ = fs::remove_file(&sidecar);
-    let temp_sidecar = temp.path().join("composition-provenance.json");
+    let parent = sidecar
+        .parent()
+        .ok_or_else(|| PatchCompositionError::UnsafeOutput("provenance has no parent".into()))?;
+    if !is_safe_child(parent, &sidecar)
+        || fs::symlink_metadata(&sidecar).is_ok()
+        || hex_digest(Sha256::digest(fs::read(&plan.output_path).map_err(io_err)?)) != output_hash
+    {
+        return Err(PatchCompositionError::UnsafeOutput(
+            "output or provenance destination changed before publication".into(),
+        ));
+    }
+    let mut temp_sidecar = tempfile::NamedTempFile::new_in(parent).map_err(io_err)?;
     let bytes = serde_json::to_vec_pretty(&provenance)
         .map_err(|e| PatchCompositionError::Provenance(e.to_string()))?;
-    fs::write(&temp_sidecar, bytes).map_err(io_err)?;
-    fs::rename(&temp_sidecar, &sidecar).map_err(|e| {
-        let _ = fs::remove_file(&plan.output_path);
-        PatchCompositionError::Provenance(e.to_string())
-    })?;
+    temp_sidecar.write_all(&bytes).map_err(io_err)?;
+    temp_sidecar.as_file().sync_all().map_err(io_err)?;
+    fs::hard_link(temp_sidecar.path(), &sidecar)
+        .map_err(|e| PatchCompositionError::Provenance(e.to_string()))?;
+    #[cfg(target_os = "linux")]
+    fs::File::open(parent)
+        .map_err(io_err)?
+        .sync_all()
+        .map_err(io_err)?;
+    Ok(provenance)
+}
+
+/// Complete package provenance only after replaying the reviewed patch chain
+/// into a private directory and proving its bytes equal the already-published
+/// standalone output. An unrelated destination is never adopted.
+pub fn recover_patch_composition_provenance(
+    plan: &PatchCompositionPlan,
+    inspection: &PatchPackageInspection,
+) -> Result<PatchCompositionResult, PatchCompositionError> {
+    let PatchCompositionReadiness::NeedsProvenanceRecovery { output_sha256 } = &plan.readiness
+    else {
+        return Err(PatchCompositionError::UnsafeOutput(
+            "no package provenance recovery is required".into(),
+        ));
+    };
+    if hex_digest(Sha256::digest(fs::read(&plan.source_path).map_err(io_err)?))
+        != plan.source_sha256
+    {
+        return Err(PatchCompositionError::StaleSource);
+    }
+    if package_fingerprint(&plan.package_path)? != plan.package_sha256 {
+        return Err(PatchCompositionError::StalePackage);
+    }
+    let parent = plan
+        .output_path
+        .parent()
+        .ok_or_else(|| PatchCompositionError::UnsafeOutput("output has no parent".into()))?;
+    if !is_safe_child(parent, &plan.output_path)
+        || provenance_path(&plan.output_path)
+            .symlink_metadata()
+            .is_ok()
+        || hex_digest(Sha256::digest(fs::read(&plan.output_path).map_err(io_err)?))
+            != *output_sha256
+    {
+        return Err(PatchCompositionError::UnsafeOutput(
+            "published output or destination changed before recovery".into(),
+        ));
+    }
+    let temp = tempfile::tempdir_in(parent).map_err(io_err)?;
+    let mut current = temp.path().join("source");
+    fs::copy(&plan.source_path, &current).map_err(io_err)?;
+    if hex_digest(Sha256::digest(fs::read(&current).map_err(io_err)?)) != plan.source_sha256 {
+        return Err(PatchCompositionError::StaleSource);
+    }
+    let mut final_hash = None;
+    for (position, step) in plan.patches.iter().enumerate() {
+        let patch_path = materialize_patch(inspection, step, temp.path())?;
+        let patch_inspection = inspect_standalone_patch(&patch_path)
+            .map_err(|e| PatchCompositionError::Patch(e.to_string()))?;
+        if patch_inspection.patch_sha256 != step.patch_sha256 {
+            return Err(PatchCompositionError::StalePackage);
+        }
+        let next = temp.path().join(format!("replay-{position}"));
+        let patch_plan =
+            build_standalone_patch_apply_plan(&patch_inspection, &current, &next, temp.path())
+                .map_err(|e| PatchCompositionError::Patch(e.to_string()))?;
+        let result = apply_standalone_patch(&patch_plan)
+            .map_err(|e| PatchCompositionError::Patch(e.to_string()))?;
+        current = next;
+        final_hash = Some(result.output_sha256);
+    }
+    if final_hash.as_deref() != Some(output_sha256.as_str())
+        || hex_digest(Sha256::digest(fs::read(&plan.output_path).map_err(io_err)?))
+            != *output_sha256
+    {
+        return Err(PatchCompositionError::UnsafeOutput(
+            "replayed patch chain differs from the published output".into(),
+        ));
+    }
+    let provenance = publish_composition_provenance(plan, output_sha256)?;
     Ok(PatchCompositionResult {
         output_path: plan.output_path.clone(),
-        output_sha256: output_hash,
-        readiness: PatchCompositionReadiness::Ready,
+        output_sha256: output_sha256.clone(),
+        readiness: PatchCompositionReadiness::AlreadyCreated {
+            output_sha256: output_sha256.clone(),
+        },
         provenance,
     })
 }
@@ -678,15 +904,41 @@ fn materialize_patch(
     if inspection.package_path.is_dir() {
         return Ok(inspection.package_path.join(Path::new(&step.relative_path)));
     }
-    let mut archive =
-        zip::ZipArchive::new(fs::File::open(&inspection.package_path).map_err(io_err)?)
-            .map_err(|e| PatchCompositionError::MalformedPackage(e.to_string()))?;
-    let mut member = archive
+    let package =
+        crate::launch::process_spawn::open_regular_file_nonblocking(&inspection.package_path)
+            .map_err(|e| PatchCompositionError::UnsafePackage(e.to_string()))?;
+    if package.metadata().map_err(io_err)?.len() > MAX_PACKAGE_BYTES {
+        return Err(PatchCompositionError::PackageLimit(
+            "compressed package bytes".into(),
+        ));
+    }
+    let mut bytes = Vec::new();
+    package
+        .take(MAX_PACKAGE_BYTES + 1)
+        .read_to_end(&mut bytes)
+        .map_err(io_err)?;
+    if bytes.len() as u64 > MAX_PACKAGE_BYTES {
+        return Err(PatchCompositionError::PackageLimit(
+            "compressed package bytes".into(),
+        ));
+    }
+    let mut archive = zip::ZipArchive::new(std::io::Cursor::new(bytes))
+        .map_err(|e| PatchCompositionError::MalformedPackage(e.to_string()))?;
+    let member = archive
         .by_name(&step.relative_path)
         .map_err(|e| PatchCompositionError::MalformedPackage(e.to_string()))?;
+    if member.size() > crate::standalone_patch::MAX_PATCH_BYTES as u64 {
+        return Err(PatchCompositionError::PackageLimit("patch bytes".into()));
+    }
     let path = temp.join(format!("patch-{}", step.order));
     let mut bytes = Vec::new();
-    member.read_to_end(&mut bytes).map_err(io_err)?;
+    member
+        .take(crate::standalone_patch::MAX_PATCH_BYTES as u64 + 1)
+        .read_to_end(&mut bytes)
+        .map_err(io_err)?;
+    if bytes.len() > crate::standalone_patch::MAX_PATCH_BYTES {
+        return Err(PatchCompositionError::PackageLimit("patch bytes".into()));
+    }
     fs::write(&path, bytes).map_err(io_err)?;
     Ok(path)
 }
@@ -840,6 +1092,12 @@ fn is_safe_child(root: &Path, child: &Path) -> bool {
     if relative.as_os_str().is_empty() {
         return false;
     }
+    if root.ancestors().any(|path| {
+        path.symlink_metadata()
+            .is_ok_and(|metadata| metadata.file_type().is_symlink())
+    }) {
+        return false;
+    }
     let mut current = root.to_path_buf();
     for component in relative.components() {
         if !matches!(component, Component::Normal(_)) {
@@ -856,7 +1114,7 @@ fn is_safe_child(root: &Path, child: &Path) -> bool {
     }
     true
 }
-fn provenance_path(output: &Path) -> PathBuf {
+pub fn provenance_path(output: &Path) -> PathBuf {
     output.with_file_name(format!(
         "{}.emuwiz-patch-package.json",
         output
@@ -867,7 +1125,23 @@ fn provenance_path(output: &Path) -> PathBuf {
 }
 fn package_fingerprint(path: &Path) -> Result<String, PatchCompositionError> {
     if path.is_file() {
-        return Ok(hex_digest(Sha256::digest(fs::read(path).map_err(io_err)?)));
+        let file = crate::launch::process_spawn::open_regular_file_nonblocking(path)
+            .map_err(|e| PatchCompositionError::UnsafePackage(e.to_string()))?;
+        if file.metadata().map_err(io_err)?.len() > MAX_PACKAGE_BYTES {
+            return Err(PatchCompositionError::PackageLimit(
+                "compressed package bytes".into(),
+            ));
+        }
+        let mut bytes = Vec::new();
+        file.take(MAX_PACKAGE_BYTES + 1)
+            .read_to_end(&mut bytes)
+            .map_err(io_err)?;
+        if bytes.len() as u64 > MAX_PACKAGE_BYTES {
+            return Err(PatchCompositionError::PackageLimit(
+                "compressed package bytes".into(),
+            ));
+        }
+        return Ok(hex_digest(Sha256::digest(bytes)));
     }
     let report = inspect_folder(path)?;
     Ok(report.package_sha256)
@@ -1019,6 +1293,186 @@ mod tests {
             apply_patch_composition(&plan, &inspection),
             Err(PatchCompositionError::StaleSource)
         ));
+    }
+
+    #[test]
+    fn destination_created_after_review_is_never_replaced() {
+        let dir = folder();
+        let package = dir.path().join("package");
+        fs::create_dir(&package).unwrap();
+        fs::write(package.join("patch.ips"), ips_bytes(b"Xld")).unwrap();
+        fs::write(
+            package.join("patch.json"),
+            br#"{"verified_identity":"GAME"}"#,
+        )
+        .unwrap();
+        let source = candidate(dir.path(), b"old", Some("GAME"));
+        let output_root = dir.path().join("derived");
+        let output = output_root.join("game-patched.rom");
+        let inspection = inspect_patch_package(&package).unwrap();
+        let plan =
+            build_patch_composition_plan(&inspection, &[source], &output, &output_root, None)
+                .unwrap();
+        fs::create_dir(&output_root).unwrap();
+        fs::write(&output, b"someone else's file").unwrap();
+        assert!(matches!(
+            apply_patch_composition(&plan, &inspection),
+            Err(PatchCompositionError::UnsafeOutput(_))
+        ));
+        assert_eq!(fs::read(&output).unwrap(), b"someone else's file");
+        assert_eq!(fs::read(dir.path().join("game.rom")).unwrap(), b"old");
+    }
+
+    #[test]
+    fn interrupted_final_output_uses_existing_durable_recovery() {
+        use crate::patch_output_recovery::{
+            PatchOutputCheckpoint, PatchOutputRecoveryClassification,
+            discover_pending_patch_outputs, inject_checkpoint_failure, plan_patch_output_recovery,
+            resume_patch_output,
+        };
+        let dir = folder();
+        let package = dir.path().join("package");
+        fs::create_dir(&package).unwrap();
+        fs::write(package.join("patch.ips"), ips_bytes(b"Xld")).unwrap();
+        fs::write(
+            package.join("patch.json"),
+            br#"{"verified_identity":"GAME"}"#,
+        )
+        .unwrap();
+        let source = candidate(dir.path(), b"old", Some("GAME"));
+        let output_root = dir.path().join("derived");
+        let output = output_root.join("game-patched.rom");
+        let inspection = inspect_patch_package(&package).unwrap();
+        let plan =
+            build_patch_composition_plan(&inspection, &[source], &output, &output_root, None)
+                .unwrap();
+        inject_checkpoint_failure(Some(PatchOutputCheckpoint::BeforePublish));
+        let interrupted = apply_patch_composition(&plan, &inspection);
+        inject_checkpoint_failure(None);
+        assert!(interrupted.is_err());
+        assert!(!output.exists());
+        let (records, problems) = discover_pending_patch_outputs(&output_root);
+        assert!(problems.is_empty());
+        assert_eq!(records.len(), 1);
+        assert_eq!(
+            records[0].classification,
+            PatchOutputRecoveryClassification::SafeToResume
+        );
+        let recovery = plan_patch_output_recovery(&records[0].journal_path).unwrap();
+        resume_patch_output(&recovery).unwrap();
+        assert_eq!(fs::read(&output).unwrap(), b"Xld");
+        assert_eq!(fs::read(dir.path().join("game.rom")).unwrap(), b"old");
+        // The standalone receipt survives. Package finalisation must be
+        // reviewed separately; recovery does not invent package provenance.
+        assert!(
+            output
+                .with_file_name("game-patched.rom.emuwiz-patch.json")
+                .exists()
+        );
+        assert!(!provenance_path(&output).exists());
+        let source = PatchCompositionCandidate {
+            source_path: dir.path().join("game.rom"),
+            verified_identity: Some("GAME".into()),
+        };
+        let pending =
+            build_patch_composition_plan(&inspection, &[source], &output, &output_root, None)
+                .unwrap();
+        assert!(matches!(
+            pending.readiness,
+            PatchCompositionReadiness::NeedsProvenanceRecovery { .. }
+        ));
+        recover_patch_composition_provenance(&pending, &inspection).unwrap();
+        assert!(provenance_path(&output).exists());
+    }
+
+    #[test]
+    fn published_output_with_missing_package_receipt_replays_before_finalising() {
+        let dir = folder();
+        let package = dir.path().join("package");
+        fs::create_dir(&package).unwrap();
+        fs::write(package.join("patch.ips"), ips_bytes(b"Xld")).unwrap();
+        fs::write(
+            package.join("patch.json"),
+            br#"{"verified_identity":"GAME"}"#,
+        )
+        .unwrap();
+        let source = candidate(dir.path(), b"old", Some("GAME"));
+        let output_root = dir.path().join("derived");
+        let output = output_root.join("game-patched.rom");
+        let inspection = inspect_patch_package(&package).unwrap();
+        let plan = build_patch_composition_plan(
+            &inspection,
+            &[source.clone()],
+            &output,
+            &output_root,
+            None,
+        )
+        .unwrap();
+        apply_patch_composition(&plan, &inspection).unwrap();
+        fs::remove_file(provenance_path(&output)).unwrap();
+        let pending = build_patch_composition_plan(
+            &inspection,
+            &[source.clone()],
+            &output,
+            &output_root,
+            None,
+        )
+        .unwrap();
+        assert!(matches!(
+            pending.readiness,
+            PatchCompositionReadiness::NeedsProvenanceRecovery { .. }
+        ));
+        let recovered = recover_patch_composition_provenance(&pending, &inspection).unwrap();
+        assert_eq!(recovered.output_sha256, hex_digest(Sha256::digest(b"Xld")));
+        assert!(provenance_path(&output).exists());
+        assert_eq!(fs::read(dir.path().join("game.rom")).unwrap(), b"old");
+
+        fs::remove_file(provenance_path(&output)).unwrap();
+        fs::write(&output, b"someone changed it").unwrap();
+        assert!(matches!(
+            build_patch_composition_plan(&inspection, &[source], &output, &output_root, None),
+            Err(PatchCompositionError::UnsafeOutput(_))
+        ));
+    }
+
+    #[test]
+    fn duplicate_zip_member_names_are_refused() {
+        let dir = folder();
+        let path = dir.path().join("package.zip");
+        // ZipWriter collapses duplicate names, so use a small two-entry ZIP
+        // with duplicate central-directory names and empty stored members.
+        const ZIP_HEX: &str = concat!(
+            "504b030414000000000020af5c5d0000000000000000000000000800000073616d652e697073",
+            "504b030414000000000020af5c5d0000000000000000000000000800000073616d652e697073",
+            "504b0102140314000000000020af5c5d00000000000000000000000008000000000000000000000080010000000073616d652e697073",
+            "504b0102140314000000000020af5c5d00000000000000000000000008000000000000000000000080012600000073616d652e697073",
+            "504b050600000000020002006c0000004c0000000000"
+        );
+        let archive = ZIP_HEX
+            .as_bytes()
+            .chunks_exact(2)
+            .map(|pair| u8::from_str_radix(std::str::from_utf8(pair).unwrap(), 16).unwrap())
+            .collect::<Vec<_>>();
+        assert_eq!(declared_zip_entry_count(&archive).unwrap(), 2);
+        fs::write(&path, archive).unwrap();
+        let mut raw = zip::ZipArchive::new(fs::File::open(&path).unwrap()).unwrap();
+        assert_eq!(raw.len(), 1);
+        assert_eq!(raw.by_index(0).unwrap().name().unwrap(), "same.ips");
+        assert!(matches!(
+            inspect_patch_package(&path),
+            Err(PatchCompositionError::MalformedPackage(_))
+        ));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn symlinked_output_root_is_refused_before_directory_creation() {
+        let dir = folder();
+        let target = dir.path().join("target");
+        fs::create_dir(&target).unwrap();
+        let link = dir.path().join("linked");
+        std::os::unix::fs::symlink(&target, &link).unwrap();
+        assert!(!is_safe_child(&link, &link.join("out.rom")));
     }
 
     #[test]

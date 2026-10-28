@@ -348,8 +348,8 @@ fn verify_file(
 }
 
 /// Execute the byte-producing applier only after durable intent exists. The
-/// finalizer is called after the published output is verified and before the
-/// journal becomes `Completed` (used for the existing provenance sidecar).
+/// finalizer is called after the temporary output is verified and before
+/// publication, so an interrupted operation retains its provenance for resume.
 pub fn publish_durable_patch_output<F, G>(
     intent: PatchOutputIntent,
     produce: F,
@@ -457,6 +457,8 @@ where
             journal.expected_output_sha256.as_deref(),
         )?;
         checkpoint(PatchOutputCheckpoint::TemporaryVerified)?;
+        finalize(&prepared)?;
+        journal.provenance_sha256 = Some(digest_path(&journal.provenance_path)?.1);
         Ok::<(), PatchOutputRecoveryError>(())
     })() {
         if matches!(error, PatchOutputRecoveryError::Interrupted(_)) {
@@ -508,8 +510,6 @@ where
         journal.expected_output_sha256.as_deref(),
     )?;
     checkpoint(PatchOutputCheckpoint::PublishedVerified)?;
-    finalize(&prepared)?;
-    journal.provenance_sha256 = Some(digest_path(&journal.provenance_path)?.1);
     checkpoint(PatchOutputCheckpoint::BeforeCompleted)?;
     transition(
         &journal_path,
@@ -618,8 +618,10 @@ pub fn inspect_patch_output_operation(
         journal.expected_output_size,
         journal.expected_output_sha256.as_deref(),
     );
-    let provenance_present = fs::symlink_metadata(&journal.provenance_path)
-        .is_ok_and(|metadata| metadata.is_file() && !metadata.file_type().is_symlink());
+    let provenance_matches = journal
+        .provenance_sha256
+        .as_deref()
+        .is_some_and(|hash| matches_expected(&journal.provenance_path, None, Some(hash)));
     let (classification, explanation) = if journal.state.is_terminal() {
         (
             if journal.state == PatchOutputState::Completed {
@@ -640,7 +642,7 @@ pub fn inspect_patch_output_operation(
             | PatchOutputState::Published
             | PatchOutputState::VerifyingPublished
     ) && destination_matches
-        && provenance_present
+        && provenance_matches
     {
         (
             PatchOutputRecoveryClassification::PublicationLikelyComplete,
@@ -652,6 +654,7 @@ pub fn inspect_patch_output_operation(
             | PatchOutputState::VerifyingTemporary
             | PatchOutputState::Publishing
     ) && temporary_matches
+        && provenance_matches
         && !fs::symlink_metadata(&journal.destination_path).is_ok()
     {
         (
@@ -845,6 +848,57 @@ pub fn rollback_patch_output(
     )
 }
 
+/// Dismiss a failed operation only when it published no destination. Removes
+/// verified owned temporary artifacts, then marks the journal terminal. The
+/// original source and patch are never removed.
+pub fn dismiss_failed_patch_output(
+    plan: &PatchOutputRecoveryPlan,
+) -> Result<(), PatchOutputRecoveryError> {
+    let (inspection, mut journal) = verify_plan(plan)?;
+    if inspection.classification != PatchOutputRecoveryClassification::Failed
+        || fs::symlink_metadata(&journal.destination_path).is_ok()
+        || journal.destination_preexisting
+        || journal.temporary_output_path == journal.source_path
+        || journal.temporary_output_path == journal.patch_path
+        || journal.provenance_path == journal.source_path
+        || journal.provenance_path == journal.patch_path
+    {
+        return Err(PatchOutputRecoveryError::Unsafe(
+            "failed output is not safe to dismiss".into(),
+        ));
+    }
+    if fs::symlink_metadata(&journal.temporary_output_path).is_ok() {
+        let Some(hash) = journal.expected_output_sha256.as_deref() else {
+            return Err(PatchOutputRecoveryError::Unsafe(
+                "temporary output exists without a recorded hash".into(),
+            ));
+        };
+        verify_file(
+            &journal.temporary_output_path,
+            journal.expected_output_size,
+            Some(hash),
+        )?;
+    }
+    if fs::symlink_metadata(&journal.provenance_path).is_ok() {
+        let Some(hash) = journal.provenance_sha256.as_deref() else {
+            return Err(PatchOutputRecoveryError::Unsafe(
+                "provenance exists without a recorded hash".into(),
+            ));
+        };
+        verify_file(&journal.provenance_path, None, Some(hash))?;
+    }
+    remove_owned_artifact(&journal.temporary_output_path)?;
+    if journal.provenance_sha256.is_some() {
+        remove_owned_artifact(&journal.provenance_path)?;
+    }
+    transition(
+        &plan.journal_path,
+        &mut journal,
+        PatchOutputState::RolledBack,
+        PatchOutputCheckpoint::RollbackCompleted,
+    )
+}
+
 pub fn discover_pending_patch_outputs(
     directory: &Path,
 ) -> (Vec<PatchOutputRecoveryInspection>, Vec<String>) {
@@ -1005,7 +1059,8 @@ mod tests {
     #[test]
     fn prepared_temp_can_be_explicitly_resumed_only_with_matching_inputs() {
         let directory = tempfile::tempdir().unwrap();
-        inject_checkpoint_failure(Some(PatchOutputCheckpoint::TemporaryWritten));
+        let provenance_path = intent(directory.path()).provenance_path;
+        inject_checkpoint_failure(Some(PatchOutputCheckpoint::BeforePublish));
         let result = publish_durable_patch_output(
             intent(directory.path()),
             || {
@@ -1014,7 +1069,10 @@ mod tests {
                     application: "fixture".into(),
                 })
             },
-            |_prepared| Ok(()),
+            |_prepared| {
+                fs::write(&provenance_path, b"fixture provenance").unwrap();
+                Ok(())
+            },
         );
         inject_checkpoint_failure(None);
         assert!(result.is_err());
@@ -1035,11 +1093,6 @@ mod tests {
             inspection.classification,
             PatchOutputRecoveryClassification::SafeToResume
         );
-        fs::write(
-            directory.path().join("output.bin.emuwiz-patch.json"),
-            b"fixture provenance",
-        )
-        .unwrap();
         let plan = plan_patch_output_recovery(&journal).unwrap();
         resume_patch_output(&plan).unwrap();
         assert_eq!(
@@ -1081,6 +1134,40 @@ mod tests {
                 .unwrap()
                 .classification,
             PatchOutputRecoveryClassification::UnsafeToResume
+        );
+    }
+
+    #[test]
+    fn failed_unpublished_output_can_be_explicitly_dismissed() {
+        let directory = tempfile::tempdir().unwrap();
+        let result = publish_durable_patch_output(
+            intent(directory.path()),
+            || Err(PatchOutputRecoveryError::Failed("bad patch".into())),
+            |_| Ok(()),
+        );
+        assert!(result.is_err());
+        let (pending, problems) = discover_pending_patch_outputs(directory.path());
+        assert!(problems.is_empty());
+        assert_eq!(pending.len(), 1);
+        assert_eq!(
+            pending[0].classification,
+            PatchOutputRecoveryClassification::Failed
+        );
+        let plan = plan_patch_output_recovery(&pending[0].journal_path).unwrap();
+        fs::write(&pending[0].journal.temporary_output_path, b"unowned").unwrap();
+        assert!(dismiss_failed_patch_output(&plan).is_err());
+        assert_eq!(fs::read(&pending[0].journal.temporary_output_path).unwrap(), b"unowned");
+        fs::remove_file(&pending[0].journal.temporary_output_path).unwrap();
+        dismiss_failed_patch_output(&plan).unwrap();
+        assert!(!directory.path().join("output.bin").exists());
+        assert!(
+            discover_pending_patch_outputs(directory.path())
+                .0
+                .is_empty()
+        );
+        assert_eq!(
+            fs::read(directory.path().join("source.bin")).unwrap(),
+            b"source-bytes"
         );
     }
 

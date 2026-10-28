@@ -38,6 +38,7 @@ enum Tab {
 pub(super) struct ModsPageState {
     tab: Tab,
     local: LocalModPackagePageState,
+    patch_composition: super::patch_composition::State,
     history: Option<ModHistory>,
     history_error: Option<String>,
     history_loaded: bool,
@@ -182,7 +183,14 @@ pub(super) fn show_mods_page(
                 workshop_lanes(ui, &mut state.tab);
                 match state.tab {
                     Tab::Installed => installed(ui, state.history.as_ref(), selected_game),
-                    Tab::Add => add_package(ui, &mut state.local, selected_game),
+                    Tab::Add => {
+                        add_package(ui, &mut state.local, selected_game);
+                        super::patch_composition::show(
+                            ui,
+                            &mut state.patch_composition,
+                            selected_game,
+                        );
+                    }
                     Tab::Stack => stack(ui, state.history.as_ref(), selected_game),
                     Tab::Conflicts => conflicts(ui, state.history.as_ref(), selected_game),
                     Tab::Activation => {

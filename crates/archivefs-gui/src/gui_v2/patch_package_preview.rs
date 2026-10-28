@@ -9,7 +9,7 @@ use std::{
     path::{Path, PathBuf},
     sync::mpsc::{self, Receiver, TryRecvError},
 };
-const LIMIT: &str = "Inspect a ZIP snapshot only. Source files and games are unchanged. A private temporary copy is discarded after inspection. Patch structure and package metadata do not establish base-game identity, compatibility or a safe patch order. No Apply is available.";
+const LIMIT: &str = "Inspect a ZIP snapshot only. Source files and games are unchanged. A private temporary copy is discarded after inspection. Patch structure and package metadata do not establish base-game identity, compatibility or a safe patch order. To create a verified derived copy, select a game and open Mods & Cheats → Available packages.";
 #[derive(Default)]
 pub(super) struct State {
     path: Option<PathBuf>,
@@ -17,7 +17,7 @@ pub(super) struct State {
     report: Option<PatchPackageInspection>,
     error: Option<String>,
 }
-fn inspect(path: &Path) -> Result<PatchPackageInspection, String> {
+pub(super) fn inspect(path: &Path) -> Result<PatchPackageInspection, String> {
     // The general inspector reopens its input. Supply a bounded private copy,
     // so replacement of an external package cannot change the bytes it inspects.
     let file = open_regular_file_nonblocking(path).map_err(|e| e.to_string())?;
