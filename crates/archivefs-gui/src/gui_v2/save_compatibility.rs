@@ -473,6 +473,308 @@ mod tests {
         .remove(0)
     }
 
+    fn rendered_report(report: &SaveMigrationReadiness) -> String {
+        fn collect(shape: &egui::epaint::Shape, text: &mut String) {
+            match shape {
+                egui::epaint::Shape::Text(shape) => {
+                    text.push_str(shape.galley.text());
+                    text.push('\n');
+                }
+                egui::epaint::Shape::Vec(shapes) => {
+                    for shape in shapes {
+                        collect(shape, text);
+                    }
+                }
+                _ => {}
+            }
+        }
+        let context = egui::Context::default();
+        let output = context.run(Default::default(), |ctx| {
+            egui::CentralPanel::default().show(ctx, |ui| draw_report(ui, report));
+        });
+        let mut text = String::new();
+        for shape in output.shapes {
+            collect(&shape.shape, &mut text);
+        }
+        text
+    }
+
+    #[test]
+    #[cfg(all(target_os = "linux", target_arch = "x86_64", target_env = "gnu"))]
+    fn native_sram_public_capture_refresh_and_blue_preview() {
+        use std::{
+            path::Path,
+            process::Command,
+            time::{Duration, Instant},
+        };
+        const CHILD: &str = "EMUWIZ_SRAM_BLUE_INTEGRATION_CHILD";
+        if std::env::var_os(CHILD).is_some() {
+            let root = std::path::PathBuf::from(std::env::var_os("EMUWIZ_SRAM_BLUE_ROOT").unwrap());
+            let core = root.join("cores/gambatte_libretro.so");
+            let config = root.join("home/.config/retroarch/retroarch.cfg");
+            let saves = root.join("saves");
+            let rom = root.join("game.gb");
+            let other_rom = root.join("other.gb");
+            let exe = root.join("bin/retroarch");
+            let profile = archivefs_core::emulator_environment::retroarch::ProfileRef {
+                profile_kind: archivefs_core::emulator_environment::retroarch::ProfileKind::Native,
+                scope: archivefs_core::emulator_environment::retroarch::ProfileScope::User,
+            };
+            let environment = archivefs_core::emulator_environment::retroarch::DiscoveryEnvironment::from_process_environment();
+            let discovery =
+                archivefs_core::emulator_environment::retroarch::discover_retroarch_environment(
+                    &archivefs_core::emulator_environment::HostReadOnlyFilesystem,
+                    &environment,
+                )
+                .unwrap();
+            let native = discovery
+                .profiles
+                .iter()
+                .find(|p| p.profile_kind == profile.profile_kind && p.scope == profile.scope)
+                .unwrap();
+            assert!(
+                native.paths.iter().any(|p| p.purpose
+                    == archivefs_core::emulator_environment::retroarch::PathPurpose::Saves
+                    && p.resolved_path.is_some()),
+                "config: {:?}, paths: {:?}",
+                native.config_file,
+                native.paths
+            );
+            let launch = |content: &Path, name: &str| {
+                let save = saves.join(name);
+                let command = archivefs_core::launch::RetroArchCommand {
+                    saturn_core_selection: None,
+                    snapshot_evidence: None,
+                    executable: exe.clone(),
+                    arguments: vec![
+                        core.clone().into_os_string(),
+                        content.as_os_str().to_os_string(),
+                        save.as_os_str().to_os_string(),
+                        config.clone().into_os_string(),
+                        "normal".into(),
+                    ],
+                    working_directory: None,
+                    selection: archivefs_core::launch::RetroArchCommandSelection {
+                        profile,
+                        core_stem: "gambatte".into(),
+                        platform_id: "Game Boy".into(),
+                        core_library: core.clone(),
+                        content_path: content.to_path_buf(),
+                    },
+                };
+                let mut process = archivefs_core::launch::execution::spawn_retroarch(command)
+                    .expect("public native SRAM launch");
+                let deadline = Instant::now() + Duration::from_secs(5);
+                loop {
+                    if let Some(exit) = process.poll() {
+                        assert!(exit.status.as_ref().unwrap().success(), "{:?}", exit.stderr);
+                        break;
+                    }
+                    assert!(Instant::now() < deadline, "fixture host did not finish");
+                    std::thread::sleep(Duration::from_millis(10));
+                }
+                save
+            };
+            let first = launch(&rom, "first.srm");
+            let second = launch(&rom, "second.srm");
+            let roots = [PersistentStateRoot::configured(
+                StateEmulator::RetroArch,
+                &saves,
+                Some(PersistentStateType::NativeSave),
+            )];
+            let inventory = archivefs_core::sram_provenance::inventory_with_sram_origins(&roots);
+            let source = inventory.records.iter().find(|r| r.path == first).unwrap();
+            let target = inventory.records.iter().find(|r| r.path == second).unwrap();
+            let source_origin = source.sram_origin.as_ref().unwrap_or_else(|| {
+                panic!(
+                    "first origin absent: {:?}; records: {:?}",
+                    inventory.warnings, inventory.records
+                )
+            });
+            let target_origin = target.sram_origin.as_ref().unwrap_or_else(|| {
+                panic!(
+                    "second origin absent: {:?}; records: {:?}",
+                    inventory.warnings, inventory.records
+                )
+            });
+            assert_eq!(
+                source_origin.state,
+                archivefs_core::sram_provenance::OriginState::Associated
+            );
+            assert_eq!(
+                target_origin.state,
+                archivefs_core::sram_provenance::OriginState::Associated
+            );
+            assert_ne!(source_origin.session, target_origin.session);
+            let mut game = game();
+            game.archive.absolute_path = rom.clone();
+            game.archive.identity_report = Some(
+                archivefs_core::game_identity::inspect_catalogued_game_identity(
+                    &rom,
+                    Some("Game Boy"),
+                ),
+            );
+            game.platform = "Game Boy".into();
+            let before = (
+                std::fs::read(&first).unwrap(),
+                std::fs::read(&second).unwrap(),
+            );
+            let report = compare(source, target, &game);
+            assert_eq!(
+                report.outcome,
+                SaveMigrationOutcome::DirectlyCompatible,
+                "{:?}",
+                report.reasons
+            );
+            assert_eq!(
+                report.target_environment.profile.as_deref(),
+                Some("Native/User")
+            );
+            assert!(report.read_only);
+            assert!(!report.automatic_migration_available);
+            assert!(!report.restore.existing_restore_apply_ready);
+            let preview = rendered_report(&report);
+            assert!(
+                preview.contains("Observed save formats are directly compatible"),
+                "{preview}"
+            );
+            assert!(preview.contains("Target profile: Native/User"), "{preview}");
+            assert!(
+                preview.contains("No migration writer or converter is enabled here"),
+                "{preview}"
+            );
+            assert_eq!(
+                before,
+                (
+                    std::fs::read(&first).unwrap(),
+                    std::fs::read(&second).unwrap()
+                )
+            );
+            let same = compare(source, source, &game);
+            assert!(
+                same.reasons
+                    .contains(&SaveMigrationReason::SameSaveLocation)
+            );
+
+            let wrong = launch(&other_rom, "wrong.srm");
+            let latest = archivefs_core::sram_provenance::inventory_with_sram_origins(&roots);
+            let other = latest.records.iter().find(|r| r.path == wrong).unwrap();
+            let wrong_report = compare(source, other, &game);
+            assert_eq!(
+                wrong_report.outcome,
+                SaveMigrationOutcome::KnownIncompatible
+            );
+            assert!(
+                wrong_report
+                    .reasons
+                    .contains(&SaveMigrationReason::WrongGame)
+            );
+
+            let receipt_root = root.join("app-data/snapshots/sram-origins-v1");
+            let forged = receipt_root.join("forged.json");
+            std::fs::write(&forged, b"{}").unwrap();
+            let untrusted = archivefs_core::sram_provenance::inventory_with_sram_origins(&roots);
+            assert!(untrusted.records.iter().all(|r| r.sram_origin.is_none()));
+            assert_ne!(
+                compare(source, target, &game).outcome,
+                SaveMigrationOutcome::DirectlyCompatible
+            );
+            std::fs::remove_file(forged).unwrap();
+
+            std::fs::write(&second, [2u8; 8192]).unwrap();
+            let stale = compare(source, target, &game);
+            assert_ne!(stale.outcome, SaveMigrationOutcome::DirectlyCompatible);
+            assert!(
+                stale
+                    .reasons
+                    .contains(&SaveMigrationReason::TargetEvidenceMissingOrChanged)
+            );
+            return;
+        }
+
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path();
+        for relative in [
+            "bin",
+            "cores",
+            "saves",
+            "home/.config/retroarch",
+            "app-data",
+            "tmp",
+            "xdg-data",
+            "xdg-data-dirs",
+        ] {
+            std::fs::create_dir_all(root.join(relative)).unwrap();
+        }
+        let source = Path::new(env!("CARGO_MANIFEST_DIR")).join("src/gui_v2/fixtures/sram_host.c");
+        let core_source = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../archivefs-core/src/sram_provenance/test_core.c");
+        assert!(
+            Command::new("cc")
+                .args(["-o"])
+                .arg(root.join("bin/retroarch"))
+                .arg(source)
+                .args(["-ldl"])
+                .status()
+                .unwrap()
+                .success()
+        );
+        assert!(
+            Command::new("cc")
+                .args(["-shared", "-fPIC", "-o"])
+                .arg(root.join("cores/gambatte_libretro.so"))
+                .arg(core_source)
+                .status()
+                .unwrap()
+                .success()
+        );
+        let mut rom = vec![0u8; 0x8000];
+        const LOGO: [u8; 48] = [
+            0xCE, 0xED, 0x66, 0x66, 0xCC, 0x0D, 0x00, 0x0B, 0x03, 0x73, 0x00, 0x83, 0x00, 0x0C,
+            0x00, 0x0D, 0x00, 0x08, 0x11, 0x1F, 0x88, 0x89, 0x00, 0x0E, 0xDC, 0xCC, 0x6E, 0xE6,
+            0xDD, 0xDD, 0xD9, 0x99, 0xBB, 0xBB, 0x67, 0x63, 0x6E, 0x0E, 0xEC, 0xCC, 0xDD, 0xDC,
+            0x99, 0x9F, 0xBB, 0xB9, 0x33, 0x3E,
+        ];
+        rom[0x104..0x134].copy_from_slice(&LOGO);
+        rom[0x147] = 0x03;
+        rom[0x149] = 0x03;
+        rom[0x14d] = archivefs_core::gb_header_evidence::compute_header_checksum(&rom).unwrap();
+        std::fs::write(root.join("game.gb"), &rom).unwrap();
+        rom[0x200] = 1;
+        std::fs::write(root.join("other.gb"), &rom).unwrap();
+        std::fs::write(root.join("home/.config/retroarch/retroarch.cfg"), format!(
+            "libretro_directory = \"{}\"\nlibretro_info_path = \"{}\"\nsavefile_directory = \"{}\"\n",
+            root.join("cores").display(), root.join("cores").display(), root.join("saves").display(),
+        )).unwrap();
+        std::fs::write(
+            root.join("cores/gambatte_libretro.info"),
+            b"display_name = \"Gambatte\"\nsupported_extensions = \"gb|gbc\"\n",
+        )
+        .unwrap();
+        let output = Command::new(std::env::current_exe().unwrap())
+            .args(["--exact", "gui_v2::save_compatibility::tests::native_sram_public_capture_refresh_and_blue_preview", "--nocapture"])
+            .env_clear()
+            .env(CHILD, "1")
+            .env("EMUWIZ_SRAM_BLUE_ROOT", root)
+            .env("HOME", root.join("home"))
+            .env("PATH", root.join("bin"))
+            .env("XDG_CONFIG_HOME", root.join("home/.config"))
+            .env("XDG_DATA_HOME", root.join("xdg-data"))
+            .env("XDG_DATA_DIRS", root.join("xdg-data-dirs"))
+            .env("EMUWIZ_DATA_HOME", root.join("app-data"))
+            .env("TMPDIR", root.join("tmp"))
+            // The child already has only disposable roots. The ordinary test
+            // constructor would replace them before the fixture can run.
+            .env("EMUWIZ_TEST_REAL_ENVIRONMENT", "1")
+            .output().unwrap();
+        assert!(
+            output.status.success(),
+            "stdout: {}\nstderr: {}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+
     fn witnessed_record(
         path: &std::path::Path,
         game: &Game,
@@ -584,28 +886,7 @@ mod tests {
         assert!(report.read_only);
         assert!(!report.automatic_migration_available);
         assert!(!report.restore.existing_restore_apply_ready);
-        fn collect(shape: &egui::epaint::Shape, text: &mut String) {
-            match shape {
-                egui::epaint::Shape::Text(shape) => {
-                    text.push_str(shape.galley.text());
-                    text.push('\n');
-                }
-                egui::epaint::Shape::Vec(shapes) => {
-                    for shape in shapes {
-                        collect(shape, text);
-                    }
-                }
-                _ => {}
-            }
-        }
-        let context = egui::Context::default();
-        let output = context.run(Default::default(), |ctx| {
-            egui::CentralPanel::default().show(ctx, |ui| draw_report(ui, &report));
-        });
-        let mut text = String::new();
-        for shape in output.shapes {
-            collect(&shape.shape, &mut text);
-        }
+        let text = rendered_report(&report);
         assert!(
             text.contains("Observed save formats are directly compatible"),
             "{text}"
