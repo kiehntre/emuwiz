@@ -233,11 +233,12 @@ fn manual_viewer_reads_cbr_pages_inside_the_app_at_1024_by_600() {
     app.manual_viewer
         .open(&context, path.clone(), "Strategy guide".into(), Some(saved));
     let deadline = Instant::now() + Duration::from_secs(10);
-    let strings = loop {
-        let strings = text(&frame(&context, &mut app, SIZE));
+    let (strings, output) = loop {
+        let output = frame(&context, &mut app, SIZE);
+        let strings = text(&output);
         // Natural order: page1, page2, page10 -> resumed page 2 is "page2.png".
         if strings.iter().any(|s| s == "Page 2 of 3") && strings.iter().any(|s| s == "page2.png") {
-            break strings;
+            break (strings, output);
         }
         assert!(
             Instant::now() < deadline,
@@ -255,6 +256,17 @@ fn manual_viewer_reads_cbr_pages_inside_the_app_at_1024_by_600() {
         "150%",
     ] {
         assert!(strings.iter().any(|s| s == label), "missing {label}");
+    }
+    for label in ["Previous", "Next", "Zoom −", "Zoom +", "Close"] {
+        let position = text_pos(&output, label).expect("viewer control is laid out");
+        assert!(
+            position.x >= 0.0 && position.x < SIZE[0],
+            "{label} is outside the 1024 px width"
+        );
+        assert!(
+            position.y >= 0.0 && position.y < SIZE[1],
+            "{label} is outside the 600 px height"
+        );
     }
     assert!(
         !strings.iter().any(|s| s.contains("cannot show")),
@@ -305,4 +317,38 @@ fn selected_game_details_show_existing_guides_and_refresh_after_provider_index_c
         documents::GameDocumentAssociation::SameGameDirectory
     );
     assert_eq!(app.router.current, Route::Game(9));
+}
+
+#[test]
+fn selected_game_details_refreshes_a_removed_document_at_1024_by_600() {
+    let context = egui::Context::default();
+    let mut app = fixture(&context);
+    let root = tempfile::tempdir().unwrap();
+    let path = root.path().join("Rez.cbz");
+    cbz(&path);
+    let mut game = archive(9, "Rez", Some("Dreamcast"));
+    game.absolute_path = root.path().join("Rez.iso");
+    app.library = Arc::new(Library::new(vec![game]));
+    app.router.current = Route::Game(9);
+    app.document_preferences
+        .associations
+        .insert(path.clone(), 9);
+    frame(&context, &mut app, [1024.0, 600.0]);
+    assert!(
+        app.document_cache.as_ref().unwrap().2[0]
+            .document_id
+            .is_some()
+    );
+    fs::remove_file(&path).unwrap();
+    frame(&context, &mut app, [1024.0, 600.0]);
+    let document = &app.document_cache.as_ref().unwrap().2[0];
+    assert_eq!(
+        document.viewer,
+        documents::DocumentOpenCapability::MissingFile
+    );
+    assert!(document.document_id.is_none());
+    assert_eq!(
+        document.association,
+        documents::GameDocumentAssociation::Explicit
+    );
 }

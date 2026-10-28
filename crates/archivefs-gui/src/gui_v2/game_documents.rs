@@ -73,7 +73,16 @@ impl App {
             (None, None) => false,
             _ => true,
         };
+        let cached_source_changed = self.document_cache.as_ref().is_some_and(|(_, _, docs)| {
+            docs.iter().any(|document| {
+                document
+                    .document_id
+                    .as_ref()
+                    .is_some_and(|id| id.check_path().is_err())
+            })
+        });
         if provider_changed
+            || cached_source_changed
             || self
                 .document_cache
                 .as_ref()
@@ -142,7 +151,7 @@ impl App {
                 ui.weak(if document.format == super::documents::GameDocumentFormat::Text {
                     if document.document_id.is_some() { "Plain text · Read inside EmuWiz." } else { "Plain text · EmuWiz cannot show this file." }
                 } else {
-                    super::manual_viewer::capability_text(document.readiness)
+                    super::manual_viewer::capability_text(document.format, document.readiness)
                 });
                 if let Some(reason) = &document.refusal_reason { ui.label(reason); }
                 ui.horizontal_wrapped(|ui| {

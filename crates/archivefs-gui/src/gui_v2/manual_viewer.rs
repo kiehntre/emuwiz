@@ -14,20 +14,28 @@ use std::{
     sync::{Arc, Condvar, Mutex},
 };
 
-pub(super) fn capability_text(readiness: Option<ManualReadiness>) -> &'static str {
-    match readiness {
-        Some(ManualReadiness::Viewable) => "Comic archive (CBZ/CBR) · Read pages inside EmuWiz.",
-        Some(ManualReadiness::InspectOnly { .. }) => {
+pub(super) fn capability_text(
+    format: super::documents::GameDocumentFormat,
+    readiness: Option<ManualReadiness>,
+) -> &'static str {
+    match (format, readiness) {
+        (super::documents::GameDocumentFormat::Cbz, Some(ManualReadiness::Viewable)) => {
+            "CBZ · Read pages inside EmuWiz."
+        }
+        (super::documents::GameDocumentFormat::Cbr, Some(ManualReadiness::Viewable)) => {
+            "CBR · Read pages inside EmuWiz. External opening is unavailable."
+        }
+        (super::documents::GameDocumentFormat::Pdf, Some(ManualReadiness::InspectOnly { .. })) => {
             if pdf_render::available() {
                 "PDF · Read pages inside EmuWiz. Open externally if a page cannot be rendered."
             } else {
                 "PDF · Internal rendering is unavailable on this platform. Open externally."
             }
         }
-        Some(ManualReadiness::Unsupported { .. }) => {
+        (_, Some(ManualReadiness::Unsupported { .. })) => {
             "Recognised, but EmuWiz cannot read this document's pages internally."
         }
-        None => "Internal reading is unavailable: the document could not be safely inspected.",
+        _ => "Internal reading is unavailable: the document could not be safely inspected.",
     }
 }
 
@@ -331,7 +339,23 @@ impl ManualViewer {
                     },
                 );
                 if !internal_supported(Some(inspection.readiness)) {
-                    session.error = Some(capability_text(Some(inspection.readiness)).into());
+                    session.error = Some(
+                        capability_text(
+                            match inspection.kind {
+                                ManualDocumentKind::Pdf => {
+                                    super::documents::GameDocumentFormat::Pdf
+                                }
+                                ManualDocumentKind::Cbz => {
+                                    super::documents::GameDocumentFormat::Cbz
+                                }
+                                ManualDocumentKind::Cbr => {
+                                    super::documents::GameDocumentFormat::Cbr
+                                }
+                            },
+                            Some(inspection.readiness),
+                        )
+                        .into(),
+                    );
                     return;
                 }
                 session
