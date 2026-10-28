@@ -151,6 +151,22 @@ fn compare(
     target: &PersistentStateRecord,
     game: &Game,
 ) -> SaveMigrationReadiness {
+    compare_with_refresh(
+        source,
+        target,
+        game,
+        archivefs_core::sram_provenance::inventory_with_sram_origins,
+    )
+}
+
+fn compare_with_refresh(
+    source: &PersistentStateRecord,
+    target: &PersistentStateRecord,
+    game: &Game,
+    refresh: impl FnOnce(
+        &[archivefs_core::persistent_state_inventory::PersistentStateRoot],
+    ) -> archivefs_core::persistent_state_inventory::PersistentStateInventory,
+) -> SaveMigrationReadiness {
     let mut source = source.clone();
     let mut target = target.clone();
     // The existing provenance provider revalidates seals, cartridge/core/config
@@ -167,7 +183,7 @@ fn compare(
         })
         .collect();
     if !roots.is_empty() {
-        let refreshed = archivefs_core::sram_provenance::inventory_with_sram_origins(&roots);
+        let refreshed = refresh(&roots);
         for record in [&mut source, &mut target] {
             if record.sram_origin.is_some() {
                 let current = refreshed
@@ -438,6 +454,160 @@ mod tests {
         )])
         .records
         .remove(0)
+    }
+
+    fn witnessed_record(
+        path: &std::path::Path,
+        game: &Game,
+        session: &str,
+        cartridge_digest: &str,
+    ) -> PersistentStateRecord {
+        use archivefs_core::sram_provenance::{
+            Context, DirectoryIdentity, Object, OriginState, Scope, SramOrigin, Stamp,
+        };
+        let mut record = record(path);
+        let stamp = Stamp {
+            device: 0,
+            inode: 0,
+            size: record.size_bytes,
+            modified: 0,
+            modified_ns: 0,
+            changed: 0,
+            changed_ns: 0,
+            links: 1,
+            mode: 0o100600,
+            uid: 0,
+        };
+        let artifact = Object {
+            path: path.to_path_buf(),
+            stamp: stamp.clone(),
+            sha256: record.sha256.clone().unwrap(),
+        };
+        let cartridge = Object {
+            path: game.archive.absolute_path.clone(),
+            stamp,
+            sha256: cartridge_digest.into(),
+        };
+        let cartridge_identity = IdentityEvidence {
+            kind: IdentityKind::LooseRomSha256,
+            status: IdentityStatus::Verified,
+            value: Some(cartridge.sha256.clone()),
+            confidence: IdentityConfidence::StructuredMetadata,
+            provenance: IdentityProvenance {
+                archive_path: cartridge.path.clone(),
+                member_path: None,
+                member_index: None,
+                method: "isolated witness fixture".into(),
+            },
+            diagnostic: "isolated witness fixture".into(),
+        };
+        record.sram_origin = Some(SramOrigin {
+            state: OriginState::Associated,
+            session: session.into(),
+            artifact: artifact.clone(),
+            explanation: "isolated refreshed witness".into(),
+            context: Context {
+                cartridge,
+                cartridge_identity,
+                executable: artifact.clone(),
+                core: artifact.clone(),
+                scope: Scope {
+                    configuration: artifact.clone(),
+                    selected_executable: artifact.path.clone(),
+                    selected_core: artifact.path.clone(),
+                    saves: path.parent().unwrap().into(),
+                    saves_identity: DirectoryIdentity {
+                        device: 0,
+                        inode: 0,
+                    },
+                    profile: session.into(),
+                },
+            },
+        });
+        record.slot_profile_account = Some(session.into());
+        record
+    }
+
+    #[test]
+    fn refreshed_cross_profile_sram_reports_compatibility_and_refuses_stale_or_wrong_game() {
+        let dir = tempfile::tempdir().unwrap();
+        let game = game();
+        let source_dir = dir.path().join("source-profile");
+        let target_dir = dir.path().join("target-profile");
+        std::fs::create_dir_all(&source_dir).unwrap();
+        std::fs::create_dir_all(&target_dir).unwrap();
+        let source = witnessed_record(
+            &source_dir.join("source.srm"),
+            &game,
+            "source",
+            &"a".repeat(64),
+        );
+        let target = witnessed_record(
+            &target_dir.join("target.srm"),
+            &game,
+            "target",
+            &"a".repeat(64),
+        );
+        let refreshed = |source: &PersistentStateRecord, target: &PersistentStateRecord| {
+            let mut inventory = inventory_persistent_state(&[]);
+            inventory.records = vec![source.clone(), target.clone()];
+            inventory
+        };
+        let report = compare_with_refresh(&source, &target, &game, |_| refreshed(&source, &target));
+        assert_eq!(report.outcome, SaveMigrationOutcome::DirectlyCompatible);
+        assert_eq!(report.target_environment.profile.as_deref(), Some("target"));
+        assert_eq!(
+            report.target_environment.core,
+            Some(target.path.display().to_string())
+        );
+        assert_eq!(report.source_path.as_deref(), Some(source.path.as_path()));
+        assert!(report.read_only);
+        assert!(!report.automatic_migration_available);
+        assert!(!report.restore.existing_restore_apply_ready);
+
+        let wrong = witnessed_record(
+            &target_dir.join("wrong.srm"),
+            &game,
+            "wrong",
+            &"b".repeat(64),
+        );
+        let report = compare_with_refresh(&source, &wrong, &game, |_| refreshed(&source, &wrong));
+        assert_eq!(report.outcome, SaveMigrationOutcome::KnownIncompatible);
+        assert!(report.reasons.contains(&SaveMigrationReason::WrongGame));
+
+        let mut rejected_refresh = source.clone();
+        rejected_refresh.sram_origin = None;
+        let report = compare_with_refresh(&source, &target, &game, |_| {
+            refreshed(&rejected_refresh, &target)
+        });
+        assert_ne!(report.outcome, SaveMigrationOutcome::DirectlyCompatible);
+        assert!(
+            report
+                .reasons
+                .contains(&SaveMigrationReason::UnsupportedFormat)
+        );
+
+        std::fs::write(&source.path, [3u8; 16]).unwrap();
+        let report = compare_with_refresh(&source, &target, &game, |_| refreshed(&source, &target));
+        assert_ne!(report.outcome, SaveMigrationOutcome::DirectlyCompatible);
+        assert!(
+            report
+                .reasons
+                .contains(&SaveMigrationReason::SourceEvidenceStale)
+        );
+        std::fs::write(&source.path, [1u8; 16]).unwrap();
+
+        std::fs::write(&target.path, [2u8; 16]).unwrap();
+        let report = compare_with_refresh(&source, &target, &game, |_| refreshed(&source, &target));
+        assert_ne!(report.outcome, SaveMigrationOutcome::DirectlyCompatible);
+        assert!(
+            report
+                .reasons
+                .contains(&SaveMigrationReason::TargetEvidenceMissingOrChanged)
+        );
+        assert_eq!(std::fs::read(&source.path).unwrap(), [1u8; 16]);
+        assert_eq!(std::fs::read(&target.path).unwrap(), [2u8; 16]);
+        assert_eq!(std::fs::read(&wrong.path).unwrap(), [1u8; 16]);
     }
 
     #[test]
