@@ -53,6 +53,31 @@ fn readiness_reports_native_preflight_and_storage_distinctly() {
 }
 
 #[test]
+fn loose_split_directories_do_not_require_absent_search_alternatives() {
+    let (lab, environment, executable) = setup();
+    for set in ["bios", "parent", "clone"] {
+        std::fs::remove_file(lab.root().join(format!("{set}.zip"))).unwrap();
+        std::fs::create_dir(lab.root().join(set)).unwrap();
+    }
+    std::fs::write(lab.root().join("bios/sys.rom"), BIOS).unwrap();
+    std::fs::write(lab.root().join("parent/p.rom"), PARENT).unwrap();
+    std::fs::write(lab.root().join("clone/c.rom"), CLONE).unwrap();
+
+    let report = playing::inspect(&lab.inputs("clone"), &environment).unwrap();
+    assert_eq!(
+        playing::readiness(&report, "clone", Some(executable.clone())).0,
+        playing::Readiness::Ready,
+        "absent resolver alternatives are not missing source files"
+    );
+    std::fs::write(lab.root().join("parent/c.rom"), CLONE).unwrap();
+    assert_eq!(
+        playing::readiness(&report, "clone", Some(executable)).0,
+        playing::Readiness::IncompleteEvidence,
+        "creating an alternative must invalidate the inspected directory stamp"
+    );
+}
+
+#[test]
 fn displayed_ready_status_rejects_changed_catalogue_or_support_container() {
     for changed in ["catalogue", "bios"] {
         let (lab, environment, executable) = setup();

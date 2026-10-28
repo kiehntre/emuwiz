@@ -125,7 +125,12 @@ pub(super) fn inspect(
                     for location in &requirement.locations {
                         if let Some(set) = observed.get(location.set_name.as_str()) {
                             relevant_paths.insert(set.location.clone());
-                            if set.directory {
+                            if set.directory
+                                && set
+                                    .members
+                                    .iter()
+                                    .any(|member| member.name == location.member_name)
+                            {
                                 relevant_paths.insert(set.location.join(&location.member_name));
                             }
                         }
