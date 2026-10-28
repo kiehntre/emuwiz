@@ -70,6 +70,13 @@ pub(super) fn fixture(context: &egui::Context) -> App {
         artwork_job: None,
         index_job: None,
         browse_play: Default::default(),
+        batch_selection: super::multi_selection::MultiSelection::with_limit(
+            archivefs_core::screenscraper_enrichment::MAX_EXPLICIT_BATCH_SIZE,
+        ),
+        batch_state: Default::default(),
+        batch_open: false,
+        batch_selecting: false,
+        batch_message: None,
         preferences_dirty: None,
         preferences_restored: true,
         interacted: false,
@@ -251,6 +258,29 @@ fn gui_v2_browse_play_empty_state_is_safe_and_points_to_sources() {
     );
     assert!(strings.iter().any(|value| value.contains("Open Sources")));
     assert_eq!(app.router.current, Route::BrowsePlay);
+}
+
+#[test]
+fn blue_batch_selection_controls_fit_small_library_viewport() {
+    let context = egui::Context::default();
+    let mut app = fixture(&context);
+    app.library = Arc::new(Library::new(vec![archive(1, "Mario", Some("SNES"))]));
+    app.router.current = Route::BrowsePlay;
+    app.batch_selecting = true;
+    app.batch_selection.toggle(1).unwrap();
+    let output = frame(&context, &mut app, [1024.0, 600.0]);
+    let strings = text(&output);
+    for expected in [
+        "Done selecting",
+        "1 / 25 selected",
+        "Enrich metadata",
+        "Clear selection",
+    ] {
+        assert!(
+            strings.iter().any(|value| value == expected),
+            "missing {expected}"
+        );
+    }
 }
 
 #[test]

@@ -17,7 +17,7 @@ use archivefs_core::screenscraper_enrichment::{
     ScreenScraperBatchLookupRoute, ScreenScraperEnrichmentReceipt, batch_lookup_route,
     validate_explicit_batch_size,
 };
-use archivefs_core::{ArchiveRecord, PersistedArchive};
+use archivefs_core::{ArchiveMetadata, ArchiveRecord, PersistedArchive};
 use eframe::egui;
 
 use crate::database_load::CachedLibrarySnapshot;
@@ -60,7 +60,11 @@ impl BatchItemState {
 struct BatchItem {
     archive_id: i64,
     path: PathBuf,
-    record: ArchiveRecord,
+    metadata: ArchiveMetadata,
+    title: String,
+    expected: Option<PersistedArchive>,
+    prior_receipt: Option<ScreenScraperEnrichmentReceipt>,
+    prior_values: Option<AcceptedScreenScraperMetadata>,
     provider_record_id: Option<String>,
 }
 
@@ -136,7 +140,11 @@ impl ScreenScraperBatchState {
             items.push(BatchItem {
                 archive_id: persisted.id,
                 path,
-                record,
+                metadata: record.metadata,
+                title: record.identity.display_name,
+                expected: None,
+                prior_receipt: None,
+                prior_values: None,
                 provider_record_id,
             });
         }
@@ -157,6 +165,98 @@ impl ScreenScraperBatchState {
         Ok(())
     }
 
+    pub(crate) fn prepare_blue(
+        &mut self,
+        games: Vec<(
+            PersistedArchive,
+            Option<archivefs_core::screenscraper_enrichment::PersistedScreenScraperEnrichment>,
+        )>,
+    ) -> Result<(), String> {
+        validate_explicit_batch_size(games.len())?;
+        let items = games
+            .into_iter()
+            .map(|(archive, existing)| {
+                let prior_values = existing.as_ref().map(|item| item.values.clone());
+                let prior_receipt = existing.as_ref().map(|item| item.receipt.clone());
+                let mut metadata = ArchiveMetadata {
+                    title: Some(archive.display_name.clone()),
+                    region: None,
+                    ..ArchiveMetadata::empty()
+                };
+                if let Some(saved) = &existing {
+                    saved.values.apply_to(&mut metadata);
+                }
+                BatchItem {
+                    archive_id: archive.id,
+                    path: archive.absolute_path.clone(),
+                    title: archive.display_name.clone(),
+                    metadata,
+                    provider_record_id: existing
+                        .as_ref()
+                        .map(|item| item.receipt.provider_record_id.clone()),
+                    prior_receipt,
+                    prior_values,
+                    expected: Some(archive),
+                }
+            })
+            .collect::<Vec<_>>();
+        self.session = Some(BatchSession {
+            states: vec![BatchItemState::Pending; items.len()],
+            items,
+            current: 0,
+            started: false,
+            cancelled: false,
+            reply: None,
+            candidate: None,
+            candidate_options: Vec::new(),
+            choices: [false; 9],
+            quota: None,
+            requests_used: 0,
+            message: None,
+        });
+        Ok(())
+    }
+
+    pub(crate) fn current_blue_write(
+        &self,
+        archive_id: i64,
+    ) -> Option<(
+        PersistedArchive,
+        Option<AcceptedScreenScraperMetadata>,
+        Option<ScreenScraperEnrichmentReceipt>,
+    )> {
+        let session = self.session.as_ref()?;
+        let item = session.items.get(session.current)?;
+        if item.archive_id != archive_id {
+            return None;
+        }
+        Some((
+            item.expected.clone()?,
+            item.prior_values.clone(),
+            item.prior_receipt.clone(),
+        ))
+    }
+
+    pub(crate) fn mark_apply_failed(&mut self, archive_id: i64, message: String) {
+        if let Some(session) = self.session.as_mut() {
+            if session
+                .items
+                .get(session.current)
+                .is_some_and(|item| item.archive_id == archive_id)
+            {
+                session.states[session.current] = BatchItemState::ApplyFailed;
+                session.message = Some(message);
+                session.candidate = None;
+                session.candidate_options.clear();
+                session.reply = None;
+            }
+        }
+    }
+
+    pub(crate) fn active(&self) -> bool {
+        self.session.is_some()
+    }
+
     fn begin_current(session: &mut BatchSession, credentials: ScreenScraperCredentials) {
         let Some(item) = session.items.get(session.current) else {
             return;
@@ -165,12 +265,11 @@ impl ScreenScraperBatchState {
             return;
         }
         let title = item
-            .record
             .metadata
             .title
             .clone()
-            .or_else(|| Some(item.record.identity.display_name.clone()));
-        let region = item.record.metadata.region.clone();
+            .or_else(|| Some(item.title.clone()));
+        let region = item.metadata.region.clone();
         let rom_name = item
             .path
             .file_name()
@@ -222,7 +321,7 @@ impl ScreenScraperBatchState {
                     let candidate = candidates.into_iter().next().expect("length checked");
                     session.choices = single::default_choices(
                         &candidate,
-                        &session.items[session.current].record.metadata,
+                        &session.items[session.current].metadata,
                     );
                     session.candidate = Some(candidate);
                     session.states[session.current] = BatchItemState::CandidateReviewRequired;
@@ -289,6 +388,7 @@ pub(crate) fn show(
     selected: &std::collections::HashSet<PathBuf>,
 ) -> Option<crate::screenscraper_enrichment_page::ScreenScraperEnrichmentAction> {
     let mut action = None;
+    let mut close_session = false;
     widgets::card(ui, |ui| {
         widgets::section_header(
             ui,
@@ -393,7 +493,18 @@ pub(crate) fn show(
                 total - direct
             ));
             ui.weak("Provider status: credentials available; quota is reported and updated by responses.");
-            if ui.button("Start selected enrichment").clicked() {
+            if settings.credentials().is_none() {
+                ui.weak(
+                    "Configure ScreenScraper credentials in Settings › Metadata Providers first.",
+                );
+            }
+            if ui
+                .add_enabled(
+                    settings.credentials().is_some(),
+                    egui::Button::new("Start selected enrichment"),
+                )
+                .clicked()
+            {
                 session.started = true;
             }
             if ui.button("Cancel batch").clicked() {
@@ -410,12 +521,12 @@ pub(crate) fn show(
                 widgets::StatusTone::Success,
             );
             if ui.button("Close batch").clicked() {
-                state.session = None;
+                close_session = true;
             }
         } else if session.cancelled {
             ui.label("Batch cancelled. Completed games remain committed; remaining games were untouched.");
             if ui.button("Close batch").clicked() {
-                state.session = None;
+                close_session = true;
             }
         } else {
             let current = session.current;
@@ -431,7 +542,25 @@ pub(crate) fn show(
                 && session.states[current] == BatchItemState::Pending
                 && let Some(credentials) = settings.credentials()
             {
-                ScreenScraperBatchState::begin_current(session, credentials);
+                let current_identity = item
+                    .expected
+                    .as_ref()
+                    .map(|expected| {
+                        archivefs_core::default_database_path()
+                            .and_then(|path| archivefs_core::Database::open_read_only(&path))
+                            .and_then(|db| db.screenscraper_batch_game_is_current(expected))
+                            .unwrap_or(false)
+                    })
+                    .unwrap_or(true);
+                if current_identity {
+                    ScreenScraperBatchState::begin_current(session, credentials);
+                } else {
+                    session.states[current] = BatchItemState::Skipped;
+                    session.message = Some(
+                        "This saved game was removed or changed. No lookup or write was made."
+                            .into(),
+                    );
+                }
             }
             if !session.candidate_options.is_empty() {
                 ui.label("Multiple metadata candidates require review. Choose one; none is accepted automatically.");
@@ -451,7 +580,7 @@ pub(crate) fn show(
                         ))
                         .clicked()
                     {
-                        session.choices = single::default_choices(option, &item.record.metadata);
+                        session.choices = single::default_choices(option, &item.metadata);
                         session.candidate = Some(option.clone());
                         session.candidate_options.clear();
                     }
@@ -464,45 +593,39 @@ pub(crate) fn show(
             } else if let Some(candidate) = session.candidate.clone() {
                 ui.label("Candidate review required. No candidate is accepted automatically.");
                 ui.label(format!("Provider record: {}", candidate.provider_game_id));
-                egui::Grid::new("screenscraper_batch_diff")
-                    .num_columns(4)
-                    .striped(true)
-                    .show(ui, |ui| {
-                        ui.strong("Field");
-                        ui.strong("Existing");
-                        ui.strong("ScreenScraper");
-                        ui.strong("Use");
-                        ui.end_row();
-                        for (index, field) in EnrichmentField::ALL.into_iter().enumerate() {
-                            let provider = single::field_value(&candidate, field);
-                            if provider.is_none() {
-                                continue;
-                            }
-                            ui.label(field.label());
-                            ui.label(
-                                single::existing_value(&item.record.metadata, field)
-                                    .unwrap_or("(empty)"),
-                            );
-                            ui.label(provider.unwrap_or("(empty)"));
-                            ui.checkbox(&mut session.choices[index], "Use");
-                            ui.end_row();
-                        }
+                for (index, field) in EnrichmentField::ALL.into_iter().enumerate() {
+                    let Some(provider) = single::field_value(&candidate, field) else {
+                        continue;
+                    };
+                    ui.group(|ui| {
+                        ui.horizontal_wrapped(|ui| {
+                            ui.strong(field.label());
+                            ui.checkbox(&mut session.choices[index], "Use this field");
+                        });
+                        ui.label(format!(
+                            "Current: {}",
+                            single::existing_value(&item.metadata, field).unwrap_or("(empty)")
+                        ));
+                        ui.label(format!("ScreenScraper: {provider}"));
                     });
+                }
                 ui.horizontal(|ui| {
                     if ui.button("Skip this game").clicked() {
                         session.states[current] = BatchItemState::Skipped;
                         session.candidate = None;
                         ScreenScraperBatchState::advance(session);
                     }
-                    if widgets::action_button(ui, "Apply selected fields", widgets::ActionStyle::Primary, true).clicked() {
-                        let values = single::selected_values(&candidate, &session.choices);
+                    let has_selection = session.choices.iter().any(|choice| *choice);
+                    if widgets::action_button(ui, "Apply selected fields", widgets::ActionStyle::Primary, has_selection).clicked() {
+                        let accepted = single::selected_values(&candidate, &session.choices);
+                        let values = merge_accepted(item.prior_values.as_ref(), &accepted);
                         let receipt = ScreenScraperEnrichmentReceipt {
                             provider: "ScreenScraper".into(),
                             provider_record_id: candidate.provider_game_id.clone(),
                             retrieved_at_unix_seconds: candidate.title.as_ref().map(|field| field.provenance.retrieved_at_unix_seconds).unwrap_or(0),
                             match_basis: candidate.title.as_ref().map(|field| field.provenance.match_basis.clone()).unwrap_or_else(|| "provider result".into()),
-                            before: AcceptedScreenScraperMetadata::from_existing(&item.record.metadata),
-                            accepted: values.clone(),
+                            before: AcceptedScreenScraperMetadata::from_existing(&item.metadata),
+                            accepted,
                             media_reference_count: candidate.media_references.len(),
                         };
                         action = Some(crate::screenscraper_enrichment_page::ScreenScraperEnrichmentAction::Apply { archive_id: item.archive_id, values, receipt });
@@ -540,8 +663,43 @@ pub(crate) fn show(
                 session.cancelled = true;
             }
         }
+        ui.collapsing("Per-game outcomes", |ui| {
+            for (item, status) in session.items.iter().zip(&session.states) {
+                ui.label(format!("{} — {}", item.title, status.label()));
+            }
+        });
     });
+    if close_session {
+        state.session = None;
+    }
     action
+}
+
+fn merge_accepted(
+    prior: Option<&AcceptedScreenScraperMetadata>,
+    accepted: &AcceptedScreenScraperMetadata,
+) -> AcceptedScreenScraperMetadata {
+    let mut metadata = ArchiveMetadata::empty();
+    if let Some(prior) = prior {
+        prior.apply_to(&mut metadata);
+    }
+    accepted.apply_to(&mut metadata);
+    AcceptedScreenScraperMetadata::from_existing(&metadata)
+}
+
+pub(crate) fn show_blue(
+    ui: &mut egui::Ui,
+    state: &mut ScreenScraperBatchState,
+    settings: &ScreenScraperPageState,
+) -> Option<single::ScreenScraperEnrichmentAction> {
+    show(
+        ui,
+        state,
+        settings,
+        &[],
+        None,
+        &std::collections::HashSet::new(),
+    )
 }
 
 #[cfg(test)]
@@ -558,5 +716,21 @@ mod tests {
     fn states_remain_per_game() {
         assert_ne!(BatchItemState::Applied, BatchItemState::QuotaStopped);
         assert_ne!(BatchItemState::Skipped, BatchItemState::NoResult);
+    }
+
+    #[test]
+    fn blue_acceptance_preserves_unselected_saved_fields() {
+        let prior = AcceptedScreenScraperMetadata {
+            synopsis: Some("Earlier description".into()),
+            genre: Some("Adventure".into()),
+            ..Default::default()
+        };
+        let accepted = AcceptedScreenScraperMetadata {
+            genre: Some("Puzzle".into()),
+            ..Default::default()
+        };
+        let merged = merge_accepted(Some(&prior), &accepted);
+        assert_eq!(merged.synopsis.as_deref(), Some("Earlier description"));
+        assert_eq!(merged.genre.as_deref(), Some("Puzzle"));
     }
 }
