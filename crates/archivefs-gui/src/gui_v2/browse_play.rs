@@ -374,7 +374,7 @@ impl App {
                         .ok_or_else(|| "The reviewed game is no longer current.".to_string())
                         .and_then(|(expected, prior_values, prior_receipt)| {
                             archivefs_core::default_database_path()
-                                .and_then(archivefs_core::Database::open_or_create)
+                                .and_then(archivefs_core::Database::open_existing)
                                 .and_then(|mut db| db.apply_screenscraper_enrichment_if_current(&expected, prior_values.as_ref(), prior_receipt.as_ref(), &values, &receipt))
                                 .map_err(|error| error.to_string())
                         });

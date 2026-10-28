@@ -3171,6 +3171,7 @@ fn gui_v2_database_load_is_real_and_read_only() {
                         before: Default::default(),
                         accepted: Default::default(),
                         media_reference_count: 0,
+                        retained_field_sources: Default::default(),
                     },
                 )
                 .unwrap();
@@ -4790,6 +4791,7 @@ fn gui_v2_artwork_metadata_displays_local_romm_and_screenscraper_provenance() {
                 before: Default::default(),
                 accepted: Default::default(),
                 media_reference_count: 0,
+                retained_field_sources: Default::default(),
             },
         },
     );

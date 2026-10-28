@@ -615,18 +615,26 @@ pub(crate) fn show(
                         session.candidate = None;
                         ScreenScraperBatchState::advance(session);
                     }
-                    let has_selection = session.choices.iter().any(|choice| *choice);
+                    let accepted = single::selected_values(&candidate, &session.choices);
+                    let provenance = EnrichmentField::ALL.into_iter()
+                        .find(|field| accepted.has_field(*field))
+                        .and_then(|field| single::field_provenance(&candidate, field));
+                    let has_selection = provenance.is_some();
                     if widgets::action_button(ui, "Apply selected fields", widgets::ActionStyle::Primary, has_selection).clicked() {
-                        let accepted = single::selected_values(&candidate, &session.choices);
                         let values = merge_accepted(item.prior_values.as_ref(), &accepted);
+                        let provenance = provenance.expect("enabled only with an accepted field");
+                        let retained_field_sources = archivefs_core::screenscraper_enrichment::retained_field_sources(
+                            item.prior_values.as_ref(), item.prior_receipt.as_ref(), &accepted,
+                        );
                         let receipt = ScreenScraperEnrichmentReceipt {
                             provider: "ScreenScraper".into(),
                             provider_record_id: candidate.provider_game_id.clone(),
-                            retrieved_at_unix_seconds: candidate.title.as_ref().map(|field| field.provenance.retrieved_at_unix_seconds).unwrap_or(0),
-                            match_basis: candidate.title.as_ref().map(|field| field.provenance.match_basis.clone()).unwrap_or_else(|| "provider result".into()),
+                            retrieved_at_unix_seconds: provenance.retrieved_at_unix_seconds,
+                            match_basis: provenance.match_basis.clone(),
                             before: AcceptedScreenScraperMetadata::from_existing(&item.metadata),
                             accepted,
                             media_reference_count: candidate.media_references.len(),
+                            retained_field_sources,
                         };
                         action = Some(crate::screenscraper_enrichment_page::ScreenScraperEnrichmentAction::Apply { archive_id: item.archive_id, values, receipt });
                     }

@@ -1338,6 +1338,25 @@ impl Database {
         open_or_create_with_migrations(path.as_ref(), MIGRATIONS)
     }
 
+    /// Opens only an existing current-schema catalogue for writes. This
+    /// refuses a missing database without creating a replacement.
+    pub fn open_existing(path: impl AsRef<Path>) -> Result<Self> {
+        let path = path.as_ref();
+        fs::symlink_metadata(path)
+            .map_err(|error| ArchiveFsError::io(path.to_path_buf(), error))?;
+        let _lock =
+            backup_ownership::UpgradeLock::acquire_existing_waiting(path, Duration::from_secs(10))?;
+        if !matches!(
+            classify_existing_database(path, MIGRATIONS)?,
+            ExistingDatabase::Current
+        ) {
+            return Err(ArchiveFsError::Database(
+                "the existing library database is not at the current schema".into(),
+            ));
+        }
+        open_existing_current(path, MIGRATIONS)
+    }
+
     /// Opens the database at [`default_database_path`], creating it (and
     /// its parent directory) if needed.
     pub fn open_or_create_default() -> Result<Self> {
@@ -17266,6 +17285,7 @@ echo "$out"
             before: Default::default(),
             accepted: values.clone(),
             media_reference_count: 1,
+            retained_field_sources: Default::default(),
         };
         database
             .apply_screenscraper_enrichment(archive_id, &values, &receipt)
@@ -17286,6 +17306,9 @@ echo "$out"
         };
         let (root, mut database, archive_id) =
             unknown_archive_database("screenscraper-batch-stale");
+        let missing_database = root.join("missing-library.sqlite3");
+        assert!(Database::open_existing(&missing_database).is_err());
+        assert!(!missing_database.exists());
         let original = database.load_archives().unwrap().remove(0);
         let values = AcceptedScreenScraperMetadata {
             genre: Some("Puzzle".into()),
@@ -17299,6 +17322,7 @@ echo "$out"
             before: Default::default(),
             accepted: values.clone(),
             media_reference_count: 0,
+            retained_field_sources: Default::default(),
         };
         assert!(
             database
