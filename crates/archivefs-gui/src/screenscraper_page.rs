@@ -71,8 +71,11 @@ pub(crate) struct ScreenScraperPageState {
     stored: bool,
     invalid_stored: bool,
     store_available: bool,
+    file_mode: bool,
     storage_message: Option<&'static str>,
     unsaved_edits: bool,
+    storage_request: Option<Receiver<StorageOutcome>>,
+    edit_generation: u64,
 }
 
 impl std::fmt::Debug for ScreenScraperPageState {
@@ -92,6 +95,8 @@ impl std::fmt::Debug for ScreenScraperPageState {
             .field("stored", &self.stored)
             .field("invalid_stored", &self.invalid_stored)
             .field("store_available", &self.store_available)
+            .field("file_mode", &self.file_mode)
+            .field("storage_pending", &self.storage_request.is_some())
             .finish()
     }
 }
@@ -104,24 +109,30 @@ struct QuotaView {
     reset_after_seconds: Option<u64>,
 }
 
+enum StorageOutcome {
+    Loaded(Result<Option<StoredCredentials>, StoreError>),
+    Saved(Result<(), StoreError>, u64),
+    Forgotten(Result<(), StoreError>),
+}
+
 impl Default for ScreenScraperPageState {
     fn default() -> Self {
         #[cfg(test)]
         let store = SecretStore::new(std::path::Path::new("/no-such-secret-tool"));
         #[cfg(not(test))]
         let store = SecretStore::system();
-        Self::load_from_store(&store)
+        let mut state = Self::empty(store.available());
+        state.file_mode = store.uses_restricted_file();
+        if state.store_available {
+            state.begin_load_with(store);
+        }
+        state
     }
 }
 
 impl ScreenScraperPageState {
-    fn load_from_store(store: &SecretStore) -> Self {
-        let loaded = store.load();
-        let stored = matches!(loaded, Ok(Some(_)));
-        let invalid_stored = matches!(loaded, Err(StoreError::InvalidRecord));
-        let store_available = store.available();
-        let record = loaded.ok().flatten();
-        let mut state = Self {
+    fn empty(store_available: bool) -> Self {
+        Self {
             developer_id: String::new(),
             developer_password: String::new(),
             user_id: String::new(),
@@ -132,23 +143,101 @@ impl ScreenScraperPageState {
             last_error: None,
             candidate_count: None,
             request: None,
-            stored,
-            invalid_stored,
+            stored: false,
+            invalid_stored: false,
             store_available,
+            file_mode: false,
             storage_message: None,
             unsaved_edits: false,
-        };
-        if let Some(record) = record {
-            if state.set_loaded(record).is_err() {
-                state.stored = false;
-                state.invalid_stored = true;
-                state.storage_message = Some("Stored credentials are invalid; enter them again.");
-            }
+            storage_request: None,
+            edit_generation: 0,
         }
+    }
+
+    #[cfg(test)]
+    fn load_from_store(store: &SecretStore) -> Self {
+        let mut state = Self::empty(store.available());
+        state.file_mode = store.uses_restricted_file();
+        state.finish_load(store.load());
         state
     }
 
-    fn set_loaded(&mut self, record: StoredCredentials) -> Result<(), ()> {
+    fn begin_load_with(&mut self, store: SecretStore) {
+        if self.storage_request.is_some() {
+            return;
+        }
+        self.store_available = store.available();
+        self.file_mode = store.uses_restricted_file();
+        if !self.store_available {
+            self.storage_message = Some(
+                "Configured credential storage is unavailable. Credentials remain in this session only.",
+            );
+            return;
+        }
+        let (sender, receiver) = mpsc::channel();
+        self.storage_request = Some(receiver);
+        self.storage_message = Some("Checking credential storage…");
+        thread::spawn(move || {
+            let _ = sender.send(StorageOutcome::Loaded(store.load()));
+        });
+    }
+
+    fn finish_load(&mut self, loaded: Result<Option<StoredCredentials>, StoreError>) {
+        match loaded {
+            Ok(Some(record)) => {
+                if self.validate_loaded(&record).is_err() {
+                    self.stored = false;
+                    self.invalid_stored = true;
+                    self.storage_message =
+                        Some("Stored credentials are invalid; replace or forget them.");
+                } else {
+                    self.stored = true;
+                    self.invalid_stored = false;
+                    if self.edit_generation == 0 && !self.has_entered_credentials() {
+                        let _ = self.set_loaded(record);
+                        self.storage_message = Some(
+                            "Credentials loaded from the selected storage. Connection not yet verified.",
+                        );
+                    } else {
+                        self.unsaved_edits = true;
+                        self.storage_message = Some(
+                            "Stored credentials are available. Current entries were kept; save to update them.",
+                        );
+                    }
+                }
+            }
+            Ok(None) => {
+                self.stored = false;
+                self.invalid_stored = false;
+                self.storage_message = None;
+            }
+            Err(StoreError::InvalidRecord) => {
+                self.stored = false;
+                self.invalid_stored = true;
+                self.storage_message =
+                    Some("Stored credentials are invalid; replace or forget them.");
+            }
+            Err(StoreError::Insecure) => {
+                self.storage_message = Some(
+                    "The configured credentials file has unsafe ownership, permissions, or links. Credentials remain session-only.",
+                );
+            }
+            Err(_) => {
+                self.storage_message = Some(
+                    "Credential storage could not be accessed. Credentials remain in this session only; check availability and retry.",
+                );
+            }
+        }
+    }
+
+    fn has_entered_credentials(&self) -> bool {
+        !self.developer_id.is_empty()
+            || !self.developer_password.is_empty()
+            || !self.user_id.is_empty()
+            || !self.user_password.is_empty()
+    }
+
+    fn validate_loaded(&self, record: &StoredCredentials) -> Result<(), ()> {
         if record.developer_id.len() > 256
             || record.user_id.len() > 256
             || record.user_id.chars().any(|ch| ch.is_control())
@@ -169,6 +258,11 @@ impl ScreenScraperPageState {
             user_password,
         )
         .map_err(|_| ())?;
+        Ok(())
+    }
+
+    fn set_loaded(&mut self, record: StoredCredentials) -> Result<(), ()> {
+        self.validate_loaded(&record)?;
         self.developer_id = record.developer_id;
         self.developer_password = record.developer_password;
         self.user_id = record.user_id;
@@ -177,6 +271,13 @@ impl ScreenScraperPageState {
     }
 
     fn save_credentials(&mut self) {
+        self.begin_save_with(SecretStore::system());
+    }
+
+    fn begin_save_with(&mut self, store: SecretStore) {
+        if self.storage_request.is_some() {
+            return;
+        }
         if self.credentials().is_none()
             || self.user_id.len() > 256
             || self.user_id.chars().any(|ch| ch.is_control())
@@ -191,53 +292,106 @@ impl ScreenScraperPageState {
             user_id: self.user_id.trim().into(),
             user_password: self.user_password.trim().into(),
         };
-        match SecretStore::system().save(&record) {
+        self.file_mode = store.uses_restricted_file();
+        let generation = self.edit_generation;
+        let (sender, receiver) = mpsc::channel();
+        self.storage_request = Some(receiver);
+        self.storage_message = Some("Saving credentials…");
+        thread::spawn(move || {
+            let _ = sender.send(StorageOutcome::Saved(store.save(&record), generation));
+        });
+    }
+
+    fn finish_save(&mut self, result: Result<(), StoreError>, generation: u64) {
+        match result {
             Ok(()) => {
                 self.stored = true;
                 self.invalid_stored = false;
-                self.unsaved_edits = false;
-                self.storage_message = Some(
-                    "Credentials saved in the system secret store. Connection not yet verified.",
-                );
+                self.unsaved_edits = self.edit_generation != generation;
+                self.storage_message = Some(if self.unsaved_edits {
+                    "Credentials saved, but newer edits remain in this session only."
+                } else {
+                    "Credentials saved in the selected storage. Connection not yet verified."
+                });
             }
             Err(StoreError::TooLarge) => {
                 self.storage_message = Some(
-                    "Credentials are too long for the system secret store. They remain in this session only.",
+                    "Credentials are too long for the selected storage. They remain in this session only.",
+                );
+            }
+            Err(StoreError::Insecure) => {
+                self.storage_message = Some(
+                    "The configured credentials file is unsafe. Nothing was saved; current credentials remain session-only.",
                 );
             }
             Err(_) => {
                 self.storage_message = Some(if self.stored {
-                    "Could not update the secret store. Current edits remain in this session; previously saved credentials may still be present."
+                    "Could not update credential storage. Current edits remain in this session; previously saved credentials may still be present."
                 } else {
-                    "System secret storage is unavailable. Credentials remain in this session only."
+                    "Credential storage is unavailable. Credentials remain in this session only."
                 })
             }
         }
     }
 
     fn forget_credentials(&mut self) {
-        self.forget_credentials_with(&SecretStore::system());
+        self.begin_forget_with(SecretStore::system());
     }
 
-    fn forget_credentials_with(&mut self, store: &SecretStore) {
-        let removed = store.forget().is_ok();
+    fn begin_forget_with(&mut self, store: SecretStore) {
+        if self.storage_request.is_some() {
+            return;
+        }
+        self.file_mode = store.uses_restricted_file();
         self.developer_id.clear();
         self.developer_password.clear();
         self.user_id.clear();
         self.user_password.clear();
-        if removed {
-            self.stored = false;
-            self.invalid_stored = false;
-        }
+        self.edit_generation = 0;
         self.unsaved_edits = false;
         self.status = ScreenScraperUiStatus::NotConfigured;
         self.quota = None;
         self.last_error = None;
+        self.storage_message = Some("Clearing stored credentials…");
+        let (sender, receiver) = mpsc::channel();
+        self.storage_request = Some(receiver);
+        thread::spawn(move || {
+            let _ = sender.send(StorageOutcome::Forgotten(store.forget()));
+        });
+    }
+
+    fn finish_forget(&mut self, result: Result<(), StoreError>) {
+        let removed = result.is_ok();
+        if removed {
+            self.stored = false;
+            self.invalid_stored = false;
+        }
         self.storage_message = Some(if removed {
-            "Credentials forgotten from the session and system secret store."
+            "Credentials forgotten from the session and selected storage."
         } else {
             "Session credentials cleared. Stored credentials could not be removed or verified; try again when the secret store is available."
         });
+    }
+
+    fn poll_storage(&mut self) {
+        let Some(receiver) = self.storage_request.take() else {
+            return;
+        };
+        match receiver.try_recv() {
+            Ok(StorageOutcome::Loaded(result)) => self.finish_load(result),
+            Ok(StorageOutcome::Saved(result, generation)) => self.finish_save(result, generation),
+            Ok(StorageOutcome::Forgotten(result)) => self.finish_forget(result),
+            Err(TryRecvError::Empty) => self.storage_request = Some(receiver),
+            Err(TryRecvError::Disconnected) => {
+                self.storage_message = Some(
+                    "The secret-store operation ended unexpectedly. Stored credentials could not be verified.",
+                )
+            }
+        }
+    }
+
+    fn refresh_storage(&mut self) {
+        self.begin_load_with(SecretStore::system());
     }
 
     pub(crate) fn status(&self) -> ScreenScraperUiStatus {
@@ -269,6 +423,7 @@ impl ScreenScraperPageState {
     }
 
     pub(crate) fn poll(&mut self) {
+        self.poll_storage();
         let Some(request) = self.request.take() else {
             return;
         };
@@ -456,7 +611,14 @@ pub(crate) fn show_screen_scraper_settings(
 
         ui.add_space(6.0);
         ui.label(egui::RichText::new("Credentials").strong());
-        if state.invalid_stored {
+        if state.file_mode {
+            ui.label("Operator-enabled restricted file: credentials are plaintext to this account and root. The directory must be owner-only (0700), the file owner-only (0600), and backups must be protected.");
+        }
+        if state.storage_request.is_some() {
+            ui.label(
+                "Credential storage is working in the background. You can continue using EmuWiz.",
+            );
+        } else if state.invalid_stored {
             ui.label("Stored credentials are invalid. Replace or forget them.");
         } else if state.stored {
             if state.unsaved_edits {
@@ -464,12 +626,12 @@ pub(crate) fn show_screen_scraper_settings(
                     "Saved credentials are available after restart. Current edits are not saved.",
                 );
             } else {
-                ui.label("Saved in the system secret store; available after restart.");
+                ui.label("Saved in the selected storage; available after restart.");
             }
         } else if state.store_available {
-            ui.label("Session-only until saved in the system secret store.");
+            ui.label("Session-only until saved in the selected storage.");
         } else {
-            ui.label("System secret storage is unavailable. Credentials are held only while this window is open and are not saved to disk.");
+            ui.label("Credential storage is unavailable. Credentials are held only while this window is open and are not saved to disk.");
         }
         let mut edited = false;
         ui.horizontal(|ui| {
@@ -506,7 +668,10 @@ pub(crate) fn show_screen_scraper_settings(
         });
         if edited {
             state.unsaved_edits = true;
-            state.storage_message = None;
+            state.edit_generation = state.edit_generation.wrapping_add(1);
+            if state.storage_request.is_none() {
+                state.storage_message = None;
+            }
         }
         ui.horizontal(|ui| {
             if widgets::action_button(
@@ -517,7 +682,7 @@ pub(crate) fn show_screen_scraper_settings(
                     "Save credentials"
                 },
                 widgets::ActionStyle::Secondary,
-                !busy && state.store_available,
+                !busy && state.store_available && state.storage_request.is_none(),
             )
             .clicked()
             {
@@ -529,6 +694,7 @@ pub(crate) fn show_screen_scraper_settings(
                 widgets::ActionStyle::Secondary,
                 !busy
                     && state.request.is_none()
+                    && state.storage_request.is_none()
                     && (state.store_available
                         || state.stored
                         || state.invalid_stored
@@ -537,6 +703,16 @@ pub(crate) fn show_screen_scraper_settings(
             .clicked()
             {
                 state.forget_credentials();
+            }
+            if widgets::action_button(
+                ui,
+                "Retry secure storage",
+                widgets::ActionStyle::Secondary,
+                !busy && state.storage_request.is_none(),
+            )
+            .clicked()
+            {
+                state.refresh_storage();
             }
         });
         if let Some(message) = state.storage_message {
@@ -629,11 +805,27 @@ mod tests {
         })
     }
 
+    fn settle_storage(state: &mut ScreenScraperPageState) {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        while state.storage_request.is_some() && std::time::Instant::now() < deadline {
+            state.poll_storage();
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+        assert!(
+            state.storage_request.is_none(),
+            "secret-store worker did not finish"
+        );
+    }
+
     #[test]
     fn card_is_optional_metadata_and_not_identity() {
         let mut state = ScreenScraperPageState::default();
         let output = render(&mut state);
         assert!(rendered_text_contains(&output, "ScreenScraper"));
+        assert!(rendered_text_contains(
+            &output,
+            "Credential storage is unavailable"
+        ));
         assert!(rendered_text_contains(&output, "Optional metadata"));
         assert!(rendered_text_contains(&output, "Not configured"));
         assert!(rendered_text_contains(
@@ -737,17 +929,14 @@ mod tests {
     #[test]
     fn invalid_loaded_credentials_do_not_enter_session_or_debug_output() {
         let mut state = ScreenScraperPageState::default();
-        assert!(
-            state
-                .set_loaded(StoredCredentials {
-                    developer_id: "dev".into(),
-                    developer_password: "invalid\nsecret".into(),
-                    user_id: "user".into(),
-                    user_password: "synthetic-secret".into(),
-                })
-                .is_err()
-        );
+        state.finish_load(Ok(Some(StoredCredentials {
+            developer_id: "dev".into(),
+            developer_password: "invalid\nsecret".into(),
+            user_id: "user".into(),
+            user_password: "synthetic-secret".into(),
+        })));
         assert!(!state.is_configured());
+        assert!(state.invalid_stored);
         assert!(!format!("{state:?}").contains("synthetic-secret"));
         assert_eq!(
             status_for_error(&ScreenScraperError::Authentication { status: 401 }),
@@ -783,13 +972,115 @@ mod tests {
             ..ScreenScraperPageState::default()
         };
         assert!(!state.stored);
-        state.forget_credentials_with(&store);
+        state.begin_forget_with(store);
+        settle_storage(&mut state);
         assert!(!stale.exists());
         assert!(state.developer_password.is_empty());
         assert_eq!(
             state.storage_message,
-            Some("Credentials forgotten from the session and system secret store.")
+            Some("Credentials forgotten from the session and selected storage.")
         );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn locked_store_does_not_block_ui_or_discard_session_credentials() {
+        use std::os::unix::fs::PermissionsExt;
+        let root = tempfile::tempdir().unwrap();
+        let script = root.path().join("secret-tool");
+        std::fs::write(
+            &script,
+            "#!/bin/sh\ncase \"$1\" in\n lookup) sleep 1; echo locked >&2; exit 1 ;;\n store) cat >/dev/null; sleep 1; exit 1 ;;\n clear) sleep 1; exit 1 ;;\nesac\n",
+        )
+        .unwrap();
+        std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o700)).unwrap();
+        let mut state = ScreenScraperPageState::empty(true);
+        let started = std::time::Instant::now();
+        state.begin_load_with(SecretStore::new(&script));
+        let _ = render(&mut state);
+        assert!(started.elapsed() < std::time::Duration::from_millis(500));
+        settle_storage(&mut state);
+        assert!(!state.is_configured());
+        assert!(
+            state
+                .storage_message
+                .unwrap()
+                .contains("could not be accessed")
+        );
+
+        state.developer_id = "synthetic-dev".into();
+        state.developer_password = "synthetic-dev-password".into();
+        let started = std::time::Instant::now();
+        state.begin_save_with(SecretStore::new(&script));
+        assert!(started.elapsed() < std::time::Duration::from_millis(500));
+        settle_storage(&mut state);
+        assert!(state.is_configured());
+        assert!(!state.stored);
+
+        let started = std::time::Instant::now();
+        state.begin_forget_with(SecretStore::new(&script));
+        assert!(started.elapsed() < std::time::Duration::from_millis(500));
+        settle_storage(&mut state);
+        assert!(!state.is_configured());
+        assert!(
+            state
+                .storage_message
+                .unwrap()
+                .contains("could not be removed")
+        );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn explicitly_selected_restricted_file_survives_app_restart_and_forget() {
+        use std::os::unix::fs::PermissionsExt;
+        let home = std::path::PathBuf::from(std::env::var_os("HOME").expect("private test home"));
+        let root = tempfile::Builder::new()
+            .prefix("emuwiz-screenscraper-file-test-")
+            .tempdir_in(home)
+            .unwrap();
+        let directory = root.path().join("secrets");
+        std::fs::create_dir(&directory).unwrap();
+        std::fs::set_permissions(&directory, std::fs::Permissions::from_mode(0o700)).unwrap();
+
+        let mut first = ScreenScraperPageState::empty(true);
+        first.developer_id = "synthetic-dev-id".into();
+        first.developer_password = "synthetic-dev-password".into();
+        first.user_id = "synthetic-user-id".into();
+        first.user_password = "synthetic-user-password".into();
+        first.begin_save_with(SecretStore::restricted_file_for_test(directory.clone()));
+        settle_storage(&mut first);
+        assert!(first.stored);
+        assert!(first.file_mode);
+
+        let mut restarted = ScreenScraperPageState::empty(true);
+        restarted.begin_load_with(SecretStore::restricted_file_for_test(directory.clone()));
+        settle_storage(&mut restarted);
+        assert_eq!(restarted.developer_id, "synthetic-dev-id");
+        assert_eq!(restarted.developer_password, "synthetic-dev-password");
+        assert_eq!(restarted.user_id, "synthetic-user-id");
+        assert_eq!(restarted.user_password, "synthetic-user-password");
+        assert!(rendered_text_contains(
+            &render(&mut restarted),
+            "plaintext to this account"
+        ));
+        assert!(!format!("{restarted:?}").contains("synthetic-dev-password"));
+
+        restarted.user_password = "updated-user-password".into();
+        restarted.begin_save_with(SecretStore::restricted_file_for_test(directory.clone()));
+        settle_storage(&mut restarted);
+        let mut after_update = ScreenScraperPageState::empty(true);
+        after_update.begin_load_with(SecretStore::restricted_file_for_test(directory.clone()));
+        settle_storage(&mut after_update);
+        assert_eq!(after_update.developer_password, "synthetic-dev-password");
+        assert_eq!(after_update.user_password, "updated-user-password");
+
+        after_update.begin_forget_with(SecretStore::restricted_file_for_test(directory.clone()));
+        settle_storage(&mut after_update);
+        let mut after_forget = ScreenScraperPageState::empty(true);
+        after_forget.begin_load_with(SecretStore::restricted_file_for_test(directory));
+        settle_storage(&mut after_forget);
+        assert!(!after_forget.is_configured());
     }
 
     #[cfg(unix)]
@@ -798,21 +1089,46 @@ mod tests {
     fn real_secret_service_restart_and_removal() {
         let program = std::env::var_os("EMUWIZ_REAL_SECRET_TOOL")
             .expect("set EMUWIZ_REAL_SECRET_TOOL to an isolated secret-tool executable");
-        let store = SecretStore::new(std::path::Path::new(&program));
+        let tool_path = std::path::Path::new(&program);
+        let store = SecretStore::new(tool_path);
         let record = StoredCredentials {
             developer_id: "synthetic-dev".into(),
             developer_password: "synthetic-dev-password".into(),
             user_id: "synthetic-user".into(),
             user_password: "synthetic-user-password".into(),
         };
-        store.save(&record).unwrap();
-        let mut restarted = ScreenScraperPageState::load_from_store(&store);
+        let mut first = ScreenScraperPageState::empty(true);
+        first.set_loaded(record.clone()).unwrap();
+        first.begin_save_with(store);
+        settle_storage(&mut first);
+        assert!(first.stored);
+
+        let mut restarted = ScreenScraperPageState::empty(true);
+        restarted.begin_load_with(SecretStore::new(tool_path));
+        settle_storage(&mut restarted);
         assert!(restarted.is_configured());
         assert!(restarted.stored);
+        assert_eq!(restarted.developer_id, record.developer_id);
+        assert_eq!(restarted.developer_password, record.developer_password);
+        assert_eq!(restarted.user_id, record.user_id);
+        assert_eq!(restarted.user_password, record.user_password);
         assert!(!format!("{restarted:?}").contains("synthetic-user-password"));
-        restarted.forget_credentials_with(&store);
-        assert!(!restarted.is_configured());
-        let after_removal = ScreenScraperPageState::load_from_store(&store);
+        restarted.developer_password = "updated-dev-password".into();
+        restarted.user_password = "updated-user-password".into();
+        restarted.begin_save_with(SecretStore::new(tool_path));
+        settle_storage(&mut restarted);
+        assert!(restarted.stored);
+
+        let mut after_update = ScreenScraperPageState::empty(true);
+        after_update.begin_load_with(SecretStore::new(tool_path));
+        settle_storage(&mut after_update);
+        assert_eq!(after_update.developer_password, "updated-dev-password");
+        assert_eq!(after_update.user_password, "updated-user-password");
+
+        after_update.begin_forget_with(SecretStore::new(tool_path));
+        settle_storage(&mut after_update);
+        assert!(!after_update.is_configured());
+        let after_removal = ScreenScraperPageState::load_from_store(&SecretStore::new(tool_path));
         assert!(!after_removal.is_configured());
     }
 }

@@ -1,0 +1,378 @@
+//! Explicitly enabled Saltbox credential file. Contents are plaintext to this
+//! account and root; the operator must choose this backend and protect backups.
+//! Every operation retains a no-follow directory descriptor and rejects unsafe
+//! ownership, permissions, links, or repository locations.
+
+use std::ffi::CString;
+use std::fs::File;
+use std::io::{Read, Write};
+use std::os::fd::{AsRawFd, FromRawFd};
+use std::os::unix::ffi::OsStrExt;
+use std::os::unix::fs::MetadataExt;
+use std::path::{Component, Path, PathBuf};
+
+use crate::screenscraper_secret_store::{StoreError, StoredCredentials};
+
+const FILE_NAME: &str = "screenscraper-credentials.json";
+const MAX_BYTES: usize = 20_000;
+
+pub(super) struct RestrictedFileStore {
+    directory: PathBuf,
+}
+
+impl RestrictedFileStore {
+    pub fn new(directory: PathBuf) -> Self {
+        Self { directory }
+    }
+
+    pub fn load(&self) -> Result<Option<StoredCredentials>, StoreError> {
+        let directory = open_private_directory(&self.directory)?;
+        read_record(&directory)
+    }
+
+    pub fn save(&self, record: &StoredCredentials) -> Result<(), StoreError> {
+        self.save_inner(record, false)
+    }
+
+    #[cfg(test)]
+    pub fn save_failing_before_publish(
+        &self,
+        record: &StoredCredentials,
+    ) -> Result<(), StoreError> {
+        self.save_inner(record, true)
+    }
+
+    fn save_inner(
+        &self,
+        record: &StoredCredentials,
+        fail_before_publish: bool,
+    ) -> Result<(), StoreError> {
+        let directory = open_private_directory(&self.directory)?;
+        let previous = open_record(&directory)?;
+        let previous_identity = previous
+            .as_ref()
+            .map(|file| file.metadata().map(|m| (m.dev(), m.ino())))
+            .transpose()
+            .map_err(|_| StoreError::Failed)?;
+        let payload = serde_json::to_vec(record).map_err(|_| StoreError::Failed)?;
+        if payload.len() > MAX_BYTES {
+            return Err(StoreError::TooLarge);
+        }
+        let pinned_directory = pinned_path(&directory);
+        let mut temporary = tempfile::Builder::new()
+            .prefix(".screenscraper-credentials-")
+            .tempfile_in(&pinned_directory)
+            .map_err(|_| StoreError::Failed)?;
+        check_private_file(temporary.as_file())?;
+        temporary
+            .write_all(&payload)
+            .map_err(|_| StoreError::Failed)?;
+        temporary
+            .as_file()
+            .sync_all()
+            .map_err(|_| StoreError::Failed)?;
+        if fail_before_publish {
+            return Err(StoreError::Failed);
+        }
+        let current = open_record(&directory)?;
+        let current_identity = current
+            .as_ref()
+            .map(|file| file.metadata().map(|m| (m.dev(), m.ino())))
+            .transpose()
+            .map_err(|_| StoreError::Failed)?;
+        if current_identity != previous_identity {
+            return Err(StoreError::Failed);
+        }
+        temporary
+            .persist(pinned_directory.join(FILE_NAME))
+            .map_err(|_| StoreError::Failed)?;
+        directory.sync_all().map_err(|_| StoreError::Failed)?;
+        if read_record(&directory)? != Some(record.clone()) {
+            return Err(StoreError::Failed);
+        }
+        Ok(())
+    }
+
+    pub fn forget(&self) -> Result<(), StoreError> {
+        let directory = open_private_directory(&self.directory)?;
+        if open_record(&directory)?.is_none() {
+            return Ok(());
+        }
+        let name = CString::new(FILE_NAME).expect("fixed file name");
+        if unsafe { libc::unlinkat(directory.as_raw_fd(), name.as_ptr(), 0) } != 0 {
+            return Err(StoreError::Failed);
+        }
+        directory.sync_all().map_err(|_| StoreError::Failed)?;
+        if open_record(&directory)?.is_some() {
+            return Err(StoreError::Failed);
+        }
+        Ok(())
+    }
+}
+
+fn open_private_directory(path: &Path) -> Result<File, StoreError> {
+    if !path.is_absolute() {
+        return Err(StoreError::Insecure);
+    }
+    let mut directory = File::open("/").map_err(|_| StoreError::Failed)?;
+    let mut count = 0;
+    for component in path.components() {
+        let Component::Normal(name) = component else {
+            if component == Component::RootDir {
+                continue;
+            }
+            return Err(StoreError::Insecure);
+        };
+        count += 1;
+        let name = CString::new(name.as_bytes()).map_err(|_| StoreError::Insecure)?;
+        let fd = unsafe {
+            libc::openat(
+                directory.as_raw_fd(),
+                name.as_ptr(),
+                libc::O_RDONLY | libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC,
+            )
+        };
+        if fd < 0 {
+            return Err(match std::io::Error::last_os_error().raw_os_error() {
+                Some(libc::ENOENT) => StoreError::Unavailable,
+                Some(libc::ELOOP | libc::ENOTDIR) => StoreError::Insecure,
+                _ => StoreError::Failed,
+            });
+        }
+        directory = unsafe { File::from_raw_fd(fd) };
+        if is_git_worktree_directory(&directory)? {
+            return Err(StoreError::Insecure);
+        }
+    }
+    if count == 0 {
+        return Err(StoreError::Insecure);
+    }
+    let metadata = directory.metadata().map_err(|_| StoreError::Failed)?;
+    if !metadata.is_dir()
+        || metadata.uid() != unsafe { libc::geteuid() }
+        || metadata.mode() & 0o7777 != 0o700
+    {
+        return Err(StoreError::Insecure);
+    }
+    Ok(directory)
+}
+
+fn is_git_worktree_directory(directory: &File) -> Result<bool, StoreError> {
+    let marker = pinned_path(directory).join(".git");
+    let metadata = match marker.symlink_metadata() {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(false),
+        Err(_) => return Err(StoreError::Failed),
+    };
+    if metadata.file_type().is_symlink() || metadata.is_file() {
+        return Ok(true);
+    }
+    if !metadata.is_dir() {
+        return Err(StoreError::Insecure);
+    }
+    Ok(marker.join("HEAD").is_file() && marker.join("objects").is_dir())
+}
+
+fn open_record(directory: &File) -> Result<Option<File>, StoreError> {
+    let name = CString::new(FILE_NAME).expect("fixed file name");
+    let fd = unsafe {
+        libc::openat(
+            directory.as_raw_fd(),
+            name.as_ptr(),
+            libc::O_RDONLY | libc::O_NOFOLLOW | libc::O_NONBLOCK | libc::O_CLOEXEC,
+        )
+    };
+    if fd < 0 {
+        return match std::io::Error::last_os_error().raw_os_error() {
+            Some(libc::ENOENT) => Ok(None),
+            Some(libc::ELOOP) => Err(StoreError::Insecure),
+            _ => Err(StoreError::Failed),
+        };
+    }
+    let file = unsafe { File::from_raw_fd(fd) };
+    check_private_file(&file)?;
+    Ok(Some(file))
+}
+
+fn check_private_file(file: &File) -> Result<(), StoreError> {
+    check_private_file_for_uid(file, unsafe { libc::geteuid() })
+}
+
+fn check_private_file_for_uid(file: &File, expected_uid: u32) -> Result<(), StoreError> {
+    let metadata = file.metadata().map_err(|_| StoreError::Failed)?;
+    if !metadata.is_file()
+        || metadata.uid() != expected_uid
+        || metadata.mode() & 0o7777 != 0o600
+        || metadata.nlink() != 1
+        || metadata.len() > MAX_BYTES as u64
+    {
+        return Err(StoreError::Insecure);
+    }
+    Ok(())
+}
+
+fn read_record(directory: &File) -> Result<Option<StoredCredentials>, StoreError> {
+    let Some(mut file) = open_record(directory)? else {
+        return Ok(None);
+    };
+    let before = file.metadata().map_err(|_| StoreError::Failed)?;
+    let mut bytes = Vec::new();
+    Read::by_ref(&mut file)
+        .take((MAX_BYTES + 1) as u64)
+        .read_to_end(&mut bytes)
+        .map_err(|_| StoreError::Failed)?;
+    let after = file.metadata().map_err(|_| StoreError::Failed)?;
+    if bytes.len() > MAX_BYTES
+        || before.dev() != after.dev()
+        || before.ino() != after.ino()
+        || before.len() != after.len()
+        || bytes.len() as u64 != before.len()
+    {
+        return Err(StoreError::Failed);
+    }
+    serde_json::from_slice(&bytes)
+        .map(Some)
+        .map_err(|_| StoreError::InvalidRecord)
+}
+
+fn pinned_path(directory: &File) -> PathBuf {
+    PathBuf::from(format!("/proc/self/fd/{}", directory.as_raw_fd()))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::fs;
+    use std::os::unix::fs::{PermissionsExt, symlink};
+
+    fn fixture() -> (tempfile::TempDir, PathBuf, RestrictedFileStore) {
+        let home = PathBuf::from(std::env::var_os("HOME").expect("private test home"));
+        let root = tempfile::Builder::new()
+            .prefix("emuwiz-screenscraper-file-test-")
+            .tempdir_in(home)
+            .unwrap();
+        let directory = root.path().join("secrets");
+        fs::create_dir(&directory).unwrap();
+        fs::set_permissions(&directory, fs::Permissions::from_mode(0o700)).unwrap();
+        let store = RestrictedFileStore::new(directory.clone());
+        (root, directory, store)
+    }
+
+    fn record(dev_password: &str, user_password: &str) -> StoredCredentials {
+        StoredCredentials {
+            developer_id: "synthetic-dev-id".into(),
+            developer_password: dev_password.into(),
+            user_id: "synthetic-user-id".into(),
+            user_password: user_password.into(),
+        }
+    }
+
+    #[test]
+    fn restart_update_and_forget_are_private_and_durable() {
+        let (_root, directory, store) = fixture();
+        let first = record("synthetic-dev-password", "synthetic-user-password");
+        store.save(&first).unwrap();
+        let path = directory.join(FILE_NAME);
+        let metadata = fs::metadata(&path).unwrap();
+        assert_eq!(metadata.mode() & 0o7777, 0o600);
+        assert_eq!(metadata.uid(), unsafe { libc::geteuid() });
+        assert_eq!(
+            RestrictedFileStore::new(directory.clone()).load().unwrap(),
+            Some(first)
+        );
+
+        let updated = record("updated-dev-password", "updated-user-password");
+        store.save(&updated).unwrap();
+        let restarted = RestrictedFileStore::new(directory.clone());
+        assert_eq!(restarted.load().unwrap(), Some(updated.clone()));
+        assert_ne!(updated.developer_password, updated.user_password);
+        assert!(!format!("{updated:?}").contains("updated-user-password"));
+        restarted.forget().unwrap();
+        assert_eq!(RestrictedFileStore::new(directory).load().unwrap(), None);
+    }
+
+    #[test]
+    fn insecure_permissions_and_ownership_are_refused() {
+        let (_root, directory, store) = fixture();
+        fs::set_permissions(&directory, fs::Permissions::from_mode(0o755)).unwrap();
+        assert_eq!(
+            store.save(&record("dev", "user")),
+            Err(StoreError::Insecure)
+        );
+        fs::set_permissions(&directory, fs::Permissions::from_mode(0o700)).unwrap();
+        store.save(&record("dev", "user")).unwrap();
+        let path = directory.join(FILE_NAME);
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o644)).unwrap();
+        assert_eq!(store.load(), Err(StoreError::Insecure));
+        assert_eq!(
+            store.save(&record("new-dev", "new-user")),
+            Err(StoreError::Insecure)
+        );
+        assert_eq!(store.forget(), Err(StoreError::Insecure));
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o600)).unwrap();
+        let file = File::open(&path).unwrap();
+        assert_eq!(
+            check_private_file_for_uid(&file, unsafe { libc::geteuid() } + 1),
+            Err(StoreError::Insecure)
+        );
+    }
+
+    #[test]
+    fn linked_paths_and_repository_locations_are_refused() {
+        let (root, directory, store) = fixture();
+        let linked_directory = root.path().join("linked-secrets");
+        symlink(&directory, &linked_directory).unwrap();
+        assert_eq!(
+            RestrictedFileStore::new(linked_directory).load(),
+            Err(StoreError::Insecure)
+        );
+
+        let target = root.path().join("target");
+        fs::write(&target, b"synthetic-outside-value").unwrap();
+        symlink(&target, directory.join(FILE_NAME)).unwrap();
+        assert_eq!(store.load(), Err(StoreError::Insecure));
+        assert_eq!(store.forget(), Err(StoreError::Insecure));
+        assert_eq!(
+            store.save(&record("dev", "user")),
+            Err(StoreError::Insecure)
+        );
+        assert_eq!(fs::read(&target).unwrap(), b"synthetic-outside-value");
+        fs::remove_file(directory.join(FILE_NAME)).unwrap();
+
+        fs::write(root.path().join(".git"), b"").unwrap();
+        assert_eq!(
+            store.save(&record("dev", "user")),
+            Err(StoreError::Insecure)
+        );
+    }
+
+    #[test]
+    fn failed_publish_keeps_the_previous_record_and_removes_temporary_file() {
+        let (_root, directory, store) = fixture();
+        let first = record("original-dev", "original-user");
+        store.save(&first).unwrap();
+        assert_eq!(
+            store.save_failing_before_publish(&record("new-dev", "new-user")),
+            Err(StoreError::Failed)
+        );
+        assert_eq!(store.load().unwrap(), Some(first));
+        assert_eq!(fs::read_dir(directory).unwrap().count(), 1);
+    }
+
+    #[test]
+    fn missing_or_relative_directory_never_falls_back() {
+        let home = PathBuf::from(std::env::var_os("HOME").expect("private test home"));
+        let root = tempfile::Builder::new()
+            .prefix("emuwiz-screenscraper-file-test-")
+            .tempdir_in(home)
+            .unwrap();
+        assert_eq!(
+            RestrictedFileStore::new(root.path().join("missing")).load(),
+            Err(StoreError::Unavailable)
+        );
+        assert_eq!(
+            RestrictedFileStore::new(PathBuf::from("relative")).load(),
+            Err(StoreError::Insecure)
+        );
+    }
+}

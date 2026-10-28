@@ -1,5 +1,6 @@
-//! Optional ScreenScraper credentials in the desktop Secret Service.
-//! No credential is passed in arguments, written to a file, or included in errors.
+//! Optional ScreenScraper credentials in the user's Secret Service or an
+//! explicitly selected restricted file. No credential is passed in arguments
+//! or included in errors.
 
 use std::io::Write;
 #[cfg(test)]
@@ -7,6 +8,8 @@ use std::path::Path;
 use std::path::PathBuf;
 use std::process::{Command, Stdio};
 
+#[cfg(target_os = "linux")]
+use crate::screenscraper_restricted_file_store::RestrictedFileStore;
 use serde::{Deserialize, Serialize};
 
 const ATTRS: [&str; 4] = ["application", "EmuWiz", "provider", "ScreenScraper"];
@@ -34,6 +37,7 @@ pub(super) enum StoreError {
     Failed,
     InvalidRecord,
     TooLarge,
+    Insecure,
 }
 
 /// Uses the system's Secret Service through `secret-tool` when installed.
@@ -41,13 +45,26 @@ pub(super) enum StoreError {
 pub(super) struct SecretStore {
     program: PathBuf,
     requires_session_bus: bool,
+    #[cfg(target_os = "linux")]
+    restricted_file: Option<RestrictedFileStore>,
+    #[cfg(not(target_os = "linux"))]
+    unsupported_file: bool,
 }
 
 impl SecretStore {
     pub fn system() -> Self {
+        #[cfg(target_os = "linux")]
+        let restricted_file = std::env::var_os("EMUWIZ_SCREENSCRAPER_SECRETS_DIR")
+            .map(|value| RestrictedFileStore::new(PathBuf::from(value)));
+        #[cfg(not(target_os = "linux"))]
+        let unsupported_file = std::env::var_os("EMUWIZ_SCREENSCRAPER_SECRETS_DIR").is_some();
         Self {
             program: PathBuf::from("/usr/bin/secret-tool"),
             requires_session_bus: true,
+            #[cfg(target_os = "linux")]
+            restricted_file,
+            #[cfg(not(target_os = "linux"))]
+            unsupported_file,
         }
     }
 
@@ -56,16 +73,55 @@ impl SecretStore {
         Self {
             program: program.to_owned(),
             requires_session_bus: false,
+            #[cfg(target_os = "linux")]
+            restricted_file: None,
+            #[cfg(not(target_os = "linux"))]
+            unsupported_file: false,
+        }
+    }
+
+    #[cfg(all(test, target_os = "linux"))]
+    pub(super) fn restricted_file_for_test(directory: PathBuf) -> Self {
+        Self {
+            program: PathBuf::new(),
+            requires_session_bus: false,
+            restricted_file: Some(RestrictedFileStore::new(directory)),
+        }
+    }
+
+    pub fn uses_restricted_file(&self) -> bool {
+        #[cfg(target_os = "linux")]
+        {
+            self.restricted_file.is_some()
+        }
+        #[cfg(not(target_os = "linux"))]
+        {
+            false
         }
     }
 
     pub fn available(&self) -> bool {
+        #[cfg(not(target_os = "linux"))]
+        if self.unsupported_file {
+            return false;
+        }
+        if self.uses_restricted_file() {
+            return true;
+        }
         self.program.is_file()
             && (!self.requires_session_bus
                 || std::env::var_os("DBUS_SESSION_BUS_ADDRESS").is_some())
     }
 
     pub fn load(&self) -> Result<Option<StoredCredentials>, StoreError> {
+        #[cfg(not(target_os = "linux"))]
+        if self.unsupported_file {
+            return Err(StoreError::Unavailable);
+        }
+        #[cfg(target_os = "linux")]
+        if let Some(store) = &self.restricted_file {
+            return store.load();
+        }
         if !self.available() {
             return Err(StoreError::Unavailable);
         }
@@ -93,6 +149,14 @@ impl SecretStore {
     }
 
     pub fn save(&self, record: &StoredCredentials) -> Result<(), StoreError> {
+        #[cfg(not(target_os = "linux"))]
+        if self.unsupported_file {
+            return Err(StoreError::Unavailable);
+        }
+        #[cfg(target_os = "linux")]
+        if let Some(store) = &self.restricted_file {
+            return store.save(record);
+        }
         if !self.available() {
             return Err(StoreError::Unavailable);
         }
@@ -125,6 +189,14 @@ impl SecretStore {
     }
 
     pub fn forget(&self) -> Result<(), StoreError> {
+        #[cfg(not(target_os = "linux"))]
+        if self.unsupported_file {
+            return Err(StoreError::Unavailable);
+        }
+        #[cfg(target_os = "linux")]
+        if let Some(store) = &self.restricted_file {
+            return store.forget();
+        }
         if !self.available() {
             return Err(StoreError::Unavailable);
         }
@@ -233,5 +305,24 @@ mod tests {
         let store = SecretStore::new(&script);
         assert_eq!(store.load().unwrap_err(), StoreError::Failed);
         assert_eq!(store.forget().unwrap_err(), StoreError::Failed);
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    #[ignore = "requires an explicitly configured private synthetic secrets directory"]
+    fn operator_selected_file_backend_does_not_use_secret_service_fallback() {
+        assert!(std::env::var_os("EMUWIZ_SCREENSCRAPER_SECRETS_DIR").is_some());
+        let store = SecretStore::system();
+        assert!(store.uses_restricted_file());
+        let record = StoredCredentials {
+            developer_id: "synthetic-dev".into(),
+            developer_password: "synthetic-dev-password".into(),
+            user_id: "synthetic-user".into(),
+            user_password: "synthetic-user-password".into(),
+        };
+        store.save(&record).unwrap();
+        assert_eq!(SecretStore::system().load().unwrap(), Some(record));
+        SecretStore::system().forget().unwrap();
+        assert_eq!(SecretStore::system().load().unwrap(), None);
     }
 }
