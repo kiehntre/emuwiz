@@ -142,19 +142,19 @@ impl DocumentRefresh {
         let (replies, receiver) = mpsc::channel();
         let (release, blocked) = mpsc::channel();
         std::thread::spawn(move || {
-            if let Ok(request) = requests.recv() {
-                if blocked.recv().is_ok() {
-                    let (documents, issue) = discover_game_documents(
-                        &request.game,
-                        &request.preferences,
-                        request.index.as_deref(),
-                    );
-                    let _ = replies.send(RefreshReply {
-                        generation: request.generation,
-                        documents,
-                        issue,
-                    });
-                }
+            if let Ok(request) = requests.recv()
+                && blocked.recv().is_ok()
+            {
+                let (documents, issue) = discover_game_documents(
+                    &request.game,
+                    &request.preferences,
+                    request.index.as_deref(),
+                );
+                let _ = replies.send(RefreshReply {
+                    generation: request.generation,
+                    documents,
+                    issue,
+                });
             }
         });
         self.sender = Some(sender);
