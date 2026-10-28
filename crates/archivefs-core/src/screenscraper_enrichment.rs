@@ -128,10 +128,10 @@ pub struct ScreenScraperEnrichmentReceipt {
     pub before: AcceptedScreenScraperMetadata,
     pub accepted: AcceptedScreenScraperMetadata,
     pub media_reference_count: usize,
-    /// Original source for retained fields when a later batch accepts only
-    /// some new fields. The map is bounded by EnrichmentField::ALL.
+    /// Exact source for each accepted or retained field in a batch. The map
+    /// is bounded by EnrichmentField::ALL.
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
-    pub retained_field_sources: BTreeMap<EnrichmentField, ScreenScraperFieldSource>,
+    pub field_sources: BTreeMap<EnrichmentField, ScreenScraperFieldSource>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -143,7 +143,7 @@ pub struct ScreenScraperFieldSource {
 
 impl ScreenScraperEnrichmentReceipt {
     pub fn source_for(&self, field: EnrichmentField) -> ScreenScraperFieldSource {
-        self.retained_field_sources
+        self.field_sources
             .get(&field)
             .cloned()
             .unwrap_or_else(|| ScreenScraperFieldSource {
@@ -255,7 +255,7 @@ mod tests {
                 ..Default::default()
             },
             media_reference_count: 2,
-            retained_field_sources: Default::default(),
+            field_sources: Default::default(),
         };
         let encoded = serde_json::to_vec(&receipt).unwrap();
         let decoded: ScreenScraperEnrichmentReceipt = serde_json::from_slice(&encoded).unwrap();
@@ -273,7 +273,7 @@ mod tests {
             before: Default::default(),
             accepted: Default::default(),
             media_reference_count: 0,
-            retained_field_sources: Default::default(),
+            field_sources: Default::default(),
         };
         let prior_values = AcceptedScreenScraperMetadata {
             synopsis: Some("description".into()),
@@ -292,7 +292,7 @@ mod tests {
         );
         let second = ScreenScraperEnrichmentReceipt {
             provider_record_id: "second".into(),
-            retained_field_sources: retained,
+            field_sources: retained,
             ..original.clone()
         };
         let later = retained_field_sources(Some(&prior_values), Some(&second), &accepted);
@@ -302,7 +302,7 @@ mod tests {
         );
         assert_eq!(later.len(), 1);
         let legacy = serde_json::to_value(&original).unwrap();
-        assert!(legacy.get("retained_field_sources").is_none());
+        assert!(legacy.get("field_sources").is_none());
         assert_eq!(
             serde_json::from_value::<ScreenScraperEnrichmentReceipt>(legacy).unwrap(),
             original

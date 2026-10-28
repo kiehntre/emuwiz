@@ -4,6 +4,7 @@
 //! and apply paths. It never discovers its own library selection, downloads
 //! artwork, or changes identity evidence.
 
+use std::collections::BTreeMap;
 use std::path::PathBuf;
 use std::sync::mpsc::{self, Receiver, TryRecvError};
 use std::thread;
@@ -623,9 +624,10 @@ pub(crate) fn show(
                     if widgets::action_button(ui, "Apply selected fields", widgets::ActionStyle::Primary, has_selection).clicked() {
                         let values = merge_accepted(item.prior_values.as_ref(), &accepted);
                         let provenance = provenance.expect("enabled only with an accepted field");
-                        let retained_field_sources = archivefs_core::screenscraper_enrichment::retained_field_sources(
+                        let mut field_sources = archivefs_core::screenscraper_enrichment::retained_field_sources(
                             item.prior_values.as_ref(), item.prior_receipt.as_ref(), &accepted,
                         );
+                        field_sources.extend(accepted_field_sources(&candidate, &accepted));
                         let receipt = ScreenScraperEnrichmentReceipt {
                             provider: "ScreenScraper".into(),
                             provider_record_id: candidate.provider_game_id.clone(),
@@ -634,7 +636,7 @@ pub(crate) fn show(
                             before: AcceptedScreenScraperMetadata::from_existing(&item.metadata),
                             accepted,
                             media_reference_count: candidate.media_references.len(),
-                            retained_field_sources,
+                            field_sources,
                         };
                         action = Some(crate::screenscraper_enrichment_page::ScreenScraperEnrichmentAction::Apply { archive_id: item.archive_id, values, receipt });
                     }
@@ -695,6 +697,28 @@ fn merge_accepted(
     AcceptedScreenScraperMetadata::from_existing(&metadata)
 }
 
+fn accepted_field_sources(
+    candidate: &ScreenScraperEnrichment,
+    accepted: &AcceptedScreenScraperMetadata,
+) -> BTreeMap<EnrichmentField, archivefs_core::screenscraper_enrichment::ScreenScraperFieldSource> {
+    EnrichmentField::ALL
+        .into_iter()
+        .filter(|field| accepted.has_field(*field))
+        .filter_map(|field| {
+            single::field_provenance(candidate, field).map(|source| {
+                (
+                    field,
+                    archivefs_core::screenscraper_enrichment::ScreenScraperFieldSource {
+                        provider_record_id: source.provider_record_id.clone(),
+                        retrieved_at_unix_seconds: source.retrieved_at_unix_seconds,
+                        match_basis: source.match_basis.clone(),
+                    },
+                )
+            })
+        })
+        .collect()
+}
+
 pub(crate) fn show_blue(
     ui: &mut egui::Ui,
     state: &mut ScreenScraperBatchState,
@@ -713,6 +737,9 @@ pub(crate) fn show_blue(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use archivefs_core::identity_source::screenscraper::{
+        EnrichedField, IdentityContribution, MetadataProvenance,
+    };
     use archivefs_core::screenscraper_enrichment::MAX_EXPLICIT_BATCH_SIZE;
 
     #[test]
@@ -740,5 +767,50 @@ mod tests {
         let merged = merge_accepted(Some(&prior), &accepted);
         assert_eq!(merged.synopsis.as_deref(), Some("Earlier description"));
         assert_eq!(merged.genre.as_deref(), Some("Puzzle"));
+    }
+
+    #[test]
+    fn accepted_fields_keep_distinct_candidate_match_basis() {
+        let field = |value: &str, basis: &str| EnrichedField {
+            value: value.into(),
+            provenance: MetadataProvenance {
+                provider: "ScreenScraper",
+                provider_record_id: "42".into(),
+                retrieved_at_unix_seconds: 100,
+                match_basis: basis.into(),
+            },
+        };
+        let candidate = ScreenScraperEnrichment {
+            identity_contribution: IdentityContribution::None,
+            provider_game_id: "42".into(),
+            title: Some(field("Game", "search result")),
+            alternative_title: None,
+            description: Some(field("Description", "provider description")),
+            release_date: None,
+            developer: None,
+            publisher: None,
+            genre: None,
+            players: None,
+            rating: None,
+            region: None,
+            language: None,
+            external_url: None,
+            media_references: Vec::new(),
+        };
+        let accepted = AcceptedScreenScraperMetadata {
+            title: Some("Game".into()),
+            synopsis: Some("Description".into()),
+            ..Default::default()
+        };
+        let sources = accepted_field_sources(&candidate, &accepted);
+        assert_eq!(sources.len(), 2);
+        assert_eq!(
+            sources[&EnrichmentField::Title].match_basis,
+            "search result"
+        );
+        assert_eq!(
+            sources[&EnrichmentField::Synopsis].match_basis,
+            "provider description"
+        );
     }
 }

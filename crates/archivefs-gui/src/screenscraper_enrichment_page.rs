@@ -329,7 +329,7 @@ pub(crate) fn show(
                         before: archivefs_core::screenscraper_enrichment::AcceptedScreenScraperMetadata::from_existing(&record.metadata),
                         accepted: values.clone(),
                         media_reference_count: candidate.media_references.len(),
-                        retained_field_sources: Default::default(),
+                        field_sources: Default::default(),
                     };
                     action = Some(ScreenScraperEnrichmentAction::Apply { archive_id, values, receipt });
                 }

@@ -514,7 +514,7 @@ fn with_saved_record(
                 before: Default::default(),
                 accepted: Default::default(),
                 media_reference_count: 0,
-                retained_field_sources: Default::default(),
+                field_sources: Default::default(),
             },
         },
     );

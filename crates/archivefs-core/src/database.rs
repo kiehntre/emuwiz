@@ -17285,7 +17285,7 @@ echo "$out"
             before: Default::default(),
             accepted: values.clone(),
             media_reference_count: 1,
-            retained_field_sources: Default::default(),
+            field_sources: Default::default(),
         };
         database
             .apply_screenscraper_enrichment(archive_id, &values, &receipt)
@@ -17322,7 +17322,7 @@ echo "$out"
             before: Default::default(),
             accepted: values.clone(),
             media_reference_count: 0,
-            retained_field_sources: Default::default(),
+            field_sources: Default::default(),
         };
         assert!(
             database
