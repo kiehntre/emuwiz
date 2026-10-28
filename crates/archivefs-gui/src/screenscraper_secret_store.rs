@@ -72,13 +72,17 @@ impl SecretStore {
         let output = Command::new(&self.program)
             .arg("lookup")
             .args(ATTRS)
-            .stderr(Stdio::null())
             .output()
             .map_err(|_| StoreError::Unavailable)?;
         if !output.status.success() {
-            // Secret Service lookup uses exit 1 for both missing entries and
-            // service failures. A failed lookup does not authorize persistence.
-            return Ok(None);
+            // `secret-tool` returns 1 without diagnostics for a missing item.
+            // Service errors also return nonzero, but print a diagnostic.
+            // Inspect only its presence; never expose the text.
+            return if output.status.code() == Some(1) && output.stderr.is_empty() {
+                Ok(None)
+            } else {
+                Err(StoreError::Failed)
+            };
         }
         if output.stdout.len() > 20_000 {
             return Err(StoreError::InvalidRecord);
@@ -153,7 +157,7 @@ mod tests {
         std::fs::write(
             &script,
             format!(
-                "#!/bin/sh\ncase \"$1\" in\n store) cat > '{}' ;;\n lookup) cat '{}' ;;\n clear) rm -f '{}' ;;\nesac\n",
+                "#!/bin/sh\ncase \"$1\" in\n store) cat > '{}' ;;\n lookup) cat '{}' 2>/dev/null ;;\n clear) rm -f '{}' ;;\nesac\n",
                 record.display(), record.display(), record.display()
             ),
         )
@@ -214,5 +218,20 @@ mod tests {
         };
         assert_eq!(store.save(&record), Err(StoreError::TooLarge));
         assert!(store.load().unwrap().is_none());
+    }
+
+    #[test]
+    fn service_failure_after_clear_is_not_reported_as_verified_removal() {
+        let root = tempfile::tempdir().unwrap();
+        let script = root.path().join("secret-tool");
+        std::fs::write(
+            &script,
+            "#!/bin/sh\ncase \"$1\" in\n lookup) echo service-unavailable >&2; exit 1 ;;\n clear) exit 0 ;;\nesac\n",
+        )
+        .unwrap();
+        std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o700)).unwrap();
+        let store = SecretStore::new(&script);
+        assert_eq!(store.load().unwrap_err(), StoreError::Failed);
+        assert_eq!(store.forget().unwrap_err(), StoreError::Failed);
     }
 }
