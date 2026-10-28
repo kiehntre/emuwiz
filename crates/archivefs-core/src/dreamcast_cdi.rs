@@ -23,7 +23,9 @@
 //! The dependency's public parser is not used here because its API calls
 //! `std::fs::read` and would allocate the whole image before reaching the
 //! footer. This module performs the same small descriptor walk against a
-//! bounded buffer, retaining the dependency only for its sector reader.
+//! bounded buffer. The cooked sector view uses the same open file handle as
+//! the descriptor, since a path-based sector reader could reopen a replaced
+//! image between those stages.
 //!
 //! This module:
 //!
@@ -68,9 +70,7 @@
 
 use std::cell::{Cell, RefCell};
 use std::io::{Read, Seek, SeekFrom};
-use std::path::Path;
-
-use opticaldiscs::sector_reader::{BinCueSectorReader, SectorReader};
+use std::path::{Path, PathBuf};
 
 use crate::chd_identity::GDROM_HIGH_DENSITY_START_FRAME;
 use crate::logical_media::{LogicalMedia, LogicalMediaError};
@@ -115,6 +115,7 @@ pub enum CdiIdentityError {
     Truncated,
     TruncatedData,
     UnsupportedVersion(u32),
+    Changed,
     /// More tracks or descriptors than the conservative bounds allow.
     TooManyTracks,
     /// No Dreamcast-eligible data track was found at all.
@@ -153,6 +154,7 @@ impl std::fmt::Display for CdiIdentityError {
             Self::UnsupportedVersion(version) => {
                 write!(formatter, "unsupported CDI version 0x{version:08x}")
             }
+            Self::Changed => formatter.write_str("CDI source changed during inspection"),
             Self::TooManyTracks => formatter.write_str("CDI descriptor declares too many tracks"),
             Self::NoDataTrack => {
                 formatter.write_str("CDI has no track this module recognises as Dreamcast data")
@@ -233,12 +235,95 @@ fn checked_track_bytes(offset: u64, physical_sector_size: u64, frames: u64) -> O
     offset.checked_add(physical_sector_size.checked_mul(frames)?)
 }
 
-fn read_descriptor(path: &Path, file_len: u64) -> Result<(Vec<u8>, u64, u32), CdiIdentityError> {
+/// File identity plus change indicators for one bounded CDI inspection.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CdiFileStamp {
+    len: u64,
+    modified: Option<std::time::SystemTime>,
+    #[cfg(unix)]
+    dev: u64,
+    #[cfg(unix)]
+    ino: u64,
+    #[cfg(unix)]
+    ctime: i64,
+    #[cfg(unix)]
+    ctime_nsec: i64,
+}
+
+fn stamp_metadata(metadata: &std::fs::Metadata) -> CdiFileStamp {
+    #[cfg(unix)]
+    use std::os::unix::fs::MetadataExt;
+    CdiFileStamp {
+        len: metadata.len(),
+        modified: metadata.modified().ok(),
+        #[cfg(unix)]
+        dev: metadata.dev(),
+        #[cfg(unix)]
+        ino: metadata.ino(),
+        #[cfg(unix)]
+        ctime: metadata.ctime(),
+        #[cfg(unix)]
+        ctime_nsec: metadata.ctime_nsec(),
+    }
+}
+
+pub fn cdi_file_stamp(path: &Path) -> Result<CdiFileStamp, CdiIdentityError> {
+    let metadata =
+        std::fs::metadata(path).map_err(|error| CdiIdentityError::Io(error.to_string()))?;
+    if !metadata.is_file() {
+        return Err(CdiIdentityError::Parse(
+            "CDI source is not a regular file".into(),
+        ));
+    }
+    Ok(stamp_metadata(&metadata))
+}
+
+fn open_cdi_file(path: &Path) -> Result<(std::fs::File, CdiFileStamp), CdiIdentityError> {
+    let before = cdi_file_stamp(path)?;
+    #[cfg(unix)]
+    let file = {
+        use std::os::unix::fs::OpenOptionsExt;
+        std::fs::OpenOptions::new()
+            .read(true)
+            .custom_flags(libc::O_NONBLOCK)
+            .open(path)
+    };
+    #[cfg(not(unix))]
+    let file = std::fs::File::open(path);
+    let file = file.map_err(|error| CdiIdentityError::Io(error.to_string()))?;
+    let opened = file
+        .metadata()
+        .map_err(|error| CdiIdentityError::Io(error.to_string()))?;
+    if !opened.is_file() || stamp_metadata(&opened) != before {
+        return Err(CdiIdentityError::Changed);
+    }
+    Ok((file, before))
+}
+
+fn ensure_same_file(
+    file: &std::fs::File,
+    path: &Path,
+    expected: &CdiFileStamp,
+) -> Result<(), CdiIdentityError> {
+    let opened = file.metadata().map_err(|_| CdiIdentityError::Changed)?;
+    let named = std::fs::metadata(path).map_err(|_| CdiIdentityError::Changed)?;
+    if !opened.is_file()
+        || !named.is_file()
+        || stamp_metadata(&opened) != *expected
+        || stamp_metadata(&named) != *expected
+    {
+        return Err(CdiIdentityError::Changed);
+    }
+    Ok(())
+}
+
+fn read_descriptor(
+    file: &mut std::fs::File,
+    file_len: u64,
+) -> Result<(Vec<u8>, u64, u32), CdiIdentityError> {
     if file_len < 8 {
         return Err(CdiIdentityError::Truncated);
     }
-    let mut file =
-        std::fs::File::open(path).map_err(|error| CdiIdentityError::Io(error.to_string()))?;
     file.seek(SeekFrom::Start(file_len - 8))
         .map_err(|error| CdiIdentityError::Io(error.to_string()))?;
     let mut footer = [0_u8; 8];
@@ -319,6 +404,7 @@ pub enum CdiStatus {
     Unsupported,
     Ambiguous,
     Io,
+    Changed,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -353,6 +439,7 @@ fn status_for_error(error: &CdiIdentityError) -> CdiStatus {
         | CdiIdentityError::TooManyTracks => CdiStatus::Unsupported,
         CdiIdentityError::AmbiguousDataTracks => CdiStatus::Ambiguous,
         CdiIdentityError::Io(_) => CdiStatus::Io,
+        CdiIdentityError::Changed => CdiStatus::Changed,
         _ => CdiStatus::Malformed,
     }
 }
@@ -361,17 +448,17 @@ fn status_for_error(error: &CdiIdentityError) -> CdiStatus {
 /// Dreamcast identity. Boot evidence must come from the shared IP.BIN reader.
 pub fn inspect_cdi_structure(path: &Path) -> CdiStructure {
     let result = (|| {
-        let file_len = std::fs::metadata(path)
-            .map_err(|error| CdiIdentityError::Io(error.to_string()))?
-            .len();
+        let (mut file, stamp) = open_cdi_file(path)?;
+        let file_len = stamp.len;
         if file_len > MAX_CDI_BYTES {
             return Err(CdiIdentityError::TooLarge {
                 bytes: file_len,
                 maximum: MAX_CDI_BYTES,
             });
         }
-        let (descriptor, data_end, version) = read_descriptor(path, file_len)?;
+        let (descriptor, data_end, version) = read_descriptor(&mut file, file_len)?;
         let tracks = parse_descriptor(&descriptor, data_end)?;
+        ensure_same_file(&file, path, &stamp)?;
         let (selected, status) = match select_dreamcast_data_track(&tracks) {
             Ok(track) if track.data_frames > 0 => (Some(track.ordinal), CdiStatus::Valid),
             Ok(_) => (None, CdiStatus::Valid),
@@ -610,15 +697,25 @@ fn parse_track(
 /// A [`LogicalMedia`] over one `.cdi` file's selected Dreamcast data
 /// track, decoded on demand.
 ///
-/// Interior mutability ([`RefCell`]) satisfies [`LogicalMedia::read_at`]'s
-/// `&self` signature; the underlying `SectorReader` needs `&mut self` to
-/// seek+read a sector, exactly as
-/// [`crate::chd_optical_specialist::ChdOpticalSpecialist`] already does
-/// for the same reason.
+/// The descriptor and cooked sectors use the same open file handle. A path
+/// and metadata check before and after each logical read refuses a replaced
+/// or mutated source rather than combining different observations.
 pub struct CdiLogicalMedia {
-    reader: RefCell<BinCueSectorReader>,
+    reader: RefCell<std::fs::File>,
+    path: PathBuf,
+    stamp: CdiFileStamp,
+    file_byte_offset: u64,
+    physical_sector_size: u64,
+    data_offset: u64,
     len: u64,
     bytes_inspected: Cell<u64>,
+}
+
+impl CdiLogicalMedia {
+    /// Revalidate the pinned descriptor/sector source after identity parsing.
+    pub fn ensure_unchanged(&self) -> Result<(), CdiIdentityError> {
+        ensure_same_file(&self.reader.borrow(), &self.path, &self.stamp)
+    }
 }
 
 /// Opens `path` as a DiscJuggler `.cdi` and resolves the single Dreamcast
@@ -626,9 +723,8 @@ pub struct CdiLogicalMedia {
 /// exact selection rule and every bound enforced before any sector is
 /// read.
 pub fn open_dreamcast_cdi_logical_media(path: &Path) -> Result<CdiLogicalMedia, CdiIdentityError> {
-    let metadata =
-        std::fs::metadata(path).map_err(|error| CdiIdentityError::Io(error.to_string()))?;
-    let file_len = metadata.len();
+    let (mut file, stamp) = open_cdi_file(path)?;
+    let file_len = stamp.len;
     if file_len > MAX_CDI_BYTES {
         return Err(CdiIdentityError::TooLarge {
             bytes: file_len,
@@ -636,8 +732,9 @@ pub fn open_dreamcast_cdi_logical_media(path: &Path) -> Result<CdiLogicalMedia, 
         });
     }
 
-    let (descriptor, data_end, _) = read_descriptor(path, file_len)?;
+    let (descriptor, data_end, _) = read_descriptor(&mut file, file_len)?;
     let tracks = parse_descriptor(&descriptor, data_end)?;
+    ensure_same_file(&file, path, &stamp)?;
 
     let track = select_dreamcast_data_track(&tracks)?;
 
@@ -666,16 +763,13 @@ pub fn open_dreamcast_cdi_logical_media(path: &Path) -> Result<CdiLogicalMedia, 
         .checked_mul(SECTOR_SIZE)
         .ok_or(CdiIdentityError::ImpossibleOffset)?;
 
-    let reader = BinCueSectorReader::with_layout(
-        path,
-        track.file_byte_offset,
-        track.physical_sector_size,
-        track.data_offset,
-    )
-    .map_err(|error| CdiIdentityError::Parse(format!("{error:?}")))?;
-
     Ok(CdiLogicalMedia {
-        reader: RefCell::new(reader),
+        reader: RefCell::new(file),
+        path: path.to_path_buf(),
+        stamp,
+        file_byte_offset: track.file_byte_offset,
+        physical_sector_size: track.physical_sector_size,
+        data_offset: track.data_offset,
         len: logical_len,
         bytes_inspected: Cell::new(0),
     })
@@ -752,6 +846,10 @@ impl LogicalMedia for CdiLogicalMedia {
 
         let mut filled = 0usize;
         let mut reader = self.reader.borrow_mut();
+        let changed = || LogicalMediaError::DecodeFailed {
+            detail: CdiIdentityError::Changed.to_string(),
+        };
+        ensure_same_file(&reader, &self.path, &self.stamp).map_err(|_| changed())?;
         while filled < buf.len() {
             let absolute =
                 offset
@@ -763,25 +861,25 @@ impl LogicalMedia for CdiLogicalMedia {
                     })?;
             let lba = absolute / SECTOR_SIZE;
             let within_sector = (absolute % SECTOR_SIZE) as usize;
-            let sector =
-                reader
-                    .read_sector(lba)
-                    .map_err(|error| LogicalMediaError::DecodeFailed {
-                        detail: format!("{error:?}"),
-                    })?;
-            if sector.len() != SECTOR_SIZE as usize {
-                return Err(LogicalMediaError::DecodeFailed {
-                    detail: format!(
-                        "cooked sector at lba {lba} was {} bytes, expected {SECTOR_SIZE}",
-                        sector.len()
-                    ),
-                });
-            }
+            let physical = self
+                .file_byte_offset
+                .checked_add(
+                    lba.checked_mul(self.physical_sector_size)
+                        .ok_or_else(changed)?,
+                )
+                .and_then(|value| value.checked_add(self.data_offset))
+                .ok_or_else(changed)?;
+            reader
+                .seek(SeekFrom::Start(physical))
+                .map_err(|_| changed())?;
+            let mut sector = [0u8; SECTOR_SIZE as usize];
+            reader.read_exact(&mut sector).map_err(|_| changed())?;
             let take = (SECTOR_SIZE as usize - within_sector).min(buf.len() - filled);
             buf[filled..filled + take]
                 .copy_from_slice(&sector[within_sector..within_sector + take]);
             filled += take;
         }
+        ensure_same_file(&reader, &self.path, &self.stamp).map_err(|_| changed())?;
         Ok(())
     }
 }
@@ -1283,5 +1381,82 @@ mod tests {
         let report = inspect_cdi_structure(file.path());
         assert_eq!(report.status, CdiStatus::Valid);
         assert_eq!(report.selected_data_entry, None);
+    }
+
+    #[test]
+    fn replacement_between_descriptor_and_sector_read_is_refused() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("game.cdi");
+        std::fs::write(&path, build_cdi(&[vec![(1, 0, 0, 4, 0)]], None)).unwrap();
+        let media = open_dreamcast_cdi_logical_media(&path).unwrap();
+        let replacement = directory.path().join("replacement.cdi");
+        std::fs::write(&replacement, build_cdi(&[vec![(1, 0, 0, 4, 0)]], None)).unwrap();
+        std::fs::rename(&replacement, &path).unwrap();
+        let mut sector = [0u8; 2048];
+        assert!(
+            media
+                .read_at(0, &mut sector)
+                .unwrap_err()
+                .to_string()
+                .contains("changed")
+        );
+    }
+
+    #[test]
+    fn mutation_between_descriptor_and_sector_read_is_refused() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("game.cdi");
+        std::fs::write(&path, build_cdi(&[vec![(1, 0, 0, 4, 0)]], None)).unwrap();
+        let media = open_dreamcast_cdi_logical_media(&path).unwrap();
+        std::fs::OpenOptions::new()
+            .append(true)
+            .open(&path)
+            .unwrap()
+            .write_all(b"changed")
+            .unwrap();
+        let mut sector = [0u8; 2048];
+        assert!(
+            media
+                .read_at(0, &mut sector)
+                .unwrap_err()
+                .to_string()
+                .contains("changed")
+        );
+    }
+
+    #[test]
+    fn replacement_after_boot_read_is_refused_by_final_identity_check() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("game.cdi");
+        let bytes = build_cdi(&[vec![(1, 0, 0, 4, 0)]], None);
+        std::fs::write(&path, &bytes).unwrap();
+        let media = open_dreamcast_cdi_logical_media(&path).unwrap();
+        let mut header = [0u8; crate::dreamcast_boot_evidence::IP_BIN_META_BYTES];
+        media.read_at(0, &mut header).unwrap();
+        let replacement = directory.path().join("replacement.cdi");
+        std::fs::write(&replacement, &bytes).unwrap();
+        std::fs::rename(&replacement, &path).unwrap();
+        assert!(matches!(
+            media.ensure_unchanged(),
+            Err(CdiIdentityError::Changed)
+        ));
+    }
+
+    #[test]
+    fn replacement_after_descriptor_read_is_refused_before_track_selection() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("game.cdi");
+        let bytes = build_cdi(&[vec![(1, 0, 0, 4, 0)]], None);
+        std::fs::write(&path, &bytes).unwrap();
+        let (mut file, stamp) = open_cdi_file(&path).unwrap();
+        let (descriptor, data_end, _) = read_descriptor(&mut file, bytes.len() as u64).unwrap();
+        assert!(parse_descriptor(&descriptor, data_end).is_ok());
+        let replacement = directory.path().join("replacement.cdi");
+        std::fs::write(&replacement, &bytes).unwrap();
+        std::fs::rename(&replacement, &path).unwrap();
+        assert!(matches!(
+            ensure_same_file(&file, &path, &stamp),
+            Err(CdiIdentityError::Changed)
+        ));
     }
 }

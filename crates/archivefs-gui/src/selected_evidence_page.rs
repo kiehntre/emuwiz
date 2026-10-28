@@ -547,6 +547,35 @@ fn is_compressed_archive(path: &Path) -> bool {
     )
 }
 
+fn cdi_snapshot_stamp(
+    path: &Path,
+) -> Result<Option<archivefs_core::dreamcast_cdi::CdiFileStamp>, String> {
+    if !path
+        .extension()
+        .is_some_and(|extension| extension.eq_ignore_ascii_case("cdi"))
+    {
+        return Ok(None);
+    }
+    archivefs_core::dreamcast_cdi::cdi_file_stamp(path)
+        .map(Some)
+        .map_err(|error| error.to_string())
+}
+
+fn require_unchanged_cdi_snapshot(
+    path: &Path,
+    before: Option<&archivefs_core::dreamcast_cdi::CdiFileStamp>,
+) -> Result<(), String> {
+    if let Some(before) = before {
+        let after = cdi_snapshot_stamp(path).map_err(|_| {
+            "CDI source changed during inspection; refresh Game Details".to_string()
+        })?;
+        if after.as_ref() != Some(before) {
+            return Err("CDI source changed during inspection; refresh Game Details".into());
+        }
+    }
+    Ok(())
+}
+
 fn analyze_tape_file(
     path: &Path,
     platform_hint: Option<&str>,
@@ -647,6 +676,7 @@ pub(crate) fn gather_selected_evidence_fast(
     path: &Path,
     platform_hint: Option<&str>,
 ) -> Result<SelectedEvidenceReport, String> {
+    let cdi_before = cdi_snapshot_stamp(path)?;
     let archive = is_compressed_archive(path);
     let tape_analysis = analyze_tape_file(path, platform_hint);
     let structural_prefix = if archive || path.is_dir() {
@@ -690,6 +720,7 @@ pub(crate) fn gather_selected_evidence_fast(
         &game_identity_report,
         &NoIntroLookupResult::NotImported,
     );
+    require_unchanged_cdi_snapshot(path, cdi_before.as_ref())?;
 
     Ok(SelectedEvidenceReport {
         path: path.to_path_buf(),
@@ -878,6 +909,7 @@ pub(crate) fn gather_selected_evidence_with_platform(
     platform_hint: Option<&str>,
     no_intro_source: Option<&ImportedNoIntroSource>,
 ) -> Result<SelectedEvidenceReport, String> {
+    let cdi_before = cdi_snapshot_stamp(path)?;
     let bytes = std::fs::read(path)
         .map_err(|error| format!("could not read {}: {error}", path.display()))?;
     let tape_analysis = if crate::tape_analysis_page::is_tape_path(path) {
@@ -934,6 +966,7 @@ pub(crate) fn gather_selected_evidence_with_platform(
         &game_identity_report,
         &no_intro,
     );
+    require_unchanged_cdi_snapshot(path, cdi_before.as_ref())?;
 
     Ok(SelectedEvidenceReport {
         path: path.to_path_buf(),
@@ -1490,7 +1523,7 @@ fn show_structural_media_details(ui: &mut egui::Ui, details: &StructuralMediaDet
                     }
                 });
             }
-            ui.label("IP.BIN product code appears under verified identity evidence only when its bytes pass the shared Dreamcast identity reader. Track ranges do not prove a complete or bootable image. Structure and identity are separate read-only samples; refresh after the source changes.");
+            ui.label("IP.BIN product code appears under verified identity evidence only when its bytes pass the shared Dreamcast identity reader. Track ranges do not prove a complete or bootable image. A change detected between identity and structure samples refuses this Game Details inspection.");
         }
         StructuralMediaDetails::LaserDisc(details) => {
             laserdisc_details::show(ui, details);
@@ -2760,6 +2793,35 @@ mod tests {
                 .unwrap();
         assert!(
             matches!(report.structural_media, Some(StructuralMediaDetails::DreamcastCdi(ref details)) if details.status == archivefs_core::dreamcast_cdi::CdiStatus::Truncated)
+        );
+    }
+
+    #[test]
+    fn blue_cdi_snapshot_guard_refuses_replacement_and_mutation_between_stages() {
+        let bytes = synthetic_dreamcast_cdi();
+        let directory = write_temp_rom("game.cdi", &bytes);
+        let path = directory.path().join("game.cdi");
+        let before = cdi_snapshot_stamp(&path).unwrap();
+        let replacement = directory.path().join("replacement.cdi");
+        std::fs::write(&replacement, &bytes).unwrap();
+        std::fs::rename(&replacement, &path).unwrap();
+        assert!(
+            require_unchanged_cdi_snapshot(&path, before.as_ref())
+                .unwrap_err()
+                .contains("changed")
+        );
+
+        let before = cdi_snapshot_stamp(&path).unwrap();
+        std::fs::OpenOptions::new()
+            .append(true)
+            .open(&path)
+            .unwrap()
+            .write_all(b"changed")
+            .unwrap();
+        assert!(
+            require_unchanged_cdi_snapshot(&path, before.as_ref())
+                .unwrap_err()
+                .contains("changed")
         );
     }
 

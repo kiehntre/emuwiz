@@ -6345,6 +6345,23 @@ fn inspect_disc_cdi(report: &mut GameIdentityReport) {
     };
     let mut source = MediaSource::new(media);
     inspect_dreamcast_source(report, &mut source, None, None);
+    if let Err(error) = source.media.ensure_unchanged() {
+        report
+            .evidence
+            .retain(|evidence| evidence.kind != IdentityKind::DreamcastProductCode);
+        report.complete = false;
+        push_with_source(
+            report,
+            IdentityKind::DreamcastProductCode,
+            IdentityStatus::Invalid,
+            None,
+            IdentityConfidence::Unavailable,
+            None,
+            None,
+            "Dreamcast CDI source consistency",
+            &error.to_string(),
+        );
+    }
 }
 
 /// The fail-closed twin of the function above for builds where the
