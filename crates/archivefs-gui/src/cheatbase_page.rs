@@ -120,27 +120,38 @@ impl CheatBasePageState {
     }
 
     pub(crate) fn seed_from_selected(&mut self, seed: Option<CheatBaseGameSeed>) {
-        let Some(seed) = seed else {
-            return;
-        };
-        if self.seeded_for.as_ref() == Some(&seed) {
+        if self.seeded_for == seed {
             return;
         }
-        self.seeded_for = Some(seed.clone());
-        if self.title_query.trim().is_empty() {
+        // Drop the receiver for an earlier game's query so it cannot
+        // repopulate this page. A source setup task is independent of game
+        // selection and must still report its result.
+        if self
+            .task
+            .as_ref()
+            .is_some_and(|(kind, _)| *kind != TaskKind::Setup)
+        {
+            self.task = None;
+        }
+        self.search = None;
+        self.selected_game = None;
+        self.selected_cheats = None;
+        self.inspection_error = None;
+        self.seeded_for = seed.clone();
+        if let Some(seed) = seed {
             self.title_query = seed.title;
-        }
-        if self.platform_query.trim().is_empty() {
             self.platform_query = seed.platform.unwrap_or_default();
-        }
-        if self.region_query.trim().is_empty() {
             self.region_query = seed.region.unwrap_or_default();
+        } else {
+            self.title_query.clear();
+            self.platform_query.clear();
+            self.region_query.clear();
         }
     }
 
     pub(crate) fn handle(&mut self, action: CheatBasePageAction, context: egui::Context) {
         if matches!(action, CheatBasePageAction::Refresh) {
-            self.refresh_status();
+            self.start_status(context);
             return;
         }
         if matches!(
@@ -163,12 +174,19 @@ impl CheatBasePageState {
         }
     }
 
-    fn refresh_status(&mut self) {
-        self.status = Some(
-            default_cheatbase_source_root()
+    fn start_status(&mut self, context: egui::Context) {
+        if self.task.is_some() {
+            return;
+        }
+        let (sender, receiver) = mpsc::channel();
+        self.task = Some((TaskKind::Setup, receiver));
+        thread::spawn(move || {
+            let result = default_cheatbase_source_root()
                 .and_then(|root| inspect_cheatbase_source(&CheatBasePaths::at(root)))
-                .map_err(|error| error.to_string()),
-        );
+                .map_err(|error| error.to_string());
+            let _ = sender.send(TaskResult::Setup(result));
+            context.request_repaint();
+        });
     }
 
     fn source_paths() -> Result<CheatBasePaths, String> {
@@ -286,10 +304,27 @@ pub(crate) fn show_cheatbase_page(
     state: &mut CheatBasePageState,
     selected_seed: Option<CheatBaseGameSeed>,
 ) -> Option<CheatBasePageAction> {
-    if state.status.is_none() && !state.busy() {
-        state.refresh_status();
-    }
+    show_cheatbase_page_impl(ui, state, selected_seed, true)
+}
+
+pub(crate) fn show_cheatbase_browse_page(
+    ui: &mut egui::Ui,
+    state: &mut CheatBasePageState,
+    selected_seed: Option<CheatBaseGameSeed>,
+) -> Option<CheatBasePageAction> {
+    show_cheatbase_page_impl(ui, state, selected_seed, false)
+}
+
+fn show_cheatbase_page_impl(
+    ui: &mut egui::Ui,
+    state: &mut CheatBasePageState,
+    selected_seed: Option<CheatBaseGameSeed>,
+    source_management: bool,
+) -> Option<CheatBasePageAction> {
     state.seed_from_selected(selected_seed);
+    if state.status.is_none() && !state.busy() {
+        state.start_status(ui.ctx().clone());
+    }
     let mut action = None;
     ui.add_space(theme::SECTION_GAP);
     widgets::section_header(
@@ -342,63 +377,77 @@ pub(crate) fn show_cheatbase_page(
         } else if state.status.is_none() {
             ui.label("Checking whether CheatBase is set up…");
         }
-        ui.horizontal_wrapped(|ui| {
-            let enabled = !state.busy();
-            let source_disabled = state.status.as_ref().is_some_and(|status| {
-                status
-                    .as_ref()
-                    .is_ok_and(|status| status.state == CheatProviderSourceState::Disabled)
-            });
-            if widgets::action_button(
-                ui,
-                "Download pinned source",
-                widgets::ActionStyle::Primary,
-                enabled,
-            )
-            .clicked()
-            {
-                action = Some(CheatBasePageAction::Download);
-            }
-            if widgets::action_button(
-                ui,
-                "Import local database",
-                widgets::ActionStyle::Secondary,
-                enabled,
-            )
-            .clicked()
-                && let Some(path) = rfd::FileDialog::new()
-                    .add_filter("SQLite database", &["sqlite", "sqlite3", "db"])
-                    .pick_file()
-            {
-                action = Some(CheatBasePageAction::Import(path));
-            }
-            if widgets::action_button(
-                ui,
-                "Validate source",
-                widgets::ActionStyle::Quiet,
-                enabled && state.status.is_some(),
-            )
-            .clicked()
-            {
-                action = Some(CheatBasePageAction::Validate);
-            }
-            if source_disabled
-                && widgets::action_button(
+        if source_management {
+            ui.horizontal_wrapped(|ui| {
+                let enabled = !state.busy();
+                let source_disabled = state.status.as_ref().is_some_and(|status| {
+                    status
+                        .as_ref()
+                        .is_ok_and(|status| status.state == CheatProviderSourceState::Disabled)
+                });
+                if widgets::action_button(
                     ui,
-                    "Enable CheatBase",
+                    "Download pinned source",
+                    widgets::ActionStyle::Primary,
+                    enabled,
+                )
+                .clicked()
+                {
+                    action = Some(CheatBasePageAction::Download);
+                }
+                if widgets::action_button(
+                    ui,
+                    "Import local database",
                     widgets::ActionStyle::Secondary,
                     enabled,
                 )
                 .clicked()
-            {
-                action = Some(CheatBasePageAction::Enable);
-            }
-            if widgets::action_button(ui, "Refresh status", widgets::ActionStyle::Quiet, enabled)
+                    && let Some(path) = rfd::FileDialog::new()
+                        .add_filter("SQLite database", &["sqlite", "sqlite3", "db"])
+                        .pick_file()
+                {
+                    action = Some(CheatBasePageAction::Import(path));
+                }
+                if widgets::action_button(
+                    ui,
+                    "Validate source",
+                    widgets::ActionStyle::Quiet,
+                    enabled && state.status.is_some(),
+                )
                 .clicked()
-            {
+                {
+                    action = Some(CheatBasePageAction::Validate);
+                }
+                if source_disabled
+                    && widgets::action_button(
+                        ui,
+                        "Enable CheatBase",
+                        widgets::ActionStyle::Secondary,
+                        enabled,
+                    )
+                    .clicked()
+                {
+                    action = Some(CheatBasePageAction::Enable);
+                }
+                if widgets::action_button(
+                    ui,
+                    "Refresh status",
+                    widgets::ActionStyle::Quiet,
+                    enabled,
+                )
+                .clicked()
+                {
+                    action = Some(CheatBasePageAction::Refresh);
+                }
+            });
+        } else {
+            if ui.button("Refresh source status").clicked() {
                 action = Some(CheatBasePageAction::Refresh);
             }
-        });
+            if !state.source_is_usable() {
+                ui.label("CheatBase needs a validated local source before browsing is available.");
+            }
+        }
         widgets::technical_details(ui, "cheatbase-source-details", |ui| {
             if let Some(Ok(status)) = &state.status {
                 ui.label(format!("Provider: {}", status.provider.id));
@@ -489,10 +538,11 @@ pub(crate) fn show_cheatbase_page(
                             .unwrap_or(&game.upstream_system_name),
                         display_region(game)
                     ));
-                    ui.label(format!(
-                        "Available cheats: {}",
-                        game.cheat_count.unwrap_or(0)
-                    ));
+                    if let Some(count) = game.cheat_count {
+                        ui.label(format!("Available cheats: {count}"));
+                    } else {
+                        ui.label("Identity metadata only; no CheatBase cheat coverage.");
+                    }
                     if game.platform_has_cheat_coverage {
                         ui.label("Nintendo DS Action Replay records can be viewed here.");
                     } else {
@@ -570,8 +620,12 @@ pub(crate) fn show_cheatbase_page(
                     "Revision not verified"
                 }
             ));
-            let count = state.selected_cheats.as_ref().map_or(0, |page| page.total);
-            ui.label(format!("Available cheats: {count}"));
+            if game.platform_has_cheat_coverage {
+                let count = state.selected_cheats.as_ref().map_or(0, |page| page.total);
+                ui.label(format!("Available cheats: {count}"));
+            } else {
+                ui.label("Identity metadata only; no CheatBase cheat coverage.");
+            }
             ui.label(BROWSE_ONLY_COPY);
             widgets::technical_details(
                 ui,
@@ -949,7 +1003,7 @@ mod tests {
     }
 
     #[test]
-    fn selected_game_seed_only_fills_empty_search_fields() {
+    fn selected_game_seed_replaces_stale_results_and_queries() {
         let mut state = CheatBasePageState::default();
         state.seed_from_selected(Some(CheatBaseGameSeed {
             title: "Example".to_string(),
@@ -960,12 +1014,46 @@ mod tests {
         assert_eq!(state.platform_query, "Nintendo DS");
         assert_eq!(state.region_query, "USA");
         state.title_query = "Different".to_string();
+        state.selected_game = Some(game());
         state.seed_from_selected(Some(CheatBaseGameSeed {
             title: "Other".to_string(),
             platform: Some("Nintendo DS".to_string()),
             region: Some("EUR".to_string()),
         }));
-        assert_eq!(state.title_query, "Different");
+        assert_eq!(state.title_query, "Other");
+        assert_eq!(state.region_query, "EUR");
+        assert!(state.selected_game.is_none());
+        state.seed_from_selected(None);
+        assert!(state.title_query.is_empty());
+    }
+
+    #[test]
+    fn blue_browse_mode_has_no_source_mutation_controls() {
+        let mut state = CheatBasePageState::default();
+        state.status = Some(Ok(status(false, CheatProviderSourceState::NotInstalled)));
+        let context = egui::Context::default();
+        let output = context.run(egui::RawInput::default(), |context| {
+            egui::CentralPanel::default().show(context, |ui| {
+                let _ = show_cheatbase_browse_page(ui, &mut state, None);
+            });
+        });
+        assert!(rendered_text_contains(&output, "Not set up"));
+        assert!(!rendered_text_contains(&output, "Download pinned source"));
+        assert!(!rendered_text_contains(&output, "Import local database"));
+        assert!(!rendered_text_contains(&output, "Enable CheatBase"));
+    }
+
+    #[test]
+    fn metadata_only_release_never_claims_cheat_coverage() {
+        let mut state = CheatBasePageState::default();
+        state.status = Some(Ok(status(true, CheatProviderSourceState::Ready)));
+        let mut selected = game();
+        selected.platform_has_cheat_coverage = false;
+        selected.cheat_count = None;
+        state.selected_game = Some(selected);
+        let output = render(&mut state);
+        assert!(rendered_text_contains(&output, "Identity metadata only"));
+        assert!(!rendered_text_contains(&output, "Available cheats: 0"));
     }
 
     #[test]
