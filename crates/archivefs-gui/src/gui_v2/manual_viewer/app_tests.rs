@@ -1,6 +1,31 @@
 use super::*;
 use crate::gui_v2::manual_viewer::tests::{cbr, cbz};
 
+fn wait_for_documents(
+    context: &egui::Context,
+    app: &mut App,
+    size: [f32; 2],
+    count: usize,
+) -> egui::FullOutput {
+    let deadline = Instant::now() + Duration::from_secs(10);
+    loop {
+        let output = frame(context, app, size);
+        if !app.document_refresh.stale()
+            && app
+                .document_cache
+                .as_ref()
+                .is_some_and(|(_, _, docs)| docs.len() == count)
+        {
+            return output;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "document discovery did not finish"
+        );
+        std::thread::sleep(Duration::from_millis(10));
+    }
+}
+
 #[test]
 fn manual_viewer_opens_from_existing_artwork_manual_panel_without_desktop_handler() {
     let context = egui::Context::default();
@@ -17,7 +42,7 @@ fn manual_viewer_opens_from_existing_artwork_manual_panel_without_desktop_handle
         game: 9,
     };
     app.router.current = route.clone();
-    frame(&context, &mut app, [1280.0, 2400.0]);
+    wait_for_documents(&context, &mut app, [1280.0, 2400.0], 1);
     let documents = &mut app.document_cache.as_mut().unwrap().2;
     assert_eq!(documents.len(), 1);
     documents[0].viewer = documents::DocumentOpenCapability::NoHandler;
@@ -298,7 +323,7 @@ fn selected_game_details_show_existing_guides_and_refresh_after_provider_index_c
     app.library = Arc::new(Library::new(vec![game]));
     app.artwork.index = Some(Arc::new(MediaIndex::default()));
     app.router.current = Route::Game(9);
-    let output = frame(&context, &mut app, [1280.0, 4800.0]);
+    let output = wait_for_documents(&context, &mut app, [1280.0, 4800.0], 0);
     let strings = text(&output);
     assert!(strings.iter().any(|s| s == "Manuals & Guides"));
     assert!(strings.iter().any(|s| s == "Associate local document…"));
@@ -306,7 +331,7 @@ fn selected_game_details_show_existing_guides_and_refresh_after_provider_index_c
     let path = root.path().join("Strategy guide.cbz");
     cbz(&path);
     app.artwork.index = Some(Arc::new(MediaIndex::default()));
-    let output = frame(&context, &mut app, [1280.0, 4800.0]);
+    let output = wait_for_documents(&context, &mut app, [1280.0, 4800.0], 1);
     let strings = text(&output);
     assert!(strings.iter().any(|s| s == "Open internally"));
     assert!(strings.iter().any(|s| s == "Strategy guide"));
@@ -333,7 +358,7 @@ fn selected_game_details_refreshes_a_removed_document_at_1024_by_600() {
     app.document_preferences
         .associations
         .insert(path.clone(), 9);
-    frame(&context, &mut app, [1024.0, 600.0]);
+    wait_for_documents(&context, &mut app, [1024.0, 600.0], 1);
     assert!(
         app.document_cache.as_ref().unwrap().2[0]
             .document_id
@@ -377,7 +402,7 @@ fn selected_game_details_refreshes_changed_comic_format() {
     game.absolute_path = root.path().join("Rez.iso");
     app.library = Arc::new(Library::new(vec![game]));
     app.router.current = Route::Game(9);
-    frame(&context, &mut app, [1024.0, 600.0]);
+    wait_for_documents(&context, &mut app, [1024.0, 600.0], 1);
     assert_eq!(
         app.document_cache.as_ref().unwrap().2[0].format,
         documents::GameDocumentFormat::Cbz
@@ -414,7 +439,7 @@ fn blocked_document_mount_does_not_stall_game_details_or_leave_readiness_trusted
     app.library = Arc::new(Library::new(vec![game.clone()]));
     let game = app.library.game(9).unwrap().clone();
     app.router.current = Route::Game(9);
-    frame(&context, &mut app, [1024.0, 600.0]);
+    wait_for_documents(&context, &mut app, [1024.0, 600.0], 1);
     let release = app.document_refresh.block_worker_for_test();
     let start = Instant::now();
     frame(&context, &mut app, [1024.0, 600.0]);
@@ -452,4 +477,41 @@ fn blocked_document_mount_does_not_stall_game_details_or_leave_readiness_trusted
         );
         std::thread::sleep(Duration::from_millis(10));
     }
+}
+
+#[test]
+fn blocked_first_document_load_and_manual_refresh_do_not_block_the_gui() {
+    let context = egui::Context::default();
+    let mut app = fixture(&context);
+    let root = tempfile::tempdir().unwrap();
+    let path = root.path().join("Rez.cbz");
+    cbz(&path);
+    let mut game = archive(9, "Rez", Some("Dreamcast"));
+    game.absolute_path = root.path().join("Rez.iso");
+    app.library = Arc::new(Library::new(vec![game]));
+    app.router.current = Route::Game(9);
+
+    let release = app.document_refresh.block_worker_for_test();
+    let start = Instant::now();
+    frame(&context, &mut app, [1024.0, 600.0]);
+    assert!(
+        start.elapsed() < Duration::from_secs(2),
+        "first discovery blocked the GUI"
+    );
+    assert!(app.document_refresh.stale());
+    assert!(app.document_cache.as_ref().unwrap().2.is_empty());
+    release.send(()).unwrap();
+    wait_for_documents(&context, &mut app, [1024.0, 600.0], 1);
+
+    let release = app.document_refresh.block_worker_for_test();
+    app.document_cache = None; // The Refresh documents button invalidates this cache.
+    let start = Instant::now();
+    frame(&context, &mut app, [1024.0, 600.0]);
+    assert!(
+        start.elapsed() < Duration::from_secs(2),
+        "manual refresh blocked the GUI"
+    );
+    assert!(app.document_refresh.stale());
+    release.send(()).unwrap();
+    wait_for_documents(&context, &mut app, [1024.0, 600.0], 1);
 }

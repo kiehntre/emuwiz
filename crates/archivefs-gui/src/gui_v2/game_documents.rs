@@ -45,7 +45,7 @@ impl DocumentRefresh {
     fn reset(&mut self) {
         self.generation = self.generation.wrapping_add(1);
         self.pending = false;
-        self.last_confirmed = Some(Instant::now());
+        self.last_confirmed = None;
     }
 
     fn ensure_worker(&mut self, context: &egui::Context) {
@@ -240,14 +240,9 @@ impl App {
                 .as_ref()
                 .is_none_or(|(id, cached_path, _)| *id != game_id || *cached_path != path)
         {
-            let (documents, issue) = discover_game_documents(
-                game,
-                &self.document_preferences,
-                self.artwork.index.as_deref(),
-            );
-            self.document_cache = Some((game_id, path, documents));
+            self.document_cache = Some((game_id, path, Vec::new()));
             self.document_index = self.artwork.index.clone();
-            self.document_issue = issue;
+            self.document_issue = None;
             self.document_refresh.reset();
         } else if let Some(reply) = self.document_refresh.poll(ui.ctx()) {
             self.document_cache = Some((game_id, path, reply.documents));
@@ -294,7 +289,7 @@ impl App {
                 if let Some(issue) = &self.document_issue { ui.label(issue); }
                 if unverified { ui.label("Document files are being checked in the background. Opening is paused until they can be verified."); }
                 if documents.is_empty() {
-                    ui.weak("No manual or guide is associated with this game. Choose a local document to add one.");
+                    if !unverified { ui.weak("No manual or guide is associated with this game. Choose a local document to add one."); }
                     return;
                 }
             for document in documents {
