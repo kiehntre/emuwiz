@@ -56,6 +56,7 @@ mod media_sources;
 mod missing_review;
 mod mods;
 mod mounts_page;
+mod multi_selection;
 mod native_workflows;
 mod needs_attention_page;
 mod netplay_preview;
@@ -355,6 +356,12 @@ pub(super) struct App {
     index_job: Option<u64>,
     /// How many shelf cards Browse & Play draws, and the scope it was chosen for.
     browse_play: browse_play::BrowsePlayState,
+    batch_selection: multi_selection::MultiSelection,
+    batch_state: crate::screenscraper_batch_enrichment_page::ScreenScraperBatchState,
+    batch_open: bool,
+    batch_selecting: bool,
+    batch_message: Option<String>,
+    batch_changed: bool,
     preferences_dirty: Option<Instant>,
     /// Initial Restore must finish before a settings snapshot can be queued.
     preferences_restored: bool,
@@ -474,6 +481,14 @@ impl App {
             artwork_job: None,
             index_job: None,
             browse_play: Default::default(),
+            batch_selection: multi_selection::MultiSelection::with_limit(
+                archivefs_core::screenscraper_enrichment::MAX_EXPLICIT_BATCH_SIZE,
+            ),
+            batch_state: Default::default(),
+            batch_open: false,
+            batch_selecting: false,
+            batch_message: None,
+            batch_changed: false,
             preferences_dirty: None,
             preferences_restored: false,
             interacted: false,
@@ -1781,6 +1796,7 @@ impl App {
                                             technical: String::new(),
                                         });
                                     }
+                                    self.batch_selection.clear();
                                     self.library = library;
                                     // Remembered pages may name a game by an older catalogue
                                     // entry; point them at the current copy.

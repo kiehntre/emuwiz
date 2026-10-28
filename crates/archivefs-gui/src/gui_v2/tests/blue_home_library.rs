@@ -56,6 +56,37 @@ fn games() -> Vec<PersistedArchive> {
 }
 
 #[test]
+fn blue_batch_review_stays_visible_at_1024_by_600() {
+    let context = egui::Context::default();
+    let mut app = blue_app(&context, games());
+    app.router.current = Route::BrowsePlay;
+    app.batch_selecting = true;
+    app.batch_selection.toggle(1).unwrap();
+    let selected = app.library.game(1).unwrap();
+    app.batch_state
+        .prepare_blue(vec![(selected.archive.clone(), None)])
+        .unwrap();
+    app.batch_open = true;
+    let strings = shown(&context, &mut app, COMPACT);
+    assert!(has(&strings, "1 / 25 selected"));
+    assert!(has(&strings, "Batch metadata enrichment"));
+    assert!(has(&strings, "Start selected enrichment"));
+    assert!(has(&strings, "Cancel batch"));
+    let output = frame(&context, &mut app, COMPACT);
+    let cancel = text_bounds(&output, "Cancel batch");
+    assert_eq!(cancel.len(), 1, "Cancel batch must be painted once");
+    assert!(
+        egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(COMPACT[0], COMPACT[1]))
+            .contains_rect(cancel[0]),
+        "Cancel batch must fit inside the compact screen: {:?}",
+        cancel[0]
+    );
+    click(&context, &mut app, COMPACT, cancel[0].center());
+    assert!(!app.batch_open);
+    assert!(!app.batch_state.active());
+}
+
+#[test]
 fn blue_home_shows_the_welcome_tasks_and_setup_without_the_classic_layout() {
     let context = egui::Context::default();
     let mut app = blue_app(&context, games());

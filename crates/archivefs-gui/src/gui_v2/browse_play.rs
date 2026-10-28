@@ -271,6 +271,9 @@ impl App {
         let page_width = ui.available_width() - theme::SPACE_MD;
 
         self.browse_play_toolbar(ui);
+        self.batch_selection
+            .retain(|id| library.by_id.contains_key(&id));
+        self.browse_play_batch_controls(ui, &library);
         ui.add_space(theme::SPACE_XS);
         self.browse_play_systems(ui, &library);
         let indices = self.browse_play_indices();
@@ -315,6 +318,120 @@ impl App {
                 ui.add_space(theme::SPACE_SM);
             }
             self.browse_play_games(ui, &library, &indices, selected_id);
+        }
+        self.browse_play_batch_window(ui.ctx());
+    }
+
+    fn browse_play_batch_controls(&mut self, ui: &mut egui::Ui, library: &super::library::Library) {
+        ui.horizontal_wrapped(|ui| {
+            if ui
+                .button(if self.batch_selecting {
+                    "Done selecting"
+                } else {
+                    "Select games"
+                })
+                .clicked()
+            {
+                self.batch_selecting = !self.batch_selecting;
+            }
+            if self.batch_selecting || self.batch_selection.len() > 0 || self.batch_state.active() {
+                ui.label(format!("{} / 25 selected", self.batch_selection.len()));
+                if ui
+                    .add_enabled(
+                        self.batch_selection.len() > 0 || self.batch_state.active(),
+                        egui::Button::new(if self.batch_state.active() {
+                            "Resume batch"
+                        } else {
+                            "Enrich metadata"
+                        }),
+                    )
+                    .clicked()
+                {
+                    if !self.batch_state.active() {
+                        let games = self
+                            .batch_selection
+                            .ids()
+                            .filter_map(|id| library.game(id))
+                            .map(|game| (game.archive.clone(), game.screenscraper.clone()))
+                            .collect();
+                        self.batch_message = self.batch_state.prepare_blue(games).err();
+                    }
+                    self.batch_open = true;
+                }
+                if ui.small_button("Clear selection").clicked() {
+                    self.batch_selection.clear();
+                }
+            }
+        });
+        if let Some(message) = &self.batch_message {
+            ui.colored_label(ui.visuals().error_fg_color, message);
+        }
+    }
+
+    fn browse_play_batch_window(&mut self, context: &egui::Context) {
+        if !self.batch_open {
+            return;
+        }
+        let mut open = self.batch_open;
+        egui::Window::new("Batch metadata enrichment")
+            .open(&mut open)
+            .resizable(true)
+            .vscroll(true)
+            .default_width(580.0)
+            .max_width(700.0)
+            .max_height(500.0)
+            .show(context, |ui| {
+                let workflows = self.native_workflows.get_or_insert_with(|| {
+                    super::native_workflows::NativeWorkflows::new(context.clone())
+                });
+                if let Some(
+                    crate::screenscraper_enrichment_page::ScreenScraperEnrichmentAction::Apply {
+                        archive_id,
+                        values,
+                        receipt,
+                    },
+                ) = crate::screenscraper_batch_enrichment_page::show_blue(
+                    ui,
+                    &mut self.batch_state,
+                    &workflows.app.screenscraper_page,
+                ) {
+                    let result = self
+                        .batch_state
+                        .current_blue_write(archive_id)
+                        .ok_or_else(|| "The reviewed game is no longer current.".to_string())
+                        .and_then(|(expected, prior_values, prior_receipt)| {
+                            archivefs_core::default_database_path()
+                                .and_then(archivefs_core::Database::open_or_create)
+                                .and_then(|mut db| {
+                                    db.apply_screenscraper_enrichment_if_current(
+                                        &expected,
+                                        prior_values.as_ref(),
+                                        prior_receipt.as_ref(),
+                                        &values,
+                                        &receipt,
+                                    )
+                                })
+                                .map_err(|error| error.to_string())
+                        });
+                    match result {
+                        Ok(()) => {
+                            self.batch_state.mark_applied(archive_id);
+                            self.batch_changed = true;
+                        }
+                        Err(error) => self.batch_state.mark_apply_failed(archive_id, error),
+                    }
+                }
+                if self.batch_state.active() {
+                    context.request_repaint_after(std::time::Duration::from_millis(100));
+                }
+            });
+        if !self.batch_state.active() {
+            open = false;
+        }
+        self.batch_open = open;
+        if !open && self.batch_changed {
+            self.batch_changed = false;
+            self.load(false);
         }
     }
 
@@ -782,7 +899,21 @@ impl App {
             let response = response
                 .on_hover_cursor(egui::CursorIcon::PointingHand)
                 .on_hover_text(format!("{}\n{}", game.title, game.platform));
-            if response.clicked() {
+            if self.batch_selecting {
+                let mark = if self.batch_selection.contains(id) {
+                    "☑"
+                } else {
+                    "☐"
+                };
+                Self::paint_batch_mark(ui, rect, mark);
+                if response.clicked() {
+                    self.batch_message = self
+                        .batch_selection
+                        .toggle(id)
+                        .err()
+                        .map(|limit| format!("Select no more than {limit} games."));
+                }
+            } else if response.clicked() {
                 self.go(Route::BrowsePlayGame(id));
             }
         });
@@ -834,10 +965,40 @@ impl App {
                 );
             });
             let response = response.on_hover_cursor(egui::CursorIcon::PointingHand);
-            if response.clicked() {
+            if self.batch_selecting {
+                let mark = if self.batch_selection.contains(id) {
+                    "☑"
+                } else {
+                    "☐"
+                };
+                Self::paint_batch_mark(ui, rect, mark);
+                if response.clicked() {
+                    self.batch_message = self
+                        .batch_selection
+                        .toggle(id)
+                        .err()
+                        .map(|limit| format!("Select no more than {limit} games."));
+                }
+            } else if response.clicked() {
                 self.go(Route::BrowsePlayGame(id));
             }
         });
+    }
+
+    fn paint_batch_mark(ui: &egui::Ui, rect: egui::Rect, mark: &str) {
+        let badge = egui::Rect::from_center_size(
+            rect.right_top() + egui::vec2(-19.0, 19.0),
+            egui::vec2(28.0, 28.0),
+        );
+        ui.painter()
+            .rect_filled(badge, 6.0, theme::blue::SELECTED_FILL);
+        ui.painter().text(
+            badge.center(),
+            egui::Align2::CENTER_CENTER,
+            mark,
+            egui::FontId::proportional(20.0),
+            theme::PRIMARY_TEXT,
+        );
     }
 
     /// The selected game. Full panel beside the shelf, or a compact strip when

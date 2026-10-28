@@ -7018,6 +7018,56 @@ impl Database {
         values: &crate::screenscraper_enrichment::AcceptedScreenScraperMetadata,
         receipt: &crate::screenscraper_enrichment::ScreenScraperEnrichmentReceipt,
     ) -> Result<()> {
+        self.apply_screenscraper_enrichment_checked(archive_id, None, None, values, receipt)
+    }
+
+    /// Blue batch writes must still target the same saved game and the same
+    /// previously accepted metadata that the user reviewed.
+    pub fn screenscraper_batch_game_is_current(&self, expected: &PersistedArchive) -> Result<bool> {
+        type BatchGameIdentity = (i64, Vec<u8>, Option<i64>, Option<i64>, Option<String>);
+        let current: Option<BatchGameIdentity> = self.connection
+            .query_row(
+                "SELECT a.source_folder_id, a.absolute_path_cached, a.size_bytes, a.modified_time_unix_seconds, p.platform FROM archives a LEFT JOIN platform_assignments p ON p.archive_id = a.id AND p.is_current = 1 WHERE a.id = ?1 AND a.archive_kind = ?2 AND a.last_seen_at = ?3 AND a.last_verified_missing_at IS NULL",
+                params![expected.id, expected.archive_kind, expected.last_seen_at],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?, row.get(4)?)),
+            ).optional().map_err(|error| db_error("failed to check batch game identity", error))?;
+        Ok(current.is_some_and(|current| {
+            current.0 == expected.source_folder_id
+                && current.1 == expected.absolute_path.as_os_str().as_bytes()
+                && current.2.map(|size| size as u64) == expected.size_bytes
+                && current.3 == expected.modified_time_unix_seconds
+                && current.4 == expected.platform
+        }))
+    }
+
+    pub fn apply_screenscraper_enrichment_if_current(
+        &mut self,
+        expected: &PersistedArchive,
+        prior_values: Option<&crate::screenscraper_enrichment::AcceptedScreenScraperMetadata>,
+        prior_receipt: Option<&crate::screenscraper_enrichment::ScreenScraperEnrichmentReceipt>,
+        values: &crate::screenscraper_enrichment::AcceptedScreenScraperMetadata,
+        receipt: &crate::screenscraper_enrichment::ScreenScraperEnrichmentReceipt,
+    ) -> Result<()> {
+        self.apply_screenscraper_enrichment_checked(
+            expected.id,
+            Some(expected),
+            Some((prior_values, prior_receipt)),
+            values,
+            receipt,
+        )
+    }
+
+    fn apply_screenscraper_enrichment_checked(
+        &mut self,
+        archive_id: i64,
+        expected: Option<&PersistedArchive>,
+        prior: Option<(
+            Option<&crate::screenscraper_enrichment::AcceptedScreenScraperMetadata>,
+            Option<&crate::screenscraper_enrichment::ScreenScraperEnrichmentReceipt>,
+        )>,
+        values: &crate::screenscraper_enrichment::AcceptedScreenScraperMetadata,
+        receipt: &crate::screenscraper_enrichment::ScreenScraperEnrichmentReceipt,
+    ) -> Result<()> {
         if receipt.provider != "ScreenScraper" {
             return Err(ArchiveFsError::Database(
                 "metadata enrichment receipt has an unexpected provider".to_string(),
@@ -7047,6 +7097,59 @@ impl Database {
             return Err(ArchiveFsError::Database(format!(
                 "cannot enrich unknown archive {archive_id}"
             )));
+        }
+        if let Some(expected) = expected {
+            let current: (i64, Vec<u8>, Option<i64>, Option<i64>, Option<String>) = transaction
+                .query_row(
+                    "SELECT a.source_folder_id, a.absolute_path_cached, a.size_bytes, a.modified_time_unix_seconds, p.platform FROM archives a LEFT JOIN platform_assignments p ON p.archive_id = a.id AND p.is_current = 1 WHERE a.id = ?1 AND a.archive_kind = ?2 AND a.last_seen_at = ?3 AND a.last_verified_missing_at IS NULL",
+                    params![archive_id, expected.archive_kind, expected.last_seen_at],
+                    |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?, row.get(4)?)),
+                )
+                .map_err(|error| db_error("failed to validate batch game identity", error))?;
+            if current.0 != expected.source_folder_id
+                || current.1 != expected.absolute_path.as_os_str().as_bytes()
+                || current.2.map(|size| size as u64) != expected.size_bytes
+                || current.3 != expected.modified_time_unix_seconds
+                || current.4 != expected.platform
+            {
+                return Err(ArchiveFsError::Database(
+                    "batch game identity changed during review".into(),
+                ));
+            }
+        }
+        if let Some((prior_values, prior_receipt)) = prior {
+            if prior_values.is_some() != prior_receipt.is_some() {
+                return Err(ArchiveFsError::Database(
+                    "incomplete previous enrichment snapshot".into(),
+                ));
+            }
+            let current: Option<(Vec<u8>, Vec<u8>)> = transaction
+                .query_row(
+                    "SELECT values_json, receipt_json FROM screenscraper_enrichments WHERE archive_id = ?1",
+                    [archive_id],
+                    |row| Ok((row.get(0)?, row.get(1)?)),
+                )
+                .optional()
+                .map_err(|error| db_error("failed to validate previous enrichment", error))?;
+            let expected = prior_values
+                .zip(prior_receipt)
+                .map(|(values, receipt)| {
+                    Ok::<_, serde_json::Error>((
+                        serde_json::to_vec(values)?,
+                        serde_json::to_vec(receipt)?,
+                    ))
+                })
+                .transpose()
+                .map_err(|error| {
+                    ArchiveFsError::Database(format!(
+                        "failed to encode previous enrichment: {error}"
+                    ))
+                })?;
+            if current != expected {
+                return Err(ArchiveFsError::Database(
+                    "accepted metadata changed during review".into(),
+                ));
+            }
         }
         transaction
             .execute(
@@ -17174,6 +17277,166 @@ echo "$out"
         assert_eq!(saved[0].values, values);
         assert_eq!(saved[0].receipt.provider_record_id, "123");
         assert_eq!(database.load_archives().unwrap()[0].platform, None);
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn screenscraper_batch_write_rejects_stale_identity_and_prior_receipt() {
+        use crate::screenscraper_enrichment::{
+            AcceptedScreenScraperMetadata, ScreenScraperEnrichmentReceipt,
+        };
+        let (root, mut database, archive_id) =
+            unknown_archive_database("screenscraper-batch-boundary");
+        let expected = database.load_archives().unwrap().remove(0);
+        let values = AcceptedScreenScraperMetadata {
+            synopsis: Some("Accepted".into()),
+            ..Default::default()
+        };
+        let receipt = ScreenScraperEnrichmentReceipt {
+            provider: "ScreenScraper".into(),
+            provider_record_id: "77".into(),
+            retrieved_at_unix_seconds: 1,
+            match_basis: "review".into(),
+            before: Default::default(),
+            accepted: values.clone(),
+            media_reference_count: 0,
+        };
+        let rom_before = fs::read(&expected.absolute_path).unwrap();
+        assert!(
+            database
+                .screenscraper_batch_game_is_current(&expected)
+                .unwrap()
+        );
+        database
+            .apply_screenscraper_enrichment_if_current(&expected, None, None, &values, &receipt)
+            .unwrap();
+        assert!(
+            database
+                .apply_screenscraper_enrichment_if_current(&expected, None, None, &values, &receipt)
+                .is_err()
+        );
+        let mut stale = expected.clone();
+        stale.absolute_path = root.join("different.zip");
+        assert!(
+            !database
+                .screenscraper_batch_game_is_current(&stale)
+                .unwrap()
+        );
+        assert!(
+            database
+                .apply_screenscraper_enrichment_if_current(
+                    &stale,
+                    Some(&values),
+                    Some(&receipt),
+                    &values,
+                    &receipt
+                )
+                .is_err()
+        );
+        let mut removed = expected.clone();
+        removed.id = archive_id + 1000;
+        assert!(
+            !database
+                .screenscraper_batch_game_is_current(&removed)
+                .unwrap()
+        );
+        assert!(
+            database
+                .apply_screenscraper_enrichment_if_current(&removed, None, None, &values, &receipt)
+                .is_err()
+        );
+        assert_eq!(
+            database.load_screenscraper_enrichments().unwrap()[0].receipt,
+            receipt
+        );
+        assert_eq!(fs::read(&expected.absolute_path).unwrap(), rom_before);
+        assert!(!root.join("media").exists());
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn screenscraper_batch_write_rejects_changed_values_or_provenance() {
+        use crate::screenscraper_enrichment::{
+            AcceptedScreenScraperMetadata, ScreenScraperEnrichmentReceipt,
+        };
+        let (root, mut database, archive_id) =
+            unknown_archive_database("screenscraper-batch-prior-state");
+        let expected = database.load_archives().unwrap().remove(0);
+        let rom_before = fs::read(&expected.absolute_path).unwrap();
+        let accepted = AcceptedScreenScraperMetadata {
+            genre: Some("Puzzle".into()),
+            ..Default::default()
+        };
+        let receipt = ScreenScraperEnrichmentReceipt {
+            provider: "ScreenScraper".into(),
+            provider_record_id: "77".into(),
+            retrieved_at_unix_seconds: 1,
+            match_basis: "review".into(),
+            before: Default::default(),
+            accepted: accepted.clone(),
+            media_reference_count: 0,
+        };
+        database
+            .apply_screenscraper_enrichment_if_current(&expected, None, None, &accepted, &receipt)
+            .unwrap();
+        let replacement = AcceptedScreenScraperMetadata {
+            genre: Some("Adventure".into()),
+            ..Default::default()
+        };
+        database
+            .connection
+            .execute(
+                "UPDATE screenscraper_enrichments SET values_json = ?1 WHERE archive_id = ?2",
+                rusqlite::params![serde_json::to_vec(&replacement).unwrap(), archive_id],
+            )
+            .unwrap();
+        assert!(
+            database
+                .apply_screenscraper_enrichment_if_current(
+                    &expected,
+                    Some(&accepted),
+                    Some(&receipt),
+                    &accepted,
+                    &receipt,
+                )
+                .is_err()
+        );
+        assert_eq!(
+            database.load_screenscraper_enrichments().unwrap()[0].values,
+            replacement
+        );
+
+        let changed_receipt = ScreenScraperEnrichmentReceipt {
+            provider_record_id: "other-record".into(),
+            ..receipt.clone()
+        };
+        database
+            .connection
+            .execute(
+                "UPDATE screenscraper_enrichments SET values_json = ?1, receipt_json = ?2 WHERE archive_id = ?3",
+                rusqlite::params![
+                    serde_json::to_vec(&accepted).unwrap(),
+                    serde_json::to_vec(&changed_receipt).unwrap(),
+                    archive_id
+                ],
+            )
+            .unwrap();
+        assert!(
+            database
+                .apply_screenscraper_enrichment_if_current(
+                    &expected,
+                    Some(&accepted),
+                    Some(&receipt),
+                    &replacement,
+                    &receipt,
+                )
+                .is_err()
+        );
+        assert_eq!(
+            database.load_screenscraper_enrichments().unwrap()[0].receipt,
+            changed_receipt
+        );
+        assert_eq!(fs::read(&expected.absolute_path).unwrap(), rom_before);
         let _ = fs::remove_dir_all(root);
     }
 
