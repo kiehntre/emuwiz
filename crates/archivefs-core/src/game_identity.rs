@@ -876,6 +876,37 @@ pub fn inspect_catalogued_game_identity(
     inspect_game_identity_with_platform_trust(path, platform_hint, true, &TrustedRoots::none())
 }
 
+/// Catalogue CDI inspection bound to a caller's initial file stamp. A changed
+/// source produces invalid CDI evidence before descriptor or boot reads.
+#[cfg(feature = "dreamcast-cdi")]
+pub fn inspect_catalogued_game_identity_with_cdi_stamp(
+    path: &Path,
+    platform_hint: Option<&str>,
+    expected: &crate::dreamcast_cdi::CdiFileStamp,
+) -> Result<GameIdentityReport, crate::dreamcast_cdi::CdiIdentityError> {
+    let report = inspect_game_identity_with_platform_trust_and_budget(
+        path,
+        platform_hint,
+        true,
+        &TrustedRoots::none(),
+        None,
+        Some(expected),
+    );
+    if report.evidence.iter().any(|evidence| {
+        evidence.kind == IdentityKind::DreamcastProductCode
+            && evidence.diagnostic == crate::dreamcast_cdi::CdiIdentityError::Changed.to_string()
+    }) {
+        Err(crate::dreamcast_cdi::CdiIdentityError::Changed)
+    } else {
+        Ok(report)
+    }
+}
+
+#[cfg(feature = "dreamcast-cdi")]
+type CdiExpectedStamp<'a> = Option<&'a crate::dreamcast_cdi::CdiFileStamp>;
+#[cfg(not(feature = "dreamcast-cdi"))]
+type CdiExpectedStamp<'a> = Option<&'a ()>;
+
 /// Like [`inspect_catalogued_game_identity`], but permitted to follow a symlink
 /// contained by `trusted` - see [`crate::safe_read`]. `trusted` governs only
 /// *reading*: it is never used as a write destination.
@@ -903,6 +934,7 @@ pub fn inspect_catalogued_game_identity_in_roots_with_budget(
         true,
         trusted,
         Some(max_bytes_read.min(MAX_BYTES_READ)),
+        None,
     )
 }
 
@@ -918,6 +950,7 @@ fn inspect_game_identity_with_platform_trust(
         trusted_platform,
         trusted,
         None,
+        None,
     )
 }
 
@@ -927,6 +960,7 @@ fn inspect_game_identity_with_platform_trust_and_budget(
     trusted_platform: bool,
     trusted: &TrustedRoots,
     native_budget: Option<u64>,
+    cdi_expected: CdiExpectedStamp<'_>,
 ) -> GameIdentityReport {
     let platform = IdentityPlatform::from_catalogue(platform_hint);
     let mut report = GameIdentityReport {
@@ -1149,7 +1183,7 @@ fn inspect_game_identity_with_platform_trust_and_budget(
             inspect_gdi(&mut report, trusted);
         }
         "cdi" if platform == IdentityPlatform::Dreamcast => {
-            inspect_disc_cdi(&mut report);
+            inspect_disc_cdi(&mut report, cdi_expected);
         }
         "cue"
             if matches!(
@@ -6309,15 +6343,39 @@ fn inspect_dreamcast_gdrom_chd(report: &mut GameIdentityReport) {
 /// [`inspect_dreamcast_source`] every other Dreamcast source (ISO, CUE,
 /// GDI, GD-ROM CHD) already uses.
 #[cfg(feature = "dreamcast-cdi")]
-fn inspect_disc_cdi(report: &mut GameIdentityReport) {
+fn inspect_disc_cdi(report: &mut GameIdentityReport, expected: CdiExpectedStamp<'_>) {
     report.format = IdentityImageFormat::Cdi;
-    let media = match crate::dreamcast_cdi::open_dreamcast_cdi_logical_media(&report.archive_path) {
+    let opened = match expected {
+        Some(expected) => {
+            crate::dreamcast_cdi::open_dreamcast_cdi_logical_media_with_expected_stamp(
+                &report.archive_path,
+                expected,
+            )
+        }
+        None => crate::dreamcast_cdi::open_dreamcast_cdi_logical_media(&report.archive_path),
+    };
+    let media = match opened {
         Ok(media) => media,
         Err(error) => {
+            let status = match &error {
+                crate::dreamcast_cdi::CdiIdentityError::UnsupportedVersion(_)
+                | crate::dreamcast_cdi::CdiIdentityError::UnsupportedSectorLayout => {
+                    IdentityStatus::Unsupported
+                }
+                crate::dreamcast_cdi::CdiIdentityError::AmbiguousDataTracks => {
+                    IdentityStatus::Ambiguous
+                }
+                crate::dreamcast_cdi::CdiIdentityError::TooLarge { .. }
+                | crate::dreamcast_cdi::CdiIdentityError::MetadataTooLarge { .. }
+                | crate::dreamcast_cdi::CdiIdentityError::TooManyTracks => {
+                    IdentityStatus::ResourceLimitReached
+                }
+                _ => IdentityStatus::Invalid,
+            };
             push_with_source(
                 report,
                 IdentityKind::DreamcastProductCode,
-                IdentityStatus::Invalid,
+                status,
                 None,
                 IdentityConfidence::Unavailable,
                 None,
@@ -6330,6 +6388,23 @@ fn inspect_disc_cdi(report: &mut GameIdentityReport) {
     };
     let mut source = MediaSource::new(media);
     inspect_dreamcast_source(report, &mut source, None, None);
+    if let Err(error) = source.media.ensure_unchanged() {
+        report
+            .evidence
+            .retain(|evidence| evidence.kind != IdentityKind::DreamcastProductCode);
+        report.complete = false;
+        push_with_source(
+            report,
+            IdentityKind::DreamcastProductCode,
+            IdentityStatus::Invalid,
+            None,
+            IdentityConfidence::Unavailable,
+            None,
+            None,
+            "Dreamcast CDI source consistency",
+            &error.to_string(),
+        );
+    }
 }
 
 /// The fail-closed twin of the function above for builds where the
@@ -6339,7 +6414,7 @@ fn inspect_disc_cdi(report: &mut GameIdentityReport) {
 /// magic string or guesses a product code from a filename as a
 /// substitute.
 #[cfg(not(feature = "dreamcast-cdi"))]
-fn inspect_disc_cdi(report: &mut GameIdentityReport) {
+fn inspect_disc_cdi(report: &mut GameIdentityReport, _expected: CdiExpectedStamp<'_>) {
     report.format = IdentityImageFormat::Cdi;
     add_unavailable(
         report,
@@ -10069,6 +10144,40 @@ mod tests {
         assert_eq!(report.format, IdentityImageFormat::Cdi);
         assert_eq!(report.verified_dreamcast_product_code(), None);
         assert!(!report.complete);
+    }
+
+    #[test]
+    #[cfg(feature = "dreamcast-cdi")]
+    fn dreamcast_cdi_refusals_do_not_create_launch_identity() {
+        let directory = FixtureDir::new("dreamcast-cdi-refusals");
+        let mut unsupported = cdi_bytes(&[vec![(1, 0, 0, 4, 0)]]);
+        let footer = unsupported.len() - 8;
+        unsupported[footer..footer + 4].copy_from_slice(&0x8000_0007u32.to_le_bytes());
+        let path = write_fixture(&directory, "unsupported.cdi", &unsupported);
+        let report = inspect_game_identity(&path, Some("Dreamcast"));
+        assert_eq!(
+            report
+                .evidence
+                .iter()
+                .find(|e| e.kind == IdentityKind::DreamcastProductCode)
+                .unwrap()
+                .status,
+            IdentityStatus::Unsupported
+        );
+        assert_eq!(report.verified_dreamcast_product_code(), None);
+
+        let path = write_fixture(&directory, "truncated.cdi", b"short");
+        let report = inspect_game_identity(&path, Some("Dreamcast"));
+        assert_eq!(
+            report
+                .evidence
+                .iter()
+                .find(|e| e.kind == IdentityKind::DreamcastProductCode)
+                .unwrap()
+                .status,
+            IdentityStatus::Invalid
+        );
+        assert_eq!(report.verified_dreamcast_product_code(), None);
     }
 
     #[test]
