@@ -36,6 +36,7 @@
 //! - Dolphin exposes an explicitly confirmed normal-stop request for the owned
 //!   launcher only. No forced kill, process-tree stop or automatic relaunch exists.
 
+mod amiberry_cd;
 mod dolphin_profile_guidance;
 mod dolphin_stop;
 mod fbneo;
@@ -997,6 +998,7 @@ pub(crate) enum StandaloneProcess {
     ShadPs4(archivefs_core::launch::process_spawn::WatchedProcess),
     Mame(archivefs_core::launch::process_spawn::WatchedProcess),
     Tsugaru(archivefs_core::launch::process_spawn::WatchedProcess),
+    AmiberryCd(archivefs_core::launch::LaunchedAmiberryCdProcess),
     /// MAME started through the canonical per-launch cheat runtime; the session
     /// owns the temporary cheat workspace and removes it after MAME exits.
     MameCheats(
@@ -1070,6 +1072,7 @@ pub(crate) struct StandaloneLaunchState {
     /// The DOSBox check and the user's approval for the game on screen.
     dosbox: dosbox::Panel,
     tsugaru: tsugaru::Panel,
+    amiberry_cd: amiberry_cd::Panel,
     vice_trainers: vice::trainers::Chooser,
 }
 
@@ -1082,6 +1085,7 @@ impl StandaloneLaunchState {
     pub(crate) fn focus_dosbox_game(&mut self, path: Option<&Path>) {
         self.dosbox.focus(path);
         self.tsugaru.focus(path);
+        self.amiberry_cd.focus(path);
     }
 
     pub(crate) fn focus_vice_trainer_game(&mut self, path: Option<&Path>) {
@@ -1264,6 +1268,7 @@ impl StandaloneLaunchState {
                     StandaloneProcess::ShadPs4(p) => p.poll().is_some(),
                     StandaloneProcess::Mame(p) => p.poll().is_some(),
                     StandaloneProcess::Tsugaru(p) => p.poll().is_some(),
+                    StandaloneProcess::AmiberryCd(p) => p.poll().is_some(),
                     StandaloneProcess::MameCheats(session) => {
                         session.poll();
                         session.is_finished()
@@ -1486,6 +1491,7 @@ pub(crate) enum StandaloneLaunchRequest {
     ShadPs4(crate::emulator_setup::shadps4::Request),
     Mame(MameLaunchRequest),
     Tsugaru(tsugaru::Request),
+    AmiberryCd(amiberry_cd::Request),
     DuckStation(
         DuckStationLaunchRequest,
         archivefs_core::patch_manager::DuckStationProfileDiscoveryRoots,
@@ -1534,6 +1540,7 @@ impl StandaloneLaunchRequest {
             Self::ShadPs4(_) => "shadPS4",
             Self::Mame(_) => "MAME",
             Self::Tsugaru(_) => "Tsugaru",
+            Self::AmiberryCd(_) => "Amiberry CD",
             Self::DuckStation(..) => "DuckStation",
             Self::Ppsspp(_, _) => "PPSSPP",
             Self::MelonDs(_, _) => "melonDS",
@@ -1557,6 +1564,7 @@ impl StandaloneLaunchRequest {
             Self::ShadPs4(r) => (r.plan.game().executable().into(), "shadps4".into()),
             Self::Mame(r) => (r.selected_content.clone(), "mame".into()),
             Self::Tsugaru(r) => r.key(),
+            Self::AmiberryCd(r) => r.key(),
             Self::DuckStation(r, ..) => (r.selected_content_path.clone(), "duckstation".into()),
             Self::Ppsspp(r, _) => (r.selected_content_path.clone(), "ppsspp".into()),
             Self::MelonDs(r, _) => (r.selected_content_path.clone(), "melonds".into()),
@@ -1588,6 +1596,7 @@ impl StandaloneLaunchRequest {
                 .map(StandaloneProcess::ShadPs4)
                 .map_err(|e| format!("{:?}: {}", e.kind, e.detail)),
             Self::Tsugaru(r) => r.execute().map(StandaloneProcess::Tsugaru),
+            Self::AmiberryCd(r) => r.execute().map(StandaloneProcess::AmiberryCd),
             Self::Mame(r) => archivefs_core::launch::preflight_and_launch_mame(&r)
                 .map(StandaloneProcess::Mame)
                 .map_err(|error| format!("{error:?}")),
@@ -3240,6 +3249,7 @@ pub(crate) fn show_launch_readiness_panel(
         }
         LaunchReadinessInput::IdentityUnknown => {
             tsugaru::show_unresolved(ui, standalone_launch_state);
+            amiberry_cd::show_unresolved(ui, standalone_launch_state);
             widgets::banner(
                 ui,
                 "Identity unresolved",
@@ -3295,6 +3305,7 @@ pub(crate) fn show_launch_readiness_panel(
         } => {
             fbneo::show(ui, plan);
             tsugaru::show(ui, plan, standalone_launch_state);
+            amiberry_cd::show(ui, plan, standalone_launch_state);
             if plan.platform_id.as_deref() == Some("Saturn")
                 && let Some(context) = retroarch
             {
@@ -5066,6 +5077,10 @@ fn show_standalone_launch_action(
                 ui.small(format!("Tsugaru running · PID {}", p.pid));
                 ui.small("Starting the process does not prove the game ran.");
             }
+            Some((_, _, StandaloneLaunchStage::Running(StandaloneProcess::AmiberryCd(p)))) => {
+                ui.small(format!("Amiberry CD running · PID {}", p.pid));
+                ui.small("Starting the process does not prove the game ran.");
+            }
             Some((_, _, StandaloneLaunchStage::Running(StandaloneProcess::ScummVm(_)))) => {
                 ui.small("ScummVM process started; EmuWiz cannot tell whether the game itself is running.");
             }
@@ -5097,6 +5112,11 @@ fn show_standalone_launch_action(
                     && let Some(report) = p.poll()
                 {
                     ui.label(exit_line("Tsugaru", report));
+                }
+                if let StandaloneProcess::AmiberryCd(p) = process
+                    && let Some(report) = p.poll()
+                {
+                    ui.label(exit_line("Amiberry CD", report));
                 }
                 if let StandaloneProcess::DuckStation(process) = process
                     && let Some(report) = process.poll()
@@ -5175,6 +5195,13 @@ fn show_standalone_launch_action(
             state.start(request);
             return;
         }
+        if adapter == "amiberry_cd"
+            && !state.is_active()
+            && ui.button("Launch Amiberry CD again (recheck)").clicked()
+        {
+            state.start(request);
+            return;
+        }
         if adapter == "xroar"
             && !state.is_active()
             && ui.button("Launch XRoar again (recheck)").clicked()
@@ -5230,6 +5257,7 @@ fn show_standalone_launch_action(
         Some(choice) if adapter == "melonds" && choice.chosen_count() > 0 => {
             format!("Launch {adapter} with {} cheat(s)", choice.chosen_count())
         }
+        _ if adapter == "amiberry_cd" => "Launch Amiberry CD".to_string(),
         _ if adapter == dosbox::ADAPTER_KEY => "Play in DOSBox".to_string(),
         _ if adapter == "vice" => "Play in VICE".to_string(),
         // ScummVM's Play reads as the product name, like its recheck button.
