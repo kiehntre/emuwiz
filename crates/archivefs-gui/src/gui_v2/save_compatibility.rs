@@ -261,6 +261,14 @@ fn compare_with_refresh(
         // No restore preflight has been performed by this read-only journey.
         restore_refusals: None,
     });
+    if source.path == target.path {
+        result.outcome =
+            archivefs_core::save_migration_readiness::SaveMigrationOutcome::NeedsEvidence;
+        result
+            .reasons
+            .push(archivefs_core::save_migration_readiness::SaveMigrationReason::SameSaveLocation);
+        result.restore.restore_planning_may_proceed = false;
+    }
     // Source revalidation may take time. Recheck target bytes after it too;
     // compatibility remains an observation, never a target-write approval.
     if !target_current
@@ -340,7 +348,11 @@ pub(super) fn show(app: &mut App, ui: &mut egui::Ui, game: &Game) {
                 });
             }
             if changed { panel.report = None; panel.error = None; }
-            let records = panel.source.zip(panel.target).and_then(|(s,t)| Some((inventory.records.get(s)?, inventory.records.get(t)?)));
+            let selected = panel.source.zip(panel.target).and_then(|(s,t)| Some((inventory.records.get(s)?, inventory.records.get(t)?)));
+            if selected.is_some_and(|(source, target)| source.path == target.path) {
+                ui.label("Choose two different observed save locations.");
+            }
+            let records = selected.filter(|(source, target)| source.path != target.path);
             if ui.add_enabled(records.is_some(), egui::Button::new("Check observed compatibility (read only)")).clicked()
                 && let Some((source, target)) = records {
                 let (source, target, game) = (source.clone(), target.clone(), game.clone());
@@ -410,6 +422,7 @@ fn draw_report(ui: &mut egui::Ui, report: &SaveMigrationReadiness) {
             Reason::TargetEvidenceMissingOrChanged => {
                 "Target evidence is missing, changed or needs review. Refresh and recheck."
             }
+            Reason::SameSaveLocation => "Choose two different observed save locations.",
             Reason::TargetVersionEvidenceMissing => "Required target version evidence is missing.",
             Reason::NoProvenConversionRule => "No proven conversion rule is available.",
             Reason::RepresentationDiffers => "The save representations differ.",
@@ -602,6 +615,16 @@ mod tests {
             text.contains("No migration writer or converter is enabled here"),
             "{text}"
         );
+
+        let same_location =
+            compare_with_refresh(&source, &source, &game, |_| refreshed(&source, &source));
+        assert_eq!(same_location.outcome, SaveMigrationOutcome::NeedsEvidence);
+        assert!(
+            same_location
+                .reasons
+                .contains(&SaveMigrationReason::SameSaveLocation)
+        );
+        assert!(!same_location.restore.restore_planning_may_proceed);
 
         let wrong = witnessed_record(
             &dir.path().join("wrong.srm"),

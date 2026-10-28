@@ -53,6 +53,7 @@ pub enum SaveMigrationReason {
     SourceChangedSinceCapture,
     TargetVersionEvidenceMissing,
     TargetEvidenceMissingOrChanged,
+    SameSaveLocation,
     NoProvenConversionRule,
     // Conversion required.
     RepresentationDiffers,
