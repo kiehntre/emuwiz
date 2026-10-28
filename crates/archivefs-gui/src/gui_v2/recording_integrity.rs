@@ -87,7 +87,7 @@ fn check_at(database_path: &Path, scope: &Scope, clicked: Option<FileFingerprint
         }
         let before = before.unwrap();
         let outcome = db
-            .verify_preservation_fingerprint(scope.id)
+            .verify_preservation_fingerprint_bound(scope.id, &before)
             .map_err(|e| e.to_string())?;
         let after = FileFingerprint::observe(&scope.path);
         if after.as_ref() != Some(&before) {
