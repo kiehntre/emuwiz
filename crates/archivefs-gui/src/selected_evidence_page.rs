@@ -229,6 +229,7 @@ pub(crate) enum StructuralMediaDetails {
     Optical(OpticalMediaDetails),
     Chd(ChdMediaDetails),
     Cdi(CdiMediaDetails),
+    DreamcastCdi(archivefs_core::dreamcast_cdi::CdiStructure),
     LaserDisc(archivefs_core::laserdisc_set::LaserdiscSetEvidence),
 }
 
@@ -298,6 +299,7 @@ fn update_structural_media_dat_status(
         StructuralMediaDetails::Chd(details) => details.dat_status = dat_status(no_intro),
         StructuralMediaDetails::Disk(_)
         | StructuralMediaDetails::Cdi(_)
+        | StructuralMediaDetails::DreamcastCdi(_)
         | StructuralMediaDetails::LaserDisc(_) => {}
     }
 }
@@ -458,6 +460,13 @@ fn structural_media_details(
         && let Ok(observation) = observe_chd_identity(bytes)
     {
         return Some(chd_details(observation, no_intro));
+    }
+    if extension == "cdi"
+        && identity.platform == archivefs_core::game_identity::IdentityPlatform::Dreamcast
+    {
+        return Some(StructuralMediaDetails::DreamcastCdi(
+            archivefs_core::dreamcast_cdi::inspect_cdi_structure(path),
+        ));
     }
     if extension == "cdi"
         && let Ok(media) = archivefs_core::dreamcast_cdi::open_dreamcast_cdi_logical_media(path)
@@ -1251,6 +1260,19 @@ pub(crate) fn show_selected_evidence_panel(
 pub(crate) fn show_identity_evidence(ui: &mut egui::Ui, report: &SelectedEvidenceReport) {
     if let Some(details) = &report.structural_media {
         show_structural_media_details(ui, details);
+        if matches!(details, StructuralMediaDetails::DreamcastCdi(_)) {
+            if let Some(code) = report
+                .game_identity_report
+                .verified_dreamcast_product_code()
+            {
+                ui.label(format!(
+                    "CDI boot evidence: verified IP.BIN product code {code}"
+                ));
+            } else {
+                ui.label("CDI boot evidence: no verified Dreamcast IP.BIN product code");
+            }
+            ui.label("CDI readiness: image completeness and bootability have not been verified; Flycast readiness is assessed separately.");
+        }
     }
     widgets::section_header(ui, "Structural evidence", None);
     if report.structural_facts.is_empty() {
@@ -1446,6 +1468,29 @@ fn show_structural_media_details(ui: &mut egui::Ui, details: &StructuralMediaDet
                     ui.colored_label(ui.visuals().warn_fg_color, warning);
                 }
             });
+        }
+        StructuralMediaDetails::DreamcastCdi(details) => {
+            ui.label("Dreamcast DiscJuggler CDI");
+            ui.label(format!("Structure: {:?}", details.status));
+            ui.label(&details.explanation);
+            if let Some(version) = details.version {
+                ui.label(format!(
+                    "Variant: {version} · {} sessions · {} tracks",
+                    details.sessions,
+                    details.tracks.len()
+                ));
+            }
+            if let Some(entry) = details.selected_data_entry {
+                ui.label(format!("IP.BIN inspection candidate: data entry {entry}"));
+            }
+            if !details.tracks.is_empty() {
+                widgets::technical_details(ui, "dreamcast-cdi-tracks", |ui| {
+                    for track in &details.tracks {
+                        ui.label(format!("Session {} · entry {} · {} · LBA {} · {} frames · {} bytes/sector · {} pregap frames", track.session, track.ordinal, track.kind, track.start_lba, track.frames, track.sector_bytes, track.pregap_frames));
+                    }
+                });
+            }
+            ui.label("IP.BIN product code appears under verified identity evidence only when its bytes pass the shared Dreamcast identity reader. Track ranges do not prove a complete or bootable image. Structure and identity are separate read-only samples; refresh after the source changes.");
         }
         StructuralMediaDetails::LaserDisc(details) => {
             laserdisc_details::show(ui, details);
@@ -2652,6 +2697,70 @@ mod tests {
             .shapes
             .iter()
             .any(|clipped| shape_contains(&clipped.shape, needle))
+    }
+
+    fn synthetic_dreamcast_cdi() -> Vec<u8> {
+        let mut bytes = vec![0u8; 4 * 2048];
+        bytes[..16].copy_from_slice(b"SEGA SEGAKATANA ");
+        bytes[0x40..0x4a].copy_from_slice(b"TEST00001 ");
+        let mut descriptor = vec![1, 0, 1];
+        descriptor.extend_from_slice(&[0; 13]);
+        descriptor.extend_from_slice(&[0; 16]);
+        descriptor.push(0);
+        descriptor.extend_from_slice(&[0; 29 + 2]);
+        descriptor.extend_from_slice(&2u16.to_le_bytes());
+        descriptor.extend_from_slice(&0u32.to_le_bytes());
+        descriptor.extend_from_slice(&4u32.to_le_bytes());
+        descriptor.extend_from_slice(&0u32.to_le_bytes());
+        descriptor.extend_from_slice(&[0; 2]);
+        descriptor.extend_from_slice(&1u32.to_le_bytes());
+        descriptor.extend_from_slice(&[0; 4 + 4 + 4 + 4]);
+        descriptor.extend_from_slice(&4u32.to_le_bytes());
+        descriptor.extend_from_slice(&[0; 16]);
+        descriptor.extend_from_slice(&0u32.to_le_bytes());
+        descriptor.extend_from_slice(&[0; 4 + 9 + 12 + 4 + 99]);
+        descriptor.extend_from_slice(&[0; 15]);
+        let distance = (descriptor.len() + 8) as u32;
+        bytes.extend_from_slice(&descriptor);
+        bytes.extend_from_slice(&0x8000_0006u32.to_le_bytes());
+        bytes.extend_from_slice(&distance.to_le_bytes());
+        bytes
+    }
+
+    #[test]
+    fn blue_details_reports_dreamcast_cdi_structure_without_claiming_bootability() {
+        let bytes = synthetic_dreamcast_cdi();
+        let dir = write_temp_rom("synthetic.cdi", &bytes);
+        let report =
+            gather_selected_evidence_fast(&dir.path().join("synthetic.cdi"), Some("Dreamcast"))
+                .unwrap();
+        assert!(
+            matches!(report.structural_media, Some(StructuralMediaDetails::DreamcastCdi(ref details)) if details.status == archivefs_core::dreamcast_cdi::CdiStatus::Valid)
+        );
+        let ctx = egui::Context::default();
+        let output = ctx.run(egui::RawInput::default(), |ctx| {
+            egui::CentralPanel::default().show(ctx, |ui| show_identity_evidence(ui, &report));
+        });
+        assert!(rendered_text_contains(&output, "Dreamcast DiscJuggler CDI"));
+        assert!(rendered_text_contains(&output, "Structure: Valid"));
+        assert!(rendered_text_contains(&output, "bootable image"));
+        assert!(rendered_text_contains(&output, "CDI readiness:"));
+        assert!(rendered_text_contains(
+            &output,
+            "verified IP.BIN product code TEST00001"
+        ));
+        assert_eq!(
+            std::fs::read(dir.path().join("synthetic.cdi")).unwrap(),
+            bytes
+        );
+
+        let invalid = write_temp_rom("broken.cdi", b"broken");
+        let report =
+            gather_selected_evidence_fast(&invalid.path().join("broken.cdi"), Some("Dreamcast"))
+                .unwrap();
+        assert!(
+            matches!(report.structural_media, Some(StructuralMediaDetails::DreamcastCdi(ref details)) if details.status == archivefs_core::dreamcast_cdi::CdiStatus::Truncated)
+        );
     }
 
     #[test]

@@ -106,9 +106,15 @@ pub enum CdiIdentityError {
     /// The path could not be statted or read.
     Io(String),
     /// The file exceeds [`MAX_CDI_BYTES`]; refused before any read.
-    TooLarge { bytes: u64, maximum: u64 },
+    TooLarge {
+        bytes: u64,
+        maximum: u64,
+    },
     /// The footer or bounded descriptor is not a supported CDI layout.
     Parse(String),
+    Truncated,
+    TruncatedData,
+    UnsupportedVersion(u32),
     /// More tracks or descriptors than the conservative bounds allow.
     TooManyTracks,
     /// No Dreamcast-eligible data track was found at all.
@@ -125,7 +131,10 @@ pub enum CdiIdentityError {
     /// trusted just because the trailer's own arithmetic produced it.
     ImpossibleOffset,
     /// The descriptor exceeds [`MAX_CDI_METADATA_BYTES`].
-    MetadataTooLarge { bytes: u64, maximum: usize },
+    MetadataTooLarge {
+        bytes: u64,
+        maximum: usize,
+    },
 }
 
 impl std::fmt::Display for CdiIdentityError {
@@ -138,6 +147,11 @@ impl std::fmt::Display for CdiIdentityError {
             ),
             Self::Parse(detail) => {
                 write!(formatter, "CDI descriptor could not be parsed: {detail}")
+            }
+            Self::Truncated => formatter.write_str("CDI footer or descriptor is truncated"),
+            Self::TruncatedData => formatter.write_str("CDI track payload is truncated"),
+            Self::UnsupportedVersion(version) => {
+                write!(formatter, "unsupported CDI version 0x{version:08x}")
             }
             Self::TooManyTracks => formatter.write_str("CDI descriptor declares too many tracks"),
             Self::NoDataTrack => {
@@ -163,6 +177,8 @@ impl std::error::Error for CdiIdentityError {}
 
 #[derive(Debug, Clone)]
 struct CdiTrack {
+    session: usize,
+    ordinal: usize,
     is_data: bool,
     physical_sector_size: u64,
     data_offset: u64,
@@ -187,7 +203,7 @@ impl DescriptorCursor<'_> {
         let bytes = self
             .bytes
             .get(self.position..end)
-            .ok_or_else(|| CdiIdentityError::Parse("truncated CDI descriptor".into()))?;
+            .ok_or(CdiIdentityError::Truncated)?;
         self.position = end;
         Ok(bytes)
     }
@@ -217,11 +233,9 @@ fn checked_track_bytes(offset: u64, physical_sector_size: u64, frames: u64) -> O
     offset.checked_add(physical_sector_size.checked_mul(frames)?)
 }
 
-fn read_descriptor(path: &Path, file_len: u64) -> Result<(Vec<u8>, u64), CdiIdentityError> {
+fn read_descriptor(path: &Path, file_len: u64) -> Result<(Vec<u8>, u64, u32), CdiIdentityError> {
     if file_len < 8 {
-        return Err(CdiIdentityError::Parse(
-            "file too small for CDI footer".into(),
-        ));
+        return Err(CdiIdentityError::Truncated);
     }
     let mut file =
         std::fs::File::open(path).map_err(|error| CdiIdentityError::Io(error.to_string()))?;
@@ -240,9 +254,13 @@ fn read_descriptor(path: &Path, file_len: u64) -> Result<(Vec<u8>, u64), CdiIden
             |_| CdiIdentityError::Parse("invalid CDI footer location".into()),
         )?));
     if !matches!(version, CDI_V2 | CDI_V3 | CDI_V35) {
-        return Err(CdiIdentityError::Parse(format!(
-            "unsupported CDI version 0x{version:08x}"
-        )));
+        return if version & 0xffff_ff00 == 0x8000_0000 {
+            Err(CdiIdentityError::UnsupportedVersion(version))
+        } else {
+            Err(CdiIdentityError::Parse(
+                "footer is not a DiscJuggler CDI version marker".into(),
+            ))
+        };
     }
 
     // Versions 2/3 store the descriptor start; 3.5 stores the distance from
@@ -288,34 +306,168 @@ fn read_descriptor(path: &Path, file_len: u64) -> Result<(Vec<u8>, u64), CdiIden
             .map_err(|error| CdiIdentityError::Io(error.to_string()))?;
         read += amount;
     }
-    Ok((descriptor, descriptor_start))
+    Ok((descriptor, descriptor_start, version))
+}
+
+/// Result of bounded CDI structure inspection. Valid means the descriptor and
+/// declared track byte ranges fit, not that the game is complete or bootable.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CdiStatus {
+    Valid,
+    Malformed,
+    Truncated,
+    Unsupported,
+    Ambiguous,
+    Io,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CdiTrackSummary {
+    pub session: usize,
+    /// One-based entry order in the descriptor, not an asserted disc track number.
+    pub ordinal: usize,
+    pub kind: &'static str,
+    pub start_lba: u64,
+    pub frames: u64,
+    pub sector_bytes: u64,
+    pub pregap_frames: u64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CdiStructure {
+    pub status: CdiStatus,
+    pub version: Option<&'static str>,
+    pub sessions: usize,
+    pub tracks: Vec<CdiTrackSummary>,
+    pub selected_data_entry: Option<usize>,
+    pub explanation: String,
+}
+
+fn status_for_error(error: &CdiIdentityError) -> CdiStatus {
+    match error {
+        CdiIdentityError::Truncated | CdiIdentityError::TruncatedData => CdiStatus::Truncated,
+        CdiIdentityError::UnsupportedVersion(_)
+        | CdiIdentityError::UnsupportedSectorLayout
+        | CdiIdentityError::TooLarge { .. }
+        | CdiIdentityError::MetadataTooLarge { .. }
+        | CdiIdentityError::TooManyTracks => CdiStatus::Unsupported,
+        CdiIdentityError::AmbiguousDataTracks => CdiStatus::Ambiguous,
+        CdiIdentityError::Io(_) => CdiStatus::Io,
+        _ => CdiStatus::Malformed,
+    }
+}
+
+/// Inspect descriptor topology without reading track payloads or granting
+/// Dreamcast identity. Boot evidence must come from the shared IP.BIN reader.
+pub fn inspect_cdi_structure(path: &Path) -> CdiStructure {
+    let result = (|| {
+        let file_len = std::fs::metadata(path)
+            .map_err(|error| CdiIdentityError::Io(error.to_string()))?
+            .len();
+        if file_len > MAX_CDI_BYTES {
+            return Err(CdiIdentityError::TooLarge {
+                bytes: file_len,
+                maximum: MAX_CDI_BYTES,
+            });
+        }
+        let (descriptor, data_end, version) = read_descriptor(path, file_len)?;
+        let tracks = parse_descriptor(&descriptor, data_end)?;
+        let (selected, status) = match select_dreamcast_data_track(&tracks) {
+            Ok(track) if track.data_frames > 0 => (Some(track.ordinal), CdiStatus::Valid),
+            Ok(_) => (None, CdiStatus::Valid),
+            Err(CdiIdentityError::NoDataTrack) => (None, CdiStatus::Valid),
+            Err(CdiIdentityError::AmbiguousDataTracks) => (None, CdiStatus::Ambiguous),
+            Err(error) => return Err(error),
+        };
+        Ok((version, tracks, selected, status))
+    })();
+    match result {
+        Ok((version, tracks, selected_data_entry, status)) => CdiStructure {
+            status,
+            version: Some(match version {
+                CDI_V2 => "DiscJuggler v2",
+                CDI_V3 => "DiscJuggler v3",
+                _ => "DiscJuggler v3.5",
+            }),
+            sessions: tracks.iter().map(|track| track.session).max().unwrap_or(0),
+            tracks: tracks
+                .iter()
+                .map(|track| CdiTrackSummary {
+                    session: track.session,
+                    ordinal: track.ordinal,
+                    kind: if track.is_data { "data" } else { "audio" },
+                    start_lba: track.base_lba,
+                    frames: track.track_frames,
+                    sector_bytes: track.physical_sector_size,
+                    pregap_frames: track.track_frames - track.data_frames,
+                })
+                .collect(),
+            selected_data_entry,
+            explanation: if status == CdiStatus::Ambiguous {
+                "CDI descriptor and track ranges are structurally consistent, but multiple data tracks could contain Dreamcast boot evidence. No track was selected and bootability is unverified.".into()
+            } else if selected_data_entry.is_some() {
+                "CDI descriptor and track ranges are structurally consistent. Selected data track is a candidate for bounded IP.BIN inspection; complete image and bootability are unverified.".into()
+            } else {
+                "CDI descriptor is structurally consistent but contains no readable Dreamcast data-track payload. Boot evidence is unavailable.".into()
+            },
+        },
+        Err(error) => CdiStructure {
+            status: status_for_error(&error),
+            version: None,
+            sessions: 0,
+            tracks: Vec::new(),
+            selected_data_entry: None,
+            explanation: error.to_string(),
+        },
+    }
 }
 
 fn parse_descriptor(bytes: &[u8], data_end: u64) -> Result<Vec<CdiTrack>, CdiIdentityError> {
     let mut cursor = DescriptorCursor { bytes, position: 0 };
     let sessions = usize::from(cursor.u8()?);
-    if sessions == 0 || sessions > MAX_CDI_SESSIONS {
+    if sessions == 0 {
+        return Err(CdiIdentityError::Parse(
+            "CDI descriptor declares zero sessions".into(),
+        ));
+    }
+    if sessions > MAX_CDI_SESSIONS {
         return Err(CdiIdentityError::TooManyTracks);
     }
     let mut tracks: Vec<CdiTrack> = Vec::new();
     let mut current_offset = 0_u64;
     let mut descriptor_count = 0usize;
     let mut saw_terminator = false;
-    for _ in 0..=sessions {
+    for session_number in 1..=sessions + 1 {
         let session = cursor.take(15)?;
         let track_count = usize::from(session[1]);
         if track_count > 99 {
             return Err(CdiIdentityError::TooManyTracks);
         }
         if track_count == 0 {
+            if session_number != sessions + 1 {
+                return Err(CdiIdentityError::Parse(
+                    "session count disagrees with terminator".into(),
+                ));
+            }
             saw_terminator = true;
             break;
+        }
+        if session_number == sessions + 1 {
+            return Err(CdiIdentityError::Parse(
+                "missing terminating session".into(),
+            ));
         }
         for _ in 0..track_count {
             if tracks.len() >= MAX_CDI_TRACKS {
                 return Err(CdiIdentityError::TooManyTracks);
             }
-            let track = parse_track(&mut cursor, current_offset, data_end)?;
+            let track = parse_track(
+                &mut cursor,
+                current_offset,
+                data_end,
+                session_number,
+                tracks.len() + 1,
+            )?;
             descriptor_count = descriptor_count
                 .checked_add(track.descriptor_count)
                 .ok_or(CdiIdentityError::TooManyTracks)?;
@@ -351,7 +503,7 @@ fn parse_descriptor(bytes: &[u8], data_end: u64) -> Result<Vec<CdiTrack>, CdiIde
         ));
     }
     if current_offset > data_end {
-        return Err(CdiIdentityError::ImpossibleOffset);
+        return Err(CdiIdentityError::TruncatedData);
     }
     Ok(tracks)
 }
@@ -360,6 +512,8 @@ fn parse_track(
     cursor: &mut DescriptorCursor<'_>,
     track_start: u64,
     data_end: u64,
+    session: usize,
+    ordinal: usize,
 ) -> Result<CdiTrack, CdiIdentityError> {
     cursor.skip(16)?;
     let filename_len = usize::from(cursor.u8()?);
@@ -429,7 +583,7 @@ fn parse_track(
     let track_end = checked_track_bytes(track_start, physical_sector_size, track_frames)
         .ok_or(CdiIdentityError::ImpossibleOffset)?;
     if track_end > data_end {
-        return Err(CdiIdentityError::ImpossibleOffset);
+        return Err(CdiIdentityError::TruncatedData);
     }
     let data_start = checked_track_bytes(track_start, physical_sector_size, pregap)
         .ok_or(CdiIdentityError::ImpossibleOffset)?;
@@ -440,6 +594,8 @@ fn parse_track(
         return Err(CdiIdentityError::ImpossibleOffset);
     }
     Ok(CdiTrack {
+        session,
+        ordinal,
         is_data,
         physical_sector_size,
         data_offset,
@@ -480,7 +636,7 @@ pub fn open_dreamcast_cdi_logical_media(path: &Path) -> Result<CdiLogicalMedia, 
         });
     }
 
-    let (descriptor, data_end) = read_descriptor(path, file_len)?;
+    let (descriptor, data_end, _) = read_descriptor(path, file_len)?;
     let tracks = parse_descriptor(&descriptor, data_end)?;
 
     let track = select_dreamcast_data_track(&tracks)?;
@@ -882,7 +1038,7 @@ mod tests {
         let file = write_cdi(&[0x13, 0x37, 0x00, 0xff, 0x4a, 0x91]);
         assert!(matches!(
             open_dreamcast_cdi_logical_media(file.path()),
-            Err(CdiIdentityError::Parse(_))
+            Err(CdiIdentityError::Truncated)
         ));
     }
 
@@ -891,7 +1047,7 @@ mod tests {
         let file = write_cdi(&[]);
         assert!(matches!(
             open_dreamcast_cdi_logical_media(file.path()),
-            Err(CdiIdentityError::Parse(_))
+            Err(CdiIdentityError::Truncated)
         ));
     }
 
@@ -913,7 +1069,7 @@ mod tests {
         let file = write_cdi(&bytes);
         assert!(matches!(
             open_dreamcast_cdi_logical_media(file.path()),
-            Err(CdiIdentityError::Parse(_))
+            Err(CdiIdentityError::UnsupportedVersion(0x8000_0007))
         ));
     }
 
@@ -997,15 +1153,13 @@ mod tests {
 
     #[test]
     fn malformed_truncated_descriptor_refuses() {
-        // A file just large enough to carry a plausible-looking descriptor
-        // length, but with no real descriptor bytes behind it.
-        let mut bytes = vec![0u8; 16];
-        let dlen: u32 = 12;
-        bytes.extend_from_slice(&dlen.to_le_bytes());
+        let mut bytes = vec![1u8; 2];
+        bytes.extend_from_slice(&CDI_V35.to_le_bytes());
+        bytes.extend_from_slice(&10u32.to_le_bytes());
         let file = write_cdi(&bytes);
         assert!(matches!(
             open_dreamcast_cdi_logical_media(file.path()),
-            Err(CdiIdentityError::Parse(_))
+            Err(CdiIdentityError::Truncated)
         ));
     }
 
@@ -1031,7 +1185,7 @@ mod tests {
         let file = write_cdi(&truncated);
         assert!(matches!(
             open_dreamcast_cdi_logical_media(file.path()),
-            Err(CdiIdentityError::ImpossibleOffset)
+            Err(CdiIdentityError::TruncatedData)
         ));
     }
 
@@ -1058,5 +1212,76 @@ mod tests {
         // `disc_evidence_collector::max_chd_bytes_is_a_positive_sane_bound`.
         const { assert!(MAX_CDI_BYTES > 0) };
         const { assert!(MAX_CDI_BYTES < 100 * 1024 * 1024 * 1024) };
+    }
+
+    #[test]
+    fn structure_reports_only_verified_descriptor_facts() {
+        for version in [CDI_V2, CDI_V3, CDI_V35] {
+            let bytes = build_cdi_version(
+                &[vec![(0, 2, 0, 2, 0)], vec![(1, 0, 45000, 4, 1)]],
+                None,
+                version,
+            );
+            let file = write_cdi(&bytes);
+            let report = inspect_cdi_structure(file.path());
+            assert_eq!(report.status, CdiStatus::Valid);
+            assert_eq!(report.sessions, 2);
+            assert_eq!(report.tracks.len(), 2);
+            assert_eq!(report.tracks[0].kind, "audio");
+            assert_eq!(report.tracks[1].kind, "data");
+            assert_eq!(report.tracks[1].pregap_frames, 1);
+            assert_eq!(report.selected_data_entry, Some(2));
+            assert!(report.explanation.contains("bootability are unverified"));
+        }
+    }
+
+    #[test]
+    fn structure_distinguishes_refusal_classes() {
+        let cases = [
+            (vec![], CdiStatus::Truncated),
+            (vec![0xa5; 16], CdiStatus::Malformed),
+            (
+                build_cdi_version(&[vec![(1, 0, 0, 1, 0)]], None, 0x8000_0007),
+                CdiStatus::Unsupported,
+            ),
+            (
+                build_cdi(&[vec![(1, 2, 0, 4, 0)]], Some(2352)),
+                CdiStatus::Truncated,
+            ),
+            (
+                build_cdi(&[vec![(1, 0, 0, 1, 0), (1, 0, 1, 1, 0)]], None),
+                CdiStatus::Ambiguous,
+            ),
+        ];
+        for (bytes, expected) in cases {
+            let file = write_cdi(&bytes);
+            let report = inspect_cdi_structure(file.path());
+            assert_eq!(report.status, expected);
+            if expected == CdiStatus::Ambiguous {
+                assert_eq!(report.tracks.len(), 2);
+                assert_eq!(report.selected_data_entry, None);
+            }
+        }
+        let mut malformed = build_cdi(&[vec![(1, 0, 0, 1, 0)]], None);
+        let descriptor_start = 2048;
+        malformed[descriptor_start] = 2; // Claims two sessions; only one exists.
+        let file = write_cdi(&malformed);
+        assert_eq!(
+            inspect_cdi_structure(file.path()).status,
+            CdiStatus::Malformed
+        );
+        let mut zero_sessions = build_cdi(&[vec![(1, 0, 0, 1, 0)]], None);
+        zero_sessions[2048] = 0;
+        let file = write_cdi(&zero_sessions);
+        assert_eq!(
+            inspect_cdi_structure(file.path()).status,
+            CdiStatus::Malformed
+        );
+
+        let empty_data = build_cdi(&[vec![(1, 0, 0, 1, 1)]], None);
+        let file = write_cdi(&empty_data);
+        let report = inspect_cdi_structure(file.path());
+        assert_eq!(report.status, CdiStatus::Valid);
+        assert_eq!(report.selected_data_entry, None);
     }
 }

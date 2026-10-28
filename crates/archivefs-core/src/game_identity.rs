@@ -6314,10 +6314,25 @@ fn inspect_disc_cdi(report: &mut GameIdentityReport) {
     let media = match crate::dreamcast_cdi::open_dreamcast_cdi_logical_media(&report.archive_path) {
         Ok(media) => media,
         Err(error) => {
+            let status = match &error {
+                crate::dreamcast_cdi::CdiIdentityError::UnsupportedVersion(_)
+                | crate::dreamcast_cdi::CdiIdentityError::UnsupportedSectorLayout => {
+                    IdentityStatus::Unsupported
+                }
+                crate::dreamcast_cdi::CdiIdentityError::AmbiguousDataTracks => {
+                    IdentityStatus::Ambiguous
+                }
+                crate::dreamcast_cdi::CdiIdentityError::TooLarge { .. }
+                | crate::dreamcast_cdi::CdiIdentityError::MetadataTooLarge { .. }
+                | crate::dreamcast_cdi::CdiIdentityError::TooManyTracks => {
+                    IdentityStatus::ResourceLimitReached
+                }
+                _ => IdentityStatus::Invalid,
+            };
             push_with_source(
                 report,
                 IdentityKind::DreamcastProductCode,
-                IdentityStatus::Invalid,
+                status,
                 None,
                 IdentityConfidence::Unavailable,
                 None,
@@ -10069,6 +10084,40 @@ mod tests {
         assert_eq!(report.format, IdentityImageFormat::Cdi);
         assert_eq!(report.verified_dreamcast_product_code(), None);
         assert!(!report.complete);
+    }
+
+    #[test]
+    #[cfg(feature = "dreamcast-cdi")]
+    fn dreamcast_cdi_refusals_do_not_create_launch_identity() {
+        let directory = FixtureDir::new("dreamcast-cdi-refusals");
+        let mut unsupported = cdi_bytes(&[vec![(1, 0, 0, 4, 0)]]);
+        let footer = unsupported.len() - 8;
+        unsupported[footer..footer + 4].copy_from_slice(&0x8000_0007u32.to_le_bytes());
+        let path = write_fixture(&directory, "unsupported.cdi", &unsupported);
+        let report = inspect_game_identity(&path, Some("Dreamcast"));
+        assert_eq!(
+            report
+                .evidence
+                .iter()
+                .find(|e| e.kind == IdentityKind::DreamcastProductCode)
+                .unwrap()
+                .status,
+            IdentityStatus::Unsupported
+        );
+        assert_eq!(report.verified_dreamcast_product_code(), None);
+
+        let path = write_fixture(&directory, "truncated.cdi", b"short");
+        let report = inspect_game_identity(&path, Some("Dreamcast"));
+        assert_eq!(
+            report
+                .evidence
+                .iter()
+                .find(|e| e.kind == IdentityKind::DreamcastProductCode)
+                .unwrap()
+                .status,
+            IdentityStatus::Invalid
+        );
+        assert_eq!(report.verified_dreamcast_product_code(), None);
     }
 
     #[test]
