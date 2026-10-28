@@ -104,7 +104,7 @@ pub fn review_appimage_install(
                 match fs::symlink_metadata(&path) {
                     Ok(meta) if meta.file_type().is_symlink() => {
                         review.current_installations.push(format!(
-                            "{} → {} (existing pointer; preserved, target not opened)",
+                            "{} -> {} (existing pointer; preserved, target not opened)",
                             path.display(),
                             fs::read_link(&path)
                                 .map(|p| p.display().to_string())
@@ -375,10 +375,7 @@ fn inspect_destination(
     if stats.f_flag & libc::ST_RDONLY != 0 {
         return Err("Destination filesystem is read-only.".into());
     }
-    Ok((
-        ancestor,
-        (stats.f_bavail as u64).saturating_mul(stats.f_frsize as u64),
-    ))
+    Ok((ancestor, stats.f_bavail.saturating_mul(stats.f_frsize)))
 }
 #[cfg(not(unix))]
 fn inspect_destination(_: &Path, _: &Path, _: &Path) -> Result<(PathBuf, u64), String> {
