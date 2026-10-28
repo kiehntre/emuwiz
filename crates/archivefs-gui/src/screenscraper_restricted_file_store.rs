@@ -27,6 +27,7 @@ impl RestrictedFileStore {
 
     pub fn load(&self) -> Result<Option<StoredCredentials>, StoreError> {
         let directory = open_private_directory(&self.directory)?;
+        lock_directory(&directory, libc::LOCK_SH)?;
         read_record(&directory)
     }
 
@@ -48,6 +49,7 @@ impl RestrictedFileStore {
         fail_before_publish: bool,
     ) -> Result<(), StoreError> {
         let directory = open_private_directory(&self.directory)?;
+        lock_directory(&directory, libc::LOCK_EX)?;
         let previous = open_record(&directory)?;
         let previous_identity = previous
             .as_ref()
@@ -95,6 +97,7 @@ impl RestrictedFileStore {
 
     pub fn forget(&self) -> Result<(), StoreError> {
         let directory = open_private_directory(&self.directory)?;
+        lock_directory(&directory, libc::LOCK_EX)?;
         if open_record(&directory)?.is_none() {
             return Ok(());
         }
@@ -108,6 +111,13 @@ impl RestrictedFileStore {
         }
         Ok(())
     }
+}
+
+fn lock_directory(directory: &File, operation: libc::c_int) -> Result<(), StoreError> {
+    if unsafe { libc::flock(directory.as_raw_fd(), operation) } != 0 {
+        return Err(StoreError::Failed);
+    }
+    Ok(())
 }
 
 fn open_private_directory(path: &Path) -> Result<File, StoreError> {
@@ -292,6 +302,51 @@ mod tests {
     }
 
     #[test]
+    fn process_restart_recovers_updates_and_removal() {
+        let (_root, directory, _store) = fixture();
+        for operation in [
+            "save",
+            "load",
+            "update",
+            "load_updated",
+            "forget",
+            "load_empty",
+        ] {
+            let result = std::process::Command::new(std::env::current_exe().unwrap())
+                .arg("--exact")
+                .arg("screenscraper_restricted_file_store::tests::process_restart_child")
+                .env("EMUWIZ_FILE_TEST_DIR", &directory)
+                .env("EMUWIZ_FILE_TEST_OPERATION", operation)
+                .output()
+                .unwrap();
+            assert!(
+                result.status.success(),
+                "synthetic child failed at {operation}"
+            );
+        }
+    }
+
+    #[test]
+    fn process_restart_child() {
+        let Some(directory) = std::env::var_os("EMUWIZ_FILE_TEST_DIR") else {
+            return;
+        };
+        let operation = std::env::var("EMUWIZ_FILE_TEST_OPERATION").unwrap();
+        let store = RestrictedFileStore::new(PathBuf::from(directory));
+        let initial = record("synthetic-dev-password", "synthetic-user-password");
+        let updated = record("synthetic-dev-password", "updated-user-password");
+        match operation.as_str() {
+            "save" => store.save(&initial).unwrap(),
+            "load" => assert_eq!(store.load().unwrap(), Some(initial)),
+            "update" => store.save(&updated).unwrap(),
+            "load_updated" => assert_eq!(store.load().unwrap(), Some(updated)),
+            "forget" => store.forget().unwrap(),
+            "load_empty" => assert_eq!(store.load().unwrap(), None),
+            _ => panic!("unknown synthetic test operation"),
+        }
+    }
+
+    #[test]
     fn insecure_permissions_and_ownership_are_refused() {
         let (_root, directory, store) = fixture();
         fs::set_permissions(&directory, fs::Permissions::from_mode(0o755)).unwrap();
@@ -357,6 +412,31 @@ mod tests {
         );
         assert_eq!(store.load().unwrap(), Some(first));
         assert_eq!(fs::read_dir(directory).unwrap().count(), 1);
+    }
+
+    #[test]
+    fn save_waits_for_directory_lock_before_publishing() {
+        let (_root, directory, store) = fixture();
+        let pinned = open_private_directory(&directory).unwrap();
+        lock_directory(&pinned, libc::LOCK_EX).unwrap();
+        let (sender, receiver) = std::sync::mpsc::channel();
+        let worker = std::thread::spawn(move || {
+            sender.send(store.save(&record("dev", "user"))).unwrap();
+        });
+        assert!(
+            receiver
+                .recv_timeout(std::time::Duration::from_millis(100))
+                .is_err()
+        );
+        assert!(!directory.join(FILE_NAME).exists());
+        drop(pinned);
+        assert_eq!(
+            receiver
+                .recv_timeout(std::time::Duration::from_secs(5))
+                .unwrap(),
+            Ok(())
+        );
+        worker.join().unwrap();
     }
 
     #[test]

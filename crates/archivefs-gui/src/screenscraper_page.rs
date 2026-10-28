@@ -321,15 +321,13 @@ impl ScreenScraperPageState {
             }
             Err(StoreError::Insecure) => {
                 self.storage_message = Some(
-                    "The configured credentials file is unsafe. Nothing was saved; current credentials remain session-only.",
+                    "The configured credentials file is unsafe. Save could not be verified; credentials may exist in the selected storage. Fix the storage and retry or Forget.",
                 );
             }
             Err(_) => {
-                self.storage_message = Some(if self.stored {
-                    "Could not update credential storage. Current edits remain in this session; previously saved credentials may still be present."
-                } else {
-                    "Credential storage is unavailable. Credentials remain in this session only."
-                })
+                self.storage_message = Some(
+                    "Save could not be verified; credentials may exist in the selected storage. Check storage and retry or Forget.",
+                )
             }
         }
     }
