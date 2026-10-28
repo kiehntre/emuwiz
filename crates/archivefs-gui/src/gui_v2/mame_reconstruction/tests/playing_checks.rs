@@ -62,6 +62,8 @@ fn loose_split_directories_do_not_require_absent_search_alternatives() {
     std::fs::write(lab.root().join("bios/sys.rom"), BIOS).unwrap();
     std::fs::write(lab.root().join("parent/p.rom"), PARENT).unwrap();
     std::fs::write(lab.root().join("clone/c.rom"), CLONE).unwrap();
+    std::fs::create_dir(lab.root().join("clone/nested")).unwrap();
+    std::fs::write(lab.root().join("clone/nested/renamed.rom"), CLONE).unwrap();
 
     let report = playing::inspect(&lab.inputs("clone"), &environment).unwrap();
     assert_eq!(
@@ -74,6 +76,28 @@ fn loose_split_directories_do_not_require_absent_search_alternatives() {
         playing::readiness(&report, "clone", Some(executable)).0,
         playing::Readiness::IncompleteEvidence,
         "creating an alternative must invalidate the inspected directory stamp"
+    );
+}
+
+#[test]
+fn loose_nested_member_change_invalidates_ready_evidence() {
+    let (lab, environment, executable) = setup();
+    std::fs::remove_file(lab.root().join("clone.zip")).unwrap();
+    std::fs::create_dir(lab.root().join("clone")).unwrap();
+    std::fs::write(lab.root().join("clone/c.rom"), CLONE).unwrap();
+    std::fs::create_dir(lab.root().join("clone/nested")).unwrap();
+    let nested = lab.root().join("clone/nested/renamed.rom");
+    std::fs::write(&nested, CLONE).unwrap();
+
+    let report = playing::inspect(&lab.inputs("clone"), &environment).unwrap();
+    assert_eq!(
+        playing::readiness(&report, "clone", Some(executable.clone())).0,
+        playing::Readiness::Ready
+    );
+    std::fs::write(&nested, b"changed nested member").unwrap();
+    assert_eq!(
+        playing::readiness(&report, "clone", Some(executable)).0,
+        playing::Readiness::IncompleteEvidence
     );
 }
 
