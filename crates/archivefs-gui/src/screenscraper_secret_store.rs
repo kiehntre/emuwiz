@@ -10,8 +10,11 @@ use std::process::{Command, Stdio};
 use serde::{Deserialize, Serialize};
 
 const ATTRS: [&str; 4] = ["application", "EmuWiz", "provider", "ScreenScraper"];
+// `secret-tool store` reads at most 8192 bytes from stdin. Keep a margin so
+// successful exit cannot conceal a truncated JSON record.
+const MAX_STORED_BYTES: usize = 8191;
 
-#[derive(Clone, Serialize, Deserialize)]
+#[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub(super) struct StoredCredentials {
     pub developer_id: String,
     pub developer_password: String,
@@ -30,6 +33,7 @@ pub(super) enum StoreError {
     Unavailable,
     Failed,
     InvalidRecord,
+    TooLarge,
 }
 
 /// Uses the system's Secret Service through `secret-tool` when installed.
@@ -89,6 +93,9 @@ impl SecretStore {
             return Err(StoreError::Unavailable);
         }
         let payload = serde_json::to_vec(record).map_err(|_| StoreError::Failed)?;
+        if payload.len() > MAX_STORED_BYTES {
+            return Err(StoreError::TooLarge);
+        }
         let mut child = Command::new(&self.program)
             .arg("store")
             .arg("--label=EmuWiz ScreenScraper credentials")
@@ -107,7 +114,10 @@ impl SecretStore {
         if write_result.is_err() || !status.success() {
             return Err(StoreError::Failed);
         }
-        Ok(())
+        match self.load() {
+            Ok(Some(saved)) if saved == *record => Ok(()),
+            _ => Err(StoreError::Failed),
+        }
     }
 
     pub fn forget(&self) -> Result<(), StoreError> {
@@ -121,10 +131,12 @@ impl SecretStore {
             .stderr(Stdio::null())
             .status()
             .map_err(|_| StoreError::Unavailable)?;
-        if status.success() {
-            Ok(())
-        } else {
-            Err(StoreError::Failed)
+        if !status.success() {
+            return Err(StoreError::Failed);
+        }
+        match self.load() {
+            Ok(None) => Ok(()),
+            _ => Err(StoreError::Failed),
         }
     }
 }
@@ -189,5 +201,18 @@ mod tests {
         let error = store.load().unwrap_err();
         assert_eq!(error, StoreError::InvalidRecord);
         assert!(!format!("{error:?}").contains("synthetic-secret"));
+    }
+
+    #[test]
+    fn oversized_record_is_refused_before_secret_tool_can_truncate_it() {
+        let (_root, store) = fake_store();
+        let record = StoredCredentials {
+            developer_id: "d".repeat(256),
+            developer_password: "x".repeat(4096),
+            user_id: "u".repeat(256),
+            user_password: "y".repeat(4096),
+        };
+        assert_eq!(store.save(&record), Err(StoreError::TooLarge));
+        assert!(store.load().unwrap().is_none());
     }
 }

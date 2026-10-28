@@ -110,6 +110,12 @@ impl Default for ScreenScraperPageState {
         let store = SecretStore::new(std::path::Path::new("/no-such-secret-tool"));
         #[cfg(not(test))]
         let store = SecretStore::system();
+        Self::load_from_store(&store)
+    }
+}
+
+impl ScreenScraperPageState {
+    fn load_from_store(store: &SecretStore) -> Self {
         let loaded = store.load();
         let stored = matches!(loaded, Ok(Some(_)));
         let invalid_stored = matches!(loaded, Err(StoreError::InvalidRecord));
@@ -141,9 +147,7 @@ impl Default for ScreenScraperPageState {
         }
         state
     }
-}
 
-impl ScreenScraperPageState {
     fn set_loaded(&mut self, record: StoredCredentials) -> Result<(), ()> {
         if record.developer_id.len() > 256
             || record.user_id.len() > 256
@@ -196,6 +200,11 @@ impl ScreenScraperPageState {
                     "Credentials saved in the system secret store. Connection not yet verified.",
                 );
             }
+            Err(StoreError::TooLarge) => {
+                self.storage_message = Some(
+                    "Credentials are too long for the system secret store. They remain in this session only.",
+                );
+            }
             Err(_) => {
                 self.storage_message = Some(if self.stored {
                     "Could not update the secret store. Current edits remain in this session; previously saved credentials may still be present."
@@ -207,23 +216,28 @@ impl ScreenScraperPageState {
     }
 
     fn forget_credentials(&mut self) {
-        if (self.stored || self.invalid_stored) && SecretStore::system().forget().is_err() {
-            self.storage_message = Some(
-                "Could not remove stored credentials. Try again when the secret store is available.",
-            );
-            return;
-        }
+        self.forget_credentials_with(&SecretStore::system());
+    }
+
+    fn forget_credentials_with(&mut self, store: &SecretStore) {
+        let removed = store.forget().is_ok();
         self.developer_id.clear();
         self.developer_password.clear();
         self.user_id.clear();
         self.user_password.clear();
-        self.stored = false;
-        self.invalid_stored = false;
+        if removed {
+            self.stored = false;
+            self.invalid_stored = false;
+        }
         self.unsaved_edits = false;
         self.status = ScreenScraperUiStatus::NotConfigured;
         self.quota = None;
         self.last_error = None;
-        self.storage_message = Some("Credentials forgotten.");
+        self.storage_message = Some(if removed {
+            "Credentials forgotten from the session and system secret store."
+        } else {
+            "Session credentials cleared. Stored credentials could not be removed or verified; try again when the secret store is available."
+        });
     }
 
     pub(crate) fn status(&self) -> ScreenScraperUiStatus {
@@ -515,7 +529,10 @@ pub(crate) fn show_screen_scraper_settings(
                 widgets::ActionStyle::Secondary,
                 !busy
                     && state.request.is_none()
-                    && (state.stored || state.invalid_stored || state.is_configured()),
+                    && (state.store_available
+                        || state.stored
+                        || state.invalid_stored
+                        || state.is_configured()),
             )
             .clicked()
             {
@@ -740,5 +757,62 @@ mod tests {
             !public_error(&ScreenScraperError::Authentication { status: 401 })
                 .contains("synthetic-secret")
         );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn forget_removes_stale_store_item_even_when_lookup_was_unavailable() {
+        use std::os::unix::fs::PermissionsExt;
+        let root = tempfile::tempdir().unwrap();
+        let script = root.path().join("secret-tool");
+        let stale = root.path().join("stale");
+        std::fs::write(&stale, b"synthetic-stale-record").unwrap();
+        std::fs::write(
+            &script,
+            format!(
+                "#!/bin/sh\ncase \"$1\" in\n lookup) exit 1 ;;\n clear) rm -f '{}' ;;\nesac\n",
+                stale.display()
+            ),
+        )
+        .unwrap();
+        std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o700)).unwrap();
+        let store = SecretStore::new(&script);
+        let mut state = ScreenScraperPageState {
+            developer_id: "dev".into(),
+            developer_password: "synthetic-password".into(),
+            ..ScreenScraperPageState::default()
+        };
+        assert!(!state.stored);
+        state.forget_credentials_with(&store);
+        assert!(!stale.exists());
+        assert!(state.developer_password.is_empty());
+        assert_eq!(
+            state.storage_message,
+            Some("Credentials forgotten from the session and system secret store.")
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    #[ignore = "requires an isolated, functioning Secret Service"]
+    fn real_secret_service_restart_and_removal() {
+        let program = std::env::var_os("EMUWIZ_REAL_SECRET_TOOL")
+            .expect("set EMUWIZ_REAL_SECRET_TOOL to an isolated secret-tool executable");
+        let store = SecretStore::new(std::path::Path::new(&program));
+        let record = StoredCredentials {
+            developer_id: "synthetic-dev".into(),
+            developer_password: "synthetic-dev-password".into(),
+            user_id: "synthetic-user".into(),
+            user_password: "synthetic-user-password".into(),
+        };
+        store.save(&record).unwrap();
+        let mut restarted = ScreenScraperPageState::load_from_store(&store);
+        assert!(restarted.is_configured());
+        assert!(restarted.stored);
+        assert!(!format!("{restarted:?}").contains("synthetic-user-password"));
+        restarted.forget_credentials_with(&store);
+        assert!(!restarted.is_configured());
+        let after_removal = ScreenScraperPageState::load_from_store(&store);
+        assert!(!after_removal.is_configured());
     }
 }
