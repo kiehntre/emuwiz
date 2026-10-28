@@ -6,13 +6,18 @@
 use std::path::{Path, PathBuf};
 use std::sync::atomic::AtomicBool;
 use std::sync::mpsc::{self, Receiver, TryRecvError};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use archivefs_core::dat::archive::{
     ArchiveMemberSourceError,
     limits::ArchiveLimits,
     rar::{RarError, RarProvider},
     sevenz::SevenZArchiveSource,
+    zip_preflight::preflight_zip,
+};
+use archivefs_core::dat::library_identity_summary::{
+    DatAuditCompleteness, DatProvenanceFreshness, DatVerificationState, DiscFileState,
+    PersistedLibraryDatIdentity,
 };
 use archivefs_core::ingestion::ArchiveFormat;
 use archivefs_core::safe_read::TrustedRoots;
@@ -39,6 +44,16 @@ struct ArchiveInspection {
     report: InspectorReport,
     format: ArchiveFormat,
     listed_logical_size: Option<u64>,
+    dat_markers: Vec<Option<DatMarker>>,
+    physical_zip_listing: bool,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct DatMarker {
+    current: bool,
+    source: String,
+    algorithm: String,
+    hash: String,
 }
 
 enum Status {
@@ -50,6 +65,7 @@ enum Status {
     Ready {
         target: ArchiveInspectorTarget,
         inspection: ArchiveInspection,
+        checked_at: Instant,
     },
     Error {
         target: ArchiveInspectorTarget,
@@ -300,6 +316,17 @@ impl ArchiveInspectorPageState {
     ) {
         if self.current_target() == target.as_ref() {
             self.poll(ctx);
+            if let Status::Ready {
+                target, checked_at, ..
+            } = &self.status
+            {
+                let elapsed = checked_at.elapsed();
+                if elapsed >= Duration::from_secs(5) {
+                    self.start(target.clone(), ctx);
+                } else {
+                    ctx.request_repaint_after(Duration::from_secs(5) - elapsed);
+                }
+            }
             return;
         }
         let Some(target) = target else {
@@ -319,11 +346,16 @@ impl ArchiveInspectorPageState {
     }
 
     fn start(&mut self, target: ArchiveInspectorTarget, ctx: &egui::Context) {
-        let path = target.path.clone();
+        let worker_target = target.clone();
         let (sender, receiver) = mpsc::channel();
         let repaint = ctx.clone();
         std::thread::spawn(move || {
-            let result = inspect_path(&path);
+            let result = inspect_path(&worker_target.path).map(|mut inspection| {
+                if inspection.format == ArchiveFormat::Zip && inspection.physical_zip_listing {
+                    inspection.dat_markers = dat_markers(&worker_target, &inspection.report);
+                }
+                inspection
+            });
             let _ = sender.send(result);
             repaint.request_repaint();
         });
@@ -349,7 +381,11 @@ impl ArchiveInspectorPageState {
             _ => return,
         };
         self.status = match result {
-            Ok(inspection) => Status::Ready { target, inspection },
+            Ok(inspection) => Status::Ready {
+                target,
+                inspection,
+                checked_at: Instant::now(),
+            },
             Err(failure) => Status::Error { target, failure },
         };
         ctx.request_repaint();
@@ -366,9 +402,18 @@ fn inspect_path(path: &Path) -> Result<ArchiveInspection, Failure> {
         Failure::from("This file is not a supported ZIP, 7z or RAR archive.".to_string())
     })?;
     match format {
-        ArchiveFormat::Zip => inspect_archive(path)
-            .map(|report| inspection(format, report))
-            .map_err(|error| Failure::unreadable(error.to_string())),
+        ArchiveFormat::Zip => match inspect_zip_physical(path) {
+            Ok(report) => {
+                let mut result = inspection(format, report);
+                result.physical_zip_listing = true;
+                Ok(result)
+            }
+            // Keep the prior metadata listing available for archives outside
+            // the physical preflight bounds; it cannot carry a DAT marker.
+            Err(_) => inspect_archive(path)
+                .map(|report| inspection(format, report))
+                .map_err(|error| Failure::unreadable(error.to_string())),
+        },
         ArchiveFormat::SevenZip => inspect_sevenz(path, format),
         ArchiveFormat::Rar => inspect_rar(path, format),
         ArchiveFormat::Tar => unreachable!("TAR is not exposed by archive_format"),
@@ -385,7 +430,199 @@ fn inspection(format: ArchiveFormat, report: InspectorReport) -> ArchiveInspecti
         report,
         format,
         listed_logical_size,
+        dat_markers: Vec::new(),
+        physical_zip_listing: false,
     }
+}
+
+fn inspect_zip_physical(path: &Path) -> Result<InspectorReport, Failure> {
+    let mut file =
+        std::fs::File::open(path).map_err(|error| Failure::unreadable(error.to_string()))?;
+    let size = file
+        .metadata()
+        .map_err(|error| Failure::unreadable(error.to_string()))?
+        .len();
+    let limits = ArchiveLimits {
+        max_members: archivefs_core::INSPECTOR_ENTRY_LIMIT,
+        ..ArchiveLimits::default()
+    };
+    let physical = preflight_zip(&mut file, size, &limits, &AtomicBool::new(false))
+        .map_err(|error| Failure::unreadable(format!("physical ZIP listing refused: {error:?}")))?;
+    if physical
+        .entries
+        .iter()
+        .any(|entry| entry.flags & ((1 << 0) | (1 << 6) | (1 << 13)) != 0)
+    {
+        return Err(Failure::unreadable("encrypted ZIP member".into()));
+    }
+    // Preflight retains every physical central-directory entry, including
+    // duplicate names. Use the same byte escaping as DAT member provenance.
+    let entries = physical
+        .entries
+        .iter()
+        .take(archivefs_core::INSPECTOR_ENTRY_LIMIT)
+        .map(|entry| {
+            let name: String = entry
+                .name_raw
+                .iter()
+                .flat_map(|byte| byte.escape_ascii())
+                .map(char::from)
+                .collect();
+            let directory = entry.is_directory;
+            InspectorEntry {
+                classification: archivefs_core::classify_entry(&name, directory),
+                name,
+                kind: if directory {
+                    InspectorEntryKind::Directory
+                } else {
+                    InspectorEntryKind::File
+                },
+                uncompressed_size: entry.logical_size,
+                compressed_size: Some(entry.compressed_size),
+                compression_method: Some(entry.method.to_string()),
+            }
+        })
+        .collect();
+    Ok(InspectorReport {
+        entries,
+        truncated: physical.entry_count > archivefs_core::INSPECTOR_ENTRY_LIMIT,
+        total_entries_in_archive: physical.entry_count,
+    })
+}
+
+/// Saved member hashes are the only source of a marker. ZIP names and sizes
+/// merely locate the physical row that the completed audit identified.
+fn dat_markers(
+    target: &ArchiveInspectorTarget,
+    report: &InspectorReport,
+) -> Vec<Option<DatMarker>> {
+    let mut markers = vec![None; report.entries.len()];
+    let mut conflicts = std::collections::HashSet::new();
+    let Some(id) = target.game_id else {
+        return markers;
+    };
+    let Ok(path) = archivefs_core::default_database_path() else {
+        return markers;
+    };
+    let Ok(database) = archivefs_core::Database::open_read_only(&path) else {
+        return markers;
+    };
+    let Ok(identities) = database.library_dat_identities_for_item(id) else {
+        return markers;
+    };
+    let catalogues = archivefs_core::dat::sources::default_dat_sources_config_path()
+        .map(|path| archivefs_core::dat::configured_catalogues::load_configured_catalogues(&path))
+        .unwrap_or_default();
+    for saved in identities {
+        let Some((index, marker)) =
+            marker_for_identity(&database, id, target, report, &saved, &catalogues)
+        else {
+            continue;
+        };
+        // Competing source claims are not collapsed into an arbitrary winner.
+        if conflicts.contains(&index) {
+            continue;
+        }
+        if markers[index].is_none() {
+            markers[index] = Some(marker);
+        } else {
+            markers[index] = None;
+            conflicts.insert(index);
+        }
+    }
+    markers
+}
+
+fn marker_for_identity(
+    database: &archivefs_core::Database,
+    id: i64,
+    target: &ArchiveInspectorTarget,
+    report: &InspectorReport,
+    saved: &PersistedLibraryDatIdentity,
+    catalogues: &std::collections::HashMap<
+        String,
+        archivefs_core::dat::configured_catalogues::ConfiguredCatalogue,
+    >,
+) -> Option<(usize, DatMarker)> {
+    let member = saved.archive_member.as_ref()?;
+    let index = matching_zip_member(report, member)?;
+    if !proof_matches_target(saved.audit_file.as_ref(), &target.path)
+        || saved.file_state_for_path(&target.path) != DiscFileState::Unchanged
+        || !matches!(
+            saved.verification_state,
+            DatVerificationState::VerifiedSingleMatch { .. }
+        )
+    {
+        return None;
+    }
+    let algorithm = saved.hash_evidence.matched_algorithm.as_ref()?;
+    let hash = saved.hash_evidence.matched_value.as_ref()?;
+    if algorithm != &member.algorithm || hash.is_empty() {
+        return None;
+    }
+    let source = catalogues.get(&saved.source.source_id);
+    let mut summary = database
+        .library_dat_identity_summary_for_item(
+            id,
+            &saved.source.source_id,
+            None,
+            source.and_then(|s| s.revision.as_deref()),
+            source.is_some(),
+        )
+        .ok()??;
+    if let Some(source) = source {
+        source.check_saved_identity(&mut summary);
+    }
+    let current = current_exact(
+        summary.provenance_freshness,
+        saved.completeness,
+        &saved.verification_state,
+        source.is_some(),
+    );
+    Some((
+        index,
+        DatMarker {
+            current,
+            source: saved.source.source_name.clone(),
+            algorithm: algorithm.clone(),
+            hash: hash.clone(),
+        },
+    ))
+}
+
+fn matching_zip_member(
+    report: &InspectorReport,
+    member: &archivefs_core::dat::library_identity_summary::ArchiveMemberProvenance,
+) -> Option<usize> {
+    let entry = report.entries.get(member.member_index)?;
+    (member.archive_format == "zip"
+        && entry.kind == InspectorEntryKind::File
+        && entry.name == member.member_name)
+        .then_some(member.member_index)
+}
+
+fn proof_matches_target(
+    proof: Option<&archivefs_core::identity_source::hashing::FileFingerprint>,
+    path: &Path,
+) -> bool {
+    proof.is_some_and(|proof| {
+        proof.path == path && DiscFileState::of(proof) == DiscFileState::Unchanged
+    })
+}
+
+fn current_exact(
+    freshness: DatProvenanceFreshness,
+    completeness: DatAuditCompleteness,
+    verification: &DatVerificationState,
+    source_available: bool,
+) -> bool {
+    source_available
+        && freshness == DatProvenanceFreshness::Current
+        && completeness == DatAuditCompleteness::Exhaustive
+        && matches!(
+            verification,
+            DatVerificationState::VerifiedSingleMatch { .. }
+        )
 }
 
 fn inspect_sevenz(path: &Path, format: ArchiveFormat) -> Result<ArchiveInspection, Failure> {
@@ -470,7 +707,7 @@ fn format_size(size: Option<u64>) -> String {
     format!("{:.1} MiB", size as f64 / (1024.0 * 1024.0))
 }
 
-fn show_entry(ui: &mut egui::Ui, entry: &InspectorEntry) {
+fn show_entry(ui: &mut egui::Ui, entry: &InspectorEntry, marker: Option<&DatMarker>) {
     ui.horizontal_wrapped(|ui| {
         ui.label(&entry.name);
         ui.weak(format!(
@@ -478,7 +715,29 @@ fn show_entry(ui: &mut egui::Ui, entry: &InspectorEntry) {
             entry.classification.label(),
             format_size(Some(entry.uncompressed_size))
         ));
+        if let Some(marker) = marker {
+            ui.strong(if marker.current {
+                "Current exact DAT match"
+            } else {
+                "Historical DAT match"
+            })
+            .on_hover_text(format!(
+                "{}: {} {}. Recorded from {}.",
+                bounded_evidence_text(&marker.source),
+                bounded_evidence_text(&marker.algorithm),
+                bounded_evidence_text(&marker.hash),
+                if marker.current {
+                    "a current verified audit"
+                } else {
+                    "an earlier audit; recheck to establish current identity"
+                }
+            ));
+        }
     });
+}
+
+fn bounded_evidence_text(value: &str) -> String {
+    super::identity_review::provenance_text(&value.chars().take(128).collect::<String>())
 }
 
 pub(crate) fn show(
@@ -534,6 +793,10 @@ pub(crate) fn show(
 fn show_report(ui: &mut egui::Ui, inspection: &ArchiveInspection) {
     let report = &inspection.report;
     ui.label("Listing succeeded. Names and sizes do not prove that the contents are complete or undamaged; use Check Games for verification.");
+    if inspection.format == ArchiveFormat::Zip && !inspection.physical_zip_listing {
+        ui.colored_label(ui.visuals().warn_fg_color,
+            "Physical ZIP positions could not be established. Duplicate names may be collapsed; DAT member markers are withheld.");
+    }
     let likely = report
         .entries
         .iter()
@@ -571,7 +834,8 @@ fn show_report(ui: &mut egui::Ui, inspection: &ArchiveInspection) {
     let likely_entries: Vec<_> = report
         .entries
         .iter()
-        .filter(|entry| entry.classification == InspectorEntryClassification::LikelyContent)
+        .enumerate()
+        .filter(|(_, entry)| entry.classification == InspectorEntryClassification::LikelyContent)
         .collect();
     ui.collapsing(
         format!("Likely game/media files ({})", likely_entries.len()),
@@ -579,8 +843,12 @@ fn show_report(ui: &mut egui::Ui, inspection: &ArchiveInspection) {
             if likely_entries.is_empty() {
                 ui.label("No likely game or media files were recognised by their member names.");
             } else {
-                for entry in likely_entries {
-                    show_entry(ui, entry);
+                for (index, entry) in likely_entries {
+                    show_entry(
+                        ui,
+                        entry,
+                        inspection.dat_markers.get(index).and_then(Option::as_ref),
+                    );
                 }
             }
         },
@@ -589,8 +857,12 @@ fn show_report(ui: &mut egui::Ui, inspection: &ArchiveInspection) {
         egui::ScrollArea::vertical()
             .max_height(280.0)
             .show(ui, |ui| {
-                for entry in &report.entries {
-                    show_entry(ui, entry);
+                for (index, entry) in report.entries.iter().enumerate() {
+                    show_entry(
+                        ui,
+                        entry,
+                        inspection.dat_markers.get(index).and_then(Option::as_ref),
+                    );
                 }
             });
     });
@@ -603,6 +875,178 @@ fn show_report(ui: &mut egui::Ui, inspection: &ArchiveInspection) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use archivefs_core::dat::library_identity_summary::ArchiveMemberProvenance;
+
+    fn zip_report(names: &[&str], shown: usize) -> InspectorReport {
+        InspectorReport {
+            entries: names
+                .iter()
+                .take(shown)
+                .map(|name| InspectorEntry {
+                    name: (*name).into(),
+                    kind: InspectorEntryKind::File,
+                    uncompressed_size: 1,
+                    compressed_size: Some(1),
+                    compression_method: None,
+                    classification: InspectorEntryClassification::LikelyContent,
+                })
+                .collect(),
+            truncated: shown < names.len(),
+            total_entries_in_archive: names.len(),
+        }
+    }
+
+    fn member(index: usize, name: &str) -> ArchiveMemberProvenance {
+        ArchiveMemberProvenance {
+            member_name: name.into(),
+            member_index: index,
+            archive_format: "zip".into(),
+            algorithm: "SHA-1".into(),
+        }
+    }
+
+    #[test]
+    fn duplicate_names_require_the_saved_physical_index_and_name() {
+        let report = zip_report(&["game.rom", "game.rom"], 2);
+        assert_eq!(
+            matching_zip_member(&report, &member(1, "game.rom")),
+            Some(1)
+        );
+        assert_eq!(
+            matching_zip_member(&report, &member(0, "game.rom")),
+            Some(0)
+        );
+        assert_eq!(matching_zip_member(&report, &member(1, "other.rom")), None);
+    }
+
+    #[test]
+    fn physical_zip_listing_retains_duplicate_name_positions() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("duplicates.zip");
+        std::fs::write(&path, include_bytes!("test_fixtures/duplicate_names.zip")).unwrap();
+        let report = inspect_zip_physical(&path).unwrap();
+        assert_eq!(report.entries.len(), 2);
+        assert_eq!(
+            matching_zip_member(&report, &member(1, "game.rom")),
+            Some(1)
+        );
+    }
+
+    #[test]
+    fn missing_truncated_and_changed_members_have_no_marker_location() {
+        let report = zip_report(&["first.rom", "second.rom"], 1);
+        assert_eq!(matching_zip_member(&report, &member(1, "second.rom")), None);
+        assert_eq!(
+            matching_zip_member(
+                &zip_report(&["first.rom", "changed.rom"], 2),
+                &member(1, "second.rom")
+            ),
+            None
+        );
+        assert_eq!(
+            matching_zip_member(&report, &member(2, "missing.rom")),
+            None
+        );
+    }
+
+    #[test]
+    fn changed_or_missing_archive_cannot_reuse_saved_member_proof() {
+        use archivefs_core::identity_source::hashing::FileFingerprint;
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("game.zip");
+        std::fs::write(&path, b"original").unwrap();
+        let proof = FileFingerprint::observe(&path).unwrap();
+        assert!(proof_matches_target(Some(&proof), &path));
+        assert!(!proof_matches_target(
+            Some(&proof),
+            &dir.path().join("other.zip")
+        ));
+        std::fs::write(&path, b"changed contents").unwrap();
+        assert!(!proof_matches_target(Some(&proof), &path));
+        std::fs::remove_file(&path).unwrap();
+        assert!(!proof_matches_target(Some(&proof), &path));
+    }
+
+    #[test]
+    fn current_exact_requires_fresh_complete_verified_source_evidence() {
+        let exact = DatVerificationState::VerifiedSingleMatch {
+            algorithm: "SHA-1".into(),
+        };
+        assert!(current_exact(
+            DatProvenanceFreshness::Current,
+            DatAuditCompleteness::Exhaustive,
+            &exact,
+            true
+        ));
+        assert!(!current_exact(
+            DatProvenanceFreshness::Stale,
+            DatAuditCompleteness::Exhaustive,
+            &exact,
+            true
+        ));
+        assert!(!current_exact(
+            DatProvenanceFreshness::Unknown,
+            DatAuditCompleteness::Exhaustive,
+            &exact,
+            true
+        ));
+        assert!(!current_exact(
+            DatProvenanceFreshness::Current,
+            DatAuditCompleteness::Partial,
+            &exact,
+            true
+        ));
+        assert!(!current_exact(
+            DatProvenanceFreshness::Current,
+            DatAuditCompleteness::Exhaustive,
+            &exact,
+            false
+        ));
+        assert!(!current_exact(
+            DatProvenanceFreshness::Current,
+            DatAuditCompleteness::Exhaustive,
+            &DatVerificationState::Probable,
+            true
+        ));
+    }
+
+    #[test]
+    fn selection_change_discards_the_prior_archive_and_marker() {
+        let ctx = egui::Context::default();
+        let (sender, receiver) = mpsc::channel();
+        let old = ArchiveInspectorTarget {
+            game_id: Some(1),
+            title: "old".into(),
+            path: "/old.zip".into(),
+            media: "ZIP".into(),
+            platform: "test".into(),
+        };
+        let mut state = ArchiveInspectorPageState::default();
+        state.status = Status::Loading {
+            target: old.clone(),
+            receiver,
+        };
+        let mut new = old;
+        new.game_id = Some(2);
+        new.path = "/new.zip".into();
+        state.set_target(Some(new.clone()), &ctx);
+        assert_eq!(state.current_target(), Some(&new));
+        assert!(sender.send(Err(Failure::from("late".to_string()))).is_err());
+    }
+
+    #[test]
+    fn ready_evidence_refreshes_in_the_background() {
+        let ctx = egui::Context::default();
+        let target = target();
+        let mut state = ArchiveInspectorPageState::default();
+        state.status = Status::Ready {
+            target: target.clone(),
+            inspection: inspection(ArchiveFormat::Zip, zip_report(&["game.rom"], 1)),
+            checked_at: Instant::now() - Duration::from_secs(6),
+        };
+        state.set_target(Some(target), &ctx);
+        assert!(matches!(state.status, Status::Loading { .. }));
+    }
 
     #[test]
     fn clearing_selection_discards_old_worker_results() {
