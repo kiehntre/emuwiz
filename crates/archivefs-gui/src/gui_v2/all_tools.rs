@@ -181,6 +181,24 @@ pub(super) fn groups() -> Vec<ToolGroup> {
         safety: ToolSafety::LookingOnly,
     });
     games.tools.push(Tool {
+        route: Route::Tool(ToolPage::AlternativeProviders),
+        title: ToolPage::AlternativeProviders.title(),
+        purpose: ToolPage::AlternativeProviders.purpose(),
+        safety: ToolSafety::LookingOnly,
+    });
+    games.tools.push(Tool {
+        route: Route::Tool(ToolPage::HomebrewBrowser),
+        title: ToolPage::HomebrewBrowser.title(),
+        purpose: ToolPage::HomebrewBrowser.purpose(),
+        safety: ToolSafety::LookingOnly,
+    });
+    games.tools.push(Tool {
+        route: Route::Tool(ToolPage::NetplayPreview),
+        title: ToolPage::NetplayPreview.title(),
+        purpose: ToolPage::NetplayPreview.purpose(),
+        safety: ToolSafety::LookingOnly,
+    });
+    games.tools.push(Tool {
         route: Route::Tool(ToolPage::SourceImpact),
         title: ToolPage::SourceImpact.title(),
         purpose: ToolPage::SourceImpact.purpose(),
@@ -222,6 +240,12 @@ pub(super) fn groups() -> Vec<ToolGroup> {
         "Advanced diagnostics",
         &[S::AdvancedDiagnostics, S::Settings, S::Advanced],
     );
+    advanced.tools.push(Tool {
+        route: Route::Tool(ToolPage::HostDiagnostics),
+        title: ToolPage::HostDiagnostics.title(),
+        purpose: ToolPage::HostDiagnostics.purpose(),
+        safety: ToolSafety::LookingOnly,
+    });
     advanced.tools.insert(
         2,
         Tool {
@@ -481,6 +505,26 @@ pub(super) fn unlisted_sections() -> Vec<Section> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn every_native_tool_is_registered_exactly_once() {
+        let listed: Vec<_> = groups()
+            .into_iter()
+            .flat_map(|group| group.tools.into_iter())
+            .filter_map(|tool| match tool.route {
+                Route::Tool(page) => Some(page),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(listed.len(), ToolPage::ALL.len());
+        for page in ToolPage::ALL {
+            assert_eq!(
+                listed.iter().filter(|&&listed| listed == page).count(),
+                1,
+                "{page:?} must remain reachable exactly once in All Tools"
+            );
+        }
+    }
 
     #[test]
     fn every_section_but_home_is_listed_exactly_once() {

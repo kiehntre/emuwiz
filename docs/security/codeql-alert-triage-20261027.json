@@ -1,0 +1,446 @@
+{
+  "base_commit": "0797c2159b472e38e009d687dd100bb65ac1e925",
+  "open_alert_count": 32,
+  "inventory_scope": "state=open; ref=refs/heads/main; paginated GitHub code-scanning API; CodeQL only",
+  "analysis_freshness": {
+    "rust_analysis_id": 2032041160,
+    "rust_commit": "a2704012215b5c611a77bea453f9cb98fb61f59a",
+    "python_analysis_id": 2032378915,
+    "python_commit": "0797c2159b472e38e009d687dd100bb65ac1e925",
+    "evidence": "All Rust alert-location file blobs are unchanged between the recorded Rust analysis and base_commit."
+  },
+  "handling": "Raw alert responses/SARIF remain in owner-private local evidence. No raw messages, snippets, credentials or crypto values are included here. No dismissals or rule suppressions performed.",
+  "root_causes": [
+    {
+      "id": "clipboard-diagnostics",
+      "alerts": [
+        20
+      ],
+      "disposition": "repair",
+      "evidence": "Raw backend errors cross a production stderr boundary. The CodeQL source is synthetic test data; a synthetic backend failure independently reproduces the unsafe logging boundary. No real credential exposure is asserted.",
+      "preservation": "Fixed stderr categories and allowlisted session types; preserve error state, copy/paste outcomes and deduplication.",
+      "evidence_refs_at_base": [
+        "crates/archivefs-gui/src/clipboard.rs:91",
+        "crates/archivefs-gui/src/clipboard.rs:120"
+      ]
+    },
+    {
+      "id": "gui-scroll-identifiers",
+      "alerts": [
+        26,
+        27,
+        31,
+        32
+      ],
+      "disposition": "propose_false_positive_dismissal",
+      "evidence": "The string arguments identify egui scroll state. show_focus_reveal_scroll/show_reveal_scroll pass them into ScrollArea::id_salt and egui::Id; no cryptographic primitive consumes them. Alert 27 is also a test fixture.",
+      "preservation": "Keep stable GUI IDs. Replacing them with random values would break retained focus/scroll state without improving cryptography.",
+      "evidence_refs_at_base": [
+        "crates/archivefs-gui/src/gui_v2/simple_shell.rs:1610",
+        "crates/archivefs-gui/src/gui_v2/simple_shell.rs:1657",
+        "crates/archivefs-gui/src/gui_v2/simple_shell.rs:1858",
+        "crates/archivefs-gui/src/gui_v2/simple_shell.rs:1889"
+      ]
+    },
+    {
+      "id": "cargo-policy-public-projections",
+      "alerts": [
+        29,
+        30
+      ],
+      "disposition": "propose_false_positive_dismissal",
+      "evidence": "Alert 29 uses policy_for_display/public_fields, which projects the public policy schema and redacts extension keys/values. Alert 30 uses report(), an explicit state/budget/target/lifecycle projection rather than a full policy dump. Existing synthetic redaction tests cover both commands and unchanged policy authority.",
+      "preservation": "Do not alter policy digests, enablement approval, ownership, retirement or journal verification.",
+      "evidence_refs_at_base": [
+        "scripts/emuwiz-cargo-maintain:581",
+        "scripts/emuwiz-cargo-maintain:592",
+        "scripts/emuwiz-cargo-maintain:609",
+        "scripts/emuwiz-cargo-maintain:974",
+        "scripts/test_emuwiz_cargo_maintain_redaction.py:16"
+      ]
+    },
+    {
+      "id": "in-memory-container-model",
+      "alerts": [
+        4,
+        18,
+        19
+      ],
+      "disposition": "propose_false_positive_dismissal",
+      "evidence": "The flagged sinks are Vec::remove, VecDeque::truncate and VecDeque::remove in bounded UI notes/history; they do not write an external log. All reported flow sources originate in synthetic GUI fixtures.",
+      "preservation": "No container or history changes; distinguish memory bookkeeping from external disclosure.",
+      "evidence_refs_at_base": [
+        "crates/archivefs-gui/src/activity_history.rs:349",
+        "crates/archivefs-gui/src/activity_history.rs:366",
+        "crates/archivefs-gui/src/romm_source.rs:427",
+        "crates/archivefs-gui/src/tests/emulator_profiles_and_setup.rs:1464"
+      ]
+    },
+    {
+      "id": "fixture-source-selection",
+      "alerts": [
+        5,
+        6,
+        7,
+        8,
+        10,
+        11,
+        22,
+        23,
+        24,
+        25
+      ],
+      "disposition": "propose_false_positive_dismissal",
+      "evidence": "cheat_sources.rs cfg(test) module selects a trusted source descriptor using Vec::remove(0) for FakeTransport. Descriptor selection is not logging and fixture transport does not obtain real credentials.",
+      "preservation": "Preserve download/refusal test coverage; do not delete fixtures or suppress logging rules.",
+      "evidence_refs_at_base": [
+        "crates/archivefs-core/src/patch_manager/cheat_sources.rs:2958"
+      ]
+    },
+    {
+      "id": "recovery-fixture-assertions",
+      "alerts": [
+        33,
+        34,
+        35,
+        36,
+        37,
+        38,
+        39
+      ],
+      "disposition": "propose_false_positive_dismissal",
+      "evidence": "Assertions inspect synthetic recovery transactions/reasons. deployment.rs cfg(test) gates deployment_tests.rs and its restart/closure child modules. Verifier operations are taint sources, but no production key-logging sink is shown.",
+      "preservation": "Keep grant freshness, signature validation, retained recovery evidence and Undo tests intact.",
+      "evidence_refs_at_base": [
+        "crates/archivefs-core/src/dat/rename_apply/compact_recovery/deployment.rs:650"
+      ]
+    },
+    {
+      "id": "other-synthetic-assertions",
+      "alerts": [
+        12,
+        15,
+        16
+      ],
+      "disposition": "propose_false_positive_dismissal",
+      "evidence": "Alert 12 asserts a deterministic quarantine fixture destination; 15 is a negative credential-persistence test with synthetic markers; 16 asserts a synthetic blocked-action reason. All are cfg(test) assertions, not production credential logging.",
+      "preservation": "Preserve refusal and non-persistence regressions; test-only status alone is not used to excuse real secret disclosure.",
+      "evidence_refs_at_base": [
+        "crates/archivefs-core/src/repair/quarantine.rs:1023",
+        "crates/archivefs-core/src/patch_manager/gamehacking_browser_import.rs:2015",
+        "crates/archivefs-gui/src/lib.rs:679"
+      ]
+    },
+    {
+      "id": "numeric-process-owner-metadata",
+      "alerts": [
+        17,
+        28
+      ],
+      "disposition": "propose_false_positive_dismissal",
+      "evidence": "Alert 17 reports filesystem-owner UID in the explicit canary example. Alert 28 reports process UID/status metadata in a cfg(test) publication probe. These numeric ownership/capability observations are not authentication secrets. No canary or real-user probe was executed.",
+      "preservation": "Do not change filesystem ownership checks or execute destructive examples during triage.",
+      "evidence_refs_at_base": [
+        "crates/archivefs-core/examples/real_canary.rs:76",
+        "crates/archivefs-core/src/dat/rename_apply/fd_publication_probe_tests.rs:113"
+      ]
+    }
+  ],
+  "alerts": [
+    {
+      "number": 4,
+      "rule": "rust/cleartext-logging",
+      "severity": "high",
+      "path": "crates/archivefs-gui/src/romm_source.rs",
+      "line": 429,
+      "url": "https://github.com/kiehntre/emuwiz/security/code-scanning/4",
+      "root_cause": "in-memory-container-model"
+    },
+    {
+      "number": 5,
+      "rule": "rust/cleartext-logging",
+      "severity": "high",
+      "path": "crates/archivefs-core/src/patch_manager/cheat_sources.rs",
+      "line": 3436,
+      "url": "https://github.com/kiehntre/emuwiz/security/code-scanning/5",
+      "root_cause": "fixture-source-selection"
+    },
+    {
+      "number": 6,
+      "rule": "rust/cleartext-logging",
+      "severity": "high",
+      "path": "crates/archivefs-core/src/patch_manager/cheat_sources.rs",
+      "line": 3463,
+      "url": "https://github.com/kiehntre/emuwiz/security/code-scanning/6",
+      "root_cause": "fixture-source-selection"
+    },
+    {
+      "number": 7,
+      "rule": "rust/cleartext-logging",
+      "severity": "high",
+      "path": "crates/archivefs-core/src/patch_manager/cheat_sources.rs",
+      "line": 3481,
+      "url": "https://github.com/kiehntre/emuwiz/security/code-scanning/7",
+      "root_cause": "fixture-source-selection"
+    },
+    {
+      "number": 8,
+      "rule": "rust/cleartext-logging",
+      "severity": "high",
+      "path": "crates/archivefs-core/src/patch_manager/cheat_sources.rs",
+      "line": 3540,
+      "url": "https://github.com/kiehntre/emuwiz/security/code-scanning/8",
+      "root_cause": "fixture-source-selection"
+    },
+    {
+      "number": 10,
+      "rule": "rust/cleartext-logging",
+      "severity": "high",
+      "path": "crates/archivefs-core/src/patch_manager/cheat_sources.rs",
+      "line": 3702,
+      "url": "https://github.com/kiehntre/emuwiz/security/code-scanning/10",
+      "root_cause": "fixture-source-selection"
+    },
+    {
+      "number": 11,
+      "rule": "rust/cleartext-logging",
+      "severity": "high",
+      "path": "crates/archivefs-core/src/patch_manager/cheat_sources.rs",
+      "line": 3880,
+      "url": "https://github.com/kiehntre/emuwiz/security/code-scanning/11",
+      "root_cause": "fixture-source-selection"
+    },
+    {
+      "number": 12,
+      "rule": "rust/cleartext-logging",
+      "severity": "high",
+      "path": "crates/archivefs-core/src/repair/quarantine/tests.rs",
+      "line": 250,
+      "url": "https://github.com/kiehntre/emuwiz/security/code-scanning/12",
+      "root_cause": "other-synthetic-assertions"
+    },
+    {
+      "number": 15,
+      "rule": "rust/cleartext-logging",
+      "severity": "high",
+      "path": "crates/archivefs-core/src/patch_manager/gamehacking_browser_import/tests.rs",
+      "line": 772,
+      "url": "https://github.com/kiehntre/emuwiz/security/code-scanning/15",
+      "root_cause": "other-synthetic-assertions"
+    },
+    {
+      "number": 16,
+      "rule": "rust/cleartext-logging",
+      "severity": "high",
+      "path": "crates/archivefs-gui/src/tests/emulator_profiles_and_setup.rs",
+      "line": 1336,
+      "url": "https://github.com/kiehntre/emuwiz/security/code-scanning/16",
+      "root_cause": "other-synthetic-assertions"
+    },
+    {
+      "number": 17,
+      "rule": "rust/cleartext-logging",
+      "severity": "high",
+      "path": "crates/archivefs-core/examples/real_canary.rs",
+      "line": 76,
+      "url": "https://github.com/kiehntre/emuwiz/security/code-scanning/17",
+      "root_cause": "numeric-process-owner-metadata"
+    },
+    {
+      "number": 18,
+      "rule": "rust/cleartext-logging",
+      "severity": "high",
+      "path": "crates/archivefs-gui/src/activity_history.rs",
+      "line": 350,
+      "url": "https://github.com/kiehntre/emuwiz/security/code-scanning/18",
+      "root_cause": "in-memory-container-model"
+    },
+    {
+      "number": 19,
+      "rule": "rust/cleartext-logging",
+      "severity": "high",
+      "path": "crates/archivefs-gui/src/activity_history.rs",
+      "line": 367,
+      "url": "https://github.com/kiehntre/emuwiz/security/code-scanning/19",
+      "root_cause": "in-memory-container-model"
+    },
+    {
+      "number": 20,
+      "rule": "rust/cleartext-logging",
+      "severity": "high",
+      "path": "crates/archivefs-gui/src/clipboard.rs",
+      "line": 122,
+      "url": "https://github.com/kiehntre/emuwiz/security/code-scanning/20",
+      "root_cause": "clipboard-diagnostics"
+    },
+    {
+      "number": 22,
+      "rule": "rust/cleartext-logging",
+      "severity": "high",
+      "path": "crates/archivefs-core/src/patch_manager/cheat_sources.rs",
+      "line": 3583,
+      "url": "https://github.com/kiehntre/emuwiz/security/code-scanning/22",
+      "root_cause": "fixture-source-selection"
+    },
+    {
+      "number": 23,
+      "rule": "rust/cleartext-logging",
+      "severity": "high",
+      "path": "crates/archivefs-core/src/patch_manager/cheat_sources.rs",
+      "line": 3913,
+      "url": "https://github.com/kiehntre/emuwiz/security/code-scanning/23",
+      "root_cause": "fixture-source-selection"
+    },
+    {
+      "number": 24,
+      "rule": "rust/cleartext-logging",
+      "severity": "high",
+      "path": "crates/archivefs-core/src/patch_manager/cheat_sources.rs",
+      "line": 3955,
+      "url": "https://github.com/kiehntre/emuwiz/security/code-scanning/24",
+      "root_cause": "fixture-source-selection"
+    },
+    {
+      "number": 25,
+      "rule": "rust/cleartext-logging",
+      "severity": "high",
+      "path": "crates/archivefs-core/src/patch_manager/cheat_sources.rs",
+      "line": 4011,
+      "url": "https://github.com/kiehntre/emuwiz/security/code-scanning/25",
+      "root_cause": "fixture-source-selection"
+    },
+    {
+      "number": 26,
+      "rule": "rust/hard-coded-cryptographic-value",
+      "severity": "critical",
+      "path": "crates/archivefs-gui/src/gui_v2/pages.rs",
+      "line": 502,
+      "url": "https://github.com/kiehntre/emuwiz/security/code-scanning/26",
+      "root_cause": "gui-scroll-identifiers"
+    },
+    {
+      "number": 27,
+      "rule": "rust/hard-coded-cryptographic-value",
+      "severity": "critical",
+      "path": "crates/archivefs-gui/src/gui_v2/simple_shell/focus_reveal_tests.rs",
+      "line": 266,
+      "url": "https://github.com/kiehntre/emuwiz/security/code-scanning/27",
+      "root_cause": "gui-scroll-identifiers"
+    },
+    {
+      "number": 28,
+      "rule": "rust/cleartext-logging",
+      "severity": "high",
+      "path": "crates/archivefs-core/src/dat/rename_apply/fd_publication_probe_tests.rs",
+      "line": 119,
+      "url": "https://github.com/kiehntre/emuwiz/security/code-scanning/28",
+      "root_cause": "numeric-process-owner-metadata"
+    },
+    {
+      "number": 29,
+      "rule": "py/clear-text-logging-sensitive-data",
+      "severity": "high",
+      "path": "scripts/emuwiz-cargo-maintain",
+      "line": 610,
+      "url": "https://github.com/kiehntre/emuwiz/security/code-scanning/29",
+      "root_cause": "cargo-policy-public-projections"
+    },
+    {
+      "number": 30,
+      "rule": "py/clear-text-logging-sensitive-data",
+      "severity": "high",
+      "path": "scripts/emuwiz-cargo-maintain",
+      "line": 1037,
+      "url": "https://github.com/kiehntre/emuwiz/security/code-scanning/30",
+      "root_cause": "cargo-policy-public-projections"
+    },
+    {
+      "number": 31,
+      "rule": "rust/hard-coded-cryptographic-value",
+      "severity": "critical",
+      "path": "crates/archivefs-gui/src/gui_v2/pages.rs",
+      "line": 1085,
+      "url": "https://github.com/kiehntre/emuwiz/security/code-scanning/31",
+      "root_cause": "gui-scroll-identifiers"
+    },
+    {
+      "number": 32,
+      "rule": "rust/hard-coded-cryptographic-value",
+      "severity": "critical",
+      "path": "crates/archivefs-gui/src/gui_v2/simple_shell.rs",
+      "line": 1049,
+      "url": "https://github.com/kiehntre/emuwiz/security/code-scanning/32",
+      "root_cause": "gui-scroll-identifiers"
+    },
+    {
+      "number": 33,
+      "rule": "rust/cleartext-logging",
+      "severity": "high",
+      "path": "crates/archivefs-core/src/dat/rename_apply/compact_recovery/deployment_tests.rs",
+      "line": 353,
+      "url": "https://github.com/kiehntre/emuwiz/security/code-scanning/33",
+      "root_cause": "recovery-fixture-assertions"
+    },
+    {
+      "number": 34,
+      "rule": "rust/cleartext-logging",
+      "severity": "high",
+      "path": "crates/archivefs-core/src/dat/rename_apply/compact_recovery/deployment_tests.rs",
+      "line": 439,
+      "url": "https://github.com/kiehntre/emuwiz/security/code-scanning/34",
+      "root_cause": "recovery-fixture-assertions"
+    },
+    {
+      "number": 35,
+      "rule": "rust/cleartext-logging",
+      "severity": "high",
+      "path": "crates/archivefs-core/src/dat/rename_apply/compact_recovery/restart_status_tests.rs",
+      "line": 153,
+      "url": "https://github.com/kiehntre/emuwiz/security/code-scanning/35",
+      "root_cause": "recovery-fixture-assertions"
+    },
+    {
+      "number": 36,
+      "rule": "rust/cleartext-logging",
+      "severity": "high",
+      "path": "crates/archivefs-core/src/dat/rename_apply/compact_recovery/restart_status_tests.rs",
+      "line": 190,
+      "url": "https://github.com/kiehntre/emuwiz/security/code-scanning/36",
+      "root_cause": "recovery-fixture-assertions"
+    },
+    {
+      "number": 37,
+      "rule": "rust/cleartext-logging",
+      "severity": "high",
+      "path": "crates/archivefs-core/src/dat/rename_apply/compact_recovery/restart_status_tests.rs",
+      "line": 472,
+      "url": "https://github.com/kiehntre/emuwiz/security/code-scanning/37",
+      "root_cause": "recovery-fixture-assertions"
+    },
+    {
+      "number": 38,
+      "rule": "rust/cleartext-logging",
+      "severity": "high",
+      "path": "crates/archivefs-core/src/dat/rename_apply/compact_recovery/restart_status_tests.rs",
+      "line": 727,
+      "url": "https://github.com/kiehntre/emuwiz/security/code-scanning/38",
+      "root_cause": "recovery-fixture-assertions"
+    },
+    {
+      "number": 39,
+      "rule": "rust/cleartext-logging",
+      "severity": "high",
+      "path": "crates/archivefs-core/src/dat/rename_apply/compact_recovery/recovery_closure_tests.rs",
+      "line": 314,
+      "url": "https://github.com/kiehntre/emuwiz/security/code-scanning/39",
+      "root_cause": "recovery-fixture-assertions"
+    }
+  ],
+  "confirmed_repair": {
+    "commit": "4ec5cf0fdc13c9c7943fbb8370127df824a91cfe",
+    "scope": "crates/archivefs-gui/src/clipboard.rs only",
+    "reproduction": "Synthetic subprocess regression failed on base and passed after fixed-category logging and session allowlisting. No actual credential disclosure demonstrated or real clipboard accessed.",
+    "validation": "2 clipboard tests passed; 2 existing policy-redaction tests passed; targeted formatting, scope, whitespace and GUI-root boundary passed.",
+    "limits": "Raw backend errors remain in existing UI result/deduplication state. This change protects stderr rather than claiming arbitrary backend text is globally secret-free. New CodeQL results are required."
+  }
+}

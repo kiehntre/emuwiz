@@ -66,6 +66,40 @@ test('full tier cannot skip release/reproducibility; failed classification grant
   const y = fixture('core'); y.jobs[0].conclusion = 'failure';
   assert.ok(decide(y).problems.some(p => p.name.includes(FULL[0])));
 });
+function collapsedMatrix(tier = 'core') {
+  const x = fixture(tier);
+  const expanded = x.jobs.filter(j => /^Reproducibility build [12]$/.test(j.name));
+  x.jobs = x.jobs.filter(j => !expanded.includes(j));
+  const ids = new Set(expanded.map(j => Number(j.check_run_url.split('/').pop())));
+  x.checks = x.checks.filter(c => !ids.has(c.id));
+  const job = {...expanded[0], name: 'Reproducibility build ${{ matrix.run }}',
+    conclusion: 'skipped'};
+  x.jobs.push(job);
+  x.checks.push({...job, id: Number(job.check_run_url.split('/').pop())});
+  return x;
+}
+for (const tier of ['core', 'gui']) {
+  test(`${tier}: GitHub's unexpanded skipped matrix represents both conditional builds`, () => {
+    assert.equal(decide(collapsedMatrix(tier)).status, 'READY');
+  });
+}
+test('unexpanded matrix cannot bypass full-tier, classification, or job identity gates', () => {
+  const variants = [
+    x => {x.tier = 'full';},
+    x => {x.jobs[0].conclusion = 'failure';},
+    x => {x.jobs.at(-1).conclusion = 'success';},
+    x => {x.jobs.at(-1).run_id = 2;},
+    x => {x.jobs.push({...x.jobs.at(-1)});},
+    x => {x.jobs.at(-1).name += ' unexpected';},
+    x => {x.jobs.push({...x.jobs.at(-1), name: 'Reproducibility build 1'});},
+    x => {x.checks.push({...x.checks.at(-1), id: 123456});},
+    x => {x.jobs.pop();},
+  ];
+  for (const mutate of variants) {
+    const x = collapsedMatrix(); mutate(x);
+    assert.equal(decide(x).status, 'FAILED');
+  }
+});
 test('additional checks and commit statuses cannot be ignored', () => {
   for (const state of ['pending', 'failure', 'error']) {
     const x = fixture(); x.statuses = [{context: 'external', state, target_url: 'https://github.com/o/r'}];

@@ -10,9 +10,9 @@ pub fn family_for_format(format: &str) -> Option<MediaFamily> {
         "cue" | "bin" | "chd" | "gdi" | "cdi" | "iso" | "gcm" | "rvz" | "wia" | "wbfs" => {
             Some(MediaFamily::Optical)
         }
-        "adf" | "adz" | "ipf" | "dms" | "st" | "msa" | "stx" | "dsk" | "d64" | "g64" | "nib"
-        | "woz" | "2mg" | "do" | "po" | "d88" | "d77" | "fdi" | "xdf" | "dim" | "fds" | "trd"
-        | "scl" | "ssd" | "dsd" | "dc42" | "d81" => Some(MediaFamily::Floppy),
+        "adf" | "adz" | "ipf" | "dms" | "hfe" | "st" | "msa" | "stx" | "dsk" | "d64" | "g64"
+        | "nib" | "woz" | "2mg" | "do" | "po" | "d88" | "d77" | "fdi" | "xdf" | "dim" | "fds"
+        | "trd" | "scl" | "ssd" | "dsd" | "dc42" | "d81" => Some(MediaFamily::Floppy),
         "tap" | "tzx" | "t64" | "cdt" | "cas" | "uef" | "wav" => Some(MediaFamily::Tape),
         _ => None,
     }

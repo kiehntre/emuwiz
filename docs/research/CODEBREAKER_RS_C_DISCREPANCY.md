@@ -1,11 +1,17 @@
 # `codebreaker` 0.4.0 vs cb2util 1.9: V7 re-key disagreement
 
-Status: **open upstream investigation** (not yet reported upstream).
-Found 2026-10-25 while validating the crate for `ps2_codebreaker`
-([PS2_CODEBREAKER_PNACH_PREVIEW.md](PS2_CODEBREAKER_PNACH_PREVIEW.md)).
-EmuWiz works around it by refusing the affected sequences; it does not modify
-the crate. This note records what was observed, not which implementation is
-correct. Which side is right for real devices is unknown.
+Status: **confirmed and fixed upstream; production remains pinned to 0.4.0**.
+Mathias Lafeldt restored V7 double re-keying in commit
+[`75471b6ed44f5692f7bba856e909699648b02aea`](https://github.com/mlafeldt/codebreaker-rs/commit/75471b6ed44f5692f7bba856e909699648b02aea)
+on 2026-10-26. His commit explains that CodeBreaker v9.2 applies the beefcode
+twice and cb2util matches it. The observations below describe the released
+0.4.0 baseline, not the fixed revision. The candidate restores the C behaviour;
+EmuWiz's current refusals remain in force. See
+[the follow-up evidence](CODEBREAKER_UPSTREAM_FIX_FOLLOWUP.md) and
+[reproduction runner](../../tools/codebreaker-followup/README.md).
+
+Found 2026-10-25 while validating `ps2_codebreaker`. No dependency promotion
+or expansion of PNACH support is part of this follow-up.
 
 ## Observation
 
@@ -13,7 +19,8 @@ Reference: `mlafeldt/cb2util` tag `v1.9` (`5fed07b`, MIT) `cb2_crypto.c`, with
 `mlafeldt/libbig_int` `fd8f327`. Crate: `codebreaker = "=0.4.0"` (crates.io
 checksum `88e7e1d6cfc999dfad058f198b13fd539bfa0fefcf7589f976a0c4accf551d7e`).
 Streams were encrypted with the C `cb_encrypt_code` and decrypted by the C
-`cb_decrypt_code` (round trip always restores the plaintext) and by the crate's
+`cb_decrypt_code` (historically reported as always round-tripping; the follow-up corrects this
+for arbitrary DF placement) and by the crate's
 `Codebreaker::decrypt_code`.
 
 | Setup | Result |
@@ -51,7 +58,7 @@ cb2util v1.9 produces (`02210430 184C16E8`). So the two disagree already on
 the encrypt side for this shape, and the crate's expected output is not what
 v1.9 produces.
 
-Candidate explanations to check (none confirmed): v1.9 treats the common-key
+Historical hypotheses (superseded by the upstream confirmation): v1.9 treats the common-key
 state as already initialised (`v7_init = 1`) and re-keys with
 `cb7_beefcode(0, val)`, while the crate's `Cb7::default()` followed by a
 `BEEFC0DE` line takes a different path; the crate may follow a later cb2util
@@ -70,14 +77,12 @@ behaviour it relies on is that a `BEEFC0DE` key line decrypts to `BEEFC0DE`,
 which the crate and the C code agreed on in every tested stream. This note is
 the record of the disagreement; no test asserts that it persists.
 
-## Suggested upstream work
+## Upstream resolution
 
-1. Run the harness below against cb2util `master` and ps2rd's copy of the
-   cipher to see whether the C side changed after v1.9.
-2. Find a vector from a real device or an independent tool for the
-   common-key-plus-`BEEFC0DE` shape.
-3. Ask the author which behaviour is intended; see the enquiry draft in the
-   research notes.
+The fixed wrapper calls `enter_v7` after the low-level V7 cipher has already
+applied the beefcode, restoring the second key application for encrypt,
+explicit decrypt and V7 auto-decrypt. The earlier single-rekey assumption was
+the bug. No moving branch is needed to reproduce the fix.
 
 ## Reproduction harness
 

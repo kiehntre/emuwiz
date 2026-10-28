@@ -75,10 +75,15 @@ impl MediaSetsPageState {
 }
 
 fn family_for_extension(extension: &str) -> Option<MediaFamily> {
+    if let Some(family) = family_for_format(extension) {
+        return Some(family);
+    }
+    // Keep catalogue-only representations supported by this view. The shared
+    // adapter owns ordinary format families, including Amiga floppy formats.
     match extension.to_ascii_lowercase().as_str() {
-        "chd" | "cue" | "bin" | "iso" | "gdi" | "cdi" | "mds" | "ccd" => Some(MediaFamily::Optical),
-        "adf" | "dsk" | "ipf" | "st" | "stx" | "img" => Some(MediaFamily::Floppy),
-        "tap" | "tzx" | "tape" | "cas" => Some(MediaFamily::Tape),
+        "mds" | "ccd" => Some(MediaFamily::Optical),
+        "img" => Some(MediaFamily::Floppy),
+        "tape" => Some(MediaFamily::Tape),
         _ => None,
     }
 }
@@ -672,6 +677,59 @@ mod tests {
                 .iter()
                 .all(|member| member.ordinal.is_some())
         );
+    }
+
+    #[test]
+    fn amiga_catalogue_formats_reach_the_shared_unverified_grouping() {
+        for extension in ["adf", "adz", "dms", "ipf", "hfe", "HFE"] {
+            let rows = (1..=2)
+                .map(|number| {
+                    let name = format!("Clockwork (Disk {number} of 2).{extension}");
+                    PersistedArchive {
+                        id: number,
+                        source_folder_id: 1,
+                        relative_path: PathBuf::from("amiga").join(&name),
+                        absolute_path: PathBuf::from("/library/amiga").join(&name),
+                        archive_kind: "loose_file".into(),
+                        display_name: name.clone(),
+                        normalized_name: name.to_lowercase(),
+                        size_bytes: None,
+                        modified_time_unix_seconds: None,
+                        platform: Some("Amiga".into()),
+                        platform_source: None,
+                        last_known_health: "Unknown".into(),
+                        last_seen_at: "2026-10-26T00:00:00Z".into(),
+                        last_verified_missing_at: None,
+                        identity_report: None,
+                    }
+                })
+                .collect::<Vec<_>>();
+            let records = rows
+                .iter()
+                .filter_map(record_from_catalogue)
+                .collect::<Vec<_>>();
+            assert_eq!(records.len(), 2, "{extension}");
+            assert!(
+                records
+                    .iter()
+                    .all(|r| r.family == Some(MediaFamily::Floppy))
+            );
+            let mut state = MediaSetsPageState::default();
+            state.refresh(&rows, &[], 1);
+            assert_eq!(state.sets.len(), 1, "{extension}");
+            assert_eq!(state.sets[0].members.len(), 2, "{extension}");
+            assert_eq!(state.sets[0].state, MediaSetState::UnverifiedSet);
+            assert!(!state.sets[0].identity.verified);
+            assert!(state.sets[0].members.iter().all(|m| {
+                m.ordinal
+                    .as_ref()
+                    .is_some_and(|o| o.unit == OrdinalUnit::Disk)
+            }));
+        }
+        assert_eq!(family_for_extension("mds"), Some(MediaFamily::Optical));
+        assert_eq!(family_for_extension("img"), Some(MediaFamily::Floppy));
+        assert_eq!(family_for_extension("tape"), Some(MediaFamily::Tape));
+        assert_eq!(family_for_extension("unknown"), None);
     }
 
     #[test]

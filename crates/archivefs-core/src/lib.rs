@@ -22,6 +22,8 @@ use sha2::{Digest, Sha256};
 // Launch-option trainer adapters keep preview, identity, and transaction
 // semantics in the core crate for all GUI surfaces.
 
+/// Advisory requirements planning for caller-supplied launch-provider evidence.
+pub mod alternative_launch_provider_planner;
 /// Bounded gzip decompression of `.adz` (compressed Amiga floppy) containers,
 /// projected through the existing ADF parser - no new filesystem, no new
 /// ADF parsing.
@@ -87,6 +89,7 @@ pub mod homebrew_artifact;
 pub mod homebrew_catalogue;
 /// GitHub Releases provider for already-known homebrew repositories.
 pub mod homebrew_github;
+pub mod host_capability_readiness;
 mod http_agent;
 pub mod identity_attention;
 pub mod job_progress;
@@ -115,6 +118,8 @@ pub mod managed_emulator_install;
 pub mod metadata_aggregation;
 /// Bounded MSX standard cassette WAV evidence.
 pub mod msx_tape;
+/// Read-only comparison of explicitly supplied netplay observations.
+pub mod netplay_readiness;
 pub mod nintendo3ds_retail;
 /// Shared read-only projections of workflow journals into operation receipts
 /// and conservative recovery capabilities.

@@ -126,6 +126,9 @@ pub(crate) struct DatIdentityPresentation {
     /// "Checked against" - the specific configured source this result came
     /// from.
     pub(crate) checked_against: Option<String>,
+    /// Publisher-declared catalogue metadata; never verification authority.
+    pub(crate) catalogue_names: Vec<String>,
+    pub(crate) catalogue_author: Option<String>,
     /// The No-Intro representation only when the audited catalogue stated
     /// one.  It is explanatory provenance, never a confidence signal.
     pub(crate) variant: Option<String>,
@@ -286,6 +289,18 @@ pub(crate) fn present_summary(summary: &LibraryDatIdentitySummary) -> DatIdentit
         catalogue,
         match_basis,
         checked_against,
+        catalogue_names: summary
+            .source
+            .catalogue_names
+            .iter()
+            .filter(|name| !name.trim().is_empty())
+            .cloned()
+            .collect(),
+        catalogue_author: summary
+            .source
+            .author
+            .clone()
+            .filter(|author| !author.trim().is_empty()),
         variant,
         freshness_note: freshness_note(summary.provenance_freshness),
         show_verify_action,
@@ -309,6 +324,8 @@ pub(crate) fn present_missing() -> DatIdentityPresentation {
         catalogue: None,
         match_basis: None,
         checked_against: None,
+        catalogue_names: vec![],
+        catalogue_author: None,
         variant: None,
         freshness_note: None,
         show_verify_action: true,
@@ -330,6 +347,12 @@ fn render_presentation(ui: &mut egui::Ui, presentation: &DatIdentityPresentation
     }
     if let Some(value) = presentation.checked_against.as_deref() {
         rows.push(("Checked against", value));
+    }
+    for name in &presentation.catalogue_names {
+        rows.push(("Catalogue name", name));
+    }
+    if let Some(value) = presentation.catalogue_author.as_deref() {
+        rows.push(("Catalogue author", value));
     }
     if let Some(value) = presentation.variant.as_deref() {
         rows.push(("Variant", value));
@@ -738,6 +761,37 @@ pub(crate) fn show_dat_identity_section(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn publisher_metadata_is_visible_without_changing_the_verification_verdict() {
+        let mut source = summary(DatVerificationState::FilenameOnlyNotVerified);
+        source.source.catalogue_names = vec![
+            "Community catalogue — floppy preservation".into(),
+            "Other catalogue".into(),
+            "  ".into(),
+        ];
+        source.source.author = Some("Local publisher".into());
+        let (text, clicked) = render(None, &[source]);
+        assert!(text.contains("Catalogue name:"));
+        assert!(text.contains("Community catalogue — floppy preservation"));
+        assert!(text.contains("Other catalogue"));
+        assert!(text.contains("Catalogue author:"));
+        assert!(text.contains("Local publisher"));
+        assert!(text.contains(DatIdentityStatus::MoreEvidenceNeeded.label()));
+        assert!(!clicked);
+    }
+
+    #[test]
+    fn absent_or_blank_publisher_metadata_has_no_empty_rows() {
+        let mut source = summary(DatVerificationState::NoMatch);
+        source.source.catalogue_names = vec![" ".into()];
+        source.source.author = Some("\t".into());
+        let (text, _) = render(None, &[source]);
+        assert!(!text.contains("Catalogue name:"));
+        assert!(!text.contains("Catalogue author:"));
+        assert!(present_missing().catalogue_names.is_empty());
+        assert!(present_missing().catalogue_author.is_none());
+    }
 
     fn summary(state: DatVerificationState) -> LibraryDatIdentitySummary {
         LibraryDatIdentitySummary {
