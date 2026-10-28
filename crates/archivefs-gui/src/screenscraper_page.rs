@@ -1,8 +1,8 @@
-//! Session-only configuration and connection testing for ScreenScraper.
+//! ScreenScraper configuration, optional Secret Service storage, and connection testing.
 //!
 //! ScreenScraper is intentionally presented under Settings as optional
-//! metadata enrichment. This page never writes provider credentials, starts a
-//! library job, changes identity, or downloads media.
+//! metadata enrichment. It writes credentials only through the system secret
+//! store. It never starts a library job, changes identity, or downloads media.
 
 use std::sync::mpsc::{self, Receiver, TryRecvError};
 use std::thread;
@@ -15,6 +15,7 @@ use archivefs_core::identity_source::screenscraper::{
 
 use eframe::egui;
 
+use crate::screenscraper_secret_store::{SecretStore, StoreError, StoredCredentials};
 use crate::ui::components as widgets;
 
 const TEST_TITLE: &str = "EmuWiz";
@@ -54,9 +55,8 @@ impl ScreenScraperUiStatus {
     }
 }
 
-/// State is deliberately session-only until EmuWiz has a safe secret-store
-/// abstraction. The custom Debug implementation keeps entered secrets out of
-/// test diagnostics and future debug output.
+/// Secret Service credentials are loaded when available. The custom Debug
+/// implementation keeps entered secrets out of diagnostics.
 pub(crate) struct ScreenScraperPageState {
     pub(crate) developer_id: String,
     pub(crate) developer_password: String,
@@ -68,15 +68,20 @@ pub(crate) struct ScreenScraperPageState {
     last_error: Option<String>,
     candidate_count: Option<usize>,
     request: Option<Receiver<Result<LookupOutcome, ScreenScraperError>>>,
+    stored: bool,
+    invalid_stored: bool,
+    store_available: bool,
+    storage_message: Option<&'static str>,
+    unsaved_edits: bool,
 }
 
 impl std::fmt::Debug for ScreenScraperPageState {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         formatter
             .debug_struct("ScreenScraperPageState")
-            .field("developer_id", &self.developer_id)
+            .field("developer_id", &"redacted")
             .field("developer_password", &"redacted")
-            .field("user_id", &self.user_id)
+            .field("user_id", &"redacted")
             .field("user_password", &"redacted")
             .field("status", &self.status)
             .field("quota", &self.quota)
@@ -84,6 +89,9 @@ impl std::fmt::Debug for ScreenScraperPageState {
             .field("last_error", &self.last_error)
             .field("candidate_count", &self.candidate_count)
             .field("request_pending", &self.request.is_some())
+            .field("stored", &self.stored)
+            .field("invalid_stored", &self.invalid_stored)
+            .field("store_available", &self.store_available)
             .finish()
     }
 }
@@ -98,7 +106,16 @@ struct QuotaView {
 
 impl Default for ScreenScraperPageState {
     fn default() -> Self {
-        Self {
+        #[cfg(test)]
+        let store = SecretStore::new(std::path::Path::new("/no-such-secret-tool"));
+        #[cfg(not(test))]
+        let store = SecretStore::system();
+        let loaded = store.load();
+        let stored = matches!(loaded, Ok(Some(_)));
+        let invalid_stored = matches!(loaded, Err(StoreError::InvalidRecord));
+        let store_available = store.available();
+        let record = loaded.ok().flatten();
+        let mut state = Self {
             developer_id: String::new(),
             developer_password: String::new(),
             user_id: String::new(),
@@ -109,11 +126,106 @@ impl Default for ScreenScraperPageState {
             last_error: None,
             candidate_count: None,
             request: None,
+            stored,
+            invalid_stored,
+            store_available,
+            storage_message: None,
+            unsaved_edits: false,
+        };
+        if let Some(record) = record {
+            if state.set_loaded(record).is_err() {
+                state.stored = false;
+                state.invalid_stored = true;
+                state.storage_message = Some("Stored credentials are invalid; enter them again.");
+            }
         }
+        state
     }
 }
 
 impl ScreenScraperPageState {
+    fn set_loaded(&mut self, record: StoredCredentials) -> Result<(), ()> {
+        if record.developer_id.len() > 256
+            || record.user_id.len() > 256
+            || record.user_id.chars().any(|ch| ch.is_control())
+        {
+            return Err(());
+        }
+        let developer_password =
+            ScreenScraperSecret::parse(&record.developer_password).map_err(|_| ())?;
+        let user_password = if record.user_password.is_empty() {
+            None
+        } else {
+            Some(ScreenScraperSecret::parse(&record.user_password).map_err(|_| ())?)
+        };
+        ScreenScraperCredentials::new(
+            &record.developer_id,
+            developer_password,
+            Some(&record.user_id),
+            user_password,
+        )
+        .map_err(|_| ())?;
+        self.developer_id = record.developer_id;
+        self.developer_password = record.developer_password;
+        self.user_id = record.user_id;
+        self.user_password = record.user_password;
+        Ok(())
+    }
+
+    fn save_credentials(&mut self) {
+        if self.credentials().is_none()
+            || self.user_id.len() > 256
+            || self.user_id.chars().any(|ch| ch.is_control())
+        {
+            self.storage_message =
+                Some("Enter valid developer and optional user credentials before saving.");
+            return;
+        }
+        let record = StoredCredentials {
+            developer_id: self.developer_id.trim().into(),
+            developer_password: self.developer_password.trim().into(),
+            user_id: self.user_id.trim().into(),
+            user_password: self.user_password.trim().into(),
+        };
+        match SecretStore::system().save(&record) {
+            Ok(()) => {
+                self.stored = true;
+                self.invalid_stored = false;
+                self.unsaved_edits = false;
+                self.storage_message = Some(
+                    "Credentials saved in the system secret store. Connection not yet verified.",
+                );
+            }
+            Err(_) => {
+                self.storage_message = Some(if self.stored {
+                    "Could not update the secret store. Current edits remain in this session; previously saved credentials may still be present."
+                } else {
+                    "System secret storage is unavailable. Credentials remain in this session only."
+                })
+            }
+        }
+    }
+
+    fn forget_credentials(&mut self) {
+        if (self.stored || self.invalid_stored) && SecretStore::system().forget().is_err() {
+            self.storage_message = Some(
+                "Could not remove stored credentials. Try again when the secret store is available.",
+            );
+            return;
+        }
+        self.developer_id.clear();
+        self.developer_password.clear();
+        self.user_id.clear();
+        self.user_password.clear();
+        self.stored = false;
+        self.invalid_stored = false;
+        self.unsaved_edits = false;
+        self.status = ScreenScraperUiStatus::NotConfigured;
+        self.quota = None;
+        self.last_error = None;
+        self.storage_message = Some("Credentials forgotten.");
+    }
+
     pub(crate) fn status(&self) -> ScreenScraperUiStatus {
         self.status
     }
@@ -329,32 +441,90 @@ pub(crate) fn show_screen_scraper_settings(
         );
 
         ui.add_space(6.0);
-        ui.label(egui::RichText::new("Session-only credentials").strong());
-        ui.label("Credentials are held only while this window is open. EmuWiz does not yet have a safe provider secret store, so they are not saved to disk.");
+        ui.label(egui::RichText::new("Credentials").strong());
+        if state.invalid_stored {
+            ui.label("Stored credentials are invalid. Replace or forget them.");
+        } else if state.stored {
+            if state.unsaved_edits {
+                ui.label(
+                    "Saved credentials are available after restart. Current edits are not saved.",
+                );
+            } else {
+                ui.label("Saved in the system secret store; available after restart.");
+            }
+        } else if state.store_available {
+            ui.label("Session-only until saved in the system secret store.");
+        } else {
+            ui.label("System secret storage is unavailable. Credentials are held only while this window is open and are not saved to disk.");
+        }
+        let mut edited = false;
         ui.horizontal(|ui| {
             ui.label("Developer ID");
-            ui.add(egui::TextEdit::singleline(&mut state.developer_id).desired_width(220.0));
+            edited |= ui
+                .add(egui::TextEdit::singleline(&mut state.developer_id).desired_width(220.0))
+                .changed();
         });
         ui.horizontal(|ui| {
             ui.label("Developer password");
-            ui.add(
-                egui::TextEdit::singleline(&mut state.developer_password)
-                    .password(true)
-                    .desired_width(220.0),
-            );
+            edited |= ui
+                .add(
+                    egui::TextEdit::singleline(&mut state.developer_password)
+                        .password(true)
+                        .desired_width(220.0),
+                )
+                .changed();
         });
         ui.horizontal(|ui| {
             ui.label("User ID (optional)");
-            ui.add(egui::TextEdit::singleline(&mut state.user_id).desired_width(220.0));
+            edited |= ui
+                .add(egui::TextEdit::singleline(&mut state.user_id).desired_width(220.0))
+                .changed();
         });
         ui.horizontal(|ui| {
             ui.label("User password (optional)");
-            ui.add(
-                egui::TextEdit::singleline(&mut state.user_password)
-                    .password(true)
-                    .desired_width(220.0),
-            );
+            edited |= ui
+                .add(
+                    egui::TextEdit::singleline(&mut state.user_password)
+                        .password(true)
+                        .desired_width(220.0),
+                )
+                .changed();
         });
+        if edited {
+            state.unsaved_edits = true;
+            state.storage_message = None;
+        }
+        ui.horizontal(|ui| {
+            if widgets::action_button(
+                ui,
+                if state.stored {
+                    "Update saved credentials"
+                } else {
+                    "Save credentials"
+                },
+                widgets::ActionStyle::Secondary,
+                !busy && state.store_available,
+            )
+            .clicked()
+            {
+                state.save_credentials();
+            }
+            if widgets::action_button(
+                ui,
+                "Forget credentials",
+                widgets::ActionStyle::Secondary,
+                !busy
+                    && state.request.is_none()
+                    && (state.stored || state.invalid_stored || state.is_configured()),
+            )
+            .clicked()
+            {
+                state.forget_credentials();
+            }
+        });
+        if let Some(message) = state.storage_message {
+            ui.label(message);
+        }
         if widgets::action_button(
             ui,
             "Test connection",
@@ -522,13 +692,17 @@ mod tests {
     #[test]
     fn debug_output_redacts_session_credentials() {
         let state = ScreenScraperPageState {
+            developer_id: "developer-account".into(),
             developer_password: "developer-secret".into(),
+            user_id: "user-account".into(),
             user_password: "user-secret".into(),
             ..ScreenScraperPageState::default()
         };
         let debug = format!("{state:?}");
         assert!(!debug.contains("developer-secret"));
+        assert!(!debug.contains("developer-account"));
         assert!(!debug.contains("user-secret"));
+        assert!(!debug.contains("user-account"));
     }
 
     #[test]
@@ -536,8 +710,35 @@ mod tests {
         let mut state = ScreenScraperPageState::default();
         let output = render(&mut state);
         assert!(rendered_text_contains(&output, "Test connection"));
+        assert!(rendered_text_contains(&output, "Save credentials"));
+        assert!(rendered_text_contains(&output, "Forget credentials"));
         assert!(!rendered_text_contains(&output, "enrich the whole library"));
         assert_eq!(IdentityContribution::None, IdentityContribution::None);
         assert_eq!(TEST_TITLE, "EmuWiz");
+    }
+
+    #[test]
+    fn invalid_loaded_credentials_do_not_enter_session_or_debug_output() {
+        let mut state = ScreenScraperPageState::default();
+        assert!(
+            state
+                .set_loaded(StoredCredentials {
+                    developer_id: "dev".into(),
+                    developer_password: "invalid\nsecret".into(),
+                    user_id: "user".into(),
+                    user_password: "synthetic-secret".into(),
+                })
+                .is_err()
+        );
+        assert!(!state.is_configured());
+        assert!(!format!("{state:?}").contains("synthetic-secret"));
+        assert_eq!(
+            status_for_error(&ScreenScraperError::Authentication { status: 401 }),
+            ScreenScraperUiStatus::AuthenticationError
+        );
+        assert!(
+            !public_error(&ScreenScraperError::Authentication { status: 401 })
+                .contains("synthetic-secret")
+        );
     }
 }

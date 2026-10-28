@@ -270,6 +270,7 @@ mod identity_providers_page;
 mod screenscraper_batch_enrichment_page;
 mod screenscraper_enrichment_page;
 mod screenscraper_page;
+mod screenscraper_secret_store;
 mod selected_game_readiness;
 use dat_identity_panel::*;
 mod source_controller;
