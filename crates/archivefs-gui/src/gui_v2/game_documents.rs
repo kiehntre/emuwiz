@@ -6,7 +6,168 @@ use super::{
     media_sources::MediaIndex,
 };
 use eframe::egui;
-use std::sync::Arc;
+use std::{
+    sync::{
+        Arc,
+        mpsc::{self, Receiver, SyncSender, TrySendError},
+    },
+    time::{Duration, Instant},
+};
+
+const REFRESH_INTERVAL: Duration = Duration::from_secs(3);
+const STALE_AFTER: Duration = Duration::from_secs(8);
+
+struct RefreshRequest {
+    generation: u64,
+    game: Game,
+    preferences: DocumentPreferences,
+    index: Option<Arc<MediaIndex>>,
+}
+
+struct RefreshReply {
+    generation: u64,
+    documents: Vec<GameDocument>,
+    issue: Option<String>,
+}
+
+/// One worker and one pending request; slow mounts cannot accumulate threads or
+/// filesystem work on the UI thread. Results for a previous game are ignored.
+#[derive(Default)]
+pub(super) struct DocumentRefresh {
+    sender: Option<SyncSender<RefreshRequest>>,
+    receiver: Option<Receiver<RefreshReply>>,
+    generation: u64,
+    pending: bool,
+    last_confirmed: Option<Instant>,
+}
+
+impl DocumentRefresh {
+    fn reset(&mut self) {
+        self.generation = self.generation.wrapping_add(1);
+        self.pending = false;
+        self.last_confirmed = None;
+    }
+
+    fn ensure_worker(&mut self, context: &egui::Context) {
+        if self.sender.is_some() {
+            return;
+        }
+        let (sender, requests) = mpsc::sync_channel::<RefreshRequest>(1);
+        let (replies, receiver) = mpsc::channel();
+        let repaint = context.clone();
+        if std::thread::Builder::new()
+            .name("manual-document-refresh".into())
+            .spawn(move || {
+                while let Ok(request) = requests.recv() {
+                    let (documents, issue) = discover_game_documents(
+                        &request.game,
+                        &request.preferences,
+                        request.index.as_deref(),
+                    );
+                    if replies
+                        .send(RefreshReply {
+                            generation: request.generation,
+                            documents,
+                            issue,
+                        })
+                        .is_err()
+                    {
+                        break;
+                    }
+                    repaint.request_repaint();
+                }
+            })
+            .is_ok()
+        {
+            self.sender = Some(sender);
+            self.receiver = Some(receiver);
+        }
+    }
+
+    fn poll(&mut self, context: &egui::Context) -> Option<RefreshReply> {
+        let mut latest = None;
+        if let Some(receiver) = &self.receiver {
+            while let Ok(reply) = receiver.try_recv() {
+                if reply.generation == self.generation {
+                    self.pending = false;
+                    self.last_confirmed = Some(Instant::now());
+                    latest = Some(reply);
+                }
+            }
+        }
+        context.request_repaint_after(REFRESH_INTERVAL);
+        latest
+    }
+
+    fn request(
+        &mut self,
+        context: &egui::Context,
+        game: &Game,
+        preferences: &DocumentPreferences,
+        index: Option<Arc<MediaIndex>>,
+    ) {
+        if self.pending
+            || self
+                .last_confirmed
+                .is_some_and(|at| at.elapsed() < REFRESH_INTERVAL)
+        {
+            return;
+        }
+        self.ensure_worker(context);
+        if let Some(sender) = &self.sender {
+            match sender.try_send(RefreshRequest {
+                generation: self.generation,
+                game: game.clone(),
+                preferences: preferences.clone(),
+                index,
+            }) {
+                Ok(()) => self.pending = true,
+                Err(TrySendError::Full(_)) => {}
+                Err(TrySendError::Disconnected(_)) => {
+                    self.sender = None;
+                    self.receiver = None;
+                }
+            }
+        }
+    }
+
+    pub(super) fn stale(&self) -> bool {
+        self.last_confirmed
+            .is_none_or(|at| at.elapsed() >= STALE_AFTER)
+    }
+
+    #[cfg(test)]
+    pub(super) fn block_worker_for_test(&mut self) -> mpsc::Sender<()> {
+        let (sender, requests) = mpsc::sync_channel::<RefreshRequest>(1);
+        let (replies, receiver) = mpsc::channel();
+        let (release, blocked) = mpsc::channel();
+        std::thread::spawn(move || {
+            if let Ok(request) = requests.recv()
+                && blocked.recv().is_ok()
+            {
+                let (documents, issue) = discover_game_documents(
+                    &request.game,
+                    &request.preferences,
+                    request.index.as_deref(),
+                );
+                let _ = replies.send(RefreshReply {
+                    generation: request.generation,
+                    documents,
+                    issue,
+                });
+            }
+        });
+        self.sender = Some(sender);
+        self.receiver = Some(receiver);
+        self.last_confirmed = Some(Instant::now() - REFRESH_INTERVAL);
+        release
+    }
+
+    #[cfg(test)]
+    pub(super) fn expire_for_test(&mut self) {
+        self.last_confirmed = Some(Instant::now() - STALE_AFTER);
+    }
+}
 
 pub(super) fn discover_game_documents(
     game: &Game,
@@ -79,20 +240,33 @@ impl App {
                 .as_ref()
                 .is_none_or(|(id, cached_path, _)| *id != game_id || *cached_path != path)
         {
-            let (documents, issue) = discover_game_documents(
-                game,
-                &self.document_preferences,
-                self.artwork.index.as_deref(),
-            );
-            self.document_cache = Some((game_id, path, documents));
+            self.document_cache = Some((game_id, path, Vec::new()));
             self.document_index = self.artwork.index.clone();
-            self.document_issue = issue;
+            self.document_issue = None;
+            self.document_refresh.reset();
+        } else if let Some(reply) = self.document_refresh.poll(ui.ctx()) {
+            self.document_cache = Some((game_id, path, reply.documents));
+            self.document_issue = reply.issue;
         }
-        let documents = self
+        self.document_refresh.request(
+            ui.ctx(),
+            game,
+            &self.document_preferences,
+            self.artwork.index.clone(),
+        );
+        let unverified = self.document_refresh.stale();
+        let mut documents = self
             .document_cache
             .as_ref()
             .map(|(_, _, docs)| docs.clone())
             .unwrap_or_default();
+        if unverified {
+            for document in &mut documents {
+                document.document_id = None;
+                document.readiness = None;
+                document.refusal_reason = Some("Document freshness could not be confirmed yet. Opening is paused until the background check finishes.".into());
+            }
+        }
         egui::CollapsingHeader::new("Manuals & Guides")
             .id_salt(("v2_manuals", game_id))
             .default_open(true)
@@ -113,8 +287,9 @@ impl App {
                     if ui.button("Refresh documents").clicked() { self.document_cache = None; }
                 });
                 if let Some(issue) = &self.document_issue { ui.label(issue); }
+                if unverified { ui.label("Document freshness is unconfirmed. Opening is paused until the background check can finish."); }
                 if documents.is_empty() {
-                    ui.weak("No manual or guide is associated with this game. Choose a local document to add one.");
+                    if !unverified { ui.weak("No manual or guide is associated with this game. Choose a local document to add one."); }
                     return;
                 }
             for document in documents {
@@ -142,7 +317,7 @@ impl App {
                 ui.weak(if document.format == super::documents::GameDocumentFormat::Text {
                     if document.document_id.is_some() { "Plain text · Read inside EmuWiz." } else { "Plain text · EmuWiz cannot show this file." }
                 } else {
-                    super::manual_viewer::capability_text(document.readiness)
+                    super::manual_viewer::capability_text(document.format, document.readiness)
                 });
                 if let Some(reason) = &document.refusal_reason { ui.label(reason); }
                 ui.horizontal_wrapped(|ui| {

@@ -135,7 +135,24 @@ fn pdf_renderer_capability_and_external_open_are_independent() {
         enabled_buttons(readiness, DocumentOpenCapability::Supported),
         (pdf_render::available(), true)
     );
-    assert!(capability_text(Some(readiness)).contains("externally"));
+    assert!(
+        capability_text(
+            super::super::documents::GameDocumentFormat::Pdf,
+            Some(readiness)
+        )
+        .contains("externally")
+    );
+}
+
+#[test]
+fn comic_capability_names_each_format_and_cbr_external_limit() {
+    assert_eq!(
+        capability_text(GameDocumentFormat::Cbz, Some(ManualReadiness::Viewable)),
+        "CBZ · Read pages inside EmuWiz."
+    );
+    let cbr = capability_text(GameDocumentFormat::Cbr, Some(ManualReadiness::Viewable));
+    assert!(cbr.contains("CBR"));
+    assert!(cbr.contains("External opening is unavailable"));
 }
 
 #[test]
