@@ -1847,6 +1847,10 @@ fn gui_v2_organisation_primary_action_is_on_screen_at_640x375_points() {
     frame(&context, &mut app, size);
     let output = frame(&context, &mut app, size);
     assert_viewport_is(&context, &output, size);
+    assert!(organisation_label_is_visible(
+        &output,
+        "Choose what you want to organise"
+    ));
     assert!(
         organisation_label_is_visible(&output, "Preview Playing Library"),
         "not visible without scrolling"
@@ -1873,6 +1877,10 @@ fn gui_v2_organisation_primary_action_is_on_screen_at_the_160_percent_ui_scale()
     assert_viewport_is(&context, &output, size);
     assert!(organisation_label_is_visible(
         &output,
+        "Choose what you want to organise"
+    ));
+    assert!(organisation_label_is_visible(
+        &output,
         "Preview Playing Library"
     ));
     keyboard_activates_primary_action(&context, &mut app, size);
@@ -1895,7 +1903,11 @@ fn gui_v2_organisation_primary_action_scrolls_into_reach_when_clipped() {
     // The pointer must be over the page body for the wheel to scroll it.
     let body = egui::pos2(size[0] * 0.7, size[1] - 70.0);
     let mut after = before;
-    for _ in 0..12 {
+    // The 40-point viewport leaves a 19-point interval in which the whole
+    // 21-point label is visible. Coarse 40-point steps can skip that interval.
+    // Keep the same 480-point travel budget, sampled finely enough to observe
+    // reachability; the clipping, viewport and activation assertions stay strict.
+    for _ in 0..48 {
         after = frame_with(
             &context,
             &mut app,
@@ -1905,7 +1917,7 @@ fn gui_v2_organisation_primary_action_scrolls_into_reach_when_clipped() {
                 egui::Event::MouseWheel {
                     phase: egui::TouchPhase::Move,
                     unit: egui::MouseWheelUnit::Point,
-                    delta: egui::vec2(0.0, -40.0),
+                    delta: egui::vec2(0.0, -10.0),
                     modifiers: egui::Modifiers::NONE,
                 },
             ],
@@ -11161,3 +11173,33 @@ mod large_library_regressions;
 mod artwork_journey;
 
 mod provider_validation;
+
+#[test]
+fn gui_v2_same_destination_reentry_discards_an_older_preview() {
+    use crate::playing_library_page::PlayingLibraryDestination;
+    let context = egui::Context::default();
+    let mut app = fixture(&context);
+    let id = app
+        .activity
+        .queue("Old preview", Route::Section(Section::Build), false);
+    let old_state = app.playing_library.clone();
+    app.playing_library_job = Some(super::PlayingLibraryJob {
+        id,
+        kind: super::PlayingLibraryJobKind::Preview,
+        generation: 1,
+        input_fingerprint: old_state.input_fingerprint(),
+    });
+    app.playing_library_generation = 1;
+    // Reset approvals by re-entering the same route while its old worker is
+    // still running. Path/preferences and destination value have not changed.
+    app.playing_library
+        .set_destination(PlayingLibraryDestination::Generic);
+    app.finish_playing_library_job(
+        id,
+        super::PlayingLibraryJobKind::Preview,
+        Box::new(old_state),
+        1,
+    );
+    assert!(app.playing_library_job.is_none());
+    assert!(app.activity.jobs[&id].summary.contains("discarded"));
+}

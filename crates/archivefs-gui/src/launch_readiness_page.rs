@@ -33,13 +33,19 @@
 //!   content, or a `Blocked` candidate. shadPS4 alone accepts its sealed
 //!   `ReadyWithWarnings` plan with explicit unverified-compatibility warnings. Standalone
 //!   candidates are limited to adapters with an existing typed GUI executor.
-//! - It never exposes a Stop/Kill action and never automatically relaunches
-//!   a process that has exited.
+//! - Dolphin exposes an explicitly confirmed normal-stop request for the owned
+//!   launcher only. No forced kill, process-tree stop or automatic relaunch exists.
 
 mod dolphin_profile_guidance;
+mod dolphin_stop;
+mod fbneo;
+mod native_cd_feedback;
+mod native_cd_identity;
+mod tsugaru;
 
 #[path = "launch_readiness_page/cemu.rs"]
 pub(crate) mod cemu;
+mod cemu_stop;
 mod classic_pokes;
 pub(crate) mod controller_readiness;
 pub(crate) mod dosbox;
@@ -990,6 +996,7 @@ pub(crate) enum StandaloneProcess {
     #[cfg(target_os = "linux")]
     ShadPs4(archivefs_core::launch::process_spawn::WatchedProcess),
     Mame(archivefs_core::launch::process_spawn::WatchedProcess),
+    Tsugaru(archivefs_core::launch::process_spawn::WatchedProcess),
     /// MAME started through the canonical per-launch cheat runtime; the session
     /// owns the temporary cheat workspace and removes it after MAME exits.
     MameCheats(
@@ -1015,7 +1022,7 @@ pub(crate) enum StandaloneProcess {
     Rpcs3(LaunchedRpcs3Process),
     Xemu(LaunchedXemuProcess),
     Xenia(LaunchedXeniaProcess),
-    Cemu(archivefs_core::launch::LaunchedCemuProcess),
+    Cemu(cemu_stop::Session),
     Flycast(archivefs_core::launch::LaunchedFlycastProcess),
     XRoar(archivefs_core::launch::process_spawn::WatchedProcess),
     Vice(archivefs_core::launch::process_spawn::WatchedProcess),
@@ -1062,6 +1069,7 @@ pub(crate) struct StandaloneLaunchState {
     scummvm_profile: scummvm_profile::Choice,
     /// The DOSBox check and the user's approval for the game on screen.
     dosbox: dosbox::Panel,
+    tsugaru: tsugaru::Panel,
     vice_trainers: vice::trainers::Chooser,
 }
 
@@ -1073,6 +1081,7 @@ impl StandaloneLaunchState {
     /// The game the Launch page shows, for the DOSBox check.
     pub(crate) fn focus_dosbox_game(&mut self, path: Option<&Path>) {
         self.dosbox.focus(path);
+        self.tsugaru.focus(path);
     }
 
     pub(crate) fn focus_vice_trainer_game(&mut self, path: Option<&Path>) {
@@ -1254,6 +1263,7 @@ impl StandaloneLaunchState {
                     #[cfg(target_os = "linux")]
                     StandaloneProcess::ShadPs4(p) => p.poll().is_some(),
                     StandaloneProcess::Mame(p) => p.poll().is_some(),
+                    StandaloneProcess::Tsugaru(p) => p.poll().is_some(),
                     StandaloneProcess::MameCheats(session) => {
                         session.poll();
                         session.is_finished()
@@ -1475,6 +1485,7 @@ pub(crate) enum StandaloneLaunchRequest {
     #[cfg(target_os = "linux")]
     ShadPs4(crate::emulator_setup::shadps4::Request),
     Mame(MameLaunchRequest),
+    Tsugaru(tsugaru::Request),
     DuckStation(
         DuckStationLaunchRequest,
         archivefs_core::patch_manager::DuckStationProfileDiscoveryRoots,
@@ -1522,6 +1533,7 @@ impl StandaloneLaunchRequest {
             #[cfg(target_os = "linux")]
             Self::ShadPs4(_) => "shadPS4",
             Self::Mame(_) => "MAME",
+            Self::Tsugaru(_) => "Tsugaru",
             Self::DuckStation(..) => "DuckStation",
             Self::Ppsspp(_, _) => "PPSSPP",
             Self::MelonDs(_, _) => "melonDS",
@@ -1544,6 +1556,7 @@ impl StandaloneLaunchRequest {
             #[cfg(target_os = "linux")]
             Self::ShadPs4(r) => (r.plan.game().executable().into(), "shadps4".into()),
             Self::Mame(r) => (r.selected_content.clone(), "mame".into()),
+            Self::Tsugaru(r) => r.key(),
             Self::DuckStation(r, ..) => (r.selected_content_path.clone(), "duckstation".into()),
             Self::Ppsspp(r, _) => (r.selected_content_path.clone(), "ppsspp".into()),
             Self::MelonDs(r, _) => (r.selected_content_path.clone(), "melonds".into()),
@@ -1562,7 +1575,10 @@ impl StandaloneLaunchRequest {
     }
     pub(crate) fn execute(self) -> Result<StandaloneProcess, String> {
         match self {
-            Self::Cemu(r) => r.execute().map(StandaloneProcess::Cemu),
+            Self::Cemu(r) => r
+                .execute()
+                .map(cemu_stop::Session::new)
+                .map(StandaloneProcess::Cemu),
             Self::Flycast(r) => r.execute().map(StandaloneProcess::Flycast),
             Self::XRoar(r) => r.execute().map(StandaloneProcess::XRoar),
             Self::Vice(r) => r.execute().map(StandaloneProcess::Vice),
@@ -1571,6 +1587,7 @@ impl StandaloneLaunchRequest {
                 .execute()
                 .map(StandaloneProcess::ShadPs4)
                 .map_err(|e| format!("{:?}: {}", e.kind, e.detail)),
+            Self::Tsugaru(r) => r.execute().map(StandaloneProcess::Tsugaru),
             Self::Mame(r) => archivefs_core::launch::preflight_and_launch_mame(&r)
                 .map(StandaloneProcess::Mame)
                 .map_err(|error| format!("{error:?}")),
@@ -2140,9 +2157,11 @@ enum DolphinLaunchStage {
     },
     Running {
         process: LaunchedDolphinProcess,
+        stop: dolphin_stop::StopControl,
     },
     Exited {
         process: LaunchedDolphinProcess,
+        stop: dolphin_stop::StopControl,
     },
     Failed {
         error: DolphinLaunchExecutionError,
@@ -2170,7 +2189,13 @@ impl DolphinLaunchState {
         match stage {
             DolphinLaunchStage::Starting { receiver } => match receiver.try_recv() {
                 Ok(Ok(process)) => {
-                    self.tracked = Some((key, DolphinLaunchStage::Running { process }));
+                    self.tracked = Some((
+                        key,
+                        DolphinLaunchStage::Running {
+                            process,
+                            stop: Default::default(),
+                        },
+                    ));
                     true
                 }
                 Ok(Err(error)) => {
@@ -2195,12 +2220,12 @@ impl DolphinLaunchState {
                     true
                 }
             },
-            DolphinLaunchStage::Running { mut process } => {
+            DolphinLaunchStage::Running { mut process, stop } => {
                 if process.poll().is_some() {
-                    self.tracked = Some((key, DolphinLaunchStage::Exited { process }));
+                    self.tracked = Some((key, DolphinLaunchStage::Exited { process, stop }));
                     true
                 } else {
-                    self.tracked = Some((key, DolphinLaunchStage::Running { process }));
+                    self.tracked = Some((key, DolphinLaunchStage::Running { process, stop }));
                     false
                 }
             }
@@ -3185,6 +3210,9 @@ pub(crate) fn show_launch_readiness_panel(
 ) -> Option<LaunchReadinessPageAction> {
     let mut action = None;
     standalone_launch_state.vice_trainers.reconcile(input);
+    if ui.is_enabled() {
+        standalone_launch_state.show_cemu_lifecycle(ui);
+    }
     widgets::section_header(
         ui,
         "Play / Launch readiness",
@@ -3211,11 +3239,12 @@ pub(crate) fn show_launch_readiness_panel(
             });
         }
         LaunchReadinessInput::IdentityUnknown => {
+            tsugaru::show_unresolved(ui, standalone_launch_state);
             widgets::banner(
                 ui,
                 "Identity unresolved",
-                "This game's identity could not be verified, so no launch options can be \
-                 safely planned yet.",
+                "This game's identity could not be verified by the standard scan. \
+                 Native CD review, when available, checks separate catalogue evidence before offering launch.",
                 widgets::StatusTone::Pending,
             );
         }
@@ -3264,6 +3293,8 @@ pub(crate) fn show_launch_readiness_panel(
             shadps4,
             ..
         } => {
+            fbneo::show(ui, plan);
+            tsugaru::show(ui, plan, standalone_launch_state);
             if plan.platform_id.as_deref() == Some("Saturn")
                 && let Some(context) = retroarch
             {
@@ -4963,6 +4994,19 @@ fn show_standalone_launch_action(
     melonds_cheats::show_chooser(ui, state, &request);
     scummvm_profile::show_chooser(ui, state, &request);
     if same {
+        // Cemu's owned lifecycle is rendered independently of readiness, so
+        // Stop remains usable when this preview expires or becomes blocked.
+        if matches!(
+            state.tracked,
+            Some((
+                _,
+                _,
+                StandaloneLaunchStage::Running(StandaloneProcess::Cemu(_))
+                    | StandaloneLaunchStage::Exited(StandaloneProcess::Cemu(_))
+            ))
+        ) {
+            return;
+        }
         let label = match state.tracked.as_ref().map(|(_, _, stage)| stage) {
             Some(StandaloneLaunchStage::Starting(_)) => "Launching…",
             Some(
@@ -5018,6 +5062,10 @@ fn show_standalone_launch_action(
                 ui.small(format!("DuckStation running · PID {}", process.pid));
                 ui.small("Starting the process does not prove the game ran.");
             }
+            Some((_, _, StandaloneLaunchStage::Running(StandaloneProcess::Tsugaru(p)))) => {
+                ui.small(format!("Tsugaru running · PID {}", p.pid));
+                ui.small("Starting the process does not prove the game ran.");
+            }
             Some((_, _, StandaloneLaunchStage::Running(StandaloneProcess::ScummVm(_)))) => {
                 ui.small("ScummVM process started; EmuWiz cannot tell whether the game itself is running.");
             }
@@ -5045,6 +5093,11 @@ fn show_standalone_launch_action(
             }
             Some((_, _, StandaloneLaunchStage::Exited(process))) => {
                 ui.small("Historical result from the last launch attempt; current readiness is shown above.");
+                if let StandaloneProcess::Tsugaru(p) = process
+                    && let Some(report) = p.poll()
+                {
+                    ui.label(exit_line("Tsugaru", report));
+                }
                 if let StandaloneProcess::DuckStation(process) = process
                     && let Some(report) = process.poll()
                 {
@@ -5114,6 +5167,13 @@ fn show_standalone_launch_action(
                 state.start(request);
                 return;
             }
+        }
+        if adapter == "tsugaru"
+            && !state.is_active()
+            && ui.button("Launch Tsugaru again (recheck)").clicked()
+        {
+            state.start(request);
+            return;
         }
         if adapter == "xroar"
             && !state.is_active()
@@ -5378,6 +5438,7 @@ fn show_dolphin_launch_action(
             success: bool,
             status_detail: String,
             stderr_tail: Option<String>,
+            stop_outcome: Option<archivefs_core::launch::process_spawn::GracefulStopOutcome>,
         },
         Failed {
             message: &'static str,
@@ -5389,8 +5450,8 @@ fn show_dolphin_launch_action(
     let display = match launch_state.tracked.as_mut() {
         Some((key, stage)) if *key == this_key => match stage {
             DolphinLaunchStage::Starting { .. } => Display::Starting,
-            DolphinLaunchStage::Running { process } => Display::Running { pid: process.pid },
-            DolphinLaunchStage::Exited { process } => {
+            DolphinLaunchStage::Running { process, .. } => Display::Running { pid: process.pid },
+            DolphinLaunchStage::Exited { process, stop } => {
                 let report: &DolphinLaunchExitReport = process
                     .poll()
                     .expect("Exited stage always has a cached exit report");
@@ -5405,6 +5466,7 @@ fn show_dolphin_launch_action(
                     success,
                     status_detail,
                     stderr_tail,
+                    stop_outcome: stop.outcome(),
                 }
             }
             DolphinLaunchStage::Failed { error } => {
@@ -5428,13 +5490,21 @@ fn show_dolphin_launch_action(
             widgets::status_badge(ui, "Dolphin running", widgets::StatusTone::Success);
             ui.label(egui::RichText::new(format!("PID {pid}")).small());
             ui.add_enabled(false, egui::Button::new("Launch Dolphin"));
+            if let Some((_, DolphinLaunchStage::Running { process, stop })) =
+                launch_state.tracked.as_mut()
+            {
+                stop.show(ui, process);
+            }
         }
         Display::Exited {
             success,
             status_detail,
             stderr_tail,
+            stop_outcome,
         } => {
-            if success {
+            if let Some(outcome) = stop_outcome {
+                dolphin_stop::show_exit(ui, outcome, &status_detail, stderr_tail.as_deref());
+            } else if success {
                 widgets::banner(
                     ui,
                     "Dolphin exited",

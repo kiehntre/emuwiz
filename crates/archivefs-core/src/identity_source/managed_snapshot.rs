@@ -260,6 +260,20 @@ pub struct HttpsManagedSourceTransport {
 
 impl Default for HttpsManagedSourceTransport {
     fn default() -> Self {
+        Self::with_resolver(SystemResolver)
+    }
+}
+
+impl HttpsManagedSourceTransport {
+    fn with_resolver<R>(resolver: R) -> Self
+    where
+        R: crate::identity_source::net_policy::HostResolver
+            + std::fmt::Debug
+            + Send
+            + Sync
+            + Clone
+            + 'static,
+    {
         let config = crate::http_agent::config(|builder| {
             builder
                 .https_only(true)
@@ -270,7 +284,10 @@ impl Default for HttpsManagedSourceTransport {
                 .timeout_recv_body(Some(IDLE_TIMEOUT))
         });
         Self {
-            agent: config.new_agent(),
+            agent: config.with_parts(
+                ureq::unversioned::transport::DefaultConnector::default(),
+                crate::mod_download_transport::PolicyResolver(resolver),
+            ),
         }
     }
 }
@@ -420,6 +437,10 @@ impl ManagedSourceStore {
         Ok(Self { root, descriptor })
     }
 
+    pub(crate) fn object_path(&self, hash: &str) -> PathBuf {
+        self.objects_dir().join(hash)
+    }
+
     pub fn descriptor(&self) -> &ManagedSourceDescriptor {
         &self.descriptor
     }
@@ -556,8 +577,8 @@ impl ManagedSourceStore {
         if source_metadata.len() > self.descriptor.maximum_size_bytes {
             return Err(config("local source exceeds configured size limit"));
         }
-        let mut input =
-            File::open(path).map_err(|error| ArchiveFsError::io(path.clone(), error))?;
+        let mut input = crate::launch::process_spawn::open_regular_file_nonblocking(path)
+            .map_err(|error| ArchiveFsError::io(path.clone(), error))?;
         self.stage_reader(&mut input, metadata)
     }
 
@@ -668,6 +689,10 @@ impl ManagedSourceStore {
     ) -> Result<ActivationResult> {
         let _lock = self.lock()?;
         self.validate_snapshot_record(&candidate.snapshot)?;
+        let stored = self.load_snapshot(&candidate.snapshot.sha256)?;
+        if stored != candidate.snapshot {
+            return Err(config("candidate metadata changed since validation"));
+        }
         let mut state = self.load_state()?;
         if state.active_sha256.as_deref() != expected_active {
             return Err(config(
@@ -701,9 +726,29 @@ impl ManagedSourceStore {
     }
 
     pub fn rollback_snapshot(&self, hash: &str) -> Result<ActivationResult> {
+        self.rollback_snapshot_inner(hash, None)
+    }
+
+    /// Roll back only the active snapshot the user actually reviewed.
+    pub fn rollback_snapshot_if_current(
+        &self,
+        hash: &str,
+        expected_active: Option<&str>,
+    ) -> Result<ActivationResult> {
+        self.rollback_snapshot_inner(hash, Some(expected_active))
+    }
+
+    fn rollback_snapshot_inner(
+        &self,
+        hash: &str,
+        expected_active: Option<Option<&str>>,
+    ) -> Result<ActivationResult> {
         validate_sha(hash)?;
         let _lock = self.lock()?;
         let mut state = self.load_state()?;
+        if expected_active.is_some_and(|expected| state.active_sha256.as_deref() != expected) {
+            return Err(config("rollback request is stale; active snapshot changed"));
+        }
         let previous = state.active_sha256.clone();
         if !state.history.iter().any(|item| item == hash) {
             return Err(config("rollback target is not in snapshot history"));
@@ -871,6 +916,7 @@ impl ManagedSourceStore {
     fn validate_snapshot_record(&self, snapshot: &ManagedSourceSnapshot) -> Result<()> {
         if snapshot.provider_id != self.descriptor.provider_id
             || snapshot.source != self.descriptor.source
+            || snapshot.trust != self.descriptor.trust
         {
             return Err(config("snapshot does not belong to this managed source"));
         }
@@ -1241,6 +1287,40 @@ mod tests {
             summary: format!("{} bytes", body.len()),
             record_count: Some(1),
             warnings: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn connection_resolver_refuses_rebinding_and_mixed_addresses() {
+        use crate::identity_source::net_policy::{HostResolver, validate_public_https_url};
+        use std::net::IpAddr;
+        use std::sync::{Arc, Mutex};
+        #[derive(Clone, Debug)]
+        struct RebindingResolver(Arc<Mutex<Vec<Vec<IpAddr>>>>);
+        impl HostResolver for RebindingResolver {
+            fn resolve(&self, _: &str, _: u16) -> std::result::Result<Vec<IpAddr>, String> {
+                let mut answers = self.0.lock().unwrap();
+                if answers.is_empty() {
+                    return Err("unexpected extra lookup".into());
+                }
+                Ok(answers.remove(0))
+            }
+        }
+        for second in [vec!["127.0.0.1"], vec!["8.8.8.8", "169.254.169.254"]] {
+            let resolver = RebindingResolver(Arc::new(Mutex::new(vec![
+                vec!["8.8.8.8".parse().unwrap()],
+                second.iter().map(|a| a.parse().unwrap()).collect(),
+            ])));
+            let url = "https://rebind.example.test/feed.dat";
+            validate_public_https_url(url, &resolver).unwrap();
+            // Exercise the actual production agent configuration. No connection
+            // is attempted: its second DNS answer is rejected by the resolver.
+            let transport = HttpsManagedSourceTransport::with_resolver(resolver.clone());
+            assert!(matches!(
+                transport.agent.get(url).call(),
+                Err(ureq::Error::HostNotFound)
+            ));
+            assert!(resolver.0.lock().unwrap().is_empty());
         }
     }
 

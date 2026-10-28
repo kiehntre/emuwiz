@@ -1,6 +1,7 @@
 //! Native EmuWiz GUI v2 presentation layer.
 mod activity;
 mod all_tools;
+mod alternative_provider_preview;
 mod amiga_game;
 mod arcade_input_details;
 mod archive_inspector;
@@ -33,6 +34,8 @@ mod history_discovery_import;
 mod history_duckstation;
 mod history_view;
 mod home_blue;
+mod homebrew_browser;
+mod host_diagnostics;
 mod identity_review;
 mod identity_review_page;
 mod imagery;
@@ -55,13 +58,18 @@ mod mods;
 mod mounts_page;
 mod native_workflows;
 mod needs_attention_page;
+mod netplay_preview;
+mod next_disc_guidance;
 mod nkit;
 mod onboarding;
+mod optical_compare;
 mod organisation;
 mod pages;
+mod patch_package_preview;
 mod platform_aliases_page;
 mod problem_actions;
 mod problems;
+mod profile_settings_preview;
 mod psp_iso_analyser;
 mod quarantine_confirm;
 mod r2_rename;
@@ -81,6 +89,7 @@ mod setup_portability;
 #[path = "tests/shared_scroll.rs"]
 mod shared_scroll_tests;
 mod simple_shell;
+mod source_impact;
 mod sources_providers;
 #[cfg(test)]
 mod stale_inspection_tests;
@@ -104,6 +113,7 @@ mod verify_journey_tests;
 pub(crate) mod vice_evidence;
 mod view_history_page;
 mod visual_pages;
+mod whdload_option_preview;
 mod wiiu_disc;
 
 use crate::optical_conversion_page::OpticalConversionPageState;

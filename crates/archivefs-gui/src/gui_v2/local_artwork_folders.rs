@@ -38,6 +38,9 @@ pub(super) struct Folder {
     pub path: PathBuf,
     pub layout: Layout,
     pub enabled: bool,
+    /// Explicit ES-DE ROM tree, independent of its artwork/gamelist root.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub rom_root: Option<PathBuf>,
 }
 
 #[derive(Clone, Debug, Default, Deserialize, Serialize, PartialEq, Eq)]
@@ -72,14 +75,18 @@ fn save(folders: &[Folder]) -> Result<(), String> {
     fs::rename(temp, path).map_err(|e| format!("Could not save artwork folders: {e}"))
 }
 
+fn real_directory(path: &Path) -> bool {
+    fs::symlink_metadata(path).is_ok_and(|meta| meta.is_dir() && !meta.file_type().is_symlink())
+        && fs::canonicalize(path).is_ok_and(|canonical| canonical == path)
+}
+
 pub(super) fn safe_existing(folder: &Folder) -> bool {
-    let Ok(meta) = fs::symlink_metadata(&folder.path) else {
-        return false;
-    };
-    meta.is_dir()
-        && !meta.file_type().is_symlink()
-        && fs::canonicalize(&folder.path).is_ok_and(|canonical| canonical == folder.path)
+    real_directory(&folder.path)
         && Layout::detect(&folder.path) == Some(folder.layout)
+        && folder
+            .rom_root
+            .as_deref()
+            .is_none_or(|root| folder.layout == Layout::EsDe && real_directory(root))
 }
 
 /// Settings for read-only local artwork providers.
@@ -102,6 +109,7 @@ pub(super) fn show(ui: &mut egui::Ui, folders: &mut Vec<Folder>) -> bool {
                         path: canonical,
                         layout,
                         enabled: true,
+                        rom_root: None,
                     });
                     changed = true;
                 }
@@ -125,6 +133,19 @@ pub(super) fn show(ui: &mut egui::Ui, folders: &mut Vec<Folder>) -> bool {
                 if ui.small_button("Remove from EmuWiz").clicked() { remove = Some(index); }
             });
             ui.label(folder.path.display().to_string());
+            if folder.layout == Layout::EsDe {
+                ui.label(folder.rom_root.as_ref().map(|root| format!("Separate ROM root: {}", root.display())).unwrap_or_else(|| "ROM root: detected ES-DE configuration / EmuWiz master root".into()));
+                ui.label("ROM paths are resolved by exact platform and full path. Choosing a separate root saves only this EmuWiz artwork setting; no ROMs or provider files are changed.");
+                if ui.small_button("Choose separate ROM root…").clicked()
+                    && let Some(picked) = rfd::FileDialog::new().set_title("Select the ES-DE ROM tree (containing system folders)").pick_folder()
+                    && let Ok(root) = fs::canonicalize(picked)
+                    && real_directory(&root)
+                    && folder.rom_root.as_ref() != Some(&root)
+                { folder.rom_root = Some(root); changed = true; }
+                if folder.rom_root.is_some() && ui.small_button("Use detected/default ROM root").clicked() {
+                    folder.rom_root = None; changed = true;
+                }
+            }
             if safe_existing(folder) {
                 ui.label(match folder.layout { Layout::EsDe => "Detected: gamelists/<system>/gamelist.xml and downloaded_media. The current Blue resolver displays verified covers and screenshots.", Layout::LaunchBox => "Detected: Data/Platforms XML and Images/<platform>/<title>. Core indexes covers, screenshots, logos, fanart, banners, video and manuals; Blue currently displays resolved covers and screenshots." });
             } else { ui.colored_label(egui::Color32::YELLOW, "Folder is missing, disconnected, inaccessible or its layout changed. It is not indexed."); }
@@ -164,11 +185,13 @@ mod tests {
             path: dir.path().join("disconnected"),
             layout: Layout::EsDe,
             enabled: true,
+            rom_root: None,
         }));
         assert!(!safe_existing(&Folder {
             path: launchbox.clone(),
             layout: Layout::EsDe,
             enabled: true,
+            rom_root: None,
         }));
         let link = dir.path().join("link");
         #[cfg(unix)]
@@ -177,7 +200,23 @@ mod tests {
         assert!(!safe_existing(&Folder {
             path: link,
             layout: Layout::EsDe,
-            enabled: true
+            enabled: true,
+            rom_root: None,
         }));
+    }
+    #[test]
+    fn old_settings_load_without_override_and_new_settings_round_trip() {
+        let old = r#"{"folders":[{"path":"/example/ES-DE","layout":"es_de","enabled":true}]}"#;
+        let mut settings: Settings = serde_json::from_str(old).unwrap();
+        assert_eq!(settings.folders[0].rom_root, None);
+        settings.folders[0].rom_root = Some(PathBuf::from("/separate ROMs"));
+        let stored = serde_json::to_string(&settings).unwrap();
+        assert_eq!(serde_json::from_str::<Settings>(&stored).unwrap(), settings);
+        settings.folders[0].rom_root = None;
+        assert!(
+            !serde_json::to_string(&settings)
+                .unwrap()
+                .contains("rom_root")
+        );
     }
 }

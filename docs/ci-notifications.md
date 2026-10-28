@@ -33,6 +33,14 @@ CodeQL languages change. At installation, `main` has no branch protection or
 rulesets; this feature does not change repository settings. Future GitHub
 merge restrictions must still report `CLEAN` before READY.
 
+On core/gui PRs, GitHub may evaluate the reproducibility job condition before
+expanding its matrix. One skipped `Reproducibility build ${{ matrix.run }}` job
+then represents both conditional builds. The notifier accepts that exact CI
+representation only after successful classification, with no expanded build
+jobs present, and matches its check by ID. Full-tier PRs still require both
+numbered successful builds; missing jobs, unknown names and unrelated skipped
+checks remain failures.
+
 ## One result per PR head
 
 Workflow concurrency serializes events per SHA; an authenticated bot comment

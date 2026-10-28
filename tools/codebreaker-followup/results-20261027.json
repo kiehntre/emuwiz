@@ -1,0 +1,282 @@
+[
+  {
+    "case": "m0-p0",
+    "version": "baseline",
+    "streams": 4000,
+    "lines": 132023,
+    "mismatches": 0,
+    "encrypt_mismatches": 0,
+    "c_roundtrip_mismatches": 0,
+    "c_compat_mismatches": 0
+  },
+  {
+    "case": "m0-p0",
+    "version": "fixed",
+    "streams": 4000,
+    "lines": 132023,
+    "mismatches": 0,
+    "encrypt_mismatches": 0,
+    "c_roundtrip_mismatches": 0,
+    "c_compat_mismatches": 0
+  },
+  {
+    "case": "m1-p0",
+    "version": "baseline",
+    "streams": 4000,
+    "lines": 132023,
+    "mismatches": 0,
+    "encrypt_mismatches": 0,
+    "c_roundtrip_mismatches": 0,
+    "c_compat_mismatches": 0
+  },
+  {
+    "case": "m1-p0",
+    "version": "fixed",
+    "streams": 4000,
+    "lines": 132023,
+    "mismatches": 0,
+    "encrypt_mismatches": 0,
+    "c_roundtrip_mismatches": 0,
+    "c_compat_mismatches": 0
+  },
+  {
+    "case": "m0-p1",
+    "version": "baseline",
+    "streams": 4000,
+    "lines": 133491,
+    "mismatches": 0,
+    "encrypt_mismatches": 0,
+    "c_roundtrip_mismatches": 0,
+    "c_compat_mismatches": 0
+  },
+  {
+    "case": "m0-p1",
+    "version": "fixed",
+    "streams": 4000,
+    "lines": 133491,
+    "mismatches": 0,
+    "encrypt_mismatches": 0,
+    "c_roundtrip_mismatches": 0,
+    "c_compat_mismatches": 0
+  },
+  {
+    "case": "m0-p1-zero",
+    "version": "baseline",
+    "streams": 4000,
+    "lines": 134552,
+    "mismatches": 0,
+    "encrypt_mismatches": 0,
+    "c_roundtrip_mismatches": 0,
+    "c_compat_mismatches": 0
+  },
+  {
+    "case": "m0-p1-zero",
+    "version": "fixed",
+    "streams": 4000,
+    "lines": 134552,
+    "mismatches": 0,
+    "encrypt_mismatches": 0,
+    "c_roundtrip_mismatches": 0,
+    "c_compat_mismatches": 0
+  },
+  {
+    "case": "m0-p2",
+    "version": "baseline",
+    "streams": 4000,
+    "lines": 135015,
+    "mismatches": 89296,
+    "encrypt_mismatches": 89296,
+    "c_roundtrip_mismatches": 26736,
+    "c_compat_mismatches": 89296
+  },
+  {
+    "case": "m0-p2",
+    "version": "fixed",
+    "streams": 4000,
+    "lines": 135015,
+    "mismatches": 26736,
+    "encrypt_mismatches": 0,
+    "c_roundtrip_mismatches": 26736,
+    "c_compat_mismatches": 0
+  },
+  {
+    "case": "m1-p2",
+    "version": "baseline",
+    "streams": 4000,
+    "lines": 135015,
+    "mismatches": 110257,
+    "encrypt_mismatches": 110257,
+    "c_roundtrip_mismatches": 26736,
+    "c_compat_mismatches": 110257
+  },
+  {
+    "case": "m1-p2",
+    "version": "fixed",
+    "streams": 4000,
+    "lines": 135015,
+    "mismatches": 26736,
+    "encrypt_mismatches": 0,
+    "c_roundtrip_mismatches": 26736,
+    "c_compat_mismatches": 0
+  },
+  {
+    "case": "m0-p3",
+    "version": "baseline",
+    "streams": 4000,
+    "lines": 132023,
+    "mismatches": 124023,
+    "encrypt_mismatches": 124023,
+    "c_roundtrip_mismatches": 0,
+    "c_compat_mismatches": 124023
+  },
+  {
+    "case": "m0-p3",
+    "version": "fixed",
+    "streams": 4000,
+    "lines": 132023,
+    "mismatches": 0,
+    "encrypt_mismatches": 0,
+    "c_roundtrip_mismatches": 0,
+    "c_compat_mismatches": 0
+  },
+  {
+    "case": "m1-p3",
+    "version": "baseline",
+    "streams": 4000,
+    "lines": 132023,
+    "mismatches": 128023,
+    "encrypt_mismatches": 128023,
+    "c_roundtrip_mismatches": 0,
+    "c_compat_mismatches": 128023
+  },
+  {
+    "case": "m1-p3",
+    "version": "fixed",
+    "streams": 4000,
+    "lines": 132023,
+    "mismatches": 0,
+    "encrypt_mismatches": 0,
+    "c_roundtrip_mismatches": 0,
+    "c_compat_mismatches": 0
+  },
+  {
+    "case": "m0-p4",
+    "version": "baseline",
+    "streams": 4000,
+    "lines": 132023,
+    "mismatches": 124023,
+    "encrypt_mismatches": 124023,
+    "c_roundtrip_mismatches": 120023,
+    "c_compat_mismatches": 124023
+  },
+  {
+    "case": "m0-p4",
+    "version": "fixed",
+    "streams": 4000,
+    "lines": 132023,
+    "mismatches": 120023,
+    "encrypt_mismatches": 0,
+    "c_roundtrip_mismatches": 120023,
+    "c_compat_mismatches": 0
+  },
+  {
+    "case": "m1-p4",
+    "version": "baseline",
+    "streams": 4000,
+    "lines": 132023,
+    "mismatches": 128023,
+    "encrypt_mismatches": 128023,
+    "c_roundtrip_mismatches": 120023,
+    "c_compat_mismatches": 128023
+  },
+  {
+    "case": "m1-p4",
+    "version": "fixed",
+    "streams": 4000,
+    "lines": 132023,
+    "mismatches": 120023,
+    "encrypt_mismatches": 0,
+    "c_roundtrip_mismatches": 120023,
+    "c_compat_mismatches": 0
+  },
+  {
+    "case": "m0-p5",
+    "version": "baseline",
+    "streams": 4000,
+    "lines": 136294,
+    "mismatches": 128294,
+    "encrypt_mismatches": 128294,
+    "c_roundtrip_mismatches": 0,
+    "c_compat_mismatches": 128294
+  },
+  {
+    "case": "m0-p5",
+    "version": "fixed",
+    "streams": 4000,
+    "lines": 136294,
+    "mismatches": 0,
+    "encrypt_mismatches": 0,
+    "c_roundtrip_mismatches": 0,
+    "c_compat_mismatches": 0
+  },
+  {
+    "case": "m1-p5",
+    "version": "baseline",
+    "streams": 4000,
+    "lines": 136294,
+    "mismatches": 132294,
+    "encrypt_mismatches": 132294,
+    "c_roundtrip_mismatches": 0,
+    "c_compat_mismatches": 132294
+  },
+  {
+    "case": "m1-p5",
+    "version": "fixed",
+    "streams": 4000,
+    "lines": 136294,
+    "mismatches": 0,
+    "encrypt_mismatches": 0,
+    "c_roundtrip_mismatches": 0,
+    "c_compat_mismatches": 0
+  },
+  {
+    "case": "m1-p1",
+    "version": "baseline",
+    "streams": 4000,
+    "lines": 133491,
+    "mismatches": 129491,
+    "encrypt_mismatches": 129491,
+    "c_roundtrip_mismatches": 0,
+    "c_compat_mismatches": 129491
+  },
+  {
+    "case": "m1-p1",
+    "version": "fixed",
+    "streams": 4000,
+    "lines": 133491,
+    "mismatches": 0,
+    "encrypt_mismatches": 0,
+    "c_roundtrip_mismatches": 0,
+    "c_compat_mismatches": 0
+  },
+  {
+    "case": "m1-p1-zero",
+    "version": "baseline",
+    "streams": 4000,
+    "lines": 134552,
+    "mismatches": 130552,
+    "encrypt_mismatches": 130552,
+    "c_roundtrip_mismatches": 0,
+    "c_compat_mismatches": 130552
+  },
+  {
+    "case": "m1-p1-zero",
+    "version": "fixed",
+    "streams": 4000,
+    "lines": 134552,
+    "mismatches": 0,
+    "encrypt_mismatches": 0,
+    "c_roundtrip_mismatches": 0,
+    "c_compat_mismatches": 0
+  }
+]

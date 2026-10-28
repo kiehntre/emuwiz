@@ -82,6 +82,7 @@ pub(super) struct SetView {
     pub conflicts: Vec<String>,
     pub why: Vec<String>,
     pub swap: Vec<String>,
+    pub disc_order: Vec<archivefs_core::media_set::MediaSwapStep>,
     /// Catalogue id of the lowest-ordinal member, for "Open game details".
     pub game_id: Option<i64>,
     pub search: String,
@@ -283,7 +284,9 @@ pub(super) fn view_of(set: &MediaSet, ids: &HashMap<PathBuf, i64>) -> SetView {
         .min_by_key(|m| m.ordinal.as_ref().map(|o| o.number).unwrap_or(u16::MAX))
         .and_then(|m| m.representations.first())
         .and_then(|r| ids.get(&r.record.source.path).copied());
-    let swap = swap_lines(set);
+    let swap_plan = media_swap_plan(set, None);
+    let swap = swap_lines(&swap_plan);
+    let disc_order = super::next_disc_guidance::order(set, &swap_plan);
     let title = title_of(set);
     let platform = set
         .platform
@@ -317,13 +320,13 @@ pub(super) fn view_of(set: &MediaSet, ids: &HashMap<PathBuf, i64>) -> SetView {
         conflicts,
         why,
         swap,
+        disc_order,
         game_id,
         search,
     }
 }
 
-fn swap_lines(set: &MediaSet) -> Vec<String> {
-    let plan = media_swap_plan(set, None);
+fn swap_lines(plan: &archivefs_core::media_set::MediaSwapPlan) -> Vec<String> {
     let family = plan.semantics.map(|s| match s {
         SwapSemantics::OpticalSequence => MediaFamily::Optical,
         SwapSemantics::FloppySwap => MediaFamily::Floppy,
