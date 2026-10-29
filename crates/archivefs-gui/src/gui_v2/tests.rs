@@ -117,6 +117,7 @@ pub(super) fn fixture(context: &egui::Context) -> App {
         organisation: super::organisation::OrganisationState::default(),
         arcade_input_details: super::arcade_input_details::State::default(),
         classic_trainers: super::classic_trainers::State::default(),
+        recording_integrity: Default::default(),
         canonical_organisation: crate::rom_organisation_page::RomOrganisationPageState::default(),
         canonical_organisation_job: None,
         history_view: Default::default(),
