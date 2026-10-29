@@ -1829,6 +1829,23 @@ impl ArchiveFsApp {
                     firmware: archivefs_core::launch::FirmwareReadiness::NotRequired,
                 }),
         );
+        let stella_roots =
+            archivefs_core::patch_manager::StellaProfileDiscoveryRoots::from_environment();
+        standalone_profiles.extend(
+            archivefs_core::patch_manager::discover_stella_profiles(&stella_roots)
+                .profiles
+                .iter()
+                .map(|profile| archivefs_core::launch::StandaloneProfileInput {
+                    adapter_id: "stella",
+                    profile_id: profile.profile_id.clone(),
+                    profile_path: None,
+                    eligible: archivefs_core::patch_manager::resolve_stella_native_launch_binding(
+                        profile,
+                    )
+                    .is_ok(),
+                    firmware: archivefs_core::launch::FirmwareReadiness::NotRequired,
+                }),
+        );
         if let Some(home) = std::env::var_os("HOME") {
             let roots = archivefs_core::patch_manager::AzaharDiscoveryRoots {
                 explicit_executable: None,
