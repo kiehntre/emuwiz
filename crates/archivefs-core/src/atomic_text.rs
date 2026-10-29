@@ -187,7 +187,12 @@ fn write_mode(
     if expected_parent.is_none() {
         fs::create_dir_all(parent).map_err(|error| ArchiveFsError::io(parent, error))?;
     }
-    let directory = ParentDir::open(parent).map_err(|error| ArchiveFsError::io(parent, error))?;
+    let directory = if expected_parent.is_some() {
+        ParentDir::open_no_symlinks(parent)
+    } else {
+        ParentDir::open(parent)
+    }
+    .map_err(|error| ArchiveFsError::io(parent, error))?;
     directory
         .require_binding()
         .map_err(|error| ArchiveFsError::io(parent, error))?;

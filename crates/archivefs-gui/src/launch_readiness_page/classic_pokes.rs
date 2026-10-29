@@ -10,6 +10,7 @@ use archivefs_core::launch::{RetroArchLaunchRequest, preflight_retroarch_launch}
 use eframe::egui;
 use sha2::{Digest, Sha256};
 use std::collections::BTreeSet;
+use std::os::unix::ffi::OsStrExt;
 use std::path::{Path, PathBuf};
 use std::sync::mpsc::{self, Receiver};
 
@@ -31,7 +32,7 @@ pub(super) struct Chooser {
 fn profile_path(game: &Path) -> Result<PathBuf, String> {
     let database = archivefs_core::default_database_path().map_err(|e| e.to_string())?;
     let root = database.parent().ok_or("No application data folder.")?;
-    let digest = Sha256::digest(game.to_string_lossy().as_bytes());
+    let digest = Sha256::digest(game.as_os_str().as_bytes());
     let hex: String = digest.iter().map(|b| format!("{b:02x}")).collect();
     Ok(root
         .join("cheat-profiles")
@@ -197,6 +198,18 @@ mod tests {
     use archivefs_core::emulator_environment::retroarch::{ProfileRef, ProfileScope};
     use archivefs_core::safe_read::TrustedRoots;
     use sha2::{Digest, Sha256};
+
+    #[test]
+    fn distinct_non_utf8_game_paths_have_distinct_profile_paths() {
+        use std::os::unix::ffi::OsStringExt;
+
+        let first = PathBuf::from(std::ffi::OsString::from_vec(b"game-\xff.z80".to_vec()));
+        let second = PathBuf::from(std::ffi::OsString::from_vec(b"game-\xfe.z80".to_vec()));
+        assert_ne!(
+            profile_path(&first).unwrap(),
+            profile_path(&second).unwrap()
+        );
+    }
 
     fn fixture() -> (tempfile::TempDir, RetroArchLaunchRequest, PokeLaunchPreview) {
         let dir = tempfile::tempdir().unwrap();

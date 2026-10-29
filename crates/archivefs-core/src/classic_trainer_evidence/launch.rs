@@ -128,11 +128,16 @@ pub fn save_profile(
 }
 
 pub fn load_profile(path: &Path, preview: &PokeLaunchPreview) -> Result<Vec<usize>, String> {
-    let metadata = std::fs::symlink_metadata(path).map_err(|e| e.to_string())?;
-    if !metadata.is_file() || metadata.len() > 4096 {
+    use std::io::Read;
+    let file = open_profile_without_links(path).map_err(|e| e.to_string())?;
+    let metadata = file.metadata().map_err(|e| e.to_string())?;
+    if metadata.len() > 4096 {
         return Err("Saved POKE profile is not a bounded regular file.".into());
     }
-    let bytes = std::fs::read(path).map_err(|e| e.to_string())?;
+    let mut bytes = Vec::new();
+    file.take(4097)
+        .read_to_end(&mut bytes)
+        .map_err(|e| e.to_string())?;
     if bytes.len() > 4096 {
         return Err("Saved POKE profile is too large.".into());
     }
@@ -149,6 +154,57 @@ pub fn load_profile(path: &Path, preview: &PokeLaunchPreview) -> Result<Vec<usiz
     }
     compose(preview, &saved.selected)?;
     Ok(saved.selected)
+}
+
+/// Open the complete profile path atomically, refusing links in every component.
+fn open_profile_without_links(path: &Path) -> std::io::Result<std::fs::File> {
+    #[cfg(target_os = "linux")]
+    {
+        use std::os::fd::FromRawFd;
+        use std::os::unix::ffi::OsStrExt;
+        #[repr(C)]
+        struct OpenHow {
+            flags: u64,
+            mode: u64,
+            resolve: u64,
+        }
+        let name = std::ffi::CString::new(path.as_os_str().as_bytes())?;
+        let how = OpenHow {
+            flags: (libc::O_RDONLY | libc::O_NONBLOCK | libc::O_CLOEXEC) as u64,
+            mode: 0,
+            resolve: 0x04, // RESOLVE_NO_SYMLINKS.
+        };
+        // SAFETY: the pathname and repr(C) argument remain live for this syscall.
+        // Unsupported kernels fail closed, including for a swapped FIFO.
+        let fd = unsafe {
+            libc::syscall(
+                libc::SYS_openat2,
+                libc::AT_FDCWD,
+                name.as_ptr(),
+                &how,
+                std::mem::size_of::<OpenHow>(),
+            )
+        };
+        if fd < 0 {
+            return Err(std::io::Error::last_os_error());
+        }
+        let file = unsafe { std::fs::File::from_raw_fd(fd as i32) };
+        if !file.metadata()?.is_file() {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "profile is not a regular file",
+            ));
+        }
+        Ok(file)
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        let _ = path;
+        Err(std::io::Error::new(
+            std::io::ErrorKind::Unsupported,
+            "profile loading requires no-symlink path opening",
+        ))
+    }
 }
 
 /// Reuses the pin parser and retained, bounded source reads from pin creation.
@@ -477,6 +533,31 @@ mod tests {
         std::os::unix::fs::symlink(&actual, &linked).unwrap();
         assert!(save_profile(&linked.join("choice.json"), &selected_preview, &[0]).is_err());
         assert!(!actual.join("choice.json").exists());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn saved_choice_load_refuses_linked_profile_file() {
+        let (dir, game, game_path, roots) = fixture();
+        let selected_preview = preview(&game, &game_path, &roots).unwrap();
+        let actual = dir.path().join("actual.json");
+        save_profile(&actual, &selected_preview, &[0]).unwrap();
+        let linked = dir.path().join("linked.json");
+        std::os::unix::fs::symlink(&actual, &linked).unwrap();
+        assert!(load_profile(&linked, &selected_preview).is_err());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn saved_choice_load_refuses_linked_profile_parent() {
+        let (dir, game, game_path, roots) = fixture();
+        let selected_preview = preview(&game, &game_path, &roots).unwrap();
+        let actual = dir.path().join("actual");
+        std::fs::create_dir(&actual).unwrap();
+        save_profile(&actual.join("choice.json"), &selected_preview, &[0]).unwrap();
+        let linked = dir.path().join("linked");
+        std::os::unix::fs::symlink(&actual, &linked).unwrap();
+        assert!(load_profile(&linked.join("choice.json"), &selected_preview).is_err());
     }
 
     #[test]
