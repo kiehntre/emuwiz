@@ -2,10 +2,12 @@
 use super::*;
 use archivefs_core::launch::process_spawn::{CapturedFileIdentity, WatchedProcess};
 use archivefs_core::launch::{RmgLaunchRequest, preflight_rmg_launch, spawn_rmg};
+use archivefs_core::n64_byte_order::{detect_n64_byte_order, normalize_to_z64};
 use archivefs_core::patch_manager::{
     RmgProfileDiscoveryRoots, discover_rmg_profiles, resolve_rmg_native_launch_binding,
 };
-use archivefs_core::platform_evidence_fusion::FusionOutcome;
+use sha2::{Digest, Sha256};
+use std::io::Read;
 
 #[derive(Clone)]
 pub(crate) struct Request {
@@ -124,31 +126,42 @@ fn fresh_identity(
     expected_key: &str,
     authorized_file: &CapturedFileIdentity,
 ) -> Result<CanonicalIdentityStatus, String> {
-    let report = crate::selected_evidence_page::gather_selected_evidence_fast(path, Some("N64"))
-        .map_err(|error| format!("N64 identity could not be rechecked: {error}"))?;
-    let content = &report.identity_result.content;
-    if matches!(
-        content.outcome,
-        FusionOutcome::Conflict | FusionOutcome::Ambiguous
-    ) || content
-        .resolved_platform
-        .is_some_and(|platform| platform != "N64")
-    {
-        return Err(
-            "Content platform evidence conflicts with N64. Rescan before launching.".into(),
-        );
-    }
-    if capture(path)? != *authorized_file {
+    // A path-based evidence read may block if this ROM is replaced by a FIFO.
+    // Read and hash one validated, nonblocking regular-file handle instead.
+    let file = archivefs_core::launch::process_spawn::open_regular_file_nonblocking(path)
+        .map_err(|error| format!("N64 cartridge could not be opened safely: {error}"))?;
+    let opened =
+        CapturedFileIdentity::capture(&file.metadata().map_err(|error| error.to_string())?);
+    if opened != *authorized_file || capture(path)? != opened {
         return Err("N64 cartridge changed since launch was selected.".into());
     }
-    let status =
-        archivefs_core::launch::canonical_identity_from_game_report(&report.game_identity_report).0;
-    if !matches!(&status, CanonicalIdentityStatus::Resolved(identity)
-        if identity.platform_id == "N64" && identity.game_key == expected_key)
-    {
+    let mut bytes = Vec::new();
+    file.take(archivefs_core::game_identity::MAX_LOOSE_ROM_BYTES + 1)
+        .read_to_end(&mut bytes)
+        .map_err(|error| format!("N64 cartridge could not be read: {error}"))?;
+    if bytes.len() as u64 > archivefs_core::game_identity::MAX_LOOSE_ROM_BYTES {
+        return Err("N64 cartridge exceeds the supported identity size.".into());
+    }
+    if capture(path)? != opened {
+        return Err("N64 cartridge changed during identity inspection.".into());
+    }
+    let order =
+        detect_n64_byte_order(&bytes).ok_or("N64 cartridge byte order could not be verified.")?;
+    let normalized = normalize_to_z64(&bytes, order)
+        .map_err(|error| format!("N64 cartridge byte order is malformed: {}", error.detail()))?;
+    let actual_key = Sha256::digest(&normalized.bytes)
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect::<String>();
+    if actual_key != expected_key {
         return Err("Fresh N64 cartridge identity no longer matches the selected game.".into());
     }
-    Ok(status)
+    Ok(CanonicalIdentityStatus::Resolved(
+        archivefs_core::launch::ResolvedIdentity {
+            platform_id: "N64".into(),
+            game_key: actual_key,
+        },
+    ))
 }
 
 pub(super) fn offer_for(
@@ -316,6 +329,22 @@ mod tests {
         let (_dir, _roots, plan, mut candidate) = fixture(0);
         candidate.content.container = Some(LaunchContainerKind::Archive);
         assert!(Request::offer(&plan, &candidate).is_err());
+    }
+
+    #[test]
+    fn fifo_replacing_selected_cartridge_is_refused_without_blocking() {
+        let (_dir, roots, plan, candidate) = fixture(0);
+        let request = Request::offer(&plan, &candidate).unwrap();
+        let path = candidate.content.resolved_path.as_ref().unwrap();
+        std::fs::remove_file(path).unwrap();
+        assert!(
+            std::process::Command::new("mkfifo")
+                .arg(path)
+                .status()
+                .unwrap()
+                .success()
+        );
+        assert!(request.execute_with_roots(roots).is_err());
     }
 
     #[test]
