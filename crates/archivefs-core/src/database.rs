@@ -12725,6 +12725,62 @@ mod tests {
         let _ = fs::remove_dir_all(&root);
     }
 
+    #[cfg(unix)]
+    #[test]
+    fn unreadable_header_keeps_saved_platform_until_completed_retry() {
+        use std::os::unix::fs::PermissionsExt;
+        if unsafe { libc::geteuid() } == 0 {
+            return; // root can still read a mode-000 file
+        }
+        let root = temp_dir("unreadable-header-platform-evidence");
+        let source = root.join("source");
+        fs::create_dir_all(source.join("gcn")).unwrap();
+        let path = source.join("gcn").join("disc.iso");
+        let mut bytes = vec![0_u8; 64];
+        bytes[0x18..0x1c].copy_from_slice(&[0x5d, 0x1c, 0x9e, 0xa3]);
+        fs::write(&path, &bytes).unwrap();
+        let config = config_for(&source, &root.join("mount"));
+        let mut database = Database::open_or_create(root.join("library.sqlite3")).unwrap();
+        scan_and_persist(&mut database, &config, "initial").unwrap();
+        let id = database.load_archives().unwrap()[0].id;
+        assert_eq!(
+            current_assignment(&database, id),
+            Some(("Wii".into(), "header_identity".into()))
+        );
+
+        bytes.push(0); // force a fresh inspection instead of fingerprint reuse
+        rewrite_in_place(&path, &bytes);
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o000)).unwrap();
+        let incomplete = scan_and_persist(&mut database, &config, "unreadable").unwrap();
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o644)).unwrap();
+        assert_eq!(
+            current_assignment(&database, id),
+            Some(("Wii".into(), "header_identity".into()))
+        );
+        assert_eq!(assignment_rows(&database, id), 1);
+        assert!(
+            incomplete
+                .platform_assignment_warnings
+                .iter()
+                .any(|(warned, text)| warned == &path && text.contains("inspection incomplete"))
+        );
+        assert_eq!(
+            database.load_archives().unwrap()[0].last_known_health,
+            crate::ArchiveHealth::RetryAvailable.to_string()
+        );
+
+        rewrite_in_place(
+            &path,
+            &crate::synthetic_media::iso9660_image(b"UNKNOWN", "NOCNF", &[("README.TXT;1", b"hi")]),
+        );
+        scan_and_persist(&mut database, &config, "completed-retry").unwrap();
+        assert_eq!(
+            current_assignment(&database, id),
+            Some(("GameCube".into(), "folder_alias".into()))
+        );
+        let _ = fs::remove_dir_all(&root);
+    }
+
     #[test]
     fn incompatible_direct_format_stays_visible_and_unassigned() {
         let root = temp_dir("source-assignment-incompatible");

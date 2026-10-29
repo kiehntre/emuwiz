@@ -4475,11 +4475,13 @@ impl Archive {
             kind,
             identity: {
                 let mut identity = ArchiveIdentity::from_path(path, source_root, metadata.as_ref());
-                if kind == ArchiveKind::DirectGameImage
-                    && let Some(platform) = detect_direct_image_header_platform(path)
-                {
-                    identity.platform = Some(platform.to_string());
-                    identity.platform_provenance = Some(PlatformProvenance::HeaderIdentity);
+                if kind == ArchiveKind::DirectGameImage && metadata.is_some() {
+                    let (header, problems) = detect_direct_image_header_platform(path);
+                    identity.inspection_problems.extend(problems);
+                    if let Some(platform) = header {
+                        identity.platform = Some(platform.to_string());
+                        identity.platform_provenance = Some(PlatformProvenance::HeaderIdentity);
+                    }
                 }
                 // Folder and registry evidence outrank the header; the header
                 // only fills in a platform nothing else could name.
@@ -4504,6 +4506,7 @@ impl Archive {
                     identity.platform_provenance = Some(PlatformProvenance::HeaderIdentity);
                 }
                 if kind == ArchiveKind::DirectGameImage
+                    && metadata.is_some()
                     && matches!(
                         path.extension()
                             .and_then(|e| e.to_str())
@@ -4512,10 +4515,17 @@ impl Archive {
                             .as_str(),
                         "hdf" | "hdfx"
                     )
-                    && amiga_disk::inspect_amiga_image(path).is_ok()
                 {
-                    identity.platform = Some("Amiga".into());
-                    identity.platform_provenance = Some(PlatformProvenance::HeaderIdentity);
+                    match amiga_disk::inspect_amiga_image(path) {
+                        Ok(_) => {
+                            identity.platform = Some("Amiga".into());
+                            identity.platform_provenance = Some(PlatformProvenance::HeaderIdentity);
+                        }
+                        Err(amiga_disk::DiskError::Io(problem)) => {
+                            identity.inspection_problems.push(problem);
+                        }
+                        Err(_) => {}
+                    }
                 }
                 if path
                     .extension()
@@ -4654,25 +4664,30 @@ pub fn is_supported_archive(path: impl AsRef<Path>) -> bool {
 /// The GameCube and Wii magic words are no longer written out here: they are
 /// two [`platform::MagicRule`] entries in the registry, so the disc check and
 /// everything else that reasons about signatures read the same table. The
-/// behaviour is unchanged - one bounded read, `.iso`/`.gcm` only, and `None`
-/// rather than a guess when neither word matches.
-fn detect_direct_image_header_platform(path: &Path) -> Option<&'static str> {
-    let extension = path.extension()?.to_str()?.to_ascii_lowercase();
+/// recognition is unchanged: one bounded read for `.iso`/`.gcm`, with no
+/// platform guess when neither word matches. Read failures are returned so a
+/// completed rescan cannot mistake unavailable bytes for a withdrawn header.
+fn detect_direct_image_header_platform(path: &Path) -> (Option<&'static str>, Vec<String>) {
+    let Some(extension) = path.extension().and_then(|ext| ext.to_str()) else {
+        return (None, Vec::new());
+    };
+    let extension = extension.to_ascii_lowercase();
     if !matches!(extension.as_str(), "iso" | "gcm") {
-        return None;
+        return (None, Vec::new());
     }
     // Header recognition needs signatures only, never sibling/directory inspection.
     let mut request = platform::DetectionRequest::new(path, Path::new(""));
     request.read_signatures = true;
     let report = platform::detect_platform_report(&request);
-    report
+    let platform = report
         .evidence
         .iter()
         .find(|item| {
             item.source == platform::DetectionSource::Signature
                 && matches!(item.platform, "GameCube" | "Wii")
         })
-        .map(|item| item.platform)
+        .map(|item| item.platform);
+    (platform, report.inspection_problems)
 }
 
 /// Platform for a loose `.gb`/`.gbc` ROM from its own cartridge header: a
