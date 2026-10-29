@@ -532,13 +532,12 @@ fn spawn_mgba_with_before_spawn(
             request.expected_config_path.as_ref(),
             request.config_identity,
             request.config_sha256,
-        ) {
-            if capture_mgba_config(path).ok() != Some((expected_identity, expected_sha256)) {
-                return Err(io::Error::new(
-                    io::ErrorKind::InvalidData,
-                    "mGBA configuration changed immediately before spawn",
-                ));
-            }
+        ) && capture_mgba_config(path).ok() != Some((expected_identity, expected_sha256))
+        {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "mGBA configuration changed immediately before spawn",
+            ));
         }
         let mut files = vec![&executable, &content];
         if let Some(config) = &config {

@@ -180,10 +180,7 @@ fn fresh_identity(path: &Path, platform: &str) -> Result<CanonicalIdentityStatus
     if matches!(
         content.outcome,
         FusionOutcome::Conflict | FusionOutcome::Ambiguous
-    ) || content
-        .resolved_platform
-        .as_deref()
-        .is_some_and(|p| p != platform)
+    ) || content.resolved_platform.is_some_and(|p| p != platform)
     {
         return Err("Content platform evidence conflicts with the selected game. Rescan it before launching.".into());
     }
