@@ -56,6 +56,57 @@ fn games() -> Vec<PersistedArchive> {
 }
 
 #[test]
+fn blue_batch_cancel_remains_clickable_at_1024_by_600() {
+    let context = egui::Context::default();
+    let mut app = blue_app(&context, games());
+    app.router.current = Route::BrowsePlay;
+    let selected = app.library.game(1).unwrap();
+    app.batch_state
+        .prepare_blue(vec![(selected.archive.clone(), None)])
+        .unwrap();
+    app.batch_open = true;
+    let strings = shown(&context, &mut app, COMPACT);
+    assert!(has(&strings, "Batch metadata enrichment"));
+    assert!(has(&strings, "Start selected enrichment"));
+    let output = frame(&context, &mut app, COMPACT);
+    let cancel = text_bounds(&output, "Cancel batch");
+    assert_eq!(cancel.len(), 1);
+    assert!(
+        egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(COMPACT[0], COMPACT[1]))
+            .contains_rect(cancel[0])
+    );
+    click(&context, &mut app, COMPACT, cancel[0].center());
+    assert!(
+        !app.batch_state.active(),
+        "Cancel batch at {:?} did not close the prepared session",
+        cancel[0]
+    );
+}
+
+#[test]
+fn blue_batch_can_resume_after_window_closes_and_selection_clears() {
+    let context = egui::Context::default();
+    let mut app = blue_app(&context, games());
+    app.router.current = Route::BrowsePlay;
+    let selected = app.library.game(1).unwrap();
+    app.batch_state
+        .prepare_blue(vec![(selected.archive.clone(), None)])
+        .unwrap();
+    app.batch_open = false;
+    app.batch_selection.clear();
+    let output = frame(&context, &mut app, COMPACT);
+    let resume = text_bounds(&output, "Resume batch");
+    assert_eq!(resume.len(), 1);
+    assert!(
+        egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(COMPACT[0], COMPACT[1]))
+            .contains_rect(resume[0])
+    );
+    click(&context, &mut app, COMPACT, resume[0].center());
+    assert!(app.batch_open);
+    assert!(app.batch_state.active());
+}
+
+#[test]
 fn blue_home_shows_the_welcome_tasks_and_setup_without_the_classic_layout() {
     let context = egui::Context::default();
     let mut app = blue_app(&context, games());

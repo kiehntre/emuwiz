@@ -669,6 +669,8 @@ pub struct PersistedSetAuditDependency {
     pub via_member: Option<String>,
 }
 
+type ScreenScraperBatchIdentity = (i64, Vec<u8>, Option<i64>, Option<i64>, Option<String>);
+
 impl Database {
     /// Keep transactions short enough that a large real-world Arcade source
     /// exposes progress promptly, while amortising SQLite commit overhead.
@@ -7043,10 +7045,10 @@ impl Database {
     /// Blue batch writes must still target the same saved game and the same
     /// previously accepted metadata that the user reviewed.
     pub fn screenscraper_batch_game_is_current(&self, expected: &PersistedArchive) -> Result<bool> {
-        let current: Option<(i64, Vec<u8>, Option<i64>, Option<i64>, Option<String>)> = self.connection
+        let current: Option<ScreenScraperBatchIdentity> = self.connection
             .query_row(
-                "SELECT a.source_folder_id, a.absolute_path_cached, a.size_bytes, a.modified_time_unix_seconds, p.platform FROM archives a LEFT JOIN platform_assignments p ON p.archive_id = a.id AND p.is_current = 1 WHERE a.id = ?1",
-                [expected.id],
+                "SELECT a.source_folder_id, a.absolute_path_cached, a.size_bytes, a.modified_time_unix_seconds, p.platform FROM archives a LEFT JOIN platform_assignments p ON p.archive_id = a.id AND p.is_current = 1 WHERE a.id = ?1 AND a.archive_kind = ?2 AND a.last_seen_at = ?3 AND a.last_verified_missing_at IS NULL",
+                params![expected.id, expected.archive_kind, expected.last_seen_at],
                 |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?, row.get(4)?)),
             ).optional().map_err(|error| db_error("failed to check batch game identity", error))?;
         Ok(current.is_some_and(|current| {
@@ -7117,13 +7119,19 @@ impl Database {
             )));
         }
         if let Some(expected) = expected {
-            let current: (i64, Vec<u8>, Option<i64>, Option<i64>, Option<String>) = transaction
+            let current: Option<ScreenScraperBatchIdentity> = transaction
                 .query_row(
-                    "SELECT a.source_folder_id, a.absolute_path_cached, a.size_bytes, a.modified_time_unix_seconds, p.platform FROM archives a LEFT JOIN platform_assignments p ON p.archive_id = a.id AND p.is_current = 1 WHERE a.id = ?1",
-                    [archive_id],
+                    "SELECT a.source_folder_id, a.absolute_path_cached, a.size_bytes, a.modified_time_unix_seconds, p.platform FROM archives a LEFT JOIN platform_assignments p ON p.archive_id = a.id AND p.is_current = 1 WHERE a.id = ?1 AND a.archive_kind = ?2 AND a.last_seen_at = ?3 AND a.last_verified_missing_at IS NULL",
+                    params![archive_id, expected.archive_kind, expected.last_seen_at],
                     |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?, row.get(4)?)),
                 )
+                .optional()
                 .map_err(|error| db_error("failed to validate batch game identity", error))?;
+            let Some(current) = current else {
+                return Err(ArchiveFsError::Database(
+                    "batch game identity changed or game is missing during review".into(),
+                ));
+            };
             if current.0 != expected.source_folder_id
                 || current.1 != expected.absolute_path.as_os_str().as_bytes()
                 || current.2.map(|size| size as u64) != expected.size_bytes
@@ -17410,6 +17418,178 @@ echo "$out"
                 .apply_screenscraper_enrichment_if_current(&missing, None, None, &changed, &receipt)
                 .is_err()
         );
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn screenscraper_batch_refuses_changed_kind_new_scan_and_missing_row() {
+        use crate::screenscraper_enrichment::{
+            AcceptedScreenScraperMetadata, ScreenScraperEnrichmentReceipt,
+        };
+        let (root, mut database, archive_id) =
+            unknown_archive_database("screenscraper-batch-freshness");
+        let expected = database.load_archives().unwrap().remove(0);
+        let values = AcceptedScreenScraperMetadata {
+            genre: Some("Puzzle".into()),
+            ..Default::default()
+        };
+        let receipt = ScreenScraperEnrichmentReceipt {
+            provider: "ScreenScraper".into(),
+            provider_record_id: "42".into(),
+            retrieved_at_unix_seconds: 10,
+            match_basis: "search".into(),
+            before: Default::default(),
+            accepted: values.clone(),
+            media_reference_count: 0,
+            field_sources: Default::default(),
+        };
+        let assert_refused = |database: &mut Database| {
+            assert!(
+                !database
+                    .screenscraper_batch_game_is_current(&expected)
+                    .unwrap()
+            );
+            assert!(
+                database
+                    .apply_screenscraper_enrichment_if_current(
+                        &expected, None, None, &values, &receipt
+                    )
+                    .is_err()
+            );
+            assert!(
+                database
+                    .load_screenscraper_enrichments()
+                    .unwrap()
+                    .is_empty()
+            );
+        };
+        database
+            .connection
+            .execute(
+                "UPDATE archives SET archive_kind = 'rar' WHERE id = ?1",
+                [archive_id],
+            )
+            .unwrap();
+        assert_refused(&mut database);
+        database
+            .connection
+            .execute(
+                "UPDATE archives SET archive_kind = ?1 WHERE id = ?2",
+                params![expected.archive_kind, archive_id],
+            )
+            .unwrap();
+        database
+            .connection
+            .execute(
+                "UPDATE archives SET last_seen_at = 'later' WHERE id = ?1",
+                [archive_id],
+            )
+            .unwrap();
+        assert_refused(&mut database);
+        database
+            .connection
+            .execute(
+                "UPDATE archives SET last_seen_at = ?1 WHERE id = ?2",
+                params![expected.last_seen_at, archive_id],
+            )
+            .unwrap();
+        database
+            .connection
+            .execute(
+                "UPDATE archives SET last_verified_missing_at = '2026-10-28' WHERE id = ?1",
+                [archive_id],
+            )
+            .unwrap();
+        assert_refused(&mut database);
+        let mut missing = expected.clone();
+        missing.id = i64::MAX;
+        assert!(
+            !database
+                .screenscraper_batch_game_is_current(&missing)
+                .unwrap()
+        );
+        assert!(
+            database
+                .apply_screenscraper_enrichment_if_current(&missing, None, None, &values, &receipt)
+                .is_err()
+        );
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn screenscraper_batch_refuses_concurrent_values_and_receipt_changes() {
+        use crate::screenscraper_enrichment::{
+            AcceptedScreenScraperMetadata, ScreenScraperEnrichmentReceipt,
+        };
+        let (root, mut database, archive_id) =
+            unknown_archive_database("screenscraper-batch-concurrent");
+        let expected = database.load_archives().unwrap().remove(0);
+        let original = AcceptedScreenScraperMetadata {
+            genre: Some("Puzzle".into()),
+            ..Default::default()
+        };
+        let replacement = AcceptedScreenScraperMetadata {
+            genre: Some("Adventure".into()),
+            ..Default::default()
+        };
+        let receipt = ScreenScraperEnrichmentReceipt {
+            provider: "ScreenScraper".into(),
+            provider_record_id: "42".into(),
+            retrieved_at_unix_seconds: 10,
+            match_basis: "search".into(),
+            before: Default::default(),
+            accepted: original.clone(),
+            media_reference_count: 0,
+            field_sources: Default::default(),
+        };
+        database
+            .apply_screenscraper_enrichment_if_current(&expected, None, None, &original, &receipt)
+            .unwrap();
+        database
+            .connection
+            .execute(
+                "UPDATE screenscraper_enrichments SET values_json = ?1 WHERE archive_id = ?2",
+                params![serde_json::to_vec(&replacement).unwrap(), archive_id],
+            )
+            .unwrap();
+        assert!(
+            database
+                .apply_screenscraper_enrichment_if_current(
+                    &expected,
+                    Some(&original),
+                    Some(&receipt),
+                    &original,
+                    &receipt
+                )
+                .is_err()
+        );
+        assert_eq!(
+            database.load_screenscraper_enrichments().unwrap()[0].values,
+            replacement
+        );
+
+        let changed_receipt = ScreenScraperEnrichmentReceipt {
+            provider_record_id: "new-provider-id".into(),
+            ..receipt.clone()
+        };
+        database.connection.execute(
+            "UPDATE screenscraper_enrichments SET values_json = ?1, receipt_json = ?2 WHERE archive_id = ?3",
+            params![serde_json::to_vec(&original).unwrap(), serde_json::to_vec(&changed_receipt).unwrap(), archive_id],
+        ).unwrap();
+        assert!(
+            database
+                .apply_screenscraper_enrichment_if_current(
+                    &expected,
+                    Some(&original),
+                    Some(&receipt),
+                    &replacement,
+                    &receipt
+                )
+                .is_err()
+        );
+        let saved = database.load_screenscraper_enrichments().unwrap();
+        assert_eq!(saved[0].values, original);
+        assert_eq!(saved[0].receipt, changed_receipt);
         let _ = fs::remove_dir_all(root);
     }
 

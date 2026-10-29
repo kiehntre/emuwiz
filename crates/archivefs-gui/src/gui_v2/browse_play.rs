@@ -323,15 +323,19 @@ impl App {
     }
 
     fn browse_play_batch_controls(&mut self, ui: &mut egui::Ui, library: &super::library::Library) {
-        if !self.batch_selecting && self.batch_selection.len() == 0 {
+        if !self.batch_selecting && self.batch_selection.len() == 0 && !self.batch_state.active() {
             return;
         }
         ui.horizontal_wrapped(|ui| {
             ui.label(format!("{} / 25 selected", self.batch_selection.len()));
             if ui
                 .add_enabled(
-                    self.batch_selection.len() > 0,
-                    egui::Button::new("Enrich metadata"),
+                    self.batch_selection.len() > 0 || self.batch_state.active(),
+                    egui::Button::new(if self.batch_state.active() {
+                        "Resume batch"
+                    } else {
+                        "Enrich metadata"
+                    }),
                 )
                 .clicked()
             {
