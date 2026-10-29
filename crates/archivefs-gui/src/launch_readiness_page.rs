@@ -3256,6 +3256,13 @@ pub(crate) fn show_launch_readiness_panel(
         LaunchReadinessInput::RetroArchNotScanned => {
             widgets::card(ui, |ui| {
                 ui.label("Scan RetroArch profiles to check installed cores.");
+                if ui.button("Open Emulator Setup").clicked() {
+                    action = Some(LaunchReadinessPageAction::Navigate(
+                        crate::navigation::NavClick::View(
+                            crate::navigation::MainView::EmulatorSetup,
+                        ),
+                    ));
+                }
             });
         }
         LaunchReadinessInput::IdentityUnknown => {

@@ -799,7 +799,7 @@ impl ArchiveFsApp {
                 ui.separator();
                 ui.strong("Review RetroArch setup change");
                 ui.label(format!("Selected core folder: {}", folder.display()));
-                ui.label("EmuWiz will create only its own core-folder choice file. RetroArch settings, cores, and existing user overrides are left untouched. A fresh scan will check installed cores after approval; a matching game's launch readiness is checked separately.");
+                ui.label("EmuWiz will record this choice only in its own core-folder file. RetroArch settings, cores, and earlier choices are left intact. A fresh scan will check installed cores after approval; a matching game's launch readiness is checked separately.");
                 if mode.is_custom() {
                     ui.colored_label(ui.visuals().warn_fg_color, "An EmuWiz core-folder choice already exists. Reset it explicitly before choosing a replacement.");
                 } else {
@@ -816,7 +816,7 @@ impl ArchiveFsApp {
             if self.emulator_readiness.retroarch_core_folder_reset_preview {
                 ui.separator();
                 ui.strong("Review reset to automatic detection");
-                ui.label("EmuWiz will remove only its own core-folder choice file and scan RetroArch's configured core folder again. RetroArch settings and cores will not be changed.");
+                ui.label("EmuWiz will append an automatic-detection choice to its own core-folder file and scan RetroArch's configured core folder again. Previous choices, RetroArch settings and cores will be preserved.");
                 ui.horizontal(|ui| {
                     if ui.button("Confirm reset").clicked() {
                         pending = Some(CoreFolderAction::Reset);
@@ -2979,12 +2979,7 @@ impl ArchiveFsApp {
             .retroarch_core_directory_override
             .as_ref()
             .ok_or("No saved EmuWiz core-folder choice is active")?;
-        if std::fs::read(&path).map_err(|e| e.to_string())?
-            != expected.as_os_str().as_encoded_bytes()
-        {
-            return Err("The saved core-folder choice changed after preview. Check again before resetting it.".into());
-        }
-        save_retroarch_core_directory_override(None)?;
+        reset_retroarch_core_directory_override_at(&path, expected)?;
         self.emulator_readiness.retroarch_core_directory_override = None;
         Ok(())
     }
@@ -3304,9 +3299,9 @@ pub(crate) fn managed_appimage_explicit_executables(
         .collect()
 }
 
-/// Only creates EmuWiz's own sidecar, or explicitly removes that sidecar.
-/// Refuses existing files so an old choice, symlink or concurrent write is
-/// never replaced. The caller updates in-memory discovery only on success.
+/// Creates EmuWiz's sidecar without replacing a pre-existing entry. After an
+/// explicit reset, appends a new choice to the same managed file. Old choices
+/// remain intact; a symlink or changed entry is refused.
 pub(crate) fn save_retroarch_core_directory_override_at(
     path: &Path,
     value: Option<&Path>,
@@ -3319,6 +3314,15 @@ pub(crate) fn save_retroarch_core_directory_override_at(
                     "The chosen core folder is no longer available. Choose it again.".into(),
                 );
             }
+            let choice = dir.to_str().ok_or(
+                "The core folder path cannot be saved as UTF-8. Choose a folder with a UTF-8 path.",
+            )?;
+            if choice.contains('\n') || choice.contains('\r') || choice == "@emuwiz-automatic" {
+                return Err(
+                    "The core folder path cannot be stored safely in the EmuWiz choice file."
+                        .into(),
+                );
+            }
             std::fs::create_dir_all(parent).map_err(|e| e.to_string())?;
             if !std::fs::symlink_metadata(parent)
                 .is_ok_and(|meta| meta.is_dir() && !meta.file_type().is_symlink())
@@ -3327,33 +3331,81 @@ pub(crate) fn save_retroarch_core_directory_override_at(
                     "The EmuWiz configuration directory is not a regular directory.".into(),
                 );
             }
-            use std::io::Write;
-            let mut file = tempfile::NamedTempFile::new_in(parent).map_err(|e| e.to_string())?;
-            file.write_all(dir.as_os_str().as_encoded_bytes())
-                .and_then(|_| file.as_file().sync_all())
-                .map_err(|e| format!("Could not save the core-folder choice: {e}"))?;
-            file.persist_noclobber(path).map_err(|e| {
-                format!(
-                    "The EmuWiz core-folder choice already exists or cannot be created: {}",
-                    e.error
-                )
-            })?;
-        }
-        None => {
-            match std::fs::symlink_metadata(path) {
-                Ok(meta) if meta.is_file() && !meta.file_type().is_symlink() => {
-                    std::fs::remove_file(path).map_err(|e| e.to_string())?;
-                }
-                Ok(_) => return Err(
-                    "The EmuWiz core-folder choice is not a regular file; it was left untouched."
-                        .into(),
-                ),
-                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
-                Err(error) => return Err(error.to_string()),
+            if std::fs::symlink_metadata(path).is_ok() {
+                append_retroarch_core_choice_at(path, b"@emuwiz-automatic", choice)?;
+            } else {
+                use std::io::Write;
+                let mut file =
+                    tempfile::NamedTempFile::new_in(parent).map_err(|e| e.to_string())?;
+                file.write_all(choice.as_bytes())
+                    .and_then(|_| file.as_file().sync_all())
+                    .map_err(|e| format!("Could not save the core-folder choice: {e}"))?;
+                file.persist_noclobber(path).map_err(|e| {
+                    format!(
+                        "The EmuWiz core-folder choice already exists or cannot be created: {}",
+                        e.error
+                    )
+                })?;
             }
         }
+        None => return Err("Reset requires the currently loaded core-folder choice.".into()),
     }
     Ok(())
+}
+
+/// Append to an already opened regular file, so a concurrent path swap can
+/// never redirect a reset into an unrelated file or unlink one. The expected
+/// last record binds the action to the choice the user reviewed.
+fn append_retroarch_core_choice_at(path: &Path, expected: &[u8], next: &str) -> Result<(), String> {
+    use std::io::{Read, Write};
+    use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
+    let mut file = std::fs::OpenOptions::new()
+        .read(true)
+        .append(true)
+        .custom_flags(libc::O_NOFOLLOW)
+        .open(path)
+        .map_err(|e| format!("The saved core-folder choice cannot be opened safely: {e}"))?;
+    let metadata = file.metadata().map_err(|e| e.to_string())?;
+    if !metadata.is_file() || metadata.len() > 64 * 1024 {
+        return Err("The saved core-folder choice is not a small regular file.".into());
+    }
+    let mut contents = Vec::new();
+    file.read_to_end(&mut contents).map_err(|e| e.to_string())?;
+    if contents.rsplit(|byte| *byte == b'\n').next() != Some(expected) {
+        return Err(
+            "The saved core-folder choice changed after preview. Check again before changing it."
+                .into(),
+        );
+    }
+    let current = std::fs::symlink_metadata(path).map_err(|e| e.to_string())?;
+    if current.dev() != metadata.dev() || current.ino() != metadata.ino() {
+        return Err(
+            "The saved core-folder choice changed after preview. Check again before changing it."
+                .into(),
+        );
+    }
+    file.write_all(b"\n")
+        .and_then(|_| file.write_all(next.as_bytes()))
+        .and_then(|_| file.sync_all())
+        .map_err(|e| e.to_string())?;
+    let current = std::fs::symlink_metadata(path).map_err(|e| e.to_string())?;
+    if current.dev() != metadata.dev() || current.ino() != metadata.ino() {
+        return Err(
+            "The saved core-folder choice changed during the operation. Check again.".into(),
+        );
+    }
+    Ok(())
+}
+
+pub(crate) fn reset_retroarch_core_directory_override_at(
+    path: &Path,
+    expected: &Path,
+) -> Result<(), String> {
+    append_retroarch_core_choice_at(
+        path,
+        expected.as_os_str().as_encoded_bytes(),
+        "@emuwiz-automatic",
+    )
 }
 
 pub(crate) fn save_retroarch_core_directory_override(value: Option<&Path>) -> Result<(), String> {

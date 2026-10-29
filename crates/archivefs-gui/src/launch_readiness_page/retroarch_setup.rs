@@ -2,6 +2,7 @@
 //! Suggestions here never turn into launch authority; the normal plan and
 //! fresh preflight continue to decide whether Play is available.
 
+use archivefs_core::emulator_environment::FsProbe;
 use archivefs_core::emulator_environment::retroarch::CoreInfoFinding;
 use archivefs_core::launch::{
     LaunchPlan, LaunchTarget, launch_compatibility_for_platform, retroarch_platform_matches,
@@ -30,8 +31,28 @@ pub(super) fn show(
         })
         .collect();
     if !matching.is_empty() {
+        let missing_config = plan
+            .candidates
+            .iter()
+            .filter_map(|candidate| match &candidate.target {
+                LaunchTarget::RetroArchCore { profile, .. } => context.and_then(|context| {
+                    context.environment.profiles.iter().find(|found| {
+                        found.profile_kind == profile.profile_kind && found.scope == profile.scope
+                    })
+                }),
+                _ => None,
+            })
+            .any(|profile| profile.config_file.probe != FsProbe::PresentFile);
+        let mut open_setup = false;
+        if missing_config {
+            super::widgets::card(ui, |ui| {
+                ui.strong("RetroArch settings have not been created yet");
+                ui.label("A matching installed core was found, but its RetroArch profile has no settings file. Start that RetroArch installation once so it can create its own settings, then check again. An AppImage launch needs its own settings file; a native installation may run with defaults. EmuWiz will not create or replace retroarch.cfg.");
+                open_setup = ui.button("Open Emulator Setup").clicked();
+            });
+        }
         ui.small(format!("RetroArch setup: installed core {} matches {platform}. This is a launch recommendation from scanned files; Play performs a fresh safety check. Successful launch is reported separately.", matching.join(", ")));
-        return false;
+        return open_setup;
     }
     let mut open_setup = false;
     super::widgets::card(ui, |ui| {
