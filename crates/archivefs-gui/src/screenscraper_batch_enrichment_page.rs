@@ -117,7 +117,7 @@ impl ObservedQuota {
 
 #[derive(Debug, Default)]
 pub(crate) struct ScreenScraperBatchState {
-    session: Option<BatchSession>,
+    session: Option<Box<BatchSession>>,
 }
 
 impl ScreenScraperBatchState {
@@ -182,7 +182,7 @@ impl ScreenScraperBatchState {
                 provider_record_id,
             });
         }
-        self.session = Some(BatchSession {
+        self.session = Some(Box::new(BatchSession {
             states: vec![BatchItemState::Pending; items.len()],
             items,
             current: 0,
@@ -196,7 +196,7 @@ impl ScreenScraperBatchState {
             quota: None,
             requests_used: 0,
             message: None,
-        });
+        }));
         Ok(())
     }
 
@@ -235,7 +235,7 @@ impl ScreenScraperBatchState {
                 }
             })
             .collect::<Vec<_>>();
-        self.session = Some(BatchSession {
+        self.session = Some(Box::new(BatchSession {
             states: vec![BatchItemState::Pending; items.len()],
             items,
             current: 0,
@@ -249,7 +249,7 @@ impl ScreenScraperBatchState {
             quota: None,
             requests_used: 0,
             message: None,
-        });
+        }));
         Ok(())
     }
 
@@ -874,7 +874,7 @@ mod tests {
     #[test]
     fn cancellation_discards_queued_candidate_and_blocks_acceptance() {
         let mut state = ScreenScraperBatchState {
-            session: Some(two_game_session()),
+            session: Some(Box::new(two_game_session())),
         };
         let (sender, receiver) = mpsc::channel();
         state.session.as_mut().unwrap().reply = Some(receiver);
@@ -958,7 +958,7 @@ mod tests {
     fn provider_daily_quota_response_stops_next_lookup_without_dispatch() {
         let credentials = credentials("fixture-secret");
         let mut state = ScreenScraperBatchState {
-            session: Some(two_game_session()),
+            session: Some(Box::new(two_game_session())),
         };
         let (sender, receiver) = mpsc::channel();
         let session = state.session.as_mut().unwrap();
