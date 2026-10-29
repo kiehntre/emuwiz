@@ -436,7 +436,7 @@ pub fn plan_ps1_pbp_export(
             .library_dat_identity_for_item(archive.id, &source)
             .map_err(|e| refuse(e.to_string()))?
             .ok_or_else(|| refuse("whole-disc audit is missing"))?;
-        if configured.path != PathBuf::from(&saved.source.dat_path)
+        if configured.path.as_path() != Path::new(&saved.source.dat_path)
             || sha256(&configured.path, cancel)? != digest
         {
             return Err(refuse("configured DAT file differs from audited catalogue"));
@@ -877,10 +877,10 @@ pub fn execute_ps1_pbp_export(
         }
     }
     for path in [playlist_path, stage_path.join("writer.log")] {
-        if let Err(error) = fs::remove_file(&path) {
-            if error.kind() != std::io::ErrorKind::NotFound {
-                cleanup_errors.push(format!("{}: {error}", path.display()));
-            }
+        if let Err(error) = fs::remove_file(&path)
+            && error.kind() != std::io::ErrorKind::NotFound
+        {
+            cleanup_errors.push(format!("{}: {error}", path.display()));
         }
     }
     Ok(PbpExportResult {
