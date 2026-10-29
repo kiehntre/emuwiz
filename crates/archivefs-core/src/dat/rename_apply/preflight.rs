@@ -526,7 +526,7 @@ mod tests {
     }
 
     #[test]
-    fn create_symlink_accepts_an_exact_existing_link_without_rename_placement() {
+    fn create_symlink_refuses_an_exact_existing_link_without_ownership_proof() {
         let source_root = tempfile::tempdir().unwrap();
         let library_root = tempfile::tempdir().unwrap();
         let source = source_root.path().join("Game.iso");
@@ -542,7 +542,10 @@ mod tests {
         let approved = BTreeSet::from([source.to_string_lossy().into_owned()]);
         let trusted = TrustedRoots::from_paths([source_root.path()]);
         let result = run_preflight(&entry, &options(&approved, &trusted, &BTreeSet::new(), 1));
-        assert!(result.is_ok(), "{result:?}");
+        assert!(
+            matches!(result, Err(ref failures) if failures.contains(&PreflightFailure::DestinationExists)),
+            "{result:?}"
+        );
     }
 
     #[test]
