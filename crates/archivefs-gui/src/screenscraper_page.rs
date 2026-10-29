@@ -1060,10 +1060,9 @@ mod tests {
     #[cfg(target_os = "linux")]
     #[test]
     fn managed_env_is_created_then_survives_app_restart_update_and_forget() {
-        let home = std::path::PathBuf::from(std::env::var_os("HOME").expect("private test home"));
         let root = tempfile::Builder::new()
             .prefix("emuwiz-screenscraper-file-test-")
-            .tempdir_in(home)
+            .tempdir()
             .unwrap();
         let directory = root.path().join(".config/emuwiz");
         assert!(!directory.exists());
@@ -1115,10 +1114,9 @@ mod tests {
     #[cfg(target_os = "linux")]
     #[test]
     fn file_storage_needs_explicit_plaintext_and_backup_acknowledgment() {
-        let home = std::path::PathBuf::from(std::env::var_os("HOME").expect("private test home"));
         let root = tempfile::Builder::new()
             .prefix("emuwiz-screenscraper-ack-test-")
-            .tempdir_in(home)
+            .tempdir()
             .unwrap();
         let directory = root.path().join(".config/emuwiz");
         let mut state = ScreenScraperPageState::empty(true);
