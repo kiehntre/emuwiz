@@ -563,12 +563,42 @@ pub(crate) fn retroarch_core_directory_override_path() -> Option<PathBuf> {
 /// explicit choice, never canonicalised here.
 pub(crate) fn load_retroarch_core_directory_override_at(path: &Path) -> Option<PathBuf> {
     let contents = std::fs::read_to_string(path).ok()?;
-    let choice = if contents.contains("\n@emuwiz-automatic") {
-        contents.rsplit('\n').next()?
-    } else {
-        contents.as_str()
-    };
+    let choice = active_retroarch_core_choice(&contents);
     (!choice.trim().is_empty() && choice != "@emuwiz-automatic").then(|| PathBuf::from(choice))
+}
+
+/// The last complete, checksummed record wins. A torn append is ignored, so
+/// a failed write cannot silently change the active choice on restart.
+pub(crate) fn active_retroarch_core_choice(contents: &str) -> &str {
+    const PREFIX: &str = "@emuwiz-core-choice-v1:";
+    let marker = format!("\n{PREFIX}");
+    let Some(first) = contents.find(&marker) else {
+        return contents;
+    };
+    let mut choice = &contents[..first];
+    let mut remaining = &contents[first + 1..];
+    while let Some(end) = remaining.find('\n') {
+        let line = &remaining[..end];
+        if let Some((checksum, value)) = line
+            .strip_prefix(PREFIX)
+            .and_then(|rest| rest.split_once(':'))
+            && checksum == retroarch_choice_checksum(value)
+        {
+            choice = value;
+        }
+        remaining = &remaining[end + 1..];
+    }
+    choice
+}
+
+pub(crate) fn retroarch_choice_checksum(value: &str) -> String {
+    use sha2::{Digest, Sha256};
+    use std::fmt::Write;
+    let mut encoded = String::with_capacity(64);
+    for byte in Sha256::digest(value.as_bytes()) {
+        write!(&mut encoded, "{byte:02x}").expect("writing to String cannot fail");
+    }
+    encoded
 }
 
 /// The default-location counterparts, used by the running app.
@@ -643,6 +673,52 @@ pub(crate) fn reset_refuses_a_changed_choice_without_modifying_it() {
         std::fs::read_to_string(&path).unwrap(),
         second.to_str().unwrap()
     );
+}
+
+#[test]
+pub(crate) fn reset_refuses_a_busy_sidecar_and_can_retry() {
+    use std::os::fd::AsRawFd;
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("retroarch_core_directory_override.txt");
+    let choice = dir.path().join("cores");
+    std::fs::write(&path, choice.to_str().unwrap()).unwrap();
+    let locked = std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open(&path)
+        .unwrap();
+    // SAFETY: locked is a live file descriptor.
+    assert_eq!(
+        unsafe { libc::flock(locked.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) },
+        0
+    );
+    assert!(reset_retroarch_core_directory_override_at(&path, &choice).is_err());
+    assert_eq!(
+        load_retroarch_core_directory_override_at(&path),
+        Some(choice.clone())
+    );
+    // SAFETY: locked remains open through this unlock.
+    assert_eq!(unsafe { libc::flock(locked.as_raw_fd(), libc::LOCK_UN) }, 0);
+    reset_retroarch_core_directory_override_at(&path, &choice).unwrap();
+    assert_eq!(load_retroarch_core_directory_override_at(&path), None);
+}
+
+#[test]
+pub(crate) fn incomplete_append_is_ignored_and_safe_retry_commits_a_complete_record() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("retroarch_core_directory_override.txt");
+    let choice = dir.path().join("cores");
+    std::fs::write(
+        &path,
+        format!("{}\n@emuwiz-core-choice-v1:partial", choice.display()),
+    )
+    .unwrap();
+    assert_eq!(
+        load_retroarch_core_directory_override_at(&path),
+        Some(choice.clone())
+    );
+    reset_retroarch_core_directory_override_at(&path, &choice).unwrap();
+    assert_eq!(load_retroarch_core_directory_override_at(&path), None);
 }
 
 #[test]

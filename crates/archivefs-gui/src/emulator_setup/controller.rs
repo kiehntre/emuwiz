@@ -829,7 +829,7 @@ impl ArchiveFsApp {
             if let Some(error) = &self.emulator_readiness.retroarch_core_folder_save_error {
                 widgets::banner(
                     ui,
-                    "Setup was not saved",
+                    "Setup could not be confirmed",
                     error,
                     widgets::StatusTone::Blocked,
                 );
@@ -3346,6 +3346,11 @@ pub(crate) fn save_retroarch_core_directory_override_at(
                         e.error
                     )
                 })?;
+                std::fs::File::open(parent)
+                    .and_then(|directory| directory.sync_all())
+                    .map_err(|e| {
+                        format!("The new core-folder choice could not be confirmed on disk: {e}")
+                    })?;
             }
         }
         None => return Err("Reset requires the currently loaded core-folder choice.".into()),
@@ -3358,20 +3363,39 @@ pub(crate) fn save_retroarch_core_directory_override_at(
 /// last record binds the action to the choice the user reviewed.
 fn append_retroarch_core_choice_at(path: &Path, expected: &[u8], next: &str) -> Result<(), String> {
     use std::io::{Read, Write};
+    use std::os::fd::AsRawFd;
     use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
+    struct ChoiceLock(std::os::fd::RawFd);
+    impl Drop for ChoiceLock {
+        fn drop(&mut self) {
+            // SAFETY: the descriptor stays open until after this guard drops.
+            unsafe { libc::flock(self.0, libc::LOCK_UN) };
+        }
+    }
     let mut file = std::fs::OpenOptions::new()
         .read(true)
         .append(true)
         .custom_flags(libc::O_NOFOLLOW)
         .open(path)
         .map_err(|e| format!("The saved core-folder choice cannot be opened safely: {e}"))?;
+    // SAFETY: file.as_raw_fd() is a live descriptor. LOCK_NB keeps the UI
+    // responsive when another EmuWiz process is updating this sidecar.
+    if unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } != 0 {
+        return Err(format!(
+            "The EmuWiz core-folder choice is busy; try again: {}",
+            std::io::Error::last_os_error()
+        ));
+    }
+    let _lock = ChoiceLock(file.as_raw_fd());
     let metadata = file.metadata().map_err(|e| e.to_string())?;
     if !metadata.is_file() || metadata.len() > 64 * 1024 {
         return Err("The saved core-folder choice is not a small regular file.".into());
     }
     let mut contents = Vec::new();
     file.read_to_end(&mut contents).map_err(|e| e.to_string())?;
-    if contents.rsplit(|byte| *byte == b'\n').next() != Some(expected) {
+    let contents = String::from_utf8(contents)
+        .map_err(|_| "The saved core-folder choice is not UTF-8; it was left untouched.")?;
+    if crate::retroarch_core_setup::active_retroarch_core_choice(&contents).as_bytes() != expected {
         return Err(
             "The saved core-folder choice changed after preview. Check again before changing it."
                 .into(),
@@ -3384,8 +3408,9 @@ fn append_retroarch_core_choice_at(path: &Path, expected: &[u8], next: &str) -> 
                 .into(),
         );
     }
-    file.write_all(b"\n")
-        .and_then(|_| file.write_all(next.as_bytes()))
+    let checksum = crate::retroarch_core_setup::retroarch_choice_checksum(next);
+    let record = format!("\n@emuwiz-core-choice-v1:{checksum}:{next}\n");
+    file.write_all(record.as_bytes())
         .and_then(|_| file.sync_all())
         .map_err(|e| e.to_string())?;
     let current = std::fs::symlink_metadata(path).map_err(|e| e.to_string())?;
