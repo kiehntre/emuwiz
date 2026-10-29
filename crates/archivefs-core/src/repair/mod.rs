@@ -42,11 +42,11 @@ mod identity;
 pub mod library;
 pub mod n64_equivalent;
 pub mod optical_conversion;
-pub mod ps1_pbp_export;
 pub mod optical_equivalent;
 pub mod plan;
 pub mod preflight;
 pub mod proposal;
+pub mod ps1_pbp_export;
 pub mod quarantine;
 
 #[cfg(test)]
