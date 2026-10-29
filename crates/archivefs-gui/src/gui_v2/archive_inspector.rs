@@ -1021,10 +1021,12 @@ mod tests {
             media: "ZIP".into(),
             platform: "test".into(),
         };
-        let mut state = ArchiveInspectorPageState::default();
-        state.status = Status::Loading {
-            target: old.clone(),
-            receiver,
+        let mut state = ArchiveInspectorPageState {
+            status: Status::Loading {
+                target: old.clone(),
+                receiver,
+            },
+            rows: None,
         };
         let mut new = old;
         new.game_id = Some(2);
@@ -1038,11 +1040,13 @@ mod tests {
     fn ready_evidence_refreshes_in_the_background() {
         let ctx = egui::Context::default();
         let target = target();
-        let mut state = ArchiveInspectorPageState::default();
-        state.status = Status::Ready {
-            target: target.clone(),
-            inspection: inspection(ArchiveFormat::Zip, zip_report(&["game.rom"], 1)),
-            checked_at: Instant::now() - Duration::from_secs(6),
+        let mut state = ArchiveInspectorPageState {
+            status: Status::Ready {
+                target: target.clone(),
+                inspection: inspection(ArchiveFormat::Zip, zip_report(&["game.rom"], 1)),
+                checked_at: Instant::now() - Duration::from_secs(6),
+            },
+            rows: None,
         };
         state.set_target(Some(target), &ctx);
         assert!(matches!(state.status, Status::Loading { .. }));
