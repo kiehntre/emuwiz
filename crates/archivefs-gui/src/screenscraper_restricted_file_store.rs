@@ -377,10 +377,10 @@ mod tests {
     use std::os::unix::fs::{PermissionsExt, symlink};
 
     fn fixture() -> (tempfile::TempDir, PathBuf, RestrictedFileStore) {
-        let home = PathBuf::from(std::env::var_os("HOME").expect("private test home"));
+        // Test HOME may be inside the checkout; the store must reject Git worktrees.
         let root = tempfile::Builder::new()
             .prefix("emuwiz-screenscraper-file-test-")
-            .tempdir_in(home)
+            .tempdir()
             .unwrap();
         let directory = root.path().join("secrets");
         fs::create_dir(&directory).unwrap();
@@ -390,10 +390,9 @@ mod tests {
     }
 
     fn absent_fixture() -> (tempfile::TempDir, PathBuf, RestrictedFileStore) {
-        let home = PathBuf::from(std::env::var_os("HOME").expect("private test home"));
         let root = tempfile::Builder::new()
             .prefix("emuwiz-screenscraper-env-test-")
-            .tempdir_in(home)
+            .tempdir()
             .unwrap();
         let directory = root.path().join(".config/emuwiz");
         let store = RestrictedFileStore::managed_default(directory.clone());
@@ -648,10 +647,9 @@ mod tests {
 
     #[test]
     fn missing_or_relative_directory_never_falls_back() {
-        let home = PathBuf::from(std::env::var_os("HOME").expect("private test home"));
         let root = tempfile::Builder::new()
             .prefix("emuwiz-screenscraper-file-test-")
-            .tempdir_in(home)
+            .tempdir()
             .unwrap();
         assert_eq!(
             RestrictedFileStore::new(root.path().join("missing")).load(),
