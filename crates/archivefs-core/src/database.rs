@@ -5721,6 +5721,19 @@ impl Database {
         Ok(retired > 0)
     }
 
+    /// A completed scan may withdraw a former format/header claim. The
+    /// source predicate leaves manual, DAT, RomM and folder evidence intact.
+    fn retire_header_assignment(&mut self, archive_id: i64) -> Result<()> {
+        self.connection
+            .execute(
+                "UPDATE platform_assignments SET is_current = 0 \
+                 WHERE archive_id = ?1 AND is_current = 1 AND source = 'header_identity'",
+                [archive_id],
+            )
+            .map_err(|error| db_error("failed to retire obsolete header platform", error))?;
+        Ok(())
+    }
+
     /// Reads `archive_id`'s current (`is_current = 1`) platform assignment,
     /// if any - the shared read step behind [`Self::set_manual_platform`]
     /// and [`Self::clear_manual_platform`].
@@ -6615,12 +6628,15 @@ impl Database {
         let mut stmt = self
             .connection
             .prepare(
-                "SELECT id, absolute_path_cached, archive_kind FROM archives WHERE source_folder_id = ?1 AND last_verified_missing_at IS NULL",
+                "SELECT a.id, a.absolute_path_cached, a.archive_kind, p.source \
+                 FROM archives a LEFT JOIN platform_assignments p \
+                 ON p.archive_id = a.id AND p.is_current = 1 \
+                 WHERE a.source_folder_id = ?1 AND a.last_verified_missing_at IS NULL",
             )
             .map_err(|error| db_error("failed to prepare missing-archive scan", error))?;
-        let candidates: Vec<(i64, Vec<u8>, String)> = stmt
+        let candidates: Vec<(i64, Vec<u8>, String, Option<String>)> = stmt
             .query_map(params![source_folder_id], |row| {
-                Ok((row.get(0)?, row.get(1)?, row.get(2)?))
+                Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?))
             })
             .map_err(|error| db_error("failed to list archives for missing check", error))?
             .collect::<rusqlite::Result<_>>()
@@ -6629,9 +6645,10 @@ impl Database {
 
         let seen: HashSet<i64> = seen_archive_ids.iter().copied().collect();
         let mut unsafe_probe = false;
+        let mut unseen_headers = Vec::new();
         let missing: Vec<i64> = candidates
             .into_iter()
-            .filter_map(|(id, bytes, kind)| {
+            .filter_map(|(id, bytes, kind, current_source)| {
                 let path = PathBuf::from(OsString::from_vec(bytes));
                 if seen.contains(&id)
                     || !path.starts_with(&coverage.root)
@@ -6652,6 +6669,16 @@ impl Database {
                 ) {
                     unsafe_probe = true;
                 }
+                if current_source.as_deref() == Some("header_identity")
+                    && probe != crate::emulator_environment::FsProbe::Missing
+                    && !matches!(
+                        probe,
+                        crate::emulator_environment::FsProbe::IoError
+                            | crate::emulator_environment::FsProbe::Inaccessible
+                    )
+                {
+                    unseen_headers.push((id, path, kind));
+                }
                 (probe == crate::emulator_environment::FsProbe::Missing).then_some(id)
             })
             .collect();
@@ -6665,7 +6692,7 @@ impl Database {
                 "source changed while probing missing candidates".into(),
             ));
         }
-        if missing.is_empty() {
+        if missing.is_empty() && unseen_headers.is_empty() {
             return Ok(0);
         }
 
@@ -6720,11 +6747,38 @@ impl Database {
             )
             .map_err(|error| db_error("failed to mark archive missing", error))?;
             tx.execute(
+                "UPDATE platform_assignments SET is_current = 0 \
+                 WHERE archive_id = ?1 AND is_current = 1 AND source = 'header_identity'",
+                [archive_id],
+            )
+            .map_err(|error| db_error("failed to retire missing header platform", error))?;
+            tx.execute(
                 "INSERT INTO archive_scan_observations (scan_run_id, archive_id, observation, observed_at) \
                  VALUES (?1, ?2, 'missing', ?3)",
                 params![scan_run_id, archive_id, now],
             )
             .map_err(|error| db_error("failed to record missing observation", error))?;
+        }
+        for (archive_id, path, kind) in &unseen_headers {
+            if !matches!(
+                source_guard
+                    .probe(path, crate::archive_kind_is_directory_item(kind))
+                    .probe,
+                crate::emulator_environment::FsProbe::PresentFile
+                    | crate::emulator_environment::FsProbe::PresentDirectory
+                    | crate::emulator_environment::FsProbe::Symlink
+                    | crate::emulator_environment::FsProbe::WrongType
+            ) {
+                return Err(ArchiveFsError::Database(
+                    "unseen header candidate changed before reconciliation".into(),
+                ));
+            }
+            tx.execute(
+                "UPDATE platform_assignments SET is_current = 0 \
+                 WHERE archive_id = ?1 AND is_current = 1 AND source = 'header_identity'",
+                [archive_id],
+            )
+            .map_err(|error| db_error("failed to retire unseen header platform", error))?;
         }
         if !source_guard.current() {
             return Err(ArchiveFsError::Database(
@@ -10340,6 +10394,12 @@ fn assign_platform_for_scanned_archive(
     // manual assignment).
     let header_identity =
         archive.identity.platform_provenance == Some(PlatformProvenance::HeaderIdentity);
+    if !header_identity && archive.identity.inspection_problems.is_empty() {
+        // A newly completed inspection no longer supports the saved header.
+        // Retire it before weaker current evidence (for example a folder
+        // alias) is considered; an incomplete inspection keeps it for retry.
+        database.retire_header_assignment(archive_id)?;
+    }
     let custom_alias_platform =
         find_custom_platform_alias(database, &archive.path, &archive.identity.source_root)?;
     let compatible_source_platform = folder
@@ -12650,6 +12710,18 @@ mod tests {
         let archive = &database.load_archives().unwrap()[0];
         assert_eq!(archive.platform.as_deref(), Some("Wii"));
         assert_eq!(archive.platform_source.as_deref(), Some("header_identity"));
+
+        rewrite_in_place(
+            &source.join("disc.iso"),
+            &crate::synthetic_media::iso9660_image(b"UNKNOWN", "NOCNF", &[("README.TXT;1", b"hi")]),
+        );
+        scan_and_persist(&mut database, &config, "header-withdrawn").unwrap();
+        let archive = &database.load_archives().unwrap()[0];
+        assert_eq!(archive.platform.as_deref(), Some("GameCube"));
+        assert_eq!(
+            archive.platform_source.as_deref(),
+            Some(SOURCE_PLATFORM_ASSIGNMENT_SOURCE)
+        );
         let _ = fs::remove_dir_all(&root);
     }
 
@@ -14742,6 +14814,160 @@ echo "$out"
                 |row| row.get(0),
             )
             .unwrap()
+    }
+
+    #[test]
+    fn completed_rescan_retires_changed_adf_and_tap_header_evidence() {
+        use crate::synthetic_media;
+        let root = temp_dir("changed-header-platform-evidence");
+        let source = root.join("source");
+        fs::create_dir_all(&source).unwrap();
+        let adf = source.join("disk.adf");
+        let tap = source.join("tape.tap");
+        let valid_adf = synthetic_media::amiga_adf(0, b"TEST");
+        let mut valid_tap = vec![16, 0, 0xff];
+        valid_tap.extend([0; 14]);
+        valid_tap.push(0xff);
+        fs::write(&adf, &valid_adf).unwrap();
+        fs::write(&tap, &valid_tap).unwrap();
+        let config = config_for(&source, &root.join("mount"));
+        let mut database = Database::open_or_create(root.join("library.sqlite3")).unwrap();
+        scan_and_persist(&mut database, &config, "initial").unwrap();
+        for (name, platform) in [("disk.adf", "Amiga"), ("tape.tap", "ZX Spectrum")] {
+            let id = database
+                .load_archives()
+                .unwrap()
+                .into_iter()
+                .find(|row| row.absolute_path == source.join(name))
+                .unwrap()
+                .id;
+            assert_eq!(
+                current_assignment(&database, id),
+                Some((platform.into(), "header_identity".into())),
+                "{name}"
+            );
+        }
+
+        let mut invalid_adf = valid_adf;
+        invalid_adf[64 * 512 + 20] ^= 1;
+        rewrite_in_place(&adf, &invalid_adf);
+        let mut invalid_tap = valid_tap;
+        *invalid_tap.last_mut().unwrap() = 0;
+        rewrite_in_place(&tap, &invalid_tap);
+        scan_and_persist(&mut database, &config, "changed").unwrap();
+        for name in ["disk.adf", "tape.tap"] {
+            let id = database
+                .load_archives()
+                .unwrap()
+                .into_iter()
+                .find(|row| row.absolute_path == source.join(name))
+                .unwrap()
+                .id;
+            assert_eq!(current_assignment(&database, id), None, "{name}");
+        }
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn confirmed_missing_file_retires_only_header_platform_evidence() {
+        use crate::synthetic_media;
+        let root = temp_dir("missing-header-platform-evidence");
+        let source = root.join("source");
+        fs::create_dir_all(&source).unwrap();
+        let path = source.join("disk.adf");
+        fs::write(&path, synthetic_media::amiga_adf(0, b"TEST")).unwrap();
+        let config = config_for(&source, &root.join("mount"));
+        let mut database = Database::open_or_create(root.join("library.sqlite3")).unwrap();
+        scan_and_persist(&mut database, &config, "initial").unwrap();
+        let id = database.load_archives().unwrap()[0].id;
+        assert_eq!(
+            current_assignment(&database, id),
+            Some(("Amiga".into(), "header_identity".into()))
+        );
+        fs::remove_file(&path).unwrap();
+        let summary = scan_and_persist(&mut database, &config, "missing").unwrap();
+        assert_eq!(summary.counts.archives_missing, 1);
+        assert!(
+            database.load_archives().unwrap()[0]
+                .last_verified_missing_at
+                .is_some()
+        );
+        assert_eq!(current_assignment(&database, id), None);
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn unchanged_valid_header_is_stable_and_manual_evidence_survives_missing() {
+        use crate::synthetic_media;
+        let root = temp_dir("stable-header-platform-evidence");
+        let source = root.join("source");
+        fs::create_dir_all(&source).unwrap();
+        let path = source.join("disk.adf");
+        fs::write(&path, synthetic_media::amiga_adf(0, b"TEST")).unwrap();
+        let config = config_for(&source, &root.join("mount"));
+        let mut database = Database::open_or_create(root.join("library.sqlite3")).unwrap();
+        scan_and_persist(&mut database, &config, "initial").unwrap();
+        let id = database.load_archives().unwrap()[0].id;
+        scan_and_persist(&mut database, &config, "unchanged").unwrap();
+        assert_eq!(
+            current_assignment(&database, id),
+            Some(("Amiga".into(), "header_identity".into()))
+        );
+        assert_eq!(assignment_rows(&database, id), 1);
+        database.set_manual_platform(id, "ZX Spectrum").unwrap();
+        fs::remove_file(&path).unwrap();
+        scan_and_persist(&mut database, &config, "missing").unwrap();
+        assert_eq!(
+            current_assignment(&database, id),
+            Some(("ZX Spectrum".into(), MANUAL_PLATFORM_SOURCE.into()))
+        );
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn confirmed_missing_preserves_dat_and_folder_platform_assignments() {
+        use crate::synthetic_media;
+        let root = temp_dir("missing-independent-platform-evidence");
+        let source = root.join("source");
+        fs::create_dir_all(source.join("amiga600")).unwrap();
+        let dat_path = source.join("dat.adf");
+        let folder_path = source.join("amiga600").join("game.zip");
+        fs::write(&dat_path, synthetic_media::amiga_adf(0, b"TEST")).unwrap();
+        fs::write(&folder_path, b"synthetic archive").unwrap();
+        let config = config_for(&source, &root.join("mount"));
+        let mut database = Database::open_or_create(root.join("library.sqlite3")).unwrap();
+        scan_and_persist(&mut database, &config, "initial").unwrap();
+        let rows = database.load_archives().unwrap();
+        let dat_id = rows
+            .iter()
+            .find(|row| row.absolute_path == dat_path)
+            .unwrap()
+            .id;
+        let folder_id = rows
+            .iter()
+            .find(|row| row.absolute_path == folder_path)
+            .unwrap()
+            .id;
+        assert_eq!(
+            current_assignment(&database, folder_id),
+            Some(("Amiga".into(), "folder_alias".into()))
+        );
+        database.retire_header_assignment(dat_id).unwrap();
+        database
+            .assign_platform(dat_id, Some("Amiga"), VERIFIED_DAT_PLATFORM_SOURCE)
+            .unwrap();
+        fs::remove_file(&dat_path).unwrap();
+        fs::remove_file(&folder_path).unwrap();
+        scan_and_persist(&mut database, &config, "missing").unwrap();
+        assert_eq!(
+            current_assignment(&database, dat_id),
+            Some(("Amiga".into(), VERIFIED_DAT_PLATFORM_SOURCE.into()))
+        );
+        assert_eq!(
+            current_assignment(&database, folder_id),
+            Some(("Amiga".into(), "folder_alias".into()))
+        );
+        let _ = fs::remove_dir_all(&root);
     }
 
     #[test]
