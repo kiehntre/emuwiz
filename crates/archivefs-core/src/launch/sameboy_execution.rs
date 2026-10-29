@@ -35,9 +35,10 @@
 //!   long-running, user-facing process the caller owns.
 
 use std::fs;
+use std::io::Read;
 use std::path::{Path, PathBuf};
 
-use crate::gb_header_evidence::parse_gb_header;
+use crate::gb_header_evidence::{GB_HEADER_BYTES, parse_gb_header};
 use crate::launch::process_spawn::{
     self, CapturedFileIdentity, PreparedProcessCommand, ProcessExitReport, WatchedProcess,
 };
@@ -174,12 +175,35 @@ pub fn preflight_sameboy_launch(
     let content_identity = inspect_and_capture_content_identity(content_path)?;
 
     // --- 4: fresh header read + parse ---
-    let header_bytes = fs::read(content_path).map_err(|io_error| {
+    let handle =
+        process_spawn::open_regular_file_nonblocking(content_path).map_err(|io_error| {
+            preflight_error(
+                SameBoyLaunchPreflightErrorKind::ContentNotFound,
+                format!("{}: {io_error}", content_path.display()),
+            )
+        })?;
+    if CapturedFileIdentity::capture(&handle.metadata().map_err(|error| {
         preflight_error(
             SameBoyLaunchPreflightErrorKind::ContentNotFound,
-            format!("{}: {io_error}", content_path.display()),
+            error.to_string(),
         )
-    })?;
+    })?) != content_identity
+    {
+        return Err(preflight_error(
+            SameBoyLaunchPreflightErrorKind::ContentChangedBeforeSpawn,
+            "content changed before header inspection",
+        ));
+    }
+    let mut header_bytes = Vec::new();
+    handle
+        .take(GB_HEADER_BYTES as u64)
+        .read_to_end(&mut header_bytes)
+        .map_err(|io_error| {
+            preflight_error(
+                SameBoyLaunchPreflightErrorKind::ContentNotFound,
+                format!("{}: {io_error}", content_path.display()),
+            )
+        })?;
     let rom_header = parse_gb_header(&header_bytes);
 
     // --- 5-6: fresh profile discovery, find the exact requested profile ---
@@ -348,6 +372,10 @@ impl LaunchedSameBoyProcess {
 
     pub fn is_running(&self) -> bool {
         self.watched.is_running()
+    }
+
+    pub fn exit_report(&self) -> Option<&ProcessExitReport> {
+        self.watched.exit_report()
     }
 }
 
