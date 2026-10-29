@@ -777,13 +777,7 @@ fn format_specific_evidence(
         "md" | "gen" | "68k" | "32x" => mega_drive_family_evidence(path, trusted, problems),
         "sms" | "gg" => tmr_sega_evidence(path, trusted, problems),
         "adf" => {
-            // The Amiga inspector opens by path (it may follow symlinks on
-            // purpose for launch); at scan time apply the same refusal set
-            // every other signature read uses before handing it the path.
-            if crate::safe_read::open_bounded_read(path, trusted).is_err() {
-                return Vec::new();
-            }
-            let inspection = match crate::amiga_disk::inspect_amiga_floppy(path) {
+            let inspection = match crate::amiga_disk::inspect_amiga_floppy_in_roots(path, trusted) {
                 Ok(inspection) => inspection,
                 Err(crate::amiga_disk::AmigaFloppyError::Container(
                     crate::amiga_disk::DiskError::Io(error),
@@ -793,17 +787,11 @@ fn format_specific_evidence(
                 }
                 Err(_) => return Vec::new(),
             };
-            let Some(filesystem) = inspection.filesystem() else {
-                return Vec::new();
-            };
             vec![DetectionEvidence {
                 source: DetectionSource::Signature,
-                conclusive: true,
+                conclusive: inspection.filesystem().is_some(),
                 platform: "Amiga",
-                detail: format!(
-                    "AmigaDOS boot block and root block validate (DOS\\{} {:?})",
-                    filesystem.dos_type, filesystem.family
-                ),
+                detail: inspection.description(),
             }]
         }
         "z80" | "sna" | "szx" => {
@@ -1325,57 +1313,6 @@ fn structural_format_evidence(
         return Vec::new();
     }
 
-    if let Some(extension) = path.extension().and_then(|value| value.to_str()) {
-        if matches!(
-            extension.to_ascii_lowercase().as_str(),
-            "z80" | "sna" | "szx"
-        ) && let Ok(mut file) = crate::safe_read::open_bounded_read(path, trusted)
-            && file.len() <= crate::zx_spectrum_snapshot::MAX_SNAPSHOT_BYTES
-            && let Some(bytes) = file.read_exact_at(
-                0,
-                file.len() as usize,
-                crate::zx_spectrum_snapshot::MAX_SNAPSHOT_BYTES as usize,
-            )
-        {
-            let parsed = match extension.to_ascii_lowercase().as_str() {
-                "z80" => crate::zx_spectrum_snapshot::parse_z80_snapshot(&bytes),
-                "sna" => crate::zx_spectrum_snapshot::parse_sna_snapshot(&bytes),
-                _ => crate::zx_spectrum_snapshot::parse_szx_snapshot(&bytes),
-            };
-            if let Ok(facts) = parsed {
-                if facts.format == crate::zx_spectrum_snapshot::SnapshotFormat::Z80V1
-                    && facts.compressed == Some(true)
-                    && !valid_z80_v1_compressed_ram(&bytes)
-                {
-                    return Vec::new();
-                }
-                return vec![DetectionEvidence {
-                    source: DetectionSource::Signature,
-                    conclusive: true,
-                    platform: "ZX Spectrum",
-                    detail: format!(
-                        "{} snapshot structure validated; game identity was not checked",
-                        facts.format.label()
-                    ),
-                }];
-            }
-        }
-    }
-
-    if path
-        .extension()
-        .and_then(|value| value.to_str())
-        .is_some_and(|value| value.eq_ignore_ascii_case("adf"))
-        && let Ok(inspection) = crate::amiga_disk::inspect_amiga_floppy_in_roots(path, trusted)
-    {
-        return vec![DetectionEvidence {
-            source: DetectionSource::Signature,
-            conclusive: inspection.filesystem().is_some(),
-            platform: "Amiga",
-            detail: inspection.description(),
-        }];
-    }
-
     use crate::disk_format::{DiskFormatContext, inspect_disk_format};
 
     if path
@@ -1486,41 +1423,4 @@ fn structural_format_evidence(
         platform,
         detail,
     }]
-}
-
-/// Count the expanded length without allocating or interpreting machine RAM.
-/// The snapshot parser validates the envelope; platform detection additionally
-/// requires a compressed v1 stream to account for all 48 KiB of RAM.
-fn valid_z80_v1_compressed_ram(bytes: &[u8]) -> bool {
-    const RAM_BYTES: usize = 49_152;
-    const HEADER_BYTES: usize = 30;
-    const TAIL_BYTES: usize = 4;
-    let Some(end) = bytes.len().checked_sub(TAIL_BYTES) else {
-        return false;
-    };
-    if end < HEADER_BYTES {
-        return false;
-    }
-    let mut offset = HEADER_BYTES;
-    let mut expanded = 0usize;
-    while offset < end {
-        let count = if bytes.get(offset..offset + 2) == Some(&[0xed, 0xed]) {
-            let Some(run) = bytes.get(offset + 2..offset + 4) else {
-                return false;
-            };
-            offset += 4;
-            usize::from(run[0])
-        } else {
-            offset += 1;
-            1
-        };
-        if count == 0 {
-            return false;
-        }
-        expanded += count;
-        if expanded > RAM_BYTES {
-            return false;
-        }
-    }
-    expanded == RAM_BYTES
 }

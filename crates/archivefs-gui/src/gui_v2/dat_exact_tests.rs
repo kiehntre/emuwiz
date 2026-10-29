@@ -252,7 +252,7 @@ fn only_a_single_exact_match_verifies_a_game() {
         ("probable.gbc", "Probable match"),
         // The fixture's files have no platform, so "not in this catalogue"
         // is not evidence about them (`negative_dat_result_applies`).
-        ("unlisted.gbc", "Not checked"),
+        ("unlisted.gbc", "Unknown platform"),
     ] {
         let game = library
             .games
@@ -306,7 +306,7 @@ fn a_same_platform_no_match_is_shown_and_another_platforms_is_not() {
     );
     assert_eq!(
         label(&load_library(&fixture.db).unwrap()),
-        Some((false, "Not checked"))
+        Some((false, "Platform recognised · Game not yet identified"))
     );
 }
 
@@ -339,7 +339,10 @@ fn corrupt_zip_is_not_checked_in_library_and_has_no_definitive_attention_negativ
         .iter()
         .find(|game| game.title == "broken.zip")
         .unwrap();
-    assert_eq!(broken.identity_summary(), "Not checked");
+    assert_eq!(
+        broken.identity_summary(),
+        "Platform recognised · Game not yet identified"
+    );
     assert!(!broken.identified);
     assert!(broken.dat_exact_label().is_none());
     let unlisted = library
@@ -386,12 +389,12 @@ fn a_stale_exact_row_does_not_verify_a_game() {
         .unwrap();
     let library = load_library(&fixture.db).unwrap();
     assert!(library.games.iter().all(|game| !game.identified));
-    assert!(
-        library
-            .games
-            .iter()
-            .all(|game| game.identity_summary() == "Not checked")
-    );
+    assert!(library.games.iter().all(|game| game.identity_summary()
+        == if game.platform == super::library::UNKNOWN_PLATFORM {
+            "Unknown platform"
+        } else {
+            "Platform recognised · Game not yet identified"
+        }));
 }
 
 #[test]

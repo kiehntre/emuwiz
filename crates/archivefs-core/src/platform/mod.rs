@@ -1502,7 +1502,6 @@ pub const PLATFORMS: &[Platform] = &[
             "sega32xgenesis",
             "mega32x",
             "genesis32x",
-            "sega32",
         ],
         filename_aliases: &[],
         strong_extensions: &["32x"],
