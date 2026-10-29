@@ -30,6 +30,18 @@ pub struct StagingItem {
     pub identity: Option<ObjectIdentity>,
 }
 
+fn unowned_reason(path: &Path) -> &'static str {
+    if path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .is_some_and(|name| name.starts_with("mame-") && name.ends_with(".zip.staged"))
+    {
+        "No recovery journal owns this staged file. It may be an interrupted write or a foreign file; it cannot be published, adopted, undone or removed automatically. It is retained in place. Preview again to make a fresh, separately approved attempt."
+    } else {
+        "Unknown or manually added file; retained without ownership proof"
+    }
+}
+
 /// Locks are advisory application coordination; identity is separate evidence.
 /// Existing-only opens ensure that inventory never creates directories/files.
 pub struct StagingLock {
@@ -86,10 +98,15 @@ pub fn inventory(staging: &Path, journals: &Path) -> Result<Vec<StagingItem>, St
         dir.lock()?;
         let mut items = Vec::new();
         for e in std::fs::read_dir(&dir.path).map_err(|e| e.to_string())? {
+            let path = e.map_err(|e| e.to_string())?.path();
             items.push(StagingItem {
-                path: e.map_err(|e| e.to_string())?.path(), transaction_id: None,
-                transaction_state: None, identity: None, cleanup_eligible: false, finalise_eligible: false,
-                retention_reason: "No recovery journal directory; unpublished/unknown files retained without ownership proof".into(),
+                retention_reason: unowned_reason(&path).into(),
+                path,
+                transaction_id: None,
+                transaction_state: None,
+                identity: None,
+                cleanup_eligible: false,
+                finalise_eligible: false,
             });
         }
         dir.require_binding()?;
@@ -223,10 +240,10 @@ fn classify(
 ) -> Result<StagingItem, String> {
     let owners: Vec<_> = txs.iter().filter(|t| references(t, &path)).collect();
     let mut item = StagingItem {
+        retention_reason: unowned_reason(&path).into(),
         path,
         transaction_id: None,
         transaction_state: None,
-        retention_reason: "Unknown or manually added file; never cleaned".into(),
         cleanup_eligible: false,
         finalise_eligible: false,
         identity: None,

@@ -396,6 +396,8 @@ pub(super) enum MameRefusal {
     VerificationFailed(String),
     PackedMemberUnsupported(String),
     NoEvidence(String),
+    /// A stage exists without a publication journal after an interrupted write.
+    StagingInterrupted(String),
     /// An earlier MAME transaction or staging leftover needs Recovery first.
     RecoveryRequired(String),
     /// Another MAME publication holds the journal lock.
@@ -418,6 +420,7 @@ impl MameRefusal {
                 "Some required members cannot be read from this archive layout"
             }
             Self::NoEvidence(_) => "EmuWiz has no verified evidence for this set yet",
+            Self::StagingInterrupted(_) => "MAME staging was interrupted",
             Self::RecoveryRequired(_) => "An earlier MAME operation needs Recovery first",
             Self::Busy(_) => "Another MAME publication is running",
             Self::Preflight(_) => "The safety check refused this publication",
@@ -436,6 +439,7 @@ impl MameRefusal {
             | Self::VerificationFailed(d)
             | Self::PackedMemberUnsupported(d)
             | Self::NoEvidence(d)
+            | Self::StagingInterrupted(d)
             | Self::RecoveryRequired(d)
             | Self::Busy(d)
             | Self::Preflight(d)
@@ -462,7 +466,10 @@ impl MameRefusal {
                 "Nothing was published. Resolve the blockers shown in the preview first."
             }
             Self::RecoveryRequired(_) => {
-                "Nothing was published. Review the transaction in History and Recovery before trying again; do not move staged files by hand."
+                "Nothing was published by this attempt. Review History and Recovery before trying again; do not move staged files by hand."
+            }
+            Self::StagingInterrupted(_) => {
+                "Nothing was published. Inspect the retained file in Recovery, then preview again for a fresh attempt. The old staged file will not be reused or removed."
             }
             Self::Busy(_) => "Nothing was published. Wait for it to finish, then try again.",
             Self::VerificationFailed(_) => {
@@ -491,6 +498,8 @@ impl MameRefusal {
             Self::DestinationChanged(text)
         } else if lower.contains("another mame publication is in progress") {
             Self::Busy(text)
+        } else if lower.contains("may remain after interruption") {
+            Self::StagingInterrupted(text)
         } else if lower.contains("requires recovery before another publication")
             || lower.contains("leftover")
             || lower.contains("malformed recovery journal")

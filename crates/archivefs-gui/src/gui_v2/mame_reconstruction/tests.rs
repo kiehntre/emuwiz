@@ -1358,6 +1358,10 @@ fn backend_refusals_keep_their_meaning() {
             "RecoveryRequired",
         ),
         (
+            "write interrupted; staged file /m/.emuwiz-mame-staging/mame-1.zip.staged may remain after interruption; inspect Recovery before retrying; nothing was published",
+            "StagingInterrupted",
+        ),
+        (
             "transaction mame-1 is Applying and requires Recovery before another publication",
             "RecoveryRequired",
         ),

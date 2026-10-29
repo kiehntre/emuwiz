@@ -605,7 +605,7 @@ fn staging_repair_in_flight_entry_cannot_hide_in_a_settled_journal() {
 }
 
 #[test]
-fn staging_repair_unjournalled_interruption_refuses_without_destroying_stage() {
+fn staging_repair_unjournalled_interruption_can_retry_without_destroying_stage() {
     let lab = Lab::new();
     let plan = repair_plan(&lab);
     let hook = repair_hook(|event, _| {
@@ -624,13 +624,56 @@ fn staging_repair_unjournalled_interruption_refuses_without_destroying_stage() {
         .unwrap()
         .path();
     let before = std::fs::read(&stage).unwrap();
+    let pending = super::staging_lifecycle::inventory(&lab.stage_root(), &lab.journal()).unwrap();
+    assert_eq!(pending.len(), 1);
+    assert!(pending[0].retention_reason.contains("Preview again"));
+    assert!(!pending[0].cleanup_eligible);
+    let outcome =
+        apply_staged_reconstruction_output(&plan, &lab.stage_root(), &lab.journal()).unwrap();
+    assert_eq!(
+        outcome.transaction.state,
+        crate::dat::rename_apply::model::TransactionState::Applied
+    );
+    assert_ne!(outcome.transaction.entries[0].source_path, stage);
+    assert_eq!(std::fs::read(&stage).unwrap(), before);
+    verify_staged_output(&plan, &plan.destination).unwrap();
+    let items = super::staging_lifecycle::inventory(&lab.stage_root(), &lab.journal()).unwrap();
+    let orphan = items.iter().find(|item| item.path == stage).unwrap();
+    assert!(orphan.retention_reason.contains("No recovery journal owns"));
+    assert!(!orphan.cleanup_eligible);
+    assert_eq!(
+        crate::dat::rename_apply::journal::list_journals(&lab.journal())
+            .0
+            .len(),
+        1
+    );
+}
+
+#[test]
+fn staging_repair_changed_journal_source_still_refuses_retry() {
+    use crate::dat::rename_apply::{model::TransactionState, rollback};
+    let lab = Lab::new();
+    let plan = repair_plan(&lab);
+    let mut first = apply_staged_reconstruction_output(&plan, &lab.stage_root(), &lab.journal())
+        .unwrap()
+        .transaction;
+    rollback::rollback_transaction_confined(
+        &mut first,
+        &lab.journal(),
+        &AtomicBool::new(false),
+        &TrustedRoots::from_paths([lab.root()]),
+    )
+    .unwrap();
+    assert_eq!(first.state, TransactionState::RolledBack);
+    let staged = &first.entries[0].source_path;
+    let retained = lab.root().join("retained-stage");
+    std::fs::rename(staged, &retained).unwrap();
+    std::fs::write(staged, b"foreign replacement").unwrap();
     let error =
         apply_staged_reconstruction_output(&plan, &lab.stage_root(), &lab.journal()).unwrap_err();
-    assert!(
-        error.contains("unrecorded") && error.contains("Recovery"),
-        "{error}"
-    );
-    assert_eq!(std::fs::read(stage).unwrap(), before);
+    assert!(error.contains("changed journal ownership"), "{error}");
+    assert_eq!(std::fs::read(staged).unwrap(), b"foreign replacement");
+    assert!(retained.exists());
     assert!(!plan.destination.exists());
 }
 
