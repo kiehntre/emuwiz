@@ -59,6 +59,67 @@ pub(super) struct BrowsePlayState {
 }
 
 #[cfg(test)]
+mod classic_identity_status_tests {
+    use super::{readiness_sentence, status_text};
+    use crate::gui_v2::library::Game;
+    use archivefs_core::PersistedArchive;
+    use archivefs_core::game_identity::*;
+
+    #[test]
+    fn conflicting_game_identity_is_not_hidden_by_recognised_platform() {
+        let path = std::path::PathBuf::from("/fixture/conflict.zip");
+        let mut archive = PersistedArchive {
+            id: 1,
+            source_folder_id: 1,
+            relative_path: "conflict.zip".into(),
+            absolute_path: path.clone(),
+            archive_kind: "zip".into(),
+            display_name: "Conflict".into(),
+            normalized_name: "conflict".into(),
+            size_bytes: Some(1),
+            modified_time_unix_seconds: Some(1),
+            platform: Some("PSX".into()),
+            platform_source: Some("folder_alias".into()),
+            last_known_health: "pending".into(),
+            last_seen_at: "fixture".into(),
+            last_verified_missing_at: None,
+            identity_report: None,
+        };
+        archive.identity_report = Some(GameIdentityReport {
+            archive_path: path.clone(),
+            platform: IdentityPlatform::PlayStation,
+            format: IdentityImageFormat::Iso,
+            evidence: ["SCUS-94163", "SLUS-00001"]
+                .into_iter()
+                .map(|value| IdentityEvidence {
+                    kind: IdentityKind::Ps1Serial,
+                    status: IdentityStatus::Verified,
+                    value: Some(value.into()),
+                    confidence: IdentityConfidence::StructuredMetadata,
+                    provenance: IdentityProvenance {
+                        archive_path: path.clone(),
+                        member_path: None,
+                        member_index: None,
+                        method: "fixture".into(),
+                    },
+                    diagnostic: "fixture".into(),
+                })
+                .collect(),
+            warnings: vec![],
+            bytes_read: 1,
+            archive_members_inspected: 0,
+            metadata_paths_inspected: 1,
+            nested_container_depth: 0,
+            complete: true,
+        });
+        let game = Game::from_archive(archive);
+        assert_eq!(game.identity_summary(), "Mismatch");
+        assert_eq!(status_text(&game).0, "Mismatch");
+        assert!(readiness_sentence(&game).contains("conflicts"));
+    }
+}
+
+#[cfg(test)]
 impl BrowsePlayState {
     pub(super) fn reset_scroll_pending(&self) -> bool {
         self.reset_scroll
@@ -122,11 +183,6 @@ fn thousands(value: usize) -> String {
 fn status_text(game: &Game) -> (&'static str, Color32) {
     if game.attention {
         ("Needs attention", ATTENTION_TEXT)
-    } else if !game.identified && game.platform != super::library::UNKNOWN_PLATFORM {
-        (
-            "Platform recognised · Game not yet identified",
-            theme::SECONDARY_TEXT,
-        )
     } else {
         match game.identity_summary() {
             "Verified" => ("Verified", theme::SUCCESS),
@@ -139,6 +195,8 @@ fn status_text(game: &Game) -> (&'static str, Color32) {
 fn readiness_sentence(game: &Game) -> &'static str {
     if game.attention {
         "Something needs attention before this can start. Game Details shows what."
+    } else if game.identity_summary() == "Mismatch" {
+        "Game identity evidence conflicts. Review it before play."
     } else if game.identified {
         "Play checks that everything is ready first. Nothing starts until you confirm."
     } else if game.platform != super::library::UNKNOWN_PLATFORM {

@@ -13,7 +13,10 @@ use std::path::{Path, PathBuf};
 fn validated_spectrum_tap_recovers_platform_without_a_dat_match() {
     let tree = TempTree::new("spectrum-tap-recovery");
     // One standard ZX data block: flag, payload, XOR checksum.
-    let path = tree.file("Games/title.tap", &[4, 0, 0xff, 0x42, 0x10, 0xad]);
+    let mut tape = vec![16, 0, 0xff];
+    tape.extend([0; 14]);
+    tape.push(0xff);
+    let path = tree.file("Games/title.tap", &tape);
     let report =
         detect_platform_report(&DetectionRequest::new(&path, tree.path()).inspecting_content());
     assert_eq!(report.platform, Some("ZX Spectrum"));
@@ -26,11 +29,21 @@ fn validated_spectrum_tap_recovers_platform_without_a_dat_match() {
         crate::PlatformProvenance::HeaderIdentity
     );
 
-    let misleading = tree.file("Games/bad.tap", &[4, 0, 0xff, 0x42, 0x10, 0x00]);
+    *tape.last_mut().unwrap() = 0;
+    let misleading = tree.file("Games/bad.tap", &tape);
     let bad = detect_platform_report(
         &DetectionRequest::new(&misleading, tree.path()).inspecting_content(),
     );
     assert_ne!(bad.platform, Some("ZX Spectrum"));
+
+    let other_only = tree.file("Games/other.tap", &[2, 0, 0, 0]);
+    let other = detect_platform_report(
+        &DetectionRequest::new(&other_only, tree.path()).inspecting_content(),
+    );
+    assert_ne!(other.platform, Some("ZX Spectrum"));
+    assert!(!other.evidence.iter().any(|evidence| {
+        evidence.platform == "ZX Spectrum" && evidence.source == DetectionSource::Signature
+    }));
 }
 
 #[test]
@@ -92,6 +105,29 @@ fn spectrum_snapshot_requires_valid_structure_and_shared_tzx_stays_ambiguous() {
     let shared =
         detect_platform_report(&DetectionRequest::new(&tzx, tree.path()).inspecting_content());
     assert_eq!(shared.confidence, DetectionConfidence::Ambiguous);
+
+    let mut tiny_z80 = vec![0u8; 30];
+    tiny_z80[6] = 1; // v1 PC
+    tiny_z80[12] = 0x20; // compressed RAM
+    tiny_z80.extend([0, 0xed, 0xed, 0]);
+    let tiny = tree.file("Games/tiny.z80", &tiny_z80);
+    let tiny_report =
+        detect_platform_report(&DetectionRequest::new(&tiny, tree.path()).inspecting_content());
+    assert!(!tiny_report.evidence.iter().any(|evidence| {
+        evidence.platform == "ZX Spectrum" && evidence.source == DetectionSource::Signature
+    }));
+
+    let mut compressed = tiny_z80[..30].to_vec();
+    for _ in 0..192 {
+        compressed.extend([0xed, 0xed, 255, 0]);
+    }
+    compressed.extend([0xed, 0xed, 192, 0]);
+    compressed.extend([0, 0xed, 0xed, 0]);
+    let complete = tree.file("Games/complete.z80", &compressed);
+    let complete_report =
+        detect_platform_report(&DetectionRequest::new(&complete, tree.path()).inspecting_content());
+    assert_eq!(complete_report.confidence, DetectionConfidence::Confirmed);
+    assert_eq!(complete_report.platform, Some("ZX Spectrum"));
 }
 
 const ROOT: &str = "/roms";
