@@ -167,10 +167,14 @@ impl Game {
             "Needs attention"
         } else if self.inspection_incomplete && self.dat_exact.is_none() {
             "Rescan to finish checking"
+        } else if self.identity_summary() == "Mismatch" {
+            "Identity conflict · review evidence"
         } else if self.identified {
             "Identified · not yet checked for play"
+        } else if self.platform != UNKNOWN_PLATFORM {
+            self.identity_summary()
         } else {
-            "Not checked yet"
+            "Unknown platform · More evidence needed"
         }
     }
 
@@ -477,8 +481,13 @@ mod tests {
             last_verified_missing_at: None,
             identity_report: None,
         };
+        let game = Game::from_archive(archive);
         assert_eq!(
-            Game::from_archive(archive).identity_summary(),
+            game.identity_summary(),
+            "Platform recognised · Game not yet identified"
+        );
+        assert_eq!(
+            game.status(),
             "Platform recognised · Game not yet identified"
         );
     }

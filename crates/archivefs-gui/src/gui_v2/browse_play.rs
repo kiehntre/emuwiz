@@ -149,8 +149,14 @@ mod classic_identity_status_tests {
         let mut game = Game::from_archive(archive);
         game.dat_state = Some(archivefs_core::LibraryDatState::NoMatch);
         assert_eq!(game.identity_summary(), "Mismatch");
+        assert_eq!(game.status(), "Identity conflict · review evidence");
         assert_eq!(status_text(&game, true).0, "Mismatch");
         assert!(readiness_sentence(&game).contains("conflicts"));
+        let mut exact = game.clone();
+        exact.dat_state = None;
+        exact.mark_dat_exact(Some("DAT"));
+        assert_eq!(exact.identity_summary(), "Mismatch");
+        assert_eq!(exact.status(), "Identity conflict · review evidence");
     }
 }
 
