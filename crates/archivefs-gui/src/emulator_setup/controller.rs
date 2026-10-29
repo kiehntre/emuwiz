@@ -719,6 +719,9 @@ impl ArchiveFsApp {
         enum CoreFolderAction {
             Rescan,
             ChooseFolder(PathBuf),
+            ApplyPreview,
+            CancelPreview,
+            PreviewReset,
             Reset,
         }
         let mut pending: Option<CoreFolderAction> = None;
@@ -780,7 +783,7 @@ impl ArchiveFsApp {
                         .add_enabled(!scanning, egui::Button::new("Reset to automatic"))
                         .clicked()
                 {
-                    pending = Some(CoreFolderAction::Reset);
+                    pending = Some(CoreFolderAction::PreviewReset);
                 }
             });
             if rejected_pick.is_some() {
@@ -789,6 +792,45 @@ impl ArchiveFsApp {
                     "Folder not usable",
                     "This folder could not be used for RetroArch game support. Choose another \
                      folder or reset to automatic detection.",
+                    widgets::StatusTone::Blocked,
+                );
+            }
+            if let Some(folder) = &self.emulator_readiness.retroarch_core_folder_preview {
+                ui.separator();
+                ui.strong("Review RetroArch setup change");
+                ui.label(format!("Selected core folder: {}", folder.display()));
+                ui.label("EmuWiz will create only its own core-folder choice file. RetroArch settings, cores, and existing user overrides are left untouched. A fresh scan will check installed cores after approval; a matching game's launch readiness is checked separately.");
+                if mode.is_custom() {
+                    ui.colored_label(ui.visuals().warn_fg_color, "An EmuWiz core-folder choice already exists. Reset it explicitly before choosing a replacement.");
+                } else {
+                    ui.horizontal(|ui| {
+                        if ui.button("Apply this setup change").clicked() {
+                            pending = Some(CoreFolderAction::ApplyPreview);
+                        }
+                        if ui.button("Cancel").clicked() {
+                            pending = Some(CoreFolderAction::CancelPreview);
+                        }
+                    });
+                }
+            }
+            if self.emulator_readiness.retroarch_core_folder_reset_preview {
+                ui.separator();
+                ui.strong("Review reset to automatic detection");
+                ui.label("EmuWiz will remove only its own core-folder choice file and scan RetroArch's configured core folder again. RetroArch settings and cores will not be changed.");
+                ui.horizontal(|ui| {
+                    if ui.button("Confirm reset").clicked() {
+                        pending = Some(CoreFolderAction::Reset);
+                    }
+                    if ui.button("Cancel reset").clicked() {
+                        pending = Some(CoreFolderAction::CancelPreview);
+                    }
+                });
+            }
+            if let Some(error) = &self.emulator_readiness.retroarch_core_folder_save_error {
+                widgets::banner(
+                    ui,
+                    "Setup was not saved",
+                    error,
                     widgets::StatusTone::Blocked,
                 );
             }
@@ -821,6 +863,7 @@ impl ArchiveFsApp {
         match pending {
             Some(CoreFolderAction::Rescan) => {
                 self.emulator_readiness.retroarch_core_folder_rejected_pick = None;
+                self.emulator_readiness.retroarch_core_folder_preview = None;
                 if !scanning {
                     self.start_retroarch_profile_scan(context.clone());
                 }
@@ -828,10 +871,38 @@ impl ArchiveFsApp {
             Some(CoreFolderAction::ChooseFolder(folder)) => {
                 self.apply_picked_retroarch_core_folder(folder, context.clone());
             }
+            Some(CoreFolderAction::ApplyPreview) => {
+                if let Some(folder) = self.emulator_readiness.retroarch_core_folder_preview.take() {
+                    match self.set_retroarch_core_directory_override(folder.clone()) {
+                        Ok(()) => {
+                            self.emulator_readiness.retroarch_core_folder_save_error = None;
+                            self.start_retroarch_profile_scan(context.clone());
+                        }
+                        Err(error) => {
+                            self.emulator_readiness.retroarch_core_folder_preview = Some(folder);
+                            self.emulator_readiness.retroarch_core_folder_save_error = Some(error);
+                        }
+                    }
+                }
+            }
+            Some(CoreFolderAction::CancelPreview) => {
+                self.emulator_readiness.retroarch_core_folder_preview = None;
+                self.emulator_readiness.retroarch_core_folder_reset_preview = false;
+            }
+            Some(CoreFolderAction::PreviewReset) => {
+                self.emulator_readiness.retroarch_core_folder_preview = None;
+                self.emulator_readiness.retroarch_core_folder_reset_preview = true;
+            }
             Some(CoreFolderAction::Reset) => {
                 self.emulator_readiness.retroarch_core_folder_rejected_pick = None;
-                self.clear_retroarch_core_directory_override();
-                self.start_retroarch_profile_scan(context.clone());
+                self.emulator_readiness.retroarch_core_folder_preview = None;
+                self.emulator_readiness.retroarch_core_folder_reset_preview = false;
+                match self.clear_retroarch_core_directory_override() {
+                    Ok(()) => self.start_retroarch_profile_scan(context.clone()),
+                    Err(error) => {
+                        self.emulator_readiness.retroarch_core_folder_save_error = Some(error)
+                    }
+                }
             }
             None => {}
         }
@@ -2883,48 +2954,58 @@ impl ArchiveFsApp {
         });
     }
 
-    /// Persist an explicit EmuWiz override for the RetroArch core directory
-    /// and keep the in-memory copy in sync. This does not itself trigger a
+    /// Create an explicit EmuWiz override for the RetroArch core directory
+    /// and keep the in-memory copy in sync after the write succeeds. This does not itself trigger a
     /// rescan (matching the `save_gui_mode` convention); callers that need
     /// fresh core state run `start_retroarch_profile_scan` next - the
     /// Emulator Setup repair flow does exactly that.
-    pub(crate) fn set_retroarch_core_directory_override(&mut self, path: PathBuf) {
+    pub(crate) fn set_retroarch_core_directory_override(
+        &mut self,
+        path: PathBuf,
+    ) -> Result<(), String> {
+        save_retroarch_core_directory_override(Some(&path))?;
         self.emulator_readiness.retroarch_core_directory_override = Some(path);
-        save_retroarch_core_directory_override(
-            self.emulator_readiness
-                .retroarch_core_directory_override
-                .as_deref(),
-        );
+        Ok(())
     }
 
     /// Drop any persisted RetroArch core-directory override, returning
     /// discovery to fully automatic `retroarch.cfg` resolution. Does not
     /// rescan on its own; the "Reset to automatic" control rescans after.
-    pub(crate) fn clear_retroarch_core_directory_override(&mut self) {
+    pub(crate) fn clear_retroarch_core_directory_override(&mut self) -> Result<(), String> {
+        let path = retroarch_core_directory_override_path()
+            .ok_or("Could not resolve the EmuWiz configuration directory")?;
+        let expected = self
+            .emulator_readiness
+            .retroarch_core_directory_override
+            .as_ref()
+            .ok_or("No saved EmuWiz core-folder choice is active")?;
+        if std::fs::read(&path).map_err(|e| e.to_string())?
+            != expected.as_os_str().as_encoded_bytes()
+        {
+            return Err("The saved core-folder choice changed after preview. Check again before resetting it.".into());
+        }
+        save_retroarch_core_directory_override(None)?;
         self.emulator_readiness.retroarch_core_directory_override = None;
-        save_retroarch_core_directory_override(None);
+        Ok(())
     }
 
     /// Emulator Setup "Choose core folder" outcome. A picked directory is
-    /// validated (exists + is a directory) *before* it is persisted; on
-    /// success it is saved through the shared helper and a fresh RetroArch
-    /// profile scan is started so `matching_retroarch_cores` ->
-    /// `build_retroarch_candidates` -> `build_launch_plan` -> gamer
-    /// readiness all update naturally. An unusable pick is reported and
-    /// never stored, so the active core folder is unchanged.
+    /// validated (exists + is a directory) before it is offered for review.
+    /// Approval in the card persists it and starts the normal scan lane.
     pub(crate) fn apply_picked_retroarch_core_folder(
         &mut self,
         folder: PathBuf,
-        context: egui::Context,
+        _context: egui::Context,
     ) {
         match retroarch_core_setup::classify_picked_core_folder(&folder) {
             retroarch_core_setup::PickedCoreFolder::Directory => {
                 self.emulator_readiness.retroarch_core_folder_rejected_pick = None;
-                self.set_retroarch_core_directory_override(folder);
-                self.start_retroarch_profile_scan(context);
+                self.emulator_readiness.retroarch_core_folder_save_error = None;
+                self.emulator_readiness.retroarch_core_folder_preview = Some(folder);
             }
             retroarch_core_setup::PickedCoreFolder::Unusable => {
                 self.emulator_readiness.retroarch_core_folder_rejected_pick = Some(folder);
+                self.emulator_readiness.retroarch_core_folder_preview = None;
             }
         }
     }
@@ -3223,27 +3304,62 @@ pub(crate) fn managed_appimage_explicit_executables(
         .collect()
 }
 
-/// Writes (or, for `None`, removes) the override at an explicit file path.
-/// Best-effort: a persistence failure never blocks the in-memory value
-/// from taking effect for the session, exactly like `save_gui_mode`.
-pub(crate) fn save_retroarch_core_directory_override_at(path: &Path, value: Option<&Path>) {
+/// Only creates EmuWiz's own sidecar, or explicitly removes that sidecar.
+/// Refuses existing files so an old choice, symlink or concurrent write is
+/// never replaced. The caller updates in-memory discovery only on success.
+pub(crate) fn save_retroarch_core_directory_override_at(
+    path: &Path,
+    value: Option<&Path>,
+) -> Result<(), String> {
+    let parent = path.parent().ok_or("No EmuWiz configuration directory")?;
     match value {
         Some(dir) => {
-            if let Some(parent) = path.parent() {
-                let _ = std::fs::create_dir_all(parent);
+            if !dir.is_absolute() || !std::fs::metadata(dir).is_ok_and(|meta| meta.is_dir()) {
+                return Err(
+                    "The chosen core folder is no longer available. Choose it again.".into(),
+                );
             }
-            let _ = std::fs::write(path, dir.to_string_lossy().as_ref());
+            std::fs::create_dir_all(parent).map_err(|e| e.to_string())?;
+            if !std::fs::symlink_metadata(parent)
+                .is_ok_and(|meta| meta.is_dir() && !meta.file_type().is_symlink())
+            {
+                return Err(
+                    "The EmuWiz configuration directory is not a regular directory.".into(),
+                );
+            }
+            use std::io::Write;
+            let mut file = tempfile::NamedTempFile::new_in(parent).map_err(|e| e.to_string())?;
+            file.write_all(dir.as_os_str().as_encoded_bytes())
+                .and_then(|_| file.as_file().sync_all())
+                .map_err(|e| format!("Could not save the core-folder choice: {e}"))?;
+            file.persist_noclobber(path).map_err(|e| {
+                format!(
+                    "The EmuWiz core-folder choice already exists or cannot be created: {}",
+                    e.error
+                )
+            })?;
         }
         None => {
-            let _ = std::fs::remove_file(path);
+            match std::fs::symlink_metadata(path) {
+                Ok(meta) if meta.is_file() && !meta.file_type().is_symlink() => {
+                    std::fs::remove_file(path).map_err(|e| e.to_string())?;
+                }
+                Ok(_) => return Err(
+                    "The EmuWiz core-folder choice is not a regular file; it was left untouched."
+                        .into(),
+                ),
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                Err(error) => return Err(error.to_string()),
+            }
         }
     }
+    Ok(())
 }
 
-pub(crate) fn save_retroarch_core_directory_override(value: Option<&Path>) {
-    if let Some(path) = retroarch_core_directory_override_path() {
-        save_retroarch_core_directory_override_at(&path, value);
-    }
+pub(crate) fn save_retroarch_core_directory_override(value: Option<&Path>) -> Result<(), String> {
+    let path = retroarch_core_directory_override_path()
+        .ok_or("Could not resolve the EmuWiz configuration directory")?;
+    save_retroarch_core_directory_override_at(&path, value)
 }
 
 /// The selected-evidence worker's diagnostic for a CUE disc whose files could

@@ -212,13 +212,13 @@ pub(crate) fn core_folder_readiness(
             let inventory = core_inventory(discovery);
             if inventory.usable_cores > 0 {
                 let sentence = if mode.is_custom() {
-                    "The selected game-support folder is ready to use.".to_string()
+                    "Installed core files were found in the selected folder. Choose a game to check its platform and launch readiness.".to_string()
                 } else {
-                    "RetroArch's game-support files are ready to use.".to_string()
+                    "Installed RetroArch core files were found. Choose a game to check its platform and launch readiness.".to_string()
                 };
                 CoreFolderReadiness {
                     kind: CoreFolderReadinessKind::Ready,
-                    badge_label: "Ready",
+                    badge_label: "Cores found",
                     badge_tone: StatusTone::Success,
                     headline: None,
                     sentence,
@@ -433,7 +433,7 @@ mod tests {
         assert_eq!(readiness.kind, CoreFolderReadinessKind::Ready);
         assert_eq!(
             readiness.sentence,
-            "The selected game-support folder is ready to use."
+            "Installed core files were found in the selected folder. Choose a game to check its platform and launch readiness."
         );
     }
 
@@ -594,8 +594,9 @@ pub(crate) fn a_core_directory_override_round_trips_through_save_and_load() {
     let path = dir
         .path()
         .join("nested/retroarch_core_directory_override.txt");
-    let chosen = PathBuf::from("/opt/libretro/cores");
-    save_retroarch_core_directory_override_at(&path, Some(chosen.as_path()));
+    let chosen = dir.path().join("cores");
+    std::fs::create_dir(&chosen).unwrap();
+    save_retroarch_core_directory_override_at(&path, Some(chosen.as_path())).unwrap();
     assert!(path.exists(), "save must create the file (and any parent)");
     assert_eq!(
         load_retroarch_core_directory_override_at(&path),
@@ -607,27 +608,50 @@ pub(crate) fn a_core_directory_override_round_trips_through_save_and_load() {
 pub(crate) fn clearing_a_core_directory_override_removes_the_file_and_next_load_is_none() {
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("retroarch_core_directory_override.txt");
-    save_retroarch_core_directory_override_at(
-        &path,
-        Some(PathBuf::from("/opt/libretro/cores").as_path()),
-    );
+    let chosen = dir.path().join("cores");
+    std::fs::create_dir(&chosen).unwrap();
+    save_retroarch_core_directory_override_at(&path, Some(&chosen)).unwrap();
     assert!(path.exists());
-    save_retroarch_core_directory_override_at(&path, None);
+    save_retroarch_core_directory_override_at(&path, None).unwrap();
     assert!(!path.exists(), "clearing must remove the file");
     assert_eq!(load_retroarch_core_directory_override_at(&path), None);
     // Clearing an already-absent file is a harmless no-op.
-    save_retroarch_core_directory_override_at(&path, None);
+    save_retroarch_core_directory_override_at(&path, None).unwrap();
     assert!(!path.exists());
 }
 
 #[test]
-pub(crate) fn a_persisted_core_directory_override_survives_a_second_save() {
+pub(crate) fn a_persisted_core_directory_override_is_never_replaced_by_a_second_save() {
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("retroarch_core_directory_override.txt");
-    save_retroarch_core_directory_override_at(&path, Some(Path::new("/first/cores")));
-    save_retroarch_core_directory_override_at(&path, Some(Path::new("/second/cores")));
+    let first = dir.path().join("first");
+    let second = dir.path().join("second");
+    std::fs::create_dir(&first).unwrap();
+    std::fs::create_dir(&second).unwrap();
+    save_retroarch_core_directory_override_at(&path, Some(&first)).unwrap();
+    assert!(save_retroarch_core_directory_override_at(&path, Some(&second)).is_err());
     assert_eq!(
         load_retroarch_core_directory_override_at(&path),
-        Some(PathBuf::from("/second/cores"))
+        Some(first)
+    );
+}
+
+#[test]
+pub(crate) fn core_directory_override_refuses_symlink_and_allows_safe_retry() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("retroarch_core_directory_override.txt");
+    let target = dir.path().join("custom.txt");
+    let core_folder = dir.path().join("cores");
+    std::fs::create_dir(&core_folder).unwrap();
+    std::fs::write(&target, "user choice").unwrap();
+    std::os::unix::fs::symlink(&target, &path).unwrap();
+    assert!(save_retroarch_core_directory_override_at(&path, Some(&core_folder)).is_err());
+    assert!(save_retroarch_core_directory_override_at(&path, None).is_err());
+    assert_eq!(std::fs::read_to_string(&target).unwrap(), "user choice");
+    std::fs::remove_file(&path).unwrap();
+    save_retroarch_core_directory_override_at(&path, Some(&core_folder)).unwrap();
+    assert_eq!(
+        load_retroarch_core_directory_override_at(&path),
+        Some(core_folder)
     );
 }
