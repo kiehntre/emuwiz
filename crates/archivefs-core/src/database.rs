@@ -3954,6 +3954,8 @@ pub const ROMM_PLATFORM_SOURCE: &str = "romm";
 pub const VERIFIED_DAT_PLATFORM_SOURCE: &str = "verified_dat";
 /// RomM and verified DAT independently established the same platform.
 pub const DAT_ROMM_AGREEMENT_SOURCE: &str = "verified_dat+romm";
+/// Bounded structural evidence from a member of an archive, never a game or DAT match.
+pub const ARCHIVE_MEMBER_PLATFORM_SOURCE: &str = "archive_member_structure";
 
 /// Relative strength of a `platform_assignments.source` value, used by
 /// [`Database::assign_platform`] to decide whether a new assignment may
@@ -3986,6 +3988,7 @@ fn provenance_priority(source: &str) -> u8 {
     match source {
         "folder_alias" => 0,
         CUSTOM_FOLDER_ALIAS_SOURCE => 2,
+        ARCHIVE_MEMBER_PLATFORM_SOURCE => 2,
         SOURCE_PLATFORM_ASSIGNMENT_SOURCE => 3,
         "header_identity" => 4,
         ROMM_PLATFORM_SOURCE => 5,
@@ -5734,6 +5737,28 @@ impl Database {
         Ok(())
     }
 
+    fn retire_archive_member_assignment(&mut self, archive_id: i64) -> Result<()> {
+        self.connection.execute(
+            "UPDATE platform_assignments SET is_current = 0 WHERE archive_id = ?1 AND is_current = 1 AND source = ?2",
+            params![archive_id, ARCHIVE_MEMBER_PLATFORM_SOURCE],
+        ).map_err(|error| db_error("failed to retire obsolete archive-member platform", error))?;
+        Ok(())
+    }
+
+    /// Withdrawal must also erase shadow automatic rows: clearing a manual
+    /// choice later must never resurrect evidence removed by a completed scan.
+    fn invalidate_archive_member_evidence(&mut self, archive_id: i64) -> Result<()> {
+        self.connection
+            .execute(
+                "DELETE FROM platform_assignments WHERE archive_id = ?1 AND source = ?2",
+                params![archive_id, ARCHIVE_MEMBER_PLATFORM_SOURCE],
+            )
+            .map_err(|error| {
+                db_error("failed to invalidate stale archive-member evidence", error)
+            })?;
+        Ok(())
+    }
+
     /// Reads `archive_id`'s current (`is_current = 1`) platform assignment,
     /// if any - the shared read step behind [`Self::set_manual_platform`]
     /// and [`Self::clear_manual_platform`].
@@ -6876,7 +6901,7 @@ impl Database {
             }
             seen_ids.push(*archive_id);
             seen_paths.insert(key);
-            assign_platform_for_scanned_archive(self, folder, archive, *archive_id)?;
+            assign_platform_for_scanned_archive(self, folder, archive, *archive_id, true)?;
         }
 
         // A source can contain catalogue rows no longer present in the
@@ -10329,7 +10354,13 @@ fn persist_one_folder(
                 .and_then(system_time_to_unix_seconds),
         )?;
 
-        assign_platform_for_scanned_archive(database, folder, archive, outcome.archive_id)?;
+        assign_platform_for_scanned_archive(
+            database,
+            folder,
+            archive,
+            outcome.archive_id,
+            complete,
+        )?;
 
         // An inspection that did not finish writes no identity report: the
         // report already saved stays as history (its size/mtime still match),
@@ -10382,6 +10413,7 @@ fn assign_platform_for_scanned_archive(
     folder: &RegisteredSourceFolder,
     archive: &Archive,
     archive_id: i64,
+    complete: bool,
 ) -> Result<()> {
     // Required precedence: manual > header identity > source assignment
     // > folder alias > filename heuristic > unknown. `archive.identity.platform`/
@@ -10406,6 +10438,54 @@ fn assign_platform_for_scanned_archive(
         .assigned_platform
         .as_deref()
         .filter(|platform| source_assignment_is_compatible(archive, platform));
+    let member_observation = if complete && archive.kind == ArchiveKind::Zip {
+        Some(crate::archive_platform_members::observe_zip_platform(
+            &archive.path,
+        ))
+    } else {
+        None
+    };
+    if member_observation.is_some() {
+        database.set_inspection_retry_mark(
+            archive_id,
+            !archive.identity.inspection_problems.is_empty()
+                || matches!(
+                    member_observation,
+                    Some(crate::archive_platform_members::MemberPlatformObservation::Incomplete(_))
+                ),
+        )?;
+    }
+    let member_platform = match &member_observation {
+        Some(crate::archive_platform_members::MemberPlatformObservation::Complete(platform)) => {
+            *platform
+        }
+        Some(crate::archive_platform_members::MemberPlatformObservation::Incomplete(problem)) => {
+            warn!(
+                "archive member platform inspection incomplete for {}: {problem}",
+                archive.path.display()
+            );
+            None
+        }
+        None => None,
+    };
+    let stronger_folder =
+        archive.identity.platform_provenance == Some(PlatformProvenance::FolderAlias);
+    if matches!(
+        member_observation,
+        Some(crate::archive_platform_members::MemberPlatformObservation::Complete(_))
+    ) && member_platform.is_none()
+    {
+        database.invalidate_archive_member_evidence(archive_id)?;
+    } else if matches!(
+        member_observation,
+        Some(crate::archive_platform_members::MemberPlatformObservation::Complete(_))
+    ) && (header_identity
+        || stronger_folder
+        || compatible_source_platform.is_some()
+        || custom_alias_platform.is_some())
+    {
+        database.retire_archive_member_assignment(archive_id)?;
+    }
     let (platform, source): (Option<String>, &str) = if header_identity {
         (
             archive.identity.platform.clone(),
@@ -10416,11 +10496,25 @@ fn assign_platform_for_scanned_archive(
             Some(platform.to_string()),
             SOURCE_PLATFORM_ASSIGNMENT_SOURCE,
         )
+    } else if let Some(platform) = &custom_alias_platform {
+        (Some(platform.clone()), CUSTOM_FOLDER_ALIAS_SOURCE)
+    } else if stronger_folder {
+        (
+            archive.identity.platform.clone(),
+            PlatformProvenance::FolderAlias.as_source_str(),
+        )
     } else {
         match &custom_alias_platform {
             Some(platform) => (Some(platform.clone()), CUSTOM_FOLDER_ALIAS_SOURCE),
             None => {
                 database.retire_stale_custom_alias_assignment(archive_id)?;
+                if let Some(platform) = member_platform {
+                    return database.assign_platform(
+                        archive_id,
+                        Some(platform),
+                        ARCHIVE_MEMBER_PLATFORM_SOURCE,
+                    );
+                }
                 if archive.identity.platform.is_none() {
                     // The file was inspected and no platform could be told:
                     // an earlier detector-owned confirmation is obsolete and
