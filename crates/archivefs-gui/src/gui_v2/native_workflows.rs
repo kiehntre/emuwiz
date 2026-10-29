@@ -907,6 +907,27 @@ impl NativeWorkflows {
         ))
     }
 
+    /// The same current selected-game topology used by disc guidance. Core
+    /// rechecks it against live DAT and source bytes before any export.
+    pub(super) fn selected_media_set(
+        &self,
+        path: &Path,
+    ) -> Option<archivefs_core::media_set::MediaSet> {
+        let snapshot = self.app.database_state.snapshot()?;
+        let sets =
+            crate::multidisc_launch_view::library_sets(snapshot, self.app.database_generation.0);
+        sets.iter()
+            .find(|set| {
+                set.members.iter().any(|member| {
+                    member
+                        .representations
+                        .iter()
+                        .any(|representation| representation.record.source.path == path)
+                })
+            })
+            .cloned()
+    }
+
     /// Native v2 presentation of the existing bounded tape-analysis result.
     /// The selected-evidence worker remains the sole reader/parser owner; this
     /// method only selects a path, waits for that result, and renders it.

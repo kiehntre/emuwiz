@@ -145,6 +145,7 @@ pub(super) fn fixture(context: &egui::Context) -> App {
         equiv: Default::default(),
         storage: Default::default(),
         multi: Default::default(),
+        pbp_export: Default::default(),
         // The page tests below assert the Classic view's chrome (full sidebar,
         // Jump to…, top toolbar), which stays as the explicit fallback. Blue,
         // the production default, is covered in `simple_shell_ui`.
@@ -2133,6 +2134,49 @@ fn gui_v2_history_can_project_a_playing_library_transaction() {
             .any(|value| value == "Built a Playing Library (1 link)")
     );
     assert!(strings.iter().any(|value| value.contains("Undo available")));
+}
+
+#[test]
+fn gui_v2_history_identifies_pbp_as_derived_copy_without_undo_claim() {
+    use archivefs_core::dat::rename_apply::model::{
+        EntryState, RenameTransaction, TransactionState,
+    };
+    let context = egui::Context::default();
+    let mut app = fixture(&context);
+    let record = RenameTransaction {
+        transaction_id: "ps1-pbp-test".into(),
+        plan_generation: 0,
+        classifier_version: None,
+        created_at_unix: 1,
+        source_scan_root: "verified-ps1-pbp-export-v1".into(),
+        state: TransactionState::Applied,
+        entries: vec![crate::gui_v2::history_view::tests::item(
+            "/tmp/private/derived.pbp",
+            "/tmp/games/derived.pbp",
+            EntryState::Applied,
+        )],
+        created_directories: Vec::new(),
+        recovery_resolution: None,
+        recovery_resolved_at_unix: None,
+        unknown: Default::default(),
+    };
+    assert_eq!(
+        super::history_view::source_of(&record),
+        super::history_view::Source::PbpExport
+    );
+    app.canonical_organisation_history.push(record);
+    app.router.current = Route::Section(Section::History);
+    let strings = scrolled_text(&context, &mut app, [1024.0, 600.0]);
+    assert!(
+        strings
+            .iter()
+            .any(|value| value.contains("PS1 PBP playing-copy export"))
+    );
+    assert!(
+        strings
+            .iter()
+            .any(|value| value.contains("does not offer Undo"))
+    );
 }
 
 #[test]

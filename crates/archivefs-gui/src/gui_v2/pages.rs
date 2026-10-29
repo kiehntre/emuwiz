@@ -2937,6 +2937,20 @@ impl App {
             ui.add_space(theme::SPACE_SM);
             crate::multidisc_launch_view::show_guidance(ui, guidance);
         }
+        if game.platform == "PSX" {
+            let set = self
+                .native_workflows
+                .as_ref()
+                .and_then(|workflows| workflows.selected_media_set(&game.archive.absolute_path));
+            if let Some(route) = self.pbp_export.show(
+                ui,
+                game,
+                set.as_ref(),
+                std::sync::Arc::as_ptr(&self.library) as usize,
+            ) {
+                self.go(route);
+            }
+        }
         // Amiga format, machine and readiness; links only, never Play.
         if super::amiga_game::machine(game).is_some() {
             ui.add_space(theme::SPACE_SM);

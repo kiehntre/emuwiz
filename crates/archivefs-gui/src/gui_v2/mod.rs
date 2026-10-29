@@ -70,6 +70,7 @@ mod platform_aliases_page;
 mod problem_actions;
 mod problems;
 mod profile_settings_preview;
+mod ps1_pbp_export;
 mod psp_iso_analyser;
 mod quarantine_confirm;
 mod r2_rename;
@@ -444,6 +445,7 @@ pub(super) struct App {
     storage: storage_review::StorageState,
     reconcile: library_reconciliation::ReconcileState,
     multi: media_sets::MultiDiscState,
+    pbp_export: ps1_pbp_export::State,
     /// Simple v1 shell: presentation state only.
     simple: simple_shell::ShellState,
     /// Native pages of former legacy-only tools.
@@ -551,6 +553,7 @@ impl App {
             storage: Default::default(),
             reconcile: Default::default(),
             multi: Default::default(),
+            pbp_export: Default::default(),
             simple: Default::default(),
             tools: tool_pages::ToolPagesState::live(),
         };
@@ -1652,6 +1655,10 @@ impl App {
     }
 
     fn poll(&mut self, context: &egui::Context) {
+        self.pbp_export.poll();
+        if self.pbp_export.take_history_refresh() {
+            self.send(0, Command::LoadRepairHistory);
+        }
         if self.discovery_import_history.poll_background() {
             self.load(false);
             if let Some(native) = &mut self.native_workflows {
