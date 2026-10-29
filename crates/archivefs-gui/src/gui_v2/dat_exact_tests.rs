@@ -296,7 +296,7 @@ fn a_same_platform_no_match_is_shown_and_another_platforms_is_not() {
     };
     assert_eq!(
         label(&load_library(&fixture.db).unwrap()),
-        Some((false, "No catalogue match"))
+        Some((false, "Platform recognised · Catalogue match unavailable"))
     );
     // Reclassified to another platform: the saved row stays, as history only.
     set_platform("Game Boy Advance");
@@ -350,7 +350,10 @@ fn corrupt_zip_is_not_checked_in_library_and_has_no_definitive_attention_negativ
         .iter()
         .find(|game| game.title == "unlisted.gbc")
         .unwrap();
-    assert_eq!(unlisted.identity_summary(), "No catalogue match");
+    assert_eq!(
+        unlisted.identity_summary(),
+        "Platform recognised · Catalogue match unavailable"
+    );
     let db = Database::open_read_only(&fixture.db).unwrap();
     let attention = db.attention_snapshot().unwrap();
     let dat_items: Vec<_> = attention
@@ -466,7 +469,7 @@ fn saved_dat_status_is_visible_even_with_scan_identity_reports() {
         (
             "unlisted.gbc",
             archivefs_core::LibraryDatState::NoMatch,
-            "No catalogue match",
+            "Platform recognised · Catalogue match unavailable",
         ),
         (
             "ambiguous.gbc",
@@ -480,10 +483,18 @@ fn saved_dat_status_is_visible_even_with_scan_identity_reports() {
             .find(|g| g.archive.relative_path == Path::new(name))
             .unwrap()
             .clone();
+        game.platform = "Game Boy Color".into();
         game.archive.identity_report = Some(report.clone());
         game.dat_state = Some(state);
         assert_eq!(game.identity_summary(), label);
-        assert_eq!(game.dat_identity_summary(), label);
+        assert_eq!(
+            game.dat_identity_summary(),
+            if state == archivefs_core::LibraryDatState::NoMatch {
+                "No catalogue match"
+            } else {
+                label
+            }
+        );
     }
     let mut unchecked = library.games[0].clone();
     unchecked.dat_exact = None;

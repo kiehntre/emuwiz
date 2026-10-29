@@ -203,7 +203,23 @@ impl Game {
     }
 
     pub fn identity_summary(&self) -> &'static str {
+        if !self.inspection_incomplete
+            && self.archive.identity_report.as_ref().is_some_and(|report| {
+                matches!(
+                    canonical_identity_for_saved_report(report, EvidenceFreshness::Current).0,
+                    CanonicalIdentityStatus::Conflicting
+                )
+            })
+        {
+            return "Mismatch";
+        }
         if self.dat_exact.is_some() || self.dat_state.is_some() {
+            if self.dat_exact.is_none()
+                && self.dat_state == Some(archivefs_core::LibraryDatState::NoMatch)
+                && self.platform != UNKNOWN_PLATFORM
+            {
+                return "Platform recognised · Catalogue match unavailable";
+            }
             return self.dat_identity_summary();
         }
         let Some(report) = self.archive.identity_report.as_ref() else {
@@ -224,7 +240,10 @@ impl Game {
         match canonical_identity_for_saved_report(report, freshness).0 {
             CanonicalIdentityStatus::Resolved(_) => "Verified",
             CanonicalIdentityStatus::Conflicting => "Mismatch",
-            CanonicalIdentityStatus::Unknown => "Needs verification",
+            CanonicalIdentityStatus::Unknown if self.platform != UNKNOWN_PLATFORM => {
+                "Platform recognised · Game not yet identified"
+            }
+            CanonicalIdentityStatus::Unknown => "Unknown platform",
         }
     }
 }

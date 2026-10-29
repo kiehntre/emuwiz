@@ -146,7 +146,8 @@ mod classic_identity_status_tests {
             nested_container_depth: 0,
             complete: true,
         });
-        let game = Game::from_archive(archive);
+        let mut game = Game::from_archive(archive);
+        game.dat_state = Some(archivefs_core::LibraryDatState::NoMatch);
         assert_eq!(game.identity_summary(), "Mismatch");
         assert_eq!(status_text(&game, true).0, "Mismatch");
         assert!(readiness_sentence(&game).contains("conflicts"));
