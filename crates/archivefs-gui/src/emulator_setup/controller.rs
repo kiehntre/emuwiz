@@ -1809,6 +1809,26 @@ impl ArchiveFsApp {
                 }
             }));
         }
+        let desmume_roots =
+            archivefs_core::launch::DesmumeProfileDiscoveryRoots::from_environment();
+        standalone_profiles.extend(
+            archivefs_core::launch::discover_desmume_profiles(&desmume_roots)
+                .profiles
+                .iter()
+                .map(|profile| archivefs_core::launch::StandaloneProfileInput {
+                    adapter_id: "desmume",
+                    profile_id: profile.profile_id.clone(),
+                    profile_path: profile
+                        .executable
+                        .as_ref()
+                        .map(|executable| executable.path.clone()),
+                    eligible: archivefs_core::launch::resolve_desmume_native_launch_binding(
+                        profile,
+                    )
+                    .is_ok(),
+                    firmware: archivefs_core::launch::FirmwareReadiness::NotRequired,
+                }),
+        );
         if let Some(home) = std::env::var_os("HOME") {
             let roots = archivefs_core::patch_manager::AzaharDiscoveryRoots {
                 explicit_executable: None,
