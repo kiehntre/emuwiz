@@ -329,6 +329,7 @@ pub(crate) fn show(
                         before: archivefs_core::screenscraper_enrichment::AcceptedScreenScraperMetadata::from_existing(&record.metadata),
                         accepted: values.clone(),
                         media_reference_count: candidate.media_references.len(),
+                        field_sources: Default::default(),
                     };
                     action = Some(ScreenScraperEnrichmentAction::Apply { archive_id, values, receipt });
                 }
@@ -430,6 +431,24 @@ pub(crate) fn selected_values(
     }
 }
 
+pub(crate) fn field_provenance(
+    candidate: &ScreenScraperEnrichment,
+    field: EnrichmentField,
+) -> Option<&archivefs_core::identity_source::screenscraper::MetadataProvenance> {
+    let value = match field {
+        EnrichmentField::Title => candidate.title.as_ref(),
+        EnrichmentField::Synopsis => candidate.description.as_ref(),
+        EnrichmentField::Developer => candidate.developer.as_ref(),
+        EnrichmentField::Publisher => candidate.publisher.as_ref(),
+        EnrichmentField::Genre => candidate.genre.as_ref(),
+        EnrichmentField::Players => candidate.players.as_ref(),
+        EnrichmentField::Region => candidate.region.as_ref(),
+        EnrichmentField::Languages => candidate.language.as_ref(),
+        EnrichmentField::ReleaseYear => candidate.release_date.as_ref(),
+    };
+    value.map(|value| &value.provenance)
+}
+
 pub(crate) fn public_error(error: &ScreenScraperError) -> String {
     match error {
         ScreenScraperError::Authentication { .. } => {
@@ -509,5 +528,19 @@ mod tests {
             Some(vec!["English".into(), "French".into()])
         );
         assert_eq!(values.region, None);
+    }
+
+    #[test]
+    fn titleless_candidate_keeps_accepted_field_provenance() {
+        let mut candidate = candidate();
+        candidate.title = None;
+        let values = selected_values(
+            &candidate,
+            &[false, true, false, false, false, false, false, false, false],
+        );
+        assert!(values.has_field(EnrichmentField::Synopsis));
+        let provenance = field_provenance(&candidate, EnrichmentField::Synopsis).unwrap();
+        assert_eq!(provenance.retrieved_at_unix_seconds, 9);
+        assert_eq!(provenance.match_basis, "search");
     }
 }
