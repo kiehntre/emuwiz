@@ -299,6 +299,7 @@ impl App {
         }
     }
     pub(super) fn show(&mut self, context: &egui::Context) {
+        self.recording_integrity.retain_route(&self.router.current);
         // Presentation only: a no-op unless the Simple v1 preference changed.
         if self.simple.apply_zoom_shortcuts(context) {
             self.preferences_dirty = Some(std::time::Instant::now());
@@ -2805,6 +2806,11 @@ impl App {
                         },
                     );
                 });
+                if super::recording_integrity::eligible(game) {
+                    super::game_detail_blue::side_card(ui, "Recording integrity", |ui| {
+                        self.recording_integrity.show(ui, game);
+                    });
+                }
                 return;
             }
             let wide = ui.available_width() >= 760.0;
@@ -2821,6 +2827,11 @@ impl App {
                     self.detail_more(ui, game);
                 });
             });
+            if blue && super::recording_integrity::eligible(game) {
+                super::game_detail_blue::side_card(ui, "Recording integrity", |ui| {
+                    self.recording_integrity.show(ui, game);
+                });
+            }
             if blue {
                 super::game_detail_blue::information_card(ui, game, self.artwork.index.as_deref());
             }

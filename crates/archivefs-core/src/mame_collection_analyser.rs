@@ -19,8 +19,8 @@ pub mod inspection;
 mod storage;
 mod versions;
 pub use storage::{
-    MameMemberEvidence, MameRequirementEvidence, MameRunnability, MameStorageEvidence,
-    MameVerifiedChd,
+    MameLaunchEvidenceStatus, MameMemberEvidence, MameRequirementEvidence, MameRunnability,
+    MameStorageEvidence, MameVerifiedChd,
 };
 /// Parse one whole supported MAME version/build declaration, without searching
 /// unrelated text for a numeric token.

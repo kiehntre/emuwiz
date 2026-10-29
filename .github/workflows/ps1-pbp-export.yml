@@ -1,0 +1,27 @@
+name: PS1 PBP export
+
+on:
+  pull_request:
+    paths:
+      - 'crates/archivefs-core/src/repair/ps1_pbp_export.rs'
+      - 'crates/archivefs-core/src/repair/ps1_pbp_export/**'
+      - 'crates/archivefs-core/src/repair/mod.rs'
+      - 'scripts/test-ps1-pbp-export.sh'
+      - '.github/workflows/ps1-pbp-export.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  synthetic-roundtrip:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: '1.97.1'
+      - name: Install ISO fixture builder
+        run: sudo apt-get update && sudo apt-get install -y --no-install-recommends genisoimage
+      - name: Verify pinned writer and run synthetic exports
+        run: bash scripts/test-ps1-pbp-export.sh

@@ -25,6 +25,151 @@ fn setup() -> (Lab, MameEnvironment, PathBuf) {
 }
 
 #[test]
+fn readiness_reports_native_preflight_and_storage_distinctly() {
+    let (lab, environment, executable) = setup();
+    let report = playing::inspect(&lab.inputs("clone"), &environment).unwrap();
+    assert_eq!(
+        playing::readiness(&report, "clone", Some(executable.clone())).0,
+        playing::Readiness::Ready
+    );
+    assert_eq!(
+        playing::readiness(&report, "clone", None).0,
+        playing::Readiness::NeedsConfiguration
+    );
+    assert_eq!(
+        playing::readiness(&report, "clone", Some(lab.dir.path().join("missing-mame"))).0,
+        playing::Readiness::NeedsConfiguration
+    );
+    assert_eq!(
+        playing::readiness(&report, "bios", Some(executable.clone())).0,
+        playing::Readiness::Unsupported
+    );
+    std::fs::remove_file(lab.root().join("bios.zip")).unwrap();
+    let missing = playing::inspect(&lab.inputs("clone"), &environment).unwrap();
+    assert_eq!(
+        playing::readiness(&missing, "clone", Some(executable)).0,
+        playing::Readiness::MissingDependency
+    );
+}
+
+#[test]
+fn loose_split_directories_do_not_require_absent_search_alternatives() {
+    let (lab, environment, executable) = setup();
+    for set in ["bios", "parent", "clone"] {
+        std::fs::remove_file(lab.root().join(format!("{set}.zip"))).unwrap();
+        std::fs::create_dir(lab.root().join(set)).unwrap();
+    }
+    std::fs::write(lab.root().join("bios/sys.rom"), BIOS).unwrap();
+    std::fs::write(lab.root().join("parent/p.rom"), PARENT).unwrap();
+    std::fs::write(lab.root().join("clone/c.rom"), CLONE).unwrap();
+    std::fs::create_dir(lab.root().join("clone/nested")).unwrap();
+    std::fs::write(lab.root().join("clone/nested/renamed.rom"), CLONE).unwrap();
+
+    let report = playing::inspect(&lab.inputs("clone"), &environment).unwrap();
+    assert_eq!(
+        playing::readiness(&report, "clone", Some(executable.clone())).0,
+        playing::Readiness::Ready,
+        "absent resolver alternatives are not missing source files"
+    );
+    std::fs::write(lab.root().join("parent/c.rom"), CLONE).unwrap();
+    assert_eq!(
+        playing::readiness(&report, "clone", Some(executable)).0,
+        playing::Readiness::IncompleteEvidence,
+        "creating an alternative must invalidate the inspected directory stamp"
+    );
+}
+
+#[test]
+fn loose_nested_member_change_invalidates_ready_evidence() {
+    let (lab, environment, executable) = setup();
+    std::fs::remove_file(lab.root().join("clone.zip")).unwrap();
+    std::fs::create_dir(lab.root().join("clone")).unwrap();
+    std::fs::write(lab.root().join("clone/c.rom"), CLONE).unwrap();
+    std::fs::create_dir(lab.root().join("clone/nested")).unwrap();
+    let nested = lab.root().join("clone/nested/renamed.rom");
+    std::fs::write(&nested, CLONE).unwrap();
+
+    let report = playing::inspect(&lab.inputs("clone"), &environment).unwrap();
+    assert_eq!(
+        playing::readiness(&report, "clone", Some(executable.clone())).0,
+        playing::Readiness::Ready
+    );
+    std::fs::write(&nested, b"changed nested member").unwrap();
+    assert_eq!(
+        playing::readiness(&report, "clone", Some(executable)).0,
+        playing::Readiness::IncompleteEvidence
+    );
+}
+
+#[test]
+fn displayed_ready_status_rejects_changed_catalogue_or_support_container() {
+    for changed in ["catalogue", "bios"] {
+        let (lab, environment, executable) = setup();
+        let inputs = lab.inputs("clone");
+        let report = playing::inspect(&inputs, &environment).unwrap();
+        assert_eq!(
+            playing::readiness(&report, "clone", Some(executable.clone())).0,
+            playing::Readiness::Ready
+        );
+        if changed == "catalogue" {
+            let mut xml = std::fs::read_to_string(&inputs.dat).unwrap();
+            xml.push_str("<!-- newer catalogue -->");
+            std::fs::write(&inputs.dat, xml).unwrap();
+        } else {
+            std::fs::write(lab.root().join("bios.zip"), b"changed support archive").unwrap();
+        }
+        let (status, review) = playing::readiness(&report, "clone", Some(executable));
+        assert_eq!(status, playing::Readiness::IncompleteEvidence, "{changed}");
+        assert!(review.unwrap_err().contains("changed"), "{changed}");
+    }
+}
+
+#[test]
+fn playing_readiness_is_visible_at_1024_by_600() {
+    let (lab, environment, _) = setup();
+    let inputs = lab.inputs("clone");
+    let report = playing::inspect(&inputs, &environment).unwrap();
+    let mut panel = playing::Panel::default();
+    panel.report = Some(Arc::new(report));
+    panel.selected = "clone".into();
+    let context = egui::Context::default();
+    let output = context.run(
+        egui::RawInput {
+            screen_rect: Some(egui::Rect::from_min_size(
+                egui::Pos2::ZERO,
+                egui::vec2(1024.0, 600.0),
+            )),
+            ..Default::default()
+        },
+        |ctx| {
+            egui::CentralPanel::default().show(ctx, |ui| {
+                egui::ScrollArea::vertical().show(ui, |ui| {
+                    panel.show(ui, Some(inputs.clone()), &environment, false);
+                });
+            });
+        },
+    );
+    fn readiness_rect(shape: &egui::Shape) -> Option<egui::Rect> {
+        match shape {
+            egui::Shape::Text(text) if text.galley.text().starts_with("Readiness:") => {
+                Some(text.visual_bounding_rect())
+            }
+            egui::Shape::Vec(shapes) => shapes.iter().find_map(readiness_rect),
+            _ => None,
+        }
+    }
+    let rect = output
+        .shapes
+        .iter()
+        .find_map(|s| readiness_rect(&s.shape))
+        .expect("readiness label");
+    assert!(
+        rect.max.y <= 600.0,
+        "readiness below compact viewport: {rect:?}"
+    );
+}
+
+#[test]
 fn split_parent_and_clone_select_their_own_machine_not_a_rom_member() {
     let (lab, environment, executable) = setup();
     let report = playing::inspect(&lab.inputs("clone"), &environment).unwrap();
@@ -58,6 +203,22 @@ fn a_merged_archive_keeps_the_selected_clone_identity() {
 }
 
 #[test]
+fn non_merged_clone_with_inherited_roms_in_its_own_archive_is_ready() {
+    let (lab, environment, executable) = setup();
+    lab.zip(
+        "clone.zip",
+        &[("c.rom", CLONE), ("p.rom", PARENT), ("sys.rom", BIOS)],
+    );
+    let report = playing::inspect(&lab.inputs("clone"), &environment).unwrap();
+    let (status, request) = playing::readiness(&report, "clone", Some(executable));
+    assert_eq!(status, playing::Readiness::Ready);
+    assert_eq!(
+        request.unwrap().set_resolutions[0].identity.game_name,
+        "clone"
+    );
+}
+
+#[test]
 fn missing_bios_device_and_chd_requirements_block_the_native_planner() {
     for kind in ["bios", "device", "chd", "chd-present"] {
         let (lab, environment, executable) = setup();
@@ -85,6 +246,11 @@ fn missing_bios_device_and_chd_requirements_block_the_native_planner() {
         let report = playing::inspect(&lab.inputs("clone"), &environment).unwrap();
         let machine = report.machines.iter().find(|m| m.name == "clone").unwrap();
         assert!(!machine.result.evidence.verified_complete(), "{kind}");
+        let status = playing::readiness(&report, "clone", Some(executable.clone())).0;
+        assert_ne!(status, playing::Readiness::Ready, "{kind}");
+        if kind == "chd-present" {
+            assert_eq!(status, playing::Readiness::IncompleteEvidence);
+        }
         assert!(
             playing::request(&report, "clone", executable).is_err(),
             "{kind}"

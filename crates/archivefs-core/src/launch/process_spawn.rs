@@ -228,6 +228,11 @@ impl WatchedProcess {
         self.exit_report.is_none()
     }
 
+    /// The already-observed terminal result, without polling or consuming it.
+    pub fn exit_report(&self) -> Option<&ProcessExitReport> {
+        self.exit_report.as_ref()
+    }
+
     /// Explicitly requests one SIGTERM to the owned launched child, then
     /// observes it for at most `grace_period`. Repeated requests never send
     /// a second SIGTERM (which can itself force some emulators to stop).

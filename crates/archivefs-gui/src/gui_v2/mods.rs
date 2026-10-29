@@ -17,6 +17,7 @@ use super::{
     native_workflows::NativeWorkflows,
     routes::{Route, Section},
 };
+use crate::cheatbase_page::{CheatBaseGameSeed, CheatBasePageState, show_cheatbase_browse_page};
 use crate::local_mod_package_page::{
     LocalModPackagePageState, show_local_mod_package_panel_with_catalogue,
 };
@@ -39,6 +40,8 @@ pub(super) struct ModsPageState {
     tab: Tab,
     local: LocalModPackagePageState,
     patch_composition: super::patch_composition::State,
+    cheatbase: CheatBasePageState,
+    cheatbase_game_id: Option<i64>,
     history: Option<ModHistory>,
     history_error: Option<String>,
     history_loaded: bool,
@@ -104,7 +107,13 @@ pub(super) fn show_mods_page(
     workflows: &mut NativeWorkflows,
     activity: &mut Activity,
 ) -> Option<Route> {
+    let game_id = selected_game.map(|game| game.archive.id);
+    if state.cheatbase_game_id != game_id {
+        state.cheatbase = CheatBasePageState::default();
+        state.cheatbase_game_id = game_id;
+    }
     state.poll();
+    state.cheatbase.poll(ui.ctx());
     if !state.history_loaded {
         state.refresh_history(ui.ctx());
     }
@@ -169,6 +178,7 @@ pub(super) fn show_mods_page(
             }
             if state.tab == Tab::Cheats && selected_game.is_none() {
                 destination = workflows.show_cheats(ui, selected_game, activity).or(destination.take());
+                show_cheatbase(ui, &mut state.cheatbase, selected_game);
             } else {
                 selected_game_strip(ui, selected_game);
                 glance_card(
@@ -198,6 +208,7 @@ pub(super) fn show_mods_page(
                     }
                     Tab::Cheats => {
                         destination = workflows.show_cheats(ui, selected_game, activity).or(destination.take());
+                        show_cheatbase(ui, &mut state.cheatbase, selected_game);
                     }
                 }
             }
@@ -238,6 +249,45 @@ pub(super) fn show_mods_page(
         state.refresh_history(ui.ctx());
     }
     destination
+}
+
+fn cheatbase_seed(game: Option<&crate::gui_v2::library::Game>) -> Option<CheatBaseGameSeed> {
+    let game = game?;
+    // Use current verified game evidence; an incomplete scan makes saved
+    // identity historical, so it cannot seed a new catalogue match.
+    if game.inspection_incomplete || !(game.identified || game.dat_exact.is_some()) {
+        return None;
+    }
+    let accepted = game.screenscraper.as_ref().map(|entry| &entry.values);
+    Some(CheatBaseGameSeed {
+        title: accepted
+            .and_then(|values| values.title.clone())
+            .unwrap_or_else(|| game.title.clone()),
+        platform: game.archive.platform.clone(),
+        region: accepted.and_then(|values| values.region.clone()),
+    })
+}
+
+fn show_cheatbase(
+    ui: &mut egui::Ui,
+    state: &mut CheatBasePageState,
+    game: Option<&crate::gui_v2::library::Game>,
+) {
+    ui.separator();
+    ui.label("CheatBase is a read-only catalogue. A title match does not verify the game's revision or activate a cheat.");
+    if game.is_some() && cheatbase_seed(game).is_none() {
+        ui.label("This game's current identity is not verified. Search CheatBase manually if you want to inspect its catalogue.");
+    }
+    if let Some(action) = show_cheatbase_browse_page(ui, state, cheatbase_seed(game))
+        && matches!(
+            action,
+            crate::cheatbase_page::CheatBasePageAction::Refresh
+                | crate::cheatbase_page::CheatBasePageAction::Search
+                | crate::cheatbase_page::CheatBasePageAction::Inspect(_)
+        )
+    {
+        state.handle(action, ui.ctx().clone());
+    }
 }
 
 /// Which part of the history can be attributed to the selected game.
@@ -743,6 +793,24 @@ fn conflicts(
 mod tests {
     use super::*;
     use eframe::egui;
+
+    #[test]
+    fn verified_game_seeds_cheatbase_without_inventing_region() {
+        let fixture = crate::gui_v2::verified_game_fixture::VerifiedGame::new();
+        let game = fixture.game().expect("verified game");
+        let seed = cheatbase_seed(Some(&game)).expect("verified seed");
+        assert_eq!(seed.title, game.title);
+        assert_eq!(seed.platform, game.archive.platform);
+        assert_eq!(seed.region, None);
+
+        let mut stale = game;
+        stale.inspection_incomplete = true;
+        assert!(cheatbase_seed(Some(&stale)).is_none());
+        stale.inspection_incomplete = false;
+        stale.identified = false;
+        stale.dat_exact = None;
+        assert!(cheatbase_seed(Some(&stale)).is_none());
+    }
 
     #[test]
     fn history_refresh_is_single_flight_and_failure_retains_previous_evidence() {

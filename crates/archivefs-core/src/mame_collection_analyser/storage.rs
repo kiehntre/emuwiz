@@ -36,6 +36,15 @@ pub enum MameRunnability {
     NotAssessed,
 }
 
+/// Storage evidence for a launch candidate. This does not assess whether MAME
+/// can boot the machine or whether an executable is configured.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum MameLaunchEvidenceStatus {
+    Verified,
+    MissingDependency,
+    IncompleteEvidence,
+}
+
 #[derive(Clone, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
 pub struct MameStorageEvidence {
     /// False for old serialized reports or incomplete inventories.
@@ -51,6 +60,22 @@ pub struct MameStorageEvidence {
 }
 
 impl MameStorageEvidence {
+    pub fn launch_evidence_status(&self) -> MameLaunchEvidenceStatus {
+        if self.requirements.iter().any(|r| {
+            r.preservation == MamePreservationStatus::VerifiedDumpExpected
+                && matches!(
+                    r.content,
+                    MameMemberEvidence::Missing | MameMemberEvidence::Contradictory
+                )
+        }) {
+            MameLaunchEvidenceStatus::MissingDependency
+        } else if self.verified_complete() {
+            MameLaunchEvidenceStatus::Verified
+        } else {
+            MameLaunchEvidenceStatus::IncompleteEvidence
+        }
+    }
+
     pub fn verified_complete(&self) -> bool {
         self.inspection_complete
             && self.unresolved_dependencies.is_empty()
@@ -74,6 +99,46 @@ impl MameStorageEvidence {
         } else {
             MameSetHealth::Unknown
         }
+    }
+}
+
+#[cfg(test)]
+mod launch_status_tests {
+    use super::*;
+
+    #[test]
+    fn verified_missing_and_weak_evidence_have_distinct_launch_statuses() {
+        let mut evidence = MameStorageEvidence {
+            inspection_complete: true,
+            requirements: vec![MameRequirementEvidence {
+                declaring_set: "clone".into(),
+                member: "program.rom".into(),
+                disk: false,
+                content: MameMemberEvidence::Verified,
+                preservation: MamePreservationStatus::VerifiedDumpExpected,
+            }],
+            ..Default::default()
+        };
+        assert_eq!(
+            evidence.launch_evidence_status(),
+            MameLaunchEvidenceStatus::Verified
+        );
+        evidence.requirements[0].content = MameMemberEvidence::Missing;
+        assert_eq!(
+            evidence.launch_evidence_status(),
+            MameLaunchEvidenceStatus::MissingDependency
+        );
+        evidence.requirements[0].content = MameMemberEvidence::Uninspectable;
+        assert_eq!(
+            evidence.launch_evidence_status(),
+            MameLaunchEvidenceStatus::IncompleteEvidence
+        );
+        evidence.requirements[0].disk = true;
+        evidence.requirements[0].content = MameMemberEvidence::PartialHash;
+        assert_eq!(
+            evidence.launch_evidence_status(),
+            MameLaunchEvidenceStatus::IncompleteEvidence
+        );
     }
 }
 
