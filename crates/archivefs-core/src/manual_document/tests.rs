@@ -524,6 +524,16 @@ fn pdf_page_index_refuses_a_changed_source() {
     );
 }
 
+#[test]
+fn inspected_identity_reports_a_removed_source_before_opening() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = write(dir.path(), "manual.pdf", &PdfBuilder::new(1).build());
+    let id = inspect_manual(&path, &ManualLimits::default()).unwrap().id;
+    assert!(id.check_path().is_ok());
+    fs::remove_file(&path).unwrap();
+    assert!(id.check_path().is_err());
+}
+
 #[cfg(unix)]
 #[test]
 fn pdf_page_index_refuses_source_replacement_and_symlinks() {

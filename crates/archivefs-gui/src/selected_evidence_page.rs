@@ -229,6 +229,7 @@ pub(crate) enum StructuralMediaDetails {
     Optical(OpticalMediaDetails),
     Chd(ChdMediaDetails),
     Cdi(CdiMediaDetails),
+    DreamcastCdi(archivefs_core::dreamcast_cdi::CdiStructure),
     LaserDisc(archivefs_core::laserdisc_set::LaserdiscSetEvidence),
 }
 
@@ -298,6 +299,7 @@ fn update_structural_media_dat_status(
         StructuralMediaDetails::Chd(details) => details.dat_status = dat_status(no_intro),
         StructuralMediaDetails::Disk(_)
         | StructuralMediaDetails::Cdi(_)
+        | StructuralMediaDetails::DreamcastCdi(_)
         | StructuralMediaDetails::LaserDisc(_) => {}
     }
 }
@@ -370,6 +372,7 @@ fn structural_media_details(
     structural_facts: &[ContentEvidence],
     identity: &archivefs_core::game_identity::GameIdentityReport,
     no_intro: &NoIntroLookupResult,
+    cdi_expected: Option<&archivefs_core::dreamcast_cdi::CdiFileStamp>,
 ) -> Option<StructuralMediaDetails> {
     if path.is_dir() {
         return archivefs_core::laserdisc_set::verify_laserdisc_set(path)
@@ -460,6 +463,18 @@ fn structural_media_details(
         return Some(chd_details(observation, no_intro));
     }
     if extension == "cdi"
+        && identity.platform == archivefs_core::game_identity::IdentityPlatform::Dreamcast
+    {
+        return Some(StructuralMediaDetails::DreamcastCdi(match cdi_expected {
+            Some(expected) => {
+                archivefs_core::dreamcast_cdi::inspect_cdi_structure_with_expected_stamp(
+                    path, expected,
+                )
+            }
+            None => archivefs_core::dreamcast_cdi::inspect_cdi_structure(path),
+        }));
+    }
+    if extension == "cdi"
         && let Ok(media) = archivefs_core::dreamcast_cdi::open_dreamcast_cdi_logical_media(path)
         && let Ok(evidence) = archivefs_core::cdi_disc_evidence::observe_cdi(&media)
         && evidence.status != archivefs_core::cdi_disc_evidence::CdiStatus::NotCdi
@@ -523,6 +538,7 @@ pub(crate) enum SelectedEvidenceEnrichmentStatus {
     Pending,
     Complete,
     SkippedArchive,
+    SkippedCdi,
     Failed(String),
 }
 
@@ -536,6 +552,53 @@ fn is_compressed_archive(path: &Path) -> bool {
                 | archivefs_core::ArchiveKind::Lha
         )
     )
+}
+
+fn cdi_snapshot_stamp(
+    path: &Path,
+) -> Result<Option<archivefs_core::dreamcast_cdi::CdiFileStamp>, String> {
+    if !path
+        .extension()
+        .is_some_and(|extension| extension.eq_ignore_ascii_case("cdi"))
+    {
+        return Ok(None);
+    }
+    archivefs_core::dreamcast_cdi::cdi_file_stamp(path)
+        .map(Some)
+        .map_err(|error| error.to_string())
+}
+
+fn require_unchanged_cdi_snapshot(
+    path: &Path,
+    before: Option<&archivefs_core::dreamcast_cdi::CdiFileStamp>,
+) -> Result<(), String> {
+    if let Some(before) = before {
+        let after = cdi_snapshot_stamp(path).map_err(|_| {
+            "CDI source changed during inspection; refresh Game Details".to_string()
+        })?;
+        if after.as_ref() != Some(before) {
+            return Err("CDI source changed during inspection; refresh Game Details".into());
+        }
+    }
+    Ok(())
+}
+
+fn inspect_catalogued_identity_for_cdi_snapshot(
+    path: &Path,
+    platform_hint: Option<&str>,
+    before: Option<&archivefs_core::dreamcast_cdi::CdiFileStamp>,
+) -> Result<archivefs_core::game_identity::GameIdentityReport, String> {
+    match before {
+        Some(before) => {
+            archivefs_core::game_identity::inspect_catalogued_game_identity_with_cdi_stamp(
+                path,
+                platform_hint,
+                before,
+            )
+            .map_err(|_| "CDI source changed during inspection; refresh Game Details".to_string())
+        }
+        None => Ok(inspect_catalogued_game_identity(path, platform_hint)),
+    }
 }
 
 fn analyze_tape_file(
@@ -638,14 +701,21 @@ pub(crate) fn gather_selected_evidence_fast(
     path: &Path,
     platform_hint: Option<&str>,
 ) -> Result<SelectedEvidenceReport, String> {
+    let cdi_before = if platform_hint.is_some_and(|value| value.eq_ignore_ascii_case("Dreamcast")) {
+        cdi_snapshot_stamp(path)?
+    } else {
+        None
+    };
     let archive = is_compressed_archive(path);
     let tape_analysis = analyze_tape_file(path, platform_hint);
-    let structural_prefix = if archive || path.is_dir() {
+    let structural_prefix = if cdi_before.is_some() || archive || path.is_dir() {
         Vec::new()
     } else {
         read_structural_prefix(path)?
     };
-    let structural_facts = if archive {
+    let structural_facts = if cdi_before.is_some() {
+        Vec::new()
+    } else if archive {
         // Archive extensions do not feed any of this module's loose-ROM
         // structural detectors. Opening is enough to surface a missing or
         // unreadable RAR/7z (ZIP is additionally validated by the bounded
@@ -666,10 +736,11 @@ pub(crate) fn gather_selected_evidence_fast(
         ..Default::default()
     });
     let identity = present_identity(&identity_result);
-    let game_identity_report = inspect_catalogued_game_identity(
+    let game_identity_report = inspect_catalogued_identity_for_cdi_snapshot(
         path,
         selected_launch_platform_hint(path, platform_hint, identity.platform),
-    );
+        cdi_before.as_ref(),
+    )?;
     let base_observations: Vec<EvidenceObservation> = structural_facts
         .iter()
         .map(observation_from_content_evidence)
@@ -680,7 +751,13 @@ pub(crate) fn gather_selected_evidence_fast(
         &structural_facts,
         &game_identity_report,
         &NoIntroLookupResult::NotImported,
+        cdi_before.as_ref(),
     );
+    if matches!(structural_media, Some(StructuralMediaDetails::DreamcastCdi(ref details)) if details.status == archivefs_core::dreamcast_cdi::CdiStatus::Changed)
+    {
+        return Err("CDI source changed during inspection; refresh Game Details".into());
+    }
+    require_unchanged_cdi_snapshot(path, cdi_before.as_ref())?;
 
     Ok(SelectedEvidenceReport {
         path: path.to_path_buf(),
@@ -692,7 +769,9 @@ pub(crate) fn gather_selected_evidence_fast(
         game_identity_report,
         hashes: None,
         no_intro: NoIntroLookupResult::NotImported,
-        enrichment: if archive {
+        enrichment: if cdi_before.is_some() {
+            SelectedEvidenceEnrichmentStatus::SkippedCdi
+        } else if archive {
             SelectedEvidenceEnrichmentStatus::SkippedArchive
         } else {
             SelectedEvidenceEnrichmentStatus::Pending
@@ -869,6 +948,17 @@ pub(crate) fn gather_selected_evidence_with_platform(
     platform_hint: Option<&str>,
     no_intro_source: Option<&ImportedNoIntroSource>,
 ) -> Result<SelectedEvidenceReport, String> {
+    let cdi_before = if platform_hint.is_some_and(|value| value.eq_ignore_ascii_case("Dreamcast")) {
+        cdi_snapshot_stamp(path)?
+    } else {
+        None
+    };
+    if cdi_before.is_some() {
+        // CDI uses the bounded, stamp-bound identity and topology pass. The
+        // general whole-file hash path reopens by name and cannot bind its
+        // DAT evidence to the same file identity.
+        return gather_selected_evidence_fast(path, platform_hint);
+    }
     let bytes = std::fs::read(path)
         .map_err(|error| format!("could not read {}: {error}", path.display()))?;
     let tape_analysis = if crate::tape_analysis_page::is_tape_path(path) {
@@ -906,10 +996,11 @@ pub(crate) fn gather_selected_evidence_with_platform(
         ..Default::default()
     });
     let identity = present_identity(&identity_result);
-    let game_identity_report = inspect_catalogued_game_identity(
+    let game_identity_report = inspect_catalogued_identity_for_cdi_snapshot(
         path,
         selected_launch_platform_hint(path, platform_hint, identity.platform),
-    );
+        cdi_before.as_ref(),
+    )?;
 
     let mut base_observations: Vec<EvidenceObservation> = structural_facts
         .iter()
@@ -924,7 +1015,13 @@ pub(crate) fn gather_selected_evidence_with_platform(
         &structural_facts,
         &game_identity_report,
         &no_intro,
+        cdi_before.as_ref(),
     );
+    if matches!(structural_media, Some(StructuralMediaDetails::DreamcastCdi(ref details)) if details.status == archivefs_core::dreamcast_cdi::CdiStatus::Changed)
+    {
+        return Err("CDI source changed during inspection; refresh Game Details".into());
+    }
+    require_unchanged_cdi_snapshot(path, cdi_before.as_ref())?;
 
     Ok(SelectedEvidenceReport {
         path: path.to_path_buf(),
@@ -1251,6 +1348,19 @@ pub(crate) fn show_selected_evidence_panel(
 pub(crate) fn show_identity_evidence(ui: &mut egui::Ui, report: &SelectedEvidenceReport) {
     if let Some(details) = &report.structural_media {
         show_structural_media_details(ui, details);
+        if matches!(details, StructuralMediaDetails::DreamcastCdi(_)) {
+            if let Some(code) = report
+                .game_identity_report
+                .verified_dreamcast_product_code()
+            {
+                ui.label(format!(
+                    "CDI boot evidence: verified IP.BIN product code {code}"
+                ));
+            } else {
+                ui.label("CDI boot evidence: no verified Dreamcast IP.BIN product code");
+            }
+            ui.label("CDI readiness: image completeness and bootability have not been verified; Flycast readiness is assessed separately.");
+        }
     }
     widgets::section_header(ui, "Structural evidence", None);
     if report.structural_facts.is_empty() {
@@ -1315,6 +1425,14 @@ pub(crate) fn show_identity_evidence(ui: &mut egui::Ui, report: &SelectedEvidenc
                 ui,
                 "Bounded archive inspection",
                 "EmuWiz inspected only the archive metadata and bounded game-member evidence. It did not hash the entire ZIP, 7z, or RAR just to populate this card.",
+                widgets::StatusTone::Info,
+            );
+        }
+        SelectedEvidenceEnrichmentStatus::SkippedCdi => {
+            widgets::banner(
+                ui,
+                "Bounded CDI inspection",
+                "Whole-file checksum enrichment is skipped for CDI because that path cannot bind its reads to this inspection's file identity.",
                 widgets::StatusTone::Info,
             );
         }
@@ -1447,6 +1565,29 @@ fn show_structural_media_details(ui: &mut egui::Ui, details: &StructuralMediaDet
                 }
             });
         }
+        StructuralMediaDetails::DreamcastCdi(details) => {
+            ui.label("Dreamcast DiscJuggler CDI");
+            ui.label(format!("Structure: {:?}", details.status));
+            ui.label(&details.explanation);
+            if let Some(version) = details.version {
+                ui.label(format!(
+                    "Variant: {version} · {} sessions · {} tracks",
+                    details.sessions,
+                    details.tracks.len()
+                ));
+            }
+            if let Some(entry) = details.selected_data_entry {
+                ui.label(format!("IP.BIN inspection candidate: data entry {entry}"));
+            }
+            if !details.tracks.is_empty() {
+                widgets::technical_details(ui, "dreamcast-cdi-tracks", |ui| {
+                    for track in &details.tracks {
+                        ui.label(format!("Session {} · entry {} · {} · LBA {} · {} frames · {} bytes/sector · {} pregap frames", track.session, track.ordinal, track.kind, track.start_lba, track.frames, track.sector_bytes, track.pregap_frames));
+                    }
+                });
+            }
+            ui.label("IP.BIN product code appears under verified identity evidence only when its bytes pass the shared Dreamcast identity reader. Track ranges do not prove a complete or bootable image. A change detected between identity and structure samples refuses this Game Details inspection.");
+        }
         StructuralMediaDetails::LaserDisc(details) => {
             laserdisc_details::show(ui, details);
         }
@@ -1500,6 +1641,9 @@ fn show_ready_report(
         SelectedEvidenceEnrichmentStatus::SkippedArchive => {
             ui.label("DAT lookup was not started because it would require hashing the whole outer archive.");
         }
+        SelectedEvidenceEnrichmentStatus::SkippedCdi => {
+            ui.label("DAT lookup was not started because whole-file CDI hashing is not bound to this inspection's file identity.");
+        }
         SelectedEvidenceEnrichmentStatus::Failed(_) => {
             ui.label("DAT lookup could not run because the local checksum was unavailable.");
         }
@@ -1551,6 +1695,9 @@ fn show_ready_report(
                 let reason = match &report.enrichment {
                     SelectedEvidenceEnrichmentStatus::SkippedArchive => {
                         "Hasheous is unavailable because whole-archive hashing is not started automatically."
+                    }
+                    SelectedEvidenceEnrichmentStatus::SkippedCdi => {
+                        "Hasheous is unavailable because whole-file CDI hashing is not bound to this inspection's file identity."
                     }
                     _ => "A SHA1 hash is required before Hasheous can be checked.",
                 };
@@ -2652,6 +2799,169 @@ mod tests {
             .shapes
             .iter()
             .any(|clipped| shape_contains(&clipped.shape, needle))
+    }
+
+    fn synthetic_dreamcast_cdi() -> Vec<u8> {
+        let mut bytes = vec![0u8; 4 * 2048];
+        bytes[..16].copy_from_slice(b"SEGA SEGAKATANA ");
+        bytes[0x40..0x4a].copy_from_slice(b"TEST00001 ");
+        let mut descriptor = vec![1, 0, 1];
+        descriptor.extend_from_slice(&[0; 13]);
+        descriptor.extend_from_slice(&[0; 16]);
+        descriptor.push(0);
+        descriptor.extend_from_slice(&[0; 29 + 2]);
+        descriptor.extend_from_slice(&2u16.to_le_bytes());
+        descriptor.extend_from_slice(&0u32.to_le_bytes());
+        descriptor.extend_from_slice(&4u32.to_le_bytes());
+        descriptor.extend_from_slice(&0u32.to_le_bytes());
+        descriptor.extend_from_slice(&[0; 2]);
+        descriptor.extend_from_slice(&1u32.to_le_bytes());
+        descriptor.extend_from_slice(&[0; 4 + 4 + 4 + 4]);
+        descriptor.extend_from_slice(&4u32.to_le_bytes());
+        descriptor.extend_from_slice(&[0; 16]);
+        descriptor.extend_from_slice(&0u32.to_le_bytes());
+        descriptor.extend_from_slice(&[0; 4 + 9 + 12 + 4 + 99]);
+        descriptor.extend_from_slice(&[0; 15]);
+        let distance = (descriptor.len() + 8) as u32;
+        bytes.extend_from_slice(&descriptor);
+        bytes.extend_from_slice(&0x8000_0006u32.to_le_bytes());
+        bytes.extend_from_slice(&distance.to_le_bytes());
+        bytes
+    }
+
+    #[test]
+    fn blue_details_reports_dreamcast_cdi_structure_without_claiming_bootability() {
+        let bytes = synthetic_dreamcast_cdi();
+        let dir = write_temp_rom("synthetic.cdi", &bytes);
+        let report =
+            gather_selected_evidence_fast(&dir.path().join("synthetic.cdi"), Some("Dreamcast"))
+                .unwrap();
+        assert_eq!(
+            report.enrichment,
+            SelectedEvidenceEnrichmentStatus::SkippedCdi
+        );
+        assert!(
+            matches!(report.structural_media, Some(StructuralMediaDetails::DreamcastCdi(ref details)) if details.status == archivefs_core::dreamcast_cdi::CdiStatus::Valid)
+        );
+        let ctx = egui::Context::default();
+        let output = ctx.run(egui::RawInput::default(), |ctx| {
+            egui::CentralPanel::default().show(ctx, |ui| show_identity_evidence(ui, &report));
+        });
+        assert!(rendered_text_contains(&output, "Dreamcast DiscJuggler CDI"));
+        assert!(rendered_text_contains(&output, "Structure: Valid"));
+        assert!(rendered_text_contains(&output, "bootable image"));
+        assert!(rendered_text_contains(&output, "CDI readiness:"));
+        assert!(rendered_text_contains(
+            &output,
+            "verified IP.BIN product code TEST00001"
+        ));
+        assert_eq!(
+            std::fs::read(dir.path().join("synthetic.cdi")).unwrap(),
+            bytes
+        );
+
+        let invalid = write_temp_rom("broken.cdi", b"broken");
+        let report =
+            gather_selected_evidence_fast(&invalid.path().join("broken.cdi"), Some("Dreamcast"))
+                .unwrap();
+        assert!(
+            matches!(report.structural_media, Some(StructuralMediaDetails::DreamcastCdi(ref details)) if details.status == archivefs_core::dreamcast_cdi::CdiStatus::Truncated)
+        );
+    }
+
+    #[test]
+    fn blue_cdi_snapshot_guard_refuses_replacement_and_mutation_between_stages() {
+        let bytes = synthetic_dreamcast_cdi();
+        let directory = write_temp_rom("game.cdi", &bytes);
+        let path = directory.path().join("game.cdi");
+        let before = cdi_snapshot_stamp(&path).unwrap();
+        let replacement = directory.path().join("replacement.cdi");
+        std::fs::write(&replacement, &bytes).unwrap();
+        std::fs::rename(&replacement, &path).unwrap();
+        assert!(
+            require_unchanged_cdi_snapshot(&path, before.as_ref())
+                .unwrap_err()
+                .contains("changed")
+        );
+
+        let before = cdi_snapshot_stamp(&path).unwrap();
+        std::fs::OpenOptions::new()
+            .append(true)
+            .open(&path)
+            .unwrap()
+            .write_all(b"changed")
+            .unwrap();
+        assert!(
+            require_unchanged_cdi_snapshot(&path, before.as_ref())
+                .unwrap_err()
+                .contains("changed")
+        );
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn blue_cdi_stage_binding_refuses_aba_replacement() {
+        use std::os::unix::fs::symlink;
+        let bytes = synthetic_dreamcast_cdi();
+        let directory = write_temp_rom("a.cdi", &bytes);
+        let path = directory.path().join("game.cdi");
+        symlink("a.cdi", &path).unwrap();
+        let initial = cdi_snapshot_stamp(&path).unwrap();
+        let mut other = bytes.clone();
+        other[0x40..0x4a].copy_from_slice(b"OTHER0001 ");
+        let b = directory.path().join("b.cdi");
+        std::fs::write(&b, &other).unwrap();
+        let b_link = directory.path().join("b-link.cdi");
+        symlink("b.cdi", &b_link).unwrap();
+        std::fs::rename(&b_link, &path).unwrap();
+
+        assert!(
+            inspect_catalogued_identity_for_cdi_snapshot(
+                &path,
+                Some("Dreamcast"),
+                initial.as_ref(),
+            )
+            .unwrap_err()
+            .contains("changed")
+        );
+        let structure = archivefs_core::dreamcast_cdi::inspect_cdi_structure_with_expected_stamp(
+            &path,
+            initial.as_ref().unwrap(),
+        );
+        assert_eq!(
+            structure.status,
+            archivefs_core::dreamcast_cdi::CdiStatus::Changed
+        );
+
+        let a_link = directory.path().join("a-link.cdi");
+        symlink("a.cdi", &a_link).unwrap();
+        std::fs::rename(&a_link, &path).unwrap();
+        assert!(require_unchanged_cdi_snapshot(&path, initial.as_ref()).is_ok());
+        assert_eq!(std::fs::read(&path).unwrap(), bytes);
+    }
+
+    #[test]
+    fn full_cdi_evidence_request_uses_the_bounded_snapshot_path() {
+        let bytes = synthetic_dreamcast_cdi();
+        let directory = write_temp_rom("game.cdi", &bytes);
+        let path = directory.path().join("game.cdi");
+        let report =
+            gather_selected_evidence_with_platform(&path, Some("Dreamcast"), None).unwrap();
+        assert_eq!(
+            report.enrichment,
+            SelectedEvidenceEnrichmentStatus::SkippedCdi
+        );
+        assert!(
+            matches!(report.structural_media, Some(StructuralMediaDetails::DreamcastCdi(ref details)) if details.status == archivefs_core::dreamcast_cdi::CdiStatus::Valid)
+        );
+        assert_eq!(
+            report
+                .game_identity_report
+                .verified_dreamcast_product_code(),
+            Some("TEST00001")
+        );
+        assert!(report.hashes.is_none());
+        assert_eq!(std::fs::read(path).unwrap(), bytes);
     }
 
     #[test]
