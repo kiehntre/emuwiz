@@ -14,7 +14,7 @@ use std::path::{Component, Path, PathBuf};
 use crate::screenscraper_secret_store::{StoreError, StoredCredentials};
 
 const FILE_NAME: &str = "screenscraper.env";
-const HEADER: &str = "# EmuWiz ScreenScraper credentials v1\n";
+const HEADER: &str = "# EmuWiz ScreenScraper credentials v1; data only, do not source\n";
 const KEYS: [&str; 4] = [
     "EMUWIZ_SCREENSCRAPER_DEVELOPER_ID",
     "EMUWIZ_SCREENSCRAPER_DEVELOPER_PASSWORD",
@@ -25,15 +25,26 @@ const MAX_BYTES: usize = 20_000;
 
 pub(super) struct RestrictedFileStore {
     directory: PathBuf,
+    create_trailing_components: usize,
 }
 
 impl RestrictedFileStore {
     pub fn new(directory: PathBuf) -> Self {
-        Self { directory }
+        Self {
+            directory,
+            create_trailing_components: 1,
+        }
+    }
+
+    pub fn managed_default(directory: PathBuf) -> Self {
+        Self {
+            directory,
+            create_trailing_components: 2,
+        }
     }
 
     pub fn load(&self) -> Result<Option<StoredCredentials>, StoreError> {
-        let directory = match open_private_directory(&self.directory, false) {
+        let directory = match open_private_directory(&self.directory, 0) {
             Ok(directory) => directory,
             Err(StoreError::Unavailable) => return Ok(None),
             Err(error) => return Err(error),
@@ -59,7 +70,7 @@ impl RestrictedFileStore {
         record: &StoredCredentials,
         fail_before_publish: bool,
     ) -> Result<(), StoreError> {
-        let directory = open_private_directory(&self.directory, true)?;
+        let directory = open_private_directory(&self.directory, self.create_trailing_components)?;
         lock_directory(&directory, libc::LOCK_EX)?;
         let previous = open_record(&directory)?;
         let previous_value = previous.as_ref().map(decode_file).transpose()?;
@@ -115,7 +126,7 @@ impl RestrictedFileStore {
     }
 
     pub fn forget(&self) -> Result<(), StoreError> {
-        let directory = match open_private_directory(&self.directory, false) {
+        let directory = match open_private_directory(&self.directory, 0) {
             Ok(directory) => directory,
             Err(StoreError::Unavailable) => return Ok(()),
             Err(error) => return Err(error),
@@ -144,12 +155,19 @@ fn lock_directory(directory: &File, operation: libc::c_int) -> Result<(), StoreE
     Ok(())
 }
 
-fn open_private_directory(path: &Path, create: bool) -> Result<File, StoreError> {
+fn open_private_directory(
+    path: &Path,
+    create_trailing_components: usize,
+) -> Result<File, StoreError> {
     if !path.is_absolute() {
         return Err(StoreError::Insecure);
     }
     let mut directory = File::open("/").map_err(|_| StoreError::Failed)?;
     let mut count = 0;
+    let total_components = path
+        .components()
+        .filter(|component| matches!(component, Component::Normal(_)))
+        .count();
     for component in path.components() {
         let Component::Normal(name) = component else {
             if component == Component::RootDir {
@@ -166,8 +184,15 @@ fn open_private_directory(path: &Path, create: bool) -> Result<File, StoreError>
                 libc::O_RDONLY | libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC,
             )
         };
-        if fd < 0 && create && std::io::Error::last_os_error().raw_os_error() == Some(libc::ENOENT)
+        if fd < 0
+            && create_trailing_components > 0
+            && count > total_components.saturating_sub(create_trailing_components)
+            && std::io::Error::last_os_error().raw_os_error() == Some(libc::ENOENT)
         {
+            let parent_metadata = directory.metadata().map_err(|_| StoreError::Failed)?;
+            if parent_metadata.uid() != unsafe { libc::geteuid() } {
+                return Err(StoreError::Insecure);
+            }
             let created = unsafe { libc::mkdirat(directory.as_raw_fd(), name.as_ptr(), 0o700) };
             if created != 0 && std::io::Error::last_os_error().raw_os_error() != Some(libc::EEXIST)
             {
@@ -278,7 +303,13 @@ fn encode_record(record: &StoredCredentials) -> Result<Vec<u8>, StoreError> {
     for (key, value) in KEYS.into_iter().zip(values) {
         text.push_str(key);
         text.push('=');
-        text.push_str(&serde_json::to_string(value).map_err(|_| StoreError::Failed)?);
+        let quoted = serde_json::to_string(value).map_err(|_| StoreError::Failed)?;
+        text.push_str(
+            &quoted
+                .replace('$', "\\u0024")
+                .replace('`', "\\u0060")
+                .replace('!', "\\u0021"),
+        );
         text.push('\n');
     }
     Ok(text.into_bytes())
@@ -365,7 +396,7 @@ mod tests {
             .tempdir_in(home)
             .unwrap();
         let directory = root.path().join(".config/emuwiz");
-        let store = RestrictedFileStore::new(directory.clone());
+        let store = RestrictedFileStore::managed_default(directory.clone());
         (root, directory, store)
     }
 
@@ -470,11 +501,15 @@ mod tests {
         let (_root, directory, store) = fixture();
         let original = StoredCredentials {
             developer_id: "developer id with spaces".into(),
-            developer_password: "synthetic \"quoted\" $HOME $(command) \\ newline\nnext".into(),
+            developer_password: "synthetic \"quoted\" $HOME $(command) `command` \\ newline\nnext"
+                .into(),
             user_id: "synthetic-user-id".into(),
             user_password: "synthetic # = ' \\ \t 🔒".into(),
         };
         store.save(&original).unwrap();
+        let saved = fs::read(directory.join(FILE_NAME)).unwrap();
+        assert!(!saved.contains(&b'$'));
+        assert!(!saved.contains(&b'`'));
         assert_eq!(
             RestrictedFileStore::new(directory.clone()).load().unwrap(),
             Some(original)
@@ -499,7 +534,7 @@ mod tests {
             return;
         };
         let operation = std::env::var("EMUWIZ_FILE_TEST_OPERATION").unwrap();
-        let store = RestrictedFileStore::new(PathBuf::from(directory));
+        let store = RestrictedFileStore::managed_default(PathBuf::from(directory));
         let initial = record("synthetic-dev-password", "synthetic-user-password");
         let updated = record("synthetic-dev-password", "updated-user-password");
         match operation.as_str() {
@@ -589,7 +624,7 @@ mod tests {
     #[test]
     fn save_waits_for_directory_lock_before_publishing() {
         let (_root, directory, store) = fixture();
-        let pinned = open_private_directory(&directory, false).unwrap();
+        let pinned = open_private_directory(&directory, 0).unwrap();
         lock_directory(&pinned, libc::LOCK_EX).unwrap();
         let (sender, receiver) = std::sync::mpsc::channel();
         let worker = std::thread::spawn(move || {
@@ -626,5 +661,11 @@ mod tests {
             RestrictedFileStore::new(PathBuf::from("relative")).load(),
             Err(StoreError::Insecure)
         );
+        let absent_home = root.path().join("missing-home/.config/emuwiz");
+        assert_eq!(
+            RestrictedFileStore::managed_default(absent_home.clone()).save(&record("dev", "user")),
+            Err(StoreError::Unavailable)
+        );
+        assert!(!root.path().join("missing-home").exists());
     }
 }

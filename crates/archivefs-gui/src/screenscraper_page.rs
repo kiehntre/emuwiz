@@ -72,6 +72,7 @@ pub(crate) struct ScreenScraperPageState {
     invalid_stored: bool,
     store_available: bool,
     file_mode: bool,
+    file_storage_acknowledged: bool,
     storage_message: Option<&'static str>,
     unsaved_edits: bool,
     storage_request: Option<Receiver<StorageOutcome>>,
@@ -147,6 +148,7 @@ impl ScreenScraperPageState {
             invalid_stored: false,
             store_available,
             file_mode: false,
+            file_storage_acknowledged: false,
             storage_message: None,
             unsaved_edits: false,
             storage_request: None,
@@ -281,6 +283,13 @@ impl ScreenScraperPageState {
         if self.storage_request.is_some() {
             return;
         }
+        self.file_mode = store.uses_restricted_file();
+        if self.file_mode && !self.file_storage_acknowledged {
+            self.storage_message = Some(
+                "Confirm local plaintext storage and the backup policy before saving credentials.",
+            );
+            return;
+        }
         if self.credentials().is_none()
             || self.user_id.len() > 256
             || self.user_id.chars().any(|ch| ch.is_control())
@@ -295,7 +304,6 @@ impl ScreenScraperPageState {
             user_id: self.user_id.trim().into(),
             user_password: self.user_password.trim().into(),
         };
-        self.file_mode = store.uses_restricted_file();
         let generation = self.edit_generation;
         let (sender, receiver) = mpsc::channel();
         self.storage_request = Some(receiver);
@@ -619,6 +627,10 @@ pub(crate) fn show_screen_scraper_settings(
         ui.label(egui::RichText::new("Credentials").strong());
         if state.file_mode {
             ui.label("EmuWiz-managed private screenscraper.env: Save creates an owner-only directory (0700) and file (0600). Contents are plaintext to this account and root. Protect or exclude backups; Forget cannot erase old SSD blocks or backup copies.");
+            ui.checkbox(
+                &mut state.file_storage_acknowledged,
+                "I accept local plaintext storage and have approved how backups handle this file.",
+            );
         }
         if state.storage_request.is_some() {
             ui.label(
@@ -694,7 +706,10 @@ pub(crate) fn show_screen_scraper_settings(
                     "Save credentials"
                 },
                 widgets::ActionStyle::Secondary,
-                !busy && state.store_available && state.storage_request.is_none(),
+                !busy
+                    && state.store_available
+                    && state.storage_request.is_none()
+                    && (!state.file_mode || state.file_storage_acknowledged),
             )
             .clicked()
             {
@@ -1058,6 +1073,7 @@ mod tests {
         first.developer_password = "synthetic-dev-password".into();
         first.user_id = "synthetic-user-id".into();
         first.user_password = "synthetic-user-password".into();
+        first.file_storage_acknowledged = true;
         first.begin_save_with(SecretStore::restricted_file_for_test(directory.clone()));
         settle_storage(&mut first);
         assert!(first.stored);
@@ -1078,6 +1094,7 @@ mod tests {
         assert!(!format!("{restarted:?}").contains("synthetic-dev-password"));
 
         restarted.user_password = "updated-user-password".into();
+        restarted.file_storage_acknowledged = true;
         restarted.begin_save_with(SecretStore::restricted_file_for_test(directory.clone()));
         settle_storage(&mut restarted);
         let mut after_update = ScreenScraperPageState::empty(true);
@@ -1093,6 +1110,34 @@ mod tests {
         after_forget.begin_load_with(SecretStore::restricted_file_for_test(directory));
         settle_storage(&mut after_forget);
         assert!(!after_forget.is_configured());
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn file_storage_needs_explicit_plaintext_and_backup_acknowledgment() {
+        let home = std::path::PathBuf::from(std::env::var_os("HOME").expect("private test home"));
+        let root = tempfile::Builder::new()
+            .prefix("emuwiz-screenscraper-ack-test-")
+            .tempdir_in(home)
+            .unwrap();
+        let directory = root.path().join(".config/emuwiz");
+        let mut state = ScreenScraperPageState::empty(true);
+        state.developer_id = "synthetic-dev-id".into();
+        state.developer_password = "synthetic-dev-password".into();
+        state.begin_save_with(SecretStore::restricted_file_for_test(directory.clone()));
+        assert!(state.storage_request.is_none());
+        assert!(!directory.exists());
+        assert_eq!(
+            state.storage_message,
+            Some(
+                "Confirm local plaintext storage and the backup policy before saving credentials."
+            )
+        );
+        state.file_storage_acknowledged = true;
+        state.begin_save_with(SecretStore::restricted_file_for_test(directory.clone()));
+        settle_storage(&mut state);
+        assert!(state.stored);
+        assert!(directory.join("screenscraper.env").exists());
     }
 
     #[cfg(unix)]

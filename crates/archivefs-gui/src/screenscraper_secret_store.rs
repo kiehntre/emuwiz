@@ -55,8 +55,11 @@ pub(super) struct SecretStore {
 impl SecretStore {
     pub fn system() -> Self {
         #[cfg(target_os = "linux")]
-        let restricted_file = selected_file_directory(Path::new("/usr/bin/secret-tool").is_file())
-            .map(RestrictedFileStore::new);
+        let restricted_file = match std::env::var_os("EMUWIZ_SCREENSCRAPER_SECRETS_DIR") {
+            Some(override_dir) => Some(RestrictedFileStore::new(PathBuf::from(override_dir))),
+            None => selected_file_directory(Path::new("/usr/bin/secret-tool").is_file())
+                .map(RestrictedFileStore::managed_default),
+        };
         #[cfg(not(target_os = "linux"))]
         let unsupported_file = std::env::var_os("EMUWIZ_SCREENSCRAPER_SECRETS_DIR").is_some();
         Self {
@@ -86,7 +89,7 @@ impl SecretStore {
         Self {
             program: PathBuf::new(),
             requires_session_bus: false,
-            restricted_file: Some(RestrictedFileStore::new(directory)),
+            restricted_file: Some(RestrictedFileStore::managed_default(directory)),
         }
     }
 
@@ -221,19 +224,14 @@ impl SecretStore {
 #[cfg(target_os = "linux")]
 fn selected_file_directory(secret_tool_available: bool) -> Option<PathBuf> {
     let home = std::env::var_os("HOME").map(PathBuf::from);
-    let override_dir = std::env::var_os("EMUWIZ_SCREENSCRAPER_SECRETS_DIR").map(PathBuf::from);
-    selected_file_directory_for(home.as_deref(), override_dir, secret_tool_available)
+    selected_file_directory_for(home.as_deref(), secret_tool_available)
 }
 
 #[cfg(target_os = "linux")]
 fn selected_file_directory_for(
     home: Option<&Path>,
-    override_dir: Option<PathBuf>,
     secret_tool_available: bool,
 ) -> Option<PathBuf> {
-    if let Some(override_dir) = override_dir {
-        return Some(override_dir);
-    }
     let home = home?;
     if !home.is_absolute() {
         return None;
@@ -344,17 +342,14 @@ mod tests {
         let home = tempfile::tempdir().unwrap();
         let directory = home.path().join(".config/emuwiz");
         assert_eq!(
-            selected_file_directory_for(Some(home.path()), None, false),
+            selected_file_directory_for(Some(home.path()), false),
             Some(directory.clone())
         );
-        assert_eq!(
-            selected_file_directory_for(Some(home.path()), None, true),
-            None
-        );
+        assert_eq!(selected_file_directory_for(Some(home.path()), true), None);
         std::fs::create_dir_all(&directory).unwrap();
         std::fs::write(directory.join("screenscraper.env"), b"unrelated").unwrap();
         assert_eq!(
-            selected_file_directory_for(Some(home.path()), None, true),
+            selected_file_directory_for(Some(home.path()), true),
             Some(directory)
         );
     }
