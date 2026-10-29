@@ -2797,6 +2797,7 @@ impl App {
                                 self.classic_trainers.show(ui, game);
                             });
                             super::game_detail_blue::information_card(ui, game, self.artwork.index.as_deref());
+                            self.detail_pbp_export(ui, game);
                             super::game_detail_blue::side_card(ui, "", |ui| {
                                 ui.collapsing("Advanced details", |ui| {
                                     self.detail_advanced(ui, &library, game, &key);
@@ -2825,6 +2826,7 @@ impl App {
                 super::game_detail_blue::information_card(ui, game, self.artwork.index.as_deref());
             }
             self.detail_body(ui, game, &key);
+            self.detail_pbp_export(ui, game);
             self.classic_trainers.show(ui, game);
             ui.add_space(theme::SPACE_MD);
             ui.collapsing("Advanced details", |ui| {
@@ -2937,20 +2939,6 @@ impl App {
             ui.add_space(theme::SPACE_SM);
             crate::multidisc_launch_view::show_guidance(ui, guidance);
         }
-        if game.platform == "PSX" {
-            let set = self
-                .native_workflows
-                .as_ref()
-                .and_then(|workflows| workflows.selected_media_set(&game.archive.absolute_path));
-            if let Some(route) = self.pbp_export.show(
-                ui,
-                game,
-                set.as_ref(),
-                std::sync::Arc::as_ptr(&self.library) as usize,
-            ) {
-                self.go(route);
-            }
-        }
         // Amiga format, machine and readiness; links only, never Play.
         if super::amiga_game::machine(game).is_some() {
             ui.add_space(theme::SPACE_SM);
@@ -3033,6 +3021,24 @@ impl App {
             if ui.button("Try again").clicked() {
                 self.detail_failed = None;
             }
+        }
+    }
+
+    fn detail_pbp_export(&mut self, ui: &mut egui::Ui, game: &Game) {
+        if game.platform != "PSX" {
+            return;
+        }
+        let set = self
+            .native_workflows
+            .as_ref()
+            .and_then(|workflows| workflows.selected_media_set(&game.archive.absolute_path));
+        if let Some(route) = self.pbp_export.show(
+            ui,
+            game,
+            set.as_ref(),
+            std::sync::Arc::as_ptr(&self.library) as usize,
+        ) {
+            self.go(route);
         }
     }
 

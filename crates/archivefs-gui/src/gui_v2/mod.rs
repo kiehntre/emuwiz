@@ -445,7 +445,7 @@ pub(super) struct App {
     storage: storage_review::StorageState,
     reconcile: library_reconciliation::ReconcileState,
     multi: media_sets::MultiDiscState,
-    pbp_export: ps1_pbp_export::State,
+    pbp_export: Box<ps1_pbp_export::State>,
     /// Simple v1 shell: presentation state only.
     simple: simple_shell::ShellState,
     /// Native pages of former legacy-only tools.

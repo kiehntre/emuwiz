@@ -4944,6 +4944,8 @@ fn gui_v2_game_details_keep_artwork_actions_and_metadata_together() {
     let mut app = visual_fixture(&context);
     app.go(Route::Game(1));
     let mut strings = text(&pump_imagery(&context, &mut app, [1280.0, 1200.0]));
+    assert!(strings.iter().any(|value| value == "Verify"));
+    assert!(strings.iter().any(|value| value == "Open Folder"));
     // Screenshots may be below the fold after the upper guidance/readiness
     // content; they must remain reachable with ordinary page scrolling.
     let expected = [
