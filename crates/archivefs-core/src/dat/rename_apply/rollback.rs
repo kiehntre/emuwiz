@@ -331,6 +331,22 @@ fn rollback_transaction_inner(
         let attempted = rollback_mutation(&transaction.entries[index], trusted);
         match attempted {
             Ok(()) => {
+                #[cfg(unix)]
+                if matches!(
+                    transaction.entries[index].operation,
+                    TransactionOperation::CreateSymlink { .. }
+                ) {
+                    if let Some(proof) = transaction.entries[index].created_link_identity() {
+                        let tombstone = super::dirsync::link_undo_tombstone_path(
+                            &transaction.entries[index].destination_path,
+                            &proof,
+                        );
+                        transaction.entries[index].unknown.insert(
+                            "emuwiz_link_undo_tombstone_v1".into(),
+                            serde_json::Value::String(tombstone.to_string_lossy().into_owned()),
+                        );
+                    }
+                }
                 if let Some(catalogue) = catalogue {
                     catalogue.commit()?;
                 }

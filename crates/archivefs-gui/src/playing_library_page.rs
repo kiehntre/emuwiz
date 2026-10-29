@@ -34,9 +34,7 @@ use archivefs_core::dat::rename_apply::executor::{
 use archivefs_core::dat::rename_apply::identity::{capture_identity, identity_matches};
 use archivefs_core::dat::rename_apply::journal::{default_rename_transaction_dir, write_journal};
 use archivefs_core::dat::rename_apply::model::{ObjectIdentity, ObjectKind};
-use archivefs_core::dat::rename_apply::model::{
-    RenameTransaction, RollbackResult, TransactionState,
-};
+use archivefs_core::dat::rename_apply::model::{RenameTransaction, TransactionState};
 use archivefs_core::dat::rename_apply::preflight::DirectoryPolicy;
 use archivefs_core::dat::rename_apply::rollback::rollback_transaction;
 use archivefs_core::emulator_environment::es_de::{EsDeEnvironmentReport, EsDeProfile};
@@ -1269,9 +1267,7 @@ impl PlayingLibraryPageState {
             }
             Err(error) => {
                 self.apply_error = Some(error.to_string());
-                if transaction.applied_count() > 0 {
-                    self.applied = Some(transaction);
-                }
+                self.applied = Some(transaction);
             }
         }
     }
@@ -2081,6 +2077,16 @@ pub(crate) fn show_playing_library_page_with_busy(
                 .strong(),
             );
             ui.label("Original ROM data copied: 0 bytes. Link metadata uses filesystem space.");
+            if transaction.state == TransactionState::RolledBack {
+                let retained = transaction
+                    .entries
+                    .iter()
+                    .filter(|entry| entry.unknown.contains_key("emuwiz_link_undo_tombstone_v1"))
+                    .count();
+                if retained > 0 {
+                    ui.label(format!("Undo moved {retained} link(s) out of the Playing Library. Hidden link tombstones remain for safety; originals are unchanged."));
+                }
+            }
             ui.label("this receipt is not current collection evidence");
             widgets::technical_details(ui, "playing-library-receipt-entries", |ui| {
                 for entry in &transaction.entries {

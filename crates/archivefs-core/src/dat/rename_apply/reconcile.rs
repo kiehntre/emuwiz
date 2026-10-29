@@ -528,11 +528,56 @@ pub(super) fn classify_entry(entry: &TransactionEntry, index: usize) -> Recovery
                 kind: RecoveryIssueKind::SourceIdentityChanged,
                 detail: "link source changed or disappeared; manual review is required".to_string(),
             }
-        } else if exact_link {
+        } else if exact_link
+            && entry.created_link_identity().is_some_and(|proof| {
+                destination_identity
+                    .as_ref()
+                    .is_some_and(|actual| identity_matches(&proof, actual))
+            })
+        {
             RecoveryIssue {
                 entry_index: index,
                 kind: RecoveryIssueKind::RenameConfirmed,
-                detail: "link creation confirmed; source intentionally remains present".to_string(),
+                detail: "the journal-proved link object remains present; source intentionally remains present".to_string(),
+            }
+        } else if exact_link {
+            RecoveryIssue {
+                entry_index: index,
+                kind: RecoveryIssueKind::DestinationIdentityChanged,
+                detail: "a link has the expected target, but the journal does not prove it is the created object; manual review is required".to_string(),
+            }
+        } else if !destination_present
+            && entry.state == EntryState::RollingBack
+            && super::executor::link_adoption(entry) != Some(true)
+        {
+            #[cfg(unix)]
+            {
+                let proved_tombstone = entry.created_link_identity().is_some_and(|proof| {
+                    let path =
+                        super::dirsync::link_undo_tombstone_path(&entry.destination_path, &proof);
+                    capture_identity(&path).is_ok_and(|actual| identity_matches(&proof, &actual))
+                        && std::fs::read_link(&path).is_ok_and(|actual| actual == *expected_target)
+                });
+                if proved_tombstone {
+                    RecoveryIssue {
+                        entry_index: index,
+                        kind: RecoveryIssueKind::RenameDidNotHappen,
+                        detail: "the journal-proved link is retained in its Undo tombstone"
+                            .to_string(),
+                    }
+                } else {
+                    RecoveryIssue {
+                        entry_index: index,
+                        kind: RecoveryIssueKind::DestinationIdentityChanged,
+                        detail: "the link is absent but its Undo tombstone is not proved; manual review is required".to_string(),
+                    }
+                }
+            }
+            #[cfg(not(unix))]
+            RecoveryIssue {
+                entry_index: index,
+                kind: RecoveryIssueKind::EvidenceUnavailable,
+                detail: "linked-library Undo recovery requires Unix object evidence".into(),
             }
         } else if !destination_present {
             RecoveryIssue {
@@ -740,6 +785,60 @@ mod tests {
         let issues = reconcile_recovery(&mut tx, &journal).unwrap();
         assert_eq!(tx.entries[0].state, EntryState::Applied);
         assert_eq!(issues[0].kind, RecoveryIssueKind::RenameConfirmed);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn interrupted_link_with_target_text_but_no_object_proof_stays_unresolved() {
+        let dir = tempfile::tempdir().unwrap();
+        let source = dir.path().join("source.bin");
+        let destination = dir.path().join("playing.bin");
+        std::fs::write(&source, b"source").unwrap();
+        let mut link = entry(&source, &destination, EntryState::Applying);
+        link.operation = TransactionOperation::CreateSymlink {
+            expected_target: source.clone(),
+            destination_root: dir.path().to_path_buf(),
+        };
+        std::os::unix::fs::symlink(&source, &destination).unwrap();
+        let journal = dir.path().join("journal");
+        std::fs::create_dir_all(&journal).unwrap();
+        let mut tx = transaction_with(link);
+        let issues = reconcile_recovery(&mut tx, &journal).unwrap();
+        assert_eq!(
+            issues[0].kind,
+            RecoveryIssueKind::DestinationIdentityChanged
+        );
+        assert_eq!(tx.entries[0].state, EntryState::Applying);
+        assert!(destination.is_symlink());
+        assert_eq!(std::fs::read(source).unwrap(), b"source");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn interrupted_link_undo_recovers_only_a_proved_tombstone() {
+        let dir = tempfile::tempdir().unwrap();
+        let source = dir.path().join("source.bin");
+        let destination = dir.path().join("playing.bin");
+        std::fs::write(&source, b"source").unwrap();
+        let mut link = entry(&source, &destination, EntryState::RollingBack);
+        link.operation = TransactionOperation::CreateSymlink {
+            expected_target: source.clone(),
+            destination_root: dir.path().to_path_buf(),
+        };
+        std::os::unix::fs::symlink(&source, &destination).unwrap();
+        let proof = capture_identity(&destination).unwrap();
+        link.record_created_link(&proof).unwrap();
+        let tombstone = super::super::dirsync::link_undo_tombstone_path(&destination, &proof);
+        std::fs::rename(&destination, &tombstone).unwrap();
+        let journal = dir.path().join("journal");
+        std::fs::create_dir_all(&journal).unwrap();
+        let mut tx = transaction_with(link);
+        tx.state = super::super::model::TransactionState::RollingBack;
+        let issues = reconcile_recovery(&mut tx, &journal).unwrap();
+        assert_eq!(issues[0].kind, RecoveryIssueKind::RenameDidNotHappen);
+        assert_eq!(tx.entries[0].state, EntryState::RolledBack);
+        assert!(tombstone.is_symlink());
+        assert_eq!(std::fs::read(source).unwrap(), b"source");
     }
 
     #[test]

@@ -546,8 +546,25 @@ fn apply_transaction_inner(execution: &mut ApplyExecution<'_>) -> Result<ApplyOu
                 transaction.entries[index].applied_at_unix = Some(crate::dat::sources::now_unix());
             }
             Err((state, reason)) => {
-                transaction.entries[index].state = state;
-                transaction.entries[index].failure_reason = Some(reason);
+                let uncertain_link = matches!(
+                    &transaction.entries[index].operation,
+                    TransactionOperation::CreateSymlink { expected_target, .. }
+                        if link_adoption(&transaction.entries[index]) == Some(false)
+                            && std::fs::read_link(&transaction.entries[index].destination_path)
+                                .is_ok_and(|target| target == *expected_target)
+                );
+                transaction.entries[index].state = if uncertain_link {
+                    EntryState::Applying
+                } else {
+                    state
+                };
+                transaction.entries[index].failure_reason = Some(if uncertain_link {
+                    format!(
+                        "{reason}; a link may have been created but ownership is unproved; recovery requires review"
+                    )
+                } else {
+                    reason
+                });
                 transaction.state = TransactionState::ApplyFailed;
                 if super::exact_resume::has_envelope(transaction) {
                     super::exact_resume::set_state(

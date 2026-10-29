@@ -523,7 +523,7 @@ mod tests {
     }
 
     #[test]
-    fn rollback_of_a_multi_file_release_removes_only_the_generated_links() {
+    fn rollback_of_a_multi_file_release_retains_proved_link_tombstones() {
         let temp = tempfile::tempdir().expect("temp dir");
         let cue = temp.path().join("Game (Europe).cue");
         let track1 = temp.path().join("track1.bin");
@@ -574,8 +574,24 @@ mod tests {
         assert!(!destination_root.join("Game (Europe).cue").exists());
         assert!(!destination_root.join("track1.bin").exists());
         assert!(!destination_root.join("track2.bin").exists());
-        // Only the generated links were removed - every master file
-        // remains exactly as it was.
+        for entry in &transaction.entries {
+            let proof = entry.created_link_identity().unwrap();
+            let tombstone = crate::dat::rename_apply::dirsync::link_undo_tombstone_path(
+                &entry.destination_path,
+                &proof,
+            );
+            assert!(tombstone.is_symlink());
+            assert_eq!(std::fs::read_link(&tombstone).unwrap(), entry.source_path);
+            assert_eq!(
+                entry
+                    .unknown
+                    .get("emuwiz_link_undo_tombstone_v1")
+                    .and_then(serde_json::Value::as_str),
+                Some(tombstone.to_str().unwrap())
+            );
+        }
+        // Only the generated links moved out of the public library paths;
+        // every master file remains exactly as it was.
         assert!(cue.is_file() && !cue.is_symlink());
         assert_eq!(
             std::fs::read(&cue).unwrap(),
@@ -697,5 +713,100 @@ mod tests {
         ));
         assert!(link.is_symlink());
         assert!(held_original.is_symlink());
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn undo_race_restores_a_replacement_without_deleting_it() {
+        let temp = tempfile::tempdir().unwrap();
+        let source = temp.path().join("game.rom");
+        std::fs::write(&source, b"verified").unwrap();
+        let destination = temp.path().join("playing");
+        std::fs::create_dir_all(&destination).unwrap();
+        let journal = temp.path().join("journal");
+        std::fs::create_dir_all(&journal).unwrap();
+        let plan = plan_with_one_operation(source.clone(), destination.clone());
+        let mut tx = build_playing_library_transaction(&plan, 1).unwrap();
+        apply_transaction(&mut ApplyExecution {
+            transaction: &mut tx,
+            approved_paths: std::iter::once(source.to_string_lossy().into_owned()).collect(),
+            current_generation: 1,
+            trusted: TrustedRoots::from_paths([temp.path()]),
+            journal_dir: journal.clone(),
+            hard_conflict_mode: HardConflictMode::AbortAll,
+            cancel: &std::sync::atomic::AtomicBool::new(false),
+            directory_policy: DirectoryPolicy::SameFilesystem,
+            allow_symlink_source: false,
+        })
+        .unwrap();
+        let link = destination.join("Game (Europe).zip");
+        let held_original = destination.join("held-original-link");
+        let source_for_hook = source.clone();
+        let held_for_hook = held_original.clone();
+        let mut fired = false;
+        crate::dat::rename_apply::dirsync::set_undo_move_hook(Some(Box::new(move |path| {
+            if fired {
+                return;
+            }
+            fired = true;
+            std::fs::rename(path, &held_for_hook).unwrap();
+            std::os::unix::fs::symlink(&source_for_hook, path).unwrap();
+        })));
+        let result = crate::dat::rename_apply::rollback::rollback_transaction(
+            &mut tx,
+            &journal,
+            &std::sync::atomic::AtomicBool::new(false),
+        )
+        .unwrap();
+        crate::dat::rename_apply::dirsync::set_undo_move_hook(None);
+        assert!(matches!(
+            result.result,
+            crate::dat::rename_apply::model::RollbackResult::RollbackFailed { .. }
+        ));
+        assert!(link.is_symlink());
+        assert!(held_original.is_symlink());
+        assert_eq!(std::fs::read(source).unwrap(), b"verified");
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn post_create_failure_retains_unproved_link_for_restart_review() {
+        let temp = tempfile::tempdir().unwrap();
+        let source = temp.path().join("game.rom");
+        std::fs::write(&source, b"verified").unwrap();
+        let destination = temp.path().join("playing");
+        std::fs::create_dir_all(&destination).unwrap();
+        let journal = temp.path().join("journal");
+        std::fs::create_dir_all(&journal).unwrap();
+        let plan = plan_with_one_operation(source.clone(), destination.clone());
+        let mut tx = build_playing_library_transaction(&plan, 1).unwrap();
+        crate::dat::rename_apply::dirsync::set_after_link_hook(Some(Box::new(|_| {
+            Err(std::io::Error::other("injected post-create failure"))
+        })));
+        let outcome = apply_transaction(&mut ApplyExecution {
+            transaction: &mut tx,
+            approved_paths: std::iter::once(source.to_string_lossy().into_owned()).collect(),
+            current_generation: 1,
+            trusted: TrustedRoots::from_paths([temp.path()]),
+            journal_dir: journal.clone(),
+            hard_conflict_mode: HardConflictMode::AbortAll,
+            cancel: &std::sync::atomic::AtomicBool::new(false),
+            directory_policy: DirectoryPolicy::SameFilesystem,
+            allow_symlink_source: false,
+        })
+        .unwrap();
+        crate::dat::rename_apply::dirsync::set_after_link_hook(None);
+        assert_eq!(outcome.transaction.state, TransactionState::ApplyFailed);
+        assert_eq!(tx.entries[0].state, EntryState::Applying);
+        assert!(tx.entries[0].created_link_identity().is_none());
+        assert!(destination.join("Game (Europe).zip").is_symlink());
+        let issues =
+            crate::dat::rename_apply::reconcile::reconcile_recovery(&mut tx, &journal).unwrap();
+        assert_eq!(
+            issues[0].kind,
+            crate::dat::rename_apply::reconcile::RecoveryIssueKind::DestinationIdentityChanged
+        );
+        assert_eq!(tx.entries[0].state, EntryState::Applying);
+        assert_eq!(std::fs::read(source).unwrap(), b"verified");
     }
 }

@@ -1493,7 +1493,7 @@ impl super::App {
                 .resizable(false)
                 .show(ui.ctx(), |ui| {
                     ui.label(if library_index.is_some() {
-                        "EmuWiz will re-verify each recorded link object before removing it. Replaced or changed links will be refused; original ROMs remain untouched."
+                        "EmuWiz will re-verify each recorded link object before moving it to a hidden Undo tombstone. Replaced or changed links will be refused; original ROMs remain untouched."
                     } else {
                         "EmuWiz will re-verify the quarantined files and restore them to their original locations. If anything changed unexpectedly it will refuse and tell you why."
                     });
@@ -1508,8 +1508,8 @@ impl super::App {
                     view.confirm_undo = None;
                     self.undo_confirm = None;
                     self.history_view = view;
-                    if let Some(index) = repair_index {
-                        self.undo_history_entry(index);
+                    if repair_index.is_some() {
+                        self.undo_history_entry(&id);
                     } else if let Some(index) = library_index
                         && let Some(transaction) = self.playing_library_history.get(index).cloned()
                     {
