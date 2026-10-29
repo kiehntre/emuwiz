@@ -1819,7 +1819,15 @@ fn show_preview(
                 Source::DuplicateQuarantine | Source::PlayingLibrary
                     if entry.source == Source::DuplicateQuarantine
                         || entry.transaction.unknown.get("playing_library_profile").and_then(serde_json::Value::as_str) == Some("generic") => {
-                    if ui.button(RichText::new("Undo").strong()).clicked() {
+                    if crate::ui::components::action_button(
+                        ui,
+                        RichText::new("Undo").strong(),
+                        crate::ui::components::ActionStyle::Undo,
+                        !undo_busy,
+                    )
+                    .on_disabled_hover_text("Another Undo is still running.")
+                    .clicked()
+                    {
                         *undo_request = Some(entry.transaction_id.clone());
                     }
                 }

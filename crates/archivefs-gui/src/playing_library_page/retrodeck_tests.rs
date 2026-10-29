@@ -28,7 +28,7 @@ fn retrodeck_campaign_undo_survives_discarded_preview() {
         .clone();
     let before = std::fs::read(&gamelist).unwrap();
     state.request_retrodeck_apply();
-    state.confirm_retrodeck_apply();
+    confirm_retrodeck(&mut state);
     assert!(
         state.retrodeck_error.is_none(),
         "{:?}",
@@ -65,7 +65,7 @@ fn retrodeck_campaign_genuine_preview_block_confirmation_completion_uptodate_and
     let (output, _) = render(&ctx, &mut state, campaign_input());
     assert!(rendered_text_contains(&output, "Apply is blocked"));
     state.request_retrodeck_apply();
-    state.confirm_retrodeck_apply();
+    confirm_retrodeck(&mut state);
     assert!(state.retrodeck_applied.is_none());
     state.retrodeck_visibility_verified = true;
     state.preview_retrodeck();
@@ -91,7 +91,7 @@ fn retrodeck_campaign_genuine_preview_block_confirmation_completion_uptodate_and
         action,
         Some(PlayingLibraryPageAction::ConfirmApply)
     ));
-    state.confirm_retrodeck_apply();
+    confirm_retrodeck(&mut state);
     assert_eq!(
         state.retrodeck_phase,
         Some(Phase::Completed),

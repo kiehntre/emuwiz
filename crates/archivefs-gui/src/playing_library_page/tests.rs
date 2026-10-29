@@ -114,8 +114,7 @@ fn confirm_romm(state: &mut PlayingLibraryPageState) {
     let count = state
         .romm_projection
         .as_ref()
-        .expect("RomM preview")
-        .total_files;
+        .map_or(0, |plan| plan.total_files);
     state.romm_confirm_text = playing_library_confirmation_phrase(count);
     state.confirm_romm_apply();
 }
@@ -124,8 +123,7 @@ fn confirm_retrodeck(state: &mut PlayingLibraryPageState) {
     let count = state
         .retrodeck_projection
         .as_ref()
-        .expect("RetroDECK preview")
-        .total_files;
+        .map_or(0, |plan| plan.total_files);
     state.retrodeck_confirm_text = playing_library_confirmation_phrase(count);
     state.confirm_retrodeck_apply();
 }
@@ -2151,7 +2149,7 @@ fn failed_undo_is_visible_for_every_linked_library_destination() {
         let fixture = Fixture::new("failed-undo-projection");
         let (mut state, original, destination) = preview_a_single_election(&fixture);
         state.request_apply();
-        state.confirm_apply();
+        confirm_library(&mut state);
         let transaction = state.applied.take().unwrap();
         let id = transaction.transaction_id.clone();
         let link = destination.join("unknown/europe.bin");
@@ -2216,7 +2214,7 @@ fn render_incomplete_receipt(summary: TransactionState) {
         let fixture = Fixture::new("incomplete-receipt-render");
         let (mut state, _, _) = preview_a_single_election(&fixture);
         state.request_apply();
-        state.confirm_apply();
+        confirm_library(&mut state);
         let mut transaction = state.applied.take().unwrap();
         state.plan = state.applied_plan.clone();
         if summary == TransactionState::RollbackFailed {
@@ -2309,7 +2307,7 @@ fn reviewed_source_replacement_is_refused_instead_of_recaptured_at_confirmation(
         let replacement = if same_bytes { b"test" } else { b"evil" };
         std::fs::write(&source, replacement).unwrap();
         state.request_apply();
-        state.confirm_apply();
+        confirm_library(&mut state);
         assert!(
             state.applied().is_none(),
             "unreviewed replacement was published"
@@ -2342,7 +2340,7 @@ fn reviewed_source_in_place_edit_during_confirmation_is_refused() {
     })
     .join()
     .unwrap();
-    state.confirm_apply();
+    confirm_library(&mut state);
     assert!(
         state.applied().is_none(),
         "edited bytes were silently adopted"
@@ -2370,7 +2368,7 @@ fn reviewed_source_symlink_and_parent_redirection_refuse_without_touching_foreig
             std::os::unix::fs::symlink(foreign.join("europe.bin"), &source).unwrap();
         }
         state.request_apply();
-        state.confirm_apply();
+        confirm_library(&mut state);
         assert!(state.applied().is_none());
         assert!(state.apply_error().is_some());
         assert_eq!(
@@ -2389,7 +2387,7 @@ fn reviewed_apply_refuses_an_occupied_destination_and_preserves_it() {
     std::fs::create_dir_all(output.parent().unwrap()).unwrap();
     std::fs::write(&output, b"foreign output").unwrap();
     state.request_apply();
-    state.confirm_apply();
+    confirm_library(&mut state);
     assert!(state.applied().is_none());
     assert!(state.apply_error().is_some());
     assert_eq!(std::fs::read(&output).unwrap(), b"foreign output");
@@ -2402,7 +2400,7 @@ fn reviewed_apply_refuses_changed_plan_without_creating_a_journal_or_output() {
     let (mut state, source, destination) = preview_a_single_election(&fixture);
     state.plan.as_mut().unwrap().operations[0].destination_path = fixture.path("unreviewed.bin");
     state.request_apply();
-    state.confirm_apply();
+    confirm_library(&mut state);
     assert!(state.apply_error().unwrap().contains("stale"));
     assert!(state.applied().is_none());
     assert!(
@@ -2426,7 +2424,7 @@ fn reviewed_apply_binding_is_single_use_across_background_result_merge() {
     std::fs::write(&source, b"evil").unwrap();
     state.request_apply();
     let mut worker = state.clone();
-    worker.confirm_apply();
+    confirm_library(&mut worker);
     assert!(worker.apply_error().is_some());
     state.merge_async_apply_result(worker);
     assert!(
@@ -2446,22 +2444,25 @@ fn reviewed_apply_binding_is_single_use_across_background_result_merge() {
         files
     };
     let evidence = journals();
-    assert!(!evidence.is_empty());
+    assert!(
+        evidence.is_empty(),
+        "a stale source is refused before journaling"
+    );
     std::fs::remove_file(&source).unwrap();
     std::fs::rename(&saved, &source).unwrap();
     state.request_apply();
-    state.confirm_apply();
+    confirm_library(&mut state);
     assert!(state.apply_error().unwrap().contains("already used"));
     assert!(state.applied().is_none());
     assert_eq!(
         journals(),
         evidence,
-        "retry must retain the failed attempt's evidence"
+        "retry must not invent an operation journal"
     );
     assert!(std::fs::symlink_metadata(&output).is_err());
     state.preview();
     state.request_apply();
-    state.confirm_apply();
+    confirm_library(&mut state);
     assert!(state.apply_error().is_none(), "{:?}", state.apply_error());
     assert_eq!(state.applied().unwrap().state, TransactionState::Applied);
     assert_eq!(std::fs::read(output).unwrap(), b"test");
@@ -2523,10 +2524,10 @@ fn reviewed_profile_fixture(
 fn apply_reviewed_profile(state: &mut PlayingLibraryPageState, retrodeck: bool) {
     if retrodeck {
         state.request_retrodeck_apply();
-        state.confirm_retrodeck_apply();
+        confirm_retrodeck(state);
     } else {
         state.request_romm_apply();
-        state.confirm_romm_apply();
+        confirm_romm(state);
     }
 }
 
@@ -2891,7 +2892,7 @@ fn destination_change_requires_a_new_confirmation_after_repreview() {
         assert!(std::fs::symlink_metadata(&output).is_err());
         assert_eq!(std::fs::read(&source).unwrap(), b"test");
         state.request_apply();
-        state.confirm_apply();
+        confirm_library(&mut state);
         assert!(
             state.applied().is_some(),
             "fresh explicit confirmation still works"
@@ -2904,7 +2905,7 @@ fn destination_change_preserves_completed_receipts_and_undo() {
     let fixture = Fixture::new("destination-receipt-preservation");
     let (mut state, source, _) = preview_a_single_election(&fixture);
     state.request_apply();
-    state.confirm_apply();
+    confirm_library(&mut state);
     let receipt = state.applied().unwrap().clone();
     let output = receipt.entries[0].destination_path.clone();
     state.apply_error = Some("Retained receipt diagnostic".into());

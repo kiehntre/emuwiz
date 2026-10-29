@@ -1155,6 +1155,9 @@ impl PlayingLibraryPageState {
             self.apply_error = Some("the typed confirmation did not match".to_string());
             return;
         }
+        // A confirmed attempt consumes the original source binding even if
+        // the fresh collection check refuses it. Retrying requires Preview.
+        let reviewed_binding = self.preview_transaction.take();
         self.apply_error = None;
         self.apply_stage.store(1, Ordering::Relaxed);
         // Re-resolve the catalogue and re-hash the collection on the worker.
@@ -1166,7 +1169,7 @@ impl PlayingLibraryPageState {
             || fresh.output_projection != self.output_projection
         {
             self.apply_error =
-                Some("the collection or DAT changed; preview again before creating links".into());
+                Some("the collection or DAT changed; preview is stale; preview again before creating links".into());
             self.pending_apply = None;
             return;
         }
@@ -1192,7 +1195,7 @@ impl PlayingLibraryPageState {
         // preflight. Rebuilding here would silently approve a replacement.
         // Consume even a refused attempt: a retry needs a new preview, never
         // an overwrite of a prior attempt's authoritative journal.
-        let reviewed = match self.preview_transaction.take() {
+        let reviewed = match reviewed_binding {
             Some((reviewed_plan, transaction)) if reviewed_plan == *plan => transaction,
             _ => Err("the preview binding is stale or already used; run a fresh preview".into()),
         };
@@ -1721,6 +1724,33 @@ pub(crate) fn show_playing_library_page_with_busy(
     let inputs_ready = state.has_catalogue_selection()
         && !state.source_root_draft.trim().is_empty()
         && !state.destination_root_draft.trim().is_empty();
+    let compact_profile_action =
+        state
+            .output_projection
+            .as_ref()
+            .and_then(|projection| match state.destination {
+                PlayingLibraryDestination::Romm => Some((
+                    projection.operation_count,
+                    projection.conflicts.is_empty()
+                        && state
+                            .romm_projection
+                            .as_ref()
+                            .is_some_and(|value| value.visibility.is_verified()),
+                    state.romm_pending_apply,
+                    state.romm_applied.is_some(),
+                )),
+                PlayingLibraryDestination::RetroDeck => Some((
+                    projection.operation_count,
+                    projection.conflicts.is_empty()
+                        && state
+                            .retrodeck_projection
+                            .as_ref()
+                            .is_some_and(|value| value.visibility.is_verified()),
+                    state.retrodeck_pending_apply,
+                    state.retrodeck_applied.is_some(),
+                )),
+                _ => None,
+            });
     ui.horizontal_wrapped(|ui| {
         if widgets::action_button(
             ui,
@@ -1762,6 +1792,44 @@ pub(crate) fn show_playing_library_page_with_busy(
                     "Confirm links",
                     widgets::ActionStyle::Destructive,
                     true,
+                )
+                .clicked()
+                {
+                    action = Some(PlayingLibraryPageAction::ConfirmApply);
+                }
+            }
+        }
+        if let Some((count, ready, pending, applied)) = compact_profile_action
+            && count > 0
+            && !applied
+        {
+            if !pending {
+                if widgets::action_button(
+                    ui,
+                    "Apply output profile",
+                    widgets::ActionStyle::Primary,
+                    ready && !async_busy,
+                )
+                .clicked()
+                {
+                    action = Some(PlayingLibraryPageAction::RequestApply);
+                }
+            } else {
+                ui.label(format!(
+                    "Type {}",
+                    playing_library_confirmation_phrase(count)
+                ));
+                let confirmation = if state.destination == PlayingLibraryDestination::Romm {
+                    &mut state.romm_confirm_text
+                } else {
+                    &mut state.retrodeck_confirm_text
+                };
+                ui.add(egui::TextEdit::singleline(confirmation).desired_width(210.0));
+                if widgets::action_button(
+                    ui,
+                    "Confirm",
+                    widgets::ActionStyle::Destructive,
+                    !async_busy,
                 )
                 .clicked()
                 {
