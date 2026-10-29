@@ -8,7 +8,9 @@ use archivefs_core::launch::cheat_runtime_retroarch::{
 use archivefs_core::launch::libretro_probe::ProbeLauncher;
 use archivefs_core::launch::{RetroArchLaunchRequest, preflight_retroarch_launch};
 use eframe::egui;
+use sha2::{Digest, Sha256};
 use std::collections::BTreeSet;
+use std::path::{Path, PathBuf};
 use std::sync::mpsc::{self, Receiver};
 
 type Scope = RetroArchLaunchRequest;
@@ -23,6 +25,17 @@ pub(super) struct Chooser {
     pending: Option<Receiver<PreviewResult>>,
     problem: Option<String>,
     requested: Vec<String>,
+    profile_status: Option<String>,
+}
+
+fn profile_path(game: &Path) -> Result<PathBuf, String> {
+    let database = archivefs_core::default_database_path().map_err(|e| e.to_string())?;
+    let root = database.parent().ok_or("No application data folder.")?;
+    let digest = Sha256::digest(game.to_string_lossy().as_bytes());
+    let hex: String = digest.iter().map(|b| format!("{b:02x}")).collect();
+    Ok(root
+        .join("cheat-profiles")
+        .join(format!("spectrum-{hex}.json")))
 }
 #[derive(Clone)]
 pub(super) struct Selection {
@@ -84,15 +97,34 @@ impl Chooser {
                 }
                 if let Some(error) = &self.problem { ui.label(format!("Trainer activation blocked: {error}")); }
                 if let Some(preview) = &self.preview {
+                    ui.label(format!("Compatible game identity: {}", preview.identity_summary()));
+                    ui.label("Source: local same-name .pok, bound to this DAT-verified snapshot by .pok.target. World of Spectrum/ZXDB references alone do not verify this release.");
                     for (index, title) in preview.titles().iter().enumerate() {
                         let mut selected = self.selected.contains(&index);
                         if ui.checkbox(&mut selected, format!("{}: {title}", index + 1)).changed() {
                             self.acknowledged = false;
                             if selected { self.selected.insert(index); } else { self.selected.remove(&index); }
                         }
+                        if let Some(detail) = preview.entry_summary(index) { ui.small(detail); }
                     }
                     let requested: Vec<_> = self.selected.iter().map(|&i| preview.titles()[i].clone()).collect();
                     ui.label(format!("Requested POKEs: {}", if requested.is_empty() { "none".into() } else { requested.join(", ") }));
+                    ui.horizontal(|ui| {
+                        if ui.button("Load saved POKE profile").clicked() {
+                            self.profile_status = Some(match profile_path(preview.game_path()).and_then(|path| launch::load_profile(&path, preview)) {
+                                Ok(entries) => { self.selected = entries.into_iter().collect(); self.acknowledged = false; "Saved choice loaded. Review the game, addresses and selection again before launch.".into() },
+                                Err(error) => format!("Saved choice unavailable: {error}"),
+                            });
+                        }
+                        if ui.add_enabled(!self.selected.is_empty(), egui::Button::new("Save selected POKE profile")).clicked() {
+                            let entries: Vec<_> = self.selected.iter().copied().collect();
+                            self.profile_status = Some(match profile_path(preview.game_path()).and_then(|path| launch::save_profile(&path, preview, &entries)) {
+                                Ok(()) => "Saved choice for this exact snapshot and trainer. No cheat was activated.".into(),
+                                Err(error) => format!("Choice was not saved: {error}"),
+                            });
+                        }
+                    });
+                    if let Some(status) = &self.profile_status { ui.label(status); }
                     ui.label("This action launches only these selected POKE entries. Sources, pin, game identity and core are checked again before launch. This launch starts from the snapshot with automatic state loading disabled. In-game activation remains unconfirmed.");
                     ui.label("These trainers require review before launch. Approval does not confirm that they work in this game.");
                     ui.add_enabled_ui(!requested.is_empty(), |ui| { ui.checkbox(&mut self.acknowledged, "I reviewed these POKE trainers for this game"); });

@@ -17,6 +17,7 @@ use crate::patch_manager::{
     assess_cheat_applicability, parse_cht_text, validate_destination_root,
 };
 use crate::safe_read::TrustedRoots;
+use serde::{Deserialize, Serialize};
 
 /// Empirically exercised installed native core, not a name-based assertion.
 /// An upgrade must be tested again before its digest can be added.
@@ -42,6 +43,95 @@ impl PokeLaunchPreview {
     pub fn game_path(&self) -> &Path {
         &self.path
     }
+    pub fn identity_summary(&self) -> String {
+        self.cheats
+            .first()
+            .and_then(|c| c.target_identity.clone())
+            .unwrap_or_default()
+    }
+    pub fn entry_summary(&self, index: usize) -> Option<String> {
+        self.cheats.get(index).map(|cheat| {
+            cheat
+                .operations
+                .iter()
+                .map(|op| {
+                    format!(
+                        "bank {:?}, address {}, value {}, restore {:?}",
+                        op.bank,
+                        op.address.0,
+                        op.value.value,
+                        op.restore_value.map(|v| v.value)
+                    )
+                })
+                .collect::<Vec<_>>()
+                .join("; ")
+        })
+    }
+}
+
+/// A saved choice is bound to the exact snapshot, trainer and pin observed at
+/// preview time. It is never an instruction to start or activate an emulator.
+#[derive(Debug, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct SavedPokeProfile {
+    version: u8,
+    game_path: PathBuf,
+    game_sha256: String,
+    trainer_sha256: String,
+    pin_sha256: String,
+    identity: Vec<String>,
+    selected: Vec<usize>,
+}
+
+fn profile_for(preview: &PokeLaunchPreview, selected: &[usize]) -> SavedPokeProfile {
+    SavedPokeProfile {
+        version: 1,
+        game_path: preview.path.clone(),
+        game_sha256: preview.observations[0].1.sha256.clone(),
+        trainer_sha256: preview.observations[1].1.sha256.clone(),
+        pin_sha256: preview.observations[2].1.sha256.clone(),
+        identity: preview.game.identities.clone(),
+        selected: selected.to_vec(),
+    }
+}
+
+pub fn save_profile(
+    path: &Path,
+    preview: &PokeLaunchPreview,
+    selected: &[usize],
+) -> Result<(), String> {
+    // The same composition gate used at launch rejects unsupported banks,
+    // overlapping addresses, duplicate selections and unrepresentable titles.
+    compose(preview, selected)?;
+    let parent = path.parent().ok_or("Profile has no parent directory.")?;
+    std::fs::create_dir_all(parent).map_err(|e| e.to_string())?;
+    let body =
+        serde_json::to_string_pretty(&profile_for(preview, selected)).map_err(|e| e.to_string())?;
+    crate::atomic_write_text(path, &body).map_err(|e| e.to_string())
+}
+
+pub fn load_profile(path: &Path, preview: &PokeLaunchPreview) -> Result<Vec<usize>, String> {
+    let metadata = std::fs::symlink_metadata(path).map_err(|e| e.to_string())?;
+    if !metadata.is_file() || metadata.len() > 4096 {
+        return Err("Saved POKE profile is not a bounded regular file.".into());
+    }
+    let bytes = std::fs::read(path).map_err(|e| e.to_string())?;
+    if bytes.len() > 4096 {
+        return Err("Saved POKE profile is too large.".into());
+    }
+    let saved: SavedPokeProfile = serde_json::from_slice(&bytes)
+        .map_err(|e| format!("Saved POKE profile is invalid: {e}"))?;
+    if saved.version != 1
+        || saved.game_path != preview.path
+        || saved.game_sha256 != preview.observations[0].1.sha256
+        || saved.trainer_sha256 != preview.observations[1].1.sha256
+        || saved.pin_sha256 != preview.observations[2].1.sha256
+        || saved.identity != preview.game.identities
+    {
+        return Err("Saved POKE profile belongs to a different game revision, trainer or verified identity. Review and save a new choice.".into());
+    }
+    compose(preview, &saved.selected)?;
+    Ok(saved.selected)
 }
 
 /// Reuses the pin parser and retained, bounded source reads from pin creation.
@@ -336,6 +426,28 @@ mod tests {
     };
     use crate::patch_manager::CheatApplicabilityMatch;
     use crate::patch_manager::{CheatDerivativeInput, render_retroarch_selected_derivative};
+
+    #[test]
+    fn saved_choice_is_bound_to_exact_game_and_trainer_and_never_activates() {
+        let (dir, game, path, roots) = fixture();
+        let selected_preview = preview(&game, &path, &roots).unwrap();
+        let saved = dir.path().join("profiles/choice.json");
+        save_profile(&saved, &selected_preview, &[0, 1]).unwrap();
+        assert_eq!(load_profile(&saved, &selected_preview).unwrap(), vec![0, 1]);
+        assert!(
+            !std::fs::read_to_string(&saved)
+                .unwrap()
+                .contains("activate")
+        );
+        assert!(save_profile(&saved, &selected_preview, &[0, 0]).is_err());
+        assert!(save_profile(&saved, &selected_preview, &[0, 99]).is_err());
+        let mut other = game.clone();
+        other.identities.push(format!("sha1:{}", "a".repeat(40)));
+        let changed = preview(&other, &path, &roots).unwrap();
+        assert!(load_profile(&saved, &changed).is_err());
+        std::fs::write(path.with_extension("pok"), "N Other\nZ 8 40000 1 0\nY\n").unwrap();
+        assert!(preview(&game, &path, &roots).is_err());
+    }
 
     fn fixture() -> (tempfile::TempDir, ClassicTrainerGame, PathBuf, TrustedRoots) {
         let dir = tempfile::tempdir().unwrap();
