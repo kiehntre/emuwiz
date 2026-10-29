@@ -377,6 +377,7 @@ mod tests {
     use std::os::unix::fs::{PermissionsExt, symlink};
 
     fn fixture() -> (tempfile::TempDir, PathBuf, RestrictedFileStore) {
+        // Test HOME may be inside the checkout; the store must reject Git worktrees.
         let root = tempfile::Builder::new()
             .prefix("emuwiz-screenscraper-file-test-")
             .tempdir()

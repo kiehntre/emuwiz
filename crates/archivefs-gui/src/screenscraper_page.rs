@@ -1060,6 +1060,7 @@ mod tests {
     #[cfg(target_os = "linux")]
     #[test]
     fn managed_env_is_created_then_survives_app_restart_update_and_forget() {
+        // Test HOME may sit inside the checkout, which file storage must reject.
         let root = tempfile::Builder::new()
             .prefix("emuwiz-screenscraper-file-test-")
             .tempdir()
