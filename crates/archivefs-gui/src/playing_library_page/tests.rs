@@ -746,7 +746,14 @@ fn retrodeck_gui_apply_requires_confirmation_then_publishes_and_rolls_back() {
     );
     assert_eq!(std::fs::read(&original).unwrap(), b"test");
     let ctx = egui::Context::default();
-    let (output, _) = render(&ctx, &mut state, base_input());
+    let receipt_input = || egui::RawInput {
+        screen_rect: Some(egui::Rect::from_min_size(
+            egui::Pos2::ZERO,
+            egui::vec2(1000.0, 2600.0),
+        )),
+        ..Default::default()
+    };
+    let (output, _) = render(&ctx, &mut state, receipt_input());
     assert!(rendered_text_contains(&output, "RetroDECK library created"));
     state.rollback_retrodeck();
     assert_eq!(
@@ -754,7 +761,7 @@ fn retrodeck_gui_apply_requires_confirmation_then_publishes_and_rolls_back() {
         "<gameList>\n<!-- keep -->\n</gameList>\n"
     );
     assert!(!destinations.iter().any(|path| path.exists()));
-    let (output, _) = render(&ctx, &mut state, base_input());
+    let (output, _) = render(&ctx, &mut state, receipt_input());
     assert!(rendered_text_contains(
         &output,
         "RetroDECK library rolled back"
