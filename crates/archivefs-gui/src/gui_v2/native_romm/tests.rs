@@ -16,6 +16,7 @@ struct Fixture {
     version: &'static str,
     status: u16,
     artwork: bool,
+    platforms_status: u16,
     requests: Mutex<Vec<String>>,
 }
 impl Default for Fixture {
@@ -24,6 +25,7 @@ impl Default for Fixture {
             version: "5.3.1",
             status: 200,
             artwork: false,
+            platforms_status: 200,
             requests: Mutex::new(vec![]),
         }
     }
@@ -98,6 +100,13 @@ impl RommTransport for Fixture {
                 location: None,
             });
         } else if path == "api/platforms" {
+            if self.platforms_status != 200 {
+                return Ok(RommHttpResponse {
+                    status: self.platforms_status,
+                    body: TOKEN.as_bytes().to_vec(),
+                    location: None,
+                });
+            }
             json!([{"id":7,"slug":"gb","fs_slug":"gb","name":"Game Boy","rom_count":55},{"id":8,"slug":"custom","name":"Custom console","rom_count":0}])
         } else if path.starts_with("api/roms?") {
             assert!(authorization.is_some());
@@ -323,6 +332,69 @@ fn successful_connection_loads_a_bounded_first_page() {
     let text = text(&mut state);
     assert!(text.contains("Connected to your RomM server"));
     assert!(text.contains("Showing 1–50 of 55"));
+}
+#[test]
+fn platform_list_failure_keeps_browsing_available() {
+    let fixture = Fixture {
+        platforms_status: 503,
+        ..Default::default()
+    };
+    let reply = call(&fixture, Request::Connect);
+    let mut state = State {
+        open: true,
+        settings_loaded: true,
+        configured: true,
+        ..Default::default()
+    };
+    state.absorb(&egui::Context::default(), 0, Ok(reply));
+    assert!(state.connected());
+    assert_eq!(state.page.as_ref().unwrap().games.len(), 50);
+    assert!(state.platform_warning);
+    let view = text(&mut state);
+    assert!(view.contains("platform list could not be loaded"));
+    assert!(view.contains("Showing 1–50 of 55"));
+    assert!(!view.contains(TOKEN));
+}
+#[test]
+fn cached_pages_and_details_are_reused_and_reconnect_clears_them() {
+    let mut state = connected();
+    let first = state.page.clone().unwrap();
+    state.games(0);
+    assert!(state.browse.pending.is_none());
+    assert!(Arc::ptr_eq(&first, state.page.as_ref().unwrap()));
+    state.select_game(1);
+    assert!(matches!(state.browse.pending, Some(Request::Detail(1))));
+    let reply = call(&Fixture::default(), Request::Detail(1));
+    state.absorb(&egui::Context::default(), state.generation, Ok(reply));
+    state.back();
+    state.select_game(1);
+    assert!(state.browse.pending.is_none());
+    assert!(state.detail.is_some());
+    state.queue(Request::Connect);
+    assert!(state.pages.is_empty());
+    assert!(state.details.is_empty());
+}
+#[test]
+fn browser_fits_a_1024_by_600_display() {
+    let mut state = connected();
+    let ctx = egui::Context::default();
+    let _ = ctx.run(
+        egui::RawInput {
+            screen_rect: Some(egui::Rect::from_min_size(
+                egui::Pos2::ZERO,
+                egui::vec2(1024.0, 600.0),
+            )),
+            ..Default::default()
+        },
+        |ctx| {
+            state.show(ctx);
+        },
+    );
+    let rect = ctx
+        .memory(|memory| memory.area_rect(egui::Id::new("native-romm-browser")))
+        .unwrap();
+    assert!(rect.max.x <= 1024.0, "{rect:?}");
+    assert!(rect.max.y <= 600.0, "{rect:?}");
 }
 #[test]
 fn dns_failure_explains_possible_causes_and_recovery_without_raw_errors() {
@@ -598,6 +670,8 @@ fn detail_uses_external_identity_evidence_and_backend_metadata() {
     assert!(text.contains("Identity clues from RomM"));
     assert!(text.contains("RomM suggests"));
     assert!(text.contains("external evidence"));
+    assert!(text.contains("Find in local games"));
+    assert!(text.contains("does not verify that a local ROM exists"));
     assert!(text.contains("deadbeef"));
 }
 #[test]

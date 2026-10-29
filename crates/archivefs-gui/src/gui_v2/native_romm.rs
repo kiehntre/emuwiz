@@ -169,6 +169,7 @@ pub(in crate::gui_v2) enum Reply {
         info: RommServerInfo,
         platforms: Vec<RommPlatformSummary>,
         page: Option<RommBrowsePage>,
+        platform_warning: bool,
         token: RommToken,
     },
     Page(RommBrowsePage, RommToken),
@@ -331,6 +332,9 @@ pub(super) struct State {
     token: Option<RommToken>,
     platforms: Vec<RommPlatformSummary>,
     page: Option<Arc<RommBrowsePage>>,
+    pages: HashMap<(Option<u64>, String, u32), Arc<RommBrowsePage>>,
+    details: HashMap<u64, Arc<RommGameDetail>>,
+    platform_warning: bool,
     search: String,
     platform: Option<u64>,
     offset: u32,
@@ -343,6 +347,7 @@ pub(super) struct State {
     covers: HashMap<u64, Option<egui::TextureHandle>>,
     text_focused: bool,
     visible_last_frame: bool,
+    local_handoff: bool,
     #[cfg(test)]
     test_root: Option<PathBuf>,
 }
@@ -361,6 +366,9 @@ impl Default for State {
             token: None,
             platforms: vec![],
             page: None,
+            pages: HashMap::new(),
+            details: HashMap::new(),
+            platform_warning: false,
             search: String::new(),
             platform: None,
             offset: 0,
@@ -373,6 +381,7 @@ impl Default for State {
             covers: HashMap::new(),
             text_focused: false,
             visible_last_frame: false,
+            local_handoff: false,
             #[cfg(test)]
             test_root: None,
         }
@@ -391,6 +400,9 @@ impl State {
     }
     pub(super) fn is_open(&self) -> bool {
         self.open
+    }
+    pub(super) fn take_local_handoff(&mut self) -> bool {
+        std::mem::take(&mut self.local_handoff)
     }
     pub(super) fn open(&mut self, roots: Vec<PathBuf>) {
         self.open = true;
@@ -414,6 +426,9 @@ impl State {
             self.selected = None;
             self.detail = None;
             self.covers.clear();
+            self.pages.clear();
+            self.details.clear();
+            self.platform_warning = false;
         }
         self.problem = None;
         self.retry = request.clone();
@@ -431,10 +446,33 @@ impl State {
         self.detail = None;
         self.page = None;
         self.covers.clear();
+        let key = self.page_key(offset);
+        if let Some(cached) = self.pages.get(&key).cloned() {
+            self.invalidate();
+            self.problem = None;
+            self.page = Some(cached);
+            return;
+        }
         self.queue(Request::Games {
             offset,
             filter: self.filter(),
         });
+    }
+    fn page_key(&self, offset: u32) -> (Option<u64>, String, u32) {
+        (self.platform, self.search.trim().to_owned(), offset)
+    }
+    fn select_game(&mut self, id: u64) {
+        self.selected = Some(id);
+        self.last_selected = Some(id);
+        self.detail = None;
+        self.text_focused = false;
+        if let Some(detail) = self.details.get(&id).cloned() {
+            self.invalidate();
+            self.problem = None;
+            self.detail = Some(detail);
+        } else {
+            self.queue(Request::Detail(id));
+        }
     }
     fn edit_search(&mut self, now: Instant) {
         self.invalidate();
@@ -461,6 +499,8 @@ impl State {
         self.info = None;
         self.token = None;
         self.page = None;
+        self.pages.clear();
+        self.details.clear();
         self.problem = None;
         self.visible_last_frame = false;
     }
@@ -536,6 +576,7 @@ impl State {
                 info,
                 platforms,
                 page,
+                platform_warning,
                 token,
             }) => {
                 self.problem = info.error.clone().map(Problem::Backend);
@@ -545,7 +586,13 @@ impl State {
                 self.info = Some(info);
                 self.token = Some(token);
                 self.platforms = platforms;
+                self.platform_warning = platform_warning;
                 self.page = page.map(Arc::new);
+                self.pages.clear();
+                self.details.clear();
+                if let Some(page) = &self.page {
+                    self.pages.insert((None, String::new(), 0), page.clone());
+                }
                 self.search.clear();
                 self.platform = None;
                 self.offset = 0;
@@ -555,12 +602,22 @@ impl State {
                 self.covers.clear();
             }
             Ok(Reply::Page(page, token)) => {
-                self.page = Some(Arc::new(page));
+                let page = Arc::new(page);
+                if self.pages.len() >= 12 {
+                    self.pages.clear();
+                }
+                self.pages.insert(self.page_key(page.offset), page.clone());
+                self.page = Some(page);
                 self.token = Some(token);
             }
             Ok(Reply::Detail(detail, token)) => {
                 if self.selected == Some(detail.game.id) {
-                    self.detail = Some(Arc::new(detail));
+                    let detail = Arc::new(detail);
+                    if self.details.len() >= 32 {
+                        self.details.clear();
+                    }
+                    self.details.insert(detail.game.id, detail.clone());
+                    self.detail = Some(detail);
                     self.token = Some(token);
                 } else {
                     return false;
@@ -629,7 +686,7 @@ impl State {
             .id(egui::Id::new("native-romm-browser"))
             .open(&mut open)
             .collapsible(false)
-            .default_size(egui::vec2(850.0, 620.0))
+            .default_size(egui::vec2(850.0, 500.0))
             .min_size(egui::vec2(360.0, 280.0))
             .max_size(screen - egui::vec2(24.0, 50.0))
             .show(ctx, |ui| {
@@ -673,6 +730,9 @@ impl State {
                 });
             } else if self.connected() && self.problem.is_none() {
                 ui.strong("Connected to your RomM server.");
+                if let Some(info) = &self.info {
+                    ui.label(format!("Server: {}", self.display(&info.server_id)));
+                }
             } else if self.problem.is_none() {
                 ui.strong("Your RomM settings are ready.");
                 ui.label("Connect to browse your library.");
@@ -763,7 +823,7 @@ impl State {
             ui.weak("Search is unavailable on this RomM server. You can still browse its pages.");
         }
         ui.horizontal_wrapped(|ui| {
-            ui.label("Platform");
+            ui.label("Library / platform");
             ui.add_enabled_ui(
                 capabilities.platform_filter && !self.platforms.is_empty(),
                 |ui| {
@@ -794,11 +854,15 @@ impl State {
                 .add_enabled(!self.browse.active(), egui::Button::new("Refresh games"))
                 .clicked()
             {
+                self.pages.clear();
                 self.games(self.offset);
             }
         });
         if capabilities.platforms && self.platforms.is_empty() {
             ui.weak("No platforms are visible to this connection. The server may be empty or this login may have limited access.");
+        }
+        if self.platform_warning {
+            ui.weak("The platform list could not be loaded. You can still browse and search all RomM games; retry the connection to restore platform choices.");
         }
         if !capabilities.platform_filter {
             ui.weak("Platform filtering is unavailable on this server.");
@@ -868,11 +932,7 @@ impl State {
                                 .selected(self.last_selected == Some(game.id))
                                 .wrap();
                             if ui.add_enabled(capabilities.game_detail, button).clicked() {
-                                self.selected = Some(game.id);
-                                self.last_selected = Some(game.id);
-                                self.detail = None;
-                                self.text_focused = false;
-                                self.queue(Request::Detail(game.id));
+                                self.select_game(game.id);
                             }
                             ui.weak(self.display(&self.game_platform(game)));
                             if !game.identity.regions.is_empty() {
@@ -963,6 +1023,12 @@ impl State {
             self.display(&self.game_platform(game))
         ));
         ui.label("This is external evidence from RomM. EmuWiz's verified identity and your chosen metadata remain unchanged.");
+        ui.label("To import or launch a game, find its local file in Browse & Play. A RomM listing alone does not verify that a local ROM exists or is ready to launch.");
+        if ui.button("Find in local games").clicked() {
+            self.local_handoff = true;
+            self.open = false;
+            self.invalidate();
+        }
         for hash in &game.identity.hashes {
             ui.label(format!(
                 "{:?}: {}",

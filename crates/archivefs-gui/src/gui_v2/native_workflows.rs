@@ -2779,6 +2779,9 @@ impl NativeWorkflows {
             self.app.open_romm_configuration();
             self.app.romm_ui.config_draft = Some(Box::new(draft));
         }
+        if self.native_romm.take_local_handoff() {
+            return Some(Route::BrowsePlay);
+        }
         route
     }
 
