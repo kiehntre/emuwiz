@@ -221,10 +221,9 @@ impl State {
             .job
             .as_ref()
             .is_some_and(|job| job.kind == JobKind::Plan)
+            && let Some(job) = self.job.take()
         {
-            if let Some(job) = self.job.take() {
-                job.cancel.store(true, Ordering::Relaxed);
-            }
+            job.cancel.store(true, Ordering::Relaxed);
         }
         self.scope = Some((path.to_path_buf(), library_key));
         self.destination = suggested_destination(game, set);
@@ -418,10 +417,10 @@ impl State {
             ui.horizontal(|ui| {
                 let width = (ui.available_width() - 90.0).max(120.0);
                 ui.add(egui::TextEdit::singleline(&mut self.writer).desired_width(width));
-                if ui.button("Browse…").clicked() {
-                    if let Some(path) = rfd::FileDialog::new().pick_file() {
-                        self.writer = path.display().to_string();
-                    }
+                if ui.button("Browse…").clicked()
+                    && let Some(path) = rfd::FileDialog::new().pick_file()
+                {
+                    self.writer = path.display().to_string();
                 }
             });
             ui.small(format!("Choose the user-installed, pinned {WRITER_RELEASE} Linux build; Core checks its binary and required resources."));
@@ -429,13 +428,12 @@ impl State {
             ui.horizontal(|ui| {
                 let width = (ui.available_width() - 90.0).max(120.0);
                 ui.add(egui::TextEdit::singleline(&mut self.destination).desired_width(width));
-                if ui.button("Choose…").clicked() {
-                    if let Some(path) = rfd::FileDialog::new()
+                if ui.button("Choose…").clicked()
+                    && let Some(path) = rfd::FileDialog::new()
                         .add_filter("PBP", &["pbp"])
                         .save_file()
-                    {
-                        self.destination = path.display().to_string();
-                    }
+                {
+                    self.destination = path.display().to_string();
                 }
             });
             if self.writer != old_writer || self.destination != old_destination {
@@ -776,12 +774,14 @@ mod tests {
     #[test]
     fn same_path_in_new_library_does_not_show_old_result() {
         let selected = game(1);
-        let mut state = State::default();
-        state.last = Some((
-            selected.archive.absolute_path.clone(),
-            1,
-            Err(failure("old library result")),
-        ));
+        let mut state = State {
+            last: Some((
+                selected.archive.absolute_path.clone(),
+                1,
+                Err(failure("old library result")),
+            )),
+            ..Default::default()
+        };
         let context = egui::Context::default();
         let output = context.run(
             egui::RawInput {

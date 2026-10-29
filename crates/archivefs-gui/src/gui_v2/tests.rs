@@ -4946,14 +4946,23 @@ fn gui_v2_game_details_keep_artwork_actions_and_metadata_together() {
     let mut strings = text(&pump_imagery(&context, &mut app, [1280.0, 1200.0]));
     // Screenshots may be below the fold after the upper guidance/readiness
     // content; they must remain reachable with ordinary page scrolling.
-    strings.extend(text(&scroll_page(&context, &mut app, [1280.0, 1200.0])));
-    for expected in [
+    let expected = [
         "Play",
         "PSX · Game image",
         "Verify",
         "Open Folder",
         "No screenshots found for this game.",
-    ] {
+    ];
+    for _ in 0..8 {
+        if expected
+            .iter()
+            .all(|value| strings.iter().any(|seen| seen == value))
+        {
+            break;
+        }
+        strings.extend(text(&scroll_page(&context, &mut app, [1280.0, 1200.0])));
+    }
+    for expected in expected {
         assert!(
             strings.iter().any(|value| value == expected),
             "{expected}: {strings:?}"
