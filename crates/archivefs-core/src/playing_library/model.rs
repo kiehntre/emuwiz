@@ -222,6 +222,9 @@ pub struct PlayingLibraryPolicy {
 /// trusted evidence is reported as absence, not guessed at.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CandidateEvidenceSummary {
+    /// DAT member status after checksum verification: good, uncertain, or
+    /// NO_DUMP. A checksum match alone does not erase a BAD_DUMP declaration.
+    pub dump_quality: String,
     /// Recognized provider-region tokens from the canonical DAT entry
     /// name. Empty means unknown - no recognized region evidence exists.
     pub regions: Vec<String>,
@@ -249,6 +252,7 @@ impl CandidateEvidenceSummary {
     /// field), never in place of a real, empty scan result.
     pub fn unknown() -> Self {
         Self {
+            dump_quality: "unknown".into(),
             regions: Vec::new(),
             languages: Vec::new(),
             revision: None,
@@ -381,8 +385,8 @@ pub struct PlayingLibraryPlan {
     pub elected_games: Vec<ElectedGame>,
     pub unresolved_groups: Vec<UnresolvedGroup>,
     pub exclusions: Vec<ExcludedCandidate>,
-    /// Archives in singleton families are always elected trivially; this
-    /// counts them so callers can reconcile
+    /// Archives in singleton families, including those whose relationship
+    /// evidence needs review; this counts them so callers can reconcile
     /// "2084 files -> XXX families -> YYY games".
     pub singleton_families: usize,
     pub conflicts: Vec<DestinationConflict>,

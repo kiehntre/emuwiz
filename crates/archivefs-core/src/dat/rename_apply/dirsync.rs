@@ -89,6 +89,75 @@ pub(crate) struct RenameDirs {
 
 #[cfg(unix)]
 impl RenameDirs {
+    /// Creates a symlink inside the verified destination parent. The kernel
+    /// resolves the parent descriptor, so a later path swap cannot redirect
+    /// this operation to an unrelated directory.
+    pub(crate) fn create_link(&self, target: &Path) -> io::Result<super::model::ObjectIdentity> {
+        use std::ffi::CString;
+        use std::os::fd::AsRawFd;
+        use std::os::unix::ffi::OsStrExt;
+        self.verify_bound()?;
+        let target_text = target.to_path_buf();
+        let target = CString::new(target.as_os_str().as_bytes())
+            .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "invalid link target"))?;
+        let name = CString::new(self.destination_name.as_bytes())
+            .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "invalid link name"))?;
+        // SAFETY: both C strings and the destination descriptor remain live.
+        if unsafe {
+            libc::symlinkat(
+                target.as_ptr(),
+                self.destination_dir.as_raw_fd(),
+                name.as_ptr(),
+            )
+        } < 0
+        {
+            return Err(io::Error::last_os_error());
+        }
+        let proof = super::identity::capture_identity(&self.destination_entry())?;
+        if proof.kind != super::model::ObjectKind::Symlink
+            || std::fs::read_link(self.destination_entry())? != target_text
+        {
+            return Err(io::Error::other(
+                "created link changed before it could be proved",
+            ));
+        }
+        self.destination_dir.sync_all()?;
+        self.verify_bound()?;
+        Ok(proof)
+    }
+
+    /// Removes only the journal-proved link in the bound destination parent.
+    /// A path substitution before binding or a different link object refuses.
+    pub(crate) fn remove_recorded_link(
+        &self,
+        expected: &super::model::ObjectIdentity,
+        target: &Path,
+    ) -> io::Result<()> {
+        use std::ffi::CString;
+        use std::os::fd::AsRawFd;
+        use std::os::unix::ffi::OsStrExt;
+        self.verify_bound()?;
+        let entry = self.destination_entry();
+        let current = super::identity::capture_identity(&entry)?;
+        if current.kind != super::model::ObjectKind::Symlink
+            || !super::identity::identity_matches(expected, &current)
+            || std::fs::read_link(&entry)? != target
+        {
+            return Err(io::Error::other(
+                "destination is not the journal-proved link object",
+            ));
+        }
+        let name = CString::new(self.destination_name.as_bytes())
+            .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "invalid destination name"))?;
+        // SAFETY: the verified destination parent descriptor and NUL-terminated
+        // filename remain live for the syscall; unlinkat never follows a link.
+        if unsafe { libc::unlinkat(self.destination_dir.as_raw_fd(), name.as_ptr(), 0) } < 0 {
+            return Err(io::Error::last_os_error());
+        }
+        self.destination_dir.sync_all()?;
+        self.verify_bound()
+    }
+
     /// Opens (O_DIRECTORY|O_NOFOLLOW|O_CLOEXEC) and verifies both parents.
     pub(crate) fn open(source: &Path, destination: &Path) -> io::Result<Self> {
         let split = |path: &Path| -> io::Result<(std::path::PathBuf, std::ffi::OsString)> {

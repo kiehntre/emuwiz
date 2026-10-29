@@ -286,17 +286,10 @@ pub fn run_preflight(
         TransactionOperation::ReplaceExisting { .. }
     ) {
         // The exact existing target was checked above; existence alone grants no authority.
-    } else if let Ok(metadata) = std::fs::symlink_metadata(&entry.destination_path) {
-        if let Some(expected_target) = link_operation {
-            if !metadata.file_type().is_symlink()
-                || std::fs::read_link(&entry.destination_path).ok().as_deref()
-                    != Some(expected_target)
-            {
-                failures.push(PreflightFailure::DestinationExists);
-            }
-        } else {
-            failures.push(PreflightFailure::DestinationExists);
-        }
+    } else if std::fs::symlink_metadata(&entry.destination_path).is_ok() {
+        // Even an equal-looking symlink is not proof that this transaction
+        // created it. A fresh transaction must never claim or Undo it.
+        failures.push(PreflightFailure::DestinationExists);
     } else {
         // Case-only collision re-checked against the live destination
         // directory: a file whose name differs from the destination only by

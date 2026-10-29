@@ -264,7 +264,7 @@ pub fn apply_transaction(execution: &mut ApplyExecution<'_>) -> Result<ApplyOutc
         &execution.journal_dir,
         execution.transaction,
     )
-    .map_err(ApplyError::Journal)?;
+    .map_err(|error| ApplyError::Journal(error.to_string()))?;
     apply_transaction_inner(execution)
 }
 
@@ -276,7 +276,7 @@ pub(crate) fn apply_retrodeck_transaction(
         &execution.journal_dir,
         execution.transaction,
     )
-    .map_err(ApplyError::Journal)?;
+    .map_err(|error| ApplyError::Journal(error.to_string()))?;
     apply_transaction_inner(execution)
 }
 
@@ -432,7 +432,7 @@ fn apply_transaction_inner(execution: &mut ApplyExecution<'_>) -> Result<ApplyOu
         // this transaction did not create (see `LINK_ADOPTED_KEY`).
         let catalogue =
             crate::database::organisation_paths::begin(&transaction.entries[index], false, false)
-                .map_err(ApplyError::Journal)?;
+                .map_err(|error| ApplyError::Journal(error.to_string()))?;
         let prior_state = transaction.entries[index].state;
         if prior_state == EntryState::Planned {
             if let Err(reason) = record_link_adoption(&mut transaction.entries[index]) {
@@ -505,8 +505,42 @@ fn apply_transaction_inner(execution: &mut ApplyExecution<'_>) -> Result<ApplyOu
             .unwrap_or_else(|| apply_mutation_in(&transaction.entries[index], &execution.trusted))
         {
             Ok(()) => {
+                if let TransactionOperation::CreateSymlink {
+                    expected_target, ..
+                } = &transaction.entries[index].operation
+                {
+                    if link_adoption(&transaction.entries[index]) == Some(false)
+                        && transaction.entries[index].created_link_identity().is_none()
+                    {
+                        let proof = capture_identity(&transaction.entries[index].destination_path);
+                        let target =
+                            std::fs::read_link(&transaction.entries[index].destination_path);
+                        match (proof, target) {
+                            (Ok(proof), Ok(target))
+                                if proof.kind == super::model::ObjectKind::Symlink
+                                    && target == *expected_target =>
+                            {
+                                transaction.entries[index]
+                                    .record_created_link(&proof)
+                                    .map_err(|error| ApplyError::Journal(error.to_string()))?;
+                            }
+                            _ => {
+                                transaction.entries[index].state = EntryState::ApplyFailed;
+                                transaction.entries[index].failure_reason = Some(
+                                    "created link could not be proved; review the journal".into(),
+                                );
+                                transaction.state = TransactionState::ApplyFailed;
+                                write_journal(&execution.journal_dir, transaction)
+                                    .map_err(|error| ApplyError::Journal(error.to_string()))?;
+                                break;
+                            }
+                        }
+                    }
+                }
                 if let Some(catalogue) = catalogue {
-                    catalogue.commit().map_err(ApplyError::Journal)?;
+                    catalogue
+                        .commit()
+                        .map_err(|error| ApplyError::Journal(error.to_string()))?;
                 }
                 transaction.entries[index].state = EntryState::Applied;
                 transaction.entries[index].applied_at_unix = Some(crate::dat::sources::now_unix());
@@ -596,7 +630,8 @@ pub(crate) fn apply_mutation_in(
         destination_root,
     } = &entry.operation
     {
-        return apply_symlink_mutation(entry, expected_target, destination_root);
+        return apply_symlink_mutation(entry, expected_target, destination_root, trusted)
+            .map(|_| ());
     }
     if let TransactionOperation::CreateHardlink {
         expected_source,
@@ -900,6 +935,7 @@ fn apply_symlink_mutation(
     entry: &TransactionEntry,
     expected_target: &std::path::Path,
     destination_root: &std::path::Path,
+    trusted: &crate::safe_read::TrustedRoots,
 ) -> Result<(), (EntryState, String)> {
     if !expected_target.is_absolute() || expected_target != entry.source_path {
         return Err((
@@ -967,35 +1003,53 @@ fn apply_symlink_mutation(
         Err(error) => return Err((EntryState::ApplyFailed, error.to_string())),
     }
     #[cfg(unix)]
-    std::os::unix::fs::symlink(expected_target, &entry.destination_path)
-        .map_err(|error| (EntryState::ApplyFailed, error.to_string()))?;
+    {
+        let dirs = super::dirsync::RenameDirs::open_in(
+            &entry.source_path,
+            &entry.destination_path,
+            trusted,
+        )
+        .map_err(|error| {
+            (
+                EntryState::ApplyFailed,
+                format!("could not bind link directories: {error}"),
+            )
+        })?;
+        let bound_source = capture_identity(&dirs.source_entry()).map_err(|error| {
+            (
+                EntryState::ApplyFailed,
+                format!("bound link source is unavailable: {error}"),
+            )
+        })?;
+        if !super::identity::identity_matches(&entry.identity, &bound_source) {
+            return Err((
+                EntryState::ApplyFailed,
+                "bound link source changed since review".into(),
+            ));
+        }
+        dirs.create_link(expected_target)
+            .map_err(|error| (EntryState::ApplyFailed, error.to_string()))?;
+        let source_after = capture_identity(&dirs.source_entry()).map_err(|_| {
+            (
+                EntryState::ApplyFailed,
+                "link source disappeared".to_string(),
+            )
+        })?;
+        if super::preflight::destination_is_confined(&entry.destination_path, destination_root)
+            && super::identity::identity_matches(&entry.identity, &source_after)
+        {
+            return Ok(());
+        }
+        return Err((
+            EntryState::ApplyFailed,
+            "created link failed verification".into(),
+        ));
+    }
     #[cfg(not(unix))]
     return Err((
         EntryState::ApplyFailed,
         "symlink creation is unsupported on this platform".to_string(),
     ));
-    let source_after = capture_identity(&entry.source_path).map_err(|_| {
-        (
-            EntryState::ApplyFailed,
-            "link source disappeared".to_string(),
-        )
-    })?;
-    match std::fs::read_link(&entry.destination_path) {
-        Ok(target)
-            if target == expected_target
-                && super::preflight::destination_is_confined(
-                    &entry.destination_path,
-                    destination_root,
-                )
-                && super::identity::identity_matches(&entry.identity, &source_after) =>
-        {
-            Ok(())
-        }
-        _ => Err((
-            EntryState::ApplyFailed,
-            "created link failed verification".to_string(),
-        )),
-    }
 }
 
 /// Confirms, from the filesystem and INSIDE the bound directories, that a rename

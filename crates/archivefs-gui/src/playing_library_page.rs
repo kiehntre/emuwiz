@@ -20,16 +20,23 @@ mod presentation;
 mod retrodeck;
 
 use presentation::PreviewFilter;
+use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::AtomicBool;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, AtomicU8, Ordering};
 
 use archivefs_core::dat::catalogue_selection::{CatalogueRef, resolve_catalogue};
 use archivefs_core::dat::identity::DatPlatformIdentity;
+use archivefs_core::dat::model::ParsedDat;
 use archivefs_core::dat::rename_apply::executor::{
     ApplyExecution, HardConflictMode, apply_transaction,
 };
+use archivefs_core::dat::rename_apply::identity::{capture_identity, identity_matches};
 use archivefs_core::dat::rename_apply::journal::{default_rename_transaction_dir, write_journal};
-use archivefs_core::dat::rename_apply::model::{RenameTransaction, TransactionState};
+use archivefs_core::dat::rename_apply::model::{ObjectIdentity, ObjectKind};
+use archivefs_core::dat::rename_apply::model::{
+    RenameTransaction, RollbackResult, TransactionState,
+};
 use archivefs_core::dat::rename_apply::preflight::DirectoryPolicy;
 use archivefs_core::dat::rename_apply::rollback::rollback_transaction;
 use archivefs_core::emulator_environment::es_de::{EsDeEnvironmentReport, EsDeProfile};
@@ -39,32 +46,31 @@ use archivefs_core::launch::es_de_publish::{
     has_unresolved_es_de_gamelist_recovery, plan_es_de_gamelist_publication,
     recover_es_de_gamelist_publication,
 };
+use archivefs_core::playing_library::apply_adapter::prepare_destination_root;
 use archivefs_core::playing_library::{
-    CandidateEvidenceSummary, LibraryOutputProfile, LibraryOutputProjection, PlayingLibraryPlan,
-    PlayingLibraryPolicy, ReleaseClass, RetroDeckProjectionPlan, RetroDeckVisibility,
-    RommLibraryProjectionPlan, RommVisibility, build_playing_library_plan,
+    CandidateEvidenceSummary, DatArchiveMatch, LibraryOutputProfile, LibraryOutputProjection,
+    PlayingLibraryPlan, PlayingLibraryPolicy, ReleaseClass, RetroDeckProjectionPlan,
+    RetroDeckVisibility, RommLibraryProjectionPlan, RommVisibility, build_playing_library_plan,
     build_playing_library_transaction, build_retrodeck_projection,
     build_retrodeck_projection_transaction, build_romm_projection_transaction,
     build_romm_projection_with_visibility, inspect_library_output_ownership,
-    match_loose_files_against_dat, project_generic_playing_library,
+    match_loose_files_against_dat, override_verified_candidate, project_generic_playing_library,
 };
 use archivefs_core::safe_read::TrustedRoots;
 use eframe::egui;
 
 use crate::dat_catalogue_picker::{DatCataloguePickerState, DatCatalogueWorkflow};
-use crate::rom_organisation_page::collect_source_files;
+use crate::rom_organisation_page::collect_source_files_reported;
 use crate::ui::{components as widgets, theme};
 
 /// The confirmation phrase a user must type before a Create Playing Library
-/// apply larger than [`TYPED_CONFIRMATION_THRESHOLD`] runs - truthful
+/// apply runs - truthful
 /// wording, matching `crate::rom_organisation_page::apply_confirmation_phrase`
 /// for `OrganisationMode::BuildLinkedLibrary`: a link is created, nothing is
 /// renamed or moved.
 pub(crate) fn playing_library_confirmation_phrase(count: usize) -> String {
     format!("CREATE {count} LINKS")
 }
-
-pub(crate) const TYPED_CONFIRMATION_THRESHOLD: usize = 8;
 
 /// Beginner-facing destination choice. All variants use the existing
 /// Playing Library election and apply machinery; this selects the reviewed
@@ -106,6 +112,11 @@ pub(crate) struct PlayingLibraryPageState {
     /// Immutable, single-attempt source/content evidence captured before the
     /// preview is shown. Confirmation must never recapture a new baseline.
     preview_transaction: Option<(PlayingLibraryPlan, Result<RenameTransaction, String>)>,
+    verified_dat: Option<ParsedDat>,
+    verified_matches: Vec<DatArchiveMatch>,
+    candidate_overrides: BTreeMap<String, PathBuf>,
+    /// Content and object bindings captured during the reviewed preview.
+    preview_sources: BTreeMap<PathBuf, ObjectIdentity>,
     output_projection: Option<LibraryOutputProjection>,
     dat_platform_identity: Option<DatPlatformIdentity>,
     plan_generation: u64,
@@ -153,6 +164,7 @@ pub(crate) struct PlayingLibraryPageState {
     apply_error: Option<String>,
     journal_dir: PathBuf,
     async_busy: bool,
+    apply_stage: Arc<AtomicU8>,
 
     // --- "Publish to ES-DE" (see `archivefs_core::launch::es_de_publish`) ---
     //
@@ -197,7 +209,7 @@ impl Default for PlayingLibraryPageState {
             dat_path_draft: String::new(),
             source_root_draft: String::new(),
             destination_root_draft: String::new(),
-            preferred_regions_draft: "Europe, USA, Japan".to_string(),
+            preferred_regions_draft: "Europe, USA, Japan, Other".to_string(),
             preferred_languages_draft: String::new(),
             prefer_newest_revision: true,
             prefer_parent: true,
@@ -207,6 +219,10 @@ impl Default for PlayingLibraryPageState {
             exclude_sample: true,
             plan: None,
             preview_transaction: None,
+            verified_dat: None,
+            verified_matches: Vec::new(),
+            candidate_overrides: BTreeMap::new(),
+            preview_sources: BTreeMap::new(),
             output_projection: None,
             dat_platform_identity: None,
             plan_generation: 0,
@@ -246,6 +262,7 @@ impl Default for PlayingLibraryPageState {
                 PathBuf::from(archivefs_core::dat::rename_apply::RENAME_TRANSACTIONS_DIRECTORY)
             }),
             async_busy: false,
+            apply_stage: Arc::new(AtomicU8::new(0)),
             esde_platform_id: None,
             esde_profile: None,
             esde_discovery_error: None,
@@ -472,8 +489,7 @@ impl PlayingLibraryPageState {
 
     pub(crate) fn input_fingerprint(&self) -> String {
         format!(
-            "{}|{:?}|{:?}|{}|{}|{}|{}|{}|{}|{}|{}|{}|{}",
-            self.plan_generation,
+            "{:?}|{:?}|{}|{}|{}|{}|{}|{}|{}|{}|{}|{}|{:?}",
             self.destination,
             self.selected_catalogue,
             self.source_root_draft,
@@ -486,7 +502,31 @@ impl PlayingLibraryPageState {
             self.exclude_proto,
             self.exclude_demo,
             self.exclude_sample,
+            self.candidate_overrides,
         )
+    }
+
+    pub(crate) fn set_candidate_override(&mut self, family: String, source: PathBuf) {
+        self.candidate_overrides.insert(family, source);
+    }
+
+    pub(crate) fn clear_candidate_overrides(&mut self) {
+        self.candidate_overrides.clear();
+    }
+
+    pub(crate) fn verified_paths_named(&self, name: &str) -> Vec<PathBuf> {
+        let Some(dat) = &self.verified_dat else {
+            return Vec::new();
+        };
+        self.verified_matches
+            .iter()
+            .filter(|candidate| {
+                dat.games
+                    .get(candidate.dat_entry_index)
+                    .is_some_and(|entry| entry.name == name)
+            })
+            .map(|candidate| candidate.archive_path.clone())
+            .collect()
     }
 
     pub(crate) fn merge_async_apply_result(&mut self, result: Self) {
@@ -552,6 +592,9 @@ impl PlayingLibraryPageState {
     pub(crate) fn preview(&mut self) {
         self.plan = None;
         self.preview_transaction = None;
+        self.verified_dat = None;
+        self.verified_matches.clear();
+        self.preview_sources.clear();
         self.output_projection = None;
         self.dat_platform_identity = None;
         self.romm_projection = None;
@@ -601,7 +644,15 @@ impl PlayingLibraryPageState {
         };
         self.dat_platform_identity = Some(resolved.dat_platform_identity());
 
-        let candidates = collect_source_files(std::slice::from_ref(&source_root));
+        let scan = collect_source_files_reported(std::slice::from_ref(&source_root), 20_000, 16);
+        if !scan.incomplete.is_empty() {
+            self.error = Some(format!(
+                "source scan is incomplete; no selection was made: {}",
+                scan.incomplete[0]
+            ));
+            return;
+        }
+        let candidates = scan.files;
         let trusted = TrustedRoots::from_paths([&source_root]);
         let outcome_matches = match_loose_files_against_dat(
             &resolved.parsed,
@@ -614,13 +665,30 @@ impl PlayingLibraryPageState {
         self.review_paths = presentation::unrepresented_paths(&candidates, &outcome_matches);
 
         let request = resolved.playing_library_request(
-            outcome_matches.matches,
+            outcome_matches.matches.clone(),
             destination_root.clone(),
             self.build_policy(),
         );
         match build_playing_library_plan(&request) {
             Ok(mut plan) => {
+                self.verified_dat = Some(resolved.parsed.clone());
+                self.verified_matches = outcome_matches.matches;
                 plan.rejected_launchers = outcome_matches.rejected_launchers;
+                for (family, source) in &self.candidate_overrides {
+                    plan = match override_verified_candidate(
+                        &plan,
+                        &resolved.parsed,
+                        &self.verified_matches,
+                        family,
+                        source,
+                    ) {
+                        Ok(value) => value,
+                        Err(error) => {
+                            self.error = Some(format!("override needs review: {error}"));
+                            return;
+                        }
+                    };
+                }
                 if self.destination == PlayingLibraryDestination::Generic {
                     plan = match project_generic_playing_library(
                         &plan,
@@ -675,7 +743,15 @@ impl PlayingLibraryPageState {
             &outcome.dat,
         ));
         let source_roots = [source_root.to_path_buf()];
-        let candidates = collect_source_files(&source_roots);
+        let scan = collect_source_files_reported(&source_roots, 20_000, 16);
+        if !scan.incomplete.is_empty() {
+            self.error = Some(format!(
+                "source scan is incomplete; no selection was made: {}",
+                scan.incomplete[0]
+            ));
+            return;
+        }
+        let candidates = scan.files;
         let trusted = TrustedRoots::from_paths([source_root]);
         let outcome_matches = match_loose_files_against_dat(
             &outcome.dat,
@@ -688,13 +764,30 @@ impl PlayingLibraryPageState {
 
         let request = archivefs_core::playing_library::PlayingLibraryRequest {
             dat: &outcome.dat,
-            matches: outcome_matches.matches,
+            matches: outcome_matches.matches.clone(),
             destination_root: destination_root.to_path_buf(),
             policy: self.build_policy(),
         };
         match build_playing_library_plan(&request) {
             Ok(mut plan) => {
+                self.verified_dat = Some(outcome.dat.clone());
+                self.verified_matches = outcome_matches.matches;
                 plan.rejected_launchers = outcome_matches.rejected_launchers;
+                for (family, source) in &self.candidate_overrides {
+                    plan = match override_verified_candidate(
+                        &plan,
+                        &outcome.dat,
+                        &self.verified_matches,
+                        family,
+                        source,
+                    ) {
+                        Ok(value) => value,
+                        Err(error) => {
+                            self.error = Some(format!("override needs review: {error}"));
+                            return;
+                        }
+                    };
+                }
                 if self.destination == PlayingLibraryDestination::Generic {
                     plan = match project_generic_playing_library(
                         &plan,
@@ -725,6 +818,10 @@ impl PlayingLibraryPageState {
     }
 
     fn retain_reviewed_plan(&mut self, plan: PlayingLibraryPlan) {
+        if let Err(error) = self.bind_preview_sources(&plan) {
+            self.error = Some(error);
+            return;
+        }
         let transaction = build_playing_library_transaction(&plan, self.plan_generation).and_then(
             |transaction| {
                 if transaction.entries.len() != plan.operations.len() {
@@ -743,7 +840,14 @@ impl PlayingLibraryPageState {
             return;
         };
         self.apply_error = None;
-        self.pending_apply = Some(plan.elected_games.len());
+        self.apply_stage.store(0, Ordering::Relaxed);
+        self.pending_apply = Some(
+            self.output_projection
+                .as_ref()
+                .map_or(plan.operations.len(), |projection| {
+                    projection.operation_count
+                }),
+        );
         self.confirm_text.clear();
     }
 
@@ -931,9 +1035,8 @@ impl PlayingLibraryPageState {
         let Some(projection) = &self.retrodeck_projection else {
             return;
         };
-        if projection.total_files > TYPED_CONFIRMATION_THRESHOLD
-            && self.retrodeck_confirm_text.trim()
-                != playing_library_confirmation_phrase(projection.total_files)
+        if self.retrodeck_confirm_text.trim()
+            != playing_library_confirmation_phrase(projection.total_files)
         {
             self.retrodeck_error = Some("the typed confirmation did not match".into());
             return;
@@ -971,9 +1074,7 @@ impl PlayingLibraryPageState {
             return;
         };
         let count = projection.total_files;
-        if count > TYPED_CONFIRMATION_THRESHOLD
-            && self.romm_confirm_text.trim() != playing_library_confirmation_phrase(count)
-        {
+        if self.romm_confirm_text.trim() != playing_library_confirmation_phrase(count) {
             self.romm_error = Some("the typed confirmation did not match".to_string());
             return;
         }
@@ -1018,10 +1119,15 @@ impl PlayingLibraryPageState {
         self.romm_pending_apply = false;
         self.romm_confirm_text.clear();
         match result {
-            Ok(outcome) => self.romm_applied = Some(outcome.transaction),
-            Err(error) => {
-                self.romm_error = Some(format!("{error}; run a fresh Preview before retrying"))
+            Ok(outcome) => {
+                if outcome.transaction.state != TransactionState::Applied {
+                    self.romm_error = Some(
+                        "RomM link creation stopped partway through; review the receipt".into(),
+                    );
+                }
+                self.romm_applied = Some(outcome.transaction);
             }
+            Err(error) => self.romm_error = Some(error.to_string()),
         }
     }
 
@@ -1047,12 +1153,39 @@ impl PlayingLibraryPageState {
         let Some(count) = self.pending_apply else {
             return;
         };
-        if count > TYPED_CONFIRMATION_THRESHOLD
-            && self.confirm_text.trim() != playing_library_confirmation_phrase(count)
-        {
+        if self.confirm_text.trim() != playing_library_confirmation_phrase(count) {
             self.apply_error = Some("the typed confirmation did not match".to_string());
             return;
         }
+        self.apply_error = None;
+        self.apply_stage.store(1, Ordering::Relaxed);
+        // Re-resolve the catalogue and re-hash the collection on the worker.
+        // A changed DAT, source set, or election invalidates the reviewed plan.
+        let mut fresh = self.clone();
+        fresh.preview();
+        if fresh.error.is_some()
+            || fresh.plan != self.plan
+            || fresh.output_projection != self.output_projection
+        {
+            self.apply_error =
+                Some("the collection or DAT changed; preview again before creating links".into());
+            self.pending_apply = None;
+            return;
+        }
+        if self.preview_sources.len() != fresh.preview_sources.len()
+            || self.preview_sources.iter().any(|(path, old)| {
+                fresh
+                    .preview_sources
+                    .get(path)
+                    .is_none_or(|new| !identity_matches(old, new))
+            })
+        {
+            self.apply_error =
+                Some("a source changed since preview; preview again before creating links".into());
+            self.pending_apply = None;
+            return;
+        }
+        self.apply_stage.store(2, Ordering::Relaxed);
         let Some(plan) = &self.plan else {
             self.pending_apply = None;
             return;
@@ -1073,7 +1206,21 @@ impl PlayingLibraryPageState {
                 return;
             }
         };
-        if let Err(error) = std::fs::create_dir_all(&plan.destination_root) {
+        if let Some(projection) = &self.output_projection {
+            transaction.entries.retain(|entry| {
+                projection.planned_links.iter().any(|link| {
+                    link.source_path == entry.source_path
+                        && link.destination_path == entry.destination_path
+                })
+            });
+        }
+        if self.destination == PlayingLibraryDestination::Generic {
+            transaction.unknown.insert(
+                "playing_library_profile".into(),
+                serde_json::Value::String("generic".into()),
+            );
+        }
+        if let Err(error) = prepare_destination_root(&plan.destination_root) {
             self.apply_error = Some(format!("could not create the destination folder: {error}"));
             self.pending_apply = None;
             return;
@@ -1102,6 +1249,7 @@ impl PlayingLibraryPageState {
             directory_policy: DirectoryPolicy::SameFilesystem,
             allow_symlink_source: false,
         });
+        self.apply_stage.store(4, Ordering::Relaxed);
         self.pending_apply = None;
         self.confirm_text.clear();
         match result {
@@ -1111,9 +1259,35 @@ impl PlayingLibraryPageState {
                 // the elections that produced it.
                 self.applied_plan = self.plan.take();
                 self.applied = Some(outcome.transaction);
+                if self
+                    .applied
+                    .as_ref()
+                    .is_some_and(|tx| tx.state != TransactionState::Applied)
+                {
+                    self.apply_error = Some("link creation stopped partway through; review the receipt and use Undo for recorded links".into());
+                }
             }
-            Err(error) => self.apply_error = Some(error.to_string()),
+            Err(error) => {
+                self.apply_error = Some(error.to_string());
+                if transaction.applied_count() > 0 {
+                    self.applied = Some(transaction);
+                }
+            }
         }
+    }
+
+    fn bind_preview_sources(&mut self, plan: &PlayingLibraryPlan) -> Result<(), String> {
+        let mut bindings = BTreeMap::new();
+        for operation in &plan.operations {
+            let identity = capture_identity(&operation.source_path)
+                .map_err(|error| format!("source changed during preview: {error}"))?;
+            if identity.kind != ObjectKind::RegularFile {
+                return Err("source is no longer a regular file; preview again".into());
+            }
+            bindings.insert(operation.source_path.clone(), identity);
+        }
+        self.preview_sources = bindings;
+        Ok(())
     }
 
     fn source_root_draft_path(&self) -> PathBuf {
@@ -1132,6 +1306,12 @@ impl PlayingLibraryPageState {
             &self.journal_dir,
             &AtomicBool::new(false),
         ));
+    }
+
+    pub(crate) fn load_generic_history_receipt(&mut self, transaction: RenameTransaction) {
+        self.destination = PlayingLibraryDestination::Generic;
+        self.applied = Some(transaction);
+        self.apply_error = None;
     }
 
     // --- "Publish to ES-DE" ------------------------------------------------
@@ -1447,6 +1627,8 @@ fn esde_platform_options() -> Vec<&'static str> {
 pub(crate) enum PlayingLibraryPageAction {
     Preview,
     SelectFamily(Option<String>),
+    OverrideCandidate { family: String, source: PathBuf },
+    ClearOverrides,
     RequestApply,
     CancelApply,
     ConfirmApply,
@@ -1537,6 +1719,72 @@ pub(crate) fn show_playing_library_page_with_busy(
     };
     ui.label(egui::RichText::new(destination_help).color(theme::muted(ui)));
     ui.add_space(8.0);
+
+    // Keep the next action in the first viewport on compact displays. The
+    // detailed output card below remains the authoritative review surface.
+    let inputs_ready = state.has_catalogue_selection()
+        && !state.source_root_draft.trim().is_empty()
+        && !state.destination_root_draft.trim().is_empty();
+    ui.horizontal_wrapped(|ui| {
+        if widgets::action_button(
+            ui,
+            "Preview playing library",
+            widgets::ActionStyle::Primary,
+            inputs_ready && !async_busy,
+        )
+        .clicked()
+        {
+            action = Some(PlayingLibraryPageAction::Preview);
+        }
+        if matches!(
+            state.destination,
+            PlayingLibraryDestination::Generic | PlayingLibraryDestination::EsDe
+        ) && state.output_projection.as_ref().is_some_and(|projection| {
+            projection.operation_count > 0 && projection.conflicts.is_empty()
+        }) && !async_busy
+        {
+            if state.pending_apply.is_none() {
+                if widgets::action_button(
+                    ui,
+                    "Create reviewed links",
+                    widgets::ActionStyle::Primary,
+                    true,
+                )
+                .clicked()
+                {
+                    action = Some(PlayingLibraryPageAction::RequestApply);
+                }
+            } else {
+                let count = state.pending_apply.unwrap_or(0);
+                ui.label(format!(
+                    "Type {}",
+                    playing_library_confirmation_phrase(count)
+                ));
+                ui.add(egui::TextEdit::singleline(&mut state.confirm_text).desired_width(210.0));
+                if widgets::action_button(
+                    ui,
+                    "Confirm links",
+                    widgets::ActionStyle::Destructive,
+                    true,
+                )
+                .clicked()
+                {
+                    action = Some(PlayingLibraryPageAction::ConfirmApply);
+                }
+            }
+        }
+    });
+    if !state.candidate_overrides.is_empty() {
+        ui.horizontal_wrapped(|ui| {
+            ui.label(format!(
+                "{} individual choice(s) active",
+                state.candidate_overrides.len()
+            ));
+            if ui.button("Clear individual choices").clicked() {
+                action = Some(PlayingLibraryPageAction::ClearOverrides);
+            }
+        });
+    }
 
     widgets::section_header(
         ui,
@@ -1647,7 +1895,7 @@ pub(crate) fn show_playing_library_page_with_busy(
             ui.add(
                 egui::TextEdit::singleline(&mut state.preferred_regions_draft)
                     .id(egui::Id::new(PREFERRED_REGIONS_FIELD_ID))
-                    .hint_text("Europe, USA, Japan"),
+                    .hint_text("Europe, USA, Japan, Other"),
             );
             ui.add_space(6.0);
 
@@ -1704,7 +1952,14 @@ pub(crate) fn show_playing_library_page_with_busy(
         action = Some(PlayingLibraryPageAction::Preview);
     }
     if async_busy {
-        ui.label("Working in the background… You can keep browsing.");
+        let progress = match state.apply_stage.load(Ordering::Relaxed) {
+            1 => "Checking DAT and source identities…",
+            2 => "Preparing and journaling links…",
+            3 => "Creating links with a durable journal…",
+            4 => "Finalising the link receipt…",
+            _ => "Working in the background… You can keep browsing.",
+        };
+        ui.label(progress);
     }
     if !ready {
         ui.label(
@@ -1817,12 +2072,32 @@ pub(crate) fn show_playing_library_page_with_busy(
         widgets::card(ui, |ui| {
             ui.label(
                 egui::RichText::new(format!(
-                    "Last operation created {} link(s) — this receipt is not current collection evidence",
-                    transaction.applied_count()
+                    "Receipt {} · {} of {} link(s) recorded · {:?}",
+                    transaction.transaction_id,
+                    transaction.applied_count(),
+                    transaction.entries.len(),
+                    transaction.state
                 ))
                 .strong(),
             );
-            if transaction.state == TransactionState::Applied
+            ui.label("Original ROM data copied: 0 bytes. Link metadata uses filesystem space.");
+            ui.label("this receipt is not current collection evidence");
+            widgets::technical_details(ui, "playing-library-receipt-entries", |ui| {
+                for entry in &transaction.entries {
+                    ui.label(format!(
+                        "{} · {}{}",
+                        entry.state.label(),
+                        entry.destination_path.display(),
+                        entry
+                            .failure_reason
+                            .as_deref()
+                            .map(|reason| format!(" · {reason}"))
+                            .unwrap_or_default()
+                    ));
+                }
+            });
+            if transaction.applied_count() > 0
+                && transaction.state != TransactionState::RolledBack
                 && widgets::action_button(ui, "Undo", widgets::ActionStyle::Quiet, true).clicked()
             {
                 action = Some(PlayingLibraryPageAction::RollbackLast);
@@ -1905,6 +2180,7 @@ fn show_output_projection_summary(
                 },
             );
         });
+        ui.label("ROM data to copy: 0 bytes. Links use a small amount of filesystem metadata.");
         if !projection.unresolved_mappings.is_empty() {
             ui.label(
                 egui::RichText::new("Some platform mappings need review.")
@@ -1981,7 +2257,7 @@ fn show_output_projection_summary(
         let applied = match projection.profile {
             LibraryOutputProfile::Romm => state.romm_applied.is_some(),
             LibraryOutputProfile::RetroDeck => state.retrodeck_applied.is_some(),
-            LibraryOutputProfile::Generic | LibraryOutputProfile::EsDe => state.applied.is_some(),
+            LibraryOutputProfile::Generic | LibraryOutputProfile::EsDe => false,
         };
         if !state.async_busy
             && !pending
@@ -2024,7 +2300,7 @@ fn show_output_projection_summary(
                 ui.label("Building your playing library in the background…");
             }
             let count = projection.operation_count;
-            if count > TYPED_CONFIRMATION_THRESHOLD {
+            {
                 let confirmation = match projection.profile {
                     LibraryOutputProfile::Romm => &mut state.romm_confirm_text,
                     LibraryOutputProfile::RetroDeck => &mut state.retrodeck_confirm_text,
@@ -2391,7 +2667,10 @@ fn evidence_summary_line(evidence: &CandidateEvidenceSummary) -> String {
     } else {
         "no declared relationship"
     };
-    format!("region: {region} - language: {language} - revision: {revision} - {relationship}")
+    format!(
+        "dump: {} - region: {region} - language: {language} - revision: {revision} - {relationship}",
+        evidence.dump_quality
+    )
 }
 
 fn generic_mapping_explanation(identity: Option<&DatPlatformIdentity>) -> Vec<String> {

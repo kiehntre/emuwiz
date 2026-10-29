@@ -338,6 +338,21 @@ pub struct TransactionEntry {
 }
 
 impl TransactionEntry {
+    /// Bind a newly created link object to this journal entry. Existing links
+    /// and older journals have no proof and cannot authorize link Undo.
+    pub fn record_created_link(&mut self, identity: &ObjectIdentity) -> Result<(), String> {
+        let value = serde_json::to_value(identity).map_err(|error| error.to_string())?;
+        self.unknown
+            .insert("emuwiz_created_link_identity_v1".into(), value);
+        Ok(())
+    }
+
+    pub fn created_link_identity(&self) -> Option<ObjectIdentity> {
+        self.unknown
+            .get("emuwiz_created_link_identity_v1")
+            .and_then(|value| serde_json::from_value(value.clone()).ok())
+    }
+
     /// Whether a rollback pass may reverse this entry (it was applied and has
     /// not already been rolled back).
     pub fn is_eligible_for_rollback(&self) -> bool {

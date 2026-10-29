@@ -28,6 +28,8 @@ pub struct DatReleaseEvidence {
     /// Recognized language codes in declaration order, e.g. `["En", "Ja"]`.
     pub languages: Vec<String>,
     pub revision: Option<RevisionNumber>,
+    /// Conflicting strict revision declarations cannot authorize an election.
+    pub contradictory_revision: bool,
     /// Explicitly declared non-retail classes, e.g. `[ReleaseClass::Beta]`.
     pub release_classes: Vec<ReleaseClass>,
 }
@@ -215,6 +217,7 @@ pub fn dat_release_evidence(canonical_entry_name: &str) -> DatReleaseEvidence {
         regions: Vec::new(),
         languages: Vec::new(),
         revision: None,
+        contradictory_revision: false,
         release_classes: Vec::new(),
     };
     for token in name_tokens(canonical_entry_name) {
@@ -225,10 +228,10 @@ pub fn dat_release_evidence(canonical_entry_name: &str) -> DatReleaseEvidence {
             continue;
         }
         if let Some(revision) = parse_revision_token(&token) {
-            // The first strict revision token wins; real catalogues declare
-            // at most one per entry.
-            if evidence.revision.is_none() {
-                evidence.revision = Some(revision);
+            match evidence.revision {
+                Some(previous) if previous != revision => evidence.contradictory_revision = true,
+                None => evidence.revision = Some(revision),
+                _ => {}
             }
             continue;
         }

@@ -18,6 +18,85 @@ use crate::dat::rename_apply::model::{
 
 use super::PlayingLibraryPlan;
 
+/// Creates the selected output directory without following a substituted
+/// symlink in any component. The shared executor still checks confinement
+/// immediately before each link operation.
+#[cfg(unix)]
+pub fn prepare_destination_root(path: &std::path::Path) -> Result<(), String> {
+    use std::ffi::CString;
+    use std::os::fd::{AsRawFd, FromRawFd};
+    use std::os::unix::ffi::OsStrExt;
+    use std::os::unix::fs::MetadataExt;
+    use std::path::Component;
+
+    if !path.is_absolute() {
+        return Err("destination must be absolute".into());
+    }
+    let mut current = std::fs::File::open("/").map_err(|error| error.to_string())?;
+    let mut walked = std::path::PathBuf::from("/");
+    for component in path.components() {
+        let Component::Normal(name) = component else {
+            if component == Component::RootDir {
+                continue;
+            }
+            return Err("destination contains an unsafe path component".into());
+        };
+        let name = CString::new(name.as_bytes()).map_err(|_| "destination contains NUL")?;
+        // SAFETY: the directory descriptor and NUL-terminated component are
+        // live for each call. The returned descriptor is immediately owned.
+        let fd = unsafe {
+            libc::openat(
+                current.as_raw_fd(),
+                name.as_ptr(),
+                libc::O_RDONLY | libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC,
+            )
+        };
+        if fd < 0 {
+            let error = std::io::Error::last_os_error();
+            if error.kind() != std::io::ErrorKind::NotFound {
+                return Err(format!("destination directory is unsafe: {error}"));
+            }
+            // SAFETY: same live descriptor and component; EEXIST is handled
+            // by the following O_NOFOLLOW open, which verifies the object.
+            if unsafe { libc::mkdirat(current.as_raw_fd(), name.as_ptr(), 0o755) } < 0 {
+                let error = std::io::Error::last_os_error();
+                if error.kind() != std::io::ErrorKind::AlreadyExists {
+                    return Err(format!("could not create destination directory: {error}"));
+                }
+            }
+        }
+        let fd = unsafe {
+            libc::openat(
+                current.as_raw_fd(),
+                name.as_ptr(),
+                libc::O_RDONLY | libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC,
+            )
+        };
+        if fd < 0 {
+            return Err(format!(
+                "destination directory is unsafe: {}",
+                std::io::Error::last_os_error()
+            ));
+        }
+        current = unsafe { std::fs::File::from_raw_fd(fd) };
+        walked.push(std::ffi::OsStr::from_bytes(name.as_bytes()));
+        let by_path = std::fs::symlink_metadata(&walked).map_err(|error| error.to_string())?;
+        let by_fd = current.metadata().map_err(|error| error.to_string())?;
+        if !by_path.is_dir()
+            || by_path.file_type().is_symlink()
+            || (by_path.dev(), by_path.ino()) != (by_fd.dev(), by_fd.ino())
+        {
+            return Err("destination directory changed while preparing it".into());
+        }
+    }
+    Ok(())
+}
+
+#[cfg(not(unix))]
+pub fn prepare_destination_root(_path: &std::path::Path) -> Result<(), String> {
+    Err("linked Playing Library creation requires safe directory handles on this platform".into())
+}
+
 /// Builds an unwritten, unapplied [`RenameTransaction`] from `plan`'s
 /// conflict-free elected operations. Read-only: captures each source's
 /// current identity but writes no journal and mutates nothing. The caller
@@ -507,7 +586,7 @@ mod tests {
     }
 
     #[test]
-    fn reapplying_the_same_multi_file_plan_is_idempotent() {
+    fn reapplying_the_same_multi_file_plan_refuses_existing_links() {
         let temp = tempfile::tempdir().expect("temp dir");
         let cue = temp.path().join("Game (Europe).cue");
         let track1 = temp.path().join("track1.bin");
@@ -549,12 +628,10 @@ mod tests {
         .expect("first apply succeeds");
         assert_eq!(outcome.summary.applied, 3);
 
-        // Re-running the identical plan (a fresh transaction over the same
-        // election) must succeed again rather than treating the
-        // already-correct symlinks as a conflict.
+        // A fresh operation cannot claim links that an earlier operation made.
         let mut second = build_playing_library_transaction(&plan, 2).expect("transaction");
         write_journal(&journal_dir, &second).unwrap();
-        let outcome = apply_transaction(&mut ApplyExecution {
+        let result = apply_transaction(&mut ApplyExecution {
             transaction: &mut second,
             approved_paths,
             current_generation: 2,
@@ -564,13 +641,61 @@ mod tests {
             cancel: &std::sync::atomic::AtomicBool::new(false),
             directory_policy: DirectoryPolicy::SameFilesystem,
             allow_symlink_source: false,
-        })
-        .expect("reapplying an already-correct plan succeeds");
-        assert_eq!(outcome.summary.applied, 3);
-        assert_eq!(second.state, TransactionState::Applied);
+        });
+        assert!(matches!(result, Err(ApplyError::HardConflicts(_))));
+        assert_eq!(second.applied_count(), 0);
 
         for name in ["Game (Europe).cue", "track1.bin", "track2.bin"] {
             assert!(destination_root.join(name).is_symlink());
         }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn undo_refuses_an_external_link_with_the_same_target_text() {
+        let temp = tempfile::tempdir().unwrap();
+        let source = temp.path().join("game.rom");
+        std::fs::write(&source, b"verified").unwrap();
+        let destination = temp.path().join("playing");
+        std::fs::create_dir_all(&destination).unwrap();
+        let journal = temp.path().join("journal");
+        std::fs::create_dir_all(&journal).unwrap();
+        let plan = plan_with_one_operation(source.clone(), destination.clone());
+        let mut tx = build_playing_library_transaction(&plan, 1).unwrap();
+        let approved_paths = std::iter::once(source.to_string_lossy().into_owned()).collect();
+        apply_transaction(&mut ApplyExecution {
+            transaction: &mut tx,
+            approved_paths,
+            current_generation: 1,
+            trusted: TrustedRoots::from_paths([temp.path()]),
+            journal_dir: journal.clone(),
+            hard_conflict_mode: HardConflictMode::AbortAll,
+            cancel: &std::sync::atomic::AtomicBool::new(false),
+            directory_policy: DirectoryPolicy::SameFilesystem,
+            allow_symlink_source: false,
+        })
+        .unwrap();
+        let link = destination.join("Game (Europe).zip");
+        let owned = crate::dat::rename_apply::identity::capture_identity(&link).unwrap();
+        let held_original = destination.join("held-original-link");
+        std::fs::rename(&link, &held_original).unwrap();
+        std::os::unix::fs::symlink(&source, &link).unwrap();
+        let replacement = crate::dat::rename_apply::identity::capture_identity(&link).unwrap();
+        assert!(!crate::dat::rename_apply::identity::identity_matches(
+            &owned,
+            &replacement
+        ));
+        let result = crate::dat::rename_apply::rollback::rollback_transaction(
+            &mut tx,
+            &journal,
+            &std::sync::atomic::AtomicBool::new(false),
+        )
+        .unwrap();
+        assert!(matches!(
+            result.result,
+            crate::dat::rename_apply::model::RollbackResult::RollbackFailed { .. }
+        ));
+        assert!(link.is_symlink());
+        assert!(held_original.is_symlink());
     }
 }

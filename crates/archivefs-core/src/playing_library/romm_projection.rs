@@ -814,7 +814,7 @@ mod tests {
     }
 
     #[test]
-    fn identical_projection_reapply_is_idempotent() {
+    fn identical_projection_reapply_does_not_claim_prior_links() {
         let temp = tempfile::tempdir().unwrap();
         let source = temp.path().join("game.gba");
         std::fs::write(&source, b"game").unwrap();
@@ -847,9 +847,15 @@ mod tests {
                 cancel: &std::sync::atomic::AtomicBool::new(false),
                 directory_policy: DirectoryPolicy::SameFilesystem,
                 allow_symlink_source: false,
-            })
-            .unwrap();
-            assert_eq!(outcome.summary.applied, 1);
+            });
+            if generation == 1 {
+                assert_eq!(outcome.unwrap().summary.applied, 1);
+            } else {
+                assert!(matches!(
+                    outcome,
+                    Err(crate::dat::rename_apply::executor::ApplyError::HardConflicts(_))
+                ));
+            }
         }
         assert!(projection.romm_root.join("game.cue").is_symlink());
         assert_eq!(std::fs::read(&source).unwrap(), b"game");

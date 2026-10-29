@@ -104,6 +104,32 @@ fn base_state(fixture: &Fixture) -> PlayingLibraryPageState {
     state
 }
 
+fn confirm_library(state: &mut PlayingLibraryPageState) {
+    let count = state.pending_apply.expect("pending confirmation");
+    state.confirm_text = playing_library_confirmation_phrase(count);
+    state.confirm_apply();
+}
+
+fn confirm_romm(state: &mut PlayingLibraryPageState) {
+    let count = state
+        .romm_projection
+        .as_ref()
+        .expect("RomM preview")
+        .total_files;
+    state.romm_confirm_text = playing_library_confirmation_phrase(count);
+    state.confirm_romm_apply();
+}
+
+fn confirm_retrodeck(state: &mut PlayingLibraryPageState) {
+    let count = state
+        .retrodeck_projection
+        .as_ref()
+        .expect("RetroDECK preview")
+        .total_files;
+    state.retrodeck_confirm_text = playing_library_confirmation_phrase(count);
+    state.confirm_retrodeck_apply();
+}
+
 // --- real-widget render/interaction helpers -----------------------------
 //
 // These drive the page exactly the way a real frame loop would: a single
@@ -386,6 +412,46 @@ fn preview_uses_the_real_core_planner() {
 }
 
 #[test]
+fn individual_override_rehashes_and_selects_only_a_verified_family_member() {
+    let fixture = Fixture::new("manual-override");
+    let source = fixture.path("roms");
+    std::fs::create_dir_all(&source).unwrap();
+    std::fs::write(source.join("europe.bin"), b"test").unwrap();
+    std::fs::write(source.join("usa.bin"), b"abc").unwrap();
+    let dat = write_dat(
+        &fixture,
+        "one.dat",
+        &format!(
+            r#"<datafile><header><name>One</name></header>
+<game name="Sonic (Europe)"><rom name="europe.bin" size="4" sha1="{SHA1_TEST}"/></game>
+<game name="Sonic (USA)" cloneof="Sonic (Europe)"><rom name="usa.bin" size="3" sha1="{SHA1_ABC}"/></game>
+</datafile>"#
+        ),
+    );
+    let mut state = base_state(&fixture);
+    state.dat_path_draft = dat.display().to_string();
+    state.source_root_draft = source.display().to_string();
+    state.destination_root_draft = fixture.path("playing").display().to_string();
+    state.preferred_regions_draft = "Europe, USA".into();
+    state.preview();
+    assert_eq!(
+        state.plan().unwrap().elected_games[0].dat_entry_name,
+        "Sonic (Europe)"
+    );
+    state.set_candidate_override("Sonic (Europe)".into(), source.join("usa.bin"));
+    state.preview();
+    assert_eq!(
+        state.plan().unwrap().elected_games[0].dat_entry_name,
+        "Sonic (USA)"
+    );
+    std::fs::write(source.join("usa.bin"), b"changed").unwrap();
+    state.request_apply();
+    confirm_library(&mut state);
+    assert!(state.apply_error().is_some());
+    assert!(!fixture.path("playing/unknown/usa.bin").exists());
+}
+
+#[test]
 fn unresolved_groups_remain_unresolved_in_the_preview() {
     let fixture = Fixture::new("unresolved");
     let source = fixture.path("roms");
@@ -456,7 +522,7 @@ fn a_destination_conflict_blocks_that_operation_from_applying() {
     assert!(plan.operations.is_empty());
 
     state.request_apply();
-    state.confirm_apply();
+    confirm_library(&mut state);
 
     assert!(
         state.apply_error().unwrap().contains("conflict"),
@@ -662,7 +728,7 @@ fn retrodeck_gui_apply_requires_confirmation_then_publishes_and_rolls_back() {
     state.request_retrodeck_apply();
     assert!(state.retrodeck_pending_apply);
     assert!(!destinations.iter().any(|path| path.exists()));
-    state.confirm_retrodeck_apply();
+    confirm_retrodeck(&mut state);
     assert!(
         state.retrodeck_error.is_none(),
         "{:?}",
@@ -731,7 +797,7 @@ fn retrodeck_gui_cancel_and_publication_failure_make_no_false_success() {
     std::fs::create_dir_all(parent.parent().unwrap()).unwrap();
     std::fs::write(&parent, b"blocking file").unwrap();
     state.request_retrodeck_apply();
-    state.confirm_retrodeck_apply();
+    confirm_retrodeck(&mut state);
     assert!(state.retrodeck_applied.is_none());
     assert!(state.retrodeck_error.is_some());
     assert!(!destinations.iter().any(|path| path.exists()));
@@ -744,7 +810,7 @@ fn create_playing_library_uses_the_existing_linked_library_transaction_seam() {
     let (mut state, original, destination) = preview_a_single_election(&fixture);
 
     state.request_apply();
-    state.confirm_apply(); // below the typed-confirmation threshold
+    confirm_library(&mut state);
 
     assert!(state.apply_error().is_none(), "{:?}", state.apply_error());
     let transaction = state.applied().expect("an applied transaction");
@@ -770,12 +836,167 @@ fn create_playing_library_uses_the_existing_linked_library_transaction_seam() {
 }
 
 #[test]
+fn every_batch_requires_the_exact_link_confirmation() {
+    let fixture = Fixture::new("typed-one-link");
+    let (mut state, _, destination) = preview_a_single_election(&fixture);
+    state.request_apply();
+    state.confirm_apply();
+    assert!(state.apply_error().unwrap().contains("typed confirmation"));
+    assert!(!destination.join("unknown/europe.bin").exists());
+    confirm_library(&mut state);
+    assert!(state.apply_error().is_none());
+}
+
+#[test]
+fn compact_1024_by_600_view_keeps_the_main_action_reachable() {
+    let fixture = Fixture::new("compact-action");
+    let (mut state, _, _) = preview_a_single_election(&fixture);
+    let ctx = egui::Context::default();
+    let small = egui::RawInput {
+        screen_rect: Some(egui::Rect::from_min_size(
+            egui::Pos2::ZERO,
+            egui::vec2(1024.0, 600.0),
+        )),
+        ..Default::default()
+    };
+    let (output, _) = render(&ctx, &mut state, small.clone());
+    let center = find_exact_text_center(&output, "Create reviewed links").expect("create action");
+    assert!(
+        center.y < 600.0,
+        "create action must be in the compact viewport: {center:?}"
+    );
+    let clicked = egui::RawInput {
+        events: click_event(center),
+        ..small
+    };
+    let (_, action) = render(&ctx, &mut state, clicked);
+    assert!(matches!(
+        action,
+        Some(PlayingLibraryPageAction::RequestApply)
+    ));
+}
+
+#[test]
+fn a_replaced_source_refuses_the_reviewed_preview() {
+    let fixture = Fixture::new("source-swap");
+    let (mut state, original, destination) = preview_a_single_election(&fixture);
+    let replacement = fixture.path("replacement.bin");
+    std::fs::write(&replacement, b"test").unwrap();
+    std::fs::rename(&replacement, &original).unwrap();
+    state.request_apply();
+    confirm_library(&mut state);
+    assert!(state.apply_error().unwrap().contains("source changed"));
+    assert!(!destination.join("unknown/europe.bin").exists());
+}
+
+#[test]
+fn a_changed_dat_refuses_the_reviewed_preview() {
+    let fixture = Fixture::new("dat-change");
+    let (mut state, _, destination) = preview_a_single_election(&fixture);
+    std::fs::write(
+        &state.dat_path_draft,
+        b"<datafile><header><name>changed</name></header></datafile>",
+    )
+    .unwrap();
+    state.request_apply();
+    confirm_library(&mut state);
+    assert!(
+        state
+            .apply_error()
+            .unwrap()
+            .contains("collection or DAT changed")
+    );
+    assert!(!destination.join("unknown/europe.bin").exists());
+}
+
+#[test]
+fn a_new_preview_creates_only_new_links_after_an_earlier_receipt() {
+    let fixture = Fixture::new("incremental-library");
+    let (mut state, original, destination) = preview_a_single_election(&fixture);
+    state.request_apply();
+    confirm_library(&mut state);
+    let first_receipt = state.applied().unwrap().transaction_id.clone();
+    let second = original.parent().unwrap().join("second.bin");
+    std::fs::write(&second, b"abc").unwrap();
+    std::fs::write(
+        &state.dat_path_draft,
+        format!(
+            r#"<datafile><header><name>Two</name></header>
+<game name="First (Europe)"><rom name="europe.bin" size="4" sha1="{SHA1_TEST}"/></game>
+<game name="Second (Europe)"><rom name="second.bin" size="3" sha1="{SHA1_ABC}"/></game>
+</datafile>"#
+        ),
+    )
+    .unwrap();
+    state.preview();
+    assert_eq!(state.output_projection.as_ref().unwrap().operation_count, 1);
+    state.request_apply();
+    confirm_library(&mut state);
+    assert!(state.apply_error().is_none(), "{:?}", state.apply_error());
+    assert_ne!(state.applied().unwrap().transaction_id, first_receipt);
+    assert_eq!(state.applied().unwrap().applied_count(), 1);
+    assert!(destination.join("unknown/europe.bin").is_symlink());
+    assert!(destination.join("unknown/second.bin").is_symlink());
+}
+
+#[test]
+fn a_history_receipt_can_undo_links_after_page_restart() {
+    let fixture = Fixture::new("history-restart-undo");
+    let (mut state, original, destination) = preview_a_single_election(&fixture);
+    state.request_apply();
+    confirm_library(&mut state);
+    assert!(state.apply_error().is_none(), "{:?}", state.apply_error());
+    let receipt = state.applied().unwrap().clone();
+    let mut restored = PlayingLibraryPageState::with_journal_dir(state.journal_dir.clone());
+    restored.load_generic_history_receipt(receipt);
+    restored.rollback_last();
+    assert!(
+        restored.apply_error().is_none(),
+        "{:?}",
+        restored.apply_error()
+    );
+    assert!(!destination.join("unknown/europe.bin").exists());
+    assert_eq!(std::fs::read(original).unwrap(), b"test");
+}
+
+#[cfg(unix)]
+#[test]
+fn a_source_replaced_by_a_symlink_never_becomes_a_link_target() {
+    let fixture = Fixture::new("source-symlink-swap");
+    let (mut state, original, destination) = preview_a_single_election(&fixture);
+    let outside = fixture.path("outside.rom");
+    std::fs::write(&outside, b"test").unwrap();
+    std::fs::remove_file(&original).unwrap();
+    std::os::unix::fs::symlink(&outside, &original).unwrap();
+    state.request_apply();
+    confirm_library(&mut state);
+    assert!(state.apply_error().is_some());
+    assert!(!destination.join("unknown/europe.bin").exists());
+    assert_eq!(std::fs::read(&outside).unwrap(), b"test");
+}
+
+#[cfg(unix)]
+#[test]
+fn a_symlinked_destination_ancestor_is_refused_before_creating_links() {
+    let fixture = Fixture::new("destination-symlink");
+    let (mut state, _, destination) = preview_a_single_election(&fixture);
+    let outside = fixture.path("outside");
+    std::fs::create_dir_all(&outside).unwrap();
+    std::fs::create_dir_all(destination.parent().unwrap()).unwrap();
+    std::os::unix::fs::symlink(&outside, &destination).unwrap();
+    state.request_apply();
+    confirm_library(&mut state);
+    assert!(state.apply_error().unwrap().contains("unsafe"));
+    assert_eq!(std::fs::read_dir(outside).unwrap().count(), 0);
+}
+
+#[test]
 fn original_source_files_remain_untouched_after_apply() {
     let fixture = Fixture::new("untouched");
     let (mut state, original, _destination) = preview_a_single_election(&fixture);
 
     state.request_apply();
-    state.confirm_apply();
+    confirm_library(&mut state);
 
     assert!(state.apply_error().is_none());
     assert!(original.exists(), "the original file must still exist");
@@ -792,7 +1013,7 @@ fn successful_apply_creates_symlinks_only_nothing_else_under_destination() {
     let (mut state, _original, destination) = preview_a_single_election(&fixture);
 
     state.request_apply();
-    state.confirm_apply();
+    confirm_library(&mut state);
     assert!(state.apply_error().is_none());
 
     let entries: Vec<_> = std::fs::read_dir(destination.join("unknown"))
@@ -879,7 +1100,7 @@ fn romm_apply_requires_verified_visibility_then_applies_and_rolls_back() {
     });
     state.preview_romm();
     state.request_romm_apply();
-    state.confirm_romm_apply();
+    confirm_romm(&mut state);
     assert!(state.romm_applied.is_none());
     assert!(
         state
@@ -895,7 +1116,7 @@ fn romm_apply_requires_verified_visibility_then_applies_and_rolls_back() {
     state.romm_visible_source_root_draft = state.source_root_draft.clone();
     state.preview_romm();
     state.request_romm_apply();
-    state.confirm_romm_apply();
+    confirm_romm(&mut state);
     assert!(state.romm_error.is_none(), "{:?}", state.romm_error);
     let transaction = state.romm_applied.as_ref().expect("RomM transaction");
     assert_eq!(transaction.state, TransactionState::Applied);
@@ -940,7 +1161,7 @@ fn rollback_uses_the_existing_journal_backed_rollback_path() {
     let fixture = Fixture::new("rollback");
     let (mut state, original, destination) = preview_a_single_election(&fixture);
     state.request_apply();
-    state.confirm_apply();
+    confirm_library(&mut state);
     assert!(state.apply_error().is_none());
     let link = destination.join("unknown/europe.bin");
     assert!(link.is_symlink());
@@ -1222,7 +1443,7 @@ mod esde {
         let fixture = Fixture::new(tag);
         let (mut state, _original, _destination) = preview_a_single_election(&fixture);
         state.request_apply();
-        state.confirm_apply();
+        confirm_library(&mut state);
         assert!(state.apply_error().is_none(), "{:?}", state.apply_error());
         assert!(state.applied().is_some());
 
@@ -1751,7 +1972,7 @@ mod organisation_usability {
         let f = Fixture::new("organisation-current");
         let (mut s, _, _) = preview_a_single_election(&f);
         s.request_apply();
-        s.confirm_apply();
+        confirm_library(&mut s);
         assert!(s.applied().is_some());
         s.preview();
         s.plan.as_mut().unwrap().elected_games.clear();
