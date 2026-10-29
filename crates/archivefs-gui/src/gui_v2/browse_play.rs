@@ -385,12 +385,11 @@ impl App {
                     match result {
                         Ok(()) => {
                             self.batch_state.mark_applied(archive_id);
-                            if let Some(index) = self.library.by_id.get(&archive_id).copied() {
-                                Arc::make_mut(&mut self.library).games[index].screenscraper = Some(
-                                    archivefs_core::screenscraper_enrichment::PersistedScreenScraperEnrichment {
-                                        archive_id, values, receipt,
-                                    });
-                            }
+                            self.cache_applied_batch_enrichment(
+                                archivefs_core::screenscraper_enrichment::PersistedScreenScraperEnrichment {
+                                    archive_id, values, receipt,
+                                },
+                            );
                         }
                         Err(error) => self.batch_state.mark_apply_failed(archive_id, error),
                     }
@@ -398,6 +397,19 @@ impl App {
                 if self.batch_state.active() { context.request_repaint_after(std::time::Duration::from_millis(100)); }
             });
         self.batch_open = open;
+    }
+
+    pub(super) fn cache_applied_batch_enrichment(
+        &mut self,
+        saved: archivefs_core::screenscraper_enrichment::PersistedScreenScraperEnrichment,
+    ) {
+        if let Some(index) = self.library.by_id.get(&saved.archive_id).copied() {
+            Arc::make_mut(&mut self.library).games[index].screenscraper = Some(saved);
+            // A resolved row may already contain the previous provider values.
+            // reload also advances the generation when indexing is in flight, so
+            // an older worker cannot publish its stale snapshot afterward.
+            self.artwork.reload(self.library.clone());
+        }
     }
 
     /// The games matching the current search and system. Recomputed only when
