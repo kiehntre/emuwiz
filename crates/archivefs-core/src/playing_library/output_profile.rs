@@ -182,10 +182,9 @@ pub fn inspect_library_output_ownership(
             if let TransactionOperation::CreateSymlink {
                 expected_target, ..
             } = &entry.operation
+                && let Some(proof) = entry.created_link_identity()
             {
-                if let Some(proof) = entry.created_link_identity() {
-                    owned_links.insert(entry.destination_path, (expected_target.clone(), proof));
-                }
+                owned_links.insert(entry.destination_path, (expected_target.clone(), proof));
             }
         }
     }

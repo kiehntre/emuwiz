@@ -604,11 +604,9 @@ pub fn rollback_publisher_transaction(
         trusted,
     )?;
     for directory in &mut publisher.directories {
-        directory.state = if outcome.directories_removed.contains(&directory.path) {
-            PublisherDirectoryState::NotCreated
-        } else {
-            PublisherDirectoryState::PreExisting
-        };
+        if outcome.directories_removed.contains(&directory.path) {
+            directory.state = PublisherDirectoryState::NotCreated;
+        }
     }
     Ok(outcome)
 }
@@ -898,13 +896,17 @@ mod tests {
                 .all(|directory| directory.state == PublisherDirectoryState::CreatedByTransaction)
         );
 
-        rollback_publisher_transaction(
+        let outcome = rollback_publisher_transaction(
             &mut publisher,
             &journal,
             &cancel,
             &TrustedRoots::from_paths([temp.path()]),
         )
         .unwrap();
+        assert_eq!(
+            outcome.rollback.result,
+            crate::dat::rename_apply::model::RollbackResult::FullyRolledBack
+        );
         assert!(source.exists());
         assert_eq!(std::fs::read(&source).unwrap(), b"source bytes");
         assert!(!destination_path.exists());
@@ -912,10 +914,20 @@ mod tests {
             publisher
                 .directories
                 .iter()
-                .all(|directory| directory.state == PublisherDirectoryState::NotCreated)
+                .all(|directory| directory.state == PublisherDirectoryState::CreatedByTransaction)
         );
         assert!(destination.exists());
-        assert!(!destination.join("roms").exists());
+        assert!(
+            destination.join("roms").exists(),
+            "the proved Undo tombstone keeps its parent directory occupied"
+        );
+        let proof = publisher.transaction.entries[0]
+            .created_link_identity()
+            .unwrap();
+        let tombstone =
+            crate::dat::rename_apply::dirsync::link_undo_tombstone_path(&destination_path, &proof);
+        assert!(tombstone.is_symlink());
+        assert_eq!(std::fs::read_link(tombstone).unwrap(), source);
     }
 
     #[test]

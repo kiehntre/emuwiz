@@ -128,7 +128,7 @@ pub(crate) struct PlayingLibraryPageState {
     preview_filter: PreviewFilter,
     preview_page: usize,
     pending_apply: Option<usize>,
-    confirm_text: String,
+    pub(crate) confirm_text: String,
     applied: Option<RenameTransaction>,
     romm_projection: Option<RommLibraryProjectionPlan>,
     romm_preview_transaction:
@@ -487,7 +487,7 @@ impl PlayingLibraryPageState {
 
     pub(crate) fn input_fingerprint(&self) -> String {
         format!(
-            "{:?}|{:?}|{}|{}|{}|{}|{}|{}|{}|{}|{}|{}|{:?}",
+            "{:?}|{:?}|{}|{}|{}|{}|{}|{}|{}|{}|{}|{}|{:?}|{}",
             self.destination,
             self.selected_catalogue,
             self.source_root_draft,
@@ -501,6 +501,7 @@ impl PlayingLibraryPageState {
             self.exclude_demo,
             self.exclude_sample,
             self.candidate_overrides,
+            self.plan_generation,
         )
     }
 

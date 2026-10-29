@@ -230,20 +230,14 @@ fn undo_never_removes_a_link_the_transaction_did_not_create() {
     let destination = temp.path().join("preexisting.bin");
     std::os::unix::fs::symlink(source, &destination).unwrap();
     let mut tx = link_transaction(source, &destination, temp.path());
-    // Adopting an already-correct link is the accepted idempotent-reapply
-    // contract (playing_library::apply_adapter); a repeat on the same
-    // transaction may be accepted or refused.
-    apply(&mut tx, temp.path()).unwrap();
-    let _ = apply(&mut tx, temp.path());
-    rollback_transaction(
-        &mut tx,
-        &temp.path().join("journal"),
-        &AtomicBool::new(false),
-    )
-    .unwrap();
+    // Matching link text alone does not prove this transaction owns the link.
+    assert!(matches!(
+        apply(&mut tx, temp.path()),
+        Err(ApplyError::HardConflicts(_))
+    ));
     assert!(
         destination.is_symlink(),
-        "rollback removed a link this transaction never created"
+        "Apply changed a link this transaction never created"
     );
     assert_eq!(fs::read_link(&destination).unwrap(), *source);
     assert_eq!(fs::read(source).unwrap(), b"original");
@@ -837,15 +831,44 @@ fn an_interrupted_link_entry_is_recognised_as_its_own_link_and_undo_removes_it()
 }
 
 #[test]
-fn an_interrupted_link_entry_with_no_link_yet_is_created() {
+fn interrupted_link_replaced_with_identical_text_is_not_owned() {
     let (temp, original) = fixture();
     let root = temp.path();
     let source = &original.entries[0].source_path;
     let destination = root.join("link.bin");
     let mut tx = link_transaction(source, &destination, root);
     apply(&mut tx, root).unwrap();
+    fs::rename(&destination, root.join("original-link-held")).unwrap();
+    std::os::unix::fs::symlink(source, &destination).unwrap();
+    tx.entries[0].state = EntryState::Applying;
+    tx.entries[0].applied_at_unix = None;
+    tx.state = TransactionState::Applying;
+    write_journal(&root.join("journal"), &tx).unwrap();
+
+    assert!(matches!(
+        apply(&mut tx, root),
+        Err(ApplyError::HardConflicts(_))
+    ));
+    tx = journal_on_disk(root, &tx);
+    let undo =
+        rollback_transaction(&mut tx, &root.join("journal"), &AtomicBool::new(false)).unwrap();
+    assert!(matches!(undo.result, RollbackResult::RollbackFailed { .. }));
+    assert!(destination.is_symlink());
+    assert_eq!(fs::read_link(&destination).unwrap(), *source);
+    assert_eq!(fs::read(source).unwrap(), b"original");
+}
+
+#[test]
+fn an_interrupted_link_entry_with_no_link_yet_is_created() {
+    let (temp, original) = fixture();
+    let root = temp.path();
+    let source = &original.entries[0].source_path;
+    let destination = root.join("link.bin");
+    let mut tx = link_transaction(source, &destination, root);
     // A crash after the Applying checkpoint but before symlink(2).
-    fs::remove_file(&destination).unwrap();
+    tx.entries[0]
+        .unknown
+        .insert("emuwiz_link_adopted_v1".into(), serde_json::json!(false));
     tx.entries[0].state = EntryState::Applying;
     tx.state = TransactionState::Applying;
     write_journal(&root.join("journal"), &tx).unwrap();
@@ -855,6 +878,31 @@ fn an_interrupted_link_entry_with_no_link_yet_is_created() {
         EntryState::Applied
     );
     assert_eq!(fs::read_link(&destination).unwrap(), *source);
+}
+
+#[test]
+fn missing_previously_proved_link_is_not_recreated_on_resume() {
+    let (temp, original) = fixture();
+    let root = temp.path();
+    let source = &original.entries[0].source_path;
+    let destination = root.join("link.bin");
+    let mut tx = link_transaction(source, &destination, root);
+    apply(&mut tx, root).unwrap();
+    let held = root.join("original-link-held");
+    fs::rename(&destination, &held).unwrap();
+    tx.entries[0].state = EntryState::Applying;
+    tx.entries[0].applied_at_unix = None;
+    tx.state = TransactionState::Applying;
+    write_journal(&root.join("journal"), &tx).unwrap();
+
+    let resumed = apply(&mut tx, root).unwrap();
+    assert_eq!(resumed.transaction.entries[0].state, EntryState::Applying);
+    assert!(!destination.is_symlink());
+    assert!(held.is_symlink());
+    assert_eq!(fs::read(source).unwrap(), b"original");
+    let undo =
+        rollback_transaction(&mut tx, &root.join("journal"), &AtomicBool::new(false)).unwrap();
+    assert!(matches!(undo.result, RollbackResult::RollbackFailed { .. }));
 }
 
 #[test]

@@ -1394,9 +1394,11 @@ impl super::App {
                                 &view,
                                 &self.activity,
                                 self.playing_library_job.is_some(),
-                                &mut go,
-                                &mut preview_request,
-                                &mut undo_request,
+                                HistoryRowRequests {
+                                    go: &mut go,
+                                    preview: &mut preview_request,
+                                    undo: &mut undo_request,
+                                },
                             );
                         }
                         if total > limit {
@@ -1664,15 +1666,19 @@ fn show_filters(ui: &mut egui::Ui, view: &mut HistoryViewState) {
 
 const ROWS_MIN_HEIGHT: f32 = 360.0;
 
+struct HistoryRowRequests<'a> {
+    go: &'a mut Option<Route>,
+    preview: &'a mut Option<String>,
+    undo: &'a mut Option<String>,
+}
+
 fn show_row(
     ui: &mut egui::Ui,
     entry: &HistoryEntry,
     view: &HistoryViewState,
     activity: &super::activity::Activity,
     playing_library_busy: bool,
-    go: &mut Option<Route>,
-    preview_request: &mut Option<String>,
-    undo_request: &mut Option<String>,
+    requests: HistoryRowRequests<'_>,
 ) {
     ui.push_id(("history-row", &entry.transaction_id), |ui| {
         egui::Frame::group(ui.style()).show(ui, |ui| {
@@ -1753,7 +1759,7 @@ fn show_row(
             ui.horizontal_wrapped(|ui| match (&entry.undo, preview) {
                 (UndoStatus::Available, None) => {
                     if ui.button(RichText::new("Preview undo").strong()).clicked() {
-                        *preview_request = Some(entry.transaction_id.clone());
+                        *requests.preview = Some(entry.transaction_id.clone());
                     }
                 }
                 // The preview panel below carries the next action.
@@ -1763,7 +1769,7 @@ fn show_row(
                         .button(RichText::new(entry.handoff.label).strong())
                         .clicked()
                     {
-                        *go = Some(entry.handoff.route.clone());
+                        *requests.go = Some(entry.handoff.route.clone());
                     }
                 }
             });
@@ -1774,7 +1780,7 @@ fn show_row(
                         .undo_attempts
                         .values()
                         .any(|id| activity.jobs.get(id).is_some_and(|job| job.active()));
-                show_preview(ui, entry, preview, undo_busy, go, undo_request);
+                show_preview(ui, entry, preview, undo_busy, requests.go, requests.undo);
             }
 
             ui.collapsing("Advanced details", |ui| {

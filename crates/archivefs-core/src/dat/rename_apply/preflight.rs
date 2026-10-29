@@ -14,7 +14,7 @@ use std::path::{Component, Path};
 use crate::safe_read::TrustedRoots;
 
 use super::identity::{capture_identity, identity_matches};
-use super::model::{TransactionEntry, TransactionOperation};
+use super::model::{EntryState, ObjectKind, TransactionEntry, TransactionOperation};
 
 /// A named reason a preflight check failed.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -287,9 +287,17 @@ pub fn run_preflight(
     ) {
         // The exact existing target was checked above; existence alone grants no authority.
     } else if std::fs::symlink_metadata(&entry.destination_path).is_ok() {
-        // Even an equal-looking symlink is not proof that this transaction
-        // created it. A fresh transaction must never claim or Undo it.
-        failures.push(PreflightFailure::DestinationExists);
+        // Only this transaction's persisted creation proof can permit an
+        // interrupted or repeated Apply. Link text alone grants no ownership.
+        let own_link = matches!(entry.state, EntryState::Applying | EntryState::Applied)
+            && matches!(&entry.operation, TransactionOperation::CreateSymlink { expected_target, .. }
+                if entry.created_link_identity().is_some_and(|proof|
+                    capture_identity(&entry.destination_path).is_ok_and(|actual|
+                        actual.kind == ObjectKind::Symlink && identity_matches(&proof, &actual))
+                    && std::fs::read_link(&entry.destination_path).is_ok_and(|target| target == *expected_target)));
+        if !own_link {
+            failures.push(PreflightFailure::DestinationExists);
+        }
     } else {
         // Case-only collision re-checked against the live destination
         // directory: a file whose name differs from the destination only by

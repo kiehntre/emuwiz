@@ -579,6 +579,12 @@ pub(super) fn classify_entry(entry: &TransactionEntry, index: usize) -> Recovery
                 kind: RecoveryIssueKind::EvidenceUnavailable,
                 detail: "linked-library Undo recovery requires Unix object evidence".into(),
             }
+        } else if !destination_present && entry.created_link_identity().is_some() {
+            RecoveryIssue {
+                entry_index: index,
+                kind: RecoveryIssueKind::DestinationIdentityChanged,
+                detail: "the journal proved link creation, but the link is absent without a proved Undo tombstone; manual review is required".to_string(),
+            }
         } else if !destination_present {
             RecoveryIssue {
                 entry_index: index,

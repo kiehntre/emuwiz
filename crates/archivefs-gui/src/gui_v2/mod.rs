@@ -1536,14 +1536,13 @@ impl App {
                 let transaction = state.applied().cloned();
                 let error = state.apply_error().map(str::to_owned);
                 self.playing_library.merge_async_apply_result(*state);
-                if let Some(transaction) = &transaction {
-                    if !self
+                if let Some(transaction) = &transaction
+                    && !self
                         .playing_library_history
                         .iter()
                         .any(|item| item.transaction_id == transaction.transaction_id)
-                    {
-                        self.playing_library_history.push(transaction.clone());
-                    }
+                {
+                    self.playing_library_history.push(transaction.clone());
                 }
                 if let Some(error) = error {
                     self.activity.finish(

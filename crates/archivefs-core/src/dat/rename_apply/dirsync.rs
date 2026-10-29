@@ -243,7 +243,7 @@ impl RenameDirs {
                 // Retain the proved symlink as a small hidden tombstone. An
                 // unlink by pathname would reintroduce a replacement race.
                 // The journal records this deterministic path after success.
-                return self.verify_bound();
+                self.verify_bound()
             }
         }
         #[cfg(not(target_os = "linux"))]
