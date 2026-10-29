@@ -7036,16 +7036,24 @@ pub fn detect_platform_with_details_and_problems(
     let report = detect_platform_report_for_registry(path, source_root);
     let problems = report.inspection_problems.clone();
     if let Some(platform) = platform_from_registry_report(&report) {
+        let provenance = if matches!(
+            (
+                platform.as_str(),
+                path.extension().and_then(|ext| ext.to_str())
+            ),
+            ("Amiga", Some("adf")) | ("ZX Spectrum", Some("tap"))
+        ) && report.deciding_source
+            == Some(platform::DetectionSource::Signature)
+            && report.confidence == platform::DetectionConfidence::Confirmed
+        {
+            PlatformProvenance::HeaderIdentity
+        } else {
+            PlatformProvenance::RegistryDetector
+        };
         return (
             Some(DetailedPlatformDetection {
                 platform,
-                provenance: if report.deciding_source == Some(platform::DetectionSource::Signature)
-                    && report.confidence == platform::DetectionConfidence::Confirmed
-                {
-                    PlatformProvenance::HeaderIdentity
-                } else {
-                    PlatformProvenance::RegistryDetector
-                },
+                provenance,
                 matched_folder: None,
             }),
             problems,

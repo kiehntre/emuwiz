@@ -129,7 +129,7 @@ pub(crate) fn platform_provenance_lines(
     if details.platform.is_none() {
         lines.push((
             "Reason",
-            "No explicit assignment, compatible source mapping, folder alias, or decisive format evidence resolved this platform."
+            "No explicit override, compatible source mapping, folder alias, or decisive format evidence resolved this platform."
                 .to_string(),
         ));
         lines.push((

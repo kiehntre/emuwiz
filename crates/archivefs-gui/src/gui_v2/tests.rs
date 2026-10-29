@@ -3058,7 +3058,7 @@ fn gui_v2_unknown_title_never_becomes_verified_identity() {
     let game = Game::from_archive(archive(1, "Verified Final Fantasy VII Disc 1", None));
     assert!(!game.identified);
     assert_eq!(game.platform, "Unknown system");
-    assert_eq!(game.status(), "Not checked yet");
+    assert_eq!(game.status(), "Unknown platform · More evidence needed");
 }
 
 #[test]

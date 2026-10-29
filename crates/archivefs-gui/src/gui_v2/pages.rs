@@ -1912,6 +1912,7 @@ impl App {
                             };
                             ui.push_id(("museum-game", game.archive.id), |ui| {
                                 egui::Frame::group(ui.style()).show(ui, |ui| {
+                                    ui.set_width(card_width);
                                     self.picture(
                                         ui,
                                         game,
