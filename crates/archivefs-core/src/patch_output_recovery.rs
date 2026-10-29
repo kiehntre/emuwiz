@@ -594,6 +594,60 @@ fn matches_expected(path: &Path, size: Option<u64>, hash: Option<&str>) -> bool 
     verify_file(path, size, hash).is_ok()
 }
 
+/// Older schema-1 writers published the receipt before recording its hash in
+/// the terminal journal transition. Adopt only a bounded standalone-patch
+/// receipt whose identity fields agree with the durable plan.
+fn legacy_provenance_hash(journal: &PatchOutputJournal) -> Option<String> {
+    if journal.provenance_sha256.is_some()
+        || !matches!(
+            journal.state,
+            PatchOutputState::Publishing
+                | PatchOutputState::Published
+                | PatchOutputState::VerifyingPublished
+        )
+    {
+        return None;
+    }
+    let metadata = fs::symlink_metadata(&journal.provenance_path).ok()?;
+    if !metadata.is_file() || metadata.file_type().is_symlink() || metadata.len() > 64 * 1024 {
+        return None;
+    }
+    let bytes = fs::read(&journal.provenance_path).ok()?;
+    if bytes.len() as u64 != metadata.len() {
+        return None;
+    }
+    let receipt: serde_json::Value = serde_json::from_slice(&bytes).ok()?;
+    let path_matches = |key: &str, expected: &Path| {
+        receipt.get(key).and_then(serde_json::Value::as_str) == expected.to_str()
+    };
+    if !path_matches("base_path", &journal.source_path)
+        || receipt.get("base_sha256")?.as_str()? != journal.source_sha256
+        || !path_matches("patch_path", &journal.patch_path)
+        || receipt.get("patch_sha256")?.as_str()? != journal.patch_sha256
+        || receipt.get("format")? != &serde_json::to_value(journal.patch_format).ok()?
+        || !path_matches("output_path", &journal.destination_path)
+        || receipt.get("output_sha256")?.as_str()? != journal.expected_output_sha256.as_deref()?
+    {
+        return None;
+    }
+    Some(digest_bytes(&bytes))
+}
+
+fn verified_provenance_hash(
+    journal: &PatchOutputJournal,
+) -> Result<String, PatchOutputRecoveryError> {
+    if let Some(hash) = &journal.provenance_sha256 {
+        verify_file(&journal.provenance_path, None, Some(hash))?;
+        Ok(hash.clone())
+    } else {
+        legacy_provenance_hash(journal).ok_or_else(|| {
+            PatchOutputRecoveryError::PreconditionsChanged(
+                "legacy patch provenance no longer matches the durable plan".into(),
+            )
+        })
+    }
+}
+
 pub fn inspect_patch_output_operation(
     path: &Path,
 ) -> Result<PatchOutputRecoveryInspection, PatchOutputRecoveryError> {
@@ -618,10 +672,10 @@ pub fn inspect_patch_output_operation(
         journal.expected_output_size,
         journal.expected_output_sha256.as_deref(),
     );
-    let provenance_matches = journal
-        .provenance_sha256
-        .as_deref()
-        .is_some_and(|hash| matches_expected(&journal.provenance_path, None, Some(hash)));
+    let provenance_matches = match journal.provenance_sha256.as_deref() {
+        Some(hash) => matches_expected(&journal.provenance_path, None, Some(hash)),
+        None => legacy_provenance_hash(&journal).is_some(),
+    };
     let (classification, explanation) = if journal.state.is_terminal() {
         (
             if journal.state == PatchOutputState::Completed {
@@ -740,7 +794,7 @@ fn verify_plan(
 pub fn resume_patch_output(plan: &PatchOutputRecoveryPlan) -> Result<(), PatchOutputRecoveryError> {
     let (inspection, mut journal) = verify_plan(plan)?;
     if inspection.classification == PatchOutputRecoveryClassification::PublicationLikelyComplete {
-        journal.provenance_sha256 = Some(digest_path(&journal.provenance_path)?.1);
+        journal.provenance_sha256 = Some(verified_provenance_hash(&journal)?);
         transition(
             &plan.journal_path,
             &mut journal,
@@ -755,6 +809,7 @@ pub fn resume_patch_output(plan: &PatchOutputRecoveryPlan) -> Result<(), PatchOu
             "recovery is not classified safe to resume".into(),
         ));
     }
+    journal.provenance_sha256 = Some(verified_provenance_hash(&journal)?);
     transition(
         &plan.journal_path,
         &mut journal,
@@ -780,7 +835,7 @@ pub fn resume_patch_output(plan: &PatchOutputRecoveryPlan) -> Result<(), PatchOu
         PatchOutputState::VerifyingPublished,
         PatchOutputCheckpoint::PublishedVerified,
     )?;
-    journal.provenance_sha256 = Some(digest_path(&journal.provenance_path)?.1);
+    journal.provenance_sha256 = Some(verified_provenance_hash(&journal)?);
     transition(
         &plan.journal_path,
         &mut journal,
@@ -808,6 +863,7 @@ pub fn rollback_patch_output(
             "destination no longer matches EmuWiz output".into(),
         ));
     }
+    journal.provenance_sha256 = Some(verified_provenance_hash(&journal)?);
     transition(
         &plan.journal_path,
         &mut journal,
@@ -1206,6 +1262,69 @@ mod tests {
         assert_eq!(
             fs::read(changed.path().join("output.bin")).unwrap(),
             b"user changed"
+        );
+    }
+
+    #[test]
+    fn legacy_published_journal_without_provenance_hash_requires_matching_receipt() {
+        let directory = tempfile::tempdir().unwrap();
+        let result = publish(directory.path());
+        let mut journal = read_journal(&result.journal_path).unwrap();
+        journal.state = PatchOutputState::Published;
+        journal.provenance_sha256 = None;
+        let receipt = serde_json::json!({
+            "base_path": journal.source_path,
+            "base_sha256": journal.source_sha256,
+            "patch_path": journal.patch_path,
+            "patch_sha256": journal.patch_sha256,
+            "format": journal.patch_format,
+            "output_path": journal.destination_path,
+            "output_sha256": journal.expected_output_sha256,
+        });
+        fs::write(
+            &journal.provenance_path,
+            serde_json::to_vec(&receipt).unwrap(),
+        )
+        .unwrap();
+        write_journal(&result.journal_path, &journal).unwrap();
+
+        assert_eq!(
+            inspect_patch_output_operation(&result.journal_path)
+                .unwrap()
+                .classification,
+            PatchOutputRecoveryClassification::PublicationLikelyComplete
+        );
+        let mut changed = receipt.clone();
+        changed["patch_sha256"] = serde_json::json!(digest_bytes(b"different patch"));
+        fs::write(
+            &journal.provenance_path,
+            serde_json::to_vec(&changed).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(
+            inspect_patch_output_operation(&result.journal_path)
+                .unwrap()
+                .classification,
+            PatchOutputRecoveryClassification::NeedsReview
+        );
+        fs::write(
+            &journal.provenance_path,
+            serde_json::to_vec(&receipt).unwrap(),
+        )
+        .unwrap();
+        let plan = plan_patch_output_recovery(&result.journal_path).unwrap();
+        resume_patch_output(&plan).unwrap();
+        assert_eq!(
+            inspect_patch_output_operation(&result.journal_path)
+                .unwrap()
+                .classification,
+            PatchOutputRecoveryClassification::Completed
+        );
+        assert!(
+            read_journal(&result.journal_path)
+                .unwrap()
+                .provenance_sha256
+                .is_some()
         );
     }
 

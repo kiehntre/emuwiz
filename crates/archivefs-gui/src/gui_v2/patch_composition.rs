@@ -233,6 +233,7 @@ impl State {
         self.job = None;
         match outcome {
             Outcome::Inspected(Ok(report)) => {
+                self.order_reviewed = false;
                 self.order = (0..report.patches.len()).collect();
                 self.inspection = Some(report);
             }
@@ -331,6 +332,7 @@ pub(super) fn show(ui: &mut egui::Ui, state: &mut State, game: Option<&Game>) {
         state.plan = None;
         state.result = None;
         state.confirmed = false;
+        state.order_reviewed = false;
         state.error = None;
         state.start(
             move || Outcome::Inspected(patch_package_preview::inspect(&path)),
@@ -687,6 +689,31 @@ mod tests {
         assert_eq!(result.provenance.patches.len(), 2);
         assert_eq!(result.provenance.source_path, game);
         assert_eq!(result.provenance.package_path, package);
+    }
+
+    #[test]
+    fn inspecting_another_package_revokes_patch_order_approval() {
+        let directory = tempfile::tempdir().unwrap();
+        let package = directory.path().join("other.zip");
+        let mut zip = zip::ZipWriter::new(fs::File::create(&package).unwrap());
+        for name in ["first.bps", "second.bps"] {
+            zip.start_file(name, zip::write::SimpleFileOptions::default())
+                .unwrap();
+            zip.write_all(&bps(b"old", b"new")).unwrap();
+        }
+        zip.finish().unwrap();
+        let report = patch_package_preview::inspect(&package).unwrap();
+        let (sender, receiver) = mpsc::channel();
+        let mut state = State {
+            order: vec![1, 0],
+            order_reviewed: true,
+            job: Some(receiver),
+            ..Default::default()
+        };
+        assert!(sender.send(Outcome::Inspected(Ok(report))).is_ok());
+        state.poll();
+        assert_eq!(state.order, vec![0, 1]);
+        assert!(!state.order_reviewed);
     }
 
     #[test]
