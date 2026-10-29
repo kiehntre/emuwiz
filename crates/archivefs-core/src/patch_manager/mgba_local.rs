@@ -12,6 +12,7 @@ use std::path::{Path, PathBuf};
 
 pub const MGBA_MAX_PROFILES: usize = 16;
 pub const MGBA_MAX_CONFIG_BYTES: u64 = 256 * 1024;
+pub const MGBA_MAX_EXECUTABLE_BYTES: u64 = 256 * 1024 * 1024;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 pub enum MgbaInstallationType {
@@ -108,8 +109,17 @@ fn regular(path: &Path) -> bool {
 
 #[cfg(unix)]
 fn executable(path: &Path) -> bool {
+    use std::os::unix::fs::OpenOptionsExt;
     use std::os::unix::fs::PermissionsExt;
-    regular(path) && fs::metadata(path).is_ok_and(|m| m.permissions().mode() & 0o111 != 0)
+    regular(path)
+        && fs::metadata(path).is_ok_and(|m| {
+            m.len() <= MGBA_MAX_EXECUTABLE_BYTES && m.permissions().mode() & 0o111 != 0
+        })
+        && fs::OpenOptions::new()
+            .read(true)
+            .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK | libc::O_CLOEXEC)
+            .open(path)
+            .is_ok_and(|file| file.metadata().is_ok_and(|m| m.is_file()))
 }
 #[cfg(not(unix))]
 fn executable(path: &Path) -> bool {
@@ -196,7 +206,8 @@ fn profile(
     let eligible = !matching.is_empty() && config.as_ref().is_none_or(|c| c.readable);
     let blocker = (!eligible).then(|| {
         if matching.is_empty() {
-            "no safe mGBA executable was discovered".into()
+            "no safe mGBA executable was discovered (it must be readable for launch verification)"
+                .into()
         } else {
             "mGBA configuration is unreadable or oversized".into()
         }
