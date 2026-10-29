@@ -98,10 +98,18 @@ fn shared_tzx_and_conflicting_members_remain_unknown() {
             ("two.adf", samples::amiga_adf(1, b"TEST")),
         ],
     );
+    zip(
+        &source.join("shared-mixed.zip"),
+        &[
+            ("one.z80", samples::zx_z80_v1()),
+            ("two.tzx", samples::zx_tzx()),
+        ],
+    );
     let mut db = Database::open_or_create(&dir.path().join("library.db")).unwrap();
     scan(&mut db, &source);
     assert!(row(&db, "shared.zip").platform.is_none());
     assert!(row(&db, "mixed.zip").platform.is_none());
+    assert!(row(&db, "shared-mixed.zip").platform.is_none());
 }
 
 #[test]

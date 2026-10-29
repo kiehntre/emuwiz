@@ -19,6 +19,10 @@ pub(crate) enum MemberPlatformObservation {
 }
 
 pub(crate) fn observe_zip_platform(path: &Path) -> MemberPlatformObservation {
+    observe_zip_platform_in_temp_dir(path, &std::env::temp_dir())
+}
+
+fn observe_zip_platform_in_temp_dir(path: &Path, temp_dir: &Path) -> MemberPlatformObservation {
     let safe =
         match crate::safe_read::open_bounded_read(path, &crate::safe_read::TrustedRoots::none()) {
             Ok(file) => file,
@@ -58,6 +62,7 @@ pub(crate) fn observe_zip_platform(path: &Path) -> MemberPlatformObservation {
     let mut platform = None;
     let mut total = 0_u64;
     let mut ambiguous = false;
+    let mut shared_tape = false;
     for index in 0..archive.len() {
         let (name, size, symlink, directory, encrypted) = match archive.by_index_raw(index) {
             Ok(member) => (
@@ -144,10 +149,41 @@ pub(crate) fn observe_zip_platform(path: &Path) -> MemberPlatformObservation {
             "sna" if crate::zx_spectrum_snapshot::parse_sna_snapshot(&bytes).is_ok() => {
                 Some("ZX Spectrum")
             }
-            "adf" => crate::amiga_adz::inspect_adf_member_bytes(&bytes)
-                .ok()
-                .and_then(|inspection| inspection.filesystem().map(|_| "Amiga")),
-            // TZX/CDT framing is shared with CPC; it cannot settle a platform.
+            "adf" => match crate::amiga_adz::inspect_adf_member_bytes_in_temp_dir(&bytes, temp_dir)
+            {
+                Ok(inspection) => inspection.filesystem().map(|_| "Amiga"),
+                Err(
+                    crate::amiga_adz::AdzError::TempFileUnavailable(detail)
+                    | crate::amiga_adz::AdzError::Io(detail),
+                ) => {
+                    return MemberPlatformObservation::Incomplete(format!(
+                        "ADF staging failed: {detail}"
+                    ));
+                }
+                Err(crate::amiga_adz::AdzError::NotAdf(
+                    crate::amiga_disk::AmigaFloppyError::Container(
+                        crate::amiga_disk::DiskError::Io(_)
+                        | crate::amiga_disk::DiskError::ChangedWhileReading,
+                    )
+                    | crate::amiga_disk::AmigaFloppyError::Filesystem(
+                        crate::amiga_disk::FilesystemError::Io(_)
+                        | crate::amiga_disk::FilesystemError::Cancelled,
+                    ),
+                )) => {
+                    return MemberPlatformObservation::Incomplete(
+                        "ADF inspection stopped before validation".into(),
+                    );
+                }
+                Err(_) => None,
+            },
+            "tzx" | "cdt" => {
+                shared_tape |= if extension == "tzx" {
+                    crate::tape_identity::parse_tzx(&bytes).is_ok()
+                } else {
+                    crate::tape_identity::parse_cdt(&bytes).is_ok()
+                };
+                None
+            }
             _ => None,
         };
         if let Some(found) = found {
@@ -170,6 +206,10 @@ pub(crate) fn observe_zip_platform(path: &Path) -> MemberPlatformObservation {
                 && named.ino() == opened.ino()
                 && descriptor.len() == opened.len()
                 && named.len() == opened.len()
+                && descriptor.ctime() == opened.ctime()
+                && descriptor.ctime_nsec() == opened.ctime_nsec()
+                && named.ctime() == opened.ctime()
+                && named.ctime_nsec() == opened.ctime_nsec()
                 && descriptor.modified().ok() == opened.modified().ok()
                 && named.modified().ok() == opened.modified().ok()
         });
@@ -178,5 +218,34 @@ pub(crate) fn observe_zip_platform(path: &Path) -> MemberPlatformObservation {
             "ZIP changed during member inspection".into(),
         );
     }
-    MemberPlatformObservation::Complete(if ambiguous { None } else { platform })
+    MemberPlatformObservation::Complete(if ambiguous || shared_tape {
+        None
+    } else {
+        platform
+    })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::io::Write;
+
+    #[test]
+    fn adf_staging_failure_keeps_member_inspection_incomplete() {
+        let dir = tempfile::tempdir().unwrap();
+        let archive_path = dir.path().join("disk.zip");
+        let file = std::fs::File::create(&archive_path).unwrap();
+        let mut zip = zip::ZipWriter::new(file);
+        zip.start_file("disk.adf", zip::write::SimpleFileOptions::default())
+            .unwrap();
+        zip.write_all(&crate::synthetic_media::amiga_adf(1, b"TEST"))
+            .unwrap();
+        zip.finish().unwrap();
+        let unusable_temp = dir.path().join("ordinary-file");
+        std::fs::write(&unusable_temp, b"not a directory").unwrap();
+        assert!(matches!(
+            observe_zip_platform_in_temp_dir(&archive_path, &unusable_temp),
+            MemberPlatformObservation::Incomplete(_)
+        ));
+    }
 }

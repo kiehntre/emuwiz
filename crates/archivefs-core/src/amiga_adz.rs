@@ -141,13 +141,16 @@ pub fn inspect_adz(path: &Path) -> Result<AdzInspection, AdzError> {
 
 /// Reuse the ADF validator for an already bounded, complete in-memory member.
 /// The staging inode is private and unlinked; no archive name becomes a path.
-pub(crate) fn inspect_adf_member_bytes(bytes: &[u8]) -> Result<AmigaFloppyInspection, AdzError> {
+pub(crate) fn inspect_adf_member_bytes_in_temp_dir(
+    bytes: &[u8],
+    temp_dir: &Path,
+) -> Result<AmigaFloppyInspection, AdzError> {
     if bytes.len() as u64 > MAX_ADZ_DECOMPRESSED_BYTES {
         return Err(AdzError::DecompressedTooLarge {
             limit: MAX_ADZ_DECOMPRESSED_BYTES,
         });
     }
-    let mut temp = open_private_temp_file(&std::env::temp_dir())
+    let mut temp = open_private_temp_file(temp_dir)
         .map_err(|error| AdzError::TempFileUnavailable(error.to_string()))?;
     temp.write_all(bytes)
         .map_err(|error| AdzError::Io(error.to_string()))?;
