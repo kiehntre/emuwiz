@@ -677,16 +677,22 @@ fn install_retrodeck_projection(
     );
     std::fs::create_dir_all(gamelist.parent().unwrap()).unwrap();
     std::fs::write(&gamelist, "<gameList>\n<!-- keep -->\n</gameList>\n").unwrap();
-    state.retain_retrodeck_projection(
-        build_retrodeck_projection(
-            &plan,
-            &identity,
-            fixture.path("retrodeck-destination"),
-            visibility,
-            &profile,
-        )
-        .unwrap(),
-    );
+    let projection = build_retrodeck_projection(
+        &plan,
+        &identity,
+        fixture.path("retrodeck-destination"),
+        visibility,
+        &profile,
+    )
+    .unwrap();
+    state.output_projection = Some(LibraryOutputProjection::from_plan_with_ownership(
+        LibraryOutputProfile::RetroDeck,
+        projection.destination_root.clone(),
+        &projection.playing_library_plan,
+        Vec::new(),
+        &inspect_library_output_ownership(&projection.playing_library_plan, &state.journal_dir),
+    ));
+    state.retain_retrodeck_projection(projection);
 }
 
 #[test]
