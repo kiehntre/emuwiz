@@ -1301,6 +1301,16 @@ fn structural_format_evidence(
         }
         if let Ok(crate::tape_identity::TapeInspection::ZxSpectrum(tape)) =
             crate::tape_identity::inspect_tap_file(path, trusted)
+            && tape
+                .blocks
+                .iter()
+                .any(|block| match (&block.kind, &block.header) {
+                    (crate::tape_identity::ZxTapBlockKind::Header, Some(header)) => {
+                        header.file_type <= 3
+                    }
+                    (crate::tape_identity::ZxTapBlockKind::Data, _) => block.length >= 16,
+                    _ => false,
+                })
         {
             return vec![DetectionEvidence {
                 source: DetectionSource::Signature,
@@ -1333,6 +1343,12 @@ fn structural_format_evidence(
                 _ => crate::zx_spectrum_snapshot::parse_szx_snapshot(&bytes),
             };
             if let Ok(facts) = parsed {
+                if facts.format == crate::zx_spectrum_snapshot::SnapshotFormat::Z80V1
+                    && facts.compressed == Some(true)
+                    && !valid_z80_v1_compressed_ram(&bytes)
+                {
+                    return Vec::new();
+                }
                 return vec![DetectionEvidence {
                     source: DetectionSource::Signature,
                     conclusive: true,
@@ -1470,4 +1486,41 @@ fn structural_format_evidence(
         platform,
         detail,
     }]
+}
+
+/// Count the expanded length without allocating or interpreting machine RAM.
+/// The snapshot parser validates the envelope; platform detection additionally
+/// requires a compressed v1 stream to account for all 48 KiB of RAM.
+fn valid_z80_v1_compressed_ram(bytes: &[u8]) -> bool {
+    const RAM_BYTES: usize = 49_152;
+    const HEADER_BYTES: usize = 30;
+    const TAIL_BYTES: usize = 4;
+    let Some(end) = bytes.len().checked_sub(TAIL_BYTES) else {
+        return false;
+    };
+    if end < HEADER_BYTES {
+        return false;
+    }
+    let mut offset = HEADER_BYTES;
+    let mut expanded = 0usize;
+    while offset < end {
+        let count = if bytes.get(offset..offset + 2) == Some(&[0xed, 0xed]) {
+            let Some(run) = bytes.get(offset + 2..offset + 4) else {
+                return false;
+            };
+            offset += 4;
+            usize::from(run[0])
+        } else {
+            offset += 1;
+            1
+        };
+        if count == 0 {
+            return false;
+        }
+        expanded += count;
+        if expanded > RAM_BYTES {
+            return false;
+        }
+    }
+    expanded == RAM_BYTES
 }
