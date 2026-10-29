@@ -137,6 +137,7 @@ pub(super) fn fixture(context: &egui::Context) -> App {
         text_guide_viewer: Default::default(),
         document_preferences: super::documents::DocumentPreferences::default(),
         document_cache: None,
+        document_refresh: Default::default(),
         document_index: None,
         document_issue: None,
         setup_portability: super::setup_portability::SetupPortabilityState::default(),
@@ -3889,7 +3890,15 @@ fn gui_v2_game_details_show_evidence_section_only_when_the_media_has_evidence() 
     let mut app = fixture(&context);
     app.library = Arc::new(Library::new(vec![archive(1, "Plain Game", Some("PS2"))]));
     app.router.current = Route::Game(1);
-    let output = frame(&context, &mut app, [1280.0, 1600.0]);
+    let deadline = Instant::now() + Duration::from_secs(10);
+    let output = loop {
+        let output = frame(&context, &mut app, [1280.0, 1600.0]);
+        if !app.document_refresh.stale() {
+            break output;
+        }
+        assert!(Instant::now() < deadline, "manual discovery did not finish");
+        std::thread::sleep(Duration::from_millis(10));
+    };
     assert!(
         !text(&output)
             .iter()
@@ -4574,6 +4583,12 @@ fn gui_v2_artwork_metadata_has_library_and_selected_game_views() {
         section: Section::Artwork,
         game: 9,
     };
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while app.document_refresh.stale() {
+        frame(&context, &mut app, [1280.0, 820.0]);
+        assert!(Instant::now() < deadline, "manual discovery did not finish");
+        std::thread::sleep(Duration::from_millis(10));
+    }
     let selected_text = scrolled_text(&context, &mut app, [1280.0, 820.0]);
     assert!(selected_text.iter().any(|value| value == "Rez"));
     assert!(selected_text.iter().any(|value| value == "Metadata"));
