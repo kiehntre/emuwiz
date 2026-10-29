@@ -100,14 +100,31 @@ pub fn save_profile(
     preview: &PokeLaunchPreview,
     selected: &[usize],
 ) -> Result<(), String> {
+    use std::os::unix::fs::MetadataExt;
     // The same composition gate used at launch rejects unsupported banks,
     // overlapping addresses, duplicate selections and unrepresentable titles.
     compose(preview, selected)?;
     let parent = path.parent().ok_or("Profile has no parent directory.")?;
-    std::fs::create_dir_all(parent).map_err(|e| e.to_string())?;
+    let root = parent.parent().ok_or("Profile root is missing.")?;
+    validate_destination_root(root).map_err(|e| format!("Unsafe profile root: {e}"))?;
+    match std::fs::create_dir(parent) {
+        Ok(()) => (),
+        Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => (),
+        Err(error) => return Err(error.to_string()),
+    }
+    validate_destination_root(parent).map_err(|e| format!("Unsafe profile folder: {e}"))?;
+    let parent_metadata = std::fs::metadata(parent).map_err(|e| e.to_string())?;
     let body =
         serde_json::to_string_pretty(&profile_for(preview, selected)).map_err(|e| e.to_string())?;
-    crate::atomic_write_text(path, &body).map_err(|e| e.to_string())
+    if body.len() > 4096 {
+        return Err("Saved POKE profile exceeds 4 KiB.".into());
+    }
+    crate::atomic_text::write_in_existing_parent(
+        path,
+        &body,
+        (parent_metadata.dev(), parent_metadata.ino()),
+    )
+    .map_err(|e| e.to_string())
 }
 
 pub fn load_profile(path: &Path, preview: &PokeLaunchPreview) -> Result<Vec<usize>, String> {
@@ -447,6 +464,29 @@ mod tests {
         assert!(load_profile(&saved, &changed).is_err());
         std::fs::write(path.with_extension("pok"), "N Other\nZ 8 40000 1 0\nY\n").unwrap();
         assert!(preview(&game, &path, &roots).is_err());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn saved_choice_refuses_linked_profile_directory() {
+        let (dir, game, path, roots) = fixture();
+        let selected_preview = preview(&game, &path, &roots).unwrap();
+        let actual = dir.path().join("actual");
+        std::fs::create_dir(&actual).unwrap();
+        let linked = dir.path().join("linked");
+        std::os::unix::fs::symlink(&actual, &linked).unwrap();
+        assert!(save_profile(&linked.join("choice.json"), &selected_preview, &[0]).is_err());
+        assert!(!actual.join("choice.json").exists());
+    }
+
+    #[test]
+    fn oversized_saved_choice_is_never_published() {
+        let (dir, game, path, roots) = fixture();
+        let mut selected_preview = preview(&game, &path, &roots).unwrap();
+        selected_preview.path = PathBuf::from("x".repeat(4096));
+        let saved = dir.path().join("profiles/choice.json");
+        assert!(save_profile(&saved, &selected_preview, &[0]).is_err());
+        assert!(!saved.exists());
     }
 
     fn fixture() -> (tempfile::TempDir, ClassicTrainerGame, PathBuf, TrustedRoots) {

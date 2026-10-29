@@ -97,7 +97,7 @@ impl Chooser {
                 }
                 if let Some(error) = &self.problem { ui.label(format!("Trainer activation blocked: {error}")); }
                 if let Some(preview) = &self.preview {
-                    ui.label(format!("Compatible game identity: {}", preview.identity_summary()));
+                    ui.label(format!("Pinned game identity (matches this verified copy): {}", preview.identity_summary()));
                     ui.label("Source: local same-name .pok, bound to this DAT-verified snapshot by .pok.target. World of Spectrum/ZXDB references alone do not verify this release.");
                     for (index, title) in preview.titles().iter().enumerate() {
                         let mut selected = self.selected.contains(&index);

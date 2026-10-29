@@ -151,16 +151,30 @@ fn target_permissions(parent: &ParentDir, name: &Leaf, path: &Path) -> Result<Op
 }
 
 pub(super) fn write(path: &Path, contents: &str) -> Result<()> {
-    write_mode(path, contents, None)
+    write_mode(path, contents, None, false)
 }
 
 /// Exclusive publication for reviewed new files; never replaces a destination.
 pub(crate) fn create_new(path: &Path, contents: &str, parent_identity: (u64, u64)) -> Result<()> {
-    write_mode(path, contents, Some(parent_identity))
+    write_mode(path, contents, Some(parent_identity), true)
 }
 
-fn write_mode(path: &Path, contents: &str, expected_parent: Option<(u64, u64)>) -> Result<()> {
-    let exclusive = expected_parent.is_some();
+/// Replace a regular file only beneath the already observed parent directory.
+/// This refuses a swapped parent before creating a staging file.
+pub(crate) fn write_in_existing_parent(
+    path: &Path,
+    contents: &str,
+    parent_identity: (u64, u64),
+) -> Result<()> {
+    write_mode(path, contents, Some(parent_identity), false)
+}
+
+fn write_mode(
+    path: &Path,
+    contents: &str,
+    expected_parent: Option<(u64, u64)>,
+    exclusive: bool,
+) -> Result<()> {
     let parent = path.parent().ok_or_else(|| {
         ArchiveFsError::Config(format!("config path has no parent: {}", path.display()))
     })?;
@@ -170,7 +184,7 @@ fn write_mode(path: &Path, contents: &str, expected_parent: Option<(u64, u64)>) 
         parent
     };
     let name = Leaf::from_path(path).map_err(|error| ArchiveFsError::io(path, error))?;
-    if !exclusive {
+    if expected_parent.is_none() {
         fs::create_dir_all(parent).map_err(|error| ArchiveFsError::io(parent, error))?;
     }
     let directory = ParentDir::open(parent).map_err(|error| ArchiveFsError::io(parent, error))?;
