@@ -20,10 +20,10 @@ use crate::LibraryRowFilters;
 /// core change that adds a real per-entry reason only has to update the
 /// call sites below, not invent new copy. See docs/GUI_SIMPLIFICATION.md
 /// for the core API shape that would unlock per-entry reasons.
-pub(crate) const UNKNOWN_PLATFORM_EXPLANATION: &str = "EmuWiz checks the filename, title, and folder \
-    path against known platform names and folder aliases. When none of those match, the \
-    platform is left Unknown rather than guessed. Assign a platform manually below, or add a \
-    folder alias in Sources so future scans recognize it automatically.";
+pub(crate) const UNKNOWN_PLATFORM_EXPLANATION: &str = "EmuWiz checks configured source mappings, \
+    folder aliases, and bounded media structure. A shared or unsupported format may still \
+    leave the platform unresolved. Assign a platform manually below, or add a folder alias \
+    in Sources so future scans recognize it automatically.";
 
 /// Aggregate-form headline for the Unknown-platform explanation banner
 /// shown on the Library page - see `UNKNOWN_PLATFORM_EXPLANATION`.
@@ -102,6 +102,14 @@ pub(crate) fn platform_provenance_lines(
     };
     let mut lines = vec![
         ("Platform", platform_line),
+        (
+            "Platform result",
+            if details.platform.is_some() {
+                "Platform recognised · game identity and DAT verification are separate".to_string()
+            } else {
+                "Unknown platform · more evidence needed".to_string()
+            },
+        ),
         ("Confidence", platform_confidence_label(details).to_string()),
         (
             "Source",
@@ -121,8 +129,17 @@ pub(crate) fn platform_provenance_lines(
     if details.platform.is_none() {
         lines.push((
             "Reason",
-            "No explicit override, header identity, source assignment, folder alias, or filename evidence matched."
+            "No explicit assignment, compatible source mapping, folder alias, or decisive format evidence resolved this platform."
                 .to_string(),
+        ));
+        lines.push((
+            "Next action",
+            "Assign a platform or add a source folder alias".to_string(),
+        ));
+    } else {
+        lines.push((
+            "Next action",
+            "Check a suitable game catalogue for an exact match".to_string(),
         ));
     }
 

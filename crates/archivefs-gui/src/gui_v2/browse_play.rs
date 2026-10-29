@@ -204,14 +204,13 @@ pub(super) const SELECT_VS_PLAY: &str =
 const PRESERVATION_ONLY_SENTENCE: &str = "A recording of a play session, kept for \
      preservation. EmuWiz has no verified replay workflow, so Play is not offered.";
 
-/// "Verified · SNES" on one line. The status comes first so a long system name
-/// is what gets shortened, never the status.
+/// Platform, identity and DAT state on one line, without conflating them.
 fn status_line(game: &Game, width: f32, blue: bool) -> egui::text::LayoutJob {
     let (status, colour) = status_text(game, blue);
     let font = egui::FontId::proportional(theme::METADATA_SIZE);
     let mut job = egui::text::LayoutJob::default();
     job.append(
-        status,
+        &format!("{} · {status}", game.platform),
         0.0,
         egui::TextFormat {
             font_id: font.clone(),
@@ -220,11 +219,7 @@ fn status_line(game: &Game, width: f32, blue: bool) -> egui::text::LayoutJob {
         },
     );
     job.append(
-        &format!(
-            "  ·  {}  ·  DAT: {}",
-            game.platform,
-            game.dat_identity_summary()
-        ),
+        &format!("  ·  DAT: {}", game.dat_identity_summary()),
         0.0,
         egui::TextFormat {
             font_id: font,

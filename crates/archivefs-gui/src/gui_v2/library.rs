@@ -207,7 +207,11 @@ impl Game {
             return self.dat_identity_summary();
         }
         let Some(report) = self.archive.identity_report.as_ref() else {
-            return "Not checked";
+            return if self.platform == UNKNOWN_PLATFORM {
+                "Unknown platform"
+            } else {
+                "Platform recognised · Game not yet identified"
+            };
         };
         let freshness = if self.inspection_incomplete {
             EvidenceFreshness::InspectionIncomplete
@@ -456,7 +460,7 @@ mod tests {
         };
         assert_eq!(
             Game::from_archive(archive).identity_summary(),
-            "Not checked"
+            "Platform recognised · Game not yet identified"
         );
     }
 }

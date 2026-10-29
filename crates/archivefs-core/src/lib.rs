@@ -7039,7 +7039,13 @@ pub fn detect_platform_with_details_and_problems(
         return (
             Some(DetailedPlatformDetection {
                 platform,
-                provenance: PlatformProvenance::RegistryDetector,
+                provenance: if report.deciding_source == Some(platform::DetectionSource::Signature)
+                    && report.confidence == platform::DetectionConfidence::Confirmed
+                {
+                    PlatformProvenance::HeaderIdentity
+                } else {
+                    PlatformProvenance::RegistryDetector
+                },
                 matched_folder: None,
             }),
             problems,
