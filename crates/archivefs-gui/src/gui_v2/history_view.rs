@@ -1393,6 +1393,7 @@ impl super::App {
                                 entry,
                                 &view,
                                 &self.activity,
+                                self.playing_library_job.is_some(),
                                 &mut go,
                                 &mut preview_request,
                                 &mut undo_request,
@@ -1497,7 +1498,10 @@ impl super::App {
                     } else {
                         "EmuWiz will re-verify the quarantined files and restore them to their original locations. If anything changed unexpectedly it will refuse and tell you why."
                     });
-                    if ui.button(if library_index.is_some() { "Undo these links" } else { "Undo this repair" }).clicked() {
+                    if ui.add_enabled(
+                        self.playing_library_job.is_none(),
+                        egui::Button::new(if library_index.is_some() { "Undo these links" } else { "Undo this repair" }),
+                    ).clicked() {
                         confirmed = true;
                     }
                     if ui.button("Cancel").clicked() {
@@ -1505,6 +1509,11 @@ impl super::App {
                     }
                 });
                 if confirmed {
+                    if self.playing_library_job.is_some() {
+                        view.confirm_undo = None;
+                        self.history_view = view;
+                        return;
+                    }
                     view.confirm_undo = None;
                     self.undo_confirm = None;
                     self.history_view = view;
@@ -1660,6 +1669,7 @@ fn show_row(
     entry: &HistoryEntry,
     view: &HistoryViewState,
     activity: &super::activity::Activity,
+    playing_library_busy: bool,
     go: &mut Option<Route>,
     preview_request: &mut Option<String>,
     undo_request: &mut Option<String>,
@@ -1759,10 +1769,11 @@ fn show_row(
             });
 
             if let Some(preview) = preview {
-                let undo_busy = view
-                    .undo_attempts
-                    .values()
-                    .any(|id| activity.jobs.get(id).is_some_and(|job| job.active()));
+                let undo_busy = playing_library_busy
+                    || view
+                        .undo_attempts
+                        .values()
+                        .any(|id| activity.jobs.get(id).is_some_and(|job| job.active()));
                 show_preview(ui, entry, preview, undo_busy, go, undo_request);
             }
 

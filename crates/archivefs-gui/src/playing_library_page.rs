@@ -1039,6 +1039,18 @@ impl PlayingLibraryPageState {
             self.retrodeck_error = Some("the typed confirmation did not match".into());
             return;
         }
+        if self
+            .output_projection
+            .as_ref()
+            .map(|value| value.operation_count)
+            != Some(projection.total_files)
+        {
+            self.retrodeck_error = Some(
+                "partial RetroDECK output needs review before more links can be created".into(),
+            );
+            self.retrodeck_pending_apply = false;
+            return;
+        }
         let reviewed = match self.retrodeck_preview_transaction.take() {
             Some((preview, transaction)) if preview == *projection => transaction,
             _ => Err("RetroDECK preview is stale or already used; run a fresh Preview".into()),
@@ -1074,6 +1086,17 @@ impl PlayingLibraryPageState {
         let count = projection.total_files;
         if self.romm_confirm_text.trim() != playing_library_confirmation_phrase(count) {
             self.romm_error = Some("the typed confirmation did not match".to_string());
+            return;
+        }
+        if self
+            .output_projection
+            .as_ref()
+            .map(|value| value.operation_count)
+            != Some(count)
+        {
+            self.romm_error =
+                Some("partial RomM output needs review before more links can be created".into());
+            self.romm_pending_apply = false;
             return;
         }
         let reviewed = match self.romm_preview_transaction.take() {
@@ -1732,20 +1755,20 @@ pub(crate) fn show_playing_library_page_with_busy(
                 PlayingLibraryDestination::Romm => Some((
                     projection.operation_count,
                     projection.conflicts.is_empty()
-                        && state
-                            .romm_projection
-                            .as_ref()
-                            .is_some_and(|value| value.visibility.is_verified()),
+                        && state.romm_projection.as_ref().is_some_and(|value| {
+                            value.visibility.is_verified()
+                                && value.total_files == projection.operation_count
+                        }),
                     state.romm_pending_apply,
                     state.romm_applied.is_some(),
                 )),
                 PlayingLibraryDestination::RetroDeck => Some((
                     projection.operation_count,
                     projection.conflicts.is_empty()
-                        && state
-                            .retrodeck_projection
-                            .as_ref()
-                            .is_some_and(|value| value.visibility.is_verified()),
+                        && state.retrodeck_projection.as_ref().is_some_and(|value| {
+                            value.visibility.is_verified()
+                                && value.total_files == projection.operation_count
+                        }),
                     state.retrodeck_pending_apply,
                     state.retrodeck_applied.is_some(),
                 )),
@@ -1815,9 +1838,20 @@ pub(crate) fn show_playing_library_page_with_busy(
                     action = Some(PlayingLibraryPageAction::RequestApply);
                 }
             } else {
+                let required = if state.destination == PlayingLibraryDestination::Romm {
+                    state
+                        .romm_projection
+                        .as_ref()
+                        .map_or(count, |value| value.total_files)
+                } else {
+                    state
+                        .retrodeck_projection
+                        .as_ref()
+                        .map_or(count, |value| value.total_files)
+                };
                 ui.label(format!(
                     "Type {}",
-                    playing_library_confirmation_phrase(count)
+                    playing_library_confirmation_phrase(required)
                 ));
                 let confirmation = if state.destination == PlayingLibraryDestination::Romm {
                     &mut state.romm_confirm_text
@@ -2340,14 +2374,16 @@ fn show_output_projection_summary(
             && projection.conflicts.is_empty()
         {
             let visibility_ok = match projection.profile {
-                LibraryOutputProfile::Romm => state
-                    .romm_projection
-                    .as_ref()
-                    .is_some_and(|value| value.visibility.is_verified()),
-                LibraryOutputProfile::RetroDeck => state
-                    .retrodeck_projection
-                    .as_ref()
-                    .is_some_and(|value| value.visibility.is_verified()),
+                LibraryOutputProfile::Romm => state.romm_projection.as_ref().is_some_and(|value| {
+                    value.visibility.is_verified()
+                        && value.total_files == projection.operation_count
+                }),
+                LibraryOutputProfile::RetroDeck => {
+                    state.retrodeck_projection.as_ref().is_some_and(|value| {
+                        value.visibility.is_verified()
+                            && value.total_files == projection.operation_count
+                    })
+                }
                 LibraryOutputProfile::Generic | LibraryOutputProfile::EsDe => true,
             };
             if widgets::action_button(
@@ -2363,7 +2399,12 @@ fn show_output_projection_summary(
             if !visibility_ok {
                 ui.label(
                     egui::RichText::new(
-                        "Apply is blocked until the profile's source visibility is explicitly verified.",
+                        if matches!(projection.profile, LibraryOutputProfile::Romm | LibraryOutputProfile::RetroDeck)
+                            && projection.already_correct > 0 {
+                            "Apply is blocked: partial existing profile output needs review. Undo its receipt or use a fresh destination."
+                        } else {
+                            "Apply is blocked until the profile's source visibility is explicitly verified."
+                        },
                     )
                     .color(theme::warning(ui)),
                 );
@@ -2373,7 +2414,17 @@ fn show_output_projection_summary(
             if state.async_busy {
                 ui.label("Building your playing library in the background…");
             }
-            let count = projection.operation_count;
+            let count = match projection.profile {
+                LibraryOutputProfile::Romm => state
+                    .romm_projection
+                    .as_ref()
+                    .map_or(projection.operation_count, |value| value.total_files),
+                LibraryOutputProfile::RetroDeck => state
+                    .retrodeck_projection
+                    .as_ref()
+                    .map_or(projection.operation_count, |value| value.total_files),
+                _ => projection.operation_count,
+            };
             {
                 let confirmation = match projection.profile {
                     LibraryOutputProfile::Romm => &mut state.romm_confirm_text,
