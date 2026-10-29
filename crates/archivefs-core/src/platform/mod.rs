@@ -185,7 +185,7 @@ pub const MAX_MAGIC_OFFSET: u64 = 0x8008;
 /// at best, with every plausible platform reported as a candidate.
 pub const SHARED_EXTENSIONS: &[&str] = &[
     "bin", "cue", "iso", "img", "rom", "zip", "7z", "rar", "dsk", "tap", "cas", "adf", "chd",
-    "mdf", "ccd",
+    "mdf", "ccd", "sna", "ipf",
 ];
 
 /// Whether `extension` (lowercased, no dot) is one of the shared extensions
@@ -802,7 +802,13 @@ pub const PLATFORMS: &[Platform] = &[
     Platform {
         id: "Commodore 64",
         display_name: "Commodore 64",
-        folder_aliases: &["commodore64", "c64", "commodorec64", "c64gs"],
+        folder_aliases: &[
+            "commodore64",
+            "c64",
+            "commodorec64",
+            "commodorecommodore64",
+            "c64gs",
+        ],
         filename_aliases: &[],
         strong_extensions: &["t64", "crt", "g64", "d81ns"],
         weak_extensions: &["tap", "cas", "bin", "zip"],
@@ -820,23 +826,23 @@ pub const PLATFORMS: &[Platform] = &[
             "commodoreamiga",
             "commodoreamiga500",
             "amiga500",
+            "amiga600",
+            "amiga1200",
             "amigaocs",
             "amigaaga",
             "amigaecs",
         ],
         filename_aliases: &[],
-        strong_extensions: &["adz", "ipf", "dms", "lha"],
-        weak_extensions: &["adf", "hdf", "zip", "iso", "lzx"],
-        magic: &[MagicRule {
-            offset: 0,
-            bytes: b"DOS\x00",
-            description: "OFS/FFS floppy images begin with the `DOS` boot-block identifier",
-            confidence: MagicConfidence::Strong,
-        }],
+        strong_extensions: &["adz", "dms", "lha"],
+        weak_extensions: &["adf", "hdf", "zip", "iso", "lzx", "ipf"],
+        // A DOS boot identifier alone is insufficient: corrupt images can
+        // carry it, and valid custom-booting games can omit it. The existing
+        // bounded Amiga floppy inspector validates the usable structure.
+        magic: &[],
         layout: &[],
         conflicts_with: &["AmigaCD32", "Acorn Archimedes", "Commodore CDTV"],
         preferred_emulator: None,
-        explanation: "`.adf` is shared with Acorn ADFS, so the boot-block signature is what confirms an Amiga floppy. CD-based Amiga titles belong to CD32 or CDTV, not here.",
+        explanation: "`.adf` is shared with Acorn ADFS; validated Amiga filesystem structure can confirm it, while custom-booting disks need folder or other evidence. CD-based Amiga titles belong to CD32 or CDTV, not here.",
     },
     Platform {
         id: "Commodore CDTV",
@@ -1494,6 +1500,7 @@ pub const PLATFORMS: &[Platform] = &[
             "sega32xgenesis",
             "mega32x",
             "genesis32x",
+            "sega32",
         ],
         filename_aliases: &[],
         strong_extensions: &["32x"],
@@ -1551,6 +1558,7 @@ pub const PLATFORMS: &[Platform] = &[
             "segasms",
             "mastersystemmarkiii",
             "segamarkiii",
+            "markiii",
         ],
         filename_aliases: &[],
         strong_extensions: &["sms"],
@@ -1879,8 +1887,8 @@ pub const PLATFORMS: &[Platform] = &[
             "zxspectrum128k",
         ],
         filename_aliases: &[],
-        strong_extensions: &["z80", "sna", "szx", "scl", "trd"],
-        weak_extensions: &["cdt", "tap", "dsk", "tzx", "zip"],
+        strong_extensions: &["z80", "szx", "scl", "trd"],
+        weak_extensions: &["cdt", "tap", "dsk", "tzx", "zip", "sna"],
         magic: &[MagicRule {
             offset: 0,
             bytes: b"ZXTape!\x1a",

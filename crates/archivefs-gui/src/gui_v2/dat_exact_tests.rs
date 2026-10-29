@@ -210,7 +210,7 @@ fn only_a_single_exact_match_verifies_a_game() {
             .find(|game| game.title == file)
             .unwrap();
         assert!(!game.identified, "{file} must not be verified");
-        assert_eq!(game.identity_summary(), "Unknown");
+        assert_eq!(game.identity_summary(), "Unknown platform");
         assert!(game.dat_exact_label().is_none());
     }
 }
@@ -236,7 +236,7 @@ fn a_stale_exact_row_does_not_verify_a_game() {
         library
             .games
             .iter()
-            .all(|game| game.identity_summary() == "Unknown")
+            .all(|game| game.identity_summary() == "Unknown platform")
     );
 }
 

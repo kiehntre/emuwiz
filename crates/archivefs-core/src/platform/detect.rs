@@ -833,21 +833,77 @@ fn structural_format_evidence(
         .and_then(|v| v.to_str())
         .is_some_and(|v| v.eq_ignore_ascii_case("tap"))
     {
-        return crate::oric_media::inspect_oric_file(
+        if let Ok(inspection) = crate::oric_media::inspect_oric_file(
             path,
             trusted,
             &std::sync::atomic::AtomicBool::new(false),
-        )
-        .ok()
-        .map(|inspection| {
-            vec![DetectionEvidence {
+        ) {
+            return vec![DetectionEvidence {
                 source: DetectionSource::Signature,
                 conclusive: true,
                 platform: "Oric",
                 detail: inspection.observation().evidence()[0].detail.clone(),
-            }]
-        })
-        .unwrap_or_default();
+            }];
+        }
+        if let Ok(crate::tape_identity::TapeInspection::ZxSpectrum(tape)) =
+            crate::tape_identity::inspect_tap_file(path, trusted)
+        {
+            return vec![DetectionEvidence {
+                source: DetectionSource::Signature,
+                conclusive: true,
+                platform: "ZX Spectrum",
+                detail: format!(
+                    "{} TAP blocks passed length and XOR checksum validation; game identity was not checked",
+                    tape.blocks.len()
+                ),
+            }];
+        }
+        return Vec::new();
+    }
+
+    if let Some(extension) = path.extension().and_then(|value| value.to_str()) {
+        if matches!(
+            extension.to_ascii_lowercase().as_str(),
+            "z80" | "sna" | "szx"
+        ) && let Ok(mut file) = crate::safe_read::open_bounded_read(path, trusted)
+            && file.len() <= crate::zx_spectrum_snapshot::MAX_SNAPSHOT_BYTES
+            && let Some(bytes) = file.read_exact_at(
+                0,
+                file.len() as usize,
+                crate::zx_spectrum_snapshot::MAX_SNAPSHOT_BYTES as usize,
+            )
+        {
+            let parsed = match extension.to_ascii_lowercase().as_str() {
+                "z80" => crate::zx_spectrum_snapshot::parse_z80_snapshot(&bytes),
+                "sna" => crate::zx_spectrum_snapshot::parse_sna_snapshot(&bytes),
+                _ => crate::zx_spectrum_snapshot::parse_szx_snapshot(&bytes),
+            };
+            if let Ok(facts) = parsed {
+                return vec![DetectionEvidence {
+                    source: DetectionSource::Signature,
+                    conclusive: true,
+                    platform: "ZX Spectrum",
+                    detail: format!(
+                        "{} snapshot structure validated; game identity was not checked",
+                        facts.format.label()
+                    ),
+                }];
+            }
+        }
+    }
+
+    if path
+        .extension()
+        .and_then(|value| value.to_str())
+        .is_some_and(|value| value.eq_ignore_ascii_case("adf"))
+        && let Ok(inspection) = crate::amiga_disk::inspect_amiga_floppy_in_roots(path, trusted)
+    {
+        return vec![DetectionEvidence {
+            source: DetectionSource::Signature,
+            conclusive: inspection.filesystem().is_some(),
+            platform: "Amiga",
+            detail: inspection.description(),
+        }];
     }
 
     use crate::disk_format::{DiskFormatContext, inspect_disk_format};

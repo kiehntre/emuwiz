@@ -122,6 +122,11 @@ fn thousands(value: usize) -> String {
 fn status_text(game: &Game) -> (&'static str, Color32) {
     if game.attention {
         ("Needs attention", ATTENTION_TEXT)
+    } else if !game.identified && game.platform != super::library::UNKNOWN_PLATFORM {
+        (
+            "Platform recognised · Game not yet identified",
+            theme::SECONDARY_TEXT,
+        )
     } else {
         match game.identity_summary() {
             "Verified" => ("Verified", theme::SUCCESS),
@@ -136,8 +141,10 @@ fn readiness_sentence(game: &Game) -> &'static str {
         "Something needs attention before this can start. Game Details shows what."
     } else if game.identified {
         "Play checks that everything is ready first. Nothing starts until you confirm."
+    } else if game.platform != super::library::UNKNOWN_PLATFORM {
+        "The platform is recognised. Check a suitable catalogue to identify the exact game."
     } else {
-        "This game is not verified yet. Play will show what is missing."
+        "More platform evidence is needed. Assign the platform or review the source folder."
     }
 }
 
@@ -148,20 +155,11 @@ fn status_line(game: &Game, width: f32) -> egui::text::LayoutJob {
     let font = egui::FontId::proportional(theme::METADATA_SIZE);
     let mut job = egui::text::LayoutJob::default();
     job.append(
-        status,
+        &format!("{} · {status}", game.platform),
         0.0,
         egui::TextFormat {
             font_id: font.clone(),
             color: colour,
-            ..Default::default()
-        },
-    );
-    job.append(
-        &format!("  ·  {}", game.platform),
-        0.0,
-        egui::TextFormat {
-            font_id: font,
-            color: theme::SECONDARY_TEXT,
             ..Default::default()
         },
     );

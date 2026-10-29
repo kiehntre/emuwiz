@@ -165,12 +165,19 @@ impl Game {
             return "Verified";
         }
         let Some(report) = self.archive.identity_report.as_ref() else {
-            return "Unknown";
+            return if self.platform == UNKNOWN_PLATFORM {
+                "Unknown platform"
+            } else {
+                "Platform recognised · Game not yet identified"
+            };
         };
         match canonical_identity_from_game_report(report).0 {
             CanonicalIdentityStatus::Resolved(_) => "Verified",
             CanonicalIdentityStatus::Conflicting => "Mismatch",
-            CanonicalIdentityStatus::Unknown => "Needs verification",
+            CanonicalIdentityStatus::Unknown if self.platform != UNKNOWN_PLATFORM => {
+                "Platform recognised · Game not yet identified"
+            }
+            CanonicalIdentityStatus::Unknown => "Unknown platform",
         }
     }
 }
@@ -377,7 +384,10 @@ mod tests {
             last_verified_missing_at: None,
             identity_report: None,
         };
-        assert_eq!(Game::from_archive(archive).identity_summary(), "Unknown");
+        assert_eq!(
+            Game::from_archive(archive).identity_summary(),
+            "Platform recognised · Game not yet identified"
+        );
     }
 }
 

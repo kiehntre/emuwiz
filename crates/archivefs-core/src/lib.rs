@@ -6552,10 +6552,10 @@ pub fn detect_platform_with_details(
         });
     }
 
-    if let Some(platform) = detect_platform_from_registry(path, source_root) {
+    if let Some((platform, provenance)) = detect_platform_from_registry(path, source_root) {
         return Some(DetailedPlatformDetection {
             platform,
-            provenance: PlatformProvenance::RegistryDetector,
+            provenance,
             matched_folder: None,
         });
     }
@@ -6596,13 +6596,23 @@ pub fn detect_platform_with_details(
 /// media family as explicit registry-policy exceptions. A `.rvz`/`.wbfs`
 /// file remains subject to the existing GameCube/Wii conflict handling, so
 /// this is not a blanket "any strong extension is confirmed" rule.
-fn detect_platform_from_registry(path: &Path, source_root: &Path) -> Option<String> {
+fn detect_platform_from_registry(
+    path: &Path,
+    source_root: &Path,
+) -> Option<(String, PlatformProvenance)> {
     let mut request = platform::DetectionRequest::new(path, source_root);
     request.read_signatures = true;
     let report = platform::detect_platform_report(&request);
     let platform = report.platform?;
     match report.confidence {
-        platform::DetectionConfidence::Confirmed => Some(platform.to_string()),
+        platform::DetectionConfidence::Confirmed => Some((
+            platform.to_string(),
+            if report.deciding_source == Some(platform::DetectionSource::Signature) {
+                PlatformProvenance::HeaderIdentity
+            } else {
+                PlatformProvenance::RegistryDetector
+            },
+        )),
         platform::DetectionConfidence::Probable => {
             // Apple II and Macintosh are the one paired family whose strong
             // media extensions remain discoverable as registry candidates
@@ -6614,7 +6624,7 @@ fn detect_platform_from_registry(path: &Path, source_root: &Path) -> Option<Stri
                     || platform::platform_by_id(platform)
                         .is_some_and(|entry| entry.conflicts_with.is_empty())
                     || matches!(platform, "MSX" | "MSX2"));
-            unambiguous.then(|| platform.to_string())
+            unambiguous.then(|| (platform.to_string(), PlatformProvenance::RegistryDetector))
         }
         platform::DetectionConfidence::Unknown | platform::DetectionConfidence::Ambiguous => None,
     }

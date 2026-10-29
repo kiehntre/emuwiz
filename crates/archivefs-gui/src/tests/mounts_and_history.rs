@@ -778,6 +778,8 @@ fn custom_and_built_in_alias_provenance_show_their_matches() {
     let built_in_lines = provenance_line_map(&built_in);
     assert_eq!(built_in_lines["Source"], "Built-in folder alias");
     assert_eq!(built_in_lines["Matched folder"], "intellivision");
+    assert!(built_in_lines["Platform result"].starts_with("Platform recognised"));
+    assert!(built_in_lines["Next action"].contains("catalogue"));
 }
 
 #[test]
@@ -805,6 +807,8 @@ fn heuristic_and_unknown_provenance_are_clear_and_never_show_raw_sources() {
     let unknown_lines = provenance_line_map(&unknown);
     assert_eq!(unknown_lines["Platform"], "Unknown");
     assert_eq!(unknown_lines["Source"], "Unknown");
+    assert!(unknown_lines["Platform result"].starts_with("Unknown platform"));
+    assert!(unknown_lines["Next action"].contains("source folder"));
 }
 
 #[test]
