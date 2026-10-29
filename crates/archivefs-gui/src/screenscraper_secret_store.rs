@@ -1,9 +1,9 @@
 //! Optional ScreenScraper credentials in the user's Secret Service or an
-//! explicitly selected restricted file. No credential is passed in arguments
+//! EmuWiz-owned restricted file. No credential is passed in arguments
 //! or included in errors.
 
 use std::io::Write;
-#[cfg(test)]
+#[cfg(any(test, target_os = "linux"))]
 use std::path::Path;
 use std::path::PathBuf;
 use std::process::{Command, Stdio};
@@ -40,8 +40,9 @@ pub(super) enum StoreError {
     Insecure,
 }
 
-/// Uses the system's Secret Service through `secret-tool` when installed.
-/// A missing or failing service never causes a plaintext fallback.
+/// Uses the EmuWiz-owned file if present, or when `secret-tool` is absent.
+/// Existing Secret Service users keep that backend; a failing service never
+/// causes a plaintext fallback.
 pub(super) struct SecretStore {
     program: PathBuf,
     requires_session_bus: bool,
@@ -54,8 +55,8 @@ pub(super) struct SecretStore {
 impl SecretStore {
     pub fn system() -> Self {
         #[cfg(target_os = "linux")]
-        let restricted_file = std::env::var_os("EMUWIZ_SCREENSCRAPER_SECRETS_DIR")
-            .map(|value| RestrictedFileStore::new(PathBuf::from(value)));
+        let restricted_file = selected_file_directory(Path::new("/usr/bin/secret-tool").is_file())
+            .map(RestrictedFileStore::new);
         #[cfg(not(target_os = "linux"))]
         let unsupported_file = std::env::var_os("EMUWIZ_SCREENSCRAPER_SECRETS_DIR").is_some();
         Self {
@@ -217,6 +218,36 @@ impl SecretStore {
     }
 }
 
+#[cfg(target_os = "linux")]
+fn selected_file_directory(secret_tool_available: bool) -> Option<PathBuf> {
+    let home = std::env::var_os("HOME").map(PathBuf::from);
+    let override_dir = std::env::var_os("EMUWIZ_SCREENSCRAPER_SECRETS_DIR").map(PathBuf::from);
+    selected_file_directory_for(home.as_deref(), override_dir, secret_tool_available)
+}
+
+#[cfg(target_os = "linux")]
+fn selected_file_directory_for(
+    home: Option<&Path>,
+    override_dir: Option<PathBuf>,
+    secret_tool_available: bool,
+) -> Option<PathBuf> {
+    if let Some(override_dir) = override_dir {
+        return Some(override_dir);
+    }
+    let home = home?;
+    if !home.is_absolute() {
+        return None;
+    }
+    let directory = home.join(".config/emuwiz");
+    let file = directory.join("screenscraper.env");
+    let existing_file_or_error = match file.symlink_metadata() {
+        Ok(_) => true,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => false,
+        Err(_) => true,
+    };
+    (existing_file_or_error || !secret_tool_available).then_some(directory)
+}
+
 #[cfg(all(test, unix))]
 mod tests {
     use super::*;
@@ -305,6 +336,27 @@ mod tests {
         let store = SecretStore::new(&script);
         assert_eq!(store.load().unwrap_err(), StoreError::Failed);
         assert_eq!(store.forget().unwrap_err(), StoreError::Failed);
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn saltbox_default_selects_managed_env_without_manual_environment_variable() {
+        let home = tempfile::tempdir().unwrap();
+        let directory = home.path().join(".config/emuwiz");
+        assert_eq!(
+            selected_file_directory_for(Some(home.path()), None, false),
+            Some(directory.clone())
+        );
+        assert_eq!(
+            selected_file_directory_for(Some(home.path()), None, true),
+            None
+        );
+        std::fs::create_dir_all(&directory).unwrap();
+        std::fs::write(directory.join("screenscraper.env"), b"unrelated").unwrap();
+        assert_eq!(
+            selected_file_directory_for(Some(home.path()), None, true),
+            Some(directory)
+        );
     }
 
     #[cfg(target_os = "linux")]

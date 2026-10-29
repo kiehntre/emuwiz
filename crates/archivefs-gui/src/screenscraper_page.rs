@@ -214,8 +214,11 @@ impl ScreenScraperPageState {
             Err(StoreError::InvalidRecord) => {
                 self.stored = false;
                 self.invalid_stored = true;
-                self.storage_message =
-                    Some("Stored credentials are invalid; replace or forget them.");
+                self.storage_message = Some(if self.file_mode {
+                    "Existing screenscraper.env is invalid or not EmuWiz-owned. It was not loaded; EmuWiz will not overwrite or remove an unrelated file."
+                } else {
+                    "Stored credentials are invalid; replace or forget them."
+                });
             }
             Err(StoreError::Insecure) => {
                 self.storage_message = Some(
@@ -317,6 +320,11 @@ impl ScreenScraperPageState {
             Err(StoreError::TooLarge) => {
                 self.storage_message = Some(
                     "Credentials are too long for the selected storage. They remain in this session only.",
+                );
+            }
+            Err(StoreError::InvalidRecord) => {
+                self.storage_message = Some(
+                    "Existing screenscraper.env is invalid or not EmuWiz-owned. Save was not verified; check the file before retrying. Current entries remain in this session.",
                 );
             }
             Err(StoreError::Insecure) => {
@@ -610,14 +618,20 @@ pub(crate) fn show_screen_scraper_settings(
         ui.add_space(6.0);
         ui.label(egui::RichText::new("Credentials").strong());
         if state.file_mode {
-            ui.label("Operator-enabled restricted file: credentials are plaintext to this account and root. The directory must be owner-only (0700), the file owner-only (0600), and backups must be protected.");
+            ui.label("EmuWiz-managed private screenscraper.env: Save creates an owner-only directory (0700) and file (0600). Contents are plaintext to this account and root. Protect or exclude backups; Forget cannot erase old SSD blocks or backup copies.");
         }
         if state.storage_request.is_some() {
             ui.label(
                 "Credential storage is working in the background. You can continue using EmuWiz.",
             );
         } else if state.invalid_stored {
-            ui.label("Stored credentials are invalid. Replace or forget them.");
+            if state.file_mode {
+                ui.label(
+                    "Existing screenscraper.env is invalid or not EmuWiz-owned; it was not loaded.",
+                );
+            } else {
+                ui.label("Stored credentials are invalid. Replace or forget them.");
+            }
         } else if state.stored {
             if state.unsaved_edits {
                 ui.label(
@@ -1030,16 +1044,14 @@ mod tests {
 
     #[cfg(target_os = "linux")]
     #[test]
-    fn explicitly_selected_restricted_file_survives_app_restart_and_forget() {
-        use std::os::unix::fs::PermissionsExt;
+    fn managed_env_is_created_then_survives_app_restart_update_and_forget() {
         let home = std::path::PathBuf::from(std::env::var_os("HOME").expect("private test home"));
         let root = tempfile::Builder::new()
             .prefix("emuwiz-screenscraper-file-test-")
             .tempdir_in(home)
             .unwrap();
-        let directory = root.path().join("secrets");
-        std::fs::create_dir(&directory).unwrap();
-        std::fs::set_permissions(&directory, std::fs::Permissions::from_mode(0o700)).unwrap();
+        let directory = root.path().join(".config/emuwiz");
+        assert!(!directory.exists());
 
         let mut first = ScreenScraperPageState::empty(true);
         first.developer_id = "synthetic-dev-id".into();
@@ -1050,14 +1062,15 @@ mod tests {
         settle_storage(&mut first);
         assert!(first.stored);
         assert!(first.file_mode);
+        assert!(directory.join("screenscraper.env").exists());
 
         let mut restarted = ScreenScraperPageState::empty(true);
         restarted.begin_load_with(SecretStore::restricted_file_for_test(directory.clone()));
         settle_storage(&mut restarted);
         assert_eq!(restarted.developer_id, "synthetic-dev-id");
-        assert_eq!(restarted.developer_password, "synthetic-dev-password");
+        assert!(restarted.developer_password == "synthetic-dev-password");
         assert_eq!(restarted.user_id, "synthetic-user-id");
-        assert_eq!(restarted.user_password, "synthetic-user-password");
+        assert!(restarted.user_password == "synthetic-user-password");
         assert!(rendered_text_contains(
             &render(&mut restarted),
             "plaintext to this account"
@@ -1070,11 +1083,12 @@ mod tests {
         let mut after_update = ScreenScraperPageState::empty(true);
         after_update.begin_load_with(SecretStore::restricted_file_for_test(directory.clone()));
         settle_storage(&mut after_update);
-        assert_eq!(after_update.developer_password, "synthetic-dev-password");
-        assert_eq!(after_update.user_password, "updated-user-password");
+        assert!(after_update.developer_password == "synthetic-dev-password");
+        assert!(after_update.user_password == "updated-user-password");
 
         after_update.begin_forget_with(SecretStore::restricted_file_for_test(directory.clone()));
         settle_storage(&mut after_update);
+        assert!(!directory.join("screenscraper.env").exists());
         let mut after_forget = ScreenScraperPageState::empty(true);
         after_forget.begin_load_with(SecretStore::restricted_file_for_test(directory));
         settle_storage(&mut after_forget);
