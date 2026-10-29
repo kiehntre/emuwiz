@@ -36,6 +36,9 @@ fn unowned_reason(path: &Path) -> &'static str {
         .and_then(|name| name.to_str())
         .is_some_and(|name| name.starts_with("mame-") && name.ends_with(".zip.staged"))
     {
+        if !std::fs::symlink_metadata(path).is_ok_and(|m| m.is_file() && !m.is_symlink()) {
+            return "No recovery journal owns this staged entry, and it is missing or not a regular file. It was not followed or changed. A fresh publication will refuse this path; inspect it in Recovery before retrying.";
+        }
         "No recovery journal owns this staged file. It may be an interrupted write or a foreign file; it cannot be published, adopted, undone or removed automatically. It is retained in place. Preview again to make a fresh, separately approved attempt."
     } else {
         "Unknown or manually added file; retained without ownership proof"

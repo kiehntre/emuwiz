@@ -678,6 +678,30 @@ fn staging_repair_changed_journal_source_still_refuses_retry() {
 }
 
 #[test]
+fn staging_repair_unknown_symlink_is_shown_as_blocking_and_not_followed() {
+    use std::os::unix::fs::symlink;
+    let lab = Lab::new();
+    let plan = repair_plan(&lab);
+    std::fs::create_dir_all(lab.stage_root()).unwrap();
+    let victim = lab.root().join("foreign-file");
+    std::fs::write(&victim, b"foreign bytes").unwrap();
+    let link = lab
+        .stage_root()
+        .join(format!("mame-{}.zip.staged", "c".repeat(32)));
+    symlink(&victim, &link).unwrap();
+    let items = super::staging_lifecycle::inventory(&lab.stage_root(), &lab.journal()).unwrap();
+    assert!(items[0].retention_reason.contains("not a regular file"));
+    assert!(
+        apply_staged_reconstruction_output(&plan, &lab.stage_root(), &lab.journal())
+            .unwrap_err()
+            .contains("not a regular file")
+    );
+    assert_eq!(std::fs::read(victim).unwrap(), b"foreign bytes");
+    assert!(std::fs::symlink_metadata(link).unwrap().is_symlink());
+    assert!(!plan.destination.exists());
+}
+
+#[test]
 fn staging_repair_exclusive_journal_collision_keeps_earlier_journal() {
     use crate::dat::rename_apply::{journal, rollback};
     let lab = Lab::new();

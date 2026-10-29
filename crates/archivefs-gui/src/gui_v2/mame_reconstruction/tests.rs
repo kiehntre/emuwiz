@@ -1415,6 +1415,39 @@ fn restarted_blue_shows_unjournaled_stage_without_a_history_receipt() {
     assert_eq!(std::fs::read(orphan).unwrap(), b"interrupted write");
 }
 
+#[test]
+fn blue_discards_staging_status_from_a_previously_selected_folder() {
+    let lab = Lab::new();
+    let old_root = lab.root();
+    let stage_dir = staging_root(&old_root);
+    std::fs::create_dir_all(&stage_dir).unwrap();
+    std::fs::write(
+        stage_dir.join(format!("mame-{}.zip.staged", "b".repeat(32))),
+        b"old folder",
+    )
+    .unwrap();
+    let items = staging_lifecycle::inventory(&stage_dir, &lab.journal()).unwrap();
+    let mut panel = panel_with(&lab, Arc::new(|_, _, _| unreachable!()));
+    panel.root = Some(lab.dir.path().join("another-mame-folder"));
+    panel.finish(MameJobReport {
+        result: MameResult::History,
+        history: None,
+        staging: Some((old_root.clone(), Ok(items.clone()))),
+    });
+    assert!(panel.unjournaled_stages.is_empty());
+    panel.root = Some(old_root.clone());
+    panel.finish(MameJobReport {
+        result: MameResult::History,
+        history: None,
+        staging: Some((old_root, Ok(items))),
+    });
+    assert_eq!(panel.unjournaled_stages.len(), 1);
+    panel.history_root = panel.root.clone();
+    panel.root = Some(lab.dir.path().join("another-mame-folder"));
+    panel.sync_history_root();
+    assert!(panel.unjournaled_stages.is_empty());
+}
+
 // --- Clone-free games ---------------------------------------------------
 
 #[test]

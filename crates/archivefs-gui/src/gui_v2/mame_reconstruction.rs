@@ -1425,7 +1425,7 @@ pub(super) type HistoryRead = Result<(Vec<RenameTransaction>, Vec<String>), Stri
 pub(super) struct MameJobReport {
     pub result: MameResult,
     pub history: Option<HistoryRead>,
-    pub staging: Option<Result<Vec<StagingItem>, String>>,
+    pub staging: Option<(PathBuf, Result<Vec<StagingItem>, String>)>,
 }
 
 pub(super) type MameExecutor =
@@ -1438,8 +1438,9 @@ fn reload_history(environment: &MameEnvironment) -> Option<HistoryRead> {
 fn reload_staging(
     root: &Path,
     environment: &MameEnvironment,
-) -> Option<Result<Vec<StagingItem>, String>> {
-    Some(
+) -> (PathBuf, Result<Vec<StagingItem>, String>) {
+    (
+        root.to_owned(),
         environment
             .journal_dir()
             .and_then(|journal| staging_lifecycle::inventory(&staging_root(root), &journal)),
@@ -1581,7 +1582,7 @@ pub(super) fn execute(
             MameJobReport {
                 result: MameResult::Publish(Box::new(result)),
                 history: reload_history(environment),
-                staging: reload_staging(&preview.inputs.root, environment),
+                staging: Some(reload_staging(&preview.inputs.root, environment)),
             }
         }
         MameRequest::Undo { transaction_id } => {
@@ -1621,7 +1622,7 @@ pub(super) fn execute(
             history: reload_history(environment),
             staging: root
                 .as_deref()
-                .and_then(|root| reload_staging(root, environment)),
+                .map(|root| reload_staging(root, environment)),
         },
     }
 }
@@ -1865,7 +1866,10 @@ impl MameReconstructionPanel {
     }
 
     fn finish(&mut self, report: MameJobReport) {
-        if let Some(staging) = report.staging {
+        if let Some((_, staging)) = report
+            .staging
+            .filter(|(root, _)| self.root.as_ref() == Some(root))
+        {
             match staging {
                 Ok(items) => {
                     self.unjournaled_stages = items
@@ -2269,14 +2273,18 @@ impl MameReconstructionPanel {
     // Rendering.
     // -----------------------------------------------------------------------
 
-    pub(super) fn show(&mut self, ui: &mut egui::Ui) {
-        self.poll();
+    fn sync_history_root(&mut self) {
         if self.history_root != self.root {
             self.history_root = self.root.clone();
             self.history_requested = false;
             self.unjournaled_stages.clear();
             self.staging_problem = None;
         }
+    }
+
+    pub(super) fn show(&mut self, ui: &mut egui::Ui) {
+        self.poll();
+        self.sync_history_root();
         if !self.history_requested && !self.is_busy() {
             self.history_requested = true;
             self.start(MameRequest::LoadHistory {
@@ -2291,6 +2299,9 @@ impl MameReconstructionPanel {
         self.show_notice(ui);
         ui.add_space(theme::SPACE_SM);
         self.show_selection(ui);
+        // A folder picked during this frame must not inherit the previous
+        // folder's orphan status even for one rendered frame.
+        self.sync_history_root();
         if let Some(game) = &self.standalone
             && self.inputs().as_ref() == Some(&game.inputs)
         {
