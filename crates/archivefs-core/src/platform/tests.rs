@@ -9,7 +9,168 @@ use std::collections::BTreeMap;
 use std::fs;
 use std::path::{Path, PathBuf};
 
+#[test]
+fn validated_spectrum_tap_recovers_platform_without_a_dat_match() {
+    let tree = TempTree::new("spectrum-tap-recovery");
+    // One standard ZX data block: flag, payload, XOR checksum.
+    let mut tape = vec![16, 0, 0xff];
+    tape.extend([0; 14]);
+    tape.push(0xff);
+    let path = tree.file("Games/title.tap", &tape);
+    let report =
+        detect_platform_report(&DetectionRequest::new(&path, tree.path()).inspecting_content());
+    assert_eq!(report.platform, Some("ZX Spectrum"));
+    assert_eq!(report.confidence, DetectionConfidence::Confirmed);
+    assert_eq!(report.deciding_source, Some(DetectionSource::Signature));
+    assert_eq!(
+        crate::detect_platform_with_details(&path, tree.path())
+            .expect("validated tape has a platform")
+            .provenance,
+        crate::PlatformProvenance::HeaderIdentity
+    );
+
+    *tape.last_mut().unwrap() = 0;
+    let misleading = tree.file("Games/bad.tap", &tape);
+    let bad = detect_platform_report(
+        &DetectionRequest::new(&misleading, tree.path()).inspecting_content(),
+    );
+    assert_ne!(bad.platform, Some("ZX Spectrum"));
+
+    let other_only = tree.file("Games/other.tap", &[2, 0, 0, 0]);
+    let other = detect_platform_report(
+        &DetectionRequest::new(&other_only, tree.path()).inspecting_content(),
+    );
+    assert_ne!(other.platform, Some("ZX Spectrum"));
+    assert!(!other.evidence.iter().any(|evidence| {
+        evidence.platform == "ZX Spectrum" && evidence.source == DetectionSource::Signature
+    }));
+}
+
+#[test]
+fn amiga_model_source_folders_resolve_without_dat_evidence() {
+    for folder in ["amiga600", "amiga1200"] {
+        let path = PathBuf::from(format!("/roms/{folder}/custom-boot.adf"));
+        let report = detect_platform_report(&DetectionRequest::new(&path, Path::new(ROOT)));
+        assert_eq!(report.platform, Some("Amiga"));
+        assert_eq!(report.deciding_source, Some(DetectionSource::FolderAlias));
+        assert_eq!(report.confidence, DetectionConfidence::Probable);
+    }
+}
+
+#[test]
+fn observed_classic_source_folders_identify_zipped_media_without_dat_claims() {
+    for (folder, platform) in [
+        ("markiii", "MasterSystem"),
+        ("sega32", "Sega 32X"),
+        ("Commodore - Commodore 64", "Commodore 64"),
+    ] {
+        let path = PathBuf::from(format!("/roms/{folder}/game.zip"));
+        let report = detect_platform_report(&DetectionRequest::new(&path, Path::new(ROOT)));
+        assert_eq!(report.platform, Some(platform));
+        assert_eq!(report.deciding_source, Some(DetectionSource::FolderAlias));
+        assert_eq!(report.confidence, DetectionConfidence::Probable);
+    }
+}
+
+#[test]
+fn amiga_dos_prefix_on_corrupt_adf_is_not_platform_proof() {
+    let tree = TempTree::new("amiga-corrupt-adf");
+    let path = tree.file("Games/bad.adf", b"DOS\x00not-a-floppy");
+    let report =
+        detect_platform_report(&DetectionRequest::new(&path, tree.path()).inspecting_content());
+    assert_ne!(report.platform, Some("Amiga"));
+    assert!(!report.evidence.iter().any(|evidence| {
+        evidence.platform == "Amiga" && evidence.source == DetectionSource::Signature
+    }));
+}
+
+#[test]
+fn spectrum_snapshot_requires_valid_structure_and_shared_tzx_stays_ambiguous() {
+    let tree = TempTree::new("spectrum-snapshot-recovery");
+    let mut sna = vec![0u8; 49_179];
+    sna[23] = 0xff;
+    sna[24] = 0x5f;
+    let valid = tree.file("Games/title.sna", &sna);
+    let report =
+        detect_platform_report(&DetectionRequest::new(&valid, tree.path()).inspecting_content());
+    assert_eq!(report.platform, Some("ZX Spectrum"));
+    assert_eq!(report.confidence, DetectionConfidence::Confirmed);
+
+    let invalid = tree.file("Games/bad.sna", &[0u8; 32]);
+    let bad =
+        detect_platform_report(&DetectionRequest::new(&invalid, tree.path()).inspecting_content());
+    assert_ne!(bad.platform, Some("ZX Spectrum"));
+
+    let tzx = tree.file("Games/shared.tzx", b"ZXTape!\x1a\x01\x14");
+    let shared =
+        detect_platform_report(&DetectionRequest::new(&tzx, tree.path()).inspecting_content());
+    assert_eq!(shared.confidence, DetectionConfidence::Ambiguous);
+
+    let mut tiny_z80 = vec![0u8; 30];
+    tiny_z80[6] = 1; // v1 PC
+    tiny_z80[12] = 0x20; // compressed RAM
+    tiny_z80.extend([0, 0xed, 0xed, 0]);
+    let tiny = tree.file("Games/tiny.z80", &tiny_z80);
+    let tiny_report =
+        detect_platform_report(&DetectionRequest::new(&tiny, tree.path()).inspecting_content());
+    assert!(!tiny_report.evidence.iter().any(|evidence| {
+        evidence.platform == "ZX Spectrum" && evidence.source == DetectionSource::Signature
+    }));
+
+    let mut compressed = tiny_z80[..30].to_vec();
+    for _ in 0..192 {
+        compressed.extend([0xed, 0xed, 255, 0]);
+    }
+    compressed.extend([0xed, 0xed, 192, 0]);
+    compressed.extend([0, 0xed, 0xed, 0]);
+    let complete = tree.file("Games/complete.z80", &compressed);
+    let complete_report =
+        detect_platform_report(&DetectionRequest::new(&complete, tree.path()).inspecting_content());
+    assert_eq!(complete_report.confidence, DetectionConfidence::Confirmed);
+    assert_eq!(complete_report.platform, Some("ZX Spectrum"));
+}
+
 const ROOT: &str = "/roms";
+
+/// Opt-in, read-only sample of a real collection. Kept bounded so it can be
+/// rerun after catalogue changes without opening an entire library.
+#[test]
+#[ignore]
+fn sample_classic_collection_platform_recovery() {
+    let root = PathBuf::from(std::env::var("EMUWIZ_CLASSIC_SAMPLE_ROOT").expect("sample root"));
+    let mut paths: Vec<_> = fs::read_dir(root.join("Games"))
+        .expect("Games directory")
+        .take(100_000)
+        .flatten()
+        .map(|entry| entry.path())
+        .filter(|path| fs::symlink_metadata(path).is_ok_and(|metadata| metadata.is_file()))
+        .collect();
+    paths.sort();
+    for extension in ["tap", "tzx", "z80", "scl", "trd", "sna"] {
+        let sample: Vec<_> = paths
+            .iter()
+            .filter(|path| path.extension().is_some_and(|value| value == extension))
+            .take(100)
+            .collect();
+        let mut before_unknown = 0;
+        let mut after_unknown = 0;
+        let mut recognised = 0;
+        for path in &sample {
+            let before = detect_platform_report(&DetectionRequest::new(path, &root));
+            // The old scan path already used disk-format structural checks,
+            // so only tape/snapshot results are compared with this baseline.
+            let after =
+                detect_platform_report(&DetectionRequest::new(path, &root).inspecting_content());
+            before_unknown += usize::from(before.platform.is_none());
+            after_unknown += usize::from(after.platform.is_none());
+            recognised += usize::from(after.platform == Some("ZX Spectrum"));
+        }
+        eprintln!(
+            "{extension}: sampled={} extension-only-unknown={before_unknown} after-unknown={after_unknown} spectrum-recognised={recognised}",
+            sample.len()
+        );
+    }
+}
 
 #[test]
 fn ps4_is_a_conservative_canonical_platform_distinct_from_ps3() {
@@ -2342,7 +2503,6 @@ fn platform_candidates_from_bytes_behaviour_is_unchanged_by_the_confidence_field
 const REVIEWED_MAGIC_CONFIDENCE: &[(&str, u64, &[u8], MagicConfidence)] = &[
     ("Atari7800", 0x1, b"ATARI7800", MagicConfidence::Strong),
     ("Atari Lynx", 0, b"LYNX", MagicConfidence::Strong),
-    ("Amiga", 0, b"DOS\x00", MagicConfidence::Strong),
     ("N64", 0, &[0x80, 0x37, 0x12, 0x40], MagicConfidence::Strong),
     ("NES", 0, b"NES\x1a", MagicConfidence::Strong),
     (
@@ -2547,7 +2707,7 @@ fn a_platform_with_mixed_confidence_rules_reports_its_best_match() {
 }
 
 #[test]
-fn total_magic_rule_coverage_is_twenty_two_rules_across_nineteen_platforms() {
+fn total_magic_rule_coverage_is_twenty_one_rules_across_eighteen_platforms() {
     let mut rule_count = 0usize;
     let mut platform_count = 0usize;
     for platform in PLATFORMS {
@@ -2556,10 +2716,10 @@ fn total_magic_rule_coverage_is_twenty_two_rules_across_nineteen_platforms() {
         }
         rule_count += platform.magic.len();
     }
-    assert_eq!(rule_count, 22);
+    assert_eq!(rule_count, 21);
     assert_eq!(
-        platform_count, 19,
-        "Pokemon Mini adds the newest magic-rule platform"
+        platform_count, 18,
+        "Amiga DOS prefix now requires structural validation"
     );
 }
 

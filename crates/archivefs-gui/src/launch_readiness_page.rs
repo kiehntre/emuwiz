@@ -49,6 +49,7 @@ pub(crate) mod cemu;
 mod cemu_stop;
 mod classic_pokes;
 pub(crate) mod controller_readiness;
+mod desmume;
 pub(crate) mod dosbox;
 #[path = "launch_readiness_page/flycast.rs"]
 pub(crate) mod flycast;
@@ -1000,6 +1001,7 @@ pub(crate) enum StandaloneProcess {
     Mame(archivefs_core::launch::process_spawn::WatchedProcess),
     Tsugaru(archivefs_core::launch::process_spawn::WatchedProcess),
     Mgba(archivefs_core::launch::process_spawn::WatchedProcess),
+    Desmume(archivefs_core::launch::process_spawn::WatchedProcess),
     AmiberryCd(archivefs_core::launch::LaunchedAmiberryCdProcess),
     /// MAME started through the canonical per-launch cheat runtime; the session
     /// owns the temporary cheat workspace and removes it after MAME exits.
@@ -1271,6 +1273,7 @@ impl StandaloneLaunchState {
                     StandaloneProcess::Mame(p) => p.poll().is_some(),
                     StandaloneProcess::Tsugaru(p) => p.poll().is_some(),
                     StandaloneProcess::Mgba(p) => p.poll().is_some(),
+                    StandaloneProcess::Desmume(p) => p.poll().is_some(),
                     StandaloneProcess::AmiberryCd(p) => p.poll().is_some(),
                     StandaloneProcess::MameCheats(session) => {
                         session.poll();
@@ -1333,6 +1336,9 @@ impl StandaloneLaunchState {
             Some((_, _, StandaloneLaunchStage::Failed(error))) => Some(error.clone()),
             Some((_, _, StandaloneLaunchStage::Exited(StandaloneProcess::Mgba(process)))) => {
                 process.exit_report().and_then(mgba::exit_failure)
+            }
+            Some((_, _, StandaloneLaunchStage::Exited(StandaloneProcess::Desmume(process)))) => {
+                process.exit_report().and_then(desmume::exit_failure)
             }
             Some((
                 _,
@@ -1498,6 +1504,7 @@ pub(crate) enum StandaloneLaunchRequest {
     Mame(MameLaunchRequest),
     Tsugaru(tsugaru::Request),
     Mgba(mgba::Request),
+    Desmume(desmume::Request),
     AmiberryCd(amiberry_cd::Request),
     DuckStation(
         DuckStationLaunchRequest,
@@ -1548,6 +1555,7 @@ impl StandaloneLaunchRequest {
             Self::Mame(_) => "MAME",
             Self::Tsugaru(_) => "Tsugaru",
             Self::Mgba(_) => "mGBA",
+            Self::Desmume(_) => "DeSmuME",
             Self::AmiberryCd(_) => "Amiberry CD",
             Self::DuckStation(..) => "DuckStation",
             Self::Ppsspp(_, _) => "PPSSPP",
@@ -1573,6 +1581,7 @@ impl StandaloneLaunchRequest {
             Self::Mame(r) => (r.selected_content.clone(), "mame".into()),
             Self::Tsugaru(r) => r.key(),
             Self::Mgba(r) => r.key(),
+            Self::Desmume(r) => r.key(),
             Self::AmiberryCd(r) => r.key(),
             Self::DuckStation(r, ..) => (r.selected_content_path.clone(), "duckstation".into()),
             Self::Ppsspp(r, _) => (r.selected_content_path.clone(), "ppsspp".into()),
@@ -1606,6 +1615,7 @@ impl StandaloneLaunchRequest {
                 .map_err(|e| format!("{:?}: {}", e.kind, e.detail)),
             Self::Tsugaru(r) => r.execute().map(StandaloneProcess::Tsugaru),
             Self::Mgba(r) => r.execute().map(StandaloneProcess::Mgba),
+            Self::Desmume(r) => r.execute().map(StandaloneProcess::Desmume),
             Self::AmiberryCd(r) => r.execute().map(StandaloneProcess::AmiberryCd),
             Self::Mame(r) => archivefs_core::launch::preflight_and_launch_mame(&r)
                 .map(StandaloneProcess::Mame)
@@ -4782,8 +4792,11 @@ fn show_candidate(
         );
         let mgba_offer = mgba::offer_for(plan, candidate);
         let mgba_blocked = matches!(mgba_offer, Some(Err(_)));
-        let readiness_override = (strict_mame_blocked || installation_blocked || mgba_blocked)
-            .then_some(("Needs attention", widgets::StatusTone::Blocked));
+        let desmume_offer = desmume::offer_for(plan, candidate);
+        let desmume_blocked = matches!(desmume_offer, Some(Err(_)));
+        let readiness_override =
+            (strict_mame_blocked || installation_blocked || mgba_blocked || desmume_blocked)
+                .then_some(("Needs attention", widgets::StatusTone::Blocked));
         let (readiness_label, readiness_tone) =
             readiness_override.unwrap_or_else(|| readiness_label_and_tone(candidate.readiness));
 
@@ -4927,6 +4940,9 @@ fn show_candidate(
         if let Some(offer) = mgba_offer {
             mgba::show_offer(ui, standalone_launch_state, offer);
         }
+        if let Some(offer) = desmume_offer {
+            desmume::show_offer(ui, standalone_launch_state, offer);
+        }
         if let Some(context) = amiga_whdload {
             amiga_boot::show_configuration(ui, candidate, context);
         }
@@ -5047,6 +5063,13 @@ fn show_standalone_launch_action(
                     "Exited"
                 }
             }
+            Some(StandaloneLaunchStage::Exited(StandaloneProcess::Desmume(p))) => {
+                if p.exit_report().and_then(desmume::exit_failure).is_some() {
+                    "Failed"
+                } else {
+                    "Exited"
+                }
+            }
             Some(StandaloneLaunchStage::Exited(_)) => "Process exited",
             Some(StandaloneLaunchStage::Failed(_)) => "Launch failed",
             None => "Launch",
@@ -5102,6 +5125,9 @@ fn show_standalone_launch_action(
             Some((_, _, StandaloneLaunchStage::Running(StandaloneProcess::Mgba(p)))) => {
                 mgba::show_running(ui, p);
             }
+            Some((_, _, StandaloneLaunchStage::Running(StandaloneProcess::Desmume(p)))) => {
+                desmume::show_running(ui, p);
+            }
             Some((_, _, StandaloneLaunchStage::Running(StandaloneProcess::AmiberryCd(p)))) => {
                 ui.small(format!("Amiberry CD running · PID {}", p.pid));
                 ui.small("Starting the process does not prove the game ran.");
@@ -5140,6 +5166,9 @@ fn show_standalone_launch_action(
                 }
                 if let StandaloneProcess::Mgba(p) = process {
                     mgba::show_exited(ui, p);
+                }
+                if let StandaloneProcess::Desmume(p) = process {
+                    desmume::show_exited(ui, p);
                 }
                 if let StandaloneProcess::AmiberryCd(p) = process
                     && let Some(report) = p.poll()
@@ -5226,6 +5255,13 @@ fn show_standalone_launch_action(
         if adapter == "mgba"
             && !state.is_active()
             && ui.button("Launch mGBA again (recheck)").clicked()
+        {
+            state.start(request);
+            return;
+        }
+        if adapter == "desmume"
+            && !state.is_active()
+            && ui.button("Launch DeSmuME again (recheck)").clicked()
         {
             state.start(request);
             return;

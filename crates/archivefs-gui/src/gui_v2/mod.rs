@@ -74,6 +74,7 @@ mod profile_settings_preview;
 mod psp_iso_analyser;
 mod quarantine_confirm;
 mod r2_rename;
+mod recording_integrity;
 #[cfg(test)]
 mod retroarch_journey_tests;
 mod romm_library;
@@ -412,6 +413,7 @@ pub(super) struct App {
     organisation: organisation::OrganisationState,
     arcade_input_details: arcade_input_details::State,
     classic_trainers: classic_trainers::State,
+    recording_integrity: recording_integrity::State,
     canonical_organisation: crate::rom_organisation_page::RomOrganisationPageState,
     canonical_organisation_job: Option<CanonicalOrganisationJob>,
     history_view: history_view::HistoryViewState,
@@ -529,6 +531,7 @@ impl App {
             organisation: organisation::OrganisationState::default(),
             arcade_input_details: arcade_input_details::State::default(),
             classic_trainers: classic_trainers::State::default(),
+            recording_integrity: recording_integrity::State::default(),
             canonical_organisation: crate::rom_organisation_page::RomOrganisationPageState::load(),
             canonical_organisation_job: None,
             history_view: Default::default(),
@@ -1797,6 +1800,7 @@ impl App {
                                         });
                                     }
                                     self.library = library;
+                                    self.recording_integrity.clear();
                                     // Remembered pages may name a game by an older catalogue
                                     // entry; point them at the current copy.
                                     let before = self.router.current.game();

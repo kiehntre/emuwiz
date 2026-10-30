@@ -204,14 +204,28 @@ pub(super) const SELECT_VS_PLAY: &str =
 const PRESERVATION_ONLY_SENTENCE: &str = "A recording of a play session, kept for \
      preservation. EmuWiz has no verified replay workflow, so Play is not offered.";
 
-/// "Verified · SNES" on one line. The status comes first so a long system name
-/// is what gets shortened, never the status.
+/// One sentence that says what Play will do for this game.
+fn readiness_sentence(game: &Game) -> &'static str {
+    if game.attention {
+        "Something needs attention before this can start. Game Details shows what."
+    } else if game.identity_summary() == "Mismatch" {
+        "Game identity evidence conflicts. Review it before play."
+    } else if game.identified {
+        "Play checks that everything is ready first. Nothing starts until you confirm."
+    } else if game.platform != super::library::UNKNOWN_PLATFORM {
+        "The platform is recognised. Check a suitable catalogue to identify the exact game."
+    } else {
+        "More platform evidence is needed. Assign the platform or review the source folder."
+    }
+}
+
+/// Platform, identity and DAT state on one line, without conflating them.
 fn status_line(game: &Game, width: f32, blue: bool) -> egui::text::LayoutJob {
     let (status, colour) = status_text(game, blue);
     let font = egui::FontId::proportional(theme::METADATA_SIZE);
     let mut job = egui::text::LayoutJob::default();
     job.append(
-        status,
+        &format!("{} · {status}", game.platform),
         0.0,
         egui::TextFormat {
             font_id: font.clone(),
@@ -220,11 +234,7 @@ fn status_line(game: &Game, width: f32, blue: bool) -> egui::text::LayoutJob {
         },
     );
     job.append(
-        &format!(
-            "  ·  {}  ·  DAT: {}",
-            game.platform,
-            game.dat_identity_summary()
-        ),
+        &format!("  ·  DAT: {}", game.dat_identity_summary()),
         0.0,
         egui::TextFormat {
             font_id: font,
@@ -385,12 +395,11 @@ impl App {
                     match result {
                         Ok(()) => {
                             self.batch_state.mark_applied(archive_id);
-                            if let Some(index) = self.library.by_id.get(&archive_id).copied() {
-                                Arc::make_mut(&mut self.library).games[index].screenscraper = Some(
-                                    archivefs_core::screenscraper_enrichment::PersistedScreenScraperEnrichment {
-                                        archive_id, values, receipt,
-                                    });
-                            }
+                            self.cache_applied_batch_enrichment(
+                                archivefs_core::screenscraper_enrichment::PersistedScreenScraperEnrichment {
+                                    archive_id, values, receipt,
+                                },
+                            );
                         }
                         Err(error) => self.batch_state.mark_apply_failed(archive_id, error),
                     }
@@ -398,6 +407,19 @@ impl App {
                 if self.batch_state.active() { context.request_repaint_after(std::time::Duration::from_millis(100)); }
             });
         self.batch_open = open;
+    }
+
+    pub(super) fn cache_applied_batch_enrichment(
+        &mut self,
+        saved: archivefs_core::screenscraper_enrichment::PersistedScreenScraperEnrichment,
+    ) {
+        if let Some(index) = self.library.by_id.get(&saved.archive_id).copied() {
+            Arc::make_mut(&mut self.library).games[index].screenscraper = Some(saved);
+            // A resolved row may already contain the previous provider values.
+            // reload also advances the generation when indexing is in flight, so
+            // an older worker cannot publish its stale snapshot afterward.
+            self.artwork.reload(self.library.clone());
+        }
     }
 
     /// The games matching the current search and system. Recomputed only when
@@ -1166,6 +1188,7 @@ impl App {
                 )
                 .wrap(),
             );
+            ui.small(readiness_sentence(game));
         }
     }
 
@@ -1216,5 +1239,73 @@ impl App {
                     }
                 }
             });
+    }
+}
+
+#[cfg(test)]
+mod classic_identity_status_tests {
+    use super::{readiness_sentence, status_text};
+    use crate::gui_v2::library::Game;
+    use archivefs_core::PersistedArchive;
+    use archivefs_core::game_identity::*;
+
+    #[test]
+    fn conflicting_game_identity_is_not_hidden_by_recognised_platform() {
+        let path = std::path::PathBuf::from("/fixture/conflict.zip");
+        let mut archive = PersistedArchive {
+            id: 1,
+            source_folder_id: 1,
+            relative_path: "conflict.zip".into(),
+            absolute_path: path.clone(),
+            archive_kind: "zip".into(),
+            display_name: "Conflict".into(),
+            normalized_name: "conflict".into(),
+            size_bytes: Some(1),
+            modified_time_unix_seconds: Some(1),
+            platform: Some("PSX".into()),
+            platform_source: Some("folder_alias".into()),
+            last_known_health: "pending".into(),
+            last_seen_at: "fixture".into(),
+            last_verified_missing_at: None,
+            identity_report: None,
+        };
+        archive.identity_report = Some(GameIdentityReport {
+            archive_path: path.clone(),
+            platform: IdentityPlatform::PlayStation,
+            format: IdentityImageFormat::Iso,
+            evidence: ["SCUS-94163", "SLUS-00001"]
+                .into_iter()
+                .map(|value| IdentityEvidence {
+                    kind: IdentityKind::Ps1Serial,
+                    status: IdentityStatus::Verified,
+                    value: Some(value.into()),
+                    confidence: IdentityConfidence::StructuredMetadata,
+                    provenance: IdentityProvenance {
+                        archive_path: path.clone(),
+                        member_path: None,
+                        member_index: None,
+                        method: "fixture".into(),
+                    },
+                    diagnostic: "fixture".into(),
+                })
+                .collect(),
+            warnings: vec![],
+            bytes_read: 1,
+            archive_members_inspected: 0,
+            metadata_paths_inspected: 1,
+            nested_container_depth: 0,
+            complete: true,
+        });
+        let mut game = Game::from_archive(archive);
+        game.dat_state = Some(archivefs_core::LibraryDatState::NoMatch);
+        assert_eq!(game.identity_summary(), "Mismatch");
+        assert_eq!(game.status(), "Identity conflict · review evidence");
+        assert_eq!(status_text(&game, true).0, "Mismatch");
+        assert!(readiness_sentence(&game).contains("conflicts"));
+        let mut exact = game.clone();
+        exact.dat_state = None;
+        exact.mark_dat_exact(Some("DAT"));
+        assert_eq!(exact.identity_summary(), "Mismatch");
+        assert_eq!(exact.status(), "Identity conflict · review evidence");
     }
 }
