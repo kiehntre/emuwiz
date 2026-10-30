@@ -64,7 +64,12 @@ impl StagingLock {
         Ok(Self { staging, journals })
     }
     fn transactions(&self) -> Result<Vec<RenameTransaction>, String> {
-        let txs = self.journals.transactions()?;
+        checked_transactions(&self.journals)
+    }
+}
+fn checked_transactions(journals: &Directory) -> Result<Vec<RenameTransaction>, String> {
+    {
+        let txs = journals.transactions()?;
         let mut ids = std::collections::BTreeSet::new();
         // A canonical transaction must occupy its own journal slot. A second,
         // mismatched or substituted record is ambiguous ownership, not history.
@@ -72,9 +77,7 @@ impl StagingLock {
             if t.transaction_id.contains('/') || t.transaction_id.contains('\\') {
                 return Err("unsafe journal transaction ID".into());
             }
-            let value = self
-                .journals
-                .read_json(&format!("{}.json", t.transaction_id))?;
+            let value = journals.read_json(&format!("{}.json", t.transaction_id))?;
             let canonical: RenameTransaction =
                 serde_json::from_value(value).map_err(|e| e.to_string())?;
             if canonical != *t {
