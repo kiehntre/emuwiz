@@ -451,7 +451,7 @@ pub use planning::{
 pub use platform_map::{
     LAUNCH_COMPATIBILITY, LaunchCompatibility, MappingConfidence, extension_narrows_candidate,
     launch_compatibility_for_platform, platforms_for_standalone_adapter,
-    retroarch_platform_candidate,
+    retroarch_platform_candidate, retroarch_platform_matches,
 };
 pub use ppsspp_command::{
     PPSSPP_SUPPORTED_PLATFORM_ID, PpssppCommand, PpssppCommandPlan, PpssppCommandSelection,
