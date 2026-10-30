@@ -493,6 +493,7 @@ impl State {
         if self.selected.take().is_some() {
             self.invalidate();
             self.detail = None;
+            self.problem = None;
         } else {
             self.open = false;
             self.invalidate();
@@ -862,7 +863,7 @@ impl State {
                 self.refresh_games();
             }
         });
-        if capabilities.platforms && self.platforms.is_empty() {
+        if capabilities.platforms && self.platforms.is_empty() && !self.platform_warning {
             ui.weak("No platforms are visible to this connection. The server may be empty or this login may have limited access.");
         }
         if self.platform_warning {
