@@ -5,6 +5,8 @@
 //! that `ArchiveMetadata` can persist.  Applying a proposal never changes a
 //! hash, platform assignment, DAT result, or identity verdict.
 
+use std::collections::BTreeMap;
+
 use serde::{Deserialize, Serialize};
 
 use crate::ArchiveMetadata;
@@ -58,6 +60,20 @@ pub struct AcceptedScreenScraperMetadata {
 }
 
 impl AcceptedScreenScraperMetadata {
+    pub fn has_field(&self, field: EnrichmentField) -> bool {
+        match field {
+            EnrichmentField::Title => self.title.is_some(),
+            EnrichmentField::Synopsis => self.synopsis.is_some(),
+            EnrichmentField::Developer => self.developer.is_some(),
+            EnrichmentField::Publisher => self.publisher.is_some(),
+            EnrichmentField::Genre => self.genre.is_some(),
+            EnrichmentField::Players => self.players.is_some(),
+            EnrichmentField::Region => self.region.is_some(),
+            EnrichmentField::Languages => self.languages.is_some(),
+            EnrichmentField::ReleaseYear => self.release_year.is_some(),
+        }
+    }
+
     pub fn apply_to(&self, metadata: &mut ArchiveMetadata) {
         if let Some(value) = &self.title {
             metadata.title = Some(value.clone());
@@ -112,6 +128,46 @@ pub struct ScreenScraperEnrichmentReceipt {
     pub before: AcceptedScreenScraperMetadata,
     pub accepted: AcceptedScreenScraperMetadata,
     pub media_reference_count: usize,
+    /// Exact source for each accepted or retained field in a batch. The map
+    /// is bounded by EnrichmentField::ALL.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub field_sources: BTreeMap<EnrichmentField, ScreenScraperFieldSource>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ScreenScraperFieldSource {
+    pub provider_record_id: String,
+    pub retrieved_at_unix_seconds: u64,
+    pub match_basis: String,
+}
+
+impl ScreenScraperEnrichmentReceipt {
+    pub fn source_for(&self, field: EnrichmentField) -> ScreenScraperFieldSource {
+        self.field_sources
+            .get(&field)
+            .cloned()
+            .unwrap_or_else(|| ScreenScraperFieldSource {
+                provider_record_id: self.provider_record_id.clone(),
+                retrieved_at_unix_seconds: self.retrieved_at_unix_seconds,
+                match_basis: self.match_basis.clone(),
+            })
+    }
+}
+
+pub fn retained_field_sources(
+    prior_values: Option<&AcceptedScreenScraperMetadata>,
+    prior_receipt: Option<&ScreenScraperEnrichmentReceipt>,
+    accepted: &AcceptedScreenScraperMetadata,
+) -> BTreeMap<EnrichmentField, ScreenScraperFieldSource> {
+    let mut sources = BTreeMap::new();
+    if let (Some(prior_values), Some(prior_receipt)) = (prior_values, prior_receipt) {
+        for field in EnrichmentField::ALL {
+            if prior_values.has_field(field) && !accepted.has_field(field) {
+                sources.insert(field, prior_receipt.source_for(field));
+            }
+        }
+    }
+    sources
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -124,7 +180,7 @@ pub struct PersistedScreenScraperEnrichment {
 /// A field whose value may be reviewed in the GUI.  Provider-only fields such
 /// as alternative titles and media URLs stay in the candidate/receipt and are
 /// never silently squeezed into an unrelated local field.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
 pub enum EnrichmentField {
     Title,
     Synopsis,
@@ -199,11 +255,58 @@ mod tests {
                 ..Default::default()
             },
             media_reference_count: 2,
+            field_sources: Default::default(),
         };
         let encoded = serde_json::to_vec(&receipt).unwrap();
         let decoded: ScreenScraperEnrichmentReceipt = serde_json::from_slice(&encoded).unwrap();
         assert_eq!(decoded, receipt);
         assert!(!encoded.windows(6).any(|window| window == b"secret"));
+    }
+
+    #[test]
+    fn retained_fields_keep_original_provenance_across_repeated_acceptance() {
+        let original = ScreenScraperEnrichmentReceipt {
+            provider: "ScreenScraper".into(),
+            provider_record_id: "first".into(),
+            retrieved_at_unix_seconds: 10,
+            match_basis: "hash".into(),
+            before: Default::default(),
+            accepted: Default::default(),
+            media_reference_count: 0,
+            field_sources: Default::default(),
+        };
+        let prior_values = AcceptedScreenScraperMetadata {
+            synopsis: Some("description".into()),
+            genre: Some("Adventure".into()),
+            ..Default::default()
+        };
+        let accepted = AcceptedScreenScraperMetadata {
+            genre: Some("Puzzle".into()),
+            ..Default::default()
+        };
+        let retained = retained_field_sources(Some(&prior_values), Some(&original), &accepted);
+        assert_eq!(retained.len(), 1);
+        assert_eq!(
+            retained[&EnrichmentField::Synopsis].provider_record_id,
+            "first"
+        );
+        let second = ScreenScraperEnrichmentReceipt {
+            provider_record_id: "second".into(),
+            field_sources: retained,
+            ..original.clone()
+        };
+        let later = retained_field_sources(Some(&prior_values), Some(&second), &accepted);
+        assert_eq!(
+            later[&EnrichmentField::Synopsis].provider_record_id,
+            "first"
+        );
+        assert_eq!(later.len(), 1);
+        let legacy = serde_json::to_value(&original).unwrap();
+        assert!(legacy.get("field_sources").is_none());
+        assert_eq!(
+            serde_json::from_value::<ScreenScraperEnrichmentReceipt>(legacy).unwrap(),
+            original
+        );
     }
 
     #[test]

@@ -17,7 +17,7 @@ GENERATED from the live registries by `archivefs_core::format_coverage_matrix` -
 |---|---:|
 | Registered platforms | 83 |
 | PLATFORM × EXTENSION rows | 434 |
-| Strong claims | 110 |
+| Strong claims | 108 |
 | Strong claims the plain scan does not store | 5 |
 | Platforms with no Library route at all | 0 |
 | Platforms claiming no extension | 1 |
@@ -76,7 +76,7 @@ None.
 | Amiga CD32 | `.mdf` | weak (shared) | NOT STORED | - | content | ambiguous | - | - | Dreamcast, PS2, PSX, Philips CD-i, Saturn, Sega CD | standalone (exact) | none |
 | Amstrad CPC | `.cdt` | weak | stored (extension) | Cassette/tape image | content | ambiguous | - | - | ZX Spectrum | none reviewed | none |
 | Amstrad CPC | `.dsk` | weak (shared) | stored (extension) | Computer disk image | content | ambiguous | - | - | Acorn Electron, Apple II, AtariST, BBC Micro, Enterprise, MSX, MSX2, Macintosh, NEC PC-8801, NEC PC-9801, Oric, PC-98, Sharp X68000, ZX Spectrum | none reviewed | none |
-| Amstrad CPC | `.sna` | weak | stored (structural gate) | Machine snapshot | content | ZX Spectrum (probable) | - | ZX Spectrum | - | none reviewed | none |
+| Amstrad CPC | `.sna` | weak (shared) | stored (structural gate) | Machine snapshot | content | ambiguous | - | - | ZX Spectrum | none reviewed | none |
 | Amstrad CPC | `.tap` | weak (shared) | stored (extension) | Cassette/tape image | content | ambiguous | - | - | Commodore 128, Commodore 64, Enterprise, Oric, VIC-20, ZX Spectrum | none reviewed | none |
 | Amstrad CPC | `.tzx` | weak | stored (extension) | Cassette/tape image | content | ambiguous | - | - | ZX Spectrum | none reviewed | none |
 | Apple II | `.do` | strong | stored (extension) | Computer disk image | content | Apple II (probable) | Apple II | - | - | none reviewed | none |
@@ -135,7 +135,7 @@ None.
 | Atari ST | `.msa` | strong | stored (extension) | Computer disk image | content | AtariST (probable) | - | - | - | standalone (exact) | none |
 | Atari ST | `.mfm` | strong | stored (extension) | Computer disk image | content | AtariST (probable) | - | - | - | standalone (exact) | none |
 | Atari ST | `.dsk` | weak (shared) | stored (extension) | Computer disk image | content | ambiguous | - | - | Acorn Electron, Amstrad CPC, Apple II, BBC Micro, Enterprise, MSX, MSX2, Macintosh, NEC PC-8801, NEC PC-9801, Oric, PC-98, Sharp X68000, ZX Spectrum | standalone (exact) | none |
-| Atari ST | `.ipf` | weak | stored (extension) | Computer disk image | content | Amiga (probable) | - | Amiga | - | standalone (exact) | none |
+| Atari ST | `.ipf` | weak (shared) | stored (extension) | Computer disk image | content | ambiguous | - | - | Amiga | standalone (exact) | none |
 | Atari ST | `.zip` | weak (shared) | stored (extension) | - | - | ambiguous | - | - | Amiga, Apple II, Arcade, Atari2600, Atari5200, Atari7800, ColecoVision, Commodore 64, DOS, Game Boy, Game Boy Advance, Game Boy Color, GameCube, GameGear, Intellivision, MSX, MSX2, Macintosh, MasterSystem, MegaDrive, N64, NES, NGage, Neo Geo Pocket, Neo Geo Pocket Color, NeoGeo, NeoGeo64, Nintendo 3DS, Nintendo DS, PC, PC Engine, PC-98, PS2, PS3, PSP, PSX, PlayStation Vita, SNES, ScummVM, Sega 32X, Sharp X68000, Switch, TurboGrafx-16, Vectrex, Virtual Boy, Watara Supervision, Wii, WiiU, WonderSwan, WonderSwan Color, Xbox, Xbox360, ZX Spectrum | standalone (exact) | none |
 | Bandai WonderSwan | `.ws` | strong | stored (extension) | ROM cartridge | content | WonderSwan (probable) | - | - | WonderSwan Color | standalone (strongly known) | synthetic-validated |
 | Bandai WonderSwan | `.bin` | weak (shared) | stored (needs corroboration) | - | content | ambiguous | - | - | 3DO, AmigaCD32, Atari 8-bit, Atari Jaguar, Atari Lynx, Atari2600, Atari5200, Atari7800, ColecoVision, Commodore 64, Commodore CDTV, Dreamcast, FM Towns, Game Boy, Game Boy Advance, Game Boy Color, GameGear, Intellivision, MasterSystem, MegaDrive, N64, NES, Neo Geo CD, Neo Geo Pocket, Neo Geo Pocket Color, NeoGeo64, Nintendo DS, PC Engine, PC Engine CD, PC-FX, PS2, PSX, Philips CD-i, SNES, Saturn, Sega 32X, Sega CD, TurboGrafx-16, Vectrex, Virtual Boy, Watara Supervision, WonderSwan Color | standalone (strongly known) | synthetic-validated |
@@ -169,7 +169,6 @@ None.
 | Commodore 64 | `.bin` | weak (shared) | stored (needs corroboration) | - | content | ambiguous | - | - | 3DO, AmigaCD32, Atari 8-bit, Atari Jaguar, Atari Lynx, Atari2600, Atari5200, Atari7800, ColecoVision, Commodore CDTV, Dreamcast, FM Towns, Game Boy, Game Boy Advance, Game Boy Color, GameGear, Intellivision, MasterSystem, MegaDrive, N64, NES, Neo Geo CD, Neo Geo Pocket, Neo Geo Pocket Color, NeoGeo64, Nintendo DS, PC Engine, PC Engine CD, PC-FX, PS2, PSX, Philips CD-i, SNES, Saturn, Sega 32X, Sega CD, TurboGrafx-16, Vectrex, Virtual Boy, Watara Supervision, WonderSwan, WonderSwan Color | standalone (exact) | none |
 | Commodore 64 | `.zip` | weak (shared) | stored (extension) | - | - | ambiguous | - | - | Amiga, Apple II, Arcade, Atari2600, Atari5200, Atari7800, AtariST, ColecoVision, DOS, Game Boy, Game Boy Advance, Game Boy Color, GameCube, GameGear, Intellivision, MSX, MSX2, Macintosh, MasterSystem, MegaDrive, N64, NES, NGage, Neo Geo Pocket, Neo Geo Pocket Color, NeoGeo, NeoGeo64, Nintendo 3DS, Nintendo DS, PC, PC Engine, PC-98, PS2, PS3, PSP, PSX, PlayStation Vita, SNES, ScummVM, Sega 32X, Sharp X68000, Switch, TurboGrafx-16, Vectrex, Virtual Boy, Watara Supervision, Wii, WiiU, WonderSwan, WonderSwan Color, Xbox, Xbox360, ZX Spectrum | standalone (exact) | none |
 | Commodore Amiga | `.adz` | strong | stored (extension) | Amiga image | content | Amiga (probable) | - | - | - | standalone (exact) | none |
-| Commodore Amiga | `.ipf` | strong | stored (extension) | Computer disk image | content | Amiga (probable) | - | - | AtariST | standalone (exact) | none |
 | Commodore Amiga | `.dms` | strong | stored (extension) | Amiga image | content | Amiga (probable) | - | - | - | standalone (exact) | none |
 | Commodore Amiga | `.lha` | strong | stored (extension) | Amiga image | - | Amiga (probable) | - | - | - | standalone (exact) | none |
 | Commodore Amiga | `.adf` | weak (shared) | stored (extension) | Amiga image | content | ambiguous | - | - | Acorn Archimedes, Acorn Electron, BBC Micro | standalone (exact) | none |
@@ -177,6 +176,7 @@ None.
 | Commodore Amiga | `.zip` | weak (shared) | stored (extension) | - | - | ambiguous | - | - | Apple II, Arcade, Atari2600, Atari5200, Atari7800, AtariST, ColecoVision, Commodore 64, DOS, Game Boy, Game Boy Advance, Game Boy Color, GameCube, GameGear, Intellivision, MSX, MSX2, Macintosh, MasterSystem, MegaDrive, N64, NES, NGage, Neo Geo Pocket, Neo Geo Pocket Color, NeoGeo, NeoGeo64, Nintendo 3DS, Nintendo DS, PC, PC Engine, PC-98, PS2, PS3, PSP, PSX, PlayStation Vita, SNES, ScummVM, Sega 32X, Sharp X68000, Switch, TurboGrafx-16, Vectrex, Virtual Boy, Watara Supervision, Wii, WiiU, WonderSwan, WonderSwan Color, Xbox, Xbox360, ZX Spectrum | standalone (exact) | none |
 | Commodore Amiga | `.iso` | weak (shared) | stored (extension) | Disc image | content | ambiguous | - | - | 3DO, AmigaCD32, Commodore CDTV, Dreamcast, FM Towns, GameCube, Macintosh, Neo Geo CD, PC, PC Engine CD, PC-FX, PS2, PS3, PSP, PSX, Philips CD-i, Saturn, Sega CD, Wii, WiiU, Xbox, Xbox360 | standalone (exact) | none |
 | Commodore Amiga | `.lzx` | weak | NOT STORED | - | - | unknown | - | - | - | standalone (exact) | none |
+| Commodore Amiga | `.ipf` | weak (shared) | stored (extension) | Computer disk image | content | ambiguous | - | - | AtariST | standalone (exact) | none |
 | Commodore CDTV | `.iso` | weak (shared) | stored (extension) | Disc image | content | ambiguous | - | - | 3DO, Amiga, AmigaCD32, Dreamcast, FM Towns, GameCube, Macintosh, Neo Geo CD, PC, PC Engine CD, PC-FX, PS2, PS3, PSP, PSX, Philips CD-i, Saturn, Sega CD, Wii, WiiU, Xbox, Xbox360 | standalone (exact) | none |
 | Commodore CDTV | `.cue` | weak (shared) | stored (structural gate) | - | - | ambiguous | - | - | 3DO, AmigaCD32, Dreamcast, FM Towns, Neo Geo CD, PC Engine CD, PC-FX, PS2, PSX, Philips CD-i, Saturn, Sega CD | standalone (exact) | none |
 | Commodore CDTV | `.bin` | weak (shared) | stored (needs corroboration) | - | content | ambiguous | - | - | 3DO, AmigaCD32, Atari 8-bit, Atari Jaguar, Atari Lynx, Atari2600, Atari5200, Atari7800, ColecoVision, Commodore 64, Dreamcast, FM Towns, Game Boy, Game Boy Advance, Game Boy Color, GameGear, Intellivision, MasterSystem, MegaDrive, N64, NES, Neo Geo CD, Neo Geo Pocket, Neo Geo Pocket Color, NeoGeo64, Nintendo DS, PC Engine, PC Engine CD, PC-FX, PS2, PSX, Philips CD-i, SNES, Saturn, Sega 32X, Sega CD, TurboGrafx-16, Vectrex, Virtual Boy, Watara Supervision, WonderSwan, WonderSwan Color | standalone (exact) | none |
@@ -480,7 +480,6 @@ None.
 | Watara Supervision | `.bin` | weak (shared) | stored (needs corroboration) | - | content | ambiguous | - | - | 3DO, AmigaCD32, Atari 8-bit, Atari Jaguar, Atari Lynx, Atari2600, Atari5200, Atari7800, ColecoVision, Commodore 64, Commodore CDTV, Dreamcast, FM Towns, Game Boy, Game Boy Advance, Game Boy Color, GameGear, Intellivision, MasterSystem, MegaDrive, N64, NES, Neo Geo CD, Neo Geo Pocket, Neo Geo Pocket Color, NeoGeo64, Nintendo DS, PC Engine, PC Engine CD, PC-FX, PS2, PSX, Philips CD-i, SNES, Saturn, Sega 32X, Sega CD, TurboGrafx-16, Vectrex, Virtual Boy, WonderSwan, WonderSwan Color | none reviewed | none |
 | Watara Supervision | `.zip` | weak (shared) | stored (extension) | - | - | ambiguous | - | - | Amiga, Apple II, Arcade, Atari2600, Atari5200, Atari7800, AtariST, ColecoVision, Commodore 64, DOS, Game Boy, Game Boy Advance, Game Boy Color, GameCube, GameGear, Intellivision, MSX, MSX2, Macintosh, MasterSystem, MegaDrive, N64, NES, NGage, Neo Geo Pocket, Neo Geo Pocket Color, NeoGeo, NeoGeo64, Nintendo 3DS, Nintendo DS, PC, PC Engine, PC-98, PS2, PS3, PSP, PSX, PlayStation Vita, SNES, ScummVM, Sega 32X, Sharp X68000, Switch, TurboGrafx-16, Vectrex, Virtual Boy, Wii, WiiU, WonderSwan, WonderSwan Color, Xbox, Xbox360, ZX Spectrum | none reviewed | none |
 | ZX Spectrum | `.z80` | strong | stored (structural gate) | Machine snapshot | content | ZX Spectrum (probable) | - | - | - | standalone (exact) | none |
-| ZX Spectrum | `.sna` | strong | stored (structural gate) | Machine snapshot | content | ZX Spectrum (probable) | - | - | Amstrad CPC | standalone (exact) | none |
 | ZX Spectrum | `.szx` | strong | stored (structural gate) | Machine snapshot | content | ZX Spectrum (probable) | - | - | - | standalone (exact) | none |
 | ZX Spectrum | `.scl` | strong | stored (structural gate) | Computer disk image | content | ZX Spectrum (probable) | - | - | - | standalone (exact) | none |
 | ZX Spectrum | `.trd` | strong | stored (structural gate) | Computer disk image | content | ZX Spectrum (probable) | - | - | - | standalone (exact) | none |
@@ -489,6 +488,7 @@ None.
 | ZX Spectrum | `.dsk` | weak (shared) | stored (extension) | Computer disk image | content | ambiguous | - | - | Acorn Electron, Amstrad CPC, Apple II, AtariST, BBC Micro, Enterprise, MSX, MSX2, Macintosh, NEC PC-8801, NEC PC-9801, Oric, PC-98, Sharp X68000 | standalone (exact) | none |
 | ZX Spectrum | `.tzx` | weak | stored (extension) | Cassette/tape image | content | ambiguous | - | - | Amstrad CPC | standalone (exact) | none |
 | ZX Spectrum | `.zip` | weak (shared) | stored (extension) | - | - | ambiguous | - | - | Amiga, Apple II, Arcade, Atari2600, Atari5200, Atari7800, AtariST, ColecoVision, Commodore 64, DOS, Game Boy, Game Boy Advance, Game Boy Color, GameCube, GameGear, Intellivision, MSX, MSX2, Macintosh, MasterSystem, MegaDrive, N64, NES, NGage, Neo Geo Pocket, Neo Geo Pocket Color, NeoGeo, NeoGeo64, Nintendo 3DS, Nintendo DS, PC, PC Engine, PC-98, PS2, PS3, PSP, PSX, PlayStation Vita, SNES, ScummVM, Sega 32X, Sharp X68000, Switch, TurboGrafx-16, Vectrex, Virtual Boy, Watara Supervision, Wii, WiiU, WonderSwan, WonderSwan Color, Xbox, Xbox360 | standalone (exact) | none |
+| ZX Spectrum | `.sna` | weak (shared) | stored (structural gate) | Machine snapshot | content | ambiguous | - | - | Amstrad CPC | standalone (exact) | none |
 
 ## Validated content samples
 
@@ -496,8 +496,8 @@ Legally generated media (`archivefs_core::synthetic_media`) scanned from a folde
 
 | Platform | Ext | Structure | Stored as | Provenance | Discovery |
 |---|---|---|---|---|---|
-| Amiga | `.adf` | AmigaDOS OFS boot block + valid root block | Amiga | registry_detector | accepted: Amiga |
-| Amiga | `.adf` | AmigaDOS FFS boot block + valid root block | Amiga | registry_detector | accepted: Amiga |
+| Amiga | `.adf` | AmigaDOS OFS boot block + valid root block | Amiga | header_identity | accepted: Amiga |
+| Amiga | `.adf` | AmigaDOS FFS boot block + valid root block | Amiga | header_identity | accepted: Amiga |
 | ZX Spectrum | `.sna` | 48K SNA header with SP in RAM and IM 1 | ZX Spectrum | registry_detector | accepted: ZX Spectrum |
 | ZX Spectrum | `.z80` | Z80 v1 uncompressed snapshot | ZX Spectrum | registry_detector | accepted: ZX Spectrum |
 | ZX Spectrum | `.tap` | one ZX TAP block with a valid checksum (shared format) | - | - | skipped: No identity match found |

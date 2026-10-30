@@ -34,6 +34,7 @@ fn shown(context: &egui::Context, app: &mut App, route: Route, size: [f32; 2]) -
 fn recording_row_is_labelled_preservation_only_and_has_no_play() {
     let row = Game::from_archive(recording(2));
     assert!(row.is_preservation_only());
+    assert!(super::super::recording_integrity::eligible(&row));
     assert!(
         !Game::from_archive(archive(1, "Manic Miner", Some("ZX Spectrum"))).is_preservation_only()
     );
@@ -80,6 +81,17 @@ fn recording_row_is_labelled_preservation_only_and_has_no_play() {
             has(&details, "Spectrum gameplay recording"),
             "blue={blue}: details do not name the recording: {details:?}"
         );
+        if blue {
+            let integrity = scroll_to_text(
+                &context,
+                &mut app,
+                [1280.0, 720.0],
+                "Check recording integrity",
+            );
+            assert!(visible_text(&integrity, "Check recording integrity"));
+        } else {
+            assert!(!has(&details, "Check recording integrity"));
+        }
     }
 }
 

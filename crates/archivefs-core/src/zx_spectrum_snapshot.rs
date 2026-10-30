@@ -269,6 +269,42 @@ const Z80_MAX_PAGES: usize = 32;
 const Z80_PAGE_UNCOMPRESSED_MARKER: u16 = 0xFFFF;
 const Z80_PAGE_DATA_BYTES: usize = 16384;
 
+/// Count the expanded length without allocating or interpreting machine RAM.
+/// A compressed v1 stream must account for all 48 KiB of RAM.
+fn valid_z80_v1_compressed_ram(bytes: &[u8]) -> bool {
+    const RAM_BYTES: usize = 49_152;
+    const HEADER_BYTES: usize = 30;
+    const TAIL_BYTES: usize = 4;
+    let Some(end) = bytes.len().checked_sub(TAIL_BYTES) else {
+        return false;
+    };
+    if end < HEADER_BYTES {
+        return false;
+    }
+    let mut offset = HEADER_BYTES;
+    let mut expanded = 0usize;
+    while offset < end {
+        let count = if bytes.get(offset..offset + 2) == Some(&[0xed, 0xed]) {
+            let Some(run) = bytes.get(offset + 2..offset + 4) else {
+                return false;
+            };
+            offset += 4;
+            usize::from(run[0])
+        } else {
+            offset += 1;
+            1
+        };
+        if count == 0 {
+            return false;
+        }
+        expanded += count;
+        if expanded > RAM_BYTES {
+            return false;
+        }
+    }
+    expanded == RAM_BYTES
+}
+
 /// Parses a `.z80` snapshot (v1/v2/v3). `None` is never returned as a partial
 /// success - either every checked field is consistent or this fails closed.
 pub fn parse_z80_snapshot(bytes: &[u8]) -> Result<SpectrumSnapshotFacts, SnapshotRefusal> {
@@ -308,6 +344,11 @@ pub fn parse_z80_snapshot(bytes: &[u8]) -> Result<SpectrumSnapshotFacts, Snapsho
                 return Err(SnapshotRefusal::Malformed {
                     detail: "a compressed v1 .z80 must end with the 00 ED ED 00 memory marker"
                         .to_string(),
+                });
+            }
+            if !valid_z80_v1_compressed_ram(bytes) {
+                return Err(SnapshotRefusal::Malformed {
+                    detail: "compressed v1 .z80 RAM does not expand to 48 KiB".to_string(),
                 });
             }
         } else if bytes.len() != Z80_V1_UNCOMPRESSED_LEN {
