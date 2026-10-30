@@ -299,6 +299,7 @@ impl App {
         }
     }
     pub(super) fn show(&mut self, context: &egui::Context) {
+        self.recording_integrity.retain_route(&self.router.current);
         // Presentation only: a no-op unless the Simple v1 preference changed.
         if self.simple.apply_zoom_shortcuts(context) {
             self.preferences_dirty = Some(std::time::Instant::now());
@@ -1911,6 +1912,7 @@ impl App {
                             };
                             ui.push_id(("museum-game", game.archive.id), |ui| {
                                 egui::Frame::group(ui.style()).show(ui, |ui| {
+                                    ui.set_width(card_width);
                                     self.picture(
                                         ui,
                                         game,
@@ -1918,12 +1920,21 @@ impl App {
                                         egui::vec2(card_width, 180.0),
                                     );
                                     ui.strong(&game.title);
-                                    ui.label(game.status());
-                                    ui.horizontal_wrapped(|ui| {
+                                    let status = game.status();
+                                    let short_status =
+                                        if status.starts_with("Platform recognised ·") {
+                                            "Platform recognised"
+                                        } else {
+                                            status
+                                        };
+                                    ui.label(short_status).on_hover_text(status);
+                                    ui.horizontal(|ui| {
                                         if ui.button("Details").clicked() {
                                             self.go(Route::Game(game.archive.id));
                                         }
-                                        if !game.is_preservation_only() && primary(ui, "Play") {
+                                        if !game.is_preservation_only()
+                                            && ui.button("Play").clicked()
+                                        {
                                             self.go(Route::Task {
                                                 section: Section::Launch,
                                                 game: game.archive.id,
@@ -2806,6 +2817,11 @@ impl App {
                         },
                     );
                 });
+                if super::recording_integrity::eligible(game) {
+                    super::game_detail_blue::side_card(ui, "Recording integrity", |ui| {
+                        self.recording_integrity.show(ui, game);
+                    });
+                }
                 return;
             }
             let wide = ui.available_width() >= 760.0;
@@ -2822,6 +2838,11 @@ impl App {
                     self.detail_more(ui, game);
                 });
             });
+            if blue && super::recording_integrity::eligible(game) {
+                super::game_detail_blue::side_card(ui, "Recording integrity", |ui| {
+                    self.recording_integrity.show(ui, game);
+                });
+            }
             if blue {
                 super::game_detail_blue::information_card(ui, game, self.artwork.index.as_deref());
             }

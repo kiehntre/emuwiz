@@ -53,6 +53,7 @@ pub(super) struct NativeWorkflows {
     readiness_job: Option<u64>,
     setup_job: Option<u64>,
     launch_job: Option<u64>,
+    launch_game_at_start: Option<i64>,
     launch_was_active: bool,
     launch_kind: Option<LaunchKind>,
     launch_attempts: launch_readiness_summary::AttemptTracker,
@@ -364,6 +365,7 @@ impl NativeWorkflows {
             readiness_job: None,
             setup_job: None,
             launch_job: None,
+            launch_game_at_start: None,
             launch_was_active: false,
             launch_kind: None,
             launch_attempts: Default::default(),
@@ -442,6 +444,7 @@ impl NativeWorkflows {
         let active = self.launch_active();
         if active && !self.launch_was_active {
             self.launch_kind = self.active_launch_kind();
+            self.launch_game_at_start = self.selected_game;
             self.launch_attempts.started();
             let job = activity.queue("Launching game", self.selected_route(), false);
             activity.start(job);
@@ -452,7 +455,7 @@ impl NativeWorkflows {
         {
             let error = self.launch_failure();
             self.launch_attempts
-                .finished(self.selected_game, error.clone());
+                .finished(self.launch_game_at_start.take(), error.clone());
             activity.finish(
                 job,
                 if error.is_some() {
@@ -3523,6 +3526,22 @@ mod launch_recovery_tests;
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn launch_completion_stays_with_game_selected_at_start() {
+        let mut workflows = NativeWorkflows::new(egui::Context::default());
+        let mut activity = Activity::default();
+        let job = activity.queue("Launching game", Route::Section(Section::Launch), false);
+        activity.start(job);
+        workflows.launch_attempts.started();
+        workflows.launch_job = Some(job);
+        workflows.launch_was_active = true;
+        workflows.launch_game_at_start = Some(1);
+        workflows.selected_game = Some(2);
+        workflows.observe_launch_activity(&mut activity);
+        assert!(workflows.launch_attempts.for_game(1).is_some());
+        assert!(workflows.launch_attempts.for_game(2).is_none());
+    }
 
     #[test]
     fn dat_name_snapshot_does_not_initialize_recovery_controller() {

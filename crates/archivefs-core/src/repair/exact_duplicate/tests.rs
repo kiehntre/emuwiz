@@ -971,6 +971,56 @@ fn matching_sha256_and_size_authorizes_an_exact_group() {
     assert_eq!(report.groups[0].size_bytes, identity_a.size_bytes);
 }
 
+#[cfg(unix)]
+#[test]
+fn full_hash_refuses_an_opened_replacement_even_after_original_path_is_restored() {
+    let temp = tempfile::tempdir().unwrap();
+    let path = temp.path().join("recording.rzx");
+    let replacement = temp.path().join("replacement.rzx");
+    let held_original = temp.path().join("held-original.rzx");
+    std::fs::write(&path, b"original bytes").unwrap();
+    std::fs::write(&replacement, b"replacement!!!").unwrap();
+    let clicked = FileFingerprint::observe(&path).unwrap();
+
+    // Model a filesystem whose final metadata is indistinguishable from the
+    // clicked stamp. The opened descriptor is the only remaining distinction.
+    let observations = std::cell::Cell::new(0);
+    let result = hash_full_file_sha256_inner(
+        &path,
+        &TrustedRoots::none(),
+        None,
+        Some(&clicked),
+        |_| {
+            observations.set(observations.get() + 1);
+            Some(clicked.clone())
+        },
+        || {
+            std::fs::rename(&path, &held_original).unwrap();
+            std::fs::rename(&replacement, &path).unwrap();
+        },
+        || {
+            std::fs::rename(&path, &replacement).unwrap();
+            std::fs::rename(&held_original, &path).unwrap();
+        },
+    );
+    assert!(matches!(result, Err(FullHashRefusal::ChangedWhileReading)));
+    assert_eq!(
+        observations.get(),
+        1,
+        "the opened-object check must refuse before hashing"
+    );
+    let restored = FileFingerprint::observe(&path).unwrap();
+    assert_eq!(
+        restored.object.unwrap().device,
+        clicked.object.unwrap().device
+    );
+    assert_eq!(
+        restored.object.unwrap().inode,
+        clicked.object.unwrap().inode
+    );
+    assert_eq!(std::fs::read(&path).unwrap(), b"original bytes");
+}
+
 #[test]
 fn archive_member_hashes_never_substitute_for_outer_file_sha256() {
     // hash_full_file_sha256 must hash the physical ZIP itself, never look

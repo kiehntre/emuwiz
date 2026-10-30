@@ -56,6 +56,7 @@ mod media_sources;
 mod missing_review;
 mod mods;
 mod mounts_page;
+mod multi_selection;
 mod native_workflows;
 mod needs_attention_page;
 mod netplay_preview;
@@ -74,6 +75,7 @@ mod ps1_pbp_export;
 mod psp_iso_analyser;
 mod quarantine_confirm;
 mod r2_rename;
+mod recording_integrity;
 #[cfg(test)]
 mod retroarch_journey_tests;
 mod romm_library;
@@ -356,6 +358,11 @@ pub(super) struct App {
     index_job: Option<u64>,
     /// How many shelf cards Browse & Play draws, and the scope it was chosen for.
     browse_play: browse_play::BrowsePlayState,
+    batch_selection: multi_selection::MultiSelection,
+    batch_state: crate::screenscraper_batch_enrichment_page::ScreenScraperBatchState,
+    batch_open: bool,
+    batch_selecting: bool,
+    batch_message: Option<String>,
     preferences_dirty: Option<Instant>,
     /// Initial Restore must finish before a settings snapshot can be queued.
     preferences_restored: bool,
@@ -407,6 +414,7 @@ pub(super) struct App {
     organisation: organisation::OrganisationState,
     arcade_input_details: arcade_input_details::State,
     classic_trainers: classic_trainers::State,
+    recording_integrity: recording_integrity::State,
     canonical_organisation: crate::rom_organisation_page::RomOrganisationPageState,
     canonical_organisation_job: Option<CanonicalOrganisationJob>,
     history_view: history_view::HistoryViewState,
@@ -438,6 +446,7 @@ pub(super) struct App {
     document_index: Option<std::sync::Arc<media_sources::MediaIndex>>,
     document_issue: Option<String>,
     document_cache: Option<(i64, std::path::PathBuf, Vec<documents::GameDocument>)>,
+    document_refresh: game_documents::DocumentRefresh,
     setup_portability: setup_portability::SetupPortabilityState,
     update_check: update_check::UpdateCheckState,
     missing: missing_review::MissingReviewState,
@@ -476,6 +485,13 @@ impl App {
             artwork_job: None,
             index_job: None,
             browse_play: Default::default(),
+            batch_selection: multi_selection::MultiSelection::with_limit(
+                archivefs_core::screenscraper_enrichment::MAX_EXPLICIT_BATCH_SIZE,
+            ),
+            batch_state: Default::default(),
+            batch_open: false,
+            batch_selecting: false,
+            batch_message: None,
             preferences_dirty: None,
             preferences_restored: false,
             interacted: false,
@@ -517,6 +533,7 @@ impl App {
             organisation: organisation::OrganisationState::default(),
             arcade_input_details: arcade_input_details::State::default(),
             classic_trainers: classic_trainers::State::default(),
+            recording_integrity: recording_integrity::State::default(),
             canonical_organisation: crate::rom_organisation_page::RomOrganisationPageState::load(),
             canonical_organisation_job: None,
             history_view: Default::default(),
@@ -546,6 +563,7 @@ impl App {
             document_index: None,
             document_issue: None,
             document_cache: None,
+            document_refresh: Default::default(),
             setup_portability: setup_portability::SetupPortabilityState::default(),
             update_check: update_check::UpdateCheckState::default(),
             missing: Default::default(),
@@ -1789,6 +1807,7 @@ impl App {
                                         });
                                     }
                                     self.library = library;
+                                    self.recording_integrity.clear();
                                     // Remembered pages may name a game by an older catalogue
                                     // entry; point them at the current copy.
                                     let before = self.router.current.game();
