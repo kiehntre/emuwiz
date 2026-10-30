@@ -51,6 +51,11 @@ pub fn prepare_destination_root(path: &std::path::Path) -> Result<(), String> {
                 libc::O_RDONLY | libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC,
             )
         };
+        if fd >= 0 {
+            // The component exists: close this probe descriptor; the verified reopen below owns the one we keep.
+            // SAFETY: `fd` is a fresh, valid descriptor owned only here.
+            drop(unsafe { std::fs::File::from_raw_fd(fd) });
+        }
         if fd < 0 {
             let error = std::io::Error::last_os_error();
             if error.kind() != std::io::ErrorKind::NotFound {
@@ -808,5 +813,71 @@ mod tests {
         );
         assert_eq!(tx.entries[0].state, EntryState::Applying);
         assert_eq!(std::fs::read(source).unwrap(), b"verified");
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn undo_removes_a_proved_link_whose_original_later_moved() {
+        let temp = tempfile::tempdir().unwrap();
+        let source = temp.path().join("game.rom");
+        std::fs::write(&source, b"verified").unwrap();
+        let destination = temp.path().join("playing");
+        std::fs::create_dir_all(&destination).unwrap();
+        let journal = temp.path().join("journal");
+        std::fs::create_dir_all(&journal).unwrap();
+        let plan = plan_with_one_operation(source.clone(), destination.clone());
+        let mut tx = build_playing_library_transaction(&plan, 1).unwrap();
+        apply_transaction(&mut ApplyExecution {
+            transaction: &mut tx,
+            approved_paths: std::iter::once(source.to_string_lossy().into_owned()).collect(),
+            current_generation: 1,
+            trusted: TrustedRoots::from_paths([temp.path()]),
+            journal_dir: journal.clone(),
+            hard_conflict_mode: HardConflictMode::AbortAll,
+            cancel: &std::sync::atomic::AtomicBool::new(false),
+            directory_policy: DirectoryPolicy::SameFilesystem,
+            allow_symlink_source: false,
+        })
+        .unwrap();
+        // The user moves the original; the generated link is now broken.
+        let moved = temp.path().join("moved.rom");
+        std::fs::rename(&source, &moved).unwrap();
+        let link = destination.join("Game (Europe).zip");
+        assert!(link.is_symlink() && !link.exists());
+        let result = crate::dat::rename_apply::rollback::rollback_transaction(
+            &mut tx,
+            &journal,
+            &std::sync::atomic::AtomicBool::new(false),
+        )
+        .unwrap();
+        assert!(matches!(
+            result.result,
+            crate::dat::rename_apply::model::RollbackResult::FullyRolledBack
+        ));
+        assert!(std::fs::symlink_metadata(&link).is_err());
+        assert_eq!(std::fs::read(moved).unwrap(), b"verified");
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn preparing_an_existing_destination_does_not_leak_descriptors() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().join("a/b/c");
+        std::fs::create_dir_all(&root).unwrap();
+        // Count only descriptors naming this test's directory, so parallel
+        // tests opening unrelated files cannot disturb the result.
+        let prefix = temp.path().canonicalize().unwrap();
+        let open_fds = || {
+            std::fs::read_dir("/proc/self/fd")
+                .unwrap()
+                .filter_map(|entry| std::fs::read_link(entry.ok()?.path()).ok())
+                .filter(|target| target.starts_with(&prefix))
+                .count()
+        };
+        let before = open_fds();
+        for _ in 0..20 {
+            prepare_destination_root(&root).unwrap();
+        }
+        assert_eq!(open_fds(), before, "descriptors leaked");
     }
 }

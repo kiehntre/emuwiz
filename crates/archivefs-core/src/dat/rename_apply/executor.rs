@@ -972,10 +972,8 @@ pub(crate) fn reverify_recorded_link(
     Some(match probe_exact_link(entry, expected_target) {
         Ok(true)
             if entry.created_link_identity().is_some_and(|proof| {
-                capture_identity(&entry.destination_path).is_ok_and(|actual| {
-                    actual.kind == super::model::ObjectKind::Symlink
-                        && super::identity::identity_matches(&proof, &actual)
-                })
+                capture_identity(&entry.destination_path)
+                    .is_ok_and(|actual| super::identity::link_identity_matches(&proof, &actual))
             }) =>
         {
             Ok(())

@@ -153,8 +153,7 @@ impl RenameDirs {
         self.verify_bound()?;
         let entry = self.destination_entry();
         let current = super::identity::capture_identity(&entry)?;
-        if current.kind != super::model::ObjectKind::Symlink
-            || !super::identity::identity_matches(expected, &current)
+        if !super::identity::link_identity_matches(expected, &current)
             || std::fs::read_link(&entry)? != target
         {
             return Err(io::Error::other(
@@ -214,8 +213,7 @@ impl RenameDirs {
                 let held = super::identity::capture_identity(&held_path);
                 let held_target = std::fs::read_link(&held_path);
                 if !matches!((held, held_target), (Ok(actual), Ok(actual_target))
-                    if actual.kind == super::model::ObjectKind::Symlink
-                    && super::identity::identity_matches(expected, &actual)
+                    if super::identity::link_identity_matches(expected, &actual)
                     && actual_target == target)
                 {
                     // A foreign object was moved. Put it back only if its old

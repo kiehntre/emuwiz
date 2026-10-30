@@ -532,7 +532,7 @@ pub(super) fn classify_entry(entry: &TransactionEntry, index: usize) -> Recovery
             && entry.created_link_identity().is_some_and(|proof| {
                 destination_identity
                     .as_ref()
-                    .is_some_and(|actual| identity_matches(&proof, actual))
+                    .is_some_and(|actual| super::identity::link_identity_matches(&proof, actual))
             })
         {
             RecoveryIssue {
@@ -555,7 +555,8 @@ pub(super) fn classify_entry(entry: &TransactionEntry, index: usize) -> Recovery
                 let proved_tombstone = entry.created_link_identity().is_some_and(|proof| {
                     let path =
                         super::dirsync::link_undo_tombstone_path(&entry.destination_path, &proof);
-                    capture_identity(&path).is_ok_and(|actual| identity_matches(&proof, &actual))
+                    capture_identity(&path)
+                        .is_ok_and(|actual| super::identity::link_identity_matches(&proof, &actual))
                         && std::fs::read_link(&path).is_ok_and(|actual| actual == *expected_target)
                 });
                 if proved_tombstone {

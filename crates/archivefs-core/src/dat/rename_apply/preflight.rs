@@ -293,7 +293,7 @@ pub fn run_preflight(
             && matches!(&entry.operation, TransactionOperation::CreateSymlink { expected_target, .. }
                 if entry.created_link_identity().is_some_and(|proof|
                     capture_identity(&entry.destination_path).is_ok_and(|actual|
-                        actual.kind == ObjectKind::Symlink && identity_matches(&proof, &actual))
+                        super::identity::link_identity_matches(&proof, &actual))
                     && std::fs::read_link(&entry.destination_path).is_ok_and(|target| target == *expected_target)));
         if !own_link {
             failures.push(PreflightFailure::DestinationExists);

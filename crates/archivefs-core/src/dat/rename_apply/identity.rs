@@ -115,6 +115,22 @@ pub fn identity_matches(expected: &ObjectIdentity, current: &ObjectIdentity) -> 
         if a.version == FRESHNESS_VERSION && b.version == FRESHNESS_VERSION && a == b)
 }
 
+/// Like [`identity_matches`] for a symlink the journal created, ignoring whether
+/// its target currently resolves. A recorded `Symlink` whose original later moves
+/// is classified `BrokenSymlink`; the link object itself (inode, mtime, link text
+/// hash) is unchanged and must still be Undo-able. Anything that is not a symlink
+/// on both sides never matches.
+pub fn link_identity_matches(expected: &ObjectIdentity, current: &ObjectIdentity) -> bool {
+    let is_link =
+        |kind: ObjectKind| matches!(kind, ObjectKind::Symlink | ObjectKind::BrokenSymlink);
+    if !is_link(expected.kind) || !is_link(current.kind) {
+        return false;
+    }
+    let mut normalised = current.clone();
+    normalised.kind = expected.kind;
+    identity_matches(expected, &normalised)
+}
+
 /// Compares the content proof of two regular files without requiring the same
 /// inode. Used for copy-created destinations, where preserving the source
 /// inode would defeat the preservation boundary.
