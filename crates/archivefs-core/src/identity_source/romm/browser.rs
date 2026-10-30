@@ -480,6 +480,10 @@ impl<'a, T: RommTransport> RommBrowser<'a, T> {
                             text.to_owned()
                         } else if let Some(id) = v.as_u64() {
                             id.to_string()
+                        } else if v.as_i64().is_some_and(|id| id < 0) {
+                            // RomM uses negative integers as a "no match" sentinel; it is not
+                            // an identifier, so ignore it rather than reject the platform list.
+                            continue;
                         } else {
                             return Err(RommBrowseError::SchemaIncompatibility);
                         };
