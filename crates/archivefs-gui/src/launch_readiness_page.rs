@@ -60,6 +60,7 @@ mod pcsx2_cheats;
 mod retroarch_cheat_sets;
 mod retroarch_cheats;
 mod retroarch_setup;
+mod rmg;
 mod sameboy;
 pub(crate) mod saturn_core;
 mod scummvm_profile;
@@ -1007,6 +1008,7 @@ pub(crate) enum StandaloneProcess {
     Desmume(archivefs_core::launch::process_spawn::WatchedProcess),
     Stella(archivefs_core::launch::process_spawn::WatchedProcess),
     SameBoy(archivefs_core::launch::LaunchedSameBoyProcess),
+    Rmg(archivefs_core::launch::process_spawn::WatchedProcess),
     AmiberryCd(archivefs_core::launch::LaunchedAmiberryCdProcess),
     /// MAME started through the canonical per-launch cheat runtime; the session
     /// owns the temporary cheat workspace and removes it after MAME exits.
@@ -1281,6 +1283,7 @@ impl StandaloneLaunchState {
                     StandaloneProcess::Desmume(p) => p.poll().is_some(),
                     StandaloneProcess::Stella(p) => p.poll().is_some(),
                     StandaloneProcess::SameBoy(p) => p.poll().is_some(),
+                    StandaloneProcess::Rmg(p) => p.poll().is_some(),
                     StandaloneProcess::AmiberryCd(p) => p.poll().is_some(),
                     StandaloneProcess::MameCheats(session) => {
                         session.poll();
@@ -1352,6 +1355,9 @@ impl StandaloneLaunchState {
             }
             Some((_, _, StandaloneLaunchStage::Exited(StandaloneProcess::SameBoy(process)))) => {
                 process.exit_report().and_then(sameboy::exit_failure)
+            }
+            Some((_, _, StandaloneLaunchStage::Exited(StandaloneProcess::Rmg(process)))) => {
+                process.exit_report().and_then(rmg::exit_failure)
             }
             Some((
                 _,
@@ -1520,6 +1526,7 @@ pub(crate) enum StandaloneLaunchRequest {
     Desmume(desmume::Request),
     Stella(stella::Request),
     SameBoy(sameboy::Request),
+    Rmg(rmg::Request),
     AmiberryCd(amiberry_cd::Request),
     DuckStation(
         DuckStationLaunchRequest,
@@ -1573,6 +1580,7 @@ impl StandaloneLaunchRequest {
             Self::Desmume(_) => "DeSmuME",
             Self::Stella(_) => "Stella",
             Self::SameBoy(_) => "SameBoy",
+            Self::Rmg(_) => "RMG",
             Self::AmiberryCd(_) => "Amiberry CD",
             Self::DuckStation(..) => "DuckStation",
             Self::Ppsspp(_, _) => "PPSSPP",
@@ -1601,6 +1609,7 @@ impl StandaloneLaunchRequest {
             Self::Desmume(r) => r.key(),
             Self::Stella(r) => r.key(),
             Self::SameBoy(r) => r.key(),
+            Self::Rmg(r) => r.key(),
             Self::AmiberryCd(r) => r.key(),
             Self::DuckStation(r, ..) => (r.selected_content_path.clone(), "duckstation".into()),
             Self::Ppsspp(r, _) => (r.selected_content_path.clone(), "ppsspp".into()),
@@ -1637,6 +1646,7 @@ impl StandaloneLaunchRequest {
             Self::Desmume(r) => r.execute().map(StandaloneProcess::Desmume),
             Self::Stella(r) => r.execute().map(StandaloneProcess::Stella),
             Self::SameBoy(r) => r.execute().map(StandaloneProcess::SameBoy),
+            Self::Rmg(r) => r.execute().map(StandaloneProcess::Rmg),
             Self::AmiberryCd(r) => r.execute().map(StandaloneProcess::AmiberryCd),
             Self::Mame(r) => archivefs_core::launch::preflight_and_launch_mame(&r)
                 .map(StandaloneProcess::Mame)
@@ -4831,12 +4841,15 @@ fn show_candidate(
         let stella_blocked = matches!(stella_offer, Some(Err(_)));
         let sameboy_offer = sameboy::offer_for(plan, candidate);
         let sameboy_blocked = matches!(sameboy_offer, Some(Err(_)));
+        let rmg_offer = rmg::offer_for(plan, candidate);
+        let rmg_blocked = matches!(rmg_offer, Some(Err(_)));
         let readiness_override = (strict_mame_blocked
             || installation_blocked
             || mgba_blocked
             || desmume_blocked
             || stella_blocked
-            || sameboy_blocked)
+            || sameboy_blocked
+            || rmg_blocked)
             .then_some(("Needs attention", widgets::StatusTone::Blocked));
         let (readiness_label, readiness_tone) =
             readiness_override.unwrap_or_else(|| readiness_label_and_tone(candidate.readiness));
@@ -4990,6 +5003,9 @@ fn show_candidate(
         if let Some(offer) = sameboy_offer {
             sameboy::show_offer(ui, standalone_launch_state, offer);
         }
+        if let Some(offer) = rmg_offer {
+            rmg::show_offer(ui, standalone_launch_state, offer);
+        }
         if let Some(context) = amiga_whdload {
             amiga_boot::show_configuration(ui, candidate, context);
         }
@@ -5131,6 +5147,13 @@ fn show_standalone_launch_action(
                     "Exited"
                 }
             }
+            Some(StandaloneLaunchStage::Exited(StandaloneProcess::Rmg(p))) => {
+                if p.exit_report().and_then(rmg::exit_failure).is_some() {
+                    "Failed"
+                } else {
+                    "Exited"
+                }
+            }
             Some(StandaloneLaunchStage::Exited(_)) => "Process exited",
             Some(StandaloneLaunchStage::Failed(_)) => "Launch failed",
             None => "Launch",
@@ -5195,6 +5218,9 @@ fn show_standalone_launch_action(
             Some((_, _, StandaloneLaunchStage::Running(StandaloneProcess::SameBoy(p)))) => {
                 sameboy::show_running(ui, p);
             }
+            Some((_, _, StandaloneLaunchStage::Running(StandaloneProcess::Rmg(p)))) => {
+                rmg::show_running(ui, p);
+            }
             Some((_, _, StandaloneLaunchStage::Running(StandaloneProcess::AmiberryCd(p)))) => {
                 ui.small(format!("Amiberry CD running · PID {}", p.pid));
                 ui.small("Starting the process does not prove the game ran.");
@@ -5242,6 +5268,9 @@ fn show_standalone_launch_action(
                 }
                 if let StandaloneProcess::SameBoy(p) = process {
                     sameboy::show_exited(ui, p);
+                }
+                if let StandaloneProcess::Rmg(p) = process {
+                    rmg::show_exited(ui, p);
                 }
                 if let StandaloneProcess::AmiberryCd(p) = process
                     && let Some(report) = p.poll()
@@ -5349,6 +5378,13 @@ fn show_standalone_launch_action(
         if adapter == "sameboy"
             && !state.is_active()
             && ui.button("Launch SameBoy again (recheck)").clicked()
+        {
+            state.start(request);
+            return;
+        }
+        if adapter == "rmg"
+            && !state.is_active()
+            && ui.button("Launch RMG again (recheck)").clicked()
         {
             state.start(request);
             return;

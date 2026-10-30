@@ -1917,6 +1917,22 @@ impl ArchiveFsApp {
                     firmware: archivefs_core::launch::FirmwareReadiness::NotRequired,
                 }),
         );
+        let rmg_roots = archivefs_core::patch_manager::RmgProfileDiscoveryRoots::from_environment();
+        standalone_profiles.extend(
+            archivefs_core::patch_manager::discover_rmg_profiles(&rmg_roots)
+                .profiles
+                .iter()
+                .map(|profile| archivefs_core::launch::StandaloneProfileInput {
+                    adapter_id: "rmg",
+                    profile_id: profile.profile_id.clone(),
+                    profile_path: None,
+                    eligible: archivefs_core::patch_manager::resolve_rmg_native_launch_binding(
+                        profile,
+                    )
+                    .is_ok(),
+                    firmware: archivefs_core::launch::FirmwareReadiness::NotRequired,
+                }),
+        );
         let stella_roots =
             archivefs_core::patch_manager::StellaProfileDiscoveryRoots::from_environment();
         standalone_profiles.extend(
