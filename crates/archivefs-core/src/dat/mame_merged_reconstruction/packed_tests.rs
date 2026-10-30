@@ -2063,3 +2063,18 @@ fn staging_inventory_still_refuses_missing_stage_referenced_by_journal() {
     std::fs::remove_dir_all(lab.stage_root()).unwrap();
     assert!(super::staging_lifecycle::inventory(&lab.stage_root(), &lab.journal()).is_err());
 }
+
+#[test]
+fn staging_inventory_without_staging_refuses_ambiguous_journal_slots() {
+    let lab = Lab::new();
+    let plan = repair_plan(&lab);
+    apply_staged_reconstruction_output(&plan, &lab.stage_root(), &lab.journal()).unwrap();
+    std::fs::remove_dir_all(lab.stage_root()).unwrap();
+    let journal = std::fs::read_dir(lab.journal())
+        .unwrap()
+        .map(|e| e.unwrap().path())
+        .find(|p| p.extension().is_some_and(|e| e == "json"))
+        .unwrap();
+    std::fs::copy(&journal, lab.journal().join("copy-of-journal.json")).unwrap();
+    assert!(super::staging_lifecycle::inventory(&lab.stage_root(), &lab.journal()).is_err());
+}

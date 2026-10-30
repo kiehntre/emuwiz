@@ -135,10 +135,12 @@ fn inventory_without_staging(staging: &Path, journals: &Path) -> Result<Vec<Stag
         return Ok(Vec::new());
     };
     journals.lock()?;
-    let referenced = journals.transactions()?.iter().any(|t| {
-        t.entries
-            .iter()
-            .any(|e| e.source_path.parent() == Some(staging))
+    let referenced = checked_transactions(&journals)?.iter().any(|t| {
+        references(t, staging)
+            || t.entries.iter().any(|e| {
+                e.source_path.parent() == Some(staging)
+                    || e.destination_path.parent() == Some(staging)
+            })
     });
     journals.require_binding()?;
     if referenced {
