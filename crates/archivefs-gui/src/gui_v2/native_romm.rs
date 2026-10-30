@@ -343,6 +343,9 @@ pub(super) struct State {
     last_selected: Option<u64>,
     detail: Option<Arc<RommGameDetail>>,
     problem: Option<Problem>,
+    /// A live request failed after the last verified reply, so cached pages/details
+    /// may be shown but must not be presented as a verified connection.
+    stale: bool,
     retry: Request,
     covers: HashMap<u64, Option<egui::TextureHandle>>,
     text_focused: bool,
@@ -377,6 +380,7 @@ impl Default for State {
             last_selected: None,
             detail: None,
             problem: None,
+            stale: false,
             retry: Request::Connect,
             covers: HashMap::new(),
             text_focused: false,
@@ -449,7 +453,9 @@ impl State {
         let key = self.page_key(offset);
         if let Some(cached) = self.pages.get(&key).cloned() {
             self.invalidate();
-            self.problem = None;
+            if !self.stale {
+                self.problem = None;
+            }
             self.page = Some(cached);
             return;
         }
@@ -473,7 +479,9 @@ impl State {
         self.text_focused = false;
         if let Some(detail) = self.details.get(&id).cloned() {
             self.invalidate();
-            self.problem = None;
+            if !self.stale {
+                self.problem = None;
+            }
             self.detail = Some(detail);
         } else {
             self.queue(Request::Detail(id));
@@ -563,6 +571,7 @@ impl State {
                 if matches!(self.retry, Request::Settings) {
                     self.settings_loaded = true;
                 }
+                self.stale = !matches!(self.retry, Request::Settings);
                 self.problem = Some(error);
             }
             Ok(Reply::Settings(settings, token)) => {
@@ -585,6 +594,7 @@ impl State {
                 platform_warning,
                 token,
             }) => {
+                self.stale = false;
                 self.problem = info.error.clone().map(Problem::Backend);
                 if self.problem.is_none() && !info.capabilities.games {
                     self.problem = Some(Problem::Backend(RommBrowseError::UnsupportedCapability));
@@ -608,6 +618,7 @@ impl State {
                 self.covers.clear();
             }
             Ok(Reply::Page(page, token)) => {
+                self.stale = false;
                 let page = Arc::new(page);
                 if self.pages.len() >= 12 {
                     self.pages.clear();
@@ -618,6 +629,7 @@ impl State {
             }
             Ok(Reply::Detail(detail, token)) => {
                 if self.selected == Some(detail.game.id) {
+                    self.stale = false;
                     let detail = Arc::new(detail);
                     if self.details.len() >= 32 {
                         self.details.clear();
@@ -742,6 +754,10 @@ impl State {
             } else if self.problem.is_none() {
                 ui.strong("Your RomM settings are ready.");
                 ui.label("Connect to browse your library.");
+            }
+            if self.stale && (self.page.is_some() || self.detail.is_some()) {
+                ui.strong("Showing saved results");
+                ui.label("These games were loaded earlier. EmuWiz could not verify the connection to RomM just now, so they may be out of date.");
             }
             if let Some(problem) = &self.problem {
                 let (heading, message, next) = problem.explanation();

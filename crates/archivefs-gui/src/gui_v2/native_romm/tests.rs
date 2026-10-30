@@ -764,6 +764,51 @@ fn failed_reconnect_does_not_leave_old_data_marked_connected() {
     assert!(text(&mut state).contains("Couldn't connect to RomM"));
 }
 #[test]
+fn cached_content_after_a_failure_is_labelled_saved_and_retry_restores_live() {
+    let mut state = connected();
+    state.select_game(1);
+    let reply = call(&Fixture::default(), Request::Detail(1));
+    state.absorb(&egui::Context::default(), state.generation, Ok(reply));
+    state.back();
+    state.games(50);
+    state.absorb(
+        &egui::Context::default(),
+        state.generation,
+        Err(Problem::Backend(RommBrowseError::AuthFailed)),
+    );
+    assert!(state.stale && state.problem.is_some());
+    // Cached first page and cached detail stay usable but are never "Connected".
+    state.games(0);
+    assert!(state.page.is_some());
+    assert!(state.problem.is_some());
+    let view = text(&mut state);
+    assert!(view.contains("Showing saved results"));
+    assert!(!view.contains("Connected to your RomM server"));
+    state.select_game(1);
+    assert!(state.detail.is_some() && state.problem.is_some() && state.stale);
+    assert!(state.browse.pending.is_none());
+    // The offline cache is not discarded by the failure.
+    assert!(!state.pages.is_empty() && !state.details.is_empty());
+    // Retry re-queues the failed live request, still keeping the cache while it runs.
+    state.back();
+    state.queue(state.retry.clone());
+    assert!(matches!(
+        state.browse.pending,
+        Some(Request::Games { offset: 50, .. })
+    ));
+    assert!(!state.pages.is_empty());
+    let page = call(
+        &Fixture::default(),
+        Request::Games {
+            offset: 0,
+            filter: state.filter(),
+        },
+    );
+    state.absorb(&egui::Context::default(), state.generation, Ok(page));
+    assert!(!state.stale && state.problem.is_none());
+    assert!(text(&mut state).contains("Connected to your RomM server"));
+}
+#[test]
 fn empty_unknown_total_last_page_keeps_a_way_back() {
     let mut state = connected();
     state.page = Some(Arc::new(RommBrowsePage {
