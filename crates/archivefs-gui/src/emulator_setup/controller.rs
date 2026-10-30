@@ -1917,6 +1917,26 @@ impl ArchiveFsApp {
                     firmware: archivefs_core::launch::FirmwareReadiness::NotRequired,
                 }),
         );
+        if let Ok(roots) =
+            archivefs_core::patch_manager::SameBoyProfileDiscoveryRoots::from_environment()
+        {
+            standalone_profiles.extend(
+                archivefs_core::patch_manager::discover_sameboy_profiles(&roots)
+                    .profiles
+                    .iter()
+                    .map(|profile| archivefs_core::launch::StandaloneProfileInput {
+                        adapter_id: "sameboy",
+                        profile_id: profile.profile_id.clone(),
+                        profile_path: Some(profile.configuration_path.clone()),
+                        eligible:
+                            archivefs_core::patch_manager::resolve_sameboy_native_launch_binding(
+                                profile,
+                            )
+                            .is_ok(),
+                        firmware: archivefs_core::launch::FirmwareReadiness::NotRequired,
+                    }),
+            );
+        }
         if let Some(home) = std::env::var_os("HOME") {
             let roots = archivefs_core::patch_manager::AzaharDiscoveryRoots {
                 explicit_executable: None,
