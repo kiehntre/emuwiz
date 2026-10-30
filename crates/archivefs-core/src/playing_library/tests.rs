@@ -152,6 +152,126 @@ fn europe_wins_over_usa_when_configured_first() {
 }
 
 #[test]
+fn a_manual_override_uses_only_a_verified_member_of_the_same_family() {
+    let temp = tempfile::tempdir().unwrap();
+    let dat = synthetic_dat(vec![
+        game("Sonic (Europe)", None),
+        game("Sonic (USA)", Some("Sonic (Europe)")),
+        game("Different game (USA)", None),
+    ]);
+    let matches = auto_matches(&dat.games, temp.path());
+    let request = PlayingLibraryRequest {
+        dat: &dat,
+        matches: matches.clone(),
+        destination_root: temp.path().join("playing"),
+        policy: default_policy(),
+    };
+    let plan = build_playing_library_plan(&request).unwrap();
+    let overridden = override_verified_candidate(
+        &plan,
+        &dat,
+        &matches,
+        "Sonic (Europe)",
+        &matches[1].archive_path,
+    )
+    .unwrap();
+    assert!(
+        overridden
+            .elected_games
+            .iter()
+            .any(|game| game.family_root_name == "Sonic (Europe)"
+                && game.dat_entry_name == "Sonic (USA)")
+    );
+    assert_eq!(
+        overridden,
+        override_verified_candidate(
+            &plan,
+            &dat,
+            &matches,
+            "Sonic (Europe)",
+            &matches[1].archive_path
+        )
+        .unwrap()
+    );
+    assert!(
+        override_verified_candidate(
+            &plan,
+            &dat,
+            &matches,
+            "Sonic (Europe)",
+            &matches[2].archive_path
+        )
+        .is_err()
+    );
+    assert!(
+        override_verified_candidate(
+            &plan,
+            &dat,
+            &matches,
+            "Sonic (Europe)",
+            &temp.path().join("unknown.rom")
+        )
+        .is_err()
+    );
+}
+
+#[test]
+fn contradictory_revision_tokens_require_review() {
+    let temp = tempfile::tempdir().unwrap();
+    let dat = synthetic_dat(vec![game("Puzzle (Europe) (Rev 1) (Rev 2)", None)]);
+    let request = PlayingLibraryRequest {
+        dat: &dat,
+        matches: auto_matches(&dat.games, temp.path()),
+        destination_root: temp.path().join("playing"),
+        policy: default_policy(),
+    };
+    let plan = build_playing_library_plan(&request).unwrap();
+    assert!(plan.elected_games.is_empty());
+    assert_eq!(plan.unresolved_groups.len(), 1);
+    assert!(
+        plan.unresolved_groups[0]
+            .reason
+            .contains("conflicting revision")
+    );
+}
+
+#[test]
+fn good_dump_outweighs_region_and_bad_only_requires_review() {
+    let temp = tempfile::tempdir().unwrap();
+    let mut bad = game("Puzzle (Europe)", None);
+    bad.roms.push(crate::dat::model::DatRomEntry {
+        status: Some("baddump".into()),
+        ..Default::default()
+    });
+    let mut good = game("Puzzle (USA)", Some("Puzzle (Europe)"));
+    good.roms.push(crate::dat::model::DatRomEntry {
+        status: Some("good".into()),
+        ..Default::default()
+    });
+    let dat = synthetic_dat(vec![bad.clone(), good]);
+    let request = PlayingLibraryRequest {
+        dat: &dat,
+        matches: auto_matches(&dat.games, temp.path()),
+        destination_root: temp.path().join("playing"),
+        policy: default_policy(),
+    };
+    let plan = build_playing_library_plan(&request).unwrap();
+    assert_eq!(plan.elected_games[0].dat_entry_name, "Puzzle (USA)");
+    assert!(plan.elected_games[0].explanation.rejected[0].reasons[0].contains("BAD_DUMP"));
+
+    let bad_only = synthetic_dat(vec![bad]);
+    let request = PlayingLibraryRequest {
+        dat: &bad_only,
+        matches: auto_matches(&bad_only.games, temp.path()),
+        destination_root: temp.path().join("bad-only"),
+        policy: default_policy(),
+    };
+    let plan = build_playing_library_plan(&request).unwrap();
+    assert!(plan.elected_games.is_empty());
+    assert_eq!(plan.unresolved_groups.len(), 1);
+}
+
+#[test]
 fn usa_wins_when_policy_order_is_reversed() {
     let temp = tempfile::tempdir().expect("temp dir");
     let dat = synthetic_dat(vec![
@@ -174,6 +294,26 @@ fn usa_wins_when_policy_order_is_reversed() {
     let plan = build_playing_library_plan(&request).expect("plan");
 
     assert_eq!(elected_names(&plan), vec!["Sonic the Hedgehog (USA)"]);
+}
+
+#[test]
+fn other_region_can_be_explicitly_prioritised() {
+    let temp = tempfile::tempdir().unwrap();
+    let dat = synthetic_dat(vec![
+        game("Game (Europe)", None),
+        game("Game (Asia)", Some("Game (Europe)")),
+    ]);
+    let request = PlayingLibraryRequest {
+        dat: &dat,
+        matches: auto_matches(&dat.games, temp.path()),
+        destination_root: temp.path().join("playing"),
+        policy: PlayingLibraryPolicy {
+            preferred_regions: vec!["Other".into(), "Europe".into()],
+            ..default_policy()
+        },
+    };
+    let plan = build_playing_library_plan(&request).unwrap();
+    assert_eq!(plan.elected_games[0].dat_entry_name, "Game (Asia)");
 }
 
 #[test]
@@ -609,8 +749,8 @@ fn clone_cycle_fails_closed_never_merges() {
         "a cycle must never merge into one family"
     );
     assert_eq!(plan.singleton_families, 2);
-    assert_eq!(plan.elected_games.len(), 2);
-    assert!(plan.unresolved_groups.is_empty());
+    assert!(plan.elected_games.is_empty());
+    assert_eq!(plan.unresolved_groups.len(), 2);
 }
 
 #[test]
@@ -618,9 +758,8 @@ fn duplicate_parent_name_fails_closed_never_merges() {
     let temp = tempfile::tempdir().expect("temp dir");
     // Two entries share the name "Foo" (an authoring error some real DATs do
     // contain); a third clones "Foo". The clone target is ambiguous, so the
-    // clone must stand alone rather than guess which "Foo" it means - and
-    // the two "Foo" entries themselves, having no cloneof of their own, are
-    // never touched by the ambiguity either.
+    // clone must be unresolved rather than guess which "Foo" it means. The
+    // duplicated parent identity is also unresolved.
     let dat = synthetic_dat(vec![
         game("Foo", None),
         game("Foo", None),
@@ -640,7 +779,8 @@ fn duplicate_parent_name_fails_closed_never_merges() {
         "an ambiguous clone target must never be silently resolved to either duplicate"
     );
     assert_eq!(plan.singleton_families, 3);
-    assert_eq!(plan.elected_games.len(), 3);
+    assert!(plan.elected_games.is_empty());
+    assert_eq!(plan.unresolved_groups.len(), 3);
 }
 
 #[test]

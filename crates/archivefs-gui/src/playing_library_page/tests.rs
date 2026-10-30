@@ -104,6 +104,30 @@ fn base_state(fixture: &Fixture) -> PlayingLibraryPageState {
     state
 }
 
+fn confirm_library(state: &mut PlayingLibraryPageState) {
+    let count = state.pending_apply.expect("pending confirmation");
+    state.confirm_text = playing_library_confirmation_phrase(count);
+    state.confirm_apply();
+}
+
+fn confirm_romm(state: &mut PlayingLibraryPageState) {
+    let count = state
+        .romm_projection
+        .as_ref()
+        .map_or(0, |plan| plan.total_files);
+    state.romm_confirm_text = playing_library_confirmation_phrase(count);
+    state.confirm_romm_apply();
+}
+
+fn confirm_retrodeck(state: &mut PlayingLibraryPageState) {
+    let count = state
+        .retrodeck_projection
+        .as_ref()
+        .map_or(0, |plan| plan.total_files);
+    state.retrodeck_confirm_text = playing_library_confirmation_phrase(count);
+    state.confirm_retrodeck_apply();
+}
+
 // --- real-widget render/interaction helpers -----------------------------
 //
 // These drive the page exactly the way a real frame loop would: a single
@@ -386,6 +410,46 @@ fn preview_uses_the_real_core_planner() {
 }
 
 #[test]
+fn individual_override_rehashes_and_selects_only_a_verified_family_member() {
+    let fixture = Fixture::new("manual-override");
+    let source = fixture.path("roms");
+    std::fs::create_dir_all(&source).unwrap();
+    std::fs::write(source.join("europe.bin"), b"test").unwrap();
+    std::fs::write(source.join("usa.bin"), b"abc").unwrap();
+    let dat = write_dat(
+        &fixture,
+        "one.dat",
+        &format!(
+            r#"<datafile><header><name>One</name></header>
+<game name="Sonic (Europe)"><rom name="europe.bin" size="4" sha1="{SHA1_TEST}"/></game>
+<game name="Sonic (USA)" cloneof="Sonic (Europe)"><rom name="usa.bin" size="3" sha1="{SHA1_ABC}"/></game>
+</datafile>"#
+        ),
+    );
+    let mut state = base_state(&fixture);
+    state.dat_path_draft = dat.display().to_string();
+    state.source_root_draft = source.display().to_string();
+    state.destination_root_draft = fixture.path("playing").display().to_string();
+    state.preferred_regions_draft = "Europe, USA".into();
+    state.preview();
+    assert_eq!(
+        state.plan().unwrap().elected_games[0].dat_entry_name,
+        "Sonic (Europe)"
+    );
+    state.set_candidate_override("Sonic (Europe)".into(), source.join("usa.bin"));
+    state.preview();
+    assert_eq!(
+        state.plan().unwrap().elected_games[0].dat_entry_name,
+        "Sonic (USA)"
+    );
+    std::fs::write(source.join("usa.bin"), b"changed").unwrap();
+    state.request_apply();
+    confirm_library(&mut state);
+    assert!(state.apply_error().is_some());
+    assert!(!fixture.path("playing/unknown/usa.bin").exists());
+}
+
+#[test]
 fn unresolved_groups_remain_unresolved_in_the_preview() {
     let fixture = Fixture::new("unresolved");
     let source = fixture.path("roms");
@@ -456,7 +520,7 @@ fn a_destination_conflict_blocks_that_operation_from_applying() {
     assert!(plan.operations.is_empty());
 
     state.request_apply();
-    state.confirm_apply();
+    confirm_library(&mut state);
 
     assert!(
         state.apply_error().unwrap().contains("conflict"),
@@ -613,16 +677,22 @@ fn install_retrodeck_projection(
     );
     std::fs::create_dir_all(gamelist.parent().unwrap()).unwrap();
     std::fs::write(&gamelist, "<gameList>\n<!-- keep -->\n</gameList>\n").unwrap();
-    state.retain_retrodeck_projection(
-        build_retrodeck_projection(
-            &plan,
-            &identity,
-            fixture.path("retrodeck-destination"),
-            visibility,
-            &profile,
-        )
-        .unwrap(),
-    );
+    let projection = build_retrodeck_projection(
+        &plan,
+        &identity,
+        fixture.path("retrodeck-destination"),
+        visibility,
+        &profile,
+    )
+    .unwrap();
+    state.output_projection = Some(LibraryOutputProjection::from_plan_with_ownership(
+        LibraryOutputProfile::RetroDeck,
+        projection.destination_root.clone(),
+        &projection.playing_library_plan,
+        Vec::new(),
+        &inspect_library_output_ownership(&projection.playing_library_plan, &state.journal_dir),
+    ));
+    state.retain_retrodeck_projection(projection);
 }
 
 #[test]
@@ -662,7 +732,7 @@ fn retrodeck_gui_apply_requires_confirmation_then_publishes_and_rolls_back() {
     state.request_retrodeck_apply();
     assert!(state.retrodeck_pending_apply);
     assert!(!destinations.iter().any(|path| path.exists()));
-    state.confirm_retrodeck_apply();
+    confirm_retrodeck(&mut state);
     assert!(
         state.retrodeck_error.is_none(),
         "{:?}",
@@ -676,7 +746,14 @@ fn retrodeck_gui_apply_requires_confirmation_then_publishes_and_rolls_back() {
     );
     assert_eq!(std::fs::read(&original).unwrap(), b"test");
     let ctx = egui::Context::default();
-    let (output, _) = render(&ctx, &mut state, base_input());
+    let receipt_input = || egui::RawInput {
+        screen_rect: Some(egui::Rect::from_min_size(
+            egui::Pos2::ZERO,
+            egui::vec2(1000.0, 2600.0),
+        )),
+        ..Default::default()
+    };
+    let (output, _) = render(&ctx, &mut state, receipt_input());
     assert!(rendered_text_contains(&output, "RetroDECK library created"));
     state.rollback_retrodeck();
     assert_eq!(
@@ -684,7 +761,7 @@ fn retrodeck_gui_apply_requires_confirmation_then_publishes_and_rolls_back() {
         "<gameList>\n<!-- keep -->\n</gameList>\n"
     );
     assert!(!destinations.iter().any(|path| path.exists()));
-    let (output, _) = render(&ctx, &mut state, base_input());
+    let (output, _) = render(&ctx, &mut state, receipt_input());
     assert!(rendered_text_contains(
         &output,
         "RetroDECK library rolled back"
@@ -731,7 +808,7 @@ fn retrodeck_gui_cancel_and_publication_failure_make_no_false_success() {
     std::fs::create_dir_all(parent.parent().unwrap()).unwrap();
     std::fs::write(&parent, b"blocking file").unwrap();
     state.request_retrodeck_apply();
-    state.confirm_retrodeck_apply();
+    confirm_retrodeck(&mut state);
     assert!(state.retrodeck_applied.is_none());
     assert!(state.retrodeck_error.is_some());
     assert!(!destinations.iter().any(|path| path.exists()));
@@ -744,7 +821,7 @@ fn create_playing_library_uses_the_existing_linked_library_transaction_seam() {
     let (mut state, original, destination) = preview_a_single_election(&fixture);
 
     state.request_apply();
-    state.confirm_apply(); // below the typed-confirmation threshold
+    confirm_library(&mut state);
 
     assert!(state.apply_error().is_none(), "{:?}", state.apply_error());
     let transaction = state.applied().expect("an applied transaction");
@@ -770,12 +847,167 @@ fn create_playing_library_uses_the_existing_linked_library_transaction_seam() {
 }
 
 #[test]
+fn every_batch_requires_the_exact_link_confirmation() {
+    let fixture = Fixture::new("typed-one-link");
+    let (mut state, _, destination) = preview_a_single_election(&fixture);
+    state.request_apply();
+    state.confirm_apply();
+    assert!(state.apply_error().unwrap().contains("typed confirmation"));
+    assert!(!destination.join("unknown/europe.bin").exists());
+    confirm_library(&mut state);
+    assert!(state.apply_error().is_none());
+}
+
+#[test]
+fn compact_1024_by_600_view_keeps_the_main_action_reachable() {
+    let fixture = Fixture::new("compact-action");
+    let (mut state, _, _) = preview_a_single_election(&fixture);
+    let ctx = egui::Context::default();
+    let small = egui::RawInput {
+        screen_rect: Some(egui::Rect::from_min_size(
+            egui::Pos2::ZERO,
+            egui::vec2(1024.0, 600.0),
+        )),
+        ..Default::default()
+    };
+    let (output, _) = render(&ctx, &mut state, small.clone());
+    let center = find_exact_text_center(&output, "Create reviewed links").expect("create action");
+    assert!(
+        center.y < 600.0,
+        "create action must be in the compact viewport: {center:?}"
+    );
+    let clicked = egui::RawInput {
+        events: click_event(center),
+        ..small
+    };
+    let (_, action) = render(&ctx, &mut state, clicked);
+    assert!(matches!(
+        action,
+        Some(PlayingLibraryPageAction::RequestApply)
+    ));
+}
+
+#[test]
+fn a_replaced_source_refuses_the_reviewed_preview() {
+    let fixture = Fixture::new("source-swap");
+    let (mut state, original, destination) = preview_a_single_election(&fixture);
+    let replacement = fixture.path("replacement.bin");
+    std::fs::write(&replacement, b"test").unwrap();
+    std::fs::rename(&replacement, &original).unwrap();
+    state.request_apply();
+    confirm_library(&mut state);
+    assert!(state.apply_error().unwrap().contains("source changed"));
+    assert!(!destination.join("unknown/europe.bin").exists());
+}
+
+#[test]
+fn a_changed_dat_refuses_the_reviewed_preview() {
+    let fixture = Fixture::new("dat-change");
+    let (mut state, _, destination) = preview_a_single_election(&fixture);
+    std::fs::write(
+        &state.dat_path_draft,
+        b"<datafile><header><name>changed</name></header></datafile>",
+    )
+    .unwrap();
+    state.request_apply();
+    confirm_library(&mut state);
+    assert!(
+        state
+            .apply_error()
+            .unwrap()
+            .contains("collection or DAT changed")
+    );
+    assert!(!destination.join("unknown/europe.bin").exists());
+}
+
+#[test]
+fn a_new_preview_creates_only_new_links_after_an_earlier_receipt() {
+    let fixture = Fixture::new("incremental-library");
+    let (mut state, original, destination) = preview_a_single_election(&fixture);
+    state.request_apply();
+    confirm_library(&mut state);
+    let first_receipt = state.applied().unwrap().transaction_id.clone();
+    let second = original.parent().unwrap().join("second.bin");
+    std::fs::write(&second, b"abc").unwrap();
+    std::fs::write(
+        &state.dat_path_draft,
+        format!(
+            r#"<datafile><header><name>Two</name></header>
+<game name="First (Europe)"><rom name="europe.bin" size="4" sha1="{SHA1_TEST}"/></game>
+<game name="Second (Europe)"><rom name="second.bin" size="3" sha1="{SHA1_ABC}"/></game>
+</datafile>"#
+        ),
+    )
+    .unwrap();
+    state.preview();
+    assert_eq!(state.output_projection.as_ref().unwrap().operation_count, 1);
+    state.request_apply();
+    confirm_library(&mut state);
+    assert!(state.apply_error().is_none(), "{:?}", state.apply_error());
+    assert_ne!(state.applied().unwrap().transaction_id, first_receipt);
+    assert_eq!(state.applied().unwrap().applied_count(), 1);
+    assert!(destination.join("unknown/europe.bin").is_symlink());
+    assert!(destination.join("unknown/second.bin").is_symlink());
+}
+
+#[test]
+fn a_history_receipt_can_undo_links_after_page_restart() {
+    let fixture = Fixture::new("history-restart-undo");
+    let (mut state, original, destination) = preview_a_single_election(&fixture);
+    state.request_apply();
+    confirm_library(&mut state);
+    assert!(state.apply_error().is_none(), "{:?}", state.apply_error());
+    let receipt = state.applied().unwrap().clone();
+    let mut restored = PlayingLibraryPageState::with_journal_dir(state.journal_dir.clone());
+    restored.load_generic_history_receipt(receipt);
+    restored.rollback_last();
+    assert!(
+        restored.apply_error().is_none(),
+        "{:?}",
+        restored.apply_error()
+    );
+    assert!(!destination.join("unknown/europe.bin").exists());
+    assert_eq!(std::fs::read(original).unwrap(), b"test");
+}
+
+#[cfg(unix)]
+#[test]
+fn a_source_replaced_by_a_symlink_never_becomes_a_link_target() {
+    let fixture = Fixture::new("source-symlink-swap");
+    let (mut state, original, destination) = preview_a_single_election(&fixture);
+    let outside = fixture.path("outside.rom");
+    std::fs::write(&outside, b"test").unwrap();
+    std::fs::remove_file(&original).unwrap();
+    std::os::unix::fs::symlink(&outside, &original).unwrap();
+    state.request_apply();
+    confirm_library(&mut state);
+    assert!(state.apply_error().is_some());
+    assert!(!destination.join("unknown/europe.bin").exists());
+    assert_eq!(std::fs::read(&outside).unwrap(), b"test");
+}
+
+#[cfg(unix)]
+#[test]
+fn a_symlinked_destination_ancestor_is_refused_before_creating_links() {
+    let fixture = Fixture::new("destination-symlink");
+    let (mut state, _, destination) = preview_a_single_election(&fixture);
+    let outside = fixture.path("outside");
+    std::fs::create_dir_all(&outside).unwrap();
+    std::fs::create_dir_all(destination.parent().unwrap()).unwrap();
+    std::os::unix::fs::symlink(&outside, &destination).unwrap();
+    state.request_apply();
+    confirm_library(&mut state);
+    assert!(state.apply_error().unwrap().contains("unsafe"));
+    assert_eq!(std::fs::read_dir(outside).unwrap().count(), 0);
+}
+
+#[test]
 fn original_source_files_remain_untouched_after_apply() {
     let fixture = Fixture::new("untouched");
     let (mut state, original, _destination) = preview_a_single_election(&fixture);
 
     state.request_apply();
-    state.confirm_apply();
+    confirm_library(&mut state);
 
     assert!(state.apply_error().is_none());
     assert!(original.exists(), "the original file must still exist");
@@ -792,7 +1024,7 @@ fn successful_apply_creates_symlinks_only_nothing_else_under_destination() {
     let (mut state, _original, destination) = preview_a_single_election(&fixture);
 
     state.request_apply();
-    state.confirm_apply();
+    confirm_library(&mut state);
     assert!(state.apply_error().is_none());
 
     let entries: Vec<_> = std::fs::read_dir(destination.join("unknown"))
@@ -879,7 +1111,7 @@ fn romm_apply_requires_verified_visibility_then_applies_and_rolls_back() {
     });
     state.preview_romm();
     state.request_romm_apply();
-    state.confirm_romm_apply();
+    confirm_romm(&mut state);
     assert!(state.romm_applied.is_none());
     assert!(
         state
@@ -895,7 +1127,7 @@ fn romm_apply_requires_verified_visibility_then_applies_and_rolls_back() {
     state.romm_visible_source_root_draft = state.source_root_draft.clone();
     state.preview_romm();
     state.request_romm_apply();
-    state.confirm_romm_apply();
+    confirm_romm(&mut state);
     assert!(state.romm_error.is_none(), "{:?}", state.romm_error);
     let transaction = state.romm_applied.as_ref().expect("RomM transaction");
     assert_eq!(transaction.state, TransactionState::Applied);
@@ -940,7 +1172,7 @@ fn rollback_uses_the_existing_journal_backed_rollback_path() {
     let fixture = Fixture::new("rollback");
     let (mut state, original, destination) = preview_a_single_election(&fixture);
     state.request_apply();
-    state.confirm_apply();
+    confirm_library(&mut state);
     assert!(state.apply_error().is_none());
     let link = destination.join("unknown/europe.bin");
     assert!(link.is_symlink());
@@ -1222,7 +1454,7 @@ mod esde {
         let fixture = Fixture::new(tag);
         let (mut state, _original, _destination) = preview_a_single_election(&fixture);
         state.request_apply();
-        state.confirm_apply();
+        confirm_library(&mut state);
         assert!(state.apply_error().is_none(), "{:?}", state.apply_error());
         assert!(state.applied().is_some());
 
@@ -1751,7 +1983,7 @@ mod organisation_usability {
         let f = Fixture::new("organisation-current");
         let (mut s, _, _) = preview_a_single_election(&f);
         s.request_apply();
-        s.confirm_apply();
+        confirm_library(&mut s);
         assert!(s.applied().is_some());
         s.preview();
         s.plan.as_mut().unwrap().elected_games.clear();
@@ -1930,7 +2162,7 @@ fn failed_undo_is_visible_for_every_linked_library_destination() {
         let fixture = Fixture::new("failed-undo-projection");
         let (mut state, original, destination) = preview_a_single_election(&fixture);
         state.request_apply();
-        state.confirm_apply();
+        confirm_library(&mut state);
         let transaction = state.applied.take().unwrap();
         let id = transaction.transaction_id.clone();
         let link = destination.join("unknown/europe.bin");
@@ -1995,7 +2227,7 @@ fn render_incomplete_receipt(summary: TransactionState) {
         let fixture = Fixture::new("incomplete-receipt-render");
         let (mut state, _, _) = preview_a_single_election(&fixture);
         state.request_apply();
-        state.confirm_apply();
+        confirm_library(&mut state);
         let mut transaction = state.applied.take().unwrap();
         state.plan = state.applied_plan.clone();
         if summary == TransactionState::RollbackFailed {
@@ -2088,7 +2320,7 @@ fn reviewed_source_replacement_is_refused_instead_of_recaptured_at_confirmation(
         let replacement = if same_bytes { b"test" } else { b"evil" };
         std::fs::write(&source, replacement).unwrap();
         state.request_apply();
-        state.confirm_apply();
+        confirm_library(&mut state);
         assert!(
             state.applied().is_none(),
             "unreviewed replacement was published"
@@ -2121,7 +2353,7 @@ fn reviewed_source_in_place_edit_during_confirmation_is_refused() {
     })
     .join()
     .unwrap();
-    state.confirm_apply();
+    confirm_library(&mut state);
     assert!(
         state.applied().is_none(),
         "edited bytes were silently adopted"
@@ -2149,7 +2381,7 @@ fn reviewed_source_symlink_and_parent_redirection_refuse_without_touching_foreig
             std::os::unix::fs::symlink(foreign.join("europe.bin"), &source).unwrap();
         }
         state.request_apply();
-        state.confirm_apply();
+        confirm_library(&mut state);
         assert!(state.applied().is_none());
         assert!(state.apply_error().is_some());
         assert_eq!(
@@ -2168,7 +2400,7 @@ fn reviewed_apply_refuses_an_occupied_destination_and_preserves_it() {
     std::fs::create_dir_all(output.parent().unwrap()).unwrap();
     std::fs::write(&output, b"foreign output").unwrap();
     state.request_apply();
-    state.confirm_apply();
+    confirm_library(&mut state);
     assert!(state.applied().is_none());
     assert!(state.apply_error().is_some());
     assert_eq!(std::fs::read(&output).unwrap(), b"foreign output");
@@ -2181,7 +2413,7 @@ fn reviewed_apply_refuses_changed_plan_without_creating_a_journal_or_output() {
     let (mut state, source, destination) = preview_a_single_election(&fixture);
     state.plan.as_mut().unwrap().operations[0].destination_path = fixture.path("unreviewed.bin");
     state.request_apply();
-    state.confirm_apply();
+    confirm_library(&mut state);
     assert!(state.apply_error().unwrap().contains("stale"));
     assert!(state.applied().is_none());
     assert!(
@@ -2205,7 +2437,7 @@ fn reviewed_apply_binding_is_single_use_across_background_result_merge() {
     std::fs::write(&source, b"evil").unwrap();
     state.request_apply();
     let mut worker = state.clone();
-    worker.confirm_apply();
+    confirm_library(&mut worker);
     assert!(worker.apply_error().is_some());
     state.merge_async_apply_result(worker);
     assert!(
@@ -2225,22 +2457,25 @@ fn reviewed_apply_binding_is_single_use_across_background_result_merge() {
         files
     };
     let evidence = journals();
-    assert!(!evidence.is_empty());
+    assert!(
+        evidence.is_empty(),
+        "a stale source is refused before journaling"
+    );
     std::fs::remove_file(&source).unwrap();
     std::fs::rename(&saved, &source).unwrap();
     state.request_apply();
-    state.confirm_apply();
+    confirm_library(&mut state);
     assert!(state.apply_error().unwrap().contains("already used"));
     assert!(state.applied().is_none());
     assert_eq!(
         journals(),
         evidence,
-        "retry must retain the failed attempt's evidence"
+        "retry must not invent an operation journal"
     );
     assert!(std::fs::symlink_metadata(&output).is_err());
     state.preview();
     state.request_apply();
-    state.confirm_apply();
+    confirm_library(&mut state);
     assert!(state.apply_error().is_none(), "{:?}", state.apply_error());
     assert_eq!(state.applied().unwrap().state, TransactionState::Applied);
     assert_eq!(std::fs::read(output).unwrap(), b"test");
@@ -2302,10 +2537,10 @@ fn reviewed_profile_fixture(
 fn apply_reviewed_profile(state: &mut PlayingLibraryPageState, retrodeck: bool) {
     if retrodeck {
         state.request_retrodeck_apply();
-        state.confirm_retrodeck_apply();
+        confirm_retrodeck(state);
     } else {
         state.request_romm_apply();
-        state.confirm_romm_apply();
+        confirm_romm(state);
     }
 }
 
@@ -2670,7 +2905,7 @@ fn destination_change_requires_a_new_confirmation_after_repreview() {
         assert!(std::fs::symlink_metadata(&output).is_err());
         assert_eq!(std::fs::read(&source).unwrap(), b"test");
         state.request_apply();
-        state.confirm_apply();
+        confirm_library(&mut state);
         assert!(
             state.applied().is_some(),
             "fresh explicit confirmation still works"
@@ -2683,7 +2918,7 @@ fn destination_change_preserves_completed_receipts_and_undo() {
     let fixture = Fixture::new("destination-receipt-preservation");
     let (mut state, source, _) = preview_a_single_election(&fixture);
     state.request_apply();
-    state.confirm_apply();
+    confirm_library(&mut state);
     let receipt = state.applied().unwrap().clone();
     let output = receipt.entries[0].destination_path.clone();
     state.apply_error = Some("Retained receipt diagnostic".into());

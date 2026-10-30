@@ -14,7 +14,7 @@ use std::path::{Component, Path};
 use crate::safe_read::TrustedRoots;
 
 use super::identity::{capture_identity, identity_matches};
-use super::model::{TransactionEntry, TransactionOperation};
+use super::model::{EntryState, TransactionEntry, TransactionOperation};
 
 /// A named reason a preflight check failed.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -286,15 +286,16 @@ pub fn run_preflight(
         TransactionOperation::ReplaceExisting { .. }
     ) {
         // The exact existing target was checked above; existence alone grants no authority.
-    } else if let Ok(metadata) = std::fs::symlink_metadata(&entry.destination_path) {
-        if let Some(expected_target) = link_operation {
-            if !metadata.file_type().is_symlink()
-                || std::fs::read_link(&entry.destination_path).ok().as_deref()
-                    != Some(expected_target)
-            {
-                failures.push(PreflightFailure::DestinationExists);
-            }
-        } else {
+    } else if std::fs::symlink_metadata(&entry.destination_path).is_ok() {
+        // Only this transaction's persisted creation proof can permit an
+        // interrupted or repeated Apply. Link text alone grants no ownership.
+        let own_link = matches!(entry.state, EntryState::Applying | EntryState::Applied)
+            && matches!(&entry.operation, TransactionOperation::CreateSymlink { expected_target, .. }
+                if entry.created_link_identity().is_some_and(|proof|
+                    capture_identity(&entry.destination_path).is_ok_and(|actual|
+                        super::identity::link_identity_matches(&proof, &actual))
+                    && std::fs::read_link(&entry.destination_path).is_ok_and(|target| target == *expected_target)));
+        if !own_link {
             failures.push(PreflightFailure::DestinationExists);
         }
     } else {
@@ -533,7 +534,7 @@ mod tests {
     }
 
     #[test]
-    fn create_symlink_accepts_an_exact_existing_link_without_rename_placement() {
+    fn create_symlink_refuses_an_exact_existing_link_without_ownership_proof() {
         let source_root = tempfile::tempdir().unwrap();
         let library_root = tempfile::tempdir().unwrap();
         let source = source_root.path().join("Game.iso");
@@ -549,7 +550,10 @@ mod tests {
         let approved = BTreeSet::from([source.to_string_lossy().into_owned()]);
         let trusted = TrustedRoots::from_paths([source_root.path()]);
         let result = run_preflight(&entry, &options(&approved, &trusted, &BTreeSet::new(), 1));
-        assert!(result.is_ok(), "{result:?}");
+        assert!(
+            matches!(result, Err(ref failures) if failures.contains(&PreflightFailure::DestinationExists)),
+            "{result:?}"
+        );
     }
 
     #[test]

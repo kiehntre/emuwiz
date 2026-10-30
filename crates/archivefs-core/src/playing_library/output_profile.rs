@@ -63,6 +63,7 @@ pub struct LibraryOutputProjection {
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct LibraryOutputOwnership {
     pub already_correct: usize,
+    pub owned_correct_paths: BTreeSet<PathBuf>,
     pub stale_owned_entries: Vec<PathBuf>,
 }
 
@@ -107,33 +108,33 @@ impl LibraryOutputProjection {
         ownership: &LibraryOutputOwnership,
     ) -> Self {
         let mut projection = Self::from_plan(profile, destination_root, plan, unresolved_mappings);
-        let owned_correct = plan
-            .operations
-            .iter()
-            .filter(|operation| {
-                classify_library_view_object(
-                    &operation.destination_path,
-                    LibraryViewObjectKind::Symlink,
-                    Some(&operation.source_path),
-                    true,
-                ) == LibraryViewObjectClassification::OwnedCorrect
-            })
-            .count();
-        projection.already_correct = ownership.already_correct.max(owned_correct);
+        projection.already_correct = ownership.already_correct;
         projection.stale_owned_entries = ownership.stale_owned_entries.clone();
         projection.planned_links = plan
             .operations
             .iter()
             .filter(|operation| {
-                classify_library_view_object(
-                    &operation.destination_path,
-                    LibraryViewObjectKind::Symlink,
-                    Some(&operation.source_path),
-                    true,
-                ) != LibraryViewObjectClassification::OwnedCorrect
+                !ownership
+                    .owned_correct_paths
+                    .contains(&operation.destination_path)
             })
             .cloned()
             .collect();
+        for operation in &projection.planned_links {
+            if !matches!(std::fs::symlink_metadata(&operation.destination_path), Err(error) if error.kind() == std::io::ErrorKind::NotFound)
+            {
+                projection.conflicts.push(DestinationConflict {
+                    destination_basename: operation
+                        .destination_path
+                        .file_name()
+                        .unwrap_or_default()
+                        .to_string_lossy()
+                        .into_owned(),
+                    contenders: vec!["an existing object occupies this destination".into()],
+                    destinations: vec![operation.destination_path.clone()],
+                });
+            }
+        }
         projection.operation_count = projection.planned_links.len();
         projection.planned_directories = projection
             .planned_links
@@ -163,7 +164,10 @@ pub fn inspect_library_output_ownership(
 ) -> LibraryOutputOwnership {
     let root = &plan.destination_root;
     let root_text = root.to_string_lossy();
-    let mut owned_links = std::collections::BTreeMap::<PathBuf, PathBuf>::new();
+    let mut owned_links = std::collections::BTreeMap::<
+        PathBuf,
+        (PathBuf, crate::dat::rename_apply::model::ObjectIdentity),
+    >::new();
     let (transactions, _) = list_journals(journal_dir);
     for transaction in transactions {
         if transaction.source_scan_root != root_text
@@ -177,9 +181,10 @@ pub fn inspect_library_output_ownership(
             }
             if let TransactionOperation::CreateSymlink {
                 expected_target, ..
-            } = entry.operation
+            } = &entry.operation
+                && let Some(proof) = entry.created_link_identity()
             {
-                owned_links.insert(entry.destination_path, expected_target);
+                owned_links.insert(entry.destination_path, (expected_target.clone(), proof));
             }
         }
     }
@@ -189,22 +194,44 @@ pub fn inspect_library_output_ownership(
         .iter()
         .map(|operation| operation.destination_path.clone())
         .collect();
-    let already_correct = plan
+    let owned_correct_paths: BTreeSet<PathBuf> = plan
         .operations
         .iter()
         .filter(|operation| {
+            let Some((expected, proof)) = owned_links.get(&operation.destination_path) else {
+                return false;
+            };
+            if expected != &operation.source_path
+                || !crate::dat::rename_apply::identity::capture_identity(
+                    &operation.destination_path,
+                )
+                .is_ok_and(|actual| {
+                    crate::dat::rename_apply::identity::identity_matches(proof, &actual)
+                })
+            {
+                return false;
+            }
             classify_library_view_object(
                 &operation.destination_path,
                 LibraryViewObjectKind::Symlink,
                 Some(&operation.source_path),
-                owned_links.contains_key(&operation.destination_path),
+                true,
             ) == LibraryViewObjectClassification::OwnedCorrect
         })
-        .count();
+        .map(|operation| operation.destination_path.clone())
+        .collect();
+    let already_correct = owned_correct_paths.len();
     let stale_owned_entries = owned_links
         .into_iter()
         .filter(|(path, _expected_target)| !desired.contains(path))
-        .filter_map(|(path, expected_target)| {
+        .filter_map(|(path, (expected_target, proof))| {
+            // A stale link whose original later moved reads as a broken symlink;
+            // it is still the journal-proved object and must stay cleanable.
+            if !crate::dat::rename_apply::identity::capture_identity(&path).is_ok_and(|actual| {
+                crate::dat::rename_apply::identity::link_identity_matches(&proof, &actual)
+            }) {
+                return None;
+            }
             matches!(
                 classify_library_view_object(
                     &path,
@@ -220,6 +247,7 @@ pub fn inspect_library_output_ownership(
         .collect();
     LibraryOutputOwnership {
         already_correct,
+        owned_correct_paths,
         stale_owned_entries,
     }
 }
@@ -461,6 +489,11 @@ mod tests {
         let mut transaction = build_playing_library_transaction(&plan, 1).unwrap();
         transaction.state = TransactionState::Applied;
         transaction.entries[0].state = EntryState::Applied;
+        let proof = crate::dat::rename_apply::identity::capture_identity(
+            &plan.operations[0].destination_path,
+        )
+        .unwrap();
+        transaction.entries[0].record_created_link(&proof).unwrap();
         write_journal(&journal_dir, &transaction).unwrap();
         (temp, plan, journal_dir)
     }
@@ -485,6 +518,23 @@ mod tests {
     }
 
     #[test]
+    fn same_target_foreign_link_is_a_collision_not_owned_output() {
+        let (_temp, plan, _journal_dir) = applied_journal_fixture();
+        let empty_journal = tempfile::tempdir().unwrap();
+        let ownership = inspect_library_output_ownership(&plan, empty_journal.path());
+        assert_eq!(ownership.already_correct, 0);
+        let projection = LibraryOutputProjection::from_plan_with_ownership(
+            LibraryOutputProfile::Generic,
+            plan.destination_root.clone(),
+            &plan,
+            Vec::new(),
+            &ownership,
+        );
+        assert_eq!(projection.operation_count, 1);
+        assert!(!projection.conflicts.is_empty());
+    }
+
+    #[test]
     fn ownership_scan_reports_only_existing_managed_stale_links() {
         let (_temp, plan, journal_dir) = applied_journal_fixture();
         let mut current = plan.clone();
@@ -499,6 +549,29 @@ mod tests {
         fs::remove_file(&plan.operations[0].destination_path).unwrap();
         let missing = inspect_library_output_ownership(&current, &journal_dir);
         assert!(missing.stale_owned_entries.is_empty());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn stale_owned_link_whose_original_moved_is_still_reported_but_foreign_links_are_not() {
+        let (temp, plan, journal_dir) = applied_journal_fixture();
+        let mut current = plan.clone();
+        current.operations.clear();
+        current.elected_games.clear();
+        let link = plan.operations[0].destination_path.clone();
+        let original = plan.operations[0].source_path.clone();
+        let moved = temp.path().join("moved-original");
+        fs::rename(&original, &moved).unwrap();
+        assert!(link.is_symlink() && !link.exists());
+        let ownership = inspect_library_output_ownership(&current, &journal_dir);
+        assert_eq!(ownership.stale_owned_entries, vec![link.clone()]);
+        assert_eq!(fs::read(&moved).unwrap(), b"source");
+
+        // A foreign replacement with the same text is a different inode: not owned.
+        fs::remove_file(&link).unwrap();
+        std::os::unix::fs::symlink(&original, &link).unwrap();
+        let foreign = inspect_library_output_ownership(&current, &journal_dir);
+        assert!(foreign.stale_owned_entries.is_empty());
     }
 
     #[test]

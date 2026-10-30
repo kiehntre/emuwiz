@@ -38,7 +38,7 @@
 //! identities are journalled and checked for publication, recovery and undo.
 
 pub mod copy;
-mod dirsync;
+pub(crate) mod dirsync;
 pub mod exact_resume;
 pub mod executor;
 pub mod history;

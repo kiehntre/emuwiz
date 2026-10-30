@@ -1067,25 +1067,61 @@ impl RomOrganisationPageState {
 /// collected as link objects but never traversed, so a symlink loop cannot
 /// recurse. Read-only.
 pub(crate) fn collect_source_files(roots: &[PathBuf]) -> Vec<PathBuf> {
-    const MAX_DEPTH: usize = 4;
-    const MAX_FILES: usize = 2_000;
+    collect_source_files_bounded(roots, 2_000, 4)
+}
+
+/// Same conservative collector with explicit bounds for background workflows
+/// that can safely review larger nested collections.
+pub(crate) fn collect_source_files_bounded(
+    roots: &[PathBuf],
+    max_files: usize,
+    max_depth: usize,
+) -> Vec<PathBuf> {
+    collect_source_files_reported(roots, max_files, max_depth).files
+}
+
+pub(crate) struct SourceFileScan {
+    pub files: Vec<PathBuf>,
+    pub incomplete: Vec<String>,
+}
+
+pub(crate) fn collect_source_files_reported(
+    roots: &[PathBuf],
+    max_files: usize,
+    max_depth: usize,
+) -> SourceFileScan {
     let mut out = Vec::new();
+    let mut incomplete = Vec::new();
     for root in roots {
         let mut queue: Vec<(PathBuf, usize)> = vec![(root.clone(), 0)];
         while let Some((dir, depth)) = queue.pop() {
-            if out.len() >= MAX_FILES {
+            if out.len() >= max_files {
+                incomplete.push(format!("scan reached the {max_files}-file limit"));
                 break;
             }
-            let Ok(entries) = std::fs::read_dir(&dir) else {
-                continue;
+            let entries = match std::fs::read_dir(&dir) {
+                Ok(entries) => entries,
+                Err(error) => {
+                    incomplete.push(format!("could not read {}: {error}", dir.display()));
+                    continue;
+                }
             };
-            for entry in entries.flatten() {
-                if out.len() >= MAX_FILES {
+            for entry in entries {
+                if out.len() >= max_files {
+                    incomplete.push(format!("scan reached the {max_files}-file limit"));
                     break;
                 }
-                let path = entry.path();
-                let Ok(metadata) = std::fs::symlink_metadata(&path) else {
+                let Ok(entry) = entry else {
+                    incomplete.push(format!("could not read an entry in {}", dir.display()));
                     continue;
+                };
+                let path = entry.path();
+                let metadata = match std::fs::symlink_metadata(&path) {
+                    Ok(metadata) => metadata,
+                    Err(error) => {
+                        incomplete.push(format!("could not inspect {}: {error}", path.display()));
+                        continue;
+                    }
                 };
                 // A library-organisation plan is intentionally a games-only
                 // operation. Cover art, manuals, metadata, and other
@@ -1116,8 +1152,13 @@ pub(crate) fn collect_source_files(roots: &[PathBuf]) -> Vec<PathBuf> {
                     // never followed or traversed.
                     out.push(path);
                 } else if metadata.is_dir() {
-                    if depth < MAX_DEPTH {
+                    if depth < max_depth {
                         queue.push((path, depth + 1));
+                    } else {
+                        incomplete.push(format!(
+                            "folder exceeds {max_depth}-level scan depth: {}",
+                            path.display()
+                        ));
                     }
                 } else if metadata.is_file() {
                     out.push(path);
@@ -1126,7 +1167,12 @@ pub(crate) fn collect_source_files(roots: &[PathBuf]) -> Vec<PathBuf> {
         }
     }
     out.sort();
-    out
+    incomplete.sort();
+    incomplete.dedup();
+    SourceFileScan {
+        files: out,
+        incomplete,
+    }
 }
 
 /// Builds organisation candidates by resolving each source file's platform
@@ -1251,6 +1297,14 @@ fn apply_playing_library_action(
     match action {
         PlayingLibraryPageAction::Preview => state.preview(),
         PlayingLibraryPageAction::SelectFamily(name) => state.select_family(name),
+        PlayingLibraryPageAction::OverrideCandidate { family, source } => {
+            state.set_candidate_override(family, source);
+            state.preview();
+        }
+        PlayingLibraryPageAction::ClearOverrides => {
+            state.clear_candidate_overrides();
+            state.preview();
+        }
         PlayingLibraryPageAction::RequestApply => match state.destination {
             PlayingLibraryDestination::Romm => state.request_romm_apply(),
             PlayingLibraryDestination::RetroDeck => state.request_retrodeck_apply(),

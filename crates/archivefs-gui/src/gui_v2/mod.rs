@@ -1401,6 +1401,14 @@ impl App {
                 self.start_playing_library_job(PlayingLibraryJobKind::Preview);
             }
             SelectFamily(name) => self.playing_library.select_family(name),
+            OverrideCandidate { family, source } => {
+                self.playing_library.set_candidate_override(family, source);
+                self.start_playing_library_job(PlayingLibraryJobKind::Preview);
+            }
+            ClearOverrides => {
+                self.playing_library.clear_candidate_overrides();
+                self.start_playing_library_job(PlayingLibraryJobKind::Preview);
+            }
             RequestApply => match self.playing_library.destination {
                 crate::playing_library_page::PlayingLibraryDestination::Romm => {
                     self.playing_library.request_romm_apply()
@@ -1532,28 +1540,30 @@ impl App {
                 let transaction = state.applied().cloned();
                 let error = state.apply_error().map(str::to_owned);
                 self.playing_library.merge_async_apply_result(*state);
-                if let Some(error) = error {
-                    self.activity.finish(
-                        job.id,
-                        "The playing library was not completed. Your original collection remains unchanged.".into(),
-                        Some(error),
-                    );
-                } else if let Some(transaction) = transaction {
-                    if !self
+                if let Some(transaction) = &transaction
+                    && !self
                         .playing_library_history
                         .iter()
                         .any(|item| item.transaction_id == transaction.transaction_id)
-                    {
-                        self.playing_library_history.push(transaction.clone());
-                    }
+                {
+                    self.playing_library_history.push(transaction.clone());
+                }
+                if let Some(error) = error {
                     self.activity.finish(
                         job.id,
-                        format!(
-                            "Playing library created: {} links. Your original collection was not changed.",
-                            transaction.applied_count()
-                        ),
-                        None,
+                        format!("The playing library was not completed. {} link(s) are recorded in the receipt; review and Undo them if needed. Your original collection remains unchanged.", transaction.as_ref().map_or(0, |tx| tx.applied_count())),
+                        Some(error),
                     );
+                } else if let Some(transaction) = transaction {
+                    let complete = transaction.state
+                        == archivefs_core::dat::rename_apply::model::TransactionState::Applied;
+                    self.activity.finish(job.id,
+                        if complete {
+                            format!("Playing library created: {} links. Your original collection was not changed.", transaction.applied_count())
+                        } else {
+                            format!("Playing library stopped after {} links. Review the receipt and use Undo for recorded links.", transaction.applied_count())
+                        },
+                        if complete { None } else { Some("Some links were not created; the journal records the partial result.".into()) });
                 } else {
                     self.activity.finish(
                         job.id,

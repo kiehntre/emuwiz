@@ -331,6 +331,21 @@ fn rollback_transaction_inner(
         let attempted = rollback_mutation(&transaction.entries[index], trusted);
         match attempted {
             Ok(()) => {
+                #[cfg(unix)]
+                if matches!(
+                    transaction.entries[index].operation,
+                    TransactionOperation::CreateSymlink { .. }
+                ) && let Some(proof) = transaction.entries[index].created_link_identity()
+                {
+                    let tombstone = super::dirsync::link_undo_tombstone_path(
+                        &transaction.entries[index].destination_path,
+                        &proof,
+                    );
+                    transaction.entries[index].unknown.insert(
+                        "emuwiz_link_undo_tombstone_v1".into(),
+                        serde_json::Value::String(tombstone.to_string_lossy().into_owned()),
+                    );
+                }
                 if let Some(catalogue) = catalogue {
                     catalogue.commit()?;
                 }
@@ -853,25 +868,26 @@ fn rollback_mutation(
         {
             return Err("rollback refused: invalid journalled symlink target".to_string());
         }
-        // The link existed before this transaction and was only adopted:
-        // undoing the transaction leaves it exactly as it was found.
         if super::executor::link_adoption(entry) == Some(true) {
             return Ok(());
         }
-        let metadata = std::fs::symlink_metadata(&entry.destination_path)
-            .map_err(|_| "rollback refused: the link destination no longer exists".to_string())?;
-        if !metadata.file_type().is_symlink() {
-            return Err(
-                "rollback refused: destination is no longer the recorded symlink".to_string(),
-            );
-        }
-        if std::fs::read_link(&entry.destination_path).ok().as_deref() != Some(expected_target) {
-            return Err("rollback refused: destination symlink target changed".to_string());
-        }
-        std::fs::remove_file(&entry.destination_path).map_err(|error| {
-            format!("rollback refused: could not remove recorded symlink: {error}")
+        let proof = entry.created_link_identity().ok_or_else(|| {
+            "rollback refused: journal has no created-link object proof; manual review required"
+                .to_string()
         })?;
-        return Ok(());
+        #[cfg(unix)]
+        {
+            let dirs =
+                super::dirsync::RenameDirs::open(&entry.source_path, &entry.destination_path)
+                    .map_err(|error| {
+                        format!("rollback refused: could not bind link parent: {error}")
+                    })?;
+            dirs.remove_recorded_link(&proof, expected_target)
+                .map_err(|error| format!("rollback refused: {error}"))?;
+            return Ok(());
+        }
+        #[cfg(not(unix))]
+        return Err("linked-library Undo is unsupported on this platform".into());
     }
     if let TransactionOperation::CreateHardlink {
         expected_source,

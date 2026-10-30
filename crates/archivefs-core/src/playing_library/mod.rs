@@ -141,11 +141,21 @@ pub fn build_playing_library_plan(
     }
 
     let graph = DependencyGraph::build(&request.dat.games);
+    let mut name_counts: BTreeMap<&str, usize> = BTreeMap::new();
+    for game in &request.dat.games {
+        *name_counts.entry(game.name.as_str()).or_default() += 1;
+    }
     // Family root -> that family's matched archives, keyed by the resolved
     // root's declaration position so plan output is deterministic.
     let mut families: BTreeMap<usize, Vec<DatArchiveMatch>> = BTreeMap::new();
     let mut ordered: Vec<&DatArchiveMatch> = request.matches.iter().collect();
-    ordered.sort_by_key(|matched| matched.dat_entry_index);
+    ordered.sort_by(|a, b| {
+        (a.dat_entry_index, &a.archive_path, &a.companion_paths).cmp(&(
+            b.dat_entry_index,
+            &b.archive_path,
+            &b.companion_paths,
+        ))
+    });
     for matched in ordered {
         let root = resolve_family_root(&graph, matched.dat_entry_index);
         families.entry(root).or_default().push(matched.clone());
@@ -168,6 +178,34 @@ pub fn build_playing_library_plan(
     for (root_index, members) in &families {
         if members.len() == 1 {
             plan.singleton_families += 1;
+        }
+        let broken_relationship = members.iter().any(|member| {
+            arcade_topology(&graph, member.dat_entry_index) == ArcadeTopology::Review
+        });
+        let duplicate_name = members.iter().any(|member| {
+            name_counts
+                .get(request.dat.games[member.dat_entry_index].name.as_str())
+                .copied()
+                .unwrap_or(0)
+                > 1
+        });
+        let contradictory_revision = members.iter().any(|member| {
+            evidence::dat_release_evidence(&request.dat.games[member.dat_entry_index].name)
+                .contradictory_revision
+        });
+        if broken_relationship || duplicate_name || contradictory_revision {
+            plan.unresolved_groups.push(UnresolvedGroup {
+                family_root_name: request.dat.games[*root_index].name.clone(),
+                tied_candidates: members.iter().map(|member| request.dat.games[member.dat_entry_index].name.clone()).collect(),
+                reason: if broken_relationship {
+                    "DAT parent/clone topology is missing, cyclic or ambiguous; review this group before selection"
+                } else if duplicate_name {
+                    "DAT contains duplicate game identities; review this group before selection"
+                } else {
+                    "DAT declares conflicting revision evidence; review this group before selection"
+                }.into(),
+            });
+            continue;
         }
         if request.policy.mode == PlayingLibraryPolicyMode::Arcade {
             elect_arcade_family(request, *root_index, members, &mut plan, &graph);
@@ -199,6 +237,129 @@ pub fn build_playing_library_plan(
         .flat_map(|elected| elected.all_operations().cloned())
         .collect();
     Ok(plan)
+}
+
+/// Replaces one election only with a candidate proved by the same DAT match
+/// set as the preview. The caller must refresh that match set before accepting
+/// an override. Names alone never authorize a cross-family relationship.
+pub fn override_verified_candidate(
+    plan: &PlayingLibraryPlan,
+    dat: &ParsedDat,
+    matches: &[DatArchiveMatch],
+    family_root_name: &str,
+    source_path: &Path,
+) -> Result<PlayingLibraryPlan, String> {
+    let graph = DependencyGraph::build(&dat.games);
+    let roots: Vec<usize> = (0..dat.games.len())
+        .filter(|index| {
+            dat.games[*index].name == family_root_name
+                && resolve_family_root(&graph, *index) == *index
+        })
+        .collect();
+    if roots.len() != 1 {
+        return Err("family identity is ambiguous or no longer available".into());
+    }
+    let root = roots[0];
+    let mut members: Vec<DatArchiveMatch> = matches
+        .iter()
+        .filter(|matched| {
+            matched.dat_entry_index < dat.games.len()
+                && resolve_family_root(&graph, matched.dat_entry_index) == root
+        })
+        .cloned()
+        .collect();
+    members.sort_by(|a, b| {
+        (a.dat_entry_index, &a.archive_path).cmp(&(b.dat_entry_index, &b.archive_path))
+    });
+    let chosen: Vec<usize> = members
+        .iter()
+        .enumerate()
+        .filter(|(_, candidate)| candidate.archive_path == source_path)
+        .map(|(index, _)| index)
+        .collect();
+    if chosen.len() != 1 {
+        return Err("override source has no unique verified identity in this family".into());
+    }
+    if !plan
+        .elected_games
+        .iter()
+        .any(|game| game.family_root_name == family_root_name)
+        && !plan
+            .unresolved_groups
+            .iter()
+            .any(|group| group.family_root_name == family_root_name)
+    {
+        return Err("family is not part of the reviewed plan".into());
+    }
+    let mut revised = plan.clone();
+    revised
+        .elected_games
+        .retain(|game| game.family_root_name != family_root_name);
+    revised
+        .unresolved_groups
+        .retain(|group| group.family_root_name != family_root_name);
+    revised
+        .exclusions
+        .retain(|item| item.source_path != source_path);
+    revised.operations.clear();
+    let request = PlayingLibraryRequest {
+        dat,
+        matches: members.clone(),
+        destination_root: plan.destination_root.clone(),
+        policy: plan.policy.clone(),
+    };
+    let reasons: Vec<Vec<String>> = members
+        .iter()
+        .enumerate()
+        .map(|(index, _)| {
+            if index == chosen[0] {
+                Vec::new()
+            } else {
+                vec!["a different verified release was chosen by individual override".into()]
+            }
+        })
+        .collect();
+    record_election(
+        &mut revised,
+        &request,
+        root,
+        &members,
+        chosen[0],
+        vec![
+            "user selected this checksum-verified release after reviewing the alternatives".into(),
+        ],
+        &reasons,
+    );
+    revised.elected_games.sort_by(|a, b| {
+        (
+            &a.family_root_name,
+            &a.dat_entry_name,
+            &a.launcher_operation.source_path,
+        )
+            .cmp(&(
+                &b.family_root_name,
+                &b.dat_entry_name,
+                &b.launcher_operation.source_path,
+            ))
+    });
+    revised.conflicts.clear();
+    mark_destination_conflicts(&mut revised);
+    let conflicted: BTreeSet<&PathBuf> = revised
+        .conflicts
+        .iter()
+        .flat_map(|conflict| &conflict.destinations)
+        .collect();
+    revised.operations = revised
+        .elected_games
+        .iter()
+        .filter(|game| {
+            !game
+                .all_operations()
+                .any(|operation| conflicted.contains(&operation.destination_path))
+        })
+        .flat_map(|game| game.all_operations().cloned())
+        .collect();
+    Ok(revised)
 }
 
 /// Walks declared parent/clone chains up to the family root.
@@ -517,6 +678,41 @@ fn finish_arcade_review(
 /// One family's full election: class-exclusion filter, then the fixed tier
 /// sequence region -> language -> revision -> declared parent, narrating
 /// every elimination. No alphabetical fallback; no score.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum DumpQuality {
+    Good = 0,
+    Uncertain = 1,
+    NoDump = 2,
+}
+
+impl DumpQuality {
+    fn label(self) -> &'static str {
+        match self {
+            Self::Good => "verified good dump",
+            Self::Uncertain => "BAD_DUMP or uncertain DAT status",
+            Self::NoDump => "NO_DUMP",
+        }
+    }
+}
+
+fn dump_quality(game: &crate::dat::model::DatGameEntry) -> DumpQuality {
+    let mut result = DumpQuality::Good;
+    for rom in &game.roms {
+        match rom
+            .status
+            .as_deref()
+            .map(str::trim)
+            .filter(|status| !status.is_empty())
+        {
+            Some(status) if status.eq_ignore_ascii_case("nodump") => return DumpQuality::NoDump,
+            Some(status) if status.eq_ignore_ascii_case("good") => {}
+            Some(_) => result = DumpQuality::Uncertain,
+            None => {}
+        }
+    }
+    result
+}
+
 fn elect_family(
     request: &PlayingLibraryRequest<'_>,
     root_index: usize,
@@ -532,6 +728,14 @@ fn elect_family(
     // release status is never excluded by anything.
     let mut survivors: Vec<usize> = Vec::new();
     for (position, member) in members.iter().enumerate() {
+        if dump_quality(&request.dat.games[member.dat_entry_index]) == DumpQuality::NoDump {
+            plan.exclusions.push(ExcludedCandidate {
+                dat_entry_name: name_of(member.dat_entry_index),
+                source_path: member.archive_path.clone(),
+                excluded_classes: vec!["DAT status NO_DUMP".into()],
+            });
+            continue;
+        }
         let classes_found = evidence_of(member.dat_entry_index).release_classes.clone();
         let excluded: Vec<ReleaseClass> = classes_found
             .iter()
@@ -554,9 +758,41 @@ fn elect_family(
     if survivors.is_empty() {
         return;
     }
+    if survivors.iter().all(|position| {
+        dump_quality(&request.dat.games[members[*position].dat_entry_index]) != DumpQuality::Good
+    }) {
+        plan.unresolved_groups.push(UnresolvedGroup {
+            family_root_name: request.dat.games[root_index].name.clone(),
+            tied_candidates: survivors
+                .iter()
+                .map(|position| name_of(members[*position].dat_entry_index))
+                .collect(),
+            reason:
+                "only BAD_DUMP or uncertain DAT dump status is available; review before selection"
+                    .into(),
+        });
+        return;
+    }
 
     let mut reasons: Vec<Vec<String>> = vec![Vec::new(); members.len()];
     let mut steps: Vec<String> = Vec::new();
+
+    run_rank_tier(
+        "DAT dump quality",
+        true,
+        &mut survivors,
+        &mut reasons,
+        &mut steps,
+        |position| dump_quality(&request.dat.games[members[position].dat_entry_index]) as usize,
+        |position| {
+            dump_quality(&request.dat.games[members[position].dat_entry_index])
+                .label()
+                .into()
+        },
+        "DAT declares BAD_DUMP or uncertain status",
+        members,
+        &name_of,
+    );
 
     // The policy-empty case disables its tier entirely: no preference was
     // expressed, so that field must not decide or explain anything.
@@ -803,6 +1039,7 @@ fn record_election(
         let entry = &request.dat.games[member.dat_entry_index];
         let release_evidence = evidence::dat_release_evidence(&entry.name);
         CandidateEvidenceSummary {
+            dump_quality: dump_quality(entry).label().into(),
             regions: release_evidence.regions,
             languages: release_evidence.languages,
             revision: release_evidence.revision.as_ref().map(format_revision),
@@ -886,6 +1123,15 @@ fn finish_unresolved(
 /// match anywhere ranks last. Never called "bad" - only "ranked below".
 fn rank_in_preference(values: &[String], preferences: &[String]) -> usize {
     for (index, preference) in preferences.iter().enumerate() {
+        if preference.eq_ignore_ascii_case("Other")
+            && !values.iter().any(|value| {
+                preferences.iter().any(|known| {
+                    !known.eq_ignore_ascii_case("Other") && known.eq_ignore_ascii_case(value)
+                })
+            })
+        {
+            return index;
+        }
         if values
             .iter()
             .any(|value| value.eq_ignore_ascii_case(preference))
@@ -900,6 +1146,15 @@ fn rank_in_preference(values: &[String], preferences: &[String]) -> usize {
 /// narration lines.
 fn preference_label(values: &[String], preferences: &[String]) -> String {
     for preference in preferences {
+        if preference.eq_ignore_ascii_case("Other")
+            && !values.iter().any(|value| {
+                preferences.iter().any(|known| {
+                    !known.eq_ignore_ascii_case("Other") && known.eq_ignore_ascii_case(value)
+                })
+            })
+        {
+            return "\"Other / unlisted region\"".into();
+        }
         if values
             .iter()
             .any(|value| value.eq_ignore_ascii_case(preference))

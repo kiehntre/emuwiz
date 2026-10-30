@@ -42,6 +42,18 @@ use std::io;
 use std::path::Path;
 
 #[cfg(test)]
+pub(crate) use hook::set_after_link_hook;
+
+#[cfg(unix)]
+pub(crate) fn link_undo_tombstone_path(
+    destination: &Path,
+    proof: &super::model::ObjectIdentity,
+) -> std::path::PathBuf {
+    destination.with_file_name(format!(".emuwiz-undone-{:x}-{:x}", proof.dev, proof.ino))
+}
+#[cfg(test)]
+pub(crate) use hook::set_undo_move_hook;
+#[cfg(test)]
 pub(crate) use hook::{DirSyncEvent, set_open_hook, set_test_hook};
 
 #[cfg(unix)]
@@ -89,6 +101,158 @@ pub(crate) struct RenameDirs {
 
 #[cfg(unix)]
 impl RenameDirs {
+    /// Creates a symlink inside the verified destination parent. The kernel
+    /// resolves the parent descriptor, so a later path swap cannot redirect
+    /// this operation to an unrelated directory.
+    pub(crate) fn create_link(&self, target: &Path) -> io::Result<super::model::ObjectIdentity> {
+        use std::ffi::CString;
+        use std::os::fd::AsRawFd;
+        use std::os::unix::ffi::OsStrExt;
+        self.verify_bound()?;
+        let target_text = target.to_path_buf();
+        let target = CString::new(target.as_os_str().as_bytes())
+            .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "invalid link target"))?;
+        let name = CString::new(self.destination_name.as_bytes())
+            .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "invalid link name"))?;
+        // SAFETY: both C strings and the destination descriptor remain live.
+        if unsafe {
+            libc::symlinkat(
+                target.as_ptr(),
+                self.destination_dir.as_raw_fd(),
+                name.as_ptr(),
+            )
+        } < 0
+        {
+            return Err(io::Error::last_os_error());
+        }
+        #[cfg(test)]
+        hook::after_link_create(&self.destination_entry())?;
+        let proof = super::identity::capture_identity(&self.destination_entry())?;
+        if proof.kind != super::model::ObjectKind::Symlink
+            || std::fs::read_link(self.destination_entry())? != target_text
+        {
+            return Err(io::Error::other(
+                "created link changed before it could be proved",
+            ));
+        }
+        self.destination_dir.sync_all()?;
+        self.verify_bound()?;
+        Ok(proof)
+    }
+
+    /// Moves only the journal-proved link to a hidden tombstone in the bound parent.
+    /// A path substitution before binding or a different link object refuses.
+    pub(crate) fn remove_recorded_link(
+        &self,
+        expected: &super::model::ObjectIdentity,
+        target: &Path,
+    ) -> io::Result<()> {
+        use std::ffi::CString;
+        use std::os::fd::AsRawFd;
+        use std::os::unix::ffi::OsStrExt;
+        self.verify_bound()?;
+        let entry = self.destination_entry();
+        let current = super::identity::capture_identity(&entry)?;
+        if !super::identity::link_identity_matches(expected, &current)
+            || std::fs::read_link(&entry)? != target
+        {
+            return Err(io::Error::other(
+                "destination is not the journal-proved link object",
+            ));
+        }
+        let name = CString::new(self.destination_name.as_bytes())
+            .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "invalid destination name"))?;
+        #[cfg(test)]
+        hook::before_undo_move(&entry);
+        #[cfg(target_os = "linux")]
+        {
+            let fd = self.destination_dir.as_raw_fd();
+            {
+                let held_path = link_undo_tombstone_path(&entry, expected);
+                let quarantine_name = held_path
+                    .file_name()
+                    .unwrap()
+                    .to_string_lossy()
+                    .into_owned();
+                let quarantine = CString::new(quarantine_name.as_bytes())
+                    .map_err(|_| io::Error::other("invalid undo quarantine name"))?;
+                // Atomic no-replace move ensures that a replacement between the
+                // check above and this syscall is never directly unlinked.
+                // SAFETY: both names and the bound directory descriptor live.
+                if unsafe {
+                    libc::renameat2(
+                        fd,
+                        name.as_ptr(),
+                        fd,
+                        quarantine.as_ptr(),
+                        libc::RENAME_NOREPLACE,
+                    )
+                } < 0
+                {
+                    let error = io::Error::last_os_error();
+                    return Err(error);
+                }
+                self.destination_dir.sync_all().map_err(|error| {
+                    io::Error::new(
+                        error.kind(),
+                        format!(
+                            "Undo object retained at {} after sync failure: {error}",
+                            held_path.display()
+                        ),
+                    )
+                })?;
+                self.verify_bound().map_err(|error| {
+                    io::Error::new(
+                        error.kind(),
+                        format!(
+                            "Undo object retained at {} after path change: {error}",
+                            held_path.display()
+                        ),
+                    )
+                })?;
+                let held = super::identity::capture_identity(&held_path);
+                let held_target = std::fs::read_link(&held_path);
+                if !matches!((held, held_target), (Ok(actual), Ok(actual_target))
+                    if super::identity::link_identity_matches(expected, &actual)
+                    && actual_target == target)
+                {
+                    // A foreign object was moved. Put it back only if its old
+                    // name is still empty; otherwise leave it untouched in
+                    // quarantine and report the path for manual recovery.
+                    let restored = unsafe {
+                        libc::renameat2(
+                            fd,
+                            quarantine.as_ptr(),
+                            fd,
+                            name.as_ptr(),
+                            libc::RENAME_NOREPLACE,
+                        )
+                    };
+                    let _ = self.destination_dir.sync_all();
+                    return Err(io::Error::other(if restored == 0 {
+                        "destination changed during Undo; foreign object restored".to_string()
+                    } else {
+                        format!(
+                            "destination changed during Undo; foreign object retained at {} for manual recovery",
+                            held_path.display()
+                        )
+                    }));
+                }
+                // Retain the proved symlink as a small hidden tombstone. An
+                // unlink by pathname would reintroduce a replacement race.
+                // The journal records this deterministic path after success.
+                self.verify_bound()
+            }
+        }
+        #[cfg(not(target_os = "linux"))]
+        {
+            let _ = (name, expected, target);
+            Err(io::Error::other(
+                "safe linked-library Undo requires Linux renameat2",
+            ))
+        }
+    }
+
     /// Opens (O_DIRECTORY|O_NOFOLLOW|O_CLOEXEC) and verifies both parents.
     pub(crate) fn open(source: &Path, destination: &Path) -> io::Result<Self> {
         let split = |path: &Path| -> io::Result<(std::path::PathBuf, std::ffi::OsString)> {
@@ -621,6 +785,33 @@ mod hook {
 
     type OpenHook = Box<dyn FnMut(&Path)>;
     thread_local! { static OPEN_HOOK: RefCell<Option<OpenHook>> = const { RefCell::new(None) }; }
+    type UndoMoveHook = Box<dyn FnMut(&Path)>;
+    thread_local! { static UNDO_MOVE_HOOK: RefCell<Option<UndoMoveHook>> = const { RefCell::new(None) }; }
+    type AfterLinkHook = Box<dyn FnMut(&Path) -> io::Result<()>>;
+    thread_local! { static AFTER_LINK_HOOK: RefCell<Option<AfterLinkHook>> = const { RefCell::new(None) }; }
+
+    pub(crate) fn set_after_link_hook(hook: Option<AfterLinkHook>) {
+        AFTER_LINK_HOOK.with(|slot| *slot.borrow_mut() = hook);
+    }
+
+    pub(super) fn after_link_create(path: &Path) -> io::Result<()> {
+        let taken = AFTER_LINK_HOOK.with(|slot| slot.borrow_mut().take());
+        let Some(mut hook) = taken else { return Ok(()) };
+        let result = hook(path);
+        AFTER_LINK_HOOK.with(|slot| *slot.borrow_mut() = Some(hook));
+        result
+    }
+
+    pub(crate) fn set_undo_move_hook(hook: Option<UndoMoveHook>) {
+        UNDO_MOVE_HOOK.with(|slot| *slot.borrow_mut() = hook);
+    }
+
+    pub(super) fn before_undo_move(path: &Path) {
+        let taken = UNDO_MOVE_HOOK.with(|slot| slot.borrow_mut().take());
+        let Some(mut hook) = taken else { return };
+        hook(path);
+        UNDO_MOVE_HOOK.with(|slot| *slot.borrow_mut() = Some(hook));
+    }
 
     /// Runs just before each path component is opened below a trusted root:
     /// the deterministic point at which a concurrent replacer would strike.

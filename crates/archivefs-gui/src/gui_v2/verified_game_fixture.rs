@@ -371,6 +371,7 @@ mod tests {
         assert!(page.error().is_none(), "{:?}", page.error());
         assert_eq!(page.plan().expect("plan").elected_games.len(), 1);
         page.request_apply();
+        page.confirm_text = crate::playing_library_page::playing_library_confirmation_phrase(1);
         page.confirm_apply();
         assert!(page.apply_error().is_none(), "{:?}", page.apply_error());
         let applied = page.applied().expect("applied").transaction_id.clone();

@@ -3884,11 +3884,22 @@ fn a_non_adopted_link_entry_refuses_an_exact_link_that_appeared_after_its_checkp
     );
     assert_eq!(std::fs::read_link(&destination).unwrap(), source);
 
-    // Without the marker (a legacy journal) the earlier adoption is unchanged.
+    // A legacy entry without the marker cannot use matching text as proof.
     entry.unknown.clear();
+    assert!(matches!(
+        super::executor::apply_mutation_in(&entry, &TrustedRoots::from_paths([dir.path()])),
+        Err((EntryState::ApplyFailed, _))
+    ));
+    // The same refusal applies when a link arrives between batch preflight
+    // and the fresh entry's checkpoint.
+    entry.state = EntryState::Planned;
+    assert!(super::executor::record_link_adoption(&mut entry).is_err());
     assert!(
-        super::executor::apply_mutation_in(&entry, &TrustedRoots::from_paths([dir.path()])).is_ok()
+        !entry
+            .unknown
+            .contains_key(super::executor::LINK_ADOPTED_KEY)
     );
+    assert_eq!(std::fs::read_link(&destination).unwrap(), source);
 }
 
 /// Unreadable link evidence (here ELOOP from a looping parent) is not proof the

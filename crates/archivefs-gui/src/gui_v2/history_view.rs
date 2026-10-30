@@ -260,6 +260,17 @@ fn undo_status_of(transaction: &RenameTransaction, source: Source) -> UndoStatus
         TransactionState::Applied => UndoStatus::Unavailable(
             "The receipt records no applied changes, so there is nothing to undo.".into(),
         ),
+        TransactionState::ApplyFailed
+            if applied_count(transaction) > 0
+                && source == Source::PlayingLibrary
+                && transaction
+                    .entries
+                    .iter()
+                    .filter(|entry| entry.state == EntryState::Applied)
+                    .all(|entry| entry.created_link_identity().is_some()) =>
+        {
+            UndoStatus::Available
+        }
         TransactionState::ApplyFailed if applied_count(transaction) == 0 => {
             UndoStatus::Unavailable("Nothing was changed, so there is nothing to undo.".into())
         }
@@ -1079,7 +1090,18 @@ fn check_entry(entry: &TransactionEntry, blockers: &mut Vec<Blocker>) {
             Ok(target) if &target != expected_target => {
                 blockers.push(Blocker::OutputChanged(name));
             }
-            Ok(_) => {}
+            Ok(_) => {
+                let owned = entry.created_link_identity();
+                let current = archivefs_core::dat::rename_apply::identity::capture_identity(
+                    &entry.destination_path,
+                )
+                .ok();
+                if !matches!((owned, current), (Some(expected), Some(actual))
+                    if archivefs_core::dat::rename_apply::identity::identity_matches(&expected, &actual))
+                {
+                    blockers.push(Blocker::OutputChanged(name));
+                }
+            }
         },
         TransactionOperation::CreateCopy { .. } => {
             match archivefs_core::dat::rename_apply::capture_identity(&entry.destination_path) {
@@ -1380,9 +1402,12 @@ impl super::App {
                                 entry,
                                 &view,
                                 &self.activity,
-                                &mut go,
-                                &mut preview_request,
-                                &mut undo_request,
+                                self.playing_library_job.is_some(),
+                                HistoryRowRequests {
+                                    go: &mut go,
+                                    preview: &mut preview_request,
+                                    undo: &mut undo_request,
+                                },
                             );
                         }
                         if total > limit {
@@ -1459,55 +1484,64 @@ impl super::App {
             go = Some(self.open_recovery_history());
         }
 
-        if let Some(id) = view.confirm_undo.clone()
-            && self
+        if let Some(id) = view.confirm_undo.clone() {
+            let repair_index = self
                 .repair_history
                 .iter()
-                .any(|record| record.transaction.transaction_id == id)
-        {
-            let mut confirmed = false;
-            let mut cancelled = false;
-            crate::ui::components::centered_window("Confirm undo")
+                .position(|record| record.transaction.transaction_id == id);
+            let library_index = self.playing_library_history.iter().position(|transaction| {
+                transaction.transaction_id == id
+                    && transaction
+                        .unknown
+                        .get("playing_library_profile")
+                        .and_then(serde_json::Value::as_str)
+                        == Some("generic")
+            });
+            if repair_index.is_some() || library_index.is_some() {
+                let mut confirmed = false;
+                let mut cancelled = false;
+                egui::Window::new("Confirm undo")
+                .collapsible(false)
                 .resizable(false)
                 .show(ui.ctx(), |ui| {
-                    ui.label("EmuWiz will re-verify the quarantined files and restore them to their original locations. If anything changed unexpectedly it will refuse and tell you why.");
-                    ui.horizontal(|ui| {
-                        // Cancel first, and focused once per opening.
-                        let cancel = ui.button("Cancel");
-                        let opened = egui::Id::new(("v2_history_undo_opened", id.clone()));
-                        if !ui.ctx().data(|data| data.get_temp::<bool>(opened).unwrap_or(false)) {
-                            cancel.request_focus();
-                            ui.ctx().data_mut(|data| data.insert_temp(opened, true));
-                        }
-                        if cancel.clicked() {
-                            cancelled = true;
-                        }
-                        if crate::ui::components::action_button(
-                            ui,
-                            "Undo this repair",
-                            crate::ui::components::ActionStyle::Undo,
-                            self.undo_job.is_none(),
-                        )
-                        .on_disabled_hover_text("Another duplicate Undo is still running.")
-                        .clicked()
-                        {
-                            confirmed = true;
-                        }
+                    ui.label(if library_index.is_some() {
+                        "EmuWiz will re-verify each recorded link object before moving it to a hidden Undo tombstone. Replaced or changed links will be refused; original ROMs remain untouched."
+                    } else {
+                        "EmuWiz will re-verify the quarantined files and restore them to their original locations. If anything changed unexpectedly it will refuse and tell you why."
                     });
+                    if ui.add_enabled(
+                        self.playing_library_job.is_none(),
+                        egui::Button::new(if library_index.is_some() { "Undo these links" } else { "Undo this repair" }),
+                    ).clicked() {
+                        confirmed = true;
+                    }
+                    if ui.button("Cancel").clicked() {
+                        cancelled = true;
+                    }
                 });
-            if confirmed || cancelled {
-                let opened = egui::Id::new(("v2_history_undo_opened", id.clone()));
-                ui.ctx().data_mut(|data| data.remove::<bool>(opened));
-            }
-            if confirmed {
-                view.confirm_undo = None;
-                self.undo_confirm = None;
-                self.history_view = view;
-                self.undo_history_entry(&id);
-                return;
-            }
-            if cancelled {
-                view.confirm_undo = None;
+                if confirmed {
+                    if self.playing_library_job.is_some() {
+                        view.confirm_undo = None;
+                        self.history_view = view;
+                        return;
+                    }
+                    view.confirm_undo = None;
+                    self.undo_confirm = None;
+                    self.history_view = view;
+                    if repair_index.is_some() {
+                        self.undo_history_entry(&id);
+                    } else if let Some(index) = library_index
+                        && let Some(transaction) = self.playing_library_history.get(index).cloned()
+                    {
+                        self.playing_library
+                            .load_generic_history_receipt(transaction);
+                        self.start_playing_library_job(super::PlayingLibraryJobKind::Rollback);
+                    }
+                    return;
+                }
+                if cancelled {
+                    view.confirm_undo = None;
+                }
             }
         }
         self.history_view = view;
@@ -1641,14 +1675,19 @@ fn show_filters(ui: &mut egui::Ui, view: &mut HistoryViewState) {
 
 const ROWS_MIN_HEIGHT: f32 = 360.0;
 
+struct HistoryRowRequests<'a> {
+    go: &'a mut Option<Route>,
+    preview: &'a mut Option<String>,
+    undo: &'a mut Option<String>,
+}
+
 fn show_row(
     ui: &mut egui::Ui,
     entry: &HistoryEntry,
     view: &HistoryViewState,
     activity: &super::activity::Activity,
-    go: &mut Option<Route>,
-    preview_request: &mut Option<String>,
-    undo_request: &mut Option<String>,
+    playing_library_busy: bool,
+    requests: HistoryRowRequests<'_>,
 ) {
     ui.push_id(("history-row", &entry.transaction_id), |ui| {
         egui::Frame::group(ui.style()).show(ui, |ui| {
@@ -1729,7 +1768,7 @@ fn show_row(
             ui.horizontal_wrapped(|ui| match (&entry.undo, preview) {
                 (UndoStatus::Available, None) => {
                     if ui.button(RichText::new("Preview undo").strong()).clicked() {
-                        *preview_request = Some(entry.transaction_id.clone());
+                        *requests.preview = Some(entry.transaction_id.clone());
                     }
                 }
                 // The preview panel below carries the next action.
@@ -1742,17 +1781,18 @@ fn show_row(
                         .button(RichText::new(entry.handoff.label).strong())
                         .clicked()
                     {
-                        *go = Some(entry.handoff.route.clone());
+                        *requests.go = Some(entry.handoff.route.clone());
                     }
                 }
             });
 
             if let Some(preview) = preview {
-                let undo_busy = view
-                    .undo_attempts
-                    .values()
-                    .any(|id| activity.jobs.get(id).is_some_and(|job| job.active()));
-                show_preview(ui, entry, preview, undo_busy, go, undo_request);
+                let undo_busy = playing_library_busy
+                    || view
+                        .undo_attempts
+                        .values()
+                        .any(|id| activity.jobs.get(id).is_some_and(|job| job.active()));
+                show_preview(ui, entry, preview, undo_busy, requests.go, requests.undo);
             }
 
             ui.collapsing("Advanced details", |ui| {
@@ -1815,16 +1855,16 @@ fn show_preview(
         }
         if preview.safe() && matches!(entry.undo, UndoStatus::Available) {
             match entry.source {
-                Source::DuplicateQuarantine => {
-                    // Verified here: the preview is safe and the record says
-                    // Undo is available, so it takes the Undo (purple) style.
+                Source::DuplicateQuarantine | Source::PlayingLibrary
+                    if entry.source == Source::DuplicateQuarantine
+                        || entry.transaction.unknown.get("playing_library_profile").and_then(serde_json::Value::as_str) == Some("generic") => {
                     if crate::ui::components::action_button(
                         ui,
                         RichText::new("Undo").strong(),
                         crate::ui::components::ActionStyle::Undo,
                         !undo_busy,
                     )
-                    .on_disabled_hover_text("Another duplicate Undo is still running.")
+                    .on_disabled_hover_text("Another Undo is still running.")
                     .clicked()
                     {
                         *undo_request = Some(entry.transaction_id.clone());

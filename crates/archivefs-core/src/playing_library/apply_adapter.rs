@@ -18,6 +18,90 @@ use crate::dat::rename_apply::model::{
 
 use super::PlayingLibraryPlan;
 
+/// Creates the selected output directory without following a substituted
+/// symlink in any component. The shared executor still checks confinement
+/// immediately before each link operation.
+#[cfg(unix)]
+pub fn prepare_destination_root(path: &std::path::Path) -> Result<(), String> {
+    use std::ffi::CString;
+    use std::os::fd::{AsRawFd, FromRawFd};
+    use std::os::unix::ffi::OsStrExt;
+    use std::os::unix::fs::MetadataExt;
+    use std::path::Component;
+
+    if !path.is_absolute() {
+        return Err("destination must be absolute".into());
+    }
+    let mut current = std::fs::File::open("/").map_err(|error| error.to_string())?;
+    let mut walked = std::path::PathBuf::from("/");
+    for component in path.components() {
+        let Component::Normal(name) = component else {
+            if component == Component::RootDir {
+                continue;
+            }
+            return Err("destination contains an unsafe path component".into());
+        };
+        let name = CString::new(name.as_bytes()).map_err(|_| "destination contains NUL")?;
+        // SAFETY: the directory descriptor and NUL-terminated component are
+        // live for each call. The returned descriptor is immediately owned.
+        let fd = unsafe {
+            libc::openat(
+                current.as_raw_fd(),
+                name.as_ptr(),
+                libc::O_RDONLY | libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC,
+            )
+        };
+        if fd >= 0 {
+            // The component exists: close this probe descriptor; the verified reopen below owns the one we keep.
+            // SAFETY: `fd` is a fresh, valid descriptor owned only here.
+            drop(unsafe { std::fs::File::from_raw_fd(fd) });
+        }
+        if fd < 0 {
+            let error = std::io::Error::last_os_error();
+            if error.kind() != std::io::ErrorKind::NotFound {
+                return Err(format!("destination directory is unsafe: {error}"));
+            }
+            // SAFETY: same live descriptor and component; EEXIST is handled
+            // by the following O_NOFOLLOW open, which verifies the object.
+            if unsafe { libc::mkdirat(current.as_raw_fd(), name.as_ptr(), 0o755) } < 0 {
+                let error = std::io::Error::last_os_error();
+                if error.kind() != std::io::ErrorKind::AlreadyExists {
+                    return Err(format!("could not create destination directory: {error}"));
+                }
+            }
+        }
+        let fd = unsafe {
+            libc::openat(
+                current.as_raw_fd(),
+                name.as_ptr(),
+                libc::O_RDONLY | libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC,
+            )
+        };
+        if fd < 0 {
+            return Err(format!(
+                "destination directory is unsafe: {}",
+                std::io::Error::last_os_error()
+            ));
+        }
+        current = unsafe { std::fs::File::from_raw_fd(fd) };
+        walked.push(std::ffi::OsStr::from_bytes(name.as_bytes()));
+        let by_path = std::fs::symlink_metadata(&walked).map_err(|error| error.to_string())?;
+        let by_fd = current.metadata().map_err(|error| error.to_string())?;
+        if !by_path.is_dir()
+            || by_path.file_type().is_symlink()
+            || (by_path.dev(), by_path.ino()) != (by_fd.dev(), by_fd.ino())
+        {
+            return Err("destination directory changed while preparing it".into());
+        }
+    }
+    Ok(())
+}
+
+#[cfg(not(unix))]
+pub fn prepare_destination_root(_path: &std::path::Path) -> Result<(), String> {
+    Err("linked Playing Library creation requires safe directory handles on this platform".into())
+}
+
 /// Builds an unwritten, unapplied [`RenameTransaction`] from `plan`'s
 /// conflict-free elected operations. Read-only: captures each source's
 /// current identity but writes no journal and mutates nothing. The caller
@@ -444,7 +528,7 @@ mod tests {
     }
 
     #[test]
-    fn rollback_of_a_multi_file_release_removes_only_the_generated_links() {
+    fn rollback_of_a_multi_file_release_retains_proved_link_tombstones() {
         let temp = tempfile::tempdir().expect("temp dir");
         let cue = temp.path().join("Game (Europe).cue");
         let track1 = temp.path().join("track1.bin");
@@ -495,8 +579,24 @@ mod tests {
         assert!(!destination_root.join("Game (Europe).cue").exists());
         assert!(!destination_root.join("track1.bin").exists());
         assert!(!destination_root.join("track2.bin").exists());
-        // Only the generated links were removed - every master file
-        // remains exactly as it was.
+        for entry in &transaction.entries {
+            let proof = entry.created_link_identity().unwrap();
+            let tombstone = crate::dat::rename_apply::dirsync::link_undo_tombstone_path(
+                &entry.destination_path,
+                &proof,
+            );
+            assert!(tombstone.is_symlink());
+            assert_eq!(std::fs::read_link(&tombstone).unwrap(), entry.source_path);
+            assert_eq!(
+                entry
+                    .unknown
+                    .get("emuwiz_link_undo_tombstone_v1")
+                    .and_then(serde_json::Value::as_str),
+                Some(tombstone.to_str().unwrap())
+            );
+        }
+        // Only the generated links moved out of the public library paths;
+        // every master file remains exactly as it was.
         assert!(cue.is_file() && !cue.is_symlink());
         assert_eq!(
             std::fs::read(&cue).unwrap(),
@@ -507,7 +607,7 @@ mod tests {
     }
 
     #[test]
-    fn reapplying_the_same_multi_file_plan_is_idempotent() {
+    fn reapplying_the_same_multi_file_plan_refuses_existing_links() {
         let temp = tempfile::tempdir().expect("temp dir");
         let cue = temp.path().join("Game (Europe).cue");
         let track1 = temp.path().join("track1.bin");
@@ -549,12 +649,10 @@ mod tests {
         .expect("first apply succeeds");
         assert_eq!(outcome.summary.applied, 3);
 
-        // Re-running the identical plan (a fresh transaction over the same
-        // election) must succeed again rather than treating the
-        // already-correct symlinks as a conflict.
+        // A fresh operation cannot claim links that an earlier operation made.
         let mut second = build_playing_library_transaction(&plan, 2).expect("transaction");
         write_journal(&journal_dir, &second).unwrap();
-        let outcome = apply_transaction(&mut ApplyExecution {
+        let result = apply_transaction(&mut ApplyExecution {
             transaction: &mut second,
             approved_paths,
             current_generation: 2,
@@ -564,13 +662,222 @@ mod tests {
             cancel: &std::sync::atomic::AtomicBool::new(false),
             directory_policy: DirectoryPolicy::SameFilesystem,
             allow_symlink_source: false,
-        })
-        .expect("reapplying an already-correct plan succeeds");
-        assert_eq!(outcome.summary.applied, 3);
-        assert_eq!(second.state, TransactionState::Applied);
+        });
+        assert!(matches!(result, Err(ApplyError::HardConflicts(_))));
+        assert_eq!(second.applied_count(), 0);
 
         for name in ["Game (Europe).cue", "track1.bin", "track2.bin"] {
             assert!(destination_root.join(name).is_symlink());
         }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn undo_refuses_an_external_link_with_the_same_target_text() {
+        let temp = tempfile::tempdir().unwrap();
+        let source = temp.path().join("game.rom");
+        std::fs::write(&source, b"verified").unwrap();
+        let destination = temp.path().join("playing");
+        std::fs::create_dir_all(&destination).unwrap();
+        let journal = temp.path().join("journal");
+        std::fs::create_dir_all(&journal).unwrap();
+        let plan = plan_with_one_operation(source.clone(), destination.clone());
+        let mut tx = build_playing_library_transaction(&plan, 1).unwrap();
+        let approved_paths = std::iter::once(source.to_string_lossy().into_owned()).collect();
+        apply_transaction(&mut ApplyExecution {
+            transaction: &mut tx,
+            approved_paths,
+            current_generation: 1,
+            trusted: TrustedRoots::from_paths([temp.path()]),
+            journal_dir: journal.clone(),
+            hard_conflict_mode: HardConflictMode::AbortAll,
+            cancel: &std::sync::atomic::AtomicBool::new(false),
+            directory_policy: DirectoryPolicy::SameFilesystem,
+            allow_symlink_source: false,
+        })
+        .unwrap();
+        let link = destination.join("Game (Europe).zip");
+        let owned = crate::dat::rename_apply::identity::capture_identity(&link).unwrap();
+        let held_original = destination.join("held-original-link");
+        std::fs::rename(&link, &held_original).unwrap();
+        std::os::unix::fs::symlink(&source, &link).unwrap();
+        let replacement = crate::dat::rename_apply::identity::capture_identity(&link).unwrap();
+        assert!(!crate::dat::rename_apply::identity::identity_matches(
+            &owned,
+            &replacement
+        ));
+        let result = crate::dat::rename_apply::rollback::rollback_transaction(
+            &mut tx,
+            &journal,
+            &std::sync::atomic::AtomicBool::new(false),
+        )
+        .unwrap();
+        assert!(matches!(
+            result.result,
+            crate::dat::rename_apply::model::RollbackResult::RollbackFailed { .. }
+        ));
+        assert!(link.is_symlink());
+        assert!(held_original.is_symlink());
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn undo_race_restores_a_replacement_without_deleting_it() {
+        let temp = tempfile::tempdir().unwrap();
+        let source = temp.path().join("game.rom");
+        std::fs::write(&source, b"verified").unwrap();
+        let destination = temp.path().join("playing");
+        std::fs::create_dir_all(&destination).unwrap();
+        let journal = temp.path().join("journal");
+        std::fs::create_dir_all(&journal).unwrap();
+        let plan = plan_with_one_operation(source.clone(), destination.clone());
+        let mut tx = build_playing_library_transaction(&plan, 1).unwrap();
+        apply_transaction(&mut ApplyExecution {
+            transaction: &mut tx,
+            approved_paths: std::iter::once(source.to_string_lossy().into_owned()).collect(),
+            current_generation: 1,
+            trusted: TrustedRoots::from_paths([temp.path()]),
+            journal_dir: journal.clone(),
+            hard_conflict_mode: HardConflictMode::AbortAll,
+            cancel: &std::sync::atomic::AtomicBool::new(false),
+            directory_policy: DirectoryPolicy::SameFilesystem,
+            allow_symlink_source: false,
+        })
+        .unwrap();
+        let link = destination.join("Game (Europe).zip");
+        let held_original = destination.join("held-original-link");
+        let source_for_hook = source.clone();
+        let held_for_hook = held_original.clone();
+        let mut fired = false;
+        crate::dat::rename_apply::dirsync::set_undo_move_hook(Some(Box::new(move |path| {
+            if fired {
+                return;
+            }
+            fired = true;
+            std::fs::rename(path, &held_for_hook).unwrap();
+            std::os::unix::fs::symlink(&source_for_hook, path).unwrap();
+        })));
+        let result = crate::dat::rename_apply::rollback::rollback_transaction(
+            &mut tx,
+            &journal,
+            &std::sync::atomic::AtomicBool::new(false),
+        )
+        .unwrap();
+        crate::dat::rename_apply::dirsync::set_undo_move_hook(None);
+        assert!(matches!(
+            result.result,
+            crate::dat::rename_apply::model::RollbackResult::RollbackFailed { .. }
+        ));
+        assert!(link.is_symlink());
+        assert!(held_original.is_symlink());
+        assert_eq!(std::fs::read(source).unwrap(), b"verified");
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn post_create_failure_retains_unproved_link_for_restart_review() {
+        let temp = tempfile::tempdir().unwrap();
+        let source = temp.path().join("game.rom");
+        std::fs::write(&source, b"verified").unwrap();
+        let destination = temp.path().join("playing");
+        std::fs::create_dir_all(&destination).unwrap();
+        let journal = temp.path().join("journal");
+        std::fs::create_dir_all(&journal).unwrap();
+        let plan = plan_with_one_operation(source.clone(), destination.clone());
+        let mut tx = build_playing_library_transaction(&plan, 1).unwrap();
+        crate::dat::rename_apply::dirsync::set_after_link_hook(Some(Box::new(|_| {
+            Err(std::io::Error::other("injected post-create failure"))
+        })));
+        let outcome = apply_transaction(&mut ApplyExecution {
+            transaction: &mut tx,
+            approved_paths: std::iter::once(source.to_string_lossy().into_owned()).collect(),
+            current_generation: 1,
+            trusted: TrustedRoots::from_paths([temp.path()]),
+            journal_dir: journal.clone(),
+            hard_conflict_mode: HardConflictMode::AbortAll,
+            cancel: &std::sync::atomic::AtomicBool::new(false),
+            directory_policy: DirectoryPolicy::SameFilesystem,
+            allow_symlink_source: false,
+        })
+        .unwrap();
+        crate::dat::rename_apply::dirsync::set_after_link_hook(None);
+        assert_eq!(outcome.transaction.state, TransactionState::ApplyFailed);
+        assert_eq!(tx.entries[0].state, EntryState::Applying);
+        assert!(tx.entries[0].created_link_identity().is_none());
+        assert!(destination.join("Game (Europe).zip").is_symlink());
+        let issues =
+            crate::dat::rename_apply::reconcile::reconcile_recovery(&mut tx, &journal).unwrap();
+        assert_eq!(
+            issues[0].kind,
+            crate::dat::rename_apply::reconcile::RecoveryIssueKind::DestinationIdentityChanged
+        );
+        assert_eq!(tx.entries[0].state, EntryState::Applying);
+        assert_eq!(std::fs::read(source).unwrap(), b"verified");
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn undo_removes_a_proved_link_whose_original_later_moved() {
+        let temp = tempfile::tempdir().unwrap();
+        let source = temp.path().join("game.rom");
+        std::fs::write(&source, b"verified").unwrap();
+        let destination = temp.path().join("playing");
+        std::fs::create_dir_all(&destination).unwrap();
+        let journal = temp.path().join("journal");
+        std::fs::create_dir_all(&journal).unwrap();
+        let plan = plan_with_one_operation(source.clone(), destination.clone());
+        let mut tx = build_playing_library_transaction(&plan, 1).unwrap();
+        apply_transaction(&mut ApplyExecution {
+            transaction: &mut tx,
+            approved_paths: std::iter::once(source.to_string_lossy().into_owned()).collect(),
+            current_generation: 1,
+            trusted: TrustedRoots::from_paths([temp.path()]),
+            journal_dir: journal.clone(),
+            hard_conflict_mode: HardConflictMode::AbortAll,
+            cancel: &std::sync::atomic::AtomicBool::new(false),
+            directory_policy: DirectoryPolicy::SameFilesystem,
+            allow_symlink_source: false,
+        })
+        .unwrap();
+        // The user moves the original; the generated link is now broken.
+        let moved = temp.path().join("moved.rom");
+        std::fs::rename(&source, &moved).unwrap();
+        let link = destination.join("Game (Europe).zip");
+        assert!(link.is_symlink() && !link.exists());
+        let result = crate::dat::rename_apply::rollback::rollback_transaction(
+            &mut tx,
+            &journal,
+            &std::sync::atomic::AtomicBool::new(false),
+        )
+        .unwrap();
+        assert!(matches!(
+            result.result,
+            crate::dat::rename_apply::model::RollbackResult::FullyRolledBack
+        ));
+        assert!(std::fs::symlink_metadata(&link).is_err());
+        assert_eq!(std::fs::read(moved).unwrap(), b"verified");
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn preparing_an_existing_destination_does_not_leak_descriptors() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().join("a/b/c");
+        std::fs::create_dir_all(&root).unwrap();
+        // Count only descriptors naming this test's directory, so parallel
+        // tests opening unrelated files cannot disturb the result.
+        let prefix = temp.path().canonicalize().unwrap();
+        let open_fds = || {
+            std::fs::read_dir("/proc/self/fd")
+                .unwrap()
+                .filter_map(|entry| std::fs::read_link(entry.ok()?.path()).ok())
+                .filter(|target| target.starts_with(&prefix))
+                .count()
+        };
+        let before = open_fds();
+        for _ in 0..20 {
+            prepare_destination_root(&root).unwrap();
+        }
+        assert_eq!(open_fds(), before, "descriptors leaked");
     }
 }

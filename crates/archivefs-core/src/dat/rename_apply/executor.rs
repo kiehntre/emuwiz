@@ -264,7 +264,7 @@ pub fn apply_transaction(execution: &mut ApplyExecution<'_>) -> Result<ApplyOutc
         &execution.journal_dir,
         execution.transaction,
     )
-    .map_err(ApplyError::Journal)?;
+    .map_err(|error| ApplyError::Journal(error.to_string()))?;
     apply_transaction_inner(execution)
 }
 
@@ -276,7 +276,7 @@ pub(crate) fn apply_retrodeck_transaction(
         &execution.journal_dir,
         execution.transaction,
     )
-    .map_err(ApplyError::Journal)?;
+    .map_err(|error| ApplyError::Journal(error.to_string()))?;
     apply_transaction_inner(execution)
 }
 
@@ -312,6 +312,41 @@ fn apply_transaction_inner(execution: &mut ApplyExecution<'_>) -> Result<ApplyOu
             plan: transaction.plan_generation,
             current: execution.current_generation,
         });
+    }
+
+    // A caller-supplied in-memory proof cannot by itself authorize reentry.
+    // Require the same recovery-relevant record in the independently sealed journal before
+    // treating a destination link as this transaction's own object.
+    if transaction
+        .entries
+        .iter()
+        .any(|entry| entry.created_link_identity().is_some())
+    {
+        #[cfg(target_os = "linux")]
+        if super::compact_recovery::is_enrolled(&execution.journal_dir, &transaction.transaction_id)
+        {
+            return Err(ApplyError::Journal("resuming a compact-enrolled link creation requires its own authenticated recovery path".into()));
+        }
+        let check = super::seal::verify(&execution.journal_dir, &transaction.transaction_id);
+        if !check.trusted() {
+            return Err(ApplyError::Journal(
+                check
+                    .refusal()
+                    .unwrap_or_else(|| "link creation proof is not sealed".into()),
+            ));
+        }
+        let path =
+            super::journal::journal_path(&execution.journal_dir, &transaction.transaction_id)
+                .ok_or_else(|| {
+                    ApplyError::Journal("link creation journal cannot be named".into())
+                })?;
+        let saved = super::journal::read_journal(&path)
+            .map_err(|error| ApplyError::Journal(error.to_string()))?;
+        if super::seal::digest(&saved) != super::seal::digest(transaction) {
+            return Err(ApplyError::Journal(
+                "the in-memory link creation proof differs from the sealed journal".into(),
+            ));
+        }
     }
 
     let destinations = batch_destinations(&transaction.entries);
@@ -427,12 +462,12 @@ fn apply_transaction_inner(execution: &mut ApplyExecution<'_>) -> Result<ApplyOu
         }
         transaction.entries[index].preflight_passed = true;
 
-        // A fresh link entry journals, before the checkpoint below, whether its
-        // already-correct link existed beforehand, so Undo never removes a link
-        // this transaction did not create (see `LINK_ADOPTED_KEY`).
+        // A fresh link entry proves absence before its checkpoint. An existing
+        // link is refused even when its target text matches; only an object
+        // this transaction creates may later be eligible for Undo.
         let catalogue =
             crate::database::organisation_paths::begin(&transaction.entries[index], false, false)
-                .map_err(ApplyError::Journal)?;
+                .map_err(|error| ApplyError::Journal(error.to_string()))?;
         let prior_state = transaction.entries[index].state;
         if prior_state == EntryState::Planned {
             if let Err(reason) = record_link_adoption(&mut transaction.entries[index]) {
@@ -494,8 +529,12 @@ fn apply_transaction_inner(execution: &mut ApplyExecution<'_>) -> Result<ApplyOu
                 // Interrupted before the syscall: no link yet, so create it.
                 // Unavailable evidence is kept, never treated as "no link".
                 EntryState::Applying => {
-                    reverify_recorded_link(&transaction.entries[index], prior_state)
-                        .filter(|result| !matches!(result, Err((EntryState::ApplyFailed, _))))
+                    reverify_recorded_link(&transaction.entries[index], prior_state).filter(
+                        |result| {
+                            transaction.entries[index].created_link_identity().is_some()
+                                || !matches!(result, Err((EntryState::ApplyFailed, _)))
+                        },
+                    )
                 }
                 _ => None,
             }
@@ -505,15 +544,62 @@ fn apply_transaction_inner(execution: &mut ApplyExecution<'_>) -> Result<ApplyOu
             .unwrap_or_else(|| apply_mutation_in(&transaction.entries[index], &execution.trusted))
         {
             Ok(()) => {
+                if let TransactionOperation::CreateSymlink {
+                    expected_target, ..
+                } = &transaction.entries[index].operation
+                    && link_adoption(&transaction.entries[index]) == Some(false)
+                    && transaction.entries[index].created_link_identity().is_none()
+                {
+                    let proof = capture_identity(&transaction.entries[index].destination_path);
+                    let target = std::fs::read_link(&transaction.entries[index].destination_path);
+                    match (proof, target) {
+                        (Ok(proof), Ok(target))
+                            if proof.kind == super::model::ObjectKind::Symlink
+                                && target == *expected_target =>
+                        {
+                            transaction.entries[index]
+                                .record_created_link(&proof)
+                                .map_err(|error| ApplyError::Journal(error.to_string()))?;
+                        }
+                        _ => {
+                            transaction.entries[index].state = EntryState::ApplyFailed;
+                            transaction.entries[index].failure_reason =
+                                Some("created link could not be proved; review the journal".into());
+                            transaction.state = TransactionState::ApplyFailed;
+                            write_journal(&execution.journal_dir, transaction)
+                                .map_err(|error| ApplyError::Journal(error.to_string()))?;
+                            break;
+                        }
+                    }
+                }
                 if let Some(catalogue) = catalogue {
-                    catalogue.commit().map_err(ApplyError::Journal)?;
+                    catalogue
+                        .commit()
+                        .map_err(|error| ApplyError::Journal(error.to_string()))?;
                 }
                 transaction.entries[index].state = EntryState::Applied;
                 transaction.entries[index].applied_at_unix = Some(crate::dat::sources::now_unix());
             }
             Err((state, reason)) => {
-                transaction.entries[index].state = state;
-                transaction.entries[index].failure_reason = Some(reason);
+                let uncertain_link = matches!(
+                    &transaction.entries[index].operation,
+                    TransactionOperation::CreateSymlink { expected_target, .. }
+                        if link_adoption(&transaction.entries[index]) == Some(false)
+                            && std::fs::read_link(&transaction.entries[index].destination_path)
+                                .is_ok_and(|target| target == *expected_target)
+                );
+                transaction.entries[index].state = if uncertain_link {
+                    EntryState::Applying
+                } else {
+                    state
+                };
+                transaction.entries[index].failure_reason = Some(if uncertain_link {
+                    format!(
+                        "{reason}; a link may have been created but ownership is unproved; recovery requires review"
+                    )
+                } else {
+                    reason
+                });
                 transaction.state = TransactionState::ApplyFailed;
                 if super::exact_resume::has_envelope(transaction) {
                     super::exact_resume::set_state(
@@ -596,7 +682,8 @@ pub(crate) fn apply_mutation_in(
         destination_root,
     } = &entry.operation
     {
-        return apply_symlink_mutation(entry, expected_target, destination_root);
+        return apply_symlink_mutation(entry, expected_target, destination_root, trusted)
+            .map(|_| ());
     }
     if let TransactionOperation::CreateHardlink {
         expected_source,
@@ -820,11 +907,10 @@ fn apply_hardlink_mutation(
     }
 }
 
-/// Entry metadata recording, at the pre-mutation checkpoint, whether a
-/// `CreateSymlink` entry found its exact link already present (`true`: the
-/// link is adopted, never created, and Undo leaves it in place) or absent
-/// (`false`: the link must be created by this entry). Absent on journals
-/// written before this key existed, which keep the earlier behaviour.
+/// Entry metadata recording absence before a new `CreateSymlink` checkpoint.
+/// New entries write `false`; older journals may contain `true` for an
+/// adopted, unowned link, which Undo must leave in place. A missing marker
+/// never authorizes adoption or removal.
 pub(crate) const LINK_ADOPTED_KEY: &str = "emuwiz_link_adopted_v1";
 
 /// The recorded adoption decision for a link entry, if any.
@@ -852,21 +938,20 @@ fn probe_exact_link(
     }
 }
 
-/// Journals the adoption decision; unavailable link evidence records nothing
-/// and returns the reason, so the caller fails the entry before its checkpoint.
+/// Journals absence for a fresh link entry. Existing or unavailable evidence
+/// records nothing, so the caller fails before its checkpoint.
 pub(crate) fn record_link_adoption(entry: &mut TransactionEntry) -> Result<(), String> {
-    let TransactionOperation::CreateSymlink {
-        expected_target, ..
-    } = &entry.operation
-    else {
+    let TransactionOperation::CreateSymlink { .. } = &entry.operation else {
         return Ok(());
     };
-    let adopted = probe_exact_link(entry, expected_target)
-        .map_err(|error| format!("link evidence unavailable: {error}"))?;
-    entry.unknown.insert(
-        LINK_ADOPTED_KEY.to_string(),
-        serde_json::Value::Bool(adopted),
-    );
+    match std::fs::symlink_metadata(&entry.destination_path) {
+        Ok(_) => return Err("the destination appeared before the link checkpoint; it is not owned by this transaction".into()),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(error) => return Err(format!("link evidence unavailable: {error}")),
+    }
+    entry
+        .unknown
+        .insert(LINK_ADOPTED_KEY.to_string(), serde_json::Value::Bool(false));
     Ok(())
 }
 
@@ -885,9 +970,24 @@ pub(crate) fn reverify_recorded_link(
         return None;
     };
     Some(match probe_exact_link(entry, expected_target) {
-        Ok(true) => Ok(()),
-        Ok(false) => Err((
+        Ok(true)
+            if entry.created_link_identity().is_some_and(|proof| {
+                capture_identity(&entry.destination_path)
+                    .is_ok_and(|actual| super::identity::link_identity_matches(&proof, &actual))
+            }) =>
+        {
+            Ok(())
+        }
+        Ok(true) => Err((
             EntryState::ApplyFailed,
+            "the link at the destination is not this transaction's proved object".to_string(),
+        )),
+        Ok(false) => Err((
+            if entry.created_link_identity().is_some() {
+                prior_state
+            } else {
+                EntryState::ApplyFailed
+            },
             "the link recorded by this transaction is no longer in place".to_string(),
         )),
         // Unavailable evidence keeps the entry's outcome (and its Undo
@@ -900,6 +1000,7 @@ fn apply_symlink_mutation(
     entry: &TransactionEntry,
     expected_target: &std::path::Path,
     destination_root: &std::path::Path,
+    trusted: &crate::safe_read::TrustedRoots,
 ) -> Result<(), (EntryState, String)> {
     if !expected_target.is_absolute() || expected_target != entry.source_path {
         return Err((
@@ -931,14 +1032,10 @@ fn apply_symlink_mutation(
     match std::fs::symlink_metadata(&entry.destination_path) {
         Ok(metadata) if metadata.file_type().is_symlink() => {
             match std::fs::read_link(&entry.destination_path) {
-                Ok(target) if target == expected_target && adoption != Some(false) => {
-                    return Ok(());
-                }
                 Ok(target) if target == expected_target => {
                     return Err((
                         EntryState::ApplyFailed,
-                        "a link appeared after this entry's checkpoint and was not created by \
-                         this transaction"
+                        "the existing link has no matching creation proof from this transaction"
                             .to_string(),
                     ));
                 }
@@ -967,34 +1064,55 @@ fn apply_symlink_mutation(
         Err(error) => return Err((EntryState::ApplyFailed, error.to_string())),
     }
     #[cfg(unix)]
-    std::os::unix::fs::symlink(expected_target, &entry.destination_path)
-        .map_err(|error| (EntryState::ApplyFailed, error.to_string()))?;
-    #[cfg(not(unix))]
-    return Err((
-        EntryState::ApplyFailed,
-        "symlink creation is unsupported on this platform".to_string(),
-    ));
-    let source_after = capture_identity(&entry.source_path).map_err(|_| {
-        (
-            EntryState::ApplyFailed,
-            "link source disappeared".to_string(),
+    {
+        let dirs = super::dirsync::RenameDirs::open_in(
+            &entry.source_path,
+            &entry.destination_path,
+            trusted,
         )
-    })?;
-    match std::fs::read_link(&entry.destination_path) {
-        Ok(target)
-            if target == expected_target
-                && super::preflight::destination_is_confined(
-                    &entry.destination_path,
-                    destination_root,
-                )
-                && super::identity::identity_matches(&entry.identity, &source_after) =>
+        .map_err(|error| {
+            (
+                EntryState::ApplyFailed,
+                format!("could not bind link directories: {error}"),
+            )
+        })?;
+        let bound_source = capture_identity(&dirs.source_entry()).map_err(|error| {
+            (
+                EntryState::ApplyFailed,
+                format!("bound link source is unavailable: {error}"),
+            )
+        })?;
+        if !super::identity::identity_matches(&entry.identity, &bound_source) {
+            return Err((
+                EntryState::ApplyFailed,
+                "bound link source changed since review".into(),
+            ));
+        }
+        dirs.create_link(expected_target)
+            .map_err(|error| (EntryState::ApplyFailed, error.to_string()))?;
+        let source_after = capture_identity(&dirs.source_entry()).map_err(|_| {
+            (
+                EntryState::ApplyFailed,
+                "link source disappeared".to_string(),
+            )
+        })?;
+        if super::preflight::destination_is_confined(&entry.destination_path, destination_root)
+            && super::identity::identity_matches(&entry.identity, &source_after)
         {
             Ok(())
+        } else {
+            Err((
+                EntryState::ApplyFailed,
+                "created link failed verification".into(),
+            ))
         }
-        _ => Err((
+    }
+    #[cfg(not(unix))]
+    {
+        Err((
             EntryState::ApplyFailed,
-            "created link failed verification".to_string(),
-        )),
+            "symlink creation is unsupported on this platform".to_string(),
+        ))
     }
 }
 

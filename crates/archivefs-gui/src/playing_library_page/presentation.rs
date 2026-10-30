@@ -224,6 +224,16 @@ pub(super) fn show_preview(
                     ui.colored_label(theme::warning(ui), format!("{} · Needs review", group.family_root_name));
                     ui.label("Identity or preference evidence is not strong enough to choose automatically.");
                     widgets::technical_details(ui, "unresolved-evidence", |ui| { ui.label(&group.reason); ui.label(group.tied_candidates.join(", ")); });
+                    for name in &group.tied_candidates {
+                        for source in state.verified_paths_named(name) {
+                            ui.push_id((&group.family_root_name, name, &source), |ui| {
+                                ui.label(format!("{} · {}", name, source.display()));
+                                if widgets::action_button(ui, "Choose this verified release", widgets::ActionStyle::Quiet, !state.async_busy).clicked() {
+                                    *action = Some(PlayingLibraryPageAction::OverrideCandidate { family: group.family_root_name.clone(), source: source.clone() });
+                                }
+                            });
+                        }
+                    }
                 });
             }
             for rejected in window(&plan.rejected_launchers, &mut skip, &mut remaining) {
@@ -240,13 +250,15 @@ pub(super) fn show_preview(
             }
             for path in window(&state.review_paths, &mut skip, &mut remaining) {
                 ui.push_id(("unverified-file", path), |ui| {
-                    ui.colored_label(
-                        theme::warning(ui),
-                        format!("{} · Needs review", filename(path)),
-                    );
-                    ui.label(
-                        "This preview did not establish a unique checksum identity. Not selected.",
-                    );
+                    let archive = path.extension().and_then(|value| value.to_str())
+                        .is_some_and(|value| matches!(value.to_ascii_lowercase().as_str(), "zip" | "7z" | "rar"));
+                    ui.colored_label(theme::warning(ui), format!("{} · {}", filename(path),
+                        if archive { "Unsupported archive member matching" } else { "Needs review" }));
+                    ui.label(if archive {
+                        "Archive members are not verified by this loose-file workflow. This file was not selected."
+                    } else {
+                        "This preview did not establish a unique checksum identity. Not selected."
+                    });
                     widgets::technical_details(ui, "unverified-path", |ui| {
                         ui.label(path.display().to_string());
                     });
@@ -299,6 +311,19 @@ pub(super) fn show_preview(
                             widgets::technical_details(ui, "alternative-evidence", |ui| {
                                 ui.label(format!("{:?}", rejected.evidence));
                             });
+                            if widgets::action_button(
+                                ui,
+                                "Choose this verified release",
+                                widgets::ActionStyle::Quiet,
+                                !state.async_busy,
+                            )
+                            .clicked()
+                            {
+                                *action = Some(PlayingLibraryPageAction::OverrideCandidate {
+                                    family: elected.family_root_name.clone(),
+                                    source: rejected.source_path.clone(),
+                                });
+                            }
                         },
                     );
                 }

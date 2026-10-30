@@ -13918,6 +13918,39 @@ mod tests {
         assert_eq!(archives[0].path, source.join("inside.zip"));
     }
 
+    #[cfg(unix)]
+    #[test]
+    fn scanner_ignores_playing_library_undo_tombstones() {
+        use std::os::unix::fs::symlink;
+
+        let root = test_root("scanner_ignores_undo_tombstones");
+        let source = root.join("library");
+        let originals = root.join("originals");
+        fs::create_dir_all(&source).unwrap();
+        fs::create_dir_all(&originals).unwrap();
+        fs::write(originals.join("Game.zip"), b"rom").unwrap();
+        // One tombstone whose original still exists, one whose original is gone.
+        symlink(
+            originals.join("Game.zip"),
+            source.join(".emuwiz-undone-801-2a"),
+        )
+        .unwrap();
+        symlink(
+            originals.join("Gone.zip"),
+            source.join(".emuwiz-undone-801-2b"),
+        )
+        .unwrap();
+
+        let archives = ArchiveScanner::new(&scanner_config(&source))
+            .scan_archives()
+            .unwrap();
+
+        assert!(
+            archives.is_empty(),
+            "tombstones must not be playable: {archives:?}"
+        );
+    }
+
     #[test]
     fn scanner_rejects_duplicate_and_shadows_nested_roots_but_not_prefix_siblings() {
         let root = test_root("scanner_source_overlap");
