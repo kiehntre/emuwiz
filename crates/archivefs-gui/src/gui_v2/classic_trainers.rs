@@ -8,6 +8,8 @@
 //! trainers is separate from this evidence and requires explicit selection
 //! at the supported RetroArch launch boundary.
 
+#[path = "classic_trainers/import.rs"]
+mod import_local;
 mod pinning;
 
 use std::path::{Path, PathBuf};
@@ -41,6 +43,7 @@ struct Key {
 pub(super) struct State {
     cached: Option<(Key, Result<Option<ClassicTrainerReport>, String>)>,
     pinning: pinning::Pinning,
+    import: import_local::Import,
 }
 
 fn stamp(path: &Path) -> Option<(u64, Option<SystemTime>)> {
@@ -140,12 +143,17 @@ impl State {
             .default_open(false)
             .show(ui, |ui| {
                 render(ui, result);
+                if poke_platform_for_label(&input.platform)
+                    == Some(archivefs_core::classic_poke_family::PokePlatform::ZxSpectrum)
+                {
+                    refresh |= self.import.show(ui, &game.archive.absolute_path);
+                }
                 let candidate = result
                     .as_ref()
                     .ok()
                     .and_then(|r| r.as_ref())
                     .is_some_and(|r| r.candidates().next().is_some());
-                refresh = self.pinning.show(ui, game, candidate);
+                refresh |= self.pinning.show(ui, game, candidate);
             });
         if refresh {
             self.cached = None;
