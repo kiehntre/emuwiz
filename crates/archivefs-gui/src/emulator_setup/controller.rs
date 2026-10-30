@@ -898,7 +898,10 @@ impl ArchiveFsApp {
                 self.emulator_readiness.retroarch_core_folder_preview = None;
                 self.emulator_readiness.retroarch_core_folder_reset_preview = false;
                 match self.clear_retroarch_core_directory_override() {
-                    Ok(()) => self.start_retroarch_profile_scan(context.clone()),
+                    Ok(()) => {
+                        self.emulator_readiness.retroarch_core_folder_save_error = None;
+                        self.start_retroarch_profile_scan(context.clone())
+                    }
                     Err(error) => {
                         self.emulator_readiness.retroarch_core_folder_save_error = Some(error)
                     }
@@ -3412,7 +3415,13 @@ fn append_retroarch_core_choice_at(path: &Path, expected: &[u8], next: &str) -> 
         return Err("The saved core-folder choice is not a small regular file.".into());
     }
     let mut contents = Vec::new();
-    file.read_to_end(&mut contents).map_err(|e| e.to_string())?;
+    (&file)
+        .take(64 * 1024 + 1)
+        .read_to_end(&mut contents)
+        .map_err(|e| e.to_string())?;
+    if contents.len() > 64 * 1024 {
+        return Err("The saved core-folder choice is not a small regular file.".into());
+    }
     let contents = String::from_utf8(contents)
         .map_err(|_| "The saved core-folder choice is not UTF-8; it was left untouched.")?;
     if crate::retroarch_core_setup::active_retroarch_core_choice(&contents).as_bytes() != expected {

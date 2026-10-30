@@ -562,7 +562,24 @@ pub(crate) fn retroarch_core_directory_override_path() -> Option<PathBuf> {
 /// discovery). The stored path is taken verbatim - it is the user's
 /// explicit choice, never canonicalised here.
 pub(crate) fn load_retroarch_core_directory_override_at(path: &Path) -> Option<PathBuf> {
-    let contents = std::fs::read_to_string(path).ok()?;
+    use std::io::Read;
+    use std::os::unix::fs::OpenOptionsExt;
+    // Same protections as the write side: no symlink, no blocking on a FIFO,
+    // regular file only, bounded read. This runs on the UI thread at startup.
+    let file = std::fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK)
+        .open(path)
+        .ok()?;
+    if !file.metadata().ok()?.is_file() {
+        return None;
+    }
+    let mut bytes = Vec::new();
+    file.take(64 * 1024 + 1).read_to_end(&mut bytes).ok()?;
+    if bytes.len() > 64 * 1024 {
+        return None;
+    }
+    let contents = String::from_utf8(bytes).ok()?;
     let choice = active_retroarch_core_choice(&contents);
     (!choice.trim().is_empty() && choice != "@emuwiz-automatic").then(|| PathBuf::from(choice))
 }
@@ -614,6 +631,27 @@ pub(crate) fn a_missing_core_directory_override_file_loads_as_none() {
     let path = dir.path().join("retroarch_core_directory_override.txt");
     assert!(!path.exists());
     assert_eq!(load_retroarch_core_directory_override_at(&path), None);
+}
+
+#[test]
+pub(crate) fn an_unsafe_core_directory_override_file_is_never_loaded() {
+    let dir = tempfile::tempdir().unwrap();
+    let real = dir.path().join("real.txt");
+    std::fs::write(&real, "/opt/cores").unwrap();
+    let link = dir.path().join("link.txt");
+    std::os::unix::fs::symlink(&real, &link).unwrap();
+    assert_eq!(load_retroarch_core_directory_override_at(&link), None);
+    let big = dir.path().join("big.txt");
+    std::fs::write(&big, format!("/{}", "a".repeat(70 * 1024))).unwrap();
+    assert_eq!(load_retroarch_core_directory_override_at(&big), None);
+    let fifo = dir.path().join("fifo.txt");
+    let c = std::ffi::CString::new(fifo.to_str().unwrap()).unwrap();
+    assert_eq!(unsafe { libc::mkfifo(c.as_ptr(), 0o600) }, 0);
+    assert_eq!(load_retroarch_core_directory_override_at(&fifo), None);
+    assert_eq!(
+        load_retroarch_core_directory_override_at(&real),
+        Some(PathBuf::from("/opt/cores"))
+    );
 }
 
 #[test]
