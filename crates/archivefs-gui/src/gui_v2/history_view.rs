@@ -43,6 +43,7 @@ const MAX_ADVANCED_ENTRIES: usize = 20;
 /// only basis for grouping; nothing is classified from message text.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub(super) enum Source {
+    PbpExport,
     DuplicateQuarantine,
     PlayingLibrary,
     CanonicalOrganisation,
@@ -231,6 +232,9 @@ fn outcome_of(transaction: &RenameTransaction, source: Source) -> Outcome {
 
 fn undo_status_of(transaction: &RenameTransaction, source: Source) -> UndoStatus {
     match transaction.state {
+        TransactionState::Applied if source == Source::PbpExport => UndoStatus::Unavailable(
+            "The derived PBP and receipt are journaled; this Blue journey does not offer Undo. Review recovery records for interrupted publication.".into(),
+        ),
         TransactionState::RolledBack
             if source == Source::DuplicateQuarantine && !transaction.is_fully_rolled_back() =>
         {
@@ -284,6 +288,7 @@ fn undo_status_of(transaction: &RenameTransaction, source: Source) -> UndoStatus
 fn summary_of(transaction: &RenameTransaction, source: Source) -> String {
     let count = transaction.entries.len();
     match source {
+        Source::PbpExport => "PS1 PBP playing-copy export".into(),
         Source::DuplicateQuarantine => format!(
             "Moved {} to quarantine",
             plural(count, "redundant file", "redundant files")
@@ -330,6 +335,7 @@ fn summary_of(transaction: &RenameTransaction, source: Source) -> String {
 
 fn family_of(transaction: &RenameTransaction, source: Source) -> Family {
     match source {
+        Source::PbpExport => Family::Repair,
         Source::DuplicateQuarantine => Family::Repair,
         Source::PlayingLibrary => Family::Organisation,
         Source::MameReconstruction | Source::MameInternalRepair => Family::Mame,
@@ -711,7 +717,9 @@ pub(super) struct HistorySources<'a> {
 /// Which workflow a sealed receipt belongs to, from what it recorded.
 pub(super) fn source_of(transaction: &RenameTransaction) -> Source {
     use archivefs_core::dat::rename_apply::model::TransactionOperation;
-    if transaction.entries.iter().any(|entry| {
+    if transaction.source_scan_root == "verified-ps1-pbp-export-v1" {
+        Source::PbpExport
+    } else if transaction.entries.iter().any(|entry| {
         entry.destination_path.components().any(|component| {
             component.as_os_str() == archivefs_core::repair::QUARANTINE_DIRECTORY_NAME
         })
@@ -1155,6 +1163,7 @@ pub(super) fn check_undo_safety(entry: &HistoryEntry) -> UndoPreview {
         warnings.push(format!("Receipt status: {}.", entry.undo.label()));
     }
     let will_change = match entry.source {
+        Source::PbpExport => vec!["The original discs are retained. This journey does not offer Undo of the derived PBP.".into()],
         Source::DuplicateQuarantine => vec![format!(
             "Restore {} from quarantine to {}.",
             plural(applied, "file", "files"),
@@ -1725,6 +1734,9 @@ fn show_row(
                 }
                 // The preview panel below carries the next action.
                 (UndoStatus::Available, Some(_)) | (UndoStatus::AlreadyUndone, _) => {}
+                _ if entry.source == Source::PbpExport => {
+                    ui.label("Use Review recovery records below to inspect the journal.");
+                }
                 _ => {
                     if ui
                         .button(RichText::new(entry.handoff.label).strong())
@@ -1774,10 +1786,16 @@ fn show_preview(
             ui.label(format!("Affected: {target}"));
         }
         for line in &preview.will_change {
-            ui.label(format!("Undo would: {line}"));
+            if entry.source == Source::PbpExport {
+                ui.label(format!("Recovery note: {line}"));
+            } else {
+                ui.label(format!("Undo would: {line}"));
+            }
         }
         ui.label(format!("Uses: {}", preview.receipt));
-        if preview.safe() {
+        if preview.safe() && entry.source == Source::PbpExport {
+            ui.label(format!("Recorded evidence: {} looked unchanged. This page does not offer PBP Undo.", plural(preview.checked, "item", "items")));
+        } else if preview.safe() {
             ui.label(format!(
                 "Safety check: {} looked unchanged. EmuWiz re-verifies everything again when you undo.",
                 plural(preview.checked, "item", "items")
@@ -1787,7 +1805,11 @@ fn show_preview(
                 ui.label(format!("Blocked: {}", blocker.describe()));
             }
         }
-        ui.label("This preview checks recorded metadata, link targets or presence only. The owning workflow repeats its full verification before undo changes any files.");
+        if entry.source == Source::PbpExport {
+            ui.label("This read-only check covers recorded metadata and presence. Review the journal and retained recovery stage before any separate recovery action.");
+        } else {
+            ui.label("This preview checks recorded metadata, link targets or presence only. The owning workflow repeats its full verification before undo changes any files.");
+        }
         for warning in &preview.warnings {
             ui.label(format!("Note: {warning}"));
         }

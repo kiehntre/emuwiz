@@ -243,8 +243,14 @@ impl Database {
                 if outcome.change != ArchiveChangeKind::New {
                     return Err("Existing record encountered; transaction rolled back.".into());
                 }
-                assign_platform_for_scanned_archive(&mut db, &folder, &archive, outcome.archive_id)
-                    .map_err(|e| e.to_string())?;
+                assign_platform_for_scanned_archive(
+                    &mut db,
+                    &folder,
+                    &archive,
+                    outcome.archive_id,
+                    true,
+                )
+                .map_err(|e| e.to_string())?;
                 let platform: Option<String> = db
                     .connection
                     .query_row(

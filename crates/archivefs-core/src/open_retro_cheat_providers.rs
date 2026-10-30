@@ -196,6 +196,9 @@ pub enum ZxPokError {
     },
     MissingTerminator,
     TooManyLines,
+    TooManyTrainers,
+    TooManyOperations,
+    DuplicateTrainer,
     /// Value 256 asks the user for a value when the trainer is activated.
     /// That runtime prompt has no exact preview, so it is refused by name
     /// rather than reported as an out-of-range number.
@@ -205,6 +208,9 @@ pub enum ZxPokError {
 }
 
 pub fn parse_zx_pok(input: &str) -> Result<Vec<ZxPokTrainer>, ZxPokError> {
+    if input.len() > 256 * 1024 {
+        return Err(ZxPokError::TooManyLines);
+    }
     let mut trainers = Vec::new();
     let mut current: Option<ZxPokTrainer> = None;
     let mut terminated = false;
@@ -230,8 +236,18 @@ pub fn parse_zx_pok(input: &str) -> Result<Vec<ZxPokTrainer>, ZxPokError> {
                 if let Some(trainer) = current.take() {
                     trainers.push(trainer);
                 }
+                if trainers.len() >= 128 {
+                    return Err(ZxPokError::TooManyTrainers);
+                }
+                let title = rest.trim();
+                if title.is_empty() || title.len() > 256 || title.chars().any(char::is_control) {
+                    return Err(ZxPokError::InvalidLine {
+                        line: index + 1,
+                        detail: "trainer title is empty, too long or contains controls".into(),
+                    });
+                }
                 current = Some(ZxPokTrainer {
-                    title: rest.trim().to_string(),
+                    title: title.to_string(),
                     operations: Vec::new(),
                 });
             }
@@ -239,6 +255,9 @@ pub fn parse_zx_pok(input: &str) -> Result<Vec<ZxPokTrainer>, ZxPokError> {
                 let trainer = current
                     .as_mut()
                     .ok_or(ZxPokError::MissingTrainer { line: index + 1 })?;
+                if trainer.operations.len() >= 512 {
+                    return Err(ZxPokError::TooManyOperations);
+                }
                 let numbers: Vec<_> = rest.split_whitespace().collect();
                 if numbers.len() != 4 {
                     return Err(ZxPokError::InvalidLine {
@@ -285,6 +304,18 @@ pub fn parse_zx_pok(input: &str) -> Result<Vec<ZxPokTrainer>, ZxPokError> {
     }
     if trainers.is_empty() {
         return Err(ZxPokError::Empty);
+    }
+    let mut titles = std::collections::BTreeSet::new();
+    for trainer in &trainers {
+        if trainer.operations.is_empty() {
+            return Err(ZxPokError::InvalidLine {
+                line: 0,
+                detail: "trainer has no POKEs".into(),
+            });
+        }
+        if !titles.insert(trainer.title.to_lowercase()) {
+            return Err(ZxPokError::DuplicateTrainer);
+        }
     }
     Ok(trainers)
 }
@@ -399,6 +430,26 @@ mod tests {
             parse_zx_pok("NBad\nZ 8 1 2 3"),
             Err(ZxPokError::MissingTerminator)
         ));
+    }
+
+    #[test]
+    fn zx_pok_rejects_duplicate_empty_and_unbounded_entries() {
+        assert_eq!(
+            parse_zx_pok("NLives\nZ 8 40000 1 0\nNlives\nZ 8 40001 1 0\nY\n"),
+            Err(ZxPokError::DuplicateTrainer)
+        );
+        assert!(matches!(
+            parse_zx_pok("NEmpty\nY\n"),
+            Err(ZxPokError::InvalidLine { .. })
+        ));
+        assert!(matches!(
+            parse_zx_pok("N\nZ 8 40000 1 0\nY\n"),
+            Err(ZxPokError::InvalidLine { .. })
+        ));
+        let huge = format!("NToo many\n{}Y\n", "M 8 40000 1 0\n".repeat(513));
+        assert_eq!(parse_zx_pok(&huge), Err(ZxPokError::TooManyOperations));
+        let huge = format!("NLarge\nZ 8 40000 1 0\nY\n{}", " ".repeat(256 * 1024));
+        assert_eq!(parse_zx_pok(&huge), Err(ZxPokError::TooManyLines));
     }
 
     #[test]
