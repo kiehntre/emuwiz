@@ -19,7 +19,7 @@
 //!   not silently re-recorded.
 use super::*;
 use crate::identity_source::hashing::FileFingerprint;
-use crate::repair::exact_duplicate::hash_full_file_sha256;
+use crate::repair::exact_duplicate::{hash_full_file_sha256, hash_full_file_sha256_bound};
 use crate::safe_read::TrustedRoots;
 
 /// `(id, content_hash, size_bytes, modified_time_unix_seconds)` of one row.
@@ -117,7 +117,7 @@ impl Database {
         Ok(None)
     }
 
-    pub(super) fn is_preservation_recording(&self, archive_id: i64) -> Result<bool> {
+    pub fn is_preservation_recording(&self, archive_id: i64) -> Result<bool> {
         self.connection
             .query_row(
                 "SELECT archive_kind = 'preservation_recording' FROM archives WHERE id = ?1",
@@ -149,6 +149,24 @@ impl Database {
         &self,
         archive_id: i64,
     ) -> Result<PreservationFreshness> {
+        self.verify_preservation_fingerprint_inner(archive_id, None)
+    }
+
+    /// Re-checks the recording without accepting a different object opened
+    /// after the caller captured its file identity.
+    pub fn verify_preservation_fingerprint_bound(
+        &self,
+        archive_id: i64,
+        expected: &FileFingerprint,
+    ) -> Result<PreservationFreshness> {
+        self.verify_preservation_fingerprint_inner(archive_id, Some(expected))
+    }
+
+    fn verify_preservation_fingerprint_inner(
+        &self,
+        archive_id: i64,
+        expected: Option<&FileFingerprint>,
+    ) -> Result<PreservationFreshness> {
         let Some(recorded) = self.preservation_fingerprint(archive_id)? else {
             return Ok(PreservationFreshness::NotRecorded);
         };
@@ -161,21 +179,31 @@ impl Database {
             )
             .map_err(|error| db_error("failed to load preservation recording path", error))?;
         let path = PathBuf::from(OsString::from_vec(path));
-        Ok(
-            match hash_full_file_sha256(&path, &TrustedRoots::none(), None) {
-                Ok(identity) if identity.sha256 == recorded => {
-                    PreservationFreshness::Fresh { sha256: recorded }
-                }
-                Ok(identity) => PreservationFreshness::Changed {
+        let hash = match expected {
+            Some(expected) if expected.path != path => {
+                return Ok(PreservationFreshness::Unavailable {
                     recorded,
-                    current: identity.sha256,
-                },
-                Err(refusal) => PreservationFreshness::Unavailable {
-                    recorded,
-                    reason: refusal.to_string(),
-                },
+                    reason: "recording path changed before hashing".into(),
+                });
+            }
+            Some(expected) => {
+                hash_full_file_sha256_bound(&path, &TrustedRoots::none(), None, expected)
+            }
+            None => hash_full_file_sha256(&path, &TrustedRoots::none(), None),
+        };
+        Ok(match hash {
+            Ok(identity) if identity.sha256 == recorded => {
+                PreservationFreshness::Fresh { sha256: recorded }
+            }
+            Ok(identity) => PreservationFreshness::Changed {
+                recorded,
+                current: identity.sha256,
             },
-        )
+            Err(refusal) => PreservationFreshness::Unavailable {
+                recorded,
+                reason: refusal.to_string(),
+            },
+        })
     }
 }
 

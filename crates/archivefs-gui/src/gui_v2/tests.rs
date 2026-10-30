@@ -117,6 +117,7 @@ pub(super) fn fixture(context: &egui::Context) -> App {
         organisation: super::organisation::OrganisationState::default(),
         arcade_input_details: super::arcade_input_details::State::default(),
         classic_trainers: super::classic_trainers::State::default(),
+        recording_integrity: Default::default(),
         canonical_organisation: crate::rom_organisation_page::RomOrganisationPageState::default(),
         canonical_organisation_job: None,
         history_view: Default::default(),
@@ -3057,7 +3058,7 @@ fn gui_v2_unknown_title_never_becomes_verified_identity() {
     let game = Game::from_archive(archive(1, "Verified Final Fantasy VII Disc 1", None));
     assert!(!game.identified);
     assert_eq!(game.platform, "Unknown system");
-    assert_eq!(game.status(), "Not checked yet");
+    assert_eq!(game.status(), "Unknown platform · More evidence needed");
 }
 
 #[test]
@@ -6145,6 +6146,75 @@ fn no_route_shows_its_title_more_often_than_the_chrome_explains() {
 }
 
 // ---- Artwork startup: any artwork-consuming surface starts the one index ----
+
+#[test]
+fn batch_enrichment_refreshes_built_and_inflight_metadata_indexes() {
+    use archivefs_core::screenscraper_enrichment::{
+        AcceptedScreenScraperMetadata, PersistedScreenScraperEnrichment,
+        ScreenScraperEnrichmentReceipt,
+    };
+
+    let context = egui::Context::default();
+    for index_in_flight in [false, true] {
+        let mut app = fixture(&context);
+        app.library = Arc::new(Library::new(vec![archive(1, "Game", Some("PSX"))]));
+        app.artwork = Artwork::with_indexer(
+            context.clone(),
+            None,
+            Arc::new(|library| {
+                std::thread::sleep(Duration::from_millis(25));
+                let mut index = MediaIndex::default();
+                if let Some(synopsis) = library.games[0]
+                    .screenscraper
+                    .as_ref()
+                    .and_then(|saved| saved.values.synopsis.clone())
+                {
+                    index.descriptions.insert(1, synopsis);
+                }
+                index
+            }),
+        );
+        if index_in_flight {
+            app.artwork.reload(app.library.clone());
+        } else {
+            let mut old = MediaIndex::default();
+            old.descriptions.insert(1, "Old synopsis".into());
+            app.artwork.index = Some(Arc::new(old));
+        }
+        let prior_generation = app.artwork.generation;
+        app.cache_applied_batch_enrichment(PersistedScreenScraperEnrichment {
+            archive_id: 1,
+            values: AcceptedScreenScraperMetadata {
+                synopsis: Some("New synopsis".into()),
+                ..Default::default()
+            },
+            receipt: ScreenScraperEnrichmentReceipt {
+                provider: "ScreenScraper".into(),
+                provider_record_id: "fixture".into(),
+                retrieved_at_unix_seconds: 1,
+                match_basis: "verified hash".into(),
+                before: Default::default(),
+                accepted: Default::default(),
+                media_reference_count: 0,
+                field_sources: Default::default(),
+            },
+        });
+        assert_eq!(app.artwork.generation, prior_generation + 1);
+        let started = Instant::now();
+        while app.artwork.index_loading && started.elapsed() < Duration::from_secs(3) {
+            std::thread::sleep(Duration::from_millis(5));
+            app.artwork.begin_frame(&context);
+        }
+        assert!(
+            !app.artwork.index_loading,
+            "replacement index did not finish"
+        );
+        assert_eq!(
+            app.artwork.index.as_ref().unwrap().descriptions.get(&1),
+            Some(&"New synopsis".to_string())
+        );
+    }
+}
 
 /// An app whose artwork index is built by a counting fake (never the real
 /// provider data) and whose only cover is a real local PNG.

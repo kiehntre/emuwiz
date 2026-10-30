@@ -174,9 +174,55 @@ pub fn hash_full_file_sha256(
     trusted: &TrustedRoots,
     cancel: Option<&AtomicBool>,
 ) -> Result<FullFileIdentity, FullHashRefusal> {
-    let before = FileFingerprint::observe(path).ok_or_else(|| {
+    hash_full_file_sha256_inner(
+        path,
+        trusted,
+        cancel,
+        None,
+        FileFingerprint::observe,
+        || {},
+        || {},
+    )
+}
+
+/// Hash only the object observed by `expected`. Used when a caller has already
+/// bound a user action to one file identity before starting the read.
+pub fn hash_full_file_sha256_bound(
+    path: &Path,
+    trusted: &TrustedRoots,
+    cancel: Option<&AtomicBool>,
+    expected: &FileFingerprint,
+) -> Result<FullFileIdentity, FullHashRefusal> {
+    hash_full_file_sha256_inner(
+        path,
+        trusted,
+        cancel,
+        Some(expected),
+        FileFingerprint::observe,
+        || {},
+        || {},
+    )
+}
+
+fn hash_full_file_sha256_inner(
+    path: &Path,
+    trusted: &TrustedRoots,
+    cancel: Option<&AtomicBool>,
+    expected: Option<&FileFingerprint>,
+    observe: impl Fn(&Path) -> Option<FileFingerprint>,
+    before_open: impl FnOnce(),
+    after_open: impl FnOnce(),
+) -> Result<FullFileIdentity, FullHashRefusal> {
+    let before = observe(path).ok_or_else(|| {
         FullHashRefusal::NotReadable(format!("{} is not a readable regular file", path.display()))
     })?;
+    if expected.is_some_and(|expected| expected != &before) {
+        return Err(FullHashRefusal::ChangedWhileReading);
+    }
+    #[cfg(not(unix))]
+    if expected.is_some() {
+        return Err(FullHashRefusal::ChangedWhileReading);
+    }
     if before.size_bytes > MAX_AUTOMATIC_HASH_BYTES {
         return Err(FullHashRefusal::TooLarge {
             bytes: before.size_bytes,
@@ -187,9 +233,28 @@ pub fn hash_full_file_sha256(
         return Err(FullHashRefusal::Cancelled);
     }
 
+    before_open();
     let file = open_bounded_read(path, trusted)
         .map_err(|refusal| FullHashRefusal::NotReadable(refusal.detail()))?;
     let mut reader = file.into_file();
+    after_open();
+
+    // The path can be replaced and restored before the final observation.
+    // Bind the bytes to the object observed before opening, not just to the
+    // path that happens to exist after hashing.
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        let opened = reader
+            .metadata()
+            .map_err(|_| FullHashRefusal::ChangedWhileReading)?;
+        if !before
+            .object
+            .is_some_and(|stamp| stamp.device == opened.dev() && stamp.inode == opened.ino())
+        {
+            return Err(FullHashRefusal::ChangedWhileReading);
+        }
+    }
 
     let mut hasher = Sha256::new();
     let mut buffer = vec![0_u8; 256 * 1024];
@@ -208,7 +273,7 @@ pub fn hash_full_file_sha256(
         total = total.saturating_add(read as u64);
     }
 
-    let after = FileFingerprint::observe(path).ok_or(FullHashRefusal::ChangedWhileReading)?;
+    let after = observe(path).ok_or(FullHashRefusal::ChangedWhileReading)?;
     if after != before || after.size_bytes != total {
         return Err(FullHashRefusal::ChangedWhileReading);
     }

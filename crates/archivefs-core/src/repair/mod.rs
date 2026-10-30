@@ -46,6 +46,7 @@ pub mod optical_equivalent;
 pub mod plan;
 pub mod preflight;
 pub mod proposal;
+pub mod ps1_pbp_export;
 pub mod quarantine;
 
 #[cfg(test)]
