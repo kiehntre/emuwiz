@@ -1358,6 +1358,10 @@ fn backend_refusals_keep_their_meaning() {
             "RecoveryRequired",
         ),
         (
+            "write interrupted; staged file /m/.emuwiz-mame-staging/mame-1.zip.staged may remain after interruption; inspect Recovery before retrying; nothing was published",
+            "StagingInterrupted",
+        ),
+        (
             "transaction mame-1 is Applying and requires Recovery before another publication",
             "RecoveryRequired",
         ),
@@ -1391,6 +1395,59 @@ fn backend_refusals_keep_their_meaning() {
     }
 }
 
+#[test]
+fn restarted_blue_shows_unjournaled_stage_without_a_history_receipt() {
+    let lab = Lab::new();
+    let stage_dir = staging_root(&lab.root());
+    std::fs::create_dir_all(&stage_dir).unwrap();
+    let orphan = stage_dir.join(format!("mame-{}.zip.staged", "a".repeat(32)));
+    std::fs::write(&orphan, b"interrupted write").unwrap();
+    let mut panel = panel_with(&lab, Arc::new(execute));
+    panel.root = Some(lab.root());
+    render(&mut panel);
+    wait_for(&mut panel);
+    let text = render(&mut panel);
+    assert!(panel.history.is_empty());
+    assert!(text.contains("Retained staged file"), "{text}");
+    assert!(text.contains(&orphan.display().to_string()), "{text}");
+    assert!(text.contains("No recovery journal owns"), "{text}");
+    assert!(text.contains("Preview again"), "{text}");
+    assert_eq!(std::fs::read(orphan).unwrap(), b"interrupted write");
+}
+
+#[test]
+fn blue_discards_staging_status_from_a_previously_selected_folder() {
+    let lab = Lab::new();
+    let old_root = lab.root();
+    let stage_dir = staging_root(&old_root);
+    std::fs::create_dir_all(&stage_dir).unwrap();
+    std::fs::write(
+        stage_dir.join(format!("mame-{}.zip.staged", "b".repeat(32))),
+        b"old folder",
+    )
+    .unwrap();
+    let items = staging_lifecycle::inventory(&stage_dir, &lab.journal()).unwrap();
+    let mut panel = panel_with(&lab, Arc::new(|_, _, _| unreachable!()));
+    panel.root = Some(lab.dir.path().join("another-mame-folder"));
+    panel.finish(MameJobReport {
+        result: MameResult::History,
+        history: None,
+        staging: Some((old_root.clone(), Ok(items.clone()))),
+    });
+    assert!(panel.unjournaled_stages.is_empty());
+    panel.root = Some(old_root.clone());
+    panel.finish(MameJobReport {
+        result: MameResult::History,
+        history: None,
+        staging: Some((old_root, Ok(items))),
+    });
+    assert_eq!(panel.unjournaled_stages.len(), 1);
+    panel.history_root = panel.root.clone();
+    panel.root = Some(lab.dir.path().join("another-mame-folder"));
+    panel.sync_history_root();
+    assert!(panel.unjournaled_stages.is_empty());
+}
+
 // --- Clone-free games ---------------------------------------------------
 
 #[test]
@@ -1404,6 +1461,7 @@ fn a_clone_free_game_is_explained_not_reported_as_broken_identity() {
             dependencies: reconstruction_dependencies(&lab.dat, "solo").unwrap(),
         })))),
         history: None,
+        staging: None,
     });
     let notice = panel.notice.clone().unwrap();
     assert_eq!(notice.tone, Tone::Info);
@@ -1493,6 +1551,7 @@ fn a_long_publish_runs_off_the_gui_thread_and_locks_other_actions() {
                 refreshed_plan: None,
             })),
             history: None,
+            staging: None,
         }
     });
     let mut panel = panel_with(&lab, executor);
@@ -1520,7 +1579,9 @@ fn a_long_publish_runs_off_the_gui_thread_and_locks_other_actions() {
     }
     assert!(!panel.can_publish());
     assert!(!panel.confirm_publish(), "a second publish cannot start");
-    assert!(!panel.start(MameRequest::LoadHistory));
+    assert!(!panel.start(MameRequest::LoadHistory {
+        root: Some(lab.root())
+    }));
 
     release.send(()).unwrap();
     wait_for(&mut panel);
@@ -1558,6 +1619,7 @@ fn the_production_worker_publishes_and_undoes_through_the_panel() {
             MameRequest::Publish { preview } => MameJobReport {
                 result: MameResult::Publish(Box::new(lab.publish(&preview))),
                 history: history(),
+                staging: None,
             },
             MameRequest::Undo { transaction_id } => MameJobReport {
                 result: MameResult::Undo(run_undo(
@@ -1565,10 +1627,12 @@ fn the_production_worker_publishes_and_undoes_through_the_panel() {
                     &environment.journal_dir().unwrap(),
                 )),
                 history: history(),
+                staging: None,
             },
-            MameRequest::LoadHistory => MameJobReport {
+            MameRequest::LoadHistory { .. } => MameJobReport {
                 result: MameResult::History,
                 history: history(),
+                staging: None,
             },
             other => panic!("unexpected {other:?}"),
         }
@@ -1578,6 +1642,7 @@ fn the_production_worker_publishes_and_undoes_through_the_panel() {
     panel.dat = Some(lab.inputs("clone").dat);
     panel.set = "clone".into();
     panel.preview = Some(lab.preview("clone"));
+    panel.history_root = panel.root.clone();
 
     let text = render(&mut panel);
     for expected in [
