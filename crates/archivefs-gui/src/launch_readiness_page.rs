@@ -49,7 +49,7 @@ pub(crate) mod cemu;
 mod cemu_stop;
 mod classic_pokes;
 pub(crate) mod controller_readiness;
-mod desmume;
+pub(crate) mod desmume;
 pub(crate) mod dosbox;
 #[path = "launch_readiness_page/flycast.rs"]
 pub(crate) mod flycast;
@@ -59,9 +59,12 @@ mod mgba;
 mod pcsx2_cheats;
 mod retroarch_cheat_sets;
 mod retroarch_cheats;
+mod retroarch_setup;
 mod rmg;
+mod sameboy;
 pub(crate) mod saturn_core;
 mod scummvm_profile;
+mod stella;
 pub(crate) mod vice;
 pub(crate) mod xroar;
 use std::path::{Path, PathBuf};
@@ -1003,6 +1006,8 @@ pub(crate) enum StandaloneProcess {
     Tsugaru(archivefs_core::launch::process_spawn::WatchedProcess),
     Mgba(archivefs_core::launch::process_spawn::WatchedProcess),
     Desmume(archivefs_core::launch::process_spawn::WatchedProcess),
+    Stella(archivefs_core::launch::process_spawn::WatchedProcess),
+    SameBoy(archivefs_core::launch::LaunchedSameBoyProcess),
     Rmg(archivefs_core::launch::process_spawn::WatchedProcess),
     AmiberryCd(archivefs_core::launch::LaunchedAmiberryCdProcess),
     /// MAME started through the canonical per-launch cheat runtime; the session
@@ -1276,6 +1281,8 @@ impl StandaloneLaunchState {
                     StandaloneProcess::Tsugaru(p) => p.poll().is_some(),
                     StandaloneProcess::Mgba(p) => p.poll().is_some(),
                     StandaloneProcess::Desmume(p) => p.poll().is_some(),
+                    StandaloneProcess::Stella(p) => p.poll().is_some(),
+                    StandaloneProcess::SameBoy(p) => p.poll().is_some(),
                     StandaloneProcess::Rmg(p) => p.poll().is_some(),
                     StandaloneProcess::AmiberryCd(p) => p.poll().is_some(),
                     StandaloneProcess::MameCheats(session) => {
@@ -1342,6 +1349,12 @@ impl StandaloneLaunchState {
             }
             Some((_, _, StandaloneLaunchStage::Exited(StandaloneProcess::Desmume(process)))) => {
                 process.exit_report().and_then(desmume::exit_failure)
+            }
+            Some((_, _, StandaloneLaunchStage::Exited(StandaloneProcess::Stella(process)))) => {
+                process.exit_report().and_then(stella::exit_failure)
+            }
+            Some((_, _, StandaloneLaunchStage::Exited(StandaloneProcess::SameBoy(process)))) => {
+                process.exit_report().and_then(sameboy::exit_failure)
             }
             Some((_, _, StandaloneLaunchStage::Exited(StandaloneProcess::Rmg(process)))) => {
                 process.exit_report().and_then(rmg::exit_failure)
@@ -1511,6 +1524,8 @@ pub(crate) enum StandaloneLaunchRequest {
     Tsugaru(tsugaru::Request),
     Mgba(mgba::Request),
     Desmume(desmume::Request),
+    Stella(stella::Request),
+    SameBoy(sameboy::Request),
     Rmg(rmg::Request),
     AmiberryCd(amiberry_cd::Request),
     DuckStation(
@@ -1563,6 +1578,8 @@ impl StandaloneLaunchRequest {
             Self::Tsugaru(_) => "Tsugaru",
             Self::Mgba(_) => "mGBA",
             Self::Desmume(_) => "DeSmuME",
+            Self::Stella(_) => "Stella",
+            Self::SameBoy(_) => "SameBoy",
             Self::Rmg(_) => "RMG",
             Self::AmiberryCd(_) => "Amiberry CD",
             Self::DuckStation(..) => "DuckStation",
@@ -1590,6 +1607,8 @@ impl StandaloneLaunchRequest {
             Self::Tsugaru(r) => r.key(),
             Self::Mgba(r) => r.key(),
             Self::Desmume(r) => r.key(),
+            Self::Stella(r) => r.key(),
+            Self::SameBoy(r) => r.key(),
             Self::Rmg(r) => r.key(),
             Self::AmiberryCd(r) => r.key(),
             Self::DuckStation(r, ..) => (r.selected_content_path.clone(), "duckstation".into()),
@@ -1625,6 +1644,8 @@ impl StandaloneLaunchRequest {
             Self::Tsugaru(r) => r.execute().map(StandaloneProcess::Tsugaru),
             Self::Mgba(r) => r.execute().map(StandaloneProcess::Mgba),
             Self::Desmume(r) => r.execute().map(StandaloneProcess::Desmume),
+            Self::Stella(r) => r.execute().map(StandaloneProcess::Stella),
+            Self::SameBoy(r) => r.execute().map(StandaloneProcess::SameBoy),
             Self::Rmg(r) => r.execute().map(StandaloneProcess::Rmg),
             Self::AmiberryCd(r) => r.execute().map(StandaloneProcess::AmiberryCd),
             Self::Mame(r) => archivefs_core::launch::preflight_and_launch_mame(&r)
@@ -3275,6 +3296,13 @@ pub(crate) fn show_launch_readiness_panel(
         LaunchReadinessInput::RetroArchNotScanned => {
             widgets::card(ui, |ui| {
                 ui.label("Scan RetroArch profiles to check installed cores.");
+                if ui.button("Open Emulator Setup").clicked() {
+                    action = Some(LaunchReadinessPageAction::Navigate(
+                        crate::navigation::NavClick::View(
+                            crate::navigation::MainView::EmulatorSetup,
+                        ),
+                    ));
+                }
             });
         }
         LaunchReadinessInput::IdentityUnknown => {
@@ -3402,6 +3430,11 @@ pub(crate) fn show_launch_readiness_panel(
             let dos = plan.platform_id.as_deref() == Some(dosbox::DOS_PLATFORM_ID);
             if dos {
                 dosbox::show(ui, &preview_identity(plan), standalone_launch_state);
+            }
+            if retroarch_setup::show(ui, plan, retroarch.as_ref()) {
+                action = Some(LaunchReadinessPageAction::Navigate(
+                    crate::navigation::NavClick::View(crate::navigation::MainView::EmulatorSetup),
+                ));
             }
             if !(dos && plan.candidates.is_empty())
                 && show_plan(
@@ -4804,12 +4837,18 @@ fn show_candidate(
         let mgba_blocked = matches!(mgba_offer, Some(Err(_)));
         let desmume_offer = desmume::offer_for(plan, candidate);
         let desmume_blocked = matches!(desmume_offer, Some(Err(_)));
+        let stella_offer = stella::offer_for(plan, candidate);
+        let stella_blocked = matches!(stella_offer, Some(Err(_)));
+        let sameboy_offer = sameboy::offer_for(plan, candidate);
+        let sameboy_blocked = matches!(sameboy_offer, Some(Err(_)));
         let rmg_offer = rmg::offer_for(plan, candidate);
         let rmg_blocked = matches!(rmg_offer, Some(Err(_)));
         let readiness_override = (strict_mame_blocked
             || installation_blocked
             || mgba_blocked
             || desmume_blocked
+            || stella_blocked
+            || sameboy_blocked
             || rmg_blocked)
             .then_some(("Needs attention", widgets::StatusTone::Blocked));
         let (readiness_label, readiness_tone) =
@@ -4958,6 +4997,12 @@ fn show_candidate(
         if let Some(offer) = desmume_offer {
             desmume::show_offer(ui, standalone_launch_state, offer);
         }
+        if let Some(offer) = stella_offer {
+            stella::show_offer(ui, standalone_launch_state, offer);
+        }
+        if let Some(offer) = sameboy_offer {
+            sameboy::show_offer(ui, standalone_launch_state, offer);
+        }
         if let Some(offer) = rmg_offer {
             rmg::show_offer(ui, standalone_launch_state, offer);
         }
@@ -5088,6 +5133,20 @@ fn show_standalone_launch_action(
                     "Exited"
                 }
             }
+            Some(StandaloneLaunchStage::Exited(StandaloneProcess::Stella(p))) => {
+                if p.exit_report().and_then(stella::exit_failure).is_some() {
+                    "Failed"
+                } else {
+                    "Exited"
+                }
+            }
+            Some(StandaloneLaunchStage::Exited(StandaloneProcess::SameBoy(p))) => {
+                if p.exit_report().and_then(sameboy::exit_failure).is_some() {
+                    "Failed"
+                } else {
+                    "Exited"
+                }
+            }
             Some(StandaloneLaunchStage::Exited(StandaloneProcess::Rmg(p))) => {
                 if p.exit_report().and_then(rmg::exit_failure).is_some() {
                     "Failed"
@@ -5153,6 +5212,12 @@ fn show_standalone_launch_action(
             Some((_, _, StandaloneLaunchStage::Running(StandaloneProcess::Desmume(p)))) => {
                 desmume::show_running(ui, p);
             }
+            Some((_, _, StandaloneLaunchStage::Running(StandaloneProcess::Stella(p)))) => {
+                stella::show_running(ui, p);
+            }
+            Some((_, _, StandaloneLaunchStage::Running(StandaloneProcess::SameBoy(p)))) => {
+                sameboy::show_running(ui, p);
+            }
             Some((_, _, StandaloneLaunchStage::Running(StandaloneProcess::Rmg(p)))) => {
                 rmg::show_running(ui, p);
             }
@@ -5197,6 +5262,12 @@ fn show_standalone_launch_action(
                 }
                 if let StandaloneProcess::Desmume(p) = process {
                     desmume::show_exited(ui, p);
+                }
+                if let StandaloneProcess::Stella(p) = process {
+                    stella::show_exited(ui, p);
+                }
+                if let StandaloneProcess::SameBoy(p) = process {
+                    sameboy::show_exited(ui, p);
                 }
                 if let StandaloneProcess::Rmg(p) = process {
                     rmg::show_exited(ui, p);
@@ -5293,6 +5364,20 @@ fn show_standalone_launch_action(
         if adapter == "desmume"
             && !state.is_active()
             && ui.button("Launch DeSmuME again (recheck)").clicked()
+        {
+            state.start(request);
+            return;
+        }
+        if adapter == "stella"
+            && !state.is_active()
+            && ui.button("Launch Stella again (recheck)").clicked()
+        {
+            state.start(request);
+            return;
+        }
+        if adapter == "sameboy"
+            && !state.is_active()
+            && ui.button("Launch SameBoy again (recheck)").clicked()
         {
             state.start(request);
             return;

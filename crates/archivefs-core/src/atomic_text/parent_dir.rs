@@ -60,6 +60,51 @@ impl ParentDir {
         })
     }
 
+    /// Checked publications must not follow a swapped parent or ancestor link.
+    pub(super) fn open_no_symlinks(path: &Path) -> io::Result<Self> {
+        #[cfg(target_os = "linux")]
+        {
+            #[repr(C)]
+            struct OpenHow {
+                flags: u64,
+                mode: u64,
+                resolve: u64,
+            }
+            let name = CString::new(path.as_os_str().as_bytes())?;
+            let how = OpenHow {
+                flags: (libc::O_PATH | libc::O_DIRECTORY | libc::O_CLOEXEC) as u64,
+                mode: 0,
+                resolve: 0x04, // RESOLVE_NO_SYMLINKS, including every ancestor.
+            };
+            // SAFETY: the pathname and repr(C) argument remain live for this syscall.
+            // Unsupported kernels fail closed; no pathname-following fallback.
+            let fd = unsafe {
+                libc::syscall(
+                    libc::SYS_openat2,
+                    libc::AT_FDCWD,
+                    name.as_ptr(),
+                    &how,
+                    std::mem::size_of::<OpenHow>(),
+                )
+            };
+            let handle = owned_file(fd as libc::c_int)?;
+            let metadata = handle.metadata()?;
+            Ok(Self {
+                handle,
+                path: path.to_owned(),
+                identity: (metadata.dev(), metadata.ino()),
+            })
+        }
+        #[cfg(not(target_os = "linux"))]
+        {
+            let _ = path;
+            Err(io::Error::new(
+                io::ErrorKind::Unsupported,
+                "checked publication requires no-symlink directory opening",
+            ))
+        }
+    }
+
     pub(super) fn matches_identity(&self, expected: (u64, u64)) -> bool {
         self.identity == expected
     }

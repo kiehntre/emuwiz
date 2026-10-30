@@ -35,9 +35,10 @@
 //!   long-running, user-facing process the caller owns.
 
 use std::fs;
+use std::io::Read;
 use std::path::{Path, PathBuf};
 
-use crate::gb_header_evidence::parse_gb_header;
+use crate::gb_header_evidence::{GB_HEADER_BYTES, parse_gb_header};
 use crate::launch::process_spawn::{
     self, CapturedFileIdentity, PreparedProcessCommand, ProcessExitReport, WatchedProcess,
 };
@@ -61,6 +62,10 @@ pub struct SameBoyPreflightRequest {
     pub expected_platform_id: String,
     pub profile_id: String,
     pub expected_executable: PathBuf,
+    /// Identity of the file the caller already verified. When set, preflight
+    /// refuses any file whose identity differs, closing the window between the
+    /// caller's full-content check and this preflight.
+    pub expected_content_identity: Option<CapturedFileIdentity>,
 }
 
 // ---------------------------------------------------------------------------
@@ -172,14 +177,45 @@ pub fn preflight_sameboy_launch(
         )
     })?;
     let content_identity = inspect_and_capture_content_identity(content_path)?;
+    if let Some(expected) = &request.expected_content_identity
+        && *expected != content_identity
+    {
+        return Err(preflight_error(
+            SameBoyLaunchPreflightErrorKind::ContentChangedBeforeSpawn,
+            "content differs from the file that was verified for this launch",
+        ));
+    }
 
     // --- 4: fresh header read + parse ---
-    let header_bytes = fs::read(content_path).map_err(|io_error| {
+    let handle =
+        process_spawn::open_regular_file_nonblocking(content_path).map_err(|io_error| {
+            preflight_error(
+                SameBoyLaunchPreflightErrorKind::ContentNotFound,
+                format!("{}: {io_error}", content_path.display()),
+            )
+        })?;
+    if CapturedFileIdentity::capture(&handle.metadata().map_err(|error| {
         preflight_error(
             SameBoyLaunchPreflightErrorKind::ContentNotFound,
-            format!("{}: {io_error}", content_path.display()),
+            error.to_string(),
         )
-    })?;
+    })?) != content_identity
+    {
+        return Err(preflight_error(
+            SameBoyLaunchPreflightErrorKind::ContentChangedBeforeSpawn,
+            "content changed before header inspection",
+        ));
+    }
+    let mut header_bytes = Vec::new();
+    handle
+        .take(GB_HEADER_BYTES as u64)
+        .read_to_end(&mut header_bytes)
+        .map_err(|io_error| {
+            preflight_error(
+                SameBoyLaunchPreflightErrorKind::ContentNotFound,
+                format!("{}: {io_error}", content_path.display()),
+            )
+        })?;
     let rom_header = parse_gb_header(&header_bytes);
 
     // --- 5-6: fresh profile discovery, find the exact requested profile ---
@@ -349,6 +385,10 @@ impl LaunchedSameBoyProcess {
     pub fn is_running(&self) -> bool {
         self.watched.is_running()
     }
+
+    pub fn exit_report(&self) -> Option<&ProcessExitReport> {
+        self.watched.exit_report()
+    }
 }
 
 /// Spawns exactly the process `command` describes - never a shell.
@@ -455,12 +495,42 @@ mod tests {
             expected_platform_id: "Game Boy".to_string(),
             profile_id: format!("sameboy:{}", config_root.display()),
             expected_executable: exe.clone(),
+            expected_content_identity: None,
         };
         let command = preflight_sameboy_launch(&request, &roots).expect("preflight ok");
         assert_eq!(command.executable, exe);
         assert_eq!(
             command.arguments,
             vec![std::ffi::OsString::from(rom.as_os_str())]
+        );
+    }
+
+    #[test]
+    fn replaced_content_is_refused_against_the_verified_identity() {
+        let d = tempdir().unwrap();
+        let exe = d.path().join("sameboy");
+        write_exe(&exe);
+        let config_root = d.path().join("profile");
+        fs::create_dir_all(&config_root).unwrap();
+        let rom = d.path().join("game.gb");
+        fs::write(&rom, valid_gb_rom(0x00)).unwrap();
+        let roots = roots_for(d.path(), exe.clone(), config_root.clone());
+        let verified = inspect_and_capture_content_identity(&rom).unwrap();
+        // Replace the verified file with a different one at the same path.
+        let other = d.path().join("other.gb");
+        fs::write(&other, valid_gb_rom(0x00)).unwrap();
+        fs::rename(&other, &rom).unwrap();
+        let request = SameBoyPreflightRequest {
+            selected_content_path: rom,
+            expected_platform_id: "Game Boy".to_string(),
+            profile_id: format!("sameboy:{}", config_root.display()),
+            expected_executable: exe,
+            expected_content_identity: Some(verified),
+        };
+        let error = preflight_sameboy_launch(&request, &roots).unwrap_err();
+        assert_eq!(
+            error.kind,
+            SameBoyLaunchPreflightErrorKind::ContentChangedBeforeSpawn
         );
     }
 
@@ -480,6 +550,7 @@ mod tests {
             expected_platform_id: "Game Boy".to_string(),
             profile_id: "sameboy:/does/not/exist".to_string(),
             expected_executable: exe,
+            expected_content_identity: None,
         };
         let error = preflight_sameboy_launch(&request, &roots).unwrap_err();
         assert_eq!(error.kind, SameBoyLaunchPreflightErrorKind::ProfileNotFound);
@@ -501,6 +572,7 @@ mod tests {
             expected_platform_id: "Game Boy".to_string(),
             profile_id: format!("sameboy:{}", config_root.display()),
             expected_executable: d.path().join("a-different-sameboy"),
+            expected_content_identity: None,
         };
         let error = preflight_sameboy_launch(&request, &roots).unwrap_err();
         assert_eq!(error.kind, SameBoyLaunchPreflightErrorKind::BindingDrift);
@@ -522,6 +594,7 @@ mod tests {
             expected_platform_id: "Game Boy".to_string(),
             profile_id: format!("sameboy:{}", config_root.display()),
             expected_executable: exe,
+            expected_content_identity: None,
         };
         let error = preflight_sameboy_launch(&request, &roots).unwrap_err();
         assert_eq!(error.kind, SameBoyLaunchPreflightErrorKind::CommandBlocked);
@@ -543,6 +616,7 @@ mod tests {
             expected_platform_id: "Game Boy".to_string(),
             profile_id: format!("sameboy:{}", config_root.display()),
             expected_executable: exe,
+            expected_content_identity: None,
         };
         let error = preflight_sameboy_launch(&request, &roots).unwrap_err();
         assert_eq!(error.kind, SameBoyLaunchPreflightErrorKind::CommandBlocked);
@@ -564,6 +638,7 @@ mod tests {
             expected_platform_id: "Game Boy".to_string(),
             profile_id: format!("sameboy:{}", config_root.display()),
             expected_executable: exe,
+            expected_content_identity: None,
         };
         let error = preflight_sameboy_launch(&request, &roots).unwrap_err();
         assert_eq!(
@@ -593,6 +668,7 @@ mod tests {
                 expected_platform_id: "Game Boy".to_string(),
                 profile_id: format!("sameboy:{}", config_root.display()),
                 expected_executable: exe,
+                expected_content_identity: None,
             };
             let error = preflight_sameboy_launch(&request, &roots).unwrap_err();
             assert_eq!(
@@ -619,6 +695,7 @@ mod tests {
             expected_platform_id: "Game Boy".to_string(),
             profile_id: format!("sameboy:{}", config_root.display()),
             expected_executable: exe,
+            expected_content_identity: None,
         };
         let _ = preflight_sameboy_launch(&request, &roots);
 

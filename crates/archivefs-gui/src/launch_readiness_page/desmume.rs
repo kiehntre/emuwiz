@@ -121,6 +121,61 @@ fn capture(path: &Path) -> Result<CapturedFileIdentity, String> {
     Ok(CapturedFileIdentity::capture(&metadata))
 }
 
+fn cartridge_code(path: &Path, authorized_file: &CapturedFileIdentity) -> Result<String, String> {
+    let mut file = archivefs_core::launch::process_spawn::open_regular_file_nonblocking(path)
+        .map_err(|error| format!("Nintendo DS cartridge could not be opened: {error}"))?;
+    if CapturedFileIdentity::capture(&file.metadata().map_err(|error| error.to_string())?)
+        != *authorized_file
+    {
+        return Err("Nintendo DS cartridge changed during identity inspection.".into());
+    }
+    let mut header = [0_u8; 0x200];
+    file.read_exact(&mut header)
+        .map_err(|_| "Nintendo DS cartridge header is incomplete.")?;
+    let code = &header[0x0c..0x10];
+    if !code
+        .iter()
+        .all(|byte| byte.is_ascii_uppercase() || byte.is_ascii_digit())
+        || capture(path)? != *authorized_file
+    {
+        return Err("Nintendo DS cartridge identity is invalid or changed.".into());
+    }
+    Ok(format!("NTR-{}", String::from_utf8_lossy(code)))
+}
+
+pub(crate) fn selected_identity(
+    path: &Path,
+    report: &crate::selected_evidence_page::SelectedEvidenceReport,
+    freshness: archivefs_core::launch::EvidenceFreshness,
+) -> Option<CanonicalIdentityStatus> {
+    if freshness.is_incomplete()
+        || report.path != path
+        || report.game_identity_report.platform
+            != archivefs_core::game_identity::IdentityPlatform::Other
+        || !path
+            .extension()
+            .is_some_and(|extension| extension.eq_ignore_ascii_case("nds"))
+        || matches!(
+            report.identity_result.content.outcome,
+            FusionOutcome::Conflict | FusionOutcome::Ambiguous
+        )
+        || report
+            .identity_result
+            .content
+            .resolved_platform
+            .is_some_and(|platform| platform != "Nintendo DS")
+    {
+        return None;
+    }
+    let code = cartridge_code(path, &capture(path).ok()?).ok()?;
+    Some(CanonicalIdentityStatus::Resolved(
+        archivefs_core::launch::ResolvedIdentity {
+            platform_id: "Nintendo DS".into(),
+            game_key: code,
+        },
+    ))
+}
+
 fn fresh_identity(
     path: &Path,
     expected_key: &str,
@@ -144,21 +199,7 @@ fn fresh_identity(
     // The general game identity inspector does not yet parse Nintendo DS.
     // Its verified launch key is the NTR-prefixed cartridge game code, which
     // we re-read from the exact authorized file before Core's preflight.
-    let expected_code = expected_key
-        .strip_prefix("NTR-")
-        .filter(|code| code.len() == 4 && code.as_bytes().iter().all(u8::is_ascii_graphic))
-        .ok_or("A verified NTR cartridge game key is required to launch DeSmuME.")?;
-    let mut file = archivefs_core::launch::process_spawn::open_regular_file_nonblocking(path)
-        .map_err(|error| format!("Nintendo DS cartridge could not be opened: {error}"))?;
-    if CapturedFileIdentity::capture(&file.metadata().map_err(|error| error.to_string())?)
-        != *authorized_file
-    {
-        return Err("Nintendo DS cartridge changed since launch was selected.".into());
-    }
-    let mut header = [0_u8; 0x10];
-    file.read_exact(&mut header)
-        .map_err(|_| "Nintendo DS cartridge header is incomplete.")?;
-    if &header[0x0c..0x10] != expected_code.as_bytes() {
+    if cartridge_code(path, authorized_file)? != expected_key {
         return Err("Nintendo DS game code no longer matches the selected game.".into());
     }
     Ok(CanonicalIdentityStatus::Resolved(
@@ -325,5 +366,32 @@ mod tests {
         let (_dir, _roots, plan, mut candidate) = fixture(0);
         candidate.content.container = Some(LaunchContainerKind::Archive);
         assert!(Request::offer(&plan, &candidate).is_err());
+    }
+
+    #[test]
+    fn selected_game_reaches_blue_planning_with_header_identity() {
+        let (_dir, _roots, plan, candidate) = fixture(0);
+        let game = candidate.content.resolved_path.as_ref().unwrap();
+        let report =
+            crate::selected_evidence_page::gather_selected_evidence_fast(game, Some("Nintendo DS"))
+                .unwrap();
+        assert!(matches!(
+            selected_identity(game, &report, archivefs_core::launch::EvidenceFreshness::Current),
+            Some(CanonicalIdentityStatus::Resolved(identity)) if identity.game_key == "NTR-EWZP"
+        ));
+        let mut app = crate::tests::app_for_operation_tests();
+        app.archive_context.focused = Some(game.clone());
+        app.selected_evidence_ui.selected_evidence =
+            crate::selected_evidence_page::SelectedEvidenceState::Ready {
+                generation: 0,
+                hasheous: crate::selected_evidence_page::HasheousState::Idle,
+                report: Box::new(report),
+            };
+        let input = app.build_launch_readiness_input(None);
+        assert!(matches!(
+            input,
+            crate::launch_readiness_page::LaunchReadinessInput::Plan { plan: actual, .. }
+                if actual.platform_id == plan.platform_id && actual.game_key == plan.game_key
+        ));
     }
 }
