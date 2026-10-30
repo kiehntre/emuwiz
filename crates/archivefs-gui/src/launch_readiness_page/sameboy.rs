@@ -118,6 +118,7 @@ impl Request {
                 .ok_or("Game platform is unresolved.")?,
             profile_id: profile_id.clone(),
             expected_executable: binding.executable,
+            expected_content_identity: Some(self.content_identity),
         };
         let command = preflight_sameboy_launch(&request, &roots).map_err(|error| {
             format!(
