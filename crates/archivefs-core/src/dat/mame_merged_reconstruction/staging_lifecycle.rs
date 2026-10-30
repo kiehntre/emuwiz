@@ -30,6 +30,21 @@ pub struct StagingItem {
     pub identity: Option<ObjectIdentity>,
 }
 
+fn unowned_reason(path: &Path) -> &'static str {
+    if path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .is_some_and(|name| name.starts_with("mame-") && name.ends_with(".zip.staged"))
+    {
+        if !std::fs::symlink_metadata(path).is_ok_and(|m| m.is_file() && !m.is_symlink()) {
+            return "No recovery journal owns this staged entry, and it is missing or not a regular file. It was not followed or changed. A fresh publication will refuse this path; inspect it in Recovery before retrying.";
+        }
+        "No recovery journal owns this staged file. It may be an interrupted write or a foreign file; it cannot be published, adopted, undone or removed automatically. It is retained in place. Preview again to make a fresh, separately approved attempt."
+    } else {
+        "Unknown or manually added file; retained without ownership proof"
+    }
+}
+
 /// Locks are advisory application coordination; identity is separate evidence.
 /// Existing-only opens ensure that inventory never creates directories/files.
 pub struct StagingLock {
@@ -49,7 +64,12 @@ impl StagingLock {
         Ok(Self { staging, journals })
     }
     fn transactions(&self) -> Result<Vec<RenameTransaction>, String> {
-        let txs = self.journals.transactions()?;
+        checked_transactions(&self.journals)
+    }
+}
+fn checked_transactions(journals: &Directory) -> Result<Vec<RenameTransaction>, String> {
+    {
+        let txs = journals.transactions()?;
         let mut ids = std::collections::BTreeSet::new();
         // A canonical transaction must occupy its own journal slot. A second,
         // mismatched or substituted record is ambiguous ownership, not history.
@@ -57,9 +77,7 @@ impl StagingLock {
             if t.transaction_id.contains('/') || t.transaction_id.contains('\\') {
                 return Err("unsafe journal transaction ID".into());
             }
-            let value = self
-                .journals
-                .read_json(&format!("{}.json", t.transaction_id))?;
+            let value = journals.read_json(&format!("{}.json", t.transaction_id))?;
             let canonical: RenameTransaction =
                 serde_json::from_value(value).map_err(|e| e.to_string())?;
             if canonical != *t {
@@ -86,18 +104,49 @@ pub fn inventory(staging: &Path, journals: &Path) -> Result<Vec<StagingItem>, St
         dir.lock()?;
         let mut items = Vec::new();
         for e in std::fs::read_dir(&dir.path).map_err(|e| e.to_string())? {
+            let path = e.map_err(|e| e.to_string())?.path();
             items.push(StagingItem {
-                path: e.map_err(|e| e.to_string())?.path(), transaction_id: None,
-                transaction_state: None, identity: None, cleanup_eligible: false, finalise_eligible: false,
-                retention_reason: "No recovery journal directory; unpublished/unknown files retained without ownership proof".into(),
+                retention_reason: unowned_reason(&path).into(),
+                path,
+                transaction_id: None,
+                transaction_state: None,
+                identity: None,
+                cleanup_eligible: false,
+                finalise_eligible: false,
             });
         }
         dir.require_binding()?;
         items.sort_by(|a, b| a.path.cmp(&b.path));
         return Ok(items);
     }
+    if Directory::existing(staging)?.is_none() {
+        return inventory_without_staging(staging, journals);
+    }
     let lock = StagingLock::acquire(staging, journals)?;
     inventory_locked(&lock)
+}
+/// A never-rebuilt folder has no staging directory: that is an empty inventory,
+/// unless a journal still references a path inside it, which stays refused.
+fn inventory_without_staging(staging: &Path, journals: &Path) -> Result<Vec<StagingItem>, String> {
+    if staging == journals {
+        return Err("staging and journals must be separate".into());
+    }
+    let Some(journals) = Directory::existing(journals)? else {
+        return Ok(Vec::new());
+    };
+    journals.lock()?;
+    let referenced = checked_transactions(&journals)?.iter().any(|t| {
+        references(t, staging)
+            || t.entries.iter().any(|e| {
+                e.source_path.parent() == Some(staging)
+                    || e.destination_path.parent() == Some(staging)
+            })
+    });
+    journals.require_binding()?;
+    if referenced {
+        return Err("staging directory does not exist but a recovery journal references it".into());
+    }
+    Ok(Vec::new())
 }
 fn inventory_locked(lock: &StagingLock) -> Result<Vec<StagingItem>, String> {
     let txs = lock.transactions()?;
@@ -223,10 +272,10 @@ fn classify(
 ) -> Result<StagingItem, String> {
     let owners: Vec<_> = txs.iter().filter(|t| references(t, &path)).collect();
     let mut item = StagingItem {
+        retention_reason: unowned_reason(&path).into(),
         path,
         transaction_id: None,
         transaction_state: None,
-        retention_reason: "Unknown or manually added file; never cleaned".into(),
         cleanup_eligible: false,
         finalise_eligible: false,
         identity: None,

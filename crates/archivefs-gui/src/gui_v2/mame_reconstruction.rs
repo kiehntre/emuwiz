@@ -27,7 +27,7 @@ use std::time::Duration;
 
 use archivefs_core::dat::mame_arcade_join::{ArcadeJoinEvidence, refresh_mame_member_evidence};
 use archivefs_core::dat::mame_merged_reconstruction::staging_lifecycle::{
-    self, FINALISE_CONFIRMATION, Finalise, finalise_marker,
+    self, FINALISE_CONFIRMATION, Finalise, StagingItem, finalise_marker,
 };
 use archivefs_core::dat::mame_merged_reconstruction::{
     CatalogueReference, DeviceMemberSupply, ExcludedMemberReason, MAME_RECONSTRUCTION_WORKFLOW,
@@ -396,6 +396,8 @@ pub(super) enum MameRefusal {
     VerificationFailed(String),
     PackedMemberUnsupported(String),
     NoEvidence(String),
+    /// A stage exists without a publication journal after an interrupted write.
+    StagingInterrupted(String),
     /// An earlier MAME transaction or staging leftover needs Recovery first.
     RecoveryRequired(String),
     /// Another MAME publication holds the journal lock.
@@ -418,6 +420,7 @@ impl MameRefusal {
                 "Some required members cannot be read from this archive layout"
             }
             Self::NoEvidence(_) => "EmuWiz has no verified evidence for this set yet",
+            Self::StagingInterrupted(_) => "MAME staging was interrupted",
             Self::RecoveryRequired(_) => "An earlier MAME operation needs Recovery first",
             Self::Busy(_) => "Another MAME publication is running",
             Self::Preflight(_) => "The safety check refused this publication",
@@ -436,6 +439,7 @@ impl MameRefusal {
             | Self::VerificationFailed(d)
             | Self::PackedMemberUnsupported(d)
             | Self::NoEvidence(d)
+            | Self::StagingInterrupted(d)
             | Self::RecoveryRequired(d)
             | Self::Busy(d)
             | Self::Preflight(d)
@@ -462,7 +466,10 @@ impl MameRefusal {
                 "Nothing was published. Resolve the blockers shown in the preview first."
             }
             Self::RecoveryRequired(_) => {
-                "Nothing was published. Review the transaction in History and Recovery before trying again; do not move staged files by hand."
+                "Nothing was published by this attempt. Review History and Recovery before trying again; do not move staged files by hand."
+            }
+            Self::StagingInterrupted(_) => {
+                "Nothing was published. Review the retained file in Results and Undo, then preview again for a fresh attempt. The old staged file will not be reused or removed."
             }
             Self::Busy(_) => "Nothing was published. Wait for it to finish, then try again.",
             Self::VerificationFailed(_) => {
@@ -491,6 +498,8 @@ impl MameRefusal {
             Self::DestinationChanged(text)
         } else if lower.contains("another mame publication is in progress") {
             Self::Busy(text)
+        } else if lower.contains("may remain after interruption") {
+            Self::StagingInterrupted(text)
         } else if lower.contains("requires recovery before another publication")
             || lower.contains("leftover")
             || lower.contains("malformed recovery journal")
@@ -1355,7 +1364,9 @@ pub(super) enum MameRequest {
         action: FinaliseAction,
         exclusive_ack: bool,
     },
-    LoadHistory,
+    LoadHistory {
+        root: Option<PathBuf>,
+    },
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1376,7 +1387,7 @@ impl MameRequest {
             Self::Publish { .. } => MameJobKind::Publish,
             Self::Undo { .. } => MameJobKind::Undo,
             Self::Finalise { .. } => MameJobKind::Finalise,
-            Self::LoadHistory => MameJobKind::LoadHistory,
+            Self::LoadHistory { .. } => MameJobKind::LoadHistory,
         }
     }
 }
@@ -1414,6 +1425,7 @@ pub(super) type HistoryRead = Result<(Vec<RenameTransaction>, Vec<String>), Stri
 pub(super) struct MameJobReport {
     pub result: MameResult,
     pub history: Option<HistoryRead>,
+    pub staging: Option<(PathBuf, Result<Vec<StagingItem>, String>)>,
 }
 
 pub(super) type MameExecutor =
@@ -1421,6 +1433,18 @@ pub(super) type MameExecutor =
 
 fn reload_history(environment: &MameEnvironment) -> Option<HistoryRead> {
     Some(environment.journal_dir().map(|dir| load_history(&dir)))
+}
+
+fn reload_staging(
+    root: &Path,
+    environment: &MameEnvironment,
+) -> (PathBuf, Result<Vec<StagingItem>, String>) {
+    (
+        root.to_owned(),
+        environment
+            .journal_dir()
+            .and_then(|journal| staging_lifecycle::inventory(&staging_root(root), &journal)),
+    )
 }
 
 /// Production worker body, run on a background thread.
@@ -1456,6 +1480,7 @@ pub(super) fn execute(
             MameJobReport {
                 result: MameResult::Evidence(result),
                 history: None,
+                staging: None,
             }
         }
         MameRequest::Preview { inputs } => {
@@ -1485,6 +1510,7 @@ pub(super) fn execute(
             MameJobReport {
                 result: MameResult::Preview(result),
                 history: None,
+                staging: None,
             }
         }
         MameRequest::Publish { preview } => {
@@ -1499,6 +1525,7 @@ pub(super) fn execute(
                             refreshed_plan: None,
                         })),
                         history: None,
+                        staging: None,
                     };
                 }
             };
@@ -1539,6 +1566,7 @@ pub(super) fn execute(
                             refreshed_plan: None,
                         })),
                         history: None,
+                        staging: None,
                     };
                 }
             };
@@ -1554,6 +1582,7 @@ pub(super) fn execute(
             MameJobReport {
                 result: MameResult::Publish(Box::new(result)),
                 history: reload_history(environment),
+                staging: Some(reload_staging(&preview.inputs.root, environment)),
             }
         }
         MameRequest::Undo { transaction_id } => {
@@ -1567,6 +1596,7 @@ pub(super) fn execute(
             MameJobReport {
                 result: MameResult::Undo(outcome),
                 history: reload_history(environment),
+                staging: None,
             }
         }
         MameRequest::Finalise {
@@ -1584,11 +1614,15 @@ pub(super) fn execute(
             MameJobReport {
                 result: MameResult::Finalise(outcome),
                 history: reload_history(environment),
+                staging: None,
             }
         }
-        MameRequest::LoadHistory => MameJobReport {
+        MameRequest::LoadHistory { root } => MameJobReport {
             result: MameResult::History,
             history: reload_history(environment),
+            staging: root
+                .as_deref()
+                .map(|root| reload_staging(root, environment)),
         },
     }
 }
@@ -1660,7 +1694,10 @@ pub(super) struct MameReconstructionPanel {
     pub(super) finalise_ack: bool,
     pub(super) history: Vec<RenameTransaction>,
     pub(super) history_problems: Vec<String>,
+    pub(super) unjournaled_stages: Vec<StagingItem>,
+    pub(super) staging_problem: Option<String>,
     history_requested: bool,
+    history_root: Option<PathBuf>,
     pub(super) notice: Option<Notice>,
     job: Option<RunningJob>,
     environment: MameEnvironment,
@@ -1692,7 +1729,10 @@ impl MameReconstructionPanel {
             finalise_ack: false,
             history: Vec::new(),
             history_problems: Vec::new(),
+            unjournaled_stages: Vec::new(),
+            staging_problem: None,
             history_requested: false,
+            history_root: None,
             notice: None,
             job: None,
             environment,
@@ -1826,6 +1866,31 @@ impl MameReconstructionPanel {
     }
 
     fn finish(&mut self, report: MameJobReport) {
+        if let Some((_, staging)) = report
+            .staging
+            .filter(|(root, _)| self.root.as_ref() == Some(root))
+        {
+            match staging {
+                Ok(items) => {
+                    self.unjournaled_stages = items
+                        .into_iter()
+                        .filter(|item| {
+                            item.transaction_id.is_none()
+                                && item
+                                    .path
+                                    .file_name()
+                                    .and_then(|name| name.to_str())
+                                    .is_some_and(|name| name.ends_with(".zip.staged"))
+                        })
+                        .collect();
+                    self.staging_problem = None;
+                }
+                Err(error) => {
+                    self.unjournaled_stages.clear();
+                    self.staging_problem = Some(error);
+                }
+            }
+        }
         if let Some(history) = report.history {
             match history {
                 Ok((history, problems)) => {
@@ -2208,11 +2273,23 @@ impl MameReconstructionPanel {
     // Rendering.
     // -----------------------------------------------------------------------
 
+    fn sync_history_root(&mut self) {
+        if self.history_root != self.root {
+            self.history_root = self.root.clone();
+            self.history_requested = false;
+            self.unjournaled_stages.clear();
+            self.staging_problem = None;
+        }
+    }
+
     pub(super) fn show(&mut self, ui: &mut egui::Ui) {
         self.poll();
+        self.sync_history_root();
         if !self.history_requested && !self.is_busy() {
             self.history_requested = true;
-            self.start(MameRequest::LoadHistory);
+            self.start(MameRequest::LoadHistory {
+                root: self.root.clone(),
+            });
         }
         if self.is_busy() {
             ui.ctx().request_repaint_after(Duration::from_millis(100));
@@ -2222,6 +2299,9 @@ impl MameReconstructionPanel {
         self.show_notice(ui);
         ui.add_space(theme::SPACE_SM);
         self.show_selection(ui);
+        // A folder picked during this frame must not inherit the previous
+        // folder's orphan status even for one rendered frame.
+        self.sync_history_root();
         if let Some(game) = &self.standalone
             && self.inputs().as_ref() == Some(&game.inputs)
         {
@@ -2581,11 +2661,25 @@ impl MameReconstructionPanel {
     }
 
     fn show_history(&mut self, ui: &mut egui::Ui) {
-        if self.history.is_empty() && self.history_problems.is_empty() {
+        if self.history.is_empty()
+            && self.history_problems.is_empty()
+            && self.unjournaled_stages.is_empty()
+            && self.staging_problem.is_none()
+        {
             return;
         }
         ui.separator();
         ui.heading("5. Results and Undo");
+        if let Some(error) = &self.staging_problem {
+            ui.colored_label(theme::warning(ui), format!("Staging inventory could not be read: {error}. Recovery status is unknown; inspect the staging folder before publishing."));
+        }
+        for item in &self.unjournaled_stages {
+            ui.colored_label(
+                theme::warning(ui),
+                format!("Retained staged file: {}", item.path.display()),
+            );
+            ui.label(&item.retention_reason);
+        }
         for problem in &self.history_problems {
             ui.colored_label(
                 theme::warning(ui),
