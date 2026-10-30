@@ -93,6 +93,7 @@ sha1 = "0.11.0"
 md-5 = "0.11.0"
 time = { version = "0.3.53", features = ["local-offset"] }
 tempfile = "3"
+libc = "0.2"
 zip = { version = "9.0", default-features = false, features = ["deflate"] }
 
 [dev-dependencies]

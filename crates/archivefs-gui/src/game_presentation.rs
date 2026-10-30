@@ -52,6 +52,7 @@ pub(crate) fn platform_source_label(source: Option<&str>) -> &'static str {
         Some(CUSTOM_FOLDER_ALIAS_SOURCE) => "Custom folder alias",
         Some("source_assignment") => "Source assignment",
         Some("header_identity") => "Format/header identity",
+        Some("archive_member_structure") => "Archive member structure",
         Some("folder_alias") => "Built-in folder alias",
         Some("heuristic-path-detector") => "Filename/path heuristic",
         Some(_) => "Automatic detection",
@@ -75,6 +76,7 @@ pub(crate) fn platform_confidence_label(details: &PlatformProvenanceDetails) -> 
     match details.source.as_deref() {
         Some(MANUAL_PLATFORM_SOURCE)
         | Some("header_identity")
+        | Some("archive_member_structure")
         | Some(VERIFIED_DAT_PLATFORM_SOURCE)
         | Some(DAT_ROMM_AGREEMENT_SOURCE) => DetectionConfidence::Confirmed.label(),
         Some(ROMM_PLATFORM_SOURCE) => "High",
@@ -185,4 +187,18 @@ pub(crate) fn platform_provenance_lines(
     }
 
     lines
+}
+
+#[cfg(test)]
+mod archive_member_tests {
+    use super::*;
+
+    #[test]
+    fn blue_names_archive_structure_and_keeps_shared_format_uncertain() {
+        assert_eq!(
+            platform_source_label(Some("archive_member_structure")),
+            "Archive member structure"
+        );
+        assert!(UNKNOWN_PLATFORM_EXPLANATION.contains("shared or unsupported format"));
+    }
 }
