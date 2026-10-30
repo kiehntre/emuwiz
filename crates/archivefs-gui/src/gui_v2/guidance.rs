@@ -154,6 +154,9 @@ pub(super) fn show_tip(ui: &mut egui::Ui, selected: &GuidanceTip) {
         .inner_margin(egui::Margin::symmetric(10, 6))
         .show(ui, |ui| {
             ui.horizontal_wrapped(|ui| {
+                // Without this the first row keeps a button's height, leaving
+                // a wider gap under it than between the other wrapped rows.
+                ui.spacing_mut().interact_size.y = 0.0;
                 ui.strong(format!("Mr Wiz · {}", selected.category.label()));
                 ui.label(&selected.message);
             });

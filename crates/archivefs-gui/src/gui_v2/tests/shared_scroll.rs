@@ -316,3 +316,128 @@ fn check_home_and_end_reveal_actual_viewport_content() {
         }
     }
 }
+
+const COMPACT: [f32; 2] = [1024., 600.];
+const MODS_PURPOSE: &str =
+    "Find improvements for a game and preview every change before installing.";
+
+/// One notch moves a little per settled frame, so a real scroll is several.
+fn wheel_down(context: &egui::Context, app: &mut App, size: [f32; 2]) -> egui::FullOutput {
+    let mut output = wheel(context, app, size, -120.);
+    for _ in 0..12 {
+        output = wheel(context, app, size, -120.);
+    }
+    output
+}
+
+#[test]
+fn blue_page_introductions_scroll_away_but_the_location_stays() {
+    let context = egui::Context::default();
+    let mut app = ready(&context, Section::Mods, true, 1.);
+    let purpose = MODS_PURPOSE;
+    let top = settled(&context, &mut app, COMPACT);
+    assert!(visible(&top, COMPACT, purpose).is_some());
+    let scrolled = wheel_down(&context, &mut app, COMPACT);
+    assert!(
+        visible(&scrolled, COMPACT, purpose).is_none(),
+        "the introduction must leave the viewport at 1024x600"
+    );
+    assert!(visible(&scrolled, COMPACT, "Mods & Cheats").is_some());
+}
+
+#[test]
+fn a_notice_stays_in_view_while_the_page_is_scrolled() {
+    let context = egui::Context::default();
+    let mut app = ready(&context, Section::Mods, true, 1.);
+    settled(&context, &mut app, COMPACT);
+    wheel_down(&context, &mut app, COMPACT);
+    app.notice = Some(super::Notice {
+        message: "Pinned notice".into(),
+        technical: String::new(),
+    });
+    let output = settled(&context, &mut app, COMPACT);
+    assert!(visible(&output, COMPACT, "Pinned notice").is_some());
+}
+
+#[test]
+fn a_new_visit_starts_at_the_top_and_back_keeps_the_place() {
+    let context = egui::Context::default();
+    let mut app = ready(&context, Section::Mods, true, 1.);
+    let purpose = MODS_PURPOSE;
+    settled(&context, &mut app, COMPACT);
+    wheel_down(&context, &mut app, COMPACT);
+    app.go(Route::Section(Section::Settings));
+    settled(&context, &mut app, COMPACT);
+    app.back();
+    let returned = settled(&context, &mut app, COMPACT);
+    assert!(
+        visible(&returned, COMPACT, purpose).is_none(),
+        "Back returns to the earlier position"
+    );
+    app.go(Route::Section(Section::Settings));
+    settled(&context, &mut app, COMPACT);
+    app.go(Route::Section(Section::Mods));
+    let revisited = settled(&context, &mut app, COMPACT);
+    assert!(visible(&revisited, COMPACT, purpose).is_some());
+}
+
+#[test]
+fn reopening_all_tools_starts_at_the_top() {
+    let context = egui::Context::default();
+    let mut app = ready(&context, Section::Mods, true, 1.);
+    app.open_all_tools();
+    let top = settled(&context, &mut app, COMPACT);
+    let purpose = super::all_tools::PURPOSE;
+    assert!(visible(&top, COMPACT, purpose).is_some());
+    let scrolled = wheel_down(&context, &mut app, COMPACT);
+    assert!(visible(&scrolled, COMPACT, purpose).is_none());
+    app.simple.all_tools = false;
+    settled(&context, &mut app, COMPACT);
+    app.open_all_tools();
+    let reopened = settled(&context, &mut app, COMPACT);
+    assert!(visible(&reopened, COMPACT, purpose).is_some());
+}
+
+#[test]
+fn romm_failures_stay_on_their_page_and_other_jobs_keep_the_notice() {
+    let context = egui::Context::default();
+    let mut app = ready(&context, Section::Mods, true, 1.);
+    let romm = app.activity.queue(
+        "Previewing RomM import",
+        Route::Section(Section::Romm),
+        false,
+    );
+    let scan = app
+        .activity
+        .queue("Scanning", Route::Section(Section::Games), false);
+    assert!(app.failure_stays_on_its_page(romm));
+    assert!(!app.failure_stays_on_its_page(scan));
+}
+
+#[test]
+fn mr_wiz_stays_quiet_where_its_tip_does_not_apply() {
+    let context = egui::Context::default();
+    let mut app = ready(&context, Section::Mods, true, 1.);
+    assert!(app.guidance_context(&Route::MameWorkflow).is_none());
+    let mods = Route::Section(Section::Mods);
+    assert!(app.guidance_context(&mods).is_none());
+    app.mods.select_activation();
+    assert!(app.guidance_context(&mods).is_some());
+    // Pages with their own tip keep it.
+    assert!(
+        app.guidance_context(&Route::Section(Section::Sources))
+            .is_some()
+    );
+}
+
+#[test]
+fn mame_actions_explain_what_they_are_waiting_for() {
+    use super::mame_reconstruction::selection_blocker;
+    assert!(selection_blocker(false, true).unwrap().contains("folder"));
+    assert!(
+        selection_blocker(true, false)
+            .unwrap()
+            .contains("catalogue")
+    );
+    assert_eq!(selection_blocker(true, true), None);
+}
