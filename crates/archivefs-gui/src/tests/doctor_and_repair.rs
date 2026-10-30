@@ -2781,6 +2781,46 @@ fn choosing_an_unusable_core_folder_is_reported_and_never_persisted() {
 }
 
 #[test]
+fn choosing_a_usable_core_folder_only_previews_a_change() {
+    let mut app = emulator_setup_app_ready();
+    let home = tempfile::tempdir().unwrap();
+    let folder = home.path().join("cores");
+    std::fs::create_dir(&folder).unwrap();
+
+    app.apply_picked_retroarch_core_folder(folder.clone(), egui::Context::default());
+
+    assert!(
+        app.emulator_readiness
+            .retroarch_core_directory_override
+            .is_none()
+    );
+    assert_eq!(
+        app.emulator_readiness.retroarch_core_folder_preview,
+        Some(folder)
+    );
+    let context = egui::Context::default();
+    let output = context.run(
+        egui::RawInput {
+            screen_rect: Some(egui::Rect::from_min_size(
+                egui::Pos2::ZERO,
+                egui::vec2(1280.0, 1200.0),
+            )),
+            ..Default::default()
+        },
+        |context| {
+            egui::CentralPanel::default().show(context, |ui| {
+                app.show_retroarch_core_folder_card(ui, context, false);
+            });
+        },
+    );
+    assert!(rendered_text_contains(
+        &output,
+        "Review RetroArch setup change"
+    ));
+    assert!(rendered_text_contains(&output, "Apply this setup change"));
+}
+
+#[test]
 fn check_again_routes_through_the_one_existing_profile_scan_lane() {
     let mut app = emulator_setup_app_ready();
     // The card's "Check again" action calls exactly this - no second

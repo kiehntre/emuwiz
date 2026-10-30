@@ -344,7 +344,12 @@ impl StagedOutput {
                         name,
                         created: (m.dev(), m.ino()),
                     };
-                    event("created", &value.path)?;
+                    event("created", &value.path).map_err(|error| {
+                        format!(
+                            "{error}; staged file {} may remain after interruption; inspect Recovery before retrying; nothing was published",
+                            value.path.display()
+                        )
+                    })?;
                     value.require_owned()?;
                     return Ok(value);
                 }
@@ -584,41 +589,37 @@ impl PublicationGuard {
                     path.display()
                 ));
             }
-            let actual = capture_identity(&path).map_err(|e| format!("leftover {} cannot be verified: {e}; inspect Recovery, do not move an Undo backup manually", path.display()))?;
-            let recorded = transactions.iter().any(|t| t.entries.iter().any(|e| {
-                (e.source_path == path || e.destination_path == path) &&
-                (identity_matches(&e.identity, &actual) || matches!(&e.operation, TransactionOperation::ReplaceExisting { original_identity, .. } if identity_matches(original_identity, &actual)))
-            }));
-            if recorded {
+            let references = transactions
+                .iter()
+                .flat_map(|t| &t.entries)
+                .filter(|e| e.source_path == path || e.destination_path == path)
+                .collect::<Vec<_>>();
+            if references.is_empty() {
+                if path == legacy {
+                    return Err(format!(
+                        "unrecorded legacy leftover {} was left untouched; inspect Recovery before publishing; do not move an Undo backup manually",
+                        path.display()
+                    ));
+                }
+                // Reservation is durable before a publication move. With no
+                // journal reference this random-name stage cannot be an Undo
+                // source. Retain it without opening or adopting it, and use a
+                // fresh exclusive name for the separately approved attempt.
                 continue;
             }
-            // An unpublished attempt can be retained without a transaction.
-            // Its complete diagnostic must bind the exact current object;
-            // filenames and content matching alone never authorize adoption.
-            let mut noted = false;
-            if path != legacy {
-                for n in 0..64 {
-                    let leaf = format!("{name}.note-{n}.json");
-                    let Ok(v) = self.staging.read_json(&leaf) else {
-                        continue;
-                    };
-                    if v.get("staged_path").and_then(|v| v.as_str()) != path.to_str() {
-                        continue;
-                    }
-                    if let Some(i) = v
-                        .get("identity")
-                        .and_then(|v| serde_json::from_value::<ObjectIdentity>(v.clone()).ok())
-                    {
-                        if identity_matches(&i, &actual) {
-                            noted = true;
-                            break;
-                        }
-                    }
-                }
-            }
-            if !noted {
+            if references.len() != 1 {
                 return Err(format!(
-                    "unrecorded or changed leftover {} was left untouched; inspect Recovery and its diagnostics before publishing; do not move an Undo backup manually",
+                    "leftover {} has ambiguous journal ownership; inspect Recovery before publishing; no file was moved",
+                    path.display()
+                ));
+            }
+            let actual = capture_identity(&path).map_err(|e| format!("leftover {} cannot be verified: {e}; inspect Recovery, do not move an Undo backup manually", path.display()))?;
+            let e = references[0];
+            if !identity_matches(&e.identity, &actual)
+                && !matches!(&e.operation, TransactionOperation::ReplaceExisting { original_identity, .. } if identity_matches(original_identity, &actual))
+            {
+                return Err(format!(
+                    "leftover {} has changed journal ownership; inspect Recovery before publishing; no file was moved",
                     path.display()
                 ));
             }
