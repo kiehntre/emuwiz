@@ -116,8 +116,32 @@ pub fn inventory(staging: &Path, journals: &Path) -> Result<Vec<StagingItem>, St
         items.sort_by(|a, b| a.path.cmp(&b.path));
         return Ok(items);
     }
+    if Directory::existing(staging)?.is_none() {
+        return inventory_without_staging(staging, journals);
+    }
     let lock = StagingLock::acquire(staging, journals)?;
     inventory_locked(&lock)
+}
+/// A never-rebuilt folder has no staging directory: that is an empty inventory,
+/// unless a journal still references a path inside it, which stays refused.
+fn inventory_without_staging(staging: &Path, journals: &Path) -> Result<Vec<StagingItem>, String> {
+    if staging == journals {
+        return Err("staging and journals must be separate".into());
+    }
+    let Some(journals) = Directory::existing(journals)? else {
+        return Ok(Vec::new());
+    };
+    journals.lock()?;
+    let referenced = journals.transactions()?.iter().any(|t| {
+        t.entries
+            .iter()
+            .any(|e| e.source_path.parent() == Some(staging))
+    });
+    journals.require_binding()?;
+    if referenced {
+        return Err("staging directory does not exist but a recovery journal references it".into());
+    }
+    Ok(Vec::new())
 }
 fn inventory_locked(lock: &StagingLock) -> Result<Vec<StagingItem>, String> {
     let txs = lock.transactions()?;

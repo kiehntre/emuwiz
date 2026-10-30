@@ -2041,3 +2041,25 @@ fn the_reserved_journal_marker_survives_the_staging_failure_suffix() {
         None
     );
 }
+
+#[test]
+fn staging_inventory_treats_never_rebuilt_folder_as_empty() {
+    let lab = Lab::new();
+    std::fs::create_dir_all(lab.journal()).unwrap();
+    assert!(!lab.stage_root().exists());
+    let items = super::staging_lifecycle::inventory(&lab.stage_root(), &lab.journal()).unwrap();
+    assert!(items.is_empty());
+    assert!(
+        !lab.stage_root().exists(),
+        "inventory must not create staging"
+    );
+}
+
+#[test]
+fn staging_inventory_still_refuses_missing_stage_referenced_by_journal() {
+    let lab = Lab::new();
+    let plan = repair_plan(&lab);
+    apply_staged_reconstruction_output(&plan, &lab.stage_root(), &lab.journal()).unwrap();
+    std::fs::remove_dir_all(lab.stage_root()).unwrap();
+    assert!(super::staging_lifecycle::inventory(&lab.stage_root(), &lab.journal()).is_err());
+}
