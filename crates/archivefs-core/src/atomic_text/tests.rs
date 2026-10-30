@@ -701,3 +701,26 @@ fn exclusive_publication_checks_reviewed_parent_and_preserves_existing_file() {
     assert_eq!(fs::read_to_string(&target).unwrap(), "existing");
     assert!(stages(root.path()).is_empty());
 }
+
+#[test]
+fn reviewed_writes_refuse_a_parent_symlink_even_with_matching_target_identity() {
+    let root = fixture();
+    let outside = root.path().join("outside");
+    fs::create_dir(&outside).unwrap();
+    let linked = root.path().join("linked");
+    symlink(&outside, &linked).unwrap();
+    let metadata = fs::metadata(&outside).unwrap();
+    let identity = (metadata.dev(), metadata.ino());
+
+    let imported = linked.join("game.pok");
+    assert!(super::create_new(&imported, "trainer", identity).is_err());
+    assert!(!outside.join("game.pok").exists());
+
+    let profile = linked.join("choice.json");
+    fs::write(outside.join("choice.json"), "original profile").unwrap();
+    assert!(super::write_in_existing_parent(&profile, "replacement", identity).is_err());
+    assert_eq!(
+        fs::read_to_string(outside.join("choice.json")).unwrap(),
+        "original profile"
+    );
+}

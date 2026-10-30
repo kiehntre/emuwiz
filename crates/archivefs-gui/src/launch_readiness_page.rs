@@ -49,7 +49,7 @@ pub(crate) mod cemu;
 mod cemu_stop;
 mod classic_pokes;
 pub(crate) mod controller_readiness;
-mod desmume;
+pub(crate) mod desmume;
 pub(crate) mod dosbox;
 #[path = "launch_readiness_page/flycast.rs"]
 pub(crate) mod flycast;
@@ -59,6 +59,7 @@ mod mgba;
 mod pcsx2_cheats;
 mod retroarch_cheat_sets;
 mod retroarch_cheats;
+mod retroarch_setup;
 mod sameboy;
 pub(crate) mod saturn_core;
 mod scummvm_profile;
@@ -3275,6 +3276,13 @@ pub(crate) fn show_launch_readiness_panel(
         LaunchReadinessInput::RetroArchNotScanned => {
             widgets::card(ui, |ui| {
                 ui.label("Scan RetroArch profiles to check installed cores.");
+                if ui.button("Open Emulator Setup").clicked() {
+                    action = Some(LaunchReadinessPageAction::Navigate(
+                        crate::navigation::NavClick::View(
+                            crate::navigation::MainView::EmulatorSetup,
+                        ),
+                    ));
+                }
             });
         }
         LaunchReadinessInput::IdentityUnknown => {
@@ -3402,6 +3410,11 @@ pub(crate) fn show_launch_readiness_panel(
             let dos = plan.platform_id.as_deref() == Some(dosbox::DOS_PLATFORM_ID);
             if dos {
                 dosbox::show(ui, &preview_identity(plan), standalone_launch_state);
+            }
+            if retroarch_setup::show(ui, plan, retroarch.as_ref()) {
+                action = Some(LaunchReadinessPageAction::Navigate(
+                    crate::navigation::NavClick::View(crate::navigation::MainView::EmulatorSetup),
+                ));
             }
             if !(dos && plan.candidates.is_empty())
                 && show_plan(
