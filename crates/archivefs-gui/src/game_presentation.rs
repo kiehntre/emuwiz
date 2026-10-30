@@ -60,20 +60,6 @@ pub(crate) fn platform_source_label(source: Option<&str>) -> &'static str {
     }
 }
 
-#[cfg(test)]
-mod archive_member_tests {
-    use super::*;
-
-    #[test]
-    fn blue_names_archive_structure_and_keeps_shared_format_uncertain() {
-        assert_eq!(
-            platform_source_label(Some("archive_member_structure")),
-            "Archive member structure"
-        );
-        assert!(UNKNOWN_PLATFORM_EXPLANATION.contains("shared or unsupported format"));
-    }
-}
-
 /// The confidence a stored platform source implies, using the same four-level
 /// scale as [`archivefs_core::platform::DetectionConfidence`].
 ///
@@ -201,4 +187,18 @@ pub(crate) fn platform_provenance_lines(
     }
 
     lines
+}
+
+#[cfg(test)]
+mod archive_member_tests {
+    use super::*;
+
+    #[test]
+    fn blue_names_archive_structure_and_keeps_shared_format_uncertain() {
+        assert_eq!(
+            platform_source_label(Some("archive_member_structure")),
+            "Archive member structure"
+        );
+        assert!(UNKNOWN_PLATFORM_EXPLANATION.contains("shared or unsupported format"));
+    }
 }

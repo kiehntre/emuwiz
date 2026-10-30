@@ -10499,6 +10499,7 @@ fn assign_platform_for_scanned_archive(
     } else if let Some(platform) = &custom_alias_platform {
         (Some(platform.clone()), CUSTOM_FOLDER_ALIAS_SOURCE)
     } else if stronger_folder {
+        database.retire_stale_custom_alias_assignment(archive_id)?;
         (
             archive.identity.platform.clone(),
             PlatformProvenance::FolderAlias.as_source_str(),

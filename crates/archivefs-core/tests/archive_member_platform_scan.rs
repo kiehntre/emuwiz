@@ -65,7 +65,7 @@ fn validated_members_assign_platform_without_game_or_dat_identity() {
             &[(member_name.as_str(), bytes)],
         );
     }
-    let mut db = Database::open_or_create(&dir.path().join("library.db")).unwrap();
+    let mut db = Database::open_or_create(dir.path().join("library.db")).unwrap();
     scan(&mut db, &source);
     for (name, platform) in [
         ("tape", "ZX Spectrum"),
@@ -105,7 +105,7 @@ fn shared_tzx_and_conflicting_members_remain_unknown() {
             ("two.tzx", samples::zx_tzx()),
         ],
     );
-    let mut db = Database::open_or_create(&dir.path().join("library.db")).unwrap();
+    let mut db = Database::open_or_create(dir.path().join("library.db")).unwrap();
     scan(&mut db, &source);
     assert!(row(&db, "shared.zip").platform.is_none());
     assert!(row(&db, "mixed.zip").platform.is_none());
@@ -119,7 +119,7 @@ fn completed_replacement_retires_stale_member_evidence_but_manual_stands() {
     std::fs::create_dir(&source).unwrap();
     let path = source.join("changing.zip");
     zip(&path, &[("one.z80", samples::zx_z80_v1())]);
-    let mut db = Database::open_or_create(&dir.path().join("library.db")).unwrap();
+    let mut db = Database::open_or_create(dir.path().join("library.db")).unwrap();
     scan(&mut db, &source);
     assert_eq!(
         row(&db, "changing.zip").platform.as_deref(),
@@ -160,7 +160,7 @@ fn interrupted_member_inspection_does_not_withdraw_old_assignment() {
     std::fs::create_dir(&source).unwrap();
     let path = source.join("changing.zip");
     zip(&path, &[("one.z80", samples::zx_z80_v1())]);
-    let mut db = Database::open_or_create(&dir.path().join("library.db")).unwrap();
+    let mut db = Database::open_or_create(dir.path().join("library.db")).unwrap();
     scan(&mut db, &source);
     zip(&path, &[("too-large.z80", vec![0; 8 * 1024 * 1024 + 1])]);
     scan(&mut db, &source);
@@ -185,7 +185,7 @@ fn folder_and_verified_dat_assignments_outweigh_archive_members() {
         &source.join("dat.zip"),
         &[("snap.z80", samples::zx_z80_v1())],
     );
-    let mut db = Database::open_or_create(&dir.path().join("library.db")).unwrap();
+    let mut db = Database::open_or_create(dir.path().join("library.db")).unwrap();
     scan(&mut db, &source);
     assert_eq!(row(&db, "folder.zip").platform.as_deref(), Some("Amiga"));
     let dat_id = row(&db, "dat.zip").id;
