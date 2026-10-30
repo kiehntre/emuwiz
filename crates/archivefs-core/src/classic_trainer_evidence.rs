@@ -38,6 +38,38 @@ pub const TRAINER_TARGET_MAX_BYTES: u64 = 4 * 1024;
 /// Extension of the file that pins a trainer to an exact release.
 pub const TRAINER_TARGET_EXTENSION: &str = "pok.target";
 
+/// Publish a locally supplied ZX .pok as an unverified same-name candidate.
+/// The parent-bound exclusive writer refuses replacement and folder rebinding.
+/// This never writes game media or creates a target pin.
+pub fn import_zx_pok_candidate(
+    game_path: &Path,
+    bytes: &[u8],
+    roots: &crate::safe_read::TrustedRoots,
+) -> Result<usize, String> {
+    use crate::patch_manager::validate_destination_root;
+    use std::os::unix::fs::MetadataExt;
+    if bytes.len() as u64 > TRAINER_FILE_MAX_BYTES {
+        return Err("Trainer exceeds 256 KiB.".into());
+    }
+    let text = std::str::from_utf8(bytes).map_err(|_| "Trainer is not UTF-8.")?;
+    let trainers = parse_zx_pok(text).map_err(|e| format!("Invalid Spectrum .pok: {e:?}"))?;
+    let parent = game_path.parent().ok_or("Game has no parent folder.")?;
+    validate_destination_root(parent).map_err(|e| format!("Unsafe game folder: {e}"))?;
+    if !roots.contains_canonical(parent) {
+        return Err("Game folder is outside configured trusted source roots.".into());
+    }
+    let metadata = std::fs::metadata(parent).map_err(|e| e.to_string())?;
+    let target = game_path.with_extension("pok");
+    if target.symlink_metadata().is_ok()
+        || game_path.with_extension("POK").symlink_metadata().is_ok()
+    {
+        return Err("A same-name trainer already exists; import never replaces it.".into());
+    }
+    crate::atomic_text::create_new(&target, text, (metadata.dev(), metadata.ino()))
+        .map_err(|e| e.to_string())?;
+    Ok(trainers.len())
+}
+
 const ALL_EMULATORS: [PokeRuntimeEmulator; 7] = [
     PokeRuntimeEmulator::Fuse,
     PokeRuntimeEmulator::Vice,

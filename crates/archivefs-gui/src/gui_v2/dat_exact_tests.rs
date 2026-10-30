@@ -252,7 +252,7 @@ fn only_a_single_exact_match_verifies_a_game() {
         ("probable.gbc", "Probable match"),
         // The fixture's files have no platform, so "not in this catalogue"
         // is not evidence about them (`negative_dat_result_applies`).
-        ("unlisted.gbc", "Not checked"),
+        ("unlisted.gbc", "Unknown platform"),
     ] {
         let game = library
             .games
@@ -296,7 +296,7 @@ fn a_same_platform_no_match_is_shown_and_another_platforms_is_not() {
     };
     assert_eq!(
         label(&load_library(&fixture.db).unwrap()),
-        Some((false, "No catalogue match"))
+        Some((false, "Platform recognised · Catalogue match unavailable"))
     );
     // Reclassified to another platform: the saved row stays, as history only.
     set_platform("Game Boy Advance");
@@ -306,7 +306,7 @@ fn a_same_platform_no_match_is_shown_and_another_platforms_is_not() {
     );
     assert_eq!(
         label(&load_library(&fixture.db).unwrap()),
-        Some((false, "Not checked"))
+        Some((false, "Platform recognised · Game not yet identified"))
     );
 }
 
@@ -339,7 +339,10 @@ fn corrupt_zip_is_not_checked_in_library_and_has_no_definitive_attention_negativ
         .iter()
         .find(|game| game.title == "broken.zip")
         .unwrap();
-    assert_eq!(broken.identity_summary(), "Not checked");
+    assert_eq!(
+        broken.identity_summary(),
+        "Platform recognised · Game not yet identified"
+    );
     assert!(!broken.identified);
     assert!(broken.dat_exact_label().is_none());
     let unlisted = library
@@ -347,7 +350,10 @@ fn corrupt_zip_is_not_checked_in_library_and_has_no_definitive_attention_negativ
         .iter()
         .find(|game| game.title == "unlisted.gbc")
         .unwrap();
-    assert_eq!(unlisted.identity_summary(), "No catalogue match");
+    assert_eq!(
+        unlisted.identity_summary(),
+        "Platform recognised · Catalogue match unavailable"
+    );
     let db = Database::open_read_only(&fixture.db).unwrap();
     let attention = db.attention_snapshot().unwrap();
     let dat_items: Vec<_> = attention
@@ -386,12 +392,12 @@ fn a_stale_exact_row_does_not_verify_a_game() {
         .unwrap();
     let library = load_library(&fixture.db).unwrap();
     assert!(library.games.iter().all(|game| !game.identified));
-    assert!(
-        library
-            .games
-            .iter()
-            .all(|game| game.identity_summary() == "Not checked")
-    );
+    assert!(library.games.iter().all(|game| game.identity_summary()
+        == if game.platform == super::library::UNKNOWN_PLATFORM {
+            "Unknown platform"
+        } else {
+            "Platform recognised · Game not yet identified"
+        }));
 }
 
 #[test]
@@ -463,7 +469,7 @@ fn saved_dat_status_is_visible_even_with_scan_identity_reports() {
         (
             "unlisted.gbc",
             archivefs_core::LibraryDatState::NoMatch,
-            "No catalogue match",
+            "Platform recognised · Catalogue match unavailable",
         ),
         (
             "ambiguous.gbc",
@@ -477,10 +483,18 @@ fn saved_dat_status_is_visible_even_with_scan_identity_reports() {
             .find(|g| g.archive.relative_path == Path::new(name))
             .unwrap()
             .clone();
+        game.platform = "Game Boy Color".into();
         game.archive.identity_report = Some(report.clone());
         game.dat_state = Some(state);
         assert_eq!(game.identity_summary(), label);
-        assert_eq!(game.dat_identity_summary(), label);
+        assert_eq!(
+            game.dat_identity_summary(),
+            if state == archivefs_core::LibraryDatState::NoMatch {
+                "No catalogue match"
+            } else {
+                label
+            }
+        );
     }
     let mut unchecked = library.games[0].clone();
     unchecked.dat_exact = None;
