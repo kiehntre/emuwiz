@@ -192,14 +192,44 @@ fn two_and_five_disc_roundtrip_publish_with_receipt() {
         let plan =
             plan_ps1_pbp_export(&f.db, &f.sources, &f.set, &destination, &writer, &cancel).unwrap();
         assert_eq!(plan.discs.len(), count);
-        let result = execute_ps1_pbp_export(
+        assert_eq!(
+            plan.discs()
+                .iter()
+                .map(PbpDiscProof::ordinal)
+                .collect::<Vec<_>>(),
+            (1..=count as u16).collect::<Vec<_>>()
+        );
+        assert!(plan.discs().iter().all(|disc| disc.cue().is_file()
+            && disc.bin().is_file()
+            && !disc.serial().is_empty()
+            && !disc.dat_entry().is_empty()));
+        let progress = std::sync::Mutex::new(Vec::new());
+        let result = execute_ps1_pbp_export_with_progress(
             &f.db,
             &f.sources,
             &plan,
             &f.root.path().join("journal"),
             &cancel,
+            &|step| progress.lock().unwrap().push(step),
         )
         .unwrap();
+        let steps = progress.into_inner().unwrap();
+        assert_eq!(steps.first(), Some(&PbpExportProgress::Rechecking));
+        assert_eq!(steps.last(), Some(&PbpExportProgress::Publishing));
+        assert_eq!(
+            steps
+                .iter()
+                .filter(|step| matches!(step, PbpExportProgress::Copying { .. }))
+                .count(),
+            count
+        );
+        assert_eq!(
+            steps
+                .iter()
+                .filter(|step| matches!(step, PbpExportProgress::Comparing { .. }))
+                .count(),
+            count
+        );
         assert!(destination.is_file());
         assert!(plan.receipt_path.is_file());
         assert_eq!(result.receipt.discs.len(), count);
@@ -231,6 +261,29 @@ fn source_replacement_and_destination_collision_refuse() {
         .is_err()
     );
     assert!(!target_one.exists());
+    let changed_cue = fixture(2);
+    let cue_target = destination(&changed_cue);
+    let cue_plan = plan_ps1_pbp_export(
+        &changed_cue.db,
+        &changed_cue.sources,
+        &changed_cue.set,
+        &cue_target,
+        &writer,
+        &cancel,
+    )
+    .unwrap();
+    fs::write(&changed_cue.cues[0], b"changed companion").unwrap();
+    assert!(
+        execute_ps1_pbp_export(
+            &changed_cue.db,
+            &changed_cue.sources,
+            &cue_plan,
+            &changed_cue.root.path().join("journal"),
+            &cancel
+        )
+        .is_err()
+    );
+    assert!(!cue_target.exists());
     let fresh = fixture(2);
     let target = destination(&fresh);
     fs::write(&target, b"foreign").unwrap();
@@ -265,6 +318,33 @@ fn six_discs_and_cancellation_refuse() {
         plan_ps1_pbp_export(&two.db, &two.sources, &two.set, &target, &writer, &cancel).is_err()
     );
     assert!(!target.exists());
+
+    let active = fixture(2);
+    let active_target = destination(&active);
+    let active_cancel = AtomicBool::new(false);
+    let active_plan = plan_ps1_pbp_export(
+        &active.db,
+        &active.sources,
+        &active.set,
+        &active_target,
+        &writer,
+        &active_cancel,
+    )
+    .unwrap();
+    let stopped = execute_ps1_pbp_export_with_progress(
+        &active.db,
+        &active.sources,
+        &active_plan,
+        &active.root.path().join("journal"),
+        &active_cancel,
+        &|step| {
+            if step == PbpExportProgress::Packaging {
+                active_cancel.store(true, Ordering::Relaxed);
+            }
+        },
+    );
+    assert!(stopped.is_err());
+    assert!(!active_target.exists());
 }
 
 #[test]
@@ -329,6 +409,7 @@ fn writer_failure_and_unpinned_writer_refuse() {
     let stage = tempfile::tempdir().unwrap();
     assert!(run_writer(Path::new("/bin/false"), &[], stage.path(), &cancel).is_err());
     assert!(writer_check(Path::new("/bin/false"), &cancel).is_err());
+    assert!(writer_check(&stage.path().join("missing-psxpackager"), &cancel).is_err());
 }
 
 #[test]
@@ -376,6 +457,13 @@ fn interrupted_publication_recovers_without_touching_sources() {
     let failed = execute_ps1_pbp_export(&f.db, &f.sources, &plan, &journal, &cancel);
     crate::dat::rename_apply::executor::set_test_before_rename_hook(None);
     assert!(failed.is_err());
+    assert!(matches!(
+        failed
+            .as_ref()
+            .err()
+            .and_then(|error| error.recovery.as_ref()),
+        Some(PbpRecoveryStatus::NeedsReview { .. })
+    ));
     // The move can complete before the sabotaged journal checkpoint. It is
     // unresolved output until the saved journal is recovered below.
     assert!(target.exists());
