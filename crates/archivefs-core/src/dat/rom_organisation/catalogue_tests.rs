@@ -727,3 +727,23 @@ fn history_selection_of_a_partial_undo_stays_actionable_and_a_finished_one_is_ex
     let reason = undo_blocker(&finished).expect("nothing left to undo");
     assert!(reason.contains("already undone"), "{reason}");
 }
+
+#[test]
+fn undo_blocker_keeps_undo_for_a_transaction_that_only_created_a_directory() {
+    let mut f = Fixture::new(OrganisationMode::RenameInPlace);
+    f.apply().unwrap();
+    f.reload();
+    let mut only_directory = f.tx.clone();
+    only_directory.state = TransactionState::ApplyFailed;
+    for entry in &mut only_directory.entries {
+        entry.state = EntryState::Skipped;
+    }
+    assert!(undo_blocker(&only_directory).is_some());
+    only_directory
+        .created_directories
+        .push(f.plan.master_root.join("PSP"));
+    assert!(
+        undo_blocker(&only_directory).is_none(),
+        "Undo also removes the empty platform directory it created"
+    );
+}

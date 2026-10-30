@@ -96,7 +96,9 @@ pub fn open_history_transaction_for_undo(
 /// Why Undo would be misleading for `transaction`, or `None` when it still
 /// has something to reverse or reconcile.
 pub fn undo_blocker(transaction: &RenameTransaction) -> Option<String> {
+    // Undo also removes empty platform directories this transaction created.
     let actionable = transaction.applied_count() > 0
+        || !transaction.created_directories.is_empty()
         || transaction
             .entries
             .iter()

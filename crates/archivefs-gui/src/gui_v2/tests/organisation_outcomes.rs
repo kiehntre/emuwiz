@@ -547,6 +547,17 @@ fn a_tampered_journal_quarantines_undo_for_the_session_without_any_write() {
         TransactionState::RollbackFailed
     );
 
+    // History cannot re-enable it by selecting its own id, even though the
+    // history copy still equals what was last sealed.
+    app.canonical_organisation_history
+        .push(marked(transaction.clone()));
+    app.select_organisation_transaction(&transaction.transaction_id);
+    assert!(app.canonical_organisation.applied().is_none());
+    assert!(app.canonical_organisation.quarantined_undo().is_some());
+    let refusal = app.canonical_organisation.error().unwrap();
+    assert!(refusal.contains("not opened for Undo again"), "{refusal}");
+    assert_eq!(fs::read(&path).unwrap(), tampered);
+
     // 5-6. Undo again in the same session: refused, with no mutation at all.
     let again = undo(&mut app);
     assert_eq!(app.activity.jobs[&again].phase, Phase::Failed);

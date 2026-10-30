@@ -732,11 +732,11 @@ impl RomOrganisationPageState {
                 held.transaction_id
             )
         };
-        if let Some(quarantined) = &self.quarantined_undo
-            && quarantined.transaction_id != id
-        {
+        // A quarantined Undo is never retried as an ordinary Undo this session,
+        // not even by selecting its own id.
+        if let Some(quarantined) = &self.quarantined_undo {
             self.error = Some(format!(
-                "Transaction {} was set aside because its journal changed, and it holds this page. Resolve it first, then open {id} from History. Nothing was changed.",
+                "Transaction {} was set aside because its journal changed, and it holds this page. Review its journal in History; it is not opened for Undo again this session ({id} was not opened). Nothing was changed.",
                 quarantined.transaction_id
             ));
             return;
