@@ -225,8 +225,10 @@ pub fn inspect_library_output_ownership(
         .into_iter()
         .filter(|(path, _expected_target)| !desired.contains(path))
         .filter_map(|(path, (expected_target, proof))| {
+            // A stale link whose original later moved reads as a broken symlink;
+            // it is still the journal-proved object and must stay cleanable.
             if !crate::dat::rename_apply::identity::capture_identity(&path).is_ok_and(|actual| {
-                crate::dat::rename_apply::identity::identity_matches(&proof, &actual)
+                crate::dat::rename_apply::identity::link_identity_matches(&proof, &actual)
             }) {
                 return None;
             }
@@ -547,6 +549,29 @@ mod tests {
         fs::remove_file(&plan.operations[0].destination_path).unwrap();
         let missing = inspect_library_output_ownership(&current, &journal_dir);
         assert!(missing.stale_owned_entries.is_empty());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn stale_owned_link_whose_original_moved_is_still_reported_but_foreign_links_are_not() {
+        let (temp, plan, journal_dir) = applied_journal_fixture();
+        let mut current = plan.clone();
+        current.operations.clear();
+        current.elected_games.clear();
+        let link = plan.operations[0].destination_path.clone();
+        let original = plan.operations[0].source_path.clone();
+        let moved = temp.path().join("moved-original");
+        fs::rename(&original, &moved).unwrap();
+        assert!(link.is_symlink() && !link.exists());
+        let ownership = inspect_library_output_ownership(&current, &journal_dir);
+        assert_eq!(ownership.stale_owned_entries, vec![link.clone()]);
+        assert_eq!(fs::read(&moved).unwrap(), b"source");
+
+        // A foreign replacement with the same text is a different inode: not owned.
+        fs::remove_file(&link).unwrap();
+        std::os::unix::fs::symlink(&original, &link).unwrap();
+        let foreign = inspect_library_output_ownership(&current, &journal_dir);
+        assert!(foreign.stale_owned_entries.is_empty());
     }
 
     #[test]
