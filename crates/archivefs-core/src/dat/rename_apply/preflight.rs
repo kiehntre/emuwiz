@@ -14,7 +14,7 @@ use std::path::{Component, Path};
 use crate::safe_read::TrustedRoots;
 
 use super::identity::{capture_identity, identity_matches};
-use super::model::{EntryState, ObjectKind, TransactionEntry, TransactionOperation};
+use super::model::{EntryState, TransactionEntry, TransactionOperation};
 
 /// A named reason a preflight check failed.
 #[derive(Debug, Clone, PartialEq, Eq)]
