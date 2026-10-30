@@ -24,7 +24,10 @@ fn z80_v1_uncompressed() -> Vec<u8> {
 
 fn z80_v1_compressed() -> Vec<u8> {
     let mut file = z80_v1_header(true).to_vec();
-    file.extend_from_slice(&[0x12, 0x34, 0x56]); // arbitrary "compressed" body
+    for _ in 0..192 {
+        file.extend_from_slice(&[0xed, 0xed, 255, 0]);
+    }
+    file.extend_from_slice(&[0xed, 0xed, 192, 0]);
     file.extend_from_slice(&[0x00, 0xED, 0xED, 0x00]); // end marker
     file
 }
@@ -72,6 +75,12 @@ fn z80_v1_compressed_needs_the_end_marker() {
     broken[last] = 0x01; // corrupt the 00 ED ED 00 tail
     assert!(matches!(
         parse_z80_snapshot(&broken),
+        Err(SnapshotRefusal::Malformed { .. })
+    ));
+    let mut no_ram = z80_v1_header(true).to_vec();
+    no_ram.extend_from_slice(&Z80_V1_COMPRESSION_TAIL);
+    assert!(matches!(
+        parse_z80_snapshot(&no_ram),
         Err(SnapshotRefusal::Malformed { .. })
     ));
 }

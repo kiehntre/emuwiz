@@ -777,13 +777,7 @@ fn format_specific_evidence(
         "md" | "gen" | "68k" | "32x" => mega_drive_family_evidence(path, trusted, problems),
         "sms" | "gg" => tmr_sega_evidence(path, trusted, problems),
         "adf" => {
-            // The Amiga inspector opens by path (it may follow symlinks on
-            // purpose for launch); at scan time apply the same refusal set
-            // every other signature read uses before handing it the path.
-            if crate::safe_read::open_bounded_read(path, trusted).is_err() {
-                return Vec::new();
-            }
-            let inspection = match crate::amiga_disk::inspect_amiga_floppy(path) {
+            let inspection = match crate::amiga_disk::inspect_amiga_floppy_in_roots(path, trusted) {
                 Ok(inspection) => inspection,
                 Err(crate::amiga_disk::AmigaFloppyError::Container(
                     crate::amiga_disk::DiskError::Io(error),
@@ -793,17 +787,11 @@ fn format_specific_evidence(
                 }
                 Err(_) => return Vec::new(),
             };
-            let Some(filesystem) = inspection.filesystem() else {
-                return Vec::new();
-            };
             vec![DetectionEvidence {
                 source: DetectionSource::Signature,
-                conclusive: true,
+                conclusive: inspection.filesystem().is_some(),
                 platform: "Amiga",
-                detail: format!(
-                    "AmigaDOS boot block and root block validate (DOS\\{} {:?})",
-                    filesystem.dos_type, filesystem.family
-                ),
+                detail: inspection.description(),
             }]
         }
         "z80" | "sna" | "szx" => {
@@ -1287,21 +1275,42 @@ fn structural_format_evidence(
         .and_then(|v| v.to_str())
         .is_some_and(|v| v.eq_ignore_ascii_case("tap"))
     {
-        return crate::oric_media::inspect_oric_file(
+        if let Ok(inspection) = crate::oric_media::inspect_oric_file(
             path,
             trusted,
             &std::sync::atomic::AtomicBool::new(false),
-        )
-        .ok()
-        .map(|inspection| {
-            vec![DetectionEvidence {
+        ) {
+            return vec![DetectionEvidence {
                 source: DetectionSource::Signature,
                 conclusive: true,
                 platform: "Oric",
                 detail: inspection.observation().evidence()[0].detail.clone(),
-            }]
-        })
-        .unwrap_or_default();
+            }];
+        }
+        if let Ok(crate::tape_identity::TapeInspection::ZxSpectrum(tape)) =
+            crate::tape_identity::inspect_tap_file(path, trusted)
+            && tape
+                .blocks
+                .iter()
+                .any(|block| match (&block.kind, &block.header) {
+                    (crate::tape_identity::ZxTapBlockKind::Header, Some(header)) => {
+                        header.file_type <= 3
+                    }
+                    (crate::tape_identity::ZxTapBlockKind::Data, _) => block.length >= 16,
+                    _ => false,
+                })
+        {
+            return vec![DetectionEvidence {
+                source: DetectionSource::Signature,
+                conclusive: true,
+                platform: "ZX Spectrum",
+                detail: format!(
+                    "{} TAP blocks passed length and XOR checksum validation; game identity was not checked",
+                    tape.blocks.len()
+                ),
+            }];
+        }
+        return Vec::new();
     }
 
     use crate::disk_format::{DiskFormatContext, inspect_disk_format};
