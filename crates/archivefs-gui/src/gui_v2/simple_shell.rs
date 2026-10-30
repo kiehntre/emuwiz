@@ -1669,7 +1669,7 @@ fn show_focus_reveal_scroll_inner<R>(
     enter_focus: bool,
     content: impl FnOnce(&mut egui::Ui) -> R,
 ) -> R {
-    let id = ui.make_persistent_id(salt);
+    let id = ui.make_persistent_id(egui::Id::new(salt));
     // A focused text field keeps its own PageUp/Down outside Check, which has
     // only buttons, so existing button focus never blocks paging.
     let paging = match keys {

@@ -441,3 +441,157 @@ fn mame_actions_explain_what_they_are_waiting_for() {
     );
     assert_eq!(selection_blocker(true, true), None);
 }
+
+/// A page tall enough for several presses, read through egui's real state.
+fn page_offsets(
+    show: impl Fn(&mut egui::Ui),
+    salt: impl std::hash::Hash + Copy,
+    keys: &[egui::Key],
+) -> Vec<f32> {
+    let context = egui::Context::default();
+    let run = |events: Vec<egui::Event>| {
+        let mut offset = 0.;
+        let _ = context.run(
+            egui::RawInput {
+                screen_rect: Some(egui::Rect::from_min_size(
+                    egui::Pos2::ZERO,
+                    egui::vec2(800., 400.),
+                )),
+                events,
+                ..Default::default()
+            },
+            |ctx| {
+                egui::CentralPanel::default().show(ctx, |ui| {
+                    let id = ui.make_persistent_id(egui::Id::new(salt));
+                    show(ui);
+                    offset = egui::scroll_area::State::load(ui.ctx(), id)
+                        .unwrap_or_default()
+                        .offset
+                        .y;
+                });
+            },
+        );
+        offset
+    };
+    run(vec![]);
+    run(vec![]);
+    keys.iter()
+        .map(|key| {
+            run([true, false]
+                .into_iter()
+                .map(|pressed| egui::Event::Key {
+                    key: *key,
+                    physical_key: None,
+                    pressed,
+                    repeat: false,
+                    modifiers: egui::Modifiers::NONE,
+                })
+                .collect());
+            run(vec![]);
+            run(vec![])
+        })
+        .collect()
+}
+
+fn tall(ui: &mut egui::Ui) {
+    ui.allocate_space(egui::vec2(100., 5000.));
+}
+
+fn assert_each_press_moves_one_page(offsets: &[f32]) {
+    let [first, second, third, back] = offsets else {
+        panic!("{offsets:?}");
+    };
+    assert!(*first > 0., "{offsets:?}");
+    assert!(second > first && third > second, "{offsets:?}");
+    assert!(
+        (second - back).abs() < 1.,
+        "PageUp moves one page: {offsets:?}"
+    );
+}
+
+#[test]
+fn repeated_paging_moves_a_page_at_a_time_on_the_shared_page_scroller() {
+    use egui::Key::{PageDown, PageUp};
+    let offsets = page_offsets(
+        |ui| {
+            super::simple_shell::show_page_scroll(ui, Section::Mods, false, tall);
+        },
+        ("v2_page_content", Section::Mods),
+        &[PageDown, PageDown, PageDown, PageUp],
+    );
+    assert_each_press_moves_one_page(&offsets);
+}
+
+#[test]
+fn repeated_paging_moves_a_page_at_a_time_on_check_games() {
+    use egui::Key::{PageDown, PageUp};
+    let offsets = page_offsets(
+        |ui| super::pages::check_scroll(ui, None, tall),
+        ("v2_check_scroll", None::<&str>),
+        &[PageDown, PageDown, PageDown, PageUp],
+    );
+    assert_each_press_moves_one_page(&offsets);
+}
+
+/// The pages that lost their inner scroller, through the real shell.
+#[test]
+fn pages_without_an_inner_scroller_page_and_navigate_in_both_views() {
+    for simple in [false, true] {
+        for section in [
+            Section::Setup,
+            Section::Mods,
+            Section::Problems,
+            Section::Build,
+            Section::Duplicates,
+            Section::Activity,
+            Section::Artwork,
+        ] {
+            let context = egui::Context::default();
+            let mut app = ready(&context, section, simple, 1.);
+            let top = settled(&context, &mut app, COMPACT);
+            // Text only: a loading spinner animates between frames.
+            let fingerprint = |output: &egui::FullOutput| {
+                output
+                    .shapes
+                    .iter()
+                    .filter_map(|clipped| match &clipped.shape {
+                        egui::Shape::Text(text) => Some((text.pos, text.galley.text().to_owned())),
+                        _ => None,
+                    })
+                    .collect::<Vec<_>>()
+            };
+            let before = fingerprint(&top);
+            key(&context, &mut app, COMPACT, egui::Key::PageDown, false);
+            key(&context, &mut app, COMPACT, egui::Key::PageUp, false);
+            let back_at_top = settled(&context, &mut app, COMPACT);
+            assert_eq!(
+                before,
+                fingerprint(&back_at_top),
+                "{section:?} simple={simple}"
+            );
+            app.go(Route::Section(Section::Settings));
+            settled(&context, &mut app, COMPACT);
+            assert_eq!(app.router.current, Route::Section(Section::Settings));
+            app.back();
+            settled(&context, &mut app, COMPACT);
+            assert_eq!(app.router.current, Route::Section(section));
+        }
+    }
+}
+
+/// Classic keeps its pinned introduction, so only the body moves.
+#[test]
+fn classic_keeps_its_pinned_title_and_restores_a_fresh_visit() {
+    let context = egui::Context::default();
+    let mut app = ready(&context, Section::Mods, false, 1.);
+    let text = "Choose a game and inspect compatibility before reviewing a change. Browsing this workshop does not change game or emulator files.";
+    settled(&context, &mut app, COMPACT);
+    let scrolled = wheel_down(&context, &mut app, COMPACT);
+    assert!(visible(&scrolled, COMPACT, MODS_PURPOSE).is_some());
+    assert!(visible(&scrolled, COMPACT, text).is_none());
+    app.go(Route::Section(Section::Settings));
+    settled(&context, &mut app, COMPACT);
+    app.go(Route::Section(Section::Mods));
+    let revisited = settled(&context, &mut app, COMPACT);
+    assert!(visible(&revisited, COMPACT, text).is_some());
+}

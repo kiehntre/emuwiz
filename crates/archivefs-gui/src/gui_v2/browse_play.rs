@@ -1242,6 +1242,18 @@ impl App {
     }
 }
 
+/// A toolbar on/off control: a real button, so the unselected state matches
+/// Select games beside it instead of reading as plain text.
+fn toggle_button(text: &str, selected: bool) -> egui::Button<'_> {
+    egui::Button::new(text).selected(selected)
+}
+
+fn view_toggle(ui: &mut egui::Ui, current: &mut bool, value: bool, text: &str) {
+    if ui.add(toggle_button(text, *current == value)).clicked() {
+        *current = value;
+    }
+}
+
 #[cfg(test)]
 mod classic_identity_status_tests {
     use super::{readiness_sentence, status_text};
@@ -1307,17 +1319,5 @@ mod classic_identity_status_tests {
         exact.mark_dat_exact(Some("DAT"));
         assert_eq!(exact.identity_summary(), "Mismatch");
         assert_eq!(exact.status(), "Identity conflict · review evidence");
-    }
-}
-
-/// A toolbar on/off control: a real button, so the unselected state matches
-/// Select games beside it instead of reading as plain text.
-fn toggle_button(text: &str, selected: bool) -> egui::Button<'_> {
-    egui::Button::new(text).selected(selected)
-}
-
-fn view_toggle(ui: &mut egui::Ui, current: &mut bool, value: bool, text: &str) {
-    if ui.add(toggle_button(text, *current == value)).clicked() {
-        *current = value;
     }
 }

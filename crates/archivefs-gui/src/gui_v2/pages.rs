@@ -38,9 +38,13 @@ const MAX_PINNED_NOTICE_SHARE: f32 = 0.4;
 const ALL_TOOLS_SCROLL: &str = "v2_all_tools_scroll";
 
 /// One bounded main-content scroller; sidebar and header are outside it.
-fn check_scroll(ui: &mut egui::Ui, platform: Option<&str>, content: impl FnOnce(&mut egui::Ui)) {
+pub(super) fn check_scroll(
+    ui: &mut egui::Ui,
+    platform: Option<&str>,
+    content: impl FnOnce(&mut egui::Ui),
+) {
     let salt = ("v2_check_scroll", platform);
-    let id = ui.make_persistent_id(salt);
+    let id = ui.make_persistent_id(egui::Id::new(salt));
     let mut scroll = egui::ScrollArea::vertical()
         .id_salt(salt)
         .auto_shrink([false, false]);
