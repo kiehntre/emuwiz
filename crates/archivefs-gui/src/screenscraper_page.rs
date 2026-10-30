@@ -855,6 +855,311 @@ pub(crate) fn show_screen_scraper_settings(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use archivefs_core::identity_source::screenscraper::{
+        ProviderResponse, ScreenScraperTransport,
+    };
+    use std::time::Duration;
+
+    // Keep endpoint validation in the public client; only this test transport
+    // maps its already validated request to a disposable localhost server.
+    struct LocalhostTransport {
+        url: String,
+        calls: std::sync::atomic::AtomicUsize,
+        inner: UreqTransport,
+    }
+
+    impl ScreenScraperTransport for &LocalhostTransport {
+        fn get(
+            &self,
+            url: &str,
+            max_bytes: usize,
+            timeout: Duration,
+        ) -> Result<ProviderResponse, ScreenScraperError> {
+            assert!(url.starts_with("https://api.screenscraper.fr/"));
+            self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            let response = self.inner.get(&self.url, max_bytes, timeout)?;
+            assert!(!format!("{:?}", Some(&response)).contains("wire-secret"));
+            Ok(response)
+        }
+    }
+
+    fn localhost_response(
+        status: u16,
+        media: Option<&str>,
+        body: &str,
+    ) -> (LocalhostTransport, std::thread::JoinHandle<()>) {
+        use std::io::{Read, Write};
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let url = format!("http://{}/synthetic", listener.local_addr().unwrap());
+        let media = media.map(str::to_owned);
+        let body = body.to_owned();
+        let server = std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            stream
+                .set_read_timeout(Some(Duration::from_secs(5)))
+                .unwrap();
+            let mut request = Vec::new();
+            let mut chunk = [0; 1024];
+            while !request.windows(4).any(|bytes| bytes == b"\r\n\r\n") {
+                let count = stream.read(&mut chunk).unwrap();
+                assert!(count > 0);
+                request.extend_from_slice(&chunk[..count]);
+                assert!(request.len() < 8192);
+            }
+            write!(stream, "HTTP/1.1 {status} Synthetic\r\nContent-Length: {}\r\nConnection: close\r\nLocation: https://invalid.example/?DeVpAsSwOrD=wire-secret\r\n", body.len()).unwrap();
+            if let Some(media) = media {
+                write!(stream, "Content-Type: {media}\r\n").unwrap();
+            }
+            write!(stream, "\r\n{body}").unwrap();
+        });
+        (
+            LocalhostTransport {
+                url,
+                calls: std::sync::atomic::AtomicUsize::new(0),
+                inner: UreqTransport::default(),
+            },
+            server,
+        )
+    }
+
+    #[test]
+    fn localhost_connection_test_refuses_challenges_without_false_ready_or_cache_changes() {
+        let oversized = "x".repeat(1100);
+        let challenge = "<html>Access denied: verify you are human wire-secret</html>";
+        let cache = tempfile::tempdir().unwrap();
+        let metadata = cache.path().join("last-known-good.json");
+        let provenance = cache.path().join("provenance.json");
+        let cached_bytes = br#"{"jeu":{"id":42,"nom":"Existing"}}"#;
+        let provenance_bytes = br#"{"provider":"ScreenScraper","provider_record_id":"42"}"#;
+        std::fs::write(&metadata, cached_bytes).unwrap();
+        std::fs::write(&provenance, provenance_bytes).unwrap();
+        for (status, media, body, expected) in [
+            (
+                404,
+                Some("text/html"),
+                challenge,
+                ScreenScraperUiStatus::TemporarilyUnavailable,
+            ),
+            (
+                404,
+                None,
+                challenge,
+                ScreenScraperUiStatus::TemporarilyUnavailable,
+            ),
+            (
+                404,
+                Some("application/xhtml+xml"),
+                challenge,
+                ScreenScraperUiStatus::TemporarilyUnavailable,
+            ),
+            (
+                404,
+                Some("application/json"),
+                challenge,
+                ScreenScraperUiStatus::TemporarilyUnavailable,
+            ),
+            (
+                404,
+                Some(oversized.as_str()),
+                challenge,
+                ScreenScraperUiStatus::TemporarilyUnavailable,
+            ),
+            (404, None, "", ScreenScraperUiStatus::TemporarilyUnavailable),
+            (
+                404,
+                Some("application/json"),
+                "",
+                ScreenScraperUiStatus::Ready,
+            ),
+            (
+                404,
+                Some("text/plain; charset=utf-8"),
+                "",
+                ScreenScraperUiStatus::Ready,
+            ),
+            (
+                404,
+                Some("application/octet-stream"),
+                "",
+                ScreenScraperUiStatus::TemporarilyUnavailable,
+            ),
+            (
+                404,
+                Some("application/json"),
+                r#"{"jeux":[]}"#,
+                ScreenScraperUiStatus::Ready,
+            ),
+            (
+                200,
+                Some("application/json"),
+                r#"{"jeu":{"id":42,"nom":"Game"}}"#,
+                ScreenScraperUiStatus::Ready,
+            ),
+            (
+                401,
+                Some("text/html"),
+                challenge,
+                ScreenScraperUiStatus::AuthenticationError,
+            ),
+            (
+                403,
+                Some("text/html"),
+                challenge,
+                // The core classifies 403 as a non-retryable permission
+                // refusal (`InvalidRequest`), which the page shows as Not
+                // configured with the redacted reason. Never Ready.
+                ScreenScraperUiStatus::NotConfigured,
+            ),
+            (
+                503,
+                Some("text/html"),
+                challenge,
+                ScreenScraperUiStatus::TemporarilyUnavailable,
+            ),
+        ] {
+            let (transport, server) = localhost_response(status, media, body);
+            let client = ScreenScraperClient::new(
+                ScreenScraperConfig {
+                    enabled: true,
+                    max_retries: 2,
+                    ..Default::default()
+                },
+                Some(
+                    ScreenScraperCredentials::new(
+                        "synthetic-id",
+                        ScreenScraperSecret::parse("synthetic-password").unwrap(),
+                        None,
+                        None,
+                    )
+                    .unwrap(),
+                ),
+                &transport,
+            );
+            let outcome = client.lookup(
+                LookupKind::Search,
+                &ScreenScraperLookup {
+                    title: Some(TEST_TITLE.into()),
+                    ..Default::default()
+                },
+            );
+            server.join().unwrap();
+            assert_eq!(transport.calls.load(std::sync::atomic::Ordering::SeqCst), 1);
+            let mut state = ScreenScraperPageState {
+                status: ScreenScraperUiStatus::Testing,
+                last_success_unix_seconds: Some(123),
+                last_error: Some("previous error".into()),
+                ..Default::default()
+            };
+            if expected != ScreenScraperUiStatus::Ready {
+                assert!(!outcome.as_ref().unwrap_err().is_retryable());
+            }
+            state.finish_request(outcome);
+            assert_eq!(state.status, expected, "{status} {media:?}");
+            if expected == ScreenScraperUiStatus::Ready {
+                assert!(state.last_error.is_none());
+                assert_eq!(
+                    state.candidate_count,
+                    Some(if status == 404 { 0 } else { 1 })
+                );
+            } else {
+                assert_ne!(state.status, ScreenScraperUiStatus::Ready);
+                assert_eq!(state.last_success_unix_seconds, Some(123));
+                let error = state.last_error.clone().unwrap();
+                assert!(!error.contains("wire-secret"));
+                assert!(rendered_text_contains(&render(&mut state), &error));
+            }
+            assert!(!format!("{state:?}").contains("wire-secret"));
+            assert_eq!(std::fs::read(&metadata).unwrap(), cached_bytes);
+            assert_eq!(std::fs::read(&provenance).unwrap(), provenance_bytes);
+        }
+    }
+
+    #[test]
+    fn localhost_404_error_contract_never_sets_setup_ready() {
+        let cache = tempfile::tempdir().unwrap();
+        let metadata = cache.path().join("last-known-good.json");
+        let bytes = br#"{"jeu":{"id":42,"nom":"Existing"}}"#;
+        std::fs::write(&metadata, bytes).unwrap();
+        let mut failures = Vec::new();
+        for (label, media, body) in [
+            (
+                "authentication JSON",
+                "application/json",
+                r#"{"error":"authentication required wire-secret"}"#,
+            ),
+            (
+                "temporary JSON",
+                "application/json",
+                r#"{"error":"temporary outage wire-secret"}"#,
+            ),
+            (
+                "plain-text failure",
+                "text/plain",
+                "temporary outage wire-secret",
+            ),
+            ("ambiguous JSON", "application/json", "{}"),
+            (
+                "embedded error JSON",
+                "application/json",
+                r#"{"jeux":[],"ssuser":{"error":"wire-secret"}}"#,
+            ),
+            (
+                "conflicting JSON",
+                "application/json",
+                r#"{"jeux":[],"error":"wire-secret"}"#,
+            ),
+        ] {
+            let (transport, server) = localhost_response(404, Some(media), body);
+            let client = ScreenScraperClient::new(
+                ScreenScraperConfig {
+                    enabled: true,
+                    max_retries: 2,
+                    ..Default::default()
+                },
+                Some(
+                    ScreenScraperCredentials::new(
+                        "synthetic-id",
+                        ScreenScraperSecret::parse("synthetic-password").unwrap(),
+                        None,
+                        None,
+                    )
+                    .unwrap(),
+                ),
+                &transport,
+            );
+            let outcome = client.lookup(
+                LookupKind::Search,
+                &ScreenScraperLookup {
+                    title: Some(TEST_TITLE.into()),
+                    ..Default::default()
+                },
+            );
+            server.join().unwrap();
+            assert_eq!(transport.calls.load(std::sync::atomic::Ordering::SeqCst), 1);
+            let mut state = ScreenScraperPageState {
+                status: ScreenScraperUiStatus::Testing,
+                last_success_unix_seconds: Some(123),
+                ..Default::default()
+            };
+            state.finish_request(outcome);
+            assert!(!format!("{state:?}").contains("wire-secret"));
+            assert_eq!(std::fs::read(&metadata).unwrap(), bytes);
+            if state.status == ScreenScraperUiStatus::Ready {
+                failures.push(label);
+                continue;
+            }
+            assert_eq!(state.status, ScreenScraperUiStatus::TemporarilyUnavailable);
+            assert_eq!(state.last_success_unix_seconds, Some(123));
+            let error = state.last_error.clone().unwrap();
+            assert!(error.contains("temporary or invalid response"));
+            assert!(!error.contains("wire-secret"));
+            assert!(rendered_text_contains(&render(&mut state), &error));
+        }
+        assert!(
+            failures.is_empty(),
+            "404 failures incorrectly set Setup Ready: {failures:?}"
+        );
+    }
 
     fn rendered_text_contains(output: &egui::FullOutput, needle: &str) -> bool {
         fn shape_contains(shape: &egui::Shape, needle: &str) -> bool {
