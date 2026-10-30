@@ -15,7 +15,7 @@ use archivefs_core::identity_source::screenscraper::{
 
 use eframe::egui;
 
-use crate::screenscraper_secret_store::{SecretStore, StoreError, StoredCredentials};
+use crate::screenscraper_secret_store::{SecretStore, StoreError, StoreNotices, StoredCredentials};
 use crate::ui::components as widgets;
 
 const TEST_TITLE: &str = "EmuWiz";
@@ -74,6 +74,7 @@ pub(crate) struct ScreenScraperPageState {
     file_mode: bool,
     file_storage_acknowledged: bool,
     storage_message: Option<&'static str>,
+    storage_warning: Option<&'static str>,
     unsaved_edits: bool,
     storage_request: Option<Receiver<StorageOutcome>>,
     edit_generation: u64,
@@ -110,9 +111,11 @@ struct QuotaView {
     reset_after_seconds: Option<u64>,
 }
 
+const DOTFILES_MESSAGE: &str = "Plaintext storage refused: the credentials folder looks managed by Git, yadm, chezmoi or similar dotfiles tooling and could be committed or synced. Set EMUWIZ_SCREENSCRAPER_SECRETS_DIR to a private folder outside it, or use Secret Service. Credentials remain session-only.";
+
 enum StorageOutcome {
-    Loaded(Result<Option<StoredCredentials>, StoreError>),
-    Saved(Result<(), StoreError>, u64),
+    Loaded(Result<Option<StoredCredentials>, StoreError>, StoreNotices),
+    Saved(Result<(), StoreError>, u64, StoreNotices),
     Forgotten(Result<(), StoreError>),
 }
 
@@ -150,6 +153,7 @@ impl ScreenScraperPageState {
             file_mode: false,
             file_storage_acknowledged: false,
             storage_message: None,
+            storage_warning: None,
             unsaved_edits: false,
             storage_request: None,
             edit_generation: 0,
@@ -180,7 +184,9 @@ impl ScreenScraperPageState {
         self.storage_request = Some(receiver);
         self.storage_message = Some("Checking credential storage…");
         thread::spawn(move || {
-            let _ = sender.send(StorageOutcome::Loaded(store.load()));
+            let loaded = store.load();
+            let notices = store.notices();
+            let _ = sender.send(StorageOutcome::Loaded(loaded, notices));
         });
     }
 
@@ -222,6 +228,9 @@ impl ScreenScraperPageState {
                     "Stored credentials are invalid; replace or forget them."
                 });
             }
+            Err(StoreError::Dotfiles) => {
+                self.storage_message = Some(DOTFILES_MESSAGE);
+            }
             Err(StoreError::Insecure) => {
                 self.storage_message = Some(
                     "The configured credentials file has unsafe ownership, permissions, or links. Credentials remain session-only.",
@@ -233,6 +242,21 @@ impl ScreenScraperPageState {
                 );
             }
         }
+    }
+
+    fn set_notices(&mut self, notices: StoreNotices) {
+        self.storage_warning = match (notices.other_backend, notices.leftover_temporary_files) {
+            (false, false) => None,
+            (true, false) => Some(
+                "Credentials also exist, or could not be ruled out, in the other storage backend (Secret Service or the private file). Forget clears both.",
+            ),
+            (false, true) => Some(
+                "Leftover temporary credential files from an interrupted save were found in the private folder. Forget removes them.",
+            ),
+            (true, true) => Some(
+                "Credentials may also exist in the other storage backend, and leftover temporary credential files from an interrupted save were found. Forget clears both and removes them.",
+            ),
+        };
     }
 
     fn has_entered_credentials(&self) -> bool {
@@ -309,7 +333,9 @@ impl ScreenScraperPageState {
         self.storage_request = Some(receiver);
         self.storage_message = Some("Saving credentials…");
         thread::spawn(move || {
-            let _ = sender.send(StorageOutcome::Saved(store.save(&record), generation));
+            let saved = store.save(&record);
+            let notices = store.notices();
+            let _ = sender.send(StorageOutcome::Saved(saved, generation, notices));
         });
     }
 
@@ -324,6 +350,17 @@ impl ScreenScraperPageState {
                 } else {
                     "Credentials saved in the selected storage. Connection not yet verified."
                 });
+            }
+            Err(StoreError::PublishedUnverified) => {
+                self.stored = true;
+                self.invalid_stored = false;
+                self.unsaved_edits = self.edit_generation != generation;
+                self.storage_message = Some(
+                    "Credentials were written to the selected storage, but durability or read-back could not be verified. They may be stored; retry Save or use Forget.",
+                );
+            }
+            Err(StoreError::Dotfiles) => {
+                self.storage_message = Some(DOTFILES_MESSAGE);
             }
             Err(StoreError::TooLarge) => {
                 self.storage_message = Some(
@@ -379,9 +416,12 @@ impl ScreenScraperPageState {
         if removed {
             self.stored = false;
             self.invalid_stored = false;
+            self.storage_warning = None;
         }
         self.storage_message = Some(if removed {
-            "Credentials forgotten from the session and selected storage."
+            "Credentials forgotten from the session and every reachable storage backend."
+        } else if result == Err(StoreError::Residual) {
+            "Session credentials cleared. Stored credentials or temporary credential files remain in a storage backend; check Secret Service and the private folder, then retry Forget."
         } else {
             "Session credentials cleared. Stored credentials could not be removed or verified; try again when the secret store is available."
         });
@@ -392,8 +432,14 @@ impl ScreenScraperPageState {
             return;
         };
         match receiver.try_recv() {
-            Ok(StorageOutcome::Loaded(result)) => self.finish_load(result),
-            Ok(StorageOutcome::Saved(result, generation)) => self.finish_save(result, generation),
+            Ok(StorageOutcome::Loaded(result, notices)) => {
+                self.set_notices(notices);
+                self.finish_load(result);
+            }
+            Ok(StorageOutcome::Saved(result, generation, notices)) => {
+                self.set_notices(notices);
+                self.finish_save(result, generation);
+            }
             Ok(StorageOutcome::Forgotten(result)) => self.finish_forget(result),
             Err(TryRecvError::Empty) => self.storage_request = Some(receiver),
             Err(TryRecvError::Disconnected) => {
@@ -626,7 +672,7 @@ pub(crate) fn show_screen_scraper_settings(
         ui.add_space(6.0);
         ui.label(egui::RichText::new("Credentials").strong());
         if state.file_mode {
-            ui.label("EmuWiz-managed private screenscraper.env: Save creates an owner-only directory (0700) and file (0600). Contents are plaintext to this account and root. Protect or exclude backups; Forget cannot erase old SSD blocks or backup copies.");
+            ui.label("EmuWiz-managed private secrets/screenscraper.env under the EmuWiz config folder: Save creates an owner-only secrets directory (0700) and file (0600); the parent config folder keeps its permissions. Contents are plaintext to this account and root. Protect or exclude backups; Forget cannot erase old SSD blocks or backup copies.");
             ui.checkbox(
                 &mut state.file_storage_acknowledged,
                 "I accept local plaintext storage and have approved how backups handle this file.",
@@ -744,6 +790,9 @@ pub(crate) fn show_screen_scraper_settings(
         });
         if let Some(message) = state.storage_message {
             ui.label(message);
+        }
+        if let Some(warning) = state.storage_warning {
+            ui.label(egui::RichText::new(warning).strong());
         }
         if widgets::action_button(
             ui,
@@ -1005,7 +1054,7 @@ mod tests {
         assert!(state.developer_password.is_empty());
         assert_eq!(
             state.storage_message,
-            Some("Credentials forgotten from the session and selected storage.")
+            Some("Credentials forgotten from the session and every reachable storage backend.")
         );
     }
 
@@ -1110,6 +1159,51 @@ mod tests {
         after_forget.begin_load_with(SecretStore::restricted_file_for_test(directory));
         settle_storage(&mut after_forget);
         assert!(!after_forget.is_configured());
+    }
+
+    #[test]
+    fn partial_save_and_forget_failures_are_reported_truthfully() {
+        let mut state = ScreenScraperPageState::empty(true);
+        state.finish_save(Err(StoreError::PublishedUnverified), 0);
+        assert!(state.stored);
+        assert!(state.storage_message.unwrap().contains("written"));
+        assert!(!state.storage_message.unwrap().contains("not saved"));
+
+        state.finish_forget(Err(StoreError::Residual));
+        assert!(state.stored, "residue means credentials may remain");
+        assert!(state.storage_message.unwrap().contains("remain"));
+        assert!(!state.storage_message.unwrap().contains("forgotten from"));
+
+        state.finish_forget(Ok(()));
+        assert!(!state.stored);
+        assert!(state.storage_warning.is_none());
+    }
+
+    #[test]
+    fn other_backend_and_leftover_files_are_surfaced_and_dotfiles_are_explained() {
+        let mut state = ScreenScraperPageState::empty(true);
+        state.set_notices(StoreNotices {
+            other_backend: true,
+            leftover_temporary_files: false,
+        });
+        assert!(
+            state
+                .storage_warning
+                .unwrap()
+                .contains("other storage backend")
+        );
+        state.set_notices(StoreNotices {
+            other_backend: false,
+            leftover_temporary_files: true,
+        });
+        assert!(state.storage_warning.unwrap().contains("temporary"));
+        state.set_notices(StoreNotices::default());
+        assert!(state.storage_warning.is_none());
+        state.finish_save(Err(StoreError::Dotfiles), 0);
+        assert!(!state.stored);
+        assert!(state.storage_message.unwrap().contains("dotfiles"));
+        state.finish_load(Err(StoreError::Dotfiles));
+        assert!(state.storage_message.unwrap().contains("refused"));
     }
 
     #[cfg(target_os = "linux")]
