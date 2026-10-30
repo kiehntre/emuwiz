@@ -20,7 +20,9 @@ use archivefs_core::launch::retroarch_platform_candidate;
 use archivefs_core::patch_manager::RetroArchCheatSetupDiscovery;
 
 #[cfg(test)]
-use crate::emulator_setup::save_retroarch_core_directory_override_at;
+use crate::emulator_setup::{
+    reset_retroarch_core_directory_override_at, save_retroarch_core_directory_override_at,
+};
 use crate::ui::components::StatusTone;
 
 /// The stable diagnostic code the core layer emits when an EmuWiz
@@ -212,13 +214,13 @@ pub(crate) fn core_folder_readiness(
             let inventory = core_inventory(discovery);
             if inventory.usable_cores > 0 {
                 let sentence = if mode.is_custom() {
-                    "The selected game-support folder is ready to use.".to_string()
+                    "Installed core files were found in the selected folder. Choose a game to check its platform and launch readiness.".to_string()
                 } else {
-                    "RetroArch's game-support files are ready to use.".to_string()
+                    "Installed RetroArch core files were found. Choose a game to check its platform and launch readiness.".to_string()
                 };
                 CoreFolderReadiness {
                     kind: CoreFolderReadinessKind::Ready,
-                    badge_label: "Ready",
+                    badge_label: "Cores found",
                     badge_tone: StatusTone::Success,
                     headline: None,
                     sentence,
@@ -433,7 +435,7 @@ mod tests {
         assert_eq!(readiness.kind, CoreFolderReadinessKind::Ready);
         assert_eq!(
             readiness.sentence,
-            "The selected game-support folder is ready to use."
+            "Installed core files were found in the selected folder. Choose a game to check its platform and launch readiness."
         );
     }
 
@@ -560,9 +562,60 @@ pub(crate) fn retroarch_core_directory_override_path() -> Option<PathBuf> {
 /// discovery). The stored path is taken verbatim - it is the user's
 /// explicit choice, never canonicalised here.
 pub(crate) fn load_retroarch_core_directory_override_at(path: &Path) -> Option<PathBuf> {
-    let contents = std::fs::read_to_string(path).ok()?;
-    let trimmed = contents.trim();
-    (!trimmed.is_empty()).then(|| PathBuf::from(trimmed))
+    use std::io::Read;
+    use std::os::unix::fs::OpenOptionsExt;
+    // Same protections as the write side: no symlink, no blocking on a FIFO,
+    // regular file only, bounded read. This runs on the UI thread at startup.
+    let file = std::fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK)
+        .open(path)
+        .ok()?;
+    if !file.metadata().ok()?.is_file() {
+        return None;
+    }
+    let mut bytes = Vec::new();
+    file.take(64 * 1024 + 1).read_to_end(&mut bytes).ok()?;
+    if bytes.len() > 64 * 1024 {
+        return None;
+    }
+    let contents = String::from_utf8(bytes).ok()?;
+    let choice = active_retroarch_core_choice(&contents);
+    (!choice.trim().is_empty() && choice != "@emuwiz-automatic").then(|| PathBuf::from(choice))
+}
+
+/// The last complete, checksummed record wins. A torn append is ignored, so
+/// a failed write cannot silently change the active choice on restart.
+pub(crate) fn active_retroarch_core_choice(contents: &str) -> &str {
+    const PREFIX: &str = "@emuwiz-core-choice-v1:";
+    let marker = format!("\n{PREFIX}");
+    let Some(first) = contents.find(&marker) else {
+        return contents;
+    };
+    let mut choice = &contents[..first];
+    let mut remaining = &contents[first + 1..];
+    while let Some(end) = remaining.find('\n') {
+        let line = &remaining[..end];
+        if let Some((checksum, value)) = line
+            .strip_prefix(PREFIX)
+            .and_then(|rest| rest.split_once(':'))
+            && checksum == retroarch_choice_checksum(value)
+        {
+            choice = value;
+        }
+        remaining = &remaining[end + 1..];
+    }
+    choice
+}
+
+pub(crate) fn retroarch_choice_checksum(value: &str) -> String {
+    use sha2::{Digest, Sha256};
+    use std::fmt::Write;
+    let mut encoded = String::with_capacity(64);
+    for byte in Sha256::digest(value.as_bytes()) {
+        write!(&mut encoded, "{byte:02x}").expect("writing to String cannot fail");
+    }
+    encoded
 }
 
 /// The default-location counterparts, used by the running app.
@@ -581,6 +634,27 @@ pub(crate) fn a_missing_core_directory_override_file_loads_as_none() {
 }
 
 #[test]
+pub(crate) fn an_unsafe_core_directory_override_file_is_never_loaded() {
+    let dir = tempfile::tempdir().unwrap();
+    let real = dir.path().join("real.txt");
+    std::fs::write(&real, "/opt/cores").unwrap();
+    let link = dir.path().join("link.txt");
+    std::os::unix::fs::symlink(&real, &link).unwrap();
+    assert_eq!(load_retroarch_core_directory_override_at(&link), None);
+    let big = dir.path().join("big.txt");
+    std::fs::write(&big, format!("/{}", "a".repeat(70 * 1024))).unwrap();
+    assert_eq!(load_retroarch_core_directory_override_at(&big), None);
+    let fifo = dir.path().join("fifo.txt");
+    let c = std::ffi::CString::new(fifo.to_str().unwrap()).unwrap();
+    assert_eq!(unsafe { libc::mkfifo(c.as_ptr(), 0o600) }, 0);
+    assert_eq!(load_retroarch_core_directory_override_at(&fifo), None);
+    assert_eq!(
+        load_retroarch_core_directory_override_at(&real),
+        Some(PathBuf::from("/opt/cores"))
+    );
+}
+
+#[test]
 pub(crate) fn an_empty_or_whitespace_core_directory_override_file_loads_as_none() {
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("retroarch_core_directory_override.txt");
@@ -594,8 +668,9 @@ pub(crate) fn a_core_directory_override_round_trips_through_save_and_load() {
     let path = dir
         .path()
         .join("nested/retroarch_core_directory_override.txt");
-    let chosen = PathBuf::from("/opt/libretro/cores");
-    save_retroarch_core_directory_override_at(&path, Some(chosen.as_path()));
+    let chosen = dir.path().join("cores");
+    std::fs::create_dir(&chosen).unwrap();
+    save_retroarch_core_directory_override_at(&path, Some(chosen.as_path())).unwrap();
     assert!(path.exists(), "save must create the file (and any parent)");
     assert_eq!(
         load_retroarch_core_directory_override_at(&path),
@@ -604,30 +679,144 @@ pub(crate) fn a_core_directory_override_round_trips_through_save_and_load() {
 }
 
 #[test]
-pub(crate) fn clearing_a_core_directory_override_removes_the_file_and_next_load_is_none() {
+pub(crate) fn resetting_a_core_directory_override_preserves_history_and_next_load_is_none() {
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("retroarch_core_directory_override.txt");
-    save_retroarch_core_directory_override_at(
-        &path,
-        Some(PathBuf::from("/opt/libretro/cores").as_path()),
-    );
+    let chosen = dir.path().join("cores");
+    std::fs::create_dir(&chosen).unwrap();
+    save_retroarch_core_directory_override_at(&path, Some(&chosen)).unwrap();
     assert!(path.exists());
-    save_retroarch_core_directory_override_at(&path, None);
-    assert!(!path.exists(), "clearing must remove the file");
+    reset_retroarch_core_directory_override_at(&path, &chosen).unwrap();
+    assert!(path.exists(), "reset preserves earlier managed choices");
     assert_eq!(load_retroarch_core_directory_override_at(&path), None);
-    // Clearing an already-absent file is a harmless no-op.
-    save_retroarch_core_directory_override_at(&path, None);
+    assert!(reset_retroarch_core_directory_override_at(&path, &chosen).is_err());
+    let replacement = dir.path().join("replacement");
+    std::fs::create_dir(&replacement).unwrap();
+    save_retroarch_core_directory_override_at(&path, Some(&replacement)).unwrap();
+    assert_eq!(
+        load_retroarch_core_directory_override_at(&path),
+        Some(replacement)
+    );
+}
+
+#[test]
+pub(crate) fn reset_refuses_a_changed_choice_without_modifying_it() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("retroarch_core_directory_override.txt");
+    let first = dir.path().join("first");
+    let second = dir.path().join("second");
+    std::fs::write(&path, second.to_str().unwrap()).unwrap();
+    assert!(reset_retroarch_core_directory_override_at(&path, &first).is_err());
+    assert_eq!(
+        std::fs::read_to_string(&path).unwrap(),
+        second.to_str().unwrap()
+    );
+}
+
+#[test]
+pub(crate) fn reset_refuses_a_busy_sidecar_and_can_retry() {
+    use std::os::fd::AsRawFd;
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("retroarch_core_directory_override.txt");
+    let choice = dir.path().join("cores");
+    std::fs::write(&path, choice.to_str().unwrap()).unwrap();
+    let locked = std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open(&path)
+        .unwrap();
+    // SAFETY: locked is a live file descriptor.
+    assert_eq!(
+        unsafe { libc::flock(locked.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) },
+        0
+    );
+    assert!(reset_retroarch_core_directory_override_at(&path, &choice).is_err());
+    assert_eq!(
+        load_retroarch_core_directory_override_at(&path),
+        Some(choice.clone())
+    );
+    // SAFETY: locked remains open through this unlock.
+    assert_eq!(unsafe { libc::flock(locked.as_raw_fd(), libc::LOCK_UN) }, 0);
+    reset_retroarch_core_directory_override_at(&path, &choice).unwrap();
+    assert_eq!(load_retroarch_core_directory_override_at(&path), None);
+}
+
+#[test]
+pub(crate) fn incomplete_append_is_ignored_and_safe_retry_commits_a_complete_record() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("retroarch_core_directory_override.txt");
+    let choice = dir.path().join("cores");
+    std::fs::write(
+        &path,
+        format!("{}\n@emuwiz-core-choice-v1:partial", choice.display()),
+    )
+    .unwrap();
+    assert_eq!(
+        load_retroarch_core_directory_override_at(&path),
+        Some(choice.clone())
+    );
+    reset_retroarch_core_directory_override_at(&path, &choice).unwrap();
+    assert_eq!(load_retroarch_core_directory_override_at(&path), None);
+}
+
+#[test]
+pub(crate) fn non_utf8_core_folder_is_refused_before_a_choice_is_written() {
+    use std::os::unix::ffi::OsStringExt;
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("retroarch_core_directory_override.txt");
+    let folder = dir
+        .path()
+        .join(std::ffi::OsString::from_vec(vec![b'c', 0xff]));
+    std::fs::create_dir(&folder).unwrap();
+    assert!(save_retroarch_core_directory_override_at(&path, Some(&folder)).is_err());
     assert!(!path.exists());
 }
 
 #[test]
-pub(crate) fn a_persisted_core_directory_override_survives_a_second_save() {
+pub(crate) fn whitespace_in_a_core_folder_path_round_trips_exactly() {
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("retroarch_core_directory_override.txt");
-    save_retroarch_core_directory_override_at(&path, Some(Path::new("/first/cores")));
-    save_retroarch_core_directory_override_at(&path, Some(Path::new("/second/cores")));
+    let folder = dir.path().join(" cores ");
+    std::fs::create_dir(&folder).unwrap();
+    save_retroarch_core_directory_override_at(&path, Some(&folder)).unwrap();
     assert_eq!(
         load_retroarch_core_directory_override_at(&path),
-        Some(PathBuf::from("/second/cores"))
+        Some(folder)
+    );
+}
+
+#[test]
+pub(crate) fn a_persisted_core_directory_override_is_never_replaced_by_a_second_save() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("retroarch_core_directory_override.txt");
+    let first = dir.path().join("first");
+    let second = dir.path().join("second");
+    std::fs::create_dir(&first).unwrap();
+    std::fs::create_dir(&second).unwrap();
+    save_retroarch_core_directory_override_at(&path, Some(&first)).unwrap();
+    assert!(save_retroarch_core_directory_override_at(&path, Some(&second)).is_err());
+    assert_eq!(
+        load_retroarch_core_directory_override_at(&path),
+        Some(first)
+    );
+}
+
+#[test]
+pub(crate) fn core_directory_override_refuses_symlink_and_allows_safe_retry() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("retroarch_core_directory_override.txt");
+    let target = dir.path().join("custom.txt");
+    let core_folder = dir.path().join("cores");
+    std::fs::create_dir(&core_folder).unwrap();
+    std::fs::write(&target, "user choice").unwrap();
+    std::os::unix::fs::symlink(&target, &path).unwrap();
+    assert!(save_retroarch_core_directory_override_at(&path, Some(&core_folder)).is_err());
+    assert!(reset_retroarch_core_directory_override_at(&path, &core_folder).is_err());
+    assert_eq!(std::fs::read_to_string(&target).unwrap(), "user choice");
+    std::fs::remove_file(&path).unwrap();
+    save_retroarch_core_directory_override_at(&path, Some(&core_folder)).unwrap();
+    assert_eq!(
+        load_retroarch_core_directory_override_at(&path),
+        Some(core_folder)
     );
 }

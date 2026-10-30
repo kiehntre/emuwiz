@@ -685,6 +685,7 @@ fn retroarch_not_scanned_shows_the_exact_prerequisite_message() {
         &output,
         "Scan RetroArch profiles to check installed cores."
     ));
+    assert!(rendered_text_contains(&output, "Open Emulator Setup"));
 }
 
 // --- unknown identity --------------------------------------------------------

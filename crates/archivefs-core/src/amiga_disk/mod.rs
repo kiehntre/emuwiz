@@ -393,6 +393,25 @@ impl std::error::Error for AmigaFloppyError {}
 /// or an atomic filesystem snapshot.
 pub fn inspect_amiga_floppy(path: &Path) -> Result<AmigaFloppyInspection, AmigaFloppyError> {
     let file = open_amiga_media_file(path).map_err(AmigaFloppyError::Container)?;
+    inspect_amiga_floppy_from_opened(path, file)
+}
+
+/// Inspect an ADF through the same trusted-root and symlink boundary used by
+/// platform detection. The descriptor stays pinned through all deeper reads.
+pub fn inspect_amiga_floppy_in_roots(
+    path: &Path,
+    trusted: &crate::safe_read::TrustedRoots,
+) -> Result<AmigaFloppyInspection, AmigaFloppyError> {
+    let file = crate::safe_read::open_bounded_read(path, trusted)
+        .map_err(|error| AmigaFloppyError::Container(DiskError::Io(format!("{error:?}"))))?
+        .into_file();
+    inspect_amiga_floppy_from_opened(path, file)
+}
+
+fn inspect_amiga_floppy_from_opened(
+    path: &Path,
+    file: std::fs::File,
+) -> Result<AmigaFloppyInspection, AmigaFloppyError> {
     let before = file
         .metadata()
         .map_err(|error| AmigaFloppyError::Container(DiskError::Io(error.to_string())))?;

@@ -605,7 +605,7 @@ fn staging_repair_in_flight_entry_cannot_hide_in_a_settled_journal() {
 }
 
 #[test]
-fn staging_repair_unjournalled_interruption_refuses_without_destroying_stage() {
+fn staging_repair_unjournalled_interruption_can_retry_without_destroying_stage() {
     let lab = Lab::new();
     let plan = repair_plan(&lab);
     let hook = repair_hook(|event, _| {
@@ -624,13 +624,80 @@ fn staging_repair_unjournalled_interruption_refuses_without_destroying_stage() {
         .unwrap()
         .path();
     let before = std::fs::read(&stage).unwrap();
+    let pending = super::staging_lifecycle::inventory(&lab.stage_root(), &lab.journal()).unwrap();
+    assert_eq!(pending.len(), 1);
+    assert!(pending[0].retention_reason.contains("Preview again"));
+    assert!(!pending[0].cleanup_eligible);
+    let outcome =
+        apply_staged_reconstruction_output(&plan, &lab.stage_root(), &lab.journal()).unwrap();
+    assert_eq!(
+        outcome.transaction.state,
+        crate::dat::rename_apply::model::TransactionState::Applied
+    );
+    assert_ne!(outcome.transaction.entries[0].source_path, stage);
+    assert_eq!(std::fs::read(&stage).unwrap(), before);
+    verify_staged_output(&plan, &plan.destination).unwrap();
+    let items = super::staging_lifecycle::inventory(&lab.stage_root(), &lab.journal()).unwrap();
+    let orphan = items.iter().find(|item| item.path == stage).unwrap();
+    assert!(orphan.retention_reason.contains("No recovery journal owns"));
+    assert!(!orphan.cleanup_eligible);
+    assert_eq!(
+        crate::dat::rename_apply::journal::list_journals(&lab.journal())
+            .0
+            .len(),
+        1
+    );
+}
+
+#[test]
+fn staging_repair_changed_journal_source_still_refuses_retry() {
+    use crate::dat::rename_apply::{model::TransactionState, rollback};
+    let lab = Lab::new();
+    let plan = repair_plan(&lab);
+    let mut first = apply_staged_reconstruction_output(&plan, &lab.stage_root(), &lab.journal())
+        .unwrap()
+        .transaction;
+    rollback::rollback_transaction_confined(
+        &mut first,
+        &lab.journal(),
+        &AtomicBool::new(false),
+        &TrustedRoots::from_paths([lab.root()]),
+    )
+    .unwrap();
+    assert_eq!(first.state, TransactionState::RolledBack);
+    let staged = &first.entries[0].source_path;
+    let retained = lab.root().join("retained-stage");
+    std::fs::rename(staged, &retained).unwrap();
+    std::fs::write(staged, b"foreign replacement").unwrap();
     let error =
         apply_staged_reconstruction_output(&plan, &lab.stage_root(), &lab.journal()).unwrap_err();
+    assert!(error.contains("changed journal ownership"), "{error}");
+    assert_eq!(std::fs::read(staged).unwrap(), b"foreign replacement");
+    assert!(retained.exists());
+    assert!(!plan.destination.exists());
+}
+
+#[test]
+fn staging_repair_unknown_symlink_is_shown_as_blocking_and_not_followed() {
+    use std::os::unix::fs::symlink;
+    let lab = Lab::new();
+    let plan = repair_plan(&lab);
+    std::fs::create_dir_all(lab.stage_root()).unwrap();
+    let victim = lab.root().join("foreign-file");
+    std::fs::write(&victim, b"foreign bytes").unwrap();
+    let link = lab
+        .stage_root()
+        .join(format!("mame-{}.zip.staged", "c".repeat(32)));
+    symlink(&victim, &link).unwrap();
+    let items = super::staging_lifecycle::inventory(&lab.stage_root(), &lab.journal()).unwrap();
+    assert!(items[0].retention_reason.contains("not a regular file"));
     assert!(
-        error.contains("unrecorded") && error.contains("Recovery"),
-        "{error}"
+        apply_staged_reconstruction_output(&plan, &lab.stage_root(), &lab.journal())
+            .unwrap_err()
+            .contains("not a regular file")
     );
-    assert_eq!(std::fs::read(stage).unwrap(), before);
+    assert_eq!(std::fs::read(victim).unwrap(), b"foreign bytes");
+    assert!(std::fs::symlink_metadata(link).unwrap().is_symlink());
     assert!(!plan.destination.exists());
 }
 
@@ -1973,4 +2040,41 @@ fn the_reserved_journal_marker_survives_the_staging_failure_suffix() {
         reserved_transaction_id("staged SHA-1/CRC/size mismatch for a"),
         None
     );
+}
+
+#[test]
+fn staging_inventory_treats_never_rebuilt_folder_as_empty() {
+    let lab = Lab::new();
+    std::fs::create_dir_all(lab.journal()).unwrap();
+    assert!(!lab.stage_root().exists());
+    let items = super::staging_lifecycle::inventory(&lab.stage_root(), &lab.journal()).unwrap();
+    assert!(items.is_empty());
+    assert!(
+        !lab.stage_root().exists(),
+        "inventory must not create staging"
+    );
+}
+
+#[test]
+fn staging_inventory_still_refuses_missing_stage_referenced_by_journal() {
+    let lab = Lab::new();
+    let plan = repair_plan(&lab);
+    apply_staged_reconstruction_output(&plan, &lab.stage_root(), &lab.journal()).unwrap();
+    std::fs::remove_dir_all(lab.stage_root()).unwrap();
+    assert!(super::staging_lifecycle::inventory(&lab.stage_root(), &lab.journal()).is_err());
+}
+
+#[test]
+fn staging_inventory_without_staging_refuses_ambiguous_journal_slots() {
+    let lab = Lab::new();
+    let plan = repair_plan(&lab);
+    apply_staged_reconstruction_output(&plan, &lab.stage_root(), &lab.journal()).unwrap();
+    std::fs::remove_dir_all(lab.stage_root()).unwrap();
+    let journal = std::fs::read_dir(lab.journal())
+        .unwrap()
+        .map(|e| e.unwrap().path())
+        .find(|p| p.extension().is_some_and(|e| e == "json"))
+        .unwrap();
+    std::fs::copy(&journal, lab.journal().join("copy-of-journal.json")).unwrap();
+    assert!(super::staging_lifecycle::inventory(&lab.stage_root(), &lab.journal()).is_err());
 }
