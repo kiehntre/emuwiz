@@ -763,7 +763,7 @@ mod tests {
 
     #[test]
     fn published_record_with_failed_follow_up_is_reported_as_unverified_not_missing() {
-        let (_root, directory, store) = fixture();
+        let (_root, _directory, store) = fixture();
         let saved = record("dev", "user");
         assert_eq!(
             store.save_failing_after_publish(&saved),
