@@ -110,6 +110,9 @@ pub(crate) use private_paths::{is_private_recovery_path, is_private_recovery_roo
 /// Whether this journal is, or cannot be shown not to be, in the compacted
 /// recovery format (written and undone only through its own authority).
 #[cfg(target_os = "linux")]
-pub(crate) fn uses_compact_recovery_format(journal_dir: &std::path::Path, transaction_id: &str) -> bool {
+pub(crate) fn uses_compact_recovery_format(
+    journal_dir: &std::path::Path,
+    transaction_id: &str,
+) -> bool {
     compact_recovery::is_enrolled(journal_dir, transaction_id)
 }
