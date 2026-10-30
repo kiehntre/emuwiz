@@ -93,7 +93,7 @@ fn visual_polish_card_metadata_has_one_baseline_per_row() {
     let mut tops = Vec::new();
     for clipped in &output.shapes {
         if let egui::Shape::Text(text) = &clipped.shape
-            && text.galley.text().starts_with("Not checked")
+            && text.galley.text().contains("Platform recognised")
         {
             tops.push(text.pos.y);
         }
