@@ -576,3 +576,154 @@ fn changed_expected_destination_is_refused_before_apply() {
     assert!(f.source.exists());
     assert!(!f.destination.exists());
 }
+
+// --- History's Undo by transaction id -------------------------------------
+
+fn journal_file(f: &Fixture) -> PathBuf {
+    crate::dat::rename_apply::journal_path(&f.journal(), &f.tx.transaction_id).unwrap()
+}
+
+#[test]
+fn history_selection_opens_the_exact_sealed_journal_after_a_restart_and_undoes_it() {
+    let mut f = Fixture::new(OrganisationMode::RenameInPlace);
+    f.apply().unwrap();
+    f.reload(); // restart: History holds the record read from disk
+    let history = f.tx.clone();
+    let mut opened = open_history_transaction_for_undo(&f.journal(), &history).unwrap();
+    assert_eq!(opened.transaction_id, history.transaction_id);
+    assert!(is_organisation_transaction(&opened));
+    assert!(undo_blocker(&opened).is_none());
+    let outcome = rollback_organisation_transaction(
+        &mut opened,
+        &f.journal(),
+        &no_cancel(),
+        &f.plan.master_root,
+    )
+    .unwrap();
+    assert_eq!(
+        outcome.rollback.result,
+        crate::dat::rename_apply::RollbackResult::FullyRolledBack
+    );
+    assert!(f.source.exists() && !f.destination.exists());
+    assert_eq!(f.path_id(&f.source), Some(f.id));
+}
+
+#[test]
+fn history_selection_refuses_a_wrong_or_unknown_id_and_a_mismatched_record() {
+    let mut f = Fixture::new(OrganisationMode::RenameInPlace);
+    f.apply().unwrap();
+    f.reload();
+    let mut other_id = f.tx.clone();
+    other_id.transaction_id = crate::dat::rename_apply::journal::new_transaction_id(42);
+    assert!(open_history_transaction_for_undo(&f.journal(), &other_id).is_err());
+    let mut unsafe_id = f.tx.clone();
+    unsafe_id.transaction_id = "../escape".into();
+    assert!(open_history_transaction_for_undo(&f.journal(), &unsafe_id).is_err());
+    // History's record disagrees with the journal on disk.
+    let mut stale = f.tx.clone();
+    stale.created_at_unix += 1;
+    let error = open_history_transaction_for_undo(&f.journal(), &stale).unwrap_err();
+    assert!(error.contains("no longer matches"), "{error}");
+    assert!(f.destination.exists() && !f.source.exists());
+}
+
+#[test]
+fn history_selection_refuses_a_journal_changed_after_it_was_sealed_and_undo_stays_refused() {
+    let mut f = Fixture::new(OrganisationMode::RenameInPlace);
+    f.apply().unwrap();
+    f.reload();
+    let history = f.tx.clone();
+    let path = journal_file(&f);
+    let mut edited: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+    edited["created_at_unix"] = serde_json::json!(1);
+    std::fs::write(&path, serde_json::to_vec(&edited).unwrap()).unwrap();
+    assert!(open_history_transaction_for_undo(&f.journal(), &history).is_err());
+    // The shared Undo applies its own seal gate to the same edited journal.
+    let mut held = history.clone();
+    let error = rollback_organisation_transaction(
+        &mut held,
+        &f.journal(),
+        &no_cancel(),
+        &f.plan.master_root,
+    )
+    .unwrap_err();
+    assert!(
+        crate::dat::rename_apply::is_journal_integrity_loss(&error),
+        "{error}"
+    );
+    assert!(f.destination.exists() && !f.source.exists());
+}
+
+#[test]
+fn history_selection_refuses_a_journal_replaced_by_a_symlink() {
+    let mut f = Fixture::new(OrganisationMode::RenameInPlace);
+    f.apply().unwrap();
+    f.reload();
+    let history = f.tx.clone();
+    let path = journal_file(&f);
+    let copy = f.temp.path().join("copy.json");
+    std::fs::copy(&path, &copy).unwrap();
+    std::fs::remove_file(&path).unwrap();
+    std::os::unix::fs::symlink(&copy, &path).unwrap();
+    assert!(open_history_transaction_for_undo(&f.journal(), &history).is_err());
+}
+
+#[test]
+fn history_selection_refuses_foreign_and_unsupported_transactions() {
+    // A linked library (symlink objects) is not an Organisation rename/move.
+    let mut linked = Fixture::new(OrganisationMode::BuildLinkedLibrary);
+    linked.apply().unwrap();
+    linked.reload();
+    let error = open_history_transaction_for_undo(&linked.journal(), &linked.tx).unwrap_err();
+    assert!(error.contains("not a ROM Organisation"), "{error}");
+
+    // A plain journalled rename with no catalogue binding is foreign.
+    let mut f = Fixture::new(OrganisationMode::RenameInPlace);
+    f.apply().unwrap();
+    f.reload();
+    let mut foreign = f.tx.clone();
+    for entry in &mut foreign.entries {
+        entry.unknown.clear();
+    }
+    assert!(!is_organisation_transaction(&foreign));
+    let mut workflow = f.tx.clone();
+    workflow.unknown.insert(
+        "workflow".into(),
+        serde_json::json!("mame_merged_reconstruction"),
+    );
+    assert!(!is_organisation_transaction(&workflow));
+    let mut copy = f.tx.clone();
+    copy.entries[0].operation = crate::dat::rename_apply::model::TransactionOperation::CreateCopy {
+        expected_source: copy.entries[0].source_path.clone(),
+        destination_root: f.plan.master_root.clone(),
+    };
+    assert!(!is_organisation_transaction(&copy));
+    assert!(!is_organisation_transaction(&RenameTransaction {
+        entries: Vec::new(),
+        ..f.tx.clone()
+    }));
+}
+
+#[test]
+fn history_selection_of_a_partial_undo_stays_actionable_and_a_finished_one_is_explained() {
+    let mut f = Fixture::new(OrganisationMode::MoveRealFile);
+    f.apply().unwrap();
+    f.fault();
+    assert!(f.undo().is_err());
+    f.reload();
+    assert_eq!(f.tx.entries[0].state, EntryState::RollingBack);
+    let reopened = open_history_transaction_for_undo(&f.journal(), &f.tx).unwrap();
+    assert!(
+        undo_blocker(&reopened).is_none(),
+        "an interrupted Undo must stay retryable"
+    );
+    f.clear_fault();
+    let mut retry = reopened;
+    rollback_organisation_transaction(&mut retry, &f.journal(), &no_cancel(), &f.plan.master_root)
+        .unwrap();
+    f.reload();
+    let finished = open_history_transaction_for_undo(&f.journal(), &f.tx).unwrap();
+    let reason = undo_blocker(&finished).expect("nothing left to undo");
+    assert!(reason.contains("already undone"), "{reason}");
+}

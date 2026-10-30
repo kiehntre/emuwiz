@@ -651,3 +651,131 @@ fn an_older_emuwiz_disables_organisation_and_undo_without_any_change() {
     let id = undo(&mut app);
     assert_eq!(app.activity.jobs[&id].phase, Phase::Complete);
 }
+
+// --- History's Undo by transaction id: page-level refusals ----------------
+
+/// A sealed catalogue marker, so the record is shaped like an Organisation
+/// record. Opening it still needs the journal's own seal and exact match.
+fn marked(mut transaction: RenameTransaction) -> RenameTransaction {
+    for entry in &mut transaction.entries {
+        entry
+            .unknown
+            .insert("organisation_catalogue_v1".into(), serde_json::json!({}));
+    }
+    transaction
+}
+
+#[test]
+fn history_selection_of_a_wrong_id_or_unsealed_record_keeps_the_held_handle_and_says_which() {
+    let fixture = disposable();
+    let (mut app, held, _) = applied_app(&fixture, &["a"]);
+    // A record History shows whose journal does not exist or does not verify.
+    let mut elsewhere = marked(held.clone());
+    elsewhere.transaction_id =
+        archivefs_core::dat::rename_apply::journal::new_transaction_id(now() + 5);
+    let before = fs::read(
+        archivefs_core::dat::rename_apply::journal_path(&fixture.journal, &held.transaction_id)
+            .unwrap(),
+    )
+    .unwrap();
+    app.canonical_organisation_history.push(elsewhere.clone());
+    app.select_organisation_transaction(&elsewhere.transaction_id);
+    let page = &app.canonical_organisation;
+    assert_eq!(page.applied().unwrap().transaction_id, held.transaction_id);
+    let error = page.error().expect("a refusal is explained");
+    assert!(error.contains("Nothing was changed"), "{error}");
+    assert!(
+        error.contains(&held.transaction_id),
+        "the page says which transaction Undo still belongs to: {error}"
+    );
+    assert_eq!(
+        fs::read(
+            archivefs_core::dat::rename_apply::journal_path(&fixture.journal, &held.transaction_id)
+                .unwrap()
+        )
+        .unwrap(),
+        before,
+        "the held journal is untouched"
+    );
+    assert!(fixture.root.join("a.new.bin").exists());
+}
+
+#[test]
+fn history_selection_of_a_foreign_record_is_refused_even_when_it_looks_organised() {
+    let fixture = disposable();
+    let (mut app, held, _) = applied_app(&fixture, &["a"]);
+    // The held journal is a real sealed record, but unmarked: selecting it as
+    // an Organisation record must be refused, not adopted.
+    app.canonical_organisation_history.clear();
+    app.canonical_organisation_history
+        .push(marked(held.clone()));
+    app.select_organisation_transaction(&held.transaction_id);
+    let error = app.canonical_organisation.error().unwrap();
+    assert!(
+        error.contains("not a ROM Organisation") || error.contains("no longer matches"),
+        "{error}"
+    );
+    assert_eq!(
+        app.canonical_organisation.applied().unwrap().transaction_id,
+        held.transaction_id
+    );
+}
+
+#[test]
+fn history_selection_never_replaces_an_unresolved_handle() {
+    let fixture = disposable();
+    let locked = fixture.root.join("locked");
+    fs::create_dir(&locked).unwrap();
+    fs::set_permissions(&locked, fs::Permissions::from_mode(0o555)).unwrap();
+    if fs::write(locked.join("probe"), b"x").is_ok() {
+        fs::set_permissions(&locked, fs::Permissions::from_mode(0o755)).unwrap();
+        eprintln!("SKIPPED: directory permissions are not enforced for this user");
+        return;
+    }
+    let entries = vec![
+        entry(&fixture.root, "a", fixture.root.join("a.new.bin")),
+        entry(&fixture.root, "b", locked.join("b.new.bin")),
+    ];
+    let (result, transaction) = real_apply(&fixture.root, &fixture.journal, entries);
+    fs::set_permissions(&locked, fs::Permissions::from_mode(0o755)).unwrap();
+    let context = egui::Context::default();
+    let mut app = fixture_app(&context);
+    app.canonical_organisation = reviewed_page(&fixture);
+    let mut worker = reviewed_page(&fixture);
+    worker.record_apply_result_for_test(result, transaction.clone());
+    finish(&mut app, Kind::Apply, worker);
+    let held = app.canonical_organisation.applied().unwrap().clone();
+
+    let mut other = marked(held.clone());
+    other.transaction_id =
+        archivefs_core::dat::rename_apply::journal::new_transaction_id(now() + 9);
+    app.canonical_organisation_history.push(other.clone());
+    app.select_organisation_transaction(&other.transaction_id);
+    let page = &app.canonical_organisation;
+    assert_eq!(page.applied().unwrap().transaction_id, held.transaction_id);
+    let error = page.error().unwrap();
+    assert!(error.contains("still needs recovery"), "{error}");
+    assert!(error.contains(&held.transaction_id), "{error}");
+    assert!(page.has_plan_for_test(), "the reviewed plan is kept");
+}
+
+#[test]
+fn history_selection_waits_for_a_running_organisation_job() {
+    let fixture = disposable();
+    let (mut app, held, _) = applied_app(&fixture, &["a"]);
+    app.canonical_organisation_history
+        .push(marked(held.clone()));
+    let id = app
+        .activity
+        .queue("Organisation", Route::Section(Section::Build), false);
+    let generation = app.canonical_organisation_generation;
+    app.canonical_organisation_job = Some(super::super::CanonicalOrganisationJob {
+        id,
+        kind: Kind::Rollback,
+        generation,
+        input_fingerprint: app.canonical_organisation.input_fingerprint(),
+    });
+    app.select_organisation_transaction(&held.transaction_id);
+    assert!(app.notice.is_some());
+    assert!(app.canonical_organisation.error().is_none());
+}
