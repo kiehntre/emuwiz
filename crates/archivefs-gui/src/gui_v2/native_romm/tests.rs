@@ -375,6 +375,21 @@ fn cached_pages_and_details_are_reused_and_reconnect_clears_them() {
     assert!(state.details.is_empty());
 }
 #[test]
+fn explicit_refresh_discards_cached_details_as_well_as_pages() {
+    let mut state = connected();
+    state.select_game(1);
+    let reply = call(&Fixture::default(), Request::Detail(1));
+    state.absorb(&egui::Context::default(), state.generation, Ok(reply));
+    state.back();
+    assert!(!state.details.is_empty());
+    state.refresh_games();
+    assert!(state.pages.is_empty());
+    assert!(state.details.is_empty());
+    assert!(matches!(state.browse.pending, Some(Request::Games { .. })));
+    state.select_game(1);
+    assert!(matches!(state.browse.pending, Some(Request::Detail(1))));
+}
+#[test]
 fn browser_fits_a_1024_by_600_display() {
     let mut state = connected();
     let ctx = egui::Context::default();

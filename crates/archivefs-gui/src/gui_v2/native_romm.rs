@@ -461,6 +461,11 @@ impl State {
     fn page_key(&self, offset: u32) -> (Option<u64>, String, u32) {
         (self.platform, self.search.trim().to_owned(), offset)
     }
+    fn refresh_games(&mut self) {
+        self.pages.clear();
+        self.details.clear();
+        self.games(self.offset);
+    }
     fn select_game(&mut self, id: u64) {
         self.selected = Some(id);
         self.last_selected = Some(id);
@@ -854,8 +859,7 @@ impl State {
                 .add_enabled(!self.browse.active(), egui::Button::new("Refresh games"))
                 .clicked()
             {
-                self.pages.clear();
-                self.games(self.offset);
+                self.refresh_games();
             }
         });
         if capabilities.platforms && self.platforms.is_empty() {
