@@ -192,6 +192,9 @@ pub(super) fn system_source_note(source: Option<&str>) -> &'static str {
     match source {
         Some(archivefs_core::MANUAL_PLATFORM_SOURCE) => "You chose this system.",
         Some("header_identity") => "Detected from the file's own header.",
+        Some("archive_member_structure") => {
+            "Detected from bounded structure inside the ZIP; this does not identify the game or verify a catalogue match."
+        }
         Some("verified_dat") | Some("verified_dat+romm") => {
             "Established by a verified catalogue match."
         }

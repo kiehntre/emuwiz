@@ -17,6 +17,7 @@ use crate::patch_manager::{
     assess_cheat_applicability, parse_cht_text, validate_destination_root,
 };
 use crate::safe_read::TrustedRoots;
+use serde::{Deserialize, Serialize};
 
 /// Empirically exercised installed native core, not a name-based assertion.
 /// An upgrade must be tested again before its digest can be added.
@@ -41,6 +42,168 @@ impl PokeLaunchPreview {
     }
     pub fn game_path(&self) -> &Path {
         &self.path
+    }
+    pub fn identity_summary(&self) -> String {
+        self.cheats
+            .first()
+            .and_then(|c| c.target_identity.clone())
+            .unwrap_or_default()
+    }
+    pub fn entry_summary(&self, index: usize) -> Option<String> {
+        self.cheats.get(index).map(|cheat| {
+            cheat
+                .operations
+                .iter()
+                .map(|op| {
+                    format!(
+                        "bank {:?}, address {}, value {}, restore {:?}",
+                        op.bank,
+                        op.address.0,
+                        op.value.value,
+                        op.restore_value.map(|v| v.value)
+                    )
+                })
+                .collect::<Vec<_>>()
+                .join("; ")
+        })
+    }
+}
+
+/// A saved choice is bound to the exact snapshot, trainer and pin observed at
+/// preview time. It is never an instruction to start or activate an emulator.
+#[derive(Debug, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct SavedPokeProfile {
+    version: u8,
+    game_path: PathBuf,
+    game_sha256: String,
+    trainer_sha256: String,
+    pin_sha256: String,
+    identity: Vec<String>,
+    selected: Vec<usize>,
+}
+
+fn profile_for(preview: &PokeLaunchPreview, selected: &[usize]) -> SavedPokeProfile {
+    SavedPokeProfile {
+        version: 1,
+        game_path: preview.path.clone(),
+        game_sha256: preview.observations[0].1.sha256.clone(),
+        trainer_sha256: preview.observations[1].1.sha256.clone(),
+        pin_sha256: preview.observations[2].1.sha256.clone(),
+        identity: preview.game.identities.clone(),
+        selected: selected.to_vec(),
+    }
+}
+
+pub fn save_profile(
+    path: &Path,
+    preview: &PokeLaunchPreview,
+    selected: &[usize],
+) -> Result<(), String> {
+    use std::os::unix::fs::MetadataExt;
+    // The same composition gate used at launch rejects unsupported banks,
+    // overlapping addresses, duplicate selections and unrepresentable titles.
+    compose(preview, selected)?;
+    let parent = path.parent().ok_or("Profile has no parent directory.")?;
+    let root = parent.parent().ok_or("Profile root is missing.")?;
+    validate_destination_root(root).map_err(|e| format!("Unsafe profile root: {e}"))?;
+    match std::fs::create_dir(parent) {
+        Ok(()) => (),
+        Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => (),
+        Err(error) => return Err(error.to_string()),
+    }
+    validate_destination_root(parent).map_err(|e| format!("Unsafe profile folder: {e}"))?;
+    let parent_metadata = std::fs::metadata(parent).map_err(|e| e.to_string())?;
+    let body =
+        serde_json::to_string_pretty(&profile_for(preview, selected)).map_err(|e| e.to_string())?;
+    if body.len() > 4096 {
+        return Err("Saved POKE profile exceeds 4 KiB.".into());
+    }
+    crate::atomic_text::write_in_existing_parent(
+        path,
+        &body,
+        (parent_metadata.dev(), parent_metadata.ino()),
+    )
+    .map_err(|e| e.to_string())
+}
+
+pub fn load_profile(path: &Path, preview: &PokeLaunchPreview) -> Result<Vec<usize>, String> {
+    use std::io::Read;
+    let file = open_profile_without_links(path).map_err(|e| e.to_string())?;
+    let metadata = file.metadata().map_err(|e| e.to_string())?;
+    if metadata.len() > 4096 {
+        return Err("Saved POKE profile is not a bounded regular file.".into());
+    }
+    let mut bytes = Vec::new();
+    file.take(4097)
+        .read_to_end(&mut bytes)
+        .map_err(|e| e.to_string())?;
+    if bytes.len() > 4096 {
+        return Err("Saved POKE profile is too large.".into());
+    }
+    let saved: SavedPokeProfile = serde_json::from_slice(&bytes)
+        .map_err(|e| format!("Saved POKE profile is invalid: {e}"))?;
+    if saved.version != 1
+        || saved.game_path != preview.path
+        || saved.game_sha256 != preview.observations[0].1.sha256
+        || saved.trainer_sha256 != preview.observations[1].1.sha256
+        || saved.pin_sha256 != preview.observations[2].1.sha256
+        || saved.identity != preview.game.identities
+    {
+        return Err("Saved POKE profile belongs to a different game revision, trainer or verified identity. Review and save a new choice.".into());
+    }
+    compose(preview, &saved.selected)?;
+    Ok(saved.selected)
+}
+
+/// Open the complete profile path atomically, refusing links in every component.
+fn open_profile_without_links(path: &Path) -> std::io::Result<std::fs::File> {
+    #[cfg(target_os = "linux")]
+    {
+        use std::os::fd::FromRawFd;
+        use std::os::unix::ffi::OsStrExt;
+        #[repr(C)]
+        struct OpenHow {
+            flags: u64,
+            mode: u64,
+            resolve: u64,
+        }
+        let name = std::ffi::CString::new(path.as_os_str().as_bytes())?;
+        let how = OpenHow {
+            flags: (libc::O_RDONLY | libc::O_NONBLOCK | libc::O_CLOEXEC) as u64,
+            mode: 0,
+            resolve: 0x04, // RESOLVE_NO_SYMLINKS.
+        };
+        // SAFETY: the pathname and repr(C) argument remain live for this syscall.
+        // Unsupported kernels fail closed, including for a swapped FIFO.
+        let fd = unsafe {
+            libc::syscall(
+                libc::SYS_openat2,
+                libc::AT_FDCWD,
+                name.as_ptr(),
+                &how,
+                std::mem::size_of::<OpenHow>(),
+            )
+        };
+        if fd < 0 {
+            return Err(std::io::Error::last_os_error());
+        }
+        let file = unsafe { std::fs::File::from_raw_fd(fd as i32) };
+        if !file.metadata()?.is_file() {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "profile is not a regular file",
+            ));
+        }
+        Ok(file)
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        let _ = path;
+        Err(std::io::Error::new(
+            std::io::ErrorKind::Unsupported,
+            "profile loading requires no-symlink path opening",
+        ))
     }
 }
 
@@ -336,6 +499,76 @@ mod tests {
     };
     use crate::patch_manager::CheatApplicabilityMatch;
     use crate::patch_manager::{CheatDerivativeInput, render_retroarch_selected_derivative};
+
+    #[test]
+    fn saved_choice_is_bound_to_exact_game_and_trainer_and_never_activates() {
+        let (dir, game, path, roots) = fixture();
+        let selected_preview = preview(&game, &path, &roots).unwrap();
+        let saved = dir.path().join("profiles/choice.json");
+        save_profile(&saved, &selected_preview, &[0, 1]).unwrap();
+        assert_eq!(load_profile(&saved, &selected_preview).unwrap(), vec![0, 1]);
+        assert!(
+            !std::fs::read_to_string(&saved)
+                .unwrap()
+                .contains("activate")
+        );
+        assert!(save_profile(&saved, &selected_preview, &[0, 0]).is_err());
+        assert!(save_profile(&saved, &selected_preview, &[0, 99]).is_err());
+        let mut other = game.clone();
+        other.identities.push(format!("sha1:{}", "a".repeat(40)));
+        let changed = preview(&other, &path, &roots).unwrap();
+        assert!(load_profile(&saved, &changed).is_err());
+        std::fs::write(path.with_extension("pok"), "N Other\nZ 8 40000 1 0\nY\n").unwrap();
+        assert!(preview(&game, &path, &roots).is_err());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn saved_choice_refuses_linked_profile_directory() {
+        let (dir, game, path, roots) = fixture();
+        let selected_preview = preview(&game, &path, &roots).unwrap();
+        let actual = dir.path().join("actual");
+        std::fs::create_dir(&actual).unwrap();
+        let linked = dir.path().join("linked");
+        std::os::unix::fs::symlink(&actual, &linked).unwrap();
+        assert!(save_profile(&linked.join("choice.json"), &selected_preview, &[0]).is_err());
+        assert!(!actual.join("choice.json").exists());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn saved_choice_load_refuses_linked_profile_file() {
+        let (dir, game, game_path, roots) = fixture();
+        let selected_preview = preview(&game, &game_path, &roots).unwrap();
+        let actual = dir.path().join("actual.json");
+        save_profile(&actual, &selected_preview, &[0]).unwrap();
+        let linked = dir.path().join("linked.json");
+        std::os::unix::fs::symlink(&actual, &linked).unwrap();
+        assert!(load_profile(&linked, &selected_preview).is_err());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn saved_choice_load_refuses_linked_profile_parent() {
+        let (dir, game, game_path, roots) = fixture();
+        let selected_preview = preview(&game, &game_path, &roots).unwrap();
+        let actual = dir.path().join("actual");
+        std::fs::create_dir(&actual).unwrap();
+        save_profile(&actual.join("choice.json"), &selected_preview, &[0]).unwrap();
+        let linked = dir.path().join("linked");
+        std::os::unix::fs::symlink(&actual, &linked).unwrap();
+        assert!(load_profile(&linked.join("choice.json"), &selected_preview).is_err());
+    }
+
+    #[test]
+    fn oversized_saved_choice_is_never_published() {
+        let (dir, game, path, roots) = fixture();
+        let mut selected_preview = preview(&game, &path, &roots).unwrap();
+        selected_preview.path = PathBuf::from("x".repeat(4096));
+        let saved = dir.path().join("profiles/choice.json");
+        assert!(save_profile(&saved, &selected_preview, &[0]).is_err());
+        assert!(!saved.exists());
+    }
 
     fn fixture() -> (tempfile::TempDir, ClassicTrainerGame, PathBuf, TrustedRoots) {
         let dir = tempfile::tempdir().unwrap();
