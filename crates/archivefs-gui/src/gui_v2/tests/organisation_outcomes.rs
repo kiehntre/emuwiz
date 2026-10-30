@@ -790,3 +790,178 @@ fn history_selection_waits_for_a_running_organisation_job() {
     assert!(app.notice.is_some());
     assert!(app.canonical_organisation.error().is_none());
 }
+
+// --- End to end: a real database-bound Organisation, restart, History -----
+
+/// A real catalogue-bound Organisation Apply on disposable files and a
+/// disposable SQLite catalogue, through the same core entry points the page
+/// uses. Returns the catalogue path, the archive id and the applied record.
+fn bound_organisation_apply(
+    fixture: &Fixture,
+) -> (
+    PathBuf,
+    i64,
+    PathBuf,
+    PathBuf,
+    ApplyOutcome,
+    RenameTransaction,
+) {
+    use archivefs_core::dat::rom_organisation as org;
+    use archivefs_core::platform::identity::{
+        PlatformIdentityConfidence, PlatformIdentityEvidence, PlatformIdentityResolution,
+        PlatformIdentitySource,
+    };
+    let root = fixture.root.clone();
+    let incoming = root.join("incoming");
+    fs::create_dir_all(&incoming).unwrap();
+    let source = incoming.join("Old.zip");
+    fs::write(&source, b"fixture contents").unwrap();
+    let db_path = fixture.journal.parent().unwrap().join("catalogue.sqlite3");
+    let mut db = archivefs_core::Database::open_or_create(&db_path).unwrap();
+    db.register_source_folders(std::slice::from_ref(&root))
+        .unwrap();
+    let folder = db.list_source_folders().unwrap()[0].id;
+    let archive = archivefs_core::Archive::from_path_in_root(&source, &root).unwrap();
+    let id = db
+        .upsert_archive(folder, &root, &archive)
+        .unwrap()
+        .archive_id;
+    let candidate = org::OrganisationCandidate {
+        source_path: source.clone(),
+        resolution: PlatformIdentityResolution::Resolved {
+            generation: 1,
+            platform: "PSP".into(),
+            display_name: archivefs_core::platform::display_name_for("PSP").to_string(),
+            confidence: PlatformIdentityConfidence::High,
+            evidence: vec![PlatformIdentityEvidence {
+                platform: "PSP".into(),
+                source: PlatformIdentitySource::Manual,
+                confidence: PlatformIdentityConfidence::High,
+                generation: 1,
+                detail: "test evidence".into(),
+            }],
+        },
+        canonical_name: Some("New.zip".into()),
+        content_classification: None,
+        original_metadata: Default::default(),
+    };
+    let mode = org::OrganisationMode::RenameInPlace;
+    let mut plan = org::build_organisation_plan(&org::OrganisationPlanRequest {
+        master_root: &root,
+        mode,
+        content_policy: archivefs_core::dat::classification::ContentSelectionPolicy::AllEntries,
+        candidates: std::slice::from_ref(&candidate),
+        generation: 1,
+    });
+    org::prepare_organisation_catalogue(&mut plan, &db).unwrap();
+    let approved: std::collections::BTreeSet<String> =
+        [source.to_string_lossy().into_owned()].into();
+    let mut transaction = org::build_organisation_transaction(&plan, &approved, 1).unwrap();
+    let destination = transaction.entries[0].destination_path.clone();
+    let outcome = org::apply_organisation_transaction(
+        &mut transaction,
+        &approved,
+        1,
+        TrustedRoots::from_paths([root.clone()]),
+        &fixture.journal,
+        &std::sync::atomic::AtomicBool::new(false),
+        mode,
+        &root,
+        &db,
+    )
+    .expect("the bound organisation applies");
+    assert_eq!(outcome.transaction.state, TransactionState::Applied);
+    (db_path, id, source, destination, outcome, transaction)
+}
+
+/// Restart: a new app and a fresh page that hold nothing in memory; History
+/// is rebuilt only from the sealed journals on disk.
+fn restarted_app(fixture: &Fixture) -> App {
+    let context = egui::Context::default();
+    let mut app = fixture_app(&context);
+    app.canonical_organisation = reviewed_page(fixture);
+    match super::super::backend::load_repair_history(&fixture.journal, &[]) {
+        super::super::backend::Payload::RepairHistory { organisations, .. } => {
+            app.canonical_organisation_history = organisations
+        }
+        _ => unreachable!("load_repair_history returns the history payload"),
+    }
+    app
+}
+
+#[test]
+fn a_bound_organisation_is_selected_by_its_history_row_after_a_restart_and_undone_safely() {
+    use super::super::history_view::{HistorySources, build_entries};
+    let fixture = disposable();
+    let (db_path, archive_id, source, destination, outcome, transaction) =
+        bound_organisation_apply(&fixture);
+    let id = transaction.transaction_id.clone();
+    assert!(destination.exists() && !source.exists());
+
+    // Create, in a first session, through the real finisher.
+    {
+        let context = egui::Context::default();
+        let mut app = fixture_app(&context);
+        app.canonical_organisation = reviewed_page(&fixture);
+        let mut worker = reviewed_page(&fixture);
+        worker.record_apply_result_for_test(Ok(outcome), transaction.clone());
+        finish(&mut app, Kind::Apply, worker);
+        assert_eq!(history_state(&app, &id), TransactionState::Applied);
+    } // session closed
+
+    // Restart: nothing is held in memory.
+    let mut app = restarted_app(&fixture);
+    assert!(app.canonical_organisation.applied().is_none());
+    let rows = build_entries(
+        &HistorySources {
+            quarantine: &[],
+            playing_library: &[],
+            organisation: &app.canonical_organisation_history,
+            mame: &[],
+            evidence: &[],
+        },
+        None,
+    );
+    let row = rows.iter().find(|row| row.transaction_id == id).unwrap();
+    assert!(row.handoff.selects_organisation);
+    assert_eq!(row.handoff.label, "Open Organisation");
+    assert_eq!(row.handoff.route, Route::Section(Section::Build));
+
+    // The History click selects exactly that row's transaction.
+    app.select_organisation_transaction(&row.transaction_id);
+    let page = &mut app.canonical_organisation;
+    assert!(page.error().is_none(), "{:?}", page.error());
+    assert_eq!(page.applied().unwrap().transaction_id, id);
+    assert!(page_offers_undo(page));
+
+    // Undo restores the original file and the catalogue association.
+    let job = undo(&mut app);
+    assert_eq!(app.activity.jobs[&job].phase, Phase::Complete);
+    assert_eq!(fs::read(&source).unwrap(), b"fixture contents");
+    assert!(!destination.exists());
+    let db = archivefs_core::Database::open_or_create(&db_path).unwrap();
+    assert_eq!(
+        db.find_archive_id_by_absolute_path(&source).unwrap(),
+        Some(archive_id)
+    );
+    assert_eq!(
+        db.find_archive_id_by_absolute_path(&destination).unwrap(),
+        None
+    );
+    assert_eq!(history_state(&app, &id), TransactionState::RolledBack);
+    assert!(app.canonical_organisation.applied().is_none());
+
+    // Another restart: the finished Undo is a status, not a Roll back button.
+    let mut again = restarted_app(&fixture);
+    again.select_organisation_transaction(&id);
+    let page = &mut again.canonical_organisation;
+    assert!(page.applied().is_none());
+    assert!(page.error().is_none(), "{:?}", page.error());
+    assert!(page.result_complete());
+    assert!(
+        page.result_message().unwrap().contains("already undone"),
+        "{:?}",
+        page.result_message()
+    );
+    assert!(!page_offers_undo(page));
+}

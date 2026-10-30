@@ -66,6 +66,14 @@ pub fn open_history_transaction_for_undo(
     let id = history.transaction_id.as_str();
     let path = journal_path(journal_dir, id)
         .ok_or_else(|| format!("{id} is not a valid transaction id."))?;
+    // Compact-format records are written and undone only through their own
+    // recovery authority, never the seal store this route verifies against.
+    #[cfg(target_os = "linux")]
+    if crate::dat::rename_apply::uses_compact_recovery_format(journal_dir, id) {
+        return Err(format!(
+            "{id} uses, or cannot be shown to avoid, the compacted recovery format, which is undone only through its own recovery route. It was not opened for Organisation Undo. Nothing was changed."
+        ));
+    }
     let check = seal::verify(journal_dir, id);
     if !check.trusted() {
         return Err(check.refusal().unwrap_or_else(|| {

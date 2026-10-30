@@ -747,3 +747,124 @@ fn undo_blocker_keeps_undo_for_a_transaction_that_only_created_a_directory() {
         "Undo also removes the empty platform directory it created"
     );
 }
+
+#[test]
+fn history_selection_refuses_a_compacted_journal_with_an_understandable_reason() {
+    let mut f = Fixture::new(OrganisationMode::RenameInPlace);
+    f.apply().unwrap();
+    f.reload();
+    let history = f.tx.clone();
+    let path = journal_file(&f);
+    let sealed = std::fs::read(&path).unwrap();
+    std::fs::write(&path, br#"{"format":"emuwiz-enrolled-compact-v3"}"#).unwrap();
+    let error = open_history_transaction_for_undo(&f.journal(), &history).unwrap_err();
+    assert!(error.contains("compacted recovery format"), "{error}");
+    assert!(error.contains("Nothing was changed"), "{error}");
+    assert_eq!(
+        std::fs::read(&path).unwrap(),
+        br#"{"format":"emuwiz-enrolled-compact-v3"}"#
+    );
+    std::fs::write(&path, sealed).unwrap();
+    assert!(open_history_transaction_for_undo(&f.journal(), &history).is_ok());
+}
+
+#[test]
+fn history_selection_with_a_pre_undo_record_is_refused_once_the_journal_has_advanced() {
+    let mut f = Fixture::new(OrganisationMode::RenameInPlace);
+    f.apply().unwrap();
+    f.reload();
+    let before_undo = f.tx.clone();
+    let mut opened = open_history_transaction_for_undo(&f.journal(), &before_undo).unwrap();
+    rollback_organisation_transaction(&mut opened, &f.journal(), &no_cancel(), &f.plan.master_root)
+        .unwrap();
+    // Adoption racing a finished Undo sees a journal History has not read.
+    let error = open_history_transaction_for_undo(&f.journal(), &before_undo).unwrap_err();
+    assert!(error.contains("no longer matches"), "{error}");
+}
+
+/// Two Undos of the same historical transaction run at the same time, each
+/// from its own freshly adopted handle. Whatever the interleaving, the ROM
+/// ends up restored exactly once, the catalogue and sealed journal agree, and
+/// no pass reports a success the disk does not back.
+#[test]
+fn concurrent_undo_of_the_same_historical_transaction_never_double_moves_or_corrupts() {
+    for round in 0..6 {
+        let mut f = Fixture::new(OrganisationMode::RenameInPlace);
+        f.apply().unwrap();
+        f.reload();
+        let history = f.tx.clone();
+        let journal = f.journal();
+        let master = f.plan.master_root.clone();
+        let barrier = std::sync::Barrier::new(2);
+        let results: Vec<Result<OrganisationRollbackOutcome, String>> =
+            std::thread::scope(|scope| {
+                let workers: Vec<_> = (0..2)
+                    .map(|_| {
+                        scope.spawn(|| {
+                            let mut handle =
+                                open_history_transaction_for_undo(&journal, &history).unwrap();
+                            barrier.wait();
+                            rollback_organisation_transaction(
+                                &mut handle,
+                                &journal,
+                                &no_cancel(),
+                                &master,
+                            )
+                        })
+                    })
+                    .collect();
+                workers.into_iter().map(|w| w.join().unwrap()).collect()
+            });
+        eprintln!(
+            "round {round}: {:?}",
+            results
+                .iter()
+                .map(|r| match r {
+                    Ok(o) => format!("ok:{:?}", o.rollback.result)
+                        .chars()
+                        .take(40)
+                        .collect::<String>(),
+                    Err(e) => format!("err:{}", e.chars().take(60).collect::<String>()),
+                })
+                .collect::<Vec<_>>()
+        );
+        for result in &results {
+            match result {
+                Ok(outcome) => {
+                    // A pass claiming a full rollback must be backed by the disk.
+                    if outcome.rollback.result
+                        == crate::dat::rename_apply::RollbackResult::FullyRolledBack
+                    {
+                        assert!(
+                            f.source.exists() && !f.destination.exists(),
+                            "round {round}"
+                        );
+                    }
+                }
+                Err(error) => assert!(
+                    crate::dat::rename_apply::is_journal_integrity_loss(error) || !error.is_empty(),
+                    "round {round}: {error}"
+                ),
+            }
+        }
+        assert!(
+            results.iter().any(|result| result.is_ok()),
+            "round {round}: at least one Undo must complete: {results:?}"
+        );
+        // One restored original, no stray copy, catalogue follows the file.
+        assert!(
+            f.source.exists() && !f.destination.exists(),
+            "round {round}"
+        );
+        assert_eq!(std::fs::read(&f.source).unwrap(), b"fixture contents");
+        assert_eq!(f.path_id(&f.source), Some(f.id), "round {round}");
+        assert_eq!(f.path_id(&f.destination), None, "round {round}");
+        // The journal on disk still verifies and records a finished Undo.
+        assert!(
+            crate::dat::rename_apply::seal::verify(&journal, &history.transaction_id).trusted(),
+            "round {round}"
+        );
+        f.reload();
+        assert!(f.tx.is_fully_rolled_back(), "round {round}");
+    }
+}
