@@ -240,7 +240,12 @@ impl State {
             Outcome::Inspected(Err(error)) | Outcome::Planned(Err(error)) => {
                 self.error = Some(error)
             }
-            Outcome::Planned(Ok(plan)) => self.plan = Some(plan),
+            Outcome::Planned(Ok(plan)) => {
+                // A preview that finishes after the user revoked order approval is stale.
+                if self.order_reviewed || plan.patches.len() == 1 {
+                    self.plan = Some(plan);
+                }
+            }
             Outcome::Applied(result) => {
                 self.plan = None;
                 self.result = Some(result);
@@ -689,6 +694,41 @@ mod tests {
         assert_eq!(result.provenance.patches.len(), 2);
         assert_eq!(result.provenance.source_path, game);
         assert_eq!(result.provenance.package_path, package);
+    }
+
+    #[test]
+    fn late_preview_is_dropped_after_order_approval_is_revoked() {
+        let directory = tempfile::tempdir().unwrap();
+        let game = directory.path().join("game.rom");
+        fs::write(&game, b"old").unwrap();
+        let package = directory.path().join("patches.zip");
+        let mut zip = zip::ZipWriter::new(fs::File::create(&package).unwrap());
+        for (name, a, b) in [
+            ("a.bps", &b"old"[..], &b"Xld"[..]),
+            ("b.bps", b"Xld", b"Yld"),
+        ] {
+            zip.start_file(name, zip::write::SimpleFileOptions::default())
+                .unwrap();
+            zip.write_all(&bps(a, b)).unwrap();
+        }
+        zip.finish().unwrap();
+        let report = patch_package_preview::inspect(&package).unwrap();
+        let candidate = PatchCompositionCandidate {
+            source_path: game.clone(),
+            verified_identity: Some("sha256:verified".into()),
+        };
+        let root = directory.path().join("derived");
+        let plan = plan_with_root(&report, candidate, &game, &[0, 1], &root).unwrap();
+        let (sender, receiver) = mpsc::channel();
+        let mut state = State {
+            order: vec![0, 1],
+            order_reviewed: false,
+            job: Some(receiver),
+            ..Default::default()
+        };
+        assert!(sender.send(Outcome::Planned(Ok(plan))).is_ok());
+        state.poll();
+        assert!(state.plan.is_none());
     }
 
     #[test]
