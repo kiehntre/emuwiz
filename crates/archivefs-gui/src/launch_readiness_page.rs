@@ -49,7 +49,7 @@ pub(crate) mod cemu;
 mod cemu_stop;
 mod classic_pokes;
 pub(crate) mod controller_readiness;
-mod desmume;
+pub(crate) mod desmume;
 pub(crate) mod dosbox;
 #[path = "launch_readiness_page/flycast.rs"]
 pub(crate) mod flycast;

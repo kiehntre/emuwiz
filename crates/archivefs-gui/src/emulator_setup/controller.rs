@@ -1021,6 +1021,20 @@ impl ArchiveFsApp {
             })
         });
         let mut identity_status = identity_status;
+        if matches!(
+            identity_status,
+            archivefs_core::launch::CanonicalIdentityStatus::Unknown
+        ) && let Some(path) = focused
+            && let selected_evidence_page::SelectedEvidenceState::Ready { report, .. } =
+                &self.selected_evidence_ui.selected_evidence
+            && let Some(identity) = crate::launch_readiness_page::desmume::selected_identity(
+                path,
+                report,
+                evidence_freshness,
+            )
+        {
+            identity_status = identity;
+        }
         let mut mame_set_resolutions = Vec::new();
         if let Some(focused) = focused
             && let Ok(database_path) = archivefs_core::default_database_path()
