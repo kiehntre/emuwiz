@@ -139,6 +139,26 @@ pub fn inspect_adz(path: &Path) -> Result<AdzInspection, AdzError> {
     inspect_adz_in_temp_dir(path, &std::env::temp_dir())
 }
 
+/// Reuse the ADF validator for an already bounded, complete in-memory member.
+/// The staging inode is private and unlinked; no archive name becomes a path.
+pub(crate) fn inspect_adf_member_bytes_in_temp_dir(
+    bytes: &[u8],
+    temp_dir: &Path,
+) -> Result<AmigaFloppyInspection, AdzError> {
+    if bytes.len() as u64 > MAX_ADZ_DECOMPRESSED_BYTES {
+        return Err(AdzError::DecompressedTooLarge {
+            limit: MAX_ADZ_DECOMPRESSED_BYTES,
+        });
+    }
+    let mut temp = open_private_temp_file(temp_dir)
+        .map_err(|error| AdzError::TempFileUnavailable(error.to_string()))?;
+    temp.write_all(bytes)
+        .map_err(|error| AdzError::Io(error.to_string()))?;
+    temp.flush()
+        .map_err(|error| AdzError::Io(error.to_string()))?;
+    amiga_disk::inspect_amiga_floppy(&proc_self_fd_path(temp.as_raw_fd())).map_err(AdzError::NotAdf)
+}
+
 pub(crate) fn inspect_adz_in_temp_dir(
     path: &Path,
     temp_dir: &Path,

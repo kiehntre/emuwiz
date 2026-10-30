@@ -195,7 +195,7 @@ fn healthy(request: &Request) -> Reply {
         "/openapi.json" => Reply::json(api()),
         "/api/platforms" => Reply::json(json!([
             {"id":7,"slug":"gb","fs_slug":"gb","name":"Game Boy","rom_count":5,"igdb_id":33},
-            {"id":8,"slug":"custom-console","name":"Custom","rom_count":0}
+            {"id":8,"slug":"custom-console","name":"Custom","rom_count":0,"moby_id":-1}
         ])),
         "/api/roms" => {
             if request.authorization.as_deref() != Some(format!("Bearer {TOKEN}").as_str()) {
@@ -334,6 +334,8 @@ fn platforms_reuse_normalisation_and_preserve_unknowns() {
         );
         assert_eq!(platforms[0].system_identifiers["igdb_id"], "33");
         assert_eq!(platforms[1].mapping, RommPlatformMapping::Unknown);
+        // RomM's negative "no match" sentinel must not fail the whole list.
+        assert!(!platforms[1].system_identifiers.contains_key("moby_id"));
         assert_eq!(platforms[0].provenance.observed_at_unix_seconds, 42);
     });
 }

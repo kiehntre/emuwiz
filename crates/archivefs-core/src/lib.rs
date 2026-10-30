@@ -632,6 +632,7 @@ pub mod platform_evidence_fusion;
 /// each candidate member's decompressed bytes, with an explicit multi-
 /// member policy that never silently picks a "winning" member.
 pub mod archive_member_content_evidence;
+mod archive_platform_members;
 
 /// Machine-counted evidence coverage inventory: one small manifest linked
 /// to canonical platform ids from [`platform::PLATFORMS`], plus counting

@@ -159,13 +159,20 @@ fn attempt_with_endpoints<T: RommTransport>(
                 info,
                 platforms: vec![],
                 page: None,
+                platform_warning: false,
                 token: source.token().clone(),
             });
         }
-        let platforms = if info.capabilities.platforms {
-            browser.platforms(Some(cancel)).map_err(Problem::Backend)?
+        let (platforms, platform_warning) = if info.capabilities.platforms {
+            match browser.platforms(Some(cancel)) {
+                Ok(platforms) => (platforms, false),
+                Err(RommBrowseError::Cancelled) => {
+                    return Err(Problem::Backend(RommBrowseError::Cancelled));
+                }
+                Err(_) => (vec![], true),
+            }
         } else {
-            vec![]
+            (vec![], false)
         };
         let page = if info.capabilities.games {
             Some(
@@ -180,6 +187,7 @@ fn attempt_with_endpoints<T: RommTransport>(
             info,
             platforms,
             page,
+            platform_warning,
             token: source.token().clone(),
         });
     }

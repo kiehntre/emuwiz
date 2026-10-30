@@ -65,17 +65,52 @@ const WRITER_RESOURCES: [(&str, &str); 3] = [
 ];
 const PROCESS_LIMIT: Duration = Duration::from_secs(30 * 60);
 pub const DERIVED_LABEL: &str = "Derived playing copy: retain original discs";
+pub const SUPPORTED_INPUTS: &str = "2–5 verified PS1 discs; one raw MODE2/2352 BIN/CUE track per disc, INDEX 01 00:00:00, no gaps, audio or extra indexes";
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct PbpExportError(pub String);
+pub struct PbpExportError {
+    pub detail: String,
+    pub recovery: Option<PbpRecoveryStatus>,
+}
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum PbpRecoveryStatus {
+    Unknown,
+    NothingPublished {
+        transaction_id: String,
+        stage: PathBuf,
+    },
+    RolledBack {
+        transaction_id: String,
+        stage: PathBuf,
+    },
+    NeedsReview {
+        transaction_id: String,
+        stage: PathBuf,
+        detail: String,
+    },
+}
 impl std::fmt::Display for PbpExportError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.write_str(&self.0)
+        f.write_str(&self.detail)
     }
 }
 impl std::error::Error for PbpExportError {}
 fn refuse(detail: impl Into<String>) -> PbpExportError {
-    PbpExportError(detail.into())
+    PbpExportError {
+        detail: detail.into(),
+        recovery: None,
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PbpExportProgress {
+    Rechecking,
+    Copying { disc: u16, total: usize },
+    Packaging,
+    Extracting,
+    Comparing { disc: u16, total: usize },
+    Publishing,
+    Recovering,
 }
 
 #[derive(Debug, Clone)]
@@ -87,6 +122,29 @@ pub struct PbpDiscProof {
     bin_sha256: String,
     serial: String,
     dat_entry: String,
+}
+impl PbpDiscProof {
+    pub fn ordinal(&self) -> u16 {
+        self.ordinal
+    }
+    pub fn cue(&self) -> &Path {
+        &self.cue
+    }
+    pub fn bin(&self) -> &Path {
+        &self.bin
+    }
+    pub fn serial(&self) -> &str {
+        &self.serial
+    }
+    pub fn dat_entry(&self) -> &str {
+        &self.dat_entry
+    }
+    pub fn cue_sha256(&self) -> &str {
+        &self.cue_sha256
+    }
+    pub fn bin_sha256(&self) -> &str {
+        &self.bin_sha256
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -110,6 +168,24 @@ impl PbpExportPlan {
     }
     pub fn region(&self) -> &str {
         &self.region
+    }
+    pub fn discs(&self) -> &[PbpDiscProof] {
+        &self.discs
+    }
+    pub fn receipt_path(&self) -> &Path {
+        &self.receipt_path
+    }
+    pub fn release(&self) -> &str {
+        &self.set.identity.key.value
+    }
+    pub fn dat_source(&self) -> &str {
+        &self.dat_source
+    }
+    pub fn dat_revision(&self) -> &str {
+        &self.dat_revision
+    }
+    pub fn dat_catalogue_sha256(&self) -> &str {
+        &self.dat_catalogue_sha256
     }
 }
 
@@ -586,6 +662,20 @@ pub fn execute_ps1_pbp_export(
     journal_dir: &Path,
     cancel: &AtomicBool,
 ) -> Result<PbpExportResult, PbpExportError> {
+    execute_ps1_pbp_export_with_progress(db, sources, plan, journal_dir, cancel, &|_| {})
+}
+
+/// The same fail-closed executor with read-only progress notifications for a
+/// background UI worker. Notifications never authorize or alter a transaction.
+pub fn execute_ps1_pbp_export_with_progress(
+    db: &Database,
+    sources: &[DatSourceEntry],
+    plan: &PbpExportPlan,
+    journal_dir: &Path,
+    cancel: &AtomicBool,
+    progress: &dyn Fn(PbpExportProgress),
+) -> Result<PbpExportResult, PbpExportError> {
+    progress(PbpExportProgress::Rechecking);
     let fresh = plan_ps1_pbp_export(
         db,
         sources,
@@ -650,6 +740,10 @@ pub fn execute_ps1_pbp_export(
     fs::create_dir(&extracted_dir).map_err(|e| refuse(e.to_string()))?;
     let mut playlist = String::new();
     for disc in &plan.discs {
+        progress(PbpExportProgress::Copying {
+            disc: disc.ordinal,
+            total: plan.discs.len(),
+        });
         let folder = input_dir.join(format!("disc{}", disc.ordinal));
         fs::create_dir(&folder).map_err(|e| refuse(e.to_string()))?;
         let cue = folder.join(
@@ -672,6 +766,7 @@ pub fn execute_ps1_pbp_export(
     let playlist_path = stage_path.join("export.m3u");
     fs::write(&playlist_path, playlist).map_err(|e| refuse(e.to_string()))?;
     let output_flag = Path::new("-o");
+    progress(PbpExportProgress::Packaging);
     run_writer(
         &plan.writer,
         &[
@@ -697,6 +792,7 @@ pub fn execute_ps1_pbp_export(
     {
         return Err(refuse("writer created unexpected output files"));
     }
+    progress(PbpExportProgress::Extracting);
     run_writer(
         &plan.writer,
         &[Path::new("-i"), &staged_pbp, output_flag, &extracted_dir],
@@ -712,6 +808,10 @@ pub fn execute_ps1_pbp_export(
     }
     let mut verified = Vec::new();
     for disc in &plan.discs {
+        progress(PbpExportProgress::Comparing {
+            disc: disc.ordinal,
+            total: plan.discs.len(),
+        });
         let cue = extracted_dir.join(format!("export - Disc {}.cue", disc.ordinal));
         let bin = extracted_dir.join(format!("export - Disc {}.bin", disc.ordinal));
         if !files.contains(&cue) || !files.contains(&bin) {
@@ -832,6 +932,7 @@ pub fn execute_ps1_pbp_export(
         journal_dir: journal_dir.to_path_buf(),
         audit_cache: crate::dat::sources::audit_cache::AuditCacheConfig::Disabled,
     };
+    progress(PbpExportProgress::Publishing);
     let outcome = apply_repair_transaction(&mut RepairApplyExecution {
         transaction: &mut tx,
         current_generation: 0,
@@ -849,25 +950,40 @@ pub fn execute_ps1_pbp_export(
                 .all(|entry| entry.outcome == RepairReverifyOutcome::Verified)
     });
     if !confirmed {
+        progress(PbpExportProgress::Recovering);
         let detail = outcome
             .err()
             .map(|e| e.to_string())
             .unwrap_or_else(|| "transaction did not confirm both outputs".into());
-        let rollback = if tx.state == TransactionState::Planned {
-            "nothing moved".into()
+        let recovery = if tx.state == TransactionState::Planned {
+            PbpRecoveryStatus::NothingPublished {
+                transaction_id: tx.transaction_id.clone(),
+                stage: retained.clone(),
+            }
         } else {
             match rollback_repair_transaction(&mut tx, journal_dir, &AtomicBool::new(false)) {
                 Ok(crate::dat::rename_apply::model::RollbackResult::FullyRolledBack) => {
-                    "fully rolled back".into()
+                    PbpRecoveryStatus::RolledBack {
+                        transaction_id: tx.transaction_id.clone(),
+                        stage: retained.clone(),
+                    }
                 }
-                Ok(other) => format!("rollback incomplete ({other:?}); manual recovery required"),
-                Err(error) => format!("rollback failed ({error}); manual recovery required"),
+                Ok(other) => PbpRecoveryStatus::NeedsReview {
+                    transaction_id: tx.transaction_id.clone(),
+                    stage: retained.clone(),
+                    detail: format!("rollback incomplete ({other:?})"),
+                },
+                Err(error) => PbpRecoveryStatus::NeedsReview {
+                    transaction_id: tx.transaction_id.clone(),
+                    stage: retained.clone(),
+                    detail: format!("rollback failed ({error})"),
+                },
             }
         };
-        return Err(refuse(format!(
-            "publication not confirmed: {detail}; {rollback}; stage retained at {}",
-            retained.display()
-        )));
+        return Err(PbpExportError {
+            detail: format!("publication not confirmed: {detail}; {recovery:?}"),
+            recovery: Some(recovery),
+        });
     }
     let result = outcome.expect("confirmed outcome was Ok");
     let mut cleanup_errors = Vec::new();

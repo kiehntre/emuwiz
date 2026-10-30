@@ -171,6 +171,9 @@ fn run(kind: &str) {
             .env_clear()
             .envs(f.child_environment())
             .env("EMUWIZ_TEST_REAL_ENVIRONMENT", "1")
+            // The full Blue fixture needs a normal application-sized stack;
+            // libtest's child test thread defaults to only 2 MiB.
+            .env("RUST_MIN_STACK", "8388608")
             .env("XDG_CONFIG_HOME", &config)
             .env("PATH", &bin)
             .env(ROOT, &root)
