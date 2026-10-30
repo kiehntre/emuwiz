@@ -1,12 +1,15 @@
-//! Optional ScreenScraper credentials in the desktop Secret Service.
-//! No credential is passed in arguments, written to a file, or included in errors.
+//! Optional ScreenScraper credentials in the user's Secret Service or an
+//! EmuWiz-owned restricted file. No credential is passed in arguments
+//! or included in errors.
 
 use std::io::Write;
-#[cfg(test)]
+#[cfg(any(test, target_os = "linux"))]
 use std::path::Path;
 use std::path::PathBuf;
 use std::process::{Command, Stdio};
 
+#[cfg(target_os = "linux")]
+use crate::screenscraper_restricted_file_store::RestrictedFileStore;
 use serde::{Deserialize, Serialize};
 
 const ATTRS: [&str; 4] = ["application", "EmuWiz", "provider", "ScreenScraper"];
@@ -34,20 +37,77 @@ pub(super) enum StoreError {
     Failed,
     InvalidRecord,
     TooLarge,
+    Insecure,
+    /// The record was written but durability or read-back was not verified.
+    PublishedUnverified,
+    /// Forget finished the active backend but something remains elsewhere.
+    Residual,
+    /// The location looks managed by Git, yadm or chezmoi; plaintext refused.
+    Dotfiles,
 }
 
-/// Uses the system's Secret Service through `secret-tool` when installed.
-/// A missing or failing service never causes a plaintext fallback.
+/// Facts the page must surface after an operation.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub(super) struct StoreNotices {
+    /// The other backend holds, or may hold, credentials.
+    pub other_backend: bool,
+    /// Crash-left plaintext temporary files exist in the private folder.
+    pub leftover_temporary_files: bool,
+}
+
+/// Uses the EmuWiz-owned file if present, or when `secret-tool` is absent.
+/// Existing Secret Service users keep that backend; a failing service never
+/// causes a plaintext fallback. Forget and the notices also cover the backend
+/// that is not selected, so a backend switch cannot strand credentials.
 pub(super) struct SecretStore {
     program: PathBuf,
     requires_session_bus: bool,
+    #[cfg(target_os = "linux")]
+    restricted_file: Option<RestrictedFileStore>,
+    /// Default private file location, inspected (never written) while the
+    /// Secret Service is the selected backend.
+    #[cfg(target_os = "linux")]
+    secondary_file: Option<RestrictedFileStore>,
+    #[cfg(not(target_os = "linux"))]
+    unsupported_file: bool,
 }
 
 impl SecretStore {
     pub fn system() -> Self {
+        #[cfg(target_os = "linux")]
+        let (restricted_file, secondary_file) = {
+            let tool = Path::new("/usr/bin/secret-tool").is_file();
+            let default_directory = default_secrets_directory();
+            match std::env::var_os("EMUWIZ_SCREENSCRAPER_SECRETS_DIR") {
+                Some(override_dir) => (
+                    Some(RestrictedFileStore::new(PathBuf::from(override_dir))),
+                    None,
+                ),
+                None => {
+                    let selected = selected_file_directory(tool);
+                    let secondary = if selected.is_none() {
+                        default_directory.map(RestrictedFileStore::managed_default)
+                    } else {
+                        None
+                    };
+                    (
+                        selected.map(RestrictedFileStore::managed_default),
+                        secondary,
+                    )
+                }
+            }
+        };
+        #[cfg(not(target_os = "linux"))]
+        let unsupported_file = std::env::var_os("EMUWIZ_SCREENSCRAPER_SECRETS_DIR").is_some();
         Self {
             program: PathBuf::from("/usr/bin/secret-tool"),
             requires_session_bus: true,
+            #[cfg(target_os = "linux")]
+            restricted_file,
+            #[cfg(target_os = "linux")]
+            secondary_file,
+            #[cfg(not(target_os = "linux"))]
+            unsupported_file,
         }
     }
 
@@ -56,17 +116,117 @@ impl SecretStore {
         Self {
             program: program.to_owned(),
             requires_session_bus: false,
+            #[cfg(target_os = "linux")]
+            restricted_file: None,
+            #[cfg(target_os = "linux")]
+            secondary_file: None,
+            #[cfg(not(target_os = "linux"))]
+            unsupported_file: false,
         }
     }
 
-    pub fn available(&self) -> bool {
+    #[cfg(all(test, target_os = "linux"))]
+    pub(super) fn restricted_file_for_test(directory: PathBuf) -> Self {
+        Self {
+            program: PathBuf::new(),
+            requires_session_bus: false,
+            restricted_file: Some(RestrictedFileStore::managed_default(directory)),
+            secondary_file: None,
+        }
+    }
+
+    /// File backend selected, Secret Service (`program`) is the other one.
+    #[cfg(all(test, target_os = "linux"))]
+    pub(super) fn file_with_service_for_test(directory: PathBuf, program: &Path) -> Self {
+        Self {
+            program: program.to_owned(),
+            requires_session_bus: false,
+            restricted_file: Some(RestrictedFileStore::managed_default(directory)),
+            secondary_file: None,
+        }
+    }
+
+    /// Secret Service selected, `directory` is the other (file) backend.
+    #[cfg(all(test, target_os = "linux"))]
+    pub(super) fn service_with_file_for_test(program: &Path, directory: PathBuf) -> Self {
+        Self {
+            program: program.to_owned(),
+            requires_session_bus: false,
+            restricted_file: None,
+            secondary_file: Some(RestrictedFileStore::managed_default(directory)),
+        }
+    }
+
+    pub fn uses_restricted_file(&self) -> bool {
+        #[cfg(target_os = "linux")]
+        {
+            self.restricted_file.is_some()
+        }
+        #[cfg(not(target_os = "linux"))]
+        {
+            false
+        }
+    }
+
+    fn service_available(&self) -> bool {
         self.program.is_file()
             && (!self.requires_session_bus
                 || std::env::var_os("DBUS_SESSION_BUS_ADDRESS").is_some())
     }
 
+    pub fn available(&self) -> bool {
+        #[cfg(not(target_os = "linux"))]
+        if self.unsupported_file {
+            return false;
+        }
+        if self.uses_restricted_file() {
+            return true;
+        }
+        self.service_available()
+    }
+
+    /// Reports credentials left in the backend that is not selected and
+    /// crash-left plaintext temporary files. Never reads their content.
+    pub fn notices(&self) -> StoreNotices {
+        #[cfg(target_os = "linux")]
+        {
+            let other_backend = if self.restricted_file.is_some() {
+                !matches!(self.service_load(), Ok(None) | Err(StoreError::Unavailable))
+            } else {
+                self.secondary_file
+                    .as_ref()
+                    .is_some_and(|store| !matches!(store.load(), Ok(None)))
+            };
+            let leftover_temporary_files = self
+                .restricted_file
+                .as_ref()
+                .or(self.secondary_file.as_ref())
+                .is_some_and(|store| store.leftover_temporary_files() > 0);
+            StoreNotices {
+                other_backend,
+                leftover_temporary_files,
+            }
+        }
+        #[cfg(not(target_os = "linux"))]
+        {
+            StoreNotices::default()
+        }
+    }
+
     pub fn load(&self) -> Result<Option<StoredCredentials>, StoreError> {
-        if !self.available() {
+        #[cfg(not(target_os = "linux"))]
+        if self.unsupported_file {
+            return Err(StoreError::Unavailable);
+        }
+        #[cfg(target_os = "linux")]
+        if let Some(store) = &self.restricted_file {
+            return store.load();
+        }
+        self.service_load()
+    }
+
+    fn service_load(&self) -> Result<Option<StoredCredentials>, StoreError> {
+        if !self.service_available() {
             return Err(StoreError::Unavailable);
         }
         let output = Command::new(&self.program)
@@ -93,6 +253,14 @@ impl SecretStore {
     }
 
     pub fn save(&self, record: &StoredCredentials) -> Result<(), StoreError> {
+        #[cfg(not(target_os = "linux"))]
+        if self.unsupported_file {
+            return Err(StoreError::Unavailable);
+        }
+        #[cfg(target_os = "linux")]
+        if let Some(store) = &self.restricted_file {
+            return store.save(record);
+        }
         if !self.available() {
             return Err(StoreError::Unavailable);
         }
@@ -120,12 +288,40 @@ impl SecretStore {
         }
         match self.load() {
             Ok(Some(saved)) if saved == *record => Ok(()),
-            _ => Err(StoreError::Failed),
+            _ => Err(StoreError::PublishedUnverified),
         }
     }
 
+    /// Clears the selected backend and the other one. `Ok` only when nothing
+    /// is known to remain in either.
     pub fn forget(&self) -> Result<(), StoreError> {
-        if !self.available() {
+        #[cfg(not(target_os = "linux"))]
+        if self.unsupported_file {
+            return Err(StoreError::Unavailable);
+        }
+        #[cfg(target_os = "linux")]
+        {
+            if let Some(store) = &self.restricted_file {
+                let primary = store.forget();
+                // A missing or unusable Secret Service holds nothing we can reach.
+                let other = match self.service_forget() {
+                    Ok(()) | Err(StoreError::Unavailable) => Ok(()),
+                    Err(_) => Err(StoreError::Residual),
+                };
+                return primary.and(other);
+            }
+        }
+        let primary = self.service_forget();
+        #[cfg(target_os = "linux")]
+        if let Some(store) = &self.secondary_file {
+            let other = store.forget().map_err(|_| StoreError::Residual);
+            return primary.and(other);
+        }
+        primary
+    }
+
+    fn service_forget(&self) -> Result<(), StoreError> {
+        if !self.service_available() {
             return Err(StoreError::Unavailable);
         }
         let status = Command::new(&self.program)
@@ -138,11 +334,44 @@ impl SecretStore {
         if !status.success() {
             return Err(StoreError::Failed);
         }
-        match self.load() {
+        match self.service_load() {
             Ok(None) => Ok(()),
             _ => Err(StoreError::Failed),
         }
     }
+}
+
+/// `<EmuWiz config root>/secrets`, with the config root resolved by EmuWiz's
+/// own helper so explicit and XDG overrides are honoured.
+#[cfg(target_os = "linux")]
+fn default_secrets_directory() -> Option<PathBuf> {
+    secrets_directory_in(archivefs_core::app_dirs::config_dir().ok().as_deref())
+}
+
+#[cfg(target_os = "linux")]
+fn secrets_directory_in(config_root: Option<&Path>) -> Option<PathBuf> {
+    let root = config_root?;
+    root.is_absolute().then(|| root.join("secrets"))
+}
+
+#[cfg(target_os = "linux")]
+fn selected_file_directory(secret_tool_available: bool) -> Option<PathBuf> {
+    selected_file_directory_for(default_secrets_directory(), secret_tool_available)
+}
+
+#[cfg(target_os = "linux")]
+fn selected_file_directory_for(
+    directory: Option<PathBuf>,
+    secret_tool_available: bool,
+) -> Option<PathBuf> {
+    let directory = directory?;
+    let file = directory.join("screenscraper.env");
+    let existing_file_or_error = match file.symlink_metadata() {
+        Ok(_) => true,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => false,
+        Err(_) => true,
+    };
+    (existing_file_or_error || !secret_tool_available).then_some(directory)
 }
 
 #[cfg(all(test, unix))]
@@ -233,5 +462,133 @@ mod tests {
         let store = SecretStore::new(&script);
         assert_eq!(store.load().unwrap_err(), StoreError::Failed);
         assert_eq!(store.forget().unwrap_err(), StoreError::Failed);
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn saltbox_default_selects_managed_env_without_manual_environment_variable() {
+        let home = tempfile::tempdir().unwrap();
+        let directory = secrets_directory_in(Some(&home.path().join(".config/emuwiz"))).unwrap();
+        assert!(directory.ends_with(".config/emuwiz/secrets"));
+        assert_eq!(
+            selected_file_directory_for(Some(directory.clone()), false),
+            Some(directory.clone())
+        );
+        assert_eq!(
+            selected_file_directory_for(Some(directory.clone()), true),
+            None
+        );
+        std::fs::create_dir_all(&directory).unwrap();
+        std::fs::write(directory.join("screenscraper.env"), b"unrelated").unwrap();
+        assert_eq!(
+            selected_file_directory_for(Some(directory.clone()), true),
+            Some(directory)
+        );
+        assert_eq!(secrets_directory_in(Some(Path::new("relative"))), None);
+        assert_eq!(secrets_directory_in(None), None);
+    }
+
+    #[cfg(target_os = "linux")]
+    fn sample() -> StoredCredentials {
+        StoredCredentials {
+            developer_id: "synthetic-dev".into(),
+            developer_password: "synthetic-dev-secret".into(),
+            user_id: "synthetic-user".into(),
+            user_password: "synthetic-user-secret".into(),
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    fn private_directory(root: &Path) -> PathBuf {
+        let directory = root.join("emuwiz-config/secrets");
+        std::fs::create_dir_all(&directory).unwrap();
+        std::fs::set_permissions(&directory, std::fs::Permissions::from_mode(0o700)).unwrap();
+        directory
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn forget_clears_both_backends_when_file_is_selected_and_service_holds_credentials() {
+        let (root, service) = fake_store();
+        let directory = private_directory(root.path());
+        service.save(&sample()).unwrap();
+        let store = SecretStore::file_with_service_for_test(directory.clone(), &service.program);
+        assert!(store.notices().other_backend);
+        store.save(&sample()).unwrap();
+        // Saving to the file does not hide the Secret Service copy.
+        assert!(store.notices().other_backend);
+        store.forget().unwrap();
+        assert_eq!(service.load().unwrap(), None);
+        assert!(!directory.join("screenscraper.env").exists());
+        assert_eq!(store.notices(), StoreNotices::default());
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn forget_clears_both_backends_when_service_is_selected_and_file_holds_credentials() {
+        let (root, service) = fake_store();
+        let directory = private_directory(root.path());
+        let file = SecretStore::restricted_file_for_test(directory.clone());
+        file.save(&sample()).unwrap();
+        let store = SecretStore::service_with_file_for_test(&service.program, directory.clone());
+        assert!(store.notices().other_backend);
+        store.save(&sample()).unwrap();
+        assert!(store.notices().other_backend);
+        store.forget().unwrap();
+        assert!(!directory.join("screenscraper.env").exists());
+        assert_eq!(service.load().unwrap(), None);
+        assert!(!store.notices().other_backend);
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn forget_reports_residue_when_the_other_backend_cannot_be_cleared() {
+        let (root, service) = fake_store();
+        let directory = private_directory(root.path());
+        // An unrelated file in the secondary location is never removed.
+        std::fs::write(directory.join("screenscraper.env"), b"other-app=1\n").unwrap();
+        std::fs::set_permissions(
+            directory.join("screenscraper.env"),
+            std::fs::Permissions::from_mode(0o600),
+        )
+        .unwrap();
+        let store = SecretStore::service_with_file_for_test(&service.program, directory.clone());
+        assert!(store.notices().other_backend);
+        assert_eq!(store.forget(), Err(StoreError::Residual));
+        assert!(directory.join("screenscraper.env").exists());
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn notices_report_crash_left_temporary_files_without_reading_them() {
+        let (root, _service) = fake_store();
+        let directory = private_directory(root.path());
+        let path = directory.join(".screenscraper-env-crashed");
+        std::fs::write(&path, b"synthetic").unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)).unwrap();
+        let store = SecretStore::restricted_file_for_test(directory);
+        assert!(store.notices().leftover_temporary_files);
+        store.forget().unwrap();
+        assert!(!path.exists());
+        assert!(!store.notices().leftover_temporary_files);
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    #[ignore = "requires an explicitly configured private synthetic secrets directory"]
+    fn operator_selected_file_backend_does_not_use_secret_service_fallback() {
+        assert!(std::env::var_os("EMUWIZ_SCREENSCRAPER_SECRETS_DIR").is_some());
+        let store = SecretStore::system();
+        assert!(store.uses_restricted_file());
+        let record = StoredCredentials {
+            developer_id: "synthetic-dev".into(),
+            developer_password: "synthetic-dev-password".into(),
+            user_id: "synthetic-user".into(),
+            user_password: "synthetic-user-password".into(),
+        };
+        store.save(&record).unwrap();
+        assert_eq!(SecretStore::system().load().unwrap(), Some(record));
+        SecretStore::system().forget().unwrap();
+        assert_eq!(SecretStore::system().load().unwrap(), None);
     }
 }

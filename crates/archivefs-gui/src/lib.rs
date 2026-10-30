@@ -270,6 +270,8 @@ mod identity_providers_page;
 mod screenscraper_batch_enrichment_page;
 mod screenscraper_enrichment_page;
 mod screenscraper_page;
+#[cfg(target_os = "linux")]
+mod screenscraper_restricted_file_store;
 mod screenscraper_secret_store;
 mod selected_game_readiness;
 use dat_identity_panel::*;
