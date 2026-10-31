@@ -1501,6 +1501,11 @@ def verify_retirement(record, target):
 UNFINISHED_GIT_STATE = ("index.lock", "HEAD.lock", "MERGE_HEAD", "CHERRY_PICK_HEAD", "REVERT_HEAD",
                         "REBASE_HEAD", "MERGE_AUTOSTASH", "rebase-merge", "rebase-apply", "BISECT_START",
                         "BISECT_LOG", "sequencer", "locked", "modules")
+# Everything a checkout's admin directory may hold once the checks above pass. Anything
+# else (a custom pseudoref, `git notes merge` state) is state nobody here has judged.
+KNOWN_ADMIN_ENTRIES = frozenset(("HEAD", "ORIG_HEAD", "FETCH_HEAD", "AUTO_MERGE", "COMMIT_EDITMSG",
+                                 "MERGE_MSG", "SQUASH_MSG", "index", "logs", "gitdir", "commondir",
+                                 "config.worktree", "refs", "info"))
 
 
 def history_preservation_problem(wt):
@@ -1512,16 +1517,16 @@ def history_preservation_problem(wt):
     Only a ref proves preservation: a bundle counts once it is imported under
     refs/preservation/. Anything that cannot be established is a problem.
 
-    Only an existing directory that is verifiably not a checkout returns None.
-    A path that has gone cannot be judged, and `git worktree remove` still accepts
-    it and deletes the admin directory, even one a moved checkout is using.
+    A path without `.git` cannot be judged from the path alone: `git worktree
+    remove` accepts one that has gone and deletes the admin directory, even one a
+    moved checkout is using, and `git worktree prune` removes it when `.git` is lost.
     """
     # No inherited GIT_DIR/GIT_WORK_TREE/alternates, and no replace refs or grafts
     # that could make unmerged history look preserved.
     env = {k: v for k, v in os.environ.items() if not k.startswith("GIT_")}
     # GIT_OPTIONAL_LOCKS: a read-only gate must not refresh the index.
     env.update(GIT_NO_REPLACE_OBJECTS="1", GIT_GRAFT_FILE="/nonexistent", GIT_CONFIG_NOSYSTEM="1",
-               GIT_OPTIONAL_LOCKS="0")
+               GIT_OPTIONAL_LOCKS="0", LC_ALL="C")
 
     def run(*args):
         return F.run_as_owner(["git", "-C", wt, *args], capture_output=True,
@@ -1532,17 +1537,6 @@ def history_preservation_problem(wt):
         if proc.returncode != 0:
             raise LegacyCheckoutHold("GIT_STATE_UNVERIFIED", proc.stderr.strip())
         return proc.stdout.strip()
-
-    def without_git_entry():
-        if not os.path.lexists(wt):
-            return ("CHECKOUT_PATH_UNVERIFIED", "path has gone, so its registered Git state cannot be judged")
-        if run("rev-parse", "--git-dir").returncode == 0:
-            return ("CHECKOUT_PATH_UNVERIFIED", "path is inside a repository but is not a Git checkout root")
-        state, record = F.Registry(create=False).read_checked(
-            "targets", F.key_for(F.canon(target_for_worktree(wt)[1])), F.valid_target_record)
-        if state == "invalid" or record:
-            return ("GIT_STATE_UNVERIFIED", "this was a recorded checkout but its .git entry is gone")
-        return None
 
     def require_own_admin(admin):
         common = git("rev-parse", "--path-format=absolute", "--git-common-dir")
@@ -1568,6 +1562,15 @@ def history_preservation_problem(wt):
                                      os.path.basename(path) + " is not a regular file")
         return read(path)
 
+    def reflogs(path):
+        try:
+            mode = os.lstat(path).st_mode
+        except FileNotFoundError:
+            return set()
+        if stat.S_ISDIR(mode):
+            return set().union(*(reflogs(os.path.join(path, n)) for n in os.listdir(path)))
+        return names_in(path, reflog_names)
+
     def reflog_names(path):
         # Read the file itself: gc keeps both IDs of every entry, while
         # `git reflog show` lists only the new one.
@@ -1585,7 +1588,7 @@ def history_preservation_problem(wt):
         try:
             os.lstat(os.path.join(wt, ".git"))
         except FileNotFoundError:
-            return without_git_entry()
+            return ("CHECKOUT_PATH_UNVERIFIED", "path holds no .git, so its registered Git state cannot be judged")
         if git("rev-parse", "--show-toplevel") != os.path.realpath(wt):
             return ("CHECKOUT_PATH_UNVERIFIED", "path is not a Git checkout root")
         admin = git("rev-parse", "--absolute-git-dir")
@@ -1595,12 +1598,18 @@ def history_preservation_problem(wt):
         # Before status, which does not see these files.
         if any(line and (line[0].islower() or line[0] == "S") for line in git("ls-files", "-v", "-z").split("\0")):
             return ("CHECKOUT_INDEX_UNVERIFIED", "assume-unchanged or skip-worktree entries can hide unfinished code")
-        if git("status", "--porcelain=v1", "--untracked-files=all", "--ignored=matching",
-               "--ignore-submodules=none"):
+        status = run("status", "--porcelain=v1", "--untracked-files=all", "--ignored=matching",
+                     "--ignore-submodules=none")
+        if status.returncode != 0 or "could not open directory" in status.stderr:
+            return ("GIT_STATE_UNVERIFIED", status.stderr.strip())
+        if status.stdout.strip():
             return ("CHECKOUT_NOT_CLEAN", "tracked, untracked or ignored files require preservation")
         if git("for-each-ref", "--format=%(refname)", "refs/worktree", "refs/bisect", "refs/rewritten"):
             return ("GIT_HISTORY_NOT_PRESERVED", "per-worktree refs would be deleted with the checkout")
-        names = names_in(os.path.join(admin, "logs", "HEAD"), reflog_names)
+        unknown = sorted(set(os.listdir(admin)) - KNOWN_ADMIN_ENTRIES)
+        if unknown:
+            return ("GIT_STATE_UNVERIFIED", "unjudged state in the checkout's admin directory: " + ", ".join(unknown))
+        names = reflogs(os.path.join(admin, "logs"))
         names |= names_in(os.path.join(admin, "ORIG_HEAD"), orig_head_name)
         names.add(git("rev-parse", "--verify", "HEAD^{commit}"))
         if not all(len(n) in (40, 64) and not n.strip("0123456789abcdef") for n in names):

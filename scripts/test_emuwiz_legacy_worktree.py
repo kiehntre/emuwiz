@@ -497,12 +497,39 @@ class HistoryGates(LegacyCheckout):
     def test_recorded_checkout_that_lost_its_git_entry_holds(self):
         self.reflog_only_commit()
         os.unlink(os.path.join(self.wt, '.git'))
+        self.assert_gate_holds('CHECKOUT_PATH_UNVERIFIED')
+
+    def test_directory_without_git_entry_holds_because_prune_would_drop_its_admin(self):
+        wt = self.never_built('lost-git')
+        os.unlink(os.path.join(wt, '.git'))
+        self.assertEqual(self.m.history_preservation_problem(wt)[0], 'CHECKOUT_PATH_UNVERIFIED')
+
+    def test_unknown_admin_state_holds(self):
+        wip = self.run_git('commit-tree', '-m', 'wip', '-p', 'HEAD', 'HEAD^{tree}')
+        self.run_git('update-ref', 'WIP_HEAD', wip)
+        self.assert_gate_holds('GIT_STATE_UNVERIFIED')
+        self.run_git('update-ref', '-d', 'WIP_HEAD')
+        Path(self.git_dir, 'NOTES_MERGE_PARTIAL').write_text(wip + '\n')
         self.assert_gate_holds('GIT_STATE_UNVERIFIED')
 
-    def test_plain_directory_is_not_a_checkout(self):
-        plain = os.path.join(self.root_for_bundle(), 'plain')
-        os.mkdir(plain)
-        self.assertIsNone(self.m.history_preservation_problem(plain))
+    def test_ordinary_admin_entries_stay_clear(self):
+        for name in ('FETCH_HEAD', 'AUTO_MERGE', 'COMMIT_EDITMSG', 'MERGE_MSG', 'SQUASH_MSG'):
+            Path(self.git_dir, name).write_text('')
+        self.assertEqual(self.gate_when_lifecycle_clear()['status'], 'CLEAR')
+
+    def test_any_reflog_file_is_read_not_only_head(self):
+        orphan = self.reflog_only_commit()
+        Path(self.git_dir, 'logs', 'WIP_HEAD').write_text(
+            f'{self.base} {orphan} t <t@t> 0 +0000\tfixture\n')
+        os.unlink(os.path.join(self.git_dir, 'logs', 'HEAD'))
+        self.assert_gate_holds('GIT_HISTORY_NOT_PRESERVED')
+
+    @unittest.skipIf(os.geteuid() == 0, 'root ignores directory modes')
+    def test_unreadable_subdirectory_holds_though_status_exits_zero(self):
+        secret = os.path.join(self.wt, 'secret')
+        os.mkdir(secret, 0)
+        self.addCleanup(os.rmdir, secret)
+        self.assert_gate_holds('GIT_STATE_UNVERIFIED')
 
     def test_vanished_path_holds_because_git_would_still_remove_its_admin_directory(self):
         wt = self.never_built('vanished')
@@ -531,7 +558,7 @@ class HistoryGates(LegacyCheckout):
         target = self.m.target_for_worktree(wt)[1]
         Path(self.reg, 'targets', self.key_of(target) + '.json').write_text('{')
         os.unlink(os.path.join(wt, '.git'))
-        self.assertEqual(self.m.history_preservation_problem(wt)[0], 'GIT_STATE_UNVERIFIED')
+        self.assertEqual(self.m.history_preservation_problem(wt)[0], 'CHECKOUT_PATH_UNVERIFIED')
 
     @unittest.skipIf(os.geteuid() == 0, 'root ignores directory modes')
     def test_unreadable_unrecorded_checkout_and_reflog_directory_fail_closed(self):

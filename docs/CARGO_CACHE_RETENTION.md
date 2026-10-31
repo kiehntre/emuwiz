@@ -236,7 +236,9 @@ Git state, because `git worktree remove` deletes its reflog, ORIG_HEAD, per-work
 `CHECKOUT_NOT_CLEAN`, `CHECKOUT_INDEX_UNVERIFIED`, `CHECKOUT_PATH_UNVERIFIED`, `GIT_WORKTREE_PROTECTED`,
 `GIT_HISTORY_NOT_PRESERVED`, `GIT_STATE_UNVERIFIED`. A commit counts as preserved only when a ref names it, so
 retain orphans under `refs/preservation/`. `--cargo-state-only` reports the Cargo half alone and never authorises
-removal. A release record alone never
+removal. A path with no `.git` always holds, including one already removed correctly: the gate cannot
+tell that from a checkout that vanished while still registered, so check before removing, not after.
+A release record alone never
 clears the gate or authorises deletion; releasing does not stop builds, remove pins or claim
 processes have exited. The release command takes the target's exclusive lifecycle lock and
 refuses while a `cargo-iso` build holds its shared lock; retry completion after that build
