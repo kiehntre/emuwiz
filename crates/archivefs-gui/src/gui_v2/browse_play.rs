@@ -63,10 +63,15 @@ const ATTENTION_TEXT: Color32 = Color32::from_rgb(232, 170, 62);
 /// moving quickly through the shelf reads no game files.
 pub(super) const SELECTION_SETTLE_SECS: f64 = 0.35;
 
+/// Platform, search, (readiness view, cache-aware), unverified-only, library.
+type FilterKey = (String, String, (ReadinessFilter, bool), bool, usize);
+/// Base list address, cache version, view, and the narrowed list.
+type ReadinessView = (usize, u64, ReadinessFilter, Arc<Vec<usize>>);
+
 /// Cached filter result so typing or scrolling never rescans the catalogue.
 #[derive(Default)]
 pub(super) struct BrowsePlayState {
-    key: Option<(String, String, (ReadinessFilter, bool), bool, usize)>,
+    key: Option<FilterKey>,
     indices: Arc<Vec<usize>>,
     applied_generation: Option<u64>,
     // Keep the allocation token alive so pointer-based keys cannot suffer ABA.
@@ -83,7 +88,7 @@ pub(super) struct BrowsePlayState {
     readiness: ReadinessCache,
     /// The readiness view of `indices`, rebuilt only when the base list or
     /// the cache changes: (base list address, cache version, filter, result).
-    readiness_view: Option<(usize, u64, ReadinessFilter, Arc<Vec<usize>>)>,
+    readiness_view: Option<ReadinessView>,
 }
 
 impl BrowsePlayState {
@@ -104,6 +109,9 @@ impl BrowsePlayState {
 impl BrowsePlayState {
     pub(super) fn reset_scroll_pending(&self) -> bool {
         self.reset_scroll
+    }
+    pub(super) fn record_readiness(&mut self, game: &Game, result: Option<CheckedReadiness>) {
+        self.readiness.record(game, result);
     }
 }
 
@@ -244,8 +252,26 @@ fn readiness_sentence(game: &Game) -> &'static str {
 }
 
 /// Platform, identity and DAT state on one line, without conflating them.
-fn status_line(game: &Game, width: f32, blue: bool) -> egui::text::LayoutJob {
+fn status_line(
+    game: &Game,
+    width: f32,
+    blue: bool,
+    not_ready: Option<&str>,
+) -> egui::text::LayoutJob {
     let (status, colour) = status_text(game, blue);
+    let status = match not_ready {
+        Some(reason) => format!("Not ready · {reason}"),
+        None => status.to_string(),
+    };
+    let colour = if not_ready.is_some() {
+        if blue {
+            theme::blue::WARN
+        } else {
+            ATTENTION_TEXT
+        }
+    } else {
+        colour
+    };
     let font = egui::FontId::proportional(theme::METADATA_SIZE);
     let mut job = egui::text::LayoutJob::default();
     job.append(
@@ -612,8 +638,11 @@ impl App {
             });
         }
         if blue
-            && let Some(note) =
-                readiness_filter_note(self.filter.readiness, self.browse_play.readiness.len())
+            && let Some(note) = readiness_filter_note(
+                self.filter.readiness,
+                self.browse_play.readiness.len(),
+                self.library.games.len(),
+            )
         {
             ui.add(
                 egui::Label::new(
@@ -995,9 +1024,14 @@ impl App {
             );
             let blue = theme::blue_profile(&child);
             child.add(
-                egui::Label::new(status_line(game, inner.width(), blue))
-                    .wrap()
-                    .selectable(false),
+                egui::Label::new(status_line(
+                    game,
+                    inner.width(),
+                    blue,
+                    self.browse_play.readiness.not_ready_reason(game),
+                ))
+                .wrap()
+                .selectable(false),
             );
             let response = response
                 .on_hover_cursor(egui::CursorIcon::PointingHand)
@@ -1062,9 +1096,14 @@ impl App {
                 );
                 let blue = theme::blue_profile(ui);
                 ui.add(
-                    egui::Label::new(status_line(game, text_width, blue))
-                        .wrap()
-                        .selectable(false),
+                    egui::Label::new(status_line(
+                        game,
+                        text_width,
+                        blue,
+                        self.browse_play.readiness.not_ready_reason(game),
+                    ))
+                    .wrap()
+                    .selectable(false),
                 );
             });
             let response = response.on_hover_cursor(egui::CursorIcon::PointingHand);
@@ -1115,6 +1154,7 @@ impl App {
                     };
                     let text_width = (inner - cover.x - gap).max(120.0);
                     let heading = |this: &mut Self, ui: &mut egui::Ui| {
+                        let not_ready = this.browse_play.readiness.not_ready_reason(game);
                         // In a short, narrow window title and actions share a strip.
                         // Stacking every piece would put Play below the footer.
                         if compact && theme::blue_profile(ui) && inner >= 600.0 {
@@ -1138,6 +1178,7 @@ impl App {
                                                 game,
                                                 title_width,
                                                 theme::blue_profile(ui),
+                                                not_ready,
                                             ))
                                             .wrap()
                                             .selectable(false),
@@ -1166,16 +1207,31 @@ impl App {
                                 if tight {
                                     // One line, so Play stays above the fold.
                                     ui.add(
-                                        egui::Label::new(status_line(game, text_width, blue))
-                                            .wrap()
-                                            .selectable(false),
+                                        egui::Label::new(status_line(
+                                            game, text_width, blue, not_ready,
+                                        ))
+                                        .wrap()
+                                        .selectable(false),
                                     );
                                 } else {
                                     ui.label(
                                         RichText::new(&game.platform).color(theme::SECONDARY_TEXT),
                                     );
                                     let (status, colour) = status_text(game, blue);
-                                    ui.label(RichText::new(status).strong().color(colour));
+                                    match not_ready {
+                                        Some(reason) => ui.label(
+                                            RichText::new(format!("Not ready · {reason}"))
+                                                .strong()
+                                                .color(if blue {
+                                                    theme::blue::WARN
+                                                } else {
+                                                    ATTENTION_TEXT
+                                                }),
+                                        ),
+                                        None => {
+                                            ui.label(RichText::new(status).strong().color(colour))
+                                        }
+                                    };
                                     ui.label(format!("DAT: {}", game.dat_identity_summary()));
                                 }
                                 if tight {
@@ -1269,10 +1325,14 @@ impl App {
                 use super::launch_readiness_summary::ReadinessPresentationState as State;
                 // Only a finished, current answer is kept; checking, stale
                 // and partial answers leave the game Not checked.
-                let result = (!view.pending && !view.spinner).then(|| match view.tone {
-                    State::Ready | State::ReadyWithWarnings => CheckedReadiness::Ready,
-                    _ => CheckedReadiness::NotReady,
-                });
+                let result = if view.pending || view.spinner {
+                    None
+                } else {
+                    Some(match view.tone {
+                        State::Ready | State::ReadyWithWarnings => CheckedReadiness::Ready,
+                        _ => CheckedReadiness::NotReady(view.badge),
+                    })
+                };
                 this.browse_play.readiness.record(game, result);
             }
             let rows = if tight { 2 } else { 3 };
@@ -1366,14 +1426,23 @@ fn readiness_filter_hint(filter: ReadinessFilter) -> &'static str {
     }
 }
 
-/// Why the Ready and Not checked lists look the way they do: launch checks
-/// run for the game you select, so these fill in as you browse.
-fn readiness_filter_note(filter: ReadinessFilter, checked: usize) -> Option<String> {
+/// Said under every readiness view that could be mistaken for a verdict on
+/// the whole library. Launch checks run for the game you select, so nothing
+/// here has assessed every game.
+fn readiness_filter_note(filter: ReadinessFilter, checked: usize, total: usize) -> Option<String> {
+    let progress =
+        format!("{checked} of {total} games checked so far. A game is checked when you select it.");
     match filter {
-        ReadinessFilter::Ready | ReadinessFilter::NotChecked => Some(format!(
-            "{checked} checked so far. A game is checked when you select it, so Ready fills in as you browse; every other game is Not checked."
+        ReadinessFilter::All => None,
+        ReadinessFilter::Ready => Some(format!(
+            "{progress} Only checked games can appear here; the rest are Not checked."
         )),
-        _ => None,
+        ReadinessFilter::NeedsAttention => Some(format!(
+            "{progress} This lists games flagged by the catalogue and checked games that are Not ready, with the reason. Games that are Not checked are not listed."
+        )),
+        ReadinessFilter::NotChecked => Some(format!(
+            "{progress} Not checked only means no result yet, not a problem."
+        )),
     }
 }
 

@@ -501,7 +501,8 @@ impl Filter {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(super) enum CheckedReadiness {
     Ready,
-    NotReady,
+    /// A finished negative result, with the card's own label for the reason.
+    NotReady(&'static str),
 }
 
 /// The file facts a result was taken against. A result whose facts no longer
@@ -558,6 +559,14 @@ impl ReadinessCache {
             .filter(|(_, print)| *print == Fingerprint::of(game))
             .map(|(result, _)| *result)
     }
+    /// The reason label of a current Not ready result for a game the catalogue
+    /// does not already flag.
+    pub fn not_ready_reason(&self, game: &Game) -> Option<&'static str> {
+        match self.get(game) {
+            Some(CheckedReadiness::NotReady(reason)) if !game.attention => Some(reason),
+            _ => None,
+        }
+    }
     pub fn version(&self) -> u64 {
         self.version
     }
@@ -578,7 +587,8 @@ pub(super) fn matches(game: &Game, filter: &Filter, cache: &ReadinessCache) -> b
     match filter.readiness {
         ReadinessFilter::All => true,
         ReadinessFilter::NeedsAttention => {
-            game.attention || (filter.cache_aware && checked == Some(CheckedReadiness::NotReady))
+            game.attention
+                || (filter.cache_aware && matches!(checked, Some(CheckedReadiness::NotReady(_))))
         }
         ReadinessFilter::Ready => checked == Some(CheckedReadiness::Ready),
         ReadinessFilter::NotChecked => !game.attention && checked.is_none(),
@@ -676,7 +686,7 @@ mod tests {
         cache.record(&games[0], Some(C::Ready));
         // A cached Ready never hides a catalogue problem.
         cache.record(&games[2], Some(C::Ready));
-        cache.record(&games[3], Some(C::NotReady));
+        cache.record(&games[3], Some(C::NotReady("Needs emulator")));
         let hits = |readiness| -> Vec<i64> {
             games
                 .iter()
@@ -703,16 +713,16 @@ mod tests {
         let (a, b) = (game(1, "ok"), game(2, "ok"));
         let mut cache = ReadinessCache::default();
         cache.record(&a, Some(C::Ready));
-        cache.record(&b, Some(C::NotReady));
+        cache.record(&b, Some(C::NotReady("Needs emulator")));
         assert_eq!(cache.get(&a), Some(C::Ready));
-        assert_eq!(cache.get(&b), Some(C::NotReady));
+        assert_eq!(cache.get(&b), Some(C::NotReady("Needs emulator")));
         let version = cache.version();
         cache.record(&a, Some(C::Ready));
         assert_eq!(cache.version(), version, "same answer is not a change");
         // The latest answer is unknown (checking/stale): never a stale success.
         cache.record(&a, None);
         assert_eq!(cache.get(&a), None);
-        assert_eq!(cache.get(&b), Some(C::NotReady));
+        assert_eq!(cache.get(&b), Some(C::NotReady("Needs emulator")));
     }
 
     #[test]
