@@ -527,6 +527,21 @@ mod tests {
     }
 
     #[test]
+    fn a_library_generation_change_drops_cached_answers_for_disc_set_members() {
+        let g = game(8, "PlayStation");
+        let mut state = super::super::browse_play::BrowsePlayState::default();
+        state.note_generation_for_test(Some(1));
+        state.record_readiness(&g, Some(C::Ready));
+        assert!(state.is_ready_for_test(&g));
+        // Same generation: nothing is touched.
+        state.note_generation_for_test(Some(1));
+        assert!(state.is_ready_for_test(&g));
+        // A rescan (new generation) may have added Disc 2: the old Ready goes.
+        state.note_generation_for_test(Some(2));
+        assert!(!state.is_ready_for_test(&g));
+    }
+
+    #[test]
     fn dragon_coco_is_assessed_in_the_background_not_skipped() {
         assert!(!selection_bound_platform("Dragon / Tandy CoCo"));
         assert!(!selection_bound_platform("Dragon"));

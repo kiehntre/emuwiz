@@ -103,6 +103,17 @@ pub(super) struct BrowsePlayState {
 }
 
 impl BrowsePlayState {
+    /// The library snapshot generation moved: a rescan may have added a disc
+    /// set or changed what a game belongs to, so every earlier answer (cached
+    /// or settled) is dropped. Foreground answers re-record as games are drawn.
+    fn note_database_generation(&mut self, generation: Option<u64>) {
+        if self.database_generation != generation {
+            self.database_generation = generation;
+            self.background.invalidate();
+            self.readiness.clear();
+        }
+    }
+
     /// Seconds still to wait before `game`'s readiness check may start.
     fn settle_remaining(&mut self, game: i64, now: f64) -> f64 {
         let since = match self.settling {
@@ -120,6 +131,12 @@ impl BrowsePlayState {
 impl BrowsePlayState {
     pub(super) fn reset_scroll_pending(&self) -> bool {
         self.reset_scroll
+    }
+    pub(super) fn note_generation_for_test(&mut self, generation: Option<u64>) {
+        self.note_database_generation(generation);
+    }
+    pub(super) fn is_ready_for_test(&self, game: &Game) -> bool {
+        self.readiness.get(game).is_some()
     }
     pub(super) fn record_readiness(&mut self, game: &Game, result: Option<CheckedReadiness>) {
         self.readiness.record(game, result);
@@ -562,10 +579,7 @@ impl App {
             .native_workflows
             .as_ref()
             .map(|w| w.database_generation());
-        if state.database_generation != generation {
-            state.database_generation = generation;
-            state.background.invalidate();
-        }
+        state.note_database_generation(generation);
         // What the checks read changed (emulator scans, settings): drop
         // everything decided under the old state.
         // Until a game has been selected once, no scan has run and there is
