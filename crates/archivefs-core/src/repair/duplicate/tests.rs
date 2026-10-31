@@ -561,3 +561,63 @@ fn prove_duplicate_group_never_falsely_groups_a_mismatched_member() {
         }
     }
 }
+
+// --- Regression fixtures from the 2026-10-09 OpenROM feature-delta audit -----
+
+/// Prevents: turning a filename-similarity group into a duplicate verdict.
+/// A filename group is only a list of candidates; every pair still has to be
+/// proven byte-identical, and a multi-disc set, a CUE with its BIN, and
+/// regional or revision variants never are.
+#[test]
+fn regression_a_same_title_candidate_group_proves_no_duplicates() {
+    let dir = tempfile::tempdir().unwrap();
+    let paths = vec![
+        write(dir.path(), "Game (USA) (Disc 1).bin", b"disc-one-payload"),
+        write(dir.path(), "Game (USA) (Disc 2).bin", b"disc-two-payload"),
+        write(dir.path(), "Game (USA).cue", b"FILE \"g.bin\" BIN\n"),
+        write(dir.path(), "Game (USA).bin", b"usa-data-payload"),
+        write(dir.path(), "Game (Europe).bin", b"eur-data-payload"),
+        write(dir.path(), "Game (Japan) [!].bin", b"jpn-data-payload"),
+        write(dir.path(), "Game (USA) (Rev 1).bin", b"usa-rev1-payload"),
+    ];
+
+    let results = prove_duplicate_group(&paths, &trusted(), None);
+
+    assert_eq!(results.len(), paths.len() * (paths.len() - 1) / 2);
+    for (a, b, result) in &results {
+        assert!(
+            result.is_err(),
+            "{} and {} share a title, not content: {result:?}",
+            a.display(),
+            b.display()
+        );
+    }
+    for path in &paths {
+        assert!(path.is_file(), "{} must stay in place", path.display());
+    }
+}
+
+/// Prevents: a candidate key that erases the disc number or the release tags.
+/// The filename-level candidate key keeps them, so Disc 1 and Disc 2, and the
+/// USA, Europe and revision releases, are not even proposed as the same item.
+/// A CUE and its same-named BIN do share that key; that is why the key is
+/// never proof (see the test above and the companion-protection tests).
+#[test]
+fn regression_filename_candidate_key_keeps_disc_and_release_tags() {
+    let key = |name: &str| crate::safe_mount_name(Path::new(name)).to_lowercase();
+    let distinct = [
+        "Game (USA) (Disc 1).bin",
+        "Game (USA) (Disc 2).bin",
+        "Game (USA).bin",
+        "Game (Europe).bin",
+        "Game (Japan) [!].bin",
+        "Game (USA) (Rev 1).bin",
+        "Game.bin",
+    ];
+    let keys: std::collections::BTreeSet<String> = distinct.iter().map(|name| key(name)).collect();
+    assert_eq!(keys.len(), distinct.len(), "{keys:?}");
+    assert_ne!(
+        key("Game (USA) (Disc 1).bin"),
+        key("Game (USA) (Disc 2).bin")
+    );
+}

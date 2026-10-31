@@ -239,6 +239,44 @@ mod tests {
         }
     }
 
+    /// Regression fixture from the 2026-10-09 OpenROM feature-delta audit.
+    ///
+    /// Prevents: deriving any filename from a DAT-supplied name that is an
+    /// absolute path, a Windows drive or UNC path, or holds a separator in
+    /// any position. Both derivers (loose file and outer archive) refuse;
+    /// neither rewrites the separator into something that looks usable.
+    #[test]
+    fn regression_absolute_drive_and_unc_forms_are_blocked_by_both_derivers() {
+        for evil in [
+            "/escape.bin",
+            "/etc/escape.bin",
+            "//escape.bin",
+            "../../escape.bin",
+            "sub/../../escape.bin",
+            "./escape.bin",
+            "escape.bin/..",
+            "escape.bin/",
+            "..\\escape.bin",
+            "C:\\Windows\\escape.bin",
+            "C:/Windows/escape.bin",
+            "\\\\server\\share\\escape.bin",
+            "\\\\?\\C:\\escape.bin",
+            " ../escape.bin ",
+        ] {
+            for outcome in [
+                derive_proposed_basename(evil, "x.bin"),
+                derive_outer_archive_basename(evil, "x.zip"),
+            ] {
+                match outcome {
+                    DeriveOutcome::Blocked(reason) => {
+                        assert!(reason.contains("path separator"), "{evil:?}: {reason}");
+                    }
+                    other => panic!("{evil:?} must be blocked, got {other:?}"),
+                }
+            }
+        }
+    }
+
     #[test]
     fn empty_and_reserved_names_are_blocked() {
         for bad in ["", "   ", ".", ".."] {
