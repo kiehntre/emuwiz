@@ -116,9 +116,26 @@ fn missing_intermediate_disc_is_shown_and_order_is_not_claimed() {
         "no start claim without verified order"
     );
     assert!(g.next_discs.is_empty());
+    assert_eq!(g.headline, "3-disc game · order not verified");
+    assert_eq!(g.missing_media, ["Disc 2 of 3"]);
+}
+
+#[test]
+fn a_lone_disc_of_a_larger_set_still_names_what_is_missing() {
+    let root = temp_root("lone");
+    let (mut set, paths) = verified_set(&root, 3);
+    set.members.truncate(1);
+    set.state = MediaSetState::IncompleteSet;
+    let context = MultiDiscLaunchContext::for_content(std::slice::from_ref(&set), &paths[0], &[])
+        .expect("a lone disc of a three-disc set is still a multi-disc game");
+    let g = guidance(&context.sets[0], &paths[0], None);
+    assert_eq!(g.headline, "3-disc game · order not verified");
+    assert_eq!(g.missing_media, ["Disc 2 of 3", "Disc 3 of 3"]);
+
+    set.expected_count = None;
     assert!(
-        g.missing_media.iter().any(|missing| missing.contains("2")),
-        "{g:?}"
+        MultiDiscLaunchContext::for_content(std::slice::from_ref(&set), &paths[0], &[]).is_none(),
+        "a single file with no expected total stays a single-disc game"
     );
 }
 

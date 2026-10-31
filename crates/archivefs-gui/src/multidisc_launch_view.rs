@@ -176,8 +176,9 @@ pub(crate) fn playlist_root() -> PathBuf {
 }
 
 impl MultiDiscLaunchContext {
-    /// Only the multi-member set(s) containing `content` are kept, so nothing
-    /// large is copied per frame.
+    /// Only the set(s) of several media containing `content` are kept, so
+    /// nothing large is copied per frame. A set that expects more media than
+    /// the one found still counts, so its missing discs are shown.
     pub(crate) fn for_content(
         all: &[MediaSet],
         content: &Path,
@@ -185,7 +186,11 @@ impl MultiDiscLaunchContext {
     ) -> Option<Self> {
         let sets: Vec<MediaSet> = all
             .iter()
-            .filter(|set| set.members.len() > 1 && contains(set, content))
+            .filter(|set| {
+                let expected = set.expected_count.as_ref().map(|(count, _)| count.count);
+                (set.members.len() > 1 || expected.is_some_and(|count| count > 1))
+                    && contains(set, content)
+            })
             .cloned()
             .collect();
         if sets.is_empty() {
@@ -485,10 +490,15 @@ pub(crate) fn guidance(
             .collect(),
         _ => Vec::new(),
     };
+    let total = projection
+        .missing_media
+        .iter()
+        .find_map(|missing| missing.expected_count)
+        .map_or(discs.len(), usize::from);
     let missing_media: Vec<String> = projection
         .missing_media
         .iter()
-        .map(|missing| missing.detail.clone())
+        .map(|missing| format!("{noun} {} of {total}", missing.number))
         .collect();
     let mut conflicts = projection.conflicts.clone();
     conflicts.extend(set.conflicts.iter().map(|conflict| conflict.detail.clone()));
@@ -520,7 +530,7 @@ pub(crate) fn guidance(
             ));
         }
     }
-    let count = discs.len();
+    let count = total.max(discs.len());
     let noun = noun.to_ascii_lowercase();
     let headline = if order_verified {
         format!("{count}-{noun} game · order verified")
@@ -598,10 +608,7 @@ pub(crate) fn show_guidance(ui: &mut egui::Ui, guidance: &DiscGuidance) {
         ui.label(format!("Next: {}", guidance.next_discs.join(", ")));
     }
     for missing in &guidance.missing_media {
-        ui.colored_label(
-            ui.visuals().warn_fg_color,
-            format!("Missing companion: {missing}"),
-        );
+        ui.colored_label(ui.visuals().warn_fg_color, format!("Missing: {missing}"));
     }
     for conflict in &guidance.conflicts {
         ui.colored_label(ui.visuals().warn_fg_color, format!("Conflict: {conflict}"));
