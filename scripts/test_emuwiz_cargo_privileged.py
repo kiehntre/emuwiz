@@ -486,6 +486,146 @@ class ManualProcedure(Priv):
         self.assertNotEqual(r.returncode, 0)
 
 
+class OrphanRouteRoot(Priv):
+    """The GIT_PRESERVED route end to end as REAL ROOT (installed root-owned copy), disposable fixtures only.
+
+    Retirement of a preserved orphan, and every fail-closed case: nothing may be removed unless every check passes.
+    """
+
+    def orphan(self, name, on_main=True, remove="worktree"):
+        wt, t = self.managed_cache(name, completed=True)
+        head = self.m.F.head_of(wt)
+        pin_fd = os.open(wt, os.O_RDONLY | os.O_DIRECTORY)   # keep the removed checkout's inode allocated
+        self.addCleanup(os.close, pin_fd)
+        if on_main:
+            self.git("-C", self.repo, "update-ref", "refs/remotes/origin/main", head)
+        if remove == "worktree":
+            self.git("-C", self.repo, "worktree", "remove", "--force", wt)
+        g = self.group(self.worktree("scratch-" + name), t)
+        g.update({"source_exists": False, "associated_source_paths": "[]", "source_head": head,
+                  "orphan_route": "GIT_PRESERVED", "orphan_repo": os.path.realpath(self.repo)})
+        return wt, t, g
+
+    def retire_as_root(self, g, name, execute=True):
+        path, digest = self.manifest([g], name)
+        argv = ["--manifest", path, "--approved-sha256", digest, "--receipt-dir", self.receipts, "--json",
+                "--maintenance-window-attested"]
+        if execute:
+            argv.append("--execute")
+        r = self.root(self.lib("emuwiz-cargo-retire"), *argv)
+        try:
+            out = json.loads(r.stdout)
+        except ValueError:
+            self.fail((r.returncode, r.stdout, r.stderr))
+        return r, out, {h["code"] for h in out.get("groups", [{"holds": []}])[0].get("holds", [])}
+
+    def record(self, t):
+        path = os.path.join(self.reg, "targets", self.key_of(t) + ".json")
+        with open(path) as handle:
+            return path, json.load(handle)
+
+    def test_root_retires_a_preserved_orphan_with_a_journal_receipt(self):
+        wt, t, g = self.orphan("root-orphan")
+        r, dry, codes = self.retire_as_root(g, "dry.json", execute=False)
+        self.assertEqual(dry["process_census"]["unreadable_foreign"], 0, "root census must be complete")
+        self.assertEqual(dry["groups"][0]["outcome"], "WOULD_RETIRE", dry["groups"][0]["holds"])
+        self.assertTrue(self.artifacts_present(t), "dry run removes nothing")
+        r, done, codes = self.retire_as_root(g, "exec.json")
+        self.assertEqual(r.returncode, 0, r.stderr)
+        self.assertEqual(done["groups"][0]["outcome"], "RETIRED", done["groups"][0]["holds"])
+        self.assertFalse(self.artifacts_present(t))
+        self.assertTrue(os.path.exists(os.path.join(t, "debug", ".cargo-lock")), "locks are preserved")
+        self.assertTrue(os.path.exists(done["receipt_file"]) and os.path.exists(done["journal_file"]))
+        self.assertEqual(self.root_owned(), [])
+        self.assertTrue(os.path.isdir(self.repo), "the repository (history) is untouched")
+
+    def assert_held(self, g, name, wanted):
+        t = g["directory"]
+        r, out, codes = self.retire_as_root(g, name)
+        self.assertTrue(codes & set(wanted), (codes, out))
+        self.assertNotEqual(out["groups"][0]["outcome"], "RETIRED")
+        self.assertTrue(self.artifacts_present(t), "held target must be untouched")
+        self.assertEqual(self.root_owned(), [])
+
+    def test_root_without_the_marker_is_a_hard_source_missing_refusal(self):
+        wt, t, g = self.orphan("root-nomark")
+        del g["orphan_route"]
+        self.assert_held(g, "m.json", {"SOURCE_MISSING"})
+
+    def test_root_head_not_on_origin_main_holds(self):
+        wt, t, g = self.orphan("root-notmain", on_main=False)
+        self.assert_held(g, "m.json", {"GIT_HISTORY_NOT_PRESERVED"})
+
+    def test_root_forged_origin_main_pointing_elsewhere_in_another_repo_holds(self):
+        # repository ownership comes from the recorded checkout, never from the manifest
+        wt, t, g = self.orphan("root-forge", on_main=False)
+        other = os.path.join(self.tmp, "other-repo")
+        self.git("init", "-q", other)
+        self.git("-C", other, "-c", "user.name=t", "-c", "user.email=t@t", "commit", "-q", "--allow-empty", "-m", "x")
+        self.git("-C", other, "fetch", "-q", self.repo, g["source_head"])
+        self.git("-C", other, "update-ref", "refs/remotes/origin/main", g["source_head"])
+        g["orphan_repo"] = os.path.realpath(other)
+        self.assert_held(g, "m.json", {"ORPHAN_REPO_UNVERIFIED", "GIT_HISTORY_NOT_PRESERVED", "OWNER_UNVERIFIED"})
+
+    def test_root_present_checkout_or_gitdir_holds(self):
+        wt, t, g = self.orphan("root-present", remove=None)
+        self.assert_held(g, "m1.json", {"ORPHAN_SOURCE_PRESENT"})
+        wt2, t2, g2 = self.orphan("root-gitdir")             # path gone, administrative gitdir recreated
+        _, rec = self.record(t2)
+        os.makedirs(rec["checkout"]["gitdir"])
+        self.assert_held(g2, "m2.json", {"ORPHAN_SOURCE_PRESENT"})
+
+    def test_root_missing_or_stale_checkout_evidence_holds(self):
+        wt, t, g = self.orphan("root-noev")
+        path, rec = self.record(t)
+        rec.pop("checkout")
+        with open(path, "w") as handle:
+            json.dump(rec, handle)
+        self.assert_held(g, "m1.json", {"ORPHAN_EVIDENCE_MISSING"})
+        wt2, t2, g2 = self.orphan("root-stale")              # evidence for a different build/HEAD binding
+        path, rec = self.record(t2)
+        rec["worktree_hash"] = "0" * 12
+        with open(path, "w") as handle:
+            json.dump(rec, handle)
+        self.assert_held(g2, "m2.json", {"OWNER_UNVERIFIED", "ORPHAN_EVIDENCE_MISSING", "IDENTITY_MISMATCH"})
+
+    def test_root_malformed_head_and_tampered_target_identity_hold(self):
+        wt, t, g = self.orphan("root-badhead")
+        for bad in ("ABCDEF" + "0" * 34, "g" * 40, g["source_head"][:39], ""):
+            self.assert_held(dict(g, source_head=bad), "h.json", {"OWNER_UNVERIFIED", "SOURCE_MISSING"})
+        wt2, t2, g2 = self.orphan("root-ident")
+        g2["inode"] = g2["inode"] + 1
+        r, out, codes = self.retire_as_root(g2, "i.json")
+        self.assertNotEqual(out["groups"][0]["outcome"], "RETIRED", out)
+        self.assertTrue(self.artifacts_present(t2))
+
+    def test_root_unreadable_filesystem_state_holds_instead_of_counting_as_absent(self):
+        # a REAL EACCES from lstat (not a simulated one): the owner cannot search the recorded gitdir's parent
+        wt, t, g = self.orphan("root-eacces")
+        _, rec = self.record(t)
+        parent = os.path.dirname(rec["checkout"]["gitdir"])
+        self.addCleanup(os.chmod, parent, 0o755)
+        os.chmod(parent, 0)
+        r, out, codes = self.retire_as_root(g, "m.json")
+        os.chmod(parent, 0o755)
+        self.assertNotEqual(out["groups"][0]["outcome"], "RETIRED", out)
+        self.assertTrue(codes & {"ORPHAN_SOURCE_UNKNOWN", "ORPHAN_REPO_UNVERIFIED"}, codes)
+        self.assertTrue(self.artifacts_present(t))
+
+    def test_root_unidentified_cache_without_a_recorded_build_stays_held(self):
+        wt, t = self.managed_cache("root-o2", build=False)
+        self.git("-C", self.repo, "worktree", "remove", "--force", wt)
+        self.assertEqual(self.ret("adopt", t, "--owner", "tester").returncode, 0)
+        self.age_record(t, 10)
+        g = self.group(self.worktree("scratch-root-o2"), t)
+        g.update({"source_exists": False, "associated_source_paths": "[]", "orphan_route": "GIT_PRESERVED",
+                  "orphan_repo": os.path.realpath(self.repo)})
+        r, out, codes = self.retire_as_root(g, "m.json")
+        self.assertNotEqual(out["groups"][0]["outcome"], "RETIRED", out)
+        self.assertTrue(codes & {"SOURCE_MISSING", "ORPHAN_EVIDENCE_MISSING", "NOT_ADOPTED"}, codes)
+        self.assertTrue(self.artifacts_present(t))
+
+
 @unittest.skipUnless(os.environ.get("EMUWIZ_TEST_SYSTEMD") == "1",
                      "set EMUWIZ_TEST_SYSTEMD=1 to run the generated service once under systemd")
 class SystemdService(Priv):
