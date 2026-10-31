@@ -472,9 +472,10 @@ impl PublisherProfilePageState {
         self.execution_transaction = Some(transaction);
     }
 
-    /// Applied items the journal says can still be reversed. A run that needs
-    /// reconciliation keeps this route: rollback is what reverses recorded
-    /// links, and it re-verifies the journal and fences writes itself.
+    /// Items the journal says rollback can still act on: applied, plus in-flight
+    /// entries it reconciles against the disk. A failed rollback is not counted
+    /// because links are never retried. A run that needs reconciliation keeps
+    /// this route: rollback re-verifies the journal and fences writes itself.
     fn reversible_item_count(&self) -> usize {
         let settled = matches!(
             self.execution_stage,
@@ -483,7 +484,9 @@ impl PublisherProfilePageState {
         self.execution_transaction
             .as_ref()
             .filter(|transaction| settled && transaction.transaction.is_rollbackable())
-            .map_or(0, |transaction| transaction.transaction.applied_count())
+            .map_or(0, |transaction| {
+                transaction.transaction.applied_count() + in_flight_count(&transaction.transaction)
+            })
     }
 
     pub(crate) fn rollback_confirmation_phrase(&self) -> Option<String> {
@@ -535,9 +538,19 @@ impl PublisherProfilePageState {
                     archivefs_core::dat::rename_apply::RollbackResult::FullyRolledBack
                 ) =>
             {
-                self.execution_stage = PublisherExecutionStage::RolledBack;
+                let remaining = destination_left_after_rollback(&transaction.transaction, &outcome);
                 self.rollback_confirmation_text.clear();
-                self.execution_error = None;
+                if remaining.is_empty() {
+                    self.execution_stage = PublisherExecutionStage::RolledBack;
+                    self.execution_error = None;
+                } else {
+                    self.execution_stage = PublisherExecutionStage::NeedsReconciliation;
+                    self.execution_error = Some(format!(
+                        "Rollback finished, but these destination paths remain: {}. Review transaction {}.",
+                        remaining.join(", "),
+                        transaction.transaction.transaction_id
+                    ));
+                }
             }
             Ok(outcome) => {
                 self.execution_stage = PublisherExecutionStage::NeedsReconciliation;
@@ -574,6 +587,65 @@ fn publisher_execution_error_text(
         } => format!("HARDLINK is unavailable: {detail}"),
         other => format!("Publisher execution review blocked: {other:?}"),
     }
+}
+
+/// Entries whose completion was never recorded.
+fn in_flight_count(transaction: &archivefs_core::dat::rename_apply::RenameTransaction) -> usize {
+    use archivefs_core::dat::rename_apply::EntryState;
+    transaction
+        .entries
+        .iter()
+        .filter(|entry| matches!(entry.state, EntryState::Applying | EntryState::RollingBack))
+        .count()
+}
+
+/// What a rollback reported as complete did not remove: created directories
+/// it could not empty, and links from entries recorded as failed, which
+/// rollback does not touch but which can exist when verification failed
+/// after the link was created.
+fn destination_left_after_rollback(
+    transaction: &archivefs_core::dat::rename_apply::RenameTransaction,
+    outcome: &archivefs_core::platform_evidence_fusion::plan_transaction::PlanRollbackOutcome,
+) -> Vec<String> {
+    use archivefs_core::dat::rename_apply::EntryState;
+    transaction
+        .entries
+        .iter()
+        .filter(|entry| {
+            entry.state == EntryState::ApplyFailed
+                && std::fs::symlink_metadata(&entry.destination_path).is_ok()
+        })
+        .map(|entry| &entry.destination_path)
+        .chain(
+            outcome
+                .directories_remaining
+                .iter()
+                .filter(|directory| holds_more_than_undone_entries(directory)),
+        )
+        .map(|path| path.display().to_string())
+        .collect()
+}
+
+/// Rollback parks each removed link as a hidden `.emuwiz-undone-` entry beside
+/// where it was, so a created directory normally survives a clean rollback.
+/// Anything else in it, or a directory that cannot be read, is real leftover.
+fn holds_more_than_undone_entries(directory: &std::path::Path) -> bool {
+    let Ok(entries) = std::fs::read_dir(directory) else {
+        return true;
+    };
+    entries.into_iter().any(|entry| {
+        let Ok(entry) = entry else {
+            return true;
+        };
+        let path = entry.path();
+        if std::fs::symlink_metadata(&path).is_ok_and(|metadata| metadata.is_dir()) {
+            return holds_more_than_undone_entries(&path);
+        }
+        !entry
+            .file_name()
+            .to_string_lossy()
+            .starts_with(".emuwiz-undone-")
+    })
 }
 
 /// Whether the journalled record shows the destination may have changed: an
@@ -1090,7 +1162,7 @@ pub(crate) fn show_publisher_profile_page(
                         record.created_directories.len()
                     ));
                     if state.rollback_confirmation_phrase().is_none() {
-                        ui.label("This page cannot reverse this transaction. Review its journal in Repair History.");
+                        ui.label("This page cannot reverse this transaction. Its journal can be reviewed in Repair History, but Undo for links is not available there.");
                     }
                 }
                 PublisherExecutionStage::Preview | PublisherExecutionStage::Review => {}
@@ -1099,6 +1171,12 @@ pub(crate) fn show_publisher_profile_page(
                 ui.label(format!(
                     "Type {phrase} to remove the created destination entries."
                 ));
+                let in_flight = in_flight_count(&transaction.transaction);
+                if in_flight > 0 {
+                    ui.label(format!(
+                        "{in_flight} of these item(s): completion was not recorded. Rollback checks each against the disk."
+                    ));
+                }
                 ui.text_edit_singleline(&mut state.rollback_confirmation_text);
                 if ui
                     .add_enabled(

@@ -576,28 +576,36 @@ fn every_journal_state_maps_to_an_outcome_the_record_supports() {
                     let unsettled = entries
                         .iter()
                         .any(|e| !matches!(e, E::Applied | E::Skipped | E::RolledBack));
-                    match state.execution_stage {
-                        PublisherExecutionStage::Applied => {
-                            assert!(applied > 0 && reversible && !unsettled, "{case}");
+                    let rolled_back = count(E::RolledBack);
+                    let expected_stage = if unsettled {
+                        PublisherExecutionStage::NeedsReconciliation
+                    } else if applied > 0 {
+                        if reversible {
+                            PublisherExecutionStage::Applied
+                        } else {
+                            PublisherExecutionStage::NeedsReconciliation
                         }
-                        PublisherExecutionStage::RolledBack => {
-                            assert_eq!(transaction_state, T::RolledBack, "{case}");
-                            assert_eq!(count(E::RolledBack) + count(E::Skipped), 2, "{case}");
-                            assert!(count(E::RolledBack) > 0, "{case}");
+                    } else if rolled_back > 0 {
+                        if transaction_state == T::RolledBack {
+                            PublisherExecutionStage::RolledBack
+                        } else {
+                            PublisherExecutionStage::NeedsReconciliation
                         }
-                        PublisherExecutionStage::NothingPublished => {
-                            assert!(!changed && !unsettled, "{case}");
-                            assert_eq!(count(E::Skipped), 2, "{case}");
-                        }
-                        PublisherExecutionStage::NeedsReconciliation => {
-                            assert!(state.execution_error.is_some(), "{case}");
-                        }
-                        other => panic!("{case}: unexpected stage {other:?}"),
+                    } else if changed {
+                        PublisherExecutionStage::NeedsReconciliation
+                    } else {
+                        PublisherExecutionStage::NothingPublished
+                    };
+                    assert_eq!(state.execution_stage, expected_stage, "{case}");
+                    if expected_stage == PublisherExecutionStage::NeedsReconciliation {
+                        assert!(state.execution_error.is_some(), "{case}");
                     }
-                    let expected_phrase = (applied > 0
+                    let in_flight = count(E::Applying) + count(E::RollingBack);
+                    let reversible_items = applied + in_flight;
+                    let expected_phrase = (reversible_items > 0
                         && reversible
-                        && state.execution_stage != PublisherExecutionStage::RolledBack)
-                        .then(|| format!("ROLL BACK {applied} ITEMS"));
+                        && expected_stage != PublisherExecutionStage::RolledBack)
+                        .then(|| format!("ROLL BACK {reversible_items} ITEMS"));
                     assert_eq!(
                         state.rollback_confirmation_phrase(),
                         expected_phrase,
@@ -609,6 +617,149 @@ fn every_journal_state_maps_to_an_outcome_the_record_supports() {
             }
         }
     }
+}
+
+/// Two really published items whose journal is then rewritten to `entries`,
+/// as a run that stopped part-way would have left it.
+struct ReshapedRun {
+    state: PublisherProfilePageState,
+    journal: PathBuf,
+    published: Vec<PathBuf>,
+    temp: tempfile::TempDir,
+}
+
+fn reshaped_run(
+    entries: &[archivefs_core::dat::rename_apply::EntryState],
+    transaction_state: archivefs_core::dat::rename_apply::TransactionState,
+) -> ReshapedRun {
+    let temp = tempfile::tempdir().unwrap();
+    let first = temp.path().join("Game.rom");
+    let second = temp.path().join("Other.rom");
+    let destination = temp.path().join("published");
+    let journal = temp.path().join("journal");
+    std::fs::write(&first, b"first source").unwrap();
+    std::fs::write(&second, b"second source").unwrap();
+    std::fs::create_dir(&destination).unwrap();
+    let mut state = PublisherProfilePageState {
+        target: Some(PublisherFrontend::RomM),
+        destination_root: destination.display().to_string(),
+        source_plan: Some(plan_with(vec![
+            elected("Game", &first.display().to_string()),
+            elected("Other", &second.display().to_string()),
+        ])),
+        canonical_platform_id: "Amiga".to_string(),
+        ..Default::default()
+    };
+    state.preview();
+    state.link_mode = Some(archivefs_core::publisher_profile::PublisherLinkMode::Symlink);
+    state.execution_review();
+    state.confirmation_text = state.apply_confirmation_phrase().unwrap();
+    state.apply_with_journal_dir(&journal);
+    assert_eq!(state.execution_stage, PublisherExecutionStage::Applied);
+    let transaction = &mut state.execution_transaction.as_mut().unwrap().transaction;
+    for (entry, entry_state) in transaction.entries.iter_mut().zip(entries) {
+        entry.state = *entry_state;
+    }
+    transaction.state = transaction_state;
+    archivefs_core::dat::rename_apply::journal::write_journal(&journal, transaction).unwrap();
+    let published = transaction
+        .entries
+        .iter()
+        .map(|entry| entry.destination_path.clone())
+        .collect();
+    state.execution_stage = PublisherExecutionStage::NeedsReconciliation;
+    ReshapedRun {
+        state,
+        journal,
+        published,
+        temp,
+    }
+}
+
+#[test]
+fn rollback_is_not_called_complete_while_a_failed_entrys_link_remains() {
+    use archivefs_core::dat::rename_apply::{EntryState, TransactionState};
+    let mut run = reshaped_run(
+        &[EntryState::Applied, EntryState::ApplyFailed],
+        TransactionState::ApplyFailed,
+    );
+    assert_eq!(
+        run.state.rollback_confirmation_phrase().as_deref(),
+        Some("ROLL BACK 1 ITEMS")
+    );
+    run.state.rollback_confirmation_text = "ROLL BACK 1 ITEMS".into();
+    run.state.rollback_with_journal_dir(&run.journal);
+    assert!(std::fs::symlink_metadata(&run.published[1]).is_ok());
+    assert_eq!(
+        run.state.execution_stage,
+        PublisherExecutionStage::NeedsReconciliation
+    );
+    let message = run.state.execution_error.clone().expect("explained");
+    assert!(
+        message.contains(&run.published[1].display().to_string()),
+        "{message}"
+    );
+    let labels = page_labels(&mut run.state);
+    assert!(!labels.contains("rolled back."), "{labels}");
+    assert!(!labels.contains("Export rolled back"), "{labels}");
+}
+
+#[test]
+fn rollback_counts_and_reverses_an_in_flight_entry() {
+    use archivefs_core::dat::rename_apply::{EntryState, TransactionState};
+    let mut run = reshaped_run(
+        &[EntryState::Applied, EntryState::Applying],
+        TransactionState::ApplyFailed,
+    );
+    assert_eq!(
+        run.state.rollback_confirmation_phrase().as_deref(),
+        Some("ROLL BACK 2 ITEMS")
+    );
+    let labels = page_labels(&mut run.state);
+    assert!(labels.contains("completion was not recorded"), "{labels}");
+    run.state.rollback_confirmation_text = "ROLL BACK 2 ITEMS".into();
+    run.state.rollback_with_journal_dir(&run.journal);
+    assert_eq!(
+        run.state.execution_stage,
+        PublisherExecutionStage::RolledBack
+    );
+    for link in &run.published {
+        assert!(std::fs::symlink_metadata(link).is_err());
+    }
+}
+
+#[test]
+fn rollback_is_not_called_complete_while_a_created_directory_remains() {
+    use archivefs_core::dat::rename_apply::{EntryState, TransactionState};
+    let mut run = reshaped_run(
+        &[EntryState::Applied, EntryState::Applied],
+        TransactionState::Applied,
+    );
+    let directory = run.published[0].parent().unwrap().to_path_buf();
+    assert!(
+        run.state
+            .execution_transaction
+            .as_ref()
+            .unwrap()
+            .transaction
+            .created_directories
+            .contains(&directory)
+    );
+    let stranger = directory.join("user-note.txt");
+    std::fs::write(&stranger, b"not ours").unwrap();
+    run.state.rollback_confirmation_text = "ROLL BACK 2 ITEMS".into();
+    run.state.rollback_with_journal_dir(&run.journal);
+    assert_eq!(std::fs::read(&stranger).unwrap(), b"not ours");
+    assert_eq!(
+        run.state.execution_stage,
+        PublisherExecutionStage::NeedsReconciliation
+    );
+    let message = run.state.execution_error.clone().expect("explained");
+    assert!(
+        message.contains(&directory.display().to_string()),
+        "{message}"
+    );
+    assert!(run.temp.path().exists());
 }
 
 #[test]
