@@ -505,6 +505,21 @@ pub(super) enum CheckedReadiness {
     NotReady(&'static str),
 }
 
+impl CheckedReadiness {
+    /// The finished answer on a compact readiness card, or `None` when the
+    /// card is still checking, stale or partial (unknown is never a result).
+    pub fn from_compact(view: &super::launch_readiness_summary::CompactReadiness) -> Option<Self> {
+        use super::launch_readiness_summary::ReadinessPresentationState as State;
+        if view.pending || view.spinner {
+            return None;
+        }
+        Some(match view.tone {
+            State::Ready | State::ReadyWithWarnings => Self::Ready,
+            _ => Self::NotReady(view.badge),
+        })
+    }
+}
+
 /// The file facts a result was taken against. A result whose facts no longer
 /// match the catalogue row describes an older file and is ignored.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -545,6 +560,13 @@ impl ReadinessCache {
             None => self.entries.remove(&id),
         };
         self.version += 1;
+    }
+    /// Record a background answer only where no current answer exists, so a
+    /// background check never replaces a foreground one.
+    pub fn record_background(&mut self, game: &Game, result: CheckedReadiness) {
+        if self.get(game).is_none() {
+            self.record(game, Some(result));
+        }
     }
     pub fn clear(&mut self) {
         if !self.entries.is_empty() {

@@ -665,6 +665,11 @@ impl NativeWorkflows {
 
     /// True when the current selected-evidence state (loading, ready or
     /// failed) already belongs to `path`, so it can be reused at once.
+    /// Read-only view of the emulator readiness state, for background checks.
+    pub(super) fn emulator_readiness(&self) -> &crate::EmulatorReadinessState {
+        &self.app.emulator_readiness
+    }
+
     pub(super) fn has_evidence_for(&self, path: &Path) -> bool {
         match &self.app.selected_evidence_ui.selected_evidence {
             selected_evidence_page::SelectedEvidenceState::Loading { path: current, .. }
