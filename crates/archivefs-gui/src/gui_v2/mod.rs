@@ -9,6 +9,7 @@ mod artwork;
 mod backend;
 mod bezel;
 mod bezel_history;
+mod bg_readiness;
 mod browse_play;
 mod cheat_extras_page;
 pub(crate) mod classic_trainers;

@@ -3025,3 +3025,37 @@ fn failed_undo_distinguishes_recorded_links_awaiting_reversal_from_a_reversed_re
     assert!(body.contains("no links still awaiting"), "{body}");
     assert!(!body.contains("still records links"), "{body}");
 }
+
+#[test]
+fn receipt_view_shows_the_journal_based_outcome_badge() {
+    use crate::transaction_outcome::test_support::{journal, rendered_text};
+    use archivefs_core::dat::rename_apply::model::EntryState;
+    let render = |transaction| {
+        let mut state = PlayingLibraryPageState {
+            applied: Some(transaction),
+            ..PlayingLibraryPageState::default()
+        };
+        let ctx = egui::Context::default();
+        let output = ctx.run(Default::default(), |ctx| {
+            egui::CentralPanel::default().show(ctx, |ui| {
+                show_playing_library_page(ui, &mut state);
+            });
+        });
+        rendered_text(&output)
+    };
+    let live = render(journal(
+        TransactionState::Applied,
+        &[EntryState::Applied, EntryState::Applied],
+        &[],
+    ));
+    assert!(live.contains("Completed"), "{live}");
+    assert!(live.contains("Undo available now"), "{live}");
+    // After Undo the same receipt reads Undone and offers no Undo.
+    let undone = render(journal(
+        TransactionState::RolledBack,
+        &[EntryState::RolledBack, EntryState::RolledBack],
+        &[],
+    ));
+    assert!(undone.contains("Undone"), "{undone}");
+    assert!(!undone.contains("Undo available"), "{undone}");
+}

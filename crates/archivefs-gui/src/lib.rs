@@ -379,6 +379,7 @@ mod source_state;
 use source_state::{source_platform_state, source_platform_value_label};
 mod sources_page;
 pub(crate) mod status_wording;
+pub(crate) mod transaction_outcome;
 use status_wording::{
     format_database_upgrade_success, format_scan_activity, format_scan_completion,
 };

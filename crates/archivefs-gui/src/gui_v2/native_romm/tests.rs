@@ -881,6 +881,40 @@ fn visible_artwork_uses_existing_cache_and_prefers_the_small_cover() {
     assert!(!requests.iter().any(|url| url.contains("/content")));
 }
 #[test]
+fn detail_artwork_prefers_the_large_cover_and_never_touches_list_covers() {
+    let fixture = Fixture {
+        artwork: true,
+        ..Default::default()
+    };
+    let Reply::Connection {
+        page: Some(page), ..
+    } = call(&fixture, Request::Connect)
+    else {
+        panic!()
+    };
+    let Reply::DetailCover { id, image } = call(
+        &fixture,
+        Request::DetailCover(Box::new(page.games[0].clone())),
+    ) else {
+        panic!()
+    };
+    assert_eq!(id, page.games[0].id);
+    assert!(image.is_some());
+    let requests = fixture.requests.lock().unwrap();
+    assert!(requests.iter().any(|url| url.ends_with("/large.png")));
+    assert!(!requests.iter().any(|url| url.contains("/content")));
+}
+#[test]
+fn failed_detail_artwork_keeps_the_list_cover_and_does_not_refetch() {
+    let ctx = egui::Context::default();
+    let mut state = connected();
+    state.absorb(&ctx, 0, Ok(Reply::DetailCover { id: 1, image: None }));
+    assert!(matches!(state.detail_covers.get(&1), Some(None)));
+    assert!(!state.covers.contains_key(&1));
+    assert!(state.problem.is_none());
+    assert!(state.connected());
+}
+#[test]
 fn failed_reconnect_does_not_leave_old_data_marked_connected() {
     let mut state = connected();
     state.queue(Request::Connect);

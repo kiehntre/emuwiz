@@ -151,6 +151,8 @@ pub(in crate::gui_v2) enum Request {
     },
     Detail(u64),
     Cover(Box<RommGameSummary>),
+    /// The detail view's larger cover; falls back to the small cover in core.
+    DetailCover(Box<RommGameSummary>),
 }
 impl Request {
     fn label(&self) -> &'static str {
@@ -159,7 +161,7 @@ impl Request {
             Self::Connect => "Connecting to RomM",
             Self::Games { .. } => "Loading RomM games",
             Self::Detail(_) => "Loading RomM game details",
-            Self::Cover(_) => "Loading RomM artwork",
+            Self::Cover(_) | Self::DetailCover(_) => "Loading RomM artwork",
         }
     }
 }
@@ -177,6 +179,10 @@ pub(in crate::gui_v2) enum Reply {
     Page(RommBrowsePage, RommToken),
     Detail(RommGameDetail, RommToken),
     Cover {
+        id: u64,
+        image: Option<egui::ColorImage>,
+    },
+    DetailCover {
         id: u64,
         image: Option<egui::ColorImage>,
     },
@@ -353,6 +359,7 @@ pub(super) struct State {
     stale: bool,
     retry: Request,
     covers: HashMap<u64, Option<egui::TextureHandle>>,
+    detail_covers: HashMap<u64, Option<egui::TextureHandle>>,
     text_focused: bool,
     visible_last_frame: bool,
     local_handoff: bool,
@@ -391,6 +398,7 @@ impl Default for State {
             stale: false,
             retry: Request::Connect,
             covers: HashMap::new(),
+            detail_covers: HashMap::new(),
             text_focused: false,
             visible_last_frame: false,
             local_handoff: false,
@@ -429,6 +437,7 @@ impl State {
         self.browse.cancel();
         self.art.cancel();
         self.covers.retain(|_, image| image.is_some());
+        self.detail_covers.retain(|_, image| image.is_some());
     }
     fn queue(&mut self, request: Request) {
         self.invalidate();
@@ -438,6 +447,7 @@ impl State {
             self.selected = None;
             self.detail = None;
             self.covers.clear();
+            self.detail_covers.clear();
             self.pages.clear();
             self.details.clear();
             self.platform_warning = false;
@@ -461,6 +471,7 @@ impl State {
         self.detail = None;
         self.page = None;
         self.covers.clear();
+        self.detail_covers.clear();
         let key = self.page_key(offset);
         if let Some(cached) = self.pages.get(&key).cloned() {
             self.invalidate();
@@ -510,6 +521,7 @@ impl State {
         self.detail = None;
         self.selected = None;
         self.covers.clear();
+        self.detail_covers.clear();
         self.problem = None;
         self.edited = Some(now);
     }
@@ -638,6 +650,7 @@ impl State {
                 self.last_selected = None;
                 self.detail = None;
                 self.covers.clear();
+                self.detail_covers.clear();
             }
             Ok(Reply::Page(page, token)) => {
                 self.stale = false;
@@ -662,6 +675,18 @@ impl State {
                 } else {
                     return false;
                 }
+            }
+            Ok(Reply::DetailCover { id, image }) => {
+                self.detail_covers.insert(
+                    id,
+                    image.map(|image| {
+                        ctx.load_texture(
+                            format!("native-romm-detail-{}-{id}", self.generation),
+                            image,
+                            egui::TextureOptions::LINEAR,
+                        )
+                    }),
+                );
             }
             Ok(Reply::Cover { id, image }) => {
                 self.covers.insert(
@@ -1061,6 +1086,29 @@ impl State {
             }
         }
     }
+    /// Larger cover for the selected game. Shows the list thumbnail until the
+    /// large one arrives, or when none can be fetched.
+    fn detail_cover_ui(&mut self, ui: &mut egui::Ui, game: &RommGameSummary, box_size: egui::Vec2) {
+        if let Some(Some(texture)) = self.detail_covers.get(&game.id) {
+            let (rect, _) = ui.allocate_exact_size(box_size, egui::Sense::hover());
+            let size = crate::gamer_artwork::fit_within(box_size, texture.size_vec2());
+            ui.painter().image(
+                texture.id(),
+                egui::Rect::from_center_size(rect.center(), size),
+                egui::Rect::from_min_max(egui::Pos2::ZERO, egui::pos2(1.0, 1.0)),
+                egui::Color32::WHITE,
+            );
+            return;
+        }
+        if game.artwork.cover.is_some()
+            && !self.detail_covers.contains_key(&game.id)
+            && !self.art.active()
+        {
+            self.detail_covers.insert(game.id, None);
+            self.art.pending = Some(Request::DetailCover(Box::new(game.clone())));
+        }
+        self.cover_ui(ui, game, egui::vec2(90.0, 126.0));
+    }
     fn detail_ui(&mut self, ui: &mut egui::Ui) {
         if self.browse.active() {
             ui.horizontal(|ui| {
@@ -1083,7 +1131,7 @@ impl State {
             ui.label(format!("Released: {year}"));
         }
         ui.horizontal_wrapped(|ui| {
-            self.cover_ui(ui, game, egui::vec2(90.0, 126.0));
+            self.detail_cover_ui(ui, game, egui::vec2(160.0, 224.0));
             ui.vertical(|ui| {
                 ui.label(self.display(&self.game_platform(game)));
                 if !game.identity.regions.is_empty() {

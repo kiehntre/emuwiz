@@ -19,6 +19,16 @@ pub(crate) struct Controller {
 }
 
 impl Controller {
+    /// A controller already holding a finished check for `path`, for
+    /// background readiness (which never shows the panel or starts a worker).
+    pub(crate) fn with_context(path: PathBuf, context: Context) -> Self {
+        Self {
+            path: Some(path),
+            receiver: None,
+            context: Some(context),
+        }
+    }
+
     pub(crate) fn context(&self, path: Option<&Path>) -> Option<Context> {
         self.context
             .as_ref()

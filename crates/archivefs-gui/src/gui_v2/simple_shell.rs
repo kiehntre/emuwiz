@@ -509,7 +509,7 @@ pub(super) fn capability_map() -> Vec<PlannedControl> {
             "Filters: All / Ready / Needs attention / Not checked",
             New,
             Some(Route::BrowsePlay),
-            "PARTIAL: the four-way filter ships in Browse & Play, but Ready only fills in as games are selected; no background readiness checking yet.",
+            "PARTIAL: four-way filter with bounded background checks for visible games. TEMPORARY LIMIT: Dreamcast GDI, C64, Dragon/CoCo, Wii U (and Atari ST, NES, PS4) are only checked when selected; not full background coverage.",
             "3",
         ),
         control(
