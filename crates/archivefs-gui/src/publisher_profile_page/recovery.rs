@@ -6,8 +6,8 @@ use std::path::{Path, PathBuf};
 
 use archivefs_core::dat::rename_apply::RollbackResult;
 use archivefs_core::publisher_profile::recovery::{
-    RecoverableExport, open_publisher_export_for_undo, recoverable_publisher_exports,
-    rollback_publisher_export,
+    PublisherUndoFailure, RecoverableExport, open_publisher_export_for_undo,
+    recoverable_publisher_exports, rollback_publisher_export,
 };
 
 use super::{
@@ -20,6 +20,8 @@ pub(crate) struct PublisherRecoveryState {
     loaded: bool,
     journal_dir: Option<PathBuf>,
     pub(super) exports: Vec<RecoverableExport>,
+    /// What the last load could not show.
+    pub(super) notice: Option<String>,
     pub(super) selected: Option<String>,
     pub(super) confirmation_text: String,
     pub(super) message: Option<String>,
@@ -52,10 +54,22 @@ impl PublisherProfilePageState {
     pub(crate) fn load_recoverable_exports(&mut self) {
         self.recovery.loaded = true;
         match self.recovery.journal_dir() {
-            Ok(directory) => self.recovery.exports = recoverable_publisher_exports(&directory),
+            Ok(directory) => {
+                let listing = recoverable_publisher_exports(&directory);
+                self.recovery.exports = listing.exports;
+                self.recovery.notice = match (listing.unreadable, listing.unverified) {
+                    (Some(error), _) => {
+                        Some(format!("Transaction journals could not be read: {error}."))
+                    }
+                    (None, 0) => None,
+                    (None, count) => Some(format!(
+                        "{count} export journal(s) could not be verified, so they are not listed and cannot be undone here."
+                    )),
+                };
+            }
             Err(error) => {
                 self.recovery.exports.clear();
-                self.recovery.message = Some(error);
+                self.recovery.notice = Some(error);
             }
         }
         let exports = &self.recovery.exports;
@@ -148,7 +162,12 @@ impl PublisherProfilePageState {
                     "Rollback was not complete: {:?}. Review transaction {id}.",
                     outcome.rollback.result
                 ),
-                Err(reason) => format!("{reason} Nothing was rolled back for {id}."),
+                Err(PublisherUndoFailure::Refused(reason)) => {
+                    format!("{reason} Nothing was rolled back for {id}.")
+                }
+                Err(PublisherUndoFailure::Interrupted(reason)) => format!(
+                    "Rollback needs reconciliation: {reason} Some links may already be removed. Review transaction {id}."
+                ),
             },
         );
         self.recovery.selected = None;
@@ -179,15 +198,23 @@ pub(super) fn show_recoverable_exports(ui: &mut egui::Ui, state: &mut PublisherP
         .filter(|export| Some(&export.transaction.transaction_id) != current.as_ref())
         .cloned()
         .collect();
-    if exports.is_empty() && state.recovery.message.is_none() {
+    if exports.is_empty() && state.recovery.message.is_none() && state.recovery.notice.is_none() {
         return;
     }
     let mut request_rollback = false;
     widgets::card(ui, |ui| {
         ui.label(egui::RichText::new("Exports you can still undo").strong());
         ui.label("Listed from sealed transaction journals. Exports made before this version are not listed and cannot be undone here.");
+        if let Some(notice) = &state.recovery.notice {
+            ui.label(notice);
+        }
         if let Some(message) = &state.recovery.message {
             ui.label(message);
+        }
+        if exports.iter().any(|export| export.blocker.is_some())
+            && ui.button("Check again").clicked()
+        {
+            state.recovery.loaded = false;
         }
         for export in &exports {
             let id = &export.transaction.transaction_id;

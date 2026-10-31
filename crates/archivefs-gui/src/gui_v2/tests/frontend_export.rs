@@ -37,6 +37,7 @@ fn blue_frontend_profiles_navigation_and_keyboard_work_at_supported_sizes() {
             }],
         );
         assert_eq!(app.organisation.view, OrganisationView::FrontendExport);
+        settle_recovery_load(&context, &mut app, size);
         let output = frame(&context, &mut app, size);
         let labels = text(&output).join("\n");
         assert!(labels.contains("Create a RomM-ready library"));
@@ -139,7 +140,7 @@ fn frontend_export_retains_terminal_outcome_when_playing_library_changes() {
     page.execution_error =
         Some("Synthetic partial write: inspect transaction synthetic-123".into());
     app.organisation.frontend_export = page;
-    frame(&context, &mut app, [1024.0, 600.0]);
+    settle_recovery_load(&context, &mut app, [1024.0, 600.0]);
     assert_eq!(
         app.organisation.frontend_export.execution_stage,
         PublisherExecutionStage::NeedsReconciliation
@@ -153,4 +154,27 @@ fn frontend_export_retains_terminal_outcome_when_playing_library_changes() {
             .contains("synthetic-123")
     );
     assert!(app.organisation.frontend_export.source_plan.is_some());
+}
+
+/// The page's first frames load the recovery list on a worker.
+fn settle_recovery_load(context: &egui::Context, app: &mut App, size: [f32; 2]) {
+    frame(context, app, size);
+    for _ in 0..500 {
+        let page = &app.organisation.frontend_export;
+        if page.recovery.loaded() && !page.is_busy() {
+            return;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(10));
+        frame(context, app, size);
+    }
+    panic!("recovery list did not load");
+}
+
+#[test]
+fn blue_loads_recovered_exports_when_the_page_opens() {
+    let context = egui::Context::default();
+    let mut app = organisation_app(&context);
+    app.organisation.view = OrganisationView::FrontendExport;
+    assert!(!app.organisation.frontend_export.recovery.loaded());
+    settle_recovery_load(&context, &mut app, [1440.0, 900.0]);
 }

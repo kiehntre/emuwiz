@@ -802,7 +802,7 @@ fn rollback_control_says_the_export_stays_undoable_later() {
     );
     let labels = page_labels(&mut state);
     assert!(
-        labels.contains("stays listed under Exports you can still undo"),
+        labels.contains("moves to Exports you can still undo"),
         "{labels}"
     );
 }

@@ -49,9 +49,29 @@ pub struct RecoverableExport {
     pub blocker: Option<String>,
 }
 
+/// What the journal folder shows: exports to offer, and what could not be shown.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct PublisherRecoveryListing {
+    pub exports: Vec<RecoverableExport>,
+    /// Marked journals left out because their seal did not verify.
+    pub unverified: usize,
+    /// Why the folder itself could not be read.
+    pub unreadable: Option<String>,
+}
+
+/// Why a recovered Undo ended without an outcome.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum PublisherUndoFailure {
+    /// Refused while opening the journal: nothing was touched.
+    Refused(String),
+    /// Stopped inside rollback, possibly after links were already removed.
+    Interrupted(String),
+}
+
 /// Whether `transaction` is a Publisher export: the plain workflow, a marker
-/// naming the destination root and link mode, and every entry the matching
-/// link operation confined to that root. Older exports have no marker and are
+/// naming the destination root and link mode, the source root Apply requires,
+/// created directories inside the root, and every entry the matching link
+/// operation confined to that root. Older exports have no marker and are
 /// indistinguishable from other link records, so they never qualify.
 pub fn is_publisher_export(transaction: &RenameTransaction) -> bool {
     let Some(marker) = transaction.unknown.get(PUBLISHER_EXPORT_MARKER) else {
@@ -66,6 +86,11 @@ pub fn is_publisher_export(transaction: &RenameTransaction) -> bool {
     let root = Path::new(root);
     !transaction.entries.is_empty()
         && seal::workflow_of(transaction) == "rename_apply"
+        && Path::new(&transaction.source_scan_root) == root
+        && transaction
+            .created_directories
+            .iter()
+            .all(|directory| directory.starts_with(root))
         && transaction
             .entries
             .iter()
@@ -108,8 +133,14 @@ fn undo_blocker(transaction: &RenameTransaction) -> Option<String> {
         && refused_entry_count(transaction) > 0
         && reversible_entries(transaction).next().is_none()
     {
+        let reason = transaction
+            .entries
+            .iter()
+            .find(|entry| entry.state == EntryState::RollbackFailed)
+            .and_then(|entry| entry.failure_reason.as_deref())
+            .unwrap_or("no reason was recorded");
         return Some(format!(
-            "{}: {} link(s) could not be undone because they are no longer what EmuWiz created. They were left in place; check them by hand.",
+            "{}: {} link(s) were not undone and were left in place; check them by hand. Recorded reason: {reason}",
             transaction.transaction_id,
             refused_entry_count(transaction)
         ));
@@ -135,11 +166,116 @@ fn undo_blocker(transaction: &RenameTransaction) -> Option<String> {
         })
 }
 
+/// A marker's destination root, for a record `is_publisher_export` accepted.
+fn export_root(transaction: &RenameTransaction) -> Option<&Path> {
+    transaction
+        .unknown
+        .get(PUBLISHER_EXPORT_MARKER)?
+        .get("destination_root")?
+        .as_str()
+        .map(Path::new)
+}
+
+/// Why Undo should wait: an unavailable folder would otherwise be recorded as a
+/// refused link, and links are never retried. A single missing source folder
+/// is not an outage, so it stays with the per-entry partial rollback.
+fn availability_blocker(transaction: &RenameTransaction) -> Option<String> {
+    let id = &transaction.transaction_id;
+    let root = export_root(transaction)?;
+    if !root.is_dir() {
+        return Some(format!(
+            "{id} cannot be undone right now: {} is not available. Reconnect it, then choose Check again.",
+            root.display()
+        ));
+    }
+    if reversible_entries(transaction).all(|entry| {
+        entry
+            .source_path
+            .parent()
+            .is_none_or(|parent| !parent.is_dir())
+    }) {
+        return Some(format!(
+            "{id} cannot be undone right now: its source folders are not available. Reconnect them, then choose Check again."
+        ));
+    }
+    let hardlinked = reversible_entries(transaction)
+        .any(|entry| matches!(entry.operation, TransactionOperation::CreateHardlink { .. }));
+    (hardlinked && std::fs::canonicalize(root).ok().as_deref() != Some(root)).then(|| {
+        format!(
+            "{id} cannot be undone: {} no longer leads to the folder it was exported to.",
+            root.display()
+        )
+    })
+}
+
+/// A hardlink has no identity of its own, so a link at a path recorded again by
+/// a later journal cannot be told from the later one. Symlinks carry creation
+/// proof, so they keep their per-link refusal and partial rollback.
+fn superseded_blocker(
+    transaction: &RenameTransaction,
+    records: &[RenameTransaction],
+) -> Option<String> {
+    let hardlinks: Vec<&Path> = reversible_entries(transaction)
+        .filter(|entry| matches!(entry.operation, TransactionOperation::CreateHardlink { .. }))
+        .map(|entry| entry.destination_path.as_path())
+        .collect();
+    records
+        .iter()
+        .filter(|other| {
+            other.transaction_id != transaction.transaction_id
+                && other.created_at_unix >= transaction.created_at_unix
+        })
+        .any(|other| {
+            other.entries.iter().any(|entry| {
+                !matches!(
+                    entry.state,
+                    EntryState::Planned | EntryState::PreflightPassed | EntryState::Skipped
+                ) && hardlinks.contains(&entry.destination_path.as_path())
+            })
+        })
+        .then(|| {
+            format!(
+                "{} cannot be undone: a newer transaction recorded the same destination paths, so these links cannot be told apart.",
+                transaction.transaction_id
+            )
+        })
+}
+
+fn export_blocker(
+    transaction: &RenameTransaction,
+    records: &[RenameTransaction],
+) -> Option<String> {
+    undo_blocker(transaction)
+        .or_else(|| availability_blocker(transaction))
+        .or_else(|| superseded_blocker(transaction, records))
+}
+
+/// Every journal in the folder that could be read, verified or not, so an
+/// unverifiable later record still counts as ambiguity.
+fn readable_records(journal_dir: &Path) -> Vec<RenameTransaction> {
+    seal::history_evidence(journal_dir, &[])
+        .into_iter()
+        .filter_map(|item| item.transaction)
+        .collect()
+}
+
 /// Marked exports in `journal_dir` that rollback could still act on, or that an
-/// earlier rollback left needing attention, newest first. Read-only. Only sealed records in this folder are considered, so
-/// legacy folders and unverifiable journals are never offered.
-pub fn recoverable_publisher_exports(journal_dir: &Path) -> Vec<RecoverableExport> {
-    let mut exports: Vec<RecoverableExport> = seal::history_evidence(journal_dir, &[])
+/// earlier rollback left needing attention, newest first. Read-only. Only
+/// sealed records in this folder are offered, so legacy folders and
+/// unverifiable journals never are; the latter are counted instead.
+pub fn recoverable_publisher_exports(journal_dir: &Path) -> PublisherRecoveryListing {
+    let unreadable = std::fs::read_dir(journal_dir).err().and_then(|error| {
+        (error.kind() != std::io::ErrorKind::NotFound).then(|| error.to_string())
+    });
+    let evidence = seal::history_evidence(journal_dir, &[]);
+    let records = readable_records(journal_dir);
+    let unverified = evidence
+        .iter()
+        .filter(|item| !item.status.trusted())
+        .filter_map(|item| item.transaction.as_ref())
+        .filter(|transaction| transaction.unknown.contains_key(PUBLISHER_EXPORT_MARKER))
+        .count();
+    let mut exports: Vec<RecoverableExport> = evidence
         .into_iter()
         .filter(|item| item.status.trusted())
         .filter_map(|item| {
@@ -154,12 +290,16 @@ pub fn recoverable_publisher_exports(journal_dir: &Path) -> Vec<RecoverableExpor
         })
         .map(|transaction| RecoverableExport {
             item_count: reversible_entries(&transaction).count(),
-            blocker: undo_blocker(&transaction),
+            blocker: export_blocker(&transaction, &records),
             transaction,
         })
         .collect();
     exports.sort_by_key(|export| std::cmp::Reverse(export.transaction.created_at_unix));
-    exports
+    PublisherRecoveryListing {
+        exports,
+        unverified,
+        unreadable,
+    }
 }
 
 /// Loads the exact journal of `record` for Undo, and returns it only when all
@@ -201,7 +341,7 @@ pub fn open_publisher_export_for_undo(
             "The journal for {id} no longer matches this record. It was not opened for Undo."
         ));
     }
-    match undo_blocker(&journal) {
+    match export_blocker(&journal, &readable_records(journal_dir)) {
         Some(blocker) => Err(blocker),
         None => Ok(journal),
     }
@@ -214,8 +354,9 @@ pub fn rollback_publisher_export(
     journal_dir: &Path,
     record: &RenameTransaction,
     cancel: &AtomicBool,
-) -> Result<(RenameTransaction, PlanRollbackOutcome), String> {
-    let mut journal = open_publisher_export_for_undo(journal_dir, record)?;
+) -> Result<(RenameTransaction, PlanRollbackOutcome), PublisherUndoFailure> {
+    let mut journal = open_publisher_export_for_undo(journal_dir, record)
+        .map_err(PublisherUndoFailure::Refused)?;
     let mut roots = vec![PathBuf::from(&journal.source_scan_root)];
     roots.extend(
         journal
@@ -224,7 +365,8 @@ pub fn rollback_publisher_export(
             .filter_map(|entry| entry.source_path.parent().map(Path::to_path_buf)),
     );
     let trusted = TrustedRoots::from_paths(roots);
-    let outcome = rollback_plan_transaction(&mut journal, journal_dir, cancel, &trusted)?;
+    let outcome = rollback_plan_transaction(&mut journal, journal_dir, cancel, &trusted)
+        .map_err(PublisherUndoFailure::Interrupted)?;
     Ok((journal, outcome))
 }
 
@@ -241,7 +383,7 @@ mod tests {
             "transaction_id": "1-0",
             "plan_generation": 1,
             "created_at_unix": 0,
-            "source_scan_root": "/src",
+            "source_scan_root": "/out",
             "state": "applied",
             "entries": [],
         }))
@@ -313,6 +455,41 @@ mod tests {
             .unknown
             .insert("workflow".into(), serde_json::json!("other"));
         assert!(!is_publisher_export(&foreign), "foreign workflow");
+    }
+
+    #[test]
+    fn a_marked_record_outside_what_apply_builds_is_not_an_export() {
+        let marker = export_marker(Path::new("/out"), PublisherLinkMode::Symlink);
+        let mut moved = record(symlink("/out"), Some(marker.clone()));
+        moved.source_scan_root = "/elsewhere".into();
+        assert!(!is_publisher_export(&moved));
+        let mut escaping = record(symlink("/out"), Some(marker));
+        escaping.created_directories.push("/home/user".into());
+        assert!(!is_publisher_export(&escaping));
+    }
+
+    #[test]
+    fn only_losing_every_source_folder_counts_as_an_outage() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().join("out");
+        std::fs::create_dir(&root).unwrap();
+        let root_text = root.to_str().unwrap();
+        let mut gone = record(
+            hardlink(root_text),
+            Some(export_marker(&root, PublisherLinkMode::Hardlink)),
+        );
+        gone.source_scan_root = root_text.into();
+        gone.entries[0].source_path = temp.path().join("offline/a");
+        assert!(
+            availability_blocker(&gone)
+                .unwrap()
+                .contains("source folders")
+        );
+        let mut partial = gone.clone();
+        let mut present = partial.entries[0].clone();
+        present.source_path = temp.path().join("a");
+        partial.entries.push(present);
+        assert_eq!(availability_blocker(&partial), None);
     }
 
     #[test]

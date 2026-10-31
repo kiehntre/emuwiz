@@ -199,6 +199,9 @@ impl PublisherProfilePageState {
         ui: &mut egui::Ui,
         source: Option<&PlayingLibraryPlan>,
     ) {
+        if !self.recovery.loaded() && !self.is_busy() {
+            self.start(PublisherJob::LoadRecovery, ui.ctx().clone());
+        }
         if self.is_busy() || self.source_plan.as_ref() == source {
             return;
         }
@@ -1198,7 +1201,7 @@ pub(crate) fn show_publisher_profile_page(
                     "Type {phrase} to remove the created destination entries."
                 ));
                 ui.label(
-                    "If you preview again or close EmuWiz, this export stays listed under Exports you can still undo.",
+                    "If you preview again, this export moves to Exports you can still undo; Preview is refused if its journal cannot be verified. After a restart it is listed there while its sealed journal stays intact.",
                 );
                 let in_flight = in_flight_count(&transaction.transaction);
                 if in_flight > 0 {
@@ -1264,12 +1267,6 @@ impl ArchiveFsApp {
         let page = self
             .publisher_profile_page
             .get_or_insert_with(publisher_profile_page::PublisherProfilePageState::default);
-        if !page.recovery.loaded() && !page.is_busy() {
-            page.start(
-                publisher_profile_page::PublisherJob::LoadRecovery,
-                ui.ctx().clone(),
-            );
-        }
         page.sync_source_plan(ui, source_plan.as_ref());
         if let Some(action) = publisher_profile_page::show_publisher_profile_page(ui, page) {
             match action {
