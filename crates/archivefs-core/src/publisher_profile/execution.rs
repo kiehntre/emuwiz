@@ -449,6 +449,10 @@ pub fn build_publisher_transaction_with_policy(
             },
         };
     }
+    transaction.unknown.insert(
+        super::recovery::PUBLISHER_EXPORT_MARKER.to_string(),
+        super::recovery::export_marker(&plan.destination_root, link_mode),
+    );
     let directories = required_directories(&transaction, &plan.destination_root)?;
     Ok(PublisherTransaction {
         transaction,

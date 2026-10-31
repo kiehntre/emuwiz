@@ -102,6 +102,7 @@ pub(crate) struct PublisherProfilePageState {
     pub(crate) rollback_confirmation_text: String,
     pub(crate) execution_result: Option<PublisherExecutionResult>,
     pub(crate) execution_error: Option<String>,
+    pub(crate) recovery: recovery::PublisherRecoveryState,
     worker: Option<std::sync::mpsc::Receiver<Self>>,
     preview_target: Option<PublisherFrontend>,
     preview_platform_id: String,
@@ -142,6 +143,8 @@ pub(crate) enum PublisherJob {
     Review,
     Apply,
     Rollback,
+    LoadRecovery,
+    RollbackRecovered,
 }
 
 impl PublisherProfilePageState {
@@ -177,6 +180,8 @@ impl PublisherProfilePageState {
                 PublisherJob::Review => state.execution_review(),
                 PublisherJob::Apply => state.apply(),
                 PublisherJob::Rollback => state.rollback(),
+                PublisherJob::LoadRecovery => state.load_recoverable_exports(),
+                PublisherJob::RollbackRecovered => state.rollback_recovered(),
             }));
             if outcome.is_err() {
                 state.execution_stage = PublisherExecutionStage::NeedsReconciliation;
@@ -217,6 +222,9 @@ impl PublisherProfilePageState {
 
     pub(crate) fn set_source_plan(&mut self, source_plan: Option<PlayingLibraryPlan>) {
         if self.source_plan != source_plan {
+            if !self.keep_rollback_durable("The Playing Library preview was not changed") {
+                return;
+            }
             self.source_plan = source_plan;
             self.result = None;
             self.execution_transaction = None;
@@ -231,6 +239,9 @@ impl PublisherProfilePageState {
     /// Builds the read-only preview. Never called automatically - only
     /// from an explicit "Preview plan" button.
     pub(crate) fn preview(&mut self) {
+        if !self.keep_rollback_durable("Preview was not run") {
+            return;
+        }
         self.preview_generation = self.preview_generation.saturating_add(1);
         self.error = None;
         self.result = None;
@@ -358,6 +369,7 @@ impl PublisherProfilePageState {
     }
 
     pub(crate) fn apply_with_journal_dir(&mut self, journal_dir: &std::path::Path) {
+        self.recovery.note_journal_dir(journal_dir);
         if self.result.as_ref().is_some_and(|plan| {
             plan.destination_root != std::path::Path::new(self.destination_root.trim())
                 || self.preview_target != self.target
@@ -511,6 +523,7 @@ impl PublisherProfilePageState {
     }
 
     pub(crate) fn rollback_with_journal_dir(&mut self, journal_dir: &std::path::Path) {
+        self.recovery.note_journal_dir(journal_dir);
         if !self.can_rollback() {
             self.execution_error =
                 Some("Type the exact rollback confirmation phrase before rolling back.".into());
@@ -603,7 +616,7 @@ fn in_flight_count(transaction: &archivefs_core::dat::rename_apply::RenameTransa
 /// holding anything beyond what rollback recorded, and links from entries
 /// recorded as failed, which rollback does not touch but which can exist when
 /// verification failed after the link was created.
-fn destination_left_after_rollback(
+pub(super) fn destination_left_after_rollback(
     transaction: &archivefs_core::dat::rename_apply::RenameTransaction,
     outcome: &archivefs_core::platform_evidence_fusion::plan_transaction::PlanRollbackOutcome,
 ) -> Vec<String> {
@@ -867,6 +880,7 @@ pub(crate) fn show_publisher_profile_page(
         }
     });
 
+    recovery::show_recoverable_exports(ui, state);
     let Some(result) = state.result.clone() else {
         if let Some(error) = &state.execution_error {
             ui.colored_label(theme::AMBER, error);
@@ -1184,7 +1198,7 @@ pub(crate) fn show_publisher_profile_page(
                     "Type {phrase} to remove the created destination entries."
                 ));
                 ui.label(
-                    "Rollback here is available only until you preview again or close EmuWiz.",
+                    "If you preview again or close EmuWiz, this export stays listed under Exports you can still undo.",
                 );
                 let in_flight = in_flight_count(&transaction.transaction);
                 if in_flight > 0 {
@@ -1231,6 +1245,10 @@ pub(crate) fn show_publisher_profile_page(
     action
 }
 
+mod recovery;
+
+#[cfg(test)]
+mod recovery_tests;
 #[cfg(test)]
 mod tests;
 
@@ -1246,6 +1264,12 @@ impl ArchiveFsApp {
         let page = self
             .publisher_profile_page
             .get_or_insert_with(publisher_profile_page::PublisherProfilePageState::default);
+        if !page.recovery.loaded() && !page.is_busy() {
+            page.start(
+                publisher_profile_page::PublisherJob::LoadRecovery,
+                ui.ctx().clone(),
+            );
+        }
         page.sync_source_plan(ui, source_plan.as_ref());
         if let Some(action) = publisher_profile_page::show_publisher_profile_page(ui, page) {
             match action {

@@ -14,7 +14,7 @@ use archivefs_core::publisher_profile::PublisherActionSafety;
 
 use super::*;
 
-fn elected(name: &str, file: &str) -> ElectedGame {
+pub(super) fn elected(name: &str, file: &str) -> ElectedGame {
     ElectedGame {
         dat_entry_name: name.to_string(),
         family_root_name: name.to_string(),
@@ -31,7 +31,7 @@ fn elected(name: &str, file: &str) -> ElectedGame {
     }
 }
 
-fn plan_with(games: Vec<ElectedGame>) -> PlayingLibraryPlan {
+pub(super) fn plan_with(games: Vec<ElectedGame>) -> PlayingLibraryPlan {
     PlayingLibraryPlan {
         destination_root: PathBuf::from("/source-library"),
         policy: PlayingLibraryPolicy::default(),
@@ -793,7 +793,7 @@ fn clean_rollback_of_real_links_still_reads_rolled_back() {
 }
 
 #[test]
-fn rollback_control_does_not_promise_it_outlasts_this_session() {
+fn rollback_control_says_the_export_stays_undoable_later() {
     use archivefs_core::dat::rename_apply::{EntryState, TransactionState};
     let (mut state, _temp) = recorded_outcome(
         &[EntryState::Applied],
@@ -802,7 +802,7 @@ fn rollback_control_does_not_promise_it_outlasts_this_session() {
     );
     let labels = page_labels(&mut state);
     assert!(
-        labels.contains("available only until you preview again or close EmuWiz"),
+        labels.contains("stays listed under Exports you can still undo"),
         "{labels}"
     );
 }
@@ -1178,7 +1178,7 @@ fn rendered_labels(output: &egui::FullOutput) -> Vec<(String, egui::Rect)> {
     out
 }
 
-fn page_labels(state: &mut PublisherProfilePageState) -> String {
+pub(super) fn page_labels(state: &mut PublisherProfilePageState) -> String {
     let context = egui::Context::default();
     let screen = egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(1024.0, 2400.0));
     let output = context.run(
