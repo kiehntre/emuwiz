@@ -563,8 +563,7 @@ fn every_file(world: &World) -> Vec<String> {
 fn assert_whole_operation_failed(world: &World, plan: &DreamcastDcpPlan, before: &Contents) {
     let error = plan
         .prepare()
-        .err()
-        .expect("one failed member must fail the whole apply");
+        .expect_err("one failed member must fail the whole apply");
     assert!(!error.to_string().is_empty());
     assert!(!world.destination.exists(), "nothing is published");
     assert_eq!(&world.source_snapshot(), before, "the source is untouched");
