@@ -450,6 +450,55 @@ fn all_skipped_run_is_never_published_or_offered_rollback() {
 }
 
 #[test]
+fn run_recorded_as_rolled_back_reads_undone_not_unchanged() {
+    use archivefs_core::dat::rename_apply::{EntryState, TransactionState, TransactionSummary};
+    let summary = || TransactionSummary {
+        requested: 2,
+        rolled_back: 2,
+        ..Default::default()
+    };
+    let (mut state, _temp) = recorded_outcome(
+        EntryState::RolledBack,
+        TransactionState::RolledBack,
+        Vec::new(),
+        summary(),
+    );
+    assert_eq!(state.execution_stage, PublisherExecutionStage::RolledBack);
+    assert!(state.execution_error.is_none());
+    let labels = page_labels(&mut state);
+    assert!(labels.contains("Export rolled back"), "{labels}");
+    assert!(!labels.contains("Nothing was published"), "{labels}");
+
+    // The journal must prove it: a contradicting record is never called undone.
+    let (state, _temp) = recorded_outcome(
+        EntryState::RollbackFailed,
+        TransactionState::RolledBack,
+        Vec::new(),
+        summary(),
+    );
+    assert_eq!(
+        state.execution_stage,
+        PublisherExecutionStage::NeedsReconciliation
+    );
+    assert!(state.execution_error.is_some());
+}
+
+#[test]
+fn failed_unresolved_or_pending_only_batches_need_reconciliation() {
+    let transaction = no_change_record();
+    for summary in [
+        publish_summary(0, 1, 0, 0),
+        publish_summary(0, 0, 1, 0),
+        publish_summary(0, 0, 0, 1),
+    ] {
+        assert_eq!(
+            execution_stage_for(&summary, &transaction),
+            PublisherExecutionStage::NeedsReconciliation
+        );
+    }
+}
+
+#[test]
 fn partly_skipped_run_says_so_and_keeps_rollback_for_what_was_applied() {
     use archivefs_core::dat::rename_apply::{EntryState, TransactionState};
     let (mut state, _temp) = recorded_outcome(

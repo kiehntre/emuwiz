@@ -587,14 +587,16 @@ pub(crate) fn execution_stage_for(
     summary: &archivefs_core::dat::rename_apply::TransactionSummary,
     transaction: &archivefs_core::dat::rename_apply::RenameTransaction,
 ) -> PublisherExecutionStage {
-    if !summary.fully_resolved()
-        || (summary.applied == 0 && destination_may_have_changed(transaction))
-    {
+    if !summary.fully_resolved() {
         PublisherExecutionStage::NeedsReconciliation
-    } else if summary.applied == 0 {
-        PublisherExecutionStage::NothingPublished
-    } else {
+    } else if summary.applied > 0 {
         PublisherExecutionStage::Applied
+    } else if summary.rolled_back > 0 && transaction.is_fully_rolled_back() {
+        PublisherExecutionStage::RolledBack
+    } else if summary.rolled_back > 0 || destination_may_have_changed(transaction) {
+        PublisherExecutionStage::NeedsReconciliation
+    } else {
+        PublisherExecutionStage::NothingPublished
     }
 }
 
@@ -651,9 +653,12 @@ pub(crate) fn incomplete_publish_message(
     transaction: &archivefs_core::dat::rename_apply::RenameTransaction,
 ) -> Option<String> {
     if summary.fully_resolved() {
-        return (summary.applied == 0 && destination_may_have_changed(transaction)).then(|| {
+        let unsettled = summary.applied == 0
+            && execution_stage_for(summary, transaction)
+                == PublisherExecutionStage::NeedsReconciliation;
+        return unsettled.then(|| {
             format!(
-                "Publishing is NOT complete: no item was published, but the record shows {} destination director(ies) created. Review transaction {}.",
+                "Publishing is NOT complete: no item is recorded as published, but the destination may have changed ({} destination director(ies) created). Review transaction {}.",
                 transaction.created_directories.len(),
                 transaction.transaction_id
             )
