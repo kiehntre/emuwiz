@@ -1661,6 +1661,26 @@ impl Tone {
     }
 }
 
+const NO_FOLDER_SELECTED: &str =
+    "Choose a MAME folder first. Re-check and Preview are unavailable until one is selected.";
+const NO_CATALOGUE_SELECTED: &str =
+    "Select a MAME catalogue first. Re-check and Preview compare the folder against it.";
+const NO_SET_SELECTED: &str =
+    "Enter a parent or clone set name to re-check that family or preview it.";
+const BUSY: &str = "Available when the current MAME step has finished.";
+
+/// Why Re-check and Preview cannot run yet, checked in the page's reading
+/// order. Set selection is separate: only the family actions need one.
+pub(super) fn selection_blocker(has_folder: bool, has_catalogue: bool) -> Option<&'static str> {
+    if !has_folder {
+        Some(NO_FOLDER_SELECTED)
+    } else if !has_catalogue {
+        Some(NO_CATALOGUE_SELECTED)
+    } else {
+        None
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(super) struct Notice {
     pub tone: Tone,
@@ -2408,28 +2428,48 @@ impl MameReconstructionPanel {
             ui.add_enabled(!busy, egui::TextEdit::singleline(&mut self.set))
                 .labelled_by(label.id);
         });
+        let blocker = selection_blocker(
+            self.root.is_some(),
+            self.dat.is_some() && self.catalogue.is_some(),
+        );
+        let family_blocker = blocker.or(self.set.trim().is_empty().then_some(NO_SET_SELECTED));
+        if let Some(reason) = blocker.or(family_blocker) {
+            ui.colored_label(theme::warning(ui), reason);
+        }
         ui.horizontal_wrapped(|ui| {
             if ui
-                .add_enabled(!busy, egui::Button::new("Re-check this family's files"))
+                .add_enabled(
+                    !busy && family_blocker.is_none(),
+                    egui::Button::new("Re-check this family's files"),
+                )
                 .on_hover_text(
                     "Reads ROM checksums into EmuWiz's evidence. ROM files are not changed.",
                 )
+                .on_disabled_hover_text(family_blocker.unwrap_or(BUSY))
                 .clicked()
             {
                 self.request_refresh(true);
             }
             if ui
-                .add_enabled(!busy, egui::Button::new("Re-check the whole folder"))
+                .add_enabled(
+                    !busy && blocker.is_none(),
+                    egui::Button::new("Re-check the whole folder"),
+                )
                 .on_hover_text(
                     "Reads every set's checksums. This can take a long time on a large folder.",
                 )
+                .on_disabled_hover_text(blocker.unwrap_or(BUSY))
                 .clicked()
             {
                 self.request_refresh(false);
             }
             if ui
-                .add_enabled(!busy, egui::Button::new("Preview reconstruction"))
+                .add_enabled(
+                    !busy && family_blocker.is_none(),
+                    egui::Button::new("Preview reconstruction"),
+                )
                 .on_hover_text("Read-only: shows dependencies and the files EmuWiz would use.")
+                .on_disabled_hover_text(family_blocker.unwrap_or(BUSY))
                 .clicked()
             {
                 self.request_preview();
