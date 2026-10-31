@@ -488,8 +488,8 @@ impl PublisherProfilePageState {
     }
 
     /// Items the journal says rollback can still act on: applied, plus in-flight
-    /// entries it reconciles against the disk. A failed rollback is not counted
-    /// because links are never retried. A run that needs reconciliation keeps
+    /// entries it reconciles against the disk. A link refused because it changed is
+    /// not counted; one held back by an unavailable folder still is. A run that needs reconciliation keeps
     /// this route: rollback re-verifies the journal and fences writes itself.
     fn reversible_item_count(&self) -> usize {
         let settled = matches!(
@@ -570,10 +570,12 @@ impl PublisherProfilePageState {
             }
             Ok(outcome) => {
                 self.execution_stage = PublisherExecutionStage::NeedsReconciliation;
-                self.execution_error = Some(format!(
-                    "Rollback was not complete: {:?}. Review transaction {}.",
-                    outcome.rollback.result, transaction.transaction.transaction_id
-                ));
+                self.execution_error = Some(
+                    archivefs_core::publisher_profile::recovery::describe_undo_outcome(
+                        &transaction.transaction,
+                        &outcome,
+                    ),
+                );
             }
             Err(error) => {
                 self.execution_stage = PublisherExecutionStage::NeedsReconciliation;

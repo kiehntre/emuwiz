@@ -145,8 +145,10 @@ fn reversible_entries(transaction: &RenameTransaction) -> impl Iterator<Item = &
     })
 }
 
-/// Entries an earlier rollback refused. Links are never retried, so these need
-/// the user's attention rather than another Undo.
+/// Entries an earlier rollback refused because the link is no longer what was
+/// created. These are never retried, so they need the user's attention rather
+/// than another Undo. Links refused only because a folder or device was
+/// unavailable stay `Applied` and are retried by the next Undo instead.
 fn refused_entry_count(transaction: &RenameTransaction) -> usize {
     transaction
         .entries
@@ -218,9 +220,10 @@ fn destination_unchanged(transaction: &RenameTransaction, root: &Path) -> bool {
     !current.is_null() && recorded == Some(&current)
 }
 
-/// Why Undo should wait: an unavailable folder would otherwise be recorded as a
-/// refused link, and links are never retried. A single missing source folder
-/// is not an outage, so it stays with the per-entry partial rollback.
+/// Why Undo should wait. Waiting is advice, not protection: a link refused only
+/// because a folder was unavailable stays undoable, but trying now cannot finish
+/// and says nothing new. A single missing source folder is not an outage, so it
+/// stays with the per-entry partial rollback.
 pub fn availability_blocker(transaction: &RenameTransaction) -> Option<String> {
     let id = &transaction.transaction_id;
     let root = export_root(transaction)?;
@@ -402,6 +405,65 @@ pub fn open_publisher_export_for_undo(
         Some(blocker) => Err(blocker),
         None => Ok(journal),
     }
+}
+
+/// A plain account of where an Undo stands after `outcome`, from the record it
+/// left: what was undone, what a later Undo will retry, and what needs the
+/// user. Never says "complete" unless every entry is rolled back.
+pub fn describe_undo_outcome(
+    transaction: &RenameTransaction,
+    outcome: &PlanRollbackOutcome,
+) -> String {
+    let id = &transaction.transaction_id;
+    let count = |state: EntryState| {
+        transaction
+            .entries
+            .iter()
+            .filter(|entry| entry.state == state)
+            .count()
+    };
+    let undone = count(EntryState::RolledBack);
+    let retryable = reversible_entries(transaction).count();
+    let refused = refused_entry_count(transaction);
+    if retryable == 0 && refused == 0 {
+        return format!("Export {id}: every link was undone.");
+    }
+    let mut parts = vec![format!(
+        "Undo of {id} is not complete: {undone} link(s) undone."
+    )];
+    if retryable > 0 {
+        let why = transaction
+            .entries
+            .iter()
+            .find(|entry| entry.state == EntryState::Applied && entry.failure_reason.is_some())
+            .and_then(|entry| entry.failure_reason.as_deref());
+        parts.push(match why {
+            Some(reason) => format!(
+                "{retryable} link(s) were not touched because a folder or device was not available ({reason}). Reconnect it, then roll back again: every check is repeated first."
+            ),
+            None => format!(
+                "{retryable} link(s) are still to undo. Roll back again; every check is repeated first."
+            ),
+        });
+    }
+    if refused > 0 {
+        let reason = transaction
+            .entries
+            .iter()
+            .find(|entry| entry.state == EntryState::RollbackFailed)
+            .and_then(|entry| entry.failure_reason.as_deref())
+            .unwrap_or("no reason was recorded");
+        parts.push(format!(
+            "{refused} link(s) are no longer what this export created and were left in place; check them by hand. Recorded reason: {reason}"
+        ));
+    }
+    if !outcome.directories_remaining.is_empty() {
+        parts.push(format!(
+            "{} created folder(s) were kept because they are not empty.",
+            outcome.directories_remaining.len()
+        ));
+    }
+    parts.join(" ")
 }
 
 /// Rolls back exactly the journal of `record` through the shared plan rollback,

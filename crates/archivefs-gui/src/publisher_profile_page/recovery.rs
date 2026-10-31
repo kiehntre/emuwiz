@@ -6,8 +6,8 @@ use std::path::{Path, PathBuf};
 
 use archivefs_core::dat::rename_apply::RollbackResult;
 use archivefs_core::publisher_profile::recovery::{
-    PublisherUndoFailure, RecoverableExport, availability_blocker, open_publisher_export_for_undo,
-    recoverable_publisher_exports, rollback_publisher_export,
+    PublisherUndoFailure, RecoverableExport, availability_blocker, describe_undo_outcome,
+    open_publisher_export_for_undo, recoverable_publisher_exports, rollback_publisher_export,
 };
 
 use super::{
@@ -108,11 +108,11 @@ impl PublisherProfilePageState {
                 ));
                 true
             }
-            // A rollback now would fail on these links, and links are not
-            // retried, so advising one would cost the Undo this guard protects.
+            // A rollback now cannot finish; the links would be kept for a later
+            // Undo, but trying only reports the same outage.
             Err(_) if availability_blocker(&transaction.transaction).is_some() => {
                 self.execution_error = Some(format!(
-                    "{refused}, because this export's folders are not available right now. Reconnect them and try again, and do not roll back until then: a rollback now cannot finish and those links would not be offered again. Nothing was changed."
+                    "{refused}, because this export's folders are not available right now. Reconnect them and try again: a rollback now cannot finish. Nothing was changed."
                 ));
                 false
             }
@@ -174,10 +174,7 @@ impl PublisherProfilePageState {
                         )
                     }
                 }
-                Ok((_, outcome)) => format!(
-                    "Rollback was not complete: {:?}. Review transaction {id}.",
-                    outcome.rollback.result
-                ),
+                Ok((record, outcome)) => describe_undo_outcome(&record, &outcome),
                 Err(PublisherUndoFailure::Refused(reason)) => {
                     format!("{reason} Nothing was rolled back for {id}.")
                 }

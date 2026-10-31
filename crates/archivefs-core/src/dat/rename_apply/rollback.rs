@@ -60,6 +60,48 @@ pub(super) const IN_FLIGHT_MARK: &str = "\u{1}in-flight:";
 /// Internal marker: the reverse rename happened but the restored object could
 /// not be confirmed. Treated as in-flight.
 const MOVED_MARK: &str = "\u{1}moved:";
+/// Internal marker: a link was refused before anything was touched because a
+/// folder or device it needs is unavailable (not because the link changed). The
+/// entry stays `Applied`, so a later Undo re-runs every gate from the start.
+const UNAVAILABLE_MARK: &str = "\u{1}unavailable:";
+
+/// Whether an I/O failure means the place is unreachable right now (folder
+/// missing, device or mount gone, network down) rather than that an object
+/// there was changed. Used only for checks made before any mutation.
+fn is_unavailable(error: &std::io::Error) -> bool {
+    if error.kind() == std::io::ErrorKind::NotFound {
+        return true;
+    }
+    #[cfg(unix)]
+    if let Some(code) = error.raw_os_error() {
+        return [
+            libc::EIO,
+            libc::ESTALE,
+            libc::ENOTCONN,
+            libc::ETIMEDOUT,
+            libc::EHOSTDOWN,
+            libc::EHOSTUNREACH,
+            libc::ENETDOWN,
+            libc::ENETUNREACH,
+            libc::ENODEV,
+            libc::ENXIO,
+        ]
+        .contains(&code);
+    }
+    false
+}
+
+/// A missing file is an outage only when the folder holding it is gone too: a
+/// file deleted from a folder that is present is a changed link.
+fn is_file_unavailable(path: &Path, error: &std::io::Error) -> bool {
+    if error.kind() != std::io::ErrorKind::NotFound {
+        return is_unavailable(error);
+    }
+    path.parent().is_some_and(|parent| {
+        std::fs::symlink_metadata(parent)
+            .is_err_and(|parent_error| parent_error.kind() == std::io::ErrorKind::NotFound)
+    })
+}
 
 /// The outcome of a rollback pass (fully / partially / failed).
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -362,12 +404,26 @@ fn rollback_transaction_inner(
                 });
             }
             Err(reason) => {
+                let unavailable = !coordinated && reason.starts_with(UNAVAILABLE_MARK);
                 let in_flight =
                     reason.starts_with(IN_FLIGHT_MARK) || reason.starts_with(MOVED_MARK);
                 let reason = reason
                     .trim_start_matches(IN_FLIGHT_MARK)
                     .trim_start_matches(MOVED_MARK)
+                    .trim_start_matches(UNAVAILABLE_MARK)
                     .to_string();
+                if unavailable {
+                    // Nothing was touched: the link is still exactly as
+                    // recorded, so it stays `Applied` and the next Undo checks
+                    // it again from the start. It is reported, never counted as
+                    // rolled back, and the independent entries continue.
+                    transaction.entries[index].state = EntryState::Applied;
+                    transaction.entries[index].failure_reason = Some(reason.clone());
+                    reported.insert(index);
+                    failed.push((transaction.entries[index].source_path.clone(), reason));
+                    persist(journal_dir, transaction, &mut fence)?;
+                    continue;
+                }
                 transaction.entries[index].state = if in_flight
                     || matches!(
                         transaction.entries[index].operation,
@@ -880,7 +936,12 @@ fn rollback_mutation(
             let dirs =
                 super::dirsync::RenameDirs::open(&entry.source_path, &entry.destination_path)
                     .map_err(|error| {
-                        format!("rollback refused: could not bind link parent: {error}")
+                        let mark = if is_unavailable(&error) {
+                            UNAVAILABLE_MARK
+                        } else {
+                            ""
+                        };
+                        format!("{mark}rollback refused: could not bind link parent: {error}")
                     })?;
             dirs.remove_recorded_link(&proof, expected_target)
                 .map_err(|error| format!("rollback refused: {error}"))?;
@@ -900,10 +961,25 @@ fn rollback_mutation(
         {
             return Err("rollback refused: invalid journalled hardlink source".to_string());
         }
-        let source = capture_identity(&entry.source_path)
-            .map_err(|_| "rollback refused: hardlink source no longer exists".to_string())?;
-        let destination = capture_identity(&entry.destination_path)
-            .map_err(|_| "rollback refused: hardlink destination no longer exists".to_string())?;
+        let mark = |path: &Path, error: &std::io::Error| {
+            if is_file_unavailable(path, error) {
+                UNAVAILABLE_MARK
+            } else {
+                ""
+            }
+        };
+        let source = capture_identity(&entry.source_path).map_err(|error| {
+            format!(
+                "{}rollback refused: hardlink source no longer exists",
+                mark(&entry.source_path, &error)
+            )
+        })?;
+        let destination = capture_identity(&entry.destination_path).map_err(|error| {
+            format!(
+                "{}rollback refused: hardlink destination no longer exists",
+                mark(&entry.destination_path, &error)
+            )
+        })?;
         if !identity_matches(&entry.identity, &source)
             || !identity_matches(&entry.identity, &destination)
         {
