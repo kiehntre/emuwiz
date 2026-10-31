@@ -966,7 +966,7 @@ pub(crate) struct CompactReadiness {
 pub(crate) fn compact(summary: &GameReadinessSummary, checksum_pending: bool) -> CompactReadiness {
     use ReadinessPresentationState as State;
     let reason = match summary.findings.first() {
-        Some(finding) => format!("{} {}", finding.title, finding.why),
+        Some(finding) => format!("{}. {}", finding.title, finding.why),
         None => summary.explanation.clone(),
     };
     let fix = summary

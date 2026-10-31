@@ -160,6 +160,8 @@ pub(crate) struct PlayingLibraryPageState {
     /// reads it exactly as `build_playing_library_transaction` already did.
     applied_plan: Option<PlayingLibraryPlan>,
     apply_error: Option<String>,
+    /// `apply_error` came from an Undo attempt, not from Apply.
+    apply_error_is_undo: bool,
     journal_dir: PathBuf,
     async_busy: bool,
     apply_stage: Arc<AtomicU8>,
@@ -256,6 +258,7 @@ impl Default for PlayingLibraryPageState {
             retrodeck_discovery_errors: Vec::new(),
             applied_plan: None,
             apply_error: None,
+            apply_error_is_undo: false,
             journal_dir: default_rename_transaction_dir().unwrap_or_else(|_| {
                 PathBuf::from(archivefs_core::dat::rename_apply::RENAME_TRANSACTIONS_DIRECTORY)
             }),
@@ -299,6 +302,46 @@ fn split_preference_list(draft: &str) -> Vec<String> {
             }
         })
         .collect()
+}
+
+/// Outcome wording for a failed Apply or Undo, from what the receipt records
+/// rather than from the error text: refused (nothing changed), partially
+/// completed (recorded links remain, Undo offered) or Undo not finished.
+fn apply_error_heading(
+    applied: Option<&RenameTransaction>,
+    is_undo: bool,
+) -> (&'static str, &'static str) {
+    if is_undo {
+        // Only the receipt can say whether links remain, and a refused Undo
+        // (for example a lost journal seal) is not a promise of a retry.
+        let remaining = applied.map_or(0, |tx| {
+            tx.entries
+                .iter()
+                .filter(|e| e.blocks_full_rollback())
+                .count()
+        });
+        return if remaining > 0 {
+            (
+                "Undo did not finish",
+                "The receipt still records links that were not confirmed as removed. Your original games are untouched. Review Technical details before trying Undo again; it may be refused if the record cannot be verified.",
+            )
+        } else {
+            (
+                "Undo did not finish",
+                "The receipt records no links still awaiting removal. Your original games are untouched. Review Technical details.",
+            )
+        };
+    }
+    match applied {
+        Some(tx) if tx.applied_count() > 0 => (
+            "Partly created",
+            "Some links were created and are recorded in the receipt below; the rest were not. Your original games are untouched. Use Undo to remove the recorded links.",
+        ),
+        _ => (
+            "Not created",
+            "No links were created. Your original games are untouched.",
+        ),
+    }
 }
 
 // The core deliberately returns Ok for a completed rollback *attempt*. Only
@@ -535,6 +578,7 @@ impl PlayingLibraryPageState {
         self.applied = result.applied;
         self.applied_plan = result.applied_plan;
         self.apply_error = result.apply_error;
+        self.apply_error_is_undo = result.apply_error_is_undo;
     }
 
     pub(crate) fn error(&self) -> Option<&str> {
@@ -1183,6 +1227,7 @@ impl PlayingLibraryPageState {
         // the fresh collection check refuses it. Retrying requires Preview.
         let reviewed_binding = self.preview_transaction.take();
         self.apply_error = None;
+        self.apply_error_is_undo = false;
         self.apply_stage.store(1, Ordering::Relaxed);
         // Re-resolve the catalogue and re-hash the collection on the worker.
         // A changed DAT, source set, or election invalidates the reviewed plan.
@@ -1329,12 +1374,14 @@ impl PlayingLibraryPageState {
             &self.journal_dir,
             &AtomicBool::new(false),
         ));
+        self.apply_error_is_undo = self.apply_error.is_some();
     }
 
     pub(crate) fn load_generic_history_receipt(&mut self, transaction: RenameTransaction) {
         self.destination = PlayingLibraryDestination::Generic;
         self.applied = Some(transaction);
         self.apply_error = None;
+        self.apply_error_is_undo = false;
     }
 
     // --- "Publish to ES-DE" ------------------------------------------------
@@ -2136,7 +2183,7 @@ pub(crate) fn show_playing_library_page_with_busy(
             ui,
             "Create reviewed output",
             Some(
-                "Creates separate links · Originals preserved · Review and confirm before Apply · Undo available",
+                "Creates separate links · Originals preserved · Review and confirm before Apply · Undo is offered only for links that are recorded",
             ),
         );
         if let Some(projection) = state.output_projection.clone() {
@@ -2216,14 +2263,11 @@ pub(crate) fn show_playing_library_page_with_busy(
 
     if let Some(error) = state.apply_error() {
         ui.add_space(6.0);
+        let (title, simple_body) = apply_error_heading(state.applied(), state.apply_error_is_undo);
         widgets::banner(
             ui,
-            "Could not create the playing library",
-            if simple {
-                "The playing library could not be completed. Your original games are safe, but some output links may have been created. Review the result and Technical details before retrying; use Undo if it is offered for this operation."
-            } else {
-                error
-            },
+            title,
+            if simple { simple_body } else { error },
             widgets::StatusTone::Blocked,
         );
         if simple {

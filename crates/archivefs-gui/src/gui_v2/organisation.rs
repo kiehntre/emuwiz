@@ -388,15 +388,7 @@ impl App {
         let mut open_history = false;
         let mut open_mame_history = false;
 
-        egui::ScrollArea::vertical()
-            .id_salt(match self.organisation.view {
-                OrganisationView::RepairReview => "v2_repair_review",
-                OrganisationView::RepairHistory => "v2_repair_history",
-                OrganisationView::ExactDuplicates => "v2_exact_duplicates",
-                _ => "v2_organisation",
-            })
-            .auto_shrink([false, false])
-            .show(ui, |ui| match self.organisation.view {
+        ui.vertical(|ui| match self.organisation.view {
                 OrganisationView::DatNameReview
                 | OrganisationView::RepairReview
                 | OrganisationView::RepairHistory

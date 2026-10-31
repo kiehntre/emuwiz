@@ -681,4 +681,54 @@ mod tests {
             ConversionVerificationExpectation::ByteExactRestoreExpected
         );
     }
+
+    /// Regression fixture from the 2026-10-09 OpenROM feature-delta audit.
+    ///
+    /// Prevents: a CHD plan that carries a caller-chosen compressor such as
+    /// the non-existent, "lossy audio" `cdav`. The planned argv is exactly
+    /// tool, mode, source and destination; with no `--compression` argument
+    /// chdman uses its own lossless defaults, and there is nowhere for an
+    /// invalid codec to be injected.
+    #[test]
+    fn regression_chd_plans_carry_no_caller_selectable_compressor() {
+        let dir = tempfile::tempdir().unwrap();
+        let request = request(dir.path(), ConversionFormat::Chd);
+        let cue = dir.path().join("disc.cue");
+        fs::write(dir.path().join("track.bin"), vec![0; 2048]).unwrap();
+        fs::write(
+            &cue,
+            "FILE \"track.bin\" BINARY\nTRACK 01 MODE1/2048\nINDEX 01 00:00:00\n",
+        )
+        .unwrap();
+        let mut cd_request = request.clone();
+        cd_request.source = cue;
+        cd_request.source_format = ConversionFormat::Unknown;
+        let plans = [
+            (
+                plan_chd_conversion(&cd_request, ChdMediaKind::Cd).unwrap(),
+                "createcd",
+            ),
+            (
+                plan_chd_conversion(&request, ChdMediaKind::Dvd).unwrap(),
+                "createdvd",
+            ),
+        ];
+        for (plan, mode) in plans {
+            assert_eq!(plan.argv.len(), 4, "{:?}", plan.argv);
+            assert_eq!(plan.argv[0], "chdman");
+            assert_eq!(plan.argv[1], mode);
+            for argument in &plan.argv[..2] {
+                assert!(!argument.contains("cdav"), "{argument}");
+            }
+            assert!(
+                !plan
+                    .argv
+                    .iter()
+                    .any(|argument| argument == "-c" || argument.starts_with("--compression")),
+                "no compressor argument is planned: {:?}",
+                plan.argv
+            );
+            assert!(!plan.data_discarded && !plan.content_changes);
+        }
+    }
 }

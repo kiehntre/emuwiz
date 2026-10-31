@@ -428,3 +428,246 @@ fn conversion_blocks_what_the_converter_cannot_preserve() {
             .contains(&ConversionBlocker::HiddenTrackOne { frames: 150 })
     );
 }
+
+// ---------------------------------------------------------------------------
+// Regression fixtures from the 2026-10-09 OpenROM feature-delta audit.
+//
+// Each test names the unsafe behaviour it guards against. Nothing here is
+// derived from another project's code: the sheets are synthetic, the files are
+// sparse, and only this module's own timeline model is exercised.
+// ---------------------------------------------------------------------------
+
+/// One FILE, three tracks, tracks 2 and 3 with a stored (INDEX 00) pregap.
+const THREE_TRACK_STORED_PREGAPS: &str = "FILE \"disc.bin\" BINARY\n\
+  TRACK 01 MODE2/2352\n    INDEX 01 00:00:00\n\
+  TRACK 02 AUDIO\n    INDEX 00 00:02:00\n    INDEX 01 00:04:00\n\
+  TRACK 03 AUDIO\n    INDEX 00 00:05:00\n    INDEX 01 00:07:00\n";
+
+fn stored(track: &TrackTimeline) -> SourceRange {
+    match track.pregap {
+        PregapEvidence::SourceBacked(range) => range,
+        ref other => panic!(
+            "track {} pregap is not source-backed: {other:?}",
+            track.number
+        ),
+    }
+}
+
+/// Prevents: rebasing every index against INDEX 01, which moves a stored
+/// pregap 150 frames back into the previous track's program data and starts
+/// the track's program at the pregap instead of at INDEX 01.
+#[test]
+fn regression_stored_pregap_in_a_shared_file_is_never_rebased_onto_index01() {
+    let fx = Fixture::new(&[("disc.bin", 600, SECTOR)]);
+    let t = fx.timeline(THREE_TRACK_STORED_PREGAPS).unwrap();
+    let [t1, t2, t3] = [&t.tracks[0], &t.tracks[1], &t.tracks[2]];
+
+    // Track 1 keeps its full 150 frames: the next pregap does not eat into it.
+    assert_eq!((t1.program.start_frame, t1.program.frames), (0, 150));
+
+    for (track, index00, index01) in [(t2, 150, 300), (t3, 375, 525)] {
+        let pregap = stored(track);
+        // INDEX 00 stays exactly where the sheet put it in the file.
+        assert_eq!(pregap.start_frame, index00, "track {}", track.number);
+        assert_eq!(pregap.byte_offset, index00 * SECTOR);
+        assert_eq!(pregap.frames, index01 - index00);
+        // The program starts at INDEX 01, never at INDEX 00.
+        assert_eq!(track.program.start_frame, index01);
+        assert_eq!(track.program.byte_offset, index01 * SECTOR);
+        assert_eq!(
+            pregap.start_frame + pregap.frames,
+            track.program.start_frame
+        );
+        assert_eq!(
+            (track.cue_frame_start, track.cue_frame_index01),
+            (index00, index01)
+        );
+    }
+    // A stored pregap begins where the previous track's program ends; it is
+    // never placed before that point.
+    assert_eq!(
+        stored(t2).start_frame,
+        t1.program.start_frame + t1.program.frames
+    );
+    assert_eq!(
+        stored(t3).start_frame,
+        t2.program.start_frame + t2.program.frames
+    );
+    assert_eq!((t2.lba_index01, t3.lba_index01), (300, 525));
+    assert_eq!(t.total_cue_frames, 600, "stored pregaps add no frames");
+    assert_eq!(t.evidence.source_backed_pregap_tracks, vec![2, 3]);
+    assert!(t.evidence.synthetic_pregap_tracks.is_empty());
+}
+
+/// Prevents: the file-per-track form of the same bug. With one BIN per track,
+/// INDEX 00 00:00:00 / INDEX 01 00:02:00 means the pregap is the first 150
+/// frames of that track's *own* file. Rebasing against INDEX 01 would start
+/// the track 150 frames inside the previous file.
+#[test]
+fn regression_per_track_files_keep_their_stored_pregap_in_their_own_file() {
+    let fx = Fixture::new(&[
+        ("t1.bin", 300, SECTOR),
+        ("t2.bin", 450, SECTOR),
+        ("t3.bin", 300, SECTOR),
+    ]);
+    let t = fx
+        .timeline(
+            "FILE \"t1.bin\" BINARY\n  TRACK 01 MODE2/2352\n    INDEX 01 00:00:00\n\
+             FILE \"t2.bin\" BINARY\n  TRACK 02 AUDIO\n    INDEX 00 00:00:00\n    INDEX 01 00:02:00\n\
+             FILE \"t3.bin\" BINARY\n  TRACK 03 AUDIO\n    INDEX 00 00:00:00\n    INDEX 01 00:02:00\n",
+        )
+        .unwrap();
+    let [t1, t2, t3] = [&t.tracks[0], &t.tracks[1], &t.tracks[2]];
+
+    assert_eq!(t1.program.frames, 300, "track 1 is not shortened");
+    for (track, file, disc_start) in [(t2, "t2.bin", 300), (t3, "t3.bin", 750)] {
+        let pregap = stored(track);
+        assert!(track.path.ends_with(file));
+        // Physical, file-relative: the pregap is at byte 0 of its own file.
+        assert_eq!((pregap.start_frame, pregap.byte_offset), (0, 0));
+        assert_eq!(pregap.frames, 150);
+        assert_eq!(track.program.byte_offset, 150 * SECTOR);
+        // Disc position: the track begins where the previous file ended, and
+        // INDEX 01 is 150 frames later - not the other way round.
+        assert_eq!(track.cue_frame_start, disc_start);
+        assert_eq!(track.cue_frame_index01, disc_start + 150);
+    }
+    assert_eq!(t2.program.frames, 300);
+    assert_eq!(t3.program.frames, 150);
+    assert_eq!(t.total_cue_frames, 1050);
+}
+
+/// Prevents: copying a shared FILE once per TRACK. One FILE referenced by
+/// several tracks is one physical source; its bytes are accounted exactly
+/// once and every range stays an offset into that one file.
+#[test]
+fn regression_a_file_shared_by_several_tracks_is_one_source_counted_once() {
+    let fx = Fixture::new(&[("disc.bin", 600, SECTOR)]);
+    let t = fx.timeline(THREE_TRACK_STORED_PREGAPS).unwrap();
+
+    assert_eq!(t.files.len(), 1, "three tracks, still one source file");
+    assert!(!t.evidence.multi_file);
+    assert_eq!(t.files[0].frames, 600);
+    assert_eq!(t.files[0].bytes, 600 * SECTOR);
+    assert!(t.tracks.iter().all(|track| track.file_ordinal == 0));
+    assert!(t.tracks.iter().all(|track| track.path == t.files[0].path));
+
+    // Walk every source-backed range in file order: contiguous, no overlap,
+    // and together exactly the file - not three copies of it.
+    let mut ranges = Vec::new();
+    for track in &t.tracks {
+        if let PregapEvidence::SourceBacked(range) = track.pregap {
+            ranges.push(range);
+        }
+        ranges.push(track.program);
+    }
+    let mut cursor = 0;
+    for range in &ranges {
+        assert_eq!(range.byte_offset, cursor, "ranges are contiguous");
+        assert_eq!(range.byte_offset, range.start_frame * SECTOR);
+        assert_eq!(range.byte_len, range.frames * SECTOR);
+        cursor += range.byte_len;
+    }
+    assert_eq!(cursor, t.files[0].bytes);
+    assert_eq!(
+        ranges.iter().map(|range| range.byte_len).sum::<u64>(),
+        600 * SECTOR
+    );
+    assert_eq!(t.total_cue_frames, 600);
+}
+
+/// Prevents: treating INDEX 00 (sectors present in the image) and PREGAP
+/// (sectors absent from the image) as the same thing in a multi-track sheet.
+#[test]
+fn regression_stored_and_synthetic_pregap_differ_in_a_multi_track_sheet() {
+    let fx = Fixture::new(&[("disc.bin", 600, SECTOR)]);
+    let stored_sheet = "FILE \"disc.bin\" BINARY\n\
+      TRACK 01 MODE2/2352\n    INDEX 01 00:00:00\n\
+      TRACK 02 AUDIO\n    INDEX 00 00:02:00\n    INDEX 01 00:04:00\n";
+    let synthetic_sheet = "FILE \"disc.bin\" BINARY\n\
+      TRACK 01 MODE2/2352\n    INDEX 01 00:00:00\n\
+      TRACK 02 AUDIO\n    PREGAP 00:02:00\n    INDEX 01 00:04:00\n";
+    let with_index00 = fx.timeline(stored_sheet).unwrap();
+    let with_pregap = fx.timeline(synthetic_sheet).unwrap();
+
+    assert_eq!(stored(&with_index00.tracks[1]).frames, 150);
+    assert_eq!(
+        with_pregap.tracks[1].pregap,
+        PregapEvidence::Synthetic { frames: 150 }
+    );
+    // Same INDEX 01 file offset in both; PREGAP moves no bytes.
+    assert_eq!(with_index00.tracks[1].program.byte_offset, 300 * SECTOR);
+    assert_eq!(with_pregap.tracks[1].program.byte_offset, 300 * SECTOR);
+    // INDEX 00 ends track 1 early; PREGAP leaves track 1 its whole extent.
+    assert_eq!(with_index00.tracks[0].program.frames, 150);
+    assert_eq!(with_pregap.tracks[0].program.frames, 300);
+    // INDEX 00 adds no disc frames; PREGAP adds exactly its own length.
+    assert_eq!(with_index00.total_cue_frames, 600);
+    assert_eq!(with_pregap.total_cue_frames, 750);
+    assert_eq!(with_index00.evidence.source_backed_pregap_tracks, vec![2]);
+    assert!(with_index00.evidence.synthetic_pregap_tracks.is_empty());
+    assert_eq!(with_pregap.evidence.synthetic_pregap_tracks, vec![2]);
+    assert!(with_pregap.evidence.source_backed_pregap_tracks.is_empty());
+    assert_ne!(
+        with_index00.semantic_signature(),
+        with_pregap.semantic_signature()
+    );
+}
+
+/// Prevents: a conversion that silently drops PREGAP, POSTGAP, FLAGS or other
+/// per-track declarations. The CUE layout model carries no FLAGS/ISRC/CATALOG
+/// field, so the only safe answer for a sheet declaring them is refusal - not
+/// a CHD that quietly lost them. Zero-length gaps are refused too.
+#[test]
+fn regression_conversion_refuses_gap_and_flag_declarations_instead_of_dropping_them() {
+    use crate::optical_preservation::source_layout;
+    use crate::repair::optical_conversion::ChdConversionSourceMode;
+    let fx = Fixture::new(&[("d.bin", 100, 2048)]);
+    let sheet = |before_index: &str, after_index: &str| {
+        format!(
+            "FILE \"d.bin\" BINARY\n  TRACK 01 MODE1/2048\n{before_index}    INDEX 01 00:00:00\n{after_index}"
+        )
+    };
+
+    let baseline = fx.cue("baseline.cue", &sheet("", ""));
+    for mode in [
+        ChdConversionSourceMode::KeepSource,
+        ChdConversionSourceMode::QuarantineSource,
+    ] {
+        assert!(
+            source_layout(&baseline, mode).is_ok(),
+            "the plain sheet is the admitted layout"
+        );
+    }
+
+    let lossy: [(&str, &str, &str); 9] = [
+        ("pregap", "    PREGAP 00:02:00\n", ""),
+        ("zero-pregap", "    PREGAP 00:00:00\n", ""),
+        ("postgap", "", "    POSTGAP 00:02:00\n"),
+        ("zero-postgap", "", "    POSTGAP 00:00:00\n"),
+        ("flags-dcp", "    FLAGS DCP\n", ""),
+        ("flags-pre-4ch", "    FLAGS PRE 4CH\n", ""),
+        ("isrc", "    ISRC ABCDE1234567\n", ""),
+        ("index02", "", "    INDEX 02 00:00:10\n"),
+        ("catalog", "", "CATALOG 1234567890123\n"),
+    ];
+    for (name, before_index, after_index) in lossy {
+        let cue = fx.cue(&format!("{name}.cue"), &sheet(before_index, after_index));
+        for mode in [
+            ChdConversionSourceMode::KeepSource,
+            ChdConversionSourceMode::QuarantineSource,
+        ] {
+            let error = source_layout(&cue, mode)
+                .expect_err(&format!("{name}: must be refused, never converted lossily"));
+            assert!(
+                error.contains("outside the verified layout"),
+                "{name}: {error}"
+            );
+        }
+    }
+    // The sparse source was only ever measured, never written.
+    assert_eq!(
+        fs::metadata(fx.dir.path().join("d.bin")).unwrap().len(),
+        100 * 2048
+    );
+}
