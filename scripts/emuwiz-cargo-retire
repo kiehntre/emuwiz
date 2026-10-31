@@ -99,6 +99,7 @@ import importlib.util
 import json
 import re
 import signal
+import subprocess
 import time
 
 CARGO_LOCK_NAMES = (".cargo-lock", ".cargo-build-lock", ".cargo-artifact-lock")
@@ -624,10 +625,65 @@ def load_manifest(path, approved):
     return data, actual, groups
 
 
+ORPHAN_ROUTE = "GIT_PRESERVED"
+
+
+def _git(repo, *argv):
+    # Fixed argv, no shell; the repo path is only ever a -C argument.  safe.directory lets a
+    # root executor read the owner's repository without trusting any repo-local config.
+    return subprocess.run(["git", "-c", "safe.directory=" + repo, "-C", repo, *argv],
+                          capture_output=True, text=True, timeout=60)
+
+
+def orphan_git_preserved_owner(group, record, target):
+    """Narrow, fail-closed substitute for a live source checkout (ONLY for GIT_PRESERVED groups).
+
+    There is no source to compare, so ownership is established from fresh, independent evidence:
+    the cache was built through cargo-iso (lifecycle record with a build start and a recorded
+    worktree and 40-hex HEAD), the target name is bound to that recorded worktree path by its
+    hash, the worktree path is gone AND unregistered in the named repository, and the recorded
+    build HEAD is contained in that repository's origin/main (the work is preserved in Git).
+    A cache that was never built via cargo-iso or recorded no HEAD (unidentified scratch) stays
+    SOURCE_MISSING.  Anything unverifiable is a hold.  Every other gate still applies unchanged."""
+    if group.get("orphan_route") != ORPHAN_ROUTE:
+        return "SOURCE_MISSING", "the owning source checkout is not present to verify"
+    wt, head = record.get("worktree"), record.get("head")
+    if not record.get("last_start") or not wt or not os.path.isabs(wt):
+        return "SOURCE_MISSING", "orphan route needs a recorded cargo-iso build and worktree path"
+    if not isinstance(head, str) or len(head) != 40 or any(c not in "0123456789abcdef" for c in head):
+        return "SOURCE_MISSING", "orphan route needs a recorded 40-hex build HEAD"
+    if group.get("source_head") != head:
+        return "OWNER_UNVERIFIED", "manifest source_head differs from the recorded build HEAD"
+    digest = hashlib.sha256(wt.encode()).hexdigest()[:12]
+    if record.get("worktree_hash") != digest or not os.path.basename(target).endswith("-" + digest):
+        return "OWNER_UNVERIFIED", "target name is not bound to the recorded worktree path"
+    if os.path.lexists(wt):
+        return "ORPHAN_SOURCE_PRESENT", "the recorded worktree exists; use the normal route"
+    repo = group.get("orphan_repo")
+    if not isinstance(repo, str) or not os.path.isabs(repo) or os.path.realpath(repo) != repo \
+            or not os.path.exists(os.path.join(repo, ".git")):
+        return "ORPHAN_REPO_UNVERIFIED", "orphan_repo must be a canonical git checkout"
+    try:
+        listing = _git(repo, "worktree", "list", "--porcelain")
+        if listing.returncode:
+            return "ORPHAN_REPO_UNVERIFIED", "git worktree list failed"
+        if any(line[9:] == wt for line in listing.stdout.splitlines() if line.startswith("worktree ")):
+            return "ORPHAN_SOURCE_PRESENT", "git still registers the recorded worktree"
+        if _git(repo, "cat-file", "-e", head + "^{commit}").returncode:
+            return "GIT_HISTORY_NOT_PRESERVED", "the build HEAD is not a commit in the repository"
+        if _git(repo, "merge-base", "--is-ancestor", head, "refs/remotes/origin/main").returncode:
+            return "GIT_HISTORY_NOT_PRESERVED", "the build HEAD is not contained in origin/main"
+    except (OSError, subprocess.SubprocessError) as error:
+        return "ORPHAN_REPO_UNVERIFIED", str(error)
+    return None, ""
+
+
 def verified_owner(group, record, source_paths, target):
     """Adoption is only a claim; this is the evidence that makes it count."""
     if not record or not record.get("owner"):
         return "NOT_ADOPTED", "no lifecycle record with an owner"
+    if not group.get("source_exists") and not source_paths and group.get("orphan_route"):
+        return orphan_git_preserved_owner(group, record, target)
     if not group.get("source_exists") or not source_paths:
         return "SOURCE_MISSING", "the owning source checkout is not present to verify"
     name = os.path.basename(target)

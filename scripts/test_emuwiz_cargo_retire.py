@@ -926,5 +926,106 @@ class FilesystemRaces(Base):
         self.assertTrue(self.exists(t, "debug/deps/profile.sqlite3"))
 
 
+class OrphanRoute(Base):
+    """Source-less caches: SOURCE_MISSING stays a hard refusal except the narrow GIT_PRESERVED route."""
+
+    def orphan(self, name="wt-orphan", on_main=True, remove="worktree", **kw):
+        wt, t = self.managed_cache(name, **kw)
+        head = self.mod.F.head_of(wt)
+        if on_main:
+            self.git("-C", self.repo, "update-ref", "refs/remotes/origin/main", head)
+        if remove == "worktree":
+            self.git("-C", self.repo, "worktree", "remove", "--force", wt)
+        elif remove == "dir-only":
+            self.rmtree(wt)
+        g = self.group(self.worktree("scratch-" + name), t)
+        g.update({"source_exists": False, "associated_source_paths": "[]", "source_head": head,
+                  "orphan_route": "GIT_PRESERVED", "orphan_repo": os.path.realpath(self.repo)})
+        return wt, t, g
+
+    def holds(self, g, name="m.json", execute=True):
+        path, digest = self.manifest([g], name)
+        rc, r = self.run_retire(path, digest, execute=execute, window=True)
+        return {h["code"] for h in r["groups"][0]["holds"]}, r
+
+    def test_preserved_orphan_is_retired_with_a_journal_receipt(self):
+        wt, t, g = self.orphan()
+        codes, r = self.holds(g)
+        self.assertEqual(codes, set(), r)
+        self.assertFalse(self.exists(t, "debug/deps"))
+        self.assertTrue(self.exists(t, "debug/.cargo-lock"))
+        self.assertTrue(self.exists(t, "debug/emuwiz-test-env/profile/library.db"))
+        self.assertTrue(any(f.startswith("retire-") for f in os.listdir(self.receipts)))
+
+    def test_without_the_route_marker_source_missing_is_still_a_hard_refusal(self):
+        wt, t, g = self.orphan()
+        del g["orphan_route"]
+        codes, _ = self.holds(g)
+        self.assertIn("SOURCE_MISSING", codes)
+        self.assertTrue(self.exists(t, "debug/deps"))
+
+    def test_head_not_on_origin_main_holds(self):
+        wt, t, g = self.orphan(on_main=False)
+        codes, _ = self.holds(g)
+        self.assertIn("GIT_HISTORY_NOT_PRESERVED", codes)
+        self.assertTrue(self.exists(t, "debug/deps"))
+
+    def test_existing_or_still_registered_worktree_holds(self):
+        wt, t, g = self.orphan(remove=None)
+        codes, _ = self.holds(g)
+        self.assertIn("ORPHAN_SOURCE_PRESENT", codes)
+        self.assertTrue(self.exists(t, "debug/deps"))
+        wt2, t2, g2 = self.orphan("wt-registered", remove="dir-only")
+        codes, _ = self.holds(g2, "m2.json")
+        self.assertIn("ORPHAN_SOURCE_PRESENT", codes)
+        self.assertTrue(self.exists(t2, "debug/deps"))
+
+    def test_manifest_head_mismatch_and_unbound_name_hold(self):
+        wt, t, g = self.orphan()
+        bad = dict(g, source_head="1" * 40)
+        codes, _ = self.holds(bad)
+        self.assertIn("OWNER_UNVERIFIED", codes)
+        self.assertTrue(self.exists(t, "debug/deps"))
+
+    def test_unidentified_cache_without_a_recorded_build_stays_source_missing(self):
+        wt, t, g = self.orphan("wt-never-built", build=False)
+        self.assertEqual(self.ret("adopt", t, "--owner", "tester").returncode, 0)
+        self.age_record(t, 10)
+        codes, _ = self.holds(g)
+        self.assertTrue(codes & {"SOURCE_MISSING", "NOT_ADOPTED"}, codes)
+        self.assertTrue(self.exists(t, "debug/deps"))
+
+    def test_other_gates_still_apply_to_the_orphan_route(self):
+        wt, t = self.managed_cache("wt-pinned-orphan")
+        self.assertEqual(self.ret("pin", wt, "--reason", "independent-review").returncode, 0)
+        head = self.mod.F.head_of(wt)
+        self.git("-C", self.repo, "update-ref", "refs/remotes/origin/main", head)
+        self.git("-C", self.repo, "worktree", "remove", "--force", wt)
+        g = self.group(self.worktree("wt-scratch-unused2"), t)
+        g.update({"source_exists": False, "associated_source_paths": "[]", "source_head": head,
+                  "orphan_route": "GIT_PRESERVED", "orphan_repo": os.path.realpath(self.repo)})
+        codes, _ = self.holds(g)
+        self.assertIn("PINNED", codes)
+        self.assertTrue(self.exists(t, "debug/deps"))
+
+
+class NoManualDeletionRoute(unittest.TestCase):
+    def test_no_script_in_the_repository_bypasses_the_retirement_tool(self):
+        root = os.path.dirname(HERE)
+        out = subprocess.run(["git", "-C", root, "ls-files", "scripts"], capture_output=True, text=True).stdout.split()
+        offenders = []
+        for rel in out:
+            if os.path.basename(rel).startswith("test_") or rel.endswith("emuwiz-cargo-retire"):
+                continue
+            try:
+                with open(os.path.join(root, rel), errors="replace") as handle:
+                    text = handle.read()
+            except OSError:
+                continue
+            if "emuwiz-cargo-targets" in text and ("--one-file-system" in text or "shutil.rmtree" in text):
+                offenders.append(rel)
+        self.assertEqual(offenders, [])
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

@@ -621,3 +621,20 @@ need; the per-cycle caps still bound it). `plan --only` exits 1 when the request
 the batch did not fully complete (see `batch.remaining`).
 
 A target whose executor outcome is PARTIAL with freed bytes is recorded as retired in the registry (existing behaviour) while a batch lists it under `remaining`; trust `batch.remaining` and the per-target outcomes.
+
+## No manual deletion route, and source-less caches
+
+Every refusal of `emuwiz-cargo-retire` (`SOURCE_MISSING`, `NOT_ADOPTED`, `PINNED`, `BUILD_LOCK_HELD`,
+`INCOMPLETE_PROCESS_VISIBILITY`, ...) is final. Never replace the tool with a script, `rm -rf`, `find -delete` or a copy of an
+earlier one-off script: the pin, lock, process, identity, preservation and journal checks do not exist in a copy. If a
+hold looks wrong, fix the tool (tests, review, install approval) or report the hold.
+
+`SOURCE_MISSING` stays the default for a cache without a source checkout. The one exception is a group whose manifest sets
+`"orphan_route": "GIT_PRESERVED"`, `"source_exists": false`, no source paths, `source_head` and `orphan_repo`. The tool then
+verifies freshly and holds on anything unverifiable: a lifecycle record with a cargo-iso build and a 40-hex HEAD equal to
+`source_head`; the target name bound to the recorded worktree path by its hash; the worktree path absent and not
+registered by `git worktree list` in `orphan_repo`; the HEAD a commit contained in that repository's
+`refs/remotes/origin/main`. Holds: `SOURCE_MISSING`, `OWNER_UNVERIFIED`, `ORPHAN_SOURCE_PRESENT`, `ORPHAN_REPO_UNVERIFIED`,
+`GIT_HISTORY_NOT_PRESERVED`. Every other gate (completion release, pin, lock, census, identity, idle time, journal) applies
+unchanged. Unidentified caches (no recorded build HEAD, such as the 2026-10-15 adopted scratch/source directories) cannot use
+the route and stay hard `SOURCE_MISSING`.
