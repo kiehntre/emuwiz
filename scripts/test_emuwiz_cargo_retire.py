@@ -1204,6 +1204,156 @@ class OrphanRoute(Base):
         rewrite(back, saved)
         self.assertIsNotNone(F.checkout_evidence(wt))
 
+    # --- mutation-driven additions
+    def test_marker_never_overrides_a_live_source_checkout(self):
+        wt, t = self.managed_cache("wt-live-marker")
+        g = self.group(wt, t)
+        g["orphan_route"] = "GIT_PRESERVED"        # a live source: the normal route decides, not the orphan route
+        codes, _ = self.holds(g)
+        self.assertEqual(codes, set())
+        self.assertFalse(self.exists(t, "debug/deps"))
+
+    def test_git_failures_and_timeouts_hold_instead_of_retiring_or_crashing(self):
+        wt, t, g = self.orphan("wt-gitfail")
+        orig = self.mod._git
+        self.addCleanup(setattr, self.mod, "_git", orig)
+        for label, behaviour in (
+                ("rc", lambda a: subprocess.CompletedProcess(a, 1, "", "boom")),
+                ("timeout", lambda a: (_ for _ in ()).throw(subprocess.TimeoutExpired(a, 60))),
+                ("decode", lambda a: (_ for _ in ()).throw(UnicodeDecodeError("utf-8", b"\xff", 0, 1, "bad")))):
+            self.mod._git = lambda repo, *argv, b=behaviour: b(argv)
+            codes, _ = self.holds(g, label + ".json")
+            self.assertIn("ORPHAN_REPO_UNVERIFIED", codes, label)
+            self.assertTrue(self.exists(t, "debug/deps"), label)
+
+    def test_non_utf8_registered_worktree_name_does_not_abort_the_run(self):
+        wt, t, g = self.orphan("wt-odd-name")
+        odd = os.fsencode(self.tmp) + b"/odd-\xff-name"
+        subprocess.run(["git", "-C", self.repo, "worktree", "add", "-q", odd, "-b", "odd-branch"],
+                       check=True, capture_output=True)
+        codes, r = self.holds(g)
+        self.assertEqual(codes, set(), r)
+
+    def test_recorded_repository_must_be_a_canonical_real_git_directory(self):
+        wt, t, g = self.orphan("wt-repo-shape")
+        path, rec = self.record_of(t)
+        real_common = rec["checkout"]["common_dir"]
+        link_parent = os.path.join(self.tmp, "linked-repo")
+        os.makedirs(link_parent)
+        os.symlink(real_common, os.path.join(link_parent, ".git"))
+        for label, common in (("symlink", os.path.join(link_parent, ".git")),
+                              ("missing", os.path.join(self.tmp, "no-repo", ".git")),
+                              ("wrong-name", os.path.join(self.tmp, "gitdir-x"))):
+            if label == "wrong-name":
+                os.makedirs(common)
+            data = dict(rec, checkout=dict(rec["checkout"], common_dir=common))
+            T.jdump(data, path)
+            codes, _ = self.holds(dict(g, orphan_repo=os.path.dirname(common)), label + ".json")
+            self.assertIn("ORPHAN_REPO_UNVERIFIED", codes, label)
+            self.assertTrue(self.exists(t, "debug/deps"), label)
+
+    def test_route_needs_a_recorded_cargo_iso_build(self):
+        wt, t, g = self.orphan("wt-nostart")
+        _, rec = self.record_of(t)
+        rec.pop("last_start")
+        code, _ = self.mod.orphan_git_preserved_owner(g, rec, t)
+        self.assertEqual(code, "SOURCE_MISSING")
+
+    def test_stale_checkout_evidence_is_cleared_when_a_build_finds_no_valid_checkout(self):
+        wt, t = self.managed_cache("wt-stale")
+        path, rec = self.record_of(t)
+        self.assertIn("checkout", rec)
+        back = os.path.join(rec["checkout"]["gitdir"], "gitdir")
+        with open(back, "w") as handle:         # git still works, but the checkout no longer validates
+            handle.write("relative/.git\n")
+        r = self.iso(wt, "check")
+        self.assertEqual(r.returncode, 0, r.stderr)
+        _, rec = self.record_of(t)
+        self.assertNotIn("checkout", rec)
+
+    def test_checkout_evidence_rejects_symlinked_and_ambiguous_files(self):
+        F = self.mod.F
+        wt = os.path.realpath(self.worktree("wt-ev2"))
+        admin = F.checkout_evidence(wt)["gitdir"]
+        gitfile = os.path.join(wt, ".git")
+
+        def swap(path, text=None, symlink_to=None, mode="w"):
+            os.unlink(path)
+            if symlink_to:
+                os.symlink(symlink_to, path)
+            else:
+                with open(path, mode) as handle:
+                    handle.write(text)
+
+        def keep(path):
+            with open(path) as handle:
+                return handle.read()
+
+        decoy = os.path.join(self.tmp, "decoy-content")
+        for name in ("commondir", "gitdir"):
+            path = os.path.join(admin, name)
+            saved = keep(path)
+            with open(decoy, "w") as handle:
+                handle.write(saved)
+            swap(path, symlink_to=decoy)              # valid content behind a symlink must still be refused
+            self.assertIsNone(F.checkout_evidence(wt), name)
+            swap(path, saved)
+            self.assertIsNotNone(F.checkout_evidence(wt), name)
+        saved = keep(gitfile)
+        with open(decoy, "w") as handle:
+            handle.write(saved)
+        swap(gitfile, symlink_to=decoy)
+        self.assertIsNone(F.checkout_evidence(wt))
+        swap(gitfile, saved)
+        cd = os.path.join(admin, "commondir")
+        saved_cd = keep(cd)
+        swap(cd, "")
+        self.assertIsNone(F.checkout_evidence(wt))
+        swap(cd, "../..\0")
+        self.assertIsNone(F.checkout_evidence(wt))
+        swap(cd, saved_cd)
+        back = os.path.join(admin, "gitdir")
+        saved_back = keep(back)
+        swap(back, os.path.relpath(gitfile) + "\n")   # relative back-pointer that resolves from this cwd
+        self.assertIsNone(F.checkout_evidence(wt))
+        swap(back, saved_back)
+        # admin dir not under <common>/worktrees, and a common dir not named .git
+        decoy_common = os.path.join(self.tmp, "decoy", ".git")
+        os.makedirs(decoy_common)
+        swap(cd, decoy_common + "\n")
+        self.assertIsNone(F.checkout_evidence(wt))
+        swap(cd, saved_cd)
+        fake_common = os.path.join(self.tmp, "cx")
+        fake_admin = os.path.join(fake_common, "worktrees", "id")
+        fake_wt = os.path.join(self.tmp, "fake-wt")
+        os.makedirs(fake_admin)
+        os.makedirs(fake_wt)
+        with open(os.path.join(fake_wt, ".git"), "w") as handle:
+            handle.write("gitdir: " + fake_admin + "\n")
+        with open(os.path.join(fake_admin, "commondir"), "w") as handle:
+            handle.write("../..\n")
+        with open(os.path.join(fake_admin, "gitdir"), "w") as handle:
+            handle.write(os.path.join(fake_wt, ".git") + "\n")
+        self.assertIsNone(F.checkout_evidence(fake_wt))     # common dir is not named .git
+        os.rename(fake_common, os.path.join(self.tmp, ".git"))
+        # a worktree path that is a file, not a directory
+        plain = os.path.join(self.tmp, "plain-file")
+        with open(plain, "w") as handle:
+            handle.write("x")
+        self.assertIsNone(F.checkout_evidence(plain))
+
+    def test_fifo_with_a_live_writer_is_not_accepted_as_commondir(self):
+        F = self.mod.F
+        wt = os.path.realpath(self.worktree("wt-fifo"))
+        admin = F.checkout_evidence(wt)["gitdir"]
+        cd = os.path.join(admin, "commondir")
+        os.unlink(cd)
+        os.mkfifo(cd)
+        fd = os.open(cd, os.O_RDWR)             # a live writer supplying plausible content
+        self.addCleanup(os.close, fd)
+        os.write(fd, b"../..\n")
+        self.assertIsNone(F.checkout_evidence(wt))
+
     def test_git_runs_with_scrubbed_env_and_owner_runner(self):
         seen = {}
         orig = self.mod.F.run_as_owner

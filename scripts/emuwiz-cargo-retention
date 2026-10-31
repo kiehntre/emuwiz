@@ -596,7 +596,8 @@ def checkout_evidence(worktree):
         if os.path.dirname(admin) != os.path.join(common, "worktrees") or os.path.basename(common) != ".git":
             return None
         back = _read_small_regular(os.path.join(admin, "gitdir"))
-        if back is None or len(back) != 1 or os.path.realpath(back[0]) != os.path.realpath(gitfile):
+        if back is None or len(back) != 1 or not os.path.isabs(back[0]) \
+                or os.path.realpath(back[0]) != os.path.realpath(gitfile):
             return None
         return {"worktree_identity": {"dev": st.st_dev, "ino": st.st_ino}, "gitdir": admin, "common_dir": common}
     except (OSError, ValueError):
@@ -633,7 +634,9 @@ def begin_record(registry, key, args, token, cmd):
         record["head"] = head_of(record["worktree"]) if record.get("worktree") else None
         evidence = checkout_evidence(record["worktree"]) if record.get("worktree") else None
         if evidence:
-            record["checkout"] = evidence  # kept from the last build when the checkout is gone
+            record["checkout"] = evidence
+        else:
+            record.pop("checkout", None)  # never pair a new HEAD with evidence from another checkout
         record["owner"] = record.get("owner") or owner_name()
         record["last_builder"] = owner_name()
         record["task"] = os.environ.get("EMUWIZ_TASK") or record.get("task") or record["worktree"]

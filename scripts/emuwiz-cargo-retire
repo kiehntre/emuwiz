@@ -636,9 +636,13 @@ def _git(repo, *argv):
     env = {"PATH": "/usr/bin:/bin", "HOME": "/nonexistent", "LC_ALL": "C", "GIT_CONFIG_NOSYSTEM": "1",
            "GIT_CONFIG_GLOBAL": "/dev/null", "GIT_NO_LAZY_FETCH": "1", "GIT_NO_REPLACE_OBJECTS": "1",
            "GIT_TERMINAL_PROMPT": "0"}
-    return F.run_as_owner(["git", "-c", "core.fsmonitor=false", "-c", "protocol.allow=never",
+    done = F.run_as_owner(["git", "-c", "core.fsmonitor=false", "-c", "protocol.allow=never",
                            "-c", "core.hooksPath=/dev/null", "-C", repo, *argv],
-                          env=env, capture_output=True, text=True, timeout=60)
+                          env=env, capture_output=True, timeout=60)
+    # bytes -> str with surrogateescape: an odd (non-UTF-8) worktree name must not abort the run
+    return subprocess.CompletedProcess(done.args, done.returncode,
+                                       (done.stdout or b"").decode("utf-8", "surrogateescape"),
+                                       (done.stderr or b"").decode("utf-8", "surrogateescape"))
 
 
 def path_presence(path):
@@ -718,7 +722,7 @@ def orphan_git_preserved_owner(group, record, target):
             return "GIT_HISTORY_NOT_PRESERVED", "the build HEAD is not a commit in the recorded repository"
         if _git(repo, "merge-base", "--is-ancestor", head, "refs/remotes/origin/main").returncode:
             return "GIT_HISTORY_NOT_PRESERVED", "the build HEAD is not contained in origin/main"
-    except (OSError, subprocess.SubprocessError) as error:
+    except (OSError, ValueError, subprocess.SubprocessError) as error:
         return "ORPHAN_REPO_UNVERIFIED", str(error)
     return None, ""
 

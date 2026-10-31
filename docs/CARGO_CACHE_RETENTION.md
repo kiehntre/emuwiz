@@ -652,3 +652,6 @@ registered worktree. cargo-iso records checkout evidence only from a normalised 
 small regular file with one `gitdir: <absolute normalised path>` line, an admin dir that is a real directory, a small
 regular `commondir` (read with O_NOFOLLOW|O_NONBLOCK, so a FIFO cannot block), and a `gitdir` back-pointer naming this
 checkout's `.git`; anything else records no evidence and the route refuses.
+A build that finds no valid linked checkout at the recorded path removes any earlier `checkout` evidence (never paired with a newer
+HEAD); a non-UTF-8 registered worktree name is decoded with surrogateescape and cannot abort a run; git errors, non-zero exits and
+timeouts are `ORPHAN_REPO_UNVERIFIED`.
