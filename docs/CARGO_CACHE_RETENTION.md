@@ -621,3 +621,42 @@ need; the per-cycle caps still bound it). `plan --only` exits 1 when the request
 the batch did not fully complete (see `batch.remaining`).
 
 A target whose executor outcome is PARTIAL with freed bytes is recorded as retired in the registry (existing behaviour) while a batch lists it under `remaining`; trust `batch.remaining` and the per-target outcomes.
+
+## No manual deletion route, and source-less caches
+
+Every refusal of `emuwiz-cargo-retire` (`SOURCE_MISSING`, `NOT_ADOPTED`, `PINNED`, `BUILD_LOCK_HELD`,
+`INCOMPLETE_PROCESS_VISIBILITY`, ...) is final. Never replace the tool with a script, `rm -rf`, `find -delete` or a copy of an
+earlier one-off script: the pin, lock, process, identity, preservation and journal checks do not exist in a copy. If a
+hold looks wrong, fix the tool (tests, review, install approval) or report the hold.
+
+`SOURCE_MISSING` stays the default for a cache without a source checkout. The one exception is a group whose manifest sets
+`"orphan_route": "GIT_PRESERVED"`, `"source_exists": false`, no source paths and `source_head`. The repository is never taken
+from the manifest (a differing `orphan_repo` is a hold): cargo-iso records, from the live linked checkout at build time,
+`checkout` = {checkout root device/inode, administrative gitdir, repository common dir}. Records without it are refused
+(`ORPHAN_EVIDENCE_MISSING`), so only builds made after this change qualify. Freshly, and holding on anything unverifiable,
+the tool requires: a cargo-iso record with a 40-hex HEAD equal to `source_head`; the target name bound to the recorded
+worktree path by its hash; the worktree path gone AND the checkout's administrative gitdir gone (git no longer holds it,
+moved or not); no registered worktree with the recorded path or the recorded checkout identity (`ORPHAN_SOURCE_MOVED`); the
+HEAD contained in `refs/remotes/origin/main` of the recorded repository. git runs only through `run_as_owner` (all uids
+dropped) with a scrubbed environment and no lazy fetch. Holds: `SOURCE_MISSING`, `OWNER_UNVERIFIED`, `ORPHAN_EVIDENCE_MISSING`,
+`ORPHAN_SOURCE_PRESENT`, `ORPHAN_SOURCE_MOVED`, `ORPHAN_SOURCE_UNKNOWN`, `ORPHAN_REPO_UNVERIFIED`, `GIT_HISTORY_NOT_PRESERVED`. Every other gate
+(completion release, pin, lock, census, identity, idle time, journal) applies unchanged. Unidentified caches (no recorded
+build HEAD, such as the 2026-10-15 adopted scratch/source directories) cannot use the route and stay hard `SOURCE_MISSING`.
+Limits: the registry and the recorded repository are owner-writable, so a deliberately forged record plus a hand-made
+`origin/main` ref in the recorded repository is the same trust base as every other registry gate; a checkout moved by hand and
+pruned leaves no registration, no gitdir and no path, so the route CANNOT distinguish it from a retired checkout and will
+treat the cache as an orphan (not detected, by design of the evidence available). What stays protected: only regenerable
+compiler artifacts are removed (never source, the checkout, history, locks, databases or the repository), the HEAD must
+already be contained in the recorded repository's `origin/main`, and the pin, lock, process-census, idle-time and
+approved-manifest gates still apply, so a build that is running or recent is held. The cost of this undetected case is a
+rebuild, plus any uncommitted work in the moved checkout is untouched because the route never reads or writes it.
+
+Absence is decided by `lstat` only: ENOENT or ENOTDIR mean absent; any other error (EACCES, EIO, ENOTCONN, ESTALE, ELOOP,
+timeouts) is `ORPHAN_SOURCE_UNKNOWN` and never permits retirement, for the worktree path, the administrative gitdir and each
+registered worktree. cargo-iso records checkout evidence only from a normalised absolute worktree path whose `.git` is a
+small regular file with one `gitdir: <absolute normalised path>` line, an admin dir that is a real directory, a small
+regular `commondir` (read with O_NOFOLLOW|O_NONBLOCK, so a FIFO cannot block), and a `gitdir` back-pointer naming this
+checkout's `.git`; anything else records no evidence and the route refuses.
+A build that finds no valid linked checkout at the recorded path removes any earlier `checkout` evidence (never paired with a newer
+HEAD); a non-UTF-8 registered worktree name is decoded with surrogateescape and cannot abort a run; git errors, non-zero exits and
+timeouts are `ORPHAN_REPO_UNVERIFIED`.
