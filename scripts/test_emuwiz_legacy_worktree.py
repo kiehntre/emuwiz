@@ -512,6 +512,31 @@ class HistoryGates(LegacyCheckout):
         Path(self.git_dir, 'NOTES_MERGE_PARTIAL').write_text(wip + '\n')
         self.assert_gate_holds('GIT_STATE_UNVERIFIED')
 
+    def test_finished_rebase_leaving_rebase_head_can_clear(self):
+        self.run_git('checkout', '-q', '-b', 'side')
+        Path(self.wt, 'conflict').write_text('side')
+        self.run_git('add', 'conflict')
+        self.run_git('commit', '-qm', 'side')
+        self.run_git('checkout', '-q', '-b', 'topic', self.base)
+        Path(self.wt, 'conflict').write_text('topic')
+        self.run_git('add', 'conflict')
+        self.run_git('commit', '-qm', 'topic')
+        self.run_git('update-ref', 'refs/preservation/topic', 'HEAD')
+        with self.assertRaises(subprocess.CalledProcessError):
+            self.run_git('rebase', 'side')
+        Path(self.wt, 'conflict').write_text('resolved')
+        self.run_git('add', 'conflict')
+        subprocess.check_output(['git', '-C', self.wt, 'rebase', '--continue'], stderr=subprocess.STDOUT,
+                                env=dict(self.env, GIT_EDITOR='true'))
+        self.assertTrue(os.path.exists(os.path.join(self.git_dir, 'REBASE_HEAD')))
+        self.assertEqual(self.gate_when_lifecycle_clear()['status'], 'CLEAR')
+
+    def test_commit_named_only_by_rebase_head_holds(self):
+        orphan = self.reflog_only_commit()
+        os.unlink(os.path.join(self.git_dir, 'logs', 'HEAD'))
+        Path(self.git_dir, 'REBASE_HEAD').write_text(orphan + '\n')
+        self.assert_gate_holds('GIT_HISTORY_NOT_PRESERVED')
+
     def test_ordinary_admin_entries_stay_clear(self):
         for name in ('FETCH_HEAD', 'AUTO_MERGE', 'COMMIT_EDITMSG', 'MERGE_MSG', 'SQUASH_MSG'):
             Path(self.git_dir, name).write_text('')
@@ -606,7 +631,7 @@ class HistoryGates(LegacyCheckout):
 
     def test_unfinished_operations_hold_the_lifecycle_gate(self):
         for name in ('index.lock', 'HEAD.lock', 'MERGE_HEAD', 'CHERRY_PICK_HEAD', 'REVERT_HEAD',
-                     'REBASE_HEAD', 'MERGE_AUTOSTASH', 'rebase-merge', 'rebase-apply', 'BISECT_START',
+                     'MERGE_AUTOSTASH', 'rebase-merge', 'rebase-apply', 'BISECT_START',
                      'BISECT_LOG', 'sequencer', 'locked', 'modules'):
             with self.subTest(name=name):
                 marker = Path(self.git_dir, name)

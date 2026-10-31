@@ -1499,11 +1499,11 @@ def verify_retirement(record, target):
 # FETCH_HEAD is left out on purpose: every fetching checkout has one, and what it
 # names came from a remote, not from this checkout.
 UNFINISHED_GIT_STATE = ("index.lock", "HEAD.lock", "MERGE_HEAD", "CHERRY_PICK_HEAD", "REVERT_HEAD",
-                        "REBASE_HEAD", "MERGE_AUTOSTASH", "rebase-merge", "rebase-apply", "BISECT_START",
+                        "MERGE_AUTOSTASH", "rebase-merge", "rebase-apply", "BISECT_START",
                         "BISECT_LOG", "sequencer", "locked", "modules")
 # Everything a checkout's admin directory may hold once the checks above pass. Anything
 # else (a custom pseudoref, `git notes merge` state) is state nobody here has judged.
-KNOWN_ADMIN_ENTRIES = frozenset(("HEAD", "ORIG_HEAD", "FETCH_HEAD", "AUTO_MERGE", "COMMIT_EDITMSG",
+KNOWN_ADMIN_ENTRIES = frozenset(("HEAD", "ORIG_HEAD", "REBASE_HEAD", "FETCH_HEAD", "AUTO_MERGE", "COMMIT_EDITMSG",
                                  "MERGE_MSG", "SQUASH_MSG", "index", "logs", "gitdir", "commondir",
                                  "config.worktree", "refs", "info"))
 
@@ -1611,6 +1611,8 @@ def history_preservation_problem(wt):
             return ("GIT_STATE_UNVERIFIED", "unjudged state in the checkout's admin directory: " + ", ".join(unknown))
         names = reflogs(os.path.join(admin, "logs"))
         names |= names_in(os.path.join(admin, "ORIG_HEAD"), orig_head_name)
+        # A finished rebase can leave this behind, so it is checked, not held on.
+        names |= names_in(os.path.join(admin, "REBASE_HEAD"), orig_head_name)
         names.add(git("rev-parse", "--verify", "HEAD^{commit}"))
         if not all(len(n) in (40, 64) and not n.strip("0123456789abcdef") for n in names):
             return ("GIT_STATE_UNVERIFIED", "reflog or ORIG_HEAD holds something other than an object ID")
