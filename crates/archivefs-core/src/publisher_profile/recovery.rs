@@ -9,7 +9,8 @@ use std::sync::atomic::AtomicBool;
 
 use crate::dat::rename_apply::model::{EntryState, TransactionOperation};
 use crate::dat::rename_apply::{
-    RenameTransaction, TransactionEntry, journal_path, read_journal, seal,
+    RenameTransaction, TransactionEntry, abandon_unavailable_links, journal_path,
+    link_unavailable_now, read_journal, seal,
 };
 use crate::platform_evidence_fusion::plan_transaction::{
     PlanRollbackOutcome, rollback_plan_transaction,
@@ -22,6 +23,9 @@ use super::execution::PublisherLinkMode;
 /// of the sealed record, so it cannot be added to or removed from a journal
 /// without breaking the seal.
 pub const PUBLISHER_EXPORT_MARKER: &str = "publisher_export_v1";
+
+/// Entry-level `unknown` key the engine writes when the user abandons a link.
+const ABANDONED_MARKER: &str = "emuwiz_undo_abandoned_v1";
 
 const MODE_HARDLINK: &str = "hardlink";
 const MODE_SYMLINK: &str = "symlink";
@@ -75,6 +79,9 @@ pub struct RecoverableExport {
     pub item_count: usize,
     /// Why Undo is not offered, when the record is short of evidence.
     pub blocker: Option<String>,
+    /// Links whose folders are unavailable right now and which the user may
+    /// explicitly abandon (see [`abandon_publisher_links`]).
+    pub abandonable: usize,
 }
 
 /// What the journal folder shows: exports to offer, and what could not be shown.
@@ -347,6 +354,7 @@ pub fn recoverable_publisher_exports(journal_dir: &Path) -> PublisherRecoveryLis
         .map(|transaction| RecoverableExport {
             item_count: reversible_entries(&transaction).count(),
             blocker: export_blocker(&transaction, &records),
+            abandonable: abandonable_indices(&transaction).len(),
             transaction,
         })
         .collect();
@@ -364,6 +372,22 @@ pub fn recoverable_publisher_exports(journal_dir: &Path) -> PublisherRecoveryLis
 /// records the same id; it is a Publisher export; it equals `record` by seal
 /// digest; and it has proof of what it created. Read-only.
 pub fn open_publisher_export_for_undo(
+    journal_dir: &Path,
+    record: &RenameTransaction,
+) -> Result<RenameTransaction, String> {
+    let journal = open_verified_export(journal_dir, record)?;
+    match export_blocker(
+        &journal,
+        &journal_records(&seal::history_evidence(journal_dir, &[])),
+    ) {
+        Some(blocker) => Err(blocker),
+        None => Ok(journal),
+    }
+}
+
+/// Every check [`open_publisher_export_for_undo`] makes except availability
+/// and supersession, which only decide whether Undo may run now.
+fn open_verified_export(
     journal_dir: &Path,
     record: &RenameTransaction,
 ) -> Result<RenameTransaction, String> {
@@ -398,13 +422,49 @@ pub fn open_publisher_export_for_undo(
             "The journal for {id} no longer matches this record. It was not opened for Undo."
         ));
     }
-    match export_blocker(
-        &journal,
-        &journal_records(&seal::history_evidence(journal_dir, &[])),
-    ) {
-        Some(blocker) => Err(blocker),
-        None => Ok(journal),
+    Ok(journal)
+}
+
+/// Indices of entries the user may abandon: applied or in-flight links whose
+/// folders are unavailable now.
+fn abandonable_indices(transaction: &RenameTransaction) -> Vec<usize> {
+    transaction
+        .entries
+        .iter()
+        .enumerate()
+        .filter(|(_, entry)| {
+            matches!(entry.state, EntryState::Applied | EntryState::RollingBack)
+                && link_unavailable_now(entry)
+        })
+        .map(|(index, _)| index)
+        .collect()
+}
+
+/// On the user's deliberate decision, records that every link currently held
+/// back by an unavailable folder will not be undone. Deletes and moves nothing,
+/// never records a rollback as complete, and keeps the earlier state and reason
+/// as evidence in the sealed journal. Refused unless the journal verifies, equals
+/// `record`, and at least one link is unavailable now.
+pub fn abandon_publisher_links(
+    journal_dir: &Path,
+    record: &RenameTransaction,
+) -> Result<RenameTransaction, String> {
+    let mut journal = open_verified_export(journal_dir, record)?;
+    if !journal.is_rollbackable() {
+        return Err(format!(
+            "{} has nothing left to abandon.",
+            journal.transaction_id
+        ));
     }
+    let indices = abandonable_indices(&journal);
+    if indices.is_empty() {
+        return Err(format!(
+            "No link of {} is unavailable right now, so nothing was abandoned.",
+            journal.transaction_id
+        ));
+    }
+    abandon_unavailable_links(&mut journal, journal_dir, &indices)?;
+    Ok(journal)
 }
 
 /// A plain account of where an Undo stands after `outcome`, from the record it
@@ -439,25 +499,67 @@ pub fn describe_undo_outcome(
     if !held.is_empty() {
         let reason = held[0].failure_reason.as_deref().unwrap_or_default();
         parts.push(format!(
-            "{} link(s) were not touched because a folder or device was not available ({reason}). Reconnect it, then roll back again: every check is repeated first. If that folder is gone for good, remove those links by hand.",
+            "{} link(s) were not touched because a folder or device was not available ({reason}). Reconnect it, then roll back again: every check is repeated first. If that folder is gone for good, choose Preview plan: the export is then listed under Exports you can still undo, where those links can be abandoned. Nothing is deleted when you abandon.",
             held.len()
         ));
     }
-    if retryable > held.len() {
+    let interrupted = transaction
+        .entries
+        .iter()
+        .find(|entry| entry.state == EntryState::RollingBack);
+    if let Some(entry) = interrupted {
+        let count = transaction
+            .entries
+            .iter()
+            .filter(|entry| entry.state == EntryState::RollingBack)
+            .count();
+        let detail = entry
+            .failure_reason
+            .as_deref()
+            .map(|reason| format!(" ({reason})"))
+            .unwrap_or_default();
         parts.push(format!(
-            "{} other link(s) are still to undo or were interrupted. Roll back again; every check is repeated first.",
-            retryable - held.len()
+            "{count} link(s) were interrupted part-way{detail}. Nothing is recorded as undone for them; roll back again and the recorded steps are resumed after every check is repeated."
         ));
     }
-    if refused > 0 {
+    let other = retryable
+        - held.len()
+        - transaction
+            .entries
+            .iter()
+            .filter(|entry| entry.state == EntryState::RollingBack)
+            .count();
+    if retryable > held.len() && other > 0 {
+        parts.push(format!(
+            "{other} other link(s) are still to undo. Roll back again; every check is repeated first."
+        ));
+    }
+    let abandoned = transaction
+        .entries
+        .iter()
+        .filter(|entry| {
+            entry.state == EntryState::RollbackFailed
+                && entry.unknown.contains_key(ABANDONED_MARKER)
+        })
+        .count();
+    if abandoned > 0 {
+        parts.push(format!(
+            "{abandoned} link(s) were abandoned at your request: they were left in place, not undone and not deleted; remove them by hand if you want them gone."
+        ));
+    }
+    if refused > abandoned {
         let reason = transaction
             .entries
             .iter()
-            .find(|entry| entry.state == EntryState::RollbackFailed)
+            .find(|entry| {
+                entry.state == EntryState::RollbackFailed
+                    && !entry.unknown.contains_key(ABANDONED_MARKER)
+            })
             .and_then(|entry| entry.failure_reason.as_deref())
             .unwrap_or("no reason was recorded");
         parts.push(format!(
-            "{refused} link(s) are no longer what this export created and were left in place; check them by hand. Recorded reason: {reason}"
+            "{} link(s) are no longer what this export created and were left in place; check them by hand. Recorded reason: {reason}",
+            refused - abandoned
         ));
     }
     if !outcome.directories_remaining.is_empty() {

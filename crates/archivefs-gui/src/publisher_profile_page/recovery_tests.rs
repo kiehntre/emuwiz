@@ -1026,3 +1026,174 @@ fn an_outage_link_and_a_changed_link_in_one_pass_are_told_apart() {
         assert_eq!(std::fs::read(&export.links[1]).unwrap(), b"user data");
     }
 }
+
+fn abandon_listed(state: &mut PublisherProfilePageState, phrase: &str) {
+    let id = state.recovery.exports[0].transaction.transaction_id.clone();
+    state.recovery.abandon_selected = Some(id);
+    state.recovery.abandon_text = phrase.to_string();
+    state.abandon_recovered();
+}
+
+#[test]
+fn abandoning_a_permanently_missing_folder_deletes_nothing_and_never_claims_rollback() {
+    for mode in BOTH_MODES {
+        let export = exported_split(mode);
+        let independent = PathBuf::from(&export.state.destination_root).join("mine.txt");
+        std::fs::write(&independent, b"mine").unwrap();
+        let folder = export.sources[0].parent().unwrap().to_path_buf();
+        let away = take_away(&folder);
+        let mut state = restarted(&export.journal);
+        roll_back_listed(&mut state);
+        assert_eq!(state.recovery.exports[0].abandonable, 1, "{mode:?}");
+        let before = journal_record(&export);
+
+        // Without the exact phrase nothing is recorded.
+        abandon_listed(&mut state, "yes");
+        assert_eq!(journal_record(&export), before, "{mode:?}");
+        assert!(message(&state).contains("exact abandon"), "{mode:?}");
+
+        abandon_listed(&mut state, "ABANDON 1 LINKS");
+        let said = message(&state);
+        assert!(said.contains("NOT rolled back"), "{mode:?}: {said}");
+        assert!(
+            present(&export.links[0]),
+            "{mode:?}: the link is left in place"
+        );
+        assert_eq!(std::fs::read(&independent).unwrap(), b"mine", "{mode:?}");
+        let record = journal_record(&export);
+        assert_ne!(record.state, TransactionState::RolledBack, "{mode:?}");
+        assert_eq!(
+            record.entries[0].state,
+            EntryState::RollbackFailed,
+            "{mode:?}"
+        );
+        let evidence = &record.entries[0].unknown["emuwiz_undo_abandoned_v1"];
+        assert_eq!(evidence["previous_state"], "Applied", "{mode:?}");
+        assert!(
+            evidence["previous_reason"]
+                .as_str()
+                .unwrap()
+                .contains("rollback refused")
+        );
+
+        // Listed as needing the user, never offered for Undo again.
+        let page = restarted(&export.journal);
+        let blocker = page.recovery.exports[0].blocker.clone().expect("blocked");
+        assert!(blocker.contains("left in place"), "{mode:?}: {blocker}");
+        assert!(blocker.contains("abandoned"), "{mode:?}: {blocker}");
+        assert_eq!(page.recovery.exports[0].abandonable, 0, "{mode:?}");
+
+        // Even when the folder returns, the abandoned link is not retried.
+        std::fs::rename(&away, &folder).unwrap();
+        let mut back = restarted(&export.journal);
+        assert!(back.recovery.exports[0].blocker.is_some(), "{mode:?}");
+        back.recovery.selected = Some(back.recovery.exports[0].transaction.transaction_id.clone());
+        back.recovery.confirmation_text = "ROLL BACK 0 ITEMS".into();
+        assert!(!back.can_rollback_recovered(), "{mode:?}");
+        assert!(present(&export.links[0]), "{mode:?}");
+    }
+}
+
+#[test]
+fn abandon_is_refused_while_the_folder_is_reachable() {
+    for mode in BOTH_MODES {
+        let export = exported_split(mode);
+        let folder = export.sources[0].parent().unwrap().to_path_buf();
+        let away = take_away(&folder);
+        let mut state = restarted(&export.journal);
+        assert_eq!(state.recovery.exports[0].abandonable, 1, "{mode:?}");
+        std::fs::rename(&away, &folder).unwrap();
+        let before = journal_record(&export);
+        // The listing is stale, but the engine checks again before writing.
+        abandon_listed(&mut state, "ABANDON 1 LINKS");
+        assert!(
+            message(&state).contains("nothing was abandoned"),
+            "{mode:?}"
+        );
+        assert_eq!(journal_record(&export), before, "{mode:?}");
+        assert!(present(&export.links[0]), "{mode:?}");
+    }
+}
+
+#[test]
+fn abandon_works_when_every_source_folder_is_gone_before_any_undo_attempt() {
+    for mode in BOTH_MODES {
+        let export = exported_split(mode);
+        for source in &export.sources {
+            take_away(source.parent().unwrap());
+        }
+        let mut state = restarted(&export.journal);
+        assert!(state.recovery.exports[0].blocker.is_some(), "{mode:?}");
+        assert_eq!(state.recovery.exports[0].abandonable, 2, "{mode:?}");
+        abandon_listed(&mut state, "ABANDON 2 LINKS");
+        assert!(
+            message(&state).contains("2 link(s)"),
+            "{mode:?}: {}",
+            message(&state)
+        );
+        let record = journal_record(&export);
+        assert!(
+            record
+                .entries
+                .iter()
+                .all(|e| e.state == EntryState::RollbackFailed)
+        );
+        assert_ne!(record.state, TransactionState::RolledBack, "{mode:?}");
+        for link in &export.links {
+            assert!(present(link), "{mode:?}");
+        }
+    }
+}
+
+#[test]
+fn a_tampered_journal_cannot_be_abandoned() {
+    let export = exported_split(PublisherLinkMode::Symlink);
+    take_away(export.sources[0].parent().unwrap());
+    let mut state = restarted(&export.journal);
+    let id = state.recovery.exports[0].transaction.transaction_id.clone();
+    let path = journal::journal_path(&export.journal, &id).unwrap();
+    let mut edited: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+    edited["created_at_unix"] = serde_json::json!(1);
+    std::fs::write(&path, serde_json::to_vec(&edited).unwrap()).unwrap();
+    abandon_listed(&mut state, "ABANDON 1 LINKS");
+    assert!(
+        message(&state).contains("Nothing was changed"),
+        "{}",
+        message(&state)
+    );
+    let raw: serde_json::Value = serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+    assert_eq!(raw, edited, "the altered journal was left exactly as found");
+}
+
+#[test]
+fn hard_link_undo_leaves_no_hidden_files_and_the_folder_can_be_cleaned_up() {
+    let export = exported(PublisherLinkMode::Hardlink);
+    let mut state = restarted(&export.journal);
+    roll_back_listed(&mut state);
+    assert!(
+        message(&state).contains("rolled back"),
+        "{}",
+        message(&state)
+    );
+    let root = PathBuf::from(&export.state.destination_root);
+    fn names(dir: &Path, out: &mut Vec<String>) {
+        for item in std::fs::read_dir(dir).unwrap().flatten() {
+            out.push(item.file_name().to_string_lossy().into_owned());
+            if item.file_type().unwrap().is_dir() {
+                names(&item.path(), out);
+            }
+        }
+    }
+    let mut found = Vec::new();
+    names(&root, &mut found);
+    assert!(
+        found.iter().all(|name| !name.starts_with(".emuwiz-undo")),
+        "{found:?}"
+    );
+    assert!(found.is_empty(), "created folders were removed: {found:?}");
+    use std::os::unix::fs::MetadataExt;
+    for source in &export.sources {
+        assert_eq!(std::fs::metadata(source).unwrap().nlink(), 1);
+    }
+}

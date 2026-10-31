@@ -68,7 +68,7 @@ const UNAVAILABLE_MARK: &str = "\u{1}unavailable:";
 /// Whether an I/O failure means the place is unreachable right now (folder
 /// missing, device or mount gone, network down) rather than that an object
 /// there was changed. Used only for checks made before any mutation.
-fn is_unavailable(error: &std::io::Error) -> bool {
+pub(crate) fn is_unavailable(error: &std::io::Error) -> bool {
     if error.kind() == std::io::ErrorKind::NotFound {
         return true;
     }
@@ -93,7 +93,7 @@ fn is_unavailable(error: &std::io::Error) -> bool {
 
 /// A missing file is an outage only when the folder holding it is gone too: a
 /// file deleted from a folder that is present is a changed link.
-fn is_file_unavailable(path: &Path, error: &std::io::Error) -> bool {
+pub(crate) fn is_file_unavailable(path: &Path, error: &std::io::Error) -> bool {
     if error.kind() != std::io::ErrorKind::NotFound {
         return is_unavailable(error);
     }
@@ -361,6 +361,29 @@ fn rollback_transaction_inner(
 
         let catalogue =
             crate::database::organisation_paths::begin(&transaction.entries[index], true, false)?;
+        // A hard link is removed through a private quarantine. Its names are
+        // sealed into the journal with the `RollingBack` checkpoint, before any
+        // filesystem change, so an interrupted removal can always be found and
+        // resumed. A quarantine left by an earlier attempt keeps its record.
+        #[cfg(unix)]
+        if matches!(
+            transaction.entries[index].operation,
+            TransactionOperation::CreateHardlink { .. }
+        ) && !super::dirsync::hardlink_quarantine_present(&transaction.entries[index])
+        {
+            match super::dirsync::new_hardlink_quarantine_record() {
+                Ok(record) => {
+                    transaction.entries[index]
+                        .unknown
+                        .insert(super::dirsync::HARDLINK_QUARANTINE_KEY.into(), record);
+                }
+                Err(error) => {
+                    return Err(format!(
+                        "no random name could be made for the Undo quarantine: {error}"
+                    ));
+                }
+            }
+        }
         // Durable `RollingBack` checkpoint BEFORE the reverse rename syscall.
         transaction.entries[index].state = EntryState::RollingBack;
         persist(journal_dir, transaction, &mut fence)?;
@@ -872,6 +895,118 @@ pub fn reenter_recovery_reconciliation(
     persist(journal_dir, transaction, &mut fence)
 }
 
+/// The destination must be confined to its recorded root. A root that cannot be
+/// reached right now (missing or a device error) is an outage, not an invalid
+/// record, so the link stays retryable.
+fn confined_or_unavailable(
+    entry: &super::model::TransactionEntry,
+    root: &Path,
+    invalid: &str,
+) -> Result<(), String> {
+    if super::preflight::destination_is_confined(&entry.destination_path, root) {
+        return Ok(());
+    }
+    let outage = root.is_absolute()
+        && entry.destination_path.starts_with(root)
+        && std::fs::symlink_metadata(root).is_err_and(|error| is_unavailable(&error));
+    Err(if outage {
+        format!(
+            "{UNAVAILABLE_MARK}rollback refused: the destination folder {} is not available",
+            root.display()
+        )
+    } else {
+        format!("rollback refused: {invalid}")
+    })
+}
+
+/// Test-only: the coordinated (RetroDeck-style) entry into the shared pass, so
+/// a test can show its behaviour is unchanged by retryable Undo.
+#[cfg(test)]
+pub(super) fn rollback_coordinated_for_test(
+    transaction: &mut RenameTransaction,
+    journal_dir: &Path,
+    cancel: &AtomicBool,
+    trusted: &TrustedRoots,
+) -> Result<RollbackOutcome, String> {
+    rollback_transaction_inner(transaction, journal_dir, cancel, Some(trusted), true)
+}
+
+/// Whether a link's folders are unreachable right now (a folder or device is
+/// gone), judged afresh from the filesystem.
+pub fn link_unavailable_now(entry: &super::model::TransactionEntry) -> bool {
+    matches!(
+        entry.operation,
+        TransactionOperation::CreateSymlink { .. } | TransactionOperation::CreateHardlink { .. }
+    ) && [&entry.source_path, &entry.destination_path]
+        .iter()
+        .filter_map(|path| path.parent())
+        .any(|parent| std::fs::symlink_metadata(parent).is_err_and(|error| is_unavailable(&error)))
+}
+
+/// Records, on the user's explicit decision, that link entries held back by a
+/// permanently unavailable folder will not be undone. Nothing is deleted or
+/// moved and nothing is recorded as rolled back: each entry becomes
+/// `RollbackFailed` (never retried, left for the user), the transaction stays
+/// `RollbackFailed`, and the previous state and reason are kept as evidence
+/// under `emuwiz_undo_abandoned_v1`. Every index must be an applied or in-flight
+/// link whose folders are unavailable now; otherwise nothing is written. The
+/// journal is verified against its seal and fenced like any Undo write.
+pub fn abandon_unavailable_links(
+    transaction: &mut RenameTransaction,
+    journal_dir: &Path,
+    indices: &[usize],
+) -> Result<(), String> {
+    crate::launch::es_de_publish::operation::require_independent(journal_dir, transaction)?;
+    super::writer_gate::check()?;
+    let _live = super::journal::mark_transaction_live(journal_dir, &transaction.transaction_id);
+    if indices.is_empty() {
+        return Err("no link was selected to abandon".into());
+    }
+    let fence = JournalFence::validate(transaction, journal_dir)?
+        .ok_or_else(|| "this transaction has no journal to record the decision in".to_string())?;
+    for &index in indices {
+        let entry = transaction
+            .entries
+            .get(index)
+            .ok_or_else(|| "the journal no longer has the selected link".to_string())?;
+        if !matches!(entry.state, EntryState::Applied | EntryState::RollingBack) {
+            return Err(format!(
+                "{} is not waiting to be undone, so it cannot be abandoned",
+                entry.destination_path.display()
+            ));
+        }
+        if !link_unavailable_now(entry) {
+            return Err(format!(
+                "{} is available now, so it is not abandoned; roll back instead",
+                entry.destination_path.display()
+            ));
+        }
+    }
+    let now = crate::dat::sources::now_unix();
+    for &index in indices {
+        let entry = &mut transaction.entries[index];
+        let previous_state = entry.state.label().to_string();
+        let previous_reason = entry.failure_reason.take();
+        entry.unknown.insert(
+            "emuwiz_undo_abandoned_v1".into(),
+            serde_json::json!({
+                "at_unix": now,
+                "previous_state": previous_state,
+                "previous_reason": previous_reason,
+            }),
+        );
+        entry.failure_reason = Some(format!(
+            "abandoned by the user while its folder was unavailable; the link was left in place and was not undone{}",
+            previous_reason
+                .map(|reason| format!(" (earlier: {reason})"))
+                .unwrap_or_default()
+        ));
+        entry.state = EntryState::RollbackFailed;
+    }
+    transaction.state = TransactionState::RollbackFailed;
+    persist(journal_dir, transaction, &mut Some(fence))
+}
+
 /// Persists this session's record, fenced when the pass is a repeat or retry.
 fn persist(
     journal_dir: &Path,
@@ -918,12 +1053,10 @@ fn rollback_mutation(
         destination_root,
     } = &entry.operation
     {
-        if !expected_target.is_absolute()
-            || expected_target != &entry.source_path
-            || !super::preflight::destination_is_confined(&entry.destination_path, destination_root)
-        {
+        if !expected_target.is_absolute() || expected_target != &entry.source_path {
             return Err("rollback refused: invalid journalled symlink target".to_string());
         }
+        confined_or_unavailable(entry, destination_root, "invalid journalled symlink target")?;
         if super::executor::link_adoption(entry) == Some(true) {
             return Ok(());
         }
@@ -955,12 +1088,14 @@ fn rollback_mutation(
         destination_root,
     } = &entry.operation
     {
-        if !expected_source.is_absolute()
-            || expected_source != &entry.source_path
-            || !super::preflight::destination_is_confined(&entry.destination_path, destination_root)
-        {
+        if !expected_source.is_absolute() || expected_source != &entry.source_path {
             return Err("rollback refused: invalid journalled hardlink source".to_string());
         }
+        confined_or_unavailable(
+            entry,
+            destination_root,
+            "invalid journalled hardlink source",
+        )?;
         let mark = |path: &Path, error: &std::io::Error| {
             if is_file_unavailable(path, error) {
                 UNAVAILABLE_MARK
@@ -974,20 +1109,60 @@ fn rollback_mutation(
                 mark(&entry.source_path, &error)
             )
         })?;
-        let destination = capture_identity(&entry.destination_path).map_err(|error| {
-            format!(
-                "{}rollback refused: hardlink destination no longer exists",
-                mark(&entry.destination_path, &error)
-            )
-        })?;
-        if !identity_matches(&entry.identity, &source)
-            || !identity_matches(&entry.identity, &destination)
-        {
+        // A quarantine from an interrupted attempt means the link was already
+        // moved aside: the export name is legitimately empty, and the retained
+        // object is proved against the record where it sits.
+        #[cfg(unix)]
+        let resuming = super::dirsync::hardlink_quarantine_present(entry);
+        #[cfg(not(unix))]
+        let resuming = false;
+        let destination_matches = if resuming {
+            true
+        } else {
+            let destination = capture_identity(&entry.destination_path).map_err(|error| {
+                format!(
+                    "{}rollback refused: hardlink destination no longer exists",
+                    mark(&entry.destination_path, &error)
+                )
+            })?;
+            identity_matches(&entry.identity, &destination)
+        };
+        if !identity_matches(&entry.identity, &source) || !destination_matches {
             return Err("rollback refused: hardlink identity changed".to_string());
         }
-        std::fs::remove_file(&entry.destination_path)
-            .map_err(|error| format!("rollback refused: could not remove hardlink: {error}"))?;
-        return Ok(());
+        // Removed through a private quarantine (see `remove_recorded_hardlink`),
+        // never by an unchecked unlink of the export name. Leftovers are
+        // reported as in flight so the next Undo resumes them from the journal.
+        #[cfg(unix)]
+        {
+            let dirs =
+                super::dirsync::HardlinkDir::open(&entry.destination_path).map_err(|error| {
+                    let mark = if is_unavailable(&error) {
+                        UNAVAILABLE_MARK
+                    } else {
+                        ""
+                    };
+                    format!("{mark}rollback refused: could not bind link parent: {error}")
+                })?;
+            let (quarantine_dir, quarantine_file) =
+                super::dirsync::hardlink_quarantine_names(entry).ok_or_else(|| {
+                    "rollback refused: the journal has no quarantine record for this hard link"
+                        .to_string()
+                })?;
+            return dirs
+                .remove(&entry.identity, &quarantine_dir, &quarantine_file)
+                .map_err(|error| match error {
+                    super::dirsync::HardlinkUndoError::Refused(reason) => {
+                        format!("rollback refused: {reason}")
+                    }
+                    super::dirsync::HardlinkUndoError::Retained(reason) => format!(
+                        "{IN_FLIGHT_MARK}the hard link is not fully removed ({reason}); \
+                         nothing was recorded as undone and the next Undo resumes it"
+                    ),
+                });
+        }
+        #[cfg(not(unix))]
+        return Err("linked-library Undo is unsupported on this platform".into());
     }
     if let TransactionOperation::CreateCopy {
         expected_source,

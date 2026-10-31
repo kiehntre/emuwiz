@@ -6,8 +6,9 @@ use std::path::{Path, PathBuf};
 
 use archivefs_core::dat::rename_apply::RollbackResult;
 use archivefs_core::publisher_profile::recovery::{
-    PublisherUndoFailure, RecoverableExport, availability_blocker, describe_undo_outcome,
-    open_publisher_export_for_undo, recoverable_publisher_exports, rollback_publisher_export,
+    PublisherUndoFailure, RecoverableExport, abandon_publisher_links, availability_blocker,
+    describe_undo_outcome, open_publisher_export_for_undo, recoverable_publisher_exports,
+    rollback_publisher_export,
 };
 
 use super::{
@@ -25,6 +26,9 @@ pub(crate) struct PublisherRecoveryState {
     pub(super) selected: Option<String>,
     pub(super) confirmation_text: String,
     pub(super) message: Option<String>,
+    /// The export whose unavailable links the user is considering abandoning.
+    pub(super) abandon_selected: Option<String>,
+    pub(super) abandon_text: String,
 }
 
 impl PublisherRecoveryState {
@@ -134,6 +138,61 @@ impl PublisherProfilePageState {
             .filter(|export| export.blocker.is_none())
     }
 
+    fn abandon_target(&self) -> Option<&RecoverableExport> {
+        let id = self.recovery.abandon_selected.as_ref()?;
+        self.recovery
+            .exports
+            .iter()
+            .find(|export| export.transaction.transaction_id == *id)
+            .filter(|export| export.abandonable > 0)
+    }
+
+    pub(crate) fn abandon_phrase(&self) -> Option<String> {
+        self.abandon_target()
+            .map(|export| format!("ABANDON {} LINKS", export.abandonable))
+    }
+
+    pub(crate) fn can_abandon_recovered(&self) -> bool {
+        self.abandon_phrase()
+            .is_some_and(|phrase| phrase == self.recovery.abandon_text)
+    }
+
+    /// Records the user's decision not to undo links whose folders are gone.
+    /// Nothing is deleted or moved, and the export is never shown as rolled back.
+    pub(crate) fn abandon_recovered(&mut self) {
+        self.recovery.message = None;
+        let (export, directory) = match (self.abandon_target(), self.recovery.journal_dir()) {
+            (_, Err(error)) => {
+                self.recovery.message = Some(error);
+                return;
+            }
+            (Some(export), Ok(directory)) if self.can_abandon_recovered() => {
+                (export.clone(), directory)
+            }
+            _ => {
+                self.recovery.message =
+                    Some("Type the exact abandon confirmation phrase first.".into());
+                return;
+            }
+        };
+        let id = export.transaction.transaction_id.clone();
+        let message = match abandon_publisher_links(&directory, &export.transaction) {
+            Ok(record) => format!(
+                "{} link(s) of {id} were abandoned at your request. They were left in place, not undone and not deleted, and the decision is recorded in the journal. The export is NOT rolled back.",
+                record
+                    .entries
+                    .iter()
+                    .filter(|entry| entry.unknown.contains_key("emuwiz_undo_abandoned_v1"))
+                    .count()
+            ),
+            Err(reason) => format!("{reason} Nothing was changed for {id}."),
+        };
+        self.recovery.abandon_selected = None;
+        self.recovery.abandon_text.clear();
+        self.load_recoverable_exports();
+        self.recovery.message = Some(message);
+    }
+
     pub(crate) fn can_rollback_recovered(&self) -> bool {
         self.selected_recovery()
             .is_some_and(|export| recovery_phrase(export) == self.recovery.confirmation_text)
@@ -236,11 +295,39 @@ pub(super) fn show_recoverable_exports(ui: &mut egui::Ui, state: &mut PublisherP
                 "Transaction {id}: {} item(s) in {}",
                 export.item_count, export.transaction.source_scan_root
             ));
+            if export.abandonable > 0 {
+                ui.label(format!(
+                    "{} link(s) cannot be reached because a folder or device is unavailable. Reconnect it and choose Check again. If it is gone for good, you can abandon those links: they are left in place, not undone and not deleted.",
+                    export.abandonable
+                ));
+                if ui
+                    .button(format!("Review abandoning links of {id}"))
+                    .clicked()
+                {
+                    state.recovery.abandon_selected = Some(id.clone());
+                    state.recovery.abandon_text.clear();
+                }
+            }
             if let Some(blocker) = &export.blocker {
                 ui.label(blocker);
             } else if ui.button(format!("Choose {id}")).clicked() {
                 state.recovery.selected = Some(id.clone());
                 state.recovery.confirmation_text.clear();
+            }
+        }
+        if let Some(phrase) = state.abandon_phrase() {
+            ui.label(format!(
+                "Abandoning records that these links will not be undone. Nothing is deleted or moved, the export is not marked rolled back, and the links must be removed by hand. Type {phrase} to confirm."
+            ));
+            ui.text_edit_singleline(&mut state.recovery.abandon_text);
+            if ui
+                .add_enabled(
+                    state.can_abandon_recovered(),
+                    egui::Button::new("Abandon these links"),
+                )
+                .clicked()
+            {
+                state.abandon_recovered();
             }
         }
         if let Some(phrase) = state.selected_recovery().map(recovery_phrase) {

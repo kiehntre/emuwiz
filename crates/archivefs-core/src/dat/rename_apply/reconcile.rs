@@ -603,6 +603,20 @@ pub(super) fn classify_entry(entry: &TransactionEntry, index: usize) -> Recovery
         };
     }
     if let TransactionOperation::CreateHardlink { .. } = &entry.operation {
+        // An interrupted Undo left its private quarantine behind: the removal is
+        // not complete whatever the export name shows, so the entry is returned
+        // to Applied and the next Undo resumes the recorded quarantine.
+        #[cfg(unix)]
+        if entry.state == EntryState::RollingBack
+            && super::dirsync::hardlink_quarantine_present(entry)
+        {
+            return RecoveryIssue {
+                entry_index: index,
+                kind: RecoveryIssueKind::RenameConfirmed,
+                detail: "an Undo quarantine for this hard link remains; the next Undo resumes it"
+                    .to_string(),
+            };
+        }
         return if source_matches && destination_matches {
             RecoveryIssue {
                 entry_index: index,
