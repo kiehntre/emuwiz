@@ -585,7 +585,11 @@ impl App {
             state.visible.iter().filter_map(|id| self.library.game(*id)),
             |game| state.readiness.get(game).is_some(),
         );
-        for job in jobs {
+        for mut job in jobs {
+            job.multidisc = self
+                .native_workflows
+                .as_ref()
+                .is_some_and(|w| w.has_multidisc_context(&job.archive.absolute_path));
             state.background.spawn(env, job, context.clone());
         }
     }

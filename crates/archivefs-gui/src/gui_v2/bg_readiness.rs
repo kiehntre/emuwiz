@@ -58,6 +58,18 @@ pub(super) fn selection_bound_platform(platform: &str) -> bool {
     })
 }
 
+/// The same skip rule, from the evidence report's typed platform (the typed
+/// ids, not their Debug text).
+pub(super) fn selection_bound_identity(
+    platform: archivefs_core::game_identity::IdentityPlatform,
+) -> bool {
+    use archivefs_core::game_identity::IdentityPlatform as P;
+    matches!(
+        platform,
+        P::Dreamcast | P::Commodore64 | P::WiiU | P::AtariST | P::Nes | P::PlayStation4
+    )
+}
+
 /// Immutable copy of the emulator readiness the builder reads. Only finished
 /// scans are copied; anything still scanning is `None`, and the worker waits.
 #[derive(Clone)]
@@ -74,6 +86,9 @@ pub(super) struct EnvSnapshot {
     firmware: Option<Vec<archivefs_core::dat::firmware_evidence::FirmwareIdentityRecord>>,
     xenia: XeniaProfilesState,
     overrides: crate::emulator_setup_overrides::EmulatorPathOverrides,
+    /// The user's remembered emulator choice decides between several safe
+    /// candidates, so the plan must see the same memory the foreground does.
+    remembered: Vec<RememberedEmulatorProfile>,
 }
 
 impl EnvSnapshot {
@@ -91,6 +106,7 @@ impl EnvSnapshot {
         format!("{:?}", state.retroarch_core_directory_override).hash(&mut hasher);
         format!("{:?}", state.emulator_setup_overrides).hash(&mut hasher);
         format!("{:?}", state.xenia_profiles).hash(&mut hasher);
+        format!("{:?}", state.remembered_emulator_profiles).hash(&mut hasher);
         match &state.dolphin_local_profiles {
             DolphinLocalProfilesState::Ready(r) => format!("{:?}", r.discovery).hash(&mut hasher),
             DolphinLocalProfilesState::Error(_) => 1u8.hash(&mut hasher),
@@ -140,6 +156,7 @@ impl EnvSnapshot {
             firmware,
             xenia: state.xenia_profiles.clone(),
             overrides: state.emulator_setup_overrides.clone(),
+            remembered: state.remembered_emulator_profiles.clone(),
         })
     }
 
@@ -169,6 +186,7 @@ impl EnvSnapshot {
             Pcsx2FirmwareEvidenceState::Ready(self.firmware.clone().unwrap_or_default());
         state.xenia_profiles = self.xenia.clone();
         state.emulator_setup_overrides = self.overrides.clone();
+        state.remembered_emulator_profiles = self.remembered.clone();
         state
     }
 }
@@ -180,6 +198,10 @@ pub(super) struct Job {
     pub(super) archive: PersistedArchive,
     pub(super) catalogue_platform: String,
     pub(super) dat_exact: bool,
+    /// The game belongs to a multi-disc set. The foreground plan uses the
+    /// library snapshot for that; a background check has none, so it must not
+    /// answer (a disc set may need review where this would say Ready).
+    pub(super) multidisc: bool,
 }
 
 impl Job {
@@ -189,6 +211,7 @@ impl Job {
             archive: game.archive.clone(),
             catalogue_platform: game.platform.clone(),
             dat_exact: game.dat_exact.is_some(),
+            multidisc: false,
         }
     }
 }
@@ -207,7 +230,7 @@ pub(super) enum Outcome {
 /// the snapshot, writes nothing, launches nothing.
 pub(super) fn check(env: &EnvSnapshot, job: &Job, cancel: &AtomicBool) -> Outcome {
     use super::launch_readiness_summary as summary;
-    if selection_bound_platform(&job.catalogue_platform) {
+    if job.multidisc || selection_bound_platform(&job.catalogue_platform) {
         return Outcome::Skipped;
     }
     let path = job.archive.absolute_path.clone();
@@ -219,7 +242,7 @@ pub(super) fn check(env: &EnvSnapshot, job: &Job, cancel: &AtomicBool) -> Outcom
     if cancel.load(Ordering::Relaxed) {
         return Outcome::Unknown;
     }
-    if selection_bound_platform(&format!("{:?}", report.game_identity_report.platform)) {
+    if selection_bound_identity(report.game_identity_report.platform) {
         return Outcome::Skipped;
     }
     let state = env.to_state();
@@ -307,6 +330,17 @@ pub(super) fn check(env: &EnvSnapshot, job: &Job, cancel: &AtomicBool) -> Outcom
         Some(result) => Outcome::Known(result),
         None => Outcome::Unknown,
     }
+}
+
+/// Whether the foreground checker would plan `path` with multi-disc set
+/// context (the same lookup it uses). Background checks have none.
+pub(super) fn in_disc_set(
+    sets: &[archivefs_core::media_set::MediaSet],
+    path: &Path,
+    archives: &[PersistedArchive],
+) -> bool {
+    crate::multidisc_launch_view::MultiDiscLaunchContext::for_content(sets, path, archives)
+        .is_some()
 }
 
 /// Apply one finished check to the cache. Only a known answer is kept, and
@@ -468,7 +502,41 @@ mod tests {
             firmware: None,
             xenia: XeniaProfilesState::NotScanned,
             overrides: Default::default(),
+            remembered: Vec::new(),
         }
+    }
+
+    #[test]
+    fn typed_identity_platforms_match_the_skip_rule() {
+        use archivefs_core::game_identity::IdentityPlatform as P;
+        for platform in [
+            P::Dreamcast,
+            P::Commodore64,
+            P::WiiU,
+            P::AtariST,
+            P::Nes,
+            P::PlayStation4,
+        ] {
+            assert!(selection_bound_identity(platform), "{platform:?}");
+        }
+        assert!(!selection_bound_identity(P::Snes));
+        assert!(!selection_bound_identity(P::PlayStation));
+    }
+
+    #[test]
+    fn the_remembered_emulator_choice_reaches_the_worker_state() {
+        let mut snapshot = env();
+        snapshot.remembered = vec![RememberedEmulatorProfile {
+            adapter: "dolphin".into(),
+            profile_id: "profile-a".into(),
+            root: "/fixture/dolphin".into(),
+        }];
+        let state = snapshot.to_state();
+        assert_eq!(state.remembered_emulator_profiles.len(), 1);
+        assert_eq!(
+            state.remembered_emulator_profiles[0].profile_id,
+            "profile-a"
+        );
     }
 
     #[test]
@@ -494,6 +562,34 @@ mod tests {
                 "{platform} must be left Not checked"
             );
         }
+    }
+
+    #[test]
+    fn a_multi_disc_game_is_never_answered_in_the_background() {
+        use crate::multidisc_launch_view::tests::{catalogue_archives, temp_root, verified_set};
+        let cancel = AtomicBool::new(false);
+        let root = temp_root("bg-disc-set");
+        let (set, paths) = verified_set(&root, 2);
+        let archives = catalogue_archives(&paths);
+        // The foreground lookup finds a disc set for either disc...
+        assert!(in_disc_set(
+            std::slice::from_ref(&set),
+            &paths[1],
+            &archives
+        ));
+        // ...and not for an unrelated file, so single-disc games are unaffected.
+        assert!(!in_disc_set(&[set], &root.join("other.cue"), &archives));
+        // A readable disc of that set, flagged as the scheduler flags it,
+        // yields no verdict at all: not Ready, not Not ready.
+        let mut persisted = archives[1].clone();
+        persisted.platform = Some("PlayStation".into());
+        let mut job = Job::for_game(&Game::from_archive(persisted));
+        job.multidisc = true;
+        assert_eq!(check(&env(), &job, &cancel), Outcome::Skipped);
+        // Without the flag the same game is judged (here: no answer without
+        // finished emulator scans), proving the flag is what withholds it.
+        job.multidisc = false;
+        assert_ne!(check(&env(), &job, &cancel), Outcome::Skipped);
     }
 
     #[test]

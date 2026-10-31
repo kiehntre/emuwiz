@@ -670,6 +670,20 @@ impl NativeWorkflows {
         &self.app.emulator_readiness
     }
 
+    /// Whether the foreground checker would plan this game with multi-disc
+    /// set context (the same lookup it uses). Background checks have no such
+    /// context, so they must not answer for these games.
+    pub(super) fn has_multidisc_context(&self, path: &Path) -> bool {
+        // No library snapshot: the set context cannot be known, so fail closed.
+        self.app.database_state.snapshot().is_none_or(|snapshot| {
+            let sets = crate::multidisc_launch_view::library_sets(
+                snapshot,
+                self.app.database_generation.0,
+            );
+            super::bg_readiness::in_disc_set(&sets, path, &snapshot.archives)
+        })
+    }
+
     pub(super) fn has_evidence_for(&self, path: &Path) -> bool {
         match &self.app.selected_evidence_ui.selected_evidence {
             selected_evidence_page::SelectedEvidenceState::Loading { path: current, .. }
