@@ -95,6 +95,8 @@ pub(super) struct BrowsePlayState {
     /// signature it was taken at; a different signature invalidates both.
     env: Option<(u64, super::bg_readiness::EnvSnapshot)>,
     env_signature: Option<u64>,
+    /// The library snapshot generation the settled decisions were made at.
+    database_generation: Option<u64>,
     /// Ids drawn this frame / last frame, nearest the top first.
     visible_now: Vec<i64>,
     visible: Vec<i64>,
@@ -554,6 +556,16 @@ impl App {
             return;
         }
         let state = &mut self.browse_play;
+        // The library snapshot (and so every disc-set decision) changed: games
+        // held back for want of it are looked at again.
+        let generation = self
+            .native_workflows
+            .as_ref()
+            .map(|w| w.database_generation());
+        if state.database_generation != generation {
+            state.database_generation = generation;
+            state.background.invalidate();
+        }
         // What the checks read changed (emulator scans, settings): drop
         // everything decided under the old state.
         // Until a game has been selected once, no scan has run and there is
@@ -586,10 +598,16 @@ impl App {
             |game| state.readiness.get(game).is_some(),
         );
         for mut job in jobs {
+            // Fail closed: with no workflows or no library snapshot the disc
+            // set context is unknown, so the game is not answered (yet).
             job.multidisc = self
                 .native_workflows
                 .as_ref()
-                .is_some_and(|w| w.has_multidisc_context(&job.archive.absolute_path));
+                .is_none_or(|w| w.has_multidisc_context(&job.archive.absolute_path));
+            if job.multidisc {
+                state.background.settle(job.id);
+                continue;
+            }
             state.background.spawn(env, job, context.clone());
         }
     }

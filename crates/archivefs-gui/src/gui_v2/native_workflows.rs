@@ -670,6 +670,10 @@ impl NativeWorkflows {
         &self.app.emulator_readiness
     }
 
+    pub(super) fn database_generation(&self) -> u64 {
+        self.app.database_generation.0
+    }
+
     /// Whether the foreground checker would plan this game with multi-disc
     /// set context (the same lookup it uses). Background checks have no such
     /// context, so they must not answer for these games.

@@ -35,14 +35,15 @@ pub(super) const MAX_CANDIDATES: usize = 24;
 /// without it could say Not ready, or Ready where the selected game would be
 /// asked to choose. The whole platform is therefore skipped, not just that
 /// emulator. TEMPORARY: the follow-up supplies selection-independent evidence
-/// and removes entries one at a time, NES/Mesen first.
-const SELECTION_BOUND_PLATFORMS: [(&str, &str); 9] = [
+/// and removes entries one at a time, NES/Mesen first. What each still needs:
+/// Dreamcast (Flycast GDI): `flycast_profiles` in the snapshot plus a bounded,
+/// cancel-aware disc read (CHD/CDI have no path-only evidence at all); C64
+/// (VICE), Wii U (Cemu), Atari ST (Hatari), NES (Mesen), PS4 (shadPS4): their
+/// own environment data in the snapshot. Dragon/CoCo cassette is NOT skipped:
+/// its check needs only the file path, so the worker runs it itself.
+const SELECTION_BOUND_PLATFORMS: [(&str, &str); 8] = [
     ("Dreamcast", "Flycast GDI context"),
     ("Commodore 64", "VICE context"),
-    (
-        archivefs_core::launch::DRAGON_COCO_PLATFORM_ID,
-        "XRoar cassette context",
-    ),
     ("WiiU", "Cemu context and inspection"),
     ("Wii U", "Cemu context and inspection"),
     ("AtariST", "Hatari snapshot"),
@@ -245,7 +246,21 @@ pub(super) fn check(env: &EnvSnapshot, job: &Job, cancel: &AtomicBool) -> Outcom
     if selection_bound_identity(report.game_identity_report.platform) {
         return Outcome::Skipped;
     }
-    let state = env.to_state();
+    let mut state = env.to_state();
+    // Dragon/CoCo cassette evidence needs only the file: run the same bounded
+    // path-only check the selected game runs (one small file, hashed once).
+    if crate::emulator_setup::xroar_cassette::is_cas(&path)
+        && archivefs_core::canonical_platform_for_alias(&job.catalogue_platform)
+            .unwrap_or(&job.catalogue_platform)
+            .eq_ignore_ascii_case(archivefs_core::launch::DRAGON_COCO_PLATFORM_ID)
+    {
+        if cancel.load(Ordering::Relaxed) {
+            return Outcome::Unknown;
+        }
+        let context = crate::launch_readiness_page::xroar::Context::inspect(path.clone());
+        state.xroar_cassette =
+            crate::emulator_setup::xroar_cassette::Controller::with_context(path.clone(), context);
+    }
     let evidence = crate::selected_evidence_page::SelectedEvidenceState::Ready {
         generation: 0,
         report: Box::new(report),
@@ -440,6 +455,11 @@ impl Scheduler {
             .collect()
     }
 
+    /// Mark a game decided without running anything (it is not eligible yet).
+    pub(super) fn settle(&mut self, id: i64) {
+        self.settled.insert(id, Outcome::Skipped);
+    }
+
     pub(super) fn spawn(&mut self, env: &EnvSnapshot, job: Job, context: egui::Context) {
         self.in_flight += 1;
         // Mark it so a slow check is not queued twice.
@@ -507,6 +527,37 @@ mod tests {
     }
 
     #[test]
+    fn dragon_coco_is_assessed_in_the_background_not_skipped() {
+        assert!(!selection_bound_platform("Dragon / Tandy CoCo"));
+        assert!(!selection_bound_platform("Dragon"));
+        let cancel = AtomicBool::new(false);
+        let job = Job::for_game(&game(7, "Dragon / Tandy CoCo"));
+        // Unreadable here, so no verdict: never skipped, never Ready.
+        assert_eq!(check(&env(), &job, &cancel), Outcome::Unknown);
+    }
+
+    #[test]
+    fn a_background_xroar_context_is_visible_to_the_builder_for_its_path() {
+        use crate::emulator_setup::xroar_cassette::Controller;
+        use crate::launch_readiness_page::xroar::Context;
+        let path = PathBuf::from("/fixture/game.cas");
+        let context = Context {
+            selected: path.clone(),
+            result: Err(archivefs_core::launch::DragonCocoRefusal {
+                kind: archivefs_core::launch::DragonCocoRefusalKind::Unreadable,
+                detail: "fixture".into(),
+            }),
+        };
+        let controller = Controller::with_context(path.clone(), context);
+        assert!(controller.context(Some(&path)).is_some());
+        assert!(
+            controller
+                .context(Some(Path::new("/fixture/other.cas")))
+                .is_none()
+        );
+    }
+
+    #[test]
     fn typed_identity_platforms_match_the_skip_rule() {
         use archivefs_core::game_identity::IdentityPlatform as P;
         for platform in [
@@ -548,7 +599,6 @@ mod tests {
             "Dreamcast",
             "Commodore 64",
             "C64",
-            "Dragon / Tandy CoCo",
             "Wii U",
             "WiiU",
             "Atari ST",
