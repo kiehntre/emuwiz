@@ -1495,7 +1495,91 @@ def verify_retirement(record, target):
     return True, ""
 
 
+def history_preservation_problem(wt):
+    """Why removing this checkout could lose work, or None.
+
+    `git worktree remove` deletes the checkout's own refs, HEAD reflog and
+    ORIG_HEAD, and silently deletes ignored files, so every gate that can say
+    CLEAR must prove them first. HEAD being merged says nothing about them.
+    Only a ref proves preservation: a bundle counts once it is imported under
+    refs/preservation/. Anything that cannot be established is a problem.
+    """
+    if not os.path.isdir(wt) or not os.path.lexists(os.path.join(wt, ".git")):
+        return None
+    # No inherited GIT_DIR/GIT_WORK_TREE/alternates, and no replace refs or grafts
+    # that could make unmerged history look preserved.
+    env = {k: v for k, v in os.environ.items() if not k.startswith("GIT_")}
+    env.update(GIT_NO_REPLACE_OBJECTS="1", GIT_GRAFT_FILE="/nonexistent", GIT_CONFIG_NOSYSTEM="1")
+
+    def git(*args):
+        proc = F.run_as_owner(["git", "-C", wt, *args], capture_output=True,
+                              text=True, timeout=30, env=env)
+        if proc.returncode != 0:
+            raise LegacyCheckoutHold("GIT_STATE_UNVERIFIED", proc.stderr.strip())
+        return proc.stdout.strip()
+
+    def names_in(path, read):
+        if not os.path.lexists(path):
+            return set()
+        if not stat.S_ISREG(os.lstat(path).st_mode):
+            raise LegacyCheckoutHold("GIT_STATE_UNVERIFIED",
+                                     os.path.basename(path) + " is not a regular file")
+        return read(path)
+
+    def reflog_names(path):
+        # Read the file itself: gc keeps both IDs of every entry, while
+        # `git reflog show` lists only the new one.
+        names = set()
+        with open(path, "rb") as handle:
+            for line in handle:
+                names.update(line.split(b"\t", 1)[0].decode(errors="replace").split()[:2])
+        return names
+
+    def orig_head_name(path):
+        with open(path) as handle:
+            return {handle.read().strip()}
+
+    try:
+        if git("status", "--porcelain=v1", "--untracked-files=all", "--ignored=matching",
+               "--ignore-submodules=none"):
+            return ("CHECKOUT_NOT_CLEAN", "tracked, untracked or ignored files require preservation")
+        if git("for-each-ref", "--format=%(refname)", "refs/worktree", "refs/bisect", "refs/rewritten"):
+            return ("GIT_HISTORY_NOT_PRESERVED", "per-worktree refs would be deleted with the checkout")
+        admin = git("rev-parse", "--absolute-git-dir")
+        names = names_in(os.path.join(admin, "logs", "HEAD"), reflog_names)
+        names |= names_in(os.path.join(admin, "ORIG_HEAD"), orig_head_name)
+        names.add(git("rev-parse", "--verify", "HEAD^{commit}"))
+        if not all(len(n) in (40, 64) and not n.strip("0123456789abcdef") for n in names):
+            return ("GIT_STATE_UNVERIFIED", "reflog or ORIG_HEAD holds something other than an object ID")
+        names -= {"0" * 40, "0" * 64}
+        # Not --all: that counts worktree HEADs, including this checkout's own.
+        # A named object that no longer exists makes rev-list fail, and so HOLD.
+        orphans = git("rev-list", *sorted(names), "--not", "--glob=refs/*").split()
+    except (OSError, ValueError, subprocess.SubprocessError) as error:
+        return ("GIT_STATE_UNVERIFIED", str(error))
+    except LegacyCheckoutHold as error:
+        return (error.code, error.explanation)
+    if orphans:
+        return ("GIT_HISTORY_NOT_PRESERVED",
+                f"{len(orphans)} commit(s) are named only by this checkout's HEAD, reflog or ORIG_HEAD; "
+                "retain them under refs/preservation/ first")
+    return None
+
+
 def worktree_gate(path):
+    """The lifecycle gate, which can only be CLEAR when the checkout's history is
+    also preserved. A HOLD still reports any history problem, so a Cargo reason
+    can never hide it."""
+    res = lifecycle_gate(path)
+    problem = history_preservation_problem(res["worktree"])
+    if problem and res["status"] == "CLEAR":
+        res.update(status="HOLD", code=problem[0], explanation=problem[1])
+    elif problem:
+        res["history_preservation"] = dict(code=problem[0], explanation=problem[1])
+    return res
+
+
+def lifecycle_gate(path):
     """CLEAR only when the worktree's compiler artifacts are gone (retired with a
     verified receipt, or never existed).  Otherwise HOLD with the reason and the
     next step.  The gate never deletes and a release record alone never clears it."""
@@ -1636,6 +1720,11 @@ def reconcile_legacy_worktree(path, preserved_ref=None, remove=False):
         require(proc.returncode == 0, "GIT_STATE_UNVERIFIED", proc.stderr.strip())
         return proc.stdout.strip()
 
+    def history():
+        problem = history_preservation_problem(wt)
+        if problem:
+            raise LegacyCheckoutHold(*problem)
+
     def absent():
         # exists/isdir would misclassify dangling symlinks and permission failures.
         try:
@@ -1669,18 +1758,9 @@ def reconcile_legacy_worktree(path, preserved_ref=None, remove=False):
         tracked = git("ls-files", "-v", "-z").split("\0")
         require(not any(line and (line[0].islower() or line[0] == "S") for line in tracked),
                 "CHECKOUT_INDEX_UNVERIFIED", "assume-unchanged or skip-worktree entries can hide unfinished code")
-        require(not git("status", "--porcelain=v1", "--untracked-files=all", "--ignored=matching",
-                        "--ignore-submodules=none"),
-                "CHECKOUT_NOT_CLEAN", "tracked, untracked or ignored files require preservation")
-        # `git worktree remove` also deletes this checkout's own refs and HEAD reflog.
-        require(not git("for-each-ref", "--format=%(refname)", "refs/worktree", "refs/bisect", "refs/rewritten"),
-                "GIT_HISTORY_NOT_PRESERVED", "per-worktree refs would be deleted with the checkout")
+        history()
         head = git("rev-parse", "HEAD")
         main = git("rev-parse", "--verify", "refs/remotes/origin/main^{commit}")
-        orphans = reflog_only_commits(admin, main)
-        require(not orphans, "GIT_HISTORY_NOT_PRESERVED",
-                f"{len(orphans)} commit(s) are named only by this checkout's reflog or ORIG_HEAD; "
-                "retain them under refs/preservation/ first")
         merged = F.run_as_owner(["git", "-C", wt, "merge-base", "--is-ancestor", head, main],
                                 capture_output=True, text=True, timeout=30, env=git_env).returncode == 0
         preserved = None
@@ -1693,29 +1773,6 @@ def reconcile_legacy_worktree(path, preserved_ref=None, remove=False):
         return dict(head=head, branch=rows[0].get("branch", ""), main=main,
                     preserved_ref=preserved_ref, preserved_head=preserved,
                     checkout_identity=[st.st_dev, st.st_ino])
-
-    def reflog_only_commits(admin, main):
-        # Read the reflog file itself: gc keeps both IDs of every entry, while
-        # `git reflog show` lists only the new one.
-        names = set()
-        log = os.path.join(admin, "logs", "HEAD")
-        if os.path.lexists(log):
-            require(stat.S_ISREG(os.lstat(log).st_mode), "GIT_STATE_UNVERIFIED", "HEAD reflog is not a regular file")
-            with open(log, "rb") as handle:
-                for line in handle:
-                    names.update(line.split(b"\t", 1)[0].decode(errors="replace").split()[:2])
-        orig = os.path.join(admin, "ORIG_HEAD")
-        if os.path.lexists(orig):
-            require(stat.S_ISREG(os.lstat(orig).st_mode), "GIT_STATE_UNVERIFIED", "ORIG_HEAD is not a regular file")
-            with open(orig) as handle:
-                names.add(handle.read().strip())
-        require(all(len(n) in (40, 64) and not n.strip("0123456789abcdef") for n in names),
-                "GIT_STATE_UNVERIFIED", "reflog or ORIG_HEAD holds something other than an object ID")
-        names -= {"0" * 40, "0" * 64}
-        if not names:
-            return []
-        # --all includes every ref and every worktree's HEAD; HEAD itself is proven above.
-        return git("rev-list", *sorted(names), "--not", "--all", main).split()
 
     def ownership(registry, key, branch):
         records = []
@@ -1767,6 +1824,8 @@ def reconcile_legacy_worktree(path, preserved_ref=None, remove=False):
                 "LIVE_PROCESS_REFERENCE", "a process references the checkout or target")
 
     try:
+        # First: a present target must not be able to hide lost history.
+        history()
         absent()
         registry = F.Registry(create=True)
         key = F.key_for(target)

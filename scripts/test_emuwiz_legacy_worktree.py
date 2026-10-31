@@ -346,5 +346,125 @@ class LegacyCheckout(M.MaintBase):
             self.hold('GIT_HISTORY_NOT_PRESERVED')
 
 
+class HistoryGates(LegacyCheckout):
+    """Both gates must prove the checkout's history before any early return."""
+    def setUp(self):
+        super().setUp()
+        self.env = dict(os.environ, GIT_AUTHOR_NAME='t', GIT_AUTHOR_EMAIL='t@t',
+                        GIT_COMMITTER_NAME='t', GIT_COMMITTER_EMAIL='t@t')
+        self.base = self.m.F.head_of(self.wt)
+        self.git_dir = subprocess.check_output(
+            ['git', '-C', self.wt, 'rev-parse', '--absolute-git-dir'], text=True).strip()
+
+    def run_git(self, *args):
+        return subprocess.check_output(['git', '-C', self.wt, *args], text=True,
+                                       env=self.env, stderr=subprocess.STDOUT).strip()
+
+    def reflog_only_commit(self):
+        self.run_git('commit', '--allow-empty', '-qm', 'history only in the reflog')
+        orphan = self.run_git('rev-parse', 'HEAD')
+        self.run_git('reset', '-q', '--hard', self.base)
+        os.unlink(os.path.join(self.git_dir, 'ORIG_HEAD'))
+        return orphan
+
+    def gate_when_lifecycle_clear(self):
+        clear = dict(worktree=self.wt, target=self.target, worktree_exists=True,
+                     status='CLEAR', code='CLEAR', explanation='fixture')
+        with patch.object(self.m, 'lifecycle_gate', return_value=clear):
+            return self.m.worktree_gate(self.wt)
+
+    def assert_gate_holds(self, code):
+        gate = self.gate_when_lifecycle_clear()
+        self.assertEqual((gate['status'], gate['code']), ('HOLD', code), gate)
+
+    def test_clean_merged_checkout_stays_clear(self):
+        self.assertEqual(self.gate_when_lifecycle_clear()['status'], 'CLEAR')
+        self.assertEqual(self.check()['status'], 'CLEAR')
+
+    def test_reflog_only_commit_holds_the_lifecycle_gate(self):
+        self.reflog_only_commit()
+        self.assert_gate_holds('GIT_HISTORY_NOT_PRESERVED')
+
+    def test_present_target_cannot_hide_reflog_only_history(self):
+        self.reflog_only_commit()
+        os.mkdir(self.target)
+        self.hold('GIT_HISTORY_NOT_PRESERVED')
+
+    def test_missing_artifacts_hold_still_reports_the_history_problem(self):
+        self.reflog_only_commit()
+        gate = self.m.worktree_gate(self.wt)
+        self.assertEqual(gate['code'], 'ARTIFACTS_MISSING_UNVERIFIED')
+        self.assertEqual(gate['history_preservation']['code'], 'GIT_HISTORY_NOT_PRESERVED')
+
+    def test_orig_head_only_commit_holds(self):
+        orphan = self.reflog_only_commit()
+        os.unlink(os.path.join(self.git_dir, 'logs', 'HEAD'))
+        Path(self.git_dir, 'ORIG_HEAD').write_text(orphan + '\n')
+        self.assert_gate_holds('GIT_HISTORY_NOT_PRESERVED')
+
+    def test_detached_head_kept_only_by_this_checkout_holds(self):
+        self.run_git('checkout', '-q', '--detach')
+        self.run_git('commit', '--allow-empty', '-qm', 'detached')
+        self.assert_gate_holds('GIT_HISTORY_NOT_PRESERVED')
+
+    def test_commit_retained_under_refs_preservation_clears(self):
+        orphan = self.reflog_only_commit()
+        self.run_git('update-ref', 'refs/preservation/fixture', orphan)
+        self.assertEqual(self.gate_when_lifecycle_clear()['status'], 'CLEAR')
+        self.assertEqual(self.check()['status'], 'CLEAR')
+
+    def test_bundle_counts_only_once_imported_under_refs_preservation(self):
+        orphan = self.reflog_only_commit()
+        self.run_git('update-ref', 'refs/tmp-bundle', orphan)
+        bundle = os.path.join(self.root_for_bundle(), 'history.bundle')
+        self.run_git('bundle', 'create', '-q', bundle, 'refs/tmp-bundle', '^' + self.base)
+        self.run_git('bundle', 'verify', '-q', bundle)
+        self.run_git('update-ref', '-d', 'refs/tmp-bundle')
+        self.assert_gate_holds('GIT_HISTORY_NOT_PRESERVED')
+        self.run_git('fetch', '-q', bundle, 'refs/tmp-bundle:refs/preservation/from-bundle')
+        self.assertEqual(self.gate_when_lifecycle_clear()['status'], 'CLEAR')
+
+    def root_for_bundle(self):
+        return os.path.dirname(self.wt)
+
+    def test_reflog_naming_a_deleted_object_fails_closed(self):
+        gone = 'a' * 40
+        with open(os.path.join(self.git_dir, 'logs', 'HEAD'), 'a') as log:
+            log.write(f'{gone} {self.base} t <t@t> 1 +0000\tcheckout: fixture\n')
+        self.assert_gate_holds('GIT_STATE_UNVERIFIED')
+        self.hold('GIT_STATE_UNVERIFIED')
+
+    def test_uncommitted_untracked_and_ignored_work_holds(self):
+        tracked = 'tracked-file'
+        Path(self.wt, tracked).write_bytes(b'original')
+        self.run_git('add', tracked)
+        self.run_git('commit', '-qm', 'tracked fixture')
+        self.run_git('update-ref', 'refs/remotes/origin/main', 'HEAD')
+        original = Path(self.wt, tracked).read_bytes()
+        Path(self.wt, tracked).write_bytes(original + b'changed')
+        self.assert_gate_holds('CHECKOUT_NOT_CLEAN')
+        os.mkdir(self.target)
+        self.hold('CHECKOUT_NOT_CLEAN')
+        os.rmdir(self.target)
+        Path(self.wt, tracked).write_bytes(original)
+        Path(self.wt, 'untracked-work').write_text('x')
+        self.assert_gate_holds('CHECKOUT_NOT_CLEAN')
+        os.unlink(os.path.join(self.wt, 'untracked-work'))
+        exclude = self.run_git('rev-parse', '--git-path', 'info/exclude')
+        with open(os.path.join(self.wt, exclude) if not os.path.isabs(exclude) else exclude, 'a') as f:
+            f.write('ignored-evidence\n')
+        Path(self.wt, 'ignored-evidence').write_text('x')
+        self.assert_gate_holds('CHECKOUT_NOT_CLEAN')
+
+    def test_git_that_cannot_answer_fails_closed(self):
+        with patch.object(self.m.F, 'run_as_owner', side_effect=OSError('no git')):
+            self.assert_gate_holds('GIT_STATE_UNVERIFIED')
+
+    def test_malformed_reflog_fails_closed(self):
+        with open(os.path.join(self.git_dir, 'logs', 'HEAD'), 'a') as log:
+            log.write('not-an-id also-not\tfixture\n')
+        self.assert_gate_holds('GIT_STATE_UNVERIFIED')
+
+
 if __name__ == '__main__':
     unittest.main()
