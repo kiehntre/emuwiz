@@ -4487,3 +4487,506 @@ mod sealed_namespace_identity {
         }
     }
 }
+
+// ---------------------------------------------------------------------
+// Retryable Undo after an environmental failure (#263)
+// ---------------------------------------------------------------------
+
+#[cfg(unix)]
+#[test]
+fn error_classification_separates_an_outage_from_a_changed_object() {
+    use super::rollback::{is_file_unavailable, is_unavailable};
+    let os = std::io::Error::from_raw_os_error;
+    for code in [
+        libc::EIO,
+        libc::ESTALE,
+        libc::ENOTCONN,
+        libc::ETIMEDOUT,
+        libc::EHOSTDOWN,
+        libc::EHOSTUNREACH,
+        libc::ENETDOWN,
+        libc::ENETUNREACH,
+        libc::ENODEV,
+        libc::ENXIO,
+        libc::ENOENT,
+    ] {
+        assert!(is_unavailable(&os(code)), "errno {code} is an outage");
+    }
+    for code in [
+        libc::EACCES,
+        libc::EPERM,
+        libc::ELOOP,
+        libc::ENOTDIR,
+        libc::EEXIST,
+        libc::EISDIR,
+        libc::EINVAL,
+        libc::EROFS,
+        libc::ENOSPC,
+    ] {
+        assert!(!is_unavailable(&os(code)), "errno {code} is not an outage");
+    }
+    assert!(!is_unavailable(&std::io::Error::other("changed")));
+    assert!(!is_unavailable(&std::io::Error::from(
+        std::io::ErrorKind::PermissionDenied
+    )));
+
+    let dir = tempfile::tempdir().unwrap();
+    let missing_in_present = dir.path().join("gone.bin");
+    let not_found = os(libc::ENOENT);
+    assert!(
+        !is_file_unavailable(&missing_in_present, &not_found),
+        "a file missing from a folder that is present was changed"
+    );
+    let in_missing_folder = dir.path().join("nofolder/gone.bin");
+    assert!(is_file_unavailable(&in_missing_folder, &not_found));
+    assert!(is_file_unavailable(&missing_in_present, &os(libc::EIO)));
+    assert!(!is_file_unavailable(&missing_in_present, &os(libc::EACCES)));
+}
+
+#[cfg(unix)]
+#[test]
+fn an_outage_link_stays_applied_and_finishes_after_the_folder_returns() {
+    let mut m = applied_mixed();
+    let away = m.hard.with_extension("away");
+    std::fs::rename(&m.hard, &away).unwrap();
+    let first = rollback_transaction(&mut m.tx, &m.journal, &no_cancel()).unwrap();
+    assert!(!matches!(first.result, RollbackResult::FullyRolledBack));
+    assert_eq!(
+        entry_states(&m.tx),
+        vec![
+            EntryState::RolledBack,
+            EntryState::RolledBack,
+            EntryState::Applied
+        ]
+    );
+    assert!(m.tx.entries[2].failure_reason.is_some());
+    assert_ne!(m.tx.state, TransactionState::RolledBack);
+    std::fs::rename(&away, &m.hard).unwrap();
+    let second = rollback_transaction(&mut m.tx, &m.journal, &no_cancel()).unwrap();
+    assert_eq!(second.result, RollbackResult::FullyRolledBack);
+    assert_eq!(m.tx.state, TransactionState::RolledBack);
+    assert!(m.tx.entries[2].failure_reason.is_none());
+}
+
+#[cfg(unix)]
+#[test]
+fn cancellation_during_an_outage_leaves_every_entry_retryable() {
+    // Cancelled before anything runs, with the hard link's folder away.
+    let mut m = applied_mixed();
+    let away = m.hard.with_extension("away");
+    std::fs::rename(&m.hard, &away).unwrap();
+    let cancelled = AtomicBool::new(true);
+    let outcome = rollback_transaction(&mut m.tx, &m.journal, &cancelled).unwrap();
+    assert!(!matches!(outcome.result, RollbackResult::FullyRolledBack));
+    assert!(
+        entry_states(&m.tx)
+            .iter()
+            .all(|state| *state == EntryState::Applied)
+    );
+    assert!(m.sym.join("s.bin").exists());
+
+    // Cancelled after the first reversal; the outage entry was already held back.
+    let cancel = Arc::new(AtomicBool::new(false));
+    let flag = Arc::clone(&cancel);
+    super::rollback::AFTER_REVERSAL.with(|hook| {
+        *hook.borrow_mut() = Some(Box::new(move |_| flag.store(true, Ordering::Relaxed)));
+    });
+    let outcome = rollback_transaction(&mut m.tx, &m.journal, &cancel).unwrap();
+    super::rollback::AFTER_REVERSAL.with(|hook| *hook.borrow_mut() = None);
+    assert!(!matches!(outcome.result, RollbackResult::FullyRolledBack));
+    assert_eq!(
+        entry_states(&m.tx),
+        vec![
+            EntryState::Applied,
+            EntryState::RolledBack,
+            EntryState::Applied
+        ]
+    );
+
+    // Folder back, no cancellation: the rest completes and nothing is double-undone.
+    std::fs::rename(&away, &m.hard).unwrap();
+    let done = rollback_transaction(&mut m.tx, &m.journal, &no_cancel()).unwrap();
+    assert_eq!(done.result, RollbackResult::FullyRolledBack);
+    assert_eq!(m.tx.state, TransactionState::RolledBack);
+}
+
+#[cfg(unix)]
+#[test]
+fn a_coordinated_rollback_still_records_an_unavailable_link_as_refused() {
+    let mut m = applied_mixed();
+    let away = m.hard.with_extension("away");
+    std::fs::rename(&m.hard, &away).unwrap();
+    let trusted = TrustedRoots::from_paths([m.roms.parent().unwrap()]);
+    let outcome = super::rollback::rollback_coordinated_for_test(
+        &mut m.tx,
+        &m.journal,
+        &no_cancel(),
+        &trusted,
+    )
+    .unwrap();
+    assert!(!matches!(outcome.result, RollbackResult::FullyRolledBack));
+    assert_eq!(
+        m.tx.entries[2].state,
+        EntryState::RollbackFailed,
+        "coordinated callers keep the old recorded-refusal behaviour"
+    );
+    assert!(
+        !m.tx.entries[2]
+            .failure_reason
+            .as_deref()
+            .unwrap_or_default()
+            .contains('\u{1}'),
+        "no internal marker leaks into the reason"
+    );
+}
+
+/// Every directory entry under `root`, recursively.
+#[cfg(unix)]
+fn tree_names(root: &Path) -> Vec<String> {
+    let mut out = Vec::new();
+    let mut stack = vec![root.to_path_buf()];
+    while let Some(dir) = stack.pop() {
+        let Ok(read) = std::fs::read_dir(&dir) else {
+            continue;
+        };
+        for item in read.flatten() {
+            out.push(item.file_name().to_string_lossy().into_owned());
+            if item.file_type().is_ok_and(|kind| kind.is_dir()) {
+                stack.push(item.path());
+            }
+        }
+    }
+    out
+}
+
+#[cfg(unix)]
+fn hidden_leftovers(root: &Path) -> Vec<String> {
+    tree_names(root)
+        .into_iter()
+        .filter(|name| {
+            name.starts_with(".emuwiz-undo-q-") || name.starts_with(".emuwiz-undone-hl-")
+        })
+        .collect()
+}
+
+#[cfg(unix)]
+#[test]
+fn a_hard_link_undo_leaves_no_hidden_file_and_frees_the_extra_name() {
+    use std::os::unix::fs::MetadataExt;
+    let mut m = applied_mixed();
+    let source = m.roms.join("h.bin");
+    let before = std::fs::read(&source).unwrap();
+    assert_eq!(std::fs::metadata(&source).unwrap().nlink(), 2);
+    let outcome = rollback_transaction(&mut m.tx, &m.journal, &no_cancel()).unwrap();
+    assert_eq!(outcome.result, RollbackResult::FullyRolledBack);
+    assert!(!m.hard.join("h.bin").exists());
+    assert_eq!(std::fs::read(&source).unwrap(), before);
+    // Storage accounting: the source is the only name for its data again.
+    assert_eq!(std::fs::metadata(&source).unwrap().nlink(), 1);
+    // No quarantine folder or retained link anywhere, and the folder is empty.
+    let hard_dir_listing = tree_names(&m.hard);
+    assert!(hard_dir_listing.is_empty(), "{hard_dir_listing:?}");
+    assert!(hidden_leftovers(m.roms.parent().unwrap()).is_empty());
+}
+
+#[cfg(unix)]
+#[test]
+fn a_foreign_file_swapped_in_before_the_move_is_restored_and_leaves_nothing_behind() {
+    let mut m = applied_mixed();
+    let link = m.hard.join("h.bin");
+    let held = m.hard.join("held-original");
+    let held_for_hook = held.clone();
+    super::dirsync::set_undo_move_hook(Some(Box::new(move |path| {
+        std::fs::rename(path, &held_for_hook).unwrap();
+        std::fs::write(path, b"unrelated user file").unwrap();
+    })));
+    let outcome = rollback_transaction(&mut m.tx, &m.journal, &no_cancel()).unwrap();
+    super::dirsync::set_undo_move_hook(None);
+    assert!(!matches!(outcome.result, RollbackResult::FullyRolledBack));
+    assert_eq!(std::fs::read(&link).unwrap(), b"unrelated user file");
+    assert!(held.exists(), "the original link is untouched");
+    assert_eq!(m.tx.entries[2].state, EntryState::RollbackFailed);
+    let reason = m.tx.entries[2].failure_reason.clone().unwrap();
+    assert!(reason.contains("foreign object restored"), "{reason}");
+    assert!(hidden_leftovers(&m.hard).is_empty(), "quarantine removed");
+}
+
+#[cfg(unix)]
+#[test]
+fn a_foreign_file_whose_name_is_retaken_stays_in_quarantine_and_is_reported_incomplete() {
+    let mut m = applied_mixed();
+    let link = m.hard.join("h.bin");
+    let held = m.hard.join("held-original");
+    let (held_for_hook, link_for_hook) = (held.clone(), link.clone());
+    super::dirsync::set_undo_move_hook(Some(Box::new(move |path| {
+        std::fs::rename(path, &held_for_hook).unwrap();
+        std::fs::write(path, b"foreign").unwrap();
+    })));
+    // After the foreign file is moved aside, someone recreates its old name.
+    super::dirsync::set_moved_hook(Some(Box::new(move || {
+        std::fs::write(&link_for_hook, b"newcomer").unwrap();
+    })));
+    let outcome = rollback_transaction(&mut m.tx, &m.journal, &no_cancel()).unwrap();
+    super::dirsync::set_undo_move_hook(None);
+    super::dirsync::set_moved_hook(None);
+    assert!(!matches!(outcome.result, RollbackResult::FullyRolledBack));
+    assert_eq!(std::fs::read(&link).unwrap(), b"newcomer");
+    assert_ne!(m.tx.entries[2].state, EntryState::RolledBack);
+    // Nothing was deleted: the foreign file is still somewhere under the folder.
+    let kept = tree_names(&m.hard);
+    assert_eq!(hidden_leftovers(&m.hard).len(), 1, "{kept:?}");
+    assert!(held.exists(), "the original link is untouched");
+}
+
+#[cfg(unix)]
+#[test]
+fn an_interruption_after_the_move_resumes_after_a_restart_and_removes_everything() {
+    use std::os::unix::fs::MetadataExt;
+    let mut m = applied_mixed();
+    let source = m.roms.join("h.bin");
+    // The process dies once the link is inside its quarantine.
+    super::dirsync::set_unlink_hook(Some(Box::new(|_| {
+        Err(std::io::Error::other("simulated crash"))
+    })));
+    let first = rollback_transaction(&mut m.tx, &m.journal, &no_cancel()).unwrap();
+    super::dirsync::set_unlink_hook(None);
+    assert!(!matches!(first.result, RollbackResult::FullyRolledBack));
+    assert_eq!(m.tx.entries[2].state, EntryState::RollingBack);
+    assert!(!m.hard.join("h.bin").exists());
+    assert_eq!(
+        hidden_leftovers(&m.hard).len(),
+        1,
+        "the quarantine is retained"
+    );
+    assert_eq!(std::fs::metadata(&source).unwrap().nlink(), 2);
+    assert_ne!(m.tx.state, TransactionState::RolledBack);
+
+    // A fresh process knows only the sealed journal on disk.
+    let id = m.tx.transaction_id.clone();
+    let mut restarted =
+        read_journal(&journal_path(&m.journal, &id).unwrap()).expect("journal reread");
+    assert_eq!(restarted.entries[2].state, EntryState::RollingBack);
+    assert!(
+        restarted.entries[2]
+            .unknown
+            .contains_key("emuwiz_hl_quarantine_v1")
+    );
+    let done = rollback_transaction(&mut restarted, &m.journal, &no_cancel()).unwrap();
+    assert_eq!(done.result, RollbackResult::FullyRolledBack);
+    assert_eq!(restarted.state, TransactionState::RolledBack);
+    assert!(hidden_leftovers(m.roms.parent().unwrap()).is_empty());
+    assert_eq!(std::fs::metadata(&source).unwrap().nlink(), 1);
+    assert!(tree_names(&m.hard).is_empty());
+}
+
+#[cfg(unix)]
+#[test]
+fn an_interruption_right_after_creating_the_quarantine_leaves_the_link_and_resumes() {
+    let mut m = applied_mixed();
+    super::dirsync::set_quarantine_hook(Some(Box::new(|| {
+        Err(std::io::Error::other("simulated crash"))
+    })));
+    let first = rollback_transaction(&mut m.tx, &m.journal, &no_cancel()).unwrap();
+    super::dirsync::set_quarantine_hook(None);
+    assert!(!matches!(first.result, RollbackResult::FullyRolledBack));
+    assert!(m.hard.join("h.bin").exists(), "the link was never moved");
+    assert_eq!(m.tx.entries[2].state, EntryState::RollingBack);
+    let done = rollback_transaction(&mut m.tx, &m.journal, &no_cancel()).unwrap();
+    assert_eq!(done.result, RollbackResult::FullyRolledBack);
+    assert!(!m.hard.join("h.bin").exists());
+    assert!(tree_names(&m.hard).is_empty());
+}
+
+#[cfg(unix)]
+#[test]
+fn an_unrecognised_object_in_the_quarantine_is_never_removed_and_undo_stays_incomplete() {
+    let mut m = applied_mixed();
+    super::dirsync::set_unlink_hook(Some(Box::new(|_| {
+        Err(std::io::Error::other("simulated crash"))
+    })));
+    let _ = rollback_transaction(&mut m.tx, &m.journal, &no_cancel()).unwrap();
+    super::dirsync::set_unlink_hook(None);
+    // While interrupted, the retained file is replaced by something else.
+    let quarantine = tree_names(&m.hard);
+    assert_eq!(quarantine.len(), 1, "{quarantine:?}");
+    let record = m.tx.entries[2].unknown["emuwiz_hl_quarantine_v1"].clone();
+    let folder = m.hard.join(record["dir"].as_str().unwrap());
+    let file = folder.join(record["file"].as_str().unwrap());
+    use std::os::unix::fs::PermissionsExt;
+    std::fs::set_permissions(&folder, std::fs::Permissions::from_mode(0o700)).unwrap();
+    std::fs::remove_file(&file).unwrap();
+    std::fs::write(&file, b"someone else's file").unwrap();
+    let again = rollback_transaction(&mut m.tx, &m.journal, &no_cancel()).unwrap();
+    assert!(!matches!(again.result, RollbackResult::FullyRolledBack));
+    assert_eq!(std::fs::read(&file).unwrap(), b"someone else's file");
+    assert_ne!(m.tx.entries[2].state, EntryState::RolledBack);
+    assert_ne!(m.tx.state, TransactionState::RolledBack);
+}
+
+#[cfg(unix)]
+#[test]
+fn cancellation_between_hard_link_undos_never_leaves_a_quarantine() {
+    let mut m = applied_mixed();
+    let cancel = Arc::new(AtomicBool::new(false));
+    let flag = Arc::clone(&cancel);
+    super::rollback::AFTER_REVERSAL.with(|hook| {
+        *hook.borrow_mut() = Some(Box::new(move |_| flag.store(true, Ordering::Relaxed)));
+    });
+    // Reverse order: the hard link is first, so it completes before the stop.
+    let outcome = rollback_transaction(&mut m.tx, &m.journal, &cancel).unwrap();
+    super::rollback::AFTER_REVERSAL.with(|hook| *hook.borrow_mut() = None);
+    assert!(!matches!(outcome.result, RollbackResult::FullyRolledBack));
+    assert_eq!(m.tx.entries[2].state, EntryState::RolledBack);
+    assert!(hidden_leftovers(m.roms.parent().unwrap()).is_empty());
+    let done = rollback_transaction(&mut m.tx, &m.journal, &no_cancel()).unwrap();
+    assert_eq!(done.result, RollbackResult::FullyRolledBack);
+}
+
+#[cfg(unix)]
+#[test]
+fn an_independent_file_beside_the_link_survives_hard_link_undo() {
+    let mut m = applied_mixed();
+    let independent = m.hard.join("mine.txt");
+    std::fs::write(&independent, b"mine").unwrap();
+    let outcome = rollback_transaction(&mut m.tx, &m.journal, &no_cancel()).unwrap();
+    assert_eq!(outcome.result, RollbackResult::FullyRolledBack);
+    assert_eq!(std::fs::read(&independent).unwrap(), b"mine");
+    assert!(hidden_leftovers(&m.hard).is_empty());
+}
+
+#[cfg(unix)]
+#[test]
+fn a_missing_destination_root_is_an_outage_not_an_invalid_record() {
+    let mut m = applied_mixed();
+    let away = m.hard.with_extension("away");
+    std::fs::rename(&m.hard, &away).unwrap();
+    let _ = rollback_transaction(&mut m.tx, &m.journal, &no_cancel()).unwrap();
+    assert_eq!(m.tx.entries[2].state, EntryState::Applied);
+    std::fs::rename(&away, &m.hard).unwrap();
+    let done = rollback_transaction(&mut m.tx, &m.journal, &no_cancel()).unwrap();
+    assert_eq!(done.result, RollbackResult::FullyRolledBack);
+}
+
+#[cfg(unix)]
+fn interrupted_inside_quarantine() -> Mixed {
+    let mut m = applied_mixed();
+    super::dirsync::set_unlink_hook(Some(Box::new(|_| {
+        Err(std::io::Error::other("simulated crash"))
+    })));
+    let _ = rollback_transaction(&mut m.tx, &m.journal, &no_cancel()).unwrap();
+    super::dirsync::set_unlink_hook(None);
+    assert_eq!(m.tx.entries[2].state, EntryState::RollingBack);
+    m
+}
+
+#[cfg(unix)]
+#[test]
+fn an_offline_folder_never_turns_a_retained_quarantine_into_a_recorded_rollback() {
+    let mut m = interrupted_inside_quarantine();
+    let record = m.tx.entries[2].unknown["emuwiz_hl_quarantine_v1"].clone();
+    let away = m.hard.with_extension("away");
+    std::fs::rename(&m.hard, &away).unwrap();
+    for _ in 0..2 {
+        let outcome = rollback_transaction(&mut m.tx, &m.journal, &no_cancel()).unwrap();
+        assert!(!matches!(outcome.result, RollbackResult::FullyRolledBack));
+        assert_ne!(m.tx.entries[2].state, EntryState::RolledBack);
+        assert_ne!(m.tx.state, TransactionState::RolledBack);
+        assert_eq!(m.tx.entries[2].unknown["emuwiz_hl_quarantine_v1"], record);
+    }
+    std::fs::rename(&away, &m.hard).unwrap();
+    let done = rollback_transaction(&mut m.tx, &m.journal, &no_cancel()).unwrap();
+    assert_eq!(done.result, RollbackResult::FullyRolledBack);
+    assert!(hidden_leftovers(m.roms.parent().unwrap()).is_empty());
+}
+
+#[cfg(unix)]
+#[test]
+fn an_empty_mount_point_in_the_folders_place_is_not_taken_for_a_finished_removal() {
+    let mut m = interrupted_inside_quarantine();
+    let record = m.tx.entries[2].unknown["emuwiz_hl_quarantine_v1"].clone();
+    let away = m.hard.with_extension("away");
+    std::fs::rename(&m.hard, &away).unwrap();
+    std::fs::create_dir(&m.hard).unwrap(); // the unmounted mount point
+    let outcome = rollback_transaction(&mut m.tx, &m.journal, &no_cancel()).unwrap();
+    assert!(!matches!(outcome.result, RollbackResult::FullyRolledBack));
+    assert_ne!(m.tx.entries[2].state, EntryState::RolledBack);
+    assert_ne!(m.tx.state, TransactionState::RolledBack);
+    assert_eq!(m.tx.entries[2].unknown["emuwiz_hl_quarantine_v1"], record);
+    assert!(
+        tree_names(&m.hard).is_empty(),
+        "the stand-in was not touched"
+    );
+    std::fs::remove_dir(&m.hard).unwrap();
+    std::fs::rename(&away, &m.hard).unwrap();
+    let done = rollback_transaction(&mut m.tx, &m.journal, &no_cancel()).unwrap();
+    assert_eq!(done.result, RollbackResult::FullyRolledBack);
+}
+
+#[cfg(unix)]
+#[test]
+fn only_the_exact_quarantine_record_shape_is_accepted() {
+    let m = interrupted_inside_quarantine();
+    let mut entry = m.tx.entries[2].clone();
+    assert!(super::dirsync::hardlink_quarantine_names(&entry).is_some());
+    for (dir, file) in [
+        ("hard", "0".repeat(32)),
+        (".emuwiz-undo-q-short", "0".repeat(32)),
+        (
+            ".emuwiz-undo-q-00000000000000000000000000000000",
+            "x".repeat(32),
+        ),
+        (
+            ".emuwiz-undo-q-../../../etc00000000000000000",
+            "0".repeat(32),
+        ),
+    ] {
+        entry.unknown.insert(
+            "emuwiz_hl_quarantine_v1".into(),
+            serde_json::json!({"dir": dir, "file": file}),
+        );
+        assert!(
+            super::dirsync::hardlink_quarantine_names(&entry).is_none(),
+            "{dir}"
+        );
+    }
+}
+
+#[cfg(unix)]
+#[test]
+fn a_stand_in_folder_at_the_first_undo_never_seals_a_quarantine_record() {
+    let mut m = applied_mixed();
+    let away = m.hard.with_extension("away");
+    std::fs::rename(&m.hard, &away).unwrap();
+    std::fs::create_dir(&m.hard).unwrap(); // empty mount point
+    let _ = rollback_transaction(&mut m.tx, &m.journal, &no_cancel()).unwrap();
+    assert!(
+        !m.tx.entries[2]
+            .unknown
+            .contains_key("emuwiz_hl_quarantine_v1"),
+        "no record was sealed for a folder that holds no proved link"
+    );
+    assert!(tree_names(&m.hard).is_empty());
+    assert!(away.join("h.bin").exists(), "the real link was not touched");
+}
+
+#[cfg(unix)]
+#[test]
+fn an_unproven_folder_can_be_abandoned_and_the_evidence_names_the_quarantine() {
+    let mut m = interrupted_inside_quarantine();
+    let away = m.hard.with_extension("away");
+    std::fs::rename(&m.hard, &away).unwrap();
+    std::fs::create_dir(&m.hard).unwrap(); // the drive is gone for good
+    assert!(super::link_unavailable_now(&m.tx.entries[2]));
+    super::abandon_unavailable_links(&mut m.tx, &m.journal, &[2]).unwrap();
+    let entry = &m.tx.entries[2];
+    assert_eq!(entry.state, EntryState::RollbackFailed);
+    assert_ne!(m.tx.state, TransactionState::RolledBack);
+    let evidence = &entry.unknown["emuwiz_undo_abandoned_v1"];
+    assert!(
+        evidence["quarantine"]["dir"]
+            .as_str()
+            .unwrap()
+            .starts_with(".emuwiz-undo-q-")
+    );
+    assert!(tree_names(&m.hard).is_empty(), "nothing was touched");
+}

@@ -6,14 +6,18 @@ use std::path::{Path, PathBuf};
 
 use archivefs_core::dat::rename_apply::RollbackResult;
 use archivefs_core::publisher_profile::recovery::{
-    PublisherUndoFailure, RecoverableExport, availability_blocker, open_publisher_export_for_undo,
-    recoverable_publisher_exports, rollback_publisher_export,
+    PublisherUndoFailure, RecoverableExport, abandon_publisher_links, availability_blocker,
+    describe_undo_outcome, open_publisher_export_for_undo, recoverable_publisher_exports,
+    rollback_publisher_export,
 };
 
 use super::{
     PublisherExecutionStage, PublisherJob, PublisherProfilePageState,
     destination_left_after_rollback, egui, widgets,
 };
+
+/// Shown above the typed confirmation for abandoning links.
+pub(crate) const ABANDON_WARNING: &str = "WARNING: Abandoning these links is irreversible. The transaction will remain marked as failed, and any remaining links must be removed manually. No files will be deleted automatically.";
 
 #[derive(Debug, Default)]
 pub(crate) struct PublisherRecoveryState {
@@ -25,6 +29,9 @@ pub(crate) struct PublisherRecoveryState {
     pub(super) selected: Option<String>,
     pub(super) confirmation_text: String,
     pub(super) message: Option<String>,
+    /// The export whose unavailable links the user is considering abandoning.
+    pub(super) abandon_selected: Option<String>,
+    pub(super) abandon_text: String,
 }
 
 impl PublisherRecoveryState {
@@ -108,11 +115,11 @@ impl PublisherProfilePageState {
                 ));
                 true
             }
-            // A rollback now would fail on these links, and links are not
-            // retried, so advising one would cost the Undo this guard protects.
+            // A rollback now cannot finish; the links would be kept for a later
+            // Undo, but trying only reports the same outage.
             Err(_) if availability_blocker(&transaction.transaction).is_some() => {
                 self.execution_error = Some(format!(
-                    "{refused}, because this export's folders are not available right now. Reconnect them and try again, and do not roll back until then: a rollback now cannot finish and those links would not be offered again. Nothing was changed."
+                    "{refused}, because this export's folders are not available right now. Reconnect them and try again: a rollback now cannot finish. Nothing was changed."
                 ));
                 false
             }
@@ -132,6 +139,87 @@ impl PublisherProfilePageState {
             .iter()
             .find(|export| export.transaction.transaction_id == *id)
             .filter(|export| export.blocker.is_none())
+    }
+
+    fn abandon_target(&self) -> Option<&RecoverableExport> {
+        let id = self.recovery.abandon_selected.as_ref()?;
+        self.recovery
+            .exports
+            .iter()
+            .find(|export| export.transaction.transaction_id == *id)
+            .filter(|export| export.abandonable > 0)
+    }
+
+    pub(crate) fn abandon_phrase(&self) -> Option<String> {
+        self.abandon_target()
+            .map(|export| format!("ABANDON {} LINKS", export.abandonable))
+    }
+
+    pub(crate) fn can_abandon_recovered(&self) -> bool {
+        self.abandon_phrase()
+            .is_some_and(|phrase| phrase == self.recovery.abandon_text)
+    }
+
+    /// Records the user's decision not to undo links whose folders are gone.
+    /// Nothing is deleted or moved, and the export is never shown as rolled back.
+    pub(crate) fn abandon_recovered(&mut self) {
+        self.recovery.message = None;
+        let (export, directory) = match (self.abandon_target(), self.recovery.journal_dir()) {
+            (_, Err(error)) => {
+                self.recovery.message = Some(error);
+                return;
+            }
+            (Some(export), Ok(directory)) if self.can_abandon_recovered() => {
+                (export.clone(), directory)
+            }
+            _ => {
+                self.recovery.message =
+                    Some("Type the exact abandon confirmation phrase first.".into());
+                return;
+            }
+        };
+        let id = export.transaction.transaction_id.clone();
+        let message = match abandon_publisher_links(&directory, &export.transaction) {
+            Ok(record) => {
+                let abandoned = |entry: &&archivefs_core::dat::rename_apply::TransactionEntry| {
+                    entry.unknown.contains_key("emuwiz_undo_abandoned_v1")
+                };
+                let count = record.entries.iter().filter(abandoned).count();
+                let quarantined: Vec<String> = record
+                    .entries
+                    .iter()
+                    .filter(abandoned)
+                    .filter_map(|entry| {
+                        let dir = entry
+                            .unknown
+                            .get("emuwiz_hl_quarantine_v1")?
+                            .get("dir")?
+                            .as_str()?;
+                        Some(format!(
+                            "{}/{dir}",
+                            entry.destination_path.parent()?.display()
+                        ))
+                    })
+                    .collect();
+                let quarantine_note = if quarantined.is_empty() {
+                    String::new()
+                } else {
+                    format!(
+                        " {} of them may already sit in a private, unlisted quarantine folder ({}); it is hidden and has no read permission, so grant yourself read access to look inside.",
+                        quarantined.len(),
+                        quarantined.join(", ")
+                    )
+                };
+                format!(
+                    "{count} link(s) of {id} were abandoned at your request. They were left in place, not undone and not deleted, and the decision is recorded in the journal. The export is NOT rolled back.{quarantine_note}"
+                )
+            }
+            Err(reason) => format!("{reason} Nothing was changed for {id}."),
+        };
+        self.recovery.abandon_selected = None;
+        self.recovery.abandon_text.clear();
+        self.load_recoverable_exports();
+        self.recovery.message = Some(message);
     }
 
     pub(crate) fn can_rollback_recovered(&self) -> bool {
@@ -174,10 +262,7 @@ impl PublisherProfilePageState {
                         )
                     }
                 }
-                Ok((_, outcome)) => format!(
-                    "Rollback was not complete: {:?}. Review transaction {id}.",
-                    outcome.rollback.result
-                ),
+                Ok((record, outcome)) => describe_undo_outcome(&record, &outcome),
                 Err(PublisherUndoFailure::Refused(reason)) => {
                     format!("{reason} Nothing was rolled back for {id}.")
                 }
@@ -239,11 +324,40 @@ pub(super) fn show_recoverable_exports(ui: &mut egui::Ui, state: &mut PublisherP
                 "Transaction {id}: {} item(s) in {}",
                 export.item_count, export.transaction.source_scan_root
             ));
+            if export.abandonable > 0 {
+                ui.label(format!(
+                    "{} link(s) cannot be reached because a folder or device is unavailable. Reconnect it and choose Check again. If it is gone for good, you can abandon those links: they are left in place, not undone and not deleted.",
+                    export.abandonable
+                ));
+                if ui
+                    .button(format!("Review abandoning links of {id}"))
+                    .clicked()
+                {
+                    state.recovery.abandon_selected = Some(id.clone());
+                    state.recovery.abandon_text.clear();
+                }
+            }
             if let Some(blocker) = &export.blocker {
                 ui.label(blocker);
             } else if ui.button(format!("Choose {id}")).clicked() {
                 state.recovery.selected = Some(id.clone());
                 state.recovery.confirmation_text.clear();
+            }
+        }
+        if let Some(phrase) = state.abandon_phrase() {
+            ui.colored_label(ui.visuals().warn_fg_color, ABANDON_WARNING);
+            ui.label(format!(
+                "Abandoning records that these links will not be undone. Nothing is deleted or moved, the export is not marked rolled back, and the links must be removed by hand. Type {phrase} to confirm."
+            ));
+            ui.text_edit_singleline(&mut state.recovery.abandon_text);
+            if ui
+                .add_enabled(
+                    state.can_abandon_recovered(),
+                    egui::Button::new("Abandon these links"),
+                )
+                .clicked()
+            {
+                state.abandon_recovered();
             }
         }
         if let Some(phrase) = state.selected_recovery().map(recovery_phrase) {

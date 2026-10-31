@@ -89,8 +89,9 @@ pub use preflight::{
 };
 pub use reconcile::{RecoveryIssue, RecoveryIssueKind, reconcile_recovery};
 pub use rollback::{
-    JOURNAL_INTEGRITY_LOST, RollbackOutcome, is_journal_integrity_loss,
-    reenter_recovery_reconciliation, rollback_transaction, rollback_transaction_confined,
+    JOURNAL_INTEGRITY_LOST, RollbackOutcome, abandon_unavailable_links, is_journal_integrity_loss,
+    link_unavailable_now, reenter_recovery_reconciliation, rollback_transaction,
+    rollback_transaction_confined,
 };
 
 #[cfg(test)]
