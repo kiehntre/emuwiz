@@ -72,6 +72,8 @@ pub(crate) struct RomOrganisationPageState {
     /// journal for a reviewed recovery.
     quarantined_undo: Option<archivefs_core::dat::rename_apply::RenameTransaction>,
     error: Option<String>,
+    /// This error follows a run that may have changed files (not a plain refusal).
+    error_after_changes: bool,
     /// The last apply stopped at a safe point because it was cancelled.
     stopped: bool,
     /// Set when the user asked to apply; holds the count awaiting a typed
@@ -210,6 +212,7 @@ impl Default for RomOrganisationPageState {
             result_complete: true,
             last_rollback: None,
             quarantined_undo: None,
+            error_after_changes: false,
             error: None,
             stopped: false,
             pending_apply: None,
@@ -353,6 +356,7 @@ impl RomOrganisationPageState {
     /// from an earlier run.
     fn begin_outcome(&mut self) {
         self.error = None;
+        self.error_after_changes = false;
         self.result_message = None;
         self.result_complete = false;
         self.last_rollback = None;
@@ -704,6 +708,7 @@ impl RomOrganisationPageState {
                 // Keep that journalled transaction as the Undo handle.
                 if transaction_may_have_changed_disk(&transaction) {
                     self.applied = Some(transaction);
+                    self.error_after_changes = true;
                 }
                 self.error = Some(error.to_string());
             }
@@ -774,6 +779,7 @@ impl RomOrganisationPageState {
                 // Never retried as an ordinary Undo in this session.
                 self.quarantined_undo = Some(transaction);
                 self.error = Some(error);
+                self.error_after_changes = true;
             }
             Err(error) => {
                 // The journal on disk is the durable record of how far this
@@ -786,6 +792,7 @@ impl RomOrganisationPageState {
                 .filter(|recorded| recorded.transaction_id == transaction.transaction_id);
                 self.applied = Some(recorded.unwrap_or(transaction));
                 self.error = Some(error);
+                self.error_after_changes = true;
             }
         }
     }
@@ -846,8 +853,7 @@ fn apply_result_report(
     if summary.fully_resolved() && summary.applied == 0 {
         return (
             format!(
-                "Nothing was changed: {} item(s) were skipped and none were applied. \
-                 There is nothing to roll back.",
+                "Nothing was changed by this Apply: {} item(s) were skipped and none were applied.",
                 summary.skipped
             ),
             false,
@@ -1858,7 +1864,7 @@ fn show_rom_organisation_page_with_options(
 
     if let Some(error) = &state.error {
         ui.add_space(8.0);
-        let title = if state.applied.is_some() {
+        let title = if state.error_after_changes {
             "Not finished"
         } else {
             "Not applied"
@@ -2501,6 +2507,7 @@ mod tests {
         assert!(!complete, "{message}");
         assert!(message.starts_with("Nothing was changed"), "{message}");
         assert!(!message.contains("available"), "{message}");
+        assert!(!message.contains("nothing to roll back"), "{message}");
         let (message, complete) =
             apply_result_report(OrganisationMode::RenameInPlace, &with_skipped(3, 2));
         assert!(!complete, "{message}");
