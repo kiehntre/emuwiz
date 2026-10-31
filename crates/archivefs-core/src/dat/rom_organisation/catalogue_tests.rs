@@ -656,6 +656,23 @@ fn history_selection_refuses_a_journal_changed_after_it_was_sealed_and_undo_stay
 }
 
 #[test]
+fn history_selection_refuses_an_edited_journal_even_when_history_holds_the_same_edit() {
+    let mut f = Fixture::new(OrganisationMode::RenameInPlace);
+    f.apply().unwrap();
+    f.reload();
+    let path = journal_file(&f);
+    let mut edited: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+    edited["created_at_unix"] = serde_json::json!(1);
+    std::fs::write(&path, serde_json::to_vec(&edited).unwrap()).unwrap();
+    // The digest comparison cannot object here: only the seal can.
+    let history = crate::dat::rename_apply::read_journal(&path).unwrap();
+    assert_eq!(history.created_at_unix, 1);
+    assert!(open_history_transaction_for_undo(&f.journal(), &history).is_err());
+    assert!(f.destination.exists() && !f.source.exists());
+}
+
+#[test]
 fn history_selection_refuses_a_journal_replaced_by_a_symlink() {
     let mut f = Fixture::new(OrganisationMode::RenameInPlace);
     f.apply().unwrap();

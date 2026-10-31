@@ -762,6 +762,19 @@ impl RomOrganisationPageState {
             ));
             return;
         }
+        // History reopens only Organisation records, so any other handle with
+        // something left to reverse would be lost for good if replaced here.
+        if let Some(held) = &self.applied
+            && held.transaction_id != id
+            && organisation::undo_blocker(held).is_none()
+            && !organisation::is_organisation_transaction(held)
+        {
+            self.error = Some(format!(
+                "Undo on this page belongs to transaction {}, which History cannot open again here. Undo it first, then open {id} from History. Nothing was changed.",
+                held.transaction_id
+            ));
+            return;
+        }
         let opened =
             match organisation::open_history_transaction_for_undo(&self.applied_journal, history) {
                 Ok(opened) => opened,

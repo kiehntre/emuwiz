@@ -890,6 +890,36 @@ fn restarted_app(fixture: &Fixture) -> App {
 }
 
 #[test]
+fn history_selection_never_discards_a_clean_handle_history_cannot_reopen() {
+    let fixture = disposable();
+    let (_db, _archive, _source, _destination, _outcome, selectable) =
+        bound_organisation_apply(&fixture);
+    let id = selectable.transaction_id.clone();
+    let mut app = restarted_app(&fixture);
+
+    let entries = vec![entry(
+        &fixture.root,
+        "held",
+        fixture.root.join("held.new.bin"),
+    )];
+    let (result, transaction) = real_apply(&fixture.root, &fixture.journal, entries);
+    let mut worker = reviewed_page(&fixture);
+    worker.record_apply_result_for_test(result, transaction);
+    finish(&mut app, Kind::Apply, worker);
+    let held = app.canonical_organisation.applied().unwrap().clone();
+    assert_ne!(held.transaction_id, id);
+    assert!(!archivefs_core::dat::rom_organisation::is_organisation_transaction(&held));
+    assert!(archivefs_core::dat::rom_organisation::undo_blocker(&held).is_none());
+
+    app.select_organisation_transaction(&id);
+    let page = &app.canonical_organisation;
+    assert_eq!(page.applied().unwrap().transaction_id, held.transaction_id);
+    let error = page.error().unwrap();
+    assert!(error.contains(&held.transaction_id), "{error}");
+    assert!(error.contains("Nothing was changed"), "{error}");
+}
+
+#[test]
 fn a_bound_organisation_is_selected_by_its_history_row_after_a_restart_and_undone_safely() {
     use super::super::history_view::{HistorySources, build_entries};
     let fixture = disposable();
