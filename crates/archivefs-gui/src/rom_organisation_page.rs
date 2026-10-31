@@ -2630,6 +2630,49 @@ mod tests {
     }
 
     #[test]
+    fn history_selection_refusals_never_read_as_changes_made() {
+        use archivefs_core::dat::rename_apply::{RenameTransaction, TransactionState};
+        let record = |id: &str, state: TransactionState| RenameTransaction {
+            transaction_id: id.into(),
+            plan_generation: 1,
+            classifier_version: None,
+            created_at_unix: 0,
+            source_scan_root: String::new(),
+            state,
+            entries: Vec::new(),
+            created_directories: Vec::new(),
+            recovery_resolution: None,
+            recovery_resolved_at_unix: None,
+            unknown: Default::default(),
+        };
+        let journal = tempfile::tempdir().unwrap();
+        let selected = record("selected", TransactionState::Applied);
+        let refused_with = |prepare: &dyn Fn(&mut RomOrganisationPageState)| {
+            let mut state = RomOrganisationPageState {
+                applied_journal: journal.path().to_path_buf(),
+                error_after_changes: true,
+                ..Default::default()
+            };
+            prepare(&mut state);
+            state.select_history_transaction(&selected);
+            let message = state.error.clone().expect("refused");
+            assert!(!state.error_after_changes, "{message}");
+            assert!(message.contains("was not opened") || message.contains("Nothing was changed"));
+        };
+        refused_with(&|_| {});
+        refused_with(&|state| {
+            state.applied = Some(record("held", TransactionState::Applied));
+        });
+        refused_with(&|state| {
+            state.applied = Some(record("held", TransactionState::ApplyFailed));
+        });
+        refused_with(&|state| {
+            state.quarantined_undo = Some(record("held", TransactionState::Applied));
+        });
+        refused_with(&|state| state.advanced_r2_selected = true);
+    }
+
+    #[test]
     fn all_skipped_apply_keeps_no_undo_handle() {
         use archivefs_core::dat::rename_apply::{ApplyOutcome, RenameTransaction};
         let mut state = RomOrganisationPageState::default();
