@@ -599,6 +599,127 @@ fn workflow_handoffs_resolve_to_the_canonical_destination() {
     );
 }
 
+// ------------------------------------------------ organisation handoff
+
+fn sealed_marker() -> (String, serde_json::Value) {
+    ("organisation_catalogue_v1".into(), serde_json::json!({}))
+}
+
+fn organisation_record(
+    id: &str,
+    state: TransactionState,
+    entry_state: EntryState,
+) -> RenameTransaction {
+    let mut entries = renames(2, entry_state);
+    for entry in &mut entries {
+        let (key, value) = sealed_marker();
+        entry.unknown.insert(key, value);
+    }
+    tx(id, state, entries)
+}
+
+#[test]
+fn a_modern_organisation_rename_opens_organisation_with_its_own_transaction_selected() {
+    let record = organisation_record("org-1", TransactionState::Applied, EntryState::Applied);
+    let entry = entry_of(&record, source_of(&record));
+    assert_eq!(entry.source, Source::CanonicalOrganisation);
+    assert_eq!(entry.handoff.label, "Open Organisation");
+    assert_eq!(entry.handoff.route, Route::Section(Section::Build));
+    assert!(entry.handoff.selects_organisation);
+    assert_eq!(entry.transaction_id, "org-1");
+    assert!(organisation_note(&entry).is_none());
+}
+
+#[test]
+fn dat_renames_and_look_alikes_are_never_treated_as_organisation_transactions() {
+    // A plain DAT rename carries no sealed catalogue marker.
+    let dat = tx(
+        "dat-1",
+        TransactionState::Applied,
+        renames(2, EntryState::Applied),
+    );
+    let entry = entry_of(&dat, source_of(&dat));
+    assert_eq!(
+        entry.handoff.route,
+        Route::Section(Section::DatVerification)
+    );
+    assert!(!entry.handoff.selects_organisation);
+
+    // Only some entries marked.
+    let mut partial =
+        organisation_record("mixed-1", TransactionState::Applied, EntryState::Applied);
+    partial.entries[1].unknown.clear();
+    assert!(
+        !entry_of(&partial, Source::CanonicalOrganisation)
+            .handoff
+            .selects_organisation
+    );
+
+    // Another workflow's record that copies the marker.
+    let mut other = organisation_record("other-1", TransactionState::Applied, EntryState::Applied);
+    other.unknown.insert(
+        "workflow".into(),
+        serde_json::json!("mame_merged_reconstruction"),
+    );
+    assert!(
+        !entry_of(&other, Source::CanonicalOrganisation)
+            .handoff
+            .selects_organisation
+    );
+
+    // A copy or link operation that copies the marker.
+    let mut copy = organisation_record("copy-1", TransactionState::Applied, EntryState::Applied);
+    copy.entries[0].operation = TransactionOperation::CreateCopy {
+        expected_source: PathBuf::from("/a"),
+        destination_root: PathBuf::from("/library"),
+    };
+    assert!(
+        !entry_of(&copy, Source::CanonicalOrganisation)
+            .handoff
+            .selects_organisation
+    );
+
+    // The marker never changes how another source is routed.
+    let quarantine = organisation_record("q-1", TransactionState::Applied, EntryState::Applied);
+    assert!(
+        !entry_of(&quarantine, Source::DuplicateQuarantine)
+            .handoff
+            .selects_organisation
+    );
+}
+
+#[test]
+fn a_legacy_unmarked_rename_is_explained_not_silently_unactionable() {
+    let legacy = tx(
+        "legacy-1",
+        TransactionState::Applied,
+        renames(2, EntryState::Applied),
+    );
+    let entry = entry_of(&legacy, Source::CanonicalOrganisation);
+    let note = organisation_note(&entry).expect("an explicit explanation");
+    assert!(note.contains("cannot be safely verified"), "{note}");
+    assert!(note.contains("not offered"), "{note}");
+    // Nothing about the handoff was weakened for it.
+    assert!(!entry.handoff.selects_organisation);
+    // Other sources never get the Organisation explanation.
+    assert!(organisation_note(&entry_of(&legacy, Source::DuplicateQuarantine)).is_none());
+}
+
+#[test]
+fn an_already_undone_organisation_shows_a_completed_status_and_no_roll_back() {
+    let record = organisation_record(
+        "org-undone",
+        TransactionState::RolledBack,
+        EntryState::RolledBack,
+    );
+    let entry = entry_of(&record, Source::CanonicalOrganisation);
+    assert!(matches!(entry.undo, UndoStatus::AlreadyUndone));
+    assert!(entry.handoff.selects_organisation);
+    let note = organisation_note(&entry).unwrap();
+    assert!(note.contains("already undone"), "{note}");
+    assert!(note.contains("no Roll back"), "{note}");
+}
+
 // -------------------------------------------------------------- advanced
 
 #[test]

@@ -108,6 +108,12 @@ pub struct RommBrowseCapabilities {
     pub game_detail: bool,
     pub text_search: bool,
     pub platform_filter: bool,
+    /// `GET /api/collections` is declared.
+    #[serde(default)]
+    pub collections: bool,
+    /// `GET /api/roms` declares a `collection_id` filter.
+    #[serde(default)]
+    pub collection_filter: bool,
     pub omit_files: bool,
     pub omit_char_index: bool,
     pub omit_filter_values: bool,
@@ -143,6 +149,16 @@ pub struct RommPlatformSummary {
     pub game_count: Option<u64>,
     pub system_identifiers: BTreeMap<String, String>,
     pub mapping: RommPlatformMapping,
+    pub provenance: RommBrowseProvenance,
+}
+
+/// A user collection as RomM reports it; read-only browse metadata.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RommCollectionSummary {
+    pub id: u64,
+    pub name: String,
+    pub description: Option<String>,
+    pub game_count: Option<u64>,
     pub provenance: RommBrowseProvenance,
 }
 
@@ -198,6 +214,7 @@ pub struct RommGameDetail {
 pub struct RommBrowseFilter {
     pub text: Option<String>,
     pub platform_id: Option<u64>,
+    pub collection_id: Option<u64>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -346,6 +363,54 @@ impl<'a, T: RommTransport> RommBrowser<'a, T> {
             return Err(RommBrowseError::UnsupportedCapability);
         }
         self.project_platforms(&self.read("/api/platforms", true, cancel)?)
+    }
+
+    pub fn collections(
+        &self,
+        cancel: Option<&AtomicBool>,
+    ) -> Result<Vec<RommCollectionSummary>, RommBrowseError> {
+        if !self.ready()?.capabilities.collections {
+            return Err(RommBrowseError::UnsupportedCapability);
+        }
+        self.project_collections(&self.read("/api/collections", true, cancel)?)
+    }
+
+    fn project_collections(
+        &self,
+        document: &Value,
+    ) -> Result<Vec<RommCollectionSummary>, RommBrowseError> {
+        let items = document
+            .as_array()
+            .ok_or(RommBrowseError::SchemaIncompatibility)?;
+        let mut ids = BTreeSet::new();
+        items
+            .iter()
+            .map(|value| {
+                let id = required_id(value, "id")?;
+                if !ids.insert(id) {
+                    return Err(RommBrowseError::SchemaIncompatibility);
+                }
+                let name = optional_string(value, "name")?
+                    .map(|name| name.trim().to_owned())
+                    .filter(|name| !name.is_empty())
+                    .ok_or(RommBrowseError::SchemaIncompatibility)?;
+                let game_count = match optional_u64(value, "rom_count")? {
+                    Some(count) => Some(count),
+                    None => value
+                        .get("rom_ids")
+                        .and_then(Value::as_array)
+                        .map(|ids| ids.len() as u64),
+                };
+                Ok(RommCollectionSummary {
+                    id,
+                    name,
+                    description: optional_string(value, "description")?
+                        .filter(|text| !text.trim().is_empty()),
+                    game_count,
+                    provenance: self.provenance("/api/collections"),
+                })
+            })
+            .collect()
     }
 
     pub fn games(
@@ -742,6 +807,8 @@ fn capabilities(document: &Value) -> Result<RommBrowseCapabilities, RommBrowseEr
         game_detail: get("/api/roms/{id}").is_some(),
         text_search: parameters.contains("search_term"),
         platform_filter: parameters.contains("platform_ids"),
+        collections: get("/api/collections").is_some(),
+        collection_filter: parameters.contains("collection_id"),
         omit_files: parameters.contains("with_files"),
         omit_char_index: parameters.contains("with_char_index"),
         omit_filter_values: parameters.contains("with_filter_values"),
@@ -805,6 +872,13 @@ fn page_path(
         }
         check_id(id)?;
         query.append_pair("platform_ids", &id.to_string());
+    }
+    if let Some(id) = filter.collection_id {
+        if !caps.collection_filter {
+            return Err(RommBrowseError::UnsupportedFilter);
+        }
+        check_id(id)?;
+        query.append_pair("collection_id", &id.to_string());
     }
     Ok(format!("/api/roms?{}", query.finish()))
 }

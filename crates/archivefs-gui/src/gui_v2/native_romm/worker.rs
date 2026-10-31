@@ -160,12 +160,25 @@ fn attempt_with_endpoints<T: RommTransport>(
                 platforms: vec![],
                 page: None,
                 platform_warning: false,
+                collections: vec![],
+                collection_warning: false,
                 token: source.token().clone(),
             });
         }
         let (platforms, platform_warning) = if info.capabilities.platforms {
             match browser.platforms(Some(cancel)) {
                 Ok(platforms) => (platforms, false),
+                Err(RommBrowseError::Cancelled) => {
+                    return Err(Problem::Backend(RommBrowseError::Cancelled));
+                }
+                Err(_) => (vec![], true),
+            }
+        } else {
+            (vec![], false)
+        };
+        let (collections, collection_warning) = if info.capabilities.collections {
+            match browser.collections(Some(cancel)) {
+                Ok(collections) => (collections, false),
                 Err(RommBrowseError::Cancelled) => {
                     return Err(Problem::Backend(RommBrowseError::Cancelled));
                 }
@@ -188,6 +201,8 @@ fn attempt_with_endpoints<T: RommTransport>(
             platforms,
             page,
             platform_warning,
+            collections,
+            collection_warning,
             token: source.token().clone(),
         });
     }

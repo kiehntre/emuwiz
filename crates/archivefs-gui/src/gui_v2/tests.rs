@@ -3065,7 +3065,7 @@ fn gui_v2_library_search_platform_filter_attention_and_empty_platform() {
     assert_eq!(
         library
             .filter(&Filter {
-                attention_only: true,
+                readiness: super::library::ReadinessFilter::NeedsAttention,
                 ..Default::default()
             })
             .len(),
@@ -4050,13 +4050,13 @@ fn gui_v2_platform_selection_clears_old_filters_and_counts_all_sources() {
     ]);
     let mut filter = Filter {
         search: "old search".into(),
-        attention_only: true,
+        readiness: super::library::ReadinessFilter::NeedsAttention,
         list: true,
         ..Default::default()
     };
     filter.select_platform("Arcade".into());
     assert!(filter.search.is_empty());
-    assert!(!filter.attention_only);
+    assert_eq!(filter.readiness, super::library::ReadinessFilter::All);
     assert!(filter.list);
     assert_eq!(library.filter(&filter).len(), library.platforms["Arcade"]);
     assert_eq!(library.filter(&filter).len(), 2);

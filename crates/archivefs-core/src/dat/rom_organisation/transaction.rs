@@ -37,6 +37,91 @@ use crate::dat::rename_apply::rollback::{RollbackOutcome, rollback_transaction};
 
 use crate::dat::rom_organisation::model::{OrganisationMode, OrganisationPlan, OrganisationStatus};
 
+/// Whether `transaction` was produced by the ROM Organisation page's rename or
+/// move workflow: the plain rename workflow, every entry a `RenameMove`, and
+/// every entry carrying the exact catalogue binding Apply seals before any
+/// mutation. Link, copy, replacement, MAME, repair and PBP records never
+/// qualify, so a foreign journal cannot be opened as an Organisation Undo.
+pub fn is_organisation_transaction(transaction: &RenameTransaction) -> bool {
+    !transaction.entries.is_empty()
+        && crate::dat::rename_apply::seal::workflow_of(transaction) == "rename_apply"
+        && transaction.entries.iter().all(|entry| {
+            matches!(entry.operation, TransactionOperation::RenameMove)
+                && entry.unknown.contains_key("organisation_catalogue_v1")
+        })
+}
+
+/// Loads, for an Undo selected from History, the exact journal of
+/// `history.transaction_id`, and returns it only when all of these hold: the
+/// journal is a plain file whose independent seal verifies; it records the
+/// same transaction id; it is an Organisation transaction; and it is
+/// byte-for-byte the record History holds (so a journal changed since History
+/// read it is refused). Read-only. Opening grants no authority by itself: the
+/// shared rollback re-verifies the seal and fences every write again.
+pub fn open_history_transaction_for_undo(
+    journal_dir: &Path,
+    history: &RenameTransaction,
+) -> Result<RenameTransaction, String> {
+    use crate::dat::rename_apply::{journal_path, read_journal, seal};
+    let id = history.transaction_id.as_str();
+    let path = journal_path(journal_dir, id)
+        .ok_or_else(|| format!("{id} is not a valid transaction id."))?;
+    // Compact-format records are written and undone only through their own
+    // recovery authority, never the seal store this route verifies against.
+    #[cfg(target_os = "linux")]
+    if crate::dat::rename_apply::uses_compact_recovery_format(journal_dir, id) {
+        return Err(format!(
+            "{id} uses, or cannot be shown to avoid, the compacted recovery format, which is undone only through its own recovery route. It was not opened for Organisation Undo. Nothing was changed."
+        ));
+    }
+    let check = seal::verify(journal_dir, id);
+    if !check.trusted() {
+        return Err(check.refusal().unwrap_or_else(|| {
+            format!("The journal for {id} could not be verified, so it was not opened for Undo.")
+        }));
+    }
+    let journal = read_journal(&path)
+        .map_err(|error| format!("The journal for {id} could not be read: {error}"))?;
+    if journal.transaction_id != id {
+        return Err(format!(
+            "The journal found for {id} records {} instead.",
+            journal.transaction_id
+        ));
+    }
+    if !is_organisation_transaction(&journal) {
+        return Err(format!(
+            "{id} is not a ROM Organisation rename or move, so it cannot be undone from this page."
+        ));
+    }
+    if seal::digest(&journal) != seal::digest(history) {
+        return Err(format!(
+            "The journal for {id} no longer matches the record History holds. It was not opened for Undo."
+        ));
+    }
+    Ok(journal)
+}
+
+/// Why Undo would be misleading for `transaction`, or `None` when it still
+/// has something to reverse or reconcile.
+pub fn undo_blocker(transaction: &RenameTransaction) -> Option<String> {
+    // Undo also removes empty platform directories this transaction created.
+    let actionable = transaction.applied_count() > 0
+        || !transaction.created_directories.is_empty()
+        || transaction
+            .entries
+            .iter()
+            .any(TransactionEntry::blocks_full_rollback);
+    if transaction.state == TransactionState::RolledBack {
+        return Some(if transaction.is_fully_rolled_back() {
+            "This organisation was already undone. There is nothing left to undo.".into()
+        } else {
+            "The journal says this was rolled back, but an entry is recorded otherwise. Undo would change nothing; review the journal before any further action.".into()
+        });
+    }
+    (!actionable)
+        .then(|| "This transaction records no applied changes, so there is nothing to undo.".into())
+}
+
 /// Builds the transaction for the approved Suggested entries of a plan.
 ///
 /// Read-only and side-effect free: it captures each source's identity and
