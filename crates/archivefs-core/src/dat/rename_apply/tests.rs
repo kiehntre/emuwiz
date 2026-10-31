@@ -4866,3 +4866,87 @@ fn a_missing_destination_root_is_an_outage_not_an_invalid_record() {
     let done = rollback_transaction(&mut m.tx, &m.journal, &no_cancel()).unwrap();
     assert_eq!(done.result, RollbackResult::FullyRolledBack);
 }
+
+#[cfg(unix)]
+fn interrupted_inside_quarantine() -> Mixed {
+    let mut m = applied_mixed();
+    super::dirsync::set_unlink_hook(Some(Box::new(|_| {
+        Err(std::io::Error::other("simulated crash"))
+    })));
+    let _ = rollback_transaction(&mut m.tx, &m.journal, &no_cancel()).unwrap();
+    super::dirsync::set_unlink_hook(None);
+    assert_eq!(m.tx.entries[2].state, EntryState::RollingBack);
+    m
+}
+
+#[cfg(unix)]
+#[test]
+fn an_offline_folder_never_turns_a_retained_quarantine_into_a_recorded_rollback() {
+    let mut m = interrupted_inside_quarantine();
+    let record = m.tx.entries[2].unknown["emuwiz_hl_quarantine_v1"].clone();
+    let away = m.hard.with_extension("away");
+    std::fs::rename(&m.hard, &away).unwrap();
+    for _ in 0..2 {
+        let outcome = rollback_transaction(&mut m.tx, &m.journal, &no_cancel()).unwrap();
+        assert!(!matches!(outcome.result, RollbackResult::FullyRolledBack));
+        assert_ne!(m.tx.entries[2].state, EntryState::RolledBack);
+        assert_ne!(m.tx.state, TransactionState::RolledBack);
+        assert_eq!(m.tx.entries[2].unknown["emuwiz_hl_quarantine_v1"], record);
+    }
+    std::fs::rename(&away, &m.hard).unwrap();
+    let done = rollback_transaction(&mut m.tx, &m.journal, &no_cancel()).unwrap();
+    assert_eq!(done.result, RollbackResult::FullyRolledBack);
+    assert!(hidden_leftovers(m.roms.parent().unwrap()).is_empty());
+}
+
+#[cfg(unix)]
+#[test]
+fn an_empty_mount_point_in_the_folders_place_is_not_taken_for_a_finished_removal() {
+    let mut m = interrupted_inside_quarantine();
+    let record = m.tx.entries[2].unknown["emuwiz_hl_quarantine_v1"].clone();
+    let away = m.hard.with_extension("away");
+    std::fs::rename(&m.hard, &away).unwrap();
+    std::fs::create_dir(&m.hard).unwrap(); // the unmounted mount point
+    let outcome = rollback_transaction(&mut m.tx, &m.journal, &no_cancel()).unwrap();
+    assert!(!matches!(outcome.result, RollbackResult::FullyRolledBack));
+    assert_ne!(m.tx.entries[2].state, EntryState::RolledBack);
+    assert_ne!(m.tx.state, TransactionState::RolledBack);
+    assert_eq!(m.tx.entries[2].unknown["emuwiz_hl_quarantine_v1"], record);
+    assert!(
+        tree_names(&m.hard).is_empty(),
+        "the stand-in was not touched"
+    );
+    std::fs::remove_dir(&m.hard).unwrap();
+    std::fs::rename(&away, &m.hard).unwrap();
+    let done = rollback_transaction(&mut m.tx, &m.journal, &no_cancel()).unwrap();
+    assert_eq!(done.result, RollbackResult::FullyRolledBack);
+}
+
+#[cfg(unix)]
+#[test]
+fn only_the_exact_quarantine_record_shape_is_accepted() {
+    let m = interrupted_inside_quarantine();
+    let mut entry = m.tx.entries[2].clone();
+    assert!(super::dirsync::hardlink_quarantine_names(&entry).is_some());
+    for (dir, file) in [
+        ("hard", "0".repeat(32)),
+        (".emuwiz-undo-q-short", "0".repeat(32)),
+        (
+            ".emuwiz-undo-q-00000000000000000000000000000000",
+            "x".repeat(32),
+        ),
+        (
+            ".emuwiz-undo-q-../../../etc00000000000000000",
+            "0".repeat(32),
+        ),
+    ] {
+        entry.unknown.insert(
+            "emuwiz_hl_quarantine_v1".into(),
+            serde_json::json!({"dir": dir, "file": file}),
+        );
+        assert!(
+            super::dirsync::hardlink_quarantine_names(&entry).is_none(),
+            "{dir}"
+        );
+    }
+}

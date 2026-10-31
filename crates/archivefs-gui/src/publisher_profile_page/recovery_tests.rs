@@ -1197,3 +1197,29 @@ fn hard_link_undo_leaves_no_hidden_files_and_the_folder_can_be_cleaned_up() {
         assert_eq!(std::fs::metadata(source).unwrap().nlink(), 1);
     }
 }
+
+#[test]
+fn abandoning_an_in_flight_hard_link_names_its_quarantine() {
+    let export = exported_split(PublisherLinkMode::Hardlink);
+    let mut state = restarted(&export.journal);
+    let mut record = state.recovery.exports[0].transaction.clone();
+    let dir = ".emuwiz-undo-q-00000000000000000000000000000000";
+    record.entries[0].state = EntryState::RollingBack;
+    record.state = TransactionState::RollingBack;
+    record.entries[0].unknown.insert(
+        "emuwiz_hl_quarantine_v1".into(),
+        serde_json::json!({"dir": dir, "file": "1".repeat(32)}),
+    );
+    journal::write_journal(&export.journal, &record).unwrap();
+    take_away(export.sources[0].parent().unwrap());
+    state.load_recoverable_exports();
+    abandon_listed(&mut state, "ABANDON 1 LINKS");
+    let said = message(&state);
+    assert!(said.contains("quarantine"), "{said}");
+    assert!(said.contains(dir), "{said}");
+    let saved = journal_record(&export);
+    assert_eq!(
+        saved.entries[0].unknown["emuwiz_undo_abandoned_v1"]["quarantine"]["dir"],
+        dir
+    );
+}

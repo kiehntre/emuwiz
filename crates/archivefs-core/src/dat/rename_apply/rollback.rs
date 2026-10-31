@@ -369,18 +369,30 @@ fn rollback_transaction_inner(
         if matches!(
             transaction.entries[index].operation,
             TransactionOperation::CreateHardlink { .. }
-        ) && !super::dirsync::hardlink_quarantine_present(&transaction.entries[index])
-        {
-            match super::dirsync::new_hardlink_quarantine_record() {
-                Ok(record) => {
-                    transaction.entries[index]
-                        .unknown
-                        .insert(super::dirsync::HARDLINK_QUARANTINE_KEY.into(), record);
-                }
-                Err(error) => {
-                    return Err(format!(
-                        "no random name could be made for the Undo quarantine: {error}"
-                    ));
+        ) {
+            use super::dirsync::{
+                QuarantineState, hardlink_quarantine_names, hardlink_quarantine_state,
+            };
+            let entry = &transaction.entries[index];
+            // A record is only replaced when its folder is proved and holds no
+            // quarantine; an unreachable or unrecognised folder keeps it.
+            let need_new = hardlink_quarantine_names(entry).is_none()
+                || hardlink_quarantine_state(entry) == QuarantineState::Absent;
+            if need_new {
+                match super::dirsync::new_hardlink_quarantine_record(&entry.destination_path) {
+                    Ok(record) => {
+                        transaction.entries[index]
+                            .unknown
+                            .insert(super::dirsync::HARDLINK_QUARANTINE_KEY.into(), record);
+                    }
+                    // The folder cannot be reached: the removal reports an
+                    // outage below and the entry stays retryable.
+                    Err(error) if is_unavailable(&error) => {}
+                    Err(error) => {
+                        return Err(format!(
+                            "no quarantine record could be made for the hard link Undo: {error}"
+                        ));
+                    }
                 }
             }
         }
@@ -993,6 +1005,7 @@ pub fn abandon_unavailable_links(
                 "at_unix": now,
                 "previous_state": previous_state,
                 "previous_reason": previous_reason,
+                "quarantine": entry.unknown.get("emuwiz_hl_quarantine_v1"),
             }),
         );
         entry.failure_reason = Some(format!(
@@ -1146,9 +1159,15 @@ fn rollback_mutation(
                 })?;
             let (quarantine_dir, quarantine_file) =
                 super::dirsync::hardlink_quarantine_names(entry).ok_or_else(|| {
-                    "rollback refused: the journal has no quarantine record for this hard link"
-                        .to_string()
+                    format!(
+                        "{UNAVAILABLE_MARK}rollback refused: the journal has no usable quarantine record for this hard link yet; nothing was changed"
+                    )
                 })?;
+            if super::dirsync::hardlink_quarantine_folder_id(entry) != Some(dirs.id()) {
+                return Err(format!(
+                    "{UNAVAILABLE_MARK}rollback refused: the destination folder is not the one recorded for this hard link; nothing was changed"
+                ));
+            }
             return dirs
                 .remove(&entry.identity, &quarantine_dir, &quarantine_file)
                 .map_err(|error| match error {

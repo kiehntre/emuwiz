@@ -56,42 +56,97 @@ pub(crate) fn link_undo_tombstone_path(
 #[cfg(unix)]
 pub(crate) const HARDLINK_QUARANTINE_KEY: &str = "emuwiz_hl_quarantine_v1";
 
-/// The quarantine folder and file names an entry's journal record names.
+/// The quarantine folder and file names an entry's journal record names. Only
+/// the exact shape this code writes is accepted.
 #[cfg(unix)]
 pub(crate) fn hardlink_quarantine_names(
     entry: &super::model::TransactionEntry,
 ) -> Option<(std::ffi::OsString, std::ffi::OsString)> {
     let record = entry.unknown.get(HARDLINK_QUARANTINE_KEY)?;
-    let valid = |name: &str| !name.is_empty() && !name.contains('/') && name != "." && name != "..";
-    let dir = record.get("dir")?.as_str().filter(|n| valid(n))?;
-    let file = record.get("file")?.as_str().filter(|n| valid(n))?;
-    Some((dir.into(), file.into()))
+    let hex =
+        |text: &str, len: usize| text.len() == len && text.bytes().all(|b| b.is_ascii_hexdigit());
+    let dir = record.get("dir")?.as_str()?;
+    let file = record.get("file")?.as_str()?;
+    (dir.strip_prefix(".emuwiz-undo-q-")
+        .is_some_and(|rest| hex(rest, 32))
+        && hex(file, 32))
+    .then(|| (dir.into(), file.into()))
 }
 
-/// A fresh, random quarantine record. Randomness keeps the names unguessable to
-/// other processes; the record makes the attempt recoverable after a crash.
+/// The destination folder (device, inode) sealed into the quarantine record.
 #[cfg(unix)]
-pub(crate) fn new_hardlink_quarantine_record() -> io::Result<serde_json::Value> {
+pub(crate) fn hardlink_quarantine_folder_id(
+    entry: &super::model::TransactionEntry,
+) -> Option<(u64, u64)> {
+    let folder = entry.unknown.get(HARDLINK_QUARANTINE_KEY)?.get("folder")?;
+    Some((folder.get("dev")?.as_u64()?, folder.get("ino")?.as_u64()?))
+}
+
+/// A fresh, random quarantine record that also seals the identity of the folder
+/// it will live in, so a later pass can tell that folder from an empty mount
+/// point or a replacement. Randomness keeps the names unguessable to other
+/// processes; the record makes the attempt recoverable after a crash.
+#[cfg(unix)]
+pub(crate) fn new_hardlink_quarantine_record(destination: &Path) -> io::Result<serde_json::Value> {
     use std::io::Read;
+    use std::os::unix::fs::MetadataExt;
+    let parent = destination
+        .parent()
+        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "no parent directory"))?;
+    let folder = std::fs::metadata(std::fs::canonicalize(parent)?)?;
     let mut bytes = [0_u8; 32];
     std::fs::File::open("/dev/urandom")?.read_exact(&mut bytes)?;
     let hex = |slice: &[u8]| slice.iter().map(|b| format!("{b:02x}")).collect::<String>();
     Ok(serde_json::json!({
         "dir": format!(".emuwiz-undo-q-{}", hex(&bytes[..16])),
         "file": hex(&bytes[16..]),
+        "folder": {"dev": folder.dev(), "ino": folder.ino()},
     }))
+}
+
+/// What can be proved about an entry's recorded quarantine right now.
+#[cfg(unix)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum QuarantineState {
+    /// No record, or the recorded folder is provably the same one and holds no
+    /// such quarantine.
+    Absent,
+    /// The recorded quarantine exists beside the link.
+    Present,
+    /// The folder is unreachable, is not the recorded folder (an empty mount
+    /// point, a replacement), or cannot be read: absence proves nothing.
+    Unknown,
+}
+
+#[cfg(unix)]
+pub(crate) fn hardlink_quarantine_state(entry: &super::model::TransactionEntry) -> QuarantineState {
+    use std::os::unix::fs::MetadataExt;
+    let Some((dir, _)) = hardlink_quarantine_names(entry) else {
+        return QuarantineState::Absent;
+    };
+    let Some(parent) = entry.destination_path.parent() else {
+        return QuarantineState::Unknown;
+    };
+    let Ok(real) = std::fs::canonicalize(parent) else {
+        return QuarantineState::Unknown;
+    };
+    let Ok(folder) = std::fs::metadata(&real) else {
+        return QuarantineState::Unknown;
+    };
+    if hardlink_quarantine_folder_id(entry) != Some((folder.dev(), folder.ino())) {
+        return QuarantineState::Unknown;
+    }
+    match std::fs::symlink_metadata(real.join(dir)) {
+        Ok(_) => QuarantineState::Present,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => QuarantineState::Absent,
+        Err(_) => QuarantineState::Unknown,
+    }
 }
 
 /// Whether the quarantine an entry's record names still exists beside its link.
 #[cfg(unix)]
 pub(crate) fn hardlink_quarantine_present(entry: &super::model::TransactionEntry) -> bool {
-    let (Some((dir, _)), Some(parent)) = (
-        hardlink_quarantine_names(entry),
-        entry.destination_path.parent(),
-    ) else {
-        return false;
-    };
-    std::fs::symlink_metadata(parent.join(dir)).is_ok()
+    hardlink_quarantine_state(entry) == QuarantineState::Present
 }
 
 /// How an Undo of a hard link ended short of removal.
@@ -742,8 +797,17 @@ pub(crate) fn remove_hardlink_in(
         } < 0
         {
             let error = io::Error::last_os_error();
+            let unsupported = matches!(
+                error.raw_os_error(),
+                Some(libc::EINVAL | libc::ENOSYS | libc::EOPNOTSUPP)
+            );
+            let what = if unsupported {
+                "this filesystem does not support the no-replace rename that safe hard link removal needs, so nothing was changed; remove this export's links by hand".to_string()
+            } else {
+                format!("the link could not be moved: {error}")
+            };
             return match remove_quarantine() {
-                Ok(()) => Err(Refused(format!("the link could not be moved: {error}"))),
+                Ok(()) => Err(Refused(what)),
                 Err(_) => Err(Retained(format!(
                     "the link could not be moved ({error}) and the empty quarantine folder remains"
                 ))),
@@ -853,6 +917,10 @@ impl HardlinkDir {
         };
         this.verify()?;
         Ok(this)
+    }
+
+    pub(crate) fn id(&self) -> (u64, u64) {
+        self.id
     }
 
     fn verify(&self) -> io::Result<()> {

@@ -177,14 +177,40 @@ impl PublisherProfilePageState {
         };
         let id = export.transaction.transaction_id.clone();
         let message = match abandon_publisher_links(&directory, &export.transaction) {
-            Ok(record) => format!(
-                "{} link(s) of {id} were abandoned at your request. They were left in place, not undone and not deleted, and the decision is recorded in the journal. The export is NOT rolled back.",
-                record
+            Ok(record) => {
+                let abandoned = |entry: &&archivefs_core::dat::rename_apply::TransactionEntry| {
+                    entry.unknown.contains_key("emuwiz_undo_abandoned_v1")
+                };
+                let count = record.entries.iter().filter(abandoned).count();
+                let quarantined: Vec<String> = record
                     .entries
                     .iter()
-                    .filter(|entry| entry.unknown.contains_key("emuwiz_undo_abandoned_v1"))
-                    .count()
-            ),
+                    .filter(abandoned)
+                    .filter_map(|entry| {
+                        let dir = entry
+                            .unknown
+                            .get("emuwiz_hl_quarantine_v1")?
+                            .get("dir")?
+                            .as_str()?;
+                        Some(format!(
+                            "{}/{dir}",
+                            entry.destination_path.parent()?.display()
+                        ))
+                    })
+                    .collect();
+                let quarantine_note = if quarantined.is_empty() {
+                    String::new()
+                } else {
+                    format!(
+                        " {} of them may already sit in a private, unlisted quarantine folder ({}); it is hidden and has no read permission, so grant yourself read access to look inside.",
+                        quarantined.len(),
+                        quarantined.join(", ")
+                    )
+                };
+                format!(
+                    "{count} link(s) of {id} were abandoned at your request. They were left in place, not undone and not deleted, and the decision is recorded in the journal. The export is NOT rolled back.{quarantine_note}"
+                )
+            }
             Err(reason) => format!("{reason} Nothing was changed for {id}."),
         };
         self.recovery.abandon_selected = None;
