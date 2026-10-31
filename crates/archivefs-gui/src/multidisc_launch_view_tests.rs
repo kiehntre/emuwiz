@@ -207,7 +207,19 @@ fn unnumbered_media_are_not_reported_as_missing_numbers() {
     set.state = MediaSetState::IncompleteSet;
     let g = guidance(&set, &paths[0], None);
     assert!(g.missing_media.is_empty(), "{g:?}");
+    assert!(!g.conflicts.iter().any(|c| c.contains("missing")), "{g:?}");
     assert_eq!(g.headline, "2-disc game · order not verified");
+}
+
+#[test]
+fn a_bonus_disc_does_not_hide_missing_game_discs() {
+    let g = named_guidance(
+        "bonus",
+        &["Game (Disc 1 of 3).iso", "Game (Bonus Disc).iso"],
+    )
+    .unwrap();
+    assert_eq!(g.headline, "3-disc game · order not verified");
+    assert_eq!(g.missing_media, ["Disc 2 of 3", "Disc 3 of 3"]);
 }
 
 #[test]

@@ -7,7 +7,7 @@ use archivefs_core::launch::multidisc_launch::{
     MultiDiscLaunch, MultiDiscPlaylist, plan_multidisc_launch,
 };
 use archivefs_core::launch::{LaunchCandidate, LaunchTarget, project_media_set_for_launch};
-use archivefs_core::media_set::{MediaFamily, MediaSet, MediaSetState, OrdinalUnit};
+use archivefs_core::media_set::{MediaFamily, MediaRole, MediaSet, MediaSetState, OrdinalUnit};
 use eframe::egui;
 use std::collections::BTreeMap;
 use std::ffi::OsString;
@@ -187,11 +187,9 @@ fn lone_member_of_larger_set(set: &MediaSet) -> bool {
             .iter()
             .flat_map(|r| &r.record.evidence)
             .any(|evidence| {
-                evidence.provenance.trusted()
-                    || evidence
-                        .ordinal
-                        .as_ref()
-                        .is_some_and(|ordinal| ordinal.unit != OrdinalUnit::Medium)
+                evidence.ordinal.as_ref().is_some_and(|ordinal| {
+                    evidence.provenance.trusted() || ordinal.unit != OrdinalUnit::Medium
+                })
             })
 }
 
@@ -525,17 +523,28 @@ pub(crate) fn guidance(
             .collect(),
         _ => Vec::new(),
     };
-    // An unnumbered member may be the very medium a gap would name, so no
-    // number is called missing until every member has one.
-    let gaps: &[_] = if set.members.iter().all(|m| m.ordinal.is_some()) {
+    // An unnumbered game medium may be the very one a gap would name, so no
+    // number is called missing until each has one. Extras are never numbered.
+    let numbered = set.members.iter().all(|member| {
+        member.ordinal.is_some()
+            || matches!(
+                member.role,
+                MediaRole::BonusMedia
+                    | MediaRole::ExtrasMedia
+                    | MediaRole::SaveMedia
+                    | MediaRole::DemoMedia
+                    | MediaRole::AudioMedia
+            )
+    });
+    let gaps: &[_] = if numbered {
         &projection.missing_media
     } else {
         &[]
     };
-    let total = gaps
-        .iter()
-        .find_map(|missing| missing.expected_count)
-        .map_or(set.members.len(), usize::from);
+    let total = set
+        .expected_count
+        .as_ref()
+        .map_or(set.members.len(), |(count, _)| usize::from(count.count));
     let missing_media: Vec<String> = gaps
         .iter()
         .map(|missing| format!("{noun} {} of {total}", missing.number))
@@ -553,7 +562,7 @@ pub(crate) fn guidance(
         gap[..1].make_ascii_uppercase();
         conflicts.insert(0, gap);
     }
-    if !order_verified && conflicts.is_empty() && missing_media.is_empty() {
+    if !order_verified && conflicts.is_empty() && projection.missing_media.is_empty() {
         conflicts.push(projection.explanation.clone());
     }
     conflicts.sort();
