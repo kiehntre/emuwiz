@@ -748,28 +748,35 @@ pub fn xenia_firmware_readiness() -> FirmwareReadiness {
 /// Projects a RetroArch core's declared, non-optional `firmwareN_*` entries
 /// onto [`FirmwareReadiness`]. This performs no I/O: discovery already
 /// probed each entry read-only and no-follow under the profile's system
-/// directory and recorded a [`FirmwarePresence`]. Any `Missing` required
-/// entry is `Missing`; any entry EmuWiz cannot judge (or a core whose
-/// `.info` could not be read) is `Unknown`; only when every required entry
-/// is present does the result reach `PresentUnverified`. Never `Verified`:
-/// file contents are not hashed.
+/// directory and recorded a [`FirmwarePresence`].
+///
+/// `.info` metadata marks each entry only required or optional; it does not
+/// say which required files are alternatives (e.g. Mednafen PSX lists the
+/// JP, US and EU BIOS all as required, though the core uses the one matching
+/// the disc). EmuWiz does not invent such groups, so:
+/// - every required entry `Missing` is `Missing` (nothing usable exists);
+/// - some `Missing` alongside any present or unjudgeable entry is `Unknown`
+///   (it could be an unused regional alternative - not claimed either way);
+/// - all required entries present is `PresentUnverified`; any other
+///   unjudgeable entry, or an unreadable `.info`, is `Unknown`.
+/// Never `Verified`: file contents are not hashed.
 pub fn retroarch_core_firmware_readiness(info: &CoreInfoFinding) -> FirmwareReadiness {
     let CoreInfoFinding::Found { firmware, .. } = info else {
         return FirmwareReadiness::Unknown;
     };
-    let mut required = firmware.iter().filter(|entry| !entry.optional).peekable();
-    if required.peek().is_none() {
-        return FirmwareReadiness::NotRequired;
-    }
-    let mut all_present = true;
-    for entry in required {
-        match entry.presence {
-            FirmwarePresence::Missing => return FirmwareReadiness::Missing,
-            FirmwarePresence::Unknown => all_present = false,
-            FirmwarePresence::PresentUnverified => {}
-        }
-    }
-    if all_present {
+    let required: Vec<FirmwarePresence> = firmware
+        .iter()
+        .filter(|entry| !entry.optional)
+        .map(|entry| entry.presence)
+        .collect();
+    if required.is_empty() {
+        FirmwareReadiness::NotRequired
+    } else if required.iter().all(|p| *p == FirmwarePresence::Missing) {
+        FirmwareReadiness::Missing
+    } else if required
+        .iter()
+        .all(|p| *p == FirmwarePresence::PresentUnverified)
+    {
         FirmwareReadiness::PresentUnverified
     } else {
         FirmwareReadiness::Unknown
@@ -808,12 +815,18 @@ mod tests {
     #[test]
     fn retroarch_core_firmware_projection() {
         use FirmwarePresence::*;
-        let cases: [(&[(bool, FirmwarePresence)], FirmwareReadiness); 7] = [
+        let cases: [(&[(bool, FirmwarePresence)], FirmwareReadiness); 8] = [
             (&[], FirmwareReadiness::NotRequired),
             (&[(true, Missing)], FirmwareReadiness::NotRequired),
             (&[(false, Missing)], FirmwareReadiness::Missing),
+            // Mednafen PSX-style: JP/US/EU all "required"; only one installed.
+            // Alternatives are not invented, so this is Unknown, not Missing.
             (
                 &[(false, PresentUnverified), (false, Missing)],
+                FirmwareReadiness::Unknown,
+            ),
+            (
+                &[(false, Missing), (false, Missing), (false, Missing)],
                 FirmwareReadiness::Missing,
             ),
             (
