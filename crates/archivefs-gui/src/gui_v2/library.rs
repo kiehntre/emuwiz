@@ -402,7 +402,7 @@ impl Library {
     pub fn filter(&self, filter: &Filter) -> Vec<usize> {
         let needle = filter.search.trim().to_lowercase();
         let matches = |game: &Game| {
-            (!filter.attention_only || game.attention)
+            filter.admits_before_check(game)
                 && (!filter.unverified_only || !game.identified)
                 && (needle.is_empty() || game.search.contains(&needle))
         };
@@ -429,9 +429,42 @@ impl Library {
 pub(super) struct Filter {
     pub search: String,
     pub platform: String,
-    pub attention_only: bool,
+    pub readiness: ReadinessFilter,
+    /// Blue's Browse & Play also folds finished launch checks into the
+    /// readiness views; the classic Library does not.
+    #[serde(skip)]
+    pub cache_aware: bool,
     pub unverified_only: bool,
     pub list: bool,
+}
+
+/// The Library's readiness views. Ready is answered only from checks that
+/// have already finished; nothing is planned in bulk to fill it in.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub(super) enum ReadinessFilter {
+    #[default]
+    All,
+    Ready,
+    NeedsAttention,
+    NotChecked,
+}
+
+impl ReadinessFilter {
+    pub const ALL: [Self; 4] = [
+        Self::All,
+        Self::Ready,
+        Self::NeedsAttention,
+        Self::NotChecked,
+    ];
+
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::All => "All",
+            Self::Ready => "Ready",
+            Self::NeedsAttention => "Needs attention",
+            Self::NotChecked => "Not checked",
+        }
+    }
 }
 
 impl Filter {
@@ -439,8 +472,116 @@ impl Filter {
     pub fn select_platform(&mut self, platform: String) {
         self.platform = platform;
         self.search.clear();
-        self.attention_only = false;
+        self.readiness = ReadinessFilter::All;
         self.unverified_only = false;
+    }
+
+    /// Whether the catalogue-only part of the filter keeps `game`. Views that
+    /// read the readiness cache are a superset here; `matches` is final.
+    fn admits_before_check(&self, game: &Game) -> bool {
+        match self.readiness {
+            ReadinessFilter::All => true,
+            ReadinessFilter::NeedsAttention => game.attention || self.cache_aware,
+            ReadinessFilter::Ready | ReadinessFilter::NotChecked => !game.attention,
+        }
+    }
+
+    /// True when the final list also depends on the readiness cache.
+    pub fn uses_cache(&self) -> bool {
+        match self.readiness {
+            ReadinessFilter::All => false,
+            ReadinessFilter::NeedsAttention => self.cache_aware,
+            ReadinessFilter::Ready | ReadinessFilter::NotChecked => true,
+        }
+    }
+}
+
+/// What a finished launch check said. Unknown is never stored: a game with no
+/// entry is Not checked.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) enum CheckedReadiness {
+    Ready,
+    NotReady,
+}
+
+/// The file facts a result was taken against. A result whose facts no longer
+/// match the catalogue row describes an older file and is ignored.
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct Fingerprint {
+    size: Option<u64>,
+    modified: Option<i64>,
+    health: String,
+}
+
+impl Fingerprint {
+    fn of(game: &Game) -> Self {
+        Self {
+            size: game.archive.size_bytes,
+            modified: game.archive.modified_time_unix_seconds,
+            health: game.archive.last_known_health.clone(),
+        }
+    }
+}
+
+/// Finished per-game launch-check results, kept while browsing.
+#[derive(Clone, Debug, Default)]
+pub(super) struct ReadinessCache {
+    entries: std::collections::HashMap<i64, (CheckedReadiness, Fingerprint)>,
+    version: u64,
+}
+
+impl ReadinessCache {
+    /// Record a finished answer for `game`, or forget it with `None` when the
+    /// latest answer is unknown (checking, stale, partial).
+    pub fn record(&mut self, game: &Game, result: Option<CheckedReadiness>) {
+        let id = game.archive.id;
+        let entry = result.map(|result| (result, Fingerprint::of(game)));
+        if self.entries.get(&id) == entry.as_ref() {
+            return;
+        }
+        match entry {
+            Some(entry) => self.entries.insert(id, entry),
+            None => self.entries.remove(&id),
+        };
+        self.version += 1;
+    }
+    pub fn clear(&mut self) {
+        if !self.entries.is_empty() {
+            self.entries.clear();
+            self.version += 1;
+        }
+    }
+    /// The stored answer, only while it still matches the catalogue row.
+    pub fn get(&self, game: &Game) -> Option<CheckedReadiness> {
+        self.entries
+            .get(&game.archive.id)
+            .filter(|(_, print)| *print == Fingerprint::of(game))
+            .map(|(result, _)| *result)
+    }
+    pub fn version(&self) -> u64 {
+        self.version
+    }
+    pub fn len(&self) -> usize {
+        self.entries.len()
+    }
+}
+
+/// The four-way readiness view. A catalogue problem is always Needs
+/// attention. Otherwise a cached Ready is Ready, a cached Not ready is Needs
+/// attention, and a game with no current answer is Not checked.
+pub(super) fn matches(game: &Game, filter: &Filter, cache: &ReadinessCache) -> bool {
+    let checked = if game.attention {
+        None
+    } else {
+        cache.get(game)
+    };
+    match filter.readiness {
+        ReadinessFilter::All => true,
+        ReadinessFilter::NeedsAttention => {
+            game.attention || (filter.cache_aware && checked == Some(CheckedReadiness::NotReady))
+        }
+        ReadinessFilter::Ready => checked == Some(CheckedReadiness::Ready),
+        ReadinessFilter::NotChecked => !game.attention && checked.is_none(),
     }
 }
 
@@ -491,6 +632,142 @@ mod tests {
             game.status(),
             "Platform recognised · Game not yet identified"
         );
+    }
+
+    fn game(id: i64, health: &str) -> Game {
+        Game::from_archive(PersistedArchive {
+            id,
+            source_folder_id: 1,
+            relative_path: format!("{id}.zip").into(),
+            absolute_path: format!("/fixture/{id}.zip").into(),
+            archive_kind: "zip".into(),
+            display_name: format!("Game {id}"),
+            normalized_name: format!("game {id}"),
+            size_bytes: Some(1),
+            modified_time_unix_seconds: Some(1),
+            platform: Some("SNES".into()),
+            platform_source: Some("fixture".into()),
+            last_known_health: health.into(),
+            last_seen_at: "fixture".into(),
+            last_verified_missing_at: None,
+            identity_report: None,
+        })
+    }
+
+    fn filter(readiness: super::ReadinessFilter) -> super::Filter {
+        super::Filter {
+            readiness,
+            cache_aware: true,
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn readiness_views_partition_games_by_finished_results() {
+        use super::{CheckedReadiness as C, ReadinessCache, ReadinessFilter as F, matches};
+        let games = [
+            game(1, "ok"),
+            game(2, "ok"),
+            game(3, "missing"),
+            game(4, "ok"),
+            game(5, "ok"),
+        ];
+        let mut cache = ReadinessCache::default();
+        cache.record(&games[0], Some(C::Ready));
+        // A cached Ready never hides a catalogue problem.
+        cache.record(&games[2], Some(C::Ready));
+        cache.record(&games[3], Some(C::NotReady));
+        let hits = |readiness| -> Vec<i64> {
+            games
+                .iter()
+                .filter(|g| matches(g, &filter(readiness), &cache))
+                .map(|g| g.archive.id)
+                .collect()
+        };
+        assert_eq!(hits(F::All), [1, 2, 3, 4, 5]);
+        assert_eq!(hits(F::Ready), [1]);
+        assert_eq!(hits(F::NeedsAttention), [3, 4]);
+        assert_eq!(hits(F::NotChecked), [2, 5]);
+        for g in &games {
+            let n = [F::Ready, F::NeedsAttention, F::NotChecked]
+                .into_iter()
+                .filter(|f| matches(g, &filter(*f), &cache))
+                .count();
+            assert_eq!(n, 1, "game {}", g.archive.id);
+        }
+    }
+
+    #[test]
+    fn selection_switching_keeps_earlier_results_and_unknown_forgets() {
+        use super::{CheckedReadiness as C, ReadinessCache};
+        let (a, b) = (game(1, "ok"), game(2, "ok"));
+        let mut cache = ReadinessCache::default();
+        cache.record(&a, Some(C::Ready));
+        cache.record(&b, Some(C::NotReady));
+        assert_eq!(cache.get(&a), Some(C::Ready));
+        assert_eq!(cache.get(&b), Some(C::NotReady));
+        let version = cache.version();
+        cache.record(&a, Some(C::Ready));
+        assert_eq!(cache.version(), version, "same answer is not a change");
+        // The latest answer is unknown (checking/stale): never a stale success.
+        cache.record(&a, None);
+        assert_eq!(cache.get(&a), None);
+        assert_eq!(cache.get(&b), Some(C::NotReady));
+    }
+
+    #[test]
+    fn a_changed_file_invalidates_its_cached_result() {
+        use super::{CheckedReadiness as C, ReadinessCache};
+        let mut g = game(1, "ok");
+        let mut cache = ReadinessCache::default();
+        cache.record(&g, Some(C::Ready));
+        assert_eq!(cache.get(&g), Some(C::Ready));
+        g.archive.modified_time_unix_seconds = Some(2);
+        assert_eq!(cache.get(&g), None, "newer file");
+        g.archive.modified_time_unix_seconds = Some(1);
+        g.archive.last_known_health = "corrupt".into();
+        assert_eq!(cache.get(&g), None, "health changed");
+        cache.clear();
+        assert_eq!(cache.len(), 0);
+    }
+
+    #[test]
+    fn library_filter_is_a_superset_for_cache_views_and_exact_for_classic() {
+        use super::{Filter, Library, ReadinessFilter as F};
+        let library = Library::new(vec![game(1, "ok").archive, game(2, "missing").archive]);
+        let n = |readiness, cache_aware| {
+            library
+                .filter(&Filter {
+                    readiness,
+                    cache_aware,
+                    ..Default::default()
+                })
+                .len()
+        };
+        assert_eq!(n(F::All, false), 2);
+        assert_eq!(n(F::NeedsAttention, false), 1, "classic stays exact");
+        assert_eq!(n(F::NeedsAttention, true), 2);
+        assert_eq!(n(F::Ready, true), 1);
+        assert_eq!(n(F::NotChecked, true), 1);
+    }
+
+    #[test]
+    fn a_large_catalogue_filters_without_per_game_work_beyond_a_lookup() {
+        use super::{CheckedReadiness as C, ReadinessCache, ReadinessFilter as F, matches};
+        let games: Vec<Game> = (0..20_000).map(|i| game(i, "ok")).collect();
+        let mut cache = ReadinessCache::default();
+        for g in games.iter().step_by(100) {
+            cache.record(g, Some(C::Ready));
+        }
+        let ready = games
+            .iter()
+            .filter(|g| matches(g, &filter(F::Ready), &cache))
+            .count();
+        let unchecked = games
+            .iter()
+            .filter(|g| matches(g, &filter(F::NotChecked), &cache))
+            .count();
+        assert_eq!((ready, unchecked), (200, 19_800));
     }
 }
 

@@ -1518,9 +1518,16 @@ impl App {
             if self.filter.platform != previous_platform {
                 self.filter.select_platform(self.filter.platform.clone());
             }
-            changed |= ui
-                .checkbox(&mut self.filter.attention_only, "Needs attention")
-                .changed();
+            let mut attention =
+                self.filter.readiness == super::library::ReadinessFilter::NeedsAttention;
+            if ui.checkbox(&mut attention, "Needs attention").changed() {
+                self.filter.readiness = if attention {
+                    super::library::ReadinessFilter::NeedsAttention
+                } else {
+                    super::library::ReadinessFilter::All
+                };
+                changed = true;
+            }
             changed |= ui
                 .selectable_value(&mut self.filter.list, false, "Grid")
                 .changed();
@@ -1569,7 +1576,7 @@ impl App {
             egui::ScrollArea::vertical().id_salt("v2_filter_details").max_height(150.0).show(ui, |ui| {
             ui.label(format!("Selected platform ID: {} · display label: {}", self.filter.platform, self.filter.platform));
             ui.label("Platform IDs are the catalogue's exact current assignments; no alias grouping or artwork filter is applied.");
-            ui.label(format!("Search: {:?} · needs attention only: {} · source/path filter: none", self.filter.search, self.filter.attention_only));
+            ui.label(format!("Search: {:?} · readiness: {} · source/path filter: none", self.filter.search, self.filter.readiness.label()));
             ui.label(format!("Logical filtered rows: {} · updating: {}", self.indices.len(), self.filter_inflight || self.filter_dirty.is_some()));
             for (platform, sources) in &self.library.platform_sources {
                 if self.filter.platform.is_empty() || *platform == self.filter.platform {

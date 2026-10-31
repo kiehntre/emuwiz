@@ -509,7 +509,7 @@ pub(super) fn capability_map() -> Vec<PlannedControl> {
             "Filters: All / Ready / Needs attention / Not checked",
             New,
             Some(Route::BrowsePlay),
-            "Attention and unverified filters exist; a Ready filter needs a readiness projection.",
+            "PARTIAL: the four-way filter ships in Browse & Play, but Ready only fills in as games are selected; no background readiness checking yet.",
             "3",
         ),
         control(

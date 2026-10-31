@@ -52,7 +52,7 @@ impl App {
 
     fn open_platform_games(&mut self, platform: String) {
         self.filter.select_platform(platform);
-        self.filter.attention_only = false;
+        self.filter.readiness = super::library::ReadinessFilter::All;
         self.change_filter();
         self.go(Route::Section(Section::Games));
     }
