@@ -1499,8 +1499,8 @@ def verify_retirement(record, target):
 # FETCH_HEAD is left out on purpose: every fetching checkout has one, and what it
 # names came from a remote, not from this checkout.
 UNFINISHED_GIT_STATE = ("index.lock", "HEAD.lock", "MERGE_HEAD", "CHERRY_PICK_HEAD", "REVERT_HEAD",
-                        "REBASE_HEAD", "rebase-merge", "rebase-apply", "BISECT_START", "BISECT_LOG",
-                        "sequencer")
+                        "REBASE_HEAD", "MERGE_AUTOSTASH", "rebase-merge", "rebase-apply", "BISECT_START",
+                        "BISECT_LOG", "sequencer", "locked", "modules")
 
 
 def history_preservation_problem(wt):
@@ -1512,9 +1512,9 @@ def history_preservation_problem(wt):
     Only a ref proves preservation: a bundle counts once it is imported under
     refs/preservation/. Anything that cannot be established is a problem.
 
-    Only a path that is verifiably not a checkout returns None. A directory that
-    has already gone cannot be judged from its path, but `git worktree remove`
-    needs a path that still holds a `.git`, so a gate is never asked to clear one.
+    Only an existing directory that is verifiably not a checkout returns None.
+    A path that has gone cannot be judged, and `git worktree remove` still accepts
+    it and deletes the admin directory, even one a moved checkout is using.
     """
     # No inherited GIT_DIR/GIT_WORK_TREE/alternates, and no replace refs or grafts
     # that could make unmerged history look preserved.
@@ -1534,11 +1534,8 @@ def history_preservation_problem(wt):
         return proc.stdout.strip()
 
     def without_git_entry():
-        # lexists/isdir would misclassify permission failures as absence.
-        try:
-            os.lstat(wt)
-        except FileNotFoundError:
-            return None
+        if not os.path.lexists(wt):
+            return ("CHECKOUT_PATH_UNVERIFIED", "path has gone, so its registered Git state cannot be judged")
         if run("rev-parse", "--git-dir").returncode == 0:
             return ("CHECKOUT_PATH_UNVERIFIED", "path is inside a repository but is not a Git checkout root")
         state, record = F.Registry(create=False).read_checked(
@@ -1548,19 +1545,25 @@ def history_preservation_problem(wt):
         return None
 
     def require_own_admin(admin):
-        # A .git file can point at another checkout's admin directory.
         common = git("rev-parse", "--path-format=absolute", "--git-common-dir")
         if admin == common:
-            return
+            raise LegacyCheckoutHold("GIT_WORKTREE_PROTECTED", "a main checkout or clone is never removable: "
+                                     "its own refs cannot prove its history is held elsewhere")
+        if os.path.lexists(os.path.join(common, "reftable")):
+            raise LegacyCheckoutHold("GIT_STATE_UNVERIFIED", "reftable storage keeps reflogs outside logs/HEAD")
+        # A .git file can point at another checkout's admin directory.
         with open(os.path.join(admin, "gitdir")) as handle:
             recorded = os.path.join(admin, handle.read().strip())
         if os.path.realpath(recorded) != os.path.realpath(os.path.join(wt, ".git")):
             raise LegacyCheckoutHold("CHECKOUT_PATH_UNVERIFIED", "this .git names another checkout's admin directory")
 
     def names_in(path, read):
-        if not os.path.lexists(path):
+        # lexists would misclassify permission failures as absence.
+        try:
+            mode = os.lstat(path).st_mode
+        except FileNotFoundError:
             return set()
-        if not stat.S_ISREG(os.lstat(path).st_mode):
+        if not stat.S_ISREG(mode):
             raise LegacyCheckoutHold("GIT_STATE_UNVERIFIED",
                                      os.path.basename(path) + " is not a regular file")
         return read(path)
@@ -1612,8 +1615,8 @@ def history_preservation_problem(wt):
         return (error.code, error.explanation)
     if orphans:
         return ("GIT_HISTORY_NOT_PRESERVED",
-                f"{len(orphans)} commit(s) are named only by this checkout's HEAD, reflog or ORIG_HEAD; "
-                "retain them under refs/preservation/ first")
+                f"{len(orphans)} commit(s) are named only by this checkout's HEAD, reflog or ORIG_HEAD "
+                f"(for example {', '.join(o[:12] for o in orphans[:5])}); retain them under refs/preservation/ first")
     return None
 
 
@@ -1805,9 +1808,6 @@ def reconcile_legacy_worktree(path, preserved_ref=None, remove=False):
         rows = [b for b in blocks if b.get("worktree") == wt]
         require(len(rows) == 1 and not any(k in rows[0] for k in ("locked", "prunable")),
                 "GIT_WORKTREE_PROTECTED", "checkout must be registered, unlocked and not prunable")
-        admin = git("rev-parse", "--absolute-git-dir")
-        common = git("rev-parse", "--path-format=absolute", "--git-common-dir")
-        require(admin != common, "GIT_WORKTREE_PROTECTED", "never reconcile the main checkout")
         history()
         head = git("rev-parse", "HEAD")
         main = git("rev-parse", "--verify", "refs/remotes/origin/main^{commit}")

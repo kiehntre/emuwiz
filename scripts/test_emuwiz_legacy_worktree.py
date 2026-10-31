@@ -499,11 +499,76 @@ class HistoryGates(LegacyCheckout):
         os.unlink(os.path.join(self.wt, '.git'))
         self.assert_gate_holds('GIT_STATE_UNVERIFIED')
 
-    def test_plain_directory_and_vanished_path_are_not_checkouts(self):
+    def test_plain_directory_is_not_a_checkout(self):
         plain = os.path.join(self.root_for_bundle(), 'plain')
         os.mkdir(plain)
         self.assertIsNone(self.m.history_preservation_problem(plain))
-        self.assertIsNone(self.m.history_preservation_problem(plain + '-gone'))
+
+    def test_vanished_path_holds_because_git_would_still_remove_its_admin_directory(self):
+        wt = self.never_built('vanished')
+        shutil.rmtree(wt)
+        self.assertEqual(self.m.history_preservation_problem(wt)[0], 'CHECKOUT_PATH_UNVERIFIED')
+
+    def test_old_path_of_a_moved_checkout_holds(self):
+        wt = self.never_built('moved')
+        os.rename(wt, wt + '-new')
+        self.assertEqual(self.m.history_preservation_problem(wt)[0], 'CHECKOUT_PATH_UNVERIFIED')
+
+    def test_main_checkout_or_clone_cannot_prove_itself(self):
+        clone = os.path.join(self.root_for_bundle(), 'clone')
+        subprocess.check_call(['git', 'init', '-q', clone])
+        subprocess.check_call(['git', '-C', clone, 'commit', '--allow-empty', '-qm', 'only here'], env=self.env)
+        self.assertEqual(self.m.history_preservation_problem(clone)[0], 'GIT_WORKTREE_PROTECTED')
+
+    def test_reftable_storage_fails_closed(self):
+        common = self.run_git('rev-parse', '--path-format=absolute', '--git-common-dir')
+        os.mkdir(os.path.join(common, 'reftable'))
+        self.addCleanup(os.rmdir, os.path.join(common, 'reftable'))
+        self.assert_gate_holds('GIT_STATE_UNVERIFIED')
+
+    def test_corrupt_record_for_a_checkout_without_git_entry_holds(self):
+        wt = self.never_built('corrupt-record')
+        target = self.m.target_for_worktree(wt)[1]
+        Path(self.reg, 'targets', self.key_of(target) + '.json').write_text('{')
+        os.unlink(os.path.join(wt, '.git'))
+        self.assertEqual(self.m.history_preservation_problem(wt)[0], 'GIT_STATE_UNVERIFIED')
+
+    @unittest.skipIf(os.geteuid() == 0, 'root ignores directory modes')
+    def test_unreadable_unrecorded_checkout_and_reflog_directory_fail_closed(self):
+        wt = self.never_built('unreadable')
+        os.chmod(wt, 0)
+        self.addCleanup(os.chmod, wt, 0o755)
+        self.assertEqual(self.m.history_preservation_problem(wt)[0], 'GIT_STATE_UNVERIFIED')
+        self.reflog_only_commit()
+        logs = os.path.join(self.git_dir, 'logs')
+        os.chmod(logs, 0)
+        self.addCleanup(os.chmod, logs, 0o755)
+        self.assert_gate_holds('GIT_STATE_UNVERIFIED')
+
+    def test_recorded_gitdir_may_be_relative_or_a_symlink_alias(self):
+        link = os.path.join(self.root_for_bundle(), 'alias')
+        os.symlink(self.wt, link)
+        gitdir = Path(self.git_dir, 'gitdir')
+        for recorded in (os.path.relpath(os.path.join(self.wt, '.git'), self.git_dir),
+                         os.path.join(link, '.git')):
+            with self.subTest(recorded=recorded):
+                gitdir.write_text(recorded + '\n')
+                self.assertIsNone(self.m.history_preservation_problem(self.wt))
+
+    def test_rewritten_refs_hold(self):
+        self.run_git('update-ref', 'refs/rewritten/fixture', self.base)
+        self.assert_gate_holds('GIT_HISTORY_NOT_PRESERVED')
+
+    def test_git_timeout_and_undecodable_output_fail_closed(self):
+        failures = (subprocess.TimeoutExpired('git', 30), UnicodeDecodeError('utf-8', b'x', 0, 1, 'bad'))
+        for failure in failures:
+            with self.subTest(failure=type(failure).__name__), \
+                    patch.object(self.m.F, 'run_as_owner', side_effect=failure):
+                self.assertEqual(self.m.history_preservation_problem(self.wt)[0], 'GIT_STATE_UNVERIFIED')
+
+    def test_orphan_message_names_the_commits(self):
+        orphan = self.reflog_only_commit()
+        self.assertIn(orphan[:12], self.gate_when_lifecycle_clear()['explanation'])
 
     def test_empty_git_directory_or_subdirectory_cannot_borrow_the_parent_repo(self):
         nested = os.path.join(self.wt, 'nested')
@@ -513,7 +578,9 @@ class HistoryGates(LegacyCheckout):
         self.assertEqual(self.m.history_preservation_problem(nested)[0], 'CHECKOUT_PATH_UNVERIFIED')
 
     def test_unfinished_operations_hold_the_lifecycle_gate(self):
-        for name in self.m.UNFINISHED_GIT_STATE:
+        for name in ('index.lock', 'HEAD.lock', 'MERGE_HEAD', 'CHERRY_PICK_HEAD', 'REVERT_HEAD',
+                     'REBASE_HEAD', 'MERGE_AUTOSTASH', 'rebase-merge', 'rebase-apply', 'BISECT_START',
+                     'BISECT_LOG', 'sequencer', 'locked', 'modules'):
             with self.subTest(name=name):
                 marker = Path(self.git_dir, name)
                 marker.touch()

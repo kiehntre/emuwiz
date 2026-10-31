@@ -223,7 +223,7 @@ Finishing a Cargo command is not finishing a task. While the worktree still exis
 
 ```
 scripts/cargo-iso --finish-task --task <name>      # idempotent release + "may I remove it?"
-scripts/emuwiz-cargo-maintain worktree-check <wt>  # CLEAR only after verified retirement
+scripts/emuwiz-cargo-maintain worktree-check <wt>  # CLEAR only when retired and history is preserved
 ```
 
 Retirement verifies ownership from the source worktree, so the
@@ -231,7 +231,12 @@ worktree must stay until `worktree-check` reports CLEAR (artifacts retired with 
 receipt/journal, or none was ever created: no record of a cargo-iso build and an absent or empty cache
 directory). Missing artifacts alone prove nothing: they HOLD as `ARTIFACTS_MISSING_UNVERIFIED`. HOLD reasons: `NOT_RELEASED`, `OWNER_UNVERIFIED`, `COMPLETION_UNVERIFIED`,
 `WRITTEN_AFTER_RELEASE`, `AWAITING_RETIREMENT`, `ACTIVE`, `PINNED`, `PROTECTED_REMNANTS`,
-`SOURCE_MISSING`, `NO_LIFECYCLE_RECORD`, `RECEIPT_UNVERIFIED`, `ARTIFACTS_MISSING_UNVERIFIED`. A release record alone never
+`SOURCE_MISSING`, `NO_LIFECYCLE_RECORD`, `RECEIPT_UNVERIFIED`, `ARTIFACTS_MISSING_UNVERIFIED`. The gate also holds on the checkout's own
+Git state, because `git worktree remove` deletes its reflog, ORIG_HEAD, per-worktree refs and ignored files:
+`CHECKOUT_NOT_CLEAN`, `CHECKOUT_INDEX_UNVERIFIED`, `CHECKOUT_PATH_UNVERIFIED`, `GIT_WORKTREE_PROTECTED`,
+`GIT_HISTORY_NOT_PRESERVED`, `GIT_STATE_UNVERIFIED`. A commit counts as preserved only when a ref names it, so
+retain orphans under `refs/preservation/`. `--cargo-state-only` reports the Cargo half alone and never authorises
+removal. A release record alone never
 clears the gate or authorises deletion; releasing does not stop builds, remove pins or claim
 processes have exited. The release command takes the target's exclusive lifecycle lock and
 refuses while a `cargo-iso` build holds its shared lock; retry completion after that build
