@@ -1829,6 +1829,10 @@ fn show_rom_organisation_page_with_options(
             widgets::StatusTone::Warning
         };
         widgets::banner(ui, "Result", message, tone);
+        if let Some(transaction) = state.applied() {
+            // Same condition as the Undo button below.
+            crate::transaction_outcome::show(ui, transaction, !state.advanced_r2_selected);
+        }
         if quick_only && let Some(transaction) = state.applied() {
             ui.label(format!("Renamed: {}", transaction.applied_count()));
             ui.label(format!("Skipped: {}", transaction.skipped_count()));
