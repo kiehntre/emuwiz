@@ -977,3 +977,52 @@ fn a_changed_journal_still_blocks_a_retry_after_an_outage() {
     assert!(restarted(&export.journal).recovery.exports.is_empty());
     assert!(present(&export.links[0]));
 }
+
+#[test]
+fn a_replaced_hardlink_source_in_a_present_folder_is_refused_not_retried() {
+    let export = exported_split(PublisherLinkMode::Hardlink);
+    std::fs::remove_file(&export.sources[0]).unwrap();
+    std::fs::write(&export.sources[0], b"different file").unwrap();
+    let mut state = restarted(&export.journal);
+    roll_back_listed(&mut state);
+    assert_eq!(
+        journal_record(&export).entries[0].state,
+        EntryState::RollbackFailed
+    );
+    assert_eq!(
+        std::fs::read(&export.sources[0]).unwrap(),
+        b"different file"
+    );
+    assert!(present(&export.links[0]));
+}
+
+#[test]
+fn an_outage_link_and_a_changed_link_in_one_pass_are_told_apart() {
+    for mode in BOTH_MODES {
+        let export = exported_split(mode);
+        // links[1] is changed by the user; links[0]'s source folder is away.
+        std::fs::remove_file(&export.links[1]).unwrap();
+        std::fs::write(&export.links[1], b"user data").unwrap();
+        let folder = export.sources[0].parent().unwrap().to_path_buf();
+        let away = take_away(&folder);
+        let mut state = restarted(&export.journal);
+        roll_back_listed(&mut state);
+        let record = journal_record(&export);
+        assert_eq!(record.entries[0].state, EntryState::Applied, "{mode:?}");
+        assert_eq!(
+            record.entries[1].state,
+            EntryState::RollbackFailed,
+            "{mode:?}"
+        );
+        let said = message(&state);
+        assert!(said.contains("not available"), "{mode:?}: {said}");
+        assert!(said.contains("check them by hand"), "{mode:?}: {said}");
+        assert!(said.contains("gone for good"), "{mode:?}: {said}");
+        assert_eq!(std::fs::read(&export.links[1]).unwrap(), b"user data");
+        std::fs::rename(&away, &folder).unwrap();
+        let mut back = restarted(&export.journal);
+        roll_back_listed(&mut back);
+        assert!(!present(&export.links[0]), "{mode:?}");
+        assert_eq!(std::fs::read(&export.links[1]).unwrap(), b"user data");
+    }
+}

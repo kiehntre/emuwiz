@@ -431,20 +431,23 @@ pub fn describe_undo_outcome(
     let mut parts = vec![format!(
         "Undo of {id} is not complete: {undone} link(s) undone."
     )];
-    if retryable > 0 {
-        let why = transaction
-            .entries
-            .iter()
-            .find(|entry| entry.state == EntryState::Applied && entry.failure_reason.is_some())
-            .and_then(|entry| entry.failure_reason.as_deref());
-        parts.push(match why {
-            Some(reason) => format!(
-                "{retryable} link(s) were not touched because a folder or device was not available ({reason}). Reconnect it, then roll back again: every check is repeated first."
-            ),
-            None => format!(
-                "{retryable} link(s) are still to undo. Roll back again; every check is repeated first."
-            ),
-        });
+    let held: Vec<&TransactionEntry> = transaction
+        .entries
+        .iter()
+        .filter(|entry| entry.state == EntryState::Applied && entry.failure_reason.is_some())
+        .collect();
+    if !held.is_empty() {
+        let reason = held[0].failure_reason.as_deref().unwrap_or_default();
+        parts.push(format!(
+            "{} link(s) were not touched because a folder or device was not available ({reason}). Reconnect it, then roll back again: every check is repeated first. If that folder is gone for good, remove those links by hand.",
+            held.len()
+        ));
+    }
+    if retryable > held.len() {
+        parts.push(format!(
+            "{} other link(s) are still to undo or were interrupted. Roll back again; every check is repeated first.",
+            retryable - held.len()
+        ));
     }
     if refused > 0 {
         let reason = transaction
