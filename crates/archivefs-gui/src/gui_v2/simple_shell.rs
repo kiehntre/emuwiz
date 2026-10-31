@@ -292,6 +292,10 @@ pub(super) fn destination_for(route: &Route) -> Option<Destination> {
         | Route::PlatformCheck(_)
         | Route::LibraryFiles => return Some(Destination::Library),
         Route::QuickRename | Route::MameWorkflow => return Some(Destination::OrganiseExport),
+        // Tools opened from All Tools live there, whatever section owns them.
+        Route::Tool(tool) if matches!(tool.parent_label(), "Tools" | "Games & collection") => {
+            return Some(Destination::Tools);
+        }
         _ => {}
     }
     Some(match route.section() {
@@ -301,17 +305,18 @@ pub(super) fn destination_for(route: &Route) -> Option<Destination> {
         | Section::Duplicates
         | Section::MultiDisc
         | Section::Romm
-        | Section::Check
-        | Section::DatVerification => Destination::Library,
+        | Section::Check => Destination::Library,
         Section::Setup
         | Section::Emulators
         | Section::EmulatorsFamily
         | Section::Firmware
         | Section::Sources
         | Section::SourcesProviders => Destination::Setup,
-        Section::OrganisationFamily | Section::Build | Section::Dat | Section::Mame => {
-            Destination::OrganiseExport
-        }
+        Section::OrganisationFamily
+        | Section::Build
+        | Section::Dat
+        | Section::DatVerification
+        | Section::Mame => Destination::OrganiseExport,
         Section::Converter
         | Section::Conversion
         | Section::Tape
@@ -342,7 +347,7 @@ pub(super) fn simple_breadcrumb_labels(route: &Route, game_title: Option<&str>) 
     let mut labels = super::routes::breadcrumb_labels(route, game_title);
     let family = super::routes::family_for_route(route).map(|family| family.label());
     if let (Some(destination), Some(first)) = (destination_for(route), labels.first_mut())
-        && (family == Some(first.as_str()) || first == "Games")
+        && (family == Some(first.as_str()) || first == "Games" || matches!(route, Route::Tool(_)))
     {
         *first = destination.label().to_string();
     }
@@ -1463,6 +1468,25 @@ pub(super) fn prepare_keyboard_reveal(context: &egui::Context) {
     }
 }
 
+/// Forget a scroller's position, so its next paint starts at the top. Must be
+/// called on the same `ui` that owns the scroller.
+pub(super) fn reset_scroll(ui: &egui::Ui, salt: impl std::hash::Hash) {
+    // `ScrollArea::id_salt` hashes its salt into an `Id` before the ui's.
+    let id = ui.make_persistent_id(egui::Id::new(salt));
+    if let Some(mut state) = egui::scroll_area::State::load(ui.ctx(), id) {
+        state.offset = egui::Vec2::ZERO;
+        state.store(ui.ctx(), id);
+    }
+}
+
+pub(super) fn reset_page_scroll(ui: &egui::Ui, section: Section) {
+    reset_scroll(ui, page_scroll_salt(section));
+}
+
+fn page_scroll_salt(section: Section) -> (&'static str, Section) {
+    ("v2_page_content", section)
+}
+
 /// Keep the existing page scroller and identity. Only the Simple Manage hub
 /// uses focus reveal; Classic and every other page keep their usual scroller.
 pub(super) fn show_page_scroll<R>(
@@ -1471,7 +1495,7 @@ pub(super) fn show_page_scroll<R>(
     manage: bool,
     content: impl FnOnce(&mut egui::Ui) -> R,
 ) {
-    let salt = ("v2_page_content", section);
+    let salt = page_scroll_salt(section);
     if manage {
         show_reveal_scroll(
             ui,
@@ -1645,7 +1669,7 @@ fn show_focus_reveal_scroll_inner<R>(
     enter_focus: bool,
     content: impl FnOnce(&mut egui::Ui) -> R,
 ) -> R {
-    let id = ui.make_persistent_id(salt);
+    let id = ui.make_persistent_id(egui::Id::new(salt));
     // A focused text field keeps its own PageUp/Down outside Check, which has
     // only buttons, so existing button focus never blocks paging.
     let paging = match keys {
@@ -2217,6 +2241,28 @@ mod tests {
                 "{section:?}"
             );
         }
+    }
+
+    #[test]
+    fn tools_and_dat_hubs_highlight_the_row_their_trail_names() {
+        let tool = Route::Tool(crate::gui_v2::routes::ToolPage::SourceImpact);
+        assert_eq!(destination_for(&tool), Some(Destination::Tools));
+        assert_eq!(simple_breadcrumb_labels(&tool, None)[0], "Tools");
+        let netplay = Route::Tool(crate::gui_v2::routes::ToolPage::NetplayPreview);
+        assert_eq!(destination_for(&netplay), Some(Destination::Tools));
+        assert_eq!(simple_breadcrumb_labels(&netplay, None)[0], "Tools");
+        // A tool that belongs to a row keeps it.
+        assert_eq!(
+            destination_for(&Route::Tool(
+                crate::gui_v2::routes::ToolPage::DatabaseStatus
+            )),
+            Some(Destination::Settings)
+        );
+        // Opening DAT Management from its hub no longer moves the highlight.
+        assert_eq!(
+            destination_for(&Route::Section(Section::DatVerification)),
+            destination_for(&Route::Section(Section::Dat))
+        );
     }
 
     #[test]

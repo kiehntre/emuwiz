@@ -486,7 +486,7 @@ impl App {
         let attention_filter = |this: &mut Self, ui: &mut egui::Ui| {
             if blue
                 && ui
-                    .selectable_label(this.filter.attention_only, "Needs attention")
+                    .add(toggle_button("Needs attention", this.filter.attention_only))
                     .on_hover_text("Show only games that need attention.")
                     .clicked()
             {
@@ -494,8 +494,8 @@ impl App {
             }
         };
         let view_switch = |this: &mut Self, ui: &mut egui::Ui| {
-            ui.selectable_value(&mut this.filter.list, false, "Grid");
-            ui.selectable_value(&mut this.filter.list, true, "List");
+            view_toggle(ui, &mut this.filter.list, false, "Grid");
+            view_toggle(ui, &mut this.filter.list, true, "List");
         };
         ui.horizontal(|ui| {
             ui.add_sized(
@@ -510,8 +510,8 @@ impl App {
             if !stacked {
                 attention_filter(self, ui);
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                    ui.selectable_value(&mut self.filter.list, true, "List");
-                    ui.selectable_value(&mut self.filter.list, false, "Grid");
+                    view_toggle(ui, &mut self.filter.list, true, "List");
+                    view_toggle(ui, &mut self.filter.list, false, "Grid");
                     self.browse_play_selection_toggle(ui);
                 });
             }
@@ -1239,6 +1239,18 @@ impl App {
                     }
                 }
             });
+    }
+}
+
+/// A toolbar on/off control: a real button, so the unselected state matches
+/// Select games beside it instead of reading as plain text.
+fn toggle_button(text: &str, selected: bool) -> egui::Button<'_> {
+    egui::Button::new(text).selected(selected)
+}
+
+fn view_toggle(ui: &mut egui::Ui, current: &mut bool, value: bool, text: &str) {
+    if ui.add(toggle_button(text, *current == value)).clicked() {
+        *current = value;
     }
 }
 

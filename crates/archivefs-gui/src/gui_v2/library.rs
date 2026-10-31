@@ -124,7 +124,8 @@ pub(super) struct Game {
 
 impl Game {
     pub fn from_archive(archive: PersistedArchive) -> Self {
-        let title = archive.display_name.clone();
+        let title =
+            crate::media_sets_page::title_without_cue_suffix(&archive.display_name).to_string();
         let platform = canonical_platform_name(archive.platform.as_deref());
         let freshness = EvidenceFreshness::from_stored_health(&archive.last_known_health);
         let identified = archive.identity_report.as_ref().is_some_and(|report| {

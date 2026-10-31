@@ -33,11 +33,18 @@ pub(super) fn primary(ui: &mut egui::Ui, text: &str) -> bool {
 
 /// Below this much body height (points) contextual guidance scrolls with the page.
 const COMPACT_BODY_HEIGHT: f32 = 260.0;
+/// A pinned notice can expand its technical details; the page keeps the rest.
+const MAX_PINNED_NOTICE_SHARE: f32 = 0.4;
+const ALL_TOOLS_SCROLL: &str = "v2_all_tools_scroll";
 
 /// One bounded main-content scroller; sidebar and header are outside it.
-fn check_scroll(ui: &mut egui::Ui, platform: Option<&str>, content: impl FnOnce(&mut egui::Ui)) {
+pub(super) fn check_scroll(
+    ui: &mut egui::Ui,
+    platform: Option<&str>,
+    content: impl FnOnce(&mut egui::Ui),
+) {
     let salt = ("v2_check_scroll", platform);
-    let id = ui.make_persistent_id(salt);
+    let id = ui.make_persistent_id(egui::Id::new(salt));
     let mut scroll = egui::ScrollArea::vertical()
         .id_salt(salt)
         .auto_shrink([false, false]);
@@ -472,7 +479,7 @@ impl App {
             match chosen.map(|destination| destination.route()) {
                 Some(Some(route)) => self.go(route),
                 // Tools: the All Tools browser over the current location.
-                Some(None) => self.simple.all_tools = true,
+                Some(None) => self.open_all_tools(),
                 None => {}
             }
         } else {
@@ -562,6 +569,12 @@ impl App {
                 });
         }
         egui::CentralPanel::default().show(context, |ui| {
+            // Organisation's views share the page scroller; each starts at its top.
+            let view_changed = self.organisation.view != self.scrolled_organisation_view;
+            self.scrolled_organisation_view = self.organisation.view;
+            if std::mem::take(&mut self.reset_page_scroll) || view_changed {
+                super::simple_shell::reset_page_scroll(ui, self.router.current.section());
+            }
             if self.simple.all_tools_open() {
                 self.all_tools_page(ui);
                 return;
@@ -577,15 +590,31 @@ impl App {
                         }
                         | Route::MameWorkflow
                 );
+            let blue = self.simple.simple_navigation();
+            let browse_play = matches!(
+                self.router.current,
+                Route::BrowsePlay | Route::BrowsePlayGame(_)
+            );
             let scrolling_intro = matches!(
                 self.router.current,
                 Route::Section(
                     Section::Emulators | Section::Sources | Section::Dat | Section::Check
                 ) | Route::Tool(_)
-            ) || health_page;
-            // These native pages own one page scroller. Their introduction must
-            // share it: at large text sizes pinning it can consume the viewport.
-            if !scrolling_intro {
+            ) || health_page
+                || (blue && !browse_play);
+            // These pages own one page scroller. Their introduction must share
+            // it: at 1024x600 or large text sizes pinning it consumes the
+            // viewport. Blue keeps only the location and any notice pinned, so
+            // Back and a failure raised while scrolled down stay in view.
+            if blue && scrolling_intro {
+                self.simple_breadcrumbs(ui);
+                let height = ui.available_height() * MAX_PINNED_NOTICE_SHARE;
+                egui::ScrollArea::vertical()
+                    .id_salt("v2_page_notices")
+                    .max_height(height)
+                    .auto_shrink([false, true])
+                    .show(ui, |ui| self.page_notices(ui));
+            } else if !scrolling_intro {
                 self.page_intro(ui);
             }
             let route = self.router.current.clone();
@@ -618,8 +647,15 @@ impl App {
             }
             // A failed library load is shown as a failure, never as a loading
             // spinner or an empty catalogue.
-            if super::library_failure::needs_library(&route) && self.show_library_failure(ui) {
-                return;
+            if super::library_failure::needs_library(&route) {
+                // The failure panel replaces the page, so it needs the title
+                // the page scroller would otherwise have painted.
+                if blue && scrolling_intro && self.library_failure.is_some() && !self.loaded {
+                    self.page_header(ui);
+                }
+                if self.show_library_failure(ui) {
+                    return;
+                }
             }
             // Browse & Play is an application layout: the shelf scrolls, the page
             // does not, so the selected game and its Play button stay in view.
@@ -653,7 +689,9 @@ impl App {
                 self.simple.simple_navigation()
                     && route == Route::Section(Section::OrganisationFamily),
                 |ui| {
-                    if scrolling_intro {
+                    if blue && scrolling_intro {
+                        self.page_header(ui);
+                    } else if scrolling_intro {
                         self.page_intro(ui);
                     }
                     // Settings leads with its size controls, so there the
@@ -824,7 +862,8 @@ impl App {
             Route::Home | Route::Section(Section::Home) => GuidancePage::Home,
             // The page explains itself; a tip repeating it would only cost room.
             Route::BrowsePlay | Route::BrowsePlayGame(_) => return None,
-            Route::MameWorkflow => GuidancePage::Organisation,
+            // The publication tip is about Organisation; MAME explains itself.
+            Route::MameWorkflow => return None,
             Route::Game(_) | Route::Section(Section::Games) => GuidancePage::Games,
             Route::Section(Section::Sources) => GuidancePage::Sources,
             Route::Section(Section::Launch)
@@ -848,6 +887,8 @@ impl App {
             Route::Section(Section::Advanced) => GuidancePage::Advanced,
             Route::Section(Section::Settings) => GuidancePage::Settings,
             Route::Section(Section::Build) => GuidancePage::Organisation,
+            // The only script here is about the Enable / disable tab.
+            Route::Section(Section::Mods) if !self.mods.activation_open() => return None,
             Route::Section(Section::Mods) => GuidancePage::CheatsMods,
             Route::Section(Section::Museum) => GuidancePage::Museum,
             Route::Section(Section::Tape)
@@ -1068,7 +1109,11 @@ impl App {
                     ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                         let open = self.simple.all_tools_open();
                         if simple_shell::all_tools_button(ui, open).clicked() {
-                            self.simple.all_tools = !open;
+                            if open {
+                                self.simple.all_tools = false;
+                            } else {
+                                self.open_all_tools();
+                            }
                         }
                     });
                 });
@@ -1076,17 +1121,23 @@ impl App {
     }
 
     /// The All Tools browser over the current location (Blue view only).
+    /// A fresh visit starts at the top; Back keeps its place.
+    pub(super) fn open_all_tools(&mut self) {
+        self.simple.all_tools = true;
+        self.reset_all_tools_scroll = true;
+    }
+
     fn all_tools_page(&mut self, ui: &mut egui::Ui) {
-        ui.heading(super::all_tools::TITLE);
-        ui.label(super::all_tools::PURPOSE);
-        ui.add_space(8.0);
+        if std::mem::take(&mut self.reset_all_tools_scroll) {
+            super::simple_shell::reset_scroll(ui, ALL_TOOLS_SCROLL);
+        }
         let mut chosen = None;
-        super::simple_shell::show_focus_reveal_scroll(
-            ui,
-            "v2_all_tools_scroll",
-            [false, false],
-            |ui| chosen = super::all_tools::show(ui, &mut self.simple.tools),
-        );
+        super::simple_shell::show_focus_reveal_scroll(ui, ALL_TOOLS_SCROLL, [false, false], |ui| {
+            ui.heading(super::all_tools::TITLE);
+            ui.label(super::all_tools::PURPOSE);
+            ui.add_space(8.0);
+            chosen = super::all_tools::show(ui, &mut self.simple.tools);
+        });
         if let Some(route) = chosen {
             self.go(route);
         }
@@ -1218,6 +1269,10 @@ impl App {
             self.simple_breadcrumbs(ui);
         }
         self.page_header(ui);
+        self.page_notices(ui);
+    }
+
+    fn page_notices(&mut self, ui: &mut egui::Ui) {
         if let Some(notice) = &self.notice {
             let mut dismiss = false;
             egui::Frame::group(ui.style()).show(ui, |ui| {
@@ -2125,10 +2180,7 @@ impl App {
     }
 
     fn duplicates(&mut self, ui: &mut egui::Ui) {
-        egui::ScrollArea::vertical()
-            .id_salt("v2_duplicates_scroll")
-            .auto_shrink([false, false])
-            .show(ui, |ui| self.duplicates_content(ui));
+        self.duplicates_content(ui);
     }
 
     fn duplicates_content(&mut self, ui: &mut egui::Ui) {
@@ -2357,7 +2409,7 @@ impl App {
         if self.problem_summary.is_none() {
             self.start_problem_summary();
         }
-        egui::ScrollArea::vertical().id_salt("v2_problems").show(ui, |ui| {
+        ui.vertical(|ui| {
             let summary = self.problem_summary.clone();
             let (attention, warnings) = summary
                 .as_ref()
@@ -2760,7 +2812,8 @@ impl App {
         let key = self.artwork.key(id, Kind::Cover);
         // One scroll area holds the whole page. Specialist evidence used to be
         // drawn above it, which pushed the title and Play off small windows.
-        egui::ScrollArea::vertical().id_salt(("v2_detail", id)).show(ui, |ui| {
+        // The shared page scroller carries this page, so its title scrolls too.
+        ui.vertical(|ui| {
             if self.moved_game == Some(id) {
                 ui.group(|ui| {
                     ui.strong("This game has moved");
@@ -3596,10 +3649,7 @@ impl App {
         }
         let library = self.library.clone();
         let mut metadata_changed = false;
-        egui::ScrollArea::vertical()
-            .id_salt(("v2_artwork_metadata", selected))
-            .auto_shrink([false, false])
-            .show(ui, |ui| {
+        ui.vertical(|ui| {
                 ui.label("Review artwork, manuals and supported extras for one game. Provider setup stays in Sources & Providers.");
                 if ui
                     .add_enabled(!self.artwork.index_loading, egui::Button::new("Recheck providers"))
@@ -3842,7 +3892,7 @@ impl App {
             self.go(route);
             return;
         }
-        egui::ScrollArea::vertical().id_salt(("v2_task", section)).show(ui, |ui| {
+        ui.vertical(|ui| {
             ui.heading("This workflow is available in the existing interface");
             ui.label("This task opens the existing interface in a separate window. GUI v2 stays open so you can return safely.");
             if let Some(game) = self.router.current.game().and_then(|id| self.library.game(id)) { ui.strong(format!("Selected game: {}", game.title)); }
@@ -3921,36 +3971,34 @@ impl App {
             });
         }
         let attention_only = self.activity_attention_only;
-        egui::ScrollArea::vertical()
-            .id_salt("v2_jobs")
-            .show(ui, |ui| {
-                for (id, job) in super::activity::visible_jobs(&self.activity, attention_only) {
-                    ui.push_id(id, |ui| {
-                        egui::Frame::group(ui.style()).show(ui, |ui| {
-                            ui.set_min_width(ui.available_width());
-                            let card = super::job_card::show(ui, job, false);
-                            if card.cancel {
-                                job.request_cancel();
-                            }
-                            if !job.active()
-                                && primary(
-                                    ui,
-                                    if job.phase == Phase::Failed {
-                                        "Return to task / retry"
-                                    } else {
-                                        "View result"
-                                    },
-                                )
-                            {
-                                destination = Some(job.result.clone());
-                            }
-                            ui.collapsing("Technical details", |ui| {
-                                ui.label(&job.technical);
-                            });
+        ui.vertical(|ui| {
+            for (id, job) in super::activity::visible_jobs(&self.activity, attention_only) {
+                ui.push_id(id, |ui| {
+                    egui::Frame::group(ui.style()).show(ui, |ui| {
+                        ui.set_min_width(ui.available_width());
+                        let card = super::job_card::show(ui, job, false);
+                        if card.cancel {
+                            job.request_cancel();
+                        }
+                        if !job.active()
+                            && primary(
+                                ui,
+                                if job.phase == Phase::Failed {
+                                    "Return to task / retry"
+                                } else {
+                                    "View result"
+                                },
+                            )
+                        {
+                            destination = Some(job.result.clone());
+                        }
+                        ui.collapsing("Technical details", |ui| {
+                            ui.label(&job.technical);
                         });
                     });
-                }
-            });
+                });
+            }
+        });
         if let Some(route) = destination {
             self.go(route);
         }

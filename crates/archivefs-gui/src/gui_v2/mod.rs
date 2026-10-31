@@ -441,6 +441,9 @@ pub(super) struct App {
     hackhash: hackhash::HackHashPageState,
     romm_library: romm_library::RommBrowserState,
     romm_library_job: Option<u64>,
+    reset_page_scroll: bool,
+    reset_all_tools_scroll: bool,
+    scrolled_organisation_view: organisation::OrganisationView,
     manual_viewer: manual_viewer::ManualViewer,
     text_guide_viewer: text_guide_viewer::TextGuideViewer,
     document_preferences: documents::DocumentPreferences,
@@ -558,6 +561,9 @@ impl App {
             hackhash: hackhash::HackHashPageState::new(),
             romm_library: romm_library::RommBrowserState::default(),
             romm_library_job: None,
+            reset_page_scroll: false,
+            reset_all_tools_scroll: false,
+            scrolled_organisation_view: organisation::OrganisationView::default(),
             manual_viewer: manual_viewer::ManualViewer::default(),
             text_guide_viewer: text_guide_viewer::TextGuideViewer::default(),
             document_preferences: documents::DocumentPreferences::default(),
@@ -603,6 +609,15 @@ impl App {
         } else {
             true
         }
+    }
+
+    /// RomM reports its own failures on its page, and Activity keeps the job.
+    /// The page-wide notice would follow the person onto unrelated pages.
+    fn failure_stays_on_its_page(&self, id: u64) -> bool {
+        self.activity
+            .jobs
+            .get(&id)
+            .is_some_and(|job| job.result == Route::Section(Section::Romm))
     }
 
     fn romm_library_load_needed(&self) -> bool {
@@ -873,6 +888,8 @@ impl App {
             workflows.leave_platform_check();
         }
         self.router.go(resolved);
+        // Back alone returns to where the person was on a page.
+        self.reset_page_scroll = true;
         self.handoff_status = None;
         self.navigation_changed();
     }
@@ -2125,7 +2142,9 @@ impl App {
                                     notice.message.clone(),
                                     activity::Settled::Failed(error.clone()),
                                 );
-                                self.notice = Some(notice);
+                                if !self.failure_stays_on_its_page(id) {
+                                    self.notice = Some(notice);
+                                }
                             } else {
                                 // Startup housekeeping (preference restore and history
                                 // discovery) is intentionally untracked. It must not turn a
