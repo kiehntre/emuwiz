@@ -629,10 +629,16 @@ ORPHAN_ROUTE = "GIT_PRESERVED"
 
 
 def _git(repo, *argv):
-    # Fixed argv, no shell; the repo path is only ever a -C argument.  safe.directory lets a
-    # root executor read the owner's repository without trusting any repo-local config.
-    return subprocess.run(["git", "-c", "safe.directory=" + repo, "-C", repo, *argv],
-                          capture_output=True, text=True, timeout=60)
+    """git as the unprivileged owner only: F.run_as_owner drops every uid (real, effective, saved) before
+    exec, so a helper that git spawns from an owner-controlled .git/config can never regain root.
+    The environment is scrubbed (no GIT_* from the caller, no system/global config, no lazy fetch,
+    no replace objects) and the network, fsmonitor and hooks-by-config are disabled."""
+    env = {"PATH": "/usr/bin:/bin", "HOME": "/nonexistent", "LC_ALL": "C", "GIT_CONFIG_NOSYSTEM": "1",
+           "GIT_CONFIG_GLOBAL": "/dev/null", "GIT_NO_LAZY_FETCH": "1", "GIT_NO_REPLACE_OBJECTS": "1",
+           "GIT_TERMINAL_PROMPT": "0"}
+    return F.run_as_owner(["git", "-c", "core.fsmonitor=false", "-c", "protocol.allow=never",
+                           "-c", "core.hooksPath=/dev/null", "-C", repo, *argv],
+                          env=env, capture_output=True, text=True, timeout=60)
 
 
 def orphan_git_preserved_owner(group, record, target):
@@ -661,13 +667,14 @@ def orphan_git_preserved_owner(group, record, target):
         return "ORPHAN_SOURCE_PRESENT", "the recorded worktree exists; use the normal route"
     repo = group.get("orphan_repo")
     if not isinstance(repo, str) or not os.path.isabs(repo) or os.path.realpath(repo) != repo \
-            or not os.path.exists(os.path.join(repo, ".git")):
-        return "ORPHAN_REPO_UNVERIFIED", "orphan_repo must be a canonical git checkout"
+            or not os.path.isdir(os.path.join(repo, ".git")) or os.path.islink(os.path.join(repo, ".git")):
+        return "ORPHAN_REPO_UNVERIFIED", "orphan_repo must be a canonical checkout with a real .git directory"
     try:
         listing = _git(repo, "worktree", "list", "--porcelain")
         if listing.returncode:
             return "ORPHAN_REPO_UNVERIFIED", "git worktree list failed"
-        if any(line[9:] == wt for line in listing.stdout.splitlines() if line.startswith("worktree ")):
+        if any(os.path.realpath(line[9:]) in (wt, os.path.realpath(wt))
+               for line in listing.stdout.splitlines() if line.startswith("worktree ")):
             return "ORPHAN_SOURCE_PRESENT", "git still registers the recorded worktree"
         if _git(repo, "cat-file", "-e", head + "^{commit}").returncode:
             return "GIT_HISTORY_NOT_PRESERVED", "the build HEAD is not a commit in the repository"

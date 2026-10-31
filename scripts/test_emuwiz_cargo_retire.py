@@ -995,6 +995,52 @@ class OrphanRoute(Base):
         self.assertTrue(codes & {"SOURCE_MISSING", "NOT_ADOPTED"}, codes)
         self.assertTrue(self.exists(t, "debug/deps"))
 
+    def test_forged_binding_and_repository_evidence_hold(self):
+        wt, t, g = self.orphan()
+        for label, change, want in (
+                ("hash", {"orphan_repo": "relative/repo"}, "ORPHAN_REPO_UNVERIFIED"),
+                ("missing-repo", {"orphan_repo": os.path.join(self.tmp, "no-such-repo")}, "ORPHAN_REPO_UNVERIFIED"),
+                ("unknown-commit", {"source_head": "2" * 40}, "OWNER_UNVERIFIED")):
+            codes, _ = self.holds(dict(g, **change), label + ".json")
+            self.assertIn(want, codes, label)
+            self.assertTrue(self.exists(t, "debug/deps"), label)
+        # a .git FILE (gitdir redirect) is not accepted as the repository
+        fake = os.path.join(self.tmp, "redirect")
+        os.makedirs(fake)
+        with open(os.path.join(fake, ".git"), "w") as handle:
+            handle.write("gitdir: " + os.path.join(self.repo, ".git") + "\n")
+        codes, _ = self.holds(dict(g, orphan_repo=os.path.realpath(fake)), "redirect.json")
+        self.assertIn("ORPHAN_REPO_UNVERIFIED", codes)
+        self.assertTrue(self.exists(t, "debug/deps"))
+        # record whose name/hash binding was tampered with
+        rec = os.path.join(self.reg, "targets", self.key_of(t) + ".json")
+        data = T.jload(rec)
+        data["worktree_hash"] = "0" * 12
+        T.jdump(data, rec)
+        codes, _ = self.holds(g, "tampered.json")
+        self.assertIn("OWNER_UNVERIFIED", codes)
+        self.assertTrue(self.exists(t, "debug/deps"))
+
+    def test_git_runs_with_scrubbed_env_and_owner_runner(self):
+        seen = {}
+        orig = self.mod.F.run_as_owner
+
+        def spy(cmd, **kw):
+            seen.update(cmd=cmd, env=kw.get("env"))
+            return orig(cmd, **kw)
+
+        self.mod.F.run_as_owner = spy
+        self.addCleanup(setattr, self.mod.F, "run_as_owner", orig)
+        wt, t, g = self.orphan()
+        os.environ["GIT_DIR"] = "/nonexistent"
+        self.addCleanup(os.environ.pop, "GIT_DIR", None)
+        codes, _ = self.holds(g)
+        self.assertEqual(codes, set())
+        self.assertFalse(any(k.startswith("GIT_") and k not in (
+            "GIT_CONFIG_NOSYSTEM", "GIT_CONFIG_GLOBAL", "GIT_NO_LAZY_FETCH", "GIT_NO_REPLACE_OBJECTS",
+            "GIT_TERMINAL_PROMPT") for k in seen["env"]))
+        self.assertIn("protocol.allow=never", seen["cmd"])
+
     def test_other_gates_still_apply_to_the_orphan_route(self):
         wt, t = self.managed_cache("wt-pinned-orphan")
         self.assertEqual(self.ret("pin", wt, "--reason", "independent-review").returncode, 0)
