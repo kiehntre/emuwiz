@@ -134,11 +134,12 @@ fn attempt_with_endpoints<T: RommTransport>(
     let now = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map_or(0, |t| i64::try_from(t.as_secs()).unwrap_or(i64::MAX));
-    if let Request::Cover(game) = request {
+    if let Request::Cover(game) | Request::DetailCover(game) = &request {
+        let detail = matches!(request, Request::DetailCover(_));
         // The established core cache owns fetch policy, byte/image bounds and storage.
         let cache = ArtworkCache::new(root, IdentityProvider::Romm);
         let mut request = ArtworkRequest::from_record(&game.identity);
-        if request.small_reference.is_some() {
+        if !detail && request.small_reference.is_some() {
             request.large_reference = None;
         }
         let image = cache
@@ -146,7 +147,12 @@ fn attempt_with_endpoints<T: RommTransport>(
             .ok()
             .and_then(|thumbnail| crate::romm_game::decode_thumbnail(&thumbnail, true).ok())
             .map(|cover| cover.image);
-        return Ok(Reply::Cover { id: game.id, image });
+        let id = game.id;
+        return Ok(if detail {
+            Reply::DetailCover { id, image }
+        } else {
+            Reply::Cover { id, image }
+        });
     }
     let mut browser = RommBrowser::new(&source, transport, now);
     let info = browser.discover(Some(cancel));
@@ -223,7 +229,9 @@ fn attempt_with_endpoints<T: RommTransport>(
             .game_detail(id, Some(cancel))
             .map(|detail| Reply::Detail(detail, source.token().clone()))
             .map_err(Problem::Backend),
-        Request::Settings | Request::Connect | Request::Cover(_) => unreachable!(),
+        Request::Settings | Request::Connect | Request::Cover(_) | Request::DetailCover(_) => {
+            unreachable!()
+        }
     }
 }
 
