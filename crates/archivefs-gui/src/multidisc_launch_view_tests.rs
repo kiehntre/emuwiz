@@ -116,10 +116,110 @@ fn missing_intermediate_disc_is_shown_and_order_is_not_claimed() {
         "no start claim without verified order"
     );
     assert!(g.next_discs.is_empty());
+    assert_eq!(g.headline, "3-disc game · order not verified");
+    assert_eq!(g.missing_media, ["Disc 2 of 3"]);
+}
+
+#[test]
+fn a_lone_disc_of_a_larger_set_still_names_what_is_missing() {
+    let root = temp_root("lone");
+    let (mut set, paths) = verified_set(&root, 3);
+    set.members.truncate(1);
+    set.state = MediaSetState::IncompleteSet;
+    let context = MultiDiscLaunchContext::for_content(std::slice::from_ref(&set), &paths[0], &[])
+        .expect("a lone disc of a three-disc set is still a multi-disc game");
+    let g = guidance(&context.sets[0], &paths[0], None);
+    assert_eq!(g.headline, "3-disc game · order not verified");
+    assert_eq!(g.missing_media, ["Disc 2 of 3", "Disc 3 of 3"]);
+
+    set.expected_count = None;
     assert!(
-        g.missing_media.iter().any(|missing| missing.contains("2")),
-        "{g:?}"
+        MultiDiscLaunchContext::for_content(std::slice::from_ref(&set), &paths[0], &[]).is_none(),
+        "a single file with no expected total stays a single-disc game"
     );
+}
+
+/// Guidance the library would show for files known only by name.
+fn named_guidance(label: &str, names: &[&str]) -> Option<DiscGuidance> {
+    let root = temp_root(label);
+    let paths: Vec<PathBuf> = names.iter().map(|name| root.join(name)).collect();
+    for path in &paths {
+        fs::write(path, [0u8; 16]).unwrap();
+    }
+    let archives = catalogue_archives(&paths);
+    let sets = sets_from(&[], &archives);
+    let context = MultiDiscLaunchContext::for_content(&sets, &paths[0], &archives)?;
+    Some(guidance(&context.sets[0], &paths[0], None))
+}
+
+#[test]
+fn a_lone_disc_named_by_filename_lists_the_rest() {
+    let g = named_guidance("lone-name", &["Game (Disc 1 of 3).iso"]).unwrap();
+    assert_eq!(g.headline, "3-disc game · order not verified");
+    assert_eq!(g.missing_media, ["Disc 2 of 3", "Disc 3 of 3"]);
+}
+
+#[test]
+fn dates_and_bare_ranges_never_invent_a_multi_disc_game() {
+    for name in [
+        "SkidMarks - Racer Disk Issue 1 (1995-08)(Acid)[h SR][addons].adf",
+        "Compilation (1990-1996).adf",
+        "Collection (1-4).iso",
+        "Game (Side 1 of 2).d64",
+    ] {
+        assert_eq!(named_guidance("not-multi", &[name]), None, "{name}");
+    }
+}
+
+#[test]
+fn parts_are_never_called_discs() {
+    let g = named_guidance(
+        "parts",
+        &["Game (Part 1 of 3).iso", "Game (Part 3 of 3).iso"],
+    )
+    .unwrap();
+    assert_eq!(g.headline, "3-part game · order not verified");
+    assert_eq!(g.missing_media, ["Part 2 of 3"]);
+}
+
+#[test]
+fn the_headline_counts_media_not_sides() {
+    let g = named_guidance(
+        "sides",
+        &[
+            "Game (Disk 1 of 3 Side A).adf",
+            "Game (Disk 1 of 3 Side B).adf",
+            "Game (Disk 2 of 3 Side A).adf",
+            "Game (Disk 2 of 3 Side B).adf",
+        ],
+    )
+    .unwrap();
+    assert_eq!(g.headline, "3-disk game · order not verified");
+    assert_eq!(g.missing_media, ["Disk 3 of 3"]);
+}
+
+#[test]
+fn unnumbered_media_are_not_reported_as_missing_numbers() {
+    let root = temp_root("unnumbered");
+    let (mut set, paths) = verified_set(&root, 2);
+    set.members[1].ordinal = None;
+    set.members[1].representations[0].ordinal = None;
+    set.state = MediaSetState::IncompleteSet;
+    let g = guidance(&set, &paths[0], None);
+    assert!(g.missing_media.is_empty(), "{g:?}");
+    assert!(!g.conflicts.iter().any(|c| c.contains("missing")), "{g:?}");
+    assert_eq!(g.headline, "2-disc game · order not verified");
+}
+
+#[test]
+fn a_bonus_disc_does_not_hide_missing_game_discs() {
+    let g = named_guidance(
+        "bonus",
+        &["Game (Disc 1 of 3).iso", "Game (Bonus Disc).iso"],
+    )
+    .unwrap();
+    assert_eq!(g.headline, "3-disc game · order not verified");
+    assert_eq!(g.missing_media, ["Disc 2 of 3", "Disc 3 of 3"]);
 }
 
 #[test]
