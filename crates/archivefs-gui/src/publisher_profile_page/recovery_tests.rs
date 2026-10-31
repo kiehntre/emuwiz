@@ -22,13 +22,17 @@ struct Export {
 
 fn exported(mode: PublisherLinkMode) -> Export {
     let temp = tempfile::tempdir().unwrap();
-    let sources = vec![temp.path().join("Game.rom"), temp.path().join("Other.rom")];
     let destination = temp.path().join("published");
+    std::fs::create_dir(&destination).unwrap();
+    export_to(mode, temp, destination)
+}
+
+fn export_to(mode: PublisherLinkMode, temp: tempfile::TempDir, destination: PathBuf) -> Export {
+    let sources = vec![temp.path().join("Game.rom"), temp.path().join("Other.rom")];
     let journal = temp.path().join("journal");
     for source in &sources {
         std::fs::write(source, source.display().to_string()).unwrap();
     }
-    std::fs::create_dir(&destination).unwrap();
     let mut state = PublisherProfilePageState {
         target: Some(PublisherFrontend::RomM),
         destination_root: destination.display().to_string(),
@@ -44,7 +48,12 @@ fn exported(mode: PublisherLinkMode) -> Export {
     state.execution_review();
     state.confirmation_text = state.apply_confirmation_phrase().unwrap();
     state.apply_with_journal_dir(&journal);
-    assert_eq!(state.execution_stage, PublisherExecutionStage::Applied);
+    assert_eq!(
+        state.execution_stage,
+        PublisherExecutionStage::Applied,
+        "{:?}",
+        state.execution_error
+    );
     let links = state
         .execution_transaction
         .as_ref()
@@ -509,4 +518,85 @@ fn an_interrupted_undo_never_claims_nothing_happened() {
         message(&state)
     );
     assert!(!message(&state).contains("Nothing was rolled back"));
+}
+
+/// `temp/via/published`, where `via` is a symlink to `temp/real`.
+#[cfg(unix)]
+fn through_a_symlinked_parent() -> (tempfile::TempDir, PathBuf) {
+    let temp = tempfile::tempdir().unwrap();
+    std::fs::create_dir_all(temp.path().join("real/published")).unwrap();
+    std::os::unix::fs::symlink(temp.path().join("real"), temp.path().join("via")).unwrap();
+    let destination = temp.path().join("via/published");
+    (temp, destination)
+}
+
+#[cfg(unix)]
+#[test]
+fn a_hardlink_export_through_an_unchanged_symlink_survives_preview_and_restart() {
+    let (temp, destination) = through_a_symlinked_parent();
+    let mut export = export_to(PublisherLinkMode::Hardlink, temp, destination);
+    export.state.preview();
+    assert!(export.state.execution_error.is_none());
+    let mut state = restarted(&export.journal);
+    assert_eq!(state.recovery.exports[0].blocker, None);
+    roll_back_listed(&mut state);
+    assert!(
+        message(&state).contains("rolled back"),
+        "{}",
+        message(&state)
+    );
+    assert!(!present(&export.links[0]));
+    assert!(export.sources[0].exists());
+}
+
+#[cfg(unix)]
+#[test]
+fn a_retargeted_symlink_or_replaced_folder_refuses_hardlink_undo() {
+    let (temp, destination) = through_a_symlinked_parent();
+    let root = temp.path().to_path_buf();
+    let export = export_to(PublisherLinkMode::Hardlink, temp, destination);
+    let refused = |journal: &Path| {
+        let mut state = restarted(journal);
+        let blocker = state.recovery.exports[0].blocker.clone().expect("refused");
+        assert!(blocker.contains("no longer leads"), "{blocker}");
+        roll_back_listed(&mut state);
+    };
+
+    std::fs::create_dir_all(root.join("other/published")).unwrap();
+    std::fs::remove_file(root.join("via")).unwrap();
+    std::os::unix::fs::symlink(root.join("other"), root.join("via")).unwrap();
+    refused(&export.journal);
+    std::fs::remove_file(root.join("via")).unwrap();
+    std::os::unix::fs::symlink(root.join("real"), root.join("via")).unwrap();
+
+    let moved = root.join("real/moved");
+    std::fs::rename(root.join("real/published"), &moved).unwrap();
+    std::fs::create_dir(root.join("real/published")).unwrap();
+    refused(&export.journal);
+    assert!(moved.join("roms/amiga/Game.rom").exists());
+}
+
+#[cfg(unix)]
+#[test]
+fn a_symlink_export_through_a_symlinked_parent_stops_before_apply() {
+    let (temp, destination) = through_a_symlinked_parent();
+    let source = temp.path().join("Game.rom");
+    std::fs::write(&source, b"rom").unwrap();
+    let mut state = PublisherProfilePageState {
+        target: Some(PublisherFrontend::RomM),
+        destination_root: destination.display().to_string(),
+        source_plan: Some(plan_with(vec![elected(
+            "Game",
+            &source.display().to_string(),
+        )])),
+        canonical_platform_id: "Amiga".to_string(),
+        ..Default::default()
+    };
+    state.preview();
+    state.link_mode = Some(PublisherLinkMode::Symlink);
+    state.execution_review();
+    assert_ne!(state.execution_stage, PublisherExecutionStage::Confirming);
+    let error = state.execution_error.clone().unwrap_or_default();
+    assert!(error.contains("goes through a symlink"), "{error}");
+    assert_eq!(std::fs::read_dir(&destination).unwrap().count(), 0);
 }

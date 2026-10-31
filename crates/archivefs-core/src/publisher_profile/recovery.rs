@@ -26,6 +26,30 @@ pub const PUBLISHER_EXPORT_MARKER: &str = "publisher_export_v1";
 const MODE_HARDLINK: &str = "hardlink";
 const MODE_SYMLINK: &str = "symlink";
 
+/// Where `root` really is: its resolved path and filesystem identity, or null
+/// when that cannot be established. The root may be reached through a symlinked
+/// parent, so comparing this, not the path text, shows it is still the same
+/// folder.
+fn destination_identity(root: &Path) -> serde_json::Value {
+    let Ok(real) = std::fs::canonicalize(root) else {
+        return serde_json::Value::Null;
+    };
+    let Ok(metadata) = std::fs::metadata(&real) else {
+        return serde_json::Value::Null;
+    };
+    #[cfg(unix)]
+    let (dev, ino) = {
+        use std::os::unix::fs::MetadataExt;
+        (metadata.dev(), metadata.ino())
+    };
+    #[cfg(not(unix))]
+    let (dev, ino) = {
+        let _ = metadata;
+        (0_u64, 0_u64)
+    };
+    serde_json::json!({"real_path": real, "dev": dev, "ino": ino})
+}
+
 /// The value stamped when a Publisher transaction is built.
 pub(super) fn export_marker(
     destination_root: &Path,
@@ -33,6 +57,7 @@ pub(super) fn export_marker(
 ) -> serde_json::Value {
     serde_json::json!({
         "destination_root": destination_root,
+        "destination_identity": destination_identity(destination_root),
         "link_mode": match link_mode {
             PublisherLinkMode::Hardlink => MODE_HARDLINK,
             PublisherLinkMode::Symlink => MODE_SYMLINK,
@@ -176,6 +201,18 @@ fn export_root(transaction: &RenameTransaction) -> Option<&Path> {
         .map(Path::new)
 }
 
+/// Whether the root still resolves to the folder recorded at export. Hardlink
+/// rollback checks containment from the root down, so this covers the path
+/// above it. Unrecorded identity never matches.
+fn destination_unchanged(transaction: &RenameTransaction, root: &Path) -> bool {
+    let recorded = transaction
+        .unknown
+        .get(PUBLISHER_EXPORT_MARKER)
+        .and_then(|marker| marker.get("destination_identity"));
+    let current = destination_identity(root);
+    !current.is_null() && recorded == Some(&current)
+}
+
 /// Why Undo should wait: an unavailable folder would otherwise be recorded as a
 /// refused link, and links are never retried. A single missing source folder
 /// is not an outage, so it stays with the per-entry partial rollback.
@@ -200,7 +237,7 @@ fn availability_blocker(transaction: &RenameTransaction) -> Option<String> {
     }
     let hardlinked = reversible_entries(transaction)
         .any(|entry| matches!(entry.operation, TransactionOperation::CreateHardlink { .. }));
-    (hardlinked && std::fs::canonicalize(root).ok().as_deref() != Some(root)).then(|| {
+    (hardlinked && !destination_unchanged(transaction, root)).then(|| {
         format!(
             "{id} cannot be undone: {} no longer leads to the folder it was exported to.",
             root.display()
@@ -466,6 +503,20 @@ mod tests {
         let mut escaping = record(symlink("/out"), Some(marker));
         escaping.created_directories.push("/home/user".into());
         assert!(!is_publisher_export(&escaping));
+    }
+
+    #[test]
+    fn unrecorded_destination_identity_never_matches() {
+        let temp = tempfile::tempdir().unwrap();
+        let root_text = temp.path().to_str().unwrap();
+        let mut marker = export_marker(temp.path(), PublisherLinkMode::Hardlink);
+        let mut export = record(hardlink(root_text), Some(marker.clone()));
+        assert!(destination_unchanged(&export, temp.path()));
+        marker["destination_identity"] = serde_json::Value::Null;
+        export
+            .unknown
+            .insert(PUBLISHER_EXPORT_MARKER.into(), marker);
+        assert!(!destination_unchanged(&export, temp.path()));
     }
 
     #[test]
