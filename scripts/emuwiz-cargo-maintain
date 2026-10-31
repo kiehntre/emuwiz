@@ -1495,7 +1495,174 @@ def verify_retirement(record, target):
     return True, ""
 
 
+# Per-worktree state naming work that `git worktree remove` would delete unchecked.
+# FETCH_HEAD is left out on purpose: every fetching checkout has one, and what it
+# names came from a remote, not from this checkout.
+UNFINISHED_GIT_STATE = ("index.lock", "HEAD.lock", "MERGE_HEAD", "CHERRY_PICK_HEAD", "REVERT_HEAD",
+                        "MERGE_AUTOSTASH", "rebase-merge", "rebase-apply", "BISECT_START",
+                        "BISECT_LOG", "sequencer", "locked", "modules")
+# Everything a checkout's admin directory may hold once the checks above pass. Anything
+# else (a custom pseudoref, `git notes merge` state) is state nobody here has judged.
+KNOWN_ADMIN_ENTRIES = frozenset(("HEAD", "ORIG_HEAD", "REBASE_HEAD", "FETCH_HEAD", "AUTO_MERGE", "COMMIT_EDITMSG",
+                                 "MERGE_MSG", "SQUASH_MSG", "index", "logs", "gitdir", "commondir",
+                                 "config.worktree", "refs", "info"))
+
+
+def history_preservation_problem(wt):
+    """Why removing this checkout could lose work, or None.
+
+    `git worktree remove` deletes the checkout's own refs, HEAD reflog and
+    ORIG_HEAD, and silently deletes ignored files, so every gate that can say
+    CLEAR must prove them first. HEAD being merged says nothing about them.
+    Only a ref proves preservation: a bundle counts once it is imported under
+    refs/preservation/. Anything that cannot be established is a problem.
+
+    A path without `.git` cannot be judged from the path alone: `git worktree
+    remove` accepts one that has gone and deletes the admin directory, even one a
+    moved checkout is using, and `git worktree prune` removes it when `.git` is lost.
+    """
+    # No inherited GIT_DIR/GIT_WORK_TREE/alternates, and no replace refs or grafts
+    # that could make unmerged history look preserved.
+    env = {k: v for k, v in os.environ.items() if not k.startswith("GIT_")}
+    # GIT_OPTIONAL_LOCKS: a read-only gate must not refresh the index.
+    env.update(GIT_NO_REPLACE_OBJECTS="1", GIT_GRAFT_FILE="/nonexistent", GIT_CONFIG_NOSYSTEM="1",
+               GIT_OPTIONAL_LOCKS="0", LC_ALL="C")
+
+    def run(*args):
+        return F.run_as_owner(["git", "-C", wt, *args], capture_output=True,
+                              text=True, timeout=30, env=env)
+
+    def git(*args):
+        proc = run(*args)
+        if proc.returncode != 0:
+            raise LegacyCheckoutHold("GIT_STATE_UNVERIFIED", proc.stderr.strip())
+        return proc.stdout.strip()
+
+    def nested_git_entry():
+        # `git status` skips anything named .git, but the removal deletes it.
+        def fail(error):
+            raise error
+        for root, dirs, files in os.walk(wt, onerror=fail):
+            if root == wt:
+                dirs[:] = [d for d in dirs if d != ".git"]
+            elif ".git" in dirs or ".git" in files:
+                return os.path.relpath(root, wt)
+        return None
+
+    def require_own_admin(admin):
+        common = git("rev-parse", "--path-format=absolute", "--git-common-dir")
+        if admin == common:
+            raise LegacyCheckoutHold("GIT_WORKTREE_PROTECTED", "a main checkout or clone is never removable: "
+                                     "its own refs cannot prove its history is held elsewhere")
+        if os.path.lexists(os.path.join(common, "reftable")):
+            raise LegacyCheckoutHold("GIT_STATE_UNVERIFIED", "reftable storage keeps reflogs outside logs/HEAD")
+        # A .git file can point at another checkout's admin directory.
+        with open(os.path.join(admin, "gitdir")) as handle:
+            recorded = os.path.join(admin, handle.read().strip())
+        if os.path.realpath(recorded) != os.path.realpath(os.path.join(wt, ".git")):
+            raise LegacyCheckoutHold("CHECKOUT_PATH_UNVERIFIED", "this .git names another checkout's admin directory")
+
+    def names_in(path, read):
+        # lexists would misclassify permission failures as absence.
+        try:
+            mode = os.lstat(path).st_mode
+        except FileNotFoundError:
+            return set()
+        if not stat.S_ISREG(mode):
+            raise LegacyCheckoutHold("GIT_STATE_UNVERIFIED",
+                                     os.path.basename(path) + " is not a regular file")
+        return read(path)
+
+    def reflogs(path):
+        try:
+            mode = os.lstat(path).st_mode
+        except FileNotFoundError:
+            return set()
+        if stat.S_ISDIR(mode):
+            return set().union(*(reflogs(os.path.join(path, n)) for n in os.listdir(path)))
+        return names_in(path, reflog_names)
+
+    def reflog_names(path):
+        # Read the file itself: gc keeps both IDs of every entry, while
+        # `git reflog show` lists only the new one.
+        names = set()
+        with open(path, "rb") as handle:
+            for line in handle:
+                names.update(line.split(b"\t", 1)[0].decode(errors="replace").split()[:2])
+        return names
+
+    def orig_head_name(path):
+        with open(path) as handle:
+            return {handle.read().strip()}
+
+    try:
+        try:
+            os.lstat(os.path.join(wt, ".git"))
+        except FileNotFoundError:
+            return ("CHECKOUT_PATH_UNVERIFIED", "path holds no .git, so its registered Git state cannot be judged")
+        if git("rev-parse", "--show-toplevel") != os.path.realpath(wt):
+            return ("CHECKOUT_PATH_UNVERIFIED", "path is not a Git checkout root")
+        admin = git("rev-parse", "--absolute-git-dir")
+        require_own_admin(admin)
+        if any(os.path.lexists(os.path.join(admin, n)) for n in UNFINISHED_GIT_STATE):
+            return ("GIT_WORKTREE_PROTECTED", "unfinished Git operation or lock")
+        # Before status, which does not see these files.
+        if any(line and (line[0].islower() or line[0] == "S") for line in git("ls-files", "-v", "-z").split("\0")):
+            return ("CHECKOUT_INDEX_UNVERIFIED", "assume-unchanged or skip-worktree entries can hide unfinished code")
+        status = run("status", "--porcelain=v1", "--untracked-files=all", "--ignored=matching",
+                     "--ignore-submodules=none")
+        if status.returncode != 0 or "could not open directory" in status.stderr:
+            return ("GIT_STATE_UNVERIFIED", status.stderr.strip())
+        if status.stdout.strip():
+            return ("CHECKOUT_NOT_CLEAN", "tracked, untracked or ignored files require preservation")
+        # Files inside a gitlink's directory are invisible to status, with or without
+        # submodule state, and are deleted with the checkout.
+        if any(line.startswith("160000 ") for line in git("ls-files", "-s", "-z").split("\0")):
+            return ("GIT_STATE_UNVERIFIED", "a gitlink's directory can hold files status does not report")
+        nested = nested_git_entry()
+        if nested:
+            return ("GIT_STATE_UNVERIFIED", "nested .git entry status does not report: " + ascii(nested))
+        if git("for-each-ref", "--format=%(refname)", "refs/worktree", "refs/bisect", "refs/rewritten"):
+            return ("GIT_HISTORY_NOT_PRESERVED", "per-worktree refs would be deleted with the checkout")
+        unknown = sorted(set(os.listdir(admin)) - KNOWN_ADMIN_ENTRIES)
+        if unknown:
+            return ("GIT_STATE_UNVERIFIED", "unjudged state in the checkout's admin directory: " + ", ".join(unknown))
+        names = reflogs(os.path.join(admin, "logs"))
+        names |= names_in(os.path.join(admin, "ORIG_HEAD"), orig_head_name)
+        # A finished rebase can leave this behind, so it is checked, not held on.
+        names |= names_in(os.path.join(admin, "REBASE_HEAD"), orig_head_name)
+        names.add(git("rev-parse", "--verify", "HEAD^{commit}"))
+        if not all(len(n) in (40, 64) and not n.strip("0123456789abcdef") for n in names):
+            return ("GIT_STATE_UNVERIFIED", "reflog or ORIG_HEAD holds something other than an object ID")
+        names -= {"0" * 40, "0" * 64}
+        # Not --all: that counts worktree HEADs, including this checkout's own.
+        # A named object that no longer exists makes rev-list fail, and so HOLD.
+        orphans = git("rev-list", *sorted(names), "--not", "--glob=refs/*").split()
+    except (OSError, ValueError, subprocess.SubprocessError) as error:
+        return ("GIT_STATE_UNVERIFIED", str(error))
+    except LegacyCheckoutHold as error:
+        return (error.code, error.explanation)
+    if orphans:
+        return ("GIT_HISTORY_NOT_PRESERVED",
+                f"{len(orphans)} commit(s) are named only by this checkout's HEAD, reflog or ORIG_HEAD "
+                f"(for example {', '.join(o[:12] for o in orphans[:5])}); retain them under refs/preservation/ first")
+    return None
+
+
 def worktree_gate(path):
+    """The lifecycle gate, which can only be CLEAR when the checkout's history is
+    also preserved. A HOLD still reports any history problem, so a Cargo reason
+    can never hide it."""
+    res = lifecycle_gate(path)
+    problem = history_preservation_problem(res["worktree"])
+    if problem and res["status"] == "CLEAR":
+        res.update(status="HOLD", code=problem[0], explanation=problem[1])
+    elif problem:
+        res["history_preservation"] = dict(code=problem[0], explanation=problem[1])
+    return res
+
+
+def lifecycle_gate(path):
     """CLEAR only when the worktree's compiler artifacts are gone (retired with a
     verified receipt, or never existed).  Otherwise HOLD with the reason and the
     next step.  The gate never deletes and a release record alone never clears it."""
@@ -1596,12 +1763,18 @@ def worktree_gate(path):
                 "when the soft budget is exceeded). Keep the worktree until the artifacts are retired")
 
 
+def history_note(gate):
+    problem = gate.get("history_preservation")
+    return f"\n  history: {problem['code']}: {problem['explanation']}" if problem else ""
+
+
 def cmd_worktree_check(args):
-    res = worktree_gate(args.worktree)
+    # --cargo-state-only answers "is there compiler output?"; it never authorizes removal.
+    res = (lifecycle_gate if args.cargo_state_only else worktree_gate)(args.worktree)
     if args.json:
         print(json.dumps(res, indent=1, sort_keys=True))
     else:
-        print(f"{res['status']}: {res['worktree']}\n  {res['explanation']}")
+        print(f"{res['status']}: {res['worktree']}\n  {res['explanation']}{history_note(res)}")
     return 0 if res["status"] == "CLEAR" else EXIT_WORKTREE_HOLD
 
 
@@ -1636,6 +1809,11 @@ def reconcile_legacy_worktree(path, preserved_ref=None, remove=False):
         require(proc.returncode == 0, "GIT_STATE_UNVERIFIED", proc.stderr.strip())
         return proc.stdout.strip()
 
+    def history():
+        problem = history_preservation_problem(wt)
+        if problem:
+            raise LegacyCheckoutHold(*problem)
+
     def absent():
         # exists/isdir would misclassify dangling symlinks and permission failures.
         try:
@@ -1659,28 +1837,9 @@ def reconcile_legacy_worktree(path, preserved_ref=None, remove=False):
         rows = [b for b in blocks if b.get("worktree") == wt]
         require(len(rows) == 1 and not any(k in rows[0] for k in ("locked", "prunable")),
                 "GIT_WORKTREE_PROTECTED", "checkout must be registered, unlocked and not prunable")
-        admin = git("rev-parse", "--absolute-git-dir")
-        common = git("rev-parse", "--path-format=absolute", "--git-common-dir")
-        require(admin != common, "GIT_WORKTREE_PROTECTED", "never reconcile the main checkout")
-        require(not any(os.path.lexists(os.path.join(admin, n)) for n in
-                        ("index.lock", "HEAD.lock", "MERGE_HEAD", "CHERRY_PICK_HEAD", "REVERT_HEAD",
-                         "rebase-merge", "rebase-apply", "BISECT_START", "sequencer")),
-                "GIT_WORKTREE_PROTECTED", "unfinished Git operation or lock")
-        tracked = git("ls-files", "-v", "-z").split("\0")
-        require(not any(line and (line[0].islower() or line[0] == "S") for line in tracked),
-                "CHECKOUT_INDEX_UNVERIFIED", "assume-unchanged or skip-worktree entries can hide unfinished code")
-        require(not git("status", "--porcelain=v1", "--untracked-files=all", "--ignored=matching",
-                        "--ignore-submodules=none"),
-                "CHECKOUT_NOT_CLEAN", "tracked, untracked or ignored files require preservation")
-        # `git worktree remove` also deletes this checkout's own refs and HEAD reflog.
-        require(not git("for-each-ref", "--format=%(refname)", "refs/worktree", "refs/bisect", "refs/rewritten"),
-                "GIT_HISTORY_NOT_PRESERVED", "per-worktree refs would be deleted with the checkout")
+        history()
         head = git("rev-parse", "HEAD")
         main = git("rev-parse", "--verify", "refs/remotes/origin/main^{commit}")
-        orphans = reflog_only_commits(admin, main)
-        require(not orphans, "GIT_HISTORY_NOT_PRESERVED",
-                f"{len(orphans)} commit(s) are named only by this checkout's reflog or ORIG_HEAD; "
-                "retain them under refs/preservation/ first")
         merged = F.run_as_owner(["git", "-C", wt, "merge-base", "--is-ancestor", head, main],
                                 capture_output=True, text=True, timeout=30, env=git_env).returncode == 0
         preserved = None
@@ -1693,29 +1852,6 @@ def reconcile_legacy_worktree(path, preserved_ref=None, remove=False):
         return dict(head=head, branch=rows[0].get("branch", ""), main=main,
                     preserved_ref=preserved_ref, preserved_head=preserved,
                     checkout_identity=[st.st_dev, st.st_ino])
-
-    def reflog_only_commits(admin, main):
-        # Read the reflog file itself: gc keeps both IDs of every entry, while
-        # `git reflog show` lists only the new one.
-        names = set()
-        log = os.path.join(admin, "logs", "HEAD")
-        if os.path.lexists(log):
-            require(stat.S_ISREG(os.lstat(log).st_mode), "GIT_STATE_UNVERIFIED", "HEAD reflog is not a regular file")
-            with open(log, "rb") as handle:
-                for line in handle:
-                    names.update(line.split(b"\t", 1)[0].decode(errors="replace").split()[:2])
-        orig = os.path.join(admin, "ORIG_HEAD")
-        if os.path.lexists(orig):
-            require(stat.S_ISREG(os.lstat(orig).st_mode), "GIT_STATE_UNVERIFIED", "ORIG_HEAD is not a regular file")
-            with open(orig) as handle:
-                names.add(handle.read().strip())
-        require(all(len(n) in (40, 64) and not n.strip("0123456789abcdef") for n in names),
-                "GIT_STATE_UNVERIFIED", "reflog or ORIG_HEAD holds something other than an object ID")
-        names -= {"0" * 40, "0" * 64}
-        if not names:
-            return []
-        # --all includes every ref and every worktree's HEAD; HEAD itself is proven above.
-        return git("rev-list", *sorted(names), "--not", "--all", main).split()
 
     def ownership(registry, key, branch):
         records = []
@@ -1767,6 +1903,8 @@ def reconcile_legacy_worktree(path, preserved_ref=None, remove=False):
                 "LIVE_PROCESS_REFERENCE", "a process references the checkout or target")
 
     try:
+        # First: a present target must not be able to hide lost history.
+        history()
         absent()
         registry = F.Registry(create=True)
         key = F.key_for(target)
@@ -1838,8 +1976,9 @@ def cmd_task_complete(args):
     gate = worktree_gate(wt)
     if rc != 0:
         print(msg, file=sys.stderr)
-        # a target that was never built has nothing to release or strand
-        if gate["status"] != "CLEAR":
+        # a target that was never built has nothing to release or strand, whatever
+        # the checkout's Git state: that is reported below, and is not a release failure
+        if lifecycle_gate(wt)["status"] != "CLEAR":
             return rc
     res = {"released": rc == 0, "message": msg, "gate": gate}
     if args.json:
@@ -1847,7 +1986,7 @@ def cmd_task_complete(args):
     else:
         if msg:
             print(msg)
-        print(f"worktree: {gate['status']} - {gate['explanation']}")
+        print(f"worktree: {gate['status']} - {gate['explanation']}{history_note(gate)}")
         if gate["status"] != "CLEAR":
             print("  KEEP this worktree. Do not remove it until "
                   f"`scripts/emuwiz-cargo-maintain worktree-check {wt}` reports CLEAR.")
@@ -2177,6 +2316,8 @@ def build_parser():
     wc = sub.add_parser("worktree-check", help="may this worktree be removed? (CLEAR/HOLD, exit 10 on HOLD)")
     wc.add_argument("worktree")
     wc.add_argument("--json", action="store_true")
+    wc.add_argument("--cargo-state-only", action="store_true",
+                    help="report only the Cargo cache state; never an authority to remove the worktree")
     wc.set_defaults(func=cmd_worktree_check)
     wr = sub.add_parser("worktree-reconcile", help="independent legacy checkout reconciliation; never claims cache retirement")
     wr.add_argument("worktree")
