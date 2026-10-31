@@ -165,7 +165,8 @@ fn preview_refuses_to_drop_a_rollback_it_cannot_recover_later() {
 
 #[test]
 fn modified_or_replaced_links_are_refused_and_preserved() {
-    let plant: [(&str, fn(&Path)); 2] = [
+    type Plant = (&'static str, fn(&Path));
+    let plant: [Plant; 2] = [
         ("replaced by a user file", |link| {
             std::fs::remove_file(link).unwrap();
             std::fs::write(link, b"user data").unwrap();
