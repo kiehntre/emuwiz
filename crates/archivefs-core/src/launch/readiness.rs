@@ -18,7 +18,7 @@
 //! inventing a PSP BIOS requirement here would be exactly the kind of
 //! unreviewed assumption this module exists to avoid.
 
-use crate::emulator_environment::retroarch::CoreInfoFinding;
+use crate::emulator_environment::retroarch::{CoreInfoFinding, FirmwarePresence};
 use crate::patch_manager::{
     DuckStationBiosState, FlycastSystemFileState, HatariTosHealth, PceCdFirmwareReadiness,
     Pcsx2BiosVerification, Rpcs3FirmwareStatus, XemuSystemFileState,
@@ -745,31 +745,99 @@ pub fn xenia_firmware_readiness() -> FirmwareReadiness {
     FirmwareReadiness::NotRequired
 }
 
-/// Whether a RetroArch core's own `.info` metadata declares a required
-/// (non-optional) `firmwareN_*` entry. This never checks whether the
-/// declared file actually exists on disk (that would be filesystem I/O the
-/// pure planner must not perform) - it only reads metadata the core's
-/// `.info` file already declared, exactly as
-/// [`crate::emulator_environment::retroarch`] already parsed it. A core
-/// that declares no firmware requirement, or whose `.info` could not be
-/// read at all, answers `NotRequired`/`Unknown` respectively rather than a
-/// guess.
+/// Projects a RetroArch core's declared, non-optional `firmwareN_*` entries
+/// onto [`FirmwareReadiness`]. This performs no I/O: discovery already
+/// probed each entry read-only and no-follow under the profile's system
+/// directory and recorded a [`FirmwarePresence`]. Any `Missing` required
+/// entry is `Missing`; any entry EmuWiz cannot judge (or a core whose
+/// `.info` could not be read) is `Unknown`; only when every required entry
+/// is present does the result reach `PresentUnverified`. Never `Verified`:
+/// file contents are not hashed.
 pub fn retroarch_core_firmware_readiness(info: &CoreInfoFinding) -> FirmwareReadiness {
-    match info {
-        CoreInfoFinding::Found { firmware, .. } => {
-            if firmware.iter().any(|entry| !entry.optional) {
-                FirmwareReadiness::Unknown
-            } else {
-                FirmwareReadiness::NotRequired
-            }
+    let CoreInfoFinding::Found { firmware, .. } = info else {
+        return FirmwareReadiness::Unknown;
+    };
+    let mut required = firmware.iter().filter(|entry| !entry.optional).peekable();
+    if required.peek().is_none() {
+        return FirmwareReadiness::NotRequired;
+    }
+    let mut all_present = true;
+    for entry in required {
+        match entry.presence {
+            FirmwarePresence::Missing => return FirmwareReadiness::Missing,
+            FirmwarePresence::Unknown => all_present = false,
+            FirmwarePresence::PresentUnverified => {}
         }
-        _ => FirmwareReadiness::Unknown,
+    }
+    if all_present {
+        FirmwareReadiness::PresentUnverified
+    } else {
+        FirmwareReadiness::Unknown
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn core_with(entries: &[(bool, FirmwarePresence)]) -> CoreInfoFinding {
+        use crate::emulator_environment::retroarch::FirmwareRequirement;
+        CoreInfoFinding::Found {
+            display_name: None,
+            display_version: None,
+            system_name: None,
+            supported_extensions: Vec::new(),
+            core_name: None,
+            manufacturer: None,
+            categories: None,
+            database: None,
+            firmware: entries
+                .iter()
+                .enumerate()
+                .map(|(i, (optional, presence))| FirmwareRequirement {
+                    index: i as u32,
+                    path: Some(format!("f{i}.bin")),
+                    description: None,
+                    optional: *optional,
+                    presence: *presence,
+                })
+                .collect(),
+        }
+    }
+
+    #[test]
+    fn retroarch_core_firmware_projection() {
+        use FirmwarePresence::*;
+        let cases: [(&[(bool, FirmwarePresence)], FirmwareReadiness); 7] = [
+            (&[], FirmwareReadiness::NotRequired),
+            (&[(true, Missing)], FirmwareReadiness::NotRequired),
+            (&[(false, Missing)], FirmwareReadiness::Missing),
+            (
+                &[(false, PresentUnverified), (false, Missing)],
+                FirmwareReadiness::Missing,
+            ),
+            (
+                &[(false, PresentUnverified), (false, Unknown)],
+                FirmwareReadiness::Unknown,
+            ),
+            (
+                &[(false, PresentUnverified), (true, Missing)],
+                FirmwareReadiness::PresentUnverified,
+            ),
+            (&[(false, Unknown)], FirmwareReadiness::Unknown),
+        ];
+        for (entries, expected) in cases {
+            assert_eq!(
+                retroarch_core_firmware_readiness(&core_with(entries)),
+                expected,
+                "{entries:?}"
+            );
+        }
+        assert_eq!(
+            retroarch_core_firmware_readiness(&CoreInfoFinding::Missing),
+            FirmwareReadiness::Unknown
+        );
+    }
 
     #[test]
     fn duckstation_projection_matches_every_state() {
