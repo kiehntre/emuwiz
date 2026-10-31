@@ -378,7 +378,11 @@ fn rollback_transaction_inner(
             // quarantine; an unreachable or unrecognised folder keeps it.
             let need_new = hardlink_quarantine_names(entry).is_none()
                 || hardlink_quarantine_state(entry) == QuarantineState::Absent;
-            if need_new {
+            // Sealed only once the live link is proved, so a stand-in folder
+            // (an empty mount point) can never poison the record.
+            let link_proved = capture_identity(&entry.destination_path)
+                .is_ok_and(|current| identity_matches(&entry.identity, &current));
+            if need_new && link_proved {
                 match super::dirsync::new_hardlink_quarantine_record(&entry.destination_path) {
                     Ok(record) => {
                         transaction.entries[index]
@@ -946,13 +950,28 @@ pub(super) fn rollback_coordinated_for_test(
 /// Whether a link's folders are unreachable right now (a folder or device is
 /// gone), judged afresh from the filesystem.
 pub fn link_unavailable_now(entry: &super::model::TransactionEntry) -> bool {
+    let folder_unproven = {
+        #[cfg(unix)]
+        {
+            matches!(entry.operation, TransactionOperation::CreateHardlink { .. })
+                && super::dirsync::hardlink_quarantine_state(entry)
+                    == super::dirsync::QuarantineState::Unknown
+        }
+        #[cfg(not(unix))]
+        {
+            false
+        }
+    };
     matches!(
         entry.operation,
         TransactionOperation::CreateSymlink { .. } | TransactionOperation::CreateHardlink { .. }
-    ) && [&entry.source_path, &entry.destination_path]
-        .iter()
-        .filter_map(|path| path.parent())
-        .any(|parent| std::fs::symlink_metadata(parent).is_err_and(|error| is_unavailable(&error)))
+    ) && (folder_unproven
+        || [&entry.source_path, &entry.destination_path]
+            .iter()
+            .filter_map(|path| path.parent())
+            .any(|parent| {
+                std::fs::symlink_metadata(parent).is_err_and(|error| is_unavailable(&error))
+            }))
 }
 
 /// Records, on the user's explicit decision, that link entries held back by a

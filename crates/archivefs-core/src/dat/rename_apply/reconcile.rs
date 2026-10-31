@@ -623,7 +623,7 @@ pub(super) fn classify_entry(entry: &TransactionEntry, index: usize) -> Recovery
                     return RecoveryIssue {
                         entry_index: index,
                         kind: RecoveryIssueKind::EvidenceUnavailable,
-                        detail: "the folder of this hard link's Undo quarantine cannot be reached or is not the recorded folder, so whether the link was removed is unproven"
+                        detail: "the folder of this hard link's Undo quarantine cannot be reached or is not the recorded folder, so whether the link was removed is unproven; reconnect the original drive or folder, or abandon this link from the export list"
                             .to_string(),
                     };
                 }

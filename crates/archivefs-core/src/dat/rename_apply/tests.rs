@@ -4950,3 +4950,43 @@ fn only_the_exact_quarantine_record_shape_is_accepted() {
         );
     }
 }
+
+#[cfg(unix)]
+#[test]
+fn a_stand_in_folder_at_the_first_undo_never_seals_a_quarantine_record() {
+    let mut m = applied_mixed();
+    let away = m.hard.with_extension("away");
+    std::fs::rename(&m.hard, &away).unwrap();
+    std::fs::create_dir(&m.hard).unwrap(); // empty mount point
+    let _ = rollback_transaction(&mut m.tx, &m.journal, &no_cancel()).unwrap();
+    assert!(
+        !m.tx.entries[2]
+            .unknown
+            .contains_key("emuwiz_hl_quarantine_v1"),
+        "no record was sealed for a folder that holds no proved link"
+    );
+    assert!(tree_names(&m.hard).is_empty());
+    assert!(away.join("h.bin").exists(), "the real link was not touched");
+}
+
+#[cfg(unix)]
+#[test]
+fn an_unproven_folder_can_be_abandoned_and_the_evidence_names_the_quarantine() {
+    let mut m = interrupted_inside_quarantine();
+    let away = m.hard.with_extension("away");
+    std::fs::rename(&m.hard, &away).unwrap();
+    std::fs::create_dir(&m.hard).unwrap(); // the drive is gone for good
+    assert!(super::link_unavailable_now(&m.tx.entries[2]));
+    super::abandon_unavailable_links(&mut m.tx, &m.journal, &[2]).unwrap();
+    let entry = &m.tx.entries[2];
+    assert_eq!(entry.state, EntryState::RollbackFailed);
+    assert_ne!(m.tx.state, TransactionState::RolledBack);
+    let evidence = &entry.unknown["emuwiz_undo_abandoned_v1"];
+    assert!(
+        evidence["quarantine"]["dir"]
+            .as_str()
+            .unwrap()
+            .starts_with(".emuwiz-undo-q-")
+    );
+    assert!(tree_names(&m.hard).is_empty(), "nothing was touched");
+}
