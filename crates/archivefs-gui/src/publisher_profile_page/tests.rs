@@ -1322,3 +1322,37 @@ fn unsupported_frontend_platform_has_no_apply_path() {
     assert!(!destination.exists());
     assert!(!temp.path().join("journal").exists());
 }
+
+#[test]
+fn result_view_shows_the_journal_based_outcome_badge() {
+    use crate::transaction_outcome::test_support::rendered_text;
+    let temp = tempfile::tempdir().unwrap();
+    let source = temp.path().join("Game.rom");
+    let destination = temp.path().join("published");
+    let journal = temp.path().join("journal");
+    std::fs::write(&source, b"badge source").unwrap();
+    std::fs::create_dir(&destination).unwrap();
+    let mut state = executable_state(&source, &destination);
+    state.link_mode = Some(archivefs_core::publisher_profile::PublisherLinkMode::Hardlink);
+    state.execution_review();
+    state.confirmation_text = state.apply_confirmation_phrase().unwrap();
+    state.apply_with_journal_dir(&journal);
+    let render = |state: &mut PublisherProfilePageState| {
+        let ctx = egui::Context::default();
+        let output = ctx.run(Default::default(), |ctx| {
+            egui::CentralPanel::default().show(ctx, |ui| {
+                show_publisher_profile_page(ui, state);
+            });
+        });
+        rendered_text(&output)
+    };
+    let applied = render(&mut state);
+    assert!(applied.contains("Completed"), "{applied}");
+    assert!(applied.contains("1 applied"), "{applied}");
+    assert!(applied.contains("Undo available now"), "{applied}");
+    state.rollback_confirmation_text = state.rollback_confirmation_phrase().unwrap();
+    state.rollback_with_journal_dir(&journal);
+    let undone = render(&mut state);
+    assert!(undone.contains("Undone"), "{undone}");
+    assert!(!undone.contains("Undo available"), "{undone}");
+}

@@ -1058,6 +1058,21 @@ pub(crate) fn show_publisher_profile_page(
                     .map(|result| &result.summary),
             );
             ui.label(egui::RichText::new(title).strong());
+            if !matches!(
+                state.execution_stage,
+                PublisherExecutionStage::Preview
+                    | PublisherExecutionStage::Review
+                    | PublisherExecutionStage::Confirming
+                    | PublisherExecutionStage::Applying
+            ) {
+                // The current journal, not the apply-time summary: after Undo the
+                // stored summary still says "applied" while the journal says rolled back.
+                crate::transaction_outcome::show(
+                    ui,
+                    &transaction.transaction,
+                    state.rollback_confirmation_phrase().is_some(),
+                );
+            }
             if state.execution_stage == PublisherExecutionStage::Confirming {
                 ui.label("Preview reviewed. Nothing has been changed yet.");
             }
