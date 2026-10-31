@@ -7,7 +7,7 @@ use archivefs_core::launch::multidisc_launch::{
     MultiDiscLaunch, MultiDiscPlaylist, plan_multidisc_launch,
 };
 use archivefs_core::launch::{LaunchCandidate, LaunchTarget, project_media_set_for_launch};
-use archivefs_core::media_set::{MediaFamily, MediaSet, MediaSetState};
+use archivefs_core::media_set::{MediaFamily, MediaSet, MediaSetState, OrdinalUnit};
 use eframe::egui;
 use std::collections::BTreeMap;
 use std::ffi::OsString;
@@ -169,6 +169,32 @@ fn contains(set: &MediaSet, path: &Path) -> bool {
     })
 }
 
+/// One numbered medium of a larger set. A bare `(a-b)` range is not enough: in
+/// a file name it is usually a date, so such a claim needs trusted evidence.
+/// One side of a medium does not show that another medium is missing.
+fn lone_member_of_larger_set(set: &MediaSet) -> bool {
+    let ([member], Some((expected, _))) = (set.members.as_slice(), &set.expected_count) else {
+        return false;
+    };
+    expected.count > 1
+        && member.sides.is_empty()
+        && member
+            .ordinal
+            .as_ref()
+            .is_some_and(|ordinal| (1..=expected.count).contains(&ordinal.number))
+        && member
+            .representations
+            .iter()
+            .flat_map(|r| &r.record.evidence)
+            .any(|evidence| {
+                evidence.provenance.trusted()
+                    || evidence
+                        .ordinal
+                        .as_ref()
+                        .is_some_and(|ordinal| ordinal.unit != OrdinalUnit::Medium)
+            })
+}
+
 /// EmuWiz-managed playlists live under the app data directory. An unavailable
 /// directory yields an empty (relative) root, which core refuses as unsafe.
 pub(crate) fn playlist_root() -> PathBuf {
@@ -187,9 +213,7 @@ impl MultiDiscLaunchContext {
         let sets: Vec<MediaSet> = all
             .iter()
             .filter(|set| {
-                let expected = set.expected_count.as_ref().map(|(count, _)| count.count);
-                (set.members.len() > 1 || expected.is_some_and(|count| count > 1))
-                    && contains(set, content)
+                (set.members.len() > 1 || lone_member_of_larger_set(set)) && contains(set, content)
             })
             .cloned()
             .collect();
@@ -445,9 +469,20 @@ pub(crate) fn guidance(
         && projection.start_media.is_some()
         && trusted_ordinals
         && duplicate.is_none();
-    let noun = match set.family {
-        Some(MediaFamily::Floppy) => "Disk",
-        Some(MediaFamily::Tape) => "Tape",
+    let unit = set
+        .expected_count
+        .as_ref()
+        .map(|(count, _)| count.unit)
+        .or_else(|| {
+            set.members
+                .iter()
+                .find_map(|m| Some(m.ordinal.as_ref()?.unit))
+        });
+    let noun = match (unit, set.family) {
+        (Some(OrdinalUnit::Part), _) => "Part",
+        (Some(OrdinalUnit::Reel), _) => "Reel",
+        (_, Some(MediaFamily::Floppy)) => "Disk",
+        (_, Some(MediaFamily::Tape)) => "Tape",
         _ => "Disc",
     };
     let mut discs = Vec::new();
@@ -490,13 +525,18 @@ pub(crate) fn guidance(
             .collect(),
         _ => Vec::new(),
     };
-    let total = projection
-        .missing_media
+    // An unnumbered member may be the very medium a gap would name, so no
+    // number is called missing until every member has one.
+    let gaps: &[_] = if set.members.iter().all(|m| m.ordinal.is_some()) {
+        &projection.missing_media
+    } else {
+        &[]
+    };
+    let total = gaps
         .iter()
         .find_map(|missing| missing.expected_count)
-        .map_or(discs.len(), usize::from);
-    let missing_media: Vec<String> = projection
-        .missing_media
+        .map_or(set.members.len(), usize::from);
+    let missing_media: Vec<String> = gaps
         .iter()
         .map(|missing| format!("{noun} {} of {total}", missing.number))
         .collect();
@@ -530,7 +570,7 @@ pub(crate) fn guidance(
             ));
         }
     }
-    let count = total.max(discs.len());
+    let count = total.max(set.members.len());
     let noun = noun.to_ascii_lowercase();
     let headline = if order_verified {
         format!("{count}-{noun} game · order verified")
