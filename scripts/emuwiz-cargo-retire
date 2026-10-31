@@ -641,6 +641,16 @@ def _git(repo, *argv):
                           env=env, capture_output=True, text=True, timeout=60)
 
 
+def path_presence(path):
+    """'absent' only for ENOENT/ENOTDIR from lstat; 'present' when lstat succeeds; anything else
+    (EACCES, EIO, ENOTCONN, ESTALE, ELOOP, ...) is 'unknown' and must never permit retirement."""
+    try:
+        os.lstat(path)
+    except OSError as error:
+        return "absent" if error.errno in (errno.ENOENT, errno.ENOTDIR) else "unknown"
+    return "present"
+
+
 def orphan_git_preserved_owner(group, record, target):
     """Narrow, fail-closed substitute for a live source checkout (ONLY for GIT_PRESERVED groups).
 
@@ -662,6 +672,8 @@ def orphan_git_preserved_owner(group, record, target):
         return "SOURCE_MISSING", "orphan route needs a recorded cargo-iso build and worktree path"
     if not isinstance(head, str) or len(head) != 40 or any(c not in "0123456789abcdef" for c in head):
         return "SOURCE_MISSING", "orphan route needs a recorded 40-hex build HEAD"
+    if os.path.normpath(wt) != wt:
+        return "OWNER_UNVERIFIED", "recorded worktree path is not normalised"
     ident = (ev or {}).get("worktree_identity") if isinstance(ev, dict) else None
     admin, common = (ev or {}).get("gitdir"), (ev or {}).get("common_dir")
     if not (isinstance(ident, dict) and isinstance(ident.get("dev"), int) and isinstance(ident.get("ino"), int)
@@ -678,10 +690,12 @@ def orphan_git_preserved_owner(group, record, target):
         return "ORPHAN_REPO_UNVERIFIED", "the recorded repository is not a canonical checkout with a .git directory"
     if group.get("orphan_repo") is not None and group.get("orphan_repo") != repo:
         return "ORPHAN_REPO_UNVERIFIED", "manifest repository differs from the repository recorded at build time"
-    if os.path.lexists(wt):
-        return "ORPHAN_SOURCE_PRESENT", "the recorded worktree path exists; use the normal route"
-    if os.path.lexists(admin):
-        return "ORPHAN_SOURCE_PRESENT", "git still holds the checkout's administrative directory (live, moved or not pruned)"
+    for what, path in (("recorded worktree path", wt), ("checkout's administrative gitdir", admin)):
+        state = path_presence(path)
+        if state == "unknown":
+            return "ORPHAN_SOURCE_UNKNOWN", f"cannot establish whether the {what} is absent"
+        if state == "present":
+            return "ORPHAN_SOURCE_PRESENT", f"the {what} still exists (live, moved or not pruned); use the normal route"
     try:
         listing = _git(repo, "worktree", "list", "--porcelain")
         if listing.returncode:
@@ -694,8 +708,10 @@ def orphan_git_preserved_owner(group, record, target):
                 return "ORPHAN_SOURCE_PRESENT", "git still registers the recorded worktree"
             try:
                 st = os.lstat(path)
-            except OSError:
-                continue
+            except OSError as error:
+                if error.errno in (errno.ENOENT, errno.ENOTDIR):
+                    continue
+                return "ORPHAN_SOURCE_UNKNOWN", f"cannot inspect registered worktree {path}: {error.strerror}"
             if (st.st_dev, st.st_ino) == (ident["dev"], ident["ino"]):
                 return "ORPHAN_SOURCE_MOVED", f"a registered worktree at {path} is the recorded checkout (moved)"
         if _git(repo, "cat-file", "-e", head + "^{commit}").returncode:

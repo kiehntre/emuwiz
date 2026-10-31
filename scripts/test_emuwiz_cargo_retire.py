@@ -1062,6 +1062,148 @@ class OrphanRoute(Base):
         self.assertIn("ORPHAN_SOURCE_MOVED", codes)
         self.assertTrue(self.exists(t, "debug/deps"))
 
+    # --- independent checks, one failure mode each
+    def record_of(self, t):
+        path = os.path.join(self.reg, "targets", self.key_of(t) + ".json")
+        return path, T.jload(path)
+
+    def test_each_presence_condition_holds_on_its_own(self):
+        wt, t, g = self.orphan("wt-p1")            # worktree path recreated, gitdir gone
+        os.makedirs(wt)
+        self.assertIn("ORPHAN_SOURCE_PRESENT", self.holds(g)[0])
+        self.assertTrue(self.exists(t, "debug/deps"))
+        wt, t, g = self.orphan("wt-p2")            # only the administrative gitdir remains
+        _, rec = self.record_of(t)
+        os.makedirs(rec["checkout"]["gitdir"])
+        self.assertIn("ORPHAN_SOURCE_PRESENT", self.holds(g, "p2.json")[0])
+        self.assertTrue(self.exists(t, "debug/deps"))
+        wt, t, g = self.orphan("wt-p3")            # only git's worktree list names the recorded path
+        orig = self.mod._git
+
+        def listing(repo, *argv):
+            if argv[:2] == ("worktree", "list"):
+                return subprocess.CompletedProcess(argv, 0, "worktree " + wt + "\n", "")
+            return orig(repo, *argv)
+
+        self.mod._git = listing
+        self.addCleanup(setattr, self.mod, "_git", orig)
+        self.assertIn("ORPHAN_SOURCE_PRESENT", self.holds(g, "p3.json")[0])
+        self.assertTrue(self.exists(t, "debug/deps"))
+
+    def test_malformed_recorded_head_is_refused(self):
+        for bad in ("g" * 40, "A" * 40, "a" * 39, "a" * 41, "", None):
+            wt, t, g = self.orphan("wt-h%d" % abs(hash(str(bad))))
+            path, rec = self.record_of(t)
+            rec["head"] = bad
+            T.jdump(rec, path)
+            codes, _ = self.holds(dict(g, source_head=bad))
+            self.assertTrue(codes & {"SOURCE_MISSING", "OWNER_UNVERIFIED"}, (bad, codes))
+            self.assertTrue(self.exists(t, "debug/deps"), bad)
+
+    def test_tampered_target_identity_holds(self):
+        wt, t, g = self.orphan("wt-id1")           # name suffix not bound to the (consistently rewritten) record
+        path, rec = self.record_of(t)
+        other = os.path.join(self.tmp, "somewhere-else")
+        rec["worktree"] = other
+        rec["worktree_hash"] = hashlib.sha256(other.encode()).hexdigest()[:12]
+        T.jdump(rec, path)
+        self.assertIn("OWNER_UNVERIFIED", self.holds(g)[0])
+        self.assertTrue(self.exists(t, "debug/deps"))
+        wt, t, g = self.orphan("wt-id2")           # directory identity differs from the manifest's
+        self.assertIn("DIRECTORY_IDENTITY_CHANGED", self.holds(dict(g, inode=g["inode"] + 1), "id2.json")[0])
+        self.assertTrue(self.exists(t, "debug/deps"))
+        wt, t, g = self.orphan("wt-id3")           # non-normalised recorded worktree path
+        path, rec = self.record_of(t)
+        rec["worktree"] = rec["worktree"] + "/../" + os.path.basename(rec["worktree"])
+        rec["worktree_hash"] = hashlib.sha256(rec["worktree"].encode()).hexdigest()[:12]
+        T.jdump(rec, path)
+        self.assertTrue(self.holds(g, "id3.json")[0] & {"OWNER_UNVERIFIED", "ORPHAN_SOURCE_PRESENT"})
+        self.assertTrue(self.exists(t, "debug/deps"))
+
+    def _fail_lstat(self, match, err):
+        real = os.lstat
+
+        def fake(path, *a, **kw):
+            if os.fspath(path) in match:
+                raise OSError(err, os.strerror(err))
+            return real(path, *a, **kw)
+
+        self.mod.os.lstat = fake
+        self.addCleanup(setattr, self.mod.os, "lstat", real)
+
+    def test_only_enoent_and_enotdir_mean_absent(self):
+        import errno
+        for err in (errno.EACCES, errno.EIO, errno.ENOTCONN, errno.ESTALE, errno.ELOOP, errno.ETIMEDOUT):
+            wt, t, g = self.orphan("wt-e%d" % err)
+            _, rec = self.record_of(t)
+            real = os.lstat
+            for which in (wt, rec["checkout"]["gitdir"]):
+                self._fail_lstat({which}, err)
+                codes, _ = self.holds(g, "e%d.json" % err)
+                self.assertIn("ORPHAN_SOURCE_UNKNOWN", codes, (err, which))
+                self.assertTrue(self.exists(t, "debug/deps"))
+                self.mod.os.lstat = real
+        wt, t, g = self.orphan("wt-enotdir")       # ENOTDIR is a genuine "absent"
+        self._fail_lstat({wt}, errno.ENOTDIR)
+        self.assertEqual(self.holds(g, "enotdir.json")[0], set())
+        self.assertFalse(self.exists(t, "debug/deps"))
+
+    def test_error_inspecting_a_registered_worktree_holds(self):
+        import errno
+        wt, t, g = self.orphan("wt-reg-err")
+        keeper = self.worktree("wt-keeper")
+        self._fail_lstat({keeper}, errno.EIO)
+        codes, _ = self.holds(g)
+        self.assertIn("ORPHAN_SOURCE_UNKNOWN", codes)
+        self.assertTrue(self.exists(t, "debug/deps"))
+
+    def test_checkout_evidence_rejects_malformed_checkouts(self):
+        F = self.mod.F
+        wt = os.path.realpath(self.worktree("wt-ev"))
+        good = F.checkout_evidence(wt)
+        self.assertEqual(sorted(good), ["common_dir", "gitdir", "worktree_identity"])
+        gitfile = os.path.join(wt, ".git")
+        original = open(gitfile).read()
+        admin = good["gitdir"]
+
+        def rewrite(path, text):
+            os.unlink(path) if os.path.lexists(path) else None
+            with open(path, "w") as handle:
+                handle.write(text)
+
+        for label, text in (("relative", "gitdir: ../relative\n"), ("unnormalised", "gitdir: " + admin + "/../" + os.path.basename(admin) + "\n"),
+                            ("two lines", original + "extra\n"), ("no prefix", admin + "\n"), ("empty", "")):
+            rewrite(gitfile, text)
+            self.assertIsNone(F.checkout_evidence(wt), label)
+        rewrite(gitfile, original)
+        self.assertIsNotNone(F.checkout_evidence(wt))
+        # relative / unnormalised worktree argument
+        self.assertIsNone(F.checkout_evidence(os.path.relpath(wt)))
+        self.assertIsNone(F.checkout_evidence(wt + "/../" + os.path.basename(wt)))
+        # commondir must be a small regular file: FIFO (must not block), symlink, oversized
+        cd = os.path.join(admin, "commondir")
+        saved = open(cd).read()
+        os.unlink(cd)
+        os.mkfifo(cd)
+        self.assertIsNone(F.checkout_evidence(wt))          # returns instead of hanging
+        os.unlink(cd)
+        os.symlink("/etc/passwd", cd)
+        self.assertIsNone(F.checkout_evidence(wt))
+        os.unlink(cd)
+        rewrite(cd, "x" * 5000)
+        self.assertIsNone(F.checkout_evidence(wt))
+        rewrite(cd, saved)
+        self.assertIsNotNone(F.checkout_evidence(wt))
+        # back-pointer: missing, pointing at another checkout, or not a regular file
+        back = os.path.join(admin, "gitdir")
+        saved = open(back).read()
+        os.unlink(back)
+        self.assertIsNone(F.checkout_evidence(wt))
+        rewrite(back, os.path.join(self.tmp, "other", ".git") + "\n")
+        self.assertIsNone(F.checkout_evidence(wt))
+        rewrite(back, saved)
+        self.assertIsNotNone(F.checkout_evidence(wt))
+
     def test_git_runs_with_scrubbed_env_and_owner_runner(self):
         seen = {}
         orig = self.mod.F.run_as_owner

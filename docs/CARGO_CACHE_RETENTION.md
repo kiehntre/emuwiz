@@ -639,9 +639,16 @@ worktree path by its hash; the worktree path gone AND the checkout's administrat
 moved or not); no registered worktree with the recorded path or the recorded checkout identity (`ORPHAN_SOURCE_MOVED`); the
 HEAD contained in `refs/remotes/origin/main` of the recorded repository. git runs only through `run_as_owner` (all uids
 dropped) with a scrubbed environment and no lazy fetch. Holds: `SOURCE_MISSING`, `OWNER_UNVERIFIED`, `ORPHAN_EVIDENCE_MISSING`,
-`ORPHAN_SOURCE_PRESENT`, `ORPHAN_SOURCE_MOVED`, `ORPHAN_REPO_UNVERIFIED`, `GIT_HISTORY_NOT_PRESERVED`. Every other gate
+`ORPHAN_SOURCE_PRESENT`, `ORPHAN_SOURCE_MOVED`, `ORPHAN_SOURCE_UNKNOWN`, `ORPHAN_REPO_UNVERIFIED`, `GIT_HISTORY_NOT_PRESERVED`. Every other gate
 (completion release, pin, lock, census, identity, idle time, journal) applies unchanged. Unidentified caches (no recorded
 build HEAD, such as the 2026-10-15 adopted scratch/source directories) cannot use the route and stay hard `SOURCE_MISSING`.
 Limits: the registry and the recorded repository are owner-writable, so a deliberately forged record plus a hand-made
 `origin/main` ref in the recorded repository is the same trust base as every other registry gate; a checkout moved by hand and
 pruned leaves no registration, which only the process census can then catch.
+
+Absence is decided by `lstat` only: ENOENT or ENOTDIR mean absent; any other error (EACCES, EIO, ENOTCONN, ESTALE, ELOOP,
+timeouts) is `ORPHAN_SOURCE_UNKNOWN` and never permits retirement, for the worktree path, the administrative gitdir and each
+registered worktree. cargo-iso records checkout evidence only from a normalised absolute worktree path whose `.git` is a
+small regular file with one `gitdir: <absolute normalised path>` line, an admin dir that is a real directory, a small
+regular `commondir` (read with O_NOFOLLOW|O_NONBLOCK, so a FIFO cannot block), and a `gitdir` back-pointer naming this
+checkout's `.git`; anything else records no evidence and the route refuses.

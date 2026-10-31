@@ -547,24 +547,56 @@ def head_of(worktree):
         return None
 
 
+def _read_small_regular(path, limit=4096):
+    """First line of a small regular file, read without following a symlink or blocking on a
+    FIFO/device; None for anything else."""
+    fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK | os.O_CLOEXEC)
+    try:
+        st = os.fstat(fd)
+        if not stat.S_ISREG(st.st_mode) or st.st_size > limit:
+            return None
+        data = os.read(fd, limit + 1)
+    finally:
+        os.close(fd)
+    if len(data) > limit or b"\0" in data:
+        return None
+    text = data.decode("utf-8", "strict")
+    lines = text.split("\n")
+    if lines[-1] == "":
+        lines.pop()
+    return lines
+
+
 def checkout_evidence(worktree):
     """Continuity evidence of a LINKED git worktree, read from the live checkout with plain file reads
     (no git process): the checkout root's device/inode, its administrative gitdir and the owning
-    repository's common dir.  None when anything is not exactly as git writes it."""
+    repository's common dir.  None when anything is not exactly as git writes it: the worktree path
+    must be absolute and normalised, `.git` a small regular file with the single line `gitdir: <absolute
+    normalised path>`, the admin dir `<common>/.git/worktrees/<id>` a real directory whose `commondir`
+    is a small regular file and whose `gitdir` back-pointer names this checkout's `.git`."""
     try:
+        if not os.path.isabs(worktree) or os.path.normpath(worktree) != worktree:
+            return None
         st = os.lstat(worktree)
         gitfile = os.path.join(worktree, ".git")
-        gst = os.lstat(gitfile)
-        if not stat.S_ISDIR(st.st_mode) or not stat.S_ISREG(gst.st_mode) or gst.st_size > 4096:
+        lines = _read_small_regular(gitfile)
+        if not stat.S_ISDIR(st.st_mode) or lines is None or len(lines) != 1 or not lines[0].startswith("gitdir: "):
             return None
-        with open(gitfile) as handle:
-            first = handle.readline().rstrip("\n")
-        if not first.startswith("gitdir: "):
+        raw = lines[0][len("gitdir: "):]
+        if not os.path.isabs(raw) or os.path.normpath(raw) != raw:
             return None
-        admin = os.path.realpath(first[len("gitdir: "):])
-        with open(os.path.join(admin, "commondir")) as handle:
-            common = os.path.realpath(os.path.join(admin, handle.readline().strip()))
+        admin = os.path.realpath(raw)
+        ast = os.lstat(admin)
+        if not stat.S_ISDIR(ast.st_mode):
+            return None
+        rel = _read_small_regular(os.path.join(admin, "commondir"))
+        if rel is None or len(rel) != 1 or not rel[0]:
+            return None
+        common = os.path.realpath(os.path.join(admin, rel[0]))
         if os.path.dirname(admin) != os.path.join(common, "worktrees") or os.path.basename(common) != ".git":
+            return None
+        back = _read_small_regular(os.path.join(admin, "gitdir"))
+        if back is None or len(back) != 1 or os.path.realpath(back[0]) != os.path.realpath(gitfile):
             return None
         return {"worktree_identity": {"dev": st.st_dev, "ino": st.st_ino}, "gitdir": admin, "common_dir": common}
     except (OSError, ValueError):
