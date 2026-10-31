@@ -2976,5 +2976,7 @@ fn failed_apply_and_failed_undo_are_worded_by_what_the_receipt_records() {
     // A failed Undo is never presented as a failed creation.
     let (title, body) = apply_error_heading(Some(&empty), true);
     assert_eq!(title, "Undo did not finish");
-    assert!(body.contains("retry Undo"), "{body}");
+    assert!(!body.contains("still in the Playing Library"), "{body}");
+    assert!(!body.contains("retry Undo"), "{body}");
+    assert!(body.contains("no links still awaiting"), "{body}");
 }

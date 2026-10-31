@@ -2513,7 +2513,7 @@ mod tests {
         use archivefs_core::dat::rename_apply::{ApplyOutcome, RenameTransaction};
         let mut state = RomOrganisationPageState::default();
         use archivefs_core::dat::rename_apply::TransactionState;
-        let transaction = RenameTransaction {
+        let outcome_transaction = || RenameTransaction {
             transaction_id: "t".into(),
             plan_generation: 1,
             classifier_version: None,
@@ -2526,6 +2526,7 @@ mod tests {
             recovery_resolved_at_unix: None,
             unknown: Default::default(),
         };
+        let transaction = outcome_transaction();
         let outcome = ApplyOutcome {
             transaction: transaction.clone(),
             summary: TransactionSummary {

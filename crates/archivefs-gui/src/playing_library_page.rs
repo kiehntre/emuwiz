@@ -312,10 +312,25 @@ fn apply_error_heading(
     is_undo: bool,
 ) -> (&'static str, &'static str) {
     if is_undo {
-        return (
-            "Undo did not finish",
-            "Some links are still in the Playing Library. Your original games are untouched. Review Technical details, then retry Undo.",
-        );
+        // Only the receipt can say whether links remain, and a refused Undo
+        // (for example a lost journal seal) is not a promise of a retry.
+        let remaining = applied.map_or(0, |tx| {
+            tx.entries
+                .iter()
+                .filter(|e| e.blocks_full_rollback())
+                .count()
+        });
+        return if remaining > 0 {
+            (
+                "Undo did not finish",
+                "The receipt still records links that were not confirmed as removed. Your original games are untouched. Review Technical details before trying Undo again; it may be refused if the record cannot be verified.",
+            )
+        } else {
+            (
+                "Undo did not finish",
+                "The receipt records no links still awaiting removal. Your original games are untouched. Review Technical details.",
+            )
+        };
     }
     match applied {
         Some(tx) if tx.applied_count() > 0 => (
