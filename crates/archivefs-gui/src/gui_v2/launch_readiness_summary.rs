@@ -1612,6 +1612,70 @@ mod tests {
         );
     }
 
+    /// The remembered emulator choice is part of the plan the worker must
+    /// share with the foreground: it turns "choose one" into Play.
+    #[test]
+    fn a_remembered_choice_among_safe_candidates_is_ready_not_a_choice() {
+        let summary = project(
+            &plan(vec![
+                candidate(
+                    LaunchReadiness::Ready,
+                    FirmwareReadiness::NotRequired,
+                    vec![],
+                    vec![],
+                    CandidatePreference::Remembered,
+                    Some("/game.iso"),
+                ),
+                candidate(
+                    LaunchReadiness::Ready,
+                    FirmwareReadiness::NotRequired,
+                    vec![],
+                    vec![],
+                    CandidatePreference::Undetermined,
+                    Some("/game.iso"),
+                ),
+            ]),
+            ReadinessFreshness::Current,
+        );
+        assert_eq!(summary.status, ReadinessPresentationState::Ready);
+        assert_eq!(summary.primary_action, Some(ReadinessAction::Play));
+    }
+
+    /// A remembered emulator that is blocked must not let a clean alternative
+    /// make the game Ready: without the memory the alternative looks clean.
+    #[test]
+    fn a_blocked_remembered_candidate_beside_a_clean_one_is_not_ready() {
+        let summary = project(
+            &plan(vec![
+                candidate(
+                    LaunchReadiness::Blocked,
+                    FirmwareReadiness::NotRequired,
+                    vec![LaunchBlocker {
+                        kind: LaunchBlockerKind::NoInstallationCandidate,
+                        detail: "remembered profile is gone".into(),
+                    }],
+                    vec![],
+                    CandidatePreference::Remembered,
+                    Some("/game.iso"),
+                ),
+                candidate(
+                    LaunchReadiness::Ready,
+                    FirmwareReadiness::NotRequired,
+                    vec![],
+                    vec![],
+                    CandidatePreference::Undetermined,
+                    Some("/game.iso"),
+                ),
+            ]),
+            ReadinessFreshness::Current,
+        );
+        assert_ne!(
+            summary.status,
+            ReadinessPresentationState::Ready,
+            "{summary:?}"
+        );
+    }
+
     /// Job #22: an installation refusal withdraws Ready and routes to Setup
     /// with its own reason; game-format refusals never do.
     #[test]
