@@ -537,6 +537,29 @@ class HistoryGates(LegacyCheckout):
         Path(self.git_dir, 'REBASE_HEAD').write_text(orphan + '\n')
         self.assert_gate_holds('GIT_HISTORY_NOT_PRESERVED')
 
+    def test_nested_git_directory_or_file_holds(self):
+        outer = Path(self.wt, 'tracked')
+        outer.mkdir()
+        Path(outer, 'f').write_text('x')
+        self.run_git('add', 'tracked')
+        self.run_git('commit', '-qm', 'tracked')
+        self.run_git('update-ref', 'refs/remotes/origin/main', 'HEAD')
+        self.assertIsNone(self.m.history_preservation_problem(self.wt))
+        nested = Path(outer, '.git')
+        subprocess.check_call(['git', 'init', '-q', str(outer)])
+        self.assert_gate_holds('GIT_STATE_UNVERIFIED')
+        shutil.rmtree(nested)
+        nested.write_text('secret')
+        self.assert_gate_holds('GIT_STATE_UNVERIFIED')
+
+    def test_gitlink_without_submodule_state_holds(self):
+        self.run_git('update-index', '--add', '--cacheinfo', f'160000,{self.base},sm')
+        self.run_git('commit', '-qm', 'gitlink')
+        self.run_git('update-ref', 'refs/remotes/origin/main', 'HEAD')
+        Path(self.wt, 'sm').mkdir(exist_ok=True)
+        Path(self.wt, 'sm', 'plain').write_text('secret')
+        self.assert_gate_holds('GIT_STATE_UNVERIFIED')
+
     def test_ordinary_admin_entries_stay_clear(self):
         for name in ('FETCH_HEAD', 'AUTO_MERGE', 'COMMIT_EDITMSG', 'MERGE_MSG', 'SQUASH_MSG'):
             Path(self.git_dir, name).write_text('')

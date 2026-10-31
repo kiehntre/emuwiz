@@ -1538,6 +1538,17 @@ def history_preservation_problem(wt):
             raise LegacyCheckoutHold("GIT_STATE_UNVERIFIED", proc.stderr.strip())
         return proc.stdout.strip()
 
+    def nested_git_entry():
+        # `git status` skips anything named .git, but the removal deletes it.
+        def fail(error):
+            raise error
+        for root, dirs, files in os.walk(wt, onerror=fail):
+            if root == wt:
+                dirs[:] = [d for d in dirs if d != ".git"]
+            elif ".git" in dirs or ".git" in files:
+                return os.path.relpath(root, wt)
+        return None
+
     def require_own_admin(admin):
         common = git("rev-parse", "--path-format=absolute", "--git-common-dir")
         if admin == common:
@@ -1604,6 +1615,13 @@ def history_preservation_problem(wt):
             return ("GIT_STATE_UNVERIFIED", status.stderr.strip())
         if status.stdout.strip():
             return ("CHECKOUT_NOT_CLEAN", "tracked, untracked or ignored files require preservation")
+        # Files inside a gitlink's directory are invisible to status, with or without
+        # submodule state, and are deleted with the checkout.
+        if any(line.startswith("160000 ") for line in git("ls-files", "-s", "-z").split("\0")):
+            return ("GIT_STATE_UNVERIFIED", "a gitlink's directory can hold files status does not report")
+        nested = nested_git_entry()
+        if nested:
+            return ("GIT_STATE_UNVERIFIED", "nested .git entry status does not report: " + nested)
         if git("for-each-ref", "--format=%(refname)", "refs/worktree", "refs/bisect", "refs/rewritten"):
             return ("GIT_HISTORY_NOT_PRESERVED", "per-worktree refs would be deleted with the checkout")
         unknown = sorted(set(os.listdir(admin)) - KNOWN_ADMIN_ENTRIES)
