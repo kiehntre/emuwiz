@@ -1886,6 +1886,22 @@ impl RetroArchLaunchState {
         }
     }
 
+    /// Tracks `request` as an in-flight launch whose worker never reports, so
+    /// other views can be tested against a deterministic "already starting"
+    /// state without racing a real preflight thread. Returns the sender so
+    /// the caller keeps the channel open.
+    pub(crate) fn track_starting_for_test(
+        &mut self,
+        request: &RetroArchLaunchRequest,
+    ) -> mpsc::Sender<Result<LaunchedRetroArchProcess, LaunchExecutionError>> {
+        let (sender, receiver) = mpsc::channel();
+        self.tracked = Some((
+            RetroArchLaunchKey::from_request(request),
+            RetroArchLaunchStage::Starting { receiver },
+        ));
+        sender
+    }
+
     pub(crate) fn use_probe(
         &mut self,
         probe: std::sync::Arc<
@@ -2008,6 +2024,18 @@ impl RetroArchLaunchState {
         )
     }
 
+    /// Whether another game's launch is still starting or running, so this
+    /// request must not start. Phase 1 tracks one launch at a time; a second
+    /// `start` would drop the first handle (never killing it) and leave an
+    /// untracked RetroArch process.
+    pub(crate) fn blocked_by_other_launch(&self, request: &RetroArchLaunchRequest) -> bool {
+        self.is_active()
+            && self
+                .tracked
+                .as_ref()
+                .is_none_or(|(key, _)| *key != RetroArchLaunchKey::from_request(request))
+    }
+
     pub(crate) fn failure_detail(&self) -> Option<String> {
         match &self.tracked {
             Some((_, RetroArchLaunchStage::Failed { error })) => Some(format!("{error:?}")),
@@ -2021,6 +2049,9 @@ impl RetroArchLaunchState {
         request: RetroArchLaunchRequest,
         playlist: Option<crate::multidisc_launch_view::PlaylistHandoff>,
     ) {
+        if self.is_active() {
+            return;
+        }
         let key = RetroArchLaunchKey::from_request(&request);
         let (sender, receiver) = mpsc::channel();
         thread::spawn(move || {
@@ -2043,6 +2074,9 @@ impl RetroArchLaunchState {
     /// choice for this exact request it is an ordinary launch. Every refusal
     /// happens in the worker before RetroArch starts.
     pub(crate) fn start_with_cheats(&mut self, request: RetroArchLaunchRequest) {
+        if self.is_active() {
+            return;
+        }
         let Some(choice) = self
             .cheats
             .clone()
@@ -2072,6 +2106,9 @@ impl RetroArchLaunchState {
         request: RetroArchLaunchRequest,
         selected: classic_pokes::Selection,
     ) {
+        if self.is_active() {
+            return;
+        }
         let key = RetroArchLaunchKey::from_request(&request);
         let probe = self
             .probe
@@ -5525,6 +5562,10 @@ fn show_amiga_whdload_launch_action(
     }
 }
 
+/// Shown instead of an enabled Play button while another game's RetroArch is
+/// starting or running (one tracked launch at a time).
+pub(crate) const RETROARCH_BUSY_HINT: &str = "RetroArch is already running for another game";
+
 /// Renders the user-facing "Play" action for one eligible candidate while
 /// retaining the adapter name for technical clarity,
 /// entirely from an owned snapshot of `launch_state` so the click handler
@@ -5569,7 +5610,10 @@ fn show_launch_action(
 
     match display {
         RetroArchLaunchDisplay::Idle => {
-            if ui.button(&label).clicked() {
+            if launch_state.blocked_by_other_launch(&request) {
+                ui.add_enabled(false, egui::Button::new(&label));
+                ui.small(RETROARCH_BUSY_HINT);
+            } else if ui.button(&label).clicked() {
                 launch(launch_state, request, playlist);
             }
         }
