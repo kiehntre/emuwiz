@@ -1873,7 +1873,12 @@ fn safe_firmware_components(declared: &str) -> Option<Vec<&OsStr>> {
     (!components.is_empty()).then_some(components)
 }
 
-/// Filesystem evidence a cached report's firmware presence depends on:
+/// Filesystem evidence a cached report's firmware presence depends on. It is
+/// deliberately a superset of what the probe touches (a not-yet-existing or
+/// symlinked system directory is still listed so its creation/replacement is
+/// noticed). Known gap: edits to a core's `.info` file are not included, so
+/// a changed `firmwareN_path` is picked up on the next rescan trigger, not
+/// immediately. Covers:
 /// each non-Flatpak profile's `retroarch.cfg`, its resolved system
 /// directory, and every prefix path of each required firmware file that was
 /// probed. A caller that caches the report can re-check these (e.g. by
@@ -4485,8 +4490,7 @@ mod tests {
     #[test]
     fn firmware_evidence_paths_cover_config_system_dir_and_probed_prefixes_only() {
         let info = fw_info(&[("dc/boot.bin", false), ("../x", false), ("opt.bin", true)]);
-        let fixture = Fixture::new("fw-evidence");
-        let (f, _) = firmware_probe_fixture("fw-evidence-inner", info.as_bytes(), |_| {});
+        let (f, _) = firmware_probe_fixture("fw-evidence", info.as_bytes(), |_| {});
         let report = discover_retroarch_environment(&HostReadOnlyFilesystem, &f.env()).unwrap();
         let paths = firmware_evidence_paths(&report);
         let sys = f.path("system");
@@ -4499,7 +4503,6 @@ mod tests {
                 .iter()
                 .any(|p| p.ends_with("x") || p.ends_with("opt.bin"))
         );
-        drop(fixture);
     }
 
     #[test]
