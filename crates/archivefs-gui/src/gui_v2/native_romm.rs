@@ -6,8 +6,8 @@ use super::super::{
     routes::{Route, Section},
 };
 use archivefs_core::identity_source::romm::browser::{
-    RommBrowseError, RommBrowseFilter, RommBrowsePage, RommGameDetail, RommGameSummary,
-    RommPlatformSummary, RommServerInfo, RommServerStatus,
+    RommBrowseError, RommBrowseFilter, RommBrowsePage, RommCollectionSummary, RommGameDetail,
+    RommGameSummary, RommPlatformSummary, RommServerInfo, RommServerStatus,
 };
 use archivefs_core::identity_source::romm::config::RommToken;
 use archivefs_core::identity_source::settings::ProviderSettings;
@@ -170,6 +170,8 @@ pub(in crate::gui_v2) enum Reply {
         platforms: Vec<RommPlatformSummary>,
         page: Option<RommBrowsePage>,
         platform_warning: bool,
+        collections: Vec<RommCollectionSummary>,
+        collection_warning: bool,
         token: RommToken,
     },
     Page(RommBrowsePage, RommToken),
@@ -332,11 +334,14 @@ pub(super) struct State {
     token: Option<RommToken>,
     platforms: Vec<RommPlatformSummary>,
     page: Option<Arc<RommBrowsePage>>,
-    pages: HashMap<(Option<u64>, String, u32), Arc<RommBrowsePage>>,
+    pages: HashMap<PageKey, Arc<RommBrowsePage>>,
     details: HashMap<u64, Arc<RommGameDetail>>,
     platform_warning: bool,
+    collections: Vec<RommCollectionSummary>,
+    collection_warning: bool,
     search: String,
     platform: Option<u64>,
+    collection: Option<u64>,
     offset: u32,
     edited: Option<Instant>,
     selected: Option<u64>,
@@ -372,8 +377,11 @@ impl Default for State {
             pages: HashMap::new(),
             details: HashMap::new(),
             platform_warning: false,
+            collections: vec![],
+            collection_warning: false,
             search: String::new(),
             platform: None,
+            collection: None,
             offset: 0,
             edited: None,
             selected: None,
@@ -433,6 +441,8 @@ impl State {
             self.pages.clear();
             self.details.clear();
             self.platform_warning = false;
+            self.collections.clear();
+            self.collection_warning = false;
         }
         self.problem = None;
         self.retry = request.clone();
@@ -442,6 +452,7 @@ impl State {
         RommBrowseFilter {
             text: (!self.search.trim().is_empty()).then(|| self.search.trim().to_owned()),
             platform_id: self.platform,
+            collection_id: self.collection,
         }
     }
     fn games(&mut self, offset: u32) {
@@ -464,8 +475,13 @@ impl State {
             filter: self.filter(),
         });
     }
-    fn page_key(&self, offset: u32) -> (Option<u64>, String, u32) {
-        (self.platform, self.search.trim().to_owned(), offset)
+    fn page_key(&self, offset: u32) -> PageKey {
+        (
+            self.platform,
+            self.collection,
+            self.search.trim().to_owned(),
+            offset,
+        )
     }
     fn refresh_games(&mut self) {
         self.pages.clear();
@@ -592,6 +608,8 @@ impl State {
                 platforms,
                 page,
                 platform_warning,
+                collections,
+                collection_warning,
                 token,
             }) => {
                 self.stale = false;
@@ -603,14 +621,18 @@ impl State {
                 self.token = Some(token);
                 self.platforms = platforms;
                 self.platform_warning = platform_warning;
+                self.collections = collections;
+                self.collection_warning = collection_warning;
                 self.page = page.map(Arc::new);
                 self.pages.clear();
                 self.details.clear();
                 if let Some(page) = &self.page {
-                    self.pages.insert((None, String::new(), 0), page.clone());
+                    self.pages
+                        .insert((None, None, String::new(), 0), page.clone());
                 }
                 self.search.clear();
                 self.platform = None;
+                self.collection = None;
                 self.offset = 0;
                 self.selected = None;
                 self.last_selected = None;
@@ -670,6 +692,8 @@ impl State {
                 "No games matched '{}'. Try another search or clear the platform filter.",
                 self.display(self.search.trim())
             )
+        } else if self.collection.is_some() {
+            "No games are visible in this collection. Try All collections or check the collection in RomM.".into()
         } else if self.platform.is_some() {
             "No games are visible for this platform. Try All platforms or check this account's access in RomM.".into()
         } else {
@@ -824,6 +848,7 @@ impl State {
         ui.heading("Your RomM library");
         let capabilities = self.info.as_ref().unwrap().capabilities.clone();
         let mut changed_platform = false;
+        let mut changed_collection = false;
         let mut search_changed = false;
         ui.horizontal_wrapped(|ui| {
             ui.label("Search");
@@ -879,6 +904,48 @@ impl State {
                 self.refresh_games();
             }
         });
+        if capabilities.collections {
+            ui.horizontal_wrapped(|ui| {
+                ui.label("Collection");
+                ui.add_enabled_ui(
+                    capabilities.collection_filter && !self.collections.is_empty(),
+                    |ui| {
+                        egui::ComboBox::from_id_salt("native-romm-collection")
+                            .selected_text(
+                                self.collections
+                                    .iter()
+                                    .find(|c| Some(c.id) == self.collection)
+                                    .map_or_else(
+                                        || "All collections".into(),
+                                        |c| self.display(&collection_label(c)),
+                                    ),
+                            )
+                            .show_ui(ui, |ui| {
+                                changed_collection |= ui
+                                    .selectable_value(&mut self.collection, None, "All collections")
+                                    .changed();
+                                for collection in &self.collections {
+                                    let name = self.display(&collection_label(collection));
+                                    changed_collection |= ui
+                                        .selectable_value(
+                                            &mut self.collection,
+                                            Some(collection.id),
+                                            name,
+                                        )
+                                        .changed();
+                                }
+                            });
+                    },
+                );
+            });
+            if self.collection_warning {
+                ui.weak("Collections could not be loaded. You can still browse all RomM games; retry the connection to restore them.");
+            } else if self.collections.is_empty() {
+                ui.weak("This account has no collections in RomM.");
+            } else if !capabilities.collection_filter {
+                ui.weak("This server lists collections but can't filter games by collection.");
+            }
+        }
         if capabilities.platforms && self.platforms.is_empty() && !self.platform_warning {
             ui.weak("No platforms are visible to this connection. The server may be empty or this login may have limited access.");
         }
@@ -891,7 +958,7 @@ impl State {
         if !capabilities.game_detail {
             ui.weak("This server can list games, but doesn't provide game details to EmuWiz.");
         }
-        if changed_platform {
+        if changed_platform || changed_collection {
             self.games(0);
         } else if search_changed {
             self.edit_search(Instant::now());
@@ -1120,6 +1187,15 @@ impl State {
         text
     }
 }
+type PageKey = (Option<u64>, Option<u64>, String, u32);
+
+fn collection_label(collection: &RommCollectionSummary) -> String {
+    match collection.game_count {
+        Some(count) => format!("{} ({count})", collection.name),
+        None => collection.name.clone(),
+    }
+}
+
 fn platform_label(platform: &RommPlatformSummary) -> &str {
     platform.name.as_deref().unwrap_or("Unnamed platform")
 }

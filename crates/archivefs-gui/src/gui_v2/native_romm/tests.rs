@@ -17,6 +17,8 @@ struct Fixture {
     status: u16,
     artwork: bool,
     platforms_status: u16,
+    /// 0 = server does not declare collections; otherwise the /api/collections status.
+    collections_status: u16,
     requests: Mutex<Vec<String>>,
 }
 impl Default for Fixture {
@@ -26,6 +28,7 @@ impl Default for Fixture {
             status: 200,
             artwork: false,
             platforms_status: 200,
+            collections_status: 0,
             requests: Mutex::new(vec![]),
         }
     }
@@ -47,7 +50,10 @@ fn game(id: u64) -> Value {
         "files":[],"sibling_roms":[],"metadatum":{"genres":["Puzzle"]}})
 }
 fn api(version: &str) -> Value {
-    let params = [
+    api_with(version, false)
+}
+fn api_with(version: &str, collections: bool) -> Value {
+    let mut params = vec![
         "limit",
         "offset",
         "search_term",
@@ -57,11 +63,21 @@ fn api(version: &str) -> Value {
         "with_filter_values",
         "with_rom_id_index",
         "group_by_meta_id",
-    ]
-    .map(|name| json!({"name":name,"in":"query"}));
-    json!({"openapi":"3.1.0","info":{"version":version},"paths":{
+    ];
+    if collections {
+        params.push("collection_id");
+    }
+    let params = params
+        .into_iter()
+        .map(|name| json!({"name":name,"in":"query"}))
+        .collect::<Vec<_>>();
+    let mut document = json!({"openapi":"3.1.0","info":{"version":version},"paths":{
         "/api/platforms":{"get":{}},"/api/roms":{"get":{"parameters":params}},"/api/roms/{id}":{"get":{}},
-        "/api/roms/{id}/content":{"get":{}},"/api/scan":{"post":{}}}})
+        "/api/roms/{id}/content":{"get":{}},"/api/scan":{"post":{}}}});
+    if collections {
+        document["paths"]["/api/collections"] = json!({"get":{}});
+    }
+    document
 }
 fn query(url: &str, key: &str) -> Option<String> {
     url.split_once('?')?.1.split('&').find_map(|p| {
@@ -92,13 +108,22 @@ impl RommTransport for Fixture {
         let value = if path == "api/heartbeat" {
             json!({"SYSTEM":{"VERSION":self.version}})
         } else if path == "openapi.json" {
-            api(self.version)
+            api_with(self.version, self.collections_status != 0)
         } else if self.status != 200 {
             return Ok(RommHttpResponse {
                 status: self.status,
                 body: TOKEN.as_bytes().to_vec(),
                 location: None,
             });
+        } else if path == "api/collections" {
+            if self.collections_status != 200 {
+                return Ok(RommHttpResponse {
+                    status: self.collections_status,
+                    body: TOKEN.as_bytes().to_vec(),
+                    location: None,
+                });
+            }
+            json!([{"id":3,"name":"Favourites","rom_count":2},{"id":4,"name":"Backlog","rom_count":0}])
         } else if path == "api/platforms" {
             if self.platforms_status != 200 {
                 return Ok(RommHttpResponse {
@@ -114,9 +139,12 @@ impl RommTransport for Fixture {
             let offset: usize = query(url, "offset").unwrap().parse().unwrap();
             let search = query(url, "search_term");
             let empty = search.as_deref() == Some("Nothing")
-                || query(url, "platform_ids").as_deref() == Some("8");
+                || query(url, "platform_ids").as_deref() == Some("8")
+                || query(url, "collection_id").as_deref() == Some("4");
             let total = if empty {
                 0
+            } else if query(url, "collection_id").is_some() {
+                2
             } else if search.is_some() {
                 3
             } else {
@@ -542,6 +570,114 @@ fn platforms_use_friendly_names_and_all_platforms_is_the_default() {
     assert!(text(&mut state).contains("All platforms"));
     state.platform = Some(7);
     assert!(text(&mut state).contains("Game Boy"));
+}
+fn connected_with_collections() -> State {
+    let fixture = Fixture {
+        collections_status: 200,
+        ..Default::default()
+    };
+    let mut state = State {
+        open: true,
+        settings_loaded: true,
+        configured: true,
+        ..Default::default()
+    };
+    let reply = call(&fixture, Request::Connect);
+    assert!(state.absorb(&egui::Context::default(), state.generation, Ok(reply)));
+    state
+}
+#[test]
+fn collections_are_discovered_shown_and_filter_games_without_mixing_cached_pages() {
+    let mut state = connected_with_collections();
+    assert_eq!(
+        state
+            .collections
+            .iter()
+            .map(|c| c.name.as_str())
+            .collect::<Vec<_>>(),
+        ["Favourites", "Backlog"]
+    );
+    let view = text(&mut state);
+    assert!(
+        view.contains("Collection") && view.contains("All collections"),
+        "{view}"
+    );
+    // Choose a collection: the request carries it, and its page is cached apart
+    // from the unfiltered first page.
+    state.collection = Some(3);
+    assert_eq!(state.filter().collection_id, Some(3));
+    let fixture = Fixture {
+        collections_status: 200,
+        ..Default::default()
+    };
+    let reply = call(
+        &fixture,
+        Request::Games {
+            offset: 0,
+            filter: state.filter(),
+        },
+    );
+    state.absorb(&egui::Context::default(), state.generation, Ok(reply));
+    assert_eq!(state.page.as_ref().unwrap().games.len(), 2);
+    assert!(
+        fixture
+            .requests
+            .lock()
+            .unwrap()
+            .iter()
+            .any(|url| url.contains("collection_id=3"))
+    );
+    assert!(state.pages.contains_key(&(None, Some(3), String::new(), 0)));
+    assert_eq!(
+        state.pages[&(None, None, String::new(), 0)].games.len(),
+        50,
+        "the unfiltered page is not overwritten by the collection page"
+    );
+    // An empty collection says so instead of implying a connection fault.
+    state.collection = Some(4);
+    assert!(state.empty_message().contains("in this collection"));
+    // Reconnecting forgets the collection choice and list.
+    state.queue(Request::Connect);
+    assert!(state.collections.is_empty());
+    let reply = call(
+        &Fixture {
+            collections_status: 200,
+            ..Default::default()
+        },
+        Request::Connect,
+    );
+    state.absorb(&egui::Context::default(), state.generation, Ok(reply));
+    assert_eq!(state.collection, None);
+}
+#[test]
+fn collection_list_failure_keeps_browsing_and_says_so() {
+    let fixture = Fixture {
+        collections_status: 503,
+        ..Default::default()
+    };
+    let reply = call(&fixture, Request::Connect);
+    let mut state = State {
+        open: true,
+        settings_loaded: true,
+        configured: true,
+        ..Default::default()
+    };
+    state.absorb(&egui::Context::default(), 0, Ok(reply));
+    assert!(state.connected() && state.collection_warning);
+    assert_eq!(state.page.as_ref().unwrap().games.len(), 50);
+    let view = text(&mut state);
+    assert!(view.contains("Collections could not be loaded"), "{view}");
+    assert!(view.contains("Showing 1–50 of 55") && !view.contains(TOKEN));
+}
+#[test]
+fn servers_without_collections_show_no_collection_controls() {
+    let mut state = connected();
+    assert!(state.collections.is_empty() && !state.collection_warning);
+    let view = text(&mut state);
+    assert!(
+        !view.contains("All collections") && !view.contains("no collections"),
+        "{view}"
+    );
 }
 #[test]
 fn platform_filter_is_sent_to_the_server() {
