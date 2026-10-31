@@ -139,21 +139,15 @@ pub(crate) fn counts_line(summary: &TransactionSummary) -> String {
 /// `undo_offered` must be the page's own Undo-button condition.
 pub(crate) fn show(ui: &mut egui::Ui, transaction: &RenameTransaction, undo_offered: bool) {
     let summary = TransactionSummary::from_transaction(transaction);
-    show_with_summary(ui, &summary, transaction, undo_offered);
-}
-
-pub(crate) fn show_with_summary(
-    ui: &mut egui::Ui,
-    summary: &TransactionSummary,
-    transaction: &RenameTransaction,
-    undo_offered: bool,
-) {
+    let summary = &summary;
     let outcome = TransactionOutcome::classify(summary, transaction);
     ui.horizontal_wrapped(|ui| {
         widgets::status_badge(ui, outcome.label(), outcome.tone());
         ui.label(counts_line(summary));
         if undo_offered && outcome.can_offer_undo() {
-            widgets::status_badge(ui, "Undo available", StatusTone::Info);
+            // "now": it describes the action this page offers at this moment, not a
+            // recovery promise that outlives a new preview or a restart.
+            widgets::status_badge(ui, "Undo available now", StatusTone::Info);
         } else if outcome == TransactionOutcome::RecoveryRequired {
             widgets::status_badge(ui, "Review recovery", StatusTone::Warning);
         }
@@ -161,14 +155,14 @@ pub(crate) fn show_with_summary(
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod test_support {
     use super::*;
     use archivefs_core::dat::rename_apply::model::{
         EntryState, ObjectIdentity, ObjectKind, TransactionState,
     };
     use std::path::PathBuf;
 
-    fn entry(state: EntryState) -> TransactionEntry {
+    pub(crate) fn entry(state: EntryState) -> TransactionEntry {
         TransactionEntry {
             source_path: PathBuf::from("/lib/a"),
             destination_path: PathBuf::from("/out/a"),
@@ -193,7 +187,7 @@ mod tests {
         }
     }
 
-    fn journal(
+    pub(crate) fn journal(
         state: TransactionState,
         entries: &[EntryState],
         directories: &[&str],
@@ -212,6 +206,32 @@ mod tests {
             unknown: Default::default(),
         }
     }
+
+    /// Every text run drawn in one frame, in paint order.
+    pub(crate) fn rendered_text(output: &egui::FullOutput) -> String {
+        fn collect(shape: &egui::Shape, out: &mut String) {
+            match shape {
+                egui::Shape::Text(text) => {
+                    out.push_str(text.galley.text());
+                    out.push('\n');
+                }
+                egui::Shape::Vec(nested) => nested.iter().for_each(|shape| collect(shape, out)),
+                _ => {}
+            }
+        }
+        let mut text = String::new();
+        for clipped in &output.shapes {
+            collect(&clipped.shape, &mut text);
+        }
+        text
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::test_support::journal;
+    use super::*;
+    use archivefs_core::dat::rename_apply::model::{EntryState, TransactionState};
 
     fn outcome(t: &RenameTransaction) -> TransactionOutcome {
         TransactionOutcome::classify(&TransactionSummary::from_transaction(t), t)

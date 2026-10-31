@@ -1065,18 +1065,10 @@ pub(crate) fn show_publisher_profile_page(
                     | PublisherExecutionStage::Confirming
                     | PublisherExecutionStage::Applying
             ) {
-                let summary = state
-                    .execution_result
-                    .as_ref()
-                    .map(|result| result.summary.clone())
-                    .unwrap_or_else(|| {
-                        archivefs_core::dat::rename_apply::TransactionSummary::from_transaction(
-                            &transaction.transaction,
-                        )
-                    });
-                crate::transaction_outcome::show_with_summary(
+                // The current journal, not the apply-time summary: after Undo the
+                // stored summary still says "applied" while the journal says rolled back.
+                crate::transaction_outcome::show(
                     ui,
-                    &summary,
                     &transaction.transaction,
                     state.rollback_confirmation_phrase().is_some(),
                 );

@@ -2520,6 +2520,40 @@ mod tests {
     }
 
     #[test]
+    fn result_view_shows_the_journal_based_outcome_badge() {
+        use crate::transaction_outcome::test_support::{journal, rendered_text};
+        use archivefs_core::dat::rename_apply::model::{EntryState, TransactionState};
+        let render = |transaction| {
+            let mut state = RomOrganisationPageState::default();
+            state.applied = Some(transaction);
+            state.result_message = Some("result".into());
+            state.result_complete = true;
+            let ctx = egui::Context::default();
+            let output = ctx.run(Default::default(), |ctx| {
+                egui::CentralPanel::default().show(ctx, |ui| {
+                    show_rom_organisation_page(ui, &mut state);
+                });
+            });
+            rendered_text(&output)
+        };
+        let done = render(journal(
+            TransactionState::Applied,
+            &[EntryState::Applied, EntryState::Applied],
+            &[],
+        ));
+        assert!(done.contains("Completed"), "{done}");
+        assert!(done.contains("2 applied"), "{done}");
+        assert!(done.contains("Undo available now"), "{done}");
+        let partly = render(journal(
+            TransactionState::Applied,
+            &[EntryState::Applied, EntryState::Skipped],
+            &[],
+        ));
+        assert!(partly.contains("Partially completed"), "{partly}");
+        assert!(!partly.contains("Completed\n"), "{partly}");
+    }
+
+    #[test]
     fn all_skipped_apply_keeps_no_undo_handle() {
         use archivefs_core::dat::rename_apply::{ApplyOutcome, RenameTransaction};
         let mut state = RomOrganisationPageState::default();
