@@ -472,21 +472,28 @@ impl PublisherProfilePageState {
         self.execution_transaction = Some(transaction);
     }
 
-    pub(crate) fn rollback_confirmation_phrase(&self) -> Option<String> {
-        self.execution_result
+    /// Applied items the journal says can still be reversed. A run that needs
+    /// reconciliation keeps this route: rollback is what reverses recorded
+    /// links, and it re-verifies the journal and fences writes itself.
+    fn reversible_item_count(&self) -> usize {
+        let settled = matches!(
+            self.execution_stage,
+            PublisherExecutionStage::Applied | PublisherExecutionStage::NeedsReconciliation
+        );
+        self.execution_transaction
             .as_ref()
-            .map(|result| format!("ROLL BACK {} ITEMS", result.operations_created))
+            .filter(|transaction| settled && transaction.transaction.is_rollbackable())
+            .map_or(0, |transaction| transaction.transaction.applied_count())
+    }
+
+    pub(crate) fn rollback_confirmation_phrase(&self) -> Option<String> {
+        let count = self.reversible_item_count();
+        (count > 0).then(|| format!("ROLL BACK {count} ITEMS"))
     }
 
     pub(crate) fn can_rollback(&self) -> bool {
-        self.execution_stage == PublisherExecutionStage::Applied
-            && self
-                .execution_transaction
-                .as_ref()
-                .is_some_and(|transaction| transaction.transaction.is_rollbackable())
-            && self
-                .rollback_confirmation_phrase()
-                .is_some_and(|phrase| self.rollback_confirmation_text == phrase)
+        self.rollback_confirmation_phrase()
+            .is_some_and(|phrase| self.rollback_confirmation_text == phrase)
     }
 
     pub(crate) fn rollback(&mut self) {
@@ -1052,21 +1059,6 @@ pub(crate) fn show_publisher_profile_page(
                                 ui.label("Published as links to the source library.");
                             }
                         }
-                        if let Some(phrase) = state.rollback_confirmation_phrase() {
-                            ui.label(format!(
-                                "Type {phrase} to remove the created destination entries."
-                            ));
-                            ui.text_edit_singleline(&mut state.rollback_confirmation_text);
-                            if ui
-                                .add_enabled(
-                                    state.can_rollback(),
-                                    egui::Button::new("Roll back publisher transaction"),
-                                )
-                                .clicked()
-                            {
-                                request_rollback = true;
-                            }
-                        }
                     }
                 }
                 PublisherExecutionStage::NothingPublished => {
@@ -1084,15 +1076,39 @@ pub(crate) fn show_publisher_profile_page(
                 PublisherExecutionStage::RolledBack => {
                     ui.label("Publisher transaction rolled back. Source files and pre-existing destination data remain untouched.");
                 }
-                PublisherExecutionStage::Failed | PublisherExecutionStage::NeedsReconciliation => {
-                    ui.label(match state.execution_stage {
-                        PublisherExecutionStage::Failed => {
-                            "Publishing failed; nothing is claimed as successful."
-                        }
-                        _ => "Publishing needs reconciliation; do not retry this transaction here.",
-                    });
+                PublisherExecutionStage::Failed => {
+                    ui.label("Publishing failed; nothing is claimed as successful.");
+                }
+                PublisherExecutionStage::NeedsReconciliation => {
+                    ui.label(
+                        "Publishing needs reconciliation; do not retry this transaction here.",
+                    );
+                    let record = &transaction.transaction;
+                    ui.label(format!(
+                        "The record shows {} item(s) applied and {} destination director(ies) created.",
+                        record.applied_count(),
+                        record.created_directories.len()
+                    ));
+                    if state.rollback_confirmation_phrase().is_none() {
+                        ui.label("This page cannot reverse this transaction. Review its journal in Repair History.");
+                    }
                 }
                 PublisherExecutionStage::Preview | PublisherExecutionStage::Review => {}
+            }
+            if let Some(phrase) = state.rollback_confirmation_phrase() {
+                ui.label(format!(
+                    "Type {phrase} to remove the created destination entries."
+                ));
+                ui.text_edit_singleline(&mut state.rollback_confirmation_text);
+                if ui
+                    .add_enabled(
+                        state.can_rollback(),
+                        egui::Button::new("Roll back publisher transaction"),
+                    )
+                    .clicked()
+                {
+                    request_rollback = true;
+                }
             }
             if let Some(error) = &state.execution_error {
                 ui.colored_label(egui::Color32::from_rgb(220, 80, 80), error);

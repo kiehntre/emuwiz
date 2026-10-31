@@ -359,13 +359,16 @@ fn no_change_record() -> archivefs_core::dat::rename_apply::RenameTransaction {
 
 #[test]
 fn publisher_reports_applied_only_for_a_fully_resolved_batch() {
-    let transaction = no_change_record();
-    let done = publish_summary(3, 0, 0, 0);
-    assert_eq!(
-        execution_stage_for(&done, &transaction),
-        PublisherExecutionStage::Applied
+    use archivefs_core::dat::rename_apply::{EntryState, TransactionState};
+    let (state, _temp) = recorded_outcome(
+        &[EntryState::Applied, EntryState::Applied],
+        TransactionState::Applied,
+        Vec::new(),
     );
-    assert!(incomplete_publish_message(&done, &transaction).is_none());
+    assert_eq!(state.execution_stage, PublisherExecutionStage::Applied);
+    assert!(state.execution_error.is_none());
+
+    let transaction = no_change_record();
 
     for incomplete in [
         publish_summary(0, 0, 1, 2),
@@ -384,12 +387,12 @@ fn publisher_reports_applied_only_for_a_fully_resolved_batch() {
     assert!(message.contains("do not replay"), "{message}");
 }
 
-/// A real reviewed transaction, reshaped into what the executor recorded.
+/// A real reviewed transaction, reshaped into what the executor recorded,
+/// with its summary built from that record by the core.
 fn recorded_outcome(
-    entry_state: archivefs_core::dat::rename_apply::EntryState,
+    entry_states: &[archivefs_core::dat::rename_apply::EntryState],
     transaction_state: archivefs_core::dat::rename_apply::TransactionState,
     created_directories: Vec<PathBuf>,
-    summary: archivefs_core::dat::rename_apply::TransactionSummary,
 ) -> (PublisherProfilePageState, tempfile::TempDir) {
     let temp = tempfile::tempdir().unwrap();
     let source = temp.path().join("Game.rom");
@@ -400,39 +403,34 @@ fn recorded_outcome(
     state.link_mode = Some(archivefs_core::publisher_profile::PublisherLinkMode::Symlink);
     state.execution_review();
     let mut transaction = state.execution_transaction.take().expect("reviewed");
-    for entry in &mut transaction.transaction.entries {
-        entry.state = entry_state;
-    }
+    let entry = transaction.transaction.entries[0].clone();
+    transaction.transaction.entries = entry_states
+        .iter()
+        .map(|entry_state| {
+            let mut entry = entry.clone();
+            entry.state = *entry_state;
+            entry
+        })
+        .collect();
     transaction.transaction.state = transaction_state;
     transaction.transaction.created_directories = created_directories;
     let outcome = archivefs_core::dat::rename_apply::ApplyOutcome {
         transaction: transaction.transaction.clone(),
-        summary,
+        summary: archivefs_core::dat::rename_apply::TransactionSummary::from_transaction(
+            &transaction.transaction,
+        ),
     };
     state.record_success(transaction, outcome);
     (state, temp)
-}
-
-fn skipped_summary(
-    applied: usize,
-    skipped: usize,
-) -> archivefs_core::dat::rename_apply::TransactionSummary {
-    archivefs_core::dat::rename_apply::TransactionSummary {
-        requested: applied + skipped,
-        applied,
-        skipped,
-        ..Default::default()
-    }
 }
 
 #[test]
 fn all_skipped_run_is_never_published_or_offered_rollback() {
     use archivefs_core::dat::rename_apply::{EntryState, TransactionState};
     let (mut state, _temp) = recorded_outcome(
-        EntryState::Skipped,
+        &[EntryState::Skipped, EntryState::Skipped],
         TransactionState::ApplyFailed,
         Vec::new(),
-        skipped_summary(0, 2),
     );
     assert_eq!(
         state.execution_stage,
@@ -451,17 +449,11 @@ fn all_skipped_run_is_never_published_or_offered_rollback() {
 
 #[test]
 fn run_recorded_as_rolled_back_reads_undone_not_unchanged() {
-    use archivefs_core::dat::rename_apply::{EntryState, TransactionState, TransactionSummary};
-    let summary = || TransactionSummary {
-        requested: 2,
-        rolled_back: 2,
-        ..Default::default()
-    };
+    use archivefs_core::dat::rename_apply::{EntryState, TransactionState};
     let (mut state, _temp) = recorded_outcome(
-        EntryState::RolledBack,
+        &[EntryState::RolledBack, EntryState::RolledBack],
         TransactionState::RolledBack,
         Vec::new(),
-        summary(),
     );
     assert_eq!(state.execution_stage, PublisherExecutionStage::RolledBack);
     assert!(state.execution_error.is_none());
@@ -471,10 +463,9 @@ fn run_recorded_as_rolled_back_reads_undone_not_unchanged() {
 
     // The journal must prove it: a contradicting record is never called undone.
     let (state, _temp) = recorded_outcome(
-        EntryState::RollbackFailed,
+        &[EntryState::RolledBack, EntryState::RollbackFailed],
         TransactionState::RolledBack,
         Vec::new(),
-        summary(),
     );
     assert_eq!(
         state.execution_stage,
@@ -540,7 +531,12 @@ fn every_journal_state_maps_to_an_outcome_the_record_supports() {
     for first in entry_states {
         for second in entry_states {
             for transaction_state in transaction_states {
-                for created in [Vec::new(), vec![PathBuf::from("/out/created")]] {
+                for created_flag in [false, true] {
+                    let created = if created_flag {
+                        vec![PathBuf::from("/out/created")]
+                    } else {
+                        Vec::new()
+                    };
                     let mut transaction = base.clone();
                     transaction.transaction.entries[0].state = first;
                     transaction.transaction.entries[1].state = second;
@@ -558,30 +554,57 @@ fn every_journal_state_maps_to_an_outcome_the_record_supports() {
                     };
                     state.record_success(transaction, outcome);
                     let case = format!("{first:?}/{second:?}/{transaction_state:?}");
+                    // Expected values come from the raw states, not the
+                    // production predicates under test.
+                    let entries = [first, second];
+                    let count = |wanted: E| entries.iter().filter(|e| **e == wanted).count();
+                    let applied = count(E::Applied);
+                    let surrendered = matches!(transaction_state, T::Finalising | T::Finalised);
+                    let reversible = !surrendered
+                        && match transaction_state {
+                            T::Applied => applied > 0,
+                            T::RolledBack => false,
+                            _ => true,
+                        };
+                    let changed = created_flag
+                        || entries.iter().any(|e| {
+                            matches!(
+                                e,
+                                E::Applying | E::Applied | E::RollingBack | E::RollbackFailed
+                            )
+                        });
+                    let unsettled = entries
+                        .iter()
+                        .any(|e| !matches!(e, E::Applied | E::Skipped | E::RolledBack));
                     match state.execution_stage {
                         PublisherExecutionStage::Applied => {
-                            assert!(summary.fully_resolved() && summary.applied > 0, "{case}");
-                            assert!(record.is_rollbackable(), "{case}");
+                            assert!(applied > 0 && reversible && !unsettled, "{case}");
                         }
                         PublisherExecutionStage::RolledBack => {
-                            assert!(record.is_fully_rolled_back(), "{case}");
+                            assert_eq!(transaction_state, T::RolledBack, "{case}");
+                            assert_eq!(count(E::RolledBack) + count(E::Skipped), 2, "{case}");
+                            assert!(count(E::RolledBack) > 0, "{case}");
                         }
                         PublisherExecutionStage::NothingPublished => {
-                            assert!(!destination_may_have_changed(&record), "{case}");
-                            assert_eq!(summary.rolled_back, 0, "{case}");
+                            assert!(!changed && !unsettled, "{case}");
+                            assert_eq!(count(E::Skipped), 2, "{case}");
                         }
                         PublisherExecutionStage::NeedsReconciliation => {
                             assert!(state.execution_error.is_some(), "{case}");
                         }
                         other => panic!("{case}: unexpected stage {other:?}"),
                     }
-                    state.rollback_confirmation_text =
-                        state.rollback_confirmation_phrase().unwrap();
+                    let expected_phrase = (applied > 0
+                        && reversible
+                        && state.execution_stage != PublisherExecutionStage::RolledBack)
+                        .then(|| format!("ROLL BACK {applied} ITEMS"));
                     assert_eq!(
-                        state.can_rollback(),
-                        state.execution_stage == PublisherExecutionStage::Applied,
+                        state.rollback_confirmation_phrase(),
+                        expected_phrase,
                         "{case}"
                     );
+                    state.rollback_confirmation_text = expected_phrase.clone().unwrap_or_default();
+                    assert_eq!(state.can_rollback(), expected_phrase.is_some(), "{case}");
                 }
             }
         }
@@ -589,13 +612,109 @@ fn every_journal_state_maps_to_an_outcome_the_record_supports() {
 }
 
 #[test]
+fn partial_failure_keeps_a_rollback_route_for_what_the_journal_applied() {
+    use archivefs_core::dat::rename_apply::{EntryState, TransactionState};
+    let (mut state, _temp) = recorded_outcome(
+        &[EntryState::Applied, EntryState::ApplyFailed],
+        TransactionState::ApplyFailed,
+        vec![PathBuf::from("/out/created")],
+    );
+    assert_eq!(
+        state.execution_stage,
+        PublisherExecutionStage::NeedsReconciliation
+    );
+    assert_eq!(
+        state.rollback_confirmation_phrase().as_deref(),
+        Some("ROLL BACK 1 ITEMS")
+    );
+    let labels = page_labels(&mut state);
+    assert!(
+        labels.contains("1 item(s) applied and 1 destination"),
+        "{labels}"
+    );
+    assert!(
+        labels.contains("Roll back publisher transaction"),
+        "{labels}"
+    );
+    assert!(!labels.contains("cannot reverse"), "{labels}");
+}
+
+#[test]
+fn reconciliation_rollback_removes_real_links_without_touching_the_source() {
+    let temp = tempfile::tempdir().unwrap();
+    let source = temp.path().join("Game.rom");
+    let destination = temp.path().join("published");
+    let journal = temp.path().join("journal");
+    std::fs::write(&source, b"reconciliation source").unwrap();
+    std::fs::create_dir(&destination).unwrap();
+    let mut state = executable_state(&source, &destination);
+    state.link_mode = Some(archivefs_core::publisher_profile::PublisherLinkMode::Symlink);
+    state.execution_review();
+    state.confirmation_text = state.apply_confirmation_phrase().unwrap();
+    state.apply_with_journal_dir(&journal);
+    let published = state
+        .execution_transaction
+        .as_ref()
+        .unwrap()
+        .transaction
+        .entries[0]
+        .destination_path
+        .clone();
+    assert!(std::fs::symlink_metadata(&published).is_ok());
+    state.execution_stage = PublisherExecutionStage::NeedsReconciliation;
+    state.rollback_confirmation_text = "ROLL BACK 1 ITEMS".into();
+    state.rollback_with_journal_dir(&journal);
+    assert_eq!(state.execution_stage, PublisherExecutionStage::RolledBack);
+    assert!(std::fs::symlink_metadata(&published).is_err());
+    assert_eq!(std::fs::read(&source).unwrap(), b"reconciliation source");
+    assert!(state.rollback_confirmation_phrase().is_none());
+}
+
+#[test]
+fn real_refusal_after_creating_directories_reports_them_without_a_rollback_claim() {
+    let temp = tempfile::tempdir().unwrap();
+    let source = temp.path().join("Game.rom");
+    let destination = temp.path().join("published");
+    let journal = temp.path().join("journal");
+    std::fs::write(&source, b"refused source").unwrap();
+    std::fs::create_dir(&destination).unwrap();
+    let mut state = executable_state(&source, &destination);
+    state.link_mode = Some(archivefs_core::publisher_profile::PublisherLinkMode::Symlink);
+    state.execution_review();
+    state.confirmation_text = state.apply_confirmation_phrase().unwrap();
+    std::fs::remove_file(&source).unwrap();
+    state.apply_with_journal_dir(&journal);
+    let record = &state.execution_transaction.as_ref().unwrap().transaction;
+    assert_eq!(record.applied_count(), 0);
+    let directories = record.created_directories.len();
+    assert!(directories > 0, "fixture must create directories first");
+    assert!(state.execution_result.is_none());
+    assert_eq!(
+        state.execution_stage,
+        PublisherExecutionStage::NeedsReconciliation
+    );
+    assert!(state.rollback_confirmation_phrase().is_none());
+    let labels = page_labels(&mut state);
+    assert!(
+        labels.contains(&format!("0 item(s) applied and {directories} destination")),
+        "{labels}"
+    );
+    assert!(labels.contains("cannot reverse"), "{labels}");
+}
+
+#[test]
 fn partly_skipped_run_says_so_and_keeps_rollback_for_what_was_applied() {
     use archivefs_core::dat::rename_apply::{EntryState, TransactionState};
     let (mut state, _temp) = recorded_outcome(
-        EntryState::Applied,
+        &[
+            EntryState::Applied,
+            EntryState::Applied,
+            EntryState::Applied,
+            EntryState::Skipped,
+            EntryState::Skipped,
+        ],
         TransactionState::Applied,
         Vec::new(),
-        skipped_summary(3, 2),
     );
     assert_eq!(state.execution_stage, PublisherExecutionStage::Applied);
     assert_eq!(
@@ -654,10 +773,9 @@ fn failed_apply_is_a_plain_failure_only_when_the_record_shows_no_change() {
 fn all_skipped_run_that_created_directories_is_not_called_unchanged() {
     use archivefs_core::dat::rename_apply::{EntryState, TransactionState};
     let (state, _temp) = recorded_outcome(
-        EntryState::Skipped,
+        &[EntryState::Skipped, EntryState::Skipped],
         TransactionState::ApplyFailed,
         vec![PathBuf::from("/out/created")],
-        skipped_summary(0, 2),
     );
     assert_eq!(
         state.execution_stage,
