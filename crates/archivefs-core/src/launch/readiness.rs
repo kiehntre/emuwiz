@@ -759,6 +759,7 @@ pub fn xenia_firmware_readiness() -> FirmwareReadiness {
 ///   (it could be an unused regional alternative - not claimed either way);
 /// - all required entries present is `PresentUnverified`; any other
 ///   unjudgeable entry, or an unreadable `.info`, is `Unknown`.
+///
 /// Never `Verified`: file contents are not hashed.
 pub fn retroarch_core_firmware_readiness(info: &CoreInfoFinding) -> FirmwareReadiness {
     let CoreInfoFinding::Found { firmware, .. } = info else {
