@@ -478,7 +478,9 @@ fn an_unreadable_journal_folder_is_reported() {
     std::fs::set_permissions(&export.journal, mode(0o000)).unwrap();
     let mut state = restarted(&export.journal);
     std::fs::set_permissions(&export.journal, mode(0o700)).unwrap();
-    assert!(page_labels(&mut state).contains("could not be read"));
+    let labels = page_labels(&mut state);
+    assert!(labels.contains("could not be read"), "{labels}");
+    assert!(labels.contains("Check again"), "{labels}");
 }
 
 #[test]
@@ -599,4 +601,46 @@ fn a_symlink_export_through_a_symlinked_parent_stops_before_apply() {
     let error = state.execution_error.clone().unwrap_or_default();
     assert!(error.contains("goes through a symlink"), "{error}");
     assert_eq!(std::fs::read_dir(&destination).unwrap().count(), 0);
+}
+
+#[test]
+fn a_symlink_export_keeps_undo_while_its_destination_is_unmounted() {
+    let export = exported(PublisherLinkMode::Symlink);
+    let root = PathBuf::from(&export.state.destination_root);
+    let hidden = root.with_extension("offline");
+    std::fs::rename(&root, &hidden).unwrap();
+    std::fs::create_dir(&root).unwrap();
+    let blocker = restarted(&export.journal).recovery.exports[0]
+        .blocker
+        .clone()
+        .expect("not offered");
+    assert!(blocker.contains("no longer leads"), "{blocker}");
+    std::fs::remove_dir(&root).unwrap();
+    std::fs::rename(&hidden, &root).unwrap();
+    let mut state = restarted(&export.journal);
+    assert_eq!(state.recovery.exports[0].blocker, None);
+    roll_back_listed(&mut state);
+    assert!(!present(&export.links[0]));
+}
+
+#[test]
+fn an_unreadable_journal_blocks_hardlink_undo_but_not_symlink_undo() {
+    for (mode, blocked) in [
+        (PublisherLinkMode::Hardlink, true),
+        (PublisherLinkMode::Symlink, false),
+    ] {
+        let export = exported(mode);
+        std::fs::write(export.journal.join("9999999999-0.json"), b"not json").unwrap();
+        let mut state = restarted(&export.journal);
+        assert_eq!(
+            state.recovery.exports[0].blocker.is_some(),
+            blocked,
+            "{mode:?}"
+        );
+        let labels = page_labels(&mut state);
+        assert!(
+            labels.contains("1 journal(s) could not be read"),
+            "{labels}"
+        );
+    }
 }

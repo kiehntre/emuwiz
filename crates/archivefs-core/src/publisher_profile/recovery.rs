@@ -47,7 +47,10 @@ fn destination_identity(root: &Path) -> serde_json::Value {
         let _ = metadata;
         (0_u64, 0_u64)
     };
-    serde_json::json!({"real_path": real, "dev": dev, "ino": ino})
+    match serde_json::to_value(&real) {
+        Ok(real_path) => serde_json::json!({"real_path": real_path, "dev": dev, "ino": ino}),
+        Err(_) => serde_json::Value::Null,
+    }
 }
 
 /// The value stamped when a Publisher transaction is built.
@@ -56,7 +59,7 @@ pub(super) fn export_marker(
     link_mode: PublisherLinkMode,
 ) -> serde_json::Value {
     serde_json::json!({
-        "destination_root": destination_root,
+        "destination_root": destination_root.to_string_lossy(),
         "destination_identity": destination_identity(destination_root),
         "link_mode": match link_mode {
             PublisherLinkMode::Hardlink => MODE_HARDLINK,
@@ -80,6 +83,8 @@ pub struct PublisherRecoveryListing {
     pub exports: Vec<RecoverableExport>,
     /// Marked journals left out because their seal did not verify.
     pub unverified: usize,
+    /// Journals too damaged to say what they record.
+    pub unparseable: usize,
     /// Why the folder itself could not be read.
     pub unreadable: Option<String>,
 }
@@ -201,9 +206,9 @@ fn export_root(transaction: &RenameTransaction) -> Option<&Path> {
         .map(Path::new)
 }
 
-/// Whether the root still resolves to the folder recorded at export. Hardlink
-/// rollback checks containment from the root down, so this covers the path
-/// above it. Unrecorded identity never matches.
+/// Whether the root still resolves to the folder recorded at export. Rollback
+/// checks containment from the root down, so this covers the path above it, and
+/// an empty mount point in the folder's place. Unrecorded identity never matches.
 fn destination_unchanged(transaction: &RenameTransaction, root: &Path) -> bool {
     let recorded = transaction
         .unknown
@@ -235,11 +240,9 @@ fn availability_blocker(transaction: &RenameTransaction) -> Option<String> {
             "{id} cannot be undone right now: its source folders are not available. Reconnect them, then choose Check again."
         ));
     }
-    let hardlinked = reversible_entries(transaction)
-        .any(|entry| matches!(entry.operation, TransactionOperation::CreateHardlink { .. }));
-    (hardlinked && !destination_unchanged(transaction, root)).then(|| {
+    (!destination_unchanged(transaction, root)).then(|| {
         format!(
-            "{id} cannot be undone: {} no longer leads to the folder it was exported to.",
+            "{id} cannot be undone right now: {} no longer leads to the folder it was exported to. Reconnect it, then choose Check again.",
             root.display()
         )
     })
@@ -247,16 +250,21 @@ fn availability_blocker(transaction: &RenameTransaction) -> Option<String> {
 
 /// A hardlink has no identity of its own, so a link at a path recorded again by
 /// a later journal cannot be told from the later one. Symlinks carry creation
-/// proof, so they keep their per-link refusal and partial rollback.
-fn superseded_blocker(
-    transaction: &RenameTransaction,
-    records: &[RenameTransaction],
-) -> Option<String> {
+/// proof, so they keep their per-link refusal and partial rollback. A journal
+/// that cannot be read may be such a record, so it counts too.
+fn superseded_blocker(transaction: &RenameTransaction, records: &JournalRecords) -> Option<String> {
     let hardlinks: Vec<&Path> = reversible_entries(transaction)
         .filter(|entry| matches!(entry.operation, TransactionOperation::CreateHardlink { .. }))
         .map(|entry| entry.destination_path.as_path())
         .collect();
+    if !hardlinks.is_empty() && records.unreadable > 0 {
+        return Some(format!(
+            "{} cannot be undone: {} journal(s) in this folder could not be read and may record the same destination paths.",
+            transaction.transaction_id, records.unreadable
+        ));
+    }
     records
+        .readable
         .iter()
         .filter(|other| {
             other.transaction_id != transaction.transaction_id
@@ -278,22 +286,30 @@ fn superseded_blocker(
         })
 }
 
-fn export_blocker(
-    transaction: &RenameTransaction,
-    records: &[RenameTransaction],
-) -> Option<String> {
+fn export_blocker(transaction: &RenameTransaction, records: &JournalRecords) -> Option<String> {
     undo_blocker(transaction)
         .or_else(|| availability_blocker(transaction))
         .or_else(|| superseded_blocker(transaction, records))
 }
 
-/// Every journal in the folder that could be read, verified or not, so an
-/// unverifiable later record still counts as ambiguity.
-fn readable_records(journal_dir: &Path) -> Vec<RenameTransaction> {
-    seal::history_evidence(journal_dir, &[])
-        .into_iter()
-        .filter_map(|item| item.transaction)
-        .collect()
+/// Every journal in the folder, verified or not, so an unverifiable later
+/// record still counts as ambiguity.
+struct JournalRecords {
+    readable: Vec<RenameTransaction>,
+    unreadable: usize,
+}
+
+fn journal_records(evidence: &[seal::JournalEvidence]) -> JournalRecords {
+    JournalRecords {
+        readable: evidence
+            .iter()
+            .filter_map(|item| item.transaction.clone())
+            .collect(),
+        unreadable: evidence
+            .iter()
+            .filter(|item| item.transaction.is_none())
+            .count(),
+    }
 }
 
 /// Marked exports in `journal_dir` that rollback could still act on, or that an
@@ -305,7 +321,7 @@ pub fn recoverable_publisher_exports(journal_dir: &Path) -> PublisherRecoveryLis
         (error.kind() != std::io::ErrorKind::NotFound).then(|| error.to_string())
     });
     let evidence = seal::history_evidence(journal_dir, &[]);
-    let records = readable_records(journal_dir);
+    let records = journal_records(&evidence);
     let unverified = evidence
         .iter()
         .filter(|item| !item.status.trusted())
@@ -335,6 +351,7 @@ pub fn recoverable_publisher_exports(journal_dir: &Path) -> PublisherRecoveryLis
     PublisherRecoveryListing {
         exports,
         unverified,
+        unparseable: records.unreadable,
         unreadable,
     }
 }
@@ -378,7 +395,10 @@ pub fn open_publisher_export_for_undo(
             "The journal for {id} no longer matches this record. It was not opened for Undo."
         ));
     }
-    match export_blocker(&journal, &readable_records(journal_dir)) {
+    match export_blocker(
+        &journal,
+        &journal_records(&seal::history_evidence(journal_dir, &[])),
+    ) {
         Some(blocker) => Err(blocker),
         None => Ok(journal),
     }
@@ -503,6 +523,18 @@ mod tests {
         let mut escaping = record(symlink("/out"), Some(marker));
         escaping.created_directories.push("/home/user".into());
         assert!(!is_publisher_export(&escaping));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_path_json_cannot_hold_has_no_identity_and_does_not_panic() {
+        use std::os::unix::ffi::OsStrExt;
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().join(std::ffi::OsStr::from_bytes(b"bad\xff"));
+        std::fs::create_dir(&root).unwrap();
+        assert!(destination_identity(&root).is_null());
+        let marker = export_marker(&root, PublisherLinkMode::Hardlink);
+        assert!(marker["destination_identity"].is_null());
     }
 
     #[test]

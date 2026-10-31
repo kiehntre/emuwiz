@@ -601,6 +601,10 @@ fn publisher_execution_error_text(
             detail,
             ..
         } => format!("HARDLINK is unavailable: {detail}"),
+        archivefs_core::publisher_profile::PublisherExecutionError::DirectoryConflict {
+            detail,
+            ..
+        } => format!("Publisher execution review blocked: {detail}"),
         other => format!("Publisher execution review blocked: {other:?}"),
     }
 }

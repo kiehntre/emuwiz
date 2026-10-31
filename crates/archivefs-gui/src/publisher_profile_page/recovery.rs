@@ -57,15 +57,23 @@ impl PublisherProfilePageState {
             Ok(directory) => {
                 let listing = recoverable_publisher_exports(&directory);
                 self.recovery.exports = listing.exports;
-                self.recovery.notice = match (listing.unreadable, listing.unverified) {
-                    (Some(error), _) => {
-                        Some(format!("Transaction journals could not be read: {error}."))
-                    }
-                    (None, 0) => None,
-                    (None, count) => Some(format!(
-                        "{count} export journal(s) could not be verified, so they are not listed and cannot be undone here."
-                    )),
-                };
+                let mut notices = Vec::new();
+                if let Some(error) = listing.unreadable {
+                    notices.push(format!("Transaction journals could not be read: {error}."));
+                }
+                if listing.unverified > 0 {
+                    notices.push(format!(
+                        "{} export journal(s) could not be verified, so they are not listed and cannot be undone here.",
+                        listing.unverified
+                    ));
+                }
+                if listing.unparseable > 0 {
+                    notices.push(format!(
+                        "{} journal(s) could not be read, so hardlink exports cannot be undone here until they are repaired.",
+                        listing.unparseable
+                    ));
+                }
+                self.recovery.notice = (!notices.is_empty()).then(|| notices.join(" "));
             }
             Err(error) => {
                 self.recovery.exports.clear();
@@ -211,7 +219,8 @@ pub(super) fn show_recoverable_exports(ui: &mut egui::Ui, state: &mut PublisherP
         if let Some(message) = &state.recovery.message {
             ui.label(message);
         }
-        if exports.iter().any(|export| export.blocker.is_some())
+        if (state.recovery.notice.is_some()
+            || exports.iter().any(|export| export.blocker.is_some()))
             && ui.button("Check again").clicked()
         {
             state.recovery.loaded = false;
