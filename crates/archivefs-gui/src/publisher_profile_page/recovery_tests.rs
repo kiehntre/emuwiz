@@ -644,3 +644,19 @@ fn an_unreadable_journal_blocks_hardlink_undo_but_not_symlink_undo() {
         );
     }
 }
+
+#[test]
+fn preview_during_an_outage_does_not_advise_a_rollback_that_would_lose_undo() {
+    let mut export = exported(PublisherLinkMode::Symlink);
+    let root = PathBuf::from(&export.state.destination_root);
+    let hidden = root.with_extension("offline");
+    std::fs::rename(&root, &hidden).unwrap();
+    std::fs::create_dir(&root).unwrap();
+    assert!(!export.state.keep_rollback_durable("Preview was not run"));
+    let error = export.state.execution_error.clone().unwrap();
+    assert!(!error.contains("Roll it back here first"), "{error}");
+    assert!(error.contains("do not roll back until then"), "{error}");
+    std::fs::remove_dir(&root).unwrap();
+    std::fs::rename(&hidden, &root).unwrap();
+    assert!(export.state.keep_rollback_durable("Preview was not run"));
+}

@@ -6,7 +6,7 @@ use std::path::{Path, PathBuf};
 
 use archivefs_core::dat::rename_apply::RollbackResult;
 use archivefs_core::publisher_profile::recovery::{
-    PublisherUndoFailure, RecoverableExport, open_publisher_export_for_undo,
+    PublisherUndoFailure, RecoverableExport, availability_blocker, open_publisher_export_for_undo,
     recoverable_publisher_exports, rollback_publisher_export,
 };
 
@@ -107,6 +107,14 @@ impl PublisherProfilePageState {
                     "Export {id} was not undone. It stays listed here until you roll it back."
                 ));
                 true
+            }
+            // A rollback now would fail on these links, and links are not
+            // retried, so advising one would cost the Undo this guard protects.
+            Err(_) if availability_blocker(&transaction.transaction).is_some() => {
+                self.execution_error = Some(format!(
+                    "{refused}, because this export's folders are not available right now. Reconnect them and try again, and do not roll back until then: a rollback now cannot finish and those links would not be offered again. Nothing was changed."
+                ));
+                false
             }
             Err(reason) => {
                 self.execution_error = Some(format!(

@@ -221,7 +221,7 @@ fn destination_unchanged(transaction: &RenameTransaction, root: &Path) -> bool {
 /// Why Undo should wait: an unavailable folder would otherwise be recorded as a
 /// refused link, and links are never retried. A single missing source folder
 /// is not an outage, so it stays with the per-entry partial rollback.
-fn availability_blocker(transaction: &RenameTransaction) -> Option<String> {
+pub fn availability_blocker(transaction: &RenameTransaction) -> Option<String> {
     let id = &transaction.transaction_id;
     let root = export_root(transaction)?;
     if !root.is_dir() {
