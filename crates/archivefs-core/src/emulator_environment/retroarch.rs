@@ -380,6 +380,22 @@ pub struct FirmwareRequirement {
     /// that an unmarked firmware entry is required unless a core's
     /// `.info` explicitly says otherwise.
     pub optional: bool,
+    /// Read-only, no-follow presence of `path` under the profile's resolved
+    /// system directory. Never a content/hash claim.
+    pub presence: FirmwarePresence,
+}
+
+/// Whether a declared firmware file exists under the system directory.
+/// `PresentUnverified` means a regular file of that name exists - its
+/// contents are never read or hashed. `Unknown` is every case where EmuWiz
+/// cannot honestly say (no resolved system directory, Flatpak sandbox
+/// mapping, unsafe/absent declared path, symlink, unreadable, wrong type).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum FirmwarePresence {
+    Unknown,
+    Missing,
+    PresentUnverified,
 }
 
 // `Found` is by far the common case for a discovered core (a core with a
@@ -1580,6 +1596,7 @@ fn parse_firmware_requirements(
             optional: optional_raw
                 .remove(&index)
                 .is_some_and(|raw| raw.eq_ignore_ascii_case("true")),
+            presence: FirmwarePresence::Unknown,
         })
         .collect()
 }
@@ -1816,6 +1833,14 @@ fn discover_cores(
                 resolve_core_info(filesystem, directory, &stem, profile, diagnostics)
             }
         };
+        let mut info = info;
+        if let CoreInfoFinding::Found { firmware, .. } = &mut info {
+            let system_dir = resolved_dirs.get(&PathPurpose::System);
+            for requirement in firmware.iter_mut().filter(|r| !r.optional) {
+                requirement.presence =
+                    probe_firmware_presence(filesystem, profile, system_dir, requirement);
+            }
+        }
         let core = CoreFinding {
             file_name: EncodedPath::from_os_string(&entry.file_name),
             full_path: EncodedPath::from_path(&full_path),
@@ -1827,6 +1852,126 @@ fn discover_cores(
 
     cores.sort_by(|(left, _), (right, _)| left.cmp(right));
     cores.into_iter().map(|(_, core)| core).collect()
+}
+
+/// A declared firmware path is only honoured when it is a plain relative
+/// path of `Normal` components: `..`, absolute, `.`-led, empty or NUL-bearing
+/// names yield `None`. Shared by the probe and [`firmware_evidence_paths`] so
+/// both always agree on exactly which paths are looked at.
+fn safe_firmware_components(declared: &str) -> Option<Vec<&OsStr>> {
+    use std::path::Component;
+    if declared.is_empty() || declared.contains('\0') {
+        return None;
+    }
+    let mut components = Vec::new();
+    for component in Path::new(declared).components() {
+        match component {
+            Component::Normal(name) => components.push(name),
+            _ => return None,
+        }
+    }
+    (!components.is_empty()).then_some(components)
+}
+
+/// Filesystem evidence a cached report's firmware presence depends on. It is
+/// deliberately a superset of what the probe touches (a not-yet-existing or
+/// symlinked system directory is still listed so its creation/replacement is
+/// noticed). Known gap: edits to a core's `.info` file are not included, so
+/// a changed `firmwareN_path` is picked up on the next rescan trigger, not
+/// immediately. Covers:
+/// each non-Flatpak profile's `retroarch.cfg`, its resolved system
+/// directory, and every prefix path of each required firmware file that was
+/// probed. A caller that caches the report can re-check these (e.g. by
+/// no-follow metadata) to know when the cached presence may be stale. Pure:
+/// it only reads the report and never touches the filesystem.
+pub fn firmware_evidence_paths(report: &RetroArchEnvironmentReport) -> Vec<PathBuf> {
+    let mut paths = Vec::new();
+    for profile in report
+        .profiles
+        .iter()
+        .filter(|profile| profile.profile_kind != ProfileKind::Flatpak)
+    {
+        if !profile.config_file.path.lossy {
+            paths.push(PathBuf::from(&profile.config_file.path.display));
+        }
+        let Some(system_dir) = profile
+            .paths
+            .iter()
+            .find(|finding| finding.purpose == PathPurpose::System)
+            .filter(|finding| finding.resolution == ResolutionState::ConfiguredResolved)
+            .and_then(|finding| finding.resolved_path.as_ref())
+            .filter(|path| !path.lossy)
+            .map(|path| PathBuf::from(&path.display))
+        else {
+            continue;
+        };
+        paths.push(system_dir.clone());
+        for core in &profile.cores {
+            let CoreInfoFinding::Found { firmware, .. } = &core.info else {
+                continue;
+            };
+            for requirement in firmware.iter().filter(|r| !r.optional) {
+                let Some(components) = requirement
+                    .path
+                    .as_deref()
+                    .and_then(safe_firmware_components)
+                else {
+                    continue;
+                };
+                let mut current = system_dir.clone();
+                for component in components {
+                    current.push(component);
+                    paths.push(current.clone());
+                }
+            }
+        }
+    }
+    paths.sort();
+    paths.dedup();
+    paths
+}
+
+/// Read-only, no-follow presence check for one declared firmware file.
+///
+/// Every component is probed with the final-component no-follow `probe`,
+/// starting from the already-validated system directory; a symlink at any
+/// level is `Unknown` (never followed, never trusted). Declared paths come
+/// from user-editable `.info` files, so anything but plain relative
+/// `Normal` components (absolute, `..`, empty, NUL) is `Unknown`. Flatpak
+/// system directories are sandbox-mapped, so no host-side claim is made.
+fn probe_firmware_presence(
+    filesystem: &dyn ReadOnlyHostFilesystem,
+    profile: ProfileRef,
+    system_dir: Option<&PathBuf>,
+    requirement: &FirmwareRequirement,
+) -> FirmwarePresence {
+    if profile.profile_kind == ProfileKind::Flatpak {
+        return FirmwarePresence::Unknown;
+    }
+    let (Some(system_dir), Some(declared)) = (system_dir, requirement.path.as_deref()) else {
+        return FirmwarePresence::Unknown;
+    };
+    let Some(components) = safe_firmware_components(declared) else {
+        return FirmwarePresence::Unknown;
+    };
+    let Some((last, parents)) = components.split_last() else {
+        return FirmwarePresence::Unknown;
+    };
+    let mut current = system_dir.clone();
+    for parent in parents {
+        current.push(parent);
+        match filesystem.probe(&current) {
+            FsProbe::PresentDirectory => {}
+            FsProbe::Missing => return FirmwarePresence::Missing,
+            _ => return FirmwarePresence::Unknown,
+        }
+    }
+    current.push(last);
+    match filesystem.probe(&current) {
+        FsProbe::PresentFile => FirmwarePresence::PresentUnverified,
+        FsProbe::Missing => FirmwarePresence::Missing,
+        _ => FirmwarePresence::Unknown,
+    }
 }
 
 /// The `.info` filename conventions this resolver understands, tried in
@@ -4167,6 +4312,221 @@ mod tests {
             }
             other => panic!("expected Found, got {other:?}"),
         }
+    }
+
+    /// Builds a native profile with one core whose `.info` is `info_bytes`
+    /// and a configured system directory `system/`, then returns the
+    /// per-entry presences plus the projected readiness.
+    fn firmware_probe_fixture(
+        name: &str,
+        info_bytes: &[u8],
+        setup: impl FnOnce(&Fixture),
+    ) -> (Fixture, CoreInfoFinding) {
+        let fixture = Fixture::new(name);
+        fixture.write(
+            ".config/retroarch/retroarch.cfg",
+            &format!(
+                "libretro_directory = \"{}\"\nlibretro_info_path = \"{}\"\nsystem_directory = \"{}\"\n",
+                fixture.path("cores").display(),
+                fixture.path("info").display(),
+                fixture.path("system").display()
+            ),
+        );
+        fixture.mkdir("cores");
+        fixture.mkdir("info");
+        fixture.mkdir("system");
+        fixture.write("cores/psx_libretro.so", "stub");
+        fs::write(fixture.path("info/psx.info"), info_bytes).unwrap();
+        setup(&fixture);
+        let before = fixture.snapshot();
+        let report =
+            discover_retroarch_environment(&HostReadOnlyFilesystem, &fixture.env()).unwrap();
+        assert_eq!(
+            before,
+            fixture.snapshot(),
+            "discovery must not write anything"
+        );
+        let info = report.profiles[0].cores[0].info.clone();
+        (fixture, info)
+    }
+
+    fn presences(info: &CoreInfoFinding) -> Vec<FirmwarePresence> {
+        match info {
+            CoreInfoFinding::Found { firmware, .. } => {
+                firmware.iter().map(|f| f.presence).collect()
+            }
+            other => panic!("expected Found, got {other:?}"),
+        }
+    }
+
+    fn fw_info(entries: &[(&str, bool)]) -> String {
+        let mut text = format!("firmware_count = \"{}\"\n", entries.len());
+        for (i, (path, opt)) in entries.iter().enumerate() {
+            text.push_str(&format!(
+                "firmware{i}_path = \"{path}\"\nfirmware{i}_opt = \"{opt}\"\n"
+            ));
+        }
+        text
+    }
+
+    impl Fixture {
+        fn snapshot(&self) -> Vec<(PathBuf, bool)> {
+            fn walk(dir: &Path, out: &mut Vec<(PathBuf, bool)>) {
+                let mut entries: Vec<_> = fs::read_dir(dir).unwrap().flatten().collect();
+                entries.sort_by_key(|e| e.path());
+                for entry in entries {
+                    let meta = fs::symlink_metadata(entry.path()).unwrap();
+                    out.push((entry.path(), meta.is_dir()));
+                    if meta.is_dir() {
+                        walk(&entry.path(), out);
+                    }
+                }
+            }
+            let mut out = Vec::new();
+            walk(&self.root, &mut out);
+            out
+        }
+    }
+
+    #[test]
+    fn firmware_presence_missing_present_and_optional() {
+        let info = fw_info(&[
+            ("scph5501.bin", false),
+            ("scph5500.bin", true),
+            ("scph1001.bin", false),
+        ]);
+        let (_f, found) = firmware_probe_fixture("fw-presence", info.as_bytes(), |f| {
+            f.write("system/scph5501.bin", "not a real bios");
+        });
+        // optional entries are not probed and stay Unknown
+        assert_eq!(
+            presences(&found),
+            vec![
+                FirmwarePresence::PresentUnverified,
+                FirmwarePresence::Unknown,
+                FirmwarePresence::Missing
+            ]
+        );
+    }
+
+    #[test]
+    fn firmware_presence_nested_path_and_missing_parent() {
+        let info = fw_info(&[("dc/boot.bin", false), ("nodir/x.bin", false)]);
+        let (_f, found) = firmware_probe_fixture("fw-nested", info.as_bytes(), |f| {
+            f.write("system/dc/boot.bin", "x");
+        });
+        assert_eq!(
+            presences(&found),
+            vec![
+                FirmwarePresence::PresentUnverified,
+                FirmwarePresence::Missing
+            ]
+        );
+    }
+
+    #[test]
+    fn firmware_presence_never_follows_symlinks() {
+        let info = fw_info(&[
+            ("link.bin", false),
+            ("linkdir/real.bin", false),
+            ("dirname", false),
+        ]);
+        let (_f, found) = firmware_probe_fixture("fw-symlink", info.as_bytes(), |f| {
+            f.write("elsewhere/real.bin", "x");
+            std::os::unix::fs::symlink(f.path("elsewhere/real.bin"), f.path("system/link.bin"))
+                .unwrap();
+            std::os::unix::fs::symlink(f.path("elsewhere"), f.path("system/linkdir")).unwrap();
+            f.mkdir("system/dirname");
+        });
+        assert_eq!(
+            presences(&found),
+            vec![
+                FirmwarePresence::Unknown,
+                FirmwarePresence::Unknown,
+                FirmwarePresence::Unknown
+            ]
+        );
+    }
+
+    #[test]
+    fn firmware_presence_rejects_traversal_and_absolute_names() {
+        let info = fw_info(&[
+            ("../outside.bin", false),
+            ("sub/../../outside.bin", false),
+            ("/etc/passwd", false),
+            ("", false),
+            (".", false),
+        ]);
+        let (_f, found) = firmware_probe_fixture("fw-traversal", info.as_bytes(), |f| {
+            f.write("outside.bin", "x");
+        });
+        assert!(
+            presences(&found)
+                .iter()
+                .all(|p| *p == FirmwarePresence::Unknown)
+        );
+    }
+
+    #[test]
+    fn firmware_presence_handles_non_utf8_names_and_info() {
+        // A non-UTF-8 file in the system dir is never matched by a UTF-8
+        // declared name, and does not break the probe.
+        let info = fw_info(&[("bios.bin", false)]);
+        let (_f, found) = firmware_probe_fixture("fw-nonutf8-dir", info.as_bytes(), |f| {
+            let weird = std::ffi::OsStr::from_bytes(b"bios\xff.bin");
+            fs::write(f.path("system").join(weird), "x").unwrap();
+        });
+        assert_eq!(presences(&found), vec![FirmwarePresence::Missing]);
+
+        // A non-UTF-8 `.info` is already InvalidUtf8, never guessed at.
+        let (_f, found) = firmware_probe_fixture(
+            "fw-nonutf8-info",
+            b"firmware_count = \"1\"\nfirmware0_path = \"a\xff\"\n",
+            |_| {},
+        );
+        assert_eq!(found, CoreInfoFinding::InvalidUtf8);
+    }
+
+    #[test]
+    fn firmware_evidence_paths_cover_config_system_dir_and_probed_prefixes_only() {
+        let info = fw_info(&[("dc/boot.bin", false), ("../x", false), ("opt.bin", true)]);
+        let (f, _) = firmware_probe_fixture("fw-evidence", info.as_bytes(), |_| {});
+        let report = discover_retroarch_environment(&HostReadOnlyFilesystem, &f.env()).unwrap();
+        let paths = firmware_evidence_paths(&report);
+        let sys = f.path("system");
+        assert!(paths.contains(&f.path(".config/retroarch/retroarch.cfg")));
+        assert!(paths.contains(&sys));
+        assert!(paths.contains(&sys.join("dc")));
+        assert!(paths.contains(&sys.join("dc/boot.bin")));
+        assert!(
+            !paths
+                .iter()
+                .any(|p| p.ends_with("x") || p.ends_with("opt.bin"))
+        );
+    }
+
+    #[test]
+    fn firmware_presence_unknown_without_resolved_system_directory() {
+        let fixture = Fixture::new("fw-nosystem");
+        fixture.write(
+            ".config/retroarch/retroarch.cfg",
+            &format!(
+                "libretro_directory = \"{}\"\nlibretro_info_path = \"{}\"\nsystem_directory = \"{}\"\n",
+                fixture.path("cores").display(),
+                fixture.path("info").display(),
+                fixture.path("absent-system").display()
+            ),
+        );
+        fixture.mkdir("cores");
+        fixture.mkdir("info");
+        fixture.write("cores/psx_libretro.so", "stub");
+        fixture.write("info/psx.info", &fw_info(&[("scph5501.bin", false)]));
+        let report =
+            discover_retroarch_environment(&HostReadOnlyFilesystem, &fixture.env()).unwrap();
+        assert_eq!(
+            presences(&report.profiles[0].cores[0].info),
+            vec![FirmwarePresence::Unknown]
+        );
     }
 
     #[test]
