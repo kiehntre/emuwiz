@@ -932,6 +932,10 @@ class OrphanRoute(Base):
     def orphan(self, name="wt-orphan", on_main=True, remove="worktree", **kw):
         wt, t = self.managed_cache(name, **kw)
         head = self.mod.F.head_of(wt)
+        # keep the checkout's inode allocated after removal so a later fixture directory cannot reuse it
+        # (a reused inode is correctly held as ORPHAN_SOURCE_MOVED and would make tests flaky)
+        pin_fd = os.open(wt, os.O_RDONLY | os.O_DIRECTORY)
+        self.addCleanup(os.close, pin_fd)
         if on_main:
             self.git("-C", self.repo, "update-ref", "refs/remotes/origin/main", head)
         if remove == "worktree":
@@ -1353,6 +1357,17 @@ class OrphanRoute(Base):
         self.addCleanup(os.close, fd)
         os.write(fd, b"../..\n")
         self.assertIsNone(F.checkout_evidence(wt))
+
+    def test_unnormalised_recorded_worktree_path_is_refused_on_its_own(self):
+        wt, t, g = self.orphan("wt-norm")
+        _, rec = self.record_of(t)
+        odd = os.path.join(self.tmp, "gone", "..", "elsewhere")
+        rec["worktree"] = odd
+        rec["worktree_hash"] = hashlib.sha256(odd.encode()).hexdigest()[:12]
+        target = os.path.join(os.path.dirname(t), "name-" + rec["worktree_hash"])  # name binding satisfied
+        code, detail = self.mod.orphan_git_preserved_owner(g, rec, target)
+        self.assertEqual(code, "OWNER_UNVERIFIED")
+        self.assertIn("normalised", detail)
 
     def test_git_runs_with_scrubbed_env_and_owner_runner(self):
         seen = {}
