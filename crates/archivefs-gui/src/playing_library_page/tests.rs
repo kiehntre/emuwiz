@@ -2980,3 +2980,48 @@ fn failed_apply_and_failed_undo_are_worded_by_what_the_receipt_records() {
     assert!(!body.contains("retry Undo"), "{body}");
     assert!(body.contains("no links still awaiting"), "{body}");
 }
+
+#[test]
+fn failed_undo_distinguishes_recorded_links_awaiting_reversal_from_a_reversed_receipt() {
+    use archivefs_core::dat::rename_apply::model::{EntryState, TransactionEntry};
+    let exe = std::env::current_exe().unwrap();
+    let entry = |state| TransactionEntry {
+        source_path: exe.clone(),
+        destination_path: PathBuf::from("/library/link"),
+        original_basename: "a".into(),
+        proposed_basename: "link".into(),
+        identity: capture_identity(&exe).unwrap(),
+        operation: Default::default(),
+        preflight_passed: true,
+        preflight_failures: Vec::new(),
+        state,
+        failure_reason: None,
+        applied_at_unix: Some(1),
+        rolled_back_at_unix: None,
+        unknown: Default::default(),
+    };
+    let mut tx = RenameTransaction {
+        transaction_id: "t".into(),
+        plan_generation: 1,
+        classifier_version: None,
+        created_at_unix: 0,
+        source_scan_root: String::new(),
+        state: TransactionState::RollbackFailed,
+        entries: vec![
+            entry(EntryState::RolledBack),
+            entry(EntryState::RollbackFailed),
+        ],
+        created_directories: Vec::new(),
+        recovery_resolution: None,
+        recovery_resolved_at_unix: None,
+        unknown: Default::default(),
+    };
+    let (_, body) = apply_error_heading(Some(&tx), true);
+    assert!(body.contains("still records links"), "{body}");
+    assert!(!body.contains("no links still awaiting"), "{body}");
+    // Every entry reversed: nothing is claimed to remain.
+    tx.entries = vec![entry(EntryState::RolledBack)];
+    let (_, body) = apply_error_heading(Some(&tx), true);
+    assert!(body.contains("no links still awaiting"), "{body}");
+    assert!(!body.contains("still records links"), "{body}");
+}
