@@ -49,9 +49,6 @@ fn game(id: u64) -> Value {
         "fs_size_bytes":32768,"regions":["USA"],"crc_hash":"DEADBEEF","igdb_id":101,
         "files":[],"sibling_roms":[],"metadatum":{"genres":["Puzzle"]}})
 }
-fn api(version: &str) -> Value {
-    api_with(version, false)
-}
 fn api_with(version: &str, collections: bool) -> Value {
     let mut params = vec![
         "limit",
