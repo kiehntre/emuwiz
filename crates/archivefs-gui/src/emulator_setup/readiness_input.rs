@@ -802,8 +802,6 @@ impl ReadinessSources<'_> {
         // command, infer identity, or turn an executable's presence into a
         // Ready result. A later launch click still invokes that adapter's
         // own preflight and execution path.
-        let empty_firmware: &[archivefs_core::dat::firmware_evidence::FirmwareIdentityRecord] = &[];
-
         // Already-validated EmuWiz-managed AppImages (if any) - caller-
         // confirmed explicit executables fed into the *existing* per-adapter
         // discovery. The `install.json`-backed managed slice is swept once

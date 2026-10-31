@@ -4,10 +4,9 @@ use super::profile_resolution::ppsspp::{
     PpssppResolutionInputs, PpssppResolutionState, spawn_ppsspp_resolution,
 };
 use super::profile_resolution::{
-    DuckStationLaunchAuthority, DuckStationLaunchSelection, DuckStationResolutionInputs,
-    DuckStationResolutionState, DuckStationResolutionView, ResolutionView, ResolverSubject,
-    present_resolution, present_resolution_for, select_for_launch, show_profile_resolution,
-    spawn_duckstation_resolution,
+    DuckStationResolutionInputs, DuckStationResolutionState, DuckStationResolutionView,
+    ResolutionView, ResolverSubject, present_resolution, present_resolution_for,
+    show_profile_resolution, spawn_duckstation_resolution,
 };
 
 impl ArchiveFsApp {
