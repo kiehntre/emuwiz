@@ -552,6 +552,14 @@ class HistoryGates(LegacyCheckout):
         nested.write_text('secret')
         self.assert_gate_holds('GIT_STATE_UNVERIFIED')
 
+    def test_nested_git_under_a_non_utf8_name_is_printable(self):
+        bad = os.path.join(os.fsencode(self.wt), b'bad\xff')
+        os.mkdir(bad)
+        os.mkdir(os.path.join(bad, b'.git'))
+        wt = self.gate_when_lifecycle_clear()
+        self.assertEqual(wt['code'], 'GIT_STATE_UNVERIFIED')
+        wt['explanation'].encode('utf-8')
+
     def test_gitlink_without_submodule_state_holds(self):
         self.run_git('update-index', '--add', '--cacheinfo', f'160000,{self.base},sm')
         self.run_git('commit', '-qm', 'gitlink')

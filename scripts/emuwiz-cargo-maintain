@@ -1621,7 +1621,7 @@ def history_preservation_problem(wt):
             return ("GIT_STATE_UNVERIFIED", "a gitlink's directory can hold files status does not report")
         nested = nested_git_entry()
         if nested:
-            return ("GIT_STATE_UNVERIFIED", "nested .git entry status does not report: " + nested)
+            return ("GIT_STATE_UNVERIFIED", "nested .git entry status does not report: " + ascii(nested))
         if git("for-each-ref", "--format=%(refname)", "refs/worktree", "refs/bisect", "refs/rewritten"):
             return ("GIT_HISTORY_NOT_PRESERVED", "per-worktree refs would be deleted with the checkout")
         unknown = sorted(set(os.listdir(admin)) - KNOWN_ADMIN_ENTRIES)
