@@ -630,11 +630,18 @@ earlier one-off script: the pin, lock, process, identity, preservation and journ
 hold looks wrong, fix the tool (tests, review, install approval) or report the hold.
 
 `SOURCE_MISSING` stays the default for a cache without a source checkout. The one exception is a group whose manifest sets
-`"orphan_route": "GIT_PRESERVED"`, `"source_exists": false`, no source paths, `source_head` and `orphan_repo`. The tool then
-verifies freshly and holds on anything unverifiable: a lifecycle record with a cargo-iso build and a 40-hex HEAD equal to
-`source_head`; the target name bound to the recorded worktree path by its hash; the worktree path absent and not
-registered by `git worktree list` in `orphan_repo`; the HEAD a commit contained in that repository's
-`refs/remotes/origin/main`. Holds: `SOURCE_MISSING`, `OWNER_UNVERIFIED`, `ORPHAN_SOURCE_PRESENT`, `ORPHAN_REPO_UNVERIFIED`,
-`GIT_HISTORY_NOT_PRESERVED`. Every other gate (completion release, pin, lock, census, identity, idle time, journal) applies
-unchanged. Unidentified caches (no recorded build HEAD, such as the 2026-10-15 adopted scratch/source directories) cannot use
-the route and stay hard `SOURCE_MISSING`.
+`"orphan_route": "GIT_PRESERVED"`, `"source_exists": false`, no source paths and `source_head`. The repository is never taken
+from the manifest (a differing `orphan_repo` is a hold): cargo-iso records, from the live linked checkout at build time,
+`checkout` = {checkout root device/inode, administrative gitdir, repository common dir}. Records without it are refused
+(`ORPHAN_EVIDENCE_MISSING`), so only builds made after this change qualify. Freshly, and holding on anything unverifiable,
+the tool requires: a cargo-iso record with a 40-hex HEAD equal to `source_head`; the target name bound to the recorded
+worktree path by its hash; the worktree path gone AND the checkout's administrative gitdir gone (git no longer holds it,
+moved or not); no registered worktree with the recorded path or the recorded checkout identity (`ORPHAN_SOURCE_MOVED`); the
+HEAD contained in `refs/remotes/origin/main` of the recorded repository. git runs only through `run_as_owner` (all uids
+dropped) with a scrubbed environment and no lazy fetch. Holds: `SOURCE_MISSING`, `OWNER_UNVERIFIED`, `ORPHAN_EVIDENCE_MISSING`,
+`ORPHAN_SOURCE_PRESENT`, `ORPHAN_SOURCE_MOVED`, `ORPHAN_REPO_UNVERIFIED`, `GIT_HISTORY_NOT_PRESERVED`. Every other gate
+(completion release, pin, lock, census, identity, idle time, journal) applies unchanged. Unidentified caches (no recorded
+build HEAD, such as the 2026-10-15 adopted scratch/source directories) cannot use the route and stay hard `SOURCE_MISSING`.
+Limits: the registry and the recorded repository are owner-writable, so a deliberately forged record plus a hand-made
+`origin/main` ref in the recorded repository is the same trust base as every other registry gate; a checkout moved by hand and
+pruned leaves no registration, which only the process census can then catch.

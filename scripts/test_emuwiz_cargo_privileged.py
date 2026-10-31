@@ -527,5 +527,104 @@ class SystemdService(Priv):
         self.assertFalse(os.path.exists("/etc/systemd/system/emuwiz-cargo-maintain.timer"))
 
 
+class OrphanRouteGitPrivilege(Priv):
+    """Real root, disposable fixtures only: git and anything it spawns never regain uid 0."""
+
+    PROBE = """\
+import importlib.machinery, json, os, sys
+lib, user, repo, out = sys.argv[1:5]
+sys.dont_write_bytecode = True
+def load(name):
+    loader = importlib.machinery.SourceFileLoader(name.replace("-", "_"), os.path.join(lib, name))
+    mod = importlib.util.module_from_spec(importlib.util.spec_from_loader(loader.name, loader))
+    loader.exec_module(mod)
+    return mod
+import importlib.util
+F = load("emuwiz-cargo-retention")
+R = load("emuwiz-cargo-retire")
+F.drop_to_owner(user)
+missing = "1" * 40 + "^{commit}"
+state = {"ruid_euid_suid_before": list(os.getresuid())}
+F.run_as_owner(["git", "-C", repo, "cat-file", "-e", missing], env={"PATH": "/usr/bin:/bin", "HOME": "/nonexistent"},
+               capture_output=True, text=True, timeout=60)           # unscrubbed positive control
+state["control_helper_runs"] = len(open(out).read().splitlines()) if os.path.exists(out) else 0
+os.unlink(out) if os.path.exists(out) else None
+R._git(repo, "cat-file", "-e", missing)                               # the tool's own git runner
+state["tool_helper_runs"] = len(open(out).read().splitlines()) if os.path.exists(out) else 0
+print(json.dumps(state))
+"""
+
+    def test_git_children_never_hold_root_and_the_tool_does_not_lazy_fetch(self):
+        src = os.path.join(self.tmp, "src")
+        repo = os.path.join(self.tmp, "repo")
+        out = os.path.join(self.tmp, "helper-out")
+        for cmd in (["git", "init", "-q", src], ["git", "init", "-q", repo]):
+            subprocess.run(cmd, check=True, capture_output=True)
+        subprocess.run(["git", "-C", src, "-c", "user.name=t", "-c", "user.email=t@t", "commit", "-q",
+                        "--allow-empty", "-m", "a"], check=True, capture_output=True)
+        helper = os.path.join(self.tmp, "helper.sh")
+        with open(helper, "w") as handle:
+            handle.write("#!/bin/sh\n"
+                         f"echo \"$(grep '^Uid' /proc/$$/status) $(python3 -c 'import os\ntry:\n os.setresuid(0,0,0);print(\"REGAINED\")\nexcept OSError:\n print(\"denied\")')\" >> {out}\n"
+                         "exit 1\n")
+        os.chmod(helper, 0o755)
+        for key, value in (("extensions.partialclone", "origin"), ("remote.origin.url", src),
+                           ("remote.origin.promisor", "true"), ("remote.origin.uploadpack", helper),
+                           ("core.repositoryformatversion", "1")):
+            subprocess.run(["git", "-C", repo, "config", key, value], check=True)
+        probe = os.path.join(self.tmp, "probe.py")
+        with open(probe, "w") as handle:
+            handle.write(self.PROBE)
+        lib = os.path.join(INSTALL, "libexec")
+        sudo("install", "-o", "root", "-g", "root", "-m", "0644", probe, os.path.join(lib, "orphan_probe.py"))
+        r = sudo("env", "-i", f"HOME={self.home}", "PATH=/usr/bin:/bin", PYTHON, "-I", "-S",
+                 os.path.join(lib, "orphan_probe.py"), lib, ME, repo, out, check=False)
+        self.assertEqual(r.returncode, 0, r.stderr)
+        state = json.loads(r.stdout.strip().splitlines()[-1])
+        self.assertEqual(state["ruid_euid_suid_before"][1], os.getuid())  # session is the owner (suid stays 0)
+        self.assertGreaterEqual(state["control_helper_runs"], 1, state)  # control: git did spawn a helper
+        self.assertEqual(state["tool_helper_runs"], 0, state)             # tool's git: no lazy fetch at all
+        self.assertEqual(self.root_owned(), [])
+
+    def test_helper_spawned_through_run_as_owner_holds_no_root_uid(self):
+        # same fixture, but record what the control helper saw
+        src = os.path.join(self.tmp, "src2")
+        repo = os.path.join(self.tmp, "repo2")
+        out = os.path.join(self.tmp, "helper-out2")
+        for cmd in (["git", "init", "-q", src], ["git", "init", "-q", repo]):
+            subprocess.run(cmd, check=True, capture_output=True)
+        subprocess.run(["git", "-C", src, "-c", "user.name=t", "-c", "user.email=t@t", "commit", "-q",
+                        "--allow-empty", "-m", "a"], check=True, capture_output=True)
+        helper = os.path.join(self.tmp, "helper2.sh")
+        with open(helper, "w") as handle:
+            handle.write("#!/bin/sh\n"
+                         f"echo \"$(grep '^Uid' /proc/$$/status) $(python3 -c 'import os\ntry:\n os.setresuid(0,0,0);print(\"REGAINED\")\nexcept OSError:\n print(\"denied\")')\" > {out}\n"
+                         "exit 1\n")
+        os.chmod(helper, 0o755)
+        for key, value in (("extensions.partialclone", "origin"), ("remote.origin.url", src),
+                           ("remote.origin.promisor", "true"), ("remote.origin.uploadpack", helper),
+                           ("core.repositoryformatversion", "1")):
+            subprocess.run(["git", "-C", repo, "config", key, value], check=True)
+        probe = os.path.join(self.tmp, "probe2.py")
+        with open(probe, "w") as handle:
+            handle.write("import importlib.machinery, importlib.util, os, sys\n"
+                         "lib, user, repo = sys.argv[1:4]\nsys.dont_write_bytecode = True\n"
+                         "l = importlib.machinery.SourceFileLoader('F', os.path.join(lib, 'emuwiz-cargo-retention'))\n"
+                         "F = importlib.util.module_from_spec(importlib.util.spec_from_loader('F', l)); l.exec_module(F)\n"
+                         "F.drop_to_owner(user)\n"
+                         "F.run_as_owner(['git', '-C', repo, 'cat-file', '-e', '1'*40 + '^{commit}'],\n"
+                         "               env={'PATH': '/usr/bin:/bin', 'HOME': '/nonexistent'}, capture_output=True, text=True, timeout=60)\n")
+        lib = os.path.join(INSTALL, "libexec")
+        sudo("install", "-o", "root", "-g", "root", "-m", "0644", probe, os.path.join(lib, "orphan_probe2.py"))
+        r = sudo("env", "-i", f"HOME={self.home}", "PATH=/usr/bin:/bin", PYTHON, "-I", "-S",
+                 os.path.join(lib, "orphan_probe2.py"), lib, ME, repo, check=False)
+        self.assertEqual(r.returncode, 0, r.stderr)
+        with open(out) as handle:
+            seen = handle.read().split()
+        uid = str(os.getuid())
+        self.assertEqual(seen[:5], ["Uid:", uid, uid, uid, uid], seen)  # real/effective/saved/fs all the owner
+        self.assertEqual(seen[5], "denied", seen)                        # and it cannot setresuid(0,0,0)
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

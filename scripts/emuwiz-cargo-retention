@@ -547,6 +547,30 @@ def head_of(worktree):
         return None
 
 
+def checkout_evidence(worktree):
+    """Continuity evidence of a LINKED git worktree, read from the live checkout with plain file reads
+    (no git process): the checkout root's device/inode, its administrative gitdir and the owning
+    repository's common dir.  None when anything is not exactly as git writes it."""
+    try:
+        st = os.lstat(worktree)
+        gitfile = os.path.join(worktree, ".git")
+        gst = os.lstat(gitfile)
+        if not stat.S_ISDIR(st.st_mode) or not stat.S_ISREG(gst.st_mode) or gst.st_size > 4096:
+            return None
+        with open(gitfile) as handle:
+            first = handle.readline().rstrip("\n")
+        if not first.startswith("gitdir: "):
+            return None
+        admin = os.path.realpath(first[len("gitdir: "):])
+        with open(os.path.join(admin, "commondir")) as handle:
+            common = os.path.realpath(os.path.join(admin, handle.readline().strip()))
+        if os.path.dirname(admin) != os.path.join(common, "worktrees") or os.path.basename(common) != ".git":
+            return None
+        return {"worktree_identity": {"dev": st.st_dev, "ino": st.st_ino}, "gitdir": admin, "common_dir": common}
+    except (OSError, ValueError):
+        return None
+
+
 def begin_record(registry, key, args, token, cmd):
     target = canon(args.target)
     try:
@@ -575,6 +599,9 @@ def begin_record(registry, key, args, token, cmd):
             hashlib.sha256(record["worktree"].encode()).hexdigest()[:12] if record.get("worktree") else None
         )
         record["head"] = head_of(record["worktree"]) if record.get("worktree") else None
+        evidence = checkout_evidence(record["worktree"]) if record.get("worktree") else None
+        if evidence:
+            record["checkout"] = evidence  # kept from the last build when the checkout is gone
         record["owner"] = record.get("owner") or owner_name()
         record["last_builder"] = owner_name()
         record["task"] = os.environ.get("EMUWIZ_TASK") or record.get("task") or record["worktree"]

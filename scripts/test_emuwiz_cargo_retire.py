@@ -1021,6 +1021,47 @@ class OrphanRoute(Base):
         self.assertIn("OWNER_UNVERIFIED", codes)
         self.assertTrue(self.exists(t, "debug/deps"))
 
+    def test_repository_comes_from_build_time_evidence_not_the_manifest(self):
+        wt, t, g = self.orphan()
+        other = os.path.join(self.tmp, "other-repo")
+        self.git("init", "-q", other)
+        self.git("-C", other, "fetch", "-q", os.path.join(self.repo, ".git"))
+        self.git("-C", other, "update-ref", "refs/remotes/origin/main", g["source_head"])
+        codes, _ = self.holds(dict(g, orphan_repo=os.path.realpath(other)), "other.json")
+        self.assertIn("ORPHAN_REPO_UNVERIFIED", codes)
+        self.assertTrue(self.exists(t, "debug/deps"))
+
+    def test_record_without_checkout_evidence_is_refused(self):
+        wt, t, g = self.orphan()
+        rec = os.path.join(self.reg, "targets", self.key_of(t) + ".json")
+        data = T.jload(rec)
+        data.pop("checkout")
+        T.jdump(data, rec)
+        codes, _ = self.holds(g)
+        self.assertIn("ORPHAN_EVIDENCE_MISSING", codes)
+        self.assertTrue(self.exists(t, "debug/deps"))
+
+    def test_moved_checkout_is_refused(self):
+        wt, t = self.managed_cache("wt-moved")
+        head = self.mod.F.head_of(wt)
+        self.git("-C", self.repo, "update-ref", "refs/remotes/origin/main", head)
+        moved = os.path.join(self.tmp, "wt-moved-elsewhere")
+        self.git("-C", self.repo, "worktree", "move", wt, moved)
+        g = self.group(self.worktree("scratch-moved"), t)
+        g.update({"source_exists": False, "associated_source_paths": "[]", "source_head": head,
+                  "orphan_route": "GIT_PRESERVED", "orphan_repo": os.path.realpath(self.repo)})
+        codes, _ = self.holds(g)  # original path gone, process census clear, git still registers it
+        self.assertTrue(codes & {"ORPHAN_SOURCE_PRESENT", "ORPHAN_SOURCE_MOVED"}, codes)
+        self.assertTrue(self.exists(t, "debug/deps"))
+        # administrative dir recorded elsewhere (so only identity can reveal the move)
+        rec = os.path.join(self.reg, "targets", self.key_of(t) + ".json")
+        data = T.jload(rec)
+        data["checkout"]["gitdir"] = os.path.join(self.tmp, "gone-admin")
+        T.jdump(data, rec)
+        codes, _ = self.holds(g, "m2.json")
+        self.assertIn("ORPHAN_SOURCE_MOVED", codes)
+        self.assertTrue(self.exists(t, "debug/deps"))
+
     def test_git_runs_with_scrubbed_env_and_owner_runner(self):
         seen = {}
         orig = self.mod.F.run_as_owner
