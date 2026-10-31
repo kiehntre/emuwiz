@@ -176,6 +176,20 @@ pub fn build_publisher_transaction_with_policy(
             detail: "publisher destination root is not absolute".to_string(),
         });
     }
+    // Link creation and rollback refuse a redirected path for symlinks, so
+    // refuse here rather than fail part-way through Apply.
+    if link_mode == PublisherLinkMode::Symlink
+        && let Ok(real) = std::fs::canonicalize(&plan.destination_root)
+        && real != plan.destination_root
+    {
+        return Err(PublisherExecutionError::DirectoryConflict {
+            path: plan.destination_root.clone(),
+            detail: format!(
+                "symlink exports need the folder's real path, and this one goes through a symlink. Choose {} instead, or use hardlinks.",
+                real.display()
+            ),
+        });
+    }
     let destination_root_identity = capture_destination_root_identity(&plan.destination_root)
         .map_err(|error| PublisherExecutionError::DirectoryConflict {
             path: plan.destination_root.clone(),
@@ -449,6 +463,10 @@ pub fn build_publisher_transaction_with_policy(
             },
         };
     }
+    transaction.unknown.insert(
+        super::recovery::PUBLISHER_EXPORT_MARKER.to_string(),
+        super::recovery::export_marker(&plan.destination_root, link_mode),
+    );
     let directories = required_directories(&transaction, &plan.destination_root)?;
     Ok(PublisherTransaction {
         transaction,
