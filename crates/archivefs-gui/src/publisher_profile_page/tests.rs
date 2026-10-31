@@ -705,6 +705,109 @@ fn rollback_is_not_called_complete_while_a_failed_entrys_link_remains() {
 }
 
 #[test]
+fn rollback_reports_anything_in_a_created_directory_it_did_not_record() {
+    use archivefs_core::dat::rename_apply::{EntryState, TransactionState};
+    type Plant = fn(&std::path::Path);
+    let shapes: [(&str, Plant); 6] = [
+        ("empty folder", |d| {
+            std::fs::create_dir(d.join("saves")).unwrap()
+        }),
+        ("nested tombstone name", |d| {
+            std::fs::create_dir(d.join("saves")).unwrap();
+            std::fs::write(d.join("saves/.emuwiz-undone-x"), b"user").unwrap();
+        }),
+        ("file with tombstone prefix", |d| {
+            std::fs::write(d.join(".emuwiz-undone-user-save"), b"user").unwrap()
+        }),
+        ("symlink with tombstone prefix", |d| {
+            std::os::unix::fs::symlink("/nowhere", d.join(".emuwiz-undone-link")).unwrap()
+        }),
+        ("folder with tombstone prefix", |d| {
+            std::fs::create_dir(d.join(".emuwiz-undone-d")).unwrap()
+        }),
+        ("plain symlink", |d| {
+            std::os::unix::fs::symlink("/nowhere", d.join("plain")).unwrap()
+        }),
+    ];
+    for (name, plant) in shapes {
+        let mut run = reshaped_run(
+            &[EntryState::Applied, EntryState::Applied],
+            TransactionState::Applied,
+        );
+        plant(run.published[0].parent().unwrap());
+        run.state.rollback_confirmation_text = "ROLL BACK 2 ITEMS".into();
+        run.state.rollback_with_journal_dir(&run.journal);
+        assert_eq!(
+            run.state.execution_stage,
+            PublisherExecutionStage::NeedsReconciliation,
+            "{name}"
+        );
+        assert!(run.state.execution_error.is_some(), "{name}");
+    }
+}
+
+#[test]
+fn rollback_refuses_an_in_flight_entry_with_no_creation_proof() {
+    use archivefs_core::dat::rename_apply::{EntryState, TransactionState};
+    let mut run = reshaped_run(
+        &[EntryState::Applied, EntryState::Applied],
+        TransactionState::Applied,
+    );
+    let journal = run.journal.clone();
+    let transaction = &mut run
+        .state
+        .execution_transaction
+        .as_mut()
+        .unwrap()
+        .transaction;
+    transaction.entries[1].state = EntryState::Applying;
+    transaction.entries[1].unknown.clear();
+    transaction.state = TransactionState::ApplyFailed;
+    archivefs_core::dat::rename_apply::journal::write_journal(&journal, transaction).unwrap();
+    run.state.rollback_confirmation_text = "ROLL BACK 2 ITEMS".into();
+    run.state.rollback_with_journal_dir(&journal);
+    assert_eq!(
+        run.state.execution_stage,
+        PublisherExecutionStage::NeedsReconciliation
+    );
+    assert!(run.state.execution_error.is_some());
+    for link in &run.published {
+        assert!(std::fs::symlink_metadata(link).is_ok(), "nothing reversed");
+    }
+}
+
+#[test]
+fn clean_rollback_of_real_links_still_reads_rolled_back() {
+    use archivefs_core::dat::rename_apply::{EntryState, TransactionState};
+    let mut run = reshaped_run(
+        &[EntryState::Applied, EntryState::Applied],
+        TransactionState::Applied,
+    );
+    run.state.rollback_confirmation_text = "ROLL BACK 2 ITEMS".into();
+    run.state.rollback_with_journal_dir(&run.journal);
+    assert_eq!(
+        run.state.execution_stage,
+        PublisherExecutionStage::RolledBack
+    );
+    assert!(run.state.execution_error.is_none());
+}
+
+#[test]
+fn rollback_control_does_not_promise_it_outlasts_this_session() {
+    use archivefs_core::dat::rename_apply::{EntryState, TransactionState};
+    let (mut state, _temp) = recorded_outcome(
+        &[EntryState::Applied],
+        TransactionState::Applied,
+        Vec::new(),
+    );
+    let labels = page_labels(&mut state);
+    assert!(
+        labels.contains("available only until you preview again or close EmuWiz"),
+        "{labels}"
+    );
+}
+
+#[test]
 fn rollback_counts_and_reverses_an_in_flight_entry() {
     use archivefs_core::dat::rename_apply::{EntryState, TransactionState};
     let mut run = reshaped_run(

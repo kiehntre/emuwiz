@@ -600,14 +600,20 @@ fn in_flight_count(transaction: &archivefs_core::dat::rename_apply::RenameTransa
 }
 
 /// What a rollback reported as complete did not remove: created directories
-/// it could not empty, and links from entries recorded as failed, which
-/// rollback does not touch but which can exist when verification failed
-/// after the link was created.
+/// holding anything beyond what rollback recorded, and links from entries
+/// recorded as failed, which rollback does not touch but which can exist when
+/// verification failed after the link was created.
 fn destination_left_after_rollback(
     transaction: &archivefs_core::dat::rename_apply::RenameTransaction,
     outcome: &archivefs_core::platform_evidence_fusion::plan_transaction::PlanRollbackOutcome,
 ) -> Vec<String> {
     use archivefs_core::dat::rename_apply::EntryState;
+    let tombstones: std::collections::BTreeSet<PathBuf> = transaction
+        .entries
+        .iter()
+        .filter_map(|entry| entry.unknown.get("emuwiz_link_undo_tombstone_v1"))
+        .filter_map(|value| value.as_str().map(PathBuf::from))
+        .collect();
     transaction
         .entries
         .iter()
@@ -617,35 +623,41 @@ fn destination_left_after_rollback(
         })
         .map(|entry| &entry.destination_path)
         .chain(
-            outcome
-                .directories_remaining
-                .iter()
-                .filter(|directory| holds_more_than_undone_entries(directory)),
+            outcome.directories_remaining.iter().filter(|directory| {
+                !holds_only_rollback_records(directory, &tombstones, transaction)
+            }),
         )
         .map(|path| path.display().to_string())
         .collect()
 }
 
-/// Rollback parks each removed link as a hidden `.emuwiz-undone-` entry beside
-/// where it was, so a created directory normally survives a clean rollback.
-/// Anything else in it, or a directory that cannot be read, is real leftover.
-fn holds_more_than_undone_entries(directory: &std::path::Path) -> bool {
+/// Rollback parks each removed symlink as a tombstone it records in the
+/// journal, so a created directory can survive a clean rollback. Only exact
+/// recorded tombstones and created directories holding nothing else are
+/// rollback's own. An empty or unreadable directory is real leftover.
+fn holds_only_rollback_records(
+    directory: &std::path::Path,
+    tombstones: &std::collections::BTreeSet<PathBuf>,
+    transaction: &archivefs_core::dat::rename_apply::RenameTransaction,
+) -> bool {
     let Ok(entries) = std::fs::read_dir(directory) else {
-        return true;
+        return false;
     };
-    entries.into_iter().any(|entry| {
+    let mut held = 0;
+    for entry in entries {
         let Ok(entry) = entry else {
-            return true;
+            return false;
         };
         let path = entry.path();
-        if std::fs::symlink_metadata(&path).is_ok_and(|metadata| metadata.is_dir()) {
-            return holds_more_than_undone_entries(&path);
+        let ours = tombstones.contains(&path)
+            || (transaction.created_directories.contains(&path)
+                && holds_only_rollback_records(&path, tombstones, transaction));
+        if !ours {
+            return false;
         }
-        !entry
-            .file_name()
-            .to_string_lossy()
-            .starts_with(".emuwiz-undone-")
-    })
+        held += 1;
+    }
+    held > 0
 }
 
 /// Whether the journalled record shows the destination may have changed: an
@@ -1171,6 +1183,9 @@ pub(crate) fn show_publisher_profile_page(
                 ui.label(format!(
                     "Type {phrase} to remove the created destination entries."
                 ));
+                ui.label(
+                    "Rollback here is available only until you preview again or close EmuWiz.",
+                );
                 let in_flight = in_flight_count(&transaction.transaction);
                 if in_flight > 0 {
                     ui.label(format!(
