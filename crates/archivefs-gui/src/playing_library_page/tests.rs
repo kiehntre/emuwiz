@@ -2952,3 +2952,29 @@ fn destination_change_preserves_completed_receipts_and_undo() {
     assert!(std::fs::symlink_metadata(&output).is_err());
     assert_eq!(std::fs::read(&source).unwrap(), b"test");
 }
+
+#[test]
+fn failed_apply_and_failed_undo_are_worded_by_what_the_receipt_records() {
+    let empty = RenameTransaction {
+        transaction_id: "t".into(),
+        plan_generation: 1,
+        classifier_version: None,
+        created_at_unix: 0,
+        source_scan_root: String::new(),
+        state: TransactionState::Planned,
+        entries: Vec::new(),
+        created_directories: Vec::new(),
+        recovery_resolution: None,
+        recovery_resolved_at_unix: None,
+        unknown: Default::default(),
+    };
+    let (title, body) = apply_error_heading(None, false);
+    assert_eq!(title, "Not created");
+    assert!(!body.contains("may have been created"), "{body}");
+    // A receipt holding no recorded links is the same refusal, with no Undo claim.
+    assert_eq!(apply_error_heading(Some(&empty), false).0, "Not created");
+    // A failed Undo is never presented as a failed creation.
+    let (title, body) = apply_error_heading(Some(&empty), true);
+    assert_eq!(title, "Undo did not finish");
+    assert!(body.contains("retry Undo"), "{body}");
+}
