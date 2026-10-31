@@ -28,27 +28,34 @@ pub(super) const MAX_IN_FLIGHT: usize = 2;
 /// Games considered per frame, taken from the ones drawn.
 pub(super) const MAX_CANDIDATES: usize = 24;
 
-/// Canonical platform ids whose readiness depends on selected-game-only
-/// controller state (Flycast GDI, VICE, XRoar cassette, Cemu, plus the
-/// Hatari, Mesen and shadPS4 snapshots, which are the same kind). Compared
-/// case-insensitively against the catalogue, the evidence report and the plan.
-const SELECTION_BOUND_PLATFORMS: [&str; 9] = [
-    "Dreamcast",
-    "Commodore 64",
-    archivefs_core::launch::DRAGON_COCO_PLATFORM_ID,
-    "WiiU",
-    "Wii U",
-    "AtariST",
-    "Atari ST",
-    "NES",
-    "PS4",
+/// Platforms skipped for now, each with the selection-bound controller that
+/// makes a background answer unsafe. That controller contributes a launch
+/// candidate (or the identity itself) only after the game is selected, and the
+/// readiness plan is one result over all candidates, so a background plan
+/// without it could say Not ready, or Ready where the selected game would be
+/// asked to choose. The whole platform is therefore skipped, not just that
+/// emulator. TEMPORARY: the follow-up supplies selection-independent evidence
+/// and removes entries one at a time, NES/Mesen first.
+const SELECTION_BOUND_PLATFORMS: [(&str, &str); 9] = [
+    ("Dreamcast", "Flycast GDI context"),
+    ("Commodore 64", "VICE context"),
+    (
+        archivefs_core::launch::DRAGON_COCO_PLATFORM_ID,
+        "XRoar cassette context",
+    ),
+    ("WiiU", "Cemu context and inspection"),
+    ("Wii U", "Cemu context and inspection"),
+    ("AtariST", "Hatari snapshot"),
+    ("Atari ST", "Hatari snapshot"),
+    ("NES", "Mesen snapshot"),
+    ("PS4", "shadPS4 snapshot"),
 ];
 
 pub(super) fn selection_bound_platform(platform: &str) -> bool {
     let canonical = archivefs_core::canonical_platform_for_alias(platform).unwrap_or(platform);
-    SELECTION_BOUND_PLATFORMS
-        .iter()
-        .any(|bound| bound.eq_ignore_ascii_case(canonical) || bound.eq_ignore_ascii_case(platform))
+    SELECTION_BOUND_PLATFORMS.iter().any(|(bound, _)| {
+        bound.eq_ignore_ascii_case(canonical) || bound.eq_ignore_ascii_case(platform)
+    })
 }
 
 /// Immutable copy of the emulator readiness the builder reads. Only finished
@@ -302,6 +309,19 @@ pub(super) fn check(env: &EnvSnapshot, job: &Job, cancel: &AtomicBool) -> Outcom
     }
 }
 
+/// Apply one finished check to the cache. Only a known answer is kept, and
+/// only where no current answer exists; skipped and unknown outcomes leave the
+/// game Not checked.
+pub(super) fn record_outcome(
+    cache: &mut super::library::ReadinessCache,
+    game: &Game,
+    outcome: Outcome,
+) {
+    if let Outcome::Known(result) = outcome {
+        cache.record_background(game, result);
+    }
+}
+
 struct Finished {
     epoch: u64,
     id: i64,
@@ -346,6 +366,7 @@ impl Scheduler {
         // Results from the old epoch still arrive and are dropped in `drain`.
     }
 
+    #[cfg(test)]
     pub(super) fn epoch(&self) -> u64 {
         self.epoch
     }
@@ -407,5 +428,189 @@ impl Scheduler {
             });
             context.request_repaint();
         });
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::gui_v2::library::{CheckedReadiness as C, ReadinessCache};
+
+    fn archive(id: i64, platform: &str) -> PersistedArchive {
+        PersistedArchive {
+            id,
+            source_folder_id: 1,
+            relative_path: format!("{id}.bin").into(),
+            absolute_path: format!("/nonexistent-bg-readiness/{id}.bin").into(),
+            archive_kind: "file".into(),
+            display_name: format!("Game {id}"),
+            normalized_name: format!("game {id}"),
+            size_bytes: Some(1),
+            modified_time_unix_seconds: Some(1),
+            platform: Some(platform.into()),
+            platform_source: Some("fixture".into()),
+            last_known_health: "ok".into(),
+            last_seen_at: "fixture".into(),
+            last_verified_missing_at: None,
+            identity_report: None,
+        }
+    }
+
+    fn game(id: i64, platform: &str) -> Game {
+        Game::from_archive(archive(id, platform))
+    }
+
+    fn env() -> EnvSnapshot {
+        EnvSnapshot {
+            retroarch: None,
+            dolphin: None,
+            pcsx2: None,
+            firmware: None,
+            xenia: XeniaProfilesState::NotScanned,
+            overrides: Default::default(),
+        }
+    }
+
+    #[test]
+    fn every_selection_bound_platform_family_is_skipped_never_judged() {
+        let cancel = AtomicBool::new(false);
+        // The four approved families, by their aliases and canonical names,
+        // plus the three same-kind snapshots (Atari ST, NES, PS4).
+        for platform in [
+            "Dreamcast",
+            "Commodore 64",
+            "C64",
+            "Dragon / Tandy CoCo",
+            "Wii U",
+            "WiiU",
+            "Atari ST",
+            "NES",
+            "PS4",
+        ] {
+            let job = Job::for_game(&game(1, platform));
+            assert_eq!(
+                check(&env(), &job, &cancel),
+                Outcome::Skipped,
+                "{platform} must be left Not checked"
+            );
+        }
+    }
+
+    #[test]
+    fn an_unreadable_game_is_unknown_not_ready_or_not_ready() {
+        let cancel = AtomicBool::new(false);
+        let job = Job::for_game(&game(2, "SNES"));
+        assert_eq!(check(&env(), &job, &cancel), Outcome::Unknown);
+    }
+
+    #[test]
+    fn skipped_and_unknown_outcomes_leave_games_not_checked() {
+        let g = game(3, "Dreamcast");
+        let mut cache = ReadinessCache::default();
+        record_outcome(&mut cache, &g, Outcome::Skipped);
+        record_outcome(&mut cache, &g, Outcome::Unknown);
+        assert_eq!(cache.get(&g), None);
+        record_outcome(&mut cache, &g, Outcome::Known(C::Ready));
+        assert_eq!(cache.get(&g), Some(C::Ready));
+    }
+
+    #[test]
+    fn a_background_answer_never_replaces_a_foreground_one() {
+        let g = game(4, "SNES");
+        let mut cache = ReadinessCache::default();
+        cache.record(&g, Some(C::NotReady("Needs emulator")));
+        record_outcome(&mut cache, &g, Outcome::Known(C::Ready));
+        assert_eq!(cache.get(&g), Some(C::NotReady("Needs emulator")));
+    }
+
+    #[test]
+    fn pick_is_bounded_by_capacity_candidates_and_settled_games() {
+        let games: Vec<Game> = (0..20_000).map(|i| game(i, "SNES")).collect();
+        let mut scheduler = Scheduler::default();
+        let picked = scheduler.pick(games.iter(), |_| false);
+        assert_eq!(picked.len(), MAX_IN_FLIGHT);
+        assert_eq!(picked[0].id, 0, "nearest the top first");
+        // Full pool: nothing more starts.
+        scheduler.in_flight = MAX_IN_FLIGHT;
+        assert!(scheduler.pick(games.iter(), |_| false).is_empty());
+        // Games already decided or already cached are not picked again.
+        scheduler.in_flight = 0;
+        scheduler.settled.insert(0, Outcome::Skipped);
+        let picked = scheduler.pick(games.iter(), |g| g.archive.id == 1);
+        assert_eq!(picked.iter().map(|j| j.id).collect::<Vec<_>>(), [2, 3]);
+        // Only the first MAX_CANDIDATES drawn are ever considered.
+        let all_cached = scheduler.pick(games.iter(), |g| g.archive.id < MAX_CANDIDATES as i64);
+        assert!(
+            all_cached.is_empty(),
+            "games past the window are not looked at"
+        );
+    }
+
+    #[test]
+    fn rapid_scrolling_never_exceeds_the_pool_or_requeues_a_game() {
+        let games: Vec<Game> = (0..500).map(|i| game(i, "SNES")).collect();
+        let mut scheduler = Scheduler::default();
+        let mut started = std::collections::HashSet::new();
+        for window in games.windows(MAX_CANDIDATES).step_by(7) {
+            for job in scheduler.pick(window.iter(), |_| false) {
+                assert!(started.insert(job.id), "game {} queued twice", job.id);
+                scheduler.in_flight += 1;
+                scheduler.settled.insert(job.id, Outcome::Unknown);
+            }
+            assert!(scheduler.in_flight() <= MAX_IN_FLIGHT);
+            // A finished check frees one slot as the viewport moves on.
+            scheduler.in_flight = scheduler.in_flight.saturating_sub(1);
+        }
+    }
+
+    #[test]
+    fn invalidation_cancels_outstanding_work_and_drops_its_late_results() {
+        let mut scheduler = Scheduler::default();
+        let cancel = Arc::clone(&scheduler.cancel);
+        let old_epoch = scheduler.epoch();
+        scheduler.in_flight = 1;
+        scheduler.invalidate();
+        assert!(cancel.load(Ordering::Relaxed), "old work is told to stop");
+        assert_ne!(scheduler.epoch(), old_epoch);
+        // A result from before the change arrives late: dropped, not applied.
+        scheduler
+            .sender
+            .send(Finished {
+                epoch: old_epoch,
+                id: 9,
+                outcome: Outcome::Known(C::Ready),
+            })
+            .unwrap();
+        assert!(scheduler.drain().is_empty());
+        assert_eq!(scheduler.in_flight(), 0, "the slot is still freed");
+        // The new epoch's work is accepted.
+        scheduler
+            .sender
+            .send(Finished {
+                epoch: scheduler.epoch(),
+                id: 10,
+                outcome: Outcome::Known(C::Ready),
+            })
+            .unwrap();
+        assert_eq!(scheduler.drain().len(), 1);
+    }
+
+    #[test]
+    fn a_cancelled_check_returns_nothing() {
+        let cancel = AtomicBool::new(true);
+        // Even a game with real bytes yields no verdict once cancelled.
+        let dir = std::env::temp_dir().join(format!("bg-readiness-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let file = dir.join("x.sfc");
+        std::fs::write(&file, vec![0u8; 4096]).unwrap();
+        let mut archive = archive(5, "SNES");
+        archive.absolute_path = file;
+        let job = Job::for_game(&Game::from_archive(archive));
+        assert_ne!(
+            check(&env(), &job, &cancel),
+            Outcome::Known(C::Ready),
+            "a cancelled check must not report Ready"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

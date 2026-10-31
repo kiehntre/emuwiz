@@ -567,17 +567,12 @@ impl App {
             state.env_signature = signature;
             state.background.invalidate();
             state.readiness.clear();
-            state.env = signature.and_then(|signature| {
-                readiness
-                    .and_then(super::bg_readiness::EnvSnapshot::capture)
-                    .map(|env| (signature, env))
-            });
+            state.env =
+                signature.zip(readiness.and_then(super::bg_readiness::EnvSnapshot::capture));
         }
         for (id, outcome) in state.background.drain() {
-            if let super::bg_readiness::Outcome::Known(result) = outcome
-                && let Some(game) = self.library.game(id)
-            {
-                state.readiness.record_background(game, result);
+            if let Some(game) = self.library.game(id) {
+                super::bg_readiness::record_outcome(&mut state.readiness, game, outcome);
             }
         }
         // The games drawn last frame, in order and without repeats.
