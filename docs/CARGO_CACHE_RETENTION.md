@@ -644,7 +644,12 @@ dropped) with a scrubbed environment and no lazy fetch. Holds: `SOURCE_MISSING`,
 build HEAD, such as the 2026-10-15 adopted scratch/source directories) cannot use the route and stay hard `SOURCE_MISSING`.
 Limits: the registry and the recorded repository are owner-writable, so a deliberately forged record plus a hand-made
 `origin/main` ref in the recorded repository is the same trust base as every other registry gate; a checkout moved by hand and
-pruned leaves no registration, which only the process census can then catch.
+pruned leaves no registration, no gitdir and no path, so the route CANNOT distinguish it from a retired checkout and will
+treat the cache as an orphan (not detected, by design of the evidence available). What stays protected: only regenerable
+compiler artifacts are removed (never source, the checkout, history, locks, databases or the repository), the HEAD must
+already be contained in the recorded repository's `origin/main`, and the pin, lock, process-census, idle-time and
+approved-manifest gates still apply, so a build that is running or recent is held. The cost of this undetected case is a
+rebuild, plus any uncommitted work in the moved checkout is untouched because the route never reads or writes it.
 
 Absence is decided by `lstat` only: ENOENT or ENOTDIR mean absent; any other error (EACCES, EIO, ENOTCONN, ESTALE, ELOOP,
 timeouts) is `ORPHAN_SOURCE_UNKNOWN` and never permits retirement, for the worktree path, the administrative gitdir and each
