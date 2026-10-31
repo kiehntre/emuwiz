@@ -339,11 +339,33 @@ fn publish_summary(
     }
 }
 
+/// A journal recording no entry and no created directory.
+fn no_change_record() -> archivefs_core::dat::rename_apply::RenameTransaction {
+    use archivefs_core::dat::rename_apply::{RenameTransaction, TransactionState};
+    RenameTransaction {
+        transaction_id: "t".into(),
+        plan_generation: 1,
+        classifier_version: None,
+        created_at_unix: 0,
+        source_scan_root: String::new(),
+        state: TransactionState::ApplyFailed,
+        entries: Vec::new(),
+        created_directories: Vec::new(),
+        recovery_resolution: None,
+        recovery_resolved_at_unix: None,
+        unknown: Default::default(),
+    }
+}
+
 #[test]
 fn publisher_reports_applied_only_for_a_fully_resolved_batch() {
+    let transaction = no_change_record();
     let done = publish_summary(3, 0, 0, 0);
-    assert_eq!(execution_stage_for(&done), PublisherExecutionStage::Applied);
-    assert!(incomplete_publish_message(&done).is_none());
+    assert_eq!(
+        execution_stage_for(&done, &transaction),
+        PublisherExecutionStage::Applied
+    );
+    assert!(incomplete_publish_message(&done, &transaction).is_none());
 
     for incomplete in [
         publish_summary(0, 0, 1, 2),
@@ -351,15 +373,159 @@ fn publisher_reports_applied_only_for_a_fully_resolved_batch() {
         publish_summary(1, 0, 0, 3),
     ] {
         assert_eq!(
-            execution_stage_for(&incomplete),
+            execution_stage_for(&incomplete, &transaction),
             PublisherExecutionStage::NeedsReconciliation
         );
-        let message = incomplete_publish_message(&incomplete).expect("explained");
+        let message = incomplete_publish_message(&incomplete, &transaction).expect("explained");
         assert!(message.contains("NOT complete"), "{message}");
     }
-    let message = incomplete_publish_message(&publish_summary(0, 0, 1, 0)).unwrap();
+    let message = incomplete_publish_message(&publish_summary(0, 0, 1, 0), &transaction).unwrap();
     assert!(message.contains("/out/A0.bin"), "{message}");
     assert!(message.contains("do not replay"), "{message}");
+}
+
+/// A real reviewed transaction, reshaped into what the executor recorded.
+fn recorded_outcome(
+    entry_state: archivefs_core::dat::rename_apply::EntryState,
+    transaction_state: archivefs_core::dat::rename_apply::TransactionState,
+    created_directories: Vec<PathBuf>,
+    summary: archivefs_core::dat::rename_apply::TransactionSummary,
+) -> (PublisherProfilePageState, tempfile::TempDir) {
+    let temp = tempfile::tempdir().unwrap();
+    let source = temp.path().join("Game.rom");
+    let destination = temp.path().join("published");
+    std::fs::write(&source, b"outcome source").unwrap();
+    std::fs::create_dir(&destination).unwrap();
+    let mut state = executable_state(&source, &destination);
+    state.link_mode = Some(archivefs_core::publisher_profile::PublisherLinkMode::Symlink);
+    state.execution_review();
+    let mut transaction = state.execution_transaction.take().expect("reviewed");
+    for entry in &mut transaction.transaction.entries {
+        entry.state = entry_state;
+    }
+    transaction.transaction.state = transaction_state;
+    transaction.transaction.created_directories = created_directories;
+    let outcome = archivefs_core::dat::rename_apply::ApplyOutcome {
+        transaction: transaction.transaction.clone(),
+        summary,
+    };
+    state.record_success(transaction, outcome);
+    (state, temp)
+}
+
+fn skipped_summary(
+    applied: usize,
+    skipped: usize,
+) -> archivefs_core::dat::rename_apply::TransactionSummary {
+    archivefs_core::dat::rename_apply::TransactionSummary {
+        requested: applied + skipped,
+        applied,
+        skipped,
+        ..Default::default()
+    }
+}
+
+#[test]
+fn all_skipped_run_is_never_published_or_offered_rollback() {
+    use archivefs_core::dat::rename_apply::{EntryState, TransactionState};
+    let (mut state, _temp) = recorded_outcome(
+        EntryState::Skipped,
+        TransactionState::ApplyFailed,
+        Vec::new(),
+        skipped_summary(0, 2),
+    );
+    assert_eq!(
+        state.execution_stage,
+        PublisherExecutionStage::NothingPublished
+    );
+    assert!(state.execution_error.is_none());
+    state.rollback_confirmation_text = "ROLL BACK 0 ITEMS".into();
+    assert!(!state.can_rollback(), "nothing was recorded to reverse");
+    let labels = page_labels(&mut state);
+    assert!(labels.contains("Nothing published"), "{labels}");
+    assert!(labels.contains("2 item(s) were skipped"), "{labels}");
+    for false_claim in ["Published 0", "Ready to publish", "Roll back publisher"] {
+        assert!(!labels.contains(false_claim), "{false_claim}: {labels}");
+    }
+}
+
+#[test]
+fn partly_skipped_run_says_so_and_keeps_rollback_for_what_was_applied() {
+    use archivefs_core::dat::rename_apply::{EntryState, TransactionState};
+    let (mut state, _temp) = recorded_outcome(
+        EntryState::Applied,
+        TransactionState::Applied,
+        Vec::new(),
+        skipped_summary(3, 2),
+    );
+    assert_eq!(state.execution_stage, PublisherExecutionStage::Applied);
+    assert_eq!(
+        state.rollback_confirmation_phrase().as_deref(),
+        Some("ROLL BACK 3 ITEMS")
+    );
+    state.rollback_confirmation_text = "ROLL BACK 3 ITEMS".into();
+    assert!(state.can_rollback());
+    let labels = page_labels(&mut state);
+    assert!(labels.contains("Export partly published"), "{labels}");
+    assert!(
+        labels.contains("3 published, 2 skipped and left untouched"),
+        "{labels}"
+    );
+    assert!(!labels.contains("Published 3 item(s)"), "{labels}");
+}
+
+#[test]
+fn failed_apply_is_a_plain_failure_only_when_the_record_shows_no_change() {
+    use archivefs_core::dat::rename_apply::{EntryState, TransactionEntry};
+    let temp = tempfile::tempdir().unwrap();
+    let source = temp.path().join("Game.rom");
+    let destination = temp.path().join("published");
+    std::fs::write(&source, b"outcome source").unwrap();
+    std::fs::create_dir(&destination).unwrap();
+    let mut state = executable_state(&source, &destination);
+    state.link_mode = Some(archivefs_core::publisher_profile::PublisherLinkMode::Symlink);
+    state.execution_review();
+    let mut record = state.execution_transaction.expect("reviewed").transaction;
+    assert_eq!(
+        stage_after_apply_error(&record),
+        PublisherExecutionStage::Failed
+    );
+    let set_entries = |record: &mut archivefs_core::dat::rename_apply::RenameTransaction,
+                       value: EntryState| {
+        record
+            .entries
+            .iter_mut()
+            .for_each(|entry: &mut TransactionEntry| entry.state = value);
+    };
+    // In flight with nothing yet Applied: the old check called this a failure.
+    set_entries(&mut record, EntryState::Applying);
+    assert_eq!(
+        stage_after_apply_error(&record),
+        PublisherExecutionStage::NeedsReconciliation
+    );
+    set_entries(&mut record, EntryState::Skipped);
+    record.created_directories = vec![PathBuf::from("/out/created")];
+    assert_eq!(
+        stage_after_apply_error(&record),
+        PublisherExecutionStage::NeedsReconciliation
+    );
+}
+
+#[test]
+fn all_skipped_run_that_created_directories_is_not_called_unchanged() {
+    use archivefs_core::dat::rename_apply::{EntryState, TransactionState};
+    let (state, _temp) = recorded_outcome(
+        EntryState::Skipped,
+        TransactionState::ApplyFailed,
+        vec![PathBuf::from("/out/created")],
+        skipped_summary(0, 2),
+    );
+    assert_eq!(
+        state.execution_stage,
+        PublisherExecutionStage::NeedsReconciliation
+    );
+    let message = state.execution_error.as_deref().expect("explained");
+    assert!(message.contains("1 destination"), "{message}");
 }
 
 #[test]
@@ -499,6 +665,27 @@ fn rendered_labels(output: &egui::FullOutput) -> Vec<(String, egui::Rect)> {
         gather(&shape.shape, &mut out);
     }
     out
+}
+
+fn page_labels(state: &mut PublisherProfilePageState) -> String {
+    let context = egui::Context::default();
+    let screen = egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(1024.0, 2400.0));
+    let output = context.run(
+        egui::RawInput {
+            screen_rect: Some(screen),
+            ..Default::default()
+        },
+        |context| {
+            egui::CentralPanel::default().show(context, |ui| {
+                show_publisher_profile_page(ui, state);
+            });
+        },
+    );
+    rendered_labels(&output)
+        .into_iter()
+        .map(|x| x.0)
+        .collect::<Vec<_>>()
+        .join("\n")
 }
 
 #[test]

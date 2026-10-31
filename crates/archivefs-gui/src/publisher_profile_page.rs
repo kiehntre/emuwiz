@@ -115,6 +115,8 @@ pub(crate) enum PublisherExecutionStage {
     Confirming,
     Applying,
     Applied,
+    /// The run finished but recorded no change: every item was skipped.
+    NothingPublished,
     Failed,
     RolledBack,
     NeedsReconciliation,
@@ -198,6 +200,7 @@ impl PublisherProfilePageState {
         let has_outcome = matches!(
             self.execution_stage,
             PublisherExecutionStage::Applied
+                | PublisherExecutionStage::NothingPublished
                 | PublisherExecutionStage::Failed
                 | PublisherExecutionStage::NeedsReconciliation
                 | PublisherExecutionStage::RolledBack
@@ -442,16 +445,13 @@ impl PublisherProfilePageState {
                 let state = transaction.transaction.state;
                 self.execution_transaction = Some(transaction);
                 self.execution_error = Some(format_apply_error(&error, state));
-                self.execution_stage = if matches!(state, TransactionState::ApplyFailed)
-                    && self
+                self.execution_stage = stage_after_apply_error(
+                    &self
                         .execution_transaction
                         .as_ref()
-                        .is_some_and(|transaction| transaction.transaction.applied_count() > 0)
-                {
-                    PublisherExecutionStage::NeedsReconciliation
-                } else {
-                    PublisherExecutionStage::Failed
-                };
+                        .expect("just set")
+                        .transaction,
+                );
             }
         }
     }
@@ -464,12 +464,12 @@ impl PublisherProfilePageState {
             directories_created: transaction.transaction.created_directories.len(),
             operations_created: outcome.summary.applied,
         });
-        self.execution_transaction = Some(transaction);
         // `Ok(outcome)` only means the executor returned; a batch with in-flight,
         // failed or not-attempted entries is NOT a published library.
         let summary = &self.execution_result.as_ref().expect("just set").summary;
-        self.execution_stage = execution_stage_for(summary);
-        self.execution_error = incomplete_publish_message(summary);
+        self.execution_stage = execution_stage_for(summary, &transaction.transaction);
+        self.execution_error = incomplete_publish_message(summary, &transaction.transaction);
+        self.execution_transaction = Some(transaction);
     }
 
     pub(crate) fn rollback_confirmation_phrase(&self) -> Option<String> {
@@ -569,23 +569,95 @@ fn publisher_execution_error_text(
     }
 }
 
-/// Applied only for a fully resolved batch; anything else needs reconciliation.
+/// Whether the journalled record shows the destination may have changed: an
+/// entry is applied or in flight, or the run created a directory.
+fn destination_may_have_changed(
+    transaction: &archivefs_core::dat::rename_apply::RenameTransaction,
+) -> bool {
+    !transaction.created_directories.is_empty()
+        || transaction
+            .entries
+            .iter()
+            .any(archivefs_core::dat::rename_apply::TransactionEntry::blocks_full_rollback)
+}
+
+/// Applied only for a fully resolved batch that applied something. A resolved
+/// batch that applied nothing changed nothing, unless the journal says it did.
 pub(crate) fn execution_stage_for(
     summary: &archivefs_core::dat::rename_apply::TransactionSummary,
+    transaction: &archivefs_core::dat::rename_apply::RenameTransaction,
 ) -> PublisherExecutionStage {
-    if summary.fully_resolved() {
-        PublisherExecutionStage::Applied
-    } else {
+    if !summary.fully_resolved()
+        || (summary.applied == 0 && destination_may_have_changed(transaction))
+    {
         PublisherExecutionStage::NeedsReconciliation
+    } else if summary.applied == 0 {
+        PublisherExecutionStage::NothingPublished
+    } else {
+        PublisherExecutionStage::Applied
+    }
+}
+
+/// A refused or failed Apply is only a plain failure when the journal records
+/// no possible destination change.
+fn stage_after_apply_error(
+    transaction: &archivefs_core::dat::rename_apply::RenameTransaction,
+) -> PublisherExecutionStage {
+    if destination_may_have_changed(transaction) {
+        PublisherExecutionStage::NeedsReconciliation
+    } else {
+        PublisherExecutionStage::Failed
+    }
+}
+
+/// What this run did, for a batch that published at least one item.
+fn published_outcome_line(
+    summary: &archivefs_core::dat::rename_apply::TransactionSummary,
+) -> String {
+    if summary.skipped == 0 {
+        format!("Published {} item(s).", summary.applied)
+    } else {
+        format!(
+            "Partly published: {} published, {} skipped and left untouched.",
+            summary.applied, summary.skipped
+        )
+    }
+}
+
+/// The result card's heading: "Ready" only while nothing has been attempted.
+fn execution_card_title(
+    stage: PublisherExecutionStage,
+    summary: Option<&archivefs_core::dat::rename_apply::TransactionSummary>,
+) -> &'static str {
+    match stage {
+        PublisherExecutionStage::Preview
+        | PublisherExecutionStage::Review
+        | PublisherExecutionStage::Confirming => "Ready to publish",
+        PublisherExecutionStage::Applying => "Publishing",
+        PublisherExecutionStage::Applied if summary.is_some_and(|s| s.skipped > 0) => {
+            "Export partly published"
+        }
+        PublisherExecutionStage::Applied => "Export published",
+        PublisherExecutionStage::NothingPublished => "Nothing published",
+        PublisherExecutionStage::Failed => "Publishing failed",
+        PublisherExecutionStage::RolledBack => "Export rolled back",
+        PublisherExecutionStage::NeedsReconciliation => "Publishing needs reconciliation",
     }
 }
 
 /// The actionable explanation for an incomplete batch (None when complete).
 pub(crate) fn incomplete_publish_message(
     summary: &archivefs_core::dat::rename_apply::TransactionSummary,
+    transaction: &archivefs_core::dat::rename_apply::RenameTransaction,
 ) -> Option<String> {
     if summary.fully_resolved() {
-        return None;
+        return (summary.applied == 0 && destination_may_have_changed(transaction)).then(|| {
+            format!(
+                "Publishing is NOT complete: no item was published, but the record shows {} destination director(ies) created. Review transaction {}.",
+                transaction.created_directories.len(),
+                transaction.transaction_id
+            )
+        });
     }
     let mut message = format!(
         "Publishing is NOT complete: {} applied, {} failed, {} unresolved (in flight), {} not attempted.",
@@ -879,7 +951,14 @@ pub(crate) fn show_publisher_profile_page(
     if let Some(transaction) = state.execution_transaction.clone() {
         ui.add_space(10.0);
         widgets::card(ui, |ui| {
-            ui.label(egui::RichText::new("Ready to publish").strong());
+            let title = execution_card_title(
+                state.execution_stage,
+                state
+                    .execution_result
+                    .as_ref()
+                    .map(|result| &result.summary),
+            );
+            ui.label(egui::RichText::new(title).strong());
             if state.execution_stage == PublisherExecutionStage::Confirming {
                 ui.label("Preview reviewed. Nothing has been changed yet.");
             }
@@ -930,13 +1009,13 @@ pub(crate) fn show_publisher_profile_page(
                 }
                 PublisherExecutionStage::Applied => {
                     if let Some(outcome) = &state.execution_result {
-                        ui.label(format!("Published {} item(s).", outcome.summary.applied));
+                        ui.label(published_outcome_line(&outcome.summary));
                         ui.label(format!(
                             "Already present/no-op: {}.",
                             summary.already_present
                         ));
                         ui.label(format!(
-                            "Skipped/non-executable: {}.",
+                            "Not part of this export (review, blocked or unsupported): {}.",
                             summary.review_required + summary.blocked + summary.unsupported
                         ));
                         ui.label(format!(
@@ -981,6 +1060,15 @@ pub(crate) fn show_publisher_profile_page(
                             }
                         }
                     }
+                }
+                PublisherExecutionStage::NothingPublished => {
+                    let skipped = state
+                        .execution_result
+                        .as_ref()
+                        .map_or(0, |result| result.summary.skipped);
+                    ui.label(format!(
+                        "Nothing was published: {skipped} item(s) were skipped and none were applied. There is nothing to roll back."
+                    ));
                 }
                 PublisherExecutionStage::Applying => {
                     ui.label("Applying transaction…");
