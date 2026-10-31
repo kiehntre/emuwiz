@@ -3031,8 +3031,10 @@ fn receipt_view_shows_the_journal_based_outcome_badge() {
     use crate::transaction_outcome::test_support::{journal, rendered_text};
     use archivefs_core::dat::rename_apply::model::EntryState;
     let render = |transaction| {
-        let mut state = PlayingLibraryPageState::default();
-        state.applied = Some(transaction);
+        let mut state = PlayingLibraryPageState {
+            applied: Some(transaction),
+            ..PlayingLibraryPageState::default()
+        };
         let ctx = egui::Context::default();
         let output = ctx.run(Default::default(), |ctx| {
             egui::CentralPanel::default().show(ctx, |ui| {

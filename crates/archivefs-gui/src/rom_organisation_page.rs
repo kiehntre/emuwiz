@@ -2656,10 +2656,12 @@ mod tests {
         use crate::transaction_outcome::test_support::{journal, rendered_text};
         use archivefs_core::dat::rename_apply::model::{EntryState, TransactionState};
         let render = |transaction| {
-            let mut state = RomOrganisationPageState::default();
-            state.applied = Some(transaction);
-            state.result_message = Some("result".into());
-            state.result_complete = true;
+            let mut state = RomOrganisationPageState {
+                applied: Some(transaction),
+                result_message: Some("result".into()),
+                result_complete: true,
+                ..RomOrganisationPageState::default()
+            };
             let ctx = egui::Context::default();
             let output = ctx.run(Default::default(), |ctx| {
                 egui::CentralPanel::default().show(ctx, |ui| {
