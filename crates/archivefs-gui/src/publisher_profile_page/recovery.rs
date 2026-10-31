@@ -16,6 +16,9 @@ use super::{
     destination_left_after_rollback, egui, widgets,
 };
 
+/// Shown above the typed confirmation for abandoning links.
+pub(crate) const ABANDON_WARNING: &str = "WARNING: Abandoning these links is irreversible. The transaction will remain marked as failed, and any remaining links must be removed manually. No files will be deleted automatically.";
+
 #[derive(Debug, Default)]
 pub(crate) struct PublisherRecoveryState {
     loaded: bool,
@@ -342,6 +345,7 @@ pub(super) fn show_recoverable_exports(ui: &mut egui::Ui, state: &mut PublisherP
             }
         }
         if let Some(phrase) = state.abandon_phrase() {
+            ui.colored_label(ui.visuals().warn_fg_color, ABANDON_WARNING);
             ui.label(format!(
                 "Abandoning records that these links will not be undone. Nothing is deleted or moved, the export is not marked rolled back, and the links must be removed by hand. Type {phrase} to confirm."
             ));

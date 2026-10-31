@@ -1223,3 +1223,11 @@ fn abandoning_an_in_flight_hard_link_names_its_quarantine() {
         dir
     );
 }
+
+#[test]
+fn the_abandon_dialog_warns_that_it_is_irreversible() {
+    assert_eq!(
+        super::recovery::ABANDON_WARNING,
+        "WARNING: Abandoning these links is irreversible. The transaction will remain marked as failed, and any remaining links must be removed manually. No files will be deleted automatically."
+    );
+}
