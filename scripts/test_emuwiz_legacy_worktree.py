@@ -1,6 +1,8 @@
 #!/usr/bin/env python3
 """Legacy checkout reconciliation: private synthetic Git/registry fixtures only."""
+import contextlib
 import fcntl
+import io
 import json
 import os
 from pathlib import Path
@@ -405,7 +407,135 @@ class HistoryGates(LegacyCheckout):
     def test_detached_head_kept_only_by_this_checkout_holds(self):
         self.run_git('checkout', '-q', '--detach')
         self.run_git('commit', '--allow-empty', '-qm', 'detached')
+        os.unlink(os.path.join(self.git_dir, 'logs', 'HEAD'))
         self.assert_gate_holds('GIT_HISTORY_NOT_PRESERVED')
+
+    def test_symlinked_reflog_or_orig_head_fails_closed(self):
+        for name in ('logs/HEAD', 'ORIG_HEAD'):
+            with self.subTest(name=name):
+                path = os.path.join(self.git_dir, name)
+                saved = path + '.saved'
+                if os.path.lexists(path):
+                    os.rename(path, saved)
+                    self.addCleanup(os.replace, saved, path)
+                os.symlink('/nonexistent', path)
+                self.assert_gate_holds('GIT_STATE_UNVERIFIED')
+                os.unlink(path)
+
+    def never_built(self, name):
+        """A real checkout with no target and no record: the lifecycle gate is CLEAR."""
+        wt = os.path.join(os.path.dirname(self.wt), name)
+        self.run_git('worktree', 'add', '-q', '--detach', wt, self.base)
+        self.assertEqual(self.m.lifecycle_gate(wt)['status'], 'CLEAR')
+        return wt
+
+    def cli(self, *argv):
+        out, err = io.StringIO(), io.StringIO()
+        with contextlib.redirect_stdout(out), contextlib.redirect_stderr(err):
+            try:
+                rc = self.m.main(list(argv))
+            except SystemExit as exit_:
+                rc = exit_.code
+        return rc, out.getvalue() + err.getvalue()
+
+    def test_cli_exit_code_holds_unpatched(self):
+        wt = self.never_built('cli-hold')
+        self.assertEqual(self.cli('worktree-check', wt)[0], 0)
+        Path(wt, 'unsaved').write_text('work')
+        rc, text = self.cli('worktree-check', wt)
+        self.assertEqual(rc, self.m.EXIT_WORKTREE_HOLD, text)
+        self.assertIn('HOLD', text)
+
+    def test_cargo_state_only_is_not_blocked_by_git_state(self):
+        wt = self.never_built('cargo-only')
+        Path(wt, 'unsaved').write_text('work')
+        self.assertEqual(self.cli('worktree-check', '--cargo-state-only', wt)[0], 0)
+
+    def test_cargo_iso_gives_a_dirty_new_worktree_low_debug(self):
+        wt = self.never_built('cargo-iso-new')
+        scripts = os.path.dirname(os.path.abspath(self.m.__file__))
+        Path(wt, 'unsaved').write_text('work')
+        out = subprocess.run([os.path.join(scripts, 'cargo-iso'), '--print-target'], cwd=wt,
+                             capture_output=True, text=True)
+        self.assertRegex(out.stdout + out.stderr, r'debug: +low \(no compiler output to keep')
+
+    def test_task_complete_on_never_built_dirty_worktree_succeeds_and_reports_hold(self):
+        wt = self.never_built('finish-dirty')
+        Path(wt, 'unsaved').write_text('work')
+        rc, text = self.cli('task-complete', '--worktree', wt, '--task', 'fixture')
+        self.assertEqual(rc, 0, text)
+        self.assertIn('worktree: HOLD', text)
+        self.assertIn('KEEP this worktree', text)
+
+    def test_text_output_reports_history_behind_a_cargo_hold(self):
+        self.reflog_only_commit()
+        text = self.cli('worktree-check', self.wt)[1]
+        self.assertIn('ARTIFACTS_MISSING', self.m.worktree_gate(self.wt)['code'])
+        self.assertIn('history: GIT_HISTORY_NOT_PRESERVED', text)
+
+    def test_hidden_index_edits_hold_the_lifecycle_gate(self):
+        source = Path(self.wt, 'source.rs')
+        source.write_text('committed')
+        self.run_git('add', 'source.rs')
+        self.run_git('commit', '-qm', 'source')
+        self.run_git('update-ref', 'refs/remotes/origin/main', 'HEAD')
+        for flag, undo in [('--assume-unchanged', '--no-assume-unchanged'),
+                           ('--skip-worktree', '--no-skip-worktree')]:
+            with self.subTest(flag=flag):
+                self.run_git('update-index', flag, 'source.rs')
+                source.write_text('UNSAVED')
+                self.assert_gate_holds('CHECKOUT_INDEX_UNVERIFIED')
+                self.run_git('update-index', undo, 'source.rs')
+                source.write_text('committed')
+
+    @unittest.skipIf(os.geteuid() == 0, 'root ignores directory modes')
+    def test_unreadable_checkout_fails_closed(self):
+        os.chmod(self.wt, 0)
+        self.addCleanup(os.chmod, self.wt, 0o755)
+        self.assert_gate_holds('GIT_STATE_UNVERIFIED')
+
+    def test_recorded_checkout_that_lost_its_git_entry_holds(self):
+        self.reflog_only_commit()
+        os.unlink(os.path.join(self.wt, '.git'))
+        self.assert_gate_holds('GIT_STATE_UNVERIFIED')
+
+    def test_plain_directory_and_vanished_path_are_not_checkouts(self):
+        plain = os.path.join(self.root_for_bundle(), 'plain')
+        os.mkdir(plain)
+        self.assertIsNone(self.m.history_preservation_problem(plain))
+        self.assertIsNone(self.m.history_preservation_problem(plain + '-gone'))
+
+    def test_empty_git_directory_or_subdirectory_cannot_borrow_the_parent_repo(self):
+        nested = os.path.join(self.wt, 'nested')
+        os.mkdir(nested)
+        self.assertEqual(self.m.history_preservation_problem(nested)[0], 'CHECKOUT_PATH_UNVERIFIED')
+        os.mkdir(os.path.join(nested, '.git'))
+        self.assertEqual(self.m.history_preservation_problem(nested)[0], 'CHECKOUT_PATH_UNVERIFIED')
+
+    def test_unfinished_operations_hold_the_lifecycle_gate(self):
+        for name in self.m.UNFINISHED_GIT_STATE:
+            with self.subTest(name=name):
+                marker = Path(self.git_dir, name)
+                marker.touch()
+                self.assert_gate_holds('GIT_WORKTREE_PROTECTED')
+                marker.unlink()
+
+    def test_git_file_pointing_at_another_checkout_holds(self):
+        other = self.never_built('other-checkout')
+        other_git = Path(other, '.git').read_text()
+        Path(self.wt, '.git').write_text(other_git)
+        self.assert_gate_holds('CHECKOUT_PATH_UNVERIFIED')
+
+    def test_gate_does_not_write_the_index(self):
+        source = Path(self.wt, 'tracked.txt')
+        source.write_text('x')
+        self.run_git('add', 'tracked.txt')
+        self.run_git('commit', '-qm', 'tracked')
+        index = os.path.join(self.git_dir, 'index')
+        os.utime(source)  # stale stat data: an optional refresh would rewrite the index
+        before = os.stat(index).st_mtime_ns
+        self.m.history_preservation_problem(self.wt)
+        self.assertEqual(os.stat(index).st_mtime_ns, before)
 
     def test_commit_retained_under_refs_preservation_clears(self):
         orphan = self.reflog_only_commit()
