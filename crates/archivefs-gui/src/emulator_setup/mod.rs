@@ -27,6 +27,7 @@ pub(crate) mod flycast_gdi;
 pub(crate) mod hatari;
 pub(crate) mod mesen;
 pub(crate) mod profile_resolution;
+mod readiness_input;
 #[cfg(target_os = "linux")]
 pub(crate) mod shadps4;
 mod state;
