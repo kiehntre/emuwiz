@@ -1221,16 +1221,18 @@ mod hook {
         UNDO_MOVE_HOOK.with(|slot| *slot.borrow_mut() = hook);
     }
 
+    type QuarantineHook = Box<dyn FnMut() -> io::Result<()>>;
+    type UnlinkHook = Box<dyn FnMut(&Path) -> io::Result<()>>;
     thread_local! {
-        static QUARANTINE_HOOK: std::cell::RefCell<Option<Box<dyn FnMut() -> io::Result<()>>>> =
+        static QUARANTINE_HOOK: std::cell::RefCell<Option<QuarantineHook>> =
             const { std::cell::RefCell::new(None) };
-        static UNLINK_HOOK: std::cell::RefCell<Option<Box<dyn FnMut(&Path) -> io::Result<()>>>> =
+        static UNLINK_HOOK: std::cell::RefCell<Option<UnlinkHook>> =
             const { std::cell::RefCell::new(None) };
     }
-    pub(crate) fn set_quarantine_hook(hook: Option<Box<dyn FnMut() -> io::Result<()>>>) {
+    pub(crate) fn set_quarantine_hook(hook: Option<QuarantineHook>) {
         QUARANTINE_HOOK.with(|slot| *slot.borrow_mut() = hook);
     }
-    pub(crate) fn set_unlink_hook(hook: Option<Box<dyn FnMut(&Path) -> io::Result<()>>>) {
+    pub(crate) fn set_unlink_hook(hook: Option<UnlinkHook>) {
         UNLINK_HOOK.with(|slot| *slot.borrow_mut() = hook);
     }
     thread_local! {
