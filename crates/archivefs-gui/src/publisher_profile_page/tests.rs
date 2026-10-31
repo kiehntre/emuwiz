@@ -499,6 +499,96 @@ fn failed_unresolved_or_pending_only_batches_need_reconciliation() {
 }
 
 #[test]
+fn every_journal_state_maps_to_an_outcome_the_record_supports() {
+    use archivefs_core::dat::rename_apply::{
+        EntryState as E, TransactionState as T, TransactionSummary,
+    };
+    let entry_states = [
+        E::Planned,
+        E::PreflightPassed,
+        E::Applying,
+        E::Applied,
+        E::ApplyFailed,
+        E::RollingBack,
+        E::RolledBack,
+        E::RollbackFailed,
+        E::Skipped,
+    ];
+    let transaction_states = [
+        T::Planned,
+        T::Applying,
+        T::Applied,
+        T::ApplyFailed,
+        T::RollingBack,
+        T::RolledBack,
+        T::RollbackFailed,
+        T::Finalising,
+        T::Finalised,
+    ];
+    let temp = tempfile::tempdir().unwrap();
+    let source = temp.path().join("Game.rom");
+    let destination = temp.path().join("published");
+    std::fs::write(&source, b"outcome source").unwrap();
+    std::fs::create_dir(&destination).unwrap();
+    let mut reviewed = executable_state(&source, &destination);
+    reviewed.link_mode = Some(archivefs_core::publisher_profile::PublisherLinkMode::Symlink);
+    reviewed.execution_review();
+    let mut base = reviewed.execution_transaction.take().expect("reviewed");
+    let extra = base.transaction.entries[0].clone();
+    base.transaction.entries.push(extra);
+
+    for first in entry_states {
+        for second in entry_states {
+            for transaction_state in transaction_states {
+                for created in [Vec::new(), vec![PathBuf::from("/out/created")]] {
+                    let mut transaction = base.clone();
+                    transaction.transaction.entries[0].state = first;
+                    transaction.transaction.entries[1].state = second;
+                    transaction.transaction.state = transaction_state;
+                    transaction.transaction.created_directories = created;
+                    let record = transaction.transaction.clone();
+                    let summary = TransactionSummary::from_transaction(&record);
+                    let outcome = archivefs_core::dat::rename_apply::ApplyOutcome {
+                        transaction: record.clone(),
+                        summary: summary.clone(),
+                    };
+                    let mut state = PublisherProfilePageState {
+                        link_mode: reviewed.link_mode,
+                        ..Default::default()
+                    };
+                    state.record_success(transaction, outcome);
+                    let case = format!("{first:?}/{second:?}/{transaction_state:?}");
+                    match state.execution_stage {
+                        PublisherExecutionStage::Applied => {
+                            assert!(summary.fully_resolved() && summary.applied > 0, "{case}");
+                            assert!(record.is_rollbackable(), "{case}");
+                        }
+                        PublisherExecutionStage::RolledBack => {
+                            assert!(record.is_fully_rolled_back(), "{case}");
+                        }
+                        PublisherExecutionStage::NothingPublished => {
+                            assert!(!destination_may_have_changed(&record), "{case}");
+                            assert_eq!(summary.rolled_back, 0, "{case}");
+                        }
+                        PublisherExecutionStage::NeedsReconciliation => {
+                            assert!(state.execution_error.is_some(), "{case}");
+                        }
+                        other => panic!("{case}: unexpected stage {other:?}"),
+                    }
+                    state.rollback_confirmation_text =
+                        state.rollback_confirmation_phrase().unwrap();
+                    assert_eq!(
+                        state.can_rollback(),
+                        state.execution_stage == PublisherExecutionStage::Applied,
+                        "{case}"
+                    );
+                }
+            }
+        }
+    }
+}
+
+#[test]
 fn partly_skipped_run_says_so_and_keeps_rollback_for_what_was_applied() {
     use archivefs_core::dat::rename_apply::{EntryState, TransactionState};
     let (mut state, _temp) = recorded_outcome(

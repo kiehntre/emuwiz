@@ -581,16 +581,19 @@ fn destination_may_have_changed(
             .any(archivefs_core::dat::rename_apply::TransactionEntry::blocks_full_rollback)
 }
 
-/// Applied only for a fully resolved batch that applied something. A resolved
-/// batch that applied nothing changed nothing, unless the journal says it did.
+/// Applied only for a fully resolved batch that applied something and can
+/// still be rolled back. A resolved batch that applied nothing changed
+/// nothing, unless the journal says it did.
 pub(crate) fn execution_stage_for(
     summary: &archivefs_core::dat::rename_apply::TransactionSummary,
     transaction: &archivefs_core::dat::rename_apply::RenameTransaction,
 ) -> PublisherExecutionStage {
     if !summary.fully_resolved() {
         PublisherExecutionStage::NeedsReconciliation
-    } else if summary.applied > 0 {
+    } else if summary.applied > 0 && transaction.is_rollbackable() {
         PublisherExecutionStage::Applied
+    } else if summary.applied > 0 {
+        PublisherExecutionStage::NeedsReconciliation
     } else if summary.rolled_back > 0 && transaction.is_fully_rolled_back() {
         PublisherExecutionStage::RolledBack
     } else if summary.rolled_back > 0 || destination_may_have_changed(transaction) {
@@ -653,12 +656,12 @@ pub(crate) fn incomplete_publish_message(
     transaction: &archivefs_core::dat::rename_apply::RenameTransaction,
 ) -> Option<String> {
     if summary.fully_resolved() {
-        let unsettled = summary.applied == 0
-            && execution_stage_for(summary, transaction)
-                == PublisherExecutionStage::NeedsReconciliation;
+        let unsettled = execution_stage_for(summary, transaction)
+            == PublisherExecutionStage::NeedsReconciliation;
         return unsettled.then(|| {
             format!(
-                "Publishing is NOT complete: no item is recorded as published, but the destination may have changed ({} destination director(ies) created). Review transaction {}.",
+                "Publishing is NOT settled: the record shows {} applied and {} destination director(ies) created, and the destination may have changed. Review transaction {}.",
+                summary.applied,
                 transaction.created_directories.len(),
                 transaction.transaction_id
             )
@@ -1072,7 +1075,7 @@ pub(crate) fn show_publisher_profile_page(
                         .as_ref()
                         .map_or(0, |result| result.summary.skipped);
                     ui.label(format!(
-                        "Nothing was published: {skipped} item(s) were skipped and none were applied. There is nothing to roll back."
+                        "Nothing was published by this Apply: {skipped} item(s) were skipped and none were applied. It left nothing to roll back."
                     ));
                 }
                 PublisherExecutionStage::Applying => {
