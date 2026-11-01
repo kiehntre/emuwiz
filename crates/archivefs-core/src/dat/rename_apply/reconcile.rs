@@ -603,6 +603,33 @@ pub(super) fn classify_entry(entry: &TransactionEntry, index: usize) -> Recovery
         };
     }
     if let TransactionOperation::CreateHardlink { .. } = &entry.operation {
+        // An interrupted Undo may have left its private quarantine behind. If
+        // it exists the removal is not complete whatever the export name shows,
+        // so the entry returns to Applied and the next Undo resumes it. If the
+        // folder cannot be proved to be the recorded one, absence of the
+        // quarantine proves nothing and the entry stays unresolved.
+        #[cfg(unix)]
+        if entry.state == EntryState::RollingBack {
+            match super::dirsync::hardlink_quarantine_state(entry) {
+                super::dirsync::QuarantineState::Present => {
+                    return RecoveryIssue {
+                        entry_index: index,
+                        kind: RecoveryIssueKind::RenameConfirmed,
+                        detail: "an Undo quarantine for this hard link remains; the next Undo resumes it"
+                            .to_string(),
+                    };
+                }
+                super::dirsync::QuarantineState::Unknown => {
+                    return RecoveryIssue {
+                        entry_index: index,
+                        kind: RecoveryIssueKind::EvidenceUnavailable,
+                        detail: "the folder of this hard link's Undo quarantine cannot be reached or is not the recorded folder, so whether the link was removed is unproven; reconnect the original drive or folder, or abandon this link from the export list"
+                            .to_string(),
+                    };
+                }
+                super::dirsync::QuarantineState::Absent => {}
+            }
+        }
         return if source_matches && destination_matches {
             RecoveryIssue {
                 entry_index: index,
