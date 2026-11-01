@@ -10,6 +10,8 @@ pub(super) mod native_romm;
 #[cfg(all(test, target_os = "linux"))]
 #[path = "native_workflows/cemu_stop_tests.rs"]
 mod cemu_stop_tests;
+#[cfg(all(test, target_os = "linux"))]
+mod retroarch_stop_tests;
 
 #[path = "native_collection.rs"]
 mod native_collection;
@@ -555,6 +557,7 @@ impl NativeWorkflows {
             let launch_active = self.launch_active();
             if launch_active {
                 self.app.launch_standalone.show_cemu_lifecycle(ui);
+                self.app.launch_retroarch.show_stop_control(ui);
             }
             // A readable but invalid file produces unresolved evidence, not
             // a worker error. Let a repaired file use the same bounded retry.

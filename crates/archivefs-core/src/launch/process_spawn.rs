@@ -201,6 +201,24 @@ pub enum GracefulStopOutcome {
     Refused(GracefulStopRefusal),
 }
 
+/// One file on disk, by identity rather than by path.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ExecutableFile {
+    device: u64,
+    inode: u64,
+}
+
+impl ExecutableFile {
+    pub fn of(path: &Path) -> std::io::Result<Self> {
+        use std::os::unix::fs::MetadataExt;
+        let metadata = fs::metadata(path)?;
+        Ok(Self {
+            device: metadata.dev(),
+            inode: metadata.ino(),
+        })
+    }
+}
+
 /// What the kernel says the owned child is executing, compared to one file.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum OwnedExecutable {
@@ -245,26 +263,23 @@ impl WatchedProcess {
         self.exit_report.as_ref()
     }
 
-    /// Whether the owned child is executing `expected` right now. The process
+    /// Whether the owned child is executing `expected` right now, even if that
+    /// file has since been replaced or deleted at its path. The process
     /// comes from the pidfd, never from `pid`, and a child that has not exited
     /// by the final check cannot have had its number reused. Scripts run their
     /// interpreter and launchers exec something else, so neither matches.
-    pub fn owned_executable(&self, expected: &Path) -> OwnedExecutable {
+    pub fn owned_executable(&self, expected: ExecutableFile) -> OwnedExecutable {
         match &self.stop_identity {
             #[cfg(target_os = "linux")]
             OwnedChildIdentity::ProcessFd(fd) => {
                 use std::os::fd::AsRawFd;
-                use std::os::unix::fs::MetadataExt;
                 let fd = fd.as_raw_fd();
                 let observe = || -> std::io::Result<Option<bool>> {
                     if pidfd_has_exited(fd)? {
                         return Ok(None);
                     }
-                    let running = std::fs::metadata(format!("/proc/{}/exe", pidfd_pid(fd)?))?;
-                    let expected = std::fs::metadata(expected)?;
-                    Ok(Some(
-                        running.dev() == expected.dev() && running.ino() == expected.ino(),
-                    ))
+                    let exe = PathBuf::from(format!("/proc/{}/exe", pidfd_pid(fd)?));
+                    Ok(Some(ExecutableFile::of(&exe)? == expected))
                 };
                 let observed = observe();
                 match (pidfd_has_exited(fd), observed) {

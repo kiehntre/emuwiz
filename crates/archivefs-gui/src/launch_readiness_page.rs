@@ -61,6 +61,8 @@ mod retroarch_cheat_sets;
 mod retroarch_cheats;
 mod retroarch_setup;
 mod retroarch_stop;
+#[cfg(test)]
+pub(crate) use retroarch_stop::retroarch_test_request;
 mod rmg;
 mod sameboy;
 pub(crate) mod saturn_core;
@@ -2221,7 +2223,11 @@ impl RetroArchLaunchState {
                         .and_then(|p| p.exit.clone());
                     let success = exit.as_ref().is_some_and(|e| e.success);
                     let status_detail = match &exit {
-                        Some(exit) => format!("exit code {:?}", exit.code),
+                        Some(archivefs_core::launch::cheat_runtime::ExitSummary {
+                            code: Some(code),
+                            ..
+                        }) => format!("exit code {code}"),
+                        Some(_) => "ended by a signal".to_string(),
                         None => "status unknown".to_string(),
                     };
                     let stderr_tail = (!success)
@@ -3335,6 +3341,7 @@ pub(crate) fn show_launch_readiness_panel(
     standalone_launch_state.vice_trainers.reconcile(input);
     if ui.is_enabled() {
         standalone_launch_state.show_cemu_lifecycle(ui);
+        retroarch_launch_state.show_stop_control(ui);
     }
     widgets::section_header(
         ui,
@@ -5609,7 +5616,6 @@ fn show_launch_action(
     }
     let display = launch_state.display_for(&request);
     show_retroarch_launch_feedback(ui, &display);
-    launch_state.show_stop_control(ui);
     for line in launch_state.cheat_lines(&request) {
         ui.small(line);
     }
@@ -5683,6 +5689,14 @@ pub(crate) fn show_retroarch_launch_feedback(ui: &mut egui::Ui, display: &RetroA
                 widgets::banner(ui, "RetroArch stopped", summary.0, summary.1);
                 if !*success {
                     ui.small(format!("Exit status: {status_detail}"));
+                    if let Some(stderr_tail) = stderr_tail {
+                        widgets::technical_details(ui, "retroarch-stopped-stderr", |ui| {
+                            ui.add(
+                                egui::Label::new(egui::RichText::new(stderr_tail).monospace())
+                                    .wrap(),
+                            );
+                        });
+                    }
                 }
             } else if *success {
                 widgets::banner(

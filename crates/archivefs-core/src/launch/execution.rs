@@ -860,6 +860,8 @@ pub struct LaunchedRetroArchProcess {
     pub pid: u32,
     pub command_facts: LaunchCommandFacts,
     watched: WatchedProcess,
+    /// The launched file as it was when the launch started. `None` refuses Stop.
+    launched_file: Option<process_spawn::ExecutableFile>,
 }
 
 impl LaunchedRetroArchProcess {
@@ -875,14 +877,14 @@ impl LaunchedRetroArchProcess {
     }
 
     /// Whether a stop request would reach RetroArch itself. Only a native
-    /// profile whose owned child is executing the launched file qualifies:
+    /// profile whose owned child is executing the file it launched qualifies:
     /// an AppImage or other launcher may exit while the emulator keeps
     /// running, or take the emulator down before it writes saves.
     pub fn stop_target(&self) -> process_spawn::OwnedExecutable {
-        match self
-            .watched
-            .owned_executable(&self.command_facts.executable)
-        {
+        let Some(file) = self.launched_file else {
+            return process_spawn::OwnedExecutable::Unavailable;
+        };
+        match self.watched.owned_executable(file) {
             process_spawn::OwnedExecutable::Matches
                 if self.command_facts.profile.profile_kind != ProfileKind::Native =>
             {
@@ -1046,6 +1048,7 @@ pub(crate) fn spawn_retroarch_guarded(
             )));
         }
     }
+    let launched_file = process_spawn::ExecutableFile::of(&command.executable).ok();
     let watched = observation
         .spawn(&prepared)
         .map_err(LaunchSpawnError::Spawn)?;
@@ -1053,6 +1056,7 @@ pub(crate) fn spawn_retroarch_guarded(
         pid: watched.pid,
         command_facts: facts,
         watched,
+        launched_file,
     })
 }
 

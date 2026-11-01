@@ -95,19 +95,21 @@ fn stop_needs_confirmation_and_sends_one_request_to_the_tracked_launch() {
     let feedback = rendered(|ui| {
         show_retroarch_launch_feedback(ui, &state.display_for(&request()));
     });
-    assert!(feedback.contains("after your Stop request"), "{feedback}");
+    assert!(feedback.contains("asked it to stop"), "{feedback}");
     assert!(feedback.contains("may not have been saved"), "{feedback}");
     assert!(!feedback.contains("unexpectedly"), "{feedback}");
 }
 
 #[test]
 fn a_clean_exit_after_stop_is_reported_as_closed_normally() {
-    let mut state = tracking(spawn_test_process(
-        "/bin/sh",
-        &["-c", "trap 'exit 0' TERM; while :; do sleep 0.01; done"],
-    ));
-    // Let the shell install its trap before asking.
-    std::thread::sleep(Duration::from_millis(200));
+    let dir = tempfile::tempdir().unwrap();
+    let ready = dir.path().join("ready");
+    let script = format!(
+        "trap 'exit 0' TERM; : > '{}'; while :; do sleep 0.01; done",
+        ready.display()
+    );
+    let mut state = tracking(spawn_test_process("/bin/sh", &["-c", &script]));
+    wait_for_file(&ready);
     state.stop_for_test();
     wait_for_exit(&mut state);
     let display = state.display_for(&request());
@@ -117,7 +119,7 @@ fn a_clean_exit_after_stop_is_reported_as_closed_normally() {
     ));
     let feedback = rendered(|ui| show_retroarch_launch_feedback(ui, &display));
     assert!(
-        feedback.contains("closed normally after your Stop"),
+        feedback.contains("closed normally after you asked"),
         "{feedback}"
     );
 }
@@ -190,25 +192,26 @@ fn a_launch_that_already_exited_is_not_reported_as_stopped() {
         feedback.contains("RetroArch closed normally."),
         "{feedback}"
     );
-    assert!(!feedback.contains("Stop request"), "{feedback}");
+    assert!(!feedback.contains("asked it to stop"), "{feedback}");
 }
 
 #[test]
-fn a_process_ignoring_stop_stays_tracked_and_is_never_escalated() {
+fn a_process_ignoring_stop_gets_one_request_stays_tracked_and_is_never_escalated() {
     let dir = tempfile::tempdir().unwrap();
-    let release = dir.path().join("release");
-    let ready = dir.path().join("ready");
+    let (release, ready, count) = (
+        dir.path().join("release"),
+        dir.path().join("ready"),
+        dir.path().join("count"),
+    );
     let script = format!(
-        "trap '' TERM; : > '{}'; while [ ! -e '{}' ]; do sleep 0.01; done",
-        ready.display(),
-        release.display()
+        "trap 'printf x >> \"{count}\"' TERM; : > '{ready}'; while [ -d '{dir}' ] && [ ! -e '{release}' ]; do sleep 0.01; done",
+        count = count.display(),
+        ready = ready.display(),
+        dir = dir.path().display(),
+        release = release.display()
     );
     let mut state = tracking(spawn_test_process("/bin/sh", &["-c", &script]));
-    let deadline = Instant::now() + Duration::from_secs(5);
-    while !ready.exists() {
-        assert!(Instant::now() < deadline, "the fixture never started");
-        std::thread::sleep(Duration::from_millis(5));
-    }
+    wait_for_file(&ready);
     let first = state.stop_for_test();
     assert!(matches!(
         first,
@@ -223,6 +226,15 @@ fn a_process_ignoring_stop_stays_tracked_and_is_never_escalated() {
         state.display_for(&request()),
         RetroArchLaunchDisplay::Running { .. }
     ));
+    // Neither the GUI nor Core's own repeat sends a second signal.
+    state.stop_for_test();
+    let Some((_, RetroArchLaunchStage::Running { process, .. })) = state.tracked.as_mut() else {
+        panic!("expected a running launch");
+    };
+    process.request_graceful_stop(GracefulStopScope::LaunchedChild, Duration::ZERO);
+    wait_for_file(&count);
+    std::thread::sleep(Duration::from_millis(100));
+    assert_eq!(std::fs::read(&count).unwrap(), b"x");
     let text = rendered(|ui| state.show_stop_control(ui));
     assert!(text.contains("has not closed yet"), "{text}");
     assert!(text.contains("will not force"), "{text}");
@@ -300,7 +312,7 @@ fn release_and_assert_no_stop_claim(state: &mut RetroArchLaunchState, release: &
     };
     assert!(requested_exit(*stop_outcome, true).is_none());
     let feedback = rendered(|ui| show_retroarch_launch_feedback(ui, &display));
-    assert!(!feedback.contains("Stop request"), "{feedback}");
+    assert!(!feedback.contains("asked it to stop"), "{feedback}");
 }
 
 fn wait_for_file(path: &std::path::Path) {
@@ -318,8 +330,9 @@ fn a_launcher_script_is_refused_and_exit_never_reads_as_stopped() {
     let script = launcher(
         dir.path(),
         &format!(
-            ": > '{}'; while [ ! -e '{}' ]; do sleep 0.01; done",
+            ": > '{}'; while [ -d '{}' ] && [ ! -e '{}' ]; do sleep 0.01; done",
             ready.display(),
+            dir.path().display(),
             release.display()
         ),
     );
@@ -337,51 +350,100 @@ fn a_launcher_that_execs_another_program_is_refused() {
     let ready = dir.path().join("ready");
     let script = launcher(
         dir.path(),
-        &format!(": > '{}'; exec /bin/sleep 30", ready.display()),
+        &format!(": > '{}'; exec /bin/sleep 1", ready.display()),
     );
-    let mut process = spawn_test_process(&script, &[]);
+    let mut state = tracking(spawn_test_process(&script, &[]));
     wait_for_file(&ready);
-    // The ready file is written just before the exec.
-    let deadline = Instant::now() + Duration::from_secs(5);
-    process.command_facts.executable = "/bin/sleep".into();
-    while process.stop_target() != OwnedExecutable::Matches {
-        assert!(
-            Instant::now() < deadline,
-            "the launcher never replaced itself"
-        );
-        std::thread::sleep(Duration::from_millis(5));
-    }
-    process.command_facts.executable = script.into();
-    assert_eq!(process.stop_target(), OwnedExecutable::Differs);
-    let mut state = tracking(process);
     assert_refused_and_still_tracked(&mut state);
-    let Some((_, RetroArchLaunchStage::Running { process, .. })) = state.tracked.as_mut() else {
-        panic!("expected a running launch");
+    let display = wait_for_exit(&mut state);
+    let RetroArchLaunchDisplay::Exited { stop_outcome, .. } = display else {
+        panic!("expected an exited launch");
     };
-    process.command_facts.executable = "/bin/sleep".into();
-    process.request_graceful_stop(GracefulStopScope::LaunchedChild, Duration::ZERO);
-    wait_for_exit(&mut state);
+    assert_eq!(requested_exit(stop_outcome, true), None);
 }
 
 #[test]
-fn a_launcher_leaving_a_child_behind_never_offers_stop_or_claims_a_stopped_game() {
+fn stop_never_reaches_a_launchers_child_or_claims_it_closed_when_the_launcher_exits() {
     let dir = tempfile::tempdir().unwrap();
-    let (started, alive) = (dir.path().join("started"), dir.path().join("alive"));
+    let path = |name: &str| dir.path().join(name);
+    let (started, alive, let_go, child_gone) = (
+        path("started"),
+        path("alive"),
+        path("let-go"),
+        path("child-gone"),
+    );
     std::fs::write(&alive, b"").unwrap();
     let script = launcher(
         dir.path(),
         &format!(
-            "(: > '{}'; while [ -e '{}' ]; do sleep 0.01; done) >/dev/null 2>&1 &\nexit 0",
-            started.display(),
-            alive.display()
+            "(: > '{started}'; while [ -e '{alive}' ]; do sleep 0.01; done; : > '{child_gone}') >/dev/null 2>&1 &\n\
+             while [ -d '{dir}' ] && [ ! -e '{let_go}' ]; do sleep 0.01; done\nexit 0",
+            started = started.display(),
+            alive = alive.display(),
+            child_gone = child_gone.display(),
+            dir = dir.path().display(),
+            let_go = let_go.display(),
         ),
     );
     let mut state = tracking(spawn_test_process(&script, &[]));
     wait_for_file(&started);
-    let display = wait_for_exit(&mut state);
-    let feedback = rendered(|ui| show_retroarch_launch_feedback(ui, &display));
-    assert!(!feedback.contains("Stop request"), "{feedback}");
+    assert_refused_and_still_tracked(&mut state);
+    release_and_assert_no_stop_claim(&mut state, &let_go);
+    assert!(
+        state.stop_for_test().is_none(),
+        "an exited launch has no Stop"
+    );
     assert!(!rendered(|ui| state.show_stop_control(ui)).contains("Stop RetroArch"));
+    assert!(
+        !child_gone.exists(),
+        "the launcher's child must be untouched"
+    );
+    std::fs::remove_file(&alive).unwrap();
+    wait_for_file(&child_gone);
+}
+
+#[test]
+fn replacing_or_deleting_the_program_on_disk_does_not_block_stop() {
+    use std::os::unix::fs::PermissionsExt;
+    for delete in [false, true] {
+        let dir = tempfile::tempdir().unwrap();
+        let program = dir.path().join("retroarch");
+        std::fs::copy("/bin/sleep", &program).unwrap();
+        std::fs::set_permissions(&program, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let process = spawn_test_process(program.to_str().unwrap(), &["30"]);
+        assert_eq!(process.stop_target(), OwnedExecutable::Matches);
+        std::fs::remove_file(&program).unwrap();
+        if !delete {
+            std::fs::copy("/bin/true", &program).unwrap();
+        }
+        assert_eq!(process.stop_target(), OwnedExecutable::Matches);
+        let mut state = tracking(process);
+        assert!(matches!(
+            state.stop_for_test(),
+            Some(
+                GracefulStopOutcome::StillRunning { .. } | GracefulStopOutcome::ExitedAfterRequest
+            )
+        ));
+        wait_for_exit(&mut state);
+    }
+}
+
+#[test]
+fn the_stop_result_stays_visible_from_another_games_card() {
+    let mut state = tracking(spawn_test_process("/bin/sleep", &["30"]));
+    state.stop_for_test();
+    let other = super::super::tests::request_for("/library/OtherGame.bin");
+    assert!(matches!(
+        wait_for_exit(&mut state),
+        RetroArchLaunchDisplay::Exited { .. }
+    ));
+    assert!(matches!(
+        state.display_for(&other),
+        RetroArchLaunchDisplay::Idle
+    ));
+    let text = rendered(|ui| state.show_stop_control(ui));
+    assert!(text.contains("Game.bin"), "{text}");
+    assert!(text.contains("may not have been saved"), "{text}");
 }
 
 #[test]

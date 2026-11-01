@@ -22,8 +22,8 @@ const STILL_CLOSING: &str =
 pub(super) struct StopControl {
     confirmed: bool,
     outcome: Option<GracefulStopOutcome>,
-    /// The launch's target, asked once rather than every frame. Core asks
-    /// again at the moment of the request.
+    /// The launch's settled target, so it is not asked every frame. Core
+    /// asks again at the moment of the request.
     target: Option<OwnedExecutable>,
 }
 
@@ -44,21 +44,17 @@ impl StopControl {
     }
 
     fn show(&mut self, ui: &mut egui::Ui, process: &mut LaunchedRetroArchProcess) {
-        let target = *self.target.get_or_insert_with(|| process.stop_target());
+        let target = match self.target {
+            Some(target @ (OwnedExecutable::Matches | OwnedExecutable::Differs)) => target,
+            _ => *self.target.insert(process.stop_target()),
+        };
         ui.push_id("owned-retroarch-stop", |ui| match self.outcome {
             None if matches!(target, OwnedExecutable::Exited) => {}
             None if !matches!(target, OwnedExecutable::Matches) => {
                 ui.label(NOT_THE_EMULATOR);
             }
             None => {
-                let game = process
-                    .command_facts
-                    .content_path
-                    .file_name()
-                    .map_or_else(
-                        || process.command_facts.content_path.display().to_string(),
-                        |name| name.to_string_lossy().into_owned(),
-                    );
+                let game = game_name(process);
                 ui.small(EXPLANATION);
                 ui.checkbox(
                     &mut self.confirmed,
@@ -92,21 +88,57 @@ impl StopControl {
 impl RetroArchLaunchState {
     /// Stop is shown for whichever launch is tracked as running, whatever
     /// game is on screen: the request can only reach that launch's own child.
-    /// A starting, failed or exited launch has no running handle, so it shows
-    /// nothing.
+    /// Afterwards this keeps the result in view until the next launch, because
+    /// the game's own card may no longer be on screen. A starting, failed or
+    /// unstopped launch has nothing to show.
     pub(crate) fn show_stop_control(&mut self, ui: &mut egui::Ui) {
-        let (process, stop) = match self.tracked.as_mut() {
-            Some((_, RetroArchLaunchStage::Running { process, stop })) => (process, stop),
+        let (process, stop, success) = match self.tracked.as_mut() {
+            Some((_, RetroArchLaunchStage::Running { process, stop })) => {
+                return stop.show(ui, process);
+            }
             Some((_, RetroArchLaunchStage::RunningCheats { session, stop })) => {
-                match session.process_mut() {
-                    Some(process) => (process, stop),
+                if let Some(process) = session.process_mut() {
+                    stop.show(ui, process);
+                }
+                return;
+            }
+            Some((_, RetroArchLaunchStage::Exited { process, stop })) => {
+                let success = process
+                    .poll()
+                    .is_some_and(|report| matches!(&report.status, Ok(status) if status.success()));
+                (&*process, &*stop, success)
+            }
+            Some((_, RetroArchLaunchStage::ExitedCheats { session, stop })) => {
+                let success = session
+                    .receipt()
+                    .process
+                    .as_ref()
+                    .and_then(|process| process.exit.as_ref())
+                    .is_some_and(|exit| exit.success);
+                match session.process() {
+                    Some(process) => (process, &*stop, success),
                     None => return,
                 }
             }
             _ => return,
         };
-        stop.show(ui, process);
+        if let Some((summary, _)) = requested_exit(stop.outcome(), success) {
+            ui.small(format!("{}: {summary}", game_name(process)));
+        }
     }
+}
+
+fn game_name(process: &LaunchedRetroArchProcess) -> String {
+    let path = &process.command_facts.content_path;
+    path.file_name().map_or_else(
+        || path.display().to_string(),
+        |name| name.to_string_lossy().into_owned(),
+    )
+}
+
+#[cfg(test)]
+pub(crate) fn retroarch_test_request(path: &str) -> archivefs_core::launch::RetroArchLaunchRequest {
+    super::tests::request_for(path)
 }
 
 #[cfg(test)]
@@ -151,12 +183,12 @@ pub(super) fn requested_exit(
     }
     Some(if success {
         (
-            "RetroArch closed normally after your Stop request.",
+            "RetroArch closed normally after you asked it to stop.",
             StatusTone::Success,
         )
     } else {
         (
-            "RetroArch ended after your Stop request but did not close normally. Recent in-game progress may not have been saved. If its window is still open, close it yourself.",
+            "RetroArch ended after you asked it to stop but did not close normally. Recent in-game progress may not have been saved. If its window is still open, close it yourself.",
             StatusTone::Warning,
         )
     })
