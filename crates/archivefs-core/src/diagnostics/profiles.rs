@@ -358,6 +358,10 @@ pub fn discover_linux_emulator_installations() -> Vec<LinuxEmulatorInstallationE
     let Some(home) = env::var_os("HOME").map(PathBuf::from) else {
         return Vec::new();
     };
+    discover_linux_emulator_installations_in(&home)
+}
+
+fn discover_linux_emulator_installations_in(home: &Path) -> Vec<LinuxEmulatorInstallationEvidence> {
     let definitions = [
         (
             "Dolphin",
@@ -381,7 +385,7 @@ pub fn discover_linux_emulator_installations() -> Vec<LinuxEmulatorInstallationE
             &["duckstation-qt", "duckstation-nogui", "duckstation"][..],
             "org.duckstation.DuckStation",
         ),
-        ("Azahar", &["azahar"][..], "org.azahar_emulator.Azahar"),
+        ("Azahar", &["azahar"][..], "org.azahar_emu.Azahar"),
         ("Cemu", &["Cemu", "cemu"][..], "info.cemu.Cemu"),
         (
             "melonDS",
@@ -411,7 +415,7 @@ pub fn discover_linux_emulator_installations() -> Vec<LinuxEmulatorInstallationE
     ];
     let mut evidence = Vec::new();
     for (emulator, names, app_id) in definitions {
-        let executable = first_executable(&home, names);
+        let executable = first_executable(home, names);
         if let Some(path) = executable {
             evidence.push(LinuxEmulatorInstallationEvidence {
                 emulator: emulator.to_string(),
@@ -421,7 +425,7 @@ pub fn discover_linux_emulator_installations() -> Vec<LinuxEmulatorInstallationE
                 detail: format!("Executable found at {}", path.display()),
             });
         }
-        if let Some(form) = flatpak_metadata(&home, app_id) {
+        if let Some(form) = flatpak_metadata(home, app_id) {
             evidence.push(LinuxEmulatorInstallationEvidence {
                 emulator: emulator.to_string(),
                 installation_form: form.to_string(),
@@ -445,6 +449,12 @@ pub fn discover_linux_emulator_installations() -> Vec<LinuxEmulatorInstallationE
             home.join("Applications/DuckStation/DuckStation.AppImage"),
         ),
         ("Xenia", home.join("Applications/Xenia.AppImage")),
+        ("Cemu", home.join("Applications/Cemu/Cemu.AppImage")),
+        ("mGBA", home.join("Applications/mGBA/mGBA.AppImage")),
+        (
+            "melonDS",
+            home.join("Applications/melonDS/melonDS-x86_64.AppImage"),
+        ),
     ] {
         if safe_executable(&path) {
             evidence.push(LinuxEmulatorInstallationEvidence {
@@ -456,8 +466,8 @@ pub fn discover_linux_emulator_installations() -> Vec<LinuxEmulatorInstallationE
             });
         }
     }
-    evidence.extend(discover_shadps4_installations(&home));
-    evidence.extend(discover_managed_emulator_installations(&home));
+    evidence.extend(discover_shadps4_installations(home));
+    evidence.extend(discover_managed_emulator_installations(home));
     if let Some(path) = [home.join(".config/scummvm"), home.join(".config/ScummVM")]
         .into_iter()
         .find(|path| {
@@ -2510,6 +2520,56 @@ mod tests {
     use super::*;
     use crate::diagnostics::tests::{TempTree, snapshot_tree};
     use std::os::unix::fs::symlink;
+
+    fn evidence_for<'a>(
+        all: &'a [LinuxEmulatorInstallationEvidence],
+        emulator: &str,
+        form: &str,
+    ) -> Option<&'a LinuxEmulatorInstallationEvidence> {
+        all.iter()
+            .find(|item| item.emulator == emulator && item.installation_form == form)
+    }
+
+    #[test]
+    fn named_appimages_in_their_application_folders_are_discovered() {
+        use std::os::unix::fs::PermissionsExt;
+        let tree = TempTree::new("appimage-names");
+        let home = tree.path();
+        for relative in [
+            "Applications/Cemu/Cemu.AppImage",
+            "Applications/mGBA/mGBA.AppImage",
+            "Applications/melonDS/melonDS-x86_64.AppImage",
+        ] {
+            let path = home.join(relative);
+            fs::create_dir_all(path.parent().unwrap()).unwrap();
+            fs::write(&path, b"x").unwrap();
+            fs::set_permissions(&path, fs::Permissions::from_mode(0o755)).unwrap();
+        }
+        // A directory named like the executable (melonDS ships one) is not a match.
+        fs::create_dir_all(home.join("Applications/melonDS/melonDS")).unwrap();
+        let found = discover_linux_emulator_installations_in(home);
+        for (emulator, relative) in [
+            ("Cemu", "Applications/Cemu/Cemu.AppImage"),
+            ("mGBA", "Applications/mGBA/mGBA.AppImage"),
+            ("melonDS", "Applications/melonDS/melonDS-x86_64.AppImage"),
+        ] {
+            let item = evidence_for(&found, emulator, "AppImage")
+                .unwrap_or_else(|| panic!("{emulator} AppImage not discovered"));
+            assert_eq!(
+                item.executable,
+                Some(EncodedPath::from_path(&home.join(relative)))
+            );
+        }
+    }
+
+    #[test]
+    fn azahar_flatpak_uses_the_published_application_id() {
+        let tree = TempTree::new("azahar-flatpak");
+        let home = tree.path();
+        fs::create_dir_all(home.join(".local/share/flatpak/app/org.azahar_emu.Azahar")).unwrap();
+        let found = discover_linux_emulator_installations_in(home);
+        assert!(evidence_for(&found, "Azahar", "Flatpak (user installation)").is_some());
+    }
 
     /// One assessment of a real path, through the same code path the runner
     /// uses. Nothing is created here except the fixture itself.

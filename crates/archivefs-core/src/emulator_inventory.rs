@@ -57,8 +57,8 @@ impl InventoryEmulator {
             // Bare `dolphin` is KDE's file manager on Linux, not the emulator.
             Self::Dolphin => &["dolphin-emu"],
             Self::Rpcs3 => &["rpcs3"],
-            Self::Pcsx2 => &["pcsx2"],
-            Self::Ppsspp => &["ppsspp"],
+            Self::Pcsx2 => &["pcsx2", "pcsx2-qt"],
+            Self::Ppsspp => &["ppsspp", "PPSSPPSDL"],
             Self::DuckStation => &["duckstation", "duckstation-qt"],
             Self::Xemu => &["xemu"],
             Self::ShadPs4 => &["shadps4", "shadPS4"],
@@ -592,6 +592,29 @@ mod tests {
             PathBuf::from("/a")
         );
         assert_eq!(inventory.installations.len(), 2);
+    }
+    #[test]
+    fn pcsx2_and_ppsspp_wrapper_names_are_recognised_read_only() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        for name in ["pcsx2-qt", "PPSSPPSDL"] {
+            let p = dir.path().join(name);
+            fs::write(&p, "#!/bin/sh\nexit 0\n").unwrap();
+            fs::set_permissions(&p, fs::Permissions::from_mode(0o755)).unwrap();
+        }
+        let found = discover_in_path_entries(vec![dir.path().into()], false);
+        for (emulator, name) in [
+            (InventoryEmulator::Pcsx2, "pcsx2-qt"),
+            (InventoryEmulator::Ppsspp, "PPSSPPSDL"),
+        ] {
+            assert!(
+                found
+                    .installations
+                    .iter()
+                    .any(|i| i.emulator == emulator && i.executable_path == dir.path().join(name)),
+                "{name} not recognised"
+            );
+        }
     }
     #[test]
     fn real_smoke_is_bounded_and_read_only() {
