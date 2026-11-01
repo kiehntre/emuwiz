@@ -10,6 +10,7 @@ mod backend;
 mod bezel;
 mod bezel_history;
 mod bg_readiness;
+mod big_picture;
 mod browse_play;
 mod cheat_extras_page;
 pub(crate) mod classic_trainers;
@@ -225,6 +226,7 @@ pub fn run() -> eframe::Result<()> {
             .unwrap_or(Section::Advanced);
         (section, args.get(index + 2).map(std::path::PathBuf::from))
     });
+    let big_picture = args.iter().any(|arg| arg == "--big-picture");
     let mut viewport = egui::ViewportBuilder::default()
         .with_inner_size([1280.0, 820.0])
         .with_min_inner_size([620.0, 480.0])
@@ -252,6 +254,9 @@ pub fn run() -> eframe::Result<()> {
             } else {
                 let mut app = App::new(context.egui_ctx.clone());
                 app.setup_portability.set_dialog_parent(context);
+                if big_picture {
+                    app.enter_big_picture(&context.egui_ctx);
+                }
                 Ok(Box::new(app))
             }
         }),
@@ -347,6 +352,7 @@ pub(super) struct App {
     filter: Filter,
     filter_generation: u64,
     filter_inflight: bool,
+    big_picture: Option<Box<big_picture::BigPicture>>,
     filter_dirty: Option<Instant>,
     detail: Option<Detail>,
     detail_pending: Option<i64>,
@@ -478,6 +484,7 @@ impl App {
             filter: Filter::default(),
             filter_generation: 0,
             filter_inflight: false,
+            big_picture: None,
             filter_dirty: None,
             detail: None,
             detail_pending: None,

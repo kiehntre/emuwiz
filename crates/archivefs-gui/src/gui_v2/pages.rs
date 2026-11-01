@@ -322,6 +322,9 @@ impl App {
         if self.show_manual_viewer(context) || self.show_text_guide_viewer(context) {
             return;
         }
+        if self.show_big_picture(context) {
+            return;
+        }
         let modal_open = self.confirm_scan
             || self.setup_actions.confirm.is_some()
             || self.repair_confirm
@@ -3442,7 +3445,7 @@ impl App {
         }
     }
 
-    fn launch(&mut self, ui: &mut egui::Ui, game_id: i64) {
+    pub(super) fn launch(&mut self, ui: &mut egui::Ui, game_id: i64) {
         let Some(game) = self.library.game(game_id).cloned() else {
             ui.label("This game is no longer in the current library.");
             if primary(ui, "Return to games") {

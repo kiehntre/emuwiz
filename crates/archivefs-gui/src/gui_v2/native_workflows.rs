@@ -3448,6 +3448,16 @@ impl NativeWorkflows {
         self.app.build_launch_readiness_input(live)
     }
 
+    /// An emulator is starting or running, whichever page started it.
+    pub(super) fn launch_in_progress(&self) -> bool {
+        self.launch_active()
+    }
+
+    /// How the last launch of this game went, if it went wrong.
+    pub(super) fn launch_attempt(&self, game: i64) -> Option<&launch_readiness_summary::Attempt> {
+        self.launch_attempts.for_game(game)
+    }
+
     fn launch_active(&self) -> bool {
         self.app.launch_retroarch.is_active()
             || self.app.launch_dolphin.is_active()
