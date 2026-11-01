@@ -426,6 +426,7 @@ impl Library {
 }
 
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(from = "SavedFilter")]
 pub(super) struct Filter {
     pub search: String,
     pub platform: String,
@@ -436,6 +437,38 @@ pub(super) struct Filter {
     pub cache_aware: bool,
     pub unverified_only: bool,
     pub list: bool,
+}
+
+/// What a saved `gui-v2.json` may hold, including files written before the
+/// readiness views replaced `attention_only`. Loading only: saves always use
+/// [`Filter`].
+#[derive(Default, Deserialize)]
+#[serde(default)]
+struct SavedFilter {
+    search: String,
+    platform: String,
+    readiness: Option<ReadinessFilter>,
+    attention_only: bool,
+    unverified_only: bool,
+    list: bool,
+}
+
+impl From<SavedFilter> for Filter {
+    fn from(saved: SavedFilter) -> Self {
+        let older_view = if saved.attention_only {
+            ReadinessFilter::NeedsAttention
+        } else {
+            ReadinessFilter::All
+        };
+        Self {
+            search: saved.search,
+            platform: saved.platform,
+            readiness: saved.readiness.unwrap_or(older_view),
+            cache_aware: false,
+            unverified_only: saved.unverified_only,
+            list: saved.list,
+        }
+    }
 }
 
 /// The Library's readiness views. Ready is answered only from checks that
