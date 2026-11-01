@@ -2227,7 +2227,7 @@ impl RetroArchLaunchState {
                             code: Some(code),
                             ..
                         }) => format!("exit code {code}"),
-                        Some(_) => "ended by a signal".to_string(),
+                        Some(_) => "ended without an exit code".to_string(),
                         None => "status unknown".to_string(),
                     };
                     let stderr_tail = (!success)

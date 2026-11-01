@@ -350,11 +350,25 @@ fn a_launcher_that_execs_another_program_is_refused() {
     let ready = dir.path().join("ready");
     let script = launcher(
         dir.path(),
-        &format!(": > '{}'; exec /bin/sleep 1", ready.display()),
+        &format!(": > '{}'; exec /bin/sleep 30", ready.display()),
     );
-    let mut state = tracking(spawn_test_process(&script, &[]));
+    let process = spawn_test_process(&script, &[]);
+    let pid = process.pid;
+    let running = format!("/proc/{pid}/exe");
+    let sleep = std::fs::canonicalize("/bin/sleep").unwrap();
     wait_for_file(&ready);
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while std::fs::read_link(&running).ok().as_ref() != Some(&sleep) {
+        assert!(
+            Instant::now() < deadline,
+            "the launcher never replaced itself"
+        );
+        std::thread::sleep(Duration::from_millis(5));
+    }
+    let mut state = tracking(process);
     assert_refused_and_still_tracked(&mut state);
+    // Stop refused it, so the fixture is ended from outside.
+    Command::new("kill").arg(pid.to_string()).status().unwrap();
     let display = wait_for_exit(&mut state);
     let RetroArchLaunchDisplay::Exited { stop_outcome, .. } = display else {
         panic!("expected an exited launch");
@@ -408,13 +422,19 @@ fn replacing_or_deleting_the_program_on_disk_does_not_block_stop() {
     for delete in [false, true] {
         let dir = tempfile::tempdir().unwrap();
         let program = dir.path().join("retroarch");
-        std::fs::copy("/bin/sleep", &program).unwrap();
+        // A copied shell keeps working under any name; a multi-call
+        // coreutils `sleep` would not.
+        std::fs::copy(std::fs::canonicalize("/bin/sh").unwrap(), &program).unwrap();
         std::fs::set_permissions(&program, std::fs::Permissions::from_mode(0o755)).unwrap();
-        let process = spawn_test_process(program.to_str().unwrap(), &["30"]);
+        let script = format!(
+            "while [ -d '{}' ]; do sleep 0.01; done",
+            dir.path().display()
+        );
+        let process = spawn_test_process(program.to_str().unwrap(), &["-c", &script]);
         assert_eq!(process.stop_target(), OwnedExecutable::Matches);
         std::fs::remove_file(&program).unwrap();
         if !delete {
-            std::fs::copy("/bin/true", &program).unwrap();
+            std::fs::write(&program, b"a newer version").unwrap();
         }
         assert_eq!(process.stop_target(), OwnedExecutable::Matches);
         let mut state = tracking(process);
