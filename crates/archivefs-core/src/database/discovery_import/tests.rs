@@ -619,3 +619,44 @@ fn operation_projection_uses_receipt_and_only_fresh_preview_offers_undo() {
         OperationState::RolledBack
     );
 }
+
+#[test]
+fn a_game_kept_in_favourites_blocks_undo_until_it_is_removed_there() {
+    let f = Fixture::new();
+    f.write("new.z80", 2);
+    let r = f.import();
+    let operation = r.operation_id.as_deref().unwrap().to_string();
+    let id = r.inserted[0].1;
+    let favourites = f.db().favourites_collection_id().unwrap();
+    Database::open_existing(&f.db)
+        .unwrap()
+        .add_game_to_collection(favourites, id)
+        .unwrap();
+
+    let p = f.preview(&operation);
+    assert!(!p.can_undo());
+    assert!(p.blockers.iter().any(|b| b.contains("Favourites")));
+
+    Database::open_existing(&f.db)
+        .unwrap()
+        .remove_current_game_from_collection(favourites, id)
+        .unwrap();
+    assert!(f.preview(&operation).can_undo());
+}
+
+#[test]
+fn favouriting_after_the_preview_stops_the_confirmed_undo() {
+    let f = Fixture::new();
+    f.write("new.z80", 2);
+    let r = f.import();
+    let id = r.inserted[0].1;
+    let p = f.preview(r.operation_id.as_deref().unwrap());
+    assert!(p.can_undo(), "{:?}", p.blockers);
+    let favourites = f.db().favourites_collection_id().unwrap();
+    Database::open_existing(&f.db)
+        .unwrap()
+        .add_game_to_collection(favourites, id)
+        .unwrap();
+    assert!(Database::undo_discovery_import(&p).is_err());
+    assert!(f.db().load_archives().unwrap().iter().any(|a| a.id == id));
+}

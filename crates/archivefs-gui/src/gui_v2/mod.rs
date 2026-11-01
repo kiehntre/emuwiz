@@ -13,6 +13,7 @@ mod bg_readiness;
 mod browse_play;
 mod cheat_extras_page;
 pub(crate) mod classic_trainers;
+mod collections;
 #[cfg(test)]
 mod dat_exact_tests;
 mod database_status_page;
@@ -345,6 +346,7 @@ pub(super) struct App {
     library: SharedLibrary,
     indices: Vec<usize>,
     filter: Filter,
+    collections: collections::State,
     filter_generation: u64,
     filter_inflight: bool,
     filter_dirty: Option<Instant>,
@@ -476,6 +478,10 @@ impl App {
             library: Arc::new(Library::default()),
             indices: Vec::new(),
             filter: Filter::default(),
+            collections: collections::State::with_database(
+                archivefs_core::default_database_path().ok(),
+                context.clone(),
+            ),
             filter_generation: 0,
             filter_inflight: false,
             filter_dirty: None,
@@ -981,6 +987,7 @@ impl App {
                 self.router.current = preferences.route;
             }
             self.filter = preferences.filter;
+            self.collections.sort = preferences.collection_sort;
             self.filter_dirty = Some(Instant::now());
         }
         self.preferences_restored = true;
@@ -1715,6 +1722,8 @@ impl App {
         self.organisation.frontend_export.poll(context);
         self.artwork.begin_frame(context);
         self.imagery.begin_frame(context);
+        let library = self.library.clone();
+        self.collections.poll(&library);
         for _ in 0..32 {
             let Ok(event) = self.backend.rx.try_recv() else {
                 break;
@@ -1836,6 +1845,7 @@ impl App {
                                         });
                                     }
                                     self.library = library;
+                                    self.collections.library_changed(&self.library);
                                     self.recording_integrity.clear();
                                     // Remembered pages may name a game by an older catalogue
                                     // entry; point them at the current copy.
@@ -2243,6 +2253,7 @@ impl App {
                     simple_shell: self.simple.enabled,
                     classic_view: !self.simple.enabled,
                     ui_scale: self.simple.ui_scale,
+                    collection_sort: self.collections.sort,
                 }),
             );
         }

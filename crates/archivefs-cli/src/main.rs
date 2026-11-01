@@ -3255,6 +3255,9 @@ fn run_library_upgrade(
         return Ok(format!(
             "Library database: {}\nSchema {current} would be upgraded to schema {latest}.\n\
              A verified backup is taken first and kept. Nothing was changed.\n\
+             This is one-way: builds made for schema {current} will refuse the upgraded \
+             library, and going back means restoring that backup of the whole library, \
+             which loses every later change to it.\n\
              To upgrade, run: emuwiz-cli library-upgrade --confirm\n",
             database_path.display()
         ));
@@ -3263,11 +3266,14 @@ fn run_library_upgrade(
     Ok(format!(
         "Upgraded the library database from schema {} to schema {}.\n\
          Backup kept at: {}\nBackup SHA-256: {}\n\
-         Run emuwiz-cli library-scan to refresh the catalogue.\n",
+         Builds made for schema {} will now refuse this library. That backup restores the whole \
+         library as it was before this upgrade, so restoring it loses every later change.\n\
+         No scan was run. Run emuwiz-cli library-scan later, once your source drives are ready.\n",
         report.from_version,
         report.to_version,
         report.backup_path.display(),
-        report.backup_sha256
+        report.backup_sha256,
+        report.from_version
     ))
 }
 
@@ -7734,6 +7740,10 @@ mod tests {
 
         let preview = run_library_upgrade(&database_path, false).unwrap();
         assert!(preview.contains("Schema 16 would be upgraded"), "{preview}");
+        assert!(
+            preview.contains("builds made for schema 16 will refuse"),
+            "{preview}"
+        );
         assert!(preview.contains("Nothing was changed"), "{preview}");
         assert_eq!(std::fs::read(&database_path).unwrap(), original);
         assert_eq!(names(&root), before, "a preview created a file");

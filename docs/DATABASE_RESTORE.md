@@ -28,3 +28,7 @@ After a successful replacement it reloads the catalogue and tells the user
 that a restart may be required for other processes. Rollback uses the verified
 emergency backup only when the restored live database still matches the
 recorded post-restore identity.
+
+Review restore accepts only a backup at the running build's own schema. A
+backup from before a schema upgrade is refused, by design. To return to one, see
+[Going back to schema 26](FAVOURITES_AND_COLLECTIONS.md#going-back-to-schema-26).

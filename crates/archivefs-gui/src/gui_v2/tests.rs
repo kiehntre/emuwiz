@@ -56,6 +56,7 @@ pub(super) fn fixture(context: &egui::Context) -> App {
         review: Default::default(),
         indices: Vec::new(),
         filter: Filter::default(),
+        collections: Default::default(),
         filter_generation: 0,
         filter_inflight: false,
         filter_dirty: None,
@@ -3285,6 +3286,7 @@ fn gui_v2_preferences_round_trip_is_separate_from_legacy_mode() {
             simple_shell: false,
             classic_view: false,
             ui_scale: 1.0,
+            collection_sort: Default::default(),
         },
     )
     .unwrap();

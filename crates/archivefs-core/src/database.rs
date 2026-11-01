@@ -65,7 +65,18 @@ mod backup_ownership;
 #[path = "database/backup_ownership_tests.rs"]
 mod backup_ownership_tests;
 mod bounded_import;
+mod collections;
+#[cfg(test)]
+#[path = "database/collections_tests.rs"]
+mod collections_tests;
+#[cfg(test)]
+#[path = "database/collections_upgrade_tests.rs"]
+mod collections_upgrade_tests;
 mod discovery_import;
+pub use collections::{
+    CollectionItemKey, CollectionReanchor, GameCollection, GameCollectionItem, GameCollectionKind,
+    MAX_COLLECTION_NAME_CHARS, validate_collection_name,
+};
 pub use discovery_import::{
     DiscoveryImportExclusion, DiscoveryImportItem, DiscoveryImportOperation,
     DiscoveryImportUndoPreview, DiscoveryImportUndoResult,
@@ -387,6 +398,11 @@ const MIGRATIONS: &[Migration] = &[
         version: 26,
         description: "bind DAT inventories to exact catalogue bytes",
         sql: include_str!("migrations/0026_dat_inventory_digest.sql"),
+    },
+    Migration {
+        version: 27,
+        description: "game collections: Favourites and user-created collections",
+        sql: include_str!("migrations/0027_game_collections.sql"),
     },
 ];
 
@@ -11079,21 +11095,21 @@ mod tests {
 
         let report = upgrade_library_database(&database_path).unwrap();
         assert_eq!(report.from_version, 16);
-        assert_eq!(report.to_version, 26);
+        assert_eq!(report.to_version, 27);
         assert_eq!(
             report.applied_versions,
-            vec![17, 18, 19, 20, 21, 22, 23, 24, 25, 26]
+            vec![17, 18, 19, 20, 21, 22, 23, 24, 25, 26, 27]
         );
 
         let upgraded = Database::open_or_create(&database_path).unwrap();
-        assert_eq!(upgraded.schema_version().unwrap(), 26);
+        assert_eq!(upgraded.schema_version().unwrap(), 27);
         let source = upgraded.list_source_folders().unwrap();
         assert_eq!(source.len(), 1);
         assert_eq!(source[0].role, SourceRole::Games);
         assert_eq!(upgraded.load_archives().unwrap().len(), 1);
         assert_eq!(
             pending_schema_migration_versions(19).unwrap(),
-            vec![20, 21, 22, 23, 24, 25, 26]
+            vec![20, 21, 22, 23, 24, 25, 26, 27]
         );
 
         let quick_check: String = upgraded
@@ -11113,11 +11129,11 @@ mod tests {
 
         let report = upgrade_library_database(&database_path).unwrap();
         assert_eq!(report.from_version, 20);
-        assert_eq!(report.to_version, 26);
-        assert_eq!(report.applied_versions, vec![21, 22, 23, 24, 25, 26]);
+        assert_eq!(report.to_version, 27);
+        assert_eq!(report.applied_versions, vec![21, 22, 23, 24, 25, 26, 27]);
 
         let upgraded = Database::open_or_create(&database_path).unwrap();
-        assert_eq!(upgraded.schema_version().unwrap(), 26);
+        assert_eq!(upgraded.schema_version().unwrap(), 27);
         assert_eq!(upgraded.list_source_folders().unwrap().len(), 1);
         assert_eq!(upgraded.load_archives().unwrap().len(), 1);
         let table_count: i64 = upgraded
@@ -11132,7 +11148,7 @@ mod tests {
         upgraded.close().unwrap();
 
         let reopened = Database::open_read_only(&database_path).unwrap();
-        assert_eq!(reopened.schema_version().unwrap(), 26);
+        assert_eq!(reopened.schema_version().unwrap(), 27);
         reopened.close().unwrap();
         let _ = fs::remove_dir_all(root);
     }
@@ -11985,6 +12001,8 @@ mod tests {
                 "discovery_details",
                 "discovery_import_operations",
                 "discovery_import_records",
+                "game_collection_items",
+                "game_collections",
                 "library_dat_identities",
                 "mame_member_evidence",
                 "media_topology_evidence",
@@ -22087,7 +22105,7 @@ echo "$out"
 
         #[test]
         fn migrations_0011_and_0012_are_registered() {
-            assert_eq!(latest_known_version(MIGRATIONS), 26);
+            assert_eq!(latest_known_version(MIGRATIONS), 27);
             assert!(MIGRATIONS.iter().any(|migration| {
                 migration.version == 11
                     && migration.sql.contains("CREATE TABLE dat_expected_entries")

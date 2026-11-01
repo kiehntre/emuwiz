@@ -459,7 +459,7 @@ pub(super) fn upgrade_message(state: &DatabaseStatusState) -> String {
         _ => "an older schema".to_string(),
     };
     format!(
-        "EmuWiz will keep a verified backup of its library database, update it from {from} to {latest} and then scan your sources. Your game files are not changed. {NO_UNDO}"
+        "EmuWiz will keep a verified backup of its library database, update it from {from} to {latest} and then scan every source folder, so make sure your drives are connected first. Your game files are not changed. This cannot be undone from here: older EmuWiz builds will refuse the upgraded library, and going back means restoring the backup of the whole library, which loses every later change. {NO_UNDO}"
     )
 }
 
@@ -563,6 +563,9 @@ mod tests {
         assert!(message.contains("verified backup"));
         assert!(message.contains(NO_UNDO));
         assert!(message.contains("game files are not changed"));
+        assert!(message.contains("older EmuWiz builds will refuse"));
+        assert!(message.contains("whole library"));
+        assert!(message.contains("scan every source folder"));
         // Confirm: exactly one upgrade starts.
         assert!(state.answer_upgrade(true, &context));
         assert!(UPGRADES.load(Ordering::SeqCst) >= before + 1);

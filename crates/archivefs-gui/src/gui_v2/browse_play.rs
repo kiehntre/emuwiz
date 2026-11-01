@@ -64,7 +64,16 @@ const ATTENTION_TEXT: Color32 = Color32::from_rgb(232, 170, 62);
 pub(super) const SELECTION_SETTLE_SECS: f64 = 0.35;
 
 /// Platform, search, (readiness view, cache-aware), unverified-only, library.
-type FilterKey = (String, String, (ReadinessFilter, bool), bool, usize);
+type FilterKey = (
+    String,
+    String,
+    (ReadinessFilter, bool),
+    bool,
+    usize,
+    CollectionKey,
+);
+/// Which collection is listed, its version, and its order.
+type CollectionKey = Option<(i64, u64, super::collections::CollectionSort)>;
 /// Base list address, cache version, view, and the narrowed list.
 type ReadinessView = (usize, u64, ReadinessFilter, Arc<Vec<usize>>);
 
@@ -359,6 +368,7 @@ impl App {
         let page_width = ui.available_width() - theme::SPACE_MD;
 
         self.browse_play_toolbar(ui);
+        self.browse_play_scope_bar(ui);
         self.batch_selection
             .retain(|id| library.by_id.contains_key(&id));
         self.browse_play_batch_controls(ui, &library);
@@ -410,6 +420,7 @@ impl App {
             self.browse_play_games(ui, &library, &indices, selected_id);
         }
         self.browse_play_batch_window(ui.ctx());
+        self.collection_dialogs(ui.ctx());
     }
 
     fn browse_play_batch_controls(&mut self, ui: &mut egui::Ui, library: &super::library::Library) {
@@ -511,9 +522,19 @@ impl App {
             (self.filter.readiness, self.filter.cache_aware),
             self.filter.unverified_only,
             Arc::as_ptr(&self.library) as usize,
+            self.collections
+                .scoped()
+                .map(|view| (view.id, self.collections.version(), self.collections.sort)),
         );
+        let scoped = key.5.is_some();
         if self.browse_play.key.as_ref() != Some(&key) {
-            self.browse_play.reset_scroll = true;
+            // Starring inside a collection keeps the place in the list.
+            let only_members_changed = self.browse_play.key.as_ref().is_some_and(|old| {
+                (&old.0, &old.1, old.2, old.3, old.4) == (&key.0, &key.1, key.2, key.3, key.4)
+                    && old.5.map(|(id, _, sort)| (id, sort))
+                        == key.5.map(|(id, _, sort)| (id, sort))
+            });
+            self.browse_play.reset_scroll |= !only_members_changed;
             if self
                 .browse_play
                 .key
@@ -526,7 +547,18 @@ impl App {
             }
             self.browse_play.key = Some(key);
             self.browse_play.library_token = Arc::downgrade(&self.library);
-            if self.library.games.len() <= IMMEDIATE_FILTER_LIMIT {
+            if let Some(view) = self.collections.scoped() {
+                self.browse_play.indices = Arc::new(super::collections::scoped_indices(
+                    &self.library,
+                    view,
+                    &self.filter,
+                    self.collections.sort,
+                ));
+                // Classic shares the filter and reads the worker's list.
+                if !only_members_changed && self.library.games.len() > IMMEDIATE_FILTER_LIMIT {
+                    self.change_filter();
+                }
+            } else if self.library.games.len() <= IMMEDIATE_FILTER_LIMIT {
                 self.browse_play.indices = Arc::new(self.library.filter(&self.filter));
             } else {
                 self.browse_play.indices = Arc::default();
@@ -534,7 +566,8 @@ impl App {
                 self.change_filter();
             }
         }
-        if self.library.games.len() > IMMEDIATE_FILTER_LIMIT
+        if !scoped
+            && self.library.games.len() > IMMEDIATE_FILTER_LIMIT
             && self.filter_dirty.is_none()
             && !self.filter_inflight
             && self.browse_play.applied_generation != Some(self.filter_generation)
@@ -762,12 +795,18 @@ impl App {
     }
 
     fn browse_play_systems(&mut self, ui: &mut egui::Ui, library: &super::library::Library) {
-        let mut ordered: Vec<(String, usize)> = library
-            .platforms
-            .iter()
-            .map(|(name, count)| (name.clone(), *count))
-            .collect();
-        ordered.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
+        let ordered: Vec<(String, usize)> = match self.collections.scoped() {
+            Some(view) => view.platforms.clone(),
+            None => {
+                let mut ordered: Vec<(String, usize)> = library
+                    .platforms
+                    .iter()
+                    .map(|(name, count)| (name.clone(), *count))
+                    .collect();
+                ordered.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
+                ordered
+            }
+        };
         let total: usize = ordered.iter().map(|(_, count)| count).sum();
         let mut chosen: Option<String> = None;
 
@@ -920,7 +959,8 @@ impl App {
         indices: &Arc<Vec<usize>>,
         selected_id: Option<i64>,
     ) {
-        if library.games.len() > IMMEDIATE_FILTER_LIMIT
+        if self.collections.scoped().is_none()
+            && library.games.len() > IMMEDIATE_FILTER_LIMIT
             && (self.filter_dirty.is_some() || self.filter_inflight)
         {
             ui.spinner();
@@ -928,6 +968,9 @@ impl App {
             return;
         }
         self.browse_play_summary(ui, indices.len());
+        if indices.is_empty() && self.collection_empty(ui) {
+            return;
+        }
         if indices.is_empty() {
             self.browse_play_empty(ui, library.games.is_empty());
             return;
@@ -1067,6 +1110,26 @@ impl App {
         }
     }
 
+    /// Title and system, and which copy this is when another shares the title:
+    /// favourites belong to one copy, not to a title.
+    fn game_hover(&self, game: &Game) -> String {
+        let copy = self
+            .library
+            .has_title_twin(game.archive.id)
+            .then(|| {
+                super::pages::disambiguating_hint(
+                    &game.title,
+                    &game.archive.relative_path,
+                    &game.archive.absolute_path,
+                )
+            })
+            .flatten();
+        match copy {
+            Some(copy) => format!("{}\n{}\n{copy}", game.title, game.platform),
+            None => format!("{}\n{}", game.title, game.platform),
+        }
+    }
+
     /// A whole-card button: picture, two-line title, and "system · status".
     fn browse_play_card(
         &mut self,
@@ -1127,9 +1190,17 @@ impl App {
                 .wrap()
                 .selectable(false),
             );
+            if !self.batch_selecting {
+                let star = egui::Rect::from_min_size(
+                    inner.right_top() - egui::vec2(28.0, 0.0),
+                    egui::vec2(28.0, 28.0),
+                );
+                let mut over_cover = child.new_child(egui::UiBuilder::new().max_rect(star));
+                self.favourite_star(&mut over_cover, id, &game.title);
+            }
             let response = response
                 .on_hover_cursor(egui::CursorIcon::PointingHand)
-                .on_hover_text(format!("{}\n{}", game.title, game.platform));
+                .on_hover_text(self.game_hover(game));
             if self.batch_selecting {
                 let mark = if self.batch_selection.contains(id) {
                     "☑"
@@ -1177,7 +1248,7 @@ impl App {
             );
             self.picture_tile(&mut child, game, Kind::Cover, LIST_COVER_SIZE);
             self.note_cover_problem(game, note);
-            let text_width = (inner.width() - LIST_COVER_SIZE.x - 12.0).max(80.0);
+            let text_width = (inner.width() - LIST_COVER_SIZE.x - 44.0).max(80.0);
             child.vertical(|ui| {
                 ui.set_width(text_width);
                 ui.add(
@@ -1201,7 +1272,12 @@ impl App {
                     .selectable(false),
                 );
             });
-            let response = response.on_hover_cursor(egui::CursorIcon::PointingHand);
+            if !self.batch_selecting {
+                self.favourite_star(&mut child, id, &game.title);
+            }
+            let response = response
+                .on_hover_cursor(egui::CursorIcon::PointingHand)
+                .on_hover_text(self.game_hover(game));
             if self.batch_selecting {
                 let mark = if self.batch_selection.contains(id) {
                     "☑"
@@ -1278,6 +1354,7 @@ impl App {
                                             .wrap()
                                             .selectable(false),
                                         );
+                                        this.game_collection_actions(ui, id, &game.title);
                                     },
                                 );
                                 ui.allocate_ui_with_layout(
@@ -1329,6 +1406,7 @@ impl App {
                                     };
                                     ui.label(format!("DAT: {}", game.dat_identity_summary()));
                                 }
+                                this.game_collection_actions(ui, id, &game.title);
                                 if tight {
                                     // The detail scroll bar takes 12 points.
                                     let scrollbar = if compact { 0.0 } else { 12.0 };

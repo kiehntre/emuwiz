@@ -183,9 +183,10 @@ pub use database::{
     rollback_database_restore, scan_and_persist, upgrade_library_database,
 };
 pub use database::{
-    DiscoveryImportExclusion, DiscoveryImportItem, DiscoveryImportOperation,
-    DiscoveryImportUndoPreview, DiscoveryImportUndoResult, MissingCleanupTarget,
-    PreservationFreshness,
+    CollectionItemKey, CollectionReanchor, DiscoveryImportExclusion, DiscoveryImportItem,
+    DiscoveryImportOperation, DiscoveryImportUndoPreview, DiscoveryImportUndoResult,
+    GameCollection, GameCollectionItem, GameCollectionKind, MAX_COLLECTION_NAME_CHARS,
+    MissingCleanupTarget, PreservationFreshness, validate_collection_name,
 };
 
 mod inspector;
