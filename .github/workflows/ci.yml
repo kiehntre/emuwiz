@@ -416,7 +416,10 @@ jobs:
 
   release-artifact:
     name: Create canonical artifact
-    runs-on: ubuntu-latest
+    # Pinned: ubuntu-latest is 26.04 (glibc 2.43), whose binaries do not run on
+    # Ubuntu 24.04 (glibc 2.39). Release binaries must be built on the oldest
+    # supported baseline; scripts/release/check_glibc_compat.py enforces it.
+    runs-on: ubuntu-24.04
     # Keep release qualification observable even when a workspace test fails;
     # the failed validation job still fails CI and blocks merging normally.
     # Installer tests run in parallel rather than first: they share no output
@@ -438,6 +441,10 @@ jobs:
         run: sudo apt-get update && sudo apt-get install -y desktop-file-utils
       - name: Build and internally verify artifact
         run: scripts/build-release.sh --output-dir "$RUNNER_TEMP/release"
+      - name: Check binaries run on Ubuntu 24.04 (glibc 2.39)
+        run: |
+          python3 -I scripts/release/check_glibc_compat.py --max 2.39 \
+            --require bin/emuwiz --require bin/emuwiz-cli "$RUNNER_TEMP/release/"*.tar.xz
       - name: Reject representative malformed artifacts
         run: scripts/test-release-artifact-verifier.sh "$RUNNER_TEMP/release/"*.tar.xz
       - name: Check artifact and binary versions
@@ -458,7 +465,7 @@ jobs:
 
   verify-artifact:
     name: Verify downloaded artifact
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     needs: [classify, release-artifact]
     if: needs.classify.outputs.tier == 'full' || github.event_name != 'pull_request'
     steps:
@@ -473,6 +480,10 @@ jobs:
       - name: Install desktop-file-utils
         run: sudo apt-get update && sudo apt-get install -y desktop-file-utils
       - run: scripts/verify-release-artifact.sh "$RUNNER_TEMP/download/"*.tar.xz
+      - name: Check downloaded binaries run on Ubuntu 24.04 (glibc 2.39)
+        run: |
+          python3 -I scripts/release/check_glibc_compat.py --max 2.39 \
+            --require bin/emuwiz --require bin/emuwiz-cli "$RUNNER_TEMP/download/"*.tar.xz
 
   # The two clean builds run on separate runners, each with the same isolation
   # as before (disposable shared clone, own target, TMPDIR and output root, no
@@ -480,7 +491,7 @@ jobs:
   # unchanged byte-for-byte --archives check of both downloaded outputs.
   reproducibility-build:
     name: Reproducibility build ${{ matrix.run }}
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     needs: [classify, security]
     if: needs.classify.outputs.tier == 'full' || github.event_name != 'pull_request'
     strategy:
@@ -515,6 +526,8 @@ jobs:
           toolchain: "1.97.1"
       - name: Test reproducibility orchestration and archive diagnostics
         run: python3 -B scripts/release/test_release_reproducibility.py
+      - name: Test glibc compatibility checker
+        run: cd scripts/release && python3 -B test_check_glibc_compat.py
       - uses: actions/download-artifact@v5
         with:
           pattern: reproducibility-run*
