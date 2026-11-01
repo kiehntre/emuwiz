@@ -268,6 +268,13 @@ pub(super) fn launch_scroll<R>(
     )
 }
 
+/// What the game page already knows about this entry before readiness runs.
+#[derive(Clone, Copy, Default)]
+pub(super) struct SavedFileFacts {
+    pub catalogue_verified: bool,
+    pub file_missing: bool,
+}
+
 impl NativeWorkflows {
     /// Hand the page's own catalogue row to the launch planner (see
     /// `ArchiveFsApp::catalogued_scummvm_folder`).
@@ -609,7 +616,7 @@ impl NativeWorkflows {
         game_id: i64,
         path: &Path,
         catalogue_identity_report: Option<&archivefs_core::game_identity::GameIdentityReport>,
-        catalogue_verified: bool,
+        saved: SavedFileFacts,
         activity: &mut Activity,
     ) -> Option<Route> {
         self.app.emulator_readiness.flycast_gdi.show(ui, Some(path));
@@ -618,15 +625,18 @@ impl NativeWorkflows {
             .emulator_readiness
             .xroar_cassette
             .show(ui, Some(path));
-        let (summary, input) = self.readiness_projection(
+        let (mut summary, input) = self.readiness_projection(
             ui.ctx(),
             game_id,
             path,
             catalogue_identity_report,
-            catalogue_verified,
+            saved.catalogue_verified,
             true,
             activity,
         );
+        if saved.file_missing {
+            launch_readiness_summary::note_file_missing(&mut summary);
+        }
         let action = launch_readiness_summary::show(ui, &summary);
         launch_readiness_page::show_dolphin_profile_guidance(ui, &input);
         self.show_game_firmware_guidance(ui, game_id, path, &input);
@@ -794,6 +804,26 @@ impl NativeWorkflows {
 
     /// Reuse the same current plan and candidate policy as Launch. Never
     /// substitute an inventory installation or select a different candidate.
+    /// The current readiness answer for the game on screen, for reading only.
+    pub(super) fn readiness_summary(
+        &self,
+        game_id: i64,
+        path: &Path,
+    ) -> Option<launch_readiness_summary::GameReadinessSummary> {
+        if self.selected_game != Some(game_id) || self.selected.as_deref() != Some(path) {
+            return None;
+        }
+        let freshness = if self.readiness_error().is_some() {
+            ReadinessFreshness::Stale
+        } else {
+            ReadinessFreshness::Current
+        };
+        Some(launch_readiness_summary::project(
+            &self.launch_input(),
+            freshness,
+        ))
+    }
+
     pub(super) fn save_state_target(
         &self,
         game_id: i64,

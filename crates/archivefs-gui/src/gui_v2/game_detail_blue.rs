@@ -120,6 +120,18 @@ fn resolved_information_rows(
     rows
 }
 
+/// The region and its source, as Game information would show them.
+pub(super) fn region(
+    game: &Game,
+    index: Option<&super::media_sources::MediaIndex>,
+) -> Option<(String, String)> {
+    let resolved = index.map(|index| index.resolved_for(game));
+    resolved_information_rows(game, resolved.as_deref())
+        .into_iter()
+        .find(|(label, _, _)| *label == "Region")
+        .map(|(_, value, source)| (value, source))
+}
+
 /// Shared explanation used by Game Details and Artwork, Manuals & Extras.
 pub(super) fn metadata_sources(
     ui: &mut egui::Ui,

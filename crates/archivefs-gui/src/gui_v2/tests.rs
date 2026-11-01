@@ -118,6 +118,7 @@ pub(super) fn fixture(context: &egui::Context) -> App {
         arcade_input_details: super::arcade_input_details::State::default(),
         classic_trainers: super::classic_trainers::State::default(),
         recording_integrity: Default::default(),
+        game_detail_facts: Default::default(),
         canonical_organisation: crate::rom_organisation_page::RomOrganisationPageState::default(),
         canonical_organisation_job: None,
         history_view: Default::default(),
@@ -4104,7 +4105,7 @@ fn gui_v2_game_details_show_evidence_section_only_when_the_media_has_evidence() 
     app.router.current = Route::Game(1);
     let deadline = Instant::now() + Duration::from_secs(10);
     let output = loop {
-        let output = frame(&context, &mut app, [1280.0, 1600.0]);
+        let output = frame(&context, &mut app, [1280.0, 2000.0]);
         if !app.document_refresh.stale() {
             break output;
         }
@@ -4829,7 +4830,7 @@ fn gui_v2_selected_dreamcast_game_shows_native_ipbin_boundary() {
     app.library = Arc::new(Library::new(vec![archive(9, "Rez", Some("Dreamcast"))]));
     app.router.current = Route::Game(9);
 
-    let closed = text(&frame(&context, &mut app, [1280.0, 1600.0]));
+    let closed = text(&frame(&context, &mut app, [1280.0, 2000.0]));
     assert!(closed.iter().any(|value| value == "Disc & ROM evidence"));
     assert!(
         !closed
@@ -4841,8 +4842,8 @@ fn gui_v2_selected_dreamcast_game_shows_native_ipbin_boundary() {
             .iter()
             .any(|value| value == "Inspect / refresh IP.BIN")
     );
-    let _ = click_label(&context, &mut app, [1280.0, 1600.0], "Disc & ROM evidence");
-    let strings = scrolled_text(&context, &mut app, [1280.0, 1600.0]);
+    let _ = click_label(&context, &mut app, [1280.0, 2000.0], "Disc & ROM evidence");
+    let strings = scrolled_text(&context, &mut app, [1280.0, 2000.0]);
     assert!(
         strings
             .iter()
@@ -4880,7 +4881,7 @@ fn gui_v2_selected_saturn_game_shows_read_only_disc_manifest_boundary() {
     )]));
     app.router.current = Route::Game(9);
 
-    let closed = text(&frame(&context, &mut app, [1280.0, 1600.0]));
+    let closed = text(&frame(&context, &mut app, [1280.0, 2000.0]));
     assert!(closed.iter().any(|value| value == "Disc & ROM evidence"));
     assert!(!closed.iter().any(|value| value == "Saturn disc layout"));
     let _ = click_label(&context, &mut app, [1280.0, 2600.0], "Disc & ROM evidence");
@@ -11001,6 +11002,7 @@ mod history_page {
 
 mod blue_home_library;
 mod blue_usability;
+mod game_detail_facts;
 mod history_records;
 mod organisation_outcomes;
 mod simple_shell_ui;

@@ -301,7 +301,7 @@ fn blue_launch_and_details_start_cassette_verification() {
                             1,
                             &path,
                             None,
-                            false,
+                            Default::default(),
                             &mut Activity::default(),
                         );
                     } else {

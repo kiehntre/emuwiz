@@ -2850,6 +2850,8 @@ impl App {
                                     ui.vertical(|ui| {
                                         self.detail_heading(ui, &library, game);
                                         ui.add_space(theme::SPACE_SM);
+                                        self.detail_facts(ui, game);
+                                        ui.add_space(theme::SPACE_MD);
                                         self.detail_more(ui, game);
                                     });
                                 });
@@ -2896,6 +2898,9 @@ impl App {
                     self.show_arcade_input_details(ui, game);
                     ui.add_space(theme::SPACE_SM);
                     self.detail_more(ui, game);
+                    // Below Play, so small windows keep it near the title.
+                    ui.add_space(theme::SPACE_MD);
+                    self.detail_facts(ui, game);
                 });
             });
             if blue && super::recording_integrity::eligible(game) {
@@ -2970,6 +2975,39 @@ impl App {
         }
     }
 
+    /// "At a glance": saved facts and the file check, never a Play decision.
+    fn detail_facts(&mut self, ui: &mut egui::Ui, game: &Game) {
+        let id = game.archive.id;
+        let readiness = self
+            .native_workflows
+            .as_ref()
+            .and_then(|workflows| workflows.readiness_summary(id, &game.archive.absolute_path));
+        if readiness.is_none() {
+            // The readiness card selects this game later in the same frame.
+            ui.ctx()
+                .request_repaint_after(std::time::Duration::from_millis(100));
+        }
+        let index = self.artwork.index.as_deref();
+        let region = super::game_detail_blue::region(game, index);
+        let rows = super::game_detail_facts::facts(
+            game,
+            super::game_detail_facts::Sources {
+                detail: self.detail.as_ref().filter(|detail| detail.game == id),
+                detail_failed: self.detail_failed == Some(id),
+                readiness: readiness.as_ref(),
+                region: region
+                    .as_ref()
+                    .map(|(value, source)| (value.as_str(), source.as_str())),
+                region_checked: index.is_some(),
+                discs: self
+                    .game_detail_facts
+                    .discs_for(id, &self.library)
+                    .map(|discs| discs.headline.as_str()),
+            },
+        );
+        super::game_detail_facts::show(ui, game, &rows);
+    }
+
     /// The readiness card (which owns the single primary action), the latest
     /// verification, the identity status and the saved-check notes.
     fn detail_readiness(
@@ -2982,6 +3020,10 @@ impl App {
         let id = game.archive.id;
         // The readiness card owns the single primary action: Play
         // when the game is ready, otherwise the step that fixes it.
+        let file_missing = self
+            .detail
+            .as_ref()
+            .is_some_and(|detail| detail.game == id && !detail.file_present);
         let readiness_route = {
             let workflows = self.native_workflows.get_or_insert_with(|| {
                 super::native_workflows::NativeWorkflows::new(ui.ctx().clone())
@@ -2992,7 +3034,10 @@ impl App {
                 id,
                 &game.archive.absolute_path,
                 game.archive.identity_report.as_ref(),
-                game.dat_exact.is_some(),
+                super::native_workflows::SavedFileFacts {
+                    catalogue_verified: game.dat_exact.is_some(),
+                    file_missing,
+                },
                 &mut self.activity,
             )
         };
@@ -3019,6 +3064,17 @@ impl App {
         if let Some(guidance) = &disc_guidance {
             ui.add_space(theme::SPACE_SM);
             crate::multidisc_launch_view::show_guidance(ui, guidance);
+            let library = self.library.clone();
+            if self.game_detail_facts.note_discs(id, &library, guidance) {
+                ui.ctx().request_repaint();
+            }
+            let links = self
+                .game_detail_facts
+                .discs_for(id, &library)
+                .map_or(&[][..], |discs| &discs.links);
+            if let Some(other) = super::game_detail_facts::show_disc_links(ui, links) {
+                self.go(Route::Game(other));
+            }
         }
         // Amiga format, machine and readiness; links only, never Play.
         if super::amiga_game::machine(game).is_some() {
