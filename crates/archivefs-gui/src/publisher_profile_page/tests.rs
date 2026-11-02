@@ -14,7 +14,7 @@ use archivefs_core::publisher_profile::PublisherActionSafety;
 
 use super::*;
 
-fn elected(name: &str, file: &str) -> ElectedGame {
+pub(super) fn elected(name: &str, file: &str) -> ElectedGame {
     ElectedGame {
         dat_entry_name: name.to_string(),
         family_root_name: name.to_string(),
@@ -31,7 +31,7 @@ fn elected(name: &str, file: &str) -> ElectedGame {
     }
 }
 
-fn plan_with(games: Vec<ElectedGame>) -> PlayingLibraryPlan {
+pub(super) fn plan_with(games: Vec<ElectedGame>) -> PlayingLibraryPlan {
     PlayingLibraryPlan {
         destination_root: PathBuf::from("/source-library"),
         policy: PlayingLibraryPolicy::default(),
@@ -793,7 +793,7 @@ fn clean_rollback_of_real_links_still_reads_rolled_back() {
 }
 
 #[test]
-fn rollback_control_does_not_promise_it_outlasts_this_session() {
+fn rollback_control_says_the_export_stays_undoable_later() {
     use archivefs_core::dat::rename_apply::{EntryState, TransactionState};
     let (mut state, _temp) = recorded_outcome(
         &[EntryState::Applied],
@@ -802,7 +802,7 @@ fn rollback_control_does_not_promise_it_outlasts_this_session() {
     );
     let labels = page_labels(&mut state);
     assert!(
-        labels.contains("available only until you preview again or close EmuWiz"),
+        labels.contains("moves to Exports you can still undo"),
         "{labels}"
     );
 }
@@ -1178,7 +1178,7 @@ fn rendered_labels(output: &egui::FullOutput) -> Vec<(String, egui::Rect)> {
     out
 }
 
-fn page_labels(state: &mut PublisherProfilePageState) -> String {
+pub(super) fn page_labels(state: &mut PublisherProfilePageState) -> String {
     let context = egui::Context::default();
     let screen = egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(1024.0, 2400.0));
     let output = context.run(
@@ -1321,4 +1321,38 @@ fn unsupported_frontend_platform_has_no_apply_path() {
     state.apply_with_journal_dir(&temp.path().join("journal"));
     assert!(!destination.exists());
     assert!(!temp.path().join("journal").exists());
+}
+
+#[test]
+fn result_view_shows_the_journal_based_outcome_badge() {
+    use crate::transaction_outcome::test_support::rendered_text;
+    let temp = tempfile::tempdir().unwrap();
+    let source = temp.path().join("Game.rom");
+    let destination = temp.path().join("published");
+    let journal = temp.path().join("journal");
+    std::fs::write(&source, b"badge source").unwrap();
+    std::fs::create_dir(&destination).unwrap();
+    let mut state = executable_state(&source, &destination);
+    state.link_mode = Some(archivefs_core::publisher_profile::PublisherLinkMode::Hardlink);
+    state.execution_review();
+    state.confirmation_text = state.apply_confirmation_phrase().unwrap();
+    state.apply_with_journal_dir(&journal);
+    let render = |state: &mut PublisherProfilePageState| {
+        let ctx = egui::Context::default();
+        let output = ctx.run(Default::default(), |ctx| {
+            egui::CentralPanel::default().show(ctx, |ui| {
+                show_publisher_profile_page(ui, state);
+            });
+        });
+        rendered_text(&output)
+    };
+    let applied = render(&mut state);
+    assert!(applied.contains("Completed"), "{applied}");
+    assert!(applied.contains("1 applied"), "{applied}");
+    assert!(applied.contains("Undo available now"), "{applied}");
+    state.rollback_confirmation_text = state.rollback_confirmation_phrase().unwrap();
+    state.rollback_with_journal_dir(&journal);
+    let undone = render(&mut state);
+    assert!(undone.contains("Undone"), "{undone}");
+    assert!(!undone.contains("Undo available"), "{undone}");
 }

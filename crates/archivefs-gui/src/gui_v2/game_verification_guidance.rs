@@ -24,11 +24,10 @@ pub(super) enum Action {
 impl Action {
     pub fn label(self) -> &'static str {
         match self {
-            Self::SelectDat => "Select DAT",
-            Self::Validate => "Validate",
-            Self::Audit => "Audit",
-            Self::Recheck => "Re-check",
-            Self::Review => "View evidence",
+            Self::SelectDat | Self::Validate => "Set up verification",
+            Self::Audit => "Verify this game",
+            Self::Recheck => "Re-check this game",
+            Self::Review => "View verification result",
         }
     }
 
@@ -39,6 +38,64 @@ impl Action {
             Self::Review => Route::ReviewIdentity(game.archive.id),
             Self::SelectDat | Self::Audit | Self::Recheck => {
                 super::identity_review_page::setup_verification_route(Some(&game.platform))
+            }
+        }
+    }
+}
+
+/// The plain-language state a normal user sees first. It is derived only from
+/// the existing guidance reason; it never adds a verification conclusion.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) enum Outcome {
+    Verified,
+    NotRecognised,
+    NeedsSetup,
+    /// A compatible catalogue is ready but this game has not been checked yet.
+    NotCheckedYet,
+    NeedsAttention,
+}
+
+impl Outcome {
+    pub(super) fn of(reason: &str) -> Self {
+        match reason {
+            "Verified" => Self::Verified,
+            "No catalogue match" => Self::NotRecognised,
+            "Audit not yet performed" => Self::NotCheckedYet,
+            "No trusted DAT configured"
+            | "Configured DAT unavailable or disabled"
+            | "Catalogue does not cover this system"
+            | "Catalogue system coverage unresolved"
+            | "Catalogue selection required"
+            | "Catalogue not validated or unavailable"
+            | "Catalogue status unavailable" => Self::NeedsSetup,
+            _ => Self::NeedsAttention,
+        }
+    }
+
+    pub(super) fn headline(self) -> &'static str {
+        match self {
+            Self::Verified => "Verified",
+            Self::NotRecognised => "Not recognised",
+            Self::NeedsSetup => "Needs setup",
+            Self::NotCheckedYet => "Not checked yet",
+            Self::NeedsAttention => "Needs attention",
+        }
+    }
+
+    pub(super) fn next_step(self) -> &'static str {
+        match self {
+            Self::Verified => "This game's identity matched a trusted catalogue.",
+            Self::NotRecognised => {
+                "The trusted catalogue for this system did not list this file. That does not mean the file is damaged."
+            }
+            Self::NeedsSetup => {
+                "EmuWiz needs a trusted catalogue for this system before it can check this game."
+            }
+            Self::NotCheckedYet => {
+                "A trusted catalogue is ready. You can preview and then confirm a read-only check."
+            }
+            Self::NeedsAttention => {
+                "Something about this game's saved check needs a second look before it can be relied on."
             }
         }
     }
@@ -419,13 +476,20 @@ impl super::App {
 }
 
 fn show(ui: &mut eframe::egui::Ui, guidance: &Guidance) -> bool {
-    ui.strong(format!("DAT: {}", guidance.reason));
-    ui.label(&guidance.explanation);
+    let outcome = Outcome::of(guidance.reason);
+    ui.strong(format!("Verification: {}", outcome.headline()));
+    ui.label(outcome.next_step());
     let clicked = ui.button(guidance.action.label()).clicked();
     ui.small(match guidance.action {
-            Action::Validate => "Opens DATs & Verification. Validate the catalogue there.",
-            Action::Review => "Opens this game's saved evidence.",
-            _ => "Opens verification for this system. Choose a DAT and review the preview before starting an audit.",
-        });
+        Action::Review => "Opens this game's saved result.",
+        _ => "You will see a preview first. Nothing is checked until you confirm.",
+    });
+    ui.small(
+        "Verification is about this game's identity. Whether it can launch is shown separately under Launch readiness.",
+    );
+    ui.collapsing("Technical details", |ui| {
+        ui.strong(format!("DAT: {}", guidance.reason));
+        ui.label(&guidance.explanation);
+    });
     clicked
 }

@@ -59,7 +59,8 @@
 #   * explicit --low-debug / --full-debug: used, and recorded (a change is announced);
 #   * a recorded low mode is reused;
 #   * a target with no compiler output to keep gets low-debug, recorded. That is
-#     decided only by `emuwiz-cargo-maintain worktree-check` saying CLEAR: a new
+#     decided only by `emuwiz-cargo-maintain worktree-check --cargo-state-only`
+#     saying CLEAR (the checkout's Git state has no bearing on the cache): a new
 #     target, or one retired with a verified receipt (its preserved evidence stays).
 #     Anything else (HOLD, an error, the tool missing) fails closed to the next rule;
 #   * otherwise a recorded full mode is reused, and an existing target from before
@@ -171,13 +172,13 @@ if [ -e "$mode_file" ] || [ -L "$mode_file" ]; then
   recorded=$(cat -- "$mode_file" 2>/dev/null) || recorded="<unreadable>"
   case "$recorded" in low|full) ;; *) recorded="invalid:$recorded" ;; esac
 fi
-# CLEAR from the retirement gate is the only proof that no compiler output would be
+# CLEAR from the retirement gate's Cargo half is the only proof that no compiler output would be
 # duplicated by a profile change. Read-only; skipped when the answer cannot matter.
 fresh=0
 fresh_why=""
 if [ -z "$debug_choice" ] && [ "$recorded" != low ] && [ "${recorded#invalid:}" = "$recorded" ] &&
    [ -f "$maintain" ] && command -v python3 >/dev/null 2>&1 &&
-   python3 -I "$maintain" worktree-check "$top" >/dev/null 2>&1; then
+   python3 -I "$maintain" worktree-check --cargo-state-only "$top" >/dev/null 2>&1; then
   fresh=1
   [ -n "$recorded" ] && fresh_why=" after verified retirement" || fresh_why=""
 fi

@@ -66,6 +66,7 @@ pub mod es_de;
 pub mod execution;
 pub mod model;
 pub mod planner;
+pub mod recovery;
 pub mod romm;
 
 pub use execution::{

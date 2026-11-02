@@ -1229,6 +1229,13 @@ fn candidate_state_label(plan: &LocalModPackagePlan) -> &'static str {
 /// with no written journal. This is what gates the Undo control for every
 /// status: on `Failed` no entry ever qualifies, on `PartialFailure` only the
 /// subset that genuinely changed does.
+fn show_applied_summary(ui: &mut egui::Ui, result: &SharedApplyResult) {
+    let presentation = apply_presentation(result.journal.status);
+    widgets::status_badge(ui, presentation.headline, presentation.tone);
+    ui.label(presentation.detail);
+    crate::shared_apply_warnings::show(ui, &crate::shared_apply_warnings::lines(result));
+}
+
 fn has_restorable_changes(result: &SharedApplyResult) -> bool {
     result.journal_path.is_some()
         && result.journal.entries.iter().any(|entry| {
@@ -1651,11 +1658,9 @@ pub(crate) fn show_local_mod_package_panel_with_evidence(
             state.stage = Some(Stage::Applying(receiver, plan));
         }
         Stage::Applied(result) => {
-            let presentation = apply_presentation(result.journal.status);
             let can_undo = has_restorable_changes(&result);
             widgets::card(ui, |ui| {
-                widgets::status_badge(ui, presentation.headline, presentation.tone);
-                ui.label(presentation.detail);
+                show_applied_summary(ui, &result);
                 if can_undo
                     && let Some(journal) = result.journal_path.as_ref()
                     && widgets::action_button(
@@ -2037,6 +2042,15 @@ mod tests {
             },
             rom_hack: None,
         }
+    }
+
+    #[test]
+    fn apply_result_shows_shared_transaction_warnings() {
+        use crate::shared_apply_warnings::test_support::{
+            assert_shows_warning, render, warned_result,
+        };
+        let result = warned_result();
+        assert_shows_warning(&render(|ui| show_applied_summary(ui, &result)));
     }
 
     #[test]

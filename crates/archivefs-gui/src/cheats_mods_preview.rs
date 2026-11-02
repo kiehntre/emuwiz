@@ -1425,6 +1425,10 @@ pub(crate) fn show_shared_transaction_readiness(
                         "s"
                     }
                 ));
+                crate::shared_apply_warnings::show(
+                    ui,
+                    &crate::shared_apply_warnings::lines(result),
+                );
                 if let Some(report) = loadability {
                     show_cheat_loadability(ui, report);
                 }

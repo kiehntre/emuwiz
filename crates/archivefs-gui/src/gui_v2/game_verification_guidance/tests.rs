@@ -379,11 +379,25 @@ fn guidance_rendering_names_the_reason_and_navigation_action() {
         gather(&shape.shape, &mut texts);
     }
     assert!(
-        texts.iter().any(|t| t == "DAT: Audit not yet performed"),
+        texts.iter().any(|t| t == "Verification: Not checked yet"),
         "{texts:?}"
     );
-    assert!(texts.iter().any(|t| t == "Audit"));
-    assert!(!texts.iter().any(|t| t == "Verified"));
+    assert!(texts.iter().any(|t| t == "Verify this game"));
+    assert!(texts.iter().any(|t| t == "Technical details"));
+    // Catalogue details stay behind the collapsed section, and a ready
+    // catalogue is never presented as a verified game.
+    assert!(!texts.iter().any(|t| t.contains("Audit not yet performed")));
+    assert!(
+        !texts
+            .iter()
+            .any(|t| t.starts_with("Verification: Verified"))
+    );
+    assert!(
+        texts
+            .iter()
+            .any(|t| t.contains("Whether it can launch is shown separately")),
+        "{texts:?}"
+    );
 }
 
 #[test]
@@ -433,7 +447,7 @@ fn clicking_the_guidance_action_only_requests_the_existing_platform_route() {
     let output = frame(vec![]);
     fn find(shape: &egui::Shape) -> Option<egui::Pos2> {
         match shape {
-            egui::Shape::Text(t) if t.galley.text() == "Audit" => {
+            egui::Shape::Text(t) if t.galley.text() == "Verify this game" => {
                 Some(t.pos + t.galley.size() / 2.0)
             }
             egui::Shape::Vec(shapes) => shapes.iter().find_map(find),
@@ -443,7 +457,7 @@ fn clicking_the_guidance_action_only_requests_the_existing_platform_route() {
     for shape in output.shapes {
         button = button.or_else(|| find(&shape.shape));
     }
-    let position = button.expect("Audit button must be rendered");
+    let position = button.expect("Verify button must be rendered");
     let _ = frame(vec![
         egui::Event::PointerMoved(position),
         egui::Event::PointerButton {
@@ -643,4 +657,75 @@ fn configuration_coverage_and_unattempted_check_are_distinct_without_changing_id
         .reason,
         "No catalogue match"
     );
+}
+
+#[test]
+fn every_guidance_reason_maps_to_one_plain_outcome_without_inventing_verification() {
+    for (reason, outcome) in [
+        ("Verified", Outcome::Verified),
+        ("No catalogue match", Outcome::NotRecognised),
+        ("Audit not yet performed", Outcome::NotCheckedYet),
+        ("No trusted DAT configured", Outcome::NeedsSetup),
+        (
+            "Configured DAT unavailable or disabled",
+            Outcome::NeedsSetup,
+        ),
+        ("Catalogue does not cover this system", Outcome::NeedsSetup),
+        ("Catalogue system coverage unresolved", Outcome::NeedsSetup),
+        ("Catalogue selection required", Outcome::NeedsSetup),
+        (
+            "Catalogue not validated or unavailable",
+            Outcome::NeedsSetup,
+        ),
+        ("Catalogue status unavailable", Outcome::NeedsSetup),
+        ("File evidence stale or changed", Outcome::NeedsAttention),
+        ("Audit needs review", Outcome::NeedsAttention),
+        ("Audit has no usable exact result", Outcome::NeedsAttention),
+        (
+            "Saved exact match; freshness needs checking",
+            Outcome::NeedsAttention,
+        ),
+        (
+            "File format unsupported for exact verification",
+            Outcome::NeedsAttention,
+        ),
+        ("Verification evidence unavailable", Outcome::NeedsAttention),
+        ("a reason added later", Outcome::NeedsAttention),
+    ] {
+        assert_eq!(Outcome::of(reason), outcome, "{reason}");
+    }
+}
+
+#[test]
+fn a_ready_catalogue_or_missing_setup_is_never_shown_as_verified() {
+    let f = fixture("PS1", "cue");
+    let ready = explain(
+        &f.game,
+        true,
+        true,
+        0,
+        DatProvenanceFreshness::Unknown,
+        Ok(&f.catalogues),
+        None,
+    );
+    assert_eq!(Outcome::of(ready.reason), Outcome::NotCheckedYet);
+    let none = explain(
+        &f.game,
+        true,
+        true,
+        0,
+        DatProvenanceFreshness::Unknown,
+        Ok(&[]),
+        None,
+    );
+    assert_eq!(Outcome::of(none.reason), Outcome::NeedsSetup);
+    assert_eq!(none.action.label(), "Set up verification");
+    for outcome in [
+        Outcome::NotCheckedYet,
+        Outcome::NeedsSetup,
+        Outcome::NeedsAttention,
+        Outcome::NotRecognised,
+    ] {
+        assert_ne!(outcome.headline(), "Verified");
+    }
 }

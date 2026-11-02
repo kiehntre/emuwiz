@@ -2226,6 +2226,13 @@ pub(crate) fn show_playing_library_page_with_busy(
                 ))
                 .strong(),
             );
+            // Same condition as the Undo button in this card.
+            crate::transaction_outcome::show(
+                ui,
+                transaction,
+                transaction.applied_count() > 0
+                    && transaction.state != TransactionState::RolledBack,
+            );
             ui.label("Original ROM data copied: 0 bytes. Link metadata uses filesystem space.");
             if transaction.state == TransactionState::RolledBack {
                 let retained = transaction

@@ -42,6 +42,7 @@ enum Stage {
     },
     Applied {
         result: SharedApplyResult,
+        warnings: Vec<String>,
         destination: PathBuf,
     },
     RollbackPreview {
@@ -144,8 +145,13 @@ impl Pcsx2TextureModPageState {
                 destination,
             } => match receiver.try_recv() {
                 Ok(Ok(result)) => {
+                    let warnings = crate::shared_apply_warnings::lines_after_rollback(
+                        &result.apply,
+                        result.rollback.as_ref(),
+                    );
                     self.stage = Some(Stage::Applied {
                         result: result.apply,
+                        warnings,
                         destination,
                     });
                     true
@@ -204,6 +210,11 @@ fn now() -> u64 {
         .duration_since(UNIX_EPOCH)
         .map(|d| d.as_secs())
         .unwrap_or(0)
+}
+
+fn show_applied_summary(ui: &mut egui::Ui, warnings: &[String]) {
+    widgets::status_badge(ui, "Installed", widgets::StatusTone::Success);
+    crate::shared_apply_warnings::show(ui, warnings);
 }
 
 pub(crate) fn show_pcsx2_texture_mod_panel(
@@ -292,9 +303,10 @@ pub(crate) fn show_pcsx2_texture_mod_panel(
             }
             Some(Stage::Applied {
                 result,
+                warnings,
                 destination,
             }) => {
-                widgets::status_badge(ui, "Installed", widgets::StatusTone::Success);
+                show_applied_summary(ui, &warnings);
                 if let Some(journal) = result.journal_path.clone() {
                     if widgets::action_button(ui, "Undo", widgets::ActionStyle::Destructive, true)
                         .clicked()
@@ -318,6 +330,7 @@ pub(crate) fn show_pcsx2_texture_mod_panel(
                     } else {
                         state.stage = Some(Stage::Applied {
                             result,
+                            warnings,
                             destination,
                         });
                     }
@@ -325,6 +338,7 @@ pub(crate) fn show_pcsx2_texture_mod_panel(
                 } else {
                     state.stage = Some(Stage::Applied {
                         result,
+                        warnings,
                         destination,
                     });
                 }
@@ -415,4 +429,56 @@ fn spawn_rollback(preview: SharedRollbackPreview) -> Stage {
         let _ = sender.send(result);
     });
     Stage::RollingBack(receiver)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::shared_apply_warnings::test_support::*;
+
+    fn warnings_after(
+        apply: SharedApplyResult,
+        rollback: Option<SharedRollbackResult>,
+    ) -> Vec<String> {
+        let (sender, receiver) = mpsc::channel();
+        sender
+            .send(Ok(Pcsx2TexturePackApplyResult { apply, rollback }))
+            .unwrap();
+        let mut state = Pcsx2TextureModPageState {
+            stage: Some(Stage::Applying {
+                receiver,
+                destination: PathBuf::from("/disposable/destination"),
+            }),
+            ..Default::default()
+        };
+        assert!(state.poll());
+        let Some(Stage::Applied { warnings, .. }) = state.stage.take() else {
+            panic!("expected the applied stage");
+        };
+        warnings
+    }
+
+    #[test]
+    fn apply_result_shows_shared_transaction_warnings() {
+        let warnings = warnings_after(warned_result(), None);
+        assert_shows_warning(&render(|ui| show_applied_summary(ui, &warnings)));
+    }
+
+    #[test]
+    fn warning_text_follows_a_successful_rollback() {
+        let warnings = warnings_after(partly_failed_result(), Some(succeeded_rollback()));
+        assert_rollback_succeeded(&render(|ui| show_applied_summary(ui, &warnings)));
+    }
+
+    #[test]
+    fn warning_text_follows_a_failed_rollback() {
+        let warnings = warnings_after(partly_failed_result(), Some(failed_rollback()));
+        assert_rollback_failed(&render(|ui| show_applied_summary(ui, &warnings)));
+    }
+
+    #[test]
+    fn warning_text_says_when_no_rollback_ran() {
+        let warnings = warnings_after(partly_failed_result(), None);
+        assert_rollback_did_not_run(&render(|ui| show_applied_summary(ui, &warnings)));
+    }
 }

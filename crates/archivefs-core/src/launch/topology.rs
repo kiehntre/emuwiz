@@ -19,6 +19,7 @@ pub type MediaTopologyActionSafety = ActionSafety;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct MediaTopologyMissingMedia {
+    pub number: u16,
     pub expected_count: Option<u16>,
     pub expected_unit: Option<String>,
     pub detail: String,
@@ -79,6 +80,7 @@ fn missing_media(set: &MediaSet) -> Vec<MediaTopologyMissingMedia> {
     (1..=expected.count)
         .filter(|number| !observed.contains(number))
         .map(|number| MediaTopologyMissingMedia {
+            number,
             expected_count: Some(expected.count),
             expected_unit: Some(format!("{:?}", expected.unit)),
             detail: format!("required {:?} {} is missing", expected.unit, number),

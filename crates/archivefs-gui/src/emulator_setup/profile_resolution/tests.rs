@@ -644,11 +644,14 @@ mod launch {
 
     #[test]
     fn no_legacy_duckstation_discovery_remains_in_the_launch_input_builder() {
-        let source = include_str!("../controller.rs");
+        // The builder lives in readiness_input.rs; the controller must not
+        // grow its own discovery either.
+        let builder = include_str!("../readiness_input.rs");
+        let source = [include_str!("../controller.rs"), builder].join("\n");
         assert!(
             !source.contains("discover_duckstation_profiles("),
             "Launch must obtain DuckStation profiles only through select_for_launch"
         );
-        assert!(source.contains("select_for_launch("));
+        assert!(builder.contains("select_for_launch("));
     }
 }

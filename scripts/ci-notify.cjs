@@ -12,7 +12,7 @@ const ALWAYS = [
   'DOSBox sandbox enforcement (ubuntu-latest)',
 ];
 const FULL = [
-  'Installer script tests', 'Create canonical artifact', 'Verify downloaded artifact',
+  'Installer script tests', 'Maintenance script tests', 'Create canonical artifact', 'Verify downloaded artifact',
   'Reproducibility build 1', 'Reproducibility build 2', 'Reproducibility',
 ];
 const UNEXPANDED_BUILD = 'Reproducibility build ${{ matrix.run }}';
@@ -31,7 +31,7 @@ function decide({runs, jobs, tier, checks, statuses, mergeable, mergeStateStatus
       checks.some(c => c.status !== 'completed') ||
       statuses.some(s => s.state === 'pending')) return {status: 'PENDING'};
 
-  const shards = tier === 'gui' ? ['all'] : ['recovery', 'dat', 'gui-v2', 'rest'];
+  const shards = tier === 'gui' ? ['gui-tier-v2', 'gui-tier-other'] : ['recovery', 'dat', 'gui-v2', 'rest'];
   const ciJobs = jobs.filter(j => j.run_id === runs[0].id);
   const classifiedFast = (tier === 'core' || tier === 'gui') && ciJobs.some(j =>
     j.name === 'Classify change risk' && j.conclusion === 'success');
@@ -60,7 +60,7 @@ function decide({runs, jobs, tier, checks, statuses, mergeable, mergeStateStatus
       problems.push({name: `${runs[i].name}: ${runs[i].conclusion}`, url: runs[i].html_url});
     }
   }
-  // Only the six existing full-tier jobs may skip, only on core/gui PRs,
+  // Only the seven full-tier jobs may skip, only on core/gui PRs,
   // and only when classification itself succeeded. Never allowlist by name alone.
   const expectedSkip = j => classifiedFast && j.run_id === runs[0].id &&
     (FULL.includes(j.name) || (collapsedBuilds && j.name === UNEXPANDED_BUILD));

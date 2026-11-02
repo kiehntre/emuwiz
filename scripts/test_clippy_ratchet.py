@@ -158,7 +158,7 @@ class WorkflowConditionTests(unittest.TestCase):
         ext4 = re.search(r"(?ms)^      - name: Create qualified disposable ext4.*?(?=^      - )", validation).group(0)
         self.assertNotRegex(ext4, r"(?m)^        if:")
         self.assertIn('echo "TMPDIR=$mnt" >> "$GITHUB_ENV"', ext4)
-        for job in ["install-script-tests", "release-artifact", "verify-artifact", "reproducibility-build",
+        for job in ["install-script-tests", "maintenance-script-tests", "release-artifact", "verify-artifact", "reproducibility-build",
                     "reproducibility"]:
             with self.subTest(job=job):
                 self.assertIn("if: needs.classify.outputs.tier == 'full' || github.event_name != 'pull_request'",
@@ -172,6 +172,23 @@ class WorkflowConditionTests(unittest.TestCase):
         self.assertIn("python3 -B scripts/test_ci_test_shards.py", coverage)
         self.assertIn('python3 -I scripts/ci_test_shards.py check "$RUNNER_TEMP/test-shard-lists"', coverage)
         self.assertIn("SHARDS: ${{ needs.classify.outputs.shards }}", coverage)
+
+    def test_maintenance_safety_tests_run_with_real_root_on_the_supported_python(self) -> None:
+        job = job_block(self.workflow, "maintenance-script-tests")
+        self.assertIn("runs-on: ubuntu-24.04", job)
+        self.assertIn("run: scripts/ci-maintenance-tests.sh", job)
+        self.assertNotIn("continue-on-error", job)
+        script = (ROOT / "scripts" / "ci-maintenance-tests.sh").read_text(encoding="utf-8")
+        self.assertIn("for test in scripts/test_emuwiz_*.py; do", script)  # a glob: new files are included
+        self.assertIn("sudo -n true ||", script)
+        self.assertIn("grep -qx 'OK (skipped=1)'", script)
+        self.assertNotIn("EMUWIZ_TEST_SYSTEMD=", script)
+        # Changing any of these tests or tools must select the tier that runs them.
+        for path in ("scripts/emuwiz-cargo-retire", "scripts/test_emuwiz_cargo_retire.py",
+                     "scripts/ci-maintenance-tests.sh", ".github/workflows/ci.yml"):
+            tier = subprocess.run(["bash", str(ROOT / "scripts" / "classify-ci-changes.sh"), path],
+                                  capture_output=True, text=True, check=True).stdout.strip()
+            self.assertEqual(tier, "full", path)
 
     def test_reproducibility_builds_twice_independently_and_compares_bytes(self) -> None:
         build = job_block(self.workflow, "reproducibility-build")

@@ -89,9 +89,31 @@ pub(super) struct BrowsePlayState {
     /// The readiness view of `indices`, rebuilt only when the base list or
     /// the cache changes: (base list address, cache version, filter, result).
     readiness_view: Option<ReadinessView>,
+    /// Background checks for the games on screen.
+    background: super::bg_readiness::Scheduler,
+    /// The emulator-state snapshot the background checks run against, and the
+    /// signature it was taken at; a different signature invalidates both.
+    env: Option<(u64, super::bg_readiness::EnvSnapshot)>,
+    env_signature: Option<u64>,
+    /// The library snapshot generation the settled decisions were made at.
+    database_generation: Option<u64>,
+    /// Ids drawn this frame / last frame, nearest the top first.
+    visible_now: Vec<i64>,
+    visible: Vec<i64>,
 }
 
 impl BrowsePlayState {
+    /// The library snapshot generation moved: a rescan may have added a disc
+    /// set or changed what a game belongs to, so every earlier answer (cached
+    /// or settled) is dropped. Foreground answers re-record as games are drawn.
+    fn note_database_generation(&mut self, generation: Option<u64>) {
+        if self.database_generation != generation {
+            self.database_generation = generation;
+            self.background.invalidate();
+            self.readiness.clear();
+        }
+    }
+
     /// Seconds still to wait before `game`'s readiness check may start.
     fn settle_remaining(&mut self, game: i64, now: f64) -> f64 {
         let since = match self.settling {
@@ -109,6 +131,12 @@ impl BrowsePlayState {
 impl BrowsePlayState {
     pub(super) fn reset_scroll_pending(&self) -> bool {
         self.reset_scroll
+    }
+    pub(super) fn note_generation_for_test(&mut self, generation: Option<u64>) {
+        self.note_database_generation(generation);
+    }
+    pub(super) fn is_ready_for_test(&self, game: &Game) -> bool {
+        self.readiness.get(game).is_some()
     }
     pub(super) fn record_readiness(&mut self, game: &Game, result: Option<CheckedReadiness>) {
         self.readiness.record(game, result);
@@ -337,6 +365,8 @@ impl App {
         ui.add_space(theme::SPACE_XS);
         self.browse_play_systems(ui, &library);
         let indices = self.browse_play_indices();
+        let blue = theme::blue_profile(ui);
+        self.browse_play_background(ui.ctx(), blue);
         ui.add_space(theme::SPACE_XS);
         ui.separator();
 
@@ -492,6 +522,7 @@ impl App {
             {
                 // A different catalogue: earlier answers no longer describe it.
                 self.browse_play.readiness.clear();
+                self.browse_play.background.invalidate();
             }
             self.browse_play.key = Some(key);
             self.browse_play.library_token = Arc::downgrade(&self.library);
@@ -532,6 +563,67 @@ impl App {
         ));
         self.browse_play.readiness_view = Some((token, version, filter, view.clone()));
         view
+    }
+
+    /// Keep the background readiness checks in step with what is on screen.
+    /// Blue only. Never selects a game, loads evidence for the details panel,
+    /// or starts any scan; it waits until the foreground has finished them.
+    fn browse_play_background(&mut self, context: &egui::Context, blue: bool) {
+        if !blue {
+            return;
+        }
+        let state = &mut self.browse_play;
+        // The library snapshot (and so every disc-set decision) changed: games
+        // held back for want of it are looked at again.
+        let generation = self
+            .native_workflows
+            .as_ref()
+            .map(|w| w.database_generation());
+        state.note_database_generation(generation);
+        // What the checks read changed (emulator scans, settings): drop
+        // everything decided under the old state.
+        // Until a game has been selected once, no scan has run and there is
+        // nothing to check against.
+        let readiness = self
+            .native_workflows
+            .as_ref()
+            .map(|w| w.emulator_readiness());
+        let signature = readiness.and_then(super::bg_readiness::EnvSnapshot::signature);
+        if state.env_signature != signature {
+            state.env_signature = signature;
+            state.background.invalidate();
+            state.readiness.clear();
+            state.env =
+                signature.zip(readiness.and_then(super::bg_readiness::EnvSnapshot::capture));
+        }
+        for (id, outcome) in state.background.drain() {
+            if let Some(game) = self.library.game(id) {
+                super::bg_readiness::record_outcome(&mut state.readiness, game, outcome);
+            }
+        }
+        // The games drawn last frame, in order and without repeats.
+        state.visible = std::mem::take(&mut state.visible_now);
+        state.visible.dedup();
+        let Some((_, env)) = &state.env else {
+            return;
+        };
+        let jobs = state.background.pick(
+            state.visible.iter().filter_map(|id| self.library.game(*id)),
+            |game| state.readiness.get(game).is_some(),
+        );
+        for mut job in jobs {
+            // Fail closed: with no workflows or no library snapshot the disc
+            // set context is unknown, so the game is not answered (yet).
+            job.multidisc = self
+                .native_workflows
+                .as_ref()
+                .is_none_or(|w| w.has_multidisc_context(&job.archive.absolute_path));
+            if job.multidisc {
+                state.background.settle(job.id);
+                continue;
+            }
+            state.background.spawn(env, job, context.clone());
+        }
     }
 
     fn browse_play_toolbar(&mut self, ui: &mut egui::Ui) {
@@ -642,6 +734,7 @@ impl App {
                 self.filter.readiness,
                 self.browse_play.readiness.len(),
                 self.library.games.len(),
+                self.browse_play.background.in_flight() > 0,
             )
         {
             ui.add(
@@ -984,6 +1077,7 @@ impl App {
         note: &mut Option<String>,
     ) {
         let id = game.archive.id;
+        self.browse_play.visible_now.push(id);
         ui.push_id(("v2_browse_play_game", id), |ui| {
             let (rect, response) =
                 ui.allocate_exact_size(egui::vec2(card_width, CARD_HEIGHT), egui::Sense::click());
@@ -1064,6 +1158,7 @@ impl App {
         note: &mut Option<String>,
     ) {
         let id = game.archive.id;
+        self.browse_play.visible_now.push(id);
         ui.push_id(("v2_browse_play_game", id), |ui| {
             let (rect, response) = ui.allocate_exact_size(
                 egui::vec2(ui.available_width(), LIST_ROW_HEIGHT - 8.0),
@@ -1322,17 +1417,9 @@ impl App {
                 )
             };
             {
-                use super::launch_readiness_summary::ReadinessPresentationState as State;
                 // Only a finished, current answer is kept; checking, stale
                 // and partial answers leave the game Not checked.
-                let result = if view.pending || view.spinner {
-                    None
-                } else {
-                    Some(match view.tone {
-                        State::Ready | State::ReadyWithWarnings => CheckedReadiness::Ready,
-                        _ => CheckedReadiness::NotReady(view.badge),
-                    })
-                };
+                let result = CheckedReadiness::from_compact(&view);
                 this.browse_play.readiness.record(game, result);
             }
             let rows = if tight { 2 } else { 3 };
@@ -1429,9 +1516,20 @@ fn readiness_filter_hint(filter: ReadinessFilter) -> &'static str {
 /// Said under every readiness view that could be mistaken for a verdict on
 /// the whole library. Launch checks run for the game you select, so nothing
 /// here has assessed every game.
-fn readiness_filter_note(filter: ReadinessFilter, checked: usize, total: usize) -> Option<String> {
-    let progress =
-        format!("{checked} of {total} games checked so far. A game is checked when you select it.");
+fn readiness_filter_note(
+    filter: ReadinessFilter,
+    checked: usize,
+    total: usize,
+    checking: bool,
+) -> Option<String> {
+    let progress = format!(
+        "{checked} of {total} games checked so far. A game is checked when you select it, and most systems are also checked in the background as they scroll into view."
+    );
+    let progress = if checking {
+        format!("{progress} Checking more now…")
+    } else {
+        progress
+    };
     match filter {
         ReadinessFilter::All => None,
         ReadinessFilter::Ready => Some(format!(

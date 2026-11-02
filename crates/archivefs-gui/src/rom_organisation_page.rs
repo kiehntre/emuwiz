@@ -1935,6 +1935,15 @@ fn show_rom_organisation_page_with_options(
             widgets::StatusTone::Warning
         };
         widgets::banner(ui, "Result", message, tone);
+        if let Some(transaction) = state.applied() {
+            // Same condition as the Undo button below.
+            crate::transaction_outcome::show(
+                ui,
+                transaction,
+                !state.advanced_r2_selected
+                    && archivefs_core::dat::rom_organisation::undo_blocker(transaction).is_none(),
+            );
+        }
         if quick_only && let Some(transaction) = state.applied() {
             ui.label(format!("Renamed: {}", transaction.applied_count()));
             ui.label(format!("Skipped: {}", transaction.skipped_count()));
@@ -2640,6 +2649,42 @@ mod tests {
         assert!(!complete, "{message}");
         assert!(message.starts_with("Partly applied"), "{message}");
         assert!(message.contains("2 skipped"), "{message}");
+    }
+
+    #[test]
+    fn result_view_shows_the_journal_based_outcome_badge() {
+        use crate::transaction_outcome::test_support::{journal, rendered_text};
+        use archivefs_core::dat::rename_apply::model::{EntryState, TransactionState};
+        let render = |transaction| {
+            let mut state = RomOrganisationPageState {
+                applied: Some(transaction),
+                result_message: Some("result".into()),
+                result_complete: true,
+                ..RomOrganisationPageState::default()
+            };
+            let ctx = egui::Context::default();
+            let output = ctx.run(Default::default(), |ctx| {
+                egui::CentralPanel::default().show(ctx, |ui| {
+                    show_rom_organisation_page(ui, &mut state);
+                });
+            });
+            rendered_text(&output)
+        };
+        let done = render(journal(
+            TransactionState::Applied,
+            &[EntryState::Applied, EntryState::Applied],
+            &[],
+        ));
+        assert!(done.contains("Completed"), "{done}");
+        assert!(done.contains("2 applied"), "{done}");
+        assert!(done.contains("Undo available now"), "{done}");
+        let partly = render(journal(
+            TransactionState::Applied,
+            &[EntryState::Applied, EntryState::Skipped],
+            &[],
+        ));
+        assert!(partly.contains("Partially completed"), "{partly}");
+        assert!(!partly.contains("Completed\n"), "{partly}");
     }
 
     #[test]

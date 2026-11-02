@@ -8,7 +8,7 @@ function fixture(tier = 'full') {
   const runs = [1, 2].map(id => ({id, name: id === 1 ? 'CI' : 'CodeQL',
     status: 'completed', conclusion: 'success', head_sha: sha,
     html_url: `https://github.com/o/r/actions/runs/${id}`}));
-  const shards = tier === 'gui' ? ['all'] : ['recovery', 'dat', 'gui-v2', 'rest'];
+  const shards = tier === 'gui' ? ['gui-tier-v2', 'gui-tier-other'] : ['recovery', 'dat', 'gui-v2', 'rest'];
   const names = [[...ALWAYS, ...FULL, ...shards.map(s => `Formatting and relevant tests (${s})`)], ANALYZE];
   const jobs = names.flatMap((group, i) => group.map((name, k) => ({name, run_id: i + 1,
     status: 'completed', conclusion: tier !== 'full' && FULL.includes(name) ? 'skipped' : 'success',

@@ -726,9 +726,17 @@ fn featured_retroarch_launch_action(
 
     let display = launch_state.display_for(request);
     launch_readiness_page::show_retroarch_launch_feedback(ui, &display);
+    launch_state.show_stop_control(ui);
     // Integration: the executor state machine, polling and running/closed/
     // error presentation are 934c9ec's; the plain beginner label is
     // 1c825e7's (`GAMER_PLAY_LABEL`).
+    if matches!(display, RetroArchLaunchDisplay::Idle)
+        && launch_state.blocked_by_other_launch(request)
+    {
+        featured_primary_button(ui, GAMER_PLAY_LABEL, false);
+        ui.small(launch_readiness_page::RETROARCH_BUSY_HINT);
+        return false;
+    }
     match display {
         RetroArchLaunchDisplay::Idle
         | RetroArchLaunchDisplay::Exited { .. }
@@ -2765,5 +2773,68 @@ mod game_metadata_enrichment_tests {
             });
             assert!(rendered_text_contains(&output, "Update game information"));
         }
+    }
+}
+
+#[cfg(test)]
+mod retroarch_one_launch_tests {
+    use super::*;
+    use archivefs_core::emulator_environment::retroarch::{ProfileKind, ProfileRef, ProfileScope};
+    use archivefs_core::launch::RetroArchLaunchRequest;
+
+    fn request(path: &str) -> RetroArchLaunchRequest {
+        RetroArchLaunchRequest {
+            selected_content_path: path.into(),
+            expected_platform_id: "PSX".into(),
+            expected_game_key: "a".repeat(64),
+            profile: ProfileRef {
+                profile_kind: ProfileKind::Native,
+                scope: ProfileScope::User,
+            },
+            core_stem: "mednafen_psx_hw".into(),
+            saturn_core_selection: None,
+            expected_snapshot_evidence: None,
+            expected_appimage_executable: None,
+            expected_executable_binding: None,
+            expected_configuration_file: None,
+        }
+    }
+
+    fn texts(output: &egui::FullOutput) -> String {
+        format!("{:?}", output.shapes)
+    }
+
+    #[test]
+    fn gamer_play_is_disabled_with_a_hint_while_another_game_is_launching() {
+        let mut state = launch_readiness_page::RetroArchLaunchState::default();
+        let _keep_open = state.track_starting_for_test(&request("/library/GameA.bin"));
+        assert!(state.is_active());
+        let other = request("/library/GameB.bin");
+        let ctx = egui::Context::default();
+        let mut clicked = true;
+        let output = ctx.run(egui::RawInput::default(), |ctx| {
+            egui::CentralPanel::default().show(ctx, |ui| {
+                clicked = featured_retroarch_launch_action(ui, &mut state, &other, true);
+            });
+        });
+        assert!(!clicked);
+        assert!(texts(&output).contains(launch_readiness_page::RETROARCH_BUSY_HINT));
+    }
+
+    #[test]
+    fn gamer_view_offers_stop_for_the_running_game_and_keeps_play_disabled() {
+        let mut state = launch_readiness_page::RetroArchLaunchState::default();
+        let game = request("/library/GameA.bin");
+        state.track_running_for_test(&game);
+        let ctx = egui::Context::default();
+        let mut clicked = true;
+        let output = ctx.run(egui::RawInput::default(), |ctx| {
+            egui::CentralPanel::default().show(ctx, |ui| {
+                clicked = featured_retroarch_launch_action(ui, &mut state, &game, true);
+            });
+        });
+        assert!(!clicked);
+        assert!(texts(&output).contains("Stop RetroArch"));
+        state.stop_for_test();
     }
 }

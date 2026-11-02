@@ -491,7 +491,7 @@ pub fn extension_narrows_candidate(extension: &str, platform_id: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::emulator_environment::retroarch::FirmwareRequirement;
+    use crate::emulator_environment::retroarch::{FirmwarePresence, FirmwareRequirement};
 
     fn found(system_name: Option<&str>, database: Option<&str>) -> CoreInfoFinding {
         CoreInfoFinding::Found {
@@ -726,6 +726,7 @@ mod tests {
                 path: None,
                 description: None,
                 optional: true,
+                presence: FirmwarePresence::Unknown,
             }],
         };
         assert_eq!(retroarch_platform_candidate(&info), None);
