@@ -849,7 +849,8 @@ fn command_facts(command: &RetroArchCommand) -> LaunchCommandFacts {
 pub use crate::launch::process_spawn::ProcessExitReport as LaunchExitReport;
 
 /// A spawned, still-owned RetroArch process. Never automatically killed,
-/// timed out, or relaunched by this module - RetroArch is a long-running,
+/// timed out, or relaunched by this module; only an explicit
+/// [`Self::request_graceful_stop`] sends it a signal - RetroArch is a long-running,
 /// user-facing program the caller (a future GUI) owns for as long as the
 /// user wants it running. [`Self::poll`] is the narrow, non-blocking way to
 /// notice it has exited, backed by a background thread (see
@@ -859,6 +860,8 @@ pub struct LaunchedRetroArchProcess {
     pub pid: u32,
     pub command_facts: LaunchCommandFacts,
     watched: WatchedProcess,
+    /// The launched file as it was when the launch started. `None` refuses Stop.
+    launched_file: Option<process_spawn::ExecutableFile>,
 }
 
 impl LaunchedRetroArchProcess {
@@ -871,6 +874,44 @@ impl LaunchedRetroArchProcess {
 
     pub fn is_running(&self) -> bool {
         self.watched.is_running()
+    }
+
+    /// Whether a stop request would reach RetroArch itself. Only a native
+    /// profile whose owned child is executing the file it launched qualifies:
+    /// an AppImage or other launcher may exit while the emulator keeps
+    /// running, or take the emulator down before it writes saves.
+    pub fn stop_target(&self) -> process_spawn::OwnedExecutable {
+        let Some(file) = self.launched_file else {
+            return process_spawn::OwnedExecutable::Unavailable;
+        };
+        match self.watched.owned_executable(file) {
+            process_spawn::OwnedExecutable::Matches
+                if self.command_facts.profile.profile_kind != ProfileKind::Native =>
+            {
+                process_spawn::OwnedExecutable::Differs
+            }
+            target => target,
+        }
+    }
+
+    /// Requests one graceful stop of this launch's own child; see
+    /// [`WatchedProcess::request_graceful_stop`]. Never a PID lookup, a
+    /// second signal or an escalation, and refused for any [`Self::stop_target`]
+    /// other than RetroArch itself.
+    pub fn request_graceful_stop(
+        &mut self,
+        scope: process_spawn::GracefulStopScope,
+        grace_period: std::time::Duration,
+    ) -> process_spawn::GracefulStopOutcome {
+        use process_spawn::{GracefulStopOutcome, GracefulStopRefusal, OwnedExecutable};
+        match self.stop_target() {
+            OwnedExecutable::Matches | OwnedExecutable::Exited => {
+                self.watched.request_graceful_stop(scope, grace_period)
+            }
+            OwnedExecutable::Differs | OwnedExecutable::Unavailable => {
+                GracefulStopOutcome::Refused(GracefulStopRefusal::TargetNotEmulator)
+            }
+        }
     }
 }
 
@@ -1007,6 +1048,7 @@ pub(crate) fn spawn_retroarch_guarded(
             )));
         }
     }
+    let launched_file = process_spawn::ExecutableFile::of(&command.executable).ok();
     let watched = observation
         .spawn(&prepared)
         .map_err(LaunchSpawnError::Spawn)?;
@@ -1014,6 +1056,7 @@ pub(crate) fn spawn_retroarch_guarded(
         pid: watched.pid,
         command_facts: facts,
         watched,
+        launched_file,
     })
 }
 

@@ -726,6 +726,7 @@ fn featured_retroarch_launch_action(
 
     let display = launch_state.display_for(request);
     launch_readiness_page::show_retroarch_launch_feedback(ui, &display);
+    launch_state.show_stop_control(ui);
     // Integration: the executor state machine, polling and running/closed/
     // error presentation are 934c9ec's; the plain beginner label is
     // 1c825e7's (`GAMER_PLAY_LABEL`).
@@ -2818,5 +2819,22 @@ mod retroarch_one_launch_tests {
         });
         assert!(!clicked);
         assert!(texts(&output).contains(launch_readiness_page::RETROARCH_BUSY_HINT));
+    }
+
+    #[test]
+    fn gamer_view_offers_stop_for_the_running_game_and_keeps_play_disabled() {
+        let mut state = launch_readiness_page::RetroArchLaunchState::default();
+        let game = request("/library/GameA.bin");
+        state.track_running_for_test(&game);
+        let ctx = egui::Context::default();
+        let mut clicked = true;
+        let output = ctx.run(egui::RawInput::default(), |ctx| {
+            egui::CentralPanel::default().show(ctx, |ui| {
+                clicked = featured_retroarch_launch_action(ui, &mut state, &game, true);
+            });
+        });
+        assert!(!clicked);
+        assert!(texts(&output).contains("Stop RetroArch"));
+        state.stop_for_test();
     }
 }

@@ -120,7 +120,8 @@ impl World {
             "bin/retroarch",
             format!(
                 "#!/bin/sh\\nrec=\"{rec}\"\\nmkdir -p \"$rec\"\\nprintf '%s\\\\n' \"$@\" > \"$rec/args.txt\"\\n\
-                 while [ $# -gt 0 ]; do if [ \"$1\" = \"--config\" ]; then cp -r \"$(dirname \"$(dirname \"$2\")\")\" \"$rec/profile\"; fi; shift; done\\nexit 0\\n",
+                 while [ $# -gt 0 ]; do if [ \"$1\" = \"--config\" ]; then cp -r \"$(dirname \"$(dirname \"$2\")\")\" \"$rec/profile\"; fi; shift; done\\n\
+                 if [ -e \"$rec.hold\" ]; then : > \"$rec.held\"; while [ -e \"$rec.hold\" ]; do sleep 0.01; done; fi\\nexit 0\\n",
                 rec = root.join("record").display()
             )
             .replace("\\\\n", "\n")
@@ -651,6 +652,53 @@ fn a_cheat_launch_runs_through_the_state_machine_and_reports_honestly() {
     let mut other = world.request.clone();
     other.core_stem = "someone_else".into();
     assert!(state.cheat_lines(&other).is_empty());
+}
+
+#[test]
+fn a_cheat_launch_through_a_launcher_is_refused_and_keeps_normal_cleanup() {
+    // The fixture RetroArch is a small program that execs a shell, so what is
+    // running is not the launched file and Stop must not touch it.
+    let world = World::new("Genesis Plus GX");
+    let hold = world.root.join("record.hold");
+    let held = world.root.join("record.held");
+    fs::write(&hold, b"").unwrap();
+    let settings = fs::read(world.real_config()).unwrap();
+    let game = fs::read(&world.request.selected_content_path).unwrap();
+    let choice = world.choice(CHT, &["Infinite Lives"]);
+    let mut state = state_for(&world, choice);
+    state.start_with_cheats(world.request.clone());
+    let deadline = Instant::now() + Duration::from_secs(30);
+    while !held.exists()
+        || !matches!(
+            state.display_for(&world.request),
+            RetroArchLaunchDisplay::Running { .. }
+        )
+    {
+        state.poll();
+        assert!(Instant::now() < deadline, "the launch never started");
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    assert!(matches!(
+        state.stop_for_test(),
+        Some(archivefs_core::launch::process_spawn::GracefulStopOutcome::Refused(_))
+    ));
+    state.poll();
+    assert!(state.is_active(), "a refusal must not end the launch");
+    fs::remove_file(&hold).unwrap();
+    run_state(&mut state);
+    match state.display_for(&world.request) {
+        RetroArchLaunchDisplay::Exited { success, .. } => assert!(success),
+        _ => panic!("expected an exited launch"),
+    }
+    assert_eq!(
+        state.smoke_receipt().unwrap().cleanup,
+        CleanupOutcome::Completed
+    );
+    assert_eq!(fs::read(world.real_config()).unwrap(), settings);
+    assert_eq!(
+        fs::read(&world.request.selected_content_path).unwrap(),
+        game
+    );
 }
 
 #[test]
