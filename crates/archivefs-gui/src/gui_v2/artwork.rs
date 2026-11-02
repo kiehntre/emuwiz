@@ -214,7 +214,8 @@ enum Reply {
     },
     Picture {
         key: Key,
-        result: Result<Pixels, ResolveFailure>,
+        /// Boxed: decoded pixels are far larger than the index reply.
+        result: Box<Result<Pixels, ResolveFailure>>,
         completed: Instant,
     },
 }
@@ -372,7 +373,7 @@ impl Artwork {
                     if answers
                         .send(Reply::Picture {
                             key: request.key,
-                            result,
+                            result: Box::new(result),
                             completed: Instant::now(),
                         })
                         .is_err()
@@ -465,7 +466,7 @@ impl Artwork {
                         .remove(&key)
                         .is_none_or(|cancel| cancel.load(Ordering::Relaxed));
                     if !cancelled {
-                        let picture = match result {
+                        let picture = match *result {
                             Ok(mut pixels) => {
                                 pixels.timings.delivery = completed.elapsed();
                                 log::debug!("gui_v2 artwork {:?}: {:?}", key, pixels.timings);
