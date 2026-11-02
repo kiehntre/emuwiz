@@ -21,7 +21,10 @@ def decoy_named(directory, name):
     """An unrelated process whose name is a real desktop's, run by this test."""
     path = Path(directory) / name
     shutil.copy(shutil.which("sleep"), path)
-    return subprocess.Popen([str(path), "60"], start_new_session=True)
+    # argv[0] stays "sleep": a multi-call sleep (uutils on ubuntu-26.04,
+    # busybox) dispatches on it. The process name in /proc/<pid>/comm comes
+    # from the executed file, so the decoy is still named `name`.
+    return subprocess.Popen(["sleep", "60"], executable=path, start_new_session=True)
 
 
 class Limits(unittest.TestCase):
@@ -121,7 +124,39 @@ def decoy_named_in(sandbox, directory, name):
     if not target.exists():
         shutil.copy(shutil.which("sleep"), target)
     del path
-    return sandbox.spawn([str(target), "60"])
+    # Same as decoy_named: exec the copy under argv[0] "sleep" (same pid, so
+    # still owned); its process name comes from the file, so it is `name`.
+    return sandbox.spawn([sys.executable, "-I", "-c", EXEC_AS_SLEEP, str(target)])
+
+
+EXEC_AS_SLEEP = "import os, sys; os.execv(sys.argv[1], ['sleep', '60'])"
+
+
+class MultiCallSleep(unittest.TestCase):
+    """ubuntu-26.04's sleep is a multi-call binary that dispatches on argv[0]."""
+
+    def test_decoys_live_and_keep_their_names_with_a_multi_call_sleep(self):
+        busybox = shutil.which("busybox")
+        if busybox is None:
+            self.skipTest("busybox provides the multi-call sleep for this check")
+        with tempfile.TemporaryDirectory() as directory:
+            bin_dir = Path(directory) / "bin"
+            bin_dir.mkdir()
+            shutil.copy(busybox, bin_dir / "sleep")
+            original = os.environ["PATH"]
+            os.environ["PATH"] = f"{bin_dir}{os.pathsep}{original}"
+            self.addCleanup(os.environ.__setitem__, "PATH", original)
+            decoy = decoy_named(directory, "xfwm4")
+            self.addCleanup(decoy.wait)
+            self.addCleanup(decoy.terminate)  # exact child handle
+            with gui_sandbox.Sandbox() as sandbox:
+                owned = decoy_named_in(sandbox, directory, "xfdesktop")
+                time.sleep(0.3)
+                self.assertIsNone(owned.poll(), "the owned decoy exited at once")
+                self.assertEqual((Path("/proc") / str(owned.pid) / "comm").read_text().strip(), "xfdesktop")
+            time.sleep(0.3)
+            self.assertIsNone(decoy.poll(), "the unowned decoy exited at once")
+            self.assertEqual((Path("/proc") / str(decoy.pid) / "comm").read_text().strip(), "xfwm4")
 
 
 class Source(unittest.TestCase):
