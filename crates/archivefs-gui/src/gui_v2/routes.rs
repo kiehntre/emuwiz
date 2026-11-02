@@ -783,10 +783,11 @@ pub(super) enum ToolPage {
     WhdloadOptions,
     OpticalCompare,
     SourceImpact,
+    ArcadeShelf,
 }
 
 impl ToolPage {
-    pub const ALL: [Self; 17] = [
+    pub const ALL: [Self; 18] = [
         Self::AlternativeProviders,
         Self::NeedsAttention,
         Self::Mounts,
@@ -804,6 +805,7 @@ impl ToolPage {
         Self::WhdloadOptions,
         Self::OpticalCompare,
         Self::SourceImpact,
+        Self::ArcadeShelf,
     ];
 
     pub fn title(self) -> &'static str {
@@ -825,6 +827,7 @@ impl ToolPage {
             Self::NetplayPreview => "Netplay comparison",
             Self::HostDiagnostics => "Host capability diagnostics",
             Self::CheatExtras => "Providers and code previews",
+            Self::ArcadeShelf => "Virtual Arcade Shelf",
         }
     }
 
@@ -869,6 +872,9 @@ impl ToolPage {
             Self::CheatExtras => {
                 "Licences for open and local cheat providers, and read-only code previews."
             }
+            Self::ArcadeShelf => {
+                "Browse your covers on one shelf per system, then open Game Details for any game."
+            }
         }
     }
 
@@ -891,6 +897,7 @@ impl ToolPage {
             Self::NetplayPreview => Section::Launch,
             Self::HostDiagnostics => Section::Setup,
             Self::CheatExtras => Section::Mods,
+            Self::ArcadeShelf => Section::Games,
         }
     }
 
@@ -912,6 +919,7 @@ impl ToolPage {
             Self::NetplayPreview => "Games & collection",
             Self::HostDiagnostics => "Tools",
             Self::CheatExtras => "Enhance",
+            Self::ArcadeShelf => "Games & collection",
         }
     }
 }

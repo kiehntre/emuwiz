@@ -90,6 +90,7 @@ pub(super) fn needs_library(route: &super::Route) -> bool {
                     | Section::Museum
                     | Section::MultiDisc
             )
+            | Route::Tool(super::routes::ToolPage::ArcadeShelf)
     )
 }
 

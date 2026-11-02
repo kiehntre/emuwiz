@@ -37,6 +37,10 @@ pub(super) struct Key {
     pub game: i64,
     pub kind: Kind,
     pub generation: u64,
+    /// Local artwork and covers already in the disk cache only: a cache miss
+    /// ends as `Missing` and is never handed to the remote lane. A separate
+    /// key, so a local-only miss never hides a picture from other surfaces.
+    pub local_only: bool,
 }
 
 /// Why a picture could not be produced. `connectivity` is set only when the
@@ -47,7 +51,16 @@ pub(super) struct ResolveFailure {
     pub message: String,
     pub connectivity: Option<RommConnectivity>,
 }
+/// Message of the failure a local-only request ends with on a cache miss.
+const NOT_CACHED_LOCALLY: &str = "This cover is not stored on this computer.";
+
 impl ResolveFailure {
+    fn not_cached_locally() -> Self {
+        NOT_CACHED_LOCALLY.into()
+    }
+    fn is_not_cached_locally(&self) -> bool {
+        self.connectivity.is_none() && self.message == NOT_CACHED_LOCALLY
+    }
     fn provider(state: RommConnectivity) -> Self {
         Self {
             message: state.plain_message().into(),
@@ -343,9 +356,9 @@ impl Artwork {
                         std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| resolve(&request, &transport, &health)))
                             .unwrap_or_else(|_| Err("The picture could not be decoded safely. Retry or choose another picture.".into()))
                     };
-                    let result = match result {
-                        Ok(Some(pixels)) => Ok(pixels),
-                        Ok(None) => {
+                    let result = match after_resolve(&request, result) {
+                        Next::Reply(result) => result,
+                        Next::Promote => {
                             // Probe disk caches on a local lane first. A slow
                             // online request cannot queue ahead of cached covers.
                             request.remote = true;
@@ -355,7 +368,6 @@ impl Artwork {
                             }
                             continue;
                         }
-                        Err(error) => Err(error),
                     };
                     if answers
                         .send(Reply::Picture {
@@ -467,6 +479,9 @@ impl Artwork {
                                     timings: pixels.timings,
                                 }
                             }
+                            Err(failure) if key.local_only && failure.is_not_cached_locally() => {
+                                Picture::Missing
+                            }
                             Err(failure) => {
                                 self.failures += 1;
                                 self.failed_at.insert(key, Instant::now());
@@ -489,10 +504,27 @@ impl Artwork {
             game,
             kind,
             generation: self.generation,
+            local_only: false,
+        }
+    }
+    pub fn local_key(&self, game: i64, kind: Kind) -> Key {
+        Key {
+            local_only: true,
+            ..self.key(game, kind)
         }
     }
     pub fn request(&mut self, game: i64, kind: Kind) -> Key {
         let key = self.key(game, kind);
+        self.request_key(key)
+    }
+    /// Like [`Self::request`], but only local artwork and covers already in
+    /// the disk cache: never a provider request, never a new cache entry.
+    pub fn request_local(&mut self, game: i64, kind: Kind) -> Key {
+        let key = self.local_key(game, kind);
+        self.request_key(key)
+    }
+    fn request_key(&mut self, key: Key) -> Key {
+        let (game, kind) = (key.game, key.kind);
         self.wanted.insert(key);
         self.last_seen.insert(key, self.frame);
         // A failure is not permanent: once it is old enough, forget it so the
@@ -857,6 +889,24 @@ impl<T: archivefs_core::identity_source::romm::client::RommTransport>
     }
 }
 
+/// What a picture worker does with a resolved request.
+enum Next {
+    Reply(Result<Pixels, ResolveFailure>),
+    /// Not in any local cache: ask the remote lane.
+    Promote,
+}
+
+fn after_resolve(request: &Request, result: Result<Option<Pixels>, ResolveFailure>) -> Next {
+    match result {
+        Ok(Some(pixels)) => Next::Reply(Ok(pixels)),
+        Ok(None) if request.key.local_only => {
+            Next::Reply(Err(ResolveFailure::not_cached_locally()))
+        }
+        Ok(None) => Next::Promote,
+        Err(error) => Next::Reply(Err(error)),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -887,6 +937,7 @@ mod tests {
                 game: 1,
                 kind: Kind::Cover,
                 generation: 1,
+                local_only: false,
             },
             index: Arc::new(index),
             remote: false,
@@ -1179,6 +1230,7 @@ mod tests {
                 game: 1,
                 kind: Kind::Cover,
                 generation: 1,
+                local_only: false,
             },
             index: Arc::new(index),
             remote: true,
@@ -1548,6 +1600,7 @@ mod tests {
                 game: 1,
                 kind: Kind::Cover,
                 generation: 1,
+                local_only: false,
             },
             index: Arc::new(index),
             remote: true,
@@ -1870,5 +1923,92 @@ mod tests {
         // A reload (new generation) drops every old-generation picture's key.
         artwork.generation += 1;
         assert_ne!(artwork.key(1, Kind::Cover), first);
+    }
+
+    /// Arcade Shelf regression: with Online artwork switched on and a server
+    /// configured, a local-only cover that no local cache holds ends as a
+    /// miss. It is never handed to the remote lane, so nothing is resolved,
+    /// requested or cached.
+    #[test]
+    fn a_local_only_cache_miss_ends_missing_with_zero_network_requests() {
+        let directory = tempfile::tempdir().unwrap();
+        let mut request = remote_request(directory.path(), "http://192.168.1.50:8080", true);
+        request.remote = false; // every request starts on a local lane
+        request.key.local_only = true;
+        let transport = TimedTransport::new(FakeServer::serving_png());
+        let resolver = FakeResolver::resolving();
+        let health = health();
+        let result = resolve_with(&request, &transport, &resolver, &health);
+        assert!(matches!(result, Ok(None)));
+        assert!(matches!(
+            after_resolve(&request, result),
+            Next::Reply(Err(failure)) if failure.is_not_cached_locally()
+        ));
+        assert_eq!((resolver.calls(), transport.inner.calls()), (0, 0));
+        assert!(health.snapshot().is_none());
+        assert!(!directory.path().join("identity").exists());
+
+        // Control: the same miss on an ordinary key is promoted, and the
+        // remote lane would then ask RomM. The test can see a request.
+        request.key.local_only = false;
+        let result = resolve_with(&request, &transport, &resolver, &health);
+        assert!(matches!(after_resolve(&request, result), Next::Promote));
+        request.remote = true;
+        let result = resolve_with(&request, &transport, &resolver, &health);
+        assert!(matches!(result, Ok(Some(_))));
+        assert!(transport.inner.calls() > 0);
+    }
+
+    /// The same, end to end through the real picture workers: RomM is
+    /// configured at a local listener that must never see a connection.
+    #[test]
+    fn local_only_requests_never_contact_romm_through_the_real_workers() {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        listener.set_nonblocking(true).unwrap();
+        let url = format!("http://127.0.0.1:{}", listener.local_addr().unwrap().port());
+        let directory = tempfile::tempdir().unwrap();
+        let root = directory.path().to_path_buf();
+        let indexer_url = url.clone();
+        let indexer: Indexer = Arc::new(move |_| {
+            let request = remote_request(&root, &indexer_url, true);
+            Arc::try_unwrap(request.index).unwrap_or_default()
+        });
+        let context = egui::Context::default();
+        let mut artwork = Artwork::with_indexer(
+            context.clone(),
+            Some(directory.path().join("thumbs")),
+            indexer,
+        );
+        artwork.reload(Arc::new(super::super::library::Library::default()));
+        for _ in 0..400 {
+            artwork.begin_frame(&context);
+            if artwork.index.is_some() {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        assert!(artwork.index.is_some());
+        let key = artwork.request_local(1, Kind::Cover);
+        for _ in 0..400 {
+            artwork.begin_frame(&context);
+            artwork.request_local(1, Kind::Cover);
+            if !matches!(artwork.pictures.get(&key), Some(Picture::Loading)) {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        assert!(matches!(artwork.pictures.get(&key), Some(Picture::Missing)));
+        // Give a wrongly promoted request time to reach the listener.
+        std::thread::sleep(Duration::from_millis(300));
+        assert!(matches!(
+            listener.accept(),
+            Err(error) if error.kind() == std::io::ErrorKind::WouldBlock
+        ));
+        assert!(artwork.health.snapshot().is_none());
+        assert_eq!(artwork.failures, 0);
+        assert!(!directory.path().join("identity").exists());
+        // The ordinary picture for this game is untouched, so Browse & Play
+        // still loads it exactly as before.
+        assert!(!artwork.pictures.contains_key(&artwork.key(1, Kind::Cover)));
     }
 }
