@@ -758,6 +758,7 @@ impl App {
                         Route::Section(Section::Check) => self.check_games(ui, None),
                         Route::QuickRename => self.quick_rename(ui),
                         Route::PlatformCheck(platform) => self.platform_check(ui, &platform),
+                        Route::GameCheck(id) => self.game_dat_check(ui, id),
                         Route::LibraryFiles => self.library_files_page(ui),
                         Route::Tool(tool) => self.tool_page(ui, tool),
                         Route::Section(Section::Duplicates) => self.duplicates(ui),
@@ -908,7 +909,7 @@ impl App {
                 section: Section::Advanced,
                 ..
             } => GuidancePage::ArchiveInspector,
-            Route::PlatformCheck(_) => GuidancePage::CheckGames,
+            Route::PlatformCheck(_) | Route::GameCheck(_) => GuidancePage::CheckGames,
             Route::LibraryFiles => GuidancePage::ProblemsRepair,
             Route::Section(Section::Dat) | Route::QuickRename => GuidancePage::DatManagement,
             Route::Section(Section::Firmware) => GuidancePage::BiosFirmware,
@@ -2045,6 +2046,24 @@ impl App {
         }
     }
 
+    fn game_dat_check(&mut self, ui: &mut egui::Ui, id: i64) {
+        use super::game_dat_check::{self, PageAction, Target};
+        let Some(game) = self.library.game(id).cloned() else {
+            ui.label("This game is no longer in the library. Nothing was checked.");
+            return;
+        };
+        self.game_dat_check
+            .open(Target::of(&game), game_dat_check::load_inputs);
+        match game_dat_check::show(ui, &mut self.game_dat_check) {
+            Some(PageAction::BackToGame) => self.go(Route::Game(id)),
+            Some(PageAction::CheckWholePlatform) => self.go(
+                super::identity_review_page::setup_verification_route(Some(&game.platform)),
+            ),
+            Some(PageAction::SetUpCatalogues) => self.go(Route::Section(Section::Dat)),
+            None => {}
+        }
+    }
+
     fn check_games(&mut self, ui: &mut egui::Ui, game_id: Option<i64>) {
         if let Some(game_id) = game_id
             && let Some((title, platform_name)) = self
@@ -2053,12 +2072,17 @@ impl App {
                 .map(|game| (game.title.clone(), game.platform.clone()))
         {
             egui::Frame::group(ui.style()).show(ui, |ui| {
-                ui.strong("Checking this selected game");
+                ui.strong("Opened from this game");
                 ui.label(format!("{title} · {platform_name}"));
-                ui.label("The existing platform verification run remains authoritative; this context is retained while you review it.");
-                if ui.button("Back to Game Details").clicked() {
-                    self.go(Route::Game(game_id));
-                }
+                ui.label("A check started on this page covers every game on the chosen system. To read and check only this game, use Check only this game.");
+                ui.horizontal(|ui| {
+                    if ui.button("Check only this game").clicked() {
+                        self.go(Route::GameCheck(game_id));
+                    }
+                    if ui.button("Back to Game Details").clicked() {
+                        self.go(Route::Game(game_id));
+                    }
+                });
             });
         }
         ui.label("Read-only verification. Your original game files are never renamed, moved or deleted here.");
@@ -3038,7 +3062,7 @@ impl App {
                     .filter(|detail| detail.game == id)
                     .and_then(|detail| detail.dat_region.as_ref())
                     .map(|(value, source)| (value.as_str(), source.as_str())),
-                dat_current: game.dat_exact.is_some(),
+                dat_current: game.has_current_dat_verification(),
                 discs: self
                     .game_detail_facts
                     .discs_for(id, &self.library)

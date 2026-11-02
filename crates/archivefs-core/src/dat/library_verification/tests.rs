@@ -1,4 +1,5 @@
 use super::*;
+use crate::LibraryDatState;
 use crate::dat::catalogue_selection::{CatalogueInventoryInputs, CatalogueRef, resolve_catalogue};
 use crate::dat::sources::{DatSourceEntry, DatSourceRegistry};
 use std::io::Write;
@@ -950,4 +951,421 @@ fn cue_launch_content(f: &Fixture) -> crate::launch::planning::LaunchContentRef 
         crate::ArchiveHealth::Pending,
     );
     crate::launch::evidence_bridge::launch_content_ref_from_archive_record(&record, None)
+}
+
+// Issue #279: saved evidence written before the audit-bound proof fields
+// (`audit_file`, `source.catalogue_sha256`) were mandatory never counts as
+// current. These pin what an explicit, confirmed re-verification does to it.
+impl Fixture {
+    fn configured(
+        &self,
+    ) -> std::collections::HashMap<String, crate::dat::configured_catalogues::ConfiguredCatalogue>
+    {
+        let mut registry = DatSourceRegistry::default();
+        registry
+            .add(DatSourceEntry::new(
+                "synthetic".into(),
+                "Synthetic TOSEC".into(),
+                self.dat.clone(),
+                DatSourceKind::File,
+            ))
+            .unwrap();
+        crate::dat::configured_catalogues::configured_catalogues(CatalogueInventoryInputs {
+            local_registry: &registry,
+            managed_sources: &Default::default(),
+            managed_root: self.dir.path(),
+            limits: DatLimits::default(),
+        })
+    }
+    /// Rewrites every saved row as a pre-proof legacy row: the verdict, hashes
+    /// and source stay; only the two proof fields are removed.
+    fn strip_proof(&self) {
+        let conn = rusqlite::Connection::open(&self.db).unwrap();
+        let rows: Vec<(i64, Vec<u8>)> = conn
+            .prepare("SELECT archive_id, facts_json FROM library_dat_identities")
+            .unwrap()
+            .query_map([], |r| Ok((r.get(0)?, r.get(1)?)))
+            .unwrap()
+            .map(Result::unwrap)
+            .collect();
+        assert!(!rows.is_empty());
+        for (id, bytes) in rows {
+            let mut v: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+            let object = v.as_object_mut().unwrap();
+            object.remove("audit_file");
+            object["source"]
+                .as_object_mut()
+                .unwrap()
+                .remove("catalogue_sha256");
+            conn.execute(
+                "UPDATE library_dat_identities SET facts_json = ?1, audited_at = '2026-10-08T00:00:00Z' WHERE archive_id = ?2",
+                rusqlite::params![serde_json::to_vec(&v).unwrap(), id],
+            )
+            .unwrap();
+        }
+    }
+    /// Records each existing file's size on its row, as a scan does; the
+    /// current-evidence filter compares it with the audited size.
+    fn sized(&self) {
+        let conn = rusqlite::Connection::open(&self.db).unwrap();
+        let rows: Vec<(i64, Vec<u8>)> = conn
+            .prepare("SELECT id, absolute_path_cached FROM archives")
+            .unwrap()
+            .query_map([], |r| Ok((r.get(0)?, r.get(1)?)))
+            .unwrap()
+            .map(Result::unwrap)
+            .collect();
+        for (id, path) in rows {
+            let path = std::path::PathBuf::from(std::ffi::OsStr::from_bytes(&path));
+            if let Some(metadata) = std::fs::metadata(&path).ok().filter(|m| m.is_file()) {
+                conn.execute(
+                    "UPDATE archives SET size_bytes = ?1 WHERE id = ?2 AND size_bytes IS NOT ?1",
+                    rusqlite::params![metadata.len() as i64, id],
+                )
+                .unwrap();
+            }
+        }
+    }
+    fn evidence(&self) -> crate::database::CurrentLibraryDatEvidence {
+        self.sized();
+        Database::open_read_only(&self.db)
+            .unwrap()
+            .current_library_dat_evidence(&self.configured())
+            .unwrap()
+    }
+    fn facts(&self, id: i64) -> serde_json::Value {
+        let conn = rusqlite::Connection::open(&self.db).unwrap();
+        let bytes: Vec<u8> = conn
+            .query_row(
+                "SELECT facts_json FROM library_dat_identities WHERE archive_id = ?1",
+                [id],
+                |r| r.get(0),
+            )
+            .unwrap();
+        serde_json::from_slice(&bytes).unwrap()
+    }
+}
+
+#[test]
+fn fresh_verification_is_current_evidence() {
+    let f = Fixture::new();
+    f.add(
+        1,
+        "a.tap",
+        Some(b"matching synthetic tape"),
+        Some("ZX Spectrum"),
+    );
+    f.add(2, "b.tap", Some(b"different tape"), Some("ZX Spectrum"));
+    f.run();
+    let e = f.evidence();
+    assert!(e.exact.contains_key(&1), "{e:?}");
+    assert_eq!(e.states.get(&1), Some(&LibraryDatState::Verified));
+    assert_eq!(e.states.get(&2), Some(&LibraryDatState::NoMatch));
+    assert!(e.exact_hashes.contains_key(&1));
+}
+
+#[test]
+fn legacy_rows_without_proof_are_not_current_and_reverification_restores_them() {
+    let f = Fixture::new();
+    f.add(
+        1,
+        "a.tap",
+        Some(b"matching synthetic tape"),
+        Some("ZX Spectrum"),
+    );
+    f.add(2, "b.tap", Some(b"different tape"), Some("ZX Spectrum"));
+    f.run();
+    f.strip_proof();
+    let before = f.evidence();
+    assert!(
+        before.exact.is_empty() && before.states.is_empty(),
+        "{before:?}"
+    );
+    let legacy = f.facts(1);
+    assert!(legacy.get("audit_file").is_none());
+
+    let t = f.run();
+    assert_eq!(
+        (t.verified, t.no_match, t.saved, t.protected_prior),
+        (1, 1, 2, 0)
+    );
+    let after = f.evidence();
+    assert_eq!(after.states.get(&1), Some(&LibraryDatState::Verified));
+    assert_eq!(after.states.get(&2), Some(&LibraryDatState::NoMatch));
+    assert!(after.exact.contains_key(&1) && after.exact_hashes.contains_key(&1));
+    let fresh = f.facts(1);
+    assert!(fresh["audit_file"].is_object(), "{fresh}");
+    assert!(fresh["source"]["catalogue_sha256"].is_string(), "{fresh}");
+    // Exactly one row per item and source: the legacy row was replaced, not duplicated.
+    let conn = rusqlite::Connection::open(&f.db).unwrap();
+    let rows: i64 = conn
+        .query_row("SELECT COUNT(*) FROM library_dat_identities", [], |r| {
+            r.get(0)
+        })
+        .unwrap();
+    assert_eq!(rows, 2);
+}
+
+#[test]
+fn reverification_does_not_upgrade_a_legacy_match_whose_file_changed() {
+    let f = Fixture::new();
+    f.add(
+        1,
+        "a.tap",
+        Some(b"matching synthetic tape"),
+        Some("ZX Spectrum"),
+    );
+    f.run();
+    f.strip_proof();
+    std::fs::write(f.root.join("a.tap"), b"replaced different tape").unwrap();
+    let t = f.run();
+    assert_eq!((t.verified, t.no_match), (0, 1));
+    let e = f.evidence();
+    assert!(e.exact.is_empty(), "{e:?}");
+    assert_eq!(e.states.get(&1), Some(&LibraryDatState::NoMatch));
+}
+
+#[test]
+fn a_one_file_collection_bound_rechecks_only_that_game() {
+    let f = Fixture::new();
+    f.add(
+        1,
+        "a.tap",
+        Some(b"matching synthetic tape"),
+        Some("ZX Spectrum"),
+    );
+    f.add(
+        2,
+        "b.tap",
+        Some(b"matching synthetic tape"),
+        Some("ZX Spectrum"),
+    );
+    f.run();
+    f.strip_proof();
+    let other_before = f.facts(2);
+    let p = preview_library_verification(
+        f.resolved(),
+        f.db.clone(),
+        "ZX Spectrum".into(),
+        Some(f.root.join("a.tap")),
+    )
+    .unwrap();
+    assert_eq!(
+        (p.selected_games, p.eligible_games, p.outside_collection),
+        (1, 1, 1)
+    );
+    assert_eq!(
+        p.eligible_paths().collect::<Vec<_>>(),
+        vec![f.root.join("a.tap").as_path()]
+    );
+    let t = p
+        .execute(&TrustedRoots::none(), &AtomicBool::new(false), &|_| {})
+        .unwrap();
+    assert_eq!((t.verified, t.saved), (1, 1));
+    let e = f.evidence();
+    assert_eq!(e.states.get(&1), Some(&LibraryDatState::Verified));
+    assert!(!e.states.contains_key(&2), "{e:?}");
+    assert_eq!(f.facts(2), other_before);
+}
+
+// One-game verification (Game Details "Re-check this game"): the same engine,
+// bound to exactly one library row, never widened to the platform.
+impl Fixture {
+    fn game_preview(&self, id: i64, name: &str) -> Result<VerificationPreview, String> {
+        preview_game_verification(
+            self.resolved(),
+            self.db.clone(),
+            "ZX Spectrum".into(),
+            id,
+            self.root.join(name),
+        )
+    }
+    fn dat_rows(&self) -> Vec<(i64, Vec<u8>)> {
+        let conn = rusqlite::Connection::open(&self.db).unwrap();
+        conn.prepare(
+            "SELECT archive_id, facts_json FROM library_dat_identities ORDER BY archive_id",
+        )
+        .unwrap()
+        .query_map([], |r| Ok((r.get(0)?, r.get(1)?)))
+        .unwrap()
+        .map(Result::unwrap)
+        .collect()
+    }
+}
+
+#[test]
+fn one_game_check_hashes_and_saves_only_the_selected_game() {
+    let f = Fixture::new();
+    f.add(
+        1,
+        "a.tap",
+        Some(b"matching synthetic tape"),
+        Some("ZX Spectrum"),
+    );
+    f.add(
+        2,
+        "b.tap",
+        Some(b"matching synthetic tape"),
+        Some("ZX Spectrum"),
+    );
+    f.add(3, "c.tap", Some(b"different tape"), Some("ZX Spectrum"));
+    f.run();
+    f.strip_proof();
+    // A FIFO in the same system: opening it for hashing would block forever.
+    let fifo = f.root.join("fifo.tap");
+    assert!(
+        std::process::Command::new("mkfifo")
+            .arg(&fifo)
+            .status()
+            .unwrap()
+            .success()
+    );
+    f.add(4, "fifo.tap", None, Some("ZX Spectrum"));
+    f.sized();
+    let others: Vec<_> = f
+        .dat_rows()
+        .into_iter()
+        .filter(|(id, _)| *id != 1)
+        .collect();
+    let tables = other_tables(&f.db);
+
+    let p = f.game_preview(1, "a.tap").unwrap();
+    let a = f.root.join("a.tap");
+    assert_eq!(p.eligible_paths().collect::<Vec<_>>(), vec![a.as_path()]);
+    assert_eq!(p.fingerprints.keys().collect::<Vec<_>>(), vec![&a]);
+    assert_eq!(p.targets.files, vec![a.clone()]);
+    assert_eq!(
+        (
+            p.selected_games,
+            p.eligible_games,
+            p.wrong_system,
+            p.unknown_system,
+            p.outside_collection
+        ),
+        (1, 1, 0, 0, 0)
+    );
+    assert!(p.exclusions.is_empty());
+    let t = p
+        .execute(&TrustedRoots::none(), &AtomicBool::new(false), &|_| {})
+        .unwrap();
+    assert_eq!(
+        (t.verified, t.no_match, t.saved, t.not_checked),
+        (1, 0, 1, 0)
+    );
+    assert!(t.disc_order.is_none());
+    let e = f.evidence();
+    assert_eq!(e.states.get(&1), Some(&LibraryDatState::Verified));
+    assert!(e.exact.contains_key(&1));
+    assert_eq!(e.states.len(), 1, "{e:?}");
+    let after: Vec<_> = f
+        .dat_rows()
+        .into_iter()
+        .filter(|(id, _)| *id != 1)
+        .collect();
+    assert_eq!(after, others);
+    assert_eq!(other_tables(&f.db), tables);
+    for name in ["a.tap", "b.tap"] {
+        assert_eq!(
+            std::fs::read(f.root.join(name)).unwrap(),
+            b"matching synthetic tape"
+        );
+    }
+}
+
+#[test]
+fn one_game_check_reports_a_mismatch_for_that_game_only() {
+    let f = Fixture::new();
+    f.add(
+        1,
+        "a.tap",
+        Some(b"matching synthetic tape"),
+        Some("ZX Spectrum"),
+    );
+    f.add(2, "b.tap", Some(b"different tape"), Some("ZX Spectrum"));
+    let t = f
+        .game_preview(2, "b.tap")
+        .unwrap()
+        .execute(&TrustedRoots::none(), &AtomicBool::new(false), &|_| {})
+        .unwrap();
+    assert_eq!((t.verified, t.no_match, t.saved), (0, 1, 1));
+    assert_eq!(
+        f.dat_rows().iter().map(|(id, _)| *id).collect::<Vec<_>>(),
+        vec![2]
+    );
+}
+
+#[test]
+fn one_game_check_refuses_instead_of_widening() {
+    let f = Fixture::new();
+    f.add(
+        1,
+        "a.tap",
+        Some(b"matching synthetic tape"),
+        Some("ZX Spectrum"),
+    );
+    f.add(2, "missing.tap", None, Some("ZX Spectrum"));
+    f.add(
+        3,
+        "gb.tap",
+        Some(b"matching synthetic tape"),
+        Some("Game Boy"),
+    );
+    f.add(
+        4,
+        "dup.tap",
+        Some(b"matching synthetic tape"),
+        Some("ZX Spectrum"),
+    );
+    f.add(5, "shadow.tap", None, Some("ZX Spectrum"));
+    rusqlite::Connection::open(&f.db)
+        .unwrap()
+        .execute(
+            "UPDATE archives SET absolute_path_cached=?1 WHERE id=5",
+            [f.root.join("dup.tap").as_os_str().as_bytes()],
+        )
+        .unwrap();
+    // An unavailable mount: the game's folder is not there at all.
+    let gone = f.root.join("unmounted");
+    let conn = rusqlite::Connection::open(&f.db).unwrap();
+    conn.execute("INSERT INTO archives(id,source_folder_id,relative_path,absolute_path_cached,file_name_cached,archive_kind,display_name,normalized_name,first_seen_at,last_seen_at,created_at,updated_at) VALUES(6,1,?2,?1,?3,'direct_game_image','x','x','now','now','now','now')", rusqlite::params![gone.join("x.tap").as_os_str().as_bytes(), b"unmounted/x.tap".as_slice(), b"x.tap".as_slice()]).unwrap();
+    conn.execute("INSERT INTO platform_assignments(archive_id,platform,source,is_current,assigned_at) VALUES(6,'ZX Spectrum','manual',1,'now')", []).unwrap();
+    drop(conn);
+    for (id, path, expected) in [
+        (2, f.root.join("missing.tap"), "Unavailable file"),
+        (6, gone.join("x.tap"), "Unavailable file"),
+        (3, f.root.join("gb.tap"), "not assigned to ZX Spectrum"),
+        (4, f.root.join("dup.tap"), "Ambiguous library path"),
+        (99, f.root.join("a.tap"), "no longer in the library"),
+        (1, f.root.join("b.tap"), "location changed"),
+    ] {
+        let error =
+            preview_game_verification(f.resolved(), f.db.clone(), "ZX Spectrum".into(), id, path)
+                .err()
+                .unwrap_or_else(|| panic!("game {id} was not refused"));
+        assert!(error.contains(expected), "game {id}: {error}");
+        assert!(error.contains("Nothing was checked"), "game {id}: {error}");
+    }
+    assert!(f.dat_rows().is_empty());
+}
+
+#[test]
+fn one_game_check_cancelled_or_changed_saves_nothing() {
+    let f = Fixture::new();
+    f.add(
+        1,
+        "a.tap",
+        Some(b"matching synthetic tape"),
+        Some("ZX Spectrum"),
+    );
+    let cancelled = f.game_preview(1, "a.tap").unwrap().execute(
+        &TrustedRoots::none(),
+        &AtomicBool::new(true),
+        &|_| {},
+    );
+    assert!(cancelled.unwrap_err().contains("Cancelled"));
+    let p = f.game_preview(1, "a.tap").unwrap();
+    std::fs::write(f.root.join("a.tap"), b"matching synthetic tape").unwrap();
+    let changed = p.execute(&TrustedRoots::none(), &AtomicBool::new(false), &|_| {});
+    assert!(changed.unwrap_err().contains("File changed after preview"));
+    assert!(f.dat_rows().is_empty());
 }

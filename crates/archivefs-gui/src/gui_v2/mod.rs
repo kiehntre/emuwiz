@@ -23,6 +23,7 @@ mod duplicate_undo;
 mod electron_preview;
 mod environment;
 mod equivalent_duplicates;
+mod game_dat_check;
 mod game_detail_blue;
 mod game_detail_facts;
 mod game_documents;
@@ -377,6 +378,7 @@ pub(super) struct App {
     /// catalogue entry is from an older library location.
     moved_game: Option<i64>,
     review: identity_review_page::ReviewUi,
+    game_dat_check: game_dat_check::State,
     notice: Option<Notice>,
     /// Non-alarming confirmation that a separate window was opened; cleared on
     /// navigation or dismissal.
@@ -506,6 +508,7 @@ impl App {
             library_failure: None,
             moved_game: None,
             review: Default::default(),
+            game_dat_check: Default::default(),
             notice: None,
             handoff_status: None,
             confirm_scan: false,
@@ -2344,6 +2347,12 @@ impl eframe::App for App {
             }
         }
         saves_states::poll_completed_sessions(self);
+        // A finished one-game check saves new evidence even when its page is
+        // no longer showing; reload so Game Details reads it.
+        self.game_dat_check.poll();
+        if self.load_job.is_none() && self.game_dat_check.take_saved() {
+            reload_library = true;
+        }
         if reload_library {
             self.load(false);
         }

@@ -186,6 +186,14 @@ impl Game {
         self.dat_exact = Some(ecosystem);
     }
 
+    /// The one answer to "is this game verified against a DAT right now?".
+    /// `dat_exact` is set only from `current_library_dat_evidence`, which
+    /// requires recorded file and catalogue proof that still holds. Game
+    /// Details' Region note and verification panel both read this.
+    pub fn has_current_dat_verification(&self) -> bool {
+        self.dat_exact.is_some()
+    }
+
     /// "Exact No-Intro match" (or "Exact DAT match" when the saved row does
     /// not record which catalogue it came from).
     pub fn dat_exact_label(&self) -> Option<String> {

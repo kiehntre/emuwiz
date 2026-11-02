@@ -54,6 +54,7 @@ pub(super) fn fixture(context: &egui::Context) -> App {
         library: Arc::new(Library::default()),
         moved_game: None,
         review: Default::default(),
+        game_dat_check: Default::default(),
         indices: Vec::new(),
         filter: Filter::default(),
         filter_generation: 0,
