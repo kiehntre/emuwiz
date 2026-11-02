@@ -160,17 +160,20 @@ impl State {
         self.receiver.is_some()
     }
 
-    /// Binds the page to `target`. A running check keeps its own game.
+    /// Binds the page to `target`. Only a confirmed, running check keeps its
+    /// own game; catalogue loading or a preview for another game is dropped
+    /// (both are read-only). A pending library reload is never lost.
     pub(super) fn open(
         &mut self,
         target: Target,
         load: impl FnOnce() -> Result<Inputs, String> + Send + 'static,
     ) {
-        if self.busy() || self.target.as_ref() == Some(&target) {
+        if self.target.as_ref() == Some(&target) || matches!(self.stage, Stage::Running(_)) {
             return;
         }
         *self = Self {
             target: Some(target),
+            saved: self.saved,
             ..Default::default()
         };
         let (sender, receiver) = mpsc::channel();
@@ -358,7 +361,13 @@ pub(super) enum PageAction {
     SetUpCatalogues,
 }
 
-pub(super) fn show(ui: &mut eframe::egui::Ui, state: &mut State) -> Option<PageAction> {
+/// `opened` is the game whose page this is; while a confirmed check of
+/// another game runs, the page says so rather than show that game as this one.
+pub(super) fn show(
+    ui: &mut eframe::egui::Ui,
+    state: &mut State,
+    opened: i64,
+) -> Option<PageAction> {
     use crate::ui::theme;
     state.poll();
     let Some(target) = state.target.clone() else {
@@ -366,6 +375,15 @@ pub(super) fn show(ui: &mut eframe::egui::Ui, state: &mut State) -> Option<PageA
         return None;
     };
     let mut action = None;
+    if target.archive_id != opened {
+        ui.colored_label(
+            theme::WARNING,
+            format!(
+                "Still checking {}. This page switches to the game you opened when that check finishes or is cancelled.",
+                target.title
+            ),
+        );
+    }
     ui.heading("Check this game against a DAT");
     ui.label(format!("{} · {}", target.title, target.platform));
     ui.small(target.path.display().to_string());

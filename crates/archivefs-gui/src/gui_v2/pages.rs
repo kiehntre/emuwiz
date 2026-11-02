@@ -2054,7 +2054,7 @@ impl App {
         };
         self.game_dat_check
             .open(Target::of(&game), game_dat_check::load_inputs);
-        match game_dat_check::show(ui, &mut self.game_dat_check) {
+        match game_dat_check::show(ui, &mut self.game_dat_check, id) {
             Some(PageAction::BackToGame) => self.go(Route::Game(id)),
             Some(PageAction::CheckWholePlatform) => self.go(
                 super::identity_review_page::setup_verification_route(Some(&game.platform)),
@@ -3062,7 +3062,10 @@ impl App {
                     .filter(|detail| detail.game == id)
                     .and_then(|detail| detail.dat_region.as_ref())
                     .map(|(value, source)| (value.as_str(), source.as_str())),
-                dat_current: game.has_current_dat_verification(),
+                dat_current: super::game_verification_guidance::dat_verified_now(
+                    game,
+                    self.review.verification_guidance.result_for(id),
+                ),
                 discs: self
                     .game_detail_facts
                     .discs_for(id, &self.library)

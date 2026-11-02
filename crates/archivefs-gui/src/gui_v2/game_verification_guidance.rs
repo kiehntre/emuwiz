@@ -130,6 +130,13 @@ impl State {
         *self = Self::default();
     }
 
+    /// This panel's finished result for `game`, if it has one.
+    pub(super) fn result_for(&self, game: i64) -> Option<&Guidance> {
+        (self.game == Some(game))
+            .then_some(self.result.as_ref())
+            .flatten()
+    }
+
     fn poll(&mut self, game: &Game, context: &eframe::egui::Context) {
         if self.game != Some(game.archive.id) {
             self.invalidate();
@@ -252,6 +259,17 @@ fn load(
             Err(&error),
             None,
         ),
+    }
+}
+
+/// Whether Game Details may call this game's DAT match current anywhere on
+/// the page (the Region note included): the panel's own answer once it has
+/// one, so the two can never disagree; before that, the Library's strict
+/// current-evidence decision the panel itself starts from.
+pub(super) fn dat_verified_now(game: &Game, panel: Option<&Guidance>) -> bool {
+    match panel {
+        Some(guidance) => guidance.reason == "Verified",
+        None => game.has_current_dat_verification(),
     }
 }
 

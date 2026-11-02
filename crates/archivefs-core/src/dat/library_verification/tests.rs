@@ -1369,3 +1369,46 @@ fn one_game_check_cancelled_or_changed_saves_nothing() {
     assert!(changed.unwrap_err().contains("File changed after preview"));
     assert!(f.dat_rows().is_empty());
 }
+
+#[test]
+fn one_game_cue_check_reads_its_tracks_but_saves_only_the_sheet_row() {
+    let (f, _, _) = cue_fixture(["Track01.bin", "Track02.bin"]);
+    // The first track is also its own library row, as a scan can leave it.
+    f.add(2, "Track01.bin", None, Some("PSX"));
+    f.add(
+        3,
+        "other.cue",
+        Some(b"FILE \"x.bin\" BINARY\n"),
+        Some("PSX"),
+    );
+    f.sized();
+    let tables = other_tables(&f.db);
+    let p = preview_game_verification(
+        f.resolved(),
+        f.db.clone(),
+        "PSX".into(),
+        1,
+        f.root.join("Synthetic Disc.cue"),
+    )
+    .unwrap();
+    let mut files = p.targets.files.clone();
+    files.sort();
+    assert_eq!(
+        files,
+        vec![
+            f.root.join("Synthetic Disc.cue"),
+            f.root.join("Track01.bin"),
+            f.root.join("Track02.bin"),
+        ]
+    );
+    assert_eq!(p.eligible_paths().count(), 1);
+    let t = p
+        .execute(&TrustedRoots::none(), &AtomicBool::new(false), &|_| {})
+        .unwrap();
+    assert_eq!((t.verified, t.saved), (1, 1), "{t:?}");
+    assert_eq!(
+        f.dat_rows().iter().map(|(id, _)| *id).collect::<Vec<_>>(),
+        vec![1]
+    );
+    assert_eq!(other_tables(&f.db), tables);
+}
