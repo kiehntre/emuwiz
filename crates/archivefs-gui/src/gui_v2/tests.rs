@@ -8603,6 +8603,26 @@ fn shows(strings: &[String], needle: &str) -> bool {
     strings.iter().any(|value| value.contains(needle))
 }
 
+/// This game's verification panel has answered `reason` (no worker runs).
+fn panel_answered(app: &mut App, game: i64, reason: &'static str) {
+    app.review.verification_guidance.set_for_test(
+        game,
+        None,
+        Some(super::game_verification_guidance::Guidance {
+            reason,
+            explanation: String::new(),
+            action: super::game_verification_guidance::Action::Review,
+        }),
+    );
+}
+
+/// This game's panel is still reading its saved evidence (no worker runs).
+fn panel_pending(app: &mut App, game: i64) {
+    app.review
+        .verification_guidance
+        .set_for_test(game, None, None);
+}
+
 fn knowledge(
     state: archivefs_core::dat::library_identity_summary::DatVerificationState,
 ) -> DatKnowledge {
@@ -9100,6 +9120,7 @@ fn stale_or_untrusted_dat_evidence_is_never_labelled_verified_in_game_details() 
         app.review.knowledge = Some(current);
         let review = app.identity_review_for(1).unwrap();
         assert!(!review.is_verified(), "stale={stale} trusted={trusted}");
+        panel_answered(&mut app, 1, "File evidence stale or changed");
         app.router.current = Route::Game(1);
         let strings = text(&frame(&context, &mut app, [1280.0, 900.0]));
         assert!(
@@ -9115,6 +9136,176 @@ fn stale_or_untrusted_dat_evidence_is_never_labelled_verified_in_game_details() 
     }
 }
 
+/// Game Details never says Verified from a saved Library flag alone: before
+/// this game's panel answers, the Identity line and the readiness card both
+/// say "Checking verification"; afterwards both follow the panel's answer.
+/// Launch readiness is decided separately throughout.
+#[test]
+fn game_details_identity_follows_this_games_panel_from_pending_to_answer() {
+    let context = egui::Context::default();
+    let size = [1280.0, 900.0];
+    for (answer, verified) in [
+        ("Verified", true),
+        ("File evidence stale or changed", false),
+        ("Saved exact match; freshness needs checking", false),
+        ("Configured DAT unavailable or disabled", false),
+    ] {
+        let mut app = review_app(&context, vec![(1, "Amidar", "Atari2600")]);
+        app.review.knowledge_for = None;
+        Arc::make_mut(&mut app.library).games[0].mark_dat_exact(Some("No-Intro"));
+        app.router.current = Route::Game(1);
+
+        // Before the panel answers
+        panel_pending(&mut app, 1);
+        let strings = text(&frame(&context, &mut app, size));
+        let pending = strings
+            .iter()
+            .filter(|line| line.contains("Identity: Checking verification"))
+            .count();
+        assert_eq!(pending, 2, "line and card, {answer}: {strings:?}");
+        assert!(!shows(&strings, "Identity: Verified"), "{strings:?}");
+        assert!(
+            shows(&strings, "Checking whether this game is ready"),
+            "launch is still undecided: {strings:?}"
+        );
+
+        // After it answers
+        panel_answered(&mut app, 1, answer);
+        let strings = text(&frame(&context, &mut app, size));
+        assert!(
+            !shows(&strings, "Checking verification"),
+            "{answer}: {strings:?}"
+        );
+        let verified_lines = strings
+            .iter()
+            .filter(|line| line.contains("Identity: Verified"))
+            .count();
+        assert_eq!(
+            verified_lines,
+            if verified { 2 } else { 0 },
+            "{answer}: {strings:?}"
+        );
+        assert!(
+            shows(&strings, "Checking whether this game is ready"),
+            "verified identity never decides launch: {strings:?}"
+        );
+        // The in-memory Library agrees; the database is never written here.
+        assert_eq!(
+            app.library.game(1).unwrap().dat_identity_summary() == "Verified",
+            verified,
+            "{answer}"
+        );
+    }
+}
+
+/// A disproved match drops only that game's in-memory badge; an unreadable
+/// answer drops nothing and never says Verified.
+#[test]
+fn only_a_disproving_answer_clears_only_that_games_library_badge() {
+    let context = egui::Context::default();
+    let mut app = review_app(
+        &context,
+        vec![(1, "Amidar", "Atari2600"), (2, "Pitfall", "Atari2600")],
+    );
+    app.review.knowledge_for = None;
+    for game in &mut Arc::make_mut(&mut app.library).games {
+        game.mark_dat_exact(Some("No-Intro"));
+    }
+    app.router.current = Route::Game(1);
+    panel_answered(&mut app, 1, "Verification evidence unavailable");
+    let strings = text(&frame(&context, &mut app, [1280.0, 900.0]));
+    assert!(
+        shows(&strings, "Identity: Verification not yet confirmed"),
+        "{strings:?}"
+    );
+    assert!(!shows(&strings, "Identity: Verified"), "{strings:?}");
+    assert_eq!(
+        app.library.game(1).unwrap().dat_identity_summary(),
+        "Verified"
+    );
+
+    panel_answered(&mut app, 1, "File evidence stale or changed");
+    frame(&context, &mut app, [1280.0, 900.0]);
+    assert_ne!(
+        app.library.game(1).unwrap().dat_identity_summary(),
+        "Verified"
+    );
+    assert_eq!(
+        app.library.game(2).unwrap().dat_identity_summary(),
+        "Verified",
+        "another game is untouched"
+    );
+}
+
+/// One game's answer never applies to another, and a late result from an
+/// earlier game or an earlier check cannot land after the panel moved on.
+#[test]
+fn a_panel_answer_never_crosses_games_or_outlives_its_check() {
+    use super::detail_identity::DetailIdentity;
+    let context = egui::Context::default();
+    let mut app = review_app(
+        &context,
+        vec![(1, "Amidar", "Atari2600"), (2, "Pitfall", "Atari2600")],
+    );
+    app.review.knowledge_for = None;
+    for game in &mut Arc::make_mut(&mut app.library).games {
+        game.mark_dat_exact(Some("No-Intro"));
+    }
+    let second = app.library.game(2).unwrap().clone();
+    panel_answered(&mut app, 1, "Verified");
+    assert!(
+        app.detail_identity(&app.library.game(1).unwrap().clone())
+            .unwrap()
+            .is_verified()
+    );
+    assert_eq!(app.detail_identity(&second), Some(DetailIdentity::Checking));
+
+    // A check for game 1 is in flight; the panel then moves to game 2.
+    let (late, receiver) = std::sync::mpsc::channel();
+    app.review
+        .verification_guidance
+        .set_for_test(1, Some(receiver), None);
+    app.review.verification_guidance.invalidate();
+    panel_pending(&mut app, 2);
+    let answer = super::game_verification_guidance::Guidance {
+        reason: "Verified",
+        explanation: String::new(),
+        action: super::game_verification_guidance::Action::Review,
+    };
+    assert!(
+        late.send(answer.clone()).is_err(),
+        "the old check was dropped"
+    );
+    app.router.current = Route::Game(2);
+    let strings = text(&frame(&context, &mut app, [1280.0, 900.0]));
+    assert!(!shows(&strings, "Identity: Verified"), "{strings:?}");
+    assert_eq!(app.detail_identity(&second), Some(DetailIdentity::Checking));
+
+    // A re-check of the same game: only the newer check's answer counts.
+    let (older, older_receiver) = std::sync::mpsc::channel();
+    app.review
+        .verification_guidance
+        .set_for_test(2, Some(older_receiver), None);
+    app.review.verification_guidance.invalidate();
+    let (newer, newer_receiver) = std::sync::mpsc::channel();
+    app.review
+        .verification_guidance
+        .set_for_test(2, Some(newer_receiver), None);
+    assert!(
+        older.send(answer.clone()).is_err(),
+        "the older check was dropped"
+    );
+    newer
+        .send(super::game_verification_guidance::Guidance {
+            reason: "File evidence stale or changed",
+            ..answer
+        })
+        .unwrap();
+    let strings = text(&frame(&context, &mut app, [1280.0, 900.0]));
+    assert!(!shows(&strings, "Identity: Verified"), "{strings:?}");
+    assert!(!app.detail_identity(&second).unwrap().is_verified());
+}
+
 #[test]
 fn one_game_has_one_identity_status_on_every_page() {
     use archivefs_core::dat::library_identity_summary::DatVerificationState as S;
@@ -9128,8 +9319,11 @@ fn one_game_has_one_identity_status_on_every_page() {
             app.review.knowledge = Some(knowledge(S::VerifiedSingleMatch {
                 algorithm: "SHA-1".into(),
             }));
+            // This game's own panel confirmed current proof.
+            panel_answered(&mut app, 1, "Verified");
         } else {
             app.review.knowledge = Some(knowledge(S::NoMatch));
+            panel_answered(&mut app, 1, "No catalogue match");
         }
         let label = app.identity_review_for(1).unwrap().list_label();
         // Game Details
@@ -9282,7 +9476,8 @@ fn a_fresh_exact_dat_match_is_verified_on_every_page_and_launch_says_what_it_sti
     let review = app.identity_review_for(vid).unwrap();
     assert!(review.is_verified() && review.list_label() == "Verified");
     assert!(!app.identity_review_for(uid).unwrap().is_verified());
-    // Game Details
+    // Game Details, once this game's panel has confirmed current proof
+    panel_answered(&mut app, vid, "Verified");
     app.router.current = Route::Game(vid);
     let strings = text(&frame(&context, &mut app, [1280.0, 900.0]));
     assert!(shows(&strings, "Identity: Verified"), "{strings:?}");

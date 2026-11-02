@@ -3085,12 +3085,16 @@ impl App {
             .detail
             .as_ref()
             .is_some_and(|detail| detail.game == id && !detail.file_present);
-        // The same strict decision as the Identity line below: a loaded
-        // per-game lookup supersedes the library's older DAT flag, and stale
-        // or untrusted evidence never counts. Launch readiness stays separate.
-        let identity_verified = self
-            .identity_review_for(id)
-            .is_some_and(|review| review.is_verified());
+        // The Identity line's own answer (see `detail_identity`): a DAT match
+        // counts only once this game's panel has confirmed current proof.
+        // Launch readiness stays separate; verified identity never enables Play.
+        self.forget_disproved_dat_match(id);
+        let identity = self.detail_identity(game);
+        let identity_verified = identity.as_ref().is_some_and(|i| i.is_verified());
+        let identity_pending = matches!(
+            identity,
+            Some(super::detail_identity::DetailIdentity::Checking)
+        );
         let readiness_route = {
             let workflows = self.native_workflows.get_or_insert_with(|| {
                 super::native_workflows::NativeWorkflows::new(ui.ctx().clone())
@@ -3103,6 +3107,7 @@ impl App {
                 game.archive.identity_report.as_ref(),
                 super::native_workflows::SavedFileFacts {
                     catalogue_verified: identity_verified,
+                    identity_pending,
                     file_missing,
                 },
                 &mut self.activity,
@@ -3199,10 +3204,10 @@ impl App {
         }
         // General file identification and launch readiness remain separate.
         // The identity result leads; the longer verification guidance follows.
-        if let Some(review) = self.identity_review_for(id) {
+        if let Some(identity) = self.detail_identity(game) {
             ui.horizontal_wrapped(|ui| {
-                ui.strong(format!("Identity: {}", review.list_label()));
-                let label = if review.is_verified() {
+                ui.strong(format!("Identity: {}", identity.label()));
+                let label = if identity.is_verified() {
                     "View evidence"
                 } else {
                     "Review identity"

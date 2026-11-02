@@ -16,6 +16,7 @@ pub(crate) mod classic_trainers;
 #[cfg(test)]
 mod dat_exact_tests;
 mod database_status_page;
+mod detail_identity;
 mod documents;
 mod dreamcast_ipbin;
 mod duplicate_undo;

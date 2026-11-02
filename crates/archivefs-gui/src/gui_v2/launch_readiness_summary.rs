@@ -52,6 +52,9 @@ pub(crate) enum IdentitySummary {
     /// The game's identity is verified by current, trusted evidence while
     /// launch readiness is still being checked. Says nothing about launch.
     Verified,
+    /// A DAT match is on record, but this game's current proof is still
+    /// being checked. Says nothing about launch.
+    VerificationPending,
     Mismatch,
 }
 
@@ -1271,6 +1274,13 @@ pub(crate) fn note_file_missing(summary: &mut GameReadinessSummary) {
     }
 }
 
+/// The identity line only: status, headline and actions keep their answer.
+pub(crate) fn note_identity_pending(summary: &mut GameReadinessSummary) {
+    if summary.identity == IdentitySummary::NeedsReview {
+        summary.identity = IdentitySummary::VerificationPending;
+    }
+}
+
 /// Callers pass only a current, strictly verified identity. While readiness
 /// is still checking, only the identity line changes: the headline, status
 /// and primary action keep saying launch has not been decided.
@@ -1296,6 +1306,7 @@ fn identity_label(identity: IdentitySummary) -> &'static str {
         IdentitySummary::NeedsReview => "Needs review",
         IdentitySummary::CatalogueVerified => "Verified · file identity still needed to launch",
         IdentitySummary::Verified => "Verified",
+        IdentitySummary::VerificationPending => "Checking verification",
         IdentitySummary::Mismatch => "Mismatch / blocked",
     }
 }
