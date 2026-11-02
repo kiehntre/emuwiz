@@ -724,8 +724,10 @@ fn recording_app(
     let library = app.library.clone();
     app.collections.library_changed(&library);
     let (jobs, sent) = std::sync::mpsc::channel();
-    let (_answers, results) = std::sync::mpsc::channel();
+    let (answers, results) = std::sync::mpsc::channel();
     app.collections.worker = Some((jobs, results));
+    // Held open for the test: a dropped sender means the worker has died.
+    std::mem::forget(answers);
     (app, sent)
 }
 
@@ -813,9 +815,76 @@ fn try_again_reads_the_saved_collections_again() {
 fn browse_shows_a_failure_once_with_a_game_selected() {
     let context = eframe::egui::Context::default();
     let mut app = star_app(&context);
+    app.router.current = super::super::routes::Route::BrowsePlayGame(1);
+    app.collections.message = Some("That change was not saved: fixture".into());
+    frame(&context, &mut app, vec![]);
+    let strings = super::super::tests::text(&frame(&context, &mut app, vec![]));
+    assert!(
+        strings
+            .iter()
+            .any(|s| s == "Favourite" || s == "In Favourites")
+    );
+    let shown = strings.iter().filter(|s| s.contains("not saved")).count();
+    assert_eq!(shown, 1, "{strings:?}");
+}
+
+#[test]
+fn game_details_shows_a_failure_once() {
+    let context = eframe::egui::Context::default();
+    let mut app = star_app(&context);
+    app.router.current = super::super::routes::Route::Game(1);
     app.collections.message = Some("That change was not saved: fixture".into());
     frame(&context, &mut app, vec![]);
     let strings = super::super::tests::text(&frame(&context, &mut app, vec![]));
     let shown = strings.iter().filter(|s| s.contains("not saved")).count();
     assert_eq!(shown, 1, "{strings:?}");
+}
+
+#[test]
+fn opening_rename_keeps_the_name_on_screen_at_that_moment() {
+    let context = eframe::egui::Context::default();
+    let (mut app, _sent) = recording_app(&context, &[(5, "Kids")]);
+    app.collections.scope = Some(5);
+    click_text(&context, &mut app, "Rename");
+    assert!(matches!(
+        &app.collections.dialog,
+        super::Dialog::Rename { seen, .. } if seen == "Kids"
+    ));
+}
+
+#[test]
+fn rename_and_delete_stay_off_until_the_last_change_is_answered() {
+    let context = eframe::egui::Context::default();
+    for label in ["Rename", "Delete"] {
+        let (mut app, _sent) = recording_app(&context, &[(5, "Kids")]);
+        app.collections.scope = Some(5);
+        app.collections.pending = 1;
+        click_text(&context, &mut app, label);
+        assert!(
+            matches!(app.collections.dialog, super::Dialog::None),
+            "{label}"
+        );
+    }
+    let (mut app, sent) = recording_app(&context, &[(5, "Kids")]);
+    app.collections.pending = 1;
+    app.collections.dialog = super::Dialog::Rename {
+        collection: 5,
+        seen: "Kids".into(),
+        name: "New".into(),
+    };
+    click_text(&context, &mut app, "Rename");
+    assert!(sent.try_recv().is_err());
+}
+
+#[test]
+fn a_worker_that_dies_mid_job_does_not_leave_the_buttons_off() {
+    let mut state = State::default();
+    let (jobs, _requests) = std::sync::mpsc::channel();
+    let (answers, results) = std::sync::mpsc::channel();
+    state.worker = Some((jobs, results));
+    state.pending = 1;
+    drop(answers);
+    state.poll(&Arc::new(library()));
+    assert_eq!(state.pending, 0);
+    assert_eq!(state.message.as_deref(), Some(super::UNAVAILABLE));
 }

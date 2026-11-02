@@ -345,6 +345,7 @@ fn start_worker(
     (jobs, results)
 }
 
+const UNAVAILABLE: &str = "Collections are unavailable. Reopen EmuWiz.";
 const READ_FAILED: &str = "Saved collections could not be read just now.";
 
 #[derive(Default)]
@@ -403,7 +404,7 @@ impl State {
             if jobs.send(job).is_ok() {
                 self.pending += 1;
             } else {
-                self.message = Some("Collections are unavailable. Reopen EmuWiz.".into());
+                self.message = Some(UNAVAILABLE.to_string());
             }
         }
     }
@@ -451,11 +452,19 @@ impl State {
     /// Collect finished work. Called every frame; does nothing when idle.
     pub(super) fn poll(&mut self, library: &Arc<Library>) {
         let mut newest = None;
-        while let Some(answer) = self
-            .worker
-            .as_ref()
-            .and_then(|(_, answers)| answers.try_recv().ok())
-        {
+        while let Some((_, answers)) = &self.worker {
+            let answer = match answers.try_recv() {
+                Ok(answer) => answer,
+                Err(mpsc::TryRecvError::Empty) => break,
+                // Nothing further will be answered, so nothing may wait for it.
+                Err(mpsc::TryRecvError::Disconnected) => {
+                    if self.pending > 0 {
+                        self.pending = 0;
+                        self.message = Some(UNAVAILABLE.to_string());
+                    }
+                    break;
+                }
+            };
             self.pending = self.pending.saturating_sub(1);
             if let Some(error) = &answer.error {
                 self.message = Some(format!("That change was not saved: {error}"));
