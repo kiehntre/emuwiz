@@ -12,7 +12,7 @@ use super::identity::{DatPlatformIdentity, identify_dat_source};
 use super::library_identity_projection::project_dat_audit_for_library_identity;
 use super::library_identity_summary::DatVerificationState;
 use super::limits::DatLimits;
-use super::model::{DatEcosystem, DatPackingPolicy};
+use super::model::{DatEcosystem, DatPackingPolicy, ParsedDat};
 use super::parsers::parse_dat_file;
 use super::sources::DatSourceKind;
 use super::sources::audit_cache::AuditCacheConfig;
@@ -157,6 +157,44 @@ fn same_file(a: &std::fs::Metadata, b: &std::fs::Metadata) -> bool {
         && a.ctime_nsec() == b.ctime_nsec()
 }
 
+/// Whether the frozen catalogue is for `platform`, from its own header.
+///
+/// An ordinary game list must name `platform`. Extras (downloadable
+/// content, e-Reader cards and so on) are only accepted when the person set
+/// that system for the catalogue themselves, and so is a header naming more
+/// than one system when the person chose one of them. A catalogue whose header has no
+/// name falls back to the older evidence rules; any other header (several
+/// systems, not games, ambiguous, unsupported) is refused.
+fn catalogue_is_for(parsed: &ParsedDat, platform: &str, assigned: Option<&str>) -> bool {
+    use super::catalogue_recognition::{CatalogueRecognition, recognise_catalogue, same_platform};
+    let recognition =
+        recognise_catalogue(parsed.source.name.as_deref(), Some(parsed.source.ecosystem));
+    match &recognition {
+        CatalogueRecognition::Games { .. } => recognition.is_for(platform),
+        CatalogueRecognition::Extras { .. } => {
+            recognition.is_for(platform)
+                && assigned
+                    .and_then(crate::canonical_platform_for_alias)
+                    .is_some_and(|assigned| same_platform(assigned, platform))
+        }
+        // The person resolved the ambiguity by choosing one of the systems
+        // the header names.
+        CatalogueRecognition::Ambiguous { platforms } => {
+            platforms
+                .iter()
+                .any(|candidate| same_platform(candidate, platform))
+                && assigned
+                    .and_then(crate::canonical_platform_for_alias)
+                    .is_some_and(|assigned| same_platform(assigned, platform))
+        }
+        CatalogueRecognition::NoName => matches!(
+            identify_dat_source(parsed),
+            DatPlatformIdentity::Resolved { platform: p, .. } if p == platform
+        ),
+        _ => false,
+    }
+}
+
 /// Metadata-only ROM population preview; DAT bytes are frozen and parsed on the worker.
 pub fn preview_library_verification(
     resolved: ResolvedCatalogue,
@@ -203,12 +241,11 @@ pub fn preview_library_verification(
     {
         return Err("Managed catalogue snapshot changed.".into());
     }
-    match identify_dat_source(&parsed) {
-        DatPlatformIdentity::Resolved { platform: p, .. } if p == platform => {}
-        _ => return Err(
+    if !catalogue_is_for(&parsed, &platform, resolved.assigned_platform.as_deref()) {
+        return Err(
             "Catalogue platform is unknown, ambiguous or incompatible with the selected system."
                 .into(),
-        ),
+        );
     }
     if resolved
         .assigned_platform
@@ -615,3 +652,7 @@ impl VerificationPreview {
 
 #[cfg(test)]
 mod tests;
+
+#[cfg(test)]
+#[path = "library_verification/recognition_tests.rs"]
+mod recognition_tests;

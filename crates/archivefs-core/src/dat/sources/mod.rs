@@ -40,6 +40,7 @@ pub mod audit_cache;
 pub mod audit_run;
 pub mod audit_targets;
 pub mod config;
+pub mod recognition;
 pub mod validation;
 
 use std::collections::BTreeMap;
@@ -51,9 +52,10 @@ use crate::dat::model::DatEcosystem;
 
 pub use crate::dat::policy::{DatPolicyConfig, default_dat_policy};
 pub use config::{
-    DatSourceConfigEntry, DatSourcesConfig, default_dat_sources_config_path,
-    load_dat_sources_config_default, load_dat_sources_config_from, save_dat_sources_config_default,
-    save_dat_sources_config_to,
+    DatSourceConfigEntry, DatSourcesConfig, DatSourcesRevision, DatSourcesSaveError,
+    default_dat_sources_config_path, load_dat_sources_config_default, load_dat_sources_config_from,
+    load_dat_sources_config_with_revision, save_dat_sources_config_default,
+    save_dat_sources_config_if_unchanged, save_dat_sources_config_to,
 };
 pub use validation::{
     DatDiagnostic, DatFileOutcome, DatFileReport, DatPathRefusal, DatValidationReport,
@@ -297,6 +299,23 @@ pub struct DatSourceHealth {
     /// without reopening the DAT. Empty for a source with no arcade catalogue.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub arcade_catalogue_revisions: Vec<ArcadeCatalogueRevision>,
+    /// The catalogue header this validation read, for recognising which
+    /// system the catalogue describes. File sources only.
+    pub header: Option<RecordedDatHeader>,
+}
+
+/// The header `<name>` and parsed ecosystem one validation read from a DAT
+/// file, tied to the file observation it was read with.
+///
+/// `observed` repeats the health record's size and modification time. A
+/// header is only trusted while it still matches them, so a record an older
+/// build re-validated (which keeps these keys as unknown fields but rewrites
+/// the observation) can never pass off an old header as the current one.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RecordedDatHeader {
+    pub name: Option<String>,
+    pub ecosystem: Option<crate::dat::model::DatEcosystem>,
+    pub observed: String,
 }
 
 impl DatSourceHealth {
@@ -307,6 +326,25 @@ impl DatSourceHealth {
     /// The recorded state, or `NotChecked` when nothing was recorded.
     pub fn state(&self) -> DatHealthState {
         self.state.unwrap_or(DatHealthState::NotChecked)
+    }
+
+    /// `size:seconds:nanoseconds` of the observation this record was made
+    /// with, or `None` when the file was not observed.
+    pub fn observation(&self) -> Option<String> {
+        let size = self.observed_size_bytes?;
+        let modified = self.observed_modified_unix_seconds?;
+        Some(format!(
+            "{size}:{modified}:{}",
+            self.observed_modified_subsec_nanos
+                .map_or_else(|| "-".to_string(), |nanos| nanos.to_string())
+        ))
+    }
+
+    /// The header this record's own validation read, if it is still the one
+    /// that belongs to the recorded observation.
+    pub fn current_header(&self) -> Option<&RecordedDatHeader> {
+        let header = self.header.as_ref()?;
+        (Some(header.observed.as_str()) == self.observation().as_deref()).then_some(header)
     }
 
     /// Whether the file this verdict describes has changed since.
@@ -371,6 +409,11 @@ pub struct DatSourceEntry {
     pub enabled: bool,
     pub priority: u32,
     pub platform: Option<String>,
+    /// The header name `platform` was recognised from, when a person applied
+    /// a recognised match rather than choosing the system themselves. Only
+    /// shown as "recognised" while it still agrees with the current header
+    /// and `platform`; otherwise the assignment is treated as the person's.
+    pub platform_recognised_from: Option<String>,
     /// How this source came to be registered, for provenance. Free text set by
     /// whoever added it (`"added via GUI"`), never interpreted.
     pub origin: Option<String>,
@@ -400,6 +443,7 @@ impl DatSourceEntry {
             enabled: true,
             priority: DEFAULT_DAT_PRIORITY,
             platform: None,
+            platform_recognised_from: None,
             origin: None,
             added_unix_seconds: Some(now_unix()),
             health: DatSourceHealth::default(),

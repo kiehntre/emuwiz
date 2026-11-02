@@ -88,6 +88,10 @@ pub struct DatSourceConfigEntry {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub platform: Option<String>,
 
+    /// The header name a recognised match was applied from.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub platform_recognised_from_header: Option<String>,
+
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub origin: Option<String>,
 
@@ -133,6 +137,18 @@ pub struct DatSourceConfigEntry {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub health_arcade_catalogue_revisions: Option<Vec<String>>,
 
+    /// The header `<name>` the last validation read (file sources only).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub health_header_name: Option<String>,
+
+    /// The parsed ecosystem of that header.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub health_header_ecosystem: Option<crate::dat::model::DatEcosystem>,
+
+    /// The `size:seconds:nanoseconds` observation the header was read with.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub health_header_observed: Option<String>,
+
     /// Keys inside this entry that a newer build wrote.
     #[serde(flatten)]
     pub unknown_fields: toml::Table,
@@ -162,6 +178,7 @@ impl DatSourceConfigEntry {
                 .unwrap_or(super::DEFAULT_DAT_PRIORITY)
                 .clamp(MIN_DAT_PRIORITY, super::MAX_DAT_PRIORITY),
             platform: self.platform.filter(|value| !value.trim().is_empty()),
+            platform_recognised_from: self.platform_recognised_from_header,
             origin: self.origin,
             added_unix_seconds: self.added_unix_seconds,
             health: DatSourceHealth {
@@ -180,6 +197,13 @@ impl DatSourceConfigEntry {
                         .as_deref()
                         .unwrap_or(&[]),
                 ),
+                header: self
+                    .health_header_observed
+                    .map(|observed| super::RecordedDatHeader {
+                        name: self.health_header_name,
+                        ecosystem: self.health_header_ecosystem,
+                        observed,
+                    }),
             },
             unknown_fields: self.unknown_fields,
         }
@@ -195,6 +219,7 @@ impl DatSourceConfigEntry {
             enabled: Some(entry.enabled),
             priority: Some(entry.priority),
             platform: entry.platform.clone(),
+            platform_recognised_from_header: entry.platform_recognised_from.clone(),
             origin: entry.origin.clone(),
             added_unix_seconds: entry.added_unix_seconds,
             health_state: entry.health.state,
@@ -210,6 +235,21 @@ impl DatSourceConfigEntry {
             health_arcade_catalogue_revisions: ArcadeCatalogueRevision::encode_all(
                 &entry.health.arcade_catalogue_revisions,
             ),
+            health_header_name: entry
+                .health
+                .header
+                .as_ref()
+                .and_then(|header| header.name.clone()),
+            health_header_ecosystem: entry
+                .health
+                .header
+                .as_ref()
+                .and_then(|header| header.ecosystem),
+            health_header_observed: entry
+                .health
+                .header
+                .as_ref()
+                .map(|header| header.observed.clone()),
             unknown_fields: entry.unknown_fields.clone(),
         }
     }
@@ -256,6 +296,163 @@ pub fn load_dat_sources_config_from(
     toml::from_str(&text).map_err(|error| {
         ArchiveFsError::Config(format!("failed to parse {}: {error}", path.display()))
     })
+}
+
+/// What the registry file held when it was read: the SHA-256 of its bytes,
+/// or `None` when there was no file.
+///
+/// A page that loads the registry keeps this and passes it back when it
+/// saves. The save is refused if the file no longer holds exactly those
+/// bytes, so an edit made elsewhere in the meantime (another window, a pack
+/// import, a hand edit) is never silently overwritten.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DatSourcesRevision(Option<String>);
+
+impl DatSourcesRevision {
+    fn of(bytes: Option<&[u8]>) -> Self {
+        use sha2::{Digest, Sha256};
+        Self(bytes.map(|bytes| {
+            Sha256::digest(bytes)
+                .iter()
+                .map(|byte| format!("{byte:02x}"))
+                .collect()
+        }))
+    }
+
+    /// The revision of the registry file at `path` as it is now.
+    pub fn current(path: impl AsRef<Path>) -> Result<Self, ArchiveFsError> {
+        let path = path.as_ref();
+        match fs::read(path) {
+            Ok(bytes) => Ok(Self::of(Some(&bytes))),
+            Err(source) if source.kind() == std::io::ErrorKind::NotFound => Ok(Self::of(None)),
+            Err(source) => Err(ArchiveFsError::io(path.to_path_buf(), source)),
+        }
+    }
+}
+
+/// Why a conditional save did not happen.
+#[derive(Debug)]
+pub enum DatSourcesSaveError {
+    /// The file changed since it was read. Nothing was written.
+    ChangedElsewhere,
+    /// Another save held the registry lock for too long. Nothing was written.
+    Busy,
+    Failed(ArchiveFsError),
+}
+
+impl std::fmt::Display for DatSourcesSaveError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::ChangedElsewhere => f.write_str(
+                "your DAT setup was changed somewhere else after this page read it \
+                 (for example in another EmuWiz window). Nothing was saved. Reload the \
+                 setup to see the latest version, then try again",
+            ),
+            Self::Busy => f.write_str(
+                "another save of your DAT setup is still in progress. Nothing was saved. \
+                 Try again in a moment",
+            ),
+            Self::Failed(error) => write!(f, "{error}"),
+        }
+    }
+}
+
+impl From<ArchiveFsError> for DatSourcesSaveError {
+    fn from(error: ArchiveFsError) -> Self {
+        Self::Failed(error)
+    }
+}
+
+/// Reads the registry together with the revision it was read at. The bytes
+/// are read once, so the revision describes exactly what was parsed.
+pub fn load_dat_sources_config_with_revision(
+    path: impl AsRef<Path>,
+) -> Result<(DatSourcesConfig, DatSourcesRevision), ArchiveFsError> {
+    let path = path.as_ref();
+    let bytes = match fs::read(path) {
+        Ok(bytes) => bytes,
+        Err(source) if source.kind() == std::io::ErrorKind::NotFound => {
+            return Ok((DatSourcesConfig::default(), DatSourcesRevision::of(None)));
+        }
+        Err(source) => return Err(ArchiveFsError::io(path.to_path_buf(), source)),
+    };
+    let revision = DatSourcesRevision::of(Some(&bytes));
+    let text = String::from_utf8(bytes).map_err(|error| {
+        ArchiveFsError::Config(format!("failed to parse {}: {error}", path.display()))
+    })?;
+    if text.trim().is_empty() {
+        return Ok((DatSourcesConfig::default(), revision));
+    }
+    let config = toml::from_str(&text).map_err(|error| {
+        ArchiveFsError::Config(format!("failed to parse {}: {error}", path.display()))
+    })?;
+    Ok((config, revision))
+}
+
+/// Writes the registry only if it still holds `expected`, and returns the
+/// new revision.
+///
+/// The check and the write happen while an exclusive lock on a sibling
+/// `dat_sources.toml.lock` file is held, so two EmuWiz saves cannot
+/// interleave. A writer that does not take the lock is still caught by the
+/// byte comparison unless it writes in the instant between the check and
+/// the atomic rename.
+pub fn save_dat_sources_config_if_unchanged(
+    path: impl AsRef<Path>,
+    expected: &DatSourcesRevision,
+    config: &DatSourcesConfig,
+) -> Result<DatSourcesRevision, DatSourcesSaveError> {
+    let path = path.as_ref();
+    let _lock = lock_registry(path)?;
+    if &DatSourcesRevision::current(path)? != expected {
+        return Err(DatSourcesSaveError::ChangedElsewhere);
+    }
+    save_dat_sources_config_to(path, config)?;
+    Ok(DatSourcesRevision::current(path)?)
+}
+
+/// Holds the registry's sibling lock file exclusively until dropped. Waits a
+/// short, bounded time for another save to finish.
+fn lock_registry(path: &Path) -> Result<fs::File, DatSourcesSaveError> {
+    let lock_path = match path.file_name() {
+        Some(name) => {
+            let mut name = name.to_os_string();
+            name.push(".lock");
+            path.with_file_name(name)
+        }
+        None => {
+            return Err(DatSourcesSaveError::Failed(ArchiveFsError::Config(
+                format!("{} is not a file path", path.display()),
+            )));
+        }
+    };
+    if let Some(parent) = lock_path.parent()
+        && !parent.as_os_str().is_empty()
+    {
+        fs::create_dir_all(parent)
+            .map_err(|source| ArchiveFsError::io(parent.to_path_buf(), source))?;
+    }
+    let file = fs::OpenOptions::new()
+        .create(true)
+        .truncate(false)
+        .write(true)
+        .open(&lock_path)
+        .map_err(|source| ArchiveFsError::io(lock_path.clone(), source))?;
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+    loop {
+        match file.try_lock() {
+            Ok(()) => return Ok(file),
+            Err(fs::TryLockError::WouldBlock) if std::time::Instant::now() < deadline => {
+                std::thread::sleep(std::time::Duration::from_millis(20));
+            }
+            Err(fs::TryLockError::WouldBlock) => return Err(DatSourcesSaveError::Busy),
+            Err(fs::TryLockError::Error(source)) => {
+                return Err(DatSourcesSaveError::Failed(ArchiveFsError::io(
+                    lock_path, source,
+                )));
+            }
+        }
+    }
 }
 
 pub fn save_dat_sources_config_default(config: &DatSourcesConfig) -> Result<(), ArchiveFsError> {

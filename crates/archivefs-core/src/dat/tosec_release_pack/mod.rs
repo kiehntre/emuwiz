@@ -31,10 +31,9 @@ use std::path::{Component, Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
 
-use super::sources::config::{
-    DatSourceConfigEntry, DatSourcesConfig, load_dat_sources_config_from,
-    save_dat_sources_config_to,
-};
+use super::sources::config::{DatSourceConfigEntry, DatSourcesConfig};
+#[cfg(test)]
+use super::sources::config::{load_dat_sources_config_from, save_dat_sources_config_to};
 use super::sources::{DEFAULT_DAT_PRIORITY, DatSourceKind, DatSourceOwnership};
 use crate::ArchiveFsError;
 use crate::identity_source::managed_snapshot::{
@@ -1869,6 +1868,7 @@ pub fn register_selected_tosec_dats(
                     enabled: Some(true),
                     priority: Some(DEFAULT_DAT_PRIORITY),
                     platform: None,
+                    platform_recognised_from_header: None,
                     origin: Some(provenance.summary()),
                     added_unix_seconds: Some(now_unix_seconds),
                     health_state: None,
@@ -1882,6 +1882,9 @@ pub fn register_selected_tosec_dats(
                     health_observed_modified_unix_seconds: None,
                     health_observed_modified_subsec_nanos: None,
                     health_arcade_catalogue_revisions: None,
+                    health_header_name: None,
+                    health_header_ecosystem: None,
+                    health_header_observed: None,
                     unknown_fields: toml::Table::new(),
                 };
                 let sources_list = sources.sources.get_or_insert_with(Vec::new);
@@ -1928,9 +1931,14 @@ pub fn apply_selection_to_registry(
     registry_path: &Path,
     now_unix_seconds: u64,
 ) -> Result<TosecRegistrationOutcome, ArchiveFsError> {
-    let mut sources = load_dat_sources_config_from(registry_path)?;
+    let (mut sources, revision) =
+        crate::dat::sources::load_dat_sources_config_with_revision(registry_path)?;
     let outcome = register_selected_tosec_dats(pack, &mut sources, now_unix_seconds);
-    save_dat_sources_config_to(registry_path, &sources)?;
+    crate::dat::sources::save_dat_sources_config_if_unchanged(registry_path, &revision, &sources)
+        .map_err(|error| match error {
+        crate::dat::sources::DatSourcesSaveError::Failed(error) => error,
+        other => ArchiveFsError::Config(other.to_string()),
+    })?;
     Ok(outcome)
 }
 
