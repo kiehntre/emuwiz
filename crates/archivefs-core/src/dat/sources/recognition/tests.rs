@@ -885,6 +885,16 @@ mod durable_undo {
         let undone = undo_apply(&setup.config, &setup.revision(), &applied.batch).unwrap();
         assert_eq!(undone.cleared, vec!["gbc".to_string()]);
         assert_eq!(undone.left_alone, vec!["gb.dat".to_string()]);
+        // Undo never invents history for what it left alone.
+        let registry = setup.registry();
+        assert_eq!(
+            registry.get("gb").unwrap().platform_provenance(),
+            PlatformProvenance::Unrecorded
+        );
+        assert_eq!(
+            registry.get("gba").unwrap().platform_provenance(),
+            PlatformProvenance::ChosenByPerson
+        );
         assert_eq!(
             platforms(&setup.registry()),
             vec![
@@ -1026,7 +1036,7 @@ mod provenance {
     }
 
     #[test]
-    fn choosing_by_hand_replaces_a_recognised_origin_and_undo_clears_it() {
+    fn undo_clears_provenance_and_never_undoes_a_later_hand_choice() {
         let setup = Setup::new(&[("gbc", "gbc.dat", "Nintendo - Game Boy Color")]);
         let registry = setup.registry();
         let applied = apply_safe_matches(
@@ -1044,7 +1054,7 @@ mod provenance {
         );
 
         let registry = setup.registry();
-        apply_safe_matches(
+        let second = apply_safe_matches(
             &setup.config,
             &setup.revision(),
             &registry,
@@ -1059,6 +1069,13 @@ mod provenance {
         });
         assert_eq!(origin_of(&setup, "gbc"), PlatformProvenance::ChosenByPerson);
         assert_eq!(last_undoable_apply(&setup.registry()), None);
+        // Even asked directly, Undo of that apply leaves the choice alone.
+        let batch = second.batch.clone();
+        assert!(matches!(
+            undo_apply(&setup.config, &setup.revision(), &batch),
+            Err(ApplyRefusal::NothingToApply)
+        ));
+        assert_eq!(origin_of(&setup, "gbc"), PlatformProvenance::ChosenByPerson);
     }
 
     #[test]
@@ -1106,4 +1123,33 @@ mod provenance {
         });
         assert_eq!(origin_of(&setup, "gb"), PlatformProvenance::Unrecorded);
     }
+}
+
+#[test]
+fn an_unrecorded_system_needs_a_check_once_its_catalogue_changes() {
+    let setup = Setup::new(&[("gbc", "gbc.dat", "Nintendo - Game Boy Color")]);
+    setup.edit(|registry| {
+        registry.get_mut("gbc").unwrap().platform = Some("Game Boy Color".into());
+    });
+    assert_eq!(
+        group_of(&setup.registry(), "gbc"),
+        RecognitionGroup::AlreadySet
+    );
+    std::thread::sleep(std::time::Duration::from_millis(20));
+    touch(&setup.path("gbc.dat"));
+    assert_eq!(
+        group_of(&setup.registry(), "gbc"),
+        RecognitionGroup::NeedsCheck
+    );
+    // A person's own choice is left as chosen.
+    setup.edit(|registry| {
+        registry
+            .get_mut("gbc")
+            .unwrap()
+            .set_platform_by_person(Some("Game Boy Color".into()));
+    });
+    assert_eq!(
+        group_of(&setup.registry(), "gbc"),
+        RecognitionGroup::AlreadySet
+    );
 }

@@ -373,3 +373,22 @@ fn known_extras_qualifiers_stay_extras_and_spelled_names_stay_games() {
         assert_eq!(no_intro(name), games(platform), "{name}");
     }
 }
+
+#[test]
+fn an_unknown_leading_word_is_never_ignored() {
+    assert_eq!(
+        extras(&no_intro("Hacks - Game Boy"), "Game Boy"),
+        "\u{201c}Hacks\u{201d}"
+    );
+    let recognition = no_intro("Homebrew - Nintendo - Game Boy");
+    assert_eq!(recognition.safe_platform(), None, "{recognition:?}");
+    assert!(recognition.is_for("Game Boy"), "{recognition:?}");
+    // Reviewed makers still lead ordinary lists.
+    assert_eq!(no_intro("Nintendo - Game Boy"), games("Game Boy"));
+}
+
+#[test]
+fn an_unknown_part_of_a_tosec_system_name_is_never_ignored() {
+    let recognition = tosec("Nintendo Game Boy & Foo - Games");
+    assert_eq!(recognition.safe_platform(), None, "{recognition:?}");
+}

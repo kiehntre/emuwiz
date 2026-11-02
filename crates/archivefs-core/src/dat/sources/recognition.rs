@@ -144,7 +144,6 @@ fn assigned_group(
     assigned: &str,
     state: &RecognitionState,
 ) -> RecognitionGroup {
-    let by_recognition = assigned_by_recognition(entry);
     // Only a person's own choice may stand for extras or for one system of
     // several; a recognised or unrecorded system must match a game list.
     let chosen = entry.platform_provenance() == PlatformProvenance::ChosenByPerson;
@@ -169,9 +168,10 @@ fn assigned_group(
                 RecognitionGroup::Conflict
             }
         }
-        // Set automatically, but the header it came from is no longer
-        // current: check the catalogue again before trusting it.
-        RecognitionState::NotChecked | RecognitionState::Changed if by_recognition => {
+        // Set automatically, or with no record of who set it, and the
+        // header is not current: check the catalogue again before trusting
+        // it. Only the person's own choice stands without a check.
+        RecognitionState::NotChecked | RecognitionState::Changed if !chosen => {
             RecognitionGroup::NeedsCheck
         }
         RecognitionState::NotChecked | RecognitionState::Changed | RecognitionState::Folder => {
@@ -491,6 +491,10 @@ pub fn undo_apply(
             entry.platform_recognised_from = None;
             cleared.push(id.clone());
         } else {
+            // Changed afterwards by something that does not record who set
+            // it: the system stays, and it no longer claims to be the
+            // recognised one, so it reads as unrecorded, not as applied.
+            entry.platform_recognised_from = None;
             left_alone.push(entry.display_name.clone());
         }
     }

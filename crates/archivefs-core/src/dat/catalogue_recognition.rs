@@ -351,14 +351,24 @@ fn tosec_system_platform(system: &str) -> Result<&'static str, CatalogueRecognit
         return Ok(platform);
     }
     let mut candidates = Vec::new();
-    collect(&mut candidates, system);
-    for part in split_names(system) {
-        collect(&mut candidates, part);
-        if let Some(rest) = strip_maker(part) {
-            collect(&mut candidates, rest);
-        }
+    if collect(&mut candidates, system) {
+        return decide(candidates, system);
     }
-    decide(candidates, system)
+    let mut unknown = false;
+    for part in split_names(system) {
+        let known = collect(&mut candidates, part)
+            | strip_maker(part).is_some_and(|rest| collect(&mut candidates, rest));
+        unknown |= !known;
+    }
+    match decide(candidates, system) {
+        // A part naming no system could narrow what the catalogue holds, so
+        // it is never dropped to leave an ordinary list.
+        Ok(platform) if unknown => Err(CatalogueRecognition::Extras {
+            platform,
+            what: format!("\u{201c}{system}\u{201d}"),
+        }),
+        other => other,
+    }
 }
 
 /// TOSEC names lead with the maker ("Nintendo Game Boy"). Only these exact
@@ -479,23 +489,99 @@ fn no_intro_system_platform(
     let mut segments = system.split(" - ");
     let maker = segments.next().unwrap_or_default();
     let names: Vec<&str> = segments.collect();
-    // The whole name, or everything after the maker, spelled as one alias
-    // (for example "Sega - Master System - Mark III").
+    // The whole name spelled as one alias needs nothing else checked.
     let mut whole = collect(&mut candidates, system);
-    if !names.is_empty() {
-        whole |= collect(&mut candidates, &names.join(" - "));
-    }
     let mut unknown = Vec::new();
+    if !names.is_empty() {
+        // A leading word that is not a reviewed maker (for example "Hacks"
+        // or "Homebrew") may describe a subset, so it is never ignored.
+        let maker_known = is_known_maker(maker);
+        if !maker_known && !whole {
+            unknown.push(maker.to_string());
+        }
+        // Everything after the maker spelled as one alias (for example
+        // "Sega - Master System - Mark III").
+        let rest = collect(&mut candidates, &names.join(" - "));
+        whole |= rest && maker_known;
+    }
     for segment in names {
         for part in split_names(segment) {
             let known = collect(&mut candidates, part)
-                | collect(&mut candidates, &format!("{maker} {part}"));
+                | collect(&mut candidates, &format!("{maker} {part}"))
+                | is_known_maker(part);
             if !known && !whole {
                 unknown.push(part.to_string());
             }
         }
     }
     decide(candidates, system).map(|platform| (platform, unknown))
+}
+
+/// Reviewed makers that lead a No-Intro / Redump style name. Any other
+/// leading word is treated as a qualifier, not skipped.
+const NO_INTRO_MAKERS: &[&str] = &[
+    "Acorn",
+    "Amstrad",
+    "APF",
+    "Apple",
+    "Atari",
+    "Bally",
+    "Bandai",
+    "Benesse",
+    "Casio",
+    "Coleco",
+    "Commodore",
+    "Emerson",
+    "Entex",
+    "Epoch",
+    "Fairchild",
+    "Fujitsu",
+    "Funtech",
+    "GamePark",
+    "GCE",
+    "Hartung",
+    "IBM",
+    "Interton",
+    "iQue",
+    "Konami",
+    "LeapFrog",
+    "Magnavox",
+    "Mattel",
+    "Microsoft",
+    "Mobile",
+    "NEC",
+    "Nichibutsu",
+    "Nintendo",
+    "Nokia",
+    "Ouya",
+    "Panasonic",
+    "Philips",
+    "RCA",
+    "Sanyo",
+    "Sega",
+    "Seta",
+    "Sharp",
+    "Sinclair",
+    "SNK",
+    "Sony",
+    "Tandy",
+    "TeleNova",
+    "Texas Instruments",
+    "Thomson",
+    "Tiger",
+    "Tomy",
+    "Toshiba",
+    "VM Labs",
+    "VTech",
+    "Watara",
+    "Welback",
+    "Yamaha",
+    "ZAPiT Games",
+    "Zeebo",
+];
+
+fn is_known_maker(word: &str) -> bool {
+    NO_INTRO_MAKERS.contains(&word.trim())
 }
 
 /// Splits `A + B`, `A & B` and `A / B` into separate names.

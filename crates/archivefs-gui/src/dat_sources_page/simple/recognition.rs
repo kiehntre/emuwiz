@@ -60,8 +60,11 @@ pub(super) fn row_text(row: &RecognitionRow) -> String {
             "Used for {assigned} (not recorded who set it), but the catalogue says: {header}. \
              Choose its system again if {assigned} is right. Nothing was changed."
         ),
-        (RecognitionGroup::NeedsCheck, _) => format!(
+        (RecognitionGroup::NeedsCheck, PlatformProvenance::AppliedFromRecognition) => format!(
             "Set to {assigned} automatically. {header}; check catalogues again to confirm it."
+        ),
+        (RecognitionGroup::NeedsCheck, _) => format!(
+            "Used for {assigned} (not recorded who set it). {header}; check catalogues to confirm it."
         ),
         (_, PlatformProvenance::AppliedFromRecognition) => {
             format!("Used for {assigned} (recognised from the catalogue)")
@@ -180,8 +183,9 @@ pub(super) fn card(
             if ui
                 .add_enabled(!busy, egui::Button::new("Undo"))
                 .on_hover_text(format!(
-                    "Clears the system set by the last \u{201c}Apply all safe matches\u{201d} for {}. Anything changed since is left alone.",
-                    plural(n, "catalogue", "catalogues")
+                    "Clears the system set by the latest \u{201c}Apply all safe matches\u{201d} that can still be undone, for {}: {}. Anything changed since is left alone.",
+                    plural(n, "catalogue", "catalogues"),
+                    undo.catalogues.join(", ")
                 ))
                 .clicked()
             {

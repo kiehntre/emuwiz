@@ -450,3 +450,21 @@ fn the_catalogue_picker_says_who_set_each_system() {
         "{labels:?}"
     );
 }
+
+#[test]
+fn applying_a_check_of_a_changed_file_marks_its_earlier_results_stale() {
+    let dir = tempfile::tempdir().unwrap();
+    let config = setup(dir.path(), CATALOGUES);
+    let (before, _) =
+        DatSourceRegistry::from_config(&load_dat_sources_config_from(&config).unwrap());
+    let mut after = before.clone();
+    after.get_mut("src-165").unwrap().health.observed_size_bytes = Some(999_999);
+    assert_eq!(
+        super::super::sources_needing_stale_mark(
+            &before,
+            &after,
+            ["src-165", "src-170"].into_iter()
+        ),
+        vec!["src-165".to_string()]
+    );
+}
