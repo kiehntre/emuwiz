@@ -10,6 +10,9 @@ The rules here, which test_gui_sandbox.py enforces:
 * Every process is started by `spawn`, in its own session, with a random token
   in its environment. A process counts as owned only if `/proc/<pid>/environ`
   holds that exact token. Descendants inherit it; nothing else can have it.
+* `spawn` returns only once the child's `/proc/<pid>/environ` shows the token.
+  Right after fork the kernel can still show the parent's environment, or an
+  empty one, so a just-started child is briefly unprovable.
 * Signals go only through a pidfd, opened first and then checked, so a reused
   PID can never be hit. `os.kill` and `os.killpg` are not used at all.
 * The display comes from `Xvfb -displayfd` and is refused if it is the one this
@@ -44,6 +47,7 @@ DESKTOP_COMMANDS = {
 # SESSION_MANAGER or XAUTHORITY.
 INHERITED_ENVIRONMENT = ("LANG", "LC_ALL", "PATH", "RUST_LOG", "TERM")
 STOP_TIMEOUT_SECONDS = 5.0
+SPAWN_TIMEOUT_SECONDS = 5.0
 
 
 class SandboxError(RuntimeError):
@@ -135,7 +139,18 @@ class Sandbox:
             stderr=log,
         )
         self.children.append(child)
+        self._await_token(child)
         return child
+
+    def _await_token(self, child):
+        """Wait until the child is provably ours, or has already exited."""
+        deadline = time.monotonic() + SPAWN_TIMEOUT_SECONDS
+        while self.marker not in _environ(child.pid, self.proc):
+            if child.poll() is not None:
+                return
+            if time.monotonic() >= deadline:
+                raise SandboxError(f"child {child.pid} never showed this sandbox's token")
+            time.sleep(0.001)
 
     def start_display(self, size="1600x900x24"):
         read_end, write_end = os.pipe()
@@ -150,6 +165,7 @@ class Sandbox:
                 stderr=subprocess.DEVNULL,
             )
             self.children.append(child)
+            self._await_token(child)
             os.close(write_end)
             write_end = None
             if not select.select([read_end], [], [], 10)[0]:

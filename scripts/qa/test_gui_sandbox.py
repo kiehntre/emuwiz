@@ -87,6 +87,14 @@ class Limits(unittest.TestCase):
                 sandbox._signal(os.getpid(), 15)
         self.assertTrue(self.alive(self.decoy))
 
+    def test_a_spawned_child_is_owned_as_soon_as_spawn_returns(self):
+        with gui_sandbox.Sandbox() as sandbox:
+            for _ in range(50):
+                child = sandbox.spawn(["sleep", "60"])
+                # Read at once: a scan of all of /proc is slow enough to hide the race.
+                self.assertTrue(sandbox._signal(child.pid, 9))
+                child.wait()
+
     def test_a_reused_pid_is_not_signalled(self):
         with gui_sandbox.Sandbox() as sandbox:
             child = sandbox.spawn(["sleep", "60"])
