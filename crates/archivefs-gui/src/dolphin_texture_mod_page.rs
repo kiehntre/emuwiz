@@ -378,13 +378,20 @@ impl DolphinTextureModPageState {
                     } else {
                         let rollback = result
                             .rollback
+                            .as_ref()
                             .map(|rollback| format!(" Automatic rollback: {:?}.", rollback.status))
                             .unwrap_or_default();
                         let mut detail = format!(
                             "texture-pack installation failed ({:?}).{}",
                             result.apply.journal.status, rollback
                         );
-                        crate::shared_apply_warnings::append(&mut detail, &result.apply);
+                        crate::shared_apply_warnings::append_lines(
+                            &mut detail,
+                            crate::shared_apply_warnings::lines_after_rollback(
+                                &result.apply,
+                                result.rollback.as_ref(),
+                            ),
+                        );
                         self.stage = Some(DolphinTextureModStage::Failed { detail });
                     }
                     true

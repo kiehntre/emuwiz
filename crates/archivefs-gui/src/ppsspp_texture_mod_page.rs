@@ -239,12 +239,7 @@ pub(crate) fn show_ppsspp_texture_mod_panel(
                 if result.apply.journal.status == SharedApplyStatus::Success {
                     state.applied = Some(result.apply);
                 } else {
-                    let mut error = format!(
-                        "Install did not complete: {:?}",
-                        result.apply.journal.status
-                    );
-                    crate::shared_apply_warnings::append(&mut error, &result.apply);
-                    state.error = Some(error);
+                    state.error = Some(incomplete_install_message(&result));
                 }
             }
         }
@@ -294,6 +289,20 @@ pub(crate) fn show_ppsspp_texture_mod_panel(
             );
         }
     });
+}
+
+fn incomplete_install_message(
+    result: &archivefs_core::patch_manager::PpssppTexturePackApplyResult,
+) -> String {
+    let mut message = format!(
+        "Install did not complete: {:?}",
+        result.apply.journal.status
+    );
+    crate::shared_apply_warnings::append_lines(
+        &mut message,
+        crate::shared_apply_warnings::lines_after_rollback(&result.apply, result.rollback.as_ref()),
+    );
+    message
 }
 
 fn show_applied_summary(ui: &mut egui::Ui, result: &SharedApplyResult) {

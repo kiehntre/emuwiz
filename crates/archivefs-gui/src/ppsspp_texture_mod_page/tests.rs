@@ -142,3 +142,30 @@ fn apply_result_shows_shared_transaction_warnings() {
     let result = warned_result();
     assert_shows_warning(&render(|ui| show_applied_summary(ui, &result)));
 }
+
+mod rollback_warnings {
+    use super::*;
+    use crate::shared_apply_warnings::test_support::*;
+
+    fn message(rollback: Option<SharedRollbackResult>) -> String {
+        incomplete_install_message(&PpssppTexturePackApplyResult {
+            apply: partly_failed_result(),
+            rollback,
+        })
+    }
+
+    #[test]
+    fn warning_text_follows_a_successful_rollback() {
+        assert_rollback_succeeded(&message(Some(succeeded_rollback())));
+    }
+
+    #[test]
+    fn warning_text_follows_a_failed_rollback() {
+        assert_rollback_failed(&message(Some(failed_rollback())));
+    }
+
+    #[test]
+    fn warning_text_says_when_no_rollback_ran() {
+        assert_rollback_did_not_run(&message(None));
+    }
+}

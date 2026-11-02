@@ -810,3 +810,50 @@ fn apply_result_shows_shared_transaction_warnings() {
         &output,
     ));
 }
+
+mod rollback_warnings {
+    use super::*;
+    use crate::shared_apply_warnings::test_support::*;
+    use archivefs_core::patch_manager::DolphinTexturePackApplyResult;
+
+    fn detail(rollback: Option<archivefs_core::patch_manager::SharedRollbackResult>) -> String {
+        let (sender, receiver) = std::sync::mpsc::channel();
+        sender
+            .send(DolphinTexturePackApplyResult {
+                apply: partly_failed_result(),
+                rollback,
+            })
+            .unwrap();
+        let mut state = DolphinTextureModPageState {
+            stage: Some(DolphinTextureModStage::PackApplying {
+                receiver,
+                destination_root: PathBuf::from("/disposable/destination"),
+            }),
+            ..Default::default()
+        };
+        assert!(state.poll());
+        let Some(DolphinTextureModStage::Failed { detail }) = state.stage.take() else {
+            panic!("expected the failed stage");
+        };
+        detail
+    }
+
+    #[test]
+    fn warning_text_follows_a_successful_rollback() {
+        let detail = detail(Some(succeeded_rollback()));
+        assert!(detail.contains("Automatic rollback: Success."), "{detail}");
+        assert_rollback_succeeded(&detail);
+    }
+
+    #[test]
+    fn warning_text_follows_a_failed_rollback() {
+        let detail = detail(Some(failed_rollback()));
+        assert!(detail.contains("Automatic rollback: Failed."), "{detail}");
+        assert_rollback_failed(&detail);
+    }
+
+    #[test]
+    fn warning_text_says_when_no_rollback_ran() {
+        assert_rollback_did_not_run(&detail(None));
+    }
+}
