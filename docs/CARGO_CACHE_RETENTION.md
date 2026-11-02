@@ -231,13 +231,24 @@ worktree must stay until `worktree-check` reports CLEAR (artifacts retired with 
 receipt/journal, or none was ever created: no record of a cargo-iso build and an absent or empty cache
 directory). Missing artifacts alone prove nothing: they HOLD as `ARTIFACTS_MISSING_UNVERIFIED`. HOLD reasons: `NOT_RELEASED`, `OWNER_UNVERIFIED`, `COMPLETION_UNVERIFIED`,
 `WRITTEN_AFTER_RELEASE`, `AWAITING_RETIREMENT`, `ACTIVE`, `PINNED`, `PROTECTED_REMNANTS`,
-`SOURCE_MISSING`, `NO_LIFECYCLE_RECORD`, `RECEIPT_UNVERIFIED`, `ARTIFACTS_MISSING_UNVERIFIED`. The gate also holds on the checkout's own
+`SOURCE_MISSING`, `NO_LIFECYCLE_RECORD`, `RECEIPT_UNVERIFIED`, `ARTIFACTS_MISSING_UNVERIFIED`, `UNRECOGNISED_RESIDUE`. The gate also holds on the checkout's own
 Git state, because `git worktree remove` deletes its reflog, ORIG_HEAD, per-worktree refs and ignored files:
 `CHECKOUT_NOT_CLEAN`, `CHECKOUT_INDEX_UNVERIFIED`, `CHECKOUT_PATH_UNVERIFIED`, `GIT_WORKTREE_PROTECTED`,
 `GIT_HISTORY_NOT_PRESERVED`, `GIT_STATE_UNVERIFIED`. A commit counts as preserved only when a ref names it, so
 retain orphans under `refs/preservation/`. `--cargo-state-only` reports the Cargo half alone and never authorises
 removal. A path with no `.git` always holds, including one already removed correctly: the gate cannot
 tell that from a checkout that vanished while still registered, so check before removing, not after.
+
+`UNRECOGNISED_RESIDUE`: even with a verified retirement receipt, the gate is CLEAR only if the cache directory holds nothing
+but directories, Cargo's own empty lock files (`.cargo-lock`, `.cargo-build-lock`, `.cargo-artifact-lock`) and the preserved
+evidence directories (`emuwiz-test-env`, `tmp`, `history`, `undo`, `receipts`, `backups`, `audit-ledger`, directly under the
+cache or one to three levels down, where a profile directory lives; their contents are not inspected). Anything else (a
+standalone executable with no sibling `.d`, a stray or nested file, a symlink, a special file, another filesystem, an
+unreadable or oversized tree) is output retirement does not recognise and so can never retire; with the worktree gone it
+would be an orphan (`SOURCE_MISSING`) that no gate can release. The result carries `residue` (`items`, `bytes`, a few
+example paths) in `--json`. The check is read-only (`lstat`/directory listing only, symlinks never followed), is shared by the
+plain and `--cargo-state-only` paths, and never deletes or selects anything: review the files by hand, then re-check. Every
+earlier hold (`ACTIVE`, `PINNED`, `NOT_RELEASED`, `RECEIPT_UNVERIFIED`, ...) keeps its own reason.
 A release record alone never
 clears the gate or authorises deletion; releasing does not stop builds, remove pins or claim
 processes have exited. The release command takes the target's exclusive lifecycle lock and
