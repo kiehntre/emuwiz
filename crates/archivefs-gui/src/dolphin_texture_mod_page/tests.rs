@@ -798,3 +798,15 @@ fn state_resets_when_the_profile_changes() {
     ));
     assert!(rendered_text_contains(&output, "Choose PNG"));
 }
+
+#[test]
+fn apply_result_shows_shared_transaction_warnings() {
+    use crate::shared_apply_warnings::test_support::{assert_shows_warning, warned_result};
+    let output = render_stage(DolphinTextureModStage::Applied {
+        result: warned_result(),
+        destination_root: PathBuf::from("/disposable/textures"),
+    });
+    assert_shows_warning(&crate::transaction_outcome::test_support::rendered_text(
+        &output,
+    ));
+}

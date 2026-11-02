@@ -206,6 +206,11 @@ fn now() -> u64 {
         .unwrap_or(0)
 }
 
+fn show_applied_summary(ui: &mut egui::Ui, result: &SharedApplyResult) {
+    widgets::status_badge(ui, "Installed", widgets::StatusTone::Success);
+    crate::shared_apply_warnings::show(ui, &crate::shared_apply_warnings::lines(result));
+}
+
 pub(crate) fn show_pcsx2_texture_mod_panel(
     ui: &mut egui::Ui,
     state: &mut Pcsx2TextureModPageState,
@@ -294,7 +299,7 @@ pub(crate) fn show_pcsx2_texture_mod_panel(
                 result,
                 destination,
             }) => {
-                widgets::status_badge(ui, "Installed", widgets::StatusTone::Success);
+                show_applied_summary(ui, &result);
                 if let Some(journal) = result.journal_path.clone() {
                     if widgets::action_button(ui, "Undo", widgets::ActionStyle::Destructive, true)
                         .clicked()
@@ -415,4 +420,18 @@ fn spawn_rollback(preview: SharedRollbackPreview) -> Stage {
         let _ = sender.send(result);
     });
     Stage::RollingBack(receiver)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn apply_result_shows_shared_transaction_warnings() {
+        use crate::shared_apply_warnings::test_support::{
+            assert_shows_warning, render, warned_result,
+        };
+        let result = warned_result();
+        assert_shows_warning(&render(|ui| show_applied_summary(ui, &result)));
+    }
 }

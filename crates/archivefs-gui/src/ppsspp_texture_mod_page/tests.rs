@@ -135,3 +135,10 @@ fn profile_discovery_is_reused_within_the_ttl_and_refreshed_after_it() {
     probe(&mut state, start + PROFILE_DISCOVERY_TTL);
     assert_eq!(probes.get(), 2, "the TTL expiring forces a fresh probe");
 }
+
+#[test]
+fn apply_result_shows_shared_transaction_warnings() {
+    use crate::shared_apply_warnings::test_support::{assert_shows_warning, render, warned_result};
+    let result = warned_result();
+    assert_shows_warning(&render(|ui| show_applied_summary(ui, &result)));
+}

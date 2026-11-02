@@ -239,15 +239,17 @@ pub(crate) fn show_ppsspp_texture_mod_panel(
                 if result.apply.journal.status == SharedApplyStatus::Success {
                     state.applied = Some(result.apply);
                 } else {
-                    state.error = Some(format!(
+                    let mut error = format!(
                         "Install did not complete: {:?}",
                         result.apply.journal.status
-                    ));
+                    );
+                    crate::shared_apply_warnings::append(&mut error, &result.apply);
+                    state.error = Some(error);
                 }
             }
         }
         if let Some(result) = &state.applied {
-            ui.label("Installed transactionally; provenance and rollback journal retained.");
+            show_applied_summary(ui, result);
             if let Some(path) = &result.journal_path
                 && state.rollback_preview.is_none()
                 && let Ok(backups) = default_shared_backup_root()
@@ -292,6 +294,11 @@ pub(crate) fn show_ppsspp_texture_mod_panel(
             );
         }
     });
+}
+
+fn show_applied_summary(ui: &mut egui::Ui, result: &SharedApplyResult) {
+    ui.label("Installed transactionally; provenance and rollback journal retained.");
+    crate::shared_apply_warnings::show(ui, &crate::shared_apply_warnings::lines(result));
 }
 
 #[cfg(test)]
