@@ -1253,6 +1253,21 @@ pub(crate) fn note_retroarch_installation_refusal(
     summary.primary_action = Some(ReadinessAction::SetUpEmulator);
 }
 
+/// A file already found missing is never offered for Play and never left
+/// reading as "Checking". DOS review offers Play without looking at the file.
+pub(crate) fn note_file_missing(summary: &mut GameReadinessSummary) {
+    if summary.primary_action == Some(ReadinessAction::Play)
+        || summary.status == ReadinessPresentationState::Checking
+    {
+        summary.status = ReadinessPresentationState::SourceUnavailable;
+        summary.headline = "The game file is unavailable".into();
+        summary.explanation =
+            "Reconnect its drive or restore the file, then open this game again.".into();
+        summary.source = SourceSummary::Unavailable;
+        summary.primary_action = Some(ReadinessAction::CheckGamesFolder);
+    }
+}
+
 pub(crate) fn note_catalogue_verified(summary: &mut GameReadinessSummary) {
     if summary.status == ReadinessPresentationState::NeedsIdentityReview
         && summary.identity == IdentitySummary::NeedsReview

@@ -24,6 +24,7 @@ mod electron_preview;
 mod environment;
 mod equivalent_duplicates;
 mod game_detail_blue;
+mod game_detail_facts;
 mod game_documents;
 mod game_verification_guidance;
 #[cfg(test)]
@@ -417,6 +418,7 @@ pub(super) struct App {
     arcade_input_details: arcade_input_details::State,
     classic_trainers: classic_trainers::State,
     recording_integrity: recording_integrity::State,
+    game_detail_facts: game_detail_facts::State,
     canonical_organisation: crate::rom_organisation_page::RomOrganisationPageState,
     canonical_organisation_job: Option<CanonicalOrganisationJob>,
     history_view: history_view::HistoryViewState,
@@ -539,6 +541,7 @@ impl App {
             arcade_input_details: arcade_input_details::State::default(),
             classic_trainers: classic_trainers::State::default(),
             recording_integrity: recording_integrity::State::default(),
+            game_detail_facts: game_detail_facts::State::default(),
             canonical_organisation: crate::rom_organisation_page::RomOrganisationPageState::load(),
             canonical_organisation_job: None,
             history_view: Default::default(),
@@ -945,6 +948,14 @@ impl App {
         self.preferences_dirty = Some(Instant::now());
         self.screenshots = false;
         self.detail_generation += 1;
+        // A file that was missing may be back: look again on the next visit.
+        if self
+            .detail
+            .as_ref()
+            .is_some_and(|detail| !detail.file_present)
+        {
+            self.detail = None;
+        }
         self.review.verification_guidance.invalidate();
         self.detail_failed = None;
         // Cancelled artwork remains resumable; entering a game/browser resumes it.
@@ -1949,6 +1960,11 @@ impl App {
                                     self.equivalent_applied(*record)
                                 }
                                 Payload::MediaSetReview(review) => self.media_sets_done(*review),
+                                Payload::DiscLookup(found) => {
+                                    if let Some(found) = found {
+                                        self.game_detail_facts.finish(*found);
+                                    }
+                                }
                                 Payload::StorageReview(review) => self.storage_review_done(*review),
                                 Payload::Reconciliation(view) => self.reconcile_done(view),
                                 Payload::ReconciliationHashes(run) => self.reconcile_hash_done(run),
@@ -2199,6 +2215,16 @@ impl App {
             self.romm_library.loading = true;
             self.romm_library_job = Some(id);
             self.send(id, Command::LoadRommLibrary);
+        }
+        if let Some(game) = self
+            .router
+            .current
+            .game()
+            .and_then(|id| self.library.game(id))
+            && self.game_detail_facts.should_look_up(game, &self.library)
+        {
+            let (id, library) = (game.archive.id, self.library.clone());
+            self.send(0, Command::DiscLookup { library, game: id });
         }
         if let Some(id) = self.router.current.game()
             && self.detail_pending.is_none()

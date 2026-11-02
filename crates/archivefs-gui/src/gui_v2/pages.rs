@@ -33,6 +33,9 @@ pub(super) fn primary(ui: &mut egui::Ui, text: &str) -> bool {
 
 /// Below this much body height (points) contextual guidance scrolls with the page.
 const COMPACT_BODY_HEIGHT: f32 = 260.0;
+/// Below this window height Game Details keeps Play in the first screen: no
+/// page heading, a small cover, and contextual guidance after the page.
+const SHORT_GAME_WINDOW: f32 = 760.0;
 /// A pinned notice can expand its technical details; the page keeps the rest.
 const MAX_PINNED_NOTICE_SHARE: f32 = 0.4;
 const ALL_TOOLS_SCROLL: &str = "v2_all_tools_scroll";
@@ -80,6 +83,10 @@ pub(super) fn check_scroll(
     let output = scroll.show(ui, content);
     ui.ctx()
         .data_mut(|d| d.insert_temp(id.with("content_height"), output.content_size.y));
+}
+
+fn short_window(context: &egui::Context) -> bool {
+    context.content_rect().height() < SHORT_GAME_WINDOW
 }
 
 impl App {
@@ -699,7 +706,8 @@ impl App {
                     // Organisation's one primary action must not sit under a
                     // multi-line strip on a short window; the strip follows it.
                     let guidance_last =
-                        matches!(route, Route::Section(Section::Settings | Section::Build));
+                        matches!(route, Route::Section(Section::Settings | Section::Build))
+                            || (matches!(route, Route::Game(_)) && short_window(ui.ctx()));
                     if !guidance_last && let Some(guidance) = pinned_guidance.clone() {
                         super::guidance::show(ui, &mut self.guidance, guidance);
                         ui.add_space(theme::SPACE_SM);
@@ -1316,6 +1324,14 @@ impl App {
             ui.heading(super::simple_shell::MANAGE_TITLE);
             ui.label(super::simple_shell::MANAGE_PURPOSE);
             ui.add_space(8.0);
+            return;
+        }
+        // The breadcrumb and hero already name the game; on a short window
+        // this heading would cost the first screen its Play button.
+        if matches!(self.router.current, Route::Game(_))
+            && self.simple.simple_navigation()
+            && short_window(ui.ctx())
+        {
             return;
         }
         let family = family_for_route(&self.router.current);
@@ -2850,6 +2866,8 @@ impl App {
                                     ui.vertical(|ui| {
                                         self.detail_heading(ui, &library, game);
                                         ui.add_space(theme::SPACE_SM);
+                                        self.detail_facts(ui, game);
+                                        ui.add_space(theme::SPACE_MD);
                                         self.detail_more(ui, game);
                                     });
                                 });
@@ -2863,7 +2881,8 @@ impl App {
                         |ui| {
                             ui.set_width(right);
                             super::game_detail_blue::side_card(ui, "Can I play it?", |ui| {
-                                self.detail_readiness(ui, game, latest_verification.as_deref());
+                                self.detail_readiness(ui, game);
+                                self.detail_readiness_notes(ui, game, latest_verification.as_deref());
                                 self.show_arcade_input_details(ui, game);
                                 self.classic_trainers.show(ui, game);
                             });
@@ -2885,17 +2904,36 @@ impl App {
                 return;
             }
             let wide = ui.available_width() >= 760.0;
-            let cover = if wide { egui::vec2(240.0, 320.0) } else { egui::vec2(168.0, 224.0) };
+            let cover = if short_window(ui.ctx()) {
+                egui::vec2(120.0, 160.0)
+            } else if wide {
+                egui::vec2(240.0, 320.0)
+            } else {
+                egui::vec2(168.0, 224.0)
+            };
             ui.horizontal_top(|ui| {
                 self.picture(ui, game, Kind::Cover, cover);
                 ui.add_space(theme::SPACE_LG);
                 ui.vertical(|ui| {
                     self.detail_heading(ui, &library, game);
                     ui.add_space(theme::SPACE_SM);
-                    self.detail_readiness(ui, game, latest_verification.as_deref());
-                    self.show_arcade_input_details(ui, game);
+                    self.detail_readiness(ui, game);
+                    let notes = latest_verification.as_deref();
+                    // A short window reaches quick actions and facts before
+                    // the long notes; taller ones keep the notes beside Play.
+                    let short = short_window(ui.ctx());
+                    if !short {
+                        self.detail_readiness_notes(ui, game, notes);
+                    }
                     ui.add_space(theme::SPACE_SM);
                     self.detail_more(ui, game);
+                    ui.add_space(theme::SPACE_MD);
+                    self.detail_facts(ui, game);
+                    if short {
+                        ui.add_space(theme::SPACE_MD);
+                        self.detail_readiness_notes(ui, game, notes);
+                    }
+                    self.show_arcade_input_details(ui, game);
                 });
             });
             if blue && super::recording_integrity::eligible(game) {
@@ -2970,18 +3008,56 @@ impl App {
         }
     }
 
-    /// The readiness card (which owns the single primary action), the latest
-    /// verification, the identity status and the saved-check notes.
-    fn detail_readiness(
-        &mut self,
-        ui: &mut egui::Ui,
-        game: &Game,
-        latest_verification: Option<&str>,
-    ) {
+    /// "At a glance": saved facts and the file check, never a Play decision.
+    fn detail_facts(&mut self, ui: &mut egui::Ui, game: &Game) {
+        let id = game.archive.id;
+        let readiness = self
+            .native_workflows
+            .as_ref()
+            .and_then(|workflows| workflows.readiness_summary(id, &game.archive.absolute_path));
+        if readiness.is_none() {
+            // The readiness card selects this game later in the same frame.
+            ui.ctx()
+                .request_repaint_after(std::time::Duration::from_millis(100));
+        }
+        let index = self.artwork.index.as_deref();
+        let region = super::game_detail_blue::region(game, index);
+        let rows = super::game_detail_facts::facts(
+            game,
+            super::game_detail_facts::Sources {
+                detail: self.detail.as_ref().filter(|detail| detail.game == id),
+                detail_failed: self.detail_failed == Some(id),
+                readiness: readiness.as_ref(),
+                region: region
+                    .as_ref()
+                    .map(|(value, source)| (value.as_str(), source.as_str())),
+                region_checked: index.is_some(),
+                dat_region: self
+                    .detail
+                    .as_ref()
+                    .filter(|detail| detail.game == id)
+                    .and_then(|detail| detail.dat_region.as_ref())
+                    .map(|(value, source)| (value.as_str(), source.as_str())),
+                dat_current: game.dat_exact.is_some(),
+                discs: self
+                    .game_detail_facts
+                    .discs_for(id, &self.library)
+                    .map(|found| found.guidance.headline.as_str()),
+            },
+        );
+        super::game_detail_facts::show(ui, game, &rows);
+    }
+
+    /// The readiness card, which owns the single primary action.
+    fn detail_readiness(&mut self, ui: &mut egui::Ui, game: &Game) {
         self.nkit_guidance(ui, game, false);
         let id = game.archive.id;
         // The readiness card owns the single primary action: Play
         // when the game is ready, otherwise the step that fixes it.
+        let file_missing = self
+            .detail
+            .as_ref()
+            .is_some_and(|detail| detail.game == id && !detail.file_present);
         let readiness_route = {
             let workflows = self.native_workflows.get_or_insert_with(|| {
                 super::native_workflows::NativeWorkflows::new(ui.ctx().clone())
@@ -2992,13 +3068,27 @@ impl App {
                 id,
                 &game.archive.absolute_path,
                 game.archive.identity_report.as_ref(),
-                game.dat_exact.is_some(),
+                super::native_workflows::SavedFileFacts {
+                    catalogue_verified: game.dat_exact.is_some(),
+                    file_missing,
+                },
                 &mut self.activity,
             )
         };
         if let Some(route) = readiness_route {
             self.go(route);
         }
+    }
+
+    /// Everything else "Can I play it?" holds: saves, discs, verification and
+    /// identity notes. Long enough that small windows place it after the facts.
+    fn detail_readiness_notes(
+        &mut self,
+        ui: &mut egui::Ui,
+        game: &Game,
+        latest_verification: Option<&str>,
+    ) {
+        let id = game.archive.id;
         let state_target = self
             .native_workflows
             .as_ref()
@@ -3012,13 +3102,27 @@ impl App {
         #[cfg(target_os = "linux")]
         super::electron_preview::show(ui, game);
         // Multi-disc guidance, read-only, under the same readiness card.
+        // The launch-aware answer needs the database snapshot, which this page
+        // never loads; without it the bounded background lookup answers.
         let disc_guidance = self
             .native_workflows
             .as_ref()
-            .and_then(|workflows| workflows.disc_guidance(&game.archive.absolute_path));
+            .and_then(|workflows| workflows.disc_guidance(&game.archive.absolute_path))
+            .or_else(|| {
+                self.game_detail_facts
+                    .discs_for(id, &self.library)
+                    .map(|found| found.guidance.clone())
+            });
         if let Some(guidance) = &disc_guidance {
             ui.add_space(theme::SPACE_SM);
             crate::multidisc_launch_view::show_guidance(ui, guidance);
+            let links = self
+                .game_detail_facts
+                .discs_for(id, &self.library)
+                .map_or(&[][..], |found| &found.links);
+            if let Some(other) = super::game_detail_facts::show_disc_links(ui, links) {
+                self.go(Route::Game(other));
+            }
         }
         // Amiga format, machine and readiness; links only, never Play.
         if super::amiga_game::machine(game).is_some() {
@@ -3130,6 +3234,7 @@ impl App {
         let button_width = ((ui.available_width() - ui.spacing().item_spacing.x) / 2.0)
             .clamp(140.0, 240.0)
             .min(ui.available_width());
+        let button_height = if short_window(ui.ctx()) { 52.0 } else { 64.0 };
         ui.horizontal_wrapped(|ui| {
             for (label, section) in [
                 ("Verify", Section::Check),
@@ -3139,7 +3244,10 @@ impl App {
                 ("Fix Problems", Section::Problems),
             ] {
                 if ui
-                    .add_sized([button_width, 64.0], egui::Button::new(label).wrap())
+                    .add_sized(
+                        [button_width, button_height],
+                        egui::Button::new(label).wrap(),
+                    )
                     .clicked()
                 {
                     if matches!(section, Section::Check) {
@@ -3149,7 +3257,10 @@ impl App {
                 }
             }
             if ui
-                .add_sized([button_width, 64.0], egui::Button::new("Open Folder"))
+                .add_sized(
+                    [button_width, button_height],
+                    egui::Button::new("Open Folder"),
+                )
                 .clicked()
             {
                 let job = self
