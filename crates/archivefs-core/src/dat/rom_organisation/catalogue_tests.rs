@@ -885,3 +885,149 @@ fn concurrent_undo_of_the_same_historical_transaction_never_double_moves_or_corr
         assert!(f.tx.is_fully_rolled_back(), "round {round}");
     }
 }
+
+/// Deterministic: while another Undo of the same transaction is in progress,
+/// a second Undo waits instead of racing its journal fence and seal, and then
+/// judges the journal the first one left. Nothing is moved while it waits.
+#[test]
+fn a_second_undo_of_the_same_transaction_waits_for_the_first_instead_of_racing_it() {
+    let mut f = Fixture::new(OrganisationMode::RenameInPlace);
+    f.apply().unwrap();
+    f.reload();
+    let history = f.tx.clone();
+    let journal = f.journal();
+    let master = f.plan.master_root.clone();
+    let first =
+        crate::dat::rename_apply::journal::serialise_undo(&journal, &history.transaction_id);
+    let finished = std::sync::atomic::AtomicBool::new(false);
+    let result = std::thread::scope(|scope| {
+        let waiting = scope.spawn(|| {
+            let mut handle = open_history_transaction_for_undo(&journal, &history).unwrap();
+            let result =
+                rollback_organisation_transaction(&mut handle, &journal, &no_cancel(), &master);
+            finished.store(true, std::sync::atomic::Ordering::SeqCst);
+            result
+        });
+        std::thread::sleep(std::time::Duration::from_millis(300));
+        assert!(
+            !finished.load(std::sync::atomic::Ordering::SeqCst),
+            "the second Undo must wait for the first"
+        );
+        assert!(
+            !f.source.exists() && f.destination.exists(),
+            "nothing may move while the second Undo waits"
+        );
+        drop(first);
+        waiting.join().unwrap()
+    });
+    assert!(result.is_ok(), "{result:?}");
+    assert!(f.source.exists() && !f.destination.exists());
+    assert_eq!(std::fs::read(&f.source).unwrap(), b"fixture contents");
+}
+
+/// Simultaneous Undo requests from separately adopted handles: neither may
+/// fail, the ROM is restored exactly once with its content intact, the
+/// catalogue follows the file and the sealed journal records one finished Undo.
+/// Bounded: the deterministic test above proves the serialisation; this guards
+/// the end-to-end result across a few real interleavings.
+#[test]
+fn simultaneous_undo_requests_both_succeed_and_restore_the_file_exactly_once() {
+    for round in 0..8 {
+        let mut f = Fixture::new(OrganisationMode::RenameInPlace);
+        f.apply().unwrap();
+        f.reload();
+        let history = f.tx.clone();
+        let journal = f.journal();
+        let master = f.plan.master_root.clone();
+        let barrier = std::sync::Barrier::new(2);
+        let results: Vec<Result<OrganisationRollbackOutcome, String>> =
+            std::thread::scope(|scope| {
+                let workers: Vec<_> = (0..2)
+                    .map(|_| {
+                        scope.spawn(|| {
+                            let mut handle =
+                                open_history_transaction_for_undo(&journal, &history).unwrap();
+                            barrier.wait();
+                            rollback_organisation_transaction(
+                                &mut handle,
+                                &journal,
+                                &no_cancel(),
+                                &master,
+                            )
+                        })
+                    })
+                    .collect();
+                workers.into_iter().map(|w| w.join().unwrap()).collect()
+            });
+        assert!(
+            results.iter().all(|r| r.is_ok()),
+            "round {round}: neither simultaneous Undo may fail: {results:?}"
+        );
+        assert!(
+            results.iter().any(|r| matches!(
+                r,
+                Ok(o) if o.rollback.result
+                    == crate::dat::rename_apply::RollbackResult::FullyRolledBack
+            )),
+            "round {round}: {results:?}"
+        );
+        assert!(
+            f.source.exists() && !f.destination.exists(),
+            "round {round}"
+        );
+        assert_eq!(std::fs::read(&f.source).unwrap(), b"fixture contents");
+        assert_eq!(f.path_id(&f.source), Some(f.id), "round {round}");
+        assert_eq!(f.path_id(&f.destination), None, "round {round}");
+        assert!(
+            crate::dat::rename_apply::seal::verify(&journal, &history.transaction_id).trusted(),
+            "round {round}"
+        );
+        f.reload();
+        assert!(f.tx.is_fully_rolled_back(), "round {round}");
+    }
+}
+
+/// A cancelled Undo leaves a legitimately advanced journal. The old History
+/// record is refused (nothing changes), and reopening History from the
+/// journal as it now is allows the Undo to be retried and finished.
+#[test]
+fn reopening_history_after_an_interrupted_undo_allows_a_safe_retry() {
+    let mut f = Fixture::new(OrganisationMode::RenameInPlace);
+    f.apply().unwrap();
+    f.reload();
+    let stale_history = f.tx.clone();
+    let journal = f.journal();
+    let master = f.plan.master_root.clone();
+    let cancelled = AtomicBool::new(true);
+    let mut handle = open_history_transaction_for_undo(&journal, &stale_history).unwrap();
+    let first = rollback_organisation_transaction(&mut handle, &journal, &cancelled, &master);
+    assert!(
+        !matches!(&first, Ok(o) if o.rollback.result
+            == crate::dat::rename_apply::RollbackResult::FullyRolledBack),
+        "a cancelled Undo must not claim a full rollback: {first:?}"
+    );
+    f.reload();
+    if f.tx == stale_history {
+        // Cancelled before anything was written: the old record is still exact.
+        assert!(open_history_transaction_for_undo(&journal, &stale_history).is_ok());
+    } else {
+        let refused = open_history_transaction_for_undo(&journal, &stale_history).unwrap_err();
+        assert!(refused.contains("no longer matches"), "{refused}");
+    }
+    assert!(
+        crate::dat::rename_apply::seal::verify(&journal, &stale_history.transaction_id).trusted()
+    );
+    // Reopen History from the journal as it is now, then retry.
+    let fresh_history = f.tx.clone();
+    let mut reopened = open_history_transaction_for_undo(&journal, &fresh_history).unwrap();
+    let retry =
+        rollback_organisation_transaction(&mut reopened, &journal, &no_cancel(), &master).unwrap();
+    assert_eq!(
+        retry.rollback.result,
+        crate::dat::rename_apply::RollbackResult::FullyRolledBack
+    );
+    assert!(f.source.exists() && !f.destination.exists());
+    assert_eq!(std::fs::read(&f.source).unwrap(), b"fixture contents");
+    f.reload();
+    assert!(f.tx.is_fully_rolled_back());
+}
