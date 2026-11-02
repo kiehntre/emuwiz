@@ -689,3 +689,5 @@ mod tests;
 // GUI-only `retroarch_core_directory_override.txt` file. The discovery
 // behaviour it feeds is covered in `archivefs-core`
 // (`retroarch_cheat_setup` + `emulator_environment::retroarch`).
+
+// CI gate probe: gui tier.
