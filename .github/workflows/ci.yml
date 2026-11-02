@@ -78,18 +78,24 @@ jobs:
     runs-on: ubuntu-latest
     needs: [classify]
     env:
-      # Test builds of the whole workspace with full debuginfo (debuginfo=2)
-      # exhausted the runner disk ("No space left on device", linker bus
-      # errors). Line tables keep panic backtraces readable at a fraction of
-      # the size. Scoped to this job: release/packaging builds are separate
-      # workflows and their profiles are untouched.
-      CARGO_PROFILE_DEV_DEBUG: line-tables-only
+      # A whole-workspace test build with line tables took 22 GiB, more than
+      # the 16 GiB free on the smallest runners ("No space left on device",
+      # linker bus errors, crashed runner workers). Without debuginfo it takes
+      # 6.3 GiB and links about 35 s faster. CI sets no RUST_BACKTRACE, and panic
+      # messages keep their file and line. Scoped to this job: release and
+      # packaging builds are separate and their profiles are untouched.
+      CARGO_PROFILE_DEV_DEBUG: 0
     strategy:
       fail-fast: false
       matrix:
         shard: ${{ fromJSON(needs.classify.outputs.shards) }}
     steps:
       - uses: actions/checkout@v5
+      # First, before anything is written: the build needs about 7 GiB, the
+      # ext4 image up to 4 GiB and the toolchain, tools and cache about 3 GiB,
+      # with margin for growth. Roomy runners skip this at no cost.
+      - name: Ensure runner disk headroom
+        run: scripts/ci-disk.sh ensure 20
       - name: Install tools for real patch and optical-conversion tests
         run: |
           sudo apt-get update
@@ -173,8 +179,8 @@ jobs:
       - name: Disk space after tests
         if: always()
         run: |
-          df -h / "$RUNNER_TEMP" /tmp/r2e || true
-          du -sh target 2>/dev/null || true
+          df -h "$RUNNER_TEMP" /tmp/r2e || true
+          scripts/ci-disk.sh report
       - name: Report and enforce formatting outcome
         if: always()
         env:
@@ -201,6 +207,8 @@ jobs:
           toolchain: "1.97.1"
       - name: Test shard partitioning against a real libtest binary
         run: python3 -B scripts/test_ci_test_shards.py
+      - name: Test the runner disk guard
+        run: python3 -B scripts/test_ci_disk.py
       - uses: actions/download-artifact@v5
         with:
           pattern: test-shard-list-*
@@ -427,6 +435,19 @@ jobs:
       - run: bash tests/test_install.sh
       - run: python3 tests/test_installer_asset_races.py
       - run: python3 tests/test_installer_upgrade_preservation.py
+
+  # Cargo retention and retirement delete real data on developer machines, so
+  # their safety tests run here too. Any change under scripts/ selects the full
+  # tier, and main always runs it. Python 3.12 is what the real-root tests and
+  # the supported hosts use, and the runner is disposable, so sudo is safe.
+  maintenance-script-tests:
+    name: Maintenance script tests
+    runs-on: ubuntu-24.04
+    needs: [classify]
+    if: needs.classify.outputs.tier == 'full' || github.event_name != 'pull_request'
+    steps:
+      - uses: actions/checkout@v5
+      - run: scripts/ci-maintenance-tests.sh
 
   release-artifact:
     name: Create canonical artifact
