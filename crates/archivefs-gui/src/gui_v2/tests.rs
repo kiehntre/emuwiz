@@ -9083,6 +9083,38 @@ fn check_games_leads_with_what_verified_automatically_and_lists_only_the_rest() 
     assert!(!shows(&strings, "Manage DAT sources") && !shows(&strings, "Unknown:"));
 }
 
+/// An older library flag cannot outvote the current per-game lookup: stale or
+/// untrusted DAT evidence is never labelled Verified anywhere in Game Details.
+#[test]
+fn stale_or_untrusted_dat_evidence_is_never_labelled_verified_in_game_details() {
+    use archivefs_core::dat::library_identity_summary::DatVerificationState as S;
+    let context = egui::Context::default();
+    for (stale, trusted) in [(true, true), (false, false)] {
+        let mut app = review_app(&context, vec![(1, "Amidar", "Atari2600")]);
+        Arc::make_mut(&mut app.library).games[0].mark_dat_exact(Some("No-Intro"));
+        let mut current = knowledge(S::VerifiedSingleMatch {
+            algorithm: "SHA-1".into(),
+        });
+        current.stale = stale;
+        current.trusted_source = trusted;
+        app.review.knowledge = Some(current);
+        let review = app.identity_review_for(1).unwrap();
+        assert!(!review.is_verified(), "stale={stale} trusted={trusted}");
+        app.router.current = Route::Game(1);
+        let strings = text(&frame(&context, &mut app, [1280.0, 900.0]));
+        assert!(
+            shows(&strings, &format!("Identity: {}", review.list_label())),
+            "stale={stale} trusted={trusted}: {strings:?}"
+        );
+        assert!(
+            !strings
+                .iter()
+                .any(|line| line.starts_with("Identity: Verified") || line.starts_with("Verified")),
+            "stale={stale} trusted={trusted}: {strings:?}"
+        );
+    }
+}
+
 #[test]
 fn one_game_has_one_identity_status_on_every_page() {
     use archivefs_core::dat::library_identity_summary::DatVerificationState as S;
@@ -9102,10 +9134,22 @@ fn one_game_has_one_identity_status_on_every_page() {
         let label = app.identity_review_for(1).unwrap().list_label();
         // Game Details
         app.router.current = Route::Game(1);
+        // The identity result is on the first screen, not below the fold.
         let strings = text(&frame(&context, &mut app, [1280.0, 900.0]));
         assert!(
             shows(&strings, &format!("Identity: {label}")),
             "details {label}: {strings:?}"
+        );
+        // The launch card never contradicts it: a verified game is not
+        // "Needs review", and verified identity alone never decides launch.
+        assert_eq!(
+            shows(&strings, "Identity: Needs review"),
+            !verified,
+            "details {label}: {strings:?}"
+        );
+        assert!(
+            shows(&strings, "Checking whether this game is ready"),
+            "launch readiness stays separate: {strings:?}"
         );
         // Problems for this one game
         app.router.current = Route::Task {
@@ -9242,6 +9286,12 @@ fn a_fresh_exact_dat_match_is_verified_on_every_page_and_launch_says_what_it_sti
     app.router.current = Route::Game(vid);
     let strings = text(&frame(&context, &mut app, [1280.0, 900.0]));
     assert!(shows(&strings, "Identity: Verified"), "{strings:?}");
+    // One identity status on the page; launch is still decided separately.
+    assert!(!shows(&strings, "Identity: Needs review"), "{strings:?}");
+    assert!(
+        shows(&strings, "Checking whether this game is ready"),
+        "{strings:?}"
+    );
     // Review Identity: verified, nothing to confirm
     app.router.current = Route::ReviewIdentity(vid);
     let strings = text(&frame(&context, &mut app, [1280.0, 900.0]));

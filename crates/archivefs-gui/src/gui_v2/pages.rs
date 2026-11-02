@@ -3085,6 +3085,12 @@ impl App {
             .detail
             .as_ref()
             .is_some_and(|detail| detail.game == id && !detail.file_present);
+        // The same strict decision as the Identity line below: a loaded
+        // per-game lookup supersedes the library's older DAT flag, and stale
+        // or untrusted evidence never counts. Launch readiness stays separate.
+        let identity_verified = self
+            .identity_review_for(id)
+            .is_some_and(|review| review.is_verified());
         let readiness_route = {
             let workflows = self.native_workflows.get_or_insert_with(|| {
                 super::native_workflows::NativeWorkflows::new(ui.ctx().clone())
@@ -3096,7 +3102,7 @@ impl App {
                 &game.archive.absolute_path,
                 game.archive.identity_report.as_ref(),
                 super::native_workflows::SavedFileFacts {
-                    catalogue_verified: game.dat_exact.is_some(),
+                    catalogue_verified: identity_verified,
                     file_missing,
                 },
                 &mut self.activity,
@@ -3191,8 +3197,8 @@ impl App {
         if let Some(status) = latest_verification {
             ui.label(format!("Latest verification: {status}"));
         }
-        self.detail_verification_guidance(ui, game);
         // General file identification and launch readiness remain separate.
+        // The identity result leads; the longer verification guidance follows.
         if let Some(review) = self.identity_review_for(id) {
             ui.horizontal_wrapped(|ui| {
                 ui.strong(format!("Identity: {}", review.list_label()));
@@ -3206,6 +3212,7 @@ impl App {
                 }
             });
         }
+        self.detail_verification_guidance(ui, game);
         if let Some(detail) = self.detail.as_ref().filter(|detail| detail.game == id) {
             if !detail.file_present {
                 ui.colored_label(

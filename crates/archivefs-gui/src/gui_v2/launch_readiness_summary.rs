@@ -49,6 +49,9 @@ pub(crate) enum IdentitySummary {
     /// The saved catalogue holds an exact authoritative match, but launch
     /// still needs the file's own identity evidence.
     CatalogueVerified,
+    /// The game's identity is verified by current, trusted evidence while
+    /// launch readiness is still being checked. Says nothing about launch.
+    Verified,
     Mismatch,
 }
 
@@ -1268,7 +1271,15 @@ pub(crate) fn note_file_missing(summary: &mut GameReadinessSummary) {
     }
 }
 
+/// Callers pass only a current, strictly verified identity. While readiness
+/// is still checking, only the identity line changes: the headline, status
+/// and primary action keep saying launch has not been decided.
 pub(crate) fn note_catalogue_verified(summary: &mut GameReadinessSummary) {
+    if summary.status == ReadinessPresentationState::Checking
+        && summary.identity == IdentitySummary::NeedsReview
+    {
+        summary.identity = IdentitySummary::Verified;
+    }
     if summary.status == ReadinessPresentationState::NeedsIdentityReview
         && summary.identity == IdentitySummary::NeedsReview
     {
@@ -1284,6 +1295,7 @@ fn identity_label(identity: IdentitySummary) -> &'static str {
         IdentitySummary::LaunchableWithWarning => "Launchable with warning",
         IdentitySummary::NeedsReview => "Needs review",
         IdentitySummary::CatalogueVerified => "Verified · file identity still needed to launch",
+        IdentitySummary::Verified => "Verified",
         IdentitySummary::Mismatch => "Mismatch / blocked",
     }
 }
@@ -1855,6 +1867,32 @@ mod tests {
             ReadinessFreshness::Current,
         );
         assert_eq!(summary.primary_action, Some(ReadinessAction::SetUpEmulator));
+    }
+
+    #[test]
+    fn verified_identity_while_checking_changes_only_the_identity_line() {
+        let mut checking = project(
+            &LaunchReadinessInput::EvidenceNotLoaded,
+            ReadinessFreshness::Current,
+        );
+        let before = checking.clone();
+        assert_eq!(before.identity, IdentitySummary::NeedsReview);
+        note_catalogue_verified(&mut checking);
+        assert_eq!(checking.identity, IdentitySummary::Verified);
+        assert_eq!(identity_label(checking.identity), "Verified");
+        // Identity is not launch readiness: still checking, no Play.
+        assert_eq!(checking.status, ReadinessPresentationState::Checking);
+        assert_eq!(checking.headline, before.headline);
+        assert_eq!(checking.explanation, before.explanation);
+        assert_eq!(checking.primary_action, before.primary_action);
+        assert_ne!(checking.primary_action, Some(ReadinessAction::Play));
+        assert_eq!(checking.source, before.source);
+        // Without verified identity nothing changes.
+        let unverified = project(
+            &LaunchReadinessInput::EvidenceNotLoaded,
+            ReadinessFreshness::Current,
+        );
+        assert_eq!(unverified.identity, IdentitySummary::NeedsReview);
     }
 
     #[test]
