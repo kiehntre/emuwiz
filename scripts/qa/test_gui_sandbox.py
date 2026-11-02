@@ -3,7 +3,6 @@
 
 import os
 import re
-import shutil
 import subprocess
 import sys
 import tempfile
@@ -17,14 +16,21 @@ import gui_sandbox  # noqa: E402
 REPO = Path(__file__).resolve().parents[2]
 
 
+def write_decoy(path):
+    """A one-process Python script: /proc/<pid>/comm is its file name.
+
+    Copies of `sleep` cannot be renamed: ubuntu-26.04's coreutils is a
+    multi-call binary that picks the program from the executed file name.
+    """
+    path.write_text(f"#!{sys.executable} -I\nimport time\ntime.sleep(60)\n")
+    path.chmod(0o755)
+    return path
+
+
 def decoy_named(directory, name):
     """An unrelated process whose name is a real desktop's, run by this test."""
-    path = Path(directory) / name
-    shutil.copy(shutil.which("sleep"), path)
-    # argv[0] stays "sleep": a multi-call sleep (uutils on ubuntu-26.04,
-    # busybox) dispatches on it. The process name in /proc/<pid>/comm comes
-    # from the executed file, so the decoy is still named `name`.
-    return subprocess.Popen(["sleep", "60"], executable=path, start_new_session=True)
+    path = write_decoy(Path(directory) / name)
+    return subprocess.Popen([str(path)], start_new_session=True)
 
 
 class Limits(unittest.TestCase):
@@ -118,45 +124,57 @@ class Limits(unittest.TestCase):
 
 
 def decoy_named_in(sandbox, directory, name):
-    path = Path(directory) / f"owned-{name}"
     target = Path(directory) / "owned" / name
     target.parent.mkdir(exist_ok=True)
     if not target.exists():
-        shutil.copy(shutil.which("sleep"), target)
-    del path
-    # Same as decoy_named: exec the copy under argv[0] "sleep" (same pid, so
-    # still owned); its process name comes from the file, so it is `name`.
-    return sandbox.spawn([sys.executable, "-I", "-c", EXEC_AS_SLEEP, str(target)])
+        write_decoy(target)
+    return sandbox.spawn([str(target)])
 
 
-EXEC_AS_SLEEP = "import os, sys; os.execv(sys.argv[1], ['sleep', '60'])"
+# Dispatches on its own executed file name, like ubuntu-26.04's coreutils.
+FILE_NAME_DISPATCHING_SLEEP = """#!/bin/sh
+case "${0##*/}" in
+  sleep) exec /bin/sleep "$@" ;;
+  *) echo "coreutils: unknown program '${0##*/}'" >&2; exit 1 ;;
+esac
+"""
 
 
-class MultiCallSleep(unittest.TestCase):
-    """ubuntu-26.04's sleep is a multi-call binary that dispatches on argv[0]."""
+class DecoyIdentity(unittest.TestCase):
+    """The decoys must not depend on how the host's sleep picks its program."""
 
-    def test_decoys_live_and_keep_their_names_with_a_multi_call_sleep(self):
-        busybox = shutil.which("busybox")
-        if busybox is None:
-            self.skipTest("busybox provides the multi-call sleep for this check")
-        with tempfile.TemporaryDirectory() as directory:
-            bin_dir = Path(directory) / "bin"
-            bin_dir.mkdir()
-            shutil.copy(busybox, bin_dir / "sleep")
-            original = os.environ["PATH"]
-            os.environ["PATH"] = f"{bin_dir}{os.pathsep}{original}"
-            self.addCleanup(os.environ.__setitem__, "PATH", original)
-            decoy = decoy_named(directory, "xfwm4")
-            self.addCleanup(decoy.wait)
-            self.addCleanup(decoy.terminate)  # exact child handle
-            with gui_sandbox.Sandbox() as sandbox:
-                owned = decoy_named_in(sandbox, directory, "xfdesktop")
-                time.sleep(0.3)
-                self.assertIsNone(owned.poll(), "the owned decoy exited at once")
-                self.assertEqual((Path("/proc") / str(owned.pid) / "comm").read_text().strip(), "xfdesktop")
-            time.sleep(0.3)
-            self.assertIsNone(decoy.poll(), "the unowned decoy exited at once")
-            self.assertEqual((Path("/proc") / str(decoy.pid) / "comm").read_text().strip(), "xfwm4")
+    def setUp(self):
+        directory = tempfile.TemporaryDirectory()
+        self.addCleanup(directory.cleanup)
+        self.directory = Path(directory.name)
+        bin_dir = self.directory / "bin"
+        bin_dir.mkdir()
+        (bin_dir / "sleep").write_text(FILE_NAME_DISPATCHING_SLEEP)
+        (bin_dir / "sleep").chmod(0o755)
+        original = os.environ["PATH"]
+        os.environ["PATH"] = f"{bin_dir}{os.pathsep}{original}"
+        self.addCleanup(os.environ.__setitem__, "PATH", original)
+
+    def assert_lone_decoy(self, process, name):
+        time.sleep(0.3)
+        self.assertIsNone(process.poll(), f"the {name} decoy exited at once")
+        proc = Path("/proc") / str(process.pid)
+        self.assertEqual((proc / "comm").read_text().strip(), name)
+        self.assertEqual(os.path.realpath(proc / "exe"), os.path.realpath(sys.executable))
+        self.assertEqual((proc / "task" / str(process.pid) / "children").read_text().strip(), "")
+
+    def test_decoys_live_alone_under_their_desktop_names_and_stop_on_sigterm(self):
+        decoy = decoy_named(self.directory, "xfwm4")
+        self.addCleanup(decoy.wait)
+        self.addCleanup(decoy.terminate)  # exact child handle
+        self.assert_lone_decoy(decoy, "xfwm4")
+        with gui_sandbox.Sandbox() as sandbox:
+            owned = decoy_named_in(sandbox, self.directory, "xfdesktop")
+            self.assert_lone_decoy(owned, "xfdesktop")
+        self.assertIsNotNone(owned.poll(), "the sandbox stopped its own decoy")
+        self.assertIsNone(decoy.poll(), "the unowned decoy was touched")
+        decoy.terminate()
+        self.assertEqual(decoy.wait(timeout=5), -15)
 
 
 class Source(unittest.TestCase):
