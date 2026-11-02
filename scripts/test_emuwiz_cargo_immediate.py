@@ -33,8 +33,9 @@ class Immediate(M.MaintBase):
         rc, out = self.call("run")
         self.assertEqual(rc, 0, out)
         self.assertFalse(self.exists(target, "debug/deps"))
+        self.review_unrecognised(wt, target)       # the fixture's stray file holds the gate until reviewed
         self.assertEqual(self.m.worktree_gate(wt)["status"], "CLEAR")
-        for path in self.preserved_paths(target):
+        for path in self.evidence_paths(target):
             self.assertTrue(os.path.exists(path), path)
 
     def test_immediate_manual_manifest_execution(self):

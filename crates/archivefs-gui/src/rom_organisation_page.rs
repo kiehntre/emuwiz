@@ -72,6 +72,8 @@ pub(crate) struct RomOrganisationPageState {
     /// journal for a reviewed recovery.
     quarantined_undo: Option<archivefs_core::dat::rename_apply::RenameTransaction>,
     error: Option<String>,
+    /// This error follows a run that may have changed files (not a plain refusal).
+    error_after_changes: bool,
     /// The last apply stopped at a safe point because it was cancelled.
     stopped: bool,
     /// Set when the user asked to apply; holds the count awaiting a typed
@@ -210,6 +212,7 @@ impl Default for RomOrganisationPageState {
             result_complete: true,
             last_rollback: None,
             quarantined_undo: None,
+            error_after_changes: false,
             error: None,
             stopped: false,
             pending_apply: None,
@@ -353,6 +356,7 @@ impl RomOrganisationPageState {
     /// from an earlier run.
     fn begin_outcome(&mut self) {
         self.error = None;
+        self.error_after_changes = false;
         self.result_message = None;
         self.result_complete = false;
         self.last_rollback = None;
@@ -684,7 +688,13 @@ impl RomOrganisationPageState {
     ) {
         match result {
             Ok(outcome) => {
-                self.applied = Some(outcome.transaction.clone());
+                // Undo is offered only when something may have changed on disk;
+                // an all-skipped run leaves nothing to reverse.
+                if outcome.summary.applied > 0
+                    || transaction_may_have_changed_disk(&outcome.transaction)
+                {
+                    self.applied = Some(outcome.transaction.clone());
+                }
                 let (message, complete) = apply_result_report(self.mode, &outcome.summary);
                 self.result_message = Some(message);
                 self.result_complete = complete;
@@ -698,10 +708,102 @@ impl RomOrganisationPageState {
                 // Keep that journalled transaction as the Undo handle.
                 if transaction_may_have_changed_disk(&transaction) {
                     self.applied = Some(transaction);
+                    self.error_after_changes = true;
                 }
                 self.error = Some(error.to_string());
             }
         }
+    }
+
+    /// Makes the transaction History selected - exactly that journal, by id -
+    /// this page's Undo handle. The page's own latest transaction is never
+    /// substituted, and a different handle that still needs recovery (partial,
+    /// failed, in flight or quarantined) is never replaced. The journal must
+    /// verify against its seal, record the same id, be an Organisation
+    /// rename/move and equal the record History holds. Nothing on disk is
+    /// read beyond the journal or written; the shared rollback re-verifies and
+    /// fences everything again at Undo time.
+    pub(crate) fn select_history_transaction(
+        &mut self,
+        history: &archivefs_core::dat::rename_apply::RenameTransaction,
+    ) {
+        use archivefs_core::dat::rom_organisation as organisation;
+        self.begin_outcome();
+        let id = history.transaction_id.clone();
+        if self.advanced_r2_selected {
+            self.error = Some(
+                "Advanced Protection was selected. Its Undo needs a fresh separate approval in History. Nothing was changed."
+                    .into(),
+            );
+            return;
+        }
+        let holding = |held: &archivefs_core::dat::rename_apply::RenameTransaction| {
+            format!(
+                " Undo on this page still belongs to transaction {}.",
+                held.transaction_id
+            )
+        };
+        // A quarantined Undo is never retried as an ordinary Undo this session,
+        // not even by selecting its own id.
+        if let Some(quarantined) = &self.quarantined_undo {
+            self.error = Some(format!(
+                "Transaction {} was set aside because its journal changed, and it holds this page. Review its journal in History; it is not opened for Undo again this session ({id} was not opened). Nothing was changed.",
+                quarantined.transaction_id
+            ));
+            return;
+        }
+        if let Some(held) = &self.applied
+            && held.transaction_id != id
+            && held_needs_recovery(held)
+        {
+            self.error = Some(format!(
+                "Transaction {} still needs recovery and holds this page. Resolve it first, then open {id} from History. Nothing was changed.",
+                held.transaction_id
+            ));
+            return;
+        }
+        // History reopens only Organisation records, so any other handle with
+        // something left to reverse would be lost for good if replaced here.
+        if let Some(held) = &self.applied
+            && held.transaction_id != id
+            && organisation::undo_blocker(held).is_none()
+            && !organisation::is_organisation_transaction(held)
+        {
+            self.error = Some(format!(
+                "Undo on this page belongs to transaction {}, which History cannot open again here. Undo it first, then open {id} from History. Nothing was changed.",
+                held.transaction_id
+            ));
+            return;
+        }
+        let opened =
+            match organisation::open_history_transaction_for_undo(&self.applied_journal, history) {
+                Ok(opened) => opened,
+                Err(reason) => {
+                    let note = self.applied.as_ref().map(holding).unwrap_or_default();
+                    self.error = Some(format!("{reason} Nothing was changed.{note}"));
+                    return;
+                }
+            };
+        if let Some(blocker) = organisation::undo_blocker(&opened) {
+            let note = self
+                .applied
+                .as_ref()
+                .filter(|held| held.transaction_id != id)
+                .map(holding)
+                .unwrap_or_default();
+            let finished = opened.state
+                == archivefs_core::dat::rename_apply::model::TransactionState::RolledBack
+                && opened.is_fully_rolled_back();
+            if finished {
+                // A completed Undo is a status, not a failure.
+                self.result_message = Some(format!("Transaction {id}: {blocker}{note}"));
+                self.result_complete = true;
+            } else {
+                self.error = Some(format!("Transaction {id}: {blocker}{note}"));
+            }
+            return;
+        }
+        self.applied = Some(opened);
     }
 
     /// Rolls back the last applied transaction.
@@ -768,6 +870,7 @@ impl RomOrganisationPageState {
                 // Never retried as an ordinary Undo in this session.
                 self.quarantined_undo = Some(transaction);
                 self.error = Some(error);
+                self.error_after_changes = true;
             }
             Err(error) => {
                 // The journal on disk is the durable record of how far this
@@ -780,6 +883,7 @@ impl RomOrganisationPageState {
                 .filter(|recorded| recorded.transaction_id == transaction.transaction_id);
                 self.applied = Some(recorded.unwrap_or(transaction));
                 self.error = Some(error);
+                self.error_after_changes = true;
             }
         }
     }
@@ -818,6 +922,21 @@ pub(crate) fn older_writer_notice() -> Option<String> {
     notice
 }
 
+/// A held handle that is not a cleanly applied (or fully undone) transaction:
+/// partial, failed, in flight or contradictory. Another transaction must never
+/// take its place on the page.
+fn held_needs_recovery(transaction: &archivefs_core::dat::rename_apply::RenameTransaction) -> bool {
+    use archivefs_core::dat::rename_apply::model::{EntryState, TransactionState};
+    match transaction.state {
+        TransactionState::RolledBack => !transaction.is_fully_rolled_back(),
+        TransactionState::Applied => transaction
+            .entries
+            .iter()
+            .any(|entry| !matches!(entry.state, EntryState::Applied | EntryState::Skipped)),
+        _ => true,
+    }
+}
+
 /// Whether any entry may have left the source or any platform directory was
 /// created, so an Undo handle must be kept.
 fn transaction_may_have_changed_disk(
@@ -837,7 +956,16 @@ fn apply_result_report(
     mode: OrganisationMode,
     summary: &archivefs_core::dat::rename_apply::TransactionSummary,
 ) -> (String, bool) {
-    if summary.fully_resolved() {
+    if summary.fully_resolved() && summary.applied == 0 {
+        return (
+            format!(
+                "Nothing was changed by this Apply: {} item(s) were skipped and none were applied.",
+                summary.skipped
+            ),
+            false,
+        );
+    }
+    if summary.fully_resolved() && summary.skipped == 0 {
         let message = if mode == OrganisationMode::BuildLinkedLibrary {
             format!(
                 "Created {} library link(s); your original files were not touched. \
@@ -851,6 +979,16 @@ fn apply_result_report(
             )
         };
         return (message, true);
+    }
+    if summary.fully_resolved() {
+        return (
+            format!(
+                "Partly applied: {} applied, {} skipped as unsafe and left untouched. \
+                 Roll back is available for the {} applied.",
+                summary.applied, summary.skipped, summary.applied
+            ),
+            false,
+        );
     }
     let mut message = format!(
         "Not complete: {} applied, {} failed, {} unresolved (in flight), {} not attempted.",
@@ -1797,6 +1935,15 @@ fn show_rom_organisation_page_with_options(
             widgets::StatusTone::Warning
         };
         widgets::banner(ui, "Result", message, tone);
+        if let Some(transaction) = state.applied() {
+            // Same condition as the Undo button below.
+            crate::transaction_outcome::show(
+                ui,
+                transaction,
+                !state.advanced_r2_selected
+                    && archivefs_core::dat::rom_organisation::undo_blocker(transaction).is_none(),
+            );
+        }
         if quick_only && let Some(transaction) = state.applied() {
             ui.label(format!("Renamed: {}", transaction.applied_count()));
             ui.label(format!("Skipped: {}", transaction.skipped_count()));
@@ -1832,12 +1979,38 @@ fn show_rom_organisation_page_with_options(
 
     if let Some(error) = &state.error {
         ui.add_space(8.0);
-        widgets::banner(ui, "Not applied", error, widgets::StatusTone::Blocked);
+        let title = if state.error_after_changes {
+            "Not finished"
+        } else {
+            "Not applied"
+        };
+        widgets::banner(ui, title, error, widgets::StatusTone::Blocked);
     }
 
-    // Offered whenever this page holds an Undo handle, including after an
-    // error or a refused Undo that kept it.
+    // Offered whenever this page holds an Undo handle with something left to
+    // reverse, including after an error or a refused Undo that kept it. A
+    // handle with nothing left to undo is explained, never offered.
+    let undo_blocker = state
+        .applied
+        .as_ref()
+        .and_then(archivefs_core::dat::rom_organisation::undo_blocker);
+    if let Some(transaction) = &state.applied
+        && !state.advanced_r2_selected
+    {
+        match &undo_blocker {
+            Some(reason) => {
+                ui.label(reason);
+            }
+            None => {
+                ui.label(format!(
+                    "Undo on this page reverses only transaction {}.",
+                    transaction.transaction_id
+                ));
+            }
+        }
+    }
     if state.applied.is_some()
+        && undo_blocker.is_none()
         && !state.advanced_r2_selected
         && widgets::action_button(
             ui,
@@ -2456,6 +2629,140 @@ mod tests {
             message.starts_with("Applied 3 organisation(s)"),
             "{message}"
         );
+    }
+
+    #[test]
+    fn apply_banner_never_claims_success_for_skipped_or_empty_batches() {
+        let with_skipped = |applied, skipped| TransactionSummary {
+            skipped,
+            requested: applied + skipped,
+            ..summary(applied, 0, 0, 0)
+        };
+        let (message, complete) =
+            apply_result_report(OrganisationMode::RenameInPlace, &with_skipped(0, 2));
+        assert!(!complete, "{message}");
+        assert!(message.starts_with("Nothing was changed"), "{message}");
+        assert!(!message.contains("available"), "{message}");
+        assert!(!message.contains("nothing to roll back"), "{message}");
+        let (message, complete) =
+            apply_result_report(OrganisationMode::RenameInPlace, &with_skipped(3, 2));
+        assert!(!complete, "{message}");
+        assert!(message.starts_with("Partly applied"), "{message}");
+        assert!(message.contains("2 skipped"), "{message}");
+    }
+
+    #[test]
+    fn result_view_shows_the_journal_based_outcome_badge() {
+        use crate::transaction_outcome::test_support::{journal, rendered_text};
+        use archivefs_core::dat::rename_apply::model::{EntryState, TransactionState};
+        let render = |transaction| {
+            let mut state = RomOrganisationPageState {
+                applied: Some(transaction),
+                result_message: Some("result".into()),
+                result_complete: true,
+                ..RomOrganisationPageState::default()
+            };
+            let ctx = egui::Context::default();
+            let output = ctx.run(Default::default(), |ctx| {
+                egui::CentralPanel::default().show(ctx, |ui| {
+                    show_rom_organisation_page(ui, &mut state);
+                });
+            });
+            rendered_text(&output)
+        };
+        let done = render(journal(
+            TransactionState::Applied,
+            &[EntryState::Applied, EntryState::Applied],
+            &[],
+        ));
+        assert!(done.contains("Completed"), "{done}");
+        assert!(done.contains("2 applied"), "{done}");
+        assert!(done.contains("Undo available now"), "{done}");
+        let partly = render(journal(
+            TransactionState::Applied,
+            &[EntryState::Applied, EntryState::Skipped],
+            &[],
+        ));
+        assert!(partly.contains("Partially completed"), "{partly}");
+        assert!(!partly.contains("Completed\n"), "{partly}");
+    }
+
+    #[test]
+    fn history_selection_refusals_never_read_as_changes_made() {
+        use archivefs_core::dat::rename_apply::{RenameTransaction, TransactionState};
+        let record = |id: &str, state: TransactionState| RenameTransaction {
+            transaction_id: id.into(),
+            plan_generation: 1,
+            classifier_version: None,
+            created_at_unix: 0,
+            source_scan_root: String::new(),
+            state,
+            entries: Vec::new(),
+            created_directories: Vec::new(),
+            recovery_resolution: None,
+            recovery_resolved_at_unix: None,
+            unknown: Default::default(),
+        };
+        let journal = tempfile::tempdir().unwrap();
+        let selected = record("selected", TransactionState::Applied);
+        let refused_with = |prepare: &dyn Fn(&mut RomOrganisationPageState)| {
+            let mut state = RomOrganisationPageState {
+                applied_journal: journal.path().to_path_buf(),
+                error_after_changes: true,
+                ..Default::default()
+            };
+            prepare(&mut state);
+            state.select_history_transaction(&selected);
+            let message = state.error.clone().expect("refused");
+            assert!(!state.error_after_changes, "{message}");
+            assert!(message.contains("was not opened") || message.contains("Nothing was changed"));
+        };
+        refused_with(&|_| {});
+        refused_with(&|state| {
+            state.applied = Some(record("held", TransactionState::Applied));
+        });
+        refused_with(&|state| {
+            state.applied = Some(record("held", TransactionState::ApplyFailed));
+        });
+        refused_with(&|state| {
+            state.quarantined_undo = Some(record("held", TransactionState::Applied));
+        });
+        refused_with(&|state| state.advanced_r2_selected = true);
+    }
+
+    #[test]
+    fn all_skipped_apply_keeps_no_undo_handle() {
+        use archivefs_core::dat::rename_apply::{ApplyOutcome, RenameTransaction};
+        let mut state = RomOrganisationPageState::default();
+        use archivefs_core::dat::rename_apply::TransactionState;
+        let outcome_transaction = || RenameTransaction {
+            transaction_id: "t".into(),
+            plan_generation: 1,
+            classifier_version: None,
+            created_at_unix: 0,
+            source_scan_root: String::new(),
+            state: TransactionState::Planned,
+            entries: Vec::new(),
+            created_directories: Vec::new(),
+            recovery_resolution: None,
+            recovery_resolved_at_unix: None,
+            unknown: Default::default(),
+        };
+        let transaction = outcome_transaction();
+        let outcome = ApplyOutcome {
+            transaction: transaction.clone(),
+            summary: TransactionSummary {
+                skipped: 2,
+                requested: 2,
+                ..TransactionSummary::default()
+            },
+        };
+        state.record_apply_result(Ok(outcome), transaction);
+        assert!(
+            state.applied().is_none(),
+            "nothing applied, nothing to undo"
+        );
+        assert!(!state.result_complete());
     }
 
     #[test]

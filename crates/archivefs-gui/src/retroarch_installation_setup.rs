@@ -179,8 +179,12 @@ impl InstallationFingerprint {
 
     /// Adds the programs a finished scan found.
     pub(crate) fn with_programs(mut self, report: &RetroArchEnvironmentReport) -> Self {
+        // Programs plus the evidence the BIOS readiness in this report was
+        // derived from (config, system dir, probed firmware path prefixes),
+        // so adding/removing a BIOS or editing `retroarch.cfg` rescans.
         self.programs = report_programs(report)
             .into_iter()
+            .chain(archivefs_core::emulator_environment::retroarch::firmware_evidence_paths(report))
             .map(|path| {
                 let identity = program_identity(&path);
                 (path, identity)
@@ -630,5 +634,83 @@ mod tests {
                 .ends_with("RetroArch.AppImage.config/retroarch/retroarch.cfg")
         );
         assert!(!choices.iter().any(|choice| choice.program == wrapper));
+    }
+
+    #[test]
+    fn fingerprint_notices_bios_and_config_changes_behind_a_cached_report() {
+        use archivefs_core::emulator_environment::retroarch::{CoreInfoFinding, FirmwarePresence};
+        let root = tempfile::tempdir().unwrap();
+        let p = root.path();
+        for dir in ["cores", "info", "system"] {
+            fs::create_dir_all(p.join(dir)).unwrap();
+        }
+        fs::create_dir_all(p.join(".config/retroarch")).unwrap();
+        let cfg = p.join(".config/retroarch/retroarch.cfg");
+        let write_cfg = |system: &str| {
+            fs::write(
+                &cfg,
+                format!(
+                    "libretro_directory = \"{}\"\nlibretro_info_path = \"{}\"\nsystem_directory = \"{}\"\n",
+                    p.join("cores").display(),
+                    p.join("info").display(),
+                    p.join(system).display()
+                ),
+            )
+            .unwrap();
+        };
+        write_cfg("system");
+        fs::write(p.join("cores/psx_libretro.so"), "stub").unwrap();
+        fs::write(
+            p.join("info/psx.info"),
+            "firmware_count = \"1\"\nfirmware0_path = \"dc/scph.bin\"\nfirmware0_opt = \"false\"\n",
+        )
+        .unwrap();
+        let environment = DiscoveryEnvironment {
+            home: Some(p.into()),
+            xdg_config_home: None,
+            path: None,
+            explicit_executables: Vec::new(),
+            user_flatpak_root: p.join("user-flatpak"),
+            system_flatpak_root: p.join("system-flatpak"),
+            app_image_search_roots: Vec::new(),
+            desktop_file_roots: Vec::new(),
+        };
+        let scan =
+            || discover_retroarch_environment(&HostReadOnlyFilesystem, &environment).unwrap();
+        let presence = |report: &RetroArchEnvironmentReport| match &report.profiles[0].cores[0].info
+        {
+            CoreInfoFinding::Found { firmware, .. } => firmware[0].presence,
+            other => panic!("{other:?}"),
+        };
+        let fingerprint = |report: &RetroArchEnvironmentReport| {
+            InstallationFingerprint {
+                selection: None,
+                programs: Vec::new(),
+            }
+            .with_programs(report)
+        };
+
+        let report = scan();
+        assert_eq!(presence(&report), FirmwarePresence::Missing);
+        let print = fingerprint(&report);
+        assert!(!print.changed(), "nothing changed yet");
+
+        // Adding the BIOS (and its parent directory) must invalidate the cache.
+        fs::create_dir_all(p.join("system/dc")).unwrap();
+        assert!(print.changed(), "new parent directory");
+        fs::write(p.join("system/dc/scph.bin"), "x").unwrap();
+        let report = scan();
+        assert_eq!(presence(&report), FirmwarePresence::PresentUnverified);
+        let print = fingerprint(&report);
+        assert!(!print.changed());
+
+        // Removing it, and repointing system_directory, both invalidate too.
+        fs::remove_file(p.join("system/dc/scph.bin")).unwrap();
+        assert!(print.changed(), "BIOS removed");
+        let print = fingerprint(&scan());
+        fs::create_dir_all(p.join("other-system")).unwrap();
+        write_cfg("other-system");
+        assert!(print.changed(), "retroarch.cfg changed");
+        assert_eq!(presence(&scan()), FirmwarePresence::Missing);
     }
 }

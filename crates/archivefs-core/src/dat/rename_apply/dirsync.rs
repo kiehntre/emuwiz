@@ -51,10 +51,117 @@ pub(crate) fn link_undo_tombstone_path(
 ) -> std::path::PathBuf {
     destination.with_file_name(format!(".emuwiz-undone-{:x}-{:x}", proof.dev, proof.ino))
 }
-#[cfg(test)]
-pub(crate) use hook::set_undo_move_hook;
+/// Entry-level `unknown` key recording, in the sealed journal and BEFORE any
+/// filesystem change, the private quarantine an Undo of a hard link will use.
+#[cfg(unix)]
+pub(crate) const HARDLINK_QUARANTINE_KEY: &str = "emuwiz_hl_quarantine_v1";
+
+/// The quarantine folder and file names an entry's journal record names. Only
+/// the exact shape this code writes is accepted.
+#[cfg(unix)]
+pub(crate) fn hardlink_quarantine_names(
+    entry: &super::model::TransactionEntry,
+) -> Option<(std::ffi::OsString, std::ffi::OsString)> {
+    let record = entry.unknown.get(HARDLINK_QUARANTINE_KEY)?;
+    let hex =
+        |text: &str, len: usize| text.len() == len && text.bytes().all(|b| b.is_ascii_hexdigit());
+    let dir = record.get("dir")?.as_str()?;
+    let file = record.get("file")?.as_str()?;
+    (dir.strip_prefix(".emuwiz-undo-q-")
+        .is_some_and(|rest| hex(rest, 32))
+        && hex(file, 32))
+    .then(|| (dir.into(), file.into()))
+}
+
+/// The destination folder (device, inode) sealed into the quarantine record.
+#[cfg(unix)]
+pub(crate) fn hardlink_quarantine_folder_id(
+    entry: &super::model::TransactionEntry,
+) -> Option<(u64, u64)> {
+    let folder = entry.unknown.get(HARDLINK_QUARANTINE_KEY)?.get("folder")?;
+    Some((folder.get("dev")?.as_u64()?, folder.get("ino")?.as_u64()?))
+}
+
+/// A fresh, random quarantine record that also seals the identity of the folder
+/// it will live in, so a later pass can tell that folder from an empty mount
+/// point or a replacement. Randomness keeps the names unguessable to other
+/// processes; the record makes the attempt recoverable after a crash.
+#[cfg(unix)]
+pub(crate) fn new_hardlink_quarantine_record(destination: &Path) -> io::Result<serde_json::Value> {
+    use std::io::Read;
+    use std::os::unix::fs::MetadataExt;
+    let parent = destination
+        .parent()
+        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "no parent directory"))?;
+    let folder = std::fs::metadata(std::fs::canonicalize(parent)?)?;
+    let mut bytes = [0_u8; 32];
+    std::fs::File::open("/dev/urandom")?.read_exact(&mut bytes)?;
+    let hex = |slice: &[u8]| slice.iter().map(|b| format!("{b:02x}")).collect::<String>();
+    Ok(serde_json::json!({
+        "dir": format!(".emuwiz-undo-q-{}", hex(&bytes[..16])),
+        "file": hex(&bytes[16..]),
+        "folder": {"dev": folder.dev(), "ino": folder.ino()},
+    }))
+}
+
+/// What can be proved about an entry's recorded quarantine right now.
+#[cfg(unix)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum QuarantineState {
+    /// No record, or the recorded folder is provably the same one and holds no
+    /// such quarantine.
+    Absent,
+    /// The recorded quarantine exists beside the link.
+    Present,
+    /// The folder is unreachable, is not the recorded folder (an empty mount
+    /// point, a replacement), or cannot be read: absence proves nothing.
+    Unknown,
+}
+
+#[cfg(unix)]
+pub(crate) fn hardlink_quarantine_state(entry: &super::model::TransactionEntry) -> QuarantineState {
+    use std::os::unix::fs::MetadataExt;
+    let Some((dir, _)) = hardlink_quarantine_names(entry) else {
+        return QuarantineState::Absent;
+    };
+    let Some(parent) = entry.destination_path.parent() else {
+        return QuarantineState::Unknown;
+    };
+    let Ok(real) = std::fs::canonicalize(parent) else {
+        return QuarantineState::Unknown;
+    };
+    let Ok(folder) = std::fs::metadata(&real) else {
+        return QuarantineState::Unknown;
+    };
+    if hardlink_quarantine_folder_id(entry) != Some((folder.dev(), folder.ino())) {
+        return QuarantineState::Unknown;
+    }
+    match std::fs::symlink_metadata(real.join(dir)) {
+        Ok(_) => QuarantineState::Present,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => QuarantineState::Absent,
+        Err(_) => QuarantineState::Unknown,
+    }
+}
+
+/// Whether the quarantine an entry's record names still exists beside its link.
+#[cfg(unix)]
+pub(crate) fn hardlink_quarantine_present(entry: &super::model::TransactionEntry) -> bool {
+    hardlink_quarantine_state(entry) == QuarantineState::Present
+}
+
+/// How an Undo of a hard link ended short of removal.
+#[cfg(unix)]
+pub(crate) enum HardlinkUndoError {
+    /// Nothing is left behind: the link, or a foreign object, is where it was.
+    Refused(String),
+    /// Something is still in the quarantine; the next Undo resumes from it.
+    Retained(String),
+}
+
 #[cfg(test)]
 pub(crate) use hook::{DirSyncEvent, set_open_hook, set_test_hook};
+#[cfg(test)]
+pub(crate) use hook::{set_moved_hook, set_quarantine_hook, set_undo_move_hook, set_unlink_hook};
 
 #[cfg(unix)]
 #[derive(Clone)]
@@ -537,6 +644,314 @@ fn require_own_real_path(path: &Path) -> io::Result<()> {
 }
 
 #[cfg(unix)]
+/// Removes only the journal-proved hard link, never by an unchecked path
+/// unlink of the export name. The link is renamed with no-replace semantics,
+/// through the bound parent, into a private quarantine folder (mode 0300:
+/// not listable, random name, named in the journal beforehand). Its identity
+/// is proved there: a different file swapped in at the export name is put
+/// back, never deleted. Only the proved link is then unlinked, by a name no
+/// other process was told, and the folder is removed. Anything left over is
+/// reported as `Retained` and resumed by the next Undo from the journal.
+///
+/// Residual limit: POSIX has no unlink-by-identity, so the final unlink is
+/// by name. It is confined to a private, unlisted, randomly named folder
+/// created moments earlier; only a same-user process that deliberately
+/// discovers it (by changing its mode) and replaces the file inside the
+/// instant between the identity check and the unlink could defeat it.
+pub(crate) fn remove_hardlink_in(
+    dir: &std::fs::File,
+    name: &std::ffi::OsStr,
+    verify: &dyn Fn() -> io::Result<()>,
+    expected: &super::model::ObjectIdentity,
+    quarantine_dir: &std::ffi::OsStr,
+    quarantine_file: &std::ffi::OsStr,
+) -> Result<(), HardlinkUndoError> {
+    use HardlinkUndoError::{Refused, Retained};
+    use std::ffi::CString;
+    use std::os::fd::{AsRawFd, FromRawFd};
+    use std::os::unix::ffi::OsStrExt;
+    let cstr = |name: &std::ffi::OsStr| {
+        CString::new(name.as_bytes()).map_err(|_| Refused("invalid quarantine name".to_string()))
+    };
+    let (qdir_c, qfile_c, name_c) = (cstr(quarantine_dir)?, cstr(quarantine_file)?, cstr(name)?);
+    let fd = dir.as_raw_fd();
+    let io_err = |error: io::Error| error.to_string();
+    verify().map_err(|e| Refused(io_err(e)))?;
+
+    // Open the quarantine folder if a previous attempt left one.
+    let open_quarantine = || -> io::Result<Option<std::fs::File>> {
+        // SAFETY: names and the bound directory descriptor live.
+        let raw = unsafe {
+            libc::openat(
+                fd,
+                qdir_c.as_ptr(),
+                libc::O_PATH | libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC,
+            )
+        };
+        if raw >= 0 {
+            // SAFETY: `raw` is a freshly opened descriptor we own.
+            return Ok(Some(unsafe { std::fs::File::from_raw_fd(raw) }));
+        }
+        let error = io::Error::last_os_error();
+        if error.kind() == io::ErrorKind::NotFound {
+            Ok(None)
+        } else {
+            Err(error)
+        }
+    };
+    let remove_quarantine = || -> io::Result<()> {
+        // SAFETY: as above.
+        if unsafe { libc::unlinkat(fd, qdir_c.as_ptr(), libc::AT_REMOVEDIR) } < 0 {
+            return Err(io::Error::last_os_error());
+        }
+        Ok(())
+    };
+    let quarantine_path = |held: &std::fs::File| {
+        std::path::PathBuf::from(format!("/proc/self/fd/{}", held.as_raw_fd()))
+            .join(quarantine_file)
+    };
+
+    let mut held = open_quarantine().map_err(|e| Refused(io_err(e)))?;
+    if let Some(folder) = &held {
+        // Resuming an interrupted attempt: only the recorded file is judged.
+        let path = quarantine_path(folder);
+        match std::fs::symlink_metadata(&path) {
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {
+                remove_quarantine().map_err(|e| {
+                    Retained(format!(
+                        "the empty Undo quarantine folder could not be removed: {}",
+                        io_err(e)
+                    ))
+                })?;
+                held = None;
+            }
+            Err(error) => {
+                return Err(Retained(format!(
+                    "the retained link cannot be inspected: {}",
+                    io_err(error)
+                )));
+            }
+            Ok(_) => {
+                let proved = super::identity::capture_identity(&path)
+                    .is_ok_and(|actual| super::identity::identity_matches(expected, &actual));
+                if !proved {
+                    return Err(Retained(format!(
+                        "the object retained in the Undo quarantine is not the recorded link; it was left untouched at {}",
+                        path.display()
+                    )));
+                }
+            }
+        }
+    }
+    if held.is_none() {
+        // Nothing retained: the link must still be at the export name.
+        let entry = fd_entry(dir, name);
+        let current = super::identity::capture_identity(&entry).map_err(|e| {
+            if e.kind() == io::ErrorKind::NotFound {
+                // Already gone and nothing retained: the removal completed.
+                return Refused(String::new());
+            }
+            Refused(io_err(e))
+        });
+        match current {
+            Err(Refused(empty)) if empty.is_empty() => return Ok(()),
+            Err(other) => return Err(other),
+            Ok(current)
+                if current.kind == super::model::ObjectKind::Symlink
+                    || current.kind == super::model::ObjectKind::BrokenSymlink
+                    || !super::identity::identity_matches(expected, &current) =>
+            {
+                return Err(Refused(
+                    "destination is not the journal-proved hard link".to_string(),
+                ));
+            }
+            Ok(_) => {}
+        }
+        #[cfg(test)]
+        hook::before_undo_move(&entry);
+        // SAFETY: names and the bound directory descriptor live.
+        if unsafe { libc::mkdirat(fd, qdir_c.as_ptr(), 0o300) } < 0 {
+            return Err(Refused(format!(
+                "the Undo quarantine folder could not be created: {}",
+                io::Error::last_os_error()
+            )));
+        }
+        let folder = open_quarantine()
+            .map_err(|e| Retained(io_err(e)))?
+            .ok_or_else(|| {
+                Retained("the Undo quarantine folder vanished after creation".to_string())
+            })?;
+        let qfd = folder.as_raw_fd();
+        #[cfg(test)]
+        hook::after_quarantine_created()
+            .map_err(|e| Retained(format!("interrupted after creating the quarantine: {e}")))?;
+        // SAFETY: both directory descriptors and names live.
+        if unsafe {
+            libc::renameat2(
+                fd,
+                name_c.as_ptr(),
+                qfd,
+                qfile_c.as_ptr(),
+                libc::RENAME_NOREPLACE,
+            )
+        } < 0
+        {
+            let error = io::Error::last_os_error();
+            let unsupported = matches!(
+                error.raw_os_error(),
+                Some(libc::EINVAL | libc::ENOSYS | libc::EOPNOTSUPP)
+            );
+            let what = if unsupported {
+                "this filesystem does not support the no-replace rename that safe hard link removal needs, so nothing was changed; remove this export's links by hand".to_string()
+            } else {
+                format!("the link could not be moved: {error}")
+            };
+            return match remove_quarantine() {
+                Ok(()) => Err(Refused(what)),
+                Err(_) => Err(Retained(format!(
+                    "the link could not be moved ({error}) and the empty quarantine folder remains"
+                ))),
+            };
+        }
+        let moved = quarantine_path(&folder);
+        #[cfg(test)]
+        hook::after_quarantine_move();
+        let proved = dir.sync_all().is_ok()
+            && verify().is_ok()
+            && super::identity::capture_identity(&moved)
+                .is_ok_and(|actual| super::identity::identity_matches(expected, &actual));
+        if !proved {
+            // A different object was swapped in after the check, or the
+            // directories changed. Put it back if its name is still free.
+            // SAFETY: as above.
+            let restored = unsafe {
+                libc::renameat2(
+                    qfd,
+                    qfile_c.as_ptr(),
+                    fd,
+                    name_c.as_ptr(),
+                    libc::RENAME_NOREPLACE,
+                )
+            };
+            let _ = dir.sync_all();
+            if restored != 0 {
+                return Err(Retained(format!(
+                    "destination changed during Undo; the foreign object was retained at {} for manual recovery",
+                    moved.display()
+                )));
+            }
+            return match remove_quarantine() {
+                Ok(()) => Err(Refused(
+                    "destination changed during Undo; foreign object restored".to_string(),
+                )),
+                Err(error) => Err(Retained(format!(
+                    "destination changed during Undo; foreign object restored, but the empty quarantine folder remains: {error}"
+                ))),
+            };
+        }
+        held = Some(folder);
+    }
+    let folder = held.expect("quarantine held for the proved link");
+    #[cfg(test)]
+    let path = quarantine_path(&folder);
+    #[cfg(test)]
+    hook::before_hardlink_unlink(&path)
+        .map_err(|e| Retained(format!("interrupted before removing the link: {e}")))?;
+    // SAFETY: the quarantine descriptor and name live.
+    if unsafe { libc::unlinkat(folder.as_raw_fd(), qfile_c.as_ptr(), 0) } < 0 {
+        return Err(Retained(format!(
+            "the verified link could not be removed from the Undo quarantine: {}",
+            io::Error::last_os_error()
+        )));
+    }
+    remove_quarantine().map_err(|e| {
+        Retained(format!(
+            "the link was removed but its quarantine folder could not be: {}",
+            io_err(e)
+        ))
+    })?;
+    dir.sync_all().map_err(|e| {
+        Retained(format!(
+            "directory sync failed after removal: {}",
+            io_err(e)
+        ))
+    })?;
+    verify().map_err(|e| Retained(io_err(e)))?;
+    Ok(())
+}
+
+/// The destination folder of a hard link, bound by descriptor. Unlike
+/// [`RenameDirs`] it accepts a destination reached through a symlinked ancestor:
+/// a hard link is proved by its inode and content, not by where it was found,
+/// so binding the real folder cannot make an unrelated file look proved.
+#[cfg(unix)]
+pub(crate) struct HardlinkDir {
+    dir: std::fs::File,
+    name: std::ffi::OsString,
+    real: std::path::PathBuf,
+    id: (u64, u64),
+}
+
+#[cfg(unix)]
+impl HardlinkDir {
+    pub(crate) fn open(destination: &Path) -> io::Result<Self> {
+        use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
+        let (Some(parent), Some(name)) = (destination.parent(), destination.file_name()) else {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "no parent directory to bind",
+            ));
+        };
+        let real = std::fs::canonicalize(parent)?;
+        let dir = std::fs::OpenOptions::new()
+            .read(true)
+            .custom_flags(libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC)
+            .open(&real)?;
+        let opened = dir.metadata()?;
+        let id = (opened.dev(), opened.ino());
+        let this = Self {
+            dir,
+            name: name.to_os_string(),
+            real,
+            id,
+        };
+        this.verify()?;
+        Ok(this)
+    }
+
+    pub(crate) fn id(&self) -> (u64, u64) {
+        self.id
+    }
+
+    fn verify(&self) -> io::Result<()> {
+        use std::os::unix::fs::MetadataExt;
+        let current = std::fs::symlink_metadata(&self.real)?;
+        if (current.dev(), current.ino()) != self.id || !current.file_type().is_dir() {
+            return Err(io::Error::other(
+                "the destination folder changed while it was bound",
+            ));
+        }
+        Ok(())
+    }
+
+    pub(crate) fn remove(
+        &self,
+        expected: &super::model::ObjectIdentity,
+        quarantine_dir: &std::ffi::OsStr,
+        quarantine_file: &std::ffi::OsStr,
+    ) -> Result<(), HardlinkUndoError> {
+        remove_hardlink_in(
+            &self.dir,
+            &self.name,
+            &|| self.verify(),
+            expected,
+            quarantine_dir,
+            quarantine_file,
+        )
+    }
+}
+
+#[cfg(unix)]
 fn fd_entry(dir: &std::fs::File, name: &std::ffi::OsStr) -> std::path::PathBuf {
     use std::os::fd::AsRawFd;
     std::path::PathBuf::from(format!("/proc/self/fd/{}", dir.as_raw_fd())).join(name)
@@ -804,6 +1219,48 @@ mod hook {
 
     pub(crate) fn set_undo_move_hook(hook: Option<UndoMoveHook>) {
         UNDO_MOVE_HOOK.with(|slot| *slot.borrow_mut() = hook);
+    }
+
+    type QuarantineHook = Box<dyn FnMut() -> io::Result<()>>;
+    type UnlinkHook = Box<dyn FnMut(&Path) -> io::Result<()>>;
+    thread_local! {
+        static QUARANTINE_HOOK: std::cell::RefCell<Option<QuarantineHook>> =
+            const { std::cell::RefCell::new(None) };
+        static UNLINK_HOOK: std::cell::RefCell<Option<UnlinkHook>> =
+            const { std::cell::RefCell::new(None) };
+    }
+    pub(crate) fn set_quarantine_hook(hook: Option<QuarantineHook>) {
+        QUARANTINE_HOOK.with(|slot| *slot.borrow_mut() = hook);
+    }
+    pub(crate) fn set_unlink_hook(hook: Option<UnlinkHook>) {
+        UNLINK_HOOK.with(|slot| *slot.borrow_mut() = hook);
+    }
+    thread_local! {
+        static MOVED_HOOK: std::cell::RefCell<Option<Box<dyn FnMut()>>> =
+            const { std::cell::RefCell::new(None) };
+    }
+    pub(crate) fn set_moved_hook(hook: Option<Box<dyn FnMut()>>) {
+        MOVED_HOOK.with(|slot| *slot.borrow_mut() = hook);
+    }
+    pub(super) fn after_quarantine_move() {
+        let taken = MOVED_HOOK.with(|slot| slot.borrow_mut().take());
+        let Some(mut hook) = taken else { return };
+        hook();
+        MOVED_HOOK.with(|slot| *slot.borrow_mut() = Some(hook));
+    }
+    pub(super) fn after_quarantine_created() -> io::Result<()> {
+        let taken = QUARANTINE_HOOK.with(|slot| slot.borrow_mut().take());
+        let Some(mut hook) = taken else { return Ok(()) };
+        let result = hook();
+        QUARANTINE_HOOK.with(|slot| *slot.borrow_mut() = Some(hook));
+        result
+    }
+    pub(super) fn before_hardlink_unlink(path: &Path) -> io::Result<()> {
+        let taken = UNLINK_HOOK.with(|slot| slot.borrow_mut().take());
+        let Some(mut hook) = taken else { return Ok(()) };
+        let result = hook(path);
+        UNLINK_HOOK.with(|slot| *slot.borrow_mut() = Some(hook));
+        result
     }
 
     pub(super) fn before_undo_move(path: &Path) {

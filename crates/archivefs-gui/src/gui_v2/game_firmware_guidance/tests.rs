@@ -308,7 +308,8 @@ fn delayed_ready_report_keeps_worker_observation_time_and_is_expired() {
 }
 fn core_request(mut r: Request, platform: &'static str, name: &str, system: PathBuf) -> Request {
     use archivefs_core::emulator_environment::retroarch::{
-        CoreInfoFinding, FirmwareRequirement, ProfileKind, ProfileRef, ProfileScope,
+        CoreInfoFinding, FirmwarePresence, FirmwareRequirement, ProfileKind, ProfileRef,
+        ProfileScope,
     };
     r.context.platform = platform.into();
     r.candidate.target = LaunchTarget::RetroArchCore {
@@ -339,6 +340,7 @@ fn core_request(mut r: Request, platform: &'static str, name: &str, system: Path
                 path: Some(name.into()),
                 description: None,
                 optional: false,
+                presence: FirmwarePresence::Unknown,
             }],
         },
         Some(system),

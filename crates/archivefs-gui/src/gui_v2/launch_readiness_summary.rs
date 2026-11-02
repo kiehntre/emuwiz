@@ -966,7 +966,7 @@ pub(crate) struct CompactReadiness {
 pub(crate) fn compact(summary: &GameReadinessSummary, checksum_pending: bool) -> CompactReadiness {
     use ReadinessPresentationState as State;
     let reason = match summary.findings.first() {
-        Some(finding) => format!("{} {}", finding.title, finding.why),
+        Some(finding) => format!("{}. {}", finding.title, finding.why),
         None => summary.explanation.clone(),
     };
     let fix = summary
@@ -1251,6 +1251,21 @@ pub(crate) fn note_retroarch_installation_refusal(
     summary.headline = "RetroArch can't be used as chosen".into();
     summary.explanation = refusal.message();
     summary.primary_action = Some(ReadinessAction::SetUpEmulator);
+}
+
+/// A file already found missing is never offered for Play and never left
+/// reading as "Checking". DOS review offers Play without looking at the file.
+pub(crate) fn note_file_missing(summary: &mut GameReadinessSummary) {
+    if summary.primary_action == Some(ReadinessAction::Play)
+        || summary.status == ReadinessPresentationState::Checking
+    {
+        summary.status = ReadinessPresentationState::SourceUnavailable;
+        summary.headline = "The game file is unavailable".into();
+        summary.explanation =
+            "Reconnect its drive or restore the file, then open this game again.".into();
+        summary.source = SourceSummary::Unavailable;
+        summary.primary_action = Some(ReadinessAction::CheckGamesFolder);
+    }
 }
 
 pub(crate) fn note_catalogue_verified(summary: &mut GameReadinessSummary) {
@@ -1609,6 +1624,70 @@ mod tests {
         assert_eq!(
             summary.primary_action,
             Some(ReadinessAction::ChooseEmulator)
+        );
+    }
+
+    /// The remembered emulator choice is part of the plan the worker must
+    /// share with the foreground: it turns "choose one" into Play.
+    #[test]
+    fn a_remembered_choice_among_safe_candidates_is_ready_not_a_choice() {
+        let summary = project(
+            &plan(vec![
+                candidate(
+                    LaunchReadiness::Ready,
+                    FirmwareReadiness::NotRequired,
+                    vec![],
+                    vec![],
+                    CandidatePreference::Remembered,
+                    Some("/game.iso"),
+                ),
+                candidate(
+                    LaunchReadiness::Ready,
+                    FirmwareReadiness::NotRequired,
+                    vec![],
+                    vec![],
+                    CandidatePreference::Undetermined,
+                    Some("/game.iso"),
+                ),
+            ]),
+            ReadinessFreshness::Current,
+        );
+        assert_eq!(summary.status, ReadinessPresentationState::Ready);
+        assert_eq!(summary.primary_action, Some(ReadinessAction::Play));
+    }
+
+    /// A remembered emulator that is blocked must not let a clean alternative
+    /// make the game Ready: without the memory the alternative looks clean.
+    #[test]
+    fn a_blocked_remembered_candidate_beside_a_clean_one_is_not_ready() {
+        let summary = project(
+            &plan(vec![
+                candidate(
+                    LaunchReadiness::Blocked,
+                    FirmwareReadiness::NotRequired,
+                    vec![LaunchBlocker {
+                        kind: LaunchBlockerKind::NoInstallationCandidate,
+                        detail: "remembered profile is gone".into(),
+                    }],
+                    vec![],
+                    CandidatePreference::Remembered,
+                    Some("/game.iso"),
+                ),
+                candidate(
+                    LaunchReadiness::Ready,
+                    FirmwareReadiness::NotRequired,
+                    vec![],
+                    vec![],
+                    CandidatePreference::Undetermined,
+                    Some("/game.iso"),
+                ),
+            ]),
+            ReadinessFreshness::Current,
+        );
+        assert_ne!(
+            summary.status,
+            ReadinessPresentationState::Ready,
+            "{summary:?}"
         );
     }
 

@@ -57,8 +57,8 @@ impl InventoryEmulator {
             // Bare `dolphin` is KDE's file manager on Linux, not the emulator.
             Self::Dolphin => &["dolphin-emu"],
             Self::Rpcs3 => &["rpcs3"],
-            Self::Pcsx2 => &["pcsx2"],
-            Self::Ppsspp => &["ppsspp"],
+            Self::Pcsx2 => &["pcsx2", "pcsx2-qt"],
+            Self::Ppsspp => &["ppsspp", "PPSSPPSDL"],
             Self::DuckStation => &["duckstation", "duckstation-qt"],
             Self::Xemu => &["xemu"],
             Self::ShadPs4 => &["shadps4", "shadPS4"],
@@ -317,9 +317,11 @@ fn probe_version(path: &Path, emulator: InventoryEmulator) -> Option<String> {
     // shadPS4 has no read-only version probe: user paths are initialized
     // before argument parsing. Its adapter uses static recognition instead.
     // Flycast has no version CLI; its cheat installer uses pinned artifact hashes.
+    // PCSX2-Qt rejects `--version` with a modal "Unknown parameter" dialog and
+    // keeps running, so it is never executed to read a version.
     if matches!(
         emulator,
-        InventoryEmulator::ShadPs4 | InventoryEmulator::Flycast
+        InventoryEmulator::ShadPs4 | InventoryEmulator::Flycast | InventoryEmulator::Pcsx2
     ) {
         return None;
     }
@@ -592,6 +594,74 @@ mod tests {
             PathBuf::from("/a")
         );
         assert_eq!(inventory.installations.len(), 2);
+    }
+    #[test]
+    fn pcsx2_and_ppsspp_wrapper_names_are_recognised_read_only() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        for name in ["pcsx2-qt", "PPSSPPSDL"] {
+            let p = dir.path().join(name);
+            fs::write(&p, "#!/bin/sh\nexit 0\n").unwrap();
+            fs::set_permissions(&p, fs::Permissions::from_mode(0o755)).unwrap();
+        }
+        let found = discover_in_path_entries(vec![dir.path().into()], false);
+        for (emulator, name) in [
+            (InventoryEmulator::Pcsx2, "pcsx2-qt"),
+            (InventoryEmulator::Ppsspp, "PPSSPPSDL"),
+        ] {
+            assert!(
+                found
+                    .installations
+                    .iter()
+                    .any(|i| i.emulator == emulator && i.executable_path == dir.path().join(name)),
+                "{name} not recognised"
+            );
+        }
+    }
+    #[test]
+    fn pcsx2_is_discovered_but_never_executed_to_read_a_version() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let marker = dir.path().join("pcsx2-was-executed");
+        let launcher = dir.path().join("pcsx2-qt");
+        fs::write(
+            &launcher,
+            format!("#!/bin/sh\ntouch '{}'\necho 'v9.9.9'\n", marker.display()),
+        )
+        .unwrap();
+        fs::set_permissions(&launcher, fs::Permissions::from_mode(0o755)).unwrap();
+        // probe_versions = true is the path the Emulator Inventory page uses.
+        let found = discover_in_path_entries(vec![dir.path().into()], true);
+        let pcsx2: Vec<_> = found
+            .installations
+            .iter()
+            .filter(|i| i.emulator == InventoryEmulator::Pcsx2)
+            .collect();
+        assert_eq!(pcsx2.len(), 1, "PCSX2 must still be reported as installed");
+        assert_eq!(pcsx2[0].executable_path, launcher);
+        assert_eq!(pcsx2[0].version, None);
+        assert!(
+            !marker.exists(),
+            "pcsx2-qt must not be executed for discovery"
+        );
+        assert_eq!(
+            probe_version_output(&launcher, InventoryEmulator::Pcsx2),
+            None
+        );
+        assert!(!marker.exists());
+    }
+
+    #[test]
+    fn other_emulators_are_still_probed_for_a_version() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let p = dir.path().join("xemu");
+        fs::write(&p, "#!/bin/sh\necho 'xemu_version: 0.8.136'\n").unwrap();
+        fs::set_permissions(&p, fs::Permissions::from_mode(0o755)).unwrap();
+        assert!(
+            probe_version_output(&p, InventoryEmulator::Xemu)
+                .is_some_and(|out| out.contains("0.8.136"))
+        );
     }
     #[test]
     fn real_smoke_is_bounded_and_read_only() {

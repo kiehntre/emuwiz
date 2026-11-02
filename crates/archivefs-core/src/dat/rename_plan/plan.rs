@@ -1458,6 +1458,119 @@ mod tests {
         assert!(p.blockers.iter().any(|b| b.contains("path separator")));
     }
 
+    // --- Regression fixtures from the 2026-10-09 OpenROM feature-delta audit --
+    //
+    // Unsafe behaviour prevented: joining a DAT entry's ROM name straight onto
+    // the library folder and renaming to it. A DAT is third-party input; a
+    // name such as `../x.bin` or `/abs/x.bin` would then move a verified file
+    // out of the library, or over a file elsewhere.
+
+    /// Plans one verified file against one hostile DAT name, inside a library
+    /// folder that has a sentinel beside it (outside the scan root).
+    fn plan_for_dat_name(rom_name: &str) -> (RenamePlan, std::path::PathBuf) {
+        let dir = temp();
+        let library = dir.path().join("library");
+        let file = write(&library, "game.bin");
+        let sentinel = write(dir.path(), "escape.bin");
+        let before = snapshot(dir.path());
+        let entries = vec![entry_for(&file, "game.bin", exact(rom_name))];
+        let plan = build_rename_plan(
+            &outcome(&library, entries, Vec::new(), None, false),
+            &RenamePlanContext { generation: 1 },
+            &no_cancel(),
+        )
+        .unwrap();
+        assert_eq!(
+            snapshot(dir.path()),
+            before,
+            "{rom_name:?}: planning changed the filesystem"
+        );
+        assert_eq!(std::fs::read(&sentinel).unwrap(), b"fixture");
+        (plan, library)
+    }
+
+    #[test]
+    fn regression_hostile_dat_names_never_produce_a_rename_target() {
+        for rom_name in [
+            "../escape.bin",
+            "../../escape.bin",
+            " ../escape.bin ",
+            "/escape.bin",
+            "/etc/escape.bin",
+            "//escape.bin",
+            "sub/escape.bin",
+            "sub/../../escape.bin",
+            "./escape.bin",
+            "escape.bin/..",
+            "escape.bin/",
+            "..\\escape.bin",
+            "sub\\escape.bin",
+            "C:\\Windows\\escape.bin",
+            "C:/Windows/escape.bin",
+            "\\\\server\\share\\escape.bin",
+            "\\\\?\\C:\\escape.bin",
+            "esc\0ape.bin",
+            "..",
+            ".",
+            "",
+            "   ",
+        ] {
+            let (plan, _library) = plan_for_dat_name(rom_name);
+            assert_eq!(plan.proposals.len(), 1, "{rom_name:?}");
+            let proposal = &plan.proposals[0];
+            assert_eq!(proposal.state, ProposalState::Blocked, "{rom_name:?}");
+            assert!(!proposal.state.is_actionable(), "{rom_name:?}");
+            assert_eq!(
+                proposal.proposed_basename, None,
+                "{rom_name:?}: refused, never sanitised into a usable name"
+            );
+            assert!(!proposal.blockers.is_empty(), "{rom_name:?}");
+            assert_eq!(plan.counts.suggested, 0, "{rom_name:?}");
+            assert_eq!(plan.counts.blocked, 1, "{rom_name:?}");
+        }
+    }
+
+    /// Names that look suspicious but hold no separator are single filename
+    /// components. Whatever is proposed for them must stay a single component
+    /// of the source's own directory.
+    #[test]
+    fn regression_suspicious_single_component_names_stay_inside_the_source_folder() {
+        for rom_name in [
+            "..escape.bin",
+            "...bin",
+            "~escape.bin",
+            "-rf.bin",
+            "C:escape.bin",
+            "CON.bin",
+            "escape.bin ",
+            "es\u{202e}cape.bin",
+            "es\ncape.bin",
+        ] {
+            let (plan, library) = plan_for_dat_name(rom_name);
+            let proposal = &plan.proposals[0];
+            let Some(basename) = proposal.proposed_basename.as_deref() else {
+                assert!(!proposal.state.is_actionable(), "{rom_name:?}");
+                continue;
+            };
+            let components: Vec<_> = Path::new(basename).components().collect();
+            assert!(
+                matches!(components.as_slice(), [std::path::Component::Normal(_)]),
+                "{rom_name:?} -> {basename:?} is not one plain component"
+            );
+            assert!(
+                !basename.contains(['/', '\\', '\0']) && !basename.chars().any(char::is_control),
+                "{rom_name:?} -> {basename:?}"
+            );
+            let target = library.join(basename);
+            assert_eq!(target.parent(), Some(library.as_path()), "{rom_name:?}");
+            assert_eq!(
+                proposal.source_path.parent(),
+                Some(library.as_path()),
+                "{rom_name:?}"
+            );
+        }
+    }
+
     #[test]
     fn an_empty_canonical_name_is_blocked() {
         let dir = temp();

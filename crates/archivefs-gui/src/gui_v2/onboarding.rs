@@ -243,10 +243,7 @@ pub(super) fn show(
     }
 
     let mut action = None;
-    egui::ScrollArea::vertical()
-        .id_salt("v2_setup_doctor")
-        .auto_shrink([false, false])
-        .show(ui, |ui| {
+    ui.vertical(|ui| {
 
             if snapshot.both_roots_conflict {
                 egui::Frame::group(ui.style()).show(ui, |ui| {
@@ -744,9 +741,7 @@ fn update_status_label(status: archivefs_core::emulator_update::UpdateStatus) ->
 
 fn welcome(ui: &mut egui::Ui) -> Option<Action> {
     let mut action = None;
-    egui::ScrollArea::vertical()
-        .id_salt("v2_first_run")
-        .show(ui, |ui| {
+    ui.vertical(|ui| {
             ui.heading("Welcome to EmuWiz");
             ui.label("EmuWiz helps you understand, preserve, and play a game collection without changing original files unexpectedly.");
             // "›", not "→": egui's default fonts have no arrow glyph and drew a box.

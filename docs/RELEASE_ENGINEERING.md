@@ -18,6 +18,15 @@ is reproducibly staged when `SOURCE_DATE_EPOCH` and `--reproducible` are used.
 The maintained packager is `scripts/release/package_release.py`, normally
 invoked by `scripts/release/package-release.sh` or `scripts/build-release.sh`.
 
+## Platform baseline
+
+Official Linux binaries must run on Ubuntu 24.04 (glibc 2.39). Release and
+reproducibility jobs therefore build on the pinned `ubuntu-24.04` runner
+(never `ubuntu-latest`, which moves to newer glibc), and
+`scripts/release/check_glibc_compat.py` fails the artifact job, the
+downloaded-artifact job and the tag release workflow if any ELF in the archive
+requires a `GLIBC_` version above 2.39.
+
 ## Payload contract
 
 Every canonical archive contains, with manifest and checksum coverage:

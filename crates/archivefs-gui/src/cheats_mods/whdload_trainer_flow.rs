@@ -512,6 +512,32 @@ mod tests {
     }
 
     #[test]
+    fn saving_from_the_editor_shows_shared_transaction_warnings() {
+        use crate::shared_apply_warnings::test_support::{assert_shows_warning, warned_result};
+        let lab = lab();
+        let (discovery, path) = found(&lab, Some("amiga:turrican"));
+        let path = path.unwrap();
+        let staging = tempfile::tempdir().unwrap();
+        let staged = preview(
+            &discovery,
+            &select(&discovery, &["Infinite lives"]),
+            &path,
+            staging.path(),
+        )
+        .unwrap();
+        let mut editor = crate::cheats_mods::WhdloadTrainerEditorState::default();
+        crate::cheats_mods::save_whdload_preview_with(
+            &mut editor,
+            &staged,
+            |_| Ok(warned_result()),
+            None,
+        );
+        let (saved, message) = editor.outcome.unwrap();
+        assert!(saved);
+        assert_shows_warning(&message);
+    }
+
+    #[test]
     fn saving_from_the_editor_keeps_its_staging_until_the_apply_has_run() {
         // The editor owns the private staging folder the preview wrote into.
         // Saving must not drop it before the apply copies the staged file.

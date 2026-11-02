@@ -420,5 +420,4 @@
 ["unused_mut", "crates/archivefs-gui/src/tests/cheat_routing_loadability.rs", "variable does not need to be mutable"]
 ["unused_parens", "crates/archivefs-gui/src/launch_readiness_page/retroarch_cheats_tests.rs", "unnecessary parentheses around block return value"]
 ["unused_parens", "third_party/chd-0.3.4/src/header.rs", "unnecessary parentheses around closure body"]
-["unused_variables", "crates/archivefs-gui/src/emulator_setup/controller.rs", "unused variable: `empty_firmware`"]
 ["unused_variables", "third_party/chd-0.3.4/src/compression/zstd.rs", "unused variable: `e`"]

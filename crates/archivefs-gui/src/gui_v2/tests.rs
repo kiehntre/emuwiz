@@ -118,6 +118,7 @@ pub(super) fn fixture(context: &egui::Context) -> App {
         arcade_input_details: super::arcade_input_details::State::default(),
         classic_trainers: super::classic_trainers::State::default(),
         recording_integrity: Default::default(),
+        game_detail_facts: Default::default(),
         canonical_organisation: crate::rom_organisation_page::RomOrganisationPageState::default(),
         canonical_organisation_job: None,
         history_view: Default::default(),
@@ -141,6 +142,9 @@ pub(super) fn fixture(context: &egui::Context) -> App {
         hackhash: super::hackhash::HackHashPageState::default(),
         romm_library: super::romm_library::RommBrowserState::default(),
         romm_library_job: None,
+        reset_page_scroll: false,
+        reset_all_tools_scroll: false,
+        scrolled_organisation_view: organisation::OrganisationView::default(),
         manual_viewer: super::manual_viewer::ManualViewer::default(),
         text_guide_viewer: Default::default(),
         document_preferences: super::documents::DocumentPreferences::default(),
@@ -3062,7 +3066,7 @@ fn gui_v2_library_search_platform_filter_attention_and_empty_platform() {
     assert_eq!(
         library
             .filter(&Filter {
-                attention_only: true,
+                readiness: super::library::ReadinessFilter::NeedsAttention,
                 ..Default::default()
             })
             .len(),
@@ -3290,6 +3294,139 @@ fn gui_v2_preferences_round_trip_is_separate_from_legacy_mode() {
     assert_eq!(restored.filter.search, "Zelda");
     assert!(restored.beginner_hints_enabled);
     assert_eq!(fs::read_to_string(old).unwrap(), "advanced");
+}
+
+fn old_format_preferences(filter: serde_json::Value) -> serde_json::Value {
+    serde_json::json!({
+        "route": {"Section": "Activity"},
+        "filter": filter,
+        "welcome_dismissed": true,
+        "beginner_hints_enabled": false,
+        "document_roots": [],
+        "document_associations": {},
+        "document_reading": {},
+        "simple_shell": true,
+        "classic_view": false,
+        "ui_scale": 1.25
+    })
+}
+
+fn save_and_reload(path: &std::path::Path, preferences: &Preferences) -> Preferences {
+    backend::save_preferences(path, preferences).unwrap();
+    serde_json::from_slice(&fs::read(path).unwrap()).unwrap()
+}
+
+#[test]
+fn saved_filter_from_before_readiness_keeps_every_setting_and_survives_a_save() {
+    let directory = tempfile::tempdir().unwrap();
+    let path = directory.path().join("gui-v2.json");
+    let old = old_format_preferences(serde_json::json!({
+        "search": "Mario",
+        "platform": "Game Boy",
+        "attention_only": false,
+        "unverified_only": true,
+        "list": true
+    }));
+    fs::write(&path, serde_json::to_vec(&old).unwrap()).unwrap();
+
+    let restored: Preferences = serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
+    assert_eq!(restored.route, Route::Section(Section::Activity));
+    assert_eq!(
+        restored.filter,
+        Filter {
+            search: "Mario".into(),
+            platform: "Game Boy".into(),
+            readiness: library::ReadinessFilter::All,
+            unverified_only: true,
+            list: true,
+            ..Default::default()
+        }
+    );
+    assert!(restored.welcome_dismissed);
+    assert!(!restored.beginner_hints_enabled);
+    assert_eq!(restored.ui_scale, 1.25);
+
+    let reloaded = save_and_reload(&path, &restored);
+    assert_eq!(reloaded.filter, restored.filter);
+    let stored: serde_json::Value = serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
+    assert_eq!(stored["filter"]["readiness"], "All");
+    assert!(stored["filter"].get("attention_only").is_none());
+}
+
+#[test]
+fn saved_attention_view_from_before_readiness_stays_the_attention_view() {
+    let directory = tempfile::tempdir().unwrap();
+    let path = directory.path().join("gui-v2.json");
+    let restored: Preferences = serde_json::from_value(old_format_preferences(serde_json::json!({
+        "search": "",
+        "platform": "SNES",
+        "attention_only": true,
+        "unverified_only": false,
+        "list": false
+    })))
+    .unwrap();
+    assert_eq!(
+        restored.filter.readiness,
+        library::ReadinessFilter::NeedsAttention
+    );
+    assert_eq!(restored.filter.platform, "SNES");
+    assert_eq!(
+        save_and_reload(&path, &restored).filter.readiness,
+        library::ReadinessFilter::NeedsAttention
+    );
+}
+
+#[test]
+fn saved_readiness_is_kept_and_wins_over_a_stale_attention_flag() {
+    let directory = tempfile::tempdir().unwrap();
+    let path = directory.path().join("gui-v2.json");
+    for readiness in library::ReadinessFilter::ALL {
+        let preferences = Preferences {
+            filter: Filter {
+                search: "Zelda".into(),
+                platform: "Game Boy".into(),
+                readiness,
+                list: true,
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        assert_eq!(
+            save_and_reload(&path, &preferences).filter,
+            preferences.filter
+        );
+    }
+    let stale: Preferences = serde_json::from_value(old_format_preferences(serde_json::json!({
+        "search": "",
+        "platform": "",
+        "readiness": "Ready",
+        "attention_only": true,
+        "unverified_only": false,
+        "list": false
+    })))
+    .unwrap();
+    assert_eq!(stale.filter.readiness, library::ReadinessFilter::Ready);
+}
+
+#[test]
+fn saved_filter_with_missing_fields_takes_defaults_and_rejects_invalid_readiness() {
+    let restored: Preferences = serde_json::from_value(old_format_preferences(
+        serde_json::json!({"platform": "NES"}),
+    ))
+    .unwrap();
+    assert_eq!(
+        restored.filter,
+        Filter {
+            platform: "NES".into(),
+            ..Default::default()
+        }
+    );
+    assert!(
+        serde_json::from_value::<Preferences>(old_format_preferences(serde_json::json!({
+            "readiness": "Sometimes"
+        })))
+        .is_err()
+    );
 }
 
 #[test]
@@ -3982,7 +4119,7 @@ fn gui_v2_game_details_show_evidence_section_only_when_the_media_has_evidence() 
     );
     // With nothing associated, Game Details still offers the Manuals section
     // (it carries "Associate local document…") and says plainly it is empty.
-    let strings = text(&output);
+    let strings = scrolled_text(&context, &mut app, [1280.0, 1600.0]);
     assert!(strings.iter().any(|line| line == "Manuals & Guides"));
     assert!(
         strings
@@ -4047,13 +4184,13 @@ fn gui_v2_platform_selection_clears_old_filters_and_counts_all_sources() {
     ]);
     let mut filter = Filter {
         search: "old search".into(),
-        attention_only: true,
+        readiness: super::library::ReadinessFilter::NeedsAttention,
         list: true,
         ..Default::default()
     };
     filter.select_platform("Arcade".into());
     assert!(filter.search.is_empty());
-    assert!(!filter.attention_only);
+    assert_eq!(filter.readiness, super::library::ReadinessFilter::All);
     assert!(filter.list);
     assert_eq!(library.filter(&filter).len(), library.platforms["Arcade"]);
     assert_eq!(library.filter(&filter).len(), 2);
@@ -4693,7 +4830,7 @@ fn gui_v2_selected_dreamcast_game_shows_native_ipbin_boundary() {
     app.library = Arc::new(Library::new(vec![archive(9, "Rez", Some("Dreamcast"))]));
     app.router.current = Route::Game(9);
 
-    let closed = text(&frame(&context, &mut app, [1280.0, 1600.0]));
+    let closed = scrolled_text(&context, &mut app, [1280.0, 1600.0]);
     assert!(closed.iter().any(|value| value == "Disc & ROM evidence"));
     assert!(
         !closed
@@ -4744,7 +4881,7 @@ fn gui_v2_selected_saturn_game_shows_read_only_disc_manifest_boundary() {
     )]));
     app.router.current = Route::Game(9);
 
-    let closed = text(&frame(&context, &mut app, [1280.0, 1600.0]));
+    let closed = scrolled_text(&context, &mut app, [1280.0, 1600.0]);
     assert!(closed.iter().any(|value| value == "Disc & ROM evidence"));
     assert!(!closed.iter().any(|value| value == "Saturn disc layout"));
     let _ = click_label(&context, &mut app, [1280.0, 2600.0], "Disc & ROM evidence");
@@ -10865,6 +11002,7 @@ mod history_page {
 
 mod blue_home_library;
 mod blue_usability;
+mod game_detail_facts;
 mod history_records;
 mod organisation_outcomes;
 mod simple_shell_ui;

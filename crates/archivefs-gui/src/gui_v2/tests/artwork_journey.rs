@@ -341,15 +341,16 @@ fn job36_narrow_browse_filters_do_not_overlap_the_entry_controls() {
         let size = [620.0, 480.0];
         frame(&context, &mut app, size);
         let output = frame(&context, &mut app, size);
-        let attention = text_bounds(&output, "Needs attention")[0];
+        // At this width the four readiness views are one dropdown.
+        let attention = text_bounds(&output, "All")[0];
         let grid = text_bounds(&output, "Grid")[0];
         assert!(
-            visible_text(&output, "Needs attention"),
-            "attention filter clipped for {query:?}"
+            visible_text(&output, "All"),
+            "readiness filter clipped for {query:?}"
         );
         assert!(
             !attention.intersects(grid),
-            "attention filter overlaps Grid for {query:?}: {attention:?} {grid:?}"
+            "readiness filter overlaps Grid for {query:?}: {attention:?} {grid:?}"
         );
     }
 }

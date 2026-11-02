@@ -135,6 +135,9 @@ pub(super) struct GameRef {
 pub(super) struct Handoff {
     pub label: &'static str,
     pub route: Route,
+    /// Opening the destination must first select exactly this receipt's
+    /// transaction there (ROM Organisation Undo by id).
+    pub selects_organisation: bool,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -385,20 +388,39 @@ fn handoff_for(source: Source, family: Family) -> Handoff {
         (Source::DuplicateQuarantine, _) => Handoff {
             label: "Open Duplicates",
             route: Route::Section(Section::Duplicates),
+            selects_organisation: false,
         },
         (Source::MameReconstruction | Source::MameInternalRepair, _) => Handoff {
             label: "Open MAME workflow",
             route: Route::MameWorkflow,
+            selects_organisation: false,
         },
         (_, Family::VerificationRename) => Handoff {
             label: "Open DATs & Verification",
             route: Route::Section(Section::DatVerification),
+            selects_organisation: false,
         },
         _ => Handoff {
             label: "Open Organisation",
             route: Route::Section(Section::Build),
+            selects_organisation: false,
         },
     }
+}
+
+/// A ROM Organisation rename or move opens its own page with exactly this
+/// transaction selected; every other canonical receipt keeps its handoff.
+fn handoff_of(transaction: &RenameTransaction, source: Source, family: Family) -> Handoff {
+    if source == Source::CanonicalOrganisation
+        && archivefs_core::dat::rom_organisation::is_organisation_transaction(transaction)
+    {
+        return Handoff {
+            label: "Open Organisation",
+            route: Route::Section(Section::Build),
+            selects_organisation: true,
+        };
+    }
+    handoff_for(source, family)
 }
 
 fn failure_facts(transaction: &RenameTransaction, source: Source) -> Option<FailureFacts> {
@@ -691,7 +713,7 @@ impl HistoryEntry {
             target: target_of(transaction, source),
             games: Vec::new(),
             undo,
-            handoff: handoff_for(source, family),
+            handoff: handoff_of(transaction, source, family),
             failure: failure_facts(transaction, source),
             advanced: advanced_of(transaction, journal_dir),
             transaction: transaction.clone(),
@@ -1336,6 +1358,7 @@ impl super::App {
         ui.label("This is a record of what EmuWiz did earlier. It is history, not the current state of your files. Browsing it changes nothing.");
 
         let mut go: Option<Route> = None;
+        let mut select_organisation: Option<String> = None;
         let mut view = std::mem::take(&mut self.history_view);
 
         if let Some(game_id) = scoped_game {
@@ -1405,6 +1428,7 @@ impl super::App {
                                 self.playing_library_job.is_some(),
                                 HistoryRowRequests {
                                     go: &mut go,
+                                    select_organisation: &mut select_organisation,
                                     preview: &mut preview_request,
                                     undo: &mut undo_request,
                                 },
@@ -1545,9 +1569,35 @@ impl super::App {
             }
         }
         self.history_view = view;
+        if let Some(id) = select_organisation {
+            self.select_organisation_transaction(&id);
+        }
         if let Some(route) = go {
             self.go(route);
         }
+    }
+
+    /// History's "Open Organisation": select exactly this transaction on the
+    /// page, from its sealed journal. A running organisation job owns the page
+    /// and its copy, so nothing is selected under it.
+    pub(super) fn select_organisation_transaction(&mut self, id: &str) {
+        let Some(transaction) = self
+            .canonical_organisation_history
+            .iter()
+            .find(|transaction| transaction.transaction_id == id)
+            .cloned()
+        else {
+            return;
+        };
+        if self.canonical_organisation_job.is_some() {
+            self.notice = Some(super::Notice {
+                message: "Another organisation job is running, so this transaction was not selected. Open it from History again when the job has finished.".into(),
+                technical: format!("Transaction {id}"),
+            });
+            return;
+        }
+        self.canonical_organisation
+            .select_history_transaction(&transaction);
     }
 
     /// Recovery stays with the existing native journal controller and its
@@ -1677,6 +1727,7 @@ const ROWS_MIN_HEIGHT: f32 = 360.0;
 
 struct HistoryRowRequests<'a> {
     go: &'a mut Option<Route>,
+    select_organisation: &'a mut Option<String>,
     preview: &'a mut Option<String>,
     undo: &'a mut Option<String>,
 }
@@ -1754,6 +1805,9 @@ fn show_row(
                     ui.label(reason);
                 }
             }
+            if let Some(note) = organisation_note(entry) {
+                ui.label(note);
+            }
 
             if let Some(failure) = &entry.failure {
                 ui.label(&failure.attempted);
@@ -1782,6 +1836,9 @@ fn show_row(
                         .clicked()
                     {
                         *requests.go = Some(entry.handoff.route.clone());
+                        if entry.handoff.selects_organisation {
+                            *requests.select_organisation = Some(entry.transaction_id.clone());
+                        }
                     }
                 }
             });
@@ -1792,7 +1849,15 @@ fn show_row(
                         .undo_attempts
                         .values()
                         .any(|id| activity.jobs.get(id).is_some_and(|job| job.active()));
-                show_preview(ui, entry, preview, undo_busy, requests.go, requests.undo);
+                show_preview(
+                    ui,
+                    entry,
+                    preview,
+                    undo_busy,
+                    requests.go,
+                    requests.select_organisation,
+                    requests.undo,
+                );
             }
 
             ui.collapsing("Advanced details", |ui| {
@@ -1811,12 +1876,38 @@ fn show_row(
     });
 }
 
+/// What History says, beyond the status label, about a ROM Organisation
+/// rename/move row. A finished Undo is shown as completed; an unmarked plain
+/// rename is explained instead of silently offering nothing, because EmuWiz can
+/// only open a transaction for Organisation Undo when the catalogue marker it
+/// sealed before moving anything proves where it came from.
+fn organisation_note(entry: &HistoryEntry) -> Option<&'static str> {
+    if entry.source != Source::CanonicalOrganisation {
+        return None;
+    }
+    if entry.handoff.selects_organisation {
+        return matches!(entry.undo, UndoStatus::AlreadyUndone).then_some(
+            "This organisation was already undone and nothing is left to reverse, so no Roll back is offered.",
+        );
+    }
+    let plain_rename = !entry.transaction.entries.is_empty()
+        && entry
+            .transaction
+            .entries
+            .iter()
+            .all(|item| matches!(item.operation, TransactionOperation::RenameMove));
+    (plain_rename && !matches!(entry.undo, UndoStatus::AlreadyUndone)).then_some(
+        "This record carries no sealed Organisation marker. If ROM Organisation made it before EmuWiz sealed that marker, historical Undo from the Organisation page cannot be safely verified and is not offered; use the workflow that made it.",
+    )
+}
+
 fn show_preview(
     ui: &mut egui::Ui,
     entry: &HistoryEntry,
     preview: &UndoPreview,
     undo_busy: bool,
     go: &mut Option<Route>,
+    select_organisation: &mut Option<String>,
     undo_request: &mut Option<String>,
 ) {
     egui::Frame::group(ui.style()).show(ui, |ui| {
@@ -1874,11 +1965,17 @@ fn show_preview(
                     ui.label("Undo for this kind of operation is run from the workflow that owns it.");
                     if ui.button(RichText::new(entry.handoff.label).strong()).clicked() {
                         *go = Some(entry.handoff.route.clone());
+                        if entry.handoff.selects_organisation {
+                            *select_organisation = Some(entry.transaction_id.clone());
+                        }
                     }
                 }
             }
         } else if ui.button(entry.handoff.label).clicked() {
             *go = Some(entry.handoff.route.clone());
+            if entry.handoff.selects_organisation {
+                *select_organisation = Some(entry.transaction_id.clone());
+            }
         }
     });
 }

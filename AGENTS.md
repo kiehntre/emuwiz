@@ -94,7 +94,8 @@ Keeping builds warm (a target is only reused by the same worktree path):
 - The target is keyed by the worktree path, so it is reused across commits, rebases and
   test runs in that worktree. Do not rename or move a worktree you are still building in.
 - Debug mode is recorded per target and kept. A target with no compiler output to keep
-  (new worktree, or retired with a verified receipt: `worktree-check` says CLEAR) builds
+  (new worktree, or retired with a verified receipt: `worktree-check --cargo-state-only`
+  says CLEAR) builds
   with `--low-debug` by default: full debug info
   is ~93% of each test executable (measured on `verified_game_fixture`: 563 MB -> 37 MB;
   cold target 3.2 GB -> 1.5 GB, build 3m08s -> 2m06s). An existing target built before

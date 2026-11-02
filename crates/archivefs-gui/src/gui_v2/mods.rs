@@ -98,6 +98,15 @@ impl ModsPageState {
     pub(super) fn select_cheats(&mut self) {
         self.tab = Tab::Cheats;
     }
+
+    #[cfg(test)]
+    pub(super) fn select_activation(&mut self) {
+        self.tab = Tab::Activation;
+    }
+
+    pub(super) fn activation_open(&self) -> bool {
+        self.tab == Tab::Activation
+    }
 }
 
 pub(super) fn show_mods_page(
@@ -119,9 +128,8 @@ pub(super) fn show_mods_page(
     }
 
     let mut destination = None;
-    egui::ScrollArea::vertical()
-        .id_salt("v2_mods_native")
-        .show(ui, |ui| {
+    // The shared page scroller carries this page, so its title scrolls too.
+    ui.vertical(|ui| {
             widgets::workflow_header(
                 ui,
                 "Cheats & Mods workshop",

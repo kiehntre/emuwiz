@@ -88,6 +88,18 @@ fn family_for_extension(extension: &str) -> Option<MediaFamily> {
     }
 }
 
+/// A `.cue` sheet is not a registered media format, so the scanner's title
+/// keeps the extension. Stripped for display and grouping only: the same core
+/// title also names mounts, which must not change.
+pub(crate) fn title_without_cue_suffix(title: &str) -> &str {
+    title
+        .len()
+        .checked_sub(".cue".len())
+        .filter(|&stem| title.is_char_boundary(stem) && stem > 0)
+        .filter(|&stem| title[stem..].eq_ignore_ascii_case(".cue"))
+        .map_or(title, |stem| &title[..stem])
+}
+
 pub(crate) fn record_from_catalogue(archive: &PersistedArchive) -> Option<MediaRecord> {
     let extension = archive
         .absolute_path
@@ -95,7 +107,10 @@ pub(crate) fn record_from_catalogue(archive: &PersistedArchive) -> Option<MediaR
         .and_then(|value| value.to_str())?;
     let family = family_for_extension(extension)?;
     let platform = catalogue_platform_hint(archive);
-    let mut evidence = filename_evidence(&archive.display_name, Some(family));
+    let mut evidence = filename_evidence(
+        title_without_cue_suffix(&archive.display_name),
+        Some(family),
+    );
     if let Some(platform) = platform.as_deref() {
         evidence
             .notes
@@ -480,6 +495,20 @@ pub(crate) fn show_selected_item_link(
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn cue_sheets_lose_their_extension_in_titles_only() {
+        use super::title_without_cue_suffix as title;
+        assert_eq!(
+            title("Disc Saga (USA) (Disc 1).cue"),
+            "Disc Saga (USA) (Disc 1)"
+        );
+        assert_eq!(title("Disc Saga.CUE"), "Disc Saga");
+        assert_eq!(title("Pool Cue"), "Pool Cue");
+        assert_eq!(title("Rescue"), "Rescue");
+        assert_eq!(title(".cue"), ".cue");
+        assert_eq!(title("é.cue"), "é");
+    }
+
     use super::*;
     use archivefs_core::media_set::{EvidenceKind, IdentityKey, MediaEvidence};
     use std::path::PathBuf;

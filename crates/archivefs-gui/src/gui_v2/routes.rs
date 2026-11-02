@@ -154,7 +154,7 @@ impl Section {
         match self {
             Self::Home => "Your games, and the things you can do with them.",
             Self::Setup => "Understand what EmuWiz needs and why a game may not be ready.",
-            Self::Games => "Browse your games. Select one to see what you can do next.",
+            Self::Games => "The full catalogue list, with its filters and details.",
             Self::Saves => "See which saves are portable, emulator-bound or need careful handling.",
             Self::Duplicates => {
                 "Review exact copies without silently collapsing different releases."
@@ -895,7 +895,7 @@ impl ToolPage {
     }
 
     /// The breadcrumb parent, as on the board.
-    fn parent_label(self) -> &'static str {
+    pub(super) fn parent_label(self) -> &'static str {
         match self {
             Self::AlternativeProviders => "Games & collection",
             Self::NeedsAttention => "Health & Recovery",

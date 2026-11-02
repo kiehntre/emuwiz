@@ -1373,3 +1373,90 @@ fn progress_reporting_on_a_large_synthetic_scan_is_throttled_and_does_not_slow_i
         "reporting {reported_time:?} vs plain {plain_time:?}"
     );
 }
+
+// --- Regression fixtures from the 2026-10-09 OpenROM feature-delta audit -----
+//
+// Unsafe behaviour prevented: a "one game, one ROM" pass that clusters files
+// by a title with every `(...)`/`[...]` tag and the extension stripped. That
+// makes Disc 2 a "duplicate" of Disc 1, a `.bin` a duplicate of its own
+// `.cue`, and every regional or revision variant a duplicate of the first
+// one, and then moves the "losers" away. Here a duplicate is only ever a
+// byte-identical file; names, tags and extensions are never evidence.
+
+/// Every file shares one clean title and is the same size, so only content
+/// can tell them apart.
+fn one_title_many_releases(dir: &std::path::Path) -> Vec<PathBuf> {
+    let files: [(&str, &[u8]); 9] = [
+        ("Game (USA) (Disc 1).bin", b"disc-one-payload"),
+        ("Game (USA) (Disc 2).bin", b"disc-two-payload"),
+        ("Game (USA).cue", b"FILE \"g.bin\" BIN"),
+        ("Game (USA).bin", b"usa-data-payload"),
+        ("Game (Europe).bin", b"eur-data-payload"),
+        ("Game (Japan) [!].bin", b"jpn-data-payload"),
+        ("Game (USA) (Rev 1).bin", b"usa-rev1-payload"),
+        ("Game [b1].bin", b"bad-dump-payload"),
+        ("Game.bin", b"untagged-payload"),
+    ];
+    files
+        .into_iter()
+        .map(|(name, bytes)| {
+            assert_eq!(bytes.len(), 16, "{name}: sizes must not distinguish");
+            let path = dir.join(name);
+            std::fs::write(&path, bytes).unwrap();
+            path
+        })
+        .collect()
+}
+
+#[test]
+fn regression_discs_companions_and_regional_variants_are_never_exact_duplicates() {
+    let temp = tempfile::tempdir().unwrap();
+    let files = one_title_many_releases(temp.path());
+    let trusted = trusted_for(temp.path());
+
+    let report = scan_exact_duplicates(&files, &trusted, &[], &BTreeSet::new(), None);
+
+    assert!(
+        report.groups.is_empty(),
+        "same title, different bytes must never group: {:?}",
+        report.groups
+    );
+    assert!(report.excluded.is_empty(), "{:?}", report.excluded);
+    assert_eq!(report.files_examined, files.len());
+    assert_eq!(report.total_reclaimable_bytes(), 0);
+    // Nothing was moved, renamed or collected into a "duplicates" folder.
+    for file in &files {
+        assert!(file.is_file(), "{} must stay in place", file.display());
+    }
+    assert_eq!(
+        std::fs::read_dir(temp.path()).unwrap().count(),
+        files.len(),
+        "the scan created nothing"
+    );
+}
+
+/// The converse must also hold, or the test above would pass for a scanner
+/// that never groups anything: a genuine byte-identical copy is still found,
+/// and it is the *only* thing found among the look-alike names.
+#[test]
+fn regression_only_the_byte_identical_copy_groups_among_look_alike_names() {
+    let temp = tempfile::tempdir().unwrap();
+    let mut files = one_title_many_releases(temp.path());
+    let copy = temp.path().join("Totally Different Name (World).rom");
+    std::fs::write(&copy, b"disc-two-payload").unwrap();
+    files.push(copy.clone());
+    let trusted = trusted_for(temp.path());
+
+    let report = scan_exact_duplicates(&files, &trusted, &[], &BTreeSet::new(), None);
+
+    assert_eq!(report.groups.len(), 1, "{:?}", report.groups);
+    let mut members: Vec<_> = report.groups[0]
+        .members
+        .iter()
+        .map(|member| member.path.clone())
+        .collect();
+    members.sort();
+    let mut expected = vec![temp.path().join("Game (USA) (Disc 2).bin"), copy];
+    expected.sort();
+    assert_eq!(members, expected, "grouped by bytes, not by name");
+}

@@ -18,12 +18,7 @@ pub(super) enum Action {
 impl Action {
     fn label(self) -> &'static str {
         match self {
-            Self::Verification(VerificationAction::SelectDat | VerificationAction::Validate) => {
-                "Choose DAT"
-            }
-            Self::Verification(VerificationAction::Audit) => "Verify",
-            Self::Verification(VerificationAction::Recheck) => "Re-check",
-            Self::Verification(VerificationAction::Review) => "Review Identity",
+            Self::Verification(action) => action.label(),
             Self::FindMissingFile => "Find Missing File",
             Self::RepairReview => "Repair Review",
         }

@@ -10,6 +10,7 @@
 
 use crate::optical_preservation as layout_contract;
 
+use std::ffi::OsStr;
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::AtomicBool;
@@ -591,6 +592,22 @@ fn revalidate_source(plan: &ChdConversionPlan) -> Result<(), ChdConversionError>
     Ok(())
 }
 
+/// The exact arguments handed to chdman for the admitted CUE/BIN -> CHD lane.
+///
+/// This is the single place the command is written down; execution passes
+/// this slice to the process runner unchanged. It deliberately names no
+/// compressor and no hunk size, so chdman applies its own `createcd`
+/// defaults: EmuWiz does not select codecs here.
+pub(crate) fn chdman_createcd_args<'a>(cue: &'a Path, staged_output: &'a Path) -> [&'a OsStr; 5] {
+    [
+        "createcd".as_ref(),
+        "--input".as_ref(),
+        cue.as_os_str(),
+        "--output".as_ref(),
+        staged_output.as_os_str(),
+    ]
+}
+
 pub fn execute_chd_conversion(
     plan: &ChdConversionPlan,
     trusted: TrustedRoots,
@@ -636,13 +653,7 @@ pub fn execute_chd_conversion(
         output: staged.clone(),
         retain: false,
     };
-    let args = [
-        "createcd".as_ref(),
-        "--input".as_ref(),
-        plan.cue_path.as_os_str(),
-        "--output".as_ref(),
-        staged.as_os_str(),
-    ];
+    let args = chdman_createcd_args(&plan.cue_path, &staged);
     crate::run_command_os_with_timeout(&plan.chdman_path.to_string_lossy(), &args, CHDMAN_TIMEOUT)
         .map_err(|e| ChdConversionError::ProcessFailed(e.to_string()))?;
     revalidate_source(plan)?;

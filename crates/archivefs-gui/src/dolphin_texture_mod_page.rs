@@ -378,14 +378,21 @@ impl DolphinTextureModPageState {
                     } else {
                         let rollback = result
                             .rollback
+                            .as_ref()
                             .map(|rollback| format!(" Automatic rollback: {:?}.", rollback.status))
                             .unwrap_or_default();
-                        self.stage = Some(DolphinTextureModStage::Failed {
-                            detail: format!(
-                                "texture-pack installation failed ({:?}).{}",
-                                result.apply.journal.status, rollback
+                        let mut detail = format!(
+                            "texture-pack installation failed ({:?}).{}",
+                            result.apply.journal.status, rollback
+                        );
+                        crate::shared_apply_warnings::append_lines(
+                            &mut detail,
+                            crate::shared_apply_warnings::lines_after_rollback(
+                                &result.apply,
+                                result.rollback.as_ref(),
                             ),
-                        });
+                        );
+                        self.stage = Some(DolphinTextureModStage::Failed { detail });
                     }
                     true
                 }
@@ -1442,6 +1449,7 @@ fn show_applied(
             ),
         };
         widgets::status_badge(ui, headline, tone);
+        crate::shared_apply_warnings::show(ui, &crate::shared_apply_warnings::lines(&result));
         if let Some(path) = &result.journal_path {
             widgets::path_value(ui, "Journal", path);
         }

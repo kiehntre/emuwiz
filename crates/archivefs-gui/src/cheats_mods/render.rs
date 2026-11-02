@@ -2253,22 +2253,20 @@ pub(crate) fn save_whdload_preview_with(
     drop(staging);
     match applied {
         Ok(result) if result.journal.status == SharedApplyStatus::Success => {
-            editor.outcome = Some((
-                true,
-                "Saved to EmuWiz's option file and checked. Trainer launch unsupported; no CUSTOM options are passed.".into(),
-            ));
+            let mut message = "Saved to EmuWiz's option file and checked. Trainer launch unsupported; no CUSTOM options are passed.".to_string();
+            crate::shared_apply_warnings::append(&mut message, &result);
+            editor.outcome = Some((true, message));
             editor.undo = backups.and_then(|backups| {
                 flow::undo_preview(&result, &preview.configuration_path, &backups)
             });
         }
         Ok(result) => {
-            editor.outcome = Some((
-                false,
-                format!(
-                    "The options were not fully saved ({:?}). Open History & Undo to review.",
-                    result.journal.status
-                ),
-            ));
+            let mut message = format!(
+                "The options were not fully saved ({:?}). Open History & Undo to review.",
+                result.journal.status
+            );
+            crate::shared_apply_warnings::append(&mut message, &result);
+            editor.outcome = Some((false, message));
             editor.undo = None;
         }
         Err(reason) => {
@@ -3271,6 +3269,7 @@ pub(crate) fn show_beginner_install_result(
                 ));
             }
         }
+        crate::shared_apply_warnings::show(ui, &crate::shared_apply_warnings::lines(result));
         if let Some(report) = loadability {
             show_cheat_loadability(ui, report);
         }
@@ -7501,6 +7500,7 @@ pub(crate) fn show_bsfree_install_result(
                 ));
             }
         }
+        crate::shared_apply_warnings::show(ui, &crate::shared_apply_warnings::lines(result));
         if let Some(report) = workflow.routing.loadability.as_ref() {
             show_cheat_loadability(ui, report);
         }

@@ -14,7 +14,7 @@ use std::sync::Arc;
 use super::{
     App,
     artwork::Picture,
-    library::{Filter, Game},
+    library::{CheckedReadiness, Filter, Game, ReadinessCache, ReadinessFilter},
     media_sources::Kind,
     routes::{Route, Section},
 };
@@ -56,15 +56,22 @@ pub(super) fn minimum_body_height(width: f32, selected: bool, blue: bool) -> f32
     }
 }
 
+/// Horizontal padding inside each readiness button.
+const READINESS_BUTTON_PAD: f32 = 5.0;
 const ATTENTION_TEXT: Color32 = Color32::from_rgb(232, 170, 62);
 /// How long a selection must stay put before its readiness check starts, so
 /// moving quickly through the shelf reads no game files.
 pub(super) const SELECTION_SETTLE_SECS: f64 = 0.35;
 
+/// Platform, search, (readiness view, cache-aware), unverified-only, library.
+type FilterKey = (String, String, (ReadinessFilter, bool), bool, usize);
+/// Base list address, cache version, view, and the narrowed list.
+type ReadinessView = (usize, u64, ReadinessFilter, Arc<Vec<usize>>);
+
 /// Cached filter result so typing or scrolling never rescans the catalogue.
 #[derive(Default)]
 pub(super) struct BrowsePlayState {
-    key: Option<(String, String, bool, bool, usize)>,
+    key: Option<FilterKey>,
     indices: Arc<Vec<usize>>,
     applied_generation: Option<u64>,
     // Keep the allocation token alive so pointer-based keys cannot suffer ABA.
@@ -76,9 +83,37 @@ pub(super) struct BrowsePlayState {
     cover_note: Option<String>,
     /// The selected game and when it was first shown, for the settle delay.
     settling: Option<(i64, f64)>,
+    /// Games whose readiness check has finished positive. Filled only by the
+    /// selection check; the Ready view never plans launches in bulk.
+    readiness: ReadinessCache,
+    /// The readiness view of `indices`, rebuilt only when the base list or
+    /// the cache changes: (base list address, cache version, filter, result).
+    readiness_view: Option<ReadinessView>,
+    /// Background checks for the games on screen.
+    background: super::bg_readiness::Scheduler,
+    /// The emulator-state snapshot the background checks run against, and the
+    /// signature it was taken at; a different signature invalidates both.
+    env: Option<(u64, super::bg_readiness::EnvSnapshot)>,
+    env_signature: Option<u64>,
+    /// The library snapshot generation the settled decisions were made at.
+    database_generation: Option<u64>,
+    /// Ids drawn this frame / last frame, nearest the top first.
+    visible_now: Vec<i64>,
+    visible: Vec<i64>,
 }
 
 impl BrowsePlayState {
+    /// The library snapshot generation moved: a rescan may have added a disc
+    /// set or changed what a game belongs to, so every earlier answer (cached
+    /// or settled) is dropped. Foreground answers re-record as games are drawn.
+    fn note_database_generation(&mut self, generation: Option<u64>) {
+        if self.database_generation != generation {
+            self.database_generation = generation;
+            self.background.invalidate();
+            self.readiness.clear();
+        }
+    }
+
     /// Seconds still to wait before `game`'s readiness check may start.
     fn settle_remaining(&mut self, game: i64, now: f64) -> f64 {
         let since = match self.settling {
@@ -97,6 +132,15 @@ impl BrowsePlayState {
     pub(super) fn reset_scroll_pending(&self) -> bool {
         self.reset_scroll
     }
+    pub(super) fn note_generation_for_test(&mut self, generation: Option<u64>) {
+        self.note_database_generation(generation);
+    }
+    pub(super) fn is_ready_for_test(&self, game: &Game) -> bool {
+        self.readiness.get(game).is_some()
+    }
+    pub(super) fn record_readiness(&mut self, game: &Game, result: Option<CheckedReadiness>) {
+        self.readiness.record(game, result);
+    }
 }
 
 fn browse_primary(ui: &mut egui::Ui, label: &str) -> bool {
@@ -111,7 +155,23 @@ fn browse_primary(ui: &mut egui::Ui, label: &str) -> bool {
 
 #[cfg_attr(not(test), allow(dead_code))]
 pub(super) fn filtered_game_indices(app: &App) -> Vec<usize> {
-    app.library.filter(&app.filter)
+    let base = app.library.filter(&app.filter);
+    apply_readiness(&app.library, base, &app.filter, &app.browse_play.readiness)
+}
+
+/// Narrow a catalogue-filtered list to the readiness view.
+fn apply_readiness(
+    library: &super::library::Library,
+    base: Vec<usize>,
+    filter: &Filter,
+    cache: &ReadinessCache,
+) -> Vec<usize> {
+    if !filter.uses_cache() {
+        return base;
+    }
+    base.into_iter()
+        .filter(|index| super::library::matches(&library.games[*index], filter, cache))
+        .collect()
 }
 
 pub(super) fn browse_play_contextual_routes(game: i64) -> [(&'static str, Route); 4] {
@@ -220,8 +280,26 @@ fn readiness_sentence(game: &Game) -> &'static str {
 }
 
 /// Platform, identity and DAT state on one line, without conflating them.
-fn status_line(game: &Game, width: f32, blue: bool) -> egui::text::LayoutJob {
+fn status_line(
+    game: &Game,
+    width: f32,
+    blue: bool,
+    not_ready: Option<&str>,
+) -> egui::text::LayoutJob {
     let (status, colour) = status_text(game, blue);
+    let status = match not_ready {
+        Some(reason) => format!("Not ready · {reason}"),
+        None => status.to_string(),
+    };
+    let colour = if not_ready.is_some() {
+        if blue {
+            theme::blue::WARN
+        } else {
+            ATTENTION_TEXT
+        }
+    } else {
+        colour
+    };
     let font = egui::FontId::proportional(theme::METADATA_SIZE);
     let mut job = egui::text::LayoutJob::default();
     job.append(
@@ -287,6 +365,8 @@ impl App {
         ui.add_space(theme::SPACE_XS);
         self.browse_play_systems(ui, &library);
         let indices = self.browse_play_indices();
+        let blue = theme::blue_profile(ui);
+        self.browse_play_background(ui.ctx(), blue);
         ui.add_space(theme::SPACE_XS);
         ui.separator();
 
@@ -428,12 +508,22 @@ impl App {
         let key = (
             self.filter.platform.clone(),
             self.filter.search.trim().to_lowercase(),
-            self.filter.attention_only,
+            (self.filter.readiness, self.filter.cache_aware),
             self.filter.unverified_only,
             Arc::as_ptr(&self.library) as usize,
         );
         if self.browse_play.key.as_ref() != Some(&key) {
             self.browse_play.reset_scroll = true;
+            if self
+                .browse_play
+                .key
+                .as_ref()
+                .is_some_and(|old| old.4 != key.4)
+            {
+                // A different catalogue: earlier answers no longer describe it.
+                self.browse_play.readiness.clear();
+                self.browse_play.background.invalidate();
+            }
             self.browse_play.key = Some(key);
             self.browse_play.library_token = Arc::downgrade(&self.library);
             if self.library.games.len() <= IMMEDIATE_FILTER_LIMIT {
@@ -452,7 +542,88 @@ impl App {
             self.browse_play.indices = Arc::new(self.indices.clone());
             self.browse_play.applied_generation = Some(self.filter_generation);
         }
-        self.browse_play.indices.clone()
+        let base = self.browse_play.indices.clone();
+        let filter = self.filter.readiness;
+        if !self.filter.uses_cache() {
+            self.browse_play.readiness_view = None;
+            return base;
+        }
+        let token = Arc::as_ptr(&base) as usize;
+        let version = self.browse_play.readiness.version();
+        if let Some((t, v, f, view)) = &self.browse_play.readiness_view
+            && (*t, *v, *f) == (token, version, filter)
+        {
+            return view.clone();
+        }
+        let view = Arc::new(apply_readiness(
+            &self.library,
+            base.to_vec(),
+            &self.filter,
+            &self.browse_play.readiness,
+        ));
+        self.browse_play.readiness_view = Some((token, version, filter, view.clone()));
+        view
+    }
+
+    /// Keep the background readiness checks in step with what is on screen.
+    /// Blue only. Never selects a game, loads evidence for the details panel,
+    /// or starts any scan; it waits until the foreground has finished them.
+    fn browse_play_background(&mut self, context: &egui::Context, blue: bool) {
+        if !blue {
+            return;
+        }
+        let state = &mut self.browse_play;
+        // The library snapshot (and so every disc-set decision) changed: games
+        // held back for want of it are looked at again.
+        let generation = self
+            .native_workflows
+            .as_ref()
+            .map(|w| w.database_generation());
+        state.note_database_generation(generation);
+        // What the checks read changed (emulator scans, settings): drop
+        // everything decided under the old state.
+        // Until a game has been selected once, no scan has run and there is
+        // nothing to check against.
+        let readiness = self
+            .native_workflows
+            .as_ref()
+            .map(|w| w.emulator_readiness());
+        let signature = readiness.and_then(super::bg_readiness::EnvSnapshot::signature);
+        if state.env_signature != signature {
+            state.env_signature = signature;
+            state.background.invalidate();
+            state.readiness.clear();
+            state.env =
+                signature.zip(readiness.and_then(super::bg_readiness::EnvSnapshot::capture));
+        }
+        for (id, outcome) in state.background.drain() {
+            if let Some(game) = self.library.game(id) {
+                super::bg_readiness::record_outcome(&mut state.readiness, game, outcome);
+            }
+        }
+        // The games drawn last frame, in order and without repeats.
+        state.visible = std::mem::take(&mut state.visible_now);
+        state.visible.dedup();
+        let Some((_, env)) = &state.env else {
+            return;
+        };
+        let jobs = state.background.pick(
+            state.visible.iter().filter_map(|id| self.library.game(*id)),
+            |game| state.readiness.get(game).is_some(),
+        );
+        for mut job in jobs {
+            // Fail closed: with no workflows or no library snapshot the disc
+            // set context is unknown, so the game is not answered (yet).
+            job.multidisc = self
+                .native_workflows
+                .as_ref()
+                .is_none_or(|w| w.has_multidisc_context(&job.archive.absolute_path));
+            if job.multidisc {
+                state.background.settle(job.id);
+                continue;
+            }
+            state.background.spawn(env, job, context.clone());
+        }
     }
 
     fn browse_play_toolbar(&mut self, ui: &mut egui::Ui) {
@@ -471,7 +642,11 @@ impl App {
         };
         let blue = theme::blue_profile(ui);
         let attention = if blue {
-            measure("Needs attention") + gap
+            ReadinessFilter::ALL
+                .iter()
+                .map(|filter| measure(filter.label()) - pad + 2.0 * READINESS_BUTTON_PAD + 2.0)
+                .sum::<f32>()
+                + gap
         } else {
             0.0
         };
@@ -484,18 +659,49 @@ impl App {
             search
         };
         let attention_filter = |this: &mut Self, ui: &mut egui::Ui| {
-            if blue
-                && ui
-                    .selectable_label(this.filter.attention_only, "Needs attention")
-                    .on_hover_text("Show only games that need attention.")
-                    .clicked()
-            {
-                this.filter.attention_only = !this.filter.attention_only;
+            if !blue {
+                return;
             }
+            if stacked {
+                // A narrow window keeps one control's width: the same four
+                // choices in a dropdown instead of a four-button row.
+                let before = this.filter.readiness;
+                egui::ComboBox::from_id_salt("readiness_filter")
+                    .selected_text(this.filter.readiness.label())
+                    .show_ui(ui, |ui| {
+                        for choice in ReadinessFilter::ALL {
+                            ui.selectable_value(&mut this.filter.readiness, choice, choice.label())
+                                .on_hover_text(readiness_filter_hint(choice));
+                        }
+                    });
+                if this.filter.readiness != before {
+                    this.filter.cache_aware = true;
+                }
+                return;
+            }
+            // One tight segmented group, so four choices stay on the row.
+            ui.scope(|ui| {
+                ui.spacing_mut().button_padding.x = READINESS_BUTTON_PAD;
+                ui.spacing_mut().item_spacing.x = 2.0;
+                for choice in ReadinessFilter::ALL {
+                    if ui
+                        .add(toggle_button(
+                            choice.label(),
+                            this.filter.readiness == choice,
+                        ))
+                        .on_hover_text(readiness_filter_hint(choice))
+                        .clicked()
+                    {
+                        this.filter.readiness = choice;
+                        // Blue folds finished launch checks into these views.
+                        this.filter.cache_aware = true;
+                    }
+                }
+            });
         };
         let view_switch = |this: &mut Self, ui: &mut egui::Ui| {
-            ui.selectable_value(&mut this.filter.list, false, "Grid");
-            ui.selectable_value(&mut this.filter.list, true, "List");
+            view_toggle(ui, &mut this.filter.list, false, "Grid");
+            view_toggle(ui, &mut this.filter.list, true, "List");
         };
         ui.horizontal(|ui| {
             ui.add_sized(
@@ -510,8 +716,8 @@ impl App {
             if !stacked {
                 attention_filter(self, ui);
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                    ui.selectable_value(&mut self.filter.list, true, "List");
-                    ui.selectable_value(&mut self.filter.list, false, "Grid");
+                    view_toggle(ui, &mut self.filter.list, true, "List");
+                    view_toggle(ui, &mut self.filter.list, false, "Grid");
                     self.browse_play_selection_toggle(ui);
                 });
             }
@@ -522,6 +728,23 @@ impl App {
                 view_switch(self, ui);
                 self.browse_play_selection_toggle(ui);
             });
+        }
+        if blue
+            && let Some(note) = readiness_filter_note(
+                self.filter.readiness,
+                self.browse_play.readiness.len(),
+                self.library.games.len(),
+                self.browse_play.background.in_flight() > 0,
+            )
+        {
+            ui.add(
+                egui::Label::new(
+                    RichText::new(note)
+                        .size(theme::METADATA_SIZE)
+                        .color(theme::blue::SECONDARY_TEXT),
+                )
+                .wrap(),
+            );
         }
     }
 
@@ -854,6 +1077,7 @@ impl App {
         note: &mut Option<String>,
     ) {
         let id = game.archive.id;
+        self.browse_play.visible_now.push(id);
         ui.push_id(("v2_browse_play_game", id), |ui| {
             let (rect, response) =
                 ui.allocate_exact_size(egui::vec2(card_width, CARD_HEIGHT), egui::Sense::click());
@@ -894,9 +1118,14 @@ impl App {
             );
             let blue = theme::blue_profile(&child);
             child.add(
-                egui::Label::new(status_line(game, inner.width(), blue))
-                    .wrap()
-                    .selectable(false),
+                egui::Label::new(status_line(
+                    game,
+                    inner.width(),
+                    blue,
+                    self.browse_play.readiness.not_ready_reason(game),
+                ))
+                .wrap()
+                .selectable(false),
             );
             let response = response
                 .on_hover_cursor(egui::CursorIcon::PointingHand)
@@ -929,6 +1158,7 @@ impl App {
         note: &mut Option<String>,
     ) {
         let id = game.archive.id;
+        self.browse_play.visible_now.push(id);
         ui.push_id(("v2_browse_play_game", id), |ui| {
             let (rect, response) = ui.allocate_exact_size(
                 egui::vec2(ui.available_width(), LIST_ROW_HEIGHT - 8.0),
@@ -961,9 +1191,14 @@ impl App {
                 );
                 let blue = theme::blue_profile(ui);
                 ui.add(
-                    egui::Label::new(status_line(game, text_width, blue))
-                        .wrap()
-                        .selectable(false),
+                    egui::Label::new(status_line(
+                        game,
+                        text_width,
+                        blue,
+                        self.browse_play.readiness.not_ready_reason(game),
+                    ))
+                    .wrap()
+                    .selectable(false),
                 );
             });
             let response = response.on_hover_cursor(egui::CursorIcon::PointingHand);
@@ -1014,6 +1249,7 @@ impl App {
                     };
                     let text_width = (inner - cover.x - gap).max(120.0);
                     let heading = |this: &mut Self, ui: &mut egui::Ui| {
+                        let not_ready = this.browse_play.readiness.not_ready_reason(game);
                         // In a short, narrow window title and actions share a strip.
                         // Stacking every piece would put Play below the footer.
                         if compact && theme::blue_profile(ui) && inner >= 600.0 {
@@ -1037,6 +1273,7 @@ impl App {
                                                 game,
                                                 title_width,
                                                 theme::blue_profile(ui),
+                                                not_ready,
                                             ))
                                             .wrap()
                                             .selectable(false),
@@ -1065,16 +1302,31 @@ impl App {
                                 if tight {
                                     // One line, so Play stays above the fold.
                                     ui.add(
-                                        egui::Label::new(status_line(game, text_width, blue))
-                                            .wrap()
-                                            .selectable(false),
+                                        egui::Label::new(status_line(
+                                            game, text_width, blue, not_ready,
+                                        ))
+                                        .wrap()
+                                        .selectable(false),
                                     );
                                 } else {
                                     ui.label(
                                         RichText::new(&game.platform).color(theme::SECONDARY_TEXT),
                                     );
                                     let (status, colour) = status_text(game, blue);
-                                    ui.label(RichText::new(status).strong().color(colour));
+                                    match not_ready {
+                                        Some(reason) => ui.label(
+                                            RichText::new(format!("Not ready · {reason}"))
+                                                .strong()
+                                                .color(if blue {
+                                                    theme::blue::WARN
+                                                } else {
+                                                    ATTENTION_TEXT
+                                                }),
+                                        ),
+                                        None => {
+                                            ui.label(RichText::new(status).strong().color(colour))
+                                        }
+                                    };
                                     ui.label(format!("DAT: {}", game.dat_identity_summary()));
                                 }
                                 if tight {
@@ -1164,6 +1416,12 @@ impl App {
                     &mut this.activity,
                 )
             };
+            {
+                // Only a finished, current answer is kept; checking, stale
+                // and partial answers leave the game Not checked.
+                let result = CheckedReadiness::from_compact(&view);
+                this.browse_play.readiness.record(game, result);
+            }
             let rows = if tight { 2 } else { 3 };
             match readiness::show_compact(ui, &view, width, rows, Some("Game details")) {
                 Some(CompactChoice::Trailing) => true,
@@ -1239,6 +1497,60 @@ impl App {
                     }
                 }
             });
+    }
+}
+
+/// A toolbar on/off control: a real button, so the unselected state matches
+/// Select games beside it instead of reading as plain text.
+fn readiness_filter_hint(filter: ReadinessFilter) -> &'static str {
+    match filter {
+        ReadinessFilter::All => "Show every game.",
+        ReadinessFilter::Ready => {
+            "Games whose launch check has already passed. Select a game to check it."
+        }
+        ReadinessFilter::NeedsAttention => "Show only games that need attention.",
+        ReadinessFilter::NotChecked => "Games with no passed launch check yet.",
+    }
+}
+
+/// Said under every readiness view that could be mistaken for a verdict on
+/// the whole library. Launch checks run for the game you select, so nothing
+/// here has assessed every game.
+fn readiness_filter_note(
+    filter: ReadinessFilter,
+    checked: usize,
+    total: usize,
+    checking: bool,
+) -> Option<String> {
+    let progress = format!(
+        "{checked} of {total} games checked so far. A game is checked when you select it, and most systems are also checked in the background as they scroll into view."
+    );
+    let progress = if checking {
+        format!("{progress} Checking more now…")
+    } else {
+        progress
+    };
+    match filter {
+        ReadinessFilter::All => None,
+        ReadinessFilter::Ready => Some(format!(
+            "{progress} Only checked games can appear here; the rest are Not checked."
+        )),
+        ReadinessFilter::NeedsAttention => Some(format!(
+            "{progress} This lists games flagged by the catalogue and checked games that are Not ready, with the reason. Games that are Not checked are not listed."
+        )),
+        ReadinessFilter::NotChecked => Some(format!(
+            "{progress} Not checked only means no result yet, not a problem."
+        )),
+    }
+}
+
+fn toggle_button(text: &str, selected: bool) -> egui::Button<'_> {
+    egui::Button::new(text).selected(selected)
+}
+
+fn view_toggle(ui: &mut egui::Ui, current: &mut bool, value: bool, text: &str) {
+    if ui.add(toggle_button(text, *current == value)).clicked() {
+        *current = value;
     }
 }
 

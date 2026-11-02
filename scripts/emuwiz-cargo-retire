@@ -99,6 +99,7 @@ import importlib.util
 import json
 import re
 import signal
+import subprocess
 import time
 
 CARGO_LOCK_NAMES = (".cargo-lock", ".cargo-build-lock", ".cargo-artifact-lock")
@@ -624,10 +625,114 @@ def load_manifest(path, approved):
     return data, actual, groups
 
 
+ORPHAN_ROUTE = "GIT_PRESERVED"
+
+
+def _git(repo, *argv):
+    """git as the unprivileged owner only: F.run_as_owner drops every uid (real, effective, saved) before
+    exec, so a helper that git spawns from an owner-controlled .git/config can never regain root.
+    The environment is scrubbed (no GIT_* from the caller, no system/global config, no lazy fetch,
+    no replace objects) and the network, fsmonitor and hooks-by-config are disabled."""
+    env = {"PATH": "/usr/bin:/bin", "HOME": "/nonexistent", "LC_ALL": "C", "GIT_CONFIG_NOSYSTEM": "1",
+           "GIT_CONFIG_GLOBAL": "/dev/null", "GIT_NO_LAZY_FETCH": "1", "GIT_NO_REPLACE_OBJECTS": "1",
+           "GIT_TERMINAL_PROMPT": "0"}
+    done = F.run_as_owner(["git", "-c", "core.fsmonitor=false", "-c", "protocol.allow=never",
+                           "-c", "core.hooksPath=/dev/null", "-C", repo, *argv],
+                          env=env, capture_output=True, timeout=60)
+    # bytes -> str with surrogateescape: an odd (non-UTF-8) worktree name must not abort the run
+    return subprocess.CompletedProcess(done.args, done.returncode,
+                                       (done.stdout or b"").decode("utf-8", "surrogateescape"),
+                                       (done.stderr or b"").decode("utf-8", "surrogateescape"))
+
+
+def path_presence(path):
+    """'absent' only for ENOENT/ENOTDIR from lstat; 'present' when lstat succeeds; anything else
+    (EACCES, EIO, ENOTCONN, ESTALE, ELOOP, ...) is 'unknown' and must never permit retirement."""
+    try:
+        os.lstat(path)
+    except OSError as error:
+        return "absent" if error.errno in (errno.ENOENT, errno.ENOTDIR) else "unknown"
+    return "present"
+
+
+def orphan_git_preserved_owner(group, record, target):
+    """Narrow, fail-closed substitute for a live source checkout (ONLY for GIT_PRESERVED groups).
+
+    The repository is NOT nominated by the manifest.  It is the one recorded by cargo-iso from the
+    live linked checkout at build time (record["checkout"]: checkout root identity, administrative
+    gitdir, repository common dir).  Records without that evidence (older builds, never-built
+    adoptions) are refused.  Retirement is allowed only when, freshly:
+      * the recorded build HEAD is a 40-hex commit equal to the manifest's source_head;
+      * the target name is bound to the recorded worktree path by its hash;
+      * the recorded worktree path is gone, the checkout's administrative gitdir is gone (so git no
+        longer registers it, moved or not), no registered worktree of the repository has the recorded
+        path or the recorded checkout identity (a moved checkout keeps its inode);
+      * the HEAD is a commit contained in refs/remotes/origin/main of that recorded repository.
+    Anything unverifiable is a hold; every other retirement gate still applies unchanged."""
+    if group.get("orphan_route") != ORPHAN_ROUTE:
+        return "SOURCE_MISSING", "the owning source checkout is not present to verify"
+    wt, head, ev = record.get("worktree"), record.get("head"), record.get("checkout")
+    if not record.get("last_start") or not wt or not os.path.isabs(wt):
+        return "SOURCE_MISSING", "orphan route needs a recorded cargo-iso build and worktree path"
+    if not isinstance(head, str) or len(head) != 40 or any(c not in "0123456789abcdef" for c in head):
+        return "SOURCE_MISSING", "orphan route needs a recorded 40-hex build HEAD"
+    if os.path.normpath(wt) != wt:
+        return "OWNER_UNVERIFIED", "recorded worktree path is not normalised"
+    ident = (ev or {}).get("worktree_identity") if isinstance(ev, dict) else None
+    admin, common = (ev or {}).get("gitdir"), (ev or {}).get("common_dir")
+    if not (isinstance(ident, dict) and isinstance(ident.get("dev"), int) and isinstance(ident.get("ino"), int)
+            and isinstance(admin, str) and isinstance(common, str) and os.path.isabs(admin) and os.path.isabs(common)):
+        return "ORPHAN_EVIDENCE_MISSING", "no recorded checkout continuity evidence (gitdir, common dir, identity)"
+    if group.get("source_head") != head:
+        return "OWNER_UNVERIFIED", "manifest source_head differs from the recorded build HEAD"
+    digest = hashlib.sha256(wt.encode()).hexdigest()[:12]
+    if record.get("worktree_hash") != digest or not os.path.basename(target).endswith("-" + digest):
+        return "OWNER_UNVERIFIED", "target name is not bound to the recorded worktree path"
+    repo = os.path.dirname(common)
+    if os.path.basename(common) != ".git" or os.path.realpath(common) != common \
+            or not os.path.isdir(common) or os.path.islink(common):
+        return "ORPHAN_REPO_UNVERIFIED", "the recorded repository is not a canonical checkout with a .git directory"
+    if group.get("orphan_repo") is not None and group.get("orphan_repo") != repo:
+        return "ORPHAN_REPO_UNVERIFIED", "manifest repository differs from the repository recorded at build time"
+    for what, path in (("recorded worktree path", wt), ("checkout's administrative gitdir", admin)):
+        state = path_presence(path)
+        if state == "unknown":
+            return "ORPHAN_SOURCE_UNKNOWN", f"cannot establish whether the {what} is absent"
+        if state == "present":
+            return "ORPHAN_SOURCE_PRESENT", f"the {what} still exists (live, moved or not pruned); use the normal route"
+    try:
+        listing = _git(repo, "worktree", "list", "--porcelain")
+        if listing.returncode:
+            return "ORPHAN_REPO_UNVERIFIED", "git worktree list failed"
+        for line in listing.stdout.splitlines():
+            if not line.startswith("worktree "):
+                continue
+            path = line[9:]
+            if path == wt or os.path.realpath(path) == wt:
+                return "ORPHAN_SOURCE_PRESENT", "git still registers the recorded worktree"
+            try:
+                st = os.lstat(path)
+            except OSError as error:
+                if error.errno in (errno.ENOENT, errno.ENOTDIR):
+                    continue
+                return "ORPHAN_SOURCE_UNKNOWN", f"cannot inspect registered worktree {path}: {error.strerror}"
+            if (st.st_dev, st.st_ino) == (ident["dev"], ident["ino"]):
+                return "ORPHAN_SOURCE_MOVED", f"a registered worktree at {path} is the recorded checkout (moved)"
+        if _git(repo, "cat-file", "-e", head + "^{commit}").returncode:
+            return "GIT_HISTORY_NOT_PRESERVED", "the build HEAD is not a commit in the recorded repository"
+        if _git(repo, "merge-base", "--is-ancestor", head, "refs/remotes/origin/main").returncode:
+            return "GIT_HISTORY_NOT_PRESERVED", "the build HEAD is not contained in origin/main"
+    except (OSError, ValueError, subprocess.SubprocessError) as error:
+        return "ORPHAN_REPO_UNVERIFIED", str(error)
+    return None, ""
+
+
 def verified_owner(group, record, source_paths, target):
     """Adoption is only a claim; this is the evidence that makes it count."""
     if not record or not record.get("owner"):
         return "NOT_ADOPTED", "no lifecycle record with an owner"
+    if not group.get("source_exists") and not source_paths and group.get("orphan_route"):
+        return orphan_git_preserved_owner(group, record, target)
     if not group.get("source_exists") or not source_paths:
         return "SOURCE_MISSING", "the owning source checkout is not present to verify"
     name = os.path.basename(target)

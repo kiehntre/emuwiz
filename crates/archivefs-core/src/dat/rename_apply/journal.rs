@@ -60,6 +60,7 @@ pub fn rename_transaction_dir_in(home: Option<OsString>) -> Result<PathBuf, Arch
 struct LiveState {
     live: std::collections::BTreeMap<LiveKey, usize>,
     reconciling: std::collections::BTreeMap<LiveKey, usize>,
+    undoing: std::collections::BTreeSet<LiveKey>,
 }
 
 type LiveKey = (PathBuf, String);
@@ -67,6 +68,7 @@ type LiveKey = (PathBuf, String);
 static LIVE_STATE: std::sync::Mutex<LiveState> = std::sync::Mutex::new(LiveState {
     live: std::collections::BTreeMap::new(),
     reconciling: std::collections::BTreeMap::new(),
+    undoing: std::collections::BTreeSet::new(),
 });
 static LIVE_CHANGED: std::sync::Condvar = std::sync::Condvar::new();
 
@@ -128,6 +130,37 @@ pub fn is_transaction_live(journal_dir: &Path, transaction_id: &str) -> bool {
 impl Drop for LiveTransactionGuard {
     fn drop(&mut self) {
         release(&mut live_state().live, &self.key);
+        LIVE_CHANGED.notify_all();
+    }
+}
+
+/// Held by an organisation Undo for its whole pass over one transaction.
+#[must_use = "the transaction is only serialised while the guard is held"]
+pub struct UndoSerialGuard {
+    key: LiveKey,
+}
+
+/// Serialises Undo passes over the same transaction within this process: a
+/// second Undo waits for the first to finish, then validates the journal the
+/// first one left (usually an already finished Undo) instead of racing its
+/// journal and seal writes. Waits are unbounded only by the first pass, which
+/// always ends (success, refusal, cancel or panic drops the guard). In-process
+/// only; the journal fence and seal still fail closed against another process.
+pub fn serialise_undo(journal_dir: &Path, transaction_id: &str) -> UndoSerialGuard {
+    let key = live_key(journal_dir, transaction_id);
+    let mut state = live_state();
+    while state.undoing.contains(&key) {
+        state = LIVE_CHANGED
+            .wait(state)
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+    }
+    state.undoing.insert(key.clone());
+    UndoSerialGuard { key }
+}
+
+impl Drop for UndoSerialGuard {
+    fn drop(&mut self) {
+        live_state().undoing.remove(&self.key);
         LIVE_CHANGED.notify_all();
     }
 }

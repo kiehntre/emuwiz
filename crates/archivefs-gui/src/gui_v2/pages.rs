@@ -33,11 +33,21 @@ pub(super) fn primary(ui: &mut egui::Ui, text: &str) -> bool {
 
 /// Below this much body height (points) contextual guidance scrolls with the page.
 const COMPACT_BODY_HEIGHT: f32 = 260.0;
+/// Below this window height Game Details keeps Play in the first screen: no
+/// page heading, a small cover, and contextual guidance after the page.
+const SHORT_GAME_WINDOW: f32 = 760.0;
+/// A pinned notice can expand its technical details; the page keeps the rest.
+const MAX_PINNED_NOTICE_SHARE: f32 = 0.4;
+const ALL_TOOLS_SCROLL: &str = "v2_all_tools_scroll";
 
 /// One bounded main-content scroller; sidebar and header are outside it.
-fn check_scroll(ui: &mut egui::Ui, platform: Option<&str>, content: impl FnOnce(&mut egui::Ui)) {
+pub(super) fn check_scroll(
+    ui: &mut egui::Ui,
+    platform: Option<&str>,
+    content: impl FnOnce(&mut egui::Ui),
+) {
     let salt = ("v2_check_scroll", platform);
-    let id = ui.make_persistent_id(salt);
+    let id = ui.make_persistent_id(egui::Id::new(salt));
     let mut scroll = egui::ScrollArea::vertical()
         .id_salt(salt)
         .auto_shrink([false, false]);
@@ -73,6 +83,10 @@ fn check_scroll(ui: &mut egui::Ui, platform: Option<&str>, content: impl FnOnce(
     let output = scroll.show(ui, content);
     ui.ctx()
         .data_mut(|d| d.insert_temp(id.with("content_height"), output.content_size.y));
+}
+
+fn short_window(context: &egui::Context) -> bool {
+    context.content_rect().height() < SHORT_GAME_WINDOW
 }
 
 impl App {
@@ -472,7 +486,7 @@ impl App {
             match chosen.map(|destination| destination.route()) {
                 Some(Some(route)) => self.go(route),
                 // Tools: the All Tools browser over the current location.
-                Some(None) => self.simple.all_tools = true,
+                Some(None) => self.open_all_tools(),
                 None => {}
             }
         } else {
@@ -562,6 +576,12 @@ impl App {
                 });
         }
         egui::CentralPanel::default().show(context, |ui| {
+            // Organisation's views share the page scroller; each starts at its top.
+            let view_changed = self.organisation.view != self.scrolled_organisation_view;
+            self.scrolled_organisation_view = self.organisation.view;
+            if std::mem::take(&mut self.reset_page_scroll) || view_changed {
+                super::simple_shell::reset_page_scroll(ui, self.router.current.section());
+            }
             if self.simple.all_tools_open() {
                 self.all_tools_page(ui);
                 return;
@@ -577,15 +597,31 @@ impl App {
                         }
                         | Route::MameWorkflow
                 );
+            let blue = self.simple.simple_navigation();
+            let browse_play = matches!(
+                self.router.current,
+                Route::BrowsePlay | Route::BrowsePlayGame(_)
+            );
             let scrolling_intro = matches!(
                 self.router.current,
                 Route::Section(
                     Section::Emulators | Section::Sources | Section::Dat | Section::Check
                 ) | Route::Tool(_)
-            ) || health_page;
-            // These native pages own one page scroller. Their introduction must
-            // share it: at large text sizes pinning it can consume the viewport.
-            if !scrolling_intro {
+            ) || health_page
+                || (blue && !browse_play);
+            // These pages own one page scroller. Their introduction must share
+            // it: at 1024x600 or large text sizes pinning it consumes the
+            // viewport. Blue keeps only the location and any notice pinned, so
+            // Back and a failure raised while scrolled down stay in view.
+            if blue && scrolling_intro {
+                self.simple_breadcrumbs(ui);
+                let height = ui.available_height() * MAX_PINNED_NOTICE_SHARE;
+                egui::ScrollArea::vertical()
+                    .id_salt("v2_page_notices")
+                    .max_height(height)
+                    .auto_shrink([false, true])
+                    .show(ui, |ui| self.page_notices(ui));
+            } else if !scrolling_intro {
                 self.page_intro(ui);
             }
             let route = self.router.current.clone();
@@ -618,8 +654,15 @@ impl App {
             }
             // A failed library load is shown as a failure, never as a loading
             // spinner or an empty catalogue.
-            if super::library_failure::needs_library(&route) && self.show_library_failure(ui) {
-                return;
+            if super::library_failure::needs_library(&route) {
+                // The failure panel replaces the page, so it needs the title
+                // the page scroller would otherwise have painted.
+                if blue && scrolling_intro && self.library_failure.is_some() && !self.loaded {
+                    self.page_header(ui);
+                }
+                if self.show_library_failure(ui) {
+                    return;
+                }
             }
             // Browse & Play is an application layout: the shelf scrolls, the page
             // does not, so the selected game and its Play button stay in view.
@@ -653,7 +696,9 @@ impl App {
                 self.simple.simple_navigation()
                     && route == Route::Section(Section::OrganisationFamily),
                 |ui| {
-                    if scrolling_intro {
+                    if blue && scrolling_intro {
+                        self.page_header(ui);
+                    } else if scrolling_intro {
                         self.page_intro(ui);
                     }
                     // Settings leads with its size controls, so there the
@@ -661,7 +706,8 @@ impl App {
                     // Organisation's one primary action must not sit under a
                     // multi-line strip on a short window; the strip follows it.
                     let guidance_last =
-                        matches!(route, Route::Section(Section::Settings | Section::Build));
+                        matches!(route, Route::Section(Section::Settings | Section::Build))
+                            || (matches!(route, Route::Game(_)) && short_window(ui.ctx()));
                     if !guidance_last && let Some(guidance) = pinned_guidance.clone() {
                         super::guidance::show(ui, &mut self.guidance, guidance);
                         ui.add_space(theme::SPACE_SM);
@@ -824,7 +870,8 @@ impl App {
             Route::Home | Route::Section(Section::Home) => GuidancePage::Home,
             // The page explains itself; a tip repeating it would only cost room.
             Route::BrowsePlay | Route::BrowsePlayGame(_) => return None,
-            Route::MameWorkflow => GuidancePage::Organisation,
+            // The publication tip is about Organisation; MAME explains itself.
+            Route::MameWorkflow => return None,
             Route::Game(_) | Route::Section(Section::Games) => GuidancePage::Games,
             Route::Section(Section::Sources) => GuidancePage::Sources,
             Route::Section(Section::Launch)
@@ -848,6 +895,8 @@ impl App {
             Route::Section(Section::Advanced) => GuidancePage::Advanced,
             Route::Section(Section::Settings) => GuidancePage::Settings,
             Route::Section(Section::Build) => GuidancePage::Organisation,
+            // The only script here is about the Enable / disable tab.
+            Route::Section(Section::Mods) if !self.mods.activation_open() => return None,
             Route::Section(Section::Mods) => GuidancePage::CheatsMods,
             Route::Section(Section::Museum) => GuidancePage::Museum,
             Route::Section(Section::Tape)
@@ -1068,7 +1117,11 @@ impl App {
                     ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                         let open = self.simple.all_tools_open();
                         if simple_shell::all_tools_button(ui, open).clicked() {
-                            self.simple.all_tools = !open;
+                            if open {
+                                self.simple.all_tools = false;
+                            } else {
+                                self.open_all_tools();
+                            }
                         }
                     });
                 });
@@ -1076,17 +1129,23 @@ impl App {
     }
 
     /// The All Tools browser over the current location (Blue view only).
+    /// A fresh visit starts at the top; Back keeps its place.
+    pub(super) fn open_all_tools(&mut self) {
+        self.simple.all_tools = true;
+        self.reset_all_tools_scroll = true;
+    }
+
     fn all_tools_page(&mut self, ui: &mut egui::Ui) {
-        ui.heading(super::all_tools::TITLE);
-        ui.label(super::all_tools::PURPOSE);
-        ui.add_space(8.0);
+        if std::mem::take(&mut self.reset_all_tools_scroll) {
+            super::simple_shell::reset_scroll(ui, ALL_TOOLS_SCROLL);
+        }
         let mut chosen = None;
-        super::simple_shell::show_focus_reveal_scroll(
-            ui,
-            "v2_all_tools_scroll",
-            [false, false],
-            |ui| chosen = super::all_tools::show(ui, &mut self.simple.tools),
-        );
+        super::simple_shell::show_focus_reveal_scroll(ui, ALL_TOOLS_SCROLL, [false, false], |ui| {
+            ui.heading(super::all_tools::TITLE);
+            ui.label(super::all_tools::PURPOSE);
+            ui.add_space(8.0);
+            chosen = super::all_tools::show(ui, &mut self.simple.tools);
+        });
         if let Some(route) = chosen {
             self.go(route);
         }
@@ -1218,6 +1277,10 @@ impl App {
             self.simple_breadcrumbs(ui);
         }
         self.page_header(ui);
+        self.page_notices(ui);
+    }
+
+    fn page_notices(&mut self, ui: &mut egui::Ui) {
         if let Some(notice) = &self.notice {
             let mut dismiss = false;
             egui::Frame::group(ui.style()).show(ui, |ui| {
@@ -1261,6 +1324,14 @@ impl App {
             ui.heading(super::simple_shell::MANAGE_TITLE);
             ui.label(super::simple_shell::MANAGE_PURPOSE);
             ui.add_space(8.0);
+            return;
+        }
+        // The breadcrumb and hero already name the game; on a short window
+        // this heading would cost the first screen its Play button.
+        if matches!(self.router.current, Route::Game(_))
+            && self.simple.simple_navigation()
+            && short_window(ui.ctx())
+        {
             return;
         }
         let family = family_for_route(&self.router.current);
@@ -1463,9 +1534,16 @@ impl App {
             if self.filter.platform != previous_platform {
                 self.filter.select_platform(self.filter.platform.clone());
             }
-            changed |= ui
-                .checkbox(&mut self.filter.attention_only, "Needs attention")
-                .changed();
+            let mut attention =
+                self.filter.readiness == super::library::ReadinessFilter::NeedsAttention;
+            if ui.checkbox(&mut attention, "Needs attention").changed() {
+                self.filter.readiness = if attention {
+                    super::library::ReadinessFilter::NeedsAttention
+                } else {
+                    super::library::ReadinessFilter::All
+                };
+                changed = true;
+            }
             changed |= ui
                 .selectable_value(&mut self.filter.list, false, "Grid")
                 .changed();
@@ -1514,7 +1592,7 @@ impl App {
             egui::ScrollArea::vertical().id_salt("v2_filter_details").max_height(150.0).show(ui, |ui| {
             ui.label(format!("Selected platform ID: {} · display label: {}", self.filter.platform, self.filter.platform));
             ui.label("Platform IDs are the catalogue's exact current assignments; no alias grouping or artwork filter is applied.");
-            ui.label(format!("Search: {:?} · needs attention only: {} · source/path filter: none", self.filter.search, self.filter.attention_only));
+            ui.label(format!("Search: {:?} · readiness: {} · source/path filter: none", self.filter.search, self.filter.readiness.label()));
             ui.label(format!("Logical filtered rows: {} · updating: {}", self.indices.len(), self.filter_inflight || self.filter_dirty.is_some()));
             for (platform, sources) in &self.library.platform_sources {
                 if self.filter.platform.is_empty() || *platform == self.filter.platform {
@@ -2125,10 +2203,7 @@ impl App {
     }
 
     fn duplicates(&mut self, ui: &mut egui::Ui) {
-        egui::ScrollArea::vertical()
-            .id_salt("v2_duplicates_scroll")
-            .auto_shrink([false, false])
-            .show(ui, |ui| self.duplicates_content(ui));
+        self.duplicates_content(ui);
     }
 
     fn duplicates_content(&mut self, ui: &mut egui::Ui) {
@@ -2357,7 +2432,7 @@ impl App {
         if self.problem_summary.is_none() {
             self.start_problem_summary();
         }
-        egui::ScrollArea::vertical().id_salt("v2_problems").show(ui, |ui| {
+        ui.vertical(|ui| {
             let summary = self.problem_summary.clone();
             let (attention, warnings) = summary
                 .as_ref()
@@ -2760,7 +2835,8 @@ impl App {
         let key = self.artwork.key(id, Kind::Cover);
         // One scroll area holds the whole page. Specialist evidence used to be
         // drawn above it, which pushed the title and Play off small windows.
-        egui::ScrollArea::vertical().id_salt(("v2_detail", id)).show(ui, |ui| {
+        // The shared page scroller carries this page, so its title scrolls too.
+        ui.vertical(|ui| {
             if self.moved_game == Some(id) {
                 ui.group(|ui| {
                     ui.strong("This game has moved");
@@ -2790,6 +2866,8 @@ impl App {
                                     ui.vertical(|ui| {
                                         self.detail_heading(ui, &library, game);
                                         ui.add_space(theme::SPACE_SM);
+                                        self.detail_facts(ui, game);
+                                        ui.add_space(theme::SPACE_MD);
                                         self.detail_more(ui, game);
                                     });
                                 });
@@ -2803,7 +2881,8 @@ impl App {
                         |ui| {
                             ui.set_width(right);
                             super::game_detail_blue::side_card(ui, "Can I play it?", |ui| {
-                                self.detail_readiness(ui, game, latest_verification.as_deref());
+                                self.detail_readiness(ui, game);
+                                self.detail_readiness_notes(ui, game, latest_verification.as_deref());
                                 self.show_arcade_input_details(ui, game);
                                 self.classic_trainers.show(ui, game);
                             });
@@ -2825,17 +2904,36 @@ impl App {
                 return;
             }
             let wide = ui.available_width() >= 760.0;
-            let cover = if wide { egui::vec2(240.0, 320.0) } else { egui::vec2(168.0, 224.0) };
+            let cover = if short_window(ui.ctx()) {
+                egui::vec2(120.0, 160.0)
+            } else if wide {
+                egui::vec2(240.0, 320.0)
+            } else {
+                egui::vec2(168.0, 224.0)
+            };
             ui.horizontal_top(|ui| {
                 self.picture(ui, game, Kind::Cover, cover);
                 ui.add_space(theme::SPACE_LG);
                 ui.vertical(|ui| {
                     self.detail_heading(ui, &library, game);
                     ui.add_space(theme::SPACE_SM);
-                    self.detail_readiness(ui, game, latest_verification.as_deref());
-                    self.show_arcade_input_details(ui, game);
+                    self.detail_readiness(ui, game);
+                    let notes = latest_verification.as_deref();
+                    // A short window reaches quick actions and facts before
+                    // the long notes; taller ones keep the notes beside Play.
+                    let short = short_window(ui.ctx());
+                    if !short {
+                        self.detail_readiness_notes(ui, game, notes);
+                    }
                     ui.add_space(theme::SPACE_SM);
                     self.detail_more(ui, game);
+                    ui.add_space(theme::SPACE_MD);
+                    self.detail_facts(ui, game);
+                    if short {
+                        ui.add_space(theme::SPACE_MD);
+                        self.detail_readiness_notes(ui, game, notes);
+                    }
+                    self.show_arcade_input_details(ui, game);
                 });
             });
             if blue && super::recording_integrity::eligible(game) {
@@ -2910,18 +3008,56 @@ impl App {
         }
     }
 
-    /// The readiness card (which owns the single primary action), the latest
-    /// verification, the identity status and the saved-check notes.
-    fn detail_readiness(
-        &mut self,
-        ui: &mut egui::Ui,
-        game: &Game,
-        latest_verification: Option<&str>,
-    ) {
+    /// "At a glance": saved facts and the file check, never a Play decision.
+    fn detail_facts(&mut self, ui: &mut egui::Ui, game: &Game) {
+        let id = game.archive.id;
+        let readiness = self
+            .native_workflows
+            .as_ref()
+            .and_then(|workflows| workflows.readiness_summary(id, &game.archive.absolute_path));
+        if readiness.is_none() {
+            // The readiness card selects this game later in the same frame.
+            ui.ctx()
+                .request_repaint_after(std::time::Duration::from_millis(100));
+        }
+        let index = self.artwork.index.as_deref();
+        let region = super::game_detail_blue::region(game, index);
+        let rows = super::game_detail_facts::facts(
+            game,
+            super::game_detail_facts::Sources {
+                detail: self.detail.as_ref().filter(|detail| detail.game == id),
+                detail_failed: self.detail_failed == Some(id),
+                readiness: readiness.as_ref(),
+                region: region
+                    .as_ref()
+                    .map(|(value, source)| (value.as_str(), source.as_str())),
+                region_checked: index.is_some(),
+                dat_region: self
+                    .detail
+                    .as_ref()
+                    .filter(|detail| detail.game == id)
+                    .and_then(|detail| detail.dat_region.as_ref())
+                    .map(|(value, source)| (value.as_str(), source.as_str())),
+                dat_current: game.dat_exact.is_some(),
+                discs: self
+                    .game_detail_facts
+                    .discs_for(id, &self.library)
+                    .map(|found| found.guidance.headline.as_str()),
+            },
+        );
+        super::game_detail_facts::show(ui, game, &rows);
+    }
+
+    /// The readiness card, which owns the single primary action.
+    fn detail_readiness(&mut self, ui: &mut egui::Ui, game: &Game) {
         self.nkit_guidance(ui, game, false);
         let id = game.archive.id;
         // The readiness card owns the single primary action: Play
         // when the game is ready, otherwise the step that fixes it.
+        let file_missing = self
+            .detail
+            .as_ref()
+            .is_some_and(|detail| detail.game == id && !detail.file_present);
         let readiness_route = {
             let workflows = self.native_workflows.get_or_insert_with(|| {
                 super::native_workflows::NativeWorkflows::new(ui.ctx().clone())
@@ -2932,13 +3068,27 @@ impl App {
                 id,
                 &game.archive.absolute_path,
                 game.archive.identity_report.as_ref(),
-                game.dat_exact.is_some(),
+                super::native_workflows::SavedFileFacts {
+                    catalogue_verified: game.dat_exact.is_some(),
+                    file_missing,
+                },
                 &mut self.activity,
             )
         };
         if let Some(route) = readiness_route {
             self.go(route);
         }
+    }
+
+    /// Everything else "Can I play it?" holds: saves, discs, verification and
+    /// identity notes. Long enough that small windows place it after the facts.
+    fn detail_readiness_notes(
+        &mut self,
+        ui: &mut egui::Ui,
+        game: &Game,
+        latest_verification: Option<&str>,
+    ) {
+        let id = game.archive.id;
         let state_target = self
             .native_workflows
             .as_ref()
@@ -2952,13 +3102,27 @@ impl App {
         #[cfg(target_os = "linux")]
         super::electron_preview::show(ui, game);
         // Multi-disc guidance, read-only, under the same readiness card.
+        // The launch-aware answer needs the database snapshot, which this page
+        // never loads; without it the bounded background lookup answers.
         let disc_guidance = self
             .native_workflows
             .as_ref()
-            .and_then(|workflows| workflows.disc_guidance(&game.archive.absolute_path));
+            .and_then(|workflows| workflows.disc_guidance(&game.archive.absolute_path))
+            .or_else(|| {
+                self.game_detail_facts
+                    .discs_for(id, &self.library)
+                    .map(|found| found.guidance.clone())
+            });
         if let Some(guidance) = &disc_guidance {
             ui.add_space(theme::SPACE_SM);
             crate::multidisc_launch_view::show_guidance(ui, guidance);
+            let links = self
+                .game_detail_facts
+                .discs_for(id, &self.library)
+                .map_or(&[][..], |found| &found.links);
+            if let Some(other) = super::game_detail_facts::show_disc_links(ui, links) {
+                self.go(Route::Game(other));
+            }
         }
         // Amiga format, machine and readiness; links only, never Play.
         if super::amiga_game::machine(game).is_some() {
@@ -3070,6 +3234,7 @@ impl App {
         let button_width = ((ui.available_width() - ui.spacing().item_spacing.x) / 2.0)
             .clamp(140.0, 240.0)
             .min(ui.available_width());
+        let button_height = if short_window(ui.ctx()) { 52.0 } else { 64.0 };
         ui.horizontal_wrapped(|ui| {
             for (label, section) in [
                 ("Verify", Section::Check),
@@ -3079,7 +3244,10 @@ impl App {
                 ("Fix Problems", Section::Problems),
             ] {
                 if ui
-                    .add_sized([button_width, 64.0], egui::Button::new(label).wrap())
+                    .add_sized(
+                        [button_width, button_height],
+                        egui::Button::new(label).wrap(),
+                    )
                     .clicked()
                 {
                     if matches!(section, Section::Check) {
@@ -3089,7 +3257,10 @@ impl App {
                 }
             }
             if ui
-                .add_sized([button_width, 64.0], egui::Button::new("Open Folder"))
+                .add_sized(
+                    [button_width, button_height],
+                    egui::Button::new("Open Folder"),
+                )
                 .clicked()
             {
                 let job = self
@@ -3596,10 +3767,7 @@ impl App {
         }
         let library = self.library.clone();
         let mut metadata_changed = false;
-        egui::ScrollArea::vertical()
-            .id_salt(("v2_artwork_metadata", selected))
-            .auto_shrink([false, false])
-            .show(ui, |ui| {
+        ui.vertical(|ui| {
                 ui.label("Review artwork, manuals and supported extras for one game. Provider setup stays in Sources & Providers.");
                 if ui
                     .add_enabled(!self.artwork.index_loading, egui::Button::new("Recheck providers"))
@@ -3842,7 +4010,7 @@ impl App {
             self.go(route);
             return;
         }
-        egui::ScrollArea::vertical().id_salt(("v2_task", section)).show(ui, |ui| {
+        ui.vertical(|ui| {
             ui.heading("This workflow is available in the existing interface");
             ui.label("This task opens the existing interface in a separate window. GUI v2 stays open so you can return safely.");
             if let Some(game) = self.router.current.game().and_then(|id| self.library.game(id)) { ui.strong(format!("Selected game: {}", game.title)); }
@@ -3921,36 +4089,34 @@ impl App {
             });
         }
         let attention_only = self.activity_attention_only;
-        egui::ScrollArea::vertical()
-            .id_salt("v2_jobs")
-            .show(ui, |ui| {
-                for (id, job) in super::activity::visible_jobs(&self.activity, attention_only) {
-                    ui.push_id(id, |ui| {
-                        egui::Frame::group(ui.style()).show(ui, |ui| {
-                            ui.set_min_width(ui.available_width());
-                            let card = super::job_card::show(ui, job, false);
-                            if card.cancel {
-                                job.request_cancel();
-                            }
-                            if !job.active()
-                                && primary(
-                                    ui,
-                                    if job.phase == Phase::Failed {
-                                        "Return to task / retry"
-                                    } else {
-                                        "View result"
-                                    },
-                                )
-                            {
-                                destination = Some(job.result.clone());
-                            }
-                            ui.collapsing("Technical details", |ui| {
-                                ui.label(&job.technical);
-                            });
+        ui.vertical(|ui| {
+            for (id, job) in super::activity::visible_jobs(&self.activity, attention_only) {
+                ui.push_id(id, |ui| {
+                    egui::Frame::group(ui.style()).show(ui, |ui| {
+                        ui.set_min_width(ui.available_width());
+                        let card = super::job_card::show(ui, job, false);
+                        if card.cancel {
+                            job.request_cancel();
+                        }
+                        if !job.active()
+                            && primary(
+                                ui,
+                                if job.phase == Phase::Failed {
+                                    "Return to task / retry"
+                                } else {
+                                    "View result"
+                                },
+                            )
+                        {
+                            destination = Some(job.result.clone());
+                        }
+                        ui.collapsing("Technical details", |ui| {
+                            ui.label(&job.technical);
                         });
                     });
-                }
-            });
+                });
+            }
+        });
         if let Some(route) = destination {
             self.go(route);
         }

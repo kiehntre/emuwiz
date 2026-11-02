@@ -44,7 +44,11 @@ fn cached_platform_filters_and_title_hints_match_the_full_scan() {
                     let filter = Filter {
                         platform: platform.into(),
                         search: search.into(),
-                        attention_only: attention,
+                        readiness: if attention {
+                            crate::gui_v2::library::ReadinessFilter::NeedsAttention
+                        } else {
+                            crate::gui_v2::library::ReadinessFilter::All
+                        },
                         unverified_only: unverified,
                         ..Default::default()
                     };

@@ -3,6 +3,7 @@
 //! painted and where a click leads; nothing here may start work or launch.
 use super::*;
 use crate::gui_v2::home_blue::{FIRST_RUN_TITLE, HOME_TILES, WELCOME_TITLE};
+use crate::gui_v2::library::ReadinessFilter;
 
 const DESKTOP: [f32; 2] = [1672.0, 941.0];
 const COMPACT: [f32; 2] = [1024.0, 600.0];
@@ -518,8 +519,11 @@ fn browse_play_shows_no_developer_placeholder_filters() {
     // Unimplemented readiness filters are not advertised to players.
     assert!(!strings.iter().any(|s| s.contains("Proposed")));
     assert!(!strings.iter().any(|s| s.contains("does not keep yet")));
-    assert!(!has(&strings, "Not checked"));
-    // The existing Needs attention filter is still a working toggle.
+    // The four readiness views are all offered.
+    for label in ["All", "Ready", "Needs attention", "Not checked"] {
+        assert!(has(&strings, label), "{label} missing: {strings:?}");
+    }
+    // Needs attention is still a working filter.
     let layout = frame(&context, &mut app, DESKTOP);
     let attention = text_bounds(&layout, "Needs attention")
         .into_iter()
@@ -527,7 +531,46 @@ fn browse_play_shows_no_developer_placeholder_filters() {
         .expect("Needs attention")
         .center();
     click(&context, &mut app, DESKTOP, attention);
-    assert!(app.filter.attention_only);
+    assert_eq!(app.filter.readiness, ReadinessFilter::NeedsAttention);
+    // Not checked is selectable from the same row and Ready fits beside it.
+    let layout = frame(&context, &mut app, DESKTOP);
+    let not_checked = text_bounds(&layout, "Not checked")
+        .into_iter()
+        .next()
+        .expect("Not checked")
+        .center();
+    click(&context, &mut app, DESKTOP, not_checked);
+    assert_eq!(app.filter.readiness, ReadinessFilter::NotChecked);
+}
+
+#[test]
+fn browse_play_readiness_control_fits_the_compact_window() {
+    let context = egui::Context::default();
+    let mut app = blue_app(&context, games());
+    app.router.current = Route::BrowsePlay;
+    // Narrow: one dropdown showing the current view, inside the window.
+    let narrow = [620.0, 480.0];
+    let layout = frame(&context, &mut app, narrow);
+    let rects = text_bounds(&layout, "All");
+    assert!(
+        rects.iter().any(|r| r.min.x >= 0.0 && r.max.x <= narrow[0]),
+        "readiness control outside the window: {rects:?}"
+    );
+    assert!(
+        text_bounds(&layout, "Not checked").is_empty(),
+        "dropdown is closed"
+    );
+    // Compact desktop and wide: all four choices side by side in the window.
+    let layout = frame(&context, &mut app, COMPACT);
+    for label in ["All", "Ready", "Needs attention", "Not checked"] {
+        let rects = text_bounds(&layout, label);
+        assert!(
+            rects
+                .iter()
+                .any(|r| r.min.x >= 0.0 && r.max.x <= COMPACT[0]),
+            "{label} outside the window: {rects:?}"
+        );
+    }
 }
 
 #[test]
@@ -887,5 +930,49 @@ fn saves_opens_native_save_vault_without_starting_a_restore() {
             .pcsx2_save_vault
             .manual_loading
             .is_none()
+    );
+}
+
+#[test]
+fn readiness_views_never_suggest_the_whole_library_was_assessed() {
+    use crate::gui_v2::library::CheckedReadiness;
+    let context = egui::Context::default();
+    let mut app = blue_app(&context, games());
+    app.router.current = Route::BrowsePlay;
+    let first = app.library.games[0].clone();
+    app.browse_play
+        .record_readiness(&first, Some(CheckedReadiness::NotReady("Needs emulator")));
+    let total = app.library.games.len();
+    for view in [
+        ReadinessFilter::Ready,
+        ReadinessFilter::NeedsAttention,
+        ReadinessFilter::NotChecked,
+    ] {
+        app.filter.readiness = view;
+        app.filter.cache_aware = true;
+        let strings = shown(&context, &mut app, DESKTOP);
+        let note = format!("1 of {total} games checked so far");
+        assert!(
+            strings.iter().any(|s| s.contains(&note)),
+            "{view:?} lacks the progress note: {strings:?}"
+        );
+    }
+    // Not checked is described as "no result yet", never as a failure.
+    app.filter.readiness = ReadinessFilter::NotChecked;
+    let strings = shown(&context, &mut app, DESKTOP);
+    assert!(
+        strings
+            .iter()
+            .any(|s| s.contains("only means no result yet, not a problem"))
+    );
+    assert!(!strings.iter().any(|s| s.contains("Not ready")));
+    // A finished negative result is named, with its reason, in Needs attention.
+    app.filter.readiness = ReadinessFilter::NeedsAttention;
+    let strings = shown(&context, &mut app, DESKTOP);
+    assert!(
+        strings
+            .iter()
+            .any(|s| s.contains("Not ready · Needs emulator")),
+        "{strings:?}"
     );
 }

@@ -156,6 +156,7 @@ fn api() -> Value {
         "offset",
         "search_term",
         "platform_ids",
+        "collection_id",
         "with_files",
         "with_char_index",
         "with_filter_values",
@@ -167,6 +168,7 @@ fn api() -> Value {
     .collect::<Vec<_>>();
     json!({"openapi":"3.1.0", "info":{"version":"5.3.1"}, "paths": {
         "/api/platforms":{"get":{"security":[{"OAuth2PasswordBearer":["platforms.read"]}]}},
+        "/api/collections":{"get":{}},
         "/api/roms":{"get":{"parameters":params,"security":[{"OAuth2PasswordBearer":["roms.read"]}]}},
         "/api/roms/{id}":{"get":{}},
         "/api/client-tokens":{"post":{}},
@@ -197,6 +199,10 @@ fn healthy(request: &Request) -> Reply {
             {"id":7,"slug":"gb","fs_slug":"gb","name":"Game Boy","rom_count":5,"igdb_id":33},
             {"id":8,"slug":"custom-console","name":"Custom","rom_count":0,"moby_id":-1}
         ])),
+        "/api/collections" => Reply::json(json!([
+            {"id":3,"name":"Favourites","description":"Pinned games","rom_count":2},
+            {"id":4,"name":"  Backlog ","description":"","rom_ids":[1,2,3]}
+        ])),
         "/api/roms" => {
             if request.authorization.as_deref() != Some(format!("Bearer {TOKEN}").as_str()) {
                 return Reply::bytes(401, Vec::new());
@@ -213,6 +219,10 @@ fn healthy(request: &Request) -> Reply {
             }
             if let Some(platform) = query.get("platform_ids") {
                 games.retain(|g| g["platform_id"].as_u64().unwrap().to_string() == *platform);
+            }
+            if let Some(collection) = query.get("collection_id") {
+                let members: &[u64] = if collection == "3" { &[2, 4] } else { &[] };
+                games.retain(|g| members.contains(&g["id"].as_u64().unwrap()));
             }
             let total = games.len();
             let items = games
@@ -380,6 +390,151 @@ fn pagination_exposes_total_next_previous_without_fetching_other_pages() {
 }
 
 #[test]
+fn collections_are_listed_read_only_with_counts_and_names_normalised() {
+    with_browser(|server, browser| {
+        let caps = &browser.server_info().unwrap().capabilities;
+        assert!(caps.collections && caps.collection_filter);
+        let collections = browser.collections(None).unwrap();
+        assert_eq!(
+            collections
+                .iter()
+                .map(|c| (c.id, c.name.as_str(), c.game_count))
+                .collect::<Vec<_>>(),
+            vec![(3, "Favourites", Some(2)), (4, "Backlog", Some(3))]
+        );
+        assert_eq!(collections[0].description.as_deref(), Some("Pinned games"));
+        assert_eq!(
+            collections[1].description, None,
+            "blank text is not a description"
+        );
+        assert_eq!(collections[0].provenance.endpoint, "/api/collections");
+        assert_eq!(server.targets().last().unwrap(), "/api/collections");
+    });
+}
+
+#[test]
+fn collection_filter_is_server_side_combines_with_search_and_checks_membership_shape() {
+    with_browser(|server, browser| {
+        let page = browser
+            .games(
+                0,
+                5,
+                &RommBrowseFilter {
+                    collection_id: Some(3),
+                    ..Default::default()
+                },
+                None,
+            )
+            .unwrap();
+        assert_eq!(
+            page.games.iter().map(|g| g.id).collect::<Vec<_>>(),
+            vec![2, 4]
+        );
+        assert_eq!(page.total, Some(2));
+        assert!(server.targets().last().unwrap().contains("collection_id=3"));
+        let both = browser
+            .games(
+                0,
+                5,
+                &RommBrowseFilter {
+                    text: Some("Game 4".into()),
+                    platform_id: Some(7),
+                    collection_id: Some(3),
+                },
+                None,
+            )
+            .unwrap();
+        assert_eq!(both.games.len(), 1);
+        let target = server.targets().pop().unwrap();
+        assert!(target.contains("platform_ids=7") && target.contains("collection_id=3"));
+        assert_eq!(
+            browser.games(
+                0,
+                5,
+                &RommBrowseFilter {
+                    collection_id: Some(0),
+                    ..Default::default()
+                },
+                None
+            ),
+            Err(RommBrowseError::SchemaIncompatibility)
+        );
+    });
+}
+
+#[test]
+fn collections_are_refused_not_guessed_when_the_server_does_not_declare_them() {
+    let server = MockServer::new(|request| {
+        if request.target == "/openapi.json" {
+            let mut document = api();
+            document["paths"]
+                .as_object_mut()
+                .unwrap()
+                .remove("/api/collections");
+            for parameter in document["paths"]["/api/roms"]["get"]["parameters"]
+                .as_array_mut()
+                .unwrap()
+            {
+                if parameter["name"] == "collection_id" {
+                    parameter["name"] = json!("not_collections");
+                }
+            }
+            return Reply::json(document);
+        }
+        healthy(request)
+    });
+    let source = server.source();
+    let transport = UreqTransport::new();
+    let mut browser = RommBrowser::new(&source, &transport, 42);
+    let info = browser.discover(None);
+    assert!(!info.capabilities.collections && !info.capabilities.collection_filter);
+    assert_eq!(
+        browser.collections(None),
+        Err(RommBrowseError::UnsupportedCapability)
+    );
+    let before = server.targets().len();
+    assert_eq!(
+        browser.games(
+            0,
+            5,
+            &RommBrowseFilter {
+                collection_id: Some(3),
+                ..Default::default()
+            },
+            None
+        ),
+        Err(RommBrowseError::UnsupportedFilter)
+    );
+    assert_eq!(server.targets().len(), before, "no request was sent");
+}
+
+#[test]
+fn malformed_collection_lists_are_schema_errors() {
+    for body in [
+        json!({"not":"an array"}),
+        json!([{"id":3}]),
+        json!([{"id":3,"name":"A"},{"id":3,"name":"B"}]),
+        json!([{"id":3,"name":"  "}]),
+    ] {
+        let server = MockServer::new(move |request| {
+            if request.target == "/api/collections" {
+                Reply::json(body.clone())
+            } else {
+                healthy(request)
+            }
+        });
+        let source = server.source();
+        let transport = UreqTransport::new();
+        let mut browser = RommBrowser::new(&source, &transport, 42);
+        browser.discover(None);
+        assert_eq!(
+            browser.collections(None),
+            Err(RommBrowseError::SchemaIncompatibility)
+        );
+    }
+}
+
+#[test]
 fn search_and_platform_filter_are_server_side_and_query_encoded() {
     with_browser(|server, browser| {
         let result = browser
@@ -389,6 +544,7 @@ fn search_and_platform_filter_are_server_side_and_query_encoded() {
                 &RommBrowseFilter {
                     text: Some("Game 3".into()),
                     platform_id: Some(7),
+                    ..Default::default()
                 },
                 None,
             )
@@ -410,6 +566,7 @@ fn search_and_platform_filter_are_server_side_and_query_encoded() {
                 &RommBrowseFilter {
                     text: Some(text.into()),
                     platform_id: None,
+                    ..Default::default()
                 },
                 None,
             )
@@ -513,10 +670,12 @@ fn unsupported_filters_are_explicit_and_do_not_request_a_catalogue() {
         RommBrowseFilter {
             text: Some("Game".into()),
             platform_id: None,
+            ..Default::default()
         },
         RommBrowseFilter {
             text: None,
             platform_id: Some(7),
+            ..Default::default()
         },
     ] {
         assert_eq!(
@@ -744,7 +903,8 @@ fn invalid_page_requests_are_refused_before_http() {
                     1,
                     &RommBrowseFilter {
                         text: Some(text),
-                        platform_id: None
+                        platform_id: None,
+                        ..Default::default()
                     },
                     None
                 ),
@@ -777,7 +937,8 @@ fn inconsistent_pages_duplicate_ids_and_ignored_platform_filters_are_refused() {
                 0,
                 &RommBrowseFilter {
                     text: None,
-                    platform_id: Some(8)
+                    platform_id: Some(8),
+                    ..Default::default()
                 }
             ),
             Err(RommBrowseError::PaginationInconsistency)
