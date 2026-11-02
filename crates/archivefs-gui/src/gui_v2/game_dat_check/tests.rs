@@ -85,12 +85,11 @@ fn region_note(game: &Game, panel: Option<&Guidance>) -> String {
 }
 
 /// Panel and Region note must agree about current DAT verification once the
-/// panel has answered; before that, the Region note uses the Library's
-/// decision, which here must give the same answer.
+/// panel has answered, and nothing may say Verified before it has.
 fn assert_agree(f: &VerifiedGame, game: &Game) -> bool {
     let verified = assert_agree_after_panel(f, game);
-    let early = region_note(game, None).starts_with("From the verified match");
-    assert_eq!(early, verified, "Library decision vs panel");
+    let early = region_note(game, None);
+    assert!(!early.starts_with("From the verified match"), "{early}");
     verified
 }
 

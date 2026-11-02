@@ -263,14 +263,11 @@ fn load(
 }
 
 /// Whether Game Details may call this game's DAT match current anywhere on
-/// the page (the Region note included): the panel's own answer once it has
-/// one, so the two can never disagree; before that, the Library's strict
-/// current-evidence decision the panel itself starts from.
-pub(super) fn dat_verified_now(game: &Game, panel: Option<&Guidance>) -> bool {
-    match panel {
-        Some(guidance) => guidance.reason == "Verified",
-        None => game.has_current_dat_verification(),
-    }
+/// the page (the Region note included): only the panel's own answer, once
+/// its worker has re-read this game's saved rows. Before that nothing says
+/// Verified, whatever the Library decided at load.
+pub(super) fn dat_verified_now(_game: &Game, panel: Option<&Guidance>) -> bool {
+    panel.is_some_and(|guidance| guidance.reason == "Verified")
 }
 
 /// Current only when the Library's strict current-evidence decision
