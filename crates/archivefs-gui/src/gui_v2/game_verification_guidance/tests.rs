@@ -99,9 +99,10 @@ fn ready_dat_installation_never_verifies_any_of_the_four_systems() {
         assert_eq!(result.action, Action::Audit);
         assert!(result.explanation.contains("do not check game content"));
         assert!(result.explanation.contains("preview eligible files"));
+        // A one-game action opens the one-game check, never the platform.
         assert_eq!(
             result.action.route(&f.game),
-            super::super::routes::Route::PlatformCheck(f.game.platform.clone())
+            super::super::routes::Route::GameCheck(f.game.archive.id)
         );
     }
 }
@@ -476,7 +477,7 @@ fn clicking_the_guidance_action_only_requests_the_existing_platform_route() {
     assert!(clicked);
     assert_eq!(
         guidance.action.route(&f.game),
-        super::super::routes::Route::PlatformCheck("BBC Micro".into())
+        super::super::routes::Route::GameCheck(f.game.archive.id)
     );
 }
 
@@ -565,6 +566,8 @@ fn a_stale_saved_exact_audit_is_not_cleared_by_an_unrelated_unknown_audit() {
         .unwrap();
     let (count, stale) = saved_evidence(game, &database).unwrap();
     assert_eq!(count, 2);
+    assert!(stale);
+    // A stale mark wins over the Library's earlier current decision.
     assert_eq!(freshness(game, stale), DatProvenanceFreshness::Stale);
 }
 

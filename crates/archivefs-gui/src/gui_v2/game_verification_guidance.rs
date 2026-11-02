@@ -36,7 +36,17 @@ impl Action {
         match self {
             Self::Validate => Route::Section(Section::Dat),
             Self::Review => Route::ReviewIdentity(game.archive.id),
-            Self::SelectDat | Self::Audit | Self::Recheck => {
+            // Both read and save only this game; see `game_dat_check`. A
+            // game with no known system must have one chosen first.
+            Self::Audit | Self::Recheck
+                if archivefs_core::canonical_platform_for_alias(&game.platform).is_some() =>
+            {
+                Route::GameCheck(game.archive.id)
+            }
+            Self::Audit | Self::Recheck => {
+                super::identity_review_page::setup_verification_route(None)
+            }
+            Self::SelectDat => {
                 super::identity_review_page::setup_verification_route(Some(&game.platform))
             }
         }
@@ -175,17 +185,23 @@ fn unavailable() -> Guidance {
     )
 }
 
+/// Whether the file is there and still agrees with the scan's size/mtime.
+pub(super) fn file_state(game: &Game) -> (Option<std::fs::Metadata>, bool) {
+    let metadata = std::fs::symlink_metadata(&game.archive.absolute_path).ok();
+    let unchanged = metadata.as_ref().is_some_and(|m| {
+        Some(m.len()) == game.archive.size_bytes
+            && m.modified()
+                .ok()
+                .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+                .and_then(|d| i64::try_from(d.as_secs()).ok())
+                == game.archive.modified_time_unix_seconds
+    });
+    (metadata, unchanged)
+}
+
 fn read_game(game: &Game) -> Guidance {
     let result = (|| -> Result<_, String> {
-        let metadata = std::fs::symlink_metadata(&game.archive.absolute_path).ok();
-        let unchanged = metadata.as_ref().is_some_and(|m| {
-            Some(m.len()) == game.archive.size_bytes
-                && m.modified()
-                    .ok()
-                    .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
-                    .and_then(|d| i64::try_from(d.as_secs()).ok())
-                    == game.archive.modified_time_unix_seconds
-        });
+        let (metadata, unchanged) = file_state(game);
         let database = Database::open_read_only(
             &archivefs_core::default_database_path().map_err(|e| e.to_string())?,
         )
@@ -328,7 +344,12 @@ pub(super) fn explain(
     catalogues: Result<&[InstalledCatalogueSummary], &str>,
     format_exclusion: Option<&str>,
 ) -> Guidance {
-    if !present || !unchanged || freshness == DatProvenanceFreshness::Stale {
+    // Current evidence already proved the audited file object is unchanged,
+    // which is stronger than the scan's size/mtime baseline; a re-checked
+    // file whose scan row is older must not be called changed. A file that
+    // is gone now is reported whatever the evidence said at load.
+    let current = freshness == DatProvenanceFreshness::Current;
+    if !present || (!unchanged && !current) || freshness == DatProvenanceFreshness::Stale {
         return guidance(
             "File evidence stale or changed",
             if !present {

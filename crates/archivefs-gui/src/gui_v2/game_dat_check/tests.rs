@@ -8,6 +8,7 @@ use super::super::routes::Route;
 use super::super::verified_game_fixture::{RomState, VerifiedGame};
 use super::*;
 use archivefs_core::Database;
+use archivefs_core::dat::library_identity_summary::DatProvenanceFreshness;
 use archivefs_core::dat::sources::{DatSourceRegistry, load_dat_sources_config_from};
 use std::time::{Duration, Instant};
 
@@ -456,4 +457,58 @@ fn a_changed_catalogue_is_never_current_in_either_place() {
     assert!(!game.has_current_dat_verification());
     assert_ne!(panel(&f, &game).reason, "Verified");
     assert!(!assert_agree(&f, &game));
+}
+
+/// The Library loaded current proof, then the file changed: the panel
+/// re-reads the saved rows and must not say Verified.
+#[test]
+fn a_file_changed_after_library_load_is_not_verified() {
+    let f = VerifiedGame::new();
+    let game = game(&f);
+    assert!(game.has_current_dat_verification());
+    f.change_rom();
+    assert_ne!(panel(&f, &game).reason, "Verified");
+    assert!(!assert_agree(&f, &game));
+}
+
+/// Same bytes, size and modification time, but a new file-system object
+/// (as after a remount or a copy back): not proof of the same file, so the
+/// panel must not say Verified while core reports it uncertain.
+#[test]
+fn a_new_file_object_after_library_load_is_not_verified() {
+    let f = VerifiedGame::new();
+    let game = game(&f);
+    assert!(game.has_current_dat_verification());
+    let path = &game.archive.absolute_path;
+    let bytes = std::fs::read(path).unwrap();
+    let mtime = std::fs::metadata(path).unwrap().modified().unwrap();
+    let replacement = path.with_extension("tmp");
+    std::fs::write(&replacement, &bytes).unwrap();
+    std::fs::File::options()
+        .write(true)
+        .open(&replacement)
+        .unwrap()
+        .set_modified(mtime)
+        .unwrap();
+    std::fs::rename(&replacement, path).unwrap();
+    assert_ne!(panel(&f, &game).reason, "Verified");
+    let database = Database::open_read_only(&f.database).unwrap();
+    for check in database
+        .library_dat_identities_for_item(game.archive.id)
+        .unwrap()
+    {
+        let summary = database
+            .library_dat_identity_summary_for_item(
+                game.archive.id,
+                &check.source.source_id,
+                None,
+                None,
+                true,
+            )
+            .unwrap();
+        assert_ne!(
+            summary.map(|summary| summary.provenance_freshness),
+            Some(DatProvenanceFreshness::Current)
+        );
+    }
 }
