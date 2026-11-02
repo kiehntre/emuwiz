@@ -826,7 +826,8 @@ impl AuditProgressView {
 pub(crate) struct RecognitionView {
     pub(crate) rows: Vec<archivefs_core::dat::sources::recognition::RecognitionRow>,
     pub(crate) safe: Vec<archivefs_core::dat::sources::recognition::SafeMatch>,
-    pub(crate) can_undo: bool,
+    /// The latest apply Undo can still reverse, from the saved receipts.
+    pub(crate) undo: Option<archivefs_core::dat::sources::recognition::UndoableApply>,
     pub(crate) message: Option<Result<String, String>>,
 }
 
@@ -3232,8 +3233,6 @@ pub(crate) struct DatSourcesPageState {
     /// refused unless the file still holds it, so an edit made elsewhere is
     /// never silently overwritten. `None` when the file could not be read.
     saved_revision: Option<DatSourcesRevision>,
-    /// The systems the last "Apply all safe matches" set, for Undo.
-    recognition_applied: Option<Vec<archivefs_core::dat::sources::recognition::SafeMatch>>,
     /// Outcome of the last apply or undo.
     recognition_message: Option<Result<String, String>>,
     /// What the user has edited but not yet saved.
@@ -3514,7 +3513,6 @@ impl DatSourcesPageState {
             coverage_cache: BTreeMap::new(),
             saved,
             saved_revision,
-            recognition_applied: None,
             recognition_message: None,
             draft,
             load_error,
@@ -4271,9 +4269,8 @@ impl DatSourcesPageState {
             }
             DatSourcesPageAction::SetPlatform { id, platform } => {
                 if let Some(entry) = self.draft.get_mut(&id) {
-                    entry.platform = platform.filter(|value| !value.trim().is_empty());
                     // A system set by hand is the person's own choice.
-                    entry.platform_recognised_from = None;
+                    entry.set_platform_by_person(platform.filter(|value| !value.trim().is_empty()));
                 }
             }
             DatSourcesPageAction::ApplyRecognisedSystems { preview } => {
@@ -6246,15 +6243,13 @@ impl DatSourcesPageState {
         }) {
             return Err("Not saved: this catalogue is already assigned to another system.".into());
         }
-        entry.platform = Some(platform.to_string());
-        entry.platform_recognised_from = None;
+        entry.set_platform_by_person(Some(platform.to_string()));
         let name = entry.display_name.clone();
         self.save_checked(&next)
             .map_err(|error| format!("Not saved: {error}. Nothing was changed."))?;
         self.saved = next;
         if let Some(draft) = self.draft.get_mut(id) {
-            draft.platform = Some(platform.to_string());
-            draft.platform_recognised_from = None;
+            draft.set_platform_by_person(Some(platform.to_string()));
         }
         Ok(format!("Saved: {name} is now used for {platform}."))
     }
@@ -6343,7 +6338,8 @@ impl DatSourcesPageState {
                 self.load_problems = problems;
                 self.load_error = None;
                 self.save_state = DatSaveState::Idle;
-                self.recognition_applied = None;
+                // Undo is read from the saved receipts, so it stays
+                // available after a reload.
                 self.recognition_message = None;
             }
             Err(error) => self.load_error = Some(error.to_string()),
@@ -6352,14 +6348,13 @@ impl DatSourcesPageState {
 
     /// The recognition summary for the catalogues as they are on this page.
     fn recognition_view(&self) -> RecognitionView {
-        use archivefs_core::dat::sources::recognition::{recognition_rows, safe_matches};
+        use archivefs_core::dat::sources::recognition::{
+            last_undoable_apply, recognition_rows, safe_matches,
+        };
         RecognitionView {
             rows: recognition_rows(&self.draft),
             safe: safe_matches(&self.draft),
-            can_undo: self
-                .recognition_applied
-                .as_ref()
-                .is_some_and(|applied| !applied.is_empty()),
+            undo: last_undoable_apply(&self.saved),
             message: self.recognition_message.clone(),
         }
     }
@@ -6398,12 +6393,12 @@ impl DatSourcesPageState {
             ) {
                 draft.platform = saved.platform.clone();
                 draft.platform_recognised_from = saved.platform_recognised_from.clone();
+                draft.recognition_receipt = saved.recognition_receipt.clone();
                 draft.health = saved.health.clone();
             }
         }
         self.saved = applied.registry;
         let count = applied.applied.len();
-        self.recognition_applied = Some(applied.applied);
         Ok(format!(
             "Set the system for {count} catalogue{}. Nothing else was changed, and no game was read or checked.",
             if count == 1 { "" } else { "s" }
@@ -6415,36 +6410,72 @@ impl DatSourcesPageState {
     }
 
     fn try_undo_recognised(&mut self) -> Result<String, String> {
+        use archivefs_core::dat::sources::recognition::{last_undoable_apply, undo_apply};
         if self.is_busy() {
             return Err("Nothing was changed: wait for the current check to finish.".into());
         }
-        let Some(applied) = self.recognition_applied.clone() else {
+        let Some(last) = last_undoable_apply(&self.saved) else {
             return Err("There is nothing to undo.".into());
         };
         let Some(revision) = self.saved_revision.clone() else {
             return Err("Nothing was changed: your catalogue list could not be read.".into());
         };
-        let undone = archivefs_core::dat::sources::recognition::undo_applied_matches(
-            &self.config_path,
-            &revision,
-            &applied,
-        )
-        .map_err(|refusal| refusal.to_string())?;
+        let undone =
+            undo_apply(&self.config_path, &revision, &last.batch).map_err(
+                |refusal| match refusal {
+                    archivefs_core::dat::sources::recognition::ApplyRefusal::NothingToApply => {
+                        "There is nothing to undo.".to_string()
+                    }
+                    other => other.to_string(),
+                },
+            )?;
         self.saved_revision = Some(undone.revision.clone());
-        for item in &undone.applied {
-            if let Some(draft) = self.draft.get_mut(&item.source_id) {
-                draft.platform = None;
-                draft.platform_recognised_from = None;
+        let from_batch: Vec<String> = self
+            .draft
+            .entries()
+            .iter()
+            .filter(|entry| {
+                entry
+                    .recognition_receipt
+                    .as_ref()
+                    .is_some_and(|receipt| receipt.batch == last.batch)
+            })
+            .map(|entry| entry.id.clone())
+            .collect();
+        for id in from_batch {
+            if let Some(draft) = self.draft.get_mut(&id) {
+                draft.recognition_receipt = None;
+                if undone.cleared.contains(&id) {
+                    draft.platform = None;
+                    draft.platform_recognised_from = None;
+                }
             }
         }
         self.saved = undone.registry;
-        self.recognition_applied = None;
-        let count = undone.applied.len();
-        Ok(format!(
+        let count = undone.cleared.len();
+        let mut message = format!(
             "Undone: {count} catalogue{} no longer {} a system set.",
             if count == 1 { "" } else { "s" },
             if count == 1 { "has" } else { "have" }
-        ))
+        );
+        if !undone.left_alone.is_empty() {
+            message.push_str(&format!(
+                " {} changed since then and {} left as {}: {}.",
+                undone.left_alone.len(),
+                if undone.left_alone.len() == 1 {
+                    "was"
+                } else {
+                    "were"
+                },
+                if undone.left_alone.len() == 1 {
+                    "it is"
+                } else {
+                    "they are"
+                },
+                undone.left_alone.join(", ")
+            ));
+        }
+        Ok(message)
     }
 
     fn start_validate(&mut self, id: String) {

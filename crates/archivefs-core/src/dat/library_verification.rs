@@ -161,11 +161,12 @@ fn same_file(a: &std::fs::Metadata, b: &std::fs::Metadata) -> bool {
 ///
 /// An ordinary game list must name `platform`. Extras (downloadable
 /// content, e-Reader cards and so on) are only accepted when the person set
-/// that system for the catalogue themselves, and so is a header naming more
+/// that system for the catalogue themselves (`chosen`; a system applied from
+/// a recognised header is not a choice), and so is a header naming more
 /// than one system when the person chose one of them. A catalogue whose header has no
 /// name falls back to the older evidence rules; any other header (several
 /// systems, not games, ambiguous, unsupported) is refused.
-fn catalogue_is_for(parsed: &ParsedDat, platform: &str, assigned: Option<&str>) -> bool {
+fn catalogue_is_for(parsed: &ParsedDat, platform: &str, chosen: Option<&str>) -> bool {
     use super::catalogue_recognition::{CatalogueRecognition, recognise_catalogue, same_platform};
     let recognition =
         recognise_catalogue(parsed.source.name.as_deref(), Some(parsed.source.ecosystem));
@@ -173,7 +174,7 @@ fn catalogue_is_for(parsed: &ParsedDat, platform: &str, assigned: Option<&str>) 
         CatalogueRecognition::Games { .. } => recognition.is_for(platform),
         CatalogueRecognition::Extras { .. } => {
             recognition.is_for(platform)
-                && assigned
+                && chosen
                     .and_then(crate::canonical_platform_for_alias)
                     .is_some_and(|assigned| same_platform(assigned, platform))
         }
@@ -183,7 +184,7 @@ fn catalogue_is_for(parsed: &ParsedDat, platform: &str, assigned: Option<&str>) 
             platforms
                 .iter()
                 .any(|candidate| same_platform(candidate, platform))
-                && assigned
+                && chosen
                     .and_then(crate::canonical_platform_for_alias)
                     .is_some_and(|assigned| same_platform(assigned, platform))
         }
@@ -241,7 +242,7 @@ pub fn preview_library_verification(
     {
         return Err("Managed catalogue snapshot changed.".into());
     }
-    if !catalogue_is_for(&parsed, &platform, resolved.assigned_platform.as_deref()) {
+    if !catalogue_is_for(&parsed, &platform, resolved.chosen_platform()) {
         return Err(
             "Catalogue platform is unknown, ambiguous or incompatible with the selected system."
                 .into(),

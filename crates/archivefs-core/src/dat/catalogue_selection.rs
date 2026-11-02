@@ -385,9 +385,13 @@ pub struct InstalledCatalogueSummary {
     pub store: CatalogueStore,
     pub display_name: String,
     /// Canonical-platform display where derivable, plus how it was
-    /// derived. `Assigned` = manual local assignment; `Confirmed` = strong
-    /// typed/parsed identity.
+    /// derived. `Assigned` = set in the local settings (who set it is
+    /// `platform_origin`, never implied); `Confirmed` = strong typed/parsed
+    /// identity.
     pub platform: EvidenceValue<String>,
+    /// Who set a locally assigned platform: the person, "Apply all safe
+    /// matches", or unrecorded. `NotSet` for rows without one.
+    pub platform_origin: crate::dat::sources::PlatformProvenance,
     pub ecosystem: EvidenceValue<DatEcosystem>,
     pub variant: EvidenceValue<CatalogueVariant>,
     /// Header/upstream revision string where known.
@@ -635,6 +639,7 @@ fn summarise_local(entry: &DatSourceEntry) -> InstalledCatalogueSummary {
         store: CatalogueStore::LocalRegistry,
         display_name: entry.display_name.clone(),
         platform,
+        platform_origin: entry.platform_provenance(),
         // Generic local rows have no persisted parsed ecosystem/variant.
         ecosystem: EvidenceValue::Unknown,
         variant: EvidenceValue::Unknown,
@@ -783,6 +788,7 @@ fn summarise_managed(
         },
         store,
         display_name,
+        platform_origin: crate::dat::sources::PlatformProvenance::NotSet,
         platform,
         ecosystem,
         variant,
@@ -823,9 +829,26 @@ pub struct ResolvedCatalogue {
     /// here from the DAT header alone). A DAT-derived platform identity is
     /// available via [`ResolvedCatalogue::dat_platform_identity`].
     pub assigned_platform: Option<String>,
+    /// Who set `assigned_platform`. Only the person's own choice vouches
+    /// for extras or for one system of several the header names; a system
+    /// applied from recognition, or one with no record of who set it, never
+    /// does.
+    pub platform_origin: crate::dat::sources::PlatformProvenance,
 }
 
 impl ResolvedCatalogue {
+    /// The platform the person chose themselves, if any. A platform applied
+    /// from a recognised header, or saved with no record of who set it, is
+    /// not a choice.
+    pub fn chosen_platform(&self) -> Option<&str> {
+        match self.platform_origin {
+            crate::dat::sources::PlatformProvenance::ChosenByPerson => {
+                self.assigned_platform.as_deref()
+            }
+            _ => None,
+        }
+    }
+
     /// The DAT-derived platform identity (`Resolved` / `Ambiguous` /
     /// `Unknown`) - fail-closed, never guessed.
     pub fn dat_platform_identity(&self) -> crate::dat::identity::DatPlatformIdentity {
@@ -1103,6 +1126,7 @@ pub fn resolve_catalogue(
                 parsed: outcome.dat,
                 provenance: local_provenance(entry),
                 assigned_platform: entry.platform.clone(),
+                platform_origin: entry.platform_provenance(),
             })
         }
         CatalogueRef::ManagedCurrent {
@@ -1153,6 +1177,7 @@ pub fn resolve_catalogue(
                     provider: source_id.provider,
                 },
                 assigned_platform: None,
+                platform_origin: crate::dat::sources::PlatformProvenance::NotSet,
             })
         }
     }

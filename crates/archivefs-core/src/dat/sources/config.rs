@@ -92,6 +92,19 @@ pub struct DatSourceConfigEntry {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub platform_recognised_from_header: Option<String>,
 
+    /// The Undo receipt of the apply that set `platform` (see
+    /// `RecognitionReceipt`). Both keys must be present to count.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub platform_recognised_batch: Option<String>,
+
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub platform_recognised_platform: Option<String>,
+
+    /// `"person"` when the person chose `platform`. Absent for a system set
+    /// from recognition or saved by an older build.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub platform_set_by: Option<String>,
+
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub origin: Option<String>,
 
@@ -178,7 +191,20 @@ impl DatSourceConfigEntry {
                 .unwrap_or(super::DEFAULT_DAT_PRIORITY)
                 .clamp(MIN_DAT_PRIORITY, super::MAX_DAT_PRIORITY),
             platform: self.platform.filter(|value| !value.trim().is_empty()),
+            recognition_receipt: match (
+                self.platform_recognised_batch,
+                self.platform_recognised_platform,
+            ) {
+                (Some(batch), Some(platform))
+                    if !batch.trim().is_empty() && !platform.trim().is_empty() =>
+                {
+                    Some(super::RecognitionReceipt { batch, platform })
+                }
+                // A partial or blank receipt is never trusted for Undo.
+                _ => None,
+            },
             platform_recognised_from: self.platform_recognised_from_header,
+            platform_chosen_by_person: self.platform_set_by.as_deref() == Some("person"),
             origin: self.origin,
             added_unix_seconds: self.added_unix_seconds,
             health: DatSourceHealth {
@@ -220,6 +246,16 @@ impl DatSourceConfigEntry {
             priority: Some(entry.priority),
             platform: entry.platform.clone(),
             platform_recognised_from_header: entry.platform_recognised_from.clone(),
+            platform_recognised_batch: entry
+                .recognition_receipt
+                .as_ref()
+                .map(|receipt| receipt.batch.clone()),
+            platform_recognised_platform: entry
+                .recognition_receipt
+                .as_ref()
+                .map(|receipt| receipt.platform.clone()),
+            platform_set_by: (entry.platform.is_some() && entry.platform_chosen_by_person)
+                .then(|| "person".to_string()),
             origin: entry.origin.clone(),
             added_unix_seconds: entry.added_unix_seconds,
             health_state: entry.health.state,
@@ -327,6 +363,12 @@ impl DatSourcesRevision {
             Err(source) if source.kind() == std::io::ErrorKind::NotFound => Ok(Self::of(None)),
             Err(source) => Err(ArchiveFsError::io(path.to_path_buf(), source)),
         }
+    }
+
+    /// The SHA-256 the revision stands for, or `none` for no file. Used to
+    /// record which settings an apply was made to.
+    pub fn label(&self) -> &str {
+        self.0.as_deref().unwrap_or("none")
     }
 }
 

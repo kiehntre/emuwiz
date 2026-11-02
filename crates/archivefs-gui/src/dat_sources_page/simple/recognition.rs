@@ -7,6 +7,7 @@
 //! catalogue. No game file is read and no verification is started.
 use super::*;
 use archivefs_core::dat::catalogue_recognition::CatalogueRecognition;
+use archivefs_core::dat::sources::PlatformProvenance;
 use archivefs_core::dat::sources::recognition::{
     RecognitionGroup, RecognitionRow, RecognitionState,
 };
@@ -35,18 +36,44 @@ pub(super) fn row_text(row: &RecognitionRow) -> String {
         RecognitionState::NotChecked => "Its system hasn\u{2019}t been checked yet".to_string(),
         RecognitionState::Changed => "The file changed since it was checked".to_string(),
     };
-    match (row.group, &row.assigned) {
-        (RecognitionGroup::Conflict, Some(assigned)) => {
+    let Some(assigned) = &row.assigned else {
+        return match row.group {
+            RecognitionGroup::TurnedOff => format!("Turned off. {header}"),
+            _ => header,
+        };
+    };
+    let header_backs_ordinary_list = matches!(
+        &row.state,
+        RecognitionState::Recognised(CatalogueRecognition::Games { .. })
+    );
+    let checked = matches!(row.state, RecognitionState::Recognised(_));
+    match (row.group, row.origin) {
+        (RecognitionGroup::Conflict, PlatformProvenance::AppliedFromRecognition) => format!(
+            "Set to {assigned} automatically, but the catalogue now says: {header}. \
+             It won\u{2019}t be used to check {assigned} games until you choose its system again. \
+             Nothing was changed."
+        ),
+        (RecognitionGroup::Conflict, PlatformProvenance::ChosenByPerson) => {
             format!("You chose {assigned}, but the catalogue says: {header}. Nothing was changed.")
         }
-        (RecognitionGroup::AlreadySet, Some(assigned)) if row.assigned_by_recognition => {
+        (RecognitionGroup::Conflict, _) => format!(
+            "Used for {assigned} (not recorded who set it), but the catalogue says: {header}. \
+             Choose its system again if {assigned} is right. Nothing was changed."
+        ),
+        (RecognitionGroup::NeedsCheck, _) => format!(
+            "Set to {assigned} automatically. {header}; check catalogues again to confirm it."
+        ),
+        (_, PlatformProvenance::AppliedFromRecognition) => {
             format!("Used for {assigned} (recognised from the catalogue)")
         }
-        (RecognitionGroup::AlreadySet, Some(assigned)) => {
+        (_, PlatformProvenance::ChosenByPerson) if header_backs_ordinary_list || !checked => {
             format!("Used for {assigned} (your choice)")
         }
-        (RecognitionGroup::TurnedOff, _) => format!("Turned off. {header}"),
-        _ => header,
+        (_, PlatformProvenance::ChosenByPerson) => {
+            format!("Used for {assigned} (your choice). The catalogue says: {header}")
+        }
+        (_, _) if checked => format!("Used for {assigned}. The catalogue says: {header}"),
+        (_, _) => format!("Used for {assigned} (not recorded who set it)"),
     }
 }
 
@@ -90,8 +117,8 @@ pub(super) fn card(
             ),
             (
                 count(rows, RecognitionGroup::Conflict),
-                "catalogue says a different system from the one you chose (not changed)",
-                "catalogues say a different system from the one you chose (not changed)",
+                "catalogue doesn\u{2019}t confirm the system set for it (not changed)",
+                "catalogues don\u{2019}t confirm the system set for them (not changed)",
             ),
             (
                 count(rows, RecognitionGroup::CannotUse),
@@ -131,11 +158,6 @@ pub(super) fn card(
         match &recognition.message {
             Some(Ok(message)) => {
                 ui.colored_label(theme::SUCCESS, message);
-                if recognition.can_undo
-                    && ui.add_enabled(!busy, egui::Button::new("Undo")).clicked()
-                {
-                    action = Some(DatSourcesPageAction::UndoRecognisedSystems);
-                }
             }
             Some(Err(message)) => {
                 ui.colored_label(theme::WARNING, message);
@@ -150,6 +172,21 @@ pub(super) fn card(
                 }
             }
             None => {}
+        }
+        // Read from the receipts saved with the settings, so it is still
+        // offered after a restart or a reload.
+        if let Some(undo) = &recognition.undo {
+            let n = undo.catalogues.len();
+            if ui
+                .add_enabled(!busy, egui::Button::new("Undo"))
+                .on_hover_text(format!(
+                    "Clears the system set by the last \u{201c}Apply all safe matches\u{201d} for {}. Anything changed since is left alone.",
+                    plural(n, "catalogue", "catalogues")
+                ))
+                .clicked()
+            {
+                action = Some(DatSourcesPageAction::UndoRecognisedSystems);
+            }
         }
         if safe > 0 {
             if !state.preview_open {

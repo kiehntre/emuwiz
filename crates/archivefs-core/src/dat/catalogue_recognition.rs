@@ -429,7 +429,18 @@ fn recognise_no_intro_style(name: &str) -> CatalogueRecognition {
         };
     }
     let platform = match no_intro_system_platform(&system) {
-        Ok(platform) => platform,
+        Ok((platform, unknown)) => {
+            // A part of the name that names no system is never ignored: the
+            // catalogue may be a subset (for example "- Digital"), so it is
+            // treated as extras rather than as the ordinary game list.
+            for segment in unknown {
+                let plain = format!("\u{201c}{segment}\u{201d}");
+                if !extras.contains(&plain) {
+                    extras.push(plain);
+                }
+            }
+            platform
+        }
         Err(other) => return other,
     };
     if extras.is_empty() {
@@ -455,28 +466,36 @@ fn split_labels(name: &str) -> (&str, Vec<&str>) {
     (rest, labels)
 }
 
-fn no_intro_system_platform(system: &str) -> Result<&'static str, CatalogueRecognition> {
+fn no_intro_system_platform(
+    system: &str,
+) -> Result<(&'static str, Vec<String>), CatalogueRecognition> {
     if let Some((_, platforms)) = REVIEWED_SYSTEM_NAMES
         .iter()
         .find(|(exact, _)| *exact == system)
     {
-        return decide(platforms.to_vec(), system);
+        return decide(platforms.to_vec(), system).map(|platform| (platform, Vec::new()));
     }
     let mut candidates = Vec::new();
-    collect(&mut candidates, system);
     let mut segments = system.split(" - ");
     let maker = segments.next().unwrap_or_default();
     let names: Vec<&str> = segments.collect();
+    // The whole name, or everything after the maker, spelled as one alias
+    // (for example "Sega - Master System - Mark III").
+    let mut whole = collect(&mut candidates, system);
     if !names.is_empty() {
-        collect(&mut candidates, &names.join(" - "));
+        whole |= collect(&mut candidates, &names.join(" - "));
     }
+    let mut unknown = Vec::new();
     for segment in names {
         for part in split_names(segment) {
-            collect(&mut candidates, part);
-            collect(&mut candidates, &format!("{maker} {part}"));
+            let known = collect(&mut candidates, part)
+                | collect(&mut candidates, &format!("{maker} {part}"));
+            if !known && !whole {
+                unknown.push(part.to_string());
+            }
         }
     }
-    decide(candidates, system)
+    decide(candidates, system).map(|platform| (platform, unknown))
 }
 
 /// Splits `A + B`, `A & B` and `A / B` into separate names.
@@ -495,12 +514,15 @@ fn split_names(text: &str) -> Vec<&str> {
         .collect()
 }
 
-fn collect(candidates: &mut Vec<&'static str>, text: &str) {
-    if let Some(platform) = crate::canonical_platform_for_alias(text.trim())
-        && !candidates.contains(&platform)
-    {
+/// Adds the system `text` names exactly, if any; true when it names one.
+fn collect(candidates: &mut Vec<&'static str>, text: &str) -> bool {
+    let Some(platform) = crate::canonical_platform_for_alias(text.trim()) else {
+        return false;
+    };
+    if !candidates.contains(&platform) {
         candidates.push(platform);
     }
+    true
 }
 
 /// One system (after folding equivalents), several, or none.

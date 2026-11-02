@@ -17,7 +17,10 @@ use super::config::{
     save_dat_sources_config_if_unchanged,
 };
 use super::validation::observation_text;
-use super::{DatHealthState, DatSourceEntry, DatSourceKind, DatSourceRegistry};
+use super::{
+    DatHealthState, DatSourceEntry, DatSourceKind, DatSourceRegistry, PlatformProvenance,
+    RecognitionReceipt,
+};
 use crate::dat::catalogue_recognition::{CatalogueRecognition, recognise_catalogue, same_platform};
 
 /// How far recognition got for one catalogue.
@@ -39,7 +42,10 @@ pub enum RecognitionGroup {
     /// An ordinary game list with no system set yet. "Apply all safe
     /// matches" would set it.
     SafeMatch,
-    /// A system is set and the header disagrees. Never changed automatically.
+    /// A system is set and the current header does not back it: it names
+    /// another system, is extras or several systems for a system that was
+    /// set automatically, or names no supported game list. Never changed
+    /// automatically.
     Conflict,
     /// The right system, but extras. Only set if a person chooses to.
     Extras,
@@ -47,8 +53,9 @@ pub enum RecognitionGroup {
     Ambiguous,
     /// Not checked yet, or changed since it was checked.
     NeedsCheck,
-    /// A system is set and agrees with the header (or there is nothing to
-    /// compare it with).
+    /// A system is set and the current header backs it: an ordinary game
+    /// list for that system, or extras / one of several systems the person
+    /// chose themselves. Also a manual choice not checked yet.
     AlreadySet,
     /// Turned off by the person; left alone.
     TurnedOff,
@@ -65,9 +72,11 @@ pub struct RecognitionRow {
     pub state: RecognitionState,
     /// The system already set for it, as a display name.
     pub assigned: Option<String>,
-    /// The set system came from an applied recognised match that still
-    /// agrees with the current header.
+    /// The set system was applied from a recognised match rather than
+    /// chosen by the person. Whether the header still backs it is `group`.
     pub assigned_by_recognition: bool,
+    /// Who set the system, as saved.
+    pub origin: PlatformProvenance,
     pub group: RecognitionGroup,
 }
 
@@ -95,42 +104,15 @@ pub fn recognition_state(entry: &DatSourceEntry) -> RecognitionState {
     ))
 }
 
-/// Whether the entry's system came from an applied recognised match that
-/// the current header still supports.
-fn assigned_by_recognition(entry: &DatSourceEntry, state: &RecognitionState) -> bool {
-    let (Some(from), Some(assigned)) = (&entry.platform_recognised_from, &entry.platform) else {
-        return false;
-    };
-    let Some(header) = entry.health.current_header() else {
-        return false;
-    };
-    header.name.as_deref() == Some(from.as_str())
-        && matches!(state, RecognitionState::Recognised(recognition)
-        if recognition.safe_platform().is_some_and(|platform| {
-            crate::canonical_platform_for_alias(assigned)
-                .is_some_and(|assigned| same_platform(platform, assigned))
-        }))
+/// Whether the entry's system was applied from a recognised match, not
+/// chosen by the person.
+fn assigned_by_recognition(entry: &DatSourceEntry) -> bool {
+    entry.platform_provenance() == PlatformProvenance::AppliedFromRecognition
 }
 
 fn group(entry: &DatSourceEntry, state: &RecognitionState) -> RecognitionGroup {
-    let assigned = entry.platform.as_deref();
-    let assigned_canonical = assigned.and_then(crate::canonical_platform_for_alias);
-    if let (Some(_), RecognitionState::Recognised(recognition)) = (assigned, state) {
-        let agrees = match (assigned_canonical, recognition.platform()) {
-            (Some(set), Some(header)) => same_platform(set, header),
-            // A set system the header cannot speak to is left as chosen.
-            (_, None) => true,
-            // A set system this build does not know cannot be compared.
-            (None, Some(_)) => true,
-        };
-        return if agrees {
-            RecognitionGroup::AlreadySet
-        } else {
-            RecognitionGroup::Conflict
-        };
-    }
-    if assigned.is_some() {
-        return RecognitionGroup::AlreadySet;
+    if let Some(assigned) = entry.platform.as_deref() {
+        return assigned_group(entry, assigned, state);
     }
     if !entry.enabled {
         return RecognitionGroup::TurnedOff;
@@ -150,6 +132,54 @@ fn group(entry: &DatSourceEntry, state: &RecognitionState) -> RecognitionGroup {
     }
 }
 
+/// A catalogue that already has a system. Nothing here changes the setting;
+/// it only says whether the catalogue's current header backs it.
+///
+/// A header that names nothing usable (not a game list, several systems, an
+/// unsupported system, no name) never counts as agreeing. Extras, or one
+/// system of several the header names, back only a system the person chose;
+/// a system set automatically must still match an ordinary game list.
+fn assigned_group(
+    entry: &DatSourceEntry,
+    assigned: &str,
+    state: &RecognitionState,
+) -> RecognitionGroup {
+    let by_recognition = assigned_by_recognition(entry);
+    // Only a person's own choice may stand for extras or for one system of
+    // several; a recognised or unrecorded system must match a game list.
+    let chosen = entry.platform_provenance() == PlatformProvenance::ChosenByPerson;
+    let set = crate::canonical_platform_for_alias(assigned);
+    let names = |platform: &str| set.is_some_and(|set| same_platform(set, platform));
+    match state {
+        RecognitionState::Recognised(recognition) => {
+            let backed = match recognition {
+                CatalogueRecognition::Games { platform } => names(platform),
+                CatalogueRecognition::Extras { platform, .. } => chosen && names(platform),
+                CatalogueRecognition::Ambiguous { platforms } => {
+                    chosen && platforms.iter().any(|platform| names(platform))
+                }
+                CatalogueRecognition::SeveralSystems
+                | CatalogueRecognition::NotGames { .. }
+                | CatalogueRecognition::NotRecognised { .. }
+                | CatalogueRecognition::NoName => false,
+            };
+            if backed {
+                RecognitionGroup::AlreadySet
+            } else {
+                RecognitionGroup::Conflict
+            }
+        }
+        // Set automatically, but the header it came from is no longer
+        // current: check the catalogue again before trusting it.
+        RecognitionState::NotChecked | RecognitionState::Changed if by_recognition => {
+            RecognitionGroup::NeedsCheck
+        }
+        RecognitionState::NotChecked | RecognitionState::Changed | RecognitionState::Folder => {
+            RecognitionGroup::AlreadySet
+        }
+    }
+}
+
 /// Every registered catalogue with its recognition, sorted by group, then
 /// name.
 pub fn recognition_rows(registry: &DatSourceRegistry) -> Vec<RecognitionRow> {
@@ -162,7 +192,8 @@ pub fn recognition_rows(registry: &DatSourceRegistry) -> Vec<RecognitionRow> {
                 source_id: entry.id.clone(),
                 display_name: entry.display_name.clone(),
                 assigned: entry.platform_display(),
-                assigned_by_recognition: assigned_by_recognition(entry, &state),
+                assigned_by_recognition: assigned_by_recognition(entry),
+                origin: entry.platform_provenance(),
                 group: group(entry, &state),
                 state,
             }
@@ -256,6 +287,8 @@ pub struct AppliedMatches {
     pub registry: DatSourceRegistry,
     pub revision: DatSourcesRevision,
     pub applied: Vec<SafeMatch>,
+    /// The Undo receipt batch every applied catalogue now carries.
+    pub batch: String,
 }
 
 /// Sets the system of every catalogue in `preview`, all or nothing.
@@ -314,6 +347,9 @@ pub fn apply_safe_matches(
             return Err(stale("changed after it was checked"));
         }
     }
+    // The Undo receipt goes into the same atomic write as the systems, so
+    // there is no moment at which a system is saved without its receipt.
+    let batch = format!("{}-{}", now_unix_nanos(), expected.label());
     for item in preview {
         let health = checked
             .get(&item.source_id)
@@ -322,6 +358,11 @@ pub fn apply_safe_matches(
             entry.health = health;
             entry.platform = Some(item.platform.to_string());
             entry.platform_recognised_from = Some(item.header_name.clone());
+            entry.platform_chosen_by_person = false;
+            entry.recognition_receipt = Some(RecognitionReceipt {
+                batch: batch.clone(),
+                platform: item.platform.to_string(),
+            });
         }
     }
     let revision =
@@ -331,20 +372,92 @@ pub fn apply_safe_matches(
         registry,
         revision,
         applied: preview.to_vec(),
+        batch,
     })
 }
 
-/// Undoes an apply: clears the system of each listed catalogue whose system
-/// is still exactly the one that apply set. Anything changed since is left
-/// alone. All or nothing, under the same settings check.
-pub fn undo_applied_matches(
+fn now_unix_nanos() -> u128 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|elapsed| elapsed.as_nanos())
+        .unwrap_or_default()
+}
+
+/// Whether Undo may clear this catalogue's system: it still carries the
+/// receipt and the exact system that apply wrote, and nobody chose a system
+/// for it since (choosing one by hand drops the receipt).
+fn still_as_applied(entry: &DatSourceEntry, receipt: &RecognitionReceipt) -> bool {
+    entry.platform.as_deref() == Some(receipt.platform.as_str())
+        && entry.platform_recognised_from.is_some()
+}
+
+/// The most recent apply that Undo can still reverse, read from the saved
+/// receipts.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct UndoableApply {
+    pub batch: String,
+    /// Catalogues whose system Undo would clear, by display name.
+    pub catalogues: Vec<String>,
+}
+
+/// Orders batches by when they were applied; an unreadable time sorts first.
+fn batch_order(batch: &str) -> (u128, &str) {
+    let nanos = batch
+        .split_once('-')
+        .and_then(|(nanos, _)| nanos.parse().ok())
+        .unwrap_or_default();
+    (nanos, batch)
+}
+
+/// The latest apply with at least one catalogue still exactly as it set it.
+pub fn last_undoable_apply(registry: &DatSourceRegistry) -> Option<UndoableApply> {
+    let batch = registry
+        .entries()
+        .iter()
+        .filter_map(|entry| {
+            let receipt = entry.recognition_receipt.as_ref()?;
+            still_as_applied(entry, receipt).then_some(receipt.batch.as_str())
+        })
+        .max_by(|a, b| batch_order(a).cmp(&batch_order(b)))?
+        .to_string();
+    let catalogues = registry
+        .entries()
+        .iter()
+        .filter(|entry| {
+            entry
+                .recognition_receipt
+                .as_ref()
+                .is_some_and(|receipt| receipt.batch == batch && still_as_applied(entry, receipt))
+        })
+        .map(|entry| entry.display_name.clone())
+        .collect();
+    Some(UndoableApply { batch, catalogues })
+}
+
+/// The result of an Undo.
+#[derive(Debug, Clone)]
+pub struct UndoneApply {
+    pub registry: DatSourceRegistry,
+    pub revision: DatSourcesRevision,
+    /// Source ids whose system was cleared.
+    pub cleared: Vec<String>,
+    /// Display names of catalogues from that apply that were changed later
+    /// and so were left exactly as they are.
+    pub left_alone: Vec<String>,
+}
+
+/// Undoes the apply `batch` from its saved receipts. Works after a restart
+/// or reload because nothing is kept in memory.
+///
+/// Clears the system of each catalogue that still holds exactly what the
+/// apply wrote, and leaves every other setting and every later change alone.
+/// The receipts of that apply are removed in the same atomic, conditional
+/// write, so repeating Undo finds nothing to do and changes nothing.
+pub fn undo_apply(
     config_path: &Path,
     expected: &DatSourcesRevision,
-    applied: &[SafeMatch],
-) -> Result<AppliedMatches, ApplyRefusal> {
-    if applied.is_empty() {
-        return Err(ApplyRefusal::NothingToApply);
-    }
+    batch: &str,
+) -> Result<UndoneApply, ApplyRefusal> {
     let (config, revision) = load_dat_sources_config_with_revision(config_path)
         .map_err(|error| ApplyRefusal::Settings(DatSourcesSaveError::Failed(error)))?;
     if &revision != expected {
@@ -353,27 +466,45 @@ pub fn undo_applied_matches(
         ));
     }
     let (mut registry, _) = DatSourceRegistry::from_config(&config);
-    let mut undone = Vec::new();
-    for item in applied {
-        if let Some(entry) = registry.get_mut(&item.source_id)
-            && entry.platform.as_deref() == Some(item.platform)
-            && entry.platform_recognised_from.as_deref() == Some(item.header_name.as_str())
-        {
+    let ids: Vec<String> = registry
+        .entries()
+        .iter()
+        .filter(|entry| {
+            entry
+                .recognition_receipt
+                .as_ref()
+                .is_some_and(|receipt| receipt.batch == batch)
+        })
+        .map(|entry| entry.id.clone())
+        .collect();
+    let mut cleared = Vec::new();
+    let mut left_alone = Vec::new();
+    for id in &ids {
+        let Some(entry) = registry.get_mut(id) else {
+            continue;
+        };
+        let Some(receipt) = entry.recognition_receipt.take() else {
+            continue;
+        };
+        if still_as_applied(entry, &receipt) {
             entry.platform = None;
             entry.platform_recognised_from = None;
-            undone.push(item.clone());
+            cleared.push(id.clone());
+        } else {
+            left_alone.push(entry.display_name.clone());
         }
     }
-    if undone.is_empty() {
+    if cleared.is_empty() {
         return Err(ApplyRefusal::NothingToApply);
     }
     let revision =
         save_dat_sources_config_if_unchanged(config_path, expected, &registry.to_config())
             .map_err(ApplyRefusal::Settings)?;
-    Ok(AppliedMatches {
+    Ok(UndoneApply {
         registry,
         revision,
-        applied: undone,
+        cleared,
+        left_alone,
     })
 }
 

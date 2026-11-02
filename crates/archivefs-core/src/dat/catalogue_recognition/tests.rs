@@ -322,3 +322,54 @@ fn recognition_is_deterministic() {
         assert_eq!(no_intro(name), first);
     }
 }
+
+#[test]
+fn an_unrecognised_name_segment_is_never_ignored() {
+    // A trailing " - qualifier" that names no system could be a subset of
+    // the system's games, so it is extras, never the ordinary list.
+    for (name, platform, what) in [
+        (
+            "Nintendo - Nintendo 3DS - Digital",
+            "Nintendo 3DS",
+            "\u{201c}Digital\u{201d}",
+        ),
+        ("Sony - PlayStation 3 - Demos", "PS3", "demos"),
+        (
+            "Nintendo - Game Boy Color - Something New",
+            "Game Boy Color",
+            "\u{201c}Something New\u{201d}",
+        ),
+        (
+            "Nintendo - Nintendo 3DS - Digital (CDN)",
+            "Nintendo 3DS",
+            "digital downloads, \u{201c}Digital\u{201d}",
+        ),
+    ] {
+        let recognition = no_intro(name);
+        assert_eq!(extras(&recognition, platform), what, "{name}");
+        assert_eq!(recognition.safe_platform(), None, "{name}");
+    }
+}
+
+#[test]
+fn known_extras_qualifiers_stay_extras_and_spelled_names_stay_games() {
+    assert_eq!(
+        extras(&no_intro("Sony - PlayStation - BIOS Images"), "PSX"),
+        "BIOS files"
+    );
+    assert_eq!(
+        extras(
+            &no_intro("Nintendo - Nintendo 3DS (Digital) (CDN)"),
+            "Nintendo 3DS"
+        ),
+        "digital downloads"
+    );
+    // Every segment names the same machine, so these remain game lists.
+    for (name, platform) in [
+        ("Sega - Mega Drive - Genesis", "MegaDrive"),
+        ("Sega - Master System - Mark III", "MasterSystem"),
+        ("NEC - PC Engine - TurboGrafx-16", "PC Engine"),
+    ] {
+        assert_eq!(no_intro(name), games(platform), "{name}");
+    }
+}

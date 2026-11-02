@@ -9,7 +9,7 @@ use crate::dat::sources::config::{
     load_dat_sources_config_from, load_dat_sources_config_with_revision, save_dat_sources_config_to,
 };
 use crate::dat::sources::validation::validate_dat_source;
-use crate::dat::sources::{DatSourceEntry, DatSourceKind, DatSourceRegistry};
+use crate::dat::sources::{DatSourceEntry, DatSourceKind, DatSourceRegistry, PlatformProvenance};
 
 fn dat(header: &str) -> String {
     format!(
@@ -397,7 +397,8 @@ fn a_changed_catalogue_needs_a_new_check_and_keeps_its_applied_system() {
     // The setting is not erased, but it is no longer shown as backed by the
     // header until the catalogue is checked again.
     assert_eq!(row.assigned.as_deref(), Some("Nintendo Game Boy Color"));
-    assert!(!row.assigned_by_recognition);
+    assert!(row.assigned_by_recognition);
+    assert_eq!(row.group, RecognitionGroup::NeedsCheck);
 }
 
 #[test]
@@ -480,7 +481,9 @@ fn undo_clears_only_what_the_apply_set() {
         entry.platform = Some("Game Boy".into());
         entry.platform_recognised_from = None;
     });
-    undo_applied_matches(&setup.config, &setup.revision(), &applied.applied).unwrap();
+    let undone = undo_apply(&setup.config, &setup.revision(), &applied.batch).unwrap();
+    assert_eq!(undone.cleared, vec!["gbc".to_string()]);
+    assert_eq!(undone.left_alone, vec!["gba.dat".to_string()]);
     assert_eq!(
         platforms(&setup.registry()),
         vec![
@@ -645,5 +648,462 @@ mod verification_compatibility {
             after,
             vec![std::ffi::OsString::from("dat_sources.toml.lock")]
         );
+    }
+}
+
+/// Applies the one safe match, then replaces the catalogue with `header`
+/// and checks it again, as the page would.
+fn applied_then_replaced(header: &str) -> Setup {
+    let setup = Setup::new(&[("gb", "gb.dat", "Nintendo - Game Boy")]);
+    let preview = safe_matches(&setup.registry());
+    assert_eq!(preview.len(), 1);
+    apply_safe_matches(
+        &setup.config,
+        &setup.revision(),
+        &setup.registry(),
+        &preview,
+    )
+    .unwrap();
+    std::fs::write(setup.path("gb.dat"), dat(header)).unwrap();
+    setup.edit(|registry| validate_into(registry.get_mut("gb").unwrap()));
+    setup
+}
+
+#[test]
+fn an_applied_system_is_not_backed_by_extras_or_an_unusable_header() {
+    for header in [
+        "Nintendo - Game Boy (Private)",
+        "Nintendo - Game Boy (e-Reader)",
+        "Source Code - Nintendo - Game Boy",
+        "Totally Unknown Maker - Imaginary Console",
+        "Arcade - PC-based",
+    ] {
+        let setup = applied_then_replaced(header);
+        let registry = setup.registry();
+        let row = &recognition_rows(&registry)[0];
+        assert_eq!(row.group, RecognitionGroup::Conflict, "{header}");
+        assert!(row.assigned_by_recognition, "{header}");
+        // Nothing is changed or erased.
+        assert_eq!(
+            platforms(&registry)[0].1.as_deref(),
+            Some("Game Boy"),
+            "{header}"
+        );
+        assert!(registry.entries()[0].platform_recognised_from.is_some());
+    }
+}
+
+#[test]
+fn an_applied_system_still_backed_by_an_ordinary_list_stays_set() {
+    let setup = applied_then_replaced("Nintendo - Game Boy");
+    assert_eq!(
+        group_of(&setup.registry(), "gb"),
+        RecognitionGroup::AlreadySet
+    );
+}
+
+#[test]
+fn a_manual_choice_is_backed_only_by_a_header_that_names_it() {
+    let setup = Setup::new(&[
+        (
+            "extras",
+            "extras.dat",
+            "Nintendo - Game Boy Advance (e-Reader)",
+        ),
+        ("ibm", "ibm.dat", "IBM - PC and Compatibles (Flux)"),
+        ("ordinary", "ordinary.dat", "Nintendo - Game Boy Color"),
+        ("other", "other.dat", "Sega - Game Gear"),
+        (
+            "source",
+            "source.dat",
+            "Source Code - Nintendo - Game Boy Color",
+        ),
+        (
+            "unknown",
+            "unknown.dat",
+            "Totally Unknown Maker - Imaginary Console",
+        ),
+    ]);
+    setup.edit(|registry| {
+        for (id, platform) in [
+            ("extras", "Game Boy Advance"),
+            ("ibm", "DOS"),
+            ("ordinary", "Game Boy Color"),
+            ("other", "Game Boy Color"),
+            ("source", "Game Boy Color"),
+            ("unknown", "Game Boy Color"),
+        ] {
+            registry
+                .get_mut(id)
+                .unwrap()
+                .set_platform_by_person(Some(platform.into()));
+        }
+    });
+    let registry = setup.registry();
+    for (id, expected) in [
+        ("extras", RecognitionGroup::AlreadySet),
+        ("ibm", RecognitionGroup::AlreadySet),
+        ("ordinary", RecognitionGroup::AlreadySet),
+        ("other", RecognitionGroup::Conflict),
+        ("source", RecognitionGroup::Conflict),
+        ("unknown", RecognitionGroup::Conflict),
+    ] {
+        assert_eq!(group_of(&registry, id), expected, "{id}");
+    }
+    assert!(
+        recognition_rows(&registry)
+            .iter()
+            .all(|row| !row.assigned_by_recognition)
+    );
+}
+
+mod durable_undo {
+    use super::*;
+
+    fn apply_all(setup: &Setup) -> AppliedMatches {
+        let registry = setup.registry();
+        let preview = safe_matches(&registry);
+        assert!(!preview.is_empty());
+        apply_safe_matches(&setup.config, &setup.revision(), &registry, &preview).unwrap()
+    }
+
+    fn two_lists() -> Setup {
+        Setup::new(&[
+            ("gbc", "gbc.dat", "Nintendo - Game Boy Color"),
+            ("gba", "gba.dat", "Nintendo - Game Boy Advance"),
+        ])
+    }
+
+    #[test]
+    fn the_receipt_is_saved_in_the_same_write_as_the_systems() {
+        let setup = two_lists();
+        let before = setup.revision();
+        let applied = apply_all(&setup);
+        assert!(applied.batch.ends_with(before.label()), "{}", applied.batch);
+        // Read back from disk, as after a restart: every system set by the
+        // apply carries its receipt and the exact value written.
+        for entry in setup.registry().entries() {
+            let receipt = entry.recognition_receipt.as_ref().unwrap();
+            assert_eq!(receipt.batch, applied.batch);
+            assert_eq!(Some(receipt.platform.as_str()), entry.platform.as_deref());
+        }
+        let text = std::fs::read_to_string(&setup.config).unwrap();
+        assert_eq!(text.matches("platform_recognised_batch").count(), 2);
+    }
+
+    #[test]
+    fn undo_is_offered_and_works_after_a_restart() {
+        let setup = two_lists();
+        let applied = apply_all(&setup);
+        // Nothing from the apply is kept: start from the file alone.
+        let fresh = setup.registry();
+        let last = last_undoable_apply(&fresh).unwrap();
+        assert_eq!(last.batch, applied.batch);
+        assert_eq!(
+            last.catalogues,
+            vec!["gba.dat".to_string(), "gbc.dat".to_string()]
+        );
+        undo_apply(&setup.config, &setup.revision(), &last.batch).unwrap();
+        let after = setup.registry();
+        assert!(
+            platforms(&after)
+                .iter()
+                .all(|(_, platform)| platform.is_none())
+        );
+        assert!(
+            after
+                .entries()
+                .iter()
+                .all(|entry| entry.recognition_receipt.is_none()
+                    && entry.platform_recognised_from.is_none())
+        );
+        assert_eq!(last_undoable_apply(&after), None);
+    }
+
+    #[test]
+    fn repeating_undo_changes_nothing() {
+        let setup = two_lists();
+        let applied = apply_all(&setup);
+        undo_apply(&setup.config, &setup.revision(), &applied.batch).unwrap();
+        let saved = std::fs::read(&setup.config).unwrap();
+        assert!(matches!(
+            undo_apply(&setup.config, &setup.revision(), &applied.batch),
+            Err(ApplyRefusal::NothingToApply)
+        ));
+        assert_eq!(std::fs::read(&setup.config).unwrap(), saved);
+    }
+
+    #[test]
+    fn undo_refuses_a_stale_page_and_keeps_an_edit_made_elsewhere() {
+        let setup = two_lists();
+        let applied = apply_all(&setup);
+        let stale = setup.revision();
+        setup.edit(|registry| {
+            registry.get_mut("gbc").unwrap().display_name = "Renamed elsewhere".into();
+        });
+        let edited = std::fs::read(&setup.config).unwrap();
+        assert!(matches!(
+            undo_apply(&setup.config, &stale, &applied.batch),
+            Err(ApplyRefusal::Settings(
+                DatSourcesSaveError::ChangedElsewhere
+            ))
+        ));
+        assert_eq!(std::fs::read(&setup.config).unwrap(), edited);
+        // After reloading, Undo is still there and keeps the other edit.
+        undo_apply(&setup.config, &setup.revision(), &applied.batch).unwrap();
+        let registry = setup.registry();
+        assert_eq!(
+            registry.get("gbc").unwrap().display_name,
+            "Renamed elsewhere"
+        );
+        assert!(
+            platforms(&registry)
+                .iter()
+                .all(|(_, platform)| platform.is_none())
+        );
+    }
+
+    #[test]
+    fn undo_never_removes_a_later_choice() {
+        let setup = Setup::new(&[
+            ("gbc", "gbc.dat", "Nintendo - Game Boy Color"),
+            ("gba", "gba.dat", "Nintendo - Game Boy Advance"),
+            ("gb", "gb.dat", "Nintendo - Game Boy"),
+        ]);
+        let applied = apply_all(&setup);
+        setup.edit(|registry| {
+            // Chosen again by hand in this build: the receipt is dropped.
+            registry
+                .get_mut("gba")
+                .unwrap()
+                .set_platform_by_person(Some("Game Boy Advance".into()));
+            // Changed by a build that keeps keys it does not know: the
+            // receipt is still there, but the system is no longer the one
+            // the apply wrote.
+            registry.get_mut("gb").unwrap().platform = Some("Game Boy Color".into());
+        });
+        let undone = undo_apply(&setup.config, &setup.revision(), &applied.batch).unwrap();
+        assert_eq!(undone.cleared, vec!["gbc".to_string()]);
+        assert_eq!(undone.left_alone, vec!["gb.dat".to_string()]);
+        assert_eq!(
+            platforms(&setup.registry()),
+            vec![
+                ("gb".into(), Some("Game Boy Color".into())),
+                ("gba".into(), Some("Game Boy Advance".into())),
+                ("gbc".into(), None),
+            ]
+        );
+        assert_eq!(last_undoable_apply(&setup.registry()), None);
+    }
+
+    #[test]
+    fn a_damaged_receipt_is_never_used_and_the_setting_is_kept() {
+        let setup = Setup::new(&[("gbc", "gbc.dat", "Nintendo - Game Boy Color")]);
+        apply_all(&setup);
+        let text = std::fs::read_to_string(&setup.config).unwrap();
+        let damaged: String = text
+            .lines()
+            .filter(|line| !line.starts_with("platform_recognised_platform"))
+            .map(|line| format!("{line}\n"))
+            .collect();
+        assert_ne!(damaged, text);
+        std::fs::write(&setup.config, damaged).unwrap();
+        let registry = setup.registry();
+        assert_eq!(registry.entries()[0].recognition_receipt, None);
+        assert_eq!(
+            registry.entries()[0].platform.as_deref(),
+            Some("Game Boy Color")
+        );
+        assert_eq!(last_undoable_apply(&registry), None);
+    }
+
+    #[test]
+    fn undo_reverses_the_latest_apply_first() {
+        let setup = Setup::new(&[
+            ("gbc", "gbc.dat", "Nintendo - Game Boy Color"),
+            ("gba", "gba.dat", "Nintendo - Game Boy Advance"),
+        ]);
+        setup.edit(|registry| registry.get_mut("gba").unwrap().enabled = false);
+        let first = apply_all(&setup);
+        setup.edit(|registry| registry.get_mut("gba").unwrap().enabled = true);
+        let second = apply_all(&setup);
+        assert_ne!(first.batch, second.batch);
+        let last = last_undoable_apply(&setup.registry()).unwrap();
+        assert_eq!(last.batch, second.batch);
+        undo_apply(&setup.config, &setup.revision(), &last.batch).unwrap();
+        assert_eq!(
+            platforms(&setup.registry()),
+            vec![
+                ("gba".into(), None),
+                ("gbc".into(), Some("Game Boy Color".into()))
+            ]
+        );
+        assert_eq!(
+            last_undoable_apply(&setup.registry()).unwrap().batch,
+            first.batch
+        );
+    }
+
+    #[test]
+    fn a_refused_apply_writes_no_receipt() {
+        let setup = two_lists();
+        let registry = setup.registry();
+        let preview = safe_matches(&registry);
+        let stale = setup.revision();
+        setup.edit(|registry| registry.get_mut("gbc").unwrap().display_name = "x".into());
+        let saved = std::fs::read(&setup.config).unwrap();
+        assert!(apply_safe_matches(&setup.config, &stale, &registry, &preview).is_err());
+        assert_eq!(std::fs::read(&setup.config).unwrap(), saved);
+        assert_eq!(last_undoable_apply(&setup.registry()), None);
+    }
+}
+
+mod provenance {
+    use super::*;
+    use crate::dat::catalogue_selection::{CatalogueInventoryInputs, list_installed_catalogues};
+
+    fn origin_of(setup: &Setup, id: &str) -> PlatformProvenance {
+        setup.registry().get(id).unwrap().platform_provenance()
+    }
+
+    fn summary_origin(setup: &Setup, name: &str) -> PlatformProvenance {
+        list_installed_catalogues(CatalogueInventoryInputs {
+            local_registry: &setup.registry(),
+            managed_sources: &Default::default(),
+            managed_root: setup.dir.path(),
+            limits: DatLimits::default(),
+        })
+        .into_iter()
+        .find(|row| row.display_name == name)
+        .unwrap()
+        .platform_origin
+    }
+
+    #[test]
+    fn who_set_a_system_is_saved_and_survives_a_reload_and_a_new_check() {
+        let setup = Setup::new(&[
+            ("gbc", "gbc.dat", "Nintendo - Game Boy Color"),
+            ("gba", "gba.dat", "Nintendo - Game Boy Advance (e-Reader)"),
+        ]);
+        assert_eq!(origin_of(&setup, "gbc"), PlatformProvenance::NotSet);
+        setup.edit(|registry| {
+            registry
+                .get_mut("gba")
+                .unwrap()
+                .set_platform_by_person(Some("Game Boy Advance".into()));
+        });
+        let registry = setup.registry();
+        apply_safe_matches(
+            &setup.config,
+            &setup.revision(),
+            &registry,
+            &safe_matches(&registry),
+        )
+        .unwrap();
+        // Read back from disk (as after a restart or Reload setup) and again
+        // after both catalogues are checked once more.
+        for _ in 0..2 {
+            assert_eq!(origin_of(&setup, "gba"), PlatformProvenance::ChosenByPerson);
+            assert_eq!(
+                origin_of(&setup, "gbc"),
+                PlatformProvenance::AppliedFromRecognition
+            );
+            assert_eq!(
+                summary_origin(&setup, "gba.dat"),
+                PlatformProvenance::ChosenByPerson
+            );
+            assert_eq!(
+                summary_origin(&setup, "gbc.dat"),
+                PlatformProvenance::AppliedFromRecognition
+            );
+            setup.edit(|registry| {
+                validate_into(registry.get_mut("gba").unwrap());
+                validate_into(registry.get_mut("gbc").unwrap());
+            });
+        }
+        let text = std::fs::read_to_string(&setup.config).unwrap();
+        assert_eq!(text.matches("platform_set_by = \"person\"").count(), 1);
+    }
+
+    #[test]
+    fn choosing_by_hand_replaces_a_recognised_origin_and_undo_clears_it() {
+        let setup = Setup::new(&[("gbc", "gbc.dat", "Nintendo - Game Boy Color")]);
+        let registry = setup.registry();
+        let applied = apply_safe_matches(
+            &setup.config,
+            &setup.revision(),
+            &registry,
+            &safe_matches(&registry),
+        )
+        .unwrap();
+        undo_apply(&setup.config, &setup.revision(), &applied.batch).unwrap();
+        assert_eq!(origin_of(&setup, "gbc"), PlatformProvenance::NotSet);
+        assert_eq!(
+            summary_origin(&setup, "gbc.dat"),
+            PlatformProvenance::NotSet
+        );
+
+        let registry = setup.registry();
+        apply_safe_matches(
+            &setup.config,
+            &setup.revision(),
+            &registry,
+            &safe_matches(&registry),
+        )
+        .unwrap();
+        setup.edit(|registry| {
+            registry
+                .get_mut("gbc")
+                .unwrap()
+                .set_platform_by_person(Some("Game Boy Color".into()));
+        });
+        assert_eq!(origin_of(&setup, "gbc"), PlatformProvenance::ChosenByPerson);
+        assert_eq!(last_undoable_apply(&setup.registry()), None);
+    }
+
+    #[test]
+    fn an_older_assignment_is_unrecorded_never_guessed() {
+        let setup = Setup::new(&[
+            (
+                "ereader",
+                "ereader.dat",
+                "Nintendo - Game Boy Advance (e-Reader)",
+            ),
+            ("gbc", "gbc.dat", "Nintendo - Game Boy Color"),
+        ]);
+        // Written as an older build would: a system and nothing else.
+        setup.edit(|registry| {
+            registry.get_mut("ereader").unwrap().platform = Some("Game Boy Advance".into());
+            registry.get_mut("gbc").unwrap().platform = Some("Game Boy Color".into());
+        });
+        assert_eq!(origin_of(&setup, "ereader"), PlatformProvenance::Unrecorded);
+        assert_eq!(
+            summary_origin(&setup, "gbc.dat"),
+            PlatformProvenance::Unrecorded
+        );
+        let registry = setup.registry();
+        // Extras never count as backing a system nobody recorded choosing.
+        assert_eq!(group_of(&registry, "ereader"), RecognitionGroup::Conflict);
+        assert_eq!(group_of(&registry, "gbc"), RecognitionGroup::AlreadySet);
+        // It is not a recognised apply, so there is nothing to undo.
+        assert_eq!(last_undoable_apply(&registry), None);
+        assert!(safe_matches(&registry).is_empty());
+    }
+
+    #[test]
+    fn a_system_changed_by_a_build_that_does_not_record_provenance_is_unrecorded() {
+        let setup = Setup::new(&[("gb", "gb.dat", "Nintendo - Game Boy")]);
+        let registry = setup.registry();
+        apply_safe_matches(
+            &setup.config,
+            &setup.revision(),
+            &registry,
+            &safe_matches(&registry),
+        )
+        .unwrap();
+        setup.edit(|registry| {
+            registry.get_mut("gb").unwrap().platform = Some("Game Boy Color".into());
+        });
+        assert_eq!(origin_of(&setup, "gb"), PlatformProvenance::Unrecorded);
     }
 }

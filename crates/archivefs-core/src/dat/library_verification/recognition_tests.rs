@@ -10,6 +10,28 @@ const PLATFORM_REFUSAL: &str =
 /// The preview's answer for a catalogue with `header`, optionally set to
 /// `assigned` by the person, checked for `platform`.
 fn preview_for(header: &str, assigned: Option<&str>, platform: &str) -> Result<(), String> {
+    preview_with(header, assigned, false, platform)
+}
+
+fn preview_with(
+    header: &str,
+    assigned: Option<&str>,
+    recognised: bool,
+    platform: &str,
+) -> Result<(), String> {
+    preview_full(header, assigned, recognised, false, platform)
+}
+
+/// As [`preview_for`], with the assignment marked as applied from a
+/// recognised header (`recognised`), or saved with no record of who set it
+/// (`unrecorded`), rather than chosen by the person.
+fn preview_full(
+    header: &str,
+    assigned: Option<&str>,
+    recognised: bool,
+    unrecorded: bool,
+    platform: &str,
+) -> Result<(), String> {
     let dir = tempfile::tempdir().unwrap();
     let db = dir.path().join("library.sqlite3");
     Database::open_or_create(&db).unwrap();
@@ -24,7 +46,16 @@ fn preview_for(header: &str, assigned: Option<&str>, platform: &str) -> Result<(
     )
     .unwrap();
     let mut entry = DatSourceEntry::new("c".into(), "c".into(), dat, DatSourceKind::File);
-    entry.platform = assigned.map(str::to_string);
+    if recognised {
+        entry.platform = assigned.map(str::to_string);
+        entry.platform_recognised_from = Some(header.to_string());
+    } else {
+        entry.set_platform_by_person(assigned.map(str::to_string));
+    }
+    if unrecorded {
+        // As an older build saved it: a system with no record of who set it.
+        entry.platform_chosen_by_person = false;
+    }
     let mut registry = DatSourceRegistry::default();
     registry.add(entry).unwrap();
     let resolved = resolve_catalogue(
@@ -129,4 +160,70 @@ fn multi_system_catalogues_are_refused() {
         Some("Arcade"),
         "Arcade"
     )));
+}
+
+#[test]
+fn a_system_applied_from_recognition_never_vouches_for_extras_or_ambiguity() {
+    // The catalogue was replaced after its system was applied automatically.
+    for (header, platform) in [
+        ("Nintendo - Game Boy (Private)", "Game Boy"),
+        ("Nintendo - Game Boy Advance (e-Reader)", "Game Boy Advance"),
+        ("IBM - PC and Compatibles (Flux)", "DOS"),
+        ("Source Code - Nintendo - Game Boy", "Game Boy"),
+    ] {
+        assert!(
+            preview_with(header, Some(platform), true, platform).is_err(),
+            "{header}"
+        );
+    }
+    // An ordinary game list still counts, whoever set the system.
+    assert!(preview_with("Nintendo - Game Boy", Some("Game Boy"), true, "Game Boy").is_ok());
+    // The person choosing the same extras themselves is still accepted.
+    assert!(
+        preview_with(
+            "Nintendo - Game Boy Advance (e-Reader)",
+            Some("Game Boy Advance"),
+            false,
+            "Game Boy Advance"
+        )
+        .is_ok()
+    );
+}
+
+#[test]
+fn an_unrecognised_name_segment_is_not_an_ordinary_list_for_verification() {
+    assert!(preview_for("Nintendo - Nintendo 3DS - Digital", None, "Nintendo 3DS").is_err());
+    assert!(
+        preview_for(
+            "Nintendo - Nintendo 3DS - Digital",
+            Some("Nintendo 3DS"),
+            "Nintendo 3DS"
+        )
+        .is_ok()
+    );
+}
+
+#[test]
+fn a_system_with_no_record_of_who_set_it_is_treated_strictly() {
+    // An ordinary game list is still accepted, as before.
+    assert!(
+        preview_full(
+            "Nintendo - Game Boy",
+            Some("Game Boy"),
+            false,
+            true,
+            "Game Boy"
+        )
+        .is_ok()
+    );
+    // But it never vouches for extras or for one of several systems.
+    for (header, platform) in [
+        ("Nintendo - Game Boy Advance (e-Reader)", "Game Boy Advance"),
+        ("IBM - PC and Compatibles (Flux)", "DOS"),
+    ] {
+        assert!(
+            preview_full(header, Some(platform), false, true, platform).is_err(),
+            "{header}"
+        );
+    }
 }
