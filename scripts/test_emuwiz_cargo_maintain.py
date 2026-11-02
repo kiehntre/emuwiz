@@ -108,6 +108,18 @@ class MaintBase(R.Base):
                 os.path.join(t, "debug", "UNKNOWN.txt"),
                 os.path.join(t, "debug", ".cargo-lock")]
 
+    def evidence_paths(self, t):
+        """The preserved paths the gate permits: everything except the stray file."""
+        return [p for p in self.preserved_paths(t) if not p.endswith("UNKNOWN.txt")]
+
+    def review_unrecognised(self, wt, t, m=None):
+        """The fixture leaves a stray debug/UNKNOWN.txt that retirement does not
+        recognise. The gate must HOLD on it (UNRECOGNISED_RESIDUE) until the owner
+        has reviewed and removed it; this is that review."""
+        g = (m or self.m).worktree_gate(wt)
+        self.assertEqual((g["status"], g["code"]), ("HOLD", "UNRECOGNISED_RESIDUE"), g)
+        os.unlink(os.path.join(t, "debug", "UNKNOWN.txt"))
+
 
 class Lifecycle(MaintBase):
     def test_two_agents_release_one_retire_it_and_keep_the_other(self):
@@ -571,10 +583,11 @@ class WorktreeOrdering(MaintBase):
         self.assertFalse(os.path.exists(os.path.join(t, "debug", "deps", "libx.rlib")))
         # restart: a fresh process reads the same state and the gate is CLEAR with a verified receipt
         m2 = load_maintain()
+        self.review_unrecognised(wt, t, m2)
         g = self.gate(wt, m2)
         self.assertEqual(g["status"], "CLEAR", g)
         self.assertIn("receipt verified", g["explanation"])
-        for p in self.preserved_paths(t):
+        for p in self.evidence_paths(t):
             self.assertTrue(os.path.exists(p), p)
         r = subprocess.run([sys.executable, MAINTAIN, "worktree-check", wt], env=self.env,
                            capture_output=True, text=True)
@@ -665,6 +678,7 @@ class WorktreeOrdering(MaintBase):
         self.age_record(t2, 10)
         self.approve()
         self.retire_cycle()
+        self.review_unrecognised(wt2, t2)
         self.assertEqual(self.gate(wt2)["status"], "CLEAR")
         cyc = self.last_cycle()
         os.rename(cyc["journal"], cyc["journal"] + ".moved")
@@ -678,6 +692,186 @@ class WorktreeOrdering(MaintBase):
         post = open(os.path.join(HERE, "task-postcheck.sh")).read()
         self.assertIn("--finish-task", post)
 
+
+
+class UnrecognisedResidue(MaintBase):
+    """worktree-check is CLEAR only when the cache holds nothing but permitted
+    content. Output the retirement tool cannot recognise (a standalone executable
+    with no sibling .d, a stray file, nested residue, a symlink) would be orphaned
+    once the worktree is gone, so it must HOLD with UNRECOGNISED_RESIDUE. The check
+    is read-only and shared by the plain and --cargo-state-only paths."""
+
+    def retire_cycle(self):
+        self.full_census()
+        self.call("run")
+
+    def retired(self, name):
+        wt, t = self.managed_cache(name, age_days=10)
+        self.finish(wt)
+        self.age(t, 10)
+        self.age_record(t, 10)
+        self.approve()
+        self.retire_cycle()
+        self.assertEqual(self.last_cycle()["outcome"], "RETIRED")
+        # the fixture's stray UNKNOWN.txt is itself residue; start from permitted content only
+        self.review_unrecognised(wt, t)
+        g = self.m.worktree_gate(wt)
+        self.assertEqual((g["status"], g["code"]), ("CLEAR", "CLEAR"), g)
+        return wt, t
+
+    def checks(self, wt):
+        """(plain, cargo-state-only) results through the real CLI entry point."""
+        results = []
+        for extra in ((), ("--cargo-state-only",)):
+            rc, out = self.call("worktree-check", "--json", *extra, wt)
+            data = json.loads(out)
+            self.assertEqual(rc == 0, data["status"] == "CLEAR", (rc, data))
+            if data["status"] != "CLEAR":
+                self.assertEqual(rc, self.m.EXIT_WORKTREE_HOLD)
+            results.append(data)
+        return results
+
+    def assert_residue(self, wt, needle):
+        for data in self.checks(wt) + [self.m.worktree_gate(wt), load_maintain().lifecycle_gate(wt)]:
+            self.assertEqual((data["status"], data["code"]), ("HOLD", "UNRECOGNISED_RESIDUE"), data)
+            self.assertGreaterEqual(data["residue"]["items"], 1)
+            self.assertIn(needle, " ".join(data["residue"]["examples"]), data)
+            self.assertIn("Keep the worktree", data["explanation"])
+
+    def assert_clear(self, wt):
+        for data in self.checks(wt) + [self.m.worktree_gate(wt)]:
+            self.assertEqual((data["status"], data["code"]), ("CLEAR", "CLEAR"), data)
+            self.assertIn("receipt verified", data["explanation"])
+
+    def snapshot(self, root):
+        rows = []
+        for dirpath, dirs, files in os.walk(root):
+            for name in sorted(dirs + files):
+                path = os.path.join(dirpath, name)
+                st = os.lstat(path)
+                rows.append((path, st.st_mode, st.st_size, st.st_mtime_ns, st.st_ino))
+        return sorted(rows)
+
+    def test_permitted_content_stays_clear(self):
+        wt, t = self.retired("resid-ok")
+        self.assert_clear(wt)
+        debug = os.path.join(t, "debug")
+        # empty directories at any depth, empty lock files and preserved-evidence directories
+        os.makedirs(os.path.join(debug, "a", "b", "c"))
+        os.makedirs(os.path.join(t, "tmp"))
+        for lock in (".cargo-build-lock", ".cargo-artifact-lock"):
+            open(os.path.join(debug, lock), "wb").close()
+        for evidence in (os.path.join(t, "tmp", "scratch.bin"),
+                         os.path.join(t, "receipts", "r.json"),
+                         os.path.join(debug, "emuwiz-test-env", "profile", "extra.sqlite")):
+            os.makedirs(os.path.dirname(evidence), exist_ok=True)
+            with open(evidence, "wb") as handle:
+                handle.write(b"evidence")
+        self.assert_clear(wt)
+        for p in self.evidence_paths(t):
+            self.assertTrue(os.path.exists(p), p)
+
+    def test_each_kind_of_residue_holds_and_clears_when_removed(self):
+        wt, t = self.retired("resid-kinds")
+        debug = os.path.join(t, "debug")
+        elf = b"\x7fELF\x02\x01\x01" + b"\0" * 4096
+
+        def write(path, data=b"x", mode=0o644):
+            os.makedirs(os.path.dirname(path), exist_ok=True)
+            with open(path, "wb") as handle:
+                handle.write(data)
+            os.chmod(path, mode)
+            return lambda: os.unlink(path)
+
+        def symlink(target_path, path):
+            os.symlink(target_path, path)
+            return lambda: os.unlink(path)
+
+        def fifo(path):
+            os.mkfifo(path)
+            return lambda: os.unlink(path)
+
+        def unreadable(path):
+            os.makedirs(path)
+            os.chmod(path, 0)
+            def undo():
+                os.chmod(path, 0o755)
+                os.rmdir(path)
+            return undo
+
+        cases = {
+            "standalone ELF, no sibling .d": (lambda: write(os.path.join(debug, "archivefs-gui"), elf, 0o755), "archivefs-gui"),
+            "executable that is not an ELF": (lambda: write(os.path.join(debug, "helper.sh"), b"#!/bin/sh\n", 0o755), "helper.sh"),
+            "second ELF alias": (lambda: write(os.path.join(debug, "emuwiz-v2"), elf, 0o755), "emuwiz-v2"),
+            "unrecognised file at the cache root": (lambda: write(os.path.join(t, "stray.txt")), "stray.txt"),
+            "unrecognised file beside the lock files": (lambda: write(os.path.join(debug, "notes.txt")), "notes.txt"),
+            "nested residue": (lambda: write(os.path.join(debug, "x", "y", "z", "blob.bin")), "blob.bin"),
+            "evidence name too deep to be permitted": (lambda: write(os.path.join(debug, "a", "b", "c", "tmp", "f")), "f"),
+            "dangling symlink": (lambda: symlink("/nonexistent-target", os.path.join(debug, "dangling")), "dangling"),
+            "symlink to a real file": (lambda: symlink("/etc/hostname", os.path.join(debug, "link")), "link"),
+            "non-empty lock file": (lambda: write(os.path.join(debug, ".cargo-artifact-lock"), b"data"), ".cargo-artifact-lock"),
+            "named pipe": (lambda: fifo(os.path.join(debug, "pipe")), "pipe"),
+            "unreadable directory": (lambda: unreadable(os.path.join(debug, "locked")), "locked"),
+        }
+        for label, (plant, needle) in cases.items():
+            with self.subTest(label):
+                undo = plant()
+                self.assert_residue(wt, needle)
+                undo()
+                self.assert_clear(wt)
+
+    def test_the_standalone_executable_case_the_real_orphans_had(self):
+        # Several 373 MB executables with different names and no .d, as left in real caches.
+        wt, t = self.retired("resid-real")
+        for name in ("archivefs-gui", "emuwiz", "emuwiz-gui", "emuwiz-v2"):
+            path = os.path.join(t, "debug", name)
+            with open(path, "wb") as handle:
+                handle.write(b"\x7fELF" + b"\0" * 1_000_000)
+            os.chmod(path, 0o755)
+        gate = self.m.worktree_gate(wt)
+        self.assertEqual(gate["code"], "UNRECOGNISED_RESIDUE")
+        self.assertEqual(gate["residue"]["items"], 4)
+        self.assertGreater(gate["residue"]["bytes"], 4_000_000)
+        self.assertIn("4 item(s)", gate["explanation"])
+
+    def test_check_is_read_only_and_repeatable_after_restart(self):
+        wt, t = self.retired("resid-ro")
+        path = os.path.join(t, "debug", "archivefs-gui")
+        with open(path, "wb") as handle:
+            handle.write(b"\x7fELF" + b"\0" * 512)
+        os.chmod(path, 0o755)
+        before = self.snapshot(t)
+        first = self.m.worktree_gate(wt)
+        self.checks(wt)
+        second = load_maintain().worktree_gate(wt)
+        self.assertEqual(self.snapshot(t), before)
+        self.assertEqual((first["code"], first["residue"]), (second["code"], second["residue"]))
+        self.assertTrue(os.path.exists(path))
+
+    def test_earlier_protections_keep_their_own_reasons(self):
+        # unreleased cache with compiler output: residue must not mask the lifecycle reason
+        wt, t = self.managed_cache("resid-unreleased", age_days=10)
+        with open(os.path.join(t, "debug", "archivefs-gui"), "wb") as handle:
+            handle.write(b"\x7fELF")
+        os.chmod(os.path.join(t, "debug", "archivefs-gui"), 0o755)
+        self.assertEqual(self.m.worktree_gate(wt)["code"], "NOT_RELEASED")
+        # a retired cache whose receipt was removed keeps RECEIPT_UNVERIFIED
+        wt2, t2 = self.retired("resid-tamper")
+        with open(os.path.join(t2, "debug", "archivefs-gui"), "wb") as handle:
+            handle.write(b"\x7fELF")
+        cycle = self.last_cycle()
+        os.rename(cycle["journal"], cycle["journal"] + ".moved")
+        self.assertEqual(self.m.worktree_gate(wt2)["code"], "RECEIPT_UNVERIFIED")
+        # no cache, and an empty cache, are still CLEAR
+        self.assertEqual(self.m.worktree_gate(self.worktree("resid-nothing"))["status"], "CLEAR")
+
+    def test_no_new_deletion_capability(self):
+        with open(MAINTAIN) as handle:
+            src = handle.read()
+        start = src.index("def unrecognised_residue")
+        body = src[start:src.index("def lifecycle_gate")]
+        for banned in ("rmtree", "os.remove", "os.unlink", "os.rmdir", "os.rename", "shutil", "unlinkat", "os.open(", "write("):
+            self.assertNotIn(banned, body)
 
 
 class DebugModeAcrossRetirement(MaintBase):
@@ -737,11 +931,14 @@ class DebugModeAcrossRetirement(MaintBase):
         self.retire_cycle()
         self.assertEqual(self.last_cycle()["outcome"], "RETIRED")
         self.assertTrue(os.listdir(t))                       # evidence remains: not empty
+        # unrecognised residue holds the gate, so the target is not "fresh" yet
+        self.assertEqual((self.build(wt)[0], self.recorded(t)), ("unset", "full"))
+        self.review_unrecognised(wt, t)
         self.assertEqual(self.gate(wt)["status"], "CLEAR")
         mode, err = self.build(wt)
         self.assertEqual((mode, self.recorded(t)), ("0", "low"))
         self.assertIn("changes from full to low", err)
-        for p in self.preserved_paths(t):
+        for p in self.evidence_paths(t):
             self.assertTrue(os.path.exists(p), p)
 
     def test_partially_retired_target_is_not_fresh(self):
