@@ -41,6 +41,8 @@ const SIDE_BY_SIDE_MIN_WIDTH: f32 = 1100.0;
 /// Narrowest the Library search field is allowed to become before the
 /// List/Grid switch moves to its own row.
 const SEARCH_MIN_WIDTH: f32 = 140.0;
+/// The button at the end of the systems row that opens the Surprise Me picker.
+pub(super) const SURPRISE_ME: &str = "Surprise me";
 /// Below this height the selected-game panel uses the compact cover so Play
 /// stays beside it instead of below a tall picture.
 const TIGHT_PANEL_HEIGHT: f32 = 440.0;
@@ -85,7 +87,7 @@ pub(super) struct BrowsePlayState {
     settling: Option<(i64, f64)>,
     /// Games whose readiness check has finished positive. Filled only by the
     /// selection check; the Ready view never plans launches in bulk.
-    readiness: ReadinessCache,
+    pub(super) readiness: ReadinessCache,
     /// The readiness view of `indices`, rebuilt only when the base list or
     /// the cache changes: (base list address, cache version, filter, result).
     readiness_view: Option<ReadinessView>,
@@ -100,6 +102,8 @@ pub(super) struct BrowsePlayState {
     /// Ids drawn this frame / last frame, nearest the top first.
     visible_now: Vec<i64>,
     visible: Vec<i64>,
+    /// The Surprise Me picker's filter, seeded generator and current pick.
+    pub(super) surprise: super::surprise_me::SurpriseState,
 }
 
 impl BrowsePlayState {
@@ -410,6 +414,7 @@ impl App {
             self.browse_play_games(ui, &library, &indices, selected_id);
         }
         self.browse_play_batch_window(ui.ctx());
+        self.surprise_me_window(ui.ctx());
     }
 
     fn browse_play_batch_controls(&mut self, ui: &mut egui::Ui, library: &super::library::Library) {
@@ -748,6 +753,16 @@ impl App {
         }
     }
 
+    fn browse_play_surprise_button(&mut self, ui: &mut egui::Ui) {
+        if ui
+            .button(SURPRISE_ME)
+            .on_hover_text("Pick a random game from your library")
+            .clicked()
+        {
+            self.open_surprise_me();
+        }
+    }
+
     fn browse_play_selection_toggle(&mut self, ui: &mut egui::Ui) {
         if ui
             .button(if self.batch_selecting {
@@ -824,6 +839,7 @@ impl App {
                         }
                     });
             }
+            self.browse_play_surprise_button(ui);
         });
         if let Some(platform) = chosen {
             self.filter.select_platform(platform);
@@ -1437,6 +1453,7 @@ impl App {
         if details {
             this.go(Route::Game(id));
         }
+        this.surprise_retry_offer(ui, game);
         if !game.is_preservation_only() && !tight && theme::blue_profile(ui) {
             ui.add(
                 egui::Label::new(
