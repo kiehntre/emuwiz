@@ -844,6 +844,8 @@ pub(super) struct Detail {
     pub saved_checks: usize,
     pub installed: Vec<String>,
     pub technical: String,
+    /// Region and catalogue from a saved exact DAT match of this same file.
+    pub dat_region: Option<(String, String)>,
 }
 
 impl Detail {

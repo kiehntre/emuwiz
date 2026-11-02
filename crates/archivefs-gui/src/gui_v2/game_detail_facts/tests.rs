@@ -1,7 +1,7 @@
 use super::*;
-use crate::{
-    gui_v2::launch_readiness_summary::{self, EmulatorSummary},
-    multidisc_launch_view::{DiscGuidance, DiscRow},
+use crate::gui_v2::{
+    launch_readiness_summary::{self, EmulatorSummary},
+    library::Library,
 };
 use archivefs_core::PersistedArchive;
 use std::path::PathBuf;
@@ -154,24 +154,195 @@ fn file_state_is_unknown_until_it_has_been_checked() {
     assert_eq!(row.tone, Tone::Warning);
 }
 
+fn region_of(game: &Game, sources: Sources<'_>) -> Fact {
+    fact(&facts(game, sources), "Region")
+}
+
+fn checked_sources(found: &Detail) -> Sources<'_> {
+    Sources {
+        detail: Some(found),
+        region_checked: true,
+        ..Sources::default()
+    }
+}
+
 #[test]
-fn a_file_name_never_becomes_a_region() {
+fn saved_metadata_outranks_a_verified_dat_match_and_the_file_name() {
     let game = game("/roms/Fixture (USA).iso", "iso");
-    let checking = fact(&facts(&game, Sources::default()), "Region");
-    assert_eq!(checking.value, CHECKING);
-    let checked = Sources {
-        region_checked: true,
-        ..Sources::default()
-    };
-    assert_eq!(fact(&facts(&game, checked), "Region").value, NOT_RECORDED);
-    let sourced = Sources {
-        region: Some(("Europe", "ScreenScraper (saved record)")),
-        region_checked: true,
-        ..Sources::default()
-    };
-    let row = fact(&facts(&game, sourced), "Region");
+    let found = detail(true, true, &[]);
+    let row = region_of(
+        &game,
+        Sources {
+            region: Some(("Europe", "ScreenScraper (saved record)")),
+            dat_region: Some(("Japan", "No-Intro: Fixture")),
+            ..checked_sources(&found)
+        },
+    );
     assert_eq!(row.value, "Europe");
     assert_eq!(row.note.unwrap(), "From ScreenScraper (saved record)");
+}
+
+#[test]
+fn a_verified_dat_match_outranks_the_file_name_and_is_not_called_a_hint() {
+    let game = game("/roms/Fixture (USA).iso", "iso");
+    let found = detail(true, true, &[]);
+    let row = region_of(
+        &game,
+        Sources {
+            dat_region: Some(("Japan", "No-Intro: Fixture")),
+            dat_current: true,
+            ..checked_sources(&found)
+        },
+    );
+    assert_eq!(row.value, "Japan");
+    assert_eq!(
+        row.note.unwrap(),
+        "From the verified match in No-Intro: Fixture"
+    );
+}
+
+#[test]
+fn a_saved_match_that_is_not_current_never_reads_as_verified() {
+    let game = game("/roms/Fixture (NA).iso", "iso");
+    let found = detail(true, true, &[]);
+    let row = region_of(
+        &game,
+        Sources {
+            dat_region: Some(("USA, Europe", "No-Intro: Fixture")),
+            ..checked_sources(&found)
+        },
+    );
+    assert_eq!(row.value, "USA, Europe");
+    let note = row.note.unwrap();
+    assert!(note.contains("Needs a recheck"), "{note}");
+    assert!(!note.contains("verified"), "{note}");
+}
+
+#[test]
+fn a_filename_hint_says_so_in_the_value_and_the_note() {
+    let game = game("/roms/Fixture (USA).iso", "iso");
+    let found = detail(true, true, &[]);
+    let row = region_of(&game, checked_sources(&found));
+    assert_eq!(row.value, "USA (filename hint)");
+    assert!(row.note.unwrap().contains("Not verified"));
+    assert_eq!(row.tone, Tone::Plain);
+}
+
+#[test]
+fn no_hint_appears_before_saved_evidence_has_been_read() {
+    let game = game("/roms/Fixture (USA).iso", "iso");
+    assert_eq!(region_of(&game, Sources::default()).value, CHECKING);
+    let waiting = Sources {
+        region_checked: true,
+        ..Sources::default()
+    };
+    assert_eq!(region_of(&game, waiting).value, CHECKING);
+    let failed = Sources {
+        detail_failed: true,
+        ..waiting
+    };
+    assert_eq!(region_of(&game, failed).value, "USA (filename hint)");
+}
+
+#[test]
+fn unknown_regions_stay_not_recorded() {
+    let found = detail(true, true, &[]);
+    for path in [
+        "/roms/Fixture.iso",
+        "/roms/sf2.zip",
+        "/roms/Fixture (Beta).iso",
+    ] {
+        let row = region_of(&game(path, "iso"), checked_sources(&found));
+        assert_eq!(row.value, NOT_RECORDED, "{path}");
+    }
+}
+
+#[test]
+fn unambiguous_tags_give_a_hint() {
+    for (name, wanted) in [
+        ("Game (USA).iso", "USA"),
+        ("Game (Europe).chd", "Europe"),
+        ("Game (Japan).7z", "Japan"),
+        ("Game (USA, Europe).zip", "USA, Europe"),
+        ("Game (Europe) (En,Fr,De,Es).chd", "Europe"),
+        ("Game (United Kingdom) (v5.12A).zip", "United Kingdom"),
+        ("Game (Japan) (Rev 1) [!].iso", "Japan"),
+    ] {
+        assert_eq!(
+            filename_region_hint(std::path::Path::new(name)).as_deref(),
+            Some(wanted),
+            "{name}"
+        );
+    }
+}
+
+#[test]
+fn ambiguous_or_unrelated_text_gives_no_hint() {
+    for name in [
+        // Abbreviations and codes.
+        "Game (U).iso",
+        "Game (E).iso",
+        "Game (J).iso",
+        "Game (UE).iso",
+        "Game (JP).iso",
+        "Game (UK).iso",
+        "Game [USA].iso",
+        // Different spelling or case is not the tag.
+        "Game (usa).iso",
+        "Game (Japanese).iso",
+        // Languages and part-region groups.
+        "Game (En,Ja).iso",
+        "Game (USA, Beta).iso",
+        // Title text.
+        "Escape from Japan.iso",
+        "Europe Racer.iso",
+        "Game (Japan Edition).iso",
+        // More than one different tag, or nothing before it.
+        "Game (USA) (Europe).iso",
+        "Trip to (Japan) Land (USA).iso",
+        "(USA) Game.iso",
+        "(USA).iso",
+        // Unbalanced.
+        "Game (USA.iso",
+    ] {
+        assert_eq!(
+            filename_region_hint(std::path::Path::new(name)),
+            None,
+            "{name}"
+        );
+    }
+}
+
+#[test]
+fn folders_never_supply_a_hint() {
+    assert_eq!(
+        filename_region_hint(std::path::Path::new("/roms/Game (USA)/disc.iso")),
+        None
+    );
+    let found = detail(true, true, &[]);
+    let folder = game(
+        "/roms/Game (USA)",
+        ArchiveKind::ScummVmDirectory.storage_name(),
+    );
+    assert_eq!(
+        region_of(&folder, checked_sources(&found)).value,
+        NOT_RECORDED
+    );
+}
+
+#[test]
+fn each_disc_of_a_set_reads_its_own_name() {
+    for name in ["Game (Europe) (Disc 1).chd", "Game (Disc 2) (Europe).chd"] {
+        assert_eq!(
+            filename_region_hint(std::path::Path::new(name)).as_deref(),
+            Some("Europe"),
+            "{name}"
+        );
+    }
+    assert_eq!(
+        filename_region_hint(std::path::Path::new("Game (Disc 1).chd")),
+        None
+    );
 }
 
 #[test]
@@ -345,51 +516,77 @@ fn preservation_only_media_has_no_emulator_row() {
     assert!(rows.iter().all(|row| row.label != "Emulator"));
 }
 
-fn guidance(discs: Vec<DiscRow>) -> DiscGuidance {
-    DiscGuidance {
-        headline: "3-disc game · order not verified".into(),
-        order_verified: false,
-        discs,
-        next_discs: vec![],
-        missing_media: vec![],
-        conflicts: vec![],
-        provenance: vec![],
-        selected_launch_disc: None,
-        problems: vec![],
-        launch: None,
-    }
-}
-
-fn row(label: &str, path: Option<&str>, this_entry: bool) -> DiscRow {
-    DiscRow {
-        label: label.into(),
-        path: path.map(PathBuf::from),
-        this_entry,
-        start: false,
-    }
+fn disc_entry(id: i64, folder: &std::path::Path, name: &str) -> PersistedArchive {
+    let path = folder.join(name);
+    std::fs::write(&path, b"disc").unwrap();
+    let mut entry = archive(id, path.to_str().unwrap(), "direct_game_image");
+    entry.display_name = name.rsplit_once('.').unwrap().0.into();
+    entry
 }
 
 #[test]
-fn links_lead_only_to_other_discs_with_their_own_library_entry() {
+fn only_an_entry_that_names_a_disc_starts_a_lookup_and_only_once() {
     let library = std::sync::Arc::new(Library::new(vec![
-        archive(1, "/roms/Fixture 1.iso", "iso"),
-        archive(2, "/roms/Fixture 2.iso", "iso"),
+        archive(1, "/roms/Fixture.iso", "iso"),
+        {
+            let mut disc = archive(2, "/roms/Fixture (Disc 1).iso", "iso");
+            disc.display_name = "Fixture (Disc 1)".into();
+            disc
+        },
     ]));
-    let set = guidance(vec![
-        row("Disc 1", Some("/roms/Fixture 1.iso"), true),
-        row("Disc 2", Some("/roms/Fixture 2.iso"), false),
-        row("Disc 3", None, false),
-        row("Disc 4", Some("/roms/Not in the library.iso"), false),
-    ]);
     let mut state = State::default();
-    assert!(state.note_discs(1, &library, &set));
-    let summary = state.discs_for(1, &library).unwrap();
-    assert_eq!(summary.links, vec![("Disc 2".to_string(), 2)]);
-    assert_eq!(summary.headline, set.headline);
-    assert!(state.discs_for(2, &library).is_none());
-    assert!(!state.note_discs(1, &library, &set));
+    assert!(!state.should_look_up(library.game(1).unwrap(), &library));
+    assert!(state.should_look_up(library.game(2).unwrap(), &library));
+    assert!(!state.should_look_up(library.game(2).unwrap(), &library));
+    let reloaded = std::sync::Arc::new(Library::new(vec![{
+        let mut disc = archive(2, "/roms/Fixture (Disc 1).iso", "iso");
+        disc.display_name = "Fixture (Disc 1)".into();
+        disc
+    }]));
+    assert!(state.should_look_up(reloaded.game(2).unwrap(), &reloaded));
+}
 
-    let reloaded =
-        std::sync::Arc::new(Library::new(vec![archive(1, "/roms/Fixture 1.iso", "iso")]));
-    assert!(state.discs_for(1, &reloaded).is_none());
+#[test]
+fn a_lookup_stays_in_the_folder_and_links_only_real_other_entries() {
+    let root = tempfile::tempdir().unwrap();
+    let elsewhere = tempfile::tempdir().unwrap();
+    let library = std::sync::Arc::new(Library::new(vec![
+        disc_entry(1, root.path(), "Fixture (Disc 1).iso"),
+        disc_entry(2, root.path(), "Fixture (Disc 2).iso"),
+        disc_entry(3, elsewhere.path(), "Fixture (Disc 1).iso"),
+        disc_entry(4, elsewhere.path(), "Fixture (Disc 3).iso"),
+    ]));
+    let found = look_up(&library, 1).expect("two discs in one folder form a set");
+    assert_eq!(found.links.len(), 1, "{:?}", found.links);
+    assert_eq!(found.links[0].1, 2);
+    assert!(found.guidance.headline.starts_with("2-disc game"));
+    assert!(found.guidance.headline.contains("order not verified"));
+}
+
+#[test]
+fn a_flagged_missing_neighbour_gets_no_link_and_a_lone_copy_no_set() {
+    let root = tempfile::tempdir().unwrap();
+    let mut gone = disc_entry(2, root.path(), "Fixture (Disc 2).iso");
+    gone.last_verified_missing_at = Some("2026-11-01".into());
+    let library = std::sync::Arc::new(Library::new(vec![
+        disc_entry(1, root.path(), "Fixture (Disc 1).iso"),
+        gone,
+    ]));
+    let found = look_up(&library, 1);
+    assert!(found.is_none_or(|found| found.links.is_empty()));
+}
+
+#[test]
+fn a_late_answer_for_another_game_is_dropped() {
+    let root = tempfile::tempdir().unwrap();
+    let library = std::sync::Arc::new(Library::new(vec![
+        disc_entry(1, root.path(), "Fixture (Disc 1).iso"),
+        disc_entry(2, root.path(), "Fixture (Disc 2).iso"),
+    ]));
+    let late = look_up(&library, 1).unwrap();
+    let mut state = State::default();
+    assert!(state.should_look_up(library.game(2).unwrap(), &library));
+    state.finish(late);
+    assert!(state.discs_for(1, &library).is_none());
+    assert!(state.discs_for(2, &library).is_none());
 }

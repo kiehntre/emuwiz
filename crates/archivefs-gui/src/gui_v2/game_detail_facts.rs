@@ -2,18 +2,26 @@
 //! links between the entries of one disc set.
 //!
 //! Presentation only. Each value comes from existing saved or checked
-//! evidence and carries its limits; anything else reads "Not recorded". A file
-//! name is never read as a region, and no row here says a game can be played:
-//! that answer belongs to the readiness card alone.
+//! evidence and carries its limits; anything else reads "Not recorded". The
+//! one inference is a region hint from the file name, labelled as a hint on
+//! screen and never stored. No row here says a game can be played: that answer
+//! belongs to the readiness card alone.
 
 use super::{
     launch_readiness_summary::{
         GameReadinessSummary, ReadinessAction, ReadinessFreshness, ReadinessPresentationState,
     },
-    library::{Detail, Game, Library, media_kind_label},
+    library::{Detail, Game, SharedLibrary, media_kind_label},
 };
-use crate::ui::theme;
-use archivefs_core::{ArchiveKind, MANUAL_PLATFORM_SOURCE};
+use crate::{
+    media_sets_page::record_from_catalogue,
+    multidisc_launch_view::{DiscGuidance, MultiDiscLaunchContext},
+    ui::theme,
+};
+use archivefs_core::{
+    ArchiveKind, MANUAL_PLATFORM_SOURCE,
+    media_set::{MediaRecord, index_media, resolve_index},
+};
 use eframe::egui::{self, RichText};
 
 const NOT_RECORDED: &str = "Not recorded";
@@ -43,77 +51,126 @@ pub(super) struct Sources<'a> {
     /// The selected value and its source, from the shared metadata resolver.
     pub region: Option<(&'a str, &'a str)>,
     pub region_checked: bool,
+    /// The region and catalogue of a saved exact DAT match of this file.
+    pub dat_region: Option<(&'a str, &'a str)>,
+    /// That match still holds against the current catalogue.
+    pub dat_current: bool,
     pub discs: Option<&'a str>,
 }
 
-/// One disc set as seen from one game page.
-#[derive(Clone, Debug, Default, Eq, PartialEq)]
-pub(super) struct DiscSummary {
+/// The disc set of one entry, worked out away from the UI thread.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(super) struct DiscLookup {
     pub game: i64,
     pub library: usize,
-    pub headline: String,
+    pub guidance: DiscGuidance,
     /// Label and game of each other disc that has its own library entry.
     pub links: Vec<(String, i64)>,
 }
 
-/// Remembers the page's disc set so the catalogue is walked once per game and
-/// the facts can name it without inspecting the disc files a second time.
+/// The current game's lookup, and which game and library it was asked for.
 #[derive(Default)]
 pub(super) struct State {
-    pub discs: Option<DiscSummary>,
+    asked: Option<(i64, usize)>,
+    found: Option<DiscLookup>,
 }
 
 impl State {
-    /// True when this game's set was not the one remembered.
-    pub(super) fn note_discs(
-        &mut self,
-        game: i64,
-        library: &std::sync::Arc<Library>,
-        guidance: &crate::multidisc_launch_view::DiscGuidance,
-    ) -> bool {
-        let address = std::sync::Arc::as_ptr(library) as usize;
-        if let Some(discs) = self
-            .discs
-            .as_mut()
-            .filter(|discs| discs.game == game && discs.library == address)
-        {
-            discs.headline.clone_from(&guidance.headline);
+    /// True once per game and library, when a lookup is worth starting.
+    pub(super) fn should_look_up(&mut self, game: &Game, library: &SharedLibrary) -> bool {
+        let key = (game.archive.id, library_key(library));
+        if self.asked == Some(key) {
             return false;
         }
-        self.discs = Some(DiscSummary {
-            game,
-            library: address,
-            headline: guidance.headline.clone(),
-            links: disc_links(library, game, guidance),
-        });
-        true
+        self.asked = Some(key);
+        self.found = None;
+        names_a_disc(game)
     }
 
-    pub(super) fn discs_for(
-        &self,
-        game: i64,
-        library: &std::sync::Arc<Library>,
-    ) -> Option<&DiscSummary> {
-        let address = std::sync::Arc::as_ptr(library) as usize;
-        self.discs
+    /// A late answer for a game or library no longer on screen is dropped.
+    pub(super) fn finish(&mut self, found: DiscLookup) {
+        if self.asked == Some((found.game, found.library)) {
+            self.found = Some(found);
+        }
+    }
+
+    pub(super) fn discs_for(&self, game: i64, library: &SharedLibrary) -> Option<&DiscLookup> {
+        self.found
             .as_ref()
-            .filter(|discs| discs.game == game && discs.library == address)
+            .filter(|found| found.game == game && found.library == library_key(library))
     }
 }
 
-fn disc_links(
-    library: &Library,
-    game: i64,
-    guidance: &crate::multidisc_launch_view::DiscGuidance,
-) -> Vec<(String, i64)> {
+fn library_key(library: &SharedLibrary) -> usize {
+    std::sync::Arc::as_ptr(library) as usize
+}
+
+/// Filename evidence only, and only a hint: most games stop here, so opening
+/// them does no catalogue work at all.
+fn names_a_disc(game: &Game) -> bool {
+    record_from_catalogue(&game.archive).is_some_and(|record| carries_disc_number(&record))
+}
+
+fn carries_disc_number(record: &MediaRecord) -> bool {
+    record
+        .evidence
+        .iter()
+        .any(|evidence| evidence.ordinal.is_some() || evidence.expected_count.is_some())
+}
+
+/// The set around one entry, resolved by the core engine from that entry's
+/// folder alone. Runs on the background worker: it checks disc files, which
+/// can stall on a slow or disconnected drive.
+pub(super) fn look_up(library: &SharedLibrary, id: i64) -> Option<DiscLookup> {
+    let started = std::time::Instant::now();
+    let game = library.game(id)?;
+    let path = &game.archive.absolute_path;
+    let folder = path.parent()?;
+    let neighbours: Vec<&Game> = library
+        .games
+        .iter()
+        .filter(|other| {
+            other.archive.last_verified_missing_at.is_none()
+                && other.archive.absolute_path.parent() == Some(folder)
+        })
+        .collect();
+    let records = neighbours
+        .iter()
+        .filter_map(|other| record_from_catalogue(&other.archive))
+        .filter(carries_disc_number)
+        .collect();
+    let sets = resolve_index(index_media(records)).sets;
+    let context = MultiDiscLaunchContext::for_content(&sets, path, &[]);
+    let found = context
+        .as_ref()
+        .and_then(|context| context.sets.first())
+        .map(|set| {
+            let guidance = crate::multidisc_launch_view::guidance(set, path, None);
+            let links = disc_links(&neighbours, id, &guidance);
+            DiscLookup {
+                game: id,
+                library: library_key(library),
+                guidance,
+                links,
+            }
+        });
+    log::debug!(
+        "gui_v2 disc lookup: {} of {} entries in the folder, {} ms",
+        neighbours.len(),
+        library.games.len(),
+        started.elapsed().as_millis()
+    );
+    found
+}
+
+fn disc_links(neighbours: &[&Game], game: i64, guidance: &DiscGuidance) -> Vec<(String, i64)> {
     guidance
         .discs
         .iter()
         .filter(|disc| !disc.this_entry)
         .filter_map(|disc| {
             let path = disc.path.as_deref()?;
-            let found = library
-                .games
+            let found = neighbours
                 .iter()
                 .find(|other| other.archive.absolute_path == path)?;
             (found.archive.id != game).then(|| (disc.label.clone(), found.archive.id))
@@ -122,7 +179,12 @@ fn disc_links(
 }
 
 pub(super) fn facts(game: &Game, sources: Sources<'_>) -> Vec<Fact> {
-    let mut rows = vec![system(game), region(sources), format(game), size(game)];
+    let mut rows = vec![
+        system(game),
+        region(game, sources),
+        format(game),
+        size(game),
+    ];
     rows.push(availability(game, sources));
     if !game.is_preservation_only() {
         rows.push(emulator(sources));
@@ -153,11 +215,106 @@ fn system(game: &Game) -> Fact {
     plain("System", game.platform.clone(), note)
 }
 
-fn region(sources: Sources<'_>) -> Fact {
-    match sources.region {
-        Some((value, source)) => plain("Region", value.to_string(), Some(format!("From {source}"))),
-        None if sources.region_checked => plain("Region", NOT_RECORDED.into(), None),
-        None => plain("Region", CHECKING.into(), None),
+/// Saved metadata first, then a saved DAT match, then a labelled hint.
+fn region(game: &Game, sources: Sources<'_>) -> Fact {
+    if let Some((value, source)) = sources.region {
+        return plain("Region", value.to_string(), Some(format!("From {source}")));
+    }
+    if let Some((value, catalogue)) = sources.dat_region {
+        let note = if sources.dat_current {
+            format!("From the verified match in {catalogue}")
+        } else {
+            format!("From a saved match in {catalogue}. Needs a recheck.")
+        };
+        return plain("Region", value.to_string(), Some(note));
+    }
+    if !sources.region_checked || (sources.detail.is_none() && !sources.detail_failed) {
+        return plain("Region", CHECKING.into(), None);
+    }
+    match (!is_folder(game))
+        .then(|| filename_region_hint(&game.archive.absolute_path))
+        .flatten()
+    {
+        Some(hint) => plain(
+            "Region",
+            format!("{hint} (filename hint)"),
+            Some("Read from the file name. Not verified.".into()),
+        ),
+        None => plain("Region", NOT_RECORDED.into(), None),
+    }
+}
+
+/// Whole tags only. Abbreviations such as `U`, `E`, `JP` or `UK` stay out:
+/// the same letters mean other things in other naming schemes.
+const FILENAME_REGION_TAGS: &[&str] = &[
+    "Argentina",
+    "Asia",
+    "Australia",
+    "Austria",
+    "Belgium",
+    "Brazil",
+    "Canada",
+    "Chile",
+    "China",
+    "Croatia",
+    "Denmark",
+    "Europe",
+    "Finland",
+    "France",
+    "Germany",
+    "Greece",
+    "Hong Kong",
+    "Hungary",
+    "India",
+    "Ireland",
+    "Italy",
+    "Japan",
+    "Korea",
+    "Latin America",
+    "Mexico",
+    "Netherlands",
+    "New Zealand",
+    "Norway",
+    "Poland",
+    "Portugal",
+    "Russia",
+    "Scandinavia",
+    "Spain",
+    "Sweden",
+    "Switzerland",
+    "Taiwan",
+    "Turkey",
+    "United Kingdom",
+    "USA",
+    "World",
+];
+
+/// A display hint from the file's own name, never its folders, and never
+/// stored. It needs one bracketed tag, after a title, made only of whole
+/// region names: `Game (USA, Europe)`. Two different tags are ambiguous.
+pub(super) fn filename_region_hint(path: &std::path::Path) -> Option<String> {
+    let name = path.file_stem()?.to_str()?;
+    let mut tags = Vec::new();
+    let mut rest = name;
+    let mut title_seen = false;
+    while let Some(open) = rest.find('(') {
+        title_seen |= !rest[..open].trim().is_empty();
+        let after = &rest[open + 1..];
+        let close = after.find(')')?;
+        let group = &after[..close];
+        let parts: Vec<&str> = group.split(',').map(str::trim).collect();
+        if parts.iter().all(|part| FILENAME_REGION_TAGS.contains(part)) {
+            if !title_seen {
+                return None;
+            }
+            tags.push(parts.join(", "));
+        }
+        rest = &after[close + 1..];
+    }
+    tags.dedup();
+    match tags.as_slice() {
+        [only] => Some(only.clone()),
+        _ => None,
     }
 }
 
@@ -295,12 +452,16 @@ pub(super) fn show(ui: &mut egui::Ui, game: &Game, rows: &[Fact]) {
     let width = ui.available_width();
     egui::Grid::new(("v2_detail_facts", game.archive.id))
         .num_columns(2)
-        .spacing(egui::vec2(16.0, 4.0))
+        .spacing(egui::vec2(16.0, 8.0))
         .min_col_width(88.0)
         .max_col_width((width - 104.0).max(88.0))
         .show(ui, |ui| {
             for row in rows {
-                ui.label(RichText::new(row.label).color(theme::muted(ui)));
+                // Both cells start at the top, or a two-line value would
+                // leave its label beside the row above.
+                ui.vertical(|ui| {
+                    ui.label(RichText::new(row.label).color(theme::muted(ui)));
+                });
                 ui.vertical(|ui| {
                     let color = match row.tone {
                         Tone::Plain => ui.visuals().text_color(),

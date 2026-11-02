@@ -1960,6 +1960,11 @@ impl App {
                                     self.equivalent_applied(*record)
                                 }
                                 Payload::MediaSetReview(review) => self.media_sets_done(*review),
+                                Payload::DiscLookup(found) => {
+                                    if let Some(found) = found {
+                                        self.game_detail_facts.finish(*found);
+                                    }
+                                }
                                 Payload::StorageReview(review) => self.storage_review_done(*review),
                                 Payload::Reconciliation(view) => self.reconcile_done(view),
                                 Payload::ReconciliationHashes(run) => self.reconcile_hash_done(run),
@@ -2210,6 +2215,16 @@ impl App {
             self.romm_library.loading = true;
             self.romm_library_job = Some(id);
             self.send(id, Command::LoadRommLibrary);
+        }
+        if let Some(game) = self
+            .router
+            .current
+            .game()
+            .and_then(|id| self.library.game(id))
+            && self.game_detail_facts.should_look_up(game, &self.library)
+        {
+            let (id, library) = (game.archive.id, self.library.clone());
+            self.send(0, Command::DiscLookup { library, game: id });
         }
         if let Some(id) = self.router.current.game()
             && self.detail_pending.is_none()

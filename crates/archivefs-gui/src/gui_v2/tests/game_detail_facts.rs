@@ -4,7 +4,6 @@ use super::*;
 use crate::gui_v2::library::Detail;
 
 const DESKTOP: [f32; 2] = [1672.0, 941.0];
-const COMPACT: [f32; 2] = [1024.0, 600.0];
 
 fn blue_app(context: &egui::Context, games: Vec<PersistedArchive>, open: i64) -> App {
     let mut app = fixture(context);
@@ -137,17 +136,72 @@ fn a_missing_verdict_is_looked_at_again_on_the_next_visit() {
     assert!(app.detail.is_none(), "a missing file must be rechecked");
 }
 
+/// The bar across the bottom of the window, which pages scroll under.
+const STATUS_BAR: f32 = 56.0;
+
+fn assert_first_screen(output: &egui::FullOutput, size: [f32; 2], wanted: &str) {
+    let bounds = text_bounds(output, wanted);
+    assert!(!bounds.is_empty(), "{wanted} missing: {:?}", text(output));
+    assert!(
+        bounds[0].max.y + 14.0 < size[1] - STATUS_BAR,
+        "{wanted} is cut off at {size:?}: {:?}",
+        bounds[0]
+    );
+}
+
 #[test]
-fn compact_details_keep_the_title_and_readiness_above_the_facts() {
+fn play_and_its_fix_are_on_the_first_screen_at_every_supported_size() {
+    for size in [[1024.0, 600.0], [1280.0, 720.0], [1920.0, 1080.0]] {
+        for blue in [true, false] {
+            let context = egui::Context::default();
+            let mut app = blue_app(&context, vec![archive(7, "Fixture", Some("PSX"))], 7);
+            app.simple.enabled = blue;
+            app.detail = Some(checked(7, true));
+            let output = settled(&context, &mut app, size);
+            assert_first_screen(&output, size, "Play");
+        }
+    }
+}
+
+#[test]
+fn a_long_title_does_not_push_play_off_a_small_window() {
+    let size = [1024.0, 600.0];
+    let context = egui::Context::default();
+    let title = "Fixture With A Very Long Name That Wraps (Europe) (En,Fr,De,Es,It) (Rev 1)";
+    let mut app = blue_app(&context, vec![archive(7, title, Some("PSX"))], 7);
+    app.detail = Some(checked(7, true));
+    assert_first_screen(&settled(&context, &mut app, size), size, "Play");
+}
+
+#[test]
+fn a_short_window_puts_quick_actions_and_facts_before_the_long_notes() {
     let context = egui::Context::default();
     let mut app = blue_app(&context, vec![archive(7, "Fixture", Some("PSX"))], 7);
     app.detail = Some(checked(7, true));
-    let tall = settled(&context, &mut app, [COMPACT[0], 1800.0]);
-    let facts = text_bounds(&tall, "At a glance");
-    let more = text_bounds(&tall, "More for this game");
-    assert!(!facts.is_empty() && !more.is_empty(), "{:?}", text(&tall));
-    assert!(facts[0].min.y >= more[0].max.y);
-    assert!(text_bounds(&tall, "Play")[0].max.y < facts[0].min.y);
+    let short = settled(&context, &mut app, [1024.0, 600.0]);
+    assert_first_screen(&short, [1024.0, 600.0], "Play");
+    let tall = settled(&context, &mut app, [1024.0, 1600.0]);
+    assert!(!text_bounds(&tall, "At a glance").is_empty());
+    let painted = scrolled_text(&context, &mut app, [1024.0, 600.0]);
+    let at = |wanted: &str| {
+        painted
+            .iter()
+            .position(|line| line == wanted)
+            .unwrap_or_else(|| panic!("{wanted}: {painted:?}"))
+    };
+    assert!(at("More for this game") < at("At a glance"));
+    assert!(at("At a glance") < at("Save-state compatibility guidance"));
+}
+
+#[test]
+fn a_short_window_drops_the_page_heading_but_a_tall_one_keeps_it() {
+    let context = egui::Context::default();
+    let mut app = blue_app(&context, vec![archive(7, "Fixture", Some("PSX"))], 7);
+    app.detail = Some(checked(7, true));
+    let short = settled(&context, &mut app, [1280.0, 720.0]);
+    assert!(text_bounds(&short, "Game Details").is_empty());
+    let tall = settled(&context, &mut app, [1920.0, 1080.0]);
+    assert!(!text_bounds(&tall, "Game Details").is_empty());
 }
 
 #[test]
@@ -175,26 +229,36 @@ fn copy_file_path_only_places_text_on_the_clipboard() {
     assert_eq!(app.router.current, Route::Game(7));
 }
 
+fn disc_set(root: &std::path::Path) -> Vec<PersistedArchive> {
+    [(1, 1), (2, 2)]
+        .map(|(id, number)| {
+            let path = root.join(format!("Fixture (Disc {number}).iso"));
+            fs::write(&path, b"disc").unwrap();
+            let mut game = archive(id, &format!("Fixture (Disc {number})"), Some("PSX"));
+            game.absolute_path = path;
+            game
+        })
+        .to_vec()
+}
+
 #[test]
-fn a_real_disc_set_is_summarised_and_links_to_the_other_disc() {
+fn a_disc_set_appears_without_the_database_snapshot_and_a_link_only_navigates() {
     let root = tempfile::tempdir().unwrap();
-    let mut games = Vec::new();
-    for (id, number) in [(1, 1), (2, 2)] {
-        let path = root.path().join(format!("Fixture (Disc {number}).iso"));
-        fs::write(&path, b"disc").unwrap();
-        let mut game = archive(id, &format!("Fixture (Disc {number})"), Some("PSX"));
-        game.absolute_path = path;
-        games.push(game);
-    }
     let context = egui::Context::default();
-    let mut app = blue_app(&context, games.clone(), 1);
+    let mut app = blue_app(&context, disc_set(root.path()), 1);
     app.detail = Some(checked(1, true));
-    frame(&context, &mut app, DESKTOP);
-    app.native_workflows.as_mut().unwrap().app.database_state = crate::DatabaseState::Ready {
-        snapshot: Box::new(crate::tests::cached_snapshot(games)),
-        last_scan_summary: None,
-    };
-    let output = settled(&context, &mut app, [1672.0, 2400.0]);
+    let size = [1920.0, 1400.0];
+    frame(&context, &mut app, size);
+    let workflows = app.native_workflows.as_ref().unwrap();
+    assert!(workflows.app.database_state.snapshot().is_none());
+    // The fixture has no worker, so run the job the first frame asked for.
+    let library = app.library.clone();
+    let _ = app
+        .game_detail_facts
+        .should_look_up(library.game(1).unwrap(), &library);
+    let found = crate::gui_v2::game_detail_facts::look_up(&library, 1).unwrap();
+    app.game_detail_facts.finish(found);
+    let output = settled(&context, &mut app, size);
     let strings = text(&output);
     let headline = strings
         .iter()
@@ -207,6 +271,20 @@ fn a_real_disc_set_is_summarised_and_links_to_the_other_disc() {
         .find(|line| line.starts_with("Go to Disc 2"))
         .unwrap_or_else(|| panic!("{strings:?}"));
     let at = text_pos(&output, link).unwrap() + egui::vec2(5.0, 5.0);
-    click(&context, &mut app, [1672.0, 2400.0], at);
+    let jobs: Vec<_> = app.activity.jobs.keys().copied().collect();
+    click(&context, &mut app, size, at);
     assert_eq!(app.router.current, Route::Game(2));
+    // A launch would add a job and an attempt; following a link adds neither.
+    let launched = settled(&context, &mut app, size);
+    let workflows = app.native_workflows.as_ref().unwrap();
+    assert!(!workflows.launch_was_requested(1));
+    assert!(!workflows.launch_was_requested(2));
+    assert!(
+        app.activity
+            .jobs
+            .iter()
+            .filter(|(id, _)| !jobs.contains(id))
+            .all(|(_, job)| !job.title.to_lowercase().contains("launch")),
+    );
+    assert!(visible_text(&launched, "Fixture (Disc 2)"));
 }

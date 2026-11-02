@@ -804,6 +804,11 @@ impl NativeWorkflows {
 
     /// Reuse the same current plan and candidate policy as Launch. Never
     /// substitute an inventory installation or select a different candidate.
+    #[cfg(test)]
+    pub(super) fn launch_was_requested(&self, game_id: i64) -> bool {
+        self.launch_active() || self.launch_attempts.for_game(game_id).is_some()
+    }
+
     /// The current readiness answer for the game on screen, for reading only.
     pub(super) fn readiness_summary(
         &self,
