@@ -689,3 +689,8 @@ mod tests;
 // GUI-only `retroarch_core_directory_override.txt` file. The discovery
 // behaviour it feeds is covered in `archivefs-core`
 // (`retroarch_cheat_setup` + `emulator_environment::retroarch`).
+
+#[test]
+fn ci_gate_probe_deliberate_failure() {
+    panic!("deliberate CI gate probe failure");
+}
