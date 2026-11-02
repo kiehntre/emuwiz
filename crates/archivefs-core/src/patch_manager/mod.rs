@@ -1070,6 +1070,8 @@ pub use shared_preview::{
     PreviewWarning, PreviewWarningKind, SharedPreviewEntry, SharedPreviewError,
     SharedPreviewReport, SharedPreviewRequest, build_shared_preview,
 };
+#[cfg(feature = "test-support")]
+pub use shared_transaction::set_test_rollback_restore_fault;
 pub use shared_transaction::{
     SHARED_APPLY_SCHEMA_VERSION, SHARED_DURABLE_JOURNAL_SCHEMA_VERSION, SHARED_MAX_BACKUP_BYTES,
     SHARED_MAX_CREATED_DIRECTORIES, SHARED_MAX_ENTRIES, SHARED_MAX_FAILURES,

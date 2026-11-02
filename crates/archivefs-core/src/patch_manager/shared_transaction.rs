@@ -94,13 +94,13 @@ pub(super) enum FaultPoint {
     ReverseExchange,
 }
 
-#[cfg(test)]
+#[cfg(any(test, feature = "test-support"))]
 thread_local! {
     static INJECTED_FAULT: std::cell::Cell<Option<FaultPoint>> = const { std::cell::Cell::new(None) };
     static INJECTED_AFTER: std::cell::Cell<Option<(FaultPoint, usize)>> = const { std::cell::Cell::new(None) };
 }
 
-#[cfg(test)]
+#[cfg(any(test, feature = "test-support"))]
 pub(super) fn inject_fault(point: Option<FaultPoint>) {
     INJECTED_FAULT.with(|fault| fault.set(point));
     INJECTED_AFTER.with(|fault| fault.set(None));
@@ -112,12 +112,12 @@ pub(super) fn inject_fault_after(point: FaultPoint, occurrences: usize) {
     INJECTED_AFTER.with(|fault| fault.set(Some((point, occurrences))));
 }
 
-#[cfg(test)]
+#[cfg(any(test, feature = "test-support"))]
 fn should_inject(point: FaultPoint) -> bool {
     INJECTED_FAULT.with(|fault| fault.get() == Some(point))
 }
 
-#[cfg(test)]
+#[cfg(any(test, feature = "test-support"))]
 fn should_inject_after(point: FaultPoint) -> bool {
     INJECTED_AFTER.with(|fault| {
         let Some((configured, remaining)) = fault.get() else {
@@ -135,12 +135,20 @@ fn should_inject_after(point: FaultPoint) -> bool {
     })
 }
 
-#[cfg(not(test))]
+#[cfg(not(any(test, feature = "test-support")))]
 fn should_inject(_point: FaultPoint) -> bool {
     false
 }
 
-#[cfg(not(test))]
+/// Synthetic GUI tests make every rollback restore on this thread fail, the
+/// way `FaultPoint::RollbackRestore` does in this module's own tests, until
+/// called again with `false`. Unavailable in ordinary application builds.
+#[cfg(feature = "test-support")]
+pub fn set_test_rollback_restore_fault(enabled: bool) {
+    inject_fault(enabled.then_some(FaultPoint::RollbackRestore));
+}
+
+#[cfg(not(any(test, feature = "test-support")))]
 fn should_inject_after(_point: FaultPoint) -> bool {
     false
 }

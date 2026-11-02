@@ -552,11 +552,9 @@ pub(crate) fn show_pcsx2_texture_mod_panel(
                 };
                 state.stage = match (undo, journal) {
                     (true, Some(journal)) => match default_shared_backup_root() {
-                        Ok(backup_root) => Some(Stage::RollbackPreview {
-                            preview: preview_shared_rollback(&journal, &destination, &backup_root),
-                            destination,
-                            back: Box::new(back),
-                        }),
+                        Ok(backup_root) => {
+                            Some(undo_preview(&journal, destination, &backup_root, back))
+                        }
                         Err(error) => Some(Stage::Failed(error.detail)),
                     },
                     // The stage stays empty, which starts over.
@@ -608,6 +606,16 @@ pub(crate) fn show_pcsx2_texture_mod_panel(
             }
         }
     });
+}
+
+/// Undo always starts from the core's own preview of the saved journal,
+/// which re-reads every file and backup; the page never decides on its own.
+fn undo_preview(journal: &Path, destination: PathBuf, backup_root: &Path, back: Stage) -> Stage {
+    Stage::RollbackPreview {
+        preview: preview_shared_rollback(journal, &destination, backup_root),
+        destination,
+        back: Box::new(back),
+    }
 }
 
 fn spawn_apply(plan: SharedTransactionPlan, destination: PathBuf) -> Stage {
@@ -1000,5 +1008,368 @@ mod tests {
             )),
             "{detail}"
         );
+    }
+
+    /// End to end through the real core, in disposable directories only: a
+    /// genuine partial install, a genuine failed automatic rollback, then
+    /// the page's recovery and the core's own Undo preview and rollback.
+    mod end_to_end {
+        use super::*;
+        use archivefs_core::patch_manager::{
+            Pcsx2TextureIdentity, set_test_rollback_restore_fault,
+        };
+        use std::fs;
+
+        const SERIAL: &str = "SLUS-12345";
+
+        struct Fixture {
+            _root: tempfile::TempDir,
+            root: PathBuf,
+        }
+
+        impl Fixture {
+            /// A two-file synthetic pack and a profile whose texture folder
+            /// already holds different `a.png` and `b.webp`, so both entries
+            /// are replacements with backups.
+            fn new() -> Self {
+                let dir = tempfile::tempdir().unwrap();
+                let root = dir.path().to_path_buf();
+                fs::create_dir(root.join("pack")).unwrap();
+                fs::write(root.join("pack/a.png"), b"pack-a").unwrap();
+                fs::write(root.join("pack/b.webp"), b"pack-b").unwrap();
+                let fixture = Self { _root: dir, root };
+                fs::create_dir_all(fixture.textures()).unwrap();
+                fs::write(fixture.file("a.png"), b"original-a").unwrap();
+                fs::write(fixture.file("b.webp"), b"original-b").unwrap();
+                fixture
+            }
+
+            fn profile(&self) -> Pcsx2Profile {
+                Pcsx2Profile {
+                    configuration_path: self.root.join("config"),
+                    ..profile()
+                }
+            }
+
+            fn destination(&self) -> PathBuf {
+                self.root.join("config/textures")
+            }
+
+            fn textures(&self) -> PathBuf {
+                self.destination().join(SERIAL)
+            }
+
+            fn file(&self, name: &str) -> PathBuf {
+                self.textures().join(name)
+            }
+
+            fn backups(&self) -> PathBuf {
+                self.root.join("backups")
+            }
+
+            fn history(&self) -> PathBuf {
+                self.root.join("history")
+            }
+
+            fn transaction(&self) -> SharedTransactionPlan {
+                let plan = build_pcsx2_texture_pack_preview(&Pcsx2TexturePackPreviewRequest {
+                    selected_pack: self.root.join("pack"),
+                    source_root: self.root.join("pack"),
+                    identity: Pcsx2TextureIdentity {
+                        archive_path: self.root.join("game.iso"),
+                        serial: SERIAL.into(),
+                    },
+                    profile: self.profile(),
+                })
+                .unwrap();
+                assert_eq!(plan.replace_count(), 2);
+                build_pcsx2_texture_pack_transaction_plan(
+                    &plan,
+                    &self.profile().profile_id,
+                    &plan.inspection.source_root,
+                )
+                .unwrap()
+            }
+
+            fn apply(&self, plan: &SharedTransactionPlan) -> Pcsx2TexturePackApplyResult {
+                execute_pcsx2_texture_pack_apply(
+                    plan,
+                    &SharedApplyOptions {
+                        dry_run: false,
+                        confirmation: Some(SharedApplyConfirmation {
+                            plan_id: plan.plan_id.clone(),
+                            general_approved: true,
+                            replacement_approved: true,
+                        }),
+                        operation_id: generate_shared_operation_id(),
+                        timestamp_unix_seconds: 1,
+                        current_context: plan.context.clone(),
+                        history_root: self.history(),
+                        backup_root: self.backups(),
+                    },
+                )
+            }
+
+            /// `a.png` is replaced; `b.webp` changes on disk after the
+            /// preview, so its Apply is refused: a real PartialFailure.
+            /// `fail_rollback` makes the automatic rollback's restore fail.
+            fn partial_install(&self, fail_rollback: bool) -> Pcsx2TexturePackApplyResult {
+                let plan = self.transaction();
+                fs::write(self.file("b.webp"), b"changed-b").unwrap();
+                set_test_rollback_restore_fault(fail_rollback);
+                let result = self.apply(&plan);
+                set_test_rollback_restore_fault(false);
+                assert_eq!(
+                    result.apply.journal.status,
+                    SharedApplyStatus::PartialFailure
+                );
+                result
+            }
+
+            /// The page after the real install worker's result arrived.
+            fn page(&self, result: Pcsx2TexturePackApplyResult) -> Pcsx2TextureModPageState {
+                let (sender, receiver) = mpsc::channel();
+                sender.send(Ok(result)).unwrap();
+                let mut state = Pcsx2TextureModPageState {
+                    key: Some((PathBuf::from(ARCHIVE), self.profile().profile_id)),
+                    stage: Some(Stage::Applying {
+                        receiver,
+                        destination: self.destination(),
+                    }),
+                };
+                assert!(state.poll());
+                state
+            }
+
+            fn text(&self, state: &mut Pcsx2TextureModPageState) -> String {
+                let profile = self.profile();
+                render(|ui| {
+                    show_pcsx2_texture_mod_panel(ui, state, Path::new(ARCHIVE), &profile, None)
+                })
+            }
+
+            /// What Check Undo opens: the core's preview against the
+            /// disposable backup folder.
+            fn check_undo(&self, state: &mut Pcsx2TextureModPageState) {
+                let Some(back @ Stage::Applied { .. }) = state.stage.take() else {
+                    panic!("expected the applied stage");
+                };
+                let Stage::Applied {
+                    ref result,
+                    ref rollback,
+                    ..
+                } = back
+                else {
+                    unreachable!()
+                };
+                assert_eq!(
+                    undo_choice(result, rollback.as_ref()),
+                    UndoChoice::CheckUndo
+                );
+                let journal = result.journal_path.clone().unwrap();
+                state.stage = Some(undo_preview(
+                    &journal,
+                    self.destination(),
+                    &self.backups(),
+                    back,
+                ));
+            }
+
+            fn preview(state: &Pcsx2TextureModPageState) -> &SharedRollbackPreview {
+                match &state.stage {
+                    Some(Stage::RollbackPreview { preview, .. }) => preview,
+                    _ => panic!("expected the Undo preview"),
+                }
+            }
+
+            /// Every file under the texture folder, with its bytes.
+            fn snapshot(&self) -> Vec<(String, Vec<u8>)> {
+                let mut files: Vec<_> = fs::read_dir(self.textures())
+                    .unwrap()
+                    .map(|entry| {
+                        let entry = entry.unwrap();
+                        (
+                            entry.file_name().to_string_lossy().into_owned(),
+                            fs::read(entry.path()).unwrap(),
+                        )
+                    })
+                    .collect();
+                files.sort();
+                files
+            }
+
+            fn backup_of_a(&self, result: &SharedApplyResult) -> PathBuf {
+                result.journal.entries[0]
+                    .backup_path
+                    .as_ref()
+                    .unwrap()
+                    .to_path_buf()
+                    .unwrap()
+            }
+        }
+
+        fn files(pairs: &[(&str, &[u8])]) -> Vec<(String, Vec<u8>)> {
+            pairs
+                .iter()
+                .map(|(name, bytes)| (name.to_string(), bytes.to_vec()))
+                .collect()
+        }
+
+        /// The state a failed automatic rollback leaves, and the page for it.
+        fn after_failed_rollback(fixture: &Fixture) -> (Pcsx2TextureModPageState, PathBuf) {
+            let result = fixture.partial_install(true);
+            let rollback = result.rollback.as_ref().expect("automatic rollback ran");
+            assert_ne!(rollback.status, SharedApplyStatus::Success);
+            assert_eq!(
+                fixture.snapshot(),
+                files(&[("a.png", b"pack-a"), ("b.webp", b"changed-b")])
+            );
+            let backup = fixture.backup_of_a(&result.apply);
+            assert_eq!(fs::read(&backup).unwrap(), b"original-a");
+            let mut state = fixture.page(result);
+            let text = fixture.text(&mut state);
+            assert!(!text.contains("Installed"), "{text}");
+            assert!(text.contains("Install incomplete"), "{text}");
+            assert!(text.contains("Recovery required"), "{text}");
+            assert!(
+                text.contains("Automatic rollback did not complete"),
+                "{text}"
+            );
+            assert!(
+                text.contains(&format!(
+                    "{}: may still be the pack's file; your original is kept in EmuWiz's backup at {}",
+                    fixture.file("a.png").display(),
+                    backup.display()
+                )),
+                "{text}"
+            );
+            // b.webp was never written, so it is not listed as remaining.
+            assert!(
+                !text.contains(&format!("{}:", fixture.file("b.webp").display())),
+                "{text}"
+            );
+            assert!(text.contains("Check Undo"), "{text}");
+            (state, backup)
+        }
+
+        #[test]
+        fn a_successful_install_is_installed_with_undo() {
+            let fixture = Fixture::new();
+            let result = fixture.apply(&fixture.transaction());
+            assert_eq!(result.apply.journal.status, SharedApplyStatus::Success);
+            assert!(result.rollback.is_none());
+            let text = fixture.text(&mut fixture.page(result));
+            assert!(text.contains("Installed"), "{text}");
+            assert!(text.contains("Undo"), "{text}");
+            assert!(!text.contains("Recovery required"), "{text}");
+            assert_eq!(
+                fixture.snapshot(),
+                files(&[("a.png", b"pack-a"), ("b.webp", b"pack-b")])
+            );
+        }
+
+        #[test]
+        fn a_fully_rolled_back_install_is_not_installed_and_offers_no_undo() {
+            let fixture = Fixture::new();
+            let result = fixture.partial_install(false);
+            assert_eq!(
+                result.rollback.as_ref().map(|r| r.status),
+                Some(SharedApplyStatus::Success)
+            );
+            assert_eq!(
+                fixture.snapshot(),
+                files(&[("a.png", b"original-a"), ("b.webp", b"changed-b")])
+            );
+            let text = fixture.text(&mut fixture.page(result));
+            assert!(!text.contains("Installed"), "{text}");
+            assert!(!text.contains("Undo"), "{text}");
+            assert!(!text.contains("Recovery required"), "{text}");
+            assert!(
+                text.contains("reversed this install's recorded changes"),
+                "{text}"
+            );
+        }
+
+        #[test]
+        fn after_a_failed_rollback_a_retried_undo_restores_the_original_and_nothing_else() {
+            let fixture = Fixture::new();
+            let (mut state, _backup) = after_failed_rollback(&fixture);
+            fixture.check_undo(&mut state);
+            let text = fixture.text(&mut state);
+            assert!(!text.contains("Undo refused"), "{text}");
+            assert!(text.contains("Confirm undo"), "{text}");
+            let preview = Fixture::preview(&state).clone();
+            assert!(preview.available);
+            let result = execute_shared_rollback(
+                &preview,
+                &SharedRollbackOptions {
+                    confirmation: SharedRollbackConfirmation {
+                        preview_id: preview.preview_id.clone(),
+                        approved: true,
+                    },
+                    rollback_operation_id: generate_shared_operation_id(),
+                    timestamp_unix_seconds: 2,
+                    history_root: fixture.history(),
+                    backup_root: fixture.backups(),
+                },
+            );
+            assert_eq!(result.status, SharedApplyStatus::Success);
+            // The original is back; the file Apply never touched keeps the
+            // user's change; nothing else appeared.
+            assert_eq!(
+                fixture.snapshot(),
+                files(&[("a.png", b"original-a"), ("b.webp", b"changed-b")])
+            );
+            let (sender, receiver) = mpsc::channel();
+            sender.send(Ok(result)).unwrap();
+            state.stage = Some(Stage::RollingBack(receiver));
+            assert!(state.poll());
+            assert!(
+                state.stage.is_none(),
+                "a finished Undo returns to the start"
+            );
+        }
+
+        fn assert_refused(fixture: &Fixture, state: &mut Pcsx2TextureModPageState, outcome: &str) {
+            let before = fixture.snapshot();
+            fixture.check_undo(state);
+            assert!(!Fixture::preview(state).available);
+            let text = fixture.text(state);
+            assert!(text.contains("Undo refused"), "{text}");
+            assert!(text.contains("Nothing was changed"), "{text}");
+            assert!(
+                text.contains(&format!("{}: {outcome}.", fixture.file("a.png").display())),
+                "{text}"
+            );
+            assert!(text.contains("Back"), "{text}");
+            assert_eq!(fixture.snapshot(), before, "a refused Undo changed files");
+        }
+
+        #[test]
+        fn a_missing_backup_refuses_undo_without_guessing() {
+            let fixture = Fixture::new();
+            let (mut state, backup) = after_failed_rollback(&fixture);
+            fs::remove_file(&backup).unwrap();
+            assert_refused(&fixture, &mut state, "BackupMissing");
+            assert_eq!(fs::read(fixture.file("a.png")).unwrap(), b"pack-a");
+        }
+
+        #[test]
+        fn a_modified_backup_refuses_undo_without_guessing() {
+            let fixture = Fixture::new();
+            let (mut state, backup) = after_failed_rollback(&fixture);
+            fs::write(&backup, b"tampered").unwrap();
+            assert_refused(&fixture, &mut state, "BackupChanged");
+            assert_eq!(fs::read(&backup).unwrap(), b"tampered");
+        }
+
+        #[test]
+        fn a_file_changed_after_the_failed_rollback_refuses_undo() {
+            let fixture = Fixture::new();
+            let (mut state, backup) = after_failed_rollback(&fixture);
+            fs::write(fixture.file("a.png"), b"edited-by-user").unwrap();
+            assert_refused(&fixture, &mut state, "DestinationChanged");
+            assert_eq!(fs::read(&backup).unwrap(), b"original-a");
+        }
     }
 }
