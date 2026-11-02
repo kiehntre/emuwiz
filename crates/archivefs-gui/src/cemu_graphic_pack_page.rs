@@ -218,15 +218,7 @@ pub fn show_cemu_graphic_pack_panel(
     }
     if let Some(applied) = state.applied.as_ref() {
         widgets::card(ui, |ui| {
-            let label = match applied.journal.status {
-                SharedApplyStatus::Success => "Installed successfully",
-                SharedApplyStatus::PartialFailure => "Install partially failed",
-                _ => "Install failed",
-            };
-            ui.strong(label);
-            if let Some(path) = &applied.journal_path {
-                ui.label(format!("Receipt: {}", path.display()));
-            }
+            show_apply_summary(ui, applied);
             if applied.journal.status == SharedApplyStatus::Success
                 && widgets::action_button(
                     ui,
@@ -296,6 +288,19 @@ fn inspect_selected(state: &mut CemuGraphicPackPageState, path: PathBuf) {
             Err(error) => state.error = Some(error.to_string()),
         }
     }
+}
+
+fn show_apply_summary(ui: &mut egui::Ui, applied: &SharedApplyResult) {
+    let label = match applied.journal.status {
+        SharedApplyStatus::Success => "Installed successfully",
+        SharedApplyStatus::PartialFailure => "Install partially failed",
+        _ => "Install failed",
+    };
+    ui.strong(label);
+    if let Some(path) = &applied.journal_path {
+        ui.label(format!("Receipt: {}", path.display()));
+    }
+    crate::shared_apply_warnings::show(ui, &crate::shared_apply_warnings::lines(applied));
 }
 
 fn show_plan(
@@ -383,4 +388,18 @@ fn now() -> u64 {
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_secs())
         .unwrap_or(0)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn apply_result_shows_shared_transaction_warnings() {
+        use crate::shared_apply_warnings::test_support::{
+            assert_shows_warning, render, warned_result,
+        };
+        let result = warned_result();
+        assert_shows_warning(&render(|ui| show_apply_summary(ui, &result)));
+    }
 }

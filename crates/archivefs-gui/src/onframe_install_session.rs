@@ -457,6 +457,13 @@ impl OnFrameInstallSession {
         self.workflow_state.approve();
     }
 
+    /// Warnings of the retained Apply, for the result panel.
+    pub(crate) fn apply_warnings(&self) -> Vec<String> {
+        self.transaction
+            .as_ref()
+            .map_or_else(Vec::new, crate::shared_apply_warnings::lines)
+    }
+
     pub(crate) fn retain_apply_result(&mut self, result: SharedApplyResult) {
         let transaction_id = result.journal.operation_id.clone();
         let needs_recovery = matches!(
@@ -744,6 +751,7 @@ mod tests {
             journal_path: None,
             journal_failure: None,
         });
+        assert!(session.apply_warnings().is_empty());
         assert_eq!(
             session.transaction.as_ref().unwrap().journal.operation_id,
             "onframe-op"
@@ -754,5 +762,16 @@ mod tests {
             session.workflow_state,
             OnFrameInstallState::RecoveryRequired { .. }
         ));
+    }
+
+    #[test]
+    fn the_retained_apply_keeps_shared_transaction_warnings_for_the_panel() {
+        use crate::shared_apply_warnings::test_support::{WARNED_FILE, WARNING, warned_result};
+        let mut session = OnFrameInstallSession::default();
+        session.retain_apply_result(warned_result());
+        assert_eq!(
+            session.apply_warnings(),
+            vec![format!("{WARNED_FILE}: {WARNING}")]
+        );
     }
 }
