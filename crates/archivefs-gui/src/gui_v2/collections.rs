@@ -357,6 +357,8 @@ enum Dialog {
     },
     Rename {
         collection: i64,
+        /// The name when the dialog opened, which is what the user was shown.
+        seen: String,
         name: String,
     },
     Delete {
@@ -571,7 +573,6 @@ impl App {
 
     /// Star, plain words, and the collections menu, for one selected game.
     pub(super) fn game_collection_actions(&mut self, ui: &mut egui::Ui, game: i64, title: &str) {
-        self.collection_message(ui);
         if !self.collections.ready() {
             return;
         }
@@ -612,7 +613,7 @@ impl App {
 
     /// Why a change did not stick. Drawn wherever collections can be changed,
     /// including when nothing else can be drawn because the first read failed.
-    fn collection_message(&mut self, ui: &mut egui::Ui) {
+    pub(super) fn collection_message(&mut self, ui: &mut egui::Ui) {
         let Some(message) = &self.collections.message else {
             return;
         };
@@ -688,13 +689,22 @@ impl App {
                         }
                     });
                 if !favourites {
-                    if ui.small_button("Rename").clicked() {
+                    // Until the last change is answered the list may already be out of date.
+                    let settled = self.collections.pending == 0;
+                    if ui
+                        .add_enabled(settled, egui::Button::new("Rename").small())
+                        .clicked()
+                    {
                         dialog = Some(Dialog::Rename {
                             collection: id,
+                            seen: name.clone(),
                             name,
                         });
                     }
-                    if ui.small_button("Delete").clicked() {
+                    if ui
+                        .add_enabled(settled, egui::Button::new("Delete").small())
+                        .clicked()
+                    {
                         dialog = Some(Dialog::Delete { collection: id });
                     }
                 }
@@ -785,6 +795,7 @@ impl App {
             self.collections.dialog = Dialog::None;
             return;
         }
+        let settled = self.collections.pending == 0;
         match &mut self.collections.dialog {
             Dialog::None => {}
             Dialog::Create { name, game } => {
@@ -811,7 +822,11 @@ impl App {
                         });
                     });
             }
-            Dialog::Rename { collection, name } => {
+            Dialog::Rename {
+                collection,
+                seen,
+                name,
+            } => {
                 egui::Window::new("Rename collection")
                     .collapsible(false)
                     .resizable(false)
@@ -820,13 +835,12 @@ impl App {
                             egui::TextEdit::singleline(name).char_limit(MAX_COLLECTION_NAME_CHARS),
                         );
                         ui.horizontal(|ui| {
-                            let valid = archivefs_core::validate_collection_name(name).is_ok();
+                            let valid =
+                                settled && archivefs_core::validate_collection_name(name).is_ok();
                             if ui.add_enabled(valid, egui::Button::new("Rename")).clicked() {
                                 change = Some(Change::Rename {
                                     collection: *collection,
-                                    seen: selected
-                                        .as_ref()
-                                        .map_or_else(String::new, |view| view.0.clone()),
+                                    seen: seen.clone(),
                                     name: name.clone(),
                                 });
                                 close = true;
@@ -846,7 +860,10 @@ impl App {
                             thousands(count)
                         ));
                         ui.horizontal(|ui| {
-                            if ui.button("Delete collection").clicked() {
+                            if ui
+                                .add_enabled(settled, egui::Button::new("Delete collection"))
+                                .clicked()
+                            {
                                 change = Some(Change::Delete {
                                     collection: *collection,
                                     seen: name.clone(),

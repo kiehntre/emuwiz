@@ -6793,7 +6793,7 @@ fn frame_with(
     )
 }
 
-fn text_pos(output: &egui::FullOutput, needle: &str) -> Option<egui::Pos2> {
+pub(super) fn text_pos(output: &egui::FullOutput, needle: &str) -> Option<egui::Pos2> {
     fn find(shape: &egui::Shape, needle: &str) -> Option<egui::Pos2> {
         match shape {
             egui::Shape::Text(text) if text.galley.text() == needle => Some(text.pos),

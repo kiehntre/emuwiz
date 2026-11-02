@@ -2849,6 +2849,7 @@ impl App {
                                     ui.add_space(theme::SPACE_LG);
                                     ui.vertical(|ui| {
                                         self.detail_heading(ui, &library, game);
+                                        self.collection_message(ui);
                                         self.game_collection_actions(ui, game.archive.id, &game.title);
                                         ui.add_space(theme::SPACE_SM);
                                         self.detail_more(ui, game);
@@ -2893,6 +2894,7 @@ impl App {
                 ui.add_space(theme::SPACE_LG);
                 ui.vertical(|ui| {
                     self.detail_heading(ui, &library, game);
+                    self.collection_message(ui);
                     self.game_collection_actions(ui, game.archive.id, &game.title);
                     self.collection_dialogs(ui.ctx());
                     ui.add_space(theme::SPACE_SM);

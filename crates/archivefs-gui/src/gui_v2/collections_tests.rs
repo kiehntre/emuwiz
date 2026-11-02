@@ -704,4 +704,118 @@ fn removing_a_game_while_its_item_is_being_moved_removes_the_moved_item() {
     f.settle();
     let saved = Database::open_read_only(&f.path).unwrap();
     assert!(saved.load_game_collections().unwrap()[0].items.is_empty());
+    assert!(f.state.reanchoring.is_empty(), "cleared once answered");
+}
+
+/// `star_app` with a worker that only records what it is sent.
+fn recording_app(
+    context: &eframe::egui::Context,
+    names: &[(i64, &str)],
+) -> (super::super::App, std::sync::mpsc::Receiver<super::Job>) {
+    let mut app = star_app(context);
+    for (id, name) in names {
+        app.collections.saved.push(GameCollection {
+            id: *id,
+            kind: GameCollectionKind::User,
+            name: (*name).into(),
+            items: Vec::new(),
+        });
+    }
+    let library = app.library.clone();
+    app.collections.library_changed(&library);
+    let (jobs, sent) = std::sync::mpsc::channel();
+    let (_answers, results) = std::sync::mpsc::channel();
+    app.collections.worker = Some((jobs, results));
+    (app, sent)
+}
+
+fn click_text(context: &eframe::egui::Context, app: &mut super::super::App, label: &str) {
+    use eframe::egui::{Event, PointerButton};
+    frame(context, app, vec![]);
+    let drawn = frame(context, app, vec![]);
+    let target =
+        super::super::tests::text_pos(&drawn, label).expect(label) + eframe::egui::vec2(4.0, 6.0);
+    let click = |pressed| Event::PointerButton {
+        pos: target,
+        button: PointerButton::Primary,
+        pressed,
+        modifiers: Default::default(),
+    };
+    frame(context, app, vec![Event::PointerMoved(target)]);
+    frame(context, app, vec![click(true)]);
+    frame(context, app, vec![click(false)]);
+}
+
+#[test]
+fn rename_sends_the_name_shown_when_the_dialog_opened() {
+    let context = eframe::egui::Context::default();
+    let (mut app, sent) = recording_app(&context, &[(5, "Kids")]);
+    app.collections.dialog = super::Dialog::Rename {
+        collection: 5,
+        seen: "Retro".into(),
+        name: "New".into(),
+    };
+    click_text(&context, &mut app, "Rename");
+    match sent.try_recv().unwrap() {
+        super::Job::Change(super::Change::Rename {
+            collection,
+            seen,
+            name,
+        }) => assert_eq!(
+            (collection, seen.as_str(), name.as_str()),
+            (5, "Retro", "New")
+        ),
+        _ => panic!("expected a rename"),
+    }
+}
+
+#[test]
+fn delete_sends_the_name_the_dialog_shows() {
+    let context = eframe::egui::Context::default();
+    let (mut app, sent) = recording_app(&context, &[(5, "Alpha list"), (6, "Beta list")]);
+    app.collections.scope = Some(6);
+    app.collections.dialog = super::Dialog::Delete { collection: 5 };
+    click_text(&context, &mut app, "Delete collection");
+    match sent.try_recv().unwrap() {
+        super::Job::Change(super::Change::Delete { collection, seen }) => {
+            assert_eq!((collection, seen.as_str()), (5, "Alpha list"));
+        }
+        _ => panic!("expected a delete"),
+    }
+}
+
+#[test]
+fn a_second_delete_cannot_be_sent_while_the_first_is_unanswered() {
+    let context = eframe::egui::Context::default();
+    let (mut app, sent) = recording_app(&context, &[(5, "Alpha list")]);
+    app.collections.dialog = super::Dialog::Delete { collection: 5 };
+    click_text(&context, &mut app, "Delete collection");
+    assert!(sent.try_recv().is_ok());
+    assert_eq!(app.collections.pending, 1);
+    app.collections.dialog = super::Dialog::Delete { collection: 5 };
+    click_text(&context, &mut app, "Delete collection");
+    assert!(sent.try_recv().is_err(), "the button is off until answered");
+}
+
+#[test]
+fn try_again_reads_the_saved_collections_again() {
+    let context = eframe::egui::Context::default();
+    let (mut app, sent) = recording_app(&context, &[]);
+    app.collections.saved.clear();
+    app.collections.views.clear();
+    app.collections.message = Some(super::READ_FAILED.into());
+    click_text(&context, &mut app, "Try again");
+    assert!(matches!(sent.try_recv().unwrap(), super::Job::Reload));
+    assert_eq!(app.collections.message, None);
+}
+
+#[test]
+fn browse_shows_a_failure_once_with_a_game_selected() {
+    let context = eframe::egui::Context::default();
+    let mut app = star_app(&context);
+    app.collections.message = Some("That change was not saved: fixture".into());
+    frame(&context, &mut app, vec![]);
+    let strings = super::super::tests::text(&frame(&context, &mut app, vec![]));
+    let shown = strings.iter().filter(|s| s.contains("not saved")).count();
+    assert_eq!(shown, 1, "{strings:?}");
 }
