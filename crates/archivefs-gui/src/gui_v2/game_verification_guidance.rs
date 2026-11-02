@@ -140,6 +140,20 @@ impl State {
         *self = Self::default();
     }
 
+    /// Test-only: put the panel in a chosen state without starting the
+    /// worker, which would read the real default database.
+    #[cfg(test)]
+    pub(super) fn set_for_test(
+        &mut self,
+        game: i64,
+        receiver: Option<Receiver<Guidance>>,
+        result: Option<Guidance>,
+    ) {
+        self.game = Some(game);
+        self.receiver = receiver;
+        self.result = result;
+    }
+
     /// This panel's finished result for `game`, if it has one.
     pub(super) fn result_for(&self, game: i64) -> Option<&Guidance> {
         (self.game == Some(game))
