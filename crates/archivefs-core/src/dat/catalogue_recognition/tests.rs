@@ -390,5 +390,26 @@ fn an_unknown_leading_word_is_never_ignored() {
 #[test]
 fn an_unknown_part_of_a_tosec_system_name_is_never_ignored() {
     let recognition = tosec("Nintendo Game Boy & Foo - Games");
-    assert_eq!(recognition.safe_platform(), None, "{recognition:?}");
+    assert!(
+        matches!(
+            recognition,
+            Extras {
+                platform: "Game Boy",
+                ..
+            }
+        ),
+        "{recognition:?}"
+    );
+}
+
+#[test]
+fn reviewed_tosec_names_with_two_spellings_stay_game_lists() {
+    for (name, platform) in [
+        ("Nintendo Famicom & Entertainment System - Games", "NES"),
+        ("Atari 2600 & VCS - Games", "Atari2600"),
+        ("Sega Mega Drive & Genesis - Games", "MegaDrive"),
+        ("NEC PC-Engine & TurboGrafx-16 - Games", "PC Engine"),
+    ] {
+        assert_eq!(tosec(name), games(platform), "{name}");
+    }
 }

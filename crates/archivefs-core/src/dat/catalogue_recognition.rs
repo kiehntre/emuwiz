@@ -350,6 +350,12 @@ fn tosec_system_platform(system: &str) -> Result<&'static str, CatalogueRecognit
     if let PlatformForTosecSystem::Platform(platform) = platform_for_tosec_system(system) {
         return Ok(platform);
     }
+    if let Some((_, platform)) = REVIEWED_TOSEC_SYSTEMS
+        .iter()
+        .find(|(exact, _)| *exact == system)
+    {
+        return Ok(platform);
+    }
     let mut candidates = Vec::new();
     if collect(&mut candidates, system) {
         return decide(candidates, system);
@@ -517,6 +523,13 @@ fn no_intro_system_platform(
     decide(candidates, system).map(|platform| (platform, unknown))
 }
 
+/// TOSEC system names whose second part the alias registry does not spell,
+/// reviewed by hand: each names one machine.
+const REVIEWED_TOSEC_SYSTEMS: &[(&str, &str)] = &[
+    ("Nintendo Famicom & Entertainment System", "NES"),
+    ("Atari 2600 & VCS", "Atari2600"),
+];
+
 /// Reviewed makers that lead a No-Intro / Redump style name. Any other
 /// leading word is treated as a qualifier, not skipped.
 const NO_INTRO_MAKERS: &[&str] = &[
@@ -528,6 +541,7 @@ const NO_INTRO_MAKERS: &[&str] = &[
     "Bally",
     "Bandai",
     "Benesse",
+    "Bit Corporation",
     "Casio",
     "Coleco",
     "Commodore",
@@ -556,6 +570,7 @@ const NO_INTRO_MAKERS: &[&str] = &[
     "Ouya",
     "Panasonic",
     "Philips",
+    "Pioneer",
     "RCA",
     "Sanyo",
     "Sega",
@@ -565,6 +580,7 @@ const NO_INTRO_MAKERS: &[&str] = &[
     "SNK",
     "Sony",
     "Tandy",
+    "Tangerine",
     "TeleNova",
     "Texas Instruments",
     "Thomson",
