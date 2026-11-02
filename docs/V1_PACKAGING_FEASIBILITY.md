@@ -226,7 +226,7 @@ Current state (already implemented for the tarball/install.sh channel):
 - Icons: `assets/branding/emuwiz-logo-{32,64,128,256,512}.png`; install.sh
   installs the launcher + hicolor icons under `$XDG_DATA_HOME` and records
   every path in its SHA-256 ownership manifest.
-- File associations: none today (`Categories=Utility;Archiving;` only).
+- File associations: none today (`Categories=Game;Emulator;` only).
 - Update mechanism: none in-app; updates are replacement-artifact installs
   via install.sh (`docs/RELEASE_ENGINEERING.md`; GitHub tag-driven release
   workflow in `.github/workflows/release.yml`).
