@@ -3091,10 +3091,7 @@ impl App {
         self.forget_disproved_dat_match(id);
         let identity = self.detail_identity(game);
         let identity_verified = identity.as_ref().is_some_and(|i| i.is_verified());
-        let identity_pending = matches!(
-            identity,
-            Some(super::detail_identity::DetailIdentity::Checking)
-        );
+        let dat_identity = identity.as_ref().and_then(|i| i.card_identity());
         let readiness_route = {
             let workflows = self.native_workflows.get_or_insert_with(|| {
                 super::native_workflows::NativeWorkflows::new(ui.ctx().clone())
@@ -3107,7 +3104,7 @@ impl App {
                 game.archive.identity_report.as_ref(),
                 super::native_workflows::SavedFileFacts {
                     catalogue_verified: identity_verified,
-                    identity_pending,
+                    dat_identity,
                     file_missing,
                 },
                 &mut self.activity,

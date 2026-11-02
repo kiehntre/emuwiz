@@ -116,6 +116,10 @@ pub(super) struct Game {
     /// The strongest other saved DAT evidence, when any applies (a negative
     /// only from this game's own platform's catalogue). `None`: not checked.
     pub dat_state: Option<archivefs_core::LibraryDatState>,
+    /// In memory only: this session's fresh per-game check established that
+    /// the Library's earlier current match no longer holds. The database is
+    /// unchanged; the next Library load re-derives everything from it.
+    pub dat_proof_invalidated: bool,
     pub attention: bool,
     pub screenscraper:
         Option<archivefs_core::screenscraper_enrichment::PersistedScreenScraperEnrichment>,
@@ -149,6 +153,7 @@ impl Game {
             dat_exact: None,
             dat_exact_hashes: None,
             dat_state: None,
+            dat_proof_invalidated: false,
             attention,
             screenscraper: None,
             search,
@@ -205,6 +210,9 @@ impl Game {
 
     /// DAT verification is independent of scan-time identification and launch readiness.
     pub fn dat_identity_summary(&self) -> &'static str {
+        if self.dat_proof_invalidated {
+            return "Re-check needed";
+        }
         if self.dat_exact.is_some() {
             return "Verified";
         }
@@ -228,8 +236,9 @@ impl Game {
         {
             return "Mismatch";
         }
-        if self.dat_exact.is_some() || self.dat_state.is_some() {
+        if self.dat_exact.is_some() || self.dat_state.is_some() || self.dat_proof_invalidated {
             if self.dat_exact.is_none()
+                && !self.dat_proof_invalidated
                 && self.dat_state == Some(archivefs_core::LibraryDatState::NoMatch)
                 && self.platform != UNKNOWN_PLATFORM
             {

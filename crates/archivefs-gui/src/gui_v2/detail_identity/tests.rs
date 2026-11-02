@@ -48,41 +48,131 @@ fn current_proof_from_the_panel_is_verified() {
     assert!(!disproves_library_match(&game, Some(&answer("Verified"))));
 }
 
+/// Every setup or coverage answer the panel classifies as "Needs setup",
+/// plus the other answers that establish nothing about this game's proof.
+const NOT_ESTABLISHED: [&str; 9] = [
+    "Catalogue selection required",
+    "Catalogue system coverage unresolved",
+    "Catalogue does not cover this system",
+    "Catalogue not validated or unavailable",
+    "No trusted DAT configured",
+    "Configured DAT unavailable or disabled",
+    "Catalogue status unavailable",
+    "Verification evidence unavailable",
+    "File format unsupported for exact verification",
+];
+
 #[test]
-fn stale_legacy_or_missing_proof_is_never_verified_and_disproves_the_flag() {
+fn setup_gaps_errors_and_unknown_answers_are_not_confirmed_and_keep_the_badge() {
+    use super::super::game_verification_guidance::Outcome;
     let game = game(1, true);
-    for reason in [
-        // stale, changed or missing file
-        "File evidence stale or changed",
-        // legacy saved match whose freshness was never established
+    let unknown = [
         "Saved exact match; freshness needs checking",
-        // the catalogue behind the match is missing or disabled
-        "Configured DAT unavailable or disabled",
-        "No trusted DAT configured",
-        "Audit needs review",
-    ] {
+        "Something new",
+    ];
+    for reason in NOT_ESTABLISHED.into_iter().chain(unknown) {
         let settled = identity(&game, Some(&answer(reason)));
-        assert!(!settled.is_verified(), "{reason}");
-        assert_ne!(settled.label(), "Verified", "{reason}");
-        assert_ne!(settled.label(), "Checking verification", "{reason}");
-        assert!(
-            disproves_library_match(&game, Some(&answer(reason))),
+        assert_eq!(
+            classify(&game, &answer(reason)),
+            ProofCheck::NotEstablished,
             "{reason}"
+        );
+        assert_eq!(settled, DetailIdentity::NotConfirmed, "{reason}");
+        assert_eq!(settled.label(), "Verification not yet confirmed");
+        assert!(!settled.is_verified(), "{reason}");
+        assert!(
+            !disproves_library_match(&game, Some(&answer(reason))),
+            "{reason}"
+        );
+    }
+    // The two named setup gaps are what the panel itself calls "Needs setup".
+    for reason in [
+        "Catalogue selection required",
+        "Catalogue system coverage unresolved",
+    ] {
+        assert_eq!(Outcome::of(reason), Outcome::NeedsSetup);
+    }
+}
+
+fn explained(
+    game: &Game,
+    present: bool,
+    unchanged: bool,
+    freshness: archivefs_core::dat::library_identity_summary::DatProvenanceFreshness,
+    catalogues: Result<
+        &[archivefs_core::dat::catalogue_selection::InstalledCatalogueSummary],
+        &str,
+    >,
+) -> Guidance {
+    super::super::game_verification_guidance::explain(
+        game, present, unchanged, 1, freshness, catalogues, None,
+    )
+}
+
+/// Pins the classification to the panel's real answers, so a wording change
+/// there cannot silently turn evidence into "not established" or back.
+#[test]
+fn the_panels_real_answers_classify_strictly() {
+    use archivefs_core::dat::library_identity_summary::DatProvenanceFreshness as F;
+    let unflagged = game(2, false);
+    let game = game(1, true);
+    // A saved row is marked stale, or no row re-reads as current (#296).
+    let stale = explained(&game, true, true, F::Stale, Ok(&[]));
+    assert_eq!(
+        classify(&game, &stale),
+        ProofCheck::Invalidated,
+        "{stale:?}"
+    );
+    assert!(disproves_library_match(&game, Some(&stale)));
+    // The file object changed and no current proof covers it.
+    let changed = explained(&unflagged, true, false, F::Unknown, Ok(&[]));
+    assert_eq!(
+        classify(&unflagged, &changed),
+        ProofCheck::Invalidated,
+        "{changed:?}"
+    );
+    // A file that is unavailable now (an unmounted drive) is not disproof.
+    let missing = explained(&game, false, true, F::Current, Ok(&[]));
+    assert_eq!(missing.reason, STALE_OR_CHANGED);
+    assert_eq!(missing.explanation, FILE_UNAVAILABLE);
+    assert_eq!(classify(&game, &missing), ProofCheck::NotEstablished);
+    assert_eq!(
+        identity(&game, Some(&missing)),
+        DetailIdentity::NotConfirmed
+    );
+    // Catalogue status could not be read; no catalogue is configured.
+    for answer in [
+        explained(&game, true, true, F::Current, Err("unreadable")),
+        explained(&game, true, true, F::Current, Ok(&[])),
+    ] {
+        assert_eq!(
+            classify(&game, &answer),
+            ProofCheck::NotEstablished,
+            "{answer:?}"
         );
     }
 }
 
 #[test]
-fn an_unreadable_answer_is_not_confirmed_and_never_disproves() {
+fn only_strict_invalidation_reads_recheck_needed() {
     let game = game(1, true);
-    for reason in [
-        "Verification evidence unavailable",
-        "Catalogue status unavailable",
-    ] {
-        let settled = identity(&game, Some(&answer(reason)));
-        assert_eq!(settled, DetailIdentity::NotConfirmed, "{reason}");
-        assert_eq!(settled.label(), "Verification not yet confirmed");
-        assert!(!disproves_library_match(&game, Some(&answer(reason))));
+    let stale = answer(STALE_OR_CHANGED);
+    let settled = identity(&game, Some(&stale));
+    assert_eq!(settled, DetailIdentity::RecheckNeeded);
+    assert_eq!(settled.label(), "Re-check needed");
+    assert!(!settled.is_verified());
+    // Once applied in memory, the game keeps saying so, whatever the panel
+    // says on a later visit, until the Library reloads from the database.
+    let mut invalidated = game.clone();
+    invalidated.dat_exact = None;
+    invalidated.dat_proof_invalidated = true;
+    assert_eq!(invalidated.dat_identity_summary(), "Re-check needed");
+    assert_eq!(invalidated.identity_summary(), "Re-check needed");
+    for panel in [None, Some(answer("Audit needs review"))] {
+        assert_eq!(
+            identity(&invalidated, panel.as_ref()),
+            DetailIdentity::RecheckNeeded
+        );
     }
 }
 

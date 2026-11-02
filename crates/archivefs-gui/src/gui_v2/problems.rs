@@ -678,6 +678,7 @@ pub(in crate::gui_v2) mod tests {
             dat_exact: None,
             dat_exact_hashes: None,
             dat_state: None,
+            dat_proof_invalidated: false,
             attention: missing,
             screenscraper: None,
             search: title.to_lowercase(),

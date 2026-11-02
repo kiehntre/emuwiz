@@ -9124,7 +9124,7 @@ fn stale_or_untrusted_dat_evidence_is_never_labelled_verified_in_game_details() 
         app.router.current = Route::Game(1);
         let strings = text(&frame(&context, &mut app, [1280.0, 900.0]));
         assert!(
-            shows(&strings, &format!("Identity: {}", review.list_label())),
+            shows(&strings, "Identity: Re-check needed"),
             "stale={stale} trusted={trusted}: {strings:?}"
         );
         assert!(
@@ -9144,12 +9144,30 @@ fn stale_or_untrusted_dat_evidence_is_never_labelled_verified_in_game_details() 
 fn game_details_identity_follows_this_games_panel_from_pending_to_answer() {
     let context = egui::Context::default();
     let size = [1280.0, 900.0];
-    for (answer, verified) in [
-        ("Verified", true),
-        ("File evidence stale or changed", false),
-        ("Saved exact match; freshness needs checking", false),
-        ("Configured DAT unavailable or disabled", false),
+    for (answer, settled, badge) in [
+        ("Verified", "Verified", "Verified"),
+        (
+            "File evidence stale or changed",
+            "Re-check needed",
+            "Re-check needed",
+        ),
+        (
+            "Catalogue selection required",
+            "Verification not yet confirmed",
+            "Verified",
+        ),
+        (
+            "Catalogue system coverage unresolved",
+            "Verification not yet confirmed",
+            "Verified",
+        ),
+        (
+            "Verification evidence unavailable",
+            "Verification not yet confirmed",
+            "Verified",
+        ),
     ] {
+        let verified = settled == "Verified";
         let mut app = review_app(&context, vec![(1, "Amidar", "Atari2600")]);
         app.review.knowledge_for = None;
         Arc::make_mut(&mut app.library).games[0].mark_dat_exact(Some("No-Intro"));
@@ -9176,30 +9194,35 @@ fn game_details_identity_follows_this_games_panel_from_pending_to_answer() {
             !shows(&strings, "Checking verification"),
             "{answer}: {strings:?}"
         );
-        let verified_lines = strings
+        // The Identity line and the card say the same thing.
+        let settled_lines = strings
             .iter()
-            .filter(|line| line.contains("Identity: Verified"))
+            .filter(|line| line.contains(&format!("Identity: {settled}")))
             .count();
-        assert_eq!(
-            verified_lines,
-            if verified { 2 } else { 0 },
-            "{answer}: {strings:?}"
-        );
+        assert_eq!(settled_lines, 2, "{answer}: {strings:?}");
+        if !verified {
+            assert!(
+                !shows(&strings, "Identity: Verified"),
+                "{answer}: {strings:?}"
+            );
+        }
         assert!(
             shows(&strings, "Checking whether this game is ready"),
             "verified identity never decides launch: {strings:?}"
         );
-        // The in-memory Library agrees; the database is never written here.
+        // The in-memory Library badge: kept unless strictly invalidated.
+        // The database is never written here.
         assert_eq!(
-            app.library.game(1).unwrap().dat_identity_summary() == "Verified",
-            verified,
+            app.library.game(1).unwrap().dat_identity_summary(),
+            badge,
             "{answer}"
         );
     }
 }
 
-/// A disproved match drops only that game's in-memory badge; an unreadable
-/// answer drops nothing and never says Verified.
+/// Only strict invalidation drops that one game's in-memory badge. Setup
+/// gaps, unreadable evidence and a cancelled check drop nothing and never
+/// say Verified.
 #[test]
 fn only_a_disproving_answer_clears_only_that_games_library_badge() {
     let context = egui::Context::default();
@@ -9224,12 +9247,55 @@ fn only_a_disproving_answer_clears_only_that_games_library_badge() {
         "Verified"
     );
 
-    panel_answered(&mut app, 1, "File evidence stale or changed");
+    for setup_gap in [
+        "Catalogue selection required",
+        "Catalogue system coverage unresolved",
+    ] {
+        panel_answered(&mut app, 1, setup_gap);
+        let strings = text(&frame(&context, &mut app, [1280.0, 900.0]));
+        assert!(
+            shows(&strings, "Identity: Verification not yet confirmed"),
+            "{setup_gap}: {strings:?}"
+        );
+        assert_eq!(
+            app.library.game(1).unwrap().dat_identity_summary(),
+            "Verified",
+            "{setup_gap} is not disproof"
+        );
+    }
+    // A check cancelled, or whose worker failed, before it answered.
+    let (cancelled, receiver) = std::sync::mpsc::channel();
+    app.review
+        .verification_guidance
+        .set_for_test(1, Some(receiver), None);
+    drop(cancelled);
     frame(&context, &mut app, [1280.0, 900.0]);
-    assert_ne!(
+    let strings = text(&frame(&context, &mut app, [1280.0, 900.0]));
+    assert!(
+        shows(&strings, "Identity: Verification not yet confirmed"),
+        "{strings:?}"
+    );
+    assert!(!shows(&strings, "Identity: Verified"), "{strings:?}");
+    assert_eq!(
         app.library.game(1).unwrap().dat_identity_summary(),
         "Verified"
     );
+
+    panel_answered(&mut app, 1, "File evidence stale or changed");
+    let strings = text(&frame(&context, &mut app, [1280.0, 900.0]));
+    assert_eq!(
+        app.library.game(1).unwrap().dat_identity_summary(),
+        "Re-check needed"
+    );
+    assert_eq!(
+        strings
+            .iter()
+            .filter(|line| line.contains("Identity: Re-check needed"))
+            .count(),
+        2,
+        "line and card: {strings:?}"
+    );
+    assert!(!shows(&strings, "Identity: Verified"), "{strings:?}");
     assert_eq!(
         app.library.game(2).unwrap().dat_identity_summary(),
         "Verified",

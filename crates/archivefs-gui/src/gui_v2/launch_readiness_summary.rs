@@ -55,6 +55,12 @@ pub(crate) enum IdentitySummary {
     /// A DAT match is on record, but this game's current proof is still
     /// being checked. Says nothing about launch.
     VerificationPending,
+    /// The check finished without establishing current proof either way
+    /// (setup gap, unreadable evidence, unavailable file). Not a disproof.
+    VerificationNotConfirmed,
+    /// This game's fresh check established its earlier proof is no longer
+    /// current.
+    RecheckNeeded,
     Mismatch,
 }
 
@@ -1274,10 +1280,17 @@ pub(crate) fn note_file_missing(summary: &mut GameReadinessSummary) {
     }
 }
 
-/// The identity line only: status, headline and actions keep their answer.
-pub(crate) fn note_identity_pending(summary: &mut GameReadinessSummary) {
+/// Game Details' DAT identity answer, on the identity line only: status,
+/// headline and actions keep their answer. Never upgrades to Verified.
+pub(crate) fn note_dat_identity(summary: &mut GameReadinessSummary, identity: IdentitySummary) {
+    debug_assert!(matches!(
+        identity,
+        IdentitySummary::VerificationPending
+            | IdentitySummary::VerificationNotConfirmed
+            | IdentitySummary::RecheckNeeded
+    ));
     if summary.identity == IdentitySummary::NeedsReview {
-        summary.identity = IdentitySummary::VerificationPending;
+        summary.identity = identity;
     }
 }
 
@@ -1307,6 +1320,8 @@ fn identity_label(identity: IdentitySummary) -> &'static str {
         IdentitySummary::CatalogueVerified => "Verified · file identity still needed to launch",
         IdentitySummary::Verified => "Verified",
         IdentitySummary::VerificationPending => "Checking verification",
+        IdentitySummary::VerificationNotConfirmed => "Verification not yet confirmed",
+        IdentitySummary::RecheckNeeded => "Re-check needed",
         IdentitySummary::Mismatch => "Mismatch / blocked",
     }
 }
