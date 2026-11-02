@@ -179,6 +179,11 @@ impl App {
             self.arcade_shelf_empty(ui);
             return;
         }
+        // First open: prepare the shared cover index read-only (discovery
+        // only, never the thumbnail-cache eviction), so no other page is needed.
+        if self.loaded && self.artwork.index.is_none() && !self.artwork.index_loading {
+            self.artwork.reload_read_only(library.clone());
+        }
         let mut state = std::mem::take(&mut self.tools.arcade_shelf);
         let mut cursor = state
             .cursor
@@ -421,14 +426,13 @@ impl App {
         (happened, response.has_focus())
     }
 
-    /// The game's cover from local artwork or the disk cache only, or a quiet
-    /// placeholder. Off-screen covers are never requested.
+    /// The game's cover from local artwork or the disk cache only, read-only,
+    /// or a quiet placeholder. Off-screen covers are never requested.
     fn arcade_shelf_cover(&mut self, ui: &mut egui::Ui, game: &Game) {
         let (rect, _) = ui.allocate_exact_size(COVER, egui::Sense::hover());
         if !ui.is_rect_visible(rect) {
             return;
         }
-        self.ensure_artwork_index();
         let key = self.artwork.request_local(game.archive.id, Kind::Cover);
         ui.painter().rect_filled(rect, 8.0, theme::deep_fill(ui));
         match self.artwork.pictures.get(&key) {
@@ -443,9 +447,12 @@ impl App {
                 );
             }
             picture => {
-                let waiting = matches!(picture, Some(Picture::Loading))
-                    || (picture.is_none() && self.artwork.index.is_none());
-                let text = if waiting { "…" } else { "No local cover" };
+                let text =
+                    if matches!(picture, Some(Picture::Loading)) || self.artwork.index.is_none() {
+                        "…"
+                    } else {
+                        "No local cover"
+                    };
                 ui.painter().text(
                     rect.center(),
                     egui::Align2::CENTER_CENTER,

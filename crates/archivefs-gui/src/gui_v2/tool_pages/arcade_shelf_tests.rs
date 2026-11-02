@@ -20,6 +20,9 @@ fn key(key: egui::Key) -> egui::Event {
 }
 
 fn frame(context: &egui::Context, app: &mut App, events: Vec<egui::Event>) -> egui::FullOutput {
+    // `App::ui` polls background replies (artwork included) before showing a
+    // frame; `App::show` alone does not, so do it here as production does.
+    app.artwork.begin_frame(context);
     context.run(
         egui::RawInput {
             screen_rect: Some(egui::Rect::from_min_size(
@@ -245,4 +248,108 @@ fn a_very_large_library_lays_out_only_visible_covers_and_reaches_the_last() {
         shown |= visible_text(&output, "Game 19999");
     }
     assert!(shown, "the last cover never came into view");
+}
+
+/// Every file under `root` with its size and modification time.
+fn tree(root: &std::path::Path) -> Vec<(std::path::PathBuf, u64, std::time::SystemTime)> {
+    let mut found = Vec::new();
+    let mut pending = vec![root.to_path_buf()];
+    while let Some(directory) = pending.pop() {
+        let Ok(entries) = std::fs::read_dir(&directory) else {
+            continue;
+        };
+        for entry in entries.flatten() {
+            let metadata = std::fs::symlink_metadata(entry.path()).unwrap();
+            if metadata.is_dir() {
+                pending.push(entry.path());
+            }
+            found.push((entry.path(), metadata.len(), metadata.modified().unwrap()));
+        }
+    }
+    found.sort();
+    found
+}
+
+/// First open on a fresh launch: the shelf prepares its own cover index and
+/// shows local covers, and opening, scrolling and moving through it writes
+/// nothing: with an isolated thumbnail cache, no cache directory or file
+/// appears and the cover files are untouched.
+#[test]
+fn browsing_and_scrolling_the_shelf_writes_no_files() {
+    use crate::gui_v2::{
+        artwork::{Artwork, Picture},
+        media_sources::{MediaIndex, Source},
+    };
+    let directory = tempfile::tempdir().unwrap();
+    let covers = directory.path().join("covers");
+    std::fs::create_dir(&covers).unwrap();
+    let titles: Vec<String> = (0..300).map(|n| format!("Game {n:03}")).collect();
+    let mut games = Vec::new();
+    let mut covers_by_game = Vec::new();
+    for (n, title) in titles.iter().enumerate() {
+        let id = n as i64 + 1;
+        let platform = if n < 40 {
+            "Alpha Console"
+        } else {
+            "Zeta Console"
+        };
+        games.push((id, title.as_str(), platform));
+        let path = covers.join(format!("{id}.png"));
+        image::RgbaImage::from_pixel(12, 16, image::Rgba([40, 90, 200, 255]))
+            .save(&path)
+            .unwrap();
+        covers_by_game.push((id, path));
+    }
+    let context = egui::Context::default();
+    let mut app = shelf_app(&context, games);
+    let cache = directory.path().join("thumbs");
+    // A fresh launch: no index yet, and no other page has been opened. The
+    // shelf prepares it itself.
+    app.artwork = Artwork::with_indexer(
+        context.clone(),
+        Some(cache.clone()),
+        Arc::new(move |_| {
+            let mut index = MediaIndex::default();
+            for (id, path) in &covers_by_game {
+                index.covers.insert(*id, Source::Local(path.clone()));
+            }
+            index
+        }),
+    );
+    assert!(app.artwork.index.is_none());
+    let before = tree(directory.path());
+
+    let keys = [
+        vec![],
+        vec![key(egui::Key::ArrowDown)],
+        vec![key(egui::Key::End)],
+        vec![key(egui::Key::ArrowDown)],
+        vec![key(egui::Key::End)],
+        vec![key(egui::Key::Home)],
+        vec![key(egui::Key::ArrowUp)],
+    ];
+    for events in keys {
+        frame(&context, &mut app, events);
+        for _ in 0..40 {
+            frame(&context, &mut app, Vec::new());
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+    }
+    let ready = app
+        .artwork
+        .pictures
+        .iter()
+        .filter(|(key, picture)| key.local_only && matches!(picture, Picture::Ready { .. }))
+        .count();
+    assert!(
+        app.artwork.index.is_some(),
+        "the shelf did not prepare covers"
+    );
+    assert!(ready > 0, "no local cover was shown");
+    assert!(
+        app.artwork.pictures.keys().all(|key| key.local_only),
+        "the shelf asked for an ordinary (writing, possibly online) picture"
+    );
+    assert_eq!(tree(directory.path()), before);
+    assert!(!cache.exists());
 }
