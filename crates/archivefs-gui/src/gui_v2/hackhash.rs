@@ -591,7 +591,7 @@ impl HackHashPageState {
             }
             let mut rollback_status = None;
             if let Some(result) = &self.apply_result {
-                ui.label(format!("Apply result: {:?}", result.shared.journal.status));
+                show_apply_status(ui, &result.shared);
                 ui.separator();
                 ui.strong("Patch result provenance");
                 ui.label(format!(
@@ -700,9 +700,23 @@ impl HackHashPageState {
     }
 }
 
+fn show_apply_status(ui: &mut egui::Ui, result: &archivefs_core::patch_manager::SharedApplyResult) {
+    ui.label(format!("Apply result: {:?}", result.journal.status));
+    crate::shared_apply_warnings::show(ui, &crate::shared_apply_warnings::lines(result));
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn apply_result_shows_shared_transaction_warnings() {
+        use crate::shared_apply_warnings::test_support::{
+            assert_shows_warning, render, warned_result,
+        };
+        let result = warned_result();
+        assert_shows_warning(&render(|ui| show_apply_status(ui, &result)));
+    }
 
     #[test]
     fn initial_source_surface_is_offline_and_unactivated() {

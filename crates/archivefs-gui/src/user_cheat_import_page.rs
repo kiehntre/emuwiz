@@ -24,22 +24,23 @@ use archivefs_core::patch_manager::{
     DolphinInstallPreviewRequest, LocalDolphinInstallState, LocalPcsx2InstallState,
     LocalXeniaInstallState, Pcsx2GameIdentity, Pcsx2InstallPreview, Pcsx2InstallPreviewRequest,
     Pcsx2Profile, PreviewProposedAction, SharedApplyConfirmation, SharedApplyOptions,
-    SharedApplyStatus, SharedRollbackConfirmation, SharedRollbackOptions, SharedRollbackPreview,
-    UserCheatCandidate, UserCheatDiagnostic, UserCheatFormat, UserCheatImportError,
-    UserCheatImportReport, UserCheatLibraryGame, UserCheatMatchState, XeniaInstallPreview,
-    XeniaInstallPreviewRequest, XeniaProfile, apply_cheat_journey, build_dolphin_install_preview,
-    build_pcsx2_install_preview, build_shared_transaction_plan, build_xenia_install_preview,
-    check_local_dolphin_install_state, check_local_pcsx2_install_state,
-    check_local_xenia_install_state, decode_action_replay, default_shared_backup_root,
-    default_shared_history_root, detect_action_replay_format, discover_local_dolphin_cheat_file,
-    discover_local_pcsx2_pnach_file, discover_local_retroarch_cheat_file,
-    discover_local_xenia_patch_file, dolphin_line_to_ir, dolphin_on_frame_line_to_ir,
-    execute_shared_apply, execute_shared_rollback, generate_shared_operation_id,
-    load_dolphin_destination, load_local_xenia_destination, parse_ds_action_replay_document,
-    pnach_line_to_ir, preview_cheat_journey, preview_cheat_journey_undo, preview_cheat_pack,
-    preview_shared_rollback, scan_user_cheat_directory, scan_user_cheat_file,
-    select_cheat_journey_candidate, stage_local_dolphin_codes, stage_local_xenia_patch_file,
-    stage_pcsx2_pnach, supported_targets_for, undo_cheat_journey,
+    SharedApplyResult, SharedApplyStatus, SharedRollbackConfirmation, SharedRollbackOptions,
+    SharedRollbackPreview, UserCheatCandidate, UserCheatDiagnostic, UserCheatFormat,
+    UserCheatImportError, UserCheatImportReport, UserCheatLibraryGame, UserCheatMatchState,
+    XeniaInstallPreview, XeniaInstallPreviewRequest, XeniaProfile, apply_cheat_journey,
+    build_dolphin_install_preview, build_pcsx2_install_preview, build_shared_transaction_plan,
+    build_xenia_install_preview, check_local_dolphin_install_state,
+    check_local_pcsx2_install_state, check_local_xenia_install_state, decode_action_replay,
+    default_shared_backup_root, default_shared_history_root, detect_action_replay_format,
+    discover_local_dolphin_cheat_file, discover_local_pcsx2_pnach_file,
+    discover_local_retroarch_cheat_file, discover_local_xenia_patch_file, dolphin_line_to_ir,
+    dolphin_on_frame_line_to_ir, execute_shared_apply, execute_shared_rollback,
+    generate_shared_operation_id, load_dolphin_destination, load_local_xenia_destination,
+    parse_ds_action_replay_document, pnach_line_to_ir, preview_cheat_journey,
+    preview_cheat_journey_undo, preview_cheat_pack, preview_shared_rollback,
+    scan_user_cheat_directory, scan_user_cheat_file, select_cheat_journey_candidate,
+    stage_local_dolphin_codes, stage_local_xenia_patch_file, stage_pcsx2_pnach,
+    supported_targets_for, undo_cheat_journey,
 };
 #[path = "user_cheat_import_page/verified_conversion.rs"]
 mod verified_conversion;
@@ -520,6 +521,13 @@ pub(crate) struct UserCheatImportPageState {
     converter_context_key: Option<String>,
     technical_details: bool,
     local_install: LocalInstallStage,
+    /// Warnings from the last Apply of each local flow, shown by its Applied
+    /// stage. Undo previews and Undo cancels rebuild that stage, so they live
+    /// beside it, and every Apply replaces them.
+    local_install_warnings: Vec<String>,
+    local_pcsx2_install_warnings: Vec<String>,
+    local_dolphin_install_warnings: Vec<String>,
+    local_xenia_install_warnings: Vec<String>,
     /// The RetroArch destination the current emulator choice resolves to,
     /// refreshed every frame; a local install only writes when its preview
     /// still targets exactly this.
@@ -1261,6 +1269,7 @@ impl UserCheatImportPageState {
                     if let Some(transaction_id) = transaction_id {
                         ui.label(format!("Transaction: {transaction_id}"));
                     }
+                    crate::shared_apply_warnings::show(ui, &session.apply_warnings());
                     if session.rollback_available && ui.button("Undo this install").clicked() {
                         session.prepare_rollback();
                     }
@@ -1278,6 +1287,7 @@ impl UserCheatImportPageState {
                         detail,
                         widgets::StatusTone::Blocked,
                     );
+                    crate::shared_apply_warnings::show(ui, &session.apply_warnings());
                 }
                 crate::onframe_install_state::OnFrameInstallState::Failed { message } => {
                     widgets::banner(
@@ -1779,9 +1789,10 @@ impl UserCheatImportPageState {
     fn record_local_apply(
         &mut self,
         destination_root: PathBuf,
-        result: archivefs_core::patch_manager::SharedApplyResult,
+        result: SharedApplyResult,
         transaction_id: String,
     ) {
+        self.local_install_warnings = crate::shared_apply_warnings::lines(&result);
         self.local_install = if local_journey_apply_recorded(&result) {
             LocalInstallStage::Applied {
                 destination_root,
@@ -2014,6 +2025,7 @@ impl UserCheatImportPageState {
                 let mut dismissed = false;
                 widgets::card(ui, |ui| {
                     widgets::status_badge(ui, "Installed", widgets::StatusTone::Success);
+                    crate::shared_apply_warnings::show(ui, &self.local_install_warnings);
                     if let Some(journal_path) = journal_path.as_ref() {
                         ui.label(format!("Transaction journal: {}", journal_path.display()));
                     }
@@ -2305,13 +2317,20 @@ impl UserCheatImportPageState {
             if let Ok(root) = result.journal.approved_source_root.to_path_buf() {
                 archivefs_core::patch_manager::retire_completed_staging_job(&root);
             }
+        }
+        self.record_local_pcsx2_apply(destination_root, result);
+    }
+
+    fn record_local_pcsx2_apply(&mut self, destination_root: PathBuf, result: SharedApplyResult) {
+        if result.journal.status == SharedApplyStatus::Success {
+            self.local_pcsx2_install_warnings = crate::shared_apply_warnings::lines(&result);
             self.local_pcsx2_install = LocalPcsx2InstallStage::Applied {
                 destination_root,
                 journal_path: result.journal_path,
             };
         } else {
             self.local_pcsx2_install = LocalPcsx2InstallStage::Error {
-                message: format!("Apply did not fully succeed: {:?}", result.journal.status),
+                message: local_apply_failure_message(&result),
             };
         }
     }
@@ -2518,6 +2537,7 @@ impl UserCheatImportPageState {
                 let mut dismissed = false;
                 widgets::card(ui, |ui| {
                     widgets::status_badge(ui, "Installed", widgets::StatusTone::Success);
+                    crate::shared_apply_warnings::show(ui, &self.local_pcsx2_install_warnings);
                     if let Some(journal_path) = journal_path.as_ref() {
                         ui.label(format!("Transaction journal: {}", journal_path.display()));
                     }
@@ -2777,14 +2797,19 @@ impl UserCheatImportPageState {
                 backup_root,
             },
         );
+        self.record_local_dolphin_apply(destination_root, result);
+    }
+
+    fn record_local_dolphin_apply(&mut self, destination_root: PathBuf, result: SharedApplyResult) {
         if result.journal.status == SharedApplyStatus::Success {
+            self.local_dolphin_install_warnings = crate::shared_apply_warnings::lines(&result);
             self.local_dolphin_install = LocalDolphinInstallStage::Applied {
                 destination_root,
                 journal_path: result.journal_path,
             };
         } else {
             self.local_dolphin_install = LocalDolphinInstallStage::Error {
-                message: format!("Apply did not fully succeed: {:?}", result.journal.status),
+                message: local_apply_failure_message(&result),
             };
         }
     }
@@ -2988,6 +3013,7 @@ impl UserCheatImportPageState {
                 let mut dismissed = false;
                 widgets::card(ui, |ui| {
                     widgets::status_badge(ui, "Installed", widgets::StatusTone::Success);
+                    crate::shared_apply_warnings::show(ui, &self.local_dolphin_install_warnings);
                     if let Some(journal_path) = journal_path.as_ref() {
                         ui.label(format!("Transaction journal: {}", journal_path.display()));
                     }
@@ -3509,14 +3535,19 @@ impl UserCheatImportPageState {
                 backup_root,
             },
         );
+        self.record_local_xenia_apply(configuration_path, result);
+    }
+
+    fn record_local_xenia_apply(&mut self, configuration_path: PathBuf, result: SharedApplyResult) {
         if result.journal.status == SharedApplyStatus::Success {
+            self.local_xenia_install_warnings = crate::shared_apply_warnings::lines(&result);
             self.local_xenia_install = LocalXeniaInstallStage::Applied {
                 destination_root: configuration_path,
                 journal_path: result.journal_path,
             };
         } else {
             self.local_xenia_install = LocalXeniaInstallStage::Error {
-                message: format!("Apply did not fully succeed: {:?}", result.journal.status),
+                message: local_apply_failure_message(&result),
             };
         }
     }
@@ -3624,6 +3655,7 @@ impl UserCheatImportPageState {
                 journal_path,
             } => {
                 widgets::status_badge(ui, "Installed", widgets::StatusTone::Success);
+                crate::shared_apply_warnings::show(ui, &self.local_xenia_install_warnings);
                 if let Some(path) = journal_path.as_ref() {
                     ui.label(format!("Transaction journal: {}", path.display()));
                 }
@@ -3893,6 +3925,12 @@ fn format_diagnostic(diagnostic: &UserCheatDiagnostic) -> String {
     format!("{}: {}", diagnostic.path.display(), diagnostic.message)
 }
 
+fn local_apply_failure_message(result: &SharedApplyResult) -> String {
+    let mut message = format!("Apply did not fully succeed: {:?}", result.journal.status);
+    crate::shared_apply_warnings::append(&mut message, result);
+    message
+}
+
 /// Status alone is not enough: an already-installed file keeps `Success` when
 /// its journal could not be written, and that Apply has no Undo.
 fn local_journey_apply_recorded(result: &archivefs_core::patch_manager::SharedApplyResult) -> bool {
@@ -3936,12 +3974,67 @@ fn local_journey_apply_failure_message(
     if let Some(failure) = &result.journal_failure {
         message.push_str(&format!("\nHistory record: {}", failure.detail));
     }
+    crate::shared_apply_warnings::append(&mut message, result);
     message
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::shared_apply_warnings::test_support::{assert_shows_warning, render, warned_result};
+
+    #[test]
+    fn local_journey_apply_shows_shared_transaction_warnings() {
+        let mut page = UserCheatImportPageState::default();
+        let mut recorded = warned_result();
+        recorded.journal_path = Some(PathBuf::from("/disposable/journal.json"));
+        page.record_local_apply(PathBuf::from("/disposable"), recorded, "t".into());
+        assert!(matches!(
+            page.local_install,
+            LocalInstallStage::Applied { .. }
+        ));
+        assert_shows_warning(&render(|ui| page.show_local_install_panel(ui)));
+    }
+
+    #[test]
+    fn an_unrecorded_local_journey_apply_keeps_its_warnings_in_the_error() {
+        let mut page = UserCheatImportPageState::default();
+        page.record_local_apply(PathBuf::from("/disposable"), warned_result(), "t".into());
+        let LocalInstallStage::Error { message } = &page.local_install else {
+            panic!("an Apply with no journal must not show Installed");
+        };
+        assert_shows_warning(message);
+    }
+
+    #[test]
+    fn local_pcsx2_apply_shows_shared_transaction_warnings() {
+        let mut page = UserCheatImportPageState::default();
+        page.record_local_pcsx2_apply(PathBuf::from("/disposable"), warned_result());
+        assert_shows_warning(&render(|ui| page.show_local_pcsx2_install_panel(ui)));
+    }
+
+    #[test]
+    fn local_dolphin_apply_shows_shared_transaction_warnings() {
+        let mut page = UserCheatImportPageState::default();
+        page.record_local_dolphin_apply(PathBuf::from("/disposable"), warned_result());
+        assert_shows_warning(&render(|ui| page.show_local_dolphin_install_panel(ui)));
+    }
+
+    #[test]
+    fn local_xenia_apply_shows_shared_transaction_warnings() {
+        let mut page = UserCheatImportPageState::default();
+        page.record_local_xenia_apply(PathBuf::from("/disposable"), warned_result());
+        assert_shows_warning(&render(|ui| page.show_local_xenia_install_panel(ui)));
+    }
+
+    #[test]
+    fn a_failed_local_apply_keeps_its_warnings_in_the_error() {
+        let mut result = warned_result();
+        result.journal.status = SharedApplyStatus::PartialFailure;
+        let message = local_apply_failure_message(&result);
+        assert!(message.starts_with("Apply did not fully succeed"));
+        assert_shows_warning(&message);
+    }
     use archivefs_core::patch_manager::{
         CheatJourneyApplyResult, SharedApplyFailure, SharedApplyFailureKind, SharedApplyOutcome,
     };

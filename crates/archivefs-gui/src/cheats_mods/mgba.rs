@@ -129,10 +129,12 @@ impl MgbaPageState {
                 self.outcome = Some("Preview only — no emulator or game files changed".into());
             }
             Ok(Message::Applied(r)) => {
-                self.outcome = Some(format!(
+                let mut outcome = format!(
                     "Install result: {:?}. Runtime cheat effectiveness remains unverified. Journal: {:?}",
                     r.journal.status, r.journal_path
-                ));
+                );
+                crate::shared_apply_warnings::append(&mut outcome, &r);
+                self.outcome = Some(outcome);
                 if r.journal.status != SharedApplyStatus::Success {
                     self.failure = Some(format!(
                         "Install incomplete or refused: {:?}; journal evidence: {:?}. Refresh History and inspect retained recovery guidance",
@@ -583,6 +585,20 @@ pub(crate) fn show(
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn apply_result_shows_shared_transaction_warnings() {
+        use crate::shared_apply_warnings::test_support::{assert_shows_warning, warned_result};
+        let (tx, rx) = mpsc::channel();
+        let mut state = MgbaPageState {
+            receiver: Some(rx),
+            ..Default::default()
+        };
+        tx.send(Ok(Message::Applied(Box::new(warned_result()))))
+            .unwrap();
+        state.poll();
+        assert_shows_warning(state.outcome.as_deref().unwrap());
+    }
+
     use super::*;
     use archivefs_core::game_identity::*;
     fn identity() -> GameIdentityReport {

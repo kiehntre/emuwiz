@@ -219,3 +219,17 @@ fn completed_undo_clears_selection_before_catalog_is_removed() {
     assert!(!s.enabled);
     assert!(!s.confirmed);
 }
+
+#[test]
+fn apply_result_shows_shared_transaction_warnings() {
+    use crate::shared_apply_warnings::test_support::{assert_shows_warning, warned_result};
+    let (tx, rx) = mpsc::channel();
+    let mut state = Rpcs3PageState {
+        receiver: Some(rx),
+        ..Default::default()
+    };
+    tx.send(Ok(Message::Applied(Box::new(warned_result()))))
+        .unwrap();
+    state.poll();
+    assert_shows_warning(state.outcome.as_deref().unwrap());
+}

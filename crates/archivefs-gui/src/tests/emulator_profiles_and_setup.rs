@@ -4414,6 +4414,52 @@ fn undo_appears_after_a_successful_beginner_install_result() {
 }
 
 #[test]
+fn cheat_install_results_show_shared_transaction_warnings() {
+    use crate::shared_apply_warnings::test_support::{assert_shows_warning, render, warned_result};
+    let temp = std::env::temp_dir().join(format!(
+        "archivefs-gui-shared-warnings-{}",
+        std::process::id()
+    ));
+    std::fs::create_dir_all(&temp).unwrap();
+    let mut app = dolphin_workflow_ready_for_beginner_install(&temp);
+    let workflow = app.cheat_workflow.as_ref().unwrap();
+    let result = warned_result();
+    assert_shows_warning(&render(|ui| {
+        let _ = show_beginner_install_result(ui, &result, None);
+    }));
+    assert_shows_warning(&render(|ui| {
+        let _ = crate::cheats_mods::show_bsfree_install_result(ui, workflow, &result);
+    }));
+
+    let workflow = app.cheat_workflow.as_mut().unwrap();
+    let mut transaction = CheatTransactionState::Result {
+        key: cheat_preview_key(workflow),
+        result: warned_result(),
+    };
+    let report = SharedPreviewReport {
+        request_archive: PathBuf::from("/roms/a.zip"),
+        adapter: PreviewAdapter::Dolphin,
+        entries: Vec::new(),
+        conflicts: Vec::new(),
+        warnings: Vec::new(),
+        summary: Default::default(),
+        complete: true,
+    };
+    let mut clipboard = InMemoryClipboard::default();
+    assert_shows_warning(&render(|ui| {
+        let _ = crate::cheats_mods_preview::show_shared_transaction_readiness(
+            ui,
+            &report,
+            true,
+            &mut transaction,
+            None,
+            &mut clipboard,
+        );
+    }));
+    let _ = std::fs::remove_dir_all(&temp);
+}
+
+#[test]
 fn beginner_failure_result_names_failed_stage_and_live_target() {
     let mut result = successful_shared_apply_result();
     result.journal.status = SharedApplyStatus::Failed;

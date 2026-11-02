@@ -6314,11 +6314,17 @@ pub(crate) fn apply_pcsx2_pending_legacy_migration(
         ActivityAction::CheatInstall,
         archive_path,
         outcome,
-        format!(
-            "Legacy PNACH migration '{}' finished with {:?} (undo available from History & Logs).",
-            result.journal.operation_id, result.journal.status
-        ),
+        legacy_migration_history_detail(&result),
     ))
+}
+
+fn legacy_migration_history_detail(result: &SharedApplyResult) -> String {
+    let mut detail = format!(
+        "Legacy PNACH migration '{}' finished with {:?} (undo available from History & Logs).",
+        result.journal.operation_id, result.journal.status
+    );
+    crate::shared_apply_warnings::append(&mut detail, result);
+    detail
 }
 
 pub(crate) fn run_bsfree_operation(
@@ -6414,4 +6420,17 @@ pub(crate) fn staging_job_consumed(root: &std::path::Path) -> bool {
         .and_then(std::path::Path::file_name)
         .is_some_and(|name| name.to_string_lossy().starts_with("generated-"));
     job && base && std::fs::symlink_metadata(root).is_err()
+}
+
+#[cfg(test)]
+mod shared_apply_warning_tests {
+    use super::*;
+    use crate::shared_apply_warnings::test_support::{assert_shows_warning, warned_result};
+
+    #[test]
+    fn legacy_migration_history_shows_shared_transaction_warnings() {
+        let detail = legacy_migration_history_detail(&warned_result());
+        assert!(detail.starts_with("Legacy PNACH migration 'warned-op'"));
+        assert_shows_warning(&detail);
+    }
 }
