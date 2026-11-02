@@ -7,6 +7,8 @@
 
 use eframe::egui::{self, RichText};
 
+mod showcase;
+
 use super::{library::Game, simple_shell::palette};
 use crate::ui::theme::{self, blue};
 
