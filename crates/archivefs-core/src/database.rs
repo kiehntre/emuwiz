@@ -1873,7 +1873,8 @@ fn classify_existing_database(path: &Path, migrations: &[Migration]) -> Result<E
     }
     Err(ArchiveFsError::Database(format!(
         "The library database at {} uses schema {version}, but this build requires schema \
-         {latest}. It has not been changed. Upgrade it with \"Scan and upgrade library\" (the \
+         {latest}. It has not been changed. Upgrade it with \"Scan and upgrade library\", or \
+         with `emuwiz-cli library-upgrade --confirm`, which does not scan (both are the \
          protected upgrade that takes a verified backup first); ordinary opens never migrate.",
         path.display()
     )))
@@ -12019,6 +12020,7 @@ mod tests {
                 "source_nested_boundaries",
                 "source_review_required",
                 "source_scan_bindings",
+                "sqlite_sequence",
                 "verified_identity_facts",
             ]
         );

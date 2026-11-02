@@ -355,7 +355,10 @@ fn deleting_the_listed_collection_returns_to_all_games() {
     f.settle();
     let id = f.state.scope.expect("a new collection opens");
     assert_eq!(f.state.scoped().unwrap().name, "Mine");
-    f.state.change(super::Change::Delete { collection: id });
+    f.state.change(super::Change::Delete {
+        collection: id,
+        seen: "Mine".into(),
+    });
     f.settle();
     assert_eq!(f.state.scope, None);
 }
@@ -607,4 +610,98 @@ fn a_new_row_on_the_items_own_id_and_place_moves_the_item() {
     let (_, moves) = build_views(&favourites(vec![saved]), &library());
     assert_eq!(moves.len(), 1);
     assert_eq!(moves[0].current_archive_id, 2);
+}
+
+#[test]
+fn a_write_failure_is_not_replaced_by_the_read_failure_after_it() {
+    let mut f = fixture();
+    let favourites = f.favourites_id();
+    let game = f.ids[0];
+    let c = rusqlite::Connection::open(&f.path).unwrap();
+    c.execute_batch("DROP TABLE game_collection_items;")
+        .unwrap();
+    drop(c);
+    let library = f.library.clone();
+    f.state.toggle(favourites, game, &library);
+    f.settle();
+    assert!(f.state.message.as_deref().unwrap().contains("not saved"));
+}
+
+#[test]
+fn a_failed_first_read_says_so_and_offers_another_try() {
+    let context = eframe::egui::Context::default();
+    let mut app = star_app(&context);
+    app.collections.saved.clear();
+    app.collections.views.clear();
+    app.collections.message = Some(super::READ_FAILED.into());
+    frame(&context, &mut app, vec![]);
+    let strings = super::super::tests::text(&frame(&context, &mut app, vec![]));
+    assert!(
+        strings.iter().any(|s| s == super::READ_FAILED),
+        "{strings:?}"
+    );
+    assert!(strings.iter().any(|s| s == "Try again"), "{strings:?}");
+}
+
+#[test]
+fn the_gone_dialog_stays_on_its_own_collection_when_the_page_changes() {
+    let context = eframe::egui::Context::default();
+    let mut app = star_app(&context);
+    let mut saved = favourites(Vec::new());
+    for (id, name) in [(5, "Alpha list"), (6, "Beta list")] {
+        saved.push(GameCollection {
+            id,
+            kind: GameCollectionKind::User,
+            name: name.into(),
+            items: vec![item(1000 + id, None, "2026-01-01")],
+        });
+    }
+    app.collections.saved = saved;
+    let library = app.library.clone();
+    app.collections.library_changed(&library);
+    app.collections.scope = Some(6);
+    app.collections.dialog = super::Dialog::Gone { collection: 5 };
+    frame(&context, &mut app, vec![]);
+    let strings = super::super::tests::text(&frame(&context, &mut app, vec![]));
+    assert!(
+        strings
+            .iter()
+            .any(|s| s.contains("Alpha list") && s.starts_with("Saved in")),
+        "{strings:?}"
+    );
+    assert!(strings.iter().any(|s| s == "Saved 1005"), "{strings:?}");
+    assert!(!strings.iter().any(|s| s == "Saved 1006"), "{strings:?}");
+}
+
+#[test]
+fn removing_a_game_while_its_item_is_being_moved_removes_the_moved_item() {
+    let mut f = fixture();
+    let favourites = f.favourites_id();
+    let (old, new) = (f.ids[0], f.ids[1]);
+    let library = f.library.clone();
+    f.state.toggle(favourites, old, &library);
+    f.settle();
+    let stored = Database::open_read_only(&f.path)
+        .unwrap()
+        .load_game_collections()
+        .unwrap()[0]
+        .items[0]
+        .stored_created_at
+        .clone();
+    let step = archivefs_core::CollectionReanchor {
+        stored_archive_id: old,
+        stored_created_at: stored,
+        current_archive_id: new,
+    };
+    // The move lands while the page still shows the old key.
+    let mut database = Database::open_existing(&f.path).unwrap();
+    database
+        .reanchor_collection_items(std::slice::from_ref(&step))
+        .unwrap();
+    database.close().unwrap();
+    f.state.reanchoring = vec![step];
+    f.state.toggle(favourites, old, &library);
+    f.settle();
+    let saved = Database::open_read_only(&f.path).unwrap();
+    assert!(saved.load_game_collections().unwrap()[0].items.is_empty());
 }

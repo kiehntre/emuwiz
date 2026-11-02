@@ -62,8 +62,12 @@ fn favourites_exists_from_the_start_and_cannot_be_renamed_or_deleted() {
     assert_eq!(collections.len(), 1);
     assert_eq!(collections[0].kind, GameCollectionKind::Favourites);
     let id = f.database.favourites_collection_id().unwrap();
-    assert!(f.database.rename_game_collection(id, "Other").is_err());
-    assert!(f.database.delete_game_collection(id).is_err());
+    assert!(
+        f.database
+            .rename_game_collection(id, "Favourites", "Other")
+            .is_err()
+    );
+    assert!(f.database.delete_game_collection(id, "Favourites").is_err());
     assert_eq!(f.database.load_game_collections().unwrap().len(), 1);
 }
 
@@ -81,7 +85,7 @@ fn names_are_tidied_unique_ignoring_case_and_bounded() {
     assert!(f.database.create_game_collection("   ").is_err());
     assert!(f.database.create_game_collection(&"x".repeat(61)).is_err());
     f.database
-        .rename_game_collection(id, "couch CO-OP")
+        .rename_game_collection(id, "Couch co-op", "couch CO-OP")
         .unwrap();
     assert_eq!(
         f.database.load_game_collections().unwrap()[1].name,
@@ -122,7 +126,7 @@ fn deleting_a_collection_leaves_games_and_other_collections_alone() {
     f.database
         .add_game_to_collection(favourites_id, id)
         .unwrap();
-    f.database.delete_game_collection(user).unwrap();
+    f.database.delete_game_collection(user, "Mine").unwrap();
     assert_eq!(f.database.load_archives().unwrap().len(), 1);
     assert_eq!(favourites(&f.database), vec![(id, Some(id))]);
 }
@@ -375,4 +379,35 @@ fn a_row_that_took_the_same_id_at_the_same_place_is_saved_against() {
         .unwrap();
     let saved = f.database.load_game_collections().unwrap()[0].items[0].clone();
     assert_eq!(saved.stored_created_at, "rescanned");
+}
+
+#[test]
+fn a_deleted_collections_id_is_never_given_to_another() {
+    let mut f = fixture(&[]);
+    let old = f.database.create_game_collection("Old").unwrap();
+    f.database.delete_game_collection(old, "Old").unwrap();
+    let new = f.database.create_game_collection("Keep").unwrap();
+    assert_ne!(new, old);
+    // A second click from a window still showing "Old" reaches nothing.
+    assert!(f.database.delete_game_collection(old, "Old").is_err());
+    assert_eq!(f.database.load_game_collections().unwrap().len(), 2);
+}
+
+#[test]
+fn a_collection_renamed_since_it_was_seen_is_left_alone() {
+    let mut f = fixture(&[]);
+    let id = f.database.create_game_collection("First").unwrap();
+    f.database
+        .rename_game_collection(id, "First", "Second")
+        .unwrap();
+    assert!(f.database.delete_game_collection(id, "First").is_err());
+    assert!(
+        f.database
+            .rename_game_collection(id, "First", "Third")
+            .is_err()
+    );
+    assert_eq!(
+        f.database.load_game_collections().unwrap()[1].name,
+        "Second"
+    );
 }

@@ -240,15 +240,27 @@ impl Database {
         Ok(self.connection.last_insert_rowid())
     }
 
-    /// Renames a user collection. Favourites keeps its name.
-    pub fn rename_game_collection(&mut self, collection_id: i64, name: &str) -> Result<()> {
+    /// Renames a user collection, only if it still has the name the user saw.
+    /// Favourites keeps its name.
+    pub fn rename_game_collection(
+        &mut self,
+        collection_id: i64,
+        seen_name: &str,
+        name: &str,
+    ) -> Result<()> {
         let name = validate_collection_name(name)?;
         let changed = self
             .connection
             .execute(
                 "UPDATE game_collections SET name = ?2, name_key = ?3, updated_at = ?4 \
-                 WHERE id = ?1 AND kind = 'user'",
-                params![collection_id, name, name_key(&name), now_utc_string()],
+                 WHERE id = ?1 AND kind = 'user' AND name = ?5",
+                params![
+                    collection_id,
+                    name,
+                    name_key(&name),
+                    now_utc_string(),
+                    seen_name
+                ],
             )
             .map_err(|error| map_name_error(error, &name))?;
         if changed == 0 {
@@ -259,14 +271,14 @@ impl Database {
         Ok(())
     }
 
-    /// Deletes a user collection and its membership. Games are not touched.
-    /// Favourites cannot be deleted.
-    pub fn delete_game_collection(&mut self, collection_id: i64) -> Result<()> {
+    /// Deletes a user collection and its membership, only if it still has the
+    /// name the user saw. Games are not touched. Favourites cannot be deleted.
+    pub fn delete_game_collection(&mut self, collection_id: i64, seen_name: &str) -> Result<()> {
         let changed = self
             .connection
             .execute(
-                "DELETE FROM game_collections WHERE id = ?1 AND kind = 'user'",
-                [collection_id],
+                "DELETE FROM game_collections WHERE id = ?1 AND kind = 'user' AND name = ?2",
+                params![collection_id, seen_name],
             )
             .map_err(|error| db_error("failed to delete the collection", error))?;
         if changed == 0 {

@@ -234,6 +234,8 @@ pub(super) enum Change {
         /// The game on screen, when there is one. Removed by its current row
         /// too, so a move or an add still in the queue cannot bring it back.
         game: Option<i64>,
+        /// Rows a queued re-anchor is moving this item to.
+        moved_to: Vec<i64>,
         stored: Vec<CollectionItemKey>,
     },
     Create {
@@ -242,10 +244,12 @@ pub(super) enum Change {
     },
     Rename {
         collection: i64,
+        seen: String,
         name: String,
     },
     Delete {
         collection: i64,
+        seen: String,
     },
     Reanchor(Vec<CollectionReanchor>),
 }
@@ -270,11 +274,12 @@ fn apply(path: &Path, change: Change) -> Result<Option<i64>, String> {
         Change::Remove {
             collection,
             game,
+            moved_to,
             stored,
         } => database
             .remove_items_from_collection(collection, &stored)
             .and_then(|()| {
-                game.map_or(Ok(()), |game| {
+                game.into_iter().chain(moved_to).try_for_each(|game| {
                     database.remove_current_game_from_collection(collection, game)
                 })
             }),
@@ -282,8 +287,12 @@ fn apply(path: &Path, change: Change) -> Result<Option<i64>, String> {
             created = Some(id);
             game.map_or(Ok(()), |game| database.add_game_to_collection(id, game))
         }),
-        Change::Rename { collection, name } => database.rename_game_collection(collection, &name),
-        Change::Delete { collection } => database.delete_game_collection(collection),
+        Change::Rename {
+            collection,
+            seen,
+            name,
+        } => database.rename_game_collection(collection, &seen, &name),
+        Change::Delete { collection, seen } => database.delete_game_collection(collection, &seen),
         Change::Reanchor(moves) => database.reanchor_collection_items(&moves),
     };
     result.map(|()| created).map_err(|error| error.to_string())
@@ -336,6 +345,8 @@ fn start_worker(
     (jobs, results)
 }
 
+const READ_FAILED: &str = "Saved collections could not be read just now.";
+
 #[derive(Default)]
 enum Dialog {
     #[default]
@@ -351,7 +362,9 @@ enum Dialog {
     Delete {
         collection: i64,
     },
-    Gone,
+    Gone {
+        collection: i64,
+    },
 }
 
 #[derive(Default)]
@@ -366,6 +379,8 @@ pub(super) struct State {
     version: u64,
     /// The library that last asked for items to be moved; asked once for each.
     reanchored: usize,
+    /// Moves sent and not yet read back; a removal must follow them.
+    reanchoring: Vec<CollectionReanchor>,
     message: Option<String>,
     dialog: Dialog,
     open_after_create: bool,
@@ -454,16 +469,22 @@ impl State {
         };
         if let Some(saved) = answer.saved {
             self.saved = saved;
+            if self.message.as_deref() == Some(READ_FAILED) {
+                self.message = None;
+            }
         } else {
-            self.message = Some("Saved collections could not be read just now.".into());
+            // A write's own failure matters more and stays on screen.
+            self.message.get_or_insert_with(|| READ_FAILED.to_string());
         }
         if self.pending > 0 {
             return;
         }
+        self.reanchoring.clear();
         let moves = self.rebuild(library);
         let token = Arc::as_ptr(library) as usize;
         if !moves.is_empty() && self.reanchored != token {
             self.reanchored = token;
+            self.reanchoring.clone_from(&moves);
             self.send(Job::Change(Change::Reanchor(moves)));
         }
     }
@@ -482,6 +503,17 @@ impl State {
             Some(member) => Change::Remove {
                 collection,
                 game: Some(game),
+                moved_to: self
+                    .reanchoring
+                    .iter()
+                    .filter(|step| {
+                        member.stored.iter().any(|key| {
+                            key.archive_id == step.stored_archive_id
+                                && key.created_at == step.stored_created_at
+                        })
+                    })
+                    .map(|step| step.current_archive_id)
+                    .collect(),
                 stored: member.stored,
             },
             None => {
@@ -539,6 +571,7 @@ impl App {
 
     /// Star, plain words, and the collections menu, for one selected game.
     pub(super) fn game_collection_actions(&mut self, ui: &mut egui::Ui, game: i64, title: &str) {
+        self.collection_message(ui);
         if !self.collections.ready() {
             return;
         }
@@ -577,8 +610,22 @@ impl App {
         });
     }
 
+    /// Why a change did not stick. Drawn wherever collections can be changed,
+    /// including when nothing else can be drawn because the first read failed.
+    fn collection_message(&mut self, ui: &mut egui::Ui) {
+        let Some(message) = &self.collections.message else {
+            return;
+        };
+        ui.colored_label(ui.visuals().error_fg_color, message);
+        if !self.collections.ready() && ui.small_button("Try again").clicked() {
+            self.collections.message = None;
+            self.collections.send(Job::Reload);
+        }
+    }
+
     /// Which games the page lists, and the tools for that collection.
     pub(super) fn browse_play_scope_bar(&mut self, ui: &mut egui::Ui) {
+        self.collection_message(ui);
         if !self.collections.ready() {
             return;
         }
@@ -656,7 +703,7 @@ impl App {
                         .small_button(format!("{} no longer in the library", thousands(gone)))
                         .clicked()
                 {
-                    dialog = Some(Dialog::Gone);
+                    dialog = Some(Dialog::Gone { collection: id });
                 }
             }
             if sort != self.collections.sort {
@@ -664,9 +711,6 @@ impl App {
                 self.preferences_dirty = Some(std::time::Instant::now());
             }
         });
-        if let Some(message) = &self.collections.message {
-            ui.colored_label(ui.visuals().error_fg_color, message);
-        }
         if let Some(scope) = chosen {
             self.choose_scope(scope);
         }
@@ -724,19 +768,18 @@ impl App {
         if matches!(self.collections.dialog, Dialog::None) {
             return;
         }
-        let gone = self
-            .collections
-            .scoped()
-            .map(|view| (view.id, view.gone.clone()));
         // The dialog's own target, not whatever is listed now: the page behind
         // it stays usable.
         let target = match self.collections.dialog {
-            Dialog::Rename { collection, .. } | Dialog::Delete { collection } => Some(collection),
+            Dialog::Rename { collection, .. }
+            | Dialog::Delete { collection }
+            | Dialog::Gone { collection } => Some(collection),
             _ => None,
         };
         let selected = target.and_then(|id| {
             let view = self.collections.views.iter().find(|view| view.id == id)?;
-            Some((view.name.clone(), view.members.len() + view.gone.len()))
+            let count = view.members.len() + view.gone.len();
+            Some((view.name.clone(), count, view.gone.clone()))
         });
         if target.is_some() && selected.is_none() {
             self.collections.dialog = Dialog::None;
@@ -781,6 +824,9 @@ impl App {
                             if ui.add_enabled(valid, egui::Button::new("Rename")).clicked() {
                                 change = Some(Change::Rename {
                                     collection: *collection,
+                                    seen: selected
+                                        .as_ref()
+                                        .map_or_else(String::new, |view| view.0.clone()),
                                     name: name.clone(),
                                 });
                                 close = true;
@@ -790,7 +836,7 @@ impl App {
                     });
             }
             Dialog::Delete { collection } => {
-                let (name, count) = selected.unwrap_or_default();
+                let (name, count, _) = selected.unwrap_or_default();
                 egui::Window::new("Delete collection")
                     .collapsible(false)
                     .resizable(false)
@@ -803,6 +849,7 @@ impl App {
                             if ui.button("Delete collection").clicked() {
                                 change = Some(Change::Delete {
                                     collection: *collection,
+                                    seen: name.clone(),
                                 });
                                 close = true;
                             }
@@ -810,14 +857,15 @@ impl App {
                         });
                     });
             }
-            Dialog::Gone => {
-                let (collection, rows) = gone.unwrap_or_default();
+            Dialog::Gone { collection } => {
+                let collection = *collection;
+                let (name, _, rows) = selected.unwrap_or_default();
                 let mut open = true;
                 egui::Window::new("No longer in the library")
                     .open(&mut open)
                     .default_width(460.0)
                     .show(context, |ui| {
-                        ui.label("These saved games have no catalogue entry now. They come back on their own if a scan finds the same file in the same place. Nothing is removed unless you remove it.");
+                        ui.label(format!("Saved in {name}, but with no catalogue entry now. A game comes back on its own if a scan finds the same file in the same place. A game that moved stays here until you remove it. Nothing is removed unless you remove it."));
                         egui::ScrollArea::vertical().max_height(320.0).show_rows(
                             ui,
                             GONE_ROW_HEIGHT,
@@ -836,6 +884,7 @@ impl App {
                                             change = Some(Change::Remove {
                                                 collection,
  game: None,
+ moved_to: Vec::new(),
  stored: vec![game.stored.clone()],
  });
                                         }

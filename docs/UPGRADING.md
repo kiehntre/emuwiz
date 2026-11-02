@@ -60,7 +60,9 @@ The catalogue database upgrades forward only, in steps. The current schema is
 **27**; the `v0.9.0` tag used schema 16, so upgrading from it applies several
 steps. Later versions may use a higher number.
 
-Starting EmuWiz only reads the database. If it is older than this version, the
+Starting EmuWiz does not upgrade the database. At schema 27 it can make one small
+write to a saved Favourites item ([details](FAVOURITES_AND_COLLECTIONS.md)). If the
+database is older than this version, the
 app shows an **Outdated** state and does not change it. Upgrade it in the app
 from **All Tools > Database status > Scan and upgrade library**. A plain
 `emuwiz-cli library-scan` refuses an outdated database and does not upgrade it.

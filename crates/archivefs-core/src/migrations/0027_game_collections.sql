@@ -11,8 +11,11 @@
 -- each item also records the row's created_at, which is part of its key, and
 -- its location; see
 -- database/collections.rs for how an item is resolved.
+--
+-- AUTOINCREMENT: a deleted collection's id is never given to another, so a stale
+-- window or queued click cannot act on a collection the user never saw.
 CREATE TABLE game_collections (
-    id          INTEGER PRIMARY KEY,
+    id          INTEGER PRIMARY KEY AUTOINCREMENT,
     kind        TEXT NOT NULL CHECK (kind IN ('favourites','user')),
     name        TEXT NOT NULL,
     name_key    TEXT NOT NULL,

@@ -43,8 +43,11 @@ can stop applying, so they only change what is shown. An item is saved against a
 different row only when that is a fact: EmuWiz's own rename journal records the
 move, or a new row sits at the item's own place and size. That small write
 happens in the background after the library loads, and only when such an item
-exists. It touches only the item. If it follows a Review restore, it can make
-that restore's Rollback refuse, because the database has changed since.
+exists. It touches only the item. A rename you later Undo does not move the item
+back: it stays on the renamed row, which then shows as missing or under
+**no longer in the library**. Forgetting the old row of a game you moved by hand
+also ends a derived link, so its star goes off and the item waits in the same list
+until you remove it. Neither deletes the item.
 
 Discovery import Undo refuses a game whose saved item points at the imported
 row, and says so. Remove it there first, then Undo. An item that has not yet been
@@ -82,7 +85,7 @@ doubt: that action also scans every game folder, and a scan with a drive absent
 can mark games missing.
 
 The CLI command opens only the database and its backup. It reads no game folder
-and changes no mount. Migration 27 changes no existing row, so paths, missing
+and changes no mount. Migration 27 changes no existing row, adding only its own `schema_migrations` entry, so paths, missing
 flags and platforms are as they were. A later scan is optional and is not needed
 for Favourites.
 
@@ -106,10 +109,10 @@ Before upgrading:
 Then run `<build>/emuwiz-cli library-upgrade --confirm` once and keep its output.
 It prints the backup path and SHA-256.
 
-This command, and the preview in step 5, create small working files: an
-upgrade lock and `undo-seals.sqlite3` beside the database, and a writer entry
-under `$XDG_RUNTIME_DIR/emuwiz`. It leaves `library.sqlite3.upgrade.lock` behind;
-an empty lock file is normal.
+This command, and the preview in step 5, create small working files beside the
+database: `undo-seals.sqlite3` with its `-wal` and `-shm` files, and the
+`sealed-writers` and `finalise-capable-writers` folders. The command also leaves
+`library.sqlite3.upgrade.lock` behind; an empty lock file is normal.
 
 If it fails or is stopped, run `database-check` before anything else.
 
@@ -160,8 +163,9 @@ last resort, and only after working out what it would cost.
 Going back also means going back to a schema 26 build. A schema 26 build refuses
 a schema 27 library, and a schema 27 build refuses the restored schema 26 library
 until it is upgraded again. EmuWiz has no downgrade: there is no automatic route
-either way, and Review restore in the app refuses this backup because it accepts
-only backups at the running build's schema.
+either way. The current app has no restore screen, and the core restore routine
+accepts only backups at the running build's schema, so this backup goes back by
+hand, as below.
 
 Rename and organisation journals, and game files, live outside the database and
 are not rewound. Anything moved after the upgrade stays moved, and its journal
@@ -215,9 +219,11 @@ sqlite3 -readonly -json library.sqlite3 "SELECT c.kind, c.name, i.title, i.platf
   > collections-export.json
 ```
 
-There is no supported import. Each item carries its own identity, so copying the
-two tables into a re-upgraded library works in testing without touching any other
-table, and items whose games still exist reattach. Items for games added after
+There is no supported import, and the repository has no test for one. Each item
+carries its own identity. A one-off trial on a disposable copy brought both tables
+into a re-upgraded library with `INSERT OR REPLACE`, which is needed because the
+upgrade has already seeded Favourites, and items whose games still exist
+reattached. Items for games added after
 the upgrade stay under **no longer in the library** until those games return. It
 still means writing to the database by hand, which [Upgrading](UPGRADING.md) rules
 out, so ask before doing it.
