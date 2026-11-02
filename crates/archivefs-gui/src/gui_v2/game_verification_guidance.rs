@@ -223,7 +223,8 @@ fn load(
     format_exclusion: Option<&str>,
 ) -> Guidance {
     let result = (|| -> Result<_, String> {
-        let (checks, freshness) = saved_evidence(game, database)?;
+        let (checks, stale) = saved_evidence(game, database)?;
+        let freshness = freshness(game, stale);
         let snapshot =
             crate::dat_catalogue_picker::load_inventory_snapshot().map_err(|e| e.to_string())?;
         Ok((
@@ -254,16 +255,30 @@ fn load(
     }
 }
 
-/// Read stored stale marks and whole-disc metadata through the existing API.
-/// With no current hashes/revision, absence of staleness is Unknown, never Current.
-fn saved_evidence(
-    game: &Game,
-    database: &Database,
-) -> Result<(usize, DatProvenanceFreshness), String> {
+/// Current only when the Library's strict current-evidence decision
+/// (`dat_exact`, set only from `current_library_dat_evidence`) holds and no
+/// saved row is stale; Stale when one is; otherwise Unknown. A saved
+/// exact-match row alone never makes evidence current.
+pub(super) fn freshness(game: &Game, stale: bool) -> DatProvenanceFreshness {
+    if stale {
+        DatProvenanceFreshness::Stale
+    } else if game.dat_exact.is_some() {
+        DatProvenanceFreshness::Current
+    } else {
+        DatProvenanceFreshness::Unknown
+    }
+}
+
+/// How many saved checks exist for this game, and whether its evidence is
+/// stale now: a row is marked stale, or the Library loaded current proof
+/// that no saved row still confirms when re-read here (the file changed,
+/// moved or became another file-system object since the Library loaded).
+pub(super) fn saved_evidence(game: &Game, database: &Database) -> Result<(usize, bool), String> {
     let checks = database
         .library_dat_identities_for_item(game.archive.id)
         .map_err(|e| e.to_string())?;
     let mut stale = false;
+    let mut confirmed = false;
     for check in &checks {
         let summary = database
             .library_dat_identity_summary_for_item(
@@ -274,17 +289,15 @@ fn saved_evidence(
                 true,
             )
             .map_err(|e| e.to_string())?;
-        if summary.is_some_and(|s| s.provenance_freshness == DatProvenanceFreshness::Stale) {
-            stale = true;
+        match summary.map(|s| s.provenance_freshness) {
+            Some(DatProvenanceFreshness::Stale) => stale = true,
+            Some(DatProvenanceFreshness::Current) => confirmed = true,
+            _ => (),
         }
     }
     Ok((
         checks.len(),
-        if stale {
-            DatProvenanceFreshness::Stale
-        } else {
-            DatProvenanceFreshness::Unknown
-        },
+        stale || (game.dat_exact.is_some() && !confirmed),
     ))
 }
 
