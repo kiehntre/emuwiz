@@ -666,16 +666,32 @@ impl ArtworkCache {
     /// longer a valid PNG is treated as absent and dropped from the index, so a
     /// corrupted entry is refetched rather than drawn as a broken image.
     pub fn lookup(&self, server_id: &str, request: &ArtworkRequest<'_>) -> Option<CachedThumbnail> {
+        self.lookup_with(server_id, request, true)
+    }
+
+    /// Like [`Self::lookup`], but strictly read-only: a corrupt or vanished
+    /// entry is reported absent and left as it is, so nothing in the cache
+    /// directory or its index is ever changed.
+    pub fn peek(&self, server_id: &str, request: &ArtworkRequest<'_>) -> Option<CachedThumbnail> {
+        self.lookup_with(server_id, request, false)
+    }
+
+    fn lookup_with(
+        &self,
+        server_id: &str,
+        request: &ArtworkRequest<'_>,
+        repair: bool,
+    ) -> Option<CachedThumbnail> {
         let key = Self::key_for(server_id, request);
-        if let Some(thumbnail) = self.lookup_key(server_id, &key) {
+        if let Some(thumbnail) = self.lookup_key(server_id, &key, repair) {
             return Some(thumbnail);
         }
         request.large_reference?;
         let fallback = request.without_large();
-        self.lookup_key(server_id, &Self::key_for(server_id, &fallback))
+        self.lookup_key(server_id, &Self::key_for(server_id, &fallback), repair)
     }
 
-    fn lookup_key(&self, server_id: &str, key: &str) -> Option<CachedThumbnail> {
+    fn lookup_key(&self, server_id: &str, key: &str, repair: bool) -> Option<CachedThumbnail> {
         let index = self.load_index(server_id);
         let entry = index.entries.iter().find(|entry| entry.key == key)?;
         let path = self.thumbnail_path(key);
@@ -683,6 +699,9 @@ impl ArtworkCache {
         let valid = bytes
             .as_deref()
             .is_some_and(|bytes| detect_format(bytes) == Some(ImageFormat::Png));
+        if !valid && !repair {
+            return None;
+        }
         if !valid {
             // Corrupt or vanished: forget it so the next request refetches. The read
             // above needed no lock - a rename is atomic, so a reader sees one whole

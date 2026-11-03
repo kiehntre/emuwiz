@@ -6,6 +6,8 @@ use eframe::egui;
 use super::App;
 use super::routes::ToolPage;
 
+mod arcade_shelf;
+
 #[derive(Default)]
 pub(super) struct ToolPagesState {
     pub host_diagnostics: super::host_diagnostics::State,
@@ -25,6 +27,7 @@ pub(super) struct ToolPagesState {
     pub alternative_provider_preview: super::alternative_provider_preview::State,
     pub netplay: super::netplay_preview::State,
     pub cheat_extras: super::cheat_extras_page::CheatExtrasState,
+    pub arcade_shelf: arcade_shelf::State,
 }
 
 impl ToolPagesState {
@@ -40,6 +43,7 @@ impl ToolPagesState {
             alternative_provider_preview: Default::default(),
             netplay: Default::default(),
             cheat_extras: Default::default(),
+            arcade_shelf: Default::default(),
             host_diagnostics: Default::default(),
             homebrew_browser: Default::default(),
             patch_package_preview: Default::default(),
@@ -123,6 +127,7 @@ impl App {
                 }
             }
             ToolPage::LibraryViews => self.library_views_page(ui),
+            ToolPage::ArcadeShelf => self.arcade_shelf_page(ui),
             ToolPage::ViewHistory => {
                 use super::view_history_page::{Request, show};
                 match show(ui, &mut self.tools.view_history) {
