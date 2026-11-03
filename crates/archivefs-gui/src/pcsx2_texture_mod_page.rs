@@ -7,13 +7,14 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use archivefs_core::game_identity::GameIdentityReport;
 use archivefs_core::patch_manager::{
     Pcsx2Profile, Pcsx2TexturePackApplyResult, Pcsx2TexturePackPlan,
-    Pcsx2TexturePackPreviewRequest, SharedApplyConfirmation, SharedApplyEntry, SharedApplyOptions,
-    SharedApplyOutcome, SharedApplyResult, SharedApplyStatus, SharedRollbackConfirmation,
-    SharedRollbackOptions, SharedRollbackOutcome, SharedRollbackPreview, SharedRollbackResult,
-    SharedTransactionPlan, build_pcsx2_texture_pack_preview,
-    build_pcsx2_texture_pack_transaction_plan, default_shared_backup_root,
-    default_shared_history_root, execute_pcsx2_texture_pack_apply, execute_shared_rollback,
-    generate_shared_operation_id, preview_shared_rollback, verified_pcsx2_texture_identity,
+    Pcsx2TexturePackPreviewRequest, SharedApplyConfirmation, SharedApplyEntry,
+    SharedApplyFailureKind, SharedApplyOptions, SharedApplyOutcome, SharedApplyResult,
+    SharedApplyStatus, SharedRollbackConfirmation, SharedRollbackOptions, SharedRollbackOutcome,
+    SharedRollbackPreview, SharedRollbackResult, SharedTransactionPlan,
+    build_pcsx2_texture_pack_preview, build_pcsx2_texture_pack_transaction_plan,
+    default_shared_backup_root, default_shared_history_root, execute_pcsx2_texture_pack_apply,
+    execute_shared_rollback, generate_shared_operation_id, preview_shared_rollback,
+    verified_pcsx2_texture_identity,
 };
 use eframe::egui;
 
@@ -292,21 +293,49 @@ fn incomplete_install_lines(
     ]
 }
 
-/// Whether this entry may have changed the destination on disk. A completed
-/// write counts, and so does a write or verification failure that happened
-/// after the pack's file reached the destination: the core records the
-/// temporary path whenever a write got that far (checkpoint failed after the
-/// replace, verification failed, a displaced file kept, or a published file
-/// that changed straight afterwards). Counting one too many fails closed:
-/// Check Undo is still gated by a fresh preview.
+/// Core failure details that mean the pack's file reached the destination
+/// before the entry failed (shared_transaction.rs). The journal has no
+/// structured "published" fact yet, so these literals are matched exactly.
+const REPLACED_THEN_CHECKPOINT_FAILED: &str =
+    "destination was replaced but its durable checkpoint failed";
+const RESTORE_AFTER_FAILED_VERIFICATION_FAILED: &str =
+    "restoring the previous live file state failed";
+
+/// Whether this entry may have changed the destination on disk: a completed
+/// write, or a failure the core records only after the pack's file was
+/// published (checkpoint failed after the replace, a verified-checkpoint
+/// failure, a failed restore after failed verification, a displaced file kept,
+/// or a published file that changed straight afterwards). A clean refusal
+/// (temporary file removed, destination untouched) does not count.
 fn written(entry: &SharedApplyEntry) -> bool {
-    match entry.outcome {
-        SharedApplyOutcome::InstalledNew | SharedApplyOutcome::ReplacedExisting => true,
-        SharedApplyOutcome::WriteFailed | SharedApplyOutcome::VerificationFailed => {
-            entry.temporary_path.is_some() || entry.final_destination_digest.is_some()
-        }
-        _ => false,
-    }
+    matches!(
+        entry.outcome,
+        SharedApplyOutcome::InstalledNew | SharedApplyOutcome::ReplacedExisting
+    ) || entry.final_destination_digest.is_some()
+        || entry.failures.iter().any(|failure| {
+            matches!(
+                failure.kind,
+                SharedApplyFailureKind::DisplacedFileKept
+                    | SharedApplyFailureKind::PublishedUnverified
+            ) || failure.detail == REPLACED_THEN_CHECKPOINT_FAILED
+                || failure
+                    .detail
+                    .contains(RESTORE_AFTER_FAILED_VERIFICATION_FAILED)
+        })
+}
+
+/// Whether the core's rollback can act on this entry. Other written entries
+/// preview as NoChangeRequired, so only manual recovery helps them.
+fn undo_can_act(entry: &SharedApplyEntry) -> bool {
+    matches!(
+        entry.outcome,
+        SharedApplyOutcome::InstalledNew | SharedApplyOutcome::ReplacedExisting
+    ) || entry.failures.iter().any(|failure| {
+        matches!(
+            failure.kind,
+            SharedApplyFailureKind::DisplacedFileKept | SharedApplyFailureKind::PublishedUnverified
+        )
+    })
 }
 
 fn rollback_succeeded(rollback: Option<&SharedRollbackResult>) -> bool {
@@ -340,7 +369,8 @@ fn undo_choice(result: &SharedApplyResult, rollback: Option<&SharedRollbackResul
         UndoChoice::None
     } else if result.journal.status == SharedApplyStatus::Success {
         UndoChoice::Undo
-    } else if recovery_required(result, rollback) {
+    } else if recovery_required(result, rollback) && result.journal.entries.iter().any(undo_can_act)
+    {
         UndoChoice::CheckUndo
     } else {
         UndoChoice::None
@@ -404,7 +434,10 @@ fn recovery_lines(
         };
         lines.push(format!("{}: {line}", path.display()));
     }
-    lines.push(if result.journal_path.is_some() {
+    let undo_can_help = result.journal.entries.iter().any(undo_can_act);
+    lines.push(if result.journal_path.is_some() && !undo_can_help {
+        "Undo cannot reverse these files from the install record. Restore or remove the files above by hand.".to_string()
+    } else if result.journal_path.is_some() {
         "Check Undo re-reads the install record and these files, and runs only if every file is still as EmuWiz left it. Otherwise, restore or remove the files above by hand.".to_string()
     } else {
         "No install record was saved, so Undo is not possible. Restore or remove the files above by hand.".to_string()
@@ -955,12 +988,14 @@ mod tests {
     #[test]
     fn a_write_failure_after_the_file_was_replaced_requires_recovery() {
         let mut result = with_backup(journalled(failed_result()));
-        result.journal.entries[0].temporary_path = Some(
-            archivefs_core::patch_manager::SharedTransactionPath::from_path(Path::new(
-                "/disposable/destination/pack/.tmp",
-            )),
-        );
-        assert_eq!(undo_choice(&result, None), UndoChoice::CheckUndo);
+        result.journal.entries[0].failures.push(SharedApplyFailure {
+            kind: SharedApplyFailureKind::JournalFailed,
+            path: None,
+            detail: REPLACED_THEN_CHECKPOINT_FAILED.into(),
+        });
+        // Core rollback treats this entry as NoChangeRequired, so the page
+        // must not offer a Check Undo that can never act.
+        assert_eq!(undo_choice(&result, None), UndoChoice::None);
         let text = panel_after(result, None);
         assert_not_installed(&text);
         assert_recovery_required(&text);
@@ -970,6 +1005,47 @@ mod tests {
         );
         assert!(!text.contains("no file was written or changed"), "{text}");
         assert!(text.contains(BACKUP), "{text}");
+        assert!(
+            text.contains("Undo cannot reverse these files from the install record"),
+            "{text}"
+        );
+        assert!(!text.contains("Check Undo"), "{text}");
+    }
+
+    /// A refusal before publication leaves a temporary path in the journal
+    /// (the temporary file was removed) and the destination untouched.
+    #[test]
+    fn a_clean_write_refusal_with_a_temporary_path_needs_no_recovery() {
+        let mut result = journalled(failed_result());
+        result.journal.entries[0].temporary_path = Some(
+            archivefs_core::patch_manager::SharedTransactionPath::from_path(Path::new(
+                "/disposable/destination/pack/.tmp",
+            )),
+        );
+        result.journal.entries[0].failures.push(SharedApplyFailure {
+            kind: SharedApplyFailureKind::WriteFailed,
+            path: None,
+            detail: "atomic destination write failed".into(),
+        });
+        assert_eq!(undo_choice(&result, None), UndoChoice::None);
+        let text = panel_after(result, None);
+        assert!(text.contains("no file was written or changed"), "{text}");
+        assert!(!text.contains("Recovery required"), "{text}");
+    }
+
+    /// A file published and then changed: core rollback can act on it.
+    #[test]
+    fn a_published_unverified_file_offers_check_undo() {
+        let mut result = with_backup(journalled(failed_result()));
+        result.journal.entries[0].outcome = SharedApplyOutcome::VerificationFailed;
+        result.journal.entries[0].failures.push(SharedApplyFailure {
+            kind: SharedApplyFailureKind::PublishedUnverified,
+            path: None,
+            detail: "changed straight afterwards".into(),
+        });
+        assert_eq!(undo_choice(&result, None), UndoChoice::CheckUndo);
+        let text = panel_after(result, None);
+        assert_recovery_required(&text);
         assert!(text.contains("Check Undo"), "{text}");
     }
 
