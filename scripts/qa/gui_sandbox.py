@@ -216,7 +216,13 @@ class Sandbox:
     def stop(self):
         for number in (signal.SIGTERM, signal.SIGKILL):
             for pid in self.owned():
-                self._signal(pid, number)
+                try:
+                    self._signal(pid, number)
+                except SandboxError:
+                    # Listed as ours, then gone and its number reused before
+                    # the pidfd opened: refused, so skip it and stop the rest.
+                    # Anything of ours still left is reported below.
+                    continue
             deadline = time.monotonic() + STOP_TIMEOUT_SECONDS
             while time.monotonic() < deadline:
                 self._reap()

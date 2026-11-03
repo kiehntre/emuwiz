@@ -104,6 +104,33 @@ class Limits(unittest.TestCase):
             # The kernel may hand this number to anyone now; it holds no token.
             self.assertFalse(sandbox._signal(pid, 15) and pid in sandbox.owned())
 
+    def test_a_pid_reused_between_listing_and_signalling_does_not_stop_the_shutdown(self):
+        # Deterministic stand-in for the race: stop() lists a PID as ours, it
+        # exits and the kernel gives the number to an unrelated process (the
+        # decoy) before the pidfd opens. That PID must be skipped, never
+        # signalled, and every process still ours must be stopped.
+        sandbox = gui_sandbox.Sandbox()
+        try:
+            child = sandbox.spawn(["sleep", "60"])
+            listed = sandbox.owned
+            calls = []
+
+            def owned_with_a_reused_pid():
+                calls.append(None)
+                current = listed()
+                return [self.decoy.pid, *current] if len(calls) == 1 else current
+
+            sandbox.owned = owned_with_a_reused_pid
+            sandbox.stop()
+            self.assertIsNotNone(child.poll(), "the owned process was stopped")
+            self.assertTrue(self.alive(self.decoy), "the reused PID was not signalled")
+        finally:
+            sandbox.owned = listed
+            if child.poll() is None:
+                sandbox._signal(child.pid, 9)
+                child.wait()
+            sandbox.root.cleanup()
+
     def test_children_cannot_reach_the_session_bus_or_session_manager(self):
         names = {"DBUS_SESSION_BUS_ADDRESS": "x", "SESSION_MANAGER": "y", "XAUTHORITY": "z"}
         previous = {name: os.environ.get(name) for name in names}
