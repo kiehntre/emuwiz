@@ -411,7 +411,13 @@ fn recovery_lines(
         let path =
             Path::new(&plan.destination_root.display).join(&plan.destination_relative_path.display);
         let rolled_back = rollback.and_then(|rollback| rollback.preview.entries.get(index));
+        let restored = shared_entry_destination(entry, rolled_back)
+            == SharedEntryDestination::RestoredAfterFailedCheck;
         let line = match rolled_back.map(|entry| entry.outcome) {
+            _ if restored => {
+                "failed its check, and EmuWiz put your previous file back (check its permissions)."
+                    .to_string()
+            }
             Some(SharedRollbackOutcome::RestoredBackup) => {
                 "your original was restored by automatic rollback.".to_string()
             }
@@ -1139,6 +1145,33 @@ mod tests {
         );
         assert!(
             !text.contains("No file from this pack reached the destination"),
+            "{text}"
+        );
+    }
+
+    /// One file restored by the engine, another left published: the restored
+    /// one is described as put back, not as possibly the pack's file.
+    #[test]
+    fn a_restored_file_beside_one_needing_recovery_is_described_truthfully() {
+        let mut result = journalled(with_backup(partly_failed_result()));
+        let mut restored = result.journal.entries[0].clone();
+        restored.plan_entry.destination_relative_path =
+            archivefs_core::patch_manager::SharedTransactionPath::from_path(Path::new(
+                "pack/restored.bin",
+            ));
+        restored.outcome = SharedApplyOutcome::VerificationFailed;
+        restored.publication = SharedPublicationState::PublishedThenRestored;
+        result.journal.entries.push(restored);
+        let text = panel_after(result, None);
+        assert_recovery_required(&text);
+        assert!(
+            text.contains(
+                "pack/restored.bin: failed its check, and EmuWiz put your previous file back"
+            ),
+            "{text}"
+        );
+        assert!(
+            !text.contains("pack/restored.bin: may still be the pack's file"),
             "{text}"
         );
     }
