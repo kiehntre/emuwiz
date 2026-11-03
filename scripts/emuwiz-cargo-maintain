@@ -123,7 +123,10 @@ import types
 
 sys.dont_write_bytecode = True
 GIB = 1024 ** 3
-POLICY_VERSION = 1
+# 2: Fix B widened what a cycle retires (post-retirement binary residue in a markerless `debug`
+# profile).  A policy approved under an earlier version never covered that, so it is rejected
+# (fail closed) until the owner runs `policy approve` again; its digest cannot be reused.
+POLICY_VERSION = 2
 DEFAULT_SOFT = 220_000_000_000
 DEFAULT_HARD = 240_000_000_000
 DEFAULT_COLD_ALLOWANCE = 3 * GIB       # expected first-build size of a new target
@@ -538,6 +541,11 @@ def load_policy(trusted_uids=None):
         policy = json.loads(text)
     except ValueError as error:
         return "invalid", None, f"policy unreadable: {error}"
+    old_schema = policy.get("schema") if isinstance(policy, dict) else None
+    if isinstance(old_schema, int) and not isinstance(old_schema, bool) and 0 < old_schema < POLICY_VERSION:
+        return "invalid", None, (f"policy schema {old_schema} was approved before the retirement scope was "
+                                 f"widened (schema {POLICY_VERSION}: post-retirement binary residue); it no longer "
+                                 "authorises anything. Review the scope and run `policy approve` again")
     if not isinstance(policy, dict) or not validate_policy(policy):
         return "invalid", None, "policy is malformed or its integrity digest does not match"
     claimed = policy["enabled"]
