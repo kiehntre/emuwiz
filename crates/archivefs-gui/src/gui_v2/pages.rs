@@ -3272,8 +3272,21 @@ impl App {
             .min(ui.available_width());
         let button_height = if short_window(ui.ctx()) { 52.0 } else { 64.0 };
         ui.horizontal_wrapped(|ui| {
+            // This game only, through the existing one-game DAT check (or the
+            // existing system choice when the game has no known system). That
+            // page explains a missing catalogue and links DAT Management.
+            let check = super::game_verification_guidance::Action::one_game_check(game);
+            if ui
+                .add_sized(
+                    [button_width, button_height],
+                    egui::Button::new(check.label()).wrap(),
+                )
+                .on_hover_text("Checks only this game's file against a trusted catalogue. You see a preview first; nothing is read until you confirm.")
+                .clicked()
+            {
+                self.go(check.route(game));
+            }
             for (label, section) in [
-                ("Verify", Section::Check),
                 ("Artwork, Manuals & Extras", Section::Artwork),
                 ("Mods & Cheats", Section::Mods),
                 ("Saves & States", Section::Saves),
@@ -3286,9 +3299,6 @@ impl App {
                     )
                     .clicked()
                 {
-                    if matches!(section, Section::Check) {
-                        self.check_platform = Some(game.platform.clone());
-                    }
                     self.go(Route::Task { section, game: id });
                 }
             }

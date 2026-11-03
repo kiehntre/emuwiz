@@ -131,7 +131,7 @@ fn visual_polish_game_detail_actions_have_equal_bounds() {
             .min_by(|a, b| a.area().total_cmp(&b.area()))
             .expect("button background")
     };
-    let verify = button("Verify");
+    let verify = button("Verify this game");
     for label in [
         "Artwork, Manuals & Extras",
         "Mods & Cheats",

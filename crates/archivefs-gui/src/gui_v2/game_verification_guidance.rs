@@ -31,6 +31,17 @@ impl Action {
         }
     }
 
+    /// Game Details' always-visible per-game action: "Re-check" once any DAT
+    /// result is saved for this game, otherwise "Verify". The label names the
+    /// action only; the result shown stays the engine's saved state.
+    pub(super) fn one_game_check(game: &Game) -> Self {
+        if game.dat_exact.is_some() || game.dat_state.is_some() {
+            Self::Recheck
+        } else {
+            Self::Audit
+        }
+    }
+
     pub(super) fn route(self, game: &Game) -> super::routes::Route {
         use super::routes::{Route, Section};
         match self {
