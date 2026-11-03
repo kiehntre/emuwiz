@@ -102,6 +102,7 @@ mod sources_providers;
 #[cfg(test)]
 mod stale_inspection_tests;
 mod storage_review;
+mod surprise_me;
 #[cfg(test)]
 mod tape_tests;
 #[cfg(test)]
