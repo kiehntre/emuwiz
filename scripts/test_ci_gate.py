@@ -125,11 +125,25 @@ class Command(unittest.TestCase):
         self.assertNotEqual(result.returncode, 0)
 
 
+def workflow_jobs(workflow: str) -> dict[str, str]:
+    """Each job id under `jobs:` with its body. Any two-space key is a job,
+    whatever its characters (ids may use _ and capitals) or trailing comment,
+    so a new job cannot hide inside the previous job's body."""
+    body = workflow[workflow.index("\njobs:\n"):]
+    parts = re.split(r"(?m)^  ([^\s#:][^:\n]*):[ \t]*(?:#[^\n]*)?\n", body)
+    return dict(zip(parts[1::2], parts[2::2]))
+
+
 class Workflow(unittest.TestCase):
     def jobs(self) -> dict[str, str]:
-        body = WORKFLOW[WORKFLOW.index("\njobs:\n"):]
-        parts = re.split(r"(?m)^  ([a-z0-9-]+):\n", body)
-        return dict(zip(parts[1::2], parts[2::2]))
+        return workflow_jobs(WORKFLOW)
+
+    def test_every_job_id_form_is_found(self) -> None:
+        for job_id, after in (("new-job", ""), ("new_job", ""), ("NewJob", ""), ("new-job", "  # a comment")):
+            with self.subTest(job_id=job_id, after=after):
+                job = f"\n  {job_id}:{after}\n    runs-on: ubuntu-latest\n\n  ci-gate:\n"
+                workflow = WORKFLOW.replace("\n  ci-gate:\n", job)
+                self.assertEqual(sorted(workflow_jobs(workflow)), sorted([*self.jobs(), job_id]))
 
     def test_the_gate_needs_exactly_every_other_job_and_the_script_knows_them(self) -> None:
         jobs = self.jobs()
