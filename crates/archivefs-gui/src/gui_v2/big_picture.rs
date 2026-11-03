@@ -320,7 +320,7 @@ fn keyboard_commands(
     let none = Modifiers::NONE;
     let mut commands = Vec::new();
     context.input_mut(|input| {
-        if input.consume_key(none, Key::Escape) {
+        if press(input, Key::Escape) {
             commands.push(Command::Back);
         }
         // Launch keeps ordinary keyboard use: Tab, arrows, Enter and Space.
@@ -345,10 +345,10 @@ fn keyboard_commands(
             // Typing goes to the search; Enter finishes it. Handled in `type_search`.
             return;
         }
-        if input.consume_key(none, Key::Enter) {
+        if press(input, Key::Enter) {
             commands.push(Command::Select);
         }
-        if input.consume_key(none, Key::Backspace) {
+        if press(input, Key::Backspace) {
             commands.push(Command::Back);
         }
         for (key, command) in [
@@ -357,12 +357,40 @@ fn keyboard_commands(
             (Key::S, Command::Search),
             (Key::F, Command::Platforms),
         ] {
-            if input.consume_key(none, key) {
+            if press(input, key) {
                 commands.push(command);
             }
         }
+        if commands.contains(&Command::Search) {
+            // The letter that opened the search arrives as text in the same
+            // frame; it must not become the first character searched for.
+            input
+                .events
+                .retain(|event| !matches!(event, egui::Event::Text(_)));
+        }
     });
     commands
+}
+
+/// Consumes every press of `key` and says whether one was a new press. Only
+/// movement repeats while held, as on the controller: an autorepeating Esc or
+/// Enter (for example the key that just closed an emulator) does not act.
+fn press(input: &mut egui::InputState, key: egui::Key) -> bool {
+    let mut fresh = false;
+    input.events.retain(|event| match event {
+        egui::Event::Key {
+            key: pressed_key,
+            modifiers,
+            pressed: true,
+            repeat,
+            ..
+        } if *pressed_key == key && modifiers.matches_logically(egui::Modifiers::NONE) => {
+            fresh |= !repeat;
+            false
+        }
+        _ => true,
+    });
+    fresh
 }
 
 /// What the keyboard typed into an open search.
@@ -483,11 +511,12 @@ impl App {
         let mut commands = std::mem::take(&mut state.clicked);
         commands.extend(state.pad_commands(now, open));
         if focused {
-            commands.extend(keyboard_commands(
-                context,
-                state.step,
-                state.overlay.as_ref(),
-            ));
+            // Taken even when closed, so a key held while a game runs or in
+            // the grace period after it reaches neither Big Picture nor a widget.
+            let keys = keyboard_commands(context, state.step, state.overlay.as_ref());
+            if open {
+                commands.extend(keys);
+            }
         }
         if state.nav.repeating() {
             context.request_repaint_after(std::time::Duration::from_millis(20));

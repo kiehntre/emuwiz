@@ -554,3 +554,137 @@ fn nothing_claims_a_game_count_before_the_library_has_loaded() {
         "{strings:?}"
     );
 }
+
+fn key_event(k: egui::Key, pressed: bool, repeat: bool) -> egui::Event {
+    egui::Event::Key {
+        key: k,
+        physical_key: Some(k),
+        pressed,
+        repeat,
+        modifiers: egui::Modifiers::NONE,
+    }
+}
+
+/// A real keyboard sends the letter as text in the same frame as the key.
+#[test]
+fn the_key_that_opens_search_is_not_typed_into_it() {
+    let context = egui::Context::default();
+    let mut app = opened(&context, 30);
+    for (k, typed) in [(egui::Key::S, "s"), (egui::Key::Slash, "/")] {
+        let _ = frame_with_events(
+            &context,
+            &mut app,
+            SIZE,
+            vec![
+                key_event(k, true, false),
+                egui::Event::Text(typed.into()),
+                key_event(k, false, false),
+            ],
+        );
+        settle(&context, &mut app);
+        assert!(state(&app).search_open(), "{typed} opens search");
+        assert_eq!(app.filter.search, "", "{typed} is not typed into it");
+        let _ = frame_with_events(&context, &mut app, SIZE, key(egui::Key::Escape));
+        assert!(!state(&app).search_open());
+    }
+    // Typing once search is open still works.
+    let _ = frame_with_events(&context, &mut app, SIZE, key(egui::Key::S));
+    let _ = frame_with_events(
+        &context,
+        &mut app,
+        SIZE,
+        vec![egui::Event::Text("s".into())],
+    );
+    assert_eq!(app.filter.search, "s");
+}
+
+/// The key that closed the emulator (often Esc) may still be held, and
+/// autorepeating, when EmuWiz gets focus back.
+#[test]
+fn keyboard_input_while_a_game_runs_or_in_the_grace_period_does_nothing() {
+    let context = egui::Context::default();
+    let mut app = opened(&context, 10);
+    tap(&context, &mut app, START);
+    let launch = state(&app).step();
+    assert!(matches!(launch, Step::Launch(_)));
+    app.big_picture.as_mut().unwrap().set_launch_active(true);
+    settle(&context, &mut app);
+    let _ = frame_with_events(&context, &mut app, SIZE, key(egui::Key::Escape));
+    assert_eq!(state(&app).step(), launch, "a running game keeps the page");
+    app.big_picture.as_mut().unwrap().set_launch_active(false);
+    settle(&context, &mut app);
+    assert_eq!(state(&app).step(), Step::Browse);
+    for _ in 0..3 {
+        let _ = frame_with_events(
+            &context,
+            &mut app,
+            SIZE,
+            vec![key_event(egui::Key::Escape, true, true)],
+        );
+    }
+    let _ = frame_with_events(&context, &mut app, SIZE, key(egui::Key::Enter));
+    let _ = frame_with_events(&context, &mut app, SIZE, key(egui::Key::ArrowRight));
+    assert!(app.big_picture.is_some(), "a held Esc did not leave");
+    assert_eq!(state(&app).step(), Step::Browse, "Enter did not reselect");
+    assert_eq!(state(&app).focus(), 0, "arrows did not move");
+    assert!(
+        !state(&app)
+            .notice_text()
+            .is_some_and(|notice| notice.contains("again")),
+        "leaving was not armed"
+    );
+}
+
+/// A held key autorepeats (egui marks every press after the first as a
+/// repeat). Only movement repeats, as on the controller: holding Esc or Enter
+/// acts once, so it cannot leave Big Picture or walk into the Launch page.
+#[test]
+fn a_held_back_or_select_key_acts_once() {
+    let context = egui::Context::default();
+    let mut app = opened(&context, 10);
+    for _ in 0..3 {
+        let _ = frame_with_events(
+            &context,
+            &mut app,
+            SIZE,
+            vec![key_event(egui::Key::Escape, true, false)],
+        );
+    }
+    assert!(app.big_picture.is_some(), "a held Esc only arms leaving");
+    assert!(state(&app).notice_text().unwrap().contains("again"));
+    let _ = frame_with_events(
+        &context,
+        &mut app,
+        SIZE,
+        vec![key_event(egui::Key::Escape, false, false)],
+    );
+    for _ in 0..3 {
+        let _ = frame_with_events(
+            &context,
+            &mut app,
+            SIZE,
+            vec![key_event(egui::Key::Enter, true, false)],
+        );
+    }
+    assert!(
+        matches!(state(&app).step(), Step::Game(_)),
+        "a held Enter opens the game and stops there"
+    );
+    let _ = frame_with_events(
+        &context,
+        &mut app,
+        SIZE,
+        vec![key_event(egui::Key::Enter, false, false)],
+    );
+    let _ = frame_with_events(&context, &mut app, SIZE, key(egui::Key::Escape));
+    assert_eq!(state(&app).step(), Step::Browse);
+    for _ in 0..3 {
+        let _ = frame_with_events(
+            &context,
+            &mut app,
+            SIZE,
+            vec![key_event(egui::Key::ArrowRight, true, false)],
+        );
+    }
+    assert_eq!(state(&app).focus(), 3, "a held arrow still moves");
+}
