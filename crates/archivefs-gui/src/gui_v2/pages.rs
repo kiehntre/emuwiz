@@ -3275,16 +3275,26 @@ impl App {
             // This game only, through the existing one-game DAT check (or the
             // existing system choice when the game has no known system). That
             // page explains a missing catalogue and links DAT Management.
-            let check = super::game_verification_guidance::Action::one_game_check(game);
+            let check = super::game_verification_guidance::Action::one_game_check(
+                game,
+                self.review.verification_guidance.result_for(id),
+            );
             if ui
                 .add_sized(
                     [button_width, button_height],
                     egui::Button::new(check.label()).wrap(),
                 )
-                .on_hover_text("Checks only this game's file against a trusted catalogue. You see a preview first; nothing is read until you confirm.")
+                .on_hover_text("Checks only this game's file against a trusted catalogue. You see a preview first; the file is not read until you confirm.")
                 .clicked()
             {
-                self.go(check.route(game));
+                let route = check.route(game);
+                if route == Route::Section(Section::Check) {
+                    // No known system: Check Games opens on its system list,
+                    // not on whichever system was chosen there last.
+                    self.check_platform = None;
+                    self.verification = None;
+                }
+                self.go(route);
             }
             for (label, section) in [
                 ("Artwork, Manuals & Extras", Section::Artwork),

@@ -112,6 +112,11 @@ fn game_details_verify_this_game_opens_the_one_game_check() {
     let context = egui::Context::default();
     let mut app = blue_app(&context, games());
     app.router.current = Route::Game(1);
+    pin_setup_guidance(&mut app, 1);
+    // Already bound to this game, so the check page reads no real catalogue
+    // inventory, configuration or database when it is painted.
+    let game = app.library.game(1).unwrap().clone();
+    app.game_dat_check.target = Some(Target::of(&game));
     click_text(&context, &mut app, [1280.0, 1200.0], "Verify this game");
     assert_eq!(app.router.current, Route::GameCheck(1));
 }
@@ -121,18 +126,18 @@ fn a_saved_result_is_offered_as_a_re_check_and_never_shown_as_verified() {
     use super::super::game_verification_guidance::Action;
     let mut no_match = Library::new(games()).game(1).unwrap().clone();
     no_match.dat_state = Some(archivefs_core::LibraryDatState::NoMatch);
-    assert_eq!(Action::one_game_check(&no_match), Action::Recheck);
+    assert_eq!(Action::one_game_check(&no_match, None), Action::Recheck);
     assert_eq!(
-        Action::one_game_check(&no_match).label(),
+        Action::one_game_check(&no_match, None).label(),
         "Re-check this game"
     );
     assert_eq!(
-        Action::one_game_check(&no_match).route(&no_match),
+        Action::one_game_check(&no_match, None).route(&no_match),
         Route::GameCheck(1)
     );
     let unchecked = Library::new(games()).game(2).unwrap().clone();
     assert_eq!(
-        Action::one_game_check(&unchecked).label(),
+        Action::one_game_check(&unchecked, None).label(),
         "Verify this game"
     );
 }
@@ -143,8 +148,37 @@ fn a_game_without_a_known_system_goes_to_check_games_first() {
     let library = Library::new(vec![archive(9, "Mystery", None)]);
     let game = library.game(9).unwrap();
     assert_eq!(
-        Action::one_game_check(game).route(game),
+        Action::one_game_check(game, None).route(game),
         Route::Section(Section::Check)
+    );
+    // Clicked from Game Details, it opens the system list, not a system
+    // chosen earlier on Check Games.
+    let context = egui::Context::default();
+    let mut app = blue_app(&context, vec![archive(9, "Mystery", None)]);
+    app.check_platform = Some("SNES".into());
+    app.router.current = Route::Game(9);
+    pin_setup_guidance(&mut app, 9);
+    click_text(&context, &mut app, [1280.0, 1200.0], "Verify this game");
+    assert_eq!(app.router.current, Route::Section(Section::Check));
+    assert_eq!(app.check_platform, None);
+    assert!(app.verification_job.is_none());
+}
+
+#[test]
+fn an_invalidated_proof_or_re_check_guidance_is_offered_as_a_re_check() {
+    use super::super::game_verification_guidance::{Action, Guidance};
+    let mut invalidated = Library::new(games()).game(1).unwrap().clone();
+    invalidated.dat_proof_invalidated = true;
+    assert_eq!(Action::one_game_check(&invalidated, None), Action::Recheck);
+    let unchecked = Library::new(games()).game(2).unwrap().clone();
+    let recheck = Guidance {
+        reason: "Audit has no usable exact result",
+        explanation: String::new(),
+        action: Action::Recheck,
+    };
+    assert_eq!(
+        Action::one_game_check(&unchecked, Some(&recheck)),
+        Action::Recheck
     );
 }
 

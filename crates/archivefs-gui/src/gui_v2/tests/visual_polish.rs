@@ -107,6 +107,7 @@ fn visual_polish_game_detail_actions_have_equal_bounds() {
     let context = egui::Context::default();
     let mut app = populated(&context);
     app.router.current = Route::Game(2);
+    super::pin_setup_guidance(&mut app, 2);
     for _ in 0..3 {
         frame(&context, &mut app, [1920.0, 1080.0]);
     }

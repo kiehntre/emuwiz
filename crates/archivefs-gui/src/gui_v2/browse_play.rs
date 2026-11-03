@@ -767,10 +767,10 @@ impl App {
 
     fn browse_play_verify_button(&mut self, ui: &mut egui::Ui) {
         let hint = if self.filter.platform.is_empty() {
-            "Check your games against trusted catalogues. Opens Check Games; nothing is read until you preview and confirm.".to_string()
+            "Check your games against trusted catalogues. Opens Check Games; no game file is read until you preview and confirm.".to_string()
         } else {
             format!(
-                "Check your {} games against trusted catalogues. Opens Check Games; nothing is read until you preview and confirm.",
+                "Check your {} games against trusted catalogues. Opens Check Games; no game file is read until you preview and confirm.",
                 self.filter.platform
             )
         };

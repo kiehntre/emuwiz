@@ -32,10 +32,16 @@ impl Action {
     }
 
     /// Game Details' always-visible per-game action: "Re-check" once any DAT
-    /// result is saved for this game, otherwise "Verify". The label names the
-    /// action only; the result shown stays the engine's saved state.
-    pub(super) fn one_game_check(game: &Game) -> Self {
-        if game.dat_exact.is_some() || game.dat_state.is_some() {
+    /// result is saved for this game (or its saved proof was invalidated, or
+    /// this panel's guidance already asks for a re-check), otherwise
+    /// "Verify". The label names the action only; the result shown stays the
+    /// engine's saved state.
+    pub(super) fn one_game_check(game: &Game, guidance: Option<&Guidance>) -> Self {
+        if game.dat_exact.is_some()
+            || game.dat_state.is_some()
+            || game.dat_proof_invalidated
+            || guidance.is_some_and(|guidance| guidance.action == Self::Recheck)
+        {
             Self::Recheck
         } else {
             Self::Audit
