@@ -577,6 +577,16 @@ def entry_class_problem(rel_parts, parent_path):
     if len(rel_parts) > 3 or any(p in F.ALWAYS_PRESERVE for p in rel_parts):
         return "NOT_A_COMPILER_ARTIFACT"
     profile = parent_path
+    # Fix B: a binary left in a markerless `debug` profile by an earlier retirement.
+    # Same predicate as the planner, re-evaluated now (content, shape, owner, links).
+    if (os.path.basename(profile) == F.RESIDUE_PROFILE and rel_parts[-2] == F.RESIDUE_PROFILE
+            and (len(rel_parts) == 2 or re.fullmatch(r"[A-Za-z0-9_]+(?:-[A-Za-z0-9_]+){2,}", rel_parts[0]))):
+        full = os.path.join(profile, name)
+        if F.residue_executable(full):
+            return None
+        if (not os.path.lexists(full) and F.RESIDUE_NAME_RE.match(name)
+                and "journal" not in name.lower() and F.markerless_profile(profile)):
+            return None  # absence is handled by the identity check (ALREADY_ABSENT)
     has_marker = any(
         os.path.isdir(os.path.join(profile, marker)) and not os.path.islink(os.path.join(profile, marker))
         for marker in (".fingerprint", "deps")
@@ -727,10 +737,114 @@ def orphan_git_preserved_owner(group, record, target):
     return None, ""
 
 
+ATTESTED_ROUTE = "GIT_PRESERVED_ATTESTED"
+ATTESTATION_KEYS = ("repo", "worktree", "head", "attested_by", "reason")
+ADMIN_FILE_MAX = 4096
+
+
+def _read_small_nofollow(path):
+    """Contents of a small regular file, or None if absent; raises OSError when it cannot be judged."""
+    try:
+        fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK | os.O_CLOEXEC)
+    except OSError as error:
+        if error.errno in (errno.ENOENT, errno.ENOTDIR):
+            return None
+        raise
+    try:
+        st = os.fstat(fd)
+        if not stat.S_ISREG(st.st_mode) or st.st_size > ADMIN_FILE_MAX:
+            raise OSError(errno.EINVAL, "not a small regular file")
+        return os.pread(fd, ADMIN_FILE_MAX + 1, 0).decode("utf-8", "surrogateescape")
+    finally:
+        os.close(fd)
+
+
+def orphan_attested_owner(group, record, target):
+    """Fix C: owner-attested orphan route for builds recorded BEFORE cargo-iso kept checkout evidence.
+
+    The manifest (whose digest the owner approves) must carry `orphan_attestation` naming the
+    repository, the recorded worktree path, the recorded build HEAD, who attests and why. The
+    attestation only nominates the repository; nothing in it is trusted without a fresh check.
+    Records that DO carry checkout evidence never take this route: they are judged by the
+    stronger evidence route (GIT_PRESERVED). Freshly, holding on anything unverifiable:
+      * cargo-iso record with last_start, a 40-hex HEAD equal to source_head and to the attested
+        head, and a normalised absolute worktree equal to the attested worktree;
+      * the target name bound to that worktree path by its hash;
+      * the repository is canonical (real `.git` directory, no symlink) and equals any orphan_repo;
+      * the worktree path is absent (lstat ENOENT/ENOTDIR only);
+      * no administrative entry `<repo>/.git/worktrees/*/gitdir` points at the worktree, every entry
+        is readable, and `git worktree list` does not register the path;
+      * the HEAD is a commit contained in refs/remotes/origin/main of that repository.
+    Same documented limit as the evidence route: a checkout moved by hand AND pruned is
+    indistinguishable from a removed one; the pin, lock, census, idle and journal gates still apply,
+    and only regenerable compiler output is ever removed."""
+    att = group.get("orphan_attestation")
+    if not isinstance(att, dict) or any(not isinstance(att.get(k), str) or not att.get(k).strip()
+                                        for k in ATTESTATION_KEYS):
+        return "ORPHAN_ATTESTATION_INVALID", "orphan_attestation needs repo, worktree, head, attested_by, reason"
+    if isinstance(record.get("checkout"), dict):
+        return orphan_git_preserved_owner(dict(group, orphan_route=ORPHAN_ROUTE), record, target)
+    wt, head = record.get("worktree"), record.get("head")
+    if not record.get("last_start") or not wt or not os.path.isabs(wt):
+        return "SOURCE_MISSING", "orphan route needs a recorded cargo-iso build and worktree path"
+    if not isinstance(head, str) or len(head) != 40 or any(c not in "0123456789abcdef" for c in head):
+        return "SOURCE_MISSING", "orphan route needs a recorded 40-hex build HEAD"
+    if os.path.normpath(wt) != wt:
+        return "OWNER_UNVERIFIED", "recorded worktree path is not normalised"
+    if group.get("source_head") != head or att["head"] != head:
+        return "OWNER_UNVERIFIED", "manifest source_head or attested head differs from the recorded build HEAD"
+    if att["worktree"] != wt:
+        return "OWNER_UNVERIFIED", "attested worktree differs from the recorded worktree"
+    digest = hashlib.sha256(wt.encode()).hexdigest()[:12]
+    if record.get("worktree_hash") != digest or not os.path.basename(target).endswith("-" + digest):
+        return "OWNER_UNVERIFIED", "target name is not bound to the recorded worktree path"
+    repo = att["repo"]
+    common = os.path.join(repo, ".git")
+    if (not os.path.isabs(repo) or os.path.normpath(repo) != repo or os.path.realpath(common) != common
+            or os.path.islink(common) or not os.path.isdir(common)):
+        return "ORPHAN_REPO_UNVERIFIED", "the attested repository is not a canonical checkout with a .git directory"
+    if group.get("orphan_repo") is not None and group.get("orphan_repo") != repo:
+        return "ORPHAN_REPO_UNVERIFIED", "manifest orphan_repo differs from the attested repository"
+    state = path_presence(wt)
+    if state == "unknown":
+        return "ORPHAN_SOURCE_UNKNOWN", "cannot establish whether the recorded worktree path is absent"
+    if state == "present":
+        return "ORPHAN_SOURCE_PRESENT", "the recorded worktree path still exists; use the normal route"
+    admin_root = os.path.join(common, "worktrees")
+    try:
+        entries = sorted(os.listdir(admin_root)) if os.path.lexists(admin_root) else []
+    except OSError as error:
+        return "ORPHAN_SOURCE_UNKNOWN", f"cannot list {admin_root}: {error.strerror}"
+    wanted = os.path.join(wt, ".git")
+    for entry in entries:
+        try:
+            text = _read_small_nofollow(os.path.join(admin_root, entry, "gitdir"))
+        except OSError as error:
+            return "ORPHAN_SOURCE_UNKNOWN", f"cannot read administrative entry {entry}: {error.strerror or error}"
+        if text is not None and os.path.normpath(text.strip()) == wanted:
+            return "ORPHAN_SOURCE_PRESENT", f"administrative entry {entry} still points at the recorded worktree"
+    try:
+        listing = _git(repo, "worktree", "list", "--porcelain")
+        if listing.returncode:
+            return "ORPHAN_REPO_UNVERIFIED", "git worktree list failed"
+        for line in listing.stdout.splitlines():
+            if line.startswith("worktree ") and (line[9:] == wt or os.path.realpath(line[9:]) == wt):
+                return "ORPHAN_SOURCE_PRESENT", "git still registers the recorded worktree"
+        if _git(repo, "cat-file", "-e", head + "^{commit}").returncode:
+            return "GIT_HISTORY_NOT_PRESERVED", "the build HEAD is not a commit in the attested repository"
+        if _git(repo, "merge-base", "--is-ancestor", head, "refs/remotes/origin/main").returncode:
+            return "GIT_HISTORY_NOT_PRESERVED", "the build HEAD is not contained in origin/main"
+    except (OSError, ValueError, subprocess.SubprocessError) as error:
+        return "ORPHAN_REPO_UNVERIFIED", str(error)
+    return None, ""
+
+
 def verified_owner(group, record, source_paths, target):
     """Adoption is only a claim; this is the evidence that makes it count."""
     if not record or not record.get("owner"):
         return "NOT_ADOPTED", "no lifecycle record with an owner"
+    if not group.get("source_exists") and not source_paths and group.get("orphan_route") == ATTESTED_ROUTE:
+        return orphan_attested_owner(group, record, target)
     if not group.get("source_exists") and not source_paths and group.get("orphan_route"):
         return orphan_git_preserved_owner(group, record, target)
     if not group.get("source_exists") or not source_paths:
@@ -1638,6 +1752,10 @@ def process_group(entry, registry, args, census, now_ts, execute, journal=None):
         "accounted_freed_bytes": 0, "retained_hardlink_bytes": 0, "outcome": "HELD",
         "paths_partial": 0, "files_removed": 0, "dirs_removed": 0,
     }
+    if group.get("orphan_route") == ATTESTED_ROUTE:
+        out["orphan_route"] = ATTESTED_ROUTE
+        att = group.get("orphan_attestation")
+        out["orphan_attestation"] = {k: att.get(k) for k in ATTESTATION_KEYS} if isinstance(att, dict) else None
     lock_fd = None
     fence = None
     try:

@@ -569,7 +569,17 @@ recognise arbitrary content simply because its directory is named `incremental`.
 The planner can locate an orphan incremental unit in `debug`/`release`, including
 under a target triple, after `.fingerprint` and `deps` have been retired. Other
 profile/output classification (`deps`, `.fingerprint`, `build`, examples and
-executables with `.d` files) is unchanged. `tests`/`benches`, unknown files and
+executables with `.d` files) is unchanged. Post-retirement binary residue (Fix B) is the only addition:
+a file directly in a `debug` profile (or `<triple>/debug`) qualifies only if every condition below holds, freshly:
+- the profile is markerless: none of `.fingerprint`, `deps`, `build`, `examples` or `incremental` remains;
+- the name is Cargo-binary-shaped (letters, digits, `_`, `-`; no dot) and does not contain `journal`;
+- it is a regular file, executable, owned by this user, with exactly one link;
+- it starts with the ELF magic, read through an `O_NOFOLLOW` descriptor whose identity matches the `lstat`.
+
+The planner selects it as `post-retirement binary residue`, and the executor re-applies the same predicate.
+A changed, relinked, swapped or non-ELF file is held. `release` binaries are never selected this way, because
+they are the usual install and rollback source. A symlink, a script, a hard link, a suffixed name, or a binary
+beside remaining Cargo output stays unrecognised, so the residue gate keeps holding the worktree. `tests`/`benches`, unknown files and
 source/worktree/audit/evidence paths do not acquire a new classification. If
 incremental contents are unrecognised, planning preserves the profile's other
 outputs too, so it does not remove their markers and strand incremental output.
@@ -671,3 +681,36 @@ checkout's `.git`; anything else records no evidence and the route refuses.
 A build that finds no valid linked checkout at the recorded path removes any earlier `checkout` evidence (never paired with a newer
 HEAD); a non-UTF-8 registered worktree name is decoded with surrogateescape and cannot abort a run; git errors, non-zero exits and
 timeouts are `ORPHAN_REPO_UNVERIFIED`.
+
+### Owner-attested orphan route (`GIT_PRESERVED_ATTESTED`)
+
+Builds recorded before cargo-iso kept `checkout` evidence can never use `GIT_PRESERVED`
+(`ORPHAN_EVIDENCE_MISSING`). For those only, a manifest group may set
+`"orphan_route": "GIT_PRESERVED_ATTESTED"` with `"orphan_attestation": {"repo", "worktree", "head",
+"attested_by", "reason"}` (all non-empty strings). The attestation lives in the manifest whose digest the owner
+approves, so it is an owner decision bound to that exact list; it only nominates the repository, and every
+fact is re-checked when the executor runs:
+- **The record:** it must have a cargo-iso build with a 40-hex HEAD equal to `source_head` and to the attested
+  head; a normalised absolute worktree equal to the attested worktree; and the target name bound to that path by its hash.
+- **The repository:** canonical, meaning a real `.git` directory with no symlink and an absolute normalised
+  path. It must equal any `orphan_repo`.
+- **The worktree:** its path must be absent (`lstat` ENOENT/ENOTDIR only). No `<repo>/.git/worktrees/*/gitdir`
+  entry may point at it, every such entry must be readable, and `git worktree list` must not register it.
+- **The history:** the HEAD must be a commit contained in that repository's `refs/remotes/origin/main`.
+
+Holds:
+- `ORPHAN_ATTESTATION_INVALID` (missing or empty attestation fields);
+- `OWNER_UNVERIFIED`;
+- `ORPHAN_REPO_UNVERIFIED`;
+- `ORPHAN_SOURCE_PRESENT`;
+- `ORPHAN_SOURCE_UNKNOWN`;
+- `GIT_HISTORY_NOT_PRESERVED`.
+
+A record that does carry `checkout` evidence is always judged by the stronger evidence route, so an attestation
+can never bypass moved-checkout detection. `GIT_PRESERVED` without evidence still refuses, and an attestation
+never upgrades it. The receipt records the route and the attestation. The pin, lock, census, idle, identity,
+journal and approved-manifest gates are unchanged.
+
+The limit is the same as for the evidence route, and is weaker here because there is no checkout inode: a
+checkout moved by hand AND pruned is indistinguishable from a removed one. Only regenerable compiler output is
+removed; the HEAD is already in `origin/main`, and git, source and the repository are never touched.

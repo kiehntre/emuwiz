@@ -791,6 +791,15 @@ class UnrecognisedResidue(MaintBase):
             os.mkfifo(path)
             return lambda: os.unlink(path)
 
+        def hardlinked(path):
+            undo = write(path, elf, 0o755)
+            alias = os.path.join(self.tmp, "installed-" + os.path.basename(path))
+            os.link(path, alias)
+            def both():
+                undo()
+                os.unlink(alias)
+            return both
+
         def unreadable(path):
             os.makedirs(path)
             os.chmod(path, 0)
@@ -800,9 +809,12 @@ class UnrecognisedResidue(MaintBase):
             return undo
 
         cases = {
-            "standalone ELF, no sibling .d": (lambda: write(os.path.join(debug, "archivefs-gui"), elf, 0o755), "archivefs-gui"),
+            # (a bare ELF directly in markerless debug/ is retirable residue since Fix B; see
+            # test_debug_binary_residue_holds_until_retired. These ELF shapes are not.)
+            "standalone ELF in a release profile": (lambda: write(os.path.join(t, "release", "archivefs-gui"), elf, 0o755), "archivefs-gui"),
             "executable that is not an ELF": (lambda: write(os.path.join(debug, "helper.sh"), b"#!/bin/sh\n", 0o755), "helper.sh"),
-            "second ELF alias": (lambda: write(os.path.join(debug, "emuwiz-v2"), elf, 0o755), "emuwiz-v2"),
+            "hard-linked ELF": (lambda: hardlinked(os.path.join(debug, "emuwiz-v2")), "emuwiz-v2"),
+            "suffixed ELF": (lambda: write(os.path.join(debug, "emuwiz.real"), elf, 0o755), "emuwiz.real"),
             "unrecognised file at the cache root": (lambda: write(os.path.join(t, "stray.txt")), "stray.txt"),
             "unrecognised file beside the lock files": (lambda: write(os.path.join(debug, "notes.txt")), "notes.txt"),
             "nested residue": (lambda: write(os.path.join(debug, "x", "y", "z", "blob.bin")), "blob.bin"),
@@ -816,29 +828,54 @@ class UnrecognisedResidue(MaintBase):
         for label, (plant, needle) in cases.items():
             with self.subTest(label):
                 undo = plant()
-                self.assert_residue(wt, needle)
-                undo()
+                try:
+                    self.assert_residue(wt, needle)
+                finally:
+                    undo()
+                    if os.path.isdir(os.path.join(t, "release")):
+                        os.rmdir(os.path.join(t, "release"))
                 self.assert_clear(wt)
 
     def test_the_standalone_executable_case_the_real_orphans_had(self):
-        # Several 373 MB executables with different names and no .d, as left in real caches.
+        # Several 373 MB executables with different names and no .d, as left in real caches,
+        # older than the release. Since Fix B they are retirable residue: the worktree still
+        # HOLDs (never CLEAR) until a maintenance cycle has retired them.
         wt, t = self.retired("resid-real")
-        for name in ("archivefs-gui", "emuwiz", "emuwiz-gui", "emuwiz-v2"):
+        names = ("archivefs-gui", "emuwiz", "emuwiz-gui", "emuwiz-v2")
+        for name in names:
             path = os.path.join(t, "debug", name)
             with open(path, "wb") as handle:
                 handle.write(b"\x7fELF" + b"\0" * 1_000_000)
             os.chmod(path, 0o755)
-        gate = self.m.worktree_gate(wt)
-        self.assertEqual(gate["code"], "UNRECOGNISED_RESIDUE")
-        self.assertEqual(gate["residue"]["items"], 4)
-        self.assertGreater(gate["residue"]["bytes"], 4_000_000)
-        self.assertIn("4 item(s)", gate["explanation"])
+        self.age(t, 10)
+        selected, _ = self.m.F.select_artifacts(t, None)
+        self.assertEqual(sorted(os.path.basename(s["path"]) for s in selected), sorted(names))
+        for data in self.checks(wt) + [self.m.worktree_gate(wt)]:
+            self.assertEqual((data["status"], data["code"]), ("HOLD", "AWAITING_RETIREMENT"), data)
+
+    def test_debug_binary_residue_holds_until_retired(self):
+        wt, t = self.retired("resid-cycle")
+        path = os.path.join(t, "debug", "archivefs-gui")
+        with open(path, "wb") as handle:
+            handle.write(b"\x7fELF\x02\x01\x01" + b"\0" * 4096)
+        os.chmod(path, 0o755)
+        # written after the release: the gate says so, and holds
+        self.assertEqual(self.m.worktree_gate(wt)["code"], "WRITTEN_AFTER_RELEASE")
+        self.age(t, 10)
+        for data in self.checks(wt):
+            self.assertEqual((data["status"], data["code"]), ("HOLD", "AWAITING_RETIREMENT"), data)
+        self.retire_cycle()
+        self.assertEqual(self.last_cycle()["outcome"], "RETIRED")
+        self.assertFalse(os.path.lexists(path))
+        self.assert_clear(wt)
+        for p in self.evidence_paths(t):
+            self.assertTrue(os.path.exists(p), p)
 
     def test_check_is_read_only_and_repeatable_after_restart(self):
         wt, t = self.retired("resid-ro")
-        path = os.path.join(t, "debug", "archivefs-gui")
+        path = os.path.join(t, "debug", "helper.sh")  # unrecognised (not an ELF)
         with open(path, "wb") as handle:
-            handle.write(b"\x7fELF" + b"\0" * 512)
+            handle.write(b"#!/bin/sh\n" + b"\0" * 512)
         os.chmod(path, 0o755)
         before = self.snapshot(t)
         first = self.m.worktree_gate(wt)
