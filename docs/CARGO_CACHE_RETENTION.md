@@ -328,7 +328,11 @@ enable record bound to the policy digest plus a history event; the `enabled` fla
 file is ignored, and re-approving requires a fresh enable. The policy carries a `schema` (currently 2); a
 policy approved under an older schema is invalid (fail closed, every cycle REFUSED with the reason) and must be
 approved again, because schema 2 widened what a cycle retires to post-retirement binary residue in a markerless
-`debug` profile, which an older approval never covered. Its old digest cannot be reused. A malformed policy, one missing fields
+`debug` profile, which an older approval never covered. Its old digest cannot be reused. After installing a
+schema-2 tool over a schema-1 policy, every timer cycle exits 1 (REFUSED) until the owner re-approves
+(`policy approve` leaves it DISABLED; enabling stays a separate step). A manifest run by hand through
+`emuwiz-cargo-retire` is different: its owner-approved digest covers exactly the paths it lists, so a residue
+path is retired only if that manifest names it. A malformed policy, one missing fields
 (`scope.kinds`, limits), one owned by an account other than the effective user or registry owner
 (root is not a wildcard), or a group/world-writable file or state directory fails closed. A generated
 manifest hash is never the authorisation: the manifest must name the live policy digest and only
@@ -727,7 +731,8 @@ Holds:
 A record that has a `checkout` key at all (valid or malformed) is always judged by the stronger evidence route,
 with the attested repository required to match the recorded one, so an attestation can never bypass moved-checkout
 detection or upgrade a corrupted record. The receipt's `orphan_route` names the route that decided
-(`GIT_PRESERVED` in that case) and `orphan_route_requested` the route the manifest asked for. `GIT_PRESERVED` without evidence still refuses, and an attestation
+(`GIT_PRESERVED` in that case, `SOURCE` when a live source checkout was used) and `orphan_route_requested`
+the route the manifest asked for. `GIT_PRESERVED` without evidence still refuses, and an attestation
 never upgrades it. The receipt records the route and the attestation. The pin, lock, census, idle, identity,
 journal and approved-manifest gates are unchanged.
 

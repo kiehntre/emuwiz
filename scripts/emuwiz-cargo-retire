@@ -836,7 +836,10 @@ def foreign_registration(wt, repo):
                     continue
                 seen.add(common)
                 if common == path:  # a bare repository: HEAD and objects/ directly inside
-                    if not (os.path.lexists(os.path.join(path, "HEAD")) and os.path.lexists(os.path.join(path, "objects"))):
+                    marks = [path_presence(os.path.join(path, n)) for n in ("HEAD", "objects")]
+                    if "unknown" in marks:
+                        return "ORPHAN_SOURCE_UNKNOWN", f"cannot establish whether {path} is a repository"
+                    if marks != ["present", "present"]:
                         continue
                 else:
                     state = path_presence(common)
@@ -948,6 +951,22 @@ def orphan_attested_owner(group, record, target):
     return None, ""
 
 
+def decided_orphan_route(group, record, source_paths):
+    """The ownership route verified_owner takes for this group (reporting only, for the receipt):
+    ATTESTED_ROUTE, ORPHAN_ROUTE (the evidence route, also for an attested group whose record carries
+    `checkout`), "SOURCE" (a live source checkout) or None (no owner record: nothing decided)."""
+    if not record or not record.get("owner"):
+        return None
+    if not group.get("source_exists") and not source_paths and group.get("orphan_route") == ATTESTED_ROUTE:
+        att = group.get("orphan_attestation")
+        valid = isinstance(att, dict) and all(isinstance(att.get(k), str) and att.get(k).strip()
+                                              for k in ATTESTATION_KEYS)
+        return ORPHAN_ROUTE if valid and "checkout" in record else ATTESTED_ROUTE
+    if not group.get("source_exists") and not source_paths and group.get("orphan_route"):
+        return ORPHAN_ROUTE
+    return "SOURCE"
+
+
 def verified_owner(group, record, source_paths, target):
     """Adoption is only a claim; this is the evidence that makes it count."""
     if not record or not record.get("owner"):
@@ -1022,6 +1041,7 @@ def evaluate_group(entry, registry, args, census, now_ts, execute, own_lock=Fals
         record = {"owner": "ASSUMED-FOR-DRY-RUN", "adopted_at": now_ts, "worktree": sources[0] if sources else None}
         ctx["record"] = record
         ctx["assumed"] = True
+    ctx["decided_route"] = decided_orphan_route(group, record, sources)
     problem, detail = verified_owner(group, record, sources, target)
     if problem:
         hold(problem, detail)
@@ -1865,8 +1885,8 @@ def process_group(entry, registry, args, census, now_ts, execute, journal=None):
         "paths_partial": 0, "files_removed": 0, "dirs_removed": 0,
     }
     if group.get("orphan_route") == ATTESTED_ROUTE:
-        # orphan_route records the route that decided; it becomes GIT_PRESERVED below when the
-        # record carries checkout evidence (then the stronger evidence route judged it)
+        # orphan_route records the route that decided; it is replaced below once the record is read
+        # (GIT_PRESERVED when the record carries checkout evidence, SOURCE for a live checkout)
         out["orphan_route_requested"] = out["orphan_route"] = ATTESTED_ROUTE
         att = group.get("orphan_attestation")
         out["orphan_attestation"] = {k: att.get(k) for k in ATTESTATION_KEYS} if isinstance(att, dict) else None
@@ -1897,9 +1917,8 @@ def process_group(entry, registry, args, census, now_ts, execute, journal=None):
             census = fresh
         holds, ctx = evaluate_group(entry, registry, args, census, now_ts, execute, own_lock=lock_fd is not None)
         out["key"] = ctx.get("key")
-        if group.get("orphan_route") == ATTESTED_ROUTE and isinstance(ctx.get("record"), dict) \
-                and "checkout" in ctx["record"]:
-            out["orphan_route"] = ORPHAN_ROUTE  # the evidence route decided (orphan_attested_owner)
+        if group.get("orphan_route") == ATTESTED_ROUTE and ctx.get("decided_route"):
+            out["orphan_route"] = ctx["decided_route"]  # the route that decided (see decided_orphan_route)
         if ctx.get("assumed"):
             out["note"] = "ownership ASSUMED for this dry run; execution would hold on NOT_ADOPTED"
         out["holds"] = holds

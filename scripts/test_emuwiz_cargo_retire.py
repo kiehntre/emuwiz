@@ -1743,6 +1743,11 @@ class AttestedOrphanRoute(Base):
         self.assertEqual(codes, set(), r)
         self.assertEqual(r["groups"][0]["orphan_route"], "GIT_PRESERVED_ATTESTED")
         self.assertEqual(r["groups"][0]["orphan_route_requested"], "GIT_PRESERVED_ATTESTED")
+        wt3, t3, g3 = self.attested("wt-att-rcpt-inv", strip=False)  # evidence, but the attestation is invalid
+        codes, r = self.holds(dict(g3, orphan_attestation=dict(g3["orphan_attestation"], reason=" ")), "m3.json")
+        self.assertIn("ORPHAN_ATTESTATION_INVALID", codes, r)
+        self.assertEqual(r["groups"][0]["orphan_route"], "GIT_PRESERVED_ATTESTED")  # it decided, and held
+        self.assertTrue(self.exists(t3, "debug/deps"))
 
     def test_pin_still_holds_an_attested_orphan(self):
         wt, t, g = self.attested("wt-att-pin")
