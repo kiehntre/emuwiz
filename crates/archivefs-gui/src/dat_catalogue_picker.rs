@@ -434,7 +434,7 @@ impl DatCataloguePickerState {
                                 ui.label(if !summary.enabled { "Disabled" } else { availability_label(&summary.availability, usable) });
                             });
                             if !simple { ui.horizontal_wrapped(|ui| {
-                                ui.label(catalogue_row_text(workflow, &evidence_label(&summary.platform)));
+                                ui.label(catalogue_row_text(workflow, &platform_label(summary)));
                                 ui.label(evidence_ecosystem_label(&summary.ecosystem));
                                 if let Some(variant) = summary.variant.confirmed() {
                                     ui.label(variant.label());
@@ -633,6 +633,25 @@ fn catalogue_row_text(workflow: DatCatalogueWorkflow, value: &str) -> String {
         text.push_str("…");
     }
     text
+}
+
+/// The platform with who set it, so a system set by "Apply all safe
+/// matches" or saved without a record never reads as the person's choice.
+pub(crate) fn platform_label(summary: &InstalledCatalogueSummary) -> String {
+    use archivefs_core::dat::sources::PlatformProvenance;
+    let label = evidence_label(&summary.platform);
+    match (&summary.platform, summary.platform_origin) {
+        (EvidenceValue::Assigned(_), PlatformProvenance::ChosenByPerson) => {
+            format!("{label} (your choice)")
+        }
+        (EvidenceValue::Assigned(_), PlatformProvenance::AppliedFromRecognition) => {
+            format!("{label} (set from the catalogue\u{2019}s own name)")
+        }
+        (EvidenceValue::Assigned(_), PlatformProvenance::Unrecorded) => {
+            format!("{label} (not recorded who set it)")
+        }
+        _ => label,
+    }
 }
 
 fn evidence_label(value: &EvidenceValue<String>) -> String {

@@ -54,6 +54,7 @@ pub(super) fn fixture(context: &egui::Context) -> App {
         library: Arc::new(Library::default()),
         moved_game: None,
         review: Default::default(),
+        game_dat_check: Default::default(),
         indices: Vec::new(),
         filter: Filter::default(),
         filter_generation: 0,
@@ -1793,13 +1794,107 @@ fn assert_viewport_is(context: &egui::Context, output: &egui::FullOutput, size: 
         "effective viewport {:?} is not the constrained {size:?}",
         content.size()
     );
+    if let Err(message) = clip_rects_within_viewport(&output.shapes, size) {
+        panic!("{message}");
+    }
+}
+
+/// Every clip rect that can paint must lie inside the `size` viewport.
+///
+/// A clip rect that is not positive (zero or negative width or height, e.g. a
+/// nested scroll area laid out entirely below its parent's clip, whose
+/// intersection is inverted) paints nothing: epaint's tessellator skips any
+/// shape whose `clip_rect.is_positive()` is false. Only those are ignored; a
+/// positive clip rect outside the viewport, or a NaN one, is still a failure.
+fn clip_rects_within_viewport(
+    shapes: &[egui::epaint::ClippedShape],
+    size: [f32; 2],
+) -> Result<(), String> {
     let screen = egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(size[0], size[1]));
-    for clipped in &output.shapes {
-        assert!(
-            screen.expand(1.0).contains_rect(clipped.clip_rect),
-            "clip rect {:?} escapes the {size:?} viewport",
-            clipped.clip_rect
+    for clipped in shapes {
+        // NaN is never positive, but it signals a broken layout, so it still fails.
+        if clipped.clip_rect.any_nan() {
+            return Err(format!("clip rect {:?} is NaN", clipped.clip_rect));
+        }
+        if !clipped.clip_rect.is_positive() {
+            continue;
+        }
+        if !screen.expand(1.0).contains_rect(clipped.clip_rect) {
+            return Err(format!(
+                "clip rect {:?} escapes the {size:?} viewport",
+                clipped.clip_rect
+            ));
+        }
+    }
+    Ok(())
+}
+
+mod clip_rects_within_viewport_tests {
+    use super::{clip_rects_within_viewport, egui};
+
+    fn shape(min: [f32; 2], max: [f32; 2]) -> egui::epaint::ClippedShape {
+        egui::epaint::ClippedShape {
+            clip_rect: egui::Rect::from_min_max(min.into(), max.into()),
+            shape: egui::Shape::rect_filled(
+                egui::Rect::from_min_max(min.into(), max.into()),
+                0.0,
+                egui::Color32::WHITE,
+            ),
+        }
+    }
+
+    const SIZE: [f32; 2] = [1024.0, 600.0];
+
+    #[test]
+    fn inverted_clip_rect_outside_the_viewport_paints_nothing_and_passes() {
+        // The exact rect seen in the CI flake: min.y 714 > max.y 551.
+        let shapes = [shape([230.0, 714.0], [1024.0, 551.0])];
+        assert_eq!(clip_rects_within_viewport(&shapes, SIZE), Ok(()));
+    }
+
+    #[test]
+    fn empty_clip_rect_outside_the_viewport_paints_nothing_and_passes() {
+        let zero_height = shape([0.0, 900.0], [1024.0, 900.0]);
+        let zero_width = shape([2000.0, 0.0], [2000.0, 600.0]);
+        assert_eq!(
+            clip_rects_within_viewport(&[zero_height, zero_width], SIZE),
+            Ok(())
         );
+    }
+
+    #[test]
+    fn positive_clip_rect_partly_outside_the_viewport_still_fails() {
+        let shapes = [
+            shape([0.0, 0.0], [1024.0, 600.0]),
+            shape([230.0, 500.0], [1024.0, 714.0]),
+        ];
+        let error = clip_rects_within_viewport(&shapes, SIZE)
+            .expect_err("a positive clip rect escaping the viewport must fail");
+        assert!(
+            error.contains("escapes the [1024.0, 600.0] viewport"),
+            "{error}"
+        );
+    }
+
+    #[test]
+    fn positive_clip_rect_wider_than_the_viewport_still_fails() {
+        let shapes = [shape([0.0, 0.0], [1400.0, 600.0])];
+        assert!(clip_rects_within_viewport(&shapes, SIZE).is_err());
+    }
+
+    #[test]
+    fn nan_clip_rect_still_fails() {
+        let shapes = [shape([0.0, f32::NAN], [1024.0, 600.0])];
+        assert!(clip_rects_within_viewport(&shapes, SIZE).is_err());
+    }
+
+    #[test]
+    fn positive_clip_rect_inside_the_viewport_passes() {
+        let shapes = [
+            shape([0.0, 0.0], [1024.0, 600.0]),
+            shape([230.0, 120.0], [1024.0, 551.0]),
+        ];
+        assert_eq!(clip_rects_within_viewport(&shapes, SIZE), Ok(()));
     }
 }
 
@@ -8602,6 +8697,26 @@ fn shows(strings: &[String], needle: &str) -> bool {
     strings.iter().any(|value| value.contains(needle))
 }
 
+/// This game's verification panel has answered `reason` (no worker runs).
+fn panel_answered(app: &mut App, game: i64, reason: &'static str) {
+    app.review.verification_guidance.set_for_test(
+        game,
+        None,
+        Some(super::game_verification_guidance::Guidance {
+            reason,
+            explanation: String::new(),
+            action: super::game_verification_guidance::Action::Review,
+        }),
+    );
+}
+
+/// This game's panel is still reading its saved evidence (no worker runs).
+fn panel_pending(app: &mut App, game: i64) {
+    app.review
+        .verification_guidance
+        .set_for_test(game, None, None);
+}
+
 fn knowledge(
     state: archivefs_core::dat::library_identity_summary::DatVerificationState,
 ) -> DatKnowledge {
@@ -9082,6 +9197,275 @@ fn check_games_leads_with_what_verified_automatically_and_lists_only_the_rest() 
     assert!(!shows(&strings, "Manage DAT sources") && !shows(&strings, "Unknown:"));
 }
 
+/// An older library flag cannot outvote the current per-game lookup: stale or
+/// untrusted DAT evidence is never labelled Verified anywhere in Game Details.
+#[test]
+fn stale_or_untrusted_dat_evidence_is_never_labelled_verified_in_game_details() {
+    use archivefs_core::dat::library_identity_summary::DatVerificationState as S;
+    let context = egui::Context::default();
+    for (stale, trusted) in [(true, true), (false, false)] {
+        let mut app = review_app(&context, vec![(1, "Amidar", "Atari2600")]);
+        Arc::make_mut(&mut app.library).games[0].mark_dat_exact(Some("No-Intro"));
+        let mut current = knowledge(S::VerifiedSingleMatch {
+            algorithm: "SHA-1".into(),
+        });
+        current.stale = stale;
+        current.trusted_source = trusted;
+        app.review.knowledge = Some(current);
+        let review = app.identity_review_for(1).unwrap();
+        assert!(!review.is_verified(), "stale={stale} trusted={trusted}");
+        panel_answered(&mut app, 1, "File evidence stale or changed");
+        app.router.current = Route::Game(1);
+        let strings = text(&frame(&context, &mut app, [1280.0, 900.0]));
+        assert!(
+            shows(&strings, "Identity: Re-check needed"),
+            "stale={stale} trusted={trusted}: {strings:?}"
+        );
+        assert!(
+            !strings
+                .iter()
+                .any(|line| line.starts_with("Identity: Verified") || line.starts_with("Verified")),
+            "stale={stale} trusted={trusted}: {strings:?}"
+        );
+    }
+}
+
+/// Game Details never says Verified from a saved Library flag alone: before
+/// this game's panel answers, the Identity line and the readiness card both
+/// say "Checking verification"; afterwards both follow the panel's answer.
+/// Launch readiness is decided separately throughout.
+#[test]
+fn game_details_identity_follows_this_games_panel_from_pending_to_answer() {
+    let context = egui::Context::default();
+    let size = [1280.0, 900.0];
+    for (answer, settled, badge) in [
+        ("Verified", "Verified", "Verified"),
+        (
+            "File evidence stale or changed",
+            "Re-check needed",
+            "Re-check needed",
+        ),
+        (
+            "Catalogue selection required",
+            "Verification not yet confirmed",
+            "Verified",
+        ),
+        (
+            "Catalogue system coverage unresolved",
+            "Verification not yet confirmed",
+            "Verified",
+        ),
+        (
+            "Verification evidence unavailable",
+            "Verification not yet confirmed",
+            "Verified",
+        ),
+    ] {
+        let verified = settled == "Verified";
+        let mut app = review_app(&context, vec![(1, "Amidar", "Atari2600")]);
+        app.review.knowledge_for = None;
+        Arc::make_mut(&mut app.library).games[0].mark_dat_exact(Some("No-Intro"));
+        app.router.current = Route::Game(1);
+
+        // Before the panel answers
+        panel_pending(&mut app, 1);
+        let strings = text(&frame(&context, &mut app, size));
+        let pending = strings
+            .iter()
+            .filter(|line| line.contains("Identity: Checking verification"))
+            .count();
+        assert_eq!(pending, 2, "line and card, {answer}: {strings:?}");
+        assert!(!shows(&strings, "Identity: Verified"), "{strings:?}");
+        assert!(
+            shows(&strings, "Checking whether this game is ready"),
+            "launch is still undecided: {strings:?}"
+        );
+
+        // After it answers
+        panel_answered(&mut app, 1, answer);
+        let strings = text(&frame(&context, &mut app, size));
+        assert!(
+            !shows(&strings, "Checking verification"),
+            "{answer}: {strings:?}"
+        );
+        // The Identity line and the card say the same thing.
+        let settled_lines = strings
+            .iter()
+            .filter(|line| line.contains(&format!("Identity: {settled}")))
+            .count();
+        assert_eq!(settled_lines, 2, "{answer}: {strings:?}");
+        if !verified {
+            assert!(
+                !shows(&strings, "Identity: Verified"),
+                "{answer}: {strings:?}"
+            );
+        }
+        assert!(
+            shows(&strings, "Checking whether this game is ready"),
+            "verified identity never decides launch: {strings:?}"
+        );
+        // The in-memory Library badge: kept unless strictly invalidated.
+        // The database is never written here.
+        assert_eq!(
+            app.library.game(1).unwrap().dat_identity_summary(),
+            badge,
+            "{answer}"
+        );
+    }
+}
+
+/// Only strict invalidation drops that one game's in-memory badge. Setup
+/// gaps, unreadable evidence and a cancelled check drop nothing and never
+/// say Verified.
+#[test]
+fn only_a_disproving_answer_clears_only_that_games_library_badge() {
+    let context = egui::Context::default();
+    let mut app = review_app(
+        &context,
+        vec![(1, "Amidar", "Atari2600"), (2, "Pitfall", "Atari2600")],
+    );
+    app.review.knowledge_for = None;
+    for game in &mut Arc::make_mut(&mut app.library).games {
+        game.mark_dat_exact(Some("No-Intro"));
+    }
+    app.router.current = Route::Game(1);
+    panel_answered(&mut app, 1, "Verification evidence unavailable");
+    let strings = text(&frame(&context, &mut app, [1280.0, 900.0]));
+    assert!(
+        shows(&strings, "Identity: Verification not yet confirmed"),
+        "{strings:?}"
+    );
+    assert!(!shows(&strings, "Identity: Verified"), "{strings:?}");
+    assert_eq!(
+        app.library.game(1).unwrap().dat_identity_summary(),
+        "Verified"
+    );
+
+    for setup_gap in [
+        "Catalogue selection required",
+        "Catalogue system coverage unresolved",
+    ] {
+        panel_answered(&mut app, 1, setup_gap);
+        let strings = text(&frame(&context, &mut app, [1280.0, 900.0]));
+        assert!(
+            shows(&strings, "Identity: Verification not yet confirmed"),
+            "{setup_gap}: {strings:?}"
+        );
+        assert_eq!(
+            app.library.game(1).unwrap().dat_identity_summary(),
+            "Verified",
+            "{setup_gap} is not disproof"
+        );
+    }
+    // A check cancelled, or whose worker failed, before it answered.
+    let (cancelled, receiver) = std::sync::mpsc::channel();
+    app.review
+        .verification_guidance
+        .set_for_test(1, Some(receiver), None);
+    drop(cancelled);
+    frame(&context, &mut app, [1280.0, 900.0]);
+    let strings = text(&frame(&context, &mut app, [1280.0, 900.0]));
+    assert!(
+        shows(&strings, "Identity: Verification not yet confirmed"),
+        "{strings:?}"
+    );
+    assert!(!shows(&strings, "Identity: Verified"), "{strings:?}");
+    assert_eq!(
+        app.library.game(1).unwrap().dat_identity_summary(),
+        "Verified"
+    );
+
+    panel_answered(&mut app, 1, "File evidence stale or changed");
+    let strings = text(&frame(&context, &mut app, [1280.0, 900.0]));
+    assert_eq!(
+        app.library.game(1).unwrap().dat_identity_summary(),
+        "Re-check needed"
+    );
+    assert_eq!(
+        strings
+            .iter()
+            .filter(|line| line.contains("Identity: Re-check needed"))
+            .count(),
+        2,
+        "line and card: {strings:?}"
+    );
+    assert!(!shows(&strings, "Identity: Verified"), "{strings:?}");
+    assert_eq!(
+        app.library.game(2).unwrap().dat_identity_summary(),
+        "Verified",
+        "another game is untouched"
+    );
+}
+
+/// One game's answer never applies to another, and a late result from an
+/// earlier game or an earlier check cannot land after the panel moved on.
+#[test]
+fn a_panel_answer_never_crosses_games_or_outlives_its_check() {
+    use super::detail_identity::DetailIdentity;
+    let context = egui::Context::default();
+    let mut app = review_app(
+        &context,
+        vec![(1, "Amidar", "Atari2600"), (2, "Pitfall", "Atari2600")],
+    );
+    app.review.knowledge_for = None;
+    for game in &mut Arc::make_mut(&mut app.library).games {
+        game.mark_dat_exact(Some("No-Intro"));
+    }
+    let second = app.library.game(2).unwrap().clone();
+    panel_answered(&mut app, 1, "Verified");
+    assert!(
+        app.detail_identity(&app.library.game(1).unwrap().clone())
+            .unwrap()
+            .is_verified()
+    );
+    assert_eq!(app.detail_identity(&second), Some(DetailIdentity::Checking));
+
+    // A check for game 1 is in flight; the panel then moves to game 2.
+    let (late, receiver) = std::sync::mpsc::channel();
+    app.review
+        .verification_guidance
+        .set_for_test(1, Some(receiver), None);
+    app.review.verification_guidance.invalidate();
+    panel_pending(&mut app, 2);
+    let answer = super::game_verification_guidance::Guidance {
+        reason: "Verified",
+        explanation: String::new(),
+        action: super::game_verification_guidance::Action::Review,
+    };
+    assert!(
+        late.send(answer.clone()).is_err(),
+        "the old check was dropped"
+    );
+    app.router.current = Route::Game(2);
+    let strings = text(&frame(&context, &mut app, [1280.0, 900.0]));
+    assert!(!shows(&strings, "Identity: Verified"), "{strings:?}");
+    assert_eq!(app.detail_identity(&second), Some(DetailIdentity::Checking));
+
+    // A re-check of the same game: only the newer check's answer counts.
+    let (older, older_receiver) = std::sync::mpsc::channel();
+    app.review
+        .verification_guidance
+        .set_for_test(2, Some(older_receiver), None);
+    app.review.verification_guidance.invalidate();
+    let (newer, newer_receiver) = std::sync::mpsc::channel();
+    app.review
+        .verification_guidance
+        .set_for_test(2, Some(newer_receiver), None);
+    assert!(
+        older.send(answer.clone()).is_err(),
+        "the older check was dropped"
+    );
+    newer
+        .send(super::game_verification_guidance::Guidance {
+            reason: "File evidence stale or changed",
+            ..answer
+        })
+        .unwrap();
+    let strings = text(&frame(&context, &mut app, [1280.0, 900.0]));
+    assert!(!shows(&strings, "Identity: Verified"), "{strings:?}");
+    assert!(!app.detail_identity(&second).unwrap().is_verified());
+}
+
 #[test]
 fn one_game_has_one_identity_status_on_every_page() {
     use archivefs_core::dat::library_identity_summary::DatVerificationState as S;
@@ -9095,16 +9479,31 @@ fn one_game_has_one_identity_status_on_every_page() {
             app.review.knowledge = Some(knowledge(S::VerifiedSingleMatch {
                 algorithm: "SHA-1".into(),
             }));
+            // This game's own panel confirmed current proof.
+            panel_answered(&mut app, 1, "Verified");
         } else {
             app.review.knowledge = Some(knowledge(S::NoMatch));
+            panel_answered(&mut app, 1, "No catalogue match");
         }
         let label = app.identity_review_for(1).unwrap().list_label();
         // Game Details
         app.router.current = Route::Game(1);
+        // The identity result is on the first screen, not below the fold.
         let strings = text(&frame(&context, &mut app, [1280.0, 900.0]));
         assert!(
             shows(&strings, &format!("Identity: {label}")),
             "details {label}: {strings:?}"
+        );
+        // The launch card never contradicts it: a verified game is not
+        // "Needs review", and verified identity alone never decides launch.
+        assert_eq!(
+            shows(&strings, "Identity: Needs review"),
+            !verified,
+            "details {label}: {strings:?}"
+        );
+        assert!(
+            shows(&strings, "Checking whether this game is ready"),
+            "launch readiness stays separate: {strings:?}"
         );
         // Problems for this one game
         app.router.current = Route::Task {
@@ -9237,10 +9636,17 @@ fn a_fresh_exact_dat_match_is_verified_on_every_page_and_launch_says_what_it_sti
     let review = app.identity_review_for(vid).unwrap();
     assert!(review.is_verified() && review.list_label() == "Verified");
     assert!(!app.identity_review_for(uid).unwrap().is_verified());
-    // Game Details
+    // Game Details, once this game's panel has confirmed current proof
+    panel_answered(&mut app, vid, "Verified");
     app.router.current = Route::Game(vid);
     let strings = text(&frame(&context, &mut app, [1280.0, 900.0]));
     assert!(shows(&strings, "Identity: Verified"), "{strings:?}");
+    // One identity status on the page; launch is still decided separately.
+    assert!(!shows(&strings, "Identity: Needs review"), "{strings:?}");
+    assert!(
+        shows(&strings, "Checking whether this game is ready"),
+        "{strings:?}"
+    );
     // Review Identity: verified, nothing to confirm
     app.router.current = Route::ReviewIdentity(vid);
     let strings = text(&frame(&context, &mut app, [1280.0, 900.0]));
