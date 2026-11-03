@@ -1335,6 +1335,7 @@ mod tests {
                 replacement_approved: true,
                 verification_succeeded: !failure,
                 outcome,
+                publication: Default::default(),
                 stages: Vec::new(),
                 warnings: Vec::new(),
                 failures: if failure {
