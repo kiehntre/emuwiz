@@ -2865,6 +2865,8 @@ impl App {
                                     ui.add_space(theme::SPACE_LG);
                                     ui.vertical(|ui| {
                                         self.detail_heading(ui, &library, game);
+                                        self.collection_message(ui);
+                                        self.game_collection_actions(ui, game.archive.id, &game.title);
                                         ui.add_space(theme::SPACE_SM);
                                         self.detail_facts(ui, game);
                                         ui.add_space(theme::SPACE_MD);
@@ -2872,6 +2874,7 @@ impl App {
                                     });
                                 });
                             });
+                            self.collection_dialogs(ui.ctx());
                             self.detail_body(ui, game, &key);
                         },
                     );
@@ -2916,6 +2919,9 @@ impl App {
                 ui.add_space(theme::SPACE_LG);
                 ui.vertical(|ui| {
                     self.detail_heading(ui, &library, game);
+                    self.collection_message(ui);
+                    self.game_collection_actions(ui, game.archive.id, &game.title);
+                    self.collection_dialogs(ui.ctx());
                     ui.add_space(theme::SPACE_SM);
                     self.detail_readiness(ui, game);
                     let notes = latest_verification.as_deref();
@@ -4256,7 +4262,7 @@ pub(super) fn romm_preview_button_label(games: usize) -> String {
 /// name that says more than the title; otherwise names the *source* the copy
 /// lives in (the last two folders of its scan root), which is what actually
 /// differs between duplicates of one file. Never a full path.
-fn disambiguating_hint(
+pub(super) fn disambiguating_hint(
     title: &str,
     relative_path: &std::path::Path,
     absolute_path: &std::path::Path,

@@ -10,7 +10,10 @@ use std::sync::OnceLock;
 
 // Schema 26 reviewed: nullable source-level DAT inventory digest only; no
 // archive dependencies or Undo deletion policy changes.
-const REVIEWED_SCHEMA: i64 = 26;
+// Schema 27 reviewed: game_collection_items names archive ids with no foreign
+// key. A game kept in Favourites or a collection is a person's choice, so it
+// joins the protected dependencies below and Undo refuses that record.
+const REVIEWED_SCHEMA: i64 = 27;
 const MAX_RECEIPT_BYTES: usize = 16 * 1024 * 1024;
 const MAX_BATCH: usize = crate::ingestion::saved_discovery::MAX_SELECTED;
 
@@ -548,6 +551,18 @@ impl Database {
                 if count != 0 {
                     blockers.push(format!("{label}: {count} dependent {table} rows are protected; none will be deleted."));
                 }
+            }
+            let collections: i64 = self
+                .connection
+                .query_row(
+                    "SELECT count(*) FROM game_collection_items i JOIN archives a \
+                     ON a.id=i.archive_id AND a.created_at=i.archive_created_at WHERE a.id=?1",
+                    [item.archive_id],
+                    |r| r.get(0),
+                )
+                .map_err(string_error)?;
+            if collections != 0 {
+                blockers.push(format!("{label}: this game is in Favourites or a collection. Remove it there first; none will be deleted."));
             }
         }
         Ok(blockers)

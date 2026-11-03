@@ -399,6 +399,28 @@ impl Library {
     pub(super) fn has_title_twin(&self, id: i64) -> bool {
         self.title_twins.contains(&id)
     }
+    /// [`Self::filter`] over `members` only, in title order: walks the members,
+    /// not the library.
+    pub(super) fn filter_members(
+        &self,
+        filter: &Filter,
+        members: &std::collections::HashSet<i64>,
+    ) -> Vec<usize> {
+        let needle = filter.search.trim().to_lowercase();
+        let mut indices: Vec<usize> = members
+            .iter()
+            .filter_map(|id| self.by_id.get(id).copied())
+            .filter(|index| {
+                let game = &self.games[*index];
+                (filter.platform.is_empty() || game.platform == filter.platform)
+                    && filter.admits_before_check(game)
+                    && (!filter.unverified_only || !game.identified)
+                    && (needle.is_empty() || game.search.contains(&needle))
+            })
+            .collect();
+        indices.sort_unstable();
+        indices
+    }
     pub fn filter(&self, filter: &Filter) -> Vec<usize> {
         let needle = filter.search.trim().to_lowercase();
         let matches = |game: &Game| {
