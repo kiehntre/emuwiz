@@ -372,7 +372,7 @@ fn opportunity_for(
                     "CUE topology could not be verified.".to_string()
                 }),
             };
-            if refusal.is_some() && layout.is_ok() { warnings.push(StorageWarning { code: "CHD_CONVERSION_UNSUPPORTED".into(), message: "This disc layout is outside the verified CUE/BIN to CHD conversion; it is listed but not offered.".into() }); }
+            if refusal.is_some() && layout.is_ok() { warnings.push(StorageWarning { code: "CHD_CONVERSION_UNSUPPORTED".into(), message: "This disc is outside the verified CUE/BIN to CHD conversion; it is listed but not offered.".into() }); }
             let admitted = refusal.is_none();
             (
                 StorageOpportunity {
@@ -399,7 +399,7 @@ fn opportunity_for(
                     target_format: None,
                     round_trip: StorageRoundTripClass::NotEstablished,
                     confidence: if valid && platform_is(platform, &["dreamcast"]) { StorageConfidence::Medium } else { StorageConfidence::Low },
-                    estimate: if valid { unknown_estimate("EmuWiz has no verified GDI to CHD converter, so no conversion is offered. Its only verified CHD conversion is a single-track CUE/BIN.") } else { unknown_estimate("GDI topology is incomplete or invalid.") },
+                    estimate: if valid { unknown_estimate("EmuWiz has no verified GDI to CHD converter, so no conversion is offered. Its only verified CHD conversion is a single-track MODE1/2048 CUE/BIN.") } else { unknown_estimate("GDI topology is incomplete or invalid.") },
                     verification_required: true,
                     topology_sensitive: true,
                     cleanup_eligibility: "NOT_ELIGIBLE".into(),

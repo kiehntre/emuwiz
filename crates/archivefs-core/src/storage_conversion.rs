@@ -32,6 +32,38 @@ pub struct ConversionToolRecord {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Default)]
 pub struct ConversionToolInventory {
     pub tools: Vec<ConversionToolRecord>,
+    /// The chdman the verified CUE/BIN converter itself would run. CHD
+    /// eligibility follows this, never the PATH lookup in `tools`.
+    #[serde(default)]
+    pub reviewed_chdman: ChdmanBinding,
+}
+
+/// The converter's reviewed chdman binding, judged by the converter's own check.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Default)]
+#[serde(tag = "state", content = "detail", rename_all = "SCREAMING_SNAKE_CASE")]
+pub enum ChdmanBinding {
+    /// The converter would run this file.
+    Usable(PathBuf),
+    /// Nothing is installed at the reviewed path.
+    #[default]
+    Absent,
+    /// Something is there, but the converter refuses it (for example a symlink
+    /// or a file without execute permission).
+    Unusable(String),
+}
+
+/// Judge `path` exactly as the converter judges its chdman binding. Reads
+/// metadata only; nothing is executed.
+pub fn chdman_binding_at(path: &Path) -> ChdmanBinding {
+    // Mirrors the converter's own lookup: a missing (or dangling) reviewed
+    // path means no binding, anything else must pass its executable check.
+    if !path.exists() {
+        return ChdmanBinding::Absent;
+    }
+    match crate::repair::optical_conversion::check_chdman_binding(path) {
+        Ok(path) => ChdmanBinding::Usable(path),
+        Err(error) => ChdmanBinding::Unusable(error.to_string()),
+    }
 }
 
 fn which(name: &str) -> Option<PathBuf> {
@@ -89,6 +121,9 @@ fn probe(name: &str, args: &[&str], capabilities: &[&str]) -> ConversionToolReco
 
 pub fn probe_conversion_tools() -> ConversionToolInventory {
     ConversionToolInventory {
+        reviewed_chdman: chdman_binding_at(Path::new(
+            crate::repair::optical_conversion::REVIEWED_CHDMAN_PATH,
+        )),
         tools: vec![
             probe(
                 "chdman",
@@ -188,24 +223,53 @@ pub fn capability_for_item(
     let Some(record) = tool(inventory, name) else {
         unreachable!()
     };
-    let reviewed_chdman = Path::new(crate::repair::optical_conversion::REVIEWED_CHDMAN_PATH);
+    let topology_unproven = item.opportunity.topology_sensitive
+        && item.opportunity.round_trip == StorageRoundTripClass::NotEstablished;
     let mut eligibility_detail = None;
-    let eligibility = if record.status == ToolCapabilityStatus::Missing {
+    let mut tool_path = record.path.clone();
+    let mut tool_version = record.version.clone();
+    let eligibility = if name == "chdman" {
+        // The converter runs only its reviewed binding, so that binding, not
+        // whichever chdman PATH finds first, decides readiness.
+        let reviewed = crate::repair::optical_conversion::REVIEWED_CHDMAN_PATH;
+        let elsewhere = record
+            .path
+            .as_deref()
+            .filter(|path| *path != Path::new(reviewed))
+            .map(|path| format!(" The chdman at {} is not used.", path.display()));
+        if record.path.as_deref() != Some(Path::new(reviewed)) {
+            tool_version = None;
+        }
+        match &inventory.reviewed_chdman {
+            ChdmanBinding::Absent => {
+                tool_path = None;
+                eligibility_detail = Some(format!(
+                    "The converter runs chdman only from {reviewed}, and nothing is installed there.{}",
+                    elsewhere.unwrap_or_default()
+                ));
+                ConversionEligibility::ToolMissing
+            }
+            ChdmanBinding::Unusable(reason) => {
+                tool_path = Some(PathBuf::from(reviewed));
+                eligibility_detail = Some(format!(
+                    "The converter cannot use {reviewed}: {reason}.{}",
+                    elsewhere.unwrap_or_default()
+                ));
+                ConversionEligibility::ReviewRequired
+            }
+            ChdmanBinding::Usable(path) => {
+                tool_path = Some(path.clone());
+                if topology_unproven {
+                    ConversionEligibility::TopologyIncomplete
+                } else {
+                    ConversionEligibility::ConversionReady
+                }
+            }
+        }
+    } else if record.status == ToolCapabilityStatus::Missing {
         ConversionEligibility::ToolMissing
-    } else if item.opportunity.topology_sensitive
-        && item.opportunity.round_trip == StorageRoundTripClass::NotEstablished
-    {
+    } else if topology_unproven {
         ConversionEligibility::TopologyIncomplete
-    } else if name == "chdman" && record.path.as_deref() != Some(reviewed_chdman) {
-        eligibility_detail = Some(format!(
-            "The converter runs only {}; the chdman found at {} is not that program.",
-            reviewed_chdman.display(),
-            record
-                .path
-                .as_deref()
-                .map_or("an unknown location".into(), |p| p.display().to_string())
-        ));
-        ConversionEligibility::ReviewRequired
     } else if record.status == ToolCapabilityStatus::VersionUnknown {
         ConversionEligibility::ReviewRequired
     } else {
@@ -214,8 +278,8 @@ pub fn capability_for_item(
     StorageConversionCapability {
         eligibility,
         tool: Some(name.into()),
-        tool_path: record.path.clone(),
-        tool_version: record.version.clone(),
+        tool_path,
+        tool_version,
         target_format: Some(target.unwrap()),
         mode: Some(mode.into()),
         options,
@@ -325,6 +389,7 @@ mod tests {
                     capability_source: "synthetic".into(),
                 })
                 .collect(),
+            reviewed_chdman: ChdmanBinding::Absent,
         }
     }
 

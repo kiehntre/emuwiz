@@ -38,7 +38,7 @@ use crate::repair::proposal::{
 use crate::safe_read::TrustedRoots;
 
 /// The only chdman the converter runs when its caller names none (the GUI
-/// never does). Storage Review compares a probed PATH copy against this.
+/// never names one). Storage Review checks this binding, not a PATH lookup.
 pub const REVIEWED_CHDMAN_PATH: &str = "/usr/bin/chdman";
 
 const CHDMAN_TIMEOUT: Duration = Duration::from_secs(30);
@@ -462,14 +462,31 @@ fn resolve_chdman(explicit: Option<&Path>) -> Result<PathBuf, ChdConversionError
     ))
 }
 
-/// Read-only source admission for the verified CUE/BIN to CHD lane: exactly
-/// the source checks [`build_chd_conversion_plan`] applies, without choosing a
-/// target, resolving chdman or capturing identities. Callers that only report
-/// eligibility (Storage Review) use this, so they can never call a disc
-/// convertible that the converter itself would refuse.
+/// Read-only source admission for the verified CUE/BIN to CHD lane: the same
+/// layout and file-safety checks [`build_chd_conversion_plan`] applies to its
+/// source (shared code, not a copy), plus a cheap open of both files. It does
+/// not hash them, fingerprint the sectors, choose a target or resolve chdman,
+/// so planning can still refuse a source this admits (for example one that
+/// changes or cannot be read in full). Callers that only report eligibility
+/// (Storage Review) use it so they never offer a layout the converter refuses.
 pub fn check_chd_conversion_source(cue_path: &Path) -> Result<(), ChdConversionError> {
     source_preflight(cue_path)?;
-    admitted_source_layout(cue_path, ChdConversionSourceMode::KeepSource).map(|_| ())
+    let layout = admitted_source_layout(cue_path, ChdConversionSourceMode::KeepSource)?;
+    let track = layout
+        .supported_single_mode1_2048()
+        .map_err(|e| ChdConversionError::InvalidSource(e.to_string()))?;
+    for (label, path) in [("CUE", cue_path), ("BIN", track.path.as_path())] {
+        fs::File::open(path)
+            .map_err(|e| ChdConversionError::InvalidSource(format!("{label}: {e}")))?;
+    }
+    Ok(())
+}
+
+/// Whether `path` is a chdman the converter would run: the same check it
+/// applies to an explicit binding (a regular, non-symlink, executable file).
+/// It only inspects metadata; nothing is executed.
+pub fn check_chdman_binding(path: &Path) -> Result<PathBuf, ChdConversionError> {
+    resolve_chdman(Some(path))
 }
 
 fn source_preflight(cue_path: &Path) -> Result<(), ChdConversionError> {

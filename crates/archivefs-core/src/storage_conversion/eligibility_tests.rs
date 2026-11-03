@@ -14,13 +14,15 @@ use crate::storage_health::{StorageHealthInput, analyze_storage_health};
 use std::fs;
 use std::path::Path;
 
-fn chdman_at(path: Option<&str>) -> ConversionToolInventory {
+/// A synthetic inventory: `on_path` is what the PATH lookup found; `binding`
+/// is the converter's own judgement of its reviewed chdman.
+fn inventory(on_path: Option<&str>, binding: ChdmanBinding) -> ConversionToolInventory {
     ConversionToolInventory {
         tools: vec![ConversionToolRecord {
             name: "chdman".into(),
-            path: path.map(PathBuf::from),
-            version: path.map(|_| "chdman 0.264".into()),
-            status: if path.is_some() {
+            path: on_path.map(PathBuf::from),
+            version: on_path.map(|_| "chdman 0.264".into()),
+            status: if on_path.is_some() {
                 ToolCapabilityStatus::Found
             } else {
                 ToolCapabilityStatus::Missing
@@ -28,11 +30,28 @@ fn chdman_at(path: Option<&str>) -> ConversionToolInventory {
             capabilities: vec!["createcd".into(), "createdvd".into()],
             capability_source: "synthetic".into(),
         }],
+        reviewed_chdman: binding,
     }
+}
+
+fn chdman_at(path: Option<&str>) -> ConversionToolInventory {
+    let binding = match path {
+        Some(path) => ChdmanBinding::Usable(PathBuf::from(path)),
+        None => ChdmanBinding::Absent,
+    };
+    inventory(path, binding)
 }
 
 fn reviewed_chdman() -> ConversionToolInventory {
     chdman_at(Some("/usr/bin/chdman"))
+}
+
+fn admitted_cue(dir: &Path) -> PathBuf {
+    cue_set(
+        dir,
+        "FILE \"disc.bin\" BINARY\nTRACK 01 MODE1/2048\nINDEX 01 00:00:00\n",
+        &[("disc.bin", 2048 * 4)],
+    )
 }
 
 fn analyse(path: &Path, platform: &str) -> StorageHealthItem {
@@ -82,12 +101,7 @@ fn assert_not_ready(item: &StorageHealthItem, inventory: &ConversionToolInventor
 #[test]
 fn the_admitted_single_track_mode1_2048_cue_stays_conversion_ready() {
     let dir = tempfile::tempdir().unwrap();
-    let cue = cue_set(
-        dir.path(),
-        "FILE \"disc.bin\" BINARY\nTRACK 01 MODE1/2048\nINDEX 01 00:00:00\n",
-        &[("disc.bin", 2048 * 4)],
-    );
-    let item = analyse(&cue, "PlayStation");
+    let item = analyse(&admitted_cue(dir.path()), "PlayStation");
     assert_eq!(item.opportunity.kind, StorageOpportunityKind::Compressible);
     assert_eq!(
         item.opportunity.round_trip,
@@ -241,18 +255,107 @@ fn regression_ps2_iso_without_media_classification_is_not_conversion_ready() {
 }
 
 #[test]
-fn regression_chdman_outside_the_converters_reviewed_binding_needs_review() {
-    // The converter runs only /usr/bin/chdman; a PATH copy elsewhere is not it.
+fn readiness_follows_the_converters_binding_not_the_path_lookup() {
     let dir = tempfile::tempdir().unwrap();
-    let cue = cue_set(
-        dir.path(),
-        "FILE \"disc.bin\" BINARY\nTRACK 01 MODE1/2048\nINDEX 01 00:00:00\n",
-        &[("disc.bin", 2048 * 4)],
+    let item = analyse(&admitted_cue(dir.path()), "PlayStation");
+
+    // A different chdman earlier on PATH does not matter: the converter runs
+    // its reviewed binding, and that one is usable.
+    let earlier_on_path = inventory(
+        Some("/usr/local/bin/chdman"),
+        ChdmanBinding::Usable(PathBuf::from("/usr/bin/chdman")),
     );
-    let item = analyse(&cue, "PlayStation");
-    let capability = capability_for_item(&item, &chdman_at(Some("/opt/tools/bin/chdman")));
+    let capability = capability_for_item(&item, &earlier_on_path);
+    assert_eq!(
+        capability.eligibility,
+        ConversionEligibility::ConversionReady
+    );
+    assert_eq!(
+        capability.tool_path.as_deref(),
+        Some(Path::new("/usr/bin/chdman"))
+    );
+    assert_eq!(
+        capability.tool_version, None,
+        "that version was of another copy"
+    );
+}
+
+#[test]
+fn regression_chdman_only_outside_the_reviewed_binding_is_a_missing_tool() {
+    let dir = tempfile::tempdir().unwrap();
+    let item = analyse(&admitted_cue(dir.path()), "PlayStation");
+    let capability = capability_for_item(
+        &item,
+        &inventory(Some("/opt/tools/bin/chdman"), ChdmanBinding::Absent),
+    );
+    assert_eq!(capability.eligibility, ConversionEligibility::ToolMissing);
+    let detail = capability
+        .eligibility_detail
+        .expect("say which chdman is needed");
+    assert!(detail.contains("/usr/bin/chdman"), "{detail}");
+    assert!(
+        detail.contains("/opt/tools/bin/chdman is not used"),
+        "{detail}"
+    );
+}
+
+#[test]
+fn regression_an_unusable_reviewed_chdman_is_not_conversion_ready() {
+    // The PATH lookup accepts a symlink or a non-executable file; the
+    // converter does not.
+    let dir = tempfile::tempdir().unwrap();
+    let item = analyse(&admitted_cue(dir.path()), "PlayStation");
+    let capability = capability_for_item(
+        &item,
+        &inventory(
+            Some("/usr/bin/chdman"),
+            ChdmanBinding::Unusable("must be a regular non-symlink file".into()),
+        ),
+    );
     assert_eq!(
         capability.eligibility,
         ConversionEligibility::ReviewRequired
+    );
+    assert!(
+        capability
+            .eligibility_detail
+            .is_some_and(|d| d.contains("cannot use /usr/bin/chdman"))
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn the_binding_check_is_the_converters_executable_check() {
+    use std::os::unix::fs::PermissionsExt;
+    let dir = tempfile::tempdir().unwrap();
+    let program = dir.path().join("chdman");
+    fs::write(&program, b"not run by this test").unwrap();
+    fs::set_permissions(&program, fs::Permissions::from_mode(0o755)).unwrap();
+    assert_eq!(
+        chdman_binding_at(&program),
+        ChdmanBinding::Usable(program.clone())
+    );
+
+    let not_executable = dir.path().join("chdman-noexec");
+    fs::write(&not_executable, b"").unwrap();
+    fs::set_permissions(&not_executable, fs::Permissions::from_mode(0o644)).unwrap();
+    assert!(matches!(
+        chdman_binding_at(&not_executable),
+        ChdmanBinding::Unusable(_)
+    ));
+
+    let link = dir.path().join("chdman-link");
+    std::os::unix::fs::symlink(&program, &link).unwrap();
+    assert!(matches!(
+        chdman_binding_at(&link),
+        ChdmanBinding::Unusable(_)
+    ));
+
+    let dangling = dir.path().join("chdman-dangling");
+    std::os::unix::fs::symlink(dir.path().join("gone"), &dangling).unwrap();
+    assert_eq!(chdman_binding_at(&dangling), ChdmanBinding::Absent);
+    assert_eq!(
+        chdman_binding_at(&dir.path().join("missing")),
+        ChdmanBinding::Absent
     );
 }

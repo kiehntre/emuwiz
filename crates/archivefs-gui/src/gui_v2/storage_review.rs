@@ -159,7 +159,7 @@ pub(super) fn project(
         )];
         why.push(format!("Round trip: {}", capability.round_trip));
         if let Some(detail) = &capability.eligibility_detail {
-            why.push(format!("Not offered: {detail}"));
+            why.push(format!("Tool note: {detail}"));
         }
         if !capability.verification_required.is_empty() {
             why.push(format!("Checked by: {}", capability.verification_required));
@@ -517,7 +517,7 @@ fn file_name(path: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use archivefs_core::storage_conversion::ConversionToolRecord;
+    use archivefs_core::storage_conversion::{ChdmanBinding, ConversionToolRecord};
     use std::fs;
     use std::path::PathBuf;
 
@@ -535,6 +535,11 @@ mod tests {
                 capabilities: vec!["createcd".into()],
                 capability_source: "test".into(),
             }],
+            reviewed_chdman: if chdman_found {
+                ChdmanBinding::Usable(PathBuf::from("/usr/bin/chdman"))
+            } else {
+                ChdmanBinding::Absent
+            },
         }
     }
 
@@ -794,15 +799,42 @@ mod tests {
             {
                 assert!(item.savings.is_none());
                 assert!(
-                    item.why
-                        .iter()
-                        .any(|l| l.starts_with("Savings:") && l.len() > 30),
+                    item.why.iter().any(|l| l.starts_with("Savings:")
+                        && (l.contains("verified CUE/BIN to CHD converter does not accept")
+                            || l.contains("has no verified GDI to CHD converter")
+                            || l.contains("has no verified ISO to CHD converter"))),
                     "{}: {:?}",
                     item.path,
                     item.why
                 );
             }
         }
+    }
+
+    /// The converter cannot use its reviewed chdman (for example a symlink),
+    /// so an admitted disc is not "Can shrink safely" and the reason is shown.
+    #[test]
+    fn regression_an_unusable_reviewed_chdman_is_explained_not_offered() {
+        let (_dir, inputs) = fixture();
+        let report = analyze_storage_health(&inputs);
+        let mut inventory = tools(true);
+        inventory.reviewed_chdman =
+            ChdmanBinding::Unusable("must be a regular non-symlink file".into());
+        let review = project(&report, &inventory);
+        let cue = review
+            .items
+            .iter()
+            .find(|i| i.path.ends_with("Disc A.cue"))
+            .unwrap();
+        assert_eq!(cue.group, Group::WontRecommend);
+        assert!(
+            cue.why
+                .iter()
+                .any(|l| l.starts_with("Tool note:") && l.contains("cannot use /usr/bin/chdman")),
+            "{:?}",
+            cue.why
+        );
+        assert!(!groups(&review).contains_key(&Group::CanShrink));
     }
 
     #[test]
