@@ -100,6 +100,8 @@ class Base(M.MaintBase):
         self.approve()
         self.call("run")
         self.assertEqual(self.last_cycle()["outcome"], "RETIRED")
+        # the fixture's stray debug/UNKNOWN.txt holds the gate (UNRECOGNISED_RESIDUE) until reviewed
+        self.review_unrecognised(wt, t)
         self.assertEqual(self.m.worktree_gate(wt)["status"], "CLEAR")
         return self.last_cycle()
 

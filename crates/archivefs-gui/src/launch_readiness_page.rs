@@ -60,6 +60,9 @@ mod pcsx2_cheats;
 mod retroarch_cheat_sets;
 mod retroarch_cheats;
 mod retroarch_setup;
+mod retroarch_stop;
+#[cfg(test)]
+pub(crate) use retroarch_stop::retroarch_test_request;
 mod rmg;
 mod sameboy;
 pub(crate) mod saturn_core;
@@ -1783,9 +1786,11 @@ enum RetroArchLaunchStage {
     },
     Running {
         process: LaunchedRetroArchProcess,
+        stop: retroarch_stop::StopControl,
     },
     Exited {
         process: LaunchedRetroArchProcess,
+        stop: retroarch_stop::StopControl,
     },
     Failed {
         error: LaunchExecutionError,
@@ -1801,15 +1806,26 @@ enum RetroArchLaunchStage {
         session: Box<
             archivefs_core::launch::cheat_runtime::CheatRuntimeSession<LaunchedRetroArchProcess>,
         >,
+        stop: retroarch_stop::StopControl,
     },
     ExitedCheats {
         session: Box<
             archivefs_core::launch::cheat_runtime::CheatRuntimeSession<LaunchedRetroArchProcess>,
         >,
+        stop: retroarch_stop::StopControl,
     },
     FailedCheats {
         message: String,
     },
+}
+
+impl RetroArchLaunchStage {
+    fn running(process: LaunchedRetroArchProcess) -> Self {
+        Self::Running {
+            process,
+            stop: Default::default(),
+        }
+    }
 }
 
 /// Owned presentation snapshot for the launch currently associated with one
@@ -1826,6 +1842,8 @@ pub(crate) enum RetroArchLaunchDisplay {
         success: bool,
         status_detail: String,
         stderr_tail: Option<String>,
+        /// What the player's Stop request, if any, returned.
+        stop_outcome: Option<archivefs_core::launch::process_spawn::GracefulStopOutcome>,
     },
     Failed {
         message: &'static str,
@@ -1879,8 +1897,8 @@ impl RetroArchLaunchState {
     ) -> Option<archivefs_core::launch::cheat_runtime::CheatRuntimeReceipt> {
         match self.tracked.as_ref().map(|(_, stage)| stage) {
             Some(
-                RetroArchLaunchStage::RunningCheats { session }
-                | RetroArchLaunchStage::ExitedCheats { session },
+                RetroArchLaunchStage::RunningCheats { session, .. }
+                | RetroArchLaunchStage::ExitedCheats { session, .. },
             ) => Some(session.receipt().clone()),
             _ => None,
         }
@@ -1921,7 +1939,7 @@ impl RetroArchLaunchState {
         match stage {
             RetroArchLaunchStage::Starting { receiver } => match receiver.try_recv() {
                 Ok(Ok(process)) => {
-                    self.tracked = Some((key, RetroArchLaunchStage::Running { process }));
+                    self.tracked = Some((key, RetroArchLaunchStage::running(process)));
                     true
                 }
                 Ok(Err(error)) => {
@@ -1946,12 +1964,12 @@ impl RetroArchLaunchState {
                     true
                 }
             },
-            RetroArchLaunchStage::Running { mut process } => {
+            RetroArchLaunchStage::Running { mut process, stop } => {
                 if process.poll().is_some() {
-                    self.tracked = Some((key, RetroArchLaunchStage::Exited { process }));
+                    self.tracked = Some((key, RetroArchLaunchStage::Exited { process, stop }));
                     true
                 } else {
-                    self.tracked = Some((key, RetroArchLaunchStage::Running { process }));
+                    self.tracked = Some((key, RetroArchLaunchStage::Running { process, stop }));
                     false
                 }
             }
@@ -1959,7 +1977,7 @@ impl RetroArchLaunchState {
                 Ok(Ok(archivefs_core::launch::cheat_runtime_retroarch::RetroArchCheatLaunch::Plain(
                     process,
                 ))) => {
-                    self.tracked = Some((key, RetroArchLaunchStage::Running { process }));
+                    self.tracked = Some((key, RetroArchLaunchStage::running(process)));
                     true
                 }
                 Ok(Ok(
@@ -1968,7 +1986,13 @@ impl RetroArchLaunchState {
                         ..
                     },
                 )) => {
-                    self.tracked = Some((key, RetroArchLaunchStage::RunningCheats { session }));
+                    self.tracked = Some((
+                        key,
+                        RetroArchLaunchStage::RunningCheats {
+                            session,
+                            stop: Default::default(),
+                        },
+                    ));
                     true
                 }
                 Ok(Err(message)) => {
@@ -1989,13 +2013,15 @@ impl RetroArchLaunchState {
                     true
                 }
             },
-            RetroArchLaunchStage::RunningCheats { mut session } => {
+            RetroArchLaunchStage::RunningCheats { mut session, stop } => {
                 session.poll();
                 if session.is_finished() {
-                    self.tracked = Some((key, RetroArchLaunchStage::ExitedCheats { session }));
+                    self.tracked =
+                        Some((key, RetroArchLaunchStage::ExitedCheats { session, stop }));
                     true
                 } else {
-                    self.tracked = Some((key, RetroArchLaunchStage::RunningCheats { session }));
+                    self.tracked =
+                        Some((key, RetroArchLaunchStage::RunningCheats { session, stop }));
                     false
                 }
             }
@@ -2141,7 +2167,7 @@ impl RetroArchLaunchState {
                     retroarch_cheats::activation_label(),
                 ]
             }
-            Some((key, RetroArchLaunchStage::ExitedCheats { session })) if *key == this_key => {
+            Some((key, RetroArchLaunchStage::ExitedCheats { session, .. })) if *key == this_key => {
                 retroarch_cheats::session_summary(session)
             }
             _ => Vec::new(),
@@ -2156,10 +2182,10 @@ impl RetroArchLaunchState {
         match self.tracked.as_mut() {
             Some((key, stage)) if *key == this_key => match stage {
                 RetroArchLaunchStage::Starting { .. } => RetroArchLaunchDisplay::Starting,
-                RetroArchLaunchStage::Running { process } => {
+                RetroArchLaunchStage::Running { process, .. } => {
                     RetroArchLaunchDisplay::Running { pid: process.pid }
                 }
-                RetroArchLaunchStage::Exited { process } => {
+                RetroArchLaunchStage::Exited { process, stop } => {
                     let report: &LaunchExitReport = process
                         .poll()
                         .expect("Exited stage always has a cached exit report");
@@ -2174,6 +2200,7 @@ impl RetroArchLaunchState {
                         success,
                         status_detail,
                         stderr_tail,
+                        stop_outcome: stop.outcome(),
                     }
                 }
                 RetroArchLaunchStage::Failed { error } => {
@@ -2181,12 +2208,12 @@ impl RetroArchLaunchState {
                     RetroArchLaunchDisplay::Failed { message, detail }
                 }
                 RetroArchLaunchStage::StartingCheats { .. } => RetroArchLaunchDisplay::Starting,
-                RetroArchLaunchStage::RunningCheats { session } => {
+                RetroArchLaunchStage::RunningCheats { session, .. } => {
                     RetroArchLaunchDisplay::Running {
                         pid: session.process().map_or(0, |p| p.pid),
                     }
                 }
-                RetroArchLaunchStage::ExitedCheats { session } => {
+                RetroArchLaunchStage::ExitedCheats { session, stop } => {
                     // `poll` on an exited process returns its cached report, so
                     // calling it every frame is cheap and idempotent.
                     let exit = session
@@ -2196,7 +2223,11 @@ impl RetroArchLaunchState {
                         .and_then(|p| p.exit.clone());
                     let success = exit.as_ref().is_some_and(|e| e.success);
                     let status_detail = match &exit {
-                        Some(exit) => format!("exit code {:?}", exit.code),
+                        Some(archivefs_core::launch::cheat_runtime::ExitSummary {
+                            code: Some(code),
+                            ..
+                        }) => format!("exit code {code}"),
+                        Some(_) => "ended without an exit code".to_string(),
                         None => "status unknown".to_string(),
                     };
                     let stderr_tail = (!success)
@@ -2212,6 +2243,7 @@ impl RetroArchLaunchState {
                         success,
                         status_detail,
                         stderr_tail,
+                        stop_outcome: stop.outcome(),
                     }
                 }
                 RetroArchLaunchStage::FailedCheats { message } => RetroArchLaunchDisplay::Failed {
@@ -3309,6 +3341,7 @@ pub(crate) fn show_launch_readiness_panel(
     standalone_launch_state.vice_trainers.reconcile(input);
     if ui.is_enabled() {
         standalone_launch_state.show_cemu_lifecycle(ui);
+        retroarch_launch_state.show_stop_control(ui);
     }
     widgets::section_header(
         ui,
@@ -5650,8 +5683,22 @@ pub(crate) fn show_retroarch_launch_feedback(ui: &mut egui::Ui, display: &RetroA
             success,
             status_detail,
             stderr_tail,
+            stop_outcome,
         } => {
-            if *success {
+            if let Some(summary) = retroarch_stop::requested_exit(*stop_outcome, *success) {
+                widgets::banner(ui, "RetroArch stopped", summary.0, summary.1);
+                if !*success {
+                    ui.small(format!("Exit status: {status_detail}"));
+                    if let Some(stderr_tail) = stderr_tail {
+                        widgets::technical_details(ui, "retroarch-stopped-stderr", |ui| {
+                            ui.add(
+                                egui::Label::new(egui::RichText::new(stderr_tail).monospace())
+                                    .wrap(),
+                            );
+                        });
+                    }
+                }
+            } else if *success {
                 widgets::banner(
                     ui,
                     "RetroArch exited",
