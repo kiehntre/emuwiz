@@ -59,13 +59,76 @@ fn redump_style_names_are_recognised() {
         recognise_catalogue(Some("Sony - PlayStation"), Some(DatEcosystem::Redump)),
         games("PSX")
     );
+}
+
+fn needs_review(recognition: &CatalogueRecognition, platform: &str) -> String {
+    match recognition {
+        NeedsReview { platform: p, why } if *p == platform => why.clone(),
+        other => panic!("expected {platform} to need review, got {other:?}"),
+    }
+}
+
+#[test]
+fn non_redump_discs_are_recognised_but_always_need_a_person_to_review_them() {
+    for (name, platform) in [
+        ("Non-Redump - Sega - Dreamcast", "Dreamcast"),
+        (
+            "Non-Redump - NEC - PC Engine CD + TurboGrafx CD",
+            "PC Engine CD",
+        ),
+        ("Non-Redump - NEC - PC-88 series", "NEC PC-8801"),
+    ] {
+        let recognition = no_intro(name);
+        assert_eq!(
+            needs_review(&recognition, platform),
+            "collected outside Redump",
+            "{name}"
+        );
+        // Never an ordinary game list, so never a safe match, but still the
+        // system's catalogue for a person who chooses it.
+        assert_eq!(recognition.safe_platform(), None, "{name}");
+        assert!(recognition.is_for(platform), "{name}");
+    }
     assert_eq!(
-        no_intro("Non-Redump - Sega - Dreamcast"),
-        games("Dreamcast")
+        no_intro("Non-Redump - Sega - Dreamcast").describe(),
+        "Sega Dreamcast discs collected outside Redump"
+    );
+    // Extras stay visible in the reason.
+    assert!(
+        needs_review(
+            &no_intro("Non-Redump - Sega - Dreamcast (Demos)"),
+            "Dreamcast"
+        )
+        .contains("Demos"),
+    );
+    assert!(
+        needs_review(
+            &no_intro("Non-Redump - Sega - Dreamcast - Prototypes"),
+            "Dreamcast"
+        )
+        .starts_with("collected outside Redump ("),
+    );
+}
+
+#[test]
+fn non_redump_catalogues_that_are_not_games_or_unknown_are_still_refused() {
+    for name in [
+        "Non-Redump - Audio CD",
+        "Non-Redump - DVD-Video",
+        "Non-Redump - BD-Video",
+    ] {
+        assert!(matches!(no_intro(name), NotGames { .. }), "{name}");
+    }
+    assert!(
+        matches!(
+            no_intro("Non-Redump - Acme - Hypothetical Console"),
+            NotRecognised { .. }
+        ),
+        "an unknown system is never treated as a game list"
     );
     assert_eq!(
-        no_intro("Non-Redump - NEC - PC Engine CD + TurboGrafx CD"),
-        games("PC Engine CD")
+        no_intro("Non-Redump - Acme - Hypothetical Console").platform(),
+        None
     );
 }
 
@@ -75,10 +138,6 @@ fn reviewed_names_the_alias_registry_does_not_spell() {
     assert_eq!(no_intro("Apple - IIGS (A2R)"), games("Apple II"));
     assert_eq!(no_intro("Atari - 8-bit Family"), games("Atari 8-bit"));
     assert_eq!(no_intro("Sinclair - ZX Spectrum +3"), games("ZX Spectrum"));
-    assert_eq!(
-        no_intro("Non-Redump - NEC - PC-88 series"),
-        games("NEC PC-8801")
-    );
 }
 
 #[test]

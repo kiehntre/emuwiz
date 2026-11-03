@@ -1153,3 +1153,113 @@ fn an_unrecorded_system_needs_a_check_once_its_catalogue_changes() {
         RecognitionGroup::AlreadySet
     );
 }
+
+mod non_redump {
+    use super::*;
+
+    const DREAMCAST: &str = "Non-Redump - Sega - Dreamcast";
+
+    fn setup() -> Setup {
+        Setup::new(&[
+            ("nr", "nr.dat", DREAMCAST),
+            ("gb", "gb.dat", "Nintendo - Game Boy"),
+            ("audio", "audio.dat", "Non-Redump - Audio CD"),
+        ])
+    }
+
+    #[test]
+    fn is_never_a_safe_match_and_shows_what_it_is() {
+        let setup = setup();
+        let registry = setup.registry();
+        let safe: Vec<_> = safe_matches(&registry)
+            .into_iter()
+            .map(|item| item.source_id)
+            .collect();
+        assert_eq!(safe, ["gb"]);
+        let row = recognition_rows(&registry)
+            .into_iter()
+            .find(|row| row.source_id == "nr")
+            .unwrap();
+        assert_eq!(row.group, RecognitionGroup::NeedsReview);
+        // The person can see exactly which catalogue it is.
+        assert_eq!(row.header_name.as_deref(), Some(DREAMCAST));
+        assert_eq!(row.path, setup.path("nr.dat"));
+        assert_eq!(row.origin, PlatformProvenance::NotSet);
+        assert_eq!(group_of(&registry, "audio"), RecognitionGroup::CannotUse);
+    }
+
+    #[test]
+    fn apply_all_never_sets_it() {
+        let setup = setup();
+        let preview = safe_matches(&setup.registry());
+        apply_safe_matches(
+            &setup.config,
+            &setup.revision(),
+            &setup.registry(),
+            &preview,
+        )
+        .unwrap();
+        let registry = setup.registry();
+        assert_eq!(registry.get("nr").unwrap().platform, None);
+        assert_eq!(group_of(&registry, "nr"), RecognitionGroup::NeedsReview);
+
+        // A forged preview entry for it is refused and writes nothing.
+        let header = registry.get("nr").unwrap().health.current_header().unwrap();
+        let forged = SafeMatch {
+            source_id: "nr".into(),
+            display_name: "nr.dat".into(),
+            platform: "Dreamcast",
+            header_name: header.name.clone().unwrap(),
+            observed: header.observed.clone(),
+        };
+        let before = std::fs::read(&setup.config).unwrap();
+        assert!(matches!(
+            apply_safe_matches(&setup.config, &setup.revision(), &registry, &[forged]),
+            Err(ApplyRefusal::Stale { .. })
+        ));
+        assert_eq!(std::fs::read(&setup.config).unwrap(), before);
+    }
+
+    #[test]
+    fn a_person_may_choose_it_and_it_stays_their_choice() {
+        let setup = setup();
+        setup.edit(|registry| {
+            registry
+                .get_mut("nr")
+                .unwrap()
+                .set_platform_by_person(Some("Dreamcast".into()));
+        });
+        let registry = setup.registry();
+        let row = recognition_rows(&registry)
+            .into_iter()
+            .find(|row| row.source_id == "nr")
+            .unwrap();
+        assert_eq!(row.group, RecognitionGroup::AlreadySet);
+        assert_eq!(row.origin, PlatformProvenance::ChosenByPerson);
+        assert!(!row.assigned_by_recognition);
+        // The choice is not an Undo-able apply.
+        assert_eq!(last_undoable_apply(&registry), None);
+    }
+
+    #[test]
+    fn a_system_nobody_chose_is_not_backed_by_it() {
+        // Applied automatically to an ordinary list later replaced by
+        // Non-Redump discs for the same system.
+        let setup = applied_then_replaced("Non-Redump - Nintendo - Game Boy");
+        assert_eq!(
+            group_of(&setup.registry(), "gb"),
+            RecognitionGroup::Conflict
+        );
+        // Saved with no record of who set it.
+        let setup = Setup::new(&[("nr", "nr.dat", DREAMCAST)]);
+        setup.edit(|registry| {
+            registry.get_mut("nr").unwrap().platform = Some("Dreamcast".into());
+        });
+        let registry = setup.registry();
+        assert_eq!(
+            registry.get("nr").unwrap().platform_provenance(),
+            PlatformProvenance::Unrecorded
+        );
+        assert_eq!(group_of(&registry, "nr"), RecognitionGroup::Conflict);
+    }
+}

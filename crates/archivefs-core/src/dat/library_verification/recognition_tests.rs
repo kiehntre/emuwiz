@@ -227,3 +227,31 @@ fn a_system_with_no_record_of_who_set_it_is_treated_strictly() {
         );
     }
 }
+
+#[test]
+fn non_redump_discs_are_accepted_only_for_the_system_the_person_chose() {
+    let header = "Non-Redump - Sega - Dreamcast";
+    // Nobody chose it: refused.
+    assert!(refused_for_platform(preview_for(header, None, "Dreamcast")));
+    // Set automatically, or with no record of who set it: refused.
+    assert!(preview_with(header, Some("Dreamcast"), true, "Dreamcast").is_err());
+    assert!(preview_full(header, Some("Dreamcast"), false, true, "Dreamcast").is_err());
+    // The person's own choice, for the system the header names: accepted.
+    assert!(!refused_for_platform(preview_for(
+        header,
+        Some("Dreamcast"),
+        "Dreamcast"
+    )));
+    // A system the header does not name is refused even if chosen.
+    assert!(refused_for_platform(preview_for(
+        header,
+        Some("PSX"),
+        "PSX"
+    )));
+    // Non-game Non-Redump discs are refused even if chosen.
+    assert!(refused_for_platform(preview_for(
+        "Non-Redump - Audio CD",
+        Some("Dreamcast"),
+        "Dreamcast"
+    )));
+}

@@ -39,6 +39,10 @@ pub(super) fn row_text(row: &RecognitionRow) -> String {
     let Some(assigned) = &row.assigned else {
         return match row.group {
             RecognitionGroup::TurnedOff => format!("Turned off. {header}"),
+            RecognitionGroup::NeedsReview => format!(
+                "{header}. Never set automatically: review it, and choose its system yourself only \
+                 if you trust it"
+            ),
             _ => header,
         };
     };
@@ -80,6 +84,41 @@ pub(super) fn row_text(row: &RecognitionRow) -> String {
     }
 }
 
+/// The system a person may choose for this catalogue individually: extras,
+/// or Non-Redump discs once its identity has been shown.
+pub(super) fn individual_choice(row: &RecognitionRow) -> Option<&'static str> {
+    match (&row.group, &row.state) {
+        (
+            RecognitionGroup::Extras,
+            RecognitionState::Recognised(CatalogueRecognition::Extras { platform, .. }),
+        )
+        | (
+            RecognitionGroup::NeedsReview,
+            RecognitionState::Recognised(CatalogueRecognition::NeedsReview { platform, .. }),
+        ) => Some(platform),
+        _ => None,
+    }
+}
+
+/// Exactly which catalogue a person is reviewing: its own header name and
+/// the file it was read from.
+pub(super) fn identity_text(row: &RecognitionRow) -> String {
+    format!(
+        "The catalogue calls itself \u{201c}{}\u{201d}. File: {}",
+        row.header_name.as_deref().unwrap_or("(no name)"),
+        row.path.display()
+    )
+}
+
+pub(super) fn review_hover(platform: &str) -> String {
+    format!(
+        "Sets {} as your own choice for this catalogue. Its discs weren\u{2019}t collected by \
+         Redump, so only choose it if you trust where it came from. A game still needs an exact \
+         match against it to be Verified.",
+        display_name_for(platform)
+    )
+}
+
 /// The summary card. Returns the action a button asked for.
 pub(super) fn card(
     ui: &mut egui::Ui,
@@ -112,6 +151,11 @@ pub(super) fn card(
                 count(rows, RecognitionGroup::Extras),
                 "catalogue has extras for a system (only used if you choose it)",
                 "catalogues have extras for a system (only used if you choose them)",
+            ),
+            (
+                count(rows, RecognitionGroup::NeedsReview),
+                "catalogue of discs collected outside Redump needs your review (never set automatically)",
+                "catalogues of discs collected outside Redump need your review (never set automatically)",
             ),
             (
                 count(rows, RecognitionGroup::Ambiguous),
@@ -245,21 +289,23 @@ pub(super) fn card(
             for row in rows {
                 ui.horizontal_wrapped(|ui| {
                     ui.label(format!("{}: {}", row.display_name, row_text(row)));
-                    if row.group == RecognitionGroup::Extras
-                        && let RecognitionState::Recognised(CatalogueRecognition::Extras {
-                            platform,
-                            ..
-                        }) = &row.state
-                        && ui
-                            .add_enabled(
-                                !busy,
-                                egui::Button::new(format!(
-                                    "Use for {}",
-                                    display_name_for(platform)
-                                )),
-                            )
-                            .clicked()
-                    {
+                    let Some(platform) = individual_choice(row) else {
+                        return;
+                    };
+                    let review = row.group == RecognitionGroup::NeedsReview;
+                    if review {
+                        ui.label(egui::RichText::new(identity_text(row)).color(theme::muted(ui)));
+                    }
+                    let button = ui.add_enabled(
+                        !busy,
+                        egui::Button::new(format!("Use for {}", display_name_for(platform))),
+                    );
+                    let button = if review {
+                        button.on_hover_text(review_hover(platform))
+                    } else {
+                        button
+                    };
+                    if button.clicked() {
                         action = Some(DatSourcesPageAction::AssignPlatformNow {
                             id: row.source_id.clone(),
                             platform: platform.to_string(),

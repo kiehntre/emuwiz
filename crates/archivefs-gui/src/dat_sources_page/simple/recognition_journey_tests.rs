@@ -452,19 +452,100 @@ fn the_catalogue_picker_says_who_set_each_system() {
 }
 
 #[test]
-fn applying_a_check_of_a_changed_file_marks_its_earlier_results_stale() {
+fn a_non_redump_catalogue_is_shown_for_review_and_only_set_by_a_person() {
     let dir = tempfile::tempdir().unwrap();
-    let config = setup(dir.path(), CATALOGUES);
-    let (before, _) =
-        DatSourceRegistry::from_config(&load_dat_sources_config_from(&config).unwrap());
-    let mut after = before.clone();
-    after.get_mut("src-165").unwrap().health.observed_size_bytes = Some(999_999);
-    assert_eq!(
-        super::super::sources_needing_stale_mark(
-            &before,
-            &after,
-            ["src-165", "src-170"].into_iter()
-        ),
-        vec!["src-165".to_string()]
+    let config = setup(
+        dir.path(),
+        &[
+            ("src-165", "Nintendo - Game Boy Color"),
+            ("src-300", "Non-Redump - Sega - Dreamcast"),
+        ],
     );
+    let mut state = page(dir.path());
+    let mut ui = DatSourcesPageUi::default();
+    state.apply(DatSourcesPageAction::ValidateAll);
+    finish(&mut state);
+    let view = state.view();
+    let text = render(&view, &mut ui).join("\n");
+    assert!(
+        text.contains(
+            "1 catalogue of discs collected outside Redump needs your review (never set automatically)"
+        ),
+        "{text}"
+    );
+    assert!(text.contains("Review 1 safe match"), "{text}");
+    // Excluded from Apply all safe matches.
+    assert_eq!(
+        view.recognition
+            .safe
+            .iter()
+            .map(|item| item.source_id.as_str())
+            .collect::<Vec<_>>(),
+        ["src-165"]
+    );
+    let row = view
+        .recognition
+        .rows
+        .iter()
+        .find(|row| row.source_id == "src-300")
+        .unwrap()
+        .clone();
+    assert_eq!(row.group, RecognitionGroup::NeedsReview);
+    let text = super::recognition::row_text(&row);
+    assert!(
+        text.starts_with("Sega Dreamcast discs collected outside Redump. Never set automatically"),
+        "{text}"
+    );
+    // The catalogue's own identity is shown next to the choice.
+    let identity = super::recognition::identity_text(&row);
+    assert!(
+        identity.contains("\u{201c}Non-Redump - Sega - Dreamcast\u{201d}")
+            && identity.contains("src-300.dat"),
+        "{identity}"
+    );
+    assert_eq!(
+        super::recognition::individual_choice(&row),
+        Some("Dreamcast")
+    );
+    assert!(
+        super::recognition::review_hover("Dreamcast").contains("your own choice"),
+        "the button says it is a manual choice"
+    );
+
+    // Applying every safe match leaves it alone.
+    let preview = view.recognition.safe.clone();
+    state.apply(DatSourcesPageAction::ApplyRecognisedSystems { preview });
+    assert_eq!(saved_platforms(&config)[1].1, None);
+
+    // The person's explicit choice is saved as theirs.
+    state.apply(DatSourcesPageAction::AssignPlatformNow {
+        id: "src-300".into(),
+        platform: "Dreamcast".into(),
+    });
+    assert!(state.view().platform_assignment.unwrap().is_ok());
+    let (registry, _) =
+        DatSourceRegistry::from_config(&load_dat_sources_config_from(&config).unwrap());
+    let entry = registry.get("src-300").unwrap();
+    assert_eq!(entry.platform.as_deref(), Some("Dreamcast"));
+    assert_eq!(
+        entry.platform_provenance(),
+        archivefs_core::dat::sources::PlatformProvenance::ChosenByPerson
+    );
+    let row = state
+        .view()
+        .recognition
+        .rows
+        .into_iter()
+        .find(|row| row.source_id == "src-300")
+        .unwrap();
+    assert_eq!(row.group, RecognitionGroup::AlreadySet);
+    assert!(
+        super::recognition::row_text(&row).starts_with("Used for Sega Dreamcast (your choice)."),
+        "{row:?}"
+    );
+    // Undo only reverses the automatic apply, never the person's choice.
+    state.apply(DatSourcesPageAction::UndoRecognisedSystems);
+    let saved = saved_platforms(&config);
+    assert_eq!(saved[0].1, None);
+    assert_eq!(saved[1].1.as_deref(), Some("Dreamcast"));
 }

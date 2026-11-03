@@ -160,11 +160,11 @@ fn same_file(a: &std::fs::Metadata, b: &std::fs::Metadata) -> bool {
 /// Whether the frozen catalogue is for `platform`, from its own header.
 ///
 /// An ordinary game list must name `platform`. Extras (downloadable
-/// content, e-Reader cards and so on) are only accepted when the person set
-/// that system for the catalogue themselves (`chosen`; a system applied from
-/// a recognised header is not a choice), and so is a header naming more
-/// than one system when the person chose one of them. A catalogue whose header has no
-/// name falls back to the older evidence rules; any other header (several
+/// content, e-Reader cards and so on) and Non-Redump discs are only
+/// accepted when the person set that system for the catalogue themselves
+/// (`chosen`; a system applied from a recognised header is not a choice),
+/// and so is a header naming more than one system when the person chose
+/// one of them. A catalogue whose header has no name falls back to the older evidence rules; any other header (several
 /// systems, not games, ambiguous, unsupported) is refused.
 fn catalogue_is_for(parsed: &ParsedDat, platform: &str, chosen: Option<&str>) -> bool {
     use super::catalogue_recognition::{CatalogueRecognition, recognise_catalogue, same_platform};
@@ -172,7 +172,9 @@ fn catalogue_is_for(parsed: &ParsedDat, platform: &str, chosen: Option<&str>) ->
         recognise_catalogue(parsed.source.name.as_deref(), Some(parsed.source.ecosystem));
     match &recognition {
         CatalogueRecognition::Games { .. } => recognition.is_for(platform),
-        CatalogueRecognition::Extras { .. } => {
+        // Extras and Non-Redump discs count only for a system the person
+        // chose themselves.
+        CatalogueRecognition::Extras { .. } | CatalogueRecognition::NeedsReview { .. } => {
             recognition.is_for(platform)
                 && chosen
                     .and_then(crate::canonical_platform_for_alias)

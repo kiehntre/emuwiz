@@ -43,12 +43,16 @@ pub enum RecognitionGroup {
     /// matches" would set it.
     SafeMatch,
     /// A system is set and the current header does not back it: it names
-    /// another system, is extras or several systems for a system that was
-    /// set automatically, or names no supported game list. Never changed
-    /// automatically.
+    /// another system, is extras, Non-Redump or several systems for a
+    /// system the person didn't choose, or names no supported game list.
+    /// Never changed automatically.
     Conflict,
     /// The right system, but extras. Only set if a person chooses to.
     Extras,
+    /// Discs collected outside Redump ("Non-Redump"): the system is
+    /// recognised, but only a person may set it, after reviewing the
+    /// catalogue. Never a safe match.
+    NeedsReview,
     /// The header names more than one system.
     Ambiguous,
     /// Not checked yet, or changed since it was checked.
@@ -69,6 +73,11 @@ pub enum RecognitionGroup {
 pub struct RecognitionRow {
     pub source_id: String,
     pub display_name: String,
+    /// The catalogue file or folder, as saved.
+    pub path: std::path::PathBuf,
+    /// The catalogue's own header name from its current check, so a person
+    /// can see exactly what they are choosing.
+    pub header_name: Option<String>,
     pub state: RecognitionState,
     /// The system already set for it, as a display name.
     pub assigned: Option<String>,
@@ -123,6 +132,7 @@ fn group(entry: &DatSourceEntry, state: &RecognitionState) -> RecognitionGroup {
         RecognitionState::Recognised(recognition) => match recognition {
             CatalogueRecognition::Games { .. } => RecognitionGroup::SafeMatch,
             CatalogueRecognition::Extras { .. } => RecognitionGroup::Extras,
+            CatalogueRecognition::NeedsReview { .. } => RecognitionGroup::NeedsReview,
             CatalogueRecognition::Ambiguous { .. } => RecognitionGroup::Ambiguous,
             CatalogueRecognition::SeveralSystems
             | CatalogueRecognition::NotGames { .. }
@@ -153,7 +163,8 @@ fn assigned_group(
         RecognitionState::Recognised(recognition) => {
             let backed = match recognition {
                 CatalogueRecognition::Games { platform } => names(platform),
-                CatalogueRecognition::Extras { platform, .. } => chosen && names(platform),
+                CatalogueRecognition::Extras { platform, .. }
+                | CatalogueRecognition::NeedsReview { platform, .. } => chosen && names(platform),
                 CatalogueRecognition::Ambiguous { platforms } => {
                     chosen && platforms.iter().any(|platform| names(platform))
                 }
@@ -191,6 +202,10 @@ pub fn recognition_rows(registry: &DatSourceRegistry) -> Vec<RecognitionRow> {
             RecognitionRow {
                 source_id: entry.id.clone(),
                 display_name: entry.display_name.clone(),
+                path: entry.path.clone(),
+                header_name: matches!(state, RecognitionState::Recognised(_))
+                    .then(|| entry.health.current_header()?.name.clone())
+                    .flatten(),
                 assigned: entry.platform_display(),
                 assigned_by_recognition: assigned_by_recognition(entry),
                 origin: entry.platform_provenance(),

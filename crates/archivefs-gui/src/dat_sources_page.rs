@@ -1097,21 +1097,6 @@ fn managed_dat_status_from_outcome(outcome: ManagedDatUpdateOutcome) -> ManagedD
     }
 }
 
-/// Of `ids`, the sources whose saved file or file version differs between
-/// `before` and `after`, so their earlier DAT results must be marked stale.
-fn sources_needing_stale_mark<'a>(
-    before: &DatSourceRegistry,
-    after: &DatSourceRegistry,
-    ids: impl Iterator<Item = &'a str>,
-) -> Vec<String> {
-    ids.filter(|id| match (before.get(id), after.get(id)) {
-        (Some(before), Some(after)) => source_requires_dat_identity_stale_mark(before, after),
-        _ => true,
-    })
-    .map(str::to_string)
-    .collect()
-}
-
 fn source_requires_dat_identity_stale_mark(
     before: &DatSourceEntry,
     after: &DatSourceEntry,
@@ -6296,34 +6281,26 @@ impl DatSourcesPageState {
             Ok(()) => {
                 self.saved = self.draft.clone();
                 self.save_state = DatSaveState::Saved;
-                self.mark_prior_results_stale(&stale_sources);
+                if let Some(database_path) = self.database_path.clone()
+                    && !stale_sources.is_empty()
+                {
+                    let result = archivefs_core::Database::open_or_create(database_path).and_then(
+                        |mut database| {
+                            for source_id in &stale_sources {
+                                database.mark_library_dat_identities_stale_for_source(source_id)?;
+                                database.mark_dat_set_results_stale_for_source(source_id)?;
+                            }
+                            Ok(())
+                        },
+                    );
+                    if let Err(error) = result {
+                        self.action_error = Some(format!(
+                            "DAT sources were saved, but prior audit results could not be marked stale: {error}"
+                        ));
+                    }
+                }
             }
             Err(error) => self.save_state = DatSaveState::Failed(error),
-        }
-    }
-
-    /// After a save that changed which file (or which version of it) a
-    /// source points at, marks that source's earlier DAT results stale, so
-    /// they are never read as proof against the new file.
-    fn mark_prior_results_stale(&mut self, stale_sources: &[String]) {
-        let Some(database_path) = self.database_path.clone() else {
-            return;
-        };
-        if stale_sources.is_empty() {
-            return;
-        }
-        let result =
-            archivefs_core::Database::open_or_create(database_path).and_then(|mut database| {
-                for source_id in stale_sources {
-                    database.mark_library_dat_identities_stale_for_source(source_id)?;
-                    database.mark_dat_set_results_stale_for_source(source_id)?;
-                }
-                Ok(())
-            });
-        if let Err(error) = result {
-            self.action_error = Some(format!(
-                "DAT sources were saved, but prior audit results could not be marked stale: {error}"
-            ));
         }
     }
 
@@ -6409,13 +6386,11 @@ impl DatSourcesPageState {
         )
         .map_err(|refusal| refusal.to_string())?;
         self.saved_revision = Some(applied.revision.clone());
-        // Apply saves each catalogue's newer check too; if that check is of
-        // a changed file, earlier results for it are stale, as after Save.
-        let stale_sources = sources_needing_stale_mark(
-            &self.saved,
-            &applied.registry,
-            applied.applied.iter().map(|item| item.source_id.as_str()),
-        );
+        // Apply writes catalogue settings and Undo receipts only. It never
+        // opens the library database: saved verification for a catalogue
+        // whose file changed is rejected when it is read, because the
+        // catalogue's current SHA-256 no longer matches the one saved with
+        // the evidence (see `ConfiguredCatalogue::check_saved_identity`).
         for item in &applied.applied {
             if let (Some(saved), Some(draft)) = (
                 applied.registry.get(&item.source_id),
@@ -6428,7 +6403,6 @@ impl DatSourcesPageState {
             }
         }
         self.saved = applied.registry;
-        self.mark_prior_results_stale(&stale_sources);
         let count = applied.applied.len();
         Ok(format!(
             "Set the system for {count} catalogue{}. Nothing else was changed, and no game was read or checked.",

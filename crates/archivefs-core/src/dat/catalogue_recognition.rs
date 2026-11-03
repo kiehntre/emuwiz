@@ -37,6 +37,15 @@ pub enum CatalogueRecognition {
         platform: &'static str,
         what: String,
     },
+    /// A system's discs collected outside Redump's reviewed disc database
+    /// ("Non-Redump"). It may be a genuine game list, but its contents are
+    /// not vouched for the way an ordinary list is, so it is never a safe
+    /// match: a person must review it and choose its system themselves.
+    NeedsReview {
+        platform: &'static str,
+        /// Why, in plain English (for example "collected outside Redump").
+        why: String,
+    },
     /// The header names more than one different system.
     Ambiguous { platforms: Vec<&'static str> },
     /// One catalogue for many systems (MAME, FinalBurn Neo, software lists,
@@ -62,7 +71,9 @@ impl CatalogueRecognition {
     /// The system the catalogue belongs to, ordinary list or extras.
     pub fn platform(&self) -> Option<&'static str> {
         match self {
-            Self::Games { platform } | Self::Extras { platform, .. } => Some(platform),
+            Self::Games { platform }
+            | Self::Extras { platform, .. }
+            | Self::NeedsReview { platform, .. } => Some(platform),
             _ => None,
         }
     }
@@ -80,6 +91,9 @@ impl CatalogueRecognition {
             Self::Games { platform } => format!("{} games", display_name_for(platform)),
             Self::Extras { platform, what } => {
                 format!("{} extras: {what}", display_name_for(platform))
+            }
+            Self::NeedsReview { platform, why } => {
+                format!("{} discs {why}", display_name_for(platform))
             }
             Self::Ambiguous { platforms } => format!(
                 "Could be {}",
@@ -405,11 +419,30 @@ fn strip_maker(part: &str) -> Option<&str> {
 
 /// `[Non-Redump - |Unofficial - ]Maker - System[ - Other name][ (label)...]`.
 fn recognise_no_intro_style(name: &str) -> CatalogueRecognition {
+    let Some(rest) = name.strip_prefix("Non-Redump - ") else {
+        return recognise_listed(name);
+    };
+    // Non-Redump discs are recognised by the same exact rules, but are never
+    // an ordinary game list: only a person may choose such a catalogue.
+    match recognise_listed(rest) {
+        CatalogueRecognition::Games { platform } => CatalogueRecognition::NeedsReview {
+            platform,
+            why: NON_REDUMP.to_string(),
+        },
+        CatalogueRecognition::Extras { platform, what } => CatalogueRecognition::NeedsReview {
+            platform,
+            why: format!("{NON_REDUMP} ({what})"),
+        },
+        other => other,
+    }
+}
+
+const NON_REDUMP: &str = "collected outside Redump";
+
+/// `[Unofficial - ]Maker - System[ - Other name][ (label)...]`.
+fn recognise_listed(name: &str) -> CatalogueRecognition {
     let mut extras: Vec<String> = Vec::new();
     let mut rest = name;
-    if let Some(stripped) = rest.strip_prefix("Non-Redump - ") {
-        rest = stripped;
-    }
     if let Some(stripped) = rest.strip_prefix("Unofficial - ") {
         rest = stripped;
         extras.push("unofficial dumps".to_string());

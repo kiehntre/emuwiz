@@ -772,3 +772,113 @@ fn production_config_paths_support_local_and_managed_disc_rechecks() {
         assert!(after.disc_recheck.is_empty());
     }
 }
+
+/// Every byte of the library database and its SQLite side files.
+fn database_bytes(database_path: &Path) -> Vec<(std::ffi::OsString, Vec<u8>)> {
+    let name = database_path.file_name().unwrap().to_owned();
+    let mut files: Vec<_> = std::fs::read_dir(database_path.parent().unwrap())
+        .unwrap()
+        .map(|entry| entry.unwrap())
+        .filter(|entry| {
+            entry
+                .file_name()
+                .to_string_lossy()
+                .starts_with(&*name.to_string_lossy())
+        })
+        .map(|entry| (entry.file_name(), std::fs::read(entry.path()).unwrap()))
+        .collect();
+    files.sort();
+    files
+}
+
+fn unmarked_identity_rows(database_path: &Path) -> i64 {
+    rusqlite::Connection::open(database_path)
+        .unwrap()
+        .query_row(
+            "SELECT COUNT(*) FROM library_dat_identities WHERE revision_marked_stale = 0",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap()
+}
+
+#[test]
+fn apply_all_safe_matches_changes_settings_only_and_a_changed_catalogue_never_stays_verified() {
+    let (fixture, _games, database_path) = audited();
+    // The catalogue has no system set, so it is a safe match once checked.
+    let mut config = load_dat_sources_config_from(&fixture.config_path).unwrap();
+    for source in config.sources.as_mut().unwrap() {
+        source.platform = None;
+    }
+    archivefs_core::dat::sources::save_dat_sources_config_to(&fixture.config_path, &config)
+        .unwrap();
+    {
+        let database = archivefs_core::Database::open_read_only(&database_path).unwrap();
+        let evidence = database
+            .current_library_dat_evidence(&catalogues(&fixture))
+            .unwrap();
+        assert_eq!(evidence.exact.len(), 2, "both discs start verified");
+    }
+
+    // The catalogue file is replaced by different bytes with the same name
+    // and version, then checked again.
+    let path = catalogues(&fixture).into_values().next().unwrap().path;
+    std::thread::sleep(std::time::Duration::from_millis(20));
+    std::fs::write(
+        &path,
+        dat().replace("</datafile>", "<!-- changed snapshot --></datafile>"),
+    )
+    .unwrap();
+    let mut page = fixture.page_with_library(vec![fixture.root.join("games")]);
+    page.database_path = Some(database_path.clone());
+    page.apply(DatSourcesPageAction::ValidateAll);
+    run_to_completion(&mut page);
+    let preview = page.view().recognition.safe.clone();
+    assert_eq!(preview.len(), 1, "{preview:?}");
+
+    let library_before = database_bytes(&database_path);
+    let unmarked = unmarked_identity_rows(&database_path);
+    assert!(unmarked > 0, "the saved evidence is not marked stale");
+    page.apply(DatSourcesPageAction::ApplyRecognisedSystems { preview });
+    assert!(
+        matches!(&page.view().recognition.message, Some(Ok(_))),
+        "{:?}",
+        page.view().recognition.message
+    );
+    let (registry, _) = DatSourceRegistry::from_config(
+        &load_dat_sources_config_from(&fixture.config_path).unwrap(),
+    );
+    assert_eq!(registry.entries()[0].platform.as_deref(), Some("PSX"));
+    assert!(registry.entries()[0].recognition_receipt.is_some());
+    // Apply wrote catalogue settings and the Undo receipt only: the library
+    // database, its verification rows and their stale marks are untouched.
+    assert_eq!(database_bytes(&database_path), library_before);
+    assert_eq!(unmarked_identity_rows(&database_path), unmarked);
+    assert!(page.action_error.is_none(), "{:?}", page.action_error);
+
+    // Even unmarked, evidence from the old catalogue never counts as
+    // current: neither the badge path nor the loaded library shows it.
+    let rows = catalogues(&fixture);
+    let database = archivefs_core::Database::open_read_only(&database_path).unwrap();
+    let evidence = database.current_library_dat_evidence(&rows).unwrap();
+    assert!(evidence.exact.is_empty(), "{:?}", evidence.exact);
+    assert!(
+        !evidence
+            .states
+            .values()
+            .any(|state| *state == archivefs_core::LibraryDatState::Verified)
+    );
+    drop(database);
+    let loaded = load(&fixture, &database_path);
+    for summaries in loaded.dat_identities.values() {
+        for summary in summaries {
+            assert!(
+                !(summary.is_verified()
+                    && summary.provenance_freshness
+                        == archivefs_core::dat::library_identity_summary::DatProvenanceFreshness::Current),
+                "{summary:?}"
+            );
+        }
+    }
+    assert!(loaded.disc_members.is_empty());
+}
