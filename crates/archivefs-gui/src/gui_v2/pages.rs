@@ -2885,7 +2885,7 @@ impl App {
                             ui.set_width(left);
                             super::game_detail_blue::hero_card(ui, |ui| {
                                 ui.horizontal_top(|ui| {
-                                    self.picture(ui, game, Kind::Cover, super::game_detail_blue::HERO_COVER);
+                                    self.detail_cover(ui, game, super::game_detail_blue::HERO_COVER);
                                     ui.add_space(theme::SPACE_LG);
                                     ui.vertical(|ui| {
                                         self.detail_heading(ui, &library, game);
@@ -2936,7 +2936,7 @@ impl App {
                 egui::vec2(168.0, 224.0)
             };
             ui.horizontal_top(|ui| {
-                self.picture(ui, game, Kind::Cover, cover);
+                self.detail_cover(ui, game, cover);
                 ui.add_space(theme::SPACE_LG);
                 ui.vertical(|ui| {
                     self.detail_heading(ui, &library, game);
@@ -3336,67 +3336,7 @@ impl App {
                 ui.label(description);
             });
         }
-        let count = self
-            .artwork
-            .index
-            .as_ref()
-            .and_then(|index| index.screenshots.get(&id))
-            .map_or(0, Vec::len);
-        ui.add_space(theme::SPACE_MD);
-        ui.label(theme::section_title("Screenshots"));
-        if self.artwork.index.is_none() {
-            ui.horizontal(|ui| {
-                ui.spinner();
-                ui.label("Looking for screenshots…");
-            });
-        } else if count == 0 {
-            ui.weak("No screenshots found for this game.");
-        } else {
-            // The first screenshot is shown straight away; the rest load
-            // only when asked for, keeping a game visit to two pictures.
-            let shown = if self.screenshots { count } else { 1 };
-            let gap = ui.spacing().item_spacing.x;
-            let columns = ((ui.available_width() + gap) / (320.0 + gap))
-                .floor()
-                .max(1.0) as usize;
-            egui::Grid::new(("v2_detail_screenshot_gallery", id))
-                .num_columns(columns)
-                .spacing(egui::vec2(gap, theme::SPACE_SM))
-                .show(ui, |ui| {
-                    for ordinal in 0..shown {
-                        ui.vertical(|ui| {
-                            ui.set_width(320.0);
-                            self.picture(
-                                ui,
-                                game,
-                                Kind::Screenshot(ordinal),
-                                egui::vec2(320.0, 240.0),
-                            );
-                            let key = self.artwork.key(id, Kind::Screenshot(ordinal));
-                            if matches!(
-                                self.artwork.pictures.get(&key),
-                                Some(Picture::Failed(_) | Picture::Unavailable { .. })
-                            ) && ui
-                                .button(format!("Retry screenshot {}", ordinal + 1))
-                                .clicked()
-                            {
-                                self.artwork.retry(key);
-                            }
-                        });
-                        if (ordinal + 1) % columns == 0 {
-                            ui.end_row();
-                        }
-                    }
-                });
-            if !self.screenshots
-                && count > 1
-                && ui
-                    .button(format!("Show all screenshots ({count})"))
-                    .clicked()
-            {
-                self.screenshots = true;
-            }
-        }
+        self.detail_screenshots(ui, game);
         self.save_backups_panel(ui, game);
         self.documents_panel(ui, id, game);
         // Everything below is reference material, closed by default and
