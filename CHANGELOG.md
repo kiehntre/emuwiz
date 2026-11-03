@@ -15,6 +15,13 @@ guessing at intent, dates, or scope.
 
 Changes promoted to `main` since `v0.9.0`. Linux-only and pre-1.0.
 
+- Big Picture: a full-screen, controller-friendly game browser with large
+  covers, D-pad and analogue-stick navigation, search with an on-screen
+  keyboard, and system filtering, opened from the Library or with
+  `--big-picture`. Keyboard and mouse work too. Play opens the existing Launch
+  page, so every launch check is unchanged, and controller input is ignored
+  while an emulator runs. Linux evdev controllers only.
+
 ### Interface: GUI v2 and EmuWiz Blue
 
 - **GUI v2 is now the release `emuwiz` interface.** Native v2 pages replace

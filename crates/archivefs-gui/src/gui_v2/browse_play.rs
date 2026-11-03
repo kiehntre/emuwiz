@@ -23,7 +23,7 @@ use eframe::egui::{self, Color32, RichText};
 
 // Keep small-catalogue interactions immediate; larger scans use the existing
 // generation-checked, debounced Filter worker rather than blocking paint.
-const IMMEDIATE_FILTER_LIMIT: usize = 10_000;
+pub(super) const IMMEDIATE_FILTER_LIMIT: usize = 10_000;
 const PLATFORM_ICON_SIZE: f32 = 22.0;
 /// Largest systems shown as chips; the rest live in the dropdown.
 const TOP_SYSTEMS: usize = 7;
@@ -38,6 +38,7 @@ const SELECTED_COVER_SIZE: egui::Vec2 = egui::vec2(150.0, 196.0);
 const COMPACT_COVER_SIZE: egui::Vec2 = egui::vec2(70.0, 92.0);
 /// Below this width the selected-game panel becomes a strip above the shelf.
 const SIDE_BY_SIDE_MIN_WIDTH: f32 = 1100.0;
+const BIG_PICTURE: &str = "Big Picture";
 /// Narrowest the Library search field is allowed to become before the
 /// List/Grid switch moves to its own row.
 const SEARCH_MIN_WIDTH: f32 = 140.0;
@@ -265,7 +266,7 @@ pub(super) const SELECT_VS_PLAY: &str =
     "Clicking a cover only selects it. Play opens the launch-readiness check first.";
 /// Preservation-only media has no launch route, so it gets this instead of
 /// a readiness check.
-const PRESERVATION_ONLY_SENTENCE: &str = "A recording of a play session, kept for \
+pub(super) const PRESERVATION_ONLY_SENTENCE: &str = "A recording of a play session, kept for \
      preservation. EmuWiz has no verified replay workflow, so Play is not offered.";
 
 /// One sentence that says what Play will do for this game.
@@ -509,7 +510,7 @@ impl App {
 
     /// The games matching the current search and system. Recomputed only when
     /// the filter or the library changes.
-    fn browse_play_indices(&mut self) -> Arc<Vec<usize>> {
+    pub(super) fn browse_play_indices(&mut self) -> Arc<Vec<usize>> {
         let key = (
             self.filter.platform.clone(),
             self.filter.search.trim().to_lowercase(),
@@ -639,7 +640,11 @@ impl App {
         let pad = 2.0 * ui.spacing().button_padding.x;
         let gap = ui.spacing().item_spacing.x;
         let measure = |text: &str| super::title_fit::text_width(ui, text, &font) + pad;
-        let switch = measure("List") + measure("Grid") + measure("Done selecting") + 2.0 * gap;
+        let switch = measure("List")
+            + measure("Grid")
+            + measure("Done selecting")
+            + measure(BIG_PICTURE)
+            + 3.0 * gap;
         let clear = if self.filter.search.is_empty() {
             0.0
         } else {
@@ -724,6 +729,7 @@ impl App {
                     view_toggle(ui, &mut self.filter.list, true, "List");
                     view_toggle(ui, &mut self.filter.list, false, "Grid");
                     self.browse_play_selection_toggle(ui);
+                    self.big_picture_button(ui);
                 });
             }
         });
@@ -732,6 +738,7 @@ impl App {
                 attention_filter(self, ui);
                 view_switch(self, ui);
                 self.browse_play_selection_toggle(ui);
+                self.big_picture_button(ui);
             });
         }
         if blue
@@ -750,6 +757,16 @@ impl App {
                 )
                 .wrap(),
             );
+        }
+    }
+
+    fn big_picture_button(&mut self, ui: &mut egui::Ui) {
+        if ui
+            .button(BIG_PICTURE)
+            .on_hover_text("Browse and launch from the sofa with a controller")
+            .clicked()
+        {
+            self.enter_big_picture(ui.ctx());
         }
     }
 
