@@ -12,7 +12,7 @@ use super::identity::{DatPlatformIdentity, identify_dat_source};
 use super::library_identity_projection::project_dat_audit_for_library_identity;
 use super::library_identity_summary::DatVerificationState;
 use super::limits::DatLimits;
-use super::model::{DatEcosystem, DatPackingPolicy};
+use super::model::{DatEcosystem, DatPackingPolicy, ParsedDat};
 use super::parsers::parse_dat_file;
 use super::sources::DatSourceKind;
 use super::sources::audit_cache::AuditCacheConfig;
@@ -118,6 +118,19 @@ pub struct VerificationPreview {
     targets: CatalogueAuditTargets,
     // Private catalogue bytes live through the run and are never a user write target.
     _snapshot: tempfile::TempDir,
+    /// One selected game: its save touches only that game's evidence, so the
+    /// library-wide disc-order rebuild is not run.
+    single_game: bool,
+}
+
+/// Which library rows a verification may hash and save.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum VerificationPopulation {
+    /// Every row assigned to the platform, optionally under one folder.
+    Platform { collection: Option<PathBuf> },
+    /// Exactly one library row, bound to the path the person was shown. Any
+    /// other row is never examined, and the preview fails rather than widen.
+    Game { archive_id: i64, path: PathBuf },
 }
 
 fn ext(path: &Path) -> String {
@@ -157,6 +170,59 @@ fn same_file(a: &std::fs::Metadata, b: &std::fs::Metadata) -> bool {
         && a.ctime_nsec() == b.ctime_nsec()
 }
 
+/// Whether the frozen catalogue is for `platform`, from its own header.
+///
+/// An ordinary game list must name `platform`. Extras (downloadable
+/// content, e-Reader cards and so on) and Non-Redump discs are only
+/// accepted when the person set that system for the catalogue themselves
+/// (`chosen`; a system applied from a recognised header is not a choice),
+/// and so is a header naming more than one system when the person chose
+/// one of them. A header with no name is read from its description by the
+/// same rules. One with neither is accepted only for the system the person
+/// chose, and only when the older evidence agrees. Any other header
+/// (several systems, not games, ambiguous, unsupported) is refused.
+fn catalogue_is_for(parsed: &ParsedDat, platform: &str, chosen: Option<&str>) -> bool {
+    use super::catalogue_recognition::{CatalogueRecognition, recognise_catalogue, same_platform};
+    let ecosystem = Some(parsed.source.ecosystem);
+    let chosen_here = || {
+        chosen
+            .and_then(crate::canonical_platform_for_alias)
+            .is_some_and(|assigned| same_platform(assigned, platform))
+    };
+    let mut recognition = recognise_catalogue(parsed.source.name.as_deref(), ecosystem);
+    if recognition == CatalogueRecognition::NoName {
+        // The description never gets looser rules than a name would: a
+        // "Non-Redump - ..." or extras description still needs the choice.
+        recognition = recognise_catalogue(parsed.source.description.as_deref(), ecosystem);
+    }
+    match &recognition {
+        CatalogueRecognition::Games { .. } => recognition.is_for(platform),
+        // Extras and Non-Redump discs count only for a system the person
+        // chose themselves.
+        CatalogueRecognition::Extras { .. } | CatalogueRecognition::NeedsReview { .. } => {
+            recognition.is_for(platform) && chosen_here()
+        }
+        // The person resolved the ambiguity by choosing one of the systems
+        // the header names.
+        CatalogueRecognition::Ambiguous { platforms } => {
+            platforms
+                .iter()
+                .any(|candidate| same_platform(candidate, platform))
+                && chosen_here()
+        }
+        // Nothing in the header names a system. File names, folders and game
+        // names alone never back a system: only the person's own choice does.
+        CatalogueRecognition::NoName => {
+            chosen_here()
+                && matches!(
+                    identify_dat_source(parsed),
+                    DatPlatformIdentity::Resolved { platform: p, .. } if p == platform
+                )
+        }
+        _ => false,
+    }
+}
+
 /// Metadata-only ROM population preview; DAT bytes are frozen and parsed on the worker.
 pub fn preview_library_verification(
     resolved: ResolvedCatalogue,
@@ -164,6 +230,46 @@ pub fn preview_library_verification(
     platform: String,
     collection: Option<PathBuf>,
 ) -> Result<VerificationPreview, String> {
+    preview_verification(
+        resolved,
+        database_path,
+        platform,
+        VerificationPopulation::Platform { collection },
+    )
+}
+
+/// The same preview for exactly one library game. Fails, and checks nothing,
+/// when that game is gone, moved, on another system, shared by several rows
+/// or not eligible; it never falls back to the platform population.
+pub fn preview_game_verification(
+    resolved: ResolvedCatalogue,
+    database_path: PathBuf,
+    platform: String,
+    archive_id: i64,
+    path: PathBuf,
+) -> Result<VerificationPreview, String> {
+    preview_verification(
+        resolved,
+        database_path,
+        platform,
+        VerificationPopulation::Game { archive_id, path },
+    )
+}
+
+fn preview_verification(
+    resolved: ResolvedCatalogue,
+    database_path: PathBuf,
+    platform: String,
+    population: VerificationPopulation,
+) -> Result<VerificationPreview, String> {
+    let collection = match &population {
+        VerificationPopulation::Platform { collection } => collection.clone(),
+        VerificationPopulation::Game { .. } => None,
+    };
+    let single = match &population {
+        VerificationPopulation::Game { archive_id, path } => Some((*archive_id, path.clone())),
+        VerificationPopulation::Platform { .. } => None,
+    };
     if resolved.kind != DatSourceKind::File {
         return Err("Choose one installed DAT file, not an aggregate folder.".into());
     }
@@ -203,12 +309,11 @@ pub fn preview_library_verification(
     {
         return Err("Managed catalogue snapshot changed.".into());
     }
-    match identify_dat_source(&parsed) {
-        DatPlatformIdentity::Resolved { platform: p, .. } if p == platform => {}
-        _ => return Err(
+    if !catalogue_is_for(&parsed, &platform, resolved.chosen_platform()) {
+        return Err(
             "Catalogue platform is unknown, ambiguous or incompatible with the selected system."
                 .into(),
-        ),
+        );
     }
     if resolved
         .assigned_platform
@@ -314,15 +419,33 @@ pub fn preview_library_verification(
         fingerprints: BTreeMap::new(),
         targets: CatalogueAuditTargets::default(),
         _snapshot: snapshot,
+        single_game: single.is_some(),
     };
     preview.request.dat_path = frozen;
     preview.request.platform = Some(platform);
     for row in rows {
+        if let Some((id, path)) = &single {
+            if row.id != *id {
+                continue;
+            }
+            if &row.absolute_path != path {
+                return Err(
+                    "This game's library location changed. Open it again. Nothing was checked."
+                        .into(),
+                );
+            }
+        }
         let assigned = row
             .platform
             .as_deref()
             .and_then(crate::canonical_platform_for_alias);
         if assigned != Some(preview.platform.as_str()) {
+            if single.is_some() {
+                return Err(format!(
+                    "This game is not assigned to {}. Nothing was checked.",
+                    preview.platform
+                ));
+            }
             if assigned.is_none() {
                 preview.unknown_system += 1;
             } else {
@@ -375,6 +498,20 @@ pub fn preview_library_verification(
         preview.eligible_games += 1;
         preview.fingerprints.insert(path.clone(), metadata);
         preview.scope.eligible.insert(path, row.id);
+    }
+    if single.is_some() {
+        if preview.selected_games == 0 {
+            return Err("This game is no longer in the library. Nothing was checked.".into());
+        }
+        if let Some(exclusion) = preview.exclusions.first() {
+            return Err(format!(
+                "This game cannot be checked: {}. Nothing was checked or saved.",
+                exclusion.reason
+            ));
+        }
+        if preview.eligible_games != 1 {
+            return Err("This game could not be resolved to one file. Nothing was checked.".into());
+        }
     }
     preview.targets =
         catalogue_audit_targets(preview.scope.eligible.keys().cloned(), Path::new("/"));
@@ -608,10 +745,17 @@ impl VerificationPreview {
         }
         totals.saved = saved.inserted + saved.updated;
         totals.protected_prior = saved.skipped_protected_prior_result;
-        totals.disc_order = Some(db.refresh_dat_disc_order(0).map_err(|e| e.to_string()));
+        // The disc-order rebuild reads and rewrites every release in the
+        // library, so a one-game check leaves it to the next platform check.
+        totals.disc_order =
+            (!self.single_game).then(|| db.refresh_dat_disc_order(0).map_err(|e| e.to_string()));
         Ok(totals)
     }
 }
 
 #[cfg(test)]
 mod tests;
+
+#[cfg(test)]
+#[path = "library_verification/recognition_tests.rs"]
+mod recognition_tests;

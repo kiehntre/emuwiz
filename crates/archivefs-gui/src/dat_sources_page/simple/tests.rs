@@ -954,3 +954,6 @@ fn a_refused_or_failed_assignment_reports_it_and_changes_nothing() {
     );
     assert!(page.view().rows.iter().all(|row| row.platform_id.is_none()));
 }
+
+#[path = "recognition_journey_tests.rs"]
+mod recognition_journey;
