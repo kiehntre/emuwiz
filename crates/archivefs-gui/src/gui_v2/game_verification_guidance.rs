@@ -36,7 +36,17 @@ impl Action {
         match self {
             Self::Validate => Route::Section(Section::Dat),
             Self::Review => Route::ReviewIdentity(game.archive.id),
-            Self::SelectDat | Self::Audit | Self::Recheck => {
+            // Both read and save only this game; see `game_dat_check`. A
+            // game with no known system must have one chosen first.
+            Self::Audit | Self::Recheck
+                if archivefs_core::canonical_platform_for_alias(&game.platform).is_some() =>
+            {
+                Route::GameCheck(game.archive.id)
+            }
+            Self::Audit | Self::Recheck => {
+                super::identity_review_page::setup_verification_route(None)
+            }
+            Self::SelectDat => {
                 super::identity_review_page::setup_verification_route(Some(&game.platform))
             }
         }
@@ -130,6 +140,27 @@ impl State {
         *self = Self::default();
     }
 
+    /// Test-only: put the panel in a chosen state without starting the
+    /// worker, which would read the real default database.
+    #[cfg(test)]
+    pub(super) fn set_for_test(
+        &mut self,
+        game: i64,
+        receiver: Option<Receiver<Guidance>>,
+        result: Option<Guidance>,
+    ) {
+        self.game = Some(game);
+        self.receiver = receiver;
+        self.result = result;
+    }
+
+    /// This panel's finished result for `game`, if it has one.
+    pub(super) fn result_for(&self, game: i64) -> Option<&Guidance> {
+        (self.game == Some(game))
+            .then_some(self.result.as_ref())
+            .flatten()
+    }
+
     fn poll(&mut self, game: &Game, context: &eframe::egui::Context) {
         if self.game != Some(game.archive.id) {
             self.invalidate();
@@ -168,17 +199,23 @@ fn unavailable() -> Guidance {
     )
 }
 
+/// Whether the file is there and still agrees with the scan's size/mtime.
+pub(super) fn file_state(game: &Game) -> (Option<std::fs::Metadata>, bool) {
+    let metadata = std::fs::symlink_metadata(&game.archive.absolute_path).ok();
+    let unchanged = metadata.as_ref().is_some_and(|m| {
+        Some(m.len()) == game.archive.size_bytes
+            && m.modified()
+                .ok()
+                .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+                .and_then(|d| i64::try_from(d.as_secs()).ok())
+                == game.archive.modified_time_unix_seconds
+    });
+    (metadata, unchanged)
+}
+
 fn read_game(game: &Game) -> Guidance {
     let result = (|| -> Result<_, String> {
-        let metadata = std::fs::symlink_metadata(&game.archive.absolute_path).ok();
-        let unchanged = metadata.as_ref().is_some_and(|m| {
-            Some(m.len()) == game.archive.size_bytes
-                && m.modified()
-                    .ok()
-                    .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
-                    .and_then(|d| i64::try_from(d.as_secs()).ok())
-                    == game.archive.modified_time_unix_seconds
-        });
+        let (metadata, unchanged) = file_state(game);
         let database = Database::open_read_only(
             &archivefs_core::default_database_path().map_err(|e| e.to_string())?,
         )
@@ -223,7 +260,8 @@ fn load(
     format_exclusion: Option<&str>,
 ) -> Guidance {
     let result = (|| -> Result<_, String> {
-        let (checks, freshness) = saved_evidence(game, database)?;
+        let (checks, stale) = saved_evidence(game, database)?;
+        let freshness = freshness(game, stale);
         let snapshot =
             crate::dat_catalogue_picker::load_inventory_snapshot().map_err(|e| e.to_string())?;
         Ok((
@@ -254,16 +292,38 @@ fn load(
     }
 }
 
-/// Read stored stale marks and whole-disc metadata through the existing API.
-/// With no current hashes/revision, absence of staleness is Unknown, never Current.
-fn saved_evidence(
-    game: &Game,
-    database: &Database,
-) -> Result<(usize, DatProvenanceFreshness), String> {
+/// Whether Game Details may call this game's DAT match current anywhere on
+/// the page (the Region note included): only the panel's own answer, once
+/// its worker has re-read this game's saved rows. Before that nothing says
+/// Verified, whatever the Library decided at load.
+pub(super) fn dat_verified_now(_game: &Game, panel: Option<&Guidance>) -> bool {
+    panel.is_some_and(|guidance| guidance.reason == "Verified")
+}
+
+/// Current only when the Library's strict current-evidence decision
+/// (`dat_exact`, set only from `current_library_dat_evidence`) holds and no
+/// saved row is stale; Stale when one is; otherwise Unknown. A saved
+/// exact-match row alone never makes evidence current.
+pub(super) fn freshness(game: &Game, stale: bool) -> DatProvenanceFreshness {
+    if stale {
+        DatProvenanceFreshness::Stale
+    } else if game.dat_exact.is_some() {
+        DatProvenanceFreshness::Current
+    } else {
+        DatProvenanceFreshness::Unknown
+    }
+}
+
+/// How many saved checks exist for this game, and whether its evidence is
+/// stale now: a row is marked stale, or the Library loaded current proof
+/// that no saved row still confirms when re-read here (the file changed,
+/// moved or became another file-system object since the Library loaded).
+pub(super) fn saved_evidence(game: &Game, database: &Database) -> Result<(usize, bool), String> {
     let checks = database
         .library_dat_identities_for_item(game.archive.id)
         .map_err(|e| e.to_string())?;
     let mut stale = false;
+    let mut confirmed = false;
     for check in &checks {
         let summary = database
             .library_dat_identity_summary_for_item(
@@ -274,17 +334,15 @@ fn saved_evidence(
                 true,
             )
             .map_err(|e| e.to_string())?;
-        if summary.is_some_and(|s| s.provenance_freshness == DatProvenanceFreshness::Stale) {
-            stale = true;
+        match summary.map(|s| s.provenance_freshness) {
+            Some(DatProvenanceFreshness::Stale) => stale = true,
+            Some(DatProvenanceFreshness::Current) => confirmed = true,
+            _ => (),
         }
     }
     Ok((
         checks.len(),
-        if stale {
-            DatProvenanceFreshness::Stale
-        } else {
-            DatProvenanceFreshness::Unknown
-        },
+        stale || (game.dat_exact.is_some() && !confirmed),
     ))
 }
 
@@ -300,7 +358,12 @@ pub(super) fn explain(
     catalogues: Result<&[InstalledCatalogueSummary], &str>,
     format_exclusion: Option<&str>,
 ) -> Guidance {
-    if !present || !unchanged || freshness == DatProvenanceFreshness::Stale {
+    // Current evidence already proved the audited file object is unchanged,
+    // which is stronger than the scan's size/mtime baseline; a re-checked
+    // file whose scan row is older must not be called changed. A file that
+    // is gone now is reported whatever the evidence said at load.
+    let current = freshness == DatProvenanceFreshness::Current;
+    if !present || (!unchanged && !current) || freshness == DatProvenanceFreshness::Stale {
         return guidance(
             "File evidence stale or changed",
             if !present {
