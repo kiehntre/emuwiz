@@ -1794,13 +1794,107 @@ fn assert_viewport_is(context: &egui::Context, output: &egui::FullOutput, size: 
         "effective viewport {:?} is not the constrained {size:?}",
         content.size()
     );
+    if let Err(message) = clip_rects_within_viewport(&output.shapes, size) {
+        panic!("{message}");
+    }
+}
+
+/// Every clip rect that can paint must lie inside the `size` viewport.
+///
+/// A clip rect that is not positive (zero or negative width or height, e.g. a
+/// nested scroll area laid out entirely below its parent's clip, whose
+/// intersection is inverted) paints nothing: epaint's tessellator skips any
+/// shape whose `clip_rect.is_positive()` is false. Only those are ignored; a
+/// positive clip rect outside the viewport, or a NaN one, is still a failure.
+fn clip_rects_within_viewport(
+    shapes: &[egui::epaint::ClippedShape],
+    size: [f32; 2],
+) -> Result<(), String> {
     let screen = egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(size[0], size[1]));
-    for clipped in &output.shapes {
-        assert!(
-            screen.expand(1.0).contains_rect(clipped.clip_rect),
-            "clip rect {:?} escapes the {size:?} viewport",
-            clipped.clip_rect
+    for clipped in shapes {
+        // NaN is never positive, but it signals a broken layout, so it still fails.
+        if clipped.clip_rect.any_nan() {
+            return Err(format!("clip rect {:?} is NaN", clipped.clip_rect));
+        }
+        if !clipped.clip_rect.is_positive() {
+            continue;
+        }
+        if !screen.expand(1.0).contains_rect(clipped.clip_rect) {
+            return Err(format!(
+                "clip rect {:?} escapes the {size:?} viewport",
+                clipped.clip_rect
+            ));
+        }
+    }
+    Ok(())
+}
+
+mod clip_rects_within_viewport_tests {
+    use super::{clip_rects_within_viewport, egui};
+
+    fn shape(min: [f32; 2], max: [f32; 2]) -> egui::epaint::ClippedShape {
+        egui::epaint::ClippedShape {
+            clip_rect: egui::Rect::from_min_max(min.into(), max.into()),
+            shape: egui::Shape::rect_filled(
+                egui::Rect::from_min_max(min.into(), max.into()),
+                0.0,
+                egui::Color32::WHITE,
+            ),
+        }
+    }
+
+    const SIZE: [f32; 2] = [1024.0, 600.0];
+
+    #[test]
+    fn inverted_clip_rect_outside_the_viewport_paints_nothing_and_passes() {
+        // The exact rect seen in the CI flake: min.y 714 > max.y 551.
+        let shapes = [shape([230.0, 714.0], [1024.0, 551.0])];
+        assert_eq!(clip_rects_within_viewport(&shapes, SIZE), Ok(()));
+    }
+
+    #[test]
+    fn empty_clip_rect_outside_the_viewport_paints_nothing_and_passes() {
+        let zero_height = shape([0.0, 900.0], [1024.0, 900.0]);
+        let zero_width = shape([2000.0, 0.0], [2000.0, 600.0]);
+        assert_eq!(
+            clip_rects_within_viewport(&[zero_height, zero_width], SIZE),
+            Ok(())
         );
+    }
+
+    #[test]
+    fn positive_clip_rect_partly_outside_the_viewport_still_fails() {
+        let shapes = [
+            shape([0.0, 0.0], [1024.0, 600.0]),
+            shape([230.0, 500.0], [1024.0, 714.0]),
+        ];
+        let error = clip_rects_within_viewport(&shapes, SIZE)
+            .expect_err("a positive clip rect escaping the viewport must fail");
+        assert!(
+            error.contains("escapes the [1024.0, 600.0] viewport"),
+            "{error}"
+        );
+    }
+
+    #[test]
+    fn positive_clip_rect_wider_than_the_viewport_still_fails() {
+        let shapes = [shape([0.0, 0.0], [1400.0, 600.0])];
+        assert!(clip_rects_within_viewport(&shapes, SIZE).is_err());
+    }
+
+    #[test]
+    fn nan_clip_rect_still_fails() {
+        let shapes = [shape([0.0, f32::NAN], [1024.0, 600.0])];
+        assert!(clip_rects_within_viewport(&shapes, SIZE).is_err());
+    }
+
+    #[test]
+    fn positive_clip_rect_inside_the_viewport_passes() {
+        let shapes = [
+            shape([0.0, 0.0], [1024.0, 600.0]),
+            shape([230.0, 120.0], [1024.0, 551.0]),
+        ];
+        assert_eq!(clip_rects_within_viewport(&shapes, SIZE), Ok(()));
     }
 }
 
