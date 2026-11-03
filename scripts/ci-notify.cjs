@@ -7,7 +7,7 @@ const path = require('node:path');
 // are also inspected; missing mandatory jobs cannot silently count as success.
 const ALWAYS = [
   'Classify change risk', 'Repository guardrails', 'Clippy warning ratchet',
-  'R2 filesystem gate', 'Dependency and secret audit', 'Test shard coverage',
+  'R2 filesystem gate', 'Dependency and secret audit', 'Test shard coverage', 'CI gate',
   'DOSBox sandbox enforcement (ubuntu-24.04)',
   'DOSBox sandbox enforcement (ubuntu-latest)',
 ];
