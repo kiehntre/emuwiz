@@ -20,9 +20,9 @@ pub(in crate::gui_v2) enum PadStatus {
     /// Nothing has been checked yet, or this platform has no reader.
     #[default]
     Unsupported,
-    /// No controller was found. `unreadable` input devices could not be
-    /// opened, so one of them may be a controller EmuWiz has no permission
-    /// to read.
+    /// No controller could be read. `unreadable` devices the kernel
+    /// describes as controllers could not be opened for lack of permission;
+    /// unreadable keyboards and mice are not counted.
     NotFound {
         unreadable: usize,
     },
@@ -38,8 +38,13 @@ impl PadStatus {
         match self {
             Self::Unsupported => "Controllers are not supported on this system".into(),
             Self::NotFound { unreadable: 0 } => "No controller found".into(),
-            Self::NotFound { .. } => {
-                "No controller found. EmuWiz has no permission to read some input devices".into()
+            Self::NotFound { unreadable: 1 } => {
+                "A controller is connected but EmuWiz has no permission to read it".into()
+            }
+            Self::NotFound { unreadable } => {
+                format!(
+                    "{unreadable} controllers are connected but EmuWiz has no permission to read them"
+                )
             }
             Self::Connected(names) => match names.as_slice() {
                 [name] => format!("Controller: {name}"),
@@ -102,6 +107,24 @@ fn is_gamepad(keys: &[u8], axes: &[u8]) -> bool {
     bit(keys, BTN_SOUTH) && !bit(keys, BTN_TOUCH) && steers
 }
 
+/// Parses a sysfs `capabilities/*` bitmap: hexadecimal kernel longs, most
+/// significant first, into the byte layout `bit` reads. These files are
+/// readable by everyone, unlike the device nodes themselves.
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+fn parse_capabilities(text: &str, bytes: usize) -> Option<Vec<u8>> {
+    const WORD_BYTES: usize = (usize::BITS / 8) as usize;
+    let mut out = vec![0_u8; bytes];
+    for (index, word) in text.split_whitespace().rev().enumerate() {
+        let value = usize::from_str_radix(word, 16).ok()?;
+        for (offset, byte) in value.to_le_bytes().into_iter().enumerate() {
+            if let Some(slot) = out.get_mut(index * WORD_BYTES + offset) {
+                *slot = byte;
+            }
+        }
+    }
+    Some(out)
+}
+
 fn button(code: u16) -> Option<Control> {
     Some(match code {
         BTN_SOUTH => Control::Button(Button::South),
@@ -111,10 +134,6 @@ fn button(code: u16) -> Option<Control> {
         BTN_TL => Control::Button(Button::LeftBumper),
         BTN_TR => Control::Button(Button::RightBumper),
         BTN_START => Control::Button(Button::Start),
-        BTN_DPAD_UP => Control::Direction(Direction::Up),
-        BTN_DPAD_DOWN => Control::Direction(Direction::Down),
-        BTN_DPAD_LEFT => Control::Direction(Direction::Left),
-        BTN_DPAD_RIGHT => Control::Direction(Direction::Right),
         _ => return None,
     })
 }
@@ -145,6 +164,8 @@ struct Decoder {
     y: AxisRange,
     stick: [Pole; 4],
     hat: [Pole; 4],
+    /// D-pads reported as buttons rather than a hat.
+    dpad: [bool; 4],
 }
 
 const AXIS_DIRECTIONS: [Direction; 4] = [
@@ -154,19 +175,42 @@ const AXIS_DIRECTIONS: [Direction; 4] = [
     Direction::Down,
 ];
 
+fn dpad_index(code: u16) -> Option<usize> {
+    Some(match code {
+        BTN_DPAD_LEFT => 0,
+        BTN_DPAD_RIGHT => 1,
+        BTN_DPAD_UP => 2,
+        BTN_DPAD_DOWN => 3,
+        _ => return None,
+    })
+}
+
 impl Decoder {
+    /// The stick, hat and d-pad buttons can all hold one direction. It is
+    /// pressed when the first of them takes it and released when the last
+    /// lets go, so letting go of one never cancels another still held.
+    fn held(&self, index: usize) -> bool {
+        self.stick[index].on || self.hat[index].on || self.dpad[index]
+    }
+
+    fn direction(&mut self, index: usize, was: bool, out: &mut Vec<PadEvent>) {
+        let now = self.held(index);
+        if now != was {
+            let (device, control) = (self.device, Control::Direction(AXIS_DIRECTIONS[index]));
+            out.push(if now {
+                PadEvent::Pressed { device, control }
+            } else {
+                PadEvent::Released { device, control }
+            });
+        }
+    }
+
     fn axis(&mut self, poles: (usize, usize), hat: bool, value: f32, out: &mut Vec<PadEvent>) {
-        let device = self.device;
-        let bank = if hat { &mut self.hat } else { &mut self.stick };
         for (index, deflection) in [(poles.0, -value), (poles.1, value)] {
-            if let Some(on) = bank[index].update(deflection) {
-                let control = Control::Direction(AXIS_DIRECTIONS[index]);
-                out.push(if on {
-                    PadEvent::Pressed { device, control }
-                } else {
-                    PadEvent::Released { device, control }
-                });
-            }
+            let was = self.held(index);
+            let bank = if hat { &mut self.hat } else { &mut self.stick };
+            bank[index].update(deflection);
+            self.direction(index, was, out);
         }
     }
 
@@ -175,12 +219,17 @@ impl Decoder {
             (EV_SYN, SYN_DROPPED) => {
                 self.stick = Default::default();
                 self.hat = Default::default();
+                self.dpad = Default::default();
                 out.push(PadEvent::Reset {
                     device: self.device,
                 });
             }
             (EV_KEY, code) if value == 0 || value == 1 => {
-                if let Some(control) = button(code) {
+                if let Some(index) = dpad_index(code) {
+                    let was = self.held(index);
+                    self.dpad[index] = value == 1;
+                    self.direction(index, was, out);
+                } else if let Some(control) = button(code) {
                     let device = self.device;
                     out.push(if value == 1 {
                         PadEvent::Pressed { device, control }
@@ -203,11 +252,11 @@ mod linux {
     use super::*;
     use eframe::egui;
     use std::{
-        collections::{BTreeSet, HashMap},
+        collections::{BTreeMap, HashMap},
         ffi::CString,
         fs,
         os::fd::{AsRawFd, FromRawFd, OwnedFd},
-        os::unix::ffi::OsStrExt,
+        os::unix::{ffi::OsStrExt, fs::MetadataExt},
         path::{Path, PathBuf},
         sync::{
             Arc, Mutex,
@@ -273,6 +322,7 @@ mod linux {
         Pad(Open),
         NotAPad,
         Denied,
+        Gone,
     }
 
     struct Open {
@@ -293,14 +343,10 @@ mod linux {
             )
         };
         if raw < 0 {
-            let denied = matches!(
-                std::io::Error::last_os_error().raw_os_error(),
-                Some(libc::EACCES | libc::EPERM)
-            );
-            return if denied {
-                Probe::Denied
-            } else {
-                Probe::NotAPad
+            return match std::io::Error::last_os_error().raw_os_error() {
+                Some(libc::EACCES | libc::EPERM) => Probe::Denied,
+                Some(libc::ENOENT | libc::ENODEV | libc::ENXIO) => Probe::Gone,
+                _ => Probe::NotAPad,
             };
         }
         // SAFETY: open returned this descriptor and nothing else owns it.
@@ -332,9 +378,64 @@ mod linux {
         })
     }
 
-    fn event_nodes(root: &Path) -> BTreeSet<PathBuf> {
+    /// Which device node a path names. A path such as `event5` is reused by
+    /// the kernel for the next device once its device leaves; devtmpfs gives
+    /// the new node a new inode, so an identity tells the two apart.
+    #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+    struct NodeId {
+        inode: u64,
+        changed: (i64, i64),
+    }
+
+    /// Where devices come from: the kernel, or a fake in tests.
+    trait Devices {
+        fn nodes(&self) -> BTreeMap<PathBuf, NodeId>;
+        fn probe(&self, path: &Path, device: u32) -> Probe;
+        /// For a node EmuWiz may not open: whether the kernel's published
+        /// capabilities say it is a controller. None when that is unknown.
+        fn denied_is_gamepad(&self, path: &Path) -> Option<bool>;
+    }
+
+    struct Kernel {
+        root: PathBuf,
+    }
+
+    impl Devices for Kernel {
+        fn nodes(&self) -> BTreeMap<PathBuf, NodeId> {
+            event_nodes(&self.root)
+                .into_iter()
+                .filter_map(|path| {
+                    let meta = fs::symlink_metadata(&path).ok()?;
+                    let id = NodeId {
+                        inode: meta.ino(),
+                        changed: (meta.ctime(), meta.ctime_nsec()),
+                    };
+                    Some((path, id))
+                })
+                .collect()
+        }
+
+        fn probe(&self, path: &Path, device: u32) -> Probe {
+            probe(path, device)
+        }
+
+        fn denied_is_gamepad(&self, path: &Path) -> Option<bool> {
+            let name = path.file_name()?;
+            let caps = Path::new("/sys/class/input")
+                .join(name)
+                .join("device/capabilities");
+            let keys = parse_capabilities(&fs::read_to_string(caps.join("key")).ok()?, KEY_BYTES)?;
+            let axes = fs::read_to_string(caps.join("abs"))
+                .ok()
+                .and_then(|text| parse_capabilities(&text, ABS_BYTES))
+                .unwrap_or_else(|| vec![0; ABS_BYTES]);
+            Some(is_gamepad(&keys, &axes))
+        }
+    }
+
+    fn event_nodes(root: &Path) -> Vec<PathBuf> {
         let Ok(entries) = fs::read_dir(root) else {
-            return BTreeSet::new();
+            return Vec::new();
         };
         entries
             .flatten()
@@ -355,16 +456,18 @@ mod linux {
     struct Scanner {
         pads: HashMap<PathBuf, Open>,
         /// Non-controllers already looked at: not reopened on every rescan.
-        ignored: BTreeSet<PathBuf>,
+        ignored: BTreeMap<PathBuf, NodeId>,
         next_device: u32,
     }
 
     impl Scanner {
-        fn scan(&mut self, root: &Path, events: &mut Vec<PadEvent>) -> PadStatus {
-            let nodes = event_nodes(root);
-            self.ignored.retain(|path| nodes.contains(path));
+        fn scan(&mut self, devices: &impl Devices, events: &mut Vec<PadEvent>) -> PadStatus {
+            let nodes = devices.nodes();
+            // A node that left, or whose name now belongs to another device,
+            // is looked at again.
+            self.ignored.retain(|path, id| nodes.get(path) == Some(id));
             self.pads.retain(|path, pad| {
-                let keep = nodes.contains(path);
+                let keep = nodes.contains_key(path);
                 if !keep {
                     events.push(PadEvent::Reset {
                         device: pad.decoder.device,
@@ -373,20 +476,32 @@ mod linux {
                 keep
             });
             let mut unreadable = 0;
-            for path in nodes {
-                if self.pads.contains_key(&path) || self.ignored.contains(&path) {
+            for (path, id) in nodes {
+                if self.pads.contains_key(&path) || self.ignored.contains_key(&path) {
                     continue;
                 }
                 self.next_device += 1;
-                match probe(&path, self.next_device) {
+                match devices.probe(&path, self.next_device) {
                     Probe::Pad(pad) => {
                         log::info!("Big Picture: controller found: {}", pad.name);
                         self.pads.insert(path, pad);
                     }
                     Probe::NotAPad => {
-                        self.ignored.insert(path);
+                        self.ignored.insert(path, id);
                     }
-                    Probe::Denied => unreadable += 1,
+                    // Keyboards and mice are normally unreadable on a desktop
+                    // and say nothing about controllers. Only a node the
+                    // kernel describes as a controller is a permission
+                    // problem; it is tried again, as its access may follow.
+                    Probe::Denied => match devices.denied_is_gamepad(&path) {
+                        Some(true) => unreadable += 1,
+                        Some(false) => {
+                            self.ignored.insert(path, id);
+                        }
+                        None => {}
+                    },
+                    // Gone between listing and opening: look again next time.
+                    Probe::Gone => {}
                 }
             }
             if self.pads.is_empty() {
@@ -475,14 +590,15 @@ mod linux {
         }
 
         fn start_at(root: PathBuf, context: egui::Context) -> Self {
+            let devices = Kernel { root };
             let mut scanner = Scanner::default();
             // The first scan runs here, so the mode opens knowing the answer.
-            let status = Arc::new(Mutex::new(scanner.scan(&root, &mut Vec::new())));
+            let status = Arc::new(Mutex::new(scanner.scan(&devices, &mut Vec::new())));
             let stop = Arc::new(AtomicBool::new(false));
             let paused = Arc::new(AtomicBool::new(false));
             let (sender, events) = mpsc::channel();
             let worker = Worker {
-                root,
+                devices,
                 scanner,
                 status: status.clone(),
                 stop: stop.clone(),
@@ -530,7 +646,7 @@ mod linux {
     }
 
     struct Worker {
-        root: PathBuf,
+        devices: Kernel,
         scanner: Scanner,
         status: Arc<Mutex<PadStatus>>,
         stop: Arc<AtomicBool>,
@@ -552,7 +668,7 @@ mod linux {
                 }
                 if scanned.elapsed() >= RESCAN {
                     scanned = Instant::now();
-                    let status = self.scanner.scan(&self.root, &mut events);
+                    let status = self.scanner.scan(&self.devices, &mut events);
                     let mut current = self.status.lock().unwrap_or_else(|e| e.into_inner());
                     if *current != status {
                         *current = status;
@@ -751,6 +867,168 @@ mod linux {
             wait(&reader, |_, status| !has_pad(status));
         }
 
+        /// What a fake node turns out to be when opened.
+        #[derive(Clone)]
+        enum Kind {
+            Pad(&'static str),
+            NotAPad,
+            /// Could not be opened; the capabilities say whether it is a pad.
+            Denied(Option<bool>),
+            /// Removed between listing and opening.
+            Gone,
+        }
+
+        /// Device enumeration and probing without the kernel: nodes appear,
+        /// vanish and are reused exactly as the test says.
+        #[derive(Default)]
+        struct Fake {
+            nodes: std::cell::RefCell<BTreeMap<PathBuf, (NodeId, Kind)>>,
+            probes: std::cell::RefCell<Vec<PathBuf>>,
+        }
+
+        fn node(inode: u64) -> NodeId {
+            NodeId {
+                inode,
+                changed: (1_700_000_000, i64::try_from(inode).unwrap()),
+            }
+        }
+
+        impl Fake {
+            fn plug(&self, name: &str, inode: u64, kind: Kind) {
+                self.nodes
+                    .borrow_mut()
+                    .insert(PathBuf::from(name), (node(inode), kind));
+            }
+            fn unplug(&self, name: &str) {
+                self.nodes.borrow_mut().remove(Path::new(name));
+            }
+            fn probed(&self, name: &str) -> usize {
+                self.probes
+                    .borrow()
+                    .iter()
+                    .filter(|path| *path == Path::new(name))
+                    .count()
+            }
+        }
+
+        impl Devices for Fake {
+            fn nodes(&self) -> BTreeMap<PathBuf, NodeId> {
+                self.nodes
+                    .borrow()
+                    .iter()
+                    .map(|(path, (id, _))| (path.clone(), *id))
+                    .collect()
+            }
+            fn probe(&self, path: &Path, device: u32) -> Probe {
+                self.probes.borrow_mut().push(path.to_path_buf());
+                match self.nodes.borrow().get(path).map(|(_, kind)| kind.clone()) {
+                    Some(Kind::Pad(name)) => Probe::Pad(Open {
+                        fd: fs::File::open("/dev/null").unwrap().into(),
+                        name: name.into(),
+                        decoder: Decoder {
+                            device,
+                            ..Default::default()
+                        },
+                    }),
+                    Some(Kind::Denied(_)) => Probe::Denied,
+                    Some(Kind::Gone) => Probe::Gone,
+                    Some(Kind::NotAPad) | None => Probe::NotAPad,
+                }
+            }
+            fn denied_is_gamepad(&self, path: &Path) -> Option<bool> {
+                match self.nodes.borrow().get(path) {
+                    Some((_, Kind::Denied(pad))) => *pad,
+                    _ => None,
+                }
+            }
+        }
+
+        fn scan(scanner: &mut Scanner, fake: &Fake) -> (PadStatus, Vec<PadEvent>) {
+            let mut events = Vec::new();
+            let status = scanner.scan(fake, &mut events);
+            (status, events)
+        }
+
+        fn connected(names: &[&str]) -> PadStatus {
+            PadStatus::Connected(names.iter().map(|name| (*name).to_string()).collect())
+        }
+
+        #[test]
+        fn a_pad_given_a_recently_freed_event_node_is_found_without_a_replug() {
+            let fake = Fake::default();
+            let mut scanner = Scanner::default();
+            fake.plug("event7", 100, Kind::NotAPad);
+            assert_eq!(
+                scan(&mut scanner, &fake).0,
+                PadStatus::NotFound { unreadable: 0 }
+            );
+            // Inside one rescan interval the mouse on event7 leaves and the
+            // kernel gives the next device, a controller, the same name.
+            fake.unplug("event7");
+            fake.plug("event7", 101, Kind::Pad("Pad"));
+            assert_eq!(scan(&mut scanner, &fake).0, connected(&["Pad"]));
+            // A node that vanished as it was opened is not written off.
+            fake.plug("event8", 200, Kind::Gone);
+            scan(&mut scanner, &fake);
+            fake.plug("event8", 200, Kind::Pad("Pad 2"));
+            assert_eq!(scan(&mut scanner, &fake).0, connected(&["Pad", "Pad 2"]));
+            // An unchanged non-controller is still not reopened.
+            fake.plug("event2", 50, Kind::NotAPad);
+            scan(&mut scanner, &fake);
+            scan(&mut scanner, &fake);
+            assert_eq!(fake.probed("event2"), 1);
+        }
+
+        #[test]
+        fn a_pad_that_disconnects_and_wakes_again_is_found_again() {
+            let fake = Fake::default();
+            let mut scanner = Scanner::default();
+            fake.plug("event5", 10, Kind::Pad("Pad"));
+            assert_eq!(scan(&mut scanner, &fake).0, connected(&["Pad"]));
+            fake.unplug("event5");
+            let (status, events) = scan(&mut scanner, &fake);
+            assert_eq!(status, PadStatus::NotFound { unreadable: 0 });
+            assert!(
+                matches!(events[..], [PadEvent::Reset { .. }]),
+                "held controls are dropped"
+            );
+            // Bluetooth wake: the same pad comes back on the same node name.
+            fake.plug("event5", 11, Kind::Pad("Pad"));
+            assert_eq!(scan(&mut scanner, &fake).0, connected(&["Pad"]));
+            // Or on another name, alongside a second pad.
+            fake.plug("event9", 12, Kind::Pad("Pad 2"));
+            assert_eq!(scan(&mut scanner, &fake).0, connected(&["Pad", "Pad 2"]));
+        }
+
+        #[test]
+        fn unreadable_keyboards_and_mice_are_not_a_permission_problem() {
+            let fake = Fake::default();
+            let mut scanner = Scanner::default();
+            fake.plug("event1", 1, Kind::Denied(Some(false)));
+            fake.plug("event2", 2, Kind::Denied(Some(false)));
+            fake.plug("event3", 3, Kind::Denied(None));
+            assert_eq!(
+                scan(&mut scanner, &fake).0,
+                PadStatus::NotFound { unreadable: 0 }
+            );
+            scan(&mut scanner, &fake);
+            assert_eq!(
+                fake.probed("event1"),
+                1,
+                "a known non-controller is not reopened"
+            );
+            assert_eq!(fake.probed("event3"), 2, "an unknown node is tried again");
+            // A controller that cannot be read is still reported, and is
+            // found once its permission arrives.
+            fake.plug("event4", 4, Kind::Denied(Some(true)));
+            assert_eq!(
+                scan(&mut scanner, &fake).0,
+                PadStatus::NotFound { unreadable: 1 }
+            );
+            fake.plug("event4", 4, Kind::Pad("Pad"));
+            assert_eq!(scan(&mut scanner, &fake).0, connected(&["Pad"]));
+        }
+
         #[test]
         fn pointer_devices_on_this_machine_class_are_not_controllers() {
             // QEMU's USB tablet and similar show up as js* nodes: absolute
@@ -877,6 +1155,64 @@ mod tests {
     }
 
     #[test]
+    fn the_stick_and_d_pad_hold_one_direction_together() {
+        let mut d = decoder();
+        assert_eq!(decode(&mut d, EV_ABS, ABS_X, 255), [pressed(RIGHT)]);
+        assert!(
+            decode(&mut d, EV_ABS, ABS_HAT0X, 1).is_empty(),
+            "already held"
+        );
+        assert!(
+            decode(&mut d, EV_ABS, ABS_HAT0X, 0).is_empty(),
+            "the stick still holds it"
+        );
+        assert!(decode(&mut d, EV_KEY, BTN_DPAD_RIGHT, 1).is_empty());
+        assert!(decode(&mut d, EV_KEY, BTN_DPAD_RIGHT, 0).is_empty());
+        assert_eq!(decode(&mut d, EV_ABS, ABS_X, 128), [released(RIGHT)]);
+        // The other way round: the d-pad holds while the stick lets go.
+        assert_eq!(decode(&mut d, EV_KEY, BTN_DPAD_UP, 1), [pressed(UP)]);
+        assert!(decode(&mut d, EV_ABS, ABS_Y, -32768).is_empty());
+        assert!(decode(&mut d, EV_ABS, ABS_Y, 0).is_empty());
+        assert_eq!(decode(&mut d, EV_KEY, BTN_DPAD_UP, 0), [released(UP)]);
+    }
+
+    /// Through the navigator: the repeat survives the d-pad being let go.
+    #[test]
+    fn letting_go_of_the_d_pad_keeps_a_held_stick_repeating() {
+        let mut d = decoder();
+        let mut nav = super::super::nav::Navigator::default();
+        let mut feed = |d: &mut Decoder, kind, code, value, now| {
+            decode(d, kind, code, value)
+                .into_iter()
+                .filter_map(|event| nav.feed(event, now, true))
+                .count()
+        };
+        assert_eq!(feed(&mut d, EV_ABS, ABS_X, 255, 0.0), 1);
+        feed(&mut d, EV_ABS, ABS_HAT0X, 1, 0.1);
+        feed(&mut d, EV_ABS, ABS_HAT0X, 0, 0.2);
+        assert!(nav.repeating(), "the stick is still held");
+    }
+
+    #[test]
+    fn sysfs_capabilities_parse_into_the_same_bits() {
+        // From a real Xbox 360 pad and this machine's keyboard.
+        let pad = parse_capabilities("7cdb000000000000 0 0 0 0\n", 0x300 / 8).unwrap();
+        let axes = parse_capabilities("3003f\n", 0x40 / 8).unwrap();
+        assert!(bit(&pad, BTN_SOUTH) && bit(&pad, BTN_START));
+        assert!(is_gamepad(&pad, &axes));
+        let keyboard = parse_capabilities(
+            "402000002 3803078f800d001 feffffdfffefffff fffffffffffffffe",
+            0x300 / 8,
+        )
+        .unwrap();
+        assert!(!is_gamepad(
+            &keyboard,
+            &parse_capabilities("0", 0x40 / 8).unwrap()
+        ));
+        assert_eq!(parse_capabilities("zz", 8), None);
+    }
+
+    #[test]
     fn a_degenerate_axis_range_reads_as_centred() {
         assert_eq!(AxisRange { min: 0, max: 0 }.normal(5), 0.0);
     }
@@ -930,9 +1266,14 @@ mod tests {
             "No controller found"
         );
         assert!(
-            PadStatus::NotFound { unreadable: 3 }
+            PadStatus::NotFound { unreadable: 1 }
                 .describe()
                 .contains("permission")
+        );
+        assert!(
+            PadStatus::NotFound { unreadable: 3 }
+                .describe()
+                .starts_with("3 controllers")
         );
         let one = PadStatus::Connected(vec!["Pad".into()]);
         assert!(one.connected());
