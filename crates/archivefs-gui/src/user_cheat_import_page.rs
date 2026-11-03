@@ -1783,6 +1783,9 @@ impl UserCheatImportPageState {
         }
     }
 
+    /// `apply_cheat_journey` returns `Ok` for every result the shared engine
+    /// reports, so `Ok` means only that the Apply ran. `Applied` draws the
+    /// green badge and offers Undo, so it needs a recorded success.
     fn record_local_apply(
         &mut self,
         destination_root: PathBuf,
@@ -1790,10 +1793,16 @@ impl UserCheatImportPageState {
         transaction_id: String,
     ) {
         self.local_install_warnings = crate::shared_apply_warnings::lines(&result);
-        self.local_install = LocalInstallStage::Applied {
-            destination_root,
-            journal_path: result.journal_path,
-            transaction_id,
+        self.local_install = if local_journey_apply_recorded(&result) {
+            LocalInstallStage::Applied {
+                destination_root,
+                journal_path: result.journal_path,
+                transaction_id,
+            }
+        } else {
+            LocalInstallStage::Error {
+                message: local_journey_apply_failure_message(&result),
+            }
         };
     }
 
@@ -3922,6 +3931,53 @@ fn local_apply_failure_message(result: &SharedApplyResult) -> String {
     message
 }
 
+/// Status alone is not enough: an already-installed file keeps `Success` when
+/// its journal could not be written, and that Apply has no Undo.
+fn local_journey_apply_recorded(result: &archivefs_core::patch_manager::SharedApplyResult) -> bool {
+    result.journal.status == SharedApplyStatus::Success
+        && result.journal_path.is_some()
+        && result.journal_failure.is_none()
+}
+
+/// What the file is known to have become, from the engine's own per-file
+/// outcomes and details. A failed Apply can still have changed the file, so
+/// this never says nothing happened. This journey has no automatic rollback.
+fn local_journey_apply_failure_message(
+    result: &archivefs_core::patch_manager::SharedApplyResult,
+) -> String {
+    use archivefs_core::patch_manager::SharedApplyOutcome;
+    let written = result.journal.entries.iter().any(|entry| {
+        matches!(
+            entry.outcome,
+            SharedApplyOutcome::InstalledNew | SharedApplyOutcome::ReplacedExisting
+        )
+    });
+    let mut message = if written && result.journal_path.is_none() {
+        "Apply did not finish: the cheat file was written, but EmuWiz could not record it, so \
+         it cannot be undone from here. Check the file before relying on it."
+            .to_string()
+    } else {
+        let status = match result.journal.status {
+            // `DryRun` is the status an interrupted Apply starts with, and
+            // `Success` here means no record was kept.
+            SharedApplyStatus::DryRun | SharedApplyStatus::Success => "Not recorded".to_string(),
+            status => format!("{status:?}"),
+        };
+        format!("Apply did not fully succeed: {status}")
+    };
+    for entry in &result.journal.entries {
+        let path = &entry.plan_entry.destination_relative_path.display;
+        for failure in &entry.failures {
+            message.push_str(&format!("\n{path}: {}", failure.detail));
+        }
+    }
+    if let Some(failure) = &result.journal_failure {
+        message.push_str(&format!("\nHistory record: {}", failure.detail));
+    }
+    crate::shared_apply_warnings::append(&mut message, result);
+    message
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -3930,8 +3986,24 @@ mod tests {
     #[test]
     fn local_journey_apply_shows_shared_transaction_warnings() {
         let mut page = UserCheatImportPageState::default();
-        page.record_local_apply(PathBuf::from("/disposable"), warned_result(), "t".into());
+        let mut recorded = warned_result();
+        recorded.journal_path = Some(PathBuf::from("/disposable/journal.json"));
+        page.record_local_apply(PathBuf::from("/disposable"), recorded, "t".into());
+        assert!(matches!(
+            page.local_install,
+            LocalInstallStage::Applied { .. }
+        ));
         assert_shows_warning(&render(|ui| page.show_local_install_panel(ui)));
+    }
+
+    #[test]
+    fn an_unrecorded_local_journey_apply_keeps_its_warnings_in_the_error() {
+        let mut page = UserCheatImportPageState::default();
+        page.record_local_apply(PathBuf::from("/disposable"), warned_result(), "t".into());
+        let LocalInstallStage::Error { message } = &page.local_install else {
+            panic!("an Apply with no journal must not show Installed");
+        };
+        assert_shows_warning(message);
     }
 
     #[test]
@@ -3963,6 +4035,9 @@ mod tests {
         assert!(message.starts_with("Apply did not fully succeed"));
         assert_shows_warning(&message);
     }
+    use archivefs_core::patch_manager::{
+        CheatJourneyApplyResult, SharedApplyFailure, SharedApplyFailureKind, SharedApplyOutcome,
+    };
 
     #[test]
     fn converter_detects_unique_formats_but_refuses_to_guess_plain_pairs() {
@@ -4662,5 +4737,223 @@ mod tests {
         assert_eq!(lines.len(), 2, "{lines:?}");
         assert!(lines[0].0.contains("0 files") && lines[0].0.contains("0 cheats"));
         assert!(lines.iter().all(|(_, attention)| !attention));
+    }
+
+    /// What the local install panel draws for the current stage.
+    fn local_panel_text(page: &mut UserCheatImportPageState) -> String {
+        let output = egui::Context::default().run(egui::RawInput::default(), |ctx| {
+            egui::CentralPanel::default().show(ctx, |ui| page.show_local_install_panel(ui));
+        });
+        crate::transaction_outcome::test_support::rendered_text(&output)
+    }
+
+    /// A real, recorded single-file Apply, not yet given to the page.
+    fn real_apply() -> (
+        UserCheatImportPageState,
+        CheatJourneyApplyResult,
+        PathBuf,
+        PathBuf,
+    ) {
+        let (mut page, destination, root) = page_with_local_preview("snes9x");
+        let LocalInstallStage::Preview {
+            catalogue_root,
+            preview,
+            ..
+        } = std::mem::take(&mut page.local_install)
+        else {
+            panic!("fixture must reach Preview");
+        };
+        let applied = apply_cheat_journey(
+            &preview,
+            &catalogue_root,
+            &CheatJourneyApplyApproval {
+                preview_id: preview.preview_id.clone(),
+                approved: true,
+                replacement_approved: false,
+            },
+            &CheatJourneyApplyOptions {
+                staging_root: crate::default_generated_cheat_staging_root().unwrap(),
+                operation_id: generate_shared_operation_id(),
+                timestamp_unix_seconds: 1,
+                history_root: default_shared_history_root().unwrap(),
+                backup_root: default_shared_backup_root().unwrap(),
+            },
+        )
+        .unwrap();
+        assert_eq!(applied.result.journal.status, SharedApplyStatus::Success);
+        (page, applied, destination.profile_cheat_root, root)
+    }
+
+    fn copy_of(
+        result: &archivefs_core::patch_manager::SharedApplyResult,
+    ) -> archivefs_core::patch_manager::SharedApplyResult {
+        archivefs_core::patch_manager::SharedApplyResult {
+            journal: result.journal.clone(),
+            journal_path: result.journal_path.clone(),
+            journal_failure: result.journal_failure.clone(),
+        }
+    }
+
+    fn assert_no_false_install(page: &mut UserCheatImportPageState) -> String {
+        assert!(
+            matches!(page.local_install, LocalInstallStage::Error { .. }),
+            "must be the failure state"
+        );
+        let text = local_panel_text(page);
+        assert!(!text.contains("Installed"), "{text}");
+        assert!(!text.contains("Undo this install"), "{text}");
+        text
+    }
+
+    #[test]
+    fn a_recorded_local_apply_shows_installed_with_undo() {
+        let _serial = INSTALLING_TESTS.lock().unwrap_or_else(|e| e.into_inner());
+        assert_writes_isolated();
+        let (mut page, applied, destination_root, root) = real_apply();
+        page.record_local_apply(destination_root, applied.result, applied.transaction_id);
+        let text = local_panel_text(&mut page);
+        assert!(text.contains("Installed"), "{text}");
+        assert!(text.contains("Undo this install"), "{text}");
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn a_real_apply_refused_by_the_filesystem_is_not_installed() {
+        use std::os::unix::fs::PermissionsExt;
+        let _serial = INSTALLING_TESTS.lock().unwrap_or_else(|e| e.into_inner());
+        assert_writes_isolated();
+        let (ctx, mut page, destination, root) = confirm_page();
+        let folder = destination.profile_cheat_root.join("snes9x");
+        let mode = |mode| std::fs::Permissions::from_mode(mode);
+        std::fs::set_permissions(&folder, mode(0o555)).unwrap();
+        // Root ignores the mode, so this environment cannot make Apply fail.
+        if std::fs::write(folder.join("probe"), "").is_ok() {
+            let _ = std::fs::remove_dir_all(&root);
+            return;
+        }
+        assert!(page.request_local_install_confirm());
+        page_frame(&ctx, &mut page, Some(destination), Some(true));
+        std::fs::set_permissions(&folder, mode(0o755)).unwrap();
+        let text = assert_no_false_install(&mut page);
+        assert!(
+            text.contains("Apply did not fully succeed: Failed"),
+            "{text}"
+        );
+        assert_eq!(written(&root), 0);
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn a_local_apply_without_a_recorded_success_is_not_installed() {
+        let _serial = INSTALLING_TESTS.lock().unwrap_or_else(|e| e.into_inner());
+        assert_writes_isolated();
+        let (mut page, applied, destination_root, root) = real_apply();
+        let journal_failed = SharedApplyFailure {
+            kind: SharedApplyFailureKind::JournalFailed,
+            path: None,
+            detail: "no space left for the journal".into(),
+        };
+        let mut cases = Vec::new();
+        for status in [
+            SharedApplyStatus::Failed,
+            SharedApplyStatus::PartialFailure,
+            // The status an Apply interrupted at a checkpoint still carries.
+            SharedApplyStatus::DryRun,
+        ] {
+            let mut result = copy_of(&applied.result);
+            result.journal.status = status;
+            cases.push(result);
+        }
+        // An already-installed file: `Success`, with no record of it.
+        let mut unrecorded = copy_of(&applied.result);
+        unrecorded.journal_path = None;
+        unrecorded.journal_failure = Some(journal_failed.clone());
+        cases.push(unrecorded);
+        let mut no_journal = copy_of(&applied.result);
+        no_journal.journal_path = None;
+        cases.push(no_journal);
+        for result in cases {
+            page.record_local_apply(destination_root.clone(), result, "t".into());
+            assert_no_false_install(&mut page);
+        }
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn a_failed_local_apply_says_what_happened_to_the_file() {
+        let _serial = INSTALLING_TESTS.lock().unwrap_or_else(|e| e.into_inner());
+        assert_writes_isolated();
+        let (_page, applied, _destination_root, root) = real_apply();
+        let detail = "destination was replaced but its durable checkpoint failed";
+        // Written, then the journal could not be finished: there is no Undo.
+        let mut unrecorded = copy_of(&applied.result);
+        unrecorded.journal.status = SharedApplyStatus::PartialFailure;
+        unrecorded.journal_path = None;
+        unrecorded.journal_failure = Some(SharedApplyFailure {
+            kind: SharedApplyFailureKind::JournalFailed,
+            path: None,
+            detail: "journal write failed".into(),
+        });
+        let message = local_journey_apply_failure_message(&unrecorded);
+        assert!(message.contains("the cheat file was written"), "{message}");
+        assert!(message.contains("cannot be undone from here"), "{message}");
+        assert!(message.contains("journal write failed"), "{message}");
+        // A `Failed` file that the engine says was still replaced: its detail
+        // reaches the user, and nothing claims the file was left alone.
+        let mut replaced = copy_of(&applied.result);
+        replaced.journal.status = SharedApplyStatus::Failed;
+        replaced.journal.entries[0].outcome = SharedApplyOutcome::WriteFailed;
+        replaced.journal.entries[0]
+            .failures
+            .push(SharedApplyFailure {
+                kind: SharedApplyFailureKind::JournalFailed,
+                path: None,
+                detail: detail.into(),
+            });
+        let message = local_journey_apply_failure_message(&replaced);
+        assert!(message.starts_with("Apply did not fully succeed: Failed"));
+        assert!(message.contains(detail), "{message}");
+        // The starting status never reaches the user as if it were an outcome.
+        let mut interrupted = copy_of(&applied.result);
+        interrupted.journal.status = SharedApplyStatus::DryRun;
+        interrupted.journal.entries[0].outcome = SharedApplyOutcome::WriteFailed;
+        let message = local_journey_apply_failure_message(&interrupted);
+        assert!(!message.contains("DryRun"), "{message}");
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn an_undone_local_apply_no_longer_shows_installed() {
+        let _serial = INSTALLING_TESTS.lock().unwrap_or_else(|e| e.into_inner());
+        assert_writes_isolated();
+        let (mut page, applied, destination_root, root) = real_apply();
+        page.record_local_apply(destination_root, applied.result, applied.transaction_id);
+        page.start_local_undo();
+        page.confirm_local_undo();
+        assert!(matches!(page.local_install, LocalInstallStage::Done { .. }));
+        let text = local_panel_text(&mut page);
+        assert!(!text.contains("Installed"), "{text}");
+        assert!(!text.contains("Undo this install"), "{text}");
+        assert_eq!(written(&root), 0);
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn a_refused_local_undo_is_not_reported_as_rolled_back() {
+        let _serial = INSTALLING_TESTS.lock().unwrap_or_else(|e| e.into_inner());
+        assert_writes_isolated();
+        let (mut page, applied, destination_root, root) = real_apply();
+        page.record_local_apply(destination_root, applied.result, applied.transaction_id);
+        page.start_local_undo();
+        // The user's file changes after the Undo preview: Undo must refuse.
+        let installed = walk_files(&root.join("retroarch/cheats"));
+        std::fs::write(&installed[0], "edited after the preview").unwrap();
+        page.confirm_local_undo();
+        assert_no_false_install(&mut page);
+        assert_eq!(
+            std::fs::read_to_string(&installed[0]).unwrap(),
+            "edited after the preview"
+        );
+        let _ = std::fs::remove_dir_all(&root);
     }
 }

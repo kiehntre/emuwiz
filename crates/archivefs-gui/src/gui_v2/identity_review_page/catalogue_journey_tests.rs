@@ -5,12 +5,16 @@ use super::*;
 #[test]
 fn verification_navigation_preserves_canonical_platform_and_never_mutates_identity() {
     let game = Game::from_archive(crate::gui_v2::tests::archive(1, "Fixture", Some("amiga")));
+    assert_eq!(
+        super::super::game_verification_guidance::Action::SelectDat.route(&game),
+        Route::PlatformCheck("Amiga".into())
+    );
+    // Verify / Re-check this game read only this game, never the platform.
     for action in [
-        super::super::game_verification_guidance::Action::SelectDat,
         super::super::game_verification_guidance::Action::Audit,
         super::super::game_verification_guidance::Action::Recheck,
     ] {
-        assert_eq!(action.route(&game), Route::PlatformCheck("Amiga".into()));
+        assert_eq!(action.route(&game), Route::GameCheck(game.archive.id));
     }
     assert_eq!(
         setup_verification_route(Some("unknown future platform")),

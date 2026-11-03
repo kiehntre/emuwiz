@@ -182,24 +182,32 @@ fn register_finalise_self() -> Result<(), String> {
     if std::fs::read_to_string(&path).ok().as_deref() == Some(text.as_str()) {
         return Ok(());
     }
-    let staging = dir.join(format!(".{pid}.staging"));
-    let written = std::fs::OpenOptions::new()
-        .write(true)
-        .create(true)
-        .truncate(true)
-        .open(&staging)
-        .and_then(|mut file| {
-            std::io::Write::write_all(&mut file, text.as_bytes())?;
-            file.sync_all()
-        })
-        .and_then(|()| std::fs::rename(&staging, &path));
-    if let Err(error) = written {
-        let _ = std::fs::remove_file(&staging);
-        return Err(format!(
-            "cannot register this finalise-capable writer: {error}"
-        ));
-    }
-    Ok(())
+    publish_record(&dir, &path, &text)
+        .map_err(|error| format!("cannot register this finalise-capable writer: {error}"))
+}
+
+/// Writes `text` to a staging file of this call's own, flushes it and renames
+/// it over `path`, so a reader sees either the old record or the whole new one.
+///
+/// The staging file is an exclusively created, randomly named temporary file
+/// (`tempfile`, as elsewhere in this crate), so no two calls ever share one,
+/// whether threads of this process or a crashed earlier process with a reused
+/// pid. A shared per-pid name let one thread rename another's staging file away
+/// and fail that thread's registration with `ENOENT`. On any failure only the
+/// file this call created is removed, and the error is returned unchanged.
+/// The name starts with a dot and is never a bare pid, so registry sweeps and
+/// lookups never mistake it for a record.
+fn publish_record(dir: &Path, path: &Path, text: &str) -> std::io::Result<()> {
+    let mut staging = tempfile::Builder::new()
+        .prefix(&format!(".{}.", std::process::id()))
+        .suffix(".staging")
+        .tempfile_in(dir)?;
+    std::io::Write::write_all(&mut staging, text.as_bytes())?;
+    staging.as_file().sync_all()?;
+    staging
+        .persist(path)
+        .map(drop)
+        .map_err(|failed| failed.error)
 }
 
 fn finalise_capable(root: &Path, pid: u32) -> bool {
@@ -302,23 +310,8 @@ fn write_record(dir: &Path, pid: u32, text: &str) -> Result<(), String> {
     if std::fs::read_to_string(&path).ok().as_deref() == Some(text) {
         return Ok(());
     }
-    let staging = dir.join(format!(".{pid}.reader.staging"));
-    // Named for this pid, so a leftover is a crashed earlier process's own;
-    // clear it rather than refusing every later process with this pid.
-    let _ = std::fs::remove_file(&staging);
-    std::fs::OpenOptions::new()
-        .write(true)
-        .create_new(true)
-        .open(&staging)
-        .and_then(|mut file| {
-            std::io::Write::write_all(&mut file, text.as_bytes())?;
-            file.sync_all()
-        })
-        .and_then(|()| std::fs::rename(&staging, &path))
-        .map_err(|error| {
-            let _ = std::fs::remove_file(&staging);
-            format!("cannot register this read-only EmuWiz: {error}")
-        })
+    publish_record(dir, &path, text)
+        .map_err(|error| format!("cannot register this read-only EmuWiz: {error}"))
 }
 
 /// Registers a read-only invocation (no journal work is expected) in the
@@ -477,23 +470,8 @@ fn register_self() -> Result<(), String> {
     if std::fs::read_to_string(&path).ok().as_deref() == Some(text.as_str()) {
         return Ok(());
     }
-    static ATTEMPT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
-    let attempt = ATTEMPT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-    let staging = dir.join(format!(".{pid}.{attempt}.staging"));
-    let written = std::fs::OpenOptions::new()
-        .write(true)
-        .create_new(true)
-        .open(&staging)
-        .and_then(|mut file| {
-            std::io::Write::write_all(&mut file, text.as_bytes())?;
-            file.sync_all()
-        })
-        .and_then(|()| std::fs::rename(&staging, &path));
-    if let Err(error) = written {
-        let _ = std::fs::remove_file(&staging);
-        return Err(format!("cannot register this sealing writer: {error}"));
-    }
-    Ok(())
+    publish_record(&dir, &path, &text)
+        .map_err(|error| format!("cannot register this sealing writer: {error}"))
 }
 
 /// Held by a running sealing-capable program; removes its registration when
@@ -1117,5 +1095,106 @@ pub(crate) mod tests {
             assert!(text.starts_with("protocol=finalised-state-v1\n"), "{text}");
         }
         assert!(!path.exists());
+    }
+
+    /// Runs `register` on many threads released together by a barrier, all
+    /// sharing one fresh registry (same fake process root), and returns every
+    /// failure. Each round uses a new directory, so every call is a first-time
+    /// registration that must stage and rename.
+    fn concurrent_first_registrations(
+        register: fn() -> Result<(), String>,
+        registry: fn() -> PathBuf,
+    ) -> Vec<String> {
+        const THREADS: usize = 32;
+        const ROUNDS: usize = 40;
+        let mut failures = Vec::new();
+        for _ in 0..ROUNDS {
+            let root = tempfile::tempdir().unwrap();
+            let barrier = std::sync::Arc::new(std::sync::Barrier::new(THREADS));
+            let workers: Vec<_> = (0..THREADS)
+                .map(|_| {
+                    let root = root.path().to_path_buf();
+                    let barrier = barrier.clone();
+                    std::thread::spawn(move || {
+                        set_process_root_for_this_thread(Some(root));
+                        let _reset = Reset;
+                        barrier.wait();
+                        register()
+                    })
+                })
+                .collect();
+            for worker in workers {
+                if let Err(error) = worker.join().unwrap() {
+                    failures.push(error);
+                }
+            }
+            set_process_root_for_this_thread(Some(root.path().to_path_buf()));
+            let _reset = Reset;
+            let dir = registry();
+            let names: Vec<_> = std::fs::read_dir(&dir)
+                .unwrap()
+                .map(|entry| entry.unwrap().file_name().into_string().unwrap())
+                .collect();
+            // Exactly the one record; no staging file is left behind.
+            assert_eq!(names, vec![std::process::id().to_string()], "{dir:?}");
+        }
+        failures
+    }
+
+    #[test]
+    fn concurrent_first_finalise_registrations_in_one_process_all_succeed() {
+        let failures = concurrent_first_registrations(register_finalise_self, || {
+            finalise_registrations_dir().unwrap()
+        });
+        assert!(
+            failures.is_empty(),
+            "{} failed: {failures:?}",
+            failures.len()
+        );
+    }
+
+    #[test]
+    fn concurrent_first_reader_records_in_one_process_all_succeed() {
+        fn register() -> Result<(), String> {
+            let dir = runtime_registry_in(&runtime_base(), FINALISE_WRITERS_DIR, true).unwrap();
+            write_record(&dir, std::process::id(), "reader record\n")
+        }
+        let failures = concurrent_first_registrations(register, || {
+            runtime_registry_in(&runtime_base(), FINALISE_WRITERS_DIR, false).unwrap()
+        });
+        assert!(
+            failures.is_empty(),
+            "{} failed: {failures:?}",
+            failures.len()
+        );
+    }
+
+    #[test]
+    fn a_failed_publication_is_reported_and_removes_only_its_own_staging_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let unrelated = dir.path().join(format!(".{}.staging", std::process::id()));
+        std::fs::write(&unrelated, b"not ours").unwrap();
+        // A directory at the record's name makes the final rename fail.
+        let path = dir.path().join("record");
+        std::fs::create_dir(&path).unwrap();
+        std::fs::write(path.join("keep"), b"").unwrap();
+        let error = publish_record(dir.path(), &path, "text").unwrap_err();
+        assert_ne!(error.kind(), std::io::ErrorKind::NotFound, "{error}");
+        let mut names: Vec<_> = std::fs::read_dir(dir.path())
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name().into_string().unwrap())
+            .collect();
+        names.sort();
+        let unrelated_name = unrelated.file_name().unwrap().to_str().unwrap().to_owned();
+        assert_eq!(names, vec![unrelated_name, "record".to_owned()]);
+        assert_eq!(std::fs::read(&unrelated).unwrap(), b"not ours");
+        // A registration that hits the same failure fails closed.
+        std::fs::create_dir(dir.path().join("1")).unwrap();
+        let refusal = write_record(dir.path(), 1, "text").unwrap_err();
+        assert!(
+            refusal.starts_with("cannot register this read-only EmuWiz: "),
+            "{refusal}"
+        );
+        assert_eq!(std::fs::read_dir(dir.path()).unwrap().count(), 3);
     }
 }
