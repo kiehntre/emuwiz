@@ -571,12 +571,16 @@ under a target triple, after `.fingerprint` and `deps` have been retired. Other
 profile/output classification (`deps`, `.fingerprint`, `build`, examples and
 executables with `.d` files) is unchanged. Post-retirement binary residue (Fix B) is the only addition:
 a file directly in a `debug` profile (or `<triple>/debug`) qualifies only if every condition below holds, freshly:
-- the profile is markerless: none of `.fingerprint`, `deps`, `build`, `examples` or `incremental` remains;
+- the profile is markerless: none of `.fingerprint`, `deps`, `build`, `examples` or `incremental` remains,
+  no leftover compiler file (`.d`, `.rlib`, `.rmeta`, `.so`, ...) sits in it, and it can be listed;
 - the name is Cargo-binary-shaped (letters, digits, `_`, `-`; no dot) and does not contain `journal`;
 - it is a regular file, executable, owned by this user, with exactly one link;
 - it starts with the ELF magic, read through an `O_NOFOLLOW` descriptor whose identity matches the `lstat`.
 
-The planner selects it as `post-retirement binary residue`, and the executor re-applies the same predicate.
+The planner selects it as `post-retirement binary residue`. The executor re-applies the same predicate to the
+very `lstat` it compares with the manifest identity, so a reappeared, relinked or swapped file is held.
+Any directory directly under the cache whose name has three or more hyphen-separated parts is treated as a
+target triple, here as elsewhere in the tool.
 A changed, relinked, swapped or non-ELF file is held. `release` binaries are never selected this way, because
 they are the usual install and rollback source. A symlink, a script, a hard link, a suffixed name, or a binary
 beside remaining Cargo output stays unrecognised, so the residue gate keeps holding the worktree. `tests`/`benches`, unknown files and
@@ -684,8 +688,9 @@ timeouts are `ORPHAN_REPO_UNVERIFIED`.
 
 ### Owner-attested orphan route (`GIT_PRESERVED_ATTESTED`)
 
-Builds recorded before cargo-iso kept `checkout` evidence can never use `GIT_PRESERVED`
-(`ORPHAN_EVIDENCE_MISSING`). For those only, a manifest group may set
+A record without cargo-iso `checkout` evidence can never use `GIT_PRESERVED` (`ORPHAN_EVIDENCE_MISSING`).
+That covers builds made before evidence was recorded, and also builds where cargo-iso could not establish it,
+such as a main (non-linked) checkout or a broken gitdir back-link. For any such record, a manifest group may set
 `"orphan_route": "GIT_PRESERVED_ATTESTED"` with `"orphan_attestation": {"repo", "worktree", "head",
 "attested_by", "reason"}` (all non-empty strings). The attestation lives in the manifest whose digest the owner
 approves, so it is an owner decision bound to that exact list; it only nominates the repository, and every
@@ -706,11 +711,14 @@ Holds:
 - `ORPHAN_SOURCE_UNKNOWN`;
 - `GIT_HISTORY_NOT_PRESERVED`.
 
-A record that does carry `checkout` evidence is always judged by the stronger evidence route, so an attestation
-can never bypass moved-checkout detection. `GIT_PRESERVED` without evidence still refuses, and an attestation
+A record that has a `checkout` key at all (valid or malformed) is always judged by the stronger evidence route,
+with the attested repository required to match the recorded one, so an attestation can never bypass moved-checkout
+detection or upgrade a corrupted record. The receipt's `orphan_route` names the route requested; in that case the
+evidence route made the decision. `GIT_PRESERVED` without evidence still refuses, and an attestation
 never upgrades it. The receipt records the route and the attestation. The pin, lock, census, idle, identity,
 journal and approved-manifest gates are unchanged.
 
-The limit is the same as for the evidence route, and is weaker here because there is no checkout inode: a
-checkout moved by hand AND pruned is indistinguishable from a removed one. Only regenerable compiler output is
-removed; the HEAD is already in `origin/main`, and git, source and the repository are never touched.
+The limit is wider than the evidence route's, because there is no checkout inode to compare: ANY moved checkout,
+including one moved with `git worktree move` (git then names only the new path), is indistinguishable from a
+removed one. A moved checkout builds into a different, hash-bound target, so the cost is a rebuild. Only regenerable
+compiler output is removed; the HEAD is already in `origin/main`, and git, source and the repository are never touched.

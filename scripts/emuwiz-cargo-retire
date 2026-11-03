@@ -565,6 +565,15 @@ def remove_entry(dir_fd, name, expect, root_dev, counters, top=True, snap=None, 
 # -------------------------------------------------------------- evaluation
 
 
+def residue_layout(rel_parts, profile):
+    """True for a path directly in a markerless `debug` (or <triple>/debug) profile: the only
+    class accepted there is post-retirement binary residue (Fix B)."""
+    return (len(rel_parts) in (2, 3) and os.path.basename(profile) == F.RESIDUE_PROFILE
+            and rel_parts[-2] == F.RESIDUE_PROFILE
+            and (len(rel_parts) == 2 or re.fullmatch(r"[A-Za-z0-9_]+(?:-[A-Za-z0-9_]+){2,}", rel_parts[0]))
+            and F.markerless_profile(profile))
+
+
 def entry_class_problem(rel_parts, parent_path):
     """Why a manifest path is not an enumerated compiler artifact, else None."""
     if not rel_parts or any(p in ("", ".", "..") for p in rel_parts):
@@ -579,13 +588,12 @@ def entry_class_problem(rel_parts, parent_path):
     profile = parent_path
     # Fix B: a binary left in a markerless `debug` profile by an earlier retirement.
     # Same predicate as the planner, re-evaluated now (content, shape, owner, links).
-    if (os.path.basename(profile) == F.RESIDUE_PROFILE and rel_parts[-2] == F.RESIDUE_PROFILE
-            and (len(rel_parts) == 2 or re.fullmatch(r"[A-Za-z0-9_]+(?:-[A-Za-z0-9_]+){2,}", rel_parts[0]))):
+    # evaluate_entry re-applies the predicate to the very lstat it compares with the manifest.
+    if residue_layout(rel_parts, profile):
         full = os.path.join(profile, name)
         if F.residue_executable(full):
             return None
-        if (not os.path.lexists(full) and F.RESIDUE_NAME_RE.match(name)
-                and "journal" not in name.lower() and F.markerless_profile(profile)):
+        if not os.path.lexists(full) and F.RESIDUE_NAME_RE.match(name) and "journal" not in name.lower():
             return None  # absence is handled by the identity check (ALREADY_ABSENT)
     has_marker = any(
         os.path.isdir(os.path.join(profile, marker)) and not os.path.islink(os.path.join(profile, marker))
@@ -689,7 +697,8 @@ def orphan_git_preserved_owner(group, record, target):
     if os.path.normpath(wt) != wt:
         return "OWNER_UNVERIFIED", "recorded worktree path is not normalised"
     ident = (ev or {}).get("worktree_identity") if isinstance(ev, dict) else None
-    admin, common = (ev or {}).get("gitdir"), (ev or {}).get("common_dir")
+    evd = ev if isinstance(ev, dict) else {}  # a malformed (non-dict) value is no evidence, never a crash
+    admin, common = evd.get("gitdir"), evd.get("common_dir")
     if not (isinstance(ident, dict) and isinstance(ident.get("dev"), int) and isinstance(ident.get("ino"), int)
             and isinstance(admin, str) and isinstance(common, str) and os.path.isabs(admin) and os.path.isabs(common)):
         return "ORPHAN_EVIDENCE_MISSING", "no recorded checkout continuity evidence (gitdir, common dir, identity)"
@@ -775,15 +784,21 @@ def orphan_attested_owner(group, record, target):
       * no administrative entry `<repo>/.git/worktrees/*/gitdir` points at the worktree, every entry
         is readable, and `git worktree list` does not register the path;
       * the HEAD is a commit contained in refs/remotes/origin/main of that repository.
-    Same documented limit as the evidence route: a checkout moved by hand AND pruned is
-    indistinguishable from a removed one; the pin, lock, census, idle and journal gates still apply,
-    and only regenerable compiler output is ever removed."""
+    Limit (wider than the evidence route, which compares the checkout inode): ANY moved checkout,
+    `git worktree move` included, is indistinguishable from a removed one, because git then names only
+    the new path. A moved checkout builds into a different, hash-bound target, so the cost is a rebuild
+    of regenerable compiler output; the pin, lock, census, idle and journal gates still apply."""
     att = group.get("orphan_attestation")
     if not isinstance(att, dict) or any(not isinstance(att.get(k), str) or not att.get(k).strip()
                                         for k in ATTESTATION_KEYS):
         return "ORPHAN_ATTESTATION_INVALID", "orphan_attestation needs repo, worktree, head, attested_by, reason"
-    if isinstance(record.get("checkout"), dict):
-        return orphan_git_preserved_owner(dict(group, orphan_route=ORPHAN_ROUTE), record, target)
+    if "checkout" in record:
+        # Evidence (or a malformed value) exists: the stronger evidence route decides, and the
+        # attested repository must be the one recorded at build time (a mismatch is a hold).
+        if group.get("orphan_repo") is not None and group.get("orphan_repo") != att["repo"]:
+            return "ORPHAN_REPO_UNVERIFIED", "manifest orphan_repo differs from the attested repository"
+        return orphan_git_preserved_owner(dict(group, orphan_route=ORPHAN_ROUTE, orphan_repo=att["repo"]),
+                                          record, target)
     wt, head = record.get("worktree"), record.get("head")
     if not record.get("last_start") or not wt or not os.path.isabs(wt):
         return "SOURCE_MISSING", "orphan route needs a recorded cargo-iso build and worktree path"
@@ -1005,6 +1020,9 @@ def evaluate_entry(entry_path, group, dev_expect):
         return "UNREADABLE", rel
     if (st.st_dev, st.st_ino, st.st_mode) != dev_expect:
         return "PATH_IDENTITY_MISMATCH", rel
+    if residue_layout(rel, parent) and not F.residue_executable(norm, st):
+        # same stat that matched the manifest: a reappeared, relinked or swapped file is held
+        return "NOT_A_COMPILER_ARTIFACT", rel
     if stat.S_ISLNK(st.st_mode):
         return "SYMLINK", rel
     if stat.S_ISDIR(st.st_mode):

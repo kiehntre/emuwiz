@@ -1650,8 +1650,14 @@ def select_artifacts(target, root_dev):
 def markerless_profile(profile):
     """True when no Cargo output subtree remains in a profile directory (nothing of
     ARTIFACT_DIRS exists, as a directory or otherwise). Only then can a bare binary
-    be post-retirement residue rather than part of a live or partial build."""
-    return not any(os.path.lexists(os.path.join(profile, n)) for n in ARTIFACT_DIRS)
+    be post-retirement residue rather than part of a live or partial build. Leftover
+    compiler files (`.d`, `.rlib`, `.rmeta`, ...) or an unlistable profile also disqualify."""
+    if any(os.path.lexists(os.path.join(profile, n)) for n in ARTIFACT_DIRS):
+        return False
+    try:
+        return not any(n.endswith(ARTIFACT_FILE_SUFFIXES) for n in os.listdir(profile))
+    except OSError:
+        return False
 
 
 def residue_executable(path, st=None):

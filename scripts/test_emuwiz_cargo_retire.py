@@ -1487,12 +1487,37 @@ class ResidueExecutable(Base):
     def test_content_swapped_after_planning_is_held(self):
         wt, t, exe = self.residue()
         g = self.group(wt, t, ["debug/emuwiz"])
+        st = os.lstat(exe)
         with open(exe, "r+b") as handle:  # same inode, no longer an ELF binary
             handle.write(b"#!/bin/sh")
+        os.utime(exe, ns=(st.st_atime_ns, st.st_mtime_ns))  # isolate the predicate from the activity gate
         path, digest = self.manifest([g])
         rc, r = self.run_retire(path, digest, execute=True, window=True)
-        self.assertNotEqual(self.outcomes(r)["debug/emuwiz"][0], "REMOVED", r)
+        self.assertEqual(self.outcomes(r)["debug/emuwiz"][1], "NOT_A_COMPILER_ARTIFACT", r)
         self.assertTrue(os.path.lexists(exe))
+
+    def test_residue_under_a_target_triple_is_retired(self):
+        rel = "x86_64-unknown-linux-gnu/debug/emuwiz"
+        wt, t, exe = self.residue(profile="x86_64-unknown-linux-gnu/debug")
+        self.assertIn(rel, self.selected(t))
+        out, r = self.retire(wt, t, [rel])
+        self.assertEqual(out[rel][0], "REMOVED", r)
+
+    def test_planned_residue_already_gone_is_absent_not_removed(self):
+        wt, t, exe = self.residue()
+        g = self.group(wt, t, ["debug/emuwiz"])
+        os.unlink(exe)
+        path, digest = self.manifest([g])
+        rc, r = self.run_retire(path, digest, execute=True, window=True)
+        self.assertEqual(self.outcomes(r)["debug/emuwiz"][1], "ALREADY_ABSENT", r)
+        self.assertTrue(self.exists(t, "debug/emuwiz-test-env/profile/library.db"))
+
+    def test_binary_beside_leftover_compiler_files_is_not_residue(self):
+        wt, t, exe = self.residue()
+        with open(os.path.join(t, "debug", "libother.rlib"), "wb") as handle:
+            handle.write(b"x" * 64)
+        self.age(t, 10)
+        self.assert_refused(wt, t, exe, "debug/emuwiz")
 
 
 class AttestedOrphanRoute(Base):
@@ -1607,6 +1632,31 @@ class AttestedOrphanRoute(Base):
         codes, _ = self.holds(g)
         self.assertIn("ORPHAN_SOURCE_MOVED", codes)
         self.assertTrue(self.exists(t, "debug/deps"))
+
+    def test_malformed_checkout_value_is_judged_by_the_evidence_route(self):
+        wt, t, g = self.attested("wt-att-null")
+        for value in (None, [], "x", False):
+            rec_path, rec = self.record_of(t)
+            rec["checkout"] = value
+            T.jdump(rec, rec_path)
+            for route in ("GIT_PRESERVED_ATTESTED", "GIT_PRESERVED"):
+                codes, _ = self.holds(dict(g, orphan_route=route), f"null-{route}-{value!r}.json")
+                self.assertIn("ORPHAN_EVIDENCE_MISSING", codes, (route, value))
+        self.assertTrue(self.exists(t, "debug/deps"))
+
+    def test_attested_repository_must_match_recorded_evidence(self):
+        wt, t, g = self.attested("wt-att-ev", strip=False)
+        other = os.path.join(self.tmp, "other-repo-att")
+        self.git("init", "-q", other)
+        self.git("-C", other, "fetch", "-q", os.path.join(self.repo, ".git"))
+        self.git("-C", other, "update-ref", "refs/remotes/origin/main", g["source_head"])
+        att = dict(g["orphan_attestation"], repo=os.path.realpath(other))
+        codes, _ = self.holds(dict(g, orphan_attestation=att, orphan_repo=None), "ev-mismatch.json")
+        self.assertIn("ORPHAN_REPO_UNVERIFIED", codes)
+        self.assertTrue(self.exists(t, "debug/deps"))
+        codes, r = self.holds(g, "ev-ok.json")  # matching repository: the evidence route retires it
+        self.assertEqual(codes, set(), r)
+        self.assertFalse(self.exists(t, "debug/deps"))
 
     def test_pin_still_holds_an_attested_orphan(self):
         wt, t, g = self.attested("wt-att-pin")
