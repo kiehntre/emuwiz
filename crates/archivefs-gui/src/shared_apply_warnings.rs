@@ -192,6 +192,7 @@ pub(crate) mod test_support {
                     replacement_approved: true,
                     verification_succeeded: true,
                     outcome: SharedApplyOutcome::ReplacedExisting,
+                    publication: Default::default(),
                     stages: Vec::new(),
                     warnings: vec![WARNING.into()],
                     failures: Vec::new(),

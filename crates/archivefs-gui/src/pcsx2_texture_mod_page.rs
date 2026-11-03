@@ -7,13 +7,14 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use archivefs_core::game_identity::GameIdentityReport;
 use archivefs_core::patch_manager::{
     Pcsx2Profile, Pcsx2TexturePackApplyResult, Pcsx2TexturePackPlan,
-    Pcsx2TexturePackPreviewRequest, SharedApplyConfirmation, SharedApplyEntry,
-    SharedApplyFailureKind, SharedApplyOptions, SharedApplyOutcome, SharedApplyResult,
-    SharedApplyStatus, SharedRollbackConfirmation, SharedRollbackOptions, SharedRollbackOutcome,
-    SharedRollbackPreview, SharedRollbackResult, SharedTransactionPlan,
+    Pcsx2TexturePackPreviewRequest, SharedApplyConfirmation, SharedApplyEntry, SharedApplyOptions,
+    SharedApplyOutcome, SharedApplyResult, SharedApplyStatus, SharedDestinationOutcome,
+    SharedEntryDestination, SharedRollbackConfirmation, SharedRollbackOptions,
+    SharedRollbackOutcome, SharedRollbackPreview, SharedRollbackResult, SharedTransactionPlan,
     build_pcsx2_texture_pack_preview, build_pcsx2_texture_pack_transaction_plan,
     default_shared_backup_root, default_shared_history_root, execute_pcsx2_texture_pack_apply,
     execute_shared_rollback, generate_shared_operation_id, preview_shared_rollback,
+    shared_destination_outcome, shared_entry_destination, shared_rollback_can_reverse,
     verified_pcsx2_texture_identity,
 };
 use eframe::egui;
@@ -260,6 +261,22 @@ fn show_applied_summary(
     crate::shared_apply_warnings::show(ui, warnings);
 }
 
+/// The engine's classification of what this install (and any automatic
+/// rollback) left at the destination. The page never infers publication
+/// from outcomes or failure wording.
+fn destination_outcome(
+    result: &SharedApplyResult,
+    rollback: Option<&SharedRollbackResult>,
+) -> SharedDestinationOutcome {
+    shared_destination_outcome(result, rollback)
+}
+
+/// Each journal entry's destination state, ignoring any rollback: did this
+/// entry's output reach the destination (or might it have)?
+fn reached_destination(entry: &SharedApplyEntry) -> bool {
+    shared_entry_destination(entry, None) != SharedEntryDestination::NothingPublished
+}
+
 /// What did and did not happen, for any status other than `Success`.
 fn incomplete_install_lines(
     result: &SharedApplyResult,
@@ -270,86 +287,70 @@ fn incomplete_install_lines(
         return Vec::new();
     }
     let entries = &result.journal.entries;
-    let written = entries.iter().filter(|entry| written(entry)).count();
-    let rollback_line = match rollback {
-        Some(rollback) if rollback.status == SharedApplyStatus::Success => {
+    let reached = entries
+        .iter()
+        .filter(|entry| reached_destination(entry))
+        .count();
+    let outcome = destination_outcome(result, rollback);
+    let rollback_line = match (rollback, outcome) {
+        (_, SharedDestinationOutcome::Reversed) => {
             "Automatic rollback completed and reversed this install's recorded changes, so there is nothing to undo.".to_string()
         }
-        Some(rollback) => format!(
+        (Some(rollback), _) if rollback.status != SharedApplyStatus::Success => format!(
             "Automatic rollback did not complete ({:?}), so some files may still come from this pack. Check the destination before using this profile.",
             rollback.status
         ),
-        None if written == 0 => {
-            "Automatic rollback did not run because no file was written or changed.".to_string()
+        (
+            Some(_),
+            SharedDestinationOutcome::PublishedNeedsRecovery | SharedDestinationOutcome::Uncertain,
+        ) => {
+            "Automatic rollback reversed the files it could, but at least one file it cannot reverse may still come from this pack. Check the destination before using this profile.".to_string()
         }
-        None => "Automatic rollback did not run, so the files written before the failure are still in place. Check the destination before using this profile.".to_string(),
+        (_, SharedDestinationOutcome::NothingPublished) => {
+            "No file from this pack reached the destination, so there is nothing to undo.".to_string()
+        }
+        (None, SharedDestinationOutcome::Uncertain) => "Automatic rollback did not run, and EmuWiz cannot confirm whether files from this pack are in place. Check the destination before using this profile.".to_string(),
+        _ => "Automatic rollback did not run, so the files written before the failure are still in place. Check the destination before using this profile.".to_string(),
     };
     vec![
         format!(
-            "The install did not complete ({status:?}): {written} of {} file(s) were written or may have been changed on disk.",
+            "The install did not complete ({status:?}): {reached} of {} file(s) were written or may have been changed on disk.",
             entries.len()
         ),
         rollback_line,
     ]
 }
 
-/// Core failure details that mean the pack's file reached the destination
-/// before the entry failed (shared_transaction.rs). The journal has no
-/// structured "published" fact yet, so these literals are matched exactly.
-const REPLACED_THEN_CHECKPOINT_FAILED: &str =
-    "destination was replaced but its durable checkpoint failed";
-const RESTORE_AFTER_FAILED_VERIFICATION_FAILED: &str =
-    "restoring the previous live file state failed";
-
-/// Whether this entry may have changed the destination on disk: a completed
-/// write, or a failure the core records only after the pack's file was
-/// published (checkpoint failed after the replace, a verified-checkpoint
-/// failure, a failed restore after failed verification, a displaced file kept,
-/// or a published file that changed straight afterwards). A clean refusal
-/// (temporary file removed, destination untouched) does not count.
-fn written(entry: &SharedApplyEntry) -> bool {
-    matches!(
-        entry.outcome,
-        SharedApplyOutcome::InstalledNew | SharedApplyOutcome::ReplacedExisting
-    ) || entry.final_destination_digest.is_some()
-        || entry.failures.iter().any(|failure| {
-            matches!(
-                failure.kind,
-                SharedApplyFailureKind::DisplacedFileKept
-                    | SharedApplyFailureKind::PublishedUnverified
-            ) || failure.detail == REPLACED_THEN_CHECKPOINT_FAILED
-                || failure
-                    .detail
-                    .contains(RESTORE_AFTER_FAILED_VERIFICATION_FAILED)
-        })
-}
-
-/// Whether the core's rollback can act on this entry. Other written entries
-/// preview as NoChangeRequired, so only manual recovery helps them.
-fn undo_can_act(entry: &SharedApplyEntry) -> bool {
-    matches!(
-        entry.outcome,
-        SharedApplyOutcome::InstalledNew | SharedApplyOutcome::ReplacedExisting
-    ) || entry.failures.iter().any(|failure| {
-        matches!(
-            failure.kind,
-            SharedApplyFailureKind::DisplacedFileKept | SharedApplyFailureKind::PublishedUnverified
-        )
-    })
-}
-
-fn rollback_succeeded(rollback: Option<&SharedRollbackResult>) -> bool {
-    rollback.is_some_and(|rollback| rollback.status == SharedApplyStatus::Success)
-}
-
-/// An install that wrote files and was not confirmed reversed: automatic
-/// rollback failed, stopped part way, or did not run.
+/// Files that may come from this pack and were not reversed, as the engine
+/// classifies them (definitely published, or uncertain).
 fn recovery_required(result: &SharedApplyResult, rollback: Option<&SharedRollbackResult>) -> bool {
-    result.journal.status != SharedApplyStatus::Success
-        && result.journal.entries.iter().any(written)
-        && !rollback_succeeded(rollback)
+    matches!(
+        destination_outcome(result, rollback),
+        SharedDestinationOutcome::PublishedNeedsRecovery | SharedDestinationOutcome::Uncertain
+    )
 }
 
+/// Entries still needing recovery: published or uncertain, not reversed.
+fn unrecovered_entries<'a>(
+    result: &'a SharedApplyResult,
+    rollback: Option<&'a SharedRollbackResult>,
+) -> impl Iterator<Item = &'a SharedApplyEntry> + 'a {
+    result
+        .journal
+        .entries
+        .iter()
+        .enumerate()
+        .filter(move |(index, entry)| {
+            let rollback_entry = rollback.and_then(|value| value.preview.entries.get(*index));
+            matches!(
+                shared_entry_destination(entry, rollback_entry),
+                SharedEntryDestination::NeedsRecovery
+                    | SharedEntryDestination::Uncertain
+                    | SharedEntryDestination::Published
+            )
+        })
+        .map(|(_, entry)| entry)
+}
 /// What Undo this page may open for a finished install worker.
 #[derive(Debug, PartialEq, Eq)]
 enum UndoChoice {
@@ -369,15 +370,19 @@ fn undo_choice(result: &SharedApplyResult, rollback: Option<&SharedRollbackResul
         UndoChoice::None
     } else if result.journal.status == SharedApplyStatus::Success {
         UndoChoice::Undo
-    } else if recovery_required(result, rollback) && result.journal.entries.iter().any(undo_can_act)
+    } else if recovery_required(result, rollback)
+        && unrecovered_entries(result, rollback).all(shared_rollback_can_reverse)
     {
+        // Only when the core's rollback can reverse every file left in place;
+        // otherwise a "successful" Undo would leave a file behind.
         UndoChoice::CheckUndo
     } else {
         UndoChoice::None
     }
 }
 
-/// Where each written file stands, and what the user can do by hand.
+/// Where each file that reached the destination stands, and what the user can
+/// do by hand.
 fn recovery_lines(
     result: &SharedApplyResult,
     rollback: Option<&SharedRollbackResult>,
@@ -387,18 +392,14 @@ fn recovery_lines(
         "This install was not fully reversed. Destination folder: {}",
         destination.display()
     )];
-    for entry in result.journal.entries.iter().filter(|entry| written(entry)) {
+    for (index, entry) in result.journal.entries.iter().enumerate() {
+        if !reached_destination(entry) {
+            continue;
+        }
         let plan = &entry.plan_entry;
         let path =
             Path::new(&plan.destination_root.display).join(&plan.destination_relative_path.display);
-        let rolled_back = rollback.and_then(|rollback| {
-            rollback.preview.entries.iter().find(|candidate| {
-                candidate
-                    .destination
-                    .as_ref()
-                    .is_some_and(|destination| Path::new(&destination.display) == path)
-            })
-        });
+        let rolled_back = rollback.and_then(|rollback| rollback.preview.entries.get(index));
         let line = match rolled_back.map(|entry| entry.outcome) {
             Some(SharedRollbackOutcome::RestoredBackup) => {
                 "your original was restored by automatic rollback.".to_string()
@@ -434,9 +435,9 @@ fn recovery_lines(
         };
         lines.push(format!("{}: {line}", path.display()));
     }
-    let undo_can_help = result.journal.entries.iter().any(undo_can_act);
+    let undo_can_help = unrecovered_entries(result, rollback).all(shared_rollback_can_reverse);
     lines.push(if result.journal_path.is_some() && !undo_can_help {
-        "Undo cannot reverse these files from the install record. Restore or remove the files above by hand.".to_string()
+        "Undo cannot reverse every file above from the install record. Restore or remove the files above by hand.".to_string()
     } else if result.journal_path.is_some() {
         "Check Undo re-reads the install record and these files, and runs only if every file is still as EmuWiz left it. Otherwise, restore or remove the files above by hand.".to_string()
     } else {
@@ -720,6 +721,7 @@ mod tests {
     use crate::shared_apply_warnings::test_support::*;
     use archivefs_core::patch_manager::{
         Pcsx2InstallationType, Pcsx2ProfileScope, SharedApplyFailure, SharedApplyFailureKind,
+        SharedPublicationState,
     };
 
     const ARCHIVE: &str = "/disposable/game.iso";
@@ -781,6 +783,9 @@ mod tests {
         let mut result = warned_result();
         result.journal.status = SharedApplyStatus::Failed;
         result.journal.entries[0].outcome = SharedApplyOutcome::WriteFailed;
+        // The engine proved nothing was published (a refusal before the
+        // rename); other tests set the publication state they need.
+        result.journal.entries[0].publication = SharedPublicationState::NotPublished;
         result.journal.entries[0].warnings.clear();
         result
     }
@@ -977,7 +982,10 @@ mod tests {
             text.contains("0 of 1 file(s) were written or may have been changed on disk"),
             "{text}"
         );
-        assert!(text.contains("no file was written or changed"), "{text}");
+        assert!(
+            text.contains("No file from this pack reached the destination"),
+            "{text}"
+        );
         assert!(!text.contains("Recovery required"), "{text}");
     }
 
@@ -988,10 +996,13 @@ mod tests {
     #[test]
     fn a_write_failure_after_the_file_was_replaced_requires_recovery() {
         let mut result = with_backup(journalled(failed_result()));
+        result.journal.entries[0].publication = SharedPublicationState::PublishedThenFailed;
+        // The wording of the failure is irrelevant: only the structured
+        // publication state decides.
         result.journal.entries[0].failures.push(SharedApplyFailure {
             kind: SharedApplyFailureKind::JournalFailed,
             path: None,
-            detail: REPLACED_THEN_CHECKPOINT_FAILED.into(),
+            detail: "any wording at all".into(),
         });
         // Core rollback treats this entry as NoChangeRequired, so the page
         // must not offer a Check Undo that can never act.
@@ -1003,10 +1014,13 @@ mod tests {
             text.contains("1 of 1 file(s) were written or may have been changed on disk"),
             "{text}"
         );
-        assert!(!text.contains("no file was written or changed"), "{text}");
+        assert!(
+            !text.contains("No file from this pack reached the destination"),
+            "{text}"
+        );
         assert!(text.contains(BACKUP), "{text}");
         assert!(
-            text.contains("Undo cannot reverse these files from the install record"),
+            text.contains("Undo cannot reverse every file above from the install record"),
             "{text}"
         );
         assert!(!text.contains("Check Undo"), "{text}");
@@ -1029,24 +1043,95 @@ mod tests {
         });
         assert_eq!(undo_choice(&result, None), UndoChoice::None);
         let text = panel_after(result, None);
-        assert!(text.contains("no file was written or changed"), "{text}");
+        assert!(
+            text.contains("No file from this pack reached the destination"),
+            "{text}"
+        );
         assert!(!text.contains("Recovery required"), "{text}");
     }
 
-    /// A file published and then changed: core rollback can act on it.
+    /// A file published and then changed: core rollback previews it as
+    /// DestinationChanged, so recovery is manual and Check Undo is not offered.
     #[test]
-    fn a_published_unverified_file_offers_check_undo() {
+    fn a_published_unverified_file_requires_manual_recovery() {
         let mut result = with_backup(journalled(failed_result()));
         result.journal.entries[0].outcome = SharedApplyOutcome::VerificationFailed;
+        result.journal.entries[0].publication = SharedPublicationState::PublishedThenFailed;
         result.journal.entries[0].failures.push(SharedApplyFailure {
             kind: SharedApplyFailureKind::PublishedUnverified,
             path: None,
             detail: "changed straight afterwards".into(),
         });
-        assert_eq!(undo_choice(&result, None), UndoChoice::CheckUndo);
+        assert_eq!(undo_choice(&result, None), UndoChoice::None);
         let text = panel_after(result, None);
         assert_recovery_required(&text);
-        assert!(text.contains("Check Undo"), "{text}");
+        assert!(!text.contains("Check Undo"), "{text}");
+    }
+
+    /// Two files: one installed, one replaced before its checkpoint failed.
+    /// Automatic rollback reverses the first and counts the second as
+    /// NoChangeRequired, so it reports Success while the second stays live.
+    #[test]
+    fn a_successful_rollback_does_not_hide_a_file_it_cannot_reverse() {
+        let mut result = journalled(with_backup(partly_failed_result()));
+        let mut installed = result.journal.entries[0].clone();
+        installed.plan_entry.destination_relative_path =
+            archivefs_core::patch_manager::SharedTransactionPath::from_path(Path::new(
+                "pack/new.bin",
+            ));
+        installed.outcome = SharedApplyOutcome::WriteFailed;
+        installed.backup_path = None;
+        installed.destination_existed_before_apply = Some(false);
+        installed.publication = SharedPublicationState::PublishedThenFailed;
+        installed.failures = vec![SharedApplyFailure {
+            kind: SharedApplyFailureKind::JournalFailed,
+            path: None,
+            detail: "reworded checkpoint failure".into(),
+        }];
+        result.journal.entries.push(installed);
+        let rollback = succeeded_rollback();
+        assert_eq!(undo_choice(&result, Some(&rollback)), UndoChoice::None);
+        let text = panel_after(result, Some(rollback));
+        assert_not_installed(&text);
+        assert!(text.contains("Recovery required"), "{text}");
+        assert!(
+            text.contains(
+                "pack/new.bin: may still be the pack's file; it did not exist before this install"
+            ),
+            "{text}"
+        );
+        assert!(!text.contains("nothing to undo"), "{text}");
+        assert!(
+            text.contains("at least one file it cannot reverse may still come from this pack"),
+            "{text}"
+        );
+        assert!(!text.contains("Check Undo"), "{text}");
+    }
+
+    /// The engine cannot tell what is live: recovery is required and the
+    /// page never claims that nothing was written.
+    #[test]
+    fn an_uncertain_publication_requires_recovery() {
+        for state in [
+            SharedPublicationState::Uncertain,
+            // An older journal with no publication record.
+            SharedPublicationState::NotRecorded,
+        ] {
+            let mut result = with_backup(journalled(failed_result()));
+            result.journal.entries[0].publication = state;
+            assert_eq!(undo_choice(&result, None), UndoChoice::None, "{state:?}");
+            let text = panel_after(result, None);
+            assert_not_installed(&text);
+            assert_recovery_required(&text);
+            assert!(
+                text.contains("EmuWiz cannot confirm whether files from this pack are in place"),
+                "{text}"
+            );
+            assert!(
+                !text.contains("No file from this pack reached the destination"),
+                "{text}"
+            );
+        }
     }
 
     #[test]
@@ -1124,7 +1209,8 @@ mod tests {
     mod end_to_end {
         use super::*;
         use archivefs_core::patch_manager::{
-            Pcsx2TextureIdentity, set_test_rollback_restore_fault,
+            Pcsx2TextureIdentity, set_test_replaced_checkpoint_fault,
+            set_test_rollback_restore_fault,
         };
         use std::fs;
 
@@ -1358,6 +1444,54 @@ mod tests {
             );
             assert!(text.contains("Check Undo"), "{text}");
             (state, backup)
+        }
+
+        /// Real engine: every file's checkpoint fails right after its
+        /// destination was replaced. The page reads the engine's recorded
+        /// publication, so it must require recovery and never say nothing
+        /// was written, whatever the failure detail says.
+        #[test]
+        fn a_checkpoint_failure_after_publication_requires_recovery() {
+            let fixture = Fixture::new();
+            let plan = fixture.transaction();
+            set_test_replaced_checkpoint_fault(true);
+            let result = fixture.apply(&plan);
+            set_test_replaced_checkpoint_fault(false);
+            assert_ne!(result.apply.journal.status, SharedApplyStatus::Success);
+            assert!(
+                result.apply.journal.entries.iter().all(|entry| {
+                    entry.publication == SharedPublicationState::PublishedThenFailed
+                })
+            );
+            // The pack's files are live; nothing repaired them.
+            assert_eq!(
+                fixture.snapshot(),
+                files(&[("a.png", b"pack-a"), ("b.webp", b"pack-b")])
+            );
+            let backup = fixture.backup_of_a(&result.apply);
+            let mut state = fixture.page(result);
+            let text = fixture.text(&mut state);
+            assert!(!text.contains("Installed"), "{text}");
+            assert!(text.contains("Recovery required"), "{text}");
+            assert!(
+                !text.contains("No file from this pack reached the destination"),
+                "{text}"
+            );
+            assert!(
+                text.contains(&format!(
+                    "{}: may still be the pack's file; your original is kept in EmuWiz's backup at {}",
+                    fixture.file("a.png").display(),
+                    backup.display()
+                )),
+                "{text}"
+            );
+            // The core's rollback cannot reverse these entries.
+            assert!(!text.contains("Check Undo"), "{text}");
+            assert!(
+                text.contains("Undo cannot reverse every file above"),
+                "{text}"
+            );
+            assert_eq!(fs::read(&backup).unwrap(), b"original-a");
         }
 
         #[test]

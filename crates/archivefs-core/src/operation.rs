@@ -1628,6 +1628,7 @@ mod tests {
                 replacement_approved: false,
                 verification_succeeded: true,
                 outcome: SharedApplyOutcome::InstalledNew,
+                publication: Default::default(),
                 stages: Vec::new(),
                 warnings: Vec::new(),
                 failures: Vec::new(),

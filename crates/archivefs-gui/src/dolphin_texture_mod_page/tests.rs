@@ -665,6 +665,7 @@ fn sample_apply_result(
             replacement_approved: false,
             verification_succeeded: true,
             outcome,
+            publication: Default::default(),
             stages: vec![SharedTransactionStage::Success],
             warnings: Vec::new(),
             failures: Vec::new(),

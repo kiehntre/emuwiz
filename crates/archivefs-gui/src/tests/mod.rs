@@ -935,6 +935,7 @@ fn successful_shared_apply_result() -> SharedApplyResult {
         replacement_approved: false,
         verification_succeeded: true,
         outcome: SharedApplyOutcome::InstalledNew,
+        publication: Default::default(),
         stages: vec![SharedTransactionStage::Success],
         warnings: Vec::new(),
         failures: Vec::new(),

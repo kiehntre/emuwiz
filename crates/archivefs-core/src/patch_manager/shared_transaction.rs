@@ -92,6 +92,8 @@ pub(super) enum FaultPoint {
     Permissions,
     ExchangeUnsupported,
     ReverseExchange,
+    /// The durable checkpoint right after the destination was replaced.
+    ReplacedCheckpoint,
 }
 
 #[cfg(any(test, feature = "test-support"))]
@@ -146,6 +148,14 @@ fn should_inject(_point: FaultPoint) -> bool {
 #[cfg(feature = "test-support")]
 pub fn set_test_rollback_restore_fault(enabled: bool) {
     inject_fault(enabled.then_some(FaultPoint::RollbackRestore));
+}
+
+/// Synthetic GUI tests make the durable checkpoint taken right after a
+/// destination is replaced fail on this thread, until called with `false`.
+/// Unavailable in ordinary application builds.
+#[cfg(feature = "test-support")]
+pub fn set_test_replaced_checkpoint_fault(enabled: bool) {
+    inject_fault(enabled.then_some(FaultPoint::ReplacedCheckpoint));
 }
 
 #[cfg(not(any(test, feature = "test-support")))]
@@ -421,6 +431,153 @@ pub enum SharedApplyOutcome {
     VerificationFailed,
 }
 
+/// Whether this entry's output reached the live destination. Recorded by the
+/// engine at the point publication happens (or is ruled out), so callers never
+/// infer it from outcomes or failure wording.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SharedPublicationState {
+    /// A journal written before this was recorded. Readers must treat a
+    /// failed entry with this state as uncertain.
+    #[default]
+    NotRecorded,
+    /// Definitely nothing was published: the entry stopped before the
+    /// destination changed, or a refused exchange was put back.
+    NotPublished,
+    /// Published and verified in place.
+    Published,
+    /// Published, then a later step (verification, durable checkpoint)
+    /// failed. The destination may hold this entry's output.
+    PublishedThenFailed,
+    /// Published, failed verification, and the previous live state was
+    /// restored and checked. The destination no longer holds this output.
+    PublishedThenRestored,
+    /// The engine cannot tell whether the destination holds this output
+    /// (for example a displaced file was kept under the temporary name).
+    Uncertain,
+}
+
+/// What an Apply (and any rollback of it) left at the destination, for
+/// callers that must say "Installed", "nothing was written" or "Recovery
+/// required" truthfully.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SharedDestinationOutcome {
+    /// Status Success and its journal was saved durably.
+    DurableSuccess,
+    /// Status Success, but the journal could not be saved: the files are in
+    /// place and verified, and there is no record to undo from.
+    SuccessWithoutDurableRecord,
+    /// No entry published anything that is still in place, proven per entry.
+    NothingPublished,
+    /// Something was published and a rollback reversed every such entry.
+    Reversed,
+    /// At least one entry's output definitely reached the destination and
+    /// was not reversed.
+    PublishedNeedsRecovery,
+    /// No definite unreversed publication, but at least one entry's
+    /// publication state is uncertain.
+    Uncertain,
+}
+
+/// Per-entry view of [`SharedDestinationOutcome`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SharedEntryDestination {
+    NothingPublished,
+    Published,
+    Reversed,
+    NeedsRecovery,
+    Uncertain,
+}
+
+/// Whether a rollback of this journal can reverse the entry. Rollback only
+/// acts on completed InstalledNew/ReplacedExisting entries; every other
+/// entry previews as NoChangeRequired or DestinationChanged.
+pub fn shared_rollback_can_reverse(entry: &SharedApplyEntry) -> bool {
+    matches!(
+        entry.outcome,
+        SharedApplyOutcome::InstalledNew | SharedApplyOutcome::ReplacedExisting
+    )
+}
+
+/// Classify one entry. `rollback_entry` is the same-index entry of a
+/// rollback of this journal, if one ran.
+pub fn shared_entry_destination(
+    entry: &SharedApplyEntry,
+    rollback_entry: Option<&SharedRollbackEntry>,
+) -> SharedEntryDestination {
+    let reversed = rollback_entry.is_some_and(|rollback| {
+        rollback.failure.is_none()
+            && matches!(
+                rollback.outcome,
+                SharedRollbackOutcome::RestoredBackup | SharedRollbackOutcome::RemovedInstalledFile
+            )
+    });
+    let completed = matches!(
+        entry.outcome,
+        SharedApplyOutcome::InstalledNew | SharedApplyOutcome::ReplacedExisting
+    );
+    let state = match entry.publication {
+        SharedPublicationState::NotRecorded => match entry.outcome {
+            _ if completed => SharedPublicationState::Published,
+            SharedApplyOutcome::WriteFailed
+            | SharedApplyOutcome::VerificationFailed
+            | SharedApplyOutcome::DestinationChanged => SharedPublicationState::Uncertain,
+            _ => SharedPublicationState::NotPublished,
+        },
+        state => state,
+    };
+    match state {
+        SharedPublicationState::NotPublished | SharedPublicationState::PublishedThenRestored => {
+            SharedEntryDestination::NothingPublished
+        }
+        _ if reversed => SharedEntryDestination::Reversed,
+        SharedPublicationState::Published if completed => SharedEntryDestination::Published,
+        SharedPublicationState::Published | SharedPublicationState::PublishedThenFailed => {
+            SharedEntryDestination::NeedsRecovery
+        }
+        SharedPublicationState::Uncertain | SharedPublicationState::NotRecorded => {
+            SharedEntryDestination::Uncertain
+        }
+    }
+}
+
+/// Classify an Apply result and, if one ran, its rollback (whose entries are
+/// index-aligned with the journal's).
+pub fn shared_destination_outcome(
+    result: &SharedApplyResult,
+    rollback: Option<&SharedRollbackResult>,
+) -> SharedDestinationOutcome {
+    if result.journal.status == SharedApplyStatus::Success && rollback.is_none() {
+        return if result.journal_path.is_some() && result.journal_failure.is_none() {
+            SharedDestinationOutcome::DurableSuccess
+        } else {
+            SharedDestinationOutcome::SuccessWithoutDurableRecord
+        };
+    }
+    let mut any_reversed = false;
+    let mut any_uncertain = false;
+    for (index, entry) in result.journal.entries.iter().enumerate() {
+        let rollback_entry = rollback.and_then(|value| value.preview.entries.get(index));
+        match shared_entry_destination(entry, rollback_entry) {
+            SharedEntryDestination::NeedsRecovery | SharedEntryDestination::Published => {
+                return SharedDestinationOutcome::PublishedNeedsRecovery;
+            }
+            SharedEntryDestination::Uncertain => any_uncertain = true,
+            SharedEntryDestination::Reversed => any_reversed = true,
+            SharedEntryDestination::NothingPublished => {}
+        }
+    }
+    if any_uncertain {
+        SharedDestinationOutcome::Uncertain
+    } else if any_reversed {
+        SharedDestinationOutcome::Reversed
+    } else {
+        SharedDestinationOutcome::NothingPublished
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SharedApplyEntry {
     pub plan_entry: SharedPlanEntry,
@@ -446,6 +603,10 @@ pub struct SharedApplyEntry {
     pub replacement_approved: bool,
     pub verification_succeeded: bool,
     pub outcome: SharedApplyOutcome,
+    /// Whether this entry's output reached the destination; see
+    /// [`SharedPublicationState`]. Absent in older journals.
+    #[serde(default)]
+    pub publication: SharedPublicationState,
     pub stages: Vec<SharedTransactionStage>,
     pub warnings: Vec<String>,
     pub failures: Vec<SharedApplyFailure>,
@@ -1448,6 +1609,7 @@ fn apply_one(
         replacement_approved,
         verification_succeeded: false,
         outcome: SharedApplyOutcome::SkippedNotEligible,
+        publication: SharedPublicationState::NotPublished,
         stages: vec![if dry_run {
             SharedTransactionStage::DryRun
         } else {
@@ -1863,7 +2025,11 @@ fn apply_one(
     match write_result {
         Ok(temp) => {
             result.temporary_path = Some(SharedTransactionPath::from_path(&temp));
-            if !checkpoint(SharedEntryRecoveryState::DestinationReplaced, &result) {
+            // The output is live from here on; any later failure leaves it.
+            result.publication = SharedPublicationState::PublishedThenFailed;
+            if should_inject(FaultPoint::ReplacedCheckpoint)
+                || !checkpoint(SharedEntryRecoveryState::DestinationReplaced, &result)
+            {
                 return fail_result(
                     result,
                     SharedApplyOutcome::WriteFailed,
@@ -1882,7 +2048,9 @@ fn apply_one(
                         SharedApplyOutcome::ReplacedExisting
                     };
                     result.stages.push(SharedTransactionStage::Success);
+                    result.publication = SharedPublicationState::Published;
                     if !checkpoint(SharedEntryRecoveryState::DestinationVerified, &result) {
+                        result.publication = SharedPublicationState::PublishedThenFailed;
                         return fail_result(
                             result,
                             SharedApplyOutcome::VerificationFailed,
@@ -1900,6 +2068,11 @@ fn apply_one(
                         &destination,
                         &output_digest,
                     );
+                    result.publication = if restore.is_ok() {
+                        SharedPublicationState::PublishedThenRestored
+                    } else {
+                        SharedPublicationState::PublishedThenFailed
+                    };
                     let detail = match restore {
                         Ok(()) => format!("{detail}; previous live file state restored"),
                         Err(kind) => format!(
@@ -1918,6 +2091,7 @@ fn apply_one(
         }
         Err((kind, temp)) => {
             result.temporary_path = temp.as_deref().map(SharedTransactionPath::from_path);
+            result.publication = publication_after_write_error(kind);
             let (outcome, detail) = publication_failure(kind, temp.as_deref());
             result = fail_result(result, outcome, kind, Some(&destination), &detail);
         }
@@ -2127,6 +2301,20 @@ fn restore_after_failed_verification(
     atomic_write(&backup, destination, digest, false, mode, installed)
         .map(|_| ())
         .map_err(|(kind, _)| kind)
+}
+
+/// Where a failed `atomic_write`/`atomic_write_bytes` left the destination.
+/// Every error kind but these two is returned before the rename or exchange
+/// that publishes, or after a refused exchange was put back.
+fn publication_after_write_error(kind: SharedApplyFailureKind) -> SharedPublicationState {
+    match kind {
+        // Published, then the final re-read did not match.
+        SharedApplyFailureKind::PublishedUnverified => SharedPublicationState::PublishedThenFailed,
+        // Either ours stayed published (reverse exchange failed) or a file
+        // that is not ours came back: which one is live is not known.
+        SharedApplyFailureKind::DisplacedFileKept => SharedPublicationState::Uncertain,
+        _ => SharedPublicationState::NotPublished,
+    }
 }
 
 /// The outcome and plain detail for a refused or failed publication.
@@ -4552,6 +4740,7 @@ fn failed_entry(
             replacement_approved: false,
             verification_succeeded: false,
             outcome: SharedApplyOutcome::SkippedNotEligible,
+            publication: SharedPublicationState::NotPublished,
             stages: Vec::new(),
             warnings: Vec::new(),
             failures: Vec::new(),
@@ -5729,6 +5918,11 @@ mod tests {
         set_before_publish(None);
         let entry = &result.journal.entries[0];
         assert_ne!(entry.outcome, SharedApplyOutcome::ReplacedExisting);
+        assert_eq!(entry.publication, SharedPublicationState::Uncertain);
+        assert_eq!(
+            shared_destination_outcome(&result, None),
+            SharedDestinationOutcome::Uncertain
+        );
         let failure = entry
             .failures
             .iter()
@@ -6414,6 +6608,14 @@ mod tests {
                 .iter()
                 .any(|failure| failure.kind == SharedApplyFailureKind::PublishedUnverified)
         );
+        assert_eq!(
+            replaced.publication,
+            SharedPublicationState::PublishedThenFailed
+        );
+        assert_eq!(
+            shared_destination_outcome(&applied, None),
+            SharedDestinationOutcome::PublishedNeedsRecovery
+        );
         let rollback = preview_shared_rollback(
             applied.journal_path.as_ref().unwrap(),
             &fixture.destination_root(),
@@ -6673,6 +6875,131 @@ mod tests {
         );
     }
 
+    /// The destination is replaced, then its durable checkpoint fails. The
+    /// engine records the publication, so callers never parse the detail.
+    #[test]
+    fn checkpoint_failure_after_replace_records_published_then_failed() {
+        let fixture = Fixture::new("replaced-checkpoint");
+        let report = preview(&fixture, b"new", Some(b"old"));
+        let plan = make_plan(&fixture, &report);
+        inject_fault(Some(FaultPoint::ReplacedCheckpoint));
+        let result = execute_shared_apply(
+            &plan,
+            &options(&fixture, &plan, "replaced-checkpoint", false, true, true),
+        );
+        inject_fault(None);
+        let entry = &result.journal.entries[0];
+        assert_eq!(entry.outcome, SharedApplyOutcome::WriteFailed);
+        assert_eq!(
+            entry.publication,
+            SharedPublicationState::PublishedThenFailed
+        );
+        assert_eq!(
+            fs::read(fixture.destination_root().join("Nintendo - NES/game.cht")).unwrap(),
+            b"new",
+            "the pack's file is live"
+        );
+        assert_eq!(
+            shared_entry_destination(entry, None),
+            SharedEntryDestination::NeedsRecovery
+        );
+        assert_eq!(
+            shared_destination_outcome(&result, None),
+            SharedDestinationOutcome::PublishedNeedsRecovery
+        );
+        assert!(!shared_rollback_can_reverse(entry));
+        // Rewording the failure detail cannot change the classification.
+        let mut reworded = SharedApplyResult {
+            journal: result.journal.clone(),
+            journal_path: result.journal_path.clone(),
+            journal_failure: None,
+        };
+        for failure in &mut reworded.journal.entries[0].failures {
+            failure.detail = "something else entirely".into();
+        }
+        assert_eq!(
+            shared_destination_outcome(&reworded, None),
+            SharedDestinationOutcome::PublishedNeedsRecovery
+        );
+    }
+
+    /// A completed install whose rollback fails stays published.
+    #[test]
+    fn failed_rollback_leaves_a_published_entry_needing_recovery() {
+        let fixture = Fixture::new("failed-rollback-publication");
+        let report = preview(&fixture, b"new", Some(b"old"));
+        let plan = make_plan(&fixture, &report);
+        let applied = execute_shared_apply(
+            &plan,
+            &options(&fixture, &plan, "failed-rollback-pub", false, true, true),
+        );
+        assert_eq!(applied.journal.status, SharedApplyStatus::Success);
+        assert_eq!(
+            applied.journal.entries[0].publication,
+            SharedPublicationState::Published
+        );
+        assert_eq!(
+            shared_destination_outcome(&applied, None),
+            SharedDestinationOutcome::DurableSuccess
+        );
+        let preview = preview_shared_rollback(
+            applied.journal_path.as_ref().unwrap(),
+            &fixture.destination_root(),
+            &fixture.backup_root(),
+        );
+        assert!(preview.available);
+        inject_fault(Some(FaultPoint::RollbackRestore));
+        let rollback = execute_shared_rollback(
+            &preview,
+            &SharedRollbackOptions {
+                confirmation: SharedRollbackConfirmation {
+                    preview_id: preview.preview_id.clone(),
+                    approved: true,
+                },
+                rollback_operation_id: "failed-rollback-pub-undo".into(),
+                timestamp_unix_seconds: 1,
+                history_root: fixture.history_root(),
+                backup_root: fixture.backup_root(),
+            },
+        );
+        inject_fault(None);
+        assert_ne!(rollback.status, SharedApplyStatus::Success);
+        assert_eq!(
+            shared_destination_outcome(&applied, Some(&rollback)),
+            SharedDestinationOutcome::PublishedNeedsRecovery
+        );
+    }
+
+    /// Journals written before publication was recorded: a failed entry is
+    /// uncertain, never "nothing written"; refusals before any write and
+    /// completed entries keep their meaning.
+    #[test]
+    fn journals_without_a_publication_record_fail_closed() {
+        let fixture = Fixture::new("legacy-publication");
+        let report = preview(&fixture, b"new", None);
+        let plan = make_plan(&fixture, &report);
+        inject_fault(Some(FaultPoint::Rename));
+        let mut result = execute_shared_apply(
+            &plan,
+            &options(&fixture, &plan, "legacy-publication", false, true, false),
+        );
+        inject_fault(None);
+        let mut json = serde_json::to_value(&result.journal.entries[0]).unwrap();
+        json.as_object_mut().unwrap().remove("publication");
+        let legacy: SharedApplyEntry = serde_json::from_value(json).unwrap();
+        assert_eq!(legacy.publication, SharedPublicationState::NotRecorded);
+        result.journal.entries[0] = legacy;
+        assert_eq!(
+            shared_destination_outcome(&result, None),
+            SharedDestinationOutcome::Uncertain
+        );
+        result.journal.entries[0].outcome = SharedApplyOutcome::SourceChanged;
+        assert_eq!(
+            shared_destination_outcome(&result, None),
+            SharedDestinationOutcome::NothingPublished
+        );
+    }
+
     #[test]
     fn injected_apply_failures_preserve_atomicity_and_truthful_state() {
         for fault in [
@@ -6699,6 +7026,17 @@ mod tests {
                     .destination_root()
                     .join("Nintendo - NES/game.cht")
                     .exists()
+            );
+            // Failures before publication are proven, not inferred.
+            assert_eq!(
+                result.journal.entries[0].publication,
+                SharedPublicationState::NotPublished,
+                "{fault:?}"
+            );
+            assert_eq!(
+                shared_destination_outcome(&result, None),
+                SharedDestinationOutcome::NothingPublished,
+                "{fault:?}"
             );
         }
 

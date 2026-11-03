@@ -1071,6 +1071,8 @@ pub use shared_preview::{
     SharedPreviewReport, SharedPreviewRequest, build_shared_preview,
 };
 #[cfg(feature = "test-support")]
+pub use shared_transaction::set_test_replaced_checkpoint_fault;
+#[cfg(feature = "test-support")]
 pub use shared_transaction::set_test_rollback_restore_fault;
 pub use shared_transaction::{
     SHARED_APPLY_SCHEMA_VERSION, SHARED_DURABLE_JOURNAL_SCHEMA_VERSION, SHARED_MAX_BACKUP_BYTES,
@@ -1080,18 +1082,20 @@ pub use shared_transaction::{
     SHARED_MAX_TOTAL_WRITTEN_BYTES, SHARED_MAX_WARNINGS, SharedAdapterWriteSupport,
     SharedApplyConfirmation, SharedApplyContext, SharedApplyEntry, SharedApplyFailure,
     SharedApplyFailureKind, SharedApplyJournal, SharedApplyOptions, SharedApplyOutcome,
-    SharedApplyResult, SharedApplyStatus, SharedContentVerification, SharedDurableEntry,
-    SharedDurableJournal, SharedEntryRecoveryState, SharedHistoryReport, SharedJournalWarning,
-    SharedMaterializedOutput, SharedPendingOperation, SharedPendingRecoveryPlan, SharedPlanEntry,
-    SharedRecoveryState, SharedRollbackConfirmation, SharedRollbackEntry, SharedRollbackOptions,
-    SharedRollbackOutcome, SharedRollbackPermissions, SharedRollbackPreview, SharedRollbackResult,
-    SharedTransactionPath, SharedTransactionPlan, SharedTransactionStage, adapter_write_support,
+    SharedApplyResult, SharedApplyStatus, SharedContentVerification, SharedDestinationOutcome,
+    SharedDurableEntry, SharedDurableJournal, SharedEntryDestination, SharedEntryRecoveryState,
+    SharedHistoryReport, SharedJournalWarning, SharedMaterializedOutput, SharedPendingOperation,
+    SharedPendingRecoveryPlan, SharedPlanEntry, SharedPublicationState, SharedRecoveryState,
+    SharedRollbackConfirmation, SharedRollbackEntry, SharedRollbackOptions, SharedRollbackOutcome,
+    SharedRollbackPermissions, SharedRollbackPreview, SharedRollbackResult, SharedTransactionPath,
+    SharedTransactionPlan, SharedTransactionStage, adapter_write_support,
     build_shared_transaction_plan, default_shared_backup_root, default_shared_history_root,
     discover_pending_operations, discover_shared_apply_history, execute_shared_apply,
     execute_shared_materialized_apply, execute_shared_rollback, generate_shared_operation_id,
     plan_pending_recovery, preview_shared_rollback,
     require_dolphin_managed_gamehacking_verification, require_local_mod_package_verification,
-    require_retroarch_bezel_verification, seal_shared_transaction_plan,
+    require_retroarch_bezel_verification, seal_shared_transaction_plan, shared_destination_outcome,
+    shared_entry_destination, shared_rollback_can_reverse,
 };
 pub use snes9x_local::{
     SNES9X_MAX_PROFILES, SNES9X_NATIVE_BINARY_NAMES, Snes9xExecutable, Snes9xInstallationType,
