@@ -75,6 +75,7 @@ pub(super) fn fixture(context: &egui::Context) -> App {
         filter: Filter::default(),
         filter_generation: 0,
         filter_inflight: false,
+        big_picture: None,
         filter_dirty: None,
         detail: None,
         detail_pending: None,
@@ -11896,6 +11897,8 @@ mod frontend_export;
 #[path = "tests/nkit.rs"]
 mod nkit_gui;
 
+#[path = "tests/big_picture.rs"]
+mod big_picture_journey;
 #[path = "tests/launch_focus.rs"]
 mod launch_focus;
 
