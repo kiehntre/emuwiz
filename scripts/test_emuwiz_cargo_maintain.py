@@ -871,6 +871,36 @@ class UnrecognisedResidue(MaintBase):
         for p in self.evidence_paths(t):
             self.assertTrue(os.path.exists(p), p)
 
+    def test_c1_policy_approved_before_residue_scope_does_not_retire_residue(self):
+        # PR #301 review C1: Fix B widened what a cycle retires. A policy approved (and enabled)
+        # under the previous schema must not retire residue; a re-approved current policy does.
+        wt, t = self.retired("resid-c1")
+        current = self.m.POLICY_VERSION
+        self.m.POLICY_VERSION = 1  # the code that approved and enabled the old policy
+        try:
+            self.approve()
+        finally:
+            self.m.POLICY_VERSION = current
+        path = os.path.join(t, "debug", "archivefs-gui")
+        with open(path, "wb") as handle:
+            handle.write(b"\x7fELF\x02\x01\x01" + b"\0" * 4096)
+        os.chmod(path, 0o755)
+        self.age(t, 10)
+        state, policy, why = self.m.load_policy()
+        self.assertEqual(state, "invalid", why)
+        self.assertIn("policy approve", why)
+        self.retire_cycle()
+        self.assertEqual(self.last_cycle()["outcome"], "REFUSED", self.last_cycle())
+        self.assertTrue(os.path.lexists(path))
+        for data in self.checks(wt):
+            self.assertEqual(data["status"], "HOLD", data)
+        self.approve()  # re-approved under the current schema, then enabled
+        self.assertEqual(self.m.load_policy()[0], "ok")
+        self.retire_cycle()
+        self.assertEqual(self.last_cycle()["outcome"], "RETIRED", self.last_cycle())
+        self.assertFalse(os.path.lexists(path))
+        self.assert_clear(wt)
+
     def test_check_is_read_only_and_repeatable_after_restart(self):
         wt, t = self.retired("resid-ro")
         path = os.path.join(t, "debug", "helper.sh")  # unrecognised (not an ELF)

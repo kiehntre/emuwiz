@@ -1658,6 +1658,92 @@ class AttestedOrphanRoute(Base):
         self.assertEqual(codes, set(), r)
         self.assertFalse(self.exists(t, "debug/deps"))
 
+    # ---- review conditions on PR #301 (C2, C3, receipt route)
+
+    def clone_with_head(self, name, head):
+        other = os.path.join(self.tmp, name)
+        self.git("init", "-q", other)
+        self.git("-C", other, "fetch", "-q", os.path.join(self.repo, ".git"))
+        self.git("-C", other, "update-ref", "refs/remotes/origin/main", head)
+        return os.path.realpath(other)
+
+    def fake_registration(self, repo_dir, wt, relative=False):
+        """`repo_dir/.git/worktrees/<id>/gitdir` pointing at `wt`, as git leaves an unpruned entry."""
+        entry = os.path.join(repo_dir, ".git", "worktrees", os.path.basename(wt))
+        os.makedirs(entry)
+        pointer = os.path.join(wt, ".git")
+        with open(os.path.join(entry, "gitdir"), "w") as handle:
+            handle.write((os.path.relpath(pointer, entry) if relative else pointer) + "\n")
+        return entry
+
+    def test_c2_worktree_still_registered_in_another_repository_holds(self):
+        # W belongs to self.repo and is still registered there (directory gone, entry unpruned); the
+        # manifest attests another clone whose origin/main also contains the HEAD.
+        wt, t, g = self.attested("wt-att-xrepo", remove="dir-only")
+        other = self.clone_with_head("other-repo-xrepo", g["source_head"])
+        att = dict(g["orphan_attestation"], repo=other)
+        codes, r = self.holds(dict(g, orphan_attestation=att, orphan_repo=None))
+        self.assertIn("ORPHAN_SOURCE_PRESENT", codes, r)
+        self.assertTrue(self.exists(t, "debug/deps"))
+
+    def test_c2_sibling_repository_with_a_relative_entry_holds(self):
+        wt, t, g = self.attested("wt-att-xrel")
+        self.fake_registration(os.path.join(self.tmp, "sibling-clone"), wt, relative=True)
+        codes, r = self.holds(g)
+        self.assertIn("ORPHAN_SOURCE_PRESENT", codes, r)
+        self.assertTrue(self.exists(t, "debug/deps"))
+
+    def test_c2_unjudgeable_sibling_repository_holds(self):
+        wt, t, g = self.attested("wt-att-xunk")
+        sib = os.path.join(self.tmp, "locked-sibling")
+        os.makedirs(os.path.join(sib, ".git", "worktrees"))
+        os.chmod(sib, 0)
+        self.addCleanup(os.chmod, sib, 0o755)
+        if os.access(sib, os.X_OK):
+            self.skipTest("running with privileges that ignore file modes")
+        codes, r = self.holds(g)
+        self.assertIn("ORPHAN_SOURCE_UNKNOWN", codes, r)
+        self.assertTrue(self.exists(t, "debug/deps"))
+
+    def test_c2_documented_limit_a_repository_elsewhere_is_not_seen(self):
+        # Pins the documented limitation: a repository that is neither beside the worktree nor beside
+        # the attested repository cannot be seen, so the owner must attest the exact repository.
+        wt, t, g = self.attested("wt-att-xfar")
+        self.fake_registration(os.path.join(self.tmp, "nest", "deeper", "far-clone"), wt)
+        codes, r = self.holds(g)
+        self.assertEqual(codes, set(), r)
+        self.assertFalse(self.exists(t, "debug/deps"))
+
+    def test_c3_unsearchable_administrative_root_holds(self):
+        # .git cannot be searched, so `.git/worktrees` cannot be judged. git is stubbed to answer
+        # "registered nowhere, HEAD on origin/main" to isolate the administrative-entry check
+        # (unstubbed, a git failure would also hold, as ORPHAN_REPO_UNVERIFIED).
+        wt, t, g = self.attested("wt-att-c3")
+        common = os.path.join(self.repo, ".git")
+        os.chmod(common, 0o644)
+        self.addCleanup(os.chmod, common, 0o755)
+        if os.access(common, os.X_OK):
+            self.skipTest("running with privileges that ignore file modes")
+        real_git = self.mod._git
+        self.mod._git = lambda repo, *argv: subprocess.CompletedProcess(argv, 0, "", "")
+        self.addCleanup(setattr, self.mod, "_git", real_git)
+        codes, r = self.holds(g)
+        self.assertIn("ORPHAN_SOURCE_UNKNOWN", codes, r)
+        os.chmod(common, 0o755)
+        self.assertTrue(self.exists(t, "debug/deps"))
+
+    def test_receipt_names_the_route_that_decided(self):
+        wt, t, g = self.attested("wt-att-rcpt-ev", strip=False)  # checkout evidence kept
+        codes, r = self.holds(g)
+        self.assertEqual(codes, set(), r)
+        self.assertEqual(r["groups"][0]["orphan_route"], "GIT_PRESERVED", r["groups"][0])
+        self.assertEqual(r["groups"][0]["orphan_route_requested"], "GIT_PRESERVED_ATTESTED")
+        wt2, t2, g2 = self.attested("wt-att-rcpt")  # no evidence: the attested route decides
+        codes, r = self.holds(g2, "m2.json")
+        self.assertEqual(codes, set(), r)
+        self.assertEqual(r["groups"][0]["orphan_route"], "GIT_PRESERVED_ATTESTED")
+        self.assertEqual(r["groups"][0]["orphan_route_requested"], "GIT_PRESERVED_ATTESTED")
+
     def test_pin_still_holds_an_attested_orphan(self):
         wt, t, g = self.attested("wt-att-pin")
         self.assertEqual(self.ret("pin", t, "--reason", "independent-review").returncode, 0)

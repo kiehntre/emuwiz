@@ -768,6 +768,103 @@ def _read_small_nofollow(path):
         os.close(fd)
 
 
+def admin_registration(admin_root, wt):
+    """(code, detail) when the administrative directory `admin_root` (`<common>/worktrees`) registers
+    worktree `wt` or cannot be judged, else None.  Only a definite absence of `admin_root` (ENOENT or
+    ENOTDIR) counts as "no entries": EACCES, EIO, a stale mount and the like are a hold.  A relative
+    `gitdir` (git's worktree.useRelativePaths) is resolved against its administrative entry."""
+    state = path_presence(admin_root)
+    if state == "absent":
+        return None
+    if state != "present":
+        return "ORPHAN_SOURCE_UNKNOWN", f"cannot establish whether {admin_root} exists"
+    try:
+        entries = sorted(os.listdir(admin_root))
+    except OSError as error:
+        return "ORPHAN_SOURCE_UNKNOWN", f"cannot list {admin_root}: {error.strerror or error}"
+    wanted = os.path.join(wt, ".git")
+    for entry in entries:
+        entry_dir = os.path.join(admin_root, entry)
+        try:
+            text = _read_small_nofollow(os.path.join(entry_dir, "gitdir"))
+        except OSError as error:
+            return "ORPHAN_SOURCE_UNKNOWN", f"cannot read administrative entry {entry_dir}: {error.strerror or error}"
+        if text is None:
+            continue
+        pointer = text.strip()
+        if os.path.normpath(os.path.join(entry_dir, pointer)) == wanted:
+            return "ORPHAN_SOURCE_PRESENT", f"administrative entry {entry_dir} still points at the recorded worktree"
+    return None
+
+
+def foreign_registration(wt, repo):
+    """C2: the attestation names one repository, but the record cannot say which repository the worktree
+    really belonged to (no checkout evidence; the worktree itself is gone).  Bounded, fail-closed check
+    for the common layout where clones sit beside their worktrees: every repository directly inside the
+    worktree's parent directory or the attested repository's parent directory (`<child>/.git/worktrees`,
+    or a bare `<child>/worktrees`) must not register the worktree.  Anything that cannot be judged is a
+    hold.  Mount points directly inside those directories are not entered (a hung mount must not block),
+    and repositories elsewhere or offline cannot be seen: the owner must attest the exact repository."""
+    mounts = {m for m, _ in F.mountinfo()}
+    if not mounts:
+        return "ORPHAN_SOURCE_UNKNOWN", "the mount table is not readable; other repositories cannot be checked"
+    seen = {os.path.join(repo, ".git")}
+    for parent in dict.fromkeys(os.path.realpath(os.path.dirname(p)) for p in (wt, repo)):
+        state = path_presence(parent)
+        if state == "absent":
+            continue
+        if state != "present":
+            return "ORPHAN_SOURCE_UNKNOWN", f"cannot establish whether {parent} exists"
+        try:
+            children = sorted(os.listdir(parent))
+        except OSError as error:
+            return "ORPHAN_SOURCE_UNKNOWN", f"cannot list {parent} for other repositories: {error.strerror or error}"
+        for child in children:
+            path = os.path.join(parent, child)
+            if path in mounts:
+                continue
+            try:
+                cst = os.lstat(path)
+            except OSError as error:
+                if error.errno in (errno.ENOENT, errno.ENOTDIR):
+                    continue
+                return "ORPHAN_SOURCE_UNKNOWN", f"cannot inspect {path}: {error.strerror or error}"
+            if not stat.S_ISDIR(cst.st_mode):
+                continue
+            for common in (os.path.join(path, ".git"), path):
+                if common in seen:
+                    continue
+                seen.add(common)
+                if common == path:  # a bare repository: HEAD and objects/ directly inside
+                    if not (os.path.lexists(os.path.join(path, "HEAD")) and os.path.lexists(os.path.join(path, "objects"))):
+                        continue
+                else:
+                    state = path_presence(common)
+                    if state == "absent":
+                        continue
+                    if state != "present":
+                        return "ORPHAN_SOURCE_UNKNOWN", f"cannot establish whether {common} exists"
+                    try:
+                        gst = os.lstat(common)
+                        if stat.S_ISLNK(gst.st_mode):  # a symlinked .git: judge the directory it names
+                            common = os.path.realpath(common)
+                            if common in seen:
+                                continue
+                            seen.add(common)
+                            gst = os.stat(common)
+                        if not stat.S_ISDIR(gst.st_mode):
+                            continue  # a gitfile: a linked worktree keeps no administrative entries
+                    except OSError as error:
+                        return "ORPHAN_SOURCE_UNKNOWN", f"cannot inspect {common}: {error.strerror or error}"
+                problem = admin_registration(os.path.join(common, "worktrees"), wt)
+                if problem:
+                    code, detail = problem
+                    if code == "ORPHAN_SOURCE_PRESENT":
+                        detail = f"another repository registers the recorded worktree ({detail}); attest that repository"
+                    return code, detail
+    return None
+
+
 def orphan_attested_owner(group, record, target):
     """Fix C: owner-attested orphan route for builds recorded BEFORE cargo-iso kept checkout evidence.
 
@@ -782,7 +879,11 @@ def orphan_attested_owner(group, record, target):
       * the repository is canonical (real `.git` directory, no symlink) and equals any orphan_repo;
       * the worktree path is absent (lstat ENOENT/ENOTDIR only);
       * no administrative entry `<repo>/.git/worktrees/*/gitdir` points at the worktree, every entry
-        is readable, and `git worktree list` does not register the path;
+        is readable (an administrative directory that cannot be judged is a hold), and `git worktree
+        list` does not register the path;
+      * no other repository directly inside the worktree's or the attested repository's parent
+        directory registers the worktree (foreign_registration); repositories elsewhere cannot be
+        seen, so the owner must attest the exact repository the worktree came from;
       * the HEAD is a commit contained in refs/remotes/origin/main of that repository.
     Limit (wider than the evidence route, which compares the checkout inode): ANY moved checkout,
     `git worktree move` included, is indistinguishable from a removed one, because git then names only
@@ -825,19 +926,12 @@ def orphan_attested_owner(group, record, target):
         return "ORPHAN_SOURCE_UNKNOWN", "cannot establish whether the recorded worktree path is absent"
     if state == "present":
         return "ORPHAN_SOURCE_PRESENT", "the recorded worktree path still exists; use the normal route"
-    admin_root = os.path.join(common, "worktrees")
-    try:
-        entries = sorted(os.listdir(admin_root)) if os.path.lexists(admin_root) else []
-    except OSError as error:
-        return "ORPHAN_SOURCE_UNKNOWN", f"cannot list {admin_root}: {error.strerror}"
-    wanted = os.path.join(wt, ".git")
-    for entry in entries:
-        try:
-            text = _read_small_nofollow(os.path.join(admin_root, entry, "gitdir"))
-        except OSError as error:
-            return "ORPHAN_SOURCE_UNKNOWN", f"cannot read administrative entry {entry}: {error.strerror or error}"
-        if text is not None and os.path.normpath(text.strip()) == wanted:
-            return "ORPHAN_SOURCE_PRESENT", f"administrative entry {entry} still points at the recorded worktree"
+    problem = admin_registration(os.path.join(common, "worktrees"), wt)
+    if problem:
+        return problem
+    problem = foreign_registration(wt, repo)
+    if problem:
+        return problem
     try:
         listing = _git(repo, "worktree", "list", "--porcelain")
         if listing.returncode:
@@ -1771,7 +1865,9 @@ def process_group(entry, registry, args, census, now_ts, execute, journal=None):
         "paths_partial": 0, "files_removed": 0, "dirs_removed": 0,
     }
     if group.get("orphan_route") == ATTESTED_ROUTE:
-        out["orphan_route"] = ATTESTED_ROUTE
+        # orphan_route records the route that decided; it becomes GIT_PRESERVED below when the
+        # record carries checkout evidence (then the stronger evidence route judged it)
+        out["orphan_route_requested"] = out["orphan_route"] = ATTESTED_ROUTE
         att = group.get("orphan_attestation")
         out["orphan_attestation"] = {k: att.get(k) for k in ATTESTATION_KEYS} if isinstance(att, dict) else None
     lock_fd = None
@@ -1801,6 +1897,9 @@ def process_group(entry, registry, args, census, now_ts, execute, journal=None):
             census = fresh
         holds, ctx = evaluate_group(entry, registry, args, census, now_ts, execute, own_lock=lock_fd is not None)
         out["key"] = ctx.get("key")
+        if group.get("orphan_route") == ATTESTED_ROUTE and isinstance(ctx.get("record"), dict) \
+                and "checkout" in ctx["record"]:
+            out["orphan_route"] = ORPHAN_ROUTE  # the evidence route decided (orphan_attested_owner)
         if ctx.get("assumed"):
             out["note"] = "ownership ASSUMED for this dry run; execution would hold on NOT_ADOPTED"
         out["holds"] = holds

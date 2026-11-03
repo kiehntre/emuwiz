@@ -325,7 +325,10 @@ A later wrapper build removes the release, including after successful retirement
 --max-gb N]` records a persistent, digest-protected, bounded policy (target root, owner labels,
 per-cycle limits; default idle delay 0 h, free reserve 100 GiB). It is **disabled** until `policy enable`, which writes a separate
 enable record bound to the policy digest plus a history event; the `enabled` flag inside the policy
-file is ignored, and re-approving requires a fresh enable. A malformed policy, one missing fields
+file is ignored, and re-approving requires a fresh enable. The policy carries a `schema` (currently 2); a
+policy approved under an older schema is invalid (fail closed, every cycle REFUSED with the reason) and must be
+approved again, because schema 2 widened what a cycle retires to post-retirement binary residue in a markerless
+`debug` profile, which an older approval never covered. Its old digest cannot be reused. A malformed policy, one missing fields
 (`scope.kinds`, limits), one owned by an account other than the effective user or registry owner
 (root is not a wildcard), or a group/world-writable file or state directory fails closed. A generated
 manifest hash is never the authorisation: the manifest must name the live policy digest and only
@@ -700,7 +703,17 @@ fact is re-checked when the executor runs:
 - **The repository:** canonical, meaning a real `.git` directory with no symlink and an absolute normalised
   path. It must equal any `orphan_repo`.
 - **The worktree:** its path must be absent (`lstat` ENOENT/ENOTDIR only). No `<repo>/.git/worktrees/*/gitdir`
-  entry may point at it, every such entry must be readable, and `git worktree list` must not register it.
+  entry may point at it (a relative `gitdir` is resolved against its entry), every such entry must be readable,
+  and `git worktree list` must not register it. A `worktrees` directory that cannot be judged (EACCES, EIO, a
+  stale mount; anything but ENOENT/ENOTDIR) is `ORPHAN_SOURCE_UNKNOWN`, never "no entries".
+- **Other repositories:** such a record does not say which repository the worktree belonged to, and the
+  worktree is gone, so it cannot be derived. As a bounded check, every repository directly inside the
+  worktree's parent directory or the attested repository's parent directory (`<dir>/.git/worktrees`, or a bare
+  `<dir>/worktrees`) must not register the worktree either (`ORPHAN_SOURCE_PRESENT`); anything there that
+  cannot be judged, or an unreadable mount table, is `ORPHAN_SOURCE_UNKNOWN`. Mount points in those
+  directories are not entered, and repositories anywhere else (or offline, for example on an unmounted volume)
+  cannot be seen. **The owner must attest the exact repository the worktree was created from**, not merely
+  one whose `origin/main` contains the HEAD.
 - **The history:** the HEAD must be a commit contained in that repository's `refs/remotes/origin/main`.
 
 Holds:
@@ -713,8 +726,8 @@ Holds:
 
 A record that has a `checkout` key at all (valid or malformed) is always judged by the stronger evidence route,
 with the attested repository required to match the recorded one, so an attestation can never bypass moved-checkout
-detection or upgrade a corrupted record. The receipt's `orphan_route` names the route requested; in that case the
-evidence route made the decision. `GIT_PRESERVED` without evidence still refuses, and an attestation
+detection or upgrade a corrupted record. The receipt's `orphan_route` names the route that decided
+(`GIT_PRESERVED` in that case) and `orphan_route_requested` the route the manifest asked for. `GIT_PRESERVED` without evidence still refuses, and an attestation
 never upgrades it. The receipt records the route and the attestation. The pin, lock, census, idle, identity,
 journal and approved-manifest gates are unchanged.
 
