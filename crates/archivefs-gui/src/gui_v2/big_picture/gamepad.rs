@@ -141,14 +141,25 @@ enum FaceLayout {
 }
 
 impl FaceLayout {
-    /// Microsoft's vendor id covers its own pads and the virtual Xbox pads
-    /// that copy their identity (Sunshine's "X-Box One" is 045e:02ea).
-    fn for_vendor(vendor: u16) -> Self {
-        if vendor == 0x045e {
-            Self::Xbox
-        } else {
-            Self::Positional
+    /// The kernel driver bound to the pad decides first, as drivers, not
+    /// vendors, choose the numbering: xpad drives about 60 vendors' Xbox-style
+    /// pads, and hid-nintendo drives Nintendo-licensed pads from vendors that
+    /// also make Xbox ones. Devices without a driver (uinput virtual pads such
+    /// as Sunshine's) and other drivers fall back to the vendor: Microsoft
+    /// (045e, including Sunshine's "X-Box One" 045e:02ea and Xbox pads over
+    /// Bluetooth) and Valve (28de, the Steam virtual gamepad).
+    fn detect(driver: Option<&str>, vendor: u16) -> Self {
+        match driver {
+            Some("playstation" | "sony" | "nintendo") => Self::Positional,
+            Some("xpad" | "hid-steam") => Self::Xbox,
+            _ if matches!(vendor, 0x045e | 0x28de) => Self::Xbox,
+            _ => Self::Positional,
         }
+    }
+
+    #[cfg(test)]
+    fn for_vendor(vendor: u16) -> Self {
+        Self::detect(None, vendor)
     }
 }
 
@@ -340,6 +351,16 @@ mod linux {
         }
     }
 
+    /// The kernel driver bound to an event node's device, if any. Virtual
+    /// (uinput) devices have none.
+    fn bound_driver(path: &Path) -> Option<String> {
+        let link = Path::new("/sys/class/input")
+            .join(path.file_name()?)
+            .join("device/device/driver");
+        let target = fs::read_link(link).ok()?;
+        Some(target.file_name()?.to_str()?.to_string())
+    }
+
     /// EVIOCGID: bus type, vendor, product and version.
     fn device_id(fd: i32) -> [u16; 4] {
         let mut id = [0_u16; 4];
@@ -415,9 +436,13 @@ mod linux {
             return Probe::NotAPad;
         }
         let [_, vendor, product, _] = device_id(raw);
-        let layout = FaceLayout::for_vendor(vendor);
+        let driver = bound_driver(path);
+        let layout = FaceLayout::detect(driver.as_deref(), vendor);
         let name = device_name(raw);
-        log::info!("Big Picture: {name} is {vendor:04x}:{product:04x}, {layout:?} face buttons");
+        log::info!(
+            "Big Picture: {name} is {vendor:04x}:{product:04x}, driver {}, {layout:?} face buttons",
+            driver.as_deref().unwrap_or("none")
+        );
         Probe::Pad(Open {
             name,
             decoder: Decoder {
@@ -1235,6 +1260,45 @@ mod tests {
         assert_eq!(map(0x045e, BTN_EAST), b(Button::East), "B");
         assert_eq!(map(0x045e, 0x133), b(Button::West), "X is the left button");
         assert_eq!(map(0x045e, 0x134), b(Button::North), "Y is the top button");
+        // Drivers decide before vendors.
+        let layout = FaceLayout::detect;
+        assert_eq!(
+            layout(Some("xpad"), 0x24c6),
+            FaceLayout::Xbox,
+            "PowerA on xpad"
+        );
+        assert_eq!(
+            layout(Some("xpad"), 0x2dc8),
+            FaceLayout::Xbox,
+            "8BitDo on xpad"
+        );
+        assert_eq!(
+            layout(Some("hid-steam"), 0x28de),
+            FaceLayout::Xbox,
+            "Steam Deck"
+        );
+        assert_eq!(
+            layout(None, 0x28de),
+            FaceLayout::Xbox,
+            "Steam virtual gamepad"
+        );
+        assert_eq!(layout(None, 0x045e), FaceLayout::Xbox, "Sunshine X-Box One");
+        assert_eq!(
+            layout(Some("microsoft"), 0x045e),
+            FaceLayout::Xbox,
+            "Xbox over Bluetooth"
+        );
+        assert_eq!(
+            layout(Some("nintendo"), 0x0f0d),
+            FaceLayout::Positional,
+            "a Hori pad licensed by Nintendo"
+        );
+        assert_eq!(layout(Some("playstation"), 0x054c), FaceLayout::Positional);
+        assert_eq!(
+            layout(Some("hid-generic"), 0x0079),
+            FaceLayout::Positional,
+            "unknown"
+        );
         // DualSense (054c) and Switch Pro (057e) report by position.
         for vendor in [0x054c, 0x057e] {
             assert_eq!(map(vendor, BTN_SOUTH), b(Button::South));
