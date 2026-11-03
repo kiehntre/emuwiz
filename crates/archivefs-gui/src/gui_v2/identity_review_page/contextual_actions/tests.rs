@@ -139,12 +139,12 @@ fn verification_actions_reuse_existing_routes_and_preserve_saved_state() {
         (
             VerificationAction::Audit,
             "Verify this game",
-            Route::PlatformCheck("Amiga".into()),
+            Route::GameCheck(game.archive.id),
         ),
         (
             VerificationAction::Recheck,
             "Re-check this game",
-            Route::PlatformCheck("Amiga".into()),
+            Route::GameCheck(game.archive.id),
         ),
         (
             VerificationAction::Review,

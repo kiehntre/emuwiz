@@ -450,6 +450,11 @@ pub struct DatValidationReport {
     pub formats: Vec<String>,
     /// A path-policy refusal, when the source never got as far as parsing.
     pub path_refusal: Option<String>,
+    /// A file source's `size:seconds:nanoseconds`, observed identically just
+    /// before and just after it was parsed. `None` when it changed while being
+    /// read (or for a folder): the header is then not recorded.
+    #[serde(skip)]
+    pub parsed_observation: Option<String>,
 }
 
 impl DatValidationReport {
@@ -474,7 +479,50 @@ impl DatValidationReport {
             observed_modified_unix_seconds: modified,
             observed_modified_subsec_nanos: modified_nanos,
             arcade_catalogue_revisions: arcade_catalogue_revisions(&self.files),
+            header: None,
         }
+        .with_header(kind, &self.files, self.parsed_observation.as_deref())
+    }
+}
+
+impl DatSourceHealth {
+    /// Records the one parsed header of a file source against this record's
+    /// own observation. A folder, a failed parse or an unobserved file
+    /// records nothing.
+    fn with_header(
+        mut self,
+        kind: DatSourceKind,
+        files: &[DatFileReport],
+        parsed_observation: Option<&str>,
+    ) -> Self {
+        if kind != DatSourceKind::File {
+            return self;
+        }
+        let Some(observed) = self.observation() else {
+            return self;
+        };
+        // The header belongs to the bytes that were parsed. If the file seen
+        // now is not the file seen while parsing, record no header.
+        if parsed_observation != Some(observed.as_str()) {
+            return self;
+        }
+        if let [
+            DatFileReport {
+                outcome:
+                    DatFileOutcome::Parsed {
+                        ecosystem, name, ..
+                    },
+                ..
+            },
+        ] = files
+        {
+            self.header = Some(super::RecordedDatHeader {
+                name: name.clone(),
+                ecosystem: Some(*ecosystem),
+                observed,
+            });
+        }
+        self
     }
 }
 
@@ -512,6 +560,19 @@ pub(crate) fn arcade_catalogue_revisions(files: &[DatFileReport]) -> Vec<ArcadeC
         }
     }
     revisions
+}
+
+/// The same `size:seconds:nanoseconds` text [`DatSourceHealth::observation`]
+/// produces, for a file as it is now.
+pub(crate) fn observation_text(path: &Path) -> Option<String> {
+    let (size, modified, nanos) = observe_file(path);
+    DatSourceHealth {
+        observed_size_bytes: size,
+        observed_modified_unix_seconds: modified,
+        observed_modified_subsec_nanos: nanos,
+        ..DatSourceHealth::default()
+    }
+    .observation()
 }
 
 fn observe_file(path: &Path) -> (Option<u64>, Option<i64>, Option<u32>) {
@@ -566,6 +627,7 @@ pub fn validate_dat_source(
         rom_count: 0,
         formats: Vec::new(),
         path_refusal: None,
+        parsed_observation: None,
     };
 
     if let Err(refusal) = validate_dat_path(&entry.path, entry.kind) {
@@ -610,6 +672,7 @@ pub fn validate_dat_source(
     let mut warned = false;
     let mut errored = false;
 
+    let before_parse = (entry.kind == DatSourceKind::File).then(|| observation_text(&entry.path));
     for path in &files {
         let file_name = path
             .file_name()
@@ -701,6 +764,11 @@ pub fn validate_dat_source(
             file_name,
             outcome,
         });
+    }
+    if let Some(Some(before)) = before_parse
+        && observation_text(&entry.path).as_deref() == Some(before.as_str())
+    {
+        report.parsed_observation = Some(before);
     }
 
     formats.sort();

@@ -290,6 +290,7 @@ pub(super) fn destination_for(route: &Route) -> Option<Destination> {
         | Route::Game(_)
         | Route::ReviewIdentity(_)
         | Route::PlatformCheck(_)
+        | Route::GameCheck(_)
         | Route::LibraryFiles => return Some(Destination::Library),
         Route::QuickRename | Route::MameWorkflow => return Some(Destination::OrganiseExport),
         // Tools opened from All Tools live there, whatever section owns them.
