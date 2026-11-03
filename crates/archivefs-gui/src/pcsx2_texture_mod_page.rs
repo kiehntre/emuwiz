@@ -269,15 +269,7 @@ fn incomplete_install_lines(
         return Vec::new();
     }
     let entries = &result.journal.entries;
-    let written = entries
-        .iter()
-        .filter(|entry| {
-            matches!(
-                entry.outcome,
-                SharedApplyOutcome::InstalledNew | SharedApplyOutcome::ReplacedExisting
-            )
-        })
-        .count();
+    let written = entries.iter().filter(|entry| written(entry)).count();
     let rollback_line = match rollback {
         Some(rollback) if rollback.status == SharedApplyStatus::Success => {
             "Automatic rollback completed and reversed this install's recorded changes, so there is nothing to undo.".to_string()
@@ -287,24 +279,34 @@ fn incomplete_install_lines(
             rollback.status
         ),
         None if written == 0 => {
-            "Automatic rollback did not run because no file was recorded as written.".to_string()
+            "Automatic rollback did not run because no file was written or changed.".to_string()
         }
         None => "Automatic rollback did not run, so the files written before the failure are still in place. Check the destination before using this profile.".to_string(),
     };
     vec![
         format!(
-            "The install did not complete ({status:?}): {written} of {} file(s) were recorded as written.",
+            "The install did not complete ({status:?}): {written} of {} file(s) were written or may have been changed on disk.",
             entries.len()
         ),
         rollback_line,
     ]
 }
 
+/// Whether this entry may have changed the destination on disk. A completed
+/// write counts, and so does a write or verification failure that happened
+/// after the pack's file reached the destination: the core records the
+/// temporary path whenever a write got that far (checkpoint failed after the
+/// replace, verification failed, a displaced file kept, or a published file
+/// that changed straight afterwards). Counting one too many fails closed:
+/// Check Undo is still gated by a fresh preview.
 fn written(entry: &SharedApplyEntry) -> bool {
-    matches!(
-        entry.outcome,
-        SharedApplyOutcome::InstalledNew | SharedApplyOutcome::ReplacedExisting
-    )
+    match entry.outcome {
+        SharedApplyOutcome::InstalledNew | SharedApplyOutcome::ReplacedExisting => true,
+        SharedApplyOutcome::WriteFailed | SharedApplyOutcome::VerificationFailed => {
+            entry.temporary_path.is_some() || entry.final_destination_digest.is_some()
+        }
+        _ => false,
+    }
 }
 
 fn rollback_succeeded(rollback: Option<&SharedRollbackResult>) -> bool {
@@ -375,12 +377,17 @@ fn recovery_lines(
                 "the pack's file was removed by automatic rollback.".to_string()
             }
             outcome => {
-                let state = match (&entry.outcome, &entry.backup_path) {
-                    (SharedApplyOutcome::ReplacedExisting, Some(backup)) => format!(
+                let replaced = match entry.outcome {
+                    SharedApplyOutcome::ReplacedExisting => true,
+                    SharedApplyOutcome::InstalledNew => false,
+                    _ => entry.destination_existed_before_apply == Some(true),
+                };
+                let state = match (replaced || entry.backup_path.is_some(), &entry.backup_path) {
+                    (_, Some(backup)) => format!(
                         "may still be the pack's file; your original is kept in EmuWiz's backup at {}",
                         backup.display
                     ),
-                    (SharedApplyOutcome::ReplacedExisting, None) => {
+                    (true, None) => {
                         "may still be the pack's file, and no backup of your original was recorded"
                             .to_string()
                     }
@@ -804,7 +811,7 @@ mod tests {
         assert!(text.contains("Install incomplete"), "{text}");
         assert!(text.contains("PartialFailure"), "{text}");
         assert!(
-            text.contains("1 of 1 file(s) were recorded as written"),
+            text.contains("1 of 1 file(s) were written or may have been changed on disk"),
             "{text}"
         );
         assert!(
@@ -934,11 +941,36 @@ mod tests {
         assert_no_undo(&text);
         assert!(text.contains("Install failed"), "{text}");
         assert!(
-            text.contains("0 of 1 file(s) were recorded as written"),
+            text.contains("0 of 1 file(s) were written or may have been changed on disk"),
             "{text}"
         );
-        assert!(text.contains("no file was recorded as written"), "{text}");
+        assert!(text.contains("no file was written or changed"), "{text}");
         assert!(!text.contains("Recovery required"), "{text}");
+    }
+
+    /// The core can report WriteFailed after the pack's file already replaced
+    /// the live file (its durable checkpoint failed). With one file the status
+    /// is Failed, so automatic rollback never runs: the page must still say
+    /// recovery is required, name the backup, and offer the gated Check Undo.
+    #[test]
+    fn a_write_failure_after_the_file_was_replaced_requires_recovery() {
+        let mut result = with_backup(journalled(failed_result()));
+        result.journal.entries[0].temporary_path = Some(
+            archivefs_core::patch_manager::SharedTransactionPath::from_path(Path::new(
+                "/disposable/destination/pack/.tmp",
+            )),
+        );
+        assert_eq!(undo_choice(&result, None), UndoChoice::CheckUndo);
+        let text = panel_after(result, None);
+        assert_not_installed(&text);
+        assert_recovery_required(&text);
+        assert!(
+            text.contains("1 of 1 file(s) were written or may have been changed on disk"),
+            "{text}"
+        );
+        assert!(!text.contains("no file was written or changed"), "{text}");
+        assert!(text.contains(BACKUP), "{text}");
+        assert!(text.contains("Check Undo"), "{text}");
     }
 
     #[test]
