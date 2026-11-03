@@ -512,7 +512,9 @@ impl App {
         commands.extend(state.pad_commands(now, open));
         if focused {
             // Taken even when closed, so a key held while a game runs or in
-            // the grace period after it reaches neither Big Picture nor a widget.
+            // the grace period after it does not act on Big Picture. The Launch
+            // step still passes Tab, Enter and Space to its page, whose own
+            // "launch in progress" guard refuses a second start.
             let keys = keyboard_commands(context, state.step, state.overlay.as_ref());
             if open {
                 commands.extend(keys);
