@@ -37,6 +37,10 @@ use crate::repair::proposal::{
 };
 use crate::safe_read::TrustedRoots;
 
+/// The only chdman the converter runs when its caller names none (the GUI
+/// never does). Storage Review compares a probed PATH copy against this.
+pub const REVIEWED_CHDMAN_PATH: &str = "/usr/bin/chdman";
+
 const CHDMAN_TIMEOUT: Duration = Duration::from_secs(30);
 
 /// Staging directory name prefix used while `chdman` writes its output.
@@ -449,7 +453,7 @@ fn resolve_chdman(explicit: Option<&Path>) -> Result<PathBuf, ChdConversionError
         }
         return Ok(path.to_path_buf());
     }
-    let preferred = Path::new("/usr/bin/chdman");
+    let preferred = Path::new(REVIEWED_CHDMAN_PATH);
     if preferred.exists() {
         return resolve_chdman(Some(preferred));
     }
@@ -458,12 +462,17 @@ fn resolve_chdman(explicit: Option<&Path>) -> Result<PathBuf, ChdConversionError
     ))
 }
 
-pub fn build_chd_conversion_plan(
-    cue_path: &Path,
-    target_path: &Path,
-    source_mode: ChdConversionSourceMode,
-    chdman_path: Option<&Path>,
-) -> Result<ChdConversionPlan, ChdConversionError> {
+/// Read-only source admission for the verified CUE/BIN to CHD lane: exactly
+/// the source checks [`build_chd_conversion_plan`] applies, without choosing a
+/// target, resolving chdman or capturing identities. Callers that only report
+/// eligibility (Storage Review) use this, so they can never call a disc
+/// convertible that the converter itself would refuse.
+pub fn check_chd_conversion_source(cue_path: &Path) -> Result<(), ChdConversionError> {
+    source_preflight(cue_path)?;
+    admitted_source_layout(cue_path, ChdConversionSourceMode::KeepSource).map(|_| ())
+}
+
+fn source_preflight(cue_path: &Path) -> Result<(), ChdConversionError> {
     safe_regular(cue_path).map_err(|e| ChdConversionError::InvalidSource(format!("CUE: {e}")))?;
     if fs::metadata(cue_path)
         .map_err(|e| ChdConversionError::InvalidSource(e.to_string()))?
@@ -474,8 +483,13 @@ pub fn build_chd_conversion_plan(
             "CUE exceeds the conversion size limit".into(),
         ));
     }
-    let cue_identity =
-        capture_identity(cue_path).map_err(|e| ChdConversionError::InvalidSource(e.to_string()))?;
+    Ok(())
+}
+
+fn admitted_source_layout(
+    cue_path: &Path,
+    source_mode: ChdConversionSourceMode,
+) -> Result<crate::ingestion::cue_bin::CueLayout, ChdConversionError> {
     let layout = layout_contract::source_layout(cue_path, source_mode)
         .map_err(ChdConversionError::InvalidSource)?;
     let track = layout
@@ -483,6 +497,22 @@ pub fn build_chd_conversion_plan(
         .map_err(|e| ChdConversionError::InvalidSource(e.to_string()))?;
     safe_regular(&track.path)
         .map_err(|e| ChdConversionError::InvalidSource(format!("BIN: {e}")))?;
+    Ok(layout)
+}
+
+pub fn build_chd_conversion_plan(
+    cue_path: &Path,
+    target_path: &Path,
+    source_mode: ChdConversionSourceMode,
+    chdman_path: Option<&Path>,
+) -> Result<ChdConversionPlan, ChdConversionError> {
+    source_preflight(cue_path)?;
+    let cue_identity =
+        capture_identity(cue_path).map_err(|e| ChdConversionError::InvalidSource(e.to_string()))?;
+    let layout = admitted_source_layout(cue_path, source_mode)?;
+    let track = layout
+        .supported_single_mode1_2048()
+        .map_err(|e| ChdConversionError::InvalidSource(e.to_string()))?;
     let bin_identity = capture_identity(&track.path)
         .map_err(|e| ChdConversionError::InvalidSource(e.to_string()))?;
     let source_fingerprint = fingerprint_cue_layout(&layout)

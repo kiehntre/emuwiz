@@ -143,6 +143,10 @@ pub struct StorageConversionCapability {
     pub round_trip: StorageRoundTripClass,
     pub verification_required: String,
     pub savings_measurement: String,
+    /// Why an otherwise-described route is not ready, when the eligibility
+    /// alone does not say (for example a chdman the converter does not run).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub eligibility_detail: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
@@ -273,6 +277,14 @@ fn unknown_estimate(explanation: &str) -> StorageEstimate {
     }
 }
 
+/// The converter's specific preservation reason when it gave one, otherwise
+/// its whole refusal message.
+fn chd_refusal_reason(message: &str) -> String {
+    crate::repair::optical_conversion::layout_preservation_detail(message)
+        .unwrap_or(message)
+        .to_string()
+}
+
 fn opportunity_for(
     format: StorageFormatClass,
     platform: Option<&str>,
@@ -346,16 +358,32 @@ fn opportunity_for(
             let warning = if track_count > 1 { Some("Multi-track topology must be preserved and independently verified.".into()) } else { None };
             let mut warnings = Vec::new();
             if layout.is_err() { warnings.push(StorageWarning { code: "CUE_REVIEW_REQUIRED".into(), message: "CUE topology could not be verified from the current source.".into() }); }
+            // Only the verified converter's own source admission makes a sheet
+            // a CHD candidate. A sheet that merely parses is not enough.
+            let admission = layout.as_ref().map_err(ToString::to_string).and_then(|_| {
+                crate::repair::optical_conversion::check_chd_conversion_source(path)
+                    .map_err(|error| chd_refusal_reason(&error.to_string()))
+            });
+            let refusal = match admission {
+                Ok(()) => None,
+                Err(reason) => Some(if layout.is_ok() {
+                    format!("EmuWiz's verified CUE/BIN to CHD converter does not accept this disc, so no conversion is offered: {reason}")
+                } else {
+                    "CUE topology could not be verified.".to_string()
+                }),
+            };
+            if refusal.is_some() && layout.is_ok() { warnings.push(StorageWarning { code: "CHD_CONVERSION_UNSUPPORTED".into(), message: "This disc layout is outside the verified CUE/BIN to CHD conversion; it is listed but not offered.".into() }); }
+            let admitted = refusal.is_none();
             (
                 StorageOpportunity {
-                    kind: if layout.is_ok() { StorageOpportunityKind::Compressible } else { StorageOpportunityKind::TopologySensitive },
-                    target_format: layout.is_ok().then_some(StorageFormatClass::Chd),
-                    round_trip: if layout.is_ok() { StorageRoundTripClass::ContentEquivalent } else { StorageRoundTripClass::NotEstablished },
-                    confidence: if layout.is_ok() { StorageConfidence::High } else { StorageConfidence::Low },
-                    estimate: if layout.is_ok() { rough_estimate(logical, "Qualitative opportunity only; exact CHD savings require a bounded dry-run or conversion measurement.") } else { unknown_estimate("CUE topology could not be verified.") },
+                    kind: if admitted { StorageOpportunityKind::Compressible } else { StorageOpportunityKind::TopologySensitive },
+                    target_format: admitted.then_some(StorageFormatClass::Chd),
+                    round_trip: if admitted { StorageRoundTripClass::ContentEquivalent } else { StorageRoundTripClass::NotEstablished },
+                    confidence: if admitted { StorageConfidence::High } else { StorageConfidence::Low },
+                    estimate: match &refusal { None => rough_estimate(logical, "Qualitative opportunity only; exact CHD savings require a bounded dry-run or conversion measurement."), Some(reason) => unknown_estimate(reason) },
                     verification_required: true,
                     topology_sensitive: true,
-                    cleanup_eligibility: "REQUIRES_VERIFICATION".into(),
+                    cleanup_eligibility: if admitted { "REQUIRES_VERIFICATION".into() } else { "NOT_ELIGIBLE".into() },
                     warning,
                 },
                 warnings,
@@ -364,15 +392,17 @@ fn opportunity_for(
         StorageFormatClass::Gdi => {
             let valid = resolve_gdi_all_tracks(path).is_ok();
             (
+                // No verified GDI to CHD converter exists: a complete descriptor
+                // is listed with its reason, never offered as a conversion.
                 StorageOpportunity {
-                    kind: if valid { StorageOpportunityKind::Compressible } else { StorageOpportunityKind::TopologySensitive },
-                    target_format: valid.then_some(StorageFormatClass::Chd),
-                    round_trip: if valid { StorageRoundTripClass::ContentEquivalent } else { StorageRoundTripClass::NotEstablished },
+                    kind: StorageOpportunityKind::TopologySensitive,
+                    target_format: None,
+                    round_trip: StorageRoundTripClass::NotEstablished,
                     confidence: if valid && platform_is(platform, &["dreamcast"]) { StorageConfidence::Medium } else { StorageConfidence::Low },
-                    estimate: if valid { rough_estimate(logical, "Range only; GD-ROM CHD savings depend on track layout and compression." ) } else { unknown_estimate("GDI topology is incomplete or invalid.") },
+                    estimate: if valid { unknown_estimate("EmuWiz has no verified GDI to CHD converter, so no conversion is offered. Its only verified CHD conversion is a single-track CUE/BIN.") } else { unknown_estimate("GDI topology is incomplete or invalid.") },
                     verification_required: true,
                     topology_sensitive: true,
-                    cleanup_eligibility: "REQUIRES_VERIFICATION".into(),
+                    cleanup_eligibility: "NOT_ELIGIBLE".into(),
                     warning: Some("Dreamcast/GD-ROM topology must be verified before any future conversion.".into()),
                 },
                 Vec::new(),
@@ -384,7 +414,22 @@ fn opportunity_for(
             } else if platform_is(platform, &["psp"]) {
                 (Some(StorageFormatClass::Cso), StorageRoundTripClass::PlayableNotOriginalReconstructable, "CSO is a PSP compatibility candidate; exact savings and compatibility require verification.")
             } else if platform_is(platform, &["playstation", "ps2", "saturn", "dreamcast", "sega cd", "pc engine cd", "neogeo cd", "3do"]) {
-                (Some(StorageFormatClass::Chd), StorageRoundTripClass::ContentEquivalent, "Optical CHD candidacy requires verified media classification; generic ISO to CHD is not assumed safe.")
+                // Listed with its reason, never offered: no ISO to CHD converter is
+                // verified, and nothing here proves CD versus DVD media.
+                return (
+                    StorageOpportunity {
+                        kind: StorageOpportunityKind::TopologySensitive,
+                        target_format: None,
+                        round_trip: StorageRoundTripClass::NotEstablished,
+                        confidence: StorageConfidence::Low,
+                        estimate: unknown_estimate("EmuWiz has no verified ISO to CHD converter, so no conversion is offered. A CD image needs its track layout (CUE/BIN) and chdman's CD mode; chdman's DVD mode is right only for proven DVD media, and this image's media type is not proven."),
+                        verification_required: true,
+                        topology_sensitive: true,
+                        cleanup_eligibility: "NOT_ELIGIBLE".into(),
+                        warning: Some("Disc type and track topology must be proven before a CHD mode is selected.".into()),
+                    },
+                    Vec::new(),
+                );
             } else {
                 (None, StorageRoundTripClass::NotEstablished, "Media platform is not sufficient to propose a safe target format.")
             };
@@ -638,13 +683,17 @@ mod tests {
         fs::write(&path, vec![0_u8; 1000]).unwrap();
         let report = analyze_storage_health(&[input(&path, "PlayStation 2")]);
         assert_eq!(report.items[0].format, StorageFormatClass::Iso);
+        // Was `Some(Chd)` with a rough estimate (2026-11-03): no verified ISO
+        // to CHD converter exists and PS2 media type is unproven, so the image
+        // is listed with a reason and no target.
+        assert_eq!(report.items[0].opportunity.target_format, None);
         assert_eq!(
-            report.items[0].opportunity.target_format,
-            Some(StorageFormatClass::Chd)
+            report.items[0].opportunity.kind,
+            StorageOpportunityKind::TopologySensitive
         );
         assert_eq!(
             report.items[0].opportunity.estimate.kind,
-            StorageEstimateKind::RoughOpportunity
+            StorageEstimateKind::Unknown
         );
         assert_ne!(
             report.items[0].opportunity.estimate.kind,
@@ -661,9 +710,12 @@ mod tests {
         fs::write(&cue, "FILE \"a.bin\" BINARY\n TRACK 01 MODE1/2352\n INDEX 01 00:00:00\n FILE \"b.bin\" BINARY\n TRACK 02 AUDIO\n INDEX 01 00:00:00\n").unwrap();
         let report = analyze_storage_health(&[input(&cue, "PlayStation")]);
         assert!(report.items[0].opportunity.topology_sensitive);
+        // Was `Some(Chd)` (2026-11-03): the verified converter refuses
+        // multi-track sheets, so no CHD target is offered for one.
+        assert_eq!(report.items[0].opportunity.target_format, None);
         assert_eq!(
-            report.items[0].opportunity.target_format,
-            Some(StorageFormatClass::Chd)
+            report.items[0].opportunity.kind,
+            StorageOpportunityKind::TopologySensitive
         );
         assert!(report.items[0].opportunity.warning.is_some());
     }
