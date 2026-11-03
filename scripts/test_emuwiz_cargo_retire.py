@@ -1403,6 +1403,360 @@ class OrphanRoute(Base):
         self.assertTrue(self.exists(t, "debug/deps"))
 
 
+ELF = b"\x7fELF\x02\x01\x01" + b"\x00" * 4089
+
+
+class ResidueExecutable(Base):
+    """Fix B: an uplifted binary left in a markerless `debug` profile by an earlier retirement."""
+
+    def residue(self, name="wt-res", exe="emuwiz", content=ELF, mode=0o755, profile="debug"):
+        wt, t = self.managed_cache(name)
+        for rel in ("debug/deps", "debug/.fingerprint", "debug/incremental"):
+            self.rmtree(os.path.join(t, rel))
+        for rel in ("debug/emuwiz", "debug/emuwiz.d", "debug/UNKNOWN.txt", ".rustc_info.json"):
+            os.unlink(os.path.join(t, rel))
+        os.makedirs(os.path.join(t, profile), exist_ok=True)
+        path = os.path.join(t, profile, exe)
+        with open(path, "wb") as handle:
+            handle.write(content)
+        os.chmod(path, mode)
+        self.age(t, 10)
+        return wt, t, path
+
+    def selected(self, t):
+        sel, _ = self.mod.F.select_artifacts(t, None)
+        return {os.path.relpath(s["path"], t): s["what"] for s in sel}
+
+    def retire(self, wt, t, rels, name="m.json"):
+        path, digest = self.manifest([self.group(wt, t, rels)], name)
+        rc, r = self.run_retire(path, digest, execute=True, window=True)
+        return self.outcomes(r), r
+
+    def test_markerless_debug_elf_is_selected_and_retired(self):
+        wt, t, exe = self.residue()
+        self.assertEqual(self.selected(t), {"debug/emuwiz": "post-retirement binary residue"})
+        out, r = self.retire(wt, t, ["debug/emuwiz"])
+        self.assertEqual(out["debug/emuwiz"][0], "REMOVED", r)
+        self.assertFalse(os.path.lexists(exe))
+        self.assertTrue(self.exists(t, "debug/.cargo-lock"))
+        self.assertTrue(self.exists(t, "debug/emuwiz-test-env/profile/library.db"))
+
+    def assert_refused(self, wt, t, exe, rel):
+        self.assertNotIn(rel, self.selected(t))
+        out, r = self.retire(wt, t, [rel])
+        self.assertNotEqual(out[rel][0], "REMOVED", r)
+        self.assertTrue(os.path.lexists(exe))
+
+    def test_non_elf_executable_is_never_residue(self):
+        wt, t, exe = self.residue(content=b"#!/bin/sh\necho keep\n" + b"x" * 64)
+        self.assert_refused(wt, t, exe, "debug/emuwiz")
+
+    def test_non_executable_elf_is_never_residue(self):
+        wt, t, exe = self.residue(mode=0o644)
+        self.assert_refused(wt, t, exe, "debug/emuwiz")
+
+    def test_hardlinked_binary_is_never_residue(self):
+        wt, t, exe = self.residue()
+        os.link(exe, os.path.join(self.tmp, "installed-copy"))
+        self.assert_refused(wt, t, exe, "debug/emuwiz")
+
+    def test_release_profile_binary_is_never_residue(self):
+        wt, t, exe = self.residue(profile="release")
+        self.assert_refused(wt, t, exe, "release/emuwiz")
+
+    def test_binary_beside_remaining_cargo_output_is_not_residue(self):
+        wt, t, exe = self.residue()
+        os.makedirs(os.path.join(t, "debug", "deps"))
+        self.assert_refused(wt, t, exe, "debug/emuwiz")
+
+    def test_suffixed_or_journal_names_are_never_residue(self):
+        wt, t, exe = self.residue(exe="emuwiz.sh")
+        self.assert_refused(wt, t, exe, "debug/emuwiz.sh")
+        wt2, t2, exe2 = self.residue("wt-res2", exe="emuwiz-journal")
+        self.assert_refused(wt2, t2, exe2, "debug/emuwiz-journal")
+
+    def test_symlink_to_an_elf_is_never_residue(self):
+        wt, t, exe = self.residue()
+        link = os.path.join(t, "debug", "emuwiz-link")
+        os.symlink(exe, link)
+        self.assertNotIn("debug/emuwiz-link", self.selected(t))
+        out, r = self.retire(wt, t, ["debug/emuwiz-link"])
+        self.assertNotEqual(out["debug/emuwiz-link"][0], "REMOVED", r)
+        self.assertTrue(os.path.lexists(link) and os.path.lexists(exe))
+
+    def test_content_swapped_after_planning_is_held(self):
+        wt, t, exe = self.residue()
+        g = self.group(wt, t, ["debug/emuwiz"])
+        st = os.lstat(exe)
+        with open(exe, "r+b") as handle:  # same inode, no longer an ELF binary
+            handle.write(b"#!/bin/sh")
+        os.utime(exe, ns=(st.st_atime_ns, st.st_mtime_ns))  # isolate the predicate from the activity gate
+        path, digest = self.manifest([g])
+        rc, r = self.run_retire(path, digest, execute=True, window=True)
+        self.assertEqual(self.outcomes(r)["debug/emuwiz"][1], "NOT_A_COMPILER_ARTIFACT", r)
+        self.assertTrue(os.path.lexists(exe))
+
+    def test_residue_under_a_target_triple_is_retired(self):
+        rel = "x86_64-unknown-linux-gnu/debug/emuwiz"
+        wt, t, exe = self.residue(profile="x86_64-unknown-linux-gnu/debug")
+        self.assertIn(rel, self.selected(t))
+        out, r = self.retire(wt, t, [rel])
+        self.assertEqual(out[rel][0], "REMOVED", r)
+
+    def test_planned_residue_already_gone_is_absent_not_removed(self):
+        wt, t, exe = self.residue()
+        g = self.group(wt, t, ["debug/emuwiz"])
+        os.unlink(exe)
+        path, digest = self.manifest([g])
+        rc, r = self.run_retire(path, digest, execute=True, window=True)
+        self.assertEqual(self.outcomes(r)["debug/emuwiz"][1], "ALREADY_ABSENT", r)
+        self.assertTrue(self.exists(t, "debug/emuwiz-test-env/profile/library.db"))
+
+    def test_binary_beside_leftover_compiler_files_is_not_residue(self):
+        wt, t, exe = self.residue()
+        with open(os.path.join(t, "debug", "libother.rlib"), "wb") as handle:
+            handle.write(b"x" * 64)
+        self.age(t, 10)
+        self.assert_refused(wt, t, exe, "debug/emuwiz")
+
+
+class AttestedOrphanRoute(Base):
+    """Fix C: owner-attested orphan route for records built before checkout evidence existed."""
+
+    orphan = OrphanRoute.orphan
+    holds = OrphanRoute.holds
+    record_of = OrphanRoute.record_of
+
+    def attested(self, name="wt-att", strip=True, **kw):
+        wt, t, g = self.orphan(name, **kw)
+        rec_path, rec = self.record_of(t)
+        if strip:
+            rec.pop("checkout", None)
+            T.jdump(rec, rec_path)
+        att = {"repo": os.path.realpath(self.repo), "worktree": rec["worktree"], "head": rec["head"],
+               "attested_by": "owner-fixture", "reason": "fixture: merged and removed"}
+        g = dict(g, orphan_route="GIT_PRESERVED_ATTESTED", orphan_attestation=att)
+        return wt, t, g
+
+    def test_attested_orphan_without_checkout_evidence_is_retired_with_receipt(self):
+        wt, t, g = self.attested()
+        codes, r = self.holds(g)
+        self.assertEqual(codes, set(), r)
+        self.assertFalse(self.exists(t, "debug/deps"))
+        self.assertTrue(self.exists(t, "debug/emuwiz-test-env/profile/library.db"))
+        self.assertEqual(r["groups"][0]["orphan_route"], "GIT_PRESERVED_ATTESTED")
+        self.assertEqual(r["groups"][0]["orphan_attestation"]["attested_by"], "owner-fixture")
+
+    def test_evidence_route_still_refuses_records_without_checkout_evidence(self):
+        wt, t, g = self.attested()
+        codes, _ = self.holds(dict(g, orphan_route="GIT_PRESERVED"))
+        self.assertIn("ORPHAN_EVIDENCE_MISSING", codes)
+        self.assertTrue(self.exists(t, "debug/deps"))
+
+    def test_incomplete_attestation_holds(self):
+        wt, t, g = self.attested()
+        for i, key in enumerate(("repo", "worktree", "head", "attested_by", "reason")):
+            att = dict(g["orphan_attestation"])
+            att[key] = "  " if i % 2 else None
+            codes, _ = self.holds(dict(g, orphan_attestation=att), f"inc-{key}.json")
+            self.assertIn("ORPHAN_ATTESTATION_INVALID", codes, key)
+        codes, _ = self.holds({k: v for k, v in g.items() if k != "orphan_attestation"}, "none.json")
+        self.assertIn("ORPHAN_ATTESTATION_INVALID", codes)
+        self.assertTrue(self.exists(t, "debug/deps"))
+
+    def test_attestation_must_match_the_record(self):
+        wt, t, g = self.attested()
+        for label, change in (("head", {"head": "3" * 40}), ("worktree", {"worktree": os.path.join(self.tmp, "x")})):
+            att = dict(g["orphan_attestation"], **change)
+            codes, _ = self.holds(dict(g, orphan_attestation=att), label + ".json")
+            self.assertIn("OWNER_UNVERIFIED", codes, label)
+        self.assertTrue(self.exists(t, "debug/deps"))
+
+    def test_attested_head_not_on_origin_main_holds(self):
+        wt, t, g = self.attested(on_main=False)
+        codes, _ = self.holds(g)
+        self.assertIn("GIT_HISTORY_NOT_PRESERVED", codes)
+        self.assertTrue(self.exists(t, "debug/deps"))
+
+    def test_attested_live_or_registered_worktree_holds(self):
+        wt, t, g = self.attested(remove=None)
+        codes, _ = self.holds(g)
+        self.assertIn("ORPHAN_SOURCE_PRESENT", codes)
+        wt2, t2, g2 = self.attested("wt-att-reg", remove="dir-only")  # directory gone, git admin entry kept
+        codes, _ = self.holds(g2, "m2.json")
+        self.assertIn("ORPHAN_SOURCE_PRESENT", codes)
+        self.assertTrue(self.exists(t, "debug/deps") and self.exists(t2, "debug/deps"))
+
+    def test_unreadable_administrative_entry_holds(self):
+        wt, t, g = self.attested("wt-att-unk")
+        other = self.worktree("wt-att-other")
+        admin = os.path.join(self.repo, ".git", "worktrees", os.path.basename(other), "gitdir")
+        os.chmod(admin, 0)
+        self.addCleanup(os.chmod, admin, 0o644)
+        if os.access(admin, os.R_OK):
+            self.skipTest("running with privileges that ignore file modes")
+        codes, _ = self.holds(g)
+        self.assertIn("ORPHAN_SOURCE_UNKNOWN", codes)
+        self.assertTrue(self.exists(t, "debug/deps"))
+
+    def test_non_canonical_or_mismatched_repository_holds(self):
+        wt, t, g = self.attested()
+        link = os.path.join(self.tmp, "repo-link")
+        os.symlink(os.path.realpath(self.repo), link)
+        fake = os.path.join(self.tmp, "redirect")
+        os.makedirs(fake)
+        with open(os.path.join(fake, ".git"), "w") as handle:
+            handle.write("gitdir: " + os.path.join(self.repo, ".git") + "\n")
+        for label, repo in (("relative", "relative/repo"), ("symlink", link), ("gitfile", os.path.realpath(fake)),
+                            ("missing", os.path.join(self.tmp, "no-such-repo"))):
+            att = dict(g["orphan_attestation"], repo=repo)
+            codes, _ = self.holds(dict(g, orphan_attestation=att, orphan_repo=None), label + ".json")
+            self.assertIn("ORPHAN_REPO_UNVERIFIED", codes, label)
+        codes, _ = self.holds(dict(g, orphan_repo=os.path.join(self.tmp, "elsewhere")), "mismatch.json")
+        self.assertIn("ORPHAN_REPO_UNVERIFIED", codes)
+        self.assertTrue(self.exists(t, "debug/deps"))
+
+    def test_records_with_checkout_evidence_keep_moved_checkout_detection(self):
+        wt, t = self.managed_cache("wt-att-moved")
+        head = self.mod.F.head_of(wt)
+        self.git("-C", self.repo, "update-ref", "refs/remotes/origin/main", head)
+        self.git("-C", self.repo, "worktree", "move", wt, os.path.join(self.tmp, "wt-att-moved-elsewhere"))
+        rec_path, rec = self.record_of(t)
+        rec["checkout"]["gitdir"] = os.path.join(self.tmp, "gone-admin")
+        T.jdump(rec, rec_path)
+        g = self.group(self.worktree("scratch-att-moved"), t)
+        g.update({"source_exists": False, "associated_source_paths": "[]", "source_head": head,
+                  "orphan_route": "GIT_PRESERVED_ATTESTED",
+                  "orphan_attestation": {"repo": os.path.realpath(self.repo), "worktree": rec["worktree"],
+                                         "head": head, "attested_by": "owner-fixture", "reason": "fixture"}})
+        codes, _ = self.holds(g)
+        self.assertIn("ORPHAN_SOURCE_MOVED", codes)
+        self.assertTrue(self.exists(t, "debug/deps"))
+
+    def test_malformed_checkout_value_is_judged_by_the_evidence_route(self):
+        wt, t, g = self.attested("wt-att-null")
+        for value in (None, [], "x", False):
+            rec_path, rec = self.record_of(t)
+            rec["checkout"] = value
+            T.jdump(rec, rec_path)
+            for route in ("GIT_PRESERVED_ATTESTED", "GIT_PRESERVED"):
+                codes, _ = self.holds(dict(g, orphan_route=route), f"null-{route}-{value!r}.json")
+                self.assertIn("ORPHAN_EVIDENCE_MISSING", codes, (route, value))
+        self.assertTrue(self.exists(t, "debug/deps"))
+
+    def test_attested_repository_must_match_recorded_evidence(self):
+        wt, t, g = self.attested("wt-att-ev", strip=False)
+        other = os.path.join(self.tmp, "other-repo-att")
+        self.git("init", "-q", other)
+        self.git("-C", other, "fetch", "-q", os.path.join(self.repo, ".git"))
+        self.git("-C", other, "update-ref", "refs/remotes/origin/main", g["source_head"])
+        att = dict(g["orphan_attestation"], repo=os.path.realpath(other))
+        codes, _ = self.holds(dict(g, orphan_attestation=att, orphan_repo=None), "ev-mismatch.json")
+        self.assertIn("ORPHAN_REPO_UNVERIFIED", codes)
+        self.assertTrue(self.exists(t, "debug/deps"))
+        codes, r = self.holds(g, "ev-ok.json")  # matching repository: the evidence route retires it
+        self.assertEqual(codes, set(), r)
+        self.assertFalse(self.exists(t, "debug/deps"))
+
+    # ---- review conditions on PR #301 (C2, C3, receipt route)
+
+    def clone_with_head(self, name, head):
+        other = os.path.join(self.tmp, name)
+        self.git("init", "-q", other)
+        self.git("-C", other, "fetch", "-q", os.path.join(self.repo, ".git"))
+        self.git("-C", other, "update-ref", "refs/remotes/origin/main", head)
+        return os.path.realpath(other)
+
+    def fake_registration(self, repo_dir, wt, relative=False):
+        """`repo_dir/.git/worktrees/<id>/gitdir` pointing at `wt`, as git leaves an unpruned entry."""
+        entry = os.path.join(repo_dir, ".git", "worktrees", os.path.basename(wt))
+        os.makedirs(entry)
+        pointer = os.path.join(wt, ".git")
+        with open(os.path.join(entry, "gitdir"), "w") as handle:
+            handle.write((os.path.relpath(pointer, entry) if relative else pointer) + "\n")
+        return entry
+
+    def test_c2_worktree_still_registered_in_another_repository_holds(self):
+        # W belongs to self.repo and is still registered there (directory gone, entry unpruned); the
+        # manifest attests another clone whose origin/main also contains the HEAD.
+        wt, t, g = self.attested("wt-att-xrepo", remove="dir-only")
+        other = self.clone_with_head("other-repo-xrepo", g["source_head"])
+        att = dict(g["orphan_attestation"], repo=other)
+        codes, r = self.holds(dict(g, orphan_attestation=att, orphan_repo=None))
+        self.assertIn("ORPHAN_SOURCE_PRESENT", codes, r)
+        self.assertTrue(self.exists(t, "debug/deps"))
+
+    def test_c2_sibling_repository_with_a_relative_entry_holds(self):
+        wt, t, g = self.attested("wt-att-xrel")
+        self.fake_registration(os.path.join(self.tmp, "sibling-clone"), wt, relative=True)
+        codes, r = self.holds(g)
+        self.assertIn("ORPHAN_SOURCE_PRESENT", codes, r)
+        self.assertTrue(self.exists(t, "debug/deps"))
+
+    def test_c2_unjudgeable_sibling_repository_holds(self):
+        wt, t, g = self.attested("wt-att-xunk")
+        sib = os.path.join(self.tmp, "locked-sibling")
+        os.makedirs(os.path.join(sib, ".git", "worktrees"))
+        os.chmod(sib, 0)
+        self.addCleanup(os.chmod, sib, 0o755)
+        if os.access(sib, os.X_OK):
+            self.skipTest("running with privileges that ignore file modes")
+        codes, r = self.holds(g)
+        self.assertIn("ORPHAN_SOURCE_UNKNOWN", codes, r)
+        self.assertTrue(self.exists(t, "debug/deps"))
+
+    def test_c2_documented_limit_a_repository_elsewhere_is_not_seen(self):
+        # Pins the documented limitation: a repository that is neither beside the worktree nor beside
+        # the attested repository cannot be seen, so the owner must attest the exact repository.
+        wt, t, g = self.attested("wt-att-xfar")
+        self.fake_registration(os.path.join(self.tmp, "nest", "deeper", "far-clone"), wt)
+        codes, r = self.holds(g)
+        self.assertEqual(codes, set(), r)
+        self.assertFalse(self.exists(t, "debug/deps"))
+
+    def test_c3_unsearchable_administrative_root_holds(self):
+        # .git cannot be searched, so `.git/worktrees` cannot be judged. git is stubbed to answer
+        # "registered nowhere, HEAD on origin/main" to isolate the administrative-entry check
+        # (unstubbed, a git failure would also hold, as ORPHAN_REPO_UNVERIFIED).
+        wt, t, g = self.attested("wt-att-c3")
+        common = os.path.join(self.repo, ".git")
+        os.chmod(common, 0o644)
+        self.addCleanup(os.chmod, common, 0o755)
+        if os.access(common, os.X_OK):
+            self.skipTest("running with privileges that ignore file modes")
+        real_git = self.mod._git
+        self.mod._git = lambda repo, *argv: subprocess.CompletedProcess(argv, 0, "", "")
+        self.addCleanup(setattr, self.mod, "_git", real_git)
+        codes, r = self.holds(g)
+        self.assertIn("ORPHAN_SOURCE_UNKNOWN", codes, r)
+        os.chmod(common, 0o755)
+        self.assertTrue(self.exists(t, "debug/deps"))
+
+    def test_receipt_names_the_route_that_decided(self):
+        wt, t, g = self.attested("wt-att-rcpt-ev", strip=False)  # checkout evidence kept
+        codes, r = self.holds(g)
+        self.assertEqual(codes, set(), r)
+        self.assertEqual(r["groups"][0]["orphan_route"], "GIT_PRESERVED", r["groups"][0])
+        self.assertEqual(r["groups"][0]["orphan_route_requested"], "GIT_PRESERVED_ATTESTED")
+        wt2, t2, g2 = self.attested("wt-att-rcpt")  # no evidence: the attested route decides
+        codes, r = self.holds(g2, "m2.json")
+        self.assertEqual(codes, set(), r)
+        self.assertEqual(r["groups"][0]["orphan_route"], "GIT_PRESERVED_ATTESTED")
+        self.assertEqual(r["groups"][0]["orphan_route_requested"], "GIT_PRESERVED_ATTESTED")
+        wt3, t3, g3 = self.attested("wt-att-rcpt-inv", strip=False)  # evidence, but the attestation is invalid
+        codes, r = self.holds(dict(g3, orphan_attestation=dict(g3["orphan_attestation"], reason=" ")), "m3.json")
+        self.assertIn("ORPHAN_ATTESTATION_INVALID", codes, r)
+        self.assertEqual(r["groups"][0]["orphan_route"], "GIT_PRESERVED_ATTESTED")  # it decided, and held
+        self.assertTrue(self.exists(t3, "debug/deps"))
+
+    def test_pin_still_holds_an_attested_orphan(self):
+        wt, t, g = self.attested("wt-att-pin")
+        self.assertEqual(self.ret("pin", t, "--reason", "independent-review").returncode, 0)
+        codes, _ = self.holds(g)
+        self.assertIn("PINNED", codes)
+        self.assertTrue(self.exists(t, "debug/deps"))
+
+
 class NoManualDeletionRoute(unittest.TestCase):
     def test_no_script_in_the_repository_bypasses_the_retirement_tool(self):
         root = os.path.dirname(HERE)

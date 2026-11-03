@@ -2058,6 +2058,7 @@ fn page_with_report(
         rom_count: 1,
         formats: vec!["Logiqx XML".to_string()],
         path_refusal: None,
+        parsed_observation: None,
     };
     page.validations.insert(id.clone(), report.clone());
     if let Some(entry) = page.draft.get_mut(&id) {
@@ -2699,6 +2700,7 @@ fn expanding_a_group_on_one_source_does_not_open_the_same_group_on_another() {
             rom_count: 1,
             formats: vec!["Logiqx XML".to_string()],
             path_refusal: None,
+            parsed_observation: None,
         };
         page.validations.insert(id, report);
         pages.push(page);
@@ -8992,6 +8994,7 @@ mod persist_expected_inventory {
             rom_count: 1,
             formats: vec!["Logiqx XML".to_string()],
             path_refusal: None,
+            parsed_observation: None,
         }
     }
 
