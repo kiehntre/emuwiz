@@ -110,9 +110,10 @@ class Limits(unittest.TestCase):
         # decoy) before the pidfd opens. That PID must be skipped, never
         # signalled, and every process still ours must be stopped.
         sandbox = gui_sandbox.Sandbox()
+        listed = sandbox.owned
+        child = None
         try:
             child = sandbox.spawn(["sleep", "60"])
-            listed = sandbox.owned
             calls = []
 
             def owned_with_a_reused_pid():
@@ -126,7 +127,7 @@ class Limits(unittest.TestCase):
             self.assertTrue(self.alive(self.decoy), "the reused PID was not signalled")
         finally:
             sandbox.owned = listed
-            if child.poll() is None:
+            if child is not None and child.poll() is None:
                 sandbox._signal(child.pid, 9)
                 child.wait()
             sandbox.root.cleanup()
