@@ -870,6 +870,10 @@ fn apply_all_safe_matches_changes_settings_only_and_a_changed_catalogue_never_st
     );
     drop(database);
     let loaded = load(&fixture, &database_path);
+    assert!(
+        !loaded.dat_identities.is_empty(),
+        "the saved rows are still read"
+    );
     for summaries in loaded.dat_identities.values() {
         for summary in summaries {
             assert!(
@@ -881,4 +885,10 @@ fn apply_all_safe_matches_changes_settings_only_and_a_changed_catalogue_never_st
         }
     }
     assert!(loaded.disc_members.is_empty());
+
+    // Apply left the newer check unsaved, so Save setup, the existing step
+    // that saves it, still marks the old catalogue's results stale.
+    page.apply(DatSourcesPageAction::Save);
+    assert!(page.action_error.is_none(), "{:?}", page.action_error);
+    assert_eq!(unmarked_identity_rows(&database_path), 0);
 }

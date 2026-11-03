@@ -331,7 +331,7 @@ fn apply_refuses_a_preview_entry_that_is_not_a_safe_match() {
 }
 
 #[test]
-fn an_unsaved_check_is_saved_together_with_the_system() {
+fn an_unsaved_check_is_used_but_never_saved_by_apply() {
     let setup = Setup::new(&[("gbc", "gbc.dat", "Nintendo - Game Boy Color")]);
     // The saved setup has never been checked by this version.
     setup.edit(|registry| registry.get_mut("gbc").unwrap().health.header = None);
@@ -348,7 +348,15 @@ fn an_unsaved_check_is_saved_together_with_the_system() {
         after.entries()[0].platform.as_deref(),
         Some("Game Boy Color")
     );
-    assert!(after.entries()[0].health.current_header().is_some());
+    assert_eq!(
+        after.entries()[0].platform_recognised_from.as_deref(),
+        Some("Nintendo - Game Boy Color")
+    );
+    // The check itself is Save setup's to save, so Save can still mark
+    // earlier results for a changed catalogue stale.
+    assert_eq!(after.entries()[0].health, saved.entries()[0].health);
+    // Until then the saved setup says to check it again.
+    assert_eq!(group_of(&after, "gbc"), RecognitionGroup::NeedsCheck);
 }
 
 #[test]

@@ -6399,7 +6399,7 @@ impl DatSourcesPageState {
                 draft.platform = saved.platform.clone();
                 draft.platform_recognised_from = saved.platform_recognised_from.clone();
                 draft.recognition_receipt = saved.recognition_receipt.clone();
-                draft.health = saved.health.clone();
+                draft.platform_chosen_by_person = saved.platform_chosen_by_person;
             }
         }
         self.saved = applied.registry;

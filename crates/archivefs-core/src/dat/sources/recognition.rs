@@ -310,8 +310,10 @@ pub struct AppliedMatches {
 ///
 /// `checked` is the registry the preview was made from. Its validation
 /// records may be newer than the saved ones (a check the person has not
-/// saved yet); for each previewed catalogue that record is saved too, so
-/// the system is never saved without the header it was recognised from.
+/// saved yet). Apply never saves those records: it writes only each
+/// system, the header name it was recognised from, and the Undo receipt.
+/// Saving a newer check stays with Save setup, which also marks earlier
+/// results for a changed catalogue stale.
 ///
 /// Refuses, writing nothing, unless the settings file still has
 /// `expected` (so the person saw the current setup) and each previewed
@@ -366,11 +368,7 @@ pub fn apply_safe_matches(
     // there is no moment at which a system is saved without its receipt.
     let batch = format!("{}-{}", now_unix_nanos(), expected.label());
     for item in preview {
-        let health = checked
-            .get(&item.source_id)
-            .map(|entry| entry.health.clone());
-        if let (Some(entry), Some(health)) = (registry.get_mut(&item.source_id), health) {
-            entry.health = health;
+        if let Some(entry) = registry.get_mut(&item.source_id) {
             entry.platform = Some(item.platform.to_string());
             entry.platform_recognised_from = Some(item.header_name.clone());
             entry.platform_chosen_by_person = false;
