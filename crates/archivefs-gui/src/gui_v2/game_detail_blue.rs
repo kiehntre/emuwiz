@@ -7,6 +7,8 @@
 
 use eframe::egui::{self, RichText};
 
+mod showcase;
+
 use super::{library::Game, simple_shell::palette};
 use crate::ui::theme::{self, blue};
 
@@ -118,6 +120,18 @@ fn resolved_information_rows(
         rows.push((*label, value.clone(), "ScreenScraper (saved record)".into()));
     }
     rows
+}
+
+/// The region and its source, as Game information would show them.
+pub(super) fn region(
+    game: &Game,
+    index: Option<&super::media_sources::MediaIndex>,
+) -> Option<(String, String)> {
+    let resolved = index.map(|index| index.resolved_for(game));
+    resolved_information_rows(game, resolved.as_deref())
+        .into_iter()
+        .find(|(label, _, _)| *label == "Region")
+        .map(|(_, value, source)| (value, source))
 }
 
 /// Shared explanation used by Game Details and Artwork, Manuals & Extras.

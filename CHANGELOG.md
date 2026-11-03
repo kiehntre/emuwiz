@@ -223,6 +223,12 @@ Changes promoted to `main` since `v0.9.0`. Linux-only and pre-1.0.
   DuckStation and PPSSPP and shows fallback and refusal.
 - **Multi-disc launch:** verified disc sets are handed to DuckStation, or
   to a RetroArch core whose own `.info` lists m3u, as an ordered playlist.
+- **Stop RetroArch:** a confirmed Stop asks the native RetroArch that EmuWiz
+  started to close normally, with one request and no forced quit. It is
+  refused for AppImage and any launch whose running program cannot be shown
+  to be RetroArch itself, and never reaches other RetroArch sessions.
+  **Flatpak RetroArch Stop is not supported yet:** EmuWiz does not launch
+  Flatpak RetroArch, including through a `flatpak run` launcher script.
 - New launch adapters for Atari800, Caprice32 and shadPS4 (extracted PS4
   folders); readiness previews only for b-em, NP2kai and Oricutron. Flycast
   GDI launch and ScummVM extracted-folder discovery and launch were added.
@@ -364,6 +370,9 @@ Changes promoted to `main` since `v0.9.0`. Linux-only and pre-1.0.
   interface, including emulator updates and Undo, CheatBase, ScreenScraper
   batch enrichment and library-wide Ready to Play. Blue save restore covers
   PS2 only; other save types are read-only.
+- RetroArch Stop covers verified native launches only. Flatpak RetroArch Stop
+  is not supported, and an AppImage launch has no Stop, so close RetroArch
+  from its own window.
 - Saturn CUE-tree and GDI patch apply exist in core but are not reachable
   from the GUI; Dreamcast DCP Apply stays refused until trustworthy package
   binding exists.

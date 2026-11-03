@@ -99,9 +99,10 @@ fn ready_dat_installation_never_verifies_any_of_the_four_systems() {
         assert_eq!(result.action, Action::Audit);
         assert!(result.explanation.contains("do not check game content"));
         assert!(result.explanation.contains("preview eligible files"));
+        // A one-game action opens the one-game check, never the platform.
         assert_eq!(
             result.action.route(&f.game),
-            super::super::routes::Route::PlatformCheck(f.game.platform.clone())
+            super::super::routes::Route::GameCheck(f.game.archive.id)
         );
     }
 }
@@ -379,11 +380,25 @@ fn guidance_rendering_names_the_reason_and_navigation_action() {
         gather(&shape.shape, &mut texts);
     }
     assert!(
-        texts.iter().any(|t| t == "DAT: Audit not yet performed"),
+        texts.iter().any(|t| t == "Verification: Not checked yet"),
         "{texts:?}"
     );
-    assert!(texts.iter().any(|t| t == "Audit"));
-    assert!(!texts.iter().any(|t| t == "Verified"));
+    assert!(texts.iter().any(|t| t == "Verify this game"));
+    assert!(texts.iter().any(|t| t == "Technical details"));
+    // Catalogue details stay behind the collapsed section, and a ready
+    // catalogue is never presented as a verified game.
+    assert!(!texts.iter().any(|t| t.contains("Audit not yet performed")));
+    assert!(
+        !texts
+            .iter()
+            .any(|t| t.starts_with("Verification: Verified"))
+    );
+    assert!(
+        texts
+            .iter()
+            .any(|t| t.contains("Whether it can launch is shown separately")),
+        "{texts:?}"
+    );
 }
 
 #[test]
@@ -433,7 +448,7 @@ fn clicking_the_guidance_action_only_requests_the_existing_platform_route() {
     let output = frame(vec![]);
     fn find(shape: &egui::Shape) -> Option<egui::Pos2> {
         match shape {
-            egui::Shape::Text(t) if t.galley.text() == "Audit" => {
+            egui::Shape::Text(t) if t.galley.text() == "Verify this game" => {
                 Some(t.pos + t.galley.size() / 2.0)
             }
             egui::Shape::Vec(shapes) => shapes.iter().find_map(find),
@@ -443,7 +458,7 @@ fn clicking_the_guidance_action_only_requests_the_existing_platform_route() {
     for shape in output.shapes {
         button = button.or_else(|| find(&shape.shape));
     }
-    let position = button.expect("Audit button must be rendered");
+    let position = button.expect("Verify button must be rendered");
     let _ = frame(vec![
         egui::Event::PointerMoved(position),
         egui::Event::PointerButton {
@@ -462,7 +477,7 @@ fn clicking_the_guidance_action_only_requests_the_existing_platform_route() {
     assert!(clicked);
     assert_eq!(
         guidance.action.route(&f.game),
-        super::super::routes::Route::PlatformCheck("BBC Micro".into())
+        super::super::routes::Route::GameCheck(f.game.archive.id)
     );
 }
 
@@ -549,9 +564,11 @@ fn a_stale_saved_exact_audit_is_not_cleared_by_an_unrelated_unknown_audit() {
             Some("changed"),
         )
         .unwrap();
-    let (count, freshness) = saved_evidence(game, &database).unwrap();
+    let (count, stale) = saved_evidence(game, &database).unwrap();
     assert_eq!(count, 2);
-    assert_eq!(freshness, DatProvenanceFreshness::Stale);
+    assert!(stale);
+    // A stale mark wins over the Library's earlier current decision.
+    assert_eq!(freshness(game, stale), DatProvenanceFreshness::Stale);
 }
 
 #[test]
@@ -580,13 +597,14 @@ fn changed_cue_companions_are_stale_even_when_the_sheet_is_unchanged() {
     database
         .persist_library_dat_identity(game.archive.id, &saved)
         .unwrap();
+    // Every recorded member still matches: the Library's current proof holds.
     assert_eq!(
-        saved_evidence(game, &database).unwrap().1,
-        DatProvenanceFreshness::Unknown
+        freshness(game, saved_evidence(game, &database).unwrap().1),
+        DatProvenanceFreshness::Current
     );
     std::fs::write(&companion, b"changed track with another length").unwrap();
     assert_eq!(
-        saved_evidence(game, &database).unwrap().1,
+        freshness(game, saved_evidence(game, &database).unwrap().1),
         DatProvenanceFreshness::Stale
     );
 }
@@ -643,4 +661,289 @@ fn configuration_coverage_and_unattempted_check_are_distinct_without_changing_id
         .reason,
         "No catalogue match"
     );
+}
+
+#[test]
+fn every_guidance_reason_maps_to_one_plain_outcome_without_inventing_verification() {
+    for (reason, outcome) in [
+        ("Verified", Outcome::Verified),
+        ("No catalogue match", Outcome::NotRecognised),
+        ("Audit not yet performed", Outcome::NotCheckedYet),
+        ("No trusted DAT configured", Outcome::NeedsSetup),
+        (
+            "Configured DAT unavailable or disabled",
+            Outcome::NeedsSetup,
+        ),
+        ("Catalogue does not cover this system", Outcome::NeedsSetup),
+        ("Catalogue system coverage unresolved", Outcome::NeedsSetup),
+        ("Catalogue selection required", Outcome::NeedsSetup),
+        (
+            "Catalogue not validated or unavailable",
+            Outcome::NeedsSetup,
+        ),
+        ("Catalogue status unavailable", Outcome::NeedsSetup),
+        ("File evidence stale or changed", Outcome::NeedsAttention),
+        ("Audit needs review", Outcome::NeedsAttention),
+        ("Audit has no usable exact result", Outcome::NeedsAttention),
+        (
+            "Saved exact match; freshness needs checking",
+            Outcome::NeedsAttention,
+        ),
+        (
+            "File format unsupported for exact verification",
+            Outcome::NeedsAttention,
+        ),
+        ("Verification evidence unavailable", Outcome::NeedsAttention),
+        ("a reason added later", Outcome::NeedsAttention),
+    ] {
+        assert_eq!(Outcome::of(reason), outcome, "{reason}");
+    }
+}
+
+#[test]
+fn a_ready_catalogue_or_missing_setup_is_never_shown_as_verified() {
+    let f = fixture("PS1", "cue");
+    let ready = explain(
+        &f.game,
+        true,
+        true,
+        0,
+        DatProvenanceFreshness::Unknown,
+        Ok(&f.catalogues),
+        None,
+    );
+    assert_eq!(Outcome::of(ready.reason), Outcome::NotCheckedYet);
+    let none = explain(
+        &f.game,
+        true,
+        true,
+        0,
+        DatProvenanceFreshness::Unknown,
+        Ok(&[]),
+        None,
+    );
+    assert_eq!(Outcome::of(none.reason), Outcome::NeedsSetup);
+    assert_eq!(none.action.label(), "Set up verification");
+    for outcome in [
+        Outcome::NotCheckedYet,
+        Outcome::NeedsSetup,
+        Outcome::NeedsAttention,
+        Outcome::NotRecognised,
+    ] {
+        assert_ne!(outcome.headline(), "Verified");
+    }
+}
+
+/// The production pipeline's verified game, loaded the way Blue loads it.
+fn verified_game() -> (
+    archivefs_core::verified_game_fixture::VerifiedGameFixture,
+    Game,
+) {
+    let fixture = archivefs_core::verified_game_fixture::VerifiedGameFixture::build().unwrap();
+    let library = super::super::verified_game_fixture_tests::load(&fixture);
+    let game = library
+        .games
+        .iter()
+        .find(|g| g.archive.absolute_path == fixture.rom_path)
+        .expect("fixture game in the library")
+        .clone();
+    assert!(game.dat_exact.is_some(), "the fixture is verified");
+    (fixture, game)
+}
+
+fn card(
+    fixture: &archivefs_core::verified_game_fixture::VerifiedGameFixture,
+    game: &Game,
+) -> DatProvenanceFreshness {
+    let database = Database::open_read_only(&fixture.database_path).unwrap();
+    freshness(game, saved_evidence(game, &database).unwrap().1)
+}
+
+fn card_outcome(
+    verified: &archivefs_core::verified_game_fixture::VerifiedGameFixture,
+    game: &Game,
+) -> Outcome {
+    let database = Database::open_read_only(&verified.database_path).unwrap();
+    let (checks, stale) = saved_evidence(game, &database).unwrap();
+    // A validated catalogue for the game's system, so the outcome turns on
+    // the saved evidence alone, not on catalogue setup.
+    let ready = fixture(&game.platform, "gba");
+    Outcome::of(
+        explain(
+            game,
+            true,
+            true,
+            checks,
+            freshness(game, stale),
+            Ok(&ready.catalogues),
+            None,
+        )
+        .reason,
+    )
+}
+
+#[test]
+fn card_freshness_matches_core_for_a_freshly_verified_game() {
+    let (fixture, game) = verified_game();
+    let database = Database::open_read_only(&fixture.database_path).unwrap();
+    let checks = database
+        .library_dat_identities_for_item(game.archive.id)
+        .unwrap();
+    let core = database
+        .library_dat_identity_summary_for_item(
+            game.archive.id,
+            &checks[0].source.source_id,
+            None,
+            None,
+            true,
+        )
+        .unwrap()
+        .expect("core summary");
+    assert_eq!(core.provenance_freshness, DatProvenanceFreshness::Current);
+    assert_eq!(card(&fixture, &game), DatProvenanceFreshness::Current);
+    assert_eq!(card_outcome(&fixture, &game), Outcome::Verified);
+}
+
+#[test]
+fn a_saved_exact_flag_without_saved_proof_is_never_current() {
+    let (fixture, mut game) = verified_game();
+    // A flag with no saved row behind it (another archive's evidence).
+    game.archive.id = -1;
+    assert_ne!(card(&fixture, &game), DatProvenanceFreshness::Current);
+    assert_ne!(card_outcome(&fixture, &game), Outcome::Verified);
+}
+
+#[test]
+fn legacy_proof_without_file_and_catalogue_fingerprints_is_never_current() {
+    let (fixture, game) = verified_game();
+    let mut saved = fixture.persisted_identity().unwrap().unwrap();
+    saved.audit_file = None;
+    saved.disc_members.clear();
+    saved.source.catalogue_sha256 = None;
+    Database::open_or_create(&fixture.database_path)
+        .unwrap()
+        .persist_library_dat_identity(game.archive.id, &saved)
+        .unwrap();
+    // The flag loaded before the proof was lost must not carry over...
+    assert_ne!(card(&fixture, &game), DatProvenanceFreshness::Current);
+    assert_ne!(card_outcome(&fixture, &game), Outcome::Verified);
+    // ...and a fresh Library load does not set it at all.
+    let reloaded = super::super::verified_game_fixture_tests::load(&fixture);
+    let again = reloaded
+        .games
+        .iter()
+        .find(|g| g.archive.id == game.archive.id)
+        .unwrap();
+    assert!(again.dat_exact.is_none());
+    assert_eq!(card(&fixture, again), DatProvenanceFreshness::Unknown);
+}
+
+#[test]
+fn a_missing_or_changed_file_after_load_is_never_current() {
+    let (fixture, game) = verified_game();
+    let mut bytes = std::fs::read(&fixture.rom_path).unwrap();
+    bytes[0] ^= 0xff;
+    std::fs::write(&fixture.rom_path, &bytes).unwrap();
+    assert_ne!(card(&fixture, &game), DatProvenanceFreshness::Current);
+    std::fs::remove_file(&fixture.rom_path).unwrap();
+    assert_ne!(card(&fixture, &game), DatProvenanceFreshness::Current);
+    assert_ne!(card_outcome(&fixture, &game), Outcome::Verified);
+}
+
+/// A remount can give an unchanged file a new file-system object. That is
+/// not proof of the same content, so it fails closed until re-checked.
+#[test]
+fn same_content_as_a_new_file_object_is_not_current() {
+    let (fixture, game) = verified_game();
+    let bytes = std::fs::read(&fixture.rom_path).unwrap();
+    let mtime = std::fs::metadata(&fixture.rom_path)
+        .unwrap()
+        .modified()
+        .unwrap();
+    let replacement = fixture.rom_path.with_extension("tmp");
+    std::fs::write(&replacement, &bytes).unwrap();
+    std::fs::File::options()
+        .write(true)
+        .open(&replacement)
+        .unwrap()
+        .set_modified(mtime)
+        .unwrap();
+    std::fs::rename(&replacement, &fixture.rom_path).unwrap();
+    let recorded = fixture
+        .persisted_identity()
+        .unwrap()
+        .unwrap()
+        .audit_file
+        .expect("recorded file");
+    assert!(matches!(
+        archivefs_core::dat::library_identity_summary::DiscFileState::of(&recorded),
+        archivefs_core::dat::library_identity_summary::DiscFileState::IdentityUncertain(_)
+    ));
+    assert_ne!(card(&fixture, &game), DatProvenanceFreshness::Current);
+    let reloaded = super::super::verified_game_fixture_tests::load(&fixture);
+    assert!(
+        reloaded
+            .games
+            .iter()
+            .all(|g| g.archive.id != game.archive.id || g.dat_exact.is_none())
+    );
+}
+
+#[test]
+fn a_stale_mark_wins_over_a_loaded_exact_flag() {
+    let (fixture, game) = verified_game();
+    let saved = fixture.persisted_identity().unwrap().unwrap();
+    Database::open_or_create(&fixture.database_path)
+        .unwrap()
+        .mark_library_dat_identity_stale_for_source_revision(
+            &saved.source.source_id,
+            Some("changed"),
+        )
+        .unwrap();
+    assert_eq!(card(&fixture, &game), DatProvenanceFreshness::Stale);
+    assert_ne!(card_outcome(&fixture, &game), Outcome::Verified);
+}
+
+/// While the read-only worker has not answered, a verified-flagged game
+/// shows only the loading line: nothing on the card says Verified.
+#[test]
+fn the_unloaded_card_never_says_verified() {
+    let (_fixture, game) = verified_game();
+    let context = eframe::egui::Context::default();
+    let mut app = super::super::tests::fixture(&context);
+    let (_sender, receiver) = mpsc::channel();
+    app.review.verification_guidance = State {
+        game: Some(game.archive.id),
+        receiver: Some(receiver),
+        result: None,
+    };
+    let output = context.run(eframe::egui::RawInput::default(), |context| {
+        eframe::egui::CentralPanel::default().show(context, |ui| {
+            app.detail_verification_guidance(ui, &game);
+        });
+    });
+    let mut texts = Vec::new();
+    for clipped in &output.shapes {
+        collect_text(&clipped.shape, &mut texts);
+    }
+    assert!(
+        texts
+            .iter()
+            .any(|t| t.contains("checking verification guidance")),
+        "{texts:?}"
+    );
+    assert!(!texts.iter().any(|t| t.contains("Verified")), "{texts:?}");
+    assert!(app.review.verification_guidance.result.is_none());
+}
+
+fn collect_text(shape: &eframe::egui::Shape, texts: &mut Vec<String>) {
+    match shape {
+        eframe::egui::Shape::Text(text) => texts.push(text.galley.text().to_string()),
+        eframe::egui::Shape::Vec(shapes) => {
+            for shape in shapes {
+                collect_text(shape, texts);
+            }
+        }
+        _ => (),
+    }
 }

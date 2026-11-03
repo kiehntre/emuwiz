@@ -231,13 +231,24 @@ worktree must stay until `worktree-check` reports CLEAR (artifacts retired with 
 receipt/journal, or none was ever created: no record of a cargo-iso build and an absent or empty cache
 directory). Missing artifacts alone prove nothing: they HOLD as `ARTIFACTS_MISSING_UNVERIFIED`. HOLD reasons: `NOT_RELEASED`, `OWNER_UNVERIFIED`, `COMPLETION_UNVERIFIED`,
 `WRITTEN_AFTER_RELEASE`, `AWAITING_RETIREMENT`, `ACTIVE`, `PINNED`, `PROTECTED_REMNANTS`,
-`SOURCE_MISSING`, `NO_LIFECYCLE_RECORD`, `RECEIPT_UNVERIFIED`, `ARTIFACTS_MISSING_UNVERIFIED`. The gate also holds on the checkout's own
+`SOURCE_MISSING`, `NO_LIFECYCLE_RECORD`, `RECEIPT_UNVERIFIED`, `ARTIFACTS_MISSING_UNVERIFIED`, `UNRECOGNISED_RESIDUE`. The gate also holds on the checkout's own
 Git state, because `git worktree remove` deletes its reflog, ORIG_HEAD, per-worktree refs and ignored files:
 `CHECKOUT_NOT_CLEAN`, `CHECKOUT_INDEX_UNVERIFIED`, `CHECKOUT_PATH_UNVERIFIED`, `GIT_WORKTREE_PROTECTED`,
 `GIT_HISTORY_NOT_PRESERVED`, `GIT_STATE_UNVERIFIED`. A commit counts as preserved only when a ref names it, so
 retain orphans under `refs/preservation/`. `--cargo-state-only` reports the Cargo half alone and never authorises
 removal. A path with no `.git` always holds, including one already removed correctly: the gate cannot
 tell that from a checkout that vanished while still registered, so check before removing, not after.
+
+`UNRECOGNISED_RESIDUE`: even with a verified retirement receipt, the gate is CLEAR only if the cache directory holds nothing
+but directories, Cargo's own empty lock files (`.cargo-lock`, `.cargo-build-lock`, `.cargo-artifact-lock`) and the preserved
+evidence directories (`emuwiz-test-env`, `tmp`, `history`, `undo`, `receipts`, `backups`, `audit-ledger`, directly under the
+cache or one to three levels down, where a profile directory lives; their contents are not inspected). Anything else (a
+standalone executable with no sibling `.d`, a stray or nested file, a symlink, a special file, another filesystem, an
+unreadable or oversized tree) is output retirement does not recognise and so can never retire; with the worktree gone it
+would be an orphan (`SOURCE_MISSING`) that no gate can release. The result carries `residue` (`items`, `bytes`, a few
+example paths) in `--json`. The check is read-only (`lstat`/directory listing only, symlinks never followed), is shared by the
+plain and `--cargo-state-only` paths, and never deletes or selects anything: review the files by hand, then re-check. Every
+earlier hold (`ACTIVE`, `PINNED`, `NOT_RELEASED`, `RECEIPT_UNVERIFIED`, ...) keeps its own reason.
 A release record alone never
 clears the gate or authorises deletion; releasing does not stop builds, remove pins or claim
 processes have exited. The release command takes the target's exclusive lifecycle lock and
@@ -314,7 +325,14 @@ A later wrapper build removes the release, including after successful retirement
 --max-gb N]` records a persistent, digest-protected, bounded policy (target root, owner labels,
 per-cycle limits; default idle delay 0 h, free reserve 100 GiB). It is **disabled** until `policy enable`, which writes a separate
 enable record bound to the policy digest plus a history event; the `enabled` flag inside the policy
-file is ignored, and re-approving requires a fresh enable. A malformed policy, one missing fields
+file is ignored, and re-approving requires a fresh enable. The policy carries a `schema` (currently 2); a
+policy approved under an older schema is invalid (fail closed, every cycle REFUSED with the reason) and must be
+approved again, because schema 2 widened what a cycle retires to post-retirement binary residue in a markerless
+`debug` profile, which an older approval never covered. Its old digest cannot be reused. After installing a
+schema-2 tool over a schema-1 policy, every timer cycle exits 1 (REFUSED) until the owner re-approves
+(`policy approve` leaves it DISABLED; enabling stays a separate step). A manifest run by hand through
+`emuwiz-cargo-retire` is different: its owner-approved digest covers exactly the paths it lists, so a residue
+path is retired only if that manifest names it. A malformed policy, one missing fields
 (`scope.kinds`, limits), one owned by an account other than the effective user or registry owner
 (root is not a wildcard), or a group/world-writable file or state directory fails closed. A generated
 manifest hash is never the authorisation: the manifest must name the live policy digest and only
@@ -558,7 +576,21 @@ recognise arbitrary content simply because its directory is named `incremental`.
 The planner can locate an orphan incremental unit in `debug`/`release`, including
 under a target triple, after `.fingerprint` and `deps` have been retired. Other
 profile/output classification (`deps`, `.fingerprint`, `build`, examples and
-executables with `.d` files) is unchanged. `tests`/`benches`, unknown files and
+executables with `.d` files) is unchanged. Post-retirement binary residue (Fix B) is the only addition:
+a file directly in a `debug` profile (or `<triple>/debug`) qualifies only if every condition below holds, freshly:
+- the profile is markerless: none of `.fingerprint`, `deps`, `build`, `examples` or `incremental` remains,
+  no leftover compiler file (`.d`, `.rlib`, `.rmeta`, `.so`, ...) sits in it, and it can be listed;
+- the name is Cargo-binary-shaped (letters, digits, `_`, `-`; no dot) and does not contain `journal`;
+- it is a regular file, executable, owned by this user, with exactly one link;
+- it starts with the ELF magic, read through an `O_NOFOLLOW` descriptor whose identity matches the `lstat`.
+
+The planner selects it as `post-retirement binary residue`. The executor re-applies the same predicate to the
+very `lstat` it compares with the manifest identity, so a reappeared, relinked or swapped file is held.
+Any directory directly under the cache whose name has three or more hyphen-separated parts is treated as a
+target triple, here as elsewhere in the tool.
+A changed, relinked, swapped or non-ELF file is held. `release` binaries are never selected this way, because
+they are the usual install and rollback source. A symlink, a script, a hard link, a suffixed name, or a binary
+beside remaining Cargo output stays unrecognised, so the residue gate keeps holding the worktree. `tests`/`benches`, unknown files and
 source/worktree/audit/evidence paths do not acquire a new classification. If
 incremental contents are unrecognised, planning preserves the profile's other
 outputs too, so it does not remove their markers and strand incremental output.
@@ -660,3 +692,51 @@ checkout's `.git`; anything else records no evidence and the route refuses.
 A build that finds no valid linked checkout at the recorded path removes any earlier `checkout` evidence (never paired with a newer
 HEAD); a non-UTF-8 registered worktree name is decoded with surrogateescape and cannot abort a run; git errors, non-zero exits and
 timeouts are `ORPHAN_REPO_UNVERIFIED`.
+
+### Owner-attested orphan route (`GIT_PRESERVED_ATTESTED`)
+
+A record without cargo-iso `checkout` evidence can never use `GIT_PRESERVED` (`ORPHAN_EVIDENCE_MISSING`).
+That covers builds made before evidence was recorded, and also builds where cargo-iso could not establish it,
+such as a main (non-linked) checkout or a broken gitdir back-link. For any such record, a manifest group may set
+`"orphan_route": "GIT_PRESERVED_ATTESTED"` with `"orphan_attestation": {"repo", "worktree", "head",
+"attested_by", "reason"}` (all non-empty strings). The attestation lives in the manifest whose digest the owner
+approves, so it is an owner decision bound to that exact list; it only nominates the repository, and every
+fact is re-checked when the executor runs:
+- **The record:** it must have a cargo-iso build with a 40-hex HEAD equal to `source_head` and to the attested
+  head; a normalised absolute worktree equal to the attested worktree; and the target name bound to that path by its hash.
+- **The repository:** canonical, meaning a real `.git` directory with no symlink and an absolute normalised
+  path. It must equal any `orphan_repo`.
+- **The worktree:** its path must be absent (`lstat` ENOENT/ENOTDIR only). No `<repo>/.git/worktrees/*/gitdir`
+  entry may point at it (a relative `gitdir` is resolved against its entry), every such entry must be readable,
+  and `git worktree list` must not register it. A `worktrees` directory that cannot be judged (EACCES, EIO, a
+  stale mount; anything but ENOENT/ENOTDIR) is `ORPHAN_SOURCE_UNKNOWN`, never "no entries".
+- **Other repositories:** such a record does not say which repository the worktree belonged to, and the
+  worktree is gone, so it cannot be derived. As a bounded check, every repository directly inside the
+  worktree's parent directory or the attested repository's parent directory (`<dir>/.git/worktrees`, or a bare
+  `<dir>/worktrees`) must not register the worktree either (`ORPHAN_SOURCE_PRESENT`); anything there that
+  cannot be judged, or an unreadable mount table, is `ORPHAN_SOURCE_UNKNOWN`. Mount points in those
+  directories are not entered, and repositories anywhere else (or offline, for example on an unmounted volume)
+  cannot be seen. **The owner must attest the exact repository the worktree was created from**, not merely
+  one whose `origin/main` contains the HEAD.
+- **The history:** the HEAD must be a commit contained in that repository's `refs/remotes/origin/main`.
+
+Holds:
+- `ORPHAN_ATTESTATION_INVALID` (missing or empty attestation fields);
+- `OWNER_UNVERIFIED`;
+- `ORPHAN_REPO_UNVERIFIED`;
+- `ORPHAN_SOURCE_PRESENT`;
+- `ORPHAN_SOURCE_UNKNOWN`;
+- `GIT_HISTORY_NOT_PRESERVED`.
+
+A record that has a `checkout` key at all (valid or malformed) is always judged by the stronger evidence route,
+with the attested repository required to match the recorded one, so an attestation can never bypass moved-checkout
+detection or upgrade a corrupted record. The receipt's `orphan_route` names the route that decided
+(`GIT_PRESERVED` in that case, `SOURCE` when a live source checkout was used) and `orphan_route_requested`
+the route the manifest asked for. `GIT_PRESERVED` without evidence still refuses, and an attestation
+never upgrades it. The receipt records the route and the attestation. The pin, lock, census, idle, identity,
+journal and approved-manifest gates are unchanged.
+
+The limit is wider than the evidence route's, because there is no checkout inode to compare: ANY moved checkout,
+including one moved with `git worktree move` (git then names only the new path), is indistinguishable from a
+removed one. A moved checkout builds into a different, hash-bound target, so the cost is a rebuild. Only regenerable
+compiler output is removed; the HEAD is already in `origin/main`, and git, source and the repository are never touched.

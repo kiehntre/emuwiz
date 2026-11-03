@@ -603,21 +603,23 @@ fn show_state(
                     reference_source_exists: true,
                 }
                 | ReviewState::NotCompared
-                | ReviewState::NoMatch(_) => {
-                    if ui.button("View file details").clicked() {
-                        *route = Some(Route::Task {
-                            section: Section::Advanced,
-                            game: game.archive.id,
-                        });
-                    }
-                }
-                ReviewState::Conflict { .. } | ReviewState::Ambiguous { .. } => {
-                    if ui.button("View file details").clicked() {
-                        *route = Some(Route::Task {
-                            section: Section::Advanced,
-                            game: game.archive.id,
-                        });
-                    }
+                | ReviewState::NoMatch(_)
+                | ReviewState::Conflict { .. }
+                | ReviewState::Ambiguous { .. } => {
+                    // Not a verification step: the next step is the contextual
+                    // action above. The Archive Inspector (under Settings) is
+                    // only for looking inside the file.
+                    ui.collapsing("Advanced", |ui| {
+                        if ui
+                            .button("Inspect archive contents (opens Archive Inspector)")
+                            .clicked()
+                        {
+                            *route = Some(Route::Task {
+                                section: Section::Advanced,
+                                game: game.archive.id,
+                            });
+                        }
+                    });
                 }
                 _ => {}
             }

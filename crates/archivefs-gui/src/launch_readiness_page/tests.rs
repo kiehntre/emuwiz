@@ -617,7 +617,7 @@ fn render_with_states(
 /// Spawns a real, short-lived process via the same [`spawn_retroarch`] core
 /// entry point production code uses - never a shell string, an explicit
 /// executable plus argv, exactly like [`RetroArchCommand`] requires.
-fn spawn_test_process(executable: &str, arguments: &[&str]) -> LaunchedRetroArchProcess {
+pub(super) fn spawn_test_process(executable: &str, arguments: &[&str]) -> LaunchedRetroArchProcess {
     let command = RetroArchCommand {
         saturn_core_selection: None,
         snapshot_evidence: None,
@@ -638,7 +638,7 @@ fn spawn_test_process(executable: &str, arguments: &[&str]) -> LaunchedRetroArch
     spawn_retroarch(command).expect("spawning the fixture test process must succeed")
 }
 
-fn wait_until_exited(process: &mut LaunchedRetroArchProcess) {
+pub(super) fn wait_until_exited(process: &mut LaunchedRetroArchProcess) {
     let deadline = Instant::now() + Duration::from_secs(5);
     while process.poll().is_none() {
         assert!(Instant::now() < deadline, "fixture process never exited");
@@ -1458,14 +1458,14 @@ fn running_stage_shows_running_status_and_pid() {
     let process = spawn_test_process("/bin/sleep", &["1"]);
     let pid = process.pid;
     let mut state = RetroArchLaunchState {
-        tracked: Some((key, RetroArchLaunchStage::Running { process })),
+        tracked: Some((key, RetroArchLaunchStage::running(process))),
         ..Default::default()
     };
 
     let output = render_with_state(&plan_input(plan), &mut state);
     assert!(rendered_text_contains(&output, "RetroArch running"));
     assert!(rendered_text_contains(&output, &pid.to_string()));
-    assert!(!rendered_text_contains(&output, "Stop"));
+    assert!(rendered_text_contains(&output, "Stop RetroArch"));
     assert!(!rendered_text_contains(&output, "Kill"));
 }
 
@@ -1480,7 +1480,13 @@ fn clean_process_exit_enters_exited_and_shows_a_clean_exit_message() {
     let mut process = spawn_test_process("/bin/true", &[]);
     wait_until_exited(&mut process);
     let mut state = RetroArchLaunchState {
-        tracked: Some((key, RetroArchLaunchStage::Exited { process })),
+        tracked: Some((
+            key,
+            RetroArchLaunchStage::Exited {
+                process,
+                stop: Default::default(),
+            },
+        )),
         ..Default::default()
     };
 
@@ -1505,7 +1511,13 @@ fn non_zero_exit_shows_bounded_stderr_behind_technical_details() {
     );
     wait_until_exited(&mut process);
     let mut state = RetroArchLaunchState {
-        tracked: Some((key, RetroArchLaunchStage::Exited { process })),
+        tracked: Some((
+            key,
+            RetroArchLaunchStage::Exited {
+                process,
+                stop: Default::default(),
+            },
+        )),
         ..Default::default()
     };
 
@@ -1571,7 +1583,7 @@ fn changing_selected_candidate_never_shows_another_selections_running_process_as
     let other_key = RetroArchLaunchKey::from_request(&other_request);
     let process = spawn_test_process("/bin/sleep", &["1"]);
     let mut state = RetroArchLaunchState {
-        tracked: Some((other_key, RetroArchLaunchStage::Running { process })),
+        tracked: Some((other_key, RetroArchLaunchStage::running(process))),
         ..Default::default()
     };
 
@@ -1595,7 +1607,7 @@ fn changing_selected_candidate_never_shows_another_selections_running_process_as
 
 // --- repeat launch / one launch at a time --------------------------------------
 
-fn request_for(path: &str) -> RetroArchLaunchRequest {
+pub(super) fn request_for(path: &str) -> RetroArchLaunchRequest {
     let mut candidate = ready_candidate();
     candidate.content = resolved_content(path);
     let plan = plan_with(vec![candidate]);
@@ -1609,10 +1621,7 @@ fn a_second_game_cannot_start_while_another_retroarch_is_running() {
     let process = spawn_test_process("/bin/sleep", &["2"]);
     let pid = process.pid;
     let mut state = RetroArchLaunchState {
-        tracked: Some((
-            running_key.clone(),
-            RetroArchLaunchStage::Running { process },
-        )),
+        tracked: Some((running_key.clone(), RetroArchLaunchStage::running(process))),
         ..Default::default()
     };
 
@@ -1621,7 +1630,7 @@ fn a_second_game_cannot_start_while_another_retroarch_is_running() {
     state.poll();
 
     match &state.tracked {
-        Some((key, RetroArchLaunchStage::Running { process })) => {
+        Some((key, RetroArchLaunchStage::Running { process, .. })) => {
             assert_eq!(*key, running_key, "the running launch must stay tracked");
             assert_eq!(process.pid, pid, "the tracked handle must not be replaced");
         }
@@ -1661,7 +1670,7 @@ fn another_games_running_launch_disables_play_and_explains_why() {
     let running_key = RetroArchLaunchKey::from_request(&running_request);
     let process = spawn_test_process("/bin/sleep", &["1"]);
     let mut state = RetroArchLaunchState {
-        tracked: Some((running_key, RetroArchLaunchStage::Running { process })),
+        tracked: Some((running_key, RetroArchLaunchStage::running(process))),
         ..Default::default()
     };
     assert!(state.blocked_by_other_launch(&request_for("/library/OtherGame.bin")));
@@ -1687,7 +1696,13 @@ fn relaunch_is_allowed_after_clean_exit_non_zero_exit_and_failure() {
         let mut process = spawn_test_process(executable, &arguments);
         wait_until_exited(&mut process);
         let mut state = RetroArchLaunchState {
-            tracked: Some((key.clone(), RetroArchLaunchStage::Exited { process })),
+            tracked: Some((
+                key.clone(),
+                RetroArchLaunchStage::Exited {
+                    process,
+                    stop: Default::default(),
+                },
+            )),
             ..Default::default()
         };
         assert!(!state.is_active(), "{name}: an exited launch is not active");

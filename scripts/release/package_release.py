@@ -257,6 +257,20 @@ def copy_sbom_payload(source: pathlib.Path, destination: pathlib.Path) -> list[d
     return records
 
 
+REPRODUCIBLE_KERNEL_NOTE = "not recorded (reproducible build)"
+
+
+def recorded_host_kernel(reproducible: bool) -> str:
+    """The build host's kernel, except in a reproducible build.
+
+    The kernel does not influence the packaged bytes, but two independent
+    builders of the same source can run different kernels (CI runners on
+    different cloud hosts do), and recording it would make the archive depend
+    on which host built it. Non-reproducible (local) builds still record it.
+    """
+    return REPRODUCIBLE_KERNEL_NOTE if reproducible else platform.release()
+
+
 def normalise_arch(value: str) -> str:
     aliases = {"amd64": "x86_64", "x64": "x86_64", "arm64": "aarch64"}
     value = aliases.get(value.lower(), value.lower())
@@ -1004,7 +1018,7 @@ def package(args: argparse.Namespace) -> pathlib.Path:
             f"build_profile: {args.build_profile or ('release' if args.target_dir else 'unknown')}",
             f"platform: {release_platform}",
             f"host_architecture: {normalise_arch(platform.machine())}",
-            f"linux_kernel: {platform.release()}",
+            f"linux_kernel: {recorded_host_kernel(args.reproducible)}",
             f"rustc: {rustc_version or 'unavailable'}",
             f"cargo: {cargo_version or 'unavailable'}",
             f"packager_version: {PACKAGER_VERSION}",
@@ -1073,7 +1087,7 @@ def package(args: argparse.Namespace) -> pathlib.Path:
             },
             "host": {
                 "architecture": normalise_arch(platform.machine()),
-                "linux_kernel": platform.release(),
+                "linux_kernel": recorded_host_kernel(args.reproducible),
                 "rustc": rustc_version,
                 "cargo": cargo_version,
             },

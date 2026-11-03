@@ -275,6 +275,7 @@ class CycleRaces(Base):
         self.full_census(m2)
         self.call("run", m=m2)
         self.assertNotEqual([h for h in m2.read_history() if h.get("event") == "cycle"][-1]["outcome"], "RETIRED")
+        self.review_unrecognised(wt_, t)           # the fixture's stray file holds the gate until reviewed
         self.assertEqual(self.m.worktree_gate(wt_)["status"], "CLEAR")
 
 

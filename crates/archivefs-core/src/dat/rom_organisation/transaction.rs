@@ -585,6 +585,12 @@ pub fn rollback_organisation_transaction(
     cancel: &AtomicBool,
     master_root: &Path,
 ) -> Result<OrganisationRollbackOutcome, String> {
+    // Two Undos of the same transaction (a double click, or two windows) must
+    // not race each other's journal fence and seal: both could fail closed and
+    // leave a healthy transaction needing a reviewed recovery. The second waits
+    // and then judges the journal the first left.
+    let _serial =
+        crate::dat::rename_apply::journal::serialise_undo(journal_dir, &transaction.transaction_id);
     let _live = crate::dat::rename_apply::journal::mark_transaction_live(
         journal_dir,
         &transaction.transaction_id,

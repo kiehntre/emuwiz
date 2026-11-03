@@ -665,6 +665,7 @@ fn sample_apply_result(
             replacement_approved: false,
             verification_succeeded: true,
             outcome,
+            publication: Default::default(),
             stages: vec![SharedTransactionStage::Success],
             warnings: Vec::new(),
             failures: Vec::new(),
@@ -797,4 +798,63 @@ fn state_resets_when_the_profile_changes() {
         "an earlier attempt failed"
     ));
     assert!(rendered_text_contains(&output, "Choose PNG"));
+}
+
+#[test]
+fn apply_result_shows_shared_transaction_warnings() {
+    use crate::shared_apply_warnings::test_support::{assert_shows_warning, warned_result};
+    let output = render_stage(DolphinTextureModStage::Applied {
+        result: warned_result(),
+        destination_root: PathBuf::from("/disposable/textures"),
+    });
+    assert_shows_warning(&crate::transaction_outcome::test_support::rendered_text(
+        &output,
+    ));
+}
+
+mod rollback_warnings {
+    use super::*;
+    use crate::shared_apply_warnings::test_support::*;
+    use archivefs_core::patch_manager::DolphinTexturePackApplyResult;
+
+    fn detail(rollback: Option<archivefs_core::patch_manager::SharedRollbackResult>) -> String {
+        let (sender, receiver) = std::sync::mpsc::channel();
+        sender
+            .send(DolphinTexturePackApplyResult {
+                apply: partly_failed_result(),
+                rollback,
+            })
+            .unwrap();
+        let mut state = DolphinTextureModPageState {
+            stage: Some(DolphinTextureModStage::PackApplying {
+                receiver,
+                destination_root: PathBuf::from("/disposable/destination"),
+            }),
+            ..Default::default()
+        };
+        assert!(state.poll());
+        let Some(DolphinTextureModStage::Failed { detail }) = state.stage.take() else {
+            panic!("expected the failed stage");
+        };
+        detail
+    }
+
+    #[test]
+    fn warning_text_follows_a_successful_rollback() {
+        let detail = detail(Some(succeeded_rollback()));
+        assert!(detail.contains("Automatic rollback: Success."), "{detail}");
+        assert_rollback_succeeded(&detail);
+    }
+
+    #[test]
+    fn warning_text_follows_a_failed_rollback() {
+        let detail = detail(Some(failed_rollback()));
+        assert!(detail.contains("Automatic rollback: Failed."), "{detail}");
+        assert_rollback_failed(&detail);
+    }
+
+    #[test]
+    fn warning_text_says_when_no_rollback_ran() {
+        assert_rollback_did_not_run(&detail(None));
+    }
 }
