@@ -274,6 +274,9 @@ pub(super) fn launch_scroll<R>(
 #[derive(Clone, Copy, Default)]
 pub(super) struct SavedFileFacts {
     pub catalogue_verified: bool,
+    /// Game Details' unconfirmed DAT identity for the card's identity line
+    /// (pending, not confirmed, or re-check needed); `None` otherwise.
+    pub dat_identity: Option<launch_readiness_summary::IdentitySummary>,
     pub file_missing: bool,
 }
 
@@ -637,6 +640,9 @@ impl NativeWorkflows {
             true,
             activity,
         );
+        if let Some(identity) = saved.dat_identity {
+            launch_readiness_summary::note_dat_identity(&mut summary, identity);
+        }
         if saved.file_missing {
             launch_readiness_summary::note_file_missing(&mut summary);
         }
