@@ -125,12 +125,43 @@ fn parse_capabilities(text: &str, bytes: usize) -> Option<Vec<u8>> {
     Some(out)
 }
 
-fn button(code: u16) -> Option<Control> {
+/// How a driver numbers the left and top face buttons. South (0x130) and
+/// east (0x131) mean the same on every driver; 0x133 and 0x134 do not.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+enum FaceLayout {
+    /// As `Documentation/input/gamepad.rst` says: 0x133 is the top button
+    /// (BTN_NORTH), 0x134 the left (BTN_WEST). hid-playstation and
+    /// hid-nintendo report this way.
+    #[default]
+    Positional,
+    /// xpad, Xbox pads over Bluetooth, and xpad-compatible virtual pads such as
+    /// Sunshine's (inputtino) report Xbox X, the left button, as BTN_X = 0x133
+    /// and Y, the top button, as BTN_Y = 0x134: the reverse of the positions.
+    Xbox,
+}
+
+impl FaceLayout {
+    /// Microsoft's vendor id covers its own pads and the virtual Xbox pads
+    /// that copy their identity (Sunshine's "X-Box One" is 045e:02ea).
+    fn for_vendor(vendor: u16) -> Self {
+        if vendor == 0x045e {
+            Self::Xbox
+        } else {
+            Self::Positional
+        }
+    }
+}
+
+fn button(code: u16, layout: FaceLayout) -> Option<Control> {
+    let (code_133, code_134) = match layout {
+        FaceLayout::Positional => (Button::North, Button::West),
+        FaceLayout::Xbox => (Button::West, Button::North),
+    };
     Some(match code {
         BTN_SOUTH => Control::Button(Button::South),
         BTN_EAST => Control::Button(Button::East),
-        BTN_WEST => Control::Button(Button::West),
-        BTN_NORTH => Control::Button(Button::North),
+        BTN_NORTH => Control::Button(code_133),
+        BTN_WEST => Control::Button(code_134),
         BTN_TL => Control::Button(Button::LeftBumper),
         BTN_TR => Control::Button(Button::RightBumper),
         BTN_START => Control::Button(Button::Start),
@@ -160,6 +191,7 @@ impl Pole {
 #[derive(Default)]
 struct Decoder {
     device: u32,
+    layout: FaceLayout,
     x: AxisRange,
     y: AxisRange,
     stick: [Pole; 4],
@@ -229,7 +261,12 @@ impl Decoder {
                     let was = self.held(index);
                     self.dpad[index] = value == 1;
                     self.direction(index, was, out);
-                } else if let Some(control) = button(code) {
+                } else if let Some(control) = button(code, self.layout) {
+                    log::debug!(
+                        "Big Picture: controller {} key {code:#x} {} is {control:?}",
+                        self.device,
+                        if value == 1 { "down" } else { "up" }
+                    );
                     let device = self.device;
                     out.push(if value == 1 {
                         PadEvent::Pressed { device, control }
@@ -303,6 +340,17 @@ mod linux {
         }
     }
 
+    /// EVIOCGID: bus type, vendor, product and version.
+    fn device_id(fd: i32) -> [u16; 4] {
+        let mut id = [0_u16; 4];
+        let request = eviocread(0x02, std::mem::size_of_val(&id));
+        // SAFETY: EVIOCGID writes one struct input_id, four u16s, into id.
+        if unsafe { libc::ioctl(fd, request as _, id.as_mut_ptr()) } < 0 {
+            return [0; 4];
+        }
+        id
+    }
+
     fn device_name(fd: i32) -> String {
         let mut name = [0_u8; 128];
         let request = eviocread(0x06, name.len());
@@ -366,10 +414,15 @@ mod linux {
         if !is_gamepad(&keys, &axes) {
             return Probe::NotAPad;
         }
+        let [_, vendor, product, _] = device_id(raw);
+        let layout = FaceLayout::for_vendor(vendor);
+        let name = device_name(raw);
+        log::info!("Big Picture: {name} is {vendor:04x}:{product:04x}, {layout:?} face buttons");
         Probe::Pad(Open {
-            name: device_name(raw),
+            name,
             decoder: Decoder {
                 device,
+                layout,
                 x: axis_range(raw, ABS_X),
                 y: axis_range(raw, ABS_Y),
                 ..Default::default()
@@ -1045,6 +1098,48 @@ mod linux {
 #[cfg(target_os = "linux")]
 pub(in crate::gui_v2) use linux::Reader;
 
+/// Decodes raw evdev events `(type, code, value)` exactly as the reader does
+/// for a controller with this vendor id, so tests start at the kernel boundary.
+#[cfg(test)]
+pub(in crate::gui_v2) fn decode_raw(
+    vendor: u16,
+    device: u32,
+    raw: &[(u16, u16, i32)],
+) -> Vec<PadEvent> {
+    let mut decoder = Decoder {
+        device,
+        layout: FaceLayout::for_vendor(vendor),
+        x: AxisRange {
+            min: -32768,
+            max: 32767,
+        },
+        y: AxisRange {
+            min: -32768,
+            max: 32767,
+        },
+        ..Default::default()
+    };
+    let mut out = Vec::new();
+    for (kind, code, value) in raw {
+        decoder.event(*kind, *code, *value, &mut out);
+    }
+    out
+}
+
+/// Raw evdev codes, for tests that drive input from the kernel boundary.
+#[cfg(test)]
+pub(in crate::gui_v2) mod codes {
+    pub(in crate::gui_v2) const EV_KEY: u16 = super::EV_KEY;
+    pub(in crate::gui_v2) const EV_ABS: u16 = super::EV_ABS;
+    pub(in crate::gui_v2) const ABS_HAT0Y: u16 = super::ABS_HAT0Y;
+    pub(in crate::gui_v2) const BTN_A: u16 = super::BTN_SOUTH;
+    pub(in crate::gui_v2) const BTN_B: u16 = super::BTN_EAST;
+    /// BTN_X and BTN_NORTH are the same code in input-event-codes.h.
+    pub(in crate::gui_v2) const BTN_X: u16 = super::BTN_NORTH;
+    /// BTN_Y and BTN_WEST are the same code.
+    pub(in crate::gui_v2) const BTN_Y: u16 = super::BTN_WEST;
+}
+
 #[cfg(not(target_os = "linux"))]
 mod other {
     use super::{PadEvent, PadStatus};
@@ -1123,6 +1218,30 @@ mod tests {
             decode(&mut d, EV_KEY, BTN_SOUTH, 2).is_empty(),
             "autorepeat"
         );
+    }
+
+    /// The codes each driver really sends, from the kernel's xpad.c and
+    /// hid-playstation.c and Sunshine's inputtino joypad_xbox.cpp.
+    #[test]
+    fn face_buttons_follow_how_each_driver_numbers_them() {
+        let map =
+            |vendor: u16, code: u16| match decode_raw(vendor, 7, &[(EV_KEY, code, 1)]).as_slice() {
+                [PadEvent::Pressed { control, .. }] => *control,
+                other => panic!("{other:?}"),
+            };
+        let b = Control::Button;
+        // Sunshine X-Box One (virtual) pad, 045e:02ea, and xpad pads.
+        assert_eq!(map(0x045e, BTN_SOUTH), b(Button::South), "A");
+        assert_eq!(map(0x045e, BTN_EAST), b(Button::East), "B");
+        assert_eq!(map(0x045e, 0x133), b(Button::West), "X is the left button");
+        assert_eq!(map(0x045e, 0x134), b(Button::North), "Y is the top button");
+        // DualSense (054c) and Switch Pro (057e) report by position.
+        for vendor in [0x054c, 0x057e] {
+            assert_eq!(map(vendor, BTN_SOUTH), b(Button::South));
+            assert_eq!(map(vendor, BTN_EAST), b(Button::East));
+            assert_eq!(map(vendor, BTN_NORTH), b(Button::North));
+            assert_eq!(map(vendor, BTN_WEST), b(Button::West));
+        }
     }
 
     #[test]

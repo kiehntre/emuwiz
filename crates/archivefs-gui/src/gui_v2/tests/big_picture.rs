@@ -688,3 +688,74 @@ fn a_held_back_or_select_key_acts_once() {
     }
     assert_eq!(state(&app).focus(), 3, "a held arrow still moves");
 }
+
+/// The owner's test pad, as /proc/bus/input/devices showed it on Saltbox26:
+/// "Sunshine X-Box One (virtual) pad", bus 0003, vendor 045e, product 02ea.
+/// Input starts as the raw evdev codes inputtino writes for Moonlight's A, B,
+/// X and Y flags (BTN_A, BTN_B, BTN_X, BTN_Y).
+const SUNSHINE_XBOX_ONE: u16 = 0x045e;
+
+fn press_raw(context: &egui::Context, app: &mut App, raw: &[(u16, u16, i32)]) {
+    let events = big_picture::decode_raw(SUNSHINE_XBOX_ONE, 3, raw);
+    assert!(!events.is_empty(), "{raw:?} decoded to nothing");
+    let state = app.big_picture.as_mut().expect("Big Picture is open");
+    for event in events {
+        state.inject(event);
+    }
+    settle(context, app);
+}
+
+fn xbox(context: &egui::Context, app: &mut App, code: u16) {
+    use big_picture::codes::EV_KEY;
+    press_raw(context, app, &[(EV_KEY, code, 1), (EV_KEY, code, 0)]);
+}
+
+#[test]
+fn a_sunshine_xbox_one_pad_selects_with_a_and_goes_back_with_b_everywhere() {
+    use big_picture::codes::{ABS_HAT0Y, BTN_A, BTN_B, BTN_X, BTN_Y, EV_ABS};
+    let context = egui::Context::default();
+    let mut app = opened(&context, 30);
+    // Grid and game step.
+    xbox(&context, &mut app, BTN_A);
+    assert_eq!(
+        state(&app).step(),
+        Step::Game(1),
+        "A selects the focused game"
+    );
+    xbox(&context, &mut app, BTN_B);
+    assert_eq!(state(&app).step(), Step::Browse, "B goes back");
+    xbox(&context, &mut app, BTN_B);
+    assert!(
+        state(&app).notice_text().unwrap().contains("again"),
+        "B at the top only arms leaving"
+    );
+    xbox(&context, &mut app, BTN_A);
+    xbox(&context, &mut app, BTN_B);
+    // Search keyboard: X, the left button, opens it as the hint says.
+    xbox(&context, &mut app, BTN_X);
+    assert!(state(&app).search_open(), "X opens search");
+    xbox(&context, &mut app, BTN_A);
+    assert_eq!(app.filter.search, "A", "A presses the focused key");
+    xbox(&context, &mut app, BTN_B);
+    assert!(!state(&app).search_open(), "B closes search");
+    assert_eq!(app.filter.search, "A");
+    app.filter.search.clear();
+    settle(&context, &mut app);
+    // System picker: Y, the top button.
+    xbox(&context, &mut app, BTN_Y);
+    assert!(state(&app).platforms_open(), "Y opens the systems");
+    xbox(&context, &mut app, BTN_B);
+    assert!(!state(&app).platforms_open(), "B closes it");
+    assert_eq!(app.filter.platform, "", "and changes nothing");
+    xbox(&context, &mut app, BTN_Y);
+    for _ in 0..2 {
+        press_raw(
+            &context,
+            &mut app,
+            &[(EV_ABS, ABS_HAT0Y, 1), (EV_ABS, ABS_HAT0Y, 0)],
+        );
+    }
+    xbox(&context, &mut app, BTN_A);
+    assert_eq!(app.filter.platform, "SNES", "A chooses the focused system");
+    assert!(!state(&app).platforms_open());
+}

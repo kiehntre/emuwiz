@@ -27,6 +27,8 @@ use super::{
 use crate::ui::theme::blue;
 use eframe::egui::{self, Color32, RichText};
 use gamepad::{PadStatus, Reader};
+#[cfg(test)]
+pub(super) use gamepad::{codes, decode_raw};
 use nav::{Command, Direction, Grid, Navigator, PadEvent, SEARCH_COLUMNS, SearchKey, search_keys};
 use std::sync::Arc;
 
