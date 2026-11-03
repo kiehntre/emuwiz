@@ -175,6 +175,10 @@ pub(super) enum Command {
         library: SharedLibrary,
         key: usize,
     },
+    DiscLookup {
+        library: SharedLibrary,
+        game: i64,
+    },
     MissingPreview,
     MissingApply {
         token: String,
@@ -284,6 +288,7 @@ pub(super) enum Payload {
     ReconciliationHashes(super::library_reconciliation::HashRun),
     ReconciliationSupportCheck(Box<super::library_reconciliation::SupportCheckRun>),
     MediaSetReview(Box<super::media_sets::MediaSetReview>),
+    DiscLookup(Option<Box<super::game_detail_facts::DiscLookup>>),
     MissingPreview(Box<archivefs_core::catalogue_health::ForgetMissingPlan>),
     MissingApplied(Box<archivefs_core::catalogue_health::ForgetMissingResult>),
     MissingUndone(usize),
@@ -415,6 +420,9 @@ fn execute(id: u64, command: Command, answers: &Sender<Event>) -> Result<Payload
         Command::MediaSetReview { library, key } => Ok(Payload::MediaSetReview(Box::new(
             super::media_sets::analyse(&library, key),
         ))),
+        Command::DiscLookup { library, game } => Ok(Payload::DiscLookup(
+            super::game_detail_facts::look_up(&library, game).map(Box::new),
+        )),
         Command::ReconcileLibrary {
             library,
             hashes,
@@ -1072,12 +1080,24 @@ fn load_detail(game: &Game) -> Result<Detail, String> {
             .collect();
     installed.sort();
     installed.dedup();
+    // Only for the same file the audit saw; a changed file gets no saved region.
+    let dat_region = checks.iter().filter(|_| unchanged).find_map(|check| {
+        matches!(
+            check.verification_state,
+            archivefs_core::dat::library_identity_summary::DatVerificationState::VerifiedSingleMatch { .. }
+        )
+        .then_some(())?;
+        (check.audited_hashes.size_bytes == game.archive.size_bytes).then_some(())?;
+        let region = check.canonical.region.clone()?;
+        Some((region, check.source.source_name.clone()))
+    });
     Ok(Detail {
         game: game.archive.id,
         file_present: metadata.is_some(),
         unchanged,
         saved_checks: checks.len(),
         installed,
+        dat_region,
         technical: format!(
             "Saved health: {}\nSaved checks: {}\n{}",
             game.archive.last_known_health,

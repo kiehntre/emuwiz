@@ -37,6 +37,11 @@ pub(super) struct Key {
     pub game: i64,
     pub kind: Kind,
     pub generation: u64,
+    /// Local artwork and covers already in the disk cache only, read-only: a
+    /// cache miss ends as `Missing` and is never handed to the remote lane, and
+    /// nothing is written (no thumbnail published, no cache entry repaired). A
+    /// separate key, so a local-only miss never hides a picture elsewhere.
+    pub local_only: bool,
 }
 
 /// Why a picture could not be produced. `connectivity` is set only when the
@@ -47,7 +52,16 @@ pub(super) struct ResolveFailure {
     pub message: String,
     pub connectivity: Option<RommConnectivity>,
 }
+/// Message of the failure a local-only request ends with on a cache miss.
+const NOT_CACHED_LOCALLY: &str = "This cover is not stored on this computer.";
+
 impl ResolveFailure {
+    fn not_cached_locally() -> Self {
+        NOT_CACHED_LOCALLY.into()
+    }
+    fn is_not_cached_locally(&self) -> bool {
+        self.connectivity.is_none() && self.message == NOT_CACHED_LOCALLY
+    }
     fn provider(state: RommConnectivity) -> Self {
         Self {
             message: state.plain_message().into(),
@@ -201,7 +215,8 @@ enum Reply {
     },
     Picture {
         key: Key,
-        result: Result<Pixels, ResolveFailure>,
+        /// Boxed: decoded pixels are far larger than the index reply.
+        result: Box<Result<Pixels, ResolveFailure>>,
         completed: Instant,
     },
 }
@@ -224,7 +239,9 @@ pub(super) enum Picture {
 
 pub(super) struct Artwork {
     queue: SharedQueue,
-    index_requests: Option<Sender<(u64, SharedLibrary)>>,
+    /// (generation, library, trim): `trim` runs the thumbnail-cache eviction
+    /// after the build; a read-only build never does.
+    index_requests: Option<Sender<(u64, SharedLibrary, bool)>>,
     index_replies: Receiver<Reply>,
     replies: Receiver<Reply>,
     pub index: Option<Arc<MediaIndex>>,
@@ -241,6 +258,8 @@ pub(super) struct Artwork {
     pub failures: u64,
     pub cancelled: u64,
     pub index_loading: bool,
+    /// The index was built read-only; the thumbnail-cache eviction is owed.
+    trim_pending: bool,
     pub paused: bool,
     cache: Option<std::path::PathBuf>,
     pub health: Arc<ProviderHealth>,
@@ -268,15 +287,19 @@ impl Artwork {
         let health = Arc::new(ProviderHealth::new(PROVIDER_BACKOFF).with_local_discovery());
         let (answers, replies) = mpsc::sync_channel(32);
         let (index_answers, index_replies) = mpsc::sync_channel(1);
-        let (index_requests, index_rx) = mpsc::channel::<(u64, SharedLibrary)>();
+        let (index_requests, index_rx) = mpsc::channel::<(u64, SharedLibrary, bool)>();
         {
             let index_answers = index_answers.clone();
             let context = context.clone();
+            let trim_root = cache.clone();
             std::thread::spawn(move || {
                 while let Ok(mut request) = index_rx.recv() {
                     // A rescan can supersede a queued index. Only build the newest.
+                    // A superseded request's trim is kept, never dropped.
                     while let Ok(newer) = index_rx.try_recv() {
+                        let trim = request.2 || newer.2;
                         request = newer;
+                        request.2 = trim;
                     }
                     let index = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
                         indexer(&request.1)
@@ -288,7 +311,12 @@ impl Artwork {
                         ],
                         ..MediaIndex::default()
                     });
-                    if let Ok(root) = thumbnail::cache_root() {
+                    if request.2
+                        && let Ok(root) = trim_root
+                            .clone()
+                            .map(Ok)
+                            .unwrap_or_else(thumbnail::cache_root)
+                    {
                         thumbnail::trim_cache(&root);
                     }
                     if index_answers
@@ -343,9 +371,9 @@ impl Artwork {
                         std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| resolve(&request, &transport, &health)))
                             .unwrap_or_else(|_| Err("The picture could not be decoded safely. Retry or choose another picture.".into()))
                     };
-                    let result = match result {
-                        Ok(Some(pixels)) => Ok(pixels),
-                        Ok(None) => {
+                    let result = match after_resolve(&request, result) {
+                        Next::Reply(result) => result,
+                        Next::Promote => {
                             // Probe disk caches on a local lane first. A slow
                             // online request cannot queue ahead of cached covers.
                             request.remote = true;
@@ -355,12 +383,11 @@ impl Artwork {
                             }
                             continue;
                         }
-                        Err(error) => Err(error),
                     };
                     if answers
                         .send(Reply::Picture {
                             key: request.key,
-                            result,
+                            result: Box::new(result),
                             completed: Instant::now(),
                         })
                         .is_err()
@@ -391,12 +418,24 @@ impl Artwork {
             failures: 0,
             cancelled: 0,
             index_loading: false,
+            trim_pending: false,
             paused: false,
             health,
         }
     }
 
     pub fn reload(&mut self, library: SharedLibrary) {
+        self.trim_pending = false;
+        self.reload_with(library, true);
+    }
+    /// Builds the index read-only: discovery only, never the thumbnail-cache
+    /// eviction. The eviction then runs once, before the first ordinary
+    /// picture request, so other surfaces keep their cache behaviour.
+    pub fn reload_read_only(&mut self, library: SharedLibrary) {
+        self.trim_pending = true;
+        self.reload_with(library, false);
+    }
+    fn reload_with(&mut self, library: SharedLibrary, trim: bool) {
         self.cancel();
         self.paused = false;
         self.generation += 1;
@@ -417,7 +456,7 @@ impl Artwork {
         if self
             .index_requests
             .as_ref()
-            .is_none_or(|sender| sender.send((self.generation, library)).is_err())
+            .is_none_or(|sender| sender.send((self.generation, library, trim)).is_err())
         {
             self.index_loading = false;
         }
@@ -453,7 +492,7 @@ impl Artwork {
                         .remove(&key)
                         .is_none_or(|cancel| cancel.load(Ordering::Relaxed));
                     if !cancelled {
-                        let picture = match result {
+                        let picture = match *result {
                             Ok(mut pixels) => {
                                 pixels.timings.delivery = completed.elapsed();
                                 log::debug!("gui_v2 artwork {:?}: {:?}", key, pixels.timings);
@@ -466,6 +505,9 @@ impl Artwork {
                                     texture,
                                     timings: pixels.timings,
                                 }
+                            }
+                            Err(failure) if key.local_only && failure.is_not_cached_locally() => {
+                                Picture::Missing
                             }
                             Err(failure) => {
                                 self.failures += 1;
@@ -489,10 +531,36 @@ impl Artwork {
             game,
             kind,
             generation: self.generation,
+            local_only: false,
+        }
+    }
+    pub fn local_key(&self, game: i64, kind: Kind) -> Key {
+        Key {
+            local_only: true,
+            ..self.key(game, kind)
         }
     }
     pub fn request(&mut self, game: i64, kind: Kind) -> Key {
+        if self.trim_pending && self.index.is_some() {
+            self.trim_pending = false;
+            let root = self.cache.clone();
+            std::thread::spawn(move || {
+                if let Ok(root) = root.map(Ok).unwrap_or_else(thumbnail::cache_root) {
+                    thumbnail::trim_cache(&root);
+                }
+            });
+        }
         let key = self.key(game, kind);
+        self.request_key(key)
+    }
+    /// Like [`Self::request`], but only local artwork and covers already in
+    /// the disk cache: never a provider request, never a new cache entry.
+    pub fn request_local(&mut self, game: i64, kind: Kind) -> Key {
+        let key = self.local_key(game, kind);
+        self.request_key(key)
+    }
+    fn request_key(&mut self, key: Key) -> Key {
+        let (game, kind) = (key.game, key.kind);
         self.wanted.insert(key);
         self.last_seen.insert(key, self.frame);
         // A failure is not permanent: once it is old enough, forget it so the
@@ -640,14 +708,18 @@ where
         .ok_or("No picture is available.")?;
     let metadata_time = start.elapsed();
     let mut pixels = match source {
-        Source::Local(path) => thumbnail::load_local(
-            path,
-            &request
+        Source::Local(path) => {
+            let root = request
                 .cache
                 .clone()
                 .map(Ok)
-                .unwrap_or_else(thumbnail::cache_root)?,
-        )?,
+                .unwrap_or_else(thumbnail::cache_root)?;
+            if request.key.local_only {
+                thumbnail::load_local_read_only(path, &root)?
+            } else {
+                thumbnail::load_local(path, &root)?
+            }
+        }
         Source::Remote { record, kind } => {
             use archivefs_core::identity_source::{
                 artwork::{ArtworkCache, ArtworkRequest},
@@ -674,7 +746,11 @@ where
             let configured = request.index.settings.source.url.trim().to_string();
             // A cover fetched through a session-only local route is stored under the
             // configured server's id, so one lookup serves every route.
-            let cached = cache.lookup(&request.index.server, &request_art);
+            let cached = if request.key.local_only {
+                cache.peek(&request.index.server, &request_art)
+            } else {
+                cache.lookup(&request.index.server, &request_art)
+            };
             timings.lookup = start.elapsed();
             timings.cache_hit = cached.is_some();
             let thumbnail = if let Some(cached) = cached {
@@ -857,6 +933,24 @@ impl<T: archivefs_core::identity_source::romm::client::RommTransport>
     }
 }
 
+/// What a picture worker does with a resolved request.
+enum Next {
+    Reply(Result<Pixels, ResolveFailure>),
+    /// Not in any local cache: ask the remote lane.
+    Promote,
+}
+
+fn after_resolve(request: &Request, result: Result<Option<Pixels>, ResolveFailure>) -> Next {
+    match result {
+        Ok(Some(pixels)) => Next::Reply(Ok(pixels)),
+        Ok(None) if request.key.local_only => {
+            Next::Reply(Err(ResolveFailure::not_cached_locally()))
+        }
+        Ok(None) => Next::Promote,
+        Err(error) => Next::Reply(Err(error)),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -887,6 +981,7 @@ mod tests {
                 game: 1,
                 kind: Kind::Cover,
                 generation: 1,
+                local_only: false,
             },
             index: Arc::new(index),
             remote: false,
@@ -1179,6 +1274,7 @@ mod tests {
                 game: 1,
                 kind: Kind::Cover,
                 generation: 1,
+                local_only: false,
             },
             index: Arc::new(index),
             remote: true,
@@ -1548,6 +1644,7 @@ mod tests {
                 game: 1,
                 kind: Kind::Cover,
                 generation: 1,
+                local_only: false,
             },
             index: Arc::new(index),
             remote: true,
@@ -1870,5 +1967,264 @@ mod tests {
         // A reload (new generation) drops every old-generation picture's key.
         artwork.generation += 1;
         assert_ne!(artwork.key(1, Kind::Cover), first);
+    }
+
+    /// Arcade Shelf regression: with Online artwork switched on and a server
+    /// configured, a local-only cover that no local cache holds ends as a
+    /// miss. It is never handed to the remote lane, so nothing is resolved,
+    /// requested or cached.
+    #[test]
+    fn a_local_only_cache_miss_ends_missing_with_zero_network_requests() {
+        let directory = tempfile::tempdir().unwrap();
+        let mut request = remote_request(directory.path(), "http://192.168.1.50:8080", true);
+        request.remote = false; // every request starts on a local lane
+        request.key.local_only = true;
+        let transport = TimedTransport::new(FakeServer::serving_png());
+        let resolver = FakeResolver::resolving();
+        let health = health();
+        let result = resolve_with(&request, &transport, &resolver, &health);
+        assert!(matches!(result, Ok(None)));
+        assert!(matches!(
+            after_resolve(&request, result),
+            Next::Reply(Err(failure)) if failure.is_not_cached_locally()
+        ));
+        assert_eq!((resolver.calls(), transport.inner.calls()), (0, 0));
+        assert!(health.snapshot().is_none());
+        assert!(!directory.path().join("identity").exists());
+
+        // Control: the same miss on an ordinary key is promoted, and the
+        // remote lane would then ask RomM. The test can see a request.
+        request.key.local_only = false;
+        let result = resolve_with(&request, &transport, &resolver, &health);
+        assert!(matches!(after_resolve(&request, result), Next::Promote));
+        request.remote = true;
+        let result = resolve_with(&request, &transport, &resolver, &health);
+        assert!(matches!(result, Ok(Some(_))));
+        assert!(transport.inner.calls() > 0);
+    }
+
+    /// The same, end to end through the real picture workers: RomM is
+    /// configured at a local listener that must never see a connection.
+    #[test]
+    fn local_only_requests_never_contact_romm_through_the_real_workers() {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        listener.set_nonblocking(true).unwrap();
+        let url = format!("http://127.0.0.1:{}", listener.local_addr().unwrap().port());
+        let directory = tempfile::tempdir().unwrap();
+        let context = egui::Context::default();
+        let mut artwork = Artwork::with_indexer(
+            context.clone(),
+            Some(directory.path().join("thumbs")),
+            Arc::new(|_| MediaIndex::default()),
+        );
+        // Installed directly: building it would trim the real thumbnail cache.
+        artwork.index = Some(remote_request(directory.path(), &url, true).index);
+        let key = artwork.request_local(1, Kind::Cover);
+        for _ in 0..400 {
+            artwork.begin_frame(&context);
+            artwork.request_local(1, Kind::Cover);
+            if !matches!(artwork.pictures.get(&key), Some(Picture::Loading)) {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        assert!(matches!(artwork.pictures.get(&key), Some(Picture::Missing)));
+        // Give a wrongly promoted request time to reach the listener.
+        std::thread::sleep(Duration::from_millis(300));
+        assert!(matches!(
+            listener.accept(),
+            Err(error) if error.kind() == std::io::ErrorKind::WouldBlock
+        ));
+        assert!(artwork.health.snapshot().is_none());
+        assert_eq!(artwork.failures, 0);
+        assert!(!directory.path().join("identity").exists());
+        // The ordinary picture for this game is untouched, so Browse & Play
+        // still loads it exactly as before.
+        assert!(!artwork.pictures.contains_key(&artwork.key(1, Kind::Cover)));
+    }
+
+    /// Every file under `root` with its size and modification time.
+    fn tree(root: &std::path::Path) -> Vec<(std::path::PathBuf, u64, std::time::SystemTime)> {
+        let mut found = Vec::new();
+        let mut pending = vec![root.to_path_buf()];
+        while let Some(directory) = pending.pop() {
+            let Ok(entries) = std::fs::read_dir(&directory) else {
+                continue;
+            };
+            for entry in entries.flatten() {
+                let metadata = std::fs::symlink_metadata(entry.path()).unwrap();
+                if metadata.is_dir() {
+                    pending.push(entry.path());
+                }
+                found.push((entry.path(), metadata.len(), metadata.modified().unwrap()));
+            }
+        }
+        found.sort();
+        found
+    }
+
+    fn settle(artwork: &mut Artwork, context: &egui::Context, keys: &[Key]) {
+        for _ in 0..400 {
+            artwork.begin_frame(context);
+            for key in keys {
+                if key.local_only {
+                    artwork.request_local(key.game, key.kind);
+                } else {
+                    artwork.request(key.game, key.kind);
+                }
+            }
+            if keys
+                .iter()
+                .all(|key| !matches!(artwork.pictures.get(key), Some(Picture::Loading) | None))
+            {
+                return;
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        panic!("pictures never settled");
+    }
+
+    /// Arcade Shelf regression: local-only (shelf) pictures read local files
+    /// and existing caches but write nothing: no thumbnail cache directory,
+    /// no thumbnail, no RomM cache entry or index. Ordinary requests on the
+    /// same setup still publish a thumbnail, so the test can see a write and
+    /// other surfaces are unchanged.
+    #[test]
+    fn local_only_pictures_write_no_thumbnail_cache_or_artwork_metadata() {
+        let directory = tempfile::tempdir().unwrap();
+        let sources = directory.path().join("covers");
+        std::fs::create_dir(&sources).unwrap();
+        write_png(&sources.join("one.png"));
+        let cache = directory.path().join("thumbs");
+        // Game 1: a local cover. Game 2: a RomM cover that is not cached, with
+        // Online artwork switched on.
+        let mut index = Arc::try_unwrap(
+            remote_request(directory.path(), "http://192.168.1.50:8080", true).index,
+        )
+        .unwrap_or_default();
+        let remote = index.covers.remove(&1).unwrap();
+        index.covers.insert(2, remote);
+        index
+            .covers
+            .insert(1, Source::Local(sources.join("one.png")));
+        let context = egui::Context::default();
+        let mut artwork = Artwork::with_indexer(
+            context.clone(),
+            Some(cache.clone()),
+            Arc::new(|_| MediaIndex::default()),
+        );
+        artwork.index = Some(Arc::new(index));
+        let before = tree(directory.path());
+
+        let local = [
+            artwork.local_key(1, Kind::Cover),
+            artwork.local_key(2, Kind::Cover),
+        ];
+        settle(&mut artwork, &context, &local);
+        assert!(matches!(
+            artwork.pictures.get(&local[0]),
+            Some(Picture::Ready { .. })
+        ));
+        assert!(matches!(
+            artwork.pictures.get(&local[1]),
+            Some(Picture::Missing)
+        ));
+        // Scrolling away and back asks again; still nothing is written.
+        artwork.pictures.clear();
+        settle(&mut artwork, &context, &local);
+        assert_eq!(tree(directory.path()), before);
+        assert!(!cache.exists());
+
+        // Control: an ordinary request publishes a thumbnail, as before.
+        let ordinary = [artwork.key(1, Kind::Cover)];
+        settle(&mut artwork, &context, &ordinary);
+        assert!(matches!(
+            artwork.pictures.get(&ordinary[0]),
+            Some(Picture::Ready { .. })
+        ));
+        assert_eq!(std::fs::read_dir(&cache).unwrap().count(), 1);
+
+        // That existing thumbnail is read by the shelf without any change.
+        let cached = tree(directory.path());
+        artwork.pictures.remove(&local[0]);
+        settle(&mut artwork, &context, &local[..1]);
+        assert!(matches!(
+            artwork.pictures.get(&local[0]),
+            Some(Picture::Ready { .. })
+        ));
+        assert_eq!(tree(directory.path()), cached);
+    }
+
+    /// Arcade Shelf first open: a read-only index build discovers covers but
+    /// never runs the thumbnail-cache eviction, even over the size limit; the
+    /// first ordinary request (Browse & Play and every other surface) still
+    /// does, so their cache behaviour is unchanged.
+    #[test]
+    fn a_read_only_index_build_never_evicts_and_the_first_ordinary_request_does() {
+        let directory = tempfile::tempdir().unwrap();
+        let cache = directory.path().join("thumbs");
+        std::fs::create_dir(&cache).unwrap();
+        // Two sparse 300 MB thumbnails: over the 512 MB budget, so an eviction
+        // would delete the older one. Sparse, so the test uses no real space.
+        let old = cache.join(format!("{}.png", "a".repeat(64)));
+        let new = cache.join(format!("{}.png", "b".repeat(64)));
+        for path in [&old, &new] {
+            std::fs::File::create(path)
+                .unwrap()
+                .set_len(300 * 1024 * 1024)
+                .unwrap();
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        let covers = directory.path().join("covers");
+        std::fs::create_dir(&covers).unwrap();
+        write_png(&covers.join("one.png"));
+        let cover = covers.join("one.png");
+        let context = egui::Context::default();
+        let mut artwork = Artwork::with_indexer(
+            context.clone(),
+            Some(cache.clone()),
+            Arc::new(move |_| {
+                let mut index = MediaIndex::default();
+                index.covers.insert(1, Source::Local(cover.clone()));
+                index
+            }),
+        );
+        let before = tree(directory.path());
+
+        artwork.reload_read_only(Arc::new(super::super::library::Library::default()));
+        for _ in 0..400 {
+            artwork.begin_frame(&context);
+            if artwork.index.is_some() {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        assert!(
+            artwork.index.is_some(),
+            "the read-only build produced no index"
+        );
+        let local = [artwork.local_key(1, Kind::Cover)];
+        settle(&mut artwork, &context, &local);
+        assert!(matches!(
+            artwork.pictures.get(&local[0]),
+            Some(Picture::Ready { .. })
+        ));
+        std::thread::sleep(Duration::from_millis(200));
+        assert_eq!(
+            tree(directory.path()),
+            before,
+            "the read-only path changed files"
+        );
+
+        // The first ordinary request runs the owed eviction exactly as before.
+        artwork.request(1, Kind::Cover);
+        for _ in 0..200 {
+            if !old.exists() {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        assert!(!old.exists(), "the owed eviction never ran");
+        assert!(new.exists());
     }
 }

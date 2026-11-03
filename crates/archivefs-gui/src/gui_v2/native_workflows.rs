@@ -10,6 +10,8 @@ pub(super) mod native_romm;
 #[cfg(all(test, target_os = "linux"))]
 #[path = "native_workflows/cemu_stop_tests.rs"]
 mod cemu_stop_tests;
+#[cfg(all(test, target_os = "linux"))]
+mod retroarch_stop_tests;
 
 #[path = "native_collection.rs"]
 mod native_collection;
@@ -266,6 +268,16 @@ pub(super) fn launch_scroll<R>(
         [true, true],
         content,
     )
+}
+
+/// What the game page already knows about this entry before readiness runs.
+#[derive(Clone, Copy, Default)]
+pub(super) struct SavedFileFacts {
+    pub catalogue_verified: bool,
+    /// Game Details' unconfirmed DAT identity for the card's identity line
+    /// (pending, not confirmed, or re-check needed); `None` otherwise.
+    pub dat_identity: Option<launch_readiness_summary::IdentitySummary>,
+    pub file_missing: bool,
 }
 
 impl NativeWorkflows {
@@ -555,6 +567,7 @@ impl NativeWorkflows {
             let launch_active = self.launch_active();
             if launch_active {
                 self.app.launch_standalone.show_cemu_lifecycle(ui);
+                self.app.launch_retroarch.show_stop_control(ui);
             }
             // A readable but invalid file produces unresolved evidence, not
             // a worker error. Let a repaired file use the same bounded retry.
@@ -609,7 +622,7 @@ impl NativeWorkflows {
         game_id: i64,
         path: &Path,
         catalogue_identity_report: Option<&archivefs_core::game_identity::GameIdentityReport>,
-        catalogue_verified: bool,
+        saved: SavedFileFacts,
         activity: &mut Activity,
     ) -> Option<Route> {
         self.app.emulator_readiness.flycast_gdi.show(ui, Some(path));
@@ -618,15 +631,21 @@ impl NativeWorkflows {
             .emulator_readiness
             .xroar_cassette
             .show(ui, Some(path));
-        let (summary, input) = self.readiness_projection(
+        let (mut summary, input) = self.readiness_projection(
             ui.ctx(),
             game_id,
             path,
             catalogue_identity_report,
-            catalogue_verified,
+            saved.catalogue_verified,
             true,
             activity,
         );
+        if let Some(identity) = saved.dat_identity {
+            launch_readiness_summary::note_dat_identity(&mut summary, identity);
+        }
+        if saved.file_missing {
+            launch_readiness_summary::note_file_missing(&mut summary);
+        }
         let action = launch_readiness_summary::show(ui, &summary);
         launch_readiness_page::show_dolphin_profile_guidance(ui, &input);
         self.show_game_firmware_guidance(ui, game_id, path, &input);
@@ -794,6 +813,31 @@ impl NativeWorkflows {
 
     /// Reuse the same current plan and candidate policy as Launch. Never
     /// substitute an inventory installation or select a different candidate.
+    #[cfg(test)]
+    pub(super) fn launch_was_requested(&self, game_id: i64) -> bool {
+        self.launch_active() || self.launch_attempts.for_game(game_id).is_some()
+    }
+
+    /// The current readiness answer for the game on screen, for reading only.
+    pub(super) fn readiness_summary(
+        &self,
+        game_id: i64,
+        path: &Path,
+    ) -> Option<launch_readiness_summary::GameReadinessSummary> {
+        if self.selected_game != Some(game_id) || self.selected.as_deref() != Some(path) {
+            return None;
+        }
+        let freshness = if self.readiness_error().is_some() {
+            ReadinessFreshness::Stale
+        } else {
+            ReadinessFreshness::Current
+        };
+        Some(launch_readiness_summary::project(
+            &self.launch_input(),
+            freshness,
+        ))
+    }
+
     pub(super) fn save_state_target(
         &self,
         game_id: i64,

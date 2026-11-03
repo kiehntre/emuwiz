@@ -120,10 +120,10 @@ impl State {
                 } else {
                     status.push_str(" Do not assume the profile was saved or unchanged. Review the receipt and recovery records before retrying.");
                 }
-                if let Some(path) = result.journal_path {
+                if let Some(path) = &result.journal_path {
                     status.push_str(&format!(" History receipt: {}.", path.display()));
                 }
-                if let Some(error) = result.journal_failure {
+                if let Some(error) = &result.journal_failure {
                     status.push_str(&format!(" Receipt problem: {}.", error.detail));
                 }
                 for entry in &result.journal.entries {
@@ -131,6 +131,7 @@ impl State {
                         status.push_str(&format!(" {}.", error.detail));
                     }
                 }
+                crate::shared_apply_warnings::append(&mut status, &result);
                 self.status = Some(status);
                 self.history_loaded = false;
                 self.undo = None;

@@ -123,7 +123,10 @@ import types
 
 sys.dont_write_bytecode = True
 GIB = 1024 ** 3
-POLICY_VERSION = 1
+# 2: Fix B widened what a cycle retires (post-retirement binary residue in a markerless `debug`
+# profile).  A policy approved under an earlier version never covered that, so it is rejected
+# (fail closed) until the owner runs `policy approve` again; its digest cannot be reused.
+POLICY_VERSION = 2
 DEFAULT_SOFT = 220_000_000_000
 DEFAULT_HARD = 240_000_000_000
 DEFAULT_COLD_ALLOWANCE = 3 * GIB       # expected first-build size of a new target
@@ -538,6 +541,11 @@ def load_policy(trusted_uids=None):
         policy = json.loads(text)
     except ValueError as error:
         return "invalid", None, f"policy unreadable: {error}"
+    old_schema = policy.get("schema") if isinstance(policy, dict) else None
+    if isinstance(old_schema, int) and not isinstance(old_schema, bool) and 0 < old_schema < POLICY_VERSION:
+        return "invalid", None, (f"policy schema {old_schema} was approved before the retirement scope was "
+                                 f"widened (schema {POLICY_VERSION}: post-retirement binary residue); it no longer "
+                                 "authorises anything. Review the scope and run `policy approve` again")
     if not isinstance(policy, dict) or not validate_policy(policy):
         return "invalid", None, "policy is malformed or its integrity digest does not match"
     claimed = policy["enabled"]
@@ -1662,6 +1670,71 @@ def worktree_gate(path):
     return res
 
 
+RESIDUE_SCAN_LIMIT = 200_000
+RESIDUE_EXAMPLES = 3
+
+
+def unrecognised_residue(target):
+    """Everything in a cache that is neither empty directory structure, one of
+    Cargo's own empty lock files, nor an explicitly permitted preserved-evidence
+    directory (`F.ALWAYS_PRESERVE`, directly under the cache or one to three
+    levels down where a profile directory lives; its contents are evidence and are
+    not descended into).
+
+    A cache that retirement has finished with can still hold output the retirement
+    tool does not recognise (a standalone executable with no sibling `.d`, a stray
+    file, a symlink, another filesystem). Retirement never selects it, so the
+    worktree must not be declared removable while it exists: once the worktree is
+    gone the residue is an orphan that no gate can ever release.
+
+    Read-only, `lstat` only, never follows a symlink. Anything it cannot judge
+    (unreadable directory, another device, an oversized tree) counts as residue.
+    Returns (count, bytes, [relative example paths])."""
+    count = size = seen = 0
+    examples = []
+    root_dev = os.lstat(target).st_dev
+
+    def note(path, st_size):
+        nonlocal count, size
+        count += 1
+        size += st_size
+        if len(examples) < RESIDUE_EXAMPLES:
+            examples.append(ascii(os.path.relpath(path, target)))
+
+    stack = [(target, 0)]
+    while stack:
+        directory, depth = stack.pop()
+        try:
+            with os.scandir(directory) as entries:
+                children = sorted(entries, key=lambda e: e.name)
+        except OSError:
+            note(directory, 0)
+            continue
+        for entry in children:
+            seen += 1
+            if seen > RESIDUE_SCAN_LIMIT:
+                note(entry.path, 0)
+                return count, size, examples
+            try:
+                st = entry.stat(follow_symlinks=False)
+            except OSError:
+                note(entry.path, 0)
+                continue
+            if stat.S_ISDIR(st.st_mode):
+                if st.st_dev != root_dev:
+                    note(entry.path, 0)
+                elif entry.name in F.ALWAYS_PRESERVE and 1 <= depth + 1 <= 3:
+                    continue
+                else:
+                    stack.append((entry.path, depth + 1))
+            elif stat.S_ISREG(st.st_mode) and entry.name in F.CARGO_LOCK_NAMES and st.st_size == 0:
+                continue
+            else:
+                note(entry.path, st.st_blocks * 512)
+    return count, size, examples
+
+
+
 def lifecycle_gate(path):
     """CLEAR only when the worktree's compiler artifacts are gone (retired with a
     verified receipt, or never existed).  Otherwise HOLD with the reason and the
@@ -1725,6 +1798,14 @@ def lifecycle_gate(path):
             if not ok:
                 return hold("RECEIPT_UNVERIFIED", "artifacts are gone but the retirement evidence could not be verified: "
                             + why + ". Keep the worktree and review the receipt and journal by hand")
+            count, size, examples = unrecognised_residue(target)
+            if count:
+                return hold("UNRECOGNISED_RESIDUE",
+                            "the retirement receipt is verified but %d item(s), %.2f GB, remain that the retirement tool "
+                            "does not recognise (for example %s), so it can never retire them and they would be orphaned "
+                            "once the worktree is gone. Keep the worktree and review them by hand"
+                            % (count, size / 1e9, ", ".join(examples)),
+                            residue={"items": count, "bytes": size, "examples": examples})
             return clear("no compiler artifacts remain (retirement receipt verified); "
                          "preserved evidence stays in the cache directory")
         try:

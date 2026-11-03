@@ -866,6 +866,7 @@ mod tests {
                 replacement_approved: true,
                 verification_succeeded: true,
                 outcome,
+                publication: Default::default(),
                 stages: Vec::new(),
                 warnings: Vec::new(),
                 failures: Vec::new(),

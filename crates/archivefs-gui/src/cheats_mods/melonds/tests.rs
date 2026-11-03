@@ -97,3 +97,17 @@ fn routed_support_requires_local_preview_and_does_not_claim_general_apply() {
         assert!(!route.can_apply());
     }
 }
+
+#[test]
+fn apply_result_shows_shared_transaction_warnings() {
+    use crate::shared_apply_warnings::test_support::{assert_shows_warning, warned_result};
+    let (tx, rx) = mpsc::channel();
+    let mut state = MelonDsPageState {
+        receiver: Some(rx),
+        ..Default::default()
+    };
+    tx.send(Ok(Message::Applied(Box::new(warned_result()))))
+        .unwrap();
+    state.poll();
+    assert_shows_warning(state.outcome.as_deref().unwrap());
+}

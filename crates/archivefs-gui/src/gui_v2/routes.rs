@@ -783,10 +783,11 @@ pub(super) enum ToolPage {
     WhdloadOptions,
     OpticalCompare,
     SourceImpact,
+    ArcadeShelf,
 }
 
 impl ToolPage {
-    pub const ALL: [Self; 17] = [
+    pub const ALL: [Self; 18] = [
         Self::AlternativeProviders,
         Self::NeedsAttention,
         Self::Mounts,
@@ -804,6 +805,7 @@ impl ToolPage {
         Self::WhdloadOptions,
         Self::OpticalCompare,
         Self::SourceImpact,
+        Self::ArcadeShelf,
     ];
 
     pub fn title(self) -> &'static str {
@@ -825,6 +827,7 @@ impl ToolPage {
             Self::NetplayPreview => "Netplay comparison",
             Self::HostDiagnostics => "Host capability diagnostics",
             Self::CheatExtras => "Providers and code previews",
+            Self::ArcadeShelf => "Virtual Arcade Shelf",
         }
     }
 
@@ -869,6 +872,9 @@ impl ToolPage {
             Self::CheatExtras => {
                 "Licences for open and local cheat providers, and read-only code previews."
             }
+            Self::ArcadeShelf => {
+                "Browse your covers on one shelf per system, then open Game Details for any game."
+            }
         }
     }
 
@@ -891,6 +897,7 @@ impl ToolPage {
             Self::NetplayPreview => Section::Launch,
             Self::HostDiagnostics => Section::Setup,
             Self::CheatExtras => Section::Mods,
+            Self::ArcadeShelf => Section::Games,
         }
     }
 
@@ -912,6 +919,7 @@ impl ToolPage {
             Self::NetplayPreview => "Games & collection",
             Self::HostDiagnostics => "Tools",
             Self::CheatExtras => "Enhance",
+            Self::ArcadeShelf => "Games & collection",
         }
     }
 }
@@ -933,6 +941,8 @@ pub(super) enum Route {
     /// The platform-first Check My Games flow for one canonical platform, so
     /// the destination already knows which platform the person came from.
     PlatformCheck(String),
+    /// Game Details' one-game DAT check: reads and saves only this game.
+    GameCheck(i64),
     /// Read-only comparison of the files in the game folders with the catalogue.
     LibraryFiles,
     /// A native page for a former legacy-only tool.
@@ -955,6 +965,7 @@ impl Route {
             Self::ReviewIdentity(_) => Section::Check,
             Self::QuickRename => Section::Dat,
             Self::PlatformCheck(_) => Section::Check,
+            Self::GameCheck(_) => Section::Check,
             Self::LibraryFiles => Section::Problems,
             Self::Tool(tool) => tool.home(),
         }
@@ -962,7 +973,10 @@ impl Route {
     pub fn game(&self) -> Option<i64> {
         match self {
             Self::BrowsePlayGame(id) => Some(*id),
-            Self::Game(id) | Self::ReviewIdentity(id) | Self::Task { game: id, .. } => Some(*id),
+            Self::Game(id)
+            | Self::ReviewIdentity(id)
+            | Self::GameCheck(id)
+            | Self::Task { game: id, .. } => Some(*id),
             _ => None,
         }
     }
@@ -973,6 +987,7 @@ impl Route {
             Self::BrowsePlayGame(_) => Self::BrowsePlayGame(new),
             Self::Game(_) => Self::Game(new),
             Self::ReviewIdentity(_) => Self::ReviewIdentity(new),
+            Self::GameCheck(_) => Self::GameCheck(new),
             Self::Task { section, .. } => Self::Task {
                 section: *section,
                 game: new,
@@ -1004,12 +1019,19 @@ pub(super) fn breadcrumb_labels(route: &Route, game_title: Option<&str>) -> Vec<
     if let Route::PlatformCheck(platform) = route {
         return vec!["Check Games".into(), platform.clone()];
     }
-    if matches!(route, Route::ReviewIdentity(_)) {
+    if matches!(route, Route::ReviewIdentity(_) | Route::GameCheck(_)) {
         let mut labels = vec!["Games".to_string()];
         if let Some(game_title) = game_title.filter(|title| !title.trim().is_empty()) {
             labels.push(game_title.to_string());
         }
-        labels.push("Review identity".to_string());
+        labels.push(
+            if matches!(route, Route::GameCheck(_)) {
+                "Check this game"
+            } else {
+                "Review identity"
+            }
+            .to_string(),
+        );
         return labels;
     }
     if matches!(route, Route::Game(_)) {

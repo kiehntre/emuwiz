@@ -175,6 +175,12 @@ pub(super) fn groups() -> Vec<ToolGroup> {
         },
     );
     games.tools.push(Tool {
+        route: Route::Tool(ToolPage::ArcadeShelf),
+        title: ToolPage::ArcadeShelf.title(),
+        purpose: ToolPage::ArcadeShelf.purpose(),
+        safety: ToolSafety::LookingOnly,
+    });
+    games.tools.push(Tool {
         route: Route::Tool(ToolPage::MediaSets),
         title: ToolPage::MediaSets.title(),
         purpose: ToolPage::MediaSets.purpose(),

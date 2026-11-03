@@ -127,7 +127,11 @@ class OwnershipF2(Priv):
         self.assertEqual(self.root_owned(), [])
         rec = json.load(open(os.path.join(self.reg, "targets", self.key_of(t) + ".json")))
         self.assertIn("last_retired", rec)
-        # the owner's worktree gate can read and verify the evidence
+        # the owner's worktree gate can read and verify the evidence; the fixture's stray
+        # file is unrecognised residue, which holds the gate until it has been reviewed
+        rc, out = self.call("worktree-check", wt, "--json")
+        self.assertEqual(json.loads(out)["code"], "UNRECOGNISED_RESIDUE", out)
+        os.unlink(os.path.join(t, "debug", "UNKNOWN.txt"))
         rc, out = self.call("worktree-check", wt, "--json")
         self.assertEqual(json.loads(out)["status"], "CLEAR", out)
         # an ordinary cargo-iso build afterwards is TRACKED (no "building untracked")
@@ -662,6 +666,7 @@ class SystemdService(Priv):
         self.assertEqual(cyc["outcome"], "RETIRED", (cyc, log))
         self.assertFalse(self.artifacts_present(t))
         self.assertEqual(self.root_owned(), [])
+        os.unlink(os.path.join(t, "debug", "UNKNOWN.txt"))      # review of the fixture's unrecognised file
         rc, out = self.call("worktree-check", wt, "--json")
         self.assertEqual(json.loads(out)["status"], "CLEAR", out)
         self.assertFalse(os.path.exists("/etc/systemd/system/emuwiz-cargo-maintain.timer"))

@@ -23,7 +23,10 @@ use archivefs_core::patch_manager::{
     RetroArchBezelApplyOptions, apply_retroarch_bezel_plan_reported, default_shared_backup_root,
     default_shared_history_root, prepare_retroarch_bezel_plan,
 };
-use archivefs_core::patch_manager::{SharedApplyResult, SharedApplyStatus};
+use archivefs_core::patch_manager::{
+    SharedApplyEntry, SharedApplyOutcome, SharedApplyResult, SharedApplyStatus,
+    SharedRollbackPermissions,
+};
 use eframe::egui;
 use std::path::PathBuf;
 use std::sync::mpsc::{self, Receiver, TryRecvError};
@@ -517,7 +520,7 @@ impl ApplyOutcome {
     /// to undo, and Undo is offered only when a fresh preview can run it.
     fn from_report(report: &archivefs_core::patch_manager::RetroArchBezelApplyReport) -> Self {
         use archivefs_core::patch_manager::BezelAutomaticRollback as R;
-        let mut outcome = Self::from_result(&report.result);
+        let mut outcome = Self::from_result(&report.result, report.automatic_rollback);
         match report.automatic_rollback {
             R::NotNeeded => {}
             R::Completed => {
@@ -551,7 +554,10 @@ impl ApplyOutcome {
         outcome
     }
 
-    fn from_result(result: &SharedApplyResult) -> Self {
+    fn from_result(
+        result: &SharedApplyResult,
+        automatic_rollback: archivefs_core::patch_manager::BezelAutomaticRollback,
+    ) -> Self {
         let journal = result
             .journal_path
             .as_ref()
@@ -572,15 +578,60 @@ impl ApplyOutcome {
                 .entries
                 .iter()
                 .flat_map(|entry| {
-                    entry
-                        .warnings
-                        .iter()
-                        .cloned()
+                    warning_lines(entry, automatic_rollback)
+                        .into_iter()
                         .chain(entry.failures.iter().map(|failure| failure.detail.clone()))
                 })
                 .collect(),
         }
     }
+}
+
+/// An entry's warnings, worded for what its outcome and the automatic rollback
+/// record. The engine writes a warning before it writes the file, and the
+/// Apply journal is not updated by a rollback, so neither proves the warning
+/// still describes the file.
+///
+/// A completed rollback restores only `ReplacedExisting` entries and passes
+/// over unfinished ones, so `Completed` says nothing about an unfinished file.
+fn warning_lines(
+    entry: &SharedApplyEntry,
+    automatic_rollback: archivefs_core::patch_manager::BezelAutomaticRollback,
+) -> Vec<String> {
+    use archivefs_core::patch_manager::BezelAutomaticRollback as R;
+    let path = &entry.plan_entry.destination_relative_path.display;
+    if entry.warnings.is_empty() {
+        return Vec::new();
+    }
+    if entry.outcome == SharedApplyOutcome::ReplacedExisting && automatic_rollback == R::Completed {
+        // The only engine warning is about the replacement's mode, so the
+        // mode the rollback restores stands in for it.
+        let permissions = SharedRollbackPermissions::for_recorded_mode(entry.destination_pre_mode);
+        return vec![format!(
+            "{path}: automatic rollback restored the original contents, so the replacement is gone. Permissions: {}.",
+            permissions.summary()
+        )];
+    }
+    let finished = matches!(
+        entry.outcome,
+        SharedApplyOutcome::InstalledNew | SharedApplyOutcome::ReplacedExisting
+    );
+    entry
+        .warnings
+        .iter()
+        .map(|warning| match (finished, automatic_rollback) {
+            (false, _) => format!(
+                "{path}: {warning} (this file's Apply did not finish, so check it before relying on this)"
+            ),
+            (true, R::NotNeeded) => format!("{path}: {warning}"),
+            (true, R::Completed) => {
+                format!("{path}: {warning} (automatic rollback removed this file)")
+            }
+            (true, R::Incomplete { .. }) => format!(
+                "{path}: {warning} (automatic rollback did not finish, so this file may be the original or the replacement; check it before relying on this)"
+            ),
+        })
+        .collect()
 }
 
 /// Plain-language apply outcome for a finished shared-transaction journal:
@@ -1284,6 +1335,7 @@ mod tests {
                 replacement_approved: true,
                 verification_succeeded: !failure,
                 outcome,
+                publication: Default::default(),
                 stages: Vec::new(),
                 warnings: Vec::new(),
                 failures: if failure {
@@ -1394,6 +1446,145 @@ mod tests {
             );
             assert!(rendered.contains("/backups/op/override.bak"), "{rendered}");
         }
+    }
+
+    use archivefs_core::patch_manager::BezelAutomaticRollback as BezelRollback;
+
+    const WARNING: &str =
+        "existing permissions 4755 were not kept; the replaced file is owner-only 0600";
+    const OVERRIDE: &str = "config/core/game.cfg";
+    const OVERLAY: &str = "overlays/game.png";
+
+    /// `partial_result` with the engine's warning on the override, whose
+    /// journalled outcome is `outcome`.
+    fn warned_report(
+        outcome: SharedApplyOutcome,
+        automatic_rollback: archivefs_core::patch_manager::BezelAutomaticRollback,
+    ) -> archivefs_core::patch_manager::RetroArchBezelApplyReport {
+        let mut report = report(automatic_rollback);
+        let entry = &mut report.result.journal.entries[1];
+        entry.outcome = outcome;
+        entry.destination_pre_mode = Some(0o4755);
+        entry.warnings = vec![WARNING.into()];
+        if matches!(automatic_rollback, BezelRollback::NotNeeded) {
+            report.result.journal.status = SharedApplyStatus::Failed;
+        }
+        report
+    }
+
+    /// The warning as it read before #283: a replacement stated as plain fact.
+    fn states_replacement_as_fact(text: &str) -> bool {
+        text.lines().any(|line| {
+            line.contains("the replaced file is owner-only")
+                && !line.contains("did not finish")
+                && !line.contains("automatic rollback")
+        })
+    }
+
+    fn warning_text(report: &archivefs_core::patch_manager::RetroArchBezelApplyReport) -> String {
+        ApplyOutcome::from_report(report).warnings.join("\n")
+    }
+
+    /// Negative control: the assertions below would have caught the old line.
+    #[test]
+    fn the_old_unqualified_warning_is_recognised_as_misleading() {
+        assert!(states_replacement_as_fact(WARNING));
+        assert!(states_replacement_as_fact(&format!(
+            "{OVERRIDE}: {WARNING}"
+        )));
+    }
+
+    #[test]
+    fn a_failed_write_says_its_apply_did_not_finish() {
+        for rollback in [
+            BezelRollback::NotNeeded,
+            BezelRollback::Completed,
+            BezelRollback::Incomplete {
+                undo_available: false,
+            },
+        ] {
+            let report = warned_report(SharedApplyOutcome::WriteFailed, rollback);
+            let rendered = render(&ApplyOutcome::from_report(&report));
+            assert!(!states_replacement_as_fact(&rendered), "{rendered}");
+            assert!(rendered.contains(OVERRIDE), "{rendered}");
+            assert!(rendered.contains(WARNING), "{rendered}");
+            assert!(rendered.contains("did not finish"), "{rendered}");
+            assert!(!rendered.contains("restored the original"), "{rendered}");
+        }
+    }
+
+    #[test]
+    fn a_completed_rollback_says_the_replacement_is_gone_and_keeps_the_permission_loss() {
+        let report = warned_report(
+            SharedApplyOutcome::ReplacedExisting,
+            BezelRollback::Completed,
+        );
+        let rendered = render(&ApplyOutcome::from_report(&report));
+        assert!(!states_replacement_as_fact(&rendered), "{rendered}");
+        assert!(
+            rendered.contains(&format!(
+                "{OVERRIDE}: automatic rollback restored the original contents"
+            )),
+            "{rendered}"
+        );
+        assert!(rendered.contains("the replacement is gone"), "{rendered}");
+        assert!(
+            rendered.contains("owner-only 0600; the original 4755 is not restored automatically"),
+            "{rendered}"
+        );
+        assert!(!rendered.contains("the replaced file"), "{rendered}");
+    }
+
+    #[test]
+    fn an_incomplete_rollback_claims_neither_state() {
+        for undo_available in [true, false] {
+            let report = warned_report(
+                SharedApplyOutcome::ReplacedExisting,
+                BezelRollback::Incomplete { undo_available },
+            );
+            let rendered = render(&ApplyOutcome::from_report(&report));
+            assert!(!states_replacement_as_fact(&rendered), "{rendered}");
+            assert!(rendered.contains(WARNING), "{rendered}");
+            assert!(
+                rendered.contains("may be the original or the replacement"),
+                "{rendered}"
+            );
+            assert!(!rendered.contains("restored the original"), "{rendered}");
+            assert!(!rendered.contains("the replacement is gone"), "{rendered}");
+        }
+    }
+
+    #[test]
+    fn a_finished_apply_keeps_the_plain_warning() {
+        let report = warned_report(
+            SharedApplyOutcome::ReplacedExisting,
+            BezelRollback::NotNeeded,
+        );
+        assert_eq!(
+            warning_lines(&report.result.journal.entries[1], BezelRollback::NotNeeded),
+            vec![format!("{OVERRIDE}: {WARNING}")]
+        );
+    }
+
+    /// Only the entry carrying a warning gets a line, and the failure detail
+    /// and kept backup still appear beside it.
+    #[test]
+    fn warning_wording_follows_each_files_own_outcome() {
+        let mut report = warned_report(SharedApplyOutcome::WriteFailed, BezelRollback::Completed);
+        report.result.journal.entries[0].warnings = vec!["overlay note".into()];
+        let text = warning_text(&report);
+        assert!(
+            text.contains(&format!(
+                "{OVERLAY}: overlay note (automatic rollback removed this file)"
+            )),
+            "{text}"
+        );
+        assert!(text.contains("did not finish"), "{text}");
+        assert!(text.contains("cannot replace files atomically"), "{text}");
+        assert!(
+            text.contains("A backup of the original file is kept at /backups/op/override.bak."),
+            "{text}"
+        );
     }
 
     /// A state with a selected, resolved asset and a stubbed preview texture
