@@ -118,6 +118,19 @@ pub struct VerificationPreview {
     targets: CatalogueAuditTargets,
     // Private catalogue bytes live through the run and are never a user write target.
     _snapshot: tempfile::TempDir,
+    /// One selected game: its save touches only that game's evidence, so the
+    /// library-wide disc-order rebuild is not run.
+    single_game: bool,
+}
+
+/// Which library rows a verification may hash and save.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum VerificationPopulation {
+    /// Every row assigned to the platform, optionally under one folder.
+    Platform { collection: Option<PathBuf> },
+    /// Exactly one library row, bound to the path the person was shown. Any
+    /// other row is never examined, and the preview fails rather than widen.
+    Game { archive_id: i64, path: PathBuf },
 }
 
 fn ext(path: &Path) -> String {
@@ -164,6 +177,46 @@ pub fn preview_library_verification(
     platform: String,
     collection: Option<PathBuf>,
 ) -> Result<VerificationPreview, String> {
+    preview_verification(
+        resolved,
+        database_path,
+        platform,
+        VerificationPopulation::Platform { collection },
+    )
+}
+
+/// The same preview for exactly one library game. Fails, and checks nothing,
+/// when that game is gone, moved, on another system, shared by several rows
+/// or not eligible; it never falls back to the platform population.
+pub fn preview_game_verification(
+    resolved: ResolvedCatalogue,
+    database_path: PathBuf,
+    platform: String,
+    archive_id: i64,
+    path: PathBuf,
+) -> Result<VerificationPreview, String> {
+    preview_verification(
+        resolved,
+        database_path,
+        platform,
+        VerificationPopulation::Game { archive_id, path },
+    )
+}
+
+fn preview_verification(
+    resolved: ResolvedCatalogue,
+    database_path: PathBuf,
+    platform: String,
+    population: VerificationPopulation,
+) -> Result<VerificationPreview, String> {
+    let collection = match &population {
+        VerificationPopulation::Platform { collection } => collection.clone(),
+        VerificationPopulation::Game { .. } => None,
+    };
+    let single = match &population {
+        VerificationPopulation::Game { archive_id, path } => Some((*archive_id, path.clone())),
+        VerificationPopulation::Platform { .. } => None,
+    };
     if resolved.kind != DatSourceKind::File {
         return Err("Choose one installed DAT file, not an aggregate folder.".into());
     }
@@ -314,15 +367,33 @@ pub fn preview_library_verification(
         fingerprints: BTreeMap::new(),
         targets: CatalogueAuditTargets::default(),
         _snapshot: snapshot,
+        single_game: single.is_some(),
     };
     preview.request.dat_path = frozen;
     preview.request.platform = Some(platform);
     for row in rows {
+        if let Some((id, path)) = &single {
+            if row.id != *id {
+                continue;
+            }
+            if &row.absolute_path != path {
+                return Err(
+                    "This game's library location changed. Open it again. Nothing was checked."
+                        .into(),
+                );
+            }
+        }
         let assigned = row
             .platform
             .as_deref()
             .and_then(crate::canonical_platform_for_alias);
         if assigned != Some(preview.platform.as_str()) {
+            if single.is_some() {
+                return Err(format!(
+                    "This game is not assigned to {}. Nothing was checked.",
+                    preview.platform
+                ));
+            }
             if assigned.is_none() {
                 preview.unknown_system += 1;
             } else {
@@ -375,6 +446,20 @@ pub fn preview_library_verification(
         preview.eligible_games += 1;
         preview.fingerprints.insert(path.clone(), metadata);
         preview.scope.eligible.insert(path, row.id);
+    }
+    if single.is_some() {
+        if preview.selected_games == 0 {
+            return Err("This game is no longer in the library. Nothing was checked.".into());
+        }
+        if let Some(exclusion) = preview.exclusions.first() {
+            return Err(format!(
+                "This game cannot be checked: {}. Nothing was checked or saved.",
+                exclusion.reason
+            ));
+        }
+        if preview.eligible_games != 1 {
+            return Err("This game could not be resolved to one file. Nothing was checked.".into());
+        }
     }
     preview.targets =
         catalogue_audit_targets(preview.scope.eligible.keys().cloned(), Path::new("/"));
@@ -608,7 +693,10 @@ impl VerificationPreview {
         }
         totals.saved = saved.inserted + saved.updated;
         totals.protected_prior = saved.skipped_protected_prior_result;
-        totals.disc_order = Some(db.refresh_dat_disc_order(0).map_err(|e| e.to_string()));
+        // The disc-order rebuild reads and rewrites every release in the
+        // library, so a one-game check leaves it to the next platform check.
+        totals.disc_order =
+            (!self.single_game).then(|| db.refresh_dat_disc_order(0).map_err(|e| e.to_string()));
         Ok(totals)
     }
 }
