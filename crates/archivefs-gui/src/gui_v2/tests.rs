@@ -11426,7 +11426,6 @@ mod history_page {
 }
 
 mod blue_home_library;
-mod verify_games_entry;
 mod blue_usability;
 mod game_detail_facts;
 mod history_records;
@@ -11434,6 +11433,7 @@ mod organisation_outcomes;
 mod simple_shell_ui;
 mod slice2b_layout;
 mod spectrum_preservation;
+mod verify_games_entry;
 
 mod duckstation_profile_resolution {
     use super::*;
