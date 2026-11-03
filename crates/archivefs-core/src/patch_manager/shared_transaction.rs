@@ -441,8 +441,9 @@ pub enum SharedPublicationState {
     /// failed entry with this state as uncertain.
     #[default]
     NotRecorded,
-    /// Definitely nothing was published: the entry stopped before the
-    /// destination changed, or a refused exchange was put back.
+    /// Definitely nothing was left published: the entry stopped before the
+    /// destination changed, or a refused exchange was put back at once (its
+    /// bytes may have been briefly visible to a concurrent reader).
     NotPublished,
     /// Published and verified in place.
     Published,
@@ -470,7 +471,9 @@ pub enum SharedDestinationOutcome {
     SuccessWithoutDurableRecord,
     /// No entry published anything that is still in place, proven per entry.
     NothingPublished,
-    /// Something was published and a rollback reversed every such entry.
+    /// Something was published, and every such entry was reversed: by a
+    /// rollback, or by the engine restoring the previous file after a failed
+    /// check. Never reported as "nothing was written".
     Reversed,
     /// At least one entry's output definitely reached the destination and
     /// was not reversed.
@@ -486,7 +489,11 @@ pub enum SharedDestinationOutcome {
 pub enum SharedEntryDestination {
     NothingPublished,
     Published,
+    /// Reversed by a rollback.
     Reversed,
+    /// Published, failed its check, and the engine restored the previous
+    /// live file (which may now be a new file with owner-only permissions).
+    RestoredAfterFailedCheck,
     NeedsRecovery,
     Uncertain,
 }
@@ -529,8 +536,9 @@ pub fn shared_entry_destination(
         state => state,
     };
     match state {
-        SharedPublicationState::NotPublished | SharedPublicationState::PublishedThenRestored => {
-            SharedEntryDestination::NothingPublished
+        SharedPublicationState::NotPublished => SharedEntryDestination::NothingPublished,
+        SharedPublicationState::PublishedThenRestored => {
+            SharedEntryDestination::RestoredAfterFailedCheck
         }
         _ if reversed => SharedEntryDestination::Reversed,
         SharedPublicationState::Published if completed => SharedEntryDestination::Published,
@@ -565,7 +573,9 @@ pub fn shared_destination_outcome(
                 return SharedDestinationOutcome::PublishedNeedsRecovery;
             }
             SharedEntryDestination::Uncertain => any_uncertain = true,
-            SharedEntryDestination::Reversed => any_reversed = true,
+            SharedEntryDestination::Reversed | SharedEntryDestination::RestoredAfterFailedCheck => {
+                any_reversed = true
+            }
             SharedEntryDestination::NothingPublished => {}
         }
     }
@@ -6920,6 +6930,31 @@ mod tests {
         assert_eq!(
             shared_destination_outcome(&reworded, None),
             SharedDestinationOutcome::PublishedNeedsRecovery
+        );
+    }
+
+    /// Published, failed its check, previous file restored: reversed, never
+    /// "nothing published".
+    #[test]
+    fn a_restore_after_a_failed_check_is_reversed_not_nothing_published() {
+        let fixture = Fixture::new("restored-after-check");
+        let report = preview(&fixture, b"new", Some(b"old"));
+        let plan = make_plan(&fixture, &report);
+        inject_fault(Some(FaultPoint::Rename));
+        let mut result = execute_shared_apply(
+            &plan,
+            &options(&fixture, &plan, "restored-after-check", false, true, true),
+        );
+        inject_fault(None);
+        result.journal.entries[0].outcome = SharedApplyOutcome::VerificationFailed;
+        result.journal.entries[0].publication = SharedPublicationState::PublishedThenRestored;
+        assert_eq!(
+            shared_entry_destination(&result.journal.entries[0], None),
+            SharedEntryDestination::RestoredAfterFailedCheck
+        );
+        assert_eq!(
+            shared_destination_outcome(&result, None),
+            SharedDestinationOutcome::Reversed
         );
     }
 

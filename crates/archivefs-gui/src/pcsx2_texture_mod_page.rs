@@ -293,6 +293,17 @@ fn incomplete_install_lines(
         .count();
     let outcome = destination_outcome(result, rollback);
     let rollback_line = match (rollback, outcome) {
+        (Some(rollback), SharedDestinationOutcome::Reversed)
+            if rollback.status != SharedApplyStatus::Success =>
+        {
+            format!(
+                "Automatic rollback reversed every file from this pack, but it did not finish cleanly ({:?}), so its record may not have been saved. Check the destination before using this profile.",
+                rollback.status
+            )
+        }
+        (None, SharedDestinationOutcome::Reversed) => {
+            "A file from this pack was written, failed its check, and EmuWiz put your previous file back, so there is nothing to undo. Check its permissions before using this profile.".to_string()
+        }
         (_, SharedDestinationOutcome::Reversed) => {
             "Automatic rollback completed and reversed this install's recorded changes, so there is nothing to undo.".to_string()
         }
@@ -1106,6 +1117,42 @@ mod tests {
             "{text}"
         );
         assert!(!text.contains("Check Undo"), "{text}");
+    }
+
+    /// Published, failed its check, previous file restored by the engine.
+    #[test]
+    fn a_file_restored_after_a_failed_check_is_not_called_unwritten() {
+        let mut result = with_backup(journalled(failed_result()));
+        result.journal.entries[0].outcome = SharedApplyOutcome::VerificationFailed;
+        result.journal.entries[0].publication = SharedPublicationState::PublishedThenRestored;
+        assert_eq!(undo_choice(&result, None), UndoChoice::None);
+        let text = panel_after(result, None);
+        assert_not_installed(&text);
+        assert!(!text.contains("Recovery required"), "{text}");
+        assert!(
+            text.contains("1 of 1 file(s) were written or may have been changed on disk"),
+            "{text}"
+        );
+        assert!(
+            text.contains("failed its check, and EmuWiz put your previous file back"),
+            "{text}"
+        );
+        assert!(
+            !text.contains("No file from this pack reached the destination"),
+            "{text}"
+        );
+    }
+
+    /// Every file reversed, but the rollback did not finish cleanly (its
+    /// record may be unsaved): never "completed".
+    #[test]
+    fn a_reversing_rollback_that_did_not_finish_is_not_called_completed() {
+        let result = journalled(with_backup(partly_failed_result()));
+        let mut rollback = succeeded_rollback();
+        rollback.status = SharedApplyStatus::PartialFailure;
+        let text = panel_after(result, Some(rollback));
+        assert!(!text.contains("Automatic rollback completed"), "{text}");
+        assert!(text.contains("did not finish cleanly"), "{text}");
     }
 
     /// The engine cannot tell what is live: recovery is required and the
