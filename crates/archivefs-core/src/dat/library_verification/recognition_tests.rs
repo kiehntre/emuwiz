@@ -32,14 +32,35 @@ fn preview_full(
     unrecorded: bool,
     platform: &str,
 ) -> Result<(), String> {
+    preview_header(
+        &format!("<name>{header}</name>"),
+        "catalogue.dat",
+        assigned,
+        recognised,
+        unrecorded,
+        platform,
+    )
+}
+
+/// As [`preview_full`], with the header's inner XML (`header_xml`) and the
+/// catalogue's file name given as they are.
+fn preview_header(
+    header_xml: &str,
+    file_name: &str,
+    assigned: Option<&str>,
+    recognised: bool,
+    unrecorded: bool,
+    platform: &str,
+) -> Result<(), String> {
+    let header = header_xml;
     let dir = tempfile::tempdir().unwrap();
     let db = dir.path().join("library.sqlite3");
     Database::open_or_create(&db).unwrap();
-    let dat = dir.path().join("catalogue.dat");
+    let dat = dir.path().join(file_name);
     std::fs::write(
         &dat,
         format!(
-            "<datafile><header><name>{header}</name><version>1</version></header>\
+            "<datafile><header>{header_xml}<version>1</version></header>\
              <game name=\"G\"><rom name=\"g.bin\" size=\"1\" sha1=\"{}\"/></game></datafile>",
             "0".repeat(40)
         ),
@@ -254,4 +275,90 @@ fn non_redump_discs_are_accepted_only_for_the_system_the_person_chose() {
         Some("Dreamcast"),
         "Dreamcast"
     )));
+}
+
+#[test]
+fn a_nameless_header_is_read_from_its_description_by_the_same_rules() {
+    let non_redump = "<description>Non-Redump - Sega - Dreamcast</description>";
+    // Nobody chose it: a Non-Redump description backs nothing.
+    assert!(refused_for_platform(preview_header(
+        non_redump,
+        "catalogue.dat",
+        None,
+        false,
+        false,
+        "Dreamcast"
+    )));
+    // With no record of who set it: still refused.
+    assert!(
+        preview_header(
+            non_redump,
+            "catalogue.dat",
+            Some("Dreamcast"),
+            false,
+            true,
+            "Dreamcast"
+        )
+        .is_err()
+    );
+    // The person's own choice: accepted, as for a named header.
+    assert!(!refused_for_platform(preview_header(
+        non_redump,
+        "catalogue.dat",
+        Some("Dreamcast"),
+        false,
+        false,
+        "Dreamcast"
+    )));
+    // An extras description needs the choice too.
+    assert!(refused_for_platform(preview_header(
+        "<description>Nintendo - Game Boy Advance (e-Reader)</description>",
+        "catalogue.dat",
+        None,
+        false,
+        false,
+        "Game Boy Advance"
+    )));
+    // An ordinary game list description is accepted for its own system.
+    assert!(!refused_for_platform(preview_header(
+        "<description>Nintendo - Game Boy Color</description>",
+        "catalogue.dat",
+        None,
+        false,
+        false,
+        "Game Boy Color"
+    )));
+}
+
+#[test]
+fn a_file_name_alone_never_backs_a_system() {
+    // Only the file name hints at a system: that alone backs nothing.
+    let file = "Nintendo - Game Boy Color.dat";
+    assert!(refused_for_platform(preview_header(
+        "",
+        file,
+        None,
+        false,
+        false,
+        "Game Boy Color"
+    )));
+    assert!(refused_for_platform(preview_header(
+        "",
+        file,
+        Some("Game Boy Color"),
+        true,
+        false,
+        "Game Boy Color"
+    )));
+    assert!(
+        preview_header(
+            "",
+            file,
+            Some("Game Boy Color"),
+            false,
+            true,
+            "Game Boy Color"
+        )
+        .is_err()
+    );
 }

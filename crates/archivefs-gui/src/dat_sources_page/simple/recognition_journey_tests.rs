@@ -549,3 +549,49 @@ fn a_non_redump_catalogue_is_shown_for_review_and_only_set_by_a_person() {
     assert_eq!(saved[0].1, None);
     assert_eq!(saved[1].1.as_deref(), Some("Dreamcast"));
 }
+
+#[test]
+fn undo_leaves_a_system_changed_since_as_unrecorded_in_the_page_too() {
+    use archivefs_core::dat::sources::PlatformProvenance;
+    let dir = tempfile::tempdir().unwrap();
+    let config = setup(
+        dir.path(),
+        &[
+            ("src-a", "Nintendo - Game Boy Color"),
+            ("src-b", "Nintendo - Game Boy Advance"),
+        ],
+    );
+    let mut state = page(dir.path());
+    state.apply(DatSourcesPageAction::ValidateAll);
+    finish(&mut state);
+    let preview = state.view().recognition.safe.clone();
+    assert_eq!(preview.len(), 2);
+    state.apply(DatSourcesPageAction::ApplyRecognisedSystems { preview });
+
+    // A build that does not record who set a system changes one of them,
+    // keeping the fields it does not know about.
+    let (mut registry, _) =
+        DatSourceRegistry::from_config(&load_dat_sources_config_from(&config).unwrap());
+    registry.get_mut("src-a").unwrap().platform = Some("Game Boy".into());
+    save_dat_sources_config_to(&config, &registry.to_config()).unwrap();
+    state.apply(DatSourcesPageAction::ReloadSetup);
+
+    state.apply(DatSourcesPageAction::UndoRecognisedSystems);
+    let (saved, _) =
+        DatSourceRegistry::from_config(&load_dat_sources_config_from(&config).unwrap());
+    let on_disk = saved.get("src-a").unwrap();
+    assert_eq!(on_disk.platform.as_deref(), Some("Game Boy"));
+    assert_eq!(
+        on_disk.platform_provenance(),
+        PlatformProvenance::Unrecorded
+    );
+    assert_eq!(saved.get("src-b").unwrap().platform, None);
+    // The page's unsaved copy says the same, so Save setup cannot write the
+    // recognised label back.
+    let draft = state.draft.get("src-a").unwrap();
+    assert_eq!(draft.platform.as_deref(), Some("Game Boy"));
+    assert_eq!(draft.platform_recognised_from, None);
+    assert_eq!(draft.recognition_receipt, None);
+    assert_eq!(draft.platform_provenance(), PlatformProvenance::Unrecorded);
+    assert_eq!(state.draft.get("src-b").unwrap().platform, None);
+}

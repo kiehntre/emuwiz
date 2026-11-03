@@ -6447,13 +6447,16 @@ impl DatSourcesPageState {
             })
             .map(|entry| entry.id.clone())
             .collect();
+        // Take what Undo saved for every catalogue in the batch, as Apply
+        // does: one left alone (changed since) also lost its recognised
+        // label on disk, and the draft must not write it back.
         for id in from_batch {
-            if let Some(draft) = self.draft.get_mut(&id) {
-                draft.recognition_receipt = None;
-                if undone.cleared.contains(&id) {
-                    draft.platform = None;
-                    draft.platform_recognised_from = None;
-                }
+            if let (Some(saved), Some(draft)) = (undone.registry.get(&id), self.draft.get_mut(&id))
+            {
+                draft.platform = saved.platform.clone();
+                draft.platform_recognised_from = saved.platform_recognised_from.clone();
+                draft.recognition_receipt = saved.recognition_receipt.clone();
+                draft.platform_chosen_by_person = saved.platform_chosen_by_person;
             }
         }
         self.saved = undone.registry;
