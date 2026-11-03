@@ -12,7 +12,7 @@ use super::identity::{DatPlatformIdentity, identify_dat_source};
 use super::library_identity_projection::project_dat_audit_for_library_identity;
 use super::library_identity_summary::DatVerificationState;
 use super::limits::DatLimits;
-use super::model::{DatEcosystem, DatPackingPolicy};
+use super::model::{DatEcosystem, DatPackingPolicy, ParsedDat};
 use super::parsers::parse_dat_file;
 use super::sources::DatSourceKind;
 use super::sources::audit_cache::AuditCacheConfig;
@@ -170,6 +170,59 @@ fn same_file(a: &std::fs::Metadata, b: &std::fs::Metadata) -> bool {
         && a.ctime_nsec() == b.ctime_nsec()
 }
 
+/// Whether the frozen catalogue is for `platform`, from its own header.
+///
+/// An ordinary game list must name `platform`. Extras (downloadable
+/// content, e-Reader cards and so on) and Non-Redump discs are only
+/// accepted when the person set that system for the catalogue themselves
+/// (`chosen`; a system applied from a recognised header is not a choice),
+/// and so is a header naming more than one system when the person chose
+/// one of them. A header with no name is read from its description by the
+/// same rules. One with neither is accepted only for the system the person
+/// chose, and only when the older evidence agrees. Any other header
+/// (several systems, not games, ambiguous, unsupported) is refused.
+fn catalogue_is_for(parsed: &ParsedDat, platform: &str, chosen: Option<&str>) -> bool {
+    use super::catalogue_recognition::{CatalogueRecognition, recognise_catalogue, same_platform};
+    let ecosystem = Some(parsed.source.ecosystem);
+    let chosen_here = || {
+        chosen
+            .and_then(crate::canonical_platform_for_alias)
+            .is_some_and(|assigned| same_platform(assigned, platform))
+    };
+    let mut recognition = recognise_catalogue(parsed.source.name.as_deref(), ecosystem);
+    if recognition == CatalogueRecognition::NoName {
+        // The description never gets looser rules than a name would: a
+        // "Non-Redump - ..." or extras description still needs the choice.
+        recognition = recognise_catalogue(parsed.source.description.as_deref(), ecosystem);
+    }
+    match &recognition {
+        CatalogueRecognition::Games { .. } => recognition.is_for(platform),
+        // Extras and Non-Redump discs count only for a system the person
+        // chose themselves.
+        CatalogueRecognition::Extras { .. } | CatalogueRecognition::NeedsReview { .. } => {
+            recognition.is_for(platform) && chosen_here()
+        }
+        // The person resolved the ambiguity by choosing one of the systems
+        // the header names.
+        CatalogueRecognition::Ambiguous { platforms } => {
+            platforms
+                .iter()
+                .any(|candidate| same_platform(candidate, platform))
+                && chosen_here()
+        }
+        // Nothing in the header names a system. File names, folders and game
+        // names alone never back a system: only the person's own choice does.
+        CatalogueRecognition::NoName => {
+            chosen_here()
+                && matches!(
+                    identify_dat_source(parsed),
+                    DatPlatformIdentity::Resolved { platform: p, .. } if p == platform
+                )
+        }
+        _ => false,
+    }
+}
+
 /// Metadata-only ROM population preview; DAT bytes are frozen and parsed on the worker.
 pub fn preview_library_verification(
     resolved: ResolvedCatalogue,
@@ -256,12 +309,11 @@ fn preview_verification(
     {
         return Err("Managed catalogue snapshot changed.".into());
     }
-    match identify_dat_source(&parsed) {
-        DatPlatformIdentity::Resolved { platform: p, .. } if p == platform => {}
-        _ => return Err(
+    if !catalogue_is_for(&parsed, &platform, resolved.chosen_platform()) {
+        return Err(
             "Catalogue platform is unknown, ambiguous or incompatible with the selected system."
                 .into(),
-        ),
+        );
     }
     if resolved
         .assigned_platform
@@ -703,3 +755,7 @@ impl VerificationPreview {
 
 #[cfg(test)]
 mod tests;
+
+#[cfg(test)]
+#[path = "library_verification/recognition_tests.rs"]
+mod recognition_tests;

@@ -37,6 +37,7 @@ pub mod amiga_adf_identity;
 pub mod archive;
 pub mod audit;
 pub mod authority;
+pub mod catalogue_recognition;
 pub mod catalogue_selection;
 pub mod classification;
 pub mod coverage;

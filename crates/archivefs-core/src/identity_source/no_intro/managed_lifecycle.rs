@@ -123,15 +123,16 @@ fn now() -> u64 {
         .map_or(0, |d| d.as_secs())
 }
 
+/// The platform a No-Intro system name covers, by the same exact rules as
+/// catalogue recognition. Extras still count for their system (as before);
+/// source code, scans and other non-game lists cover nothing.
 fn platform_for_system(system: &str) -> Option<String> {
-    crate::canonical_platform_for_alias(system)
-        .map(str::to_string)
-        .or_else(|| {
-            system
-                .rsplit_once(" - ")
-                .and_then(|(_, suffix)| crate::canonical_platform_for_alias(suffix))
-                .map(str::to_string)
-        })
+    crate::dat::catalogue_recognition::recognise_catalogue(
+        Some(system),
+        Some(crate::dat::model::DatEcosystem::NoIntro),
+    )
+    .platform()
+    .map(str::to_string)
 }
 
 fn coverage_for(source: &ImportedNoIntroSource) -> NoIntroPackCoverage {
@@ -638,6 +639,19 @@ mod tests {
         headerless.coverage[0].variant = NoIntroVariant::Headerless;
         let resolution = resolve_no_intro_current(&[headerless, headered]);
         assert_eq!(resolution.current.len(), 2);
+    }
+
+    #[test]
+    fn source_code_lists_do_not_count_as_coverage() {
+        assert_eq!(
+            platform_for_system("Nintendo - Game Boy Color").as_deref(),
+            Some("Game Boy Color")
+        );
+        assert_eq!(
+            platform_for_system("Source Code - Nintendo - Game Boy Color"),
+            None
+        );
+        assert_eq!(platform_for_system("Sony - PlayStation Mobile (PSN)"), None);
     }
 
     #[test]

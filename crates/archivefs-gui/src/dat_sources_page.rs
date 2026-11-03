@@ -82,8 +82,9 @@ use archivefs_core::dat::sources::audit_run::{
 };
 use archivefs_core::dat::sources::{
     DatFileOutcome, DatHealthState, DatSourceEntry, DatSourceHealth, DatSourceKind,
-    DatSourceRegistry, DatValidationReport, UnresolvedDatSetting, load_dat_sources_config_from,
-    save_dat_sources_config_to, suggest_display_name, validate_dat_source,
+    DatSourceRegistry, DatSourcesRevision, DatValidationReport, UnresolvedDatSetting,
+    load_dat_sources_config_with_revision, save_dat_sources_config_if_unchanged,
+    suggest_display_name, validate_dat_source,
 };
 use archivefs_core::dat::tosec_release_pack::{
     PackAvailability, PersistedTosecPack, TOSEC_OFFICIAL_DOWNLOADS_PAGE, TosecManagedCandidate,
@@ -820,6 +821,16 @@ impl AuditProgressView {
 }
 
 /// Everything the page draws.
+/// The recognition summary shown to a person.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub(crate) struct RecognitionView {
+    pub(crate) rows: Vec<archivefs_core::dat::sources::recognition::RecognitionRow>,
+    pub(crate) safe: Vec<archivefs_core::dat::sources::recognition::SafeMatch>,
+    /// The latest apply Undo can still reverse, from the saved receipts.
+    pub(crate) undo: Option<archivefs_core::dat::sources::recognition::UndoableApply>,
+    pub(crate) message: Option<Result<String, String>>,
+}
+
 #[derive(Debug, Clone, PartialEq)]
 pub(crate) struct DatSourcesPageView {
     pub(crate) rows: Vec<DatSourceRowView>,
@@ -863,6 +874,8 @@ pub(crate) struct DatSourcesPageView {
     pub(crate) save_state: DatSaveState,
     /// Outcome of the last explicit platform assignment (`Ok` = saved).
     pub(crate) platform_assignment: Option<Result<String, String>>,
+    /// Which system each catalogue's header names, from its last check.
+    pub(crate) recognition: RecognitionView,
     pub(crate) save_results: Vec<DatSaveResult>,
     pub(crate) load_error: Option<String>,
     /// The last add/remove attempt that was refused, with its reason.
@@ -2157,6 +2170,15 @@ pub(crate) enum DatSourcesPageAction {
         id: String,
         platform: String,
     },
+    /// Sets exactly the previewed recognised systems (see
+    /// [`archivefs_core::dat::sources::recognition::apply_safe_matches`]).
+    ApplyRecognisedSystems {
+        preview: Vec<archivefs_core::dat::sources::recognition::SafeMatch>,
+    },
+    /// Clears the systems the last apply set, where still unchanged.
+    UndoRecognisedSystems,
+    /// Re-reads the settings from disk, discarding unsaved edits here.
+    ReloadSetup,
     Remove {
         id: String,
     },
@@ -3207,6 +3229,12 @@ pub(crate) struct DatSourcesPageState {
     native_verification_busy: bool,
     /// What is on disk, as last read or last written.
     saved: DatSourceRegistry,
+    /// The exact file `saved` was read from or written as. Every save is
+    /// refused unless the file still holds it, so an edit made elsewhere is
+    /// never silently overwritten. `None` when the file could not be read.
+    saved_revision: Option<DatSourcesRevision>,
+    /// Outcome of the last apply or undo.
+    recognition_message: Option<Result<String, String>>,
     /// What the user has edited but not yet saved.
     draft: DatSourceRegistry,
     load_error: Option<String>,
@@ -3397,10 +3425,12 @@ impl DatSourcesPageState {
     ) -> Self {
         let mut load_error = None;
         let mut load_problems = Vec::new();
-        let saved = match load_dat_sources_config_from(&config_path) {
-            Ok(config) => {
+        let mut saved_revision = None;
+        let saved = match load_dat_sources_config_with_revision(&config_path) {
+            Ok((config, revision)) => {
                 let (registry, problems) = DatSourceRegistry::from_config(&config);
                 load_problems = problems;
+                saved_revision = Some(revision);
                 registry
             }
             Err(error) => {
@@ -3482,6 +3512,8 @@ impl DatSourcesPageState {
             native_verification_busy: false,
             coverage_cache: BTreeMap::new(),
             saved,
+            saved_revision,
+            recognition_message: None,
             draft,
             load_error,
             load_problems,
@@ -4237,9 +4269,15 @@ impl DatSourcesPageState {
             }
             DatSourcesPageAction::SetPlatform { id, platform } => {
                 if let Some(entry) = self.draft.get_mut(&id) {
-                    entry.platform = platform.filter(|value| !value.trim().is_empty());
+                    // A system set by hand is the person's own choice.
+                    entry.set_platform_by_person(platform.filter(|value| !value.trim().is_empty()));
                 }
             }
+            DatSourcesPageAction::ApplyRecognisedSystems { preview } => {
+                self.apply_recognised(preview)
+            }
+            DatSourcesPageAction::UndoRecognisedSystems => self.undo_recognised(),
+            DatSourcesPageAction::ReloadSetup => self.reload_setup(),
             DatSourcesPageAction::AssignPlatformNow { id, platform } => {
                 self.platform_assignment = Some(self.assign_platform_now(&id, &platform));
             }
@@ -5016,7 +5054,7 @@ impl DatSourcesPageState {
         }
         saved_entry.path = candidate.path.clone();
         saved_entry.health = health.clone();
-        match save_dat_sources_config_to(&self.config_path, &next_saved.to_config()) {
+        match self.save_checked(&next_saved) {
             Ok(()) => {
                 self.saved = next_saved;
                 if let Some(draft_entry) = self.draft.get_mut(id) {
@@ -5789,10 +5827,11 @@ impl DatSourcesPageState {
             conflicts: outcome.conflicts.len(),
             failed: outcome.failed.len(),
         });
-        match load_dat_sources_config_from(&self.config_path) {
-            Ok(config) => {
+        match load_dat_sources_config_with_revision(&self.config_path) {
+            Ok((config, revision)) => {
                 let (registry, problems) = DatSourceRegistry::from_config(&config);
                 self.saved = registry.clone();
+                self.saved_revision = Some(revision);
                 self.draft = registry;
                 self.load_problems = problems;
             }
@@ -6204,13 +6243,13 @@ impl DatSourcesPageState {
         }) {
             return Err("Not saved: this catalogue is already assigned to another system.".into());
         }
-        entry.platform = Some(platform.to_string());
+        entry.set_platform_by_person(Some(platform.to_string()));
         let name = entry.display_name.clone();
-        save_dat_sources_config_to(&self.config_path, &next.to_config())
+        self.save_checked(&next)
             .map_err(|error| format!("Not saved: {error}. Nothing was changed."))?;
         self.saved = next;
         if let Some(draft) = self.draft.get_mut(id) {
-            draft.platform = Some(platform.to_string());
+            draft.set_platform_by_person(Some(platform.to_string()));
         }
         Ok(format!("Saved: {name} is now used for {platform}."))
     }
@@ -6237,7 +6276,8 @@ impl DatSourcesPageState {
                 should_stale.then_some(after.id.clone())
             })
             .collect::<Vec<_>>();
-        match save_dat_sources_config_to(&self.config_path, &self.draft.to_config()) {
+        let draft = self.draft.clone();
+        match self.save_checked(&draft) {
             Ok(()) => {
                 self.saved = self.draft.clone();
                 self.save_state = DatSaveState::Saved;
@@ -6260,8 +6300,190 @@ impl DatSourcesPageState {
                     }
                 }
             }
-            Err(error) => self.save_state = DatSaveState::Failed(error.to_string()),
+            Err(error) => self.save_state = DatSaveState::Failed(error),
         }
+    }
+
+    /// Saves `registry` only if the settings file is still exactly what this
+    /// page last read or wrote, and remembers the new revision.
+    fn save_checked(&mut self, registry: &DatSourceRegistry) -> Result<(), String> {
+        let Some(revision) = self.saved_revision.as_ref() else {
+            return Err(
+                "the existing catalogue list could not be read, and overwriting it would discard it"
+                    .to_string(),
+            );
+        };
+        let revision = save_dat_sources_config_if_unchanged(
+            &self.config_path,
+            revision,
+            &registry.to_config(),
+        )
+        .map_err(|error| error.to_string())?;
+        self.saved_revision = Some(revision);
+        Ok(())
+    }
+
+    /// Re-reads the settings from disk, discarding unsaved edits on this
+    /// page. Offered after a save is refused because the file changed.
+    fn reload_setup(&mut self) {
+        if self.is_busy() {
+            return;
+        }
+        match load_dat_sources_config_with_revision(&self.config_path) {
+            Ok((config, revision)) => {
+                let (registry, problems) = DatSourceRegistry::from_config(&config);
+                self.saved = registry.clone();
+                self.saved_revision = Some(revision);
+                self.draft = registry;
+                self.load_problems = problems;
+                self.load_error = None;
+                self.save_state = DatSaveState::Idle;
+                // Undo is read from the saved receipts, so it stays
+                // available after a reload.
+                self.recognition_message = None;
+            }
+            Err(error) => self.load_error = Some(error.to_string()),
+        }
+    }
+
+    /// The recognition summary for the catalogues as they are on this page.
+    fn recognition_view(&self) -> RecognitionView {
+        use archivefs_core::dat::sources::recognition::{
+            last_undoable_apply, recognition_rows, safe_matches,
+        };
+        RecognitionView {
+            rows: recognition_rows(&self.draft),
+            safe: safe_matches(&self.draft),
+            undo: last_undoable_apply(&self.saved),
+            message: self.recognition_message.clone(),
+        }
+    }
+
+    /// "Apply all safe matches": sets exactly the previewed systems, all or
+    /// nothing, after re-checking the settings file and every catalogue.
+    fn apply_recognised(
+        &mut self,
+        preview: Vec<archivefs_core::dat::sources::recognition::SafeMatch>,
+    ) {
+        self.recognition_message = Some(self.try_apply_recognised(preview));
+    }
+
+    fn try_apply_recognised(
+        &mut self,
+        preview: Vec<archivefs_core::dat::sources::recognition::SafeMatch>,
+    ) -> Result<String, String> {
+        if self.is_busy() {
+            return Err("Nothing was changed: wait for the current check to finish.".into());
+        }
+        let Some(revision) = self.saved_revision.clone() else {
+            return Err("Nothing was changed: your catalogue list could not be read.".into());
+        };
+        let applied = archivefs_core::dat::sources::recognition::apply_safe_matches(
+            &self.config_path,
+            &revision,
+            &self.draft,
+            &preview,
+        )
+        .map_err(|refusal| refusal.to_string())?;
+        self.saved_revision = Some(applied.revision.clone());
+        // Apply writes catalogue settings and Undo receipts only. It never
+        // opens the library database: saved verification for a catalogue
+        // whose file changed is rejected when it is read, because the
+        // catalogue's current SHA-256 no longer matches the one saved with
+        // the evidence (see `ConfiguredCatalogue::check_saved_identity`).
+        for item in &applied.applied {
+            if let (Some(saved), Some(draft)) = (
+                applied.registry.get(&item.source_id),
+                self.draft.get_mut(&item.source_id),
+            ) {
+                draft.platform = saved.platform.clone();
+                draft.platform_recognised_from = saved.platform_recognised_from.clone();
+                draft.recognition_receipt = saved.recognition_receipt.clone();
+                draft.platform_chosen_by_person = saved.platform_chosen_by_person;
+            }
+        }
+        self.saved = applied.registry;
+        let count = applied.applied.len();
+        Ok(format!(
+            "Set the system for {count} catalogue{}. Nothing else was changed, and no game was read or checked.",
+            if count == 1 { "" } else { "s" }
+        ))
+    }
+
+    fn undo_recognised(&mut self) {
+        self.recognition_message = Some(self.try_undo_recognised());
+    }
+
+    fn try_undo_recognised(&mut self) -> Result<String, String> {
+        use archivefs_core::dat::sources::recognition::{last_undoable_apply, undo_apply};
+        if self.is_busy() {
+            return Err("Nothing was changed: wait for the current check to finish.".into());
+        }
+        let Some(last) = last_undoable_apply(&self.saved) else {
+            return Err("There is nothing to undo.".into());
+        };
+        let Some(revision) = self.saved_revision.clone() else {
+            return Err("Nothing was changed: your catalogue list could not be read.".into());
+        };
+        let undone =
+            undo_apply(&self.config_path, &revision, &last.batch).map_err(
+                |refusal| match refusal {
+                    archivefs_core::dat::sources::recognition::ApplyRefusal::NothingToApply => {
+                        "There is nothing to undo.".to_string()
+                    }
+                    other => other.to_string(),
+                },
+            )?;
+        self.saved_revision = Some(undone.revision.clone());
+        let from_batch: Vec<String> = self
+            .draft
+            .entries()
+            .iter()
+            .filter(|entry| {
+                entry
+                    .recognition_receipt
+                    .as_ref()
+                    .is_some_and(|receipt| receipt.batch == last.batch)
+            })
+            .map(|entry| entry.id.clone())
+            .collect();
+        // Take what Undo saved for every catalogue in the batch, as Apply
+        // does: one left alone (changed since) also lost its recognised
+        // label on disk, and the draft must not write it back.
+        for id in from_batch {
+            if let (Some(saved), Some(draft)) = (undone.registry.get(&id), self.draft.get_mut(&id))
+            {
+                draft.platform = saved.platform.clone();
+                draft.platform_recognised_from = saved.platform_recognised_from.clone();
+                draft.recognition_receipt = saved.recognition_receipt.clone();
+                draft.platform_chosen_by_person = saved.platform_chosen_by_person;
+            }
+        }
+        self.saved = undone.registry;
+        let count = undone.cleared.len();
+        let mut message = format!(
+            "Undone: {count} catalogue{} no longer {} a system set.",
+            if count == 1 { "" } else { "s" },
+            if count == 1 { "has" } else { "have" }
+        );
+        if !undone.left_alone.is_empty() {
+            message.push_str(&format!(
+                " {} changed since then and {} left as {}: {}.",
+                undone.left_alone.len(),
+                if undone.left_alone.len() == 1 {
+                    "was"
+                } else {
+                    "were"
+                },
+                if undone.left_alone.len() == 1 {
+                    "it is"
+                } else {
+                    "they are"
+                },
+                undone.left_alone.join(", ")
+            ));
+        }
+        Ok(message)
     }
 
     fn start_validate(&mut self, id: String) {
@@ -6802,6 +7024,7 @@ impl DatSourcesPageState {
             config_path: self.config_path.clone(),
             save_state: self.save_state.clone(),
             platform_assignment: self.platform_assignment.clone(),
+            recognition: self.recognition_view(),
             save_results: self.save_results.values().cloned().collect(),
             load_error: self.load_error.clone(),
             action_error: self.action_error.clone(),
