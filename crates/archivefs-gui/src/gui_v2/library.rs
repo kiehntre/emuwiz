@@ -218,7 +218,7 @@ impl Game {
         }
         use archivefs_core::LibraryDatState;
         match self.dat_state {
-            Some(LibraryDatState::Verified) | Some(LibraryDatState::Probable) => "Possible match",
+            Some(LibraryDatState::Verified) | Some(LibraryDatState::Probable) => "Probable match",
             Some(LibraryDatState::Ambiguous) => "Ambiguous match",
             Some(LibraryDatState::NoMatch) => "No catalogue match",
             None => "Not checked",

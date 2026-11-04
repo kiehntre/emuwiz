@@ -356,27 +356,6 @@ pub(super) fn load_inputs() -> Result<Inputs, String> {
 }
 
 /// Why an installed catalogue may still not be offered here, in plain words.
-/// The one-game check's start button (it opens the confirm step first).
-pub(super) const CHECK_THIS_GAME: &str = "Check this game";
-/// Verification never gates Play; this keeps that visible on every outcome.
-pub(super) const NOT_NEEDED_TO_PLAY: &str = "Checking is optional. You do not need it to play: Play is on Game Details and runs its own launch check.";
-
-pub(super) fn choose_for_system_label(platform: &str) -> String {
-    format!("Choose a catalogue for {platform}")
-}
-
-/// Why a catalogue is (or is not) already chosen. Only a single eligible
-/// catalogue is preselected; EmuWiz never ranks several against each other.
-pub(super) fn catalogue_choice_note(count: usize, platform: &str) -> String {
-    if count == 1 {
-        format!("Suggested: the only ready catalogue set up for {platform}.")
-    } else {
-        format!(
-            "{count} ready catalogues cover {platform}. Choose one; EmuWiz does not guess between them."
-        )
-    }
-}
-
 pub(super) const MISSING_CATALOGUE_HELP: &str = "A catalogue is offered here only when it is enabled, has passed its catalogue check, is set to this game's system, and can check individual games (a folder of catalogues cannot). Set up verification opens DAT Management, where you can add a catalogue or choose its system. Having a catalogue installed does not verify any game.";
 
 pub(super) enum PageAction {
@@ -423,26 +402,12 @@ pub(super) fn show(
                     "No ready catalogue covers {}. Set one up first; nothing has been checked.",
                     target.platform
                 ));
-                ui.label(NOT_NEEDED_TO_PLAY);
-                // The system's check page suggests installed catalogues and
-                // asks before saving any uncertain system assignment.
-                if ui
-                    .button(choose_for_system_label(&target.platform))
-                    .on_hover_text("Opens this system's check, which suggests installed catalogues and asks you to confirm any it is unsure about. Nothing is checked until you confirm.")
-                    .clicked()
-                {
-                    action = Some(PageAction::CheckWholePlatform);
-                }
                 ui.label(MISSING_CATALOGUE_HELP);
                 if ui.button("Set up verification").clicked() {
                     action = Some(PageAction::SetUpCatalogues);
                 }
             } else {
                 ui.strong("Catalogue");
-                ui.label(catalogue_choice_note(
-                    state.catalogues.len(),
-                    &target.platform,
-                ));
                 for row in &state.catalogues {
                     let label = match &row.revision {
                         Some(version) => format!("{} · version {version}", row.display_name),
@@ -452,12 +417,12 @@ pub(super) fn show(
                 }
                 let ready = state.choice.is_some();
                 if ui
-                    .add_enabled(ready, eframe::egui::Button::new(CHECK_THIS_GAME))
+                    .add_enabled(ready, eframe::egui::Button::new("Preview"))
                     .clicked()
                 {
                     state.preview();
                 }
-                ui.small("You see exactly what will be read first. Nothing is checked until you confirm.");
+                ui.small("Preview shows exactly what will be read. Nothing is checked until you confirm.");
             }
         }
         Stage::Previewing => {
@@ -506,8 +471,8 @@ pub(super) fn show(
                     ),
                 ),
                 Finding::Ambiguous => (
-                    "Needs review".to_string(),
-                    "The file matches several catalogue entries, so no single identity was recorded. Review identity to choose the right one.".to_string(),
+                    "More than one possible match".to_string(),
+                    "The file matches several catalogue entries, so no single identity was recorded.".to_string(),
                 ),
                 Finding::NotChecked(reason) => (
                     "Not checked".to_string(),
@@ -526,7 +491,6 @@ pub(super) fn show(
             if ui.button("Check again").clicked() {
                 state.stage = Stage::Choose;
             }
-            ui.label(NOT_NEEDED_TO_PLAY);
         }
         Stage::Failed(error) => {
             ui.colored_label(theme::WARNING, error);
@@ -551,10 +515,7 @@ pub(super) fn show(
         if ui
             .add_enabled(
                 !state.busy(),
-                eframe::egui::Button::new(format!(
-                    "Check this system's games ({})",
-                    target.platform
-                )),
+                eframe::egui::Button::new(format!("Check all {} games instead", target.platform)),
             )
             .on_hover_text("Opens the platform check, which reads every game on this system.")
             .clicked()
