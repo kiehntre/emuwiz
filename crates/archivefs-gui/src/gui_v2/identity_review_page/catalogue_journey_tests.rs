@@ -32,9 +32,9 @@ fn installed_data_guidance_requires_explicit_preview_and_confirmation() {
     let before = review.clone();
     let guidance = verification_guidance(&review);
     for text in [
-        "no completed content check",
-        "Preview",
-        "confirm verification",
+        "No completed content check",
+        "preview first",
+        "until you confirm",
         "Not checked",
     ] {
         assert!(guidance.contains(text));
