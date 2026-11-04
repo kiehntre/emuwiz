@@ -1129,6 +1129,8 @@ fn collect_loose_file_evidence(
             // A cache hit counts only when the file was the same object just
             // before and just after the lookup; that bracketing fingerprint is
             // the one recorded for it. Otherwise the file is hashed afresh.
+            // The cache entry itself matches only on an identical change
+            // time, so a same-size rewrite with a restored mtime misses.
             let before = crate::identity_source::hashing::FileFingerprint::observe(path);
             let hit = cache.lookup(path).filter(|_| {
                 before.is_some()
@@ -1154,6 +1156,7 @@ fn collect_loose_file_evidence(
                         cache.metrics.files_hashed += 1;
                         cache.insert(
                             path,
+                            &hashes.fingerprint,
                             hashes.crc32.clone(),
                             hashes.md5.clone(),
                             hashes.sha1.clone(),
@@ -3282,6 +3285,8 @@ game (
         .unwrap()
     }
 
+    // Only unix files are fingerprinted for the cache (see audit_cache).
+    #[cfg(unix)]
     #[test]
     fn combined_audit_reuses_persistent_cache_without_changing_evidence() {
         let tree = tempfile::tempdir().unwrap();
@@ -3336,6 +3341,54 @@ game (
         .unwrap();
         assert_eq!(first.report, disabled.report);
         assert_eq!(first.evidence_sources, disabled.evidence_sources);
+    }
+
+    /// S03-02 / D3-02: a warm cache must not turn a same-size in-place
+    /// rewrite with a restored mtime into a verified Exact match.
+    #[cfg(unix)]
+    #[test]
+    fn combined_audit_rehashes_a_same_size_rewrite_with_restored_mtime() {
+        let tree = tempfile::tempdir().unwrap();
+        let dat_path = tree.path().join("fixture.dat");
+        let games = tree.path().join("games");
+        std::fs::create_dir(&games).unwrap();
+        let game_path = games.join("game.rom");
+        let cache_path = tree.path().join("audit-cache.json");
+        std::fs::write(&dat_path, dat_entries(&[("Game", "game.rom", b"test")])).unwrap();
+        std::fs::write(&game_path, b"test").unwrap();
+        let request = CombinedDatAuditRequest {
+            sources: vec![source(dat_path, "fixture")],
+            scan_root: games,
+            limits: DatLimits::default(),
+        };
+        let audit = || {
+            run_combined_dat_audit_with_cache(
+                &request,
+                &TrustedRoots::none(),
+                &AtomicBool::new(false),
+                &|_| {},
+                AuditCacheConfig::At(cache_path.clone()),
+            )
+            .unwrap()
+        };
+        let warm = audit();
+        assert!(matches!(
+            warm.report.entries[0].verdict,
+            AuditVerdict::Exact { .. }
+        ));
+
+        crate::dat::sources::audit_cache::rewrite_in_place_keeping_mtime(&game_path, b"tesT");
+
+        let after = audit();
+        assert_eq!(after.cache.cache_hits, 0, "stale hashes were reused");
+        assert_eq!(after.cache.files_hashed, 1);
+        assert!(
+            !matches!(after.report.entries[0].verdict, AuditVerdict::Exact { .. }),
+            "changed bytes reported as {:?}",
+            after.report.entries[0].verdict
+        );
+        let cold = run(request.sources.clone(), request.scan_root.clone());
+        assert_eq!(after.report, cold.report);
     }
 
     fn write_zip(path: &Path, members: &[(&str, &[u8])]) {
