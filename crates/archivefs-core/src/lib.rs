@@ -158,7 +158,6 @@ pub mod uef_tape;
 #[cfg(any(test, feature = "test-support"))]
 pub mod verified_game_fixture;
 pub mod whdload_options;
-use database::scan_and_persist_folders;
 pub use database::{
     ArchiveChangeKind, ArchiveObservationKind, ArchiveUpsertOutcome, AutomaticPlatformDetails,
     BulkPlatformAssignmentResult, CUSTOM_FOLDER_ALIAS_SOURCE, CatalogueStats, CompletedScanSummary,
