@@ -146,6 +146,7 @@ fn holds_only_disposable_entries(path: &Path, kind: Kind) -> bool {
     // candidate, and the seal store at most once.
     let mut check_preferences = false;
     let mut check_seal_store = false;
+    let mut fingerprint = Vec::new();
     for entry in entries {
         let Ok(entry) = entry else {
             return false;
@@ -169,9 +170,107 @@ fn holds_only_disposable_entries(path: &Path, kind: Kind) -> bool {
             }
             _ => return false,
         }
+        let Some(stamp) = entry.metadata().ok().as_ref().map(EntryStamp::of) else {
+            return false;
+        };
+        fingerprint.push((name, stamp));
     }
-    (!check_preferences || holds_first_start_gui_preferences(&path.join(GUI_PREFERENCES_FILE)))
-        && (!check_seal_store || seal_store_records_nothing(&path.join(SEAL_STORE_FILENAME)))
+    if !check_preferences && !check_seal_store {
+        return true;
+    }
+    fingerprint.sort();
+    content_verdict_cache::get_or_check(path, fingerprint, || {
+        (!check_preferences || holds_first_start_gui_preferences(&path.join(GUI_PREFERENCES_FILE)))
+            && (!check_seal_store || seal_store_records_nothing(&path.join(SEAL_STORE_FILENAME)))
+    })
+}
+
+/// Identity and change stamp of one directory entry (not followed).
+#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord)]
+struct EntryStamp {
+    len: u64,
+    modified: Option<std::time::SystemTime>,
+    #[cfg(unix)]
+    dev_ino_ctime: (u64, u64, i64, i64),
+}
+
+impl EntryStamp {
+    fn of(metadata: &std::fs::Metadata) -> Self {
+        #[cfg(unix)]
+        use std::os::unix::fs::MetadataExt;
+        Self {
+            len: metadata.len(),
+            modified: metadata.modified().ok(),
+            #[cfg(unix)]
+            dev_ino_ctime: (
+                metadata.dev(),
+                metadata.ino(),
+                metadata.ctime(),
+                metadata.ctime_nsec(),
+            ),
+        }
+    }
+}
+
+/// Process-wide memo of the expensive part of classification (reading
+/// Blue's settings, copying and opening a seal store), so code that
+/// resolves the data folder while painting does not repeat it every frame.
+/// A verdict is reused only while every entry's stamp (inode, size, mtime,
+/// ctime) is unchanged and it is younger than [`MAX_AGE`]: any added,
+/// removed, replaced or rewritten entry is re-checked at once, and an
+/// in-place rewrite too fine for the timestamps is seen within MAX_AGE.
+mod content_verdict_cache {
+    use std::collections::HashMap;
+    use std::path::{Path, PathBuf};
+    use std::sync::Mutex;
+    use std::time::{Duration, Instant};
+
+    pub(super) const MAX_AGE: Duration = Duration::from_secs(1);
+    const MAX_ENTRIES: usize = 16;
+
+    type Fingerprint = Vec<(String, super::EntryStamp)>;
+
+    type Verdicts = HashMap<PathBuf, (Fingerprint, Instant, bool)>;
+
+    static CACHE: Mutex<Option<Verdicts>> = Mutex::new(None);
+
+    #[cfg(test)]
+    thread_local! {
+        pub(super) static CHECKS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    }
+
+    pub(super) fn get_or_check(
+        path: &Path,
+        fingerprint: Fingerprint,
+        check: impl FnOnce() -> bool,
+    ) -> bool {
+        {
+            let guard = CACHE
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            if let Some((cached, at, verdict)) = guard.as_ref().and_then(|map| map.get(path))
+                && *cached == fingerprint
+                && at.elapsed() < MAX_AGE
+            {
+                return *verdict;
+            }
+        }
+        #[cfg(test)]
+        CHECKS.with(|checks| checks.set(checks.get() + 1));
+        let verdict = check();
+        let mut guard = CACHE
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let map = guard.get_or_insert_with(HashMap::new);
+        if map.len() >= MAX_ENTRIES {
+            map.retain(|_, (_, at, _)| at.elapsed() < MAX_AGE);
+            if map.len() >= MAX_ENTRIES {
+                map.clear();
+            }
+        }
+        map.insert(path.to_path_buf(), (fingerprint, Instant::now(), verdict));
+        verdict
+    }
 }
 
 /// Whether Blue's settings file equals its first-start defaults. Read-only.
@@ -1050,6 +1149,42 @@ mod tests {
             assert_eq!(tree(&home), before, "{name} must be left untouched");
             let _ = std::fs::remove_dir_all(&home);
         }
+    }
+
+    /// Per-frame callers: the expensive content check runs once while
+    /// nothing changes, and any change (a seal written) is seen at once.
+    #[test]
+    fn repeated_resolution_reuses_the_content_verdict_until_anything_changes() {
+        let home = home_with("verdict-cache", &[]);
+        legacy_install(&home);
+        startup_leftovers(&home);
+        let writer = seal_store(&home.join(".local/share/emuwiz"), 0);
+        let checks = || content_verdict_cache::CHECKS.with(std::cell::Cell::get);
+        let start = checks();
+        for _ in 0..50 {
+            assert_eq!(
+                data_dir_in(&home).unwrap(),
+                home.join(".local/share/archivefs")
+            );
+        }
+        assert_eq!(checks() - start, 1, "50 resolutions, one content check");
+
+        writer
+            .execute(
+                "INSERT INTO journal_seals VALUES ('ns', 't', 'w', 'n', 1, x'00', NULL, NULL)",
+                [],
+            )
+            .unwrap();
+        assert!(data_dir_in(&home).is_err(), "a new seal is seen at once");
+        drop(writer);
+
+        // Bounded age: even an unchanged folder is re-checked after MAX_AGE.
+        let before = checks();
+        let _ = data_dir_in(&home);
+        std::thread::sleep(content_verdict_cache::MAX_AGE + std::time::Duration::from_millis(50));
+        let _ = data_dir_in(&home);
+        assert!(checks() - before >= 1);
+        let _ = std::fs::remove_dir_all(&home);
     }
 
     /// `archivefs -> emuwiz` or `emuwiz -> archivefs`: one setup under two
