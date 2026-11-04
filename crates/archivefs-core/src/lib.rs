@@ -1289,7 +1289,10 @@ fn complete_doctor_report(
             false
         }
         PathInspection::Missing if create_mount_root => {
-            match fs::create_dir_all(&config.mount_root) {
+            match ensure_mount_root_disjoint_from_config(config).and_then(|()| {
+                fs::create_dir_all(&config.mount_root)
+                    .map_err(|source| ArchiveFsError::io(config.mount_root.clone(), source))
+            }) {
                 Ok(()) => {
                     report.pass(
                         "mount root",
@@ -1667,6 +1670,11 @@ fn run_setup_diagnostics_with_checks(
         && mount_root.as_ref().is_some_and(|root| {
             root.parent()
                 .is_some_and(|parent| inspect(parent).is_directory())
+        })
+        && mount_root.as_ref().is_some_and(|root| {
+            contents.as_deref().is_some_and(|contents| {
+                mount_root_disjoint_from_config_text(root, contents).is_ok()
+            })
         });
     let sources_ready =
         !source_states.is_empty() && source_states.iter().all(|(_, state)| state.is_directory());
@@ -1985,12 +1993,28 @@ pub fn create_configured_mount_root_default() -> Result<PathBuf> {
     let root = parse_config_fields(&contents)?
         .mount_root
         .ok_or_else(|| ArchiveFsError::Config("missing mount_root".to_string()))?;
+    mount_root_disjoint_from_config_text(&root, &contents)?;
     create_mount_root(&root)?;
     Ok(root)
 }
 
 pub fn create_configured_mount_root(config: &Config) -> Result<()> {
+    ensure_mount_root_disjoint_from_config(config)?;
     create_mount_root(&config.mount_root)
+}
+
+/// The disjointness rule against everything the config text protects:
+/// every configured source (enabled or disabled) and the master ROM root.
+fn mount_root_disjoint_from_config_text(mount_root: &Path, contents: &str) -> Result<()> {
+    let sources: Vec<PathBuf> = parse_source_folder_configs(contents)?
+        .into_iter()
+        .map(|source| source.path)
+        .collect();
+    ensure_mount_root_disjoint_from_sources(mount_root, &sources)?;
+    if let Some(master_rom_root) = parse_config_fields(contents)?.master_rom_root {
+        ensure_mount_root_disjoint_from(mount_root, &master_rom_root, "master ROM root")?;
+    }
+    Ok(())
 }
 
 fn create_mount_root(root: &Path) -> Result<()> {
@@ -2165,7 +2189,16 @@ fn run_config_check_with_mount_root_creation(
                 .flatten()
                 .map(PathBuf::from)
                 .collect();
-            let overlap = ensure_mount_root_disjoint_from_sources(mount_root, &source_paths).err();
+            let overlap = ensure_mount_root_disjoint_from_sources(mount_root, &source_paths)
+                .and_then(|()| match &fields.master_rom_root {
+                    Some(master_rom_root) => ensure_mount_root_disjoint_from(
+                        mount_root,
+                        master_rom_root,
+                        "master ROM root",
+                    ),
+                    None => Ok(()),
+                })
+                .err();
             if let Some(error) = &overlap {
                 report.error("mount_root separate from source folders", error.to_string());
             }
@@ -2584,13 +2617,7 @@ pub fn set_master_rom_root_to(config_path: &Path, path: &Path) -> Result<Option<
         .unwrap_or_else(|| "ratarmount".to_string());
     // Organised games must never be moved into the mount root, nor the
     // mount root sit inside the organised library.
-    if ensure_mount_root_disjoint_from_sources(&mount_root, &[path.to_path_buf()]).is_err() {
-        return Err(ArchiveFsError::Config(format!(
-            "the master ROM root {} overlaps the temporary preparation folder {}; choose a separate folder",
-            path.display(),
-            mount_root.display()
-        )));
-    }
+    ensure_mount_root_disjoint_from(&mount_root, path, "master ROM root")?;
     let previous = config.and_then(|config| config.master_rom_root);
     save_source_folder_configs_to(
         config_path,
@@ -2630,6 +2657,9 @@ pub fn set_mount_root_to(config_path: &Path, path: &Path) -> Result<PathBuf> {
         .map(|source| source.path)
         .collect();
     ensure_mount_root_disjoint_from_sources(path, &sources)?;
+    if let Some(master_rom_root) = parse_config_fields(&contents)?.master_rom_root {
+        ensure_mount_root_disjoint_from(path, &master_rom_root, "master ROM root")?;
+    }
     let updated = replace_mount_root_assignment(&contents, path)?;
     // The exact bytes about to be published must parse and round-trip the
     // requested folder. This is what stops a path containing an embedded
@@ -3137,6 +3167,14 @@ fn resolve_through_nearest_existing_ancestor(path: &Path) -> io::Result<PathBuf>
                 return Ok(resolved);
             }
             Err(error) if error.kind() == io::ErrorKind::NotFound => {
+                // A dangling symlink is not a folder that does not exist
+                // yet: its real target is unknown, so fail closed.
+                if fs::symlink_metadata(current).is_ok() {
+                    return Err(io::Error::new(
+                        io::ErrorKind::NotFound,
+                        format!("{} is a dangling symbolic link", current.display()),
+                    ));
+                }
                 match (current.parent(), current.file_name()) {
                     (Some(parent), Some(name)) if !parent.as_os_str().is_empty() => {
                         missing.push(name.to_os_string());
@@ -3191,33 +3229,40 @@ pub fn ensure_mount_root_disjoint_from_sources(
     mount_root: &Path,
     sources: &[PathBuf],
 ) -> Result<()> {
-    if mount_root.as_os_str().is_empty() {
-        return Ok(());
-    }
-    for source in sources
-        .iter()
-        .filter(|source| !source.as_os_str().is_empty())
-    {
-        match mount_root_source_overlap(mount_root, source) {
-            Ok(None) => {}
-            Ok(Some(overlap)) => {
-                return Err(ArchiveFsError::Config(format!(
-                    "the temporary preparation folder {} {} the source folder {}; EmuWiz never mounts into or cleans up inside a source folder, so choose a separate preparation folder",
-                    mount_root.display(),
-                    overlap.describe(),
-                    source.display()
-                )));
-            }
-            Err(error) => {
-                return Err(ArchiveFsError::Config(format!(
-                    "cannot verify that the temporary preparation folder {} is separate from the source folder {}: {error}",
-                    mount_root.display(),
-                    source.display()
-                )));
-            }
-        }
+    for source in sources {
+        ensure_mount_root_disjoint_from(mount_root, source, "source folder")?;
     }
     Ok(())
+}
+
+/// [`ensure_mount_root_disjoint_from_sources`] for every root `config`
+/// protects: its source folders and its master ROM root.
+pub(crate) fn ensure_mount_root_disjoint_from_config(config: &Config) -> Result<()> {
+    ensure_mount_root_disjoint_from_sources(&config.mount_root, &config.source_folders)?;
+    if let Some(master_rom_root) = &config.master_rom_root {
+        ensure_mount_root_disjoint_from(&config.mount_root, master_rom_root, "master ROM root")?;
+    }
+    Ok(())
+}
+
+fn ensure_mount_root_disjoint_from(mount_root: &Path, protected: &Path, label: &str) -> Result<()> {
+    if mount_root.as_os_str().is_empty() || protected.as_os_str().is_empty() {
+        return Ok(());
+    }
+    match mount_root_source_overlap(mount_root, protected) {
+        Ok(None) => Ok(()),
+        Ok(Some(overlap)) => Err(ArchiveFsError::Config(format!(
+            "the temporary preparation folder {} {} the {label} {}; EmuWiz refuses to create, mount into or clean up folders in an overlapping preparation folder, so choose a separate one",
+            mount_root.display(),
+            overlap.describe(),
+            protected.display()
+        ))),
+        Err(error) => Err(ArchiveFsError::Config(format!(
+            "cannot verify that the temporary preparation folder {} is separate from the {label} {}: {error}",
+            mount_root.display(),
+            protected.display()
+        ))),
+    }
 }
 
 /// Folders a source scan must not enter because they belong to the mount
@@ -3225,7 +3270,7 @@ pub fn ensure_mount_root_disjoint_from_sources(
 /// a mount root inside the source is excluded whole; when the mount root is
 /// the source or contains it, only its live mount points can be told apart
 /// from the user's own folders, so those are excluded.
-fn mount_root_scan_exclusions(source: &Path, mount_root: &Path) -> Vec<PathBuf> {
+pub(crate) fn mount_root_scan_exclusions(source: &Path, mount_root: &Path) -> Vec<PathBuf> {
     if mount_root.as_os_str().is_empty() {
         return Vec::new();
     }
@@ -3771,6 +3816,12 @@ pub fn set_source_folder_enabled_at(
                 target.display()
             ))
         })?;
+    if enabled {
+        ensure_mount_root_disjoint_from_sources(
+            &config.mount_root,
+            std::slice::from_ref(&sources[index].path),
+        )?;
+    }
     sources[index].enabled = enabled;
     let updated = sources[index].clone();
 
@@ -3795,10 +3846,11 @@ pub fn set_source_folder_enabled_at(
                     target.display()
                 ))
             })?;
-        Some(scan_and_persist_folders(
+        Some(database::scan_and_persist_folders_excluding_mount_root(
             &mut database,
             std::slice::from_ref(&folder),
             "source-enable",
+            &config.mount_root,
         )?)
     } else {
         None
@@ -3972,8 +4024,12 @@ pub fn scan_source_folder_at(
             ))
         })?;
 
-    let summary =
-        scan_and_persist_folders(&mut database, std::slice::from_ref(&folder), triggered_by)?;
+    let summary = database::scan_and_persist_folders_excluding_mount_root(
+        &mut database,
+        std::slice::from_ref(&folder),
+        triggered_by,
+        &configured_mount_root_at(config_path)?,
+    )?;
     refresh_configured_mame_arcade_identity(&mut database, &[target.to_path_buf()])?;
     Ok(summary)
 }
@@ -3990,6 +4046,16 @@ pub fn scan_all_enabled_sources_default() -> Result<ScanPersistSummary> {
         &default_database_path()?,
         "cli-scan-all-sources",
     )
+}
+
+/// The configured mount root (empty when none is set), so persisted scans
+/// can exclude mount-root content from a legacy overlapping source.
+fn configured_mount_root_at(config_path: &Path) -> Result<PathBuf> {
+    let contents = fs::read_to_string(config_path)
+        .map_err(|source| ArchiveFsError::io(config_path.to_path_buf(), source))?;
+    Ok(parse_config_fields(&contents)?
+        .mount_root
+        .unwrap_or_default())
 }
 
 pub fn scan_all_enabled_sources_at(
@@ -4023,6 +4089,7 @@ pub fn scan_all_enabled_sources_at(
         &enabled_folders,
         triggered_by,
         &skipped,
+        &configured_mount_root_at(config_path)?,
     )?;
     let paths = enabled_folders
         .iter()
@@ -5898,6 +5965,7 @@ impl ArchiveMountSession {
         &self,
         archive_paths: &[PathBuf],
     ) -> Result<Vec<MountBatchTargetValidation>> {
+        ensure_mount_root_disjoint_from_config(&self.config)?;
         fs::create_dir_all(&self.config.mount_root)
             .map_err(|source| ArchiveFsError::io(self.config.mount_root.clone(), source))?;
         let active_mount_paths = current_mount_paths()?;
@@ -8548,6 +8616,7 @@ pub fn mount_archives_with_backend(
 ) -> Result<Vec<ArchiveStatus>> {
     let scanner = ArchiveScanner::new(config);
     let plans = scanner.mount_plans()?;
+    ensure_mount_root_disjoint_from_config(config)?;
     prepare_mount_root(&config.mount_root)?;
 
     let archive_paths = plans
@@ -8678,6 +8747,7 @@ fn mount_one_plan_outcome(
         plan.mount_path.display()
     );
 
+    ensure_mount_root_disjoint_from_config(config)?;
     prepare_mount_root(&config.mount_root)?;
     let active_mount_paths = backend.active_mount_paths(&config.mount_root)?;
     mount_one_plan_outcome_with_active_mounts(config, plan, backend, &active_mount_paths)
@@ -8704,6 +8774,7 @@ fn mount_unmounted_plan(
     plan: MountPlan,
     backend: &impl MountBackend,
 ) -> Result<MountPlan> {
+    ensure_mount_root_disjoint_from_config(config)?;
     prepare_mount_root(&config.mount_root)?;
     validate_archive_for_mount(&plan.archive)?;
     validate_mount_target_parent(config, &plan.mount_path)?;
@@ -9256,7 +9327,7 @@ fn validated_unmount_parent_identity(
 
 pub fn cleanup_selected_mount_dir(config: &Config, mount_path: &Path) -> Result<bool> {
     ensure_no_symlink_components(&config.mount_root)?;
-    ensure_mount_root_disjoint_from_sources(&config.mount_root, &config.source_folders)?;
+    ensure_mount_root_disjoint_from_config(config)?;
     if mount_path == config.mount_root
         || !path_is_under(mount_path, &config.mount_root)
         || !mount_path.is_dir()
@@ -9271,7 +9342,7 @@ pub fn cleanup_selected_mount_dir(config: &Config, mount_path: &Path) -> Result<
 /// Removes an empty selected mount directory and its empty ancestors below the mount root.
 pub fn cleanup_selected_mount_tree(config: &Config, mount_path: &Path) -> Result<Vec<PathBuf>> {
     ensure_no_symlink_components(&config.mount_root)?;
-    ensure_mount_root_disjoint_from_sources(&config.mount_root, &config.source_folders)?;
+    ensure_mount_root_disjoint_from_config(config)?;
     if mount_path == config.mount_root
         || !path_is_under(mount_path, &config.mount_root)
         || !mount_path.is_dir()
@@ -9346,7 +9417,7 @@ pub fn plan_stale_mount_directories(config: &Config) -> Result<Vec<PathBuf>> {
     }
     ensure_no_symlink_components(&config.mount_root)?;
     // Every empty folder in an overlapping source would look like a leftover.
-    ensure_mount_root_disjoint_from_sources(&config.mount_root, &config.source_folders)?;
+    ensure_mount_root_disjoint_from_config(config)?;
     let mounted_paths = mounted_paths_under(&config.mount_root)?;
     let mut stale = Vec::new();
     let mut inspected = 0usize;
@@ -9417,7 +9488,7 @@ pub fn clean_mount_root(config: &Config) -> Result<Vec<PathBuf>> {
         return Ok(Vec::new());
     }
     ensure_no_symlink_components(&config.mount_root)?;
-    ensure_mount_root_disjoint_from_sources(&config.mount_root, &config.source_folders)?;
+    ensure_mount_root_disjoint_from_config(config)?;
     let mut plans = ArchiveScanner::new(config).mount_plans()?;
     plans.sort_by(|left, right| right.mount_path.cmp(&left.mount_path));
     let mut removed = Vec::new();
@@ -10794,8 +10865,11 @@ mod tests {
         let real_parent = mount_root.join("Real");
         fs::create_dir_all(&real_parent).unwrap();
         symlink(&real_parent, mount_root.join("Alias")).unwrap();
-        let first_archive = root.join("First.zip");
-        let second_archive = root.join("Second.zip");
+        // The library sits beside the mount root: an overlapping one is refused.
+        let library = root.join("library");
+        fs::create_dir_all(&library).unwrap();
+        let first_archive = library.join("First.zip");
+        let second_archive = library.join("Second.zip");
         fs::write(&first_archive, b"archive").unwrap();
         fs::write(&second_archive, b"archive").unwrap();
         let plans = vec![
@@ -10809,7 +10883,7 @@ mod tests {
             ),
         ];
         let config = Config {
-            source_folders: vec![root.clone()],
+            source_folders: vec![library],
             mount_root,
             ratarmount_bin: "ratarmount".to_string(),
             master_rom_root: None,

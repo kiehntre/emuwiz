@@ -283,3 +283,203 @@ fn targeted_mount_cleanup_refuses_a_mount_root_containing_a_source() {
     assert!(cleanup_selected_mount_dir(&config, &empty_in_source).is_err());
     assert!(empty_in_source.is_dir());
 }
+
+// --- Independent-review corrections (F1-F4, F6, F9) -----------------------
+
+#[test]
+fn set_mount_root_refuses_folders_overlapping_the_master_rom_root() {
+    let fixture = tempfile::tempdir().unwrap();
+    let root = fixture.path();
+    let source = root.join("library");
+    fs::create_dir(&source).unwrap();
+    let config = root.join("config.toml");
+    legacy_config(&config, &[&source], &root.join("old-mounts"));
+    // Master ROM root first, then a mount root around or inside it.
+    let organised = root.join("organised");
+    fs::create_dir_all(organised.join("mnt")).unwrap();
+    set_master_rom_root_to(&config, &organised).unwrap();
+    let original = fs::read(&config).unwrap();
+    for candidate in [root.to_path_buf(), organised.clone(), organised.join("mnt")] {
+        assert!(
+            set_mount_root_to(&config, &candidate).is_err(),
+            "{}",
+            candidate.display()
+        );
+        assert_eq!(fs::read(&config).unwrap(), original);
+    }
+}
+
+#[cfg(unix)]
+#[test]
+fn set_mount_root_fails_closed_on_a_dangling_symlinked_source() {
+    let fixture = tempfile::tempdir().unwrap();
+    let root = fixture.path();
+    let drive = root.join("drive");
+    fs::create_dir(&drive).unwrap();
+    // The source lives on a drive folder that is offline right now.
+    let offline = root.join("offline-library");
+    std::os::unix::fs::symlink(drive.join("library"), &offline).unwrap();
+    let config = root.join("config.toml");
+    let original = legacy_config(&config, &[&offline], &root.join("old-mounts"));
+    let error = set_mount_root_to(&config, &drive).unwrap_err();
+    assert!(error.to_string().contains("cannot verify"), "{error}");
+    assert_eq!(fs::read(&config).unwrap(), original);
+}
+
+#[cfg(unix)]
+#[test]
+fn master_rom_root_reports_an_unverifiable_check_truthfully() {
+    let fixture = tempfile::tempdir().unwrap();
+    let root = fixture.path();
+    let mount_root = root.join("mnt");
+    fs::create_dir(&mount_root).unwrap();
+    let config = root.join("config.toml");
+    let original = legacy_config(&config, &[], &mount_root);
+    let dangling = root.join("organised-link");
+    std::os::unix::fs::symlink(root.join("gone"), &dangling).unwrap();
+    let error = set_master_rom_root_to(&config, &dangling).unwrap_err();
+    let text = error.to_string();
+    assert!(text.contains("cannot verify"), "{text}");
+    assert!(!text.contains("overlaps"), "{text}");
+    assert_eq!(fs::read(&config).unwrap(), original);
+}
+
+#[test]
+fn enabling_a_disabled_source_inside_the_mount_root_is_refused() {
+    let fixture = tempfile::tempdir().unwrap();
+    let root = fixture.path();
+    let mount_root = root.join("mnt");
+    let disabled = mount_root.join("library");
+    fs::create_dir_all(&disabled).unwrap();
+    let config = root.join("config.toml");
+    let contents = format!(
+        "mount_root = \"{}\"\nratarmount_bin = \"ratarmount\"\n\n[[source]]\npath = \"{}\"\nenabled = false\n",
+        mount_root.display(),
+        disabled.display()
+    );
+    fs::write(&config, &contents).unwrap();
+    let database = root.join("library.sqlite3");
+    assert!(set_source_folder_enabled_at(&config, &database, &disabled, true).is_err());
+    assert_eq!(fs::read_to_string(&config).unwrap(), contents);
+    // A disabled source is still protected when a mount root is chosen.
+    assert!(set_mount_root_to(&config, &mount_root).is_err());
+}
+
+#[test]
+fn persisted_scan_never_catalogues_mount_root_content_inside_a_source() {
+    let fixture = tempfile::tempdir().unwrap();
+    let root = fixture.path();
+    let source = root.join("library");
+    fs::create_dir_all(source.join("roms")).unwrap();
+    fs::write(source.join("roms/Outer.zip"), b"archive").unwrap();
+    let mount_root = source.join("mnt");
+    fs::create_dir_all(mount_root.join("Unknown/Outer")).unwrap();
+    fs::write(mount_root.join("Unknown/Outer/Inner.zip"), b"archive").unwrap();
+    let config = root.join("config.toml");
+    legacy_config(&config, &[&source], &mount_root);
+    let database_path = root.join("library.sqlite3");
+    scan_source_folder_at(&config, &database_path, &source, "overlap-test").unwrap();
+    let database = Database::open_or_create(&database_path).unwrap();
+    let paths: Vec<PathBuf> = database
+        .load_archives()
+        .unwrap()
+        .into_iter()
+        .map(|archive| archive.absolute_path)
+        .collect();
+    assert!(
+        paths.iter().all(|path| !path.starts_with(&mount_root)),
+        "{paths:?}"
+    );
+    assert!(paths.contains(&source.join("roms/Outer.zip")), "{paths:?}");
+}
+
+#[test]
+fn doctor_never_creates_a_mount_root_inside_a_source() {
+    let fixture = tempfile::tempdir().unwrap();
+    let source = fixture.path().join("library");
+    fs::create_dir(&source).unwrap();
+    let mount_root = source.join("mnt");
+    let config = fixture.path().join("config.toml");
+    legacy_config(&config, &[&source], &mount_root);
+    let report = run_doctor(&config);
+    assert!(
+        report
+            .checks
+            .iter()
+            .any(|check| check.status == DoctorStatus::Fail
+                && check.detail.contains("source folder")),
+        "{:#?}",
+        report.checks
+    );
+    assert!(
+        !mount_root.exists(),
+        "doctor created the mount root inside a source"
+    );
+}
+
+#[test]
+fn mount_root_creation_is_refused_and_not_offered_inside_a_source() {
+    let fixture = tempfile::tempdir().unwrap();
+    let source = fixture.path().join("library");
+    fs::create_dir(&source).unwrap();
+    let mount_root = source.join("mnt");
+    let config_path = fixture.path().join("config.toml");
+    legacy_config(&config_path, &[&source], &mount_root);
+    assert!(!run_setup_diagnostics_read_only(&config_path).can_create_mount_root);
+    let config = Config::load_from(&config_path).unwrap();
+    assert!(create_configured_mount_root(&config).is_err());
+    assert!(!mount_root.exists());
+    // A disjoint mount root is still offered and created.
+    let disjoint = fixture.path().join("mounts");
+    legacy_config(&config_path, &[&source], &disjoint);
+    assert!(run_setup_diagnostics_read_only(&config_path).can_create_mount_root);
+    create_configured_mount_root(&Config::load_from(&config_path).unwrap()).unwrap();
+    assert!(disjoint.is_dir());
+}
+
+#[derive(Default)]
+struct CountingBackend {
+    mounts: std::cell::Cell<usize>,
+}
+
+impl MountBackend for CountingBackend {
+    fn mount(&self, _plan: &MountPlan) -> Result<()> {
+        self.mounts.set(self.mounts.get() + 1);
+        Ok(())
+    }
+    fn unmount(&self, _mount_path: &Path) -> Result<()> {
+        Ok(())
+    }
+    fn active_mount_paths(&self, _root: &Path) -> Result<HashSet<PathBuf>> {
+        Ok(HashSet::new())
+    }
+}
+
+#[test]
+fn mounting_into_an_overlapping_mount_root_is_refused() {
+    let fixture = tempfile::tempdir().unwrap();
+    let source = fixture.path().join("library");
+    fs::create_dir_all(source.join("roms")).unwrap();
+    let archive = source.join("roms/Good.zip");
+    fs::write(&archive, b"archive").unwrap();
+    // Mount root equal to the source: mounting would create folders in it.
+    let equal = Config {
+        source_folders: vec![source.clone()],
+        mount_root: source.clone(),
+        ratarmount_bin: "ratarmount".to_string(),
+        master_rom_root: None,
+    };
+    let plan = ArchiveScanner::new(&equal).mount_plans().unwrap().remove(0);
+    let backend = CountingBackend::default();
+    assert!(mount_one_plan_outcome(&equal, plan.clone(), &backend).is_err());
+    assert_eq!(backend.mounts.get(), 0);
+    assert!(!plan.mount_path.exists());
+    // Batch validation must not create a mount root inside the source.
+    let inside = Config {
+        mount_root: source.join("mnt"),
+        ..equal
+    };
+    let session = ArchiveMountSession::new(&inside).unwrap();
+    assert!(session.validate_batch_targets(&[archive]).is_err());
+    assert!(!source.join("mnt").exists());
+}

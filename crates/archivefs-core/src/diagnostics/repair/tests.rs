@@ -1748,7 +1748,38 @@ fn assert_overlapping_mount_root_is_refused(
             "{:?}",
             outcome.record
         );
+        // Compared by name so this also compiles, and fails, before the fix.
+        assert_eq!(
+            format!("{:?}", outcome.record.rejection),
+            "Some(MountRootOverlapsSource)"
+        );
         assert!(outcome.record.changed_paths.is_empty());
+        // Each listed folder, repaired one at a time, is refused too: by the
+        // source-folder boundary or by the overlap gate.
+        for path in preserved {
+            let mut targeted = request_for(
+                DoctorRepairAction::CleanMountPath,
+                "mount_root.stale_mount_directory",
+                path,
+            );
+            targeted.dry_run = dry_run;
+            let outcome =
+                execute_doctor_repair(&targeted, &context(config, &scan, &fixture.index_path()));
+            assert_eq!(
+                outcome.record.status,
+                DoctorRepairStatus::Rejected,
+                "{}: {:?}",
+                path.display(),
+                outcome.record
+            );
+            let rejection = format!("{:?}", outcome.record.rejection);
+            assert!(
+                rejection == "Some(PathUnderSourceRoot)"
+                    || rejection == "Some(MountRootOverlapsSource)",
+                "{}: {rejection}",
+                path.display()
+            );
+        }
     }
     for path in preserved {
         assert!(path.is_dir(), "source folder removed: {}", path.display());
@@ -1799,13 +1830,20 @@ fn clean_and_doctor_refuse_a_mount_root_containing_a_source() {
     let fixture = Fixture::new("overlap-parent");
     let source = fixture.dir("mnt/library");
     let empty_in_source = fixture.dir("mnt/library/Empty Folder");
+    // Outside the source but under the overlapping mount root: only the
+    // overlap gate can refuse this one.
+    let empty_beside_source = fixture.dir("mnt/Other/Empty");
     let config = Config {
         source_folders: vec![source],
         mount_root: fixture.root.join("mnt"),
         ratarmount_bin: "ratarmount".to_string(),
         master_rom_root: None,
     };
-    assert_overlapping_mount_root_is_refused(&fixture, &config, &[empty_in_source]);
+    assert_overlapping_mount_root_is_refused(
+        &fixture,
+        &config,
+        &[empty_in_source, empty_beside_source],
+    );
 }
 
 #[cfg(unix)]
@@ -1863,4 +1901,16 @@ fn clean_still_removes_leftovers_under_a_disjoint_mount_root() {
     assert!(!planned[0].exists());
     assert!(empty_in_source.is_dir());
     assert!(config.mount_root.is_dir());
+}
+
+#[test]
+fn clean_and_doctor_refuse_a_mount_root_containing_the_master_rom_root() {
+    let fixture = Fixture::new("overlap-master-root");
+    let config = Config {
+        master_rom_root: Some(fixture.dir("mnt/organised")),
+        ..fixture.config()
+    };
+    // An empty canonical platform folder in the organised library.
+    let platform = fixture.dir("mnt/organised/SNES");
+    assert_overlapping_mount_root_is_refused(&fixture, &config, &[platform]);
 }
