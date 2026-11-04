@@ -8800,7 +8800,7 @@ fn review_identity_explains_each_failed_state_with_its_direct_next_action() {
     let mut app = review_app(&context, vec![(1, "Game", "SNES")]);
     let strings = render_review(&context, &mut app, 1);
     assert!(
-        shows(&strings, "This game is ready to verify"),
+        shows(&strings, "This game has not been verified yet"),
         "{strings:?}"
     );
     assert!(!shows(&strings, "Unknown"));
