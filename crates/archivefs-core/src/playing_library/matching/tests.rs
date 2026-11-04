@@ -659,12 +659,15 @@ fn regression_a_listed_descriptor_that_does_not_parse_is_not_a_match() {
     assert_eq!(outcome.rejected_launchers[0].launcher_path, gdi);
 }
 
-/// A real release reached through a symlinked source folder. The matcher
-/// compares canonical track paths with the scan's own spellings; whatever
-/// that yields, it must never be a descriptor-only match or a partial one.
+/// Guard, not new coverage: a release reached through a symlinked source
+/// folder. `hash_file` refuses any path through a symlink, so nothing in it
+/// is hashed and nothing matches - in particular no descriptor-only or
+/// partial match. If symlinked paths ever become hashable, this must be
+/// revisited (the matcher compares canonical track paths with the scan's
+/// own spellings).
 #[cfg(unix)]
 #[test]
-fn a_release_under_a_symlinked_source_root_is_never_a_partial_match() {
+fn a_release_under_a_symlinked_source_root_is_not_matched() {
     let temp = tempfile::tempdir().expect("temp dir");
     let real = temp.path().join("real");
     std::fs::create_dir(&real).unwrap();
@@ -679,12 +682,8 @@ fn a_release_under_a_symlinked_source_root_is_never_a_partial_match() {
         &TrustedRoots::from_paths([&link]),
         &AtomicBool::new(false),
     );
-    for found in &outcome.matches {
-        assert!(
-            found.companion_paths.len() == 2,
-            "a descriptor-only, partial or lone-track match: {outcome:?}"
-        );
-    }
+    assert!(outcome.matches.is_empty(), "{outcome:?}");
+    assert!(outcome.rejected_launchers.is_empty(), "{outcome:?}");
 }
 
 /// Two GDI discs of one multidisc release. The catalogue lists each disc's

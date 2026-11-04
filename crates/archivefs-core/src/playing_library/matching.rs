@@ -66,9 +66,21 @@
 //! same rule as a standalone CUE/GDI release (every track must verify) -
 //! must verify against its own distinct DAT entry, and every one of those
 //! entries must share the same multidisc base title; anything else is
-//! refused as a whole, exactly as above - the M3U, every disc it
-//! structurally names, and each of those discs' own structurally
-//! resolved companions are all excluded from independent election.
+//! refused as a whole: the M3U, and every disc (with its companions) read
+//! before the refusal, are excluded from independent election. The M3U
+//! pass stops at the first disc it refuses, so a disc listed after that one
+//! is not claimed by the playlist and is judged on its own later: it can
+//! stand as its own single disc only if it fully verifies on its own.
+//!
+//! # Known limitation: catalogue completeness
+//!
+//! A release is checked against what its descriptor references, not against
+//! every file the catalogue entry lists. A descriptor edited to drop a
+//! track line (with that track also gone) still combines, and with no
+//! descriptor at all each uniquely matching track is its own single-file
+//! match. Requiring full catalogue coverage needs a separate decision about
+//! which catalogue rows are required (descriptor rows, rows without SHA-1,
+//! disk rows), so it is not done here.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
