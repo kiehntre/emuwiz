@@ -291,14 +291,13 @@ fn legacy_roots() -> (bool, bool, bool) {
     let Some(home) = env::var_os("HOME").map(PathBuf::from) else {
         return (false, false, false);
     };
-    let primary_config = home.join(".config/emuwiz");
     let legacy_config = home.join(".config/archivefs");
-    let primary_data = home.join(".local/share/emuwiz");
     let legacy_data = home.join(".local/share/archivefs");
     let legacy_config_present = path_present(&legacy_config);
     let legacy_data_present = path_present(&legacy_data);
-    let both = (path_present(&primary_config) && legacy_config_present)
-        || (path_present(&primary_data) && legacy_data_present);
+    // A conflict only when resolution itself refuses to choose: an empty
+    // EmuWiz folder beside an established legacy setup is not one.
+    let both = archivefs_core::app_dirs::two_established_setups();
     (legacy_config_present, legacy_data_present, both)
 }
 

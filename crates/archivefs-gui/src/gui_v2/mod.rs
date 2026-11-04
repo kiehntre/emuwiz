@@ -983,6 +983,25 @@ impl App {
         self.router.back();
         self.navigation_changed();
     }
+    /// What Blue writes to `gui-v2.json`: the live state, not a default.
+    fn saved_preferences(&self) -> Preferences {
+        Preferences {
+            route: self.router.current.clone(),
+            filter: self.filter.clone(),
+            playing_library: crate::playing_library_page::preferences::SavedPreferences::from_state(
+                &self.playing_library,
+            ),
+            welcome_dismissed: self.welcome_dismissed,
+            beginner_hints_enabled: self.beginner_hints_enabled,
+            document_roots: self.document_preferences.roots.clone(),
+            document_associations: self.document_preferences.associations.clone(),
+            document_reading: self.document_preferences.reading.clone(),
+            simple_shell: self.simple.enabled,
+            classic_view: !self.simple.enabled,
+            ui_scale: self.simple.ui_scale,
+        }
+    }
+
     fn restore_preferences(&mut self, mut preferences: Preferences) {
         self.welcome_dismissed = preferences.welcome_dismissed;
         self.beginner_hints_enabled = preferences.beginner_hints_enabled;
@@ -2264,25 +2283,7 @@ impl App {
                 .is_some_and(|time| time.elapsed() > Duration::from_millis(500))
         {
             self.preferences_dirty = None;
-            self.send(
-                0,
-                Command::Save(Preferences {
-                    route: self.router.current.clone(),
-                    filter: self.filter.clone(),
-                    playing_library:
-                        crate::playing_library_page::preferences::SavedPreferences::from_state(
-                            &self.playing_library,
-                        ),
-                    welcome_dismissed: self.welcome_dismissed,
-                    beginner_hints_enabled: self.beginner_hints_enabled,
-                    document_roots: self.document_preferences.roots.clone(),
-                    document_associations: self.document_preferences.associations.clone(),
-                    document_reading: self.document_preferences.reading.clone(),
-                    simple_shell: self.simple.enabled,
-                    classic_view: !self.simple.enabled,
-                    ui_scale: self.simple.ui_scale,
-                }),
-            );
+            self.send(0, Command::Save(self.saved_preferences()));
         }
         if self.activity.active() > 0
             || self.artwork.active() > 0

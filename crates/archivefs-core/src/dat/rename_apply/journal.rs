@@ -51,7 +51,7 @@ pub fn legacy_rename_transaction_dir() -> Result<PathBuf, ArchiveFsError> {
 /// so tests can exercise the no-home case without racing on the environment.
 pub fn rename_transaction_dir_in(home: Option<OsString>) -> Result<PathBuf, ArchiveFsError> {
     let home = home.ok_or_else(|| ArchiveFsError::Config("HOME is not set".to_string()))?;
-    Ok(crate::app_dirs::data_dir_in(Path::new(&home)).join(RENAME_TRANSACTIONS_DIRECTORY))
+    Ok(crate::app_dirs::data_dir_in(Path::new(&home))?.join(RENAME_TRANSACTIONS_DIRECTORY))
 }
 
 /// Per journal folder and transaction id: how many operations in this process
@@ -358,6 +358,10 @@ fn check_finalise_transition(path: &Path, next: &RenameTransaction) -> Result<()
     }
 }
 
+/// Refusal for a journal folder that is not an absolute path: a relative
+/// (or empty) one would be resolved against the working directory.
+pub const JOURNAL_DIR_UNAVAILABLE: &str = "EmuWiz could not find its data folder, so no Undo journal can be written and nothing was changed. Open Setup to see why (for example, two existing setups were found) and choose one first.";
+
 /// Writes (or rewrites) a transaction journal through owned exclusive staging,
 /// file `sync_all`, atomic replacement and best-effort parent-directory sync.
 /// This is not a universal durable-commit or cross-process exclusion guarantee.
@@ -367,6 +371,9 @@ fn check_finalise_transition(path: &Path, next: &RenameTransaction) -> Result<()
 /// before the write and committed after it. A changed, missing or legacy
 /// unsealed journal is refused and left exactly as found.
 pub fn write_journal(dir: &Path, transaction: &RenameTransaction) -> Result<(), ArchiveFsError> {
+    if !dir.is_absolute() {
+        return Err(ArchiveFsError::Config(JOURNAL_DIR_UNAVAILABLE.into()));
+    }
     #[cfg(target_os = "linux")]
     if super::compact_recovery::is_enrolled(dir, &transaction.transaction_id) {
         return Err(ArchiveFsError::Config(
@@ -738,8 +745,20 @@ mod tests {
         );
     }
 
+    /// An unresolvable data folder must never turn into a journal folder
+    /// relative to the working directory.
     #[test]
-    fn journal_directory_reuses_legacy_and_prefers_emuwiz() {
+    fn a_relative_or_empty_journal_folder_is_refused_and_nothing_is_created() {
+        let transaction = transaction(TransactionState::Planned);
+        for dir in [Path::new(""), Path::new(RENAME_TRANSACTIONS_DIRECTORY)] {
+            let error = write_journal(dir, &transaction).unwrap_err().to_string();
+            assert!(error.contains(JOURNAL_DIR_UNAVAILABLE), "{error}");
+        }
+        assert!(!Path::new(RENAME_TRANSACTIONS_DIRECTORY).exists());
+    }
+
+    #[test]
+    fn journal_directory_follows_the_data_directory_contract() {
         let home = tempfile::tempdir().unwrap();
         let legacy = home.path().join(".local/share/archivefs");
         std::fs::create_dir_all(&legacy).unwrap();
@@ -749,12 +768,25 @@ mod tests {
             legacy.join(RENAME_TRANSACTIONS_DIRECTORY)
         );
 
+        // An empty EmuWiz data directory never moves journals away from the
+        // existing legacy install.
         let primary = home.path().join(".local/share/emuwiz");
         std::fs::create_dir_all(&primary).unwrap();
         assert_eq!(
-            rename_transaction_dir_in(home_arg).unwrap(),
+            rename_transaction_dir_in(home_arg.clone()).unwrap(),
+            legacy.join(RENAME_TRANSACTIONS_DIRECTORY)
+        );
+
+        // Once the EmuWiz directory holds the library, it is preferred.
+        std::fs::write(primary.join("library.sqlite3"), b"db").unwrap();
+        assert_eq!(
+            rename_transaction_dir_in(home_arg.clone()).unwrap(),
             primary.join(RENAME_TRANSACTIONS_DIRECTORY)
         );
+
+        // Both holding a library is ambiguous: no journal folder is chosen.
+        std::fs::write(legacy.join("library.sqlite3"), b"db").unwrap();
+        assert!(rename_transaction_dir_in(home_arg).is_err());
     }
 
     /// Upgrading an install whose pre-seal journal folder holds an interrupted

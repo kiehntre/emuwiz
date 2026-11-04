@@ -764,3 +764,32 @@ fn scanning_with_no_source_folder_shows_a_plain_error() {
     assert!(state.error().unwrap().contains("source folder"));
     assert!(state.report().is_none());
 }
+
+/// When the data folder cannot be resolved (for example two existing
+/// setups), the page has no journal folder: scanning says why and never
+/// creates a journal folder relative to the working directory.
+#[test]
+fn an_unresolvable_journal_folder_is_refused_and_nothing_is_created_in_the_cwd() {
+    let fixture = Fixture::new();
+    let source = fixture.path("source");
+    std::fs::create_dir_all(&source).unwrap();
+    std::fs::write(source.join("a.bin"), b"same").unwrap();
+    std::fs::write(source.join("b.bin"), b"same").unwrap();
+    let mut state = ExactDuplicateReviewPageState::with_journal_dir(PathBuf::new());
+    state.source_root_draft = source.display().to_string();
+    state.scan();
+    assert_eq!(
+        state.recovery_error.as_deref(),
+        Some(archivefs_core::dat::rename_apply::journal::JOURNAL_DIR_UNAVAILABLE)
+    );
+    assert!(state.recovery.is_none());
+    assert!(
+        !std::path::Path::new(archivefs_core::dat::rename_apply::RENAME_TRANSACTIONS_DIRECTORY)
+            .exists()
+    );
+    assert_eq!(
+        journal_dir_refusal(std::path::Path::new("relative")).as_deref(),
+        Some(archivefs_core::dat::rename_apply::journal::JOURNAL_DIR_UNAVAILABLE)
+    );
+    assert!(journal_dir_refusal(&fixture.path("journal")).is_none());
+}

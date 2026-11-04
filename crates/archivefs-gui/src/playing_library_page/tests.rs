@@ -3059,3 +3059,48 @@ fn receipt_view_shows_the_journal_based_outcome_badge() {
     assert!(undone.contains("Undone"), "{undone}");
     assert!(!undone.contains("Undo available"), "{undone}");
 }
+
+/// When the data folder cannot be resolved (for example two existing
+/// setups), Apply is refused before anything is created: no destination
+/// folder and no journal folder relative to the working directory.
+#[test]
+fn an_unresolvable_journal_folder_refuses_apply_before_creating_anything() {
+    let fixture = Fixture::new("unresolvable-journal");
+    let source = fixture.path("source");
+    std::fs::create_dir_all(&source).unwrap();
+    std::fs::write(source.join("europe.bin"), b"test").unwrap();
+    let dat = write_dat(
+        &fixture,
+        "one.dat",
+        &format!(
+            r#"<datafile><header><name>One</name></header>
+<game name="Sonic (Europe)"><rom name="europe.bin" size="4" sha1="{SHA1_TEST}"/></game>
+</datafile>"#
+        ),
+    );
+    let mut state = base_state(&fixture);
+    state.journal_dir = PathBuf::new();
+    state.dat_path_draft = dat.display().to_string();
+    state.source_root_draft = source.display().to_string();
+    let destination = fixture.path("playing");
+    state.destination_root_draft = destination.display().to_string();
+    state.preview();
+    assert!(
+        state.plan().is_some(),
+        "preview itself needs no journal folder"
+    );
+    state.request_apply();
+    confirm_library(&mut state);
+    assert_eq!(
+        state.apply_error.as_deref(),
+        Some(archivefs_core::dat::rename_apply::journal::JOURNAL_DIR_UNAVAILABLE)
+    );
+    assert!(
+        !destination.exists(),
+        "nothing may be created before the refusal"
+    );
+    assert!(
+        !std::path::Path::new(archivefs_core::dat::rename_apply::RENAME_TRANSACTIONS_DIRECTORY)
+            .exists()
+    );
+}

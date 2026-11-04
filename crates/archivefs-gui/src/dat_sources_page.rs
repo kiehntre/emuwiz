@@ -3299,6 +3299,10 @@ pub(crate) struct DatSourcesPageState {
     review_decisions: BTreeMap<String, ReviewDecision>,
     /// The durable transaction journal directory.
     transaction_dir: PathBuf,
+    /// Set when the data folder (and so the journal folder) could not be
+    /// resolved, for example two existing setups. Every journal read or write
+    /// on this page then refuses with this text; there is no fallback folder.
+    journal_dir_unavailable: Option<String>,
     /// The transaction built at review time, awaiting confirmation.
     apply_review: Option<archivefs_core::dat::rename_apply::RenameTransaction>,
     /// The approved source paths the review was built from.
@@ -3360,13 +3364,32 @@ impl DatSourcesPageState {
         library_folders: Vec<PathBuf>,
         trusted: TrustedRoots,
     ) -> Self {
-        let transaction_dir = archivefs_core::dat::rename_apply::default_rename_transaction_dir()
-            .unwrap_or_else(|_| std::env::temp_dir().join("archivefs-rename-transactions"));
+        Self::load_with_journal_resolver(
+            config_path,
+            library_folders,
+            trusted,
+            archivefs_core::dat::rename_apply::default_rename_transaction_dir,
+        )
+    }
+
+    /// [`Self::load`] with only the journal-folder resolver injected, so a
+    /// test can drive the production load path with a resolver that fails
+    /// (for example two existing setups) without touching the process
+    /// environment. Everything else is exactly what `load` does.
+    fn load_with_journal_resolver<E: std::fmt::Display>(
+        config_path: PathBuf,
+        library_folders: Vec<PathBuf>,
+        trusted: TrustedRoots,
+        resolve_journal_dir: impl FnOnce() -> Result<PathBuf, E>,
+    ) -> Self {
+        // No fallback folder (it used to be the shared temp folder): when the
+        // data folder cannot be resolved the page refuses every journal action.
+        let transaction_dir = resolve_journal_dir().map_err(|error| error.to_string());
         let managed_config_path = default_managed_dat_sources_config_path()
             .unwrap_or_else(|_| config_path.with_file_name("managed_dat_sources.toml"));
         let managed_root =
             managed_dat_root().unwrap_or_else(|_| config_path.with_file_name("managed-dats"));
-        let mut state = Self::load_with_transaction_dir_and_managed_paths(
+        let mut state = Self::load_with_resolved_transaction_dir(
             config_path,
             library_folders,
             trusted,
@@ -3423,6 +3446,36 @@ impl DatSourcesPageState {
         managed_config_path: PathBuf,
         managed_root: PathBuf,
     ) -> Self {
+        Self::load_with_resolved_transaction_dir(
+            config_path,
+            library_folders,
+            trusted,
+            Ok(transaction_dir),
+            managed_config_path,
+            managed_root,
+        )
+    }
+
+    /// The constructor every load goes through. `Err` (the data folder could
+    /// not be resolved) reads no journal folder at all and makes every
+    /// journal action refuse; see `journal_dir_unavailable`.
+    fn load_with_resolved_transaction_dir(
+        config_path: PathBuf,
+        library_folders: Vec<PathBuf>,
+        trusted: TrustedRoots,
+        transaction_dir: Result<PathBuf, String>,
+        managed_config_path: PathBuf,
+        managed_root: PathBuf,
+    ) -> Self {
+        let (transaction_dir, journal_dir_unavailable) = match transaction_dir {
+            Ok(dir) => (dir, None),
+            Err(_) => (
+                PathBuf::new(),
+                Some(
+                    archivefs_core::dat::rename_apply::journal::JOURNAL_DIR_UNAVAILABLE.to_string(),
+                ),
+            ),
+        };
         let mut load_error = None;
         let mut load_problems = Vec::new();
         let mut saved_revision = None;
@@ -3466,13 +3519,20 @@ impl DatSourcesPageState {
         // already-running page, so a transaction rediscovered after a
         // restart can never disagree with one the page had open the whole
         // time - see `load_reconciled_recovery_transactions`.
-        let mut recovery_transactions =
-            Self::load_reconciled_recovery_transactions(&transaction_dir);
-        let (recovery_archive_state, recovery_archive_error) =
+        let mut recovery_transactions = if journal_dir_unavailable.is_some() {
+            Vec::new()
+        } else {
+            Self::load_reconciled_recovery_transactions(&transaction_dir)
+        };
+        let (recovery_archive_state, recovery_archive_error) = if journal_dir_unavailable.is_some()
+        {
+            (RecoveryHistoryState::default(), None)
+        } else {
             match load_recovery_history_state(&transaction_dir) {
                 Ok(state) => (state, None),
                 Err(error) => (RecoveryHistoryState::default(), Some(error)),
-            };
+            }
+        };
         recovery_transactions.retain(|transaction| {
             !recovery_archive_state
                 .archived_transaction_ids
@@ -3543,6 +3603,7 @@ impl DatSourcesPageState {
             identity_enrichment: None,
             review_decisions: BTreeMap::new(),
             transaction_dir,
+            journal_dir_unavailable,
             apply_review: None,
             apply_approved: std::collections::BTreeSet::new(),
             apply_outcome: None,
@@ -3817,6 +3878,9 @@ impl DatSourcesPageState {
     /// reflect what actually happened. A settled `Applied` transaction is
     /// listed as-is, eligible for rollback.
     fn refresh_recovery(&mut self) {
+        if self.journal_dir_unavailable.is_some() {
+            return;
+        }
         match load_recovery_history_state(&self.transaction_dir) {
             Ok(state) => {
                 self.recovery_archive_state = state;
@@ -3867,6 +3931,10 @@ impl DatSourcesPageState {
     }
 
     fn archive_stale_recovery(&mut self, ids: &[String]) {
+        if let Some(refusal) = &self.journal_dir_unavailable {
+            self.recovery_archive_error = Some(refusal.clone());
+            return;
+        }
         if self.recovery_archive_error.is_some() {
             return;
         }
@@ -4685,6 +4753,10 @@ impl DatSourcesPageState {
         if self.apply_job.is_some() || self.resume_running {
             return;
         }
+        if let Some(refusal) = &self.journal_dir_unavailable {
+            self.apply_error = Some(refusal.clone());
+            return;
+        }
         let Some(review) = self.apply_review.as_ref() else {
             return;
         };
@@ -4748,6 +4820,10 @@ impl DatSourcesPageState {
         if self.apply_job.is_some() || self.resume_running {
             return;
         }
+        if let Some(refusal) = &self.journal_dir_unavailable {
+            self.rollback_error = Some(refusal.clone());
+            return;
+        }
         // Load the journal for this transaction id.
         let Some(path) =
             archivefs_core::dat::rename_apply::journal_path(&self.transaction_dir, &transaction_id)
@@ -4788,6 +4864,10 @@ impl DatSourcesPageState {
     /// filesystem reconciliation and mutation check immediately before work.
     fn start_exact_resume(&mut self, transaction_id: String) {
         if self.apply_job.is_some() || self.resume_running {
+            return;
+        }
+        if let Some(refusal) = &self.journal_dir_unavailable {
+            self.resume_error = Some(refusal.clone());
             return;
         }
         let Some(plan) = self.rename_plan.as_ref() else {
@@ -4848,6 +4928,10 @@ impl DatSourcesPageState {
 
     /// Handles a crash-recovery choice for an interrupted transaction.
     fn handle_recovery_choice(&mut self, id: String, choice: RecoveryChoice) {
+        if let Some(refusal) = &self.journal_dir_unavailable {
+            self.recovery_resolution_error = Some(refusal.clone());
+            return;
+        }
         match choice {
             RecoveryChoice::RollBack => self.start_rollback(id),
             RecoveryChoice::LeaveUntouched => {

@@ -9444,3 +9444,145 @@ fn canonical_blue_preview_explains_missing_evidence() {
     let output = render_canonical_preview(&page.view());
     assert!(rendered_text_contains(&output, "No DAT rename plan"));
 }
+
+/// #309: when the data folder cannot be resolved (for example two existing
+/// setups), DAT Sources has no journal folder at all. It used to fall back to
+/// `<temp>/archivefs-rename-transactions`, where Undo records would be lost on
+/// reboot. Apply and every Undo action refuse before touching a file or
+/// creating any journal, and no recovery journal is read from anywhere.
+#[test]
+fn an_unresolvable_data_folder_refuses_apply_and_undo_and_creates_no_journal() {
+    assert_unresolved_journal_folder_refuses_everything(|fixture, roms| {
+        DatSourcesPageState::load_with_resolved_transaction_dir(
+            fixture.config_path.clone(),
+            Vec::new(),
+            TrustedRoots::from_paths([roms]),
+            Err("EmuWiz found data in two places".to_string()),
+            fixture
+                .config_path
+                .with_file_name("managed_dat_sources.toml"),
+            fixture.config_path.with_file_name("managed-dats"),
+        )
+    });
+}
+
+/// The production `load()` path itself (only the resolver is injected): an
+/// unresolved data folder can never select the temp folder (the original
+/// fallback) or any other folder for DAT Sources Undo.
+#[test]
+fn load_never_falls_back_to_the_temp_folder_when_the_data_folder_is_unresolved() {
+    assert_unresolved_journal_folder_refuses_everything(|fixture, roms| {
+        let page = DatSourcesPageState::load_with_journal_resolver(
+            fixture.config_path.clone(),
+            Vec::new(),
+            TrustedRoots::from_paths([roms]),
+            || {
+                Err(archivefs_core::ArchiveFsError::Config(
+                    "EmuWiz found data in two places".into(),
+                ))
+            },
+        );
+        assert_eq!(page.transaction_dir, PathBuf::new());
+        assert!(!page.transaction_dir.starts_with(std::env::temp_dir()));
+        page
+    });
+}
+
+fn assert_unresolved_journal_folder_refuses_everything(
+    make_page: impl FnOnce(&Fixture, &Path) -> DatSourcesPageState,
+) {
+    let refusal = archivefs_core::dat::rename_apply::journal::JOURNAL_DIR_UNAVAILABLE;
+    let temp_fallback = std::env::temp_dir().join("archivefs-rename-transactions");
+    let temp_fallback_before = std::fs::read_dir(&temp_fallback)
+        .map(|entries| entries.count())
+        .ok();
+    let cwd_journal = Path::new(archivefs_core::dat::rename_apply::RENAME_TRANSACTIONS_DIRECTORY);
+    let cwd_journal_existed = cwd_journal.exists();
+
+    let fixture = Fixture::new();
+    let roms = fixture.dir("roms");
+    let source = roms.join("game0.bin");
+    std::fs::write(&source, b"fixture contents").unwrap();
+    let proposals = vec![plan_proposal(
+        source.to_str().unwrap(),
+        "game0.bin",
+        Some("Game 0 (Europe).bin"),
+        ProposalState::Suggested,
+    )];
+    let counts = RenamePlanCounts::from_proposals(&proposals);
+    let fixture_entries = |root: &Path| {
+        let mut names: Vec<_> = walk_fixture(root);
+        names.sort();
+        names
+    };
+    let mut page = make_page(&fixture, &roms);
+    assert_eq!(
+        page.journal_dir_unavailable.as_deref(),
+        Some(refusal),
+        "an unresolved data folder must leave the page with no journal folder"
+    );
+    assert!(page.recovery_transactions.is_empty());
+    page.rename_plan = Some(RenamePlan {
+        generation: 1,
+        source_id: "src".to_string(),
+        source_display_name: "Source".to_string(),
+        scan_root: roms.to_string_lossy().into_owned(),
+        platform: None,
+        platform_display: None,
+        content_policy: archivefs_core::dat::classification::ContentSelectionPolicy::AllEntries,
+        classifier_version: archivefs_core::dat::classification::CLASSIFIER_VERSION.to_string(),
+        proposals,
+        counts,
+        audited_total: counts.total,
+        verified_total: counts.total,
+        truncated: false,
+    });
+    let before = fixture_entries(&fixture.root);
+
+    approve_all(&mut page);
+    page.apply(DatSourcesPageAction::BeginApplyReview);
+    page.apply(DatSourcesPageAction::ConfirmApply {
+        typed: String::new(),
+    });
+    run_to_completion(&mut page);
+    assert_eq!(page.apply_error.as_deref(), Some(refusal));
+    assert!(page.apply_outcome.is_none());
+
+    page.apply(DatSourcesPageAction::RollbackTransaction { id: "t".into() });
+    assert_eq!(page.rollback_error.as_deref(), Some(refusal));
+    page.apply(DatSourcesPageAction::ResumeTransaction { id: "t".into() });
+    assert_eq!(page.resume_error.as_deref(), Some(refusal));
+    page.apply(DatSourcesPageAction::RecoveryChoice {
+        id: "t".into(),
+        choice: RecoveryChoice::LeaveUntouched,
+    });
+    assert_eq!(page.recovery_resolution_error.as_deref(), Some(refusal));
+    run_to_completion(&mut page);
+
+    // The source is untouched and nothing new exists anywhere.
+    assert_eq!(std::fs::read(&source).unwrap(), b"fixture contents");
+    assert!(!roms.join("Game 0 (Europe).bin").exists());
+    assert_eq!(fixture_entries(&fixture.root), before);
+    assert_eq!(
+        std::fs::read_dir(&temp_fallback)
+            .map(|entries| entries.count())
+            .ok(),
+        temp_fallback_before,
+        "nothing may be journalled into the shared temp folder"
+    );
+    assert_eq!(cwd_journal.exists(), cwd_journal_existed);
+}
+
+fn walk_fixture(root: &Path) -> Vec<PathBuf> {
+    let mut out = Vec::new();
+    if let Ok(entries) = std::fs::read_dir(root) {
+        for entry in entries.flatten() {
+            let path = entry.path();
+            out.push(path.clone());
+            if entry.file_type().is_ok_and(|kind| kind.is_dir()) {
+                out.extend(walk_fixture(&path));
+            }
+        }
+    }
+    out
+}

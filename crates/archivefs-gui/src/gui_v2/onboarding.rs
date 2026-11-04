@@ -250,6 +250,7 @@ pub(super) fn show(
                     ui.heading("Two existing setups were found");
                     ui.label("EmuWiz found both an EmuWiz setup and an older ArchiveFS setup.");
                     ui.label("Nothing will be merged automatically.");
+                    ui.label("Until one is chosen, EmuWiz does not open either library. To choose now, start EmuWiz with EMUWIZ_CONFIG_HOME or EMUWIZ_DATA_HOME set to the folder you want to keep using.");
                     ui.label("Run Upgrade Preflight before choosing which setup should remain active.");
                     if button(ui, "Review upgrade and recovery tools") { action = Some(Action::Open(Section::Advanced)); }
                     ui.collapsing("Advanced details", |ui| {
