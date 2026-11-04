@@ -360,7 +360,7 @@ fn guidance_rendering_names_the_reason_and_navigation_action() {
         },
         |ctx| {
             egui::CentralPanel::default().show(ctx, |ui| {
-                show(ui, &guidance);
+                show(ui, &guidance, Action::Audit);
             });
         },
     );
@@ -383,7 +383,15 @@ fn guidance_rendering_names_the_reason_and_navigation_action() {
         texts.iter().any(|t| t == "Verification: Not checked yet"),
         "{texts:?}"
     );
-    assert!(texts.iter().any(|t| t == "Verify this game"));
+    // The one-game check has one button, under "More for this game"; the
+    // card names it rather than repeating it.
+    assert!(!texts.iter().any(|t| t == "Verify this game"), "{texts:?}");
+    assert!(
+        texts
+            .iter()
+            .any(|t| t == "To check it, use Verify this game under More for this game."),
+        "{texts:?}"
+    );
     assert!(texts.iter().any(|t| t == "Technical details"));
     // Catalogue details stay behind the collapsed section, and a ready
     // catalogue is never presented as a verified game.
@@ -413,7 +421,7 @@ fn navigation_discards_pending_and_loaded_game_guidance() {
 }
 
 #[test]
-fn clicking_the_guidance_action_only_requests_the_existing_platform_route() {
+fn the_card_points_at_the_one_game_check_and_offers_no_second_button() {
     let context = egui::Context::default();
     let f = fixture("BBC Micro", "ssd");
     let guidance = explain(
@@ -440,7 +448,7 @@ fn clicking_the_guidance_action_only_requests_the_existing_platform_route() {
             |ctx| {
                 egui::CentralPanel::default().show(ctx, |ui| {
                     // The same show function the Game Details dispatch uses.
-                    clicked = show(ui, &guidance);
+                    clicked = show(ui, &guidance, Action::Audit);
                 });
             },
         )
@@ -448,7 +456,10 @@ fn clicking_the_guidance_action_only_requests_the_existing_platform_route() {
     let output = frame(vec![]);
     fn find(shape: &egui::Shape) -> Option<egui::Pos2> {
         match shape {
-            egui::Shape::Text(t) if t.galley.text() == "Verify this game" => {
+            egui::Shape::Text(t)
+                if t.galley.text()
+                    == "To check it, use Verify this game under More for this game." =>
+            {
                 Some(t.pos + t.galley.size() / 2.0)
             }
             egui::Shape::Vec(shapes) => shapes.iter().find_map(find),
@@ -458,7 +469,7 @@ fn clicking_the_guidance_action_only_requests_the_existing_platform_route() {
     for shape in output.shapes {
         button = button.or_else(|| find(&shape.shape));
     }
-    let position = button.expect("Verify button must be rendered");
+    let position = button.expect("the card names the one-game check");
     let _ = frame(vec![
         egui::Event::PointerMoved(position),
         egui::Event::PointerButton {
@@ -474,7 +485,9 @@ fn clicking_the_guidance_action_only_requests_the_existing_platform_route() {
         pressed: false,
         modifiers: egui::Modifiers::default(),
     }]);
-    assert!(clicked);
+    // Plain text: clicking it starts nothing and navigates nowhere.
+    assert!(!clicked);
+    assert_eq!(guidance.action, Action::Audit);
     assert_eq!(
         guidance.action.route(&f.game),
         super::super::routes::Route::GameCheck(f.game.archive.id)

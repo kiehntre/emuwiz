@@ -118,7 +118,12 @@ impl super::super::App {
                 self.open_identification_data(id, &game.platform);
                 return;
             }
-            _ => {}
+            Action::Verification(_) => {
+                // A game with no known system opens Check Games on its system
+                // list, not on a system chosen there earlier.
+                self.go_verification(action.route(&game));
+                return;
+            }
         }
         self.go(action.route(&game));
     }

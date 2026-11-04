@@ -46,22 +46,6 @@ pub(super) fn archive(id: i64, title: &str, platform: Option<&str>) -> Persisted
     }
 }
 
-/// Pins Game Details' verification card to a "Set up verification" answer, so
-/// the page never reads the real library for it and its button never shares
-/// the "Verify this game" label with the "More for this game" row.
-pub(super) fn pin_setup_guidance(app: &mut App, game: i64) {
-    use super::game_verification_guidance::{Action, Guidance};
-    app.review.verification_guidance.set_for_test(
-        game,
-        None,
-        Some(Guidance {
-            reason: "No trusted DAT configured",
-            explanation: "Fixture: no catalogue is set up.".into(),
-            action: Action::SelectDat,
-        }),
-    );
-}
-
 pub(super) fn fixture(context: &egui::Context) -> App {
     readable_style(context);
     App {
@@ -694,7 +678,7 @@ pub(super) fn text(output: &egui::FullOutput) -> Vec<String> {
     texts
 }
 
-fn text_bounds(output: &egui::FullOutput, wanted: &str) -> Vec<egui::Rect> {
+pub(super) fn text_bounds(output: &egui::FullOutput, wanted: &str) -> Vec<egui::Rect> {
     fn gather(shape: &egui::Shape, wanted: &str, output: &mut Vec<egui::Rect>) {
         match shape {
             egui::Shape::Text(text) if text.galley.text() == wanted => {
@@ -4128,7 +4112,6 @@ fn gui_v2_game_detail_exposes_contextual_actions_and_lazy_screenshots() {
     let mut app = fixture(&context);
     app.library = Arc::new(Library::new(vec![archive(1, "Example Game", Some("PS2"))]));
     app.router.current = Route::Game(1);
-    pin_setup_guidance(&mut app, 1);
     let texts = scrolled_text(&context, &mut app, [1280.0, 1200.0]);
     for label in [
         "Play",
@@ -4165,7 +4148,6 @@ fn gui_v2_game_details_lead_with_title_and_play_and_keep_reference_material_last
         Some("Saturn"),
     )]));
     app.router.current = Route::Game(1);
-    pin_setup_guidance(&mut app, 1);
     let output = frame(&context, &mut app, [1280.0, 2400.0]);
     let y = |label: &str| {
         bounds_below_chrome(&output, label)
@@ -5242,7 +5224,6 @@ fn gui_v2_game_details_keep_artwork_actions_and_metadata_together() {
     let context = egui::Context::default();
     let mut app = visual_fixture(&context);
     app.go(Route::Game(1));
-    pin_setup_guidance(&mut app, 1);
     let mut strings = text(&pump_imagery(&context, &mut app, [1280.0, 1200.0]));
     assert!(strings.iter().any(|value| value == "Verify this game"));
     assert!(strings.iter().any(|value| value == "Open Folder"));

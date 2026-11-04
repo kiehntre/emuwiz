@@ -2059,7 +2059,7 @@ impl App {
             .open(Target::of(&game), game_dat_check::load_inputs);
         match game_dat_check::show(ui, &mut self.game_dat_check, id) {
             Some(PageAction::BackToGame) => self.go(Route::Game(id)),
-            Some(PageAction::CheckWholePlatform) => self.go(
+            Some(PageAction::CheckWholePlatform) => self.go_verification(
                 super::identity_review_page::setup_verification_route(Some(&game.platform)),
             ),
             Some(PageAction::SetUpCatalogues) => self.go(Route::Section(Section::Dat)),
@@ -3290,14 +3290,9 @@ impl App {
                 .on_hover_text("Checks only this game's file against a trusted catalogue. You see a preview first; the file is not read until you confirm.")
                 .clicked()
             {
-                let route = check.route(game);
-                if route == Route::Section(Section::Check) {
-                    // No known system: Check Games opens on its system list,
-                    // not on whichever system was chosen there last.
-                    self.check_platform = None;
-                    self.verification = None;
-                }
-                self.go(route);
+                // No known system: Check Games opens on its system list, not
+                // on whichever system was chosen there last.
+                self.go_verification(check.route(game));
             }
             for (label, section) in [
                 ("Artwork, Manuals & Extras", Section::Artwork),
@@ -3658,10 +3653,15 @@ impl App {
                 .review
                 .dat_context
                 .as_ref()
-                .map(|(_, platform)| platform.as_str());
-            self.go(super::identity_review_page::setup_verification_route(
-                platform,
-            ));
+                .map(|(_, platform)| platform.to_owned());
+            let route = super::identity_review_page::setup_verification_route(platform.as_deref());
+            if platform.is_some() {
+                // Opened for one game: a game whose system is unknown sees
+                // the system list, not a system chosen there earlier.
+                self.go_verification(route);
+            } else {
+                self.go(route);
+            }
         }
         if let Some((game, platform)) = self.review.dat_context.clone() {
             egui::Frame::group(ui.style()).show(ui, |ui| {

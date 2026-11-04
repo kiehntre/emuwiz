@@ -512,3 +512,223 @@ fn a_new_file_object_after_library_load_is_not_verified() {
         );
     }
 }
+
+// --- Game Details: one Verify / Re-check action, the card states the result --
+//
+// Each case renders the real Game Details page for the fixture game, with the
+// verification card holding the answer its worker computes from this fixture
+// (`panel`, `explain`): real database, real DAT, real scan. The answer is
+// handed in rather than left to the worker only because the worker reads the
+// default (real) profile.
+
+mod one_action_in_game_details {
+    use super::*;
+    use crate::gui_v2::App;
+    use crate::gui_v2::library::Library;
+    use crate::gui_v2::routes::Section;
+    use crate::gui_v2::tests::{fixture, frame, text, text_bounds};
+    use eframe::egui;
+    use std::sync::Arc;
+
+    const SIZE: [f32; 2] = [1280.0, 2400.0];
+
+    fn details(context: &egui::Context, library: Library, id: i64, card: Guidance) -> App {
+        let mut app = fixture(context);
+        app.simple.enabled = true;
+        app.library = Arc::new(library);
+        app.loaded = true;
+        app.router.current = Route::Game(id);
+        app.review
+            .verification_guidance
+            .set_for_test(id, None, Some(card));
+        app
+    }
+
+    fn shown(context: &egui::Context, app: &mut App) -> Vec<String> {
+        frame(context, app, SIZE);
+        text(&frame(context, app, SIZE))
+    }
+
+    fn count(strings: &[String], wanted: &str) -> usize {
+        strings.iter().filter(|line| *line == wanted).count()
+    }
+
+    fn click(context: &egui::Context, app: &mut App, label: &str) {
+        context.style_mut(|style| style.animation_time = 0.0);
+        let layout = frame(context, app, SIZE);
+        let point = text_bounds(&layout, label)
+            .into_iter()
+            .find(|rect| rect.min.y > 64.0)
+            .unwrap_or_else(|| panic!("{label} not on screen: {:?}", text(&layout)))
+            .center();
+        for pressed in [true, false] {
+            let _ = context.run(
+                egui::RawInput {
+                    screen_rect: Some(egui::Rect::from_min_size(
+                        egui::Pos2::ZERO,
+                        egui::vec2(SIZE[0], SIZE[1]),
+                    )),
+                    events: vec![
+                        egui::Event::PointerMoved(point),
+                        egui::Event::PointerButton {
+                            pos: point,
+                            button: egui::PointerButton::Primary,
+                            pressed,
+                            modifiers: egui::Modifiers::NONE,
+                        },
+                    ],
+                    ..Default::default()
+                },
+                |context| app.show(context),
+            );
+        }
+    }
+
+    /// Registered and scanned, never checked: a ready catalogue, no result.
+    fn scanned() -> VerifiedGame {
+        let f = VerifiedGame::unregistered(RomState::Normal);
+        f.register_source();
+        f.scan();
+        f
+    }
+
+    /// The card's answer when no catalogue at all is installed.
+    fn panel_without_catalogues(game: &Game) -> Guidance {
+        let (metadata, unchanged) = file_state(game);
+        explain(
+            game,
+            metadata.is_some(),
+            unchanged,
+            0,
+            freshness(game, false),
+            Ok(&[]),
+            None,
+        )
+    }
+
+    #[test]
+    fn a_ready_catalogue_offers_one_verify_this_game_which_opens_the_one_game_check() {
+        let f = scanned();
+        let game = game(&f);
+        let card = panel(&f, &game);
+        assert_eq!(card.action, Action::Audit, "{card:?}");
+        let context = egui::Context::default();
+        let mut app = details(&context, f.library(), game.archive.id, card);
+        let strings = shown(&context, &mut app);
+        assert_eq!(count(&strings, "Verify this game"), 1, "{strings:?}");
+        assert_eq!(count(&strings, "Re-check this game"), 0);
+        assert!(
+            strings
+                .iter()
+                .any(|line| line == "To check it, use Verify this game under More for this game."),
+            "{strings:?}"
+        );
+        assert!(
+            strings
+                .iter()
+                .any(|line| line == "Verification: Not checked yet")
+        );
+        assert!(!strings.iter().any(|line| line == "Verification: Verified"));
+        // Bound already, so painting the check page reads no real inventory.
+        app.game_dat_check.target = Some(Target::of(&game));
+        click(&context, &mut app, "Verify this game");
+        assert_eq!(app.router.current, Route::GameCheck(game.archive.id));
+    }
+
+    #[test]
+    fn a_previously_checked_game_offers_one_re_check_and_keeps_its_saved_result() {
+        let f = VerifiedGame::new();
+        let game = game(&f);
+        let card = panel(&f, &game);
+        assert_eq!(card.reason, "Verified", "{card:?}");
+        let context = egui::Context::default();
+        let mut app = details(&context, f.library(), game.archive.id, card);
+        let strings = shown(&context, &mut app);
+        assert_eq!(count(&strings, "Re-check this game"), 1, "{strings:?}");
+        assert_eq!(count(&strings, "Verify this game"), 0);
+        assert!(strings.iter().any(|line| line == "Verification: Verified"));
+        // The card's own action is the saved result, not another check.
+        assert!(
+            strings
+                .iter()
+                .any(|line| line == "View verification result")
+        );
+
+        // A legacy saved row: the card asks for a re-check and points at the
+        // one button instead of repeating it.
+        strip_proof(&f);
+        let legacy = super::game(&f);
+        let card = panel(&f, &legacy);
+        assert_eq!(card.action, Action::Recheck, "{card:?}");
+        let mut app = details(&context, f.library(), legacy.archive.id, card);
+        let strings = shown(&context, &mut app);
+        assert_eq!(count(&strings, "Re-check this game"), 1, "{strings:?}");
+        assert!(!strings.iter().any(|line| line == "Verification: Verified"));
+        assert!(strings.iter().any(|line| line
+            == "To check it, use Re-check this game under More for this game."));
+        app.game_dat_check.target = Some(Target::of(&legacy));
+        click(&context, &mut app, "Re-check this game");
+        assert_eq!(app.router.current, Route::GameCheck(legacy.archive.id));
+    }
+
+    #[test]
+    fn a_missing_catalogue_keeps_set_up_verification_beside_the_one_check() {
+        let f = scanned();
+        let game = game(&f);
+        let card = panel_without_catalogues(&game);
+        assert_eq!(card.action, Action::SelectDat, "{card:?}");
+        let context = egui::Context::default();
+        let mut app = details(&context, f.library(), game.archive.id, card);
+        let strings = shown(&context, &mut app);
+        assert_eq!(count(&strings, "Set up verification"), 1, "{strings:?}");
+        assert_eq!(count(&strings, "Verify this game"), 1, "{strings:?}");
+        assert!(
+            strings
+                .iter()
+                .any(|line| line == "Verification: Needs setup")
+        );
+        assert!(!strings.iter().any(|line| line == "Verification: Verified"));
+        click(&context, &mut app, "Set up verification");
+        assert_eq!(app.router.current, Route::PlatformCheck("SNES".into()));
+    }
+
+    #[test]
+    fn every_route_for_an_unknown_system_clears_a_stale_system_first() {
+        let f = scanned();
+        let mut archive = game(&f).archive;
+        archive.platform = None;
+        archive.platform_source = None;
+        let library = Library::new(vec![archive]);
+        let game = library.games[0].clone();
+        assert!(archivefs_core::canonical_platform_for_alias(&game.platform).is_none());
+        // The real catalogue is installed for SNES; this game's system is unknown.
+        let (metadata, unchanged) = file_state(&game);
+        let catalogues = list_installed_catalogues(inputs(&f).inventory.inputs());
+        let card = explain(
+            &game,
+            metadata.is_some(),
+            unchanged,
+            0,
+            freshness(&game, false),
+            Ok(&catalogues),
+            None,
+        );
+        assert_eq!(card.action, Action::SelectDat, "{card:?}");
+        let context = egui::Context::default();
+        let id = game.archive.id;
+        for label in ["Set up verification", "Verify this game"] {
+            let mut app = details(&context, library.clone(), id, card.clone());
+            let strings = shown(&context, &mut app);
+            assert_eq!(count(&strings, label), 1, "{label}: {strings:?}");
+            app.check_platform = Some("SNES".into());
+            click(&context, &mut app, label);
+            assert_eq!(
+                app.router.current,
+                Route::Section(Section::Check),
+                "{label}"
+            );
+            assert_eq!(app.check_platform, None, "{label}");
+            assert!(app.verification_job.is_none(), "{label}");
+        }
+    }
+}
