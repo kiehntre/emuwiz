@@ -332,6 +332,7 @@ impl App {
         if self.show_big_picture(context) {
             return;
         }
+        self.drive_pad_shell(context);
         let modal_open = self.confirm_scan
             || self.setup_actions.confirm.is_some()
             || self.repair_confirm

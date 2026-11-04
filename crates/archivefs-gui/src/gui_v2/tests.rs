@@ -62,6 +62,7 @@ pub(super) fn fixture(context: &egui::Context) -> App {
         filter_generation: 0,
         filter_inflight: false,
         big_picture: None,
+        pad_shell: None,
         filter_dirty: None,
         detail: None,
         detail_pending: None,
@@ -11920,6 +11921,8 @@ mod nkit_gui;
 mod big_picture_journey;
 #[path = "tests/launch_focus.rs"]
 mod launch_focus;
+#[path = "tests/pad_shell.rs"]
+mod pad_shell_journey;
 
 #[cfg(target_os = "linux")]
 #[path = "tests/large_library_performance.rs"]
