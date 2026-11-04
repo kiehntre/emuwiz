@@ -341,3 +341,110 @@ fn a_dat_proven_disk_in_an_incomplete_name_group_keeps_both_claims_apart() {
     assert!(text.contains("Play uses this disk only"), "{text}");
     assert!(!text.contains("Play stays unavailable"), "{text}");
 }
+
+#[test]
+fn a_dat_proven_disk_with_an_unavailable_sibling_keeps_its_play_claim() {
+    use crate::multidisc_launch_view::{MultiDiscLaunchContext, guidance, sets_from, tests};
+    let root = tests::temp_root("amiga-proven-unavailable");
+    let paths: Vec<PathBuf> = ["Game (Disk 1 of 2).adf", "Game (Disk 2 of 2).adf"]
+        .iter()
+        .map(|name| root.join(name))
+        .collect();
+    for path in &paths {
+        std::fs::write(path, [0u8; 16]).unwrap();
+    }
+    let archives = tests::catalogue_archives(&paths);
+    let sets = sets_from(&[], &archives);
+    let context = MultiDiscLaunchContext::for_content(&sets, &paths[0], &archives).unwrap();
+    // The sibling disappears after the library scan.
+    std::fs::remove_file(&paths[1]).unwrap();
+    let guidance = guidance(&context.sets[0], &paths[0], None);
+    assert_eq!(guidance.problems.len(), 1, "{guidance:?}");
+    assert!(guidance.missing_media.is_empty(), "{guidance:?}");
+
+    let mut proven = facts(vec![fsuae("A500", AmigaKickstartState::PresentUnverified)]);
+    proven.adf_identity = Some(Ok("Game (1990)(Publisher)".into()));
+    let grouped = assess_amiga_game(
+        AmigaCdMachine::OrdinaryAmiga,
+        &paths[0],
+        false,
+        disk_facts(Some(&guidance)),
+        Some(&proven),
+    );
+    let alone = assess_amiga_game(
+        AmigaCdMachine::OrdinaryAmiga,
+        &paths[0],
+        false,
+        None,
+        Some(&proven),
+    );
+    assert_eq!(
+        grouped.check(AmigaCheckKind::Disks).map(|row| row.state),
+        Some(AmigaCheckState::Warning)
+    );
+    assert_eq!(
+        grouped.check(AmigaCheckKind::Play),
+        alone.check(AmigaCheckKind::Play)
+    );
+    let (text, _) = rendered(&grouped);
+    assert!(text.contains("1 disk file that is not available"), "{text}");
+    assert!(text.contains("complete single-disk game"), "{text}");
+    assert!(!text.contains("Play stays unavailable"), "{text}");
+
+    // Without DAT proof the unavailable sibling still blocks the card.
+    let unproven = assess_amiga_game(
+        AmigaCdMachine::OrdinaryAmiga,
+        &paths[0],
+        false,
+        disk_facts(Some(&guidance)),
+        Some(&facts(vec![fsuae(
+            "A500",
+            AmigaKickstartState::PresentUnverified,
+        )])),
+    );
+    assert_eq!(
+        unproven.check(AmigaCheckKind::Disks).map(|row| row.state),
+        Some(AmigaCheckState::Blocked)
+    );
+}
+
+#[test]
+fn a_verified_disk_set_never_promises_disk_swapping() {
+    let guidance = DiscGuidance {
+        headline: "2-disk game · order verified".into(),
+        order_verified: true,
+        discs: (1..=2)
+            .map(|n| DiscRow {
+                label: format!("Disk {n}"),
+                path: Some(PathBuf::from(format!("d{n}.adf"))),
+                this_entry: n == 1,
+                start: n == 1,
+            })
+            .collect(),
+        next_discs: vec!["Disk 2".into()],
+        missing_media: Vec::new(),
+        conflicts: Vec::new(),
+        provenance: Vec::new(),
+        selected_launch_disc: None,
+        problems: Vec::new(),
+        launch: None,
+    };
+    let readiness = assess_amiga_game(
+        AmigaCdMachine::OrdinaryAmiga,
+        Path::new("d1.adf"),
+        false,
+        disk_facts(Some(&guidance)),
+        Some(&facts(vec![fsuae(
+            "A500",
+            AmigaKickstartState::PresentUnverified,
+        )])),
+    );
+    let (text, _) = rendered(&readiness);
+    assert!(!text.contains("F12"), "{text}");
+    assert!(!text.to_lowercase().contains("change disks"), "{text}");
+    assert!(
+        text.contains("does not start multi-disk Amiga games"),
+        "{text}"
+    );
+    assert!(!readiness.launch_route_exists);
+}

@@ -217,7 +217,18 @@ fn incomplete_or_unverified_disk_sets_are_reported_honestly() {
     );
     let row = readiness.check(K::Disks).unwrap();
     assert_eq!(row.state, Ready);
-    assert!(row.detail.contains("does not swap disks"));
+    // Only what launch really does: no disk list, no swap instructions.
+    assert!(
+        row.detail.contains("does not start multi-disk Amiga games"),
+        "{row:?}"
+    );
+    assert!(row.detail.contains("no list of the other disks"), "{row:?}");
+    assert!(!row.detail.contains("F12"), "{row:?}");
+    assert!(
+        !row.detail.to_lowercase().contains("change disks"),
+        "{row:?}"
+    );
+    assert_eq!(state(&readiness, K::Play), Blocked);
     // A verified set is still not a launch route for direct floppies.
     assert!(!readiness.launch_route_exists);
 
@@ -289,6 +300,47 @@ fn incomplete_or_unverified_disk_sets_are_reported_honestly() {
     assert!(row.detail.contains("complete single-disk game"), "{row:?}");
     assert_eq!(state(&readiness, K::Play), state(&without, K::Play));
     assert_eq!(readiness.launch_route_exists, without.launch_route_exists);
+    // An unavailable sibling is also about the grouping: the DAT-proven disk
+    // keeps its Play claim, and the row names both facts.
+    for (problems, missing) in [(1, 0), (1, 1)] {
+        let sibling = AmigaDiskSetFacts {
+            count: 2,
+            order_verified: false,
+            problems,
+            missing,
+        };
+        let readiness = assess_amiga_game(
+            AMIGA,
+            Path::new("Game (Disk 1 of 3).adf"),
+            false,
+            Some(sibling),
+            Some(&verified_env),
+        );
+        let row = readiness.check(K::Disks).unwrap();
+        assert_eq!(row.state, Warning, "{row:?}");
+        assert!(
+            row.detail.contains("1 disk file that is not available"),
+            "{row:?}"
+        );
+        assert!(row.detail.contains("complete single-disk game"), "{row:?}");
+        assert_eq!(
+            missing == 1,
+            row.detail.contains("1 more disk is missing"),
+            "{row:?}"
+        );
+        assert_eq!(state(&readiness, K::Play), state(&without, K::Play));
+        assert_eq!(readiness.launch_route_exists, without.launch_route_exists);
+        // Without DAT proof an unavailable sibling still blocks.
+        let readiness = assess_amiga_game(
+            AMIGA,
+            Path::new("Game (Disk 1 of 3).adf"),
+            false,
+            Some(sibling),
+            Some(&env(vec![profile(AmigaEmulatorKind::FsUae, Some("A500"))])),
+        );
+        assert_eq!(state(&readiness, K::Disks), Blocked);
+        assert_eq!(state(&readiness, K::Play), Blocked);
+    }
     // Without DAT proof the same grouping still blocks.
     let readiness = assess_amiga_game(
         AMIGA,

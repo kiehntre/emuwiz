@@ -500,24 +500,36 @@ pub fn assess_amiga_game(
             Some(Ok(_))
         );
     if let Some(disks) = disks.filter(|disks| disks.count > 1 || disks.missing > 0) {
-        // The gap is a claim about the proposed grouping, not about this
-        // disk: when the DAT proves this ADF is a whole game, say both and let
-        // Play rest on that proof (FS-UAE launches only this disk).
-        let (state, detail) = if disks.missing > 0 && dat_single_disk {
+        // Gaps and unavailable siblings are claims about the proposed
+        // grouping, not about this disk: when the DAT proves this ADF is a
+        // whole game, say both and let Play rest on that proof (FS-UAE
+        // launches only this disk).
+        let (state, detail) = if dat_single_disk && (disks.missing > 0 || disks.problems > 0) {
+            let mut grouping = Vec::new();
+            if disks.missing > 0 {
+                grouping.push(if disks.missing == 1 {
+                    "suggest 1 more disk is missing".to_string()
+                } else {
+                    format!("suggest {} more disks are missing", disks.missing)
+                });
+            }
+            if disks.problems > 0 {
+                grouping.push(if disks.problems == 1 {
+                    "name 1 disk file that is not available".to_string()
+                } else {
+                    format!("name {} disk files that are not available", disks.problems)
+                });
+            }
             (
                 Warning,
                 format!(
-                    "File names {} {} missing, but this disk's DAT hash match is a complete single-disk game. Play uses this disk only.",
+                    "File names {}{}, but this disk's DAT hash match is a complete single-disk game. Play uses this disk only.",
                     if disks.count > 1 {
-                        "group this disk with others and suggest"
+                        "group this disk with others and "
                     } else {
-                        "suggest"
+                        ""
                     },
-                    if disks.missing == 1 {
-                        "1 more disk is".to_string()
-                    } else {
-                        format!("{} more disks are", disks.missing)
-                    }
+                    grouping.join(" and ")
                 ),
             )
         } else if disks.missing > 0 {
@@ -545,7 +557,7 @@ pub fn assess_amiga_game(
             (
                 Ready,
                 format!(
-                    "{} disks, order verified. Change disks from the emulator's own menu (F12 in FS-UAE and Amiberry); EmuWiz does not swap disks for you.",
+                    "{} disks, order verified. Blue does not start multi-disk Amiga games: its FS-UAE launch inserts one disk and gives the emulator no list of the other disks.",
                     disks.count
                 ),
             )
