@@ -712,13 +712,15 @@ pub(crate) fn show_screen_scraper_settings(
         });
         ui.horizontal(|ui| {
             ui.label("Developer password");
-            edited |= ui
-                .add(
+            {
+                let response = ui.add(
                     egui::TextEdit::singleline(&mut state.developer_password)
                         .password(true)
                         .desired_width(220.0),
-                )
-                .changed();
+                );
+                crate::gui_v2::mark_secret(&response);
+                edited |= response.changed();
+            }
         });
         ui.horizontal(|ui| {
             ui.label("User ID (optional)");
@@ -728,13 +730,15 @@ pub(crate) fn show_screen_scraper_settings(
         });
         ui.horizontal(|ui| {
             ui.label("User password (optional)");
-            edited |= ui
-                .add(
+            {
+                let response = ui.add(
                     egui::TextEdit::singleline(&mut state.user_password)
                         .password(true)
                         .desired_width(220.0),
-                )
-                .changed();
+                );
+                crate::gui_v2::mark_secret(&response);
+                edited |= response.changed();
+            }
         });
         if edited {
             state.unsaved_edits = true;
