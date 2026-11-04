@@ -197,6 +197,8 @@ fn a_missing_catalogue_is_explained_and_links_dat_management() {
         "No ready catalogue covers SNES. Set one up first; nothing has been checked.",
         MISSING_CATALOGUE_HELP,
         "Set up verification",
+        "Choose a catalogue for SNES",
+        game_dat_check::NOT_NEEDED_TO_PLAY,
     ] {
         assert!(painted.contains(wanted), "{wanted}: {painted}");
     }
