@@ -73,6 +73,39 @@ fn y_button_moves_to_the_next_section_and_start_opens_big_picture() {
 }
 
 #[test]
+fn x_and_y_walk_every_destination_both_ways_including_tools() {
+    let context = egui::Context::default();
+    let mut app = app(&context);
+    app.simple.enabled = true;
+    let _ = frame(&context, &mut app, SIZE);
+    let mut seen = Vec::new();
+    for _ in 0..DESTINATIONS.len() {
+        press(&context, &mut app, Control::Button(Button::North));
+        seen.push(if app.simple.all_tools_open() {
+            Some(Destination::Tools)
+        } else {
+            super::simple_shell::destination_for(&app.router.current)
+        });
+    }
+    let expected: Vec<_> = DESTINATIONS[1..]
+        .iter()
+        .chain(&DESTINATIONS[..1])
+        .map(|d| Some(*d))
+        .collect();
+    assert_eq!(
+        seen, expected,
+        "Y visits all eight, Tools included, and wraps"
+    );
+    press(&context, &mut app, Control::Button(Button::West));
+    assert_eq!(
+        super::simple_shell::destination_for(&app.router.current),
+        Some(Destination::Settings),
+        "X goes back"
+    );
+    assert!(!app.simple.all_tools_open());
+}
+
+#[test]
 fn unfocused_window_ignores_the_controller() {
     let context = egui::Context::default();
     let mut app = app(&context);
