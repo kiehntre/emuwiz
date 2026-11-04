@@ -874,7 +874,10 @@ impl App {
         self.start_artwork_index("Refreshing metadata and artwork");
     }
     fn start_artwork_index(&mut self, label: &str) {
-        if self.artwork.index_loading {
+        // A stopped index worker cannot restart: it was asked once and said
+        // so, and asking again on every frame would only clear pictures and
+        // add an activity entry each time.
+        if self.artwork.index_loading || self.artwork.index_unavailable() {
             return;
         }
         self.artwork.reload(self.library.clone());
@@ -882,6 +885,14 @@ impl App {
             .activity
             .queue(label, Route::Section(Section::Artwork), false);
         self.activity.start(id);
+        if self.artwork.index_unavailable() {
+            self.activity.finish(
+                id,
+                "Artwork discovery has stopped. Restart EmuWiz to show pictures again.".into(),
+                Some("The artwork index worker is no longer running.".into()),
+            );
+            return;
+        }
         self.index_job = Some(id);
     }
     fn go(&mut self, route: Route) {
