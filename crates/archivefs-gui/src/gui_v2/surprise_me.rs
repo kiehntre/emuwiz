@@ -6,10 +6,10 @@
 //! Play, where the usual launch-readiness check and Play button take over.
 //!
 //! The cover uses the shared `picture_tile` pipeline, exactly as Browse & Play
-//! does, so showing it can write to the thumbnail cache: a resized copy of
-//! local artwork, and, only with the optional Online artwork setting on, a
-//! RomM cover fetched because it was not cached yet. The pipeline's routine
-//! thumbnail-cache trim may also run.
+//! does, so showing it can write to local caches: a resized copy of local
+//! artwork in the thumbnail cache (whose routine trim may also run), a repair
+//! of a corrupt RomM artwork-cache entry, and, only with the optional Online
+//! artwork setting on, a RomM cover fetched into the RomM artwork cache.
 
 use super::{
     App,
