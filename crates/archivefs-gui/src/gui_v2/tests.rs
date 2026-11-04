@@ -11904,6 +11904,8 @@ mod ppsspp_profile_resolution {
 #[path = "tests/save_vault.rs"]
 mod blue_save_vault;
 
+#[path = "tests/card_restore.rs"]
+mod blue_card_restore;
 #[path = "tests/save_snapshots.rs"]
 mod blue_save_snapshots;
 
