@@ -197,6 +197,13 @@ pub fn verify_mame_repair(request: &MamePostRepairVerificationRequest) -> MameRe
     result.bad_dump_present = !result.remaining_bad_dependencies.is_empty();
     result.no_dump_present = request.no_dump_present;
 
+    if !safe_shortname(&request.identity.machine_shortname) {
+        result
+            .issues
+            .push(MameRepairVerificationIssue::SetShortnameChanged);
+        result.state = MameRepairVerificationState::StaleEvidence;
+        return result;
+    }
     let Some(executable) = request.executable.as_deref() else {
         result.targeted_mame = Some(unavailable_targeted(request));
         result.state = MameRepairVerificationState::VerificationUnavailable;
@@ -293,12 +300,16 @@ fn run_targeted_mame(
         .iter()
         .map(|arg| arg.to_string_lossy().into_owned())
         .collect::<Vec<_>>();
-    let mut child = match Command::new(executable)
-        .args(&args)
-        .stdin(Stdio::null())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn()
+    // Own process group, so a deadline or exit can also reach any helper the
+    // program started; otherwise a helper holding the pipes would block us.
+    let mut child = match std::os::unix::process::CommandExt::process_group(
+        Command::new(executable).args(&args),
+        0,
+    )
+    .stdin(Stdio::null())
+    .stdout(Stdio::piped())
+    .stderr(Stdio::piped())
+    .spawn()
     {
         Ok(child) => child,
         Err(_) => {
@@ -327,6 +338,9 @@ fn run_targeted_mame(
             Err(_) => break None,
         }
     };
+    // Whatever happened, nothing the program started may outlive the check.
+    // SAFETY: the group id is our own just-spawned child's pid (process_group(0)).
+    unsafe { libc::kill(-(child.id() as i32), libc::SIGKILL) };
     let mut output = stdout_thread.join().unwrap_or_default();
     output.extend(stderr_thread.join().unwrap_or_default());
     let output = String::from_utf8_lossy(&output)
@@ -343,8 +357,7 @@ fn run_targeted_mame(
     };
     let lower = output.to_ascii_lowercase();
     let set = identity.machine_shortname.to_ascii_lowercase();
-    let good = lower.contains(&format!("romset {set} is good"))
-        || lower.contains(&format!("romset {set} is ok"));
+    let good = reports_set_good(&lower, &set);
     let state = if status.success() && good {
         MameTargetedVerificationState::Passed
     } else if lower.contains("no dump") || lower.contains("nodump") {
@@ -364,6 +377,28 @@ fn run_targeted_mame(
         exit_code: status.code(),
         bounded_output: output,
     }
+}
+
+/// MAME prints `romset NAME is good`, or `romset NAME [PARENT] is good` for a clone.
+fn reports_set_good(lower_output: &str, set: &str) -> bool {
+    let prefix = format!("romset {set} ");
+    lower_output.lines().any(|line| {
+        let line = line.trim();
+        line.strip_prefix(&prefix).is_some_and(|rest| {
+            let rest = match rest.strip_prefix('[') {
+                Some(after) => after.split_once("] ").map_or("", |(_, r)| r),
+                None => rest,
+            };
+            rest == "is good" || rest == "is ok"
+        })
+    })
+}
+
+/// A shortname is passed to MAME as one argument; it must be a plain name.
+fn safe_shortname(name: &str) -> bool {
+    !name.is_empty()
+        && name.len() <= 64
+        && name.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'_')
 }
 
 fn bounded_read(reader: impl Read) -> Vec<u8> {
@@ -747,6 +782,51 @@ mod tests {
         assert_eq!(
             nodump_result.state,
             MameRepairVerificationState::VerificationUnavailable
+        );
+    }
+
+    #[test]
+    fn clone_output_and_unsafe_names_are_handled() {
+        assert!(reports_set_good(
+            "romset pacman [puckman] is good\n",
+            "pacman"
+        ));
+        assert!(reports_set_good("x\nromset pacman is ok\n", "pacman"));
+        assert!(!reports_set_good(
+            "romset pacman [puckman] is bad\n",
+            "pacman"
+        ));
+        assert!(!reports_set_good("romset pacmanx is good\n", "pacman"));
+        assert!(!reports_set_good(
+            "romset other [pacman] is good\n",
+            "pacman"
+        ));
+        for bad in ["-all", "pac*", "a b", "", "../x"] {
+            assert!(!safe_shortname(bad), "{bad}");
+        }
+        assert!(safe_shortname("pacman_2"));
+        let dir = tempdir().unwrap();
+        let mut request = request(dir.path(), None);
+        request.identity.machine_shortname = "-all".into();
+        request.current_machine_shortname = "-all".into();
+        let result = verify_mame_repair(&request);
+        assert_eq!(result.state, MameRepairVerificationState::StaleEvidence);
+        assert!(result.targeted_mame.is_none());
+    }
+
+    #[test]
+    fn a_helper_holding_the_pipes_cannot_outlive_the_deadline() {
+        let dir = tempdir().unwrap();
+        let executable = dir.path().join("helper-mame");
+        executable_fixture(&executable, "sleep 30 &\nexec sleep 30\n");
+        let mut request = request(dir.path(), Some(executable));
+        request.timeout = Duration::from_millis(300);
+        let started = Instant::now();
+        let result = verify_mame_repair(&request);
+        assert!(started.elapsed() < Duration::from_secs(10));
+        assert_eq!(
+            result.targeted_mame.as_ref().unwrap().state,
+            MameTargetedVerificationState::Timeout
         );
     }
 }

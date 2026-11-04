@@ -8,11 +8,17 @@ use archivefs_core::{
     },
     mame_collection_analyser::inspection::SourceStamp,
     mame_internal_repair::{
-        MameInternalRepairPlan, MameInternalRepairRequest, build_mame_internal_repair_plan,
+        MameInternalRepairPlan, MameInternalRepairRequest, MameRepairDisposition,
+        build_mame_internal_repair_plan,
     },
     mame_internal_repair_apply::{
-        MameInternalRepairApplyOptions, MameInternalRepairApplyPlan, MameRepairOperationState,
-        apply_mame_internal_repair_plan, plan_mame_internal_repair_apply,
+        MameInternalRepairApplyOptions, MameInternalRepairApplyPlan, MameInternalRepairApplyResult,
+        MameRepairOperationState, apply_mame_internal_repair_plan, plan_mame_internal_repair_apply,
+        verify_mame_internal_repair_after_apply,
+    },
+    mame_post_repair::{
+        MAME_VERIFY_TIMEOUT, MamePostRepairVerificationRequest, MameRepairVerification,
+        MameRepairVerificationState, MameSetIdentityReceipt, MameTargetedVerificationState,
     },
     safe_read::{TrustedRoots, open_bounded_read},
 };
@@ -33,6 +39,129 @@ pub(super) struct Reviewed {
     plan: MameInternalRepairPlan,
     apply: MameInternalRepairApplyPlan,
     digest: String,
+    /// Identity and dependency evidence captured while the repair was planned,
+    /// one entry per set the transaction writes to.
+    verification_basis: Vec<SetBasis>,
+}
+
+/// What the plan knew about one set before any file changed. The post-repair
+/// check compares against this, never against evidence gathered afterwards.
+#[derive(Clone, Debug)]
+pub(super) struct SetBasis {
+    set: String,
+    identity: MameSetIdentityReceipt,
+    missing_dependencies: Vec<String>,
+    bad_dump_dependencies: Vec<String>,
+    no_dump_present: bool,
+}
+
+/// At most this many sets are checked with MAME per Apply, so the background
+/// work stays bounded (each check has its own timeout). The rest are reported
+/// as not checked.
+const MAX_MAME_CHECKS: usize = 16;
+
+/// One set's typed MAME verification result.
+#[derive(Clone, Debug)]
+pub(super) struct SetVerification {
+    pub(super) verification: MameRepairVerification,
+}
+
+struct Outcome {
+    notice: String,
+    verifications: Vec<SetVerification>,
+}
+
+fn dependency_basis(
+    report: &Report,
+    plan: &MameInternalRepairPlan,
+    apply: &MameInternalRepairApplyPlan,
+    digest: &str,
+) -> Vec<SetBasis> {
+    let captured = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |d| d.as_secs());
+    let mut sets: Vec<&String> = apply
+        .operations
+        .iter()
+        .filter(|o| o.state == MameRepairOperationState::Planned)
+        .map(|o| &o.affected_set)
+        .collect();
+    sets.sort();
+    sets.dedup();
+    sets.into_iter()
+        .map(|set| {
+            let mut missing = Vec::new();
+            let mut bad = Vec::new();
+            let mut no_dump = false;
+            let mut topology = Sha256::new();
+            for r in plan.requirements.iter().filter(|r| &r.affected_set == set) {
+                topology.update(serde_json::to_vec(&r.relationship).unwrap_or_default());
+                let satisfied = apply.operations.iter().any(|o| {
+                    &o.affected_set == set
+                        && o.destination_member == r.expected_destination_member
+                        && matches!(
+                            o.state,
+                            MameRepairOperationState::Planned
+                                | MameRepairOperationState::AlreadySatisfied
+                        )
+                });
+                match r.disposition {
+                    MameRepairDisposition::NoDump => no_dump = true,
+                    MameRepairDisposition::PresentButBadDump => {
+                        bad.push(r.required_filename.clone())
+                    }
+                    _ if !satisfied => missing.push(r.required_filename.clone()),
+                    _ => {}
+                }
+            }
+            let topology: String = topology
+                .finalize()
+                .iter()
+                .map(|b| format!("{b:02x}"))
+                .collect();
+            let context = report.context.get(set);
+            SetBasis {
+                set: set.clone(),
+                identity: MameSetIdentityReceipt::new(
+                    report.catalogue.sha256.clone(),
+                    plan.catalogue_version.clone(),
+                    set.clone(),
+                    context.and_then(|c| c.clone_of.clone().or_else(|| c.rom_of.clone())),
+                    plan.collection_root.clone(),
+                    digest.to_string(),
+                    topology,
+                    captured,
+                ),
+                missing_dependencies: missing,
+                bad_dump_dependencies: bad,
+                no_dump_present: no_dump,
+            }
+        })
+        .collect()
+}
+
+/// Plain wording for each typed state. A pass is a ROM-file verification only.
+pub(super) fn describe(v: &MameRepairVerification) -> String {
+    use MameRepairVerificationState as S;
+    let detail = match v.state {
+        S::VerifiedComplete => "MAME's ROM verification reports this set as good. That checks ROM files only; it does not show the game starts, plays, or is fully compatible.".to_string(),
+        S::VerifiedBestAvailable => "MAME's ROM verification finished, but the set contains NO_DUMP material that no copy can complete. This is the best available state, not a full verification.".to_string(),
+        S::StillIncomplete => "MAME's ROM verification still reports missing files for this set, so the repair did not complete it.".to_string(),
+        S::NeedsRedump => "MAME's ROM verification reports a BAD_DUMP in this set. It needs a better dump; the copied files do not fix that.".to_string(),
+        S::VerificationFailed => {
+            let how = match v.targeted_mame.as_ref().map(|t| t.state) {
+                Some(MameTargetedVerificationState::Unavailable) => "MAME could not be started, so its ROM verification did not run",
+                Some(MameTargetedVerificationState::Timeout) => "MAME did not finish in time and was stopped",
+                Some(MameTargetedVerificationState::NonZeroExit) => "MAME exited with an error",
+                Some(MameTargetedVerificationState::UnexpectedOutput) => "MAME's output was not recognised",
+                _ => "MAME's ROM verification did not pass",
+            };
+            format!("{how}. The set is not shown to verify.")
+        }
+        S::VerificationUnavailable => "MAME's ROM verification was not run: no MAME executable is configured or it could not be started. Set one under Emulator Setup to check this.".to_string(),
+        S::StaleEvidence => "MAME's ROM verification was not run because the evidence changed since this repair was reviewed (catalogue, destination files, or transaction). Inspect the collection again.".to_string(),
+    };
+    format!("{} · {:?}: {detail}", v.identity.machine_shortname, v.state)
 }
 
 pub(super) fn prepare(
@@ -141,6 +270,7 @@ pub(super) fn prepare(
             digest.clone().into(),
         );
     }
+    let verification_basis = dependency_basis(report, &plan, &apply, &digest);
     Ok(Reviewed {
         request,
         catalogue_digest: report.catalogue.sha256.clone(),
@@ -148,6 +278,7 @@ pub(super) fn prepare(
         plan,
         apply,
         digest,
+        verification_basis,
     })
 }
 
@@ -180,11 +311,78 @@ fn prove_source(
     Ok(())
 }
 
+/// MAME settings for the post-repair check. `executable` is only ever a path the
+/// user configured; nothing is discovered or downloaded.
+struct MameCheck {
+    executable: Option<std::path::PathBuf>,
+    timeout: std::time::Duration,
+}
+
+#[cfg(test)]
 fn execute(
     reviewed: &Reviewed,
     options: &MameInternalRepairApplyOptions,
     progress: &mut dyn FnMut(&str),
 ) -> Result<String, String> {
+    let check = MameCheck {
+        executable: None,
+        timeout: MAME_VERIFY_TIMEOUT,
+    };
+    execute_checked(reviewed, options, &check, progress).map(|o| o.notice)
+}
+
+/// One set's check: Core's post-Apply verifier, fed the identity captured at
+/// planning time and the evidence just re-read. Only this set's own
+/// destinations are compared and hashed.
+fn verify_set(
+    basis: &SetBasis,
+    apply: &MameInternalRepairApplyPlan,
+    result: &MameInternalRepairApplyResult,
+    current: (&str, &MameInternalRepairPlan),
+    check: &MameCheck,
+) -> MameRepairVerification {
+    let mut for_set = result.clone();
+    for_set
+        .operations
+        .retain(|operation| operation.affected_set == basis.set);
+    let request = MamePostRepairVerificationRequest {
+        identity: basis.identity.clone(),
+        transaction_id: String::new(),
+        repair_plan_digest: String::new(),
+        expected_destinations: Vec::new(),
+        current_catalogue_sha256: current.0.to_string(),
+        current_catalogue_version: current.1.catalogue_version.clone(),
+        current_machine_shortname: basis.set.clone(),
+        current_arcade_root: current.1.collection_root.clone(),
+        executable: check.executable.clone(),
+        timeout: check.timeout,
+        missing_dependencies: basis.missing_dependencies.clone(),
+        bad_dump_dependencies: basis.bad_dump_dependencies.clone(),
+        no_dump_present: basis.no_dump_present,
+    };
+    verify_mame_internal_repair_after_apply(apply, &for_set, request)
+}
+
+/// The configured MAME is used only if it is an absolute path to a regular,
+/// executable file that is not a symlink (the same rule as the MAME launch
+/// preflight). Anything else is treated as "no MAME"; nothing is searched for.
+fn validated_executable(path: Option<&std::path::Path>) -> Option<std::path::PathBuf> {
+    use std::os::unix::fs::PermissionsExt;
+    let path = path?;
+    let metadata = std::fs::symlink_metadata(path).ok()?;
+    (path.is_absolute()
+        && !metadata.file_type().is_symlink()
+        && metadata.is_file()
+        && metadata.permissions().mode() & 0o111 != 0)
+        .then(|| path.to_path_buf())
+}
+
+fn execute_checked(
+    reviewed: &Reviewed,
+    options: &MameInternalRepairApplyOptions,
+    check: &MameCheck,
+    progress: &mut dyn FnMut(&str),
+) -> Result<Outcome, String> {
     progress("Revalidating selected catalogue and every collection source; no files changed yet");
     let cancel = AtomicBool::new(false);
     let fresh = worker::run(reviewed.request.clone(), &cancel, &mut |_| {})?;
@@ -216,30 +414,79 @@ fn execute(
         "Applying verified copies through the shared transaction journal; completion is not yet established",
     );
     let result = apply_mame_internal_repair_plan(&mut apply, options, &cancel)?;
-    let tx = result.outcome.transaction;
+    let tx = result.outcome.transaction.clone();
     let failures = tx
         .entries
         .iter()
         .filter_map(|e| e.failure_reason.as_deref())
         .collect::<Vec<_>>()
         .join("; ");
-    Ok(if tx.state == TransactionState::Applied {
-        format!(
-            "Applied transaction {}: {} copied file(s), destination hashes verified. MAME verification and runnability were not assessed. Reinspect collection for current health. Open History & Undo for the journal and Undo.",
-            tx.transaction_id,
-            tx.entries.len()
-        )
+    if tx.state != TransactionState::Applied {
+        // No MAME process is started for a transaction that did not complete.
+        return Ok(Outcome {
+            notice: format!(
+                "Transaction {} ended {:?}. Successful Apply is not established. No MAME check was run. Open History & Undo and review recovery before retrying. {failures}",
+                tx.transaction_id, tx.state
+            ),
+            verifications: Vec::new(),
+        });
+    }
+    progress(
+        "Applied. Copied files are hash-checked; now asking MAME to verify the repaired sets (ROM verification only)",
+    );
+    let check = &MameCheck {
+        executable: validated_executable(check.executable.as_deref()),
+        timeout: check.timeout,
+    };
+    // The catalogue is re-observed after the copy: if the file changed since it
+    // was read, the identity no longer matches and MAME is not run.
+    let current_catalogue = if fresh.catalogue.source.still_matches() {
+        candidate.catalogue_digest.clone()
     } else {
-        format!(
-            "Transaction {} ended {:?}. Successful Apply is not established. Open History & Undo and review recovery before retrying. {failures}",
-            tx.transaction_id, tx.state
-        )
+        "catalogue changed after review".to_string()
+    };
+    let mut verifications = Vec::new();
+    let mut unchecked_sets = Vec::new();
+    for (index, basis) in reviewed.verification_basis.iter().enumerate() {
+        if index >= MAX_MAME_CHECKS {
+            unchecked_sets.push(basis.set.clone());
+            continue;
+        }
+        verifications.push(SetVerification {
+            verification: verify_set(
+                basis,
+                &apply,
+                &result,
+                (&current_catalogue, &candidate.plan),
+                check,
+            ),
+        });
+    }
+    let passed = verifications
+        .iter()
+        .filter(|v| v.verification.state == MameRepairVerificationState::VerifiedComplete)
+        .count();
+    let mut notice = format!(
+        "Applied transaction {}: {} copied file(s), destination file hashes verified. That proves the copies, not MAME's view of the sets. MAME ROM verification: {passed} of {} set(s) verified complete; see each result below. A MAME pass checks ROM files only, not that a game plays. Reinspect collection for current health. Open History & Undo for the journal and Undo.",
+        tx.transaction_id,
+        tx.entries.len(),
+        reviewed.verification_basis.len()
+    );
+    if !unchecked_sets.is_empty() {
+        notice.push_str(&format!(
+            " {} further set(s) were not checked with MAME (limit {MAX_MAME_CHECKS} per Apply).",
+            unchecked_sets.len()
+        ));
+    }
+    Ok(Outcome {
+        notice,
+        verifications,
     })
 }
 
 enum Message {
     Stage(String),
-    Finished(Result<String, String>),
+    Finished(Result<Outcome, String>),
 }
 #[derive(Default)]
 pub(super) struct State {
@@ -250,6 +497,10 @@ pub(super) struct State {
     confirmation_digest: String,
     pub(super) notice: Option<String>,
     pub(super) open_history: bool,
+    /// Typed MAME results of the last Apply, shown beneath the notice.
+    pub(super) verifications: Vec<SetVerification>,
+    #[cfg(test)]
+    mame_check: Option<(Option<std::path::PathBuf>, std::time::Duration)>,
 }
 impl State {
     pub(super) fn busy(&self) -> bool {
@@ -263,7 +514,18 @@ impl State {
             match rx.try_recv() {
                 Ok(Message::Stage(s)) => self.notice = Some(s),
                 Ok(Message::Finished(result)) => {
-                    self.notice = Some(result.unwrap_or_else(|e| format!("Apply stopped or refused: {e}. Review History & Undo for any journal and recovery details before retrying.")));
+                    match result {
+                        Ok(outcome) => {
+                            self.notice = Some(outcome.notice);
+                            self.verifications = outcome.verifications;
+                        }
+                        Err(e) => {
+                            self.verifications.clear();
+                            self.notice = Some(format!(
+                                "Apply stopped or refused: {e}. Review History & Undo for any journal and recovery details before retrying."
+                            ));
+                        }
+                    }
                     self.receiver = None;
                     return true;
                 }
@@ -281,6 +543,7 @@ impl State {
             return;
         }
         self.confirmation.clear();
+        self.verifications.clear();
         let (sender, receiver) = mpsc::channel();
         self.receiver = Some(receiver);
         self.notice = Some("Starting repair evidence revalidation…".into());
@@ -290,8 +553,24 @@ impl State {
             journal_dir: self.journal_dir.clone(),
             ..options
         };
+        let check = MameCheck {
+            executable: crate::emulator_setup_overrides::EmulatorPathOverrides::load()
+                .mame_executable,
+            timeout: MAME_VERIFY_TIMEOUT,
+        };
+        #[cfg(test)]
+        let check = match self.mame_check.clone() {
+            Some((executable, timeout)) => MameCheck {
+                executable,
+                timeout,
+            },
+            None => MameCheck {
+                executable: None,
+                ..check
+            },
+        };
         std::thread::spawn(move || {
-            let result = execute(&reviewed, &options, &mut |s| {
+            let result = execute_checked(&reviewed, &options, &check, &mut |s| {
                 let _ = sender.send(Message::Stage(s.into()));
             });
             let _ = sender.send(Message::Finished(result));
@@ -303,6 +582,9 @@ impl State {
         ui.strong("Internal repair from exact local bytes");
         if let Some(notice) = &self.notice {
             ui.label(notice);
+        }
+        for item in &self.verifications {
+            ui.label(describe(&item.verification));
         }
         if self.busy() {
             ui.spinner();
