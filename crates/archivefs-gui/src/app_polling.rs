@@ -15,6 +15,12 @@ use crate::{
 };
 
 pub(crate) fn poll_and_reconcile(app: &mut ArchiveFsApp, context: &egui::Context) {
+    // First in every frame of both GUIs and before any launch state is
+    // polled, so a launch started from any page (Details, Gamer View, Big
+    // Picture, cheats) is seen as starting and uses up a one-time choice.
+    app.emulator_readiness
+        .launch_choices
+        .observe_launches(app.launch_retroarch.is_active() || app.launch_dolphin.is_active());
     crate::emulator_setup::zx_snapshot::poll(context);
     #[cfg(target_os = "linux")]
     app.emulator_readiness

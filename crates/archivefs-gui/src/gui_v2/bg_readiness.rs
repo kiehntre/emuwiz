@@ -110,7 +110,12 @@ impl EnvSnapshot {
         format!("{:?}", state.emulator_setup_overrides).hash(&mut hasher);
         format!("{:?}", state.xenia_profiles).hash(&mut hasher);
         format!("{:?}", state.remembered_emulator_profiles).hash(&mut hasher);
-        format!("{:?}", state.launch_choices).hash(&mut hasher);
+        // Only what changes a plan; the launch-observation flag does not.
+        format!(
+            "{:?}{:?}",
+            state.launch_choices.preferences, state.launch_choices.once
+        )
+        .hash(&mut hasher);
         match &state.dolphin_local_profiles {
             DolphinLocalProfilesState::Ready(r) => format!("{:?}", r.discovery).hash(&mut hasher),
             DolphinLocalProfilesState::Error(_) => 1u8.hash(&mut hasher),

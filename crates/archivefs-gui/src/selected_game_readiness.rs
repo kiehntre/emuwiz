@@ -386,9 +386,6 @@ impl ArchiveFsApp {
             .xroar_cassette
             .show(ui, self.archive_context.focused.as_deref());
         let launch_readiness_input = self.build_launch_readiness_input(live_for_launch_readiness);
-        self.emulator_readiness
-            .launch_choices
-            .observe_launches(self.launch_retroarch.is_active() || self.launch_dolphin.is_active());
         if self.launch_retroarch.poll() || self.launch_retroarch.is_active() {
             ui.ctx().request_repaint();
         }
