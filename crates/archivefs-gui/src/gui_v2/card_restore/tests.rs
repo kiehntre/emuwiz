@@ -452,3 +452,68 @@ fn preview_reads_one_private_verified_copy_and_leaves_only_the_psu() {
     assert!(prepare_restore(&snapshot, &world.location, &folder(), &world.dirs, 2).is_err());
     assert_eq!(World::files_in(&world.dirs.psu_dir), 0);
 }
+
+fn rewrite_journal(
+    path: &Path,
+    edit: impl FnOnce(&mut archivefs_core::memory_card_inventory::restore_guard::Ps2RestoreJournal),
+) {
+    let mut journal = load_ps2_restore_journal(path).unwrap();
+    edit(&mut journal);
+    let body = serde_json::to_vec_pretty(&journal).unwrap();
+    let mut bytes = format!(
+        "EMUWIZ-PS2-RESTORE-JOURNAL v1 sha256={}\n",
+        sha256_hex(&body)
+    )
+    .into_bytes();
+    bytes.extend_from_slice(&body);
+    fs::write(path, bytes).unwrap();
+}
+
+#[test]
+fn a_parked_record_blocks_only_its_own_physical_card() {
+    let world = World::new();
+    let snapshot = world.snapshot();
+    world.play();
+    let first = prepare_restore(&snapshot, &world.location, &folder(), &world.dirs, 1).unwrap();
+    let done = apply_restore(&first.plan, &CLOSED, &world.options).unwrap();
+    // Park it (terminal: the Save Vault keeps it for manual review), named
+    // through a symlink alias of the same card.
+    let alias = world.card.with_file_name("alias.ps2");
+    std::os::unix::fs::symlink(&world.card, &alias).unwrap();
+    rewrite_journal(&done.journal_path, |journal| {
+        journal.phase = Ps2RestorePhase::NeedsAttention;
+        journal.card_path = alias.clone();
+    });
+    let blocked = |world: &World, token| {
+        let preview =
+            prepare_restore(&snapshot, &world.location, &folder(), &world.dirs, token).unwrap();
+        let card = world.card_bytes();
+        let result = apply_restore(&preview.plan, &CLOSED, &world.options);
+        if result.is_err() {
+            assert_eq!(world.card_bytes(), card);
+        }
+        result.is_err()
+    };
+    assert!(blocked(&world, 2), "symlink alias of this card blocks");
+
+    // Same physical file under a path that no longer resolves: matched by
+    // the recorded file identity.
+    rewrite_journal(&done.journal_path, |journal| {
+        journal.card_path = world.card.with_file_name("gone/Mcd001.ps2");
+    });
+    assert!(blocked(&world, 3), "file identity of this card blocks");
+
+    // A parked record for a different card does not block this one.
+    let other = world.card.with_file_name("Mcd002.ps2");
+    fs::write(&other, ps2_inventory_fixture()).unwrap();
+    rewrite_journal(&done.journal_path, |journal| {
+        journal.card_path = other.clone();
+        journal.original_identity.inode = u64::MAX;
+        journal.post_identity = None;
+        journal.undo_identity = None;
+    });
+    assert!(
+        !blocked(&world, 4),
+        "another card's parked record does not block"
+    );
+}

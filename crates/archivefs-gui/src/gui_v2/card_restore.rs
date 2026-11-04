@@ -461,17 +461,53 @@ pub(super) fn apply_restore(
     if !records.is_complete() {
         return Err("EmuWiz could not read every earlier restore record, so it will not change the card. Open the Save Vault and refresh its restore records. Nothing was changed.".into());
     }
-    // Any unfinished or unreadable record blocks: it may name this card
-    // under another path spelling (symlink, Flatpak or canonical path).
-    if records
-        .records
-        .iter()
-        .any(|record| record.error.is_some() || record.needs_recovery || record.needs_attention)
-    {
+    // In-flight records (recoverable by the Save Vault) and unreadable ones
+    // (card unknown) block every card. A parked record that needs manual
+    // review is terminal, so it blocks only the physical card it concerns,
+    // matched by resolved path or recorded file identity so another path
+    // spelling (symlink, Flatpak) cannot slip past.
+    if records.records.iter().any(|record| {
+        record.error.is_some()
+            || record.needs_recovery
+            || (record.needs_attention && concerns_card(record, &plan.source_card_path))
+    }) {
         return Err("An earlier memory card restore was interrupted or needs review. Open the Save Vault and use Check interrupted restores first. Nothing was changed.".into());
     }
     apply_ps2_psu_restore_guarded(plan, observer, options)
         .map_err(|error| psu_restore_error_message(&error))
+}
+
+/// Whether a restore record concerns the physical card at `card`. Anything
+/// that cannot be established counts as "yes".
+fn concerns_card(
+    record: &archivefs_core::memory_card_inventory::restore_guard::Ps2RestoreJournalSummary,
+    card: &Path,
+) -> bool {
+    use std::os::unix::fs::MetadataExt;
+    let Ok(journal) =
+        archivefs_core::memory_card_inventory::restore_guard::load_ps2_restore_journal(
+            &record.path,
+        )
+    else {
+        return true;
+    };
+    let Ok(live) = fs::metadata(card) else {
+        return true;
+    };
+    let same_path = journal.card_path == card
+        || matches!(
+            (fs::canonicalize(&journal.card_path), fs::canonicalize(card)),
+            (Ok(a), Ok(b)) if a == b
+        );
+    let same_file = [
+        Some(journal.original_identity),
+        journal.post_identity,
+        journal.undo_identity,
+    ]
+    .into_iter()
+    .flatten()
+    .any(|identity| identity.device == live.dev() && identity.inode == live.ino());
+    same_path || same_file
 }
 
 /// Worker: Core's guarded Undo, bound to the restore journal.
