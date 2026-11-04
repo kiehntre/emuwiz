@@ -16,6 +16,7 @@ impl RepairHistoryPageState {
         }
         let mut placeholder = Self::empty(self.journal_dir.clone());
         placeholder.background_ui = true;
+        placeholder.journal_dir_unavailable = self.journal_dir_unavailable.clone();
         let mut working = std::mem::replace(self, placeholder);
         working.background_ui = false;
         let (sender, receiver) = std::sync::mpsc::channel();

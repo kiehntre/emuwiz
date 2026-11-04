@@ -3374,8 +3374,10 @@ impl DatSourcesPageState {
 
     /// [`Self::load`] with only the journal-folder resolver injected, so a
     /// test can drive the production load path with a resolver that fails
-    /// (for example two existing setups) without touching the process
-    /// environment. Everything else is exactly what `load` does.
+    /// (for example two existing setups) without setting environment
+    /// variables. Everything else is exactly what `load` does, including the
+    /// other app-folder lookups (read only; the GUI test binary runs them in
+    /// its private HOME/XDG, see `install_test_environment!`).
     fn load_with_journal_resolver<E: std::fmt::Display>(
         config_path: PathBuf,
         library_folders: Vec<PathBuf>,
@@ -3469,11 +3471,12 @@ impl DatSourcesPageState {
     ) -> Self {
         let (transaction_dir, journal_dir_unavailable) = match transaction_dir {
             Ok(dir) => (dir, None),
-            Err(_) => (
+            Err(error) => (
                 PathBuf::new(),
-                Some(
-                    archivefs_core::dat::rename_apply::journal::JOURNAL_DIR_UNAVAILABLE.to_string(),
-                ),
+                archivefs_core::dat::rename_apply::journal::journal_dir_or_refusal::<String>(Err(
+                    error,
+                ))
+                .err(),
             ),
         };
         let mut load_error = None;
@@ -3603,11 +3606,13 @@ impl DatSourcesPageState {
             identity_enrichment: None,
             review_decisions: BTreeMap::new(),
             transaction_dir,
-            journal_dir_unavailable,
+            journal_dir_unavailable: journal_dir_unavailable.clone(),
             apply_review: None,
             apply_approved: std::collections::BTreeSet::new(),
             apply_outcome: None,
-            apply_error: None,
+            // Shown as soon as the page opens, not only when an action is
+            // refused.
+            apply_error: journal_dir_unavailable,
             subset_available: false,
             apply_running: false,
             rollback_running: false,

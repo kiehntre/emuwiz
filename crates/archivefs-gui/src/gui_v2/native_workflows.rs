@@ -1207,14 +1207,16 @@ impl NativeWorkflows {
 
     pub(super) fn show_native_repair_history(&mut self, ui: &mut egui::Ui) {
         if self.app.repair_history_page.is_none() {
-            match archivefs_core::dat::rename_apply::default_rename_transaction_dir() {
+            match archivefs_core::dat::rename_apply::journal::journal_dir_or_refusal(
+                archivefs_core::dat::rename_apply::default_rename_transaction_dir(),
+            ) {
                 Ok(path) => {
                     self.app.repair_history_page = Some(
                         crate::repair_history_page::RepairHistoryPageState::load_background(path),
                     )
                 }
-                Err(error) => {
-                    ui.label(format!("Repair History unavailable: {error}"));
+                Err(refusal) => {
+                    ui.label(format!("Repair History unavailable: {refusal}"));
                     return;
                 }
             }

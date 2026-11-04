@@ -952,6 +952,7 @@ fn details_expose_the_full_uncopied_source_and_destination_paths() {
         background_ui: false,
         io_job: None,
         io_error: None,
+        journal_dir_unavailable: None,
         reverifications: Default::default(),
         journal_dir: PathBuf::from("/tmp/unused"),
         transactions: vec![transaction.clone()],
@@ -1009,6 +1010,7 @@ fn the_copy_button_writes_the_exact_full_path_to_the_clipboard() {
         background_ui: false,
         io_job: None,
         io_error: None,
+        journal_dir_unavailable: None,
         reverifications: Default::default(),
         journal_dir: PathBuf::from("/tmp/unused"),
         transactions: vec![transaction.clone()],
@@ -1397,3 +1399,74 @@ fn hiding_settled_transactions_leaves_undo_and_clear_reachable_for_them() {
 
 #[path = "tests/native.rs"]
 mod native;
+
+/// #312: Repair History reconciles journals on load and can Undo, remove
+/// and archive them. When the data folder cannot be resolved, the
+/// production load path selects no journal folder at all (never one
+/// relative to the launch directory), reads and reconciles nothing, and
+/// every write/delete action refuses with the resolver's reason.
+#[test]
+fn an_unresolved_data_folder_never_reconciles_removes_or_undoes_any_journal() {
+    let refusal = archivefs_core::dat::rename_apply::journal::JOURNAL_DIR_UNAVAILABLE;
+    let cwd_journal = Path::new(archivefs_core::dat::rename_apply::RENAME_TRANSACTIONS_DIRECTORY);
+    let cwd_journal_existed = cwd_journal.exists();
+    let mut page = RepairHistoryPageState::load_with_journal_resolver(|| {
+        Err("EmuWiz found data in two places")
+    });
+    assert_eq!(page.journal_dir, PathBuf::new());
+    assert!(page.transactions.is_empty() && page.load_problems.is_empty());
+    let shown = page
+        .archive_state_error
+        .clone()
+        .expect("refusal shown on load");
+    assert!(
+        shown.starts_with(refusal) && shown.contains("two places"),
+        "{shown}"
+    );
+
+    // A decoy journal folder behind the page's back: were any guard missing,
+    // refresh would list it (an unparsable journal is a load problem) and
+    // clear would remove from it. The page must stay refused regardless.
+    let id = "pr312-never-a-real-transaction".to_string();
+    let decoy = tempfile::tempdir().unwrap();
+    let decoy_journal = decoy.path().join(format!("{id}.json"));
+    std::fs::write(&decoy_journal, "decoy").unwrap();
+    page.journal_dir = decoy.path().to_path_buf();
+
+    page.refresh();
+    assert!(page.transactions.is_empty() && page.load_problems.is_empty());
+
+    page.clear_confirm = Some(vec![id.clone()]);
+    page.confirm_clear();
+    let outcome = page.clear_outcome.clone().expect("a clear outcome");
+    assert_eq!(outcome.removed, 0);
+    assert!(
+        outcome
+            .failed
+            .iter()
+            .all(|reason| reason.starts_with(refusal))
+    );
+
+    page.spawn_undo(id.clone());
+    assert!(
+        page.undo_error
+            .as_deref()
+            .is_some_and(|text| text.starts_with(refusal))
+    );
+    assert!(!page.is_undo_running());
+
+    page.archive_one(&id);
+    page.archive_confirm = Some(vec![id]);
+    page.confirm_archive();
+    assert!(page.archive_outcome.is_none());
+    assert!(page.archive_state.archived_transaction_ids.is_empty());
+    assert!(
+        page.archive_state_error
+            .as_deref()
+            .is_some_and(|text| text.starts_with(refusal))
+    );
+
+    assert_eq!(std::fs::read_to_string(&decoy_journal).unwrap(), "decoy");
+    assert_eq!(std::fs::read_dir(decoy.path()).unwrap().count(), 1);
+    assert_eq!(cwd_journal.exists(), cwd_journal_existed);
+}

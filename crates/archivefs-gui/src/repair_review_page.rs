@@ -359,6 +359,21 @@ pub(crate) struct RepairApplyConfirmation {
     pub(crate) quarantine_count: usize,
 }
 
+/// The Repair Center journal folder: the test override, else the resolved
+/// data folder's, else the refusal Apply must show. Never a folder relative
+/// to the working directory.
+fn repair_journal_dir<E: std::fmt::Display>(
+    journal_dir_override: Option<PathBuf>,
+    resolve_journal_dir: impl FnOnce() -> Result<PathBuf, E>,
+) -> Result<PathBuf, String> {
+    match journal_dir_override {
+        Some(dir) => Ok(dir),
+        None => {
+            archivefs_core::dat::rename_apply::journal::journal_dir_or_refusal(resolve_journal_dir())
+        }
+    }
+}
+
 /// Why the background apply worker could not complete, with a short label a
 /// caller does not need to match on the underlying error type to show.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -549,6 +564,11 @@ pub(crate) struct RepairReviewPageState {
     /// `RepairExecutionOptions::journal_dir` the production path already
     /// threads through unchanged.
     pub(crate) journal_dir_override: Option<PathBuf>,
+    /// Test-only stand-in for the data-folder resolver [`Self::spawn_apply`]
+    /// uses when there is no override, so a test can drive the real Apply
+    /// path with a resolver that fails (for example two existing setups).
+    #[cfg(test)]
+    pub(crate) journal_resolver_for_test: Option<fn() -> Result<PathBuf, String>>,
     /// Overrides the [`AuditCacheConfig`] both [`Self::start_scan`] (a fresh
     /// whole-library scan) and [`Self::spawn_apply`] (the authoritative
     /// re-scan [`apply_saved_plan_selected`] runs) use, exactly mirroring
@@ -1044,6 +1064,16 @@ impl RepairReviewPageState {
         self.spawn_apply(plan, confirmation);
     }
 
+    /// The production data-folder resolver (or, in tests only, its stand-in).
+    fn resolve_default_journal_dir(&self) -> Result<PathBuf, String> {
+        #[cfg(test)]
+        if let Some(resolver) = self.journal_resolver_for_test {
+            return resolver();
+        }
+        archivefs_core::dat::rename_apply::journal::default_rename_transaction_dir()
+            .map_err(|error| error.to_string())
+    }
+
     /// Spawns the background apply worker. The GUI never mutates the
     /// filesystem itself: this calls [`apply_saved_plan_selected`] on a
     /// dedicated thread with the *exact* saved plan this page loaded (never
@@ -1061,12 +1091,19 @@ impl RepairReviewPageState {
         // `None` in production: resolves the exact same default journal
         // directory as before. `Some(dir)` only in tests - see
         // `journal_dir_override`'s doc.
-        let journal_dir = self.journal_dir_override.clone().unwrap_or_else(|| {
-            archivefs_core::dat::rename_apply::journal::default_rename_transaction_dir()
-                .unwrap_or_else(|_| {
-                    PathBuf::from(archivefs_core::dat::rename_apply::RENAME_TRANSACTIONS_DIRECTORY)
-                })
-        });
+        let journal_dir = match repair_journal_dir(self.journal_dir_override.clone(), || {
+            self.resolve_default_journal_dir()
+        }) {
+            Ok(dir) => dir,
+            Err(refusal) => {
+                self.apply_result = None;
+                self.apply_failure = Some(RepairApplyFailure {
+                    label: "Nothing was repaired",
+                    detail: refusal,
+                });
+                return;
+            }
+        };
         // `None` in production: resolves `AuditCacheConfig::Default`, same as
         // every other audit path. `Some(config)` only in tests - see
         // `audit_cache_override`'s doc.
