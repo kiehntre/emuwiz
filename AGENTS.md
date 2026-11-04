@@ -93,6 +93,16 @@ Keeping builds warm (a target is only reused by the same worktree path):
   (`git switch` / `git switch --detach <sha>`) instead of adding one per candidate.
 - The target is keyed by the worktree path, so it is reused across commits, rebases and
   test runs in that worktree. Do not rename or move a worktree you are still building in.
+- Incremental compilation is OFF by default (review, verification, integration and
+  short-lived worktrees) and ON only in worktrees you designate once with
+  `scripts/cargo-iso --designate-dev` (undo: `--undesignate-dev`). Order of precedence:
+  `--incremental`/`--no-incremental`, then `EMUWIZ_CARGO_INCREMENTAL=1|0`, then the
+  designation, then off. A designated worktree overrides an inherited `CARGO_INCREMENTAL=0`.
+  Measured on `archivefs-gui --lib` tests: edit-to-rebuild 97.5 s -> ~28 s, at a one-off
+  ~5 min priming build and ~3x the target size, so designate only the worktrees you build
+  in all day. `--sccache` builds a designated worktree non-incremental; `--sccache` with an
+  explicit `--incremental` is refused. `--print-target` shows the decision. CI and
+  `scripts/build-release.sh` never go through `cargo-iso` and are unaffected.
 - Debug mode is recorded per target and kept. A target with no compiler output to keep
   (new worktree, or retired with a verified receipt: `worktree-check --cargo-state-only`
   says CLEAR) builds
