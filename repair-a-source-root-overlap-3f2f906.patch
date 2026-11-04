@@ -1,0 +1,3387 @@
+From aaf3ab05e0b79f0df1b5e3624edef0304c7c7d74 Mon Sep 17 00:00:00 2001
+From: Claude <noreply@anthropic.com>
+Date: Wed, 4 Nov 2026 09:15:58 +0000
+Subject: [PATCH 1/3] Keep the mount root disjoint from source folders
+
+Night Watch D4-01, G1-01/D4-02, D4-06, G5-04: a mount root equal to,
+inside, or containing a source folder was accepted by set-mount-root,
+source add, set-master-root and config-check (which even created it
+inside the source), the scanner walked mount-root content as library
+content, and `clean` / `doctor --repair clean_mount_root` removed the
+user's empty source folders.
+
+Add one shared, symlink-resolving disjointness rule
+(ensure_mount_root_disjoint_from_sources; missing paths resolve through
+their nearest existing ancestor) and apply it when setting the mount
+root (all configured sources, enabled or not), adding a source, and
+setting the master ROM root. config-check reports an overlapping config
+as an error and no longer creates the mount root there. Cleanup
+(plan_stale_mount_directories, clean_mount_root, cleanup_selected_mount_*)
+fails closed on overlap, and the doctor repair refuses with a new
+MountRootOverlapsSource rejection. The scanner excludes a mount root
+inside a source, and live mounts when it is the source or contains it.
+
+Regressions cover equal, child, parent, symlinked source, symlinked
+mount root, a not-yet-created mount root, and disjoint controls. The
+existing cleanup_selected_mount_* fixtures modelled the now-refused
+"source inside mount root" layout; they now place the library beside
+the mount root, keeping their boundary coverage.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01BZ7RNxHiqaj6yPxf5e6w8f
+---
+ .../archivefs-core/src/diagnostics/repair.rs  |  15 ++
+ .../src/diagnostics/repair/tests.rs           | 167 ++++++++++++-
+ crates/archivefs-core/src/lib.rs              | 230 +++++++++++++++++-
+ .../src/mount_root_validation_tests.rs        | 224 +++++++++++++++++
+ 4 files changed, 625 insertions(+), 11 deletions(-)
+
+diff --git a/crates/archivefs-core/src/diagnostics/repair.rs b/crates/archivefs-core/src/diagnostics/repair.rs
+index 5170d6d..dafa1e1 100644
+--- a/crates/archivefs-core/src/diagnostics/repair.rs
++++ b/crates/archivefs-core/src/diagnostics/repair.rs
+@@ -264,6 +264,9 @@ pub enum DoctorRepairRejection {
+     ConflictingActiveMount,
+     /// The mount root is not configured or not usable.
+     MountRootUnavailable,
++    /// The mount root is a configured source folder, is inside one, or
++    /// contains one, so nothing below it can be proven to be EmuWiz's.
++    MountRootOverlapsSource,
+ }
+ 
+ impl DoctorRepairRejection {
+@@ -302,6 +305,9 @@ impl DoctorRepairRejection {
+             Self::SourceMissing => "The archive is no longer where Doctor found it.",
+             Self::ConflictingActiveMount => "Something is already mounted at that location.",
+             Self::MountRootUnavailable => "The configured mount root is missing or unusable.",
++            Self::MountRootOverlapsSource => {
++                "The configured mount root is, is inside, or contains a configured source folder, so EmuWiz refuses to clean it. Nothing was changed. Choose a separate mount root."
++            }
+         }
+     }
+ }
+@@ -624,6 +630,7 @@ impl RepairEffect {
+ fn validate_clean_mount_root(
+     context: &DoctorRepairContext<'_>,
+ ) -> Result<RepairTarget, DoctorRepairRejection> {
++    guard_mount_root_disjoint_from_sources(context.config)?;
+     if !context.config.mount_root.is_dir() {
+         return Err(DoctorRepairRejection::MountRootUnavailable);
+     }
+@@ -641,6 +648,7 @@ fn validate_clean_mount_path(
+ ) -> Result<RepairTarget, DoctorRepairRejection> {
+     let path = affected_path(finding)?;
+     guard_against_source_roots(&path, context.config)?;
++    guard_mount_root_disjoint_from_sources(context.config)?;
+     guard_inside_mount_root(&path, context.config)?;
+     guard_no_symlink_components(&path)?;
+ 
+@@ -769,6 +777,13 @@ fn guard_against_source_roots(path: &Path, config: &Config) -> Result<(), Doctor
+     Ok(())
+ }
+ 
++/// Refuses any mount-root cleanup while the mount root overlaps a configured
++/// source folder (canonical comparison; fails closed when unverifiable).
++fn guard_mount_root_disjoint_from_sources(config: &Config) -> Result<(), DoctorRepairRejection> {
++    crate::ensure_mount_root_disjoint_from_sources(&config.mount_root, &config.source_folders)
++        .map_err(|_| DoctorRepairRejection::MountRootOverlapsSource)
++}
++
+ fn guard_inside_mount_root(path: &Path, config: &Config) -> Result<(), DoctorRepairRejection> {
+     let root = &config.mount_root;
+     if path == root.as_path() || !path.starts_with(root) {
+diff --git a/crates/archivefs-core/src/diagnostics/repair/tests.rs b/crates/archivefs-core/src/diagnostics/repair/tests.rs
+index e330192..5f32aea 100644
+--- a/crates/archivefs-core/src/diagnostics/repair/tests.rs
++++ b/crates/archivefs-core/src/diagnostics/repair/tests.rs
+@@ -356,7 +356,10 @@ fn a_path_inside_a_configured_source_folder_is_always_refused() {
+     let inside = fixture.dir("roms/mnt/SNES/Old Game");
+     let before = snapshot(&fixture.root);
+ 
+-    let mut scan = scan_with_stale_directories(&config);
++    // The read-only planner itself refuses this overlapping configuration,
++    // so the finding is forged to prove the executor's own gate holds too.
++    assert!(crate::plan_stale_mount_directories(&config).is_err());
++    let mut scan = scan_with_forged_stale_directories(std::slice::from_ref(&inside));
+     if scan.finding("mount_root.stale_mount_directory").is_none() {
+         scan.findings.push(forged_clean_path_finding(&inside));
+     }
+@@ -1699,3 +1702,165 @@ fn rebuild_index_refuses_an_index_path_the_finding_did_not_name() {
+     assert!(!other.exists(), "no index was written anywhere else");
+     assert_eq!(before, snapshot(&fixture.root));
+ }
++
++// --- Mount root overlapping a source folder (Night Watch D4-01) ----------
++
++/// A doctor scan carrying a leftover-folder finding for `stale`, built without
++/// the planner (which must refuse an overlapping mount root), so the executor's
++/// own gate is what is exercised.
++fn scan_with_forged_stale_directories(stale: &[PathBuf]) -> DoctorScan {
++    let mut inputs = DoctorScanInputs::none_loaded();
++    inputs.stale_mount_directories = Gathered::Ready(stale);
++    run_doctor_scan(&inputs)
++}
++
++/// Asserts that every read-only plan, bulk cleanup and doctor repair refuses
++/// `config` and that `preserved` (empty folders the user owns inside a source)
++/// all survive with the tree byte-for-byte unchanged.
++fn assert_overlapping_mount_root_is_refused(
++    fixture: &Fixture,
++    config: &Config,
++    preserved: &[PathBuf],
++) {
++    let before = snapshot(&fixture.root);
++    let plan = crate::plan_stale_mount_directories(config);
++    assert!(
++        plan.is_err(),
++        "an overlapping mount root must not be planned for cleanup: {plan:?}"
++    );
++    let cleaned = crate::clean_mount_root(config);
++    assert!(
++        cleaned.is_err(),
++        "clean must refuse an overlapping mount root: {cleaned:?}"
++    );
++    let scan = scan_with_forged_stale_directories(preserved);
++    for dry_run in [true, false] {
++        let mut repair = request(
++            DoctorRepairAction::CleanMountRoot,
++            "mount_root.stale_mount_directories",
++        );
++        repair.dry_run = dry_run;
++        let outcome =
++            execute_doctor_repair(&repair, &context(config, &scan, &fixture.index_path()));
++        assert_eq!(
++            outcome.record.status,
++            DoctorRepairStatus::Rejected,
++            "{:?}",
++            outcome.record
++        );
++        assert!(outcome.record.changed_paths.is_empty());
++    }
++    for path in preserved {
++        assert!(path.is_dir(), "source folder removed: {}", path.display());
++    }
++    assert_eq!(before, snapshot(&fixture.root));
++}
++
++#[test]
++fn clean_and_doctor_refuse_a_mount_root_equal_to_a_source() {
++    let fixture = Fixture::new("overlap-equal");
++    let source = fixture.dir("src");
++    fixture.file("src/roms/Good.zip", b"archive bytes");
++    let config = Config {
++        source_folders: vec![source.clone()],
++        mount_root: source.clone(),
++        ratarmount_bin: "ratarmount".to_string(),
++        master_rom_root: None,
++    };
++    // The user's own empty folder at exactly the path a mount plan would use,
++    // plus an unrelated empty folder.
++    let plan_shaped = crate::ArchiveScanner::new(&config)
++        .mount_plans()
++        .expect("plans")
++        .remove(0)
++        .mount_path;
++    fs::create_dir_all(&plan_shaped).expect("plan-shaped user dir");
++    let saves = fixture.dir("src/Saves/slot1");
++    assert_overlapping_mount_root_is_refused(&fixture, &config, &[plan_shaped, saves]);
++}
++
++#[test]
++fn clean_and_doctor_refuse_a_mount_root_inside_a_source() {
++    let fixture = Fixture::new("overlap-child");
++    let source = fixture.dir("src");
++    fixture.file("src/roms/Good.zip", b"archive bytes");
++    let leftover = fixture.dir("src/mnt/Unknown/Good");
++    let config = Config {
++        source_folders: vec![source],
++        mount_root: fixture.root.join("src/mnt"),
++        ratarmount_bin: "ratarmount".to_string(),
++        master_rom_root: None,
++    };
++    assert_overlapping_mount_root_is_refused(&fixture, &config, &[leftover]);
++}
++
++#[test]
++fn clean_and_doctor_refuse_a_mount_root_containing_a_source() {
++    let fixture = Fixture::new("overlap-parent");
++    let source = fixture.dir("mnt/library");
++    let empty_in_source = fixture.dir("mnt/library/Empty Folder");
++    let config = Config {
++        source_folders: vec![source],
++        mount_root: fixture.root.join("mnt"),
++        ratarmount_bin: "ratarmount".to_string(),
++        master_rom_root: None,
++    };
++    assert_overlapping_mount_root_is_refused(&fixture, &config, &[empty_in_source]);
++}
++
++#[cfg(unix)]
++#[test]
++fn clean_and_doctor_refuse_a_mount_root_equal_to_a_symlinked_source() {
++    let fixture = Fixture::new("overlap-symlinked-source");
++    let real = fixture.dir("real-library");
++    fixture.file("real-library/roms/Good.zip", b"archive bytes");
++    let empty_in_source = fixture.dir("real-library/Saves/slot1");
++    let linked = fixture.root.join("library-link");
++    std::os::unix::fs::symlink(&real, &linked).expect("symlink");
++    // The source is configured through the link; the mount root names the
++    // real folder. Only a symlink-resolved comparison sees they are the same.
++    let config = Config {
++        source_folders: vec![linked],
++        mount_root: real,
++        ratarmount_bin: "ratarmount".to_string(),
++        master_rom_root: None,
++    };
++    assert_overlapping_mount_root_is_refused(&fixture, &config, &[empty_in_source]);
++}
++
++#[cfg(unix)]
++#[test]
++fn clean_and_doctor_refuse_a_symlinked_mount_root_resolving_into_a_source() {
++    let fixture = Fixture::new("overlap-symlinked-mount-root");
++    let source = fixture.dir("src");
++    let leftover = fixture.dir("src/mnt/Unknown/Good");
++    let linked = fixture.root.join("mnt-link");
++    std::os::unix::fs::symlink(source.join("mnt"), &linked).expect("symlink");
++    let config = Config {
++        source_folders: vec![source],
++        mount_root: linked,
++        ratarmount_bin: "ratarmount".to_string(),
++        master_rom_root: None,
++    };
++    assert_overlapping_mount_root_is_refused(&fixture, &config, &[leftover]);
++}
++
++#[test]
++fn clean_still_removes_leftovers_under_a_disjoint_mount_root() {
++    let fixture = Fixture::new("overlap-disjoint-control");
++    let config = fixture.config();
++    let planned = planned_mount_paths(&fixture, &config, &["Old Game"]);
++    let empty_in_source = fixture.dir("roms/Empty Folder");
++    let stale = crate::plan_stale_mount_directories(&config).expect("plan");
++    assert!(stale.contains(&planned[0]), "{stale:?}");
++    assert!(
++        stale
++            .iter()
++            .all(|path| !path.starts_with(&config.source_folders[0]))
++    );
++    let removed = crate::clean_mount_root(&config).expect("clean");
++    assert!(removed.contains(&planned[0]), "{removed:?}");
++    assert!(!planned[0].exists());
++    assert!(empty_in_source.is_dir());
++    assert!(config.mount_root.is_dir());
++}
+diff --git a/crates/archivefs-core/src/lib.rs b/crates/archivefs-core/src/lib.rs
+index 0d2ef76..bab2c5d 100644
+--- a/crates/archivefs-core/src/lib.rs
++++ b/crates/archivefs-core/src/lib.rs
+@@ -2157,6 +2157,19 @@ fn run_config_check_with_mount_root_creation(
+     match &fields.mount_root {
+         Some(mount_root) => {
+             report.pass("mount_root set", format!("{}", mount_root.display()));
++            // Report an overlapping legacy config instead of fixing it, and
++            // never create the mount root inside a source folder.
++            let source_paths: Vec<PathBuf> = fields
++                .source_folders
++                .iter()
++                .flatten()
++                .map(PathBuf::from)
++                .collect();
++            let overlap = ensure_mount_root_disjoint_from_sources(mount_root, &source_paths).err();
++            if let Some(error) = &overlap {
++                report.error("mount_root separate from source folders", error.to_string());
++            }
++            let create_mount_root = create_mount_root && overlap.is_none();
+             match inspect_path(mount_root) {
+                 PathInspection::Directory => {
+                     report.pass(
+@@ -2569,6 +2582,15 @@ pub fn set_master_rom_root_to(config_path: &Path, path: &Path) -> Result<Option<
+         .as_ref()
+         .map(|config| config.ratarmount_bin.clone())
+         .unwrap_or_else(|| "ratarmount".to_string());
++    // Organised games must never be moved into the mount root, nor the
++    // mount root sit inside the organised library.
++    if ensure_mount_root_disjoint_from_sources(&mount_root, &[path.to_path_buf()]).is_err() {
++        return Err(ArchiveFsError::Config(format!(
++            "the master ROM root {} overlaps the temporary preparation folder {}; choose a separate folder",
++            path.display(),
++            mount_root.display()
++        )));
++    }
+     let previous = config.and_then(|config| config.master_rom_root);
+     save_source_folder_configs_to(
+         config_path,
+@@ -2602,6 +2624,12 @@ pub fn set_mount_root_to(config_path: &Path, path: &Path) -> Result<PathBuf> {
+     // removes a temp file inside it) or anything written.
+     let contents = read_config_for_update(config_path)?;
+     validate_mount_root_selection(path)?;
++    // Every configured source counts, enabled or not.
++    let sources: Vec<PathBuf> = parse_source_folder_configs(&contents)?
++        .into_iter()
++        .map(|source| source.path)
++        .collect();
++    ensure_mount_root_disjoint_from_sources(path, &sources)?;
+     let updated = replace_mount_root_assignment(&contents, path)?;
+     // The exact bytes about to be published must parse and round-trip the
+     // requested folder. This is what stops a path containing an embedded
+@@ -3073,6 +3101,168 @@ pub(crate) fn validate_configured_source_roots(paths: &[PathBuf]) -> Result<()>
+     Ok(())
+ }
+ 
++/// How a mount root overlaps a source folder.
++#[derive(Debug, Clone, Copy, PartialEq, Eq)]
++pub enum MountRootSourceOverlap {
++    /// The mount root is the source folder itself.
++    SameFolder,
++    /// The mount root is inside the source folder.
++    MountRootInsideSource,
++    /// The source folder is inside the mount root.
++    SourceInsideMountRoot,
++}
++
++impl MountRootSourceOverlap {
++    fn describe(self) -> &'static str {
++        match self {
++            Self::SameFolder => "is the same folder as",
++            Self::MountRootInsideSource => "is inside",
++            Self::SourceInsideMountRoot => "contains",
++        }
++    }
++}
++
++/// Resolves every symlink in `path`. A path that does not exist yet resolves
++/// its nearest existing ancestor and re-appends the missing components, so a
++/// folder that would be created later is compared where it would really be.
++fn resolve_through_nearest_existing_ancestor(path: &Path) -> io::Result<PathBuf> {
++    let mut missing = Vec::new();
++    let mut current = path;
++    loop {
++        match fs::canonicalize(current) {
++            Ok(mut resolved) => {
++                for component in missing.iter().rev() {
++                    resolved.push(component);
++                }
++                return Ok(resolved);
++            }
++            Err(error) if error.kind() == io::ErrorKind::NotFound => {
++                match (current.parent(), current.file_name()) {
++                    (Some(parent), Some(name)) if !parent.as_os_str().is_empty() => {
++                        missing.push(name.to_os_string());
++                        current = parent;
++                    }
++                    _ => return Err(error),
++                }
++            }
++            Err(error) => return Err(error),
++        }
++    }
++}
++
++fn classify_mount_root_overlap(mount_root: &Path, source: &Path) -> Option<MountRootSourceOverlap> {
++    if mount_root == source {
++        Some(MountRootSourceOverlap::SameFolder)
++    } else if mount_root.starts_with(source) {
++        Some(MountRootSourceOverlap::MountRootInsideSource)
++    } else if source.starts_with(mount_root) {
++        Some(MountRootSourceOverlap::SourceInsideMountRoot)
++    } else {
++        None
++    }
++}
++
++/// Compares `mount_root` and `source` both as spelled (normalised) and with
++/// symlinks resolved, so neither an alias nor a symlinked spelling hides an
++/// overlap. An error means the overlap could not be ruled out.
++pub fn mount_root_source_overlap(
++    mount_root: &Path,
++    source: &Path,
++) -> io::Result<Option<MountRootSourceOverlap>> {
++    let lexical_mount: PathBuf = mount_root.components().collect();
++    let lexical_source: PathBuf = source.components().collect();
++    if let Some(overlap) = classify_mount_root_overlap(&lexical_mount, &lexical_source) {
++        return Ok(Some(overlap));
++    }
++    let resolved_mount = resolve_through_nearest_existing_ancestor(mount_root)?;
++    let resolved_source = resolve_through_nearest_existing_ancestor(source)?;
++    Ok(classify_mount_root_overlap(
++        &resolved_mount,
++        &resolved_source,
++    ))
++}
++
++/// The single mount-root/source disjointness rule. The mount root must not be
++/// a source folder, be inside one, or contain one: EmuWiz creates, mounts
++/// into and cleans up empty folders below the mount root, which must never
++/// reach the user's library. Fails closed when the comparison cannot be made.
++/// An empty mount root (none configured) overlaps nothing.
++pub fn ensure_mount_root_disjoint_from_sources(
++    mount_root: &Path,
++    sources: &[PathBuf],
++) -> Result<()> {
++    if mount_root.as_os_str().is_empty() {
++        return Ok(());
++    }
++    for source in sources
++        .iter()
++        .filter(|source| !source.as_os_str().is_empty())
++    {
++        match mount_root_source_overlap(mount_root, source) {
++            Ok(None) => {}
++            Ok(Some(overlap)) => {
++                return Err(ArchiveFsError::Config(format!(
++                    "the temporary preparation folder {} {} the source folder {}; EmuWiz never mounts into or cleans up inside a source folder, so choose a separate preparation folder",
++                    mount_root.display(),
++                    overlap.describe(),
++                    source.display()
++                )));
++            }
++            Err(error) => {
++                return Err(ArchiveFsError::Config(format!(
++                    "cannot verify that the temporary preparation folder {} is separate from the source folder {}: {error}",
++                    mount_root.display(),
++                    source.display()
++                )));
++            }
++        }
++    }
++    Ok(())
++}
++
++/// Folders a source scan must not enter because they belong to the mount
++/// root. New configurations can no longer overlap, but a legacy config may:
++/// a mount root inside the source is excluded whole; when the mount root is
++/// the source or contains it, only its live mount points can be told apart
++/// from the user's own folders, so those are excluded.
++fn mount_root_scan_exclusions(source: &Path, mount_root: &Path) -> Vec<PathBuf> {
++    if mount_root.as_os_str().is_empty() {
++        return Vec::new();
++    }
++    match mount_root_source_overlap(mount_root, source) {
++        Ok(Some(MountRootSourceOverlap::MountRootInsideSource)) => {
++            let mut excluded = Vec::new();
++            let lexical: PathBuf = mount_root.components().collect();
++            if lexical.starts_with(source) {
++                excluded.push(lexical);
++            }
++            if let (Ok(resolved_mount), Ok(resolved_source)) = (
++                resolve_through_nearest_existing_ancestor(mount_root),
++                fs::canonicalize(source),
++            ) && let Ok(relative) = resolved_mount.strip_prefix(&resolved_source)
++            {
++                excluded.push(source.join(relative));
++            }
++            excluded
++        }
++        Ok(Some(_)) => match mounted_paths_under(mount_root) {
++            Ok(paths) => paths
++                .into_iter()
++                .filter(|path| path != source && path.starts_with(source))
++                .collect(),
++            Err(error) => {
++                log::warn!(
++                    "mount root {} overlaps source {} and its live mounts could not be listed: {error}",
++                    mount_root.display(),
++                    source.display()
++                );
++                Vec::new()
++            }
++        },
++        Ok(None) | Err(_) => Vec::new(),
++    }
++}
++
+ /// Returns explicitly configured roots strictly below `source`, in stable
+ /// order. A child source owns its subtree when the parent is scanned, so a
+ /// pathological child cannot consume the parent's whole entry budget and no
+@@ -3499,6 +3689,10 @@ pub fn add_source_folder_at(
+ 
+     let existing_paths: Vec<PathBuf> = sources.iter().map(|source| source.path.clone()).collect();
+     let validated_path = validate_new_source_folder(candidate, &existing_paths)?;
++    ensure_mount_root_disjoint_from_sources(
++        &config.mount_root,
++        std::slice::from_ref(&validated_path),
++    )?;
+ 
+     let new_source = SourceFolderConfig {
+         path: validated_path,
+@@ -6024,6 +6218,7 @@ impl<'a> ArchiveScanner<'a> {
+                     .filter(|root| root.starts_with(source) && *root != source)
+                     .cloned(),
+             );
++            excluded_roots.extend(mount_root_scan_exclusions(source, &self.config.mount_root));
+             excluded_roots.sort();
+             excluded_roots.dedup();
+             self.scan_source(
+@@ -9061,6 +9256,7 @@ fn validated_unmount_parent_identity(
+ 
+ pub fn cleanup_selected_mount_dir(config: &Config, mount_path: &Path) -> Result<bool> {
+     ensure_no_symlink_components(&config.mount_root)?;
++    ensure_mount_root_disjoint_from_sources(&config.mount_root, &config.source_folders)?;
+     if mount_path == config.mount_root
+         || !path_is_under(mount_path, &config.mount_root)
+         || !mount_path.is_dir()
+@@ -9075,6 +9271,7 @@ pub fn cleanup_selected_mount_dir(config: &Config, mount_path: &Path) -> Result<
+ /// Removes an empty selected mount directory and its empty ancestors below the mount root.
+ pub fn cleanup_selected_mount_tree(config: &Config, mount_path: &Path) -> Result<Vec<PathBuf>> {
+     ensure_no_symlink_components(&config.mount_root)?;
++    ensure_mount_root_disjoint_from_sources(&config.mount_root, &config.source_folders)?;
+     if mount_path == config.mount_root
+         || !path_is_under(mount_path, &config.mount_root)
+         || !mount_path.is_dir()
+@@ -9148,6 +9345,8 @@ pub fn plan_stale_mount_directories(config: &Config) -> Result<Vec<PathBuf>> {
+         return Ok(Vec::new());
+     }
+     ensure_no_symlink_components(&config.mount_root)?;
++    // Every empty folder in an overlapping source would look like a leftover.
++    ensure_mount_root_disjoint_from_sources(&config.mount_root, &config.source_folders)?;
+     let mounted_paths = mounted_paths_under(&config.mount_root)?;
+     let mut stale = Vec::new();
+     let mut inspected = 0usize;
+@@ -9218,6 +9417,7 @@ pub fn clean_mount_root(config: &Config) -> Result<Vec<PathBuf>> {
+         return Ok(Vec::new());
+     }
+     ensure_no_symlink_components(&config.mount_root)?;
++    ensure_mount_root_disjoint_from_sources(&config.mount_root, &config.source_folders)?;
+     let mut plans = ArchiveScanner::new(config).mount_plans()?;
+     plans.sort_by(|left, right| right.mount_path.cmp(&left.mount_path));
+     let mut removed = Vec::new();
+@@ -12473,7 +12673,8 @@ mod tests {
+         let mount_path = root.join("Xbox360").join("Game");
+         fs::create_dir_all(&mount_path).unwrap();
+         let config = Config {
+-            source_folders: vec![root.join("roms")],
++            // The library sits beside the mount root: an overlapping one is refused.
++            source_folders: vec![root.with_file_name("cleanup-fixture-library")],
+             mount_root: root.clone(),
+             ratarmount_bin: "ratarmount".to_string(),
+             master_rom_root: None,
+@@ -12488,7 +12689,8 @@ mod tests {
+     fn cleanup_selected_mount_dir_never_removes_mount_root() {
+         let root = test_root("cleanup_selected_root");
+         let config = Config {
+-            source_folders: vec![root.join("roms")],
++            // The library sits beside the mount root: an overlapping one is refused.
++            source_folders: vec![root.with_file_name("cleanup-fixture-library")],
+             mount_root: root.clone(),
+             ratarmount_bin: "ratarmount".to_string(),
+             master_rom_root: None,
+@@ -12505,7 +12707,8 @@ mod tests {
+         fs::create_dir_all(&mount_path).unwrap();
+         fs::write(mount_path.join("file.txt"), b"keep").unwrap();
+         let config = Config {
+-            source_folders: vec![root.join("roms")],
++            // The library sits beside the mount root: an overlapping one is refused.
++            source_folders: vec![root.with_file_name("cleanup-fixture-library")],
+             mount_root: root,
+             ratarmount_bin: "ratarmount".to_string(),
+             master_rom_root: None,
+@@ -12521,7 +12724,8 @@ mod tests {
+         let outside = test_root("cleanup_selected_outside_target").join("Game");
+         fs::create_dir_all(&outside).unwrap();
+         let config = Config {
+-            source_folders: vec![root.join("roms")],
++            // The library sits beside the mount root: an overlapping one is refused.
++            source_folders: vec![root.with_file_name("cleanup-fixture-library")],
+             mount_root: root,
+             ratarmount_bin: "ratarmount".to_string(),
+             master_rom_root: None,
+@@ -12538,7 +12742,8 @@ mod tests {
+         let mount_path = platform_path.join("Game");
+         fs::create_dir_all(&mount_path).unwrap();
+         let config = Config {
+-            source_folders: vec![root.join("roms")],
++            // The library sits beside the mount root: an overlapping one is refused.
++            source_folders: vec![root.with_file_name("cleanup-fixture-library")],
+             mount_root: root.clone(),
+             ratarmount_bin: "ratarmount".to_string(),
+             master_rom_root: None,
+@@ -12556,7 +12761,8 @@ mod tests {
+     fn cleanup_selected_mount_tree_rejects_mount_root_itself() {
+         let root = test_root("cleanup_selected_tree_root");
+         let config = Config {
+-            source_folders: vec![root.join("roms")],
++            // The library sits beside the mount root: an overlapping one is refused.
++            source_folders: vec![root.with_file_name("cleanup-fixture-library")],
+             mount_root: root.clone(),
+             ratarmount_bin: "ratarmount".to_string(),
+             master_rom_root: None,
+@@ -12576,7 +12782,8 @@ mod tests {
+         let outside = test_root("cleanup_selected_tree_outside_target").join("Game");
+         fs::create_dir_all(&outside).unwrap();
+         let config = Config {
+-            source_folders: vec![root.join("roms")],
++            // The library sits beside the mount root: an overlapping one is refused.
++            source_folders: vec![root.with_file_name("cleanup-fixture-library")],
+             mount_root: root,
+             ratarmount_bin: "ratarmount".to_string(),
+             master_rom_root: None,
+@@ -12602,7 +12809,8 @@ mod tests {
+         symlink(&outside, root.join("Platform")).unwrap();
+         let linked_mount = root.join("Platform").join("Game");
+         let config = Config {
+-            source_folders: vec![root.join("roms")],
++            // The library sits beside the mount root: an overlapping one is refused.
++            source_folders: vec![root.with_file_name("cleanup-fixture-library")],
+             mount_root: root,
+             ratarmount_bin: "ratarmount".to_string(),
+             master_rom_root: None,
+@@ -12623,7 +12831,8 @@ mod tests {
+         fs::create_dir_all(&mount_path).unwrap();
+         fs::write(mount_path.join("file.txt"), b"keep").unwrap();
+         let config = Config {
+-            source_folders: vec![root.join("roms")],
++            // The library sits beside the mount root: an overlapping one is refused.
++            source_folders: vec![root.with_file_name("cleanup-fixture-library")],
+             mount_root: root.clone(),
+             ratarmount_bin: "ratarmount".to_string(),
+             master_rom_root: None,
+@@ -12647,7 +12856,8 @@ mod tests {
+         fs::create_dir_all(&mount_path).unwrap();
+         fs::create_dir_all(&other_mount_path).unwrap();
+         let config = Config {
+-            source_folders: vec![root.join("roms")],
++            // The library sits beside the mount root: an overlapping one is refused.
++            source_folders: vec![root.with_file_name("cleanup-fixture-library")],
+             mount_root: root.clone(),
+             ratarmount_bin: "ratarmount".to_string(),
+             master_rom_root: None,
+diff --git a/crates/archivefs-core/src/mount_root_validation_tests.rs b/crates/archivefs-core/src/mount_root_validation_tests.rs
+index 0812151..8d44843 100644
+--- a/crates/archivefs-core/src/mount_root_validation_tests.rs
++++ b/crates/archivefs-core/src/mount_root_validation_tests.rs
+@@ -59,3 +59,227 @@ fn mount_root_symlink_ancestor_is_rejected_before_the_writable_probe() {
+     assert!(error.to_string().contains("not a safe location"), "{error}");
+     assert_eq!(fs::read(config).unwrap(), original);
+ }
++
++// --- Mount root / source folder disjointness (Night Watch G1-01, D4-06) ---
++
++fn legacy_config(path: &Path, sources: &[&Path], mount_root: &Path) -> Vec<u8> {
++    let sources = sources
++        .iter()
++        .map(|source| format!("\"{}\"", source.display()))
++        .collect::<Vec<_>>()
++        .join(", ");
++    let contents = format!(
++        "source_folders = [{sources}]\nmount_root = \"{}\"\nratarmount_bin = \"ratarmount\"\n",
++        mount_root.display()
++    );
++    fs::write(path, &contents).unwrap();
++    contents.into_bytes()
++}
++
++#[test]
++fn set_mount_root_refuses_a_folder_overlapping_a_source() {
++    let fixture = tempfile::tempdir().unwrap();
++    let root = fixture.path();
++    let source = root.join("library");
++    fs::create_dir_all(source.join("mnt")).unwrap();
++    let config = root.join("config.toml");
++    let original = legacy_config(&config, &[&source], &root.join("old-mounts"));
++    // Equal to, inside, and containing the source.
++    for candidate in [source.clone(), source.join("mnt"), root.to_path_buf()] {
++        let error = set_mount_root_to(&config, &candidate).unwrap_err();
++        assert!(
++            error.to_string().contains("source folder"),
++            "{}: {error}",
++            candidate.display()
++        );
++        assert_eq!(fs::read(&config).unwrap(), original);
++    }
++    // A disjoint sibling is still accepted.
++    let disjoint = root.join("mounts");
++    fs::create_dir(&disjoint).unwrap();
++    assert_eq!(set_mount_root_to(&config, &disjoint).unwrap(), disjoint);
++    assert_eq!(Config::load_from(&config).unwrap().mount_root, disjoint);
++}
++
++#[cfg(unix)]
++#[test]
++fn set_mount_root_refuses_the_real_folder_behind_a_symlinked_source() {
++    let fixture = tempfile::tempdir().unwrap();
++    let real = fixture.path().join("real-library");
++    fs::create_dir_all(real.join("sub")).unwrap();
++    let linked = fixture.path().join("library-link");
++    std::os::unix::fs::symlink(&real, &linked).unwrap();
++    let config = fixture.path().join("config.toml");
++    let original = legacy_config(&config, &[&linked], &fixture.path().join("old"));
++    for candidate in [real.clone(), real.join("sub")] {
++        assert!(
++            set_mount_root_to(&config, &candidate).is_err(),
++            "{}",
++            candidate.display()
++        );
++        assert_eq!(fs::read(&config).unwrap(), original);
++    }
++}
++
++#[test]
++fn add_source_refuses_a_folder_overlapping_the_mount_root() {
++    let fixture = tempfile::tempdir().unwrap();
++    let root = fixture.path();
++    let mount_root = root.join("mnt");
++    fs::create_dir_all(mount_root.join("Unknown/Good")).unwrap();
++    let existing = root.join("existing");
++    fs::create_dir(&existing).unwrap();
++    let config = root.join("config.toml");
++    let database = root.join("library.sqlite3");
++    let original = legacy_config(&config, &[&existing], &mount_root);
++    // Equal to, inside, and containing the mount root.
++    for candidate in [
++        mount_root.clone(),
++        mount_root.join("Unknown/Good"),
++        root.to_path_buf(),
++    ] {
++        let error = add_source_folder_at(&config, &database, &candidate).unwrap_err();
++        assert!(
++            error.to_string().contains("preparation folder"),
++            "{}: {error}",
++            candidate.display()
++        );
++        assert_eq!(fs::read(&config).unwrap(), original);
++    }
++    assert!(!database.exists(), "a refused add never opens the database");
++    // A disjoint folder is still added.
++    let games = root.join("games");
++    fs::create_dir(&games).unwrap();
++    add_source_folder_at(&config, &database, &games).unwrap();
++    assert!(
++        Config::load_from(&config)
++            .unwrap()
++            .source_folders
++            .contains(&games)
++    );
++}
++
++#[test]
++fn add_source_refuses_a_parent_of_a_not_yet_created_mount_root() {
++    let fixture = tempfile::tempdir().unwrap();
++    let root = fixture.path();
++    let candidate = root.join("library");
++    fs::create_dir(&candidate).unwrap();
++    let config = root.join("config.toml");
++    let original = legacy_config(&config, &[], &candidate.join("mounts/not-yet"));
++    assert!(add_source_folder_at(&config, &root.join("db.sqlite3"), &candidate).is_err());
++    assert_eq!(fs::read(&config).unwrap(), original);
++}
++
++#[test]
++fn master_rom_root_refuses_a_folder_overlapping_the_mount_root() {
++    let fixture = tempfile::tempdir().unwrap();
++    let root = fixture.path();
++    let mount_root = root.join("mnt");
++    fs::create_dir(&mount_root).unwrap();
++    let config = root.join("config.toml");
++    let original = legacy_config(&config, &[], &mount_root);
++    for candidate in [
++        mount_root.clone(),
++        mount_root.join("roms"),
++        root.to_path_buf(),
++    ] {
++        assert!(
++            set_master_rom_root_to(&config, &candidate).is_err(),
++            "{}",
++            candidate.display()
++        );
++        assert_eq!(fs::read(&config).unwrap(), original);
++    }
++    set_master_rom_root_to(&config, &root.join("organised")).unwrap();
++}
++
++#[test]
++fn config_check_reports_a_mount_root_inside_a_source_and_creates_nothing() {
++    let fixture = tempfile::tempdir().unwrap();
++    let source = fixture.path().join("library");
++    fs::create_dir(&source).unwrap();
++    let mount_root = source.join("mnt");
++    let config = fixture.path().join("config.toml");
++    legacy_config(&config, &[&source], &mount_root);
++    let report = run_config_check(&config);
++    assert!(
++        report
++            .checks
++            .iter()
++            .any(|check| check.status == ConfigCheckStatus::Error
++                && check.detail.contains("source folder")
++                && check.detail.contains(&source.display().to_string())),
++        "{:#?}",
++        report.checks
++    );
++    assert!(
++        !mount_root.exists(),
++        "config-check created the mount root inside a source"
++    );
++}
++
++#[test]
++fn config_check_still_passes_a_disjoint_mount_root() {
++    let fixture = tempfile::tempdir().unwrap();
++    let source = fixture.path().join("library");
++    fs::create_dir(&source).unwrap();
++    let mount_root = fixture.path().join("mounts");
++    let config = fixture.path().join("config.toml");
++    legacy_config(&config, &[&source], &mount_root);
++    let report = run_config_check(&config);
++    assert!(
++        !report
++            .checks
++            .iter()
++            .any(|check| check.detail.contains("overlaps") || check.name.contains("separate")),
++        "{:#?}",
++        report.checks
++    );
++    assert!(
++        mount_root.is_dir(),
++        "a disjoint mount root is still created"
++    );
++}
++
++#[test]
++fn scanner_never_treats_a_mount_root_inside_a_source_as_library_content() {
++    let fixture = tempfile::tempdir().unwrap();
++    let source = fixture.path().join("library");
++    fs::create_dir_all(source.join("roms")).unwrap();
++    fs::write(source.join("roms/Outer.zip"), b"archive").unwrap();
++    let mount_root = source.join("mnt");
++    // What a live mount of Outer.zip would expose: a member that is itself
++    // a supported archive.
++    fs::create_dir_all(mount_root.join("Unknown/Outer")).unwrap();
++    fs::write(mount_root.join("Unknown/Outer/Inner.zip"), b"archive").unwrap();
++    let config = Config {
++        source_folders: vec![source.clone()],
++        mount_root: mount_root.clone(),
++        ratarmount_bin: "ratarmount".to_string(),
++        master_rom_root: None,
++    };
++    let archives = ArchiveScanner::new(&config).scan_archives().unwrap();
++    let paths: Vec<_> = archives
++        .iter()
++        .map(|archive| archive.path.clone())
++        .collect();
++    assert_eq!(paths, vec![source.join("roms/Outer.zip")], "{paths:?}");
++}
++
++#[test]
++fn targeted_mount_cleanup_refuses_a_mount_root_containing_a_source() {
++    let fixture = tempfile::tempdir().unwrap();
++    let mount_root = fixture.path().join("mnt");
++    let empty_in_source = mount_root.join("roms/Empty");
++    fs::create_dir_all(&empty_in_source).unwrap();
++    let config = Config {
++        source_folders: vec![mount_root.join("roms")],
++        mount_root: mount_root.clone(),
++        ratarmount_bin: "ratarmount".to_string(),
++        master_rom_root: None,
++    };
++    assert!(cleanup_selected_mount_tree(&config, &empty_in_source).is_err());
++    assert!(cleanup_selected_mount_dir(&config, &empty_in_source).is_err());
++    assert!(empty_in_source.is_dir());
++}
+-- 
+2.43.0
+
+
+From 50de27ddd5fc567d2ecd282636c5aac14410d174 Mon Sep 17 00:00:00 2001
+From: Claude <noreply@anthropic.com>
+Date: Wed, 4 Nov 2026 10:15:32 +0000
+Subject: [PATCH 2/3] Close the remaining mount-root overlap paths from review
+
+Independent review of aaf3ab0 (F1-F4, F6, F8, F9):
+
+- F1: the master ROM root is protected like a source: set_mount_root_to,
+  config-check, every cleanup guard and the Doctor gates check it, and
+  Doctor's source-root boundary includes it.
+- F2 (partial): enabling a disabled source re-checks the mount root.
+  Cleanup still sees enabled sources only (Config holds no others).
+- F3: persisted catalogue scans exclude mount-root content and live
+  mounts from a legacy overlapping source (arcade discovery included).
+- F4: Doctor, create_configured_mount_root(_default), setup diagnostics'
+  can_create_mount_root, mount-one/mount_unmounted_plan and batch
+  validation refuse an overlapping mount root, so the refusal text is true.
+- F6: a dangling symlink fails closed instead of being read as a missing
+  folder. F9: set-master-root reports "cannot verify" truthfully.
+- F8: Doctor tests assert MountRootOverlapsSource and run CleanMountPath
+  on every listed folder; nine new regressions cover F1-F4, F6 and F9.
+
+batch_validation_deduplicates_symlinked_parent_aliases_before_mounting
+used a source containing its mount root; its library now sits beside
+the mount root, keeping the alias coverage.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01BZ7RNxHiqaj6yPxf5e6w8f
+---
+ crates/archivefs-core/src/database.rs         |  39 +++-
+ .../archivefs-core/src/diagnostics/repair.rs  |   7 +-
+ .../src/diagnostics/repair/tests.rs           |  52 ++++-
+ crates/archivefs-core/src/lib.rs              | 162 ++++++++++----
+ .../src/mount_root_validation_tests.rs        | 200 ++++++++++++++++++
+ 5 files changed, 402 insertions(+), 58 deletions(-)
+
+diff --git a/crates/archivefs-core/src/database.rs b/crates/archivefs-core/src/database.rs
+index daba8da..a7d5400 100644
+--- a/crates/archivefs-core/src/database.rs
++++ b/crates/archivefs-core/src/database.rs
+@@ -9436,7 +9436,12 @@ pub fn scan_and_persist(
+ ) -> Result<ScanPersistSummary> {
+     validate_configured_source_roots(&config.source_folders)?;
+     let registered_folders = database.register_source_folders(&config.source_folders)?;
+-    let summary = scan_and_persist_folders(database, &registered_folders, triggered_by)?;
++    let summary = scan_and_persist_folders_excluding_mount_root(
++        database,
++        &registered_folders,
++        triggered_by,
++        &config.mount_root,
++    )?;
+     // The source scanner owns logical Arcade ingestion; the version-bound DAT
+     // join is persisted immediately after that transaction so nested SQLite
+     // transactions cannot make the catalogue refresh fragile.
+@@ -9464,7 +9469,18 @@ pub(crate) fn scan_and_persist_folders(
+     folders: &[RegisteredSourceFolder],
+     triggered_by: &str,
+ ) -> Result<ScanPersistSummary> {
+-    scan_and_persist_folders_with_skipped(database, folders, triggered_by, &[])
++    scan_and_persist_folders_with_skipped(database, folders, triggered_by, &[], Path::new(""))
++}
++
++/// [`scan_and_persist_folders`] that never walks `mount_root` content when a
++/// legacy configuration places the mount root on, inside or around a source.
++pub(crate) fn scan_and_persist_folders_excluding_mount_root(
++    database: &mut Database,
++    folders: &[RegisteredSourceFolder],
++    triggered_by: &str,
++    mount_root: &Path,
++) -> Result<ScanPersistSummary> {
++    scan_and_persist_folders_with_skipped(database, folders, triggered_by, &[], mount_root)
+ }
+ 
+ pub(crate) fn scan_and_persist_folders_with_skipped(
+@@ -9472,9 +9488,11 @@ pub(crate) fn scan_and_persist_folders_with_skipped(
+     folders: &[RegisteredSourceFolder],
+     triggered_by: &str,
+     skipped: &[PathBuf],
++    mount_root: &Path,
+ ) -> Result<ScanPersistSummary> {
+     database.begin_catalogue_refresh()?;
+-    let result = scan_and_persist_folders_transaction(database, folders, triggered_by, skipped);
++    let result =
++        scan_and_persist_folders_transaction(database, folders, triggered_by, skipped, mount_root);
+     match result {
+         Ok(summary) => {
+             if let Err(error) = database.validate_scan_source_commit(summary.scan_run_id) {
+@@ -9499,6 +9517,7 @@ fn scan_and_persist_folders_transaction(
+     folders: &[RegisteredSourceFolder],
+     triggered_by: &str,
+     skipped: &[PathBuf],
++    mount_root: &Path,
+ ) -> Result<ScanPersistSummary> {
+     database.mark_interrupted_scan_runs()?;
+     let scan_run_id = database.start_scan_run(triggered_by, None)?;
+@@ -9574,6 +9593,10 @@ fn scan_and_persist_folders_transaction(
+             ratarmount_bin: String::new(),
+             master_rom_root: None,
+         };
++        // A legacy config may put the mount root on, inside or around this
++        // source: never walk its content (or live mounts) as library content.
++        let mut source_exclusions = folder.excluded_source_roots.clone();
++        source_exclusions.extend(crate::mount_root_scan_exclusions(&folder.path, mount_root));
+ 
+         let db_read_started = std::time::Instant::now();
+         let fingerprints = database.load_scan_fingerprints(folder.id)?;
+@@ -9606,23 +9629,19 @@ fn scan_and_persist_folders_transaction(
+         let arcade_sets = arcade_root
+             .as_ref()
+             .filter(|root| {
+-                !folder
+-                    .excluded_source_roots
++                !source_exclusions
+                     .iter()
+                     .any(|excluded| root.starts_with(excluded))
+             })
+             .map(|root| {
+-                crate::ingestion::discover_extracted_sets_excluding(
+-                    root,
+-                    &folder.excluded_source_roots,
+-                )
++                crate::ingestion::discover_extracted_sets_excluding(root, &source_exclusions)
+             });
+         let arcade_complete = arcade_sets.as_ref().is_none_or(|result| {
+             result
+                 .as_ref()
+                 .is_ok_and(|sets| sets.scan_errors_total == 0)
+         });
+-        let mut excluded_roots = folder.excluded_source_roots.clone();
++        let mut excluded_roots = source_exclusions.clone();
+         if let Some(Ok(sets)) = &arcade_sets {
+             // Exclude only already-aggregated logical set directories, never
+             // the other systems sharing a mixed source root.
+diff --git a/crates/archivefs-core/src/diagnostics/repair.rs b/crates/archivefs-core/src/diagnostics/repair.rs
+index dafa1e1..7fe377b 100644
+--- a/crates/archivefs-core/src/diagnostics/repair.rs
++++ b/crates/archivefs-core/src/diagnostics/repair.rs
+@@ -306,7 +306,7 @@ impl DoctorRepairRejection {
+             Self::ConflictingActiveMount => "Something is already mounted at that location.",
+             Self::MountRootUnavailable => "The configured mount root is missing or unusable.",
+             Self::MountRootOverlapsSource => {
+-                "The configured mount root is, is inside, or contains a configured source folder, so EmuWiz refuses to clean it. Nothing was changed. Choose a separate mount root."
++                "The configured mount root is, is inside, or contains a configured source folder or the master ROM root, or that could not be ruled out, so EmuWiz refuses to clean it. Nothing was changed. Choose a separate mount root."
+             }
+         }
+     }
+@@ -761,7 +761,8 @@ fn affected_path(finding: &Finding) -> Result<PathBuf, DoctorRepairRejection> {
+ /// Refuses a configured source folder, and anything inside one. This is the
+ /// hard boundary: EmuWiz never modifies the user's library.
+ fn guard_against_source_roots(path: &Path, config: &Config) -> Result<(), DoctorRepairRejection> {
+-    for source in &config.source_folders {
++    // The organised master ROM root is library content too.
++    for source in config.source_folders.iter().chain(&config.master_rom_root) {
+         if path == source.as_path() || path.starts_with(source) {
+             return Err(DoctorRepairRejection::PathUnderSourceRoot);
+         }
+@@ -780,7 +781,7 @@ fn guard_against_source_roots(path: &Path, config: &Config) -> Result<(), Doctor
+ /// Refuses any mount-root cleanup while the mount root overlaps a configured
+ /// source folder (canonical comparison; fails closed when unverifiable).
+ fn guard_mount_root_disjoint_from_sources(config: &Config) -> Result<(), DoctorRepairRejection> {
+-    crate::ensure_mount_root_disjoint_from_sources(&config.mount_root, &config.source_folders)
++    crate::ensure_mount_root_disjoint_from_config(config)
+         .map_err(|_| DoctorRepairRejection::MountRootOverlapsSource)
+ }
+ 
+diff --git a/crates/archivefs-core/src/diagnostics/repair/tests.rs b/crates/archivefs-core/src/diagnostics/repair/tests.rs
+index 5f32aea..528c7b7 100644
+--- a/crates/archivefs-core/src/diagnostics/repair/tests.rs
++++ b/crates/archivefs-core/src/diagnostics/repair/tests.rs
+@@ -1748,7 +1748,38 @@ fn assert_overlapping_mount_root_is_refused(
+             "{:?}",
+             outcome.record
+         );
++        // Compared by name so this also compiles, and fails, before the fix.
++        assert_eq!(
++            format!("{:?}", outcome.record.rejection),
++            "Some(MountRootOverlapsSource)"
++        );
+         assert!(outcome.record.changed_paths.is_empty());
++        // Each listed folder, repaired one at a time, is refused too: by the
++        // source-folder boundary or by the overlap gate.
++        for path in preserved {
++            let mut targeted = request_for(
++                DoctorRepairAction::CleanMountPath,
++                "mount_root.stale_mount_directory",
++                path,
++            );
++            targeted.dry_run = dry_run;
++            let outcome =
++                execute_doctor_repair(&targeted, &context(config, &scan, &fixture.index_path()));
++            assert_eq!(
++                outcome.record.status,
++                DoctorRepairStatus::Rejected,
++                "{}: {:?}",
++                path.display(),
++                outcome.record
++            );
++            let rejection = format!("{:?}", outcome.record.rejection);
++            assert!(
++                rejection == "Some(PathUnderSourceRoot)"
++                    || rejection == "Some(MountRootOverlapsSource)",
++                "{}: {rejection}",
++                path.display()
++            );
++        }
+     }
+     for path in preserved {
+         assert!(path.is_dir(), "source folder removed: {}", path.display());
+@@ -1799,13 +1830,20 @@ fn clean_and_doctor_refuse_a_mount_root_containing_a_source() {
+     let fixture = Fixture::new("overlap-parent");
+     let source = fixture.dir("mnt/library");
+     let empty_in_source = fixture.dir("mnt/library/Empty Folder");
++    // Outside the source but under the overlapping mount root: only the
++    // overlap gate can refuse this one.
++    let empty_beside_source = fixture.dir("mnt/Other/Empty");
+     let config = Config {
+         source_folders: vec![source],
+         mount_root: fixture.root.join("mnt"),
+         ratarmount_bin: "ratarmount".to_string(),
+         master_rom_root: None,
+     };
+-    assert_overlapping_mount_root_is_refused(&fixture, &config, &[empty_in_source]);
++    assert_overlapping_mount_root_is_refused(
++        &fixture,
++        &config,
++        &[empty_in_source, empty_beside_source],
++    );
+ }
+ 
+ #[cfg(unix)]
+@@ -1864,3 +1902,15 @@ fn clean_still_removes_leftovers_under_a_disjoint_mount_root() {
+     assert!(empty_in_source.is_dir());
+     assert!(config.mount_root.is_dir());
+ }
++
++#[test]
++fn clean_and_doctor_refuse_a_mount_root_containing_the_master_rom_root() {
++    let fixture = Fixture::new("overlap-master-root");
++    let config = Config {
++        master_rom_root: Some(fixture.dir("mnt/organised")),
++        ..fixture.config()
++    };
++    // An empty canonical platform folder in the organised library.
++    let platform = fixture.dir("mnt/organised/SNES");
++    assert_overlapping_mount_root_is_refused(&fixture, &config, &[platform]);
++}
+diff --git a/crates/archivefs-core/src/lib.rs b/crates/archivefs-core/src/lib.rs
+index bab2c5d..4083a96 100644
+--- a/crates/archivefs-core/src/lib.rs
++++ b/crates/archivefs-core/src/lib.rs
+@@ -1289,7 +1289,10 @@ fn complete_doctor_report(
+             false
+         }
+         PathInspection::Missing if create_mount_root => {
+-            match fs::create_dir_all(&config.mount_root) {
++            match ensure_mount_root_disjoint_from_config(config).and_then(|()| {
++                fs::create_dir_all(&config.mount_root)
++                    .map_err(|source| ArchiveFsError::io(config.mount_root.clone(), source))
++            }) {
+                 Ok(()) => {
+                     report.pass(
+                         "mount root",
+@@ -1667,6 +1670,11 @@ fn run_setup_diagnostics_with_checks(
+         && mount_root.as_ref().is_some_and(|root| {
+             root.parent()
+                 .is_some_and(|parent| inspect(parent).is_directory())
++        })
++        && mount_root.as_ref().is_some_and(|root| {
++            contents.as_deref().is_some_and(|contents| {
++                mount_root_disjoint_from_config_text(root, contents).is_ok()
++            })
+         });
+     let sources_ready =
+         !source_states.is_empty() && source_states.iter().all(|(_, state)| state.is_directory());
+@@ -1985,14 +1993,30 @@ pub fn create_configured_mount_root_default() -> Result<PathBuf> {
+     let root = parse_config_fields(&contents)?
+         .mount_root
+         .ok_or_else(|| ArchiveFsError::Config("missing mount_root".to_string()))?;
++    mount_root_disjoint_from_config_text(&root, &contents)?;
+     create_mount_root(&root)?;
+     Ok(root)
+ }
+ 
+ pub fn create_configured_mount_root(config: &Config) -> Result<()> {
++    ensure_mount_root_disjoint_from_config(config)?;
+     create_mount_root(&config.mount_root)
+ }
+ 
++/// The disjointness rule against everything the config text protects:
++/// every configured source (enabled or disabled) and the master ROM root.
++fn mount_root_disjoint_from_config_text(mount_root: &Path, contents: &str) -> Result<()> {
++    let sources: Vec<PathBuf> = parse_source_folder_configs(contents)?
++        .into_iter()
++        .map(|source| source.path)
++        .collect();
++    ensure_mount_root_disjoint_from_sources(mount_root, &sources)?;
++    if let Some(master_rom_root) = parse_config_fields(contents)?.master_rom_root {
++        ensure_mount_root_disjoint_from(mount_root, &master_rom_root, "master ROM root")?;
++    }
++    Ok(())
++}
++
+ fn create_mount_root(root: &Path) -> Result<()> {
+     match inspect_path(root) {
+         PathInspection::Missing => {}
+@@ -2165,7 +2189,16 @@ fn run_config_check_with_mount_root_creation(
+                 .flatten()
+                 .map(PathBuf::from)
+                 .collect();
+-            let overlap = ensure_mount_root_disjoint_from_sources(mount_root, &source_paths).err();
++            let overlap = ensure_mount_root_disjoint_from_sources(mount_root, &source_paths)
++                .and_then(|()| match &fields.master_rom_root {
++                    Some(master_rom_root) => ensure_mount_root_disjoint_from(
++                        mount_root,
++                        master_rom_root,
++                        "master ROM root",
++                    ),
++                    None => Ok(()),
++                })
++                .err();
+             if let Some(error) = &overlap {
+                 report.error("mount_root separate from source folders", error.to_string());
+             }
+@@ -2584,13 +2617,7 @@ pub fn set_master_rom_root_to(config_path: &Path, path: &Path) -> Result<Option<
+         .unwrap_or_else(|| "ratarmount".to_string());
+     // Organised games must never be moved into the mount root, nor the
+     // mount root sit inside the organised library.
+-    if ensure_mount_root_disjoint_from_sources(&mount_root, &[path.to_path_buf()]).is_err() {
+-        return Err(ArchiveFsError::Config(format!(
+-            "the master ROM root {} overlaps the temporary preparation folder {}; choose a separate folder",
+-            path.display(),
+-            mount_root.display()
+-        )));
+-    }
++    ensure_mount_root_disjoint_from(&mount_root, path, "master ROM root")?;
+     let previous = config.and_then(|config| config.master_rom_root);
+     save_source_folder_configs_to(
+         config_path,
+@@ -2630,6 +2657,9 @@ pub fn set_mount_root_to(config_path: &Path, path: &Path) -> Result<PathBuf> {
+         .map(|source| source.path)
+         .collect();
+     ensure_mount_root_disjoint_from_sources(path, &sources)?;
++    if let Some(master_rom_root) = parse_config_fields(&contents)?.master_rom_root {
++        ensure_mount_root_disjoint_from(path, &master_rom_root, "master ROM root")?;
++    }
+     let updated = replace_mount_root_assignment(&contents, path)?;
+     // The exact bytes about to be published must parse and round-trip the
+     // requested folder. This is what stops a path containing an embedded
+@@ -3137,6 +3167,14 @@ fn resolve_through_nearest_existing_ancestor(path: &Path) -> io::Result<PathBuf>
+                 return Ok(resolved);
+             }
+             Err(error) if error.kind() == io::ErrorKind::NotFound => {
++                // A dangling symlink is not a folder that does not exist
++                // yet: its real target is unknown, so fail closed.
++                if fs::symlink_metadata(current).is_ok() {
++                    return Err(io::Error::new(
++                        io::ErrorKind::NotFound,
++                        format!("{} is a dangling symbolic link", current.display()),
++                    ));
++                }
+                 match (current.parent(), current.file_name()) {
+                     (Some(parent), Some(name)) if !parent.as_os_str().is_empty() => {
+                         missing.push(name.to_os_string());
+@@ -3191,41 +3229,48 @@ pub fn ensure_mount_root_disjoint_from_sources(
+     mount_root: &Path,
+     sources: &[PathBuf],
+ ) -> Result<()> {
+-    if mount_root.as_os_str().is_empty() {
+-        return Ok(());
++    for source in sources {
++        ensure_mount_root_disjoint_from(mount_root, source, "source folder")?;
+     }
+-    for source in sources
+-        .iter()
+-        .filter(|source| !source.as_os_str().is_empty())
+-    {
+-        match mount_root_source_overlap(mount_root, source) {
+-            Ok(None) => {}
+-            Ok(Some(overlap)) => {
+-                return Err(ArchiveFsError::Config(format!(
+-                    "the temporary preparation folder {} {} the source folder {}; EmuWiz never mounts into or cleans up inside a source folder, so choose a separate preparation folder",
+-                    mount_root.display(),
+-                    overlap.describe(),
+-                    source.display()
+-                )));
+-            }
+-            Err(error) => {
+-                return Err(ArchiveFsError::Config(format!(
+-                    "cannot verify that the temporary preparation folder {} is separate from the source folder {}: {error}",
+-                    mount_root.display(),
+-                    source.display()
+-                )));
+-            }
+-        }
++    Ok(())
++}
++
++/// [`ensure_mount_root_disjoint_from_sources`] for every root `config`
++/// protects: its source folders and its master ROM root.
++pub(crate) fn ensure_mount_root_disjoint_from_config(config: &Config) -> Result<()> {
++    ensure_mount_root_disjoint_from_sources(&config.mount_root, &config.source_folders)?;
++    if let Some(master_rom_root) = &config.master_rom_root {
++        ensure_mount_root_disjoint_from(&config.mount_root, master_rom_root, "master ROM root")?;
+     }
+     Ok(())
+ }
+ 
++fn ensure_mount_root_disjoint_from(mount_root: &Path, protected: &Path, label: &str) -> Result<()> {
++    if mount_root.as_os_str().is_empty() || protected.as_os_str().is_empty() {
++        return Ok(());
++    }
++    match mount_root_source_overlap(mount_root, protected) {
++        Ok(None) => Ok(()),
++        Ok(Some(overlap)) => Err(ArchiveFsError::Config(format!(
++            "the temporary preparation folder {} {} the {label} {}; EmuWiz refuses to create, mount into or clean up folders in an overlapping preparation folder, so choose a separate one",
++            mount_root.display(),
++            overlap.describe(),
++            protected.display()
++        ))),
++        Err(error) => Err(ArchiveFsError::Config(format!(
++            "cannot verify that the temporary preparation folder {} is separate from the {label} {}: {error}",
++            mount_root.display(),
++            protected.display()
++        ))),
++    }
++}
++
+ /// Folders a source scan must not enter because they belong to the mount
+ /// root. New configurations can no longer overlap, but a legacy config may:
+ /// a mount root inside the source is excluded whole; when the mount root is
+ /// the source or contains it, only its live mount points can be told apart
+ /// from the user's own folders, so those are excluded.
+-fn mount_root_scan_exclusions(source: &Path, mount_root: &Path) -> Vec<PathBuf> {
++pub(crate) fn mount_root_scan_exclusions(source: &Path, mount_root: &Path) -> Vec<PathBuf> {
+     if mount_root.as_os_str().is_empty() {
+         return Vec::new();
+     }
+@@ -3771,6 +3816,12 @@ pub fn set_source_folder_enabled_at(
+                 target.display()
+             ))
+         })?;
++    if enabled {
++        ensure_mount_root_disjoint_from_sources(
++            &config.mount_root,
++            std::slice::from_ref(&sources[index].path),
++        )?;
++    }
+     sources[index].enabled = enabled;
+     let updated = sources[index].clone();
+ 
+@@ -3795,10 +3846,11 @@ pub fn set_source_folder_enabled_at(
+                     target.display()
+                 ))
+             })?;
+-        Some(scan_and_persist_folders(
++        Some(database::scan_and_persist_folders_excluding_mount_root(
+             &mut database,
+             std::slice::from_ref(&folder),
+             "source-enable",
++            &config.mount_root,
+         )?)
+     } else {
+         None
+@@ -3972,8 +4024,12 @@ pub fn scan_source_folder_at(
+             ))
+         })?;
+ 
+-    let summary =
+-        scan_and_persist_folders(&mut database, std::slice::from_ref(&folder), triggered_by)?;
++    let summary = database::scan_and_persist_folders_excluding_mount_root(
++        &mut database,
++        std::slice::from_ref(&folder),
++        triggered_by,
++        &configured_mount_root_at(config_path)?,
++    )?;
+     refresh_configured_mame_arcade_identity(&mut database, &[target.to_path_buf()])?;
+     Ok(summary)
+ }
+@@ -3992,6 +4048,16 @@ pub fn scan_all_enabled_sources_default() -> Result<ScanPersistSummary> {
+     )
+ }
+ 
++/// The configured mount root (empty when none is set), so persisted scans
++/// can exclude mount-root content from a legacy overlapping source.
++fn configured_mount_root_at(config_path: &Path) -> Result<PathBuf> {
++    let contents = fs::read_to_string(config_path)
++        .map_err(|source| ArchiveFsError::io(config_path.to_path_buf(), source))?;
++    Ok(parse_config_fields(&contents)?
++        .mount_root
++        .unwrap_or_default())
++}
++
+ pub fn scan_all_enabled_sources_at(
+     config_path: &Path,
+     database_path: &Path,
+@@ -4023,6 +4089,7 @@ pub fn scan_all_enabled_sources_at(
+         &enabled_folders,
+         triggered_by,
+         &skipped,
++        &configured_mount_root_at(config_path)?,
+     )?;
+     let paths = enabled_folders
+         .iter()
+@@ -5898,6 +5965,7 @@ impl ArchiveMountSession {
+         &self,
+         archive_paths: &[PathBuf],
+     ) -> Result<Vec<MountBatchTargetValidation>> {
++        ensure_mount_root_disjoint_from_config(&self.config)?;
+         fs::create_dir_all(&self.config.mount_root)
+             .map_err(|source| ArchiveFsError::io(self.config.mount_root.clone(), source))?;
+         let active_mount_paths = current_mount_paths()?;
+@@ -8548,6 +8616,7 @@ pub fn mount_archives_with_backend(
+ ) -> Result<Vec<ArchiveStatus>> {
+     let scanner = ArchiveScanner::new(config);
+     let plans = scanner.mount_plans()?;
++    ensure_mount_root_disjoint_from_config(config)?;
+     prepare_mount_root(&config.mount_root)?;
+ 
+     let archive_paths = plans
+@@ -8678,6 +8747,7 @@ fn mount_one_plan_outcome(
+         plan.mount_path.display()
+     );
+ 
++    ensure_mount_root_disjoint_from_config(config)?;
+     prepare_mount_root(&config.mount_root)?;
+     let active_mount_paths = backend.active_mount_paths(&config.mount_root)?;
+     mount_one_plan_outcome_with_active_mounts(config, plan, backend, &active_mount_paths)
+@@ -8704,6 +8774,7 @@ fn mount_unmounted_plan(
+     plan: MountPlan,
+     backend: &impl MountBackend,
+ ) -> Result<MountPlan> {
++    ensure_mount_root_disjoint_from_config(config)?;
+     prepare_mount_root(&config.mount_root)?;
+     validate_archive_for_mount(&plan.archive)?;
+     validate_mount_target_parent(config, &plan.mount_path)?;
+@@ -9256,7 +9327,7 @@ fn validated_unmount_parent_identity(
+ 
+ pub fn cleanup_selected_mount_dir(config: &Config, mount_path: &Path) -> Result<bool> {
+     ensure_no_symlink_components(&config.mount_root)?;
+-    ensure_mount_root_disjoint_from_sources(&config.mount_root, &config.source_folders)?;
++    ensure_mount_root_disjoint_from_config(config)?;
+     if mount_path == config.mount_root
+         || !path_is_under(mount_path, &config.mount_root)
+         || !mount_path.is_dir()
+@@ -9271,7 +9342,7 @@ pub fn cleanup_selected_mount_dir(config: &Config, mount_path: &Path) -> Result<
+ /// Removes an empty selected mount directory and its empty ancestors below the mount root.
+ pub fn cleanup_selected_mount_tree(config: &Config, mount_path: &Path) -> Result<Vec<PathBuf>> {
+     ensure_no_symlink_components(&config.mount_root)?;
+-    ensure_mount_root_disjoint_from_sources(&config.mount_root, &config.source_folders)?;
++    ensure_mount_root_disjoint_from_config(config)?;
+     if mount_path == config.mount_root
+         || !path_is_under(mount_path, &config.mount_root)
+         || !mount_path.is_dir()
+@@ -9346,7 +9417,7 @@ pub fn plan_stale_mount_directories(config: &Config) -> Result<Vec<PathBuf>> {
+     }
+     ensure_no_symlink_components(&config.mount_root)?;
+     // Every empty folder in an overlapping source would look like a leftover.
+-    ensure_mount_root_disjoint_from_sources(&config.mount_root, &config.source_folders)?;
++    ensure_mount_root_disjoint_from_config(config)?;
+     let mounted_paths = mounted_paths_under(&config.mount_root)?;
+     let mut stale = Vec::new();
+     let mut inspected = 0usize;
+@@ -9417,7 +9488,7 @@ pub fn clean_mount_root(config: &Config) -> Result<Vec<PathBuf>> {
+         return Ok(Vec::new());
+     }
+     ensure_no_symlink_components(&config.mount_root)?;
+-    ensure_mount_root_disjoint_from_sources(&config.mount_root, &config.source_folders)?;
++    ensure_mount_root_disjoint_from_config(config)?;
+     let mut plans = ArchiveScanner::new(config).mount_plans()?;
+     plans.sort_by(|left, right| right.mount_path.cmp(&left.mount_path));
+     let mut removed = Vec::new();
+@@ -10794,8 +10865,11 @@ mod tests {
+         let real_parent = mount_root.join("Real");
+         fs::create_dir_all(&real_parent).unwrap();
+         symlink(&real_parent, mount_root.join("Alias")).unwrap();
+-        let first_archive = root.join("First.zip");
+-        let second_archive = root.join("Second.zip");
++        // The library sits beside the mount root: an overlapping one is refused.
++        let library = root.join("library");
++        fs::create_dir_all(&library).unwrap();
++        let first_archive = library.join("First.zip");
++        let second_archive = library.join("Second.zip");
+         fs::write(&first_archive, b"archive").unwrap();
+         fs::write(&second_archive, b"archive").unwrap();
+         let plans = vec![
+@@ -10809,7 +10883,7 @@ mod tests {
+             ),
+         ];
+         let config = Config {
+-            source_folders: vec![root.clone()],
++            source_folders: vec![library],
+             mount_root,
+             ratarmount_bin: "ratarmount".to_string(),
+             master_rom_root: None,
+diff --git a/crates/archivefs-core/src/mount_root_validation_tests.rs b/crates/archivefs-core/src/mount_root_validation_tests.rs
+index 8d44843..485b329 100644
+--- a/crates/archivefs-core/src/mount_root_validation_tests.rs
++++ b/crates/archivefs-core/src/mount_root_validation_tests.rs
+@@ -283,3 +283,203 @@ fn targeted_mount_cleanup_refuses_a_mount_root_containing_a_source() {
+     assert!(cleanup_selected_mount_dir(&config, &empty_in_source).is_err());
+     assert!(empty_in_source.is_dir());
+ }
++
++// --- Independent-review corrections (F1-F4, F6, F9) -----------------------
++
++#[test]
++fn set_mount_root_refuses_folders_overlapping_the_master_rom_root() {
++    let fixture = tempfile::tempdir().unwrap();
++    let root = fixture.path();
++    let source = root.join("library");
++    fs::create_dir(&source).unwrap();
++    let config = root.join("config.toml");
++    legacy_config(&config, &[&source], &root.join("old-mounts"));
++    // Master ROM root first, then a mount root around or inside it.
++    let organised = root.join("organised");
++    fs::create_dir_all(organised.join("mnt")).unwrap();
++    set_master_rom_root_to(&config, &organised).unwrap();
++    let original = fs::read(&config).unwrap();
++    for candidate in [root.to_path_buf(), organised.clone(), organised.join("mnt")] {
++        assert!(
++            set_mount_root_to(&config, &candidate).is_err(),
++            "{}",
++            candidate.display()
++        );
++        assert_eq!(fs::read(&config).unwrap(), original);
++    }
++}
++
++#[cfg(unix)]
++#[test]
++fn set_mount_root_fails_closed_on_a_dangling_symlinked_source() {
++    let fixture = tempfile::tempdir().unwrap();
++    let root = fixture.path();
++    let drive = root.join("drive");
++    fs::create_dir(&drive).unwrap();
++    // The source lives on a drive folder that is offline right now.
++    let offline = root.join("offline-library");
++    std::os::unix::fs::symlink(drive.join("library"), &offline).unwrap();
++    let config = root.join("config.toml");
++    let original = legacy_config(&config, &[&offline], &root.join("old-mounts"));
++    let error = set_mount_root_to(&config, &drive).unwrap_err();
++    assert!(error.to_string().contains("cannot verify"), "{error}");
++    assert_eq!(fs::read(&config).unwrap(), original);
++}
++
++#[cfg(unix)]
++#[test]
++fn master_rom_root_reports_an_unverifiable_check_truthfully() {
++    let fixture = tempfile::tempdir().unwrap();
++    let root = fixture.path();
++    let mount_root = root.join("mnt");
++    fs::create_dir(&mount_root).unwrap();
++    let config = root.join("config.toml");
++    let original = legacy_config(&config, &[], &mount_root);
++    let dangling = root.join("organised-link");
++    std::os::unix::fs::symlink(root.join("gone"), &dangling).unwrap();
++    let error = set_master_rom_root_to(&config, &dangling).unwrap_err();
++    let text = error.to_string();
++    assert!(text.contains("cannot verify"), "{text}");
++    assert!(!text.contains("overlaps"), "{text}");
++    assert_eq!(fs::read(&config).unwrap(), original);
++}
++
++#[test]
++fn enabling_a_disabled_source_inside_the_mount_root_is_refused() {
++    let fixture = tempfile::tempdir().unwrap();
++    let root = fixture.path();
++    let mount_root = root.join("mnt");
++    let disabled = mount_root.join("library");
++    fs::create_dir_all(&disabled).unwrap();
++    let config = root.join("config.toml");
++    let contents = format!(
++        "mount_root = \"{}\"\nratarmount_bin = \"ratarmount\"\n\n[[source]]\npath = \"{}\"\nenabled = false\n",
++        mount_root.display(),
++        disabled.display()
++    );
++    fs::write(&config, &contents).unwrap();
++    let database = root.join("library.sqlite3");
++    assert!(set_source_folder_enabled_at(&config, &database, &disabled, true).is_err());
++    assert_eq!(fs::read_to_string(&config).unwrap(), contents);
++    // A disabled source is still protected when a mount root is chosen.
++    assert!(set_mount_root_to(&config, &mount_root).is_err());
++}
++
++#[test]
++fn persisted_scan_never_catalogues_mount_root_content_inside_a_source() {
++    let fixture = tempfile::tempdir().unwrap();
++    let root = fixture.path();
++    let source = root.join("library");
++    fs::create_dir_all(source.join("roms")).unwrap();
++    fs::write(source.join("roms/Outer.zip"), b"archive").unwrap();
++    let mount_root = source.join("mnt");
++    fs::create_dir_all(mount_root.join("Unknown/Outer")).unwrap();
++    fs::write(mount_root.join("Unknown/Outer/Inner.zip"), b"archive").unwrap();
++    let config = root.join("config.toml");
++    legacy_config(&config, &[&source], &mount_root);
++    let database_path = root.join("library.sqlite3");
++    scan_source_folder_at(&config, &database_path, &source, "overlap-test").unwrap();
++    let database = Database::open_or_create(&database_path).unwrap();
++    let paths: Vec<PathBuf> = database
++        .load_archives()
++        .unwrap()
++        .into_iter()
++        .map(|archive| archive.absolute_path)
++        .collect();
++    assert!(
++        paths.iter().all(|path| !path.starts_with(&mount_root)),
++        "{paths:?}"
++    );
++    assert!(paths.contains(&source.join("roms/Outer.zip")), "{paths:?}");
++}
++
++#[test]
++fn doctor_never_creates_a_mount_root_inside_a_source() {
++    let fixture = tempfile::tempdir().unwrap();
++    let source = fixture.path().join("library");
++    fs::create_dir(&source).unwrap();
++    let mount_root = source.join("mnt");
++    let config = fixture.path().join("config.toml");
++    legacy_config(&config, &[&source], &mount_root);
++    let report = run_doctor(&config);
++    assert!(
++        report
++            .checks
++            .iter()
++            .any(|check| check.status == DoctorStatus::Fail
++                && check.detail.contains("source folder")),
++        "{:#?}",
++        report.checks
++    );
++    assert!(
++        !mount_root.exists(),
++        "doctor created the mount root inside a source"
++    );
++}
++
++#[test]
++fn mount_root_creation_is_refused_and_not_offered_inside_a_source() {
++    let fixture = tempfile::tempdir().unwrap();
++    let source = fixture.path().join("library");
++    fs::create_dir(&source).unwrap();
++    let mount_root = source.join("mnt");
++    let config_path = fixture.path().join("config.toml");
++    legacy_config(&config_path, &[&source], &mount_root);
++    assert!(!run_setup_diagnostics_read_only(&config_path).can_create_mount_root);
++    let config = Config::load_from(&config_path).unwrap();
++    assert!(create_configured_mount_root(&config).is_err());
++    assert!(!mount_root.exists());
++    // A disjoint mount root is still offered and created.
++    let disjoint = fixture.path().join("mounts");
++    legacy_config(&config_path, &[&source], &disjoint);
++    assert!(run_setup_diagnostics_read_only(&config_path).can_create_mount_root);
++    create_configured_mount_root(&Config::load_from(&config_path).unwrap()).unwrap();
++    assert!(disjoint.is_dir());
++}
++
++#[derive(Default)]
++struct CountingBackend {
++    mounts: std::cell::Cell<usize>,
++}
++
++impl MountBackend for CountingBackend {
++    fn mount(&self, _plan: &MountPlan) -> Result<()> {
++        self.mounts.set(self.mounts.get() + 1);
++        Ok(())
++    }
++    fn unmount(&self, _mount_path: &Path) -> Result<()> {
++        Ok(())
++    }
++    fn active_mount_paths(&self, _root: &Path) -> Result<HashSet<PathBuf>> {
++        Ok(HashSet::new())
++    }
++}
++
++#[test]
++fn mounting_into_an_overlapping_mount_root_is_refused() {
++    let fixture = tempfile::tempdir().unwrap();
++    let source = fixture.path().join("library");
++    fs::create_dir_all(source.join("roms")).unwrap();
++    let archive = source.join("roms/Good.zip");
++    fs::write(&archive, b"archive").unwrap();
++    // Mount root equal to the source: mounting would create folders in it.
++    let equal = Config {
++        source_folders: vec![source.clone()],
++        mount_root: source.clone(),
++        ratarmount_bin: "ratarmount".to_string(),
++        master_rom_root: None,
++    };
++    let plan = ArchiveScanner::new(&equal).mount_plans().unwrap().remove(0);
++    let backend = CountingBackend::default();
++    assert!(mount_one_plan_outcome(&equal, plan.clone(), &backend).is_err());
++    assert_eq!(backend.mounts.get(), 0);
++    assert!(!plan.mount_path.exists());
++    // Batch validation must not create a mount root inside the source.
++    let inside = Config {
++        mount_root: source.join("mnt"),
++        ..equal
++    };
++    let session = ArchiveMountSession::new(&inside).unwrap();
++    assert!(session.validate_batch_targets(&[archive]).is_err());
++    assert!(!source.join("mnt").exists());
++}
+-- 
+2.43.0
+
+
+From 3f2f9069295e4c4f0ac4f349fe2add16d1506cfc Mon Sep 17 00:00:00 2001
+From: Claude <noreply@anthropic.com>
+Date: Wed, 4 Nov 2026 11:07:47 +0000
+Subject: [PATCH 3/3] Protect disabled sources centrally and gate unknown
+ source sets
+
+Owner decision (round 3, option A): Config gains
+`configured_source_roots: Option<Vec<PathBuf>>`, every configured source
+path (enabled and disabled). parse_config, the only production loader,
+always sets Some. ensure_mount_root_disjoint_from_config now checks
+enabled sources, every configured source and the master ROM root, and
+fails closed with a "cannot verify" error when the set is None. That one
+guard covers clean, plan_stale_mount_directories, cleanup_selected_*, the
+Doctor gates, Doctor mount-root creation, create_configured_mount_root,
+batch validation and mount/mount-one/remount. Doctor's source-root
+boundary also includes every configured source. Scan and read paths are
+not gated.
+
+Literals: the core-internal per-folder scan config, the GUI native-media
+preview and core lib tests that never clean, mount or run Doctor use
+None; every other literal uses Some(<its source_folders>).
+
+C1: the native-media preview (and the bounded import built from it) now
+scans with the configured mount root (new pub configured_mount_root_at),
+so mount-root content inside the previewed source is excluded.
+
+Regressions: a disabled [[source]] equal to, inside and containing the
+mount root (loaded via Config::load_from) is refused by clean, the
+stale plan, Doctor CleanMountRoot/CleanMountPath, run_doctor creation and
+mount-one; disjoint disabled-source controls; a None set fails closed for
+cleanup, creation and mount; the native-media preview skips mount-root
+content.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01BZ7RNxHiqaj6yPxf5e6w8f
+---
+ crates/archivefs-cli/src/main.rs              |   2 +
+ .../src/catalogue_reconciliation/tests.rs     |   2 +
+ .../snapshot/tests.rs                         |   1 +
+ .../archive_parent_e2e.rs                     |   1 +
+ .../src/dat/library_verification/tests.rs     |   1 +
+ crates/archivefs-core/src/database.rs         |  10 ++
+ .../src/database/amiga_adf_identity_tests.rs  |   1 +
+ .../src/database/catalogue_health_tests.rs    |   1 +
+ .../src/database/cue_bin_tests.rs             |   1 +
+ .../src/database/disc_order_tests.rs          |   1 +
+ .../src/database/discovery_import/tests.rs    |   2 +
+ .../src/database/gdi_disc_tests.rs            |   1 +
+ .../src/database/missing_cleanup/tests.rs     |   2 +
+ .../src/database/preservation_fingerprint.rs  |   1 +
+ .../archivefs-core/src/diagnostics/repair.rs  |   7 +-
+ .../src/diagnostics/repair/tests.rs           |  69 ++++++++
+ .../src/format_coverage_matrix/tests.rs       |   2 +
+ crates/archivefs-core/src/ingestion/tests.rs  |   1 +
+ .../src/ingestion/whdload_dat/tests.rs        |   1 +
+ .../src/launch/cemu_readiness_tests.rs        |   2 +
+ .../archivefs-core/src/lha_catalogue_tests.rs |   1 +
+ crates/archivefs-core/src/lib.rs              | 136 +++++++++++++++-
+ .../src/mount_root_validation_tests.rs        | 149 ++++++++++++++++++
+ .../src/repair/ps1_pbp_export/tests.rs        |   1 +
+ .../tests/archive_member_platform_scan.rs     |   1 +
+ .../archivefs-core/tests/catalogue_cleanup.rs |   1 +
+ .../tests/catalogue_health_adversarial.rs     |   3 +
+ .../tests/catalogue_health_truth.rs           |   2 +
+ .../tests/catalogue_rebind_review.rs          |   2 +
+ .../tests/forget_confirmed_missing.rs         |   1 +
+ .../tests/game_boy_scan_platform.rs           |   2 +
+ .../tests/platform_folder_aliases.rs          |   2 +
+ .../tests/platform_format_content.rs          |   1 +
+ .../tests/platform_format_coverage.rs         |   1 +
+ .../tests/spectrum_bounded_import.rs          |   1 +
+ .../tests/spectrum_discovery.rs               |   1 +
+ .../tests/spectrum_native_media.rs            |   1 +
+ .../tests/spectrum_rzx_preservation.rs        |   1 +
+ .../archivefs-core/tests/whdload_scan_dat.rs  |   1 +
+ .../src/collection_discovery_page.rs          |   1 +
+ .../src/dat_sources_page/simple/tests.rs      |   1 +
+ .../dat_sources_page/tests/cue_bin_order.rs   |   1 +
+ .../dat_sources_page/tests/multidisc_order.rs |   1 +
+ .../gui_v2/history_discovery_import/tests.rs  |   1 +
+ .../src/gui_v2/missing_review.rs              |   1 +
+ .../src/gui_v2/native_import_journey_tests.rs |   1 +
+ .../src/gui_v2/native_media_apply_tests.rs    |   1 +
+ .../src/gui_v2/native_media_preview.rs        |   7 +-
+ .../src/gui_v2/recording_integrity.rs         |   1 +
+ crates/archivefs-gui/src/gui_v2/tests.rs      |   4 +
+ .../src/tests/database_and_catalogue.rs       |   1 +
+ .../src/tests/doctor_and_repair.rs            |   1 +
+ crates/archivefs-gui/src/tests/mod.rs         |   3 +
+ .../src/tests/onboarding_flow.rs              |   1 +
+ 54 files changed, 438 insertions(+), 5 deletions(-)
+
+diff --git a/crates/archivefs-cli/src/main.rs b/crates/archivefs-cli/src/main.rs
+index aac40d8..63de896 100644
+--- a/crates/archivefs-cli/src/main.rs
++++ b/crates/archivefs-cli/src/main.rs
+@@ -7582,6 +7582,7 @@ mod tests {
+ 
+     fn config_for(source_dir: &Path, mount_dir: &Path) -> Config {
+         Config {
++            configured_source_roots: Some(vec![source_dir.to_path_buf()]),
+             source_folders: vec![source_dir.to_path_buf()],
+             mount_root: mount_dir.to_path_buf(),
+             ratarmount_bin: "ratarmount".to_string(),
+@@ -7856,6 +7857,7 @@ mod tests {
+         write_archive_file(&source_a, "a.zip", b"a");
+         write_archive_file(&source_b, "b.zip", b"b");
+         let config = Config {
++            configured_source_roots: Some(vec![source_a.clone(), source_b.clone()]),
+             source_folders: vec![source_a.clone(), source_b.clone()],
+             mount_root: mount,
+             ratarmount_bin: "ratarmount".to_string(),
+diff --git a/crates/archivefs-core/src/catalogue_reconciliation/tests.rs b/crates/archivefs-core/src/catalogue_reconciliation/tests.rs
+index 733802d..7542341 100644
+--- a/crates/archivefs-core/src/catalogue_reconciliation/tests.rs
++++ b/crates/archivefs-core/src/catalogue_reconciliation/tests.rs
+@@ -539,6 +539,7 @@ mod catalogue {
+             fs::write(root.join(name), bytes).unwrap();
+         }
+         let config = Config {
++            configured_source_roots: None,
+             source_folders: vec![root.clone()],
+             mount_root: dir.path().join("mounts"),
+             ratarmount_bin: "ratarmount".into(),
+@@ -821,6 +822,7 @@ mod companions {
+         let root = dir.path().join("games");
+         fs::create_dir_all(&root).unwrap();
+         let config = Config {
++            configured_source_roots: None,
+             source_folders: vec![root.clone()],
+             mount_root: dir.path().join("mounts"),
+             ratarmount_bin: "ratarmount".into(),
+diff --git a/crates/archivefs-core/src/classic_trainer_evidence/snapshot/tests.rs b/crates/archivefs-core/src/classic_trainer_evidence/snapshot/tests.rs
+index 962cc4c..0e25ea3 100644
+--- a/crates/archivefs-core/src/classic_trainer_evidence/snapshot/tests.rs
++++ b/crates/archivefs-core/src/classic_trainer_evidence/snapshot/tests.rs
+@@ -30,6 +30,7 @@ impl World {
+         bytes[30 + 16384] = 0x76;
+         std::fs::write(&path, &bytes).unwrap();
+         let config = Config {
++            configured_source_roots: None,
+             source_folders: vec![root.join("games")],
+             mount_root: root.join("mount"),
+             ratarmount_bin: "ratarmount".into(),
+diff --git a/crates/archivefs-core/src/dat/library_identity_projection/archive_parent_e2e.rs b/crates/archivefs-core/src/dat/library_identity_projection/archive_parent_e2e.rs
+index bf6cd31..341818d 100644
+--- a/crates/archivefs-core/src/dat/library_identity_projection/archive_parent_e2e.rs
++++ b/crates/archivefs-core/src/dat/library_identity_projection/archive_parent_e2e.rs
+@@ -172,6 +172,7 @@ impl Fixture {
+ 
+     fn scan(database: &mut Database, source: &Path, root: &Path) {
+         let config = Config {
++            configured_source_roots: None,
+             source_folders: vec![source.to_path_buf()],
+             mount_root: root.join("mount"),
+             ratarmount_bin: "ratarmount".to_string(),
+diff --git a/crates/archivefs-core/src/dat/library_verification/tests.rs b/crates/archivefs-core/src/dat/library_verification/tests.rs
+index bee658f..396284d 100644
+--- a/crates/archivefs-core/src/dat/library_verification/tests.rs
++++ b/crates/archivefs-core/src/dat/library_verification/tests.rs
+@@ -820,6 +820,7 @@ fn native_cue_verification_survives_unchanged_production_rescans() {
+     let (f, _, _) = cue_fixture(["Track01.bin", "Track02.bin"]);
+     assert_eq!(cue_run(&f).verified, 1);
+     let config = crate::Config {
++        configured_source_roots: Some(vec![f.root.clone()]),
+         source_folders: vec![f.root.clone()],
+         mount_root: f.dir.path().join("mount"),
+         ratarmount_bin: "ratarmount".into(),
+diff --git a/crates/archivefs-core/src/database.rs b/crates/archivefs-core/src/database.rs
+index a7d5400..d36647d 100644
+--- a/crates/archivefs-core/src/database.rs
++++ b/crates/archivefs-core/src/database.rs
+@@ -9588,6 +9588,7 @@ fn scan_and_persist_folders_transaction(
+             continue;
+         }
+         let folder_config = Config {
++            configured_source_roots: None,
+             source_folders: vec![folder.path.clone()],
+             mount_root: PathBuf::new(),
+             ratarmount_bin: String::new(),
+@@ -10891,6 +10892,7 @@ mod tests {
+ 
+     fn config_for(source_dir: &Path, mount_dir: &Path) -> Config {
+         Config {
++            configured_source_roots: Some(vec![source_dir.to_path_buf()]),
+             source_folders: vec![source_dir.to_path_buf()],
+             mount_root: mount_dir.to_path_buf(),
+             ratarmount_bin: "ratarmount".to_string(),
+@@ -13624,6 +13626,7 @@ mod tests {
+         write_archive_file(&source_a, "a.zip", b"a");
+         write_archive_file(&source_b, "b.zip", b"b");
+         let config = Config {
++            configured_source_roots: Some(vec![source_a.clone(), source_b.clone()]),
+             source_folders: vec![source_a.clone(), source_b.clone()],
+             mount_root: mount,
+             ratarmount_bin: "ratarmount".to_string(),
+@@ -13682,6 +13685,7 @@ mod tests {
+         write_archive_file(&source_a, "a.zip", b"a");
+         write_archive_file(&source_b, "b.zip", b"b");
+         let config = Config {
++            configured_source_roots: Some(vec![source_a.clone(), source_b.clone()]),
+             source_folders: vec![source_a.clone(), source_b.clone()],
+             mount_root: mount,
+             ratarmount_bin: "ratarmount".to_string(),
+@@ -13736,6 +13740,7 @@ mod tests {
+         write_archive_file(&source_a, "game.zip", b"from a");
+         write_archive_file(&source_b, "game.zip", b"from b, different size");
+         let config = Config {
++            configured_source_roots: Some(vec![source_a.clone(), source_b.clone()]),
+             source_folders: vec![source_a.clone(), source_b.clone()],
+             mount_root: mount,
+             ratarmount_bin: "ratarmount".to_string(),
+@@ -17484,6 +17489,11 @@ echo "$out"
+         write_archive_file(&source_b, "b.zip", b"b");
+         write_archive_file(&source_c, "c.zip", b"c");
+         let config = Config {
++            configured_source_roots: Some(vec![
++                source_a.clone(),
++                source_b.clone(),
++                source_c.clone(),
++            ]),
+             source_folders: vec![source_a.clone(), source_b.clone(), source_c.clone()],
+             mount_root: mount,
+             ratarmount_bin: "ratarmount".to_string(),
+diff --git a/crates/archivefs-core/src/database/amiga_adf_identity_tests.rs b/crates/archivefs-core/src/database/amiga_adf_identity_tests.rs
+index c1759e6..f925997 100644
+--- a/crates/archivefs-core/src/database/amiga_adf_identity_tests.rs
++++ b/crates/archivefs-core/src/database/amiga_adf_identity_tests.rs
+@@ -115,6 +115,7 @@ fn lab_in(header: &str, entries: Entries, files: &[(&str, &str, &str)]) -> Lab {
+     .unwrap();
+     let mut db = Database::open_or_create(root.join("library.sqlite3")).unwrap();
+     let config = crate::Config {
++        configured_source_roots: None,
+         source_folders: vec![root.join("games")],
+         mount_root: root.join("mount"),
+         ratarmount_bin: "ratarmount".into(),
+diff --git a/crates/archivefs-core/src/database/catalogue_health_tests.rs b/crates/archivefs-core/src/database/catalogue_health_tests.rs
+index 55d4101..e35cbfa 100644
+--- a/crates/archivefs-core/src/database/catalogue_health_tests.rs
++++ b/crates/archivefs-core/src/database/catalogue_health_tests.rs
+@@ -3,6 +3,7 @@ use crate::catalogue_health::{ScanCoverageState, SourceScanCoverage};
+ 
+ fn config(roots: Vec<PathBuf>, temp: &Path) -> Config {
+     Config {
++        configured_source_roots: None,
+         source_folders: roots,
+         mount_root: temp.join("mounts"),
+         ratarmount_bin: "ratarmount".into(),
+diff --git a/crates/archivefs-core/src/database/cue_bin_tests.rs b/crates/archivefs-core/src/database/cue_bin_tests.rs
+index d1f0bba..5fbe428 100644
+--- a/crates/archivefs-core/src/database/cue_bin_tests.rs
++++ b/crates/archivefs-core/src/database/cue_bin_tests.rs
+@@ -72,6 +72,7 @@ struct Library {
+ 
+ fn config(root: &Path) -> crate::Config {
+     crate::Config {
++        configured_source_roots: Some(vec![root.join("games")]),
+         source_folders: vec![root.join("games")],
+         mount_root: root.join("mount"),
+         ratarmount_bin: "ratarmount".into(),
+diff --git a/crates/archivefs-core/src/database/disc_order_tests.rs b/crates/archivefs-core/src/database/disc_order_tests.rs
+index 0e550df..bcf4700 100644
+--- a/crates/archivefs-core/src/database/disc_order_tests.rs
++++ b/crates/archivefs-core/src/database/disc_order_tests.rs
+@@ -72,6 +72,7 @@ fn library_in(folder: &str, catalogue: &[(&str, &str)], library: &[(&str, &str)]
+ 
+ fn config(root: &Path) -> crate::Config {
+     crate::Config {
++        configured_source_roots: None,
+         source_folders: vec![root.join("games")],
+         mount_root: root.join("mount"),
+         ratarmount_bin: "ratarmount".into(),
+diff --git a/crates/archivefs-core/src/database/discovery_import/tests.rs b/crates/archivefs-core/src/database/discovery_import/tests.rs
+index d3e42ea..07a4d4d 100644
+--- a/crates/archivefs-core/src/database/discovery_import/tests.rs
++++ b/crates/archivefs-core/src/database/discovery_import/tests.rs
+@@ -32,6 +32,7 @@ impl Fixture {
+         crate::scan_and_persist(
+             &mut d,
+             &Config {
++                configured_source_roots: None,
+                 source_folders: vec![root.clone()],
+                 mount_root: t.path().join("mount"),
+                 ratarmount_bin: String::new(),
+@@ -69,6 +70,7 @@ impl Fixture {
+         let d = self.db();
+         let context = begin_bounded_preview(&d, &self.cfg).unwrap();
+         let config = Config {
++            configured_source_roots: None,
+             source_folders: vec![self.root.clone()],
+             mount_root: PathBuf::new(),
+             ratarmount_bin: String::new(),
+diff --git a/crates/archivefs-core/src/database/gdi_disc_tests.rs b/crates/archivefs-core/src/database/gdi_disc_tests.rs
+index fd04ac0..fd53b27 100644
+--- a/crates/archivefs-core/src/database/gdi_disc_tests.rs
++++ b/crates/archivefs-core/src/database/gdi_disc_tests.rs
+@@ -27,6 +27,7 @@ fn a_loose_gdi_is_not_a_library_entry_so_no_descriptor_only_identity_can_be_save
+         fs::write(games.join(name), vec![1_u8; 2352 * sectors]).unwrap();
+     }
+     let config = crate::Config {
++        configured_source_roots: None,
+         source_folders: vec![root.path().join("games")],
+         mount_root: root.path().join("mount"),
+         ratarmount_bin: "ratarmount".into(),
+diff --git a/crates/archivefs-core/src/database/missing_cleanup/tests.rs b/crates/archivefs-core/src/database/missing_cleanup/tests.rs
+index 5bfbff5..78fc486 100644
+--- a/crates/archivefs-core/src/database/missing_cleanup/tests.rs
++++ b/crates/archivefs-core/src/database/missing_cleanup/tests.rs
+@@ -27,6 +27,7 @@ impl Fixture {
+             fs::write(path, b"synthetic game").unwrap();
+         }
+         let config = Config {
++            configured_source_roots: None,
+             source_folders: vec![root.clone()],
+             mount_root: temp.path().join("mount"),
+             ratarmount_bin: "ratarmount".into(),
+@@ -331,6 +332,7 @@ impl Fixture {
+     }
+     fn config(&self) -> Config {
+         Config {
++            configured_source_roots: None,
+             source_folders: vec![self.root.clone()],
+             mount_root: self._temp.path().join("mount"),
+             ratarmount_bin: "ratarmount".into(),
+diff --git a/crates/archivefs-core/src/database/preservation_fingerprint.rs b/crates/archivefs-core/src/database/preservation_fingerprint.rs
+index 3c91f03..3410209 100644
+--- a/crates/archivefs-core/src/database/preservation_fingerprint.rs
++++ b/crates/archivefs-core/src/database/preservation_fingerprint.rs
+@@ -223,6 +223,7 @@ mod tests {
+         bytes.extend_from_slice(&[0x80, 10, 0, 0, 0, 0, 0, 0, 0, 0]);
+         std::fs::write(&path, &bytes).unwrap();
+         let config = Config {
++            configured_source_roots: None,
+             source_folders: vec![source.clone()],
+             mount_root: dir.path().join("mount"),
+             ratarmount_bin: String::new(),
+diff --git a/crates/archivefs-core/src/diagnostics/repair.rs b/crates/archivefs-core/src/diagnostics/repair.rs
+index 7fe377b..f5a5a5e 100644
+--- a/crates/archivefs-core/src/diagnostics/repair.rs
++++ b/crates/archivefs-core/src/diagnostics/repair.rs
+@@ -762,7 +762,12 @@ fn affected_path(finding: &Finding) -> Result<PathBuf, DoctorRepairRejection> {
+ /// hard boundary: EmuWiz never modifies the user's library.
+ fn guard_against_source_roots(path: &Path, config: &Config) -> Result<(), DoctorRepairRejection> {
+     // The organised master ROM root is library content too.
+-    for source in config.source_folders.iter().chain(&config.master_rom_root) {
++    for source in config
++        .source_folders
++        .iter()
++        .chain(config.configured_source_roots.iter().flatten())
++        .chain(&config.master_rom_root)
++    {
+         if path == source.as_path() || path.starts_with(source) {
+             return Err(DoctorRepairRejection::PathUnderSourceRoot);
+         }
+diff --git a/crates/archivefs-core/src/diagnostics/repair/tests.rs b/crates/archivefs-core/src/diagnostics/repair/tests.rs
+index 528c7b7..d51624a 100644
+--- a/crates/archivefs-core/src/diagnostics/repair/tests.rs
++++ b/crates/archivefs-core/src/diagnostics/repair/tests.rs
+@@ -54,6 +54,7 @@ impl Fixture {
+     /// fixture, so no test can reach real data.
+     fn config(&self) -> Config {
+         Config {
++            configured_source_roots: Some(vec![self.dir("roms")]),
+             source_folders: vec![self.dir("roms")],
+             mount_root: self.dir("mnt"),
+             ratarmount_bin: "ratarmount".to_string(),
+@@ -348,6 +349,7 @@ fn a_path_inside_a_configured_source_folder_is_always_refused() {
+     let fixture = Fixture::new("source-root");
+     let source = fixture.dir("roms");
+     let config = Config {
++        configured_source_roots: Some(vec![source.clone()]),
+         source_folders: vec![source],
+         mount_root: fixture.dir("roms/mnt"),
+         ratarmount_bin: "ratarmount".to_string(),
+@@ -746,6 +748,7 @@ fn a_refused_rebuild_leaves_the_previous_valid_index_byte_identical() {
+     // No configured source folder exists, so a rebuild would produce an
+     // empty index. The guard must refuse before anything is written.
+     let config = Config {
++        configured_source_roots: Some(vec![fixture.root.join("roms-missing")]),
+         source_folders: vec![fixture.root.join("roms-missing")],
+         mount_root: fixture.dir("mnt"),
+         ratarmount_bin: "ratarmount".to_string(),
+@@ -1793,6 +1796,7 @@ fn clean_and_doctor_refuse_a_mount_root_equal_to_a_source() {
+     let source = fixture.dir("src");
+     fixture.file("src/roms/Good.zip", b"archive bytes");
+     let config = Config {
++        configured_source_roots: Some(vec![source.clone()]),
+         source_folders: vec![source.clone()],
+         mount_root: source.clone(),
+         ratarmount_bin: "ratarmount".to_string(),
+@@ -1817,6 +1821,7 @@ fn clean_and_doctor_refuse_a_mount_root_inside_a_source() {
+     fixture.file("src/roms/Good.zip", b"archive bytes");
+     let leftover = fixture.dir("src/mnt/Unknown/Good");
+     let config = Config {
++        configured_source_roots: Some(vec![source.clone()]),
+         source_folders: vec![source],
+         mount_root: fixture.root.join("src/mnt"),
+         ratarmount_bin: "ratarmount".to_string(),
+@@ -1834,6 +1839,7 @@ fn clean_and_doctor_refuse_a_mount_root_containing_a_source() {
+     // overlap gate can refuse this one.
+     let empty_beside_source = fixture.dir("mnt/Other/Empty");
+     let config = Config {
++        configured_source_roots: Some(vec![source.clone()]),
+         source_folders: vec![source],
+         mount_root: fixture.root.join("mnt"),
+         ratarmount_bin: "ratarmount".to_string(),
+@@ -1858,6 +1864,7 @@ fn clean_and_doctor_refuse_a_mount_root_equal_to_a_symlinked_source() {
+     // The source is configured through the link; the mount root names the
+     // real folder. Only a symlink-resolved comparison sees they are the same.
+     let config = Config {
++        configured_source_roots: Some(vec![linked.clone()]),
+         source_folders: vec![linked],
+         mount_root: real,
+         ratarmount_bin: "ratarmount".to_string(),
+@@ -1875,6 +1882,7 @@ fn clean_and_doctor_refuse_a_symlinked_mount_root_resolving_into_a_source() {
+     let linked = fixture.root.join("mnt-link");
+     std::os::unix::fs::symlink(source.join("mnt"), &linked).expect("symlink");
+     let config = Config {
++        configured_source_roots: Some(vec![source.clone()]),
+         source_folders: vec![source],
+         mount_root: linked,
+         ratarmount_bin: "ratarmount".to_string(),
+@@ -1914,3 +1922,64 @@ fn clean_and_doctor_refuse_a_mount_root_containing_the_master_rom_root() {
+     let platform = fixture.dir("mnt/organised/SNES");
+     assert_overlapping_mount_root_is_refused(&fixture, &config, &[platform]);
+ }
++
++// --- Disabled `[[source]]` overlapping the mount root (round 3, F2) ------
++
++/// Writes a `[[source]]` config (enabled `roms`, disabled `disabled`) and
++/// loads it the way the CLI and GUI do, so the disabled source is known only
++/// through `Config::load_from`.
++fn config_with_disabled_source(fixture: &Fixture, mount_root: &str, disabled: &str) -> Config {
++    let path = fixture.root.join("config.toml");
++    fs::write(
++        &path,
++        format!(
++            "mount_root = \"{}\"\nratarmount_bin = \"ratarmount\"\n\n[[source]]\npath = \"{}\"\nenabled = true\n\n[[source]]\npath = \"{}\"\nenabled = false\n",
++            fixture.root.join(mount_root).display(),
++            fixture.dir("roms").display(),
++            fixture.dir(disabled).display()
++        ),
++    )
++    .expect("config");
++    let config = crate::Config::load_from(&path).expect("load");
++    assert_eq!(config.source_folders, vec![fixture.root.join("roms")]);
++    config
++}
++
++#[test]
++fn clean_and_doctor_refuse_a_mount_root_equal_to_a_disabled_source() {
++    let fixture = Fixture::new("disabled-equal");
++    let config = config_with_disabled_source(&fixture, "off", "off");
++    let saves = fixture.dir("off/Saves/slot1");
++    assert_overlapping_mount_root_is_refused(&fixture, &config, &[saves]);
++}
++
++#[test]
++fn clean_and_doctor_refuse_a_mount_root_containing_a_disabled_source() {
++    let fixture = Fixture::new("disabled-inside-mount-root");
++    let config = config_with_disabled_source(&fixture, "mnt", "mnt/off");
++    let in_source = fixture.dir("mnt/off/Empty");
++    let beside_source = fixture.dir("mnt/Other/Empty");
++    assert_overlapping_mount_root_is_refused(&fixture, &config, &[in_source, beside_source]);
++}
++
++#[test]
++fn clean_and_doctor_refuse_a_mount_root_inside_a_disabled_source() {
++    let fixture = Fixture::new("disabled-contains-mount-root");
++    let config = config_with_disabled_source(&fixture, "off/mnt", "off");
++    let leftover = fixture.dir("off/mnt/Unknown/Good");
++    assert_overlapping_mount_root_is_refused(&fixture, &config, &[leftover]);
++}
++
++#[test]
++fn a_disjoint_disabled_source_still_allows_cleanup() {
++    let fixture = Fixture::new("disabled-disjoint");
++    let config = config_with_disabled_source(&fixture, "mnt", "off");
++    let empty_in_disabled = fixture.dir("off/Empty");
++    let planned = planned_mount_paths(&fixture, &config, &["Old Game"]);
++    let stale = crate::plan_stale_mount_directories(&config).expect("plan");
++    assert!(stale.contains(&planned[0]), "{stale:?}");
++    let removed = crate::clean_mount_root(&config).expect("clean");
++    assert!(removed.contains(&planned[0]), "{removed:?}");
++    assert!(empty_in_disabled.is_dir());
++    assert!(config.mount_root.is_dir());
++}
+diff --git a/crates/archivefs-core/src/format_coverage_matrix/tests.rs b/crates/archivefs-core/src/format_coverage_matrix/tests.rs
+index c05e465..4ba5ffb 100644
+--- a/crates/archivefs-core/src/format_coverage_matrix/tests.rs
++++ b/crates/archivefs-core/src/format_coverage_matrix/tests.rs
+@@ -361,6 +361,7 @@ fn stale_unsupported_fingerprints_are_re_evaluated_only_for_newly_stored_extensi
+         (1, fingerprint(&still_ambiguous, "ambiguous")),
+     ];
+     let config = Config {
++        configured_source_roots: None,
+         source_folders: vec![root.clone()],
+         mount_root: dir.path().join("mount"),
+         ratarmount_bin: "ratarmount".into(),
+@@ -466,6 +467,7 @@ fn detector_assigned_shared_signature_rows_are_re_evaluated_not_reused() {
+         }
+     };
+     let config = Config {
++        configured_source_roots: None,
+         source_folders: vec![root.clone()],
+         mount_root: dir.path().join("mount"),
+         ratarmount_bin: "ratarmount".into(),
+diff --git a/crates/archivefs-core/src/ingestion/tests.rs b/crates/archivefs-core/src/ingestion/tests.rs
+index a381e97..36f9ad4 100644
+--- a/crates/archivefs-core/src/ingestion/tests.rs
++++ b/crates/archivefs-core/src/ingestion/tests.rs
+@@ -2699,6 +2699,7 @@ fn lha_package_row_retains_its_exact_inspection_refusal() {
+     let path = root.join("Ambiguous.lha");
+     std::fs::write(&path, &bytes).unwrap();
+     let config = crate::Config {
++        configured_source_roots: None,
+         source_folders: vec![root],
+         mount_root: Default::default(),
+         ratarmount_bin: String::new(),
+diff --git a/crates/archivefs-core/src/ingestion/whdload_dat/tests.rs b/crates/archivefs-core/src/ingestion/whdload_dat/tests.rs
+index 8842890..d4a173f 100644
+--- a/crates/archivefs-core/src/ingestion/whdload_dat/tests.rs
++++ b/crates/archivefs-core/src/ingestion/whdload_dat/tests.rs
+@@ -188,6 +188,7 @@ fn mid_scan_catalogue_change_rolls_back_native_scan_writes_and_preserves_history
+     let path = root.join("db");
+     let mut db = crate::Database::open_or_create(&path).unwrap();
+     let config = crate::Config {
++        configured_source_roots: None,
+         source_folders: vec![source.clone()],
+         mount_root: root.join("mount"),
+         ratarmount_bin: String::new(),
+diff --git a/crates/archivefs-core/src/launch/cemu_readiness_tests.rs b/crates/archivefs-core/src/launch/cemu_readiness_tests.rs
+index 55da458..4a3a5c8 100644
+--- a/crates/archivefs-core/src/launch/cemu_readiness_tests.rs
++++ b/crates/archivefs-core/src/launch/cemu_readiness_tests.rs
+@@ -615,6 +615,7 @@ fn cemu_scanner_admits_only_the_exact_structured_base_inside_its_source() {
+     cafe_rpx(&loose);
+     assert!(crate::Archive::from_path_in_root(&loose, &root).is_none());
+     let config = crate::Config {
++        configured_source_roots: None,
+         source_folders: vec![root.clone()],
+         mount_root: root.join("unused-mount"),
+         ratarmount_bin: "unused".into(),
+@@ -664,6 +665,7 @@ fn cemu_scanner_rechecks_positive_and_negative_cache_when_sibling_evidence_chang
+         non_archive_kind: Some("unsupported".into()),
+     };
+     let config = crate::Config {
++        configured_source_roots: None,
+         source_folders: vec![root.clone()],
+         mount_root: root.join("unused-mount"),
+         ratarmount_bin: "unused".into(),
+diff --git a/crates/archivefs-core/src/lha_catalogue_tests.rs b/crates/archivefs-core/src/lha_catalogue_tests.rs
+index 02a2c0f..c1b20a4 100644
+--- a/crates/archivefs-core/src/lha_catalogue_tests.rs
++++ b/crates/archivefs-core/src/lha_catalogue_tests.rs
+@@ -11,6 +11,7 @@ use crate::{ArchiveKind, Config, Database, archive_kind, media_registry, scan_an
+ 
+ fn config(source: &Path, root: &Path) -> Config {
+     Config {
++        configured_source_roots: None,
+         source_folders: vec![source.to_path_buf()],
+         mount_root: root.join("mount"),
+         ratarmount_bin: "ratarmount".to_string(),
+diff --git a/crates/archivefs-core/src/lib.rs b/crates/archivefs-core/src/lib.rs
+index 4083a96..f60d11e 100644
+--- a/crates/archivefs-core/src/lib.rs
++++ b/crates/archivefs-core/src/lib.rs
+@@ -901,6 +901,14 @@ pub struct Config {
+     /// platform directories beneath it. `None` when the user has not
+     /// configured one; configuring it never moves anything by itself.
+     pub master_rom_root: Option<PathBuf>,
++    /// Every configured source path, enabled *and disabled*, exactly as the
++    /// configuration lists them. `source_folders` holds only the enabled
++    /// ones; this is what keeps a disabled source safe from mount-root
++    /// creation, mounting and cleanup. `None` means the complete set is not
++    /// known (a hand-built or partial `Config`), and every operation that
++    /// creates, mounts into or removes folders under the mount root then
++    /// fails closed. [`parse_config`] always sets it.
++    pub configured_source_roots: Option<Vec<PathBuf>>,
+ }
+ 
+ impl Config {
+@@ -2379,6 +2387,20 @@ impl PendingSourceEntry {
+ pub fn parse_config(contents: &str) -> Result<Config> {
+     let fields = parse_config_fields(contents)?;
+ 
++    let configured_source_roots = if !fields.structured_sources.is_empty() {
++        fields
++            .structured_sources
++            .iter()
++            .map(|source| source.path.clone())
++            .collect::<Vec<_>>()
++    } else {
++        fields
++            .source_folders
++            .iter()
++            .flatten()
++            .map(PathBuf::from)
++            .collect()
++    };
+     let source_folders = if !fields.structured_sources.is_empty() {
+         fields
+             .structured_sources
+@@ -2404,6 +2426,7 @@ pub fn parse_config(contents: &str) -> Result<Config> {
+             .ratarmount_bin
+             .unwrap_or_else(|| "ratarmount".to_string()),
+         master_rom_root: fields.master_rom_root,
++        configured_source_roots: Some(configured_source_roots),
+     })
+ }
+ 
+@@ -3236,9 +3259,18 @@ pub fn ensure_mount_root_disjoint_from_sources(
+ }
+ 
+ /// [`ensure_mount_root_disjoint_from_sources`] for every root `config`
+-/// protects: its source folders and its master ROM root.
++/// protects: its enabled sources, every configured source (disabled ones
++/// included) and its master ROM root. Fails closed when the complete set of
++/// configured sources is unknown.
+ pub(crate) fn ensure_mount_root_disjoint_from_config(config: &Config) -> Result<()> {
++    let Some(configured_source_roots) = &config.configured_source_roots else {
++        return Err(ArchiveFsError::Config(format!(
++            "cannot verify that the temporary preparation folder {} is separate from every configured source folder: the complete list of configured source folders (including disabled ones) is not known, so nothing was created, mounted or removed",
++            config.mount_root.display()
++        )));
++    };
+     ensure_mount_root_disjoint_from_sources(&config.mount_root, &config.source_folders)?;
++    ensure_mount_root_disjoint_from_sources(&config.mount_root, configured_source_roots)?;
+     if let Some(master_rom_root) = &config.master_rom_root {
+         ensure_mount_root_disjoint_from(&config.mount_root, master_rom_root, "master ROM root")?;
+     }
+@@ -4049,8 +4081,9 @@ pub fn scan_all_enabled_sources_default() -> Result<ScanPersistSummary> {
+ }
+ 
+ /// The configured mount root (empty when none is set), so persisted scans
+-/// can exclude mount-root content from a legacy overlapping source.
+-fn configured_mount_root_at(config_path: &Path) -> Result<PathBuf> {
++/// and bounded imports can exclude mount-root content from a legacy
++/// overlapping source.
++pub fn configured_mount_root_at(config_path: &Path) -> Result<PathBuf> {
+     let contents = fs::read_to_string(config_path)
+         .map_err(|source| ArchiveFsError::io(config_path.to_path_buf(), source))?;
+     Ok(parse_config_fields(&contents)?
+@@ -9809,6 +9842,7 @@ mod tests {
+         fs::write(root.join("specific.sMd"), b"rom").unwrap();
+ 
+         let config = Config {
++            configured_source_roots: Some(vec![root.clone()]),
+             source_folders: vec![root.clone()],
+             mount_root: root.join("mount"),
+             ratarmount_bin: "ratarmount".into(),
+@@ -9880,6 +9914,7 @@ mod tests {
+         fs::write(root.join("Disc.iso"), vec![0_u8; 64]).unwrap();
+         fs::write(root.join("Animal Crossing (USA).zip"), b"zip fixture").unwrap();
+         let config = Config {
++            configured_source_roots: Some(vec![root.clone()]),
+             source_folders: vec![root.clone()],
+             mount_root: root.join("mount"),
+             ratarmount_bin: "ratarmount".into(),
+@@ -9943,6 +9978,7 @@ mod tests {
+         .unwrap();
+ 
+         let config = Config {
++            configured_source_roots: Some(vec![root.clone()]),
+             source_folders: vec![root.clone()],
+             mount_root: root.join("mount"),
+             ratarmount_bin: "ratarmount".into(),
+@@ -10051,6 +10087,7 @@ mod tests {
+         fs::write(&boxart, b"not a rom").unwrap();
+ 
+         let config = Config {
++            configured_source_roots: Some(vec![root.clone()]),
+             source_folders: vec![root.clone()],
+             mount_root: root.join("mount"),
+             ratarmount_bin: "ratarmount".into(),
+@@ -10082,6 +10119,7 @@ mod tests {
+         fs::write(&resource, b"scummvm resource, not a rom").unwrap();
+ 
+         let config = Config {
++            configured_source_roots: Some(vec![root.clone()]),
+             source_folders: vec![root.clone()],
+             mount_root: root.join("mount"),
+             ratarmount_bin: "ratarmount".into(),
+@@ -10113,6 +10151,7 @@ mod tests {
+         fs::write(root.join("Sonic.zip"), b"zip bytes").unwrap();
+ 
+         let config = Config {
++            configured_source_roots: Some(vec![root.clone()]),
+             source_folders: vec![root.clone()],
+             mount_root: root.join("mount"),
+             ratarmount_bin: "ratarmount".into(),
+@@ -10145,6 +10184,7 @@ mod tests {
+         }
+ 
+         let config = Config {
++            configured_source_roots: Some(vec![root.clone()]),
+             source_folders: vec![root.clone()],
+             mount_root: root.join("mount"),
+             ratarmount_bin: "ratarmount".into(),
+@@ -10184,6 +10224,7 @@ mod tests {
+         }
+ 
+         let config = Config {
++            configured_source_roots: Some(vec![root.clone()]),
+             source_folders: vec![root.clone()],
+             mount_root: root.join("mount"),
+             ratarmount_bin: "ratarmount".into(),
+@@ -10337,6 +10378,7 @@ mod tests {
+ 
+     fn scan_wiiu(root: &Path) -> ArchiveScanDiscovery {
+         let config = Config {
++            configured_source_roots: Some(vec![root.to_path_buf()]),
+             source_folders: vec![root.to_path_buf()],
+             mount_root: root.join("mount"),
+             ratarmount_bin: "ratarmount".into(),
+@@ -10576,6 +10618,7 @@ mod tests {
+         let path = directory.join(name);
+         fs::write(&path, b"rom").unwrap();
+         let config = Config {
++            configured_source_roots: Some(vec![root.clone()]),
+             source_folders: vec![root.clone()],
+             mount_root: root.join("mount"),
+             ratarmount_bin: "ratarmount".into(),
+@@ -10823,6 +10866,7 @@ mod tests {
+         let mount_root = root.join("mounts");
+         fs::create_dir_all(&mount_root).unwrap();
+         let config = Config {
++            configured_source_roots: Some(vec![root.join("roms")]),
+             source_folders: vec![root.join("roms")],
+             mount_root: mount_root.clone(),
+             ratarmount_bin: "ratarmount".to_string(),
+@@ -10846,6 +10890,7 @@ mod tests {
+         fs::create_dir_all(&outside).unwrap();
+         symlink(&outside, mount_root.join("escape")).unwrap();
+         let config = Config {
++            configured_source_roots: Some(vec![root.join("roms")]),
+             source_folders: vec![root.join("roms")],
+             mount_root: mount_root.clone(),
+             ratarmount_bin: "ratarmount".to_string(),
+@@ -10883,6 +10928,7 @@ mod tests {
+             ),
+         ];
+         let config = Config {
++            configured_source_roots: Some(vec![library.clone()]),
+             source_folders: vec![library],
+             mount_root,
+             ratarmount_bin: "ratarmount".to_string(),
+@@ -10933,6 +10979,7 @@ mod tests {
+             mount_root.join("Alias/Game"),
+         )];
+         let config = Config {
++            configured_source_roots: Some(vec![root.clone()]),
+             source_folders: vec![root],
+             mount_root,
+             ratarmount_bin: "ratarmount".to_string(),
+@@ -10979,6 +11026,7 @@ mod tests {
+             mount_path.clone(),
+         );
+         let config = Config {
++            configured_source_roots: Some(vec![root.clone()]),
+             source_folders: vec![root],
+             mount_root,
+             ratarmount_bin: "ratarmount".to_string(),
+@@ -11009,6 +11057,7 @@ mod tests {
+             mount_path.clone(),
+         );
+         let config = Config {
++            configured_source_roots: Some(vec![root.clone()]),
+             source_folders: vec![root],
+             mount_root,
+             ratarmount_bin: "ratarmount".to_string(),
+@@ -11052,6 +11101,7 @@ mod tests {
+         let mount_root = root.join("mounts");
+         fs::create_dir_all(&mount_root).unwrap();
+         let config = Config {
++            configured_source_roots: Some(vec![root.clone()]),
+             source_folders: vec![root.clone()],
+             mount_root: mount_root.clone(),
+             ratarmount_bin: "ratarmount".to_string(),
+@@ -11083,6 +11133,7 @@ mod tests {
+         fs::create_dir_all(&source_root).unwrap();
+         fs::write(source_root.join("Game.zip"), b"archive").unwrap();
+         let config = Config {
++            configured_source_roots: Some(vec![root.join("roms")]),
+             source_folders: vec![root.join("roms")],
+             mount_root: root.join("mounts"),
+             ratarmount_bin: "ratarmount".to_string(),
+@@ -11113,6 +11164,7 @@ mod tests {
+         let nested = mount_path.join("child");
+         fs::create_dir_all(mount_path.parent().unwrap()).unwrap();
+         let config = Config {
++            configured_source_roots: Some(vec![root.clone()]),
+             source_folders: vec![root.clone()],
+             mount_root,
+             ratarmount_bin: "ratarmount".to_string(),
+@@ -11144,6 +11196,7 @@ mod tests {
+         fs::create_dir_all(&mount_path).unwrap();
+         fs::write(mount_path.join("owner-file"), b"owner data").unwrap();
+         let config = Config {
++            configured_source_roots: Some(vec![root.join("roms")]),
+             source_folders: vec![root.join("roms")],
+             mount_root: root.join("mounts"),
+             ratarmount_bin: "ratarmount".to_string(),
+@@ -11196,6 +11249,7 @@ mod tests {
+         fs::create_dir_all(archive_path.parent().unwrap()).unwrap();
+         fs::write(&archive_path, b"archive").unwrap();
+         let config = Config {
++            configured_source_roots: Some(vec![root.join("roms")]),
+             source_folders: vec![root.join("roms")],
+             mount_root: root.join("mounts"),
+             ratarmount_bin: "ratarmount".to_string(),
+@@ -11244,6 +11298,7 @@ mod tests {
+             ),
+         ];
+         let config = Config {
++            configured_source_roots: Some(vec![root.clone()]),
+             source_folders: vec![root],
+             mount_root,
+             ratarmount_bin: "ratarmount".to_string(),
+@@ -11280,6 +11335,7 @@ mod tests {
+         fs::write(&first, b"").unwrap();
+         fs::write(&second, b"").unwrap();
+         let config = Config {
++            configured_source_roots: Some(vec![source_root.clone()]),
+             source_folders: vec![source_root],
+             mount_root: root.join("mounts"),
+             ratarmount_bin: "ratarmount".to_string(),
+@@ -11368,6 +11424,7 @@ mod tests {
+         fs::write(xbox360.join("007 Legends.zip"), b"").unwrap();
+         fs::write(xbox360.join("Halo 3.zip"), b"").unwrap();
+         let config = Config {
++            configured_source_roots: Some(vec![source_root.clone()]),
+             source_folders: vec![source_root],
+             mount_root: mount_root.clone(),
+             ratarmount_bin: "ratarmount".to_string(),
+@@ -11390,6 +11447,7 @@ mod tests {
+         fs::create_dir_all(&source_root).unwrap();
+         fs::write(source_root.join("Halo.zip"), b"").unwrap();
+         let config = Config {
++            configured_source_roots: Some(vec![source_root.clone()]),
+             source_folders: vec![source_root],
+             mount_root: root.join("mounts"),
+             ratarmount_bin: "ratarmount".to_string(),
+@@ -11412,6 +11470,7 @@ mod tests {
+         fs::create_dir_all(&source_root).unwrap();
+         fs::write(source_root.join("Game.zip"), b"archive").unwrap();
+         let config = Config {
++            configured_source_roots: Some(vec![source_root.clone()]),
+             source_folders: vec![source_root],
+             mount_root: root.join("mounts"),
+             ratarmount_bin: "ratarmount".to_string(),
+@@ -11432,6 +11491,7 @@ mod tests {
+         fs::create_dir_all(&source_root).unwrap();
+         fs::write(&archive_path, b"").unwrap();
+         let config = Config {
++            configured_source_roots: Some(vec![root.join("roms")]),
+             source_folders: vec![root.join("roms")],
+             mount_root: root.join("mounts"),
+             ratarmount_bin: "ratarmount".to_string(),
+@@ -11451,6 +11511,7 @@ mod tests {
+         let root = test_root("lazy_unmount_boundaries");
+         let outside = test_root("lazy_unmount_outside");
+         let config = Config {
++            configured_source_roots: Some(vec![root.join("roms")]),
+             source_folders: vec![root.join("roms")],
+             mount_root: root.clone(),
+             ratarmount_bin: "ratarmount".to_string(),
+@@ -11474,6 +11535,7 @@ mod tests {
+         let mount_path = parent.join("Broken_Game");
+         fs::create_dir_all(&parent).unwrap();
+         let config = Config {
++            configured_source_roots: Some(vec![root.join("roms")]),
+             source_folders: vec![root.join("roms")],
+             mount_root,
+             ratarmount_bin: "ratarmount".to_string(),
+@@ -11497,6 +11559,7 @@ mod tests {
+         std::os::unix::fs::symlink(&outside, mount_root.join("escape")).unwrap();
+         let mount_path = mount_root.join("escape").join("Game");
+         let config = Config {
++            configured_source_roots: Some(vec![root.join("roms")]),
+             source_folders: vec![root.join("roms")],
+             mount_root,
+             ratarmount_bin: "ratarmount".to_string(),
+@@ -12613,6 +12676,7 @@ mod tests {
+         fs::create_dir_all(&source_root).unwrap();
+         fs::write(source_root.join("Game.zip"), b"archive").unwrap();
+         let config = Config {
++            configured_source_roots: Some(vec![root.join("roms")]),
+             source_folders: vec![root.join("roms")],
+             mount_root: root.join("mounts"),
+             ratarmount_bin: "ratarmount".to_string(),
+@@ -12748,6 +12812,7 @@ mod tests {
+         fs::create_dir_all(&mount_path).unwrap();
+         let config = Config {
+             // The library sits beside the mount root: an overlapping one is refused.
++            configured_source_roots: Some(vec![root.with_file_name("cleanup-fixture-library")]),
+             source_folders: vec![root.with_file_name("cleanup-fixture-library")],
+             mount_root: root.clone(),
+             ratarmount_bin: "ratarmount".to_string(),
+@@ -12764,6 +12829,7 @@ mod tests {
+         let root = test_root("cleanup_selected_root");
+         let config = Config {
+             // The library sits beside the mount root: an overlapping one is refused.
++            configured_source_roots: Some(vec![root.with_file_name("cleanup-fixture-library")]),
+             source_folders: vec![root.with_file_name("cleanup-fixture-library")],
+             mount_root: root.clone(),
+             ratarmount_bin: "ratarmount".to_string(),
+@@ -12782,6 +12848,7 @@ mod tests {
+         fs::write(mount_path.join("file.txt"), b"keep").unwrap();
+         let config = Config {
+             // The library sits beside the mount root: an overlapping one is refused.
++            configured_source_roots: Some(vec![root.with_file_name("cleanup-fixture-library")]),
+             source_folders: vec![root.with_file_name("cleanup-fixture-library")],
+             mount_root: root,
+             ratarmount_bin: "ratarmount".to_string(),
+@@ -12799,6 +12866,7 @@ mod tests {
+         fs::create_dir_all(&outside).unwrap();
+         let config = Config {
+             // The library sits beside the mount root: an overlapping one is refused.
++            configured_source_roots: Some(vec![root.with_file_name("cleanup-fixture-library")]),
+             source_folders: vec![root.with_file_name("cleanup-fixture-library")],
+             mount_root: root,
+             ratarmount_bin: "ratarmount".to_string(),
+@@ -12817,6 +12885,7 @@ mod tests {
+         fs::create_dir_all(&mount_path).unwrap();
+         let config = Config {
+             // The library sits beside the mount root: an overlapping one is refused.
++            configured_source_roots: Some(vec![root.with_file_name("cleanup-fixture-library")]),
+             source_folders: vec![root.with_file_name("cleanup-fixture-library")],
+             mount_root: root.clone(),
+             ratarmount_bin: "ratarmount".to_string(),
+@@ -12836,6 +12905,7 @@ mod tests {
+         let root = test_root("cleanup_selected_tree_root");
+         let config = Config {
+             // The library sits beside the mount root: an overlapping one is refused.
++            configured_source_roots: Some(vec![root.with_file_name("cleanup-fixture-library")]),
+             source_folders: vec![root.with_file_name("cleanup-fixture-library")],
+             mount_root: root.clone(),
+             ratarmount_bin: "ratarmount".to_string(),
+@@ -12857,6 +12927,7 @@ mod tests {
+         fs::create_dir_all(&outside).unwrap();
+         let config = Config {
+             // The library sits beside the mount root: an overlapping one is refused.
++            configured_source_roots: Some(vec![root.with_file_name("cleanup-fixture-library")]),
+             source_folders: vec![root.with_file_name("cleanup-fixture-library")],
+             mount_root: root,
+             ratarmount_bin: "ratarmount".to_string(),
+@@ -12884,6 +12955,7 @@ mod tests {
+         let linked_mount = root.join("Platform").join("Game");
+         let config = Config {
+             // The library sits beside the mount root: an overlapping one is refused.
++            configured_source_roots: Some(vec![root.with_file_name("cleanup-fixture-library")]),
+             source_folders: vec![root.with_file_name("cleanup-fixture-library")],
+             mount_root: root,
+             ratarmount_bin: "ratarmount".to_string(),
+@@ -12906,6 +12978,7 @@ mod tests {
+         fs::write(mount_path.join("file.txt"), b"keep").unwrap();
+         let config = Config {
+             // The library sits beside the mount root: an overlapping one is refused.
++            configured_source_roots: Some(vec![root.with_file_name("cleanup-fixture-library")]),
+             source_folders: vec![root.with_file_name("cleanup-fixture-library")],
+             mount_root: root.clone(),
+             ratarmount_bin: "ratarmount".to_string(),
+@@ -12931,6 +13004,7 @@ mod tests {
+         fs::create_dir_all(&other_mount_path).unwrap();
+         let config = Config {
+             // The library sits beside the mount root: an overlapping one is refused.
++            configured_source_roots: Some(vec![root.with_file_name("cleanup-fixture-library")]),
+             source_folders: vec![root.with_file_name("cleanup-fixture-library")],
+             mount_root: root.clone(),
+             ratarmount_bin: "ratarmount".to_string(),
+@@ -14117,6 +14191,7 @@ mod tests {
+ 
+     fn scanner_config(root: &Path) -> Config {
+         Config {
++            configured_source_roots: Some(vec![root.to_path_buf()]),
+             source_folders: vec![root.to_path_buf()],
+             mount_root: root.join("mounts"),
+             ratarmount_bin: "ratarmount".to_string(),
+@@ -14287,6 +14362,7 @@ mod tests {
+     fn scanner_rejects_relative_and_filesystem_root_sources() {
+         for source in [PathBuf::from("relative/source"), PathBuf::from("/")] {
+             let config = Config {
++                configured_source_roots: Some(vec![source.clone()]),
+                 source_folders: vec![source],
+                 mount_root: PathBuf::from("/tmp/archivefs-test-mounts"),
+                 ratarmount_bin: "ratarmount".to_string(),
+@@ -17059,6 +17135,60 @@ mod tests {
+         }
+     }
+ 
++    /// A `Config` that does not know its complete configured source set (a
++    /// hand-built or partial one) must never clean, create or mount.
++    #[test]
++    fn unknown_configured_source_roots_fail_closed_for_cleanup_create_and_mount() {
++        let root = test_root("unknown_configured_source_roots");
++        let source = root.join("roms");
++        fs::create_dir_all(&source).unwrap();
++        fs::write(source.join("Good.zip"), b"archive").unwrap();
++        let mount_root = root.join("mounts");
++        let leftover = mount_root.join("Leftover");
++        fs::create_dir_all(&leftover).unwrap();
++        let config = Config {
++            configured_source_roots: None,
++            source_folders: vec![source.clone()],
++            mount_root: mount_root.clone(),
++            ratarmount_bin: "ratarmount".to_string(),
++            master_rom_root: None,
++        };
++
++        let error = plan_stale_mount_directories(&config).unwrap_err();
++        assert!(error.to_string().contains("cannot verify"), "{error}");
++        assert!(clean_mount_root(&config).is_err());
++        assert!(cleanup_selected_mount_tree(&config, &leftover).is_err());
++        assert!(cleanup_selected_mount_dir(&config, &leftover).is_err());
++        assert!(leftover.is_dir());
++
++        let plan = ArchiveScanner::new(&config)
++            .mount_plans()
++            .unwrap()
++            .remove(0);
++        let backend = RecordingBackend::default();
++        assert!(mount_one_plan_outcome(&config, plan.clone(), &backend).is_err());
++        assert!(backend.mounted.borrow().is_empty());
++        assert!(!plan.mount_path.exists());
++
++        let fresh = Config {
++            mount_root: root.join("fresh-mounts"),
++            ..config.clone()
++        };
++        assert!(create_configured_mount_root(&fresh).is_err());
++        assert!(!fresh.mount_root.exists());
++
++        // The same configuration with its complete source set known works.
++        let known = Config {
++            configured_source_roots: Some(vec![source]),
++            ..config
++        };
++        assert_eq!(
++            plan_stale_mount_directories(&known).unwrap(),
++            vec![leftover]
++        );
++        let _ = fs::remove_dir_all(&root);
++    }
++
+     struct RecordingLazyUnmountBackend {
+         mounted_snapshots: std::cell::RefCell<std::collections::VecDeque<HashSet<PathBuf>>>,
+         unmounted: std::cell::RefCell<Vec<PathBuf>>,
+diff --git a/crates/archivefs-core/src/mount_root_validation_tests.rs b/crates/archivefs-core/src/mount_root_validation_tests.rs
+index 485b329..18bade2 100644
+--- a/crates/archivefs-core/src/mount_root_validation_tests.rs
++++ b/crates/archivefs-core/src/mount_root_validation_tests.rs
+@@ -254,6 +254,7 @@ fn scanner_never_treats_a_mount_root_inside_a_source_as_library_content() {
+     fs::create_dir_all(mount_root.join("Unknown/Outer")).unwrap();
+     fs::write(mount_root.join("Unknown/Outer/Inner.zip"), b"archive").unwrap();
+     let config = Config {
++        configured_source_roots: Some(vec![source.clone()]),
+         source_folders: vec![source.clone()],
+         mount_root: mount_root.clone(),
+         ratarmount_bin: "ratarmount".to_string(),
+@@ -274,6 +275,7 @@ fn targeted_mount_cleanup_refuses_a_mount_root_containing_a_source() {
+     let empty_in_source = mount_root.join("roms/Empty");
+     fs::create_dir_all(&empty_in_source).unwrap();
+     let config = Config {
++        configured_source_roots: Some(vec![mount_root.join("roms")]),
+         source_folders: vec![mount_root.join("roms")],
+         mount_root: mount_root.clone(),
+         ratarmount_bin: "ratarmount".to_string(),
+@@ -464,6 +466,7 @@ fn mounting_into_an_overlapping_mount_root_is_refused() {
+     fs::write(&archive, b"archive").unwrap();
+     // Mount root equal to the source: mounting would create folders in it.
+     let equal = Config {
++        configured_source_roots: Some(vec![source.clone()]),
+         source_folders: vec![source.clone()],
+         mount_root: source.clone(),
+         ratarmount_bin: "ratarmount".to_string(),
+@@ -483,3 +486,149 @@ fn mounting_into_an_overlapping_mount_root_is_refused() {
+     assert!(session.validate_batch_targets(&[archive]).is_err());
+     assert!(!source.join("mnt").exists());
+ }
++
++// --- Disabled `[[source]]` overlapping the mount root (round 3, F2) ------
++
++/// Enabled `library` (with one archive) and a disabled `disabled`, loaded
++/// through `Config::load_from` exactly as the CLI and GUI load it.
++fn disabled_source_config(root: &Path, mount_root: &Path, disabled: &Path) -> (PathBuf, Config) {
++    let library = root.join("library");
++    fs::create_dir_all(library.join("roms")).unwrap();
++    fs::write(library.join("roms/Good.zip"), b"archive").unwrap();
++    fs::create_dir_all(disabled).unwrap();
++    let path = root.join("config.toml");
++    fs::write(
++        &path,
++        format!(
++            "mount_root = \"{}\"\nratarmount_bin = \"ratarmount\"\n\n[[source]]\npath = \"{}\"\nenabled = true\n\n[[source]]\npath = \"{}\"\nenabled = false\n",
++            mount_root.display(),
++            library.display(),
++            disabled.display()
++        ),
++    )
++    .unwrap();
++    let config = Config::load_from(&path).unwrap();
++    assert_eq!(config.source_folders, vec![library]);
++    (path, config)
++}
++
++#[test]
++fn doctor_never_creates_a_mount_root_inside_a_disabled_source() {
++    let fixture = tempfile::tempdir().unwrap();
++    let root = fixture.path();
++    let disabled = root.join("off");
++    let mount_root = disabled.join("mnt");
++    let (config_path, _) = disabled_source_config(root, &mount_root, &disabled);
++    let report = run_doctor(&config_path);
++    assert!(
++        !mount_root.exists(),
++        "doctor created the mount root inside a disabled source: {:#?}",
++        report.checks
++    );
++    assert!(
++        report
++            .checks
++            .iter()
++            .any(|check| check.status == DoctorStatus::Fail
++                && check.detail.contains("source folder")),
++        "{:#?}",
++        report.checks
++    );
++}
++
++#[test]
++fn mount_refuses_a_mount_root_overlapping_a_disabled_source() {
++    let fixture = tempfile::tempdir().unwrap();
++    let root = fixture.path();
++    // Equal to, inside, and containing the disabled source.
++    for (mount_root, disabled) in [
++        (root.join("off"), root.join("off")),
++        (root.join("off/mnt"), root.join("off")),
++        (root.join("parent"), root.join("parent/off")),
++    ] {
++        let (_, config) = disabled_source_config(root, &mount_root, &disabled);
++        let plan = ArchiveScanner::new(&config)
++            .mount_plans()
++            .unwrap()
++            .remove(0);
++        let backend = CountingBackend::default();
++        assert!(
++            mount_one_plan_outcome(&config, plan.clone(), &backend).is_err(),
++            "{}",
++            mount_root.display()
++        );
++        assert_eq!(backend.mounts.get(), 0);
++        assert!(!plan.mount_path.exists(), "{}", plan.mount_path.display());
++        let _ = fs::remove_dir_all(&mount_root);
++        let _ = fs::remove_dir_all(&disabled);
++    }
++}
++
++#[test]
++fn doctor_and_mount_still_work_beside_a_disjoint_disabled_source() {
++    let fixture = tempfile::tempdir().unwrap();
++    let root = fixture.path();
++    let mount_root = root.join("mounts");
++    let (config_path, config) = disabled_source_config(root, &mount_root, &root.join("off"));
++    run_doctor(&config_path);
++    assert!(mount_root.is_dir(), "doctor creates a disjoint mount root");
++    let plan = ArchiveScanner::new(&config)
++        .mount_plans()
++        .unwrap()
++        .remove(0);
++    let backend = CountingBackend::default();
++    mount_one_plan_outcome(&config, plan, &backend).unwrap();
++    assert_eq!(backend.mounts.get(), 1);
++}
++
++/// C1: the native-media preview (and the bounded import built from it) must
++/// not list mount-root content when a legacy config puts the mount root
++/// inside the previewed source. The GUI passes `configured_mount_root_at`.
++#[test]
++fn native_media_preview_skips_a_mount_root_inside_the_previewed_source() {
++    let fixture = tempfile::tempdir().unwrap();
++    let source = fixture.path().join("library");
++    fs::create_dir_all(source.join("roms")).unwrap();
++    fs::write(source.join("roms/Outer.zip"), b"archive").unwrap();
++    let mount_root = source.join("mnt");
++    fs::create_dir_all(mount_root.join("Unknown/Outer")).unwrap();
++    let inner = mount_root.join("Unknown/Outer/Inner.zip");
++    fs::write(&inner, b"archive").unwrap();
++    let config_path = fixture.path().join("config.toml");
++    legacy_config(&config_path, &[&source], &mount_root);
++    let preview = |mount_root: PathBuf| {
++        let config = Config {
++            configured_source_roots: None,
++            source_folders: vec![source.clone()],
++            mount_root,
++            ratarmount_bin: String::new(),
++            master_rom_root: None,
++        };
++        crate::ingestion::preview::preview_media(
++            &config,
++            &[],
++            &[],
++            &[],
++            &std::sync::atomic::AtomicBool::new(false),
++            &mut |_, _| {},
++        )
++        .unwrap()
++        .items
++        .into_iter()
++        .map(|item| item.path)
++        .collect::<Vec<_>>()
++    };
++    // Without the mount root (the old GUI call) the mount content is listed.
++    assert!(preview(PathBuf::new()).contains(&inner));
++    let configured = configured_mount_root_at(&config_path).unwrap();
++    assert_eq!(configured, mount_root);
++    let listed = preview(configured);
++    assert!(
++        listed.iter().all(|path| !path.starts_with(&mount_root)),
++        "{listed:?}"
++    );
++    assert!(
++        listed.contains(&source.join("roms/Outer.zip")),
++        "{listed:?}"
++    );
++}
+diff --git a/crates/archivefs-core/src/repair/ps1_pbp_export/tests.rs b/crates/archivefs-core/src/repair/ps1_pbp_export/tests.rs
+index 63e7cb7..344d377 100644
+--- a/crates/archivefs-core/src/repair/ps1_pbp_export/tests.rs
++++ b/crates/archivefs-core/src/repair/ps1_pbp_export/tests.rs
+@@ -107,6 +107,7 @@ fn fixture(count: usize) -> Fixture {
+     )).unwrap();
+     let mut db = Database::open_or_create(root.path().join("library.sqlite3")).unwrap();
+     let config = crate::Config {
++        configured_source_roots: None,
+         source_folders: vec![root.path().join("games")],
+         mount_root: root.path().join("mount"),
+         ratarmount_bin: "ratarmount".into(),
+diff --git a/crates/archivefs-core/tests/archive_member_platform_scan.rs b/crates/archivefs-core/tests/archive_member_platform_scan.rs
+index 0a14ef5..ee8239b 100644
+--- a/crates/archivefs-core/tests/archive_member_platform_scan.rs
++++ b/crates/archivefs-core/tests/archive_member_platform_scan.rs
+@@ -27,6 +27,7 @@ fn tap() -> Vec<u8> {
+ 
+ fn scan(db: &mut Database, source: &Path) {
+     let config = Config {
++        configured_source_roots: Some(vec![source.to_path_buf()]),
+         source_folders: vec![source.to_path_buf()],
+         mount_root: source.join("mount"),
+         ratarmount_bin: "ratarmount".into(),
+diff --git a/crates/archivefs-core/tests/catalogue_cleanup.rs b/crates/archivefs-core/tests/catalogue_cleanup.rs
+index 64cc186..f0985e4 100644
+--- a/crates/archivefs-core/tests/catalogue_cleanup.rs
++++ b/crates/archivefs-core/tests/catalogue_cleanup.rs
+@@ -8,6 +8,7 @@ fn fixture() -> (tempfile::TempDir, Database, Config, PathBuf, i64) {
+     let path = source.join("game.zip");
+     fs::write(&path, b"synthetic").unwrap();
+     let config = Config {
++        configured_source_roots: Some(vec![source.clone()]),
+         source_folders: vec![source],
+         mount_root: root.path().join("mount"),
+         ratarmount_bin: "ratarmount".into(),
+diff --git a/crates/archivefs-core/tests/catalogue_health_adversarial.rs b/crates/archivefs-core/tests/catalogue_health_adversarial.rs
+index c706937..9b923a7 100644
+--- a/crates/archivefs-core/tests/catalogue_health_adversarial.rs
++++ b/crates/archivefs-core/tests/catalogue_health_adversarial.rs
+@@ -54,6 +54,7 @@ impl F {
+         scan_and_persist(
+             &mut self.db,
+             &Config {
++                configured_source_roots: Some(self.roots.clone()),
+                 source_folders: self.roots.clone(),
+                 mount_root: self.t.path().join("mounts"),
+                 ratarmount_bin: "ratarmount".into(),
+@@ -306,6 +307,7 @@ fn duplicate_nested_roots_are_rejected_before_scan_mutation() {
+     f.roots.push(f.roots[1].clone());
+     let before = f.db.load_archives().unwrap();
+     let config = Config {
++        configured_source_roots: Some(f.roots.clone()),
+         source_folders: f.roots.clone(),
+         mount_root: f.t.path().join("mounts"),
+         ratarmount_bin: "ratarmount".into(),
+@@ -722,6 +724,7 @@ fn post_probe_scan_attack(mode: &str) {
+     let result = scan_and_persist(
+         &mut f.db,
+         &Config {
++            configured_source_roots: Some(f.roots.clone()),
+             source_folders: f.roots.clone(),
+             mount_root: f.t.path().join("mounts"),
+             ratarmount_bin: "ratarmount".into(),
+diff --git a/crates/archivefs-core/tests/catalogue_health_truth.rs b/crates/archivefs-core/tests/catalogue_health_truth.rs
+index 88eb4d4..63726b8 100644
+--- a/crates/archivefs-core/tests/catalogue_health_truth.rs
++++ b/crates/archivefs-core/tests/catalogue_health_truth.rs
+@@ -61,6 +61,7 @@ impl Fixture {
+         scan_and_persist(
+             &mut self.db,
+             &Config {
++                configured_source_roots: Some(self.roots.clone()),
+                 source_folders: self.roots.clone(),
+                 mount_root: self.temp.path().join("mounts"),
+                 ratarmount_bin: "ratarmount".into(),
+@@ -965,6 +966,7 @@ fn duplicate_configured_bind_aliases_are_diagnosed_without_catalogue_writes() {
+         0
+     );
+     let config = Config {
++        configured_source_roots: Some(f.roots.clone()),
+         source_folders: f.roots.clone(),
+         mount_root: f.temp.path().join("mounts"),
+         ratarmount_bin: "ratarmount".into(),
+diff --git a/crates/archivefs-core/tests/catalogue_rebind_review.rs b/crates/archivefs-core/tests/catalogue_rebind_review.rs
+index 3f5d3d9..7fd4c02 100644
+--- a/crates/archivefs-core/tests/catalogue_rebind_review.rs
++++ b/crates/archivefs-core/tests/catalogue_rebind_review.rs
+@@ -61,6 +61,7 @@ impl Fixture {
+ 
+     fn config(&self) -> Config {
+         Config {
++            configured_source_roots: Some(self.roots.clone()),
+             source_folders: self.roots.clone(),
+             mount_root: self.temp.path().join("mounts"),
+             ratarmount_bin: "ratarmount".into(),
+@@ -940,6 +941,7 @@ fn independent_targeted_attempt_combinations() {
+         [SourceHealthState::NeedsScan, SourceHealthState::PartialScan]
+     );
+     let full = Config {
++        configured_source_roots: Some(folders.clone()),
+         source_folders: folders.clone(),
+         mount_root: temp.path().join("mounts"),
+         ratarmount_bin: "ratarmount".into(),
+diff --git a/crates/archivefs-core/tests/forget_confirmed_missing.rs b/crates/archivefs-core/tests/forget_confirmed_missing.rs
+index 3bc594f..1f1af2e 100644
+--- a/crates/archivefs-core/tests/forget_confirmed_missing.rs
++++ b/crates/archivefs-core/tests/forget_confirmed_missing.rs
+@@ -51,6 +51,7 @@ impl F {
+         scan_and_persist(
+             &mut self.db,
+             &Config {
++                configured_source_roots: Some(self.roots.clone()),
+                 source_folders: self.roots.clone(),
+                 mount_root: self.temp.path().join("mounts"),
+                 ratarmount_bin: "ratarmount".into(),
+diff --git a/crates/archivefs-core/tests/game_boy_scan_platform.rs b/crates/archivefs-core/tests/game_boy_scan_platform.rs
+index 997997e..7beca14 100644
+--- a/crates/archivefs-core/tests/game_boy_scan_platform.rs
++++ b/crates/archivefs-core/tests/game_boy_scan_platform.rs
+@@ -28,6 +28,7 @@ fn rom(cgb: u8, logo: bool, checksum_ok: bool, len: usize) -> Vec<u8> {
+ 
+ fn scan(root: &Path) -> Vec<(String, Option<String>, Option<PlatformProvenance>)> {
+     let config = Config {
++        configured_source_roots: Some(vec![root.to_path_buf()]),
+         source_folders: vec![root.to_path_buf()],
+         mount_root: root.join("../mount"),
+         ratarmount_bin: String::new(),
+@@ -111,6 +112,7 @@ fn persisted_lab() -> (tempfile::TempDir, Config, archivefs_core::Database) {
+     let source = dir.path().join("incoming");
+     std::fs::create_dir(&source).unwrap();
+     let config = Config {
++        configured_source_roots: Some(vec![source.clone()]),
+         source_folders: vec![source],
+         mount_root: dir.path().join("mount"),
+         ratarmount_bin: String::new(),
+diff --git a/crates/archivefs-core/tests/platform_folder_aliases.rs b/crates/archivefs-core/tests/platform_folder_aliases.rs
+index 86fb0c5..208e4bc 100644
+--- a/crates/archivefs-core/tests/platform_folder_aliases.rs
++++ b/crates/archivefs-core/tests/platform_folder_aliases.rs
+@@ -160,6 +160,7 @@ fn bounded_synthetic_rescan_preserves_ids_paths_hashes_dat_and_user_choices() {
+         )
+         .unwrap();
+     let config = Config {
++        configured_source_roots: Some(vec![source.clone()]),
+         source_folders: vec![source],
+         mount_root: dir.path().join("mount"),
+         ratarmount_bin: "ratarmount".into(),
+@@ -332,6 +333,7 @@ fn old_cached_unknown_requires_fresh_per_record_inspection() {
+     let db_path = dir.path().join("synthetic.sqlite3");
+     let mut database = Database::open_or_create(&db_path).unwrap();
+     let config = Config {
++        configured_source_roots: Some(vec![source.clone()]),
+         source_folders: vec![source.clone()],
+         mount_root: dir.path().join("mount"),
+         ratarmount_bin: "ratarmount".into(),
+diff --git a/crates/archivefs-core/tests/platform_format_content.rs b/crates/archivefs-core/tests/platform_format_content.rs
+index 3ec9601..842a8c4 100644
+--- a/crates/archivefs-core/tests/platform_format_content.rs
++++ b/crates/archivefs-core/tests/platform_format_content.rs
+@@ -70,6 +70,7 @@ fn valid_media_in_a_neutral_folder_is_stored_with_the_platform_its_bytes_prove()
+ 
+     let db_path = dir.path().join("library.sqlite3");
+     let config = Config {
++        configured_source_roots: Some(vec![source.clone()]),
+         source_folders: vec![source.clone()],
+         mount_root: dir.path().join("mount"),
+         ratarmount_bin: "ratarmount".into(),
+diff --git a/crates/archivefs-core/tests/platform_format_coverage.rs b/crates/archivefs-core/tests/platform_format_coverage.rs
+index 4302c62..2e1235b 100644
+--- a/crates/archivefs-core/tests/platform_format_coverage.rs
++++ b/crates/archivefs-core/tests/platform_format_coverage.rs
+@@ -82,6 +82,7 @@ fn every_stored_extension_survives_scan_rescan_and_reopen_and_every_other_is_rep
+ 
+     let db_path = dir.path().join("library.sqlite3");
+     let config = Config {
++        configured_source_roots: Some(vec![source.clone()]),
+         source_folders: vec![source.clone()],
+         mount_root: dir.path().join("mount"),
+         ratarmount_bin: "ratarmount".into(),
+diff --git a/crates/archivefs-core/tests/spectrum_bounded_import.rs b/crates/archivefs-core/tests/spectrum_bounded_import.rs
+index efc9b51..cda196d 100644
+--- a/crates/archivefs-core/tests/spectrum_bounded_import.rs
++++ b/crates/archivefs-core/tests/spectrum_bounded_import.rs
+@@ -28,6 +28,7 @@ fn sna(tag: u8) -> Vec<u8> {
+ }
+ fn config(root: &Path) -> Config {
+     Config {
++        configured_source_roots: Some(vec![root.clone().into()]),
+         source_folders: vec![root.into()],
+         mount_root: PathBuf::new(),
+         ratarmount_bin: String::new(),
+diff --git a/crates/archivefs-core/tests/spectrum_discovery.rs b/crates/archivefs-core/tests/spectrum_discovery.rs
+index 3a7d8e4..d6162e4 100644
+--- a/crates/archivefs-core/tests/spectrum_discovery.rs
++++ b/crates/archivefs-core/tests/spectrum_discovery.rs
+@@ -40,6 +40,7 @@ fn scl() -> Vec<u8> {
+ }
+ fn config(root: &Path) -> Config {
+     Config {
++        configured_source_roots: Some(vec![root.clone().into()]),
+         source_folders: vec![root.into()],
+         mount_root: root.join("mount"),
+         ratarmount_bin: String::new(),
+diff --git a/crates/archivefs-core/tests/spectrum_native_media.rs b/crates/archivefs-core/tests/spectrum_native_media.rs
+index 7d374a7..75f2280 100644
+--- a/crates/archivefs-core/tests/spectrum_native_media.rs
++++ b/crates/archivefs-core/tests/spectrum_native_media.rs
+@@ -74,6 +74,7 @@ fn rzx() -> Vec<u8> {
+ 
+ fn config(root: &Path) -> Config {
+     Config {
++        configured_source_roots: Some(vec![root.clone().into()]),
+         source_folders: vec![root.into()],
+         mount_root: root.join("mount"),
+         ratarmount_bin: String::new(),
+diff --git a/crates/archivefs-core/tests/spectrum_rzx_preservation.rs b/crates/archivefs-core/tests/spectrum_rzx_preservation.rs
+index 7acdc91..2df85fe 100644
+--- a/crates/archivefs-core/tests/spectrum_rzx_preservation.rs
++++ b/crates/archivefs-core/tests/spectrum_rzx_preservation.rs
+@@ -48,6 +48,7 @@ fn sha256_hex(bytes: &[u8]) -> String {
+ 
+ fn config(root: &Path, mount: &Path) -> Config {
+     Config {
++        configured_source_roots: Some(vec![root.clone().into()]),
+         source_folders: vec![root.into()],
+         mount_root: mount.into(),
+         ratarmount_bin: String::new(),
+diff --git a/crates/archivefs-core/tests/whdload_scan_dat.rs b/crates/archivefs-core/tests/whdload_scan_dat.rs
+index 8564c83..ec3254c 100644
+--- a/crates/archivefs-core/tests/whdload_scan_dat.rs
++++ b/crates/archivefs-core/tests/whdload_scan_dat.rs
+@@ -69,6 +69,7 @@ fn scan_supplies_registered_dat_context_without_creating_verified_results() {
+     let db_path = root.join("library.sqlite3");
+     let mut db = Database::open_or_create(&db_path).unwrap();
+     let config = Config {
++        configured_source_roots: Some(vec![source.clone()]),
+         source_folders: vec![source],
+         mount_root: root.join("mount"),
+         ratarmount_bin: String::new(),
+diff --git a/crates/archivefs-gui/src/collection_discovery_page.rs b/crates/archivefs-gui/src/collection_discovery_page.rs
+index 55914a2..ca2e0ba 100644
+--- a/crates/archivefs-gui/src/collection_discovery_page.rs
++++ b/crates/archivefs-gui/src/collection_discovery_page.rs
+@@ -1258,6 +1258,7 @@ mod tests {
+         }
+         let database_path = root.join("library.sqlite3");
+         let config = archivefs_core::Config {
++            configured_source_roots: Some(vec![source.clone()]),
+             source_folders: vec![source],
+             mount_root: root.join("mount"),
+             ratarmount_bin: String::new(),
+diff --git a/crates/archivefs-gui/src/dat_sources_page/simple/tests.rs b/crates/archivefs-gui/src/dat_sources_page/simple/tests.rs
+index 469fe8c..807c471 100644
+--- a/crates/archivefs-gui/src/dat_sources_page/simple/tests.rs
++++ b/crates/archivefs-gui/src/dat_sources_page/simple/tests.rs
+@@ -446,6 +446,7 @@ mod audit_population {
+             std::fs::write(folder.join("assets").join(name), vec![9u8; 4096]).unwrap();
+         }
+         let config = Config {
++            configured_source_roots: Some(vec![source.clone()]),
+             source_folders: vec![source],
+             mount_root: dir.path().join("mounts"),
+             ratarmount_bin: "ratarmount".into(),
+diff --git a/crates/archivefs-gui/src/dat_sources_page/tests/cue_bin_order.rs b/crates/archivefs-gui/src/dat_sources_page/tests/cue_bin_order.rs
+index bae49a8..6899a20 100644
+--- a/crates/archivefs-gui/src/dat_sources_page/tests/cue_bin_order.rs
++++ b/crates/archivefs-gui/src/dat_sources_page/tests/cue_bin_order.rs
+@@ -89,6 +89,7 @@ fn audited_from(managed: bool) -> (Fixture, PathBuf, PathBuf) {
+     archivefs_core::scan_and_persist(
+         &mut database,
+         &archivefs_core::Config {
++            configured_source_roots: Some(vec![fixture.root.join("games")]),
+             source_folders: vec![fixture.root.join("games")],
+             mount_root: fixture.root.join("mount"),
+             ratarmount_bin: "ratarmount".into(),
+diff --git a/crates/archivefs-gui/src/dat_sources_page/tests/multidisc_order.rs b/crates/archivefs-gui/src/dat_sources_page/tests/multidisc_order.rs
+index fd9168f..c34d366 100644
+--- a/crates/archivefs-gui/src/dat_sources_page/tests/multidisc_order.rs
++++ b/crates/archivefs-gui/src/dat_sources_page/tests/multidisc_order.rs
+@@ -77,6 +77,7 @@ impl Library {
+         archivefs_core::scan_and_persist(
+             &mut database,
+             &archivefs_core::Config {
++                configured_source_roots: Some(vec![fixture.root.join("games")]),
+                 source_folders: vec![fixture.root.join("games")],
+                 mount_root: fixture.root.join("mount"),
+                 ratarmount_bin: "ratarmount".into(),
+diff --git a/crates/archivefs-gui/src/gui_v2/history_discovery_import/tests.rs b/crates/archivefs-gui/src/gui_v2/history_discovery_import/tests.rs
+index bf08767..c0719ae 100644
+--- a/crates/archivefs-gui/src/gui_v2/history_discovery_import/tests.rs
++++ b/crates/archivefs-gui/src/gui_v2/history_discovery_import/tests.rs
+@@ -193,6 +193,7 @@ fn actual_import_results_preview_cancel_confirm_and_result_journey_preserves_rom
+     let db = t.path().join("library.sqlite3");
+     let cfg = t.path().join("config.toml");
+     let config = archivefs_core::Config {
++        configured_source_roots: Some(vec![root.clone()]),
+         source_folders: vec![root.clone()],
+         mount_root: t.path().join("mount"),
+         ratarmount_bin: String::new(),
+diff --git a/crates/archivefs-gui/src/gui_v2/missing_review.rs b/crates/archivefs-gui/src/gui_v2/missing_review.rs
+index 18fe565..23eed93 100644
+--- a/crates/archivefs-gui/src/gui_v2/missing_review.rs
++++ b/crates/archivefs-gui/src/gui_v2/missing_review.rs
+@@ -416,6 +416,7 @@ mod tests {
+             scan_and_persist(
+                 &mut self.db,
+                 &Config {
++                    configured_source_roots: Some(self.roots.clone()),
+                     source_folders: self.roots.clone(),
+                     mount_root: self.temp.path().join("mounts"),
+                     ratarmount_bin: "ratarmount".into(),
+diff --git a/crates/archivefs-gui/src/gui_v2/native_import_journey_tests.rs b/crates/archivefs-gui/src/gui_v2/native_import_journey_tests.rs
+index 8a826ad..44b31a0 100644
+--- a/crates/archivefs-gui/src/gui_v2/native_import_journey_tests.rs
++++ b/crates/archivefs-gui/src/gui_v2/native_import_journey_tests.rs
+@@ -51,6 +51,7 @@ impl Fixture {
+         )
+         .unwrap();
+         let config = Config {
++            configured_source_roots: Some(vec![self.root.clone()]),
+             source_folders: vec![self.root.clone()],
+             mount_root: self.temp.path().join("mount"),
+             ratarmount_bin: String::new(),
+diff --git a/crates/archivefs-gui/src/gui_v2/native_media_apply_tests.rs b/crates/archivefs-gui/src/gui_v2/native_media_apply_tests.rs
+index ce39e82..a87128c 100644
+--- a/crates/archivefs-gui/src/gui_v2/native_media_apply_tests.rs
++++ b/crates/archivefs-gui/src/gui_v2/native_media_apply_tests.rs
+@@ -81,6 +81,7 @@ fn bounded_confirmation_requires_review_backup_ack_and_explicit_apply_at_small_r
+     let dbpath = t.path().join("copy.sqlite3");
+     let cfg = t.path().join("config.toml");
+     let config = archivefs_core::Config {
++        configured_source_roots: Some(vec![root.clone()]),
+         source_folders: vec![root.clone()],
+         mount_root: PathBuf::new(),
+         ratarmount_bin: String::new(),
+diff --git a/crates/archivefs-gui/src/gui_v2/native_media_preview.rs b/crates/archivefs-gui/src/gui_v2/native_media_preview.rs
+index fbcec4f..9c75d71 100644
+--- a/crates/archivefs-gui/src/gui_v2/native_media_preview.rs
++++ b/crates/archivefs-gui/src/gui_v2/native_media_preview.rs
+@@ -112,9 +112,14 @@ fn run_at(
+     review.validate_saved_at(config_path, &database)?;
+     let db = Database::open_read_only(&database).map_err(|e| e.to_string())?;
+     let platforms = catalogue_platforms(&root, &sources);
++    // The configured mount root lets the scan skip mount-root content (and
++    // live mounts) when a legacy config overlaps this source.
++    let mount_root =
++        archivefs_core::configured_mount_root_at(config_path).map_err(|e| e.to_string())?;
+     let config = archivefs_core::Config {
++        configured_source_roots: None,
+         source_folders: vec![root],
+-        mount_root: PathBuf::new(),
++        mount_root,
+         ratarmount_bin: String::new(),
+         master_rom_root: None,
+     };
+diff --git a/crates/archivefs-gui/src/gui_v2/recording_integrity.rs b/crates/archivefs-gui/src/gui_v2/recording_integrity.rs
+index 527e162..f5334f5 100644
+--- a/crates/archivefs-gui/src/gui_v2/recording_integrity.rs
++++ b/crates/archivefs-gui/src/gui_v2/recording_integrity.rs
+@@ -239,6 +239,7 @@ mod tests {
+         scan_and_persist(
+             &mut db,
+             &Config {
++                configured_source_roots: Some(vec![source.clone()]),
+                 source_folders: vec![source],
+                 mount_root: dir.path().join("mount"),
+                 ratarmount_bin: String::new(),
+diff --git a/crates/archivefs-gui/src/gui_v2/tests.rs b/crates/archivefs-gui/src/gui_v2/tests.rs
+index 2bc1dc1..4082022 100644
+--- a/crates/archivefs-gui/src/gui_v2/tests.rs
++++ b/crates/archivefs-gui/src/gui_v2/tests.rs
+@@ -3290,6 +3290,7 @@ fn gui_v2_database_load_is_real_and_read_only() {
+     fs::write(source.join("game.zip"), b"fixture archive").unwrap();
+     let database_path = directory.path().join("library.sqlite3");
+     let config = archivefs_core::Config {
++        configured_source_roots: Some(vec![source.clone()]),
+         source_folders: vec![source],
+         mount_root: directory.path().join("mount"),
+         ratarmount_bin: "ratarmount".into(),
+@@ -9061,6 +9062,7 @@ fn temp_catalogue() -> (
+     let archive_path = source.join("misc/GameCube Demo.zip");
+     std::fs::write(&archive_path, b"contents").unwrap();
+     let config = archivefs_core::Config {
++        configured_source_roots: Some(vec![source.clone()]),
+         source_folders: vec![source],
+         mount_root: dir.path().join("mount"),
+         ratarmount_bin: "ratarmount".into(),
+@@ -10521,6 +10523,7 @@ mod library_files_check {
+         std::fs::create_dir_all(&root).unwrap();
+         std::fs::write(root.join("stray.xyz"), b"stray").unwrap();
+         let config = archivefs_core::Config {
++            configured_source_roots: Some(vec![root.clone()]),
+             source_folders: vec![root.clone()],
+             mount_root: dir.path().join("mounts"),
+             ratarmount_bin: "ratarmount".into(),
+@@ -10704,6 +10707,7 @@ mod library_files_check {
+         std::fs::create_dir_all(&root).unwrap();
+         std::fs::write(root.join("stray.xyz"), b"stray").unwrap();
+         let config = archivefs_core::Config {
++            configured_source_roots: Some(vec![root.clone()]),
+             source_folders: vec![root.clone()],
+             mount_root: dir.path().join("mounts"),
+             ratarmount_bin: "ratarmount".into(),
+diff --git a/crates/archivefs-gui/src/tests/database_and_catalogue.rs b/crates/archivefs-gui/src/tests/database_and_catalogue.rs
+index 3320b66..dad91b7 100644
+--- a/crates/archivefs-gui/src/tests/database_and_catalogue.rs
++++ b/crates/archivefs-gui/src/tests/database_and_catalogue.rs
+@@ -1023,6 +1023,7 @@ fn scan_partial_success_reports_folder_errors_without_failing_the_scan() {
+     write_archive_file(&source_a, "a.zip", b"a");
+     write_archive_file(&source_b, "b.zip", b"b");
+     let config = Config {
++        configured_source_roots: Some(vec![source_a.clone(), source_b.clone()]),
+         source_folders: vec![source_a.clone(), source_b.clone()],
+         mount_root: mount,
+         ratarmount_bin: "ratarmount".to_string(),
+diff --git a/crates/archivefs-gui/src/tests/doctor_and_repair.rs b/crates/archivefs-gui/src/tests/doctor_and_repair.rs
+index 9be9dda..c8b0030 100644
+--- a/crates/archivefs-gui/src/tests/doctor_and_repair.rs
++++ b/crates/archivefs-gui/src/tests/doctor_and_repair.rs
+@@ -3690,6 +3690,7 @@ fn a_refused_repair_is_recorded_in_history_and_shown_as_refused() {
+     let scratch = std::env::temp_dir().join("archivefs-doctor-repair-refusal-fixture");
+     app.confirm_doctor_repair_with(
+         Config {
++            configured_source_roots: Some(vec![scratch.join("sources")]),
+             source_folders: vec![scratch.join("sources")],
+             mount_root: scratch.join("mounts"),
+             ratarmount_bin: "ratarmount".to_string(),
+diff --git a/crates/archivefs-gui/src/tests/mod.rs b/crates/archivefs-gui/src/tests/mod.rs
+index e635e4b..a182190 100644
+--- a/crates/archivefs-gui/src/tests/mod.rs
++++ b/crates/archivefs-gui/src/tests/mod.rs
+@@ -101,6 +101,7 @@ impl GuiConfigSnapshot {
+ #[cfg(test)]
+ fn hermetic_gui_config() -> Result<Config, String> {
+     Ok(Config {
++        configured_source_roots: Some(vec![PathBuf::from("/library")]),
+         source_folders: vec![PathBuf::from("/library")],
+         mount_root: PathBuf::from("/mount"),
+         ratarmount_bin: "ratarmount".to_string(),
+@@ -1175,6 +1176,7 @@ pub(crate) fn app_for_operation_tests() -> ArchiveFsApp {
+         select_all_visible_requested: false,
+         catalogue_bsfree_ui: CatalogueBsFreeUiState::default(),
+         gui_config: GuiConfigSnapshot::from_config(Config {
++            configured_source_roots: Some(vec![PathBuf::from("/library")]),
+             source_folders: vec![PathBuf::from("/library")],
+             mount_root: PathBuf::from("/mount"),
+             ratarmount_bin: "ratarmount".to_string(),
+@@ -1367,6 +1369,7 @@ fn write_archive_file(dir: &Path, relative_path: &str, content: &[u8]) -> PathBu
+ 
+ fn config_for(source_dir: &Path, mount_dir: &Path) -> Config {
+     Config {
++        configured_source_roots: Some(vec![source_dir.to_path_buf()]),
+         source_folders: vec![source_dir.to_path_buf()],
+         mount_root: mount_dir.to_path_buf(),
+         ratarmount_bin: "ratarmount".to_string(),
+diff --git a/crates/archivefs-gui/src/tests/onboarding_flow.rs b/crates/archivefs-gui/src/tests/onboarding_flow.rs
+index 82b6376..7055e5f 100644
+--- a/crates/archivefs-gui/src/tests/onboarding_flow.rs
++++ b/crates/archivefs-gui/src/tests/onboarding_flow.rs
+@@ -10,6 +10,7 @@ use crate::app::GuiConfigSnapshot;
+ fn app_with_no_source() -> ArchiveFsApp {
+     let mut app = app_for_operation_tests();
+     app.gui_config = GuiConfigSnapshot::from_config(Config {
++        configured_source_roots: Some(Vec::new()),
+         source_folders: Vec::new(),
+         mount_root: PathBuf::from("/mount"),
+         ratarmount_bin: "ratarmount".to_string(),
+-- 
+2.43.0
+
