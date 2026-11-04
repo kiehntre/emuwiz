@@ -61,10 +61,10 @@
 //! for the organiser, reused here unchanged (no second multi-disc
 //! detector). An `.m3u` playlist's own referenced lines are read with the
 //! existing [`crate::platform_evidence_fusion::cue_m3u_parsing::parse_m3u_references`]
-//! (no second M3U parser). Each referenced disc - itself possibly a CUE
-//! with its own companions, resolved one level deep via
-//! [`crate::ingestion::cue_bin::resolve_cue_all_files_lenient`] - must
-//! verify against its own distinct DAT entry, and every one of those
+//! (no second M3U parser). Each referenced disc - itself possibly a CUE or
+//! GDI with its own companions, resolved one level deep and judged by the
+//! same rule as a standalone CUE/GDI release (every track must verify) -
+//! must verify against its own distinct DAT entry, and every one of those
 //! entries must share the same multidisc base title; anything else is
 //! refused as a whole, exactly as above - the M3U, every disc it
 //! structurally names, and each of those discs' own structurally
@@ -96,6 +96,28 @@ struct LauncherAttempt {
     known_files: Vec<PathBuf>,
 }
 
+/// What pass 1 (or the bridge) established for each file: a SHA-1 that
+/// names exactly one catalogue entry (`unique`), or one that several
+/// entries share (`shared`), as identical audio tracks across regional
+/// releases do. Only `unique` files ever become single-file matches; a
+/// shared file is evidence only inside a multi-file release, where the
+/// release's other files decide which one entry it is.
+#[derive(Debug, Clone, Default)]
+struct FileEvidence {
+    unique: BTreeMap<PathBuf, usize>,
+    shared: BTreeMap<PathBuf, BTreeSet<usize>>,
+}
+
+impl FileEvidence {
+    /// The catalogue entries this file's bytes belong to, if any.
+    fn games(&self, path: &Path) -> Option<BTreeSet<usize>> {
+        self.unique
+            .get(path)
+            .map(|game| BTreeSet::from([*game]))
+            .or_else(|| self.shared.get(path).cloned())
+    }
+}
+
 /// The result of one matching run: verified matches (single- and
 /// multi-file alike) plus every CUE/GDI launcher found but not safely
 /// combinable into one - see the module doc comment.
@@ -120,7 +142,7 @@ pub fn match_loose_files_against_dat(
 
     // Pass 1: ordinary whole-file hash match, exactly as before this
     // module gained multi-file support.
-    let mut file_game: BTreeMap<PathBuf, usize> = BTreeMap::new();
+    let mut evidence = FileEvidence::default();
     for candidate in candidates {
         if cancel.load(Ordering::Relaxed) {
             break;
@@ -130,15 +152,21 @@ pub fn match_loose_files_against_dat(
         };
         let refs = index.lookup_sha1(&hashes.sha1);
         let distinct_games: BTreeSet<usize> = refs.iter().map(|entry| entry.game_index).collect();
-        if distinct_games.len() == 1 {
-            file_game.insert(
-                candidate.clone(),
-                *distinct_games.iter().next().expect("len() == 1"),
-            );
+        match distinct_games.len() {
+            0 => {}
+            1 => {
+                evidence.unique.insert(
+                    candidate.clone(),
+                    *distinct_games.iter().next().expect("len() == 1"),
+                );
+            }
+            _ => {
+                evidence.shared.insert(candidate.clone(), distinct_games);
+            }
         }
     }
 
-    combine_verified_matches(dat, candidates, file_game, trusted, cancel)
+    combine_with_evidence(dat, candidates, &evidence, trusted, cancel)
 }
 
 /// Combines CUE/GDI/M3U launchers structurally given an already-established
@@ -158,6 +186,20 @@ pub(crate) fn combine_verified_matches(
     dat: &ParsedDat,
     candidates: &[PathBuf],
     file_game: BTreeMap<PathBuf, usize>,
+    trusted: &TrustedRoots,
+    cancel: &AtomicBool,
+) -> MatchOutcome {
+    let evidence = FileEvidence {
+        unique: file_game,
+        shared: BTreeMap::new(),
+    };
+    combine_with_evidence(dat, candidates, &evidence, trusted, cancel)
+}
+
+fn combine_with_evidence(
+    dat: &ParsedDat,
+    candidates: &[PathBuf],
+    evidence: &FileEvidence,
     trusted: &TrustedRoots,
     cancel: &AtomicBool,
 ) -> MatchOutcome {
@@ -182,7 +224,7 @@ pub(crate) fn combine_verified_matches(
         if extension != "m3u" && extension != "m3u8" {
             continue;
         }
-        let attempt = combine_m3u_launcher(candidate, dat, &file_game, trusted);
+        let attempt = combine_m3u_launcher(candidate, dat, evidence, trusted);
         record_attempt(
             candidate,
             attempt,
@@ -222,8 +264,19 @@ pub(crate) fn combine_verified_matches(
                 // all is not this module's concern (e.g. discovery already
                 // rejected it, or it belongs to a different platform
                 // pass) - only a launcher this module could actually parse
-                // but not safely combine is worth reporting.
-                Err(_) => continue,
+                // but not safely combine is worth reporting. The exception
+                // is one the catalogue lists: see `unreadable_descriptor`.
+                Err(error) => {
+                    unreadable_descriptor(
+                        candidate,
+                        "CUE",
+                        &error.to_string(),
+                        evidence,
+                        &mut excluded,
+                        &mut rejected_launchers,
+                    );
+                    continue;
+                }
             },
             "gdi" => match resolve_gdi_all_tracks_lenient(candidate) {
                 Ok(list) => (
@@ -232,11 +285,21 @@ pub(crate) fn combine_verified_matches(
                         .map(|outcome| outcome.map_err(|error| error.to_string()))
                         .collect::<Vec<_>>(),
                 ),
-                Err(_) => continue,
+                Err(error) => {
+                    unreadable_descriptor(
+                        candidate,
+                        "GDI",
+                        &format!("{error:?}"),
+                        evidence,
+                        &mut excluded,
+                        &mut rejected_launchers,
+                    );
+                    continue;
+                }
             },
             _ => continue,
         };
-        let attempt = combine_launcher(kind, candidate, &outcomes, &file_game, trusted);
+        let attempt = combine_launcher(kind, candidate, &outcomes, evidence, trusted);
         record_attempt(
             candidate,
             attempt,
@@ -250,13 +313,13 @@ pub(crate) fn combine_verified_matches(
     // accepted or rejected multi-file release becomes its own ordinary
     // single-file match - unchanged behaviour for CHD, ISO, RVZ,
     // cartridge, and archive releases.
-    for (path, game_index) in file_game {
-        if excluded.contains(&path) {
+    for (path, game_index) in &evidence.unique {
+        if excluded.contains(path) {
             continue;
         }
         matches.push(DatArchiveMatch {
-            archive_path: path,
-            dat_entry_index: game_index,
+            archive_path: path.clone(),
+            dat_entry_index: *game_index,
             companion_paths: Vec::new(),
         });
     }
@@ -265,6 +328,30 @@ pub(crate) fn combine_verified_matches(
         matches,
         rejected_launchers,
     }
+}
+
+/// A descriptor this module cannot parse is normally ignored. But when the
+/// catalogue lists it, its hash still matches, and pass 4 would publish it
+/// as a release on its own although it proves nothing about any track.
+/// Refuse it instead; its tracks are unknown, so only it is excluded.
+fn unreadable_descriptor(
+    candidate: &Path,
+    kind: &str,
+    error: &str,
+    evidence: &FileEvidence,
+    excluded: &mut BTreeSet<PathBuf>,
+    rejected_launchers: &mut Vec<RejectedLauncher>,
+) {
+    if evidence.games(candidate).is_none() {
+        return;
+    }
+    excluded.insert(candidate.to_path_buf());
+    rejected_launchers.push(RejectedLauncher {
+        launcher_path: candidate.to_path_buf(),
+        reason: format!(
+            "{kind} descriptor matches the catalogue but could not be read, so its tracks are unverified: {error}"
+        ),
+    });
 }
 
 /// Applies one [`LauncherAttempt`] to the running match/exclusion state.
@@ -320,7 +407,7 @@ fn combine_launcher(
     kind: &str,
     launcher: &Path,
     outcomes: &[Result<PathBuf, String>],
-    file_game: &BTreeMap<PathBuf, usize>,
+    evidence: &FileEvidence,
     trusted: &TrustedRoots,
 ) -> LauncherAttempt {
     let mut known_files = Vec::new();
@@ -347,26 +434,32 @@ fn combine_launcher(
     // A catalogue may list the descriptor itself (TOSEC lists `.gdi`, Redump
     // lists `.cue`), but its match proves only the descriptor text: it joins
     // the evidence and never stands for the release on its own.
-    let launcher_game = file_game.get(launcher).copied();
-    let matched_games: BTreeSet<usize> = known_files
+    let launcher_games = evidence.games(launcher);
+    let file_games: Vec<Option<BTreeSet<usize>>> = known_files
         .iter()
-        .filter_map(|path| file_game.get(path).copied())
-        .chain(launcher_game)
+        .map(|path| evidence.games(path))
         .collect();
+    if launcher_games.is_none() && file_games.iter().all(Option::is_none) {
+        return LauncherAttempt {
+            outcome: Ok(None),
+            known_files,
+        };
+    }
+    // Something in the release matched, so it is this catalogue's concern:
+    // every referenced file must then verify, or the release is refused as a
+    // whole. A changed, replaced or unhashed file is not verified.
     let unverified: Vec<String> = known_files
         .iter()
-        .filter(|path| !file_game.contains_key(*path))
-        .map(|path| {
+        .zip(&file_games)
+        .filter(|(_, games)| games.is_none())
+        .map(|(path, _)| {
             path.file_name().map_or_else(
                 || path.display().to_string(),
                 |name| name.to_string_lossy().into_owned(),
             )
         })
         .collect();
-    // Something in the release matched, so it is this catalogue's concern:
-    // every referenced file must then verify, or the release is refused as a
-    // whole. A changed, replaced or unhashable file is not verified.
-    if !matched_games.is_empty() && !unverified.is_empty() {
+    if !unverified.is_empty() {
         return LauncherAttempt {
             outcome: Err(format!(
                 "{kind} release is not verified: {} of {} referenced file(s) do not match the catalogue ({})",
@@ -377,20 +470,42 @@ fn combine_launcher(
             known_files,
         };
     }
-    let outcome = match matched_games.len() {
-        0 => Ok(None),
+    // The release is the one entry every file (and a listed descriptor)
+    // belongs to. A file shared by several entries narrows nothing on its
+    // own; the release's other files decide.
+    let mut elected: Option<BTreeSet<usize>> = None;
+    for games in file_games.iter().flatten().chain(launcher_games.iter()) {
+        elected = Some(match elected {
+            None => games.clone(),
+            Some(so_far) => so_far.intersection(games).copied().collect(),
+        });
+    }
+    let elected = elected.unwrap_or_default();
+    let outcome = match elected.len() {
+        // Every file matched only entries that several releases share:
+        // nothing decides between them, so it is left unmatched, as before.
+        n if n > 1 => Ok(None),
         1 => {
-            let dat_entry_index = *matched_games.iter().next().expect("len() == 1");
+            let dat_entry_index = *elected.iter().next().expect("len() == 1");
             Ok(Some(DatArchiveMatch {
                 archive_path: launcher.to_path_buf(),
                 dat_entry_index,
                 companion_paths: known_files.clone(),
             }))
         }
-        _ => Err(format!(
-            "referenced files verify against {} different catalogue entries, not one",
-            matched_games.len()
-        )),
+        _ => {
+            let involved: BTreeSet<usize> = file_games
+                .iter()
+                .flatten()
+                .chain(launcher_games.iter())
+                .flatten()
+                .copied()
+                .collect();
+            Err(format!(
+                "referenced files verify against {} different catalogue entries, not one",
+                involved.len()
+            ))
+        }
     };
     LauncherAttempt {
         outcome,
@@ -410,7 +525,7 @@ fn combine_launcher(
 fn combine_m3u_launcher(
     launcher: &Path,
     dat: &ParsedDat,
-    file_game: &BTreeMap<PathBuf, usize>,
+    evidence: &FileEvidence,
     trusted: &TrustedRoots,
 ) -> LauncherAttempt {
     let mut known_files = Vec::new();
@@ -482,9 +597,34 @@ fn combine_m3u_launcher(
             .extension()
             .and_then(|value| value.to_str())
             .map(str::to_ascii_lowercase);
-        let disc_game_index = if disc_extension.as_deref() == Some("cue") {
-            let per_reference = match resolve_cue_all_files_lenient(&canonical) {
-                Ok(list) => list,
+        // A CUE or GDI disc is judged exactly as a standalone one: every
+        // track it names must verify against the disc's one entry.
+        let disc_resolution = match disc_extension.as_deref() {
+            Some("cue") => Some((
+                "CUE",
+                resolve_cue_all_files_lenient(&canonical)
+                    .map(|list| {
+                        list.into_iter()
+                            .map(|outcome| outcome.map_err(|error| error.to_string()))
+                            .collect::<Vec<_>>()
+                    })
+                    .map_err(|error| error.to_string()),
+            )),
+            Some("gdi") => Some((
+                "GDI",
+                resolve_gdi_all_tracks_lenient(&canonical)
+                    .map(|list| {
+                        list.into_iter()
+                            .map(|outcome| outcome.map_err(|error| format!("{error:?}")))
+                            .collect::<Vec<_>>()
+                    })
+                    .map_err(|error| format!("{error:?}")),
+            )),
+            _ => None,
+        };
+        let disc_game_index = if let Some((kind, resolved)) = disc_resolution {
+            let outcomes = match resolved {
+                Ok(outcomes) => outcomes,
                 Err(error) => {
                     return LauncherAttempt {
                         outcome: Err(format!("disc {} is unusable: {error}", canonical.display())),
@@ -492,44 +632,32 @@ fn combine_m3u_launcher(
                     };
                 }
             };
-            let mut disc_files = Vec::new();
-            let mut disc_failures = 0usize;
-            for outcome in &per_reference {
-                match outcome {
-                    Ok(path) if trusted.contains_canonical(path) => {
-                        if !disc_files.contains(path) {
-                            disc_files.push(path.clone());
-                        }
-                    }
-                    Ok(_) | Err(_) => disc_failures += 1,
+            let attempt = combine_launcher(kind, &canonical, &outcomes, evidence, trusted);
+            for path in attempt.known_files {
+                if !known_files.contains(&path) {
+                    known_files.push(path);
                 }
             }
-            known_files.extend(disc_files.iter().cloned());
-            if disc_failures > 0 {
-                return LauncherAttempt {
-                    outcome: Err(format!(
-                        "disc {} is missing one or more required companion files",
-                        canonical.display()
-                    )),
-                    known_files,
-                };
+            match attempt.outcome {
+                Ok(Some(disc)) => disc.dat_entry_index,
+                Ok(None) => {
+                    return LauncherAttempt {
+                        outcome: Err(format!(
+                            "disc {} does not verify against exactly one catalogue entry",
+                            canonical.display()
+                        )),
+                        known_files,
+                    };
+                }
+                Err(reason) => {
+                    return LauncherAttempt {
+                        outcome: Err(format!("disc {}: {reason}", canonical.display())),
+                        known_files,
+                    };
+                }
             }
-            let matched: BTreeSet<usize> = disc_files
-                .iter()
-                .filter_map(|path| file_game.get(path).copied())
-                .collect();
-            if matched.len() != 1 {
-                return LauncherAttempt {
-                    outcome: Err(format!(
-                        "disc {} does not verify against exactly one catalogue entry",
-                        canonical.display()
-                    )),
-                    known_files,
-                };
-            }
-            *matched.iter().next().expect("len() == 1")
         } else {
-            let Some(&game_index) = file_game.get(&canonical) else {
+            let Some(&game_index) = evidence.unique.get(&canonical) else {
                 return LauncherAttempt {
                     outcome: Err(format!(
                         "disc {} does not verify against the catalogue",
