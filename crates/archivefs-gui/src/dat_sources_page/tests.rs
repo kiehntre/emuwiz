@@ -9452,6 +9452,45 @@ fn canonical_blue_preview_explains_missing_evidence() {
 /// creating any journal, and no recovery journal is read from anywhere.
 #[test]
 fn an_unresolvable_data_folder_refuses_apply_and_undo_and_creates_no_journal() {
+    assert_unresolved_journal_folder_refuses_everything(|fixture, roms| {
+        DatSourcesPageState::load_with_resolved_transaction_dir(
+            fixture.config_path.clone(),
+            Vec::new(),
+            TrustedRoots::from_paths([roms]),
+            Err("EmuWiz found data in two places".to_string()),
+            fixture
+                .config_path
+                .with_file_name("managed_dat_sources.toml"),
+            fixture.config_path.with_file_name("managed-dats"),
+        )
+    });
+}
+
+/// The production `load()` path itself (only the resolver is injected): an
+/// unresolved data folder can never select the temp folder (the original
+/// fallback) or any other folder for DAT Sources Undo.
+#[test]
+fn load_never_falls_back_to_the_temp_folder_when_the_data_folder_is_unresolved() {
+    assert_unresolved_journal_folder_refuses_everything(|fixture, roms| {
+        let page = DatSourcesPageState::load_with_journal_resolver(
+            fixture.config_path.clone(),
+            Vec::new(),
+            TrustedRoots::from_paths([roms]),
+            || {
+                Err(archivefs_core::ArchiveFsError::Config(
+                    "EmuWiz found data in two places".into(),
+                ))
+            },
+        );
+        assert_eq!(page.transaction_dir, PathBuf::new());
+        assert!(!page.transaction_dir.starts_with(std::env::temp_dir()));
+        page
+    });
+}
+
+fn assert_unresolved_journal_folder_refuses_everything(
+    make_page: impl FnOnce(&Fixture, &Path) -> DatSourcesPageState,
+) {
     let refusal = archivefs_core::dat::rename_apply::journal::JOURNAL_DIR_UNAVAILABLE;
     let temp_fallback = std::env::temp_dir().join("archivefs-rename-transactions");
     let temp_fallback_before = std::fs::read_dir(&temp_fallback)
@@ -9476,15 +9515,11 @@ fn an_unresolvable_data_folder_refuses_apply_and_undo_and_creates_no_journal() {
         names.sort();
         names
     };
-    let mut page = DatSourcesPageState::load_with_resolved_transaction_dir(
-        fixture.config_path.clone(),
-        Vec::new(),
-        TrustedRoots::from_paths([&roms]),
-        Err("EmuWiz found data in two places".to_string()),
-        fixture
-            .config_path
-            .with_file_name("managed_dat_sources.toml"),
-        fixture.config_path.with_file_name("managed-dats"),
+    let mut page = make_page(&fixture, &roms);
+    assert_eq!(
+        page.journal_dir_unavailable.as_deref(),
+        Some(refusal),
+        "an unresolved data folder must leave the page with no journal folder"
     );
     assert!(page.recovery_transactions.is_empty());
     page.rename_plan = Some(RenamePlan {

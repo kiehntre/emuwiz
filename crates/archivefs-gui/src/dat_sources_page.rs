@@ -3364,10 +3364,27 @@ impl DatSourcesPageState {
         library_folders: Vec<PathBuf>,
         trusted: TrustedRoots,
     ) -> Self {
+        Self::load_with_journal_resolver(
+            config_path,
+            library_folders,
+            trusted,
+            archivefs_core::dat::rename_apply::default_rename_transaction_dir,
+        )
+    }
+
+    /// [`Self::load`] with only the journal-folder resolver injected, so a
+    /// test can drive the production load path with a resolver that fails
+    /// (for example two existing setups) without touching the process
+    /// environment. Everything else is exactly what `load` does.
+    fn load_with_journal_resolver<E: std::fmt::Display>(
+        config_path: PathBuf,
+        library_folders: Vec<PathBuf>,
+        trusted: TrustedRoots,
+        resolve_journal_dir: impl FnOnce() -> Result<PathBuf, E>,
+    ) -> Self {
         // No fallback folder (it used to be the shared temp folder): when the
         // data folder cannot be resolved the page refuses every journal action.
-        let transaction_dir = archivefs_core::dat::rename_apply::default_rename_transaction_dir()
-            .map_err(|error| error.to_string());
+        let transaction_dir = resolve_journal_dir().map_err(|error| error.to_string());
         let managed_config_path = default_managed_dat_sources_config_path()
             .unwrap_or_else(|_| config_path.with_file_name("managed_dat_sources.toml"));
         let managed_root =
