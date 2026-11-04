@@ -312,7 +312,55 @@ pub(super) fn prepare_restore(
     now_unix_seconds: u64,
 ) -> Result<RestorePreview, String> {
     let file = snapshot_card_file(snapshot, location)?;
-    let card = inspect_memory_card(&file)
+    for dir in [&dirs.psu_dir, &dirs.backup_dir] {
+        fs::create_dir_all(dir)
+            .map_err(|error| format!("EmuWiz could not prepare its restore folder: {error}"))?;
+    }
+    let token = format!(
+        "{}-{now_unix_seconds}-{}-{}",
+        sanitize(&snapshot.manifest.snapshot_id),
+        std::process::id(),
+        NEXT_WORK_FILE.fetch_add(1, Ordering::Relaxed)
+    );
+    // Folder listing and exported bytes both come from one private copy
+    // whose hash matches the manifest, so a snapshot file changed between
+    // two reads cannot mix layouts and bytes.
+    let copy = dirs.psu_dir.join(format!("{token}.snapshot-card"));
+    let result = private_copy(&file, &copy, &snapshot.manifest.artifacts[0].sha256)
+        .and_then(|()| prepare_from_copy(snapshot, location, folder_raw_name, dirs, &copy, &token));
+    let _ = fs::remove_file(&copy);
+    result
+}
+
+/// Copy the snapshot card into a new file EmuWiz owns and check its hash.
+fn private_copy(source: &Path, copy: &Path, expected_sha256: &str) -> Result<(), String> {
+    use std::io::Write;
+    let bytes = fs::read(source)
+        .map_err(|error| format!("The snapshot card could not be read: {error}"))?;
+    if sha256_hex(&bytes) != expected_sha256 {
+        return Err(
+            "The snapshot no longer matches its recorded checksum. Nothing was changed.".into(),
+        );
+    }
+    let mut file = fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(copy)
+        .map_err(|error| format!("EmuWiz could not prepare its restore folder: {error}"))?;
+    file.write_all(&bytes)
+        .and_then(|()| file.sync_all())
+        .map_err(|error| format!("EmuWiz could not prepare its restore folder: {error}"))
+}
+
+fn prepare_from_copy(
+    snapshot: &SaveSnapshot,
+    location: &SaveLocation,
+    folder_raw_name: &[u8],
+    dirs: &WorkDirs,
+    copy: &Path,
+    token: &str,
+) -> Result<RestorePreview, String> {
+    let card = inspect_memory_card(copy)
         .map_err(|error| format!("The snapshot card could not be read: {error}"))?;
     supported_card(&card, "snapshot card")?;
     let matches = card
@@ -335,16 +383,6 @@ pub(super) fn prepare_restore(
     if let Some(problem) = folder_problem(save) {
         return Err(problem);
     }
-    for dir in [&dirs.psu_dir, &dirs.backup_dir] {
-        fs::create_dir_all(dir)
-            .map_err(|error| format!("EmuWiz could not prepare its restore folder: {error}"))?;
-    }
-    let token = format!(
-        "{}-{now_unix_seconds}-{}-{}",
-        sanitize(&snapshot.manifest.snapshot_id),
-        std::process::id(),
-        NEXT_WORK_FILE.fetch_add(1, Ordering::Relaxed)
-    );
     let psu = dirs.psu_dir.join(format!("{token}.psu"));
     let export = plan_ps2_psu_export(&card, save, &psu)
         .and_then(|plan| apply_ps2_psu_export(&plan))
@@ -412,8 +450,8 @@ pub(super) fn discard_preview(preview: &RestorePreview, dirs: &WorkDirs) {
     }
 }
 
-/// Worker: the guarded Core restore. Refuses while an earlier restore of this
-/// card is unfinished, so the Save Vault's recovery runs first.
+/// Worker: the guarded Core restore. Refuses while any earlier restore is
+/// unfinished, so the Save Vault's recovery runs first.
 pub(super) fn apply_restore(
     plan: &Ps2PsuRestorePlan,
     observer: &dyn QuiescenceProvider,
@@ -423,13 +461,14 @@ pub(super) fn apply_restore(
     if !records.is_complete() {
         return Err("EmuWiz could not read every earlier restore record, so it will not change the card. Open the Save Vault and refresh its restore records. Nothing was changed.".into());
     }
-    // An unreadable record may name this card, so it blocks too.
-    if records.records.iter().any(|record| {
-        record.error.is_some()
-            || (record.card_path.as_deref() == Some(plan.source_card_path.as_path())
-                && (record.needs_recovery || record.needs_attention))
-    }) {
-        return Err("An earlier restore to this memory card was interrupted. Open the Save Vault and use Check interrupted restores first. Nothing was changed.".into());
+    // Any unfinished or unreadable record blocks: it may name this card
+    // under another path spelling (symlink, Flatpak or canonical path).
+    if records
+        .records
+        .iter()
+        .any(|record| record.error.is_some() || record.needs_recovery || record.needs_attention)
+    {
+        return Err("An earlier memory card restore was interrupted or needs review. Open the Save Vault and use Check interrupted restores first. Nothing was changed.".into());
     }
     apply_ps2_psu_restore_guarded(plan, observer, options)
         .map_err(|error| psu_restore_error_message(&error))
@@ -803,10 +842,17 @@ pub(super) fn job_failed(app: &mut super::App, error: &str) {
     state.job = None;
     state.loaded_for = None;
     if let Some(card) = state.flow.card().map(Path::to_path_buf) {
+        // Choose/Confirm are dropped so a half-finished step is never
+        // retried from a stale preview; Done keeps Undo reachable.
+        if !matches!(state.flow, Flow::Done { .. }) {
+            state.flow = Flow::Idle;
+        }
         state.feedback = Some((
             card,
             false,
-            format!("The step did not finish. Check this card again before restoring. {error}"),
+            format!(
+                "The step did not finish. Check this card again before restoring; an interrupted restore is recovered from the Save Vault. {error}"
+            ),
         ));
     }
 }

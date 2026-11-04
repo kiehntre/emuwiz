@@ -404,3 +404,51 @@ fn savestate_and_game_tied_snapshots_are_not_card_restore_sources() {
     assert!(snapshot_folders(&listing.snapshots[0], &world.location).is_err());
     assert!(SAVESTATE_RESTORE_UNSUPPORTED.contains("cannot be restored"));
 }
+
+#[test]
+fn an_interrupted_restore_recorded_under_another_path_still_blocks() {
+    let world = World::new();
+    let snapshot = world.snapshot();
+    world.play();
+    let first = prepare_restore(&snapshot, &world.location, &folder(), &world.dirs, 1).unwrap();
+    let done = apply_restore(&first.plan, &CLOSED, &world.options).unwrap();
+    // The record names the card by another spelling of its path.
+    let mut journal = load_ps2_restore_journal(&done.journal_path).unwrap();
+    journal.phase = Ps2RestorePhase::Publishing;
+    journal.card_path = world.card.with_file_name("alias-Mcd001.ps2");
+    let body = serde_json::to_vec_pretty(&journal).unwrap();
+    let mut bytes = format!(
+        "EMUWIZ-PS2-RESTORE-JOURNAL v1 sha256={}\n",
+        sha256_hex(&body)
+    )
+    .into_bytes();
+    bytes.extend_from_slice(&body);
+    fs::write(&done.journal_path, bytes).unwrap();
+    let card = world.card_bytes();
+    let second = prepare_restore(&snapshot, &world.location, &folder(), &world.dirs, 2).unwrap();
+    assert!(apply_restore(&second.plan, &CLOSED, &world.options).is_err());
+    assert_eq!(world.card_bytes(), card);
+}
+
+#[test]
+fn preview_reads_one_private_verified_copy_and_leaves_only_the_psu() {
+    let world = World::new();
+    let snapshot = world.snapshot();
+    let preview = prepare_restore(&snapshot, &world.location, &folder(), &world.dirs, 1).unwrap();
+    let left: Vec<_> = fs::read_dir(&world.dirs.psu_dir)
+        .unwrap()
+        .map(|entry| entry.unwrap().path())
+        .collect();
+    assert_eq!(left, vec![preview.plan.source_psu_path.clone()]);
+    // A snapshot whose bytes no longer match the manifest leaves nothing.
+    discard_preview(&preview, &world.dirs);
+    let image = snapshot
+        .storage_path
+        .join("files")
+        .join(&snapshot.manifest.artifacts[0].relative_path);
+    let mut bytes = fs::read(&image).unwrap();
+    bytes[ICON_DATA.start] ^= 0x01;
+    fs::write(&image, bytes).unwrap();
+    assert!(prepare_restore(&snapshot, &world.location, &folder(), &world.dirs, 2).is_err());
+    assert_eq!(World::files_in(&world.dirs.psu_dir), 0);
+}

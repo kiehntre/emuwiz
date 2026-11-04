@@ -463,9 +463,15 @@ pub(super) fn show(app: &mut App, ui: &mut egui::Ui, game_id: Option<i64>) {
     let records: Vec<PersistentStateRecord> = records.into_iter().cloned().collect();
     let inventory_warnings = inventory.warnings.clone();
     if selected_game.is_none() {
-        let locations = card_locations
+        // Every eligible card in the inventory, not only the ones the current
+        // search/filter shows: history is loaded once per inventory, so a
+        // card hidden now must still have its snapshots when shown later.
+        let locations = inventory
+            .records
             .iter()
-            .filter_map(|location| location.as_ref().ok().cloned())
+            .filter_map(|record| {
+                super::card_restore::card_location(record, &inventory.records).ok()
+            })
             .collect();
         super::card_restore::ensure_history(app, locations);
     }

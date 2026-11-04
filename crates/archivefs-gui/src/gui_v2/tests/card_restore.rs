@@ -319,3 +319,67 @@ fn refused_steps_and_unsupported_records_are_explained() {
         CARD_RESTORE_WHERE
     );
 }
+
+#[test]
+fn a_failed_step_drops_a_stale_preview_and_keeps_undo_reachable() {
+    let context = egui::Context::default();
+    let world = World::new();
+    let mut app = world.app(&context);
+    let snapshot = world.snapshot();
+    world.load_history(&mut app);
+    let raw = card_restore::snapshot_folders(&snapshot, &world.location()).unwrap()[0]
+        .raw_name
+        .clone();
+    let preview =
+        card_restore::prepare_restore(&snapshot, &world.location(), &raw, &world.paths.dirs, 1)
+            .unwrap();
+    app.saves_states.card_restore.flow = Flow::Confirm {
+        preview: Box::new(preview),
+        location: world.location(),
+    };
+    app.saves_states.card_restore.job = Some(7);
+    card_restore::job_failed(&mut app, "worker stopped");
+    assert!(matches!(app.saves_states.card_restore.flow, Flow::Idle));
+    assert!(app.saves_states.card_restore.job.is_none());
+    let strings = shown(&context, &mut app);
+    assert!(has(&strings, "did not finish"), "{strings:?}");
+    assert!(!has(&strings, "Back up card and restore this folder"));
+}
+
+#[test]
+fn card_history_loads_even_when_the_first_view_filters_cards_out() {
+    // Codex P2: history is loaded once per inventory, so it must include
+    // cards hidden by the search or type filter at that moment.
+    let context = egui::Context::default();
+    let world = World::new();
+    let mut app = world.app(&context);
+    world.snapshot();
+    app.saves_states.filter = super::super::saves_states::Filter::SaveStates;
+    let strings = shown(&context, &mut app);
+    assert!(!has(&strings, "Card snapshots and save folder restore"));
+    assert!(
+        app.saves_states.card_restore.job.is_some(),
+        "the hidden card's history is still requested"
+    );
+
+    // Delivered as the worker would: the card's snapshot is listed once
+    // the filter is cleared, without another load.
+    let job = app.saves_states.card_restore.job.unwrap();
+    let mut histories = std::collections::BTreeMap::new();
+    histories.insert(
+        world.card.clone(),
+        card_restore::load_card_history(&world.paths.snapshot_root, &world.location(), &Closed),
+    );
+    let generation = app.saves_states.generation;
+    card_restore::receive(
+        &mut app,
+        job,
+        Outcome::History {
+            histories,
+            generation,
+        },
+    );
+    app.saves_states.filter = super::super::saves_states::Filter::All;
+    let strings = shown(&context, &mut app);
+    assert!(has(&strings, "Restore a save folder…"), "{strings:?}");
+}
