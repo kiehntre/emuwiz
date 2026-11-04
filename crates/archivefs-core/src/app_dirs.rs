@@ -243,6 +243,63 @@ pub fn data_dir() -> Result<PathBuf> {
     data_dir_in_with_roots(&home, explicit_root.as_deref(), xdg_data_home.as_deref())
 }
 
+fn ambiguous_under(
+    explicit_root: Option<&Path>,
+    base: &Path,
+    names: (&str, &str),
+    kind: Kind,
+) -> bool {
+    explicit_root.is_none()
+        && presence(&base.join(names.0), kind) == Presence::Established
+        && presence(&base.join(names.1), kind) == Presence::Established
+}
+
+/// Whether the current environment has two established setups (EmuWiz and
+/// legacy ArchiveFS) for config or data, the case where [`config_dir`] or
+/// [`data_dir`] refuses to choose. Only that case: a missing HOME, an
+/// invalid override or an empty EmuWiz folder beside a legacy one is not a
+/// conflict. Read-only.
+pub fn two_established_setups() -> bool {
+    let Ok(home) = home() else {
+        return false;
+    };
+    two_established_setups_in(
+        &home,
+        (
+            env::var_os(CONFIG_ROOT_OVERRIDE_ENV)
+                .map(PathBuf::from)
+                .as_deref(),
+            env::var_os("XDG_CONFIG_HOME").map(PathBuf::from).as_deref(),
+        ),
+        (
+            env::var_os(DATA_ROOT_OVERRIDE_ENV)
+                .map(PathBuf::from)
+                .as_deref(),
+            env::var_os("XDG_DATA_HOME").map(PathBuf::from).as_deref(),
+        ),
+    )
+}
+
+fn two_established_setups_in(
+    home: &Path,
+    (explicit_config, xdg_config): (Option<&Path>, Option<&Path>),
+    (explicit_data, xdg_data): (Option<&Path>, Option<&Path>),
+) -> bool {
+    let config_base = xdg_config.map_or_else(|| home.join(".config"), Path::to_path_buf);
+    let data_base = xdg_data.map_or_else(|| home.join(".local").join("share"), Path::to_path_buf);
+    ambiguous_under(
+        explicit_config,
+        &config_base,
+        (CONFIG_DIR_NAME, LEGACY_CONFIG_DIR_NAME),
+        Kind::Config,
+    ) || ambiguous_under(
+        explicit_data,
+        &data_base,
+        (DATA_DIR_NAME, LEGACY_DATA_DIR_NAME),
+        Kind::Data,
+    )
+}
+
 /// The path to one config file (e.g. `config.toml`) under the effective
 /// config directory.
 pub fn config_path(leaf: &str) -> Result<PathBuf> {
@@ -607,6 +664,43 @@ mod tests {
             .collect();
         assert_eq!(after, before);
         let _ = std::fs::remove_dir_all(&fresh);
+        let _ = std::fs::remove_dir_all(&home);
+    }
+
+    /// The setup-conflict signal agrees with resolution: an empty EmuWiz
+    /// folder beside a legacy install is not a conflict; two established
+    /// ones are, unless an explicit root has chosen.
+    #[test]
+    fn two_established_setups_matches_the_resolver_refusal() {
+        let home = home_with("conflict-signal", &[]);
+        let none = (None, None);
+        assert!(!two_established_setups_in(&home, none, none));
+        legacy_install(&home);
+        startup_leftovers(&home);
+        assert!(!two_established_setups_in(&home, none, none));
+        assert!(config_dir_in(&home).is_ok() && data_dir_in(&home).is_ok());
+
+        put(
+            &home,
+            &[".local", "share", "emuwiz", "library.sqlite3"],
+            "new-db",
+        );
+        assert!(data_dir_in(&home).is_err());
+        assert!(two_established_setups_in(&home, none, none));
+
+        let chosen = home.join(".local/share/archivefs");
+        assert!(!two_established_setups_in(
+            &home,
+            none,
+            (Some(&chosen), None)
+        ));
+        // An XDG root at the default base sees the same conflict.
+        let data_base = home.join(".local/share");
+        assert!(two_established_setups_in(
+            &home,
+            none,
+            (None, Some(&data_base))
+        ));
         let _ = std::fs::remove_dir_all(&home);
     }
 
