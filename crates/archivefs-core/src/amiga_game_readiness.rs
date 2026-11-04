@@ -211,6 +211,9 @@ pub struct AmigaDiskSetFacts {
     pub count: usize,
     pub order_verified: bool,
     pub problems: usize,
+    /// Disk numbers the set's own topology names as absent. A lone disk can
+    /// still belong to a larger, incomplete set.
+    pub missing: usize,
 }
 
 /// Reads the discovered emulator profiles and, for an LHA/LZH package, the
@@ -488,8 +491,17 @@ pub fn assess_amiga_game(
         }
     }
 
-    if let Some(disks) = disks.filter(|disks| disks.count > 1) {
-        let (state, detail) = if disks.problems > 0 {
+    if let Some(disks) = disks.filter(|disks| disks.count > 1 || disks.missing > 0) {
+        let (state, detail) = if disks.missing > 0 {
+            (
+                Blocked,
+                format!(
+                    "{} of this game's disks {} missing; the set is incomplete (see the disk list).",
+                    disks.missing,
+                    if disks.missing == 1 { "is" } else { "are" }
+                ),
+            )
+        } else if disks.problems > 0 {
             (
                 Blocked,
                 format!(

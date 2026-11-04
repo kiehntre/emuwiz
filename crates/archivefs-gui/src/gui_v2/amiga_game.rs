@@ -94,6 +94,7 @@ pub(super) fn disk_facts(guidance: Option<&DiscGuidance>) -> Option<AmigaDiskSet
         count: guidance.discs.len(),
         order_verified: guidance.order_verified,
         problems: guidance.problems.len(),
+        missing: guidance.missing_media.len(),
     })
 }
 

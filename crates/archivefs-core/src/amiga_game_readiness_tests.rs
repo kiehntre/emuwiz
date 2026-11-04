@@ -177,6 +177,7 @@ fn incomplete_or_unverified_disk_sets_are_reported_honestly() {
         count: 3,
         order_verified: false,
         problems: 1,
+        missing: 0,
     };
     let readiness = assess_amiga_game(
         AMIGA,
@@ -219,6 +220,27 @@ fn incomplete_or_unverified_disk_sets_are_reported_honestly() {
     assert!(row.detail.contains("does not swap disks"));
     // A verified set is still not a launch route for direct floppies.
     assert!(!readiness.launch_route_exists);
+
+    // A disk the topology names as missing blocks the row, even when only
+    // one disk of the set is present.
+    for count in [1, 2] {
+        let gap = AmigaDiskSetFacts {
+            count,
+            order_verified: false,
+            problems: 0,
+            missing: 1,
+        };
+        let readiness =
+            assess_amiga_game(AMIGA, Path::new("d1.adf"), false, Some(gap), Some(&facts));
+        let row = readiness.check(K::Disks).unwrap();
+        assert_eq!(row.state, Blocked, "{count}: {row:?}");
+        assert!(
+            row.detail.contains("1 of this game's disks is missing"),
+            "{row:?}"
+        );
+        assert_eq!(row.route, Some(AmigaFixRoute::MultiDisk));
+        assert!(!readiness.launch_route_exists);
+    }
 }
 
 #[test]
