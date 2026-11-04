@@ -2157,6 +2157,19 @@ fn run_config_check_with_mount_root_creation(
     match &fields.mount_root {
         Some(mount_root) => {
             report.pass("mount_root set", format!("{}", mount_root.display()));
+            // Report an overlapping legacy config instead of fixing it, and
+            // never create the mount root inside a source folder.
+            let source_paths: Vec<PathBuf> = fields
+                .source_folders
+                .iter()
+                .flatten()
+                .map(PathBuf::from)
+                .collect();
+            let overlap = ensure_mount_root_disjoint_from_sources(mount_root, &source_paths).err();
+            if let Some(error) = &overlap {
+                report.error("mount_root separate from source folders", error.to_string());
+            }
+            let create_mount_root = create_mount_root && overlap.is_none();
             match inspect_path(mount_root) {
                 PathInspection::Directory => {
                     report.pass(
@@ -2569,6 +2582,15 @@ pub fn set_master_rom_root_to(config_path: &Path, path: &Path) -> Result<Option<
         .as_ref()
         .map(|config| config.ratarmount_bin.clone())
         .unwrap_or_else(|| "ratarmount".to_string());
+    // Organised games must never be moved into the mount root, nor the
+    // mount root sit inside the organised library.
+    if ensure_mount_root_disjoint_from_sources(&mount_root, &[path.to_path_buf()]).is_err() {
+        return Err(ArchiveFsError::Config(format!(
+            "the master ROM root {} overlaps the temporary preparation folder {}; choose a separate folder",
+            path.display(),
+            mount_root.display()
+        )));
+    }
     let previous = config.and_then(|config| config.master_rom_root);
     save_source_folder_configs_to(
         config_path,
@@ -2602,6 +2624,12 @@ pub fn set_mount_root_to(config_path: &Path, path: &Path) -> Result<PathBuf> {
     // removes a temp file inside it) or anything written.
     let contents = read_config_for_update(config_path)?;
     validate_mount_root_selection(path)?;
+    // Every configured source counts, enabled or not.
+    let sources: Vec<PathBuf> = parse_source_folder_configs(&contents)?
+        .into_iter()
+        .map(|source| source.path)
+        .collect();
+    ensure_mount_root_disjoint_from_sources(path, &sources)?;
     let updated = replace_mount_root_assignment(&contents, path)?;
     // The exact bytes about to be published must parse and round-trip the
     // requested folder. This is what stops a path containing an embedded
@@ -3073,6 +3101,168 @@ pub(crate) fn validate_configured_source_roots(paths: &[PathBuf]) -> Result<()> 
     Ok(())
 }
 
+/// How a mount root overlaps a source folder.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MountRootSourceOverlap {
+    /// The mount root is the source folder itself.
+    SameFolder,
+    /// The mount root is inside the source folder.
+    MountRootInsideSource,
+    /// The source folder is inside the mount root.
+    SourceInsideMountRoot,
+}
+
+impl MountRootSourceOverlap {
+    fn describe(self) -> &'static str {
+        match self {
+            Self::SameFolder => "is the same folder as",
+            Self::MountRootInsideSource => "is inside",
+            Self::SourceInsideMountRoot => "contains",
+        }
+    }
+}
+
+/// Resolves every symlink in `path`. A path that does not exist yet resolves
+/// its nearest existing ancestor and re-appends the missing components, so a
+/// folder that would be created later is compared where it would really be.
+fn resolve_through_nearest_existing_ancestor(path: &Path) -> io::Result<PathBuf> {
+    let mut missing = Vec::new();
+    let mut current = path;
+    loop {
+        match fs::canonicalize(current) {
+            Ok(mut resolved) => {
+                for component in missing.iter().rev() {
+                    resolved.push(component);
+                }
+                return Ok(resolved);
+            }
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {
+                match (current.parent(), current.file_name()) {
+                    (Some(parent), Some(name)) if !parent.as_os_str().is_empty() => {
+                        missing.push(name.to_os_string());
+                        current = parent;
+                    }
+                    _ => return Err(error),
+                }
+            }
+            Err(error) => return Err(error),
+        }
+    }
+}
+
+fn classify_mount_root_overlap(mount_root: &Path, source: &Path) -> Option<MountRootSourceOverlap> {
+    if mount_root == source {
+        Some(MountRootSourceOverlap::SameFolder)
+    } else if mount_root.starts_with(source) {
+        Some(MountRootSourceOverlap::MountRootInsideSource)
+    } else if source.starts_with(mount_root) {
+        Some(MountRootSourceOverlap::SourceInsideMountRoot)
+    } else {
+        None
+    }
+}
+
+/// Compares `mount_root` and `source` both as spelled (normalised) and with
+/// symlinks resolved, so neither an alias nor a symlinked spelling hides an
+/// overlap. An error means the overlap could not be ruled out.
+pub fn mount_root_source_overlap(
+    mount_root: &Path,
+    source: &Path,
+) -> io::Result<Option<MountRootSourceOverlap>> {
+    let lexical_mount: PathBuf = mount_root.components().collect();
+    let lexical_source: PathBuf = source.components().collect();
+    if let Some(overlap) = classify_mount_root_overlap(&lexical_mount, &lexical_source) {
+        return Ok(Some(overlap));
+    }
+    let resolved_mount = resolve_through_nearest_existing_ancestor(mount_root)?;
+    let resolved_source = resolve_through_nearest_existing_ancestor(source)?;
+    Ok(classify_mount_root_overlap(
+        &resolved_mount,
+        &resolved_source,
+    ))
+}
+
+/// The single mount-root/source disjointness rule. The mount root must not be
+/// a source folder, be inside one, or contain one: EmuWiz creates, mounts
+/// into and cleans up empty folders below the mount root, which must never
+/// reach the user's library. Fails closed when the comparison cannot be made.
+/// An empty mount root (none configured) overlaps nothing.
+pub fn ensure_mount_root_disjoint_from_sources(
+    mount_root: &Path,
+    sources: &[PathBuf],
+) -> Result<()> {
+    if mount_root.as_os_str().is_empty() {
+        return Ok(());
+    }
+    for source in sources
+        .iter()
+        .filter(|source| !source.as_os_str().is_empty())
+    {
+        match mount_root_source_overlap(mount_root, source) {
+            Ok(None) => {}
+            Ok(Some(overlap)) => {
+                return Err(ArchiveFsError::Config(format!(
+                    "the temporary preparation folder {} {} the source folder {}; EmuWiz never mounts into or cleans up inside a source folder, so choose a separate preparation folder",
+                    mount_root.display(),
+                    overlap.describe(),
+                    source.display()
+                )));
+            }
+            Err(error) => {
+                return Err(ArchiveFsError::Config(format!(
+                    "cannot verify that the temporary preparation folder {} is separate from the source folder {}: {error}",
+                    mount_root.display(),
+                    source.display()
+                )));
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Folders a source scan must not enter because they belong to the mount
+/// root. New configurations can no longer overlap, but a legacy config may:
+/// a mount root inside the source is excluded whole; when the mount root is
+/// the source or contains it, only its live mount points can be told apart
+/// from the user's own folders, so those are excluded.
+fn mount_root_scan_exclusions(source: &Path, mount_root: &Path) -> Vec<PathBuf> {
+    if mount_root.as_os_str().is_empty() {
+        return Vec::new();
+    }
+    match mount_root_source_overlap(mount_root, source) {
+        Ok(Some(MountRootSourceOverlap::MountRootInsideSource)) => {
+            let mut excluded = Vec::new();
+            let lexical: PathBuf = mount_root.components().collect();
+            if lexical.starts_with(source) {
+                excluded.push(lexical);
+            }
+            if let (Ok(resolved_mount), Ok(resolved_source)) = (
+                resolve_through_nearest_existing_ancestor(mount_root),
+                fs::canonicalize(source),
+            ) && let Ok(relative) = resolved_mount.strip_prefix(&resolved_source)
+            {
+                excluded.push(source.join(relative));
+            }
+            excluded
+        }
+        Ok(Some(_)) => match mounted_paths_under(mount_root) {
+            Ok(paths) => paths
+                .into_iter()
+                .filter(|path| path != source && path.starts_with(source))
+                .collect(),
+            Err(error) => {
+                log::warn!(
+                    "mount root {} overlaps source {} and its live mounts could not be listed: {error}",
+                    mount_root.display(),
+                    source.display()
+                );
+                Vec::new()
+            }
+        },
+        Ok(None) | Err(_) => Vec::new(),
+    }
+}
+
 /// Returns explicitly configured roots strictly below `source`, in stable
 /// order. A child source owns its subtree when the parent is scanned, so a
 /// pathological child cannot consume the parent's whole entry budget and no
@@ -3499,6 +3689,10 @@ pub fn add_source_folder_at(
 
     let existing_paths: Vec<PathBuf> = sources.iter().map(|source| source.path.clone()).collect();
     let validated_path = validate_new_source_folder(candidate, &existing_paths)?;
+    ensure_mount_root_disjoint_from_sources(
+        &config.mount_root,
+        std::slice::from_ref(&validated_path),
+    )?;
 
     let new_source = SourceFolderConfig {
         path: validated_path,
@@ -6024,6 +6218,7 @@ impl<'a> ArchiveScanner<'a> {
                     .filter(|root| root.starts_with(source) && *root != source)
                     .cloned(),
             );
+            excluded_roots.extend(mount_root_scan_exclusions(source, &self.config.mount_root));
             excluded_roots.sort();
             excluded_roots.dedup();
             self.scan_source(
@@ -9061,6 +9256,7 @@ fn validated_unmount_parent_identity(
 
 pub fn cleanup_selected_mount_dir(config: &Config, mount_path: &Path) -> Result<bool> {
     ensure_no_symlink_components(&config.mount_root)?;
+    ensure_mount_root_disjoint_from_sources(&config.mount_root, &config.source_folders)?;
     if mount_path == config.mount_root
         || !path_is_under(mount_path, &config.mount_root)
         || !mount_path.is_dir()
@@ -9075,6 +9271,7 @@ pub fn cleanup_selected_mount_dir(config: &Config, mount_path: &Path) -> Result<
 /// Removes an empty selected mount directory and its empty ancestors below the mount root.
 pub fn cleanup_selected_mount_tree(config: &Config, mount_path: &Path) -> Result<Vec<PathBuf>> {
     ensure_no_symlink_components(&config.mount_root)?;
+    ensure_mount_root_disjoint_from_sources(&config.mount_root, &config.source_folders)?;
     if mount_path == config.mount_root
         || !path_is_under(mount_path, &config.mount_root)
         || !mount_path.is_dir()
@@ -9148,6 +9345,8 @@ pub fn plan_stale_mount_directories(config: &Config) -> Result<Vec<PathBuf>> {
         return Ok(Vec::new());
     }
     ensure_no_symlink_components(&config.mount_root)?;
+    // Every empty folder in an overlapping source would look like a leftover.
+    ensure_mount_root_disjoint_from_sources(&config.mount_root, &config.source_folders)?;
     let mounted_paths = mounted_paths_under(&config.mount_root)?;
     let mut stale = Vec::new();
     let mut inspected = 0usize;
@@ -9218,6 +9417,7 @@ pub fn clean_mount_root(config: &Config) -> Result<Vec<PathBuf>> {
         return Ok(Vec::new());
     }
     ensure_no_symlink_components(&config.mount_root)?;
+    ensure_mount_root_disjoint_from_sources(&config.mount_root, &config.source_folders)?;
     let mut plans = ArchiveScanner::new(config).mount_plans()?;
     plans.sort_by(|left, right| right.mount_path.cmp(&left.mount_path));
     let mut removed = Vec::new();
@@ -12473,7 +12673,8 @@ mod tests {
         let mount_path = root.join("Xbox360").join("Game");
         fs::create_dir_all(&mount_path).unwrap();
         let config = Config {
-            source_folders: vec![root.join("roms")],
+            // The library sits beside the mount root: an overlapping one is refused.
+            source_folders: vec![root.with_file_name("cleanup-fixture-library")],
             mount_root: root.clone(),
             ratarmount_bin: "ratarmount".to_string(),
             master_rom_root: None,
@@ -12488,7 +12689,8 @@ mod tests {
     fn cleanup_selected_mount_dir_never_removes_mount_root() {
         let root = test_root("cleanup_selected_root");
         let config = Config {
-            source_folders: vec![root.join("roms")],
+            // The library sits beside the mount root: an overlapping one is refused.
+            source_folders: vec![root.with_file_name("cleanup-fixture-library")],
             mount_root: root.clone(),
             ratarmount_bin: "ratarmount".to_string(),
             master_rom_root: None,
@@ -12505,7 +12707,8 @@ mod tests {
         fs::create_dir_all(&mount_path).unwrap();
         fs::write(mount_path.join("file.txt"), b"keep").unwrap();
         let config = Config {
-            source_folders: vec![root.join("roms")],
+            // The library sits beside the mount root: an overlapping one is refused.
+            source_folders: vec![root.with_file_name("cleanup-fixture-library")],
             mount_root: root,
             ratarmount_bin: "ratarmount".to_string(),
             master_rom_root: None,
@@ -12521,7 +12724,8 @@ mod tests {
         let outside = test_root("cleanup_selected_outside_target").join("Game");
         fs::create_dir_all(&outside).unwrap();
         let config = Config {
-            source_folders: vec![root.join("roms")],
+            // The library sits beside the mount root: an overlapping one is refused.
+            source_folders: vec![root.with_file_name("cleanup-fixture-library")],
             mount_root: root,
             ratarmount_bin: "ratarmount".to_string(),
             master_rom_root: None,
@@ -12538,7 +12742,8 @@ mod tests {
         let mount_path = platform_path.join("Game");
         fs::create_dir_all(&mount_path).unwrap();
         let config = Config {
-            source_folders: vec![root.join("roms")],
+            // The library sits beside the mount root: an overlapping one is refused.
+            source_folders: vec![root.with_file_name("cleanup-fixture-library")],
             mount_root: root.clone(),
             ratarmount_bin: "ratarmount".to_string(),
             master_rom_root: None,
@@ -12556,7 +12761,8 @@ mod tests {
     fn cleanup_selected_mount_tree_rejects_mount_root_itself() {
         let root = test_root("cleanup_selected_tree_root");
         let config = Config {
-            source_folders: vec![root.join("roms")],
+            // The library sits beside the mount root: an overlapping one is refused.
+            source_folders: vec![root.with_file_name("cleanup-fixture-library")],
             mount_root: root.clone(),
             ratarmount_bin: "ratarmount".to_string(),
             master_rom_root: None,
@@ -12576,7 +12782,8 @@ mod tests {
         let outside = test_root("cleanup_selected_tree_outside_target").join("Game");
         fs::create_dir_all(&outside).unwrap();
         let config = Config {
-            source_folders: vec![root.join("roms")],
+            // The library sits beside the mount root: an overlapping one is refused.
+            source_folders: vec![root.with_file_name("cleanup-fixture-library")],
             mount_root: root,
             ratarmount_bin: "ratarmount".to_string(),
             master_rom_root: None,
@@ -12602,7 +12809,8 @@ mod tests {
         symlink(&outside, root.join("Platform")).unwrap();
         let linked_mount = root.join("Platform").join("Game");
         let config = Config {
-            source_folders: vec![root.join("roms")],
+            // The library sits beside the mount root: an overlapping one is refused.
+            source_folders: vec![root.with_file_name("cleanup-fixture-library")],
             mount_root: root,
             ratarmount_bin: "ratarmount".to_string(),
             master_rom_root: None,
@@ -12623,7 +12831,8 @@ mod tests {
         fs::create_dir_all(&mount_path).unwrap();
         fs::write(mount_path.join("file.txt"), b"keep").unwrap();
         let config = Config {
-            source_folders: vec![root.join("roms")],
+            // The library sits beside the mount root: an overlapping one is refused.
+            source_folders: vec![root.with_file_name("cleanup-fixture-library")],
             mount_root: root.clone(),
             ratarmount_bin: "ratarmount".to_string(),
             master_rom_root: None,
@@ -12647,7 +12856,8 @@ mod tests {
         fs::create_dir_all(&mount_path).unwrap();
         fs::create_dir_all(&other_mount_path).unwrap();
         let config = Config {
-            source_folders: vec![root.join("roms")],
+            // The library sits beside the mount root: an overlapping one is refused.
+            source_folders: vec![root.with_file_name("cleanup-fixture-library")],
             mount_root: root.clone(),
             ratarmount_bin: "ratarmount".to_string(),
             master_rom_root: None,

@@ -264,6 +264,9 @@ pub enum DoctorRepairRejection {
     ConflictingActiveMount,
     /// The mount root is not configured or not usable.
     MountRootUnavailable,
+    /// The mount root is a configured source folder, is inside one, or
+    /// contains one, so nothing below it can be proven to be EmuWiz's.
+    MountRootOverlapsSource,
 }
 
 impl DoctorRepairRejection {
@@ -302,6 +305,9 @@ impl DoctorRepairRejection {
             Self::SourceMissing => "The archive is no longer where Doctor found it.",
             Self::ConflictingActiveMount => "Something is already mounted at that location.",
             Self::MountRootUnavailable => "The configured mount root is missing or unusable.",
+            Self::MountRootOverlapsSource => {
+                "The configured mount root is, is inside, or contains a configured source folder, so EmuWiz refuses to clean it. Nothing was changed. Choose a separate mount root."
+            }
         }
     }
 }
@@ -624,6 +630,7 @@ impl RepairEffect {
 fn validate_clean_mount_root(
     context: &DoctorRepairContext<'_>,
 ) -> Result<RepairTarget, DoctorRepairRejection> {
+    guard_mount_root_disjoint_from_sources(context.config)?;
     if !context.config.mount_root.is_dir() {
         return Err(DoctorRepairRejection::MountRootUnavailable);
     }
@@ -641,6 +648,7 @@ fn validate_clean_mount_path(
 ) -> Result<RepairTarget, DoctorRepairRejection> {
     let path = affected_path(finding)?;
     guard_against_source_roots(&path, context.config)?;
+    guard_mount_root_disjoint_from_sources(context.config)?;
     guard_inside_mount_root(&path, context.config)?;
     guard_no_symlink_components(&path)?;
 
@@ -767,6 +775,13 @@ fn guard_against_source_roots(path: &Path, config: &Config) -> Result<(), Doctor
         }
     }
     Ok(())
+}
+
+/// Refuses any mount-root cleanup while the mount root overlaps a configured
+/// source folder (canonical comparison; fails closed when unverifiable).
+fn guard_mount_root_disjoint_from_sources(config: &Config) -> Result<(), DoctorRepairRejection> {
+    crate::ensure_mount_root_disjoint_from_sources(&config.mount_root, &config.source_folders)
+        .map_err(|_| DoctorRepairRejection::MountRootOverlapsSource)
 }
 
 fn guard_inside_mount_root(path: &Path, config: &Config) -> Result<(), DoctorRepairRejection> {
