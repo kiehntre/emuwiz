@@ -14,10 +14,11 @@
 //! # Multi-file releases fail closed as a whole
 //!
 //! A CUE sheet's `.bin`/audio tracks and a GDI descriptor's tracks each
-//! verify against their own `<rom>` entry, but the `.cue`/`.gdi` file
-//! itself is never individually hashed by any real DAT provider - so a
-//! plain per-file pass alone would either drop the whole release (the
-//! launcher never matches anything) or - worse - treat each of its
+//! verify against their own `<rom>` entry. Some catalogues also list the
+//! `.cue`/`.gdi` file itself (Redump lists `.cue`, TOSEC lists `.gdi`), but
+//! that match proves only the descriptor text, never the tracks, so it is
+//! never a release on its own. A plain per-file pass alone would either
+//! drop the whole release or, worse, treat each of its
 //! several verified track files as an independent, competing election for
 //! the same game, which [`super::elect_family`] would then wrongly try to
 //! rank against each other. [`match_loose_files_against_dat`] resolves
@@ -27,9 +28,11 @@
 //! [`crate::ingestion::cue_bin::resolve_cue_all_files_lenient`]/
 //! [`crate::ingestion::gdi::resolve_gdi_all_tracks_lenient`] - no second
 //! CUE/GDI parser exists here) are checked against the first pass's own
-//! matches; if they all resolve safely and verify against exactly one
-//! distinct game, the launcher becomes one combined [`DatArchiveMatch`]
-//! with those files as [`DatArchiveMatch::companion_paths`].
+//! matches; if they all resolve safely and every one of them verifies
+//! against the same one game, the launcher becomes one combined
+//! [`DatArchiveMatch`] with those files as
+//! [`DatArchiveMatch::companion_paths`]. A release with any unverified
+//! (changed, replaced or unhashable) referenced file is refused as a whole.
 //!
 //! The moment a `.cue`/`.gdi`/`.m3u` launcher *structurally references* a
 //! file - names it in a `FILE`/track/playlist line, regardless of whether
@@ -308,8 +311,10 @@ fn record_attempt(
 /// result each) into one [`DatArchiveMatch`]. Any missing, unsafe, or
 /// trust-escaping reference fails the *entire* release closed rather than
 /// silently dropping just that one file - see the module doc comment.
-/// `Ok(None)` means every safely-resolved reference existed but none
-/// matched anything (an ordinary unmatched launcher); `Err` names a plain
+/// `Ok(None)` means every safely-resolved reference existed but neither they
+/// nor the launcher matched anything (an ordinary unmatched launcher). Once
+/// anything matched, every referenced file must verify against the same one
+/// game; otherwise the whole release is refused. `Err` names a plain
 /// reason for [`RejectedLauncher`].
 fn combine_launcher(
     kind: &str,
@@ -339,10 +344,39 @@ fn combine_launcher(
             known_files,
         };
     }
+    // A catalogue may list the descriptor itself (TOSEC lists `.gdi`, Redump
+    // lists `.cue`), but its match proves only the descriptor text: it joins
+    // the evidence and never stands for the release on its own.
+    let launcher_game = file_game.get(launcher).copied();
     let matched_games: BTreeSet<usize> = known_files
         .iter()
         .filter_map(|path| file_game.get(path).copied())
+        .chain(launcher_game)
         .collect();
+    let unverified: Vec<String> = known_files
+        .iter()
+        .filter(|path| !file_game.contains_key(*path))
+        .map(|path| {
+            path.file_name().map_or_else(
+                || path.display().to_string(),
+                |name| name.to_string_lossy().into_owned(),
+            )
+        })
+        .collect();
+    // Something in the release matched, so it is this catalogue's concern:
+    // every referenced file must then verify, or the release is refused as a
+    // whole. A changed, replaced or unhashable file is not verified.
+    if !matched_games.is_empty() && !unverified.is_empty() {
+        return LauncherAttempt {
+            outcome: Err(format!(
+                "{kind} release is not verified: {} of {} referenced file(s) do not match the catalogue ({})",
+                unverified.len(),
+                known_files.len(),
+                unverified.join(", ")
+            )),
+            known_files,
+        };
+    }
     let outcome = match matched_games.len() {
         0 => Ok(None),
         1 => {

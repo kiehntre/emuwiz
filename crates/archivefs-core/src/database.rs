@@ -83,6 +83,9 @@ mod amiga_adf_identity_tests;
 mod cue_bin_tests;
 mod dat_current;
 mod dat_inventory;
+#[cfg(test)]
+#[path = "database/gdi_disc_tests.rs"]
+mod gdi_disc_tests;
 mod preservation_fingerprint;
 pub use preservation_fingerprint::PreservationFreshness;
 mod disc_order;

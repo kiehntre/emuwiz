@@ -412,6 +412,143 @@ fn a_gdi_referencing_a_missing_track_is_rejected_and_the_present_track_is_suppre
     assert!(outcome.matches.is_empty(), "{:?}", outcome.matches);
 }
 
+/// A two-track GDI fixture: `track01.bin` holds `b"test"` and
+/// `track02.bin` holds `track2`. Returns (descriptor, track01, track02).
+fn gdi_release(dir: &Path, track2: &[u8]) -> (PathBuf, PathBuf, PathBuf) {
+    let track1 = dir.join("track01.bin");
+    let track2_path = dir.join("track02.bin");
+    std::fs::write(&track1, b"test").unwrap();
+    std::fs::write(&track2_path, track2).unwrap();
+    let gdi = dir.join("game.gdi");
+    std::fs::write(
+        &gdi,
+        "2\n1 0 4 2352 track01.bin 0\n2 45000 4 2352 track02.bin 0\n",
+    )
+    .unwrap();
+    (gdi, track1, track2_path)
+}
+
+fn gdi_catalogue(descriptor_sha1: Option<String>) -> ParsedDat {
+    let mut roms = vec![
+        DatRomEntry {
+            name: "track01.bin".to_string(),
+            size_bytes: Some(4),
+            sha1: Some(SHA1_TEST.to_string()),
+            ..DatRomEntry::default()
+        },
+        DatRomEntry {
+            name: "track02.bin".to_string(),
+            size_bytes: Some(3),
+            sha1: Some(SHA1_ABC.to_string()),
+            ..DatRomEntry::default()
+        },
+    ];
+    if let Some(sha1) = descriptor_sha1 {
+        roms.insert(
+            0,
+            DatRomEntry {
+                name: "game.gdi".to_string(),
+                sha1: Some(sha1),
+                ..DatRomEntry::default()
+            },
+        );
+    }
+    dat_with_roms(roms)
+}
+
+fn sha1_of(path: &Path) -> String {
+    use sha1::{Digest, Sha1};
+    Sha1::digest(std::fs::read(path).unwrap())
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect()
+}
+
+/// Regression (optical Priority 2): a track that is present but holds other
+/// bytes is not verified, so the release must not combine as if it were.
+#[test]
+fn regression_a_gdi_with_a_changed_track_is_rejected_not_combined() {
+    let temp = tempfile::tempdir().expect("temp dir");
+    let (gdi, track1, track2) = gdi_release(temp.path(), b"xyz");
+    let outcome = match_loose_files_against_dat(
+        &gdi_catalogue(None),
+        &[track1, track2, gdi.clone()],
+        &TrustedRoots::from_paths([temp.path()]),
+        &AtomicBool::new(false),
+    );
+    assert!(outcome.matches.is_empty(), "{:?}", outcome.matches);
+    assert_eq!(outcome.rejected_launchers.len(), 1, "{outcome:?}");
+    assert_eq!(outcome.rejected_launchers[0].launcher_path, gdi);
+    assert!(
+        outcome.rejected_launchers[0].reason.contains("track02.bin"),
+        "{}",
+        outcome.rejected_launchers[0].reason
+    );
+}
+
+/// Regression (optical Priority 2): catalogues that list the descriptor
+/// itself (TOSEC lists `.gdi`, Redump lists `.cue`) make its own hash
+/// match. That proves only the descriptor text, never the tracks.
+#[test]
+fn regression_a_matching_gdi_descriptor_with_changed_tracks_is_not_a_match() {
+    let temp = tempfile::tempdir().expect("temp dir");
+    let (gdi, track1, track2) = gdi_release(temp.path(), b"xyz");
+    std::fs::write(&track1, b"nope").unwrap();
+    let dat = gdi_catalogue(Some(sha1_of(&gdi)));
+    let outcome = match_loose_files_against_dat(
+        &dat,
+        &[track1, track2, gdi.clone()],
+        &TrustedRoots::from_paths([temp.path()]),
+        &AtomicBool::new(false),
+    );
+    assert!(outcome.matches.is_empty(), "{:?}", outcome.matches);
+    assert_eq!(outcome.rejected_launchers.len(), 1, "{outcome:?}");
+    assert_eq!(outcome.rejected_launchers[0].launcher_path, gdi);
+}
+
+/// A catalogue that lists the descriptor still combines a complete,
+/// matching release: the descriptor is one more verified member.
+#[test]
+fn a_listed_gdi_descriptor_with_matching_tracks_combines_once() {
+    let temp = tempfile::tempdir().expect("temp dir");
+    let (gdi, track1, track2) = gdi_release(temp.path(), b"abc");
+    let dat = gdi_catalogue(Some(sha1_of(&gdi)));
+    let outcome = match_loose_files_against_dat(
+        &dat,
+        &[track1.clone(), track2.clone(), gdi.clone()],
+        &TrustedRoots::from_paths([temp.path()]),
+        &AtomicBool::new(false),
+    );
+    assert_eq!(outcome.matches.len(), 1, "{:?}", outcome.matches);
+    assert_eq!(outcome.matches[0].archive_path, gdi);
+    assert_eq!(outcome.matches[0].companion_paths, vec![track1, track2]);
+    assert!(outcome.rejected_launchers.is_empty());
+}
+
+/// Regression (optical Priority 2): an unreadable track cannot be hashed,
+/// so it is unverified and the release must not combine.
+#[cfg(unix)]
+#[test]
+fn regression_a_gdi_whose_track_is_not_a_regular_file_is_rejected() {
+    let temp = tempfile::tempdir().expect("temp dir");
+    let (gdi, track1, track2) = gdi_release(temp.path(), b"abc");
+    // Replace track02 with a FIFO: it resolves, but hashing refuses it.
+    std::fs::remove_file(&track2).unwrap();
+    let status = std::process::Command::new("mkfifo")
+        .arg(&track2)
+        .status()
+        .expect("mkfifo");
+    assert!(status.success());
+    let outcome = match_loose_files_against_dat(
+        &gdi_catalogue(None),
+        &[track1, gdi.clone()],
+        &TrustedRoots::from_paths([temp.path()]),
+        &AtomicBool::new(false),
+    );
+    assert!(outcome.matches.is_empty(), "{:?}", outcome.matches);
+    assert_eq!(outcome.rejected_launchers.len(), 1, "{outcome:?}");
+}
+
 #[test]
 fn a_single_chd_produces_an_ordinary_single_file_match_unchanged() {
     let temp = tempfile::tempdir().expect("temp dir");
