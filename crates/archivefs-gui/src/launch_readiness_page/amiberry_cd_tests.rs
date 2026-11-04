@@ -303,6 +303,7 @@ fn full_unresolved_page_keeps_native_action_visible_at_1024_by_600() {
                     &mut pcsx2,
                     &mut state,
                     &mut whdload,
+                    &Default::default(),
                 );
             });
         },

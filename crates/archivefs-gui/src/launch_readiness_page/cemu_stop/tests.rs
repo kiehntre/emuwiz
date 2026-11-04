@@ -204,6 +204,7 @@ fn cemu_stop_is_visible_at_small_size_without_a_current_readiness_plan() {
                     &mut Default::default(),
                     &mut state,
                     &mut Default::default(),
+                    &Default::default(),
                 );
             });
         },

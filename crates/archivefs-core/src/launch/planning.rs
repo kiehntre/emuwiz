@@ -651,7 +651,7 @@ fn no_candidate_placeholder(content: &LaunchContentRef) -> LaunchCandidate {
     }
 }
 
-fn summarize(candidates: &[LaunchCandidate]) -> LaunchPlanSummary {
+pub(crate) fn summarize(candidates: &[LaunchCandidate]) -> LaunchPlanSummary {
     let mut summary = LaunchPlanSummary {
         candidates: candidates.len(),
         ..Default::default()

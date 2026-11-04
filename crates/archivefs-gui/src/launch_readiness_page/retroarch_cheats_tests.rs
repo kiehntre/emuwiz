@@ -161,6 +161,7 @@ impl World {
             .expect("verifiable loose rom")
             .to_string();
         let request = RetroArchLaunchRequest {
+            launch_choice: None,
             selected_content_path: content,
             expected_platform_id: platform.into(),
             expected_game_key: key,

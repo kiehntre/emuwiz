@@ -615,5 +615,11 @@ pub mod mesen_nes;
 
 pub mod nkit_readiness;
 
+/// Explicit user choice between tied launch candidates.
+pub mod launch_choice;
+
+/// Dolphin profiles are launch options only with a provable binding.
+pub mod dolphin_binding_readiness;
+
 #[cfg(target_os = "linux")]
 pub mod fsuae_whdload_boot;

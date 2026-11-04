@@ -188,6 +188,7 @@ fn build_ready_fixture_with_content(
         .to_string();
 
     let request = RetroArchLaunchRequest {
+        launch_choice: None,
         selected_content_path: content,
         expected_platform_id: "MegaDrive".to_string(),
         expected_game_key,
@@ -245,6 +246,7 @@ fn build_ready_appimage_fixture(label: &str) -> ReadyFixture {
     environment.app_image_search_roots = vec![fixture.path("Applications")];
     environment.desktop_file_roots = vec![fixture.path("desktop")];
     let request = RetroArchLaunchRequest {
+        launch_choice: None,
         selected_content_path: content,
         expected_platform_id: "MegaDrive".to_string(),
         expected_game_key,
@@ -957,4 +959,102 @@ fn raw_nkit_content_is_refused_before_retroarch_discovery_or_spawn() {
         assert!(error.detail.contains("NKit"));
         assert_eq!(fs::read(path).unwrap(), bytes);
     }
+}
+
+// --- explicit launch choice between tied RetroArch installations ------------
+
+/// Native and AppImage RetroArch both carry the same GameCube core, so the
+/// freshly rebuilt preflight plan ties them. Only an explicit choice naming
+/// the requested installation may launch it; nothing else is substituted.
+#[test]
+fn a_gamecube_retroarch_tie_launches_only_the_explicitly_chosen_installation() {
+    let fixture = Fixture::new("gamecube-launch-choice");
+    fixture.write_executable("bin/retroarch", b"#!/bin/sh\nexit 0\n");
+    let appimage =
+        fixture.write_executable("Applications/RetroArch.AppImage", b"#!/bin/sh\nexit 0\n");
+    let cores_dir = fixture.path("cores");
+    let info_dir = fixture.path("info");
+    let config = format!(
+        "libretro_directory = \"{}\"\nlibretro_info_path = \"{}\"\n",
+        cores_dir.display(),
+        info_dir.display()
+    );
+    fixture.write("config/retroarch/retroarch.cfg", config.as_bytes());
+    fixture.write(
+        "Applications/RetroArch.AppImage.config/retroarch/retroarch.cfg",
+        config.as_bytes(),
+    );
+    fixture.write("cores/dolphin_libretro.so", b"stub core");
+    fixture.write(
+        "info/dolphin.info",
+        b"systemname = \"GameCube\"\ndatabase = \"Nintendo - GameCube\"\n",
+    );
+    fixture.write(
+        "desktop/retroarch.desktop",
+        format!(
+            "[Desktop Entry]\nType=Application\nName=RetroArch\nExec={}\n",
+            appimage.display()
+        )
+        .as_bytes(),
+    );
+    let mut header = vec![0u8; 0x440];
+    header[..6].copy_from_slice(b"GZCE51");
+    header[6] = 1;
+    header[0x1c..0x20].copy_from_slice(&[0xc2, 0x33, 0x9f, 0x3d]);
+    let content = fixture.write("content/ZooCube (USA).iso", &header);
+    let (identity, _) = crate::launch::evidence_bridge::canonical_identity_from_game_report(
+        &inspect_catalogued_game_identity(&content, Some("GameCube")),
+    );
+    let CanonicalIdentityStatus::Resolved(identity) = identity else {
+        panic!("synthetic GameCube header must resolve: {identity:?}");
+    };
+    let mut environment = fixture.env();
+    environment.app_image_search_roots = vec![fixture.path("Applications")];
+    environment.desktop_file_roots = vec![fixture.path("desktop")];
+    let native = ProfileRef {
+        profile_kind: ProfileKind::Native,
+        scope: ProfileScope::User,
+    };
+    let mut request = RetroArchLaunchRequest {
+        launch_choice: None,
+        selected_content_path: content,
+        expected_platform_id: identity.platform_id.clone(),
+        expected_game_key: identity.game_key.clone(),
+        profile: native,
+        core_stem: "dolphin".to_string(),
+        saturn_core_selection: None,
+        expected_snapshot_evidence: None,
+        expected_appimage_executable: None,
+        expected_executable_binding: None,
+        expected_configuration_file: None,
+    };
+    let run = |request: &RetroArchLaunchRequest| {
+        preflight_retroarch_launch(request, &HostReadOnlyFilesystem, &environment)
+    };
+
+    let tied = run(&request).unwrap_err();
+    assert_eq!(
+        tied.kind,
+        LaunchPreflightErrorKind::CandidateNotReady,
+        "{tied:?}"
+    );
+
+    request.launch_choice = Some("retroarch/appimage/user/dolphin".into());
+    assert_eq!(
+        run(&request).unwrap_err().kind,
+        LaunchPreflightErrorKind::IdentityMismatch,
+        "a choice of the other installation never launches this one"
+    );
+    request.launch_choice = Some("standalone/dolphin/dolphin:appimage:/x".into());
+    assert_eq!(
+        run(&request).unwrap_err().kind,
+        LaunchPreflightErrorKind::IdentityMismatch,
+        "a choice naming a different kind of option is refused before planning"
+    );
+
+    request.launch_choice = Some("retroarch/native/user/dolphin".into());
+    let command = run(&request).expect("the chosen installation passes every other check");
+    assert_eq!(command.executable, fixture.path("bin/retroarch"));
+    assert_eq!(command.selection.core_stem, "dolphin");
+    assert_eq!(command.selection.profile, native);
 }
