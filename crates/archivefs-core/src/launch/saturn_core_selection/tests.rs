@@ -98,6 +98,7 @@ impl Fixture {
     }
     fn request(&self) -> RetroArchLaunchRequest {
         RetroArchLaunchRequest {
+            launch_choice: None,
             saturn_core_selection: Some(self.selection()),
             expected_snapshot_evidence: None,
             selected_content_path: self.content.clone(),

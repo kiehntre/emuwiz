@@ -59,6 +59,8 @@ pub(crate) struct EmulatorReadinessState {
     pub(crate) pcsx2_firmware_evidence: Pcsx2FirmwareEvidenceState,
     pub(crate) xenia_profiles: XeniaProfilesState,
     pub(crate) remembered_emulator_profiles: Vec<RememberedEmulatorProfile>,
+    /// The user's explicit emulator choices for launch (shared facility).
+    pub(crate) launch_choices: crate::launch_readiness_page::launch_choice::LaunchChoiceState,
     pub(crate) rpcs3_status: rpcs3_page::Rpcs3State,
     pub(crate) rpcs3_status_generation: u64,
     pub(crate) pcsx2_status: pcsx2_page::Pcsx2StatusState,
@@ -107,6 +109,7 @@ impl Default for EmulatorReadinessState {
             pcsx2_firmware_evidence: Pcsx2FirmwareEvidenceState::NotLoaded,
             xenia_profiles: XeniaProfilesState::NotScanned,
             remembered_emulator_profiles: Vec::new(),
+            launch_choices: Default::default(),
             rpcs3_status: rpcs3_page::Rpcs3State::Idle,
             rpcs3_status_generation: 0,
             pcsx2_status: pcsx2_page::Pcsx2StatusState::Idle,
@@ -128,6 +131,8 @@ impl EmulatorReadinessState {
             ),
             remembered_emulator_profiles: crate::load_remembered_emulator_profiles_default()
                 .unwrap_or_default(),
+            launch_choices:
+                crate::launch_readiness_page::launch_choice::LaunchChoiceState::load_default(),
             ..Self::default()
         }
     }

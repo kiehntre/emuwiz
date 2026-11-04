@@ -2061,6 +2061,7 @@ mod game_metadata_enrichment_tests {
     /// planner's `Launch` projection over an already-retained archive member.
     fn ready_retroarch_play_action() -> launch_readiness_page::GamerPlayAction {
         let request = archivefs_core::launch::RetroArchLaunchRequest {
+            launch_choice: None,
             selected_content_path: PathBuf::from("/mnt/archive/disc1.iso"),
             expected_platform_id: "PlayStation 2".to_string(),
             expected_game_key: "retained-member".to_string(),
@@ -2784,6 +2785,7 @@ mod retroarch_one_launch_tests {
 
     fn request(path: &str) -> RetroArchLaunchRequest {
         RetroArchLaunchRequest {
+            launch_choice: None,
             selected_content_path: path.into(),
             expected_platform_id: "PSX".into(),
             expected_game_key: "a".repeat(64),

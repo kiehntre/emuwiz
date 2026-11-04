@@ -235,6 +235,7 @@ fn render_panel(input: &LaunchReadinessInput, state: &mut StandaloneLaunchState)
                 &mut Default::default(),
                 state,
                 &mut Default::default(),
+                &Default::default(),
             );
         });
     });

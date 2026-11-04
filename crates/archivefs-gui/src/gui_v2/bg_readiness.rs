@@ -90,6 +90,8 @@ pub(super) struct EnvSnapshot {
     /// The user's remembered emulator choice decides between several safe
     /// candidates, so the plan must see the same memory the foreground does.
     remembered: Vec<RememberedEmulatorProfile>,
+    /// Explicit launch choices decide ties the same way in the background.
+    launch_choices: crate::launch_readiness_page::launch_choice::LaunchChoiceState,
 }
 
 impl EnvSnapshot {
@@ -108,6 +110,7 @@ impl EnvSnapshot {
         format!("{:?}", state.emulator_setup_overrides).hash(&mut hasher);
         format!("{:?}", state.xenia_profiles).hash(&mut hasher);
         format!("{:?}", state.remembered_emulator_profiles).hash(&mut hasher);
+        format!("{:?}", state.launch_choices).hash(&mut hasher);
         match &state.dolphin_local_profiles {
             DolphinLocalProfilesState::Ready(r) => format!("{:?}", r.discovery).hash(&mut hasher),
             DolphinLocalProfilesState::Error(_) => 1u8.hash(&mut hasher),
@@ -158,6 +161,7 @@ impl EnvSnapshot {
             xenia: state.xenia_profiles.clone(),
             overrides: state.emulator_setup_overrides.clone(),
             remembered: state.remembered_emulator_profiles.clone(),
+            launch_choices: state.launch_choices.clone(),
         })
     }
 
@@ -188,6 +192,7 @@ impl EnvSnapshot {
         state.xenia_profiles = self.xenia.clone();
         state.emulator_setup_overrides = self.overrides.clone();
         state.remembered_emulator_profiles = self.remembered.clone();
+        state.launch_choices = self.launch_choices.clone();
         state
     }
 }
@@ -523,6 +528,7 @@ mod tests {
             xenia: XeniaProfilesState::NotScanned,
             overrides: Default::default(),
             remembered: Vec::new(),
+            launch_choices: Default::default(),
         }
     }
 

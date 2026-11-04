@@ -63,6 +63,7 @@ mod retroarch_setup;
 mod retroarch_stop;
 #[cfg(test)]
 pub(crate) use retroarch_stop::retroarch_test_request;
+pub(crate) mod launch_choice;
 mod rmg;
 mod sameboy;
 pub(crate) mod saturn_core;
@@ -280,11 +281,13 @@ pub(crate) fn ready_to_play_result(
 /// The panel does not run a firmware check or a Doctor scan itself. It can
 /// only direct a person to the existing diagnostics workflow when already
 /// computed firmware evidence needs attention.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) enum LaunchReadinessPageAction {
     OpenDoctor,
     Navigate(crate::navigation::NavClick),
     ReviewDetails,
+    /// An explicit emulator choice for the shown game or its system.
+    LaunchChoice(launch_choice::LaunchChoiceAction),
 }
 
 /// Exact AppImage paths selected from the same RetroArch discovery report as
@@ -2701,7 +2704,8 @@ fn dolphin_launch_error_message(error: &DolphinLaunchExecutionError) -> (&'stati
                     "This game's content needs to be mounted before it can launch."
                 }
                 DolphinLaunchPreflightErrorKind::ContentFormatUnsupported => {
-                    "Only a direct GameCube .iso or .gcm file can be launched here."
+                    "Dolphin can be launched here only from a direct .iso, .gcm, .rvz or .ciso \
+                     disc file (or .wbfs for Wii). NKit and archived files are refused."
                 }
                 DolphinLaunchPreflightErrorKind::IdentityUnresolved
                 | DolphinLaunchPreflightErrorKind::IdentityMismatch => {
@@ -3155,6 +3159,11 @@ fn retroarch_launch_request_unexplained(
         expected_game_key: game_key.clone(),
         profile: *profile,
         core_stem: core_stem.clone(),
+        // The explicit choice that made this candidate usable, re-applied by
+        // preflight to its freshly rebuilt plan.
+        launch_choice: (archivefs_core::launch::launch_choice::is_adopted(plan)
+            && candidate.preference == CandidatePreference::Remembered)
+            .then(|| archivefs_core::launch::launch_choice::launch_option_id(&candidate.target)),
         saturn_core_selection: if platform_id == "Saturn" {
             saturn_core::load().ok().flatten()
         } else {
@@ -3328,6 +3337,9 @@ fn launch_error_message(error: &LaunchExecutionError) -> (&'static str, String) 
     }
 }
 
+// The panel's inputs are the read-only launch input, each emulator's own
+// launch tracker and the read-only emulator choices; nothing else.
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn show_launch_readiness_panel(
     ui: &mut egui::Ui,
     input: &LaunchReadinessInput,
@@ -3336,6 +3348,7 @@ pub(crate) fn show_launch_readiness_panel(
     pcsx2_launch_state: &mut Pcsx2LaunchState,
     standalone_launch_state: &mut StandaloneLaunchState,
     amiga_whdload_launch_state: &mut AmigaWHDLoadLaunchState,
+    launch_choices: &launch_choice::LaunchChoiceState,
 ) -> Option<LaunchReadinessPageAction> {
     let mut action = None;
     standalone_launch_state.vice_trainers.reconcile(input);
@@ -3506,6 +3519,8 @@ pub(crate) fn show_launch_readiness_panel(
                     crate::navigation::NavClick::View(crate::navigation::MainView::EmulatorSetup),
                 ));
             }
+            launch_choice::show_notices(ui, plan, launch_choices);
+            let mut choice_action = None;
             if !(dos && plan.candidates.is_empty())
                 && show_plan(
                     ui,
@@ -3525,9 +3540,14 @@ pub(crate) fn show_launch_readiness_panel(
                     standalone_launch_state,
                     amiga_whdload.as_ref(),
                     amiga_whdload_launch_state,
+                    launch_choices,
+                    &mut choice_action,
                 )
             {
                 action = Some(LaunchReadinessPageAction::OpenDoctor);
+            }
+            if let Some(choice) = choice_action {
+                action = Some(LaunchReadinessPageAction::LaunchChoice(choice));
             }
         }
     }
@@ -3561,6 +3581,8 @@ fn show_plan(
     standalone_launch_state: &mut StandaloneLaunchState,
     amiga_whdload: Option<&AmigaWHDLoadLaunchContext>,
     amiga_whdload_launch_state: &mut AmigaWHDLoadLaunchState,
+    launch_choices: &launch_choice::LaunchChoiceState,
+    choice_action: &mut Option<launch_choice::LaunchChoiceAction>,
 ) -> bool {
     let mut open_doctor = false;
     if let Some(context) = duckstation
@@ -3673,6 +3695,8 @@ fn show_plan(
             standalone_launch_state,
             amiga_whdload,
             amiga_whdload_launch_state,
+            launch_choices,
+            choice_action,
         );
     }
     open_doctor
@@ -4723,15 +4747,26 @@ fn gamer_blocker_for_plan(
                 .blockers
                 .iter()
                 .any(|blocker| matches!(blocker.kind, LaunchBlockerKind::AmbiguousCore))
-                || candidate
-                    .warnings
-                    .iter()
-                    .any(|warning| warning.kind == LaunchWarningKind::MultipleEligibleProfiles))
+                || candidate.warnings.iter().any(|warning| {
+                    matches!(
+                        warning.kind,
+                        LaunchWarningKind::MultipleEligibleProfiles
+                            | LaunchWarningKind::PreferredLaunchChoiceUnavailable
+                    )
+                }))
     }) {
+        // A held preference explains itself first; it is never "no emulator".
         let detail = candidate
-            .blockers
-            .first()
-            .map(|blocker| blocker.detail.clone())
+            .warnings
+            .iter()
+            .find(|warning| warning.kind == LaunchWarningKind::PreferredLaunchChoiceUnavailable)
+            .map(|warning| warning.detail.clone())
+            .or_else(|| {
+                candidate
+                    .blockers
+                    .first()
+                    .map(|blocker| blocker.detail.clone())
+            })
             .or_else(|| {
                 candidate
                     .warnings
@@ -4883,6 +4918,8 @@ fn show_candidate(
     standalone_launch_state: &mut StandaloneLaunchState,
     amiga_whdload: Option<&AmigaWHDLoadLaunchContext>,
     amiga_whdload_launch_state: &mut AmigaWHDLoadLaunchState,
+    launch_choices: &launch_choice::LaunchChoiceState,
+    choice_action: &mut Option<launch_choice::LaunchChoiceAction>,
 ) -> bool {
     let mut open_doctor = false;
     widgets::card(ui, |ui| {
@@ -4944,6 +4981,43 @@ fn show_candidate(
             .small()
             .color(theme::muted(ui)),
         );
+        // Offer a choice only where choosing would produce a real Launch
+        // request through the very gate the Launch buttons use.
+        if archivefs_core::launch::launch_choice::is_choosable(plan, candidate) {
+            let launchable_if_chosen =
+                launch_choice::plan_if_chosen(plan, candidate).is_some_and(|chosen_plan| {
+                    chosen_plan
+                        .candidates
+                        .iter()
+                        .find(|chosen| chosen.target == candidate.target)
+                        .is_some_and(|chosen| {
+                            typed_launch_request(
+                                &chosen_plan,
+                                chosen,
+                                retroarch,
+                                dolphin,
+                                pcsx2,
+                                duckstation,
+                                ppsspp,
+                                rpcs3,
+                                xemu,
+                                xenia,
+                                melonds,
+                                amiga_whdload,
+                            )
+                            .is_some()
+                        })
+                });
+            if let Some(choice) = launch_choice::show_controls(
+                ui,
+                plan,
+                candidate,
+                launch_choices,
+                launchable_if_chosen,
+            ) {
+                *choice_action = Some(choice);
+            }
+        }
 
         show_launch_recipe(
             ui,

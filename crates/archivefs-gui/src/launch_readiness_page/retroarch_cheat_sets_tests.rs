@@ -48,6 +48,7 @@ impl Drop for Root {
 
 fn request(content: &Path) -> RetroArchLaunchRequest {
     RetroArchLaunchRequest {
+        launch_choice: None,
         selected_content_path: content.to_path_buf(),
         expected_platform_id: "MegaDrive".into(),
         expected_game_key: SHA.into(),

@@ -196,6 +196,7 @@ fn gamer_view_selected_card_renders_play_from_the_shared_ready_launch_action() {
     app.archive_context.select_only(path.clone());
 
     let request = archivefs_core::launch::RetroArchLaunchRequest {
+        launch_choice: None,
         selected_content_path: path.clone(),
         expected_platform_id: "Game Boy".to_string(),
         expected_game_key: "test-game".to_string(),
@@ -384,6 +385,7 @@ fn gamer_card_ready_launch_shows_ready_to_play_and_the_play_button() {
     let play_action = launch_readiness_page::GamerPlayAction::Launch(Box::new(
         launch_readiness_page::TypedLaunchRequest::RetroArch(
             archivefs_core::launch::RetroArchLaunchRequest {
+                launch_choice: None,
                 selected_content_path: PathBuf::from("/roms/journey-d-game.gb"),
                 expected_platform_id: "Game Boy".to_string(),
                 expected_game_key: "k".to_string(),
@@ -413,6 +415,7 @@ fn gamer_card_ready_launch_shows_ready_to_play_and_the_play_button() {
 #[test]
 fn gamer_card_polls_and_surfaces_the_existing_executor_preflight_failure() {
     let request = archivefs_core::launch::RetroArchLaunchRequest {
+        launch_choice: None,
         selected_content_path: PathBuf::from("/nonexistent/gamer-launch-action.gb"),
         expected_platform_id: "Game Boy".to_string(),
         expected_game_key: "missing-game".to_string(),
@@ -500,6 +503,7 @@ fn gamer_card_media_blocked_shows_needs_attention_and_no_play() {
     let play_action = launch_readiness_page::GamerPlayAction::Launch(Box::new(
         launch_readiness_page::TypedLaunchRequest::RetroArch(
             archivefs_core::launch::RetroArchLaunchRequest {
+                launch_choice: None,
                 selected_content_path: PathBuf::from("/roms/journey-d-game.gb"),
                 expected_platform_id: "Game Boy".to_string(),
                 expected_game_key: "k".to_string(),
@@ -675,6 +679,7 @@ fn gamer_readiness_never_yields_ready_from_mount_state_alone() {
     let ready = GamerPlayAction::Launch(Box::new(
         launch_readiness_page::TypedLaunchRequest::RetroArch(
             archivefs_core::launch::RetroArchLaunchRequest {
+                launch_choice: None,
                 selected_content_path: PathBuf::from("/x"),
                 expected_platform_id: "Game Boy".to_string(),
                 expected_game_key: "k".to_string(),

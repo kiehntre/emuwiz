@@ -242,6 +242,7 @@ mod tests {
         let preview =
             launch::preview(&game, &path, &TrustedRoots::from_paths([dir.path()])).unwrap();
         let request = RetroArchLaunchRequest {
+            launch_choice: None,
             selected_content_path: path,
             expected_platform_id: "ZX Spectrum".into(),
             expected_game_key: "game".into(),

@@ -609,6 +609,7 @@ fn render_with_states(
                 pcsx2_state,
                 standalone_state,
                 &mut AmigaWHDLoadLaunchState::default(),
+                &Default::default(),
             );
         });
     })
@@ -1747,6 +1748,7 @@ fn show_launch_readiness_panel_takes_no_command_or_process_handle_parameter() {
     // tracker - never a command string, argv, or `std::process` type. If a
     // future change widened this signature to accept one, this line would
     // fail to compile.
+    #[allow(clippy::type_complexity)]
     fn assert_signature(
         _: fn(
             &mut egui::Ui,
@@ -1756,6 +1758,7 @@ fn show_launch_readiness_panel_takes_no_command_or_process_handle_parameter() {
             &mut Pcsx2LaunchState,
             &mut StandaloneLaunchState,
             &mut AmigaWHDLoadLaunchState,
+            &launch_choice::LaunchChoiceState,
         ) -> Option<LaunchReadinessPageAction>,
     ) {
     }

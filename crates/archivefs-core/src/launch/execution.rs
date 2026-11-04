@@ -85,6 +85,11 @@ pub const LAUNCH_STDERR_CAPTURE_LIMIT: usize = process_spawn::PROCESS_STDERR_CAP
 pub struct RetroArchLaunchRequest {
     /// Explicit native Saturn authority; absent for every other platform.
     pub saturn_core_selection: Option<super::saturn_core_selection::SaturnCoreSelection>,
+    /// The launch option id the user explicitly chose for this game or system
+    /// (see [`super::launch_choice`]). Preflight re-applies it to the freshly
+    /// rebuilt plan; it can only make the candidate it names usable, never
+    /// bypass another check.
+    pub launch_choice: Option<String>,
     /// Source-aware snapshot authority shown at readiness; absent on other platforms.
     pub expected_snapshot_evidence:
         Option<crate::classic_trainer_evidence::snapshot::SnapshotEvidence>,
@@ -470,6 +475,23 @@ pub fn preflight_retroarch_launch(
         &fresh_environment,
         Ok(request.saturn_core_selection.as_ref()),
     );
+    // The user's explicit choice is re-applied to the fresh plan. It can only
+    // make the one candidate it names usable; a choice naming anything else
+    // leaves the requested candidate tied or held, and it is refused below.
+    if let Some(option_id) = &request.launch_choice {
+        let once = super::launch_choice::LaunchOnceChoice {
+            platform_id: request.expected_platform_id.clone(),
+            game_key: request.expected_game_key.clone(),
+            option_id: option_id.clone(),
+        };
+        super::launch_choice::apply(
+            &mut plan,
+            super::launch_choice::LaunchChoiceInputs {
+                once: Some(&once),
+                preferences: Ok(&[]),
+            },
+        );
+    }
     let candidate = plan
         .candidates
         .iter()

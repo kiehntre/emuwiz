@@ -585,9 +585,20 @@ impl NativeWorkflows {
                         &mut self.app.launch_pcsx2,
                         &mut self.app.launch_standalone,
                         &mut self.app.launch_amiga_whdload,
+                        &self.app.emulator_readiness.launch_choices,
                     )
                 })
                 .inner;
+            // An explicit emulator choice is saved (or held for once); the
+            // next frame's readiness input is rebuilt from it.
+            if let Some(launch_readiness_page::LaunchReadinessPageAction::LaunchChoice(choice)) =
+                &action
+            {
+                self.app
+                    .emulator_readiness
+                    .launch_choices
+                    .handle(choice.clone());
+            }
             if launch_active {
                 ui.label("A launch is already in progress. Wait for it to finish before starting another.");
             }
@@ -1112,6 +1123,7 @@ impl NativeWorkflows {
                 }
             }
             launch_readiness_page::LaunchReadinessPageAction::ReviewDetails => return None,
+            launch_readiness_page::LaunchReadinessPageAction::LaunchChoice(_) => return None,
         };
         let _ = game;
         Some(Route::Section(section))

@@ -531,23 +531,19 @@ impl ReadinessSources<'_> {
             | DolphinLocalProfilesState::Scanning { .. }
             | DolphinLocalProfilesState::Error(_) => None,
         };
+        // A Dolphin profile is a launch option only when a launch binding can
+        // be proven for it now; otherwise it is blocked with that reason and
+        // never ties with an option that can actually start.
+        let dolphin_launch_profiles = dolphin_context.as_ref().map(|context| {
+            archivefs_core::launch::dolphin_binding_readiness::dolphin_launch_profiles(
+                &context.discovery,
+                &context.roots,
+            )
+        });
         let dolphin_standalone_profiles: Vec<archivefs_core::launch::StandaloneProfileInput> =
-            dolphin_context
+            dolphin_launch_profiles
                 .as_ref()
-                .map(|context| {
-                    context
-                        .discovery
-                        .profiles
-                        .iter()
-                        .map(|profile| archivefs_core::launch::StandaloneProfileInput {
-                            adapter_id: "dolphin",
-                            profile_id: profile.profile_id.clone(),
-                            profile_path: Some(profile.configuration_root.clone()),
-                            eligible: profile.eligible,
-                            firmware: archivefs_core::launch::FirmwareReadiness::NotRequired,
-                        })
-                        .collect()
-                })
+                .map(|profiles| profiles.inputs.clone())
                 .unwrap_or_default();
 
         // Real, already-discovered PCSX2 profiles and already-resolved PS2
@@ -1328,6 +1324,9 @@ impl ReadinessSources<'_> {
             &remembered,
         );
         launch_readiness_page::saturn_core::apply(&mut plan, retroarch_environment);
+        if let Some(profiles) = &dolphin_launch_profiles {
+            archivefs_core::launch::dolphin_binding_readiness::apply(&mut plan, profiles);
+        }
         archivefs_core::launch::nkit_readiness::inspect_and_apply(&mut plan);
         archivefs_core::launch::cemu_readiness::apply_cemu_readiness(
             &mut plan,
@@ -1353,6 +1352,12 @@ impl ReadinessSources<'_> {
         if let Some(snapshot) = &shadps4_context {
             snapshot.apply(&mut plan, &content);
         }
+        // Last: an explicit emulator choice only resolves what every check
+        // above left usable, and never unblocks anything.
+        archivefs_core::launch::launch_choice::apply(
+            &mut plan,
+            self.readiness.launch_choices.inputs(),
+        );
         #[cfg(target_os = "linux")]
         let standalone_scans_complete = shadps4_context
             .as_ref()

@@ -594,6 +594,12 @@ pub enum LaunchWarningKind {
     /// none is remembered/preferred - still launchable, just ambiguous
     /// which one is "the" one.
     MultipleEligibleProfiles,
+    /// The user's saved or one-time emulator choice for this game or system
+    /// names a launch option that is missing, changed or blocked (or the
+    /// saved choices cannot be read). No other option is used in its place
+    /// until the user explicitly chooses again - see
+    /// [`crate::launch::launch_choice`].
+    PreferredLaunchChoiceUnavailable,
     /// The selected Cemu extracted title has no `meta.xml`, or `meta.xml`
     /// could not be read - the layout is still launched from its `.rpx`,
     /// but with no self-reported title identity to show.

@@ -114,8 +114,8 @@ pub enum DolphinLaunchPreflightErrorKind {
     /// (zip/7z/rar) - an outer archive path is never a runnable content
     /// path in this module.
     ContentRequiresMount,
-    /// The requested content path is not a direct `.iso`/`.gcm` file - no
-    /// RVZ/CISO/WBFS in this phase.
+    /// The requested content path is not a direct `.iso`/`.gcm`/`.rvz`/
+    /// `.ciso` file (or `.wbfs` for Wii), or it carries an NKit marker.
     ContentFormatUnsupported,
     /// Fresh re-inspection produced `Unknown` or `Conflicting` identity -
     /// never resolved to one trustworthy answer.
@@ -228,8 +228,9 @@ impl From<DolphinLaunchSpawnError> for DolphinLaunchExecutionError {
 ///
 /// 1. `request.selected_content_path` must be absolute.
 /// 2. The content must exist, not be a symlink, be a regular file, not be
-///    an outer archive/mount-input path, and have a `.iso`/`.gcm`
-///    extension.
+///    an outer archive/mount-input path, have a direct Dolphin disc
+///    extension (`.iso`/`.gcm`/`.rvz`/`.ciso`, or `.wbfs` for Wii) and carry
+///    no NKit marker.
 /// 3. A [`CapturedFileIdentity`] is captured from the content's current
 ///    metadata.
 /// 4. The content is freshly re-identified via
