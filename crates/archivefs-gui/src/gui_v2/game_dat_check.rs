@@ -84,7 +84,7 @@ pub(super) enum Stage {
 }
 
 enum Message {
-    Catalogues(Result<(Inputs, Vec<InstalledCatalogueSummary>), String>),
+    Catalogues(Result<(Inputs, Vec<InstalledCatalogueSummary>, Vec<HeaderMatch>), String>),
     Preview(Result<Box<VerificationPreview>, String>),
     Progress(String),
     Done(Result<VerificationTotals, String>),
@@ -137,11 +137,26 @@ pub(super) fn ready_catalogues(
         .collect()
 }
 
-/// Enabled, ready, verify-capable local catalogues whose own header names
-/// `platform` as one of several systems. Only the person can settle that;
-/// the core preview refuses them until the system is assigned.
+/// `(local source id, system)` for each catalogue whose validated header the
+/// existing "Apply recognised systems" rule recognises as one games system
+/// and that has no system saved yet. Read from saved validation; no file is
+/// opened and nothing is written.
+pub(super) type HeaderMatch = (String, &'static str);
+
+fn header_matches(inputs: &Inputs) -> Vec<HeaderMatch> {
+    archivefs_core::dat::sources::recognition::safe_matches(&inputs.inventory.local_registry)
+        .into_iter()
+        .map(|found| (found.source_id, found.platform))
+        .collect()
+}
+
+/// Enabled, ready, verify-capable local catalogues with no saved system
+/// whose own header names this game's system. Offered for an explicit,
+/// one-game trial only: never preselected, never saved from here. The core
+/// preview re-proves the header before anything is read.
 pub(super) fn suggested_catalogues(
     rows: &[InstalledCatalogueSummary],
+    matches: &[HeaderMatch],
     platform: &str,
 ) -> Vec<InstalledCatalogueSummary> {
     let Some(platform) = archivefs_core::canonical_platform_for_alias(platform) else {
@@ -152,10 +167,14 @@ pub(super) fn suggested_catalogues(
             row.enabled
                 && row.availability == CatalogueAvailability::Ready
                 && row.capabilities.verify
-                && matches!(row.reference, CatalogueRef::Local { member: None, .. })
-                && matches!(&row.platform, EvidenceValue::Ambiguous(names) if names.iter().any(|name| {
-                    archivefs_core::canonical_platform_for_alias(name) == Some(platform)
-                }))
+                && matches!(row.platform, EvidenceValue::Unknown)
+                && local_source_id(row).is_some_and(|id| {
+                    matches.iter().any(|(source, system)| {
+                        source == id
+                            && archivefs_core::canonical_platform_for_alias(system)
+                                == Some(platform)
+                    })
+                })
         })
         .cloned()
         .collect()
@@ -258,7 +277,8 @@ impl State {
         std::thread::spawn(move || {
             let result = load().map(|inputs| {
                 let rows = list_installed_catalogues(inputs.inventory.inputs());
-                (inputs, rows)
+                let matches = header_matches(&inputs);
+                (inputs, rows, matches)
             });
             let _ = sender.send(Message::Catalogues(result));
         });
@@ -316,6 +336,7 @@ impl State {
             let row = self
                 .catalogues
                 .iter()
+                .chain(&self.suggested)
                 .find(|row| Some(&row.reference) == self.choice.as_ref())?;
             assignment_candidate(row, &preview.platform, &target.platform)
         });
@@ -379,13 +400,13 @@ impl State {
                 Message::Catalogues(result) => {
                     self.receiver = None;
                     match result {
-                        Ok((inputs, rows)) => {
+                        Ok((inputs, rows, matches)) => {
                             let platform = self
                                 .target
                                 .as_ref()
                                 .map(|t| t.platform.clone())
                                 .unwrap_or_default();
-                            self.suggested = suggested_catalogues(&rows, &platform);
+                            self.suggested = suggested_catalogues(&rows, &matches, &platform);
                             self.catalogues = ready_catalogues(rows, &platform);
                             // Preselect only one unambiguous eligible choice.
                             self.choice = (self.catalogues.len() == 1 && self.suggested.is_empty())
@@ -457,32 +478,22 @@ pub(super) const NOT_NEEDED_TO_PLAY: &str = "Checking is optional. You do not ne
 fn show_suggested(
     ui: &mut eframe::egui::Ui,
     suggested: &[InstalledCatalogueSummary],
+    choice: &mut Option<CatalogueRef>,
     platform: &str,
-) -> Option<PageAction> {
+) {
     if suggested.is_empty() {
-        return None;
+        return;
     }
-    let mut action = None;
     ui.strong("Suggested — needs your confirmation");
+    ui.small(suggested_reason(platform));
     for row in suggested {
-        let systems = match &row.platform {
-            EvidenceValue::Ambiguous(names) => names.join(", "),
-            _ => String::new(),
-        };
-        ui.group(|ui| {
-            ui.label(&row.display_name);
-            ui.small(suggested_reason(&systems, platform));
-        });
+        ui.radio_value(choice, Some(row.reference.clone()), &row.display_name);
     }
-    if ui.button(choose_for_system_label(platform)).clicked() {
-        action = Some(PageAction::CheckWholePlatform);
-    }
-    action
 }
 
-pub(super) fn suggested_reason(systems: &str, platform: &str) -> String {
+pub(super) fn suggested_reason(platform: &str) -> String {
     format!(
-        "Its header names several systems ({systems}), so it cannot check {platform} games until its system is chosen. Nothing has been saved or checked."
+        "Its header says {platform}, but no system is saved for it. Choosing it tries it for this game only; nothing is saved to your setup unless this game is verified and you say Yes."
     )
 }
 
@@ -562,22 +573,17 @@ pub(super) fn show(
                     Err(message) => ui.colored_label(theme::WARNING, message),
                 };
             }
-            if let Some(chosen) = show_suggested(ui, &state.suggested, &target.platform) {
-                action = Some(chosen);
-            }
-            if state.catalogues.is_empty() && !state.suggested.is_empty() {
-                ui.label(NOT_NEEDED_TO_PLAY);
-            } else if state.catalogues.is_empty() {
+            if state.catalogues.is_empty() && state.suggested.is_empty() {
                 ui.label(format!(
                     "No ready catalogue covers {}. Set one up first; nothing has been checked.",
                     target.platform
                 ));
                 ui.label(NOT_NEEDED_TO_PLAY);
-                // The system's check page suggests installed catalogues and
-                // asks before saving any uncertain system assignment.
+                // The system's check page offers installed catalogues and
+                // asks before saving any system assignment.
                 if ui
                     .button(choose_for_system_label(&target.platform))
-                    .on_hover_text("Opens this system's check, which suggests installed catalogues and asks you to confirm any it is unsure about. Nothing is checked until you confirm.")
+                    .on_hover_text("Opens this system's check, which offers installed catalogues and asks before saving any system for them. Nothing is checked until you confirm.")
                     .clicked()
                 {
                     action = Some(PageAction::CheckWholePlatform);
@@ -587,11 +593,13 @@ pub(super) fn show(
                     action = Some(PageAction::SetUpCatalogues);
                 }
             } else {
-                ui.strong("Confirmed for this system");
-                ui.label(catalogue_choice_note(
-                    state.catalogues.len(),
-                    &target.platform,
-                ));
+                if !state.catalogues.is_empty() {
+                    ui.strong("Confirmed for this system");
+                    ui.label(catalogue_choice_note(
+                        state.catalogues.len(),
+                        &target.platform,
+                    ));
+                }
                 for row in &state.catalogues {
                     let label = match &row.revision {
                         Some(version) => format!("{} · version {version}", row.display_name),
@@ -599,6 +607,7 @@ pub(super) fn show(
                     };
                     ui.radio_value(&mut state.choice, Some(row.reference.clone()), label);
                 }
+                show_suggested(ui, &state.suggested, &mut state.choice, &target.platform);
                 let ready = state.choice.is_some();
                 if ui
                     .add_enabled(ready, eframe::egui::Button::new(CHECK_THIS_GAME))
@@ -607,6 +616,7 @@ pub(super) fn show(
                     state.preview();
                 }
                 ui.small("You see exactly what will be read first. Nothing is checked until you confirm.");
+                ui.label(NOT_NEEDED_TO_PLAY);
             }
         }
         Stage::Previewing => {

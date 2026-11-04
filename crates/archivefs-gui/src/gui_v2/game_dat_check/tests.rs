@@ -803,23 +803,30 @@ mod one_action_in_game_details {
     }
 }
 
-/// A catalogue whose header names several systems is suggested for explicit
-/// confirmation, never treated as confirmed and never preselected.
+/// A catalogue with no saved system whose header names this system is
+/// suggested for an explicit trial: never preselected, never saved here.
 #[test]
-fn a_catalogue_naming_several_systems_is_suggested_not_confirmed() {
+fn an_unassigned_catalogue_with_a_matching_header_is_suggested_not_preselected() {
     let f = VerifiedGame::new();
     let game = game(&f);
     let platform = Target::of(&game).platform;
     let loaded = inputs(&f);
     let mut rows = list_installed_catalogues(loaded.inventory.inputs());
     assert!(!rows.is_empty());
-    rows[0].platform = EvidenceValue::Ambiguous(vec![platform.clone(), "Game Gear".into()]);
-    let suggested = suggested_catalogues(&rows, &platform);
+    rows[0].platform = EvidenceValue::Unknown;
+    let id = local_source_id(&rows[0]).unwrap().to_string();
+    let system = archivefs_core::canonical_platform_for_alias(&platform).unwrap();
+    let matches = vec![(id.clone(), system)];
+    let suggested = suggested_catalogues(&rows, &matches, &platform);
     assert_eq!(suggested.len(), 1);
-    assert!(local_source_id(&suggested[0]).is_some());
     assert!(ready_catalogues(rows.clone(), &platform).is_empty());
-    // Another system's game is never offered it.
-    assert!(suggested_catalogues(&rows, "PSX").is_empty());
+    // No header match, or another system's game: nothing is suggested.
+    assert!(suggested_catalogues(&rows, &[], &platform).is_empty());
+    assert!(suggested_catalogues(&rows, &matches, "PSX").is_empty());
+    // A saved system is never re-suggested.
+    let mut assigned = rows.clone();
+    assigned[0].platform = EvidenceValue::Assigned(platform.clone());
+    assert!(suggested_catalogues(&assigned, &matches, &platform).is_empty());
 
     let mut state = State {
         target: Some(Target::of(&game)),
@@ -827,25 +834,79 @@ fn a_catalogue_naming_several_systems_is_suggested_not_confirmed() {
         suggested,
         ..Default::default()
     };
-    let mut action = None;
     let painted = crate::shared_apply_warnings::test_support::render(|ui| {
-        action = show(ui, &mut state, game.archive.id);
+        let _ = show(ui, &mut state, game.archive.id);
     });
     for wanted in [
         "Suggested — needs your confirmation",
-        &choose_for_system_label(&platform),
+        &suggested_reason(&platform),
+        CHECK_THIS_GAME,
         NOT_NEEDED_TO_PLAY,
     ] {
         assert!(painted.contains(wanted), "{wanted}: {painted}");
     }
-    // No save is offered before a check has proved the catalogue.
+    assert!(state.choice.is_none(), "a suggestion is never preselected");
     assert!(
         !painted.contains(&use_for_system_label(&platform)),
         "{painted}"
     );
-    assert!(state.choice.is_none(), "a suggestion is never preselected");
     assert!(!painted.contains("Verified"), "{painted}");
-    assert!(action.is_none(), "nothing is saved without a click");
+}
+
+/// End to end on the real engine: the fixture's catalogue with no saved
+/// system is tried for this game only, verified, then offered for "from now
+/// on". The saved setup is unchanged until Yes.
+#[test]
+fn a_suggested_catalogue_trial_verifies_then_offers_to_remember() {
+    let f = VerifiedGame::new();
+    let game = game(&f);
+    let target = Target::of(&game);
+    let config = f.profile.join("dat_sources.toml");
+    let before = std::fs::read(&config).unwrap();
+    // The fixture registry exactly as saved: validated, no system set.
+    let mut loaded = inputs(&f);
+    for entry in loaded.inventory.local_registry.entries().to_vec() {
+        loaded
+            .inventory
+            .local_registry
+            .get_mut(&entry.id)
+            .unwrap()
+            .set_platform_by_person(None);
+    }
+    let matches = header_matches(&loaded);
+    let rows = list_installed_catalogues(loaded.inventory.inputs());
+    let suggested = suggested_catalogues(&rows, &matches, &target.platform);
+    // "Nintendo - Super Nintendo Entertainment System" is recognised by the
+    // existing rule, so the trial is offered.
+    assert_eq!(suggested.len(), 1, "{matches:?}");
+    let mut state = State {
+        target: Some(target.clone()),
+        stage: Stage::Choose,
+        inputs: Some(loaded),
+        choice: Some(suggested[0].reference.clone()),
+        suggested,
+        ..Default::default()
+    };
+    state.preview();
+    wait(&mut state, |stage| !matches!(stage, Stage::Previewing));
+    assert!(
+        matches!(state.stage, Stage::Ready(_)),
+        "header re-proved by core"
+    );
+    state.confirm();
+    wait(&mut state, |stage| {
+        matches!(stage, Stage::Finished(_) | Stage::Failed(_))
+    });
+    let Stage::Finished(finished) = &state.stage else {
+        panic!("trial failed");
+    };
+    assert_eq!(finished.finding, Finding::Verified);
+    assert!(state.assignable.is_some(), "Verified offers from now on");
+    assert_eq!(
+        std::fs::read(&config).unwrap(),
+        before,
+        "setup unchanged before Yes"
+    );
 }
 
 /// The fixture's confirmed catalogue still takes the full check path, and a
