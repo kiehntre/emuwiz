@@ -87,7 +87,6 @@ fn an_empty_emuwiz_folder_never_hides_an_established_legacy_install() {
     std::fs::create_dir_all(home.join(".config/archivefs")).unwrap();
     std::fs::write(home.join(".config/archivefs/config.toml"), LEGACY_CONFIG).unwrap();
     std::fs::create_dir_all(home.join(".config/emuwiz")).unwrap();
-    std::fs::write(home.join(".config/emuwiz/gui-v2.json"), "{}").unwrap();
     std::fs::create_dir_all(home.join(".local/share/archivefs")).unwrap();
     std::fs::write(home.join(".local/share/archivefs/library.sqlite3"), "").unwrap();
     std::fs::create_dir_all(home.join(".local/share/emuwiz/sealed-writers")).unwrap();
@@ -124,6 +123,19 @@ fn an_empty_emuwiz_folder_never_hides_an_established_legacy_install() {
     assert_eq!(
         std::fs::read_to_string(home.join(".config/archivefs/config.toml")).unwrap(),
         LEGACY_CONFIG
+    );
+
+    // Saved launch preferences make the new folder meaningful: refused, not
+    // silently outranked by the legacy one.
+    std::fs::write(
+        home.join(".config/emuwiz/launch_preferences.json"),
+        "{\"version\":1,\"preferences\":[]}",
+    )
+    .unwrap();
+    let text = combined(&run_cli(&home, &["config-check"]));
+    assert!(
+        text.contains("will not choose between them"),
+        "a new folder holding launch preferences must be reported, got:\n{text}"
     );
     let _ = std::fs::remove_dir_all(&home);
 }

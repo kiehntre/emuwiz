@@ -15,11 +15,15 @@
 //! | established | empty       | `emuwiz`                                 |
 //! | established | established | error: ambiguous, nothing is chosen      |
 //!
-//! "Established" means the directory holds one of the kind's marker files
-//! (the library database or the main config files), is not a plain directory
-//! (a symlink or other entry the user placed deliberately), or cannot be
-//! inspected. "Empty" is a plain directory without any marker; it may still
-//! contain files EmuWiz writes on start-up, such as window state.
+//! "Empty" is a plain directory holding nothing but provably disposable
+//! first-start leftovers: Blue's `gui-v2.json` still equal to its defaults,
+//! an Undo seal store recording no seal, per-process writer registrations
+//! and the thumbnail cache. Everything else is "established": any other file
+//! or folder, known or unknown (customised preferences, launch preferences,
+//! library views, a seal store with seals, a library), a symlink or other
+//! non-directory the user placed deliberately, and anything that cannot be
+//! read or verified. Unknown content therefore never silently loses
+//! precedence.
 //!
 //! An explicit `EMUWIZ_CONFIG_HOME` / `EMUWIZ_DATA_HOME` root is always used
 //! as given; that is the isolation and the way to resolve an ambiguous case.
@@ -47,10 +51,27 @@ pub const LEGACY_DATA_DIR_NAME: &str = "archivefs";
 pub const DATA_ROOT_OVERRIDE_ENV: &str = "EMUWIZ_DATA_HOME";
 pub const CONFIG_ROOT_OVERRIDE_ENV: &str = "EMUWIZ_CONFIG_HOME";
 
-/// Files whose presence means a config directory holds a user's settings.
-const CONFIG_MARKERS: &[&str] = &["config.toml", "dat_sources.toml"];
-/// Files whose presence means a data directory holds a user's library.
-const DATA_MARKERS: &[&str] = &["library.sqlite3", "index.json"];
+/// Directories a config directory may hold and still count as empty: none.
+const CONFIG_DISPOSABLE: &[&str] = &[];
+/// Directories a data directory may hold and still count as empty:
+/// per-process writer registrations and the regenerable thumbnail cache,
+/// each only as a real directory.
+const DATA_DISPOSABLE: &[&str] = &[
+    crate::dat::rename_apply::writer_gate::SEALED_WRITERS_DIR,
+    crate::dat::rename_apply::writer_gate::FINALISE_WRITERS_DIR,
+    "gui-v2-thumbnails-v1",
+];
+
+/// Blue's settings file in the config directory.
+pub const GUI_PREFERENCES_FILE: &str = "gui-v2.json";
+/// What Blue writes to [`GUI_PREFERENCES_FILE`] on a first start: its
+/// default preferences, unchanged. Only a file equal to this (as JSON) counts
+/// as disposable; any navigation or chosen setting makes it meaningful. The
+/// GUI crate's tests keep this equal to its `Preferences::default()`.
+#[doc(hidden)]
+pub const FIRST_START_GUI_PREFERENCES_JSON: &str = r#"{"route":"Home","filter":{"search":"","platform":"","readiness":"All","unverified_only":false,"list":false},"playing_library":{"preferred_regions":"Europe, USA, Japan, Other","preferred_languages":"","prefer_newest_revision":true,"prefer_parent":true,"exclude_beta":true,"exclude_proto":true,"exclude_demo":true,"exclude_sample":true},"welcome_dismissed":false,"beginner_hints_enabled":true,"document_roots":[],"document_associations":{},"document_reading":{},"simple_shell":true,"classic_view":false,"ui_scale":1.0}"#;
+/// Bigger files are never compared; they are meaningful.
+const FIRST_START_FILE_LIMIT: u64 = 1024 * 1024;
 
 #[derive(Clone, Copy)]
 enum Kind {
@@ -59,10 +80,10 @@ enum Kind {
 }
 
 impl Kind {
-    fn markers(self) -> &'static [&'static str] {
+    fn disposable(self) -> &'static [&'static str] {
         match self {
-            Self::Config => CONFIG_MARKERS,
-            Self::Data => DATA_MARKERS,
+            Self::Config => CONFIG_DISPOSABLE,
+            Self::Data => DATA_DISPOSABLE,
         }
     }
 
@@ -103,18 +124,117 @@ fn presence(path: &Path, kind: Kind) -> Presence {
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => Presence::Absent,
         Err(_) => Presence::Established,
         Ok(metadata) if !metadata.file_type().is_dir() => Presence::Established,
-        Ok(_) => {
-            if kind
-                .markers()
-                .iter()
-                .any(|marker| entry_may_exist(&path.join(marker)))
-            {
-                Presence::Established
-            } else {
-                Presence::Empty
+        Ok(_) if holds_only_disposable_entries(path, kind) => Presence::Empty,
+        Ok(_) => Presence::Established,
+    }
+}
+
+/// True only when every entry is provably disposable: a recognised
+/// directory, Blue's settings file still holding exactly its first-start
+/// defaults, or an Undo seal store (with its WAL companions) that records
+/// nothing. Any other entry, anything unreadable or unverifiable, or a name
+/// that is not valid UTF-8 is meaningful.
+fn holds_only_disposable_entries(path: &Path, kind: Kind) -> bool {
+    use crate::dat::rename_apply::seal::SEAL_STORE_FILENAME;
+    let Ok(entries) = std::fs::read_dir(path) else {
+        return false;
+    };
+    let seal_store = path.join(SEAL_STORE_FILENAME);
+    let seal_wal = format!("{SEAL_STORE_FILENAME}-wal");
+    let seal_shm = format!("{SEAL_STORE_FILENAME}-shm");
+    for entry in entries {
+        let Ok(entry) = entry else {
+            return false;
+        };
+        let Some(name) = entry.file_name().to_str().map(str::to_owned) else {
+            return false;
+        };
+        let Ok(file_type) = entry.file_type() else {
+            return false;
+        };
+        let disposable = if kind.disposable().contains(&name.as_str()) {
+            file_type.is_dir()
+        } else {
+            match kind {
+                Kind::Config => {
+                    name == GUI_PREFERENCES_FILE
+                        && file_type.is_file()
+                        && holds_first_start_gui_preferences(&entry.path())
+                }
+                Kind::Data => {
+                    (name == SEAL_STORE_FILENAME || name == seal_wal || name == seal_shm)
+                        && file_type.is_file()
+                        && seal_store_records_nothing(&seal_store)
+                }
             }
+        };
+        if !disposable {
+            return false;
         }
     }
+    true
+}
+
+/// Whether Blue's settings file equals its first-start defaults. Read-only.
+fn holds_first_start_gui_preferences(path: &Path) -> bool {
+    let Ok(metadata) = std::fs::symlink_metadata(path) else {
+        return false;
+    };
+    if !metadata.is_file() || metadata.len() > FIRST_START_FILE_LIMIT {
+        return false;
+    }
+    let (Ok(bytes), Ok(default)) = (
+        std::fs::read(path),
+        serde_json::from_str::<serde_json::Value>(FIRST_START_GUI_PREFERENCES_JSON),
+    ) else {
+        return false;
+    };
+    serde_json::from_slice::<serde_json::Value>(&bytes).is_ok_and(|value| value == default)
+}
+
+/// Whether the Undo seal store holds no seal and nothing else: at most the
+/// `journal_seals` table (and its key index), with no rows. Opened the way
+/// the store's own readers open it (read-only, no symlinks, query-only);
+/// any error, lock, other schema object or row means it records something.
+fn seal_store_records_nothing(path: &Path) -> bool {
+    use rusqlite::{Connection, OpenFlags};
+    let Ok(metadata) = std::fs::symlink_metadata(path) else {
+        return false;
+    };
+    if !metadata.is_file() || metadata.len() > FIRST_START_FILE_LIMIT {
+        return false;
+    }
+    let Ok(connection) = Connection::open_with_flags(
+        path,
+        OpenFlags::SQLITE_OPEN_READ_ONLY
+            | OpenFlags::SQLITE_OPEN_NO_MUTEX
+            | OpenFlags::SQLITE_OPEN_NOFOLLOW,
+    ) else {
+        return false;
+    };
+    let inspect = || -> rusqlite::Result<bool> {
+        connection.pragma_update(None, "query_only", true)?;
+        let mut statement = connection.prepare("SELECT type, name FROM sqlite_master")?;
+        let objects = statement
+            .query_map([], |row| {
+                Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+            })?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        let only_seal_table = objects.iter().all(|(kind, name)| {
+            (kind == "table" && name == "journal_seals")
+                || (kind == "index" && name.starts_with("sqlite_autoindex_journal_seals_"))
+        });
+        if !only_seal_table {
+            return Ok(false);
+        }
+        if objects.iter().any(|(kind, _)| kind == "table") {
+            let rows: i64 =
+                connection.query_row("SELECT count(*) FROM journal_seals", [], |row| row.get(0))?;
+            return Ok(rows == 0);
+        }
+        Ok(true)
+    };
+    inspect().unwrap_or(false)
 }
 
 fn entry_may_exist(path: &Path) -> bool {
@@ -165,6 +285,7 @@ fn resolve(
     choose_dir(&base.join(names.0), &base.join(names.1), kind)
 }
 
+#[cfg(test)]
 pub(crate) fn config_dir_in(home: &Path) -> Result<PathBuf> {
     config_dir_in_with_roots(home, None, None)
 }
@@ -367,17 +488,36 @@ mod tests {
         );
     }
 
-    /// What a first start of a new build leaves in an otherwise unused
-    /// EmuWiz directory: window state and empty bookkeeping, no library.
+    /// Only recognised disposable leftovers: an empty config folder, and
+    /// writer registrations plus the thumbnail cache in the data folder.
     fn startup_leftovers(home: &Path) {
-        put(home, &[".config", "emuwiz", "gui-v2.json"], "{}");
-        put(
-            home,
-            &[".local", "share", "emuwiz", "undo-seals.sqlite3"],
-            "",
-        );
-        std::fs::create_dir_all(join(home, &[".local", "share", "emuwiz", "sealed-writers"]))
-            .unwrap();
+        std::fs::create_dir_all(join(home, &[".config", "emuwiz"])).unwrap();
+        for dir in DATA_DISPOSABLE {
+            put(home, &[".local", "share", "emuwiz", dir, "1292226"], "pid");
+        }
+    }
+
+    /// Legacy populated; the EmuWiz folder of `kind` holds only `entry`.
+    /// Returns whether that folder was refused as ambiguous.
+    fn ambiguous_beside_legacy(name: &str, kind: Kind, entry: &[&str], contents: &str) -> bool {
+        let home = home_with(name, &[]);
+        legacy_install(&home);
+        let base: &[&str] = match kind {
+            Kind::Config => &[".config", "emuwiz"],
+            Kind::Data => &[".local", "share", "emuwiz"],
+        };
+        let parts: Vec<&str> = base.iter().chain(entry).copied().collect();
+        put(&home, &parts, contents);
+        let before = tree(&home);
+        let result = match kind {
+            Kind::Config => config_dir_in(&home),
+            Kind::Data => data_dir_in(&home),
+        };
+        // Refusing never changes either side.
+        assert_eq!(tree(&home), before);
+        let refused = result.is_err();
+        let _ = std::fs::remove_dir_all(&home);
+        refused
     }
 
     /// Every file and directory under `root`, for no-write assertions.
@@ -463,6 +603,267 @@ mod tests {
         );
         let _ = std::fs::remove_dir_all(&home);
         let _ = std::fs::remove_dir_all(&bare);
+    }
+
+    #[test]
+    fn launch_preferences_alone_make_the_new_folder_meaningful() {
+        assert!(ambiguous_beside_legacy(
+            "launch-prefs",
+            Kind::Config,
+            &["launch_preferences.json"],
+            "{\"version\":1,\"preferences\":[]}",
+        ));
+    }
+
+    #[test]
+    fn library_views_alone_make_the_new_folder_meaningful() {
+        assert!(ambiguous_beside_legacy(
+            "library-views",
+            Kind::Config,
+            &["library_views.json"],
+            "[]",
+        ));
+    }
+
+    #[test]
+    fn unknown_persistent_content_makes_the_new_folder_meaningful() {
+        // Files EmuWiz does not recognise and unparseable window state are
+        // kept, never silently outranked.
+        assert!(ambiguous_beside_legacy(
+            "unknown-config",
+            Kind::Config,
+            &["notes.txt"],
+            "mine"
+        ));
+        assert!(ambiguous_beside_legacy(
+            "window-state",
+            Kind::Config,
+            &["gui-v2.json"],
+            "{}"
+        ));
+        assert!(ambiguous_beside_legacy(
+            "unknown-data",
+            Kind::Data,
+            &["future-store", "x.db"],
+            "x"
+        ));
+        // Not a database at all: unverifiable, so meaningful.
+        assert!(ambiguous_beside_legacy(
+            "seals-garbage",
+            Kind::Data,
+            &["undo-seals.sqlite3"],
+            "not sqlite"
+        ));
+        // A disposable name used for a file rather than a directory is not
+        // the recognised artefact.
+        assert!(ambiguous_beside_legacy(
+            "disposable-as-file",
+            Kind::Data,
+            &["sealed-writers"],
+            "x"
+        ));
+    }
+
+    /// Creates the Undo seal store the way the store does (WAL, the
+    /// `journal_seals` table) with `seals` rows, and returns the writer
+    /// connection still open, so the WAL and shared-memory companions exist
+    /// as after a first start that has not checkpointed.
+    fn seal_store(dir: &Path, seals: usize) -> rusqlite::Connection {
+        std::fs::create_dir_all(dir).unwrap();
+        let connection = rusqlite::Connection::open(dir.join("undo-seals.sqlite3")).unwrap();
+        connection
+            .pragma_update(None, "journal_mode", "WAL")
+            .unwrap();
+        connection
+            .execute_batch(
+                "CREATE TABLE IF NOT EXISTS journal_seals (
+                    namespace_id TEXT NOT NULL,
+                    transaction_id TEXT NOT NULL,
+                    workflow TEXT NOT NULL,
+                    namespace TEXT NOT NULL,
+                    generation INTEGER NOT NULL,
+                    digest BLOB,
+                    pending_generation INTEGER,
+                    pending_digest BLOB,
+                    PRIMARY KEY (namespace_id, transaction_id)
+                );",
+            )
+            .unwrap();
+        for seal in 0..seals {
+            connection
+                .execute(
+                    "INSERT INTO journal_seals VALUES (?1, 't', 'w', 'n', 1, x'00', NULL, NULL)",
+                    [format!("ns-{seal}")],
+                )
+                .unwrap();
+        }
+        connection
+    }
+
+    /// Blue's first-start settings, re-serialised in another key order and
+    /// layout: compared as JSON, not as bytes.
+    fn first_start_preferences_reordered() -> String {
+        let value: serde_json::Value =
+            serde_json::from_str(FIRST_START_GUI_PREFERENCES_JSON).unwrap();
+        let mut entries: Vec<_> = value.as_object().unwrap().iter().collect();
+        entries.reverse();
+        let reordered: serde_json::Map<_, _> = entries
+            .into_iter()
+            .map(|(k, v)| (k.clone(), v.clone()))
+            .collect();
+        serde_json::to_string_pretty(&serde_json::Value::Object(reordered)).unwrap()
+    }
+
+    /// The precise first-start case: default `gui-v2.json`, an Undo seal
+    /// store with no seals (WAL companions present), writer registrations.
+    #[test]
+    fn fresh_default_startup_files_keep_the_legacy_library() {
+        let home = home_with("first-start", &[]);
+        legacy_install(&home);
+        startup_leftovers(&home);
+        put(
+            &home,
+            &[".config", "emuwiz", GUI_PREFERENCES_FILE],
+            &first_start_preferences_reordered(),
+        );
+        let writer = seal_store(&home.join(".local/share/emuwiz"), 0);
+        assert!(
+            home.join(".local/share/emuwiz/undo-seals.sqlite3-wal")
+                .exists()
+        );
+        let before = tree(&home);
+
+        assert_eq!(
+            config_dir_in(&home).unwrap(),
+            home.join(".config/archivefs")
+        );
+        assert_eq!(
+            data_dir_in(&home).unwrap(),
+            home.join(".local/share/archivefs")
+        );
+        assert!(!two_established_setups_in(
+            &home,
+            (None, None),
+            (None, None)
+        ));
+        drop(writer);
+        // After the writer closes (WAL checkpointed away) it is still empty.
+        assert_eq!(
+            data_dir_in(&home).unwrap(),
+            home.join(".local/share/archivefs")
+        );
+        // Classification wrote nothing to the legacy side or the config side.
+        let unchanged = |entries: Vec<(PathBuf, Vec<u8>)>| -> Vec<(PathBuf, Vec<u8>)> {
+            entries
+                .into_iter()
+                .filter(|(path, _)| !path.starts_with(home.join(".local/share/emuwiz")))
+                .collect()
+        };
+        assert_eq!(unchanged(tree(&home)), unchanged(before));
+        let _ = std::fs::remove_dir_all(&home);
+    }
+
+    #[test]
+    fn customised_gui_preferences_make_the_new_folder_meaningful() {
+        let mut value: serde_json::Value =
+            serde_json::from_str(FIRST_START_GUI_PREFERENCES_JSON).unwrap();
+        value["ui_scale"] = serde_json::json!(1.25);
+        assert!(ambiguous_beside_legacy(
+            "custom-scale",
+            Kind::Config,
+            &[GUI_PREFERENCES_FILE],
+            &value.to_string(),
+        ));
+        let mut value: serde_json::Value =
+            serde_json::from_str(FIRST_START_GUI_PREFERENCES_JSON).unwrap();
+        value["document_roots"] = serde_json::json!(["/home/me/manuals"]);
+        assert!(ambiguous_beside_legacy(
+            "custom-documents",
+            Kind::Config,
+            &[GUI_PREFERENCES_FILE],
+            &value.to_string(),
+        ));
+        // Browsing also changes it; a used profile is never discarded.
+        let mut value: serde_json::Value =
+            serde_json::from_str(FIRST_START_GUI_PREFERENCES_JSON).unwrap();
+        value["route"] = serde_json::json!({"Game": 42});
+        assert!(ambiguous_beside_legacy(
+            "browsed",
+            Kind::Config,
+            &[GUI_PREFERENCES_FILE],
+            &value.to_string(),
+        ));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_symlinked_default_settings_file_is_not_disposable() {
+        let home = home_with("settings-link", &[&[".config", "emuwiz"]]);
+        legacy_install(&home);
+        put(&home, &["elsewhere.json"], FIRST_START_GUI_PREFERENCES_JSON);
+        std::os::unix::fs::symlink(
+            home.join("elsewhere.json"),
+            home.join(".config/emuwiz").join(GUI_PREFERENCES_FILE),
+        )
+        .unwrap();
+        assert!(config_dir_in(&home).is_err());
+        let _ = std::fs::remove_dir_all(&home);
+    }
+
+    #[test]
+    fn populated_undo_state_makes_the_new_folder_meaningful() {
+        let home = home_with("seals-populated", &[]);
+        legacy_install(&home);
+        startup_leftovers(&home);
+        // With the writer still open (seal only in the WAL) and after close.
+        let writer = seal_store(&home.join(".local/share/emuwiz"), 1);
+        assert!(data_dir_in(&home).is_err());
+        assert!(two_established_setups_in(&home, (None, None), (None, None)));
+        drop(writer);
+        assert!(data_dir_in(&home).is_err());
+
+        // Any other schema object is unverified content too.
+        let other = home_with("seals-other-table", &[]);
+        legacy_install(&other);
+        let writer = seal_store(&other.join(".local/share/emuwiz"), 0);
+        writer.execute_batch("CREATE TABLE extra (x)").unwrap();
+        drop(writer);
+        assert!(data_dir_in(&other).is_err());
+        let _ = std::fs::remove_dir_all(&home);
+        let _ = std::fs::remove_dir_all(&other);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn an_unreadable_directory_is_never_treated_as_empty() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let home = home_with("unreadable", &[&[".local", "share", "emuwiz"]]);
+        legacy_install(&home);
+        let new_data = home.join(".local/share/emuwiz");
+        std::fs::set_permissions(&new_data, std::fs::Permissions::from_mode(0o000)).unwrap();
+        let privileged = std::fs::read_dir(&new_data).is_ok();
+        let result = data_dir_in(&home);
+        std::fs::set_permissions(&new_data, std::fs::Permissions::from_mode(0o755)).unwrap();
+        if privileged {
+            // Root reads through mode 000; the permission case cannot be
+            // produced here, so assert the readable-empty behaviour instead.
+            assert_eq!(result.unwrap(), home.join(".local/share/archivefs"));
+        } else {
+            assert!(
+                result.is_err(),
+                "an unreadable folder must not count as empty"
+            );
+        }
+
+        // An unreadable legacy folder beside an empty new one keeps the
+        // legacy choice; it is not displaced either.
+        let legacy = home.join(".local/share/archivefs");
+        std::fs::set_permissions(&legacy, std::fs::Permissions::from_mode(0o000)).unwrap();
+        let result = data_dir_in(&home);
+        std::fs::set_permissions(&legacy, std::fs::Permissions::from_mode(0o755)).unwrap();
+        assert_eq!(result.unwrap(), legacy);
+        let _ = std::fs::remove_dir_all(&home);
     }
 
     #[test]
@@ -579,6 +980,19 @@ mod tests {
             data_dir_in_with_roots(&home, None, Some(&xdg)).unwrap(),
             xdg.join(DATA_DIR_NAME)
         );
+        // A stray empty EmuWiz folder under the XDG root still never reaches
+        // the real home.
+        std::fs::create_dir_all(xdg.join(DATA_DIR_NAME)).unwrap();
+        assert_eq!(
+            data_dir_in_with_roots(&home, None, Some(&xdg)).unwrap(),
+            xdg.join(DATA_DIR_NAME)
+        );
+        assert!(!two_established_setups_in(
+            &home,
+            (None, None),
+            (None, Some(&xdg))
+        ));
+        std::fs::remove_dir(xdg.join(DATA_DIR_NAME)).unwrap();
         // A legacy copy placed under the XDG root is used, like under HOME.
         put(&xdg, &["archivefs", "library.sqlite3"], "copy");
         assert_eq!(
