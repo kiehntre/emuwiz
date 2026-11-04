@@ -2086,10 +2086,9 @@ impl App {
                 });
             });
         }
-        ui.label("Read-only verification. Your original game files are never renamed, moved or deleted here.");
-        if ui.button("Quick Rename verified games").clicked() {
-            self.go(Route::QuickRename);
-        }
+        // Read-only journey: renaming lives in DAT Management and All Tools,
+        // not beside a promise that nothing is renamed here.
+        ui.label("Read-only verification. Your original game files are never renamed, moved or deleted here. Verification is optional; you do not need it to play.");
         if self.check_platform.is_none() {
             ui.label(theme::card_title("Choose a platform"));
             // Arcade readiness is read from the saved DAT registry, the same
