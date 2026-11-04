@@ -211,6 +211,11 @@ pub struct AmigaDiskSetFacts {
     pub count: usize,
     pub order_verified: bool,
     pub problems: usize,
+    /// Disk numbers the set's own topology names as absent. A lone disk can
+    /// still belong to a larger, incomplete set.
+    pub missing: usize,
+    /// This entry's own file is one of the unavailable disks.
+    pub this_disk_unavailable: bool,
 }
 
 /// Reads the discovered emulator profiles and, for an LHA/LZH package, the
@@ -488,8 +493,63 @@ pub fn assess_amiga_game(
         }
     }
 
-    if let Some(disks) = disks.filter(|disks| disks.count > 1) {
-        let (state, detail) = if disks.problems > 0 {
+    // A DAT hash match that proves a complete single-disk game outranks disk
+    // numbers read from file names.
+    let dat_single_disk = media == AmigaMediaKind::Adf
+        && !cd_machine
+        && matches!(
+            facts.and_then(|facts| facts.adf_identity.as_ref()),
+            Some(Ok(_))
+        );
+    if let Some(disks) = disks.filter(|disks| disks.count > 1 || disks.missing > 0) {
+        // Grouping, gaps and unavailable siblings are claims about the
+        // proposed set, not about this disk: when the DAT proves this ADF is a
+        // whole game and its own file is still there, say both and let Play
+        // rest on that proof (FS-UAE launches only this disk).
+        let (state, detail) = if dat_single_disk && !disks.this_disk_unavailable {
+            let mut grouping = Vec::new();
+            if disks.count > 1 {
+                grouping.push("puts this disk with other disk files".to_string());
+            }
+            if disks.missing > 0 {
+                grouping.push(if disks.missing == 1 {
+                    "suggests 1 more disk is missing".to_string()
+                } else {
+                    format!("suggests {} more disks are missing", disks.missing)
+                });
+            }
+            if disks.problems > 0 {
+                grouping.push(if disks.problems == 1 {
+                    "names 1 disk file that is not available".to_string()
+                } else {
+                    format!("names {} disk files that are not available", disks.problems)
+                });
+            }
+            let grouping = match grouping.split_last() {
+                Some((last, [])) => last.clone(),
+                Some((last, rest)) => format!("{} and {last}", rest.join(", ")),
+                None => String::new(),
+            };
+            (
+                Warning,
+                format!(
+                    "The disk grouping {grouping}, but this disk's DAT hash match is a complete single-disk game. Play uses this disk only."
+                ),
+            )
+        } else if disks.missing > 0 {
+            (
+                Blocked,
+                format!(
+                    "{} of this game's disks {} missing from the disk numbers found; the set is incomplete or unproven (see the disk list).",
+                    disks.missing,
+                    if disks.missing == 1 {
+                        "appears to be"
+                    } else {
+                        "appear to be"
+                    }
+                ),
+            )
+        } else if disks.problems > 0 {
             (
                 Blocked,
                 format!(
@@ -501,7 +561,7 @@ pub fn assess_amiga_game(
             (
                 Ready,
                 format!(
-                    "{} disks, order verified. Change disks from the emulator's own menu (F12 in FS-UAE and Amiberry); EmuWiz does not swap disks for you.",
+                    "{} disks, order verified. Blue does not start multi-disk Amiga games: its FS-UAE launch inserts one disk and gives the emulator no list of the other disks.",
                     disks.count
                 ),
             )
