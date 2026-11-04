@@ -513,7 +513,7 @@ pub(super) fn choose_for_system_label(platform: &str) -> String {
 /// catalogue is preselected; EmuWiz never ranks several against each other.
 pub(super) fn catalogue_choice_note(count: usize, platform: &str) -> String {
     if count == 1 {
-        format!("Suggested: the only ready catalogue set up for {platform}.")
+        format!("Selected for you: the only catalogue confirmed for {platform}.")
     } else {
         format!(
             "{count} ready catalogues cover {platform}. Choose one; EmuWiz does not guess between them."
