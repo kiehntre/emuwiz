@@ -354,3 +354,153 @@ fn job36_narrow_browse_filters_do_not_overlap_the_entry_controls() {
         );
     }
 }
+
+/// #303 follow-up: when the artwork index worker has stopped for good, every
+/// surface that prepares artwork on demand asks once. It must not re-queue
+/// the index on every frame (advancing the generation and clearing every
+/// held picture), add an activity job each frame, or report the dead worker
+/// as "Artwork locations checked".
+#[test]
+fn a_stopped_artwork_indexer_is_asked_once_from_every_artwork_surface() {
+    use super::super::activity::Phase;
+    let surfaces = [
+        ("Browse & Play", Route::BrowsePlay, false),
+        ("Surprise Me", Route::BrowsePlay, true),
+        ("Game Details", Route::Game(1), false),
+        ("Museum", Route::Section(Section::Museum), false),
+        ("Artwork", Route::Section(Section::Artwork), false),
+    ];
+    let size = [1280.0, 820.0];
+    for (name, route, surprise) in surfaces {
+        let context = egui::Context::default();
+        let directory = tempfile::tempdir().unwrap();
+        let (mut app, calls) = startup_fixture(&context, directory.path(), Duration::ZERO);
+        app.artwork.stop_index_worker_for_test();
+        app.router.current = route;
+        if surprise {
+            app.simple.enabled = true;
+            app.browse_play.surprise = crate::gui_v2::surprise_me::SurpriseState::with_seed(7);
+            app.open_surprise_me();
+        }
+        let generation = app.artwork.generation;
+        app.poll(&context);
+        frame(&context, &mut app, size);
+        assert_eq!(
+            app.artwork.generation,
+            generation + 1,
+            "{name}: showing artwork asks for the index once"
+        );
+
+        // A picture already on show must survive the following frames.
+        let held = app.artwork.key(2, Kind::Cover);
+        app.artwork.pictures.insert(held, Picture::Missing);
+        let mut output = frame(&context, &mut app, size);
+        for _ in 0..5 {
+            app.poll(&context);
+            output = frame(&context, &mut app, size);
+        }
+        assert_eq!(
+            app.artwork.generation,
+            generation + 1,
+            "{name}: the index was re-queued on every frame"
+        );
+        // Nothing claims artwork is still being prepared or looked for.
+        let shown = text(&output);
+        for stale in ["Preparing artwork…", "Looking for screenshots…"] {
+            assert!(
+                !shown.iter().any(|value| value == stale),
+                "{name}: {stale:?} in {shown:?}"
+            );
+        }
+        if matches!(name, "Browse & Play" | "Surprise Me") {
+            assert!(
+                shown.iter().any(|value| value == "Pictures unavailable"),
+                "{name}: {shown:?}"
+            );
+        }
+        // The pages about artwork say why nothing is shown.
+        if matches!(name, "Museum" | "Artwork" | "Game Details") {
+            assert!(
+                text(&output)
+                    .iter()
+                    .any(|value| value == super::super::ARTWORK_STOPPED),
+                "{name}: {:?}",
+                text(&output)
+            );
+        }
+        assert!(
+            app.artwork.pictures.contains_key(&held),
+            "{name}: re-queuing cleared pictures"
+        );
+        assert!(!app.artwork.index_loading, "{name}");
+        assert_eq!(
+            calls.load(Ordering::SeqCst),
+            0,
+            "{name}: no index was built"
+        );
+        // Only artwork-index entries: a page may add its own unrelated job.
+        let artwork_jobs: Vec<_> = app
+            .activity
+            .jobs
+            .values()
+            .filter(|job| {
+                matches!(
+                    job.title.as_str(),
+                    "Preparing artwork" | "Refreshing metadata and artwork"
+                )
+            })
+            .collect();
+        assert_eq!(
+            artwork_jobs.len(),
+            1,
+            "{name}: one activity entry, not one per frame"
+        );
+        assert_eq!(
+            artwork_jobs[0].phase,
+            Phase::Failed,
+            "{name}: a stopped worker is not 'Artwork locations checked': {:?}",
+            artwork_jobs[0].summary
+        );
+    }
+}
+
+/// Ordinary preparing, refresh and library reload still build the index,
+/// each once, and finish their activity entry as checked.
+#[test]
+fn a_healthy_artwork_indexer_still_prepares_refreshes_and_reloads() {
+    use super::super::activity::Phase;
+    let context = egui::Context::default();
+    let directory = tempfile::tempdir().unwrap();
+    let (mut app, calls) = startup_fixture(&context, directory.path(), Duration::ZERO);
+    app.router.current = Route::BrowsePlay;
+    let size = [1280.0, 820.0];
+    let settle = |app: &mut App| {
+        pump_until(&context, app, size, |app| {
+            app.artwork.index.is_some() && app.index_job.is_none()
+        });
+        assert!(app.artwork.index.is_some(), "the index was never built");
+    };
+    frame(&context, &mut app, size);
+    settle(&mut app);
+    assert_eq!(calls.load(Ordering::SeqCst), 1);
+
+    app.refresh_artwork_index();
+    settle(&mut app);
+    assert_eq!(calls.load(Ordering::SeqCst), 2);
+
+    // What a completed library load does to the artwork state.
+    app.artwork.index = None;
+    app.artwork.index_loading = false;
+    app.index_job = None;
+    frame(&context, &mut app, size);
+    settle(&mut app);
+    assert_eq!(calls.load(Ordering::SeqCst), 3);
+    assert!(!app.artwork.index_unavailable());
+    assert_eq!(app.activity.jobs.len(), 3);
+    assert!(
+        app.activity
+            .jobs
+            .values()
+            .all(|job| job.phase == Phase::Complete)
+    );
+}

@@ -353,3 +353,152 @@ fn browsing_and_scrolling_the_shelf_writes_no_files() {
     assert_eq!(tree(directory.path()), before);
     assert!(!cache.exists());
 }
+
+/// Issue #303: when the cover-index worker has died, opening the shelf tries
+/// once. It must not re-queue the index (clearing every picture) on each
+/// frame, and the covers must say they are unavailable rather than loading.
+#[test]
+fn a_stopped_cover_indexer_is_tried_once_and_covers_say_they_are_unavailable() {
+    use crate::gui_v2::artwork::Picture;
+    let context = egui::Context::default();
+    let mut app = shelf_app(
+        &context,
+        vec![
+            (1, "Alpha Racer", "Zeta Console"),
+            (2, "Beta Blaster", "Zeta Console"),
+        ],
+    );
+    app.artwork.stop_index_worker_for_test();
+    let before = app.artwork.generation;
+    frame(&context, &mut app, Vec::new());
+    assert_eq!(app.artwork.generation, before + 1, "first open tries once");
+    assert!(!app.artwork.index_loading);
+
+    // A picture held by another surface must survive the following frames.
+    let held = app.artwork.key(1, Kind::Cover);
+    app.artwork.pictures.insert(held, Picture::Missing);
+    let mut output = frame(&context, &mut app, Vec::new());
+    for _ in 0..4 {
+        output = frame(&context, &mut app, Vec::new());
+    }
+    assert_eq!(
+        app.artwork.generation,
+        before + 1,
+        "the index was re-queued on every frame"
+    );
+    assert!(
+        app.artwork.pictures.contains_key(&held),
+        "re-queuing cleared pictures"
+    );
+    assert!(
+        visible_text(&output, "Covers unavailable"),
+        "{:?}",
+        gui::text(&output)
+    );
+    assert!(!visible_text(&output, "No local cover"));
+}
+
+/// Issue #303: a cover says what is actually wrong. Only a cover with no
+/// local picture says "No local cover"; an unreadable file, a cover still
+/// loading and paused artwork each say so instead.
+#[test]
+fn covers_say_whether_they_are_missing_loading_unreadable_or_paused() {
+    use crate::gui_v2::{artwork::Picture, media_sources::MediaIndex};
+    let context = egui::Context::default();
+    let mut app = shelf_app(
+        &context,
+        vec![
+            (1, "Alpha Racer", "Zeta Console"),
+            (2, "Beta Blaster", "Zeta Console"),
+            (3, "Gamma Quest", "Zeta Console"),
+        ],
+    );
+    // Index ready with no sources: game 1 has no local cover at all.
+    app.artwork.index = Some(Arc::new(MediaIndex::default()));
+    let unreadable = app.artwork.local_key(2, Kind::Cover);
+    let loading = app.artwork.local_key(3, Kind::Cover);
+    app.artwork
+        .pictures
+        .insert(unreadable, Picture::Failed("not a PNG".into()));
+    app.artwork.pictures.insert(loading, Picture::Loading);
+    let output = frame(&context, &mut app, Vec::new());
+    for wanted in ["No local cover", "Cover unreadable", "Loading…"] {
+        assert!(
+            visible_text(&output, wanted),
+            "{wanted:?} not shown in {:?}",
+            gui::text(&output)
+        );
+    }
+
+    // Paused: nothing is requested, so nothing can be called missing.
+    app.artwork.pictures.clear();
+    app.artwork.paused = true;
+    let output = frame(&context, &mut app, Vec::new());
+    assert!(
+        visible_text(&output, "Covers paused"),
+        "{:?}",
+        gui::text(&output)
+    );
+    assert!(!visible_text(&output, "No local cover"));
+}
+
+#[test]
+fn every_cover_state_has_its_own_short_label() {
+    use crate::gui_v2::artwork::Picture;
+    use archivefs_core::identity_source::romm::connectivity::RommConnectivity;
+    let label = |preparing, unavailable, paused, picture: Option<&Picture>| {
+        cover_label(preparing, unavailable, paused, picture)
+    };
+    assert_eq!(label(true, false, false, None), "Finding covers…");
+    assert_eq!(label(true, true, false, None), "Covers unavailable");
+    assert_eq!(
+        label(false, false, false, Some(&Picture::Loading)),
+        "Loading…"
+    );
+    assert_eq!(
+        label(false, false, false, Some(&Picture::Missing)),
+        "No local cover"
+    );
+    assert_eq!(
+        label(false, false, false, Some(&Picture::Failed("x".into()))),
+        "Cover unreadable"
+    );
+    let unavailable = Picture::Unavailable {
+        issue: RommConnectivity::AuthenticationFailed,
+        message: "x".into(),
+    };
+    assert_eq!(
+        label(false, false, false, Some(&unavailable)),
+        "Cover unavailable"
+    );
+    assert_eq!(label(false, false, true, None), "Covers paused");
+    // Index ready, not paused, nothing recorded yet (for example the bounded
+    // request queue was full): it is still on its way, not missing.
+    assert_eq!(label(false, false, false, None), "Waiting…");
+}
+
+/// A real library reload still rebuilds the cover index exactly once.
+#[test]
+fn a_library_reload_rebuilds_the_cover_index_once() {
+    use crate::gui_v2::{artwork::Artwork, media_sources::MediaIndex};
+    let context = egui::Context::default();
+    let mut app = shelf_app(&context, vec![(1, "Alpha Racer", "Zeta Console")]);
+    app.artwork = Artwork::with_indexer(context.clone(), None, Arc::new(|_| MediaIndex::default()));
+    let wait = |app: &mut App| {
+        for _ in 0..200 {
+            frame(&context, app, Vec::new());
+            if app.artwork.index.is_some() {
+                return;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+        panic!("the cover index was never built");
+    };
+    wait(&mut app);
+    assert_eq!(app.artwork.generation, 1);
+    // What a completed library load does to the artwork state.
+    app.artwork.index = None;
+    app.artwork.index_loading = false;
+    wait(&mut app);
+    assert_eq!(app.artwork.generation, 2);
+}

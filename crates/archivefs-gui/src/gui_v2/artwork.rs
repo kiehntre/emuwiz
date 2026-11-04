@@ -458,8 +458,17 @@ impl Artwork {
             .as_ref()
             .is_none_or(|sender| sender.send((self.generation, library, trim)).is_err())
         {
+            // The index worker has stopped and cannot restart, so drop its
+            // channel: callers can see that no index is coming this session
+            // instead of asking again on every frame.
+            self.index_requests = None;
             self.index_loading = false;
         }
+    }
+    /// The index worker has stopped, so no index will be built this session.
+    /// A surface that prepares the index on demand checks this before asking.
+    pub fn index_unavailable(&self) -> bool {
+        self.index_requests.is_none()
     }
     pub fn begin_frame(&mut self, context: &egui::Context) {
         self.frame += 1;
@@ -645,6 +654,21 @@ impl Artwork {
     pub fn preparing(&self) -> bool {
         self.index.is_none()
     }
+    /// [`picture_label`] for this pipeline's current state. With the index
+    /// worker stopped, a picture that is not already known is unavailable,
+    /// never "Preparing artwork…" for the rest of the session.
+    pub fn label(&self, key: Key) -> PictureLabel {
+        let picture = self.pictures.get(&key);
+        if picture.is_none() && self.index.is_none() && self.index_unavailable() {
+            return PictureLabel {
+                headline: "Pictures unavailable",
+                detail: Some(super::ARTWORK_STOPPED.into()),
+            };
+        }
+        // A stopped worker is not preparing: a known picture keeps its label.
+        let preparing = self.preparing() && !self.index_unavailable();
+        picture_label(preparing, self.paused, picture)
+    }
     /// How long until a failed picture is asked for again (only while it stays
     /// on screen). `None` when the picture is not in a retryable state.
     pub fn retry_in(&self, key: Key) -> Option<Duration> {
@@ -660,6 +684,13 @@ impl Artwork {
     }
     pub fn active(&self) -> usize {
         self.pending.len()
+    }
+    /// Stands in for an index worker thread that has died: the next index
+    /// request finds its channel closed, as it would in production.
+    #[cfg(test)]
+    pub(super) fn stop_index_worker_for_test(&mut self) {
+        let (sender, _) = mpsc::channel();
+        self.index_requests = Some(sender);
     }
 }
 
@@ -1944,6 +1975,27 @@ mod tests {
         assert!(f.detail.is_some());
         // Paused is only shown when nothing more specific is known.
         assert_eq!(picture_label(false, true, None).headline, "Pictures paused");
+    }
+
+    #[test]
+    fn a_stopped_index_worker_labels_pictures_unavailable_not_preparing() {
+        let context = egui::Context::default();
+        let mut artwork = Artwork::with_indexer(
+            context,
+            None,
+            Arc::new(|_: &SharedLibrary| MediaIndex::default()),
+        );
+        let key = artwork.key(1, Kind::Cover);
+        assert_eq!(artwork.label(key).headline, "Preparing artwork…");
+        artwork.stop_index_worker_for_test();
+        artwork.reload(Arc::new(super::super::library::Library::default()));
+        assert!(artwork.index_unavailable() && !artwork.index_loading);
+        let label = artwork.label(key);
+        assert_eq!(label.headline, "Pictures unavailable");
+        assert_eq!(label.detail.as_deref(), Some(super::super::ARTWORK_STOPPED));
+        // A picture already known keeps its own label.
+        artwork.pictures.insert(key, Picture::Missing);
+        assert_eq!(artwork.label(key).headline, "No picture yet");
     }
 
     #[test]

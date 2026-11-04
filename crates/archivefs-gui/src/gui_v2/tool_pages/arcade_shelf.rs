@@ -181,7 +181,12 @@ impl App {
         }
         // First open: prepare the shared cover index read-only (discovery
         // only, never the thumbnail-cache eviction), so no other page is needed.
-        if self.loaded && self.artwork.index.is_none() && !self.artwork.index_loading {
+        // A stopped index worker is asked once, not again on every frame.
+        if self.loaded
+            && self.artwork.index.is_none()
+            && !self.artwork.index_loading
+            && !self.artwork.index_unavailable()
+        {
             self.artwork.reload_read_only(library.clone());
         }
         let mut state = std::mem::take(&mut self.tools.arcade_shelf);
@@ -427,7 +432,8 @@ impl App {
     }
 
     /// The game's cover from local artwork or the disk cache only, read-only,
-    /// or a quiet placeholder. Off-screen covers are never requested.
+    /// or a short label saying why there is no picture. Off-screen covers
+    /// are never requested.
     fn arcade_shelf_cover(&mut self, ui: &mut egui::Ui, game: &Game) {
         let (rect, _) = ui.allocate_exact_size(COVER, egui::Sense::hover());
         if !ui.is_rect_visible(rect) {
@@ -447,12 +453,12 @@ impl App {
                 );
             }
             picture => {
-                let text =
-                    if matches!(picture, Some(Picture::Loading)) || self.artwork.index.is_none() {
-                        "…"
-                    } else {
-                        "No local cover"
-                    };
+                let text = cover_label(
+                    self.artwork.index.is_none(),
+                    self.artwork.index_unavailable(),
+                    self.artwork.paused,
+                    picture,
+                );
                 ui.painter().text(
                     rect.center(),
                     egui::Align2::CENTER_CENTER,
@@ -486,6 +492,31 @@ impl App {
                     }
                 }
             });
+    }
+}
+
+/// What a cover without a picture says. Only a cover the index has no local
+/// picture for is "No local cover"; every other state says what it is.
+/// `preparing`: no index yet; `unavailable`: none can be built this session.
+fn cover_label(
+    preparing: bool,
+    unavailable: bool,
+    paused: bool,
+    picture: Option<&Picture>,
+) -> &'static str {
+    match picture {
+        Some(Picture::Ready { .. }) => "",
+        Some(Picture::Loading) => "Loading…",
+        Some(Picture::Missing) => "No local cover",
+        // Local-only: a cache miss is `Missing`, so this is a file that could
+        // not be read or decoded. It is retried after a while.
+        Some(Picture::Failed(_)) => "Cover unreadable",
+        Some(Picture::Unavailable { .. }) => "Cover unavailable",
+        None if unavailable => "Covers unavailable",
+        None if preparing => "Finding covers…",
+        None if paused => "Covers paused",
+        // Not yet queued, for example while the bounded request queue is full.
+        None => "Waiting…",
     }
 }
 

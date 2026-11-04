@@ -1837,11 +1837,7 @@ impl App {
                 ui.painter()
                     .rect_stroke(rect, 8.0, theme::border(ui), egui::StrokeKind::Inside);
             }
-            let label = super::artwork::picture_label(
-                self.artwork.preparing(),
-                self.artwork.paused,
-                self.artwork.pictures.get(&key),
-            );
+            let label = self.artwork.label(key);
             let labelled = size.x > 90.0 && size.y > 90.0;
             // Lay the words out first so the hardware image leaves them room.
             let font = egui::FontId::proportional(theme::METADATA_SIZE);
@@ -1909,6 +1905,8 @@ impl App {
             if self.artwork.index_loading {
                 ui.spinner();
                 ui.label("Finding existing artwork…");
+            } else if self.artwork.index_unavailable() {
+                ui.label(super::ARTWORK_STOPPED);
             }
         });
 
@@ -3787,7 +3785,10 @@ impl App {
         ui.vertical(|ui| {
                 ui.label("Review artwork, manuals and supported extras for one game. Provider setup stays in Sources & Providers.");
                 if ui
-                    .add_enabled(!self.artwork.index_loading, egui::Button::new("Recheck providers"))
+                    .add_enabled(
+                        !self.artwork.index_loading && !self.artwork.index_unavailable(),
+                        egui::Button::new("Recheck providers"),
+                    )
                     .clicked()
                 {
                     self.refresh_artwork_index();
@@ -3795,6 +3796,8 @@ impl App {
                 if self.artwork.index_loading {
                     ui.spinner();
                     ui.label("Checking metadata and artwork providers…");
+                } else if self.artwork.index_unavailable() {
+                    ui.label(super::ARTWORK_STOPPED);
                 }
                 let Some(game_id) = selected else {
                     let (covers, screenshots, descriptions) = self.artwork.index.as_ref().map_or(
@@ -3902,7 +3905,13 @@ impl App {
                 ui.heading("Artwork");
                 ui.strong("Screenshots");
                 if count == 0 {
-                    ui.label(if self.artwork.index_loading { "Looking for screenshots…" } else { "No screenshot is available for this game." });
+                    ui.label(if self.artwork.index_loading {
+                        "Looking for screenshots…"
+                    } else if self.artwork.index_unavailable() {
+                        super::ARTWORK_STOPPED
+                    } else {
+                        "No screenshot is available for this game."
+                    });
                 } else {
                     for ordinal in 0..count {
                         self.picture(ui, game, Kind::Screenshot(ordinal), egui::vec2(320.0, 220.0));

@@ -2,8 +2,13 @@
 //! it came from, and a screenshot viewer with a large preview.
 //!
 //! Display only. Every picture comes from a reference the media index already
-//! stored, through the existing bounded loaders (`Artwork::request`), so this
-//! never downloads, contacts ScreenScraper or writes anything. The caption
+//! stored, through the existing bounded loaders (`Artwork::request`); this
+//! never contacts ScreenScraper or changes the library. Those loaders are
+//! shared with Browse & Play and can write to local caches: a resized copy
+//! of local artwork in the thumbnail cache (whose routine trim may also run),
+//! a repair of a corrupt RomM artwork-cache entry, and, only with the optional
+//! Online artwork setting on, a RomM picture fetched into the RomM artwork
+//! cache. The caption
 //! never turns a stale or unreadable reference into a good-looking one: a
 //! stale RomM record keeps its warning, and a stored file that is gone or
 //! cannot be decoded says so instead of passing for "no artwork".
@@ -242,10 +247,14 @@ impl App {
         ui.add_space(theme::SPACE_MD);
         ui.label(theme::section_title("Screenshots"));
         if self.artwork.index.is_none() {
-            ui.horizontal(|ui| {
-                ui.spinner();
-                ui.label("Looking for screenshots…");
-            });
+            if self.artwork.index_unavailable() {
+                ui.weak(crate::gui_v2::ARTWORK_STOPPED);
+            } else {
+                ui.horizontal(|ui| {
+                    ui.spinner();
+                    ui.label("Looking for screenshots…");
+                });
+            }
             return;
         }
         if count == 0 {

@@ -131,6 +131,9 @@ use crate::playing_library_page::{PlayingLibraryPageAction, PlayingLibraryPageSt
 use activity::Activity;
 
 pub(super) const DUPLICATE_SCAN_TITLE: &str = "Finding exact duplicate files";
+/// Shown once the artwork index worker has stopped; it cannot restart.
+pub(super) const ARTWORK_STOPPED: &str =
+    "Artwork discovery has stopped. Restart EmuWiz to show pictures again.";
 use artwork::Artwork;
 use backend::{
     Backend, Command, DuplicateRepairPreview, DuplicateRepairRecord, Event, Payload, Preferences,
@@ -874,7 +877,10 @@ impl App {
         self.start_artwork_index("Refreshing metadata and artwork");
     }
     fn start_artwork_index(&mut self, label: &str) {
-        if self.artwork.index_loading {
+        // A stopped index worker cannot restart: it was asked once and said
+        // so, and asking again on every frame would only clear pictures and
+        // add an activity entry each time.
+        if self.artwork.index_loading || self.artwork.index_unavailable() {
             return;
         }
         self.artwork.reload(self.library.clone());
@@ -882,6 +888,14 @@ impl App {
             .activity
             .queue(label, Route::Section(Section::Artwork), false);
         self.activity.start(id);
+        if self.artwork.index_unavailable() {
+            self.activity.finish(
+                id,
+                ARTWORK_STOPPED.into(),
+                Some("The artwork index worker is no longer running.".into()),
+            );
+            return;
+        }
         self.index_job = Some(id);
     }
     fn go(&mut self, route: Route) {

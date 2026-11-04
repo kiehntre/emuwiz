@@ -1,9 +1,15 @@
 //! Surprise Me: a playful random pick from the Library.
 //!
 //! Reads only the loaded, read-only catalogue snapshot and the finished
-//! readiness answers Browse & Play already holds. It never scans, writes or
-//! starts anything: Play selects the pick in Browse & Play, where the usual
-//! launch-readiness check and Play button take over.
+//! readiness answers Browse & Play already holds. It never scans the library,
+//! changes the catalogue or starts anything: Play selects the pick in Browse &
+//! Play, where the usual launch-readiness check and Play button take over.
+//!
+//! The cover uses the shared `picture_tile` pipeline, exactly as Browse & Play
+//! does, so showing it can write to local caches: a resized copy of local
+//! artwork in the thumbnail cache (whose routine trim may also run), a repair
+//! of a corrupt RomM artwork-cache entry, and, only with the optional Online
+//! artwork setting on, a RomM cover fetched into the RomM artwork cache.
 
 use super::{
     App,
