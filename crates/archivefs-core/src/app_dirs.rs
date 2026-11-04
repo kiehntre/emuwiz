@@ -407,6 +407,10 @@ fn choose_dir(primary: &Path, legacy: &Path, kind: Kind) -> Result<PathBuf> {
     if !entry_may_exist(primary) {
         return Ok(legacy.to_path_buf());
     }
+    // One name a symlink to the other (either way round): one setup, not two.
+    if same_directory(primary, legacy) {
+        return Ok(primary.to_path_buf());
+    }
     // The legacy folder is classified only when the EmuWiz one is established;
     // an empty EmuWiz folder decides for the legacy one by itself.
     let primary_presence = presence(primary, kind);
@@ -527,6 +531,27 @@ pub fn data_dir() -> Result<PathBuf> {
     data_dir_in_with_roots(&home, explicit_root.as_deref(), xdg_data_home.as_deref())
 }
 
+/// Whether both paths resolve to one and the same directory (same device and
+/// inode after following symlinks). Anything unresolvable is not proven the
+/// same, so it falls through to ordinary classification (fail closed).
+fn same_directory(a: &Path, b: &Path) -> bool {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        match (std::fs::metadata(a), std::fs::metadata(b)) {
+            (Ok(a), Ok(b)) => a.is_dir() && b.is_dir() && a.dev() == b.dev() && a.ino() == b.ino(),
+            _ => false,
+        }
+    }
+    #[cfg(not(unix))]
+    {
+        matches!(
+            (std::fs::canonicalize(a), std::fs::canonicalize(b)),
+            (Ok(a), Ok(b)) if a == b
+        )
+    }
+}
+
 fn ambiguous_under(
     explicit_root: Option<&Path>,
     base: &Path,
@@ -536,6 +561,7 @@ fn ambiguous_under(
     explicit_root.is_none()
         && entry_may_exist(&base.join(names.0))
         && entry_may_exist(&base.join(names.1))
+        && !same_directory(&base.join(names.0), &base.join(names.1))
         && presence(&base.join(names.0), kind) == Presence::Established
         && presence(&base.join(names.1), kind) == Presence::Established
 }
@@ -549,20 +575,20 @@ pub fn two_established_setups() -> bool {
     let Ok(home) = home() else {
         return false;
     };
+    // An environment the resolvers reject (for example a relative
+    // `XDG_DATA_HOME`) is an invalid-override error, not two setups.
+    let (Ok(explicit_config), Ok(xdg_config), Ok(explicit_data), Ok(xdg_data)) = (
+        absolute_env(CONFIG_ROOT_OVERRIDE_ENV, "config"),
+        absolute_env("XDG_CONFIG_HOME", "config"),
+        absolute_env(DATA_ROOT_OVERRIDE_ENV, "data"),
+        absolute_env("XDG_DATA_HOME", "data"),
+    ) else {
+        return false;
+    };
     two_established_setups_in(
         &home,
-        (
-            env::var_os(CONFIG_ROOT_OVERRIDE_ENV)
-                .map(PathBuf::from)
-                .as_deref(),
-            env::var_os("XDG_CONFIG_HOME").map(PathBuf::from).as_deref(),
-        ),
-        (
-            env::var_os(DATA_ROOT_OVERRIDE_ENV)
-                .map(PathBuf::from)
-                .as_deref(),
-            env::var_os("XDG_DATA_HOME").map(PathBuf::from).as_deref(),
-        ),
+        (explicit_config.as_deref(), xdg_config.as_deref()),
+        (explicit_data.as_deref(), xdg_data.as_deref()),
     )
 }
 
@@ -1020,6 +1046,116 @@ mod tests {
             assert_eq!(tree(&home), before, "{name} must be left untouched");
             let _ = std::fs::remove_dir_all(&home);
         }
+    }
+
+    /// `archivefs -> emuwiz` or `emuwiz -> archivefs`: one setup under two
+    /// names, never a two-setup refusal (as before this change).
+    #[cfg(unix)]
+    #[test]
+    fn a_symlink_pair_naming_one_directory_is_one_setup() {
+        for legacy_is_link in [true, false] {
+            let home = home_with(&format!("symlink-pair-{legacy_is_link}"), &[]);
+            legacy_install(&home);
+            put(
+                &home,
+                &[".config", "archivefs", "launch_preferences.json"],
+                "{}",
+            );
+            for base in [".config", ".local/share"] {
+                let real = home.join(base).join(if legacy_is_link {
+                    "emuwiz"
+                } else {
+                    "archivefs"
+                });
+                let link = home.join(base).join(if legacy_is_link {
+                    "archivefs"
+                } else {
+                    "emuwiz"
+                });
+                if legacy_is_link {
+                    std::fs::rename(home.join(base).join("archivefs"), &real).unwrap();
+                }
+                std::os::unix::fs::symlink(&real, &link).unwrap();
+            }
+            assert_eq!(config_dir_in(&home).unwrap(), home.join(".config/emuwiz"));
+            assert_eq!(
+                data_dir_in(&home).unwrap(),
+                home.join(".local/share/emuwiz")
+            );
+            assert!(!two_established_setups_in(
+                &home,
+                (None, None),
+                (None, None)
+            ));
+            assert!(data_dir_in(&home).unwrap().join("library.sqlite3").exists());
+            let _ = std::fs::remove_dir_all(&home);
+        }
+
+        // A symlink to some other populated directory is not proven the
+        // same: it stays a refusal (fail closed).
+        let home = home_with("symlink-other", &[&["elsewhere"]]);
+        legacy_install(&home);
+        put(&home, &["elsewhere", "library.sqlite3"], "other-db");
+        std::os::unix::fs::symlink(home.join("elsewhere"), home.join(".local/share/emuwiz"))
+            .unwrap();
+        assert!(data_dir_in(&home).is_err());
+        let _ = std::fs::remove_dir_all(&home);
+    }
+
+    /// Save snapshots, PS2 restore journals, rename/Undo journals (sealed and
+    /// pre-seal) and Undo seals stay visible: in a new folder they make it a
+    /// setup of its own (refused beside legacy, never hidden); in the legacy
+    /// folder they keep it selected, across restarts.
+    #[test]
+    fn save_snapshots_restore_journals_and_undo_records_stay_discoverable() {
+        use crate::dat::rename_apply::journal::{
+            LEGACY_RENAME_TRANSACTIONS_DIRECTORY, RENAME_TRANSACTIONS_DIRECTORY,
+        };
+        let records: [&[&str]; 4] = [
+            &["snapshots", "game", "1.json"],
+            &["ps2-restore-journals", "r.json"],
+            &[RENAME_TRANSACTIONS_DIRECTORY, "t.json"],
+            &[LEGACY_RENAME_TRANSACTIONS_DIRECTORY, "t.json"],
+        ];
+        for (index, record) in records.iter().enumerate() {
+            // In the new folder beside an established legacy one: refused.
+            let home = home_with(&format!("records-new-{index}"), &[]);
+            legacy_install(&home);
+            startup_leftovers(&home);
+            let parts: Vec<&str> = [".local", "share", "emuwiz"]
+                .iter()
+                .chain(record.iter())
+                .copied()
+                .collect();
+            put(&home, &parts, "record");
+            assert!(data_dir_in(&home).is_err(), "{record:?} must not be hidden");
+            assert!(two_established_setups_in(&home, (None, None), (None, None)));
+            let _ = std::fs::remove_dir_all(&home);
+
+            // In the legacy folder with a stray empty new one: legacy chosen,
+            // and the record resolves there on every start.
+            let home = home_with(&format!("records-legacy-{index}"), &[]);
+            legacy_install(&home);
+            startup_leftovers(&home);
+            let parts: Vec<&str> = [".local", "share", "archivefs"]
+                .iter()
+                .chain(record.iter())
+                .copied()
+                .collect();
+            put(&home, &parts, "record");
+            for _ in 0..3 {
+                let data = data_dir_in(&home).unwrap();
+                assert_eq!(data, home.join(".local/share/archivefs"));
+                assert!(data.join(record.iter().collect::<PathBuf>()).exists());
+            }
+            let _ = std::fs::remove_dir_all(&home);
+        }
+        // Undo seals: a seal store with a seal in the new folder is refused.
+        let home = home_with("records-seals", &[]);
+        legacy_install(&home);
+        drop(seal_store(&home.join(".local/share/emuwiz"), 1));
+        assert!(data_dir_in(&home).is_err());
+        let _ = std::fs::remove_dir_all(&home);
     }
 
     /// A truncated main file with the seal only in a WAL: SQLite would

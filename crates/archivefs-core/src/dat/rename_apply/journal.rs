@@ -358,6 +358,10 @@ fn check_finalise_transition(path: &Path, next: &RenameTransaction) -> Result<()
     }
 }
 
+/// Refusal for a journal folder that is not an absolute path: a relative
+/// (or empty) one would be resolved against the working directory.
+pub const JOURNAL_DIR_UNAVAILABLE: &str = "EmuWiz could not find its data folder, so no Undo journal can be written and nothing was changed. Open Setup to see why (for example, two existing setups were found) and choose one first.";
+
 /// Writes (or rewrites) a transaction journal through owned exclusive staging,
 /// file `sync_all`, atomic replacement and best-effort parent-directory sync.
 /// This is not a universal durable-commit or cross-process exclusion guarantee.
@@ -367,6 +371,9 @@ fn check_finalise_transition(path: &Path, next: &RenameTransaction) -> Result<()
 /// before the write and committed after it. A changed, missing or legacy
 /// unsealed journal is refused and left exactly as found.
 pub fn write_journal(dir: &Path, transaction: &RenameTransaction) -> Result<(), ArchiveFsError> {
+    if !dir.is_absolute() {
+        return Err(ArchiveFsError::Config(JOURNAL_DIR_UNAVAILABLE.into()));
+    }
     #[cfg(target_os = "linux")]
     if super::compact_recovery::is_enrolled(dir, &transaction.transaction_id) {
         return Err(ArchiveFsError::Config(
@@ -736,6 +743,18 @@ mod tests {
                 .join(".local/share/emuwiz")
                 .join(RENAME_TRANSACTIONS_DIRECTORY)
         );
+    }
+
+    /// An unresolvable data folder must never turn into a journal folder
+    /// relative to the working directory.
+    #[test]
+    fn a_relative_or_empty_journal_folder_is_refused_and_nothing_is_created() {
+        let transaction = transaction(TransactionState::Planned);
+        for dir in [Path::new(""), Path::new(RENAME_TRANSACTIONS_DIRECTORY)] {
+            let error = write_journal(dir, &transaction).unwrap_err().to_string();
+            assert!(error.contains(JOURNAL_DIR_UNAVAILABLE), "{error}");
+        }
+        assert!(!Path::new(RENAME_TRANSACTIONS_DIRECTORY).exists());
     }
 
     #[test]

@@ -1138,7 +1138,8 @@ pub(super) fn create_mount_root_at(expected: &Path) -> Result<(), String> {
 }
 
 fn preferences_path() -> Result<PathBuf, String> {
-    archivefs_core::app_dirs::config_path("gui-v2.json").map_err(|error| error.to_string())
+    archivefs_core::app_dirs::config_path(archivefs_core::app_dirs::GUI_PREFERENCES_FILE)
+        .map_err(|error| error.to_string())
 }
 
 pub(super) fn save_preferences(path: &Path, preferences: &Preferences) -> Result<(), String> {

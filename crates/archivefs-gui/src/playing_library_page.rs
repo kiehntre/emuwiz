@@ -259,9 +259,7 @@ impl Default for PlayingLibraryPageState {
             applied_plan: None,
             apply_error: None,
             apply_error_is_undo: false,
-            journal_dir: default_rename_transaction_dir().unwrap_or_else(|_| {
-                PathBuf::from(archivefs_core::dat::rename_apply::RENAME_TRANSACTIONS_DIRECTORY)
-            }),
+            journal_dir: resolved_journal_dir(),
             async_busy: false,
             apply_stage: Arc::new(AtomicU8::new(0)),
             esde_platform_id: None,
@@ -1156,6 +1154,11 @@ impl PlayingLibraryPageState {
                 return;
             }
         };
+        if let Some(refusal) = journal_dir_refusal(&self.journal_dir) {
+            self.romm_error = Some(refusal);
+            self.romm_pending_apply = false;
+            return;
+        }
         if let Err(error) = std::fs::create_dir_all(&projection.romm_root) {
             self.romm_error = Some(format!("could not create the RomM destination: {error}"));
             return;
@@ -1289,6 +1292,11 @@ impl PlayingLibraryPageState {
                 "playing_library_profile".into(),
                 serde_json::Value::String("generic".into()),
             );
+        }
+        if let Some(refusal) = journal_dir_refusal(&self.journal_dir) {
+            self.apply_error = Some(refusal);
+            self.pending_apply = None;
+            return;
         }
         if let Err(error) = prepare_destination_root(&plan.destination_root) {
             self.apply_error = Some(format!("could not create the destination folder: {error}"));
@@ -3177,3 +3185,17 @@ fn show_esde_publish_section(
 
 #[cfg(test)]
 mod tests;
+
+/// The journal folder, or an empty path when the data folder cannot be
+/// resolved (for example two existing setups). Never a path relative to the
+/// working directory: core refuses to journal into a non-absolute folder, and
+/// this page refuses before creating anything (see `journal_dir_refusal`).
+fn resolved_journal_dir() -> PathBuf {
+    default_rename_transaction_dir().unwrap_or_default()
+}
+
+/// The actionable refusal when no absolute journal folder is available.
+fn journal_dir_refusal(journal_dir: &std::path::Path) -> Option<String> {
+    (!journal_dir.is_absolute())
+        .then(|| archivefs_core::dat::rename_apply::journal::JOURNAL_DIR_UNAVAILABLE.to_string())
+}
