@@ -198,14 +198,63 @@ check "outside a git worktree is a usage error (2)" test "$rc" = 2
 check "no cargo command is a usage error (2)" test "$rc" = 2
 check "--help works and exits 0" bash -c "'$iso' --help | grep -q 'unique to THIS git worktree'"
 
-# ---- incremental mode (opt-in; inherited CARGO_INCREMENTAL is otherwise untouched)
-(cd "$tmp/wt-one" && CARGO_INCREMENTAL=0 "$iso" check >/dev/null 2>&1)
-check "inherited CARGO_INCREMENTAL=0 is left alone by default" test "$(logged incremental)" = 0
-(cd "$tmp/wt-one" && CARGO_INCREMENTAL=0 "$iso" --incremental check >/dev/null 2>&1)
+# ---- incremental mode: one policy. explicit flag > EMUWIZ_CARGO_INCREMENTAL > worktree designation > off
+run1() { (cd "$tmp/wt-one" && "$@" >/dev/null 2>&1); }
+inc_file="$EMUWIZ_TARGET_ROOT.incremental-mode/$(basename "$t1")"
+run1 env CARGO_INCREMENTAL=0 "$iso" check
+check "undesignated: inherited CARGO_INCREMENTAL=0 is left alone" test "$(logged incremental)" = 0
+run1 env -u CARGO_INCREMENTAL "$iso" check
+check "undesignated: CARGO_INCREMENTAL stays unset" test "$(logged incremental)" = "<unset>"
+run1 env CARGO_INCREMENTAL=0 "$iso" --incremental check
 check "--incremental sets CARGO_INCREMENTAL=1" test "$(logged incremental)" = 1
 check "--incremental is not passed on to cargo" bash -c "! grep -q 'incremental' <(grep '^arg' '$FAKE_CARGO_LOG')"
-(cd "$tmp/wt-one" && CARGO_INCREMENTAL=0 EMUWIZ_CARGO_INCREMENTAL=1 "$iso" check >/dev/null 2>&1)
+run1 env CARGO_INCREMENTAL=0 EMUWIZ_CARGO_INCREMENTAL=1 "$iso" check
 check "EMUWIZ_CARGO_INCREMENTAL=1 does the same" test "$(logged incremental)" = 1
+run1 env EMUWIZ_CARGO_INCREMENTAL=true CARGO_INCREMENTAL=0 "$iso" check
+check "a malformed EMUWIZ_CARGO_INCREMENTAL is ignored, as before" test "$(logged incremental)" = 0
+(cd "$tmp/wt-one" && EMUWIZ_CARGO_INCREMENTAL=true "$iso" --print-target >/dev/null 2>&1); rc=$?
+check "a malformed EMUWIZ_CARGO_INCREMENTAL does not break --print-target" test "$rc" = 0
+run1 env CARGO_INCREMENTAL=1 "$iso" --no-incremental check
+check "--no-incremental forces CARGO_INCREMENTAL=0 over an inherited 1" test "$(logged incremental)" = 0
+run1 env CARGO_INCREMENTAL=1 EMUWIZ_CARGO_INCREMENTAL=0 "$iso" check
+check "EMUWIZ_CARGO_INCREMENTAL=0 forces 0 over an inherited 1" test "$(logged incremental)" = 0
+run1 env CARGO_INCREMENTAL=1 "$iso" check
+check "undesignated, no choice: an inherited 1 is left alone" test "$(logged incremental)" = 1
+check "--print-target says incremental is off by default" bash -c "cd '$tmp/wt-one' && '$iso' --print-target | grep -q '^incremental: off (default'"
+
+(cd "$tmp/wt-one" && "$iso" --designate-dev >/dev/null 2>&1); rc=$?
+check "--designate-dev succeeds and runs no cargo" test "$rc" = 0
+check "--designate-dev records outside the target" test "$(cat "$inc_file")" = on
+check "--print-target reports the designation" bash -c "cd '$tmp/wt-one' && '$iso' --print-target | grep -q '^incremental: on (designated'"
+run1 env CARGO_INCREMENTAL=0 "$iso" check
+check "designated: incremental is on despite inherited CARGO_INCREMENTAL=0" test "$(logged incremental)" = 1
+run1 env -u CARGO_INCREMENTAL "$iso" check
+check "designated: incremental is on with nothing inherited" test "$(logged incremental)" = 1
+run1 env CARGO_INCREMENTAL=0 "$iso" --no-incremental check
+check "designated: --no-incremental opts out (inherited value untouched)" test "$(logged incremental)" = 0
+check "--no-incremental is not passed on to cargo" bash -c "! grep -q 'incremental' <(grep '^arg' '$FAKE_CARGO_LOG')"
+run1 env EMUWIZ_CARGO_INCREMENTAL=0 CARGO_INCREMENTAL=0 "$iso" check
+check "designated: EMUWIZ_CARGO_INCREMENTAL=0 leaves inherited 0" test "$(logged incremental)" = 0
+run1 env EMUWIZ_CARGO_INCREMENTAL=0 "$iso" --incremental check
+check "the command line beats the environment" test "$(logged incremental)" = 1
+check "another worktree is not affected by the designation" bash -c "cd '$tmp/wt two (odd) \$name' && CARGO_INCREMENTAL=0 '$iso' check >/dev/null 2>&1 && test \"\$(sed -n 's/^incremental=//p' '$FAKE_CARGO_LOG')\" = 0"
+printf 'garbage\n' >"$inc_file"
+run1 env CARGO_INCREMENTAL=0 "$iso" check
+check "an invalid designation record fails closed (off)" test "$(logged incremental)" = 0
+for combo in "--print-target" "--finish-task" "build"; do
+  (cd "$tmp/wt-one" && "$iso" --designate-dev $combo >/dev/null 2>&1); rc=$?
+  check "--designate-dev with '$combo' is refused (2)" test "$rc" = 2
+done
+(cd "$tmp/wt-one" && "$iso" --undesignate-dev build >/dev/null 2>&1); rc=$?
+check "--undesignate-dev with a cargo command is refused (2)" test "$rc" = 2
+rm -f "$inc_file"; ln -s /etc/hostname "$inc_file"
+run1 env CARGO_INCREMENTAL=0 "$iso" check
+check "a symlinked designation record is ignored (off)" test "$(logged incremental)" = 0
+rm -f "$inc_file"
+(cd "$tmp/wt-one" && "$iso" --designate-dev >/dev/null 2>&1 && "$iso" --undesignate-dev >/dev/null 2>&1); rc=$?
+check "--undesignate-dev succeeds" test "$rc" = 0
+run1 env CARGO_INCREMENTAL=0 "$iso" check
+check "--undesignate-dev returns the worktree to non-incremental" test "$(logged incremental)" = 0
 
 # ---- sccache mode (opt-in)
 fakebin="$tmp/fakebin"; mkdir -p "$fakebin"; printf '#!/bin/sh\nexit 0\n' >"$fakebin/sccache"; chmod +x "$fakebin/sccache"
@@ -222,6 +271,19 @@ check "--sccache keeps the per-worktree target" test "$(logged target)" = "$t1"
 check "--sccache is not passed on to cargo" bash -c "! grep -q 'sccache' <(grep '^arg' '$FAKE_CARGO_LOG')"
 (cd "$tmp/wt-one" && PATH="$fakebin:$PATH" "$iso" --sccache --incremental check >/dev/null 2>&1); rc=$?
 check "--sccache with --incremental is refused (2)" test "$rc" = 2
+(cd "$tmp/wt-one" && "$iso" --designate-dev >/dev/null 2>&1)
+(cd "$tmp/wt-one" && PATH="$fakebin:$PATH" CARGO_INCREMENTAL=1 "$iso" --sccache check >/dev/null 2>&1); rc=$?
+check "designated + --sccache runs (not an error)" test "$rc" = 0
+check "designated + --sccache is built non-incremental" test "$(logged incremental)" = 0
+check "designated + --sccache still sets RUSTC_WRAPPER" test "$(logged wrapper)" = "$fakebin/sccache"
+(cd "$tmp/wt-one" && PATH="$fakebin:$PATH" "$iso" --sccache --incremental check >/dev/null 2>&1); rc=$?
+check "designated + --sccache + --incremental is still refused (2)" test "$rc" = 2
+(cd "$tmp/wt-one" && PATH="$fakebin:$PATH" EMUWIZ_CARGO_INCREMENTAL=1 "$iso" --sccache check >/dev/null 2>&1); rc=$?
+check "--sccache + EMUWIZ_CARGO_INCREMENTAL=1 is refused (2)" test "$rc" = 2
+(cd "$tmp/wt-one" && PATH="$fakebin:$PATH" "$iso" --sccache --no-incremental check >/dev/null 2>&1); rc=$?
+check "--sccache + --no-incremental runs" test "$rc" = 0
+check "--print-target explains designated + --sccache" bash -c "cd '$tmp/wt-one' && PATH='$fakebin:'\$PATH '$iso' --sccache --print-target | grep -q 'incremental: off (designated, but --sccache'"
+(cd "$tmp/wt-one" && "$iso" --undesignate-dev >/dev/null 2>&1)
 (cd "$tmp/wt-one" && PATH="/usr/bin-none:$PATH" EMUWIZ_CARGO_SCCACHE=0 "$iso" check >/dev/null 2>&1); rc=$?
 check "EMUWIZ_CARGO_SCCACHE=0 is the default" test "$rc" = 0
 (cd "$tmp/wt-one" && PATH="$fakebin:$PATH" EMUWIZ_SCCACHE_SIZE=lots "$iso" --sccache check >/dev/null 2>&1); rc=$?

@@ -35,8 +35,14 @@
 #                    EMUWIZ_CARGO_LOW_DEBUG=1. The default for a NEW target (see below)
 #   --full-debug     build with Cargo's normal debug info (for a debugger or
 #                    line-numbered backtraces); also set by EMUWIZ_CARGO_FULL_DEBUG=1
-#   --incremental    enable incremental compilation for dev/test builds (see below);
+#   --incremental    force incremental compilation for this run (see below);
 #                    also set by EMUWIZ_CARGO_INCREMENTAL=1
+#   --no-incremental force it off for this run (exports CARGO_INCREMENTAL=0), even in a
+#                    designated worktree;
+#                    also set by EMUWIZ_CARGO_INCREMENTAL=0
+#   --designate-dev  mark THIS worktree as an active developer worktree: its builds
+#                    are incremental by default from now on. Runs no cargo
+#   --undesignate-dev  remove that mark (the target is kept as it is). Runs no cargo
 #   --sccache        route rustc through sccache with a dedicated, size-capped cache
 #                    shared by all worktrees (see below); also EMUWIZ_CARGO_SCCACHE=1
 #   --help           this text
@@ -46,7 +52,7 @@
 #   EMUWIZ_MIN_FREE_GB       minimum free GiB on the build disk (default 8)
 #   EMUWIZ_CARGO_LOW_DEBUG   1 = same as --low-debug
 #   EMUWIZ_CARGO_FULL_DEBUG  1 = same as --full-debug
-#   EMUWIZ_CARGO_INCREMENTAL 1 = same as --incremental
+#   EMUWIZ_CARGO_INCREMENTAL 1 = same as --incremental, 0 = same as --no-incremental
 #   EMUWIZ_CARGO_SCCACHE     1 = same as --sccache
 #   EMUWIZ_SCCACHE_DIR       sccache directory (default ~/.cache/emuwiz-sccache)
 #   EMUWIZ_SCCACHE_SIZE      cache size cap, e.g. 2G (default 2G)
@@ -67,12 +73,23 @@
 #     this record is built with the inherited settings exactly as before, unrecorded.
 # An unreadable record refuses the build (exit 3) unless a mode is given explicitly.
 #
-# Incremental builds: a shell that exports CARGO_INCREMENTAL=0 (older ~/.bashrc
-# files do) makes every edit recompile the whole crate. --incremental overrides
-# that to 1 for this run. Measured on archivefs-gui tests, an edit-to-rebuild took
-# ~92-104 s with it off and ~26-33 s with it on (after a one-off ~390 s priming
-# build), at the cost of roughly doubling that worktree's target size. Nothing is
-# changed unless you ask; keep one choice per worktree so the cache stays warm.
+# Incremental builds (ONE policy): whether a run is incremental is decided in this order,
+# first match wins:
+#   1. --incremental / --no-incremental on the command line;
+#   2. EMUWIZ_CARGO_INCREMENTAL=1 / 0 in the environment;
+#   3. this worktree's designation (--designate-dev), recorded outside every target in
+#      $EMUWIZ_TARGET_ROOT.incremental-mode/<target name> -> incremental ON;
+#   4. otherwise OFF (the default for review, verification, integration and short-lived
+#      worktrees, and for every worktree nobody designated).
+# A designation record that is unreadable or says anything but "on" is ignored (OFF).
+# Whatever is decided overrides an inherited CARGO_INCREMENTAL (older ~/.bashrc files
+# export CARGO_INCREMENTAL=0, which makes every edit recompile the whole crate). With a
+# decision of OFF that was not explicit the inherited value is left exactly as it was;
+# an explicit off (--no-incremental, EMUWIZ_CARGO_INCREMENTAL=0) exports CARGO_INCREMENTAL=0. Measured on
+# archivefs-gui tests (pilot 2026-11-04, load/pressure sampled, 5 runs): edit-to-rebuild
+# 97.5 s off vs 27.6-28.4 s on, after a one-off ~5 min priming build and roughly 3x the
+# target size (2.3 -> 6.9 GiB). Designate only the few worktrees you build in all day, and
+# keep one choice per worktree so its cache stays warm. Nothing is designated for you.
 #
 # sccache (--sccache): shares compiled dependency artefacts between worktrees
 # while every worktree keeps its own target directory. It sets RUSTC_WRAPPER for
@@ -80,7 +97,9 @@
 # own sccache is untouched), caps the cache (default 2G; sccache evicts its own
 # least-recently-used entries, never anything in a target), and forces
 # CARGO_INCREMENTAL=0 because sccache cannot cache incremental builds. It cannot be
-# combined with --incremental. It never starts or stops a server you did not need;
+# combined with an EXPLICIT incremental request (--incremental or EMUWIZ_CARGO_INCREMENTAL=1;
+# refused, exit 2). A worktree that is merely designated is built non-incremental under
+# --sccache, with a note. It never starts or stops a server you did not need;
 # it never deletes anything itself.
 #
 # Exit codes of its own: 2 usage/not a git worktree, 3 refused target,
@@ -100,14 +119,23 @@ if [ "${EMUWIZ_CARGO_FULL_DEBUG:-0}" = "1" ]; then
   [ -n "$debug_choice" ] && { echo "cargo-iso: EMUWIZ_CARGO_LOW_DEBUG and EMUWIZ_CARGO_FULL_DEBUG are mutually exclusive" >&2; exit 2; }
   debug_choice=full
 fi
-incremental="${EMUWIZ_CARGO_INCREMENTAL:-0}"
+# incremental_choice: "" (undecided), 1 or 0. Command line beats environment.
+incremental_choice="${EMUWIZ_CARGO_INCREMENTAL:-}"
+case "$incremental_choice" in
+  ''|0|1) ;;
+  *) echo "cargo-iso: note: ignoring EMUWIZ_CARGO_INCREMENTAL='$incremental_choice' (only 0 or 1 are meaningful)" >&2; incremental_choice="" ;;
+esac
+designate=""
 use_sccache="${EMUWIZ_CARGO_SCCACHE:-0}"
 while [ $# -gt 0 ]; do
   case "$1" in
     --print-target) print_only=1; shift ;;
     --low-debug) debug_choice=low; shift ;;
     --full-debug) debug_choice=full; shift ;;
-    --incremental) incremental=1; shift ;;
+    --incremental) incremental_choice=1; shift ;;
+    --no-incremental) incremental_choice=0; shift ;;
+    --designate-dev) designate=on; shift ;;
+    --undesignate-dev) designate=off; shift ;;
     --sccache) use_sccache=1; shift ;;
     --finish-task) finish_task=1; shift ;;
     --task) task_name="${2:-}"; shift; [ $# -gt 0 ] && shift ;;
@@ -115,7 +143,7 @@ while [ $# -gt 0 ]; do
     *) break ;;
   esac
 done
-if [ "$print_only" -eq 0 ] && [ "$finish_task" -eq 0 ] && [ $# -eq 0 ]; then
+if [ "$print_only" -eq 0 ] && [ "$finish_task" -eq 0 ] && [ -z "$designate" ] && [ $# -eq 0 ]; then
   echo "cargo-iso: no cargo command given (try --help)" >&2
   exit 2
 fi
@@ -196,6 +224,43 @@ else
   debug_mode=inherited; debug_why="existing target without a record; unchanged"
 fi
 
+# Incremental decision (see the header). Read-only here.
+inc_file="$root.incremental-mode/$name-$hash"
+designated=0
+if [ -f "$inc_file" ] && [ ! -L "$inc_file" ] && [ "$(cat -- "$inc_file" 2>/dev/null)" = on ]; then
+  designated=1
+fi
+if [ -n "$incremental_choice" ]; then
+  incremental=$incremental_choice; incremental_why="explicit"; inc_explicit=1
+elif [ "$designated" -eq 1 ]; then
+  incremental=1; incremental_why="designated developer worktree"; inc_explicit=0
+else
+  incremental=0; incremental_why="default (not designated)"; inc_explicit=0
+fi
+# A designated worktree under --sccache is built non-incremental (sccache cannot cache
+# incremental builds); only an explicit incremental request conflicts with it.
+if [ "$use_sccache" = "1" ] && [ "$inc_explicit" -eq 0 ] && [ "$incremental" = "1" ]; then
+  incremental=0; incremental_why="designated, but --sccache needs non-incremental"
+fi
+
+if [ -n "$designate" ]; then
+  if [ "$print_only" -eq 1 ] || [ "$finish_task" -eq 1 ] || [ $# -gt 0 ]; then
+    echo "cargo-iso: --designate-dev/--undesignate-dev cannot be combined with --print-target, --finish-task or a cargo command" >&2
+    exit 2
+  fi
+  if [ -d "$inc_file" ]; then echo "cargo-iso: $inc_file is a directory; refusing" >&2; exit 3; fi
+  # Record or remove the designation. Touches only the record, never a target, and runs no cargo.
+  { mkdir -p -- "$(dirname "$inc_file")" &&
+    printf '%s\n' "$designate" >"$inc_file.tmp.$$" && mv -f -- "$inc_file.tmp.$$" "$inc_file"; } 2>/dev/null || {
+    echo "cargo-iso: could not record the designation in $inc_file" >&2; exit 3; }
+  if [ "$designate" = on ]; then
+    echo "cargo-iso: $top is a designated developer worktree: builds are incremental by default (opt out per run with --no-incremental)"
+  else
+    echo "cargo-iso: $top is no longer designated; builds are non-incremental by default (the target was not touched)"
+  fi
+  exit 0
+fi
+
 if [ "$finish_task" -eq 1 ]; then
   # The task is done: release this worktree's cache for automatic retirement.
   # Running a Cargo command to completion never does this by itself.
@@ -209,6 +274,7 @@ if [ "$print_only" -eq 1 ]; then
   echo "target:   $target"
   echo "free:     ${free_gb} GiB (minimum ${min_free_gb} GiB)"
   echo "debug:    $debug_mode ($debug_why)"
+  if [ "$incremental" = "1" ]; then echo "incremental: on ($incremental_why)"; else echo "incremental: off ($incremental_why)"; fi
   if [ -n "${CARGO_TARGET_DIR:-}" ] && [ "$(realpath -m "$CARGO_TARGET_DIR")" != "$(realpath -m "$target")" ]; then
     echo "inherited CARGO_TARGET_DIR=$CARGO_TARGET_DIR is overridden by this wrapper"
   fi
@@ -286,7 +352,7 @@ if [ "$debug_mode" = low ] || [ "$debug_mode" = full ]; then
   fi
 fi
 if [ "$use_sccache" = "1" ]; then
-  if [ "$incremental" = "1" ]; then
+  if [ "$inc_explicit" -eq 1 ] && [ "$incremental" = "1" ]; then
     echo "cargo-iso: --sccache and --incremental are mutually exclusive (sccache cannot cache incremental builds)" >&2
     exit 2
   fi
@@ -306,6 +372,8 @@ if [ "$use_sccache" = "1" ]; then
   export CARGO_INCREMENTAL=0
 elif [ "$incremental" = "1" ]; then
   export CARGO_INCREMENTAL=1
+elif [ "$inc_explicit" -eq 1 ]; then
+  export CARGO_INCREMENTAL=0
 fi
 # Lifecycle tracking (scripts/emuwiz-cargo-retention): holds a shared lock for
 # the whole build so the cache cannot be retired under it, and records who built
