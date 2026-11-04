@@ -214,6 +214,8 @@ pub struct AmigaDiskSetFacts {
     /// Disk numbers the set's own topology names as absent. A lone disk can
     /// still belong to a larger, incomplete set.
     pub missing: usize,
+    /// This entry's own file is one of the unavailable disks.
+    pub this_disk_unavailable: bool,
 }
 
 /// Reads the discovered emulator profiles and, for an LHA/LZH package, the
@@ -500,36 +502,38 @@ pub fn assess_amiga_game(
             Some(Ok(_))
         );
     if let Some(disks) = disks.filter(|disks| disks.count > 1 || disks.missing > 0) {
-        // Gaps and unavailable siblings are claims about the proposed
-        // grouping, not about this disk: when the DAT proves this ADF is a
-        // whole game, say both and let Play rest on that proof (FS-UAE
-        // launches only this disk).
-        let (state, detail) = if dat_single_disk && (disks.missing > 0 || disks.problems > 0) {
+        // Grouping, gaps and unavailable siblings are claims about the
+        // proposed set, not about this disk: when the DAT proves this ADF is a
+        // whole game and its own file is still there, say both and let Play
+        // rest on that proof (FS-UAE launches only this disk).
+        let (state, detail) = if dat_single_disk && !disks.this_disk_unavailable {
             let mut grouping = Vec::new();
+            if disks.count > 1 {
+                grouping.push("puts this disk with other disk files".to_string());
+            }
             if disks.missing > 0 {
                 grouping.push(if disks.missing == 1 {
-                    "suggest 1 more disk is missing".to_string()
+                    "suggests 1 more disk is missing".to_string()
                 } else {
-                    format!("suggest {} more disks are missing", disks.missing)
+                    format!("suggests {} more disks are missing", disks.missing)
                 });
             }
             if disks.problems > 0 {
                 grouping.push(if disks.problems == 1 {
-                    "name 1 disk file that is not available".to_string()
+                    "names 1 disk file that is not available".to_string()
                 } else {
-                    format!("name {} disk files that are not available", disks.problems)
+                    format!("names {} disk files that are not available", disks.problems)
                 });
             }
+            let grouping = match grouping.split_last() {
+                Some((last, [])) => last.clone(),
+                Some((last, rest)) => format!("{} and {last}", rest.join(", ")),
+                None => String::new(),
+            };
             (
                 Warning,
                 format!(
-                    "File names {}{}, but this disk's DAT hash match is a complete single-disk game. Play uses this disk only.",
-                    if disks.count > 1 {
-                        "group this disk with others and "
-                    } else {
-                        ""
-                    },
-                    grouping.join(" and ")
+                    "The disk grouping {grouping}, but this disk's DAT hash match is a complete single-disk game. Play uses this disk only."
                 ),
             )
         } else if disks.missing > 0 {

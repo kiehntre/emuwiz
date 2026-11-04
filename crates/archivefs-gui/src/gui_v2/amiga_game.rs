@@ -95,6 +95,12 @@ pub(super) fn disk_facts(guidance: Option<&DiscGuidance>) -> Option<AmigaDiskSet
         order_verified: guidance.order_verified,
         problems: guidance.problems.len(),
         missing: guidance.missing_media.len(),
+        this_disk_unavailable: guidance.discs.iter().any(|disc| {
+            disc.this_entry
+                && disc.path.as_deref().is_none_or(|path| {
+                    std::fs::symlink_metadata(path).map_or(true, |m| !m.is_file())
+                })
+        }),
     })
 }
 

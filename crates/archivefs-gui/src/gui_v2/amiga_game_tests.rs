@@ -336,7 +336,7 @@ fn a_dat_proven_disk_in_an_incomplete_name_group_keeps_both_claims_apart() {
         alone.check(AmigaCheckKind::Play)
     );
     let (text, _) = rendered(&grouped);
-    assert!(text.contains("suggest 1 more disk is missing"), "{text}");
+    assert!(text.contains("The disk grouping puts this disk with other disk files and suggests 1 more disk is missing"), "{text}");
     assert!(text.contains("complete single-disk game"), "{text}");
     assert!(text.contains("Play uses this disk only"), "{text}");
     assert!(!text.contains("Play stays unavailable"), "{text}");
@@ -345,6 +345,7 @@ fn a_dat_proven_disk_in_an_incomplete_name_group_keeps_both_claims_apart() {
 #[test]
 fn a_dat_proven_disk_with_an_unavailable_sibling_keeps_its_play_claim() {
     use crate::multidisc_launch_view::{MultiDiscLaunchContext, guidance, sets_from, tests};
+    let guidance_fn = guidance;
     let root = tests::temp_root("amiga-proven-unavailable");
     let paths: Vec<PathBuf> = ["Game (Disk 1 of 2).adf", "Game (Disk 2 of 2).adf"]
         .iter()
@@ -390,6 +391,28 @@ fn a_dat_proven_disk_with_an_unavailable_sibling_keeps_its_play_claim() {
     assert!(text.contains("1 disk file that is not available"), "{text}");
     assert!(text.contains("complete single-disk game"), "{text}");
     assert!(!text.contains("Play stays unavailable"), "{text}");
+
+    assert!(!text.contains("File names"), "{text}");
+
+    // If this disk itself is the one that vanished, the card blocks again.
+    std::fs::write(&paths[1], [0u8; 16]).unwrap();
+    std::fs::remove_file(&paths[0]).unwrap();
+    let guidance_self = guidance_fn(&context.sets[0], &paths[0], None);
+    let facts_self = disk_facts(Some(&guidance_self)).unwrap();
+    assert!(facts_self.this_disk_unavailable, "{guidance_self:?}");
+    let gone = assess_amiga_game(
+        AmigaCdMachine::OrdinaryAmiga,
+        &paths[0],
+        false,
+        Some(facts_self),
+        Some(&proven),
+    );
+    assert_eq!(
+        gone.check(AmigaCheckKind::Disks).map(|row| row.state),
+        Some(AmigaCheckState::Blocked)
+    );
+    std::fs::write(&paths[0], [0u8; 16]).unwrap();
+    std::fs::remove_file(&paths[1]).unwrap();
 
     // Without DAT proof the unavailable sibling still blocks the card.
     let unproven = assess_amiga_game(
