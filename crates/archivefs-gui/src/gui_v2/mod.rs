@@ -370,6 +370,8 @@ pub(super) struct App {
     imagery: imagery::Imagery,
     load_job: Option<u64>,
     artwork_job: Option<u64>,
+    /// Picture totals for this session, shown on one grouped Activity entry.
+    artwork_totals: activity::ArtworkTotals,
     index_job: Option<u64>,
     /// How many shelf cards Browse & Play draws, and the scope it was chosen for.
     browse_play: browse_play::BrowsePlayState,
@@ -504,6 +506,7 @@ impl App {
             imagery: imagery::Imagery::default(),
             load_job: None,
             artwork_job: None,
+            artwork_totals: activity::ArtworkTotals::default(),
             index_job: None,
             browse_play: Default::default(),
             batch_selection: multi_selection::MultiSelection::with_limit(
@@ -2310,10 +2313,21 @@ impl App {
     fn finish_frame(&mut self) {
         self.artwork.end_frame();
         if self.artwork.active() > 0 && self.artwork_job.is_none() {
-            let id = self
-                .activity
-                .queue("Loading artwork", Route::Section(Section::Games), true);
-            self.activity.start(id);
+            // Every batch of on-screen pictures reuses one grouped entry, so
+            // scrolling never stacks up repeated "Loading artwork" rows.
+            let id = match self.artwork_totals.entry {
+                Some(id) if self.activity.reopen(id, "Loading artwork") => id,
+                _ => {
+                    let id = self.activity.queue(
+                        "Loading artwork",
+                        Route::Section(Section::Games),
+                        true,
+                    );
+                    self.activity.start(id);
+                    self.artwork_totals.entry = Some(id);
+                    id
+                }
+            };
             self.artwork_job = Some(id);
         }
         if let Some(id) = self.artwork_job {
@@ -2333,17 +2347,31 @@ impl App {
                 }
             }
             if self.artwork.active() == 0 {
-                let summary = format!(
-                    "{} picture requests finished; {} cancelled off screen; {} pictures could not load. Games remain available. Open a game to retry an unavailable picture.",
-                    self.artwork.completed, self.artwork.cancelled, self.artwork.failures
+                self.artwork_totals.add(
+                    self.artwork.completed,
+                    self.artwork.cancelled,
+                    self.artwork.failures,
                 );
-                self.activity.finish(
-                    id,
-                    summary,
-                    (self.artwork.failures > 0).then(|| {
-                        "Per-picture errors and timings are in the game's Advanced details.".into()
-                    }),
-                );
+                // Missing pictures are minor: the entry finishes (it is not
+                // pending work and not a global "Needs attention"), while the
+                // summary and technical note keep the truthful failure count.
+                let stopped = self.activity.jobs.get(&id).is_some_and(|job| {
+                    job.cancel
+                        .as_ref()
+                        .is_some_and(|flag| flag.load(std::sync::atomic::Ordering::Relaxed))
+                });
+                if stopped {
+                    // Cancel still reads "Stopped", as before.
+                    self.activity
+                        .finish(id, self.artwork_totals.summary(), None);
+                } else {
+                    self.activity.finish_minor(
+                        id,
+                        ARTWORK_FINISHED_TITLE,
+                        self.artwork_totals.summary(),
+                        self.artwork_totals.technical(),
+                    );
+                }
                 self.artwork_job = None;
                 self.artwork.requested = 0;
                 self.artwork.completed = 0;
@@ -2353,6 +2381,9 @@ impl App {
         }
     }
 }
+
+/// The grouped artwork entry's title once no pictures are loading.
+pub(super) const ARTWORK_FINISHED_TITLE: &str = "Artwork";
 
 impl eframe::App for App {
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {

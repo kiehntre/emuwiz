@@ -89,10 +89,10 @@ fn blue_polish_long_recent_title_keeps_home_actions_compact_and_keyboard_reachab
         render(vec![key(egui::Key::Enter)]);
         assert_eq!(app.router.current, Route::Game(1));
         assert!(
-            app.activity
-                .jobs
-                .values()
-                .all(|job| matches!(job.title.as_str(), "Preparing artwork" | "Loading artwork")),
+            app.activity.jobs.values().all(|job| matches!(
+                job.title.as_str(),
+                "Preparing artwork" | "Loading artwork" | super::super::ARTWORK_FINISHED_TITLE
+            )),
             "Opening details must not launch, verify or mutate games"
         );
     }

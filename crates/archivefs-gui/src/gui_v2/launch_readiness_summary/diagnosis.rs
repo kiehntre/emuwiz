@@ -113,7 +113,7 @@ fn describe(cause: Cause) -> (&'static str, &'static str, Option<ReadinessAction
         ),
         Cause::IdentityNotConfirmed => (
             "This exact game isn't confirmed yet",
-            "EmuWiz can't confirm which release this is, and launching needs that to choose safe settings.",
+            "EmuWiz can't tell from this file's own evidence which game it is, and launching needs that to choose safe settings. Optional catalogue (DAT) verification is separate and is not what is stopping Play. Review identity shows what EmuWiz thinks it is.",
             Some(ReadinessAction::ReviewIdentity),
         ),
         Cause::EmulatorMissing => (
