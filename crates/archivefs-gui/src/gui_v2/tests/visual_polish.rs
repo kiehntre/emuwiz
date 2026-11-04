@@ -107,6 +107,7 @@ fn visual_polish_game_detail_actions_have_equal_bounds() {
     let context = egui::Context::default();
     let mut app = populated(&context);
     app.router.current = Route::Game(2);
+    super::panel_pending(&mut app, 2);
     for _ in 0..3 {
         frame(&context, &mut app, [1920.0, 1080.0]);
     }
@@ -131,7 +132,7 @@ fn visual_polish_game_detail_actions_have_equal_bounds() {
             .min_by(|a, b| a.area().total_cmp(&b.area()))
             .expect("button background")
     };
-    let verify = button("Verify");
+    let verify = button("Verify this game");
     for label in [
         "Artwork, Manuals & Extras",
         "Mods & Cheats",

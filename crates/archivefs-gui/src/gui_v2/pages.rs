@@ -2059,7 +2059,7 @@ impl App {
             .open(Target::of(&game), game_dat_check::load_inputs);
         match game_dat_check::show(ui, &mut self.game_dat_check, id) {
             Some(PageAction::BackToGame) => self.go(Route::Game(id)),
-            Some(PageAction::CheckWholePlatform) => self.go(
+            Some(PageAction::CheckWholePlatform) => self.go_verification(
                 super::identity_review_page::setup_verification_route(Some(&game.platform)),
             ),
             Some(PageAction::SetUpCatalogues) => self.go(Route::Section(Section::Dat)),
@@ -3230,7 +3230,17 @@ impl App {
                     "Needs attention · game file changed since the last scan",
                 );
             }
-            if detail.saved_checks > 0 && ui.button("View verification result").clicked() {
+            // This opens the whole system's Check Games tally, not this
+            // game's saved result (the card's "View verification result"
+            // opens that), so it is named for where it goes.
+            if detail.saved_checks > 0
+                && ui
+                    .button(system_check_summary_label(&game.platform))
+                    .on_hover_text(
+                        "Opens Check Games for every game on this system. This game's own saved result is shown on its verification card.",
+                    )
+                    .clicked()
+            {
                 // Keep this game and its system: Check Games otherwise opens
                 // on whichever platform was chosen last (or none), and the
                 // person has to find their way back to the game they came from.
@@ -3275,8 +3285,29 @@ impl App {
             .min(ui.available_width());
         let button_height = if short_window(ui.ctx()) { 52.0 } else { 64.0 };
         ui.horizontal_wrapped(|ui| {
+            // This game only, through the existing one-game DAT check (or the
+            // existing system choice when the game has no known system). That
+            // page explains a missing catalogue and links DAT Management.
+            // Read the card's answer first, so this label and the card's
+            // pointer to it agree on the frame that answer arrives.
+            self.review.verification_guidance.poll(game, ui.ctx());
+            let check = super::game_verification_guidance::Action::one_game_check(
+                game,
+                self.review.verification_guidance.result_for(id),
+            );
+            if ui
+                .add_sized(
+                    [button_width, button_height],
+                    egui::Button::new(check.label()).wrap(),
+                )
+                .on_hover_text("Checks only this game's file against a trusted catalogue. You see a preview first; the file is not read until you confirm.")
+                .clicked()
+            {
+                // No known system: Check Games opens on its system list, not
+                // on whichever system was chosen there last.
+                self.go_verification(check.route(game));
+            }
             for (label, section) in [
-                ("Verify", Section::Check),
                 ("Artwork, Manuals & Extras", Section::Artwork),
                 ("Mods & Cheats", Section::Mods),
                 ("Saves & States", Section::Saves),
@@ -3289,9 +3320,6 @@ impl App {
                     )
                     .clicked()
                 {
-                    if matches!(section, Section::Check) {
-                        self.check_platform = Some(game.platform.clone());
-                    }
                     self.go(Route::Task { section, game: id });
                 }
             }
@@ -3638,10 +3666,15 @@ impl App {
                 .review
                 .dat_context
                 .as_ref()
-                .map(|(_, platform)| platform.as_str());
-            self.go(super::identity_review_page::setup_verification_route(
-                platform,
-            ));
+                .map(|(_, platform)| platform.to_owned());
+            let route = super::identity_review_page::setup_verification_route(platform.as_deref());
+            if platform.is_some() {
+                // Opened for one game: a game whose system is unknown sees
+                // the system list, not a system chosen there earlier.
+                self.go_verification(route);
+            } else {
+                self.go(route);
+            }
         }
         if let Some((game, platform)) = self.review.dat_context.clone() {
             egui::Frame::group(ui.style()).show(ui, |ui| {
@@ -3659,7 +3692,12 @@ impl App {
                 self.go(Route::QuickRename);
             }
             if ui.button("Check Games").clicked() {
-                self.go(Route::Section(Section::Check));
+                if self.review.dat_context.is_some() {
+                    // Opened for one game: no stale system from earlier.
+                    self.go_verification(Route::Section(Section::Check));
+                } else {
+                    self.go(Route::Section(Section::Check));
+                }
             }
             if ui.button("Advanced Rename").clicked() {
                 self.go(Route::Section(Section::Build));
@@ -4348,5 +4386,16 @@ pub(super) fn escape_action(
         EscapeAction::LeaveFocus
     } else {
         EscapeAction::Back
+    }
+}
+
+/// Game Details' link to the system-wide Check Games tally. It must never
+/// share the card's "View verification result" label: that one opens this
+/// game's own saved result.
+pub(super) fn system_check_summary_label(platform: &str) -> String {
+    if platform.trim().is_empty() {
+        "View Check Games summary".into()
+    } else {
+        format!("View {platform} check summary")
     }
 }

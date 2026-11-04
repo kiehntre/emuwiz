@@ -44,6 +44,8 @@ const BIG_PICTURE: &str = "Big Picture";
 const SEARCH_MIN_WIDTH: f32 = 140.0;
 /// The button at the end of the systems row that opens the Surprise Me picker.
 pub(super) const SURPRISE_ME: &str = "Surprise me";
+/// The Library's way into the existing read-only Check Games workflow.
+pub(super) const VERIFY_GAMES: &str = "Verify Games";
 /// Below this height the selected-game panel uses the compact cover so Play
 /// stays beside it instead of below a tall picture.
 const TIGHT_PANEL_HEIGHT: f32 = 440.0;
@@ -780,6 +782,34 @@ impl App {
         }
     }
 
+    fn browse_play_verify_button(&mut self, ui: &mut egui::Ui) {
+        let hint = if self.filter.platform.is_empty() {
+            "Check your games against trusted catalogues. Opens Check Games; no game file is read until you preview and confirm.".to_string()
+        } else {
+            format!(
+                "Check your {} games against trusted catalogues. Opens Check Games; no game file is read until you preview and confirm.",
+                self.filter.platform
+            )
+        };
+        if ui.button(VERIFY_GAMES).on_hover_text(hint).clicked() {
+            self.open_verify_games();
+        }
+    }
+
+    /// Navigation only: the existing Check Games page, on the system chosen in
+    /// the Library when there is one, otherwise on its platform list. That
+    /// page owns the summary, catalogue setup, Preview and confirmation.
+    pub(super) fn open_verify_games(&mut self) {
+        let platform = self.filter.platform.clone();
+        if platform.is_empty() {
+            self.check_platform = None;
+            self.verification = None;
+            self.go(Route::Section(Section::Check));
+        } else {
+            self.check_platform(platform);
+        }
+    }
+
     fn browse_play_selection_toggle(&mut self, ui: &mut egui::Ui) {
         if ui
             .button(if self.batch_selecting {
@@ -856,6 +886,7 @@ impl App {
                         }
                     });
             }
+            self.browse_play_verify_button(ui);
             self.browse_play_surprise_button(ui);
         });
         if let Some(platform) = chosen {

@@ -678,7 +678,7 @@ pub(super) fn text(output: &egui::FullOutput) -> Vec<String> {
     texts
 }
 
-fn text_bounds(output: &egui::FullOutput, wanted: &str) -> Vec<egui::Rect> {
+pub(super) fn text_bounds(output: &egui::FullOutput, wanted: &str) -> Vec<egui::Rect> {
     fn gather(shape: &egui::Shape, wanted: &str, output: &mut Vec<egui::Rect>) {
         match shape {
             egui::Shape::Text(text) if text.galley.text() == wanted => {
@@ -4112,11 +4112,13 @@ fn gui_v2_game_detail_exposes_contextual_actions_and_lazy_screenshots() {
     let mut app = fixture(&context);
     app.library = Arc::new(Library::new(vec![archive(1, "Example Game", Some("PS2"))]));
     app.router.current = Route::Game(1);
+    // The card is still reading; no worker opens the real profile.
+    panel_pending(&mut app, 1);
     let texts = scrolled_text(&context, &mut app, [1280.0, 1200.0]);
     for label in [
         "Play",
         "Checking whether this game is ready",
-        "Verify",
+        "Verify this game",
         "Artwork, Manuals & Extras",
         "Mods & Cheats",
         "Fix Problems",
@@ -4148,6 +4150,8 @@ fn gui_v2_game_details_lead_with_title_and_play_and_keep_reference_material_last
         Some("Saturn"),
     )]));
     app.router.current = Route::Game(1);
+    // The card is still reading; no worker opens the real profile.
+    panel_pending(&mut app, 1);
     let output = frame(&context, &mut app, [1280.0, 2400.0]);
     let y = |label: &str| {
         bounds_below_chrome(&output, label)
@@ -4160,7 +4164,7 @@ fn gui_v2_game_details_lead_with_title_and_play_and_keep_reference_material_last
     let order = [
         y("Example Game"),
         y("Play"),
-        y("Verify"),
+        y("Verify this game"),
         y("Screenshots"),
         y("Disc & ROM evidence"),
         y("Advanced details"),
@@ -5224,15 +5228,17 @@ fn gui_v2_game_details_keep_artwork_actions_and_metadata_together() {
     let context = egui::Context::default();
     let mut app = visual_fixture(&context);
     app.go(Route::Game(1));
+    // The card is still reading; no worker opens the real profile.
+    panel_pending(&mut app, 1);
     let mut strings = text(&pump_imagery(&context, &mut app, [1280.0, 1200.0]));
-    assert!(strings.iter().any(|value| value == "Verify"));
+    assert!(strings.iter().any(|value| value == "Verify this game"));
     assert!(strings.iter().any(|value| value == "Open Folder"));
     // Screenshots may be below the fold after the upper guidance/readiness
     // content; they must remain reachable with ordinary page scrolling.
     let expected = [
         "Play",
         "PSX · Game image",
-        "Verify",
+        "Verify this game",
         "Open Folder",
         "No screenshots found for this game.",
     ];
@@ -8712,7 +8718,7 @@ fn panel_answered(app: &mut App, game: i64, reason: &'static str) {
 }
 
 /// This game's panel is still reading its saved evidence (no worker runs).
-fn panel_pending(app: &mut App, game: i64) {
+pub(super) fn panel_pending(app: &mut App, game: i64) {
     app.review
         .verification_guidance
         .set_for_test(game, None, None);
@@ -11415,6 +11421,7 @@ mod organisation_outcomes;
 mod simple_shell_ui;
 mod slice2b_layout;
 mod spectrum_preservation;
+mod verify_games_entry;
 
 mod duckstation_profile_resolution {
     use super::*;

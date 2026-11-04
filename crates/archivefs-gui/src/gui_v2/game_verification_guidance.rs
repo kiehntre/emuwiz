@@ -31,6 +31,23 @@ impl Action {
         }
     }
 
+    /// Game Details' always-visible per-game action: "Re-check" once any DAT
+    /// result is saved for this game (or its saved proof was invalidated, or
+    /// this panel's guidance already asks for a re-check), otherwise
+    /// "Verify". The label names the action only; the result shown stays the
+    /// engine's saved state.
+    pub(super) fn one_game_check(game: &Game, guidance: Option<&Guidance>) -> Self {
+        if game.dat_exact.is_some()
+            || game.dat_state.is_some()
+            || game.dat_proof_invalidated
+            || guidance.is_some_and(|guidance| guidance.action == Self::Recheck)
+        {
+            Self::Recheck
+        } else {
+            Self::Audit
+        }
+    }
+
     pub(super) fn route(self, game: &Game) -> super::routes::Route {
         use super::routes::{Route, Section};
         match self {
@@ -161,7 +178,7 @@ impl State {
             .flatten()
     }
 
-    fn poll(&mut self, game: &Game, context: &eframe::egui::Context) {
+    pub(super) fn poll(&mut self, game: &Game, context: &eframe::egui::Context) {
         if self.game != Some(game.archive.id) {
             self.invalidate();
             self.game = Some(game.archive.id);
@@ -527,22 +544,47 @@ impl super::App {
             ui.label("Reading saved evidence and catalogue status; no content audit is running.");
             return;
         };
-        if show(ui, &guidance) {
+        let one_game = Action::one_game_check(game, Some(&guidance));
+        if show(ui, &guidance, one_game) {
             if guidance.action == Action::Validate {
                 self.review.dat_context = Some((game.archive.id, game.platform.clone()));
             }
             // Navigation only: the existing workflow owns selection,
             // population preview and explicit audit confirmation.
-            self.go(guidance.action.route(game));
+            self.go_verification(guidance.action.route(game));
         }
+    }
+
+    /// Opens a verification route for a game. Check Games without a system
+    /// (where a game whose system is unknown is sent) opens on its system
+    /// list, never on a system chosen there earlier.
+    pub(super) fn go_verification(&mut self, route: super::routes::Route) {
+        use super::routes::{Route, Section};
+        if route == Route::Section(Section::Check) {
+            self.check_platform = None;
+            self.verification = None;
+        }
+        self.go(route);
     }
 }
 
-fn show(ui: &mut eframe::egui::Ui, guidance: &Guidance) -> bool {
+/// The card states the result and its evidence. Its own button is kept for
+/// setup and for opening a saved result; the one-game check itself has one
+/// button, `one_game`, under "More for this game", so the card points there
+/// instead of repeating it.
+fn show(ui: &mut eframe::egui::Ui, guidance: &Guidance, one_game: Action) -> bool {
     let outcome = Outcome::of(guidance.reason);
     ui.strong(format!("Verification: {}", outcome.headline()));
     ui.label(outcome.next_step());
-    let clicked = ui.button(guidance.action.label()).clicked();
+    let clicked = if matches!(guidance.action, Action::Audit | Action::Recheck) {
+        ui.label(format!(
+            "To check it, use {} under More for this game.",
+            one_game.label()
+        ));
+        false
+    } else {
+        ui.button(guidance.action.label()).clicked()
+    };
     ui.small(match guidance.action {
         Action::Review => "Opens this game's saved result.",
         _ => "You will see a preview first. Nothing is checked until you confirm.",

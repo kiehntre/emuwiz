@@ -355,6 +355,9 @@ pub(super) fn load_inputs() -> Result<Inputs, String> {
     })
 }
 
+/// Why an installed catalogue may still not be offered here, in plain words.
+pub(super) const MISSING_CATALOGUE_HELP: &str = "A catalogue is offered here only when it is enabled, has passed its catalogue check, is set to this game's system, and can check individual games (a folder of catalogues cannot). Set up verification opens DAT Management, where you can add a catalogue or choose its system. Having a catalogue installed does not verify any game.";
+
 pub(super) enum PageAction {
     BackToGame,
     CheckWholePlatform,
@@ -399,6 +402,7 @@ pub(super) fn show(
                     "No ready catalogue covers {}. Set one up first; nothing has been checked.",
                     target.platform
                 ));
+                ui.label(MISSING_CATALOGUE_HELP);
                 if ui.button("Set up verification").clicked() {
                     action = Some(PageAction::SetUpCatalogues);
                 }
