@@ -458,8 +458,17 @@ impl Artwork {
             .as_ref()
             .is_none_or(|sender| sender.send((self.generation, library, trim)).is_err())
         {
+            // The index worker has stopped and cannot restart, so drop its
+            // channel: callers can see that no index is coming this session
+            // instead of asking again on every frame.
+            self.index_requests = None;
             self.index_loading = false;
         }
+    }
+    /// The index worker has stopped, so no index will be built this session.
+    /// A surface that prepares the index on demand checks this before asking.
+    pub fn index_unavailable(&self) -> bool {
+        self.index_requests.is_none()
     }
     pub fn begin_frame(&mut self, context: &egui::Context) {
         self.frame += 1;
@@ -660,6 +669,13 @@ impl Artwork {
     }
     pub fn active(&self) -> usize {
         self.pending.len()
+    }
+    /// Stands in for an index worker thread that has died: the next index
+    /// request finds its channel closed, as it would in production.
+    #[cfg(test)]
+    pub(super) fn stop_index_worker_for_test(&mut self) {
+        let (sender, _) = mpsc::channel();
+        self.index_requests = Some(sender);
     }
 }
 
