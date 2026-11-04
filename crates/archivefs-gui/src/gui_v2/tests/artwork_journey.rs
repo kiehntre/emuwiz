@@ -404,8 +404,22 @@ fn a_stopped_artwork_indexer_is_asked_once_from_every_artwork_surface() {
             generation + 1,
             "{name}: the index was re-queued on every frame"
         );
+        // Nothing claims artwork is still being prepared or looked for.
+        let shown = text(&output);
+        for stale in ["Preparing artwork…", "Looking for screenshots…"] {
+            assert!(
+                !shown.iter().any(|value| value == stale),
+                "{name}: {stale:?} in {shown:?}"
+            );
+        }
+        if matches!(name, "Browse & Play" | "Surprise Me") {
+            assert!(
+                shown.iter().any(|value| value == "Pictures unavailable"),
+                "{name}: {shown:?}"
+            );
+        }
         // The pages about artwork say why nothing is shown.
-        if matches!(name, "Museum" | "Artwork") {
+        if matches!(name, "Museum" | "Artwork" | "Game Details") {
             assert!(
                 text(&output)
                     .iter()

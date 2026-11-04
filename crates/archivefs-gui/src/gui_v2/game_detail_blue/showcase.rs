@@ -247,10 +247,14 @@ impl App {
         ui.add_space(theme::SPACE_MD);
         ui.label(theme::section_title("Screenshots"));
         if self.artwork.index.is_none() {
-            ui.horizontal(|ui| {
-                ui.spinner();
-                ui.label("Looking for screenshots…");
-            });
+            if self.artwork.index_unavailable() {
+                ui.weak(crate::gui_v2::ARTWORK_STOPPED);
+            } else {
+                ui.horizontal(|ui| {
+                    ui.spinner();
+                    ui.label("Looking for screenshots…");
+                });
+            }
             return;
         }
         if count == 0 {
