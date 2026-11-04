@@ -3230,7 +3230,17 @@ impl App {
                     "Needs attention · game file changed since the last scan",
                 );
             }
-            if detail.saved_checks > 0 && ui.button("View verification result").clicked() {
+            // This opens the whole system's Check Games tally, not this
+            // game's saved result (the card's "View verification result"
+            // opens that), so it is named for where it goes.
+            if detail.saved_checks > 0
+                && ui
+                    .button(system_check_summary_label(&game.platform))
+                    .on_hover_text(
+                        "Opens Check Games for every game on this system. This game's own saved result is shown on its verification card.",
+                    )
+                    .clicked()
+            {
                 // Keep this game and its system: Check Games otherwise opens
                 // on whichever platform was chosen last (or none), and the
                 // person has to find their way back to the game they came from.
@@ -4376,5 +4386,16 @@ pub(super) fn escape_action(
         EscapeAction::LeaveFocus
     } else {
         EscapeAction::Back
+    }
+}
+
+/// Game Details' link to the system-wide Check Games tally. It must never
+/// share the card's "View verification result" label: that one opens this
+/// game's own saved result.
+pub(super) fn system_check_summary_label(platform: &str) -> String {
+    if platform.trim().is_empty() {
+        "View Check Games summary".into()
+    } else {
+        format!("View {platform} check summary")
     }
 }

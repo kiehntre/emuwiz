@@ -672,6 +672,66 @@ mod one_action_in_game_details {
     }
 
     #[test]
+    fn a_saved_result_and_the_system_tally_are_two_differently_named_links() {
+        let f = VerifiedGame::new();
+        let game = game(&f);
+        let card = panel(&f, &game);
+        assert_eq!(card.action, Action::Review, "{card:?}");
+        let id = game.archive.id;
+        let context = egui::Context::default();
+        let open = |context: &egui::Context| {
+            let mut app = details(context, f.library(), id, card.clone());
+            // What the detail loader reports for this fixture: one saved
+            // check of the same, unchanged file.
+            app.detail = Some(crate::gui_v2::library::Detail {
+                game: id,
+                file_present: true,
+                unchanged: true,
+                saved_checks: 1,
+                ..Default::default()
+            });
+            app
+        };
+        let mut app = open(&context);
+        let strings = shown(&context, &mut app);
+        let summary = crate::gui_v2::pages::system_check_summary_label("SNES");
+        assert_eq!(summary, "View SNES check summary");
+        assert_eq!(
+            count(&strings, "View verification result"),
+            1,
+            "{strings:?}"
+        );
+        assert_eq!(count(&strings, &summary), 1, "{strings:?}");
+
+        // The card's link opens this game's own saved result...
+        click(&context, &mut app, "View verification result");
+        assert_eq!(app.router.current, Route::ReviewIdentity(id));
+
+        // ...and the other opens the system-wide Check Games tally, on
+        // this game's system and marked as opened from it.
+        let mut app = open(&context);
+        app.check_platform = Some("Mega Drive".into());
+        shown(&context, &mut app);
+        click(&context, &mut app, &summary);
+        assert_eq!(
+            app.router.current,
+            Route::Task {
+                section: crate::gui_v2::routes::Section::Check,
+                game: id,
+            }
+        );
+        assert_eq!(app.check_platform.as_deref(), Some("SNES"));
+    }
+
+    #[test]
+    fn the_system_tally_link_is_named_even_without_a_system() {
+        assert_eq!(
+            crate::gui_v2::pages::system_check_summary_label(""),
+            "View Check Games summary"
+        );
+    }
+
+    #[test]
     fn a_missing_catalogue_keeps_set_up_verification_beside_the_one_check() {
         let f = scanned();
         let game = game(&f);
