@@ -289,11 +289,15 @@ fn checking_summary() -> GameReadinessSummary {
 fn identity_summary(conflicting: bool) -> GameReadinessSummary {
     base(
         ReadinessPresentationState::NeedsIdentityReview,
-        "This exact release is not confirmed",
         if conflicting {
-            "Evidence for this game conflicts and needs review before launch."
+            "This file's evidence points to different games"
         } else {
-            "EmuWiz cannot confirm this exact release yet."
+            "EmuWiz cannot tell which game this file is yet"
+        },
+        if conflicting {
+            "Evidence for this game conflicts, so EmuWiz will not guess which game to start. Review identity to choose the right match."
+        } else {
+            "Play needs the file's own identity evidence to choose the right emulator settings. Optional catalogue (DAT) verification is a separate check and is not what is stopping Play. Review identity shows what EmuWiz thinks it is."
         },
         if conflicting {
             IdentitySummary::Mismatch

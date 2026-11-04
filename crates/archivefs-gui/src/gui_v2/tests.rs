@@ -72,6 +72,7 @@ pub(super) fn fixture(context: &egui::Context) -> App {
         imagery: super::imagery::Imagery::default(),
         load_job: None,
         artwork_job: None,
+        artwork_totals: super::activity::ArtworkTotals::default(),
         index_job: None,
         browse_play: Default::default(),
         batch_selection: super::multi_selection::MultiSelection::with_limit(

@@ -605,10 +605,15 @@ fn show_state(
                 | ReviewState::NotCompared
                 | ReviewState::NoMatch(_)
                 | ReviewState::Conflict { .. }
-                | ReviewState::Ambiguous { .. } => {
+                | ReviewState::Ambiguous { .. }
+                    if super::archive_inspector::is_supported_archive(
+                        &game.archive.archive_kind,
+                    ) =>
+                {
                     // Not a verification step: the next step is the contextual
                     // action above. The Archive Inspector (under Settings) is
-                    // only for looking inside the file.
+                    // only for looking inside the file, so a direct file it
+                    // cannot open (an .hdf, say) is never routed there.
                     ui.collapsing("Advanced", |ui| {
                         if ui
                             .button("Inspect archive contents (opens Archive Inspector)")

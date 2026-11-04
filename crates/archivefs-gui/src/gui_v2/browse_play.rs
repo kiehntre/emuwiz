@@ -280,7 +280,7 @@ fn readiness_sentence(game: &Game) -> &'static str {
     } else if game.identified {
         "Play checks that everything is ready first. Nothing starts until you confirm."
     } else if game.platform != super::library::UNKNOWN_PLATFORM {
-        "The platform is recognised. Check a suitable catalogue to identify the exact game."
+        "Play checks whether this game can start. Catalogue (DAT) verification is optional."
     } else {
         "More platform evidence is needed. Assign the platform or review the source folder."
     }

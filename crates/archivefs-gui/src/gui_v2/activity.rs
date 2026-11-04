@@ -147,6 +147,46 @@ pub(super) fn visible_jobs(activity: &Activity, attention_only: bool) -> Vec<(&u
         .collect()
 }
 
+/// Session picture totals behind the one grouped artwork Activity entry.
+#[derive(Default)]
+pub(super) struct ArtworkTotals {
+    pub entry: Option<u64>,
+    pub completed: u64,
+    pub cancelled: u64,
+    pub failures: u64,
+}
+
+impl ArtworkTotals {
+    pub fn add(&mut self, completed: u64, cancelled: u64, failures: u64) {
+        self.completed += completed;
+        self.cancelled += cancelled;
+        self.failures += failures;
+    }
+    pub fn summary(&self) -> String {
+        let mut text = format!("{} pictures loaded this session.", self.completed);
+        if self.failures > 0 {
+            text.push_str(&format!(
+                " {} could not load; games remain available. Open a game to retry its picture.",
+                self.failures
+            ));
+        }
+        if self.cancelled > 0 {
+            text.push_str(&format!(
+                " {} off-screen requests were cancelled.",
+                self.cancelled
+            ));
+        }
+        text
+    }
+    pub fn technical(&self) -> String {
+        if self.failures > 0 {
+            "Per-picture errors and timings are in the game's Advanced details.".into()
+        } else {
+            String::new()
+        }
+    }
+}
+
 #[derive(Default)]
 pub(super) struct Activity {
     pub jobs: BTreeMap<u64, Job>,
@@ -273,6 +313,40 @@ impl Activity {
         }
     }
 
+    /// Re-opens a finished grouped entry (only the session's artwork entry)
+    /// for a new batch. Refuses a job that is missing or still active.
+    pub fn reopen(&mut self, id: u64, title: &str) -> bool {
+        let Some(job) = self.jobs.get_mut(&id) else {
+            return false;
+        };
+        if job.active() {
+            return false;
+        }
+        job.title = title.into();
+        job.phase = Phase::Running;
+        job.started = Some(Instant::now());
+        job.finished = None;
+        if let Some(cancel) = &job.cancel {
+            cancel.store(false, Ordering::Relaxed);
+        }
+        true
+    }
+
+    /// Finishes a job whose failures are minor (missing pictures): it reads
+    /// "Finished", never "Needs attention", but the technical note is kept.
+    pub fn finish_minor(&mut self, id: u64, title: &str, summary: String, technical: String) {
+        if let Some(job) = self.jobs.get_mut(&id)
+            && job.active()
+        {
+            job.title = title.into();
+            job.phase = Phase::Complete;
+            job.summary = summary;
+            job.technical = technical;
+            job.progress = None;
+            job.finished = Some(Instant::now());
+        }
+    }
+
     pub fn failed(&self) -> usize {
         self.jobs
             .values()
@@ -306,5 +380,46 @@ impl Activity {
 
     pub fn active(&self) -> usize {
         self.queued() + self.running()
+    }
+}
+
+#[cfg(test)]
+mod grouped_artwork_tests {
+    use super::*;
+
+    #[test]
+    fn minor_picture_failures_finish_one_grouped_entry_without_needing_attention() {
+        let mut activity = Activity::default();
+        let mut totals = ArtworkTotals::default();
+        let id = activity.queue("Loading artwork", Route::BrowsePlay, true);
+        activity.start(id);
+        totals.add(10, 1, 2);
+        activity.finish_minor(id, "Artwork", totals.summary(), totals.technical());
+        // A second batch re-opens the same entry instead of adding a row.
+        assert!(activity.reopen(id, "Loading artwork"));
+        assert!(
+            !activity.reopen(id, "Loading artwork"),
+            "active entry is not reopened"
+        );
+        assert_eq!(activity.running(), 1);
+        totals.add(5, 0, 1);
+        activity.finish_minor(id, "Artwork", totals.summary(), totals.technical());
+        let job = &activity.jobs[&id];
+        assert_eq!(activity.jobs.len(), 1);
+        assert_eq!(job.phase, Phase::Complete);
+        assert_eq!(
+            activity.failed(),
+            0,
+            "missing pictures never raise global attention"
+        );
+        assert_eq!(activity.active(), 0, "finished artwork is not pending work");
+        assert!(
+            job.summary.contains("15 pictures loaded"),
+            "{}",
+            job.summary
+        );
+        assert!(job.summary.contains("3 could not load"), "{}", job.summary);
+        assert!(job.summary.contains("retry"), "{}", job.summary);
+        assert!(!job.technical.is_empty(), "failure detail is kept");
     }
 }
