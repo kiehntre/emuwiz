@@ -140,11 +140,12 @@ fn holds_only_disposable_entries(path: &Path, kind: Kind) -> bool {
     let Ok(entries) = std::fs::read_dir(path) else {
         return false;
     };
-    let seal_store = path.join(SEAL_STORE_FILENAME);
     let seal_wal = format!("{SEAL_STORE_FILENAME}-wal");
     let seal_shm = format!("{SEAL_STORE_FILENAME}-shm");
-    // Inspected at most once per directory, and only if it is reached.
-    let mut seal_store_empty = None;
+    // Names and types first; contents are read only if every entry is a
+    // candidate, and the seal store at most once.
+    let mut check_preferences = false;
+    let mut check_seal_store = false;
     for entry in entries {
         let Ok(entry) = entry else {
             return false;
@@ -155,28 +156,22 @@ fn holds_only_disposable_entries(path: &Path, kind: Kind) -> bool {
         let Ok(file_type) = entry.file_type() else {
             return false;
         };
-        let disposable = if kind.disposable().contains(&name.as_str()) {
-            file_type.is_dir()
-        } else {
-            match kind {
-                Kind::Config => {
-                    name == GUI_PREFERENCES_FILE
-                        && file_type.is_file()
-                        && holds_first_start_gui_preferences(&entry.path())
-                }
-                Kind::Data => {
-                    (name == SEAL_STORE_FILENAME || name == seal_wal || name == seal_shm)
-                        && file_type.is_file()
-                        && *seal_store_empty
-                            .get_or_insert_with(|| seal_store_records_nothing(&seal_store))
-                }
-            }
-        };
-        if !disposable {
+        if kind.disposable().contains(&name.as_str()) && file_type.is_dir() {
+            continue;
+        }
+        if !file_type.is_file() {
             return false;
         }
+        match kind {
+            Kind::Config if name == GUI_PREFERENCES_FILE => check_preferences = true,
+            Kind::Data if name == SEAL_STORE_FILENAME || name == seal_wal || name == seal_shm => {
+                check_seal_store = true;
+            }
+            _ => return false,
+        }
     }
-    true
+    (!check_preferences || holds_first_start_gui_preferences(&path.join(GUI_PREFERENCES_FILE)))
+        && (!check_seal_store || seal_store_records_nothing(&path.join(SEAL_STORE_FILENAME)))
 }
 
 /// Whether Blue's settings file equals its first-start defaults. Read-only.
@@ -187,8 +182,8 @@ fn holds_first_start_gui_preferences(path: &Path) -> bool {
     if !metadata.is_file() || metadata.len() > FIRST_START_FILE_LIMIT {
         return false;
     }
-    let (Ok(bytes), Ok(default)) = (
-        std::fs::read(path),
+    let (Some(bytes), Ok(default)) = (
+        read_plain_file(path),
         serde_json::from_str::<serde_json::Value>(FIRST_START_GUI_PREFERENCES_JSON),
     ) else {
         return false;
@@ -214,9 +209,13 @@ fn read_plain_file(path: &Path) -> Option<Vec<u8>> {
     #[cfg(unix)]
     {
         use std::os::unix::fs::OpenOptionsExt;
-        options.custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC);
+        // O_NONBLOCK: a FIFO swapped in after the type check cannot hang.
+        options.custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC | libc::O_NONBLOCK);
     }
     let file = options.open(path).ok()?;
+    if !file.metadata().ok()?.is_file() {
+        return None;
+    }
     let mut bytes = Vec::new();
     file.take(FIRST_START_FILE_LIMIT + 1)
         .read_to_end(&mut bytes)
@@ -274,27 +273,74 @@ fn seal_store_records_nothing(path: &Path) -> bool {
             }
             None => !entry_may_exist(&wal),
         };
-    if !unchanged {
+    // Timestamps can be too coarse to see an in-place rewrite: re-read both
+    // files and require the very same bytes.
+    let reread_matches = read_plain_file(path).as_ref() == Some(&main_bytes)
+        && match &wal_bytes {
+            Some(bytes) => read_plain_file(&wal).as_ref() == Some(bytes),
+            None => !entry_may_exist(&wal),
+        };
+    if !unchanged || !reread_matches {
         return false;
     }
-    let Ok(scratch) = tempfile::tempdir() else {
+    let mut builder = tempfile::Builder::new();
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        builder.permissions(std::fs::Permissions::from_mode(0o700));
+    }
+    let Ok(scratch) = builder.tempdir() else {
         return false;
     };
     let copy = scratch.path().join("seals.sqlite3");
-    if std::fs::write(&copy, &main_bytes).is_err() {
+    if write_private(&copy, &main_bytes).is_err() {
         return false;
     }
     if let Some(bytes) = &wal_bytes
-        && std::fs::write(scratch.path().join("seals.sqlite3-wal"), bytes).is_err()
+        && write_private(&scratch.path().join("seals.sqlite3-wal"), bytes).is_err()
     {
         return false;
     }
-    inspect_seal_store_copy(&copy).unwrap_or(false)
+    inspect_seal_store_copy(&copy, wal_bytes.as_deref()).unwrap_or(false)
+}
+
+/// Creates a new owner-only file in the private scratch directory.
+fn write_private(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
+    use std::io::Write;
+    let mut options = std::fs::OpenOptions::new();
+    options.write(true).create_new(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.mode(0o600);
+    }
+    options.open(path)?.write_all(bytes)
+}
+
+/// Every WAL frame SQLite accepts, or `None` when the WAL is not a
+/// well-formed sequence of whole frames for its page size.
+fn wal_frame_count(wal: &[u8]) -> Option<i64> {
+    const HEADER: usize = 32;
+    const FRAME_HEADER: usize = 24;
+    if wal.is_empty() {
+        return Some(0);
+    }
+    let page_size = u32::from_be_bytes(wal.get(8..12)?.try_into().ok()?) as usize;
+    if wal.len() < HEADER || !(512..=65536).contains(&page_size) || !page_size.is_power_of_two() {
+        return None;
+    }
+    let frames = wal.len() - HEADER;
+    frames
+        .is_multiple_of(FRAME_HEADER + page_size)
+        .then(|| (frames / (FRAME_HEADER + page_size)) as i64)
 }
 
 /// Inspects a private copy of the seal store (opened normally so its WAL is
-/// recovered into the copy).
-fn inspect_seal_store_copy(copy: &Path) -> rusqlite::Result<bool> {
+/// recovered into the copy). When a WAL was copied, every one of its frames
+/// must be accepted by SQLite: a WAL it would partly ignore (a damaged or
+/// stale frame), or one beside a store not in WAL mode, could hide a seal,
+/// so it counts as recording something.
+fn inspect_seal_store_copy(copy: &Path, wal: Option<&[u8]>) -> rusqlite::Result<bool> {
     use rusqlite::{Connection, OpenFlags};
     let connection = Connection::open_with_flags(
         copy,
@@ -302,6 +348,24 @@ fn inspect_seal_store_copy(copy: &Path) -> rusqlite::Result<bool> {
             | OpenFlags::SQLITE_OPEN_NO_MUTEX
             | OpenFlags::SQLITE_OPEN_NOFOLLOW,
     )?;
+    if let Some(wal) = wal.filter(|wal| !wal.is_empty()) {
+        let Some(frames) = wal_frame_count(wal) else {
+            return Ok(false);
+        };
+        let mode: String = connection.pragma_query_value(None, "journal_mode", |row| row.get(0))?;
+        if !mode.eq_ignore_ascii_case("wal") {
+            return Ok(false);
+        }
+        // (busy, frames in the WAL SQLite accepts, frames checkpointed); on
+        // the private copy only.
+        let (busy, accepted): (i64, i64) =
+            connection.query_row("PRAGMA wal_checkpoint(PASSIVE)", [], |row| {
+                Ok((row.get(0)?, row.get(1)?))
+            })?;
+        if busy != 0 || accepted != frames {
+            return Ok(false);
+        }
+    }
     connection.pragma_update(None, "query_only", true)?;
     let mut statement = connection.prepare("SELECT type, name FROM sqlite_master")?;
     let objects = statement
@@ -343,11 +407,15 @@ fn choose_dir(primary: &Path, legacy: &Path, kind: Kind) -> Result<PathBuf> {
     if !entry_may_exist(primary) {
         return Ok(legacy.to_path_buf());
     }
-    match (presence(primary, kind), presence(legacy, kind)) {
-        (_, Absent) => Ok(primary.to_path_buf()),
-        (Absent | Empty, _) => Ok(legacy.to_path_buf()),
-        (Established, Empty) => Ok(primary.to_path_buf()),
-        (Established, Established) => Err(ArchiveFsError::Config(format!(
+    // The legacy folder is classified only when the EmuWiz one is established;
+    // an empty EmuWiz folder decides for the legacy one by itself.
+    let primary_presence = presence(primary, kind);
+    if primary_presence != Established {
+        return Ok(legacy.to_path_buf());
+    }
+    match presence(legacy, kind) {
+        Absent | Empty => Ok(primary.to_path_buf()),
+        Established => Err(ArchiveFsError::Config(format!(
             "EmuWiz found {noun} in two places and will not choose between them: {primary} and {legacy}. \
              Nothing was changed. Start EmuWiz with {env} set to the folder you want to use, \
              or move the folder you no longer use out of {base}.",
@@ -894,6 +962,64 @@ mod tests {
         ));
         assert_eq!(tree(&home), before);
         let _ = std::fs::remove_dir_all(&home);
+    }
+
+    /// Copies a live store (main file + WAL, writer still open so nothing is
+    /// checkpointed) into the EmuWiz data folder of `home`, letting `edit`
+    /// change the copied WAL bytes.
+    fn place_uncheckpointed_store(home: &Path, seals: usize, edit: impl FnOnce(&mut Vec<u8>)) {
+        let source = home.join("live-store");
+        let writer = seal_store(&source, seals);
+        let main = std::fs::read(source.join("undo-seals.sqlite3")).unwrap();
+        let mut wal = std::fs::read(source.join("undo-seals.sqlite3-wal")).unwrap();
+        edit(&mut wal);
+        drop(writer);
+        std::fs::remove_dir_all(&source).unwrap();
+        let data = home.join(".local/share/emuwiz");
+        std::fs::create_dir_all(&data).unwrap();
+        std::fs::write(data.join("undo-seals.sqlite3"), main).unwrap();
+        std::fs::write(data.join("undo-seals.sqlite3-wal"), wal).unwrap();
+    }
+
+    #[test]
+    fn an_intact_uncheckpointed_empty_store_is_still_disposable() {
+        let home = home_with("wal-intact", &[]);
+        legacy_install(&home);
+        place_uncheckpointed_store(&home, 0, |_| {});
+        let before = tree(&home);
+        assert_eq!(
+            data_dir_in(&home).unwrap(),
+            home.join(".local/share/archivefs")
+        );
+        assert_eq!(tree(&home), before);
+        let _ = std::fs::remove_dir_all(&home);
+    }
+
+    /// A WAL frame SQLite would reject could hide a seal: never "empty".
+    #[test]
+    fn a_wal_with_a_damaged_or_partial_frame_is_meaningful() {
+        for (name, seals, edit) in [
+            (
+                "wal-damaged-empty",
+                0,
+                (|wal: &mut Vec<u8>| *wal.last_mut().unwrap() ^= 0xff) as fn(&mut Vec<u8>),
+            ),
+            ("wal-damaged-seal", 1, |wal: &mut Vec<u8>| {
+                *wal.last_mut().unwrap() ^= 0xff
+            }),
+            ("wal-partial-frame", 0, |wal: &mut Vec<u8>| {
+                wal.truncate(wal.len() - 1)
+            }),
+            ("wal-intact-seal", 1, |_: &mut Vec<u8>| {}),
+        ] {
+            let home = home_with(name, &[]);
+            legacy_install(&home);
+            place_uncheckpointed_store(&home, seals, edit);
+            let before = tree(&home);
+            assert!(data_dir_in(&home).is_err(), "{name} must be meaningful");
+            assert_eq!(tree(&home), before, "{name} must be left untouched");
+            let _ = std::fs::remove_dir_all(&home);
+        }
     }
 
     /// A truncated main file with the seal only in a WAL: SQLite would
