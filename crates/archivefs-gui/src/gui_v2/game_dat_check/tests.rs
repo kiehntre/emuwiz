@@ -693,7 +693,7 @@ mod one_action_in_game_details {
     }
 
     #[test]
-    fn every_route_for_an_unknown_system_clears_a_stale_system_first() {
+    fn game_details_routes_for_an_unknown_system_clear_a_stale_system_first() {
         let f = scanned();
         let mut archive = game(&f).archive;
         archive.platform = None;
@@ -721,6 +721,15 @@ mod one_action_in_game_details {
             let strings = shown(&context, &mut app);
             assert_eq!(count(&strings, label), 1, "{label}: {strings:?}");
             app.check_platform = Some("SNES".into());
+            app.verification = Some(crate::gui_v2::backend::VerificationResult {
+                platform: "SNES".into(),
+                matched: 0,
+                attention: 0,
+                unknown: 0,
+                missing: 0,
+                total: 0,
+                statuses: Default::default(),
+            });
             click(&context, &mut app, label);
             assert_eq!(
                 app.router.current,
@@ -728,6 +737,7 @@ mod one_action_in_game_details {
                 "{label}"
             );
             assert_eq!(app.check_platform, None, "{label}");
+            assert!(app.verification.is_none(), "{label}");
             assert!(app.verification_job.is_none(), "{label}");
         }
     }

@@ -4112,6 +4112,8 @@ fn gui_v2_game_detail_exposes_contextual_actions_and_lazy_screenshots() {
     let mut app = fixture(&context);
     app.library = Arc::new(Library::new(vec![archive(1, "Example Game", Some("PS2"))]));
     app.router.current = Route::Game(1);
+    // The card is still reading; no worker opens the real profile.
+    panel_pending(&mut app, 1);
     let texts = scrolled_text(&context, &mut app, [1280.0, 1200.0]);
     for label in [
         "Play",
@@ -4148,6 +4150,8 @@ fn gui_v2_game_details_lead_with_title_and_play_and_keep_reference_material_last
         Some("Saturn"),
     )]));
     app.router.current = Route::Game(1);
+    // The card is still reading; no worker opens the real profile.
+    panel_pending(&mut app, 1);
     let output = frame(&context, &mut app, [1280.0, 2400.0]);
     let y = |label: &str| {
         bounds_below_chrome(&output, label)
@@ -5224,6 +5228,8 @@ fn gui_v2_game_details_keep_artwork_actions_and_metadata_together() {
     let context = egui::Context::default();
     let mut app = visual_fixture(&context);
     app.go(Route::Game(1));
+    // The card is still reading; no worker opens the real profile.
+    panel_pending(&mut app, 1);
     let mut strings = text(&pump_imagery(&context, &mut app, [1280.0, 1200.0]));
     assert!(strings.iter().any(|value| value == "Verify this game"));
     assert!(strings.iter().any(|value| value == "Open Folder"));
@@ -8712,7 +8718,7 @@ fn panel_answered(app: &mut App, game: i64, reason: &'static str) {
 }
 
 /// This game's panel is still reading its saved evidence (no worker runs).
-fn panel_pending(app: &mut App, game: i64) {
+pub(super) fn panel_pending(app: &mut App, game: i64) {
     app.review
         .verification_guidance
         .set_for_test(game, None, None);

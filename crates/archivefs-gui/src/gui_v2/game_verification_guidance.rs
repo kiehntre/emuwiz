@@ -178,7 +178,7 @@ impl State {
             .flatten()
     }
 
-    fn poll(&mut self, game: &Game, context: &eframe::egui::Context) {
+    pub(super) fn poll(&mut self, game: &Game, context: &eframe::egui::Context) {
         if self.game != Some(game.archive.id) {
             self.invalidate();
             self.game = Some(game.archive.id);

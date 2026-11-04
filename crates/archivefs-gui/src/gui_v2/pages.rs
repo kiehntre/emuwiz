@@ -3278,6 +3278,9 @@ impl App {
             // This game only, through the existing one-game DAT check (or the
             // existing system choice when the game has no known system). That
             // page explains a missing catalogue and links DAT Management.
+            // Read the card's answer first, so this label and the card's
+            // pointer to it agree on the frame that answer arrives.
+            self.review.verification_guidance.poll(game, ui.ctx());
             let check = super::game_verification_guidance::Action::one_game_check(
                 game,
                 self.review.verification_guidance.result_for(id),
@@ -3679,7 +3682,12 @@ impl App {
                 self.go(Route::QuickRename);
             }
             if ui.button("Check Games").clicked() {
-                self.go(Route::Section(Section::Check));
+                if self.review.dat_context.is_some() {
+                    // Opened for one game: no stale system from earlier.
+                    self.go_verification(Route::Section(Section::Check));
+                } else {
+                    self.go(Route::Section(Section::Check));
+                }
             }
             if ui.button("Advanced Rename").clicked() {
                 self.go(Route::Section(Section::Build));

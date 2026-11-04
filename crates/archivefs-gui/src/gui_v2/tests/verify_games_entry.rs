@@ -112,6 +112,7 @@ fn game_details_verify_this_game_opens_the_one_game_check() {
     let context = egui::Context::default();
     let mut app = blue_app(&context, games());
     app.router.current = Route::Game(1);
+    panel_pending(&mut app, 1);
     // Already bound to this game, so the check page reads no real catalogue
     // inventory, configuration or database when it is painted.
     let game = app.library.game(1).unwrap().clone();
@@ -156,6 +157,7 @@ fn a_game_without_a_known_system_goes_to_check_games_first() {
     let mut app = blue_app(&context, vec![archive(9, "Mystery", None)]);
     app.check_platform = Some("SNES".into());
     app.router.current = Route::Game(9);
+    panel_pending(&mut app, 9);
     click_text(&context, &mut app, [1280.0, 1200.0], "Verify this game");
     assert_eq!(app.router.current, Route::Section(Section::Check));
     assert_eq!(app.check_platform, None);
