@@ -31,8 +31,9 @@
 //! behaves exactly like an unset variable, and an isolated XDG root only ever
 //! looks at its own `emuwiz`/`archivefs` children, never the real home.
 //!
-//! Resolution is read-only: nothing is created, copied, merged or moved, so
-//! it is idempotent across restarts. Whatever directory is chosen is where
+//! Resolution is read-only: nothing in the inspected folders is created,
+//! changed, merged or moved (a seal store is inspected through a private
+//! temporary copy), so it is idempotent across restarts. Whatever directory is chosen is where
 //! later writes go, which keeps the same choice on the next start.
 
 use std::env;
@@ -142,6 +143,8 @@ fn holds_only_disposable_entries(path: &Path, kind: Kind) -> bool {
     let seal_store = path.join(SEAL_STORE_FILENAME);
     let seal_wal = format!("{SEAL_STORE_FILENAME}-wal");
     let seal_shm = format!("{SEAL_STORE_FILENAME}-shm");
+    // Inspected at most once per directory, and only if it is reached.
+    let mut seal_store_empty = None;
     for entry in entries {
         let Ok(entry) = entry else {
             return false;
@@ -164,7 +167,8 @@ fn holds_only_disposable_entries(path: &Path, kind: Kind) -> bool {
                 Kind::Data => {
                     (name == SEAL_STORE_FILENAME || name == seal_wal || name == seal_shm)
                         && file_type.is_file()
-                        && seal_store_records_nothing(&seal_store)
+                        && *seal_store_empty
+                            .get_or_insert_with(|| seal_store_records_nothing(&seal_store))
                 }
             }
         };
@@ -192,49 +196,132 @@ fn holds_first_start_gui_preferences(path: &Path) -> bool {
     serde_json::from_slice::<serde_json::Value>(&bytes).is_ok_and(|value| value == default)
 }
 
+/// Length and modification time of a plain file (never a symlink).
+fn plain_file_stamp(path: &Path) -> Option<(u64, std::time::SystemTime)> {
+    let metadata = std::fs::symlink_metadata(path).ok()?;
+    metadata
+        .is_file()
+        .then(|| metadata.modified().ok().map(|time| (metadata.len(), time)))
+        .flatten()
+}
+
+/// Reads a whole plain file of at most [`FIRST_START_FILE_LIMIT`] bytes
+/// without following a symlink. Read-only.
+fn read_plain_file(path: &Path) -> Option<Vec<u8>> {
+    use std::io::Read;
+    let mut options = std::fs::OpenOptions::new();
+    options.read(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC);
+    }
+    let file = options.open(path).ok()?;
+    let mut bytes = Vec::new();
+    file.take(FIRST_START_FILE_LIMIT + 1)
+        .read_to_end(&mut bytes)
+        .ok()?;
+    (bytes.len() as u64 <= FIRST_START_FILE_LIMIT).then_some(bytes)
+}
+
 /// Whether the Undo seal store holds no seal and nothing else: at most the
-/// `journal_seals` table (and its key index), with no rows. Opened the way
-/// the store's own readers open it (read-only, no symlinks, query-only);
-/// any error, lock, other schema object or row means it records something.
+/// `journal_seals` table (and its key index), with no rows.
+///
+/// The store in the inspected folder is never opened by SQLite: even a
+/// read-only open creates or rewrites `-wal`/`-shm` files and can discard a
+/// WAL. Instead its main file and WAL are copied into a private temporary
+/// directory and the copy is inspected; the copy is refused if either
+/// original changed while it was taken. An empty or oversized main file,
+/// anything unreadable, a lock, other schema or any row means it records
+/// something.
 fn seal_store_records_nothing(path: &Path) -> bool {
-    use rusqlite::{Connection, OpenFlags};
-    let Ok(metadata) = std::fs::symlink_metadata(path) else {
+    let wal = path.with_file_name(format!(
+        "{}-wal",
+        crate::dat::rename_apply::seal::SEAL_STORE_FILENAME
+    ));
+    let Some(main_before) = plain_file_stamp(path) else {
         return false;
     };
-    if !metadata.is_file() || metadata.len() > FIRST_START_FILE_LIMIT {
+    // A first start always writes the database header; an empty main file
+    // beside a WAL is a crash or truncation whose WAL SQLite would discard.
+    if main_before.0 == 0 {
         return false;
     }
-    let Ok(connection) = Connection::open_with_flags(
-        path,
-        OpenFlags::SQLITE_OPEN_READ_ONLY
-            | OpenFlags::SQLITE_OPEN_NO_MUTEX
-            | OpenFlags::SQLITE_OPEN_NOFOLLOW,
-    ) else {
+    let wal_before = match std::fs::symlink_metadata(&wal) {
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
+        Ok(_) => match plain_file_stamp(&wal) {
+            Some(stamp) => Some(stamp),
+            None => return false,
+        },
+        Err(_) => return false,
+    };
+    let Some(main_bytes) = read_plain_file(path) else {
         return false;
     };
-    let inspect = || -> rusqlite::Result<bool> {
-        connection.pragma_update(None, "query_only", true)?;
-        let mut statement = connection.prepare("SELECT type, name FROM sqlite_master")?;
-        let objects = statement
-            .query_map([], |row| {
-                Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
-            })?
-            .collect::<rusqlite::Result<Vec<_>>>()?;
-        let only_seal_table = objects.iter().all(|(kind, name)| {
-            (kind == "table" && name == "journal_seals")
-                || (kind == "index" && name.starts_with("sqlite_autoindex_journal_seals_"))
-        });
-        if !only_seal_table {
-            return Ok(false);
-        }
-        if objects.iter().any(|(kind, _)| kind == "table") {
-            let rows: i64 =
-                connection.query_row("SELECT count(*) FROM journal_seals", [], |row| row.get(0))?;
-            return Ok(rows == 0);
-        }
-        Ok(true)
+    let wal_bytes = match wal_before {
+        Some(_) => match read_plain_file(&wal) {
+            Some(bytes) => Some(bytes),
+            None => return false,
+        },
+        None => None,
     };
-    inspect().unwrap_or(false)
+    let unchanged = plain_file_stamp(path) == Some(main_before)
+        && main_bytes.len() as u64 == main_before.0
+        && match wal_before {
+            Some(stamp) => {
+                plain_file_stamp(&wal) == Some(stamp)
+                    && wal_bytes.as_ref().map(|bytes| bytes.len() as u64) == Some(stamp.0)
+            }
+            None => !entry_may_exist(&wal),
+        };
+    if !unchanged {
+        return false;
+    }
+    let Ok(scratch) = tempfile::tempdir() else {
+        return false;
+    };
+    let copy = scratch.path().join("seals.sqlite3");
+    if std::fs::write(&copy, &main_bytes).is_err() {
+        return false;
+    }
+    if let Some(bytes) = &wal_bytes
+        && std::fs::write(scratch.path().join("seals.sqlite3-wal"), bytes).is_err()
+    {
+        return false;
+    }
+    inspect_seal_store_copy(&copy).unwrap_or(false)
+}
+
+/// Inspects a private copy of the seal store (opened normally so its WAL is
+/// recovered into the copy).
+fn inspect_seal_store_copy(copy: &Path) -> rusqlite::Result<bool> {
+    use rusqlite::{Connection, OpenFlags};
+    let connection = Connection::open_with_flags(
+        copy,
+        OpenFlags::SQLITE_OPEN_READ_WRITE
+            | OpenFlags::SQLITE_OPEN_NO_MUTEX
+            | OpenFlags::SQLITE_OPEN_NOFOLLOW,
+    )?;
+    connection.pragma_update(None, "query_only", true)?;
+    let mut statement = connection.prepare("SELECT type, name FROM sqlite_master")?;
+    let objects = statement
+        .query_map([], |row| {
+            Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+        })?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+    let only_seal_table = objects.iter().all(|(kind, name)| {
+        (kind == "table" && name == "journal_seals")
+            || (kind == "index" && name.starts_with("sqlite_autoindex_journal_seals_"))
+    });
+    if !only_seal_table {
+        return Ok(false);
+    }
+    if objects.iter().any(|(kind, _)| kind == "table") {
+        let rows: i64 =
+            connection.query_row("SELECT count(*) FROM journal_seals", [], |row| row.get(0))?;
+        return Ok(rows == 0);
+    }
+    Ok(true)
 }
 
 fn entry_may_exist(path: &Path) -> bool {
@@ -248,6 +335,14 @@ fn entry_may_exist(path: &Path) -> bool {
 /// the table in the module documentation. Read-only.
 fn choose_dir(primary: &Path, legacy: &Path, kind: Kind) -> Result<PathBuf> {
     use Presence::{Absent, Empty, Established};
+    // Classify contents only when both candidates exist: otherwise the answer
+    // is already decided and neither folder is inspected further.
+    if !entry_may_exist(legacy) {
+        return Ok(primary.to_path_buf());
+    }
+    if !entry_may_exist(primary) {
+        return Ok(legacy.to_path_buf());
+    }
     match (presence(primary, kind), presence(legacy, kind)) {
         (_, Absent) => Ok(primary.to_path_buf()),
         (Absent | Empty, _) => Ok(legacy.to_path_buf()),
@@ -371,6 +466,8 @@ fn ambiguous_under(
     kind: Kind,
 ) -> bool {
     explicit_root.is_none()
+        && entry_may_exist(&base.join(names.0))
+        && entry_may_exist(&base.join(names.1))
         && presence(&base.join(names.0), kind) == Presence::Established
         && presence(&base.join(names.1), kind) == Presence::Established
 }
@@ -746,20 +843,76 @@ mod tests {
             (None, None),
             (None, None)
         ));
+        // Nothing anywhere under HOME changed, the inspected EmuWiz data
+        // folder (seal store, WAL, shared memory) included.
+        assert_eq!(tree(&home), before);
         drop(writer);
-        // After the writer closes (WAL checkpointed away) it is still empty.
+
+        // After the writer closes (WAL checkpointed away) it is still empty,
+        // and inspecting it creates no -wal/-shm beside it.
+        let closed = tree(&home);
+        assert!(
+            !home
+                .join(".local/share/emuwiz/undo-seals.sqlite3-wal")
+                .exists()
+        );
         assert_eq!(
             data_dir_in(&home).unwrap(),
             home.join(".local/share/archivefs")
         );
-        // Classification wrote nothing to the legacy side or the config side.
-        let unchanged = |entries: Vec<(PathBuf, Vec<u8>)>| -> Vec<(PathBuf, Vec<u8>)> {
-            entries
-                .into_iter()
-                .filter(|(path, _)| !path.starts_with(home.join(".local/share/emuwiz")))
-                .collect()
-        };
-        assert_eq!(unchanged(tree(&home)), unchanged(before));
+        assert_eq!(tree(&home), closed);
+        assert!(
+            !home
+                .join(".local/share/emuwiz/undo-seals.sqlite3-wal")
+                .exists()
+        );
+        assert!(
+            !home
+                .join(".local/share/emuwiz/undo-seals.sqlite3-shm")
+                .exists()
+        );
+        let _ = std::fs::remove_dir_all(&home);
+    }
+
+    /// A seal store is only inspected when both folders exist, and never in
+    /// place: a legacy folder holding one, with no EmuWiz folder, is left
+    /// exactly as it was.
+    #[test]
+    fn a_seal_store_is_never_opened_where_it_lies() {
+        let home = home_with("seal-legacy-only", &[]);
+        legacy_install(&home);
+        drop(seal_store(&home.join(".local/share/archivefs"), 0));
+        let before = tree(&home);
+        assert_eq!(
+            data_dir_in(&home).unwrap(),
+            home.join(".local/share/archivefs")
+        );
+        assert!(!two_established_setups_in(
+            &home,
+            (None, None),
+            (None, None)
+        ));
+        assert_eq!(tree(&home), before);
+        let _ = std::fs::remove_dir_all(&home);
+    }
+
+    /// A truncated main file with the seal only in a WAL: SQLite would
+    /// discard that WAL, so it is unverifiable and meaningful, and the WAL
+    /// is left in place.
+    #[test]
+    fn a_truncated_seal_store_with_a_wal_is_meaningful_and_untouched() {
+        let home = home_with("seal-truncated", &[]);
+        legacy_install(&home);
+        let data = home.join(".local/share/emuwiz");
+        let writer = seal_store(&data, 1);
+        let wal = std::fs::read(data.join("undo-seals.sqlite3-wal")).unwrap();
+        drop(writer);
+        std::fs::write(data.join("undo-seals.sqlite3"), b"").unwrap();
+        std::fs::write(data.join("undo-seals.sqlite3-wal"), &wal).unwrap();
+        let _ = std::fs::remove_file(data.join("undo-seals.sqlite3-shm"));
+        let before = tree(&home);
+        assert!(data_dir_in(&home).is_err());
+        assert_eq!(tree(&home), before);
         let _ = std::fs::remove_dir_all(&home);
     }
 

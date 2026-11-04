@@ -1,5 +1,7 @@
 use super::*;
 
+#[path = "tests/first_start_preferences.rs"]
+mod first_start_preferences;
 #[path = "tests/visual_polish.rs"]
 mod visual_polish;
 

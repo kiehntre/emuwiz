@@ -1207,26 +1207,3 @@ pub(super) fn load_repair_history(journal_dir: &Path, legacy_dirs: &[PathBuf]) -
         evidence,
     }
 }
-
-#[cfg(test)]
-mod first_start_preferences_tests {
-    use super::Preferences;
-
-    /// Core treats a `gui-v2.json` equal to this as a disposable first-start
-    /// leftover when choosing between an EmuWiz and a legacy setup. If the
-    /// defaults change, update `FIRST_START_GUI_PREFERENCES_JSON` with them;
-    /// otherwise a stray first-start folder would count as a second setup
-    /// (safe, but it would block an established legacy library).
-    #[test]
-    fn core_first_start_preferences_match_the_default_preferences() {
-        let default = serde_json::to_value(Preferences::default()).unwrap();
-        let core: serde_json::Value =
-            serde_json::from_str(archivefs_core::app_dirs::FIRST_START_GUI_PREFERENCES_JSON)
-                .unwrap();
-        assert_eq!(default, core);
-        assert_eq!(
-            archivefs_core::app_dirs::GUI_PREFERENCES_FILE,
-            super::preferences_path().unwrap().file_name().unwrap()
-        );
-    }
-}
