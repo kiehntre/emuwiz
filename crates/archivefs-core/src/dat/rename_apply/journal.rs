@@ -362,6 +362,16 @@ fn check_finalise_transition(path: &Path, next: &RenameTransaction) -> Result<()
 /// (or empty) one would be resolved against the working directory.
 pub const JOURNAL_DIR_UNAVAILABLE: &str = "EmuWiz could not find its data folder, so no Undo journal can be written and nothing was changed. Open Setup to see why (for example, two existing setups were found) and choose one first.";
 
+/// The journal folder, or the refusal (starting with
+/// [`JOURNAL_DIR_UNAVAILABLE`], then the resolver's own reason) that every
+/// journal read, write or removal must show instead. Never a fallback folder:
+/// not one relative to the working directory, not the temp folder.
+pub fn journal_dir_or_refusal<E: std::fmt::Display>(
+    resolved: Result<std::path::PathBuf, E>,
+) -> Result<std::path::PathBuf, String> {
+    resolved.map_err(|error| format!("{JOURNAL_DIR_UNAVAILABLE} Details: {error}"))
+}
+
 /// Writes (or rewrites) a transaction journal through owned exclusive staging,
 /// file `sync_all`, atomic replacement and best-effort parent-directory sync.
 /// This is not a universal durable-commit or cross-process exclusion guarantee.
@@ -755,6 +765,15 @@ mod tests {
             assert!(error.contains(JOURNAL_DIR_UNAVAILABLE), "{error}");
         }
         assert!(!Path::new(RENAME_TRANSACTIONS_DIRECTORY).exists());
+    }
+
+    #[test]
+    fn an_unresolved_journal_folder_is_a_refusal_with_its_reason_never_a_fallback() {
+        let refusal = journal_dir_or_refusal(Err("two setups")).unwrap_err();
+        assert!(refusal.starts_with(JOURNAL_DIR_UNAVAILABLE), "{refusal}");
+        assert!(refusal.ends_with("Details: two setups"), "{refusal}");
+        let dir = std::path::PathBuf::from("/data/rename-transactions-sealed-v1");
+        assert_eq!(journal_dir_or_refusal::<String>(Ok(dir.clone())), Ok(dir));
     }
 
     #[test]

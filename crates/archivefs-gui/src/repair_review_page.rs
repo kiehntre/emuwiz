@@ -359,6 +359,21 @@ pub(crate) struct RepairApplyConfirmation {
     pub(crate) quarantine_count: usize,
 }
 
+/// The Repair Center journal folder: the test override, else the resolved
+/// data folder's, else the refusal Apply must show. Never a folder relative
+/// to the working directory.
+fn repair_journal_dir<E: std::fmt::Display>(
+    journal_dir_override: Option<PathBuf>,
+    resolve_journal_dir: impl FnOnce() -> Result<PathBuf, E>,
+) -> Result<PathBuf, String> {
+    match journal_dir_override {
+        Some(dir) => Ok(dir),
+        None => {
+            archivefs_core::dat::rename_apply::journal::journal_dir_or_refusal(resolve_journal_dir())
+        }
+    }
+}
+
 /// Why the background apply worker could not complete, with a short label a
 /// caller does not need to match on the underlying error type to show.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1061,12 +1076,20 @@ impl RepairReviewPageState {
         // `None` in production: resolves the exact same default journal
         // directory as before. `Some(dir)` only in tests - see
         // `journal_dir_override`'s doc.
-        let journal_dir = self.journal_dir_override.clone().unwrap_or_else(|| {
-            archivefs_core::dat::rename_apply::journal::default_rename_transaction_dir()
-                .unwrap_or_else(|_| {
-                    PathBuf::from(archivefs_core::dat::rename_apply::RENAME_TRANSACTIONS_DIRECTORY)
-                })
-        });
+        let journal_dir = match repair_journal_dir(
+            self.journal_dir_override.clone(),
+            archivefs_core::dat::rename_apply::journal::default_rename_transaction_dir,
+        ) {
+            Ok(dir) => dir,
+            Err(refusal) => {
+                self.apply_result = None;
+                self.apply_failure = Some(RepairApplyFailure {
+                    label: "Nothing was repaired",
+                    detail: refusal,
+                });
+                return;
+            }
+        };
         // `None` in production: resolves `AuditCacheConfig::Default`, same as
         // every other audit path. `Some(config)` only in tests - see
         // `audit_cache_override`'s doc.

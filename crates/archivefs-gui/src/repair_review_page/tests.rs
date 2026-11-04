@@ -2341,3 +2341,27 @@ fn job10_new_duplicate_refusal_information_is_visible_without_selectable_ids() {
     assert!(!state.can_apply());
     assert!(state.actionable_selected_ids().is_empty());
 }
+
+/// #312: Repair Center Apply never falls back to a journal folder relative
+/// to the launch directory: an unresolved data folder is a refusal (with
+/// the resolver's reason); the test override and a resolved folder are used
+/// as given.
+#[test]
+fn an_unresolved_data_folder_is_an_apply_refusal_never_a_relative_journal_folder() {
+    let refusal = repair_journal_dir(None, || Err("EmuWiz found data in two places")).unwrap_err();
+    assert!(
+        refusal.starts_with(archivefs_core::dat::rename_apply::journal::JOURNAL_DIR_UNAVAILABLE),
+        "{refusal}"
+    );
+    assert!(refusal.contains("two places"));
+    let resolved = PathBuf::from("/data/emuwiz/rename-transactions-sealed-v1");
+    assert_eq!(
+        repair_journal_dir::<String>(None, || Ok(resolved.clone())),
+        Ok(resolved.clone())
+    );
+    let override_dir = PathBuf::from("/tmp/test-override");
+    assert_eq!(
+        repair_journal_dir(Some(override_dir.clone()), || Err("ignored")),
+        Ok(override_dir)
+    );
+}

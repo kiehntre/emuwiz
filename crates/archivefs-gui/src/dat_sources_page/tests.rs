@@ -9516,10 +9516,17 @@ fn assert_unresolved_journal_folder_refuses_everything(
         names
     };
     let mut page = make_page(&fixture, &roms);
-    assert_eq!(
-        page.journal_dir_unavailable.as_deref(),
-        Some(refusal),
+    let refused = |message: Option<&str>| message.is_some_and(|text| text.starts_with(refusal));
+    assert!(
+        refused(page.journal_dir_unavailable.as_deref()),
         "an unresolved data folder must leave the page with no journal folder"
+    );
+    // Visible as soon as the page opens, with the resolver's reason.
+    assert!(refused(page.apply_error.as_deref()));
+    assert!(
+        page.apply_error
+            .as_deref()
+            .is_some_and(|text| text.contains("EmuWiz found data in two places"))
     );
     assert!(page.recovery_transactions.is_empty());
     page.rename_plan = Some(RenamePlan {
@@ -9545,18 +9552,18 @@ fn assert_unresolved_journal_folder_refuses_everything(
         typed: String::new(),
     });
     run_to_completion(&mut page);
-    assert_eq!(page.apply_error.as_deref(), Some(refusal));
+    assert!(refused(page.apply_error.as_deref()));
     assert!(page.apply_outcome.is_none());
 
     page.apply(DatSourcesPageAction::RollbackTransaction { id: "t".into() });
-    assert_eq!(page.rollback_error.as_deref(), Some(refusal));
+    assert!(refused(page.rollback_error.as_deref()));
     page.apply(DatSourcesPageAction::ResumeTransaction { id: "t".into() });
-    assert_eq!(page.resume_error.as_deref(), Some(refusal));
+    assert!(refused(page.resume_error.as_deref()));
     page.apply(DatSourcesPageAction::RecoveryChoice {
         id: "t".into(),
         choice: RecoveryChoice::LeaveUntouched,
     });
-    assert_eq!(page.recovery_resolution_error.as_deref(), Some(refusal));
+    assert!(refused(page.recovery_resolution_error.as_deref()));
     run_to_completion(&mut page);
 
     // The source is untouched and nothing new exists anywhere.

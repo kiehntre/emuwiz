@@ -81,6 +81,10 @@ pub(crate) struct RepairHistoryPageState {
     /// Where transaction journals live. Never the saved/loaded snapshot in
     /// `transactions` - every refresh re-reads this directory.
     journal_dir: PathBuf,
+    /// Set when the data folder (and so the journal folder) could not be
+    /// resolved: every journal read, reconcile, Undo, removal and archive on
+    /// this page then refuses with this text. There is no fallback folder.
+    journal_dir_unavailable: Option<String>,
     /// The journal directory's transactions, most recent first. Reloaded
     /// wholesale by [`Self::refresh`]; never mutated piecemeal in memory.
     pub(crate) transactions: Vec<RenameTransaction>,
@@ -155,11 +159,29 @@ impl RepairHistoryPageState {
     /// Loads history from the default journal directory (the same one the
     /// Repair Center executor and the DAT Sources page's rollback both use).
     pub(crate) fn load() -> Self {
-        let journal_dir = archivefs_core::dat::rename_apply::default_rename_transaction_dir()
-            .unwrap_or_else(|_| {
-                PathBuf::from(archivefs_core::dat::rename_apply::RENAME_TRANSACTIONS_DIRECTORY)
-            });
-        Self::load_with_journal_dir(journal_dir)
+        Self::load_with_journal_resolver(
+            archivefs_core::dat::rename_apply::default_rename_transaction_dir,
+        )
+    }
+
+    /// [`Self::load`] with only the journal-folder resolver injected, so a
+    /// test can drive the production load path with a failing resolver. When
+    /// it fails, nothing is read, reconciled or removed anywhere: no folder
+    /// relative to the working directory is ever used.
+    fn load_with_journal_resolver<E: std::fmt::Display>(
+        resolve_journal_dir: impl FnOnce() -> Result<PathBuf, E>,
+    ) -> Self {
+        match archivefs_core::dat::rename_apply::journal::journal_dir_or_refusal(
+            resolve_journal_dir(),
+        ) {
+            Ok(journal_dir) => Self::load_with_journal_dir(journal_dir),
+            Err(refusal) => {
+                let mut state = Self::empty(PathBuf::new());
+                state.archive_state_error = Some(refusal.clone());
+                state.journal_dir_unavailable = Some(refusal);
+                state
+            }
+        }
     }
 
     /// Loads history from an explicit journal directory. Exists so tests
@@ -178,6 +200,7 @@ impl RepairHistoryPageState {
             io_error: None,
             reverifications: Default::default(),
             journal_dir,
+            journal_dir_unavailable: None,
             transactions: Vec::new(),
             load_problems: Vec::new(),
             seal_status: Default::default(),
@@ -214,6 +237,9 @@ impl RepairHistoryPageState {
     /// page's own recovery pass already calls - never a second
     /// implementation of that classification.
     pub(crate) fn refresh(&mut self) {
+        if self.journal_dir_unavailable.is_some() {
+            return;
+        }
         if self.background_ui {
             self.start_io(Self::refresh);
             return;
@@ -367,6 +393,10 @@ impl RepairHistoryPageState {
         if self.undo_job.is_some() {
             return;
         }
+        if let Some(refusal) = &self.journal_dir_unavailable {
+            self.undo_error = Some(refusal.clone());
+            return;
+        }
         let journal_dir = self.journal_dir.clone();
         let Some(path) = journal_path(&journal_dir, &transaction_id) else {
             self.undo_error = Some(format!(
@@ -484,6 +514,14 @@ impl RepairHistoryPageState {
     /// dialog opened - e.g. another process). Always refreshes from disk
     /// afterward.
     pub(crate) fn confirm_clear(&mut self) {
+        if let Some(refusal) = &self.journal_dir_unavailable {
+            self.clear_confirm = None;
+            self.clear_outcome = Some(ClearHistoryOutcome {
+                removed: 0,
+                failed: vec![refusal.clone()],
+            });
+            return;
+        }
         if self.background_ui {
             self.start_io(Self::confirm_clear);
             return;
@@ -543,6 +581,9 @@ impl RepairHistoryPageState {
     /// Archives one stale record immediately. This only changes the visibility
     /// sidecar; the core re-reads and rechecks the journal before doing so.
     pub(crate) fn archive_one(&mut self, transaction_id: &str) {
+        if self.journal_dir_unavailable.is_some() {
+            return;
+        }
         if self.background_ui {
             let id = transaction_id.to_owned();
             self.start_io(move |state| state.archive_one(&id));
@@ -583,6 +624,10 @@ impl RepairHistoryPageState {
     /// Confirms bulk archive for the exact frozen set. Each id is rechecked by
     /// the core, so a record that became actionable remains visible.
     pub(crate) fn confirm_archive(&mut self) {
+        if self.journal_dir_unavailable.is_some() {
+            self.archive_confirm = None;
+            return;
+        }
         if self.background_ui {
             self.start_io(Self::confirm_archive);
             return;

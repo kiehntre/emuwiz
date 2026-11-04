@@ -61,6 +61,10 @@ pub(crate) struct RomOrganisationPageState {
     filter: Option<OrganisationStatus>,
     applied: Option<archivefs_core::dat::rename_apply::RenameTransaction>,
     applied_journal: PathBuf,
+    /// Set when the data folder (and so the journal folder) could not be
+    /// resolved: Apply, History Undo and Undo then refuse with this text
+    /// before creating any folder. There is no fallback folder.
+    applied_journal_unavailable: Option<String>,
     result_message: Option<String>,
     /// False when the last apply/rollback was not fully resolved (failed, pending
     /// or in-flight entries): the banner must not look like success.
@@ -185,6 +189,25 @@ fn preview_button_label(pending_preview: bool) -> &'static str {
 
 impl Default for RomOrganisationPageState {
     fn default() -> Self {
+        Self::with_journal_resolver(
+            archivefs_core::dat::rename_apply::journal::default_rename_transaction_dir,
+        )
+    }
+}
+
+impl RomOrganisationPageState {
+    /// [`Default`] with only the journal-folder resolver injected, so a test
+    /// can drive the production constructor with a failing resolver.
+    fn with_journal_resolver<E: std::fmt::Display>(
+        resolve_journal_dir: impl FnOnce() -> Result<PathBuf, E>,
+    ) -> Self {
+        let (applied_journal, applied_journal_unavailable) =
+            match archivefs_core::dat::rename_apply::journal::journal_dir_or_refusal(
+                resolve_journal_dir(),
+            ) {
+                Ok(dir) => (dir, None),
+                Err(refusal) => (PathBuf::new(), Some(refusal)),
+            };
         Self {
             master_root_draft: String::new(),
             saved_master_root: None,
@@ -201,13 +224,8 @@ impl Default for RomOrganisationPageState {
             approved: BTreeSet::new(),
             filter: None,
             applied: None,
-            applied_journal:
-                archivefs_core::dat::rename_apply::journal::default_rename_transaction_dir()
-                    .unwrap_or_else(|_| {
-                        PathBuf::from(
-                            archivefs_core::dat::rename_apply::RENAME_TRANSACTIONS_DIRECTORY,
-                        )
-                    }),
+            applied_journal,
+            applied_journal_unavailable,
             result_message: None,
             result_complete: true,
             last_rollback: None,
@@ -302,6 +320,7 @@ impl RomOrganisationPageState {
         self.mode = OrganisationMode::RenameInPlace;
         self.saved_master_root = Some(root);
         self.applied_journal = journal;
+        self.applied_journal_unavailable = None;
     }
 
     /// Test seam: a reviewed plan holding one approved source.
@@ -606,6 +625,10 @@ impl RomOrganisationPageState {
     /// only at its own transaction-safe checkpoints.
     pub(crate) fn apply_cancellable(&mut self, cancel: &std::sync::atomic::AtomicBool) {
         self.begin_outcome();
+        if let Some(refusal) = &self.applied_journal_unavailable {
+            self.error = Some(refusal.clone());
+            return;
+        }
         if self.advanced_r2_selected {
             self.error=Some("Advanced Protection was selected. Use its separate reviewed approval; legacy Apply is refused.".into());
             return;
@@ -729,6 +752,10 @@ impl RomOrganisationPageState {
     ) {
         use archivefs_core::dat::rom_organisation as organisation;
         self.begin_outcome();
+        if let Some(refusal) = &self.applied_journal_unavailable {
+            self.error = Some(refusal.clone());
+            return;
+        }
         let id = history.transaction_id.clone();
         if self.advanced_r2_selected {
             self.error = Some(
@@ -809,6 +836,10 @@ impl RomOrganisationPageState {
     /// Rolls back the last applied transaction.
     pub(crate) fn rollback(&mut self) {
         self.begin_outcome();
+        if let Some(refusal) = &self.applied_journal_unavailable {
+            self.error = Some(refusal.clone());
+            return;
+        }
         if self.advanced_r2_selected {
             self.error =
                 Some("Advanced Protection Undo needs a fresh separate approval in History.".into());
@@ -3726,5 +3757,49 @@ mod tests {
             assert!(layout.columns <= previous);
             previous = layout.columns;
         }
+    }
+
+    /// #312: the production constructor with an unresolved data folder has
+    /// no journal folder: Apply (which creates its journal folder first),
+    /// History Undo and Undo all refuse before creating anything, never in
+    /// the launch directory.
+    #[test]
+    fn an_unresolved_data_folder_refuses_apply_and_undo_before_creating_any_folder() {
+        use archivefs_core::dat::rename_apply::{RenameTransaction, TransactionState};
+        let refusal = archivefs_core::dat::rename_apply::journal::JOURNAL_DIR_UNAVAILABLE;
+        let cwd_journal =
+            std::path::Path::new(archivefs_core::dat::rename_apply::RENAME_TRANSACTIONS_DIRECTORY);
+        let cwd_journal_existed = cwd_journal.exists();
+        let mut state = RomOrganisationPageState::with_journal_resolver(|| {
+            Err("EmuWiz found data in two places")
+        });
+        assert_eq!(state.applied_journal, PathBuf::new());
+        let refused = |state: &RomOrganisationPageState| {
+            state
+                .error
+                .as_deref()
+                .is_some_and(|text| text.starts_with(refusal) && text.contains("two places"))
+        };
+        state.apply();
+        assert!(refused(&state), "{:?}", state.error);
+        state.rollback();
+        assert!(refused(&state), "{:?}", state.error);
+        let history = RenameTransaction {
+            transaction_id: "pr312".into(),
+            plan_generation: 1,
+            classifier_version: None,
+            created_at_unix: 0,
+            source_scan_root: String::new(),
+            state: TransactionState::Applied,
+            entries: Vec::new(),
+            created_directories: Vec::new(),
+            recovery_resolution: None,
+            recovery_resolved_at_unix: None,
+            unknown: Default::default(),
+        };
+        state.select_history_transaction(&history);
+        assert!(refused(&state), "{:?}", state.error);
+        assert!(!state.error_after_changes);
+        assert_eq!(cwd_journal.exists(), cwd_journal_existed);
     }
 }
