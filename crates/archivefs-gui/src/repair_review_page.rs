@@ -564,6 +564,11 @@ pub(crate) struct RepairReviewPageState {
     /// `RepairExecutionOptions::journal_dir` the production path already
     /// threads through unchanged.
     pub(crate) journal_dir_override: Option<PathBuf>,
+    /// Test-only stand-in for the data-folder resolver [`Self::spawn_apply`]
+    /// uses when there is no override, so a test can drive the real Apply
+    /// path with a resolver that fails (for example two existing setups).
+    #[cfg(test)]
+    pub(crate) journal_resolver_for_test: Option<fn() -> Result<PathBuf, String>>,
     /// Overrides the [`AuditCacheConfig`] both [`Self::start_scan`] (a fresh
     /// whole-library scan) and [`Self::spawn_apply`] (the authoritative
     /// re-scan [`apply_saved_plan_selected`] runs) use, exactly mirroring
@@ -1064,6 +1069,16 @@ impl RepairReviewPageState {
     /// dedicated thread with the *exact* saved plan this page loaded (never
     /// a GUI-built [`archivefs_core::repair::plan::RepairPlan`]) and the
     /// exact frozen selection, and relays only the result back.
+    /// The production data-folder resolver (or, in tests only, its stand-in).
+    fn resolve_default_journal_dir(&self) -> Result<PathBuf, String> {
+        #[cfg(test)]
+        if let Some(resolver) = self.journal_resolver_for_test {
+            return resolver();
+        }
+        archivefs_core::dat::rename_apply::journal::default_rename_transaction_dir()
+            .map_err(|error| error.to_string())
+    }
+
     fn spawn_apply(&mut self, plan: LibraryRepairPlan, confirmation: RepairApplyConfirmation) {
         if self.apply_job.is_some() {
             return;
@@ -1076,10 +1091,9 @@ impl RepairReviewPageState {
         // `None` in production: resolves the exact same default journal
         // directory as before. `Some(dir)` only in tests - see
         // `journal_dir_override`'s doc.
-        let journal_dir = match repair_journal_dir(
-            self.journal_dir_override.clone(),
-            archivefs_core::dat::rename_apply::journal::default_rename_transaction_dir,
-        ) {
+        let journal_dir = match repair_journal_dir(self.journal_dir_override.clone(), || {
+            self.resolve_default_journal_dir()
+        }) {
             Ok(dir) => dir,
             Err(refusal) => {
                 self.apply_result = None;

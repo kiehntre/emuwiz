@@ -581,7 +581,8 @@ impl RepairHistoryPageState {
     /// Archives one stale record immediately. This only changes the visibility
     /// sidecar; the core re-reads and rechecks the journal before doing so.
     pub(crate) fn archive_one(&mut self, transaction_id: &str) {
-        if self.journal_dir_unavailable.is_some() {
+        if let Some(refusal) = &self.journal_dir_unavailable {
+            self.archive_state_error = Some(refusal.clone());
             return;
         }
         if self.background_ui {

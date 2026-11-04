@@ -225,13 +225,14 @@ impl RomOrganisationPageState {
             filter: None,
             applied: None,
             applied_journal,
-            applied_journal_unavailable,
+            applied_journal_unavailable: applied_journal_unavailable.clone(),
             result_message: None,
             result_complete: true,
             last_rollback: None,
             quarantined_undo: None,
             error_after_changes: false,
-            error: None,
+            // Shown as soon as the page opens, not only when an action is refused.
+            error: applied_journal_unavailable,
             stopped: false,
             pending_apply: None,
             confirm_text: String::new(),
@@ -3774,6 +3775,13 @@ mod tests {
             Err("EmuWiz found data in two places")
         });
         assert_eq!(state.applied_journal, PathBuf::new());
+        assert!(
+            state
+                .error
+                .as_deref()
+                .is_some_and(|text| text.starts_with(refusal)),
+            "the refusal is shown as soon as the page opens"
+        );
         let refused = |state: &RomOrganisationPageState| {
             state
                 .error

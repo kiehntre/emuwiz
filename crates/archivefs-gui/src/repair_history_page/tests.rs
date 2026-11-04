@@ -1424,10 +1424,18 @@ fn an_unresolved_data_folder_never_reconciles_removes_or_undoes_any_journal() {
         "{shown}"
     );
 
-    page.refresh();
-    assert!(page.transactions.is_empty());
-
+    // A decoy journal folder behind the page's back: were any guard missing,
+    // refresh would list it (an unparsable journal is a load problem) and
+    // clear would remove from it. The page must stay refused regardless.
     let id = "pr312-never-a-real-transaction".to_string();
+    let decoy = tempfile::tempdir().unwrap();
+    let decoy_journal = decoy.path().join(format!("{id}.json"));
+    std::fs::write(&decoy_journal, "decoy").unwrap();
+    page.journal_dir = decoy.path().to_path_buf();
+
+    page.refresh();
+    assert!(page.transactions.is_empty() && page.load_problems.is_empty());
+
     page.clear_confirm = Some(vec![id.clone()]);
     page.confirm_clear();
     let outcome = page.clear_outcome.clone().expect("a clear outcome");
@@ -1452,6 +1460,13 @@ fn an_unresolved_data_folder_never_reconciles_removes_or_undoes_any_journal() {
     page.confirm_archive();
     assert!(page.archive_outcome.is_none());
     assert!(page.archive_state.archived_transaction_ids.is_empty());
+    assert!(
+        page.archive_state_error
+            .as_deref()
+            .is_some_and(|text| text.starts_with(refusal))
+    );
 
+    assert_eq!(std::fs::read_to_string(&decoy_journal).unwrap(), "decoy");
+    assert_eq!(std::fs::read_dir(decoy.path()).unwrap().count(), 1);
     assert_eq!(cwd_journal.exists(), cwd_journal_existed);
 }

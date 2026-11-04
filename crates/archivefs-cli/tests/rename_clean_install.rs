@@ -227,3 +227,50 @@ ratarmount_bin = "ratarmount"
     );
     let _ = std::fs::remove_dir_all(&home);
 }
+
+/// #312: with two existing setups the data folder is unresolved, and
+/// `repair history` (which reconciles journals) must refuse, never list or
+/// reconcile a `rename-transactions-sealed-v1` folder in the launch directory.
+#[test]
+fn repair_history_never_reads_a_journal_folder_in_the_launch_directory() {
+    let home = isolated_home("repair-history-two-setups");
+    for name in ["archivefs", "emuwiz"] {
+        std::fs::create_dir_all(home.join(".local/share").join(name)).unwrap();
+        std::fs::write(
+            home.join(".local/share").join(name).join("library.sqlite3"),
+            name,
+        )
+        .unwrap();
+    }
+    let launch = home.join("launch-dir");
+    let decoy_dir = launch.join(archivefs_core::dat::rename_apply::RENAME_TRANSACTIONS_DIRECTORY);
+    std::fs::create_dir_all(&decoy_dir).unwrap();
+    let decoy = decoy_dir.join("decoy-transaction.json");
+    std::fs::write(&decoy, "{\"not\":\"a journal\"}").unwrap();
+
+    let output = Command::new(env!("CARGO_BIN_EXE_emuwiz-cli"))
+        .args(["repair", "history"])
+        .current_dir(&launch)
+        .env("HOME", &home)
+        .env_remove("USERPROFILE")
+        .env_remove("XDG_DATA_HOME")
+        .env_remove("EMUWIZ_DATA_HOME")
+        .output()
+        .unwrap();
+    let text = combined(&output);
+    assert!(!output.status.success(), "must refuse, got:\n{text}");
+    assert!(
+        text.contains(archivefs_core::dat::rename_apply::journal::JOURNAL_DIR_UNAVAILABLE),
+        "the actionable refusal must be shown, got:\n{text}"
+    );
+    assert!(
+        !text.contains("decoy"),
+        "the launch directory was read:\n{text}"
+    );
+    assert_eq!(
+        std::fs::read_to_string(&decoy).unwrap(),
+        "{\"not\":\"a journal\"}"
+    );
+    assert_eq!(std::fs::read_dir(&decoy_dir).unwrap().count(), 1);
+    let _ = std::fs::remove_dir_all(&home);
+}
