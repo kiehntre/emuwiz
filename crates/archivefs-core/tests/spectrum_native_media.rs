@@ -74,7 +74,7 @@ fn rzx() -> Vec<u8> {
 
 fn config(root: &Path) -> Config {
     Config {
-        configured_source_roots: Some(vec![root.clone().into()]),
+        configured_source_roots: Some(vec![root.into()]),
         source_folders: vec![root.into()],
         mount_root: root.join("mount"),
         ratarmount_bin: String::new(),

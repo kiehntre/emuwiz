@@ -9461,6 +9461,7 @@ pub fn scan_and_persist(
 /// (`Config::source_folders`), while multi-source management must also
 /// register disabled ones (to keep them "configured" rather than
 /// "removed") without asking this function to scan them.
+#[cfg(test)]
 pub(crate) fn scan_and_persist_folders(
     database: &mut Database,
     folders: &[RegisteredSourceFolder],
