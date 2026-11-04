@@ -13,7 +13,10 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use serde::{Deserialize, Serialize};
 
-pub const CACHE_SCHEMA_VERSION: u32 = 1;
+/// Version 2 added the change time to every fingerprint. A version 1 document
+/// (no change time) is not loaded at all, so its entries are re-hashed rather
+/// than trusted.
+pub const CACHE_SCHEMA_VERSION: u32 = 2;
 pub const CACHE_FILE_NAME: &str = "loose-hashes.json";
 pub const CACHE_DIRECTORY_NAME: &str = "audit-cache";
 pub const MAX_CACHE_ENTRIES: usize = 100_000;
@@ -36,19 +39,28 @@ pub struct AuditCacheMetrics {
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 struct FileFingerprint {
-    // This is intentionally a metadata cache, not a content proof. On coarse
-    // mtime filesystems (including FAT/exFAT and some network filesystems), an
-    // in-place same-size mutation can theoretically preserve every field and
-    // produce a stale hit. We accept that residual risk here rather than add a
-    // content sample or an extra hash to every cache hit.
+    // This is intentionally a metadata cache, not a content proof. The change
+    // time (ctime) is what makes it safe against the common case: a same-size
+    // in-place rewrite whose mtime is then restored (`touch -r`, `cp -p` onto
+    // the file, `rsync --inplace -t`, timestamp-preserving patchers) keeps the
+    // path, size, mtime, device and inode, but the kernel always advances the
+    // ctime and it cannot be set back. Residual risk, accepted here rather
+    // than adding a content sample to every hit: a rewrite within the same
+    // ctime tick as the observation that recorded the entry, and filesystems
+    // that synthesize ctime from mtime (some FUSE/network mounts) or keep
+    // coarse timestamps (FAT/exFAT).
+    //
+    // Only unix exposes a ctime through stable std, so elsewhere no file is
+    // fingerprinted at all: the cache always misses and every file is hashed
+    // (fail closed rather than trust a fingerprint without a change time).
     path: String,
     file_type: FileType,
     size_bytes: u64,
     modified_unix_nanos: Option<i128>,
-    #[cfg(unix)]
-    device: Option<u64>,
-    #[cfg(unix)]
-    inode: Option<u64>,
+    device: u64,
+    inode: u64,
+    changed_unix_seconds: i64,
+    changed_nanoseconds: i64,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -259,10 +271,26 @@ impl AuditHashCache {
         })
     }
 
-    pub fn insert(&mut self, path: &Path, crc32: String, md5: String, sha1: String) {
+    /// Records hashes computed for `path`. `hashed` is the fingerprint the
+    /// hashing pass was bound to (`LocalHashes::fingerprint`). The entry is
+    /// stored only if that fingerprint still describes the file after this
+    /// cache's own observation, so a change that landed between the end of
+    /// hashing and this call can never be recorded with the old hashes.
+    pub fn insert(
+        &mut self,
+        path: &Path,
+        hashed: &crate::identity_source::hashing::FileFingerprint,
+        crc32: String,
+        md5: String,
+        sha1: String,
+    ) {
         let Some(fingerprint) = FileFingerprint::observe(path) else {
             return;
         };
+        if hashed.size_bytes != fingerprint.size_bytes || !hashed.still_current() {
+            self.entries.remove(&fingerprint.path);
+            return;
+        }
         self.entries.insert(
             fingerprint.path.clone(),
             CacheEntry {
@@ -490,7 +518,14 @@ fn process_is_alive(pid: u32) -> bool {
 }
 
 impl FileFingerprint {
+    #[cfg(not(unix))]
+    fn observe(_path: &Path) -> Option<Self> {
+        None
+    }
+
+    #[cfg(unix)]
     fn observe(path: &Path) -> Option<Self> {
+        use std::os::unix::fs::MetadataExt;
         let link_metadata = fs::symlink_metadata(path).ok()?;
         let file_type = if link_metadata.file_type().is_symlink() {
             FileType::Symlink
@@ -515,10 +550,10 @@ impl FileFingerprint {
             file_type,
             size_bytes: metadata.len(),
             modified_unix_nanos,
-            #[cfg(unix)]
-            device: Some(std::os::unix::fs::MetadataExt::dev(&metadata)),
-            #[cfg(unix)]
-            inode: Some(std::os::unix::fs::MetadataExt::ino(&metadata)),
+            device: metadata.dev(),
+            inode: metadata.ino(),
+            changed_unix_seconds: metadata.ctime(),
+            changed_nanoseconds: metadata.ctime_nsec(),
         })
     }
 }
@@ -547,9 +582,46 @@ fn now_unix_seconds() -> i64 {
         .unwrap_or(0)
 }
 
+/// Test support: rewrites `path` in place with same-size `bytes` (same inode)
+/// and restores its exact modification time, retrying until the kernel's
+/// change time has visibly advanced so the scenario is the one a cache must
+/// detect: path, size, mtime, device and inode all unchanged.
+#[cfg(all(test, unix))]
+pub(crate) fn rewrite_in_place_keeping_mtime(path: &Path, bytes: &[u8]) {
+    use std::os::unix::fs::{FileExt, MetadataExt};
+    let before = fs::metadata(path).unwrap();
+    assert_eq!(
+        before.len(),
+        bytes.len() as u64,
+        "rewrite must keep the size"
+    );
+    let modified = before.modified().unwrap();
+    for _ in 0..400 {
+        std::thread::sleep(std::time::Duration::from_millis(5));
+        let file = OpenOptions::new().write(true).open(path).unwrap();
+        file.write_all_at(bytes, 0).unwrap();
+        file.set_modified(modified).unwrap();
+        file.sync_all().unwrap();
+        drop(file);
+        let after = fs::metadata(path).unwrap();
+        assert_eq!(after.ino(), before.ino());
+        assert_eq!(after.len(), before.len());
+        assert_eq!(after.modified().unwrap(), modified);
+        if (after.ctime(), after.ctime_nsec()) != (before.ctime(), before.ctime_nsec()) {
+            return;
+        }
+    }
+    panic!("the change time never advanced; the fixture cannot exercise the case");
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::identity_source::hashing::FileFingerprint as HashedFingerprint;
+
+    fn hashed(path: &Path) -> HashedFingerprint {
+        HashedFingerprint::observe(path).unwrap()
+    }
 
     #[test]
     fn fingerprint_requires_absolute_path_and_normalises_components() {
@@ -574,10 +646,10 @@ mod tests {
                             file_type: FileType::Regular,
                             size_bytes: 1,
                             modified_unix_nanos: None,
-                            #[cfg(unix)]
-                            device: None,
-                            #[cfg(unix)]
-                            inode: None,
+                            device: 0,
+                            inode: 0,
+                            changed_unix_seconds: 0,
+                            changed_nanoseconds: 0,
                         },
                         crc32: "00000000".to_string(),
                         md5: "0".repeat(32),
@@ -593,6 +665,7 @@ mod tests {
         assert!(!cache.entries.contains_key("/synthetic/1"));
     }
 
+    #[cfg(unix)]
     #[test]
     fn unchanged_file_is_a_persistent_hit_and_size_change_misses() {
         let root = tempfile::tempdir().unwrap();
@@ -601,7 +674,13 @@ mod tests {
         let cache_path = root.path().join("cache").join(CACHE_FILE_NAME);
 
         let mut first = AuditHashCache::at(cache_path.clone());
-        first.insert(&file, "11111111".into(), "22".repeat(16), "33".repeat(20));
+        first.insert(
+            &file,
+            &hashed(&file),
+            "11111111".into(),
+            "22".repeat(16),
+            "33".repeat(20),
+        );
         assert_eq!(first.metrics.cache_hits, 0);
         first.save().unwrap();
 
@@ -614,13 +693,14 @@ mod tests {
         assert_eq!(second.metrics.invalidated_entries, 1);
     }
 
+    #[cfg(unix)]
     #[test]
     fn precise_mtime_and_identity_fields_invalidate_a_cached_entry() {
         let root = tempfile::tempdir().unwrap();
         let file = root.path().join("game.rom");
         std::fs::write(&file, b"same").unwrap();
         let mut cache = AuditHashCache::at(root.path().join(CACHE_FILE_NAME));
-        cache.insert(&file, "11".into(), "22".into(), "33".into());
+        cache.insert(&file, &hashed(&file), "11".into(), "22".into(), "33".into());
         let key = normalize_absolute(&file)
             .unwrap()
             .to_string_lossy()
@@ -633,14 +713,21 @@ mod tests {
             .modified_unix_nanos = Some(i128::MIN);
         assert!(cache.lookup(&file).is_none());
 
-        cache.insert(&file, "11".into(), "22".into(), "33".into());
-        #[cfg(unix)]
-        {
-            cache.entries.get_mut(&key).unwrap().fingerprint.inode = Some(u64::MAX);
-            assert!(cache.lookup(&file).is_none());
-        }
+        cache.insert(&file, &hashed(&file), "11".into(), "22".into(), "33".into());
+        cache.entries.get_mut(&key).unwrap().fingerprint.inode = u64::MAX;
+        assert!(cache.lookup(&file).is_none());
+
+        cache.insert(&file, &hashed(&file), "11".into(), "22".into(), "33".into());
+        cache
+            .entries
+            .get_mut(&key)
+            .unwrap()
+            .fingerprint
+            .changed_nanoseconds ^= 1;
+        assert!(cache.lookup(&file).is_none());
     }
 
+    #[cfg(unix)]
     #[test]
     fn corrupt_cache_fails_open_and_reloads_after_save() {
         let root = tempfile::tempdir().unwrap();
@@ -653,7 +740,7 @@ mod tests {
         let mut cache = AuditHashCache::at(path.clone());
         let file = root.path().join("game.rom");
         std::fs::write(&file, b"game").unwrap();
-        cache.insert(&file, "11".into(), "22".into(), "33".into());
+        cache.insert(&file, &hashed(&file), "11".into(), "22".into(), "33".into());
         cache.save().unwrap();
         assert_eq!(AuditHashCache::load(path).len(), 1);
     }
@@ -751,7 +838,13 @@ mod tests {
         let file = directory.join("game.bin");
         std::fs::write(&file, b"abcd").unwrap();
         let mut cache = AuditHashCache::at(directory.join("cache").join(CACHE_FILE_NAME));
-        cache.insert(&file, "ed82cd11".into(), "m".repeat(32), "s".repeat(40));
+        cache.insert(
+            &file,
+            &hashed(&file),
+            "ed82cd11".into(),
+            "m".repeat(32),
+            "s".repeat(40),
+        );
         cache
     }
 
@@ -883,6 +976,7 @@ mod tests {
         assert!(orphan.exists(), "cleanup never runs without the lock");
     }
 
+    #[cfg(unix)]
     #[test]
     fn a_normal_save_renames_atomically_and_leaves_no_temporary_or_lock() {
         let root = tempfile::tempdir().unwrap();
@@ -930,7 +1024,13 @@ mod tests {
         let mut cache = AuditHashCache::from_config(&AuditCacheConfig::Default);
         let file = std::env::temp_dir().join("emuwiz-cache-tripwire-probe");
         std::fs::write(&file, b"x").unwrap();
-        cache.insert(&file, "00000000".into(), "0".repeat(32), "0".repeat(40));
+        cache.insert(
+            &file,
+            &hashed(&file),
+            "00000000".into(),
+            "0".repeat(32),
+            "0".repeat(40),
+        );
         assert!(
             cache.save().is_ok(),
             "a disabled cache saves nothing and succeeds"
@@ -950,7 +1050,13 @@ mod tests {
         assert!(cache.enabled);
         let file = root.path().join("f.bin");
         std::fs::write(&file, b"abcd").unwrap();
-        cache.insert(&file, "ed82cd11".into(), "m".repeat(32), "s".repeat(40));
+        cache.insert(
+            &file,
+            &hashed(&file),
+            "ed82cd11".into(),
+            "m".repeat(32),
+            "s".repeat(40),
+        );
         cache.save().unwrap();
         assert!(root.path().join(CACHE_FILE_NAME).is_file());
     }
@@ -994,5 +1100,105 @@ mod tests {
         for path in no {
             assert!(!is_cargo_test_binary_path(Path::new(path)), "{path:?}");
         }
+    }
+
+    // ---- S03-02 / D3-02: same-size in-place rewrite with a restored mtime ----
+
+    #[cfg(unix)]
+    #[test]
+    fn same_size_rewrite_with_restored_mtime_misses_the_cache() {
+        let root = tempfile::tempdir().unwrap();
+        let file = root.path().join("game.rom");
+        std::fs::write(&file, b"abc").unwrap();
+        let cache_path = root.path().join("cache").join(CACHE_FILE_NAME);
+        let mut first = AuditHashCache::at(cache_path.clone());
+        first.insert(
+            &file,
+            &hashed(&file),
+            "11111111".into(),
+            "22".repeat(16),
+            "33".repeat(20),
+        );
+        first.save().unwrap();
+
+        rewrite_in_place_keeping_mtime(&file, b"abd");
+
+        let mut second = AuditHashCache::load(cache_path);
+        assert_eq!(second.len(), 1);
+        assert!(
+            second.lookup(&file).is_none(),
+            "a rewritten file must never be served its old hashes"
+        );
+        assert_eq!(second.metrics.cache_hits, 0);
+        assert_eq!(second.metrics.invalidated_entries, 1);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn hashes_bound_to_an_outdated_observation_are_not_recorded() {
+        let root = tempfile::tempdir().unwrap();
+        let file = root.path().join("game.rom");
+        std::fs::write(&file, b"abc").unwrap();
+        let mut cache = AuditHashCache::at(root.path().join(CACHE_FILE_NAME));
+        cache.insert(&file, &hashed(&file), "11".into(), "22".into(), "33".into());
+        assert_eq!(cache.len(), 1);
+        // Hashing finished, then the file changed before the result was cached.
+        let observed_while_hashing = hashed(&file);
+        rewrite_in_place_keeping_mtime(&file, b"abd");
+        cache.insert(
+            &file,
+            &observed_while_hashing,
+            "44".into(),
+            "55".into(),
+            "66".into(),
+        );
+        assert!(cache.is_empty(), "stale hashes were recorded");
+        assert!(cache.lookup(&file).is_none());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn an_entry_written_without_a_change_time_is_never_trusted() {
+        use std::os::unix::fs::MetadataExt;
+        let root = tempfile::tempdir().unwrap();
+        let file = root.path().join("game.rom");
+        std::fs::write(&file, b"abc").unwrap();
+        let metadata = std::fs::metadata(&file).unwrap();
+        let key = normalize_absolute(&file)
+            .unwrap()
+            .to_string_lossy()
+            .into_owned();
+        let modified = metadata
+            .modified()
+            .unwrap()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos() as i128;
+        // Exactly what the first cache format wrote: every field it knew,
+        // matching the file on disk, but no change time.
+        let document = serde_json::json!({
+            "schema_version": 1,
+            "entries": {
+                key.clone(): {
+                    "fingerprint": {
+                        "path": key,
+                        "file_type": "Regular",
+                        "size_bytes": 3,
+                        "modified_unix_nanos": modified,
+                        "device": metadata.dev(),
+                        "inode": metadata.ino(),
+                    },
+                    "crc32": "11111111",
+                    "md5": "22".repeat(16),
+                    "sha1": "33".repeat(20),
+                    "last_used_unix_seconds": now_unix_seconds(),
+                }
+            }
+        });
+        let path = root.path().join(CACHE_FILE_NAME);
+        std::fs::write(&path, serde_json::to_vec(&document).unwrap()).unwrap();
+        let mut cache = AuditHashCache::load(path);
+        assert!(cache.lookup(&file).is_none());
+        assert_eq!(cache.metrics.cache_hits, 0);
     }
 }
