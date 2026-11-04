@@ -131,6 +131,9 @@ use crate::playing_library_page::{PlayingLibraryPageAction, PlayingLibraryPageSt
 use activity::Activity;
 
 pub(super) const DUPLICATE_SCAN_TITLE: &str = "Finding exact duplicate files";
+/// Shown once the artwork index worker has stopped; it cannot restart.
+pub(super) const ARTWORK_STOPPED: &str =
+    "Artwork discovery has stopped. Restart EmuWiz to show pictures again.";
 use artwork::Artwork;
 use backend::{
     Backend, Command, DuplicateRepairPreview, DuplicateRepairRecord, Event, Payload, Preferences,
@@ -888,7 +891,7 @@ impl App {
         if self.artwork.index_unavailable() {
             self.activity.finish(
                 id,
-                "Artwork discovery has stopped. Restart EmuWiz to show pictures again.".into(),
+                ARTWORK_STOPPED.into(),
                 Some("The artwork index worker is no longer running.".into()),
             );
             return;

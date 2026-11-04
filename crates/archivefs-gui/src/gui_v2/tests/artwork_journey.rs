@@ -394,15 +394,26 @@ fn a_stopped_artwork_indexer_is_asked_once_from_every_artwork_surface() {
         // A picture already on show must survive the following frames.
         let held = app.artwork.key(2, Kind::Cover);
         app.artwork.pictures.insert(held, Picture::Missing);
+        let mut output = frame(&context, &mut app, size);
         for _ in 0..5 {
             app.poll(&context);
-            frame(&context, &mut app, size);
+            output = frame(&context, &mut app, size);
         }
         assert_eq!(
             app.artwork.generation,
             generation + 1,
             "{name}: the index was re-queued on every frame"
         );
+        // The pages about artwork say why nothing is shown.
+        if matches!(name, "Museum" | "Artwork") {
+            assert!(
+                text(&output)
+                    .iter()
+                    .any(|value| value == super::super::ARTWORK_STOPPED),
+                "{name}: {:?}",
+                text(&output)
+            );
+        }
         assert!(
             app.artwork.pictures.contains_key(&held),
             "{name}: re-queuing cleared pictures"

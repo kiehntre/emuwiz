@@ -1909,6 +1909,8 @@ impl App {
             if self.artwork.index_loading {
                 ui.spinner();
                 ui.label("Finding existing artwork…");
+            } else if self.artwork.index_unavailable() {
+                ui.label(super::ARTWORK_STOPPED);
             }
         });
 
@@ -3787,7 +3789,10 @@ impl App {
         ui.vertical(|ui| {
                 ui.label("Review artwork, manuals and supported extras for one game. Provider setup stays in Sources & Providers.");
                 if ui
-                    .add_enabled(!self.artwork.index_loading, egui::Button::new("Recheck providers"))
+                    .add_enabled(
+                        !self.artwork.index_loading && !self.artwork.index_unavailable(),
+                        egui::Button::new("Recheck providers"),
+                    )
                     .clicked()
                 {
                     self.refresh_artwork_index();
@@ -3795,6 +3800,8 @@ impl App {
                 if self.artwork.index_loading {
                     ui.spinner();
                     ui.label("Checking metadata and artwork providers…");
+                } else if self.artwork.index_unavailable() {
+                    ui.label(super::ARTWORK_STOPPED);
                 }
                 let Some(game_id) = selected else {
                     let (covers, screenshots, descriptions) = self.artwork.index.as_ref().map_or(
