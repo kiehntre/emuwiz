@@ -163,7 +163,9 @@ impl ArtworkTotals {
         self.failures += failures;
     }
     pub fn summary(&self) -> String {
-        let mut text = format!("{} pictures loaded this session.", self.completed);
+        // `completed` counts every finished request, including failed and
+        // cancelled ones, so it is never called "loaded".
+        let mut text = format!("{} picture requests finished this session.", self.completed);
         if self.failures > 0 {
             text.push_str(&format!(
                 " {} could not load; games remain available. Open a game to retry its picture.",
@@ -414,7 +416,7 @@ mod grouped_artwork_tests {
         );
         assert_eq!(activity.active(), 0, "finished artwork is not pending work");
         assert!(
-            job.summary.contains("15 pictures loaded"),
+            job.summary.contains("15 picture requests finished"),
             "{}",
             job.summary
         );
