@@ -37,6 +37,10 @@ use crate::repair::proposal::{
 };
 use crate::safe_read::TrustedRoots;
 
+/// The only chdman the converter runs when its caller names none (the GUI
+/// never names one). Storage Review checks this binding, not a PATH lookup.
+pub const REVIEWED_CHDMAN_PATH: &str = "/usr/bin/chdman";
+
 const CHDMAN_TIMEOUT: Duration = Duration::from_secs(30);
 
 /// Staging directory name prefix used while `chdman` writes its output.
@@ -449,7 +453,7 @@ fn resolve_chdman(explicit: Option<&Path>) -> Result<PathBuf, ChdConversionError
         }
         return Ok(path.to_path_buf());
     }
-    let preferred = Path::new("/usr/bin/chdman");
+    let preferred = Path::new(REVIEWED_CHDMAN_PATH);
     if preferred.exists() {
         return resolve_chdman(Some(preferred));
     }
@@ -458,12 +462,34 @@ fn resolve_chdman(explicit: Option<&Path>) -> Result<PathBuf, ChdConversionError
     ))
 }
 
-pub fn build_chd_conversion_plan(
-    cue_path: &Path,
-    target_path: &Path,
-    source_mode: ChdConversionSourceMode,
-    chdman_path: Option<&Path>,
-) -> Result<ChdConversionPlan, ChdConversionError> {
+/// Read-only source admission for the verified CUE/BIN to CHD lane: the same
+/// layout and file-safety checks [`build_chd_conversion_plan`] applies to its
+/// source (shared code, not a copy), plus a cheap open of both files. It does
+/// not hash them, fingerprint the sectors, choose a target or resolve chdman,
+/// so planning can still refuse a source this admits (for example one that
+/// changes or cannot be read in full). Callers that only report eligibility
+/// (Storage Review) use it so they never offer a layout the converter refuses.
+pub fn check_chd_conversion_source(cue_path: &Path) -> Result<(), ChdConversionError> {
+    source_preflight(cue_path)?;
+    let layout = admitted_source_layout(cue_path, ChdConversionSourceMode::KeepSource)?;
+    let track = layout
+        .supported_single_mode1_2048()
+        .map_err(|e| ChdConversionError::InvalidSource(e.to_string()))?;
+    for (label, path) in [("CUE", cue_path), ("BIN", track.path.as_path())] {
+        fs::File::open(path)
+            .map_err(|e| ChdConversionError::InvalidSource(format!("{label}: {e}")))?;
+    }
+    Ok(())
+}
+
+/// Whether `path` is a chdman the converter would run: the same check it
+/// applies to an explicit binding (a regular, non-symlink, executable file).
+/// It only inspects metadata; nothing is executed.
+pub fn check_chdman_binding(path: &Path) -> Result<PathBuf, ChdConversionError> {
+    resolve_chdman(Some(path))
+}
+
+fn source_preflight(cue_path: &Path) -> Result<(), ChdConversionError> {
     safe_regular(cue_path).map_err(|e| ChdConversionError::InvalidSource(format!("CUE: {e}")))?;
     if fs::metadata(cue_path)
         .map_err(|e| ChdConversionError::InvalidSource(e.to_string()))?
@@ -474,8 +500,13 @@ pub fn build_chd_conversion_plan(
             "CUE exceeds the conversion size limit".into(),
         ));
     }
-    let cue_identity =
-        capture_identity(cue_path).map_err(|e| ChdConversionError::InvalidSource(e.to_string()))?;
+    Ok(())
+}
+
+fn admitted_source_layout(
+    cue_path: &Path,
+    source_mode: ChdConversionSourceMode,
+) -> Result<crate::ingestion::cue_bin::CueLayout, ChdConversionError> {
     let layout = layout_contract::source_layout(cue_path, source_mode)
         .map_err(ChdConversionError::InvalidSource)?;
     let track = layout
@@ -483,6 +514,22 @@ pub fn build_chd_conversion_plan(
         .map_err(|e| ChdConversionError::InvalidSource(e.to_string()))?;
     safe_regular(&track.path)
         .map_err(|e| ChdConversionError::InvalidSource(format!("BIN: {e}")))?;
+    Ok(layout)
+}
+
+pub fn build_chd_conversion_plan(
+    cue_path: &Path,
+    target_path: &Path,
+    source_mode: ChdConversionSourceMode,
+    chdman_path: Option<&Path>,
+) -> Result<ChdConversionPlan, ChdConversionError> {
+    source_preflight(cue_path)?;
+    let cue_identity =
+        capture_identity(cue_path).map_err(|e| ChdConversionError::InvalidSource(e.to_string()))?;
+    let layout = admitted_source_layout(cue_path, source_mode)?;
+    let track = layout
+        .supported_single_mode1_2048()
+        .map_err(|e| ChdConversionError::InvalidSource(e.to_string()))?;
     let bin_identity = capture_identity(&track.path)
         .map_err(|e| ChdConversionError::InvalidSource(e.to_string()))?;
     let source_fingerprint = fingerprint_cue_layout(&layout)

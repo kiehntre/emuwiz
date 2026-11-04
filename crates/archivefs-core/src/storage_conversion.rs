@@ -5,7 +5,7 @@ use crate::storage_health::{
     StorageOpportunityKind, StorageRoundTripClass,
 };
 use serde::Serialize;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::Command;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
@@ -32,6 +32,38 @@ pub struct ConversionToolRecord {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Default)]
 pub struct ConversionToolInventory {
     pub tools: Vec<ConversionToolRecord>,
+    /// The chdman the verified CUE/BIN converter itself would run. CHD
+    /// eligibility follows this, never the PATH lookup in `tools`.
+    #[serde(default)]
+    pub reviewed_chdman: ChdmanBinding,
+}
+
+/// The converter's reviewed chdman binding, judged by the converter's own check.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Default)]
+#[serde(tag = "state", content = "detail", rename_all = "SCREAMING_SNAKE_CASE")]
+pub enum ChdmanBinding {
+    /// The converter would run this file.
+    Usable(PathBuf),
+    /// Nothing is installed at the reviewed path.
+    #[default]
+    Absent,
+    /// Something is there, but the converter refuses it (for example a symlink
+    /// or a file without execute permission).
+    Unusable(String),
+}
+
+/// Judge `path` exactly as the converter judges its chdman binding. Reads
+/// metadata only; nothing is executed.
+pub fn chdman_binding_at(path: &Path) -> ChdmanBinding {
+    // Mirrors the converter's own lookup: a missing (or dangling) reviewed
+    // path means no binding, anything else must pass its executable check.
+    if !path.exists() {
+        return ChdmanBinding::Absent;
+    }
+    match crate::repair::optical_conversion::check_chdman_binding(path) {
+        Ok(path) => ChdmanBinding::Usable(path),
+        Err(error) => ChdmanBinding::Unusable(error.to_string()),
+    }
 }
 
 fn which(name: &str) -> Option<PathBuf> {
@@ -89,6 +121,9 @@ fn probe(name: &str, args: &[&str], capabilities: &[&str]) -> ConversionToolReco
 
 pub fn probe_conversion_tools() -> ConversionToolInventory {
     ConversionToolInventory {
+        reviewed_chdman: chdman_binding_at(Path::new(
+            crate::repair::optical_conversion::REVIEWED_CHDMAN_PATH,
+        )),
         tools: vec![
             probe(
                 "chdman",
@@ -140,23 +175,20 @@ pub fn capability_for_item(
             options: Vec::new(),
             round_trip: item.opportunity.round_trip,
             verification_required: "No conversion recommended.".into(),
+            eligibility_detail: None,
             savings_measurement: "Not measured.".into(),
         };
     }
     let (name, mode, options, round_trip, verification) = match (item.format, target) {
+        // The only CHD route: storage health sets this target solely for a
+        // sheet the verified converter admits. GDI and ISO have no verified
+        // converter, and a CD image must never be offered `createdvd`.
         (StorageFormatClass::BinCue, Some(StorageFormatClass::Chd)) => (
             "chdman",
             "createcd",
             vec!["--compression cdlz,cdzl,cdfl".into(), "--hunksize 8".into()],
             StorageRoundTripClass::ContentEquivalent,
-            "Track hashes, normalized CUE/topology, and canonical optical fingerprint.",
-        ),
-        (StorageFormatClass::Gdi, Some(StorageFormatClass::Chd)) => (
-            "chdman",
-            "createcd",
-            vec!["--compression cdlz,cdzl,cdfl".into(), "--hunksize 8".into()],
-            StorageRoundTripClass::ContentEquivalent,
-            "Track hashes, normalized GDI topology, and GD-ROM fingerprint.",
+            "Canonical optical fingerprint of the source and the CHD, plus the CHD's single-track layout metadata and hunk map.",
         ),
         (StorageFormatClass::Iso, Some(StorageFormatClass::Rvz)) => (
             "dolphin-tool",
@@ -172,16 +204,6 @@ pub fn capability_for_item(
             StorageRoundTripClass::PlayableNotOriginalReconstructable,
             "CSO header/block validation and reconstructed ISO hash.",
         ),
-        (StorageFormatClass::Iso, Some(StorageFormatClass::Chd)) => (
-            "chdman",
-            "createdvd",
-            vec![
-                "--compression lzma,zlib,huff,flac".into(),
-                "--hunksize 2 sectors".into(),
-            ],
-            StorageRoundTripClass::ByteIdenticalExpected,
-            "Proven DVD media classification and SHA-256 of reconstructed ISO.",
-        ),
         _ => {
             return StorageConversionCapability {
                 eligibility: ConversionEligibility::Unsupported,
@@ -193,6 +215,7 @@ pub fn capability_for_item(
                 options: Vec::new(),
                 round_trip: StorageRoundTripClass::NotEstablished,
                 verification_required: "No evidence-backed conversion proof is established.".into(),
+                eligibility_detail: None,
                 savings_measurement: "Qualitative only.".into(),
             };
         }
@@ -200,11 +223,52 @@ pub fn capability_for_item(
     let Some(record) = tool(inventory, name) else {
         unreachable!()
     };
-    let eligibility = if record.status == ToolCapabilityStatus::Missing {
+    let topology_unproven = item.opportunity.topology_sensitive
+        && item.opportunity.round_trip == StorageRoundTripClass::NotEstablished;
+    let mut eligibility_detail = None;
+    let mut tool_path = record.path.clone();
+    let mut tool_version = record.version.clone();
+    let eligibility = if name == "chdman" {
+        // The converter runs only its reviewed binding, so that binding, not
+        // whichever chdman PATH finds first, decides readiness.
+        let reviewed = crate::repair::optical_conversion::REVIEWED_CHDMAN_PATH;
+        let elsewhere = record
+            .path
+            .as_deref()
+            .filter(|path| *path != Path::new(reviewed))
+            .map(|path| format!(" The chdman at {} is not used.", path.display()));
+        if record.path.as_deref() != Some(Path::new(reviewed)) {
+            tool_version = None;
+        }
+        match &inventory.reviewed_chdman {
+            ChdmanBinding::Absent => {
+                tool_path = None;
+                eligibility_detail = Some(format!(
+                    "The converter runs chdman only from {reviewed}, and nothing is installed there.{}",
+                    elsewhere.unwrap_or_default()
+                ));
+                ConversionEligibility::ToolMissing
+            }
+            ChdmanBinding::Unusable(reason) => {
+                tool_path = Some(PathBuf::from(reviewed));
+                eligibility_detail = Some(format!(
+                    "The converter cannot use {reviewed}: {reason}.{}",
+                    elsewhere.unwrap_or_default()
+                ));
+                ConversionEligibility::ReviewRequired
+            }
+            ChdmanBinding::Usable(path) => {
+                tool_path = Some(path.clone());
+                if topology_unproven {
+                    ConversionEligibility::TopologyIncomplete
+                } else {
+                    ConversionEligibility::ConversionReady
+                }
+            }
+        }
+    } else if record.status == ToolCapabilityStatus::Missing {
         ConversionEligibility::ToolMissing
-    } else if item.opportunity.topology_sensitive
-        && item.opportunity.round_trip == StorageRoundTripClass::NotEstablished
-    {
+    } else if topology_unproven {
         ConversionEligibility::TopologyIncomplete
     } else if record.status == ToolCapabilityStatus::VersionUnknown {
         ConversionEligibility::ReviewRequired
@@ -214,8 +278,8 @@ pub fn capability_for_item(
     StorageConversionCapability {
         eligibility,
         tool: Some(name.into()),
-        tool_path: record.path.clone(),
-        tool_version: record.version.clone(),
+        tool_path,
+        tool_version,
         target_format: Some(target.unwrap()),
         mode: Some(mode.into()),
         options,
@@ -226,6 +290,7 @@ pub fn capability_for_item(
         } else {
             "Qualitative/range estimate only; no safe read-only measurement mode.".into()
         },
+        eligibility_detail,
     }
 }
 
@@ -324,6 +389,7 @@ mod tests {
                     capability_source: "synthetic".into(),
                 })
                 .collect(),
+            reviewed_chdman: ChdmanBinding::Absent,
         }
     }
 
@@ -376,10 +442,14 @@ mod tests {
                 assert_chdman_codecs(mode, lists[0], &context);
             }
         }
+        // Was 3 (CUE/BIN, GDI and ISO). GDI and ISO to CHD were withdrawn on
+        // 2026-11-03: no verified converter exists for either, and the ISO
+        // route named chdman's DVD mode for CD media. Only the CUE/BIN lane
+        // that `repair::optical_conversion` verifies remains.
         assert_eq!(
-            chdman_routes, 3,
-            "CUE/BIN, GDI and ISO to CHD are the advertised chdman routes; a new one must be \
-             added here deliberately"
+            chdman_routes, 1,
+            "CUE/BIN to CHD is the only advertised chdman route, because it is the only \
+             one a verified converter backs; a new one must be added here deliberately"
         );
     }
 
@@ -415,3 +485,6 @@ mod tests {
         );
     }
 }
+
+#[cfg(test)]
+mod eligibility_tests;
