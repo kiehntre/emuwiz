@@ -210,8 +210,16 @@ check "--incremental sets CARGO_INCREMENTAL=1" test "$(logged incremental)" = 1
 check "--incremental is not passed on to cargo" bash -c "! grep -q 'incremental' <(grep '^arg' '$FAKE_CARGO_LOG')"
 run1 env CARGO_INCREMENTAL=0 EMUWIZ_CARGO_INCREMENTAL=1 "$iso" check
 check "EMUWIZ_CARGO_INCREMENTAL=1 does the same" test "$(logged incremental)" = 1
-(cd "$tmp/wt-one" && EMUWIZ_CARGO_INCREMENTAL=2 "$iso" check >/dev/null 2>&1); rc=$?
-check "a malformed EMUWIZ_CARGO_INCREMENTAL is refused (2)" test "$rc" = 2
+run1 env EMUWIZ_CARGO_INCREMENTAL=true CARGO_INCREMENTAL=0 "$iso" check
+check "a malformed EMUWIZ_CARGO_INCREMENTAL is ignored, as before" test "$(logged incremental)" = 0
+(cd "$tmp/wt-one" && EMUWIZ_CARGO_INCREMENTAL=true "$iso" --print-target >/dev/null 2>&1); rc=$?
+check "a malformed EMUWIZ_CARGO_INCREMENTAL does not break --print-target" test "$rc" = 0
+run1 env CARGO_INCREMENTAL=1 "$iso" --no-incremental check
+check "--no-incremental forces CARGO_INCREMENTAL=0 over an inherited 1" test "$(logged incremental)" = 0
+run1 env CARGO_INCREMENTAL=1 EMUWIZ_CARGO_INCREMENTAL=0 "$iso" check
+check "EMUWIZ_CARGO_INCREMENTAL=0 forces 0 over an inherited 1" test "$(logged incremental)" = 0
+run1 env CARGO_INCREMENTAL=1 "$iso" check
+check "undesignated, no choice: an inherited 1 is left alone" test "$(logged incremental)" = 1
 check "--print-target says incremental is off by default" bash -c "cd '$tmp/wt-one' && '$iso' --print-target | grep -q '^incremental: off (default'"
 
 (cd "$tmp/wt-one" && "$iso" --designate-dev >/dev/null 2>&1); rc=$?
@@ -233,6 +241,12 @@ check "another worktree is not affected by the designation" bash -c "cd '$tmp/wt
 printf 'garbage\n' >"$inc_file"
 run1 env CARGO_INCREMENTAL=0 "$iso" check
 check "an invalid designation record fails closed (off)" test "$(logged incremental)" = 0
+for combo in "--print-target" "--finish-task" "build"; do
+  (cd "$tmp/wt-one" && "$iso" --designate-dev $combo >/dev/null 2>&1); rc=$?
+  check "--designate-dev with '$combo' is refused (2)" test "$rc" = 2
+done
+(cd "$tmp/wt-one" && "$iso" --undesignate-dev build >/dev/null 2>&1); rc=$?
+check "--undesignate-dev with a cargo command is refused (2)" test "$rc" = 2
 rm -f "$inc_file"; ln -s /etc/hostname "$inc_file"
 run1 env CARGO_INCREMENTAL=0 "$iso" check
 check "a symlinked designation record is ignored (off)" test "$(logged incremental)" = 0

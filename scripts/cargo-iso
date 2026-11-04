@@ -37,7 +37,8 @@
 #                    line-numbered backtraces); also set by EMUWIZ_CARGO_FULL_DEBUG=1
 #   --incremental    force incremental compilation for this run (see below);
 #                    also set by EMUWIZ_CARGO_INCREMENTAL=1
-#   --no-incremental force it off for this run, even in a designated worktree;
+#   --no-incremental force it off for this run (exports CARGO_INCREMENTAL=0), even in a
+#                    designated worktree;
 #                    also set by EMUWIZ_CARGO_INCREMENTAL=0
 #   --designate-dev  mark THIS worktree as an active developer worktree: its builds
 #                    are incremental by default from now on. Runs no cargo
@@ -83,7 +84,8 @@
 # A designation record that is unreadable or says anything but "on" is ignored (OFF).
 # Whatever is decided overrides an inherited CARGO_INCREMENTAL (older ~/.bashrc files
 # export CARGO_INCREMENTAL=0, which makes every edit recompile the whole crate). With a
-# decision of OFF the inherited value is left exactly as it was. Measured on
+# decision of OFF that was not explicit the inherited value is left exactly as it was;
+# an explicit off (--no-incremental, EMUWIZ_CARGO_INCREMENTAL=0) exports CARGO_INCREMENTAL=0. Measured on
 # archivefs-gui tests (pilot 2026-11-04, load/pressure sampled, 5 runs): edit-to-rebuild
 # 97.5 s off vs 27.6-28.4 s on, after a one-off ~5 min priming build and roughly 3x the
 # target size (2.3 -> 6.9 GiB). Designate only the few worktrees you build in all day, and
@@ -121,7 +123,7 @@ fi
 incremental_choice="${EMUWIZ_CARGO_INCREMENTAL:-}"
 case "$incremental_choice" in
   ''|0|1) ;;
-  *) echo "cargo-iso: EMUWIZ_CARGO_INCREMENTAL must be 0 or 1, got '$incremental_choice'" >&2; exit 2 ;;
+  *) echo "cargo-iso: note: ignoring EMUWIZ_CARGO_INCREMENTAL='$incremental_choice' (only 0 or 1 are meaningful)" >&2; incremental_choice="" ;;
 esac
 designate=""
 use_sccache="${EMUWIZ_CARGO_SCCACHE:-0}"
@@ -242,6 +244,11 @@ if [ "$use_sccache" = "1" ] && [ "$inc_explicit" -eq 0 ] && [ "$incremental" = "
 fi
 
 if [ -n "$designate" ]; then
+  if [ "$print_only" -eq 1 ] || [ "$finish_task" -eq 1 ] || [ $# -gt 0 ]; then
+    echo "cargo-iso: --designate-dev/--undesignate-dev cannot be combined with --print-target, --finish-task or a cargo command" >&2
+    exit 2
+  fi
+  if [ -d "$inc_file" ]; then echo "cargo-iso: $inc_file is a directory; refusing" >&2; exit 3; fi
   # Record or remove the designation. Touches only the record, never a target, and runs no cargo.
   { mkdir -p -- "$(dirname "$inc_file")" &&
     printf '%s\n' "$designate" >"$inc_file.tmp.$$" && mv -f -- "$inc_file.tmp.$$" "$inc_file"; } 2>/dev/null || {
@@ -365,6 +372,8 @@ if [ "$use_sccache" = "1" ]; then
   export CARGO_INCREMENTAL=0
 elif [ "$incremental" = "1" ]; then
   export CARGO_INCREMENTAL=1
+elif [ "$inc_explicit" -eq 1 ]; then
+  export CARGO_INCREMENTAL=0
 fi
 # Lifecycle tracking (scripts/emuwiz-cargo-retention): holds a shared lock for
 # the whole build so the cache cannot be retired under it, and records who built
