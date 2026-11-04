@@ -9712,8 +9712,33 @@ fn a_fresh_exact_dat_match_is_verified_on_every_page_and_launch_says_what_it_sti
         for_verified.primary_action.is_some(),
         "still blocked, with a way forward"
     );
+    // Without a DAT match, launch names its own reason (the file's identity
+    // evidence), says optional DAT verification is separate, and offers one
+    // fix. It is still blocked and never reads as verified.
     let unresolved_summary = project(&input, ReadinessFreshness::Current);
-    assert!(unresolved_summary.headline.contains("not confirmed"));
+    assert_eq!(
+        unresolved_summary.headline,
+        "EmuWiz cannot tell which game this file is yet"
+    );
+    assert!(
+        unresolved_summary
+            .explanation
+            .contains("file's own identity evidence"),
+        "{}",
+        unresolved_summary.explanation
+    );
+    assert!(
+        unresolved_summary
+            .explanation
+            .contains("Optional catalogue (DAT) verification is a separate check"),
+        "{}",
+        unresolved_summary.explanation
+    );
+    assert!(!unresolved_summary.headline.contains("Verified"));
+    assert_eq!(
+        unresolved_summary.primary_action,
+        Some(super::launch_readiness_summary::ReadinessAction::ReviewIdentity)
+    );
 }
 
 // ---- Library files check (read-only reconciliation) ---------------------------
