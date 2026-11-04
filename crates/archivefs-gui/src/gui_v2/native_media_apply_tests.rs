@@ -81,6 +81,7 @@ fn bounded_confirmation_requires_review_backup_ack_and_explicit_apply_at_small_r
     let dbpath = t.path().join("copy.sqlite3");
     let cfg = t.path().join("config.toml");
     let config = archivefs_core::Config {
+        configured_source_roots: Some(vec![root.clone()]),
         source_folders: vec![root.clone()],
         mount_root: PathBuf::new(),
         ratarmount_bin: String::new(),

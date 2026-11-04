@@ -51,6 +51,7 @@ impl Fixture {
         )
         .unwrap();
         let config = Config {
+            configured_source_roots: Some(vec![self.root.clone()]),
             source_folders: vec![self.root.clone()],
             mount_root: self.temp.path().join("mount"),
             ratarmount_bin: String::new(),

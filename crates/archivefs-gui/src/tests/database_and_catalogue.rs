@@ -1023,6 +1023,7 @@ fn scan_partial_success_reports_folder_errors_without_failing_the_scan() {
     write_archive_file(&source_a, "a.zip", b"a");
     write_archive_file(&source_b, "b.zip", b"b");
     let config = Config {
+        configured_source_roots: Some(vec![source_a.clone(), source_b.clone()]),
         source_folders: vec![source_a.clone(), source_b.clone()],
         mount_root: mount,
         ratarmount_bin: "ratarmount".to_string(),

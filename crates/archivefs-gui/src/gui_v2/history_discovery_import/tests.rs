@@ -193,6 +193,7 @@ fn actual_import_results_preview_cancel_confirm_and_result_journey_preserves_rom
     let db = t.path().join("library.sqlite3");
     let cfg = t.path().join("config.toml");
     let config = archivefs_core::Config {
+        configured_source_roots: Some(vec![root.clone()]),
         source_folders: vec![root.clone()],
         mount_root: t.path().join("mount"),
         ratarmount_bin: String::new(),

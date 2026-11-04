@@ -101,6 +101,7 @@ impl GuiConfigSnapshot {
 #[cfg(test)]
 fn hermetic_gui_config() -> Result<Config, String> {
     Ok(Config {
+        configured_source_roots: Some(vec![PathBuf::from("/library")]),
         source_folders: vec![PathBuf::from("/library")],
         mount_root: PathBuf::from("/mount"),
         ratarmount_bin: "ratarmount".to_string(),
@@ -1175,6 +1176,7 @@ pub(crate) fn app_for_operation_tests() -> ArchiveFsApp {
         select_all_visible_requested: false,
         catalogue_bsfree_ui: CatalogueBsFreeUiState::default(),
         gui_config: GuiConfigSnapshot::from_config(Config {
+            configured_source_roots: Some(vec![PathBuf::from("/library")]),
             source_folders: vec![PathBuf::from("/library")],
             mount_root: PathBuf::from("/mount"),
             ratarmount_bin: "ratarmount".to_string(),
@@ -1367,6 +1369,7 @@ fn write_archive_file(dir: &Path, relative_path: &str, content: &[u8]) -> PathBu
 
 fn config_for(source_dir: &Path, mount_dir: &Path) -> Config {
     Config {
+        configured_source_roots: Some(vec![source_dir.to_path_buf()]),
         source_folders: vec![source_dir.to_path_buf()],
         mount_root: mount_dir.to_path_buf(),
         ratarmount_bin: "ratarmount".to_string(),

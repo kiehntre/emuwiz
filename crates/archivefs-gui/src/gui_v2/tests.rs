@@ -3292,6 +3292,7 @@ fn gui_v2_database_load_is_real_and_read_only() {
     fs::write(source.join("game.zip"), b"fixture archive").unwrap();
     let database_path = directory.path().join("library.sqlite3");
     let config = archivefs_core::Config {
+        configured_source_roots: Some(vec![source.clone()]),
         source_folders: vec![source],
         mount_root: directory.path().join("mount"),
         ratarmount_bin: "ratarmount".into(),
@@ -9063,6 +9064,7 @@ fn temp_catalogue() -> (
     let archive_path = source.join("misc/GameCube Demo.zip");
     std::fs::write(&archive_path, b"contents").unwrap();
     let config = archivefs_core::Config {
+        configured_source_roots: Some(vec![source.clone()]),
         source_folders: vec![source],
         mount_root: dir.path().join("mount"),
         ratarmount_bin: "ratarmount".into(),
@@ -10523,6 +10525,7 @@ mod library_files_check {
         std::fs::create_dir_all(&root).unwrap();
         std::fs::write(root.join("stray.xyz"), b"stray").unwrap();
         let config = archivefs_core::Config {
+            configured_source_roots: Some(vec![root.clone()]),
             source_folders: vec![root.clone()],
             mount_root: dir.path().join("mounts"),
             ratarmount_bin: "ratarmount".into(),
@@ -10706,6 +10709,7 @@ mod library_files_check {
         std::fs::create_dir_all(&root).unwrap();
         std::fs::write(root.join("stray.xyz"), b"stray").unwrap();
         let config = archivefs_core::Config {
+            configured_source_roots: Some(vec![root.clone()]),
             source_folders: vec![root.clone()],
             mount_root: dir.path().join("mounts"),
             ratarmount_bin: "ratarmount".into(),

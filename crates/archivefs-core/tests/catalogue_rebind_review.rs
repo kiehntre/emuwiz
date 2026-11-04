@@ -61,6 +61,7 @@ impl Fixture {
 
     fn config(&self) -> Config {
         Config {
+            configured_source_roots: Some(self.roots.clone()),
             source_folders: self.roots.clone(),
             mount_root: self.temp.path().join("mounts"),
             ratarmount_bin: "ratarmount".into(),
@@ -940,6 +941,7 @@ fn independent_targeted_attempt_combinations() {
         [SourceHealthState::NeedsScan, SourceHealthState::PartialScan]
     );
     let full = Config {
+        configured_source_roots: Some(folders.clone()),
         source_folders: folders.clone(),
         mount_root: temp.path().join("mounts"),
         ratarmount_bin: "ratarmount".into(),

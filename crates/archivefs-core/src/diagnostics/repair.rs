@@ -762,7 +762,12 @@ fn affected_path(finding: &Finding) -> Result<PathBuf, DoctorRepairRejection> {
 /// hard boundary: EmuWiz never modifies the user's library.
 fn guard_against_source_roots(path: &Path, config: &Config) -> Result<(), DoctorRepairRejection> {
     // The organised master ROM root is library content too.
-    for source in config.source_folders.iter().chain(&config.master_rom_root) {
+    for source in config
+        .source_folders
+        .iter()
+        .chain(config.configured_source_roots.iter().flatten())
+        .chain(&config.master_rom_root)
+    {
         if path == source.as_path() || path.starts_with(source) {
             return Err(DoctorRepairRejection::PathUnderSourceRoot);
         }

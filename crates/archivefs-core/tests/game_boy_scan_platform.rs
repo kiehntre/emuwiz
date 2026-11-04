@@ -28,6 +28,7 @@ fn rom(cgb: u8, logo: bool, checksum_ok: bool, len: usize) -> Vec<u8> {
 
 fn scan(root: &Path) -> Vec<(String, Option<String>, Option<PlatformProvenance>)> {
     let config = Config {
+        configured_source_roots: Some(vec![root.to_path_buf()]),
         source_folders: vec![root.to_path_buf()],
         mount_root: root.join("../mount"),
         ratarmount_bin: String::new(),
@@ -111,6 +112,7 @@ fn persisted_lab() -> (tempfile::TempDir, Config, archivefs_core::Database) {
     let source = dir.path().join("incoming");
     std::fs::create_dir(&source).unwrap();
     let config = Config {
+        configured_source_roots: Some(vec![source.clone()]),
         source_folders: vec![source],
         mount_root: dir.path().join("mount"),
         ratarmount_bin: String::new(),

@@ -10,6 +10,7 @@ use crate::app::GuiConfigSnapshot;
 fn app_with_no_source() -> ArchiveFsApp {
     let mut app = app_for_operation_tests();
     app.gui_config = GuiConfigSnapshot::from_config(Config {
+        configured_source_roots: Some(Vec::new()),
         source_folders: Vec::new(),
         mount_root: PathBuf::from("/mount"),
         ratarmount_bin: "ratarmount".to_string(),

@@ -61,6 +61,7 @@ impl Fixture {
         scan_and_persist(
             &mut self.db,
             &Config {
+                configured_source_roots: Some(self.roots.clone()),
                 source_folders: self.roots.clone(),
                 mount_root: self.temp.path().join("mounts"),
                 ratarmount_bin: "ratarmount".into(),
@@ -965,6 +966,7 @@ fn duplicate_configured_bind_aliases_are_diagnosed_without_catalogue_writes() {
         0
     );
     let config = Config {
+        configured_source_roots: Some(f.roots.clone()),
         source_folders: f.roots.clone(),
         mount_root: f.temp.path().join("mounts"),
         ratarmount_bin: "ratarmount".into(),

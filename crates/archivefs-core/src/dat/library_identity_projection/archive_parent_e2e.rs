@@ -172,6 +172,7 @@ impl Fixture {
 
     fn scan(database: &mut Database, source: &Path, root: &Path) {
         let config = Config {
+            configured_source_roots: None,
             source_folders: vec![source.to_path_buf()],
             mount_root: root.join("mount"),
             ratarmount_bin: "ratarmount".to_string(),

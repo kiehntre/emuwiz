@@ -27,6 +27,7 @@ fn a_loose_gdi_is_not_a_library_entry_so_no_descriptor_only_identity_can_be_save
         fs::write(games.join(name), vec![1_u8; 2352 * sectors]).unwrap();
     }
     let config = crate::Config {
+        configured_source_roots: None,
         source_folders: vec![root.path().join("games")],
         mount_root: root.path().join("mount"),
         ratarmount_bin: "ratarmount".into(),

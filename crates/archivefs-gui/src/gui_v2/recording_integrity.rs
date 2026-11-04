@@ -239,6 +239,7 @@ mod tests {
         scan_and_persist(
             &mut db,
             &Config {
+                configured_source_roots: Some(vec![source.clone()]),
                 source_folders: vec![source],
                 mount_root: dir.path().join("mount"),
                 ratarmount_bin: String::new(),

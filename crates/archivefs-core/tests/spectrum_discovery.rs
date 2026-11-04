@@ -40,6 +40,7 @@ fn scl() -> Vec<u8> {
 }
 fn config(root: &Path) -> Config {
     Config {
+        configured_source_roots: Some(vec![root.clone().into()]),
         source_folders: vec![root.into()],
         mount_root: root.join("mount"),
         ratarmount_bin: String::new(),

@@ -3,6 +3,7 @@ use crate::catalogue_health::{ScanCoverageState, SourceScanCoverage};
 
 fn config(roots: Vec<PathBuf>, temp: &Path) -> Config {
     Config {
+        configured_source_roots: None,
         source_folders: roots,
         mount_root: temp.join("mounts"),
         ratarmount_bin: "ratarmount".into(),

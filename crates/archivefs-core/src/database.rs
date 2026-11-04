@@ -9585,6 +9585,7 @@ fn scan_and_persist_folders_transaction(
             continue;
         }
         let folder_config = Config {
+            configured_source_roots: None,
             source_folders: vec![folder.path.clone()],
             mount_root: PathBuf::new(),
             ratarmount_bin: String::new(),
@@ -10888,6 +10889,7 @@ mod tests {
 
     fn config_for(source_dir: &Path, mount_dir: &Path) -> Config {
         Config {
+            configured_source_roots: Some(vec![source_dir.to_path_buf()]),
             source_folders: vec![source_dir.to_path_buf()],
             mount_root: mount_dir.to_path_buf(),
             ratarmount_bin: "ratarmount".to_string(),
@@ -13632,6 +13634,7 @@ mod tests {
         write_archive_file(&source_a, "a.zip", b"a");
         write_archive_file(&source_b, "b.zip", b"b");
         let config = Config {
+            configured_source_roots: Some(vec![source_a.clone(), source_b.clone()]),
             source_folders: vec![source_a.clone(), source_b.clone()],
             mount_root: mount,
             ratarmount_bin: "ratarmount".to_string(),
@@ -13690,6 +13693,7 @@ mod tests {
         write_archive_file(&source_a, "a.zip", b"a");
         write_archive_file(&source_b, "b.zip", b"b");
         let config = Config {
+            configured_source_roots: Some(vec![source_a.clone(), source_b.clone()]),
             source_folders: vec![source_a.clone(), source_b.clone()],
             mount_root: mount,
             ratarmount_bin: "ratarmount".to_string(),
@@ -13744,6 +13748,7 @@ mod tests {
         write_archive_file(&source_a, "game.zip", b"from a");
         write_archive_file(&source_b, "game.zip", b"from b, different size");
         let config = Config {
+            configured_source_roots: Some(vec![source_a.clone(), source_b.clone()]),
             source_folders: vec![source_a.clone(), source_b.clone()],
             mount_root: mount,
             ratarmount_bin: "ratarmount".to_string(),
@@ -17492,6 +17497,11 @@ echo "$out"
         write_archive_file(&source_b, "b.zip", b"b");
         write_archive_file(&source_c, "c.zip", b"c");
         let config = Config {
+            configured_source_roots: Some(vec![
+                source_a.clone(),
+                source_b.clone(),
+                source_c.clone(),
+            ]),
             source_folders: vec![source_a.clone(), source_b.clone(), source_c.clone()],
             mount_root: mount,
             ratarmount_bin: "ratarmount".to_string(),

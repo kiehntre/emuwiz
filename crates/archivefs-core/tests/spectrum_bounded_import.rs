@@ -28,6 +28,7 @@ fn sna(tag: u8) -> Vec<u8> {
 }
 fn config(root: &Path) -> Config {
     Config {
+        configured_source_roots: Some(vec![root.clone().into()]),
         source_folders: vec![root.into()],
         mount_root: PathBuf::new(),
         ratarmount_bin: String::new(),

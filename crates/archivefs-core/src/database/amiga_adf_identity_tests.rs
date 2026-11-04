@@ -115,6 +115,7 @@ fn lab_in(header: &str, entries: Entries, files: &[(&str, &str, &str)]) -> Lab {
     .unwrap();
     let mut db = Database::open_or_create(root.join("library.sqlite3")).unwrap();
     let config = crate::Config {
+        configured_source_roots: None,
         source_folders: vec![root.join("games")],
         mount_root: root.join("mount"),
         ratarmount_bin: "ratarmount".into(),

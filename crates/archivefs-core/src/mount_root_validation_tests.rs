@@ -254,6 +254,7 @@ fn scanner_never_treats_a_mount_root_inside_a_source_as_library_content() {
     fs::create_dir_all(mount_root.join("Unknown/Outer")).unwrap();
     fs::write(mount_root.join("Unknown/Outer/Inner.zip"), b"archive").unwrap();
     let config = Config {
+        configured_source_roots: Some(vec![source.clone()]),
         source_folders: vec![source.clone()],
         mount_root: mount_root.clone(),
         ratarmount_bin: "ratarmount".to_string(),
@@ -274,6 +275,7 @@ fn targeted_mount_cleanup_refuses_a_mount_root_containing_a_source() {
     let empty_in_source = mount_root.join("roms/Empty");
     fs::create_dir_all(&empty_in_source).unwrap();
     let config = Config {
+        configured_source_roots: Some(vec![mount_root.join("roms")]),
         source_folders: vec![mount_root.join("roms")],
         mount_root: mount_root.clone(),
         ratarmount_bin: "ratarmount".to_string(),
@@ -464,6 +466,7 @@ fn mounting_into_an_overlapping_mount_root_is_refused() {
     fs::write(&archive, b"archive").unwrap();
     // Mount root equal to the source: mounting would create folders in it.
     let equal = Config {
+        configured_source_roots: Some(vec![source.clone()]),
         source_folders: vec![source.clone()],
         mount_root: source.clone(),
         ratarmount_bin: "ratarmount".to_string(),
@@ -482,4 +485,150 @@ fn mounting_into_an_overlapping_mount_root_is_refused() {
     let session = ArchiveMountSession::new(&inside).unwrap();
     assert!(session.validate_batch_targets(&[archive]).is_err());
     assert!(!source.join("mnt").exists());
+}
+
+// --- Disabled `[[source]]` overlapping the mount root (round 3, F2) ------
+
+/// Enabled `library` (with one archive) and a disabled `disabled`, loaded
+/// through `Config::load_from` exactly as the CLI and GUI load it.
+fn disabled_source_config(root: &Path, mount_root: &Path, disabled: &Path) -> (PathBuf, Config) {
+    let library = root.join("library");
+    fs::create_dir_all(library.join("roms")).unwrap();
+    fs::write(library.join("roms/Good.zip"), b"archive").unwrap();
+    fs::create_dir_all(disabled).unwrap();
+    let path = root.join("config.toml");
+    fs::write(
+        &path,
+        format!(
+            "mount_root = \"{}\"\nratarmount_bin = \"ratarmount\"\n\n[[source]]\npath = \"{}\"\nenabled = true\n\n[[source]]\npath = \"{}\"\nenabled = false\n",
+            mount_root.display(),
+            library.display(),
+            disabled.display()
+        ),
+    )
+    .unwrap();
+    let config = Config::load_from(&path).unwrap();
+    assert_eq!(config.source_folders, vec![library]);
+    (path, config)
+}
+
+#[test]
+fn doctor_never_creates_a_mount_root_inside_a_disabled_source() {
+    let fixture = tempfile::tempdir().unwrap();
+    let root = fixture.path();
+    let disabled = root.join("off");
+    let mount_root = disabled.join("mnt");
+    let (config_path, _) = disabled_source_config(root, &mount_root, &disabled);
+    let report = run_doctor(&config_path);
+    assert!(
+        !mount_root.exists(),
+        "doctor created the mount root inside a disabled source: {:#?}",
+        report.checks
+    );
+    assert!(
+        report
+            .checks
+            .iter()
+            .any(|check| check.status == DoctorStatus::Fail
+                && check.detail.contains("source folder")),
+        "{:#?}",
+        report.checks
+    );
+}
+
+#[test]
+fn mount_refuses_a_mount_root_overlapping_a_disabled_source() {
+    let fixture = tempfile::tempdir().unwrap();
+    let root = fixture.path();
+    // Equal to, inside, and containing the disabled source.
+    for (mount_root, disabled) in [
+        (root.join("off"), root.join("off")),
+        (root.join("off/mnt"), root.join("off")),
+        (root.join("parent"), root.join("parent/off")),
+    ] {
+        let (_, config) = disabled_source_config(root, &mount_root, &disabled);
+        let plan = ArchiveScanner::new(&config)
+            .mount_plans()
+            .unwrap()
+            .remove(0);
+        let backend = CountingBackend::default();
+        assert!(
+            mount_one_plan_outcome(&config, plan.clone(), &backend).is_err(),
+            "{}",
+            mount_root.display()
+        );
+        assert_eq!(backend.mounts.get(), 0);
+        assert!(!plan.mount_path.exists(), "{}", plan.mount_path.display());
+        let _ = fs::remove_dir_all(&mount_root);
+        let _ = fs::remove_dir_all(&disabled);
+    }
+}
+
+#[test]
+fn doctor_and_mount_still_work_beside_a_disjoint_disabled_source() {
+    let fixture = tempfile::tempdir().unwrap();
+    let root = fixture.path();
+    let mount_root = root.join("mounts");
+    let (config_path, config) = disabled_source_config(root, &mount_root, &root.join("off"));
+    run_doctor(&config_path);
+    assert!(mount_root.is_dir(), "doctor creates a disjoint mount root");
+    let plan = ArchiveScanner::new(&config)
+        .mount_plans()
+        .unwrap()
+        .remove(0);
+    let backend = CountingBackend::default();
+    mount_one_plan_outcome(&config, plan, &backend).unwrap();
+    assert_eq!(backend.mounts.get(), 1);
+}
+
+/// C1: the native-media preview (and the bounded import built from it) must
+/// not list mount-root content when a legacy config puts the mount root
+/// inside the previewed source. The GUI passes `configured_mount_root_at`.
+#[test]
+fn native_media_preview_skips_a_mount_root_inside_the_previewed_source() {
+    let fixture = tempfile::tempdir().unwrap();
+    let source = fixture.path().join("library");
+    fs::create_dir_all(source.join("roms")).unwrap();
+    fs::write(source.join("roms/Outer.zip"), b"archive").unwrap();
+    let mount_root = source.join("mnt");
+    fs::create_dir_all(mount_root.join("Unknown/Outer")).unwrap();
+    let inner = mount_root.join("Unknown/Outer/Inner.zip");
+    fs::write(&inner, b"archive").unwrap();
+    let config_path = fixture.path().join("config.toml");
+    legacy_config(&config_path, &[&source], &mount_root);
+    let preview = |mount_root: PathBuf| {
+        let config = Config {
+            configured_source_roots: None,
+            source_folders: vec![source.clone()],
+            mount_root,
+            ratarmount_bin: String::new(),
+            master_rom_root: None,
+        };
+        crate::ingestion::preview::preview_media(
+            &config,
+            &[],
+            &[],
+            &[],
+            &std::sync::atomic::AtomicBool::new(false),
+            &mut |_, _| {},
+        )
+        .unwrap()
+        .items
+        .into_iter()
+        .map(|item| item.path)
+        .collect::<Vec<_>>()
+    };
+    // Without the mount root (the old GUI call) the mount content is listed.
+    assert!(preview(PathBuf::new()).contains(&inner));
+    let configured = configured_mount_root_at(&config_path).unwrap();
+    assert_eq!(configured, mount_root);
+    let listed = preview(configured);
+    assert!(
+        listed.iter().all(|path| !path.starts_with(&mount_root)),
+        "{listed:?}"
+    );
+    assert!(
+        listed.contains(&source.join("roms/Outer.zip")),
+        "{listed:?}"
+    );
 }

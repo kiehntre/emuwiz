@@ -72,6 +72,7 @@ struct Library {
 
 fn config(root: &Path) -> crate::Config {
     crate::Config {
+        configured_source_roots: Some(vec![root.join("games")]),
         source_folders: vec![root.join("games")],
         mount_root: root.join("mount"),
         ratarmount_bin: "ratarmount".into(),
