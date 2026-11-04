@@ -180,19 +180,25 @@ pub fn launch_option_id(target: &LaunchTarget) -> String {
         } => format!("standalone/{adapter_id}/{profile_id}"),
         LaunchTarget::RetroArchCore {
             profile, core_stem, ..
-        } => {
-            let kind = match profile.profile_kind {
-                ProfileKind::Native => "native",
-                ProfileKind::AppImage => "appimage",
-                ProfileKind::Flatpak => "flatpak",
-            };
-            let scope = match profile.scope {
-                ProfileScope::User => "user",
-                ProfileScope::System => "system",
-            };
-            format!("retroarch/{kind}/{scope}/{core_stem}")
-        }
+        } => retroarch_option_id(*profile, core_stem),
     }
+}
+
+/// The [`launch_option_id`] of the RetroArch candidate `profile` + `core_stem`.
+pub fn retroarch_option_id(
+    profile: crate::emulator_environment::retroarch::ProfileRef,
+    core_stem: &str,
+) -> String {
+    let kind = match profile.profile_kind {
+        ProfileKind::Native => "native",
+        ProfileKind::AppImage => "appimage",
+        ProfileKind::Flatpak => "flatpak",
+    };
+    let scope = match profile.scope {
+        ProfileScope::User => "user",
+        ProfileScope::System => "system",
+    };
+    format!("retroarch/{kind}/{scope}/{core_stem}")
 }
 
 pub fn is_adopted(plan: &LaunchPlan) -> bool {
@@ -321,8 +327,12 @@ fn choose(plan: &mut LaunchPlan, index: usize) {
                 )
             });
             candidate.preference = CandidatePreference::Remembered;
-        } else if candidate.preference == CandidatePreference::Remembered {
-            // An explicit launch choice outranks any other remembered match.
+        } else if matches!(
+            candidate.preference,
+            CandidatePreference::Remembered | CandidatePreference::SoleEligible
+        ) {
+            // An explicit launch choice outranks any other remembered or
+            // reviewed-hint preference; that option stays choosable.
             candidate.preference = CandidatePreference::Undetermined;
             candidate.warnings.push(LaunchWarning::new(
                 LaunchWarningKind::MultipleEligibleProfiles,
@@ -460,6 +470,12 @@ fn write_preferences(path: &Path, mut preferences: Vec<LaunchPreference>) -> Res
     })
     .map_err(|error| error.to_string())?;
     text.push('\n');
+    if text.len() as u64 > MAX_FILE_BYTES {
+        return Err(format!(
+            "{} would exceed its size limit; forget some per-game emulator defaults first",
+            path.display()
+        ));
+    }
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent).map_err(|error| error.to_string())?;
     }

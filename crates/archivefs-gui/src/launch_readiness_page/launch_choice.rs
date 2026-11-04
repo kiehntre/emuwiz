@@ -24,6 +24,8 @@ pub(crate) struct LaunchChoiceState {
     /// The last save failure, shown until the next successful change.
     pub(crate) save_error: Option<String>,
     path: Option<PathBuf>,
+    /// Whether a RetroArch or Dolphin launch was active when last observed.
+    launch_was_active: bool,
 }
 
 impl Default for LaunchChoiceState {
@@ -33,6 +35,7 @@ impl Default for LaunchChoiceState {
             once: None,
             save_error: None,
             path: None,
+            launch_was_active: false,
         }
     }
 }
@@ -66,6 +69,7 @@ impl LaunchChoiceState {
             once: None,
             save_error: None,
             path: Some(path),
+            launch_was_active: false,
         }
     }
 
@@ -74,6 +78,17 @@ impl LaunchChoiceState {
             once: self.once.as_ref(),
             preferences: self.preferences.as_deref().map_err(String::as_str),
         }
+    }
+
+    /// Call once per frame, before the launch states are polled, with whether
+    /// any launch that a choice can apply to (RetroArch or Dolphin) is
+    /// starting or running. A one-time choice is used up by the launch that
+    /// starts after it was made, from any Play or Launch button.
+    pub(crate) fn observe_launches(&mut self, launch_active: bool) {
+        if launch_active && !self.launch_was_active {
+            self.once = None;
+        }
+        self.launch_was_active = launch_active;
     }
 
     /// Applies one explicit user action. Saved changes are written atomically
@@ -136,7 +151,7 @@ impl LaunchChoiceState {
 
 fn source_label(source: LaunchChoiceSource, platform_id: &str) -> String {
     match source {
-        LaunchChoiceSource::Once => "Chosen for this game (once, not saved)".into(),
+        LaunchChoiceSource::Once => "Chosen for the next launch of this game (not saved)".into(),
         LaunchChoiceSource::Game => "Default for this game".into(),
         LaunchChoiceSource::System => format!("Default for {platform_id} games"),
     }

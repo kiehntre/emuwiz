@@ -523,3 +523,50 @@ fn incomplete_preferences_are_refused_before_writing() {
     }
     assert!(!path.exists());
 }
+
+#[test]
+fn an_explicit_choice_also_outranks_a_reviewed_hint_preference() {
+    let mut plan = tie();
+    // A reviewed hint makes the planner prefer one option without a tie.
+    for c in &mut plan.candidates {
+        if matches!(&c.target, LaunchTarget::Standalone { profile_id, .. } if profile_id == NATIVE)
+        {
+            c.preference = CandidatePreference::SoleEligible;
+        }
+    }
+    apply(
+        &mut plan,
+        saved(&[LaunchPreference::system("GameCube", &option(APPIMAGE))]),
+    );
+    assert_eq!(launchable(&plan), vec![option(APPIMAGE)]);
+    assert_eq!(
+        candidate(&plan, NATIVE).preference,
+        CandidatePreference::Undetermined
+    );
+    assert_eq!(
+        candidate(&plan, APPIMAGE).preference,
+        CandidatePreference::Remembered
+    );
+}
+
+#[test]
+fn a_save_that_would_exceed_the_read_limit_is_refused_and_keeps_the_old_file() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join(LAUNCH_PREFERENCES_FILE);
+    let mut saved_count = 0;
+    let refusal = loop {
+        let key = format!("GAME-{saved_count:06}-{}", "k".repeat(64));
+        match set_launch_preference_at(
+            &path,
+            &LaunchPreference::game("GameCube", &key, &option(APPIMAGE)),
+        ) {
+            Ok(()) => saved_count += 1,
+            Err(error) => break error,
+        }
+        assert!(saved_count < 10_000, "the size limit was never enforced");
+    };
+    assert!(refusal.contains("size limit"), "{refusal}");
+    assert!(std::fs::metadata(&path).unwrap().len() <= MAX_FILE_BYTES);
+    let reloaded = load_launch_preferences_at(&path).expect("the old file stays readable");
+    assert_eq!(reloaded.len(), saved_count);
+}

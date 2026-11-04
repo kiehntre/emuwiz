@@ -479,6 +479,14 @@ pub fn preflight_retroarch_launch(
     // make the one candidate it names usable; a choice naming anything else
     // leaves the requested candidate tied or held, and it is refused below.
     if let Some(option_id) = &request.launch_choice {
+        if *option_id
+            != super::launch_choice::retroarch_option_id(request.profile, &request.core_stem)
+        {
+            return Err(preflight_error(
+                LaunchPreflightErrorKind::IdentityMismatch,
+                "The chosen emulator does not match the requested launch option.",
+            ));
+        }
         let once = super::launch_choice::LaunchOnceChoice {
             platform_id: request.expected_platform_id.clone(),
             game_key: request.expected_game_key.clone(),

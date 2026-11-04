@@ -340,3 +340,35 @@ fn the_gamer_view_asks_for_a_choice_when_a_preference_is_held() {
         blocker.detail
     );
 }
+
+#[test]
+fn a_one_time_choice_is_used_up_by_the_next_launch_that_starts() {
+    let home = tempfile::tempdir().unwrap();
+    let context = two_dolphins(home.path());
+    let mut state = LaunchChoiceState::load_at(home.path().join(LAUNCH_PREFERENCES_FILE));
+    let stable = appimage_option(&plan_for(&context, &state), "Dolphin");
+    let once = LaunchChoiceAction::UseOnce(LaunchOnceChoice {
+        platform_id: "GameCube".into(),
+        game_key: GAME.into(),
+        option_id: stable,
+    });
+
+    // Choosing while an earlier launch is still running keeps the choice
+    // until that launch ends and the next one starts.
+    state.observe_launches(true);
+    state.handle(once.clone());
+    state.observe_launches(true);
+    assert!(state.once.is_some());
+    state.observe_launches(false);
+    assert_eq!(
+        dolphin_requests(&plan_for(&context, &state), &context).len(),
+        1
+    );
+
+    state.observe_launches(true);
+    assert!(state.once.is_none(), "the launch used the one-time choice");
+    assert!(
+        dolphin_requests(&plan_for(&context, &state), &context).is_empty(),
+        "the tie asks again after the one-time launch"
+    );
+}

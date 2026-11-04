@@ -1042,8 +1042,14 @@ fn a_gamecube_retroarch_tie_launches_only_the_explicitly_chosen_installation() {
     request.launch_choice = Some("retroarch/appimage/user/dolphin".into());
     assert_eq!(
         run(&request).unwrap_err().kind,
-        LaunchPreflightErrorKind::CandidateNotReady,
+        LaunchPreflightErrorKind::IdentityMismatch,
         "a choice of the other installation never launches this one"
+    );
+    request.launch_choice = Some("standalone/dolphin/dolphin:appimage:/x".into());
+    assert_eq!(
+        run(&request).unwrap_err().kind,
+        LaunchPreflightErrorKind::IdentityMismatch,
+        "a choice naming a different kind of option is refused before planning"
     );
 
     request.launch_choice = Some("retroarch/native/user/dolphin".into());
