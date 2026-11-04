@@ -3665,6 +3665,11 @@ impl DatSourcesPageState {
     }
 
     /// Whether a background job is running.
+    /// The last "Use for this system" save result, taken once.
+    pub(crate) fn take_platform_assignment(&mut self) -> Option<Result<String, String>> {
+        self.platform_assignment.take()
+    }
+
     pub(crate) fn is_busy(&self) -> bool {
         self.job.is_some()
             || self.native_verification_busy

@@ -3068,6 +3068,36 @@ impl NativeWorkflows {
         self.observe_dat_activity(activity);
     }
 
+    /// Saves a person-confirmed catalogue system through the existing DAT
+    /// setup ("Use for this system" in Check My Games), with all its refusals.
+    pub(super) fn assign_catalogue_platform(
+        &mut self,
+        source_id: &str,
+        platform: &str,
+    ) -> Result<String, String> {
+        self.app
+            .ensure_dat_sources_page_loaded()
+            .map_err(|error| format!("Not saved: {error}. Nothing was changed."))?;
+        let state = self
+            .app
+            .sources_ui
+            .dat_sources_page
+            .as_mut()
+            .ok_or_else(|| "Not saved: catalogue setup is unavailable.".to_string())?;
+        if state.is_busy() {
+            return Err("Not saved: catalogue setup is busy. Try again in a moment.".into());
+        }
+        state.apply(
+            crate::dat_sources_page::DatSourcesPageAction::AssignPlatformNow {
+                id: source_id.to_string(),
+                platform: platform.to_string(),
+            },
+        );
+        state
+            .take_platform_assignment()
+            .unwrap_or_else(|| Err("Not saved. Nothing was changed.".into()))
+    }
+
     fn observe_dat_activity(&mut self, activity: &mut Activity) {
         let state = self
             .app
