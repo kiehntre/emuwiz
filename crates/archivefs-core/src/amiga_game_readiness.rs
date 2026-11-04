@@ -500,10 +500,25 @@ pub fn assess_amiga_game(
             Some(Ok(_))
         );
     if let Some(disks) = disks.filter(|disks| disks.count > 1 || disks.missing > 0) {
-        let (state, detail) = if disks.missing > 0 && dat_single_disk && disks.count == 1 {
+        // The gap is a claim about the proposed grouping, not about this
+        // disk: when the DAT proves this ADF is a whole game, say both and let
+        // Play rest on that proof (FS-UAE launches only this disk).
+        let (state, detail) = if disks.missing > 0 && dat_single_disk {
             (
                 Warning,
-                "Its file name suggests more disks, but its DAT hash match is a complete single-disk game.".to_string(),
+                format!(
+                    "File names {} {} missing, but this disk's DAT hash match is a complete single-disk game. Play uses this disk only.",
+                    if disks.count > 1 {
+                        "group this disk with others and suggest"
+                    } else {
+                        "suggest"
+                    },
+                    if disks.missing == 1 {
+                        "1 more disk is".to_string()
+                    } else {
+                        format!("{} more disks are", disks.missing)
+                    }
+                ),
             )
         } else if disks.missing > 0 {
             (

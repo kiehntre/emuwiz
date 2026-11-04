@@ -304,3 +304,40 @@ fn a_complete_name_only_set_stays_a_warning_not_a_blocker() {
     assert_eq!(row.state, AmigaCheckState::Warning, "{row:?}");
     assert!(row.detail.contains("not verified"), "{row:?}");
 }
+
+#[test]
+fn a_dat_proven_disk_in_an_incomplete_name_group_keeps_both_claims_apart() {
+    let (guidance, content) = named_adf_guidance(
+        "amiga-proven-gap",
+        &["Game (Disk 1 of 3).adf", "Game (Disk 3 of 3).adf"],
+    );
+    assert_eq!(guidance.missing_media.len(), 1, "{guidance:?}");
+    assert!(!guidance.order_verified);
+    let mut proven = facts(vec![fsuae("A500", AmigaKickstartState::PresentUnverified)]);
+    proven.adf_identity = Some(Ok("Game (1990)(Publisher)".into()));
+    let grouped = assess_amiga_game(
+        AmigaCdMachine::OrdinaryAmiga,
+        &content,
+        false,
+        disk_facts(Some(&guidance)),
+        Some(&proven),
+    );
+    let alone = assess_amiga_game(
+        AmigaCdMachine::OrdinaryAmiga,
+        &content,
+        false,
+        None,
+        Some(&proven),
+    );
+    let disks = grouped.check(AmigaCheckKind::Disks).unwrap();
+    assert_eq!(disks.state, AmigaCheckState::Warning, "{disks:?}");
+    assert_eq!(
+        grouped.check(AmigaCheckKind::Play),
+        alone.check(AmigaCheckKind::Play)
+    );
+    let (text, _) = rendered(&grouped);
+    assert!(text.contains("suggest 1 more disk is missing"), "{text}");
+    assert!(text.contains("complete single-disk game"), "{text}");
+    assert!(text.contains("Play uses this disk only"), "{text}");
+    assert!(!text.contains("Play stays unavailable"), "{text}");
+}
