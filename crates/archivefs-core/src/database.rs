@@ -9433,7 +9433,12 @@ pub fn scan_and_persist(
 ) -> Result<ScanPersistSummary> {
     validate_configured_source_roots(&config.source_folders)?;
     let registered_folders = database.register_source_folders(&config.source_folders)?;
-    let summary = scan_and_persist_folders(database, &registered_folders, triggered_by)?;
+    let summary = scan_and_persist_folders_excluding_mount_root(
+        database,
+        &registered_folders,
+        triggered_by,
+        &config.mount_root,
+    )?;
     // The source scanner owns logical Arcade ingestion; the version-bound DAT
     // join is persisted immediately after that transaction so nested SQLite
     // transactions cannot make the catalogue refresh fragile.
@@ -9456,12 +9461,24 @@ pub fn scan_and_persist(
 /// (`Config::source_folders`), while multi-source management must also
 /// register disabled ones (to keep them "configured" rather than
 /// "removed") without asking this function to scan them.
+#[cfg(test)]
 pub(crate) fn scan_and_persist_folders(
     database: &mut Database,
     folders: &[RegisteredSourceFolder],
     triggered_by: &str,
 ) -> Result<ScanPersistSummary> {
-    scan_and_persist_folders_with_skipped(database, folders, triggered_by, &[])
+    scan_and_persist_folders_with_skipped(database, folders, triggered_by, &[], Path::new(""))
+}
+
+/// [`scan_and_persist_folders`] that never walks `mount_root` content when a
+/// legacy configuration places the mount root on, inside or around a source.
+pub(crate) fn scan_and_persist_folders_excluding_mount_root(
+    database: &mut Database,
+    folders: &[RegisteredSourceFolder],
+    triggered_by: &str,
+    mount_root: &Path,
+) -> Result<ScanPersistSummary> {
+    scan_and_persist_folders_with_skipped(database, folders, triggered_by, &[], mount_root)
 }
 
 pub(crate) fn scan_and_persist_folders_with_skipped(
@@ -9469,9 +9486,11 @@ pub(crate) fn scan_and_persist_folders_with_skipped(
     folders: &[RegisteredSourceFolder],
     triggered_by: &str,
     skipped: &[PathBuf],
+    mount_root: &Path,
 ) -> Result<ScanPersistSummary> {
     database.begin_catalogue_refresh()?;
-    let result = scan_and_persist_folders_transaction(database, folders, triggered_by, skipped);
+    let result =
+        scan_and_persist_folders_transaction(database, folders, triggered_by, skipped, mount_root);
     match result {
         Ok(summary) => {
             if let Err(error) = database.validate_scan_source_commit(summary.scan_run_id) {
@@ -9496,6 +9515,7 @@ fn scan_and_persist_folders_transaction(
     folders: &[RegisteredSourceFolder],
     triggered_by: &str,
     skipped: &[PathBuf],
+    mount_root: &Path,
 ) -> Result<ScanPersistSummary> {
     database.mark_interrupted_scan_runs()?;
     let scan_run_id = database.start_scan_run(triggered_by, None)?;
@@ -9566,11 +9586,16 @@ fn scan_and_persist_folders_transaction(
             continue;
         }
         let folder_config = Config {
+            configured_source_roots: None,
             source_folders: vec![folder.path.clone()],
             mount_root: PathBuf::new(),
             ratarmount_bin: String::new(),
             master_rom_root: None,
         };
+        // A legacy config may put the mount root on, inside or around this
+        // source: never walk its content (or live mounts) as library content.
+        let mut source_exclusions = folder.excluded_source_roots.clone();
+        source_exclusions.extend(crate::mount_root_scan_exclusions(&folder.path, mount_root));
 
         let db_read_started = std::time::Instant::now();
         let fingerprints = database.load_scan_fingerprints(folder.id)?;
@@ -9603,23 +9628,19 @@ fn scan_and_persist_folders_transaction(
         let arcade_sets = arcade_root
             .as_ref()
             .filter(|root| {
-                !folder
-                    .excluded_source_roots
+                !source_exclusions
                     .iter()
                     .any(|excluded| root.starts_with(excluded))
             })
             .map(|root| {
-                crate::ingestion::discover_extracted_sets_excluding(
-                    root,
-                    &folder.excluded_source_roots,
-                )
+                crate::ingestion::discover_extracted_sets_excluding(root, &source_exclusions)
             });
         let arcade_complete = arcade_sets.as_ref().is_none_or(|result| {
             result
                 .as_ref()
                 .is_ok_and(|sets| sets.scan_errors_total == 0)
         });
-        let mut excluded_roots = folder.excluded_source_roots.clone();
+        let mut excluded_roots = source_exclusions.clone();
         if let Some(Ok(sets)) = &arcade_sets {
             // Exclude only already-aggregated logical set directories, never
             // the other systems sharing a mixed source root.
@@ -10869,6 +10890,7 @@ mod tests {
 
     fn config_for(source_dir: &Path, mount_dir: &Path) -> Config {
         Config {
+            configured_source_roots: Some(vec![source_dir.to_path_buf()]),
             source_folders: vec![source_dir.to_path_buf()],
             mount_root: mount_dir.to_path_buf(),
             ratarmount_bin: "ratarmount".to_string(),
@@ -13613,6 +13635,7 @@ mod tests {
         write_archive_file(&source_a, "a.zip", b"a");
         write_archive_file(&source_b, "b.zip", b"b");
         let config = Config {
+            configured_source_roots: Some(vec![source_a.clone(), source_b.clone()]),
             source_folders: vec![source_a.clone(), source_b.clone()],
             mount_root: mount,
             ratarmount_bin: "ratarmount".to_string(),
@@ -13671,6 +13694,7 @@ mod tests {
         write_archive_file(&source_a, "a.zip", b"a");
         write_archive_file(&source_b, "b.zip", b"b");
         let config = Config {
+            configured_source_roots: Some(vec![source_a.clone(), source_b.clone()]),
             source_folders: vec![source_a.clone(), source_b.clone()],
             mount_root: mount,
             ratarmount_bin: "ratarmount".to_string(),
@@ -13725,6 +13749,7 @@ mod tests {
         write_archive_file(&source_a, "game.zip", b"from a");
         write_archive_file(&source_b, "game.zip", b"from b, different size");
         let config = Config {
+            configured_source_roots: Some(vec![source_a.clone(), source_b.clone()]),
             source_folders: vec![source_a.clone(), source_b.clone()],
             mount_root: mount,
             ratarmount_bin: "ratarmount".to_string(),
@@ -17473,6 +17498,11 @@ echo "$out"
         write_archive_file(&source_b, "b.zip", b"b");
         write_archive_file(&source_c, "c.zip", b"c");
         let config = Config {
+            configured_source_roots: Some(vec![
+                source_a.clone(),
+                source_b.clone(),
+                source_c.clone(),
+            ]),
             source_folders: vec![source_a.clone(), source_b.clone(), source_c.clone()],
             mount_root: mount,
             ratarmount_bin: "ratarmount".to_string(),

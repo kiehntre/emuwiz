@@ -539,6 +539,7 @@ mod catalogue {
             fs::write(root.join(name), bytes).unwrap();
         }
         let config = Config {
+            configured_source_roots: None,
             source_folders: vec![root.clone()],
             mount_root: dir.path().join("mounts"),
             ratarmount_bin: "ratarmount".into(),
@@ -821,6 +822,7 @@ mod companions {
         let root = dir.path().join("games");
         fs::create_dir_all(&root).unwrap();
         let config = Config {
+            configured_source_roots: None,
             source_folders: vec![root.clone()],
             mount_root: dir.path().join("mounts"),
             ratarmount_bin: "ratarmount".into(),

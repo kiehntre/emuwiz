@@ -54,6 +54,7 @@ impl F {
         scan_and_persist(
             &mut self.db,
             &Config {
+                configured_source_roots: Some(self.roots.clone()),
                 source_folders: self.roots.clone(),
                 mount_root: self.t.path().join("mounts"),
                 ratarmount_bin: "ratarmount".into(),
@@ -306,6 +307,7 @@ fn duplicate_nested_roots_are_rejected_before_scan_mutation() {
     f.roots.push(f.roots[1].clone());
     let before = f.db.load_archives().unwrap();
     let config = Config {
+        configured_source_roots: Some(f.roots.clone()),
         source_folders: f.roots.clone(),
         mount_root: f.t.path().join("mounts"),
         ratarmount_bin: "ratarmount".into(),
@@ -722,6 +724,7 @@ fn post_probe_scan_attack(mode: &str) {
     let result = scan_and_persist(
         &mut f.db,
         &Config {
+            configured_source_roots: Some(f.roots.clone()),
             source_folders: f.roots.clone(),
             mount_root: f.t.path().join("mounts"),
             ratarmount_bin: "ratarmount".into(),

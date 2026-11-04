@@ -89,6 +89,7 @@ fn audited_from(managed: bool) -> (Fixture, PathBuf, PathBuf) {
     archivefs_core::scan_and_persist(
         &mut database,
         &archivefs_core::Config {
+            configured_source_roots: Some(vec![fixture.root.join("games")]),
             source_folders: vec![fixture.root.join("games")],
             mount_root: fixture.root.join("mount"),
             ratarmount_bin: "ratarmount".into(),

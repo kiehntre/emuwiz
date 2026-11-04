@@ -160,6 +160,7 @@ fn bounded_synthetic_rescan_preserves_ids_paths_hashes_dat_and_user_choices() {
         )
         .unwrap();
     let config = Config {
+        configured_source_roots: Some(vec![source.clone()]),
         source_folders: vec![source],
         mount_root: dir.path().join("mount"),
         ratarmount_bin: "ratarmount".into(),
@@ -332,6 +333,7 @@ fn old_cached_unknown_requires_fresh_per_record_inspection() {
     let db_path = dir.path().join("synthetic.sqlite3");
     let mut database = Database::open_or_create(&db_path).unwrap();
     let config = Config {
+        configured_source_roots: Some(vec![source.clone()]),
         source_folders: vec![source.clone()],
         mount_root: dir.path().join("mount"),
         ratarmount_bin: "ratarmount".into(),

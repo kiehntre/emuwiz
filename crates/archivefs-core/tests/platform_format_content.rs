@@ -70,6 +70,7 @@ fn valid_media_in_a_neutral_folder_is_stored_with_the_platform_its_bytes_prove()
 
     let db_path = dir.path().join("library.sqlite3");
     let config = Config {
+        configured_source_roots: Some(vec![source.clone()]),
         source_folders: vec![source.clone()],
         mount_root: dir.path().join("mount"),
         ratarmount_bin: "ratarmount".into(),

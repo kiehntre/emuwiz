@@ -82,6 +82,7 @@ fn every_stored_extension_survives_scan_rescan_and_reopen_and_every_other_is_rep
 
     let db_path = dir.path().join("library.sqlite3");
     let config = Config {
+        configured_source_roots: Some(vec![source.clone()]),
         source_folders: vec![source.clone()],
         mount_root: dir.path().join("mount"),
         ratarmount_bin: "ratarmount".into(),

@@ -820,6 +820,7 @@ fn native_cue_verification_survives_unchanged_production_rescans() {
     let (f, _, _) = cue_fixture(["Track01.bin", "Track02.bin"]);
     assert_eq!(cue_run(&f).verified, 1);
     let config = crate::Config {
+        configured_source_roots: Some(vec![f.root.clone()]),
         source_folders: vec![f.root.clone()],
         mount_root: f.dir.path().join("mount"),
         ratarmount_bin: "ratarmount".into(),

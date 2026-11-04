@@ -7582,6 +7582,7 @@ mod tests {
 
     fn config_for(source_dir: &Path, mount_dir: &Path) -> Config {
         Config {
+            configured_source_roots: Some(vec![source_dir.to_path_buf()]),
             source_folders: vec![source_dir.to_path_buf()],
             mount_root: mount_dir.to_path_buf(),
             ratarmount_bin: "ratarmount".to_string(),
@@ -7856,6 +7857,7 @@ mod tests {
         write_archive_file(&source_a, "a.zip", b"a");
         write_archive_file(&source_b, "b.zip", b"b");
         let config = Config {
+            configured_source_roots: Some(vec![source_a.clone(), source_b.clone()]),
             source_folders: vec![source_a.clone(), source_b.clone()],
             mount_root: mount,
             ratarmount_bin: "ratarmount".to_string(),

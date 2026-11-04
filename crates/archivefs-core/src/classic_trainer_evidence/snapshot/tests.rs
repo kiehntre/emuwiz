@@ -30,6 +30,7 @@ impl World {
         bytes[30 + 16384] = 0x76;
         std::fs::write(&path, &bytes).unwrap();
         let config = Config {
+            configured_source_roots: None,
             source_folders: vec![root.join("games")],
             mount_root: root.join("mount"),
             ratarmount_bin: "ratarmount".into(),

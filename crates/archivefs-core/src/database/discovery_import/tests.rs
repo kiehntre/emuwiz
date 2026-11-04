@@ -32,6 +32,7 @@ impl Fixture {
         crate::scan_and_persist(
             &mut d,
             &Config {
+                configured_source_roots: None,
                 source_folders: vec![root.clone()],
                 mount_root: t.path().join("mount"),
                 ratarmount_bin: String::new(),
@@ -69,6 +70,7 @@ impl Fixture {
         let d = self.db();
         let context = begin_bounded_preview(&d, &self.cfg).unwrap();
         let config = Config {
+            configured_source_roots: None,
             source_folders: vec![self.root.clone()],
             mount_root: PathBuf::new(),
             ratarmount_bin: String::new(),

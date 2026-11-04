@@ -615,6 +615,7 @@ fn cemu_scanner_admits_only_the_exact_structured_base_inside_its_source() {
     cafe_rpx(&loose);
     assert!(crate::Archive::from_path_in_root(&loose, &root).is_none());
     let config = crate::Config {
+        configured_source_roots: None,
         source_folders: vec![root.clone()],
         mount_root: root.join("unused-mount"),
         ratarmount_bin: "unused".into(),
@@ -664,6 +665,7 @@ fn cemu_scanner_rechecks_positive_and_negative_cache_when_sibling_evidence_chang
         non_archive_kind: Some("unsupported".into()),
     };
     let config = crate::Config {
+        configured_source_roots: None,
         source_folders: vec![root.clone()],
         mount_root: root.join("unused-mount"),
         ratarmount_bin: "unused".into(),

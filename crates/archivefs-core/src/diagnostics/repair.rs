@@ -264,6 +264,9 @@ pub enum DoctorRepairRejection {
     ConflictingActiveMount,
     /// The mount root is not configured or not usable.
     MountRootUnavailable,
+    /// The mount root is a configured source folder, is inside one, or
+    /// contains one, so nothing below it can be proven to be EmuWiz's.
+    MountRootOverlapsSource,
 }
 
 impl DoctorRepairRejection {
@@ -302,6 +305,9 @@ impl DoctorRepairRejection {
             Self::SourceMissing => "The archive is no longer where Doctor found it.",
             Self::ConflictingActiveMount => "Something is already mounted at that location.",
             Self::MountRootUnavailable => "The configured mount root is missing or unusable.",
+            Self::MountRootOverlapsSource => {
+                "The configured mount root is, is inside, or contains a configured source folder or the master ROM root, or that could not be ruled out, so EmuWiz refuses to clean it. Nothing was changed. Choose a separate mount root."
+            }
         }
     }
 }
@@ -624,6 +630,7 @@ impl RepairEffect {
 fn validate_clean_mount_root(
     context: &DoctorRepairContext<'_>,
 ) -> Result<RepairTarget, DoctorRepairRejection> {
+    guard_mount_root_disjoint_from_sources(context.config)?;
     if !context.config.mount_root.is_dir() {
         return Err(DoctorRepairRejection::MountRootUnavailable);
     }
@@ -641,6 +648,7 @@ fn validate_clean_mount_path(
 ) -> Result<RepairTarget, DoctorRepairRejection> {
     let path = affected_path(finding)?;
     guard_against_source_roots(&path, context.config)?;
+    guard_mount_root_disjoint_from_sources(context.config)?;
     guard_inside_mount_root(&path, context.config)?;
     guard_no_symlink_components(&path)?;
 
@@ -753,7 +761,13 @@ fn affected_path(finding: &Finding) -> Result<PathBuf, DoctorRepairRejection> {
 /// Refuses a configured source folder, and anything inside one. This is the
 /// hard boundary: EmuWiz never modifies the user's library.
 fn guard_against_source_roots(path: &Path, config: &Config) -> Result<(), DoctorRepairRejection> {
-    for source in &config.source_folders {
+    // The organised master ROM root is library content too.
+    for source in config
+        .source_folders
+        .iter()
+        .chain(config.configured_source_roots.iter().flatten())
+        .chain(&config.master_rom_root)
+    {
         if path == source.as_path() || path.starts_with(source) {
             return Err(DoctorRepairRejection::PathUnderSourceRoot);
         }
@@ -767,6 +781,13 @@ fn guard_against_source_roots(path: &Path, config: &Config) -> Result<(), Doctor
         }
     }
     Ok(())
+}
+
+/// Refuses any mount-root cleanup while the mount root overlaps a configured
+/// source folder (canonical comparison; fails closed when unverifiable).
+fn guard_mount_root_disjoint_from_sources(config: &Config) -> Result<(), DoctorRepairRejection> {
+    crate::ensure_mount_root_disjoint_from_config(config)
+        .map_err(|_| DoctorRepairRejection::MountRootOverlapsSource)
 }
 
 fn guard_inside_mount_root(path: &Path, config: &Config) -> Result<(), DoctorRepairRejection> {

@@ -27,6 +27,7 @@ impl Fixture {
             fs::write(path, b"synthetic game").unwrap();
         }
         let config = Config {
+            configured_source_roots: None,
             source_folders: vec![root.clone()],
             mount_root: temp.path().join("mount"),
             ratarmount_bin: "ratarmount".into(),
@@ -331,6 +332,7 @@ impl Fixture {
     }
     fn config(&self) -> Config {
         Config {
+            configured_source_roots: None,
             source_folders: vec![self.root.clone()],
             mount_root: self._temp.path().join("mount"),
             ratarmount_bin: "ratarmount".into(),

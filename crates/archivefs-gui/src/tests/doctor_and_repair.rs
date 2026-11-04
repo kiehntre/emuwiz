@@ -3690,6 +3690,7 @@ fn a_refused_repair_is_recorded_in_history_and_shown_as_refused() {
     let scratch = std::env::temp_dir().join("archivefs-doctor-repair-refusal-fixture");
     app.confirm_doctor_repair_with(
         Config {
+            configured_source_roots: Some(vec![scratch.join("sources")]),
             source_folders: vec![scratch.join("sources")],
             mount_root: scratch.join("mounts"),
             ratarmount_bin: "ratarmount".to_string(),

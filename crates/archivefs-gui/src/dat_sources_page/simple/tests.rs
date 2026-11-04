@@ -446,6 +446,7 @@ mod audit_population {
             std::fs::write(folder.join("assets").join(name), vec![9u8; 4096]).unwrap();
         }
         let config = Config {
+            configured_source_roots: Some(vec![source.clone()]),
             source_folders: vec![source],
             mount_root: dir.path().join("mounts"),
             ratarmount_bin: "ratarmount".into(),
