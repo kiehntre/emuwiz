@@ -1064,11 +1064,6 @@ impl RepairReviewPageState {
         self.spawn_apply(plan, confirmation);
     }
 
-    /// Spawns the background apply worker. The GUI never mutates the
-    /// filesystem itself: this calls [`apply_saved_plan_selected`] on a
-    /// dedicated thread with the *exact* saved plan this page loaded (never
-    /// a GUI-built [`archivefs_core::repair::plan::RepairPlan`]) and the
-    /// exact frozen selection, and relays only the result back.
     /// The production data-folder resolver (or, in tests only, its stand-in).
     fn resolve_default_journal_dir(&self) -> Result<PathBuf, String> {
         #[cfg(test)]
@@ -1079,6 +1074,11 @@ impl RepairReviewPageState {
             .map_err(|error| error.to_string())
     }
 
+    /// Spawns the background apply worker. The GUI never mutates the
+    /// filesystem itself: this calls [`apply_saved_plan_selected`] on a
+    /// dedicated thread with the *exact* saved plan this page loaded (never
+    /// a GUI-built [`archivefs_core::repair::plan::RepairPlan`]) and the
+    /// exact frozen selection, and relays only the result back.
     fn spawn_apply(&mut self, plan: LibraryRepairPlan, confirmation: RepairApplyConfirmation) {
         if self.apply_job.is_some() {
             return;
