@@ -348,6 +348,10 @@ fn inspect_seal_store_copy(copy: &Path, wal: Option<&[u8]>) -> rusqlite::Result<
             | OpenFlags::SQLITE_OPEN_NO_MUTEX
             | OpenFlags::SQLITE_OPEN_NOFOLLOW,
     )?;
+    // A throwaway copy: no fsyncs (they made each classification cost ~15 ms
+    // on a busy disk, on every repaint that resolves the data folder). It
+    // changes durability only, never which frames SQLite accepts.
+    connection.pragma_update(None, "synchronous", "OFF")?;
     if let Some(wal) = wal.filter(|wal| !wal.is_empty()) {
         let Some(frames) = wal_frame_count(wal) else {
             return Ok(false);
