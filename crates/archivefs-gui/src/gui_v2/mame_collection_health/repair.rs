@@ -438,6 +438,13 @@ fn execute_checked(
         executable: validated_executable(check.executable.as_deref()),
         timeout: check.timeout,
     };
+    // The catalogue is re-observed after the copy: if the file changed since it
+    // was read, the identity no longer matches and MAME is not run.
+    let current_catalogue = if fresh.catalogue.source.still_matches() {
+        candidate.catalogue_digest.clone()
+    } else {
+        "catalogue changed after review".to_string()
+    };
     let mut verifications = Vec::new();
     let mut unchecked_sets = Vec::new();
     for (index, basis) in reviewed.verification_basis.iter().enumerate() {
@@ -450,7 +457,7 @@ fn execute_checked(
                 basis,
                 &apply,
                 &result,
-                (&candidate.catalogue_digest, &candidate.plan),
+                (&current_catalogue, &candidate.plan),
                 check,
             ),
         });
