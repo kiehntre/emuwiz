@@ -201,5 +201,5 @@ fn a_missing_catalogue_is_explained_and_links_dat_management() {
         assert!(painted.contains(wanted), "{wanted}: {painted}");
     }
     assert!(!painted.contains("Verified"), "{painted}");
-    assert!(matches!(action, None));
+    assert!(action.is_none());
 }
