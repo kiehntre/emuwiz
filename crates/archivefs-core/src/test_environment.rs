@@ -384,11 +384,11 @@ mod tests {
         // XDG and explicit roots taking precedence exactly as before.
         let home = Path::new("/nonexistent-emuwiz-home");
         assert_eq!(
-            crate::app_dirs::data_dir_in_with_roots(home, None, None),
+            crate::app_dirs::data_dir_in_with_roots(home, None, None).unwrap(),
             home.join(".local/share/emuwiz")
         );
         assert_eq!(
-            crate::app_dirs::data_dir_in_with_roots(home, None, Some(Path::new("/xdg"))),
+            crate::app_dirs::data_dir_in_with_roots(home, None, Some(Path::new("/xdg"))).unwrap(),
             Path::new("/xdg/emuwiz")
         );
         assert_eq!(
@@ -396,11 +396,12 @@ mod tests {
                 home,
                 Some(Path::new("/explicit")),
                 Some(Path::new("/xdg"))
-            ),
+            )
+            .unwrap(),
             Path::new("/explicit")
         );
         assert_eq!(
-            crate::app_dirs::config_dir_in_with_roots(home, None, None),
+            crate::app_dirs::config_dir_in_with_roots(home, None, None).unwrap(),
             home.join(".config/emuwiz")
         );
     }

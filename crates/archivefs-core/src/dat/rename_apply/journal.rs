@@ -51,7 +51,7 @@ pub fn legacy_rename_transaction_dir() -> Result<PathBuf, ArchiveFsError> {
 /// so tests can exercise the no-home case without racing on the environment.
 pub fn rename_transaction_dir_in(home: Option<OsString>) -> Result<PathBuf, ArchiveFsError> {
     let home = home.ok_or_else(|| ArchiveFsError::Config("HOME is not set".to_string()))?;
-    Ok(crate::app_dirs::data_dir_in(Path::new(&home)).join(RENAME_TRANSACTIONS_DIRECTORY))
+    Ok(crate::app_dirs::data_dir_in(Path::new(&home))?.join(RENAME_TRANSACTIONS_DIRECTORY))
 }
 
 /// Per journal folder and transaction id: how many operations in this process
@@ -739,7 +739,7 @@ mod tests {
     }
 
     #[test]
-    fn journal_directory_reuses_legacy_and_prefers_emuwiz() {
+    fn journal_directory_follows_the_data_directory_contract() {
         let home = tempfile::tempdir().unwrap();
         let legacy = home.path().join(".local/share/archivefs");
         std::fs::create_dir_all(&legacy).unwrap();
@@ -749,12 +749,25 @@ mod tests {
             legacy.join(RENAME_TRANSACTIONS_DIRECTORY)
         );
 
+        // An empty EmuWiz data directory never moves journals away from the
+        // existing legacy install.
         let primary = home.path().join(".local/share/emuwiz");
         std::fs::create_dir_all(&primary).unwrap();
         assert_eq!(
-            rename_transaction_dir_in(home_arg).unwrap(),
+            rename_transaction_dir_in(home_arg.clone()).unwrap(),
+            legacy.join(RENAME_TRANSACTIONS_DIRECTORY)
+        );
+
+        // Once the EmuWiz directory holds the library, it is preferred.
+        std::fs::write(primary.join("library.sqlite3"), b"db").unwrap();
+        assert_eq!(
+            rename_transaction_dir_in(home_arg.clone()).unwrap(),
             primary.join(RENAME_TRANSACTIONS_DIRECTORY)
         );
+
+        // Both holding a library is ambiguous: no journal folder is chosen.
+        std::fs::write(legacy.join("library.sqlite3"), b"db").unwrap();
+        assert!(rename_transaction_dir_in(home_arg).is_err());
     }
 
     /// Upgrading an install whose pre-seal journal folder holds an interrupted

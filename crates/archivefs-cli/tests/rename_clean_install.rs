@@ -77,23 +77,102 @@ fn a_legacy_archivefs_only_user_keeps_using_legacy_directories() {
     let _ = std::fs::remove_dir_all(&home);
 }
 
+const LEGACY_CONFIG: &str = "mount_root = \"/mnt/legacy-marker\"\n";
+
+/// The reported defect, end to end: an empty `emuwiz` folder (for example
+/// left by a start with XDG variables set) must not hide the legacy library.
 #[test]
-fn when_both_exist_emuwiz_wins_and_nothing_is_overwritten() {
-    let home = isolated_home("both");
+fn an_empty_emuwiz_folder_never_hides_an_established_legacy_install() {
+    let home = isolated_home("empty-new");
     std::fs::create_dir_all(home.join(".config/archivefs")).unwrap();
+    std::fs::write(home.join(".config/archivefs/config.toml"), LEGACY_CONFIG).unwrap();
     std::fs::create_dir_all(home.join(".config/emuwiz")).unwrap();
+    std::fs::write(home.join(".config/emuwiz/gui-v2.json"), "{}").unwrap();
     std::fs::create_dir_all(home.join(".local/share/archivefs")).unwrap();
-    std::fs::create_dir_all(home.join(".local/share/emuwiz")).unwrap();
+    std::fs::write(home.join(".local/share/archivefs/library.sqlite3"), "").unwrap();
+    std::fs::create_dir_all(home.join(".local/share/emuwiz/sealed-writers")).unwrap();
 
     let text = combined(&run_cli(&home, &["config-check"]));
     assert!(
-        text.contains(home.join(".config/emuwiz/config.toml").to_str().unwrap()),
-        "EmuWiz must take precedence when both exist, got:\n{text}"
+        text.contains(home.join(".config/archivefs/config.toml").to_str().unwrap()),
+        "the established legacy config must stay in use, got:\n{text}"
+    );
+    let status = combined(&run_cli(&home, &["library-status"]));
+    assert!(
+        status.contains(
+            home.join(".local/share/archivefs/library.sqlite3")
+                .to_str()
+                .unwrap()
+        ),
+        "the established legacy library must stay in use, got:\n{status}"
     );
 
-    // Resolution never overwrites or moves conflicting destination data.
-    assert!(home.join(".config/archivefs").exists());
-    assert!(home.join(".local/share/archivefs").exists());
+    // XDG roots equal to the default bases change nothing.
+    let xdg = Command::new(env!("CARGO_BIN_EXE_emuwiz-cli"))
+        .arg("config-check")
+        .env("HOME", &home)
+        .env("XDG_CONFIG_HOME", home.join(".config"))
+        .env("XDG_DATA_HOME", home.join(".local/share"))
+        .env_remove("USERPROFILE")
+        .output()
+        .unwrap();
+    let text = combined(&xdg);
+    assert!(
+        text.contains(home.join(".config/archivefs/config.toml").to_str().unwrap()),
+        "XDG_CONFIG_HOME=$HOME/.config must resolve like no XDG root, got:\n{text}"
+    );
+    assert_eq!(
+        std::fs::read_to_string(home.join(".config/archivefs/config.toml")).unwrap(),
+        LEGACY_CONFIG
+    );
+    let _ = std::fs::remove_dir_all(&home);
+}
+
+#[test]
+fn when_both_hold_settings_nothing_is_chosen_or_overwritten() {
+    let home = isolated_home("both");
+    std::fs::create_dir_all(home.join(".config/archivefs")).unwrap();
+    std::fs::write(home.join(".config/archivefs/config.toml"), LEGACY_CONFIG).unwrap();
+    std::fs::create_dir_all(home.join(".config/emuwiz")).unwrap();
+    std::fs::write(
+        home.join(".config/emuwiz/config.toml"),
+        "mount_root = \"/mnt/new\"\n",
+    )
+    .unwrap();
+
+    let output = run_cli(&home, &["config-check"]);
+    let text = combined(&output);
+    assert!(
+        text.contains("will not choose between them")
+            && text.contains(home.join(".config/emuwiz").to_str().unwrap())
+            && text.contains(home.join(".config/archivefs").to_str().unwrap())
+            && text.contains("EMUWIZ_CONFIG_HOME"),
+        "two established config folders must be reported, not chosen, got:\n{text}"
+    );
+
+    // Resolution never overwrites, merges or moves either side.
+    assert_eq!(
+        std::fs::read_to_string(home.join(".config/archivefs/config.toml")).unwrap(),
+        LEGACY_CONFIG
+    );
+    assert_eq!(
+        std::fs::read_to_string(home.join(".config/emuwiz/config.toml")).unwrap(),
+        "mount_root = \"/mnt/new\"\n"
+    );
+
+    // The documented way out: an explicit root picks one.
+    let chosen = Command::new(env!("CARGO_BIN_EXE_emuwiz-cli"))
+        .arg("config-check")
+        .env("HOME", &home)
+        .env("EMUWIZ_CONFIG_HOME", home.join(".config/archivefs"))
+        .env_remove("USERPROFILE")
+        .output()
+        .unwrap();
+    let text = combined(&chosen);
+    assert!(
+        text.contains(home.join(".config/archivefs/config.toml").to_str().unwrap()),
+        "an explicit root must resolve the ambiguity, got:\n{text}"
+    );
     let _ = std::fs::remove_dir_all(&home);
 }
 

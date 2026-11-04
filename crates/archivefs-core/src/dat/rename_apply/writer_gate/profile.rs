@@ -100,12 +100,14 @@ fn roots(env: &Environment) -> Option<Vec<PathBuf>> {
         &home,
         get("EMUWIZ_CONFIG_HOME").as_deref(),
         get("XDG_CONFIG_HOME").as_deref(),
-    );
+    )
+    .ok()?;
     let data = crate::app_dirs::data_dir_in_with_roots(
         &home,
         get("EMUWIZ_DATA_HOME").as_deref(),
         get("XDG_DATA_HOME").as_deref(),
-    );
+    )
+    .ok()?;
     // A changed HOME string and non-existent projected paths are not enough.
     // Require the active profile roots to be real directories as well.
     if !std::fs::metadata(config).ok()?.is_dir() || !std::fs::metadata(data).ok()?.is_dir() {

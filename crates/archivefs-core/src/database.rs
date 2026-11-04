@@ -230,10 +230,7 @@ pub fn default_database_path() -> Result<PathBuf> {
 #[cfg(test)]
 fn resolve_database_path(home: Option<OsString>) -> Result<PathBuf> {
     let home = home.ok_or_else(|| ArchiveFsError::Database("HOME is not set".to_string()))?;
-    Ok(crate::app_dirs::data_path_in(
-        Path::new(&home),
-        "library.sqlite3",
-    ))
+    Ok(crate::app_dirs::data_dir_in(Path::new(&home))?.join("library.sqlite3"))
 }
 
 /// One forward-only schema migration. Applied in ascending `version` order;
@@ -11355,8 +11352,19 @@ mod tests {
         std::fs::create_dir_all(&emuwiz).unwrap();
         std::fs::create_dir_all(&legacy).unwrap();
 
+        // Two empty directories: an empty EmuWiz folder never displaces the
+        // legacy install.
+        let path = resolve_database_path(Some(home.clone().into_os_string())).unwrap();
+        assert_eq!(path, legacy.join("library.sqlite3"));
+
+        // EmuWiz holding the library is preferred over an empty legacy folder.
+        std::fs::write(emuwiz.join("library.sqlite3"), b"db").unwrap();
         let path = resolve_database_path(Some(home.clone().into_os_string())).unwrap();
         assert_eq!(path, emuwiz.join("library.sqlite3"));
+
+        // Both holding a library: no path is chosen.
+        std::fs::write(legacy.join("library.sqlite3"), b"db").unwrap();
+        assert!(resolve_database_path(Some(home.clone().into_os_string())).is_err());
 
         let _ = std::fs::remove_dir_all(&home);
     }
