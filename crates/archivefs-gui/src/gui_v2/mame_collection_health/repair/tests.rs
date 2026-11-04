@@ -429,3 +429,273 @@ fn blue_repair_undo_runs_through_the_native_history_controller() {
         TransactionState::RolledBack
     );
 }
+
+mod mame_check {
+    use super::*;
+    use std::os::unix::fs::PermissionsExt;
+    use std::time::Duration;
+
+    /// Writes an executable script and waits until it can be spawned, so a
+    /// parallel test's fork cannot make the first real run fail with ETXTBSY.
+    fn script(dir: &std::path::Path, name: &str, body: &str) -> std::path::PathBuf {
+        let path = dir.join(name);
+        std::fs::write(
+            &path,
+            format!("#!/bin/sh\ncase \"$1\" in --probe) exit 0;; esac\n{body}\n"),
+        )
+        .unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
+        for _ in 0..200 {
+            match std::process::Command::new(&path).arg("--probe").status() {
+                Ok(_) => break,
+                Err(_) => std::thread::sleep(Duration::from_millis(10)),
+            }
+        }
+        path
+    }
+    fn check(executable: Option<std::path::PathBuf>, ms: u64) -> MameCheck {
+        MameCheck {
+            executable,
+            timeout: Duration::from_millis(ms),
+        }
+    }
+    fn run(f: &Fixture, c: &MameCheck) -> Outcome {
+        let report = f.report();
+        execute_checked(report.repair.as_ref().unwrap(), &options(f), c, &mut |_| {}).unwrap()
+    }
+    const GOOD_MAME: &str = "for a; do last=$a; done; echo \"romset $last is good\"";
+
+    #[test]
+    fn mame_pass_is_reported_as_rom_verification_only() {
+        let f = fixture();
+        let exe = script(f.dir.path(), "mame-good", GOOD_MAME);
+        let out = run(&f, &check(Some(exe), 5000));
+        assert_eq!(out.verifications.len(), 1);
+        let v = &out.verifications[0].verification;
+        assert_eq!(v.state, MameRepairVerificationState::VerifiedComplete);
+        assert_eq!(v.destination_hashes_verified.len(), 1);
+        assert!(
+            out.notice.starts_with("Applied transaction"),
+            "{}",
+            out.notice
+        );
+        assert!(out.notice.contains("destination file hashes verified"));
+        assert!(out.notice.contains("not that a game plays"));
+        let text = describe(v);
+        assert!(
+            text.contains("does not show the game starts, plays"),
+            "{text}"
+        );
+        assert_eq!(
+            std::fs::read(f.request.root.join("g/main.bin")).unwrap(),
+            b"hello world"
+        );
+    }
+
+    #[test]
+    fn mame_failure_is_not_shown_as_verified() {
+        let f = fixture();
+        let exe = script(f.dir.path(), "mame-bad", "echo 'romset g is bad'; exit 1");
+        let out = run(&f, &check(Some(exe), 5000));
+        let v = &out.verifications[0].verification;
+        assert_eq!(v.state, MameRepairVerificationState::VerificationFailed);
+        assert!(describe(v).contains("not shown to verify"));
+        assert!(!out.notice.contains("1 of 1 set(s) verified complete"));
+        // The file copy and its journal are unaffected by a failed check.
+        assert!(f.request.root.join("g/main.bin").exists());
+    }
+
+    #[test]
+    fn missing_or_unstartable_mame_is_unavailable_not_success() {
+        let f = fixture();
+        let out = run(&f, &check(None, 1000));
+        let v = &out.verifications[0].verification;
+        assert_eq!(
+            v.state,
+            MameRepairVerificationState::VerificationUnavailable
+        );
+        assert!(describe(v).contains("was not run"));
+        assert!(out.notice.contains("0 of 1 set(s) verified complete"));
+        let f = fixture();
+        let out = run(&f, &check(Some("/nonexistent/mame".into()), 1000));
+        let v = &out.verifications[0].verification;
+        assert_ne!(v.state, MameRepairVerificationState::VerifiedComplete);
+        assert_eq!(
+            v.targeted_mame.as_ref().unwrap().state,
+            MameTargetedVerificationState::Unavailable
+        );
+        assert!(describe(v).contains("could not be started"));
+        assert!(out.notice.contains("0 of 1 set(s) verified complete"));
+    }
+
+    #[test]
+    fn configured_mame_is_validated_before_it_runs() {
+        use std::os::unix::fs::PermissionsExt;
+        let f = fixture();
+        let (exe, marker) = marker_script(&f);
+        let link = f.dir.path().join("mame-link");
+        std::os::unix::fs::symlink(&exe, &link).unwrap();
+        let not_exec = f.dir.path().join("mame-plain");
+        std::fs::write(&not_exec, "#!/bin/sh\ntouch marker\n").unwrap();
+        std::fs::set_permissions(&not_exec, std::fs::Permissions::from_mode(0o644)).unwrap();
+        let cases = [
+            link,
+            not_exec,
+            f.dir.path().to_path_buf(),
+            std::path::PathBuf::from("mame"),
+        ];
+        for bad in cases {
+            let f = fixture();
+            let out = run(&f, &check(Some(bad.clone()), 2000));
+            let v = &out.verifications[0].verification;
+            assert_eq!(
+                v.state,
+                MameRepairVerificationState::VerificationUnavailable,
+                "{bad:?}"
+            );
+        }
+        assert!(!marker.exists());
+        assert_eq!(validated_executable(Some(&exe)), Some(exe));
+    }
+
+    #[test]
+    fn mame_timeout_is_bounded_and_fails() {
+        let f = fixture();
+        let exe = script(f.dir.path(), "mame-slow", "exec sleep 30");
+        let started = std::time::Instant::now();
+        let out = run(&f, &check(Some(exe), 300));
+        assert!(started.elapsed() < Duration::from_secs(10));
+        let v = &out.verifications[0].verification;
+        assert_eq!(v.state, MameRepairVerificationState::VerificationFailed);
+        assert_eq!(
+            v.targeted_mame.as_ref().unwrap().state,
+            MameTargetedVerificationState::Timeout
+        );
+        assert!(describe(v).contains("stopped"));
+    }
+
+    fn applied(
+        f: &Fixture,
+    ) -> (
+        std::sync::Arc<Reviewed>,
+        MameInternalRepairApplyPlan,
+        MameInternalRepairApplyResult,
+    ) {
+        let report = f.report();
+        let reviewed = report.repair.clone().unwrap();
+        let mut apply = reviewed.apply.clone();
+        let result =
+            apply_mame_internal_repair_plan(&mut apply, &options(f), &AtomicBool::new(false))
+                .unwrap();
+        (reviewed, apply, result)
+    }
+    fn marker_script(f: &Fixture) -> (std::path::PathBuf, std::path::PathBuf) {
+        let marker = f.dir.path().join("mame-ran");
+        let exe = script(
+            f.dir.path(),
+            "mame-marker",
+            &format!("touch '{}'; {GOOD_MAME}", marker.display()),
+        );
+        (exe, marker)
+    }
+
+    #[test]
+    fn stale_evidence_never_starts_mame() {
+        let f = fixture();
+        let (reviewed, apply, result) = applied(&f);
+        let (exe, marker) = marker_script(&f);
+        let basis = &reviewed.verification_basis[0];
+        // Changed destination bytes.
+        std::fs::write(
+            f.request.root.join("g/main.bin"),
+            b"someone else wrote this",
+        )
+        .unwrap();
+        let c = check(Some(exe.clone()), 5000);
+        let v = verify_set(
+            basis,
+            &apply,
+            &result,
+            (&reviewed.catalogue_digest, &reviewed.plan),
+            &c,
+        );
+        assert_eq!(v.state, MameRepairVerificationState::StaleEvidence);
+        // Changed catalogue.
+        let v = verify_set(
+            basis,
+            &apply,
+            &result,
+            ("different-catalogue", &reviewed.plan),
+            &c,
+        );
+        assert_eq!(v.state, MameRepairVerificationState::StaleEvidence);
+        assert!(!marker.exists(), "MAME must not run on stale evidence");
+        assert!(describe(&v).contains("evidence changed"));
+    }
+
+    #[test]
+    fn rolled_back_or_partial_transaction_never_starts_mame() {
+        let f = fixture();
+        let (reviewed, apply, mut result) = applied(&f);
+        let (exe, marker) = marker_script(&f);
+        let c = check(Some(exe), 5000);
+        for state in [
+            TransactionState::RolledBack,
+            TransactionState::Applying,
+            TransactionState::ApplyFailed,
+        ] {
+            result.outcome.transaction.state = state;
+            let v = verify_set(
+                &reviewed.verification_basis[0],
+                &apply,
+                &result,
+                (&reviewed.catalogue_digest, &reviewed.plan),
+                &c,
+            );
+            assert_eq!(
+                v.state,
+                MameRepairVerificationState::StaleEvidence,
+                "{state:?}"
+            );
+        }
+        assert!(
+            !marker.exists(),
+            "MAME must not run unless the transaction is Applied"
+        );
+    }
+
+    #[test]
+    fn failed_apply_runs_no_mame_check() {
+        use std::os::unix::fs::PermissionsExt;
+        let f = fixture();
+        let (exe, marker) = marker_script(&f);
+        let report = f.report();
+        let dir = f.request.root.join("g");
+        std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o555)).unwrap();
+        let result = execute_checked(
+            report.repair.as_ref().unwrap(),
+            &options(&f),
+            &check(Some(exe), 5000),
+            &mut |_| {},
+        );
+        std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o755)).unwrap();
+        if let Ok(out) = result {
+            assert!(out.verifications.is_empty(), "{}", out.notice);
+        }
+        assert!(!marker.exists());
+    }
+
+    #[test]
+    fn basis_is_captured_at_planning_time() {
+        let f = fixture();
+        let report = f.report();
+        let reviewed = report.repair.as_ref().unwrap();
+        let basis = &reviewed.verification_basis;
+        assert_eq!(basis.len(), 1);
+        assert_eq!(basis[0].set, "g");
+        assert_eq!(basis[0].identity.catalogue_sha256, report.catalogue.sha256);
+        assert_eq!(basis[0].identity.evidence_generation, reviewed.digest);
+        assert_eq!(basis[0].identity.arcade_root, reviewed.plan.collection_root);
+        assert!(!basis[0].identity.dependency_topology_digest.is_empty());
+    }
+}
