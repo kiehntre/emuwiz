@@ -491,14 +491,31 @@ pub fn assess_amiga_game(
         }
     }
 
+    // A DAT hash match that proves a complete single-disk game outranks disk
+    // numbers read from file names.
+    let dat_single_disk = media == AmigaMediaKind::Adf
+        && !cd_machine
+        && matches!(
+            facts.and_then(|facts| facts.adf_identity.as_ref()),
+            Some(Ok(_))
+        );
     if let Some(disks) = disks.filter(|disks| disks.count > 1 || disks.missing > 0) {
-        let (state, detail) = if disks.missing > 0 {
+        let (state, detail) = if disks.missing > 0 && dat_single_disk && disks.count == 1 {
+            (
+                Warning,
+                "Its file name suggests more disks, but its DAT hash match is a complete single-disk game.".to_string(),
+            )
+        } else if disks.missing > 0 {
             (
                 Blocked,
                 format!(
-                    "{} of this game's disks {} missing; the set is incomplete (see the disk list).",
+                    "{} of this game's disks {} missing from the disk numbers found; the set is incomplete or unproven (see the disk list).",
                     disks.missing,
-                    if disks.missing == 1 { "is" } else { "are" }
+                    if disks.missing == 1 {
+                        "appears to be"
+                    } else {
+                        "appear to be"
+                    }
                 ),
             )
         } else if disks.problems > 0 {

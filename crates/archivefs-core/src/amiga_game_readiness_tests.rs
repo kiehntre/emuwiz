@@ -235,12 +235,51 @@ fn incomplete_or_unverified_disk_sets_are_reported_honestly() {
         let row = readiness.check(K::Disks).unwrap();
         assert_eq!(row.state, Blocked, "{count}: {row:?}");
         assert!(
-            row.detail.contains("1 of this game's disks is missing"),
+            row.detail
+                .contains("1 of this game's disks appears to be missing"),
             "{row:?}"
         );
         assert_eq!(row.route, Some(AmigaFixRoute::MultiDisk));
         assert!(!readiness.launch_route_exists);
     }
+
+    // A filename disk number never overrides a DAT-proven single-disk ADF:
+    // the row warns, and Play is not blocked by it.
+    let mut verified_env = env(vec![profile(AmigaEmulatorKind::FsUae, Some("A500"))]);
+    verified_env.adf_identity = Some(Ok("Game (1990)(Publisher)".into()));
+    let lone = AmigaDiskSetFacts {
+        count: 1,
+        order_verified: false,
+        problems: 0,
+        missing: 2,
+    };
+    let readiness = assess_amiga_game(
+        AMIGA,
+        Path::new("Game (Disk 1 of 3).adf"),
+        false,
+        Some(lone),
+        Some(&verified_env),
+    );
+    let without = assess_amiga_game(
+        AMIGA,
+        Path::new("Game (Disk 1 of 3).adf"),
+        false,
+        None,
+        Some(&verified_env),
+    );
+    assert_eq!(state(&readiness, K::Disks), Warning);
+    assert_eq!(state(&readiness, K::Play), state(&without, K::Play));
+    assert_eq!(readiness.launch_route_exists, without.launch_route_exists);
+    // With another disk actually present, the gap still blocks.
+    let two = AmigaDiskSetFacts { count: 2, ..lone };
+    let readiness = assess_amiga_game(
+        AMIGA,
+        Path::new("Game (Disk 1 of 3).adf"),
+        false,
+        Some(two),
+        Some(&verified_env),
+    );
+    assert_eq!(state(&readiness, K::Disks), Blocked);
 }
 
 #[test]
