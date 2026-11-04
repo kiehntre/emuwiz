@@ -13,6 +13,8 @@ use super::game_verification_guidance::{Guidance, dat_verified_now};
 use super::identity_review::{Review, review_for};
 use super::launch_readiness_summary::IdentitySummary;
 use super::library::{Game, IdentityContext};
+use super::routes::Route;
+use eframe::egui;
 
 /// The panel's only answer that can invalidate earlier proof, and the one
 /// explanation under it that is a temporary absence rather than evidence.
@@ -166,3 +168,103 @@ impl super::App {
 
 #[cfg(test)]
 mod tests;
+
+/// How Blue arrived at its best guess. None of these is verification.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) enum GuessBasis {
+    /// A saved catalogue comparison suggested it, without current proof.
+    PossibleCatalogueMatch,
+    /// The file's own evidence (header, serial or launch identity).
+    FileEvidence,
+    /// Only the file name and folder.
+    FileName,
+}
+
+/// Blue's most likely identity for a game that is not verified, and any
+/// alternatives the saved evidence names. Read-only; never saved as proof.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(super) struct LikelyMatch {
+    pub basis: GuessBasis,
+    pub alternatives: Vec<String>,
+}
+
+pub(super) fn likely_match(
+    game: &Game,
+    review: Option<&super::identity_review::Review>,
+) -> LikelyMatch {
+    use archivefs_core::LibraryDatState;
+    let basis = if matches!(
+        game.dat_state,
+        Some(LibraryDatState::Verified | LibraryDatState::Probable)
+    ) {
+        GuessBasis::PossibleCatalogueMatch
+    } else if game.identified {
+        GuessBasis::FileEvidence
+    } else {
+        GuessBasis::FileName
+    };
+    let alternatives = match review.map(|review| &review.state) {
+        Some(super::identity_review::ReviewState::Ambiguous { candidates }) => candidates
+            .iter()
+            .filter(|name| **name != game.title)
+            .take(3)
+            .cloned()
+            .collect(),
+        _ => Vec::new(),
+    };
+    LikelyMatch {
+        basis,
+        alternatives,
+    }
+}
+
+pub(super) fn basis_text(basis: GuessBasis) -> &'static str {
+    match basis {
+        GuessBasis::PossibleCatalogueMatch => {
+            "Possible match from a saved catalogue comparison. Not verified."
+        }
+        GuessBasis::FileEvidence => {
+            "From the file's own evidence. Not checked against a catalogue."
+        }
+        GuessBasis::FileName => "From the file name and folder only. Not verified.",
+    }
+}
+
+pub(super) const LIKELY_MATCH_QUESTION: &str = "Does this look like your game?";
+pub(super) const CHOOSE_ANOTHER_MATCH: &str = "Choose another match";
+pub(super) const CHECK_THIS_GAME: &str = "Check this game";
+/// Saying yes is only the person's judgement; nothing is saved as proof.
+pub(super) const LOOKS_RIGHT_NOTE: &str = "Saying it looks right does not verify the file or change launch checks. Play above runs its own launch check; Check this game compares the file with a catalogue.";
+
+/// The "Does this look like your game?" card: Blue's guess, how it got
+/// there, alternatives, and the two working routes. Returns the route chosen.
+pub(super) fn show_likely_match(
+    ui: &mut egui::Ui,
+    game: &Game,
+    guess: &LikelyMatch,
+) -> Option<Route> {
+    let id = game.archive.id;
+    let mut route = None;
+    ui.horizontal_wrapped(|ui| {
+        ui.strong(format!("{LIKELY_MATCH_QUESTION} {}", game.title));
+        ui.small(basis_text(guess.basis));
+        if !guess.alternatives.is_empty() {
+            ui.small(format!("Or: {}", guess.alternatives.join(" · ")));
+        }
+        if ui
+            .small_button(CHOOSE_ANOTHER_MATCH)
+            .on_hover_text(LOOKS_RIGHT_NOTE)
+            .clicked()
+        {
+            route = Some(Route::ReviewIdentity(id));
+        }
+        if ui
+            .small_button(CHECK_THIS_GAME)
+            .on_hover_text(LOOKS_RIGHT_NOTE)
+            .clicked()
+        {
+            route = Some(Route::GameCheck(id));
+        }
+    });
+    route
+}

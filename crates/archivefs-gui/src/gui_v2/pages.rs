@@ -2061,6 +2061,20 @@ impl App {
                 super::identity_review_page::setup_verification_route(Some(&game.platform)),
             ),
             Some(PageAction::SetUpCatalogues) => self.go(Route::Section(Section::Dat)),
+            Some(PageAction::UseCatalogueForSystem {
+                source_id,
+                platform,
+            }) => {
+                let workflows = self.native_workflows.get_or_insert_with(|| {
+                    super::native_workflows::NativeWorkflows::new(ui.ctx().clone())
+                });
+                // Offered only after this game's Verified check (see
+                // `game_dat_check::assignable_after`); saved through the
+                // existing Check My Games assignment with all its refusals.
+                let result = workflows.assign_catalogue_platform(&source_id, &platform);
+                self.game_dat_check.assignable = None;
+                self.game_dat_check.assignment = Some(result);
+            }
             None => {}
         }
     }
@@ -3213,6 +3227,16 @@ impl App {
                     self.go(Route::ReviewIdentity(id));
                 }
             });
+            if !identity.is_verified() {
+                let review = self.identity_review_for(id);
+                let guess = super::detail_identity::likely_match(game, review.as_ref());
+                if let Some(route) = super::detail_identity::show_likely_match(ui, game, &guess) {
+                    match route {
+                        Route::GameCheck(_) => self.go_verification(route),
+                        other => self.go(other),
+                    }
+                }
+            }
         }
         self.detail_verification_guidance(ui, game);
         if let Some(detail) = self.detail.as_ref().filter(|detail| detail.game == id) {

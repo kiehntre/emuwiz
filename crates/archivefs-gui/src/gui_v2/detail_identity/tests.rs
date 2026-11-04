@@ -192,3 +192,51 @@ fn a_game_without_a_dat_match_is_unaffected_by_any_panel_answer() {
         assert!(!disproves_library_match(&game, panel.as_ref()));
     }
 }
+
+/// Blue's guess is labelled by how it was reached, offers working routes,
+/// and never claims verification.
+#[test]
+fn the_likely_match_card_is_honest_and_routes_to_review_and_check() {
+    use super::super::routes::Route;
+    use super::{
+        CHECK_THIS_GAME, CHOOSE_ANOTHER_MATCH, GuessBasis, LikelyMatch, basis_text, likely_match,
+        show_likely_match,
+    };
+    let game = super::super::library::Game::from_archive(archivefs_core::PersistedArchive {
+        id: 9,
+        source_folder_id: 1,
+        relative_path: "Super Game (USA).sfc".into(),
+        absolute_path: "/fixture/Super Game (USA).sfc".into(),
+        archive_kind: "file".into(),
+        display_name: "Super Game (USA)".into(),
+        normalized_name: "super game".into(),
+        size_bytes: Some(1),
+        modified_time_unix_seconds: Some(1),
+        platform: Some("SNES".into()),
+        platform_source: Some("fixture".into()),
+        last_known_health: "pending".into(),
+        last_seen_at: "fixture".into(),
+        last_verified_missing_at: None,
+        identity_report: None,
+    });
+    let guess = likely_match(&game, None);
+    assert_eq!(guess.basis, GuessBasis::FileName);
+    let alternatives = LikelyMatch {
+        basis: GuessBasis::FileName,
+        alternatives: vec!["Super Game (Europe)".into()],
+    };
+    let painted = crate::shared_apply_warnings::test_support::render(|ui| {
+        show_likely_match(ui, &game, &alternatives);
+    });
+    for wanted in [
+        "Does this look like your game? Super Game (USA)",
+        CHOOSE_ANOTHER_MATCH,
+        CHECK_THIS_GAME,
+        basis_text(GuessBasis::FileName),
+        "Or: Super Game (Europe)",
+    ] {
+        assert!(painted.contains(wanted), "{wanted}: {painted}");
+    }
+    assert!(!painted.contains("Verified"), "{painted}");
+    let _ = Route::GameCheck(9);
+}
