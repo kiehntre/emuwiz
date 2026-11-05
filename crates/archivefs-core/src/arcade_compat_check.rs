@@ -122,8 +122,12 @@ pub struct CheckProvenance {
     pub missing_archives: Vec<String>,
     pub mame_catalogue: Option<(FileStamp, String)>,
     pub fbneo_dat: Option<(FileStamp, String)>,
-    /// Files named as emulator provenance (stat only; may be absent).
-    pub emulator_files: Vec<FileStamp>,
+    /// Files named as emulator provenance (stat only). `None` records that the
+    /// file was absent, so creating it later also invalidates the result.
+    pub emulator_files: Vec<(PathBuf, Option<FileStamp>)>,
+    /// Closure archives that exist but could not be read (corrupt, encrypted,
+    /// over limits or changed mid-check). Their content is unobserved.
+    pub unreadable_archives: Vec<String>,
     pub mame_version_output: Option<String>,
     pub fbneo_version: Option<String>,
     pub checked_at_unix: u64,
@@ -138,7 +142,10 @@ impl CheckProvenance {
                 .iter()
                 .chain(self.fbneo_dat.iter())
                 .all(|(stamp, _)| stamp.still_matches())
-            && self.emulator_files.iter().all(FileStamp::still_matches)
+            && self
+                .emulator_files
+                .iter()
+                .all(|(path, stamp)| FileStamp::observe(path).ok() == *stamp)
     }
 }
 
@@ -237,7 +244,12 @@ fn installed_mame(
         .version
         .as_deref()
         .and_then(parse_version_evidence);
+    let executable_exists = input.executable_path.as_ref().is_some_and(|p| p.is_file());
     let version_text = match (&installed, &catalogue) {
+        _ if !executable_exists => {
+            notes.push("No existing MAME executable was named, so the typed version text is not evidence of an installed MAME; MAME evidence stays unknown.".into());
+            String::new()
+        }
         (Some(a), Some(b)) if a == b => text.to_string(),
         (Some(_), Some(_)) => {
             notes.push("The captured MAME version differs from the catalogue version, so the catalogue is not evidence for that MAME.".into());
@@ -316,7 +328,7 @@ pub fn run_arcade_compat_check(
             input
                 .executable_path
                 .iter()
-                .filter_map(|p| FileStamp::observe(p).ok()),
+                .map(|p| (p.clone(), FileStamp::observe(p).ok())),
         );
     }
     if let Some(input) = &request.fbneo {
@@ -329,7 +341,7 @@ pub fn run_arcade_compat_check(
             input
                 .core_path
                 .iter()
-                .filter_map(|p| FileStamp::observe(p).ok()),
+                .map(|p| (p.clone(), FileStamp::observe(p).ok())),
         );
     }
     check_cancel()?;
@@ -365,6 +377,7 @@ pub fn run_arcade_compat_check(
     // A dependency whose name is not a safe file name is never opened; it
     // counts as unobserved, so the evidence stays partial.
     let mut missing_archives = Vec::new();
+    let mut unreadable_archives = Vec::new();
     let mut all_complete = true;
     closure.retain(|name| {
         let safe = is_safe_set_name(name);
@@ -412,23 +425,49 @@ pub fn run_arcade_compat_check(
                 "Only ZIP arcade sets can be checked; this game's archive is not a ZIP.".into(),
             ));
         }
-        let stamp = FileStamp::observe(&path).map_err(|_| {
-            ArcadeCheckError::Archive(format!("{} could not be read.", path.display()))
-        })?;
-        let mut source = ZipArchiveSource::open(
+        let Ok(stamp) = FileStamp::observe(&path) else {
+            if *name == request.set_name {
+                return Err(ArcadeCheckError::Archive(
+                    "The selected game's file could not be read.".into(),
+                ));
+            }
+            unreadable_archives.push(name.clone());
+            all_complete = false;
+            continue;
+        };
+        let is_main = *name == request.set_name;
+        let mut source = match ZipArchiveSource::open(
             &path,
             &TrustedRoots::none(),
             ArchiveLimits::default(),
             cancel,
-        )
-        .map_err(|error| ArcadeCheckError::Archive(format!("{}: {error:?}", path.display())))?;
+        ) {
+            Ok(source) => source,
+            Err(_) if is_main => {
+                return Err(ArcadeCheckError::Archive(
+                    "The selected game's ZIP could not be opened (corrupt, encrypted or over the safety limits).".into(),
+                ));
+            }
+            Err(_) => {
+                // A bad support archive leaves its content unobserved; it
+                // must not hide what the rest of the check can say.
+                unreadable_archives.push(name.clone());
+                stamps.push(stamp);
+                all_complete = false;
+                continue;
+            }
+        };
         let outcome = source.verify_all(cancel, &mut budget);
         check_cancel()?;
         if !stamp.still_matches() {
-            return Err(ArcadeCheckError::Archive(format!(
-                "{} changed while it was being checked.",
-                path.display()
-            )));
+            if is_main {
+                return Err(ArcadeCheckError::Archive(
+                    "The selected game's ZIP changed while it was being checked.".into(),
+                ));
+            }
+            unreadable_archives.push(name.clone());
+            all_complete = false;
+            continue;
         }
         let pass = ObservedArcadeSetEvidence::from_archive_pass(
             name.clone(),
@@ -455,6 +494,12 @@ pub fn run_arcade_compat_check(
             missing_archives.join(", ")
         ));
     }
+    if !unreadable_archives.is_empty() {
+        limits.push(format!(
+            "Could not be read (corrupt, encrypted, over limits or changed): {}. Their content is unobserved, not a failure.",
+            unreadable_archives.join(", ")
+        ));
+    }
     if has_disks {
         all_complete = false;
         limits.push("This machine uses CHD disk images, which this check does not read. Compatibility cannot be proven.".into());
@@ -479,6 +524,18 @@ pub fn run_arcade_compat_check(
     // Emulator evidence. An emulator the caller did not describe is Unknown
     // (not "not installed"): the evaluators receive unusable evidence.
     let mut notes = Vec::new();
+    if request.mame.is_some() && mame_expectation.is_none() {
+        notes.push(format!(
+            "The MAME catalogue does not list a machine named \"{}\".",
+            request.set_name
+        ));
+    }
+    if request.fbneo.is_some() && fbneo_expectation.is_none() {
+        notes.push(format!(
+            "The FBNeo DAT does not list a set named \"{}\".",
+            request.set_name
+        ));
+    }
     let (mame_evidence, mame_exp) = match (&request.mame, &mame_loaded) {
         (Some(input), Some((dat, digest, _))) => {
             let (evidence, mut n) = installed_mame(input, dat, digest);
@@ -564,6 +621,7 @@ pub fn run_arcade_compat_check(
         provenance: CheckProvenance {
             archives: stamps,
             missing_archives,
+            unreadable_archives,
             mame_catalogue: mame_loaded.map(|(_, d, s)| (s, d)),
             fbneo_dat: fbneo_loaded.map(|(_, d, s)| (s, d)),
             emulator_files,

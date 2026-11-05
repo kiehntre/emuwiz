@@ -16,13 +16,14 @@ fn fixture() -> (tempfile::TempDir, Inputs) {
     )
     .unwrap();
     write_zip(&dir.path().join("game.zip"), b"abcd");
+    std::fs::write(dir.path().join("mame"), b"never executed").unwrap();
     let inputs = Inputs {
         game_id: 7,
         machine: "game".into(),
         archive: dir.path().join("game.zip"),
         mame_catalogue: Some(dir.path().join("listxml.xml")),
         mame_version: VERSION.into(),
-        mame_exe: String::new(),
+        mame_exe: dir.path().join("mame").to_string_lossy().into_owned(),
         fbneo_dat: None,
         fbneo_core: String::new(),
         fbneo_version: String::new(),
@@ -136,4 +137,29 @@ fn dropping_a_running_check_cancels_it() {
     let cancel = Arc::clone(&state.running.as_ref().unwrap().cancel);
     state.running = None;
     assert!(cancel.load(Ordering::Relaxed));
+}
+
+#[test]
+fn an_old_error_is_cleared_when_the_inputs_change() {
+    let (dir, inputs) = fixture();
+    std::fs::remove_file(dir.path().join("listxml.xml")).unwrap();
+    let mut state = State::default();
+    state.start(inputs.clone());
+    finish(&mut state);
+    state.check_freshness(Some(&inputs));
+    assert!(matches!(state.view(), View::Failed(_)));
+    let mut changed = inputs;
+    changed.mame_version.clear();
+    state.check_freshness(Some(&changed));
+    assert_eq!(state.view(), View::NoEvidenceYet);
+}
+
+#[test]
+fn version_text_with_a_missing_executable_is_never_a_recommendation() {
+    let (_dir, mut inputs) = fixture();
+    inputs.mame_exe = "/nonexistent/mame".into();
+    let mut state = State::default();
+    state.start(inputs);
+    finish(&mut state);
+    assert_eq!(state.view(), View::Insufficient);
 }

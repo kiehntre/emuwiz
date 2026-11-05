@@ -54,13 +54,17 @@ fn family() -> String {
 }
 
 fn request(dir: &Path, version: &str) -> ArcadeCheckRequest {
+    let exe = dir.join("mame");
+    if !exe.exists() {
+        std::fs::write(&exe, b"never executed").unwrap();
+    }
     ArcadeCheckRequest {
         set_name: "child".into(),
         archive_path: dir.join("child.zip"),
         mame: Some(MameCheckInput {
             catalogue_path: dir.join("listxml.xml"),
             version_output: version.into(),
-            executable_path: None,
+            executable_path: Some(exe),
         }),
         fbneo: None,
         user_preference: None,
@@ -252,5 +256,77 @@ fn fbneo_with_a_named_core_and_dat_can_be_the_only_proven_emulator() {
     assert_eq!(
         run(&req).unwrap().recommendation.preferred,
         ArcadeRecommendationChoice::Unknown
+    );
+}
+
+#[test]
+fn version_text_without_an_existing_executable_never_recommends_mame() {
+    let dir = setup(&family());
+    let mut req = request(dir.path(), VERSION);
+    req.mame.as_mut().unwrap().executable_path = Some(dir.path().join("no-such-mame"));
+    let report = run(&req).unwrap();
+    assert_eq!(
+        report.recommendation.preferred,
+        ArcadeRecommendationChoice::Unknown
+    );
+    assert!(
+        report
+            .details
+            .iter()
+            .any(|d| d.contains("No existing MAME executable"))
+    );
+    req.mame.as_mut().unwrap().executable_path = None;
+    assert_eq!(
+        run(&req).unwrap().recommendation.preferred,
+        ArcadeRecommendationChoice::Unknown
+    );
+}
+
+#[test]
+fn creating_a_named_but_absent_executable_invalidates_the_report() {
+    let dir = setup(&family());
+    let mut req = request(dir.path(), VERSION);
+    let exe = dir.path().join("later-mame");
+    req.mame.as_mut().unwrap().executable_path = Some(exe.clone());
+    let report = run(&req).unwrap();
+    assert!(report.provenance.is_current());
+    std::fs::write(&exe, b"x").unwrap();
+    assert!(!report.provenance.is_current());
+}
+
+#[test]
+fn a_corrupt_support_archive_is_unobserved_not_a_failed_check() {
+    let dir = setup(&family());
+    std::fs::write(dir.path().join("parent.zip"), b"this is not a zip").unwrap();
+    let report = run(&request(dir.path(), VERSION)).unwrap();
+    assert_eq!(
+        report.provenance.unreadable_archives,
+        vec!["parent".to_string()]
+    );
+    assert!(!matches!(
+        mame_state(&report),
+        Some(
+            MameSetCompatibilityState::Compatible
+                | MameSetCompatibilityState::CompatibleWithWarnings
+        )
+    ));
+    assert!(report.limits.iter().any(|l| l.contains("unobserved")));
+    // The selected game's own corrupt ZIP is still a refusal, without paths.
+    std::fs::write(dir.path().join("child.zip"), b"nope").unwrap();
+    match run(&request(dir.path(), VERSION)) {
+        Err(ArcadeCheckError::Archive(message)) => assert!(!message.contains('/')),
+        other => panic!("{other:?}"),
+    }
+}
+
+#[test]
+fn a_machine_absent_from_the_catalogue_is_explained() {
+    let dir = setup(r#"<machine name="other"><rom name="o" size="4" crc="00000000"/></machine>"#);
+    let report = run(&request(dir.path(), VERSION)).unwrap();
+    assert!(
+        report
+            .details
+            .iter()
+            .any(|d| d.contains("does not list a machine"))
     );
 }

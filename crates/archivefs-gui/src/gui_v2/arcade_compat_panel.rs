@@ -25,6 +25,7 @@ use archivefs_core::dat::model::DatEcosystem;
 use eframe::egui;
 
 use super::mame_collection_health::HealthPage;
+use crate::dat_catalogue_picker::DatCatalogueWorkflow as PickerWorkflow;
 
 const FRESHNESS_INTERVAL: Duration = Duration::from_secs(2);
 
@@ -95,6 +96,8 @@ pub(super) struct State {
     stored: Option<Stored>,
     running: Option<Running>,
     error: Option<String>,
+    /// The inputs the error belongs to; a different set of inputs clears it.
+    error_inputs: Option<Inputs>,
     stale_reason: Option<&'static str>,
     next_freshness: Option<Instant>,
     fbneo_core: String,
@@ -167,14 +170,32 @@ impl State {
             self.stale_reason = None;
         }
         self.poll();
-        let mame_catalogue = health.selected.as_ref().and_then(|reference| {
-            health
-                .picker
-                .summaries()
-                .iter()
-                .find(|s| &s.reference == reference)
-                .and_then(|s| s.technical_path.clone())
-        });
+        // Gated like the controls panel: a catalogue the picker no longer
+        // considers usable for MAME health, or that is not a MAME arcade
+        // catalogue, is not offered as evidence.
+        let mame_catalogue = health
+            .selected
+            .as_ref()
+            .filter(|reference| {
+                health
+                    .picker
+                    .is_usable(PickerWorkflow::MameHealth, reference)
+            })
+            .and_then(|reference| {
+                health
+                    .picker
+                    .summaries()
+                    .iter()
+                    .find(|s| &s.reference == reference)
+                    .filter(|s| {
+                        matches!(
+                            &s.ecosystem,
+                            EvidenceValue::Assigned(DatEcosystem::MAMEArcade)
+                                | EvidenceValue::Confirmed(DatEcosystem::MAMEArcade)
+                        )
+                    })
+                    .and_then(|s| s.technical_path.clone())
+            });
         let fbneo_dats: Vec<(String, PathBuf)> = health
             .picker
             .summaries()
@@ -254,7 +275,7 @@ impl State {
                 "MAME version output: as captured in MAME Collection Health (not authenticated)."
             });
             ui.horizontal(|ui| {
-                ui.label("MAME executable (provenance only, never run):");
+                ui.label("MAME executable (must exist; never run):");
                 ui.text_edit_singleline(&mut self.mame_exe);
             });
             egui::ComboBox::from_label("FBNeo DAT")
@@ -412,7 +433,10 @@ impl State {
                 });
             }
             Err(ArcadeCheckError::Cancelled) => {}
-            Err(error) => self.error = Some(error.to_string()),
+            Err(error) => {
+                self.error = Some(error.to_string());
+                self.error_inputs = Some(running.inputs.clone());
+            }
         }
         self.next_freshness = None;
     }
@@ -421,6 +445,10 @@ impl State {
     fn check_freshness(&mut self, current: Option<&Inputs>) {
         if current.is_none() {
             self.running = None;
+        }
+        if self.error.is_some() && current != self.error_inputs.as_ref() {
+            self.error = None;
+            self.error_inputs = None;
         }
         let Some(stored) = &self.stored else { return };
         let reason = match current {
