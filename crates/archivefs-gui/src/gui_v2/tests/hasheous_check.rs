@@ -83,7 +83,7 @@ fn blue_game_details_check_hasheous_runs_only_when_clicked() {
     let mut strings = Vec::new();
     while !strings
         .iter()
-        .any(|s: &String| s == "Hasheous has no entry for this SHA-1")
+        .any(|s: &String| s == super::super::hasheous_check::NO_MATCH)
     {
         assert!(std::time::Instant::now() < deadline, "{strings:?}");
         std::thread::sleep(std::time::Duration::from_millis(5));
@@ -96,7 +96,11 @@ fn blue_game_details_check_hasheous_runs_only_when_clicked() {
     // offers to work one out, and nothing is read until that click.
     app.router.current = Route::Game(8);
     let other = text(&settled(&context, &mut app));
-    assert!(!other.iter().any(|s| s.contains("no entry for this SHA-1")));
+    assert!(
+        !other
+            .iter()
+            .any(|s| s.contains("matched the submitted SHA-1"))
+    );
     assert!(
         other
             .iter()

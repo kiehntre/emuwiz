@@ -3293,16 +3293,6 @@ impl App {
                 self.detail_failed = None;
             }
         }
-        // Optional online lookup: only an explicit click contacts Hasheous.
-        ui.add_space(theme::SPACE_SM);
-        let view = self.hasheous_check.view(game);
-        match super::hasheous_check::show(ui, &view) {
-            Some(super::hasheous_check::Request::Check) => {
-                self.hasheous_check.start(game, Some(ui.ctx().clone()));
-            }
-            Some(super::hasheous_check::Request::Cancel) => self.hasheous_check.cancel(game),
-            None => {}
-        }
     }
 
     fn detail_pbp_export(&mut self, ui: &mut egui::Ui, game: &Game) {
@@ -3417,6 +3407,17 @@ impl App {
         self.detail_screenshots(ui, game);
         self.save_backups_panel(ui, game);
         self.documents_panel(ui, id, game);
+        // Optional online lookup: only an explicit click contacts Hasheous.
+        ui.add_space(theme::SPACE_MD);
+        ui.label(theme::section_title("Look up online"));
+        let view = self.hasheous_check.view(game);
+        match super::hasheous_check::show(ui, &view) {
+            Some(super::hasheous_check::Request::Check) => {
+                self.hasheous_check.start(game, Some(ui.ctx().clone()));
+            }
+            Some(super::hasheous_check::Request::Cancel) => self.hasheous_check.cancel(game),
+            None => {}
+        }
         // Everything below is reference material, closed by default and
         // always last so it never pushes the useful parts down.
         if super::dreamcast_ipbin::applies(game)

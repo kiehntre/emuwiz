@@ -38,12 +38,21 @@ use std::sync::mpsc::{self, Receiver, Sender, TryRecvError};
 
 #[cfg(test)]
 mod tests;
+mod zip_rom;
 
 pub(super) const CHECK_LABEL: &str = "Check Hasheous";
 pub(super) const CHECK_AGAIN_LABEL: &str = "Check Hasheous again";
 pub(super) const CANCEL_LABEL: &str = "Cancel";
 pub(super) const NOT_VERIFICATION: &str = "Hasheous is an online service. A match means it lists this hash in another project's catalogue; it is not checked against your catalogues and does not verify the game or change launch checks. Nothing is saved.";
 pub(super) const HASH_FIRST: &str = "EmuWiz will first read this file on this computer to work out its SHA-1, then send only the SHA-1 to hasheous.org.";
+/// What a ZIP result says about where its SHA-1 came from.
+pub(super) fn zip_worked_out(member: &str) -> String {
+    format!(
+        "SHA-1 of {} inside this ZIP, as stored (no header removed), worked out just now. It is not saved.",
+        clean(member)
+    )
+}
+
 /// The one short line under the idle button; the full wording is on hover.
 pub(super) const IDLE_HASH_FIRST: &str =
     "Optional: reads this file here, then sends only its SHA-1. Not verification.";
@@ -62,10 +71,17 @@ pub(super) const INCOMPLETE_SCAN: &str =
     "The last scan could not finish reading this file. Rescan it first.";
 pub(super) const NO_SCAN_SIZE: &str =
     "The Library has no recorded size for this file. Rescan it first.";
-pub(super) const ARCHIVE: &str = "This is an archive. Catalogues list the game inside it, and EmuWiz does not substitute that file's hash here.";
+pub(super) const ARCHIVE: &str = "This archive type is not read here. Only a ZIP holding one cartridge ROM can be checked, and no other file's hash is substituted.";
 pub(super) const COMPRESSED_DISC: &str =
     "This is a compressed disc image. Its own hash is not the disc's, so it is not sent.";
 pub(super) const DESCRIPTOR: &str = "This file lists a disc's track files. Catalogues list the tracks, so this file's own hash is not sent.";
+pub(super) const NOT_GAME_FILE: &str =
+    "This file is not a game file type EmuWiz recognises, so it is not read or sent.";
+pub(super) const NO_MATCH: &str =
+    "No Hasheous entry matched the submitted SHA-1. This does not mean the game is unknown.";
+/// Shown with a no-match: Hasheous's header convention is not established, so
+/// a headered ROM may be listed only under its headerless hash.
+pub(super) const WHOLE_FILE_NOTE: &str = "The SHA-1 covers the whole file as stored, including any ROM header (such as an NES header). A catalogue that lists the game without its header has a different SHA-1.";
 pub(super) const CANCELLED: &str = "Cancelled. Nothing was sent.";
 
 /// Whose SHA-1 a lookup uses, and the file it is bound to.
@@ -86,6 +102,8 @@ pub(super) struct ScannedFile {
     pub path: PathBuf,
     pub size_bytes: u64,
     pub modified_unix_seconds: Option<i64>,
+    /// Set for a ZIP: the system whose single ROM inside it is hashed.
+    pub zip_platform: Option<String>,
 }
 
 impl ScannedFile {
@@ -121,6 +139,9 @@ pub(super) fn availability(game: &Game) -> Availability {
     if let Some(reason) = unsupported_format(&game.archive.absolute_path) {
         return Availability::Unavailable(reason);
     }
+    if !is_game_file(&game.archive.absolute_path) {
+        return Availability::Unavailable(NOT_GAME_FILE);
+    }
     let Some(size_bytes) = game.archive.size_bytes else {
         return Availability::Unavailable(NO_SCAN_SIZE);
     };
@@ -128,6 +149,7 @@ pub(super) fn availability(game: &Game) -> Availability {
         path: game.archive.absolute_path.clone(),
         size_bytes,
         modified_unix_seconds: game.archive.modified_time_unix_seconds,
+        zip_platform: is_zip(&game.archive.absolute_path).then(|| game.platform.clone()),
     })
 }
 
@@ -135,13 +157,28 @@ pub(super) fn availability(game: &Game) -> Availability {
 pub(super) fn unsupported_format(path: &Path) -> Option<&'static str> {
     let extension = path.extension()?.to_str()?.to_ascii_lowercase();
     match extension.as_str() {
-        "zip" | "7z" | "rar" | "gz" | "tgz" | "xz" | "bz2" | "zst" | "lha" | "lzh" | "tar" => {
-            Some(ARCHIVE)
-        }
+        "7z" | "rar" | "gz" | "tgz" | "xz" | "bz2" | "zst" | "lha" | "lzh" | "tar" => Some(ARCHIVE),
         "chd" | "rvz" | "wia" | "cso" | "zso" | "pbp" | "gcz" | "wbfs" => Some(COMPRESSED_DISC),
         "cue" | "gdi" | "m3u" | "ccd" | "mds" | "toc" => Some(DESCRIPTOR),
         _ => None,
     }
+}
+
+/// Only file types the Library scanner itself treats as game media are read,
+/// so a stale or wrong Library row can never send an unrelated file's hash.
+fn is_game_file(path: &Path) -> bool {
+    path.extension()
+        .and_then(|extension| extension.to_str())
+        .map(str::to_ascii_lowercase)
+        .is_some_and(|extension| {
+            archivefs_core::media_registry::is_watch_relevant_extension(&extension)
+        })
+}
+
+fn is_zip(path: &Path) -> bool {
+    path.extension()
+        .and_then(|extension| extension.to_str())
+        .is_some_and(|extension| extension.eq_ignore_ascii_case("zip"))
 }
 
 fn is_sha1(value: &str) -> bool {
@@ -180,7 +217,8 @@ fn configured_roots() -> Roots {
 
 enum Message {
     Progress(f32),
-    Hashed,
+    /// The SHA-1 is known; for a ZIP, the member it came from.
+    Hashed(Option<String>),
     Refused(String),
     Cancelled,
     Answer(HasheousCheckOutcome),
@@ -201,6 +239,8 @@ struct Entry {
     phase: Phase,
     receiver: Option<Receiver<Message>>,
     cancel: Arc<AtomicBool>,
+    /// The ZIP member the SHA-1 was worked out from.
+    member: Option<String>,
 }
 
 /// Per-game results for this session, keyed by library row and bound to the
@@ -230,6 +270,8 @@ pub(super) enum View<'a> {
     Done {
         outcome: &'a HasheousCheckOutcome,
         worked_out_here: bool,
+        /// The ZIP member whose SHA-1 was sent.
+        member: Option<&'a str>,
     },
     Refused(&'a str),
     Cancelled,
@@ -288,6 +330,7 @@ impl State {
                 phase,
                 receiver: Some(receiver),
                 cancel,
+                member: None,
             },
         );
         true
@@ -314,7 +357,10 @@ impl State {
             loop {
                 match receiver.try_recv() {
                     Ok(Message::Progress(fraction)) => entry.phase = Phase::Hashing(Some(fraction)),
-                    Ok(Message::Hashed) => entry.phase = Phase::LookingUp,
+                    Ok(Message::Hashed(member)) => {
+                        entry.member = member;
+                        entry.phase = Phase::LookingUp;
+                    }
                     Ok(Message::Refused(reason)) => {
                         entry.phase = Phase::Refused(reason);
                         finished = true;
@@ -369,6 +415,7 @@ impl State {
             Phase::Done(outcome) => View::Done {
                 outcome,
                 worked_out_here: matches!(basis, Availability::HashOnClick(_)),
+                member: entry.member.as_deref(),
             },
             Phase::Refused(reason) => View::Refused(reason),
             Phase::Cancelled => View::Cancelled,
@@ -411,12 +458,29 @@ impl Job {
             Availability::HashOnClick(file) => file,
             Availability::Unavailable(reason) => return Err(Message::Refused((*reason).into())),
         };
-        let roots = (self.roots)();
-        // The Library's change detection: only the file it scanned is read.
-        match FileFingerprint::observe(&file.path) {
-            Some(seen) if file.matches(&seen) => {}
+        // The Library's change detection: only the file it scanned is read,
+        // and it must be the very same file object (device, inode, change
+        // time) after reading as before, so a replacement is never hashed.
+        let before = match FileFingerprint::observe(&file.path) {
+            Some(seen) if file.matches(&seen) => seen,
             Some(_) => return Err(Message::Refused(CHANGED_SINCE_SCAN.into())),
             None => return Err(Message::Refused(UNAVAILABLE_FILE.into())),
+        };
+        let unchanged = || FileFingerprint::observe(&file.path).as_ref() == Some(&before);
+        let roots = (self.roots)();
+        if let Some(platform) = &file.zip_platform {
+            let rom = zip_rom::sole_rom_sha1(&file.path, platform, &roots, &self.cancel);
+            return match rom {
+                Ok(rom) if unchanged() && is_sha1(&rom.sha1) => {
+                    self.send(Message::Hashed(Some(rom.member)));
+                    Ok(rom.sha1)
+                }
+                Ok(_) | Err(zip_rom::ZipRefusal::Changed) => {
+                    Err(Message::Refused(CHANGED_SINCE_SCAN.into()))
+                }
+                Err(zip_rom::ZipRefusal::Cancelled) => Err(Message::Cancelled),
+                Err(zip_rom::ZipRefusal::Refused(reason)) => Err(Message::Refused(reason)),
+            };
         }
         let last = std::sync::Mutex::new(-1_i32);
         let hashed = hash_file_reporting(&file.path, &roots, Some(&self.cancel), &|progress| {
@@ -430,8 +494,8 @@ impl Job {
             }
         });
         match hashed {
-            Ok(hashes) if file.matches(&hashes.fingerprint) && is_sha1(&hashes.sha1) => {
-                self.send(Message::Hashed);
+            Ok(hashes) if hashes.fingerprint == before && unchanged() && is_sha1(&hashes.sha1) => {
+                self.send(Message::Hashed(None));
                 Ok(hashes.sha1.to_ascii_lowercase())
             }
             Ok(_) => Err(Message::Refused(CHANGED_SINCE_SCAN.into())),
@@ -534,7 +598,7 @@ pub(super) fn status_line(outcome: &HasheousCheckOutcome) -> String {
                 format!("Hasheous lists this SHA-1 in {count} catalogue entries")
             }
         }
-        HasheousCheckOutcome::NoMatch => "Hasheous has no entry for this SHA-1".to_string(),
+        HasheousCheckOutcome::NoMatch => NO_MATCH.to_string(),
         HasheousCheckOutcome::Disabled => "Hasheous lookups are turned off".to_string(),
         HasheousCheckOutcome::Timeout => {
             "Hasheous did not answer in time. Try again later.".to_string()
@@ -607,8 +671,12 @@ pub(super) fn show(ui: &mut egui::Ui, view: &View<'_>) -> Option<Request> {
         View::Done {
             outcome,
             worked_out_here,
+            member,
         } => {
             ui.label(status_line(outcome));
+            if matches!(outcome, HasheousCheckOutcome::NoMatch) {
+                ui.small(WHOLE_FILE_NOTE);
+            }
             if let HasheousCheckOutcome::Found(observations) = outcome {
                 let summary = summarise(observations);
                 for found in &summary.matches {
@@ -625,8 +693,14 @@ pub(super) fn show(ui: &mut egui::Ui, view: &View<'_>) -> Option<Request> {
                     ui.small(format!("Hasheous publisher: {publisher}"));
                 }
             }
-            if *worked_out_here {
-                ui.small(WORKED_OUT_HERE);
+            match member {
+                Some(member) => {
+                    ui.small(zip_worked_out(member));
+                }
+                None if *worked_out_here => {
+                    ui.small(WORKED_OUT_HERE);
+                }
+                None => {}
             }
             ui.small(NOT_VERIFICATION);
         }
