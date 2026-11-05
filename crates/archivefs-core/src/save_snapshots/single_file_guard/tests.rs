@@ -548,3 +548,81 @@ fn a_reader_appearing_before_publication_blocks_and_one_after_is_reported() {
     .unwrap();
     assert!(done.opened_during_restore);
 }
+
+/// Live end-to-end cycle (run by hand with `--ignored --nocapture`): the
+/// production observer on the real /proc, as the current user, over a
+/// disposable synthetic SRAM and its snapshot, on the filesystem named by
+/// `PROBE_DIR` (default: a temp dir). Restore -> verify -> Undo -> verify.
+#[test]
+#[ignore = "uses the live /proc; run manually"]
+fn live_restore_undo_cycle() {
+    let base = std::env::var_os("PROBE_DIR").map(PathBuf::from);
+    let dir = match &base {
+        Some(base) => tempfile::tempdir_in(base).unwrap(),
+        None => tempdir().unwrap(),
+    };
+    let save = dir.path().join("saves/Synthetic.srm");
+    fs::create_dir_all(save.parent().unwrap()).unwrap();
+    fs::write(&save, b"ORIGINAL-CHECKPOINT").unwrap();
+    let snapshot = create_snapshot(&SaveSnapshotRequest {
+        location: SaveLocation {
+            path: save.clone(),
+            emulator: Some("RetroArch".into()),
+            profile: Some("live".into()),
+            artifact_type: SaveArtifactType::Sram,
+            provenance: SaveProvenance::EmulatorProfile,
+        },
+        game_identity: Some("LooseRomSha256:live".into()),
+        platform: Some("Game Boy".into()),
+        storage_root: dir.path().join("snapshots"),
+        available_space_bytes: Some(1 << 20),
+        snapshot_id: Some("live".into()),
+        now_unix_seconds: Some(100),
+        emulator_use: EmulatorUseStatus::NotDetected,
+    })
+    .unwrap();
+    fs::write(&save, b"PLAYED-ON-LATER-CHECKPOINT").unwrap();
+    let observer = ProcScanQuiescence::new();
+    let quiescence = restore_quiescence(StateEmulator::RetroArch, &save, &observer);
+    println!("closure before restore: {quiescence:?}");
+    let confirmed = build_single_file_restore_preflight(
+        &snapshot,
+        &SaveTargetBinding::from_snapshot(&snapshot),
+        quiescence,
+    );
+    let options = SaveRestoreApplyOptions {
+        backup_root: dir.path().join("backups"),
+        receipt_root: dir.path().join("receipts"),
+        now_unix_seconds: 200,
+    };
+    let done = restore_single_file_guarded(
+        &snapshot,
+        &confirmed,
+        StateEmulator::RetroArch,
+        &observer,
+        &options,
+    );
+    match done {
+        Ok(done) => {
+            println!("RESTORE ok, opened_during={}", done.opened_during_restore);
+            println!(
+                "contents after restore: {:?}",
+                String::from_utf8_lossy(&fs::read(&save).unwrap())
+            );
+            assert_eq!(fs::read(&save).unwrap(), b"ORIGINAL-CHECKPOINT");
+            let undo =
+                undo_single_file_guarded(&done.result.receipt, StateEmulator::RetroArch, &observer)
+                    .unwrap();
+            println!("UNDO ok, opened_during={}", undo.opened_during_undo);
+            println!(
+                "contents after undo: {:?}",
+                String::from_utf8_lossy(&fs::read(&save).unwrap())
+            );
+            assert_eq!(fs::read(&save).unwrap(), b"PLAYED-ON-LATER-CHECKPOINT");
+        }
+        Err(error) => {
+            println!("RESTORE refused: {error}");
+            assert_eq!(fs::read(&save).unwrap(), b"PLAYED-ON-LATER-CHECKPOINT");
+        }
+    }
+}

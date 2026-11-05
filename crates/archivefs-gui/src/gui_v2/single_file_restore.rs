@@ -85,6 +85,12 @@ pub(super) struct State {
 }
 
 impl State {
+    #[cfg(test)]
+    pub(super) fn dirs_for_tests(&mut self, dirs: Option<Dirs>) {
+        self.dirs = dirs;
+        self.dirs_resolved = true;
+    }
+
     pub(super) fn dirs(&mut self) -> Option<Dirs> {
         if !self.dirs_resolved {
             self.dirs_resolved = true;

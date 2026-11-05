@@ -171,7 +171,11 @@ pub fn restore_single_file_guarded(
     // Re-proved after the journal is durable, immediately before publication.
     let result =
         apply_single_file_restore_gated(snapshot, &fresh, options, &|| window.still_closed())?;
-    let opened_during_restore = !window.closed_after_write();
+    // A write that landed after publication shows as different bytes: report
+    // it too, whatever the scan says.
+    let bytes_intact = super::hash_and_metadata(target)
+        .is_ok_and(|(_, hash, _)| hash == result.receipt.snapshot_sha256);
+    let opened_during_restore = !window.closed_after_write() || !bytes_intact;
     Ok(GuardedRestore {
         result,
         opened_during_restore,

@@ -178,14 +178,10 @@ fn sram_target(
         ));
     }
     let sha = &origin.context.cartridge.sha256;
-    let own = !game.inspection_incomplete
-        && game.archive.identity_report.as_ref().is_some_and(|report| {
-            report.evidence.iter().any(|evidence| {
-                evidence.kind == IdentityKind::LooseRomSha256
-                    && evidence.status == IdentityStatus::Verified
-                    && evidence.value.as_ref() == Some(sha)
-            })
-        });
+    // The same join that puts this record on the game's page: sealed capture
+    // evidence bound to this game's exact file, refusing any disagreeing
+    // cached digest or incomplete inspection. No filename or title joins.
+    let own = super::saves_states::record_belongs_to_game(record, game);
     if !own {
         return Some(Err(
             "This save was made with a cartridge that is not this game's verified file, so EmuWiz will not snapshot or restore it here.",
