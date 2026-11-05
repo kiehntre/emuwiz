@@ -18,6 +18,7 @@ use super::{
     media_sources::Kind,
     routes::{Route, Section},
 };
+use crate::gamer_view::alpha_jump::{ALPHA_BUCKETS, bucket_for_title, bucket_label};
 use crate::ui::theme;
 use eframe::egui::{self, Color32, RichText};
 
@@ -73,9 +74,19 @@ type FilterKey = (String, String, (ReadinessFilter, bool), bool, usize);
 /// Base list address, cache version, view, and the narrowed list.
 type ReadinessView = (usize, u64, ReadinessFilter, Arc<Vec<usize>>);
 
+/// Fewest games for which the A-Z strip is worth its row.
+const ALPHA_STRIP_MIN: usize = 30;
+
 /// Cached filter result so typing or scrolling never rescans the catalogue.
 #[derive(Default)]
 pub(super) struct BrowsePlayState {
+    /// The A-Z strip: where each letter first appears in the list shown, for
+    /// the list it was made from (address and length of the shown indices).
+    alpha: Option<(usize, usize, [Option<usize>; ALPHA_BUCKETS])>,
+    /// A jump asked for by the strip, applied by the shelf in the same pass.
+    alpha_jump: Option<usize>,
+    /// The game to focus once the shelf has drawn it (after a jump).
+    focus_game: Option<i64>,
     key: Option<FilterKey>,
     indices: Arc<Vec<usize>>,
     applied_generation: Option<u64>,
@@ -998,6 +1009,7 @@ impl App {
             return;
         }
 
+        self.browse_play_alpha_strip(ui, library, indices);
         let reset = std::mem::take(&mut self.browse_play.reset_scroll);
         let list = self.filter.list;
         let scroll_height = ui.available_height().max(160.0);
@@ -1028,6 +1040,16 @@ impl App {
         if reset {
             area = area.vertical_scroll_offset(0.0);
         }
+        if let Some(position) = self.browse_play.alpha_jump.take() {
+            // Land on the letter's first game: scroll its row to the top and
+            // hand it keyboard/controller focus when it is drawn.
+            let row = (position / columns) as f32;
+            area = area.vertical_scroll_offset(row * (row_height + spacing.y));
+            self.browse_play.focus_game = indices
+                .get(position)
+                .and_then(|i| library.games.get(*i))
+                .map(|game| game.archive.id);
+        }
         area.show_rows(ui, row_height, rows, |ui, range| {
             for row in range {
                 let start = row * columns;
@@ -1048,6 +1070,56 @@ impl App {
             }
         });
         self.browse_play.cover_note = cover_note;
+    }
+
+    /// `#` and A-Z over the list shown: each letter jumps to its first game,
+    /// and a letter with no game is disabled (so the controller skips it). It
+    /// follows the current sort, filter and search because it is made from
+    /// the list the shelf is showing; it is rebuilt only when that list changes.
+    fn browse_play_alpha_strip(
+        &mut self,
+        ui: &mut egui::Ui,
+        library: &super::library::Library,
+        indices: &Arc<Vec<usize>>,
+    ) {
+        if indices.len() < ALPHA_STRIP_MIN {
+            return;
+        }
+        let key = (Arc::as_ptr(indices) as usize, indices.len());
+        if self.browse_play.alpha.as_ref().map(|a| (a.0, a.1)) != Some(key) {
+            let mut first = [None; ALPHA_BUCKETS];
+            for (position, index) in indices.iter().enumerate() {
+                if let Some(game) = library.games.get(*index) {
+                    let slot = &mut first[bucket_for_title(&game.title)];
+                    if slot.is_none() {
+                        *slot = Some(position);
+                    }
+                }
+            }
+            self.browse_play.alpha = Some((key.0, key.1, first));
+        }
+        let first = self
+            .browse_play
+            .alpha
+            .as_ref()
+            .map(|a| a.2)
+            .unwrap_or_default();
+        ui.horizontal_wrapped(|ui| {
+            ui.spacing_mut().item_spacing.x = 4.0;
+            for (bucket, position) in first.iter().enumerate() {
+                let button = egui::Button::new(RichText::new(bucket_label(bucket)).strong())
+                    .min_size(egui::vec2(28.0, 28.0));
+                let response = ui
+                    .add_enabled(position.is_some(), button)
+                    .on_hover_text(format!("Jump to {}", bucket_label(bucket)));
+                if response.clicked()
+                    && let Some(position) = position
+                {
+                    self.browse_play.alpha_jump = Some(*position);
+                }
+            }
+        });
+        ui.add_space(theme::SPACE_XS);
     }
 
     /// "392 games matching "005" in Arcade" with one-click removal of each part.
@@ -1158,6 +1230,10 @@ impl App {
         ui.push_id(("v2_browse_play_game", id), |ui| {
             let (rect, response) =
                 ui.allocate_exact_size(egui::vec2(card_width, CARD_HEIGHT), egui::Sense::click());
+            if self.browse_play.focus_game == Some(id) {
+                self.browse_play.focus_game = None;
+                response.request_focus();
+            }
             Self::reveal_keyboard_focus(ui, &response);
             // Name the card for assistive tech and the controller layer.
             response.widget_info(|| {
@@ -1245,6 +1321,10 @@ impl App {
                 egui::vec2(ui.available_width(), LIST_ROW_HEIGHT - 8.0),
                 egui::Sense::click(),
             );
+            if self.browse_play.focus_game == Some(id) {
+                self.browse_play.focus_game = None;
+                response.request_focus();
+            }
             Self::reveal_keyboard_focus(ui, &response);
             // Name the card for assistive tech and the controller layer.
             response.widget_info(|| {

@@ -1101,12 +1101,18 @@ mod spatial {
 
     impl Lib {
         fn new(games: i64) -> Self {
+            Self::with_titles((1..=games).map(|id| format!("Game {id:03}")).collect())
+        }
+
+        fn with_titles(titles: Vec<String>) -> Self {
             let context = egui::Context::default();
             let mut app = fixture(&context);
             app.simple.enabled = true;
             app.library = Arc::new(Library::new(
-                (1..=games)
-                    .map(|id| archive(id, &format!("Game {id:03}"), Some("SNES")))
+                titles
+                    .iter()
+                    .enumerate()
+                    .map(|(i, t)| archive(i as i64 + 1, t, Some("SNES")))
                     .collect(),
             ));
             app.artwork.index = Some(Arc::new(MediaIndex::default()));
@@ -1298,6 +1304,160 @@ mod spatial {
         lib.tap(RIGHT);
         assert!(lib.focused().is_some(), "focus is not lost");
         assert!(!lib.on_sidebar(), "and it moved into the content");
+    }
+
+    fn lettered() -> Vec<String> {
+        let mut titles = Vec::new();
+        for letter in ["A", "B", "C", "D", "M", "N", "Z"] {
+            for n in 1..=9 {
+                titles.push(format!("{letter}rcade Title {n:02}"));
+            }
+        }
+        for n in 0..4 {
+            titles.push(format!("19{n}3 Classic"));
+        }
+        titles
+    }
+
+    impl Lib {
+        /// Move focus (reading order, whose controls egui names) to the A-Z
+        /// button with this label.
+        fn focus_letter(&mut self, letter: &str) {
+            self.app.pad_shell.as_mut().unwrap().reading_order = true;
+            for _ in 0..400 {
+                self.tap(DOWN);
+                let label = self
+                    .context
+                    .data(|d| {
+                        d.get_temp::<(egui::Id, String, bool)>(egui::Id::new(
+                            "pad_shell_focus_label",
+                        ))
+                    })
+                    .map(|x| x.1);
+                if label.as_deref() == Some(letter) {
+                    self.app.pad_shell.as_mut().unwrap().reading_order = false;
+                    return;
+                }
+            }
+            panic!("the controller never reached the {letter} button");
+        }
+
+        fn focused_title(&self) -> Option<String> {
+            // A card's name is its game title.
+            self.context
+                .data(|d| {
+                    d.get_temp::<(egui::Id, String, bool)>(egui::Id::new("pad_shell_focus_label"))
+                })
+                .map(|x| x.1)
+        }
+    }
+
+    #[test]
+    fn a_to_z_jumps_to_the_first_game_of_a_letter_and_focuses_it() {
+        let mut lib = Lib::with_titles(lettered());
+        lib.focus_sidebar();
+        lib.focus_letter("N");
+        lib.tap(Control::Button(Button::South));
+        let id = lib.focused().expect("a game has focus after the jump");
+        assert!(lib.is_card(id), "focus moved onto a game card");
+        let rect = lib.rect(id);
+        assert!(
+            rect.top() >= 0.0 && rect.bottom() <= SIZE[1] + 1.0,
+            "the jumped-to row is on screen: {rect:?}"
+        );
+        // Reading order from here is the games from N onward: the card named
+        // for the first N title is the one focused.
+        lib.app.pad_shell.as_mut().unwrap().reading_order = true;
+        let title = lib.focused_title().unwrap_or_default();
+        assert_eq!(title, "Nrcade Title 01", "first N game, not a later one");
+    }
+
+    #[test]
+    fn letters_with_no_games_are_skipped_and_numbers_have_a_hash_button() {
+        let mut lib = Lib::with_titles(lettered());
+        lib.focus_sidebar();
+        lib.app.pad_shell.as_mut().unwrap().reading_order = true;
+        let mut seen = Vec::new();
+        for _ in 0..40 {
+            lib.tap(DOWN);
+            if let Some(l) = lib.focused_title() {
+                seen.push(l);
+            }
+        }
+        for present in ["#", "A", "B", "C", "D", "M", "N", "Z"] {
+            assert!(
+                seen.iter().any(|l| l == present),
+                "{present} missing from {seen:?}"
+            );
+        }
+        for absent in ["Q", "X", "K"] {
+            assert!(
+                !seen.iter().any(|l| l == absent),
+                "{absent} has no games, so it is not a stop"
+            );
+        }
+    }
+
+    #[test]
+    fn the_hash_button_reaches_titles_that_start_with_a_number() {
+        let mut lib = Lib::with_titles(lettered());
+        lib.focus_sidebar();
+        lib.focus_letter("#");
+        lib.tap(Control::Button(Button::South));
+        lib.app.pad_shell.as_mut().unwrap().reading_order = true;
+        assert!(lib.focused_title().unwrap_or_default().starts_with("19"));
+    }
+
+    #[test]
+    fn the_strip_follows_search_and_a_jump_can_be_left_and_returned_to() {
+        let mut lib = Lib::with_titles(lettered());
+        lib.app.filter.search = "rcade title 0".to_owned();
+        lib.frames();
+        lib.frames();
+        lib.focus_sidebar();
+        lib.app.pad_shell.as_mut().unwrap().reading_order = true;
+        let mut seen = Vec::new();
+        for _ in 0..40 {
+            lib.tap(DOWN);
+            if let Some(l) = lib.focused_title() {
+                seen.push(l);
+            }
+        }
+        assert!(
+            !seen.iter().any(|l| l == "#"),
+            "no numbered title matches: {seen:?}"
+        );
+        assert!(seen.iter().any(|l| l == "Z"));
+        lib.app.pad_shell.as_mut().unwrap().reading_order = false;
+        lib.focus_letter("Z");
+        lib.tap(Control::Button(Button::South));
+        let mut leaving = lib.focused().unwrap();
+        assert!(lib.is_card(leaving), "the jump landed on a game");
+        for _ in 0..8 {
+            lib.tap(LEFT);
+            if lib.on_sidebar() {
+                break;
+            }
+            leaving = lib.focused().unwrap();
+        }
+        assert!(lib.on_sidebar());
+        lib.tap(RIGHT);
+        assert_eq!(
+            lib.focused(),
+            Some(leaving),
+            "Right returns to where the jump left off"
+        );
+    }
+
+    #[test]
+    fn short_libraries_do_not_get_the_strip() {
+        let mut lib = Lib::with_titles((1..=10).map(|n| format!("Game {n:02}")).collect());
+        lib.focus_sidebar();
+        lib.app.pad_shell.as_mut().unwrap().reading_order = true;
+        for _ in 0..30 {
+            lib.tap(DOWN);
+            assert_ne!(lib.focused_title().as_deref(), Some("M"));
+        }
     }
 }
 
