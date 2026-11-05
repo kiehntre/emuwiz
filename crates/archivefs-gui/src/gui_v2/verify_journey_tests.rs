@@ -45,11 +45,11 @@ fn a_platform_with_games_not_yet_compared_says_ready_to_verify_not_can_be_matche
     let label = review.list_label();
     assert_ne!(label, "Can be matched");
     assert!(
-        ["Ready to verify", "Identification data missing"].contains(&label),
+        ["Not verified yet", "Identification data missing"].contains(&label),
         "unexpected label {label}"
     );
     if matches!(review.state, ReviewState::NotCompared) {
-        assert_eq!(label, "Ready to verify");
+        assert_eq!(label, "Not verified yet");
     }
 }
 

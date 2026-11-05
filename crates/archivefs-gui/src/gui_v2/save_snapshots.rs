@@ -138,28 +138,36 @@ pub(super) fn snapshot_target(
             "This save does not share a verified identity with this game, so EmuWiz will not snapshot it here.",
         )?;
     Ok(SnapshotTarget {
-        location: SaveLocation {
-            path: record.path.clone(),
-            emulator: Some(record.emulator.as_str().to_string()),
-            profile: record
-                .selected_installation
-                .as_ref()
-                .map(|installation| installation.installation_id.clone())
-                .or_else(|| record.slot_profile_account.clone()),
-            artifact_type,
-            provenance: match record.source_path_origin {
-                StatePathOrigin::Configured | StatePathOrigin::ExplicitCustom => {
-                    SaveProvenance::ConfiguredPath
-                }
-                StatePathOrigin::Native | StatePathOrigin::Flatpak | StatePathOrigin::Portable => {
-                    SaveProvenance::EmulatorProfile
-                }
-            },
-        },
+        location: save_location(record, artifact_type),
         emulator: record.emulator,
         game_identity: identity,
         platform: game.platform.clone(),
     })
+}
+
+/// The snapshot location for a live record, keyed by its emulator profile.
+pub(super) fn save_location(
+    record: &PersistentStateRecord,
+    artifact_type: SaveArtifactType,
+) -> SaveLocation {
+    SaveLocation {
+        path: record.path.clone(),
+        emulator: Some(record.emulator.as_str().to_string()),
+        profile: record
+            .selected_installation
+            .as_ref()
+            .map(|installation| installation.installation_id.clone())
+            .or_else(|| record.slot_profile_account.clone()),
+        artifact_type,
+        provenance: match record.source_path_origin {
+            StatePathOrigin::Configured | StatePathOrigin::ExplicitCustom => {
+                SaveProvenance::ConfiguredPath
+            }
+            StatePathOrigin::Native | StatePathOrigin::Flatpak | StatePathOrigin::Portable => {
+                SaveProvenance::EmulatorProfile
+            }
+        },
+    }
 }
 
 /// Worker: list, verify and compare snapshots and observe emulator closure.
@@ -320,7 +328,7 @@ pub(super) fn show(
             .on_disabled_hover_text(closure_message(target.emulator, emulator_use))
             .clicked();
         ui.add_enabled(false, egui::Button::new("Restore"))
-            .on_disabled_hover_text(RESTORE_UNAVAILABLE);
+            .on_disabled_hover_text(restore_unavailable(record.state_type));
     });
     if !create_allowed && !busy {
         tip(
@@ -332,6 +340,15 @@ pub(super) fn show(
     }
     if start && let Some(root) = app.saves_states.snapshots.root.clone() {
         app.start_snapshot_create(root, target.clone());
+    }
+}
+
+/// Why Restore is disabled on a game page, by save type.
+pub(super) fn restore_unavailable(state_type: PersistentStateType) -> &'static str {
+    match state_type {
+        PersistentStateType::SaveState => super::card_restore::SAVESTATE_RESTORE_UNSUPPORTED,
+        PersistentStateType::MemoryCard => super::card_restore::CARD_RESTORE_WHERE,
+        _ => RESTORE_UNAVAILABLE,
     }
 }
 
@@ -439,7 +456,7 @@ fn conflict_label(conflict: &SaveRestoreConflict) -> &'static str {
     }
 }
 
-fn tip(ui: &mut egui::Ui, key: &'static str, category: GuidanceCategory, message: &str) {
+pub(super) fn tip(ui: &mut egui::Ui, key: &'static str, category: GuidanceCategory, message: &str) {
     guidance::show_tip(
         ui,
         &GuidanceTip {
@@ -451,7 +468,7 @@ fn tip(ui: &mut egui::Ui, key: &'static str, category: GuidanceCategory, message
     );
 }
 
-fn format_unix_seconds(seconds: u64) -> String {
+pub(super) fn format_unix_seconds(seconds: u64) -> String {
     time::OffsetDateTime::from_unix_timestamp(seconds as i64)
         .map(|at| {
             format!(
