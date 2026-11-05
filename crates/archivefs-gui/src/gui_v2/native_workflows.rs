@@ -679,7 +679,14 @@ impl NativeWorkflows {
             .vita3k_library
             .context(Some(path))
         {
-            launch_readiness_summary::note_vita3k_package(&mut summary, &context);
+            if catalogue_identity_report.is_none_or(|r| {
+                matches!(
+                    r.platform,
+                    archivefs_core::game_identity::IdentityPlatform::Other
+                )
+            }) {
+                launch_readiness_summary::note_vita3k_package(&mut summary, &context);
+            }
         }
         if saved.file_missing {
             launch_readiness_summary::note_file_missing(&mut summary);
@@ -723,7 +730,14 @@ impl NativeWorkflows {
             .vita3k_library
             .context(Some(path))
         {
-            launch_readiness_summary::note_vita3k_package(&mut summary, &vita);
+            if catalogue_identity_report.is_none_or(|r| {
+                matches!(
+                    r.platform,
+                    archivefs_core::game_identity::IdentityPlatform::Other
+                )
+            }) {
+                launch_readiness_summary::note_vita3k_package(&mut summary, &vita);
+            }
         }
         launch_readiness_summary::compact(&summary, self.selected_checksum_pending())
     }
