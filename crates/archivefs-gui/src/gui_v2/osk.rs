@@ -91,6 +91,15 @@ pub(super) struct Osk {
     pub(super) buffer: String,
     pub(super) layer: Layer,
     pub(super) grid: Grid,
+    /// This field offers title suggestions (a Library search).
+    pub(super) suggest: bool,
+    /// Suggestions for the current text, and the one focused (None = keys).
+    pub(super) suggestions: Vec<String>,
+    pub(super) suggestion_focus: Option<usize>,
+    /// The suggestion list is still being prepared.
+    pub(super) loading: bool,
+    /// The text the suggestions were made for.
+    pub(super) suggested_for: Option<String>,
 }
 
 impl Osk {
@@ -105,6 +114,11 @@ impl Osk {
                 focus: COLUMNS,
                 top_row: 0,
             },
+            suggest: false,
+            suggestions: Vec::new(),
+            suggestion_focus: None,
+            loading: false,
+            suggested_for: None,
         }
     }
 
@@ -150,7 +164,38 @@ impl Osk {
     /// Controller commands. B cancels, X deletes, Y shifts, Start is Done.
     pub(super) fn command(&mut self, command: Command) -> Outcome {
         let all = keys(self.layer);
+        // On the suggestion row, left/right choose, down returns to the keys,
+        // A takes the suggestion; the other buttons keep their meaning.
+        if let Some(at) = self.suggestion_focus {
+            match command {
+                Command::Move(Direction::Left) => {
+                    self.suggestion_focus = Some(at.saturating_sub(1));
+                    return Outcome::Open;
+                }
+                Command::Move(Direction::Right) => {
+                    self.suggestion_focus =
+                        Some((at + 1).min(self.suggestions.len().saturating_sub(1)));
+                    return Outcome::Open;
+                }
+                Command::Move(Direction::Down) => {
+                    self.suggestion_focus = None;
+                    return Outcome::Open;
+                }
+                Command::Move(Direction::Up) => return Outcome::Open,
+                Command::Select => {
+                    self.take_suggestion(at);
+                    return Outcome::Open;
+                }
+                _ => {}
+            }
+        }
         match command {
+            Command::Move(Direction::Up)
+                if self.suggest && self.grid.focus < COLUMNS && !self.suggestions.is_empty() =>
+            {
+                self.suggestion_focus = Some(0);
+                Outcome::Open
+            }
             Command::Select => {
                 let key = all[self.grid.focus.min(all.len() - 1)];
                 self.press(key)
@@ -182,6 +227,19 @@ impl Osk {
             }
             _ => Outcome::Open,
         }
+    }
+
+    /// Replace the text with a suggested title; the keys take over again.
+    pub(super) fn take_suggestion(&mut self, at: usize) {
+        if let Some(title) = self.suggestions.get(at).cloned() {
+            self.buffer = title;
+        }
+        self.suggestion_focus = None;
+    }
+
+    /// A mouse click on a suggestion.
+    pub(super) fn click_suggestion(&mut self, at: usize) {
+        self.take_suggestion(at);
     }
 
     /// A mouse click on a key.
@@ -245,5 +303,53 @@ mod tests {
         o.grid.focus = 3 * COLUMNS - 1; // end of the third symbol row
         o.command(Command::Move(Direction::Down)); // onto the short row
         assert_ne!(keys(Layer::Symbols)[o.grid.focus], Key::Blank);
+    }
+
+    #[test]
+    fn up_from_the_top_row_reaches_suggestions_and_a_takes_one() {
+        let mut o = osk("al", false);
+        o.suggest = true;
+        o.suggestions = vec!["Alpha Quest".into(), "Alien Run".into()];
+        o.grid.focus = 3; // top row of keys
+        assert_eq!(o.command(Command::Move(Direction::Up)), Outcome::Open);
+        assert_eq!(o.suggestion_focus, Some(0));
+        o.command(Command::Move(Direction::Right));
+        o.command(Command::Move(Direction::Right)); // clamps at the last one
+        assert_eq!(o.suggestion_focus, Some(1));
+        assert_eq!(o.command(Command::Select), Outcome::Open);
+        assert_eq!(o.buffer, "Alien Run", "A replaced the text with the title");
+        assert_eq!(o.suggestion_focus, None, "keys take over again");
+        assert_eq!(
+            o.command(Command::Launch),
+            Outcome::Done("Alien Run".into())
+        );
+    }
+
+    #[test]
+    fn down_returns_to_the_keys_and_other_buttons_keep_their_meaning() {
+        let mut o = osk("ab", false);
+        o.suggest = true;
+        o.suggestions = vec!["Abc".into()];
+        o.grid.focus = 0;
+        o.command(Command::Move(Direction::Up));
+        o.command(Command::Search); // X still deletes while on suggestions
+        assert_eq!(o.buffer, "a");
+        assert_eq!(o.command(Command::Move(Direction::Down)), Outcome::Open);
+        assert_eq!(o.suggestion_focus, None);
+        o.suggestion_focus = Some(0);
+        assert_eq!(
+            o.command(Command::Back),
+            Outcome::Cancelled,
+            "B still cancels"
+        );
+    }
+
+    #[test]
+    fn fields_without_suggestions_never_enter_the_row() {
+        let mut o = osk("a", false);
+        o.suggestions = vec!["Abc".into()];
+        o.grid.focus = 0;
+        o.command(Command::Move(Direction::Up));
+        assert_eq!(o.suggestion_focus, None);
     }
 }

@@ -17,7 +17,9 @@ use super::big_picture::{
 use super::osk::{self, Key as OskKey, Osk, Outcome};
 use super::pad_mouse;
 use super::simple_shell::{DESTINATIONS, destination_for};
+use super::suggest;
 use super::*;
+use std::sync::{Arc, Mutex};
 
 #[derive(Default)]
 pub(super) struct PadShell {
@@ -355,7 +357,9 @@ impl App {
                 .set_char_range(Some(egui::text::CCursorRange::one(end)));
             state.store(context, target);
         }
-        shell.osk = Some(Osk::new(target, text, false));
+        let mut osk = Osk::new(target, text, false);
+        osk.suggest = wants_suggestions(context, target);
+        shell.osk = Some(osk);
     }
 
     /// While the keyboard is open the page behind gets none of the keyboard's
@@ -416,12 +420,82 @@ impl App {
         }
     }
 
+    /// Keep the keyboard's suggestions in step with its text. The title index
+    /// is built once per library on a worker thread; a keystroke only queries it.
+    fn pad_shell_refresh_suggestions(&mut self, context: &egui::Context) {
+        let wanted = self
+            .pad_shell
+            .as_ref()
+            .and_then(|s| s.osk.as_ref())
+            .filter(|o| o.suggest && !o.secret)
+            .map(|o| (o.buffer.clone(), o.suggested_for.clone()));
+        let Some((text, last)) = wanted else {
+            return;
+        };
+        let index = self.title_index(context);
+        let Some(osk) = self.pad_shell.as_mut().and_then(|s| s.osk.as_mut()) else {
+            return;
+        };
+        osk.loading = index.is_none();
+        if let Some(index) = index {
+            if last.as_deref() != Some(text.as_str()) {
+                osk.suggestions = index.suggest(&text);
+                osk.suggested_for = Some(text);
+                osk.suggestion_focus = osk
+                    .suggestion_focus
+                    .filter(|at| *at < osk.suggestions.len());
+            }
+        } else {
+            osk.suggested_for = None;
+            context.request_repaint_after(std::time::Duration::from_millis(100));
+        }
+    }
+
+    /// The title index for the current library, once built.
+    fn title_index(&self, context: &egui::Context) -> Option<Arc<suggest::TitleIndex>> {
+        type Slot = Arc<Mutex<(usize, usize, Option<Arc<suggest::TitleIndex>>)>>;
+        let slot: Slot = context.data_mut(|d| {
+            d.get_temp_mut_or_insert_with::<Slot>(
+                egui::Id::new("pad_title_index"),
+                Default::default,
+            )
+            .clone()
+        });
+        let key = (
+            Arc::as_ptr(&self.library) as usize,
+            self.library.games.len(),
+        );
+        {
+            let mut state = slot.lock().unwrap_or_else(|e| e.into_inner());
+            if (state.0, state.1) == key {
+                return state.2.clone();
+            }
+            *state = (key.0, key.1, None);
+        }
+        let library = self.library.clone();
+        let context = context.clone();
+        std::thread::spawn(move || {
+            let built = Arc::new(suggest::TitleIndex::build(
+                library.games.iter().map(|g| g.title.as_str()),
+            ));
+            let mut state = slot.lock().unwrap_or_else(|e| e.into_inner());
+            if (state.0, state.1) == key {
+                state.2 = Some(built);
+            }
+            drop(state);
+            context.request_repaint();
+        });
+        None
+    }
+
     fn pad_shell_draw_osk(&mut self, context: &egui::Context) {
         use crate::ui::theme::blue;
+        self.pad_shell_refresh_suggestions(context);
         let Some(osk) = self.pad_shell.as_mut().and_then(|s| s.osk.as_mut()) else {
             return;
         };
         let mut clicked = None;
+        let mut clicked_suggestion = None;
         let modal = egui::Modal::new(egui::Id::new("pad_shell_osk")).show(context, |ui| {
             ui.set_width(760.0);
             ui.label(
@@ -438,6 +512,37 @@ impl App {
             );
             ui.add_space(8.0);
             ui.spacing_mut().item_spacing = egui::vec2(6.0, 6.0);
+            if osk.suggest && !osk.secret {
+                if osk.loading {
+                    ui.label(
+                        egui::RichText::new("Loading title suggestions…")
+                            .color(blue::SECONDARY_TEXT),
+                    );
+                } else if !osk.suggestions.is_empty() {
+                    ui.horizontal_wrapped(|ui| {
+                        for (at, title) in osk.suggestions.iter().enumerate() {
+                            let shown: String = title.chars().take(34).collect();
+                            let mut button =
+                                egui::Button::new(egui::RichText::new(shown).size(17.0))
+                                    .sense(egui::Sense::CLICK);
+                            if osk.suggestion_focus == Some(at) {
+                                button = button
+                                    .fill(blue::PRIMARY_ACTION)
+                                    .stroke(egui::Stroke::new(3.0_f32, blue::ACCENT));
+                            }
+                            if ui.add(button).on_hover_text(title.as_str()).clicked() {
+                                clicked_suggestion = Some(at);
+                            }
+                        }
+                    });
+                    ui.label(
+                        egui::RichText::new("Up from the top row to pick a suggestion")
+                            .small()
+                            .color(blue::SECONDARY_TEXT),
+                    );
+                }
+                ui.add_space(4.0);
+            }
             let all = osk::keys(osk.layer);
             for (row, chunk) in all.chunks(osk::COLUMNS).enumerate() {
                 ui.horizontal(|ui| {
@@ -470,6 +575,9 @@ impl App {
             );
         });
         let backdrop = modal.should_close();
+        if let Some(at) = clicked_suggestion {
+            osk.click_suggestion(at);
+        }
         let outcome = match clicked {
             Some(index) => osk.click(index),
             None if backdrop => Outcome::Cancelled,
@@ -844,6 +952,21 @@ fn capture_slot() -> egui::Id {
     egui::Id::new("pad_shell_capture")
 }
 
+/// Mark a text field as a title search: the controller keyboard offers game
+/// title suggestions for it. Call every frame the field is drawn.
+pub(super) fn mark_suggestions(response: &egui::Response) {
+    response
+        .ctx
+        .data_mut(|d| d.insert_temp(egui::Id::new("pad_suggest").with(response.id), true));
+}
+
+fn wants_suggestions(context: &egui::Context, id: egui::Id) -> bool {
+    context
+        .data(|d| d.get_temp::<bool>(egui::Id::new("pad_suggest").with(id)))
+        .unwrap_or(false)
+        && !is_secret(context, id)
+}
+
 /// Mark a text field as a secret (a password or token): the controller
 /// keyboard masks it, starts it empty and never reads it back. Call every
 /// frame the field is drawn.
@@ -956,6 +1079,25 @@ fn key_tap(context: &egui::Context, key: egui::Key) {
 impl PadShell {
     pub(super) fn buffer(&self) -> Option<String> {
         self.osk.as_ref().map(|o| o.buffer.clone())
+    }
+    pub(super) fn suggestions(&self) -> Vec<String> {
+        self.osk
+            .as_ref()
+            .map(|o| o.suggestions.clone())
+            .unwrap_or_default()
+    }
+    pub(super) fn suggestion_focus(&self) -> Option<usize> {
+        self.osk.as_ref().and_then(|o| o.suggestion_focus)
+    }
+    pub(super) fn type_for_test(&mut self, text: &str) {
+        if let Some(o) = self.osk.as_mut() {
+            o.buffer.push_str(text);
+        }
+    }
+    pub(super) fn focus_top_row_for_test(&mut self) {
+        if let Some(o) = self.osk.as_mut() {
+            o.grid.focus = 0;
+        }
     }
     pub(super) fn mouse_on(&self) -> bool {
         self.mouse.on

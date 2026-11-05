@@ -76,6 +76,7 @@ mod organisation;
 mod osk;
 mod pad_mouse;
 mod pad_shell;
+mod suggest;
 pub(crate) use pad_shell::mark_secret;
 mod pages;
 mod patch_composition;
