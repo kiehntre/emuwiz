@@ -7,6 +7,7 @@ use super::App;
 use super::routes::ToolPage;
 
 mod arcade_shelf;
+mod vita3k_titles;
 
 #[derive(Default)]
 pub(super) struct ToolPagesState {
@@ -28,6 +29,7 @@ pub(super) struct ToolPagesState {
     pub netplay: super::netplay_preview::State,
     pub cheat_extras: super::cheat_extras_page::CheatExtrasState,
     pub arcade_shelf: arcade_shelf::State,
+    pub vita3k_titles: vita3k_titles::State,
 }
 
 impl ToolPagesState {
@@ -44,6 +46,7 @@ impl ToolPagesState {
             netplay: Default::default(),
             cheat_extras: Default::default(),
             arcade_shelf: Default::default(),
+            vita3k_titles: Default::default(),
             host_diagnostics: Default::default(),
             homebrew_browser: Default::default(),
             patch_package_preview: Default::default(),
@@ -128,6 +131,7 @@ impl App {
             }
             ToolPage::LibraryViews => self.library_views_page(ui),
             ToolPage::ArcadeShelf => self.arcade_shelf_page(ui),
+            ToolPage::Vita3kTitles => self.vita3k_titles_page(ui),
             ToolPage::ViewHistory => {
                 use super::view_history_page::{Request, show};
                 match show(ui, &mut self.tools.view_history) {

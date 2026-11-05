@@ -71,6 +71,7 @@ pub(crate) mod saturn_core;
 mod scummvm_profile;
 mod stella;
 pub(crate) mod vice;
+pub(crate) mod vita3k;
 pub(crate) mod xroar;
 use std::path::{Path, PathBuf};
 use std::sync::mpsc::{self, Receiver, TryRecvError};
@@ -1056,6 +1057,7 @@ pub(crate) enum StandaloneProcess {
     Flycast(archivefs_core::launch::LaunchedFlycastProcess),
     XRoar(archivefs_core::launch::process_spawn::WatchedProcess),
     Azahar(archivefs_core::launch::LaunchedAzaharProcess),
+    Vita3k(archivefs_core::launch::process_spawn::WatchedProcess),
     Vice(archivefs_core::launch::process_spawn::WatchedProcess),
     ViceTrainers(
         Box<
@@ -1322,6 +1324,7 @@ impl StandaloneLaunchState {
                     StandaloneProcess::Flycast(p) => p.poll().is_some(),
                     StandaloneProcess::XRoar(p) => p.poll().is_some(),
                     StandaloneProcess::Azahar(p) => p.poll().is_some(),
+                    StandaloneProcess::Vita3k(p) => p.poll().is_some(),
                     StandaloneProcess::Vice(p) => p.poll().is_some(),
                     StandaloneProcess::ViceTrainers(session) => {
                         let _ = session.poll();
@@ -1537,6 +1540,7 @@ pub(crate) enum StandaloneLaunchRequest {
     Flycast(flycast::Request),
     XRoar(xroar::Request),
     Azahar(azahar::Request),
+    Vita3k(vita3k::Request),
     Vice(vice::Request),
     #[cfg(target_os = "linux")]
     ShadPs4(crate::emulator_setup::shadps4::Request),
@@ -1613,6 +1617,7 @@ impl StandaloneLaunchRequest {
             Self::Flycast(_) => "Flycast",
             Self::XRoar(_) => "XRoar",
             Self::Azahar(_) => "Azahar",
+            Self::Vita3k(_) => "Vita3K",
             Self::Vice(_) => "VICE",
             Self::ScummVm(_) => "ScummVM",
             Self::OpenMsx(..) => "openMSX",
@@ -1643,6 +1648,7 @@ impl StandaloneLaunchRequest {
             Self::Flycast(r) => r.key(),
             Self::XRoar(r) => r.key(),
             Self::Azahar(r) => r.key(),
+            Self::Vita3k(r) => r.key(),
             Self::Vice(r) => r.key(),
             Self::ScummVm(r) => (r.selected_game_folder.clone(), "scummvm".into()),
             Self::OpenMsx(r, _) => (r.selected_content_path.clone(), "openmsx".into()),
@@ -1658,6 +1664,7 @@ impl StandaloneLaunchRequest {
             Self::Flycast(r) => r.execute().map(StandaloneProcess::Flycast),
             Self::XRoar(r) => r.execute().map(StandaloneProcess::XRoar),
             Self::Azahar(r) => r.execute().map(StandaloneProcess::Azahar),
+            Self::Vita3k(r) => r.execute().map(StandaloneProcess::Vita3k),
             Self::Vice(r) => r.execute().map(StandaloneProcess::Vice),
             #[cfg(target_os = "linux")]
             Self::ShadPs4(r) => r
@@ -5258,7 +5265,7 @@ fn exit_line(
     }
 }
 
-fn show_standalone_launch_action(
+pub(crate) fn show_standalone_launch_action(
     ui: &mut egui::Ui,
     state: &mut StandaloneLaunchState,
     mut request: StandaloneLaunchRequest,
@@ -5486,6 +5493,11 @@ fn show_standalone_launch_action(
                 {
                     ui.label(exit_line("Azahar", report));
                 }
+                if let StandaloneProcess::Vita3k(process) = process
+                    && let Some(report) = process.poll()
+                {
+                    ui.label(exit_line("Vita3K", report));
+                }
                 if let StandaloneProcess::DosBox(process) = process
                     && let Some(report) = process.poll()
                 {
@@ -5573,6 +5585,13 @@ fn show_standalone_launch_action(
         if adapter == "amiberry_cd"
             && !state.is_active()
             && ui.button("Launch Amiberry CD again (recheck)").clicked()
+        {
+            state.start(request);
+            return;
+        }
+        if adapter == "vita3k"
+            && !state.is_active()
+            && ui.button("Launch Vita3K again (recheck)").clicked()
         {
             state.start(request);
             return;
