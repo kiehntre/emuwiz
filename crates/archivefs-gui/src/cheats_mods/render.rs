@@ -586,6 +586,7 @@ pub(crate) fn dolphin_identity_format_label(format: IdentityImageFormat) -> &'st
         IdentityImageFormat::Gdi
         | IdentityImageFormat::Cdi
         | IdentityImageFormat::LooseCartridgeRom
+        | IdentityImageFormat::ZipContainingCartridgeRom
         | IdentityImageFormat::Xex
         | IdentityImageFormat::ZipContainingXex
         | IdentityImageFormat::Xbe

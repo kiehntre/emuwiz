@@ -367,6 +367,16 @@ impl ReadinessSources<'_> {
                 "verified MAME logical-set directory from the persisted DAT join".into();
         }
 
+        // A ZIP holding exactly one verified cartridge ROM is launchable
+        // through RetroArch by extracting that member at Play time.
+        if content.requires_mount
+            && let Some(zipped) = selected_game_identity_report
+                .filter(|report| focused.is_some_and(|path| report.archive_path == path))
+                .and_then(archivefs_core::launch::launch_content_ref_for_zipped_cartridge)
+        {
+            content = zipped;
+        }
+
         if let Some((_, selected_content)) = flycast_inputs {
             content = selected_content;
         }
@@ -1346,6 +1356,24 @@ impl ReadinessSources<'_> {
             retroarch_environment,
             &remembered,
         );
+        // Only RetroArch can launch a zipped cartridge; a standalone emulator
+        // would be handed the ZIP itself, which its preflight refuses.
+        if content.provenance == archivefs_core::launch::ZIPPED_CARTRIDGE_PROVENANCE {
+            for candidate in &mut plan.candidates {
+                if matches!(
+                    candidate.target,
+                    archivefs_core::launch::LaunchTarget::Standalone { .. }
+                ) {
+                    candidate.readiness = archivefs_core::launch::LaunchReadiness::Blocked;
+                    candidate
+                        .blockers
+                        .push(archivefs_core::launch::LaunchBlocker::new(
+                            archivefs_core::launch::LaunchBlockerKind::ContentNotResolved,
+                            "a zipped cartridge launches through RetroArch only",
+                        ));
+                }
+            }
+        }
         launch_readiness_page::saturn_core::apply(&mut plan, retroarch_environment);
         if let Some(profiles) = &dolphin_launch_profiles {
             archivefs_core::launch::dolphin_binding_readiness::apply(&mut plan, profiles);

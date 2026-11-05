@@ -562,6 +562,12 @@ pub enum IdentityImageFormat {
     Iso,
     ZipContainingIso,
     LooseCartridgeRom,
+    /// A ZIP containing exactly one cartridge ROM member. Its
+    /// [`IdentityKind::LooseRomSha256`] covers that member's decompressed
+    /// bytes, never the ZIP container, and is deliberately not
+    /// [`Self::LooseCartridgeRom`] so no loose-file consumer (saves, cheats,
+    /// mod packages) treats the ZIP path as the runnable ROM.
+    ZipContainingCartridgeRom,
     Xex,
     ZipContainingXex,
     /// A direct original-Xbox `.xbe` executable - identity is read from its
@@ -781,7 +787,14 @@ impl GameIdentityReport {
         self.verified_value(IdentityKind::SegaCdProductCode)
     }
 
+    /// The verified hash of a loose ROM file. Deliberately `None` for a
+    /// zipped cartridge: that hash covers a ZIP member, so file-level
+    /// consumers (patching, cheats, saves) must not treat the ZIP path as the
+    /// ROM. Use [`Self::verified_value`] for the member hash.
     pub fn verified_loose_rom_sha256(&self) -> Option<&str> {
+        if self.format == IdentityImageFormat::ZipContainingCartridgeRom {
+            return None;
+        }
         self.verified_value(IdentityKind::LooseRomSha256)
     }
 
@@ -1024,27 +1037,16 @@ fn inspect_game_identity_with_platform_trust_and_budget(
         }
     }
 
-    if matches!(
-        platform,
-        IdentityPlatform::MegaDrive
-            | IdentityPlatform::Snes
-            | IdentityPlatform::Nes
-            | IdentityPlatform::GameBoy
-            | IdentityPlatform::GameBoyColor
-            | IdentityPlatform::GameBoyAdvance
-            | IdentityPlatform::VirtualBoy
-            | IdentityPlatform::PokemonMini
-            | IdentityPlatform::N64
-            | IdentityPlatform::Atari2600
-            | IdentityPlatform::Atari5200
-            | IdentityPlatform::Atari7800
-            | IdentityPlatform::Atari8Bit
-            | IdentityPlatform::AtariLynx
-            | IdentityPlatform::AtariJaguar
-            | IdentityPlatform::Ngp
-            | IdentityPlatform::Ngpc
-    ) {
-        inspect_loose_rom(&mut report, trusted_platform, trusted);
+    if crate::zip_cartridge_select::is_loose_cartridge_platform(platform) {
+        if path
+            .extension()
+            .and_then(|value| value.to_str())
+            .is_some_and(|value| value.eq_ignore_ascii_case("zip"))
+        {
+            inspect_zip_cartridge_rom(&mut report, trusted_platform, trusted);
+        } else {
+            inspect_loose_rom(&mut report, trusted_platform, trusted);
+        }
         return report;
     }
 
@@ -1662,13 +1664,190 @@ fn inspect_loose_rom(
         );
         return;
     }
-    let mut file = match open_read_only_regular(&report.archive_path, trusted) {
+    let file = match open_read_only_regular(&report.archive_path, trusted) {
         Ok(file) => file,
         Err(message) => {
             add_loose_rom_unavailable(report, IdentityStatus::Invalid, &message);
             return;
         }
     };
+    inspect_loose_rom_file(report, format, file);
+}
+
+fn add_zip_cartridge_unavailable(
+    report: &mut GameIdentityReport,
+    status: IdentityStatus,
+    diagnostic: &str,
+) {
+    add_loose_rom_unavailable(
+        report,
+        status,
+        &format!("zipped cartridge ROM: {diagnostic}"),
+    );
+}
+
+/// Identity for a ZIP holding exactly one cartridge ROM of the trusted
+/// platform. The member's decompressed bytes go through the same checks as a
+/// loose ROM (via an anonymous, bounded temporary copy); the resulting SHA-256
+/// is the member's, never the container's, the report format is
+/// [`IdentityImageFormat::ZipContainingCartridgeRom`], and every evidence item
+/// carries the member name and index. Nothing is extracted next to the
+/// archive, and identity alone never makes the ZIP runnable: launch still
+/// needs the mount/extraction flow and its own preflight.
+fn inspect_zip_cartridge_rom(
+    report: &mut GameIdentityReport,
+    trusted_platform: bool,
+    trusted: &TrustedRoots,
+) {
+    report.format = IdentityImageFormat::ZipContainingCartridgeRom;
+    report.nested_container_depth = 1;
+    if !trusted_platform {
+        add_zip_cartridge_unavailable(
+            report,
+            IdentityStatus::Ambiguous,
+            "identity requires exact scanner or manual platform evidence",
+        );
+        return;
+    }
+    let file = match open_read_only_regular(&report.archive_path, trusted) {
+        Ok(file) => file,
+        Err(message) => {
+            add_zip_cartridge_unavailable(report, IdentityStatus::Invalid, &message);
+            return;
+        }
+    };
+    let before = match StableFileMetadata::from_file(&file) {
+        Ok(metadata) => metadata,
+        Err(error) => {
+            add_zip_cartridge_unavailable(report, IdentityStatus::Invalid, &error.to_string());
+            return;
+        }
+    };
+    let mut archive = match ZipArchive::new(file) {
+        Ok(archive) => archive,
+        Err(error) => {
+            add_zip_cartridge_unavailable(
+                report,
+                IdentityStatus::Invalid,
+                &format!("invalid ZIP: {error}"),
+            );
+            return;
+        }
+    };
+    let crate::zip_cartridge_select::ZipCartridgeMember {
+        index,
+        name: member_name,
+        declared,
+        format,
+    } = match crate::zip_cartridge_select::select_zip_cartridge_member(
+        &mut archive,
+        report.platform,
+        &mut report.archive_members_inspected,
+    ) {
+        Ok(member) => member,
+        Err((status, message)) => {
+            add_zip_cartridge_unavailable(report, status, &message);
+            return;
+        }
+    };
+    let mut temp = match tempfile::tempfile() {
+        Ok(temp) => temp,
+        Err(error) => {
+            add_zip_cartridge_unavailable(
+                report,
+                IdentityStatus::Invalid,
+                &format!("could not create the private bounded copy: {error}"),
+            );
+            return;
+        }
+    };
+    {
+        let entry = match archive.by_index(index) {
+            Ok(entry) => entry,
+            Err(error) => {
+                add_zip_cartridge_unavailable(report, IdentityStatus::Invalid, &error.to_string());
+                return;
+            }
+        };
+        if entry.name_raw() != member_name.as_slice() {
+            add_zip_cartridge_unavailable(
+                report,
+                IdentityStatus::Invalid,
+                "ZIP entry changed since it was selected",
+            );
+            return;
+        }
+        // Read one byte past the declared size so an entry that inflates
+        // beyond its header is detected rather than silently truncated.
+        let mut limited = entry.take(declared.saturating_add(1));
+        match io::copy(&mut limited, &mut temp) {
+            Ok(copied) if copied == declared => {}
+            Ok(copied) => {
+                add_zip_cartridge_unavailable(
+                    report,
+                    IdentityStatus::Invalid,
+                    &format!(
+                        "ROM member inflated to {copied} bytes but its header declares {declared}"
+                    ),
+                );
+                return;
+            }
+            Err(error) => {
+                add_zip_cartridge_unavailable(
+                    report,
+                    IdentityStatus::Invalid,
+                    &format!("ROM member is corrupt or truncated: {error}"),
+                );
+                return;
+            }
+        }
+    }
+    if temp.seek(SeekFrom::Start(0)).is_err() {
+        add_zip_cartridge_unavailable(
+            report,
+            IdentityStatus::Invalid,
+            "could not rewind the bounded ROM copy",
+        );
+        return;
+    }
+    let first_new = report.evidence.len();
+    inspect_loose_rom_file(report, format, temp);
+    // The ZIP must be byte-for-byte the same file after the member was read.
+    let unchanged = File::open(&report.archive_path)
+        .and_then(|reopened| StableFileMetadata::from_file(&reopened))
+        .is_ok_and(|after| after == before);
+    if !unchanged {
+        report.evidence.truncate(first_new);
+        report.complete = false;
+        add_zip_cartridge_unavailable(
+            report,
+            IdentityStatus::Invalid,
+            "ZIP changed while its identity was being read",
+        );
+        return;
+    }
+    let zip_note = format!(
+        "ZIP container {} bytes; ROM is member #{index} ({} decompressed bytes); \
+         the hash is of the member, not the ZIP file",
+        before.len, declared
+    );
+    for item in &mut report.evidence[first_new..] {
+        item.provenance.member_path = Some(member_name.clone());
+        item.provenance.member_index = Some(index);
+        item.provenance.method = format!("zip member: {}", item.provenance.method);
+        if item.kind == IdentityKind::LooseRomSha256 && item.status == IdentityStatus::Verified {
+            item.diagnostic = format!("{}; {zip_note}", item.diagnostic);
+        }
+    }
+    report.format = IdentityImageFormat::ZipContainingCartridgeRom;
+    report.nested_container_depth = 1;
+}
+
+/// The shared cartridge checks, run on an already-opened regular file whose
+/// exact bytes are the ROM. Used for a loose file and, via an anonymous
+/// bounded copy of one ZIP member, for a zipped cartridge ROM, so both routes
+/// apply identical header/format validation and size bounds.
+fn inspect_loose_rom_file(report: &mut GameIdentityReport, format: &'static str, mut file: File) {
     let before = match StableFileMetadata::from_file(&file) {
         Ok(metadata) => metadata,
         Err(error) => {
@@ -2230,7 +2409,7 @@ fn hash_bounded_file(file: &mut File, maximum: u64) -> io::Result<(String, u64)>
 }
 
 #[derive(Debug, PartialEq, Eq)]
-struct StableFileMetadata {
+pub(crate) struct StableFileMetadata {
     len: u64,
     modified: Option<std::time::SystemTime>,
     #[cfg(unix)]
@@ -2240,7 +2419,7 @@ struct StableFileMetadata {
 }
 
 impl StableFileMetadata {
-    fn from_file(file: &File) -> io::Result<Self> {
+    pub(crate) fn from_file(file: &File) -> io::Result<Self> {
         let metadata = file.metadata()?;
         #[cfg(unix)]
         use std::os::unix::fs::MetadataExt;
@@ -6931,7 +7110,7 @@ impl ByteSource for SliceSource<'_> {
 /// that contains both the link and its canonical target - so passing
 /// [`TrustedRoots::none`] keeps the historical behaviour of refusing every
 /// symlink outright.
-fn open_read_only_regular(path: &Path, trusted: &TrustedRoots) -> Result<File, String> {
+pub(crate) fn open_read_only_regular(path: &Path, trusted: &TrustedRoots) -> Result<File, String> {
     crate::safe_read::open_bounded_read(path, trusted)
         .map(crate::safe_read::SafeFile::into_file)
         .map_err(|refusal| refusal.detail())
@@ -11511,16 +11690,14 @@ mod tests {
 
     #[test]
     fn game_boy_zip_extension_is_unsupported_not_extracted() {
-        // No archive-mount/ZIP-member path exists for any loose-cartridge
-        // platform (Mega Drive/SNES/NES included) - a `.zip` extension
-        // simply fails closed as unsupported, exactly like any other wrong
-        // extension. This crate never adds ZIP extraction for this pass.
+        // A `.zip` that is not a valid ZIP fails closed (Invalid) and is never
+        // extracted; real single-ROM ZIPs are covered by `zip_cartridge_tests`.
         let directory = FixtureDir::new("loose-gb-zip");
         let path = write_fixture(&directory, "Mystery Game.zip", b"bytes");
         let report = inspect_catalogued_game_identity(&path, Some("Game Boy"));
         assert_eq!(report.verified_loose_rom_sha256(), None);
         assert!(report.evidence.iter().any(|item| {
-            item.kind == IdentityKind::LooseRomSha256 && item.status == IdentityStatus::Unsupported
+            item.kind == IdentityKind::LooseRomSha256 && item.status == IdentityStatus::Invalid
         }));
     }
 
@@ -11868,7 +12045,7 @@ mod tests {
         let report = inspect_catalogued_game_identity(&path, Some("N64"));
         assert_eq!(report.verified_loose_rom_sha256(), None);
         assert!(report.evidence.iter().any(|item| {
-            item.kind == IdentityKind::LooseRomSha256 && item.status == IdentityStatus::Unsupported
+            item.kind == IdentityKind::LooseRomSha256 && item.status == IdentityStatus::Invalid
         }));
     }
 
@@ -13665,3 +13842,6 @@ fn a_deferred_identity_status_reads_not_available_yet() {
     assert_eq!(IdentityStatus::Deferred.to_string(), "Not available yet");
     assert_ne!(IdentityStatus::Deferred.to_string(), "Deferred");
 }
+
+#[cfg(test)]
+mod zip_cartridge_tests;
