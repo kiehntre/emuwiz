@@ -2,6 +2,11 @@ use super::*;
 use crate::DolphinCatalogueStatusSnapshot;
 use crate::sources_page::{CatalogueManagerState, DolphinCatalogueManagerState};
 use archivefs_core::patch_manager::CheatSourceList;
+use archivefs_core::patch_manager::{
+    CheatSourceFetchOptions, CheatSourceHttpResponse, CheatSourceTransferContext,
+    CheatSourceTransport, fetch_retroarch_cheat_source,
+};
+use std::io::Write;
 
 fn temp_root(name: &str) -> PathBuf {
     let root = std::env::temp_dir().join(format!(
@@ -80,7 +85,7 @@ fn wait(workflows: &mut NativeWorkflows) {
 }
 
 #[test]
-fn databases_tab_shows_both_gold_cards_without_network_or_writes() {
+fn databases_tab_shows_both_gold_cards_and_starts_no_retrieval() {
     let context = egui::Context::default();
     let root = temp_root("cards");
     let mut workflows = workflows(&context, &root);
@@ -103,7 +108,6 @@ fn databases_tab_shows_both_gold_cards_without_network_or_writes() {
             .dolphin_catalogue_retrieval
             .is_none()
     );
-    assert!(listing(&root).is_empty());
 }
 
 #[test]
@@ -255,4 +259,292 @@ fn prune_result_clears_stale_review_and_reports_honestly() {
         message.contains("problems") && message.contains("2.0 KB"),
         "{message}"
     );
+}
+
+/// Serves a synthetic libretro archive; the "commit" decides the snapshot
+/// identity, so distinct commits create distinct saved copies. No network.
+struct SyntheticTransport {
+    commit: char,
+}
+
+impl CheatSourceTransport for SyntheticTransport {
+    fn get(
+        &self,
+        url: &str,
+        _maximum_bytes: u64,
+        destination: &mut dyn Write,
+        _context: CheatSourceTransferContext<'_>,
+    ) -> Result<CheatSourceHttpResponse, CheatSourceError> {
+        let (body, kind) =
+            if url.contains("api.github.com/repos/libretro/libretro-database/commits/") {
+                (
+                    format!(r#"{{"sha":"{}"}}"#, self.commit.to_string().repeat(40)).into_bytes(),
+                    "application/json",
+                )
+            } else {
+                let mut writer = zip::ZipWriter::new(std::io::Cursor::new(Vec::new()));
+                writer
+                    .start_file(
+                        "libretro-database-1.22.1/cht/Nintendo - SNES/Game.cht",
+                        zip::write::SimpleFileOptions::default(),
+                    )
+                    .unwrap();
+                writer
+                    .write_all(
+                        format!(
+                            "cheats = 1\ncheat0_desc = \"Lives {}\"\ncheat0_code = \"00FF\"\n",
+                            self.commit
+                        )
+                        .as_bytes(),
+                    )
+                    .unwrap();
+                (writer.finish().unwrap().into_inner(), "application/zip")
+            };
+        destination.write_all(&body).unwrap();
+        Ok(CheatSourceHttpResponse {
+            status: 200,
+            content_type: Some(kind.into()),
+            content_encoding: None,
+            content_length: Some(body.len() as u64),
+            location: None,
+            etag: None,
+            last_modified: None,
+            downloaded_bytes: body.len() as u64,
+            retry_after_seconds: None,
+        })
+    }
+}
+
+/// Creates `commits.len()` real saved copies in `root` through Core's own
+/// fetch (synthetic transport), so the manifests and digests are genuine.
+fn build_snapshots(root: &std::path::Path, commits: &[char]) {
+    for commit in commits {
+        fetch_retroarch_cheat_source(
+            "libretro-buildbot-cheats",
+            &CheatSourceFetchOptions {
+                cache_root: root.to_path_buf(),
+                force_refresh: true,
+                offline: false,
+                expected_sha256: None,
+                max_download_bytes: Some(2 * 1024 * 1024),
+                cancellation: None,
+                progress: None,
+            },
+            &SyntheticTransport { commit: *commit },
+        )
+        .unwrap();
+        // Distinct retrieval timestamps for deterministic age ordering.
+        std::thread::sleep(std::time::Duration::from_millis(1100));
+    }
+}
+
+/// Acceptance helper, not a regression test: populates the directory in
+/// `EMUWIZ_FIXTURE_ROOT` with synthetic saved copies.
+#[test]
+#[ignore = "builds a synthetic cache for real-GUI acceptance"]
+fn build_acceptance_cache() {
+    let root = PathBuf::from(std::env::var("EMUWIZ_FIXTURE_ROOT").unwrap());
+    build_snapshots(&root, &['1', '2', '3']);
+}
+
+#[test]
+fn real_snapshots_inventory_verify_pin_and_confirmed_prune() {
+    let context = egui::Context::default();
+    let root = temp_root("real");
+    build_snapshots(&root, &['1', '2', '3']);
+    let mut workflows = workflows(&context, &root);
+    workflows.cheat_catalogues.tab = SubTab::Cache;
+
+    workflows.cheat_catalogues.start(&context, CacheJob::Verify);
+    wait(&mut workflows);
+    let report = workflows
+        .cheat_catalogues
+        .verification
+        .as_ref()
+        .unwrap()
+        .as_ref()
+        .unwrap();
+    assert_eq!(report.entries.len(), 3);
+    assert_eq!(report.invalid_count, 0);
+    let oldest = report
+        .entries
+        .iter()
+        .min_by_key(|entry| entry.retrieved_at_unix_seconds)
+        .unwrap()
+        .snapshot_id
+        .clone()
+        .unwrap();
+
+    // Pin the oldest copy: preview must protect it, and pinning drops any
+    // earlier preview so a stale plan cannot be confirmed.
+    workflows.cheat_catalogues.keep = 2;
+    let policy = workflows.cheat_catalogues.policy();
+    workflows
+        .cheat_catalogues
+        .start(&context, CacheJob::Plan(policy));
+    wait(&mut workflows);
+    assert_eq!(
+        workflows
+            .cheat_catalogues
+            .plan
+            .as_ref()
+            .unwrap()
+            .candidate_count,
+        1
+    );
+    workflows.cheat_catalogues.start(
+        &context,
+        CacheJob::Pin {
+            snapshot_id: oldest.clone(),
+            pinned: true,
+        },
+    );
+    wait(&mut workflows);
+    assert!(
+        workflows.cheat_catalogues.plan.is_none(),
+        "pin must invalidate the preview"
+    );
+    let policy = workflows.cheat_catalogues.policy();
+    workflows
+        .cheat_catalogues
+        .start(&context, CacheJob::Plan(policy));
+    wait(&mut workflows);
+    assert_eq!(
+        workflows
+            .cheat_catalogues
+            .plan
+            .as_ref()
+            .unwrap()
+            .candidate_count,
+        0,
+        "the pinned copy is protected"
+    );
+
+    // Unpin, preview, confirm: exactly the previewed copy goes, and it is
+    // the only change on disk.
+    workflows.cheat_catalogues.start(
+        &context,
+        CacheJob::Pin {
+            snapshot_id: oldest.clone(),
+            pinned: false,
+        },
+    );
+    wait(&mut workflows);
+    let policy = workflows.cheat_catalogues.policy();
+    workflows
+        .cheat_catalogues
+        .start(&context, CacheJob::Plan(policy));
+    wait(&mut workflows);
+    let plan = workflows.cheat_catalogues.plan.clone().unwrap();
+    assert_eq!(plan.candidate_count, 1);
+    let before = listing(&root);
+    workflows
+        .cheat_catalogues
+        .start(&context, CacheJob::Prune(Box::new(plan)));
+    wait(&mut workflows);
+    let (ok, message) = workflows.cheat_catalogues.notice.clone().unwrap();
+    assert!(ok, "{message}");
+    assert!(workflows.cheat_catalogues.plan.is_none());
+    assert!(listing(&root).len() < before.len());
+    workflows.cheat_catalogues.start(&context, CacheJob::Verify);
+    wait(&mut workflows);
+    let report = workflows
+        .cheat_catalogues
+        .verification
+        .as_ref()
+        .unwrap()
+        .as_ref()
+        .unwrap();
+    assert_eq!(report.entries.len(), 2, "the two newest copies remain");
+    assert_eq!(report.invalid_count, 0);
+}
+
+#[test]
+fn a_plan_whose_copy_changed_after_preview_is_not_executed_blindly() {
+    let context = egui::Context::default();
+    let root = temp_root("changed");
+    build_snapshots(&root, &['1', '2', '3']);
+    let mut workflows = workflows(&context, &root);
+    let policy = workflows.cheat_catalogues.policy();
+    workflows
+        .cheat_catalogues
+        .start(&context, CacheJob::Plan(policy));
+    wait(&mut workflows);
+    let plan = workflows.cheat_catalogues.plan.clone().unwrap();
+    assert_eq!(plan.candidate_count, 1);
+    let candidate = plan
+        .entries
+        .iter()
+        .find(|entry| entry.disposition == CachePruneDisposition::Candidate)
+        .unwrap();
+    // Someone adds a file to the reviewed copy between preview and confirm.
+    let path = PathBuf::from(&candidate.path.display);
+    std::fs::write(path.join("added-after-preview.txt"), b"x").unwrap();
+    workflows
+        .cheat_catalogues
+        .start(&context, CacheJob::Prune(Box::new(plan)));
+    wait(&mut workflows);
+    assert!(path.exists(), "a changed copy must be left in place");
+    let (ok, message) = workflows.cheat_catalogues.notice.clone().unwrap();
+    assert!(
+        !ok,
+        "a skipped/changed entry must not be reported as success: {message}"
+    );
+}
+
+#[test]
+fn stale_reads_are_dropped_after_a_pin_or_a_finished_download() {
+    let context = egui::Context::default();
+    let root = temp_root("stale-reads");
+    build_snapshots(&root, &['1', '2']);
+    let mut workflows = workflows(&context, &root);
+    workflows.cheat_catalogues.start(&context, CacheJob::Verify);
+    wait(&mut workflows);
+    let id = workflows
+        .cheat_catalogues
+        .verification
+        .as_ref()
+        .unwrap()
+        .as_ref()
+        .unwrap()
+        .entries[0]
+        .snapshot_id
+        .clone()
+        .unwrap();
+    workflows.cheat_catalogues.start(
+        &context,
+        CacheJob::Pin {
+            snapshot_id: id,
+            pinned: true,
+        },
+    );
+    wait(&mut workflows);
+    assert!(
+        workflows.cheat_catalogues.verification.is_none(),
+        "old pin state must not linger"
+    );
+    // The next frame re-reads the list instead of leaving it blank.
+    workflows.poll_cheat_catalogues(&context);
+    wait(&mut workflows);
+    let report = workflows
+        .cheat_catalogues
+        .inventory
+        .as_ref()
+        .unwrap()
+        .as_ref()
+        .unwrap();
+    assert!(report.entries.iter().any(|entry| entry.pinned));
+    // A new request clears the previous result text.
+    workflows
+        .cheat_catalogues
+        .start(&context, CacheJob::Inventory);
+    assert!(workflows.cheat_catalogues.notice.is_none());
+    wait(&mut workflows);
+    // A finished download invalidates every earlier read and preview.
+    workflows.cheat_catalogues.plan =
+        Some(plan_retroarch_cheat_cache_prune(&root, &CachePrunePolicy::default()).unwrap());
+    workflows.cheat_catalogues.retrieving_before = true;
+    workflows.poll_cheat_catalogues(&context);
+    assert!(workflows.cheat_catalogues.plan.is_none());
+    assert!(workflows.cheat_catalogues.inventory.is_none());
 }

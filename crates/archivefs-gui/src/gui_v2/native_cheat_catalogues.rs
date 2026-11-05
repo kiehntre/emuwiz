@@ -18,12 +18,13 @@ use std::path::PathBuf;
 use std::sync::mpsc::{self, Receiver};
 
 use archivefs_core::patch_manager::{
-    CachePruneDisposition, CachePruneExecutionResult, CachePruneExecutionStatus, CachePrunePlan,
-    CachePrunePolicy, CheatSourceError, SnapshotInventoryEntry, SnapshotInventoryReport,
-    SnapshotPinResult, SnapshotPinStatus, SnapshotVerificationReport, SnapshotVerificationState,
-    default_cheat_source_cache_root, execute_retroarch_cheat_cache_prune,
-    inventory_retroarch_cheat_snapshots, plan_retroarch_cheat_cache_prune,
-    set_retroarch_cheat_snapshot_pin, verify_retroarch_cheat_snapshots,
+    CachePruneDisposition, CachePruneEntryStatus, CachePruneExecutionResult,
+    CachePruneExecutionStatus, CachePrunePlan, CachePrunePolicy, CheatSourceError,
+    SnapshotInventoryEntry, SnapshotInventoryReport, SnapshotPinResult, SnapshotPinStatus,
+    SnapshotVerificationReport, SnapshotVerificationState, default_cheat_source_cache_root,
+    execute_retroarch_cheat_cache_prune, inventory_retroarch_cheat_snapshots,
+    plan_retroarch_cheat_cache_prune, set_retroarch_cheat_snapshot_pin,
+    verify_retroarch_cheat_snapshots,
 };
 use eframe::egui;
 
@@ -91,6 +92,10 @@ pub(super) struct State {
     keep: usize,
     include_staging: bool,
     plan: Option<CachePrunePlan>,
+    /// Set after a change so the list is re-read (without clearing the result notice).
+    refresh_pending: bool,
+    /// Whether a RetroArch retrieval was running last frame.
+    retrieving_before: bool,
     // Activity bookkeeping.
     retroarch_job: Option<u64>,
     dolphin_job: Option<u64>,
@@ -109,6 +114,8 @@ impl Default for State {
             keep: MINIMUM_KEEP,
             include_staging: false,
             plan: None,
+            refresh_pending: false,
+            retrieving_before: false,
             retroarch_job: None,
             dolphin_job: None,
             cache_job: None,
@@ -128,7 +135,23 @@ impl State {
         }
     }
 
+    /// Starts a user-requested job; a new request clears the previous result.
     fn start(&mut self, context: &egui::Context, job: CacheJob) {
+        if self.busy() {
+            return;
+        }
+        self.notice = None;
+        self.start_job(context, job);
+    }
+
+    /// Forgets everything read from the cache: the on-disk state changed.
+    fn invalidate(&mut self) {
+        self.plan = None;
+        self.inventory = None;
+        self.verification = None;
+    }
+
+    fn start_job(&mut self, context: &egui::Context, job: CacheJob) {
         if self.busy() {
             return;
         }
@@ -158,9 +181,10 @@ impl State {
             Err(mpsc::TryRecvError::Empty) => return false,
             Err(mpsc::TryRecvError::Disconnected) => {
                 self.worker = None;
+                self.invalidate();
                 self.notice = Some((
                     false,
-                    "The cache check stopped unexpectedly. Nothing was changed; try again."
+                    "The cache check stopped unexpectedly. Saved copies may have been partly changed; list them again to see what is there."
                         .to_string(),
                 ));
                 return true;
@@ -174,6 +198,7 @@ impl State {
     fn apply(&mut self, outcome: CacheOutcome) {
         match outcome {
             CacheOutcome::Inventory(result) => {
+                self.verification = None;
                 self.inventory = Some(result.map_err(|error| error.to_string()));
             }
             CacheOutcome::Verify(result) => {
@@ -203,8 +228,8 @@ impl State {
                     };
                     self.notice = Some((true, text.to_string()));
                     // Pins change inventory and invalidate any reviewed plan.
-                    self.plan = None;
-                    self.inventory = None;
+                    self.invalidate();
+                    self.refresh_pending = true;
                 }
                 Err(error) => self.notice = Some((false, error.to_string())),
             },
@@ -216,13 +241,16 @@ impl State {
                 }
             },
             CacheOutcome::Prune(result) => {
-                self.plan = None;
-                self.inventory = None;
-                self.verification = None;
+                self.invalidate();
+                self.refresh_pending = true;
                 self.notice = Some(match result {
-                    Ok(result) => (
-                        result.status == CachePruneExecutionStatus::Completed,
-                        format!(
+                    Ok(result) => {
+                        let untouched = result
+                            .entries
+                            .iter()
+                            .filter(|entry| entry.status != CachePruneEntryStatus::Deleted)
+                            .collect::<Vec<_>>();
+                        let mut text = format!(
                             "Clean-up {}: {} old copies and {} leftovers removed, {} freed.",
                             match result.status {
                                 CachePruneExecutionStatus::Completed => "finished",
@@ -233,8 +261,17 @@ impl State {
                             result.snapshots_deleted,
                             result.staging_entries_removed,
                             human_bytes(result.bytes_reclaimed)
-                        ),
-                    ),
+                        );
+                        if let Some(first) = untouched.first() {
+                            text.push_str(&format!(
+                                " {} item(s) were left untouched, for example {}: {}",
+                                untouched.len(),
+                                first.path.display,
+                                first.detail
+                            ));
+                        }
+                        (result.status == CachePruneExecutionStatus::Completed, text)
+                    }
                     Err(error) => (false, error.to_string()),
                 });
             }
@@ -286,7 +323,20 @@ impl NativeWorkflows {
     /// Collects the cache-maintenance job. Called once per frame from `poll`,
     /// so a result never waits for the tab to be reopened.
     pub(in crate::gui_v2) fn poll_cheat_catalogues(&mut self, context: &egui::Context) {
-        let changed = self.cheat_catalogues.poll();
+        let mut changed = self.cheat_catalogues.poll();
+        // A finished download changes what is saved: drop stale reads.
+        let retrieving = self.app.catalogue_bsfree_ui.catalogue_retrieval.is_some();
+        if self.cheat_catalogues.retrieving_before && !retrieving {
+            self.cheat_catalogues.invalidate();
+            changed = true;
+        }
+        self.cheat_catalogues.retrieving_before = retrieving;
+        if self.cheat_catalogues.refresh_pending && !self.cheat_catalogues.busy() && !retrieving {
+            self.cheat_catalogues.refresh_pending = false;
+            self.cheat_catalogues
+                .start_job(context, CacheJob::Inventory);
+            changed = true;
+        }
         if changed || self.cheat_catalogues.busy() {
             context.request_repaint_after(std::time::Duration::from_millis(100));
         }
@@ -519,6 +569,7 @@ impl NativeWorkflows {
                     }
                     if let Some(id) = &entry.snapshot_id
                         && entry.pin_metadata_valid
+                        && entry.verification_state == SnapshotVerificationState::Valid
                     {
                         let label = if entry.pinned {
                             "Remove protection"
@@ -559,13 +610,23 @@ impl NativeWorkflows {
         ui.strong("Clean up old copies");
         ui.horizontal_wrapped(|ui| {
             ui.label("Keep the newest");
-            ui.add(egui::DragValue::new(&mut state.keep).range(MINIMUM_KEEP..=50));
+            if ui
+                .add(egui::DragValue::new(&mut state.keep).range(MINIMUM_KEEP..=50))
+                .changed()
+            {
+                state.plan = None;
+            }
             ui.label("copies of each database (never fewer than 2)");
         });
-        ui.checkbox(
-            &mut state.include_staging,
-            "Also remove unfinished downloads older than 24 hours",
-        );
+        if ui
+            .checkbox(
+                &mut state.include_staging,
+                "Also remove unfinished downloads older than 24 hours",
+            )
+            .changed()
+        {
+            state.plan = None;
+        }
         if ui
             .add_enabled(idle, egui::Button::new("Preview clean-up"))
             .clicked()
