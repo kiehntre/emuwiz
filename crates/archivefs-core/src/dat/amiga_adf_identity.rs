@@ -120,6 +120,23 @@ pub enum AmigaAdfIdentityRefusal {
 }
 
 impl AmigaAdfIdentityRefusal {
+    /// True when the catalogue itself says this ADF is part of a set, an
+    /// add-on or not a game that runs on its own, or disagrees with itself.
+    /// That is evidence against, so the local-media route must not bypass it.
+    /// Every other refusal only means no current DAT proof exists.
+    pub fn is_evidence_against_standalone(&self) -> bool {
+        matches!(
+            self,
+            Self::Conflicting(_)
+                | Self::NotSingleRom(_)
+                | Self::DiskNumbered(_)
+                | Self::NumberedSiblings(_)
+                | Self::NotStandaloneGame(_)
+                | Self::NotAdf
+                | Self::NotAmiga
+        )
+    }
+
     /// Plain words for the person looking at the game.
     pub fn reason(&self) -> String {
         match self {

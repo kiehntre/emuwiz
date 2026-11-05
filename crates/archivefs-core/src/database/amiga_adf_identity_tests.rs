@@ -448,6 +448,7 @@ fn request_for(lab: &Lab, emu: &Emulator, key: &str, file: &str) -> FsUaeAdfLaun
         roots: emu.roots.clone(),
         database_path: lab.root.join("library.sqlite3"),
         dat_sources_config: lab.root.join("unused.toml"),
+        route: crate::launch::FsUaeAdfRoute::CatalogueVerified,
     }
 }
 

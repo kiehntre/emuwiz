@@ -10,6 +10,13 @@ use archivefs_core::emulator_environment::retroarch::RetroArchEnvironmentReport;
 use archivefs_core::launch::{LaunchContainerKind, LaunchContentRef, build_launch_plan};
 use std::fs;
 
+/// A structurally plausible DD floppy: right size and a `DOS\0` boot block.
+fn floppy() -> Vec<u8> {
+    let mut bytes = vec![0u8; 901_120];
+    bytes[..4].copy_from_slice(b"DOS\0");
+    bytes
+}
+
 struct Lab {
     _dir: tempfile::TempDir,
     adf: PathBuf,
@@ -21,7 +28,7 @@ fn lab(conf: &str, kickstart: bool) -> Lab {
     let dir = tempfile::tempdir().unwrap();
     let base = dir.path();
     let adf = base.join("Speedball.adf");
-    fs::write(&adf, vec![0u8; 901_120]).unwrap();
+    fs::write(&adf, floppy()).unwrap();
     let config_root = base.join("fs-uae");
     fs::create_dir_all(&config_root).unwrap();
     let rom = base.join("kick13.rom");
@@ -182,5 +189,213 @@ fn only_adf_files_reach_the_catalogue_check() {
             "{path} {platform:?}"
         );
         assert!(launch_inputs(Path::new(path), platform).is_none(), "{path}");
+    }
+}
+
+fn local_play(lab: &Lab) -> (AdfLaunchInputs, GamerPlayAction) {
+    let media = local_adf_media(&lab.adf).expect("a plain single floppy");
+    let inputs = local_inputs_for(
+        &media,
+        &lab.roots,
+        lab.database.clone(),
+        lab.database.with_extension("toml"),
+    );
+    let content = LaunchContentRef {
+        kind: None,
+        container: Some(LaunchContainerKind::PlainFile),
+        resolved_path: Some(lab.adf.clone()),
+        requires_mount: false,
+        provenance: "test loose ADF".into(),
+    };
+    let plan = build_launch_plan(
+        &inputs.identity,
+        &content,
+        &inputs.profiles,
+        &RetroArchEnvironmentReport {
+            format_version: 2,
+            profiles: Vec::new(),
+            diagnostics: Vec::new(),
+        },
+        &[],
+    );
+    let input = LaunchReadinessInput::Plan {
+        plan,
+        retroarch: None,
+        retroarch_scanned: true,
+        standalone_scans_complete: true,
+        dolphin: None,
+        pcsx2: None,
+        duckstation: None,
+        ppsspp: None,
+        rpcs3: None,
+        xemu: None,
+        xenia: None,
+        melonds: None,
+        cemu: None,
+        flycast: None,
+        xroar: None,
+        vice: None,
+        amiga_whdload: Some(AmigaWHDLoadLaunchContext {
+            requests: Vec::new(),
+            adf: inputs.requests.clone(),
+        }),
+        #[cfg(target_os = "linux")]
+        shadps4: None,
+    };
+    let action = gamer_play_action(&input);
+    (inputs, action)
+}
+
+fn local_request(lab: &Lab) -> archivefs_core::launch::FsUaeAdfLaunchRequest {
+    let (inputs, action) = local_play(lab);
+    assert_eq!(inputs.requests.len(), 1);
+    let GamerPlayAction::Launch(request) = action else {
+        panic!("expected Play for a local single-disk ADF");
+    };
+    let TypedLaunchRequest::Standalone(StandaloneLaunchRequest::FsUaeAdf(request)) = *request
+    else {
+        panic!("expected the FS-UAE ADF request");
+    };
+    *request
+}
+
+fn preflight_local(
+    request: &archivefs_core::launch::FsUaeAdfLaunchRequest,
+    lab: &Lab,
+) -> Result<
+    archivefs_core::launch::process_spawn::PreparedProcessCommand,
+    archivefs_core::launch::FsUaeAdfLaunchError,
+> {
+    // An empty catalogue: the file is not in the library, so no DAT speaks.
+    let database = archivefs_core::Database::open_or_create(lab.database.clone()).unwrap();
+    archivefs_core::launch::preflight_fsuae_adf_launch(
+        request,
+        &database,
+        &std::collections::HashMap::new(),
+    )
+}
+
+#[test]
+fn an_unverified_single_floppy_plays_through_the_local_media_route() {
+    let lab = lab("amiga_model = A500", true);
+    let request = local_request(&lab);
+    assert!(matches!(
+        &request.route,
+        archivefs_core::launch::FsUaeAdfRoute::LocalMedia { sha256 } if sha256.len() == 64
+    ));
+    // Not a catalogue game: the key is namespaced to the bytes.
+    assert!(
+        request
+            .fsuae
+            .expected_game_key
+            .starts_with("local-adf-sha256:")
+    );
+    let before = fs::read(&lab.adf).unwrap();
+    let command = preflight_local(&request, &lab).expect("launchable");
+    let mut media = std::ffi::OsString::from("--floppy-drive-0=");
+    media.push(&lab.adf);
+    assert_eq!(command.arguments.len(), 2);
+    assert_eq!(command.arguments[1], media);
+    assert_eq!(fs::read(&lab.adf).unwrap(), before);
+}
+
+#[test]
+fn a_changed_floppy_is_refused_at_click_time() {
+    let lab = lab("amiga_model = A500", true);
+    let request = local_request(&lab);
+    // Same size, different bytes.
+    let mut bytes = floppy();
+    bytes[2000] = 7;
+    fs::write(&lab.adf, bytes).unwrap();
+    let refused = preflight_local(&request, &lab);
+    assert!(refused.is_err(), "{refused:?}");
+    // Replaced by something that is no longer a floppy at all.
+    fs::write(&lab.adf, b"nothing").unwrap();
+    assert!(preflight_local(&request, &lab).is_err());
+}
+
+#[test]
+fn numbered_or_sibling_disks_are_not_a_single_floppy() {
+    let dir = tempfile::tempdir().unwrap();
+    for name in ["Game (Disk 1 of 2).adf", "Game Disk 2.adf"] {
+        let path = dir.path().join(name);
+        fs::write(&path, floppy()).unwrap();
+        let refused = local_adf_media(&path);
+        assert!(refused.is_err(), "{name}: {refused:?}");
+    }
+    // A plain name beside a numbered sibling is also refused.
+    let single = tempfile::tempdir().unwrap();
+    let one = single.path().join("Monkey Island Disk 1.adf");
+    let two = single.path().join("Monkey Island Disk 2.adf");
+    fs::write(&one, floppy()).unwrap();
+    fs::write(&two, floppy()).unwrap();
+    assert!(local_adf_media(&one).is_err());
+    assert!(local_adf_media(&two).is_err());
+    let alone = single.path().join("Other.adf");
+    fs::write(&alone, floppy()).unwrap();
+    assert!(local_adf_media(&alone).is_ok());
+}
+
+#[test]
+fn only_a_plausible_amiga_floppy_image_counts_as_media() {
+    let dir = tempfile::tempdir().unwrap();
+    let wrong_size = dir.path().join("short.adf");
+    fs::write(&wrong_size, vec![0u8; 1000]).unwrap();
+    let no_boot = dir.path().join("zeros.adf");
+    fs::write(&no_boot, vec![0u8; 901_120]).unwrap();
+    let not_adf = dir.path().join("game.hdf");
+    fs::write(&not_adf, floppy()).unwrap();
+    let link = dir.path().join("link.adf");
+    let real = dir.path().join("real.adf");
+    fs::write(&real, floppy()).unwrap();
+    std::os::unix::fs::symlink(&real, &link).unwrap();
+    for path in [&wrong_size, &no_boot, &not_adf, &link] {
+        assert!(local_adf_media(path).is_err(), "{path:?}");
+    }
+    assert!(local_adf_media(&real).is_ok());
+}
+
+#[test]
+fn the_local_route_keeps_kickstart_and_machine_refusals() {
+    let no_rom = lab("amiga_model = A500", false);
+    let (inputs, action) = local_play(&no_rom);
+    assert!(inputs.requests.is_empty());
+    assert_eq!(inputs.profiles[0].firmware, FirmwareReadiness::Missing);
+    assert!(matches!(action, GamerPlayAction::BlockedTyped(_)));
+
+    let cd32 = lab("amiga_model = CD32", true);
+    let (inputs, action) = local_play(&cd32);
+    assert!(inputs.requests.is_empty());
+    assert!(!inputs.profiles[0].eligible);
+    assert!(matches!(action, GamerPlayAction::BlockedTyped(_)));
+
+    // A Kickstart that disappears after planning is refused at the click.
+    let lab = lab("amiga_model = A500", true);
+    let request = local_request(&lab);
+    fs::remove_file(lab.adf.parent().unwrap().join("kick13.rom")).unwrap();
+    assert!(preflight_local(&request, &lab).is_err());
+}
+
+#[test]
+fn catalogue_evidence_against_a_standalone_game_blocks_the_local_route() {
+    use archivefs_core::dat::amiga_adf_identity::AmigaAdfIdentityRefusal as R;
+    for against in [
+        R::Conflicting(vec!["a".into(), "b".into()]),
+        R::NotSingleRom(2),
+        R::DiskNumbered("Game".into()),
+        R::NumberedSiblings("Game (Disk 2)".into()),
+        R::NotStandaloneGame("an add-on".into()),
+    ] {
+        assert!(against.is_evidence_against_standalone(), "{against:?}");
+    }
+    for open in [
+        R::NotInLibrary,
+        R::NoCurrentMatch,
+        R::CatalogueStale,
+        R::InventoryMissing,
+        R::CompletenessUnknown,
+        R::FileChanged,
+    ] {
+        assert!(!open.is_evidence_against_standalone(), "{open:?}");
     }
 }
