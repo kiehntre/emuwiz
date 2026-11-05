@@ -335,7 +335,8 @@ pub use es_de_export::{
     es_de_system_for_platform,
 };
 pub use evidence_bridge::{
-    canonical_identity_from_game_report, launch_content_ref_for_unmounted,
+    ZIPPED_CARTRIDGE_PROVENANCE, canonical_identity_from_game_report,
+    launch_content_ref_for_unmounted, launch_content_ref_for_zipped_cartridge,
     launch_content_ref_from_archive_record,
 };
 pub use evidence_freshness::{

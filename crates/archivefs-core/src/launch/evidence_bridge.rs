@@ -673,6 +673,36 @@ pub fn launch_content_ref_for_unmounted(
     }
 }
 
+/// The launch content for a ZIP whose identity report proves exactly one
+/// verified cartridge ROM member. The plan treats it as a direct file so
+/// readiness can be Ready, but the ZIP is never handed to an emulator:
+/// RetroArch launch extracts the member to a private temporary file after
+/// re-verifying identity (see `stage_zip_cartridge_for_launch`). `None` for
+/// anything else, which keeps the ordinary mount-required route.
+pub fn launch_content_ref_for_zipped_cartridge(
+    report: &GameIdentityReport,
+) -> Option<LaunchContentRef> {
+    use crate::game_identity::IdentityImageFormat;
+    if report.format != IdentityImageFormat::ZipContainingCartridgeRom
+        || !report.complete
+        || report
+            .verified_value(IdentityKind::LooseRomSha256)
+            .is_none()
+    {
+        return None;
+    }
+    Some(LaunchContentRef {
+        kind: Some(LaunchContentKind::Cartridge),
+        container: Some(LaunchContainerKind::PlainFile),
+        resolved_path: Some(report.archive_path.clone()),
+        requires_mount: false,
+        provenance: ZIPPED_CARTRIDGE_PROVENANCE.to_string(),
+    })
+}
+
+/// Provenance text marking content that must be extracted before launch.
+pub const ZIPPED_CARTRIDGE_PROVENANCE: &str = "zipped cartridge: its single verified ROM member is extracted to a private temporary file when you press Play";
+
 pub fn launch_content_ref_from_archive_record(
     record: &ArchiveRecord,
     resolved_member_path: Option<&Path>,

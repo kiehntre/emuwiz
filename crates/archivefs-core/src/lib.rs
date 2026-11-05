@@ -214,6 +214,7 @@ pub use archive_member_resolver::{
 
 pub mod game_identity;
 pub mod scummvm_detection;
+pub mod zip_cartridge_stage;
 
 mod library_view_history;
 pub use library_view_history::{

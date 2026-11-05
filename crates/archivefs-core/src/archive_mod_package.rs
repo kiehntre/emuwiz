@@ -831,7 +831,12 @@ fn has_conflicting_verified_identity(identity: &GameIdentityReport) -> bool {
 fn verified_game_requirement(
     identity: &GameIdentityReport,
 ) -> Option<crate::mod_package::ModIdentityRequirement> {
-    if !identity.complete || has_conflicting_verified_identity(identity) {
+    // A zipped cartridge's hash identifies a ZIP member, not an installable
+    // game root, so it can never anchor a package application.
+    if !identity.complete
+        || identity.format == crate::game_identity::IdentityImageFormat::ZipContainingCartridgeRom
+        || has_conflicting_verified_identity(identity)
+    {
         return None;
     }
     [
@@ -1294,5 +1299,45 @@ mod tests {
         assert!(
             matches!(result, Err(error) if error.kind == crate::patch_manager::SharedApplyFailureKind::SourceChanged)
         );
+    }
+}
+
+#[cfg(test)]
+mod zipped_cartridge_guard_tests {
+    use super::*;
+    use crate::game_identity::{
+        GameIdentityReport, IdentityConfidence, IdentityEvidence, IdentityImageFormat,
+        IdentityPlatform, IdentityProvenance, IdentityStatus,
+    };
+
+    #[test]
+    fn zipped_cartridge_identity_never_anchors_a_package() {
+        let mut report = GameIdentityReport {
+            archive_path: "/lib/g.zip".into(),
+            platform: IdentityPlatform::Snes,
+            format: IdentityImageFormat::LooseCartridgeRom,
+            evidence: vec![IdentityEvidence {
+                kind: IdentityKind::LooseRomSha256,
+                status: IdentityStatus::Verified,
+                value: Some("a".repeat(64)),
+                confidence: IdentityConfidence::ExactBytes,
+                provenance: IdentityProvenance {
+                    archive_path: "/lib/g.zip".into(),
+                    member_path: None,
+                    member_index: None,
+                    method: "t".into(),
+                },
+                diagnostic: String::new(),
+            }],
+            warnings: vec![],
+            bytes_read: 0,
+            archive_members_inspected: 0,
+            metadata_paths_inspected: 0,
+            nested_container_depth: 0,
+            complete: true,
+        };
+        assert!(has_one_verified_identity(&report));
+        report.format = IdentityImageFormat::ZipContainingCartridgeRom;
+        assert!(!has_one_verified_identity(&report));
     }
 }
