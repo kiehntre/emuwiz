@@ -27,6 +27,8 @@ use std::{
 
 /// Files younger than this may belong to a restore being prepared.
 pub(in super::super) const MIN_AGE_SECONDS: u64 = 60 * 60;
+/// Larger files are never hashed, so never retired (cards are 8 MiB).
+const MAX_HASH_BYTES: u64 = 64 * 1024 * 1024;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(in super::super) enum FileKind {
@@ -150,6 +152,19 @@ pub(in super::super) fn assess_at(
         report.problems.push(problem.clone());
     }
     for (dir, in_backup_dir) in [(&dirs.psu_dir, false), (&dirs.backup_dir, true)] {
+        // The folder itself must be EmuWiz's real directory, never a symlink
+        // into somewhere else (a user's PSU collection, a memcards folder).
+        let dir_ok = match fs::symlink_metadata(dir) {
+            Ok(metadata) => metadata.is_dir() && !metadata.file_type().is_symlink(),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
+            Err(_) => false,
+        };
+        if !dir_ok {
+            report.problems.push(format!(
+                "{} is not a real folder (for example a link elsewhere), so nothing in it can be removed.",
+                dir.display()
+            ));
+        }
         let entries = match fs::read_dir(dir) {
             Ok(entries) => entries,
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
@@ -183,8 +198,14 @@ pub(in super::super) fn assess_at(
                 let Ok(metadata) = &metadata else {
                     return Status::Uncertain("It could not be inspected.".into());
                 };
+                if !dir_ok {
+                    return Status::Uncertain("Its folder is not EmuWiz's real folder.".into());
+                }
                 if !metadata.is_file() {
                     return Status::Uncertain("It is not a regular file.".into());
+                }
+                if metadata.len() > MAX_HASH_BYTES {
+                    return Status::Uncertain("It is too large for EmuWiz to verify.".into());
                 }
                 if kind == FileKind::Other {
                     return Status::Uncertain(
@@ -267,6 +288,25 @@ pub(in super::super) fn retire_at(
                     && file.identity.is_some()
                     && file.identity == wanted.identity =>
             {
+                // Re-check the folder and the path's identity right before
+                // unlinking, so a swapped name or folder is kept.
+                let folder_ok = file.path.parent().is_some_and(|parent| {
+                    fs::symlink_metadata(parent)
+                        .is_ok_and(|m| m.is_dir() && !m.file_type().is_symlink())
+                });
+                let same = fs::symlink_metadata(&file.path).is_ok_and(|m| {
+                    m.is_file()
+                        && file
+                            .identity
+                            .as_ref()
+                            .is_some_and(|(dev, ino, _)| m.dev() == *dev && m.ino() == *ino)
+                });
+                if !(folder_ok && same) {
+                    result
+                        .kept
+                        .push((file.path.clone(), "It changed just before removal.".into()));
+                    continue;
+                }
                 match fs::remove_file(&file.path) {
                     Ok(()) => {
                         result.freed_bytes += file.size_bytes;

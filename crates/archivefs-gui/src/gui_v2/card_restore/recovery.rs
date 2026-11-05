@@ -80,7 +80,12 @@ impl RecordRow {
             RecordKind::Unreadable => true,
             // Recoverable by Core recovery; never waived by a review.
             RecordKind::Unfinished => true,
-            RecordKind::NeedsReview => self.review.is_none() && concerns_card(&self.path, card),
+            // A review lifts the block only while its evidence still holds,
+            // re-checked every time (a forged sidecar proves nothing).
+            RecordKind::NeedsReview => {
+                (self.review.is_none() || !review_evidence_holds(&self.path))
+                    && concerns_card(&self.path, card)
+            }
             RecordKind::UndoAvailable | RecordKind::Finished => false,
         }
     }
@@ -264,10 +269,11 @@ fn readable_evidence(journal: &Ps2RestoreJournal) -> (Vec<String>, Result<String
         Some(_) => "changed since (for example by playing)",
     };
     facts.push(format!("The card is now {card_state}."));
-    let backup_ok = journal
-        .backup_sha256
-        .as_deref()
-        .is_some_and(|expected| file_sha(&journal.backup_path).as_deref() == Some(expected));
+    // Core writes the backup as the pre-restore card; both must agree.
+    let backup_ok = journal.backup_sha256.as_deref().is_some_and(|expected| {
+        expected == journal.original_sha256
+            && file_sha(&journal.backup_path).as_deref() == Some(expected)
+    });
     facts.push(format!(
         "Backup of the card from before the restore: {} ({})",
         journal.backup_path.display(),
@@ -358,6 +364,14 @@ pub(in super::super) fn mark_reviewed(
         let _ = fs::File::open(parent).and_then(|dir| dir.sync_all());
     }
     Ok(())
+}
+
+/// Whether a readable record's pre-restore card content still provably
+/// exists (the condition a review was allowed under).
+fn review_evidence_holds(journal_path: &Path) -> bool {
+    load_ps2_restore_journal(journal_path).is_ok_and(|journal| {
+        !journal.phase.needs_recovery() && readable_evidence(&journal).1.is_ok()
+    })
 }
 
 /// Whether a journal concerns the physical card at `card`. Anything that

@@ -322,3 +322,97 @@ fn unreadable_records_make_every_file_uncertain() {
     assert!(result.removed.is_empty());
     assert!(orphan.exists());
 }
+
+#[test]
+fn undo_passes_the_same_records_gate_as_apply() {
+    let (world, _, done, _) = restored();
+    let restored_card = world.card_bytes();
+    // Another restore of the card was interrupted (copy of the record).
+    let other = world
+        .options
+        .journal_dir
+        .join("ps2-psu-restore-zz-interrupted.json");
+    fs::copy(&done.journal_path, &other).unwrap();
+    rewrite_journal(&other, |j| {
+        j.phase = Ps2RestorePhase::Staged;
+        j.operation_id = "zz-interrupted".into();
+    });
+    assert!(undo_restore(&done.journal_path, &CLOSED, 5).is_err());
+    assert_eq!(world.card_bytes(), restored_card);
+    fs::remove_file(&other).unwrap();
+    // An unreadable record blocks Undo too.
+    let garbage = garbage_journal(&world);
+    assert!(undo_restore(&done.journal_path, &CLOSED, 6).is_err());
+    assert_eq!(world.card_bytes(), restored_card);
+    fs::remove_file(&garbage).unwrap();
+    undo_restore(&done.journal_path, &CLOSED, 7).unwrap();
+}
+
+#[test]
+fn a_review_lifts_the_block_only_while_its_evidence_still_holds() {
+    let (world, _, done, _) = restored();
+    park(&done.journal_path);
+    let preview = recovery::review_preview(&done.journal_path).unwrap();
+    recovery::mark_reviewed(&preview, 7).unwrap();
+    assert!(!row(&world, &done.journal_path).blocks(&world.card));
+    // The backup disappears and the card changes: the block returns.
+    fs::remove_file(&done.result.backup_path).unwrap();
+    let mut card = world.card_bytes();
+    card[ICON_DATA.start] = 0x21;
+    fs::write(&world.card, &card).unwrap();
+    assert!(row(&world, &done.journal_path).blocks(&world.card));
+}
+
+#[test]
+fn a_forged_review_of_a_readable_record_proves_nothing() {
+    let (world, _, done, _) = restored();
+    park(&done.journal_path);
+    fs::remove_file(&done.result.backup_path).unwrap();
+    let mut card = world.card_bytes();
+    card[ICON_DATA.start] = 0x22;
+    fs::write(&world.card, &card).unwrap();
+    let forged = recovery::Review {
+        version: 1,
+        journal_sha256: super::super::sha256_hex(&fs::read(&done.journal_path).unwrap()),
+        reviewed_unix_seconds: 7,
+        evidence: "forged".into(),
+    };
+    let mut sidecar = done.journal_path.clone().into_os_string();
+    sidecar.push(".reviewed");
+    fs::write(&sidecar, serde_json::to_vec(&forged).unwrap()).unwrap();
+    let row = row(&world, &done.journal_path);
+    assert!(row.review.is_some(), "sidecar is well-formed");
+    assert!(row.blocks(&world.card), "but its evidence does not hold");
+}
+
+#[test]
+fn a_symlinked_storage_folder_is_never_cleaned() {
+    let world = World::new();
+    let outside = world.dirs.psu_dir.parent().unwrap().join("users-own-psus");
+    fs::create_dir_all(&outside).unwrap();
+    let precious = outside.join("my-save.psu");
+    fs::write(&precious, b"user's own PSU").unwrap();
+    fs::create_dir_all(world.dirs.psu_dir.parent().unwrap()).unwrap();
+    std::os::unix::fs::symlink(&outside, &world.dirs.psu_dir).unwrap();
+    let report = storage::assess_at(&world.dirs, &world.options.journal_dir, &[], LATER);
+    assert!(!report.problems.is_empty());
+    assert!(report.retirable().next().is_none());
+    // Even a forged confirmation removes nothing.
+    let mut forged = report
+        .files
+        .iter()
+        .find(|f| f.path.ends_with("my-save.psu"))
+        .unwrap()
+        .clone();
+    forged.status = Status::Unreferenced;
+    forged.identity = Some((0, 0, String::new()));
+    let result = storage::retire_at(
+        &[forged],
+        &world.dirs,
+        &world.options.journal_dir,
+        &[],
+        LATER,
+    );
+    assert!(result.removed.is_empty());
+    assert_eq!(fs::read(&precious).unwrap(), b"user's own PSU");
+}

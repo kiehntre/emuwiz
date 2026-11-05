@@ -460,29 +460,40 @@ pub(super) fn apply_restore(
     observer: &dyn QuiescenceProvider,
     options: &Ps2RestoreGuardOptions,
 ) -> Result<Ps2GuardedRestore, String> {
-    let records = recovery::load_records(&options.journal_dir);
-    if !records.complete() {
-        return Err("EmuWiz could not read every earlier restore record, so it will not change the card. Refresh the restore records below. Nothing was changed.".into());
-    }
-    // Unfinished and unreviewed unreadable records block every card; a
-    // parked record blocks its own physical card until a person reviews it.
-    if records
-        .rows
-        .iter()
-        .any(|row| row.blocks(&plan.source_card_path))
-    {
-        return Err("An earlier memory card restore was interrupted or needs review. Use Restore records below (Check interrupted restores, or Review). Nothing was changed.".into());
-    }
+    records_gate(&options.journal_dir, &plan.source_card_path)?;
     apply_ps2_psu_restore_guarded(plan, observer, options)
         .map_err(|error| psu_restore_error_message(&error))
 }
 
 /// Worker: Core's guarded Undo, bound to the restore journal.
+/// Every card write from Blue (Apply and Undo) passes this first: the record
+/// list must be complete; interrupted and unreadable records block every
+/// card; a parked record blocks its own card unless its review still holds.
+fn records_gate(journal_dir: &Path, card: &Path) -> Result<(), String> {
+    let records = recovery::load_records(journal_dir);
+    if !records.complete() {
+        return Err("EmuWiz could not read every earlier restore record, so it will not change the card. Refresh the restore records below. Nothing was changed.".into());
+    }
+    if records.rows.iter().any(|row| row.blocks(card)) {
+        return Err("An earlier memory card restore was interrupted or needs review. Use Restore records below (Check interrupted restores, or Review). Nothing was changed.".into());
+    }
+    Ok(())
+}
+
 pub(super) fn undo_restore(
     journal: &Path,
     observer: &dyn QuiescenceProvider,
     now_unix_seconds: u64,
 ) -> Result<(), String> {
+    // Undo writes the card too, so it passes the same records gate.
+    let card =
+        archivefs_core::memory_card_inventory::restore_guard::load_ps2_restore_journal(journal)
+            .map_err(|error| psu_restore_error_message(&error))?
+            .card_path;
+    let journal_dir = journal
+        .parent()
+        .ok_or("The restore record has no folder. Nothing was changed.")?;
+    records_gate(journal_dir, &card)?;
     undo_ps2_psu_restore_guarded(journal, observer, now_unix_seconds)
         .map_err(|error| psu_restore_error_message(&error))
 }
