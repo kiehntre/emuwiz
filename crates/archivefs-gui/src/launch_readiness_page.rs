@@ -63,6 +63,7 @@ mod retroarch_setup;
 mod retroarch_stop;
 #[cfg(test)]
 pub(crate) use retroarch_stop::retroarch_test_request;
+pub(crate) mod azahar;
 pub(crate) mod launch_choice;
 mod rmg;
 mod sameboy;
@@ -193,6 +194,7 @@ pub(crate) enum LaunchReadinessInput {
         cemu: Option<cemu::Context>,
         flycast: Option<flycast::Context>,
         xroar: Option<xroar::Context>,
+        azahar: Option<azahar::Context>,
         vice: Option<vice::Context>,
         amiga_whdload: Option<AmigaWHDLoadLaunchContext>,
         #[cfg(target_os = "linux")]
@@ -678,6 +680,7 @@ pub(crate) fn gamer_play_action(input: &LaunchReadinessInput) -> GamerPlayAction
         cemu,
         flycast,
         xroar,
+        azahar,
         vice,
         amiga_whdload,
         #[cfg(target_os = "linux")]
@@ -775,6 +778,14 @@ pub(crate) fn gamer_play_action(input: &LaunchReadinessInput) -> GamerPlayAction
             {
                 return Some(TypedLaunchRequest::Standalone(
                     StandaloneLaunchRequest::XRoar(request),
+                ));
+            }
+            if let Some(request) = azahar
+                .as_ref()
+                .and_then(|context| context.request(plan, candidate))
+            {
+                return Some(TypedLaunchRequest::Standalone(
+                    StandaloneLaunchRequest::Azahar(request),
                 ));
             }
             if let Some(request) = cemu
@@ -1044,6 +1055,7 @@ pub(crate) enum StandaloneProcess {
     Cemu(cemu_stop::Session),
     Flycast(archivefs_core::launch::LaunchedFlycastProcess),
     XRoar(archivefs_core::launch::process_spawn::WatchedProcess),
+    Azahar(archivefs_core::launch::LaunchedAzaharProcess),
     Vice(archivefs_core::launch::process_spawn::WatchedProcess),
     ViceTrainers(
         Box<
@@ -1309,6 +1321,7 @@ impl StandaloneLaunchState {
                     StandaloneProcess::Cemu(p) => p.poll().is_some(),
                     StandaloneProcess::Flycast(p) => p.poll().is_some(),
                     StandaloneProcess::XRoar(p) => p.poll().is_some(),
+                    StandaloneProcess::Azahar(p) => p.poll().is_some(),
                     StandaloneProcess::Vice(p) => p.poll().is_some(),
                     StandaloneProcess::ViceTrainers(session) => {
                         let _ = session.poll();
@@ -1523,6 +1536,7 @@ pub(crate) enum StandaloneLaunchRequest {
     Cemu(cemu::Request),
     Flycast(flycast::Request),
     XRoar(xroar::Request),
+    Azahar(azahar::Request),
     Vice(vice::Request),
     #[cfg(target_os = "linux")]
     ShadPs4(crate::emulator_setup::shadps4::Request),
@@ -1598,6 +1612,7 @@ impl StandaloneLaunchRequest {
             Self::Cemu(_) => "Cemu",
             Self::Flycast(_) => "Flycast",
             Self::XRoar(_) => "XRoar",
+            Self::Azahar(_) => "Azahar",
             Self::Vice(_) => "VICE",
             Self::ScummVm(_) => "ScummVM",
             Self::OpenMsx(..) => "openMSX",
@@ -1627,6 +1642,7 @@ impl StandaloneLaunchRequest {
             Self::Cemu(r) => r.key(),
             Self::Flycast(r) => r.key(),
             Self::XRoar(r) => r.key(),
+            Self::Azahar(r) => r.key(),
             Self::Vice(r) => r.key(),
             Self::ScummVm(r) => (r.selected_game_folder.clone(), "scummvm".into()),
             Self::OpenMsx(r, _) => (r.selected_content_path.clone(), "openmsx".into()),
@@ -1641,6 +1657,7 @@ impl StandaloneLaunchRequest {
                 .map(StandaloneProcess::Cemu),
             Self::Flycast(r) => r.execute().map(StandaloneProcess::Flycast),
             Self::XRoar(r) => r.execute().map(StandaloneProcess::XRoar),
+            Self::Azahar(r) => r.execute().map(StandaloneProcess::Azahar),
             Self::Vice(r) => r.execute().map(StandaloneProcess::Vice),
             #[cfg(target_os = "linux")]
             Self::ShadPs4(r) => r
@@ -3438,6 +3455,7 @@ pub(crate) fn show_launch_readiness_panel(
             cemu,
             flycast,
             xroar,
+            azahar,
             vice,
             amiga_whdload,
             #[cfg(target_os = "linux")]
@@ -3463,6 +3481,19 @@ pub(crate) fn show_launch_readiness_panel(
                         candidate.target,
                         LaunchTarget::Standalone {
                             adapter_id: "xroar",
+                            ..
+                        }
+                    ) {
+                        context.show(ui, plan, candidate, standalone_launch_state);
+                    }
+                }
+            }
+            if let Some(context) = azahar {
+                for candidate in &plan.candidates {
+                    if matches!(
+                        candidate.target,
+                        LaunchTarget::Standalone {
+                            adapter_id: "azahar",
                             ..
                         }
                     ) {
@@ -4687,6 +4718,7 @@ fn candidate_emulator_name(candidate: &LaunchCandidate) -> Option<&'static str> 
             "fuse" => Some("Fuse"),
             "tsugaru" => Some("Tsugaru"),
             "xroar" => Some("XRoar"),
+            "azahar" => Some("Azahar"),
             "vice" => Some("VICE"),
             _ => None,
         },
@@ -5449,6 +5481,11 @@ fn show_standalone_launch_action(
                 {
                     ui.label(exit_line("openMSX", report));
                 }
+                if let StandaloneProcess::Azahar(process) = process
+                    && let Some(report) = process.poll()
+                {
+                    ui.label(exit_line("Azahar", report));
+                }
                 if let StandaloneProcess::DosBox(process) = process
                     && let Some(report) = process.poll()
                 {
@@ -5536,6 +5573,13 @@ fn show_standalone_launch_action(
         if adapter == "amiberry_cd"
             && !state.is_active()
             && ui.button("Launch Amiberry CD again (recheck)").clicked()
+        {
+            state.start(request);
+            return;
+        }
+        if adapter == "azahar"
+            && !state.is_active()
+            && ui.button("Launch Azahar again (recheck)").clicked()
         {
             state.start(request);
             return;

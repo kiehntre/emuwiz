@@ -226,6 +226,26 @@ impl ReadinessSources<'_> {
         if let Some((identity, _)) = &vice_inputs {
             identity_status = identity.clone();
         }
+        let azahar_context = self.readiness.azahar_homebrew.context(focused);
+        // Never impose Nintendo 3DS on a file that other evidence places on
+        // another platform.
+        let azahar_inputs = azahar_context
+            .as_ref()
+            .filter(|_| {
+                selected_game_identity_report.is_none_or(|r| {
+                    matches!(
+                        r.platform,
+                        archivefs_core::game_identity::IdentityPlatform::ThreeDS
+                            | archivefs_core::game_identity::IdentityPlatform::Other
+                    )
+                }) && crate::launch_readiness_page::azahar::platform_allows(
+                    focused_record.and_then(|r| r.mount_plan.archive.identity.platform.as_deref()),
+                )
+            })
+            .and_then(|c| c.inputs(&identity_status));
+        if let Some((identity, _)) = &azahar_inputs {
+            identity_status = identity.clone();
+        }
         let xroar_context = self.readiness.xroar_cassette.context(focused);
         let xroar_inputs = xroar_context
             .as_ref()
@@ -357,6 +377,9 @@ impl ReadinessSources<'_> {
             content = selected_content;
         }
         if let Some((_, selected_content)) = xroar_inputs {
+            content = selected_content;
+        }
+        if let Some((_, selected_content)) = azahar_inputs {
             content = selected_content;
         }
 
@@ -1388,6 +1411,7 @@ impl ReadinessSources<'_> {
             cemu: cemu_context,
             flycast: flycast_context,
             xroar: xroar_context,
+            azahar: azahar_context,
             vice: vice_context,
             amiga_whdload: amiga_whdload_context,
             #[cfg(target_os = "linux")]
