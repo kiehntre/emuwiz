@@ -398,7 +398,10 @@ fn cancelling_a_running_check_saves_nothing() {
     let Stage::Failed(error) = &state.stage else {
         panic!("a cancelled check must not finish");
     };
-    assert!(error.contains("Cancelled"), "{error}");
+    // Cancel lands either before input validation ("Cancelled. No
+    // verification results saved.") or inside the audit ("the audit was
+    // cancelled"); both are real cancellations. Any other failure still fails.
+    assert!(error.to_lowercase().contains("cancelled"), "{error}");
     assert!(!state.take_saved());
     assert_eq!(dat_rows(&f), saved);
     assert!(!game_of(&f).has_current_dat_verification());
