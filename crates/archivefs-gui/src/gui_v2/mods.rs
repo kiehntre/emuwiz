@@ -40,6 +40,7 @@ pub(super) struct ModsPageState {
     tab: Tab,
     local: LocalModPackagePageState,
     patch_composition: super::patch_composition::State,
+    discovery: super::mod_discovery::State,
     cheatbase: CheatBasePageState,
     cheatbase_game_id: Option<i64>,
     history: Option<ModHistory>,
@@ -51,7 +52,7 @@ pub(super) struct ModsPageState {
 
 impl ModsPageState {
     pub(super) fn poll(&mut self) -> bool {
-        let local_changed = self.local.poll();
+        let local_changed = self.local.poll() | self.discovery.poll();
         let Some(worker) = &self.history_worker else {
             return local_changed;
         };
@@ -202,6 +203,11 @@ pub(super) fn show_mods_page(
                 match state.tab {
                     Tab::Installed => installed(ui, state.history.as_ref(), selected_game),
                     Tab::Add => {
+                        super::mod_discovery::show(
+                            ui,
+                            &mut state.discovery,
+                            discovery_identity(selected_game),
+                        );
                         add_package(ui, &mut state.local, selected_game);
                         super::patch_composition::show(
                             ui,
@@ -257,6 +263,16 @@ pub(super) fn show_mods_page(
         state.refresh_history(ui.ctx());
     }
     destination
+}
+
+/// The selected game's identity report, only while its saved evidence is
+/// currently trustworthy; otherwise ModDB claims are not compared at all.
+fn discovery_identity(
+    game: Option<&crate::gui_v2::library::Game>,
+) -> Option<(&archivefs_core::game_identity::GameIdentityReport, &str)> {
+    let game = game?;
+    selected_identity(Some(game))?;
+    Some((game.archive.identity_report.as_ref()?, game.title.as_str()))
 }
 
 fn cheatbase_seed(game: Option<&crate::gui_v2::library::Game>) -> Option<CheatBaseGameSeed> {

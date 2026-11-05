@@ -563,8 +563,11 @@ fn parse_moddb_page(
     }
     let game_claim = first_attr(&document, "[data-moddb-game]", "data-moddb-game")
         .or_else(|| first_attr(&document, "[data-game-title]", "data-game-title"))
-        .or_else(|| first_link_text(&document, "a[href*='/games/']"));
-    let author = author.or_else(|| first_link_text(&document, "a[href*='/members/']"));
+        // No link or label is ever guessed to name the game: only explicit
+        // page metadata is a claim.
+        ;
+    // Member links on a real ModDB page include site navigation and comment
+    // authors, so no link is ever guessed to be the mod's author.
     let identity_facts = identity_facts(&document);
     let result = ModSearchResult {
         provider: ModProviderId::new(MODDB_PROVIDER_ID).expect("constant provider id"),
@@ -742,14 +745,6 @@ fn first_attr(document: &Html, selector: &str, attribute: &str) -> Option<String
         .and_then(|node| node.value().attr(attribute))
         .map(str::to_string)
         .filter(|value| !value.trim().is_empty())
-}
-
-fn first_link_text(document: &Html, selector: &str) -> Option<String> {
-    let selector = Selector::parse(selector).ok()?;
-    document
-        .select(&selector)
-        .map(|node| node.text().collect::<String>().trim().to_string())
-        .find(|value| !value.is_empty() && value.len() <= MAX_PROVIDER_TEXT_BYTES)
 }
 
 fn attr_value(value: scraper::ElementRef<'_>, attribute: &str) -> Option<String> {
@@ -1216,7 +1211,7 @@ mod tests {
             .inspect_url("https://www.moddb.com/mods/darkwatch/addons/sles-53564")
             .unwrap();
         let file = &page.releases[0].files[0];
-        assert_eq!(page.result.game_claim.as_deref(), Some("Darkwatch"));
+        assert_eq!(page.result.game_claim, None); // a bare /games/ link is not a claim
         assert_eq!(file.reported_filename.as_deref(), Some("SLES-53564.rar"));
         assert_eq!(file.size_bytes, Some(3_353_127_342));
         assert_eq!(
@@ -1225,6 +1220,80 @@ mod tests {
                 .map(|hash| hash.value.as_str()),
             Some("a2789929816064d679306c62d53a3823")
         );
+        assert!(file.download.acquisition_url.is_none());
+    }
+
+    #[test]
+    fn navigation_links_are_never_taken_as_author_or_game() {
+        let body = r#"<html><head><title>Some Mod</title></head><body>
+          <a href="/members/register">register</a><a href="/members/login">sign in</a>
+          <a href="/games/top">popular</a><a href="/games/add">add game</a>
+          <a href="https://www.moddb.com/games/black-mesa/images/x">shot</a>
+          <a href="/games/half-life-2">Half-Life 2</a>
+          <a href="/members/some-commenter" class="author">Commenter</a></body></html>"#;
+        let page = ModDbProvider::with_transport(FakeTransport::page(body))
+            .inspect_url("https://www.moddb.com/mods/some-mod")
+            .unwrap();
+        assert_eq!(page.result.author_or_team, None);
+        assert_eq!(page.result.game_claim, None);
+        assert!(page.result.game_evidence.title_claim.is_none());
+        let nav_only = r#"<html><head><title>X</title></head><body><a href="/games/top">popular</a></body></html>"#;
+        let page = ModDbProvider::with_transport(FakeTransport::page(nav_only))
+            .inspect_url("https://www.moddb.com/mods/x")
+            .unwrap();
+        assert_eq!(page.result.game_claim, None);
+    }
+
+    #[test]
+    fn real_page_fixtures_keep_title_and_description_but_establish_no_author_or_game() {
+        let cases = [
+            (
+                include_str!("../tests/fixtures/moddb/blackmesa.html"),
+                "https://www.moddb.com/mods/black-mesa",
+                "Black Mesa mod for Half-Life 2",
+            ),
+            (
+                include_str!("../tests/fixtures/moddb/darkmod.html"),
+                "https://www.moddb.com/mods/the-dark-mod",
+                "The Dark Mod (Standalone) for Doom III",
+            ),
+            (
+                include_str!("../tests/fixtures/moddb/anomaly.html"),
+                "https://www.moddb.com/mods/stalker-anomaly",
+                "S.T.A.L.K.E.R. Anomaly mod for S.T.A.L.K.E.R.: Call of Pripyat",
+            ),
+            (
+                include_str!("../tests/fixtures/moddb/addon.html"),
+                "https://www.moddb.com/mods/stalker-anomaly/addons/dynamic-emission-cover",
+                "Dynamic Emission Cover addon - S.T.A.L.K.E.R. Anomaly mod for S.T.A.L.K.E.R.: Call of Pripyat",
+            ),
+        ];
+        for (body, url, title) in cases {
+            let page = ModDbProvider::with_transport(FakeTransport::page(body))
+                .inspect_url(url)
+                .unwrap();
+            assert_eq!(page.result.title, title, "{url}");
+            assert!(page.result.summary.is_some(), "{url}");
+            assert_eq!(page.result.author_or_team, None, "{url}");
+            assert_eq!(page.result.game_claim, None, "{url}");
+            assert!(page.result.game_evidence.title_claim.is_none(), "{url}");
+            assert!(page.result.game_evidence.identity_facts.is_empty(), "{url}");
+        }
+    }
+
+    #[test]
+    fn real_addon_fixture_still_reports_file_facts_without_a_download_route() {
+        let page = ModDbProvider::with_transport(FakeTransport::page(include_str!(
+            "../tests/fixtures/moddb/addon.html"
+        )))
+        .inspect_url("https://www.moddb.com/mods/stalker-anomaly/addons/dynamic-emission-cover")
+        .unwrap();
+        let file = &page.releases[0].files[0];
+        assert_eq!(
+            file.reported_filename.as_deref(),
+            Some("Dynamic_Emission_Cover-v1.2.7z")
+        );
+        assert_eq!(file.size_bytes, Some(7_336));
         assert!(file.download.acquisition_url.is_none());
     }
 }
