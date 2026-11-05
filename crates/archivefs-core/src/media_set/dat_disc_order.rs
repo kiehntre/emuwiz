@@ -231,7 +231,9 @@ pub fn dat_disc_record(
 
 /// Whether a DAT result rests on the file's content (a hash) and so may
 /// contest a claimed entry. Filename-only, no-match and no-evidence results
-/// never do: local names can neither help nor split a set.
+/// never do: local names can neither help nor split a set. (That is about
+/// disc-order grouping only; the Amiga local-media route separately treats a
+/// persisted filename-only result as evidence and refuses.)
 pub fn content_evidence(
     state: &crate::dat::library_identity_summary::DatVerificationState,
 ) -> bool {

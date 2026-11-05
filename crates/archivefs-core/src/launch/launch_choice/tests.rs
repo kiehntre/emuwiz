@@ -429,6 +429,20 @@ fn option_ids_are_stable_and_distinguish_every_launch_identity_fact() {
 }
 
 #[test]
+fn local_amiga_media_keys_are_never_saved_as_a_game_default() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join(LAUNCH_PREFERENCES_FILE);
+    let key = format!("{}{}", crate::launch::LOCAL_ADF_KEY_PREFIX, "ab".repeat(32));
+    let error = set_launch_preference_at(
+        &path,
+        &LaunchPreference::game("Amiga", &key, "standalone/fsuae/x"),
+    )
+    .unwrap_err();
+    assert!(error.contains("launch target only"), "{error}");
+    assert!(!path.exists());
+}
+
+#[test]
 fn launch_only_homebrew_keys_are_never_saved_as_a_game_default() {
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("config").join(LAUNCH_PREFERENCES_FILE);

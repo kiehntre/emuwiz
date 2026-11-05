@@ -427,11 +427,10 @@ pub fn set_launch_preference_at(path: &Path, preference: &LaunchPreference) -> R
     preference.validate()?;
     // A launch-only file-hash identity is not a stable game identity and is
     // never persisted as a per-game default (system defaults carry no key).
-    if preference
-        .game_key
-        .as_deref()
-        .is_some_and(|key| key.starts_with(crate::launch::AZAHAR_HOMEBREW_KEY_PREFIX))
-    {
+    if preference.game_key.as_deref().is_some_and(|key| {
+        key.starts_with(crate::launch::AZAHAR_HOMEBREW_KEY_PREFIX)
+            || key.starts_with(crate::launch::LOCAL_ADF_KEY_PREFIX)
+    }) {
         return Err(
             "This file is a launch target only, so a per-game emulator default cannot be saved for it. Use the system default or choose once."
                 .into(),
