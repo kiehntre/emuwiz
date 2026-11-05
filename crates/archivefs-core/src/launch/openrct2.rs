@@ -17,6 +17,15 @@
 //! [`preflight_openrct2_launch`] rediscovers everything, re-runs the planner
 //! and refuses unless it still says `Ready` and nothing drifted.
 //!
+//! Nothing is executed until the user acts. Discovery is passive (it only
+//! looks at file metadata). Reading a version needs to *run* the executable
+//! with `--version`; that happens only in [`check_openrct2`], for the one
+//! candidate the user explicitly chose, after its path was shown. The
+//! two-second and 16 KiB limits keep a misbehaving program from hanging the
+//! check; they are not a sandbox and do not make running an untrusted file
+//! safe. Launch preflight never re-runs `--version`: it binds the checked
+//! file's identity instead.
+//!
 //! Game identity here is *user-declared*: the folder is the one the person
 //! chose, and its only content evidence is `Data/g1.dat`, the file OpenRCT2
 //! itself uses to recognise an RCT2 folder. No hash or catalogue match is
@@ -92,8 +101,8 @@ fn is_executable_file(path: &Path) -> Option<fs::Metadata> {
         .then_some(metadata)
 }
 
-/// Bounded `openrct2 --version`. Only run for an executable the user is
-/// shown and may start; killed after two seconds.
+/// Bounded `openrct2 --version`. Executes the file: call only from
+/// [`check_openrct2`], after an explicit user action.
 pub fn probe_openrct2_version(path: &Path) -> Option<String> {
     let mut child = Command::new(path)
         .arg("--version")
@@ -118,23 +127,68 @@ pub fn probe_openrct2_version(path: &Path) -> Option<String> {
     parse_version_output(&String::from_utf8(bytes).ok()?)
 }
 
-/// Every distinct installed OpenRCT2 executable, in search order. Read-only.
-pub fn discover_openrct2(
-    search_dirs: &[PathBuf],
-    probe: &dyn Fn(&Path) -> Option<String>,
-) -> Vec<OpenRct2Install> {
-    let mut found = Vec::new();
+/// Passive discovery: candidate paths only, read-only metadata, nothing is
+/// executed. Paths are resolved through directory symlinks and de-duplicated;
+/// an executable that is itself a symlink is skipped. `version` is `None`
+/// until [`check_openrct2`] is explicitly run.
+pub fn discover_openrct2(search_dirs: &[PathBuf]) -> Vec<OpenRct2Install> {
+    let mut found: Vec<OpenRct2Install> = Vec::new();
     for dir in search_dirs.iter().filter(|d| d.is_absolute()).take(64) {
-        let path = dir.join(EXECUTABLE_NAME);
+        let Ok(resolved_dir) = fs::canonicalize(dir) else {
+            continue;
+        };
+        let path = resolved_dir.join(EXECUTABLE_NAME);
+        if found.iter().any(|f| f.executable == path) {
+            continue;
+        }
         if let Some(metadata) = is_executable_file(&path) {
             found.push(OpenRct2Install {
                 executable_identity: CapturedFileIdentity::capture(&metadata),
-                version: probe(&path),
+                version: None,
                 executable: path,
             });
         }
     }
     found
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum OpenRct2CheckError {
+    /// The candidate is gone, a symlink, not executable, or not the file the
+    /// user was shown. Nothing was executed.
+    Refused(String),
+    /// It was executed but no usable version came back.
+    NoVersion,
+}
+
+/// The explicit "Check OpenRCT2" action: revalidates the one selected
+/// candidate against fresh, still-passive discovery immediately before
+/// running `<executable> --version`. This is the only place a discovered
+/// program is executed.
+pub fn check_openrct2(
+    candidate: &OpenRct2Install,
+    search_dirs: &[PathBuf],
+    probe: &dyn Fn(&Path) -> Option<String>,
+) -> Result<OpenRct2Install, OpenRct2CheckError> {
+    let matches: Vec<_> = discover_openrct2(search_dirs)
+        .into_iter()
+        .filter(|f| f.executable == candidate.executable)
+        .collect();
+    let [fresh] = matches.as_slice() else {
+        return Err(OpenRct2CheckError::Refused(
+            "the selected OpenRCT2 is no longer found at that exact path".into(),
+        ));
+    };
+    if fresh.executable_identity != candidate.executable_identity {
+        return Err(OpenRct2CheckError::Refused(
+            "the selected OpenRCT2 file changed since it was listed".into(),
+        ));
+    }
+    let version = probe(&fresh.executable).ok_or(OpenRct2CheckError::NoVersion)?;
+    Ok(OpenRct2Install {
+        version: Some(version),
+        ..fresh.clone()
+    })
 }
 
 fn version_supported(version: &str) -> bool {
@@ -270,13 +324,23 @@ pub enum OpenRct2LaunchError {
 pub fn preflight_openrct2_launch(
     request: &OpenRct2LaunchRequest,
     search_dirs: &[PathBuf],
-    probe: &dyn Fn(&Path) -> Option<String>,
 ) -> Result<PreparedProcessCommand, OpenRct2LaunchError> {
     use OpenRct2LaunchError::*;
     let fresh_data = inspect_rct2_data(&request.data.root);
-    let fresh_install = discover_openrct2(search_dirs, probe)
+    // Passive only: the version comes from the explicit check and stays valid
+    // exactly while the checked file's identity is unchanged.
+    let matches: Vec<_> = discover_openrct2(search_dirs)
         .into_iter()
-        .find(|i| i.executable == request.install.executable);
+        .filter(|i| i.executable == request.install.executable)
+        .map(|i| OpenRct2Install {
+            version: request.install.version.clone(),
+            ..i
+        })
+        .collect();
+    let fresh_install = match matches.as_slice() {
+        [one] => Some(one.clone()),
+        _ => None,
+    };
     let projection = plan_openrct2(fresh_install.as_ref(), Some(&fresh_data));
     if projection.readiness != AlternativeLaunchReadiness::Ready {
         return Err(NotReady(projection.readiness, projection.reason));
@@ -284,9 +348,6 @@ pub fn preflight_openrct2_launch(
     let (install, data) = (fresh_install.expect("ready"), fresh_data);
     if install.executable_identity != request.install.executable_identity {
         return Err(Changed("the OpenRCT2 executable changed".into()));
-    }
-    if install.version != request.install.version {
-        return Err(Changed("the OpenRCT2 version changed".into()));
     }
     if data.root_identity != request.data.root_identity
         || data.g1_identity != request.data.g1_identity
@@ -305,9 +366,8 @@ pub fn preflight_openrct2_launch(
 pub fn preflight_and_launch_openrct2(
     request: &OpenRct2LaunchRequest,
     search_dirs: &[PathBuf],
-    probe: &dyn Fn(&Path) -> Option<String>,
 ) -> Result<WatchedProcess, OpenRct2LaunchError> {
-    let command = preflight_openrct2_launch(request, search_dirs, probe)?;
+    let command = preflight_openrct2_launch(request, search_dirs)?;
     spawn_watched_process(&command).map_err(OpenRct2LaunchError::Spawn)
 }
 

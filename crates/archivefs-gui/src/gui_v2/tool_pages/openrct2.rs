@@ -6,13 +6,14 @@
 //! installs OpenRCT2, never downloads or copies game files, and never writes
 //! to the chosen RCT2 folder; the folder is chosen explicitly each session.
 
+use std::collections::BTreeMap;
 use std::path::PathBuf;
 use std::sync::mpsc::{self, Receiver, TryRecvError};
 
 use archivefs_core::alternative_launch_provider_planner::AlternativeLaunchReadiness;
 use archivefs_core::launch::{
-    OpenRct2Install, OpenRct2LaunchRequest, Rct2DataReport, discover_openrct2, inspect_rct2_data,
-    openrct2_search_dirs, plan_openrct2, probe_openrct2_version,
+    OpenRct2Install, OpenRct2LaunchRequest, Rct2DataReport, check_openrct2, discover_openrct2,
+    inspect_rct2_data, openrct2_search_dirs, plan_openrct2, probe_openrct2_version,
 };
 use eframe::egui::{self, RichText};
 
@@ -22,6 +23,7 @@ use crate::launch_readiness_page::{
     show_standalone_launch_action,
 };
 
+/// Passive discovery: file metadata only, nothing is executed.
 #[derive(Default)]
 enum Scan {
     #[default]
@@ -30,20 +32,54 @@ enum Scan {
     Ready(Vec<OpenRct2Install>),
 }
 
+/// The explicit, per-candidate version check (this is what runs the file).
+enum Check {
+    Running(Receiver<Result<OpenRct2Install, String>>),
+    Verified(OpenRct2Install),
+    Failed(String),
+}
+
 #[derive(Default)]
 pub(in crate::gui_v2) struct State {
     scan: Scan,
+    checks: BTreeMap<PathBuf, Check>,
     data: Option<Rct2DataReport>,
+    dirs: Vec<PathBuf>,
 }
 
 impl State {
-    fn start(&mut self, context: &egui::Context) {
+    fn start(&mut self, context: &egui::Context, dirs: Vec<PathBuf>) {
         let (sender, receiver) = mpsc::channel();
         self.scan = Scan::Scanning(receiver);
+        self.checks.clear();
+        self.dirs = dirs.clone();
         let context = context.clone();
         std::thread::spawn(move || {
-            let found = discover_openrct2(&openrct2_search_dirs(), &probe_openrct2_version);
-            let _ = sender.send(found);
+            let _ = sender.send(discover_openrct2(&dirs));
+            context.request_repaint();
+        });
+    }
+
+    /// Runs `--version` on exactly this candidate, off the UI thread.
+    fn begin_check(&mut self, context: &egui::Context, candidate: OpenRct2Install) {
+        let (sender, receiver) = mpsc::channel();
+        self.checks
+            .insert(candidate.executable.clone(), Check::Running(receiver));
+        let (dirs, context) = (self.dirs.clone(), context.clone());
+        std::thread::spawn(move || {
+            let result =
+                check_openrct2(&candidate, &dirs, &probe_openrct2_version).map_err(|error| {
+                    match error {
+                        archivefs_core::launch::OpenRct2CheckError::Refused(why) => {
+                            format!("Not checked: {why}. Refresh the list.")
+                        }
+                        archivefs_core::launch::OpenRct2CheckError::NoVersion => {
+                            "It was run but did not report a version, so it is not trusted."
+                                .to_string()
+                        }
+                    }
+                });
+            let _ = sender.send(result);
             context.request_repaint();
         });
     }
@@ -54,6 +90,18 @@ impl State {
                 Ok(found) => self.scan = Scan::Ready(found),
                 Err(TryRecvError::Empty) => {}
                 Err(TryRecvError::Disconnected) => self.scan = Scan::Ready(Vec::new()),
+            }
+        }
+        for check in self.checks.values_mut() {
+            if let Check::Running(receiver) = check {
+                match receiver.try_recv() {
+                    Ok(Ok(install)) => *check = Check::Verified(install),
+                    Ok(Err(why)) => *check = Check::Failed(why),
+                    Err(TryRecvError::Empty) => {}
+                    Err(TryRecvError::Disconnected) => {
+                        *check = Check::Failed("The check stopped unexpectedly.".into())
+                    }
+                }
             }
         }
     }
@@ -71,7 +119,9 @@ pub(in crate::gui_v2) fn readiness_text(readiness: AlternativeLaunchReadiness) -
         R::ProviderMissing => "OpenRCT2 was not found.",
         R::IdentityInsufficient => "Choose your RollerCoaster Tycoon 2 folder.",
         R::VersionUnsupported => "This OpenRCT2 version is too old.",
-        R::RequirementsUnknown => "The OpenRCT2 version could not be read, so it is not trusted.",
+        R::RequirementsUnknown => {
+            "Not checked: the OpenRCT2 version is not verified, so it is not trusted."
+        }
         R::OriginalAssetsMissing => {
             "The chosen folder is not a usable RollerCoaster Tycoon 2 folder."
         }
@@ -79,36 +129,56 @@ pub(in crate::gui_v2) fn readiness_text(readiness: AlternativeLaunchReadiness) -
     }
 }
 
-fn show_install(
+fn show_candidate(
     ui: &mut egui::Ui,
-    install: &OpenRct2Install,
+    candidate: &OpenRct2Install,
+    check: Option<&Check>,
     data: Option<&Rct2DataReport>,
     standalone: &mut StandaloneLaunchState,
-) {
-    let projection = plan_openrct2(Some(install), data);
-    ui.horizontal_wrapped(|ui| {
-        ui.label(RichText::new("OpenRCT2").strong());
-        ui.small(format!(
-            "{} · version {}",
-            install.executable.display(),
-            install.version.as_deref().unwrap_or("unknown")
-        ));
-    });
-    ui.label(readiness_text(projection.readiness));
-    if projection.readiness != AlternativeLaunchReadiness::Ready {
-        ui.small(&projection.reason);
-    }
-    if let (AlternativeLaunchReadiness::Ready, Some(data)) = (projection.readiness, data) {
-        show_standalone_launch_action(
-            ui,
-            standalone,
-            StandaloneLaunchRequest::OpenRct2(Request::new(OpenRct2LaunchRequest {
-                install: install.clone(),
-                data: data.clone(),
-            })),
-        );
+) -> bool {
+    let mut check_clicked = false;
+    ui.label(RichText::new("OpenRCT2 candidate").strong());
+    ui.small(format!("Resolved path: {}", candidate.executable.display()));
+    match check {
+        None | Some(Check::Failed(_)) => {
+            if let Some(Check::Failed(why)) = check {
+                ui.label(why);
+            }
+            ui.label("Not checked. EmuWiz has not run this file.");
+            ui.small(
+                "Checking the version will run this file with --version. Only check a program you \
+                 trust. EmuWiz limits the time and output, but that does not make running an \
+                 untrusted file safe.",
+            );
+            check_clicked = ui.button("Check OpenRCT2").clicked();
+        }
+        Some(Check::Running(_)) => {
+            ui.label("Checking… (the file is being run with --version)");
+        }
+        Some(Check::Verified(install)) => {
+            ui.small(format!(
+                "Version {}",
+                install.version.as_deref().unwrap_or("unknown")
+            ));
+            let projection = plan_openrct2(Some(install), data);
+            ui.label(readiness_text(projection.readiness));
+            if projection.readiness != AlternativeLaunchReadiness::Ready {
+                ui.small(&projection.reason);
+            }
+            if let (AlternativeLaunchReadiness::Ready, Some(data)) = (projection.readiness, data) {
+                show_standalone_launch_action(
+                    ui,
+                    standalone,
+                    StandaloneLaunchRequest::OpenRct2(Request::new(OpenRct2LaunchRequest {
+                        install: install.clone(),
+                        data: data.clone(),
+                    })),
+                );
+            }
+        }
     }
     ui.separator();
+    check_clicked
 }
 
 pub(in crate::gui_v2) fn show(
@@ -120,7 +190,7 @@ pub(in crate::gui_v2) fn show(
         ui.ctx().request_repaint();
     }
     if matches!(state.scan, Scan::NotStarted) {
-        state.start(ui.ctx());
+        state.start(ui.ctx(), openrct2_search_dirs());
     }
     state.poll();
     ui.label(
@@ -143,13 +213,13 @@ pub(in crate::gui_v2) fn show(
         }
         let scanning = matches!(state.scan, Scan::Scanning(_));
         if ui
-            .add_enabled(!scanning, egui::Button::new("Check again"))
+            .add_enabled(!scanning, egui::Button::new("Refresh list"))
             .clicked()
         {
             if let Some(data) = state.data.take() {
                 state.data = Some(inspect_rct2_data(&data.root));
             }
-            state.start(ui.ctx());
+            state.start(ui.ctx(), openrct2_search_dirs());
         }
     });
     match &state.data {
@@ -174,18 +244,31 @@ pub(in crate::gui_v2) fn show(
     ui.separator();
     match &state.scan {
         Scan::NotStarted | Scan::Scanning(_) => {
-            ui.label("Looking for OpenRCT2…");
+            ui.label("Looking for OpenRCT2 (nothing is run)…");
         }
         Scan::Ready(installs) if installs.is_empty() => {
             ui.label(readiness_text(AlternativeLaunchReadiness::ProviderMissing));
             ui.small(
-                "Install OpenRCT2 yourself (for example from your distribution), then check \
-                 again. EmuWiz does not download or install it.",
+                "Install OpenRCT2 yourself (for example from your distribution), then refresh. \
+                 EmuWiz does not download or install it.",
             );
         }
         Scan::Ready(installs) => {
-            for install in installs {
-                show_install(ui, install, state.data.as_ref(), standalone);
+            if installs.len() > 1 {
+                ui.small(
+                    "Several OpenRCT2 files were found. EmuWiz will not pick one for you; check \
+                     only the one you want.",
+                );
+            }
+            let mut selected = None;
+            for candidate in installs {
+                let check = state.checks.get(&candidate.executable);
+                if show_candidate(ui, candidate, check, state.data.as_ref(), standalone) {
+                    selected = Some(candidate.clone());
+                }
+            }
+            if let Some(candidate) = selected {
+                state.begin_check(ui.ctx(), candidate);
             }
         }
     }
@@ -221,6 +304,94 @@ mod tests {
         ] {
             assert!(!readiness_text(r).starts_with("Ready"), "{r:?}");
         }
+    }
+
+    fn marker_dir(root: &std::path::Path) -> (Vec<PathBuf>, PathBuf) {
+        use std::os::unix::fs::PermissionsExt;
+        let bin = root.join("bin");
+        std::fs::create_dir_all(&bin).unwrap();
+        let marker = root.join("ran");
+        let exe = bin.join("openrct2");
+        std::fs::write(
+            &exe,
+            format!(
+                "#!/bin/sh\ntouch '{}'\necho 'OpenRCT2, v0.4.14'\n",
+                marker.display()
+            ),
+        )
+        .unwrap();
+        std::fs::set_permissions(&exe, std::fs::Permissions::from_mode(0o755)).unwrap();
+        (vec![bin], marker)
+    }
+
+    fn wait_scan(state: &mut State) {
+        for _ in 0..500 {
+            state.poll();
+            if matches!(state.scan, Scan::Ready(_)) {
+                return;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        panic!("scan did not finish");
+    }
+
+    #[test]
+    fn opening_the_page_scans_passively_and_never_runs_a_candidate() {
+        let dir = tempfile::tempdir().unwrap();
+        let (dirs, marker) = marker_dir(dir.path());
+        let mut state = State::default();
+        state.start(&egui::Context::default(), dirs);
+        wait_scan(&mut state);
+        let Scan::Ready(found) = &state.scan else {
+            unreachable!()
+        };
+        assert_eq!(found.len(), 1);
+        assert!(found[0].version.is_none());
+        // Rendering the whole page also runs nothing.
+        let ctx = egui::Context::default();
+        let mut standalone = StandaloneLaunchState::default();
+        let _ = ctx.run(Default::default(), |ctx| {
+            egui::CentralPanel::default().show(ctx, |ui| {
+                // Scan is already Ready, so show() does not rescan.
+                show(ui, &mut state, &mut standalone);
+            });
+        });
+        assert!(
+            !marker.exists(),
+            "opening/rendering must not execute anything"
+        );
+        assert!(state.checks.is_empty());
+    }
+
+    #[test]
+    fn only_the_explicit_check_runs_the_selected_file_off_the_ui_thread() {
+        let dir = tempfile::tempdir().unwrap();
+        let (dirs, marker) = marker_dir(dir.path());
+        let mut state = State::default();
+        let ctx = egui::Context::default();
+        state.start(&ctx, dirs);
+        wait_scan(&mut state);
+        let Scan::Ready(found) = &state.scan else {
+            unreachable!()
+        };
+        let candidate = found[0].clone();
+        state.begin_check(&ctx, candidate.clone());
+        // begin_check returns immediately with the check still pending or done.
+        for _ in 0..500 {
+            state.poll();
+            if matches!(
+                state.checks.get(&candidate.executable),
+                Some(Check::Verified(_))
+            ) {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        assert!(marker.exists(), "the explicit check ran the selected file");
+        let Some(Check::Verified(install)) = state.checks.get(&candidate.executable) else {
+            panic!("check did not verify");
+        };
+        assert_eq!(install.version.as_deref(), Some("0.4.14"));
     }
 
     #[test]

@@ -587,8 +587,8 @@ pub use vita3k_execution::{
     preflight_vita3k_launch, spawn_vita3k,
 };
 pub use openrct2::{
-    OpenRct2Install, OpenRct2LaunchError, OpenRct2LaunchRequest, Rct2DataReport,
-    default_search_dirs as openrct2_search_dirs, discover_openrct2, inspect_rct2_data,
+    OpenRct2CheckError, OpenRct2Install, OpenRct2LaunchError, OpenRct2LaunchRequest, Rct2DataReport,
+    default_search_dirs as openrct2_search_dirs, check_openrct2, discover_openrct2, inspect_rct2_data,
     plan_openrct2, preflight_and_launch_openrct2, probe_openrct2_version,
 };
 pub use vita3k_installed::{

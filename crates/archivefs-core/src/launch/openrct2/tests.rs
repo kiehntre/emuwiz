@@ -16,13 +16,18 @@ fn rct2_data(dir: &Path) -> PathBuf {
     root
 }
 
-fn probe_ok(_: &Path) -> Option<String> {
-    Some("0.4.14".into())
+fn checked(dirs: &[PathBuf], version: Option<&'static str>) -> OpenRct2Install {
+    let candidate = discover_openrct2(dirs).remove(0);
+    assert!(
+        candidate.version.is_none(),
+        "discovery alone knows no version"
+    );
+    check_openrct2(&candidate, dirs, &|_| version.map(String::from)).unwrap_or(candidate)
 }
 
 fn request(bin: &Path, root: &Path) -> (OpenRct2LaunchRequest, Vec<PathBuf>) {
     let dirs = vec![bin.parent().unwrap().to_path_buf()];
-    let install = discover_openrct2(&dirs, &probe_ok).remove(0);
+    let install = checked(&dirs, Some("0.4.14"));
     let data = inspect_rct2_data(root);
     (OpenRct2LaunchRequest { install, data }, dirs)
 }
@@ -35,7 +40,7 @@ fn ready_plan_and_exact_argv() {
     let (req, dirs) = request(&bin, &root);
     let plan = plan_openrct2(Some(&req.install), Some(&req.data));
     assert_eq!(plan.readiness, AlternativeLaunchReadiness::Ready);
-    let command = preflight_openrct2_launch(&req, &dirs, &probe_ok).unwrap();
+    let command = preflight_openrct2_launch(&req, &dirs).unwrap();
     assert_eq!(command.executable, bin);
     let mut expected = OsString::from("--rct2-data-path=");
     expected.push(&root);
@@ -52,7 +57,7 @@ fn game_and_engine_identity_are_separate_inputs() {
     assert_eq!(plan.readiness, AlternativeLaunchReadiness::ProviderMissing);
     // Engine alone: no game declared.
     let bin = script(&t.path().join("bin"), "exit 0");
-    let install = discover_openrct2(&[bin.parent().unwrap().into()], &probe_ok).remove(0);
+    let install = checked(&[bin.parent().unwrap().into()], Some("0.4.14"));
     let plan = plan_openrct2(Some(&install), None);
     assert_eq!(
         plan.readiness,
@@ -73,7 +78,7 @@ fn unknown_or_old_versions_are_never_ready() {
             AlternativeLaunchReadiness::VersionUnsupported,
         ),
     ] {
-        let install = discover_openrct2(&dirs, &|_| version.map(String::from)).remove(0);
+        let install = checked(&dirs, version);
         assert_eq!(
             plan_openrct2(Some(&install), Some(&data)).readiness,
             expected
@@ -131,7 +136,7 @@ fn data_folder_refusals_are_specific() {
     // A refused folder yields a non-ready plan.
     let t2 = tempfile::tempdir().unwrap();
     let bin = script(&t2.path().join("bin"), "exit 0");
-    let install = discover_openrct2(&[bin.parent().unwrap().into()], &probe_ok).remove(0);
+    let install = checked(&[bin.parent().unwrap().into()], Some("0.4.14"));
     assert_eq!(
         plan_openrct2(Some(&install), Some(&inspect_rct2_data(&empty))).readiness,
         AlternativeLaunchReadiness::OriginalAssetsMissing
@@ -148,10 +153,7 @@ fn discovery_skips_symlinks_non_executables_and_relative_dirs() {
     let plain = t.path().join("plain");
     fs::create_dir_all(&plain).unwrap();
     fs::write(plain.join("openrct2"), "not executable").unwrap();
-    let found = discover_openrct2(
-        &[linked, plain, "rel".into(), real.parent().unwrap().into()],
-        &probe_ok,
-    );
+    let found = discover_openrct2(&[linked, plain, "rel".into(), real.parent().unwrap().into()]);
     assert_eq!(found.len(), 1);
     assert_eq!(found[0].executable, real);
 }
@@ -166,7 +168,7 @@ fn click_time_drift_is_refused() {
     // Data replaced after the user saw it.
     fs::remove_file(root.join("Data/g1.dat")).unwrap();
     assert!(matches!(
-        preflight_openrct2_launch(&req, &dirs, &probe_ok),
+        preflight_openrct2_launch(&req, &dirs),
         Err(OpenRct2LaunchError::NotReady(
             AlternativeLaunchReadiness::OriginalAssetsMissing,
             _
@@ -178,7 +180,7 @@ fn click_time_drift_is_refused() {
     )
     .unwrap();
     assert!(matches!(
-        preflight_openrct2_launch(&req, &dirs, &probe_ok),
+        preflight_openrct2_launch(&req, &dirs),
         Err(OpenRct2LaunchError::Changed(m)) if m.contains("data")
     ));
 
@@ -187,19 +189,15 @@ fn click_time_drift_is_refused() {
     fs::remove_file(&bin).unwrap();
     script(bin.parent().unwrap(), "echo replaced; exit 0");
     assert!(matches!(
-        preflight_openrct2_launch(&req, &dirs, &probe_ok),
+        preflight_openrct2_launch(&req, &dirs),
         Err(OpenRct2LaunchError::Changed(m)) if m.contains("executable")
     ));
 
-    // Version changed, and executable removed.
+    // Executable removed.
     let (req, dirs) = request(&bin, &rct2_data(t.path()));
-    assert!(matches!(
-        preflight_openrct2_launch(&req, &dirs, &|_| Some("0.4.15".into())),
-        Err(OpenRct2LaunchError::Changed(m)) if m.contains("version")
-    ));
     fs::remove_file(&bin).unwrap();
     assert!(matches!(
-        preflight_openrct2_launch(&req, &dirs, &probe_ok),
+        preflight_openrct2_launch(&req, &dirs),
         Err(OpenRct2LaunchError::NotReady(
             AlternativeLaunchReadiness::ProviderMissing,
             _
@@ -217,7 +215,7 @@ fn launch_spawns_only_the_validated_command_and_reports_exit() {
     );
     let root = rct2_data(t.path());
     let (req, dirs) = request(&bin, &root);
-    let mut process = preflight_and_launch_openrct2(&req, &dirs, &probe_ok).unwrap();
+    let mut process = preflight_and_launch_openrct2(&req, &dirs).unwrap();
     let started = Instant::now();
     while process.poll().is_none() {
         assert!(
@@ -259,6 +257,118 @@ fn refused_launch_spawns_nothing() {
     let root = rct2_data(t.path());
     let (req, dirs) = request(&bin, &root);
     fs::remove_dir_all(root.join("Data")).unwrap();
-    assert!(preflight_and_launch_openrct2(&req, &dirs, &probe_ok).is_err());
+    assert!(preflight_and_launch_openrct2(&req, &dirs).is_err());
     assert!(!marker.exists());
+}
+
+fn marker_script(dir: &Path, marker: &Path) -> PathBuf {
+    script(
+        dir,
+        &format!("touch '{}'\necho 'OpenRCT2, v0.4.14'", marker.display()),
+    )
+}
+
+#[test]
+fn passive_discovery_and_planning_never_execute_anything() {
+    let t = tempfile::tempdir().unwrap();
+    let marker = t.path().join("ran");
+    let bin = marker_script(&t.path().join("bin"), &marker);
+    let dirs = vec![bin.parent().unwrap().to_path_buf()];
+    let found = discover_openrct2(&dirs);
+    assert_eq!(found.len(), 1);
+    assert!(found[0].version.is_none());
+    let data = inspect_rct2_data(&rct2_data(t.path()));
+    let plan = plan_openrct2(Some(&found[0]), Some(&data));
+    assert_eq!(
+        plan.readiness,
+        AlternativeLaunchReadiness::RequirementsUnknown
+    );
+    let _ = default_search_dirs();
+    assert!(!marker.exists(), "nothing may run before an explicit check");
+}
+
+#[test]
+fn explicit_check_executes_only_the_selected_candidate_and_records_the_version() {
+    let t = tempfile::tempdir().unwrap();
+    let (marker_a, marker_b) = (t.path().join("ran-a"), t.path().join("ran-b"));
+    let a = marker_script(&t.path().join("a"), &marker_a);
+    let b = marker_script(&t.path().join("b"), &marker_b);
+    let dirs = vec![a.parent().unwrap().into(), b.parent().unwrap().into()];
+    let found = discover_openrct2(&dirs);
+    assert_eq!(found.len(), 2);
+    let want = fs::canonicalize(&b).unwrap();
+    let selected = found.iter().find(|f| f.executable == want).unwrap();
+    let done = check_openrct2(selected, &dirs, &probe_openrct2_version).unwrap();
+    assert_eq!(done.version.as_deref(), Some("0.4.14"));
+    assert!(marker_b.exists(), "the selected candidate ran");
+    assert!(!marker_a.exists(), "no other candidate may run");
+}
+
+#[test]
+fn check_refuses_changed_symlinked_missing_and_versionless_candidates() {
+    let t = tempfile::tempdir().unwrap();
+    let marker = t.path().join("ran");
+    let bin = marker_script(&t.path().join("bin"), &marker);
+    let dirs = vec![bin.parent().unwrap().to_path_buf()];
+    let listed = discover_openrct2(&dirs).remove(0);
+
+    fs::remove_file(&bin).unwrap();
+    marker_script(bin.parent().unwrap(), &marker);
+    assert!(matches!(
+        check_openrct2(&listed, &dirs, &probe_openrct2_version),
+        Err(OpenRct2CheckError::Refused(m)) if m.contains("changed")
+    ));
+    fs::remove_file(&bin).unwrap();
+    let other = t.path().join("other");
+    marker_script(&other, &marker);
+    symlink(other.join("openrct2"), &bin).unwrap();
+    assert!(matches!(
+        check_openrct2(&listed, &dirs, &probe_openrct2_version),
+        Err(OpenRct2CheckError::Refused(_))
+    ));
+    fs::remove_file(&bin).unwrap();
+    assert!(matches!(
+        check_openrct2(&listed, &dirs, &probe_openrct2_version),
+        Err(OpenRct2CheckError::Refused(_))
+    ));
+    assert!(
+        !marker.exists(),
+        "a refused check must not execute anything"
+    );
+
+    let silent = script(&t.path().join("silent"), "exit 0");
+    let dirs = vec![silent.parent().unwrap().to_path_buf()];
+    let candidate = discover_openrct2(&dirs).remove(0);
+    assert_eq!(
+        check_openrct2(&candidate, &dirs, &probe_openrct2_version),
+        Err(OpenRct2CheckError::NoVersion)
+    );
+}
+
+#[test]
+fn directory_aliases_do_not_create_ambiguous_duplicates() {
+    let t = tempfile::tempdir().unwrap();
+    let bin = script(&t.path().join("real"), "exit 0");
+    let alias = t.path().join("alias");
+    symlink(bin.parent().unwrap(), &alias).unwrap();
+    let found = discover_openrct2(&[bin.parent().unwrap().into(), alias]);
+    assert_eq!(found.len(), 1);
+}
+
+#[test]
+fn launch_preflight_does_not_rerun_the_version_check() {
+    let t = tempfile::tempdir().unwrap();
+    let marker = t.path().join("ran");
+    let bin = marker_script(&t.path().join("bin"), &marker);
+    let dirs = vec![bin.parent().unwrap().to_path_buf()];
+    let candidate = discover_openrct2(&dirs).remove(0);
+    let install = check_openrct2(&candidate, &dirs, &probe_openrct2_version).unwrap();
+    fs::remove_file(&marker).unwrap();
+    let data = inspect_rct2_data(&rct2_data(t.path()));
+    let req = OpenRct2LaunchRequest { install, data };
+    preflight_openrct2_launch(&req, &dirs).unwrap();
+    assert!(
+        !marker.exists(),
+        "preflight is passive; only the launch executes"
+    );
 }

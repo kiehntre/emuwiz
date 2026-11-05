@@ -4,8 +4,7 @@
 //! planner at click time; nothing is installed, copied or modified.
 use super::*;
 use archivefs_core::launch::{
-    OpenRct2LaunchError, OpenRct2LaunchRequest, openrct2_search_dirs,
-    preflight_and_launch_openrct2, probe_openrct2_version,
+    OpenRct2LaunchError, OpenRct2LaunchRequest, openrct2_search_dirs, preflight_and_launch_openrct2,
 };
 
 pub(crate) const ADAPTER_KEY: &str = "openrct2";
@@ -25,8 +24,7 @@ impl Request {
     pub(crate) fn execute(
         self,
     ) -> Result<archivefs_core::launch::process_spawn::WatchedProcess, String> {
-        preflight_and_launch_openrct2(&self.0, &openrct2_search_dirs(), &probe_openrct2_version)
-            .map_err(refusal_text)
+        preflight_and_launch_openrct2(&self.0, &openrct2_search_dirs()).map_err(refusal_text)
     }
 }
 
