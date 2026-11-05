@@ -175,6 +175,12 @@ pub(super) fn groups() -> Vec<ToolGroup> {
         },
     );
     games.tools.push(Tool {
+        route: Route::Tool(ToolPage::Vita3kTitles),
+        title: ToolPage::Vita3kTitles.title(),
+        purpose: ToolPage::Vita3kTitles.purpose(),
+        safety: ToolSafety::OpensElsewhere,
+    });
+    games.tools.push(Tool {
         route: Route::Tool(ToolPage::ArcadeShelf),
         title: ToolPage::ArcadeShelf.title(),
         purpose: ToolPage::ArcadeShelf.purpose(),
@@ -576,11 +582,13 @@ mod tests {
         assert_eq!(shown(&state), 0);
         state.query.clear();
         state.filter = ToolFilter::OpensElsewhere;
-        assert_eq!(shown(&state), 1);
+        // The specialist-window tool and the Vita3K launcher, which starts an
+        // external emulator window.
+        assert_eq!(shown(&state), 2);
         state.filter = ToolFilter::LookingOnly;
         let looking = shown(&state);
         state.filter = ToolFilter::AsksFirst;
-        assert_eq!(looking + shown(&state) + 1, all);
+        assert_eq!(looking + shown(&state) + 2, all);
     }
 
     #[test]
