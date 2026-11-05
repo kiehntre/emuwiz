@@ -108,10 +108,12 @@ pub(crate) fn launch_inputs(focused: &Path, platform: Option<&str>) -> Option<Ad
     let (database, config) = default_adf_identity_paths()?;
     match cached_decision(focused)? {
         Ok(identity) => Some(inputs_for(&identity, focused, &roots, database, config)),
-        Err(refusal) if refusal.is_evidence_against_standalone() => None,
+        Err(refusal) if !refusal.permits_local_media() => None,
         Err(_) => {
+            // The local route needs a library platform that says Amiga.
+            let platform = platform?;
             let media = cached_media(focused)?;
-            Some(local_inputs_for(&media, &roots, database, config))
+            Some(local_inputs_for(&media, platform, &roots, database, config))
         }
     }
 }
@@ -121,6 +123,7 @@ pub(crate) fn launch_inputs(focused: &Path, platform: Option<&str>) -> Option<Ad
 /// file's own bytes - never a catalogue game.
 pub(crate) fn local_inputs_for(
     media: &LocalAdfMedia,
+    platform: &str,
     roots: &AmigaProfileDiscoveryRoots,
     database: PathBuf,
     config: PathBuf,
@@ -133,7 +136,14 @@ pub(crate) fn local_inputs_for(
         }),
         roots,
         |profile| {
-            build_fsuae_local_adf_request(media, profile, roots, database.clone(), config.clone())
+            build_fsuae_local_adf_request(
+                media,
+                platform,
+                profile,
+                roots,
+                database.clone(),
+                config.clone(),
+            )
         },
     )
 }

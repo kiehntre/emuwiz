@@ -609,3 +609,51 @@ fn a_real_tosec_single_disk_adf_reaches_the_fs_uae_command() {
         vec![emu.config.clone().into_os_string(), media]
     );
 }
+
+#[test]
+fn a_dat_matched_numbered_disk_never_reaches_the_local_route_even_without_its_dat() {
+    use sha2::Digest as _;
+    let set: [(&str, &[(&str, &str)]); 2] = [
+        (
+            "Lotus (1990)(Gremlin)(Disk 1 of 2)",
+            &[("Lotus (1990)(Gremlin)(Disk 1 of 2).adf", "LOTUS1")],
+        ),
+        (
+            "Lotus (1990)(Gremlin)(Disk 2 of 2)",
+            &[("Lotus (1990)(Gremlin)(Disk 2 of 2).adf", "LOTUS2")],
+        ),
+    ];
+    // A neutral file name: only the DAT knows this is disk 2.
+    let lab = lab(&set, &[("amiga", "neutral.adf", "LOTUS2")]);
+    let path = lab.path("amiga", "neutral.adf");
+    let emu = emulator(&lab, "amiga_model = A500", true);
+    let sha = hex(&Sha256::digest(fs::read(&path).unwrap()));
+    let mut request = request_for(
+        &lab,
+        &emu,
+        &format!("{}{sha}", crate::launch::LOCAL_ADF_KEY_PREFIX),
+        "neutral.adf",
+    );
+    request.route = crate::launch::FsUaeAdfRoute::LocalMedia { sha256: sha };
+    // DAT configured: the catalogue says disk 2 of a set.
+    assert!(matches!(
+        lab.identity("amiga", "neutral.adf"),
+        Err(R::DiskNumbered(_))
+    ));
+    assert!(matches!(
+        preflight_fsuae_adf_launch(&request, &lab.db, &lab.catalogues),
+        Err(FsUaeAdfLaunchError::Identity(R::DiskNumbered(_)))
+    ));
+    // DAT configuration missing or unparseable: no catalogue loads.
+    let none = HashMap::new();
+    assert!(
+        !lab.db
+            .amiga_adf_launch_identity(&path, &none)
+            .unwrap()
+            .err()
+            .expect("refused")
+            .permits_local_media()
+    );
+    // The click-time gate refuses outright when no catalogue is loaded.
+    assert!(preflight_fsuae_adf_launch(&request, &lab.db, &none).is_err());
+}

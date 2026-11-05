@@ -120,21 +120,28 @@ pub enum AmigaAdfIdentityRefusal {
 }
 
 impl AmigaAdfIdentityRefusal {
-    /// True when the catalogue itself says this ADF is part of a set, an
-    /// add-on or not a game that runs on its own, or disagrees with itself.
-    /// That is evidence against, so the local-media route must not bypass it.
-    /// Every other refusal only means no current DAT proof exists.
-    pub fn is_evidence_against_standalone(&self) -> bool {
-        matches!(
-            self,
-            Self::Conflicting(_)
-                | Self::NotSingleRom(_)
-                | Self::DiskNumbered(_)
-                | Self::NumberedSiblings(_)
-                | Self::NotStandaloneGame(_)
-                | Self::NotAdf
-                | Self::NotAmiga
-        )
+    /// Whether the local-media route may proceed after this refusal. Only
+    /// "there is simply no DAT evidence for this file" permits it; every other
+    /// refusal is either evidence against a standalone game or a catalogue
+    /// state that cannot be trusted either way, so it blocks. The match is
+    /// exhaustive on purpose: a new refusal must be classified here.
+    pub fn permits_local_media(&self) -> bool {
+        match self {
+            Self::NoCurrentMatch | Self::NotInLibrary => true,
+            Self::NotAdf
+            | Self::NotAmiga
+            | Self::FileChanged
+            | Self::Conflicting(_)
+            | Self::CatalogueStale
+            | Self::InventoryMissing
+            | Self::InventoryStale
+            | Self::EntryNotInInventory
+            | Self::NotSingleRom(_)
+            | Self::DiskNumbered(_)
+            | Self::CompletenessUnknown
+            | Self::NumberedSiblings(_)
+            | Self::NotStandaloneGame(_) => false,
+        }
     }
 
     /// Plain words for the person looking at the game.

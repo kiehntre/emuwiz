@@ -28,9 +28,10 @@ pub(crate) fn platform_allows(catalogued: Option<&str>) -> bool {
     })
 }
 
-/// Launch-only file-hash keys are never stored as a per-game default.
+/// Launch-only file-hash keys (3DSX homebrew, local Amiga media) are never stored as a per-game default.
 pub(crate) fn game_default_allowed(game_key: &str) -> bool {
     !game_key.starts_with(AZAHAR_HOMEBREW_KEY_PREFIX)
+        && !game_key.starts_with(archivefs_core::launch::LOCAL_ADF_KEY_PREFIX)
 }
 
 #[derive(Clone)]
@@ -295,6 +296,7 @@ mod tests {
     #[test]
     fn launch_only_keys_are_never_a_per_game_default() {
         assert!(!game_default_allowed("3dsx-sha256:abcd"));
+        assert!(!game_default_allowed("local-adf-sha256:abcd"));
         assert!(game_default_allowed("some-catalogue-key"));
     }
 

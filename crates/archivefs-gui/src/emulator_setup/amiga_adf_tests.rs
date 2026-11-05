@@ -197,6 +197,7 @@ fn local_play(lab: &Lab) -> (AdfLaunchInputs, GamerPlayAction) {
     let media = local_adf_media(&lab.adf).expect("a plain single floppy");
     let inputs = local_inputs_for(
         &media,
+        "Amiga",
         &lab.roots,
         lab.database.clone(),
         lab.database.with_extension("toml"),
@@ -235,6 +236,7 @@ fn local_play(lab: &Lab) -> (AdfLaunchInputs, GamerPlayAction) {
         cemu: None,
         flycast: None,
         xroar: None,
+        azahar: None,
         vice: None,
         amiga_whdload: Some(AmigaWHDLoadLaunchContext {
             requests: Vec::new(),
@@ -269,11 +271,24 @@ fn preflight_local(
 > {
     // An empty catalogue: the file is not in the library, so no DAT speaks.
     let database = archivefs_core::Database::open_or_create(lab.database.clone()).unwrap();
-    archivefs_core::launch::preflight_fsuae_adf_launch(
-        request,
-        &database,
-        &std::collections::HashMap::new(),
-    )
+    // A loaded (but irrelevant) catalogue: the local route refuses without one.
+    let mut catalogues = std::collections::HashMap::new();
+    catalogues.insert(
+        "test".to_string(),
+        archivefs_core::dat::configured_catalogues::ConfiguredCatalogue {
+            reference: archivefs_core::dat::catalogue_selection::CatalogueRef::Local {
+                source_id: "test".into(),
+                member: None,
+            },
+            source_id: "test".into(),
+            display_name: "test".into(),
+            path: lab.adf.with_extension("dat"),
+            kind: archivefs_core::dat::sources::DatSourceKind::File,
+            sha256: None,
+            revision: None,
+        },
+    );
+    archivefs_core::launch::preflight_fsuae_adf_launch(request, &database, &catalogues)
 }
 
 #[test]
@@ -378,25 +393,98 @@ fn the_local_route_keeps_kickstart_and_machine_refusals() {
 }
 
 #[test]
-fn catalogue_evidence_against_a_standalone_game_blocks_the_local_route() {
+fn only_no_evidence_refusals_permit_the_local_route() {
     use archivefs_core::dat::amiga_adf_identity::AmigaAdfIdentityRefusal as R;
-    for against in [
+    for open in [R::NotInLibrary, R::NoCurrentMatch] {
+        assert!(open.permits_local_media(), "{open:?}");
+    }
+    for blocked in [
+        R::NotAdf,
+        R::NotAmiga,
+        R::FileChanged,
         R::Conflicting(vec!["a".into(), "b".into()]),
+        R::CatalogueStale,
+        R::InventoryMissing,
+        R::InventoryStale,
+        R::EntryNotInInventory,
         R::NotSingleRom(2),
         R::DiskNumbered("Game".into()),
+        R::CompletenessUnknown,
         R::NumberedSiblings("Game (Disk 2)".into()),
         R::NotStandaloneGame("an add-on".into()),
     ] {
-        assert!(against.is_evidence_against_standalone(), "{against:?}");
+        assert!(!blocked.permits_local_media(), "{blocked:?}");
     }
-    for open in [
-        R::NotInLibrary,
-        R::NoCurrentMatch,
-        R::CatalogueStale,
-        R::InventoryMissing,
-        R::CompletenessUnknown,
-        R::FileChanged,
-    ] {
-        assert!(!open.is_evidence_against_standalone(), "{open:?}");
+}
+
+#[test]
+fn siblings_of_any_amiga_media_kind_or_an_oversized_folder_refuse() {
+    let dir = tempfile::tempdir().unwrap();
+    let main = dir.path().join("Game Disk 1.adf");
+    fs::write(&main, floppy()).unwrap();
+    assert!(local_adf_media(&main).is_err(), "numbered itself");
+    let plain = tempfile::tempdir().unwrap();
+    let one = plain.path().join("Cool Game.adf");
+    fs::write(&one, floppy()).unwrap();
+    assert!(local_adf_media(&one).is_ok());
+    // A numbered sibling in another media format, and a symlinked one.
+    fs::write(plain.path().join("Cool Game Disk 2.ipf"), b"x").unwrap();
+    assert!(local_adf_media(&one).is_err(), "ipf sibling");
+    fs::remove_file(plain.path().join("Cool Game Disk 2.ipf")).unwrap();
+    std::os::unix::fs::symlink(&one, plain.path().join("Cool Game Disk 2.adf")).unwrap();
+    assert!(local_adf_media(&one).is_err(), "symlinked sibling");
+    // A folder past the scan cap refuses instead of scanning a truncation.
+    let big = tempfile::tempdir().unwrap();
+    let lone = big.path().join("Lone.adf");
+    fs::write(&lone, floppy()).unwrap();
+    for i in 0..4100 {
+        fs::write(big.path().join(format!("f{i}.txt")), b"").unwrap();
     }
+    assert!(local_adf_media(&lone).is_err(), "oversized folder");
+}
+
+#[test]
+fn unrelated_archives_beside_the_adf_do_not_block_it() {
+    let dir = tempfile::tempdir().unwrap();
+    let adf = dir.path().join("Cool Game.adf");
+    fs::write(&adf, floppy()).unwrap();
+    fs::write(dir.path().join("Something Else.zip"), b"x").unwrap();
+    fs::write(dir.path().join("Another Title.ipf"), b"x").unwrap();
+    assert!(local_adf_media(&adf).is_ok());
+}
+
+#[test]
+fn the_local_route_refuses_without_a_loaded_catalogue() {
+    let lab = lab("amiga_model = A500", true);
+    let request = local_request(&lab);
+    let database = archivefs_core::Database::open_or_create(lab.database.clone()).unwrap();
+    let refused = archivefs_core::launch::preflight_fsuae_adf_launch(
+        &request,
+        &database,
+        &std::collections::HashMap::new(),
+    );
+    assert!(refused.is_err(), "{refused:?}");
+}
+
+#[test]
+fn a_fifo_named_like_an_adf_is_refused_without_blocking() {
+    let dir = tempfile::tempdir().unwrap();
+    let fifo = dir.path().join("pipe.adf");
+    let c = std::ffi::CString::new(fifo.to_str().unwrap()).unwrap();
+    assert_eq!(unsafe { libc::mkfifo(c.as_ptr(), 0o600) }, 0);
+    assert!(local_adf_media(&fifo).is_err());
+}
+
+#[test]
+fn the_local_route_needs_an_amiga_library_platform() {
+    let lab = lab("amiga_model = A500", true);
+    let media = local_adf_media(&lab.adf).unwrap();
+    let inputs = local_inputs_for(
+        &media,
+        "Acorn Archimedes",
+        &lab.roots,
+        lab.database.clone(),
+        lab.database.with_extension("toml"),
+    );
+    assert!(inputs.requests.is_empty());
 }

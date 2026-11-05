@@ -238,6 +238,11 @@ pub fn current_adf_launch_decision(
     let database = Database::open_read_only(database_path)
         .map_err(|error| format!("The library catalogue could not be read: {error}"))?;
     let catalogues = crate::dat::configured_catalogues::load_configured_catalogues(&config);
+    // An empty or unloadable catalogue set is "no evidence", which callers
+    // must not mistake for "no evidence against".
+    if catalogues.is_empty() {
+        return Err("No DAT catalogue is configured or it could not be loaded.".into());
+    }
     database
         .amiga_adf_launch_identity(path, &catalogues)
         .map_err(|error| format!("The library catalogue could not be read: {error}"))

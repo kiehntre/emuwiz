@@ -371,7 +371,9 @@ pub use fsuae_adf::{
     default_adf_identity_paths, fsuae_adf_config, fsuae_adf_profile_refusal,
     preflight_and_launch_fsuae_adf, preflight_fsuae_adf_launch,
 };
-pub use fsuae_adf_local::{LocalAdfMedia, build_fsuae_local_adf_request, local_adf_media};
+pub use fsuae_adf_local::{
+    LOCAL_ADF_KEY_PREFIX, LocalAdfMedia, build_fsuae_local_adf_request, local_adf_media,
+};
 pub use fsuae_command::{
     FSUAE_SUPPORTED_PLATFORM_ID, FsUaeCommand, FsUaeCommandPlan, FsUaeCommandSelection,
     FsUaeLaunchBlocker, FsUaeLaunchBlockerKind, FsUaeNativeLaunchBinding, build_fsuae_command_plan,
