@@ -235,6 +235,7 @@ pub(super) enum Command {
         root: std::path::PathBuf,
         target: super::save_snapshots::SnapshotTarget,
     },
+    CardRestore(Box<super::card_restore::Job>),
 }
 
 pub(super) enum Payload {
@@ -323,6 +324,7 @@ pub(super) enum Payload {
     SaveSnapshotCreated {
         result: Result<String, String>,
     },
+    CardRestore(Box<super::card_restore::Outcome>),
 }
 
 #[derive(Clone, Debug)]
@@ -937,6 +939,9 @@ fn execute(id: u64, command: Command, answers: &Sender<Event>) -> Result<Payload
             ),
             generation,
         }),
+        Command::CardRestore(job) => Ok(Payload::CardRestore(Box::new(super::card_restore::run(
+            *job,
+        )))),
         Command::CreateSaveSnapshot { root, target } => Ok(Payload::SaveSnapshotCreated {
             result: super::save_snapshots::create(
                 &root,

@@ -521,7 +521,7 @@ pub(super) fn catalogue_choice_note(count: usize, platform: &str) -> String {
     }
 }
 
-pub(super) const MISSING_CATALOGUE_HELP: &str = "A catalogue is offered here only when it is enabled, has passed its catalogue check, is set to this game's system, and can check individual games (a folder of catalogues cannot). Set up verification opens DAT Management, where you can add a catalogue or choose its system. Having a catalogue installed does not verify any game.";
+pub(super) const MISSING_CATALOGUE_HELP: &str = "A catalogue is offered here only when it is enabled, has passed its catalogue check, is set to this game's system, and can check individual games (a folder of catalogues cannot). Choose a catalogue uses one you already installed. Set up verification opens DAT Management, where you can add a catalogue or choose its system. Having a catalogue installed does not verify any game.";
 
 pub(super) enum PageAction {
     BackToGame,
@@ -579,19 +579,22 @@ pub(super) fn show(
                     target.platform
                 ));
                 ui.label(NOT_NEEDED_TO_PLAY);
-                // The system's check page offers installed catalogues and
-                // asks before saving any system assignment.
-                if ui
-                    .button(choose_for_system_label(&target.platform))
-                    .on_hover_text("Opens this system's check, which offers installed catalogues and asks before saving any system for them. Nothing is checked until you confirm.")
-                    .clicked()
-                {
-                    action = Some(PageAction::CheckWholePlatform);
-                }
                 ui.label(MISSING_CATALOGUE_HELP);
-                if ui.button("Set up verification").clicked() {
-                    action = Some(PageAction::SetUpCatalogues);
-                }
+                // Two different next steps, side by side: use a catalogue that
+                // is already installed (asks before saving any system for it),
+                // or open DAT Management to add one.
+                ui.horizontal_wrapped(|ui| {
+                    if ui
+                        .button(choose_for_system_label(&target.platform))
+                        .on_hover_text("Opens this system's check, which offers installed catalogues and asks before saving any system for them. Nothing is checked until you confirm.")
+                        .clicked()
+                    {
+                        action = Some(PageAction::CheckWholePlatform);
+                    }
+                    if ui.button("Set up verification").clicked() {
+                        action = Some(PageAction::SetUpCatalogues);
+                    }
+                });
             } else {
                 if !state.catalogues.is_empty() {
                     ui.strong("Confirmed for this system");

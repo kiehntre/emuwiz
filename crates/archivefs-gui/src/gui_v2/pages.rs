@@ -1369,6 +1369,10 @@ impl App {
             ui.label("Find a game, check that it is ready, then play.");
         } else if let Route::Tool(tool) = &self.router.current {
             ui.label(tool.purpose());
+        } else if matches!(self.router.current, Route::GameCheck(_)) {
+            ui.label("Check just this game against a trusted catalogue. You see a preview first.");
+        } else if matches!(self.router.current, Route::ReviewIdentity(_)) {
+            ui.label("See how this game was identified and what you can do next.");
         } else if self.router.current.game().is_some() {
             ui.label("Your game's information, readiness and next actions, in one place.");
         } else if let Some(family) = family {

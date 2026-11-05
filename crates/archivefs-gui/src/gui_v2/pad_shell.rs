@@ -31,6 +31,9 @@ pub(super) struct PadShell {
     refocus: Option<(egui::Id, u8)>,
     /// Whether A (South) is physically down, for hold-to-confirm.
     south_down: bool,
+    /// The last input was the controller, not the mouse: only then is an open
+    /// dialog made modal for focus, so mouse use behind it is unchanged.
+    pad_mode: bool,
     /// A hold-to-confirm in progress: the control, when it began, its label.
     hold: Option<(egui::Id, f64, String)>,
     #[cfg(test)]
@@ -81,6 +84,23 @@ impl App {
             .unwrap_or_default();
         #[cfg(test)]
         events.append(&mut shell.injected);
+        let pointer_used = context.input(|i| {
+            i.pointer.is_moving()
+                || i.pointer.any_pressed()
+                || i.smooth_scroll_delta != egui::Vec2::ZERO
+        });
+        if pointer_used {
+            shell.pad_mode = false;
+        }
+        if events
+            .iter()
+            .any(|e| !matches!(e, PadEvent::Reset { .. } | PadEvent::Released { .. }))
+        {
+            shell.pad_mode = true;
+        }
+        if shell.pad_mode {
+            confine_to_dialog(context);
+        }
         for event in &events {
             match event {
                 PadEvent::Pressed {
@@ -426,6 +446,22 @@ impl App {
             None => self.open_all_tools(),
         }
     }
+}
+
+/// While the controller is in use, an open dialog window is made the modal
+/// layer for focus: egui then keeps focus movement and activation inside it
+/// (it takes effect from the next frame), so Next/Previous can never step onto
+/// the page behind. The picker and keyboard are `egui::Modal`s and do this
+/// themselves.
+fn confine_to_dialog(context: &egui::Context) {
+    context.memory_mut(|m| {
+        let top = m.areas().top_layer_id(egui::Order::Middle);
+        if let Some(layer) = top
+            && m.areas().is_visible(&layer)
+        {
+            m.set_modal_layer(layer);
+        }
+    });
 }
 
 /// How long A is held to press an unrecognised button in a dialog.
