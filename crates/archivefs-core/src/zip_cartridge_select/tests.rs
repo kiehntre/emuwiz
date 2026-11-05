@@ -161,10 +161,15 @@ fn exact_duplicate() -> Vec<u8> {
 
 #[test]
 fn exact_duplicate_names_are_refused_not_collapsed() {
-    assert_eq!(
-        select(&exact_duplicate(), IdentityPlatform::GameBoy),
-        Err(IdentityStatus::Invalid)
-    );
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("game.zip");
+    std::fs::write(&path, exact_duplicate()).unwrap();
+    let mut archive = ZipArchive::new(File::open(&path).unwrap()).unwrap();
+    let (status, message) =
+        select_zip_cartridge_member(&mut archive, IdentityPlatform::GameBoy, &mut 0).unwrap_err();
+    assert_eq!(status, IdentityStatus::Invalid);
+    // Refused for the duplicate itself, not some incidental inconsistency.
+    assert!(message.contains("duplicate file names"), "{message}");
 }
 
 #[test]
