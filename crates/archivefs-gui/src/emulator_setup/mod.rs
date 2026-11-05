@@ -21,6 +21,7 @@
 //! `main.rs`, so Part 2 does not need to move it.
 
 pub(crate) mod amiga_adf;
+pub(crate) mod azahar_homebrew;
 pub(crate) mod cemu;
 mod controller;
 pub(crate) mod flycast_gdi;

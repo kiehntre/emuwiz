@@ -75,6 +75,7 @@ pub mod amiga_whdload_trainer_launch;
 pub mod atari800;
 pub mod azahar_command;
 pub mod azahar_execution;
+pub mod azahar_homebrew;
 #[cfg(target_os = "linux")]
 pub mod b_em;
 #[cfg(target_os = "linux")]
@@ -249,6 +250,11 @@ pub use azahar_command::{
 pub use azahar_execution::{
     AzaharPreflightError, AzaharPreflightErrorKind, LaunchedAzaharProcess, preflight_azahar_launch,
     spawn_azahar,
+};
+pub use azahar_homebrew::{
+    AZAHAR_HOMEBREW_KEY_PREFIX, AzaharHomebrewLaunchError, AzaharHomebrewLaunchRequest,
+    ThreeDsxEvidence, ThreeDsxRefusal, ThreeDsxRefusalKind, preflight_and_launch_azahar_homebrew,
+    verify_three_dsx,
 };
 pub use cemu_command::{
     CEMU_SUPPORTED_PLATFORM_ID, CemuCommand, CemuCommandPlan, CemuCommandSelection,

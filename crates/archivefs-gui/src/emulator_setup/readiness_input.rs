@@ -226,6 +226,13 @@ impl ReadinessSources<'_> {
         if let Some((identity, _)) = &vice_inputs {
             identity_status = identity.clone();
         }
+        let azahar_context = self.readiness.azahar_homebrew.context(focused);
+        let azahar_inputs = azahar_context
+            .as_ref()
+            .and_then(|c| c.inputs(&identity_status));
+        if let Some((identity, _)) = &azahar_inputs {
+            identity_status = identity.clone();
+        }
         let xroar_context = self.readiness.xroar_cassette.context(focused);
         let xroar_inputs = xroar_context
             .as_ref()
@@ -357,6 +364,9 @@ impl ReadinessSources<'_> {
             content = selected_content;
         }
         if let Some((_, selected_content)) = xroar_inputs {
+            content = selected_content;
+        }
+        if let Some((_, selected_content)) = azahar_inputs {
             content = selected_content;
         }
 
@@ -1388,6 +1398,7 @@ impl ReadinessSources<'_> {
             cemu: cemu_context,
             flycast: flycast_context,
             xroar: xroar_context,
+            azahar: azahar_context,
             vice: vice_context,
             amiga_whdload: amiga_whdload_context,
             #[cfg(target_os = "linux")]
