@@ -131,6 +131,15 @@ fn unfocused_window_ignores_the_controller() {
 fn run_ui_frame(
     context: &egui::Context,
     events: Vec<egui::Event>,
+    body: impl FnMut(&egui::Context),
+) -> egui::FullOutput {
+    run_ui_frame_at(context, None, events, body)
+}
+
+fn run_ui_frame_at(
+    context: &egui::Context,
+    time: Option<f64>,
+    events: Vec<egui::Event>,
     mut body: impl FnMut(&egui::Context),
 ) -> egui::FullOutput {
     let before = super::super::pad_shell::hook_runs(context);
@@ -138,6 +147,7 @@ fn run_ui_frame(
         egui::RawInput {
             screen_rect: Some(egui::Rect::from_min_size(egui::Pos2::ZERO, SIZE.into())),
             events,
+            time,
             ..Default::default()
         },
         |ui| body(&ui.ctx().clone()),
@@ -573,5 +583,272 @@ mod picker_journey {
         assert_eq!(rig.app.router.current, route);
         assert!(picker::open(&rig.context));
         assert!(rig.app.big_picture.is_none());
+    }
+}
+
+mod dialog_safety {
+    use super::*;
+
+    struct Rig {
+        context: egui::Context,
+        app: App,
+        time: f64,
+        cancel: u32,
+        destroy: u32,
+        page: u32,
+        page_rect: egui::Rect,
+        dialog_open: bool,
+        dialog_buttons: bool,
+    }
+
+    const A: Control = Control::Button(Button::South);
+    const B: Control = Control::Button(Button::East);
+
+    impl Rig {
+        fn new() -> Self {
+            let context = egui::Context::default();
+            let app = super::app(&context);
+            let mut rig = Self {
+                context,
+                app,
+                time: 1.0,
+                cancel: 0,
+                destroy: 0,
+                page: 0,
+                page_rect: egui::Rect::NOTHING,
+                dialog_open: true,
+                dialog_buttons: true,
+            };
+            rig.frame();
+            rig
+        }
+
+        fn frame(&mut self) {
+            self.frame_with(Vec::new());
+        }
+
+        fn frame_with(&mut self, events: Vec<egui::Event>) {
+            self.time += 0.1;
+            let (app, cancel, destroy, page, page_rect) = (
+                &mut self.app,
+                &mut self.cancel,
+                &mut self.destroy,
+                &mut self.page,
+                &mut self.page_rect,
+            );
+            let (dialog_open, dialog_buttons) = (self.dialog_open, self.dialog_buttons);
+            run_ui_frame_at(&self.context, Some(self.time), events, |context| {
+                app.show(context);
+                egui::Area::new(egui::Id::new("page_area"))
+                    .order(egui::Order::Background)
+                    .show(context, |ui| {
+                        let r = ui.button("Delete page thing");
+                        *page_rect = r.rect;
+                        if r.clicked() {
+                            *page += 1;
+                        }
+                    });
+                if dialog_open {
+                    egui::Window::new("Are you sure?")
+                        .fixed_pos(egui::pos2(800.0, 400.0))
+                        .show(context, |ui| {
+                            if !dialog_buttons {
+                                ui.label("Working… nothing to press here");
+                                return;
+                            }
+                            if ui.button("Cancel").clicked() {
+                                *cancel += 1;
+                            }
+                            if ui.button("Delete everything").clicked() {
+                                *destroy += 1;
+                            }
+                        });
+                }
+            });
+        }
+
+        fn focus(&mut self, label: &str) {
+            // Walk with the controller's own Down until the label is focused.
+            for _ in 0..120 {
+                self.step(Control::Direction(Direction::Down));
+                if self.focused_label().as_deref() == Some(label) {
+                    return;
+                }
+            }
+            panic!("never focused {label}");
+        }
+
+        fn focused_label(&self) -> Option<String> {
+            self.context
+                .data(|d| {
+                    d.get_temp::<(egui::Id, String, bool)>(egui::Id::new("pad_shell_focus_label"))
+                })
+                .map(|(_, label, _)| label)
+        }
+
+        fn step(&mut self, control: Control) {
+            let shell = self.app.pad_shell.as_mut().unwrap();
+            shell.inject(PadEvent::Pressed { device: 1, control });
+            shell.inject(PadEvent::Released { device: 1, control });
+            for _ in 0..3 {
+                self.frame();
+            }
+        }
+
+        fn hold_a(&mut self, frames: usize) {
+            let shell = self.app.pad_shell.as_mut().unwrap();
+            shell.inject(PadEvent::Pressed {
+                device: 1,
+                control: A,
+            });
+            for _ in 0..frames {
+                self.frame();
+            }
+        }
+
+        fn release_a(&mut self) {
+            let shell = self.app.pad_shell.as_mut().unwrap();
+            shell.inject(PadEvent::Released {
+                device: 1,
+                control: A,
+            });
+            for _ in 0..3 {
+                self.frame();
+            }
+        }
+    }
+
+    #[test]
+    fn a_tap_never_presses_an_unrecognised_dialog_button() {
+        let mut rig = Rig::new();
+        rig.focus("Delete everything");
+        rig.step(A);
+        assert_eq!(rig.destroy, 0, "a tap must not confirm");
+    }
+
+    #[test]
+    fn a_tap_presses_cancel() {
+        let mut rig = Rig::new();
+        rig.focus("Cancel");
+        rig.step(A);
+        assert_eq!(rig.cancel, 1);
+        assert_eq!(rig.destroy, 0);
+    }
+
+    #[test]
+    fn holding_a_long_enough_confirms_and_releasing_early_does_not() {
+        let mut rig = Rig::new();
+        rig.focus("Delete everything");
+        rig.hold_a(3); // ~0.3 s
+        rig.release_a();
+        assert_eq!(rig.destroy, 0, "released early");
+        rig.hold_a(9); // ~0.9 s
+        assert_eq!(rig.destroy, 1, "held long enough");
+        rig.release_a();
+        assert_eq!(rig.destroy, 1, "fires once");
+    }
+
+    #[test]
+    fn moving_focus_during_a_hold_cancels_it() {
+        let mut rig = Rig::new();
+        rig.focus("Delete everything");
+        rig.hold_a(2);
+        rig.context
+            .memory_mut(|m| m.request_focus(egui::Id::new("nowhere")));
+        rig.frame();
+        rig.hold_a(9);
+        assert_eq!(rig.destroy, 0);
+    }
+
+    fn focus_is_in_the_dialog(rig: &Rig) -> bool {
+        let Some(id) = rig.context.memory(|m| m.focused()) else {
+            return true; // nothing focused is not a leak
+        };
+        rig.context
+            .read_response(id)
+            .is_some_and(|r| r.layer_id.order == egui::Order::Middle)
+    }
+
+    #[test]
+    fn controller_focus_cannot_leave_an_open_dialog_in_either_direction() {
+        for direction in [Direction::Down, Direction::Up] {
+            let mut rig = Rig::new();
+            rig.step(Control::Direction(direction)); // controller takes over
+            for _ in 0..30 {
+                rig.step(Control::Direction(direction));
+                assert!(focus_is_in_the_dialog(&rig), "focus leaked {direction:?}");
+                rig.step(A); // a tap on whatever has focus
+            }
+            assert_eq!(rig.page, 0, "the page behind was never pressed");
+            assert_eq!(rig.destroy, 0, "a tap never confirms");
+        }
+    }
+
+    #[test]
+    fn a_dialog_with_no_close_button_cannot_trap_the_controller() {
+        let mut rig = Rig::new();
+        rig.dialog_buttons = false; // a window with only text: nothing to focus
+        rig.frame();
+        rig.step(Control::Direction(Direction::Down));
+        for _ in 0..6 {
+            rig.step(Control::Direction(Direction::Down));
+            assert!(focus_is_in_the_dialog(&rig), "locked in while it is open");
+        }
+        assert_eq!(rig.page, 0);
+        rig.step(B); // Back: this window has no close rule
+        rig.step(Control::Direction(Direction::Down));
+        let mut reached_page = false;
+        for _ in 0..30 {
+            rig.step(Control::Direction(Direction::Down));
+            reached_page |= !focus_is_in_the_dialog(&rig);
+        }
+        assert!(reached_page, "after B the controller can leave the window");
+        assert!(rig.dialog_open, "the dialog itself was not touched");
+    }
+
+    #[test]
+    fn mouse_use_behind_the_dialog_is_unchanged() {
+        let mut rig = Rig::new();
+        rig.step(Control::Direction(Direction::Down)); // controller mode
+        // Mouse takes over: a move, then a click on the page button.
+        let point = rig.page_rect.center();
+        rig.frame_with(vec![egui::Event::PointerMoved(point)]);
+        rig.frame();
+        for pressed in [true, false] {
+            rig.frame_with(vec![egui::Event::PointerButton {
+                pos: point,
+                button: egui::PointerButton::Primary,
+                pressed,
+                modifiers: egui::Modifiers::NONE,
+            }]);
+        }
+        assert_eq!(rig.page, 1, "mouse can still use the page behind a dialog");
+    }
+
+    #[test]
+    fn holding_a_while_focus_moves_never_activates_another_control() {
+        let mut rig = Rig::new();
+        rig.focus("Delete everything");
+        rig.hold_a(2); // hold begun on the destructive button
+        rig.step(Control::Direction(Direction::Up)); // focus moves, A still down
+        rig.step(Control::Direction(Direction::Down));
+        for _ in 0..10 {
+            rig.frame(); // A is still held well past 0.6 s
+        }
+        rig.release_a();
+        assert_eq!(rig.destroy, 0);
+        assert_eq!(rig.cancel, 0);
+        assert_eq!(rig.page, 0);
+    }
+
+    #[test]
+    fn buttons_on_the_page_itself_are_not_slowed_down() {
+        // With no dialog open the page is ordinary: a tap presses its button.
+        let mut rig = Rig::new();
+        rig.dialog_open = false;
+        rig.frame();
+        rig.focus("Delete page thing");
+        rig.step(A);
+        assert_eq!(rig.page, 1, "the dialog guard is for dialogs only");
     }
 }
