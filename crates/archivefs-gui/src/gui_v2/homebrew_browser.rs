@@ -343,8 +343,10 @@ mod tests {
 
     #[test]
     fn rendering_never_starts_a_network_lookup() {
-        let mut state = State::default();
-        state.github_input = "owner/demo".into();
+        let mut state = State {
+            github_input: "owner/demo".into(),
+            ..Default::default()
+        };
         render(&mut state);
         render(&mut state);
         assert!(state.github_pending.is_none());
