@@ -1148,6 +1148,14 @@ impl NativeWorkflows {
         if let Some(environment) = environment {
             lifecycle_setup_panel(ui, &environment.lifecycle, &mut self.app);
         }
+        let emulator_running = self.app.launch_dolphin.is_active()
+            || self.app.launch_pcsx2.is_active()
+            || self.app.launch_standalone.is_active();
+        self.app
+            .emulator_readiness
+            .emulator_inventory_page
+            .show_blue(ui, emulator_running);
+        ui.separator();
         let context = ui.ctx().clone();
         self.app
             .navigate_to_main_view(crate::navigation::MainView::EmulatorSetup);
