@@ -283,16 +283,13 @@ fn readable_evidence(journal: &Ps2RestoreJournal) -> (Vec<String>, Result<String
             "missing or not verified"
         }
     ));
-    let card_original = card.as_deref() == Some(journal.original_sha256.as_str());
-    let allowed = if backup_ok || card_original {
-        Ok(if backup_ok {
-            "Your card from before the restore is safe in the verified backup above. Marking this record reviewed lets Blue restore to this card again. The record and backup are kept."
-        } else {
-            "The card is unchanged from before the restore. Marking this record reviewed lets Blue restore to this card again. The record is kept."
-        }
-        .to_string())
+    // Only the verified backup is lasting proof. "The card is unchanged" stops
+    // holding at the next restore, which would silently re-park the card
+    // (including the Undo of that restore), so it is never a basis on its own.
+    let allowed = if backup_ok {
+        Ok("Your card from before the restore is safe in the verified backup above. Marking this record reviewed lets Blue restore to this card again. The record and backup are kept.".to_string())
     } else {
-        Err("EmuWiz cannot prove your card from before the restore still exists: the card has changed and the backup is missing or does not verify. This record is kept and keeps restores to this card paused. Inspect the card and backup yourself (Save Vault, Advanced).".to_string())
+        Err("EmuWiz cannot prove your card from before the restore is kept safe: the backup is missing or does not verify. This record is kept and keeps restores to this card paused. Inspect the card and backup yourself (Save Vault, Advanced).".to_string())
     };
     (facts, allowed)
 }

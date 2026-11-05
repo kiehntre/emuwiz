@@ -154,6 +154,28 @@ fn a_parked_record_without_provable_pre_restore_content_stays_blocking() {
 }
 
 #[test]
+fn an_unchanged_card_without_a_verified_backup_is_not_grounds_for_review() {
+    // That evidence would vanish at the next restore and silently re-park the
+    // card, including the Undo of that restore; only a backup lasts.
+    let (world, _, done, played) = restored();
+    park(&done.journal_path);
+    fs::write(&world.card, &played).unwrap();
+    fs::remove_file(&done.result.backup_path).unwrap();
+    let preview = recovery::review_preview(&done.journal_path).unwrap();
+    assert!(
+        preview
+            .facts
+            .iter()
+            .any(|f| f.contains("the same as before the restore"))
+    );
+    assert!(preview.allowed.is_err(), "{:?}", preview.allowed);
+    assert!(recovery::mark_reviewed(&preview, 7).is_err());
+    let row = row(&world, &done.journal_path);
+    assert!(row.review.is_none() && row.blocks(&world.card));
+    assert_eq!(world.card_bytes(), played);
+}
+
+#[test]
 fn review_refuses_changed_evidence_and_unfinished_records() {
     let (world, _, done, _) = restored();
     park(&done.journal_path);
